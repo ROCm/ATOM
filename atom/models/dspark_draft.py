@@ -304,8 +304,8 @@ class DSparkDraftModel(nn.Module):
     # the proposer plans. A draft that attends its block another way (MiniMax-
     # M3.1's per-row MHA decode) builds what it reads in `prepare_paged_block`.
     block_attention_is_mla = True
-    # The draft's own pool, and with it whether the draft's KV is split across
-    # the target's DCP group. None is the generic pool, inside the group.
+    # A pool of the draft's own, outside the target's DCP group. None is the
+    # generic pool, inside the group.
     kv_pool_spec: ClassVar[DraftKvPoolSpec | None] = None
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):

@@ -63,8 +63,8 @@ class DSparkProposer(Drafter):
         )
         # The draft rides the target's block tables. An MLA draft shares the
         # target's pool and so its DCP sharding, addressing in LOCAL (per-rank)
-        # terms; a draft whose `kv_pool_spec` puts it outside the DCP group
-        # owns a pool that is not (`_draft_is_dcp_sharded`). 1 when -dcp is
+        # terms; a draft that declares a `kv_pool_spec` owns a pool outside
+        # the DCP group, which is not (`_draft_is_dcp_sharded`). 1 when -dcp is
         # unset.
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
@@ -451,12 +451,11 @@ class DSparkProposer(Drafter):
         """Whether the DRAFT's KV is split across the DCP group, like the target's.
 
         True for the MLA DSpark draft, which binds into the target's latent
-        rows and so addresses in LOCAL per-rank terms. False for a draft whose
-        `kv_pool_spec` puts it outside the DCP group, whatever `-dcp` says:
-        every rank holds the whole token axis.
+        rows and so addresses in LOCAL per-rank terms. False for a draft that
+        declares a `kv_pool_spec`, whatever `-dcp` says: that pool is outside
+        the DCP group, so every rank holds the whole token axis.
         """
-        spec = self.model.kv_pool_spec
-        return self.dcp_world_size > 1 and (spec is None or spec.in_dcp_group)
+        return self.dcp_world_size > 1 and self.model.kv_pool_spec is None
 
     @property
     def _draft_entry_tokens(self) -> int:

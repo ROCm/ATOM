@@ -344,7 +344,7 @@ class KimiK3DFlash(DSparkDraftModel):
     """
 
     block_attention_is_mla = False
-    kv_pool_spec = DraftKvPoolSpec(flash_layout=True, in_dcp_group=False)
+    kv_pool_spec = DraftKvPoolSpec()
 
     packed_modules_mapping: ClassVar[dict[str, tuple]] = {
         "q_proj": ("qkv_proj", "q"),

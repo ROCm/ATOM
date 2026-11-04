@@ -579,10 +579,13 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
 @pytest.mark.parametrize("dcp", [1, 2, 8])
 def test_dflash_pool_entry_is_dcp_blocks(dcp):
     """One target block id spans `block_size * dcp` global positions, and the
-    draft, outside the dcp group, stores all of them: `dcp` blocks an entry.
+    draft, outside the dcp group, stores all of them: `dcp` blocks an entry,
+    at the scheduler's block, the unit those ids count in.
     """
-    seen = _make_kv_pool_kwargs(_stub_runner(dcp=dcp))
+    runner = _stub_runner(dcp=dcp)
+    seen = _make_kv_pool_kwargs(runner)
     assert seen["blocks_per_entry"] == dcp
+    assert seen["builder"]._block_size == runner.block_size
 
 
 @pytest.mark.parametrize("model", ["eagle3", "minimax"])
@@ -599,21 +602,6 @@ def test_a_draft_without_a_pool_spec_gets_the_generic_pool(model):
     builder = seen.pop("builder")
     assert set(seen) == {"layers", "target_block_size", "world_size", "kv_dtype"}
     assert builder._block_size is None
-
-
-def test_a_draft_outside_the_dcp_group_needs_the_flash_pool():
-    """Out of the group, an entry is `block_size * dcp` tokens, which only the
-    FLASH order reads; the spec refuses the pair rather than let the
-    proposer's addressing and the pool's geometry part."""
-    dk = _gpu_stack_import("atom.spec_decode.draft_kv")
-    with pytest.raises(ValueError, match="FLASH"):
-        dk.DraftKvPoolSpec(in_dcp_group=False)
-    spec = dk.DraftKvPoolSpec(flash_layout=True, in_dcp_group=False)
-    assert spec.pool_kwargs(8) == {"blocks_per_entry": 8, "flash_layout": True}
-    assert dk.DraftKvPoolSpec().pool_kwargs(8) == {
-        "blocks_per_entry": 1,
-        "flash_layout": False,
-    }
 
 
 @pytest.mark.parametrize(
@@ -1122,7 +1110,7 @@ def test_the_proposer_hands_a_pooled_draft_its_own_slots():
     """A draft with a declared pool gets the builder's slots, one per row."""
     from atom.spec_decode.draft_kv import DraftKvPoolSpec
 
-    seen = _compute_draft_kv(DraftKvPoolSpec(flash_layout=True, in_dcp_group=False), 5)
+    seen = _compute_draft_kv(DraftKvPoolSpec(), 5)
     assert seen["rows"] == 5
     assert seen["slots"].tolist() == [100, 101, 102, 103, 104]
 
@@ -1138,7 +1126,7 @@ def test_the_proposer_drops_padded_target_rows(pooled):
     the scheduled rows have positions; only those rows reach any draft."""
     from atom.spec_decode.draft_kv import DraftKvPoolSpec
 
-    spec = DraftKvPoolSpec(flash_layout=True, in_dcp_group=False) if pooled else None
+    spec = DraftKvPoolSpec() if pooled else None
     seen = _compute_draft_kv(spec, 9, n_rows=12)
     assert (seen["rows"], seen["pos"]) == (9, 9)
     if pooled:

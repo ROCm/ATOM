@@ -18,33 +18,26 @@ DRAFT_KV_ROWS = "draft_kv"
 @dataclass(frozen=True)
 class DraftKvPoolSpec:
     """The pool a draft declares of its own, as the draft class's
-    `kv_pool_spec`; None there is the generic SHUFFLE pool.
+    `kv_pool_spec`; None there is the generic SHUFFLE pool in the target's DCP
+    group.
 
-    One declaration for both facts because they are one: a draft outside the
-    target's DCP group stores every position a target block id covers, so its
-    entry is `block_size * dcp` tokens, and only the FLASH order reads an entry
-    that wide. The proposer's addressing and the pool's geometry both read it
-    from here, so they cannot disagree.
+    Declaring one is the whole fact: the draft sits outside the DCP group, so
+    every rank stores every position a target block id covers. An entry is
+    then `block_size * dcp` tokens, which only the FLASH order reads, and the
+    block is the scheduler's, the unit the target's block tables count in. The
+    proposer's addressing and the pool's geometry both key on the declaration,
+    so they cannot disagree.
     """
-
-    # `MhaKvPool.flash_layout`.
-    flash_layout: bool = False
-    # Whether the draft's KV is split across the target's DCP group.
-    in_dcp_group: bool = True
-
-    def __post_init__(self):
-        if not (self.in_dcp_group or self.flash_layout):
-            raise ValueError(
-                "a draft outside the DCP group addresses entries of "
-                "block_size * dcp tokens, which only a FLASH pool reads"
-            )
 
     def pool_kwargs(self, dcp: int) -> dict:
         """What `make_kv_pool` takes beyond the geometry."""
-        return {
-            "blocks_per_entry": 1 if self.in_dcp_group else dcp,
-            "flash_layout": self.flash_layout,
-        }
+        return {"blocks_per_entry": dcp, "flash_layout": True}
+
+    def block_size(self, model_runner) -> int:
+        """The block the pool is built at. The target's builder may page at a
+        kernel page instead (MLA's ATOM_MLA_PAGE_SIZE), which a block id does
+        not count in."""
+        return model_runner.block_size
 
 
 def block_page_idx(
@@ -111,15 +104,13 @@ def draft_kv_builder(model_runner, draft_hf, model):
     if not backend.DRAFT_OWNS_KV_POOL:
         return None
 
-    # A declared pool sits beside an MLA target, whose builder pages at
-    # ATOM_MLA_PAGE_SIZE (a kernel page, not a block id), so it takes the
-    # SCHEDULER's block, the unit the target's block tables count in.
     spec = getattr(model, "kv_pool_spec", None)
-    spec_kwargs = (
-        spec.pool_kwargs(model_runner.config.decode_context_parallel_size)
-        if spec is not None
-        else {}
-    )
+    if spec is None:
+        spec_kwargs, block_size = {}, None
+    else:
+        dcp = model_runner.config.decode_context_parallel_size
+        spec_kwargs = spec.pool_kwargs(dcp)
+        block_size = spec.block_size(model_runner)
     make_pool = partial(
         backend.make_kv_pool,
         draft_hf,
@@ -127,11 +118,7 @@ def draft_kv_builder(model_runner, draft_hf, model):
         kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
         **spec_kwargs,
     )
-    return DraftKvBuilder(
-        model_runner,
-        make_pool,
-        block_size=model_runner.block_size if spec is not None else None,
-    )
+    return DraftKvBuilder(model_runner, make_pool, block_size=block_size)
 
 
 class DraftKvBuilder(PoolRowsMixin):
@@ -283,10 +270,8 @@ class DraftKvBuilder(PoolRowsMixin):
         idx = self.pool_rows[DRAFT_KV_ROWS][module]
         if pool.flash_layout:
             k_cache, v_cache = pool.fa_views(idx)
-            # One per-tensor scale of 1.0: the pool declares no scale planes,
-            # and the only such draft's checkpoint ships no KV scales (all
-            # tensors BF16, no `quantization_config`), so 1.0 is the value both
-            # ends must agree on, as SGLang defaults it.
+            # A FLASH pool reads one per-tensor scale; with no KV scales in
+            # the checkpoint it is 1.0.
             if self._unit_scale is None:
                 self._unit_scale = torch.ones(
                     1, dtype=torch.float32, device=k_cache.device
