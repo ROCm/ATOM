@@ -15,6 +15,9 @@ from atom.models.kimi_k3.image_processing import (
     _format_k3_timestamp,
     _k3_video_chunks,
     build_kimi_k3_inputs,
+    check_kimi_k3_video_processor,
+    kimi_k3_max_grid_patches,
+    kimi_k3_vision_pass_patches,
 )
 from atom.multimodal import VideoData, processing
 from atom.multimodal.media.video import decode_video, sample_frame_indices
@@ -155,6 +158,10 @@ def test_video_reaches_only_builders_that_declare_it(monkeypatch):
 
 # A minimal stand-in for the K3 media processor module: 2x2 merged patches per
 # frame group and one <|media_pad|> per grid, enough to exercise the builder.
+def ensure_media_type(media, **kwargs):
+    return media
+
+
 def navit_resize_image(width, height, patch, merge, limit, one_side, fixed):
     return {"new_width": 4, "new_height": 4, "pad_width": 0, "pad_height": 0}
 
@@ -185,6 +192,16 @@ class _MediaProcessor:
         "patch_limit_on_one_side": 512,
         "fixed_output_tokens": None,
     }
+    _transparent_bg_config: ClassVar[dict] = {}
+    _transparent_bg_fill_stage = "after_resize"
+
+    @staticmethod
+    def make_image_prompt(width, height):
+        return "<|media_begin|>image<|media_content|><|media_pad|><|media_end|>"
+
+    @staticmethod
+    def preprocess(medias, return_tensors=None):
+        raise AssertionError("no images in these requests")
 
     @staticmethod
     def resize_image(image, width, height, pad_width, pad_height):
@@ -288,7 +305,7 @@ def test_vision_passes_are_bounded_and_match_one_pass(vision_passes):
 def test_vision_pass_rejects_patch_count_mismatch(vision_passes):
     with pytest.raises(ValueError):
         vision_passes.encode_media_in_passes(
-            None, None, torch.zeros(5, 3), torch.tensor([[1, 2, 2]])
+            None, None, torch.zeros(5, 3), torch.tensor([[1, 2, 2]]), None
         )
 
 
@@ -305,3 +322,98 @@ def test_video_time_embedding_follows_the_embedding_device_and_dtype(vision_pass
     out = embed(x, torch.tensor([[2, 4, 4]]))
     assert out.device.type == "meta" and out.dtype == torch.bfloat16
     assert embed.time_weight.device.type == "cpu"
+
+
+def _k3_config():
+    return SimpleNamespace(
+        multimodal_config=SimpleNamespace(
+            media_placeholder_token_id=PAD,
+            vision_config=SimpleNamespace(merge_kernel_size=[2, 2]),
+        )
+    )
+
+
+def _processor():
+    return SimpleNamespace(media_processor=_MediaProcessor(), tokenizer=_Tokenizer())
+
+
+def test_unbound_video_parts_take_the_videos_argument_in_order():
+    # Review: a caller passing media without binding it into the parts used to
+    # hit a KeyError; it now takes the items in order, and counts must match.
+    frames = np.zeros((4, 6, 6, 3), dtype=np.uint8)
+    video = VideoData(frames=frames, fps=8.0)
+    _, data = build_kimi_k3_inputs(
+        _k3_config(), _processor(), _video_request(), [], {}, videos=[video]
+    )
+    assert data["embedding_spans"] == ((2, 1),)
+    with pytest.raises(ValueError, match="1 video parts but 2 videos"):
+        build_kimi_k3_inputs(
+            _k3_config(), _processor(), _video_request(), [], {}, videos=[video, video]
+        )
+
+
+def test_processor_coupling_is_named_and_disables_video_only():
+    assert check_kimi_k3_video_processor(_processor()) == []
+    broken = _processor()
+    broken.media_processor = SimpleNamespace(media_proc_cfg=dict(CFG))
+    problems = check_kimi_k3_video_processor(broken)
+    assert "media_processor has no make_image_prompt" in problems
+    assert "processor module has no navit_patchify" in problems
+    assert "media_proc_cfg has no patch_size" in problems
+    video = VideoData(frames=np.zeros((4, 6, 6, 3), dtype=np.uint8), fps=8.0)
+    with pytest.raises(ValueError, match="video inputs are unavailable"):
+        build_kimi_k3_inputs(
+            _k3_config(), broken, _video_request(), [], {}, videos=[video]
+        )
+    assert build_kimi_k3_inputs.check_processor is check_kimi_k3_video_processor
+
+
+def test_pass_bound_comes_from_the_processor_config(tmp_path):
+    assert kimi_k3_max_grid_patches(CFG) == 65536
+    assert (
+        kimi_k3_max_grid_patches({**CFG, "in_patch_limit_each_frame": 32768}) == 131072
+    )
+    (tmp_path / "preprocessor_config.json").write_text(
+        '{"media_proc_cfg": {"in_patch_limit": 1024, '
+        '"in_patch_limit_each_frame": 512, "temporal_merge_kernel_size": 4}}'
+    )
+    assert kimi_k3_vision_pass_patches(str(tmp_path)) == 2048
+    assert kimi_k3_vision_pass_patches(str(tmp_path / "missing")) is None
+
+
+def test_grid_above_the_pass_bound_is_rejected_when_the_request_is_built():
+    processor = _processor()
+    processor.media_processor.media_proc_cfg = {
+        **_MediaProcessor.media_proc_cfg,
+        "in_patch_limit": 8,
+        "in_patch_limit_each_frame": 2,
+    }
+    video = VideoData(frames=np.zeros((4, 6, 6, 3), dtype=np.uint8), fps=8.0)
+    with pytest.raises(ValueError, match="exceeds the 8-patch vision pass"):
+        build_kimi_k3_inputs(
+            _k3_config(), processor, _video_request(), [], {}, videos=[video]
+        )
+
+
+def test_vision_pass_bound_is_checked_and_defaults_to_one_grid(vision_passes):
+    grids = torch.tensor([[1, 4, 6], [4, 4, 4]])
+    pixels = torch.randn(int(grids.prod(-1).sum()), 3)
+    with pytest.raises(ValueError, match="exceeds the 32-patch vision pass"):
+        vision_passes.encode_media_in_passes(
+            _per_grid_tower([]), lambda x: x, pixels, grids, 32
+        )
+    seen = []
+    vision_passes.encode_media_in_passes(
+        _per_grid_tower(seen), lambda x: x, pixels, grids, None
+    )
+    assert seen == [24, 64]
+
+
+def test_image_only_requests_keep_their_binding_errors():
+    conversation = [{"role": "user", "content": [{"type": "video"}]}]
+    with pytest.raises(ValueError, match="image/text parts"):
+        processing._bind_media_to_messages(conversation, [])
+    with pytest.raises(ValueError, match="0 image markers but 1 images"):
+        processing._bind_media_to_messages(
+            [{"role": "user", "content": [{"type": "text", "text": "q"}]}], ["i0"]
+        )

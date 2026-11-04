@@ -42,7 +42,8 @@ def _import_av():
         import av
     except ImportError as exc:  # pragma: no cover - depends on the install
         raise ValueError(
-            "Video inputs need PyAV; install it with `pip install av`"
+            "Video inputs need PyAV: `pip install av`, or install ATOM with "
+            "its vision extra (`pip install -e '.[vision]'`)"
         ) from exc
     return av
 

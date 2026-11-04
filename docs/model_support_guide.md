@@ -158,6 +158,16 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **Vision:** `atom/models/kimi_k3_vl.py` implements MoonViT3d — patch embed with a bilinearly resampled learnable position grid, 27 blocks with packed `wqkv` and complex 2D RoPE over non-causal varlen attention, then an `sd2_tpool` 2x2 merge and a `patchmergerv2` projector into the 7168-wide text space. Replicated per TP rank (~0.9 GB bf16), built only on the first pipeline rank.
 - **Image tokens:** The HF processor emits one `<|media_pad|>` per image and expands it inside the model. ATOM instead expands it during input processing (`build_kimi_k3_inputs` in `atom/models/kimi_k3/image_processing.py`, using the shared helper in `atom/multimodal/processing.py`) so the scheduler, KV blocks and positions see the true prompt length. It also returns each run as an `embedding_spans` entry, so image prefills chunk like text through `atom/model_engine/multimodal_runtime.py`.
 
+- **Video:** `video_url` parts are decoded with PyAV (`pip install -e ".[vision]"`), sampled and chunked by the processor config (`sample_fps`, `temporal_merge_kernel_size` frames per grid, `in_patch_limit_each_frame`, `in_patch_limit_video` per video) and rendered as timestamped grids beside images, one embedding span per grid. The tower encodes whole grids in passes of at most `kimi_k3_max_grid_patches(media_proc_cfg)` patches (65536 for the released config), so a long video never enters it at once; the input builder rejects any grid above that bound. The video path reuses private helpers of the remote-code processor; `check_kimi_k3_video_processor` names them, logs any mismatch when the processor loads, and turns it into a request error for video only.
+- **Media memory, worst case per media item** (released config; 7168-wide bf16 embeddings; fp32 pixels at 588 values per 14x14x3 patch):
+
+  | Item | Patches | Tokens | Cached embeddings per TP rank | Host pixels per rank |
+  |---|---|---|---|---|
+  | Image (`in_patch_limit`) | 65,536 | 16,384 | 224 MiB | 147 MiB |
+  | Video (`in_patch_limit_video`) | 655,360 | 40,960 | 560 MiB | 1.44 GiB |
+
+  Embeddings stay cached for the request's prefill; pixels stay on the host until every rank holds its embeddings. Neither is part of the KV budget, and the per-video cap does not bound the number of videos in one request. The vision tower's activations are bounded by one pass (one image's worth of patches).
+
 ### Kimi-K3.1 (`KimiK31ForConditionalGeneration`)
 
 - **Architecture:** Reuses the K3 backbone and multimodal wrapper, with a separate NoPE DSA indexer on each of the 24 MLA layers. Queries come from normalized q-lora activations; keys and head weights come from the layer's hidden states.

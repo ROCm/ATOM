@@ -53,7 +53,10 @@ from atom.model_engine.llm_engine import load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.segment_tokenizer import PrefixEncoding
 from atom.model_engine.sequence import new_token_ids
-from atom.multimodal.processing import prepare_multimodal_inputs
+from atom.multimodal.processing import (
+    check_multimodal_processor,
+    prepare_multimodal_inputs,
+)
 from atom.multimodal.registry import get_native_multimodal_processor
 from atom.observability.tracing import TraceMiddleware, set_request_id
 from atom.observability.tracing import initialize as initialize_tracing
@@ -738,6 +741,8 @@ def _get_multimodal_processor():
             # (MiniMax-M3.1) renders with the server's, --chat-template included.
             if processor.chat_template is None:
                 processor.chat_template = tokenizer.chat_template
+        for problem in check_multimodal_processor(_get_engine_config(), processor):
+            logger.warning(f"Multimodal processor check: {problem}")
     return processor
 
 

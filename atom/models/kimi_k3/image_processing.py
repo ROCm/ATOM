@@ -73,7 +73,7 @@ def build_kimi_k3_inputs(
 
     if videos:
         return _build_kimi_k3_visual_inputs(
-            multimodal_config, processor, messages, template_kwargs
+            multimodal_config, processor, messages, images, videos, template_kwargs
         )
 
     medias = [{"type": "image", "image": image} for image in images]
@@ -106,6 +106,102 @@ def build_kimi_k3_inputs(
 
 
 build_kimi_k3_inputs.supports_video = True
+
+
+def kimi_k3_max_grid_patches(cfg: dict) -> int:
+    """Largest patch grid the processor config admits, one vision pass's size.
+
+    An image grid is capped by ``in_patch_limit``; a video grid holds
+    ``temporal_merge_kernel_size`` frames of at most ``in_patch_limit_each_frame``
+    patches. For the released config both are 65536.
+    """
+    image = int(cfg["in_patch_limit"])
+    frame = int(cfg.get("in_patch_limit_each_frame") or image)
+    return max(image, int(cfg.get("temporal_merge_kernel_size", 1)) * frame)
+
+
+# The video path reuses the remote-code processor's image pipeline, including
+# module-level helpers and private attributes, so a checkpoint update can break
+# it without touching this file. ``check_kimi_k3_video_processor`` names exactly
+# what it relies on; it runs when the processor loads and before each video
+# request, and a mismatch disables video only.
+_K3_PROCESSOR_MODULE_SYMBOLS = (
+    "ensure_media_type",
+    "navit_resize_image",
+    "navit_patchify",
+    "normalize",
+    "_to_tensor",
+)
+_K3_MEDIA_PROCESSOR_ATTRS = (
+    "media_proc_cfg",
+    "make_image_prompt",
+    "preprocess",
+    "resize_image",
+    "_transparent_bg_config",
+    "_transparent_bg_fill_stage",
+)
+_K3_MEDIA_PROC_CFG_KEYS = (
+    "image_mean",
+    "image_std",
+    "patch_size",
+    "merge_kernel_size",
+    "patch_limit_on_one_side",
+    "fixed_output_tokens",
+    "in_patch_limit",
+)
+
+
+def kimi_k3_vision_pass_patches(model_path: str | None) -> int | None:
+    """Vision pass size from the checkpoint's processor config, if it has one."""
+    import json
+    import os
+
+    if not model_path:
+        return None
+    path = os.path.join(model_path, "preprocessor_config.json")
+    try:
+        with open(path, encoding="utf-8") as stream:
+            cfg = json.load(stream).get("media_proc_cfg") or {}
+        return kimi_k3_max_grid_patches(cfg)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _processor_module(media_processor):
+    import sys
+
+    return sys.modules.get(type(media_processor).__module__)
+
+
+def check_kimi_k3_video_processor(processor: Any) -> list[str]:
+    """Problems that keep the Kimi-K3 video path from this processor, if any."""
+    media_processor = getattr(processor, "media_processor", None)
+    if media_processor is None:
+        return ["processor has no media_processor"]
+    problems = [
+        f"media_processor has no {name}"
+        for name in _K3_MEDIA_PROCESSOR_ATTRS
+        if not hasattr(media_processor, name)
+    ]
+    module = _processor_module(media_processor)
+    problems += [
+        f"processor module has no {name}"
+        for name in _K3_PROCESSOR_MODULE_SYMBOLS
+        if module is None or not callable(getattr(module, name, None))
+    ]
+    cfg = getattr(media_processor, "media_proc_cfg", None)
+    if isinstance(cfg, dict):
+        problems += [
+            f"media_proc_cfg has no {key}"
+            for key in _K3_MEDIA_PROC_CFG_KEYS
+            if key not in cfg
+        ]
+    if not hasattr(getattr(processor, "tokenizer", None), "apply_chat_template"):
+        problems.append("processor tokenizer has no apply_chat_template")
+    return problems
+
+
+build_kimi_k3_inputs.check_processor = check_kimi_k3_video_processor
 
 
 def _format_k3_timestamp(seconds: float, mode: str) -> str:
@@ -171,7 +267,12 @@ def _k3_video_chunks(video, cfg: dict) -> list[tuple[str, "np.ndarray", int]]:
 
 
 def _build_kimi_k3_visual_inputs(
-    multimodal_config, processor: Any, messages: list[dict], template_kwargs: dict
+    multimodal_config,
+    processor: Any,
+    messages: list[dict],
+    images: list,
+    videos: list,
+    template_kwargs: dict,
 ) -> tuple[list[int], dict]:
     """Images and videos in one prompt, in source order.
 
@@ -180,16 +281,36 @@ def _build_kimi_k3_visual_inputs(
     chat encoder only knows image parts; each source item renders as one
     image part whose prompt is either the image prompt or the video's chunk
     prompts, and every grid ends in exactly one ``<|media_pad|>``.
-    """
-    import sys
 
+    Image and video parts take their bound value when the caller bound one,
+    otherwise the next item of ``images`` / ``videos``; the part counts must
+    match the lists either way.
+    """
     import numpy as np
     import torch
     from PIL import Image
 
+    problems = check_kimi_k3_video_processor(processor)
+    if problems:
+        raise ValueError(
+            "Kimi-K3 video inputs are unavailable with this processor: "
+            + "; ".join(problems)
+        )
     media_processor = processor.media_processor
-    utils = sys.modules[type(media_processor).__module__]
+    utils = _processor_module(media_processor)
     cfg = media_processor.media_proc_cfg
+    grid_limit = kimi_k3_max_grid_patches(cfg)
+    sources = {"image": iter(images), "video": iter(videos)}
+    counts = {"image": 0, "video": 0}
+
+    def source(part: dict, kind: str):
+        counts[kind] += 1
+        fallback = next(sources[kind], None)
+        value = part.get(kind, fallback)
+        if value is None:
+            raise ValueError(f"Kimi-K3 {kind} part {counts[kind]} has no {kind}")
+        return value
+
     mean = np.array(cfg["image_mean"])
     std_inv = 1.0 / np.array(cfg["image_std"])
 
@@ -206,7 +327,7 @@ def _build_kimi_k3_visual_inputs(
         for part in content:
             if part["type"] == "image":
                 media = utils.ensure_media_type(
-                    {"type": "image", "image": part["image"]},
+                    {"type": "image", "image": source(part, "image")},
                     transparent_bg_config=media_processor._transparent_bg_config,
                     transparent_bg_fill_stage=media_processor._transparent_bg_fill_stage,
                 )
@@ -218,7 +339,9 @@ def _build_kimi_k3_visual_inputs(
                 parts.append({"type": "image", "image": media["image"]})
             elif part["type"] == "video":
                 chunk_prompts = []
-                for stamp, frames, limit in _k3_video_chunks(part["video"], cfg):
+                for stamp, frames, limit in _k3_video_chunks(
+                    source(part, "video"), cfg
+                ):
                     height, width = frames.shape[1:3]
                     resize = utils.navit_resize_image(
                         width,
@@ -260,6 +383,18 @@ def _build_kimi_k3_visual_inputs(
                 parts.append(part)
         rendered.append({**message, "content": parts})
 
+    for kind, values in (("image", images), ("video", videos)):
+        if counts[kind] != len(values):
+            raise ValueError(
+                f"Conversation has {counts[kind]} {kind} parts but "
+                f"{len(values)} {kind}s"
+            )
+    for t, h, w in torch.cat(grids).tolist():
+        if t * h * w > grid_limit:
+            raise ValueError(
+                f"Kimi-K3 media grid of {t * h * w} patches exceeds the "
+                f"{grid_limit}-patch vision pass from the processor config"
+            )
     text_inputs = processor.tokenizer.apply_chat_template(
         rendered,
         tokenize=True,

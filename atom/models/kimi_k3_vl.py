@@ -490,17 +490,12 @@ class KimiK3VisionTower(nn.Module):
         return tpool_patch_merge(hidden_states, grid_thws, self.merge_kernel_size)
 
 
-# One full-size image (``in_patch_limit``) already passes the tower at once;
-# a video's grids are encoded in passes of at most this many patches.
-VISION_PATCHES_PER_PASS = 65536
-
-
 def encode_media_in_passes(
     vision_tower: nn.Module,
     mm_projector: nn.Module,
     pixel_values: torch.Tensor,
     grid_thws: torch.Tensor,
-    max_patches: int = VISION_PATCHES_PER_PASS,
+    max_patches: int | None,
 ) -> torch.Tensor:
     """Vision embeddings for ``grid_thws``, bounding activation memory per pass.
 
@@ -515,6 +510,15 @@ def encode_media_in_passes(
         raise ValueError(
             f"pixel_values has {pixel_values.shape[0]} patches but the grids "
             f"describe {sum(sizes)}"
+        )
+    if max_patches is None:
+        # No processor config to size passes from: one grid per pass is still
+        # bounded by the largest grid the processor admits.
+        max_patches = max(sizes)
+    if max(sizes) > max_patches:
+        raise ValueError(
+            f"a media grid of {max(sizes)} patches exceeds the {max_patches}-patch "
+            "vision pass; the processor config must cap each grid at one pass"
         )
     if sum(sizes) <= max_patches:
         return mm_projector(vision_tower(pixel_values, grid_thws))

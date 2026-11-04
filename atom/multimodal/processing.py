@@ -52,39 +52,6 @@ def expand_media_placeholders(
     return expanded, tuple(spans)
 
 
-def _bind_images_to_messages(
-    conversation: list[dict[str, Any]], images: list
-) -> list[dict[str, Any]]:
-    """Bind the nth image marker to the nth image across all chat turns."""
-    messages = []
-    image_index = 0
-    for message in conversation:
-        content = message.get("content")
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if part["type"] == "image":
-                    if image_index >= len(images):
-                        raise ValueError(
-                            "Conversation has more image markers than images"
-                        )
-                    part = {**part, "image": images[image_index]}
-                    image_index += 1
-                elif part["type"] != "text":
-                    raise ValueError(
-                        "Expected a normalized conversation with image/text parts"
-                    )
-                parts.append(dict(part))
-            content = parts
-        # Retain the native processors' handling of assistant/tool messages.
-        messages.append({**message, "content": "" if content is None else content})
-    if image_index != len(images):
-        raise ValueError(
-            f"Conversation has {image_index} image markers but {len(images)} images"
-        )
-    return messages
-
-
 def prepare_multimodal_inputs(
     atom_config: Config,
     processor: Any,
@@ -136,7 +103,7 @@ def prepare_multimodal_inputs(
     media = load_multimodal_data(media_items, loader)
     images = media["image"]
     if not isinstance(prompt, str):
-        prompt = _bind_images_to_messages(prompt, images)
+        prompt = _bind_media_to_messages(prompt, images)
     return builder(
         atom_config,
         processor,
@@ -160,11 +127,12 @@ def _encoded_video(item: Any, loader: MediaLoader) -> Any:
 
 
 def _bind_media_to_messages(
-    conversation: list[dict[str, Any]], images: list, videos: list
+    conversation: list[dict[str, Any]], images: list, videos: list = ()
 ) -> list[dict[str, Any]]:
-    """Bind image and video markers to their items, in encounter order."""
+    """Bind the nth image (and video) marker to the nth item, across all turns."""
     items = {"image": list(images), "video": list(videos)}
     used = {"image": 0, "video": 0}
+    allowed = "image/video/text" if videos else "image/text"
     messages = []
     for message in conversation:
         content = message.get("content")
@@ -172,7 +140,7 @@ def _bind_media_to_messages(
             parts = []
             for part in content:
                 kind = part["type"]
-                if kind in items:
+                if kind == "image" or (kind == "video" and videos):
                     if used[kind] >= len(items[kind]):
                         raise ValueError(
                             f"Conversation has more {kind} markers than {kind}s"
@@ -181,10 +149,11 @@ def _bind_media_to_messages(
                     used[kind] += 1
                 elif kind != "text":
                     raise ValueError(
-                        "Expected a normalized conversation with image/video/text parts"
+                        f"Expected a normalized conversation with {allowed} parts"
                     )
                 parts.append(dict(part))
             content = parts
+        # Retain the native processors' handling of assistant/tool messages.
         messages.append({**message, "content": "" if content is None else content})
     for kind, values in items.items():
         if used[kind] != len(values):
@@ -192,3 +161,15 @@ def _bind_media_to_messages(
                 f"Conversation has {used[kind]} {kind} markers but {len(values)} {kind}s"
             )
     return messages
+
+
+def check_multimodal_processor(atom_config: Config, processor: Any) -> list[str]:
+    """Load-time check of a builder's processor coupling; returns the problems.
+
+    Builders that reach past the processor's public call (Kimi-K3 video) declare
+    ``check_processor``. Problems only disable that path: its requests fail with
+    a ValueError naming them, and the rest of multimodal serving is unaffected.
+    """
+    builder = get_multimodal_input_builder(atom_config)
+    check = getattr(builder, "check_processor", None)
+    return list(check(processor)) if check is not None else []

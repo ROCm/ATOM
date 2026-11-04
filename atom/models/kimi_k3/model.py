@@ -2077,6 +2077,13 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         from atom.models.kimi_k3_vl import build_vision_modules
 
         self.vision_tower, self.mm_projector = build_vision_modules(vision_config)
+        from atom.models.kimi_k3.image_processing import kimi_k3_vision_pass_patches
+
+        # Sized from the same processor config the input builder enforces, so
+        # every grid fits one pass; None encodes one grid per pass.
+        self.vision_pass_patches = kimi_k3_vision_pass_patches(
+            getattr(atom_config, "model", None)
+        )
         self.media_placeholder_token_id = getattr(
             atom_config.multimodal_config, "media_placeholder_token_id", 163605
         )
@@ -2095,7 +2102,11 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
         from atom.models.kimi_k3_vl import encode_media_in_passes
 
         return encode_media_in_passes(
-            self.vision_tower, self.mm_projector, pixel_values, grid_thw
+            self.vision_tower,
+            self.mm_projector,
+            pixel_values,
+            grid_thw,
+            self.vision_pass_patches,
         )
 
     def merge_multimodal_embeddings(
