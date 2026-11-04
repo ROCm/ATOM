@@ -684,7 +684,10 @@ def weight_is_stored_preshuffled(
     preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by default),
     always on gfx1250, whose only group32 GEMM is AITER's preshuffled FlyDSL
     one (it reads the 32x32 scales as stored), and always under
-    ``needs_preshuffled_weight`` (V4.1's grouped ``wo_a``).
+    ``needs_preshuffled_weight`` (V4.1's grouped ``wo_a``). A 1x32 (MXFP8) one
+    only when its module asks through ``needs_preshuffled_weight`` (the
+    MiniMax-M3.1 DSpark draft, whose shapes AITER's preshuffled group32 GEMM
+    runs), on gfx950 under the same switch; any other stays row-major.
 
     Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
     conv1d expands its weight to 3D and must stay row-major -- so the caller
@@ -704,13 +707,21 @@ def weight_is_stored_preshuffled(
     side backwards.
     """
     if native_group_rows is not None:
-        if native_group_rows != 32 or params_dtype != dtypes.fp8:
+        if native_group_rows not in (1, 32) or params_dtype != dtypes.fp8:
             return False
-        if needs_preshuffled_weight:
-            return True
         from aiter.jit.utils.chip_info import get_gfx
 
         gfx = get_gfx()
+        if native_group_rows == 1:
+            # MXFP8 (1x32): only a module that asks (the MiniMax-M3.1 DSpark
+            # draft), on gfx950, where AITER's preshuffled group32 GEMM runs it.
+            return bool(
+                needs_preshuffled_weight
+                and envs.ATOM_GROUP32_WEIGHT_PRESHUFFLE
+                and gfx == "gfx950"
+            )
+        if needs_preshuffled_weight:
+            return True
         return gfx == "gfx1250" or (
             envs.ATOM_GROUP32_WEIGHT_PRESHUFFLE and gfx == "gfx950"
         )

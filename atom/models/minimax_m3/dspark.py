@@ -478,6 +478,19 @@ class MiniMaxM3DSpark(DSparkDraftModel):
                 for i in range(config.num_hidden_layers)
             ]
         )
+        # MXFP8 linears: AITER's preshuffled group32 GEMM (gfx950) is ~2.5x the
+        # Triton group32 one at these shapes and bit-identical; the loader
+        # preshuffles them where it runs (weight_is_stored_preshuffled).
+        if quant_config.quant_method:
+            for layer in self.layers:
+                attn, mlp = layer.self_attn, layer.mlp
+                for proj in (
+                    attn.qkv_proj,
+                    attn.o_proj,
+                    mlp.gate_up_proj,
+                    mlp.down_proj,
+                ):
+                    proj.needs_preshuffled_weight = True
         self.final_norm = GemmaRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.markov_head = DSparkMarkovHead(self.vocab_size, self.markov_rank)
         # 0 or absent: every block row attends the whole context.
