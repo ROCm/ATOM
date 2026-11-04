@@ -141,10 +141,6 @@ from atom.utils.tbo import (
 
 logger = logging.getLogger("atom")
 
-# Device fraction held back from the KV cache under mixed prefill+decode
-# (`ModelRunner._kv_budget_extra_reserve`): 14.4 GiB on a 288 GiB MI355X.
-MIXED_KV_RESERVE_FRACTION = 0.05
-
 
 def max_schedulable_decode_bs(
     max_num_seqs: int, max_num_batched_tokens: int, full_q_len: int
@@ -1056,23 +1052,12 @@ class ModelRunner:
         logger.info(f"Model warmup done: {self.config.model}")
 
     def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
-        """Extra GPU bytes to hold back from the KV cache budget beyond the
-        base overhead. Override point for setups that share the GPU with
-        another process; overrides add to this, not replace it.
+        """Override point for processes sharing the GPU (e.g. RapidServe).
 
-        Mixed prefill+decode holds back `MIXED_KV_RESERVE_FRACTION` of the
-        device (5%). The budget is sized from one profiled pure-prefill step
-        that runs before the KV cache exists, so it cannot exercise a mixed
-        step's decode rows; on DeepSeek-V4-Pro tp8 with DSpark, the real steps
-        needed ~16 GiB more than it planned (activation peaks 1.5x the
-        profile, ~8 GiB of allocator fragmentation, ~4 GiB of growth outside
-        the allocator). Without it c=1024 OOMed and c=512 stalled with the
-        device at ~0 GiB free; at 5% both ran clean, at no-mixed throughput,
-        with the KV cache at 7% used.
+        Mixed workspace is measured with real attention in get_num_blocks,
+        rather than reserving a fixed percentage of the device.
         """
-        if not getattr(self.config, "enable_mixed_prefill_decode", False):
-            return 0
-        return int(total_bytes * MIXED_KV_RESERVE_FRACTION)
+        return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
         # Calculate local device rank considering DP, PP and PCP.
@@ -1826,7 +1811,10 @@ class ModelRunner:
         """
         if self.config.enforce_eager:
             return 0
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        peak = max(
+            torch.cuda.memory_stats()["allocated_bytes.all.peak"],
+            getattr(self, "_mixed_profile_peak_torch", 0),
+        )
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         activation_bytes = max(peak - current, 0)
 
@@ -1926,13 +1914,19 @@ class ModelRunner:
             hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
 
         free, total = torch.cuda.mem_get_info()
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        peak = max(
+            torch.cuda.memory_stats()["allocated_bytes.all.peak"],
+            getattr(self, "_mixed_profile_peak_torch", 0),
+        )
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         # weights + peak activation tensors (PyTorch allocator high-water).
         peak_torch = max(peak, current)
         # RCCL/NCCL buffers etc. held outside the allocator: device-used minus
         # torch-reserved. Ignoring it over-allocates KV and OOMs at runtime.
-        non_torch = max((total - free) - torch.cuda.memory_reserved(), 0)
+        non_torch = max(
+            (total - free) - torch.cuda.memory_reserved(),
+            getattr(self, "_mixed_profile_non_torch", 0),
+        )
 
         cudagraph_overhead = self._estimate_cudagraph_overhead()
         safety_margin = int(total * 0.02)
@@ -2178,6 +2172,17 @@ class ModelRunner:
             f"safety={safety_margin / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB)"
         )
+        if config.enable_mixed_prefill_decode and not hasattr(
+            self, "_mixed_profile_peak_torch"
+        ):
+            from atom.model_engine.mixed_profile import profile_mixed_memory
+
+            # The first plan supplies pool geometry only. Profile with a small
+            # temporary backing, release it, then size the serving pool from
+            # the measured eager workspace. No requests or graphs exist yet.
+            self._mixed_profile_peak_torch = profile_mixed_memory(self)
+            return self.get_num_blocks()
+
         # get_num_blocks runs in the RUNNER subprocess, so nothing it writes
         # to `config` is visible to the engine process that builds
         # BlockManager. Ship the whole per-class entry table across instead of

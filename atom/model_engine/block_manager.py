@@ -136,6 +136,7 @@ class AdmissionProbe:
     num_cached_blocks: int = -1
     block_hashes: list[int] = field(default_factory=list)
     num_new_blocks: int | None = None
+    reserved_decode_blocks: int = 0
 
 
 # Evicted or remapped hashes kept for `_CachedWalk` revalidation; a memo
@@ -1218,9 +1219,12 @@ class BlockManager:
             block_hashes.clear()
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
+        reserved = probe.reserved_decode_blocks if probe is not None else 0
         if not self.enable_prefix_caching:
             if not self._has_page_units(
-                self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq))
+                self.num_pool_blocks(len(seq))
+                + self.draft_lookahead_blocks(len(seq))
+                + reserved
             ):
                 return -1
             return 0
@@ -1281,7 +1285,7 @@ class BlockManager:
             protected_hash=protected_hash,
         )
         self._record_checkpoint_end(seq)
-        if not self._has_page_units(num_new_blocks, protected_hash):
+        if not self._has_page_units(num_new_blocks + reserved, protected_hash):
             return -1
         # `record_allocation` re-checks a joint against this demand instead of
         # walking the hit again.
@@ -1356,7 +1360,9 @@ class BlockManager:
         if not decision.state_from_hbm and extra == 0:
             return decision
         protected = decision.boundary_hash if decision.state_from_hbm else None
-        if self._has_page_units(num_new_blocks + extra, protected):
+        if self._has_page_units(
+            num_new_blocks + extra + probe.reserved_decode_blocks, protected
+        ):
             return decision
         reason = (
             "partial_chunk_no_room"
@@ -3494,13 +3500,21 @@ class BlockManager:
         (`mtp_k - 1`), so the lookahead never raises the bar there; it is
         passed so the check states what it covers.
         """
+        return self._has_page_units(
+            self.append_blocks_needed(seq, num_new_tokens, lookahead)
+        )
+
+    def append_blocks_needed(
+        self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0
+    ) -> int:
+        """Free pages needed by the decode admission check, before allocating."""
         seq_len = len(seq)
         current_blocks = len(seq.block_table)
         ebs = self._effective_block_size()
         reach = seq_len + max(num_new_tokens, lookahead)
         needed_blocks = (reach + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
-        return self._has_page_units(new_blocks_needed)
+        return new_blocks_needed
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0):
         """Allocate every block this step's KV writes land in.

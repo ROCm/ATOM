@@ -415,22 +415,6 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     num_decode_seqs: int = 0
 
 
-class MixedViewUnslicedField(RuntimeError):
-    """A per-row field was read off a mixed view that never sliced it.
-
-    Deliberately NOT an AttributeError. `getattr(obj, name, default)` swallows
-    only that type, and real consumers do exactly that --
-    `_state_slot_in_np` reads `getattr(batch, "state_fork_srcs", None)` and
-    `gdn_attn` reads two more the same way. An AttributeError guard is
-    therefore SILENT on precisely the reads it exists to catch: the field
-    reads back as absent, the row takes its default, and a forked row ends up
-    with `state_slot_in == state_slot_out`.
-
-    That is the same failure shape the guard was written for -- a rename going
-    quiet instead of loud -- reintroduced by the guard's own exception type.
-    """
-
-
 def _mixed_carrier_spans(
     prefill_meta,
     decode_meta,
@@ -489,6 +473,11 @@ def _mixed_carrier(
     batch and `_build_ubatch_mixed_metadata` for the straddling ubatch, and a
     field added to one and not the other is what a second copy invites.
     """
+    if (
+        prefill_meta.state is AttnState.DECODE
+        or decode_meta.state is not AttnState.DECODE
+    ):
+        raise ValueError("mixed attention requires prefill then decode metadata")
     cu_seqlens_q, state_slot_out = _mixed_carrier_spans(
         prefill_meta, decode_meta, n_p_seqs, n_d_seqs, n_p_tokens, running_bs
     )
@@ -512,169 +501,23 @@ def _mixed_carrier(
     merged.num_prefill_seqs = n_p_seqs
     merged.num_decode_tokens = n_d_tokens
     merged.num_decode_seqs = n_d_seqs
+    # One QK-norm/RoPE launch for the whole batch. Negative row IDs mask
+    # prefill's SWA stores: its prefix must survive until prefill attention
+    # finishes. Decode stores remain fused, including in the mixed TBO tail.
+    if decode_meta.swa_dest_rows is not None:
+        merged.batch_id_per_q_token = torch.cat(
+            [
+                torch.full(
+                    (n_p_tokens,), -1, dtype=torch.int32, device=cu_seqlens_q.device
+                ),
+                decode_meta.batch_id_per_q_token[:n_d_tokens],
+            ]
+        )
+        merged.swa_dest_rows = {
+            ratio: torch.cat([rows.new_zeros(n_p_tokens), rows[:n_d_tokens]])
+            for ratio, rows in decode_meta.swa_dest_rows.items()
+        }
     return merged
-
-
-def _decode_rows(batch: ScheduledBatch, name: str, n_prefill_seqs: int):
-    """`batch.<name>[n_prefill_seqs:]`, refusing a list that is not one per row."""
-    rows = getattr(batch, name, None)
-    if rows is None:
-        return None
-    if len(rows) != batch.total_seqs_num:
-        raise MixedViewUnslicedField(
-            f"{name} has {len(rows)} entries for {batch.total_seqs_num} rows, so "
-            "slicing off the prefill rows by position would misalign every "
-            "decode row's pages"
-        )
-    return rows[n_prefill_seqs:]
-
-
-class _MixedDecodeView:
-    """Thin read-only view exposing the DECODE rows ``[n_prefill:]`` of a mixed
-    batch as if they were a standalone decode batch, so the unmodified
-    `prepare_decode` builds decode metadata for them.
-
-    It exposes exactly the fields `prepare_decode` and its helpers read: per-row
-    arrays (`context_lens`, `block_tables`, `state_slots_committed`, ...) sliced
-    to drop the leading prefill rows, and counts reporting the decode totals.
-    Reading any other field raises (`__getattr__`).
-    """
-
-    def __init__(self, batch: ScheduledBatch, n_prefill_seqs: int):
-        self._batch = batch
-        self._np = n_prefill_seqs
-        self.context_lens = batch.context_lens[n_prefill_seqs:]
-        # `ScheduledBatch` builds block_tables from non-empty tables only,
-        # so one entry per row is a precondition, not a given: a row with
-        # an empty table (a preempted prefill, say) would hand every decode row
-        # its neighbour's pages. Checked before the positional slice.
-        self.block_tables = _decode_rows(batch, "block_tables", n_prefill_seqs)
-        # `per_req_cache_groups` became `state_slots_committed`. Slice the field
-        # the CONSUMERS read: `_attach_v4_paged_decode_meta` and its DSpark twin
-        # both do `batch.state_slots_committed[:scheduled_bs]`. Slicing anything
-        # else leaves this one to fall through `__getattr__` to the unsliced
-        # batch, where `[:scheduled_bs]` takes the FIRST n_decode entries -- the
-        # PREFILL rows' slots. That is silent: no error, output norms stay
-        # sensible, and the damage grows with the decode row count (n_d=1 looked
-        # fine at 0.95 while the full run sat at 0.81).
-        #
-        # The check below is NOT "this field is one entry per row" -- it is
-        # not. `state_slots_committed` is built from a FILTERED subset
-        # (`scheduler.py`: `has_per_req_cache and state_slot >= 0`), so it is
-        # one entry per row only when that filter happens to drop nothing.
-        #
-        # But every positional consumer already assumes it did:
-        # `_attach_v4_paged_decode_meta` and its DSpark twin both do
-        # `state_slots_committed[:scheduled_bs]` and read the result as
-        # row-aligned. So "the filter was a no-op for this batch" is the shared
-        # precondition of all of them AND of the slice below -- checked here,
-        # where the two lengths are still in hand.
-        #
-        # A `raise`, not an `assert`: under `python -O` an assert is stripped,
-        # and what it was standing in front of is a silent positional
-        # misalignment of every decode row's state slot -- the exact failure
-        # mode (plausible norms, no exception, damage scaling with decode rows)
-        # this whole view exists to prevent.
-        _slots = batch.state_slots_committed
-        if len(_slots) != batch.total_seqs_num:
-            raise MixedViewUnslicedField(
-                f"state_slots_committed has {len(_slots)} entries for "
-                f"{batch.total_seqs_num} rows: the scheduler's "
-                "`has_per_req_cache and state_slot >= 0` filter dropped "
-                f"{batch.total_seqs_num - len(_slots)} row(s), so neither the "
-                "decode slice here nor the `[:scheduled_bs]` reads downstream "
-                "are row-aligned any more. Both need the slots gathered per "
-                "row rather than positionally."
-            )
-        self.state_slots_committed = _slots[n_prefill_seqs:]
-        # Same list, same filter (`scheduler.py` builds both off `state_seqs`),
-        # so the same slice -- and the same precondition, checked just above.
-        #
-        # MISSED until the guard below stopped being swallowable: its only
-        # consumer reads it as `getattr(batch, "state_fork_srcs", None)`, so
-        # while the guard raised AttributeError the field read back as absent
-        # and `_state_slot_in_np` took its early return. Every forked row in a
-        # mixed batch then got `state_slot_in == state_slot_out` -- reading its
-        # own half-written state instead of the parent's, silently.
-        _srcs = getattr(batch, "state_fork_srcs", None)
-        self.state_fork_srcs = _srcs[n_prefill_seqs:] if _srcs is not None else _srcs
-        # Per-row arrays the decode consumers index by the DECODE row count.
-        # `decode_spans` (backends.py) reads the view's decode-only lengths,
-        # so an unsliced array hands it the
-        # PREFILL rows' token counts -- and pairs them with a cu_seqlens built
-        # from the real batch, which is how a length vector and its cumsum come
-        # to disagree. Found by the __getattr__ guard, not by the static scan:
-        # that scan only read this file and the consumer is a file over.
-        # Written out one by one rather than in a loop so the static scan --
-        # which looks for `self.<name> =` -- can see them.
-        _nst = getattr(batch, "num_scheduled_tokens", None)
-        self.num_scheduled_tokens = _nst[n_prefill_seqs:] if _nst is not None else _nst
-        _nct = getattr(batch, "num_cached_tokens", None)
-        self.num_cached_tokens = _nct[n_prefill_seqs:] if _nct is not None else _nct
-        _lbn = getattr(batch, "last_block_num_tokens", None)
-        self.last_block_num_tokens = _lbn[n_prefill_seqs:] if _lbn is not None else _lbn
-        # Speculative-decode per-row fields. No current consumer on the decode
-        # half reads them, but a view either slices a per-row field or raises
-        # on it, and these carry the decode rows' drafts and verify outcome.
-        _ssd = getattr(batch, "scheduled_spec_decode_tokens", None)
-        self.scheduled_spec_decode_tokens = (
-            _ssd[n_prefill_seqs:] if _ssd is not None else _ssd
-        )
-        _nrj = getattr(batch, "num_rejected", None)
-        self.num_rejected = _nrj[n_prefill_seqs:] if _nrj is not None else _nrj
-        _nbn = getattr(batch, "num_bonus", None)
-        self.num_bonus = _nbn[n_prefill_seqs:] if _nbn is not None else _nbn
-        # A TOKEN-axis array, so the per-row length guard in `__getattr__` does
-        # not recognise it and would pass the whole batch's ids through.
-        _stk = getattr(batch, "scheduled_tokens", None)
-        self.scheduled_tokens = (
-            _stk[batch.total_tokens_num_prefill :] if _stk is not None else _stk
-        )
-        # Where the decode rows start in the full batch. For per-row arrays
-        # that live OFF the batch and so cannot be sliced here -- the runner's
-        # `tokenID_processor.num_rejected`, which `prepare_decode` reads.
-        self.row_offset = n_prefill_seqs
-        self.total_seqs_num_decode = batch.total_seqs_num_decode
-        self.total_tokens_num_decode = batch.total_tokens_num_decode
-        self.total_seqs_num_prefill = 0
-        self.total_tokens_num_prefill = 0
-        self.is_dummy_run = batch.is_dummy_run
-        self.num_spec_step = batch.num_spec_step
-
-    # Fields the decode builders may read off the WHOLE batch unchanged: ones
-    # that mean the same for the decode rows as for the batch. Empty, because
-    # every field `prepare_decode` and its helpers read is set in `__init__`.
-    _PASSES_THROUGH: frozenset[str] = frozenset()
-
-    def __getattr__(self, name):
-        # Reached only for a name `__init__` did not set. Nothing falls through
-        # by default.
-        #
-        # A permissive fallthrough is what turned a field rename into a silent
-        # 13-point GSM8K loss: `per_req_cache_groups` became
-        # `state_slots_committed`, this view kept slicing the old name, and the
-        # consumer's `batch.<field>[:scheduled_bs]` quietly took the FIRST
-        # n_decode rows of the whole batch -- the prefill rows' slots.
-        #
-        # Deciding "per-row" by length (as long as the batch) is not enough
-        # either: a FILTERED per-row list (`state_slots`, `state_save_all`), a
-        # dict keyed by whole-batch row (`replaying`) and a batch scalar that
-        # is wrong for the decode half (`total_seqs_num`, `is_mixed`) all pass
-        # that test and would mislead a decode reader silently. So a new read
-        # must say what it is: set it in `__init__` (sliced to the decode rows
-        # if it is per-row) or list it in `_PASSES_THROUGH`.
-        if name.startswith("_"):
-            # Never route the view's own internals through this check --
-            # `self._batch` would recurse before __init__ has bound it.
-            raise AttributeError(name)
-        if name in self._PASSES_THROUGH:
-            return getattr(self._batch, name)
-        raise MixedViewUnslicedField(
-            f"_MixedDecodeView does not expose `{name}`. Set it in __init__ -- "
-            "sliced to the decode rows if it holds one entry per row -- or add "
-            "it to _PASSES_THROUGH if it means the same for the decode rows as "
-            "for the whole batch. A rename upstream looks exactly like this."
-        )
 
 
 class DeepseekV4Backend(AttentionBackend):
@@ -712,7 +555,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # rebuilds need their own input, state, indexer and plan groups, but never
     # the decode-only destination/attention buffers or sampling/input-id groups.
     mixed_prefill_groups = (
-        CommonAttentionBuilder.mixed_prefill_groups
+        frozenset(("early", "prefill", "positions"))
         | frozenset(
             f"{prefix}{group}"
             for prefix in ("", "ub0_", "ub1_")
@@ -1741,6 +1584,64 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ]
         return [(runner.v4_csa_idx_kv, "dsv4.csa_indexer")]
 
+    @contextmanager
+    def temporary_profile_cache(self, blocks: int):
+        """Bind scratch KV before sizing the serving pool; no graph uses it."""
+        runner = self.model_runner
+        old_plan = runner.pool_plan
+        old_geometry, old_blocks = self.pool_geometry, self.num_blocks
+        missing = object()
+        saved_runner = {}
+        saved_modules = []
+        try:
+            runner.pool_plan = old_plan.with_paged_entries(blocks)
+            pools = self.allocate_kv_cache_tensors(blocks=blocks, buf=None)
+            for name, value in pools.items():
+                saved_runner[name] = getattr(runner, name, missing)
+                setattr(runner, name, value)
+            pools = self.allocate_per_req_cache(runner.pool_plan.entries)
+            for name, value in pools.items():
+                saved_runner[name] = getattr(runner, name, missing)
+                setattr(runner, name, value)
+            del pools, value
+            self.warmup_per_req_cache()
+            models = [runner.model]
+            if hasattr(runner, "drafter"):
+                models.append(runner.drafter.model)
+            for model in models:
+                for module in model.modules():
+                    before = dict(module.__dict__)
+                    # Assigning an existing registered buffer changes the
+                    # _buffers mapping, not module.__dict__. Keep both axes
+                    # so no warmup placeholder retains the temporary pool.
+                    buffers = dict(module._buffers)
+                    self.build_kv_cache_tensor(module)
+                    changes = {
+                        name: before.get(name, missing)
+                        for name, value in module.__dict__.items()
+                        if value is not before.get(name, missing)
+                    }
+                    saved_modules.append((module, changes, buffers))
+            yield
+        finally:
+            torch.cuda.synchronize()
+            for module, changes, buffers in reversed(saved_modules):
+                for name, value in changes.items():
+                    if value is missing:
+                        delattr(module, name)
+                    else:
+                        setattr(module, name, value)
+                module._buffers.clear()
+                module._buffers.update(buffers)
+            self._invalidate_pool_caches()
+            for name, value in saved_runner.items():
+                if value is missing:
+                    delattr(runner, name)
+                else:
+                    setattr(runner, name, value)
+            self.pool_geometry, self.num_blocks = old_geometry, old_blocks
+            runner.pool_plan = old_plan
+
     def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict[str, torch.Tensor]:
         """Allocate KV pools that depend only on `num_blocks`.
 
@@ -2752,6 +2653,165 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         #   - v4 indexer meta (Indexer — only present when ratio == 4)
         return {}
 
+    def _get_mixed_prefill_bank(self):
+        """Private publication slot for the prefill half of a mixed batch.
+
+        A mixed batch is built as ``[prefill | decode]`` by running the
+        unmodified `prepare_prefill` then the decode builder, both of which
+        stage through the SAME named `forward_vars` buffers. Sharing them would
+        have decode's staging overwrite the prefill segment's GPU tensors and
+        race its in-flight pinned sources (the large-ISL OOB of `ab55dfb6`).
+
+        Instead the prefill half runs against clones of the publication groups
+        it writes, plus the ungrouped token-to-request map. Decode-only and
+        token-input buffers stay shared and keep their original bindings: the
+        prefill half must not stage into them. Backends declare any extra
+        prefill groups in `mixed_prefill_groups`, including TBO rebuild groups.
+
+        The clones are BOUND to a publication owner and groups of their own,
+        built exactly as the runner builds a ring slot's. Swapping
+        `forward_vars` alone is not enough: the prefill producers publish
+        through `h2d_groups` and `acquire_write` on each buffer's binding, and
+        the runner's groups bind the real buffers -- they would upload the real
+        (stale) sources while the metadata viewed the bank's never-uploaded
+        GPU side.
+
+        Built for every `forward_vars` ring slot by `build_mixed_prefill_banks`,
+        which the runner calls before warmup's memory profile, so the KV budget
+        counts them; a run without mixed batching builds none. A slot's bank is
+        reused only when the slot is, which the runner's own owner already
+        gates on the slot's previous forward.
+
+        So the bank's own completion event covers only its uploads, and needs
+        no more. Its GPU side is ordered by stream: uploads publish on the
+        owner's compute stream, the forward that reads them runs there too
+        (TBO rejoins its comm stream before returning), so the next step's
+        upload queues behind the previous step's reads. With a PP ring, the
+        slot owner's `begin()` -- which runs before `prepare_mixed` touches the
+        bank -- has already waited for the slot's previous forward to finish.
+
+        Returns ``(forward_vars, owner, groups)``; the last two are None for a
+        runner without a publication registry.
+        """
+        banks = getattr(self, "_mixed_prefill_banks", None)
+        if banks is None:
+            # Building here would allocate mid-serve, after the KV cache took
+            # the memory the profile left.
+            raise RuntimeError(
+                "mixed prefill banks were not built: the runner calls "
+                "build_mixed_prefill_banks() before warmup when "
+                "--enable-mixed-prefill-decode is set"
+            )
+        return banks[getattr(self.model_runner, "_fv_idx", 0)]
+
+    def build_mixed_prefill_banks(self) -> None:
+        """Build `_get_mixed_prefill_bank`'s bank for every `forward_vars` ring
+        slot. Called once, after the ring and its publication owners exist and
+        before warmup, so the memory profile and the KV budget see them."""
+        runner = self.model_runner
+        ring = getattr(runner, "_fv_ring", None) or [runner.forward_vars]
+        private_groups = getattr(
+            self, "mixed_prefill_groups", self.mixed_prefill_groups
+        )
+        banks = {}
+        for slot, forward_vars in enumerate(ring):
+            # `clone()` carries `pin_memory`: an unpinned source would make
+            # `copy_(non_blocking=True)` synchronous.
+            private = {
+                name: val.clone()
+                for name, val in forward_vars.items()
+                if isinstance(val, CpuGpuBuffer)
+                and (
+                    val.publication_group in private_groups
+                    or name == "batch_id_per_q_token"
+                )
+            }
+            variables = {**forward_vars, **private}
+            owner = groups = None
+            if getattr(runner, "h2d_groups", None) is not None:
+                # Binding a shared buffer again would steal it from the live
+                # slot's owner. Only the clones belong to this publication slot.
+                owner, groups = runner.build_h2d_slot(
+                    private, torch.cuda.Event(), partial=True
+                )
+            banks[slot] = (variables, owner, groups)
+        self._mixed_prefill_banks = banks
+
+    @contextmanager
+    def mixed_prefill_bank_selected(self):
+        """Point the runner's `forward_vars`, owner and groups at the bank.
+
+        Only the swap; it opens no publication epoch. For a caller that
+        publishes through an epoch of its own, e.g. a TBO ubatch rebuild, which
+        reopens whichever owner the runner holds (`_ubatch_prefill_sources`).
+        """
+        runner = self.model_runner
+        variables, owner, groups = self._get_mixed_prefill_bank()
+        saved = (
+            runner.forward_vars,
+            getattr(runner, "h2d_owner", None),
+            getattr(runner, "h2d_groups", None),
+        )
+        runner.forward_vars = variables
+        if owner is not None:
+            runner.h2d_owner, runner.h2d_groups = owner, groups
+        try:
+            yield variables
+        finally:
+            # Restore even on error so a failed mixed build can't leave the
+            # runner pointed at the bank.
+            runner.forward_vars = saved[0]
+            if owner is not None:
+                runner.h2d_owner, runner.h2d_groups = saved[1], saved[2]
+
+    @contextmanager
+    def mixed_prefill_bank_active(self, batch: ScheduledBatch):
+        """Build the prefill half of a mixed batch inside the bank.
+
+        Selects the bank, and opens one publication epoch on its owner, sealed
+        on exit, so the prefill producers publish into it under the same ledger
+        rules as an ordinary step. A failure fails the bank's owner, as it would
+        the runner's.
+
+        Also publishes the bank's `cu_seqlens_q`. It is the one buffer the
+        prefill path READS rather than fills (`prepare_prefill` cross-checks
+        against it), and `publish_cu_seqlens_q` gives the runner's own copy the
+        decode segment's spans on a mixed step -- so the prefill segment's spans
+        are written here, from the same `num_scheduled_tokens`.
+        """
+        _, owner, _ = self._get_mixed_prefill_bank()
+        if owner is not None:
+            owner.begin()
+        try:
+            with self.mixed_prefill_bank_selected() as variables:
+                n_p_seqs = batch.total_seqs_num_prefill
+                cu = variables["cu_seqlens_q"]
+                cu.np[1 : n_p_seqs + 1] = np.cumsum(
+                    batch.num_scheduled_tokens[:n_p_seqs]
+                )
+                cu.copy_to_gpu(n_p_seqs + 1)
+                yield variables
+        except BaseException:
+            if owner is not None:
+                owner.fail()
+            raise
+        else:
+            if owner is not None:
+                owner.finish()
+
+    @h2d_producer("early", runner="model_runner")
+    def prepare_cu_seqlens_q(self, batch: ScheduledBatch, forward_mode) -> int:
+        if not batch.is_mixed:
+            return super().prepare_cu_seqlens_q(batch, forward_mode)
+        # Only V4 dispatches mixed attention in two independent segments.
+        # Its decode spans occupy the live bank; prefill uses its own bank.
+        cu = self.model_runner.forward_vars["cu_seqlens_q"]
+        lens = batch.num_scheduled_tokens[batch.total_seqs_num_prefill :]
+        n = len(lens)
+        cu.np[1 : n + 1] = np.cumsum(lens)
+        cu.np[n + 1 : forward_mode.running_bs + 1] = cu.np[n]
+        return forward_mode.running_bs + 1
+
     def prepare_mixed(self, batch: ScheduledBatch, bs: int):
         """Build split-dispatch metadata for a V4 mixed prefill+decode batch.
 
@@ -2764,7 +2824,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
              rows are first), so it is correct as-is. It runs against the
              private prefill bank, so its `forward_vars`/`_stage` buffers are
              not the ones the decode half overwrites.
-          2. `prepare_decode(decode_view)` runs against a thin sub-batch view
+          2. `prepare_decode(decode_batch)` runs against a batch-owned row slice
              that exposes only the decode rows ``[n_p_seqs:]``.
           3. The two are returned in one carrier (`_mixed_carrier`): nested
              `prefill_attn_metadata` / `decode_attn_metadata`, which the
@@ -2802,7 +2862,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # the unmodified prepare_decode builds decode metadata into shared
         # buffer rows [0:n_d_seqs]. Mixed runs eager, so bs == n_d_seqs (no CG
         # padding). ----
-        decode_view = _MixedDecodeView(batch, n_p_seqs)
+        decode_batch = batch.slice_rows(n_p_seqs, batch.total_seqs_num)
+        if decode_batch.block_table_rows != list(
+            range(n_d_seqs)
+        ) or decode_batch.state_rows != list(range(n_d_seqs)):
+            raise ValueError("V4 decode rows must each have KV pages and a state slot")
+        rejected = self.model_runner.tokenID_processor.num_rejected
+        if rejected is not None and len(rejected) != batch.total_seqs_num:
+            raise ValueError("num_rejected is not aligned with mixed batch rows")
+        rejected = (
+            np.zeros(n_d_seqs, dtype=np.int32)
+            if rejected is None
+            else rejected[n_p_seqs:]
+        )
         # prepare_decode READS var["cu_seqlens_q"] (it never writes it) as a
         # device view, and on a mixed step `publish_cu_seqlens_q` has already
         # published the DECODE segment's spans into it (anchor + drafts per
@@ -2820,10 +2892,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             raise RuntimeError("cu_seqlens_q does not contain decode-local spans")
         decode_max_q = int(lens.max())
         decode_meta, decode_positions = self.prepare_decode(
-            decode_view,
+            decode_batch,
             running_bs=n_d_seqs,
             running_tokens=n_d_tokens,
             max_seqlen_q=decode_max_q,
+            num_rejected=rejected,
+            build_ubatches=False,
         )
 
         # ---- Merge positions ([prefill | decode]) on the device. ----
@@ -2875,6 +2949,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         running_bs: int,
         running_tokens: int,
         max_seqlen_q: int,
+        *,
+        num_rejected: np.ndarray | None = None,
+        build_ubatches: bool = True,
     ):
         """V4-style decode prep: populates positions, block_tables, and
         state_slot_out.
@@ -2902,13 +2979,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # a rejected slot's KV falls out of range on its own — `block_tables`
         # needs no truncation here.
         if not batch.is_dummy_run and batch.num_spec_step > 0:
-            num_rejected = self.model_runner.tokenID_processor.num_rejected
+            if num_rejected is None:
+                num_rejected = self.model_runner.tokenID_processor.num_rejected
             if num_rejected is not None:
-                # One entry per row of the WHOLE batch, and it lives on the
-                # runner, not the batch -- so the mixed decode view cannot slice
-                # it and says where its rows start instead.
-                row0 = getattr(batch, "row_offset", 0)
-                num_rejected = num_rejected[row0 : row0 + len(context_lens_np)]
+                if len(num_rejected) != len(context_lens_np):
+                    raise ValueError("num_rejected is not aligned with decode rows")
                 context_lens_np = context_lens_np - num_rejected.astype(np.int32)
         # DSpark q-shrink: anchor the forwarded q tokens to the draft span HEAD
         # (ctx-full_q), not the tail, so they stay in [ctx-full_q .. ctx-1] (never
@@ -3036,7 +3111,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self.model_runner.config.enable_tbo_decode
             and decode_bucket_splits(self._ubatch_split_bs or scheduled_bs)
             and not batch.is_dummy_run
-            and not isinstance(batch, _MixedDecodeView)
+            and build_ubatches
         ):
             self._prepare_ubatch_decode(
                 scheduled_bs=scheduled_bs,

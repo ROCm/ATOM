@@ -1545,6 +1545,27 @@ class TestMixedDecodeFirst:
         assert batch.total_seqs_num_prefill == 1
         assert batch.total_seqs_num_decode == 0
 
+    @pytest.mark.parametrize("prefix_cache", [False, True])
+    def test_new_prefill_cannot_spend_existing_decodes_last_page(
+        self, seq_factory, prefix_cache
+    ):
+        sched = self._mixed_sched(
+            num_kvcache_blocks=3, enable_prefix_caching=prefix_cache
+        )
+        old = seq_factory([1, 2, 3, 4])
+        sched.add(old)
+        sched.schedule()
+        old.num_cached_tokens = old.num_prompt_tokens
+        old.append_token(5)
+        new = seq_factory(list(range(20, 28)))  # needs the two remaining pages
+        sched.add(new)
+        batch, _ = sched.schedule()
+        assert batch.req_ids == [old.id]
+        assert batch.total_seqs_num_decode == 1
+        assert old in sched.running and new in sched.waiting
+        assert len(old.block_table) == 2
+        assert not new.block_table
+
 
 # ── prefix caching ────────────────────────────────────────────────────────
 
@@ -3498,11 +3519,10 @@ class TestMixedBatch:
         seq.append_token(99)
         return seq
 
-    def test_a_decode_never_preempts_a_prefill_scheduled_this_step(self, seq_factory):
-        """A mixed step admits its prefills first, at the tail of `running`. A
-        decode that then runs out of blocks must not preempt one of them: the
-        prefill would lose its blocks while staying in the batch, shifting
-        every decode row's block table onto its neighbour's pages."""
+    def test_decode_page_reservation_defers_a_prefill_before_it_is_scheduled(
+        self, seq_factory
+    ):
+        """Do not admit a prompt whose pages would force a running decode out."""
         sched = self._mixed_scheduler(
             num_kvcache_blocks=3,
             kv_cache_block_size=4,
@@ -3516,10 +3536,9 @@ class TestMixedBatch:
 
         batch, scheduled = sched.schedule()
 
-        assert p.id in scheduled
-        assert p.status == SequenceStatus.RUNNING and p.block_table
-        # The decode gave way instead: preempted, not scheduled.
-        assert d.id not in scheduled and d.status == SequenceStatus.WAITING
+        assert d.id in scheduled and d.status == SequenceStatus.RUNNING
+        assert p.id not in scheduled and p.status == SequenceStatus.WAITING
+        assert p in sched.waiting and not p.block_table
         assert len(batch.block_tables) == batch.total_seqs_num
 
     def test_prefill_hash_registration_skips_a_mixed_batchs_decode_rows(

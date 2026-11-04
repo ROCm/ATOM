@@ -282,35 +282,22 @@ def test_carrier_spans_cover_the_whole_batch():
     assert slots.tolist() == [11, 12, 21, 22, 0, 0]
 
 
-def test_decode_view_slices_spec_fields_and_says_where_its_rows_start():
-    from atom.model_ops.attentions.deepseek_v4_attn import _MixedDecodeView
+def test_batch_slice_preserves_spec_fields():
+    from test_mixed_decode_view import make_batch
 
-    n = N_P + N_D
-    batch = SimpleNamespace(
-        total_seqs_num=n,
-        total_seqs_num_decode=N_D,
-        total_tokens_num_decode=N_D * (K + 1),
-        total_tokens_num_prefill=N_P_TOKENS,
-        is_dummy_run=False,
-        num_spec_step=K,
-        context_lens=np.arange(n),
-        block_tables=[[i] for i in range(n)],
-        state_slots_committed=list(range(n)),
-        num_scheduled_tokens=NUM_SCHEDULED.copy(),
-        num_cached_tokens=np.zeros(n, dtype=np.int32),
-        last_block_num_tokens=np.ones(n, dtype=np.int32),
-        scheduled_spec_decode_tokens=np.arange(n * K).reshape(n, K),
-        num_rejected=np.array([9, 9, 1, 2], dtype=np.int32),
-        num_bonus=np.array([9, 9, 2, 1], dtype=np.int32),
-        scheduled_tokens=np.arange(N_P_TOKENS + N_D * (K + 1)),
-    )
-    view = _MixedDecodeView(batch, N_P)
-    assert view.row_offset == N_P
-    assert view.num_rejected.tolist() == [1, 2]
-    assert view.num_bonus.tolist() == [2, 1]
-    assert view.scheduled_spec_decode_tokens.tolist() == [[6, 7, 8], [9, 10, 11]]
-    # Token-axis: the length guard cannot catch this one, so it is sliced.
-    assert view.scheduled_tokens.tolist() == list(range(8, 16))
+    batch = make_batch()
+    batch.num_rejected = np.array([9, 9, 1, 2, 0], dtype=np.int32)
+    batch.num_bonus = np.array([9, 9, 2, 1, 0], dtype=np.int32)
+    batch.scheduled_spec_decode_tokens = np.arange(15).reshape(5, 3)
+    child = batch.slice_rows(2, 5)
+    assert child.num_rejected.tolist() == [1, 2, 0]
+    assert child.num_bonus.tolist() == [2, 1, 0]
+    assert child.scheduled_spec_decode_tokens.tolist() == [
+        [6, 7, 8],
+        [9, 10, 11],
+        [12, 13, 14],
+    ]
+    np.testing.assert_array_equal(child.scheduled_tokens, batch.scheduled_tokens[16:])
 
 
 # ── token inputs: the mixed branch of prepare_input_ids, end to end ─────────
@@ -332,7 +319,7 @@ def test_mixed_deferred_inputs_under_spec(monkeypatch, transport, previous_dummy
     """
     from tests.test_h2d_runner_publication import runner_with_buffers
 
-    runner = runner_with_buffers(monkeypatch, transport, speculative=True)
+    runner = runner_with_buffers(monkeypatch, transport, speculative=True, mixed=True)
     processor = runner.tokenID_processor
     processor.use_spec = True
     processor.num_spec_tokens = K

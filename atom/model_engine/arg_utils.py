@@ -304,8 +304,8 @@ class EngineArgs:
             "--enable-mixed-prefill-decode",
             action="store_true",
             help="Pack prefill chunks and decode seqs into the same forward "
-            "pass (DeepSeek-V4 only; refused at launch elsewhere). Holds 5%% of "
-            "device memory back from the KV cache. Off by default.",
+            "pass (DeepSeek-V4 only; refused at launch elsewhere). Profiles "
+            "mixed workspace before sizing the KV cache. Off by default.",
         )
         parser.add_argument(
             "--port",

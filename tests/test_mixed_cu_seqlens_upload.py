@@ -119,16 +119,16 @@ def test_host_write_detector(src, n_writes):
 
 
 def test_publish_gives_a_mixed_batch_decode_local_spans():
-    body = _function_body(_BACKENDS, "prepare_cu_seqlens_q")
+    body = _function_body(_BUILDERS[0], "prepare_cu_seqlens_q")
     assert "is_mixed" in body
     assert "total_seqs_num_prefill" in body
 
 
 def test_the_bank_publishes_the_prefill_spans_and_restores_the_runner():
-    active = _function_body(_BACKENDS, "mixed_prefill_bank_active")
+    active = _function_body(_BUILDERS[0], "mixed_prefill_bank_active")
     assert "num_scheduled_tokens[:n_p_seqs]" in active
     assert "cu.copy_to_gpu(" in active
     assert "owner.begin()" in active and "owner.finish()" in active
-    selected = _function_body(_BACKENDS, "mixed_prefill_bank_selected")
+    selected = _function_body(_BUILDERS[0], "mixed_prefill_bank_selected")
     assert "h2d_groups" in selected, "groups must swap with forward_vars"
     assert "finally:" in selected, "the swap must be restored on error"

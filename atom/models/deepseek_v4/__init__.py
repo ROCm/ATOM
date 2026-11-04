@@ -1720,27 +1720,6 @@ def _segment_forward_context(fc, ctx, seg_md, *, is_prefill: bool, input_ids):
         ctx.input_ids = saved_input_ids
 
 
-def _assert_segment_state(seg_md, *, is_prefill: bool) -> None:
-    """Both tail ops branch on `seg_md.state`, never on `ctx.is_prefill`.
-
-    A decode sub-metadata that does not carry DECODE gets
-    swa_dest_rows=None / batch_id_per_token=None, and every decode row's SWA
-    store is silently skipped -- no error, just wrong attention. Checked
-    because a 13-point GSM8K drop with faults=0 is exactly that shape.
-
-    `raise`, not `assert`: `python -O` strips asserts, and what this guards
-    is a silent accuracy loss.
-    """
-    if is_prefill:
-        if seg_md.state is AttnState.DECODE:
-            raise RuntimeError(f"prefill segment carries state={seg_md.state}")
-    elif seg_md.state is not AttnState.DECODE:
-        raise RuntimeError(
-            f"decode segment carries state={seg_md.state}, so its SWA "
-            "window write is silently skipped"
-        )
-
-
 def _mixed_span(tag: str):
     """A profiler span that is ~free when nothing is profiling.
 
@@ -2425,8 +2404,8 @@ class DeepseekV4Attention(nn.Module):
           _sparse_attention    prefill and decode run different paged kernels,
                                and it joins the launch above
 
-        `_qk_norm_rope` is in the loop only because its fused decode SWA write
-        keys off `attn_md.state`; the math itself is identical for both halves.
+        QK-norm/RoPE runs once. The carrier masks prefill SWA stores until
+        its attention has consumed the preceding chunk's window.
 
         Each segment re-enters with its own complete sub-metadata (is_mixed
         False), so there is no recursion.
@@ -2453,6 +2432,7 @@ class DeepseekV4Attention(nn.Module):
         # metadata/is_prefill swap and its restore belong to
         # `_segment_forward_context`, per segment.
         saved_input_ids = ctx.input_ids
+        qkn = self._qk_norm_rope(q, kv_pre, positions)
 
         # One combined output; each half's attention lands in its own rows
         # (`_sparse_attention(out=)`), so nothing is copied for the prefill
@@ -2464,7 +2444,6 @@ class DeepseekV4Attention(nn.Module):
         )
 
         def _seg(lo: int, hi: int, seg_md, is_prefill: bool) -> None:
-            _assert_segment_state(seg_md, is_prefill=is_prefill)
             sl = slice(lo, hi)
             tag = "prefill" if is_prefill else "decode"
             with (
@@ -2481,9 +2460,8 @@ class DeepseekV4Attention(nn.Module):
                 # (`_compressors_async`), so the join in `_sparse_attention`
                 # always matches what this launch did.
                 self._launch_compressors(x[sl])
-                qkn = self._qk_norm_rope(q[sl], kv_pre[sl], positions[sl])
                 self._sparse_attention(
-                    qkn,
+                    qkn.slice_tokens(sl),
                     positions[sl],
                     x=x[sl],
                     qr=qr[sl],
@@ -2522,7 +2500,7 @@ class DeepseekV4Attention(nn.Module):
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         rd = self.rope_head_dim
         ratio = self.compress_ratio
-        is_decode = attn_md.state is AttnState.DECODE
+        is_decode = attn_md.state is AttnState.DECODE or attn_md.is_mixed
         swa_dest_rows = (
             attn_md.swa_dest_rows[ratio]
             if (is_decode and attn_md.swa_dest_rows is not None)
@@ -2544,8 +2522,8 @@ class DeepseekV4Attention(nn.Module):
         #
         # Decode has no ordering hazard, so writing before the attention reads
         # the window is safe. Prefill does — chunked prefix reads must see the
-        # PRIOR chunk — so it passes `swa_*=None` and scatters its window tail
-        # after sparse_attn below.
+        # PRIOR chunk — so pure prefill passes `swa_*=None`; mixed masks its
+        # prefill rows. Both scatter the prefill window after sparse_attn.
         #
         # bf16 → qkn.q_sa / qkn.kv populated; fp8 2buff → qkn.q_packed / qkn.q_rope
         # / qkn.k_packed / qkn.k_rope populated (the 2buff layout nope-fp8 [.,512] +
