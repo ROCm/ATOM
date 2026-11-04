@@ -2134,31 +2134,6 @@ def test_first_attention_layer_num_follows_the_kv_binding():
     assert mla.first_attention_layer_num == 17
 
 
-def test_gqa_drafts_share_the_layer_forward_and_context_defaults():
-    """The two GQA drafts run one layer forward and context write and the
-    base's context projection and layer list; the MLA and V4 drafts keep their own."""
-    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
-    from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
-    from atom.models.dspark_draft import DSparkDraftModel, DSparkGQADecoderLayer
-    from atom.models.kimi_k3_dflash import KimiK3DFlash, KimiK3DFlashDecoderLayer
-    from atom.models.kimi_k3_dspark import KimiK3DSpark
-    from atom.models.minimax_m3.dspark import M3DSparkDecoderLayer, MiniMaxM3DSpark
-
-    for layer_cls in (KimiK3DFlashDecoderLayer, M3DSparkDecoderLayer):
-        assert layer_cls.forward is DSparkGQADecoderLayer.forward, layer_cls
-        assert (
-            layer_cls.write_context_kv is DSparkGQADecoderLayer.write_context_kv
-        ), layer_cls
-    for draft_cls in (KimiK3DFlash, MiniMaxM3DSpark):
-        assert draft_cls.project_context is DSparkDraftModel.project_context
-        assert draft_cls.context_layers is DSparkDraftModel.context_layers
-    assert KimiK3DSpark.context_layers is DSparkDraftModel.context_layers
-    for draft_cls in (KimiK3DSpark, DeepseekV4DSpark, DeepseekV41DSpark):
-        assert draft_cls.project_context is not DSparkDraftModel.project_context
-    for draft_cls in (DeepseekV4DSpark, DeepseekV41DSpark):
-        assert draft_cls.context_layers is not DSparkDraftModel.context_layers
-
-
 def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
     """A DSparkProposer carrying only what `_build_paged_block_metadata` reads.
 

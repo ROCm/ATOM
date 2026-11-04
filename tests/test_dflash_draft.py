@@ -687,8 +687,8 @@ def _fake_attn_res_kernel(monkeypatch, calls):
 def _k3_target_stub(hidden=16, n_layers=16, block_size=4, enabled=True):
     """A Kimi-K3 target's layer stack, down to what aux capture reads off it.
 
-    Each layer carries `KimiDecoderLayer`'s own `aux_hidden_state`,
-    `check_aggregate_source` and `aggregate_hidden_state`, bound to a namespace
+    Each layer carries `KimiDecoderLayer`'s own `check_aggregate_source` and
+    `aggregate_hidden_state`, bound to a namespace
     holding the attributes they read: building the real layer would want a
     checkpoint, a TP group and a GPU.
     """
@@ -700,7 +700,6 @@ def _k3_target_stub(hidden=16, n_layers=16, block_size=4, enabled=True):
     for i in range(n_layers):
         layer = types.SimpleNamespace(
             layer_idx=i,
-            aux_hidden_state=layer_cls.aux_hidden_state,
             self_attention_attn_res=types.SimpleNamespace(
                 enabled=enabled,
                 block_size=block_size,
@@ -742,9 +741,8 @@ def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
 
     hidden, block_size = 16, 4
     target = _k3_target_stub(hidden=hidden, n_layers=16, block_size=block_size)
-    # Tap 6, not 7: with block_size 4 the ceiling and the floor of
-    # (lid + 1) / block_size differ there, so the bank slice below actually
-    # pins the rounding.
+    # Tap 6, not 7: with block_size 4, layer 6 is preceded by closes at layers
+    # 0 and 4 only, so the bank slice below pins the block count.
     spec = _dflash_spec(target, (6, 11), hidden=hidden)
 
     assert spec.layer_ids == (6, 11)
@@ -762,9 +760,8 @@ def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
 
     out = spec.extract((prefix, pending, pending2, bank), block)
 
-    # nvb is a CEILING, matching SGLang's `prev_valid_blocks`: layer 6 sits
-    # above ceil(7 / 4) = 2 closed blocks (a floor would say 1), so only 2 of
-    # the bank's 6 rows are candidates.
+    # Layer 6 is preceded by closes at layers 0 and 4 (6 // 4 + 1 = 2, as
+    # SGLang's `prev_valid_blocks`), so only 2 of the bank's 6 rows are mixed.
     assert len(calls) == 1
     call = calls[0]
     assert call["bank"].shape == (rows, 2, hidden)
@@ -788,13 +785,9 @@ def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
     assert out is call["result"]
 
 
-def test_dflash_aggregate_leaves_untapped_layers_on_the_prefix(monkeypatch):
-    """A layer the draft does not tap keeps the plain reconstruction.
-
-    The hook is installed per tapped layer, but ONE extract serves all of them,
-    so it dispatches on the block it is handed. An untapped layer keeps the
-    prefix rather than mix against another layer's bank.
-    """
+def test_dflash_aggregate_refuses_a_short_bank(monkeypatch):
+    """Fewer closed blocks than the tap implies is a target layout change, not
+    a reason to drop silently back to the prefix feature."""
     torch = pytest.importorskip("torch")
     hidden = 16
     target = _k3_target_stub(hidden=hidden)
@@ -804,13 +797,6 @@ def test_dflash_aggregate_leaves_untapped_layers_on_the_prefix(monkeypatch):
     prefix = torch.randn(3, hidden)
     pending = torch.randn(3, hidden)
     bank = torch.randn(3, 6, hidden)
-
-    out = spec.extract((prefix, pending, None, bank), target.layers[5])
-    assert torch.equal(out, prefix + pending)
-    assert calls == []
-
-    # Fewer closed blocks than the tap implies is a target layout change, not
-    # a reason to drop silently back to the prefix feature.
     with pytest.raises(RuntimeError, match="expected a bank"):
         spec.extract((prefix, pending, None, bank[:, :1, :]), target.layers[6])
     assert calls == []
@@ -842,20 +828,12 @@ def test_dflash_refuses_a_tap_that_cannot_form_the_aggregate():
         _dflash_spec(target, (6,))
 
 
-def test_dflash_embedding_tap_keeps_the_prefix(monkeypatch):
-    """`-1` taps the embedding, below every mixture: the prefix is the stream.
-
-    The embedding hook takes its output verbatim, so with no layer tapped the
-    extract only ever sees an untapped layer, and keeps the prefix there.
-    """
-    torch = pytest.importorskip("torch")
-    target = _k3_target_stub()
-    spec = _dflash_spec(target, (-1,))
-    calls = _fake_attn_res_kernel(monkeypatch, [])
-    prefix = torch.randn(3, 16)
-    out = spec.extract((prefix, None, None, torch.randn(3, 6, 16)), target.layers[6])
-    assert torch.equal(out, prefix)
-    assert calls == []
+def test_dflash_arms_the_embedding_tap_without_a_successor():
+    """`-1` taps the embedding, below every mixture, and the drafter reads it
+    verbatim, so arming needs no successor layer for it."""
+    pytest.importorskip("torch")
+    spec = _dflash_spec(_k3_target_stub(n_layers=1), (-1,))
+    assert spec.layer_ids == (-1,)
 
 
 def test_k3_dspark_mla_draft_resolves_to_the_generic_extractor():

@@ -472,7 +472,7 @@ class KimiK3DFlash(DSparkDraftModel):
                     f"DFlash aggregate tap on target layer {lid}: needs a "
                     f"successor layer in a {len(target_layers)}-layer stack"
                 )
-            if getattr(target_layers[lid], "layer_idx", lid) != lid:
+            if target_layers[lid].layer_idx != lid:
                 raise ValueError(
                     f"DFlash aggregate tap on target layer {lid}: the stack's "
                     f"layer {lid} has layer_idx {target_layers[lid].layer_idx}"
@@ -484,13 +484,10 @@ class KimiK3DFlash(DSparkDraftModel):
             logger.info("DFlash aggregate tap armed on target layers %s", sorted(taps))
 
         def extract(output, block):
-            next_layer = taps.get(getattr(block, "layer_idx", -1))
-            if next_layer is None:
-                return block.aux_hidden_state(output)
             # The base hook copies the mix in place into the same fixed capture
             # buffer the prefix would have filled, so cudagraph capture is
             # unaffected.
-            return block.aggregate_hidden_state(output, next_layer)
+            return block.aggregate_hidden_state(output, taps[block.layer_idx])
 
         return AuxCaptureSpec(layer_ids, hidden_size, extract)
 
