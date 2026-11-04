@@ -462,6 +462,7 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
     proc.pp_size = 1
     proc.kv_transfer_enabled = False
     proc._in_flight = deque()
+    proc.utility_handler = SimpleNamespace(apply_deferred_profiler_action=lambda: None)
     proc.scheduler = SimpleNamespace(
         metrics=metrics,
         schedule=lambda: next(proposals),

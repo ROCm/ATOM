@@ -20,6 +20,7 @@ import queue
 import threading
 import time
 import weakref
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from threading import Thread
@@ -450,6 +451,15 @@ class AsyncIOProcManager:
         *args: Additional arguments forwarded to the runner constructor.
     """
 
+    # RPCs that execute a model forward. Every engine variant -- base, DP, PP
+    # head/downstream, disagg prefill/decode -- dispatches through call_func,
+    # so this is the only place all of them can be observed at once.
+    # tests/test_profiler_window.py fails if a new engine RPC is unclassified.
+    _FORWARD_FUNCS: ClassVar[set[str]] = {
+        "forward",
+        "prefill_forward",
+        "dummy_execution",
+    }
     # The public collective_rpc runs only these.
     _PUBLIC_RPC_METHODS: ClassVar[frozenset[str]] = COLLECTIVE_RPC_METHODS
     # Names the engine's wire protocol owns, which even the utility handler's
@@ -488,6 +498,9 @@ class AsyncIOProcManager:
         atexit.register(self._cleanup_shared_memory)
         self.all_ranks_barrier = ctx.Barrier(proc_num)
         init_exit_handler(self)
+
+        # Set by EngineCore to observe forward completions; see _FORWARD_FUNCS.
+        self.on_forward_end: Callable[[], None] | None = None
 
         # KV output aggregation infrastructure
         self.kv_output_aggregator: KVOutputAggregator | None = None
@@ -900,6 +913,10 @@ class AsyncIOProcManager:
             ret = self.outputs_queue.get()
             if isinstance(ret, SystemExit):
                 raise ret
+            # Only the waiting path knows the forward is over; without
+            # wait_out this has merely been enqueued.
+            if self.on_forward_end is not None and func_name in self._FORWARD_FUNCS:
+                self.on_forward_end()
             return ret
 
     def _start_kv_aggregation(
