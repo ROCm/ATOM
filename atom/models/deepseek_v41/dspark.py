@@ -253,7 +253,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def context_layers(self):
         return tuple(layer.attn for layer in self.mtp)
 
-    def write_context_kv(self, aux_concat, positions):
+    def write_context_kv(self, aux_concat, positions, slot_mapping=None):
         from atom.utils.forward_context import get_forward_context
 
         forward = get_forward_context()

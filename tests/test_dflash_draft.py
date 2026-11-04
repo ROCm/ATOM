@@ -960,81 +960,13 @@ def test_dspark_proposer_hands_the_target_model_to_the_draft():
 
 
 # --------------------------------------------------------------------------- #
-# draft pool addressing (dspark_proposer)
+# draft context slots (kimi_mla_gdn_attn builder -> dspark_proposer -> draft)
 #
-# The slot math (`draft_kv.draft_ctx_slots`) runs on CPU.
-# `_publish_draft_ctx_slots` is the REAL proposer method on a stub carrying
-# real forward buffers; the proposer module imports triton, so those skip on the
-# CPU-only CI job (ATOM's CI runs no unit tests on a GPU).
+# The slot math is `token_layout/slots.py`'s, on the host, and runs on CPU.
+# The builder's publication, the proposer's hand-off and the DFlash layer are
+# the REAL methods on stubs; their modules import aiter/triton, so those skip
+# on the CPU-only CI job. The base draft's fan-out runs on CPU.
 # --------------------------------------------------------------------------- #
-
-
-def _publish(block_size, dcp, tables, seqlens, positions, running_bs=None):
-    """Drive the real `_publish_draft_ctx_slots`; return what it published."""
-    import torch
-
-    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
-    from atom.utils import CpuGpuBuffer
-    from atom.utils.forward_context import AttentionMetaData
-
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    rows = max(running_bs or 0, len(seqlens))
-    bt = CpuGpuBuffer(rows, len(tables[0]), dtype=torch.int32, device=dev)
-    bt.np[: len(tables)] = tables
-    bt.copy_to_gpu()  # the target's builder uploads it before the hook runs
-    cu = CpuGpuBuffer(rows + 1, dtype=torch.int32, device=dev)
-    # Flat over the padded tail, as `prepare_cu_seqlens_q` leaves it.
-    cu.np[1 : len(seqlens) + 1] = torch.tensor(seqlens).cumsum(0).numpy()
-    cu.np[len(seqlens) + 1 :] = cu.np[len(seqlens)]
-    cu.copy_to_gpu()
-    n_tok = 64
-    stub = types.SimpleNamespace(
-        runner=types.SimpleNamespace(
-            block_size=block_size,
-            forward_vars={"block_tables": bt, "cu_seqlens_q": cu},
-            draft_kv_builder=types.SimpleNamespace(
-                kv_pool=types.SimpleNamespace(entry_tokens=block_size * dcp)
-            ),
-        ),
-        model=_gpu_stack_import("atom.models.kimi_k3_dflash").KimiK3DFlash,
-        _blk_ctx_slots=torch.full((n_tok,), 7, dtype=torch.int64, device=dev),
-        _blk_tok_ramp=torch.arange(n_tok, dtype=torch.int32, device=dev),
-    )
-    stub._draft_entry_tokens = proposer.DSparkProposer._draft_entry_tokens.fget(stub)
-    fwd = types.SimpleNamespace(
-        context=types.SimpleNamespace(
-            running_bs=running_bs or len(seqlens), scheduled_bs=len(seqlens)
-        ),
-        attn_metadata=AttentionMetaData(),
-    )
-    pos = torch.tensor(positions, dtype=torch.int64, device=dev)
-    proposer.DSparkProposer._publish_draft_ctx_slots(stub, fwd, pos)
-    out = fwd.attn_metadata.draft_ctx_slot_mapping
-    return None if out is None else out.cpu()
-
-
-def _slots(vblock, tables, seqlens, positions, running_bs=None):
-    """The device slot math (`draft_kv.draft_ctx_slots`), on CPU tensors."""
-    import torch
-
-    from atom.spec_decode.draft_kv import draft_ctx_slots
-
-    rows = max(running_bs or 0, len(seqlens))
-    bt = torch.zeros(rows, len(tables[0]), dtype=torch.int32)
-    bt[: len(tables)] = torch.tensor(tables, dtype=torch.int32)
-    ends = torch.tensor(seqlens, dtype=torch.int32).cumsum(0).to(torch.int32)
-    # Flat over the padded tail, as `prepare_cu_seqlens_q` leaves it.
-    cu_ends = torch.cat([ends, ends[-1:].expand(rows - len(seqlens))])
-    n = len(positions)
-    out = torch.full((n,), 7, dtype=torch.int64)
-    return draft_ctx_slots(
-        out,
-        torch.tensor(positions, dtype=torch.int64),
-        cu_ends,
-        bt,
-        torch.arange(n, dtype=torch.int32),
-        vblock,
-    )
 
 
 def _host_slots(tables, seqlens, positions, block_size):
@@ -1060,13 +992,12 @@ _SEQLENS = [3, 2]
 def test_draft_slots_store_every_token_at_entry_granularity(dcp):
     """Every token gets a slot, addressed in `block_size * dcp`-token entries.
 
-    The host builder answers the same numbers when handed the entry size, and
-    at DCP>1 they differ from the target's `block_size` addressing -- which
+    At DCP>1 they differ from the target's `block_size` addressing -- which
     would alias `dcp` requests' entries onto one range.
     """
     vblock = 128 * dcp
     positions = [vblock - 2, vblock - 1, vblock, 5, 6]
-    got = _slots(vblock, _TABLES, _SEQLENS, positions).tolist()
+    got = _host_slots(_TABLES, _SEQLENS, positions, vblock)
     assert got == [
         7 * vblock + vblock - 2,
         7 * vblock + vblock - 1,
@@ -1074,64 +1005,185 @@ def test_draft_slots_store_every_token_at_entry_granularity(dcp):
         4 * vblock + 5,
         4 * vblock + 6,
     ]
-    assert got == _host_slots(_TABLES, _SEQLENS, positions, vblock)
     if dcp > 1:
         assert got != _host_slots(_TABLES, _SEQLENS, positions, 128)
 
 
-def test_draft_slots_ignore_padded_rows():
-    """Padded graph rows past `scheduled_bs` resolve no token."""
-    got = _slots(1024, _TABLES, _SEQLENS, [0, 1, 2, 3, 4], running_bs=4)
-    assert got.tolist() == [
-        7 * 1024,
-        7 * 1024 + 1,
-        7 * 1024 + 2,
-        4 * 1024 + 3,
-        4 * 1024 + 4,
-    ]
+def _builder_stub(entry_tokens, tables, positions, rows=64):
+    """What `_publish_draft_ctx_slots` reads off the builder and its runner."""
+    import numpy as np
+    import torch
+
+    from atom.utils import CpuGpuBuffer
+
+    def buf(*size, dtype):
+        return CpuGpuBuffer(*size, dtype=dtype, device="cpu", pin_memory=False)
+
+    bt = buf(len(tables), len(tables[0]), dtype=torch.int32)
+    bt.np[:] = tables
+    pos = buf(rows, dtype=torch.int64)
+    pos.np[: len(positions)] = positions
+    out = buf(rows, dtype=torch.int64)
+    out.np[:] = 7
+    return types.SimpleNamespace(
+        model_runner=types.SimpleNamespace(
+            forward_vars={
+                "draft_ctx_slots": out,
+                "positions": pos,
+                "block_tables": bt,
+            },
+            draft_kv_builder=types.SimpleNamespace(
+                kv_pool=types.SimpleNamespace(entry_tokens=entry_tokens)
+            ),
+        ),
+        token_axis_scratch=np.empty(rows, dtype=np.int64),
+    )
 
 
-def test_draft_slots_past_the_table_are_dropped_not_clamped():
-    """A column the table does not have becomes -1.
+def _publish(stub, seqlens, rows, tables, dummy=False):
+    """Drive the real `_publish_draft_ctx_slots`; return the device buffer."""
+    import numpy as np
 
-    Clamping it into the last column instead would hand the row ANOTHER
-    request's KV, which reads as a plausible answer rather than a fault.
-    """
-    got = _slots(1024, [[10, 11, 12, 13]], [3], [0, 3 * 1024, 4 * 1024])
-    assert got.tolist() == [10 * 1024, 13 * 1024, -1]
+    kimi = _gpu_stack_import("atom.model_ops.attentions.kimi_mla_gdn_attn")
+    buf = stub.model_runner.forward_vars.get("draft_ctx_slots")
+    batch = types.SimpleNamespace(is_dummy_run=dummy, block_tables=tables)
+    kimi._KimiMLAGDNCommon._publish_draft_ctx_slots(
+        stub, batch, np.asarray(seqlens, dtype=np.int32), rows
+    )
+    return None if buf is None else buf.gpu
 
 
 @pytest.mark.parametrize("dcp", [1, 8])
-def test_the_proposer_publishes_the_draft_slots(dcp):
-    """The real `_publish_draft_ctx_slots` publishes, at entry granularity,
-    exactly what the slot math computes."""
+def test_the_builder_uploads_the_draft_slots(dcp):
+    """The target's builder uploads, at entry granularity and with no DCP
+    filter, the host slot of every scheduled token."""
     vblock = 128 * dcp
     positions = [vblock - 2, vblock - 1, vblock, 5, 6]
-    got = _publish(128, dcp, _TABLES, _SEQLENS, positions, running_bs=4)
-    assert got.tolist() == _slots(vblock, _TABLES, _SEQLENS, positions).tolist()
+    stub = _builder_stub(vblock, _TABLES, positions)
+    got = _publish(stub, _SEQLENS, len(positions), _TABLES)
+    assert got[:5].tolist() == _host_slots(_TABLES, _SEQLENS, positions, vblock)
 
 
-def test_draft_slots_are_published_for_an_empty_forward():
-    """Zero tokens still publish (an empty map), so the layer never sees None."""
-    got = _publish(128, 8, _TABLES, [0, 0], [])
-    assert got is not None and got.numel() == 0
+def test_the_builder_drops_the_padded_decode_rows():
+    """Graph-padded rows past the scheduled tokens get `-1`, written nowhere."""
+    stub = _builder_stub(1024, _TABLES, [3, 4, 7, 8])
+    got = _publish(stub, [2, 2], 6, _TABLES)
+    assert got[:6].tolist() == [
+        7 * 1024 + 3,
+        7 * 1024 + 4,
+        4 * 1024 + 7,
+        4 * 1024 + 8,
+        -1,
+        -1,
+    ]
 
 
-def test_dflash_context_write_refuses_a_missing_draft_slot_map(monkeypatch):
-    """No silent fallback to the target's DCP-filtered `slot_mapping`."""
+def test_the_builder_skips_dummy_runs_and_drafts_without_a_pool():
+    """A dummy run uploads nothing; a target with no pooled draft has no
+    buffer to fill and is a no-op."""
+    stub = _builder_stub(1024, _TABLES, [0, 1])
+    assert _publish(stub, [2], 2, _TABLES, dummy=True)[:2].tolist() == [0, 0]
+    del stub.model_runner.forward_vars["draft_ctx_slots"]
+    assert _publish(stub, [2], 2, _TABLES) is None
+
+
+def _compute_draft_kv(kv_pool_spec, n_tok):
+    """Drive the real `compute_draft_kv`; return what reached the model."""
+    import torch
+
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    from atom.utils import CpuGpuBuffer
+
+    slots = CpuGpuBuffer(16, dtype=torch.int64, device="cpu", pin_memory=False)
+    slots.gpu.copy_(torch.arange(16) + 100)
+    seen = {}
+    stub = types.SimpleNamespace(
+        aux_for=lambda h: [h],
+        runner=types.SimpleNamespace(forward_vars={"draft_ctx_slots": slots}),
+        model=types.SimpleNamespace(
+            kv_pool_spec=kv_pool_spec,
+            write_context_kv=lambda aux, pos, slot_mapping: seen.update(
+                rows=aux.shape[0], slots=slot_mapping
+            ),
+        ),
+    )
+    fwd = types.SimpleNamespace(context=types.SimpleNamespace(scheduled_bs=1))
+    orig = proposer.get_forward_context
+    proposer.get_forward_context = lambda: fwd
+    try:
+        proposer.DSparkProposer.compute_draft_kv(
+            stub, torch.arange(n_tok), torch.zeros(n_tok, 4), None
+        )
+    finally:
+        proposer.get_forward_context = orig
+    return seen
+
+
+def test_the_proposer_hands_a_pooled_draft_its_own_slots():
+    """A draft with a declared pool gets the builder's slots, one per row."""
+    from atom.spec_decode.draft_kv import DraftKvPoolSpec
+
+    seen = _compute_draft_kv(DraftKvPoolSpec(flash_layout=True, in_dcp_group=False), 5)
+    assert seen["rows"] == 5
+    assert seen["slots"].tolist() == [100, 101, 102, 103, 104]
+
+
+def test_the_proposer_hands_other_drafts_no_slots():
+    """Every other draft writes at the target's slots, so gets None."""
+    assert _compute_draft_kv(None, 5)["slots"] is None
+
+
+def test_the_draft_fans_its_slots_out_to_every_context_layer(monkeypatch):
+    """`DSparkDraftModel.write_context_kv` passes the slots to each layer."""
+    import torch
+
+    import atom.utils.forward_context as fc
+    from atom.models.dspark_draft import DSparkDraftModel
+
+    calls = []
+
+    class _Layer:
+        def write_context_kv(self, ctx_hidden, positions, slot_mapping):
+            calls.append(slot_mapping)
+
+    layers = [_Layer(), _Layer()]
+
+    class _Draft(DSparkDraftModel):
+        def project_context(self, aux_concat):
+            return aux_concat
+
+        @property
+        def context_layers(self):
+            return layers
+
+    monkeypatch.setattr(
+        fc,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(
+            context=types.SimpleNamespace(is_dummy_run=False)
+        ),
+    )
+    slots = torch.arange(4)
+    DSparkDraftModel.write_context_kv(_Draft(), torch.zeros(4, 2), None, slots)
+    assert len(calls) == 2 and all(c is slots for c in calls)
+
+
+def test_the_dflash_layer_writes_at_the_slots_it_is_handed():
+    """No read of the target's DCP-filtered `slot_mapping` on the way down."""
     import torch
 
     m = _gpu_stack_import("atom.models.kimi_k3_dflash")
-    from atom.utils import forward_context as fc
-
-    meta = fc.AttentionMetaData(slot_mapping=torch.zeros(4, dtype=torch.int64))
-    monkeypatch.setattr(
-        m, "get_forward_context", lambda: types.SimpleNamespace(attn_metadata=meta)
-    )
-    with pytest.raises(RuntimeError, match="draft slot mapping"):
-        m.KimiK3DFlashDecoderLayer.write_context_kv(
-            types.SimpleNamespace(), torch.zeros(4, 8), torch.arange(4)
+    seen = {}
+    layer = types.SimpleNamespace(
+        self_attn=types.SimpleNamespace(
+            write_context_kv=lambda h, p, s: seen.update(slots=s)
         )
+    )
+    slots = torch.arange(4)
+    m.KimiK3DFlashDecoderLayer.write_context_kv(
+        layer, torch.zeros(4, 8), torch.arange(4), slots
+    )
+    assert seen["slots"] is slots
 
 
 # --------------------------------------------------------------------------- #
@@ -1426,11 +1478,14 @@ def test_context_write_drops_padded_target_rows(monkeypatch):
     monkeypatch.setattr(
         dspark_draft.DSparkDraftModel,
         "write_context_kv",
-        lambda self, aux, pos: seen.update(rows=aux.shape[0], pos=pos.shape[0]),
+        lambda self, aux, pos, slots: seen.update(
+            rows=aux.shape[0], pos=pos.shape[0], slots=slots
+        ),
     )
     draft = dflash.KimiK3DFlash.__new__(dflash.KimiK3DFlash)
-    draft.write_context_kv(torch.zeros(12, 4), torch.arange(9))
-    assert seen == {"rows": 9, "pos": 9}
+    slots = torch.arange(9)
+    draft.write_context_kv(torch.zeros(12, 4), torch.arange(9), slots)
+    assert seen == {"rows": 9, "pos": 9, "slots": slots}
 
 
 def test_dflash_draft_is_refused_on_a_non_k3_target():

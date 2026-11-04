@@ -384,12 +384,13 @@ class M3DSparkDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def write_context_kv(self, ctx_hidden, positions) -> None:
+    def write_context_kv(self, ctx_hidden, positions, slot_mapping=None) -> None:
         """Populate this layer's context rows at the TARGET forward's slots,
         which are still the installed metadata when the proposer calls this."""
-        slot_mapping = get_forward_context().attn_metadata.slot_mapping[
-            : ctx_hidden.shape[0]
-        ]
+        if slot_mapping is None:
+            slot_mapping = get_forward_context().attn_metadata.slot_mapping[
+                : ctx_hidden.shape[0]
+            ]
         self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
 
     def forward(self, positions, hidden_states, residual=None):

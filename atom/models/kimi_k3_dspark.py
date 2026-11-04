@@ -477,7 +477,7 @@ class K3DSparkDecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp.gate_up_proj",
         )
 
-    def write_context_kv(self, ctx_hidden, positions) -> None:
+    def write_context_kv(self, ctx_hidden, positions, slot_mapping=None) -> None:
         """Populate this layer's context rows.
 
         The context source does NOT go through ``input_layernorm``: the reference
@@ -487,9 +487,10 @@ class K3DSparkDecoderLayer(nn.Module):
         """
         from atom.utils.forward_context import get_forward_context
 
-        slot_mapping = get_forward_context().attn_metadata.slot_mapping[
-            : ctx_hidden.shape[0]
-        ]
+        if slot_mapping is None:
+            slot_mapping = get_forward_context().attn_metadata.slot_mapping[
+                : ctx_hidden.shape[0]
+            ]
         self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
 
     def forward(

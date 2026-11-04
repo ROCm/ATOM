@@ -8,7 +8,7 @@ from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
-from atom.spec_decode.draft_kv import block_page_idx, draft_ctx_slots, entry_slots
+from atom.spec_decode.draft_kv import block_page_idx, entry_slots
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
@@ -68,10 +68,6 @@ class DSparkProposer(Drafter):
         # unset.
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
-        # None unless the draft owns a pool: `compute_draft_kv` reads these
-        # for every flavor, V4's inline draft included.
-        self._blk_ctx_slots = None
-        self._blk_tok_ramp = None
         if self._with_draft:
             self._init_draft_block_buffers()
 
@@ -248,13 +244,6 @@ class DSparkProposer(Drafter):
             ),
             **i32,
         )
-
-        if self.model.kv_pool_spec is not None:
-            # One slot per token of the target forward, prefill chunks included.
-            n_tok = int(self.config.max_num_batched_tokens)
-            self._blk_ctx_slots = torch.zeros(n_tok, **i64)
-            # int32 to match `cu_seqlens_q`: `searchsorted` will not mix dtypes.
-            self._blk_tok_ramp = torch.arange(n_tok, **i32)
 
         self._blk_dtype_q = None
 
@@ -646,9 +635,11 @@ class DSparkProposer(Drafter):
           * V4 (inline draft): scatter into a private rolling target-KV window.
           * Kimi-K3 (standalone draft): scatter into the paged sibling latent
             pool at the verified tokens' slots.
-        Both take the same ``(main_hidden_all, positions)`` contract, so this
-        hook stays flavor-agnostic -- the per-request geometry (window span vs
-        slot mapping) lives inside the model, read off the live forward context.
+        Both take the same ``(main_hidden_all, positions, slot_mapping)``
+        contract, so this hook stays flavor-agnostic -- the per-request geometry
+        (window span vs slot mapping) lives inside the model, read off the live
+        forward context. ``slot_mapping`` is the one exception: a draft with a
+        pool of its own is handed the slots the target's builder uploaded for it.
 
         Every scheduled row is written, prefill and decode alike: the read side
         gathers by absolute position without checking what was written, so
@@ -665,48 +656,17 @@ class DSparkProposer(Drafter):
         forward_context = get_forward_context()
         scheduled_bs = forward_context.context.scheduled_bs
         main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
-        # Torn down after the write so no later reader sees a stale mapping.
-        self._publish_draft_ctx_slots(forward_context, positions)
-        try:
-            with record_function(
-                f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
-            ):
-                self.model.write_context_kv(main_hidden_all, positions)
-        finally:
-            if self._blk_ctx_slots is not None:
-                forward_context.attn_metadata.draft_ctx_slot_mapping = None
-
-    def _publish_draft_ctx_slots(self, forward_context, positions) -> None:
-        """The DRAFT's own slot for every token of this target forward.
-
-            slot = block_table[req, pos // vblock] * vblock + pos % vblock
-
-        with `vblock = _draft_entry_tokens` and no DCP rank filter: the draft
-        stores every position, where the target's mapping drops the ones this
-        rank does not own. Computed on the device from `cu_seqlens_q` and the
-        block tables the target's builder already uploaded, so no host sync.
-        No-op for a draft without its own pool.
-        """
-        if self._blk_ctx_slots is None:
-            return
-        ctx = forward_context.context
-        n = int(positions.shape[0])
-        out = self._blk_ctx_slots[:n]
-        forward_context.attn_metadata.draft_ctx_slot_mapping = out
-        if n == 0:
-            return
-        var = self.runner.forward_vars
-        # The padded batch: `cu_seqlens_q` is filled out to it, non-decreasing.
-        rows = max(int(ctx.running_bs), int(ctx.scheduled_bs), 1)
-        block_tables = var["block_tables"].gpu[:rows]
-        draft_ctx_slots(
-            out,
-            positions[:n],
-            var["cu_seqlens_q"].gpu[1 : rows + 1],
-            block_tables,
-            self._blk_tok_ramp[:n],
-            self._draft_entry_tokens,
-        )
+        # A draft with a declared pool writes at the slots the target's builder
+        # uploaded for it; any other draft at the target's own.
+        slot_mapping = None
+        if self.model.kv_pool_spec is not None:
+            slot_mapping = self.runner.forward_vars["draft_ctx_slots"].gpu[
+                : positions.shape[0]
+            ]
+        with record_function(
+            f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
+        ):
+            self.model.write_context_kv(main_hidden_all, positions, slot_mapping)
 
     def propose(
         self,
@@ -963,7 +923,7 @@ class DSparkProposer(Drafter):
         else:
             # Unfiltered: this rank holds the whole token axis, so `ctx_lens`
             # is the global length.
-            entry_slots(slots, block_tables, None, block_positions, entry_tokens)
+            entry_slots(slots, block_tables, block_positions, entry_tokens)
             ctx_lens.copy_(global_lens)
 
         # The CSR generator skips entries past the block table's width, so

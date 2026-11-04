@@ -290,28 +290,18 @@ class KimiK3DFlashDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         return self.mlp(hidden_states), residual
 
-    def write_context_kv(self, ctx_hidden: torch.Tensor, positions: torch.Tensor):
+    def write_context_kv(
+        self,
+        ctx_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ):
         """The context rows bypass `input_layernorm`.
 
         The reference feeds `hidden_norm(fc(aux))` straight into k_proj/v_proj;
         only the noise stream goes through the layer's input norm.
         """
-        fwd_ctx = get_forward_context()
-        attn_metadata = fwd_ctx.attn_metadata
-        # Not `attn_metadata.slot_mapping`: under DCP the target's is -1 for
-        # tokens this rank does not own, while this draft stores every token.
-        slot_mapping = attn_metadata.draft_ctx_slot_mapping
-        if slot_mapping is None:
-            raise RuntimeError(
-                "DFlash context write without a published draft slot mapping"
-            )
-        rows = ctx_hidden.shape[0]
-        if slot_mapping.shape[0] < rows:
-            raise RuntimeError(
-                f"DFlash context write has {rows} rows but only "
-                f"{slot_mapping.shape[0]} draft slots"
-            )
-        self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping[:rows])
+        self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
 
 
 def _draft_rope_kwargs(config) -> dict:
@@ -589,11 +579,18 @@ class KimiK3DFlash(DSparkDraftModel):
 
     # -- DSparkDraftModel contract ----------------------------------------
 
-    def write_context_kv(self, aux_concat: torch.Tensor, positions: torch.Tensor):
+    def write_context_kv(
+        self,
+        aux_concat: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor | None = None,
+    ):
         # Under TR_HYBRID the runner hands over `running_tokens` rows of target
         # hidden state but only the scheduled rows' `positions`; the padded tail
         # has no slot to land in, so it is dropped before the projection.
-        super().write_context_kv(aux_concat[: positions.shape[0]], positions)
+        super().write_context_kv(
+            aux_concat[: positions.shape[0]], positions, slot_mapping
+        )
 
     @property
     def first_attention_layer_num(self) -> int:

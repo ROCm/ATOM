@@ -592,7 +592,7 @@ def test_write_context_kv_stays_eager_and_still_writes():
     calls = []
 
     class _StageStub:
-        def write_context_kv(self, ctx_hidden, positions):
+        def write_context_kv(self, ctx_hidden, positions, slot_mapping=None):
             calls.append(ctx_hidden.shape[0])
 
     class _StubCtx:

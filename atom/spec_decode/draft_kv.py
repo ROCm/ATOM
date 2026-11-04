@@ -71,42 +71,21 @@ def block_page_idx(
     return page_idx.clamp_(max=block_tables.shape[1] - 1), in_table
 
 
-def entry_slots(out, block_tables, req, positions, vblock):
+def entry_slots(out, block_tables, positions, vblock):
     """Every position's slot at ``vblock``-token entries, into ``out``.
 
-        slot = block_tables[req, pos // vblock] * vblock + pos % vblock
+        slot = block_tables[r, pos // vblock] * vblock + pos % vblock
 
-    ``req`` names each position's table row; ``None`` means ``positions`` is
-    already laid out one row per table row, ``[rows, n]``. A column the table
-    does not have is ``-1`` (see `block_page_idx`). On the device, no host
-    sync.
+    ``positions`` is laid out one row per table row, ``[rows, n]``. A column
+    the table does not have is ``-1`` (see `block_page_idx`). On the device, no
+    host sync.
     """
     page_idx, in_table = block_page_idx(positions, vblock, block_tables)
-    if req is None:
-        out.copy_(torch.gather(block_tables, 1, page_idx))
-    else:
-        out.copy_(block_tables[req, page_idx])
+    out.copy_(torch.gather(block_tables, 1, page_idx))
     out.mul_(vblock)
     out.add_(torch.remainder(positions, vblock))
     out.masked_fill_(~in_table, -1)
     return out
-
-
-def draft_ctx_slots(out, positions, cu_ends, block_tables, tok_ramp, vblock):
-    """The DFlash draft's own slot for each target token, into ``out``.
-
-    `entry_slots` with each token's request resolved from ``cu_ends``, which
-    is ``cu_seqlens_q[1 : rows + 1]``, the requests' exclusive token ends;
-    ``tok_ramp`` is ``arange(n)`` in their dtype. All on the device, no host
-    sync.
-    """
-    rows = cu_ends.shape[0]
-    # `right=True` on the EXCLUSIVE ends: token t belongs to the first request
-    # whose end is strictly past it. The clamp is for the one token that can
-    # equal the last end; a gather out of bounds is a fault rather than a wrong
-    # answer, so it is cheap insurance.
-    req = torch.searchsorted(cu_ends, tok_ramp, right=True).clamp_(max=rows - 1)
-    return entry_slots(out, block_tables, req, positions, vblock)
 
 
 def draft_kv_builder(model_runner, draft_hf, model):

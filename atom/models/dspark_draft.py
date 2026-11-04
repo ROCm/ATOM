@@ -319,6 +319,7 @@ class DSparkDraftModel(nn.Module):
         self,
         aux_concat: torch.Tensor,  # [N, target_hidden * num_target_layers]
         positions: torch.Tensor,  # [N] absolute positions
+        slot_mapping: torch.Tensor | None = None,  # [N] slots in the draft's pool
     ) -> None:
         """Absorb one target forward's hidden states into this draft's KV.
 
@@ -327,6 +328,9 @@ class DSparkDraftModel(nn.Module):
         layer reads its own addressing (``cu_seqlens_q``, ``slot_mapping``, ...)
         off the live forward context rather than taking it as an argument,
         because the two flavors need different pieces of the same metadata.
+        The exception is a draft with a pool of its own (``kv_pool_spec``):
+        the target's metadata does not address it, so its slots come in as
+        ``slot_mapping``, None for every other draft.
 
         That makes the call site load-bearing: this must run while
         ``attn_metadata`` still describes the TARGET forward that produced
@@ -346,7 +350,7 @@ class DSparkDraftModel(nn.Module):
             return
         ctx_hidden = self.project_context(aux_concat)
         for layer in self.context_layers:
-            layer.write_context_kv(ctx_hidden, positions)
+            layer.write_context_kv(ctx_hidden, positions, slot_mapping)
 
     def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
         """Fuse the concatenated target aux hidden states into one [N, hidden]
