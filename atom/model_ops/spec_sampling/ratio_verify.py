@@ -40,8 +40,9 @@ _RATIO_RESIDUAL_KEY = 2 << 32
 
 # Stored q entries one lookup iteration covers.
 _RATIO_BLOCK_Q = 1024
-# Stored q entries the residual race places per step: each is compared
-# against every lane of its V tile, so the step stays narrow.
+# Stored q entries the residual race places per step, from the span its V
+# tile's binary searches found: each is compared against every lane of the
+# tile, so the step stays narrow.
 _RATIO_RACE_BLOCK_Q = 32
 
 
@@ -286,6 +287,22 @@ def _target_p_tile(
     return p
 
 
+@triton.jit
+def _lower_bound(ids_ptr, n, x, STEPS: tl.constexpr):
+    """The first of the ``n`` ascending ``ids`` that is at least ``x`` (``n``
+    if none): a binary search of ``STEPS`` probes, enough for ``n < 2**STEPS``."""
+    lo = n * 0
+    hi = n
+    for _ in tl.static_range(STEPS):
+        mid = (lo + hi) // 2
+        open_ = lo < hi
+        v = tl.load(ids_ptr + mid, mask=open_ & (mid < n), other=0)
+        right = open_ & (v < x)
+        lo = tl.where(right, mid + 1, lo)
+        hi = tl.where(open_ & ~right, mid, hi)
+    return lo
+
+
 @triton.jit(do_not_specialize=["batch_size", "q_width", "residual_seed"])
 def _ratio_residual_race_kernel(
     residual_row_ptr,  # [batch_size] int32, the rejecting row, or -1
@@ -308,6 +325,7 @@ def _ratio_residual_race_kernel(
     residual_seed,
     BLOCK_V: tl.constexpr,
     BLOCK_Q: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
     FILTER: tl.constexpr,
 ):
     """One (request, V tile) of the residual race ``relu(p_f - q) / E``, for
@@ -316,8 +334,9 @@ def _ratio_residual_race_kernel(
     and finding out on the host would stall the verify on a readback.
 
     q is read from the rejecting row of the sparse store itself: its stored
-    ids ascend, so the program walks the row ``BLOCK_Q`` entries at a time and
-    places only the entries inside its tile; q is 0 on every other lane."""
+    ids ascend, so two binary searches find the span inside this tile, and
+    only that span is read, ``BLOCK_Q`` entries at a time; q is 0 on every
+    other lane."""
     req_idx = tl.program_id(0)
     tile = tl.program_id(1)
     row, q_base, has_q = _rejecting_row_of(residual_row_ptr, q_row_base_ptr, req_idx)
@@ -346,18 +365,17 @@ def _ratio_residual_race_kernel(
                 start_idx = tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
             q_row = (q_base + row - start_idx).to(tl.int64)
             n = tl.minimum(tl.maximum(tl.load(q_meta_ptr + q_row * 2), 0), q_width)
-            for start in range(0, n, BLOCK_Q):
+            row_ids = q_ids_ptr + q_row * q_width
+            first = _lower_bound(row_ids, n, tile_lo, SEARCH_STEPS)
+            last = _lower_bound(row_ids, n, tile_lo + BLOCK_V, SEARCH_STEPS)
+            for start in range(first, last, BLOCK_Q):
                 e = start + tl.arange(0, BLOCK_Q)
-                emask = e < n
-                ids = tl.load(q_ids_ptr + q_row * q_width + e, mask=emask, other=-1)
-                inside = emask & (ids >= tile_lo) & (ids < tile_lo + BLOCK_V)
-                if tl.sum(inside.to(tl.int32), axis=0) > 0:
-                    probs = tl.load(
-                        q_probs_ptr + q_row * q_width + e, mask=inside, other=0.0
-                    )
-                    # Stored ids are distinct, so each lane takes at most one.
-                    hit = inside[:, None] & (ids[:, None] == offs[None, :])
-                    q += tl.sum(tl.where(hit, probs[:, None], 0.0), axis=0)
+                inside = e < last
+                ids = tl.load(row_ids + e, mask=inside, other=-1)
+                probs = tl.load(q_probs_ptr + q_row * q_width + e, mask=inside, other=0.0)
+                # Stored ids are distinct, so each lane takes at most one.
+                hit = inside[:, None] & (ids[:, None] == offs[None, :])
+                q += tl.sum(tl.where(hit, probs[:, None], 0.0), axis=0)
         # Anything that is not a probability (NaN, inf, negative) counts as 0,
         # so the residual falls back toward p rather than inheriting garbage.
         q = tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
@@ -557,6 +575,7 @@ def _ratio_sample(
         _RATIO_RESIDUAL_KEY | ratio_step,
         BLOCK_V=_RATIO_BLOCK_V,
         BLOCK_Q=_RATIO_RACE_BLOCK_Q,
+        SEARCH_STEPS=q_width.bit_length(),
         FILTER=filtered,
         num_warps=8,
     )
