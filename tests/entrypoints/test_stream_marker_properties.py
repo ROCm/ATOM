@@ -53,7 +53,6 @@ import pytest
 from atom.entrypoints.openai.reasoning import (
     ReasoningChannel,
     ReasoningFilter,
-    separate_reasoning,
 )
 from atom.entrypoints.openai.reasoning_dialects import DIALECTS, resolve_dialect
 from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
@@ -518,12 +517,11 @@ class TestEverySeedingSiteIsSeeded:
     # `ReasoningChannel(...)` is what the endpoints build now; the other two
     # are what it is built from, and a caller reaching past it must answer the
     # same question.
-    SEEDED = ("ReasoningChannel", "ReasoningFilter", "separate_reasoning")
+    SEEDED = ("ReasoningChannel", "ReasoningFilter")
     # The keyword each of them spells the answer with.
     SEED_KWARG: ClassVar[dict[str, str]] = {
         "ReasoningChannel": "starts_open",
         "ReasoningFilter": "starts_thinking",
-        "separate_reasoning": "starts_thinking",
     }
 
     def _unseeded(self) -> list[str]:
@@ -553,9 +551,9 @@ class TestEverySeedingSiteIsSeeded:
                     ),
                     None,
                 )
-                # Positional counts: `separate_reasoning(text, seeded)` is a
+                # Positional counts: `ReasoningChannel(dialect, seeded)` is a
                 # correct call and an earlier version of this scan rejected it.
-                if seed is None and name == "separate_reasoning":
+                if seed is None and name == "ReasoningChannel":
                     seed = node.args[1] if len(node.args) > 1 else None
                 rel = path.relative_to(self.ROOT.parents[1])
                 if seed is None:
@@ -607,11 +605,11 @@ class TestEverySeedingSiteIsSeeded:
         "source, ok",
         [
             ("ReasoningFilter(starts_thinking=prompt_starts_in_reasoning(p))", True),
-            ("separate_reasoning(t, starts_thinking=seeded or flag)", True),
-            ("separate_reasoning(t, seeded)", True),
+            ("ReasoningChannel(d, starts_open=seeded or flag)", True),
+            ("ReasoningChannel(d, seeded)", True),
             ("ReasoningFilter()", False),
             ("ReasoningFilter(starts_thinking=False)", False),
-            ("separate_reasoning(t)", False),
+            ("ReasoningChannel(d)", False),
         ],
     )
     def test_the_scan_accepts_answers_and_rejects_literals(self, source, ok, tmp_path):
@@ -747,6 +745,13 @@ def reasoning_shapes(dialect) -> list[str]:
             out.add(a + answer_m + b + end_m + c)  # and the channel then closes
             out.add(a + answer_m + end_m + c)  # or closes right after it
             out.add(a + answer_m + "\n" + c)  # whitespace after the closer
+    # Outputs longer than a 4 KiB piece, each with its marker across
+    # 4095/4096, where a reader that chunked a whole output would cut it.
+    for head, marker in [("", end_m), (open_m, end_m)] + [
+        ("", m) for m in dialect.answer_end_markers
+    ]:
+        pad = "x" * (4096 - len(head) - len(marker) // 2)
+        out.add(head + pad + marker + "the answer")
     return sorted(out)
 
 
@@ -925,7 +930,7 @@ class TestTheReasoningReadIsChunkInvariant:
         rule was written for one stage later, and the one measured here
         before the strips came out.
         """
-        assert separate_reasoning(text, starts_thinking=False)[1] == expected
+        assert ReasoningChannel(starts_open=False).split(text)[1] == expected
         f = ReasoningFilter(starts_thinking=False)
         segs = f.process(text) + f.flush()
         assert "".join(t for k, t in segs if k == "content") == expected

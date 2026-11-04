@@ -19,8 +19,8 @@ from __future__ import annotations
 import pytest
 
 from atom.entrypoints.openai.reasoning import (
+    ReasoningChannel,
     ReasoningFilter,
-    separate_reasoning,
     template_opens_reasoning_implicitly,
 )
 
@@ -52,17 +52,17 @@ class TestWhatItBuys:
 
     def test_unseeded_and_unflagged_the_end_marker_is_just_text(self):
         """The default, unchanged: nothing opened a channel, so nothing closed one."""
-        reasoning, content = separate_reasoning(self.RAW)
+        reasoning, content = ReasoningChannel().split(self.RAW)
         assert reasoning is None and content == self.RAW
 
     def test_flagged_the_reasoning_is_recovered(self):
-        reasoning, content = separate_reasoning(self.RAW, starts_thinking=True)
+        reasoning, content = ReasoningChannel(starts_open=True).split(self.RAW)
         assert reasoning == "Let me work it out."
         assert content == "\n\n2 + 2 = 4."
 
     def test_streaming_and_non_streaming_agree_once_flagged(self):
         """The flag is one value read by both paths, so they cannot diverge."""
-        reasoning, content = separate_reasoning(self.RAW, starts_thinking=True)
+        reasoning, content = ReasoningChannel(starts_open=True).split(self.RAW)
 
         rf = ReasoningFilter(starts_thinking=True)
         segments = []

@@ -115,13 +115,13 @@ def server(monkeypatch):
                 else [("content", text)]
             )
 
-        def flush(self):
+        def flush(self, *, stopped=True):
             return []
 
-        def read_whole(self, text):
-            return self.process(text) + self.flush()
+        def read_whole_events(self, text, *, stopped=True):
+            return self.process(text) + self.flush(stopped=stopped)
 
-        def split(self, text):
+        def split(self, text, *, stopped=True):
             return "", text
 
     monkeypatch.setattr(api_server, "generate_async", generate)

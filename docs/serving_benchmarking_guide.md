@@ -152,20 +152,9 @@ its end marker — not a stall: it is reasoning, and it is delivered as
 region* appears, everything from it onward belongs to the format until it can
 parse the region.
 
-One case is sent twice instead of held. A format can declare its answer's own
-closer (`answer_end_markers`; Kimi-K3's `<|close|>response<|sep|>`). A think
-channel whose last words, whitespace and framing aside, are that closer, and
-that ends at the end of the output or at a channel other than the answer's own
-(tools, say), was the reply: the model skipped the channel and wrote its
-answer there, which K3 does on ~1M-token prompts. That is only known when the
-channel ends, after the reply has streamed as `reasoning_content`, so it is
-sent again as `content`, and both delivery modes return the reply in both
-fields (on `/v1/messages`, in `content` alone unless thinking was requested,
-since that endpoint drops reasoning otherwise). The costs are that copy and
-the channel's text, kept as one string until the channel ends. Holding the
-channel back instead would stream no reasoning at all until it closed. A
-closer the channel goes on past (quoted, say), or one followed by the think
-exit into the answer's own channel, changes nothing.
+One case is sent twice instead of held: a dialect that declares
+`answer_end_markers` replays a think channel the model used as its reply as
+`content` once that is known (see `ReasoningFilter._close_channel`).
 
 ##### What is held, and for how long
 
@@ -360,9 +349,8 @@ agree on all of them, and the property that says so is byte-exact rather than
 word-level.
 
 There is one reader: the non-streaming split is the streaming filter run over
-the whole output, fed in bounded pieces so that the cost stays linear in the
-output however many markers it carries, and the filter is chunk-invariant, so
-the two delivery modes cannot disagree.
+the whole output, once, and the filter is chunk-invariant, so the two delivery
+modes cannot disagree.
 
 The streaming filter also stopped eating the newline after its end marker. It
 only ever saw what happened to be buffered when the marker arrived, so the

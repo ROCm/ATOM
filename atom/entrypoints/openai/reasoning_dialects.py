@@ -24,17 +24,6 @@ from dataclasses import dataclass
 
 from . import kimi_k3_tokens as k3
 
-# Structured-channel format tokens (``<|open|>SECTION<|sep|>`` ... framing).
-# Named by the format concept, not the model: channel formats are a cross-model
-# pattern (e.g. gpt-oss/Harmony uses the same idea with different framing tokens).
-# The token *values* below are Kimi-K3's — a different channel-format model would
-# declare its own values. Declared locally so this module is self-contained
-# (each parser owns the token strings it uses); the tool-call parser keeps its
-# own copies of the subset it needs.
-CHANNEL_THINK_START = "<|open|>think<|sep|>"
-CHANNEL_THINK_END = "<|close|>think<|sep|>"
-CHANNEL_RESPONSE_START = "<|open|>response<|sep|>"
-
 
 @dataclass(frozen=True)
 class ReasoningDialect:
@@ -89,7 +78,8 @@ class ReasoningDialect:
 # --- Generic <think>...</think> dialect (K2/DeepSeek/Qwen3/MiniMax/...) ---
 
 # No `\s*` after `</think>`. The newline a model puts before its answer is
-# not a marker this dialect declares, so it survives -- see `separate_reasoning`.
+# not a marker this dialect declares, so it survives -- see
+# `ReasoningChannel.split`.
 THINK_OPEN_MARKER = "<think>"
 THINK_END_MARKER = "</think>"
 
@@ -108,9 +98,9 @@ MM_THINK_END_MARKER = "</mm:think>"
 # one output stream carrying several named sections (think / response / tools),
 # each wrapped in framing tokens, that we de-multiplex into separate fields.
 # Harmony's analysis/final/commentary channels map onto K3's think/response/tools.
-# We name the tokens by this cross-model concept (CHANNEL_*) rather than by the
-# model. Channel-format models differ in their framing tokens, so each gets its
-# own DIALECTS entry; the entry below carries Kimi-K3's token values.
+# Channel-format models differ in their framing tokens, so each gets its own
+# DIALECTS entry; the entry below carries Kimi-K3's, read from
+# `kimi_k3_tokens`, the one module that spells them.
 #
 # Detection/priority order: structured-channel dialects before inline-tag ones,
 # so `resolve_dialect` tries a specific channel marker before the generic
@@ -123,14 +113,14 @@ MM_THINK_END_MARKER = "</mm:think>"
 _CHANNEL_CONTENT_FRAMING = k3.CHANNEL_FRAMING
 
 _CHANNEL_DIALECT = ReasoningDialect(
-    prompt_open_marker=CHANNEL_THINK_START,
+    prompt_open_marker=k3.THINK_START,
     # The same literal, not `None`. "The template injects it, so the model
     # never writes one" is false when the prompt leaves thinking off and the
     # model opens a channel anyway -- and `ReasoningFilter` builds
     # `_open_markers` from this field, so state 0 had nothing to leave itself
     # on and delivered the whole trace as the answer.
-    output_open_marker=CHANNEL_THINK_START,
-    think_end_marker=CHANNEL_THINK_END,
+    output_open_marker=k3.THINK_START,
+    think_end_marker=k3.THINK_END,
     # `response` is what the trained format always opens next -- Kimi-K3's
     # encoder emits a complete response section before any tools section, so
     # `tools` is reachable only from a malformed generation. Listed anyway,
@@ -138,17 +128,17 @@ _CHANNEL_DIALECT = ReasoningDialect(
     # `<|open|>tools<|sep|>` puts the entire tool call in `reasoning_content`
     # with empty `content`, on both delivery paths, and on `/v1/messages`
     # where reasoning is dropped by default the client gets nothing at all.
-    extra_end_markers=(CHANNEL_RESPONSE_START, k3.TOOLS_START),
+    extra_end_markers=(k3.RESPONSE_START, k3.TOOLS_START),
     # The answer's closer, which the trained format writes only after
     # `<|open|>response<|sep|>`.
     answer_end_markers=(k3.RESPONSE_END,),
     template_efforts=frozenset({"low", "high", "max"}),  # Kimi-K3
-    template_markers=(CHANNEL_THINK_START, CHANNEL_THINK_END),
+    template_markers=(k3.THINK_START, k3.THINK_END),
     content_framing=_CHANNEL_CONTENT_FRAMING,
 )
 
 DIALECTS: tuple[ReasoningDialect, ...] = (
-    # Structured channel format — Kimi-K3 token values (see CHANNEL_* above)
+    # Structured channel format — Kimi-K3's token values
     _CHANNEL_DIALECT,
     # MiniMax-M3: the inline-tag shape in its own spelling. Before the generic
     # entry, so its longer markers are matched first -- though the two sets do

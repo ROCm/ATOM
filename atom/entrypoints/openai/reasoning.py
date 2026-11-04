@@ -32,10 +32,17 @@ _REASONING_OPEN_MARKERS = tuple(d.prompt_open_marker for d in DIALECTS)
 # resolve_thinking() clamps a request's effort to this set before forwarding it,
 # so an effort no template understands is never passed through.
 VALID_TEMPLATE_EFFORTS = frozenset().union(*(d.template_efforts for d in DIALECTS))
-# A complete output is read in pieces of this size. The filter answers the
-# same at any chunking, but one piece per output made every marker re-scan
-# and copy the rest of it: quadratic in the marker count, on the event loop.
-_WHOLE_OUTPUT_PIECE = 4096
+# The most a replayed reply is sent as in one event, so a long one reaches
+# the tool parser and the client in pieces rather than one oversized frame.
+_REPLAY_PIECE = 4096
+
+
+def ended_by_stop(finish_reason: str | None) -> bool:
+    """Did the model end its output itself -- EOS, a stop token or a stop
+    sequence -- rather than being cut off (`max_tokens`, abort)?"""
+    return finish_reason is not None and (
+        finish_reason == "eos" or finish_reason.startswith("stop")
+    )
 
 
 def template_opens_reasoning_implicitly(template_source: str) -> bool:
@@ -135,16 +142,6 @@ def prompt_tokens_start_in_reasoning(
     return prompt_starts_in_reasoning(decode(token_ids[-tail:]))
 
 
-def separate_reasoning(
-    text: str,
-    starts_thinking: bool = False,
-    dialect: ReasoningDialect | None = None,
-) -> tuple[str | None, str]:
-    """``(reasoning_content, content)`` of a complete output; see
-    :meth:`ReasoningChannel.split`, which callers should use instead."""
-    return ReasoningChannel(dialect=dialect, starts_open=starts_thinking).split(text)
-
-
 class ReasoningFilter:
     """Stateful streaming filter that separates reasoning from content.
 
@@ -241,6 +238,8 @@ class ReasoningFilter:
                 if text:
                     out.append((self._field, text))
                 return out
+            # After a hit the scanner keeps the text past it, so the next
+            # pass reads on with `text` empty.
             scan = self._scanner.feed(text)
             text = ""
             if scan.released:
@@ -254,7 +253,6 @@ class ReasoningFilter:
             if self.state == 1 and scan.hit in self._answer_end_markers:
                 # Decided by what follows: see `_close_channel`.
                 self._answer_closed = True
-                text = scan.rest
                 continue
             if scan.hit in self._framing and not (
                 self.state == 1 and scan.hit in self._end_markers
@@ -264,73 +262,81 @@ class ReasoningFilter:
                 # answer depend on which tool-call format was resolved, so a
                 # K3 deployment whose template refused the tools probe handed
                 # its channel tokens to the client on both delivery paths.
-                text = scan.rest
                 continue
             if self.state == 0 and scan.hit == self._think_end:
                 if self._at_offset_zero:
-                    self.state = 2  # declined to think; the rest is the answer
-                    self._scanner = self._scanner_for(self.state)
+                    text = self._enter(2)  # declined to think; the rest is the answer
                 else:
                     out.append((self._field, scan.hit))  # the model's own words
-                text = scan.rest
                 continue
             # A channel boundary: state 0 -> 1 on the opener, 1 -> 2 on any
             # end marker. A dialect that opens the channel from the prompt has
             # no opener to see, so it starts in state 1 and only ever takes
             # the second of these.
             if self.state == 1:
-                out.extend(self._close_channel(scan.hit))
-            self.state = 1 if self.state == 0 else 2
-            self._scanner = self._scanner_for(self.state)
-            text = scan.rest
+                out.extend(self._close_channel(scan.hit, stopped=True))
+            text = self._enter(1 if self.state == 0 else 2)
+
+    def _enter(self, state: int) -> str:
+        """Move to `state`, whose markers differ; return the text the old
+        state's scanner had not read yet, for the new one."""
+        rest = self._scanner.take_rest() if self._scanner is not None else ""
+        self.state = state
+        self._scanner = self._scanner_for(state)
+        return rest
 
     def _keep(self, released: str) -> None:
         """Channel text, kept for the reply it may turn out to be.
 
         Words after the answer's closer mean it did not end the reply;
-        whitespace does not. The one place this is decided: the text the
-        scanner holds at the end of the output is a marker's first bytes cut
-        off, not words, so it is never kept.
+        whitespace does not. The text is looked at only once a closer has been
+        seen, so the common case is one write. The one place this is decided:
+        the text the scanner holds at the end of the output is a marker's
+        first bytes cut off, not words, so it is never kept.
         """
         if self._channel_text is None:
             return
         self._channel_text.write(released)
-        if not released.isspace():
+        if self._answer_closed and not released.isspace():
             self._answer_closed = False
 
-    def _close_channel(self, at: str | None) -> list:
+    def _close_channel(self, at: str | None, *, stopped: bool) -> list:
         """The channel has ended, at end marker ``at`` or, for ``None``, at
-        the end of the output.
+        the end of the output, which ``stopped`` says the model chose.
 
         If its last words, whitespace and framing aside, were the answer's
-        closer, and it did not end by handing over to the answer's own
-        channel, the model skipped the channel and wrote its reply there
-        (Kimi-K3 does this on ~1M-token prompts). That text already went out
-        as reasoning and cannot be recalled, so it goes out again as
-        `content`.
+        closer, it did not end by handing over to the answer's own channel,
+        and the output was not cut off, the model skipped the channel and
+        wrote its reply there. That text already went out as reasoning and
+        cannot be recalled, so it goes out again as `content`.
         """
         kept, self._channel_text = self._channel_text, None  # never reopens
-        if not self._answer_closed or at in self._exits_to_answer:
+        if not self._answer_closed or at in self._exits_to_answer or not stopped:
             return []
         reply = kept.getvalue()
-        return [("content", reply)] if reply else []
+        return [
+            ("content", reply[i : i + _REPLAY_PIECE])
+            for i in range(0, len(reply), _REPLAY_PIECE)
+        ]
 
-    def flush(self) -> list:
-        """End of stream: whatever is held never became a marker."""
+    def flush(self, *, stopped: bool = True) -> list:
+        """End of stream: whatever is held never became a marker.
+
+        ``stopped`` is :func:`ended_by_stop` of the finish reason. An output
+        cut off at `max_tokens` right after a quoted answer closer looks like a
+        finished reply, and only the finish reason tells the two apart.
+        """
         rest = self._scanner.flush() if self._scanner is not None else ""
         self._scanner = None
         out = [(self._field, rest)] if rest else []
         if self.state == 1:
-            out.extend(self._close_channel(None))
+            out.extend(self._close_channel(None, stopped=stopped))
         return out
 
-    def read_whole(self, text: str) -> list:
-        """A complete output's events, flushed. Fed in bounded pieces: see
-        `_WHOLE_OUTPUT_PIECE`."""
-        out: list = []
-        for at in range(0, len(text), _WHOLE_OUTPUT_PIECE):
-            out += self.process(text[at : at + _WHOLE_OUTPUT_PIECE])
-        return out + self.flush()
+    def read_whole_events(self, text: str, *, stopped: bool = True) -> list:
+        """A complete output's events, flushed: the whole output in one feed,
+        which `MarkerScanner` reads in time linear in its length."""
+        return self.process(text) + self.flush(stopped=stopped)
 
 
 @dataclass(frozen=True)
@@ -354,12 +360,13 @@ class ReasoningChannel:
     starts_open: bool = False
     literal_answer: bool = False
 
-    def split(self, text: str) -> tuple[str | None, str]:
+    def split(self, text: str, *, stopped: bool = True) -> tuple[str | None, str]:
         """A complete output as ``(reasoning, content)``: the stream's own
         events, so the two delivery modes cannot differ. Each half is
         byte-for-byte what the model wrote minus the markers the dialect
-        declares; ``reasoning`` is ``None`` when there is none."""
-        events = self.stream().read_whole(text)
+        declares; ``reasoning`` is ``None`` when there is none. ``stopped`` is
+        as for :meth:`ReasoningFilter.flush`."""
+        events = self.stream().read_whole_events(text, stopped=stopped)
         reasoning = "".join(v for k, v in events if k == "reasoning_content")
         content = "".join(v for k, v in events if k == "content")
         return reasoning or None, content

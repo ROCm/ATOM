@@ -41,6 +41,7 @@ from atom.entrypoints.openai.protocol import (
 from atom.entrypoints.openai.reasoning import (
     NO_REASONING,
     ReasoningChannel,
+    ended_by_stop,
     prompt_starts_in_reasoning,
     template_opens_reasoning_implicitly,
     thinking_switched_off,
@@ -801,7 +802,11 @@ class ChatCompletionStreamState:
 
         segments = self.reasoning_filters[index].process(text)
         if event.get("finished", False):
-            segments.extend(self.reasoning_filters[index].flush())
+            segments.extend(
+                self.reasoning_filters[index].flush(
+                    stopped=ended_by_stop(self.engine_finish_reasons[index])
+                )
+            )
 
         for field, segment_text in segments:
             if field == "reasoning_content":
