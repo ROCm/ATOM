@@ -3890,14 +3890,13 @@ class ModelRunner:
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()
             self._record_kv_cache_ready(batch)
-            output = ScheduledBatchOutput(
+            return ScheduledBatchOutput(
                 req_ids=list(batch.req_ids),
                 token_ids=[],
                 num_rejected=None,
                 num_bonus=None,
                 draft_token_ids=None,
             )
-            return output
 
         fwd_output = self.postprocess(
             batch,

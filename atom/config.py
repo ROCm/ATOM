@@ -2139,7 +2139,7 @@ class Config:
     enable_prefix_caching: bool = True
     # Return per-request MoE routes from generate() as int16
     # [seq_len - 1, num_layers, top_k]. Scatter is CUDA-graph-safe (device
-    # write inside fused MoE). Requires DCP=PCP=PP=1, no DP-attention, and
+    # write inside fused MoE). Requires DCP=PCP=PP=1, no plugin mode, and
     # no KV transfer / offload / RapidServe P/D; prefix cache stays on.
     enable_return_routed_experts: bool = False
     enable_chunked_prefill: bool = True

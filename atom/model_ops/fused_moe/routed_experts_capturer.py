@@ -19,6 +19,9 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 
+from atom.model_ops.attentions.token_layout.slots import slot_mapping
+from atom.utils.forward_context import get_forward_context
+
 _INSTANCE: RoutedExpertsCapturer | None = None
 
 # Missed captures read as this, never as a valid expert id.
@@ -98,8 +101,6 @@ def fused_moe_modules(root: Any) -> list:
 
 def prefix_slots(block_table: AbcSequence[int], lo: int, hi: int, block_size: int):
     """KV slots of token positions ``[lo, hi)`` for one request."""
-    from atom.model_ops.attentions.token_layout.slots import slot_mapping
-
     n = int(hi) - int(lo)
     blocks = np.asarray(block_table[: (int(hi) - 1) // block_size + 1], np.int32)
     return slot_mapping(
@@ -143,8 +144,6 @@ def current_slot_mapping() -> torch.Tensor:
     pick, and a forward without slots would silently drop its routes; both
     raise instead.
     """
-    from atom.utils.forward_context import get_forward_context
-
     md = getattr(get_forward_context(), "attn_metadata", None)
     slots = None if isinstance(md, dict) else getattr(md, "slot_mapping", None)
     if isinstance(slots, torch.Tensor):

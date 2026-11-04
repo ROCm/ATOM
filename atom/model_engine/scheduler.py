@@ -4193,12 +4193,16 @@ class Scheduler:
                     seq.multimodal_cache_ready = True
         routed = getattr(fwd_output, "routed_experts", None)
         if routed is not None:
-            # Not ``running_by_id``: a dummy prefill's output carries the
-            # previous step's routes with ``batch=None``.
-            seq_map = {seq.id: seq for seq in self.running}
-            for seq in seqs:
-                seq_map[seq.id] = seq
-            self._apply_routed_experts_patch(seq_map, routed)
+            # A dummy prefill's output carries the previous step's routes with
+            # ``batch=None``, where ``running_by_id`` is empty.
+            self._apply_routed_experts_patch(
+                (
+                    running_by_id
+                    if batch is not None
+                    else {seq.id: seq for seq in self.running}
+                ),
+                routed,
+            )
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
         prefill_ids = set(batch.req_ids[:num_prefill]) if num_prefill else set()
         if self._connector_flag("is_offload") and num_prefill:

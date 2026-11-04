@@ -112,9 +112,17 @@ def test_supported_topologies_pass():
     )
 
 
+def _import_runner():
+    return pytest.importorskip(
+        "atom.model_engine.model_runner",
+        reason="model_runner imports aiter at module load",
+        exc_type=ImportError,
+    )
+
+
 def test_dp_attention_refuses_a_builder_with_prefill_token_graphs(monkeypatch):
     """Its idle-rank dummy prefill captures into physical block 0's slots."""
-    import atom.model_engine.model_runner as mr
+    mr = _import_runner()
 
     class Builder:
         supplies_token_slots = True
@@ -305,10 +313,8 @@ def test_moe_outside_the_target_model_never_captures():
 def _forward_metadata(monkeypatch, attn_metadata):
     from types import SimpleNamespace
 
-    import atom.utils.forward_context as fc
-
     ctx = SimpleNamespace(attn_metadata=attn_metadata)
-    monkeypatch.setattr(fc, "get_forward_context", lambda: ctx)
+    monkeypatch.setattr(cap_mod, "get_forward_context", lambda: ctx)
 
 
 def test_current_slot_mapping_reads_the_builder_metadata(monkeypatch):
@@ -847,8 +853,7 @@ def test_merge_routed_patches_keeps_segment_order_and_offsets():
 
 
 def _runner_with_held(*held: PendingRoutes):
-    from atom.model_engine.model_runner import ModelRunner
-
+    ModelRunner = _import_runner().ModelRunner
     runner = ModelRunner.__new__(ModelRunner)
     runner._held_routes = list(held)
     return runner, ModelRunner
@@ -931,7 +936,11 @@ def test_qwen4_exp_single_token_moe_captures_its_routes(
 ):
     """Both batch-1 MoE branches capture the ids their kernel ran: the
     in-kernel routing's own ids, or `select_experts`'."""
-    import atom.models.qwen4_exp as q4
+    q4 = pytest.importorskip(
+        "atom.models.qwen4_exp",
+        reason="qwen4_exp imports aiter at module load",
+        exc_type=ImportError,
+    )
 
     capturer = RoutedExpertsCapturer.init(
         num_slots=8, num_layers=2, top_k=2, device="cpu"
