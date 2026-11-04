@@ -46,8 +46,26 @@ Sub-mode 2 adds, after P0 (``ATOM_MONO_MLA_PREP=2``):
 
 P1 sums the same exact FP8 products as the FlyDSL GEMM in a different order.
 
-Ported from the pre-#2871 fork (``up/mono-mla-prep``); P3..P5 (q_b, absorb,
-rope + the FP8 KV-cache write) follow.
+Sub-mode 3 adds (``ATOM_MONO_MLA_PREP=3``):
+
+    P3  CTAs 56 .. 199 (144 tasks of 16 of q_b_proj's 2304 rows), after their
+        P1: the FP8 weight rows, then P2DONE of the q rows, q8 at device scope,
+        ``(sum * qs) * ws`` -> bf16 ``qb``, P3DONE.
+    P4  CTAs 208 .. 255 (48 tasks: head h, 128 absorbed columns): P3DONE of the
+        head's 12 tasks, the triton FP8 BMM's per-token 128-group prequant of
+        q_nope against W_K (``mla_post``'s v-up code), then straight on to
+        q_out: the rope kernel's nope part, RNE E4M3 of clamp(bf16 * inv_q);
+        a head's first task also ropes its pe part into q_out.
+    P5  on P2's kv CTAs: the FP8 KV-cache row of token t at its slot -- the
+        nope part from the bf16 kv P2 made, the rope part of k_rope -- as
+        aiter's ``fuse_qk_rope_concat_and_cache_mla_per_head_kernel``.
+
+P3 / P4 sum the same exact FP8 products as the FlyDSL GEMM / the triton BMM
+in another order; P5's KV row and q_out's rope part are bit-exact given equal
+inputs (aiter's contraction, ``ftz``). A token with a negative slot (a padded
+row) writes no KV row and no q_out row, as the rope kernel's early return.
+
+Ported from the pre-#2871 fork (``up/mono-mla-prep``).
 """
 
 import flydsl.expr as fx
@@ -74,6 +92,7 @@ from atom.mono.device import gemv
 from atom.mono.device.ops import (
     CM_DEV,
     bf16_pair,
+    bf16_round,
     bf_hi,
     bf_lo,
     butterfly,
@@ -112,7 +131,21 @@ P2_THREADS = 256
 P2_TDS = 8
 FLT_MIN = 1.1754943508222875e-38
 
-REGIONS = ("ppart", "pwgt", "pmsq", "pamx", "pxrdy", "p1done", "p2done")
+# mode 3 (P3 .. P5)
+HEADS = 12  # a TP8 rank's MLA heads
+QK_NOPE = 128
+QH = QK_NOPE + ROPE  # 192: q_b_proj's columns a head
+QB = HEADS * QH  # 2304
+P3_TASKS = QB // ROWS  # 144
+P3_CTA0 = 56  # 56 .. 199 (the lnorm CTAs, then P1's)
+P3_PER_HEAD = QH // ROWS  # 12 tasks a head: 8 nope, then 4 rope
+QB_K = QL  # 1536
+ENTRY = KVL + ROPE  # 576: a KV-cache row, a q_out head
+L_BLK = 128  # P4: absorbed columns a CTA (8 waves x 16)
+P4_TASKS = HEADS * (KVL // L_BLK)  # 48
+P4_CTA0 = 208  # 208 .. 255 (208 .. 215 after their P1, the rest after reduce)
+
+REGIONS = ("ppart", "pwgt", "pmsq", "pamx", "pxrdy", "p1done", "p2done", "p3done")
 
 # the prep build's arguments past K2's (and the MLA post stage's): one ABI for
 # every sub-mode, a later mode's 0 below it
@@ -131,7 +164,23 @@ ARGS = (
     "kvn",  # bf16 [S, 512]: kv_a_layernorm(kv_c)
     "qa_nw",  # q_a_layernorm weight
     "kva_nw",  # kv_a_layernorm weight
+    "w_qb",  # mode 3: q_b_proj FP8 plane (AITER (16, 16) preshuffle)
+    "w_qb_s",  # ... its fp32 row scales
+    "w_k",  # W_K [12, 512, 128] E4M3
+    "w_k_s",  # ... its fp32 scale
+    "qb",  # bf16 [S, 2304]: q_b_proj's output
+    "qout",  # fp8 [S, heads, 576]: the decode's q
+    "qout_sr",  # ... its row stride (elements)
+    "kvc",  # the layer's FP8 KV cache, [slots, 576] rows
+    "kvc_sr",  # ... its row stride (bytes)
+    "slots",  # int64 [S]: the step's slot mapping (negative: no row)
+    "pos",  # int64 [S]: the positions
+    "cosc",  # bf16 [max_pos, 32]: the rope tables
+    "sinc",
+    "k_sc",  # fp32 [1]: the KV cache's scale
+    "q_sc",  # fp32 [1]: q_out's
 )
+INT32_ARGS = ("qout_sr", "kvc_sr")
 
 
 def scratch_pairs(s: int, ns: int) -> dict:
@@ -144,6 +193,7 @@ def scratch_pairs(s: int, ns: int) -> dict:
         "pxrdy": NA,
         "p1done": P1_TASKS,
         "p2done": 2 * s,
+        "p3done": P3_TASKS,
     }
 
 
@@ -441,9 +491,10 @@ def p2_norm(c, k):
     a = c["args"]
     is_kv = k >= s
     t = k % s
-    # q needs tasks 0 .. 95, kv 96 .. 127: a thread a task, the other kind's
-    # threads idle
-    if tid < P1_Q + P1_KV:
+    # q needs tasks 0 .. 95, kv 96 .. 127 (mode 3: and k_rope's 128 .. 131): a
+    # thread a task, the other kind's threads idle
+    kv_end = P1_TASKS if c["prep_mode"] >= 3 else P1_Q + P1_KV
+    if tid < kv_end:
         want = is_kv.select(tid >= P1_Q, tid < P1_Q)
         if want:
             c["poll"]([(c["p1done"], tid, 1)])
@@ -500,6 +551,32 @@ def p2_norm(c, k):
                 (t * KVL + off) // 2,
                 cache_modifier=CM_DEV,
             )
+        if const_expr(c["prep_mode"] >= 3):
+            # P5's KV row: the rope kernel's nope part from the bf16 kv it read
+            # (RNE E4M3 of clamp(kv * inv_k)), then the rope part
+            slot, neg = _ld_i64_lo(a["slots"], t)
+            inv_k = _inv_scale(a["k_sc"])
+            kq = [
+                fx.min(
+                    fx.max(ftz(bf16_round(y[i]) * inv_k), _f32(-FP8_MAX)),
+                    _f32(FP8_MAX),
+                )
+                for i in range(P2_TDS)
+            ]
+            if active & ~neg:
+                kbase = a["kvc"] + fx.Int64(slot) * fx.Int64(a["kvc_sr"])
+                bo.buffer_store(
+                    fx.Vector.from_elements(
+                        [
+                            fp8_pack4(kq[0], kq[1], kq[2], kq[3]),
+                            fp8_pack4(kq[4], kq[5], kq[6], kq[7]),
+                        ],
+                        fx.Int32,
+                    ),
+                    rsrc(kbase),
+                    off // 4,
+                )
+            p5_kv_rope(c, t, slot, neg)
     else:
         tm = active.select(_f32(AMAX_FLOOR), _f32(0.0))
         for i in range_constexpr(P2_TDS):
@@ -535,3 +612,250 @@ def p2_norm(c, k):
             )
     publish(c["put"], c["p2done"], k, fx.Int32(1), tid == 0)
     gpu.barrier()
+
+
+# ------------------------------------------------------------ mode 3 (P3 .. P5)
+def _ld_bf_dev(ptr, i):
+    """bf16 element ``i`` (written by this launch) as f32, past the L2."""
+    return fx.Float32(
+        fx.BFloat16(
+            bo.buffer_load(
+                rsrc(ptr), i, vec_width=1, dtype=T.bf16, cache_modifier=CM_DEV
+            )
+        )
+    )
+
+
+def _ld_bf(ptr, i):
+    return fx.Float32(
+        fx.BFloat16(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.bf16))
+    )
+
+
+def _ld_i64_lo(ptr, t):
+    """An int64 element's (low word, negative): slot / position indices."""
+    w = fx.Vector(bo.buffer_load(rsrc(ptr), t * 2, vec_width=2, dtype=T.i32))
+    return w[0], w[1] < 0
+
+
+def _inv_scale(ptr):
+    """aiter's ``1.0f / *scale`` (IEEE division, as its code object has it)."""
+    sc = ftz(fx.Float32(bo.buffer_load(rsrc(ptr), 0, vec_width=1, dtype=T.f32)))
+    return ftz(_f32(1.0) / sc)
+
+
+def rope_word(c, src, at, pos, inv, o):
+    """aiter ``fuse_qk_rope_concat_and_cache_mla_per_head_kernel``'s rope of one
+    64-wide pe vector (bf16 at ``src`` elements ``at`` ..), output bytes
+    o .. o + 3 (o a multiple of 4) -> one dword of E4M3. Per pair i: cos / sin
+    the bf16 cache entries at pos * 32 + i, x' = fma(cos, x, -(sin y)),
+    y' = fma(sin, x, cos y) (the contraction its code object has), then
+    ``* inv`` and the unclamped RNE cvt. neox: (x, y) = (i, 32 + i), else
+    (2 i, 2 i + 1)."""
+    a = c["args"]
+    outs = []
+    for d in range_constexpr(4):
+        p = o + d
+        if const_expr(c["rope_neox"]):
+            i = p % 32
+            is_y = p >= 32
+            xi = i
+            yi = i + 32
+        else:
+            i = p // 2
+            is_y = (p % 2) == 1
+            xi = 2 * i
+            yi = 2 * i + 1
+        x = ftz(_ld_bf_dev(src, at + xi))
+        y = ftz(_ld_bf_dev(src, at + yi))
+        cs = ftz(_ld_bf(a["cosc"], pos * 32 + i))
+        sn = ftz(_ld_bf(a["sinc"], pos * 32 + i))
+        xr = ftz(_f32(fmath.fma(cs, x, -ftz(sn * y))))
+        yr = ftz(_f32(fmath.fma(sn, x, ftz(cs * y))))
+        outs.append(ftz(is_y.select(yr, xr) * inv))
+    return fp8_pack4(outs[0], outs[1], outs[2], outs[3])
+
+
+def _pos_clamped(c, t):
+    p, neg = _ld_i64_lo(c["args"]["pos"], t)
+    p = neg.select(fx.Int32(0), p)
+    return fx.min(p, fx.Int32(c["rope_maxpos"] - 1))
+
+
+@traced
+def p5_kv_rope(c, t, slot, neg):
+    """The KV row's rope part (cache bytes 512 .. 575 at ``slot``): 16 threads a
+    dword (P2's kv CTA of token t, after P1's k_rope tasks)."""
+    a = c["args"]
+    tid = c["tid"]
+    if (tid < ROPE // 4) & ~neg:
+        inv = _inv_scale(a["k_sc"])
+        pos = _pos_clamped(c, t)
+        w = rope_word(c, a["qkv"], t * QKV_A + QL + KVL, pos, inv, tid * 4)
+        base = a["kvc"] + fx.Int64(slot) * fx.Int64(a["kvc_sr"])
+        bo.buffer_store(w, rsrc(base), (KVL + tid * 4) // 4)
+
+
+@traced
+def p3_task(c, j):
+    """q_b_proj rows 16 j .. (K 1536) for every token -> ``qb`` bf16 (device
+    scope), P3DONE: weights first, then q8 / qs from P2 (P2DONE of the q rows),
+    q8 staged to LDS at device scope, bf16 MFMAs on the widened FP8 operands,
+    ``(sum * qs) * ws`` as the FlyDSL epilogue."""
+    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    a = c["args"]
+    xl = c["prep_xl"]
+    g = lane // ROWS
+    row0 = j * ROWS
+    gops = mp.w8_loads(lane, wave, a["w_qb"], row0, QB_K)
+    if tid < s:
+        c["poll"]([(c["p2done"], tid, 1)])
+    gpu.barrier()
+    xrow = QB_K + mp.XPAD
+    gemv.rows_to_lds(tid, a["q8"], QB_K // 2, s, xl, xrow // 2, CM_DEV)
+    tiles = mp.token_tiles(s)
+    ts = [t0 + fx.min(lane % ROWS, nt - 1) for t0, nt in tiles]
+    accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in tiles]
+    per, nch = gemv.chunks(QB_K)
+    for i in range_constexpr(per):
+        ch = wave + WAVES * i
+        live = ch < nch
+        kk = fx.min(ch, nch - 1) * gemv.KCH + g * 8
+        for q in range_constexpr(4):
+            wa = mp.w8_operand(gops[i][q])
+            for jt in range_constexpr(len(tiles)):
+                d = fx.Vector(
+                    fx.ptr_load(
+                        xl + (ts[jt] * xrow + kk + 32 * q) // 4,
+                        result_type=fx.Vector.make_type(2, fx.Int32),
+                    )
+                )
+                d0 = live.select(d[0], fx.Int32(0))
+                d1 = live.select(d[1], fx.Int32(0))
+                accs[jt] = mfma_bf16(wa, fp8x8_bf16_pk([d0, d1]), accs[jt])
+    r_out = rsrc(a["qb"])
+    for jt in range_constexpr(len(tiles)):
+        u0 = tiles[jt][0]
+        n = tiles[jt][1]
+        fx.ptr_store(accs[jt], red + (wave * 64 + lane) * 4)
+        gpu.barrier()
+        if tid < n * (ROWS // 2):
+            tt = tid // (ROWS // 2)
+            rp = tid % (ROWS // 2)
+            t = u0 + tt
+            qs = fx.Float32(
+                bo.buffer_load(
+                    rsrc(a["qs"]), t, vec_width=1, dtype=T.f32, cache_modifier=CM_DEV
+                )
+            )
+            outs = []
+            for e in range_constexpr(2):
+                r = 2 * rp + e
+                outs.append(
+                    (row_sum(red, r, tt) * qs) * mp.w8_scale(a["w_qb_s"], row0 + r)
+                )
+            bo.buffer_store(
+                bf16_pair(outs[0], outs[1]).bitcast(fx.Int32),
+                r_out,
+                (t * QB + row0 + 2 * rp) // 2,
+                cache_modifier=CM_DEV,
+            )
+        gpu.barrier()
+    publish(c["put"], c["p3done"], j, fx.Int32(1), tid == 0)
+
+
+@traced
+def p4_task(c, j):
+    """Head h = j / 4, absorbed columns l0 = 128 (j % 4) ..: wave w the 16 rows
+    l0 + 16 w .. of W_K[h] (K = q_nope's 128) -- the triton FP8 BMM's per-token
+    128-group prequant of q_nope (``mla_post``'s v-up code), one chunk, then
+    ``bf16(fma(dot, a_scale, 0) * b_scale)`` and straight on to q_out: the
+    rope kernel's nope part, RNE E4M3 of clamp(bf16 * inv_q). The j % 4 == 0
+    CTA also writes the head's rope part of q_out. Tokens with a negative
+    slot are skipped, as the rope kernel's early return does."""
+    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    a = c["args"]
+    h = j // (KVL // L_BLK)
+    lb = j % (KVL // L_BLK)
+    g = lane // ROWS
+    vrow = h * KVL + lb * L_BLK + wave * ROWS + lane % ROWS
+    r_w = rsrc(a["w_k"])
+    vops = [
+        fx.Vector(
+            bo.buffer_load(
+                r_w, (vrow * QK_NOPE + g * 8) // 4 + 8 * q, vec_width=2, dtype=T.i32
+            )
+        )
+        for q in range(4)
+    ]
+    if tid < P3_PER_HEAD:
+        c["poll"]([(c["p3done"], h * P3_PER_HEAD + tid, 1)])
+    gpu.barrier()
+    bsc = fx.Float32(bo.buffer_load(rsrc(a["w_k_s"]), 0, vec_width=1, dtype=T.f32))
+    inv_q = _inv_scale(a["q_sc"])
+    tiles = mp.token_tiles(s)
+    r_q = rsrc(a["qout"])
+    for jt in range_constexpr(len(tiles)):
+        t0 = tiles[jt][0]
+        nt = tiles[jt][1]
+        t = t0 + fx.min(lane % ROWS, nt - 1)
+        avals = [
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(a["qb"]),
+                    (t * QB + h * QH + g * 8 + 32 * q) // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )
+            for q in range(4)
+        ]
+        vals = []
+        for q in range_constexpr(4):
+            for e in range_constexpr(4):
+                w = avals[q][e]
+                vals += [bf_lo(w), bf_hi(w)]
+        lm = abs(vals[0])
+        for e in range_constexpr(1, 32):
+            lm = fx.max(lm, abs(vals[e]))
+        am = butterfly(lm, (16, 32), fx.max)
+        m = fx.max(am, _f32(mp.AMAX_FLOOR))
+        sc = m * _f32(mp.INV_FP8_MAX)
+        rcp = _f32(1.0) / sc
+        acc = fx.Vector.filled(4, 0.0, fx.Float32)
+        for q in range_constexpr(4):
+            qv = [
+                fx.min(fx.max(vals[8 * q + e] * rcp, _f32(-FP8_MAX)), _f32(FP8_MAX))
+                for e in range(8)
+            ]
+            d0 = fp8_pack4(qv[0], qv[1], qv[2], qv[3])
+            d1 = fp8_pack4(qv[4], qv[5], qv[6], qv[7])
+            acc = mfma_bf16(mp.w8_operand(vops[q]), fp8x8_bf16_pk([d0, d1]), acc)
+        # lane: token lane % 16, rows 4 g .. 4 g + 3 of this wave's 16
+        tok = t0 + lane % ROWS
+        _, neg = _ld_i64_lo(a["slots"], fx.min(tok, s - 1))
+        qb8 = []
+        for i in range_constexpr(4):
+            ql = bf16_round(_f32(fmath.fma(acc[i], sc, _f32(0.0))) * bsc)
+            qb8.append(
+                fx.min(fx.max(ftz(ftz(ql) * inv_q), _f32(-FP8_MAX)), _f32(FP8_MAX))
+            )
+        if (lane % ROWS < nt) & ~neg:
+            col = lb * L_BLK + wave * ROWS + 4 * g
+            bo.buffer_store(
+                fp8_pack4(qb8[0], qb8[1], qb8[2], qb8[3]),
+                r_q,
+                (tok * a["qout_sr"] + h * ENTRY + col) // 4,
+            )
+    if lb == 0:
+        # the head's rope part of q_out: 16 threads a token, a dword each
+        for i in range_constexpr((s * 16 + THREADS - 1) // THREADS):
+            e = fx.min(tid + THREADS * i, s * 16 - 1)
+            t = e // 16
+            o = (e % 16) * 4
+            _, neg = _ld_i64_lo(a["slots"], t)
+            if ((tid + THREADS * i) < s * 16) & ~neg:
+                pos = _pos_clamped(c, t)
+                w = rope_word(c, a["qb"], t * QB + h * QH + QK_NOPE, pos, inv_q, o)
+                bo.buffer_store(w, r_q, (t * a["qout_sr"] + h * ENTRY + KVL + o) // 4)
