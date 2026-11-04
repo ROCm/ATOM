@@ -227,64 +227,102 @@ def shared_unit(c, unit, multi):
         n = fx.min(fx.Int32(TILE), s - t0)
         load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: t0 + j, n)
         stage_shared(c, unit % shared_tasks, gops, t0, n)
+RT2_WAVES = 8
+
+
+def _rt2_key(e):
+    """The original single wave's tie order for expert ``e``: its logical lane
+    e % 64 first, then its slot e // 64."""
+    return (e & 63) * 8 + (e >> 6)
+
+
+def _rt2_top(lane, vs, os_, ids, k):
+    """k rounds of the wave's argmax over the lanes' slots (values ``vs``):
+    -> [(value, expert, weight)] descending, each wave-uniform; equal values
+    resolve in the original single wave's order (``_rt2_key``)."""
+    vs = list(vs)
+    keys = [_rt2_key(e) for e in ids]
+    big = fx.Int32(1 << 20)
+    out = []
+    for r in range_constexpr(k):
+        bv, bo, bi, bk, bs = vs[0], os_[0], ids[0], keys[0], fx.Int32(0)
+        for s_ in range_constexpr(1, len(vs)):
+            better = (vs[s_] > bv) | ((vs[s_] == bv) & (keys[s_] < bk))
+            bv = better.select(vs[s_], bv)
+            bo = better.select(os_[s_], bo)
+            bi = better.select(ids[s_], bi)
+            bk = better.select(keys[s_], bk)
+            bs = better.select(fx.Int32(s_), bs)
+        best = bv
+        for offset in (16, 8, 4, 2, 1):
+            best = fx.max(best, best.shuffle_xor(offset, 32))
+        mk = (bv == best).select(bk, big)
+        for offset in (16, 8, 4, 2, 1):
+            mk = fx.min(mk, mk.shuffle_xor(offset, 32))
+        ball = ballot((bv == best) & (bk == mk)) & fx.Int64(0xFFFFFFFF)
+        win = fx.Int32((ball == fx.Int64(0)).select(fx.Int32(0), fx.Int32(fmath.cttz(ball))))
+        out.append((readlane(bv, win), readlane(bi, win), readlane(bo, win)))
+        mine = lane == win
+        for s_ in range_constexpr(len(vs)):
+            vs[s_] = (mine & (bs == s_)).select(fx.Float32(float("-inf")), vs[s_])
+    return out
+
+
 @traced
 def stage_route(c, token):
-    """Mother six experts/lane, sequential top6 and eight tagged copies."""
+    """The CTA's eight waves each score E/8 experts and take their
+    top-k; wave 0 then takes the top-k of those 8k candidates. The same
+    selection (descending, so the same weight sum order) as one wave's six
+    rounds over all E (``Mother six experts/lane``), with 1/8 the serial
+    work on UG's critical path; eight tagged copies as before."""
     lane, wave, rs = c["lane"], c["wave"], c["rs"]
     assert rs.experts in (128,384) and rs.topk in (3,6) and not rs.dpa
-    ept=rs.experts//64
+    # gfx1250 K2: 256 threads, eight wave32 (``c["wave"]`` = tid // 32)
+    E, k = rs.experts, rs.topk
+    per = E // RT2_WAVES
+    ninf = fx.Float32(float("-inf"))
+    bases = list(range(0, per, 32))
+    es = [wave * per + fx.min(lane + b, per - 1) for b in bases]
+    oks = [lane + b < per for b in bases]
+    bias = [ld_f32(c["args"]["bias"], e) for e in es]
+    got = c["poll"]([(c["logit"], (token * E + e) * 4 + p, 2) for e in es for p in (0, 2)], batch=24)
+    vs, os_, ids = [], [], []
+    for q in range_constexpr(len(bases)):
+        parts = got[2 * q] + got[2 * q + 1]
+        total = fx.Float32(0.)
+        for p in range_constexpr(4):
+            total = total + parts[p].bitcast(fx.Float32)
+        score = _score(bf16_round(total))
+        v = fx.max(score + bias[q], ninf)
+        vs.append(oks[q].select(v, ninf))
+        os_.append(fx.Float32(fx.isnan(score).select(fx.Float32(0.), score)))
+        ids.append(fx.Int32(es[q]))
+    local = _rt2_top(lane, vs, os_, ids, k)
+    gpu.barrier()
+    red = c["red"]
+    for r in range_constexpr(k):
+        if lane == r:
+            at = (wave * k + r) * 3
+            fx.ptr_store(local[r][0], red + at)
+            fx.ptr_store(local[r][1].bitcast(fx.Float32), red + at + 1)
+            fx.ptr_store(local[r][2], red + at + 2)
+    gpu.barrier()
     if wave == 0:
-        # Both logical lane halves load bias before waiting for LOGIT.
-        bias = [[ld_f32(c["args"]["bias"],lane+32*h+64*i)
-                 for i in range(ept)] for h in range(2)]
-        got = c["poll"]([(c["logit"],(token*rs.experts+lane+32*h+64*i)*4+p,2)
-                         for h in range(2) for i in range(ept) for p in (0,2)],batch=24)
-        vals, orig, ids = [], [], []
-        for h in range_constexpr(2):
-            vh, oh, ih = [], [], []
-            for i in range_constexpr(ept):
-                parts = got[h*(2*ept)+2*i]+got[h*(2*ept)+2*i+1]
-                total = fx.Float32(0.)
-                for p in range_constexpr(4):
-                    total = total+parts[p].bitcast(fx.Float32)
-                score = _score(bf16_round(total))
-                vh.append(fx.max(score+bias[h][i],fx.Float32(float("-inf"))))
-                oh.append(fx.Float32(fx.isnan(score).select(fx.Float32(0.),score)))
-                ih.append(fx.Int32(lane+32*h+64*i))
-            for p,q in rs.sort_net:
-                swap = vh[p]<vh[q]
-                vh[p],vh[q] = swap.select(vh[q],vh[p]),swap.select(vh[p],vh[q])
-                oh[p],oh[q] = swap.select(oh[q],oh[p]),swap.select(oh[p],oh[q])
-                ih[p],ih[q] = swap.select(ih[q],ih[p]),swap.select(ih[p],ih[q])
-            vals.append(vh);orig.append(oh);ids.append(ih)
-        cursor = [fx.Int32(0),fx.Int32(0)]
-        total, my_w, my_id = fx.Float32(0.),fx.Float32(0.),fx.Int32(0)
-        for k in range_constexpr(rs.topk):
-            cv,ci,co = [],[],[]
-            for h in range_constexpr(2):
-                v, eid, weight = fx.Float32(float("-inf")),fx.Int32(0),fx.Float32(0.)
-                for i in range_constexpr(ept):
-                    at = cursor[h]==i
-                    v,eid,weight = at.select(vals[h][i],v),at.select(ids[h][i],eid),at.select(orig[h][i],weight)
-                cv.append(v);ci.append(eid);co.append(weight)
-            # Original butterfly (32,16,8,4,2,1), with xor32 in registers.
-            best = fx.max(cv[0],cv[1])
-            for offset in (16,8,4,2,1):
-                best = fx.max(best,best.shuffle_xor(offset,32))
-            ball = dual_ballot(cv[0]==best,cv[1]==best)
-            win = fx.Int32((ball==fx.Int64(0)).select(fx.Int32(0),fx.Int32(fmath.cttz(ball))))
-            winner0, winner1 = readlane(ci[0],win&31),readlane(ci[1],win&31)
-            win_id = (win<32).select(winner0,winner1)
-            mine = []
-            for h in range_constexpr(2):
-                won = (cursor[h]<ept)&(ci[h]==win_id)
-                mine.append(fx.Float32(won.select(co[h],fx.Float32(0.))))
-                cursor[h] = cursor[h]+won.select(1,0)
-            w0,w1 = readlane(mine[0],win_id&31),readlane(mine[1],win_id&31)
-            weight = ((win_id&63)<32).select(w0,w1)
-            total = total+weight
-            my_w = (lane==k).select(weight,my_w)
-            my_id = (lane==k).select(win_id,my_id)
+        cand = RT2_WAVES * k
+        vs, os_, ids = [], [], []
+        for b in range_constexpr(0, cand, 32):
+            q = fx.min(lane + b, cand - 1)
+            ok = lane + b < cand
+            vs.append(ok.select(fx.ptr_load(red + q * 3), ninf))
+            ids.append(fx.ptr_load(red + q * 3 + 1).bitcast(fx.Int32))
+            os_.append(fx.ptr_load(red + q * 3 + 2))
+        top = _rt2_top(lane, vs, os_, ids, k)
+        total, my_w, my_id = fx.Float32(0.), fx.Float32(0.), fx.Int32(0)
+        for r in range_constexpr(k):
+            _, win_id, weight = top[r]
+            total = total + weight
+            my_w = (lane == r).select(weight, my_w)
+            my_id = (lane == r).select(win_id, my_id)
         scale = fx.Float32(SCALE)/fx.max(total,fx.Float32(1e-20))
         if lane < rs.topk:
             for copy in range_constexpr(ROUTE_COPIES):
