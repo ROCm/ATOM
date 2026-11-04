@@ -5,10 +5,14 @@
 
 import json
 import os
+import re
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".github/scripts/atomesh"
@@ -24,8 +28,13 @@ def script_section(start: str, end: str) -> str:
     return source[source.index(start) : source.index(end)]
 
 
-def generate_cells(model: str) -> list[dict]:
-    """Run the matrix over one model's accuracy suite on the Spur lane."""
+def generate_cells(
+    model: str,
+    suite: str = "accuracy",
+    model_root: str = "/data/models2",
+    extra_args: tuple[str, ...] = (),
+) -> list[dict]:
+    """Run the matrix over one model's suite on the Spur lane."""
     with tempfile.TemporaryDirectory() as temp:
         output = Path(temp) / "cells.json"
         subprocess.run(
@@ -33,9 +42,10 @@ def generate_cells(model: str) -> list[dict]:
                 "python3",
                 str(SCRIPTS / "pd_matrix.py"),
                 "--suite",
-                "accuracy",
+                suite,
                 "--model",
                 model,
+                *extra_args,
                 "--output",
                 str(output),
             ],
@@ -46,7 +56,7 @@ def generate_cells(model: str) -> list[dict]:
                 ATOMESH_SLURM_ACCOUNT="",
                 ATOMESH_SLURM_PARTITION="",
                 ATOMESH_LOG_ROOT="/data/${USER}/logs/ATOMESH_LOG/",
-                ATOMESH_MODEL_ROOT="/data/models2",
+                ATOMESH_MODEL_ROOT=model_root,
                 ATOMESH_1P1D_NODES=SPUR_NODES,
                 ATOMESH_2P1D_NODES=SPUR_NODES,
                 ATOMESH_PD_RANK_MAPPING_POLICY="idx2idx",
@@ -163,6 +173,7 @@ LOW_LATENCY_DECODE_CELLS = {
     ("DeepSeek-V3", "1p1d_dpa16_ep16_ll_moriio"): (4, 2, True),
     ("Kimi-K2.5-MXFP4", "1p1d_dpa8_ep8_ll_moriio"): (2, 1, False),
     ("Kimi-K2.5-MXFP4", "1p1d_dpa16_ep16_ll_moriio"): (4, 2, False),
+    ("Kimi-K3-MXFP4", "1p1d_dpa16_ep16_ll_moriio"): (4, 2, False),
 }
 INTER_NODE_LL_GEOMETRY = {
     "MORI_EP_BLOCK_NUM": "64",
@@ -234,32 +245,60 @@ class LowLatencyDecodeCellsTest(unittest.TestCase):
         for cell, _ in self.each_cell():
             self.assertEqual(cell["env"]["common"]["KV_CONNECTOR"], "moriio")
             self.assertEqual(cell["env"]["common"]["MORI_SHMEM_HEAP_SIZE"], "16G")
-            self.assertEqual(cell["server_args"]["max_num_batched_tokens"], 16384)
+            # MoRI sizes its EP buffers from this per-rank budget, and 32768
+            # overflows the 16 GiB heap at EP16.
+            self.assertLessEqual(cell["server_args"]["max_num_batched_tokens"], 16384)
             self.assertTrue(cell["eval_only"])
             self.assertEqual(cell["accuracy"]["threshold"], 0.90)
 
 
 class KimiK3MoriIOCellTest(unittest.TestCase):
-    """Kimi-K3's PD gsm8k cell, over MoRI IO, with nothing the connector refuses."""
+    """Kimi-K3's PD gsm8k cells, over MoRI IO, with nothing the connector refuses."""
 
     @classmethod
     def setUpClass(cls):
-        (cls.cell,) = generate_cells("Kimi-K3-MXFP4")
+        cls.cells = {cell["topology"]: cell for cell in generate_cells("Kimi-K3-MXFP4")}
+        cls.cell = cls.cells["1p1d_tp8_moriio"]
+        cls.dp_attention = cls.cells["1p1d_dpa16_ep16_ll_moriio"]
+
+    def each_cell(self):
+        for topology, cell in self.cells.items():
+            with self.subTest(topology=topology):
+                yield cell
 
     def test_it_runs_over_moriio_with_the_built_in_config(self):
-        env = self.cell["env"]
-        for role in ("common", "prefill", "decode"):
-            self.assertEqual(env[role]["KV_CONNECTOR"], "moriio")
-            self.assertEqual(env[role]["ATOM_MORIIO_MODE"], "write")
-        self.assertIsNone(env["prefill"].get("PREFILL_KV_TRANSFER_CONFIG"))
-        self.assertIsNone(env["decode"].get("DECODE_KV_TRANSFER_CONFIG"))
+        for cell in self.each_cell():
+            env = cell["env"]
+            for role in ("common", "prefill", "decode"):
+                self.assertEqual(env[role]["KV_CONNECTOR"], "moriio")
+                self.assertEqual(env[role]["ATOM_MORIIO_MODE"], "write")
+            self.assertIsNone(env["prefill"].get("PREFILL_KV_TRANSFER_CONFIG"))
+            self.assertIsNone(env["decode"].get("DECODE_KV_TRANSFER_CONFIG"))
 
     def test_nothing_the_connector_refuses_is_on(self):
-        for role in ("common", "prefill", "decode"):
-            self.assertEqual(self.cell["env"][role]["ATOM_ENABLE_REPLAYSSM"], "0")
-        server = self.cell["server_args"]
-        self.assertNotIn("num_speculative_tokens", server)
-        self.assertIs(server["enable_prefix_caching"], False)
+        for cell in self.each_cell():
+            for role in ("common", "prefill", "decode"):
+                self.assertEqual(cell["env"][role]["ATOM_ENABLE_REPLAYSSM"], "0")
+            server = cell["server_args"]
+            self.assertNotIn("num_speculative_tokens", server)
+            self.assertIs(server["enable_prefix_caching"], False)
+
+    def test_dp_attention_also_keeps_f_b_proj_out_of_fp8(self):
+        def excluded(cell):
+            config = json.loads(cell["server_args"]["online_quant_config"])
+            return set(config["exclude_layer"])
+
+        self.assertEqual(
+            excluded(self.dp_attention) - excluded(self.cell), {"*self_attn.f_b_proj*"}
+        )
+        self.assertLessEqual(excluded(self.cell), excluded(self.dp_attention))
+
+    def test_dp_attention_is_scored_like_the_tp8_cell(self):
+        self.assertEqual(self.dp_attention["accuracy"], self.cell["accuracy"])
+        self.assertEqual(
+            self.dp_attention["server_args"]["extra_args"],
+            self.cell["server_args"]["extra_args"],
+        )
 
     def test_it_is_a_two_node_tp8_gsm8k_eval_with_thinking_off(self):
         self.assertTrue(self.cell["eval_only"])
@@ -271,6 +310,163 @@ class KimiK3MoriIOCellTest(unittest.TestCase):
         self.assertIn(
             '--default-chat-template-kwargs {"thinking":false}',
             self.cell["server_args"]["extra_args"],
+        )
+
+
+WORKFLOW = ROOT / ".github/workflows/atomesh-benchmark.yaml"
+TW_WEEKLY = "0 16 * * 5"
+SPUR_NIGHTLY = "10 16 * * *"
+SPUR_MORIIO = "10 4 * * *"
+# atomesh-benchmark.yaml's model root for the Spur lane.
+SPUR_MODEL_ROOT = "/data/junyyang/models"
+MORIIO_MODELS = ("DeepSeek-V3", "Kimi-K2.5-MXFP4", "Kimi-K3-MXFP4")
+
+
+def github_expressions(source: str, event: str, schedule: str = "") -> str:
+    """Evaluate the ${{ }} segments of a workflow value for a run with no inputs."""
+    context = {
+        "event_name": event,
+        "schedule": schedule,
+        "workflow": "Atomesh Benchmark",
+        "ref": "refs/heads/main",
+        "run_id": "1",
+    }
+
+    def evaluate(match: re.Match) -> str:
+        expression = re.sub(r"\binputs\.\w+", "''", match.group(1))
+        expression = re.sub(r"\bgithub\.event\.schedule\b", "schedule", expression)
+        expression = re.sub(r"\bgithub\.(\w+)\b", r"\1", expression)
+        expression = expression.replace("&&", " and ").replace("||", " or ")
+        return str(eval(expression, {"__builtins__": {}}, context))
+
+    return re.sub(r"\$\{\{(.*?)\}\}", evaluate, source)
+
+
+def is_moriio(cell: dict) -> bool:
+    return cell["env"]["common"].get("KV_CONNECTOR") == "moriio"
+
+
+class MoriIOScheduleTest(unittest.TestCase):
+    """MoRI IO accuracy runs every night on the Spur lane, apart from the nightly."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = yaml.safe_load(WORKFLOW.read_text())
+        cls.matrix_script = next(
+            step["run"]
+            for step in cls.workflow["jobs"]["load-config"]["steps"]
+            if step.get("id") == "matrix"
+        )
+        cls.moriio_cells = cls.matrix(SPUR_MORIIO)
+        cls.nightly_cells = cls.matrix(SPUR_NIGHTLY)
+
+    @classmethod
+    def lane(cls, schedule: str) -> dict[str, str]:
+        return {
+            name: github_expressions(value, "schedule", schedule)
+            for name, value in cls.workflow["env"].items()
+        }
+
+    @classmethod
+    def matrix(cls, schedule: str) -> list[dict]:
+        """Run the workflow's matrix step as that schedule would."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in (
+                ".github/scripts/atomesh/pd_matrix.py",
+                ".github/benchmark/models_atomesh.yaml",
+            ):
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / name, target)
+            env = dict(
+                os.environ,
+                **cls.lane(schedule),
+                GITHUB_EVENT_NAME="schedule",
+                EVENT_SCHEDULE=schedule,
+                GITHUB_OUTPUT=str(root / "github-output"),
+                SUITE="nightly",
+                RUN_ALL_MODELS="true",
+                MODEL_NAMES="",
+                CASE_NAMES="",
+                ATOMESH_IMAGE="test-image",
+                ATOMESH_BENCHMARK_CONCURRENCY="",
+                ATOMESH_EVAL_CONCURRENCY="",
+            )
+            subprocess.run(
+                ["bash", "-eu", "-c", cls.matrix_script],
+                cwd=root,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            return json.loads((root / "atomesh-matrix.json").read_text())["include"]
+
+    def test_the_moriio_cron_runs_on_the_spur_lane_like_the_nightly(self):
+        # PyYAML reads the workflow's `on:` key as True.
+        self.assertIn({"cron": SPUR_MORIIO}, self.workflow[True]["schedule"])
+        self.assertEqual(self.lane(SPUR_MORIIO), self.lane(SPUR_NIGHTLY))
+        runner = "ATOMESH_SLURM_SUBMIT_RUNNER"
+        self.assertEqual(self.lane(SPUR_MORIIO)[runner], "atomesh-cicd-mi350")
+        self.assertEqual(self.lane(TW_WEEKLY)[runner], "atomesh-cicd")
+
+    def test_the_moriio_cron_has_a_concurrency_group_of_its_own(self):
+        group = self.workflow["concurrency"]["group"]
+        groups = {
+            schedule: github_expressions(group, "schedule", schedule)
+            for schedule in (TW_WEEKLY, SPUR_NIGHTLY, SPUR_MORIIO)
+        }
+        self.assertEqual(len(set(groups.values())), 3)
+        prefix = "Atomesh Benchmark-refs/heads/main-"
+        self.assertEqual(groups[TW_WEEKLY], prefix + "schedule-atomesh-cicd")
+        self.assertEqual(groups[SPUR_NIGHTLY], prefix + "schedule-atomesh-cicd-mi350")
+        self.assertEqual(
+            github_expressions(group, "push"), prefix + "push-atomesh-cicd"
+        )
+
+    def test_it_runs_every_moriio_accuracy_cell_and_nothing_else(self):
+        expected = {
+            (model, cell["name"]): cell
+            for model in MORIIO_MODELS
+            for cell in generate_cells(model, "accuracy", SPUR_MODEL_ROOT)
+            if is_moriio(cell)
+        }
+        self.assertTrue(expected)
+        self.assertEqual(
+            sorted((cell["model"], cell["name"]) for cell in self.moriio_cells),
+            sorted(expected),
+        )
+        for cell in self.moriio_cells:
+            twin = expected[(cell["model"], cell["name"])]
+            for key in ("suite", "service", "server_args", "env", "accuracy"):
+                self.assertEqual(cell[key], twin[key], (cell["name"], key))
+
+    def test_the_nightly_leaves_moriio_to_its_own_schedule(self):
+        self.assertTrue(self.nightly_cells)
+        self.assertFalse([cell["id"] for cell in self.nightly_cells if is_moriio(cell)])
+
+    def test_deepseek_v3_finds_its_weights_on_the_spur_lane(self):
+        dsv3 = [cell for cell in self.moriio_cells if cell["model"] == "DeepSeek-V3"]
+        self.assertTrue(dsv3)
+        for cell in dsv3:
+            self.assertEqual(cell["model_path"], "/data/models2/DeepSeek-V3/")
+
+    def test_an_unset_connector_counts_as_mooncake(self):
+        nightly = generate_cells("Kimi-K2.5-MXFP4", "nightly", SPUR_MODEL_ROOT)
+        mooncake = generate_cells(
+            "Kimi-K2.5-MXFP4",
+            "nightly",
+            SPUR_MODEL_ROOT,
+            extra_args=("--kv-connector", "mooncake"),
+        )
+        self.assertTrue(nightly)
+        self.assertFalse(
+            [cell for cell in nightly if "KV_CONNECTOR" in cell["env"]["common"]]
+        )
+        self.assertEqual(
+            [cell["id"] for cell in mooncake], [cell["id"] for cell in nightly]
         )
 
 

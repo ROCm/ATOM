@@ -81,6 +81,17 @@ def parse_benchmark_kind_filter(value: str | None) -> set[str] | None:
     return kinds or None
 
 
+def parse_kv_connector_filter(value: str | None) -> set[str] | None:
+    if not value:
+        return None
+    connectors = {
+        item.strip()
+        for item in value.split(",")
+        if item.strip() and item.strip().lower() != "all"
+    }
+    return connectors or None
+
+
 def model_path_env_key(model_name: str) -> str:
     suffix = re.sub(r"[^A-Za-z0-9]+", "_", model_name).strip("_").upper()
     return f"ATOMESH_MODEL_PATH_{suffix}"
@@ -532,6 +543,7 @@ def build_cells(
     override_image: str | None,
     override_benchmark_concurrency: list[int] | None,
     override_eval_concurrency: list[int] | None,
+    kv_connector_filter: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     cells = []
     for model_name, model_cfg in (cfg.get("models") or {}).items():
@@ -548,18 +560,21 @@ def build_cells(
             benchmark_kind = str(benchmark_cfg.get("kind", "random"))
             if benchmark_kind_filter and benchmark_kind not in benchmark_kind_filter:
                 continue
-            cells.append(
-                build_cell(
-                    cfg=cfg,
-                    model_name=str(model_name),
-                    model_cfg=model_cfg,
-                    suite_name=suite,
-                    suite_cfg=suite_cfg,
-                    override_image=override_image,
-                    override_benchmark_concurrency=override_benchmark_concurrency,
-                    override_eval_concurrency=override_eval_concurrency,
-                )
+            cell = build_cell(
+                cfg=cfg,
+                model_name=str(model_name),
+                model_cfg=model_cfg,
+                suite_name=suite,
+                suite_cfg=suite_cfg,
+                override_image=override_image,
+                override_benchmark_concurrency=override_benchmark_concurrency,
+                override_eval_concurrency=override_eval_concurrency,
             )
+            # Unset, pd_server_atom.sh transfers the KV over Mooncake.
+            connector = cell["env"]["common"].get("KV_CONNECTOR", "mooncake")
+            if kv_connector_filter and connector not in kv_connector_filter:
+                continue
+            cells.append(cell)
     return cells
 
 
@@ -592,6 +607,11 @@ def main() -> int:
         default=os.environ.get("ATOMESH_BENCHMARK_KIND") or None,
         help="Optional benchmark kind filter: one kind, comma-separated kinds, or all",
     )
+    parser.add_argument(
+        "--kv-connector",
+        default=None,
+        help="Optional KV connector filter: one connector, comma-separated connectors, or all",
+    )
     parser.add_argument("--image", default=os.environ.get("ATOMESH_IMAGE") or None)
     parser.add_argument(
         "--benchmark-concurrency",
@@ -621,6 +641,7 @@ def main() -> int:
         override_image=args.image,
         override_benchmark_concurrency=benchmark_concurrency or None,
         override_eval_concurrency=eval_concurrency or None,
+        kv_connector_filter=parse_kv_connector_filter(args.kv_connector),
     )
     print(f"Generated {len(cells)} ATOMesh benchmark cell(s) for suite={args.suite}")
     for cell in cells:
