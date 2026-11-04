@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Block scores over MiniMax-M3's MXFP4 index cache (``--index-cache-dtype mxfp4``).
+"""Block scores over MiniMax-M3's MXFP4 index cache (``--index-cache-dtype fp4``).
 
 aiter's FlyDSL scorers (``score_flydsl_fp4`` for decode, ``score_prefill_flydsl_fp4``
 for prefill) read the cache as the two views of ``kv_mxfp4.page_views`` and write

@@ -36,6 +36,7 @@ def _install_chip_info_stub(monkeypatch, get_gfx) -> None:
     utils.__path__ = []
     chip_info = ModuleType("aiter.jit.utils.chip_info")
     chip_info.get_gfx = get_gfx
+    chip_info.get_gfx_runtime = get_gfx
 
     aiter.jit = jit
     jit.utils = utils
@@ -87,6 +88,7 @@ def _make_config(
     *,
     gfx: str = "gfx950",
     architectures: list[str] | None = None,
+    hf: dict | None = None,
     **overrides,
 ):
     hf_config = PretrainedConfig(
@@ -94,6 +96,8 @@ def _make_config(
             ["DeepseekV4ForCausalLM"] if architectures is None else architectures
         ),
         max_position_embeddings=8192,
+        sparse_attention_config={"sparse_local_block": 1, "sparse_block_size": 128},
+        **(hf or {}),
     )
     monkeypatch.setattr(
         config_module,
@@ -104,7 +108,9 @@ def _make_config(
     monkeypatch.setattr(
         config_module,
         "QuantizationConfig",
-        lambda *_args, **_kwargs: SimpleNamespace(exclude_layers=[]),
+        lambda *_args, **_kwargs: SimpleNamespace(
+            exclude_layers=[], compute_hash=lambda: ""
+        ),
     )
     monkeypatch.setattr(
         config_module,
@@ -116,10 +122,9 @@ def _make_config(
     _install_chip_info_stub(monkeypatch, probe)
     config = Config(
         model="test-model",
-        kv_cache_dtype="fp8",
         torch_profiler_dir=None,
         compilation_config=CompilationConfig(level=0, use_cudagraph=False),
-        **overrides,
+        **{"kv_cache_dtype": "fp8", **overrides},
     )
     return config, probe
 
@@ -200,3 +205,79 @@ def test_non_fp4_indexer_predicate_does_not_query_arch(monkeypatch):
 
     assert not v4_kernels.fp4_indexer_enabled("fp8")
     assert probe.calls == 0
+
+
+M3 = ["MiniMaxM3SparseForConditionalGeneration"]
+
+
+def _m3(monkeypatch, **overrides):
+    return _make_config(
+        monkeypatch, architectures=M3, kv_cache_block_size=128, **overrides
+    )[0]
+
+
+@pytest.mark.parametrize(
+    ("kv", "index", "want"),
+    [
+        # KV-only: the index default follows the fp8 storage dtype.
+        ("fp4", None, ("fp8", True, "fp8")),
+        # index-only: KV stays as asked.
+        ("bf16", "fp4", ("bf16", False, "mxfp4")),
+        ("fp4", "fp4", ("fp8", True, "mxfp4")),
+        ("fp4", "fp8", ("fp8", True, "fp8")),
+        ("fp8", None, ("fp8", False, "fp8")),
+    ],
+)
+def test_m3_public_fp4_is_the_internal_mxfp4(monkeypatch, kv, index, want):
+    config = _m3(monkeypatch, kv_cache_dtype=kv, index_cache_dtype=index)
+
+    assert (
+        config.kv_cache_dtype,
+        config.kv_mxfp4,
+        config.index_cache_dtype,
+    ) == want
+
+
+def test_m3_fp4_caches_are_normalised_before_the_cp_fallback(monkeypatch, caplog):
+    with caplog.at_level("WARNING", logger="atom"):
+        config = _m3(
+            monkeypatch,
+            kv_cache_dtype="fp4",
+            index_cache_dtype="fp4",
+            tensor_parallel_size=4,
+            hf={"num_key_value_heads": 4},
+            dcp_config=config_module.DCPConfig(indexer_dcp_only=True),
+        )
+
+    assert config.dcp_config.indexer_dcp_only is False
+    assert "MXFP4 caches are not wired to the CP scorer" in caplog.text
+
+
+def test_m3_fp4_keeps_the_m3_startup_refusals(monkeypatch):
+    with pytest.raises(ValueError, match="MXFP4 pages are 128 tokens"):
+        _make_config(
+            monkeypatch, architectures=M3, kv_cache_dtype="fp4", kv_cache_block_size=16
+        )
+
+
+def test_m3_fp4_hashes_apart_from_fp8(monkeypatch):
+    fp8 = _m3(monkeypatch, kv_cache_dtype="fp8", index_cache_dtype="fp8")
+    fp4 = _m3(monkeypatch, kv_cache_dtype="fp4", index_cache_dtype="fp4")
+    kv_only = _m3(monkeypatch, kv_cache_dtype="fp4", index_cache_dtype="fp8")
+
+    assert len({fp8.compute_hash(), fp4.compute_hash(), kv_only.compute_hash()}) == 3
+
+
+def test_v4_keeps_its_fp4_indexer_and_refuses_a_fp4_kv(monkeypatch):
+    config, _ = _make_config(monkeypatch, index_cache_dtype="fp4")
+    assert (config.kv_mxfp4, config.index_cache_dtype) == (False, "fp4")
+
+    with pytest.raises(ValueError, match="MiniMax-M3 only"):
+        _make_config(monkeypatch, kv_cache_dtype="fp4")
+
+
+def test_other_models_refuse_a_fp4_kv(monkeypatch):
+    with pytest.raises(ValueError, match="MiniMax-M3 only"):
+        _make_config(
+            monkeypatch, architectures=["Glm5NextForCausalLM"], kv_cache_dtype="fp4"
+        )

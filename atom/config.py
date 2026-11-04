@@ -1920,14 +1920,32 @@ def qrep_for_step(
     return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
 
 
-def _resolve_kv_mxfp4(kv_cache_dtype: str, kv_mxfp4: bool) -> tuple[str, bool]:
-    """``--kv-cache-dtype mxfp4`` as (fp8, True): the layers that are not MXFP4
-    keep an fp8 cache, and everything keyed on the storage dtype reads fp8."""
-    if kv_cache_dtype == "mxfp4":
-        return "fp8", True
+def _resolve_fp4_caches(
+    kv_cache_dtype: str,
+    kv_mxfp4: bool,
+    index_cache_dtype: str | None,
+    *,
+    is_m3: bool,
+    is_v41: bool,
+) -> tuple[str, bool, str | None]:
+    """The public ``fp4`` cache values as this model's internal formats.
+
+    ``fp4`` names a different layout per model (DeepSeek-V4 / GLM index pages
+    are not MiniMax-M3's), so only MiniMax-M3 maps it: KV ``fp4`` -> (fp8, True)
+    -- the layers that are not MXFP4 keep an fp8 cache, and everything keyed on
+    the storage dtype reads fp8 -- and index ``fp4`` -> ``mxfp4``. Other models
+    keep their ``fp4`` index; a KV ``fp4`` is DeepSeek-V4.1's own, else refused.
+    """
     if kv_mxfp4 and kv_cache_dtype != "fp8":
         raise ValueError(f"kv_mxfp4 needs kv_cache_dtype fp8, got {kv_cache_dtype!r}")
-    return kv_cache_dtype, kv_mxfp4
+    if is_m3:
+        if kv_cache_dtype == "fp4":
+            kv_cache_dtype, kv_mxfp4 = "fp8", True
+        if index_cache_dtype == "fp4":
+            index_cache_dtype = "mxfp4"
+    elif kv_cache_dtype == "fp4" and not is_v41:
+        raise ValueError("--kv-cache-dtype fp4 is supported by MiniMax-M3 only")
+    return kv_cache_dtype, kv_mxfp4, index_cache_dtype
 
 
 def _check_m3_mxfp4(
@@ -1939,8 +1957,8 @@ def _check_m3_mxfp4(
     sparse_local_block: int,
 ) -> None:
     """Refuse MiniMax-M3's MXFP4 caches where they cannot run, at startup rather
-    than in the first forward (``--kv-cache-dtype mxfp4``, ``--index-cache-dtype
-    mxfp4``)."""
+    than in the first forward (``--kv-cache-dtype fp4``, ``--index-cache-dtype
+    fp4``, which ``_resolve_fp4_caches`` maps to ``kv_mxfp4`` / ``"mxfp4"``)."""
     index_mxfp4 = index_cache_dtype == "mxfp4"
     if not (kv_mxfp4 or index_mxfp4):
         return
@@ -1956,7 +1974,7 @@ def _check_m3_mxfp4(
         # The decode plan is refreshed once a step, which holds only while every
         # layer's rows have the same lengths -- i.e. the tail is always picked.
         raise ValueError(
-            "--kv-cache-dtype mxfp4 needs sparse_local_block >= 1, "
+            "--kv-cache-dtype fp4 needs sparse_local_block >= 1, "
             f"got {sparse_local_block}"
         )
     # The live GPU, not `get_gfx()`, which follows GPU_ARCHS (a build setting).
@@ -2127,7 +2145,7 @@ class Config:
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
-    # Derived from ``--kv-cache-dtype mxfp4``, which leaves the generic
+    # Derived from MiniMax-M3's ``--kv-cache-dtype fp4``, which leaves the generic
     # ``kv_cache_dtype`` at "fp8" for the layers that are not MXFP4.
     kv_mxfp4: bool = False
     index_cache_dtype: str | None = None
@@ -2345,9 +2363,6 @@ class Config:
         )
 
     def __post_init__(self):
-        self.kv_cache_dtype, self.kv_mxfp4 = _resolve_kv_mxfp4(
-            self.kv_cache_dtype, self.kv_mxfp4
-        )
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
@@ -2721,6 +2736,16 @@ class Config:
         is_deepseek_v4 = any(
             str(a).startswith(("DeepseekV4For", "DeepseekV4MTP", "DeepseekV4DSpark"))
             for a in arches
+        )
+        # Before the CP fallback and the index default, which read these.
+        self.kv_cache_dtype, self.kv_mxfp4, self.index_cache_dtype = (
+            _resolve_fp4_caches(
+                self.kv_cache_dtype,
+                self.kv_mxfp4,
+                self.index_cache_dtype,
+                is_m3=any("MiniMaxM3" in str(a) for a in arches),
+                is_v41=self.hf_config.model_type == "deepseek_v41_text",
+            )
         )
         if is_deepseek_v4:
             v4_block_size = 256

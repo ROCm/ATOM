@@ -1313,9 +1313,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
         # the page-128 indexer-key cache. None until the runner binds it.
         self.index_cache: torch.Tensor | None = None
-        # --kv-cache-dtype mxfp4: the bound k/v caches are uint8 [pages, Hkv,
+        # --kv-cache-dtype fp4: the bound k/v caches are uint8 [pages, Hkv,
         # 8704] MXFP4 pages (minimax_m3/kv_mxfp4.py), written by the fused kernel
-        # directly together with an fp8 main q. `--index-cache-dtype mxfp4` makes
+        # directly together with an fp8 main q. `--index-cache-dtype fp4` makes
         # index_cache uint8 [pages, 8704] the same way.
         self.kv_mxfp4: bool = False
         self.index_mxfp4: bool = self.index_cache_dtype == "mxfp4"

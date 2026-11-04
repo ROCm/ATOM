@@ -1151,7 +1151,7 @@ def minimax_m3_index_topk(
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
-    With ``index_mxfp4`` (``--index-cache-dtype mxfp4``) ``index_kv_cache`` is the
+    With ``index_mxfp4`` (``--index-cache-dtype fp4``) ``index_kv_cache`` is the
     uint8 ``[num_blocks, 8704]`` MXFP4 page cache and the scores come from aiter's
     FlyDSL scorer (index_mxfp4.py); the selection after it is this module's.
     ``pages_per_block`` / ``block_page_stride`` describe the emitted block table:

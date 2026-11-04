@@ -45,7 +45,7 @@ class _IndexCacheSpec(NamedTuple):
     rows: int
     dim: int
     dtype: torch.dtype
-    # `--index-cache-dtype mxfp4`: one 8704 B page of data and scales a block
+    # `--index-cache-dtype fp4`: one 8704 B page of data and scales a block
     # (minimax_m3/kv_mxfp4), 68 B a token.
     mxfp4: bool = False
 

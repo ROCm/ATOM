@@ -59,19 +59,34 @@ def test_request_context_metrics_cli_reaches_engine_kwargs(enabled):
     "argv,want",
     [
         ([], ("bf16", None)),
-        (["--kv-cache-dtype", "mxfp4"], ("mxfp4", None)),
-        (["--kv_cache_dtype", "mxfp4"], ("mxfp4", None)),
-        (["--index-cache-dtype", "mxfp4"], ("bf16", "mxfp4")),
+        (["--kv-cache-dtype", "fp4"], ("fp4", None)),
+        (["--kv_cache_dtype", "fp4"], ("fp4", None)),
+        (["--index-cache-dtype", "fp4"], ("bf16", "fp4")),
         (
-            ["--kv-cache-dtype", "mxfp4", "--index-cache-dtype", "mxfp4"],
-            ("mxfp4", "mxfp4"),
+            ["--kv-cache-dtype", "fp4", "--index-cache-dtype", "fp4"],
+            ("fp4", "fp4"),
         ),
     ],
 )
-def test_mxfp4_cache_dtypes_reach_engine_kwargs(argv, want):
+def test_fp4_cache_dtypes_reach_engine_kwargs(argv, want):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     kwargs = EngineArgs.from_cli_args(parser.parse_args(argv))._get_engine_kwargs()
     assert (kwargs["kv_cache_dtype"], kwargs["index_cache_dtype"]) == want
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--kv-cache-dtype", "mxfp4"],
+        ["--kv_cache_dtype", "mxfp4"],
+        ["--index-cache-dtype", "mxfp4"],
+        ["--index_cache_dtype", "mxfp4"],
+    ],
+)
+def test_public_mxfp4_cache_dtype_is_refused(argv):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    with pytest.raises(SystemExit):
+        parser.parse_args(argv)
 
 
 @pytest.mark.parametrize(

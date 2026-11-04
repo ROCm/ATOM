@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """MXFP4 page geometry of MiniMax-M3's sparse KV and index caches
-(``--kv-cache-dtype mxfp4`` / ``--index-cache-dtype mxfp4``).
+(``--kv-cache-dtype fp4`` / ``--index-cache-dtype fp4``).
 
 One 128-token page of one head holds, for K (or V, or the index key), the
 128-wide token rows as e2m1 data (two elements a byte, the low nibble the even

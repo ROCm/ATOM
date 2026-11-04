@@ -14,7 +14,7 @@ import types
 import pytest
 import torch
 
-from atom.config import _check_m3_mxfp4, _resolve_kv_mxfp4
+from atom.config import _check_m3_mxfp4, _resolve_fp4_caches
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, page_views
 
@@ -135,18 +135,35 @@ def test_the_baselines_are_never_refused():
 
 
 @pytest.mark.parametrize(
-    "dtype, flag, want",
+    "kv, flag, index, want",
     [
-        ("mxfp4", False, ("fp8", True)),
-        ("fp8", True, ("fp8", True)),
-        ("fp8", False, ("fp8", False)),
-        ("bf16", False, ("bf16", False)),
+        ("fp4", False, None, ("fp8", True, None)),
+        ("fp4", False, "fp4", ("fp8", True, "mxfp4")),
+        ("bf16", False, "fp4", ("bf16", False, "mxfp4")),
+        ("fp8", True, "mxfp4", ("fp8", True, "mxfp4")),
+        ("fp8", False, "fp8", ("fp8", False, "fp8")),
+        ("bf16", False, None, ("bf16", False, None)),
     ],
 )
-def test_the_mxfp4_kv_request_leaves_an_fp8_storage_dtype(dtype, flag, want):
-    assert _resolve_kv_mxfp4(dtype, flag) == want
+def test_m3_fp4_requests_become_the_internal_mxfp4_ones(kv, flag, index, want):
+    assert _resolve_fp4_caches(kv, flag, index, is_m3=True, is_v41=False) == want
+
+
+def test_other_models_keep_fp4_index_and_refuse_a_fp4_kv():
+    assert _resolve_fp4_caches("fp8", False, "fp4", is_m3=False, is_v41=False) == (
+        "fp8",
+        False,
+        "fp4",
+    )
+    assert _resolve_fp4_caches("fp4", False, "fp4", is_m3=False, is_v41=True) == (
+        "fp4",
+        False,
+        "fp4",
+    )
+    with pytest.raises(ValueError, match="MiniMax-M3 only"):
+        _resolve_fp4_caches("fp4", False, None, is_m3=False, is_v41=False)
 
 
 def test_a_kv_mxfp4_flag_over_a_bf16_cache_is_refused():
     with pytest.raises(ValueError, match="kv_cache_dtype fp8"):
-        _resolve_kv_mxfp4("bf16", True)
+        _resolve_fp4_caches("bf16", True, None, is_m3=True, is_v41=False)
