@@ -402,7 +402,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.checkpoint_shard_rows = (
             self.table_rows + self.split_ngram_parts - 1
         ) // self.split_ngram_parts
-        if _host_table_available():
+        from atom.models.qwen38.mono.ple import make_host_embedding
+
+        self.ngram_embedding = make_host_embedding(
+            self.table_rows,
+            self.head_dim,
+            self.checkpoint_shard_rows,
+            embedding_prefix,
+            fp8=embedding_cls is _Qwen4ExpFP8Embedding,
+        )
+        if self.ngram_embedding is None and _host_table_available():
             self.ngram_embedding = _Qwen4ExpHostEmbedding(
                 self.table_rows,
                 self.head_dim,
@@ -410,7 +419,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 prefix=embedding_prefix,
                 fp8=embedding_cls is _Qwen4ExpFP8Embedding,
             )
-        else:
+        if self.ngram_embedding is None:
             self.ngram_embedding = embedding_cls(
                 self.table_rows, self.head_dim, prefix=embedding_prefix
             )
@@ -475,6 +484,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             return
         rows = overlap_end - overlap_start
         source = loaded_weight.narrow(0, overlap_start - checkpoint_start, rows)
+        load_rows = getattr(embedding, "load_rows", None)
+        if load_rows is not None:
+            load_rows(shard_index, overlap_start, source)
+            return
         embedding.load_shard(shard_index, overlap_start, source)
 
     def compute_ngram_ids(
