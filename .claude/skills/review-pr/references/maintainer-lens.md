@@ -1,8 +1,11 @@
 # The maintainer's lens
 
 The judgement standard this pipeline automates, written by the ATOM maintainers.
-Moved here verbatim from `SKILL.md` when the bot pipeline took that path (ROCm/ATOM
-PR #2762); it was authored in #2871 and nothing in it has been edited. The bot's
+Moved here from `SKILL.md` when the bot pipeline took that path (ROCm/ATOM PR #2762).
+It was authored in #2871. The 435-line body below is byte-identical to that file; the
+only change is this header, which replaces the five-line skill frontmatter -- the file
+is no longer a skill entry point, so the frontmatter would have declared a second skill
+with the same name. The bot's
 `rules.md` is derived from this document and from `references/rule-catalog.md` --
 section 3 below is where the N-family rules come from.
 

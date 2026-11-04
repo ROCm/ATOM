@@ -336,6 +336,20 @@ def test_a_crashed_checker_is_not_a_clean_verdict(report, monkeypatch):
     assert _publish.review_payload("9999")["comments"] == []
 
 
+def test_the_summary_says_what_the_pr_does(report, monkeypatch):
+    """The card's bold one-sentence summary must reach the posted review.
+
+    SKILL.md requires that sentence and names its audience -- "a reviewer who has not
+    opened the diff" -- and the posted review is where that reader is. build_review
+    collected the title, the verdict lines, the findings and the index, and dropped it,
+    so every published review opened on a verdict with no statement of what was judged.
+    """
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    body = _publish.review_payload("9999")["body"]
+    what = next(l for l in CARD.split("\n") if l.startswith("**"))
+    assert what in body, "the posted review does not say what the PR does"
+
+
 def test_summary_indexes_every_anchored_finding(report, monkeypatch):
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
     pl = _publish.review_payload("9999")

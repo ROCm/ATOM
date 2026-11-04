@@ -5,9 +5,15 @@ families triage derived for the diff. They are NOT in SKILL.md: the median PR
 needs a fraction of them, and shipping all of them into every review costs
 attention that the derived subset is supposed to buy back.
 
-Every rule must cite a real ATOM PR as evidence. The rules below were carried
-over verbatim from the pre-pipeline SKILL.md and most do not yet carry one --
-that is the work of P1, not a licence to add more without evidence.
+A rule is either anchored on a real ATOM PR, or it says in its own body that it is
+not. Seven bodies currently say so -- B1, D4, E3, G2, H1, H2 and T6 are carried from
+aiter with no ATOM-native instance found despite a search, and A3 cites an unmerged
+commit. They are kept as preventive rules and labelled, not quietly presented as
+evidenced; deleting them is a separate decision from pretending they are cited.
+
+The bar for ADDING one is unchanged and stricter: a merged ATOM fix of that exact
+shape, or it does not go in. "Carried from aiter" is a description of history, never
+a licence.
 
 ## Descent from `references/rule-catalog.md`
 

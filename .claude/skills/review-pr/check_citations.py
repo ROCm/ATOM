@@ -145,11 +145,15 @@ def check(card_text: str, trees, changed=()):
                 # Nothing the finding quotes appears in the cited file at all. This fell
                 # through silently before, which inverted the severity: a symbol present
                 # but far from the cited line got flagged, while one that is not in the
-                # file is the stronger sign the citation points somewhere else. Found on
-                # PR#2707, whose finding cited model_runner.py:4465 for `uses_router_gemm`
-                # -- a symbol that lives in linear.py and appears nowhere in model_runner.
+                # file is the stronger sign the citation points somewhere else.
                 # Restricted to identifier-shaped tokens: a finding may legitimately quote
                 # a value (`per_token`) that is not source text in that file.
+                #
+                # This comment used to cite ATOM#2707 and assert `uses_router_gemm`
+                # "lives in linear.py". That symbol is in no ATOM branch a reader can open
+                # -- not in #2707's diff, not in main -- so the justification for a citation
+                # checker was itself an unresolvable citation. The mechanism above needs no
+                # anecdote, and one nobody can check is worse than none.
                 ident = [q for q in quoted if "_" in q or "." in q or len(q) > 12]
                 if ident:
                     yield "note", (

@@ -468,6 +468,13 @@ def build_review(pr, card, diff_text, flagged, sha):
 
 
     parts = [p for p in (_line_starting(card, "## "),) if p]
+    # The card's one bold sentence saying what the PR does. SKILL.md requires it and says
+    # who it is for -- "a reviewer who has not opened the diff" -- and the posted review is
+    # exactly where that reader is. It was assembled out of every published review from the
+    # start: the summary opened on a verdict with no statement of what was being judged.
+    what = _line_starting(card, "**")
+    if what:
+        parts.append(what)
     for pref in ("Review:", "Validation"):
         l = _line_starting(card, pref)
         if l:
