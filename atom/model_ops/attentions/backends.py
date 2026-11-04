@@ -1107,7 +1107,12 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         self._ubatch_split_bs = ubatch_split_bs
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
-        if envs.ATOM_STATE_OPS_DRAIN and (
+        drain = envs.ATOM_STATE_OPS_DRAIN
+        if drain == "dp":
+            drain = self.model_runner.config.parallel_config.data_parallel_size > 1
+        else:
+            drain = drain == "1"
+        if drain and (
             state_ops.relocations
             or state_ops.checkpoint_stores
             or state_ops.checkpoint_restores

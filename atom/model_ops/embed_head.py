@@ -287,8 +287,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         return logits
 
     def compute_topk_candidates(
-        self, x: torch.Tensor, k: int, logits_hook=None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, x: torch.Tensor, k: int, logits_hook=None, raw: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
         """The ``k`` largest logits of each row over the TP-sharded vocab, without
         all-gathering the ``[N, vocab]`` logits: each rank takes its shard's top ``k``
         and the ranks all-gather those ``[N, 2k]`` packs. Returns fp32 values and
@@ -298,16 +298,36 @@ class ParallelLMHead(VocabParallelEmbedding):
         A sampler that keeps at most ``k`` tokens a row (top-k sampling) needs only
         these. Decode at TP > 1 only (see ``ModelRunner._topk_candidates_step``).
         ``logits_hook(logits, vocab_start)``, if given, edits the shard's logits in
-        place before the top ``k``."""
+        place before the top ``k``. ``raw``: the all-gathered ``[tp * N, 2k]`` packs
+        as they arrive (rank-major), for a consumer that indexes them itself."""
         logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab / tp]
-        if logits_hook is not None:  # in place on this shard, e.g. presence_penalty
-            logits_hook(logits, self.vocab_start_idx)
-        vals, idx = torch.topk(logits, k, dim=-1, sorted=False)
-        # Ids below 2^24 are exact in fp32, so values and ids travel as one pack.
-        packed = torch.cat([vals.float(), (idx + self.vocab_start_idx).float()], dim=-1)
+        packed = None
+        if envs.ATOM_GLUE_SHARD_TOPK:
+            from atom.model_ops.presence_penalty import PresencePenaltyStep
+            from atom.model_ops.step_glue import shard_topk_packed
+
+            step = getattr(logits_hook, "__self__", None)
+            if logits_hook is None or (
+                isinstance(step, PresencePenaltyStep)
+                and getattr(logits_hook, "__func__", None) is PresencePenaltyStep.apply
+                and step.num_rows == logits.shape[0]
+            ):
+                # The penalty is applied on load (anchors included); the step's
+                # mask still gets its anchors marked when its tokens are.
+                packed = shard_topk_packed(logits, k, self.vocab_start_idx, step)
+        if packed is None:
+            if logits_hook is not None:  # in place on this shard, e.g. presence_penalty
+                logits_hook(logits, self.vocab_start_idx)
+            vals, idx = torch.topk(logits, k, dim=-1, sorted=False)
+            # Ids below 2^24 are exact in fp32, so values and ids travel as one pack.
+            packed = torch.cat(
+                [vals.float(), (idx + self.vocab_start_idx).float()], dim=-1
+            )
         gathered = get_tp_group().all_gather(
             packed, dim=0, use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER
         )  # [tp * N, 2k]
+        if raw:
+            return gathered
         gathered = gathered.view(self.tp_size, -1, 2, k).permute(1, 2, 0, 3)
         gathered = gathered.reshape(gathered.shape[0], 2, self.tp_size * k)
         return gathered[:, 0], gathered[:, 1].long()

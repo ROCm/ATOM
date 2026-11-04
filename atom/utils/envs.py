@@ -1044,8 +1044,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Drain the compute stream before a step's state maintenance copies
     # (checkpoint stores / restores, slot relocations). 1 (the default) keeps
     # the host from running ahead of the GPU across them; see
-    # `AttentionMetadataBuilder.build`.
-    "ATOM_STATE_OPS_DRAIN": lambda: os.getenv("ATOM_STATE_OPS_DRAIN", "1") == "1",
+    # `AttentionMetadataBuilder.build`. "dp": only under DP attention (where the
+    # race it closes was seen); 0: never.
+    "ATOM_STATE_OPS_DRAIN": lambda: os.getenv("ATOM_STATE_OPS_DRAIN", "1"),
     "ATOM_GDN_GRAPH_MAX_SEQS": lambda: int(os.getenv("ATOM_GDN_GRAPH_MAX_SEQS", "8")),
     # Prefill token graphs for the GDN/MHA builder (Qwen3.5 / Qwen3-Next) under
     # DP attention. A DP group replays a prefill bucket only on a step every
@@ -1138,6 +1139,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_TOPK_CANDIDATE_HEAD", "0").lower() in ("1", "true")
     ),
     "ATOM_TOPK_CANDIDATES": lambda: int(os.getenv("ATOM_TOPK_CANDIDATES", "20")),
+    # Decode step glue (atom/model_ops/step_glue.py), TP > 1 candidate head:
+    # the shard's top-k candidates (with the presence penalty) in two Triton
+    # kernels instead of the penalty kernel + conversions + torch.topk.
+    "ATOM_GLUE_SHARD_TOPK": lambda: os.getenv("ATOM_GLUE_SHARD_TOPK", "0") == "1",
+    # The verify's sampler, rejection, presence marks and next anchors in one
+    # kernel, rank-identical (counter-based noise), so no rank-0 broadcast.
+    # Needs ATOM_TOPK_CANDIDATE_HEAD's candidate path.
+    "ATOM_GLUE_STEP_SAMPLE": lambda: os.getenv("ATOM_GLUE_STEP_SAMPLE", "0") == "1",
+    # With ATOM_GLUE_STEP_SAMPLE: compare every step's tokens across the TP
+    # ranks (a host sync); on a mismatch log it and take rank 0's.
+    "ATOM_GLUE_CHECK": lambda: os.getenv("ATOM_GLUE_CHECK", "0") == "1",
     # Pure-DP draft greedy argmax: shard the draft lm_head vocab across the DP
     # group so each rank reads [H, V/dp] instead of the full [H, V], exchanging
     # only the packed [N, 2]. Active only for a unified (rectangular) pure-DP
