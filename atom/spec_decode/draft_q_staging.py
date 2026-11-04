@@ -6,9 +6,19 @@ writes the row bases the draft head writes through and the accept kernel reads
 through.
 """
 
+from typing import NamedTuple
+
 import numpy as np
 
 from atom.spec_decode.draft_q_slots import DraftQSlots
+
+
+class StagedRows(NamedTuple):
+    """How many leading rows of each staged buffer to publish (None: none)."""
+
+    seed: int
+    q_row_base: int | None
+    verify_q_row_base: int | None
 
 
 class DraftQStaging:
@@ -18,9 +28,9 @@ class DraftQStaging:
     inputs the captured draft head and the ratio verify read beyond the
     target's own (temperatures and filters, which the draft reads from the
     runner): the Philox step, each row's q destination and each request's
-    verify q row. `stage` returns how many
-    leading rows of each buffer to publish; the proposer turns those into its
-    publication counts. Free of torch and aiter, so the policy is testable on
+    verify q row. `stage` returns how many leading rows of each buffer to
+    publish (`StagedRows`); the proposer turns those into its publication
+    counts. Free of torch and aiter, so the policy is testable on
     any host.
     """
 
@@ -47,7 +57,7 @@ class DraftQStaging:
         self._consumed = None
 
     def stage(self, batch, bs: int, *, drafts_verifiable: bool, step: int):
-        """Stage one step and return ``{buffer: rows to publish or None}``.
+        """Stage one step and return the rows to publish (`StagedRows`).
 
         ``drafts_verifiable``: this step's propose emits drafts a later verify
         may read. False for a dummy forward and an align-only middle chunk:
@@ -88,12 +98,7 @@ class DraftQStaging:
         else:
             self._dest[:hi] = -1
             self._dest_hi = 0
-        counts = {
-            "seed": 1,
-            "verify_q_row_base": bs or None,
-            "q_row_base": hi or None,
-        }
-        return counts
+        return StagedRows(seed=1, q_row_base=hi or None, verify_q_row_base=bs or None)
 
     def consume(self, step: int) -> None:
         """Claim forward ``step``'s staging for the propose about to run, or

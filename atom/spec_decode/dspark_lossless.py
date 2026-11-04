@@ -9,7 +9,6 @@ and staged inputs, and the proposer's lossless hooks delegate to it.
 
 import dataclasses
 import logging
-from typing import NamedTuple
 
 import torch
 
@@ -38,41 +37,6 @@ logger = logging.getLogger("atom")
 #: the headroom above the live set is what makes the expired entry usually a
 #: finished request rather than a running one.
 _Q_SLOT_OVERSUBSCRIBE = 2
-
-
-class _LosslessInput(NamedTuple):
-    """One staged input of the sampled draft or the ratio verify."""
-
-    #: The `DraftQStaging` keyword its numpy view is passed as, the key
-    #: `DraftQStaging.stage` reports its row count under, and, if `drafted`,
-    #: the `DraftSampling` field its device tensor binds to.
-    name: str
-    #: One entry per batch row (`max_num_seqs`), or a single scalar.
-    per_row: bool
-    dtype: torch.dtype
-    #: What rows past the staged batch hold; None leaves the zeros.
-    idle: float | int | None
-    #: Whether the draft reads it; False when only the verify does.
-    drafted: bool = True
-
-    @property
-    def key(self) -> str:
-        """The `metadata_buffers` key, a member of the `sampling` publication;
-        prefixed because it shares `forward_vars` with the runner's."""
-        return "draft_" + self.name
-
-
-#: Every per-step input of lossless speculative sampling the target does not
-#: already stage, in publication order (temperatures and filters the draft
-#: reads from the runner: `bind_target`). Pad rows hold row base -1, so a pad
-#: row writes no q.
-_LOSSLESS_INPUTS = (
-    _LosslessInput("seed", False, torch.int32, None),
-    # First q row each batch row drafts into; -1 writes nothing.
-    _LosslessInput("q_row_base", True, torch.int32, -1),
-    # First q row each request's drafts were drawn into; -1 means none.
-    _LosslessInput("verify_q_row_base", True, torch.int32, -1, drafted=False),
-)
 
 
 def lossless_unsupported_reason(drafter) -> str | None:
@@ -134,6 +98,22 @@ def lossless_unsupported_reason(drafter) -> str | None:
             "distribution they were drawn from is not."
         )
     return None
+
+
+def _sampling_buffer(rows: int, device, idle: int | None = None) -> CpuGpuBuffer:
+    """An int32 member of the runner's `sampling` publication, its unpublished
+    rows at ``idle``."""
+    buf = CpuGpuBuffer(
+        rows,
+        dtype=torch.int32,
+        device=device,
+        pin_memory=torch.device(device).type != "cpu",
+        publication_group="sampling",
+    )
+    if idle is not None:
+        buf.np[:] = idle
+        buf.gpu.fill_(idle)
+    return buf
 
 
 class DSparkLossless:
@@ -208,36 +188,32 @@ class DSparkLossless:
         draft_scratch = dspark_markov_sample_scratch(max_bs, vocab, device)
         # Members of the runner's `sampling` publication, uploaded by the H2D
         # `prepare_sample` issues; its `begin()` waits out the previous upload.
-        pin = torch.device(device).type != "cpu"
-        buffers = {}
-        for spec in _LOSSLESS_INPUTS:
-            buf = CpuGpuBuffer(
-                max_bs if spec.per_row else 1,
-                dtype=spec.dtype,
-                device=device,
-                pin_memory=pin,
-                publication_group="sampling",
-            )
-            # Rows past the staged batch are never published, so they must
-            # already hold a harmless value.
-            if spec.idle is not None:
-                buf.np[:] = spec.idle
-                buf.gpu.fill_(spec.idle)
-            buffers[spec.name] = buf
+        # The Philox key, the first q row each batch row drafts into, and the
+        # first q row each request's drafts were drawn into (-1: none). Rows
+        # past the staged batch are never published, so they hold -1 already.
+        self.seed = _sampling_buffer(1, device)
+        self.q_row_base = _sampling_buffer(max_bs, device, idle=-1)
+        self.verify_q_row_base = _sampling_buffer(max_bs, device, idle=-1)
         drafter.metadata_buffers.update(
-            {s.key: buffers[s.name] for s in _LOSSLESS_INPUTS}
+            {
+                "draft_seed": self.seed,
+                "draft_q_row_base": self.q_row_base,
+                "draft_verify_q_row_base": self.verify_q_row_base,
+            }
         )
-        self._verify_q_row_base = buffers["verify_q_row_base"].gpu
         self.staging = DraftQStaging(
             DraftQSlots(q_slots, t),
+            seed=self.seed.np,
+            q_row_base=self.q_row_base.np,
+            verify_q_row_base=self.verify_q_row_base.np,
             greedy_threshold=SAMPLER_EPS,
-            **{name: buf.np for name, buf in buffers.items()},
         )
         self.sampling = DraftSampling(
             q_store=q_store,
             s_scratch=s_scratch,
             scratch=draft_scratch,
-            **{s.name: buffers[s.name].gpu for s in _LOSSLESS_INPUTS if s.drafted},
+            seed=self.seed.gpu,
+            q_row_base=self.q_row_base.gpu,
         )
 
     def bind_target(self, forward_vars, model) -> None:
@@ -271,8 +247,10 @@ class DSparkLossless:
             drafts_verifiable=drafts_verifiable,
             step=step,
         )
-        for spec in _LOSSLESS_INPUTS:
-            group.counts[group.indices[spec.key]] = rows[spec.name]
+        counts, at = group.counts, group.indices
+        counts[at["draft_seed"]] = rows.seed
+        counts[at["draft_q_row_base"]] = rows.q_row_base
+        counts[at["draft_verify_q_row_base"]] = rows.verify_q_row_base
 
     def verify_inputs(
         self,
@@ -294,7 +272,7 @@ class DSparkLossless:
             )
         return RatioVerifyInputs(
             self.sampling.q_store,
-            self._verify_q_row_base[:bs],
+            self.verify_q_row_base.gpu[:bs],
             temperatures,
             top_ks,
             top_ps,

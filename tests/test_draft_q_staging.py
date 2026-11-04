@@ -98,7 +98,7 @@ def test_an_align_only_propose_writes_no_q_and_keeps_other_slots():
     d = a.q_row_base[0]
     rows = stage(st, batch(["m1", "m2"]), verifiable=False)
     assert a.q_row_base[:2].tolist() == [-1, -1]
-    assert rows["q_row_base"] == 2
+    assert rows.q_row_base == 2
     assert "m1" not in st.slots and "m2" not in st.slots
     stage(st, batch(["d"]))
     assert a.verify_q_row_base[0] == d
@@ -169,11 +169,11 @@ def test_a_smaller_batch_clears_the_larger_ones_pad_rows():
     """The block runs at `running_bs >= scheduled_bs`; a pad row still naming a
     previous batch's slot would write its q into a live request's rows."""
     st, a = staging()
-    assert stage(st, batch(list("abcd")))["q_row_base"] == 4
+    assert stage(st, batch(list("abcd"))).q_row_base == 4
     rows = stage(st, batch(list("ab")))
     assert a.q_row_base[2:].tolist() == [-1, -1]
-    assert rows["q_row_base"] == 4, "the cleared tail is published too"
-    assert stage(st, batch(list("ab")))["q_row_base"] == 2
+    assert rows.q_row_base == 4, "the cleared tail is published too"
+    assert stage(st, batch(list("ab"))).q_row_base == 2
 
 
 def test_the_philox_key_advances_once_per_step():
@@ -189,8 +189,8 @@ def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail():
     st, a = staging()
     stage(st, batch(["a", "b"]))
     rows = stage(st, batch([]))
-    assert rows["seed"] == 1 and rows["verify_q_row_base"] is None
-    assert rows["q_row_base"] == 2 and a.q_row_base[:2].tolist() == [-1, -1]
+    assert rows.seed == 1 and rows.verify_q_row_base is None
+    assert rows.q_row_base == 2 and a.q_row_base[:2].tolist() == [-1, -1]
 
 
 def test_a_propose_needs_a_staging_of_its_own():
@@ -227,4 +227,4 @@ def test_clearing_the_destinations_keeps_the_slot_map():
     assert a.q_row_base.tolist() == [-1] * MAX_BS
     assert {"a", "b", "c"} <= set(st.slots._slot_of)
     # The next step after it clears only what it must.
-    assert stage(st, batch(["a"]))["q_row_base"] == 1
+    assert stage(st, batch(["a"])).q_row_base == 1
