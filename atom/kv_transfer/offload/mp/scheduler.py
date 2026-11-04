@@ -256,6 +256,12 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         if stats:
             for key, value in stats.items():
                 self._perf_counters_set(f"lookup_driver_{key}", value)
+        # A TP group spanning hosts (`tp_hosts.TPHostsSchedulerAdapter`): how
+        # often the hosts' servers disagreed and what narrowing them cost.
+        host_stats = getattr(getattr(self, "_mp_adapter", None), "tp_hosts_stats", None)
+        if host_stats:
+            for key, value in dict(host_stats).items():
+                self._perf_counters_set(f"tp_hosts_{key}", value)
         return metadata
 
     def _perf_counters_set(self, key: str, value: int) -> None:

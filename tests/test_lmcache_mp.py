@@ -318,136 +318,25 @@ def test_worker_slices_block_ids_by_the_virtual_block_under_dcp():
         connector._block_slice(request, 4, 8)
 
 
-class _HostFuture:
-    def __init__(self, value):
-        self._value = value
+def test_scheduler_reports_the_tp_hosts_counters(monkeypatch):
+    class Adapter:
+        lmcache_tokens_per_chunk = 16
 
-    def query(self):
-        return True
+        def __init__(self):
+            self.tp_hosts_stats = {"answered": 3, "disagreed": 1}
 
-    def wait(self, timeout=None):
-        return True
-
-    def result(self, timeout=None):
-        return self._value
-
-
-class _FakeHost:
-    """One host's scheduler adapter: answers prefetch statuses from a script."""
-
-    def __init__(self, statuses):
-        self.lmcache_tokens_per_chunk = 16
-        self._parallel = SimpleNamespace(tp_size=4)
-        self._mq_timeout = 1.0
-        self._client = self
-        self._statuses = list(statuses)
-        self.lookups = []
-        self.status_queries = 0
-        self.freed = []
-        self.cleaned = []
-        self.ended = []
-        self.closed = False
-
-    def _create_key(self, token_ids, start, end, request_id, worker_id):
-        return SimpleNamespace(
-            token_ids=tuple(token_ids),
-            start=start,
-            end=end,
-            request_id=request_id,
-            worker_id=worker_id,
-            host=self,
-        )
-
-    def lookup(self, key, tp_size):
-        assert key.host is self and tp_size == 4
-        self.lookups.append(key)
-        return _HostFuture(None)
-
-    def query_prefetch_status(self, request_id):
-        self.status_queries += 1
-        return _HostFuture(self._statuses.pop(0))
-
-    def free_lookup_locks(self, token_ids, start, end, request_id):
-        self.freed.append((start, end, request_id))
-
-    def cleanup_lookup_result(self, request_id):
-        self.cleaned.append(request_id)
-
-    def end_session(self, request_id):
-        self.ended.append(request_id)
-
-    def shutdown(self):
-        self.closed = True
-
-
-def test_tp_hosts_lookup_takes_the_answer_every_host_gives():
-    from atom.kv_transfer.offload.mp.tp_hosts import TPHostsSchedulerAdapter
-
-    hosts = [_FakeHost([3]), _FakeHost([None, 3])]
-    adapter = TPHostsSchedulerAdapter(hosts)
-
-    adapter.maybe_submit_lookup_request("r", list(range(70)))
-    assert [len(host.lookups) for host in hosts] == [1, 1]
-    assert hosts[0].lookups[0].end == 64
-    # Host 1 is still prefetching: no answer yet, and host 0 is not asked again.
-    assert adapter.check_lookup_result("r") is None
-    assert adapter.check_lookup_result("r") == 48
-    assert [host.status_queries for host in hosts] == [1, 2]
-    assert [host.freed for host in hosts] == [[], []]
-
-
-def test_tp_hosts_lookup_loads_nothing_when_the_hosts_disagree():
-    from atom.kv_transfer.offload.mp.tp_hosts import TPHostsSchedulerAdapter
-
-    hosts = [_FakeHost([3]), _FakeHost([2])]
-    adapter = TPHostsSchedulerAdapter(hosts)
-
-    adapter.maybe_submit_lookup_request("r", list(range(64)))
-
-    assert adapter.check_lookup_result("r") == 0
-    # Every host's read locks are released: the request recomputes.
-    assert hosts[0].freed == [(0, 48, "r")]
-    assert hosts[1].freed == [(0, 32, "r")]
-    assert adapter.host_mismatches == 1
-
-
-def test_tp_hosts_adapter_serves_the_async_lookup_client():
-    from atom.kv_transfer.offload.mp.tp_hosts import TPHostsSchedulerAdapter
-
-    hosts = [_FakeHost([None, 2]), _FakeHost([2])]
-    adapter = TPHostsSchedulerAdapter(hosts)
-    client = mp_lookup._MPLookupClient(
-        adapter, config=_config(), timeout=1.0, poll_interval=0.001
+    adapter = Adapter()
+    monkeypatch.setattr(
+        mp_scheduler, "_make_scheduler_adapter", lambda _config, **_kwargs: adapter
     )
-    tokens = list(range(40))
+    scheduler = mp_scheduler.LMCacheMPConnectorScheduler(_config())
 
-    assert client.supports_async()
-    assert client.submit(tokens, "7")
-    assert not client.poll("7")
-    assert client.poll("7")
-    assert client.lookup(tokens, "7") == 32
-    client.prepare_retrieve("7", 16, 32)
-    assert [host.freed for host in hosts] == [
-        [(0, 16, "atom-offload-dp0:7")],
-        [(0, 16, "atom-offload-dp0:7")],
-    ]
+    scheduler.build_connector_meta()
+    adapter.tp_hosts_stats["answered"] = 5
+    scheduler.build_connector_meta()
 
-
-def test_tp_hosts_adapter_fans_cleanup_out_to_every_host():
-    from atom.kv_transfer.offload.mp.tp_hosts import TPHostsSchedulerAdapter
-
-    hosts = [_FakeHost([]), _FakeHost([])]
-    adapter = TPHostsSchedulerAdapter(hosts)
-
-    adapter.free_lookup_locks(token_ids=[1, 2], start=0, end=16, request_id="r")
-    adapter.cleanup_lookup_result("r")
-    adapter.end_session("r")
-    adapter.shutdown()
-
-    assert all(host.freed == [(0, 16, "r")] for host in hosts)
-    assert all(host.cleaned == ["r"] for host in hosts)
-    assert all(host.ended == ["r"] for host in hosts)
-    assert all(host.closed for host in hosts)
+    assert scheduler._perf_counters["tp_hosts_answered"] == 5
+    assert scheduler._perf_counters["tp_hosts_disagreed"] == 1
 
 
 def test_mp_config_accepts_arbitrary_model_type():

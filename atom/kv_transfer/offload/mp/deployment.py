@@ -498,7 +498,7 @@ def _make_scheduler_adapter(
             key = super()._create_key(*args, **kwargs)
             return replace(key, num_kv_readers=num_kv_readers)
 
-    extra = _extra_config(config)
+    mq_timeout = float(_extra_config(config).get("lmcache.mp.mq_timeout", 300.0))
     hosts = _tp_host_count(config)
     if hosts == 1:
         return _ReaderAwareSchedulerAdapter(
@@ -509,7 +509,7 @@ def _make_scheduler_adapter(
             ),
             block_size=_page_block_tokens(config),
             parallel_config=_parallel_strategy(config, 0),
-            mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
+            mq_timeout=mq_timeout,
         )
 
     from atom.kv_transfer.offload.mp.tp_hosts import TPHostsSchedulerAdapter
@@ -517,22 +517,29 @@ def _make_scheduler_adapter(
     adapters: list[Any] = []
     try:
         for host, url in enumerate(_tp_host_server_urls(config)):
+            namespace = _model_namespace(
+                config, checkpoint_spec=checkpoint_spec, images=images, host=host
+            )
             adapters.append(
                 _ReaderAwareSchedulerAdapter(
                     server_url=url,
                     context=zmq.Context.instance(),
-                    model_name=_model_namespace(
-                        config,
-                        checkpoint_spec=checkpoint_spec,
-                        images=images,
-                        host=host,
-                    ),
+                    model_name=namespace,
                     block_size=_page_block_tokens(config),
                     parallel_config=_parallel_strategy(config, 0),
-                    mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
+                    mq_timeout=mq_timeout,
                 )
             )
-        return TPHostsSchedulerAdapter(adapters)
+            # The workers of that host log the namespace they register under
+            # (`_make_worker_adapter`); the two must match for any hit there.
+            logger.info(
+                "LMCache MP: TP host %d of %d is looked up at %s under %s",
+                host,
+                hosts,
+                url,
+                namespace,
+            )
+        return TPHostsSchedulerAdapter(adapters, mq_timeout=mq_timeout)
     except Exception:
         for adapter in adapters:
             try:
@@ -553,12 +560,22 @@ def _make_worker_adapter(
 
     extra = _extra_config(config)
     host = rank // _tp_ranks_per_host(config) if _tp_host_count(config) > 1 else None
+    namespace = _model_namespace(
+        config, checkpoint_spec=checkpoint_spec, images=images, host=host
+    )
+    if host is not None:
+        # Built on this host from its own environment (LMCACHE_* included);
+        # the engine's host logs the namespace it looks this host up under.
+        logger.info(
+            "LMCache MP: TP rank %d registers with TP host %d's server under %s",
+            rank,
+            host,
+            namespace,
+        )
     return AtomMPWorkerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
-        model_name=_model_namespace(
-            config, checkpoint_spec=checkpoint_spec, images=images, host=host
-        ),
+        model_name=namespace,
         block_size=_page_block_tokens(config),
         parallel_config=_parallel_strategy(config, rank),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
