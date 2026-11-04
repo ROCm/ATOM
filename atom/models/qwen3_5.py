@@ -23,7 +23,6 @@ from atom.model_config.qwen3_5_moe import (
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fla_ops import gdn_fused_decode
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
-from atom.utils import envs
 from atom.model_ops.layernorm import (
     fused_ar_gemma_per_group_supported,
     gluon_gemm_ar_init,
@@ -53,6 +52,7 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.plugin.prepare import is_plugin_mode
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
 

@@ -6,6 +6,7 @@ wave runs. With the fused kernel's roles split by WGP, that prefetch would refil
 executes. This wraps FlyDSL's MlirCompiler.compile and rewrites the field in the code object of every kernel
 whose name contains ``name_part``.
 """
+
 import struct
 
 _INSTALLED = {}
@@ -20,7 +21,9 @@ def _patch_elf(data: bytearray, name_part: str, lines: int) -> int:
     secs = []
     for i in range(e_shnum):
         o = e_shoff + i * e_shentsize
-        _name, sh_type, _flags, sh_addr, sh_offset, sh_size, sh_link = struct.unpack_from("<IIQQQQI", data, o)
+        _name, sh_type, _flags, sh_addr, sh_offset, sh_size, sh_link = (
+            struct.unpack_from("<IIQQQQI", data, o)
+        )
         secs.append((sh_type, sh_addr, sh_offset, sh_size, sh_link))
     n = 0
     for sh_type, _a, off, size, link in secs:
@@ -28,9 +31,11 @@ def _patch_elf(data: bytearray, name_part: str, lines: int) -> int:
             continue
         stroff = secs[link][2]
         for j in range(size // 24):
-            st_name, _info, _other, st_shndx, st_value, _st_size = struct.unpack_from("<IBBHQQ", data, off + 24 * j)
+            st_name, _info, _other, st_shndx, st_value, _st_size = struct.unpack_from(
+                "<IBBHQQ", data, off + 24 * j
+            )
             end = data.index(b"\0", stroff + st_name)
-            sym = data[stroff + st_name:end].decode(errors="replace")
+            sym = data[stroff + st_name : end].decode(errors="replace")
             if not sym.endswith(".kd") or name_part not in sym or st_shndx >= len(secs):
                 continue
             _t, s_addr, s_off, _s, _l = secs[st_shndx]
@@ -50,7 +55,11 @@ def install(name_part: str, lines: int) -> None:
     from flydsl._mlir.dialects import gpu
     from flydsl.compiler import jit_function as jf
 
-    orig = jf.MlirCompiler.__dict__["compile"].__func__ if not _INSTALLED else jf.MlirCompiler._mono_orig_compile
+    orig = (
+        jf.MlirCompiler.__dict__["compile"].__func__
+        if not _INSTALLED
+        else jf.MlirCompiler._mono_orig_compile
+    )
     jf.MlirCompiler._mono_orig_compile = orig
     _INSTALLED[name_part] = lines
 
@@ -69,9 +78,17 @@ def install(name_part: str, lines: int) -> None:
                 for part, ln in _INSTALLED.items():
                     c += _patch_elf(data, part, ln)
                 changed += c
-                new.append(gpu.ObjectAttr.get(oa.target, oa.format, bytes(data), oa.properties, oa.kernels) if c else a)
+                new.append(
+                    gpu.ObjectAttr.get(
+                        oa.target, oa.format, bytes(data), oa.properties, oa.kernels
+                    )
+                    if c
+                    else a
+                )
             if changed:
-                op.operation.attributes["objects"] = ir.ArrayAttr.get(new, context=out.context)
+                op.operation.attributes["objects"] = ir.ArrayAttr.get(
+                    new, context=out.context
+                )
         return out
 
     jf.MlirCompiler.compile = classmethod(compile)
@@ -83,6 +100,6 @@ def read_inst_pref(data: bytes, name_part: str):
     before = bytes(buf)
     _patch_elf(buf, name_part, 0)
     for i in range(0, len(before) - 4, 4):
-        if before[i:i + 4] != bytes(buf[i:i + 4]):
+        if before[i : i + 4] != bytes(buf[i : i + 4]):
             return (struct.unpack_from("<I", before, i)[0] >> 4) & 0xFF
     return None
