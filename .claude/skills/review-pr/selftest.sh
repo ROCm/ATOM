@@ -358,6 +358,24 @@ t "a dead fetch names the cause the runner can act on" \
 t "the citation checker runs end to end" \
   "$(bash "$S/_citations_test.sh" "$S" 2>&1 | tail -1)" "ok"
 
+# check_prompts must work outside a git checkout. It asked git for the repo root, and
+# `git rev-parse --show-toplevel` prints an empty string when there is no repo -- making
+# the SKILL.md path RELATIVE to the caller's cwd, so the drift check died with
+# FileNotFoundError on a `git archive HEAD` export. That export is exactly how a reviewer
+# is told to verify, and every trial that passed had been inside a checkout.
+_drift_outside_a_repo() {
+  # The whole skill tree, at the same depth it sits in the repo, with no .git anywhere --
+  # what `git archive HEAD | tar -x` produces. Checks whose inputs are absent skip and
+  # still exit 0; what must not happen is the crash that an empty repo-root produced.
+  local t; t=$(mktemp -d)
+  mkdir -p "$t/.claude/skills"
+  cp -r "$S" "$t/.claude/skills/review-pr"
+  rm -rf "$t/.claude/skills/review-pr/reports"
+  ( cd /tmp && python3 "$t/.claude/skills/review-pr/check_prompts.py" >/dev/null 2>&1; echo $? )
+  rm -rf "$t"
+}
+t "the drift check runs outside a git checkout" "$(_drift_outside_a_repo)" "0"
+
 echo "[publish]"
 # The publish path's guards are pytest cases (_publish_test.py): the --post closure, the
 # anchoring rule (span anchors and the permalinks for what cannot be anchored included), and
