@@ -413,6 +413,53 @@ def _images_before_text(messages: list[dict]) -> list[dict]:
     return reordered
 
 
+# Qwen3.5 checkpoints whose image prompts carry explicit embedding spans. Same
+# model types as the Qwen3.5 MRoPE path (`_get_qwen3_5_mrope_input_positions`).
+_QWEN3_5_SPAN_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_moe"})
+
+
+def qwen3_5_image_spans(
+    input_ids: list[int],
+    image_grid_thw,
+    image_token_id: int,
+    spatial_merge_size: int,
+) -> tuple[tuple[int, int], ...]:
+    """Each image's ``(start, count)`` run of image tokens, in image order.
+
+    The HF Qwen processor has already expanded every ``<|image_pad|>`` into
+    ``t * h * w / spatial_merge_size**2`` image tokens, one per row the vision
+    tower returns for that grid. Walk the prompt and claim each image's run in
+    turn, so adjacent images without separators split correctly too.
+    """
+    grids = (
+        image_grid_thw.tolist() if hasattr(image_grid_thw, "tolist") else image_grid_thw
+    )
+    merge_unit = int(spatial_merge_size) ** 2
+    spans: list[tuple[int, int]] = []
+    position = 0
+    for index, (t, h, w) in enumerate(grids):
+        count = int(t) * int(h) * int(w) // merge_unit
+        while position < len(input_ids) and input_ids[position] != image_token_id:
+            position += 1
+        run = input_ids[position : position + count]
+        found = next(
+            (i for i, token in enumerate(run) if token != image_token_id), len(run)
+        )
+        if found != count:
+            raise ValueError(
+                f"image {index} needs {count} consecutive image tokens (grid "
+                f"{t}x{h}x{w}, merge {spatial_merge_size}) but only {found} start "
+                f"at position {position}"
+            )
+        spans.append((position, count))
+        position += count
+    if any(token == image_token_id for token in input_ids[position:]):
+        raise ValueError(
+            f"prompt has more image tokens than its {len(grids)} image grids produce"
+        )
+    return tuple(spans)
+
+
 def build_qwen_vl_inputs(
     atom_config,
     processor,
@@ -421,7 +468,15 @@ def build_qwen_vl_inputs(
     chat_template_kwargs: dict,
     tools=None,
 ) -> tuple[list[int], dict]:
-    """Apply the existing template/processor convention and validate image slots."""
+    """Apply the existing template/processor convention and validate image slots.
+
+    For Qwen3.5 the image token runs are also returned as ``embedding_spans``,
+    so the runner scatters only the slice of each image a forward contains.
+    Without spans the prompt goes through the whole-image merge, which assumes
+    every image token is in the forward; a prefix-cache hit that ends inside or
+    past an image breaks that assumption (ROCm/ATOM#2865). Spans also let an
+    image prompt be chunked instead of prefilled in one forward.
+    """
     if isinstance(prompt, str):
         text = prompt
     else:
@@ -440,7 +495,21 @@ def build_qwen_vl_inputs(
             f"Prompt has {num_placeholders} image placeholders but {len(images)} images"
         )
     processed = processor(text=[text], images=images, return_tensors="pt")
-    return processed["input_ids"][0].tolist(), {
+    input_ids = processed["input_ids"][0].tolist()
+    multimodal_data = {
         "pixel_values": processed["pixel_values"],
         "image_grid_thw": processed["image_grid_thw"],
     }
+    multimodal_config = getattr(atom_config, "multimodal_config", None)
+    if getattr(multimodal_config, "model_type", None) in _QWEN3_5_SPAN_MODEL_TYPES:
+        from atom.model_engine.multimodal_runtime import multimodal_cache_seed
+
+        vision_config = getattr(multimodal_config, "vision_config", None)
+        multimodal_data["embedding_spans"] = qwen3_5_image_spans(
+            input_ids,
+            multimodal_data["image_grid_thw"],
+            image_token_id=getattr(multimodal_config, "image_token_id", 248056),
+            spatial_merge_size=getattr(vision_config, "spatial_merge_size", 2),
+        )
+        multimodal_data["cache_seed"] = multimodal_cache_seed(multimodal_data)
+    return input_ids, multimodal_data
