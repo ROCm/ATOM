@@ -100,18 +100,23 @@ def stage_fused(c, task):
     m_run = fx.Float32(NEG)
     l_run = fx.Float32(0.)
     acc = [fx.Vector.filled(8, 0., fx.Float32) for _ in range(4)]
+    # Both banks' tiles issued up front; tile it + 2 issues into bank it % 2
+    # once tile it's reads retire, so a 2-tile task never waits on a second
+    # serial TDM round trip.
     if count > 0:
         issue(0, 0)
+    if count > 1:
+        issue(1, 1)
     for it in range_constexpr(MAXT):
         buf = it % 2
         if it < count:
             kv = L["kv"] + buf * TILE * ROW
             rocdl.s_wait_loadcnt(0)
-            tdm_ops.tensor_wait(0)
+            if it + 1 < count:
+                tdm_ops.tensor_wait(8)
+            else:
+                tdm_ops.tensor_wait(0)
             gpu.barrier()
-            if const_expr(it + 1 < MAXT):
-                if it + 1 < count:
-                    issue(it + 1, 1 - buf)
             part = fx.make_rmem_tensor(8, fx.Float32)
             part.store(fx.full(8, 0., fx.Float32))
             for ch in range_constexpr(8):
@@ -174,6 +179,10 @@ def stage_fused(c, task):
                     cacc.store(acc[j])
                     _wmma(cacc, aw.bitcast(fx.BFloat16), bw.bitcast(fx.BFloat16))
                     acc[j] = cacc.load()
+            if const_expr(it + 2 < MAXT):
+                if it + 2 < count:
+                    gpu.barrier()
+                    issue(it + 2, buf)
     base_o = raw_address(c, P1A_O_OFFSET)
     for j in range_constexpr(4):
         col = wave * 64 + j * 16 + half * 8
@@ -195,6 +204,8 @@ def stage_irq_p1a(c, task, groups):
     tid, wave, a, att = c["tid"], c["wave"], c["args"], c["att"]
     t, tile, g0 = tile_task(task, GROUPS // groups, c["d"].head_tiles)
     ropes = irq_rope_loads(c, t, [g0 * groups + i for i in range(groups)])
+    # The sink does not wait on the splits: in flight during the poll
+    sink_value = fx.Float32(bo.buffer_load(rsrc(a["sink"]), tid // 16, vec_width=1, dtype=T.f32))
     if wave == 0:
         c["poll"]([(_ready(c), t * S + s, 1) for s in range(S)])
     gpu.barrier()
@@ -221,7 +232,6 @@ def stage_irq_p1a(c, task, groups):
         o = [halves[i // 4][i % 4] for i in range(8)]
         total = [total[i] + o[i] * w[s] for i in range(8)]
         combined = combined + ls[s] * w[s]
-    sink_value = fx.Float32(bo.buffer_load(rsrc(a["sink"]), h, vec_width=1, dtype=T.f32))
     final_m = fx.max(mx, sink_value * fx.Float32(LOG2E))
     alpha_kv = hw_exp2(mx - final_m)
     alpha_sink = hw_exp2(sink_value * fx.Float32(LOG2E) - final_m)
@@ -233,7 +243,6 @@ def stage_irq_p1a(c, task, groups):
         fx.ptr_store(bf16_round(value), att["out"] + ((group * HEAD_TILE + h) * COLS + gcol + i))
     gpu.barrier()
     for i in range_constexpr(groups):
+        # The groups read disjoint, already-joined LDS and store global: no barrier between
         irq_group(c, t, tile, g0 * groups + i, att["out"] + i * HEAD_TILE * COLS, ropes[i])
-        if const_expr(i + 1 < groups):
-            gpu.barrier()
     finish_irq_task(c, task)

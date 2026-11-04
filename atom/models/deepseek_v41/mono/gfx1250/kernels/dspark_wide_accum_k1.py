@@ -24,8 +24,9 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import Mailbox
 from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import scalar_address
 from atom.mono.device.ops import bf2_f32, row_shr, lane_gather
 from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import CM_NT_GFX1250
-# The gate's CTAs from 80: from attn_pre's 160 they were the second slice round's.
-GATE0 = 80
+# The gate's CTAs from 232: those hold no wq_b task (wq_b runs on CTAs 40..231); from
+# attn_pre's 160 they were the second slice round's, and from 80 each also ran a wq_b unit.
+GATE0 = 232
 from flydsl.expr.typing import T
 
 THREADS = 256

@@ -88,9 +88,11 @@ class Indexer(nn.Module):
                 spec.kv_owner, step, self.wk(latent)[0], spec.ratio, self.k_norm, rope
             )
             return
-        positions = step.plans[spec.ratio].key_rope_positions_gpu
-        index = self.project_keys(latent, rope, positions)
-        cache.write_index(spec.kv_owner, step, index, spec.ratio)
+        # The FP8 plane's writer also norms and rotates the key in its pass,
+        # as the FP4 one does: two launches fewer on every KV source layer.
+        cache.write_index_normed(
+            spec.kv_owner, step, self.wk(latent)[0], spec.ratio, self.k_norm, rope
+        )
 
     @property
     def weights_scale(self):

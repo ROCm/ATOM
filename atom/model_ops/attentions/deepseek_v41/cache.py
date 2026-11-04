@@ -23,6 +23,7 @@ from atom.model_ops.deepseek_v41.index_plane import IndexUnits
 from atom.model_ops.deepseek_v41.index_write import (
     write_index_rows,
     write_index_rows_fp4,
+    write_index_rows_normed,
 )
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.unit_table import unit_table
@@ -613,6 +614,23 @@ class PagedAttentionCache:
             ratio=ratio,
             rows_per_block=self.geometry.index_block_rows,
             scale_fmt=INDEX_FP8_SCALE_FMT,
+        )
+
+    def write_index_normed(self, owner, step, keys, ratio, norm, rope):
+        """`write_index` from the keys before their norm, normed and rotated
+        in the same pass (`write_index_rows_normed`)."""
+        (plane,) = self.index_planes[owner]
+        write_index_rows_normed(
+            keys,
+            plane,
+            step.plans[ratio].compress_plan_gpu,
+            step.block_tables,
+            self.geometry.rows_per_page(ratio),
+            ratio=ratio,
+            rows_per_block=self.geometry.index_block_rows,
+            scale_fmt=INDEX_FP8_SCALE_FMT,
+            norm=norm,
+            rope=rope,
         )
 
     def write_index_fp4(self, owner, step, keys, ratio, norm, rope):

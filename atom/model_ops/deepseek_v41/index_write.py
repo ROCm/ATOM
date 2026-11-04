@@ -241,3 +241,105 @@ def write_index_rows_fp4(
         ROPE_DIM=rope.rope_dim,
         PAGE=units.values.shape[1],
     )
+
+
+@triton.jit
+def _write_index_normed_kernel(
+    keys,
+    norm_weight,
+    norm_eps,
+    cos,
+    sin,
+    data,
+    scales,
+    plan,
+    block_tables,
+    per_page,
+    table_stride,
+    block_bytes,
+    RATIO: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    UE8M0: tl.constexpr,
+    TILE: tl.constexpr,
+    SHUFFLE: tl.constexpr,
+    MFMA_N: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    """`_write_index_kernel` from the key before its norm: normed and rotated
+    in the same pass exactly as `_write_index_fp4_kernel` does (bit for bit
+    `Indexer.project_keys`), then the FP8 row quantization and store."""
+    token = tl.program_id(0)
+    batch = tl.load(plan + token * 4 + 1)
+    if batch < 0:
+        return
+    flat = _pool_row(plan, block_tables, token, batch, per_page, table_stride, RATIO)
+    tile = flat // TILE
+    in_tile = flat % TILE
+
+    d = tl.arange(0, HEAD_DIM)
+    key = tl.load(keys + token.to(tl.int64) * HEAD_DIM + d).to(tl.float32)
+    w = tl.load(norm_weight + d).to(tl.float32)
+    variance = tl.sum(key * key, axis=0) / HEAD_DIM
+    key = (key * tl.rsqrt(variance + norm_eps) * w).to(tl.bfloat16).to(tl.float32)
+
+    HALF: tl.constexpr = ROPE_DIM // 2
+    even, odd = tl.split(tl.reshape(key, (HEAD_DIM // 2, 2)))
+    pair = tl.arange(0, HEAD_DIM // 2) - (HEAD_DIM - ROPE_DIM) // 2
+    rotated = pair >= 0
+    at = (tl.load(plan + token * 4 + 2) // RATIO) * RATIO * HALF + tl.maximum(pair, 0)
+    c = tl.load(cos + at, mask=rotated, other=1.0).to(tl.float32)
+    s = tl.load(sin + at, mask=rotated, other=0.0).to(tl.float32)
+    new_even = (even * c - odd * s).to(tl.bfloat16).to(tl.float32)
+    new_odd = (odd * c + even * s).to(tl.bfloat16).to(tl.float32)
+    key = tl.reshape(tl.join(new_even, new_odd), (HEAD_DIM,))
+
+    scale = tl.maximum(tl.max(tl.abs(key)), AMAX_FLOOR) / FP8_MAX
+    if UE8M0:
+        scale = tl.exp2(tl.ceil(tl.log2(scale)))
+    stored = tl.clamp(key * (1.0 / scale), -FP8_MAX, FP8_MAX).to(data.dtype.element_ty)
+    base = tile * block_bytes
+    tl.store(
+        data
+        + base
+        + (d // MFMA_N) * (SHUFFLE * MFMA_N)
+        + (in_tile % SHUFFLE) * MFMA_N
+        + (in_tile // SHUFFLE) * SHUFFLE * HEAD_DIM
+        + d % MFMA_N,
+        stored,
+    )
+    tl.store(scales + (base + TILE * HEAD_DIM) // 4 + in_tile, scale)
+
+
+def write_index_rows_normed(
+    keys, plane, plan, block_tables, per_page, *, ratio, rows_per_block, scale_fmt, norm, rope
+):
+    """`write_index_rows` from the keys before their norm: `norm` and `rope`
+    are the indexer's `k_norm` and RoPE, applied in the same pass."""
+    count = plan.shape[0]
+    if not count:
+        return
+    flat = plane.view(-1)
+    fp8 = torch.float8_e4m3fn
+    _write_index_normed_kernel[(count,)](
+        keys,
+        norm.weight,
+        norm.eps,
+        rope.cos_cache,
+        rope.sin_cache,
+        flat.view(fp8),
+        flat.view(torch.float32),
+        plan,
+        block_tables,
+        per_page,
+        block_tables.stride(0),
+        rows_per_block * plane.shape[-1],
+        RATIO=ratio,
+        HEAD_DIM=keys.shape[-1],
+        ROPE_DIM=rope.rope_dim,
+        UE8M0=scale_fmt == "ue8m0",
+        TILE=rows_per_block,
+        SHUFFLE=min(rows_per_block, MFMA_N),
+        MFMA_N=MFMA_N,
+        FP8_MAX=torch.finfo(fp8).max,
+    )
