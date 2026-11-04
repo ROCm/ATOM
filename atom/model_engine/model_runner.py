@@ -1184,9 +1184,12 @@ class ModelRunner:
         if builder is not None:
             builder.close()
         # MegaMoE's arenas live on the EP all2all manager's cco communicator,
-        # which destroy_dist_env() destroys. A close error propagates once the
-        # rest of the teardown has run.
+        # and SP MegaMoE's runtime on the SP group; destroy_dist_env() destroys
+        # both. A close error propagates once the rest of the teardown has run.
         try:
+            sp_mega_moe = getattr(self, "sp_mega_moe", None)
+            if sp_mega_moe is not None:
+                sp_mega_moe.close()
             if envs.ATOM_MORI_V2:
                 from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
                     close_mega_transports,
@@ -3120,7 +3123,7 @@ class ModelRunner:
             )
 
         if self.sp_mega_moe is not None:
-            self.sp_mega_moe.count_step(sp_local_len(forward_mode.running_tokens))
+            self.sp_mega_moe.before_step(sp_local_len(forward_mode.running_tokens))
 
         if not forward_mode.use_cudagraph:
             # prefill, or a decode no request graph serves (enforce_eager / DP

@@ -289,7 +289,7 @@ def test_epoch_count_covers_every_tile_of_the_largest_shard(monkeypatch, sp_modu
     runtime.return_value.prepare_all.assert_called_once_with()
     assert layer.sp_mega_moe is backend
     backend.runs = lambda rows: True
-    backend.count_step(16384)
+    backend.before_step(16384)
     assert backend.launches == 8
 
 
@@ -327,11 +327,11 @@ def test_only_megamoe_steps_are_counted(monkeypatch, host_copies):
     )
     backend = _counted(runtime, layers=3)
     for rows in (1, 16, 1, 1, 1):
-        backend.count_step(rows)
+        backend.before_step(rows)
     assert backend.launches == 3
     # One host copy covers the MegaMoE step; decode adds none.
     assert error_flag.call_count == 1
-    backend.count_step(32)
+    backend.before_step(32)
     runtime.reset.assert_called_once_with()
     assert backend.launches == 0
 
@@ -343,11 +343,11 @@ def test_timed_out_launch_fails_a_later_step(host_copies):
         error_flag=lambda: flag, cfg=Mock(rank=2), max_local_tokens=16
     )
     backend = _counted(runtime)
-    backend.count_step(16)
+    backend.before_step(16)
     flag[0] = 4  # a wait in this step timed out
-    backend.count_step(1)
+    backend.before_step(1)
     with pytest.raises(RuntimeError, match="rank 2: a MegaMoeTP wait timed out"):
-        backend.count_step(1)
+        backend.before_step(1)
 
 
 @pytest.mark.parametrize("local,peer", [(4, 0), (0, 4)])
@@ -369,5 +369,5 @@ def test_epoch_reset_first_fails_on_any_rank_timeout(
     )
     backend = _counted(runtime)
     with pytest.raises(RuntimeError, match="rank 2: a MegaMoeTP wait timed out"):
-        backend.count_step(16)
+        backend.before_step(16)
     runtime.reset.assert_not_called()

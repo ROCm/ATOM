@@ -144,12 +144,16 @@ class SPMegaMoE:
         self._errors_copied.record()
         self._copy_pending, self._uncopied = True, False
 
-    def count_step(self, rows):
-        """Count a model step's launches up front, so graph replays count too.
+    def before_step(self, rows):
+        """Host bookkeeping before a model step, eager or graph replay.
 
-        ``rows`` is this rank's share of the step's padded tokens. A step that
-        keeps the native MoE launches nothing and adds no copy. Decode graphs
-        from 256 global rows up replay MegaMoE launches without running Python.
+        Raises if an earlier step's wait timed out (read through an async
+        GPU->CPU copy, no host sync), then counts this step's launches. Every
+        RESET_LAUNCHES launches it syncs the host on the error bits, agreed
+        over the SP group, and runs the collective reset(). ``rows`` is this
+        rank's share of the step's padded tokens; a step that keeps the native
+        MoE launches nothing. Capture warmups call the model directly and go
+        uncounted, which RESET_LAUNCHES' margin absorbs.
         """
         self._raise_on_timeout()
         if not self.runs(rows):
@@ -166,6 +170,11 @@ class SPMegaMoE:
                 self._timed_out(bits)
             self.runtime.reset()
             self.launches = 0
+
+    def close(self):
+        """Collective over the SP group: every rank calls it before the group
+        is destroyed."""
+        self.runtime.close()
 
     def runs(self, rows):
         """Whether MegaMoE takes a step: only where the native MoE quantizes
