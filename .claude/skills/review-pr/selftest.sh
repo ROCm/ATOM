@@ -381,6 +381,17 @@ _drift_outside_a_repo() {
 }
 t "the drift check runs outside a git checkout" "$(_drift_outside_a_repo)" "0"
 
+
+# ATOM_AGENT_TIMEOUT and ATOM_RUN_BUDGET are coupled and nothing else enforces it. A review
+# runs two agents in series and the budget gate refuses to START one that cannot finish, so
+# raising the per-agent timeout alone leaves the refuter unable to start: the worker runs for
+# an hour, the independent gate reds, the review is withheld, and the failure is reported as a
+# timeout whose named fix makes it worse. Hit for real while re-reviewing ATOM#2762.
+_budget_pair() {  # <agent> <budget> -> rc of run_one's precondition
+  ( ATOM_AGENT_TIMEOUT=$1 ATOM_RUN_BUDGET=$2 \
+    timeout 20 bash "$S/run_one.sh" 0 x/y >/dev/null 2>&1; echo $? )
+}
+t "a per-agent timeout that starves the refuter is refused" "$(_budget_pair 5400 7200)" "2"
 echo "[publish]"
 # The publish path's guards are pytest cases (_publish_test.py): the --post closure, the
 # anchoring rule (span anchors and the permalinks for what cannot be anchored included), and

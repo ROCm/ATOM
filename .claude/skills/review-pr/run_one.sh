@@ -55,6 +55,18 @@ trap _on_signal TERM INT
 : "${ATOM_AGENT_TIMEOUT:=2400}"   # 40 min per agent attempt; one default, read everywhere below
 # Wider than aiter's 100/120: validate-atom-pr (P2) stands up two model-serving instances inside
 # the same run, and that extra wall clock has to fit inside the budget alongside the review itself.
+# The two knobs are coupled, and the coupling has no other enforcement. A review runs TWO
+# agents in series -- the worker and the independent refuter -- and the budget gate below
+# refuses to START one that cannot finish inside the deadline. So if a raised
+# ATOM_AGENT_TIMEOUT leaves less than one more agent's worth of budget, the refuter never
+# runs, the `independent` gate reds, and the review is withheld. Raising one knob alone is
+# the obvious thing to do and it silently breaks the run an hour later, reported as a
+# timeout whose named fix (raise AGENT_TIMEOUT) makes it worse. Caught here instead, where
+# the numbers are, before any work is spent.
+if [ $(( ATOM_AGENT_TIMEOUT * 2 )) -gt "$ATOM_RUN_BUDGET" ]; then
+  echo "::error title=review-pr::ATOM_AGENT_TIMEOUT=${ATOM_AGENT_TIMEOUT}s x2 agents (worker + refuter) exceeds ATOM_RUN_BUDGET=${ATOM_RUN_BUDGET}s, so the refuter could not start and the review would be withheld after the worker had already run. Raise ATOM_RUN_BUDGET to at least $(( ATOM_AGENT_TIMEOUT * 2 ))s, or lower ATOM_AGENT_TIMEOUT." >&2
+  exit 2
+fi
 DEADLINE=$(( $(date +%s) + ATOM_RUN_BUDGET ))
 
 # GLM-5.3 is not in Claude's model catalog; disable the unknown-model window enforcement.
