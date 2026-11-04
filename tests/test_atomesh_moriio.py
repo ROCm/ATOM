@@ -5,14 +5,17 @@
 
 import json
 import os
-import re
-import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
-import yaml
+from atomesh_workflow_helpers import (
+    github_expressions,
+    load_workflow,
+    run_matrix_step,
+    workflow_step,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".github/scripts/atomesh"
@@ -33,6 +36,7 @@ def generate_cells(
     suite: str = "accuracy",
     model_root: str = "/data/models2",
     extra_args: tuple[str, ...] = (),
+    env: dict[str, str] | None = None,
 ) -> list[dict]:
     """Run the matrix over one model's suite on the Spur lane."""
     with tempfile.TemporaryDirectory() as temp:
@@ -60,6 +64,7 @@ def generate_cells(
                 ATOMESH_1P1D_NODES=SPUR_NODES,
                 ATOMESH_2P1D_NODES=SPUR_NODES,
                 ATOMESH_PD_RANK_MAPPING_POLICY="idx2idx",
+                **(env or {}),
             ),
             check=True,
             capture_output=True,
@@ -283,7 +288,7 @@ class KimiK3MoriIOCellTest(unittest.TestCase):
             self.assertNotIn("num_speculative_tokens", server)
             self.assertIs(server["enable_prefix_caching"], False)
 
-    def test_dp_attention_also_keeps_f_b_proj_out_of_fp8(self):
+    def test_dp_attention_also_excludes_f_b_proj_from_fp8(self):
         def excluded(cell):
             config = json.loads(cell["server_args"]["online_quant_config"])
             return set(config["exclude_layer"])
@@ -313,33 +318,12 @@ class KimiK3MoriIOCellTest(unittest.TestCase):
         )
 
 
-WORKFLOW = ROOT / ".github/workflows/atomesh-benchmark.yaml"
 TW_WEEKLY = "0 16 * * 5"
 SPUR_NIGHTLY = "10 16 * * *"
 SPUR_MORIIO = "10 4 * * *"
 # atomesh-benchmark.yaml's model root for the Spur lane.
 SPUR_MODEL_ROOT = "/data/junyyang/models"
 MORIIO_MODELS = ("DeepSeek-V3", "Kimi-K2.5-MXFP4", "Kimi-K3-MXFP4")
-
-
-def github_expressions(source: str, event: str, schedule: str = "") -> str:
-    """Evaluate the ${{ }} segments of a workflow value for a run with no inputs."""
-    context = {
-        "event_name": event,
-        "schedule": schedule,
-        "workflow": "Atomesh Benchmark",
-        "ref": "refs/heads/main",
-        "run_id": "1",
-    }
-
-    def evaluate(match: re.Match) -> str:
-        expression = re.sub(r"\binputs\.\w+", "''", match.group(1))
-        expression = re.sub(r"\bgithub\.event\.schedule\b", "schedule", expression)
-        expression = re.sub(r"\bgithub\.(\w+)\b", r"\1", expression)
-        expression = expression.replace("&&", " and ").replace("||", " or ")
-        return str(eval(expression, {"__builtins__": {}}, context))
-
-    return re.sub(r"\$\{\{(.*?)\}\}", evaluate, source)
 
 
 def is_moriio(cell: dict) -> bool:
@@ -351,12 +335,8 @@ class MoriIOScheduleTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.workflow = yaml.safe_load(WORKFLOW.read_text())
-        cls.matrix_script = next(
-            step["run"]
-            for step in cls.workflow["jobs"]["load-config"]["steps"]
-            if step.get("id") == "matrix"
-        )
+        cls.workflow = load_workflow()
+        cls.matrix_script = workflow_step(cls.workflow, "matrix")
         cls.moriio_cells = cls.matrix(SPUR_MORIIO)
         cls.nightly_cells = cls.matrix(SPUR_NIGHTLY)
 
@@ -370,21 +350,12 @@ class MoriIOScheduleTest(unittest.TestCase):
     @classmethod
     def matrix(cls, schedule: str) -> list[dict]:
         """Run the workflow's matrix step as that schedule would."""
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for name in (
-                ".github/scripts/atomesh/pd_matrix.py",
-                ".github/benchmark/models_atomesh.yaml",
-            ):
-                target = root / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(ROOT / name, target)
-            env = dict(
-                os.environ,
-                **cls.lane(schedule),
+        cells, _ = run_matrix_step(
+            cls.matrix_script,
+            dict(
+                cls.lane(schedule),
                 GITHUB_EVENT_NAME="schedule",
                 EVENT_SCHEDULE=schedule,
-                GITHUB_OUTPUT=str(root / "github-output"),
                 SUITE="nightly",
                 RUN_ALL_MODELS="true",
                 MODEL_NAMES="",
@@ -392,17 +363,9 @@ class MoriIOScheduleTest(unittest.TestCase):
                 ATOMESH_IMAGE="test-image",
                 ATOMESH_BENCHMARK_CONCURRENCY="",
                 ATOMESH_EVAL_CONCURRENCY="",
-            )
-            subprocess.run(
-                ["bash", "-eu", "-c", cls.matrix_script],
-                cwd=root,
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            return json.loads((root / "atomesh-matrix.json").read_text())["include"]
+            ),
+        )
+        return cells
 
     def test_the_moriio_cron_runs_on_the_spur_lane_like_the_nightly(self):
         # PyYAML reads the workflow's `on:` key as True.
@@ -468,6 +431,24 @@ class MoriIOScheduleTest(unittest.TestCase):
         self.assertEqual(
             [cell["id"] for cell in mooncake], [cell["id"] for cell in nightly]
         )
+
+    def test_atomesh_kv_connector_sets_the_filter_like_the_flag(self):
+        flag = generate_cells(
+            "DeepSeek-V3",
+            "accuracy",
+            SPUR_MODEL_ROOT,
+            extra_args=("--kv-connector", "moriio"),
+        )
+        from_env = generate_cells(
+            "DeepSeek-V3",
+            "accuracy",
+            SPUR_MODEL_ROOT,
+            env={"ATOMESH_KV_CONNECTOR": "moriio"},
+        )
+        everything = generate_cells("DeepSeek-V3", "accuracy", SPUR_MODEL_ROOT)
+        self.assertTrue(from_env)
+        self.assertEqual(from_env, flag)
+        self.assertLess(len(from_env), len(everything))
 
 
 class KvConnectorTest(unittest.TestCase):

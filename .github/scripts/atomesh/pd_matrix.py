@@ -48,48 +48,15 @@ def parse_int_list(value: Any, field_name: str) -> list[int]:
         raise ValueError(f"{field_name} must be a list of integers") from exc
 
 
-def parse_model_filter(value: str | None) -> set[str] | None:
+def parse_set_filter(value: str | None) -> set[str] | None:
     if not value:
         return None
-    models = {
+    items = {
         item.strip()
         for item in value.split(",")
         if item.strip() and item.strip().lower() != "all"
     }
-    return models or None
-
-
-def parse_case_filter(value: str | None) -> set[str] | None:
-    if not value:
-        return None
-    cases = {
-        item.strip()
-        for item in value.split(",")
-        if item.strip() and item.strip().lower() != "all"
-    }
-    return cases or None
-
-
-def parse_benchmark_kind_filter(value: str | None) -> set[str] | None:
-    if not value:
-        return None
-    kinds = {
-        item.strip()
-        for item in value.split(",")
-        if item.strip() and item.strip().lower() != "all"
-    }
-    return kinds or None
-
-
-def parse_kv_connector_filter(value: str | None) -> set[str] | None:
-    if not value:
-        return None
-    connectors = {
-        item.strip()
-        for item in value.split(",")
-        if item.strip() and item.strip().lower() != "all"
-    }
-    return connectors or None
+    return items or None
 
 
 def model_path_env_key(model_name: str) -> str:
@@ -466,6 +433,21 @@ def build_cell(
         "swebench_lite",
     }:
         raise ValueError("eval_only requires a supported accuracy task")
+    env = {
+        role: role_env(
+            defaults, backend_cfg, model_cfg, suite_cfg, role, slurm_submit_runner
+        )
+        for role in ("common", "prefill", "decode", "router")
+    }
+    # pd_server_atom.sh checks the connector with only env.common applied, and
+    # each server then re-applies its role env: a per-role value skips that check.
+    for role in ("prefill", "decode"):
+        connector = env[role].get("KV_CONNECTOR")
+        if connector != env["common"].get("KV_CONNECTOR"):
+            raise ValueError(
+                f"{cell_name}: env.{role} sets KV_CONNECTOR={connector!r}; "
+                "set it in env.common only"
+            )
     return {
         "id": cell_id,
         "suite": suite_name,
@@ -500,12 +482,7 @@ def build_cell(
             "router": router_cfg,
         },
         "server_args": server_args,
-        "env": {
-            role: role_env(
-                defaults, backend_cfg, model_cfg, suite_cfg, role, slurm_submit_runner
-            )
-            for role in ("common", "prefill", "decode", "router")
-        },
+        "env": env,
         "run_eval": bool(suite_cfg.get("run_eval", False)),
         "eval_only": eval_only,
         "accuracy": {
@@ -609,7 +586,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--kv-connector",
-        default=None,
+        default=os.environ.get("ATOMESH_KV_CONNECTOR") or None,
         help="Optional KV connector filter: one connector, comma-separated connectors, or all",
     )
     parser.add_argument("--image", default=os.environ.get("ATOMESH_IMAGE") or None)
@@ -635,13 +612,13 @@ def main() -> int:
     cells = build_cells(
         config,
         suite=args.suite,
-        model_filter=parse_model_filter(args.model),
-        case_filter=parse_case_filter(args.case),
-        benchmark_kind_filter=parse_benchmark_kind_filter(args.benchmark_kind),
+        model_filter=parse_set_filter(args.model),
+        case_filter=parse_set_filter(args.case),
+        benchmark_kind_filter=parse_set_filter(args.benchmark_kind),
         override_image=args.image,
         override_benchmark_concurrency=benchmark_concurrency or None,
         override_eval_concurrency=eval_concurrency or None,
-        kv_connector_filter=parse_kv_connector_filter(args.kv_connector),
+        kv_connector_filter=parse_set_filter(args.kv_connector),
     )
     print(f"Generated {len(cells)} ATOMesh benchmark cell(s) for suite={args.suite}")
     for cell in cells:

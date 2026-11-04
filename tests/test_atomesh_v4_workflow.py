@@ -3,15 +3,12 @@
 
 """Execute the workflow matrix builder and V4 accuracy paths without GPUs."""
 
-import json
 import os
-import shutil
 import subprocess
-import tempfile
 import unittest
 from pathlib import Path
 
-import yaml
+from atomesh_workflow_helpers import load_workflow, run_matrix_step, workflow_step
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".github/scripts/atomesh"
@@ -22,62 +19,34 @@ CONCURRENCIES = {1, 2, 16, 32, 128, 192, 256}
 class V4WorkflowTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        workflow = yaml.safe_load(
-            (ROOT / ".github/workflows/atomesh-benchmark.yaml").read_text()
-        )
-        cls.script = next(
-            step["run"]
-            for step in workflow["jobs"]["load-config"]["steps"]
-            if step.get("id") == "matrix"
-        )
+        cls.script = workflow_step(load_workflow(), "matrix")
 
     def matrix(self, event="schedule", schedule="0 16 * * 5", **overrides):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for name in (
-                ".github/scripts/atomesh/pd_matrix.py",
-                ".github/benchmark/models_atomesh.yaml",
-            ):
-                target = root / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(ROOT / name, target)
-            env = dict(
-                os.environ,
-                GITHUB_EVENT_NAME=event,
-                EVENT_SCHEDULE=schedule,
-                GITHUB_OUTPUT=str(root / "github-output"),
-                SUITE="nightly",
-                RUN_ALL_MODELS="true",
-                MODEL_NAMES="",
-                CASE_NAMES="",
-                ATOMESH_SLURM_SUBMIT_RUNNER="atomesh-cicd",
-                ATOMESH_SLURM_ACCOUNT="amd-atom",
-                ATOMESH_SLURM_PARTITION="amd-spur",
-                ATOMESH_MODEL_ROOT="/models",
-                ATOMESH_LOG_ROOT="/logs",
-                ATOMESH_NODE_POOL="pit2-p03-g01,pit2-p03-g03,pit2-p03-g07,pit2-p03-g42",
-                ATOMESH_SINGLE_NODE="auto",
-                ATOMESH_1P1D_NODES="",
-                ATOMESH_2P1D_NODES="",
-                ATOMESH_PD_RANK_MAPPING_POLICY="none",
-                ATOMESH_IMAGE="test-image",
-                ATOMESH_BENCHMARK_CONCURRENCY="",
-                ATOMESH_EVAL_CONCURRENCY="",
-            )
-            env.update(overrides)
-            result = subprocess.run(
-                ["bash", "-eu", "-c", self.script],
-                cwd=root,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            cells = json.loads((root / "atomesh-matrix.json").read_text())["include"]
-            self.assertIn("has_matrix=true", (root / "github-output").read_text())
-            return cells
+        env = {
+            "GITHUB_EVENT_NAME": event,
+            "EVENT_SCHEDULE": schedule,
+            "SUITE": "nightly",
+            "RUN_ALL_MODELS": "true",
+            "MODEL_NAMES": "",
+            "CASE_NAMES": "",
+            "ATOMESH_SLURM_SUBMIT_RUNNER": "atomesh-cicd",
+            "ATOMESH_SLURM_ACCOUNT": "amd-atom",
+            "ATOMESH_SLURM_PARTITION": "amd-spur",
+            "ATOMESH_MODEL_ROOT": "/models",
+            "ATOMESH_LOG_ROOT": "/logs",
+            "ATOMESH_NODE_POOL": "pit2-p03-g01,pit2-p03-g03,pit2-p03-g07,pit2-p03-g42",
+            "ATOMESH_SINGLE_NODE": "auto",
+            "ATOMESH_1P1D_NODES": "",
+            "ATOMESH_2P1D_NODES": "",
+            "ATOMESH_PD_RANK_MAPPING_POLICY": "none",
+            "ATOMESH_IMAGE": "test-image",
+            "ATOMESH_BENCHMARK_CONCURRENCY": "",
+            "ATOMESH_EVAL_CONCURRENCY": "",
+            **overrides,
+        }
+        cells, output = run_matrix_step(self.script, env)
+        self.assertIn("has_matrix=true", output)
+        return cells
 
     def test_tw_schedule_includes_v4_weekly_and_existing_models(self):
         cells = self.matrix()
