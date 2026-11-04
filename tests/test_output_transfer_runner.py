@@ -119,7 +119,6 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
     process. An all-greedy verify asks for neither."""
     bs = 2
     top_ks, top_ps = torch.tensor([5, 0]), 0.9
-    host_top_ks = np.array([5, 0], np.int32)
     spec = (
         SimpleNamespace(
             bonus_logits_indices=torch.tensor([1, 3]),
@@ -159,7 +158,6 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
                 total_seqs_num=bs,
                 return_logprobs=[False] * bs,
                 required_channel=None,
-                top_ks=host_top_ks,
             ),
             torch.zeros(4, 8),
             torch.ones(bs),
@@ -180,8 +178,6 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
     passed = runner.rejection_sampler.forward.call_args.kwargs
     assert passed["draft_q"] is draft_q
     assert passed["top_ks"] is top_ks and passed["top_ps"] is top_ps
-    # The host copy of the per-request k, so the verify knows whether to count.
-    assert passed["host_top_ks"] is host_top_ks
     # Unarmed, the exact-match draw is the flag-off law, as the bonus is.
     assert runner.sampler.sample_verification_tokens.called is not armed
 
@@ -235,8 +231,8 @@ def test_a_uniform_k_reaches_the_sampler_as_a_scalar(ks, ps):
 def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
     """The draft samples within each row's own filters, read from the target's
     buffers, so they are published whatever the batch holds: off and uniform
-    filters included. `Sampler` and the verify get those same device rows,
-    not a scalar to expand again."""
+    filters included. `Sampler` and the verify still get the batch's scalars
+    where it is uniform, so a uniform filter keeps its own variant."""
     bs = len(ks)
     buffers = {
         name: SimpleNamespace(np=np.zeros(4, dtype), gpu=torch.zeros(4))
@@ -270,16 +266,12 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
     np.testing.assert_array_equal(buffers["top_ps"].np[:bs], np.float32(ps))
     assert group.counts[group.indices["top_ks"]] == bs
     assert group.counts[group.indices["top_ps"]] == bs
-    if any(k != -1 for k in ks):
-        assert top_ks.data_ptr() == buffers["top_ks"].gpu.data_ptr()
-        assert top_ks.shape == (bs,)
-    else:
-        assert top_ks is None
-    if any(p < 1.0 for p in ps):
+    if len(set(ks)) == 1 and ks[0] != -1:
+        assert top_ks == ks[0]
+    if len(set(ps)) == 1 and ps[0] < 1.0:
+        assert top_ps == np.float32(ps[0])
+    if len(set(ps)) > 1:
         assert top_ps.data_ptr() == buffers["top_ps"].gpu.data_ptr()
-        assert top_ps.shape == (bs,)
-    else:
-        assert top_ps is None
 
 
 @pytest.mark.parametrize("max_num_seqs", [1, 64])

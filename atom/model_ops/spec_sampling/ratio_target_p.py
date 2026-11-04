@@ -9,7 +9,6 @@ filter's run-maxima pass. `ratio_verify` reads p from what this leaves.
 
 from typing import NamedTuple
 
-import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -204,7 +203,6 @@ def _ratio_target_p(
     top_ks: int | torch.Tensor | None,
     top_ps: float | torch.Tensor | None,
     work: TargetPScratch,
-    host_top_ks: np.ndarray | None = None,
 ) -> bool:
     """Each draft row's p, and p_f where its request filters.
 
@@ -213,8 +211,7 @@ def _ratio_target_p(
     ``exp(l(v) / T - row_max) * row_inv_z``, and on a filtered row 0 below
     ``row_floor`` with ``row_inv_z`` renormalized over what is left.
     ``top_ks``/``top_ps`` are what `Sampler` is given: None (no row filters),
-    one value for the batch, or one per request, a top-k of -1 meaning none;
-    ``host_top_ks`` a per-request top-k's values on the host (`row_filters`).
+    one value for the batch, or one per request, a top-k of -1 meaning none.
     Returns whether the batch filters at all; ``row_floor`` is written only
     then.
     """
@@ -226,7 +223,7 @@ def _ratio_target_p(
     filtered = top_ks is not None or top_ps is not None
     if not num_tokens:
         return filtered
-    filters = row_filters(top_ks, top_ps, batch_size, target_logits.dtype, host_top_ks)
+    filters = row_filters(top_ks, top_ps, batch_size, target_logits.dtype)
     runs = work.filter.runs if filters.counts else (None, None)
     _ratio_stats_kernel[(num_tokens, n_tiles)](
         target_logits,

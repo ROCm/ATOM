@@ -14,7 +14,6 @@ apart (about ``exp(-max)`` of mass each), and top-p compares a sum to top_p.
 
 from typing import NamedTuple
 
-import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -183,13 +182,10 @@ def row_filters(
     top_ps: float | torch.Tensor | None,
     batch_size: int,
     logits_dtype: torch.dtype,
-    host_top_ks: np.ndarray | None = None,
 ) -> RowFilters:
     """How a batch filters. ``top_ks``/``top_ps`` are what `Sampler` is
     given: None (no row filters), one value for the batch, or one per
-    request, a top-k of -1 meaning none. ``host_top_ks`` is a per-request
-    top-k's values on the host, if the caller has them: without them a
-    per-request k is assumed to hold a counted row."""
+    request, a top-k of -1 meaning none."""
     k_rows = isinstance(top_ks, torch.Tensor)
     p_rows = isinstance(top_ps, torch.Tensor)
     for name, rows_of in (("top_ks", top_ks), ("top_ps", top_ps)):
@@ -213,16 +209,12 @@ def row_filters(
     if p_scalar is not None and p_scalar >= 1.0:
         p_scalar = None
     k_small = k_scalar is not None and 0 < k_scalar <= _FILTER_COUNT_MAX_K
-    k_small_rows = k_rows and (
-        host_top_ks is None
-        or bool(((host_top_ks > 0) & (host_top_ks <= _FILTER_COUNT_MAX_K)).any())
-    )
     return RowFilters(
         request_filter,
         k_rows,
         p_rows,
         key_bits,
-        counts=(k_small_rows or k_small) and p_scalar is None,
+        counts=(k_rows or k_small) and p_scalar is None,
         descends=not (k_small and not p_rows and p_scalar is None),
         # Only a top-p needs the passes to weigh; counting alone is cheaper.
         weigh=top_ps is not None,
