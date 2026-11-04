@@ -633,16 +633,20 @@ class DSparkProposer(Drafter):
         """Absorb the target context into the draft's KV, for EVERY DSpark flavor.
 
         Called once by the runner right after each target forward, while the
-        forward context still holds the TARGET's slot mapping / cu_seqlens. Each
-        backbone overrides ``model.write_context_kv`` for its own storage:
-          * V4 (inline draft): scatter into a private rolling target-KV window.
-          * Kimi-K3 (standalone draft): scatter into the paged sibling latent
-            pool at the verified tokens' slots.
-        Both take the same ``(main_hidden_all, positions, slot_mapping)``
-        contract, so this hook stays flavor-agnostic -- the per-request geometry
-        (window span vs slot mapping) lives inside the model, read off the live
-        forward context. ``slot_mapping`` is the one exception: a draft with a
-        pool of its own is handed the slots the target's builder uploaded for it.
+        forward context still holds the TARGET's slot mapping / cu_seqlens.
+        ``model.write_context_kv`` fans the projected context out to the
+        draft's context layers, each of which writes its own storage:
+          * V4 / V4.1 (inline drafts): a private rolling target-KV window,
+            addressed by position off the live forward context.
+          * Kimi-K3 and MiniMax-M3.1 (standalone drafts): a paged pool, at the
+            ``slot_mapping`` passed here -- the slots the target's builder
+            uploaded for a draft with a pool of its own (``kv_pool_spec``),
+            else the target forward's own.
+
+        Under TR_HYBRID the target ran ``running_tokens`` rows but
+        ``positions`` covers only the scheduled ones; the aux rows and slots
+        are trimmed to ``positions``' length, since the padded tail has
+        nowhere to land.
 
         Every scheduled row is written, prefill and decode alike: the read side
         gathers by absolute position without checking what was written, so
@@ -658,15 +662,16 @@ class DSparkProposer(Drafter):
             return
         forward_context = get_forward_context()
         scheduled_bs = forward_context.context.scheduled_bs
-        # Under TR_HYBRID the target ran `running_tokens` rows but `positions`
-        # covers only the scheduled ones; the padded tail has nowhere to land.
         num_rows = positions.shape[0]
-        main_hidden_all = torch.cat(aux_hidden_states, dim=-1)[:num_rows]
-        # A draft with a declared pool writes at the slots the target's builder
-        # uploaded for it; any other draft at the target's own.
-        slot_mapping = None
+        main_hidden_all = torch.cat([h[:num_rows] for h in aux_hidden_states], dim=-1)
         if self.model.kv_pool_spec is not None:
             slot_mapping = self.runner.forward_vars["draft_ctx_slots"].gpu[:num_rows]
+        else:
+            # None on a target whose metadata addresses KV another way (V4.1);
+            # its draft addresses by position too.
+            slot_mapping = forward_context.attn_metadata.slot_mapping
+            if slot_mapping is not None:
+                slot_mapping = slot_mapping[:num_rows]
         with record_function(
             f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
         ):

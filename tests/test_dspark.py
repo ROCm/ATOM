@@ -2135,8 +2135,8 @@ def test_first_attention_layer_num_follows_the_kv_binding():
 
 
 def test_gqa_drafts_share_the_layer_forward_and_context_defaults():
-    """The two GQA drafts run one layer forward and the base's context
-    projection and layer list; the MLA and V4 drafts keep their own."""
+    """The two GQA drafts run one layer forward and context write and the
+    base's context projection and layer list; the MLA and V4 drafts keep their own."""
     from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
     from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
     from atom.models.dspark_draft import DSparkDraftModel, DSparkGQADecoderLayer
@@ -2146,6 +2146,9 @@ def test_gqa_drafts_share_the_layer_forward_and_context_defaults():
 
     for layer_cls in (KimiK3DFlashDecoderLayer, M3DSparkDecoderLayer):
         assert layer_cls.forward is DSparkGQADecoderLayer.forward, layer_cls
+        assert (
+            layer_cls.write_context_kv is DSparkGQADecoderLayer.write_context_kv
+        ), layer_cls
     for draft_cls in (KimiK3DFlash, MiniMaxM3DSpark):
         assert draft_cls.project_context is DSparkDraftModel.project_context
         assert draft_cls.context_layers is DSparkDraftModel.context_layers

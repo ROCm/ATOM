@@ -273,19 +273,6 @@ class KimiK3DFlashDecoderLayer(DSparkGQADecoderLayer):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def write_context_kv(
-        self,
-        ctx_hidden: torch.Tensor,
-        positions: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ):
-        """The context rows bypass `input_layernorm`.
-
-        The reference feeds `hidden_norm(fc(aux))` straight into k_proj/v_proj;
-        only the noise stream goes through the layer's input norm.
-        """
-        self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
-
 
 def _draft_rope_kwargs(config) -> dict:
     """`get_rope` arguments from the DRAFT's own config, never the target's.

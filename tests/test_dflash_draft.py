@@ -1074,7 +1074,7 @@ def test_the_builder_skips_dummy_runs_and_drafts_without_a_pool():
     assert _publish(stub, [2], 2, _TABLES) is None
 
 
-def _compute_draft_kv(kv_pool_spec, n_tok, n_rows=None):
+def _compute_draft_kv(kv_pool_spec, n_tok, n_rows=None, target_slots=True):
     """Drive the real `compute_draft_kv`; return what reached the model."""
     import torch
 
@@ -1085,16 +1085,22 @@ def _compute_draft_kv(kv_pool_spec, n_tok, n_rows=None):
     slots.gpu.copy_(torch.arange(16) + 100)
     seen = {}
     stub = types.SimpleNamespace(
-        aux_for=lambda h: [h],
+        # Two taps, so the trim is checked on each before the concat.
+        aux_for=lambda h: [h, h + 1],
         runner=types.SimpleNamespace(forward_vars={"draft_ctx_slots": slots}),
         model=types.SimpleNamespace(
             kv_pool_spec=kv_pool_spec,
             write_context_kv=lambda aux, pos, slot_mapping: seen.update(
-                rows=aux.shape[0], pos=pos.shape[0], slots=slot_mapping
+                aux=aux, pos=pos.shape[0], slots=slot_mapping
             ),
         ),
     )
-    fwd = types.SimpleNamespace(context=types.SimpleNamespace(scheduled_bs=1))
+    fwd = types.SimpleNamespace(
+        context=types.SimpleNamespace(scheduled_bs=1),
+        attn_metadata=types.SimpleNamespace(
+            slot_mapping=torch.arange(16) + 500 if target_slots else None
+        ),
+    )
     orig = proposer.get_forward_context
     proposer.get_forward_context = lambda: fwd
     try:
@@ -1111,26 +1117,30 @@ def test_the_proposer_hands_a_pooled_draft_its_own_slots():
     from atom.spec_decode.draft_kv import DraftKvPoolSpec
 
     seen = _compute_draft_kv(DraftKvPoolSpec(), 5)
-    assert seen["rows"] == 5
+    assert seen["aux"].shape == (5, 8)
     assert seen["slots"].tolist() == [100, 101, 102, 103, 104]
 
 
-def test_the_proposer_hands_other_drafts_no_slots():
-    """Every other draft writes at the target's slots, so gets None."""
-    assert _compute_draft_kv(None, 5)["slots"] is None
+def test_the_proposer_hands_other_drafts_the_target_slots():
+    """Every other draft writes at the target forward's slots, one per row;
+    a target whose metadata has none (V4.1) hands its positional draft None."""
+    assert _compute_draft_kv(None, 5)["slots"].tolist() == [500, 501, 502, 503, 504]
+    assert _compute_draft_kv(None, 5, target_slots=False)["slots"] is None
 
 
 @pytest.mark.parametrize("pooled", [True, False])
 def test_the_proposer_drops_padded_target_rows(pooled):
     """Under TR_HYBRID the target runs `running_tokens` hidden rows but only
     the scheduled rows have positions; only those rows reach any draft."""
+    import torch
+
     from atom.spec_decode.draft_kv import DraftKvPoolSpec
 
     spec = DraftKvPoolSpec() if pooled else None
     seen = _compute_draft_kv(spec, 9, n_rows=12)
-    assert (seen["rows"], seen["pos"]) == (9, 9)
-    if pooled:
-        assert seen["slots"].numel() == 9
+    assert seen["pos"] == 9 and seen["slots"].numel() == 9
+    zeros = torch.zeros(9, 4)
+    assert torch.equal(seen["aux"], torch.cat([zeros, zeros + 1], dim=-1))
 
 
 def test_the_draft_fans_its_slots_out_to_every_context_layer(monkeypatch):
@@ -1168,21 +1178,27 @@ def test_the_draft_fans_its_slots_out_to_every_context_layer(monkeypatch):
     assert len(calls) == 2 and all(c is slots for c in calls)
 
 
-def test_the_dflash_layer_writes_at_the_slots_it_is_handed():
-    """No read of the target's DCP-filtered `slot_mapping` on the way down."""
+@pytest.mark.parametrize(
+    "module, layer",
+    [
+        ("atom.models.dspark_draft", "DSparkGQADecoderLayer"),
+        ("atom.models.kimi_k3_dspark", "K3DSparkDecoderLayer"),
+    ],
+)
+def test_the_draft_layer_writes_at_the_slots_it_is_handed(module, layer):
+    """No read of the target's `slot_mapping` on the way down: the slots come
+    from `compute_draft_kv` alone."""
     import torch
 
-    m = _gpu_stack_import("atom.models.kimi_k3_dflash")
+    layer_cls = getattr(_gpu_stack_import(module), layer)
     seen = {}
-    layer = types.SimpleNamespace(
+    stub = types.SimpleNamespace(
         self_attn=types.SimpleNamespace(
             write_context_kv=lambda h, p, s: seen.update(slots=s)
         )
     )
     slots = torch.arange(4)
-    m.KimiK3DFlashDecoderLayer.write_context_kv(
-        layer, torch.zeros(4, 8), torch.arange(4), slots
-    )
+    layer_cls.write_context_kv(stub, torch.zeros(4, 8), torch.arange(4), slots)
     assert seen["slots"] is slots
 
 

@@ -295,6 +295,17 @@ class DSparkGQADecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         return self.mlp(hidden_states), residual
 
+    def write_context_kv(
+        self,
+        ctx_hidden: torch.Tensor,  # [N, hidden] projected + normed target hidden
+        positions: torch.Tensor,  # [N] absolute positions
+        slot_mapping: torch.Tensor,  # [N] destination slots
+    ) -> None:
+        """The context rows bypass ``input_layernorm``: the reference feeds
+        ``hidden_norm(fc(aux))`` straight into the K/V projection; only the
+        block stream goes through the layer's input norm."""
+        self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
+
 
 class DSparkDraftModel(nn.Module):
     """What a DSpark draft model must provide to ``DSparkProposer``."""
@@ -341,18 +352,15 @@ class DSparkDraftModel(nn.Module):
         self,
         aux_concat: torch.Tensor,  # [N, target_hidden * num_target_layers]
         positions: torch.Tensor,  # [N] absolute positions
-        slot_mapping: torch.Tensor | None = None,  # [N] slots in the draft's pool
+        slot_mapping: torch.Tensor | None = None,  # [N] paged-pool slots
     ) -> None:
         """Absorb one target forward's hidden states into this draft's KV.
 
-        Where those rows land -- a private rolling window, a paged pool -- and
-        how they are addressed is the layer's business, not this method's. A
-        layer reads its own addressing (``cu_seqlens_q``, ``slot_mapping``, ...)
-        off the live forward context rather than taking it as an argument,
-        because the two flavors need different pieces of the same metadata.
-        The exception is a draft with a pool of its own (``kv_pool_spec``):
-        the target's metadata does not address it, so its slots come in as
-        ``slot_mapping``, None for every other draft.
+        Where those rows land -- a private rolling window, a paged pool -- is
+        the layer's business, not this method's. A paged layer writes at
+        ``slot_mapping`` (see :meth:`DSparkProposer.compute_draft_kv` for which
+        slots); a window layer ignores it and reads ``cu_seqlens_q`` off the
+        live forward context.
 
         That makes the call site load-bearing: this must run while
         ``attn_metadata`` still describes the TARGET forward that produced
