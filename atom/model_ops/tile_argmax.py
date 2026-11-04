@@ -32,7 +32,7 @@ def argmax_of_tiles(part_val_ptr, part_idx_ptr, row, num_rows, num_tiles, BLOCK_
     """One row's ``(max, lowest id)`` from its tiles' pairs, stored
     ``[num_tiles, num_rows]``, picking among tiles that tie as
     `argmax_lowest_id` does within one. A row no tile of which holds its max
-    (all NaN) answers id 0, as ``torch.argmax`` would not, but in range, so no
+    (all NaN) answers id 0, what ``torch.argmax`` gives such a row, so no
     consumer can index past the vocab."""
     offs_tile = tl.arange(0, BLOCK_TILE)
     tile_mask = offs_tile < num_tiles

@@ -305,11 +305,8 @@ def _dspark_q_finalize(
         best_slot = tl.where(better, chunk_slot, best_slot)
 
     drawn = best > 0.0
-    # An all-NaN row's tiles reduce to -inf with stage 1's out-of-range id
-    # (tl.max skips NaN, so no lane equals it), and the combine keeps that id.
-    # Answer 0, in range, as the greedy op does for such a row.
-    argmax = tl.load(row_argmax_ptr + row)
-    x = tl.where(drawn, best_id, tl.where(argmax < vocab_size, argmax, 0))
+    # The combine's argmax is in range already (`argmax_of_tiles`).
+    x = tl.where(drawn, best_id, tl.load(row_argmax_ptr + row))
     tl.store(q_ids_ptr + base, x, mask=has_q & ~drawn)
     tl.store(q_probs_ptr + base, 1.0, mask=has_q & ~drawn)
     tl.store(q_meta_ptr + (q_base + position).to(tl.int64) * 2, n, mask=has_q & drawn)
