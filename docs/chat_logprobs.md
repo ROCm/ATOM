@@ -59,9 +59,12 @@ logprob arrays contain committed tokens only, not speculative placeholders.
 Disabled requests retain the original sampling path. In mixed batches, only
 requesting sequences have their vocabulary rows scored. Enabled requests add
 FP32 normalization, chosen-token ranking, optional top-K, and result serialization.
-Only worker 0, whose forward output the engine consumes, computes these results.
-Probabilities do not feed sampling or the next draft, so they are not broadcast
-to other TP workers; existing token-ID synchronization is unchanged.
+Every participating rank computes these results. With deferred output and TP > 1,
+the complete compact payload is broadcast from TP rank 0 before asynchronous
+output transfer: chosen/top probabilities, candidate IDs and ranks stay aligned.
+Existing token-ID synchronization is unchanged. This retains the original TP
+probability synchronization rather than assuming only the output-owning rank
+needs probability data.
 
 For `top_logprobs=0`, a lazily compiled tensor function fuses row gathering,
 normalization and ranking. It takes flat token rows, keeping optional snapshots

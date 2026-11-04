@@ -3355,10 +3355,8 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
-        # AsyncIOProcManager returns forward outputs only from worker 0.
-        # Probabilities never feed sampling or the next draft; other workers
-        # need agreed token IDs, not duplicate scoring, transfers or records.
-        need_logprobs = any(batch.return_logprobs) and self.rank == 0
+        # Keep probability payloads available on every participating rank.
+        need_logprobs = any(batch.return_logprobs)
         logprob_snapshot = None
         structured = getattr(self, "structured_output", None)
         structured_requests = getattr(batch, "structured_requests", None)
@@ -3494,6 +3492,18 @@ class ModelRunner:
                 spec_decode_metadata,
                 snapshot=logprob_snapshot,
             )
+            if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
+                # Preserve deferred TP synchronization for the complete payload:
+                # chosen/top probabilities, candidate IDs, and ranks must agree.
+                # top_logprobs=0 has an empty candidate tensor on every rank.
+                sampled_logprobs = tuple(
+                    (
+                        get_tp_group().broadcast(tensor, src=0)
+                        if tensor.numel()
+                        else tensor
+                    )
+                    for tensor in sampled_logprobs
+                )
 
         self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.

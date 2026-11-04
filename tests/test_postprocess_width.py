@@ -160,10 +160,6 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch, rank):
     )
 
     assert seen["logits_rows"] == seen["temperature_rows"] == scheduled_bs
-    if rank != 0:
-        assert captured["logprobs"] is None
-        return
-
     values, candidates, ranks = captured["logprobs"]
     assert values.shape == (scheduled_bs, 1, 1)
     assert candidates.shape == (scheduled_bs, 1, 0)
@@ -171,6 +167,70 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch, rank):
     torch.testing.assert_close(
         values.flatten(), torch.full((scheduled_bs,), -__import__("math").log(8))
     )
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("top_k", [0, 2])
+def test_deferred_tp_broadcasts_complete_probability_payload(
+    monkeypatch, rank, deferred, enabled, top_k
+):
+    monkeypatch.setattr(
+        mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(spec_decode_metadata=None),
+    )
+    monkeypatch.setattr(mod, "get_pcp_world_size", lambda: 1)
+    broadcasts = []
+
+    def broadcast(tensor, src):
+        # Distinct received values prove output uses the broadcast result.
+        received = tensor + 10 if tensor.ndim >= 2 else tensor
+        broadcasts.append((tensor, received, src))
+        return received
+
+    monkeypatch.setattr(
+        mod,
+        "get_tp_group",
+        lambda: types.SimpleNamespace(world_size=2, broadcast=broadcast),
+    )
+    batch = _batch(2)
+    batch.return_logprobs = [False, enabled]
+    batch.top_logprobs = [0, top_k]
+    runner = _runner({})
+    runner.rank = rank
+    runner.tokenID_processor.is_deferred_out = deferred
+    captured = {}
+
+    class Transferred(Exception):
+        pass
+
+    def transfer(batch, ids, event, payload, **kwargs):
+        captured["payload"] = payload
+        raise Transferred
+
+    runner.tokenID_processor.prepare_sampled_ids = transfer
+    with pytest.raises(Transferred):
+        runner.postprocess(
+            batch, torch.zeros(2, 8), torch.ones(2), None, None, False, None
+        )
+    probability_calls = [entry for entry in broadcasts if entry[0].ndim >= 2]
+    if not enabled:
+        assert captured["payload"] is None
+        assert not probability_calls
+    elif not deferred:
+        assert captured["payload"] is not None
+        assert not probability_calls
+    else:
+        assert len(probability_calls) == (3 if top_k else 2)
+        payload = captured["payload"]
+        for tensor, received, source in probability_calls:
+            assert source == 0
+            assert any(received is item for item in payload)
+        assert payload[0].shape == (1, 1, top_k + 1)
+        assert payload[1].shape == (1, 1, top_k)
+        assert payload[2].shape == (1, 1)
 
 
 @pytest.mark.parametrize(
