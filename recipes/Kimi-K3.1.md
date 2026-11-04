@@ -62,22 +62,14 @@ TP4 cannot hold the resident checkpoint; use TP8.
 
 ```bash
 export AITER_LOG_LEVEL=WARNING
-export AITER_CUSTOM_AR_MAX_SIZE=134217728
 
 python -m atom.entrypoints.openai_server \
   --model /data/Kimi-K3.1-Pro --trust-remote-code -tp 8 \
   --decode-context-parallel-size 8 \
   --kv_cache_dtype bf16 --index-cache-dtype fp8 \
-  --max-model-len 131072 --max-num-seqs 64 --max-num-batched-tokens 2048 \
-  --gpu-memory-utilization 0.85 --block-size 128 \
-  --level 0 --cudagraph-mode FULL
+  --max-model-len 131072 --max-num-seqs 64 --block-size 128
 ```
 
-- `AITER_CUSTOM_AR_MAX_SIZE=134217728` keeps an 8192×7168 BF16 partial
-  (112 MiB) on custom all-reduce. Above the default 64 MiB the collective
-  falls back to RCCL, whose summation order differs.
-- `--level 0` disables model torch.compile, which is required; CUDA graphs stay
-  on. Do not add `--enforce-eager`.
 - Mono decode is on by default (`ATOM_MONO_ENABLE=1`; set it to 0 to run
   the original decode path). It serves decode steps of up to 64 rows, a plain
   decode or a speculative verify (16-row token groups past 16): the 69 KDA
@@ -119,8 +111,8 @@ With DSpark (pinned acceptance length 4.59) and ReplaySSM, concurrency 1 / 4 /
 (no pinned acceptance) and ReplaySSM at `--max-num-seqs 8`: 96.97% (±0.47).
 
 Only that configuration has been validated: TP8 with DCP8,
-`--kv_cache_dtype bf16`, `--index-cache-dtype fp8`, `--level 0`, CUDA graphs
-on, with mono on or off, and with the DSpark drafter and ReplaySSM above.
+`--kv_cache_dtype bf16`, `--index-cache-dtype fp8`, CUDA graphs on, with mono
+on or off, and with the DSpark drafter and ReplaySSM above.
 PCP is rejected while the model is built (the indexer's projections live in
 the fused q_a projection, and the PCP indexer projects k itself). Nothing
 else is rejected at startup, but online quantization of the other layers,
