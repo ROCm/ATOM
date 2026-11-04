@@ -118,10 +118,12 @@ start_vllm_server() {
     # single_node: prefill holds GPUs 0-3 of this node.
     [[ "${SINGLE_NODE_PD}" == "1" ]] && gpus=4,5,6,7
     xfer="$(m31_moriio kv_consumer "${server_port}" $((M31_HANDSHAKE_PORT + 100 * (idx + 1))) $((M31_NOTIFY_PORT + 100 * (idx + 1))))"
-    # Every concurrency can land on one D under consistent_hash: FULL graphs for 1..CONC requests x 8 tokens.
-    role_args=(--max-num-seqs "${m31_conc}" --port "${server_port}" --gpu-memory-utilization 0.85
+    # Every concurrency can land on one D under consistent_hash: FULL graphs for 1..max-num-seqs requests x 8
+    # tokens. ATOMESH_M31_D_MAX_SEQS caps each D's decode batch (default CONC: no cap).
+    local d_seqs="${ATOMESH_M31_D_MAX_SEQS:-${m31_conc}}"
+    role_args=(--max-num-seqs "${d_seqs}" --port "${server_port}" --gpu-memory-utilization 0.85
       --max-num-batched-tokens 8192
-      --compilation-config "{\"cudagraph_capture_sizes\":[$(seq -s, 8 8 $((8 * m31_conc)))],\"max_cudagraph_capture_size\":$((8 * m31_conc))}"
+      --compilation-config "{\"cudagraph_capture_sizes\":[$(seq -s, 8 8 $((8 * d_seqs)))],\"max_cudagraph_capture_size\":$((8 * d_seqs))}"
       --kv-transfer-config "${xfer}")
   fi
   # GPUs 0-3 sit on NUMA node 0, GPUs 4-7 on node 1.

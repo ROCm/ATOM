@@ -16568,6 +16568,21 @@ models:
           env:
             common:
               ATOMESH_M31_VLLM_SHA: 0f1fbe69071cf155e64468849186d808d0bc4141
+        # The skip fix with each D's decode batch capped at 16; extra requests wait on D for a slot.
+        - <<: *m31_moriio_1p2d_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-c64-skip-dcap16
+          concurrency: [64]
+          env:
+            common:
+              ATOMESH_M31_VLLM_SHA: 0f1fbe69071cf155e64468849186d808d0bc4141
+              ATOMESH_M31_D_MAX_SEQS: "16"
+        - <<: *m31_moriio_1p2d_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-c96-skip-dcap16
+          concurrency: [96]
+          env:
+            common:
+              ATOMESH_M31_VLLM_SHA: 0f1fbe69071cf155e64468849186d808d0bc4141
+              ATOMESH_M31_D_MAX_SEQS: "16"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
