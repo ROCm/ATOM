@@ -27,10 +27,15 @@ class PrefixSpreadRouter:
     STRIDE_TOKENS = 4096
     CAP = 1 << 17
 
-    def __init__(self, idle_tokens: int, counters: dict) -> None:
+    def __init__(
+        self, idle_tokens: int, counters: dict, tier_loads: bool = True
+    ) -> None:
         # A rank with under `idle_tokens` queued prefill is about to idle; a
         # prefix's rank with over twice that has a backlog.
         self.idle_tokens = idle_tokens
+        # Whether a rank can load a prefix it does not hold from an offload
+        # tier. Without one a moved request recomputes what it does not hold.
+        self.tier_loads = tier_loads
         self.counters = counters
         for key in (
             "prefix_owner_total",
@@ -97,7 +102,9 @@ class PrefixSpreadRouter:
         local = hits.get(rank, 0)
         # The tier holds the prefix only once its source finished prefilling,
         # and the connector loads only a rest of at least the load threshold.
-        loadable = not busy and hit - local >= envs.OFFLOAD_MIN_LOAD_TOKENS
+        loadable = (
+            self.tier_loads and not busy and hit - local >= envs.OFFLOAD_MIN_LOAD_TOKENS
+        )
         if rank == owner or loadable:
             seq._dp_est_hit = hit
         else:
@@ -243,6 +250,12 @@ class PrefixSpreadRouter:
                 continue
             waiters.discard(seq_id)
             if waiters:
+                # Others on this rank still rely on the entry. If the leaving
+                # request was its producer, the KV never arrived: one of them
+                # now computes it, so it becomes the (still busy) producer.
+                holders = self.index.get(h)
+                if holders is not None and holders.get(rank) == seq_id:
+                    holders[rank] = next(iter(waiters))
                 continue
             del self.pending[key]
             holders = self.index.get(h)

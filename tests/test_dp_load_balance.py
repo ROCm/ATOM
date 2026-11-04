@@ -840,3 +840,58 @@ def test_an_aborted_move_leaves_no_hit_on_its_destination():
         _chain_seq(9, 100_000).prompt_hash_chain, 2, mgr._seq_prefilling
     )
     assert hits.get(other) == 98_304
+
+
+def test_a_producer_abort_hands_the_prefix_to_a_waiting_follower():
+    """The producer of a prefix aborts while a follower on its rank still
+    relies on it: the follower becomes the (busy) producer, so a later request
+    gets no tier credit for KV nobody has computed."""
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])  # producer, prefilling
+    other = 1 - owner
+    mgr._rank_tokens[other] = 40_000
+    assert _route(mgr, [_chain_seq(2, 110_000)]) == [owner]  # follower
+    mgr._release_seq_load(1)  # producer aborted
+    _, src_owner, source = mgr._prefix_router._rank_hits(
+        _chain_seq(9, 100_000).prompt_hash_chain, 2, mgr._seq_prefilling
+    )
+    assert src_owner == owner and source == 2 and 2 in mgr._seq_prefilling
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_tokens[owner] = 200_000
+    third = _chain_seq(3, 120_000)
+    assert _route(mgr, [third]) == [other]
+    assert third._dp_est_hit == 0  # no tier credit: still being computed
+
+
+def test_without_an_offload_tier_a_moved_request_is_charged_its_full_prompt():
+    from atom.model_engine.prefix_spread import PrefixSpreadRouter
+
+    mgr = _make_spread_mgr()
+    mgr._prefix_router = PrefixSpreadRouter(
+        32768, mgr._dp_route_counters, tier_loads=False
+    )
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._mark_seq_prefill_complete(1)
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_tokens[owner] = 200_000
+    moved = _chain_seq(2, 110_000)
+    assert _route(mgr, [moved]) == [1 - owner]
+    assert moved._dp_est_hit == 0
+    assert mgr._seq_load[2][2] == 110_000
+
+
+def test_offload_tier_loads_reads_the_kv_transfer_config():
+    from types import SimpleNamespace
+
+    from atom.model_engine.engine_core_mgr import _offload_tier_loads
+
+    def cfg(kvc):
+        return SimpleNamespace(kv_transfer_config=kvc)
+
+    assert not _offload_tier_loads(cfg({}))
+    assert _offload_tier_loads(
+        cfg({"kv_connector": "lmcache_mp", "kv_role": "offload"})
+    )
+    assert not _offload_tier_loads(
+        cfg({"kv_connector": "lmcache_mp", "kv_role": "kv_producer"})
+    )

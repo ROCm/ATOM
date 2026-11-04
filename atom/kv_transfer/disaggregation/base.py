@@ -18,6 +18,7 @@ Two roles are defined:
 
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -128,6 +129,12 @@ class KVConnectorSchedulerBase(ABC):
         """Whether `seq`'s tier lookup has answered, so the offload prefetch may
         admit it without a round trip. No tier, no answer."""
         return False
+
+    def lookup_guard(self) -> Any:
+        """Held across `lookup_ready` and the lookup that consumes the answer,
+        so a lookup driver thread cannot expire and resubmit it in between
+        (which would make the consuming lookup wait)."""
+        return contextlib.nullcontext()
 
     def cancel_preadmission(self, seq: Any) -> None:
         """Undo an admission the scheduler takes back before any dispatch."""

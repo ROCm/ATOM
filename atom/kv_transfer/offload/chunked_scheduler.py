@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 
@@ -462,6 +463,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return held[0] is seq
         has_answer = getattr(self._lookup_client, "has_answer", None)
         return callable(has_answer) and bool(has_answer(sid))
+
+    def lookup_guard(self):
+        """The lookup client's lock (the one its driver thread takes), so an
+        answer `lookup_ready` saw is still there when the admission consumes
+        it; a no-op for a client without one."""
+        lock = getattr(self._lookup_client, "_lock", None)
+        return lock if lock is not None else contextlib.nullcontext()
 
     def cancel_preadmission(self, seq) -> None:
         """Forget an admission the scheduler takes back before any dispatch.

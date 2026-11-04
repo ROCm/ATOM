@@ -274,6 +274,9 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
     def lookup_ready(self, seq: Any) -> bool:
         return self._require_impl().lookup_ready(seq)
 
+    def lookup_guard(self) -> Any:
+        return self._require_impl().lookup_guard()
+
     def cancel_preadmission(self, seq: Any) -> None:
         self._require_impl().cancel_preadmission(seq)
 

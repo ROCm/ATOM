@@ -12,6 +12,7 @@ payload mapping and PAGE/SLOT policy.
 from __future__ import annotations
 
 import collections
+import contextlib
 import json
 import logging
 import os
@@ -489,6 +490,9 @@ class OffloadSchedulerMixin(ABC):
     def lookup_ready(self, seq) -> bool:
         """No async tier answer to offer; see `ChunkedOffloadSchedulerBase`."""
         return False
+
+    def lookup_guard(self):
+        return contextlib.nullcontext()
 
     def cancel_preadmission(self, seq) -> None:
         self.cancel_pending_load(seq)

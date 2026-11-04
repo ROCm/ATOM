@@ -58,9 +58,25 @@ _WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
     DISCARD_WEIGHT_SYNC_CMD,
 }
 
+
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
 # the Config field can never diverge.
+def _offload_tier_loads(config) -> bool:
+    """Whether a rank can load a prefix it does not hold from an offload tier:
+    some configured transport (`multi` expanded) is an offload backend whose
+    role loads."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    for name, sub in KVConnectorFactory.leaf_connectors(config) or ():
+        role = (getattr(sub, "kv_transfer_config", None) or {}).get(
+            "kv_role", "offload"
+        )
+        if KVConnectorFactory.is_offload_backend(name) and role != "kv_producer":
+            return True
+    return False
+
+
 DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens", "prefix_spread")
 DP_LB_DEFAULT = "least_requests"
 
@@ -331,7 +347,9 @@ class CoreManager:
                     "and ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
                 )
             self._prefix_router = PrefixSpreadRouter(
-                envs.ATOM_DP_PREFIX_IDLE_TOKENS, self._dp_route_counters
+                envs.ATOM_DP_PREFIX_IDLE_TOKENS,
+                self._dp_route_counters,
+                tier_loads=_offload_tier_loads(config),
             )
         self._rank_routed_total = [0] * self.global_engine_count
         # Authoritative local load per rank. Request count is in-flight until
