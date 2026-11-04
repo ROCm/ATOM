@@ -251,7 +251,11 @@ class EngineCore:
 
         self.scheduler.set_prefill_delayer(
             PrefillDelayer(
-                dp_size=config.parallel_config.data_parallel_size,
+                dp_size=(
+                    1
+                    if envs.ATOM_DP_INDEPENDENT
+                    else config.parallel_config.data_parallel_size
+                ),
                 cpu_group=cpu_group,
                 max_num_batched_tokens=config.max_num_batched_tokens,
                 target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
@@ -887,7 +891,10 @@ class DPEngineCoreProc(EngineCore):
         self.engines_running = True
         self._shutting_down = False
 
-        self._init_prefill_delayer(config, self.dp_group)
+        # Independent ranks: a per-rank delayer (no cross-rank all_reduce).
+        self._init_prefill_delayer(
+            config, None if envs.ATOM_DP_INDEPENDENT else self.dp_group
+        )
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
@@ -918,6 +925,10 @@ class DPEngineCoreProc(EngineCore):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
     def busy_loop(self):
+        if envs.ATOM_DP_INDEPENDENT:
+            # No collective in any forward: step like a lone engine, never
+            # waiting on (or running dummy batches for) the other ranks.
+            return EngineCore.busy_loop(self)
         shutdown = False
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0

@@ -88,7 +88,7 @@ LEVEL=${LEVEL:-0}; KV=${KV:-bf16}; MAX_LEN=${MAX_LEN:-262144}
 # TP=1: one GPU a server (the 4xTP1 node: one server per GPU, HIP_VISIBLE_DEVICES=<gpu>)
 ARGS=(--model $MODEL --trust-remote-code --host 0.0.0.0 --server-port 8000 -tp ${TP:-4}
   --kv_cache_dtype $KV --gpu-memory-utilization 0.9 --max-model-len $MAX_LEN
-  --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384
+  --max-num-batched-tokens ${PREFILL_TOKENS:-16384} --attn-prefill-chunk-size ${PREFILL_TOKENS:-16384}
   --level $LEVEL --disable_uvicorn_access_log)
 [ "$LEVEL" = 3 ] && ARGS+=(--cudagraph-mode FULL)
 # decode graph sizes up to MAXSEQ (sequences an engine): dense past 256 too, or a batch of 300
@@ -130,7 +130,16 @@ case $MODE in
       # "DP4 + EP4 c2048"). Needs aiter alizaidy/gfx1250-qwen-support from 3d3228c1: before it the 2D
       # kernel took the block-table stride as a constant and recompiled for every prefill batch.
       export ATOM_USE_UNIFIED_ATTN=${ATOM_USE_UNIFIED_ATTN:-1}
-      ARGS+=(--enable-dp-attention --enable-expert-parallel --max-num-seqs $MAXSEQ --cudagraph-capture-sizes "${CAPS:-$(caps $MAXSEQ)}"
+      # DP_EP=0: replicated experts instead of EP4 (every rank holds all 256 experts, no mori dispatch /
+      # combine; ATOM_DP_REPLICATE_EXPERTS), the DP-attention scheduler otherwise unchanged
+      if [ "${DP_EP:-1}" = 0 ]; then
+        export ATOM_DP_REPLICATE_EXPERTS=1 ATOM_DISABLE_MORI_EP=1; EP_ARG=()
+        # DP_INDEP=1: the ranks then step independently (ATOM_DP_INDEPENDENT; no lockstep)
+        [ "${DP_INDEP:-0}" = 1 ] && export ATOM_DP_INDEPENDENT=1
+      else
+        EP_ARG=(--enable-expert-parallel)
+      fi
+      ARGS+=(--enable-dp-attention "${EP_ARG[@]}" --max-num-seqs $MAXSEQ --cudagraph-capture-sizes "${CAPS:-$(caps $MAXSEQ)}"
         --block-size ${BLOCK_SIZE:-64}) ;;
   *) echo "unknown mode $MODE"; exit 1 ;;
 esac

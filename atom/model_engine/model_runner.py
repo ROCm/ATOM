@@ -2764,7 +2764,12 @@ class ModelRunner:
         # because DSpark under DP needs the reduced query length BEFORE
         # prepare_input_ids sizes the buffer, and because one call site is the
         # only way the step is guaranteed a single cross-DP collective.
-        dp_size = self.config.parallel_config.data_parallel_size
+        # Independent DP ranks settle their step alone (a group of one).
+        dp_size = (
+            1
+            if envs.ATOM_DP_INDEPENDENT
+            else self.config.parallel_config.data_parallel_size
+        )
         forward_mode = ForwardMode.decide(
             batch=batch,
             dp_size=dp_size,
