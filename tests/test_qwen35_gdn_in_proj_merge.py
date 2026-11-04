@@ -14,18 +14,11 @@ from types import ModuleType
 import pytest
 import torch
 
-# qwen3_5.py transitively imports ~30 aiter submodules through linear.py,
-# moe.py, layernorm.py and embed_head.py.  stubbed_aiter() covers only the
-# five dist/shm modules, so the import fails on a CPU runner.  Skip until
-# the pure decision logic is extracted to model_config/.
-try:
-    from atom.models.qwen3_5 import (
-        _QWEN3_5_PACKED_MODULES_MAPPING,
-        _apply_merged_in_proj_mapping,
-        gdn_in_proj_is_merged,
-    )
-except ImportError as _e:
-    pytest.skip(f"qwen3_5 import chain needs aiter: {_e}", allow_module_level=True)
+from atom.models.qwen3_5_gdn_in_proj import (
+    _QWEN3_5_PACKED_MODULES_MAPPING,
+    _apply_merged_in_proj_mapping,
+    gdn_in_proj_is_merged,
+)
 
 from atom import quant_spec
 from atom.config import QuantizationConfig
