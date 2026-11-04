@@ -89,14 +89,6 @@ class PagedAttentionCache:
                 "64-row groups in every PAGE (block_size multiple of 128 "
                 "for ratio-2 owners)"
             )
-        if index_layout == FP4_MFMA and any(
-            pages * geometry.rows_per_page(ratio) * 64 > (1 << 32)
-            for _, ratio in geometry.owners
-        ):
-            raise ValueError(
-                "gfx950 OPUS supports at most 4 GiB per FP4 index values plane; "
-                "reduce gpu_memory_utilization or select ATOM_V4_UNIFIED_MQA=flydsl"
-            )
         # The scorer's `ScoreWorkspace`, owned by the builder so the startup
         # profile's throwaway cache and the serving one share it.
         self.workspace = workspace
