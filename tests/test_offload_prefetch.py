@@ -183,17 +183,18 @@ def test_loaded_request_is_not_promoted_ahead_of_earlier_arrivals(
     sched._promote_ready_remote_kv_requests()
 
     assert list(sched.waiting) == [a, b]  # a parked-and-loaded old-path request
-    # would have moved up; an prefetched one keeps its place
+    # would have moved up; a prefetched one keeps its place
 
 
-def test_loaded_request_passes_a_head_that_cannot_allocate(monkeypatch, seq_factory):
-    """Nothing running and a head that cannot allocate: a finished prefetch
-    behind it holds blocks and must run to release them. Otherwise it keeps
-    its place."""
+def test_loaded_request_passes_a_head_blocked_on_resources(monkeypatch, seq_factory):
+    """A head that cannot allocate, or finds every parked-load slot taken, waits
+    on what finished prefetches hold: they pass it whatever is running.
+    Otherwise they keep their place."""
     sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
     sched.kv_connector.not_ready_ids = {a.id}
     sched.schedule()  # b parks with its prefetch, a waits
     sched.finished_recving_kv_req_ids.append(b.id)
+    sched.running.append(object())  # something runs: no special case for it
 
     sched._promote_ready_remote_kv_requests()
     assert list(sched.waiting) == [a, b]  # a can allocate: order kept
@@ -202,20 +203,10 @@ def test_loaded_request_passes_a_head_that_cannot_allocate(monkeypatch, seq_fact
     sched._promote_ready_remote_kv_requests()
     assert list(sched.waiting) == [b, a]
 
-
-def test_loaded_request_passes_a_head_blocked_by_the_parked_slot_cap(
-    monkeypatch, seq_factory
-):
-    """KV fits, but every parked-load slot is held and nothing runs: the
-    finished prefetch must run first to free its slot."""
-    sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
-    sched.kv_connector.not_ready_ids = {a.id}
-    sched.schedule()  # b parks with its prefetch, a waits
-    sched.finished_recving_kv_req_ids.append(b.id)
+    monkeypatch.undo()
+    sched.waiting.rotate()  # back to [a, b]
     sched._num_parked_remote_kv = sched.max_num_seqs
-
     sched._promote_ready_remote_kv_requests()
-
     assert list(sched.waiting) == [b, a]
 
 
@@ -354,6 +345,15 @@ def test_lookup_is_checked_and_consumed_under_the_lookup_guard(setup):
 
     i = events.index("enter")
     assert events[i : i + 4] == ["enter", "ready", "match", "exit"]
+
+
+def test_a_moved_prefix_the_tier_lacks_is_counted(setup):
+    sched, _, seq = setup
+    seq._dp_tier_expect = 1_000_000  # far more than the tier answers
+    sched.schedule()
+    assert sched.total_prefix_moved_checked == 1
+    assert sched.total_prefix_moved_tier_miss == 1
+    assert "_dp_tier_expect" not in seq.__dict__  # counted once
 
 
 # -- lookup driver thread -------------------------------------------------------

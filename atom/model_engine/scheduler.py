@@ -660,9 +660,6 @@ class ScheduledBatchOutput:
 
 
 class Scheduler:
-    # Set in `__init__`; a class default so a scheduler assembled without it
-    # (test doubles) has no prefetch.
-    _prefetch: OffloadPrefetch | None = None
     """Manages the lifecycle of inference requests through prefill and decode.
 
     The scheduler maintains two primary queues:
@@ -679,6 +676,10 @@ class Scheduler:
     :meth:`_update_waiting_for_remote_kv` (decode side) and
     :meth:`_update_from_kv_xfer_finished` (both sides).
     """
+
+    # Set in `__init__`; a class default so a scheduler assembled without it
+    # (test doubles) has no prefetch.
+    _prefetch: OffloadPrefetch | None = None
 
     _ENGINE_LABEL = ""
     _METRICS_ROLE = ""
@@ -820,6 +821,10 @@ class Scheduler:
         self.total_generation_tokens = 0
         self.total_finished_requests = 0
         self.total_preemptions = 0
+        # Prefix-spread moves whose prefix the tier was expected to hold, and
+        # those it held less of (a save not landed yet, or evicted).
+        self.total_prefix_moved_checked = 0
+        self.total_prefix_moved_tier_miss = 0
         self.profile_active = False
         # Cache the env flag once (env vars are fixed at process start) so the
         # per-iteration compute_detailed_aggregates never pays an os.getenv.
@@ -3346,6 +3351,13 @@ class Scheduler:
         ext_tokens, needs_remote_load = self.kv_connector.get_num_new_matched_tokens(
             seq
         )
+        expect = seq.__dict__.pop("_dp_tier_expect", 0)
+        if expect:
+            # The router moved this request expecting its prefix from the tier
+            # (HBM plus tier hit); one sampling stride of slack.
+            self.total_prefix_moved_checked += 1
+            if int(ext_tokens) + int(seq.num_cached_tokens) + 4096 < expect:
+                self.total_prefix_moved_tier_miss += 1
         # Keep the lookup's answer, not just the park flag: `can_allocate` runs
         # next and a hybrid's two legs have to be aimed at one boundary, for
         # which this is the KV leg's ceiling. In tokens, and absolute -- the
@@ -5096,6 +5108,17 @@ class Scheduler:
                 )
         return True
 
+    def _head_blocked_on_resources(self, skip) -> bool:
+        """Whether the first waiting request outside `skip` is blocked on
+        resources: every parked-load slot is taken, or it cannot allocate."""
+        for seq in self.waiting:
+            if seq.id in skip or seq.status != SequenceStatus.WAITING:
+                continue
+            if self._num_parked_remote_kv >= self.max_num_seqs:
+                return True
+            return self.block_manager.can_allocate_memoized(seq) < 0
+        return False
+
     def _promote_ready_remote_kv_requests(self) -> None:
         """Move completed remote-KV waiters ahead of fresh admissions.
 
@@ -5113,12 +5136,16 @@ class Scheduler:
         blocked: deque[Sequence] = deque()
         # A prefetched request keeps its place in line: it was not parked by
         # the head of the queue, and moving it up would let it prefill ahead of
-        # earlier arrivals. The exception is a deadlock: nothing is running to
-        # free blocks and the head cannot allocate, while finished prefetches
-        # behind it hold blocks they can release only by running.
+        # earlier arrivals -- unless the head is blocked on what finished
+        # prefetches hold (KV blocks, parked-load slots), which they release
+        # only by running.
         prefetch = self._prefetch
         early = (
-            () if prefetch is None or prefetch.must_pass_head() else prefetch.entries
+            ()
+            if prefetch is None
+            or not prefetch.entries
+            or self._head_blocked_on_resources(prefetch.entries)
+            else prefetch.entries
         )
         while self.waiting:
             seq = self.waiting.popleft()
@@ -5452,6 +5479,10 @@ class PrefillScheduler:
         self.total_generation_tokens = 0
         self.total_finished_requests = 0
         self.total_preemptions = 0
+        # Prefix-spread moves whose prefix the tier was expected to hold, and
+        # those it held less of (a save not landed yet, or evicted).
+        self.total_prefix_moved_checked = 0
+        self.total_prefix_moved_tier_miss = 0
 
         # Shared memory for dynamic CU partitioning.
         # Layout: [0:4] = decode_tokens (uint32)

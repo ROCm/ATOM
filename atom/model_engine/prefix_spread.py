@@ -116,9 +116,15 @@ class PrefixSpreadRouter:
         else:
             decision = "prefix_moved_total"
             self.counters["prefix_moved_tokens"] += max(0, seq._dp_est_hit - local)
+            if loadable:
+                # The destination's scheduler checks this against the tier's
+                # answer (`prefix_moved_tier_miss`).
+                seq._dp_tier_expect = hit
             if local > 0:
                 self.counters["prefix_moved_partial_total"] += 1
-        self._record(chain, rank, seq.id, seq._dp_est_hit, source)
+        self._record(
+            chain, rank, seq.id, seq._dp_est_hit, source, seq.num_prompt_tokens
+        )
         return rank, decision
 
     def _idle_target(
@@ -179,7 +185,9 @@ class PrefixSpreadRouter:
                 break
         return hits, owner, source
 
-    def _record(self, chain, rank: int, seq_id, hit: int, hit_source) -> None:
+    def _record(
+        self, chain, rank: int, seq_id, hit: int, hit_source, prompt_tokens=0
+    ) -> None:
         """Record that `rank` holds this prompt's sampled prefix.
 
         Each entry names the request whose prefill puts that part on the rank:
@@ -220,7 +228,7 @@ class PrefixSpreadRouter:
                 pending[key].add(seq_id)
                 relied.append(h)
         if relied:
-            self.seq_hashes[seq_id] = (rank, relied)
+            self.seq_hashes[seq_id] = (rank, relied, prompt_tokens)
         while len(index) > self.CAP:
             old, holders = index.popitem(last=False)
             for r in holders:
@@ -231,18 +239,23 @@ class PrefixSpreadRouter:
         entry = self.seq_hashes.pop(seq_id, None)
         if entry is None:
             return
-        rank, hashes = entry
+        rank, hashes, _ = entry
         for h in hashes:
             self.pending.pop((h, rank), None)
 
-    def left_unprefilled(self, seq_id) -> None:
+    def left_unprefilled(self, seq_id) -> dict:
         """`seq_id` left before its prefill completed (abort, reject, failed
         send). Remove the provisional entries no other unfinished request on
-        that rank still relies on."""
+        that rank still relies on.
+
+        Returns {request: its prompt tokens} for the requests that took over
+        as producer of a part `seq_id` was computing: they now compute it, so
+        the caller recharges their prefill load."""
+        promoted: dict = {}
         entry = self.seq_hashes.pop(seq_id, None)
         if entry is None:
-            return
-        rank, hashes = entry
+            return promoted
+        rank, hashes, _ = entry
         for h in hashes:
             key = (h, rank)
             waiters = self.pending.get(key)
@@ -255,7 +268,11 @@ class PrefixSpreadRouter:
                 # now computes it, so it becomes the (still busy) producer.
                 holders = self.index.get(h)
                 if holders is not None and holders.get(rank) == seq_id:
-                    holders[rank] = next(iter(waiters))
+                    heir = next(iter(waiters))
+                    holders[rank] = heir
+                    heir_entry = self.seq_hashes.get(heir)
+                    if heir_entry is not None:
+                        promoted[heir] = heir_entry[2]
                 continue
             del self.pending[key]
             holders = self.index.get(h)
@@ -263,3 +280,4 @@ class PrefixSpreadRouter:
                 del holders[rank]
                 if not holders:
                     del self.index[h]
+        return promoted

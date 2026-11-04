@@ -856,6 +856,8 @@ def test_a_producer_abort_hands_the_prefix_to_a_waiting_follower():
         _chain_seq(9, 100_000).prompt_hash_chain, 2, mgr._seq_prefilling
     )
     assert src_owner == owner and source == 2 and 2 in mgr._seq_prefilling
+    # 2 now computes the whole prompt: it is charged it.
+    assert mgr._seq_load[2][2] == 110_000
     mgr._rank_tokens = [0, 0]
     mgr._rank_tokens[owner] = 200_000
     third = _chain_seq(3, 120_000)
@@ -895,3 +897,18 @@ def test_offload_tier_loads_reads_the_kv_transfer_config():
     assert not _offload_tier_loads(
         cfg({"kv_connector": "lmcache_mp", "kv_role": "kv_producer"})
     )
+    pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    assert not _offload_tier_loads(cfg({"kv_connector": "multi", "connectors": [pd]}))
+    tier = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+    assert _offload_tier_loads(cfg({"kv_connector": "multi", "connectors": [pd, tier]}))
+
+
+def test_a_loadable_move_tells_the_destination_what_it_expects():
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._mark_seq_prefill_complete(1)
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_tokens[owner] = 200_000
+    moved = _chain_seq(2, 110_000)
+    _route(mgr, [moved])
+    assert moved._dp_tier_expect == 98_304
