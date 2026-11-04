@@ -120,6 +120,31 @@ def test_plans_are_refreshed_once_a_step_and_segmented(monkeypatch):
     assert rel(out, reference(k, v, bt2, ctx2, q, 1)) < 3e-3
 
 
+def test_tbo_ubatches_keep_their_own_plans(monkeypatch):
+    """Both ubatches run on one stream with the same row count: ubatch 1's first
+    layer must not rewrite the plan ubatch 0's later layers still read."""
+    from atom.model_ops.minimax_m3 import sparse_attn_mxfp4 as m
+    from atom.utils.tbo import ubatching
+
+    cases = [make(8, 1, seed=11), make(8, 1, seed=12)]
+    assert not torch.equal(cases[0][3], cases[1][3])
+    owners = [types.SimpleNamespace(), types.SimpleNamespace()]
+
+    def layer(ub):
+        monkeypatch.setattr(ubatching, "tbo_current_ubatch_id", lambda: ub)
+        k, v, bt, ctx, q = cases[ub]
+        out = m.sparse_pa_mxfp4(q, k, v, bt, ctx, 1, SCALE, torch.bfloat16, owners[ub])
+        return rel(out, reference(k, v, bt, ctx, q, 1))
+
+    # ubatch 0 layer 0, ubatch 1 layer 0, ubatch 0 layer 1, ubatch 1 layer 1
+    assert all(layer(ub) < 3e-3 for ub in (0, 1, 0, 1))
+    plans = []
+    for ub in (0, 1):
+        monkeypatch.setattr(ubatching, "tbo_current_ubatch_id", lambda ub=ub: ub)
+        plans.append(m._plan(owners[ub], cases[ub][3], 0, 1))
+    assert plans[0] is not plans[1]
+
+
 @pytest.mark.parametrize("hkv", [1, 2])
 @pytest.mark.parametrize("rows", [1, 7, 255, 256, 257, 511, 512, 700])
 def test_plan_free_rows_attend_their_selected_pages(rows, hkv):

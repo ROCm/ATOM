@@ -333,8 +333,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 torch.empty((rows, 2), **i32_kwargs)
             )
             # ... and its scores' storage: one for every layer of a step, refilled
-            # with -inf once in `make_sparse_decode_metadata` (fp32, rows x
-            # max_block wide: about 1 MB per 32 rows at the model-length bound).
+            # with -inf once in `make_sparse_decode_metadata` (fp32: 32 KiB a row and
+            # index head at a 1M model length, so 128 MiB at TP4's one head and 512
+            # x 8 rows, 1 GiB at 8 heads). Allocated before the KV budget is sized, so
+            # the budget counts it as overhead and the cache shrinks by it.
             self.model_runner.forward_vars["sparse_attention_index_score_buf"] = (
                 index_score_buffer(
                     self.max_bs * max_qlen,
@@ -817,9 +819,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             f"{prefix}sparse_attention_n_valid_column_per_row"
         ]
 
-    def _index_score_work_map_kwargs(self) -> dict:
+    def _index_score_work_map_kwargs(self, seq_lens: torch.Tensor) -> dict:
         """The MXFP4 decode scorer's persistent map, score storage and the map's
-        bound, for `make_sparse_decode_metadata`; nothing for any other index cache."""
+        bound, for `make_sparse_decode_metadata`; nothing for any other index cache.
+        ``seq_lens`` is every row the scorer runs: a replayed graph's padded batch."""
         buf = self.model_runner.forward_vars.get(
             "sparse_attention_index_score_work_map"
         )
@@ -831,6 +834,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             "index_score_buf": self.model_runner.forward_vars[
                 "sparse_attention_index_score_buf"
             ],
+            "index_score_seq_lens": seq_lens,
         }
 
     def _get_sparse_attention_block_tables(
@@ -1403,7 +1407,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=int(max_seqlen_q),
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
-                **self._index_score_work_map_kwargs(),
+                **self._index_score_work_map_kwargs(attn_metadata.context_lens),
             )
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, max_seqlen_q, running_tokens=running_tokens
@@ -1657,7 +1661,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=max_q_len,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
-                **self._index_score_work_map_kwargs(),
+                **self._index_score_work_map_kwargs(seq_lens),
             )
 
         positions = var["positions"].copy_to_gpu(scheduled_tokens)

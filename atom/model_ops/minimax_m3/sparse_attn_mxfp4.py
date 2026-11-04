@@ -29,7 +29,8 @@ from atom.model_ops.base_attention import _FLYDSL_PLAN_MAX_BATCH, _flydsl_plan_s
 from atom.model_ops.minimax_m3.kv_mxfp4 import HEAD_DIM, PAGE_TOKENS, page_views
 
 # Plans outlive a step -- a captured graph keeps reading its plan's buffers -- so
-# they are keyed by what shapes them, never by a step's objects.
+# they are keyed by what shapes them, never by a step's objects. TBO ubatches share
+# one compute stream, so the ubatch id keeps their plans (and lengths) apart.
 _PLANS: dict[tuple, object] = {}
 
 
@@ -45,9 +46,12 @@ def _plan(owner, context, segment, num_kv_heads):
     """The segment's plan, refreshed from its context lengths once per step."""
     from aiter.ops.flydsl.pa_decode import plan_pa_decode
 
+    from atom.utils.tbo.ubatching import tbo_current_ubatch_id
+
     device = context.device
     key = (
         int(torch.cuda.current_stream(device).cuda_stream),
+        tbo_current_ubatch_id(),
         segment,
         int(context.shape[0]),
         num_kv_heads,

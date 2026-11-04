@@ -30,7 +30,7 @@ def _flydsl(name):
     except AttributeError as e:
         raise RuntimeError(
             f"MiniMax-M3 MXFP4 index scoring needs aiter.ops.flydsl.{name}, which "
-            "this aiter does not have (aiter ganyi/m3-mxfp4-all or later)"
+            "this aiter does not have (ROCm/aiter #7060 and #7061)"
         ) from e
 
 
@@ -143,24 +143,3 @@ def prefill_score_mxfp4(
         max_seq_len,
         sm_scale,
     )
-
-
-def require_supported(idx_q, index_cache, S, H, max_block, block_table, seq_lens):
-    """Refuse a decode shape the scorer cannot serve, by name, instead of letting
-    the call fail somewhere in its validation."""
-    k_data, k_scale = page_views(index_cache)
-    ok = _flydsl("minimax_m3_index_score_fp4_flydsl_supported")(
-        idx_q,
-        k_data,
-        k_scale,
-        S,
-        H,
-        max_block,
-        block_table,
-        seq_lens=seq_lens,
-    )
-    if not ok:
-        raise RuntimeError(
-            f"the MXFP4 index scorer does not serve S={S} H={H} max_block={max_block} "
-            f"batch={seq_lens.shape[0]} (idx_q {tuple(idx_q.shape)} {idx_q.dtype})"
-        )

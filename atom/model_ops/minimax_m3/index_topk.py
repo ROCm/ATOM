@@ -750,10 +750,12 @@ def _select_with_aiter(
     """Run the selection through aiter, or return False if it cannot serve.
 
     Declines rather than raises: k past the wave width, or a survivor buffer
-    past the LDS budget, are shapes the Triton selector still handles. `score`
-    and `topk_idx` are contiguous, so the flattening is a view.
+    past the LDS budget, are shapes the Triton selector still handles. `topk_idx` is contiguous, so its
+    flattening is a view; `score` is too unless the scorer laid it out transposed
+    (MXFP4 with several index heads), which only the stride-aware Triton selector
+    reads.
     """
-    if topk_per_row_small_k is None:
+    if topk_per_row_small_k is None or not score.is_contiguous():
         return False
     heads, total_q, max_block = score.shape
     rows = heads * total_q

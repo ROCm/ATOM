@@ -143,7 +143,11 @@ def test_mxfp4_pages_match_the_bf16_write(index_q_fp8, monkeypatch):
     assert (untouched == 0).all()
 
 
-def test_a_top_k_reusing_layer_writes_kv_and_skips_the_index():
+@pytest.mark.parametrize("index_q_fp8", [False, True])
+def test_a_top_k_reusing_layer_writes_kv_and_skips_the_index(index_q_fp8, monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.setattr(envs, "ATOM_M3_INDEX_Q_FP8", index_q_fp8)
     T = 21
     g = torch.Generator(device="cuda").manual_seed(2)
     width = (NQ + 2 * NKV + NIQ + 1) * D
@@ -168,3 +172,13 @@ def test_a_top_k_reusing_layer_writes_kv_and_skips_the_index():
     assert torch.equal(kp, kp2) and torch.equal(vp, vp2)  # the same K/V pages
     assert torch.equal(q_full.view(torch.uint8), q_skip.view(torch.uint8))
     assert (ip2 == 0).all() and (ip != 0).any()  # no index key written
+    # the key a reusing layer looks the producer's selection up by
+    bt = torch.zeros(2, 4, dtype=torch.int32, device="cuda")
+    for impl in (full, skip):
+        impl.topk, impl.init_blocks, impl.local_blocks = 16, 1, 1
+        impl.indexer_cp_group = None
+    args = (bt, bt[:, 0], 1, 512)
+    assert (full._index_q.dtype == torch.float8_e4m3fn) == index_q_fp8
+    assert skip._topk_cache_key("decode", None, *args) == full._topk_cache_key(
+        "decode", full._index_q, *args
+    )

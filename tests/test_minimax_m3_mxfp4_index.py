@@ -373,3 +373,49 @@ def test_the_decode_metadata_refills_the_score_view_once():
     assert bool((sbuf[out.numel() :] == 1.0).all())  # nothing past this step's rows
     # another index cache: no map, so no score storage either
     assert make_sparse_decode_metadata(**kw).index_score_out is None
+
+
+def test_a_padded_replay_builds_the_map_and_scores_of_the_captured_batch():
+    """A graph captured at 8 requests replays 3 scheduled ones: its scorer's grid,
+    the map's encoding and the score view's strides are the 8-request batch's, so
+    the metadata is built from the 8 lengths, the 5 pad ones 0."""
+    from atom.model_ops.minimax_m3.index_mxfp4 import (
+        build_index_work_map,
+        index_score_buffer,
+        index_work_map_capacity,
+    )
+    from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
+
+    batch, running, S, bound = 3, 8, 8, 64
+    seq = torch.tensor([300, 1000, 5000], dtype=torch.int32, device="cuda")
+    padded = torch.zeros(running, dtype=torch.int32, device="cuda")
+    padded[:batch] = seq
+    sbuf = index_score_buffer(running * S, HEADS, bound, "cuda")
+    sbuf.fill_(1.0)
+    wmap = torch.empty(
+        (index_work_map_capacity(running, bound, S, HEADS), 2),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    md = make_sparse_decode_metadata(
+        seq_lens=seq,
+        block_table=torch.zeros((batch, bound), dtype=torch.int32, device="cuda"),
+        slot_mapping=torch.zeros(batch * S, dtype=torch.int64, device="cuda"),
+        max_seq_len=5000,
+        num_idx_heads=HEADS,
+        max_query_len=S,
+        index_score_work_map_out=wmap,
+        index_score_max_block=bound,
+        index_score_buf=sbuf,
+        index_score_seq_lens=padded,
+    )
+    want = build_index_work_map(
+        padded, max_block=bound, max_query_len=S, num_idx_heads=HEADS
+    )
+    scheduled = build_index_work_map(
+        seq, max_block=bound, max_query_len=S, num_idx_heads=HEADS
+    )
+    assert want.shape[0] > scheduled.shape[0]
+    assert torch.equal(md.index_score_work_map, want)
+    assert tuple(md.index_score_out.shape) == (HEADS, running * S, bound)
+    assert bool((md.index_score_out == float("-inf")).all())

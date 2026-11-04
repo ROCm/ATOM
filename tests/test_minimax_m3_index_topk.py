@@ -545,6 +545,28 @@ class TestSelectorDispatch:
             assert m._aiter_selector_wins(width, emit=True)
 
 
+class TestSelectWithAiter:
+    """aiter flattens the score with a `view`: a layout it cannot view is declined."""
+
+    @pytest.mark.parametrize("transposed", [False, True])
+    def test_only_a_contiguous_score_is_served(self, monkeypatch, transposed):
+        calls = []
+        monkeypatch.setattr(m, "topk_per_row_small_k", lambda *a: calls.append(a))
+        monkeypatch.setattr(m, "topk_per_row_small_k_supported", lambda *a: True)
+        monkeypatch.setattr(m, "_AITER_SERVES", {})
+        heads, total_q, blocks = 2, 8, 2048
+        if transposed:
+            # what the MXFP4 scorer returns once S * H >= its TRANSPOSE_MIN_F
+            score = torch.empty(blocks, total_q, heads).permute(2, 1, 0)
+            assert score.stride() == (1, heads, total_q * heads)
+        else:
+            score = torch.empty(heads, total_q, blocks)
+        topk_idx = torch.empty(heads, total_q, TOPK, dtype=torch.int32)
+        bounds = torch.full((heads * total_q,), blocks, dtype=torch.int32)
+        served = m._select_with_aiter(score, topk_idx, bounds, TOPK, 1, 1)
+        assert served != transposed and len(calls) == int(not transposed)
+
+
 @gpu
 def test_the_two_selectors_agree_where_the_dispatch_switches():
     """Above the width threshold both paths must return the same selection.

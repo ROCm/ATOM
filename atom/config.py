@@ -1926,6 +1926,7 @@ def _check_m3_mxfp4(
     kv_mxfp4: bool,
     block_size: int,
     plugin_mode: bool,
+    sparse_local_block: int,
     index_q_fp8: bool = False,
 ) -> None:
     """Refuse MiniMax-M3's MXFP4 caches where they cannot run, at startup rather
@@ -1944,6 +1945,13 @@ def _check_m3_mxfp4(
         )
     if block_size != 128:
         raise ValueError(f"MXFP4 pages are 128 tokens; --block-size is {block_size}")
+    if kv_mxfp4 and sparse_local_block < 1:
+        # The decode plan is refreshed once a step, which holds only while every
+        # layer's rows have the same lengths -- i.e. the tail is always picked.
+        raise ValueError(
+            "ATOM_M3_SPARSE_KV_MXFP4 needs sparse_local_block >= 1, "
+            f"got {sparse_local_block}"
+        )
     from aiter.jit.utils.chip_info import get_gfx
 
     if get_gfx() != "gfx950":
@@ -2820,12 +2828,21 @@ class Config:
             else:
                 self.index_cache_dtype = self.kv_cache_dtype
 
+        m3_sparse_cfg = (
+            getattr(
+                getattr(self.hf_config, "text_config", self.hf_config),
+                "sparse_attention_config",
+                None,
+            )
+            or {}
+        )
         _check_m3_mxfp4(
             arches,
             self.index_cache_dtype,
             envs.ATOM_M3_SPARSE_KV_MXFP4,
             self.kv_cache_block_size,
             is_plugin_mode(),
+            m3_sparse_cfg.get("sparse_local_block", 0),
             envs.ATOM_M3_INDEX_Q_FP8,
         )
 

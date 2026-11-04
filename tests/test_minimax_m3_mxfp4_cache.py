@@ -8,6 +8,9 @@ the bytes per token the capacity arithmetic rests on, the views the kernels are
 handed, and the combinations that must fail at startup and not in a forward.
 """
 
+import sys
+import types
+
 import pytest
 import torch
 
@@ -82,6 +85,15 @@ def test_only_the_128_page_of_head_dim_128_is_a_pool(kw):
         MhaKvPool(**{**base, **kw})
 
 
+@pytest.fixture(autouse=True)
+def chip_info(monkeypatch):
+    """The architecture query: CI has no aiter, and a GPU host's answer is its own."""
+    mod = types.ModuleType("aiter.jit.utils.chip_info")
+    mod.get_gfx = lambda: "gfx950"
+    monkeypatch.setitem(sys.modules, "aiter.jit.utils.chip_info", mod)
+    return mod
+
+
 def check(**kw):
     args = {
         "arches": M3,
@@ -89,6 +101,7 @@ def check(**kw):
         "kv_mxfp4": True,
         "block_size": 128,
         "plugin_mode": False,
+        "sparse_local_block": 1,
     }
     _check_m3_mxfp4(**{**args, **kw})
 
@@ -100,6 +113,19 @@ def test_refusals_name_what_is_wrong():
         check(plugin_mode=True)
     with pytest.raises(ValueError, match="128 tokens"):
         check(block_size=16)
+
+
+def test_only_gfx950_is_served(chip_info):
+    chip_info.get_gfx = lambda: "gfx942"
+    with pytest.raises(ValueError, match="gfx950, got gfx942"):
+        check()
+
+
+def test_the_mxfp4_kv_needs_the_tail_block_selected():
+    with pytest.raises(ValueError, match="sparse_local_block >= 1"):
+        check(sparse_local_block=0)
+    # the MXFP4 index alone has no plan to keep in step
+    check(kv_mxfp4=False, sparse_local_block=0)
 
 
 def test_the_baselines_are_never_refused():
