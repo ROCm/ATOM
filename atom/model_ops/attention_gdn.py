@@ -445,7 +445,22 @@ class GatedDeltaNet(nn.Module):
                 non_spec_state_indices_tensor,
             )
 
-        if use_lossy_gdn_decode or use_flydsl_decode:
+        # ATOM_GDN_KKT_GATING: the chunk KKT kernel computes the gates of each
+        # key head's value heads itself (no fused_gdn_gating launch)
+        kkt_gating = None
+        if (
+            envs.ATOM_GDN_KKT_GATING
+            and gdn_metadata.num_prefills > 0
+            and spec_sequence_masks is None
+            and qk_normed_by_conv
+            and num_actual_tokens >= 64
+            and a.stride(1) == 1
+            and b.stride(1) == 1
+            and a.stride(0) == b.stride(0)
+        ):
+            kkt_gating = (a, b, self.A_log, self.dt_bias)
+
+        if use_lossy_gdn_decode or use_flydsl_decode or kkt_gating is not None:
             g_spec = None
             beta_spec = None
             g_non_spec = None
@@ -598,6 +613,7 @@ class GatedDeltaNet(nn.Module):
                     output_gate=(
                         self._output_gate(z[:num_actual_tokens]) if gate_fused else None
                     ),
+                    gating=kkt_gating,
                 )
             elif use_flydsl_prefill:
                 core_attn_out_non_spec, last_recurrent_state, flydsl_h = prefill(
@@ -654,6 +670,7 @@ class GatedDeltaNet(nn.Module):
                         gdn_metadata.non_spec_state_indices_i64,
                         has_initial_state,
                     ),
+                    gating=kkt_gating,
                 )
             # Init cache (the planned path wrote its final states in place)
             if last_recurrent_state is not None:

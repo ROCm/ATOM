@@ -45,16 +45,18 @@ def chunk_gated_delta_rule_fwd(
     state_slots=None,
     output_gate=None,
     checkpoint_slots=None,
+    gating=None,
 ):
     T = q.shape[1]
 
+    assert gating is None or (is_amd and T >= 64)
     if is_amd and T >= 64:
         # HIP fast path: 2 kernels for the 4 steps below.
         # chunk_local_cumsum + chunk_scaled_dot_kkt → fused_cumsum_kkt
         # solve_tril + recompute_w_u_fwd → fused_inverse_recompute (the chunk's
         # inverse in 16 x 16 blocks, then w / u)
         g, A, beta_hm, scale_hm = fused_cumsum_kkt(
-            g, k, beta, chunk_size=64, cu_seqlens=cu_seqlens, plan=plan
+            g, k, beta, chunk_size=64, cu_seqlens=cu_seqlens, plan=plan, gating=gating
         )
         w, u = fused_inverse_recompute(
             k, v, A, beta_hm, scale_hm, chunk_size=64, cu_seqlens=cu_seqlens, plan=plan
@@ -162,6 +164,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         state_slots=None,
         output_gate=None,
         checkpoint_slots=None,
+        gating=None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -186,6 +189,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             state_slots=state_slots,
             output_gate=output_gate,
             checkpoint_slots=checkpoint_slots,
+            gating=gating,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -222,6 +226,7 @@ def chunk_gated_delta_rule(
     state_slots=None,
     output_gate=None,
     checkpoint_slots=None,
+    gating=None,
 ):
     r"""
     Args:
@@ -268,6 +273,12 @@ def chunk_gated_delta_rule(
             chunk into that slot of ``pool`` (``[slots, H, K, V]``): the exact
             state for a state checkpoint at the chunk's first token, where the
             per-chunk ``h`` holds it rounded to the input dtype. Default: `None`.
+        gating (Optional[tuple]):
+            ``(a, b, A_log, dt_bias)`` with ``g`` and ``beta`` None: the chunk
+            KKT kernel computes ``g = -exp(A_log) softplus(a + dt_bias)`` and
+            ``beta = sigmoid(b)`` (``a``, ``b`` [T, H]) for the value heads of
+            each key head. Needs ``cu_seqlens`` and at least 64 tokens.
+            Default: `None`.
 
     Returns:
         o (torch.Tensor):
@@ -308,7 +319,7 @@ def chunk_gated_delta_rule(
     assert (
         q.dtype != torch.float32
     ), "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
-    assert (
+    assert gating is not None or (
         len(beta.shape) == 3
     ), "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
 
@@ -394,6 +405,7 @@ def chunk_gated_delta_rule(
         state_slots,
         output_gate,
         checkpoint_slots,
+        gating,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
