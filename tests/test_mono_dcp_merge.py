@@ -111,6 +111,39 @@ def _maxsum_kernel():
     return launch
 
 
+def _accumulate_kernel():
+    @flyc.kernel(known_block_size=[64, 1, 1])
+    def k(w_in: Int64, v_in: Int64, o_out: Int64):
+        row = fx.thread_idx.x
+        acc = [fx.Float32(0.0), fx.Float32(0.0)]
+        for src in range_constexpr(N):
+            w = fx.Float32(
+                bo.buffer_load(rsrc(w_in), row * N + src, vec_width=1, dtype=T.f32)
+            )
+            v = [
+                fx.Float32(
+                    bo.buffer_load(
+                        rsrc(v_in), (row * N + src) * 2 + j, vec_width=1, dtype=T.f32
+                    )
+                )
+                for j in range(2)
+            ]
+            acc = merge.maxsum_accumulate(acc, v, w)
+        for j in range_constexpr(2):
+            bo.buffer_store(acc[j], rsrc(o_out), row * 2 + j)
+
+    @flyc.jit
+    def launch(
+        w_in: Int64,
+        v_in: Int64,
+        o_out: Int64,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        k(w_in, v_in, o_out).launch(grid=(1,), block=(64,), stream=stream)
+
+    return launch
+
+
 def _lse_inputs():
     g = torch.Generator().manual_seed(7)
     lse = torch.randn(ROWS, N, generator=g) * 3.0
@@ -175,3 +208,24 @@ def test_maxsum_weight_is_the_softmax_share():
     ref = z / z.sum(dim=1, keepdim=True)
     ref[0] = 0.0
     torch.testing.assert_close(w, ref, rtol=2e-6, atol=1e-7)
+
+
+def test_maxsum_accumulate_drops_a_zero_weight_source_even_if_nan():
+    """An empty rank's partial is whatever its padding slot holds; at weight 0
+    it must add an exact 0, not NaN * 0."""
+    g = torch.Generator().manual_seed(13)
+    w = torch.rand(ROWS, N, generator=g)
+    v = torch.randn(ROWS, N, 2, generator=g)
+    w[:, 1::3] = 0.0
+    v[:, 1::3] = float("nan")
+    w[0] = 0.0  # every source empty
+    v[0] = float("nan")
+    w, v = w.cuda().contiguous(), v.cuda().contiguous()
+    out = torch.full((ROWS, 2), float("nan"), device="cuda")
+    _accumulate_kernel()(w.data_ptr(), v.data_ptr(), out.data_ptr())
+    torch.cuda.synchronize()
+    live = w != 0
+    ref = (torch.where(live[..., None], v, 0.0) * w[..., None]).sum(dim=1)
+    assert torch.isfinite(out).all()
+    assert torch.equal(out[0], torch.zeros(2, device="cuda"))
+    torch.testing.assert_close(out, ref, rtol=2e-6, atol=1e-6)

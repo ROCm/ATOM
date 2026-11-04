@@ -399,10 +399,11 @@ def indexer_cp_refusal(atom_config) -> str | None:
       ``FUSED_INDEX_MAX_SEQ``; the "accommodates every query" half is already
       enforced by ``fused_indexer_refusal``'s ``max_model_len`` check, which
       this refusal requires to have passed.
-    - **``dcp_size == 1``.** Redundant with ``common_refusals``' "decode CP"
-      entry, which ``config_refusal`` already applies, but named here because
-      the kernel contract names it: the two are independent mechanisms and a
-      future relaxation of the former must not silently enable CP.
+    - **``dcp_size == 1``.** Redundant with ``fused_indexer_refusal``'s DCP
+      entry (``config_refusal`` lets DCP through to the external indexer),
+      but named here because the kernel contract names it: the two are
+      independent mechanisms and a future relaxation of the former must not
+      silently enable CP.
 
     Two further contract items are **invariants of ATOM's fused path, not
     checks**, and are recorded here rather than tested because there is no

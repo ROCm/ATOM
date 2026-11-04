@@ -3,7 +3,6 @@
 
 """Compile-time storage layout and CTA schedule for the GLM-5 MonoKernel."""
 
-import math
 import os
 
 from atom.models.glm52.mono.kernels.geometry_config import (
@@ -315,20 +314,9 @@ def down_x_words(samples: int, inter: int, expert_mxfp4: bool, native_fp4_mfma: 
     return samples * MOE_SLOTS * inter // (4 if native_fp4_mfma or not expert_mxfp4 else 2)
 
 
-def dcp_softmax_weights(maxima, sums):
-    global_max = max(maxima)
-    scaled = [total * math.exp(maximum - global_max) for maximum, total in zip(maxima, sums)]
-    denominator = sum(scaled)
-    return [value / denominator if denominator else 0.0 for value in scaled]
-
-
 def dcp_summary_index(source, sample, head, item, samples, output_heads):
     """Pair ``item`` of ``source``'s partial latent of (sample, owned head)."""
     return ((source * samples + sample) * output_heads + head) * DCP_SUMMARY_PAIRS + item
-
-
-def dcp_local_uv_tile(tile, output_heads):
-    return tile % (output_heads * V_DIM // UV_TILE)
 
 
 def ug_split(samples: int, inter: int = INTER):

@@ -803,6 +803,13 @@ class Glm52MonoRunner:
             projected_k_weights=tuple(index_kw) or None,
         )
 
+    def _sparse_indptr(self, metadata, layers, samples: int) -> torch.Tensor:
+        """The sparse attention's row bounds: under DCP this rank's compacted
+        local slots, not the step's global ones."""
+        if self._dcp == 1:
+            return metadata.sparse_kv_indptr[: samples + 1]
+        return shared_dcp_indptr(layers, samples)[: samples + 1]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -824,12 +831,7 @@ class Glm52MonoRunner:
         cur_pos = self._cur_pos
         shared_indices = _shared_sparse_buffer(model.layers)
         slot_mapping = metadata.slot_mapping[:samples]
-        # under DCP the attention reads this rank's compacted local slots
-        sparse_indptr = (
-            metadata.sparse_kv_indptr[: samples + 1]
-            if self._dcp == 1
-            else shared_dcp_indptr(model.layers, samples)[: samples + 1]
-        )
+        sparse_indptr = self._sparse_indptr(metadata, model.layers, samples)
         # One mailbox epoch per decode step, not per layer. `step` is a device
         # tensor, so bumping it once per layer cost 75 one-element int32 adds
         # per step -- 485 us of pure launch overhead on a serialized stream,

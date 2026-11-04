@@ -203,3 +203,47 @@ def test_dcp_summaries_tile_the_peer_buffer(samples):
     assert seen == set(range(n))
     assert sym["_dcp_part_stride"] == n * 8
     assert sym["_bytes"] - sym["dcp"] == 2 * n * 8
+
+
+# ------------------------------------------------------- DCP query heads
+def test_dcp_decodes_the_groups_heads_with_the_replicated_w_k():
+    """Under DCP a rank's q_b / W_K cover the group's 64 heads (W_K_qrep); a
+    16-head W_K there would be refused as a shape and quietly fall back."""
+    from atom.models.glm52.mono.weights import decode_heads_w_k
+
+    impl = SimpleNamespace(
+        qrep_enabled=True,
+        W_K="w_k",
+        W_K_scale="s",
+        W_K_qrep="w_qrep",
+        W_K_qrep_scale="sq",
+    )
+    assert decode_heads_w_k(impl, 16, 4) == (64, "w_qrep", "sq")
+    assert decode_heads_w_k(impl, 16, 1) == (16, "w_k", "s")
+
+
+def test_dcp_without_query_replication_binds_no_weights():
+    from atom.models.glm52.mono.weights import decode_heads_w_k
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    impl = SimpleNamespace(qrep_enabled=False, W_K="w_k", W_K_scale="s")
+    with pytest.raises(MonoUnsupported, match="query replication"):
+        decode_heads_w_k(impl, 16, 4)
+
+
+def test_the_runner_hands_the_kernel_the_dcp_indptr_under_dcp():
+    """The global indptr under DCP would have the kernel read global slots
+    from this rank's local cache: every layer's attention silently wrong."""
+    from atom.models.glm52.mono.runner import Glm52MonoRunner
+
+    local = torch.arange(65, dtype=torch.int32)
+    meta = SimpleNamespace(sparse_kv_indptr=torch.full((65,), -1, dtype=torch.int32))
+    runner = object.__new__(Glm52MonoRunner)
+    layers = [_layer_with(local), _layer_with(local)]
+
+    runner._dcp = 4
+    assert torch.equal(runner._sparse_indptr(meta, layers, 8), local[:9])
+    runner._dcp = 1
+    assert torch.equal(
+        runner._sparse_indptr(meta, layers, 8), meta.sparse_kv_indptr[:9]
+    )

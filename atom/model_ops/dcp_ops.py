@@ -636,7 +636,7 @@ def _dcp_a2a_unpack_combine_rank_order_kernel(
     time in rank order 0 .. N-1 and explicit FMAs (``cp_lse_a2a(rank_order=True)``).
 
     The Kimi-K3 mono K2 merges a DCP decode step in-kernel with this arithmetic
-    (``kimi_k3/mono/kernels/attention/dcp_merge.py``); a layer whose mono merge is
+    (``atom/mono/device/dcp_merge.py``'s ``lse_*``); a layer whose mono merge is
     armed takes this kernel for every step mono does not serve, so a token's
     output does not depend on which path its step took.
     """

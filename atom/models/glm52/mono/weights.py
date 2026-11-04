@@ -166,6 +166,19 @@ def indexer_weights(layer, cfg) -> dict[str, torch.Tensor]:
     }
 
 
+def decode_heads_w_k(impl, local_heads: int, dcp_size: int):
+    """(heads this rank decodes, their W_K and its scale). Under DCP every rank
+    decodes the DCP group's heads (query replication: the widened q_proj and
+    the group's W_K) and keeps its own for W_V / o_proj."""
+    if dcp_size == 1:
+        return local_heads, impl.W_K, impl.W_K_scale
+    need(
+        bool(getattr(impl, "qrep_enabled", False)),
+        "DCP without query replication on this layer",
+    )
+    return local_heads * dcp_size, impl.W_K_qrep, impl.W_K_qrep_scale
+
+
 def _batched_fp8(
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -284,17 +297,7 @@ def layer_weights(
     )
 
     impl = attention_impl(layer)
-    # Under DCP every rank decodes the DCP group's heads (query replication:
-    # the widened q_proj and the group's W_K), and keeps its own for W_V / o.
-    heads = cfg.local_heads * dcp_size
-    if dcp_size > 1:
-        need(
-            bool(getattr(impl, "qrep_enabled", False)),
-            "DCP without query replication on this layer",
-        )
-        w_k, w_k_scale = impl.W_K_qrep, impl.W_K_qrep_scale
-    else:
-        w_k, w_k_scale = impl.W_K, impl.W_K_scale
+    heads, w_k, w_k_scale = decode_heads_w_k(impl, cfg.local_heads, dcp_size)
     w_uk, s_uk = _batched_fp8(
         w_k,
         w_k_scale,

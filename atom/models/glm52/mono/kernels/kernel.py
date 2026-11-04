@@ -19,6 +19,13 @@ prepared sparse indices::
       -> mid FP8 quant -> expert down + route weighting
       -> MoE TP peer reduce + residual -> x_out                   (sym_ffn)
 
+Under decode context parallelism (DCP == TP4, ATOM only) every rank decodes the
+group's heads over its KV shard: ``uvl`` rebuilds each head's partial latent
+once and pushes it to the head's owner rank, ``uv`` merges the ranks' partials
+(max / sum, rank order) before W_UV, and split tasks past a rank's keys only
+publish empty statistics. This, the 64-head q_pe staging and the PTPC-after-
+merge order are ATOM's divergence from upstream FlyDSL.
+
 Scheduling: every stage is a list of tasks; task ``t`` of a stage runs on CTA
 ``(stage_base + t) % 256`` and every CTA walks the stages in order.  There is
 no grid-wide barrier: dependencies only point to earlier stages and all CTAs
@@ -102,7 +109,6 @@ from atom.models.glm52.mono.kernels.layout import (
     XQ_BLOCKS,
     XQ_GROUPS,
     XQ_WAVES,
-    dcp_local_uv_tile,
     dcp_summary_index,
     dn_tile,
     down_prefetch_batch,
@@ -3202,7 +3208,6 @@ def build_glm5_monokernel(
                 pre_poll(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
                 stamp("uvl", tt, 5)
                 uv_latent(s, head)
-                gpu.barrier()
                 stamp("uvl", tt, 2)
                 dcp_push_latent(s, head)
                 stamp("uvl", tt, 4)
@@ -3213,7 +3218,7 @@ def build_glm5_monokernel(
             stamp("uv", tt, 0)
             s = tt // N_UV_OWN  # sample
             t = tt % N_UV_OWN  # this rank's 64-row tile
-            local_t = dcp_local_uv_tile(t, L)
+            local_t = t
             head = t // (V_DIM // UV_TILE)
 
             def u_uv(c):

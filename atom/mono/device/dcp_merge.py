@@ -84,10 +84,10 @@ def lse_accumulate(acc, vals, f):
 
 # -------------------------------------------------------------- max/sum form
 def maxsum_weight(m, local_sum, wave_max, wave_sum):
-    """A lane's source weight from the sources' (max, sum of exp) pairs, a lane
-    a source (a lane with no source passes a max below every score, sum 0): its share of the
-    normalizer, 0 when every source is empty. ``wave_max`` / ``wave_sum`` are
-    the kernel's own wave reductions."""
+    """One source's weight, a lane per source: its share of the normalizer
+    from every source's (max, sum of exp), 0 when every source is empty. A
+    lane without a source passes a max below every score and a sum of 0.
+    ``wave_max`` / ``wave_sum`` are the kernel's own wave reductions."""
     m_all = wave_max(m)
     z = local_sum * exp(m - m_all)
     den = wave_sum(z)
