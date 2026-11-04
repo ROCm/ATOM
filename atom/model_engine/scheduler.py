@@ -45,6 +45,7 @@ from atom.model_engine.dynamic_chunking import (
 )
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.multimodal_runtime import prefill_media_payload
+from atom.model_engine.pd_admission import PdAdmissionController
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
@@ -819,8 +820,6 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
-        from atom.model_engine.pd_admission import PdAdmissionController
-
         self.pd_admission = PdAdmissionController.from_config(
             config, self.kv_connector, self.metrics
         )
@@ -2409,7 +2408,7 @@ class Scheduler:
                     seq, num_blocks, num_cached_blocks
                 )
                 if pd_offset is not None and not self.pd_admission.can_admit(
-                    num_blocks - pd_offset
+                    seq, num_blocks - pd_offset, self.block_manager.kv.num_free
                 ):
                     self.waiting.appendleft(seq)
                     break

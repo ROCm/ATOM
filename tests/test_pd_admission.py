@@ -146,13 +146,61 @@ def test_bytes_limit_and_isolated_large_request(build, chunked):
     sched.extend([a, b])
     sched.schedule()
     assert a.block_table and not b.block_table
-    assert sched.pd_admission.rejected["bytes"] > 0
+    sched.schedule()
+    # B waited two passes; it is one deferred request, not two attempts.
+    assert sched.pd_admission.deferred["bytes"] == 1
     sched._update_from_kv_xfer_finished(receive_success(a))
     sched.schedule()
     sched.schedule()
     assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert sched.pd_admission.pending_bytes == 4096
     assert sched.pd_admission.oversized_admissions == 1
+    assert sched.pd_admission.deferred["bytes"] == 1
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_default_limits_bound_bytes_not_count(build, chunked):
+    sched, request = build(chunked=chunked, options={"enabled": True})
+    policy = sched.pd_admission
+    assert policy.max_requests is None
+    assert policy.max_bytes == int(64 * 1024 * 0.15)
+    assert policy.reserve_blocks is None
+    a, b = request(), request()
+    sched.extend([a, b])
+    batch, _ = sched.schedule()
+    assert set(batch.connector_meta_output.reqs_to_recv) == {a.id, b.id}
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_free_kv_watermark_keeps_room_for_running_requests(build, chunked):
+    sched, request = build(
+        chunked=chunked,
+        num_kvcache_blocks=10,
+        options={
+            "enabled": True,
+            "max_pending_kv_fraction": None,
+            "min_free_kv_fraction": 0.5,
+        },
+    )
+    assert sched.pd_admission.reserve_blocks == 5
+    a, b, c = request(), request(), request()
+    sched.extend([a, b, c])
+    batch, _ = sched.schedule()
+    # After B, 6 blocks stay free; C would leave 4, below the 5 reserved.
+    assert set(batch.connector_meta_output.reqs_to_recv) == {a.id, b.id}
+    assert not c.block_table
+    sched.schedule()
+    assert not c.block_table
+    assert sched.pd_admission.deferred == {"requests": 0, "bytes": 0, "free_kv": 1}
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    sched._update_from_kv_xfer_finished(receive_success(b))
+    batch, _ = sched.schedule()
+    assert {a.id, b.id} <= set(batch.req_ids)
+    assert not c.block_table  # A and B held credits during this pass.
+    sched.schedule()
+    # Alone, C may enter below the watermark; the allocator still has room.
+    assert c.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert set(sched.pd_admission.pending) == {str(c.id)}
 
 
 @pytest.mark.parametrize("keep_referenced", [False, True])
@@ -536,6 +584,10 @@ def test_multiconnector_uses_load_winner(build):
             "max_pending_kv_fraction": None,
         },
         {"enabled": True, "extra_growth_blocks_per_request": 1},
+        {"enabled": True, "min_free_kv_fraction": 0},
+        {"enabled": True, "min_free_kv_fraction": 1},
+        {"enabled": True, "min_free_kv_fraction": True},
+        {"enabled": True, "min_free_kv_fraction": float("inf")},
     ],
 )
 def test_invalid_config_rejected(build, options):
@@ -572,15 +624,18 @@ def test_physical_targets_are_deduplicated_and_release_is_idempotent():
     assert policy.pending_bytes == 0
 
 
-def test_admission_metrics_follow_credit_lifecycle():
+def test_admission_metrics_follow_credit_lifecycle(monkeypatch):
     from prometheus_client import CollectorRegistry
 
     from atom.metrics.scheduler import SchedulerMetrics
+    from atom.model_engine import pd_admission
 
+    clock = [100.0]
+    monkeypatch.setattr(pd_admission.time, "perf_counter", lambda: clock[0])
     registry = CollectorRegistry()
     metrics = SchedulerMetrics(registry=registry)
     policy = PdAdmissionController(1, 4096, 1024, metrics)
-    seq = SimpleNamespace(id=1)
+    seq, other = SimpleNamespace(id=1), SimpleNamespace(id=2)
     labels = {"dp_rank": "0", "engine_role": "default"}
     policy.admit(seq, [1, 2])
     assert (
@@ -589,7 +644,9 @@ def test_admission_metrics_follow_credit_lifecycle():
         )
         == 1
     )
-    assert not policy.can_admit(1)
+    assert not policy.can_admit(other, 1, 64)
+    clock[0] += 2
+    assert not policy.can_admit(other, 1, 64)
     assert (
         registry.get_sample_value(
             "atom:pd_admission_deferred_total", {**labels, "reason": "requests"}
@@ -603,9 +660,21 @@ def test_admission_metrics_follow_credit_lifecycle():
         )
         == 1
     )
+    clock[0] += 3
     policy.scheduled([seq])
     assert registry.get_sample_value("atom:pd_admission_pending_kv_bytes", labels) == 0
     assert (
         registry.get_sample_value("atom:pd_admission_ready_wait_seconds_count", labels)
         == 1
+    )
+    assert policy.can_admit(other, 1, 64)
+    policy.admit(other, [3])
+    # SEQ entered at once; OTHER waited from its first deferral at t=100.
+    assert (
+        registry.get_sample_value("atom:pd_admission_credit_wait_seconds_count", labels)
+        == 2
+    )
+    assert (
+        registry.get_sample_value("atom:pd_admission_credit_wait_seconds_sum", labels)
+        == 5
     )

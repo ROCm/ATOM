@@ -1537,7 +1537,7 @@ def test_opposite_admission_order_progresses_without_recompute(
             assert d.pd_admission.pending_bytes == 12
             if ds is db:
                 assert not da.block_table
-                assert d.pd_admission.rejected[admission_limit] > 0
+                assert d.pd_admission.deferred[admission_limit] == 1
         dw.start_load_kv(batch.connector_meta_output)
         # Reserving D's pages alone cannot admit P: the write request still
         # waits in D's queue until prior GPU writes to those pages finish.
