@@ -5,6 +5,7 @@ Covers the self-contained, GPU-free pieces: Markov head + Confidence head
 numerics, and SpeculativeConfig DSpark detection/routing.
 """
 
+import inspect
 import types
 
 import numpy as np
@@ -126,12 +127,16 @@ def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch)
         scratch=types.SimpleNamespace(buf=None),
     )
     calls = []
+    # The op's own parameters, as its fake (which torch requires to match) has
+    # them: the registered op itself is wrapped as (*args, **kwargs).
+    signature = inspect.signature(dspark_markov_sample_mod._dspark_markov_sample_fake)
 
-    def sample(base, prev, w1, w2, out, *args):
-        row_base, position, noise_offset = args[4], args[5], args[10]
-        calls.append((row_base.shape[0], position, noise_offset))
-        assert torch.equal(base, base_logits[:, position])
-        out.copy_(prev + 1)
+    def sample(*args, **kwargs):
+        # By name, so a reordered signature cannot read the wrong inputs.
+        a = signature.bind(*args, **kwargs).arguments
+        calls.append((a["q_row_base"].shape[0], a["position"], a["noise_offset"]))
+        assert torch.equal(a["base_logits"], base_logits[:, a["position"]])
+        a["out"].copy_(a["prev_ids"] + 1)
 
     monkeypatch.setattr(dspark_markov_sample_mod, "dspark_markov_sample", sample)
     base_logits = torch.randn(bs, steps, V)

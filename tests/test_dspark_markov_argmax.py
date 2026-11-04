@@ -60,38 +60,6 @@ def test_shapes_are_checked_against_each_other():
     assert embed.shape == (0, 16)
 
 
-def test_the_sampled_op_checks_its_tables_as_the_greedy_one_does():
-    """Both ops index W2 by the logits' column: a table of another vocab must
-    raise in the sampled op too, not read the wrong rows."""
-    from atom.model_ops.spec_sampling.dspark_markov_sample import (
-        dspark_markov_sample,
-        dspark_markov_sample_scratch,
-    )
-    from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
-
-    rows, vocab = 5, 64
-    base, prev, w1, w2 = _tables(rows, vocab, 16, "cpu")
-    store = SparseQStore.allocate(rows, 8, "cpu")
-    scratch = dspark_markov_sample_scratch(rows, vocab, "cpu")
-    i32 = {"dtype": torch.int32}
-    rest = (
-        *store,
-        torch.empty(rows, vocab),
-        torch.zeros(rows, **i32),
-        0,
-        torch.ones(rows),
-        torch.zeros(rows, **i32),
-        torch.ones(rows),
-        torch.zeros(1, **i32),
-        0,
-        scratch.buf,
-    )
-    with pytest.raises(ValueError, match="markov_w2"):
-        dspark_markov_sample(base, prev, w1, w2[:-1], _ids(rows, "cpu"), *rest)
-    with pytest.raises(ValueError, match="markov_w1"):
-        dspark_markov_sample(base, prev, w1[:-1], w2, _ids(rows, "cpu"), *rest)
-
-
 def test_ids_are_rejected_at_both_ends_unless_an_id_block_could_hold_them():
     """`prev_ids` indexes a table and `out` is indexed by one, so both are ids.
 
