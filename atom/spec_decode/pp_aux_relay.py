@@ -23,6 +23,7 @@ from atom.spec_decode.drafter import (
     _aux_hook,
     _resolve_decoder_layers,
     install_aux_taps,
+    tap_is_resident,
 )
 from atom.spec_decode.factory import drafter_class
 
@@ -47,20 +48,16 @@ class PPAuxRelay:
         )
         taps = spec.layer_ids
 
-        def resident(lid):
-            # The embedding tap (-1) is resident on the first stage.
-            if lid == -1:
-                return pp.is_first_rank
-            return 0 <= lid < len(layers) and not isinstance(
-                layers[lid], PPMissingLayer
-            )
-
         self.spec = spec
-        self.own_ids = tuple(lid for lid in taps if resident(lid))
+        self.own_ids = tuple(
+            lid for lid in taps if tap_is_resident(target_model, layers, lid)
+        )
         # Every tap below this stage's first layer was captured upstream, which
         # is exactly what the previous stage sent, even if it owned none itself.
         self.incoming_ids = tuple(
-            lid for lid in taps if not resident(lid) and lid < stage_start
+            lid
+            for lid in taps
+            if not tap_is_resident(target_model, layers, lid) and lid < stage_start
         )
         self.outgoing_ids = () if pp.is_last_rank else self.incoming_ids + self.own_ids
 
