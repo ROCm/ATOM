@@ -2753,7 +2753,7 @@ class ModelRunner:
         counts[group.indices["top_ks"]] = top_k_count
         counts[group.indices["top_ps"]] = top_p_count
         counts[group.indices["required_channel_states"]] = channel_count
-        # The draft's copy of the same facts, plus where its q goes, staged into
+        # The draft's own inputs (its Philox key and where its q goes), staged into
         # the same publication so the upload stays a single batched H2D and is
         # covered by this forward's staging window. A no-op on every drafter but
         # a DSpark one with lossless sampling.

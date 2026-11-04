@@ -53,7 +53,7 @@ _FILTER_F32_WIDTH = _FILTER_SPLIT * _FILTER_BINS + 1
 # its kernels on the row and request counts (== 1, a multiple of 16) and so
 # compile each once per class of batch, mid-serve, the first time that class
 # arrives. The counts only bound loops and index, so none is specialized on;
-# with every scratch view 16-byte aligned (`take`), one compile per kernel
+# with every scratch view `SCRATCH_ALIGN`-aligned (`sampling_scratch`), one compile per kernel
 # variant serves every batch.
 _BATCH_COUNTS = ["num_tokens", "batch_size"]
 

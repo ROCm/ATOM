@@ -5,7 +5,7 @@ Accept draft x iff ``u * q(x) < p(x)``; on the first rejection draw from
 request `Sampler`'s p_f (0 below the row's floor, `sampling_filter`); q is the
 distribution the draft drew x from, sparse (`SparseQStore`) and 0 off its set.
 p is never materialized: per-tile statistics (`ratio_target_p`) give p(x), and
-only a rejecting row is read across V again, with its q densified first.
+only a rejecting row is read across V again, its q straight from the store.
 The residual is an exponential race, ``argmax r(v) / E_v``: no normalizer, and
 no two reductions whose rounding must agree.
 Greedy rows take exact match in the same launch, the rule of

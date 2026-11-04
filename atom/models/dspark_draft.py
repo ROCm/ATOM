@@ -116,7 +116,7 @@ class DSparkMarkovHead(nn.Module):
         self.markov_w2 = nn.Embedding(vocab_size, rank)
         # Read once here rather than per sampled position: envs re-reads the
         # environment on every attribute access.
-        self.fused_sample = envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE
+        self.fused_argmax = envs.ATOM_DSPARK_FUSED_MARKOV_ARGMAX
 
     def forward(self, token_ids: torch.Tensor):
         """Args:
@@ -154,7 +154,7 @@ class DSparkMarkovHead(nn.Module):
         Returns:
             markov_embed: [B, r]  W1[x_{k-1}].
         """
-        if self.fused_sample:
+        if self.fused_argmax:
             # Imported here, not at module scope: the op imports Triton and
             # AITER, and this module stays importable without them.
             from atom.model_ops.dspark_markov_argmax import dspark_markov_argmax
@@ -307,8 +307,9 @@ class DSparkDraftModel(nn.Module):
     def bind_draft_sampling(self, sampling: "DraftSampling | None") -> None:
         """Hand this model the buffers its block sampler draws into.
 
-        Called once from ``DSparkProposer.__init__``, before any warmup or
-        capture, so the sampled branch is the one that gets JITed and recorded.
+        Called once the draft's sampling inputs exist (`DSparkLossless.bind_target`),
+        before any warmup or capture, so the sampled branch is the one that gets
+        JITed and recorded.
         Switching it per step would not work: the branch is python, and a
         captured graph holds whichever side was taken at capture.
         """

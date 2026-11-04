@@ -693,8 +693,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the Markov head is built, so it must be set before the server starts.
     # Once ATOM_SPEC_LOSSLESS_SAMPLING arms, Kimi-K3 drafts every row through
     # the sampled block whatever this says.
-    "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
-        os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
+    # ATOM_DSPARK_FUSED_MARKOV_SAMPLE is its old name, still read for one
+    # release when the new one is unset.
+    "ATOM_DSPARK_FUSED_MARKOV_ARGMAX": lambda: (
+        os.getenv(
+            "ATOM_DSPARK_FUSED_MARKOV_ARGMAX",
+            os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1"),
+        )
+        == "1"
     ),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
