@@ -271,8 +271,14 @@ def native_quant_linear(
     fp4 = weight.dtype == torch.float4_e2m1fn_x2
     # Native path keeps checkpoint OCP bits even when the param was typed
     # e4m3fnuz on gfx942 (process_weights_after_loading skips FNUZ normalize).
+    # `.view(dtype)` returns a new Tensor and drops the BF16 weight cache that
+    # process_weights hung on the parameter. Without it, every decode step
+    # dequants the FP8 weight again (several ms on the shared expert).
+    bf16_cache = getattr(weight, "_atom_group32_bf16_cache", None)
     if weight.dtype == torch.float8_e4m3fnuz:
         weight = weight.view(torch.float8_e4m3fn)
+        if bf16_cache is not None:
+            weight._atom_group32_bf16_cache = bf16_cache
     if weight.dtype not in (torch.float8_e4m3fn, torch.float4_e2m1fn_x2):
         raise ValueError("Weight must be E4M3 or packed E2M1")
     if weight_group_rows not in (1, 32) or (fp4 and weight_group_rows != 1):

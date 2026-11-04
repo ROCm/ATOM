@@ -29,6 +29,7 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 from atom.utils import envs
 
 if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
+    from aiter.ops.triton.moe import moe_op_gemm_a4w4 as _moe_a4w4
     from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
         moe_gemm_a4w4,
         mxfp4_quant,
@@ -37,11 +38,40 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
         get_kernel_config_gluon,
         moe_gemm_a8w4,
     )
+    from aiter.ops.triton.moe import moe_op_gemm_a16w4 as _moe_a16w4
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
         moe_gemm_a16w4,
     )
     from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
     from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+
+    def _gfx942_moe_bn_floor(orig_cfg):
+        """Keep decode BN from shrinking to 32 on gfx942 (underfills CUs)."""
+
+        def _wrapped(m, n, k, routing_data):
+            cfg = dict(orig_cfg(m, n, k, routing_data))
+            if get_arch() == "gfx942" and cfg.get("block_m") == 16:
+                bn = int(cfg.get("block_n", 64))
+                if bn < 64:
+                    bn = 64
+                if n >= 1024 and bn < 128:
+                    grid_m = routing_data.n_blocks(m, 16)
+                    grid_n = (n + 127) // 128
+                    if grid_m * grid_n >= 32:
+                        bn = 128
+                cfg["block_n"] = bn
+            return cfg
+
+        return _wrapped
+
+    # Default a16w4/a4w4 configs use `while block_n >= 64 and grid < 256`,
+    # which lands on BN=32 for decode M=1. Prefer BN>=64 (128 when N is wide).
+    _moe_a16w4.get_kernel_config_triton = _gfx942_moe_bn_floor(
+        _moe_a16w4.get_kernel_config_triton
+    )
+    _moe_a4w4.get_kernel_config_triton = _gfx942_moe_bn_floor(
+        _moe_a4w4.get_kernel_config_triton
+    )
 
 from atom.model_ops.moe import MoEActivationQuant
 
