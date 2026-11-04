@@ -138,6 +138,18 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         # is 1 for every Qwen3.5 checkpoint; with more, each still feeds `norm`).
         # The final norm covers only the rows the head reads (select_rows),
         # which the combine's tail does not: it stays the tail kernel's.
+        # ATOM_MTP_MONO_MOE: the drafter's MoE block and the final norm after it
+        # in the target's fused TP4 kernel (ATOM_QWEN_MONO_MOE: router, top-k,
+        # experts, shared expert, gated add, all-reduce, residual add, norm).
+        # It needs the final norm to all-reduce (ATOM_MTP_FUSE_ALLREDUCE_NORM).
+        # Before defer_moe_gated_sums, which it otherwise refuses: a step the
+        # fused kernel declines (prefill, > 128 rows) runs the deferred path.
+        # The one MTP layer is index 0 here, so it writes the kernel's parity-0
+        # output and leaves the target's last layer's (parity 1) alone.
+        if envs.ATOM_MTP_MONO_MOE and fuse_allreduce_norm:
+            from atom.model_ops.qwen_mono_moe.integration import enable_mono_moe
+
+            enable_mono_moe(self.layers, self.norm)
         for layer in self.layers:
             defer_moe_gated_sums(
                 [layer],

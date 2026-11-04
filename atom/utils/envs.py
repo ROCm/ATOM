@@ -515,6 +515,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # norm's kernel. The input norm stays a plain norm: its input, the fc output,
     # is replicated. Off by default.
     "ATOM_MTP_FUSE_ALLREDUCE_NORM": lambda: _flag_env("ATOM_MTP_FUSE_ALLREDUCE_NORM"),
+    # The MTP drafter's MoE block in the fused TP4 MoE-half kernel (as
+    # ATOM_QWEN_MONO_MOE for the target); needs ATOM_MTP_FUSE_ALLREDUCE_NORM.
+    "ATOM_MTP_MONO_MOE": lambda: _flag_env("ATOM_MTP_MONO_MOE"),
     # With ATOM_MTP_SELECT_ROWS_BEFORE_MOE: the drafter keeps its step-0 rows (one
     # a sequence) before o_proj instead of after post_attention_layernorm, both
     # row-wise: o_proj, its all-reduce and the norm run on those rows, the
