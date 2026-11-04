@@ -558,6 +558,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3: store the sparse layers' K/V as MXFP4 (e2m1 + e8m0 per 32, one
+    # 8704 B page per (page, kv head)); the fused qk-norm/rope kernel writes it
+    # and an FP8 main Q, and FlyDSL's pa_decode (MXFP4 K/V) reads it. Pair with
+    # --index-cache-dtype mxfp4.
+    "ATOM_M3_SPARSE_KV_MXFP4": lambda: (
+        os.getenv("ATOM_M3_SPARSE_KV_MXFP4", "0") == "1"
+    ),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",

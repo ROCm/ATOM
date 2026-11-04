@@ -106,6 +106,7 @@ class MhaKvPool:
         kv_dtype: torch.dtype,
         blocks_per_entry: int = 1,
         extra_fields: Sequence[EntryField] = (),
+        kv_format: str = "",
     ):
         # `block_size` is the caller's block, the only token count the pool
         # shapes anything by. `blocks_per_entry` is how many of them the entry
@@ -118,8 +119,14 @@ class MhaKvPool:
                 f"an entry holds at least one block, not {blocks_per_entry}"
             )
         self.block_size = block_size
+        # "mxfp4": MiniMax-M3 sparse layers, per (page, kv head) one 8704 B field
+        # holding e2m1 data and e8m0 scales (minimax_m3/kv_mxfp4.py); K and V a
+        # field each, no scale planes. "" is the dtype-wide SHUFFLE cache.
+        self.kv_format = kv_format
         self.x = shuffle_pack(kv_dtype)
-        if head_dim % self.x or block_size % self.x:
+        if kv_format == "mxfp4":
+            self.x = 1
+        elif head_dim % self.x or block_size % self.x:
             raise ValueError(
                 f"SHUFFLE packs {self.x} elements of {kv_dtype} per "
                 f"{_TILE_BYTES}B tile, which has to divide both head_dim "
@@ -133,19 +140,35 @@ class MhaKvPool:
         # 256 B field alignment by the same factor -- 9% of the pool at 8
         # blocks an entry, almost all of it padding on the 64 B scale planes.
         entry_tokens = block_size * blocks_per_entry
-        self.cache_fields = mha_kv_fields(
-            layers=layers,
-            entry_tokens=entry_tokens,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            kv_dtype=kv_dtype,
-        )
-        self.scale_fields = mha_kv_scale_fields(
-            layers=layers,
-            entry_tokens=entry_tokens,
-            num_kv_heads=num_kv_heads,
-            kv_dtype=kv_dtype,
-        )
+        if kv_format == "mxfp4":
+            from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, PAGE_TOKENS
+
+            if block_size != PAGE_TOKENS or head_dim != 128 or blocks_per_entry != 1:
+                raise ValueError(
+                    "an MXFP4 KV page is 128 tokens of head_dim 128, one block "
+                    f"an entry; got block_size {block_size}, head_dim "
+                    f"{head_dim}, {blocks_per_entry} blocks an entry"
+                )
+            per_entry = num_kv_heads * PAGE_BYTES
+            self.cache_fields = [
+                EntryField("k", layers, (per_entry,), torch.uint8),
+                EntryField("v", layers, (per_entry,), torch.uint8),
+            ]
+            self.scale_fields = []
+        else:
+            self.cache_fields = mha_kv_fields(
+                layers=layers,
+                entry_tokens=entry_tokens,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                kv_dtype=kv_dtype,
+            )
+            self.scale_fields = mha_kv_scale_fields(
+                layers=layers,
+                entry_tokens=entry_tokens,
+                num_kv_heads=num_kv_heads,
+                kv_dtype=kv_dtype,
+            )
         self.extra_fields = [f for f in extra_fields if f.layers]
         # The regions an entry is charged for, in layout order. One list, walked
         # by both the price and the allocation, so a fourth group cannot be
@@ -259,6 +282,14 @@ class MhaKvPool:
         collapsing V's outer half to one.
         """
         x, nh, hd, bs = self.x, self.num_kv_heads, self.head_dim, self.block_size
+        if self.kv_format == "mxfp4":
+            from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES
+
+            shape = (-1, nh, PAGE_BYTES)
+            return (
+                self.field_view("k", layer, torch.uint8, shape),
+                self.field_view("v", layer, torch.uint8, shape),
+            )
         return (
             self.field_view("k", layer, self.kv_dtype, (-1, nh, hd // x, bs, x)),
             self.field_view("v", layer, self.kv_dtype, (-1, nh, bs // x, hd, x)),
