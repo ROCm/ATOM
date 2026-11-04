@@ -281,7 +281,7 @@ def test_unified_decode_hands_the_request_to_aiter(monkeypatch, select):
     q = torch.zeros(10, 4, 256, dtype=torch.float8_e4m3fn, device=DEV)
     gate = torch.zeros(10, 1024, dtype=torch.bfloat16, device=DEV)
     rows = torch.tensor([4, 9], device=DEV) if select else None
-    ctx = SimpleNamespace(attn_metadata=md)
+    ctx = SimpleNamespace(attn_metadata=md, context=SimpleNamespace(is_draft=False))
     with epi.AttentionOutputEpilogue(gate, rows) as req:
         o = impl.paged_attention_unified(q, None, None, None, None, None, None, ctx)
         # A second attention in the same scope does not take it again.
