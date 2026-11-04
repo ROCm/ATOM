@@ -247,9 +247,9 @@ class Drafter(abc.ABC):
         aiter's flydsl hgemm builds a kernel per tile config, in-process, so a
         batch first seen mid-serve stalls that step and every restart pays
         again: `hipModuleLoadData` per rank went 6 -> 0 on the 16k/20/50c
-        reproducer, with this and `propose`'s padding.
+        reproducer, with this and `_propose`'s padding.
 
-        Warming `runner.capture_sizes` is the point -- `propose` runs at the batch
+        Warming `runner.capture_sizes` is the point -- `_propose` runs at the batch
         the target ran, which `ForwardMode.decide` picks out of that same list,
         so warmed and reachable are one set by construction rather than two
         that drift.
@@ -260,7 +260,7 @@ class Drafter(abc.ABC):
         all-reduce for the optional capture) and after `allocate_kv_cache`, so
         that context has real ring slots and `is_dummy_run=False`.
 
-        Whatever `propose` sets on the context, this must set too. A capture
+        Whatever `_propose` sets on the context, this must set too. A capture
         bakes every Python branch taken while it is made, so a guard that reads
         the context is decided once, here, for every replay -- `is_draft` gates
         the aux-capture hook away from the draft's own forward, and warming
@@ -324,7 +324,7 @@ class Drafter(abc.ABC):
         1 for a serial flavor, whose declared pass is the mid-step; a block
         flavor drafts its whole width in one pass and overrides. Read by
         `warmup_draft_graphs`, which must state the shape on a synthetic
-        context and cannot ask `propose`.
+        context and cannot ask `_propose`.
         """
         return 1
 

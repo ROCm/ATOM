@@ -12,8 +12,6 @@ the boundary level's lowest ids fill n = min(K, top-k, ids within 19 nats).
 That only moves acceptance: the draft samples from what is stored.
 Launches: histogram, cut, compact, finalize (normalize, then the exponential
 race over the stored entries). Both 3 and 5 level through `_q_level`.
-At B=512 rows the select costs 264 us/position, vs 141 for aiter.topk_select
-plus the store.
 Fixed-order reductions, no atomics: TP ranks must store and draw alike.
 Philox noise in-kernel, at a full-vocab race's counter per (position, row, id).
 """

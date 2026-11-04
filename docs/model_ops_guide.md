@@ -555,7 +555,7 @@ The flag arms both halves at once: the DSpark draft samples its block from `soft
 - **Which K**: any K is exact, as the draft samples only the stored entries; a smaller K gives up `q`'s tail mass, i.e. some acceptance. The stored set is every id within 19 nats of the max, cut to K by 1/8-nat level (lowest ids first in the boundary level), which likewise only moves acceptance. K = V stores everything, for acceptance studies rather than throughput (~200-400 us per draft position on MI355X, vs ~5-20 us at 1024).
 - **Large batch**: the select reads the fp32 score scratch twice (histogram, then compact). On MI355X (V=163840, K=1024) it takes 15.7/17.5/45.9/263.8 us per draft position at B=1/8/64/512 sampled rows, vs 46.4/50.3/56.7/141.1 us for `aiter.topk_select` plus the store: faster up to at least B=64, ~120 us per position slower at B=512, mostly the re-read.
   `topk_select` is not a drop-in: its stream backend at large B returns ids in a nondeterministic order, so TP ranks would store different rows, and the per-request top-k/top-p cut needs sorted output. Like K, the select moves acceptance only, not the law.
-- **Where it does not arm**: only a draft model with `supports_lossless_draft` (today Kimi-K3 DSpark); others keep the greedy pair and say so once. Where it would arm, `ATOM_ENABLE_RELAXED_MTP` is refused. It warns and keeps the greedy pair where the draft block is narrower than the verify, under PP (the `sampling` publication is ringed, and such an engine never verifies), under PCP (draft ids are broadcast, their `q` is not), on a P/D producer (it drafts for handoff only), or without aiter's top-k/top-p ops. Read at drafter construction, so set it before the server starts.
+- **Where it does not arm**: only a draft model with `supports_lossless_draft` (today Kimi-K3 DSpark); others keep the greedy pair and say so once. Where it would arm, `ATOM_ENABLE_RELAXED_MTP` is refused. It warns and keeps the greedy pair where the Markov tables cannot run the fused sampled op (`markov_weights_unsupported`), where the draft block is narrower than the verify, under PP (the `sampling` publication is ringed, and such an engine never verifies), under PCP (draft ids are broadcast, their `q` is not), on a P/D producer (it drafts for handoff only), or without aiter's top-k/top-p ops. Read at drafter construction, so set it before the server starts.
 
 ## Fused kernel chains
 
@@ -597,14 +597,14 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `sampler.py` | `Sampler` — unified greedy/random sampling |
 | `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling; dispatches between the accept rules |
 | `verify_kernels.py` | `_draft_token`, `_finish_request` — the Triton helpers every verify kernel shares |
-| `tile_argmax.py` | `argmax_lowest_id` — the lowest-id tile argmax the greedy DSpark draft and the lossless sampling kernels share |
-| `spec_sampling/ratio_verify.py` | `RatioVerifyInputs`, `ratio_verify_scratch`, `warmup_ratio_verify` — the probability-ratio accept rule: accept and a residual race that reads each rejecting row's `q` from the store |
+| `tile_argmax.py` | `argmax_lowest_id`, `argmax_of_tiles` — the lowest-id tile argmax the greedy DSpark draft and the lossless sampling kernels share, and its combine over a row's tiles |
+| `spec_sampling/ratio_verify.py` | `RatioVerifyInputs`, `ratio_verify_scratch`, `warmup_ratio_verify`, `warmup_forms`, `filter_variant` — the probability-ratio accept rule: accept and a residual race that reads each rejecting row's `q` from the store |
 | `spec_sampling/ratio_target_p.py` | `_ratio_target_p`, `filter_floor` — the ratio verify's target p: per-row softmax statistics and raw argmax, then the filter floor |
 | `dspark_markov_stage1.py` | `markov_logits_tile`, `publish_tile_argmax`, `markov_launch_geometry` — stage 1 of both DSpark Markov ops: the bias GEMV tile, its (max, lowest id), and the launch both ops use |
 | `dspark_markov_argmax.py` | `dspark_markov_argmax` / `dspark_markov_argmax_tp` — the default greedy DSpark draft (full-vocab and vocab-sharded head) |
 | `spec_sampling/dspark_markov_sample.py` | `dspark_markov_sample` — the lossless DSpark draft: samples each block position and stores its top-K `q` for the ratio verify |
 | `spec_sampling/sparse_q_select.py` | `select_and_draw_q` — the lossless DSpark draft's top-K `q` select by level, its store, and the draw from exactly the stored entries |
-| `spec_sampling/sparse_q_store.py` | `SparseQStore` — the sparse draft `q` a drafter writes and the ratio verify reads, independent of any drafter |
+| `spec_sampling/sparse_q_store.py` | `SparseQStore`, `store_width` — the sparse draft `q` a drafter writes and the ratio verify reads, independent of any drafter |
 | `spec_sampling/sampling_filter.py` | `row_filters`, `FilterScratch` — the ratio verify's top-k/top-p floor: shared row helpers and work buffers (`ratio_target_p.filter_floor` dispatches) |
 | `spec_sampling/sampling_filter_descent.py` | `descend_floor` — the floor by a radix descent over the logit bits |
 | `spec_sampling/sampling_filter_count.py` | `count_floor` — the floor of a top-k of at most 256 alone, counted |

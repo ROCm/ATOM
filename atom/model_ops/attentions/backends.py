@@ -536,7 +536,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         ) // self.block_size
         # Width of every `block_tables` buffer, and of anything gathered from one.
         self.block_table_cols = self.max_num_blocks_per_seq // self.block_ratio
-        # Per-rank attention head count. eagle.propose's mid-step path reads
+        # Per-rank attention head count. EagleProposer._propose's mid-step path reads
         # this to gate the `do_attn_metadata_update` branch. Subclasses that
         # need a kernel-minimum-padded count set `self.padded_num_attention_heads`
         # separately (it does NOT replace this attribute).

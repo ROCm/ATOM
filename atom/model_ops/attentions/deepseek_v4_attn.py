@@ -2361,7 +2361,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             AttentionMetaData_DSV4, get_forward_context().attn_metadata
         )
         # Pre-populated by the verify-forward `prepare_decode` and kept alive
-        # across eagle.propose; assert for the static checker.
+        # across EagleProposer._propose; assert for the static checker.
         assert attn_metadata.context_lens is not None
         assert attn_metadata.state_slot_out is not None
         win = self.window_size  # SWA prefix max per token
