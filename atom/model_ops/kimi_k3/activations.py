@@ -15,6 +15,8 @@ try:
     import triton
     import triton.language as tl
 
+    from atom.model_ops.triton_e8m0_quant import fp8_e8m0_group_scale
+
     _HAS_TRITON = True
 except ImportError:  # pragma: no cover
     _HAS_TRITON = False
@@ -41,6 +43,11 @@ if _HAS_TRITON:
         inv_linear_beta,
         HAS_LINEAR: tl.constexpr,
         BLOCK: tl.constexpr,
+        s_ptr=None,
+        stride_s_m=0,
+        stride_s_g=0,
+        E8M0_SCALE: tl.constexpr = False,
+        FP8_MAX: tl.constexpr = 0.0,
     ):
         row = tl.program_id(0)
         col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -55,6 +62,20 @@ if _HAS_TRITON:
         if HAS_LINEAR:
             u = linear_beta * (2.0 * tl.sigmoid(2.0 * u * inv_linear_beta) - 1.0)
         y = out * u
+        if E8M0_SCALE:
+            # quantize the bf16 the unfused path stores; groups past D are skipped
+            y = y.to(x_ptr.dtype.element_ty).to(tl.float32)
+            y = y.reshape(BLOCK // 128, 128)
+            code, multiplier = fp8_e8m0_group_scale(tl.max(tl.abs(y), axis=1), FP8_MAX)
+            y = y * multiplier[:, None]
+            y = tl.clamp(y, -FP8_MAX, FP8_MAX, propagate_nan=tl.PropagateNan.ALL)
+            y = y.reshape(BLOCK)
+            groups = tl.program_id(1) * (BLOCK // 128) + tl.arange(0, BLOCK // 128)
+            tl.store(
+                s_ptr + row * stride_s_m + groups * stride_s_g,
+                code,
+                mask=groups < D // 128,
+            )
         tl.store(y_ptr + row * stride_ym + col, y.to(y_ptr.dtype.element_ty), mask=mask)
 
     @triton.jit
@@ -210,10 +231,16 @@ def situ_and_mul(
     y = torch.empty((m, d), dtype=x.dtype, device=x.device)
     if not _HAS_TRITON or m == 0:
         return _situ_and_mul_torch(x, beta, linear_beta)
+    _launch_situ_and_mul(x2, y, beta, linear_beta)
+    return y.reshape(*lead, d)
+
+
+def _launch_situ_and_mul(x2, y, beta, linear_beta, **e8m0_args) -> None:
+    """_situ_and_mul_kernel over [m, 2*d] ``x2`` into [m, d] ``y``."""
+    m, d = y.shape
     BLOCK = 1024
-    grid = (m, triton.cdiv(d, BLOCK))
     has_linear = linear_beta is not None
-    _situ_and_mul_kernel[grid](
+    _situ_and_mul_kernel[(m, triton.cdiv(d, BLOCK))](
         x2,
         y,
         m,
@@ -226,8 +253,8 @@ def situ_and_mul(
         (1.0 / float(linear_beta)) if has_linear else 0.0,
         HAS_LINEAR=has_linear,
         BLOCK=BLOCK,
+        **e8m0_args,
     )
-    return y.reshape(*lead, d)
 
 
 def _situ_and_mul_quant_fake(
@@ -275,13 +302,55 @@ def situ_and_mul_quant(
     return out, scale
 
 
+def _situ_and_mul_fp8_e8m0_quant_fake(
+    x: torch.Tensor, beta: float, linear_beta: float | None, transpose_scale: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, d = x.numel() // x.shape[-1], x.shape[-1] // 2
+    out = torch.empty((m, d), dtype=dtypes.fp8, device=x.device)
+    scale = torch.empty((m, d // 128), dtype=dtypes.fp8_e8m0, device=x.device)
+    return out, scale
+
+
+# Functional, like per_1x128_e8m0_quant: Inductor cannot functionalize an E8M0
+# mutation.
+@torch_compile_guard(gen_fake=_situ_and_mul_fp8_e8m0_quant_fake, mutates_args=[])
+def situ_and_mul_fp8_e8m0_quant(
+    x: torch.Tensor, beta: float, linear_beta: float | None, transpose_scale: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``per_1x128_e8m0_quant(situ_and_mul(x, ...))`` in one kernel; d % 128 == 0."""
+    x2 = x.reshape(-1, x.shape[-1])
+    m, d = x2.shape[0], x2.shape[1] // 2
+    assert d % 128 == 0, f"per-1x128 groups need d % 128 == 0, got d={d}"
+    out = torch.empty((m, d), dtype=dtypes.fp8, device=x.device)
+    # uint8, viewed as E8M0 below; transpose_scale: column-major, as aiter's
+    scale = torch.empty(
+        (d // 128, m) if transpose_scale else (m, d // 128),
+        dtype=torch.uint8,
+        device=x.device,
+    )
+    if m:
+        _launch_situ_and_mul(
+            x2,
+            out,
+            beta,
+            linear_beta,
+            s_ptr=scale,
+            stride_s_m=1 if transpose_scale else d // 128,
+            stride_s_g=m if transpose_scale else 1,
+            E8M0_SCALE=True,
+            FP8_MAX=float(torch.finfo(dtypes.fp8).max),
+        )
+    return out, scale.view(m, d // 128).view(dtypes.fp8_e8m0)
+
+
 def situ_and_mul_maybe_quant(
     x: torch.Tensor,
     beta: float,
     linear_beta: float | None,
     quant: bool = False,
+    e8m0_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """SiTUv2 gated activation, optionally fused with per-token FP8 quant.
+    """SiTUv2 gated activation, optionally fused with down_proj's FP8 quant.
 
     Unifies the quant and non-quant paths behind one call site so the caller
     always does ``down_proj(x, x_scale=scale)``:
@@ -292,10 +361,15 @@ def situ_and_mul_maybe_quant(
     - ``quant=True``: fuse SiTUv2 + per-token FP8 quant into one aiter kernel and
       return ``(fp8 [m, d], scale [m, 1])`` for down_proj's ``x_scale=`` path
       (dense-MLP / shared-expert under ptpc_fp8).
-
-    Unlike :func:`fused_sigmoid_mul_maybe_quant`, there is no scheme selector: the
-    aiter ``situv2_and_mul_quant`` kernel implements only the per-token scheme.
+    - ``e8m0_scale``: per-1x128 FP8 with E8M0 scales instead, from ATOM's kernel
+      (aiter's ``situv2_and_mul_quant`` is per-token only).
     """
+    if quant and e8m0_scale:
+        from atom.utils import envs
+
+        return situ_and_mul_fp8_e8m0_quant(
+            x, beta, linear_beta, envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        )
     if quant:
         return situ_and_mul_quant(x, beta, linear_beta)
     return situ_and_mul(x, beta, linear_beta), None

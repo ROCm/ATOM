@@ -190,14 +190,15 @@ class SituAndMul(nn.Module):
         beta: float = 1.0,
         linear_beta: float | None = None,
         fused_quant: bool = False,
+        e8m0_scale: bool = False,
     ):
         super().__init__()
         self.beta = beta
         self.linear_beta = linear_beta
-        # Fuse per-token FP8 quant into the activation only when the consuming
-        # down_proj runs a8w8 per-token FP8 AND linear_beta is set (the aiter
-        # kernel always applies the linear-beta tanh to the up half).
-        self.fused_quant = fused_quant and linear_beta is not None
+        # Fuse down_proj's FP8 quant into the activation. The per-token (aiter)
+        # kernel always applies the linear-beta tanh, so it needs linear_beta.
+        self.e8m0_scale = e8m0_scale
+        self.fused_quant = fused_quant and (e8m0_scale or linear_beta is not None)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         from atom.model_ops.kimi_k3 import situ_and_mul_maybe_quant
@@ -205,7 +206,11 @@ class SituAndMul(nn.Module):
         # Always (activation, scale): (fp8, scale) when fused, else (bf16, None),
         # so KimiMLP takes the same down_proj(x_scale=) call site.
         return situ_and_mul_maybe_quant(
-            x, self.beta, self.linear_beta, quant=self.fused_quant
+            x,
+            self.beta,
+            self.linear_beta,
+            quant=self.fused_quant,
+            e8m0_scale=self.e8m0_scale,
         )
 
 
@@ -287,18 +292,21 @@ class KimiMLP(nn.Module):
         if config.hidden_act != "situ":
             raise ValueError(f"Unsupported Kimi-K3 activation: {config.hidden_act}")
         # Fuse SiTUv2 + activation quant when down_proj is a8w8 per-token FP8
-        # (ptpc_fp8): the fused kernel emits (fp8, scale) so down_proj skips its
-        # standalone quant. gate_up/down share a scheme, so probe down_proj.
+        # (ptpc_fp8) or per-1x128 FP8 with E8M0 scales: the fused kernel emits
+        # (fp8, scale) so down_proj skips its standalone quant. gate_up/down share
+        # a scheme, so probe down_proj.
         down_type, down_dtype = effective_layer_quant(
             quant_config, f"{prefix}.down_proj"
         )
-        self._fuse_act_quant = (
-            down_type == QuantType.per_Token and down_dtype == dtypes.fp8
+        down_e8m0_scale = _is_e8m0_blockscale(quant_config, down_type)
+        self._fuse_act_quant = down_dtype == dtypes.fp8 and (
+            down_type == QuantType.per_Token or down_e8m0_scale
         )
         self.act_fn = SituAndMul(
             beta=getattr(config, "activation_situ_beta", None) or 1.0,
             linear_beta=getattr(config, "activation_situ_linear_beta", None),
             fused_quant=self._fuse_act_quant,
+            e8m0_scale=down_e8m0_scale,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
