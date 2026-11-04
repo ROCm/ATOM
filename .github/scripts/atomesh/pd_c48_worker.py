@@ -150,15 +150,10 @@ def nic_limits(device):
 
 
 def prepare_store_memory(worker):
-    """ATOM's Store memory recipe (pd_server_atom.sh prepare_mooncake_store_memory), once per node before the
-    embedded segments pin: evict the models' page cache, then fault each NUMA node's share as THP from one bound
-    thread. Mooncake pre-touches from many threads whose racing compactions leave 4 KiB pages, and ionic maps a
-    whole MR at 4 KiB for one of them (job 10077)."""
+    """store_memory_prep's recipe, once per node before the embedded segments pin."""
     import fcntl
-    import subprocess
-    import sys
     import time
-    here, out = Path(__file__).resolve().parent, Path(os.environ["C48_DIAG_DIR"])
+    out = Path(os.environ["C48_DIAG_DIR"])
     out.mkdir(parents=True, exist_ok=True)
     with open(out / "mooncake-store-memory.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -171,25 +166,9 @@ def prepare_store_memory(worker):
         root, start = os.path.commonpath(models), time.monotonic()
         drop_page_cache(root)
         print(f"[C48] Store memory: dropped the page cache of {root} in {time.monotonic() - start:.0f} s", flush=True)
-        segments = (json.loads(Path(os.environ["MOONCAKE_CONFIG_PATH"]).read_text())["global_segment_size"]
-                    * worker.parallel_config.world_size)
-        nodes = [p for p in sorted(Path("/sys/devices/system/node").glob("node[0-9]*")) if (p / "cpulist").read_text().strip()]
-        for node in nodes:
-            info = {f[2].rstrip(":"): int(f[3]) << 10 for f in map(str.split, (node / "meminfo").read_text().splitlines())
-                    if len(f) == 5}
-            # A process bound to a node is killed out of memory past what the node can free; the workers hold theirs.
-            gib = min(segments / len(nodes), info["MemFree"] + info["Active(file)"] + info["Inactive(file)"] - (64 << 30)) / 2**30
-            print(f"[C48] Store memory: compacting {node.name} for {gib:.0f} of {segments / len(nodes) / 2**30:.0f} GiB"
-                  f" (MemFree {info['MemFree'] >> 30} GiB, file {(info['Active(file)'] + info['Inactive(file)']) >> 30} GiB)",
-                  flush=True)
-            if gib < 1:
-                continue
-            # 1211 GiB on node1 reached ~830 GiB of THP in 600 s (job 10183) and enough in 1800 s (job 10122).
-            try:
-                subprocess.run([sys.executable, str(here / "numa_exec.py"), node.name.removeprefix("node"), sys.executable,
-                                str(here / "compact_huge_pages.py"), f"{gib:.0f}"], check=False, timeout=1800)
-            except subprocess.TimeoutExpired:
-                print(f"[C48][WARN] Store memory: compacting {node.name} did not finish in 1800 s", flush=True)
+        from store_memory_prep import compact_nodes
+        compact_nodes(json.loads(Path(os.environ["MOONCAKE_CONFIG_PATH"]).read_text())["global_segment_size"]
+                      * worker.parallel_config.world_size)
         done.touch()
 
 

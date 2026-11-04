@@ -48,20 +48,27 @@ PY
 
 # Install the pinned ROCm Mooncake wheel (the workflow downloads it) over the
 # image, and on Prefill start the embedded Store's master when the case has one.
+# A case without a wheel uses the image's Mooncake.
 c48_start_mooncake() {
   local role="$1" config="$2" site="/tmp/atomesh-c48-mooncake"
   local wheel sha store digest
   read -r wheel sha store < <(python3 -c 'import json, sys
 m = json.load(open(sys.argv[1]))["mooncake"]
-print(m["wheel"]["name"], m["wheel"]["sha256"], int("store" in m))' "${config}") || return 2
-  wheel="${ATOMESH_SCRIPT_DIR}/mooncake-dist/${wheel}"
-  digest="$(sha256sum "${wheel}")" || return 2
-  [[ "${digest%% *}" == "${sha}" ]] || { echo "ERROR: Mooncake wheel ${wheel} is not ${sha}" >&2; return 2; }
-  rm -rf "${site}"
-  python3 -m pip install --quiet --no-cache-dir --no-deps --target "${site}" "${wheel}" || return $?
-  export PYTHONPATH="${site}${PYTHONPATH:+:${PYTHONPATH}}"
-  export LD_LIBRARY_PATH="/opt/rocm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-  python3 -c 'import sys, mooncake.engine as e; assert e.__file__.startswith(sys.argv[1]) and e.SUPPORT_HIP, e.__file__' "${site}" || return 2
+w = m.get("wheel", {"name": "-", "sha256": "-"})
+print(w["name"], w["sha256"], int("store" in m))' "${config}") || return 2
+  if [[ "${wheel}" == - ]]; then
+    site="$(python3 -c 'import importlib.util, os; print(os.path.dirname(importlib.util.find_spec("mooncake").submodule_search_locations[0]))')" || return 2
+    echo "[mooncake] image $(python3 -c 'import importlib.metadata as m; print(m.version("mooncake-transfer-engine-rocm"))') at ${site}"
+  else
+    wheel="${ATOMESH_SCRIPT_DIR}/mooncake-dist/${wheel}"
+    digest="$(sha256sum "${wheel}")" || return 2
+    [[ "${digest%% *}" == "${sha}" ]] || { echo "ERROR: Mooncake wheel ${wheel} is not ${sha}" >&2; return 2; }
+    rm -rf "${site}"
+    python3 -m pip install --quiet --no-cache-dir --no-deps --target "${site}" "${wheel}" || return $?
+    export PYTHONPATH="${site}${PYTHONPATH:+:${PYTHONPATH}}"
+    export LD_LIBRARY_PATH="/opt/rocm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    python3 -c 'import sys, mooncake.engine as e; assert e.__file__.startswith(sys.argv[1]) and e.SUPPORT_HIP, e.__file__' "${site}" || return 2
+  fi
   export VLLM_MOONCAKE_BOOTSTRAP_PORT=$((18998 + ATOMESH_SERVICE_PORT_OFFSET))
   echo "[mooncake] ${role} wheel=${wheel##*/} bootstrap=${VLLM_MOONCAKE_BOOTSTRAP_PORT} store=${store}"
   [[ "${role}" == prefill && "${store}" == 1 ]] || return 0
@@ -80,6 +87,12 @@ print(json.dumps({**c, "master_server_address": "127.0.0.1:" + sys.argv[2]}))' "
     sleep 1
   done
   echo "[mooncake] master pid=${mooncake_master_pid} port=${master_port} config=$(cat "${MOONCAKE_CONFIG_PATH}")"
+  # Patched cases prepare from the worker after loading; stock ones before vLLM starts, as an SA setup_script would.
+  [[ "${wheel}" == - ]] || return 0
+  python3 "${ATOMESH_SCRIPT_DIR}/store_memory_prep.py" "$(python3 -c 'import json, sys
+c = json.load(open(sys.argv[1]))
+print(c["mooncake"]["store"]["global_segment_size"] * c["roles"]["prefill"]["args"]["tensor-parallel-size"])' "${config}")" \
+    "$(dirname "$(dirname "${MODEL_PATH}")")"
 }
 
 if [[ "${ATOMESH_C48_CASE}" == *-MC ]]; then

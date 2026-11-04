@@ -34,6 +34,16 @@ C48_N3966_FILES
 }
 
 c48_append_port_mount() {
+  # Stock cases run the image unchanged except PR files under test; PERGPU is vllm-project/vllm#65076.
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == V-STOCK* ]]; then
+    [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == *-PERGPU-* ]] || return 0
+    local c48_source="$1/.github/benchmark/c48-model-gap/n40941f2c/pr65076/mooncake_store.py" c48_digest
+    [[ -f "${c48_source}" && -r "${c48_source}" ]] || return 2
+    c48_digest="$(sha256sum "${c48_source}")" || return $?
+    [[ "${c48_digest%% *}" == "1fff05aee982d354931d1d150241b52bf9e9ca10f714667fd575f72ea6cdfc21" ]] || return 2
+    docker_args+=(--mount "type=bind,source=${c48_source},target=/usr/local/lib/python3.12/dist-packages/vllm/distributed/mooncake_store.py,readonly")
+    return
+  fi
   if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == *-N3966-* ]]; then
     c48_append_n3966_mounts "$1"
     return

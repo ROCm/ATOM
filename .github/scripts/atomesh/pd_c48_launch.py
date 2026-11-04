@@ -40,7 +40,11 @@ def render(config: dict, role: str, model: str, host: str, proxy: str,
             if lmcache_port is None:
                 raise ValueError("C48 LMCacheMPConnector requires the sidecar --lmcache-port")
             connector["kv_connector_extra_config"]["lmcache.mp.port"] = lmcache_port
-    args.update(host="0.0.0.0", port=port, **{"worker-cls": "pd_c48_worker.ManifestWorker"})
+    args.update(host="0.0.0.0", port=port)
+    # Stock cases run the image's vLLM as SA does: none of this directory's patches.
+    stock = "stock_vllm" in config
+    if not stock:
+        args["worker-cls"] = "pd_c48_worker.ManifestWorker"
     if "profiler-config" in args:
         if not trace_dir or role != "prefill":
             raise ValueError("C48 profiler requires an explicit Prefill trace directory")
@@ -59,7 +63,8 @@ def render(config: dict, role: str, model: str, host: str, proxy: str,
         env.pop(key, None)
     env["GLOO_SOCKET_IFNAME"] = os.environ.get("MORI_SOCKET_IFNAME", "")
     env["VLLM_HOST_IP"] = host
-    env["PYTHONPATH"] = str(Path(__file__).parent) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    if not stock:
+        env["PYTHONPATH"] = str(Path(__file__).parent) + os.pathsep + os.environ.get("PYTHONPATH", "")
     if "C48_P_PP_MQ_CHUNKS" in env:
         env["PYTHONPATH"] = str(Path(__file__).parent / "pp_ring") + os.pathsep + env["PYTHONPATH"]
     env["C48_DIAG_ROLE"] = role
@@ -98,7 +103,6 @@ def main() -> None:
     options.output.parent.mkdir(parents=True, exist_ok=True)
     if options.execute:
         import vllm
-        from pd_c48_port_patch import verify_port_patch
         record["vllm_file"] = vllm.__file__
         record["versions"] = {}
         for name in ("vllm", "torch", "triton", "aiter", "mori", "amd-aiter", "amd_mori", "fastsafetensors", "lmcache",
@@ -107,11 +111,19 @@ def main() -> None:
                 record["versions"][name] = importlib.metadata.version(name)
             except importlib.metadata.PackageNotFoundError:
                 record["versions"][name] = None
-        engine = "3966924d5" if "-n3966-" in config["name"] else "81198e97b"
+        engine = config.get("stock_vllm") or ("3966924d5" if "-n3966-" in config["name"] else "81198e97b")
         assert engine in record["versions"]["vllm"], record["versions"]
-        record["engine_startup_patch"] = verify_port_patch(Path(vllm.__file__).parent)
-        from pd_c48_quant_patch import verify_quant_patch
-        record["online_quant_loading_patch"] = verify_quant_patch(Path(vllm.__file__).parent)
+        if "stock_vllm" in config:
+            store = Path(vllm.__file__).parent / "distributed/mooncake_store.py"
+            record["mooncake_store_sha256"] = hashlib.sha256(store.read_bytes()).hexdigest()
+            # Stock MooncakeStoreConfig ignores an unknown device_name_per_gpu instead of failing.
+            assert ("device_name_per_gpu" in store.read_text()) == (
+                "device_name_per_gpu" in config["mooncake"].get("store", {})), store
+        else:
+            from pd_c48_port_patch import verify_port_patch
+            from pd_c48_quant_patch import verify_quant_patch
+            record["engine_startup_patch"] = verify_port_patch(Path(vllm.__file__).parent)
+            record["online_quant_loading_patch"] = verify_quant_patch(Path(vllm.__file__).parent)
         record["loading_memory_evidence"] = {"interval_seconds": 2, "active_only_during_load_model": True}
         record["gpu_state_before_worker_start"] = {}
         command = shutil.which("rocm-smi")

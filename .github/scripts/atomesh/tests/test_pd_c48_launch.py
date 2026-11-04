@@ -132,6 +132,22 @@ class LaunchTest(unittest.TestCase):
                 self.assertEqual(mc["mooncake"]["store"]["protocol"], "rdma")
                 self.assertEqual(mc["mooncake"]["store"]["local_buffer_size"], 64 << 20)
 
+    def test_stock_cases_load_no_harness_code(self):
+        cells = {"NUMA0": {"device_name": "rdma0,rdma1,rdma2,rdma3"},
+                 "PERGPU": {"device_name_per_gpu": [f"rdma{i}" for i in range(8)]}}
+        for cell, nics in cells.items():
+            case = json.loads((GAP / f"V-STOCK40941-C88-{cell}-MC.json").read_text())
+            self.assertNotIn("wheel", case["mooncake"])
+            self.assertEqual({k: v for k, v in case["mooncake"]["store"].items() if k.startswith("device_name")}, nics)
+            for role in ("prefill", "decode"):
+                argv, env = render(case, role, *ADDR)
+                flags = " ".join(argv)
+                for patched in ("--worker-cls", "--scheduler-cls", "--quantization-config", "pd_c48"):
+                    self.assertNotIn(patched, flags)
+                self.assertNotIn("PYTHONPATH", env)
+                self.assertFalse([k for k in case["roles"][role]["env"] if k.startswith("C48_")])
+                self.assertNotIn("MC_TE_FILTERS", env)
+
     def test_mooncake_hca_follows_physical_gpu(self):
         sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))
         from pd_c48_worker import mooncake_hca
@@ -462,6 +478,7 @@ class LaunchTest(unittest.TestCase):
         import tempfile
         from unittest import mock
         import pd_c48_worker
+        import store_memory_prep
         worker = types.SimpleNamespace(
             vllm_config=types.SimpleNamespace(model_config=types.SimpleNamespace(model="/m/a/K3"),
                                               speculative_config=types.SimpleNamespace(model="/m/b/D")),
@@ -483,7 +500,7 @@ class LaunchTest(unittest.TestCase):
             dropped = []
             sys.modules["drop_page_cache"] = types.SimpleNamespace(drop_page_cache=dropped.append)
             with mock.patch.dict(os.environ, env), mock.patch.object(pd_c48_worker, "Path", fake_path), \
-                    mock.patch.object(subprocess, "run") as run:
+                    mock.patch.object(store_memory_prep, "Path", fake_path), mock.patch.object(subprocess, "run") as run:
                 pd_c48_worker.prepare_store_memory(worker)
                 pd_c48_worker.prepare_store_memory(worker)
             del sys.modules["drop_page_cache"]

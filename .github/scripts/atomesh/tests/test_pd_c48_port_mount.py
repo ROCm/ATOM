@@ -55,6 +55,21 @@ def mounts(case, root=REPO):
 
 
 class PortMountTest(unittest.TestCase):
+    def test_stock_cases_mount_only_the_pr_under_test(self):
+        rc, numa0 = mounts("V-STOCK40941-C88-NUMA0-MC")
+        self.assertEqual((rc, [m for m in numa0 if m]), (0, []))
+        rc, pergpu = mounts("V-STOCK40941-C88-PERGPU-MC")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(pergpu), 1)
+        self.assertIn("/pr65076/mooncake_store.py,target=/usr/local/lib/python3.12/dist-packages/vllm/distributed/"
+                      "mooncake_store.py,readonly", pergpu[0])
+        with tempfile.TemporaryDirectory() as temp:
+            gap = Path(temp) / ".github/benchmark/c48-model-gap"
+            shutil.copytree(REPO / ".github/benchmark/c48-model-gap", gap)
+            with (gap / "n40941f2c/pr65076/mooncake_store.py").open("a") as handle:
+                handle.write("\n")
+            self.assertEqual(mounts("V-STOCK40941-C88-PERGPU-MC", temp)[0], 2)
+
     def test_shared_prefix_store_overlay_is_scoped_and_pinned(self):
         base = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C72"
         rc, normal = mounts(base + "-MC")
