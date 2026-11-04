@@ -90,6 +90,8 @@ def check_fail_classes():
 
 
 WORKFLOW = HERE.parents[2] / ".github" / "workflows" / "atom-review-bot.yml"
+FETCH = HERE / "fetch.sh"
+WORKER = HERE / "prompts" / "worker.md"
 
 
 def _notify_mod():
@@ -191,6 +193,51 @@ def check_no_self_trigger():
               + (f" (missing: {unguarded})" if unguarded else " (no vars.ATOM_BOT_LOGIN)"))
         return 1
     print("\u2705 the gate excludes every identity this bot has spoken as")
+    return 0
+
+
+def check_prompt_artifacts():
+    """Every artifact the worker prompt promises is one fetch.sh actually writes.
+
+    check_prompts has always compared prompt text against SKILL.md. That misses the
+    contract that matters more at run time: the prompt tells the worker what is in $WORK,
+    and nothing checked that against the code that fills $WORK. worker.md named
+    struct_abi.txt, which no step has ever produced -- so every review began from a
+    prompt that lied about its own inputs, and the worker either hunted a file that was
+    never there or silently did without. fetch.sh's own comment states the rule it then
+    kept only for itself: "Naming a file that was not written sends the reviewer looking
+    for it."
+
+    The authority is fetch.sh's `artifacts:` line, which is what the run prints.
+    """
+    miss = _missing(FETCH, WORKER)
+    if miss:
+        print(f"\u23ed\ufe0f  check_prompt_artifacts: skipped \u2014 not yet built: "
+              f"{[q.name for q in miss]}")
+        return 0
+    fetch = FETCH.read_text(encoding="utf-8")
+    m = re.search(r'echo "artifacts: (.*?)"\n', fetch, re.S)
+    if not m:
+        print("\u274c fetch.sh no longer prints an `artifacts:` line to check against")
+        return 1
+    produced = set(re.findall(r"[A-Za-z0-9_]+\.(?:txt|json)", m.group(1)))
+    # Only the Materials paragraph -- the one that says what $WORK HOLDS. Filenames appear
+    # elsewhere in the prompt for the opposite reason (independent.txt is named to tell the
+    # worker NOT to write it), and a check that cannot tell a promise from a prohibition
+    # reports the prompt's clearest instruction as a defect.
+    worker = WORKER.read_text(encoding="utf-8")
+    held = re.search(r"`\{\{WORK\}\}` holds all of Step 1's output:(.*?)\n\n", worker, re.S)
+    if not held:
+        print("\u274c worker.md no longer states what {{WORK}} holds, so nothing pins the "
+              "prompt to the artifacts Step 1 writes")
+        return 1
+    promised = set(re.findall(r"`([A-Za-z0-9_]+\.(?:txt|json))`", held.group(1)))
+    phantom = sorted(promised - produced)
+    if phantom:
+        print(f"\u274c worker.md promises {phantom}, which Step 1 never writes -- the worker "
+              "will hunt for a file that is not there")
+        return 1
+    print(f"\u2705 every artifact the worker prompt names is one Step 1 writes ({len(promised)})")
     return 0
 
 
@@ -418,6 +465,7 @@ def main():
     bad += check_budget_fits()
     bad += check_owner_fallbacks()
     bad += check_no_self_trigger()
+    bad += check_prompt_artifacts()
     bad += check_notified_handoff()
     bad += check_runner_label_exclusive()
     bad += check_publish_needs_post_flag()

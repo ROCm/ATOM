@@ -96,11 +96,14 @@ the same finding's sentence or drop them — `at most 5 findings` already forces
 
 # 2. Materials
 
-`{{WORK}}` holds all of Step 1's output: `pr.diff`, `pr_meta.json`, `rules.txt`, `rules_expanded.txt`,
-`applies.txt`, `merge_target.txt`, `guards.txt`, `siblings.txt`, `symbols.txt`, `twins.txt`,
-`test_quality.txt`, `kernel_tests.txt`, `ci_coverage.txt`, `perf_claims.txt`, `struct_abi.txt`,
-`comment_only.txt`, `evidence.txt`, `validation_requirement.json`,
-plus `merge-target/` (the base-side worktree) and `head/` (the PR head file tree).
+`{{WORK}}` holds all of Step 1's output: `pr.diff`, `pr_meta.json`, `base_head.txt`, `rules.txt`,
+`rules_expanded.txt`, `applies.txt`, `merge_target.txt`, `guards.txt`, `siblings.txt`, `symbols.txt`,
+`twins.txt`, `test_quality.txt`, `kernel_tests.txt`, `ci_coverage.txt`, `perf_claims.txt`,
+`comment_only.txt`, `flydsl_bounds.txt`, `agents.txt`, `validation_requirement.json`,
+`auto_validation_outcome.txt`, and — only when a guard or an API signature actually changed —
+`evidence.txt`, plus `merge-target/` (the base-side worktree) and `head/` (the PR head file tree).
+Step 1 prints the list it actually wrote; that print is the authority, and `check_prompts.py`
+fails if this paragraph names a file Step 1 does not produce.
 
 **Both worktrees are read-only**: do not write into them or create symlinks pointing at them. To build an experiment sandbox, make a new directory under `/tmp`.
 

@@ -96,5 +96,8 @@ if npass != 7:
 # step gets forgotten" is exactly why #4860 sat unstaged in the worktree. Remind explicitly
 # and point at the breakpoint detector.
 print(
-    f"  ↳ not landed yet: git add reports/PR-{pr}/ && git commit to finish."
+    # reports/ is gitignored: a card is published to the PR, not committed to the repo.
+    # The old instruction told the reader to run a command this skill's own .gitignore
+    # refuses, which is the same prompt-vs-reality drift check_prompt_artifacts exists for.
+    f"  ↳ not published yet: python3 _publish.py {pr} --post (dry-run without --post)."
 )

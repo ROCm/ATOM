@@ -44,7 +44,7 @@ use the already-merged implementation in `merge-target/` to judge whether it is 
 check the time order of the PR base vs the relevant commits — "the author got it wrong" and "the PR is stale" are two different things;
 confirm the trigger condition is actually reachable.
 
-**Measure it for real when you can** — the box has MI300X (gfx942) GPUs. Running once beats reading ten times.
+**Read it for real when you can** — resolve the claim against the actual files in `merge-target/` and `head/`, and against what the diff's own hunks say, rather than against your memory of how the code usually looks. Do NOT execute the PR's code to settle a finding: you run with `--dangerously-skip-permissions` over content the PR author controls, on a self-hosted box, and this repo is public — the same reason this pipeline refuses to auto-run a PR's tests without a separate, gated validator.
 
 ---
 
