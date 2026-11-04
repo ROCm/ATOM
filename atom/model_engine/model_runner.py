@@ -4246,7 +4246,7 @@ class ModelRunner:
                     if tr_hybrid and (
                         sp_local_len(running_tokens)
                         in TokenGraph.captured_sizes("decode")
-                        or self._skip_token_bucket(running_tokens)
+                        or self._skip_token_bucket(sp_local_len(running_tokens))
                     ):
                         continue
                     # Names the capture trace this iteration will export. Set
