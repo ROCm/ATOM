@@ -23,8 +23,9 @@ from test_lmcache_mp_async_threads import (
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
+from atom.model_engine.offload_prefetch import OffloadPrefetch
 from atom.model_engine.prefill_delayer import PrefillDecision
-from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.scheduler import Admit, Scheduler
 from atom.model_engine.sequence import SequenceStatus
 
 META = object()
@@ -37,6 +38,7 @@ class _Connector(OffloadSchedulerMixin):
     is_producer = False
     is_offload = True
     chunk_size = 4
+    supports_async_lookup = True
 
     def __init__(self):
         self.ready = True
@@ -56,6 +58,9 @@ class _Connector(OffloadSchedulerMixin):
     def lookup_ready(self, seq):
         return self.ready and seq.id not in self.not_ready_ids
 
+    def take_ready_lookup(self, seq):
+        return self.lookup_ready(seq)
+
     def get_num_new_matched_tokens(self, seq):
         return self.match
 
@@ -67,11 +72,6 @@ class _Connector(OffloadSchedulerMixin):
 
     def cancel_preadmission(self, seq):
         self.cancelled.append(seq.id)
-
-    def lookup_guard(self):
-        import contextlib
-
-        return contextlib.nullcontext()
 
     def build_connector_meta(self):
         return META
@@ -129,6 +129,9 @@ def _make(monkeypatch, seq_factory, n=1, blocks=100, **env):
         )
     )
     sched.kv_connector = _Connector()
+    # Built here: `__init__` saw MockConfig's connector, which answers no
+    # async lookup.
+    sched._prefetch = OffloadPrefetch(sched, 0.8)
     delayer = _Delayer()
     sched.set_prefill_delayer(delayer)
     seqs = [seq_factory(list(range(16))) for _ in range(n)]
@@ -191,59 +194,130 @@ def test_loaded_request_is_not_promoted_ahead_of_earlier_arrivals(
     # would have moved up; a prefetched one keeps its place
 
 
-def test_loaded_request_passes_a_head_blocked_on_resources(monkeypatch, seq_factory):
-    """A head that cannot allocate, or finds every parked-load slot taken, waits
-    on what finished prefetches hold: they pass it whatever is running.
-    Otherwise they keep their place."""
-    sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
+def _fire_blocked_on(sched, delayer, seq, monkeypatch):
+    """A FIRE whose admission stops at `seq` for want of KV blocks."""
+    real = sched.block_manager.can_allocate
+
+    def can_allocate(s, *a, **k):
+        return -1 if s is seq else real(s, *a, **k)
+
+    monkeypatch.setattr(sched.block_manager, "can_allocate", can_allocate)
+    delayer.allow = True
+    sched.schedule()
+    delayer.allow = False
+    monkeypatch.setattr(sched.block_manager, "can_allocate", real)
+
+
+def test_loaded_request_passes_admission_stuck_on_resources(monkeypatch, seq_factory):
+    """Finished prefetches move up only when admission last stopped for KV
+    blocks or a parked-load slot (Phase 2's own record), which they hold and
+    release only by running. Otherwise they keep their place."""
+    sched, delayer, (a, b) = _make(monkeypatch, seq_factory, n=2)
     sched.kv_connector.not_ready_ids = {a.id}
     sched.schedule()  # b parks with its prefetch, a waits
     sched.finished_recving_kv_req_ids.append(b.id)
-    sched.running.append(object())  # something runs: no special case for it
-
     sched._promote_ready_remote_kv_requests()
-    assert list(sched.waiting) == [a, b]  # a can allocate: order kept
+    assert list(sched.waiting) == [a, b]  # nothing stuck: order kept
 
-    monkeypatch.setattr(sched.block_manager, "can_allocate_memoized", lambda s: -1)
-    sched._promote_ready_remote_kv_requests()
-    assert list(sched.waiting) == [b, a]
-
-    monkeypatch.undo()
-    sched.waiting.rotate()  # back to [a, b]
-    # Phase 2's slot test counts running requests too.
-    sched._num_parked_remote_kv = sched.max_num_seqs - len(sched.running)
+    sched.kv_connector.not_ready_ids = set()
+    sched.kv_connector.match = (0, False)  # a prefills locally
+    _fire_blocked_on(sched, delayer, a, monkeypatch)
+    assert sched._blocked_head == a.id
+    assert list(sched.waiting) == [a, b]  # recorded at this FIRE, not yet used
     sched._promote_ready_remote_kv_requests()
     assert list(sched.waiting) == [b, a]
 
 
-def test_a_resume_head_is_not_probed_or_passed(monkeypatch, seq_factory):
-    """A head that already holds its blocks (a finished load requeued for
-    budget) is not blocked on resources, and probing it would rewrite its
-    replay flags: finished prefetches keep their place."""
+def test_a_failed_prefetch_back_to_waiting_is_forgotten(monkeypatch, seq_factory):
+    """A prefetched joint load that fails and cannot be disowned goes back to
+    plain `waiting` holding nothing: it is no longer a prefetch, and an
+    admission stuck on it lets the finished prefetches behind it run."""
+    sched, delayer, (a, b) = _make(monkeypatch, seq_factory, n=2)
+    sched.schedule()  # both park
+    bm = sched.block_manager
+    a.offload_joint.boundary_tokens = 8
+    monkeypatch.setattr(bm, "retreat_joint_to_hbm", lambda s: False)
+    monkeypatch.setattr(bm, "disown_claimed_prefix", lambda s: False)
+    sched.failed_recving_kv_req_ids.append(a.id)
+    sched.finished_recving_kv_req_ids.append(b.id)
+
+    sched._promote_ready_remote_kv_requests()
+
+    assert a.status == SequenceStatus.WAITING and len(a.block_table) == 0
+    assert not sched._prefetch.holds(a)
+    assert sched._prefetch.holds(b) and b.offload_loaded
+    assert list(sched.waiting) == [a, b]
+    _fire_blocked_on(sched, delayer, a, monkeypatch)
+    assert sched._blocked_head == a.id
+    sched._promote_ready_remote_kv_requests()
+    assert list(sched.waiting) == [b, a]
+
+
+def test_promotion_never_probes(monkeypatch, seq_factory):
     sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
     sched.kv_connector.not_ready_ids = {a.id}
     sched.schedule()
     sched.finished_recving_kv_req_ids.append(b.id)
-    a.offload_loaded = True
-    a.block_table = [0]  # a resume holds its blocks
+    sched._blocked_head = a.id
 
-    def no_probe(_seq):
-        raise AssertionError("a resume must not be probed")
+    def no_probe(*_a, **_k):
+        raise AssertionError("promotion must not probe")
 
     monkeypatch.setattr(sched.block_manager, "can_allocate_memoized", no_probe)
-    sched._num_parked_remote_kv = sched.max_num_seqs
+    monkeypatch.setattr(sched.block_manager, "can_allocate", no_probe)
     sched._promote_ready_remote_kv_requests()
-    assert list(sched.waiting) == [a, b]
+    assert list(sched.waiting) == [b, a]
 
 
-def test_head_peek_skips_a_failed_load_that_may_park_again(setup):
+def test_a_finished_load_is_resolved_once_at_the_top_of_the_tick(setup):
+    """Resolved before anything sizes the tick's prefill work: from then on
+    the delayer's probes see an ordinary resume (main's rule), and a load in
+    flight is no prefill work."""
     sched, _, seq = setup
     sched.schedule()  # parks with its prefetch
+    assert not sched._can_admit_head_prefill()
+    assert next(sched._waiting_prefills(), None) is None
+    sched.finished_recving_kv_req_ids.append(seq.id)
+    seq.offload_loaded_tokens = 12
+    assert not sched._can_admit_head_prefill()  # not resolved yet
+
+    sched._promote_ready_remote_kv_requests()
+
+    assert seq.status == SequenceStatus.WAITING and seq.offload_loaded
+    assert sched.finished_recving_kv_req_ids == []
+    assert sched._can_admit_head_prefill()
+    assert sched._waiting_new_token_count() == len(seq) - 12
+
+
+def test_prefetch_off_keeps_mains_delayer_signal(monkeypatch, seq_factory):
+    """Prefetch off, offload tier: a failed joint load that re-parks for its
+    own state load is no prefill work, before or after it is resolved; and a
+    P/D consumer's finished receive is not resolved early (it decodes)."""
+    sched, delayer, (seq,) = _make(monkeypatch, seq_factory)
+    sched._prefetch = None
+    delayer.allow = True
+    sched.schedule()  # Phase 2 parks it
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    delayer.allow = False
+    seq.offload_joint.boundary_tokens = 8
+    seq.offload_joint.load_hash = 7
+    monkeypatch.setattr(sched.block_manager, "retreat_joint_to_hbm", lambda s: True)
     sched.failed_recving_kv_req_ids.append(seq.id)
     assert not sched._can_admit_head_prefill()
-    sched.failed_recving_kv_req_ids.clear()
+    assert next(sched._waiting_prefills(), None) is None
+
+    sched._promote_ready_remote_kv_requests()
+
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert not sched._can_admit_head_prefill()
+    assert next(sched._waiting_prefills(), None) is None
+    assert sched._local_prefill_pending_work()[0] is False
+
+    sched.kv_connector.is_offload = False
     sched.finished_recving_kv_req_ids.append(seq.id)
-    assert sched._can_admit_head_prefill()
+    sched._promote_ready_remote_kv_requests()
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert sched.finished_recving_kv_req_ids == [seq.id]
 
 
 def test_prefetch_waits_for_a_producer_only_as_phase_2_would(setup, monkeypatch):
@@ -259,11 +333,46 @@ def test_prefetch_waits_for_a_producer_only_as_phase_2_would(setup, monkeypatch)
     assert calls == [] and sched._prefetch.holds(seq)
 
 
+def test_a_producer_wait_is_retried_later_without_touching_the_tier(setup, monkeypatch):
+    sched, _, seq = setup
+    sched._local_prefill_coalescing = True
+    asked = []
+    conn = sched.kv_connector
+    take = conn.take_ready_lookup
+    conn.take_ready_lookup = lambda s: asked.append(s.id) or take(s)
+    monkeypatch.setattr(sched, "_wait_for_inflight_prefix", lambda *a, **k: True)
+    sched.schedule()
+    assert asked == [] and not sched._prefetch.holds(seq)
+    retry = sched._prefetch.skip_until[seq.id]
+    assert retry == sched._schedule_tick + OffloadPrefetch.RETRY_TICKS
+    sched.schedule()
+    assert asked == []  # not looked at again before then
+
+
+def test_a_local_admission_is_kept_as_a_resume_in_place(monkeypatch, seq_factory):
+    """The connector refuses the load after `allocate`: the prefetch keeps the
+    admission (no take-back) and the request resumes in place at its hit."""
+    sched, delayer, (a, b) = _make(monkeypatch, seq_factory, n=2)
+    sched.kv_connector.not_ready_ids = {a.id}
+    sched.kv_connector.parks = False
+    sched.schedule()
+    assert b.status == SequenceStatus.WAITING and len(b.block_table) > 0
+    assert sched._is_offload_prefill_resume(b)
+    assert sched._prefetch.holds(b) and sched.kv_connector.cancelled == []
+    assert sched._num_parked_remote_kv == 0
+    assert list(sched.waiting) == [a, b]
+
+    sched.kv_connector.not_ready_ids = set()
+    sched.kv_connector.match = (0, False)
+    delayer.allow = True
+    _, scheduled = sched.schedule()
+    assert list(scheduled) == [a.id, b.id]
+    assert sched.kv_connector.allocs.count(b.id) == 1
+
+
 def test_requeue_cancels_the_pre_admission(setup, monkeypatch):
     """A REQUEUE (a state load whose disown cannot be backed) gives the
     connector's pre-admission back, for Phase 2 as for the prefetch."""
-    from atom.model_engine.offload_prefetch import Admit
-
     sched, _, seq = setup
     bm = sched.block_manager
     seq.offload_joint.load_hash = 7
@@ -275,34 +384,14 @@ def test_requeue_cancels_the_pre_admission(setup, monkeypatch):
     assert len(seq.block_table) == 0
 
 
-def test_new_token_count_counts_a_finished_load_from_its_resume(setup):
-    sched, _, seq = setup
-    sched.schedule()  # parks with its prefetch
-    sched.finished_recving_kv_req_ids.append(seq.id)
-    seq.offload_loaded_tokens = 12
-    assert sched._waiting_new_token_count() == len(seq) - 12
-
-
-def test_finished_disagg_consumer_load_is_not_prefill_work(setup):
-    """A disaggregation consumer's finished load goes straight to decode."""
-    sched, _, seq = setup
-    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
-    sched.finished_recving_kv_req_ids.append(seq.id)
-    assert next(sched._waiting_prefills(), None) is seq  # offload: prefills
-    sched.kv_connector.is_offload = False
-    assert next(sched._waiting_prefills(), None) is None
-    sched.failed_recving_kv_req_ids.append(seq.id)
-    assert next(sched._waiting_prefills(), None) is seq  # failed: recomputes
-
-
 def test_loaded_request_prefills_only_on_a_fire(setup):
     sched, delayer, seq = setup
     sched.schedule()  # HOLD: parks and ships the load
     sched.finished_recving_kv_req_ids.append(seq.id)
 
-    batch, _ = sched.schedule()  # still HOLD
+    batch, _ = sched.schedule()  # still HOLD: resolved, not prefilled
     assert batch.total_seqs_num_prefill == 0
-    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert seq.status == SequenceStatus.WAITING and seq.offload_loaded
 
     delayer.allow = True
     batch, scheduled = sched.schedule()  # FIRE: resumes as an offload prefill
@@ -338,13 +427,13 @@ def test_watermark_stops_prefetch_allocation_and_the_request_waits_for_the_fire(
     monkeypatch, seq_factory
 ):
     sched, delayer, (seq,) = _make(monkeypatch, seq_factory)
-    sched._prefetch.KV_WATERMARK = 0.01
+    sched._prefetch.max_kv_usage = 0.01
 
     sched.schedule()
 
     assert seq.status == SequenceStatus.WAITING
     assert len(seq.block_table) == 0
-    assert seq.id in sched._prefetch.retry_at
+    assert seq.id in sched._prefetch.skip_until
     # Back to the old path: the FIRE's admission parks it as before.
     delayer.allow = True
     sched.schedule()
@@ -383,39 +472,36 @@ def test_probe_looks_past_prefetches_still_loading(monkeypatch, seq_factory):
     assert all(s.status == SequenceStatus.WAITING_FOR_REMOTE_KVS for s in seqs)
     assert not sched._can_admit_head_prefill()
     sched.finished_recving_kv_req_ids.append(seqs[4].id)
+    sched._promote_ready_remote_kv_requests()  # the top of the next tick
 
+    assert list(sched.waiting) == seqs  # it kept its place
     assert sched._can_admit_head_prefill()
 
 
-def test_lookup_is_checked_and_consumed_under_the_lookup_guard(setup):
-    """The answer `lookup_ready` saw must still be there when the admission
-    consumes it: both run inside the connector's lookup guard."""
+def test_the_tier_answer_is_taken_last(setup):
+    """Request-only checks and the HBM probe come first; the answer is taken
+    (`take_ready_lookup`) only right before it is used."""
     sched, _, _seq = setup
     events = []
     conn = sched.kv_connector
-
-    class _Guard:
-        def __enter__(self):
-            events.append("enter")
-
-        def __exit__(self, *exc):
-            events.append("exit")
-
-    conn.lookup_guard = lambda: _Guard()
-    ready, match = conn.lookup_ready, conn.get_num_new_matched_tokens
-    conn.lookup_ready = lambda s: events.append("ready") or ready(s)
+    take, match = conn.take_ready_lookup, conn.get_num_new_matched_tokens
+    probe = sched._probe_hbm_prefix
+    sched._probe_hbm_prefix = lambda s: events.append("probe") or probe(s)
+    conn.take_ready_lookup = lambda s: events.append("take") or take(s)
     conn.get_num_new_matched_tokens = lambda s: events.append("match") or match(s)
 
     sched.schedule()
 
-    i = events.index("enter")
-    assert events[i : i + 4] == ["enter", "ready", "match", "exit"]
+    i = events.index("take")
+    assert events[:i] == ["probe"] and events[i : i + 2] == ["take", "match"]
 
 
 # -- lookup driver thread -------------------------------------------------------
 
 
-def test_lookup_ready_in_lookup_thread_mode(fake_lmcache_modules):  # noqa: F811
+def test_lookup_ready_and_take_in_lookup_thread_mode(
+    fake_lmcache_modules,  # noqa: F811
+):
     """With the lookup driver thread an answered lookup reads as ready, an
     unanswered one does not, and a consumed one stops reading as ready."""
     fake = _PerRequestClient(chunks=2)
@@ -425,8 +511,6 @@ def test_lookup_ready_in_lookup_thread_mode(fake_lmcache_modules):  # noqa: F811
     sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
-    sched._shipped_tokens = {}
-    sched._shipped_drops = []
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client
@@ -447,8 +531,12 @@ def test_lookup_ready_in_lookup_thread_mode(fake_lmcache_modules):  # noqa: F811
         # No scheduler pump ran: the driver thread alone answered it.
         assert sched.lookup_ready(seq)
         assert not sched.lookup_pending(seq)
-        assert client.lookup(list(range(10)), "1") == 2 * CHUNK
+        # Taken in one step under the client's lock, and then held.
+        assert sched.take_ready_lookup(seq)
+        assert sched._lookup_results["1"] == (seq, 2 * CHUNK)
+        assert not client.has_answer("1")
         sched._lookup_results.pop("1", None)
         assert not sched.lookup_ready(seq)  # consumed
+        assert not sched.take_ready_lookup(seq)
     finally:
         client.close()

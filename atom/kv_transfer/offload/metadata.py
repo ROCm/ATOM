@@ -179,11 +179,6 @@ class LMCacheReqMeta:
     # A save covering KV this step's forward computes: the worker submits it
     # behind that forward (`after_forward`) instead of before it.
     after_forward: bool = False
-    # Incremental token shipping (LMCache MP): when >= 0, `token_ids` holds
-    # only tokens [token_base, ...) past the prefix the worker already holds
-    # for this request, and the transfer covers tokens [0, token_end).
-    token_base: int = -1
-    token_end: int = -1
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):
@@ -205,14 +200,11 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         "lookup_requests_in_step",
         "state_loads",
         "state_stores",
-        "token_cache_drops",
     )
 
     def __init__(self) -> None:
         super().__init__()
         self.requests: list[LMCacheReqMeta] = []
-        # LMCache MP: req_ids whose worker-held token prefix can be dropped.
-        self.token_cache_drops: list = []
         # req_ids whose worker-side lookup pin can be released this step.
         self.lookup_requests_in_step: list[str] = []
         # (req_id, state_hash, target_group) for the K3 state tier. A separate

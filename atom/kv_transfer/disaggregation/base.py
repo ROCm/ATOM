@@ -18,7 +18,6 @@ Two roles are defined:
 
 from __future__ import annotations
 
-import contextlib
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -125,20 +124,29 @@ class KVConnectorSchedulerBase(ABC):
         """Whether the scheduler may allocate this request and start prefill."""
         return True
 
+    # Whether `take_ready_lookup` can hand over an answered tier lookup
+    # without a round trip (the offload prefetch needs it).
+    supports_async_lookup: bool = False
+
     def lookup_ready(self, seq: Any) -> bool:
-        """Whether `seq`'s tier lookup has answered, so the offload prefetch may
-        admit it without a round trip. No tier, no answer."""
+        """Whether `seq`'s tier lookup has answered. A peek: the answer may
+        still expire before `take_ready_lookup`. No tier, no answer."""
         return False
 
-    def lookup_guard(self) -> Any:
-        """Held across `lookup_ready` and the lookup that consumes the answer,
-        so a lookup driver thread cannot expire and resubmit it in between
-        (which would make the consuming lookup wait)."""
-        return contextlib.nullcontext()
+    def take_ready_lookup(self, seq: Any) -> bool:
+        """Take `seq`'s tier answer for its admission if it has answered,
+        atomically with respect to any lookup driver thread; never waits.
+        True if the answer is now held for the admission."""
+        return False
 
     def cancel_preadmission(self, seq: Any) -> None:
-        """Undo an admission the scheduler takes back before any dispatch. A
-        P/D connector holds nothing it would dispatch for it."""
+        """Undo what `update_state_after_alloc` recorded for `seq` when the
+        scheduler refuses the admission before any dispatch and returns the
+        request to `waiting` (`Admit.REQUEUE`). The default records nothing
+        to undo. A P/D consumer does record a receive (Mooncake's and
+        MoRIIO's `_reqs_need_recv`), but the scheduler refuses an admission
+        after the notification only over an offload tier's state load, which
+        such a consumer never has."""
 
     def abort_send(self, seq: Any) -> None:
         """Retire an unsent abort; streaming senders must wait for reader drain."""

@@ -306,6 +306,25 @@ class _MPLookupClient:
         return lookup_id in self._async_hits
 
     @_locked
+    def take_answer(
+        self,
+        lookup_id: str,
+        tokens: Callable[[], list[int]],
+        before: Callable[[], None] | None = None,
+    ) -> int | None:
+        """Consume an answered async lookup as `lookup` would, under one hold
+        of the lock, so the driver cannot expire and re-ask it in between
+        (`_release_stale`). None, doing nothing, if it has not answered.
+        `tokens` (copying a long prompt is not free) and `before` (what the
+        caller runs ahead of a lookup) are called only once it has."""
+        if lookup_id not in self._async_hits:
+            return None
+        if before is not None:
+            before()
+        # Answered, so not in `_async`: `lookup` returns without waiting.
+        return self.lookup(tokens(), lookup_id)
+
+    @_locked
     def pending_ids(self):
         """Lookups already submitted and not yet consumed (do not mutate)."""
         if self._driver is not None:

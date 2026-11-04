@@ -12,7 +12,6 @@ architecture string participates in the decision.
 
 from __future__ import annotations
 
-import array
 from typing import Any
 
 from atom.kv_transfer.disaggregation.base import (
@@ -91,8 +90,6 @@ class LMCacheMPConnector(KVConnectorBase):
         validated_kv_role(getattr(config, "kv_transfer_config", {}) or {})
         self._config = config
         self._impl: KVConnectorBase | None = None
-        # req id -> the token prefix incremental shipping has delivered.
-        self._token_cache: dict[Any, array.array] = {}
 
     def _require_impl(self) -> KVConnectorBase:
         if self._impl is None:
@@ -147,40 +144,7 @@ class LMCacheMPConnector(KVConnectorBase):
         if self._impl is not None:
             self._impl.close()
 
-    def _resolve_shipped_tokens(self, metadata: Any) -> None:
-        """Rebuild each request's token prefix from incremental shipping."""
-        cache = self._token_cache
-        for req_id in getattr(metadata, "token_cache_drops", None) or ():
-            cache.pop(req_id, None)
-        for req in getattr(metadata, "requests", None) or ():
-            base = getattr(req, "token_base", -1)
-            if base is None or base < 0:
-                continue
-            tokens = cache.get(req.req_id)
-            if tokens is None:
-                tokens = cache[req.req_id] = array.array("q")
-            # The scheduler restarts a request's shipping at 0 only together
-            # with a drop for it in the same metadata (handled above), so any
-            # other length is a desync: chunk keys from it would name the
-            # wrong KV.
-            if len(tokens) != base:
-                raise RuntimeError(
-                    f"LMCache MP token cache for {req.req_id!r} holds "
-                    f"{len(tokens)} tokens, the scheduler shipped from {base}"
-                )
-            tokens.extend(req.token_ids)
-            if len(tokens) < req.token_end:
-                raise RuntimeError(
-                    f"LMCache MP token cache for {req.req_id!r} holds "
-                    f"{len(tokens)} tokens, the transfer needs {req.token_end}"
-                )
-            # An array slice: the transfer spec's `list(...)` is the one
-            # materialization, as with a shipped list.
-            req.token_ids = tokens[: req.token_end]
-            req.token_base = -1
-
     def start_load_kv(self, metadata: Any) -> None:
-        self._resolve_shipped_tokens(metadata)
         self._require_impl().start_load_kv(metadata)
 
     def get_finished(self) -> KVConnectorOutput:
@@ -273,11 +237,15 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
         pending = getattr(self._require_impl(), "lookup_pending", None)
         return bool(pending(seq)) if callable(pending) else False
 
+    @property
+    def supports_async_lookup(self) -> bool:
+        return bool(getattr(self._require_impl(), "supports_async_lookup", False))
+
     def lookup_ready(self, seq: Any) -> bool:
         return self._require_impl().lookup_ready(seq)
 
-    def lookup_guard(self) -> Any:
-        return self._require_impl().lookup_guard()
+    def take_ready_lookup(self, seq: Any) -> bool:
+        return self._require_impl().take_ready_lookup(seq)
 
     def cancel_preadmission(self, seq: Any) -> None:
         self._require_impl().cancel_preadmission(seq)

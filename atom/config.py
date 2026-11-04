@@ -2013,22 +2013,6 @@ def indexer_cp_unsupported_reason(
     return None
 
 
-def default_offload_prefetch(dp_load_balance: str, kv_transfer_config) -> bool:
-    """`Config.offload_prefetch` when unset: on with prefix-spread routing,
-    except under `kv_connector=multi`, whose composite answers no async lookup
-    (a prefetch pass would scan every tick and admit nothing)."""
-    if dp_load_balance != "prefix_spread":
-        return False
-    kvc = kv_transfer_config
-    if isinstance(kvc, dict) and kvc.get("kv_connector") == "multi":
-        logger.info(
-            "Offload prefetch is off under kv_connector=multi; prefix spread "
-            "loads moved prefixes at admission instead"
-        )
-        return False
-    return True
-
-
 @dataclass
 class Config:
     model: str
@@ -2162,17 +2146,20 @@ class Config:
     enable_dp_attention: bool = False
     # DP request-routing strategy used by CoreManager to pick an engine rank:
     # "round_robin" | "least_requests" (default) | "least_tokens" |
-    # "prefix_spread". Only has an
-    # effect when more than one DP engine rank is launched. See
-    # atom/model_engine/engine_core_mgr.py:_select_dp_rank_locked. The literal
+    # "prefix_spread". Only has an effect when more than one DP engine rank is
+    # launched. See atom/model_engine/engine_core_mgr.py:_select_dp_rank_locked
+    # and, for "prefix_spread", atom/model_engine/prefix_spread.py. The literal
     # default must stay in sync with engine_core_mgr.DP_LB_DEFAULT (config.py
     # cannot import it without a cycle: engine_core_mgr imports Config).
     dp_load_balance: str = "least_requests"
     # Offload prefetch (`atom/model_engine/offload_prefetch.py`): start a
-    # waiting request's tier load before its turn. None: on with prefix-spread
-    # DP routing (`--dp-load-balance prefix_spread`), which moves requests onto
-    # ranks that must load their prefix from the tier.
+    # waiting request's tier load before its turn (`--offload-prefetch`).
+    # Unset (None) it follows the configured connector: on when it answers
+    # tier lookups asynchronously (`OffloadTierProfile.async_lookup`).
     offload_prefetch: bool | None = None
+    # No prefetch allocation once it would take the KV pool past this
+    # fraction in use.
+    offload_prefetch_max_kv_usage: float = 0.8
     # MoE expert-parallel layout policy. When True, MoE EP computes ranks in the
     # flattened DP x TP device space (and shared-expert fusion is disabled,
     # because the fused shared expert assumes the per-DP MoE layout). The vLLM
@@ -2725,8 +2712,13 @@ class Config:
         )
 
         if self.offload_prefetch is None:
-            self.offload_prefetch = default_offload_prefetch(
-                self.dp_load_balance, self.kv_transfer_config
+            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+            self.offload_prefetch = KVConnectorFactory.offload_tier(self).async_lookup
+        if not 0.0 < self.offload_prefetch_max_kv_usage <= 1.0:
+            raise ValueError(
+                "offload_prefetch_max_kv_usage must be in (0, 1], got "
+                f"{self.offload_prefetch_max_kv_usage}"
             )
         # After the parse above: the P/D clause reads `kv_role` off
         # `kv_transfer_config`, which arrives from the CLI as a string.
