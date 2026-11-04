@@ -99,8 +99,15 @@ class WeightUpdaterMixin:
         a submodule literally called ``model``, and peeling that would drop a
         prefix the trainer does send.
         """
+        from atom.utils.sp_wrapper import SPModelWrapper
+
         model = self.model
         while True:
+            # Refused, not peeled: reloading SP's MegaMoE experts is unverified.
+            if isinstance(model, SPModelWrapper):
+                raise NotImplementedError(
+                    f"{self.label}: weight update does not support Ulysses SP (-sp)"
+                )
             inner = _unwrap_once(model)
             if inner is None:
                 return model

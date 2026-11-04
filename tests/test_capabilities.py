@@ -126,6 +126,10 @@ def test_features_are_reported_separately_from_methods():
     assert "fp8_weight_update" in rich["features"]
     assert "vocab_masking" in rich["features"]
 
+    sp = _Runner(fp8=True, vocab=151936)
+    sp.config.sequence_parallel_size = 4  # weight updates refuse Ulysses SP
+    assert sp.get_worker_capabilities()["features"] == ["vocab_masking"]
+
 
 def test_fp8_is_claimed_by_the_weights_not_by_the_helper():
     """The helper's existence was the test, and every runner has it, so every

@@ -36,15 +36,17 @@ class CapabilityProviderMixin:
             if callable(getattr(self, name, None))
         )
 
+        config = getattr(self, "config", None)
         features = set()
         # Reported as features rather than inferred by the caller from a method
         # name, because "the method exists" and "the feature works here" differ:
         # an FP8 runner has the same methods as a BF16 one.
         if getattr(self, "_true_vocab_size", 0):
             features.add("vocab_masking")
-        if self._holds_fp8_weights():
+        # Weight updates refuse Ulysses SP (`_sync_target_model`).
+        sp = getattr(config, "sequence_parallel_size", 1)
+        if self._holds_fp8_weights() and sp == 1:
             features.add("fp8_weight_update")
-        config = getattr(self, "config", None)
         parallel = getattr(config, "parallel_config", None)
         return {
             "protocol_version": COLLECTIVE_RPC_PROTOCOL_VERSION,
