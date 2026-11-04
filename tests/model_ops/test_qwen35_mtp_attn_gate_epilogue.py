@@ -21,8 +21,6 @@ import torch
 # The recipe's decode attention split, read when aiter's module is imported.
 os.environ.setdefault("AITER_GFX12_TOKEN_SPLIT", "1")
 os.environ.setdefault("AITER_GFX12_TOKEN_SPLIT_FUSED", "1")
-os.environ.setdefault("AITER_GFX12_TOKEN_SPLIT_MIN_TILES", "16")
-os.environ.setdefault("AITER_GFX12_TOKEN_SPLIT_MAX_TILES", "128")
 
 HEADS, HEAD, PAGE = 4, 256, 128
 CONTEXT = 12000  # tokens of KV a sequence
