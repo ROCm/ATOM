@@ -61,6 +61,8 @@ pub enum AdapterError {
     EngineIdMissing { prefill_url: String, dp_rank: usize },
     #[error("tp_size missing for prefill {prefill_url}")]
     TpSizeMissing { prefill_url: String },
+    #[error("invalid ATOM prefill metadata: {reason}")]
+    InvalidAtomMetadata { reason: String },
     #[error("PairCtx type does not match adapter")]
     CtxTypeMismatch,
 }

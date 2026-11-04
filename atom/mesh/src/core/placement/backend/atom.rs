@@ -62,6 +62,18 @@ impl AtomAdapter {
             })?;
         obj.insert("remote_dp_size".to_string(), json!(ctx.prefill_dp_size));
         obj.insert("remote_tp_size".to_string(), json!(tp_size));
+        if ctx.prefill_backend_routing {
+            let rank = obj.get("dp_rank").and_then(Value::as_u64);
+            if rank.is_none_or(|rank| rank >= ctx.prefill_dp_size as u64) {
+                return Err(AdapterError::InvalidAtomMetadata {
+                    reason: format!(
+                        "backend-routed prefill must return dp_rank in [0, {}), got {:?}",
+                        ctx.prefill_dp_size,
+                        obj.get("dp_rank")
+                    ),
+                });
+            }
+        }
         let remote_dp_rank = obj
             .get("dp_rank")
             .filter(|v| v.is_number())
@@ -103,6 +115,7 @@ pub struct AtomPairCtx {
     pub transfer_id: String,
     pub prefill_url: String,
     pub prefill_dp_size: usize,
+    pub prefill_backend_routing: bool,
     pub prefill_dp_rank: Option<usize>,
     pub decode_dp_rank: Option<usize>,
 }
@@ -118,10 +131,24 @@ impl BackendAdapter for AtomAdapter {
         prefill: &dyn Worker,
         _decode: &dyn Worker,
     ) -> Result<PairCtx, AdapterError> {
+        if prefill.is_dp_aware()
+            && prefill.dp_rank().is_none()
+            && self
+                .prefill_info
+                .chunked_transfer
+                .contains_key(prefill.url())
+        {
+            return Err(AdapterError::InvalidAtomMetadata {
+                reason:
+                    "backend-routed prefill requires non-chunked relay; disable chunked transfer"
+                        .into(),
+            });
+        }
         Ok(Box::new(AtomPairCtx {
             transfer_id: format!("xfer-{}", Uuid::new_v4()),
             prefill_url: prefill.url().to_string(),
             prefill_dp_size: prefill.dp_size().unwrap_or(1),
+            prefill_backend_routing: prefill.is_dp_aware() && prefill.dp_rank().is_none(),
             prefill_dp_rank: prefill.dp_rank(),
             decode_dp_rank: _decode.dp_rank(),
         }))
@@ -190,5 +217,67 @@ impl BackendAdapter for AtomAdapter {
 
     fn correlation_id(&self, ctx: &PairCtx) -> Option<String> {
         downcast(ctx).ok().map(|c| c.transfer_id.clone())
+    }
+}
+
+#[cfg(test)]
+mod backend_routing_tests {
+    use super::*;
+    use crate::core::{DPAwareWorkerBuilder, WorkerType};
+
+    fn pair(chunked: bool) -> (AtomAdapter, impl Worker, impl Worker) {
+        let p = DPAwareWorkerBuilder::new("http://p:8000", 0, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: None,
+            })
+            .backend_rank_selection(true)
+            .build();
+        let d = DPAwareWorkerBuilder::new("http://d:8000", 1, 4)
+            .worker_type(WorkerType::Decode)
+            .build();
+        let mut info = AtomPrefillInfo::default();
+        info.tp_sizes.insert(p.url().into(), 1);
+        if chunked {
+            info.chunked_transfer.insert(p.url().into(), json!({}));
+        }
+        (AtomAdapter::new(Arc::new(info)), p, d)
+    }
+
+    #[test]
+    fn backend_prefill_uses_actual_rank_and_preserves_kv_state_metadata() {
+        let (adapter, p, d) = pair(false);
+        let ctx = adapter.prepare_pair(&p, &d).unwrap();
+        for rank in 0..4 {
+            let mut kv = json!({"dp_rank":rank,"remote_block_ids":[3,8],"remote_swa_block_ids":[2],"remote_slot_index":17,"remote_engine_id":"p-engine","transfer_id":"xfer"});
+            adapter.enrich_decode_kv(&mut kv, &ctx).unwrap();
+            assert_eq!(kv["remote_dp_rank"], rank);
+            assert_eq!(kv["remote_dp_size"], 4);
+            assert_eq!(kv["remote_tp_size"], 1);
+            assert_eq!(kv["remote_slot_index"], 17);
+            assert_eq!(kv["remote_block_ids"], json!([3, 8]));
+            assert_eq!(kv["remote_engine_id"], "p-engine");
+        }
+    }
+
+    #[test]
+    fn backend_prefill_rejects_missing_or_invalid_actual_rank() {
+        let (adapter, p, d) = pair(false);
+        let ctx = adapter.prepare_pair(&p, &d).unwrap();
+        for mut kv in [
+            json!({}),
+            json!({"dp_rank":null}),
+            json!({"dp_rank":-1}),
+            json!({"dp_rank":4}),
+            json!({"dp_rank":1.5}),
+            json!({"dp_rank":"2"}),
+        ] {
+            assert!(adapter.enrich_decode_kv(&mut kv, &ctx).is_err(), "{kv}");
+        }
+    }
+
+    #[test]
+    fn backend_prefill_rejects_chunked_before_dispatch() {
+        let (adapter, p, d) = pair(true);
+        assert!(adapter.prepare_pair(&p, &d).is_err());
     }
 }

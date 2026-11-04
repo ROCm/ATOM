@@ -50,7 +50,7 @@ use crate::{
 
 /// Find workers by URL, supporting both DP-aware (prefix match) and regular (exact match) modes.
 ///
-/// For DP-aware workers, finds all workers with URL prefix `{url}@`.
+/// For DP-aware workers, finds rank workers `{url}@N` or the backend-routed service.
 /// For regular workers, finds the single worker with exact URL match.
 pub(crate) fn find_workers_by_url(
     registry: &WorkerRegistry,
@@ -62,7 +62,12 @@ pub(crate) fn find_workers_by_url(
         registry
             .get_all()
             .iter()
-            .filter(|worker| worker.url().starts_with(&worker_url_prefix))
+            .filter(|worker| {
+                worker.url().starts_with(&worker_url_prefix)
+                    || (worker.is_dp_aware()
+                        && worker.dp_rank().is_none()
+                        && worker.base_url() == url)
+            })
             .cloned()
             .collect()
     } else {
@@ -359,5 +364,34 @@ pub fn create_worker_update_workflow_data(
         app_context: Some(app_context),
         workers_to_update: None,
         updated_workers: None,
+    }
+}
+
+#[cfg(test)]
+mod backend_routing_tests {
+    use super::*;
+    use crate::core::{DPAwareWorkerBuilder, WorkerType};
+    #[test]
+    fn backend_prefill_service_can_be_found_for_update_and_removal() {
+        let registry = WorkerRegistry::new();
+        let p = Arc::new(
+            DPAwareWorkerBuilder::new("http://p:80", 0, 4)
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: None,
+                })
+                .backend_rank_selection(true)
+                .build(),
+        );
+        registry.register(p);
+        for rank in 0..4 {
+            registry.register(Arc::new(
+                DPAwareWorkerBuilder::new("http://d:80", rank, 4).build(),
+            ));
+        }
+        let ps = find_workers_by_url(&registry, "http://p:80", true);
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].dp_rank(), None);
+        assert_eq!(find_workers_by_url(&registry, "http://d:80", true).len(), 4);
+        assert!(find_workers_by_url(&registry, "http://p", true).is_empty());
     }
 }

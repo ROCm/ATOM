@@ -1369,6 +1369,7 @@ mod f_atom_adapter {
             transfer_id: "chunked-id".into(),
             prefill_url: "http://p:8000".into(),
             prefill_dp_size: 2,
+            prefill_backend_routing: false,
             prefill_dp_rank: Some(1),
             decode_dp_rank: None,
         });
@@ -1534,6 +1535,7 @@ mod f_atom_adapter {
             transfer_id: "xfer-test".to_string(),
             prefill_url: "http://p:8000".to_string(),
             prefill_dp_size: 4,
+            prefill_backend_routing: false,
             prefill_dp_rank: Some(2),
             decode_dp_rank: Some(2),
         });
@@ -1588,6 +1590,7 @@ mod f_atom_adapter {
             transfer_id: "x".to_string(),
             prefill_url: "http://unknown:8000".to_string(),
             prefill_dp_size: 1,
+            prefill_backend_routing: false,
             prefill_dp_rank: None,
             decode_dp_rank: None,
         });

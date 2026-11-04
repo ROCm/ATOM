@@ -313,6 +313,17 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        if config.atom_pd_prefill_backend_routing
+            && (config.backend != BackendType::Atom
+                || !config.mode.is_pd_mode()
+                || !config.dp_aware
+                || !matches!(config.connection_mode, crate::core::ConnectionMode::Http)
+                || config.atom_pd_rank_mapping_policy != AtomPdRankMappingPolicy::None)
+        {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "atom_pd_prefill_backend_routing requires ATOM HTTP PD, dp_aware, and rank mapping none".into(),
+            });
+        }
         {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
                 let worker_count = config.mode.worker_count();
@@ -665,5 +676,42 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod backend_routing_tests {
+    use super::*;
+    #[test]
+    fn backend_prefill_config_requires_atom_http_pd_and_no_rank_mapping() {
+        let mut good = RouterConfig::default();
+        good.backend = BackendType::Atom;
+        good.dp_aware = true;
+        good.atom_pd_prefill_backend_routing = true;
+        good.mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        assert!(good.validate().is_ok());
+        let mut bad = good.clone();
+        bad.backend = BackendType::Vllm;
+        assert!(bad.validate().is_err());
+        let mut bad = good.clone();
+        bad.dp_aware = false;
+        assert!(bad.validate().is_err());
+        let mut bad = good.clone();
+        bad.mode = RoutingMode::Regular {
+            worker_urls: vec![],
+        };
+        assert!(bad.validate().is_err());
+        let mut bad = good.clone();
+        bad.atom_pd_rank_mapping_policy = AtomPdRankMappingPolicy::Idx2Idx;
+        assert!(bad.validate().is_err());
+        let mut bad = good.clone();
+        bad.connection_mode = crate::core::ConnectionMode::Grpc { port: None };
+        assert!(bad.validate().is_err());
+        assert!(!RouterConfig::default().atom_pd_prefill_backend_routing);
     }
 }

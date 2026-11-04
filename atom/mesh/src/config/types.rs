@@ -65,6 +65,9 @@ pub struct RouterConfig {
     pub atom_standalone: bool,
     #[serde(default)]
     pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
+    /// Select P services in the router, and let ATOM select their internal DP rank.
+    #[serde(default)]
+    pub atom_pd_prefill_backend_routing: bool,
 
     pub policy: PolicyConfig,
     pub host: String,
@@ -405,6 +408,7 @@ impl Default for RouterConfig {
             connection_mode: ConnectionMode::Http,
             atom_standalone: false,
             atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
+            atom_pd_prefill_backend_routing: false,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,

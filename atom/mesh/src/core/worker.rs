@@ -787,7 +787,7 @@ pub struct DPAwareWorker {
     /// The underlying basic worker
     base_worker: BasicWorker,
     /// DP rank for this worker
-    dp_rank: usize,
+    dp_rank: Option<usize>,
     /// Total DP size
     dp_size: usize,
     /// Base URL without DP suffix
@@ -795,6 +795,12 @@ pub struct DPAwareWorker {
 }
 
 impl DPAwareWorker {
+    /// Used with a base worker whose URL identifies the entire DP service.
+    pub fn with_backend_rank_selection(mut self) -> Self {
+        self.dp_rank = None;
+        self
+    }
+
     /// Create a new DP-aware worker with a pre-configured base worker
     /// This is primarily used by the builder pattern
     pub fn with_base_worker(
@@ -805,7 +811,7 @@ impl DPAwareWorker {
     ) -> Self {
         Self {
             base_worker,
-            dp_rank,
+            dp_rank: Some(dp_rank),
             dp_size,
             base_url,
         }
@@ -887,7 +893,7 @@ impl Worker for DPAwareWorker {
     }
 
     fn dp_rank(&self) -> Option<usize> {
-        Some(self.dp_rank)
+        self.dp_rank
     }
 
     fn dp_size(&self) -> Option<usize> {
@@ -896,10 +902,12 @@ impl Worker for DPAwareWorker {
 
     async fn prepare_request(&self, mut req: serde_json::Value) -> WorkerResult<serde_json::Value> {
         if let Some(map) = req.as_object_mut() {
-            map.insert(
-                "data_parallel_rank".to_string(),
-                serde_json::json!(self.dp_rank),
-            );
+            if let Some(rank) = self.dp_rank {
+                map.insert("data_parallel_rank".to_string(), serde_json::json!(rank));
+            } else {
+                // Backend placement is authoritative for this whole P service.
+                map.remove("data_parallel_rank");
+            }
             Ok(req)
         } else {
             Err(WorkerError::InvalidConfiguration {

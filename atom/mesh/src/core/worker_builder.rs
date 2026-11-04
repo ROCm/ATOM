@@ -245,6 +245,7 @@ pub struct DPAwareWorkerBuilder {
     api_key: Option<String>,
     dp_rank: usize,
     dp_size: usize,
+    backend_rank_selection: bool,
     worker_type: WorkerType,
     connection_mode: ConnectionMode,
     runtime_type: RuntimeType,
@@ -260,6 +261,11 @@ pub struct DPAwareWorkerBuilder {
 }
 
 impl DPAwareWorkerBuilder {
+    pub fn backend_rank_selection(mut self, enabled: bool) -> Self {
+        self.backend_rank_selection = enabled;
+        self
+    }
+
     /// Create a new DP-aware worker builder
     pub fn new(base_url: impl Into<String>, dp_rank: usize, dp_size: usize) -> Self {
         Self {
@@ -267,6 +273,7 @@ impl DPAwareWorkerBuilder {
             api_key: None,
             dp_rank,
             dp_size,
+            backend_rank_selection: false,
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
             runtime_type: RuntimeType::default(),
@@ -294,6 +301,7 @@ impl DPAwareWorkerBuilder {
             api_key: None,
             dp_rank,
             dp_size,
+            backend_rank_selection: false,
             worker_type,
             connection_mode: ConnectionMode::Http,
             runtime_type: RuntimeType::default(),
@@ -395,7 +403,11 @@ impl DPAwareWorkerBuilder {
 
     /// Build the DPAwareWorker instance
     pub fn build(self) -> DPAwareWorker {
-        let worker_url = format!("{}@{}", self.base_url, self.dp_rank);
+        let worker_url = if self.backend_rank_selection {
+            self.base_url.clone()
+        } else {
+            format!("{}@{}", self.base_url, self.dp_rank)
+        };
         let mut builder = BasicWorkerBuilder::new(worker_url)
             .worker_type(self.worker_type)
             .connection_mode(self.connection_mode)
@@ -427,7 +439,13 @@ impl DPAwareWorkerBuilder {
         }
 
         let base_worker = builder.build();
-        DPAwareWorker::with_base_worker(base_worker, self.base_url, self.dp_rank, self.dp_size)
+        let worker =
+            DPAwareWorker::with_base_worker(base_worker, self.base_url, self.dp_rank, self.dp_size);
+        if self.backend_rank_selection {
+            worker.with_backend_rank_selection()
+        } else {
+            worker
+        }
     }
 }
 
@@ -778,5 +796,49 @@ mod tests {
             worker.metadata().labels.get("tier"),
             Some(&"premium".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod backend_routing_tests {
+    use super::*;
+    use crate::core::{Worker, WorkerLoadGuard};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn backend_prefill_has_service_identity_and_decode_keeps_rank() {
+        let p: Arc<dyn Worker> = Arc::new(
+            DPAwareWorkerBuilder::new("http://p:8000", 0, 4)
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: None,
+                })
+                .backend_rank_selection(true)
+                .build(),
+        );
+        assert_eq!(p.url(), "http://p:8000");
+        assert_eq!(p.dp_rank(), None);
+        assert_eq!(p.dp_size(), Some(4));
+        let body = p
+            .prepare_request(json!({"data_parallel_rank": 3, "messages": []}))
+            .await
+            .unwrap();
+        assert!(body.get("data_parallel_rank").is_none());
+        assert_eq!(body["messages"], json!([]));
+        let d = DPAwareWorkerBuilder::new("http://d:8000", 2, 4)
+            .worker_type(WorkerType::Decode)
+            .build();
+        assert_eq!(d.url(), "http://d:8000@2");
+        assert_eq!(
+            d.prepare_request(json!({})).await.unwrap()["data_parallel_rank"],
+            2
+        );
+        let a = WorkerLoadGuard::new(p.clone(), None);
+        let b = WorkerLoadGuard::new(p.clone(), None);
+        assert_eq!(p.load(), 2);
+        drop(a);
+        assert_eq!(p.load(), 1);
+        drop(b);
+        assert_eq!(p.load(), 0);
     }
 }

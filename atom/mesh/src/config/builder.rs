@@ -149,6 +149,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn atom_pd_prefill_backend_routing(mut self, enabled: bool) -> Self {
+        self.config.atom_pd_prefill_backend_routing = enabled;
+        self
+    }
+
     pub fn atom_pd_rank_mapping_policy(mut self, policy: AtomPdRankMappingPolicy) -> Self {
         self.config.atom_pd_rank_mapping_policy = policy;
         self

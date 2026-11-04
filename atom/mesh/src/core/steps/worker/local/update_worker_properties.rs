@@ -98,6 +98,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
 
                 let mut builder =
                     crate::core::DPAwareWorkerBuilder::new(base_url, dp_rank, dp_size)
+                        .backend_rank_selection(worker.dp_rank().is_none())
                         .worker_type(worker.worker_type().clone())
                         .connection_mode(worker.connection_mode().clone())
                         .runtime_type(worker.metadata().runtime_type.clone())

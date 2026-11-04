@@ -25,6 +25,7 @@ const KINDS: [DispatchKind; 3] = [DispatchKind::Atom, DispatchKind::Vllm, Dispat
 struct GatedServer {
     worker: Arc<dyn Worker>,
     entered: Arc<Notify>,
+    request: Arc<Mutex<Option<Value>>>,
     response: Option<oneshot::Sender<Response>>,
     task: JoinHandle<()>,
 }
@@ -37,12 +38,16 @@ impl GatedServer {
         let notify = entered.clone();
         let (tx, rx) = oneshot::channel::<Response>();
         let response = Arc::new(Mutex::new(Some(rx)));
+        let captured = Arc::new(Mutex::new(None));
+        let request = captured.clone();
         let app = Router::new().route(
             "/v1/chat/completions",
-            post(move || {
+            post(move |axum::Json(body): axum::Json<Value>| {
                 let notify = notify.clone();
                 let response = response.clone();
+                let request = request.clone();
                 async move {
+                    *request.lock().await = Some(body);
                     let rx = response.lock().await.take().unwrap();
                     notify.notify_one();
                     rx.await
@@ -54,6 +59,7 @@ impl GatedServer {
         Self {
             worker: Arc::new(BasicWorkerBuilder::new(url).worker_type(role).build()),
             entered,
+            request: captured,
             response: Some(tx),
             task,
         }
@@ -535,4 +541,77 @@ async fn atom_chunked_decode_admission_rejection_cancels_pending_prefill() {
         assert_eq!(p.worker.load(), 0);
         assert_eq!(d.worker.load(), 0);
     }
+}
+
+async fn backend_routed_servers() -> (GatedServer, GatedServer) {
+    let (mut p, mut d) = servers().await;
+    p.worker = Arc::new(
+        crate::core::DPAwareWorkerBuilder::new(p.worker.url(), 0, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: None,
+            })
+            .backend_rank_selection(true)
+            .build(),
+    );
+    d.worker = Arc::new(
+        crate::core::DPAwareWorkerBuilder::new(d.worker.url(), 1, 4)
+            .worker_type(WorkerType::Decode)
+            .build(),
+    );
+    (p, d)
+}
+
+#[tokio::test]
+async fn backend_prefill_relay_tracks_service_and_passes_actual_rank_to_decode() {
+    let (mut p, mut d) = backend_routed_servers().await;
+    let task = dispatch(DispatchKind::Atom, &p, &d, true);
+    p.wait_entered().await;
+    assert_eq!(p.worker.load(), 1);
+    assert_eq!(d.worker.load(), 1);
+    assert!(p
+        .request
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .get("data_parallel_rank")
+        .is_none());
+    p.respond(axum::Json(json!({"kv_transfer_params":{"dp_rank":3,"remote_block_ids":[7],"remote_slot_index":19}})).into_response());
+    d.wait_entered().await;
+    wait_load(&p.worker, 0).await;
+    let body = d.request.lock().await.clone().unwrap();
+    assert_eq!(body["data_parallel_rank"], 1);
+    assert_eq!(body["kv_transfer_params"]["remote_dp_rank"], 3);
+    assert_eq!(body["kv_transfer_params"]["remote_dp_size"], 4);
+    assert_eq!(body["kv_transfer_params"]["remote_slot_index"], 19);
+    let (response, _tx) = stream_response(StatusCode::OK);
+    d.respond(response);
+    let response = result(task).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(d.worker.load(), 1);
+    drop(response);
+    wait_load(&d.worker, 0).await;
+}
+
+#[tokio::test]
+async fn backend_prefill_bad_rank_releases_pair_and_does_not_send_decode() {
+    let (mut p, d) = backend_routed_servers().await;
+    let task = dispatch(DispatchKind::Atom, &p, &d, true);
+    p.wait_entered().await;
+    p.respond(axum::Json(json!({"kv_transfer_params":{}})).into_response());
+    assert!(result(task).await.status().is_server_error());
+    assert_eq!(p.worker.load(), 0);
+    assert_eq!(d.worker.load(), 0);
+    assert!(d.request.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn backend_prefill_cancel_releases_service_and_decode_reservations() {
+    let (p, d) = backend_routed_servers().await;
+    let task = dispatch(DispatchKind::Atom, &p, &d, true);
+    p.wait_entered().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(p.worker.load(), 0);
+    assert_eq!(d.worker.load(), 0);
 }

@@ -714,6 +714,9 @@ impl PDRouter {
             }
             info!("ATOM prefill {} tp_size={}", base_url, tp);
             if let Some(meta) = data.get("chunked_transfer").filter(|v| v.is_object()) {
+                if worker.is_dp_aware() && worker.dp_rank().is_none() {
+                    return Err(format!("{}: backend-routed prefill requires non-chunked relay; disable chunked transfer", base_url));
+                }
                 chunked_transfer.insert(base_url.clone(), meta.clone());
                 chunked_transfer.insert(worker_url.clone(), meta.clone());
             }
