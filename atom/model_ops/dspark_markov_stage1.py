@@ -75,9 +75,11 @@ def markov_logits_tile(
     BLOCK_ROW: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    STORE_EMBED: tl.constexpr,
 ):
     """``base + W1[prev] @ W2^T`` on one (row tile, V tile), fp32, -inf on
-    padded vocab lanes; tile 0 also publishes ``W1[prev]`` to ``embed_out``.
+    padded vocab lanes; with ``STORE_EMBED`` tile 0 also publishes
+    ``W1[prev]`` to ``embed_out`` (the greedy op's confidence head reads it).
 
     The GEMV both stage-1 kernels run (`dspark_markov_argmax`'s and
     `dspark_markov_sample`'s); each keeps only its own tail. ``base``
@@ -104,12 +106,16 @@ def markov_logits_tile(
         )
         # One tile publishes the row for the confidence head; the rest hold
         # the same values and would only write them again.
-        if tile == 0:
-            tl.store(
-                embed_out_ptr + offs_row[:, None] * stride_embed_row + offs_k[None, :],
-                embed,
-                mask=row_mask[:, None] & k_mask[None, :],
-            )
+        # Nested: a constexpr test, then a runtime one.
+        if STORE_EMBED:  # noqa: SIM102
+            if tile == 0:
+                tl.store(
+                    embed_out_ptr
+                    + offs_row[:, None] * stride_embed_row
+                    + offs_k[None, :],
+                    embed,
+                    mask=row_mask[:, None] & k_mask[None, :],
+                )
         # W2^T tile, [BLOCK_K, BLOCK_V]. W2 is stored [V, r] so the rank axis
         # is the contiguous one: each vocab column is one 2*BLOCK_K-byte run.
         w2 = tl.load(

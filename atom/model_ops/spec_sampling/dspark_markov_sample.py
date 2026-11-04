@@ -50,7 +50,6 @@ def _markov_sample_stage1(
     prev_ids_ptr,
     w1_ptr,
     w2_ptr,
-    embed_out_ptr,
     part_val_ptr,
     part_idx_ptr,
     temperatures_ptr,
@@ -63,7 +62,6 @@ def _markov_sample_stage1(
     stride_base_row,
     stride_prev,
     stride_w1_vocab,
-    stride_embed_row,
     stride_w2_vocab,
     stride_s_row,
     min_temperature,
@@ -87,7 +85,7 @@ def _markov_sample_stage1(
         prev_ids_ptr,
         w1_ptr,
         w2_ptr,
-        embed_out_ptr,
+        None,
         tile,
         offs_row,
         offs_v,
@@ -97,12 +95,13 @@ def _markov_sample_stage1(
         stride_base_row,
         stride_prev,
         stride_w1_vocab,
-        stride_embed_row,
+        0,
         stride_w2_vocab,
         0,
         BLOCK_ROW,
         BLOCK_V,
         BLOCK_K,
+        False,
     )
     publish_tile_argmax(
         vals,
@@ -158,13 +157,8 @@ def _dspark_markov_sample_fake(
     seed: torch.Tensor,
     noise_offset: int,
     scratch: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty(
-        base_logits.shape[0],
-        markov_w1.shape[1],
-        dtype=markov_w1.dtype,
-        device=base_logits.device,
-    )
+) -> None:
+    return None
 
 
 class SampleScratch(NamedTuple):
@@ -236,7 +230,7 @@ def dspark_markov_sample(
     seed: torch.Tensor,
     noise_offset: int,
     scratch: torch.Tensor,
-) -> torch.Tensor:
+) -> None:
     """Draw ``x_k`` from the top of ``softmax((base_logits + W1[prev_ids] @
     W2^T) / T)`` and publish exactly the q it was drawn from.
 
@@ -271,9 +265,6 @@ def dspark_markov_sample(
         scratch:              the byte buffer of a
                               `dspark_markov_sample_scratch`, which the call's
                               partials are carved from.
-
-    Returns:
-        ``[B, r]`` ``W1[prev_ids]``, for the same reason the greedy op returns it.
 
     Raises rather than falling back: an eager fallback would draw from the
     global RNG, which TP ranks do not share, and the drafts would fork.
@@ -320,10 +311,8 @@ def dspark_markov_sample(
     why = markov_weights_unsupported(markov_w1, markov_w2)
     if why is not None:
         raise ValueError(f"dspark_markov_sample cannot run: {why}")
-    device = base_logits.device
-    markov_embed = torch.empty(num_rows, rank, dtype=markov_w1.dtype, device=device)
     if num_rows == 0:
-        return markov_embed
+        return
     # Stage 1's GEMV keeps the greedy op's narrow V tile (its accumulator is the
     # MFMA one); the q stages tile wide, because they only stream.
     geometry = markov_launch_geometry(num_rows, vocab_size)
@@ -335,7 +324,6 @@ def dspark_markov_sample(
         prev_ids,
         markov_w1,
         markov_w2,
-        markov_embed,
         work.part_amax_val,
         work.part_amax_idx,
         temperatures,
@@ -348,7 +336,6 @@ def dspark_markov_sample(
         stride_base_row=base_logits.stride(0),
         stride_prev=prev_ids.stride(0),
         stride_w1_vocab=markov_w1.stride(0),
-        stride_embed_row=markov_embed.stride(0),
         stride_w2_vocab=markov_w2.stride(0),
         stride_s_row=s_scratch.stride(0),
         min_temperature=SAMPLER_EPS,
@@ -391,4 +378,3 @@ def dspark_markov_sample(
         position,
         noise_offset,
     )
-    return markov_embed

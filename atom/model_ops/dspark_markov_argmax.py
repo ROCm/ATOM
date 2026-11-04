@@ -129,6 +129,7 @@ def _markov_stage1(
         BLOCK_ROW,
         BLOCK_V,
         BLOCK_K,
+        True,
     )
     publish_tile_argmax(
         vals,
