@@ -5,6 +5,8 @@ Keep the original packed-K and split-K launch policy as a compatibility path.
 The preferred AITER backend owns subsequent tuning and configuration dispatch.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -353,3 +355,304 @@ def gemm_fp8_local(
             KERNEL_NAME="native_blockscale_reduce",
         )
     return output
+
+
+@triton.jit
+def _e8m0_to_f32(code):
+    """E8M0 scale codes (uint8) -> float32 powers of two."""
+    return (code.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _group32_dequant_act_kernel(x_ptr, s_ptr, y_ptr, K: tl.constexpr, G: tl.constexpr):
+    """One group of 32 FP8 activations -> BF16. Decode launches this instead of
+    the eager cast/mul chain, which is several kernels for a few thousand elements."""
+    row = tl.program_id(0)
+    grp = tl.program_id(1)
+    offs = grp * 32 + tl.arange(0, 32)
+    vals = tl.load(x_ptr + row * K + offs).to(tl.float32)
+    code = tl.load(s_ptr + row * G + grp)
+    tl.store(y_ptr + row * K + offs, (vals * _e8m0_to_f32(code)).to(tl.bfloat16))
+
+
+def _dequant_group32_act(x: torch.Tensor, x_scale: torch.Tensor) -> torch.Tensor:
+    """FP8 group32 activations to BF16. ``x``'s last dim is K, contiguous."""
+    k = x.shape[-1]
+    m = x.numel() // k
+    out = torch.empty(x.shape, device=x.device, dtype=torch.bfloat16)
+    if m == 0:
+        return out
+    groups = k // 32
+    flat_x = x.reshape(m, k)
+    # Triton has no pointer type for float8_e8m0fnu; the codes are raw bytes.
+    flat_s = x_scale.view(torch.uint8).reshape(m, groups)
+    flat_y = out.view(m, k)
+    _group32_dequant_act_kernel[(m, groups)](
+        flat_x, flat_s, flat_y, K=k, G=groups, num_warps=1
+    )
+    return out
+
+
+@triton.jit(do_not_specialize=["M"])
+def blockscale_gemm_fp8_bf16_dequant_kernel(
+    A,
+    B,
+    AS,
+    BS,
+    C,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    B_GROUP_N: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+):
+    """gfx942 group32 GEMM: one K=32 group per step, BF16 ``tl.dot`` (K=16 MFMA).
+
+    Do not use ``tl.dot_scaled`` on e4m3: Triton lowers that to the missing
+    ``v_mfma_f32_16x16x32_bf16`` on CDNA3. Stepping by 32 keeps each scale a
+    single broadcast, avoiding a broken multi-group expand.
+    """
+    row = tl.program_id(0) * BM + tl.arange(0, BM)
+    col = tl.program_id(1) * BN + tl.arange(0, BN)
+    groups: tl.constexpr = K // 32
+    ks = tl.arange(0, 32)
+    rows = row[:, None] < M
+    cols = col < N
+    bs_row = col // B_GROUP_N
+
+    acc = tl.zeros((BM, BN), tl.float32)
+    for g in range(0, groups):
+        offs = g * 32 + ks
+        a = tl.load(
+            A + row[:, None] * K + offs[None, :], rows & (offs[None, :] < K), other=0.0
+        ).to(tl.float32)
+        b = tl.load(
+            B + col[:, None] * K + offs[None, :],
+            cols[:, None] & (offs[None, :] < K),
+            other=0.0,
+        ).to(tl.float32)
+        a_code = tl.load(AS + row * groups + g, row < M, other=127)
+        b_code = tl.load(BS + bs_row * groups + g, col < N, other=127)
+        a_bf16 = (a * _e8m0_to_f32(a_code)[:, None]).to(tl.bfloat16)
+        b_bf16 = (b * _e8m0_to_f32(b_code)[:, None]).to(tl.bfloat16)
+        acc = tl.dot(a_bf16, tl.trans(b_bf16), acc=acc)
+    tl.store(C + row[:, None] * N + col[None, :], acc, rows & cols[None, :])
+
+
+@triton.jit(do_not_specialize=["M"])
+def blockscale_batched_gemm_fp8_bf16_dequant_kernel(
+    A,
+    B,
+    AS,
+    BS,
+    C,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    B_GROUP_N: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    stride_ag,
+    stride_bg,
+    stride_asg,
+    stride_bsg,
+    stride_cg,
+):
+    """Batched gfx942 group32 GEMM: one CTA grid covers every LoRA group."""
+    batch = tl.program_id(0)
+    row = tl.program_id(1) * BM + tl.arange(0, BM)
+    col = tl.program_id(2) * BN + tl.arange(0, BN)
+    groups: tl.constexpr = K // 32
+    ks = tl.arange(0, 32)
+    rows = row[:, None] < M
+    cols = col < N
+    bs_row = col // B_GROUP_N
+    A_b = A + batch * stride_ag
+    B_b = B + batch * stride_bg
+    AS_b = AS + batch * stride_asg
+    BS_b = BS + batch * stride_bsg
+    C_b = C + batch * stride_cg
+
+    acc = tl.zeros((BM, BN), tl.float32)
+    for g in range(0, groups):
+        offs = g * 32 + ks
+        a = tl.load(
+            A_b + row[:, None] * K + offs[None, :],
+            rows & (offs[None, :] < K),
+            other=0.0,
+        ).to(tl.float32)
+        b = tl.load(
+            B_b + col[:, None] * K + offs[None, :],
+            cols[:, None] & (offs[None, :] < K),
+            other=0.0,
+        ).to(tl.float32)
+        a_code = tl.load(AS_b + row * groups + g, row < M, other=127)
+        b_code = tl.load(BS_b + bs_row * groups + g, col < N, other=127)
+        a_bf16 = (a * _e8m0_to_f32(a_code)[:, None]).to(tl.bfloat16)
+        b_bf16 = (b * _e8m0_to_f32(b_code)[:, None]).to(tl.bfloat16)
+        acc = tl.dot(a_bf16, tl.trans(b_bf16), acc=acc)
+    tl.store(C_b + row[:, None] * N + col[None, :], acc, rows & cols[None, :])
+
+
+def _select_fp8_bf16_tile(m: int, n: int, k: int, cu_num: int):
+    """Tiles for the BF16-dequant path (K stepped by 32 inside the kernel)."""
+    if m <= 16:
+        return 16, 32, 2, 2
+    if m <= 64:
+        return 32, 32, 2, 2
+    if m <= 256 or -(-m // 64) * -(-n // 64) < cu_num:
+        return 64, 64, 4, 2
+    return 64, 64, 4, 2
+
+
+def _gemm_fp8_bf16_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    weight_group_rows: int,
+    cu_num: int,
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], weight.shape[0]), device=x.device, dtype=dtype)
+
+
+def _group32_host_bf16_gemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    weight_group_rows: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Reference / tiny-M path: e8m0 dequant on device then hipBLAS."""
+    xs = (x_scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
+    ws = (weight_scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
+    xf = x.float().reshape(*x.shape[:-1], -1, 32) * xs[..., None]
+    xf = xf.reshape(x.shape).to(torch.bfloat16)
+    n, k = weight.shape
+    wf = weight.float().reshape(n, -1, 32)
+    if weight_group_rows == 32:
+        ws = ws.repeat_interleave(32, dim=0)
+    elif weight_group_rows != 1:
+        raise ValueError(f"Unsupported weight_group_rows={weight_group_rows}")
+    wf = (wf * ws[:, :, None]).reshape(n, k).to(torch.bfloat16)
+    return torch.nn.functional.linear(xf, wf).to(dtype)
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=_gemm_fp8_bf16_fake)
+def gemm_fp8_bf16_dequant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    weight_group_rows: int,
+    cu_num: int,
+) -> torch.Tensor:
+    """In-kernel e8m0 dequant + BF16 GEMM for arches without MXFP8 MFMA."""
+    n, k = weight.shape
+    m = x.numel() // k
+    output = torch.empty((*x.shape[:-1], n), device=x.device, dtype=dtype)
+    if m == 0:
+        return output
+    # hipBLAS wins the decode-width regime; Triton pays for the weight traffic
+    # once M is large enough that the MFMA path amortizes.
+    # Prefer a weight-side BF16 cache when present (filled once on gfx942 load).
+    cached = getattr(weight, "_atom_group32_bf16_cache", None)
+    if cached is not None:
+        # Decode is a handful of rows: the cast/mul/cast chain is more kernels
+        # than math. One dequant kernel plus hipBLAS. Prefill keeps the bulk
+        # torch cast, which is faster once M is wide.
+        if m <= 32:
+            xf = _dequant_group32_act(x, x_scale)
+        else:
+            xs = (x_scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
+            xf = x.float().reshape(*x.shape[:-1], -1, 32) * xs[..., None]
+            xf = xf.reshape(x.shape).to(torch.bfloat16)
+        return torch.nn.functional.linear(xf, cached).to(dtype)
+
+    # Triton BF16-dequant GEMM is wired above for follow-up tuning; the host
+    # path is the correctness baseline on gfx942 until that kernel matches
+    # hipBLAS across the prefill M range.
+    use_triton = os.environ.get("ATOM_GFX942_GROUP32_TRITON", "0") == "1"
+    if use_triton and m > 16:
+        bm, bn, warps, stages = _select_fp8_bf16_tile(m, n, k, cu_num)
+        blockscale_gemm_fp8_bf16_dequant_kernel[(-(-m // bm), -(-n // bn))](
+            x,
+            weight,
+            x_scale.view(torch.uint8),
+            weight_scale.view(torch.uint8),
+            output,
+            m,
+            n,
+            k,
+            weight_group_rows,
+            bm,
+            bn,
+            num_warps=warps,
+            num_stages=stages,
+            matrix_instr_nonkdim=16,
+        )
+        return output
+    return _group32_host_bf16_gemm(
+        x,
+        weight,
+        x_scale,
+        weight_scale,
+        weight_group_rows=weight_group_rows,
+        dtype=dtype,
+    )
+
+
+def gemm_fp8_bf16_dequant_batched(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    weight_group_rows: int = 32,
+    cu_num: int | None = None,
+) -> torch.Tensor:
+    """Batched [G,M,K] x [G,N,K] group32 GEMM for wo_a on gfx942."""
+    if x.ndim != 3 or weight.ndim != 3:
+        raise ValueError("Batched GEMM expects [G, M, K] activations and weights")
+    g, m, k = x.shape
+    gn, n, wk = weight.shape
+    if g != gn or k != wk:
+        raise ValueError("Batch/K mismatch for batched group32 GEMM")
+    if cu_num is None:
+        cu_num = torch.cuda.get_device_properties(x.device).multi_processor_count
+    out = torch.empty((g, m, n), device=x.device, dtype=dtype)
+    if m == 0 or g == 0:
+        return out
+    bm, bn, warps, stages = _select_fp8_bf16_tile(m, n, k, cu_num)
+    blockscale_batched_gemm_fp8_bf16_dequant_kernel[
+        (g, -(-m // bm), -(-n // bn))
+    ](
+        x,
+        weight,
+        x_scale.view(torch.uint8),
+        weight_scale.view(torch.uint8),
+        out,
+        m,
+        n,
+        k,
+        weight_group_rows,
+        bm,
+        bn,
+        x.stride(0),
+        weight.stride(0),
+        x_scale.stride(0),
+        weight_scale.stride(0),
+        out.stride(0),
+        num_warps=warps,
+        num_stages=stages,
+        matrix_instr_nonkdim=16,
+    )
+    return out

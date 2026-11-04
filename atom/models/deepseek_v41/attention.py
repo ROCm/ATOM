@@ -345,14 +345,133 @@ class Attention(nn.Module):
             num_groups=self.groups,
             quant_group_size=32,
         )
-        y = batched_gemm_a8w8_mxscale_bpreshuffle(
-            x_fp8,
-            self.wo_a.weight.view(self.groups, self.o_rank, -1),
-            x_scale,
-            self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1),
-            dtype=output.dtype,
-        )
+        w = self.wo_a.weight.view(self.groups, self.o_rank, -1)
+        w_scale = self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1)
+        try:
+            from aiter.jit.utils.chip_info import get_gfx
+
+            use_aiter_bmm = get_gfx() == "gfx950"
+        except (ImportError, RuntimeError):
+            use_aiter_bmm = False
+        if use_aiter_bmm:
+            y = batched_gemm_a8w8_mxscale_bpreshuffle(
+                x_fp8, w, x_scale, w_scale, dtype=output.dtype
+            )
+        else:
+            # aiter has no 32x32 mxscale BMM on gfx942; one batched local GEMM
+            # covers every LoRA group (no Python per-group launch loop).
+            y = self._wo_a_group32_batched(x_fp8, x_scale, w, w_scale, output.dtype)
         return self.wo_b(y.view(*output.shape[:-2], -1))
+
+    def _wo_a_group32_batched(self, x_fp8, x_scale, weight, weight_scale, dtype):
+        from atom.model_ops.blockscale import (
+            _activations_for_ocp_group32,
+            _units,
+            _use_group32_bf16_fallback,
+        )
+        from atom.model_ops.blockscale_kernels.fp8 import (
+            gemm_fp8_bf16_dequant,
+            gemm_fp8_bf16_dequant_batched,
+            gemm_fp8_local,
+        )
+
+        import os
+
+        cu_num = _units(x_fp8.device.index)
+        if _use_group32_bf16_fallback() and os.environ.get(
+            "ATOM_GFX942_GROUP32_TRITON", "0"
+        ) != "1":
+            # hipBLAS decodes FNUZ, so the OCP re-encode (dequant + quantize,
+            # once per LoRA group) is only needed by aiter's MX kernel. The
+            # BF16 cache lives on the un-viewed parameter; a group slice does
+            # not carry that attribute and would otherwise dequant the weight
+            # on every token.
+            cache = getattr(self.wo_a.weight, "_atom_group32_bf16_cache", None)
+            if cache is not None:
+                cache = cache.view(self.groups, self.o_rank, -1)
+            outs = []
+            for group in range(x_fp8.shape[1]):
+                wg = weight[group]
+                if cache is not None:
+                    wg._atom_group32_bf16_cache = cache[group]
+                outs.append(
+                    gemm_fp8_bf16_dequant(
+                        x_fp8[:, group].contiguous(),
+                        wg,
+                        x_scale[:, group].contiguous(),
+                        weight_scale[group],
+                        dtype=dtype,
+                        weight_group_rows=32,
+                        cu_num=cu_num,
+                    )
+                )
+            return torch.stack(outs, dim=1)
+
+        # Activations may be FNUZ on gfx942; re-encode once per group then stack
+        # for a single batched launch.
+        xs = []
+        xscales = []
+        for group in range(x_fp8.shape[1]):
+            x_g, xs_g = _activations_for_ocp_group32(
+                x_fp8[:, group].contiguous(), x_scale[:, group].contiguous()
+            )
+            xs.append(x_g)
+            xscales.append(xs_g)
+        x_b = torch.stack(xs, dim=0)
+        xs_b = torch.stack(xscales, dim=0)
+        w = weight
+        if w.dtype == torch.float8_e4m3fnuz:
+            w = w.view(torch.float8_e4m3fn)
+        w = w.contiguous()
+        ws = weight_scale.contiguous()
+        import os
+
+        from atom.model_ops.blockscale_kernels.fp8 import gemm_fp8_bf16_dequant
+
+        cu_num = _units(x_fp8.device.index)
+        if (
+            _use_group32_bf16_fallback()
+            and os.environ.get("ATOM_GFX942_GROUP32_TRITON", "0") == "1"
+        ):
+            # Batched kernel returns [G, M, N]; attention wants [M, G, N].
+            y = gemm_fp8_bf16_dequant_batched(
+                x_b,
+                w,
+                xs_b,
+                ws,
+                dtype=dtype,
+                weight_group_rows=32,
+                cu_num=cu_num,
+            )
+            return y.transpose(0, 1).contiguous()
+        outs = []
+        for group in range(x_b.shape[0]):
+            if _use_group32_bf16_fallback():
+                outs.append(
+                    gemm_fp8_bf16_dequant(
+                        x_b[group],
+                        w[group],
+                        xs_b[group],
+                        ws[group],
+                        dtype=dtype,
+                        weight_group_rows=32,
+                        cu_num=cu_num,
+                    )
+                )
+            else:
+                outs.append(
+                    gemm_fp8_local(
+                        x_b[group],
+                        w[group],
+                        xs_b[group],
+                        ws[group],
+                        dtype=dtype,
+                        weight_group_rows=32,
+                        split_k=None,
+                        cu_num=cu_num,
+                    )
+                )
+        return torch.stack(outs, dim=1)
 
     def _fork_compress(self, hidden, cache, step, rope):
         """The compressor, issued before the projections, beside them.

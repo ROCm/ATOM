@@ -17,15 +17,25 @@ from .blockscale_kernels.blockscale_gemm import (
 )
 from .blockscale_kernels.quantization import (
     FP8_DTYPE,
+    FP8_OCP_DTYPE,
     quantize_fp4_kernel,
     quantize_fp8_kernel,
+    quantize_fp8_ocp_kernel,
 )
 
 
 def _get_aiter_fp8_gemm():
     try:
         from aiter import gemm_a8w8_blockscale
+        from aiter.jit.utils.chip_info import get_gfx
     except ImportError:
+        return None
+    # aiter's group32 FP8 path asserts gfx950; MI308 (gfx942) must use the
+    # local Triton GEMM below instead of calling into that stub.
+    try:
+        if get_gfx() != "gfx950":
+            return None
+    except RuntimeError:
         return None
     # The older same-named interface only supports FP32 128x128 scales.
     # The registered schema retains the signature hidden by torch_compile_guard.
@@ -73,6 +83,92 @@ def quantize_fp8(x: torch.Tensor, *, dequantize: bool = False):
             dequantize,
         )
     return output if dequantize else (output, scales)
+
+
+def quantize_fp8_ocp(x: torch.Tensor, *, dequantize: bool = False):
+    """Group32 E8M0 into OCP float8_e4m3fn (V4.1 checkpoint / aiter group32)."""
+    x = _check_quant_input(x, 32)
+    output = torch.empty_like(x, dtype=x.dtype if dequantize else FP8_OCP_DTYPE)
+    scales = (
+        None
+        if dequantize
+        else torch.empty(
+            (*x.shape[:-1], x.shape[-1] // 32),
+            device=x.device,
+            dtype=torch.float8_e8m0fnu,
+        )
+    )
+    if x.numel():
+        quantize_fp8_ocp_kernel[(triton.cdiv(x.numel(), 1024),)](
+            x,
+            output,
+            None if scales is None else scales.view(torch.uint8),
+            x.numel(),
+            dequantize,
+        )
+    return output if dequantize else (output, scales)
+
+
+def _activations_for_ocp_group32(x, x_scale):
+    """Native group32 GEMM wants OCP e4m3fn; gfx942 quantize_fp8 writes FNUZ."""
+    if x.dtype == torch.float8_e4m3fn:
+        return x, x_scale
+    if x.dtype == torch.float8_e4m3fnuz:
+        if x_scale is None:
+            raise ValueError("FNUZ activations need scales to re-encode as OCP e4m3fn")
+        code = x_scale.view(torch.uint8).to(torch.int32)
+        scale = (code << 23).view(torch.float32)
+        flat = x.reshape(-1, x.shape[-1]).float()
+        scale_f = scale.reshape(flat.shape[0], -1)
+        dequant = (flat.reshape(flat.shape[0], -1, 32) * scale_f[:, :, None]).reshape(
+            x.shape
+        )
+        return quantize_fp8_ocp(dequant.to(torch.bfloat16))
+    if x_scale is None and x.dtype in (torch.bfloat16, torch.float16, torch.float32):
+        return quantize_fp8_ocp(x)
+    raise ValueError(f"Unsupported activation dtype for native group32 GEMM: {x.dtype}")
+
+
+def _e8m0_codes_to_float(scale: torch.Tensor) -> torch.Tensor:
+    code = scale.view(torch.uint8).to(torch.int32)
+    return (code << 23).view(torch.float32)
+
+
+def _use_group32_bf16_fallback() -> bool:
+    """True off gfx950: no CDNA4 MXFP8 MFMA / aiter group32 path."""
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return get_gfx() != "gfx950"
+    except (ImportError, RuntimeError):
+        return True
+
+
+def _group32_bf16_gemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    weight_group_rows: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """gfx942 group32 GEMM: in-kernel e8m0 dequant + BF16 tl.dot (K=16 MFMA).
+
+    Replaces the previous host dequant + hipBLAS path. Do not call
+    ``tl.dot_scaled`` on e4m3 here -- that lowers to the missing K=32 BF16 MFMA.
+    """
+    from .blockscale_kernels.fp8 import gemm_fp8_bf16_dequant
+
+    return gemm_fp8_bf16_dequant(
+        x,
+        weight,
+        x_scale,
+        weight_scale,
+        dtype=dtype,
+        weight_group_rows=weight_group_rows,
+        cu_num=_units(x.device.index),
+    )
 
 
 def quantize_fp4(
@@ -173,6 +269,10 @@ def native_quant_linear(
             "Expected batched activations, a matrix weight and BF16/FP32 output"
         )
     fp4 = weight.dtype == torch.float4_e2m1fn_x2
+    # Native path keeps checkpoint OCP bits even when the param was typed
+    # e4m3fnuz on gfx942 (process_weights_after_loading skips FNUZ normalize).
+    if weight.dtype == torch.float8_e4m3fnuz:
+        weight = weight.view(torch.float8_e4m3fn)
     if weight.dtype not in (torch.float8_e4m3fn, torch.float4_e2m1fn_x2):
         raise ValueError("Weight must be E4M3 or packed E2M1")
     if weight_group_rows not in (1, 32) or (fp4 and weight_group_rows != 1):
@@ -181,7 +281,9 @@ def native_quant_linear(
     k = stored_k * (2 if fp4 else 1)
     if k <= 0 or k % 32 or x.shape[-1] != k or n <= 0:
         raise ValueError("Invalid matrix dimensions for group32 GEMM")
-    if x_scale is None:
+    if not fp4:
+        x, x_scale = _activations_for_ocp_group32(x, x_scale)
+    elif x_scale is None:
         x, x_scale = quantize_fp8(x)
     m = x.numel() // k
     if split_k is not None and (not isinstance(split_k, int) or split_k < 1):
@@ -228,6 +330,15 @@ def native_quant_linear(
             "GEMM operands must be contiguous on the same CUDA/ROCm device"
         )
     if not fp4:
+        if _use_group32_bf16_fallback():
+            return _group32_bf16_gemm(
+                x,
+                weight,
+                x_scale,
+                weight_scale,
+                weight_group_rows=weight_group_rows,
+                dtype=dtype,
+            )
         from .blockscale_kernels.fp8 import gemm_fp8_local
 
         return gemm_fp8_local(
@@ -309,10 +420,11 @@ def dequantize_fp8_weight(weight, scale, *, group_rows=32, dtype=torch.bfloat16)
     n, k = weight.shape
     if k % 32 or n % group_rows or scale.shape != (n // group_rows, k // 32):
         raise ValueError("FP8 source block dimensions do not match")
+    scale_f = (scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
     return (
         (
             weight.float().reshape(n // group_rows, group_rows, k // 32, 32)
-            * scale.float()[:, None, :, None]
+            * scale_f[:, None, :, None]
         )
         .reshape(n, k)
         .to(dtype)

@@ -3,6 +3,7 @@
 
 import itertools
 import logging
+import os
 from collections.abc import Callable
 from functools import partial as functools_partial
 from typing import ClassVar
@@ -847,13 +848,17 @@ class LinearBase(nn.Module):
         self.scale_dtype = _quant_scale_dtype(quant_type, quant_config)
         self.native_a8_group_rows = None
         source_block = layer_quant_config.weight_block_size
-        native_fp8 = params_dtype == torch.float8_e4m3fn and source_block in (
+        # Checkpoint FP8 is float8_e4m3fn; aiter maps dtypes.fp8 to
+        # float8_e4m3fnuz on gfx942 (MI308) and float8_e4m3fn on gfx950.
+        # Native 32x32 / 1x32 scale geometry is identical for both encodings.
+        _native_fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        native_fp8 = params_dtype in _native_fp8_dtypes and source_block in (
             (1, 32),
             (32, 32),
         )
         native_w4a8 = (
             params_dtype == torch.float4_e2m1fn_x2
-            and layer_quant_config.activation_dtype == torch.float8_e4m3fn
+            and layer_quant_config.activation_dtype in _native_fp8_dtypes
             and source_block == (1, 32)
         )
         # A weight that online quant is about to overwrite is not a native
@@ -1334,15 +1339,45 @@ class LinearBase(nn.Module):
         # A native group32 weight keeps its compact scales, and its bytes too
         # unless it is one the preshuffled group32 GEMM reads.
         if self.native_a8_group_rows is not None:
-            if self.weight.numel() and weight_is_stored_preshuffled(
-                self.quant_type,
-                self.params_dtype,
-                needs_preshuffled_weight=getattr(
-                    self, "needs_preshuffled_weight", False
-                ),
-                native_group_rows=self.native_a8_group_rows,
+            try:
+                from aiter.jit.utils.chip_info import get_gfx
+
+                gfx942 = str(get_gfx()).startswith("gfx942")
+            except (ImportError, RuntimeError):
+                gfx942 = False
+            # gfx942 never runs aiter's preshuffled group32 BMM; keep row-major.
+            if (
+                (not gfx942)
+                and self.weight.numel()
+                and weight_is_stored_preshuffled(
+                    self.quant_type,
+                    self.params_dtype,
+                    needs_preshuffled_weight=getattr(
+                        self, "needs_preshuffled_weight", False
+                    ),
+                    native_group_rows=self.native_a8_group_rows,
+                )
             ):
                 shuffle_weights(self.weight)
+            # gfx942 has no MXFP8 MFMA: dequant the weight once to BF16 so every
+            # decode step only scales activations and calls hipBLAS.
+            if (
+                gfx942
+                and self.weight.numel()
+                and self.weight_scale is not None
+                and os.environ.get("ATOM_GFX942_CACHE_BF16_WEIGHT", "1") != "0"
+            ):
+                from atom.model_ops.blockscale import dequantize_fp8_weight
+
+                w = self.weight
+                if w.dtype == torch.float8_e4m3fnuz:
+                    w = w.view(torch.float8_e4m3fn)
+                self.weight._atom_group32_bf16_cache = dequantize_fp8_weight(
+                    w,
+                    self.weight_scale,
+                    group_rows=self.native_a8_group_rows,
+                    dtype=torch.bfloat16,
+                )
             return
         if self.weight.numel() == 0:
             return
