@@ -52,6 +52,7 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.plugin.prepare import is_plugin_mode
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
 
@@ -595,6 +596,10 @@ class Qwen3_5Model(Qwen3NextModel):
             fused_allreduce=fuse_allreduce_norm,
         )
         defer_moe_gated_sums(self.layers, self.norm)
+        if envs.ATOM_QWEN_MONO_MOE:
+            from atom.model_ops.qwen_mono_moe.integration import enable_mono_moe
+
+            enable_mono_moe(self.layers, self.norm)
 
 
 _QWEN3_5_PACKED_MODULES_MAPPING = {
