@@ -28,12 +28,34 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from atom.utils import envs
+
 _BT = 64
 _TDM_MAX_PAD_INTERVAL_DWORDS = 256
 
 
 def _pad_interval(extent, elem_bits=16):
     return min(extent, _TDM_MAX_PAD_INTERVAL_DWORDS * 32 // elem_bits)
+
+
+@gluon.jit
+def _at(desc, row, col):
+    # the descriptor of the tile at (row, col), bounded at the tensor's end
+    return gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        desc, add_offsets=[row, col], clamp_bounds=True
+    )
+
+
+@gluon.jit
+def _load_pairs(w_desc, k_desc, u_desc, g_desc, w_dst, k_dst, u_dst, g_dst, c, v0):
+    # the operands of the chunk at row c in two fused copies: waves 0-1 move w
+    # then u, waves 2-3 k then the gates
+    gl.amd.gfx1250.tdm.async_load_fused(
+        [(_at(w_desc, c, 0), w_dst, 3), (_at(k_desc, c, 0), k_dst, 12)]
+    )
+    gl.amd.gfx1250.tdm.async_load_fused(
+        [(_at(u_desc, c, v0), u_dst, 3), (_at(g_desc, c, 0), g_dst, 12)]
+    )
 
 
 @gluon.jit
@@ -72,6 +94,7 @@ def _chunk_h_gfx1250_kernel(
     HAS_N: gl.constexpr,
     USE_STATE_IDX: gl.constexpr,
     STORE_CKPT: gl.constexpr,
+    PAIRED: gl.constexpr,
     WMMA: gl.constexpr,
     OP_A: gl.constexpr,
     OP_B: gl.constexpr,
@@ -166,7 +189,7 @@ def _chunk_h_gfx1250_kernel(
     # loads of a later chunk's operands, the v_new store. Every chunk issues the
     # same count (loads past the last chunk re-read the last chunk), so each wait
     # below is a fixed count of the operations issued after the chunk's loads.
-    LOADS: gl.constexpr = 3 + USE_G
+    LOADS: gl.constexpr = 2 if PAIRED else 3 + USE_G
     PER_CHUNK: gl.constexpr = STORE_H + LOADS + SAVE_NEW_VALUE
 
     # ---- the initial state ----
@@ -188,11 +211,25 @@ def _chunk_h_gfx1250_kernel(
     # the first chunks' operands
     for i in gl.static_range(NB - 1):
         c = gl.minimum(i, NT - 1) * BT
-        gl.amd.gfx1250.tdm.async_load(w_desc, [c, 0], w_smem.index(i))
-        gl.amd.gfx1250.tdm.async_load(k_desc, [c, 0], k_smem.index(i))
-        gl.amd.gfx1250.tdm.async_load(u_desc, [c, v0], u_smem.index(i))
-        if USE_G:
-            gl.amd.gfx1250.tdm.async_load(g_desc, [c, 0], g_smem.index(i))
+        if PAIRED:
+            _load_pairs(
+                w_desc,
+                k_desc,
+                u_desc,
+                g_desc,
+                w_smem.index(i),
+                k_smem.index(i),
+                u_smem.index(i),
+                g_smem.index(i),
+                c,
+                v0,
+            )
+        else:
+            gl.amd.gfx1250.tdm.async_load(w_desc, [c, 0], w_smem.index(i))
+            gl.amd.gfx1250.tdm.async_load(k_desc, [c, 0], k_smem.index(i))
+            gl.amd.gfx1250.tdm.async_load(u_desc, [c, v0], u_smem.index(i))
+            if USE_G:
+                gl.amd.gfx1250.tdm.async_load(g_desc, [c, 0], g_smem.index(i))
     if USE_INITIAL_STATE:
         state = gl.load(h0 + state_off, mask=(state_off >= 0) & use_h0, other=0.0).to(
             gl.float32
@@ -235,16 +272,33 @@ def _chunk_h_gfx1250_kernel(
             )
         nxt = gl.minimum(i_t + NB - 1, NT - 1) * BT
         nbuf = (i_t + NB - 1) % NB
-        gl.amd.gfx1250.tdm.async_load(w_desc, [nxt, 0], w_smem.index(nbuf))
-        gl.amd.gfx1250.tdm.async_load(k_desc, [nxt, 0], k_smem.index(nbuf))
-        gl.amd.gfx1250.tdm.async_load(u_desc, [nxt, v0], u_smem.index(nbuf))
-        if USE_G:
-            gl.amd.gfx1250.tdm.async_load(g_desc, [nxt, 0], g_smem.index(nbuf))
+        if PAIRED:
+            _load_pairs(
+                w_desc,
+                k_desc,
+                u_desc,
+                g_desc,
+                w_smem.index(nbuf),
+                k_smem.index(nbuf),
+                u_smem.index(nbuf),
+                g_smem.index(nbuf),
+                nxt,
+                v0,
+            )
+        else:
+            gl.amd.gfx1250.tdm.async_load(w_desc, [nxt, 0], w_smem.index(nbuf))
+            gl.amd.gfx1250.tdm.async_load(k_desc, [nxt, 0], k_smem.index(nbuf))
+            gl.amd.gfx1250.tdm.async_load(u_desc, [nxt, v0], u_smem.index(nbuf))
+            if USE_G:
+                gl.amd.gfx1250.tdm.async_load(g_desc, [nxt, 0], g_smem.index(nbuf))
         t0 = i_t * BT
         m_t = (t0 + rows_t) < T
 
         b_h = h_cur.load(OP_B)
         b_w = w_smem.index(buf).load(OP_A)
+        if PAIRED:
+            # k^T's operand is ready: read it while the first product runs
+            b_k = k_smem.index(buf).permute([1, 0]).load(OP_A)
         b_v = gl.amd.gfx1250.wmma(b_w, b_h, zero_v)
         b_u = u_smem.index(buf).load(WMMA).to(gl.float32)
         b_v = b_u - b_v
@@ -264,7 +318,8 @@ def _chunk_h_gfx1250_kernel(
         gl.barrier()
         if SAVE_NEW_VALUE:
             gl.amd.gfx1250.tdm.async_store(vn_desc, [t0, v0], vn_cur)
-        b_k = k_smem.index(buf).permute([1, 0]).load(OP_A)
+        if not PAIRED:
+            b_k = k_smem.index(buf).permute([1, 0]).load(OP_A)
         b_vgb = vg_smem.load(OP_B)
         # accumulate into the decayed state, as Triton folds `h += dot(k, v)`
         state = gl.amd.gfx1250.wmma(b_k, b_vgb, state)
@@ -413,6 +468,7 @@ def chunk_h_gfx1250(
         HAS_N=n_ptr is not None,
         USE_STATE_IDX=h0_idx is not None,
         STORE_CKPT=ckpt_slot is not None,
+        PAIRED=envs.ATOM_GDN_CHUNK_H_PAIRED_LOADS and g is not None,
         WMMA=layouts[0],
         OP_A=layouts[1],
         OP_B=layouts[2],
