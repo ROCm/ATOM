@@ -429,6 +429,8 @@ class ReplayOp:
     # Which of a mixed step's sequences it serves: "decode", "prefill", or
     # (parameter name, position) of its max query length -- 1 means decode.
     phase: str | tuple[str, int] = "decode"
+    # A collective: replayed across as many ranks as the recorded TP group.
+    collective: bool = False
 
 
 REPLAY_SCRIPTS = {
@@ -467,6 +469,20 @@ REPLAY_OPS = {
         "gdn_chunk", "atom", ("cu_seqlens", 8, 1), "prefill"
     ),
     "fused_gdn_gating": ReplayOp("gdn_gating", "atom", None),
+    # collectives: the message size is the shape, every rank takes part
+    "all_reduce_": ReplayOp("comm_all_reduce", "aiter", None, collective=True),
+    "fused_allreduce_rmsnorm_": ReplayOp(
+        "comm_allreduce_rmsnorm", "aiter", None, collective=True
+    ),
+    "fused_allreduce_rmsnorm_quant_per_group_": ReplayOp(
+        "comm_allreduce_rmsnorm_quant", "aiter", None, collective=True
+    ),
+    "fused_allreduce_rmsnorm_quant_per_group_emit_bf16_": ReplayOp(
+        "comm_allreduce_rmsnorm_quant_bf16", "aiter", None, collective=True
+    ),
+    "tensor_model_parallel_all_gather": ReplayOp(
+        "comm_all_gather", "aiter", None, collective=True
+    ),
 }
 
 
@@ -503,23 +519,32 @@ def _served(
 def replay_calls(rec: Recording, steps: list[dict]) -> dict[int, list[tuple[str, int]]]:
     """signature id -> [(work, calls)] over ``steps``: a call's work is the
     JSON of the (q, ctx) of the sequences it served (`_served`), "{}" for an
-    op no per-sequence value prices. A graph's calls count once per replay."""
+    op no per-sequence value prices, and ``graph`` for a collective a graph
+    ran. A graph's calls count once per replay."""
     out: dict[int, list] = defaultdict(list)
     for s in steps:
-        here: Counter = Counter()
+        live: Counter = Counter()
+        graphed: Counter = Counter()
         for sid, n in s.get("calls", {}).items():
             sig = rec.sigs.get(int(sid))
             if sig is not None and is_replay_entry(sig):
-                here[int(sid)] += n
+                live[int(sid)] += n
         for gid, n in s.get("replays", {}).items():
             for sid, m in rec.graphs.get(int(gid), {}).items():
                 sig = rec.sigs.get(sid)
                 if sig is not None and is_replay_entry(sig):
-                    here[sid] += n * m
-        for sid, n in here.items():
+                    graphed[sid] += n * m
+        for sid, n, in_graph in [
+            *((sid, n, False) for sid, n in live.items()),
+            *((sid, n, True) for sid, n in graphed.items()),
+        ]:
             sig = rec.sigs[sid]
             op = REPLAY_OPS[sig["op"]]
             work = {}
+            if op.collective and in_graph:
+                # A collective in a graph runs on buffers registered at capture,
+                # not the copy-in path an eager call takes: replay it in one.
+                work["graph"] = True
             if op.seqs is not None:
                 tensor = _arg(sig, op.seqs[0], op.seqs[1])
                 rows = tensor["shape"][0] - op.seqs[2]
@@ -666,12 +691,14 @@ def export(
     replay_rows: dict[str, list] = defaultdict(list)
     replay_bucketed: dict[str, bool] = defaultdict(bool)
     replay_owner: dict[str, str] = {}
+    replay_collective: dict[str, bool] = {}
     for sid, instances in sorted(replay_calls(rec, steps).items()):
         sig = rec.sigs[sid]
         op = REPLAY_OPS[sig["op"]]
         reps, bucketed = replay_bins(instances, replay_bin_count)
         replay_bucketed[op.family] |= bucketed
         replay_owner[op.family] = op.owner
+        replay_collective[op.family] = op.collective
         replay_rows[op.family] += [(sig, work, n) for work, n in reps]
     for name, rows in sorted(replay_rows.items()):
         write_replay_csv(os.path.join(out_dir, f"{name}.csv"), rows)
@@ -685,6 +712,9 @@ def export(
             "bucketed": replay_bucketed[name],
             "bins_per_signature": replay_bin_count,
         }
+        if replay_collective[name]:
+            tp = (rec.meta.get("config") or {}).get("tensor_parallel_size") or 1
+            families[name]["ranks"] = int(tp)
 
     # A depth-0 op is covered when it is a family's entry or wraps one.
     depth0, covered = Counter(), set()

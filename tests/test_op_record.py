@@ -393,3 +393,35 @@ def test_a_call_serves_the_sequences_its_row_count_matches():
     assert export._served(q, ctx, 2, "decode") == {"q": [1, 1], "ctx": [900, 901]}
     assert export._served(q, ctx, 4, "prefill") == {"q": q, "ctx": ctx}
     assert export._served([1, 1], [5, 6], 4) == {"q": [1, 1, 0, 0], "ctx": [5, 6, 0, 0]}
+
+
+def test_collectives_export_with_the_recorded_tp_size(tmp_path, patched_graph):
+    """A collective is priced by its shape alone and replayed on as many
+    ranks as the recorded TP group."""
+    rec = op_record.OpRecorder(
+        str(tmp_path), {"config": {"tensor_parallel_size": 4}}
+    )
+    op_record._patch_cuda_graph(rec)
+    graph = FakeGraph()
+    graph.capture_begin()
+    x, w = torch.empty(64, 4096, dtype=torch.bfloat16), torch.empty(4096)
+    for _ in range(2):
+        rec.on_call("fused_allreduce_rmsnorm_", 0, (x, x, w, 1e-6, "tp:0"), {})
+    rec.on_call("fused_allreduce_rmsnorm", 1, (0, x, x, x, x), {})
+    graph.capture_end()
+    rec.step(lambda b: graph.replay(), _batch([1] * 64, [100] * 64))
+    rec.step(lambda b: graph.replay(), _batch([1] * 64, [101] * 64))
+    rec.close()
+
+    rec_steps = export.window_steps(export.load(str(tmp_path)), 0, float("inf"))
+    (calls,) = export.replay_calls(export.load(str(tmp_path)), rec_steps).values()
+    assert calls == [('{"graph":true}', 2), ('{"graph":true}', 2)]
+
+    summary = export.export(str(tmp_path), str(tmp_path / "out"), None)
+    family = summary["families"]["comm_allreduce_rmsnorm"]
+    assert (family["owner"], family["ranks"], family["calls"], family["rows"]) == (
+        "aiter",
+        4,
+        4,
+        1,
+    )
