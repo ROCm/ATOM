@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793729862526,
+  "lastUpdate": 1793810682533,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4728,6 +4728,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8931,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41671740285 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611031701 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1061 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Zhu Jiale",
+            "username": "zovonoir",
+            "email": "69138280+zovonoir@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "083891e93ec6293f0c8f687a86f7b46388f1a423",
+          "message": "perf(sglang): aiter FlyDSL QSA sparse attention for Qwen3.8-Flash-Next eager prefill (#2653)\n\n* perf(sglang): run Qwen3.8-Flash-Next eager prefill QSA attention with aiter FlyDSL\n\nBehind ATOM_QSA_FLYDSL_ATTN=1 (default off), SGLang-ATOM eager prefill calls\naiter's qsa_sparse_attention_flydsl (ROCm/aiter#6576) instead of\nqsa_sparse_paged_gqa. The plugin records host query/seq lengths, and for\nprefixed requests the flat cache rows of each full context, which are gathered\ninto contiguous K/V. Selections are padded with -1 to the next width the kernel\naccepts. Decode, verify, draft and graph capture keep the native kernel.\nATOM_QSA_FLYDSL_ATTN_CHECK=1 also runs the native kernel and logs the\nper-layer difference.\n\n* chore(qwen4_exp): drop the ATOM_QSA_FLYDSL_ATTN_CHECK numerics check\n\nThe check mode ran the native QSA kernel next to the FlyDSL one and logged\nthe per-layer difference. It was used to validate the FlyDSL path and is not\nmeant to land; feddb037d keeps it for reference.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(qwen4_exp): keep the native QSA kernel for budgets, FP8 KV and archs FlyDSL cannot serve\n\n- Take the FlyDSL path only for compression ratio 4 and a budget of\n  1024 / 2048 / 3072 / 4096. Padding a selection laid out for another\n  budget moves the causal tail, and the kernel reads it at the wrong column.\n- Fall back when the KV cache is quantized: the prefixed path gathers raw\n  cache rows and the kernel accepts BF16 only.\n- Fall back on anything but gfx942, where aiter's entry raises.\n\nAddresses the review threads on #2653.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(qwen4_exp): fall back before aiter's 2**31-byte selection limit; tighten FlyDSL gate tests\n\n- A padded selection of 2**31 bytes or more (e.g. a 131072-row eager\n  prefill at budget 4096) makes aiter raise; keep the native kernel there.\n- Gate tests no longer reach the real CUDA capture query, exercise padding\n  with a genuinely short selection (width 11 -> 1027, -1 fill checked),\n  and cover the byte limit.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* test(qwen4_exp): cover the FlyDSL prefill context gather and its batch fallbacks\n\n- test_mixed_prefix_batch_gathers_full_contexts: a prefixed / fresh / prefixed\n  batch with unequal lengths on non-consecutive pages crossing page\n  boundaries. _flydsl_prefill_layout must return every request's full context\n  rows in request-major order, and _flydsl_attention must hand the kernel\n  exactly those K/V rows with the per-request query and prefix lengths.\n- tests/plugin/test_sglang_qwen4_exp_graph_padding.py: _flydsl_prefill_layout\n  returns no context rows for an unprefixed batch, and (None, None) for padded\n  tokens, partial batches, missing host lengths and an extend longer than its\n  sequence.\n\n* fix(qwen4_exp): import FlyDSL QSA prefill from aiter.ops.qsa\n\nROCm/aiter#6576 renamed the prefill attention\n(aiter.ops.flydsl.kernels.qsa.attention.qsa_sparse_attention_flydsl ->\naiter.ops.flydsl.qsa_sparse_prefill.flydsl_qsa_sparse_prefill) and added\naiter.ops.qsa.qsa_sparse_prefill as the entry for consumers, same\nsignature. With ATOM_QSA_FLYDSL_ATTN=1 the old import raised\nModuleNotFoundError at the first eager prefill, so a server on aiter with\nthe current #6576 could not start. Import the aiter.ops.qsa entry.\n\n---------\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-11-04T15:02:36Z",
+          "url": "https://github.com/ROCm/ATOM/commit/083891e93ec6293f0c8f687a86f7b46388f1a423"
+        },
+        "date": 1793810681309,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9439,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41864849595 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611041513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9409 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8976,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41864849595 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611041513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1721 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
