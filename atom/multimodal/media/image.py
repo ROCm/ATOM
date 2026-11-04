@@ -16,7 +16,8 @@ if TYPE_CHECKING:
 def load_image(
     data: ImageItem, connector: MediaConnector, *, keep_alpha: bool = False
 ) -> Image.Image:
-    """Decode an image to RGB, or to RGBA when ``keep_alpha`` and it is transparent.
+    """Decode an image to RGB, or to RGBA when ``keep_alpha`` and some pixel is
+    not fully opaque (an alpha band or palette transparency in use).
 
     Converting a transparent image straight to RGB composites it on black, so
     dark content on a transparent background disappears. Processors that apply
@@ -42,5 +43,8 @@ def load_image(
 
 def _decoded(image: Image.Image, keep_alpha: bool) -> Image.Image:
     if keep_alpha and ("A" in image.getbands() or "transparency" in image.info):
-        return image.convert("RGBA")
+        rgba = image.convert("RGBA")
+        # An alpha band that is fully opaque carries nothing to fill.
+        if rgba.getchannel("A").getextrema()[0] < 255:
+            return rgba
     return image.convert("RGB")
