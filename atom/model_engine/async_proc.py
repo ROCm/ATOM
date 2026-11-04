@@ -474,8 +474,8 @@ class AsyncIOProcManager:
         proc_num: int,
         runner: str,
         *args,
-        on_worker_failure=None,
         local_proc_num: int | None = None,
+        on_worker_failure=None,
     ):
         self.parent_finalizer = finalizer
         self.on_worker_failure = on_worker_failure

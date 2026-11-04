@@ -251,6 +251,30 @@ def test_standalone_model_runner_keeps_rank_zero_rendezvous(manager):
     )
 
 
+@pytest.mark.parametrize("env, seconds", [(None, 1800), ("60", 60)])
+def test_multinode_tp_rank_waits_on_the_store_as_long_as_tp_setup(
+    monkeypatch, env, seconds
+):
+    # A cross-node TP rank fetches lazily created NCCL ids from this store; the
+    # trays reach their first such collective as far apart as their loads differ.
+    pytest.importorskip("aiter")
+    from atom.model_engine.model_runner import managed_store_client_kwargs
+
+    if env is None:
+        monkeypatch.delenv("ATOM_MULTINODE_TP_TIMEOUT_S", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_MULTINODE_TP_TIMEOUT_S", env)
+    kwargs = managed_store_client_kwargs(SimpleNamespace(is_multinode_tp=True))
+    assert kwargs == {"timeout": timedelta(seconds=seconds)}
+
+
+def test_single_node_rank_keeps_the_default_store_timeout():
+    pytest.importorskip("aiter")
+    from atom.model_engine.model_runner import managed_store_client_kwargs
+
+    assert managed_store_client_kwargs(SimpleNamespace(is_multinode_tp=False)) == {}
+
+
 @pytest.mark.parametrize(
     "dp_size,dp_size_local,first_rank,worker_rank,raised",
     [
@@ -296,27 +320,3 @@ def test_groups_without_a_timeout_outlast_a_slow_nodes_load(monkeypatch):
     # A longer default someone else chose is kept.
     raise_default_group_timeout(60)
     assert distributed_c10d._get_default_timeout(dist.Backend.GLOO) == gloo
-
-
-@pytest.mark.parametrize("env, seconds", [(None, 1800), ("60", 60)])
-def test_multinode_tp_rank_waits_on_the_store_as_long_as_tp_setup(
-    monkeypatch, env, seconds
-):
-    # A cross-node TP rank fetches lazily created NCCL ids from this store; the
-    # trays reach their first such collective as far apart as their loads differ.
-    pytest.importorskip("aiter")
-    from atom.model_engine.model_runner import managed_store_client_kwargs
-
-    if env is None:
-        monkeypatch.delenv("ATOM_MULTINODE_TP_TIMEOUT_S", raising=False)
-    else:
-        monkeypatch.setenv("ATOM_MULTINODE_TP_TIMEOUT_S", env)
-    kwargs = managed_store_client_kwargs(SimpleNamespace(is_multinode_tp=True))
-    assert kwargs == {"timeout": timedelta(seconds=seconds)}
-
-
-def test_single_node_rank_keeps_the_default_store_timeout():
-    pytest.importorskip("aiter")
-    from atom.model_engine.model_runner import managed_store_client_kwargs
-
-    assert managed_store_client_kwargs(SimpleNamespace(is_multinode_tp=False)) == {}
