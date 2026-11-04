@@ -52,14 +52,16 @@ ai["turn_timeout_s"] = float(os.environ.get("TURN_TIMEOUT", "14400"))
 ai["enable_salt"] = True
 ai["inject_tool_delay"] = True
 # Defaults are the submission settings (README "Official Submission Rules"): STOP_FIRST=0 (every started
-# trajectory to its end), CAP_MIN=600 (the 10-hour cap), ACC_INLINE=1 (inline accuracy). STOP_FIRST=1 is not
+# trajectory to its end), ACC_INLINE=1 (inline accuracy), and CAP_MIN=10: a 10-minute issue cap, the
+# ruleset's minimum valid duration (the client stops issuing, drains and writes its report; the example
+# yaml's cap is 10 h). STOP_FIRST=1 is not
 # valid for a submission.
 ai["stop_issuing_on_first_user_complete"] = os.environ.get("STOP_FIRST", "0") == "1"
 cfg["datasets"] = [perf]
 
 cfg["settings"]["load_pattern"]["target_concurrency"] = int(conc)
 cfg["settings"].setdefault("runtime", {})["max_issue_duration_ms"] = int(
-    float(os.environ.get("CAP_MIN", "600")) * 60 * 1000
+    float(os.environ.get("CAP_MIN", "10")) * 60 * 1000
 )
 # Client capacity, YAML-only (rules 2.1.1: the reference client is unmodified; runtime behavior is set here).
 # CLIENT_WORKERS: HTTP worker processes (default auto). METRICS_TOKENIZER_WORKERS: the metrics aggregator's
