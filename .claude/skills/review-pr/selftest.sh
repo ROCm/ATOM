@@ -335,6 +335,50 @@ PYEOF
 }
 t "every id derive() emits is in ALL_RULES" "$(_rule_ids_consistent)" "ok"
 
+# derive() must not read this skill's own source. rules.md and SKILL.md quote the tokens
+# they describe, so a diff that only edits the reviewer used to derive the dtype, Triton,
+# stream and GPU-buffer families for a diff with none of that surface: 20 rules on
+# ATOM#2762, every one inapplicable, and a worker can mistake a noise adjudication for a
+# real finding. The mixed case is the one that matters -- skill prose must not pollute a
+# diff that also touches real code.
+_rules_of() {  # <diff> -> sorted rule ids (what pollution actually changes)
+  printf '%s' "$1" | python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+fams = triage.derive(triage.parse(sys.stdin.read()))
+print(" ".join(sorted({r for _, rr in fams for r in rr.split() if r != "NONE"})))' "$S"
+}
+_fams2() {  # <diff> -> family names
+  printf '%s' "$1" | python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+print(" ".join(f for f, _ in triage.derive(triage.parse(sys.stdin.read()))))' "$S"
+}
+_kern='diff --git a/atom/model_ops/moe.py b/atom/model_ops/moe.py
+--- a/atom/model_ops/moe.py
++++ b/atom/model_ops/moe.py
+@@ -1,2 +1,3 @@
++    num_warps = 4
+'
+# A .py under .claude/, NOT a .md: a markdown path matches INFRA on its extension alone,
+# so testing with rules.md would pass with the .claude/ prefix rule removed.
+# A .py under .claude/, NOT a .md: a markdown path matches INFRA on its extension alone,
+# so a .md fixture would pass with the .claude/ prefix rule removed.
+_skillcode='diff --git a/.claude/skills/review-pr/triage.py b/.claude/skills/review-pr/triage.py
+--- a/.claude/skills/review-pr/triage.py
++++ b/.claude/skills/review-pr/triage.py
+@@ -1,2 +1,3 @@
++# prose quoting tl.program_id and fp8_e8m0 and num_warps and cudaMemcpy
+'
+t "a skills-only diff derives no rules" "$(_fams2 "$_skillcode")" "infra-only"
+
+# The pollution case needs REAL skill prose, not a one-line stand-in: a synthetic hunk
+# trips no family and the test passes with the filter removed -- it did, until this was
+# measured. testdata/skill_prose.diff is three files cut from ATOM#2762's own diff, and
+# with the content filter off they add 18 rule ids (Triton, stream, dtype) to a diff
+# whose only real code is one kernel line.
+t "skill prose does not pollute a real-code diff" \
+  "$(_rules_of "$_kern$(cat "$S/testdata/skill_prose.diff")")" \
+  "$(_rules_of "$_kern")"
+
 # Rejected validation evidence must degrade the review, not delete it. The regression this
 # pins is one that actually happened on the first live auto-validation run: the consumer ran
 # under errexit, so one missing optional import aborted fetch.sh and produced no card at all

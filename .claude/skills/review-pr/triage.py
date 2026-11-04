@@ -1205,11 +1205,25 @@ def derive(files, title="", raw_diff=""):
     family here is one a path or an added line can decide on its own.
     """
     paths = list(files)
-    add = "\n".join(l for f in files.values() for l in f["add"])
+    # The content scan must not read this skill's own source. rules.md and SKILL.md quote
+    # the trigger tokens they describe -- `num_warps`, `fp8_e8m0`, `tl.program_id` -- so a
+    # diff that only edits the reviewer made the reviewer derive the dtype, GPU-buffer,
+    # stream and Triton families for a diff with none of that surface in it: 21 rules on
+    # ATOM#2762, none applicable. Noise a worker can mistake for a real finding, paid on
+    # every PR that touches the skill. Prose about a token is not a use of it.
+    add = "\n".join(
+        l
+        for path, f in files.items()
+        if not path.startswith(".claude/")
+        for l in f["add"]
+    )
     t = []
     def hit(name, rules): t.append((name, rules))
 
-    INFRA = (".github/", "docs/", "3rdparty/", ".gitignore", "requirements",
+    # `.claude/` joins INFRA for the same reason `.github/` is here: it is the machinery
+    # that runs the review, not the runtime the rules are about. A skills-only diff has no
+    # kernel, dtype or stream surface for any family to be right about.
+    INFRA = (".github/", ".claude/", "docs/", "3rdparty/", ".gitignore", "requirements",
              "README", "CONTRIBUTING", ".gitmodules", "setup.py", "pyproject.toml")
     if paths and all(p.startswith(INFRA) or p.endswith((".md", ".txt", ".cfg", ".toml"))
                      or "/docs/" in p for p in paths):
