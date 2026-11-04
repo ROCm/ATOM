@@ -500,6 +500,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SHARED_EXPERT_GATED_GEMM": lambda: (
         os.getenv("ATOM_SHARED_EXPERT_GATED_GEMM", "0") == "1"
     ),
+    # Qwen3.5 MTP drafter at TP > 1: the target's all-reduce fusions. o_proj, its
+    # all-reduce and post_attention_layernorm run as aiter's gfx1250 GEMM +
+    # all-reduce + RMSNorm (TP4, up to 128 rows; else the GEMM, then the fused
+    # all-reduce + RMSNorm), and the MoE output's all-reduce runs in the final
+    # norm's kernel. The input norm stays a plain norm: its input, the fc output,
+    # is replicated. Off by default.
+    "ATOM_MTP_FUSE_ALLREDUCE_NORM": lambda: _flag_env("ATOM_MTP_FUSE_ALLREDUCE_NORM"),
+    # With ATOM_MTP_SELECT_ROWS_BEFORE_MOE: the drafter keeps its step-0 rows (one
+    # a sequence) before o_proj instead of after post_attention_layernorm, both
+    # row-wise: o_proj, its all-reduce and the norm run on those rows, the
+    # attention output gate gathers them in its own launch, and the residual
+    # rows are gathered by the GEMM + all-reduce + RMSNorm kernel (or one
+    # index_select without it), replacing the two index_selects. Off by default.
+    "ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ": lambda: _flag_env(
+        "ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ"
+    ),
+    # Qwen3.5 MTP drafter: the attention output gate `o * sigmoid(gate)` (and the
+    # step-0 row selection of ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ) in the epilogue
+    # of aiter's unified-attention reduce_segments, bitwise the separate kernel.
+    # Unified-attention decode only (else the separate kernel); eager / CUDA
+    # graphs (the drafter is not torch.compiled). Off by default.
+    "ATOM_MTP_ATTN_GATE_IN_REDUCE": lambda: _flag_env("ATOM_MTP_ATTN_GATE_IN_REDUCE"),
+    # With ATOM_FUSED_MOE_TAIL_NORM at TP > 1 (gfx1250, TP4): a sparse MoE block
+    # whose next norm all-reduces (the Qwen3.5 MTP drafter's final norm with
+    # ATOM_MTP_FUSE_ALLREDUCE_NORM) leaves `routed + sigmoid(gate) * shared` to
+    # that norm, which computes it while it reads its input in aiter's Gluon
+    # all-reduce + RMSNorm kernel: one launch fewer, bitwise. The drafter only;
+    # ATOM_FUSED_MOE_TAIL_AR_NORM_TARGET also does it for the target's layers.
+    # Off by default.
+    "ATOM_FUSED_MOE_TAIL_AR_NORM": lambda: _flag_env("ATOM_FUSED_MOE_TAIL_AR_NORM"),
+    "ATOM_FUSED_MOE_TAIL_AR_NORM_TARGET": lambda: _flag_env(
+        "ATOM_FUSED_MOE_TAIL_AR_NORM_TARGET"
+    ),
     "ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS": lambda: int(
         os.getenv("ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS", "1024")
     ),

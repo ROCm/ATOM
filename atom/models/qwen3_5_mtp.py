@@ -28,6 +28,7 @@ from atom.model_ops.utils import atom_parameter
 from atom.models.qwen3_5 import (
     Qwen3_5DecoderLayer,
     Qwen3_5RMSNorm,
+    allreduce_norm_fusion_enabled,
     get_qwen3_5_text_config,
 )
 from atom.models.qwen3_next import defer_moe_gated_sums
@@ -92,12 +93,21 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.dual_pre_fc_norm = envs.ATOM_MTP_DUAL_PRE_FC_NORM
         self.fused_embed_pre_fc_norm = envs.ATOM_MTP_FUSED_EMBED_PRE_FC_NORM
 
+        # ATOM_MTP_FUSE_ALLREDUCE_NORM: the target's all-reduce fusions. o_proj,
+        # its all-reduce and post_attention_layernorm in one kernel, and the MoE
+        # output's all-reduce in the final norm. The layer's input (the fc
+        # output) is complete on every rank, so its input norm does not reduce.
+        fuse_allreduce_norm = (
+            envs.ATOM_MTP_FUSE_ALLREDUCE_NORM and allreduce_norm_fusion_enabled()
+        )
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
                 atom_config,
                 layer_type="full_attention",
                 prefix=f"{prefix}.layers.{idx}",
                 layer_num=idx,
+                fuse_allreduce_norm=fuse_allreduce_norm,
+                input_is_reduced=True,
             )
             for idx in range(
                 self.mtp_start_layer_idx,
@@ -105,7 +115,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             )
         )
 
-        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3_5RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=fuse_allreduce_norm,
+        )
         self.pre_fc_norm_hidden = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -117,7 +131,17 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         # The final norm covers only the rows the head reads (select_rows),
         # which the combine's tail does not: it stays the tail kernel's.
         for layer in self.layers:
-            defer_moe_gated_sums([layer], self.norm, combine_tail=False)
+            defer_moe_gated_sums(
+                [layer],
+                self.norm,
+                combine_tail=False,
+                tp_partial=envs.ATOM_FUSED_MOE_TAIL_AR_NORM,
+            )
+            # Step 0 keeps its rows before o_proj (ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ),
+            # and the output gate (with that selection) goes to the attention's
+            # epilogue (ATOM_MTP_ATTN_GATE_IN_REDUCE).
+            layer.select_rows_before_o_proj = envs.ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ
+            layer.self_attn.gate_in_attention = envs.ATOM_MTP_ATTN_GATE_IN_REDUCE
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

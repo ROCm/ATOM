@@ -13,6 +13,10 @@ from aiter.ops.triton.unified_attention import unified_attention
 from torch import nn
 
 from atom.config import get_current_atom_config
+from atom.model_ops.attn_output_epilogue import (
+    current_attention_output_epilogue,
+    unified_attention_takes_output_epilogue,
+)
 from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
     cp_mha_gather_cache,
@@ -850,6 +854,20 @@ class PagedAttentionImpl(nn.Module):
             o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
         else:
             o = torch.empty_like(q)
+        # ATOM_MTP_ATTN_GATE_IN_REDUCE: the layer's output gate (and its row
+        # selection) in the epilogue of the attention's reduce.
+        epilogue = {}
+        req = current_attention_output_epilogue()
+        if (
+            req is not None
+            and o.dtype == torch.bfloat16
+            and (req.gate is None or req.gate.dtype == o.dtype)
+            and unified_attention_takes_output_epilogue()
+        ):
+            if req.rows is not None:
+                o = o.new_empty((req.rows.shape[0], *o.shape[1:]))
+            epilogue = {"output_gate": req.gate, "output_rows": req.rows}
+            req.applied = True
 
         sliding_window = (
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
@@ -875,6 +893,7 @@ class PagedAttentionImpl(nn.Module):
             sinks=self.sinks,
             shuffled_kv_cache=not self.use_flash_layout,
             equal_seqlen_q=attn_metadata.equal_seqlen_q,
+            **epilogue,
         )
         return o
 

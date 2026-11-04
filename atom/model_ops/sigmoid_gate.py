@@ -16,6 +16,8 @@ one dtype throughout that is exactly what the eager ops compute.
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import Tensor
 
@@ -83,3 +85,58 @@ def output_gate_mul(attn_output: Tensor, gate: Tensor, fused: bool) -> Tensor:
         return fused_sigmoid_gate(attn_output, gate)
     gate = torch.sigmoid(gate)
     return attn_output * gate
+
+
+@triton.jit
+def _gated_rows_kernel(
+    x_ptr,
+    gate_ptr,
+    rows_ptr,
+    out_ptr,
+    stride_x,
+    stride_gate,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """out[r] = x[rows[r]] * sigmoid(gate[rows[r]]), rounded as
+    `_gated_pointwise_kernel`: the sigmoid to the gate dtype, the product to x's."""
+    out_row = tl.program_id(0)
+    row = tl.load(rows_ptr + out_row).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < WIDTH
+    x = tl.load(x_ptr + row * stride_x + cols, mask, 0).to(tl.float32)
+    gate = tl.load(gate_ptr + row * stride_gate + cols, mask, 0)
+    gate = tl.sigmoid(gate.to(tl.float32)).to(gate.dtype).to(tl.float32)
+    result = (x * gate).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + out_row.to(tl.int64) * WIDTH + cols, result, mask)
+
+
+def _output_gate_rows_fake(attn_output: Tensor, gate: Tensor, rows: Tensor) -> Tensor:
+    return attn_output.new_empty((rows.shape[0], attn_output.shape[1]))
+
+
+@torch_compile_guard(gen_fake=_output_gate_rows_fake, mutates_args=[])
+def output_gate_rows(attn_output: Tensor, gate: Tensor, rows: Tensor) -> Tensor:
+    """`(attn_output * sigmoid(gate))[rows]` in one launch, bitwise
+    `output_gate_mul` then the row gather (the MTP drafter's step 0,
+    ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ). The rows must be in range."""
+    if not can_fuse_sigmoid_gate(attn_output, gate, None) or gate.shape[1] == 1:
+        out = output_gate_mul(attn_output, gate, True)
+        return torch.index_select(out, 0, rows)
+    width = attn_output.shape[1]
+    out = attn_output.new_empty((rows.shape[0], width))
+    if rows.shape[0]:
+        block = min(1024, triton.next_power_of_2(width))
+        _gated_rows_kernel[(rows.shape[0], triton.cdiv(width, block))](
+            attn_output,
+            gate,
+            rows,
+            out,
+            attn_output.stride(0),
+            gate.stride(0),
+            WIDTH=width,
+            BLOCK=block,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return out
