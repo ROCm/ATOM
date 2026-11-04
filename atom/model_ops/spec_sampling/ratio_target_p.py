@@ -220,10 +220,9 @@ def _ratio_target_p(
     n_tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
     stride = target_logits.stride(0)
     search_steps = batch_size.bit_length() + 1
-    filtered = top_ks is not None or top_ps is not None
-    if not num_tokens:
-        return filtered
     filters = row_filters(top_ks, top_ps, batch_size, target_logits.dtype)
+    if not num_tokens:
+        return filters.filtered
     runs = work.filter.runs if filters.counts else (None, None)
     _ratio_stats_kernel[(num_tokens, n_tiles)](
         target_logits,
@@ -265,7 +264,7 @@ def _ratio_target_p(
         WITH_ARGMAX=True,
         num_warps=4,
     )
-    if not filtered:
+    if not filters.filtered:
         return False
     filter_floor(
         target_logits,
