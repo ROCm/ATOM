@@ -193,11 +193,13 @@ def _ratio_filter_count_kernel(
                 )
             below = WIDTHS[w]
         floor = _key_logit(cut, KEY_BITS)
-        # The mass holds at least the floor's own id, so it is 0 only if no
-        # window held n_runs, which the widths rule out; keep 1/Z then rather
-        # than divide by it. A NaN mass still divides through, as it does on
-        # the descent path.
-        tl.store(row_inv_z_ptr + row, tl.where(mass == 0.0, inv_z, inv_z / mass))
+        # The mass holds at least the floor's own id: one window always holds
+        # n_runs. A NaN mass divides through, as on the descent path.
+        # Checked only under TRITON_DEBUG.
+        tl.device_assert(
+            (mass > 0.0) | (mass != mass), "count floor without mass"  # noqa: PLR0124
+        )
+        tl.store(row_inv_z_ptr + row, inv_z / mass)
     tl.store(row_floor_ptr + row, floor)
 
 
