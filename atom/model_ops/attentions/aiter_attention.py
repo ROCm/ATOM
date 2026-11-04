@@ -836,8 +836,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # 256, where `flydsl_plan_shape` caps it at 64 with a 256-workgroup
         # budget to keep aiter's reducer off its slow serial path; remove that
         # once aiter #5949 is in the image. The shape is fixed per builder (its
-        # KV pools are), so the key needs no part of it; the op's runtime plans
-        # take the same shape from the call's own head size.
+        # KV pools are) and per batch (ATOM_FLYDSL_PA_LOWBS_CAP: batch 1 and 2
+        # get a larger ceiling), so the key, which holds the batch, needs no
+        # part of it; the op's runtime plans take the same shape from the
+        # call's own head size and batch.
         key = (n, self._flydsl_kv_heads, context_lens.device.index)
         plan = self._flydsl_plans.get(key)
         if plan is None and not create:
@@ -868,7 +870,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 context_lens,
                 self._flydsl_kv_heads,
                 query_length=1,
-                **flydsl_plan_shape(head_dims.pop() if len(head_dims) == 1 else None),
+                **flydsl_plan_shape(
+                    head_dims.pop() if len(head_dims) == 1 else None, n
+                ),
             )
             self._flydsl_plans[key] = plan
             logger.info(
