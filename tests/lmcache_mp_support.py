@@ -83,11 +83,13 @@ def start_transfers(worker, rank: int = 0) -> None:
 
 
 def settle(worker) -> None:
-    """Wait for a polling transfer thread's round that started after this call.
+    """Let a polling transfer thread submit what is queued, then poll it.
 
-    Every submission queued before it has gone out by then. A worker that polls
-    on the forward thread runs nothing between steps.
+    An asked-for round runs after the submission in progress, not after the
+    queue, so the queue is drained first. A worker that polls on the forward
+    thread runs nothing between steps.
     """
     transfer = worker._transfer
     if transfer is not None and transfer.polls:
+        assert transfer.drain(5.0), "queued submissions did not go out"
         assert transfer._wait_round(5.0), "no transfer-thread round finished"

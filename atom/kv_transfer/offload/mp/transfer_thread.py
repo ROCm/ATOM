@@ -21,13 +21,13 @@ Given a ``poll`` callable (the vLLM plugin's worker), the thread also polls
 pending transfers: whenever its queue runs dry, when the forward thread asks
 (`look`, `fence`), and every `_IDLE_POLL_S` otherwise. An asked-for round runs
 after the submission in progress, whatever is still queued, so a backlog of
-submissions delays neither a finished load's report nor a fence. A conc16 step probe of the plugin
-priced the forward thread's share at 18.7 ms per submit and 13.8 ms per
-terminal poll (the IPC handle import) under its own launch pressure. A future a
-poll finished holds the server's imported IPC event, so it is handed back
-(`hand_back`) for the forward thread to drop once nothing else holds it
-(`take_returned`): LMCache keeps each future until its next submission, on
-this thread. Native ATOM polls on its forward thread.
+submissions delays neither a finished load's report nor a fence. A conc16 step
+probe of the plugin priced the forward thread's share at 18.7 ms per submit and
+13.8 ms per terminal poll (the IPC handle import) under its own launch
+pressure. A future a poll finished holds the server's imported IPC event, so it
+is handed back (`hand_back`) for the forward thread to drop once nothing else
+holds it (`take_returned`): LMCache keeps each future until its next
+submission, on this thread. Native ATOM polls on its forward thread.
 """
 
 from __future__ import annotations
@@ -157,9 +157,17 @@ class _TransferThread:
         Inline, that exception stopped the engine on the forward thread; it
         still does, one step later.
         """
-        error, self._error = self._error, None
+        with self._idle:
+            error, self._error = self._error, None
         if error is not None:
             raise error
+
+    def _record_error(self, exc: BaseException) -> None:
+        """Keep the first failure for `raise_error`; under the lock, so the
+        forward thread's swap cannot drop one recorded meanwhile."""
+        with self._idle:
+            if self._error is None:
+                self._error = exc
 
     def hand_back(self, future: Any) -> None:
         """A future a poll finished, for the forward thread to drop."""
@@ -304,8 +312,7 @@ class _TransferThread:
                     fn(*args)
                 except BaseException as exc:  # re-raised by raise_error
                     logger.exception("LMCache MP transfer submission failed")
-                    if self._error is None:
-                        self._error = exc
+                    self._record_error(exc)
                 finally:
                     with self._spent_lock:
                         self._spent.append(args)
@@ -332,8 +339,7 @@ class _TransferThread:
             # A transfer deadline is fail-stop, and only the forward thread can
             # stop the engine.
             logger.exception("LMCache MP transfer poll failed")
-            if self._error is None:
-                self._error = exc
+            self._record_error(exc)
         finally:
             with self._idle:
                 self._rounds_done = number
