@@ -459,9 +459,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 # connector.py`: given V4.1's checkpoint spec the shell picks
                 # the native-state worker, which restores an image into an
                 # Active SLOT, while here the plugin restores it from the PAGE
-                # units a load fills. The adapter moves its transfers off the
-                # step thread.
-                self._worker = MPOffloadWorkerAdapter(LMCacheMPConnector(self._config))
+                # units a load fills. Its transfers are submitted and polled
+                # off the step thread: there a submit cost 18.7 ms and a
+                # terminal poll 13.8 ms under the plugin's launch pressure.
+                self._worker = MPOffloadWorkerAdapter(
+                    LMCacheMPConnector(self._config, transfers_off_step=True)
+                )
             else:
                 from atom.kv_transfer.offload.dense.connector import (
                     DenseOffloadConnector,

@@ -295,6 +295,35 @@ def test_transfer_thread_reraises_a_failed_submission_on_the_caller():
         thread.close(5.0)
 
 
+def test_an_asked_round_polls_before_the_rest_of_the_queue():
+    """A backlog of submissions must not hold back a finished load's report
+    or a fence: the round asked for runs after the submission in progress."""
+    order = []
+    gate = threading.Event()
+    running = threading.Event()
+
+    def first():
+        running.set()
+        gate.wait(5.0)
+        order.append("first")
+
+    thread = transfer_thread._TransferThread(
+        "mp-transfer-test", poll=lambda: order.append("poll")
+    )
+    try:
+        thread.submit(first)
+        assert running.wait(5.0)
+        thread.submit(order.append, "second")
+        thread.submit(order.append, "third")
+        thread.look(0)
+        gate.set()
+        assert thread.drain(5.0)
+        after = order[order.index("first") :]
+        assert after[:2] == ["first", "poll"]
+    finally:
+        thread.close(5.0)
+
+
 def test_a_handed_back_future_is_dropped_once_nothing_else_holds_it():
     """One LMCache still references stays queued: its last reference would
     otherwise be dropped by LMCache's next submission, on the transfer

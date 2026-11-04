@@ -73,10 +73,6 @@ class MPOffloadWorkerAdapter:
         num_blocks: int | None = None,
     ) -> None:
         self._inner.register_kv_caches(kv_caches, transfer_tensors, num_blocks)
-        # Submit and poll on the worker's transfer thread: on this frontend's
-        # step thread a submit cost 18.7 ms and a terminal poll 13.8 ms under
-        # its launch pressure.
-        self._inner.run_transfers_off_step()
 
     # -- the two hooks --------------------------------------------------
 

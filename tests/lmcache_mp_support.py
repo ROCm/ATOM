@@ -77,10 +77,9 @@ def step_event(worker) -> FakeCudaEvent:
     return FakeCudaEvent(interprocess=True)
 
 
-def run_off_step(worker, rank: int = 0) -> None:
-    """The vLLM plugin's worker: submits and polls on its transfer thread."""
-    worker._rank = rank
-    worker.run_transfers_off_step()
+def start_transfers(worker, rank: int = 0) -> None:
+    """Start the transfer thread as registration does, if the worker runs one."""
+    worker._start_transfer_thread(rank)
 
 
 def settle(worker) -> None:

@@ -21,8 +21,6 @@ from typing import Any
 
 import torch
 
-from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload.mp.deployment import _storage_kv_transfer_config
 from atom.kv_transfer.offload.mp.page_views import validate_page_views
 
 
@@ -241,22 +239,9 @@ def stores_state_images(replay_tokens: int) -> bool:
     return not replay_tokens
 
 
-def require_native_state_server(adapter: Any, config: Any) -> None:
-    """Validate native transfer geometry shared with the LMCache server."""
-    configured_chunk = int(
-        offcfg.build_lmcache_config(_storage_kv_transfer_config(config)).chunk_size
-    )
-    if configured_chunk != int(adapter.lmcache_tokens_per_chunk):
-        raise ValueError(
-            "Native-state LMCache configured chunk size must match the MP server: "
-            f"configured={configured_chunk}, server={adapter.lmcache_tokens_per_chunk}"
-        )
-
-
 __all__ = [
     "NativeStateMPKernelGroup",
     "NativeStateMPLayout",
     "build_native_state_mp_layout",
-    "require_native_state_server",
     "stores_state_images",
 ]

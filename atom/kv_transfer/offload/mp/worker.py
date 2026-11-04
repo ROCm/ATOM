@@ -9,9 +9,10 @@ the same engine block-id space, so this connector registers those opaque views
 without knowing which model or attention implementation produced them.
 
 Transfers are submitted and polled on the forward thread. Under
-OFFLOAD_MP_TRANSFER_THREAD the transfer thread submits them; a frontend whose
-forward thread cannot afford the polls either (the vLLM plugin) has it poll
-too (`run_transfers_off_step`).
+OFFLOAD_MP_TRANSFER_THREAD the transfer thread submits them. A frontend whose
+forward thread cannot afford either (the vLLM plugin) builds the worker with
+``transfers_off_step``: the transfer thread submits and polls, and `fence`
+waits on its rounds.
 """
 
 from __future__ import annotations
@@ -44,10 +45,10 @@ from atom.kv_transfer.offload.mp.deployment import (
     _published_tp_replication_factor,
     _tp_replication_factor,
     _validate_mp_config,
+    require_native_state_server,
 )
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
-    require_native_state_server,
     stores_state_images,
 )
 from atom.kv_transfer.offload.mp.page_views import _build_cache_views
@@ -97,9 +98,14 @@ class LMCacheMPConnector(KVConnectorBase):
 
     is_producer = False
 
-    def __init__(self, config: Any) -> None:
+    def __init__(self, config: Any, *, transfers_off_step: bool = False) -> None:
         _validate_mp_config(config)
         self._config = config
+        # Submit and poll on the transfer thread, whatever
+        # OFFLOAD_MP_TRANSFER_THREAD says: for the vLLM plugin, where a submit
+        # cost 18.7 ms and a terminal poll 13.8 ms on the forward thread under
+        # its launch pressure.
+        self._transfers_off_step = transfers_off_step
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         self.kv_role = validated_kv_role(kvc)
         self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
@@ -114,7 +120,6 @@ class LMCacheMPConnector(KVConnectorBase):
         # (`_register_native_state_layout`); every transfer then carries one.
         self._native_layout: Any = None
         self._adapter: Any = None
-        self._rank: int | None = None
         self._is_kv_writer = True
         self._pending_saves: dict[str, _PendingSave] = {}
         self._pending_loads: dict[str, _PendingLoad] = {}
@@ -183,7 +188,6 @@ class LMCacheMPConnector(KVConnectorBase):
 
         tp = get_tp_group()
         rank = int(tp.rank_in_group)
-        self._rank = rank
         tp_size, _ = _validate_mp_config(self._config)
         requested_replication = _tp_replication_factor(self._config)
         published_replication = _published_tp_replication_factor(
@@ -269,7 +273,6 @@ class LMCacheMPConnector(KVConnectorBase):
         spec = transfer_tensors.paged_state_checkpoint_spec
         tp_size, _ = _validate_mp_config(self._config)
         rank = int(get_tp_group().rank_in_group)
-        self._rank = rank
         requested_replication = _tp_replication_factor(self._config)
         published_page_replication = _published_tp_replication_factor(
             transfer_tensors, tp_size=tp_size
@@ -419,34 +422,19 @@ class LMCacheMPConnector(KVConnectorBase):
 
     # -- submission thread ---------------------------------------------------
 
-    def run_transfers_off_step(self) -> None:
-        """Submit and poll on the transfer thread from here on.
-
-        For a frontend whose forward thread cannot afford either: the vLLM
-        plugin, where a submit cost 18.7 ms and a terminal poll 13.8 ms under
-        its launch pressure. Called once the caches are registered.
-        """
-        if self._transfer is not None or self._rank is None:
-            raise RuntimeError(
-                "LMCache MP: register the caches first, and start the transfer "
-                "thread once"
-            )
-        if self._adapter_records_its_own_events():
-            # Inline, transfers would be safe but nothing could fence them.
-            raise RuntimeError(
-                f"LMCache MP adapter {type(self._adapter).__name__} records "
-                "producer events at submission, so its transfers cannot leave "
-                "the forward thread, and this frontend's preemption fence needs "
-                "them to"
-            )
-        self._start_transfer_thread(self._rank, poll=self._poll_round)
-
-    def _start_transfer_thread(
-        self, rank: int, *, poll: Callable[[], None] | None = None
-    ) -> None:
-        if poll is None and not envs.OFFLOAD_MP_TRANSFER_THREAD:
+    def _start_transfer_thread(self, rank: int) -> None:
+        off_step = self._transfers_off_step
+        if not off_step and not envs.OFFLOAD_MP_TRANSFER_THREAD:
             return
         if self._adapter_records_its_own_events():
+            if off_step:
+                # Inline, transfers would be safe but nothing could fence them.
+                raise RuntimeError(
+                    f"LMCache MP adapter {type(self._adapter).__name__} records "
+                    "producer events at submission, so its transfers cannot "
+                    "leave the forward thread, and this frontend's preemption "
+                    "fence needs them to"
+                )
             logger.warning(
                 "LMCache MP adapter %s records producer events at submission; "
                 "transfers stay on the forward thread",
@@ -454,11 +442,11 @@ class LMCacheMPConnector(KVConnectorBase):
             )
             return
         self._fences = _ProducerFences()
-        self._transfer = _TransferThread(f"mp-transfer-{rank}", poll=poll)
+        self._transfer = _TransferThread(
+            f"mp-transfer-{rank}", poll=self._poll_round if off_step else None
+        )
         logger.info(
-            "LMCache MP transfer thread started rank=%d polls=%s",
-            rank,
-            poll is not None,
+            "LMCache MP transfer thread started rank=%d polls=%s", rank, off_step
         )
 
     def _adapter_records_its_own_events(self) -> bool:
@@ -797,7 +785,7 @@ class LMCacheMPConnector(KVConnectorBase):
 
     def _poll_round(self) -> None:
         """Advance every pending transfer once: on the forward thread at each
-        report, or on a polling transfer thread (`run_transfers_off_step`)."""
+        report, or on a polling transfer thread (``transfers_off_step``)."""
         self._poll_pending_loads()
         self._poll_pending_saves()
 
@@ -930,8 +918,8 @@ class LMCacheMPConnector(KVConnectorBase):
         transfer = self._transfer
         if transfer is None:
             raise NotImplementedError(
-                "LMCache MP fence: only a polling transfer thread fences "
-                "(`run_transfers_off_step`)"
+                "LMCache MP fence: only a worker built with transfers_off_step "
+                "fences"
             )
 
         def outstanding() -> list[str]:

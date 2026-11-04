@@ -48,8 +48,8 @@ from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
 from tests.lmcache_mp_support import close_workers, cpu_step_events  # noqa: F401
-from tests.lmcache_mp_support import run_off_step as _run_off_step
 from tests.lmcache_mp_support import settle as _settle
+from tests.lmcache_mp_support import start_transfers as _start_transfers
 from tests.lmcache_mp_support import step_event as _step_event
 
 
@@ -1118,22 +1118,30 @@ class _WorkerAdapter:
         self.shutdown_called = True
 
 
-def _worker(adapter: _WorkerAdapter) -> mp_worker.LMCacheMPConnector:
-    """The vLLM plugin's worker: its transfer thread also polls.
+def _worker(
+    adapter: _WorkerAdapter, *, off_step: bool = True
+) -> mp_worker.LMCacheMPConnector:
+    """A worker with ``adapter`` registered.
 
-    These tests call `_submit_*` directly, as the thread does, and settle a
-    round before reading what the thread polled. The hand-off itself is
-    covered by `test_worker_save_settles_off_the_step_thread`, and native's
-    forward-thread run by the `test_inline_*` tests.
+    ``off_step`` is the vLLM plugin's: its transfer thread submits and polls.
+    Without it, native ATOM's: transfers run on the step thread. These tests
+    call `_submit_*` directly, as either thread does, and settle a round before
+    reading what a polling thread polled.
     """
-    worker = mp_worker.LMCacheMPConnector(_config())
+    worker = mp_worker.LMCacheMPConnector(_config(), transfers_off_step=off_step)
     worker._adapter = adapter
     worker.chunk_size = 8
-    _run_off_step(worker)
+    _start_transfers(worker)
     return worker
 
 
-def test_close_unregisters_the_worker_once(monkeypatch):
+@pytest.fixture(params=[False, True], ids=["inline", "off_step"])
+def off_step(request):
+    """Run a test on native ATOM's step-thread worker and on the plugin's."""
+    return request.param
+
+
+def test_close_unregisters_the_worker_once(monkeypatch, off_step):
     """`ModelRunner.exit` closes the connector before the KV pool is freed.
 
     The adapter's shutdown is what unregisters the pool from the MP server;
@@ -1141,7 +1149,7 @@ def test_close_unregisters_the_worker_once(monkeypatch):
     reaper fires, which a restarted engine on the same GPUs cannot survive.
     """
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     worker.close()
     assert adapter.shutdown_called
     assert worker._adapter is None
@@ -1252,21 +1260,13 @@ def test_worker_save_settles_off_the_step_thread(fake_lmcache_modules):
     assert worker.get_finished().finished_saving == {operation}
 
 
-def _inline_worker(adapter: _WorkerAdapter) -> mp_worker.LMCacheMPConnector:
-    """Native ATOM's worker: its transfers run on the step thread."""
-    worker = mp_worker.LMCacheMPConnector(_config())
-    worker._adapter = adapter
-    worker.chunk_size = 8
-    return worker
-
-
 @pytest.mark.parametrize("kind", ["load", "save"])
 def test_inline_transfers_settle_on_the_step_thread(fake_lmcache_modules, kind):
     """Native ATOM submits before the forward and polls at the report, as it
     always has: its save admission is sized to a save reported the step it
     lands. No drain thread starts."""
     adapter = _WorkerAdapter()
-    worker = _inline_worker(adapter)
+    worker = _worker(adapter, off_step=False)
     threads = threading.active_count()
     request = _unprovable_request(kind)
     if kind == "load":
@@ -1292,7 +1292,7 @@ def test_inline_transfer_deadline_raises_from_the_report(
     """Inline, the step's own poll notices the deadline and stops the engine."""
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
-    worker = _inline_worker(_WorkerAdapter())
+    worker = _worker(_WorkerAdapter(), off_step=False)
     worker._submit_save(_unprovable_request("save"), _step_event(worker))
     now[0] += worker._transfer_deadline_s + 1
     with pytest.raises(transfer.LMCacheTransferUnprovable):
@@ -1303,14 +1303,16 @@ def test_inline_transfer_deadline_raises_from_the_report(
 def test_inline_transfers_have_no_fence(fake_lmcache_modules):
     """Only the vLLM plugin hands a preempted request's blocks on before its
     transfers end, and its transfer thread polls them."""
-    worker = _inline_worker(_WorkerAdapter())
-    with pytest.raises(NotImplementedError, match="polling transfer thread"):
+    worker = _worker(_WorkerAdapter(), off_step=False)
+    with pytest.raises(NotImplementedError, match="transfers_off_step"):
         worker.fence(["16"])
 
 
-def test_worker_uses_transfer_boundary_and_exact_completion(fake_lmcache_modules):
+def test_worker_uses_transfer_boundary_and_exact_completion(
+    fake_lmcache_modules, off_step
+):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     operation = LoadOperationId(req_id=5, generation=3)
     request = LMCacheReqMeta(
         req_id=5,
@@ -1387,9 +1389,9 @@ def test_the_last_look_never_waits_behind_a_submit(fake_lmcache_modules, monkeyp
     assert waited < 1.0
 
 
-def test_worker_reports_failed_load_from_future(fake_lmcache_modules):
+def test_worker_reports_failed_load_from_future(fake_lmcache_modules, off_step):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     operation = LoadOperationId(req_id=6, generation=4)
     request = LMCacheReqMeta(
         req_id=6,
@@ -1407,10 +1409,10 @@ def test_worker_reports_failed_load_from_future(fake_lmcache_modules):
 
 
 def test_worker_future_query_exception_preserves_inflight_transfers(
-    fake_lmcache_modules,
+    fake_lmcache_modules, off_step
 ):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     load_operation = LoadOperationId(req_id=10, generation=1)
     save_operation = SaveOperationId(req_id=11, generation=2)
     worker._submit_load(
@@ -1439,10 +1441,9 @@ def test_worker_future_query_exception_preserves_inflight_transfers(
     save_future = worker._pending_saves["save:11:2"].future
     load_future.query_error = RuntimeError("load query failed")
     save_future.query_error = RuntimeError("save query failed")
-    # Whichever poll meets its failure first stops the engine: the load's, on
-    # the step thread in `get_finished`, or the save's on the drain round that
-    # call wakes. Neither releases what it holds, and nothing resumes after a
-    # fail-stop, so both stay pending.
+    # The first poll to meet its failure stops the engine, on the step thread
+    # or from the transfer thread's round at the next call. Neither releases
+    # what it holds.
     with pytest.raises(transfer.LMCacheTransferUnprovable, match="query failed"):
         worker.get_finished()
         _await_drain_stop(worker)
@@ -1450,12 +1451,24 @@ def test_worker_future_query_exception_preserves_inflight_transfers(
     assert set(worker._pending_loads) == {"load:10:1"}
     assert set(worker._pending_saves) == {"save:11:2"}
 
+    load_future.query_error = None
+    save_future.query_error = None
+    _finish_load(worker, "load:10:1")
+    _finish_save(worker, "save:11:2", result=False)
+    output = worker.get_finished()
+
+    assert output.finished_loading == {load_operation}
+    assert output.failed_loading == set()
+    # A failed store loses this cache opportunity but is terminal and safe to
+    # release, matching the legacy connector's save-failure semantics.
+    assert output.finished_saving == {save_operation}
+
 
 def test_worker_unhealthy_preserves_pending_until_device_futures_are_terminal(
-    fake_lmcache_modules,
+    fake_lmcache_modules, off_step
 ):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     load_operation = LoadOperationId(req_id=12, generation=1)
     save_operation = SaveOperationId(req_id=13, generation=1)
     worker._submit_load(
@@ -1499,8 +1512,7 @@ def test_worker_unhealthy_preserves_pending_until_device_futures_are_terminal(
 
 
 def test_worker_pre_submit_drops_are_immediately_terminal(
-    fake_lmcache_modules,
-    monkeypatch,
+    fake_lmcache_modules, monkeypatch, off_step
 ):
     adapter = _WorkerAdapter()
     monkeypatch.setattr(
@@ -1513,7 +1525,7 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
         "submit_store_request",
         lambda _request_id, _op, _event: None,
     )
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     load_operation = LoadOperationId(req_id=14, generation=1)
     save_operation = SaveOperationId(req_id=15, generation=1)
     worker._submit_load(
@@ -1565,9 +1577,7 @@ def _unprovable_request(kind: str) -> LMCacheReqMeta:
 
 @pytest.mark.parametrize("kind", ["load", "save"])
 def test_worker_unprovable_submission_is_never_released_on_a_clock(
-    fake_lmcache_modules,
-    monkeypatch,
-    kind,
+    fake_lmcache_modules, monkeypatch, kind, off_step
 ):
     """A raising submit may have reached the server, which may still read the
     source or write the destination. Nothing settles, so nothing is released;
@@ -1585,7 +1595,7 @@ def test_worker_unprovable_submission_is_never_released_on_a_clock(
         monkeypatch.setattr(adapter, name, unprovable)
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     request = _unprovable_request(kind)
     if kind == "load":
         worker._submit_load(request, _step_event(worker))
@@ -1609,13 +1619,11 @@ def test_worker_unprovable_submission_is_never_released_on_a_clock(
 
 @pytest.mark.parametrize("kind", ["load", "save"])
 def test_worker_failed_future_stops_immediately_without_releasing_lease(
-    fake_lmcache_modules,
-    monkeypatch,
-    kind,
+    fake_lmcache_modules, monkeypatch, kind, off_step
 ):
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
-    worker = _worker(_WorkerAdapter())
+    worker = _worker(_WorkerAdapter(), off_step=off_step)
     getattr(worker, f"_submit_{kind}")(_unprovable_request(kind), _step_event(worker))
     # Submitted and polled once by the drain thread; not terminal yet.
     _settle(worker)
@@ -1636,11 +1644,11 @@ def test_worker_failed_future_stops_immediately_without_releasing_lease(
 
 
 def test_worker_invalid_descriptor_fails_before_transport(
-    fake_lmcache_modules,
+    fake_lmcache_modules, off_step
 ):
     """A descriptor that cannot be built is provably unsent: it settles now."""
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     load = replace(_unprovable_request("load"), block_ids=[100])
     save = replace(_unprovable_request("save"), block_ids=[100])
     worker._submit_load(load, _step_event(worker))
@@ -1680,11 +1688,11 @@ def test_transfer_deadline_rejects_unbounded_or_invalid_values(value):
 @pytest.mark.parametrize("kind", ["load", "save"])
 @pytest.mark.parametrize("completes", [False, True])
 def test_worker_silent_future_is_bounded_without_remote_errors(
-    fake_lmcache_modules, monkeypatch, kind, completes
+    fake_lmcache_modules, monkeypatch, kind, completes, off_step
 ):
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
-    worker = _worker(_WorkerAdapter())
+    worker = _worker(_WorkerAdapter(), off_step=off_step)
     getattr(worker, f"_submit_{kind}")(_unprovable_request(kind), _step_event(worker))
     _settle(worker)
     operations = getattr(worker, f"_pending_{kind}s")
@@ -1712,10 +1720,10 @@ def test_worker_silent_future_is_bounded_without_remote_errors(
 
 
 def test_worker_save_slices_chunk_blocks_and_preserves_operation(
-    fake_lmcache_modules,
+    fake_lmcache_modules, off_step
 ):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     operation = SaveOperationId(req_id=8, generation=2)
     request = LMCacheReqMeta(
         req_id=8,
@@ -1736,9 +1744,11 @@ def test_worker_save_slices_chunk_blocks_and_preserves_operation(
     assert worker.get_finished().finished_saving == {operation}
 
 
-def test_worker_reports_chunk_source_safe_before_store_terminal(fake_lmcache_modules):
+def test_worker_reports_chunk_source_safe_before_store_terminal(
+    fake_lmcache_modules, off_step
+):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     operation = SaveOperationId(req_id=81, generation=2)
     request = LMCacheReqMeta(
         req_id=81,
@@ -1764,9 +1774,9 @@ def test_worker_reports_chunk_source_safe_before_store_terminal(fake_lmcache_mod
     }
 
 
-def test_non_writer_completes_save_without_submitting(fake_lmcache_modules):
+def test_non_writer_completes_save_without_submitting(fake_lmcache_modules, off_step):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     worker._is_kv_writer = False
     operation = SaveOperationId(req_id=9, generation=2)
     request = LMCacheReqMeta(
@@ -1792,7 +1802,7 @@ def test_non_writer_completes_save_without_submitting(fake_lmcache_modules):
 
 
 def test_collapsed_tp_early_release_waits_only_for_the_single_writer_dma(
-    fake_lmcache_modules,
+    fake_lmcache_modules, off_step
 ):
     operation = SaveOperationId(req_id=91, generation=1)
     request = LMCacheReqMeta(
@@ -1802,8 +1812,8 @@ def test_collapsed_tp_early_release_waits_only_for_the_single_writer_dma(
         save_spec=SaveSpec(skip_leading_tokens=0),
         save_operation=operation,
     )
-    writer = _worker(_WorkerAdapter())
-    non_writer = _worker(_WorkerAdapter())
+    writer = _worker(_WorkerAdapter(), off_step=off_step)
+    non_writer = _worker(_WorkerAdapter(), off_step=off_step)
     non_writer._is_kv_writer = False
     writer._submit_save(request, _step_event(writer))
     non_writer._submit_save(request, _step_event(non_writer))
@@ -1830,10 +1840,10 @@ def test_collapsed_tp_early_release_waits_only_for_the_single_writer_dma(
 
 
 def test_worker_tracks_two_load_generations_for_one_raw_request(
-    fake_lmcache_modules,
+    fake_lmcache_modules, off_step
 ):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     operations = [
         LoadOperationId(req_id=20, generation=1),
         LoadOperationId(req_id=20, generation=2),
@@ -1860,10 +1870,10 @@ def test_worker_tracks_two_load_generations_for_one_raw_request(
 
 
 def test_worker_tracks_two_save_generations_for_one_raw_request(
-    fake_lmcache_modules,
+    fake_lmcache_modules, off_step
 ):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     operations = [
         SaveOperationId(req_id=21, generation=1),
         SaveOperationId(req_id=21, generation=2),
@@ -1889,9 +1899,11 @@ def test_worker_tracks_two_save_generations_for_one_raw_request(
     assert worker.get_finished().finished_saving == {operations[1]}
 
 
-def test_worker_load_and_save_coexist_for_same_raw_request(fake_lmcache_modules):
+def test_worker_load_and_save_coexist_for_same_raw_request(
+    fake_lmcache_modules, off_step
+):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     load_operation = LoadOperationId(req_id=22, generation=4)
     save_operation = SaveOperationId(req_id=22, generation=5)
     worker._submit_load(
@@ -1925,9 +1937,9 @@ def test_worker_load_and_save_coexist_for_same_raw_request(fake_lmcache_modules)
 
 
 @pytest.mark.parametrize("kind", ["load", "save"])
-def test_worker_rejects_exact_operation_replay(fake_lmcache_modules, kind):
+def test_worker_rejects_exact_operation_replay(fake_lmcache_modules, kind, off_step):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     operation = (
         LoadOperationId(req_id=23, generation=6)
         if kind == "load"
@@ -1966,12 +1978,10 @@ def test_worker_rejects_exact_operation_replay(fake_lmcache_modules, kind):
 
 @pytest.mark.parametrize("kind", ["load", "save"])
 def test_worker_rejects_duplicate_while_operation_is_submitting(
-    fake_lmcache_modules,
-    monkeypatch,
-    kind,
+    fake_lmcache_modules, monkeypatch, kind, off_step
 ):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     operation = (
         LoadOperationId(req_id=27, generation=1)
         if kind == "load"
@@ -2021,13 +2031,11 @@ def test_worker_operation_tombstone_limit_is_4096():
 
 @pytest.mark.parametrize("kind", ["load", "save"])
 def test_worker_terminal_operation_tombstones_are_bounded(
-    fake_lmcache_modules,
-    monkeypatch,
-    kind,
+    fake_lmcache_modules, monkeypatch, kind, off_step
 ):
     monkeypatch.setattr(transfer, "_OPERATION_TOMBSTONE_LIMIT", 2)
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
 
     def request(generation):
         operation = (
@@ -2077,10 +2085,10 @@ def test_worker_terminal_operation_tombstones_are_bounded(
 
 
 def test_worker_immediate_operation_tombstones_reject_replay(
-    fake_lmcache_modules,
+    fake_lmcache_modules, off_step
 ):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     load_operation = LoadOperationId(req_id=25, generation=1)
     save_operation = SaveOperationId(req_id=26, generation=1)
     # Too few blocks for the range: provably never sent, so immediately terminal.
@@ -2462,9 +2470,9 @@ def test_the_base_worker_refuses_an_image_transfer_it_cannot_carry(
     assert worker.get_finished().failed_loading == {req.load_operation}
 
 
-def test_a_page_only_worker_refuses_an_image_transfer(fake_lmcache_modules):
+def test_a_page_only_worker_refuses_an_image_transfer(fake_lmcache_modules, off_step):
     adapter = _WorkerAdapter()
-    worker = _worker(adapter)
+    worker = _worker(adapter, off_step=off_step)
     req = _checkpointed_load(NativeStateTransfer((7, 9), 16, 99))
     worker._submit_load(req, _step_event(worker))
     assert adapter.loads == []
@@ -2510,12 +2518,18 @@ def test_off_step_transfers_refuse_an_adapter_that_records_its_own_event(
     behind the forward; inline, nothing could fence a preempted request."""
     adapter = _WorkerAdapter()
     adapter._producer_events = object()
-    worker = mp_worker.LMCacheMPConnector(_config())
-    worker._adapter = adapter
-    worker._rank = 0
     with pytest.raises(RuntimeError, match="records producer events at submission"):
-        worker.run_transfers_off_step()
-    assert worker._transfer is None and worker._fences is None
+        _worker(adapter)
+
+
+def test_off_step_transfers_poll_whatever_the_transfer_thread_flag_says(
+    fake_lmcache_modules, monkeypatch
+):
+    """`OFFLOAD_MP_TRANSFER_THREAD` starts native ATOM's submit-only thread;
+    a worker built to run off the step polls on its own thread either way."""
+    monkeypatch.setattr(mp_worker.envs, "OFFLOAD_MP_TRANSFER_THREAD", True)
+    assert _worker(_WorkerAdapter())._transfer.polls
+    assert not _worker(_WorkerAdapter(), off_step=False)._transfer.polls
 
 
 def test_off_step_transfers_tell_a_capable_adapter_its_fence_is_recorded(
@@ -2581,7 +2595,7 @@ def test_the_fence_names_what_waiting_cannot_clear(fake_lmcache_modules):
 
     inline = mp_worker.LMCacheMPConnector(_config())
     inline._adapter = _WorkerAdapter()
-    with pytest.raises(NotImplementedError, match="polling transfer thread"):
+    with pytest.raises(NotImplementedError, match="transfers_off_step"):
         inline.fence(["7"])
     worker = _worker(_WorkerAdapter())
     worker._queued_requests["7"] = 1

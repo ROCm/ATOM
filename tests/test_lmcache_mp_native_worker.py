@@ -32,10 +32,10 @@ from atom.kv_transfer.offload.metadata import (
 from atom.kv_transfer.offload.mp.deployment import (
     _model_namespace,
     _tp_replication_factor,
+    require_native_state_server,
 )
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
-    require_native_state_server,
     stores_state_images,
 )
 from atom.kv_transfer.offload.mp.native_state_worker import (
@@ -719,10 +719,10 @@ def test_raising_restore_keeps_its_descriptor_slot_until_the_deadline(
 
 
 def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
-    from atom.kv_transfer.offload.mp import native_state_layout
+    from atom.kv_transfer.offload.mp import deployment
 
     monkeypatch.setattr(
-        native_state_layout.offcfg,
+        deployment.offcfg,
         "build_lmcache_config",
         lambda _: SimpleNamespace(chunk_size=256),
     )

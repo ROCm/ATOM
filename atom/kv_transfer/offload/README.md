@@ -107,7 +107,8 @@ Four rules carry the module:
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
 | `mp/connector.py` | Capability-selected public `lmcache_mp` worker/scheduler shells. |
 | `mp/deployment.py` | LMCache MP configuration, topology, model namespace and server adapters. |
-| `mp/worker.py`, `mp/scheduler.py` | Generic PAGE-only LMCache MP connector halves. |
+| `mp/worker.py`, `mp/scheduler.py` | LMCache MP connector halves. The worker registers PAGE views, plus checkpoint image groups when the backend publishes them; the vLLM plugin builds it directly. |
+| `mp/transfer_thread.py` | The transfer thread: submits off the forward thread under `OFFLOAD_MP_TRANSFER_THREAD`, and also polls for a worker built with `transfers_off_step`; `_ProducerFences`, the reused producer events. |
 | `mp/lookup.py` | Scheduler-side MP lookups and read-lock bookkeeping. |
 | `mp/transfer.py` | Transfer identity, terminal detection and the fail-stop transfer deadline. |
 | `mp/page_views.py` | Shared validation of backend-published PAGE views. |
@@ -136,7 +137,14 @@ by the attention backend:
   transfer.
 
 Selection does not inspect model names or layout-ID prefixes. A new backend can
-reuse the native path by implementing these shared contracts. The native path
+reuse the native path by implementing these shared contracts.
+
+The vLLM plugin does not go through this shell. For DeepSeek-V4.1 it builds
+`LMCacheMPConnector` (`mp/worker.py`) directly with `transfers_off_step=True`:
+the backend publishes PAGE views plus checkpoint image groups
+(`recurrent_page_groups`), a load restores the image from the PAGE units it
+fills, the transfer thread submits and polls, and vLLM's preemption fence
+(`fence`) waits on that thread's rounds. The native path
 leases existing READY checkpoint PAGE units; it does not snapshot the request's
 live Active SLOT again. Every running request therefore keeps its normal fixed
 SLOT.

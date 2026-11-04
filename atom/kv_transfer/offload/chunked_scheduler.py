@@ -1424,13 +1424,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._clear_pending_load(sid)
         return True
 
-    def _reopen_saves(self, sid: str, hbm: int) -> None:
-        """The tier hit will not be loaded, so `[hbm, hit)` is recomputed:
-        let its chunks be stored again rather than treated as persisted."""
-        entry = self._save_tracker.get(sid)
-        if entry is not None:
-            entry[1] = min(int(entry[1]), self._chunk_floor(hbm))
-
     def load_finished(self, req_id) -> bool:
         sid = str(req_id.req_id if isinstance(req_id, LoadOperationId) else req_id)
         active = self._active_load_operations.get(sid)

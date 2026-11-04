@@ -875,6 +875,13 @@ class OffloadSchedulerMixin(ABC):
         if failed_seq is not None:
             self._load_failed_seqs[sid] = failed_seq
 
+    def _reopen_saves(self, sid: str, hbm: int) -> None:
+        """The tier hit will not be loaded, so `[hbm, hit)` is recomputed:
+        let its chunks be stored again rather than treated as persisted."""
+        entry = self._save_tracker.get(sid)
+        if entry is not None:
+            entry[1] = min(int(entry[1]), self._chunk_floor(hbm))
+
     def _release_failed_load_attempt(self, sid: str, seq) -> None:
         """Drop the mark when its sequence is done with the request ID."""
 

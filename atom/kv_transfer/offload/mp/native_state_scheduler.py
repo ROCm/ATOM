@@ -21,11 +21,11 @@ from atom.kv_transfer.offload._offload_common import (
     validated_kv_role,
 )
 from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
-from atom.kv_transfer.offload.mp.deployment import _validate_mp_config
-from atom.kv_transfer.offload.mp.native_state_layout import (
+from atom.kv_transfer.offload.mp.deployment import (
+    _validate_mp_config,
     require_native_state_server,
-    stores_state_images,
 )
+from atom.kv_transfer.offload.mp.native_state_layout import stores_state_images
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
 )

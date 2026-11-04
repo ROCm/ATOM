@@ -18,8 +18,10 @@ Two things never happen on this thread:
   handed back through `take_spent` and dropped on the forward thread.
 
 Given a ``poll`` callable (the vLLM plugin's worker), the thread also polls
-pending transfers: whenever its queue runs dry, when the forward thread wakes it
-(`look`), and every `_IDLE_POLL_S` otherwise. A conc16 step probe of the plugin
+pending transfers: whenever its queue runs dry, when the forward thread asks
+(`look`, `fence`), and every `_IDLE_POLL_S` otherwise. An asked-for round runs
+after the submission in progress, whatever is still queued, so a backlog of
+submissions delays neither a finished load's report nor a fence. A conc16 step probe of the plugin
 priced the forward thread's share at 18.7 ms per submit and 13.8 ms per
 terminal poll (the IPC handle import) under its own launch pressure. A future a
 poll finished holds the server's imported IPC event, so it is handed back
@@ -106,8 +108,8 @@ class _ProducerFences:
 class _TransferThread:
     """Runs queued transfer submissions in order on one thread.
 
-    With ``poll``, also a round of polls whenever the queue runs dry, so every
-    submission queued before a round has gone out when that round polls.
+    With ``poll``, also a round of polls whenever the queue runs dry or the
+    forward thread asks for one (`look`, `fence`).
     """
 
     def __init__(self, name: str, poll: Callable[[], None] | None = None) -> None:
@@ -120,6 +122,7 @@ class _TransferThread:
         self._poll = poll
         self._rounds_started = 0
         self._rounds_done = 0
+        self._round_asked = False
         self._returned: deque[Any] = deque()
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._thread.start()
@@ -188,16 +191,15 @@ class _TransferThread:
         return unshared
 
     def look(self, wait_s: float) -> None:
-        """Wake the poller, and wait up to ``wait_s`` for its round when that
-        round is a pure poll: nothing queued to submit and no round running.
-        A round that has to submit first outlasts any wait short enough for a
-        step; what it settles is reported on a later step."""
+        """Ask for a poll round, and wait up to ``wait_s`` for it when it is a
+        pure poll: nothing queued to submit and no round running. A round that
+        has to submit first outlasts any wait short enough for a step; what it
+        settles is reported on a later step."""
         with self._idle:
             pure = self._outstanding == 0 and self._rounds_done == self._rounds_started
+        target = self._ask_round()
         if wait_s > 0 and pure:
-            self._wait_round(wait_s)
-        else:
-            self._queue.put(_WAKE)
+            self._wait_for_round(target, wait_s)
 
     def fence(
         self,
@@ -237,11 +239,15 @@ class _TransferThread:
                 )
             self._wait_round(min(remaining, _IDLE_POLL_S))
 
-    def _wait_round(self, timeout: float) -> bool:
-        """Wake the poller and wait for a round that starts after this call."""
+    def _ask_round(self) -> int:
+        """Ask for a round after the submission in progress; its number."""
         with self._idle:
+            self._round_asked = True
             target = self._rounds_started + 1
         self._queue.put(_WAKE)
+        return target
+
+    def _wait_for_round(self, target: int, timeout: float) -> bool:
         with self._idle:
             return (
                 self._idle.wait_for(
@@ -250,6 +256,10 @@ class _TransferThread:
                 )
                 and self._rounds_done >= target
             )
+
+    def _wait_round(self, timeout: float) -> bool:
+        """Ask for a round and wait for it: one that starts after this call."""
+        return self._wait_for_round(self._ask_round(), timeout)
 
     def drain(self, timeout: float | None = None) -> bool:
         """Wait until every queued submission has run. False on timeout."""
@@ -286,32 +296,34 @@ class _TransferThread:
                 item = _WAKE
             if item is None:
                 return
-            if item is _WAKE:
-                if self._queue.empty():
-                    self._poll_round()
+            if item is not _WAKE:
+                fn, args, ready = item
+                try:
+                    if ready is not None:
+                        self._wait_ready(ready)
+                    fn(*args)
+                except BaseException as exc:  # re-raised by raise_error
+                    logger.exception("LMCache MP transfer submission failed")
+                    if self._error is None:
+                        self._error = exc
+                finally:
+                    with self._spent_lock:
+                        self._spent.append(args)
+                    del fn, args, ready, item
+                    with self._idle:
+                        self._outstanding -= 1
+                        if not self._outstanding:
+                            self._idle.notify_all()
+            if self._poll is None:
                 continue
-            fn, args, ready = item
-            try:
-                if ready is not None:
-                    self._wait_ready(ready)
-                fn(*args)
-            except BaseException as exc:  # re-raised by raise_error
-                logger.exception("LMCache MP transfer submission failed")
-                if self._error is None:
-                    self._error = exc
-            finally:
-                with self._spent_lock:
-                    self._spent.append(args)
-                del fn, args, ready, item
-                with self._idle:
-                    self._outstanding -= 1
-                    if not self._outstanding:
-                        self._idle.notify_all()
-            if self._poll is not None and self._queue.empty():
+            with self._idle:
+                asked = self._round_asked
+            if asked or self._queue.empty():
                 self._poll_round()
 
     def _poll_round(self) -> None:
         with self._idle:
+            self._round_asked = False
             self._rounds_started += 1
             number = self._rounds_started
         try:
