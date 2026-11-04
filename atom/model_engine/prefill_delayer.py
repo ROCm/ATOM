@@ -410,8 +410,6 @@ class PrefillDelayer:
                 "prefill_decode_interval must be non-negative; "
                 f"got {prefill_decode_interval}"
             )
-        # Accept the legacy image's empty-string interval spelling.
-        admit_policy = admit_policy or "interval"
         if admit_policy not in PREFILL_ADMIT_POLICIES:
             raise ValueError(f"unknown admit_policy={admit_policy!r}")
         self.admit_policy = admit_policy

@@ -31,8 +31,10 @@ from atom.models.deepseek_v41.mono.config import (
 )
 from atom.models.deepseek_v41.mono.draft_runner import DraftMonoRunner
 from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
+from atom.mono.runtime import deployment
 from atom.mono.runtime.deployment import dp_attention_ranks
 from atom.mono.runtime.route import LazyRunner
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -155,6 +157,17 @@ def install_mono_decode(
     """``model`` wrapped for mono decode (and ``drafter``'s DSpark draft model
     for its backbone), or ``model`` itself when this deployment is one mono
     does not serve."""
+    if not envs.ATOM_MONO_ENABLE:
+        logger.info("V4.1 mono decode off: switched off")
+        return model
+    if deployment._gfx() == "gfx1250":
+        from atom.models.deepseek_v41.mono.gfx1250.dspark_dispatch import (
+            install_mono_decode as install_dspark_decode,
+        )
+
+        return install_dspark_decode(
+            model, atom_config, drafter, metadata_builder=metadata_builder
+        )
     why = config_refusal(atom_config)
     if why is not None:
         logger.info("V4.1 mono decode off: %s", why)
