@@ -374,7 +374,7 @@ Environment variables in `atom/utils/envs.py` are evaluated lazily via `__getatt
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `AITER_QUICK_REDUCE_QUANTIZATION` | str | -- | Set to `INT4` to enable quantized AllReduce for prefill (read by AITER's AllReduce kernel). At SP4 on gfx950 it also quantizes the native SP MoE reduce-scatter of tensors from 24 MiB |
+| `AITER_QUICK_REDUCE_QUANTIZATION` | str | -- | Set to `INT4` to enable quantized AllReduce for prefill (read by AITER's AllReduce kernel) |
 
 ## Multi-GPU deployment examples
 

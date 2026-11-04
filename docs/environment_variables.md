@@ -30,9 +30,7 @@ native MoE and a warning says why. SP needs AITER with
 [ROCm/aiter#7346](https://github.com/ROCm/aiter/pull/7346), checked at startup, and
 MegaMoE also needs MORI built with `BUILD_CCO_SDMA=ON`. Each launch covers at most
 `min(ceil(max_num_batched_tokens / N), 8192)` local rows, and a larger local shard runs as
-several launches. On the native path at SP4 on gfx950,
-`AITER_QUICK_REDUCE_QUANTIZATION=INT4` also quantizes the expert reduce-scatter of
-tensors from 24 MiB.
+several launches.
 
 ## Data parallelism
 

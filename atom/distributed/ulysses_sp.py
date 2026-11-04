@@ -33,14 +33,12 @@ def check_aiter_sp_api() -> None:
     from aiter.dist.device_communicators import (
         communicator_cuda,
         custom_all_reduce,
-        quick_all_reduce,
     )
     from aiter.ops import communication
 
     needs = {
         communicator_cuda.CudaCommunicator: ["all_to_all"],
         custom_all_reduce.CustomAllreduce: ["registered_input_view", "head_exchange"],
-        quick_all_reduce.QuickAllReduce: ["quick_reduce_scatter"],
         communication: ["MegaMoeSetupError"],
     }
     missing = [
