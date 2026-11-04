@@ -101,29 +101,13 @@ for comparisons and reductions, and its
 ATOM retains its existing strictly-greater rank/tie semantics and raw-target
 probability definition. This is not a claim of equivalent vLLM throughput.
 
-## Short-run performance comparison
-
-V4.1 Flash, TP2, DSpark with five draft tokens and CUDA graphs, streaming at
-concurrency 8, temperature 0, fixed 68-token output. Each mode used two rotated
-15-second issue windows; throughput is total output tokens divided by total
-request span. These are short-run results, not long-run qualification.
-
-| Mode | Before packed transport (tok/s) | Packed transport confirmation (tok/s) |
-| --- | ---: | ---: |
-| Disabled | 2642 | 2679 |
-| Enabled, top-K 0 | 2310 | 2607 |
-| Enabled, top-K 20 | 2245 | 2570 |
-
-The confirmation run measured approximately 2.7% / 4.1% lower throughput for
-top-K 0 / 20 than disabled. All outputs had the same text hash and no request
-errors. The initial packed-transport run included a slower disabled window
-(2343 tok/s; its second window was 2654 tok/s), so an additional identical
-confirmation block was collected; the original samples were retained.
-This comparison is against the preceding PR implementation, not main.
-
 ## Text attribution and delivery
 
-Logprob-enabled requests explicitly disable tokenizer whitespace cleanup. Parsing
+Tokenizers that enable whitespace cleanup are rejected for logprob requests;
+the request never changes the tokenizer's decoding policy. Only a standalone
+ByteLevel decoder is supported; decoder chains and TikToken tokenizers are not
+currently supported. Kimi replay tests exercise parser attribution only and do
+not constitute real Kimi tokenizer support. Parsing
 keeps the original byte ranges through reasoning and tool regions, so visible
 text joined across hidden regions retains the correct token probabilities even
 when the same text also occurs inside tool arguments. SSE attaches probabilities

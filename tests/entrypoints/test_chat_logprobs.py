@@ -39,6 +39,7 @@ def codec():
                 decoder=SimpleNamespace(__getstate__=lambda: b'{"type":"ByteLevel"}')
             ),
             all_special_ids=[7],
+            get_vocab=lambda: {v: k for k, v in vocab.items()},
             convert_ids_to_tokens=lambda i: vocab[i],
         )
     )

@@ -11,7 +11,13 @@ from typing import Any
 
 from atom.structured_output.validation import raise_for_structured_error
 
-from .logprobs import LogprobCollector, LogprobError, LogprobsProcessor, LogprobText
+from .logprobs import (
+    LogprobCollector,
+    LogprobError,
+    LogprobsProcessor,
+    LogprobText,
+    claim_logprobs,
+)
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
     STREAM_DONE_MESSAGE,
@@ -292,18 +298,7 @@ def create_chat_chunk(
             if key in ("content", "reasoning_content")
         ):
             raise LogprobError("Visible text has no token-byte source spans")
-        fields = {
-            field: text
-            for field, text in delta.items()
-            if field in ("content", "reasoning_content")
-            and isinstance(text, LogprobText)
-            and text
-        }
         probabilities = logprob_values
-        if probabilities is None:
-            probabilities = (
-                next(iter(fields.values())).owner.take_fields(fields) if fields else {}
-            )
         if probabilities:
             chunk["choices"][0]["logprobs"] = probabilities
         chunk["choices"][0]["delta"] = {
@@ -324,46 +319,48 @@ def _chat_deltas(reader, parser, text, finished, finish_reason):
     for field, value in segments:
         if field == "reasoning_content":
             if value:
-                yield {field: value}
+                yield field, {field: value}
         else:
             for kind, data in parser.process(value):
                 if kind == "content":
-                    yield {"content": data}
+                    yield kind, {"content": data}
                 elif kind in ("tool_call_start", "tool_call_args"):
-                    yield {"tool_calls": [data]}
+                    yield kind, {"tool_calls": [data]}
     if finished:
         for kind, data in parser.flush():
             if kind == "content":
-                yield {"content": data}
+                yield kind, {"content": data}
             elif kind in ("tool_call_start", "tool_call_args"):
-                yield {"tool_calls": [data]}
+                yield kind, {"tool_calls": [data]}
 
 
-def _logprob_frames(pending, make_chunk, request_id, model, index=0):
+def _logprob_frames(pending, make_chunk, request_id, model, index=0, held_text=""):
     # A tool region may hold older content while reasoning is already emitted.
     # Resolve all available spans in source order, then serialize the deltas in
     # their existing event order. A boundary token belongs to one field only.
-    values = [{} for _ in pending]
-    spans = []
-    for i, delta in enumerate(pending):
-        for field in ("content", "reasoning_content"):
-            text = delta.get(field)
-            if not text:
-                continue
-            if not isinstance(text, LogprobText):
-                raise LogprobError("Visible text has no token-byte source spans")
-            values[i][field] = []
-            for value, start, end in text.parts:
-                spans.append((start, i, end, field, value, text.owner))
-    for start, i, end, field, value, owner in sorted(spans):
-        values[i][field].extend(owner.take(LogprobText([(value, start, end)], owner)))
+    cutoff = (
+        min(start for start, _ in held_text.source_ranges)
+        if isinstance(held_text, LogprobText) and held_text
+        else float("inf")
+    )
+    ready, held = [], []
+    for delta in pending:
+        spans = [
+            end
+            for field, text in delta.items()
+            if field in ("content", "reasoning_content")
+            and isinstance(text, LogprobText)
+            for _, end in text.source_ranges
+        ]
+        (ready if all(end <= cutoff for end in spans) else held).append(delta)
+    pending[:] = held
+    values = claim_logprobs(ready)
     frames = [
         make_chunk(
             request_id, model, delta=delta, index=index, logprob_values=probabilities
         )
-        for delta, probabilities in zip(pending, values)
+        for delta, probabilities in zip(ready, values)
     ]
-    pending.clear()
     return frames
 
 
@@ -379,8 +376,10 @@ def chat_finish_frames(
 ):
     """Serialize final choices once, with aggregate usage on the last choice."""
     frames = []
-    for index, reason in enumerate(reasons):
-        last = usage_on_finish and index == len(reasons) - 1
+    successful = [i for i, reason in enumerate(reasons) if reason is not None]
+    for index in successful:
+        reason = reasons[index]
+        last = usage_on_finish and index == successful[-1]
         frames.append(
             create_chat_chunk(
                 request_id,
@@ -503,26 +502,27 @@ async def stream_chat_response(
 
             try:
                 done = bool(chunk_data.get("finished"))
-                for delta in _chat_deltas(
+                for kind, delta in _chat_deltas(
                     reasoning_filter, tool_parser, new_text, done, engine_finish_reason
                 ):
-                    if "tool_calls" in delta:
-                        has_tool_calls |= any(
-                            "arguments" in call.get("function", {})
-                            for call in delta["tool_calls"]
-                        )
+                    has_tool_calls |= kind == "tool_call_args"
                     if pending is None:
                         yield make_chunk(request_id, model, delta=delta)
                     else:
                         pending.append(delta)
-                if pending is not None and (done or not tool_parser.has_pending_text):
+                if pending is not None:
                     for frame in _logprob_frames(
-                        pending, make_chunk, request_id, model
+                        pending,
+                        make_chunk,
+                        request_id,
+                        model,
+                        held_text=tool_parser.held_text if not done else "",
                     ):
                         yield frame
-                    stream_collector.trackers[0].discard_resolved(
-                        reasoning_filter.held_text
-                    )
+                    if not tool_parser.has_pending_text:
+                        stream_collector.trackers[0].discard_resolved(
+                            reasoning_filter.held_text
+                        )
                 if done:
                     break
             except LogprobError as exc:
@@ -874,32 +874,32 @@ async def stream_chat_response_fanout(
 
             try:
                 done = bool(chunk_data.get("finished"))
-                for delta in _chat_deltas(
+                for kind, delta in _chat_deltas(
                     reasoning_filters[idx],
                     tool_parsers[idx],
                     new_text,
                     done,
                     engine_finish_reasons[idx],
                 ):
-                    if "tool_calls" in delta:
-                        has_tool_calls[idx] |= any(
-                            "arguments" in call.get("function", {})
-                            for call in delta["tool_calls"]
-                        )
+                    has_tool_calls[idx] |= kind == "tool_call_args"
                     if pending is None:
                         yield make_chunk(request_id, model, delta=delta, index=idx)
                     else:
                         pending[idx].append(delta)
-                if pending is not None and (
-                    done or not tool_parsers[idx].has_pending_text
-                ):
+                if pending is not None:
                     for frame in _logprob_frames(
-                        pending[idx], make_chunk, request_id, model, idx
+                        pending[idx],
+                        make_chunk,
+                        request_id,
+                        model,
+                        idx,
+                        held_text=tool_parsers[idx].held_text if not done else "",
                     ):
                         yield frame
-                    shared_collector.trackers[idx].discard_resolved(
-                        reasoning_filters[idx].held_text
-                    )
+                    if not tool_parsers[idx].has_pending_text:
+                        shared_collector.trackers[idx].discard_resolved(
+                            reasoning_filters[idx].held_text
+                        )
                 if done:
                     finished[idx] = True
             except LogprobError as exc:
@@ -934,8 +934,12 @@ async def stream_chat_response_fanout(
             request_id,
             model,
             [
-                openai_stop_reason_with_calls(
-                    engine_finish_reasons[i], has_tool_calls[i]
+                (
+                    None
+                    if engine_finish_reasons[i] == "error"
+                    else openai_stop_reason_with_calls(
+                        engine_finish_reasons[i], has_tool_calls[i]
+                    )
                 )
                 for i in range(n)
             ],

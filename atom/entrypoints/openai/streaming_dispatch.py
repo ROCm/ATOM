@@ -115,7 +115,6 @@ class IncrementalStreamDetokenizer:
     # it. Maintained whether or not reuse is on, so the two paths never diverge
     # in state -- only in whether they pay for the decode.
     last_delta: str = ""
-    # None preserves the tokenizer's configured policy for ordinary requests.
 
     def update(self, token_ids: list[int], finished: bool) -> str:
         """The text this stream has not been given yet, from its next tokens.

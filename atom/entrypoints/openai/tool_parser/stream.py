@@ -349,6 +349,13 @@ class ToolCallStreamParser:
         """Whether an earlier input span can still become visible content."""
         return self._region is not None or bool(self._scanner and self._scanner.held)
 
+    @property
+    def held_text(self):
+        """Earliest unresolved text, without materializing an open region."""
+        if self._region is not None:
+            return self._region.head
+        return self._scanner.held if self._scanner else ""
+
     # -- public ------------------------------------------------------------
     def process(self, text: str) -> list:
         """Consume one chunk; return the events it completed."""

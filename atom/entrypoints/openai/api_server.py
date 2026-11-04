@@ -85,6 +85,7 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
+from .logprobs import LogprobCollector, TokenBytes
 from .metrics_setup import create_metrics_exporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
@@ -1921,8 +1922,6 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 multimodal=_has_multimodal_content(messages),
                 synthetic=synthetic_token_text is not None,
             )
-            from .logprobs import TokenBytes
-
             logprob_codec = getattr(app.state, "logprob_codec", None)
             if logprob_codec is None or logprob_codec.tokenizer is not tokenizer:
                 logprob_codec = TokenBytes(tokenizer)
@@ -1998,79 +1997,44 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         # Streaming
         if request.stream:
-            stream_input = prompt_or_tokens
-            stream_multimodal_data = multimodal_data
-            if effective_n > 1:
-                seq_ids, stream_collector, num_prompt_tokens = (
-                    await setup_streaming_request_fanout(
-                        stream_input,
-                        sampling_params,
-                        request_id,
-                        multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=kv_transfer_params,
-                        **dp_routing,
-                    )
-                )
-                if logprob_codec is not None:
-                    from .logprobs import LogprobCollector
-
-                    stream_collector = LogprobCollector(
-                        stream_collector,
-                        logprob_codec,
-                        request.top_logprobs or 0,
-                        effective_n,
-                    )
-                gen = stream_chat_response_fanout(
-                    request_id,
-                    model_name,
+            setup = (
+                setup_streaming_request_fanout
+                if effective_n > 1
+                else setup_streaming_request
+            )
+            sequences, stream_collector, num_prompt_tokens = await setup(
+                prompt_or_tokens,
+                sampling_params,
+                request_id,
+                multimodal_data=multimodal_data,
+                kv_transfer_params=kv_transfer_params,
+                **dp_routing,
+            )
+            if logprob_codec is not None:
+                stream_collector = LogprobCollector(
                     stream_collector,
-                    seq_ids,
-                    num_prompt_tokens,
-                    cleanup_stream,
-                    cleanup_request,
-                    tools=request.tools,
-                    tool_choice=request.tool_choice,
-                    reasoning=_reasoning,
-                    tool_parser_cls=tool_call_parser_cls,
-                    usage_on_finish=compatibility.chat_usage_on_finish,
-                    include_usage=bool(
-                        (request.stream_options or {}).get("include_usage")
-                    ),
+                    logprob_codec,
+                    sampling_params.top_logprobs,
+                    effective_n,
                 )
-            else:
-                seq_id, stream_collector, num_prompt_tokens = (
-                    await setup_streaming_request(
-                        stream_input,
-                        sampling_params,
-                        request_id,
-                        multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=kv_transfer_params,
-                        **dp_routing,
-                    )
-                )
-                if logprob_codec is not None:
-                    from .logprobs import LogprobCollector
-
-                    stream_collector = LogprobCollector(
-                        stream_collector, logprob_codec, request.top_logprobs or 0, 1
-                    )
-                gen = stream_chat_response(
-                    request_id,
-                    model_name,
-                    stream_collector,
-                    seq_id,
-                    num_prompt_tokens,
-                    cleanup_stream,
-                    cleanup_request,
-                    tools=request.tools,
-                    tool_choice=request.tool_choice,
-                    reasoning=_reasoning,
-                    tool_parser_cls=tool_call_parser_cls,
-                    usage_on_finish=compatibility.chat_usage_on_finish,
-                    include_usage=bool(
-                        (request.stream_options or {}).get("include_usage")
-                    ),
-                )
+            stream_response = (
+                stream_chat_response_fanout if effective_n > 1 else stream_chat_response
+            )
+            gen = stream_response(
+                request_id,
+                model_name,
+                stream_collector,
+                sequences,
+                num_prompt_tokens,
+                cleanup_stream,
+                cleanup_request,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+                reasoning=_reasoning,
+                tool_parser_cls=tool_call_parser_cls,
+                usage_on_finish=compatibility.chat_usage_on_finish,
+                include_usage=bool((request.stream_options or {}).get("include_usage")),
+            )
             if schema is not None:
 
                 gen = validate_chat_stream(gen, schema)
@@ -2105,7 +2069,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
                 logprob_codec=logprob_codec,
-                top_logprobs=request.top_logprobs or 0,
+                top_logprobs=sampling_params.top_logprobs,
             )
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
@@ -2132,7 +2096,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
                 logprob_codec=logprob_codec,
-                top_logprobs=request.top_logprobs or 0,
+                top_logprobs=sampling_params.top_logprobs,
             )
         elif effective_n > 1:
             outputs = await _race_disconnect(
@@ -2158,7 +2122,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
                 logprob_codec=logprob_codec,
-                top_logprobs=request.top_logprobs or 0,
+                top_logprobs=sampling_params.top_logprobs,
             )
         else:
             final_output = await _run_nonstream_with_disconnect(
@@ -2185,7 +2149,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
                 logprob_codec=logprob_codec,
-                top_logprobs=request.top_logprobs or 0,
+                top_logprobs=sampling_params.top_logprobs,
             )
         if schema is not None:
 

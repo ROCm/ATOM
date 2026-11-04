@@ -12,7 +12,9 @@ Chat wire-format assembly lives in serving_chat.py.
 import codecs
 import json
 import logging
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
+
+from transformers.convert_slow_tokenizer import bytes_to_unicode
 
 
 class LogprobError(RuntimeError):
@@ -95,13 +97,16 @@ class _LogprobStore:
         self.ends.append(end)
 
     def within(self, start, end):
-        first = bisect_right(self.ends, start, lo=self.cursor)
+        first = bisect_left(self.ends, start, lo=self.cursor)
         for index in range(first, len(self.records)):
             record = self.records[index]
             if record is None:
                 continue
-            if record[0] >= end:
+            zero_width = record[0] == record[1]
+            if record[0] > end or (record[0] == end and not zero_width):
                 break
+            if record[1] == start and not zero_width:
+                continue
             self.records[index] = None
             yield record
         while self.cursor < len(self.records) and self.records[self.cursor] is None:
@@ -131,6 +136,11 @@ class TokenBytes:
         state = json.loads(decoder.__getstate__()) if decoder is not None else {}
         if state.get("type") != "ByteLevel":
             raise ValueError("Chat logprobs currently requires a ByteLevel tokenizer")
+        if getattr(tokenizer, "clean_up_tokenization_spaces", False):
+            raise ValueError(
+                "Chat logprobs does not support tokenizer whitespace cleanup; "
+                "the tokenizer's decoding policy is not changed by this request"
+            )
         self.tokenizer = tokenizer
         self.special = frozenset(tokenizer.all_special_ids) | {
             token_id
@@ -139,35 +149,18 @@ class TokenBytes:
             ).items()
             if token.special
         }
-        # Inverse of the reversible GPT-2/ByteLevel byte alphabet.
-        bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
-        cs = list(bs)
-        extra = 0
-        for b in range(256):
-            if b not in bs:
-                bs.append(b)
-                cs.append(256 + extra)
-                extra += 1
-        self.byte_decoder = dict(zip(map(chr, cs), bs))
-        self.cache = {}
+        inverse = {char: byte for byte, char in bytes_to_unicode().items()}
+        self.byte_table = {}
+        for token, token_id in tokenizer.get_vocab().items():
+            try:
+                raw = bytes(inverse[char] for char in token)
+            except KeyError:
+                raw = token.encode("utf-8")
+            self.byte_table[token_id] = raw
 
     def raw(self, token_id):
-        if token_id in self.cache:
-            return self.cache[token_id]
-        token = self.tokenizer.convert_ids_to_tokens(int(token_id))
-        # Model vocabularies may be padded beyond the tokenizer vocabulary.
-        # Such a candidate has no text bytes; its probability remains valid.
-        if token is None:
-            return b""
-        try:
-            raw = bytes(self.byte_decoder[c] for c in token)
-        except KeyError:
-            # Added non-byte-alphabet tokens (e.g. structural markers).
-            raw = token.encode("utf-8")
-        if len(self.cache) >= 8192:
-            self.cache.clear()
-        self.cache[token_id] = raw
-        return raw
+        # Padded model-vocabulary IDs have no tokenizer representation.
+        return self.byte_table.get(int(token_id), b"")
 
     def candidate(self, token_id, logprob):
         raw = self.raw(token_id)
@@ -250,24 +243,11 @@ class LogprobsProcessor:
         return result
 
     def take_fields(self, fields):
-        """Assign boundary tokens once, in source order for both JSON and SSE."""
-        if any(
-            value and (not isinstance(value, LogprobText) or value.owner is not self)
-            for value in fields.values()
-        ):
-            raise LogprobError("Visible text has no token-byte source spans")
-        values = {field: [] for field in fields}
-        # A replayed Kimi answer has the same source as its earlier reasoning.
-        # Preserve the first delivery's ownership when both spans are identical.
-        spans = sorted(
-            (start, 0 if field == "reasoning_content" else 1, end, field, text)
-            for field, value in fields.items()
-            if value
-            for text, start, end in value.parts
+        # JSON has no event order; reasoning was delivered before replayed content.
+        ordered = dict(
+            sorted(fields.items(), key=lambda item: item[0] != "reasoning_content")
         )
-        for start, _, end, field, text in spans:
-            values[field].extend(self.take(LogprobText([(text, start, end)], self)))
-        return values
+        return claim_logprobs([ordered])[0]
 
     def discard_resolved(self, held_text):
         # Called only after the tool parser and pending SSE deltas are drained.
@@ -315,3 +295,23 @@ class LogprobCollector:
                 logprob_error=str(exc),
             )
         return payload
+
+
+def claim_logprobs(deltas):
+    """Claim source spans once, breaking equal starts by delivery order."""
+    values = [{} for _ in deltas]
+    spans = []
+    for i, delta in enumerate(deltas):
+        for priority, (field, text) in enumerate(delta.items()):
+            if field not in ("content", "reasoning_content"):
+                continue
+            values[i][field] = []
+            if not text:
+                continue
+            if not isinstance(text, LogprobText):
+                raise LogprobError("Visible text has no token-byte source spans")
+            for value, start, end in text.parts:
+                spans.append((start, i, priority, end, field, value, text.owner))
+    for start, i, _, end, field, value, owner in sorted(spans):
+        values[i][field].extend(owner.take(LogprobText([(value, start, end)], owner)))
+    return values

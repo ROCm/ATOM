@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from atom.entrypoints.openai.logprobs import LogprobsProcessor
+from atom.entrypoints.openai.logprobs import LogprobsProcessor, claim_logprobs
 from atom.entrypoints.openai.reasoning import NO_REASONING
 from atom.entrypoints.openai.serving_chat import _build_chat_choice, create_chat_chunk
 from atom.entrypoints.openai.sse import iter_sse_data
@@ -112,7 +112,11 @@ def test_stream_hidden_repeated_text_uses_visible_occurrence(size):
         for kind, value in events:
             if kind == "content":
                 frame = create_chat_chunk(
-                    "req", "model", {"content": value}, with_logprobs=True
+                    "req",
+                    "model",
+                    {"content": value},
+                    with_logprobs=True,
+                    logprob_values=claim_logprobs([{"content": value}])[0],
                 )
                 choice = json.loads(next(iter_sse_data(frame)))["choices"][0]
                 visible.append(choice["delta"]["content"])
@@ -419,6 +423,11 @@ def test_bad_logprobs_terminate_only_the_failing_fanout_choice():
             for p in payloads
             for c in p.get("choices", [])
         )
+        assert not any(
+            c["index"] == 0 and c.get("finish_reason")
+            for p in payloads
+            for c in p.get("choices", [])
+        )
         assert frames[-1].endswith("data: [DONE]\n\n")
         assert (11, {"aborted": True}) in cleaned
 
@@ -433,6 +442,7 @@ def test_added_special_tokens_and_padded_vocab_candidates():
             decoder=SimpleNamespace(__getstate__=lambda: b'{"type":"ByteLevel"}')
         ),
         all_special_ids=[7],
+        get_vocab=lambda: {"hello": 0, "eos": 7, "pad": 8},
         added_tokens_decoder={8: SimpleNamespace(special=True)},
         convert_ids_to_tokens=lambda i: {0: "hello", 7: "eos", 8: "pad"}.get(i),
     )
@@ -579,3 +589,91 @@ def test_lost_source_is_an_internal_error_for_nonstream_too():
     tracker = LogprobsProcessor(Codec())
     with pytest.raises(LogprobError, match="source spans"):
         tracker.take_fields({"content": "plain text"})
+
+
+@pytest.mark.parametrize("position", [0, 1, 2])
+def test_zero_width_tokens_at_visible_span_boundaries(position):
+    class EmptyCodec(Codec):
+        def raw(self, token):
+            return b"" if token == 0 else super().raw(token)
+
+    tracker = LogprobsProcessor(EmptyCodec())
+    ids = [97, 98]
+    ids.insert(position, 0)
+    text = tracker.feed(ids, [TokenLogprob(-1, 1)] * 3, finished=True)
+    assert text == "ab"
+    assert len(tracker.take(text)) == 3
+
+
+def test_announced_tool_name_is_not_completed_arguments():
+    from atom.entrypoints.openai.serving_chat import _chat_deltas
+
+    call = {"function": {"name": "f", "arguments": ""}}
+    parser = SimpleNamespace(
+        process=lambda text: [("tool_call_start", call)], flush=list
+    )
+    events = list(_chat_deltas(NO_REASONING.stream(), parser, "x", True, "stop"))
+    assert events == [("tool_call_start", {"tool_calls": [call]})]
+    assert not any(kind == "tool_call_args" for kind, _ in events)
+
+
+def test_failed_choice_has_no_normal_finish_frame():
+    from atom.entrypoints.openai.serving_chat import chat_finish_frames
+
+    frame = chat_finish_frames(
+        "r", "m", [None, "stop"], {"completion_tokens": 1}, usage_on_finish=True
+    )
+    payloads = [json.loads(data) for data in iter_sse_data(frame) if data != "[DONE]"]
+    assert [c["index"] for p in payloads for c in p.get("choices", [])] == [1]
+    assert payloads[-1]["usage"] == {"completion_tokens": 1}
+
+
+def test_open_tool_region_releases_resolved_prefix_and_name():
+    from functools import partial
+
+    from atom.entrypoints.openai.serving_chat import _logprob_frames
+
+    create_chunk = partial(create_chat_chunk, with_logprobs=True)
+    tracker = LogprobsProcessor(Codec())
+    text = tracker.feed(list(map(ord, "abcXYZ")), records("abcXYZ"))
+    pending = [
+        {"content": text[:3]},
+        {"tool_calls": [{"function": {"name": "f", "arguments": ""}}]},
+        {"reasoning_content": text[4:]},
+    ]
+    frames = _logprob_frames(pending, create_chunk, "r", "m", held_text=text[3:4])
+    assert len(frames) == 2
+    assert pending == [{"reasoning_content": text[4:]}]
+    assert len(_logprob_frames(pending, create_chunk, "r", "m")) == 1
+    assert pending == []
+
+
+@pytest.mark.parametrize("cleanup", [False, True])
+def test_token_byte_table_is_built_once_without_changing_cleanup(cleanup):
+    from atom.entrypoints.openai.logprobs import TokenBytes
+
+    calls = []
+
+    def vocab():
+        calls.append(1)
+        return {"Ġhello": 0, "!": 1}
+
+    tokenizer = SimpleNamespace(
+        backend_tokenizer=SimpleNamespace(
+            decoder=SimpleNamespace(__getstate__=lambda: b'{"type":"ByteLevel"}')
+        ),
+        all_special_ids=[],
+        get_vocab=vocab,
+        clean_up_tokenization_spaces=cleanup,
+    )
+    if cleanup:
+        with pytest.raises(ValueError, match="whitespace cleanup"):
+            TokenBytes(tokenizer)
+        assert tokenizer.clean_up_tokenization_spaces
+        assert not calls
+    else:
+        codec = TokenBytes(tokenizer)
+        for _ in range(9000):
+            assert codec.raw(0) == b" hello"
+            assert codec.raw(99) == b""
+        assert calls == [1]
