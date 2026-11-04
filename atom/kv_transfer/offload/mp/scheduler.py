@@ -254,10 +254,14 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         shipped[seq.id] = (seq, new)
         return base, delta
 
-    def _drop_shipped_tokens(self, req_id: Any) -> None:
-        shipped = self._shipped_tokens
-        if shipped.pop(req_id, None) is not None:
-            self._shipped_drops.append(req_id)
+    def _drop_shipped_tokens(self, req_id: Any, seq: Any = None) -> None:
+        """Drop `req_id`'s shipped prefix; with `seq`, only if the entry is
+        that request's (a reused id may already belong to a newer one)."""
+        entry = self._shipped_tokens.get(req_id)
+        if entry is None or (seq is not None and entry[0] is not seq):
+            return
+        del self._shipped_tokens[req_id]
+        self._shipped_drops.append(req_id)
 
     def _transfer_tokens(self, seq: Any, end: int) -> tuple[list[int], int]:
         base, delta = self._ship_tokens(seq, end)
@@ -461,7 +465,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             del pending[sid]
             # No save can follow now: drop the workers' copy of its shipped
             # token prefix.
-            self._drop_shipped_tokens(seq.id)
+            self._drop_shipped_tokens(seq.id, seq)
             try:
                 self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))
             except Exception:

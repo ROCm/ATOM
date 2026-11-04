@@ -137,8 +137,8 @@ class KVConnectorSchedulerBase(ABC):
         return contextlib.nullcontext()
 
     def cancel_preadmission(self, seq: Any) -> None:
-        """Undo an admission the scheduler takes back before any dispatch."""
-        self.cancel_pending_load(seq)
+        """Undo an admission the scheduler takes back before any dispatch. A
+        P/D connector holds nothing it would dispatch for it."""
 
     def abort_send(self, seq: Any) -> None:
         """Retire an unsent abort; streaming senders must wait for reader drain."""

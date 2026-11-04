@@ -20,45 +20,86 @@ from atom.utils import envs
 
 
 class PrefixSpreadRouter:
-    """Prefix ownership index and the placement rule built on it."""
+    """Prefix ownership index, in-flight prefill state and the placement rule."""
 
     # Sampled prefix hashes, `STRIDE_TOKENS` apart: 2^17 entries cover 512M
     # tokens of prefix history.
     STRIDE_TOKENS = 4096
     CAP = 1 << 17
 
-    def __init__(
-        self, idle_tokens: int, counters: dict, tier_loads: bool = True
-    ) -> None:
+    def __init__(self, idle_tokens: int, tier_loads: bool = True) -> None:
         # A rank with under `idle_tokens` queued prefill is about to idle; a
         # prefix's rank with over twice that has a backlog.
         self.idle_tokens = idle_tokens
         # Whether a rank can load a prefix it does not hold from an offload
         # tier. Without one a moved request recomputes what it does not hold.
         self.tier_loads = tier_loads
-        self.counters = counters
-        for key in (
-            "prefix_owner_total",
-            "prefix_moved_total",
-            "prefix_moved_tokens",
-            "prefix_moved_partial_total",
-            "prefix_cold_total",
-            "prefix_source_busy_total",
-        ):
-            counters.setdefault(key, 0)
+        self.counters = dict.fromkeys(
+            (
+                "prefix_owner_total",
+                "prefix_moved_total",
+                "prefix_moved_tokens",
+                "prefix_moved_partial_total",
+                "prefix_cold_total",
+                "prefix_source_busy_total",
+            ),
+            0,
+        )
         # Sampled prompt-block hash -> {rank: request whose prefill puts that
         # part on the rank}; most recent last.
         self.index: OrderedDict[int, dict] = OrderedDict()
         # seq id -> (rank, hashes whose entry it relies on before its prefill
-        # completes), and (hash, rank) -> unfinished requests relying on that
-        # not-yet-confirmed entry.
+        # completes, prompt tokens), and (hash, rank) -> unfinished requests
+        # relying on that not-yet-confirmed entry.
         self.seq_hashes: dict = {}
         self.pending: dict = {}
+        # Requests routed here whose prefill has not completed (kept apart from
+        # the token charge, which is 0 for a fully cached prompt that is
+        # nevertheless still prefilling), and the prefix each was credited.
+        self._prefilling: set = set()
+        self._est_hit: dict = {}
 
     def reset(self) -> None:
         self.index.clear()
         self.seq_hashes.clear()
         self.pending.clear()
+        self._prefilling.clear()
+        self._est_hit.clear()
+
+    # -- request lifecycle (called by CoreManager under its lock) --------------
+
+    def charged(self, seq_id) -> int:
+        """The prefix `seq_id` was credited at `select`; it is now in flight."""
+        self._prefilling.add(seq_id)
+        return self._est_hit.pop(seq_id, 0)
+
+    def prefilling(self, seq_id) -> bool:
+        return seq_id in self._prefilling
+
+    def prefill_complete(self, seq_id) -> None:
+        """`seq_id` completed its prefill: the entries it relied on are real."""
+        self._prefilling.discard(seq_id)
+        entry = self.seq_hashes.pop(seq_id, None)
+        if entry is None:
+            return
+        rank, hashes, _ = entry
+        for h in hashes:
+            self.pending.pop((h, rank), None)
+
+    def released(self, seq_id) -> dict:
+        """`seq_id` left (finished, aborted, rejected, failed send). Returns
+        {request: prompt tokens} for requests that took over computing a part
+        it left unprefilled (`_left_unprefilled`); they are charged it."""
+        self._est_hit.pop(seq_id, None)
+        if seq_id not in self._prefilling:
+            self.prefill_complete(seq_id)
+            return {}
+        self._prefilling.discard(seq_id)
+        return {
+            heir: prompt
+            for heir, prompt in self._left_unprefilled(seq_id).items()
+            if heir in self._prefilling
+        }
 
     # -- placement ------------------------------------------------------------
 
@@ -67,10 +108,10 @@ class PrefixSpreadRouter:
         seq: Any,
         rank_tokens: list[int],
         rank_load: Callable[[int], int],
-        lightest: int,
-        prefilling: set,
+        lightest: Callable[[], int],
     ) -> tuple[int, str]:
-        """(rank, route counter) for `seq`; sets `seq._dp_est_hit`.
+        """(rank, route counter) for `seq`; `charged` returns the prefix it is
+        credited.
 
         - No known prefix: the lightest rank (`least_tokens` score).
         - The prefix's rank (owner) has a backlog (over 2 x idle queued
@@ -82,22 +123,23 @@ class PrefixSpreadRouter:
           this is what lets the request reuse it from HBM.
         """
         chain = getattr(seq, "prompt_hash_chain", None)
-        hits, owner, source = self._rank_hits(chain, len(rank_tokens), prefilling)
-        hit = hits.get(owner, 0) if owner is not None else 0
+        prompt = int(getattr(seq, "num_prompt_tokens", 0) or 0)
+        hits, owner, source = self._rank_hits(chain, len(rank_tokens))
         if owner is None:
-            seq._dp_est_hit = 0
-            rank = lightest
-            self._record(chain, rank, seq.id, 0, None)
+            rank = lightest()
+            self._record(chain, rank, seq.id, 0, None, prompt)
+            self.counters["prefix_cold_total"] += 1
             return rank, "prefix_cold_total"
 
-        busy = source is not None and source in prefilling
-        target = self._idle_target(owner, hits, rank_tokens, rank_load)
-        if target is not None and rank_tokens[owner] > 2 * self.idle_tokens:
-            rank = target
-        else:
-            rank = owner
-            if busy:
-                self.counters["prefix_source_busy_total"] += 1
+        hit = hits.get(owner, 0)
+        busy = source is not None and source in self._prefilling
+        rank = owner
+        if rank_tokens[owner] > 2 * self.idle_tokens:
+            target = self._idle_target(owner, hits, rank_tokens, rank_load)
+            if target is not None:
+                rank = target
+        if rank == owner and busy:
+            self.counters["prefix_source_busy_total"] += 1
 
         local = hits.get(rank, 0)
         # The tier holds the prefix only once its source finished prefilling,
@@ -105,26 +147,19 @@ class PrefixSpreadRouter:
         loadable = (
             self.tier_loads and not busy and hit - local >= envs.OFFLOAD_MIN_LOAD_TOKENS
         )
-        if rank == owner or loadable:
-            seq._dp_est_hit = hit
-        else:
-            seq._dp_est_hit = local
+        est_hit = hit if rank == owner or loadable else local
+        self._est_hit[seq.id] = est_hit
         if hit <= 0:
             decision = "prefix_cold_total"
         elif rank == owner:
             decision = "prefix_owner_total"
         else:
             decision = "prefix_moved_total"
-            self.counters["prefix_moved_tokens"] += max(0, seq._dp_est_hit - local)
-            if loadable:
-                # The destination's scheduler checks this against the tier's
-                # answer (`prefix_moved_tier_miss`).
-                seq._dp_tier_expect = hit
+            self.counters["prefix_moved_tokens"] += max(0, est_hit - local)
             if local > 0:
                 self.counters["prefix_moved_partial_total"] += 1
-        self._record(
-            chain, rank, seq.id, seq._dp_est_hit, source, seq.num_prompt_tokens
-        )
+        self.counters[decision] += 1
+        self._record(chain, rank, seq.id, est_hit, source, prompt)
         return rank, decision
 
     def _idle_target(
@@ -154,7 +189,7 @@ class PrefixSpreadRouter:
 
     # -- prefix index ---------------------------------------------------------
 
-    def _rank_hits(self, chain, n: int, prefilling: set):
+    def _rank_hits(self, chain, n: int):
         """Per rank, the longest sampled prefix of this prompt it holds.
 
         Returns ({rank: tokens}, owner, source): the owner is the rank with the
@@ -178,7 +213,7 @@ class PrefixSpreadRouter:
                     continue
                 if owner is None:
                     owner, source = rank, seq_id
-                elif seq_id in prefilling:
+                elif seq_id in self._prefilling:
                     continue  # a shorter, finished part may still count below
                 hits[rank] = (i + 1) * hbs
             if len(hits) == n:
@@ -234,16 +269,7 @@ class PrefixSpreadRouter:
             for r in holders:
                 pending.pop((old, r), None)
 
-    def prefill_complete(self, seq_id) -> None:
-        """`seq_id` completed its prefill: the entries it relied on are real."""
-        entry = self.seq_hashes.pop(seq_id, None)
-        if entry is None:
-            return
-        rank, hashes, _ = entry
-        for h in hashes:
-            self.pending.pop((h, rank), None)
-
-    def left_unprefilled(self, seq_id) -> dict:
+    def _left_unprefilled(self, seq_id) -> dict:
         """`seq_id` left before its prefill completed (abort, reject, failed
         send). Remove the provisional entries no other unfinished request on
         that rank still relies on.

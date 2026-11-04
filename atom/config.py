@@ -2013,6 +2013,22 @@ def indexer_cp_unsupported_reason(
     return None
 
 
+def default_offload_prefetch(dp_load_balance: str, kv_transfer_config) -> bool:
+    """`Config.offload_prefetch` when unset: on with prefix-spread routing,
+    except under `kv_connector=multi`, whose composite answers no async lookup
+    (a prefetch pass would scan every tick and admit nothing)."""
+    if dp_load_balance != "prefix_spread":
+        return False
+    kvc = kv_transfer_config
+    if isinstance(kvc, dict) and kvc.get("kv_connector") == "multi":
+        logger.info(
+            "Offload prefetch is off under kv_connector=multi; prefix spread "
+            "loads moved prefixes at admission instead"
+        )
+        return False
+    return True
+
+
 @dataclass
 class Config:
     model: str
@@ -2434,8 +2450,6 @@ class Config:
     def __post_init__(self):
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
-        if self.offload_prefetch is None:
-            self.offload_prefetch = self.dp_load_balance == "prefix_spread"
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
@@ -2710,6 +2724,10 @@ class Config:
             else torch.bfloat16
         )
 
+        if self.offload_prefetch is None:
+            self.offload_prefetch = default_offload_prefetch(
+                self.dp_load_balance, self.kv_transfer_config
+            )
         # After the parse above: the P/D clause reads `kv_role` off
         # `kv_transfer_config`, which arrives from the CLI as a string.
         self._resolve_throughput_step_interval()

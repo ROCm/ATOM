@@ -145,6 +145,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._load_lifecycles: dict[str, object] = {}
         self._active_load_operations: dict[str, tuple[object, LoadOperationId]] = {}
         self._lookup_in_step: list[str] = []
+        # sid -> the save tracker entry an admission overwrote, until this
+        # tick's metadata build (`cancel_preadmission` restores it).
+        self._preadmit_floors: dict[str, tuple | None] = {}
         self._lookup_results: dict[str, tuple[object, int]] = {}
         self._handoff_loads: set[str] = set()
         self._block_manager = None
@@ -452,7 +455,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         True when the answer is already held (`_lookup_results`) or its async
         lookup has answered and waits to be consumed (`has_answer`; a failed
-        lookup has no answer, so it is not ready). `Scheduler._offload_prefetch` asks this so that it
+        lookup has no answer, so it is not ready). The offload prefetch asks this so that it
         never blocks the scheduler thread -- and with it every DP rank -- on a
         synchronous lookup. It does not advance the lookup: call it after
         `lookup_pending`, or after a lookup driver thread answered.
@@ -474,15 +477,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def cancel_preadmission(self, seq) -> None:
         """Forget an admission the scheduler takes back before any dispatch.
 
-        `Scheduler._offload_prefetch` allocates and notifies this
+        The scheduler's offload prefetch (`OffloadPrefetch`) allocates and
+        notifies this
         connector like a normal admission, then hands the request back to
         `waiting` when the outcome is not a load it can park for. Cancel its
         pending load -- which also gives the lookup's read locks back
         (`_clear_pending_load`) -- and drop the held answer, so the next
         admission asks the tier again instead of reusing an answer nothing pins
-        (`_ensure_lookup_pin` trusts a held answer). Also drop the save floor
-        that admission wrote: the re-admission sets its own, and keeping the
-        first one (`max`) would skip re-saving chunks the tier evicted since.
+        (`_ensure_lookup_pin` trusts a held answer). Also restore the save
+        tracker the admission overwrote: drop it if the admission created it
+        (the re-admission sets its own floor), or put back the previous floor
+        of a request that had already saved (a preempted one back in
+        `waiting`), keeping its saved progress.
         """
         self.cancel_pending_load(seq)
         sid = str(seq.id)
@@ -490,9 +496,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if held is not None and held[0] is seq:
             del self._lookup_results[sid]
         self._forget_tier_hit(sid)
+        if sid not in self._preadmit_floors:
+            return
+        prev = self._preadmit_floors.pop(sid)
         entry = self._save_tracker.get(sid)
-        if entry is not None and entry[0] is seq:
+        if entry is None or entry[0] is not seq:
+            return
+        if prev is None:
             del self._save_tracker[sid]
+        elif prev[0] is seq:
+            entry[1] = prev[1]
 
     def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
         """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
@@ -625,6 +638,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         )
         if self._do_save:
             entry = self._save_tracker.get(sid)
+            # What this admission overwrites, for `cancel_preadmission`.
+            self._preadmit_floors[sid] = (
+                None if entry is None or entry[0] is not seq else (seq, entry[1])
+            )
             if entry is None or entry[0] is not seq:
                 self._save_tracker[sid] = [seq, initial_saved]
             else:
@@ -978,6 +995,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             sid for sid in self._lookup_in_step if sid not in dispatched
         ]
         self._reqs_need_recv.clear()
+        self._preadmit_floors.clear()
         self._perf_bump("build_meta_us", int((time.perf_counter() - _perf_t0) * 1e6))
         self._perf_bump("build_meta_n")
         self._perf_maybe_log()

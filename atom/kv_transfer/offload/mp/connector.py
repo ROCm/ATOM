@@ -174,7 +174,9 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"LMCache MP token cache for {req.req_id!r} holds "
                     f"{len(tokens)} tokens, the transfer needs {req.token_end}"
                 )
-            req.token_ids = tokens[: req.token_end].tolist()
+            # An array slice: the transfer spec's `list(...)` is the one
+            # materialization, as with a shipped list.
+            req.token_ids = tokens[: req.token_end]
             req.token_base = -1
 
     def start_load_kv(self, metadata: Any) -> None:

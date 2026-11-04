@@ -52,9 +52,8 @@ class Admit(enum.Enum):
 class OffloadPrefetch:
     """The scheduler's offload prefetch: its state and the per-tick pass."""
 
-    # How deep into `waiting` a pass looks, and how many requests it may admit
-    # in one tick (each runs an HBM probe and an allocation).
-    SCAN = 64
+    # How many requests a pass may admit in one tick (each runs an HBM probe
+    # and an allocation); it looks `Scheduler.WAITING_SCAN` deep.
     PER_TICK = 8
     # Ticks before a request skipped for KV pressure is looked at again.
     RETRY_TICKS = 8
@@ -104,12 +103,12 @@ class OffloadPrefetch:
         chunk = int(getattr(s.kv_connector, "chunk_size", 0) or 0)
         hbs = bm.hash_block_size
         parked = 0
-        for seq in list(itertools.islice(s.waiting, 0, self.SCAN)):
+        for seq in list(itertools.islice(s.waiting, 0, s.WAITING_SCAN)):
             if parked >= self.PER_TICK:
                 break
             if not self._candidate(seq):
                 continue
-            if len(s.running) + s._num_parked_remote_kv >= s.max_num_seqs:
+            if s._parked_slots_full():
                 break
             hbm_probe = None
             if s._lookup_detach_enabled(seq):
@@ -140,7 +139,7 @@ class OffloadPrefetch:
                 self.retry_at[seq.id] = self.tick + self.RETRY_TICKS
                 break
             cached = hbm_probe.num_cached_blocks * hbs
-            if s._wait_for_inflight_prefix(seq, cached, record=False):
+            if s._should_wait_for_producer(seq, cached, True, record=False):
                 continue  # Phase 2 waits for the in-flight producer instead
             if not (needs_remote_load or seq.replay_kv_load) or (
                 chunk and cached % chunk
@@ -202,7 +201,9 @@ class OffloadPrefetch:
         if outcome is Admit.REFUSED:
             return False
         if outcome is Admit.REQUEUE:
-            self._take_back(seq, prev_hit, release=False)
+            # `_admit_after_probe` released the blocks and the pre-admission.
+            seq.prefix_cache_hit_tokens = prev_hit
+            self.settled.add(seq.id)
             return True
         oj = seq.offload_joint
         if outcome is Admit.LOCAL:
@@ -211,21 +212,19 @@ class OffloadPrefetch:
                 return True
             # A state-only load parks like a KV load (as in Phase 2).
             s._park_for_remote_load(seq, None)
-            s._inflight_prefix_wait.pop(seq.id, None)
         self.entries[seq.id] = seq
         self.retry_at.pop(seq.id, None)
         return True
 
-    def _take_back(self, seq, prev_hit: int, *, release: bool = True) -> None:
-        """Undo the connector notification (and, unless already released,
-        `allocate`) of an admission that did not park; the request is back in
-        `waiting` exactly as unadmitted, and is not tried again."""
+    def _take_back(self, seq, prev_hit: int) -> None:
+        """Undo the connector notification and `allocate` of an admission that
+        did not park; the request is back in `waiting` exactly as unadmitted,
+        and is not tried again."""
         s = self.sched
         s.kv_connector.cancel_preadmission(seq)
-        if release:
-            if seq.offload_joint.load_hash != -1:
-                s.block_manager.cancel_state_load(seq)
-            s.block_manager.deallocate(seq)
+        if seq.offload_joint.load_hash != -1:
+            s.block_manager.cancel_state_load(seq)
+        s.block_manager.deallocate(seq)
         seq.prefix_cache_hit_tokens = prev_hit
         self.settled.add(seq.id)
 

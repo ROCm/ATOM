@@ -51,7 +51,6 @@ from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.multimodal_runtime import prefill_media_payload
 from atom.model_engine.offload_prefetch import Admit, OffloadPrefetch
 from atom.model_engine.prefill_delayer import PrefillDecision
-from atom.model_engine.prefix_spread import PrefixSpreadRouter
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
     Replay,
@@ -822,10 +821,6 @@ class Scheduler:
         self.total_generation_tokens = 0
         self.total_finished_requests = 0
         self.total_preemptions = 0
-        # Prefix-spread moves whose prefix the tier was expected to hold, and
-        # those it held less of (a save not landed yet, or evicted).
-        self.total_prefix_moved_checked = 0
-        self.total_prefix_moved_tier_miss = 0
         self.profile_active = False
         # Cache the env flag once (env vars are fixed at process start) so the
         # per-iteration compute_detailed_aggregates never pays an os.getenv.
@@ -1464,12 +1459,14 @@ class Scheduler:
         # Requests with no prefill work this tick (a load in flight, aborted,
         # unschedulable) do not use up the peek of 4: admission skips them
         # too. The scan itself stays bounded, like the prefetch pass's.
-        for seq in itertools.islice(
-            self._waiting_prefills(limit=self._HEAD_PEEK_SCAN), 4
-        ):
+        for seq in itertools.islice(self._waiting_prefills(limit=self.WAITING_SCAN), 4):
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                # Its load finished: it already holds its blocks and resumes
-                # this tick. A probe would recompute its hit flags.
+                # A finished load already holds its blocks and resumes this
+                # tick (a probe would recompute its hit flags). A failed one
+                # may retreat and park again (`_consume_failed_remote_kv`), so
+                # it is not sure prefill work.
+                if self._has_req_id(self.failed_recving_kv_req_ids, seq.id):
+                    continue
                 return True
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
@@ -2311,7 +2308,7 @@ class Scheduler:
         prefix_bypass_left = min(16, self.max_num_seqs)
         # Prefetching requests held in `prefix_waiters` (they keep their place
         # but bound nothing: they are not waiting on a lookup).
-        early_waiting = 0
+        prefetch_waiting = 0
         while (
             delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
@@ -2320,7 +2317,7 @@ class Scheduler:
             and num_batched_tokens < self.max_num_batched_tokens
             and self._tick_cost < self._tick_cost_limit
         ):
-            if len(prefix_waiters) > early_waiting:
+            if len(prefix_waiters) > prefetch_waiting:
                 if prefix_bypass_left == 0:
                     break
                 prefix_bypass_left -= 1
@@ -2375,7 +2372,7 @@ class Scheduler:
                 # place in line (the tail would let later arrivals pass it once
                 # it lands) and let the requests behind it go first.
                 prefix_waiters.append(seq)
-                early_waiting += 1
+                prefetch_waiting += 1
                 continue
 
             admission_ready = getattr(self.kv_connector, "admission_ready", None)
@@ -2514,10 +2511,7 @@ class Scheduler:
                 self._uncount_inflight_load(seq)
                 continue
 
-            if (
-                needs_remote_load
-                and len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
-            ):
+            if needs_remote_load and self._parked_slots_full():
                 self.waiting.appendleft(seq)
                 break
 
@@ -2543,7 +2537,7 @@ class Scheduler:
             if (
                 seq.replay_kv_load
                 and not needs_remote_load
-                and len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
+                and self._parked_slots_full()
             ):
                 # A replay that loads its KV first parks for that load like any
                 # remote load (`needs_remote_load` knew only the state-carrying
@@ -2561,16 +2555,10 @@ class Scheduler:
             resume = num_cached_blocks * self.block_manager.hash_block_size
             start = self.block_manager.replay_start(seq, resume, hit=True)
             num_new_tokens = self._new_prefill_tokens(seq, start, resume)
-            if (
-                self._local_prefill_coalescing
-                and (not needs_remote_load or self._connector_flag("is_offload"))
-                and self._wait_for_inflight_prefix(
-                    seq,
-                    max(
-                        num_cached_blocks * self.block_manager.hash_block_size,
-                        seq.offload_joint.kv_prefix_tokens,
-                    ),
-                )
+            if self._should_wait_for_producer(
+                seq,
+                num_cached_blocks * self.block_manager.hash_block_size,
+                needs_remote_load,
             ):
                 prefix_waiters.append(seq)
                 continue
@@ -2654,7 +2642,6 @@ class Scheduler:
                 # same wake-up -- because to the scheduler both are one event:
                 # a transfer into blocks this request already holds.
                 self._park_for_remote_load(seq, skipped_waiting_requests)
-                self._inflight_prefix_wait.pop(seq.id, None)
                 continue
 
             # Refresh, not a duplicate of the set above: that one is guarded
@@ -3352,14 +3339,6 @@ class Scheduler:
         ext_tokens, needs_remote_load = self.kv_connector.get_num_new_matched_tokens(
             seq
         )
-        expect = seq.__dict__.pop("_dp_tier_expect", 0)
-        if expect:
-            # The router moved this request expecting its prefix from the tier
-            # (HBM plus tier hit); one router sampling stride of slack.
-            self.total_prefix_moved_checked += 1
-            slack = PrefixSpreadRouter.STRIDE_TOKENS
-            if int(ext_tokens) + int(seq.num_cached_tokens) + slack < expect:
-                self.total_prefix_moved_tier_miss += 1
         # Keep the lookup's answer, not just the park flag: `can_allocate` runs
         # next and a hybrid's two legs have to be aimed at one boundary, for
         # which this is the KV leg's ceiling. In tokens, and absolute -- the
@@ -4001,9 +3980,30 @@ class Scheduler:
             self.block_manager.abandon_state_load(req_id)
             self.failed_recving_kv_req_ids.append(req_id)
 
-    # How many waiting requests the delayer's head probe looks past (in-flight
-    # loads, aborted, unschedulable) to find its 4 prefillable ones.
-    _HEAD_PEEK_SCAN = 64
+    # How far into `waiting` a per-tick scan looks: the delayer's head probe
+    # (past in-flight loads, aborted, unschedulable) and the offload prefetch.
+    WAITING_SCAN = 64
+
+    def _parked_slots_full(self) -> bool:
+        """No slot to park another remote / tier load: running plus parked
+        requests fill `max_num_seqs` (the test Phase 2 applies)."""
+        return len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
+
+    def _should_wait_for_producer(
+        self, seq: Sequence, hbm_cached: int, needs_remote_load: bool, *, record=True
+    ) -> bool:
+        """Whether admission holds `seq` back for an in-flight producer of its
+        prefix (`_wait_for_inflight_prefix`), with Phase 2's conditions and
+        cached count. `record=False` only asks."""
+        return (
+            self._local_prefill_coalescing
+            and (not needs_remote_load or self._connector_flag("is_offload"))
+            and self._wait_for_inflight_prefix(
+                seq,
+                max(hbm_cached, seq.offload_joint.kv_prefix_tokens),
+                record=record,
+            )
+        )
 
     def _admit_after_probe(
         self,
@@ -4015,7 +4015,7 @@ class Scheduler:
         detach: bool = False,
     ) -> Admit:
         """Admission from `allocate` to the park, shared by Phase 2 and
-        `_offload_prefetch`.
+        the offload prefetch (`OffloadPrefetch`).
 
         REFUSED: the pool (or a declined lookup detach) refused it before the
         connector heard of it; nothing is held. REQUEUE: it was refused after
@@ -4097,9 +4097,11 @@ class Scheduler:
                 # clean recompute instead of parking a load into shared
                 # blocks.
                 self.block_manager.deallocate(seq)
+                # The connector was told of the allocation: take it back, or
+                # it would issue a load for a request back in `waiting`.
+                self.kv_connector.cancel_preadmission(seq)
                 return Admit.REQUEUE
         self._park_for_remote_load(seq, requeue)
-        self._inflight_prefix_wait.pop(seq.id, None)
         return Admit.PARKED
 
     def _park_for_remote_load(
@@ -4110,6 +4112,7 @@ class Scheduler:
         which never left `waiting`)."""
         if requeue is not None:
             requeue.append(seq)
+        self._inflight_prefix_wait.pop(seq.id, None)
         seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
         self._count_inflight_load(seq)
 
@@ -5112,11 +5115,19 @@ class Scheduler:
 
     def _head_blocked_on_resources(self, skip) -> bool:
         """Whether the first waiting request outside `skip` is blocked on
-        resources: every parked-load slot is taken, or it cannot allocate."""
+        resources: no parked-load slot (`_parked_slots_full`), or it cannot
+        allocate. A resume that already holds its blocks, or an unschedulable
+        request, is not blocked on them (and must not be probed: the probe
+        would rewrite the resume's replay flags)."""
         for seq in self.waiting:
             if seq.id in skip or seq.status != SequenceStatus.WAITING:
                 continue
-            if self._num_parked_remote_kv >= self.max_num_seqs:
+            if (
+                self._is_offload_prefill_resume(seq)
+                or self._unschedulable_reason(seq) is not None
+            ):
+                return False
+            if self._parked_slots_full():
                 return True
             return self.block_manager.can_allocate_memoized(seq) < 0
         return False
@@ -5481,10 +5492,6 @@ class PrefillScheduler:
         self.total_generation_tokens = 0
         self.total_finished_requests = 0
         self.total_preemptions = 0
-        # Prefix-spread moves whose prefix the tier was expected to hold, and
-        # those it held less of (a save not landed yet, or evicted).
-        self.total_prefix_moved_checked = 0
-        self.total_prefix_moved_tier_miss = 0
 
         # Shared memory for dynamic CU partitioning.
         # Layout: [0:4] = decode_tokens (uint32)

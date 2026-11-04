@@ -349,7 +349,6 @@ class CoreManager:
                 )
             self._prefix_router = PrefixSpreadRouter(
                 envs.ATOM_DP_PREFIX_IDLE_TOKENS,
-                self._dp_route_counters,
                 tier_loads=_offload_tier_loads(config),
             )
         self._rank_routed_total = [0] * self.global_engine_count
@@ -363,10 +362,6 @@ class CoreManager:
         # seq_id -> (dp_rank, req_cost, tok_cost) so release subtracts exactly
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
-        # Seqs whose prefill has not produced a first output yet. Kept apart
-        # from the token charge, which is 0 for a fully cached prompt that is
-        # nevertheless still prefilling (prefix-spread busy-source guard).
-        self._seq_prefilling = set()
         self._lb_lock = Lock()
         # --- Backpressure (lazy) DP dispatch --------------------------------
         # ATOM_DP_DISPATCH_DEPTH > 0 holds load-balanced seqs in _bp_pending and
@@ -1413,17 +1408,33 @@ class CoreManager:
             self._rank_rotation_cursor += 1
             return dp_rank
 
-        if self._dp_lb_strategy == "least_requests":
-            # Lexicographic (request count, prompt-token load): tokens only
-            # decide among request-count ties.
-            return self._lightest_rank_locked(
-                lambda r: (self._rank_reqs[r], self._rank_tokens[r])
-            )
-        return self._lightest_rank_locked(self._rank_load)  # "least_tokens"
+        # argmin over per-rank load, scanned from a rotating start offset so a run
+        # of fully-equal ranks spreads evenly. Scores are computed inline (no
+        # intermediate list) — the loop reads the counters directly.
+        least_requests = self._dp_lb_strategy == "least_requests"
+        best_rank = 0
+        best_score = None
+        offset = self._rank_rotation_cursor % n
+        for i in range(n):
+            r = (offset + i) % n
+            if least_requests:
+                # Lexicographic (request count, prompt-token load): tuples compare
+                # element-wise, so tokens only decide among request-count ties.
+                score = (self._rank_reqs[r], self._rank_tokens[r])
+            else:  # "least_tokens"
+                score = (
+                    self._rank_tokens[r] + self._dp_lb_req_equiv * self._rank_reqs[r]
+                )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_rank = r
+        self._rank_rotation_cursor += 1
+        return best_rank
 
     def _lightest_rank_locked(self, key) -> int:
-        """Argmin of `key(rank)`, scanned from a rotating start offset so a run
-        of fully-equal ranks spreads evenly. Caller must hold _lb_lock."""
+        """Argmin of `key(rank)` (prefix spread), scanned from a rotating start
+        offset so a run of fully-equal ranks spreads evenly. Caller must hold
+        _lb_lock."""
         n = self._routable_engine_count
         offset = self._rank_rotation_cursor % n
         self._rank_rotation_cursor += 1
@@ -1553,10 +1564,12 @@ class CoreManager:
             seq,
             self._rank_tokens,
             self._rank_load,
-            self._lightest_rank_locked(self._rank_load),
-            self._seq_prefilling,
+            lambda: self._lightest_rank_locked(self._rank_load),
         )
-        return self._record_dp_route_locked(decision, rank)
+        # The router counts its own decisions (`PrefixSpreadRouter.counters`).
+        del decision
+        self._rank_routed_total[rank] += 1
+        return rank
 
     def get_dp_router_statistics(self) -> dict:
         """Return a consistent, non-mutating snapshot of DP routing state."""
@@ -1572,6 +1585,11 @@ class CoreManager:
                 "inflight_requests_per_rank": list(self._rank_reqs),
                 "queued_prefill_tokens_per_rank": list(self._rank_tokens),
                 "session_count_per_rank": sessions_per_rank,
+                **(
+                    self._prefix_router.counters
+                    if self._prefix_router is not None
+                    else {}
+                ),
             }
 
     def _charge_seq_load_locked(self, seq: Sequence, dp_rank: int) -> None:
@@ -1580,8 +1598,8 @@ class CoreManager:
         prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
         tok_cost = prompt_tokens
         session_id = getattr(seq, "dp_session_id", None)
-        if self._prefix_spread:
-            tok_cost = max(0, prompt_tokens - int(getattr(seq, "_dp_est_hit", 0)))
+        if self._prefix_router is not None:
+            tok_cost = max(0, prompt_tokens - self._prefix_router.charged(seq.id))
         elif self._dp_session_affinity_enabled and session_id:
             previous_prompt_tokens = self._dp_session_prompt_tokens.get(session_id)
             if previous_prompt_tokens is not None:
@@ -1593,7 +1611,6 @@ class CoreManager:
         self._rank_reqs[dp_rank] += req_cost
         self._rank_tokens[dp_rank] += tok_cost
         self._seq_load[seq.id] = (dp_rank, req_cost, tok_cost)
-        self._seq_prefilling.add(seq.id)
 
     def _deliver_terminal_output(self, seq) -> bool:
         """Give an online client the terminal output for a seq that never streamed.
@@ -1649,23 +1666,13 @@ class CoreManager:
     def _release_seq_load_locked(self, seq_id) -> None:
         """``_release_seq_load`` for a caller that already holds ``_lb_lock``."""
         if self._prefix_router is not None:
-            if seq_id in self._seq_prefilling:
-                # Left before its prefill completed: its prefix record is not
-                # real. A request that took over computing its part is now
-                # charged its whole prompt.
-                for heir, prompt in self._prefix_router.left_unprefilled(
-                    seq_id
-                ).items():
-                    held = self._seq_load.get(heir)
-                    if held is None or heir not in self._seq_prefilling:
-                        continue
-                    heir_rank, heir_reqs, heir_tokens = held
-                    if prompt > heir_tokens:
-                        self._rank_tokens[heir_rank] += prompt - heir_tokens
-                        self._seq_load[heir] = (heir_rank, heir_reqs, prompt)
-            else:
-                self._prefix_router.prefill_complete(seq_id)
-        self._seq_prefilling.discard(seq_id)
+            # A request that took over computing a prefix part this one left
+            # unprefilled is now charged its whole prompt.
+            for heir, prompt in self._prefix_router.released(seq_id).items():
+                held = self._seq_load.get(heir)
+                if held is not None and prompt > held[2]:
+                    self._rank_tokens[held[0]] += prompt - held[2]
+                    self._seq_load[heir] = (held[0], held[1], prompt)
         entry = self._seq_load.pop(seq_id, None)
         if entry is None:
             return
@@ -1683,12 +1690,12 @@ class CoreManager:
         if entry is None:
             return
         _, _, tok_cost = entry
-        if tok_cost == 0 and seq_id not in self._seq_prefilling:
+        router = self._prefix_router
+        if tok_cost == 0 and (router is None or not router.prefilling(seq_id)):
             return
         with self._lb_lock:
-            self._seq_prefilling.discard(seq_id)
-            if self._prefix_router is not None:
-                self._prefix_router.prefill_complete(seq_id)
+            if router is not None:
+                router.prefill_complete(seq_id)
             entry = self._seq_load.get(seq_id)
             if entry is None:
                 return
@@ -1724,7 +1731,6 @@ class CoreManager:
             self._rank_reqs = [0] * self._routable_engine_count
             self._rank_tokens = [0] * self._routable_engine_count
             self._seq_load.clear()
-            self._seq_prefilling.clear()
             if self._prefix_router is not None:
                 self._prefix_router.reset()
             pending = getattr(self, "_bp_pending", None)

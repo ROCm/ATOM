@@ -12,7 +12,6 @@ payload mapping and PAGE/SLOT policy.
 from __future__ import annotations
 
 import collections
-import contextlib
 import json
 import logging
 import os
@@ -487,14 +486,8 @@ class OffloadSchedulerMixin(ABC):
     def send_finished(self, req_id) -> None:
         """Offload backends own saves and loads, but no P/D send claims."""
 
-    def lookup_ready(self, seq) -> bool:
-        """No async tier answer to offer; see `ChunkedOffloadSchedulerBase`."""
-        return False
-
-    def lookup_guard(self):
-        return contextlib.nullcontext()
-
     def cancel_preadmission(self, seq) -> None:
+        """An offload tier's pre-admission is its pending load."""
         self.cancel_pending_load(seq)
 
     def _init_offload_statistics(self) -> None:

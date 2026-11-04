@@ -68,6 +68,11 @@ class _Connector(OffloadSchedulerMixin):
     def cancel_preadmission(self, seq):
         self.cancelled.append(seq.id)
 
+    def lookup_guard(self):
+        import contextlib
+
+        return contextlib.nullcontext()
+
     def build_connector_meta(self):
         return META
 
@@ -205,9 +210,69 @@ def test_loaded_request_passes_a_head_blocked_on_resources(monkeypatch, seq_fact
 
     monkeypatch.undo()
     sched.waiting.rotate()  # back to [a, b]
-    sched._num_parked_remote_kv = sched.max_num_seqs
+    # Phase 2's slot test counts running requests too.
+    sched._num_parked_remote_kv = sched.max_num_seqs - len(sched.running)
     sched._promote_ready_remote_kv_requests()
     assert list(sched.waiting) == [b, a]
+
+
+def test_a_resume_head_is_not_probed_or_passed(monkeypatch, seq_factory):
+    """A head that already holds its blocks (a finished load requeued for
+    budget) is not blocked on resources, and probing it would rewrite its
+    replay flags: finished prefetches keep their place."""
+    sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
+    sched.kv_connector.not_ready_ids = {a.id}
+    sched.schedule()
+    sched.finished_recving_kv_req_ids.append(b.id)
+    a.offload_loaded = True
+    a.block_table = [0]  # a resume holds its blocks
+
+    def no_probe(_seq):
+        raise AssertionError("a resume must not be probed")
+
+    monkeypatch.setattr(sched.block_manager, "can_allocate_memoized", no_probe)
+    sched._num_parked_remote_kv = sched.max_num_seqs
+    sched._promote_ready_remote_kv_requests()
+    assert list(sched.waiting) == [a, b]
+
+
+def test_head_peek_skips_a_failed_load_that_may_park_again(setup):
+    sched, _, seq = setup
+    sched.schedule()  # parks with its prefetch
+    sched.failed_recving_kv_req_ids.append(seq.id)
+    assert not sched._can_admit_head_prefill()
+    sched.failed_recving_kv_req_ids.clear()
+    sched.finished_recving_kv_req_ids.append(seq.id)
+    assert sched._can_admit_head_prefill()
+
+
+def test_prefetch_waits_for_a_producer_only_as_phase_2_would(setup, monkeypatch):
+    """Without local prefill coalescing Phase 2 never waits for a producer, so
+    the prefetch must not either."""
+    sched, _, seq = setup
+    calls = []
+    monkeypatch.setattr(
+        sched, "_wait_for_inflight_prefix", lambda *a, **k: calls.append(1) or True
+    )
+    sched._local_prefill_coalescing = False
+    sched.schedule()
+    assert calls == [] and sched._prefetch.holds(seq)
+
+
+def test_requeue_cancels_the_pre_admission(setup, monkeypatch):
+    """A REQUEUE (a state load whose disown cannot be backed) gives the
+    connector's pre-admission back, for Phase 2 as for the prefetch."""
+    from atom.model_engine.offload_prefetch import Admit
+
+    sched, _, seq = setup
+    bm = sched.block_manager
+    seq.offload_joint.load_hash = 7
+    monkeypatch.setattr(bm, "cancel_state_load", lambda s: False)
+    probe = sched._probe_hbm_prefix(seq)
+    outcome = sched._admit_after_probe(seq, probe, True, None)
+    assert outcome is Admit.REQUEUE
+    assert sched.kv_connector.cancelled == [seq.id]
+    assert len(seq.block_table) == 0
 
 
 def test_new_token_count_counts_a_finished_load_from_its_resume(setup):
@@ -345,15 +410,6 @@ def test_lookup_is_checked_and_consumed_under_the_lookup_guard(setup):
 
     i = events.index("enter")
     assert events[i : i + 4] == ["enter", "ready", "match", "exit"]
-
-
-def test_a_moved_prefix_the_tier_lacks_is_counted(setup):
-    sched, _, seq = setup
-    seq._dp_tier_expect = 1_000_000  # far more than the tier answers
-    sched.schedule()
-    assert sched.total_prefix_moved_checked == 1
-    assert sched.total_prefix_moved_tier_miss == 1
-    assert "_dp_tier_expect" not in seq.__dict__  # counted once
 
 
 # -- lookup driver thread -------------------------------------------------------

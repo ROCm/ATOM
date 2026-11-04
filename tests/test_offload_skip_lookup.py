@@ -570,3 +570,33 @@ def test_the_detach_is_on_by_default_and_0_turns_it_off(monkeypatch):
     assert envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT is True
     monkeypatch.setenv("OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", "0")
     assert envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT is False
+
+
+def test_dropping_a_finished_requests_tokens_spares_a_reused_id(monkeypatch):
+    sched, _client, _adapter = _scheduler(monkeypatch, lookup_done=True)
+    old, new = _seq(), _seq()  # same id, different requests
+    sched._ship_tokens(old, 32)
+    sched._ship_tokens(new, 32)  # the id is reused: old's copy is dropped
+    sched._shipped_drops.clear()
+    sched._drop_shipped_tokens(7, old)  # old's session ends late
+    assert sched._shipped_tokens[7][0] is new
+    assert not sched._shipped_drops
+
+
+def test_taking_an_admission_back_restores_the_previous_save_floor(monkeypatch):
+    """A preempted request back in `waiting` keeps the floor it had saved to
+    when a prefetch takes its re-admission back; a fresh one loses the tracker
+    the admission created."""
+    sched, _client, _adapter = _scheduler(monkeypatch, lookup_done=True)
+    seq = _seq()
+    sched._save_tracker["7"] = [seq, 48]
+    sched.update_state_after_alloc(seq)
+    sched._save_tracker["7"][1] = 0  # the admission rewrote the floor
+    sched.cancel_preadmission(seq)
+    assert sched._save_tracker["7"] == [seq, 48]
+
+    fresh = _seq(sid=8)
+    sched.update_state_after_alloc(fresh)
+    assert "8" in sched._save_tracker
+    sched.cancel_preadmission(fresh)
+    assert "8" not in sched._save_tracker

@@ -684,8 +684,6 @@ class LLMEngine:
             "prompt_tokens": summed("prompt_tokens"),
             "generation_tokens": summed("generation_tokens"),
             "preemptions": summed("preemptions"),
-            "prefix_moved_checked": summed("prefix_moved_checked"),
-            "prefix_moved_tier_miss": summed("prefix_moved_tier_miss"),
             "kv_blocks_used": kv_used,
             "kv_blocks_free": summed("kv_blocks_free"),
             "kv_blocks_total": kv_total,
