@@ -719,9 +719,9 @@ class EngineCore:
             and wait_s > 0
             and getattr(self.scheduler, "_num_parked_remote_kv", 0) > 0
         ):
-            # What just completed was taken right after the previous forward;
-            # the workers are idle now, so the poll it re-armed answers at once
-            # with whatever landed during this one.
+            # What just completed was taken right after the previous forward or
+            # idle tick; the workers are idle now, so the poll it re-armed
+            # answers at once with whatever landed since.
             t0 = time.perf_counter()
             fresh = self.runner_mgr.call_func_with_aggregation(
                 "async_proc_aggregation", wait_s=wait_s
