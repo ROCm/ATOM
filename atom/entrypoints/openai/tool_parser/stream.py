@@ -372,11 +372,14 @@ class ToolCallStreamParser:
         per delivery mode.
         """
         out: list = []
+        # The scanner still holds text past the marker it last stopped at.
+        resume = False
         while True:
             if self._region is None:
-                if text:
+                if text or resume:
                     scan = self._scanner.feed(text)
                     text = ""
+                    resume = False
                     if scan.released:
                         out.append(("content", scan.released))
                     if scan.hit is not None:
@@ -388,7 +391,7 @@ class ToolCallStreamParser:
                             # `<|open|>response<|sep|>`, buffered its entire
                             # body to EOS -- 324 of 324 characters in one
                             # frame at the end.
-                            text = scan.rest
+                            resume = True
                         else:
                             # The region has opened. Opened, but not read
                             # here: the marker goes back through the region
@@ -403,7 +406,7 @@ class ToolCallStreamParser:
                             # dispatch; only `_close_region` differs.
                             self._region = Region()
                             self._end_tail = ""
-                            text = scan.hit + scan.rest
+                            text = scan.hit + self._scanner.take_rest()
                         continue
                 if not final:
                     return out

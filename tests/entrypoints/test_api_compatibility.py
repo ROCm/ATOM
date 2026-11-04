@@ -48,6 +48,7 @@ def server(monkeypatch):
         ],
         finish_reason="eos",
         cleanups=[],
+        stopped=[],
     )
 
     def encode(messages, **kwargs):
@@ -117,10 +118,15 @@ def server(monkeypatch):
                 else [("content", text)]
             )
 
-        def flush(self):
+        def flush(self, *, stopped):
+            state.stopped.append(stopped)
             return []
 
-        def split(self, text):
+        def read_whole_events(self, text, *, stopped):
+            return self.process(text) + self.flush(stopped=stopped)
+
+        def split(self, text, *, stopped):
+            state.stopped.append(stopped)
             return "", text
 
     monkeypatch.setattr(api_server, "generate_async", generate)
@@ -359,6 +365,32 @@ def test_length_limit_is_incomplete(server, stream):
     assert result["status"] == "incomplete"
     assert result["incomplete_details"] == {"reason": "max_output_tokens"}
     assert result["output"][-1]["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    "path, body",
+    [
+        ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+        ("/v1/messages", {"messages": [{"role": "user", "content": "hi"}]}),
+        ("/v1/responses", {"input": "hi"}),
+    ],
+    ids=["chat", "messages", "responses"],
+)
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "reason, stopped", [("eos", True), ("stop_163586", True), ("max_tokens", False)]
+)
+def test_the_reasoning_reader_is_told_whether_the_model_stopped(
+    server, path, body, stream, reason, stopped
+):
+    """A skipped think channel is replayed as content only when the model
+    stopped itself; every endpoint, in both modes, has to say which it was."""
+    server.finish_reason = reason
+    server.chunks[0]["finish_reason"] = reason
+    body = {"model": "renamed-model", **body, "stream": stream}
+    response = post(path, body)
+    assert response.status_code == 200, response.text
+    assert server.stopped == [stopped]
 
 
 def test_stream_failure_closes_items_and_reports_failed(server):

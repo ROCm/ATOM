@@ -100,7 +100,9 @@ def test_stream_hidden_repeated_text_uses_visible_occurrence(size):
         source = tracker.feed(
             list(map(ord, part)), all_records[start : start + size], finished=final
         )
-        segments = reader.process(source) + (reader.flush() if final else [])
+        segments = reader.process(source) + (
+            reader.flush(stopped=True) if final else []
+        )
         events = []
         for field, value in segments:
             assert field == "content"
@@ -167,7 +169,7 @@ def test_schema_literal_answer_preserves_json_and_logprob_source(traced, starts_
     source = LogprobText([(text, 0, len(text))], owner) if traced else text
     reasoning, content = ReasoningChannel(
         starts_open=starts_open, literal_answer=True
-    ).split(source)
+    ).split(source, stopped=True)
     assert reasoning == ("reason" if starts_open else None)
     assert content == answer
     if traced:
@@ -231,7 +233,9 @@ def test_boundary_tokens_owned_once_in_json_and_stream(pieces, size):
         text = tracker.feed(
             list(range(start, stop)), probabilities[start:stop], finished=final
         )
-        for field, value in reader.process(text) + (reader.flush() if final else []):
+        for field, value in reader.process(text) + (
+            reader.flush(stopped=True) if final else []
+        ):
             if field == "content":
                 for kind, part in parser.process(value):
                     if kind == "content":
@@ -492,3 +496,83 @@ def test_logprob_execution_admission_is_shared(option, value, kwargs):
     with pytest.raises(ValueError, match="logprobs"):
         SamplingParams(logprobs=True).validate_logprob_options(config, **kwargs)
     SamplingParams(logprobs=False).validate_logprob_options(config, **kwargs)
+
+
+@pytest.mark.parametrize("size", [1, 1000])
+@pytest.mark.parametrize("finish_reason", ["stop", "max_tokens"])
+def test_kimi_replayed_answer_keeps_json_sse_probabilities(size, finish_reason):
+    import asyncio
+
+    from atom.entrypoints.openai.logprobs import LogprobCollector
+    from atom.entrypoints.openai.reasoning import ReasoningChannel
+    from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
+    from atom.entrypoints.openai.serving_chat import stream_chat_response
+
+    dialect, _ = resolve_dialect("", "<|open|>think<|sep|>")
+    reasoning = ReasoningChannel(dialect=dialect, starts_open=True)
+    text = "Paris.<|close|>response<|sep|>"
+    probabilities = records(text)
+    expected = _build_chat_choice(
+        "",
+        finish_reason,
+        reasoning=reasoning,
+        logprob_codec=Codec(),
+        token_ids=list(map(ord, text)),
+        token_logprobs=probabilities,
+    )
+
+    async def run():
+        class Source:
+            def __init__(self):
+                self.at = 0
+
+            async def get(self):
+                at = self.at
+                self.at += size
+                return {
+                    "token_ids": list(map(ord, text[at : at + size])),
+                    "logprobs": probabilities[at : at + size],
+                    "finished": self.at >= len(text),
+                    "finish_reason": finish_reason if self.at >= len(text) else None,
+                }
+
+        collector = LogprobCollector(Source(), Codec(), 0)
+        frames = [
+            frame
+            async for frame in stream_chat_response(
+                "req",
+                "model",
+                collector,
+                1,
+                1,
+                lambda *a, **kw: None,
+                lambda *a: None,
+                reasoning=reasoning,
+            )
+        ]
+        actual = {"content": [], "reasoning_content": []}
+        texts = {"content": "", "reasoning_content": ""}
+        for frame in frames:
+            for data in iter_sse_data(frame):
+                if data == "[DONE]":
+                    continue
+                obj = json.loads(data)
+                assert "error" not in obj, obj
+                for choice in obj.get("choices", []):
+                    for field in texts:
+                        texts[field] += choice["delta"].get(field) or ""
+                        actual[field].extend(
+                            (choice.get("logprobs") or {}).get(field, [])
+                        )
+        assert texts["content"] == expected["message"]["content"]
+        assert actual == expected["logprobs"]
+
+    asyncio.run(run())
+
+
+def test_lost_source_is_an_internal_error_for_nonstream_too():
+    from atom.entrypoints.openai.logprobs import LogprobError
+
+    tracker = LogprobsProcessor(Codec())
+    with pytest.raises(LogprobError, match="source spans"):
+        tracker.take_fields({"content": "plain text"})

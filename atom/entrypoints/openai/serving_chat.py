@@ -18,6 +18,7 @@ from .protocol import (
     TOOL_CHOICE_VALUES,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ended_by_stop,
     openai_stop_reason_with_calls,
 )
 from .reasoning import (
@@ -316,10 +317,10 @@ def create_chat_chunk(
     return data_frame(chunk)
 
 
-def _chat_deltas(reader, parser, text, finished):
+def _chat_deltas(reader, parser, text, finished, finish_reason):
     segments = reader.process(text)
     if finished:
-        segments.extend(reader.flush())
+        segments.extend(reader.flush(stopped=ended_by_stop(finish_reason)))
     for field, value in segments:
         if field == "reasoning_content":
             if value:
@@ -503,7 +504,7 @@ async def stream_chat_response(
             try:
                 done = bool(chunk_data.get("finished"))
                 for delta in _chat_deltas(
-                    reasoning_filter, tool_parser, new_text, done
+                    reasoning_filter, tool_parser, new_text, done, engine_finish_reason
                 ):
                     if "tool_calls" in delta:
                         has_tool_calls |= any(
@@ -595,7 +596,9 @@ def _build_chat_choice(
     if logprob_codec is not None:
         tracker = LogprobsProcessor(logprob_codec, top_logprobs)
         raw_text = tracker.feed(token_ids, token_logprobs, finished=True)
-    reasoning_content, content_with_tools = reasoning.split(raw_text)
+    reasoning_content, content_with_tools = reasoning.split(
+        raw_text, stopped=ended_by_stop(finish_reason)
+    )
     content, tool_calls = parse_tool_calls(
         content_with_tools,
         tools,
@@ -872,7 +875,11 @@ async def stream_chat_response_fanout(
             try:
                 done = bool(chunk_data.get("finished"))
                 for delta in _chat_deltas(
-                    reasoning_filters[idx], tool_parsers[idx], new_text, done
+                    reasoning_filters[idx],
+                    tool_parsers[idx],
+                    new_text,
+                    done,
+                    engine_finish_reasons[idx],
                 ):
                     if "tool_calls" in delta:
                         has_tool_calls[idx] |= any(
