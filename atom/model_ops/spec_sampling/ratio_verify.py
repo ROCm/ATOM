@@ -639,8 +639,8 @@ def warmup_ratio_verify(
     width and ``scratch``'s alignment (batch counts are not specialized on,
     `_BATCH_COUNTS`).
 
-    It touches no state: the coins use step 0 of the keys rather than a
-    `RejectionSampler`'s counter, the store is its own and
+    It touches no state: the coins use step 0 of the keys rather than the
+    draft's published step, the store is its own and
     never read (the row base is -1), and ``scratch`` holds nothing across a
     verify. It has no collective and takes no input from the device, so every
     rank runs it alike.

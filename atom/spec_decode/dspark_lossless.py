@@ -246,10 +246,11 @@ class DSparkLossless:
         counts[at["draft_q_row_base"]] = rows.q_row_base
         counts[at["draft_verify_q_row_base"]] = rows.verify_q_row_base
 
-    def verify_inputs(self, bs: int) -> tuple[SparseQStore, torch.Tensor]:
-        """What the verify reads of the draft: the q store, and each of the
-        ``bs`` requests' first q row (-1: none)."""
-        return self.q_store, self.verify_q_row_base.gpu[:bs]
+    def verify_inputs(self, bs: int) -> tuple[SparseQStore, torch.Tensor, int]:
+        """What the verify reads of the draft: the q store, each of the ``bs``
+        requests' first q row (-1: none), and the Philox step this forward
+        staged, which keys the verify's draws as it keys the draft's."""
+        return self.q_store, self.verify_q_row_base.gpu[:bs], int(self.seed.np[0])
 
     def clear_destinations(self) -> None:
         """Point every draft row at no q row, on the host and the device (on

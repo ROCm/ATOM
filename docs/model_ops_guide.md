@@ -537,7 +537,7 @@ Implements rejection sampling for speculative decoding (MTP, EAGLE, DSpark). Giv
 
 Every rank must reach the same verdict. Each rule gets there its own way:
 
-- **Probability ratio**: Philox (`tl.rand`) keyed on SPMD step counters -- the accept coins and the residual race on `RejectionSampler`'s per-step counter, the draft's noise on its own -- so every TP rank draws the same coins without exchanging them.
+- **Probability ratio**: Philox (`tl.rand`) keyed on one SPMD step counter, the step the draft publishes (`DraftQStaging`): the draft's noise, the accept coins and the residual race each under their own high key word -- so every TP rank draws the same coins without exchanging them.
 - **Exact match**: the target's own draw comes from `Sampler` and is broadcast from TP rank 0 before the kernel compares against it.
 - **Synthetic**: a per-device `torch.Generator` re-seeded from a step counter each step.
 - **Relaxed** and greedy rows draw nothing.

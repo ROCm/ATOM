@@ -119,34 +119,37 @@ class RejectionSampler(nn.Module):
         # lockstep across TP ranks (SPMD), so the forced accept/reject pattern is
         # identical on every rank while still varying step to step.
         self._synthetic_step = 0
-        # Same, for the probability-ratio path's draws. Advanced on every forward
-        # that takes that path, so no two steps replay a stream.
-        self._ratio_step = 0
-        # The probability-ratio verify's preallocated scratch and the widths it
-        # was armed for (`arm_ratio`), or None while lossless sampling is not
-        # armed.
+        # The probability-ratio verify's preallocated scratch and the logits
+        # dtype it was compiled for (`arm_ratio`); None while not armed.
         self._ratio_scratch = None
-        self._ratio_widths = None
-        # The logits dtype `warmup_ratio` compiled the verify for.
         self._ratio_logits_dtype = None
 
-    def arm_ratio(self, max_bs: int, num_spec_steps: int, vocab_size: int, device):
-        """Allocate the ratio verify's scratch for up to ``max_bs`` requests of
-        ``num_spec_steps`` drafts over ``vocab_size`` ids, before the KV cache
-        is sized, so the budget and the profiling run see it and no verify
-        allocates."""
+    def arm_ratio(
+        self,
+        max_bs: int,
+        num_spec_steps: int,
+        vocab_size: int,
+        logits_dtype: torch.dtype,
+        device,
+    ) -> None:
+        """Arm the probability-ratio verify for up to ``max_bs`` requests of
+        ``num_spec_steps`` drafts over ``vocab_size`` ids: allocate its scratch
+        before the KV cache is sized, so the budget and the profiling run see
+        it and no verify allocates, and compile every variant for
+        ``logits_dtype`` at the store's width (`warmup_ratio_verify`). No
+        warmup or capture forward verifies, so without this the first sampled
+        verify would compile; one on logits of another dtype is refused
+        (`forward`)."""
         self._ratio_scratch = ratio_verify_scratch(
             max_bs, num_spec_steps, vocab_size, device
         )
-        self._ratio_widths = (num_spec_steps, vocab_size, store_width(vocab_size))
-
-    def warmup_ratio(self, logits_dtype) -> None:
-        """Compile every ratio verify variant at the widths `arm_ratio` was
-        given and the store's, for ``logits_dtype`` (`warmup_ratio_verify`).
-        No warmup or capture forward verifies, so without this the first
-        sampled verify would compile. A verify on logits of another dtype is
-        refused (`forward`)."""
-        warmup_ratio_verify(*self._ratio_widths, logits_dtype, self._ratio_scratch)
+        warmup_ratio_verify(
+            num_spec_steps,
+            vocab_size,
+            store_width(vocab_size),
+            logits_dtype,
+            self._ratio_scratch,
+        )
         self._ratio_logits_dtype = logits_dtype
 
     def forward(
@@ -158,10 +161,11 @@ class RejectionSampler(nn.Module):
         bonus_token_ids: torch.Tensor,
         *,
         target_token_ids: torch.Tensor | None = None,
-        # The draft's q store and each request's first q row; None selects
-        # exact match. With it, p is softmax(target_logits / temperatures),
-        # filtered as `Sampler` filters it with top_ks / top_ps.
-        draft_q: tuple[SparseQStore, torch.Tensor] | None = None,
+        # The draft's q store, each request's first q row and the Philox step
+        # the draft published; None selects exact match. With it, p is
+        # softmax(target_logits / temperatures), filtered as `Sampler` filters
+        # it with top_ks / top_ps.
+        draft_q: tuple[SparseQStore, torch.Tensor, int] | None = None,
         temperatures: torch.Tensor | None = None,
         top_ks: int | torch.Tensor | None = None,
         top_ps: float | torch.Tensor | None = None,
@@ -171,6 +175,7 @@ class RejectionSampler(nn.Module):
         # need to ensure it's contiguous to satisfy the assertion in rejection_sample.
         target_logits = target_logits.contiguous()
         ratio = None
+        ratio_step = 0
         if draft_q is not None:
             if target_logits.dtype != self._ratio_logits_dtype:
                 # The kernels were compiled for another logits dtype (or not at
@@ -180,7 +185,9 @@ class RejectionSampler(nn.Module):
                     f"ratio verify was warmed up for {self._ratio_logits_dtype} "
                     f"logits but the LM head emits {target_logits.dtype}"
                 )
-            store, q_row_base = draft_q
+            # The draft's step keys the verify's draws too; the key's high word
+            # keeps the two streams apart (`ratio_verify`).
+            store, q_row_base, ratio_step = draft_q
             ratio = RatioVerifyInputs(
                 store,
                 q_row_base,
@@ -203,13 +210,10 @@ class RejectionSampler(nn.Module):
             synthetic_acceptance_rates=self.synthetic_acceptance_rates,
             synthetic_step=self._synthetic_step,
             target_token_ids=target_token_ids,
-            ratio_step=self._ratio_step,
+            ratio_step=ratio_step,
         )
         if self.synthetic_acceptance_rates is not None:
             self._synthetic_step += 1
-        if ratio is not None and self.synthetic_acceptance_rates is None:
-            # The low key word; the high word is the draw's purpose.
-            self._ratio_step = (self._ratio_step + 1) & 0xFFFFFFFF
         return output_token_ids
 
 

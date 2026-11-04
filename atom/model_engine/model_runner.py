@@ -901,10 +901,14 @@ class ModelRunner:
                 "arms it; this engine (%s) samples and verifies as without it.",
                 type(getattr(self, "drafter", None)).__name__,
             )
+            # Its logits are the LM head's, which keeps the hidden states'
+            # dtype; the verify refuses logits of any other dtype rather than
+            # JIT mid-serving.
             self.rejection_sampler.arm_ratio(
                 config.max_num_seqs,
                 self.drafter.mtp_k,
                 int(self.drafter.model.vocab_size),
+                config.torch_dtype,
                 self.device,
             )
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
@@ -959,12 +963,6 @@ class ModelRunner:
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
-        if _draft_lossless(self) is not None:
-            # No warmup or capture forward verifies, so the ratio verify is
-            # compiled here, before the memory profile. Its logits are the LM
-            # head's, which keeps the hidden states' dtype; the verify refuses
-            # logits of any other dtype rather than JIT mid-serving.
-            self.rejection_sampler.warmup_ratio(config.torch_dtype)
         self._maybe_warmup()
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a

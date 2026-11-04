@@ -295,11 +295,10 @@ def test_the_rejection_sampler_owns_the_verify_scratch_and_warmup(monkeypatch):
 
     sampler = rs_mod.RejectionSampler()
     monkeypatch.setattr(sparse_q_store, "Q_WIDTH", 8)
-    sampler.arm_ratio(MAX_BS, T, VOCAB, "cpu")
-    assert sampler._ratio_scratch.nbytes()
     calls = []
     monkeypatch.setattr(rs_mod, "warmup_ratio_verify", lambda *a: calls.append(a))
-    sampler.warmup_ratio(torch.bfloat16)
+    sampler.arm_ratio(MAX_BS, T, VOCAB, torch.bfloat16, "cpu")
+    assert sampler._ratio_scratch.nbytes()
     ((steps, vocab, width, dtype, scratch),) = calls
     # The store's width, as the drafter sizes it (`store_width`).
     assert (steps, vocab, width, dtype) == (T, VOCAB, 8, torch.bfloat16)
@@ -312,9 +311,8 @@ def test_the_verify_refuses_logits_it_was_not_warmed_for(monkeypatch):
     from atom.model_ops import rejection_sampler as rs_mod
 
     sampler = rs_mod.RejectionSampler()
-    sampler.arm_ratio(MAX_BS, T, VOCAB, "cpu")
     monkeypatch.setattr(rs_mod, "warmup_ratio_verify", lambda *a: None)
-    sampler.warmup_ratio(torch.bfloat16)
+    sampler.arm_ratio(MAX_BS, T, VOCAB, torch.bfloat16, "cpu")
     reached = []
     monkeypatch.setattr(rs_mod, "rejection_sample", lambda *a, **k: reached.append(a))
     meta = SimpleNamespace(
@@ -324,7 +322,7 @@ def test_the_verify_refuses_logits_it_was_not_warmed_for(monkeypatch):
         cu_num_draft_tokens=None,
         bonus_logits_indices=None,
     )
-    draft_q = (None, torch.full((2,), -1, dtype=torch.int32))
+    draft_q = (None, torch.full((2,), -1, dtype=torch.int32), 0)
     sampler(meta, torch.zeros(2, VOCAB, dtype=torch.bfloat16), None, draft_q=draft_q)
     assert len(reached) == 1
     with pytest.raises(RuntimeError, match="warmed up for torch.bfloat16"):
@@ -412,9 +410,11 @@ def test_the_verify_reads_the_store_and_each_requests_first_q_row(monkeypatch):
     prop = proposer(monkeypatch)
     stage(prop, batch(["a", "b"]))
     stage(prop, batch(["b", "a"]))
-    store, q_row_base = prop.lossless.verify_inputs(2)
+    store, q_row_base, step = prop.lossless.verify_inputs(2)
     # The sparse store itself; the verify borrows nothing of the draft's.
     assert store is prop.lossless.q_store
+    # The step the last stage published: the draft's and the verify's one key.
+    assert step == prop.metadata_buffers["draft_seed"].np[0] == 1
     # The published verify bases, read where the H2D lands them.
     gpu = prop.metadata_buffers["draft_verify_q_row_base"].gpu
     assert q_row_base.shape == (2,) and q_row_base.data_ptr() == gpu.data_ptr()
