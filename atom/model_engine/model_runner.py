@@ -899,9 +899,6 @@ class ModelRunner:
                 int(self.drafter.model.vocab_size),
                 self.device,
             )
-        # The LM head's logits dtype, as the warmup forward emits it; the ratio
-        # verify is compiled for it.
-        self._logits_dtype = None
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             model_runner=self
         )
@@ -954,15 +951,13 @@ class ModelRunner:
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
+        if _draft_lossless(self) is not None:
+            # No warmup or capture forward verifies, so the ratio verify is
+            # compiled here, before the memory profile. Its logits are the LM
+            # head's, which keeps the hidden states' dtype; the verify refuses
+            # logits of any other dtype rather than JIT mid-serving.
+            self.rejection_sampler.warmup_ratio(config.torch_dtype)
         self._maybe_warmup()
-        lossless = _draft_lossless(self)
-        if lossless is not None:
-            # For the dtype the warmup forward's LM head emitted, so no serving
-            # verify compiles; a runner that skips the warmup (RapidServe's
-            # decode) has only the model dtype to go by.
-            self.rejection_sampler.warmup_ratio(
-                self._logits_dtype or config.torch_dtype
-            )
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a
         # DeviceContext intercepting every torch call during serving, including
@@ -3712,8 +3707,6 @@ class ModelRunner:
                 batch, get_forward_context().spec_decode_metadata
             )
         logits, hidden_states = self.run_model(input_ids, batch)
-        if logits is not None:
-            self._logits_dtype = logits.dtype
         self._settle_target_pcp_split()
         drafter = getattr(self, "drafter", None)
 

@@ -314,6 +314,34 @@ def test_the_rejection_sampler_owns_the_verify_scratch_and_warmup(monkeypatch):
     assert scratch is sampler._ratio_scratch
 
 
+def test_the_verify_refuses_logits_it_was_not_warmed_for(monkeypatch):
+    """A verify on another logits dtype would JIT every ratio kernel
+    mid-serving, so it is refused instead."""
+    from atom.model_ops import rejection_sampler as rs_mod
+
+    sampler = rs_mod.RejectionSampler()
+    sampler.arm_ratio(MAX_BS, T, VOCAB, "cpu")
+    monkeypatch.setattr(rs_mod, "warmup_ratio_verify", lambda *a: None)
+    sampler.warmup_ratio(torch.bfloat16)
+    reached = []
+    monkeypatch.setattr(rs_mod, "rejection_sample", lambda *a, **k: reached.append(a))
+    meta = SimpleNamespace(
+        input_ids=None,
+        target_logits_indices=None,
+        num_spec_steps=1,
+        cu_num_draft_tokens=None,
+        bonus_logits_indices=None,
+    )
+    draft_q = (None, torch.full((2,), -1, dtype=torch.int32))
+    sampler(meta, torch.zeros(2, VOCAB, dtype=torch.bfloat16), None, draft_q=draft_q)
+    assert len(reached) == 1
+    with pytest.raises(RuntimeError, match="warmed up for torch.bfloat16"):
+        sampler(meta, torch.zeros(2, VOCAB), None, draft_q=draft_q)
+    # Exact match reads no ratio kernel, so any dtype goes.
+    sampler(meta, torch.zeros(2, VOCAB), None)
+    assert len(reached) == 2
+
+
 # ---- staging ----------------------------------------------------------------
 
 

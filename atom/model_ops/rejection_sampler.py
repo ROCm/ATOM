@@ -127,6 +127,8 @@ class RejectionSampler(nn.Module):
         # armed.
         self._ratio_scratch = None
         self._ratio_widths = None
+        # The logits dtype `warmup_ratio` compiled the verify for.
+        self._ratio_logits_dtype = None
 
     def arm_ratio(self, max_bs: int, num_spec_steps: int, vocab_size: int, device):
         """Allocate the ratio verify's scratch for up to ``max_bs`` requests of
@@ -142,8 +144,10 @@ class RejectionSampler(nn.Module):
         """Compile every ratio verify variant at the widths `arm_ratio` was
         given and the store's, for ``logits_dtype`` (`warmup_ratio_verify`).
         No warmup or capture forward verifies, so without this the first
-        sampled verify would compile."""
+        sampled verify would compile. A verify on logits of another dtype is
+        refused (`forward`)."""
         warmup_ratio_verify(*self._ratio_widths, logits_dtype, self._ratio_scratch)
+        self._ratio_logits_dtype = logits_dtype
 
     def forward(
         self,
@@ -168,6 +172,14 @@ class RejectionSampler(nn.Module):
         target_logits = target_logits.contiguous()
         ratio = None
         if draft_q is not None:
+            if target_logits.dtype != self._ratio_logits_dtype:
+                # The kernels were compiled for another logits dtype (or not at
+                # all); this verify would JIT them mid-serving while the TP/DP
+                # peers wait.
+                raise RuntimeError(
+                    f"ratio verify was warmed up for {self._ratio_logits_dtype} "
+                    f"logits but the LM head emits {target_logits.dtype}"
+                )
             store, q_row_base = draft_q
             ratio = RatioVerifyInputs(
                 store, q_row_base, temperatures, top_ks, top_ps, self._ratio_scratch
