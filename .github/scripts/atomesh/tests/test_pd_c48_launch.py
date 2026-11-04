@@ -1,5 +1,6 @@
 """Check how the C48 launcher wires the Prefill LMCache MP sidecar port."""
 
+import itertools
 import json
 import os
 import subprocess
@@ -135,8 +136,8 @@ class LaunchTest(unittest.TestCase):
     def test_stock_cases_load_no_harness_code(self):
         cells = {"NUMA0": {"device_name": "rdma0,rdma1,rdma2,rdma3"},
                  "PERGPU": {"device_name_per_gpu": [f"rdma{i}" for i in range(8)]}}
-        for cell, nics in cells.items():
-            case = json.loads((GAP / f"V-STOCK40941-C88-{cell}-MC.json").read_text())
+        for (cell, nics), image in itertools.product(cells.items(), ("40941", "DD4E")):
+            case = json.loads((GAP / f"V-STOCK{image}-C88-{cell}-MC.json").read_text())
             self.assertNotIn("wheel", case["mooncake"])
             self.assertEqual({k: v for k, v in case["mooncake"]["store"].items() if k.startswith("device_name")}, nics)
             for role in ("prefill", "decode"):

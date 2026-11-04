@@ -56,13 +56,14 @@ def mounts(case, root=REPO):
 
 class PortMountTest(unittest.TestCase):
     def test_stock_cases_mount_only_the_pr_under_test(self):
-        rc, numa0 = mounts("V-STOCK40941-C88-NUMA0-MC")
-        self.assertEqual((rc, [m for m in numa0 if m]), (0, []))
-        rc, pergpu = mounts("V-STOCK40941-C88-PERGPU-MC")
-        self.assertEqual(rc, 0)
-        self.assertEqual(len(pergpu), 1)
-        self.assertIn("/pr65076/mooncake_store.py,target=/usr/local/lib/python3.12/dist-packages/vllm/distributed/"
-                      "mooncake_store.py,readonly", pergpu[0])
+        for image in ("40941", "DD4E"):
+            rc, numa0 = mounts(f"V-STOCK{image}-C88-NUMA0-MC")
+            self.assertEqual((rc, [m for m in numa0 if m]), (0, []))
+            rc, pergpu = mounts(f"V-STOCK{image}-C88-PERGPU-MC")
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(pergpu), 1)
+            self.assertIn("/pr65076/mooncake_store.py,target=/usr/local/lib/python3.12/dist-packages/vllm/distributed/"
+                          "mooncake_store.py,readonly", pergpu[0])
         with tempfile.TemporaryDirectory() as temp:
             gap = Path(temp) / ".github/benchmark/c48-model-gap"
             shutil.copytree(REPO / ".github/benchmark/c48-model-gap", gap)
