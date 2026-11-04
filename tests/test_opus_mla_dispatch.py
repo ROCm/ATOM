@@ -54,6 +54,7 @@ def _args(
     o_dtype=torch.bfloat16,
     kv_rows=1 << 20,
     marker_q_len=None,
+    marker_heads=opus_mla.HEADS,
     **over,
 ):
     bs = 16
@@ -70,7 +71,9 @@ def _args(
         "page_size": 1,
     }
     args.update(over)
-    marker = opus_mla.PlanMarker(bs, q_len if marker_q_len is None else marker_q_len)
+    marker = opus_mla.PlanMarker(
+        bs, q_len if marker_q_len is None else marker_q_len, marker_heads
+    )
     return SimpleNamespace(opus_plan=marker), args
 
 
@@ -190,9 +193,11 @@ def test_decode_passes_the_mla_decode_fwd_arguments(decoder):
     assert rest == ("qo_indptr", "kv_indptr", "kv_indices", 0.1, "qs", "ks", "g", 8, 3)
 
 
-def _builder(*, is_sparse=False, tbo_decode=False):
+def _builder(*, is_sparse=False, tbo_decode=False, dcp=8, heads=16):
     return SimpleNamespace(
         is_sparse=is_sparse,
+        dcp_world_size=dcp,
+        padded_num_attention_heads=heads,
         model_runner=SimpleNamespace(
             config=SimpleNamespace(enable_tbo_decode=tbo_decode)
         ),
@@ -212,3 +217,124 @@ def test_builder_gate(decoder):
     assert not uses(_builder(), 129, True)
     assert not uses(_builder(is_sparse=True), 32, True)
     assert not uses(_builder(tbo_decode=True), 32, True)
+
+
+# ---- DCP1: the MTP decode without decode context parallelism, under the same switch
+
+
+def _dcp1_args(q_len=6, *, heads=16, **over):
+    """A DCP1 call: one rank's own (padded) heads, no CP, its plan's marker."""
+    over.setdefault("cp_world_size", 1)
+    over.setdefault("marker_heads", heads)
+    return _args(q_len, heads=heads, **over)
+
+
+@pytest.fixture
+def dcp1(decoder):
+    """``ATOM_OPUS_MLA=1`` (the ``decoder`` fixture): DCP1 needs nothing else."""
+    return decoder
+
+
+def test_dcp1_off_with_the_switch_off(monkeypatch, dcp1):
+    meta, args = _dcp1_args()
+    monkeypatch.setenv("ATOM_OPUS_MLA", "0")
+    assert not opus_mla.wanted(meta, **args)
+
+
+@pytest.mark.parametrize("q_len", [2, 4, 6, 8])
+@pytest.mark.parametrize("heads", [12, 16])
+def test_dcp1_shapes_go_opus(dcp1, heads, q_len):
+    meta, args = _dcp1_args(q_len, heads=heads)
+    assert opus_mla.wanted(meta, **args)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        {"causal": False},
+        {"q_len": 1},
+        {"marker_q_len": 4},
+        {"page_size": 64},
+        {"heads": 8},
+        {"heads": 32},
+        {"heads": 96},
+        # a plan for other heads than the call's
+        {"marker_heads": 12},
+        # a DCP1 plan never serves a round-robin call
+        {"cp_world_size": 8},
+        {"q_dtype": torch.bfloat16},
+        {"kv_dtype": torch.bfloat16},
+        {"q_scale": None},
+        {"kv_rows": (1 << 32) // 576 + 1},
+    ],
+    ids=lambda c: ",".join(f"{k}={v}" for k, v in c.items()),
+)
+def test_dcp1_unsupported_calls_stay_on_mla_decode_fwd(dcp1, case):
+    meta, args = _dcp1_args(**case)
+    assert not opus_mla.wanted(meta, **args)
+
+
+def test_dcp1_leaves_round_robin_dcp_as_it_was(dcp1):
+    meta, args = _args()
+    assert opus_mla.wanted(meta, **args)
+    meta, args = _args(cp_world_size=1)
+    assert not opus_mla.wanted(meta, **args)
+
+
+def test_dcp1_shape_limits():
+    assert opus_mla.dcp1_shape_ok(16, 64)
+    assert not opus_mla.dcp1_shape_ok(16, 65)
+    assert opus_mla.dcp1_shape_ok(12, 85)
+    assert not opus_mla.dcp1_shape_ok(12, 86)
+    assert not opus_mla.dcp1_shape_ok(16, 1)
+    assert not opus_mla.dcp1_shape_ok(96, 6)
+
+
+def test_dcp1_update_plan_takes_the_rank_heads_without_cp(dcp1):
+    kv_indptr = np.arange(0, 20 * 100, 100, dtype=np.int32)
+    opus_mla.update_plan(kv_indptr, 4, 6, 1, 16)
+    name, kv, q_len, heads, cp = dcp1.calls[-1]
+    assert (name, q_len, heads, cp) == ("plan", 6, 16, 1)
+    np.testing.assert_array_equal(kv, kv_indptr[:5])
+
+
+def test_dcp1_markers_carry_their_heads(dcp1):
+    assert opus_mla.make_marker(4, 6, 16).heads == 16
+    marker = opus_mla.capture_marker(4, 6, 12)
+    assert dcp1.calls[-1] == ("clear",)
+    assert (marker.bs, marker.q_len, marker.heads) == (4, 6, 12)
+    assert opus_mla.make_marker(4, 6).heads == opus_mla.HEADS
+
+
+def test_dcp1_decode_passes_no_cp(dcp1):
+    q, kv, o = object(), object(), object()
+    opus_mla.decode(
+        q, kv, o, "qo", "kvp", "kvi", "last", 6,
+        sm_scale=0.1, q_scale="qs", kv_scale="ks",
+        g_kv_indptr=None, cp_world_size=1, cp_rank=0,
+    )  # fmt: skip
+    assert dcp1.calls[-1][4] == ("qo", "kvp", "kvi", 0.1, "qs", "ks", None, 1, 0)
+
+
+def test_dcp1_builder_gate(dcp1, monkeypatch):
+    try:
+        from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    except (ImportError, RuntimeError) as exc:
+        pytest.skip(f"aiter MLA backend unavailable: {exc}")
+
+    heads_of = AiterMLAMetadataBuilder._opus_mla_dcp1_heads
+    uses = AiterMLAMetadataBuilder._uses_opus_mla
+    one = _builder(dcp=1)
+    assert heads_of(one, 4, 6) == 16
+    assert heads_of(_builder(dcp=1, heads=12), 4, 6) == 12
+    assert heads_of(one, 128, 6) == 16
+    assert heads_of(one, 129, 6) == 0
+    assert heads_of(one, 4, 1) == 0  # no MTP
+    assert heads_of(_builder(dcp=1, heads=32), 4, 6) == 0
+    assert heads_of(_builder(dcp=8), 4, 6) == 0  # round-robin DCP: its own gate
+    assert heads_of(_builder(dcp=1, is_sparse=True), 4, 6) == 0
+    assert heads_of(_builder(dcp=1, tbo_decode=True), 4, 6) == 0
+    # the round-robin gate never takes a DCP1 batch (cp_round_robin is False)
+    assert not uses(one, 4, False)
+    monkeypatch.setenv("ATOM_OPUS_MLA", "0")
+    assert heads_of(one, 4, 6) == 0
