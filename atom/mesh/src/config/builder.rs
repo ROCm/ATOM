@@ -149,6 +149,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn atom_pd_decode_balance(mut self, policy: super::types::AtomDecodeBalancePolicy) -> Self {
+        self.config.atom_pd_decode_balance = policy;
+        self
+    }
+
+    pub fn atom_pd_late_decode(mut self, enabled: bool) -> Self {
+        self.config.atom_pd_late_decode = enabled;
+        self
+    }
+
     pub fn atom_pd_prefill_backend_routing(mut self, enabled: bool) -> Self {
         self.config.atom_pd_prefill_backend_routing = enabled;
         self

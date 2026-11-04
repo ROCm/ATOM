@@ -615,3 +615,5 @@ async fn backend_prefill_cancel_releases_service_and_decode_reservations() {
     assert_eq!(p.worker.load(), 0);
     assert_eq!(d.worker.load(), 0);
 }
+
+include!("late_decode_tests.rs");

@@ -291,6 +291,14 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub atom_pd_prefill_backend_routing: bool,
 
+    /// Experimental independent Decode selection after ATOM non-chunked prefill.
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    pub atom_pd_late_decode: bool,
+
+    /// Independent D placement policy; context budgets are estimates, not physical KV bytes.
+    #[arg(long, default_value = "request-count", value_parser = ["request-count"], help_heading = "PD Disaggregation")]
+    pub atom_pd_decode_balance: String,
+
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
     pub worker_startup_timeout_secs: u64,
@@ -616,6 +624,8 @@ impl CliArgs {
             .backend(self.backend.into())
             .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
             .atom_pd_prefill_backend_routing(self.atom_pd_prefill_backend_routing)
+            .atom_pd_late_decode(self.atom_pd_late_decode)
+            .atom_pd_decode_balance(crate::config::types::AtomDecodeBalancePolicy::RequestCount)
             .policy(policy)
             .connection_mode(connection_mode)
             .host(&self.host)
@@ -805,6 +815,8 @@ impl Default for CliArgs {
             decode_policy: None,
             atom_pd_rank_mapping_policy: "none".to_string(),
             atom_pd_prefill_backend_routing: false,
+            atom_pd_late_decode: false,
+            atom_pd_decode_balance: "request-count".into(),
             worker_startup_timeout_secs: 1800,
             worker_startup_check_interval: 30,
             log_dir: None,
@@ -878,6 +890,59 @@ mod backend_routing_tests {
             args.to_router_config(vec![])
                 .unwrap()
                 .atom_pd_prefill_backend_routing
+        );
+    }
+}
+#[cfg(test)]
+mod late_decode_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn late_decode_selected_policy_reaches_runtime_config() {
+        let cli = Cli::try_parse_from([
+            "atomesh",
+            "launch",
+            "--backend",
+            "atom",
+            "--pd-disaggregation",
+            "--dp-aware",
+            "--atom-pd-prefill-backend-routing",
+            "--atom-pd-late-decode",
+            "--atom-pd-decode-balance",
+            "request-count",
+        ])
+        .unwrap();
+        let args = match cli.command {
+            Some(Commands::Launch { args }) => args,
+            None => cli.router_args,
+        };
+        let config = args.to_router_config(vec![]).unwrap();
+        assert!(config.atom_pd_late_decode);
+        assert_eq!(
+            config.atom_pd_decode_balance,
+            crate::config::types::AtomDecodeBalancePolicy::RequestCount
+        );
+    }
+
+    #[test]
+    fn late_decode_cli_has_explicit_policy_choice() {
+        let cli = Cli::try_parse_from([
+            "atomesh",
+            "launch",
+            "--atom-pd-late-decode",
+            "--atom-pd-decode-balance",
+            "request-count",
+        ])
+        .unwrap();
+        let args = match cli.command {
+            Some(Commands::Launch { args }) => args,
+            None => cli.router_args,
+        };
+        assert!(args.atom_pd_late_decode);
+        assert_eq!(args.atom_pd_decode_balance, "request-count");
+        assert!(
+            Cli::try_parse_from(["atomesh", "--atom-pd-decode-balance", "unsupported"]).is_err()
         );
     }
 }

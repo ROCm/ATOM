@@ -1,5 +1,29 @@
 use super::*;
 
+#[cfg(test)]
+mod late_decode_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn late_decode_requires_supported_pd_configuration() {
+        let mut cfg = RouterConfig::default();
+        cfg.atom_pd_late_decode = true;
+        assert!(ConfigValidator::validate_compatibility(&cfg).is_err());
+        cfg.atom_pd_prefill_backend_routing = true;
+        cfg.backend = BackendType::Atom;
+        cfg.dp_aware = true;
+        cfg.mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        assert!(ConfigValidator::validate_compatibility(&cfg).is_ok());
+        cfg.atom_pd_rank_mapping_policy = AtomPdRankMappingPolicy::Idx2Idx;
+        assert!(ConfigValidator::validate_compatibility(&cfg).is_err());
+    }
+}
+
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 
@@ -313,6 +337,11 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        if config.atom_pd_late_decode && !config.atom_pd_prefill_backend_routing {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "atom_pd_late_decode requires atom_pd_prefill_backend_routing (ATOM HTTP PD, dp_aware, rank mapping none)".into(),
+            });
+        }
         if config.atom_pd_prefill_backend_routing
             && (config.backend != BackendType::Atom
                 || !config.mode.is_pd_mode()
