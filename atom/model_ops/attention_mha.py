@@ -872,6 +872,13 @@ class PagedAttentionImpl(nn.Module):
         sliding_window = (
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
         )
+        # A draft mid-step's token split, written by the advance before it
+        # (ATOM_MTP_ADVANCE_TOKEN_SPLIT); aiter computes it otherwise.
+        split = {}
+        if fwd_ctx.context.is_draft and attn_metadata.max_seqlen_q == 1:
+            tiles = getattr(attn_metadata, "gfx12_token_split_tiles", None)
+            if tiles is not None:
+                split["gfx12_token_split_tiles"] = tiles
         unified_attention(
             q,
             k_cache,
@@ -894,6 +901,7 @@ class PagedAttentionImpl(nn.Module):
             shuffled_kv_cache=not self.use_flash_layout,
             equal_seqlen_q=attn_metadata.equal_seqlen_q,
             **epilogue,
+            **split,
         )
         return o
 

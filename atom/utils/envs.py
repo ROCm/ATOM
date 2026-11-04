@@ -1279,6 +1279,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # export in one launch plus the kv_indices generation (57 launches a
     # decode step at mtp_k=3 down to 6). Same metadata and inputs, bit for bit.
     "ATOM_MTP_FUSED_DRAFT_GLUE": lambda: _flag_env("ATOM_MTP_FUSED_DRAFT_GLUE", "0"),
+    # With ATOM_MTP_FUSED_DRAFT_GLUE and aiter's gfx1250 token split
+    # (AITER_GFX12_TOKEN_SPLIT=1): the advance kernel also writes the next pass's
+    # attention tiles per segment, which the pass's unified attention then reads
+    # instead of launching gfx12_token_split_tiles. The same int32.
+    "ATOM_MTP_ADVANCE_TOKEN_SPLIT": lambda: _flag_env(
+        "ATOM_MTP_ADVANCE_TOKEN_SPLIT", "0"
+    ),
+    # With ATOM_MTP_FUSED_DRAFT_GLUE: skip the per-pass kv_indices generation
+    # where no draft attention reads kv_indices (page sizes other than 256 / 1024,
+    # whose persistent ASM decode is its only reader). kv_indptr is still written.
+    "ATOM_MTP_SKIP_DRAFT_KV_INDICES": lambda: _flag_env(
+        "ATOM_MTP_SKIP_DRAFT_KV_INDICES", "0"
+    ),
     # Debug: all-gather each step's draft ids over TP after propose and log any
     # rank disagreement. Syncs the host every decode step -- validation only.
     "ATOM_MTP_DRAFT_RANK_CHECK": lambda: (
