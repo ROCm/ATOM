@@ -32,6 +32,7 @@ export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 #   LM_EVAL_NUM_FEWSHOT
 #   LM_EVAL_NUM_CONCURRENT
 #   LM_EVAL_EXTRA_MODEL_ARGS
+#   LM_EVAL_REQUEST_TIMEOUT
 #   LM_EVAL_USE_CHAT_COMPLETIONS
 #   LM_EVAL_BATCH_SIZE
 #   LM_EVAL_GEN_KWARGS
@@ -57,6 +58,7 @@ LM_EVAL_TASK=${LM_EVAL_TASK:-gsm8k}
 LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 LM_EVAL_NUM_CONCURRENT=${LM_EVAL_NUM_CONCURRENT:-65}
 LM_EVAL_EXTRA_MODEL_ARGS=${LM_EVAL_EXTRA_MODEL_ARGS:-}
+LM_EVAL_REQUEST_TIMEOUT=${LM_EVAL_REQUEST_TIMEOUT:-1800}
 LM_EVAL_USE_CHAT_COMPLETIONS=${LM_EVAL_USE_CHAT_COMPLETIONS:-0}
 LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-65}
 LM_EVAL_GEN_KWARGS=${LM_EVAL_GEN_KWARGS:-}
@@ -354,6 +356,10 @@ run_accuracy() {
   else
     lm_eval_model_args="model=${resolved_model_path},base_url=http://127.0.0.1:${SGLANG_PORT}${lm_eval_endpoint_path},num_concurrent=${LM_EVAL_NUM_CONCURRENT},max_retries=1,tokenized_requests=False,trust_remote_code=True"
   fi
+  # lm_eval's 300s default is shorter than a single aiter JIT build on an image
+  # without prebuilt kernels (e.g. module_moe_asm ~210s, stacked behind others).
+  # Later keys win, so LM_EVAL_EXTRA_MODEL_ARGS can still override this.
+  lm_eval_model_args="${lm_eval_model_args},timeout=${LM_EVAL_REQUEST_TIMEOUT}"
   if [[ -n "${LM_EVAL_EXTRA_MODEL_ARGS}" ]]; then
     lm_eval_model_args="${lm_eval_model_args},${LM_EVAL_EXTRA_MODEL_ARGS#,}"
   fi
