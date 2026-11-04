@@ -422,6 +422,7 @@ failure, because not writing it was the cheapest way past this check.
   card actually has. Never omit the `Validation` line: silence on it reads as clearance.
 
 ```
+
 ## ATOM PR #NNN — [title]
 
 **[One sentence: what this PR does, in plain terms. E.g. "Wraps the per_group emit_bf16 AllReduce path in a torch.library op so Dynamo can trace it."]**
@@ -495,25 +496,5 @@ When a human reviewer (valarLip or others) catches something real that this skil
 only the prose every review needs, with no code fence over 30 lines.
 Conditional content goes in `rules.md` and reaches the reviewer through
 `triage.py expand`; executable content goes in a script and gets called.
-Raising the budget is a decision to make this file less likely to be read in
-full — make it in a commit that says why.
-
----
-
-## Where this skill's judgement comes from
-
-This file describes the **bot pipeline**: what each step fetches, what each gate
-requires, what the worker and the refuter are asked. It does not invent the standard
-it applies. Two ATOM documents hold that, and this PR supersedes neither:
-
-- `references/maintainer-lens.md` — the maintainer's lens, verbatim as the ATOM
-  maintainers wrote it (#2871), moved here when the bot pipeline took the `SKILL.md`
-  path. Its section 3 is what a human applies by hand, and the `N1-N6` rules in
-  `rules.md` are distilled from it. **Read it to review a PR yourself.**
-- `references/rule-catalog.md` — the team rule catalog (#2871). `rules.md` shares its
-  A-G taxonomy and rule ids by descent; the two deliberate divergences are recorded at
-  the top of `rules.md`.
-- `scripts/affected_tests.py` — which tests a diff reaches.
-
-A rule in `rules.md` that appears in neither is an extension, and `rules.md` says
-which ones those are and where each came from.
+Raising the budget is a decision to make this file less likely to be read in full
+— say why in the commit. Provenance lives in `references/README.md`, not here.

@@ -15,6 +15,25 @@
 #    GLM is weaker adversarially; point REFUTER_CMD at Opus to restore the cross-family check.
 set -euo pipefail
 
+# Cheapest precondition first, and the only one that needs no environment: this runs
+# BEFORE the repo is located, so a misconfigured pair is refused in a directory where
+# run_one could not start at all. Below, `git rev-parse` would fail first and report
+# 128, which says nothing about the knobs.
+: "${ATOM_RUN_BUDGET:=7200}"      # 120 min, under the job's timeout-minutes of 150
+: "${ATOM_AGENT_TIMEOUT:=2400}"   # 40 min per agent attempt; one default, read everywhere below
+# The two knobs are coupled, and the coupling has no other enforcement. A review runs TWO
+# agents in series -- the worker and the independent refuter -- and the budget gate below
+# refuses to START one that cannot finish inside the deadline. So if a raised
+# ATOM_AGENT_TIMEOUT leaves less than one more agent's worth of budget, the refuter never
+# runs, the `independent` gate reds, and the review is withheld. Raising one knob alone is
+# the obvious thing to do and it silently breaks the run an hour later, reported as a
+# timeout whose named fix (raise AGENT_TIMEOUT) makes it worse. Caught here instead, where
+# the numbers are, before any work is spent.
+if [ $(( ATOM_AGENT_TIMEOUT * 2 )) -gt "$ATOM_RUN_BUDGET" ]; then
+  echo "::error title=review-pr::ATOM_AGENT_TIMEOUT=${ATOM_AGENT_TIMEOUT}s x2 agents (worker + refuter) exceeds ATOM_RUN_BUDGET=${ATOM_RUN_BUDGET}s, so the refuter could not start and the review would be withheld after the worker had already run. Raise ATOM_RUN_BUDGET to at least $(( ATOM_AGENT_TIMEOUT * 2 ))s, or lower ATOM_AGENT_TIMEOUT." >&2
+  exit 2
+fi
+
 PR="${1:?usage: run_one.sh <pr> [owner/repo]}"
 REPO="${2:-ROCm/ATOM}"
 SKILL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .claude/skills/review-pr
@@ -51,22 +70,10 @@ trap _on_signal TERM INT
 # retries against a deadline that sits inside it instead. Anchored here, at the start: the fetch,
 # the prompt check and the health probe all spend the same wall clock the agents do, and a budget
 # that starts counting after them can still overrun the job cap.
-: "${ATOM_RUN_BUDGET:=7200}"      # 120 min, under the job's timeout-minutes of 150
-: "${ATOM_AGENT_TIMEOUT:=2400}"   # 40 min per agent attempt; one default, read everywhere below
+# Both defaults are set at the top of this file, before the budget precondition that
+# needs them. Declaring them twice would mean changing one and silently keeping the other.
 # Wider than aiter's 100/120: validate-atom-pr (P2) stands up two model-serving instances inside
 # the same run, and that extra wall clock has to fit inside the budget alongside the review itself.
-# The two knobs are coupled, and the coupling has no other enforcement. A review runs TWO
-# agents in series -- the worker and the independent refuter -- and the budget gate below
-# refuses to START one that cannot finish inside the deadline. So if a raised
-# ATOM_AGENT_TIMEOUT leaves less than one more agent's worth of budget, the refuter never
-# runs, the `independent` gate reds, and the review is withheld. Raising one knob alone is
-# the obvious thing to do and it silently breaks the run an hour later, reported as a
-# timeout whose named fix (raise AGENT_TIMEOUT) makes it worse. Caught here instead, where
-# the numbers are, before any work is spent.
-if [ $(( ATOM_AGENT_TIMEOUT * 2 )) -gt "$ATOM_RUN_BUDGET" ]; then
-  echo "::error title=review-pr::ATOM_AGENT_TIMEOUT=${ATOM_AGENT_TIMEOUT}s x2 agents (worker + refuter) exceeds ATOM_RUN_BUDGET=${ATOM_RUN_BUDGET}s, so the refuter could not start and the review would be withheld after the worker had already run. Raise ATOM_RUN_BUDGET to at least $(( ATOM_AGENT_TIMEOUT * 2 ))s, or lower ATOM_AGENT_TIMEOUT." >&2
-  exit 2
-fi
 DEADLINE=$(( $(date +%s) + ATOM_RUN_BUDGET ))
 
 # GLM-5.3 is not in Claude's model catalog; disable the unknown-model window enforcement.

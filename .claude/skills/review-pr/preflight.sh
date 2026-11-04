@@ -84,7 +84,12 @@ tok=""
 if [ -n "$tok" ]; then
   who="$(curl -s -m 12 -H "Authorization: token $tok" https://api.github.com/user 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("login",""))' 2>/dev/null)"
   chk "bot token valid (identity=${who:-?})" "[ -n '$who' ]" "ATOM_BOT_TOKEN(_FILE) invalid"
-  want=$(ATOM_BOT_LOGIN="${ATOM_BOT_LOGIN:-}" python3 -c "import _identity;print(_identity.login())" 2>/dev/null || echo aiter-bot)
+  # PYTHONPATH, because RUNNER-SETUP section 6 documents running this from the repo root,
+  # where the import fails and `want` silently degrades to the default -- firing the
+  # identity-mismatch warning for every correctly-configured bot that is not that default,
+  # which teaches operators to ignore the one warning that matters.
+  want=$(PYTHONPATH="$S" ATOM_BOT_LOGIN="${ATOM_BOT_LOGIN:-}" \
+    python3 -c "import _identity;print(_identity.login())" 2>/dev/null || echo aiter-bot)
   [ "$who" = "$want" ] || echo "     ⚠ identity is '$who', not '$want' — comments would post as $who (set ATOM_BOT_LOGIN to match the token's owner)"
 else
   echo "  ⚠ ATOM_BOT_TOKEN / ATOM_BOT_TOKEN_FILE not set — the workflow injects it from a secret; export one to verify locally"
