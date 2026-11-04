@@ -29,6 +29,7 @@ from atom.kv_transfer.offload.mp.deployment import (
 )
 from atom.kv_transfer.offload.mp.lookup import _DEFAULT_READ_TTL_S, _MPLookupClient
 from atom.kv_transfer.offload.mp.lookup_driver import _LockedAdapter
+from atom.kv_transfer.offload.mp.token_shipping import ShippedTokens, TokenShipper
 from atom.kv_transfer.offload.mp.transfer import (
     _SCHEDULER_DEADLINE_MARGIN_S,
     LMCacheTransferUnprovable,
@@ -227,6 +228,15 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         seq.offload_load_start_tokens = int(seq.num_cached_tokens)
         return operation
 
+    @property
+    def _token_shipper(self) -> TokenShipper:
+        """Incremental token shipping (`token_shipping.py`). Created on first
+        use, so schedulers assembled without `__init__` (test doubles) work."""
+        return self.__dict__.setdefault("_token_shipper_state", TokenShipper())
+
+    def _transfer_tokens(self, seq: Any, end: int) -> ShippedTokens:
+        return self._token_shipper.ship(seq, end)
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         try:
             metadata = super().build_connector_meta()
@@ -413,6 +423,8 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             if callable(in_flight) and in_flight(sid):
                 continue
             del pending[sid]
+            # No save can follow now: the workers' copy of its tokens goes.
+            self._token_shipper.drop(seq.id, seq)
             try:
                 self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))
             except Exception:

@@ -37,6 +37,19 @@ from atom.model_engine.sequence import Replay, Sequence, SequenceStatus, Sequenc
 from atom.model_engine.state_runtime import StateRuntime, StateTransfer
 
 
+def _shipped_tokens(req):
+    """The token ids a worker hands the transfer for `req` (a request's first
+    shipment carries its whole prefix: `token_shipping.WorkerTokens`)."""
+    import copy
+    from types import SimpleNamespace as _NS
+
+    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
+
+    meta = _NS(requests=[copy.copy(req)])
+    WorkerTokens().resolve(meta)
+    return meta.requests[0].token_ids
+
+
 @pytest.fixture(autouse=True)
 def storage_config(monkeypatch):
     # The transport is a double; retain config/chunk validation without needing
@@ -202,7 +215,7 @@ def test_save_uses_ready_native_hash_and_never_copies_active_slot(monkeypatch):
     assert request.native_state.boundary_tokens == 16
     assert request.native_state.unit_ids == image.unit_ids
     assert request.native_state.destination_slot is None
-    assert request.token_ids == list(seq.token_ids[:16])
+    assert _shipped_tokens(request) == list(seq.token_ids[:16])
     assert request.save_spec.skip_leading_tokens == 0
     assert checkpoints.take_checkpoint_ops() == ((), ())
     checkpoints.clear_index()
@@ -238,7 +251,7 @@ def test_save_frontier_selects_existing_checkpoint_below_computed_tokens(monkeyp
     checkpoint(scheduler, checkpoints, seq, 8)
     scheduler.update_state_after_alloc(seq)
     [request] = scheduler.build_connector_meta().requests
-    assert len(request.token_ids) == 8
+    assert len(_shipped_tokens(request)) == 8
     assert request.native_state.boundary_tokens == 8
     assert scheduler._save_tracker["1"][1] == 8
 
@@ -461,7 +474,7 @@ def test_load_queries_safe_chunk_boundary_before_reserving_state(monkeypatch, pr
     assert request.native_state.destination_slot == seq.state_slot
     assert request.load_spec.lmcache_cached_tokens == expected
     assert request.load_spec.transfer_end_tokens is None
-    assert request.token_ids == list(seq.token_ids[:expected])
+    assert _shipped_tokens(request) == list(seq.token_ids[:expected])
     assert (
         scheduler.load_finished(LoadOperationId(seq.id, operation.generation + 1))
         is False
@@ -485,7 +498,7 @@ def test_aligned_hbm_hit_uses_incremental_native_restore(monkeypatch):
     [request] = scheduler.build_connector_meta().requests
     assert request.load_spec.hbm_cached_tokens == 8
     assert request.load_spec.lmcache_cached_tokens == 16
-    assert request.token_ids == list(seq.token_ids[:16])
+    assert _shipped_tokens(request) == list(seq.token_ids[:16])
     assert seq.offload_load_start_tokens == 8
     assert checkpoints.store.pool.num_free == 27
 
