@@ -1075,8 +1075,38 @@ jobs:
             bash -lc '
               set -euo pipefail
               python3 - <<'"'"'PY'"'"'
+          import json
           import os
           from pathlib import Path
+
+
+          def incomplete_reason(path):
+              # An interrupted download can leave config.json and some shards but
+              # no index or tokenizer. Without a completion marker, require both
+              # so such a directory falls through to the resumable download.
+              index_path = path / "model.safetensors.index.json"
+              if index_path.is_file():
+                  try:
+                      weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+                  except Exception as exc:
+                      return f"invalid safetensors index ({exc})"
+                  expected = {Path(name).name for name in weight_map.values()}
+                  present = {shard.name for shard in path.glob("*.safetensors")}
+                  missing = sorted(expected - present)
+                  if missing:
+                      return f"{len(missing)} safetensors shards missing, e.g. {missing[0]}"
+              if any(
+                  (path / name).is_file()
+                  for name in (".download-complete", ".atom_download_complete")
+              ):
+                  return None
+              if not index_path.is_file() and not (path / "model.safetensors").is_file():
+                  return "no download completion marker or safetensors index"
+              tokenizer_files = ("tokenizer.json", "tokenizer.model", "tiktoken.model", "tokenizer_config.json")
+              if not any((path / name).is_file() for name in tokenizer_files):
+                  return "no download completion marker or tokenizer files"
+              return None
+
 
           model_path = os.environ["MODEL_PATH"].strip().strip("/")
           normalized = model_path.rstrip("/")
@@ -1183,8 +1213,11 @@ jobs:
               seen.add(candidate)
               path = Path(candidate)
               if (path / "config.json").is_file():
-                  print(f"FOUND_LOCAL_MODEL={candidate}")
-                  raise SystemExit(0)
+                  reason = incomplete_reason(path)
+                  if reason is None:
+                      print(f"FOUND_LOCAL_MODEL={candidate}")
+                      raise SystemExit(0)
+                  print(f"Skipping incomplete local model {candidate}: {reason}")
 
           print("LOCAL_MODEL_NOT_FOUND")
           print("Checked candidates:")
