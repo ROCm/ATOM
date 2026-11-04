@@ -276,6 +276,7 @@ def apply_chat_template(
     messages: list[dict] | list[ChatMessage],
     *,
     tools: list[dict] | None = None,
+    preserve_tool_call_arguments: bool = False,
     **kwargs: Any,
 ) -> str:
     """Render ``messages`` to a prompt string.
@@ -291,7 +292,10 @@ def apply_chat_template(
             custom_encoder is not None and custom_encoder.preserve_content
         )
         messages = [
-            message.to_template_dict(preserve_content=preserve_content)
+            message.to_template_dict(
+                preserve_content=preserve_content,
+                preserve_tool_call_arguments=preserve_tool_call_arguments,
+            )
             for message in messages
         ]
     if custom_encoder is not None:

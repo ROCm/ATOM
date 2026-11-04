@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
     checkpoint_layer_key,
     unquantized_layer_keys,
@@ -2038,6 +2039,10 @@ class Config:
     # --no-encoder-swa-bounded-replay keeps checkpoints. No effect on other models.
     enable_encoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
+    # Prefill admission (`--prefill-admit-policy`): "interval" keeps
+    # ATOM_PREFILL_DECODE_INTERVAL and the coalescer; "adaptive" replaces both
+    # with the rent-or-buy rule in prefill_delayer.py.
+    prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
@@ -2079,8 +2084,13 @@ class Config:
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
+    enable_request_context_metrics: bool = False
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
     throughput_log_interval: float = 10.0
+    # Forwards between engine-status lines, replacing the clock above when
+    # positive. For offline / MLPerf runs comparing one DP rank's lines against
+    # another's; the clock lands on a different step number on each rank.
+    throughput_log_interval_steps: int = 0
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
@@ -2219,6 +2229,71 @@ class Config:
             return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
 
+    def _resolve_throughput_step_interval(self) -> None:
+        """Keep the step trigger to the topologies it has been validated on.
+
+        Two different reasons, and only the first is a hard one. PP replaces
+        `busy_loop` outright (`pp_engine_core.py`), so `bump_step` is never
+        reached and the line would go silent after announcing a logging mode.
+        RapidServe and P/D are a scope choice: `PrefillEngineCore` and
+        `DecodeEngineCore` inherit the base loop and override only
+        `_process_engine_step`, so the counter would in fact advance there --
+        it is simply untested, and a step number nobody has lined up across a
+        disaggregated pair is worth less than the clock. Degrade rather than
+        raise: a stale flag in a shared launch script must not stop a server
+        from starting.
+        """
+        if self.throughput_log_interval_steps <= 0 or not self.enable_log_stats:
+            # Nothing to warn about with the line itself off: the fallback a
+            # warning would name is the clock, which is equally silent.
+            self.throughput_log_interval_steps = 0
+            return
+        # Shared with the P/D classifier rather than re-derived here. It walks
+        # a MultiConnector's nested entries (a prefill node carries `kv_role`
+        # one level down with nothing at the top) and tolerates any shape,
+        # which this blob needs: it is user-supplied CLI JSON, and raising
+        # would take the server down at construction. It also keys on the
+        # connector name, because an offload tier legally takes `kv_producer`
+        # and `kv_consumer` while running the loop that counts.
+        from atom.kv_transfer.disaggregation.pd_producer import (
+            disaggregated_kv_role,
+        )
+
+        kv_role = disaggregated_kv_role(self)
+        if self.pipeline_parallel_size > 1:
+            reason = (
+                f"pipeline_parallel_size is {self.pipeline_parallel_size}, which "
+                "replaces the busy loop that counts the forwards"
+            )
+        elif self.enable_rapidserve:
+            reason = "RapidServe is not covered by the step counter yet"
+        elif kv_role is not None:
+            reason = f"a P/D engine (kv_role={kv_role}) is not covered yet"
+        else:
+            return
+        logger.warning(
+            "throughput_log_interval_steps=%d ignored because %s; the "
+            "engine-status line stays on the %.1fs clock. Step-aligned "
+            "windows are supported on the base and DP engines only.",
+            self.throughput_log_interval_steps,
+            reason,
+            self.throughput_log_interval,
+        )
+        self.throughput_log_interval_steps = 0
+
+    @property
+    def end_token_ids(self) -> tuple[int, ...]:
+        """Every token ID that terminates generation on this deployment."""
+        return tuple(
+            sorted(
+                {
+                    i
+                    for i in (self.eos_token_id, *self.stop_token_ids)
+                    if i is not None and i >= 0
+                }
+            )
+        )
+
     def __post_init__(self):
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
@@ -2236,6 +2311,13 @@ class Config:
             )
             self.enable_tbo = False
             self.enable_tbo_decode = False
+
+        self.prefill_admit_policy = self.prefill_admit_policy.strip().lower()
+        if self.prefill_admit_policy not in PREFILL_ADMIT_POLICIES:
+            raise ValueError(
+                f"prefill_admit_policy must be one of {PREFILL_ADMIT_POLICIES}, "
+                f"got {self.prefill_admit_policy!r}"
+            )
 
         self.moe_backend = self.moe_backend.strip().lower()
         if self.moe_backend not in ("standard", "mega"):
@@ -2500,6 +2582,9 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        # After the parse above: the P/D clause reads `kv_role` off
+        # `kv_transfer_config`, which arrives from the CLI as a string.
+        self._resolve_throughput_step_interval()
         if self.kv_transfer_config:
             # The offload namespace hashes the model's cache geometry. A worker
             # normalises `hf_config` while it builds the model (Kimi-K3 derives

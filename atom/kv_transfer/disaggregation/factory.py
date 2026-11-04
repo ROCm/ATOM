@@ -37,6 +37,14 @@ def resolve_pd_backend(kv_transfer_config: dict | None) -> str | None:
     only the LMCache offload tier configures one too. ``multi`` is unwrapped,
     since ``multi[mooncake + lmcache_offload]`` is a mooncake peer.
     """
+    sub = pd_transfer_config(kv_transfer_config)
+    return None if sub is None else sub.get("kv_connector", _DEFAULT_BACKEND)
+
+
+def pd_transfer_config(kv_transfer_config: dict | None) -> dict | None:
+    """The config of the connector that will do P/D transfer (see
+    ``resolve_pd_backend``): ``multi``'s P/D sub-connector, whose own
+    ``kv_role`` says the instance's side; ``None`` if none will."""
     cfg = kv_transfer_config or {}
     if not cfg:
         return None
@@ -44,11 +52,11 @@ def resolve_pd_backend(kv_transfer_config: dict | None) -> str | None:
     name = cfg.get("kv_connector", _DEFAULT_BACKEND)
     if name == "multi":
         for sub in cfg.get("connectors", []) or []:
-            sub_name = (sub or {}).get("kv_connector", _DEFAULT_BACKEND)
-            if sub_name in PD_TRANSFER_BACKENDS:
-                return sub_name
+            sub = sub or {}
+            if sub.get("kv_connector", _DEFAULT_BACKEND) in PD_TRANSFER_BACKENDS:
+                return sub
         return None
-    return name if name in PD_TRANSFER_BACKENDS else None
+    return cfg if name in PD_TRANSFER_BACKENDS else None
 
 
 class KVConnectorFactory:
