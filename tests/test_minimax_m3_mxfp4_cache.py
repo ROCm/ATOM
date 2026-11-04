@@ -104,12 +104,14 @@ def check(**kw):
         "block_size": 128,
         "plugin_mode": False,
         "sparse_local_block": 1,
+        "torch_dtype": torch.bfloat16,
         **kw,
     }
     config = types.SimpleNamespace(
         kv_mxfp4=a["kv_mxfp4"],
         index_cache_dtype=a["index_cache_dtype"],
         kv_cache_block_size=a["block_size"],
+        torch_dtype=a["torch_dtype"],
         hf_config=types.SimpleNamespace(
             sparse_attention_config={"sparse_local_block": a["sparse_local_block"]}
         ),
@@ -126,6 +128,14 @@ def test_refusals_name_what_is_wrong():
     # the MXFP4 index alone, MiniMax-M3's own layout, is held to the same
     with pytest.raises(ValueError, match="128 tokens"):
         check(kv_mxfp4=False, block_size=16)
+
+
+def test_the_mxfp4_kv_needs_a_bf16_model():
+    # aiter's MXFP4 pa_decode writes bf16 only; the output takes the model dtype
+    with pytest.raises(ValueError, match="needs a bfloat16 model, got torch.float16"):
+        check(torch_dtype=torch.float16)
+    # the MXFP4 index alone never reaches that kernel
+    check(kv_mxfp4=False, torch_dtype=torch.float16)
 
 
 def test_only_gfx950_is_served(chip_info):

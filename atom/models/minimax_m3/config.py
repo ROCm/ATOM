@@ -9,6 +9,8 @@ def validate_runtime_config(config):
     """Refuse MiniMax-M3's MXFP4 caches where they cannot run, at startup rather
     than in the first forward (``--kv-cache-dtype fp4``, held as ``kv_mxfp4``, and
     ``--index-cache-dtype fp4``)."""
+    import torch
+
     from atom.config import is_plugin_mode
 
     if not (config.kv_mxfp4 or config.index_cache_dtype == "fp4"):
@@ -16,6 +18,12 @@ def validate_runtime_config(config):
     if is_plugin_mode():
         raise ValueError(
             "MXFP4 KV / index caches do not run under the vLLM/SGLang bridges"
+        )
+    if config.kv_mxfp4 and config.torch_dtype != torch.bfloat16:
+        # aiter's MXFP4 pa_decode only writes bf16; the attention output takes the
+        # model dtype, so an fp16 checkpoint would fail in its first forward.
+        raise ValueError(
+            "--kv-cache-dtype fp4 needs a bfloat16 model, " f"got {config.torch_dtype}"
         )
     block_size = config.kv_cache_block_size
     if block_size != 128:

@@ -7,6 +7,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch
 from transformers import PretrainedConfig
 
 import atom.config as config_module
@@ -266,6 +267,29 @@ def test_m3_fp4_hashes_apart_from_fp8(monkeypatch):
     kv_only = _m3(monkeypatch, kv_cache_dtype="fp4", index_cache_dtype="fp8")
 
     assert len({fp8.compute_hash(), fp4.compute_hash(), kv_only.compute_hash()}) == 3
+
+
+def test_an_fp16_m3_refuses_mxfp4_kv_at_startup(monkeypatch):
+    # aiter's MXFP4 pa_decode writes bf16 only, so the KV flavor needs a bf16 model
+    for kv in ("fp4", "fp8"):
+        flag = {"kv_mxfp4": True} if kv == "fp8" else {}
+        with pytest.raises(ValueError, match="needs a bfloat16 model"):
+            _m3(
+                monkeypatch,
+                kv_cache_dtype="fp4" if kv == "fp4" else "fp8",
+                hf={"dtype": torch.float16},
+                **flag,
+            )
+    # bf16 passes; the MXFP4 index alone (and fp8 KV) never reach that kernel
+    assert _m3(monkeypatch, kv_cache_dtype="fp4").kv_mxfp4
+    for dtype in (torch.bfloat16, torch.float16):
+        config = _m3(
+            monkeypatch,
+            kv_cache_dtype="bf16",
+            index_cache_dtype="fp4",
+            hf={"dtype": dtype},
+        )
+        assert (config.kv_mxfp4, config.index_cache_dtype) == (False, "fp4")
 
 
 def test_an_m3_export_named_only_by_model_type_gets_the_m3_mapping(monkeypatch):
