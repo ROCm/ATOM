@@ -7,7 +7,6 @@ from torch import nn
 from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
-from atom.model_ops.spec_sampling.ratio_verify import RatioVerifyInputs
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_lossless import DSparkLossless
@@ -70,75 +69,8 @@ class DSparkProposer(Drafter):
         if self._with_draft:
             self._init_draft_block_buffers()
         # Must run before any warmup or capture: the block sampler branches on
-        # the binding in python, so whichever side is bound here is recorded.
-        self._init_lossless_sampling()
-
-    # ---- lossless speculative sampling (`DSparkLossless`) -------------------
-
-    def _init_lossless_sampling(self) -> None:
-        """Arm lossless sampling, or keep the greedy pair (`DSparkLossless.arm`)."""
-        self._lossless = DSparkLossless.arm(self)
-
-    def bind_target_sampling(self, forward_vars) -> bool:
-        """`DSparkLossless.bind_target`; True when the draft now reads the
-        target's per-row filters."""
-        if self._lossless is None:
-            return False
-        self._lossless.bind_target(forward_vars, self.model)
-        return True
-
-    def stage_draft_sampling_host(
-        self, batch, bs: int, group, *, drafts_verifiable: bool
-    ) -> None:
-        """`DSparkLossless.stage`, from `ModelRunner.prepare_sample`, so every
-        member rides that function's `sampling` H2D."""
-        if self._lossless is None:
-            return
-        self._lossless.stage(
-            batch,
-            bs,
-            group,
-            drafts_verifiable=drafts_verifiable,
-            step=self.runner.forward_step,
-        )
-
-    def _before_propose(self) -> None:
-        """Claim this forward's staging for the propose about to run; a propose
-        that skipped `prepare_sample` would draft through stale row bases, so
-        it is refused (`DraftQStaging.consume`)."""
-        if self._lossless is None:
-            return
-        self._lossless.staging.consume(self.runner.forward_step)
-
-    def lossless_verify_inputs(
-        self,
-        bs: int,
-        logits_dtype: torch.dtype,
-        temperatures: torch.Tensor,
-        top_ks: int | torch.Tensor | None,
-        top_ps: float | torch.Tensor | None,
-    ) -> RatioVerifyInputs | None:
-        """`DSparkLossless.verify_inputs`, or None for exact match. Asked only
-        for a batch that is not all greedy."""
-        if self._lossless is None:
-            return None
-        return self._lossless.verify_inputs(
-            bs, logits_dtype, temperatures, top_ks, top_ps
-        )
-
-    def warmup_lossless_verify(self, logits_dtype: torch.dtype) -> None:
-        """`DSparkLossless.warmup_verify`."""
-        if self._lossless is None:
-            return
-        self._lossless.warmup_verify(logits_dtype)
-
-    def _before_draft_warmup(self) -> None:
-        """Point every draft row at no q row: the warmup runs the captured block
-        directly, and after a sleep/wake recapture the last served step's row
-        bases would overwrite live requests' q."""
-        if self._lossless is None:
-            return
-        self._lossless.clear_destinations()
+        # the binding in python, so whichever side is bound is recorded.
+        self.lossless = DSparkLossless.arm(self)
 
     def _declare_draft_graphs(self):
         """The block pass, in whichever flavor this drafter is.

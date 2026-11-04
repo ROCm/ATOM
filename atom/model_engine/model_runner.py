@@ -150,6 +150,12 @@ def max_schedulable_decode_bs(
 _kv_config_has_producer = kv_config_has_producer
 
 
+def _draft_lossless(runner):
+    """The runner's drafter's armed lossless sampling state, or None."""
+    drafter = getattr(runner, "drafter", None)
+    return None if drafter is None else drafter.lossless
+
+
 def _needs_id_sync(is_deferred_out: bool, has_drafter: bool) -> bool:
     """Whether sampled ids feed the next forward on device (deferred-out or a
     drafter), so they must agree across a group. Shared by the PCP and TP
@@ -881,10 +887,9 @@ class ModelRunner:
         self.allocate_forward_vars()
         # A lossless DSpark draft reads the target's temperatures and filters
         # rather than a copy of its own; bound before any warmup or capture.
-        drafter = getattr(self, "drafter", None)
-        self._draft_reads_filters = (
-            drafter is not None and drafter.bind_target_sampling(self.forward_vars)
-        )
+        lossless = _draft_lossless(self)
+        if lossless is not None:
+            lossless.bind_target(self.forward_vars, self.drafter.model)
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             model_runner=self
         )
@@ -937,12 +942,12 @@ class ModelRunner:
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
-        if getattr(self, "drafter", None) is not None:
+        if _draft_lossless(self) is not None:
             # No warmup or capture forward verifies, so the ratio verify is
             # compiled here, before the memory profile. Its logits are the LM
             # head's, which keeps the hidden states' dtype; the verify refuses
             # logits of any other dtype rather than JIT mid-serving.
-            self.drafter.warmup_lossless_verify(config.torch_dtype)
+            self.drafter.lossless.warmup_verify(config.torch_dtype)
         self._maybe_warmup()
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a
@@ -2725,7 +2730,8 @@ class ModelRunner:
                 top_ps = top_p_buffer.gpu[:bs]
                 top_p_count = bs
 
-        if getattr(self, "_draft_reads_filters", False):
+        lossless = _draft_lossless(self)
+        if lossless is not None:
             # The lossless draft samples within every row's own filters, so it
             # needs each row's, off (-1 / 1.0) and uniform ones included.
             if top_k_count is None:
@@ -2755,11 +2761,9 @@ class ModelRunner:
         counts[group.indices["required_channel_states"]] = channel_count
         # The draft's own inputs (its Philox key and where its q goes), staged into
         # the same publication so the upload stays a single batched H2D and is
-        # covered by this forward's staging window. A no-op on every drafter but
-        # a DSpark one with lossless sampling.
-        drafter = getattr(self, "drafter", None)
-        if drafter is not None:
-            drafter.stage_draft_sampling_host(
+        # covered by this forward's staging window.
+        if lossless is not None:
+            lossless.stage(
                 batch,
                 bs,
                 group,
@@ -2767,6 +2771,7 @@ class ModelRunner:
                 # dropped, so they must not claim q slots or write q.
                 drafts_verifiable=not batch.is_dummy_run
                 and not self._is_pure_middle_chunk(batch),
+                step=self.forward_step,
             )
         if publication_group is None:
             group.publish(counts)
@@ -3456,8 +3461,9 @@ class ModelRunner:
             # Lossless (`u * q < p`) inputs, asked first: they decide whether the
             # verification sample below runs. All-greedy batches keep exact match.
             ratio = None
-            if drafter is not None and not all_greedy:
-                ratio = drafter.lossless_verify_inputs(
+            lossless = _draft_lossless(self)
+            if lossless is not None and not all_greedy:
+                ratio = lossless.verify_inputs(
                     bs, target_logits.dtype, temperatures, top_ks, top_ps
                 )
             target_token_ids = None

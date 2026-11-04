@@ -72,7 +72,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         rejection_sampler=SimpleNamespace(
             forward=mock.Mock(return_value=(sampled, verdict)),
         ),
-        drafter=SimpleNamespace(),
+        drafter=SimpleNamespace(lossless=None),
         forward_done_event=mock.Mock(),
     )
     runner._constrain_required_channel = MethodType(
@@ -137,7 +137,8 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
         runner_module, "get_tp_group", lambda: SimpleNamespace(world_size=1)
     )
     ratio = object() if armed else None
-    drafter = SimpleNamespace(lossless_verify_inputs=mock.Mock(return_value=ratio))
+    lossless = SimpleNamespace(verify_inputs=mock.Mock(return_value=ratio))
+    drafter = SimpleNamespace(lossless=lossless)
     runner = SimpleNamespace(
         tokenID_processor=SimpleNamespace(zero_spec_counts=torch.zeros(8)),
         sampler=mock.Mock(side_effect=None if verified else _Reached),
@@ -167,11 +168,11 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
     if not verified:
         return
     if all_greedy:
-        drafter.lossless_verify_inputs.assert_not_called()
+        lossless.verify_inputs.assert_not_called()
         assert runner.rejection_sampler.forward.call_args.kwargs["ratio"] is None
         assert not runner.sampler.sample_verification_tokens.called
         return
-    asked = drafter.lossless_verify_inputs.call_args.args
+    asked = lossless.verify_inputs.call_args.args
     assert asked[3] is top_ks and asked[4] is top_ps
     assert runner.rejection_sampler.forward.call_args.kwargs["ratio"] is ratio
     # Unarmed, the exact-match draw is the flag-off law, as the bonus is.
@@ -257,7 +258,9 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
     runner = SimpleNamespace(
         forward_vars=buffers,
         sampler=SimpleNamespace(keep_top_k_ties=False),
-        _draft_reads_filters=True,
+        drafter=SimpleNamespace(lossless=SimpleNamespace(stage=mock.Mock())),
+        _is_pure_middle_chunk=lambda batch: False,
+        forward_step=0,
     )
     batch = SimpleNamespace(
         total_seqs_num=bs,
@@ -265,6 +268,7 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
         top_ks=np.array(ks, np.int32),
         top_ps=np.array(ps, np.float32),
         required_channel=None,
+        is_dummy_run=False,
     )
     _, top_ks, top_ps, _, _ = runner_module.ModelRunner.prepare_sample(
         runner, batch, publication_group=group

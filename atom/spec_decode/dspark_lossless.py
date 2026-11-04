@@ -4,7 +4,8 @@
 `DSparkLossless.arm` returns None, and the greedy pair stays, unless the flag
 is set, the flavor has a sampled entry point and the engine can run it
 (`lossless_unsupported_reason`). Armed, it owns the draft's q store, scratch
-and staged inputs, and the proposer's lossless hooks delegate to it.
+and staged inputs, and is the drafter's ``lossless``: the runner binds, stages
+and reads it directly.
 """
 
 import dataclasses

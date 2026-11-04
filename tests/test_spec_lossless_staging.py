@@ -70,7 +70,7 @@ def proposer(monkeypatch, *, lossless=True, pp=1, pcp=1, model=None, **config):
     prop.metadata_buffers = {}
     prop.mtp_k = T
     prop.model = FakeDraftModel() if model is None else model
-    prop._init_lossless_sampling()
+    prop.lossless = dspark_lossless.DSparkLossless.arm(prop)
     return prop
 
 
@@ -106,7 +106,13 @@ def stage(prop, b, *, verifiable=True):
     """One forward's staging, as `ModelRunner.forward` would number it."""
     g = group(prop)
     prop.runner.forward_step += 1
-    prop.stage_draft_sampling_host(b, len(b.req_ids), g, drafts_verifiable=verifiable)
+    prop.lossless.stage(
+        b,
+        len(b.req_ids),
+        g,
+        drafts_verifiable=verifiable,
+        step=prop.runner.forward_step,
+    )
     return {name: g.counts[g.indices[name]] for name in LOSSLESS}
 
 
@@ -143,12 +149,11 @@ def test_the_draft_reads_the_targets_own_temperatures_and_filters(monkeypatch):
             ("top_ps", torch.float32),
         )
     }
-    assert prop.bind_target_sampling(forward_vars)
+    prop.lossless.bind_target(forward_vars, prop.model)
     sampling = prop.model.bound
     assert sampling.temperatures is forward_vars["temperatures"].gpu
     assert sampling.top_k is forward_vars["top_ks"].gpu
     assert sampling.top_p is forward_vars["top_ps"].gpu
-    assert not proposer(monkeypatch, lossless=False).bind_target_sampling(forward_vars)
 
 
 @pytest.mark.parametrize("topk, width", [(None, VOCAB), (5, 5), (99999, VOCAB)])
@@ -186,11 +191,8 @@ def test_the_q_store_is_k_wide_and_never_wider_than_the_vocab(monkeypatch, topk,
 )
 def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     prop = proposer(monkeypatch, **kwargs)
-    assert prop._lossless is None
+    assert prop.lossless is None
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
-    assert prop.lossless_verify_inputs(2, torch.bfloat16, None, None, None) is None
-    # Staging is a no-op rather than an error.
-    prop.stage_draft_sampling_host(batch(["a"]), 1, None, drafts_verifiable=True)
 
 
 def test_a_block_narrower_than_the_verify_keeps_the_greedy_pair(monkeypatch, caplog):
@@ -200,13 +202,13 @@ def test_a_block_narrower_than_the_verify_keeps_the_greedy_pair(monkeypatch, cap
     model.window_size = T - 1
     with caplog.at_level("WARNING", logger="atom"):
         prop = proposer(monkeypatch, model=model)
-    assert prop._lossless is None
+    assert prop.lossless is None
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
     assert f"draft_tokens_per_seq={T - 1}, mtp_k={T}" in caplog.text
     # A window at least as wide as the block arms.
     model = FakeDraftModel()
     model.window_size = T
-    assert proposer(monkeypatch, model=model)._lossless is not None
+    assert proposer(monkeypatch, model=model).lossless is not None
 
 
 @pytest.mark.parametrize(
@@ -218,7 +220,7 @@ def test_a_block_narrower_than_the_verify_keeps_the_greedy_pair(monkeypatch, cap
     ids=["pd-consumer", "rapidserve-decode"],
 )
 def test_the_verifying_side_of_a_disaggregated_pair_still_arms(monkeypatch, config):
-    assert proposer(monkeypatch, **config)._lossless is not None
+    assert proposer(monkeypatch, **config).lossless is not None
 
 
 def test_a_head_the_fused_op_cannot_run_keeps_the_greedy_pair(monkeypatch):
@@ -229,8 +231,8 @@ def test_a_head_the_fused_op_cannot_run_keeps_the_greedy_pair(monkeypatch):
         "markov_weights_unsupported",
         lambda w1, w2: "markov weights are torch.float32/torch.float32",
     )
-    prop._init_lossless_sampling()
-    assert prop._lossless is None and prop.model.bound is None
+    prop.lossless = dspark_lossless.DSparkLossless.arm(prop)
+    assert prop.lossless is None and prop.model.bound is None
 
 
 def test_a_sampler_without_aiters_filters_keeps_the_greedy_pair(monkeypatch):
@@ -239,8 +241,8 @@ def test_a_sampler_without_aiters_filters_keeps_the_greedy_pair(monkeypatch):
     prop = proposer(monkeypatch, lossless=False)
     monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
     monkeypatch.setattr(dspark_lossless, "AITER_TOPK_TOPP_AVAILABLE", False)
-    prop._init_lossless_sampling()
-    assert prop._lossless is None and prop.model.bound is None
+    prop.lossless = dspark_lossless.DSparkLossless.arm(prop)
+    assert prop.lossless is None and prop.model.bound is None
 
 
 @pytest.mark.parametrize(
@@ -278,32 +280,27 @@ def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):
     """Next to the q store, before the KV cache is sized: the profiling run
     sees it and no step allocates."""
     prop = proposer(monkeypatch)
-    assert prop._lossless.sampling.scratch.nbytes()
-    assert prop._lossless.verify_scratch.nbytes()
+    assert prop.lossless.sampling.scratch.nbytes()
+    assert prop.lossless.verify_scratch.nbytes()
 
 
-@pytest.mark.parametrize("lossless", [True, False], ids=["armed", "not-armed"])
-def test_the_startup_verify_warmup_runs_at_the_serving_widths(monkeypatch, lossless):
+def test_the_startup_verify_warmup_runs_at_the_serving_widths(monkeypatch):
     """The ratio verify compiles per store width, draft count, vocab and
-    logits dtype, so the warmup must use the ones serving will; unarmed there
-    is nothing to compile."""
-    prop = proposer(monkeypatch, lossless=lossless)
+    logits dtype, so the warmup must use the ones serving will."""
+    prop = proposer(monkeypatch)
     calls = []
     monkeypatch.setattr(
         dspark_lossless, "warmup_ratio_verify", lambda *args: calls.append(args)
     )
-    prop.warmup_lossless_verify(torch.bfloat16)
-    if not lossless:
-        assert calls == []
-        return
+    prop.lossless.warmup_verify(torch.bfloat16)
     ((steps, vocab, width, dtype, scratch),) = calls
     assert (steps, vocab, width, dtype) == (
         T,
         VOCAB,
-        prop._lossless.sampling.q_store.ids.shape[1],
+        prop.lossless.sampling.q_store.ids.shape[1],
         torch.bfloat16,
     )
-    assert scratch is prop._lossless.verify_scratch
+    assert scratch is prop.lossless.verify_scratch
 
 
 def test_the_verify_refuses_logits_it_was_not_warmed_for(monkeypatch):
@@ -311,11 +308,11 @@ def test_the_verify_refuses_logits_it_was_not_warmed_for(monkeypatch):
     mid-serving, so it is refused instead."""
     prop = proposer(monkeypatch)
     monkeypatch.setattr(dspark_lossless, "warmup_ratio_verify", lambda *args: None)
-    prop.warmup_lossless_verify(torch.bfloat16)
+    prop.lossless.warmup_verify(torch.bfloat16)
     stage(prop, batch(["a", "b"]))
-    assert prop.lossless_verify_inputs(2, torch.bfloat16, None, None, None) is not None
+    assert prop.lossless.verify_inputs(2, torch.bfloat16, None, None, None) is not None
     with pytest.raises(RuntimeError, match="warmed up for torch.bfloat16"):
-        prop.lossless_verify_inputs(2, torch.float32, None, None, None)
+        prop.lossless.verify_inputs(2, torch.float32, None, None, None)
 
 
 # ---- staging ----------------------------------------------------------------
@@ -326,11 +323,11 @@ def test_a_propose_drafts_only_through_its_own_forwards_staging(monkeypatch):
     whose propose skipped staging must not draft through those row bases."""
     prop = proposer(monkeypatch)
     stage(prop, batch(["a"]))
-    prop._before_propose()
+    prop.lossless.staging.consume(prop.runner.forward_step)
     stage(prop, batch(["m"]), verifiable=False)
     prop.runner.forward_step += 1
-    with pytest.raises(RuntimeError, match="fresh stage_draft_sampling_host"):
-        prop._before_propose()
+    with pytest.raises(RuntimeError, match="fresh DSparkLossless.stage"):
+        prop.lossless.staging.consume(prop.runner.forward_step)
 
 
 def test_every_flavors_propose_claims_its_staging(monkeypatch):
@@ -351,10 +348,10 @@ def test_every_flavors_propose_claims_its_staging(monkeypatch):
     assert drafted == [args]
     # A second propose in the same forward, or one in a forward that staged
     # nothing, never reaches the flavor.
-    with pytest.raises(RuntimeError, match="fresh stage_draft_sampling_host"):
+    with pytest.raises(RuntimeError, match="fresh DSparkLossless.stage"):
         mono.propose(*args)
     mono.runner.forward_step += 1
-    with pytest.raises(RuntimeError, match="fresh stage_draft_sampling_host"):
+    with pytest.raises(RuntimeError, match="fresh DSparkLossless.stage"):
         mono.propose(*args)
     assert drafted == [args]
 
@@ -376,7 +373,7 @@ def test_a_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
     prop.warmup_draft_graphs(None)
     assert seen["np"] == [-1] * MAX_BS and seen["gpu"] == [-1] * MAX_BS
     # The slot map is untouched: those requests still own their q rows.
-    assert {"a", "b", "c"} <= set(prop._lossless.staging.slots._slot_of)
+    assert {"a", "b", "c"} <= set(prop.lossless.staging.slots._slot_of)
 
 
 def test_the_v4_mono_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
@@ -412,12 +409,11 @@ def test_a_filtered_batch_reaches_the_ratio_rule_too(monkeypatch):
     prop = proposer(monkeypatch)
     stage(prop, batch(["a", "b"], top_ks=[5, -1], top_ps=[1.0, 0.7]))
     temps, top_ks, top_ps = torch.ones(2), torch.tensor([5, -1]), 0.7
-    ratio = prop.lossless_verify_inputs(2, torch.bfloat16, temps, top_ks, top_ps)
+    ratio = prop.lossless.verify_inputs(2, torch.bfloat16, temps, top_ks, top_ps)
     # The sparse store itself; the verify borrows nothing of the draft's.
-    assert ratio.q is prop._lossless.sampling.q_store
+    assert ratio.q is prop.lossless.sampling.q_store
     assert (
-        ratio.q_row_base.shape == (2,)
-        and ratio.scratch is prop._lossless.verify_scratch
+        ratio.q_row_base.shape == (2,) and ratio.scratch is prop.lossless.verify_scratch
     )
     # The batch's own temperatures and filters, as `Sampler` gets them.
     assert ratio.temperatures is temps
@@ -445,7 +441,7 @@ def test_dspark_refuses_relaxed_mtp_where_lossless_sampling_arms(
             proposer(monkeypatch)
     else:
         prop = proposer(monkeypatch, lossless=bool(lossless))
-        assert (prop._lossless is not None) is bool(lossless)
+        assert (prop.lossless is not None) is bool(lossless)
 
 
 def test_a_plain_drafter_starts_with_both_flags_set(monkeypatch):

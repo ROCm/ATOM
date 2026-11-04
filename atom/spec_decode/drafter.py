@@ -28,7 +28,7 @@ from atom.utils.forward_context import (
 from atom.utils.h2d import h2d_producer
 
 if TYPE_CHECKING:
-    from atom.model_ops.spec_sampling.ratio_verify import RatioVerifyInputs
+    from atom.spec_decode.dspark_lossless import DSparkLossless
 
 logger = logging.getLogger("atom")
 
@@ -154,15 +154,20 @@ class Drafter(abc.ABC):
     sharing, anchor-index preparation, and spec-decode metadata — while the
     flavor hooks (``_resolve_mtp_k``, ``_build_draft_model``) and the hot
     ``_propose`` are subclass-supplied. ``propose`` and ``warmup_draft_graphs``
-    are templates that run ``_before_propose`` / ``_before_draft_warmup``
-    first, then ``_propose`` / ``_warmup_draft_graphs``; a flavor overrides
-    those, never the templates.
+    are templates that do the lossless draft's step first (when ``lossless``
+    is armed), then ``_propose`` / ``_warmup_draft_graphs``; a flavor
+    overrides those, never the templates.
 
     The capability properties (``is_block_drafter`` / ``uses_confidence_schedule``
     / ``verify_scheduler``) are the typed replacements for the historical
     ``getattr(drafter, "dspark_*")`` and ``method == "eagle3"`` flavor probes
     ModelRunner used to scatter through its code.
     """
+
+    #: Lossless speculative sampling's state, armed by a DSpark drafter
+    #: (`DSparkLossless.arm`); None keeps the greedy pair. The runner drives it
+    #: directly: binds it, stages it, and asks it for the verify's q.
+    lossless: "DSparkLossless | None" = None
 
     def __init__(self, atom_config: Config, device: torch.device, runner):
         self.config = atom_config
@@ -225,16 +230,15 @@ class Drafter(abc.ABC):
         )
 
     def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
-        """Warm the draft passes: `_before_draft_warmup`, then the flavor's
-        `_warmup_draft_graphs`. A template, so no flavor that replaces the
-        warmup can skip the step before it."""
-        self._before_draft_warmup()
+        """Warm the draft passes: clear the lossless draft's destinations,
+        then the flavor's `_warmup_draft_graphs`. A template, so no flavor that
+        replaces the warmup can skip the step before it."""
+        if self.lossless is not None:
+            # The warmup runs the captured block directly, and after a
+            # sleep/wake recapture the last served step's row bases would
+            # overwrite live requests' q: aim every draft row at no q row.
+            self.lossless.clear_destinations()
         self._warmup_draft_graphs(build_context, end_trace)
-
-    def _before_draft_warmup(self) -> None:
-        """Run before every draft warmup. A no-op; the lossless DSpark draft
-        aims every draft row at no q row here."""
-        return
 
     @torch.inference_mode()
     def _warmup_draft_graphs(self, build_context, end_trace=None) -> None:
@@ -353,10 +357,13 @@ class Drafter(abc.ABC):
         next_token_ids: torch.Tensor,
         last_token_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Draft this step's speculative tokens: `_before_propose`, then the
+        """Draft this step's speculative tokens: claim the lossless draft's
+        staging for this forward (or refuse: a propose that skipped
+        `prepare_sample` would draft through stale row bases), then the
         flavor's `_propose`. A template, so no flavor can skip the step before
         it."""
-        self._before_propose()
+        if self.lossless is not None:
+            self.lossless.staging.consume(self.runner.forward_step)
         return self._propose(
             target_token_ids,
             target_positions,
@@ -365,11 +372,6 @@ class Drafter(abc.ABC):
             next_token_ids,
             last_token_indices,
         )
-
-    def _before_propose(self) -> None:
-        """Run before every propose. A no-op; the lossless DSpark draft claims
-        this forward's staging here, or refuses."""
-        return
 
     @abc.abstractmethod
     def _propose(
@@ -403,46 +405,6 @@ class Drafter(abc.ABC):
         """Confidence-schedule verify planner (DSpark Level B), or None when the
         drafter uses fixed-length verification."""
         return None
-
-    # ---- lossless speculative sampling (DSpark-only; no-ops elsewhere) ----
-    #
-    # These no-ops are the guard. `EagleProposer` and every MTP/EAGLE3 drafter
-    # inherits them unchanged, which keeps the probability-ratio accept rule
-    # unreachable from any flavor that has not been ported: the runner calls
-    # the hooks unconditionally and gets None back.
-
-    def bind_target_sampling(self, forward_vars) -> bool:
-        """Let the draft read the target's own per-row sampling inputs, once
-        the runner has allocated them; True if it now reads every row's
-        top-k / top-p, which `prepare_sample` must then always publish."""
-        return False
-
-    def stage_draft_sampling_host(
-        self, batch, bs: int, group, *, drafts_verifiable: bool
-    ) -> None:
-        """Stage the draft sampler's per-step inputs into pinned host buffers
-        and claim their counts in `prepare_sample`'s own `sampling` H2D
-        publication, which is what carries them to the device."""
-        return
-
-    def lossless_verify_inputs(
-        self,
-        bs: int,
-        logits_dtype: torch.dtype,
-        temperatures: torch.Tensor,
-        top_ks: int | torch.Tensor | None,
-        top_ps: float | torch.Tensor | None,
-    ) -> "RatioVerifyInputs | None":
-        """The ratio accept rule's inputs for a batch of ``bs`` with these
-        temperatures and `Sampler` filters, or None for exact match.
-        ``logits_dtype`` is the verify's target logits dtype, which must be
-        the one `warmup_lossless_verify` compiled for."""
-        return None
-
-    def warmup_lossless_verify(self, logits_dtype: torch.dtype) -> None:
-        """Compile the ratio verify before serving; see
-        `ratio_verify.warmup_ratio_verify`."""
-        return
 
     @property
     def draft_kv_duplicates_propose(self) -> bool:

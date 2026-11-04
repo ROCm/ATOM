@@ -82,7 +82,7 @@ def test_a_claim_never_expires_a_member_of_its_own_batch():
 
 
 def test_a_verify_computed_before_the_claims_of_its_own_batch_is_unaffected():
-    """The order `stage_draft_sampling_host` uses: verify bases first, then
+    """The order `DraftQStaging.stage` uses: verify bases first, then
     claims. The new request takes the slot of one outside the batch; the
     batch's own requests keep the rows their drafts came from."""
     slots = DraftQSlots(3, T)

@@ -113,7 +113,7 @@ class DraftQStaging:
         if self._staged != step or self._consumed == step:
             raise RuntimeError(
                 f"propose in forward {step} without a fresh "
-                f"stage_draft_sampling_host (last staged {self._staged}, last "
+                f"DSparkLossless.stage (last staged {self._staged}, last "
                 f"consumed {self._consumed}): the q row bases are another "
                 "forward's"
             )

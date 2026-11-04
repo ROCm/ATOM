@@ -886,7 +886,7 @@ def _proposer_with_graph_bs(
     )
     p.device = torch.device("cpu")
     p.mtp_k = mtp_k
-    p._lossless = None  # lossless sampling off: the greedy draft
+    p.lossless = None  # lossless sampling off: the greedy draft
     p.model = types.SimpleNamespace(
         vocab_size=1024, window_size=window, supports_block_graph=True
     )
