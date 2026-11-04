@@ -1175,7 +1175,10 @@ class Scheduler:
                 if bypass_left == 0:
                     break
                 bypass_left -= 1
-            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS and not self._is_offload_prefill_resume(seq):
+            if (
+                seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+                and not self._is_offload_prefill_resume(seq)
+            ):
                 # P/D remote-ready seq: admission routes it to first
                 # decode (no prefill rows). Count the running slot only.
                 num_running += 1

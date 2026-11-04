@@ -437,7 +437,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if not client.is_pending(sid):
             return False
         first = self._lookup_defer_since.get(sid)
-        return not (first is not None and time.monotonic() - first > envs.OFFLOAD_LOOKUP_DEFER_S)
+        return not (
+            first is not None and time.monotonic() - first > envs.OFFLOAD_LOOKUP_DEFER_S
+        )
 
     def lookup_pending(self, seq) -> bool:
         """True while admission should pass over `seq`: its lookup is in flight.
