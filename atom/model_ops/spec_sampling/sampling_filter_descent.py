@@ -252,6 +252,88 @@ def _ratio_filter_pass_kernel(
         tl.store(filter_f32_ptr + part * F32_WIDTH + split * BINS + bins, masses)
 
 
+@triton.jit
+def _filter_recorded(
+    filter_i32_ptr,
+    filter_f32_ptr,
+    row,
+    SPLIT: tl.constexpr,
+    DIGIT_BITS: tl.constexpr,
+    I32_WIDTH: tl.constexpr,
+    F32_WIDTH: tl.constexpr,
+):
+    """The ``(key prefix, ids above, their mass)`` `_ratio_filter_byte_pick_kernel`
+    recorded for ``row``, where a descent pass records its state (parity 0)."""
+    BINS: tl.constexpr = 1 << DIGIT_BITS
+    state = row.to(tl.int64)
+    prefix = tl.load(filter_i32_ptr + state * I32_WIDTH + SPLIT * BINS).to(
+        tl.uint32, bitcast=True
+    )
+    above_n = tl.load(filter_i32_ptr + state * I32_WIDTH + SPLIT * BINS + 1)
+    above_m = tl.load(filter_f32_ptr + state * F32_WIDTH + SPLIT * BINS)
+    return prefix, above_n, above_m
+
+
+@triton.jit(do_not_specialize=_BATCH_COUNTS + ["top_k_val", "search_steps", "splits"])
+def _ratio_filter_byte_pick_kernel(
+    cu_num_draft_tokens_ptr,  # [batch_size]
+    temperatures_ptr,  # [batch_size] fp32, pre-clamped
+    top_k_ptr,
+    top_k_val,
+    top_p_ptr,
+    top_p_val,
+    filter_i32_ptr,
+    filter_f32_ptr,
+    floor_counts_ptr,  # [num_tokens * splits, LAST_BINS] int32, the top byte's
+    vocab_size,
+    batch_size,
+    search_steps,
+    greedy_temperature,
+    splits,
+    LAST_BITS: tl.constexpr,
+    SPLIT: tl.constexpr,
+    DIGIT_BITS: tl.constexpr,
+    I32_WIDTH: tl.constexpr,
+    F32_WIDTH: tl.constexpr,
+    K_PER_ROW: tl.constexpr,
+    P_PER_ROW: tl.constexpr,
+    COUNTED: tl.constexpr,
+):
+    """One draft row of an unweighted bf16 batch: the bin of the key's top
+    byte the floor lies in, from the top-byte count's splits added in order,
+    recorded as the descent's state (`_filter_recorded`). One 8-bit step in
+    place of the two 4-bit passes: the bins are in logit order either way and
+    the pick takes the lowest bin whose ids above number fewer than top_k, so
+    it lands on the same prefix."""
+    BINS: tl.constexpr = 1 << DIGIT_BITS
+    LAST_BINS: tl.constexpr = 1 << LAST_BITS
+    row = tl.program_id(0)
+    req_idx = _request_of_row(cu_num_draft_tokens_ptr, row, batch_size, search_steps)
+    temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
+    top_k, top_p = _request_filter(
+        top_k_ptr, top_k_val, top_p_ptr, top_p_val, req_idx, K_PER_ROW, P_PER_ROW
+    )
+    if _descended_row(temp, top_k, top_p, vocab_size, greedy_temperature, COUNTED):
+        bins = tl.arange(0, LAST_BINS)
+        counts = tl.zeros((LAST_BINS,), dtype=tl.int32)
+        for split in range(splits):
+            cell = (row * splits + split).to(tl.int64) * LAST_BINS
+            counts += tl.load(floor_counts_ptr + cell + bins)
+        pick, n_add, _, _ = _filter_pick(
+            counts,
+            tl.zeros((LAST_BINS,), dtype=tl.float32),
+            0,
+            0.0,
+            top_k,
+            top_p,
+            LAST_BINS,
+        )
+        state = row.to(tl.int64)
+        tl.store(filter_i32_ptr + state * I32_WIDTH + SPLIT * BINS, pick)
+        tl.store(filter_i32_ptr + state * I32_WIDTH + SPLIT * BINS + 1, n_add)
+        tl.store(filter_f32_ptr + state * F32_WIDTH + SPLIT * BINS, 0.0)
+
+
 @triton.jit(
     do_not_specialize=_BATCH_COUNTS
     + ["top_k_val", "search_steps", "last_pass", "tiles_per_split"]
@@ -289,13 +371,19 @@ def _ratio_filter_floor_kernel(
     P_PER_ROW: tl.constexpr,
     WEIGHED: tl.constexpr,
     COUNTED: tl.constexpr,
+    TOP_BYTE: tl.constexpr = False,
+    RECORDED: tl.constexpr = False,
 ):
     """One (draft row, vocab split): the last pass's step of the descent,
     then count the ids under the prefix by the key's last ``LAST_BITS``.
     Unless the passes ``WEIGHED`` (and so carry the mass above the prefix
     down the descent), also weigh each tile's ids above the prefix: p_f's
     normalizer needs that mass either way. A tile with none skips the
-    exponentials."""
+    exponentials.
+
+    ``TOP_BYTE`` (unweighted bf16) instead counts every id by the key's top
+    ``LAST_BITS``, the first step `_ratio_filter_byte_pick_kernel` takes;
+    ``RECORDED`` reads the prefix that kernel recorded rather than descending."""
     LAST_BINS: tl.constexpr = 1 << LAST_BITS
     row = tl.program_id(0)
     split = tl.program_id(1)
@@ -305,20 +393,33 @@ def _ratio_filter_floor_kernel(
         top_k_ptr, top_k_val, top_p_ptr, top_p_val, req_idx, K_PER_ROW, P_PER_ROW
     )
     if _descended_row(temp, top_k, top_p, vocab_size, greedy_temperature, COUNTED):
-        prefix, _, _ = _filter_descend(
-            filter_i32_ptr,
-            filter_f32_ptr,
-            row,
-            num_tokens,
-            last_pass,
-            True,
-            top_k,
-            top_p,
-            SPLIT,
-            DIGIT_BITS,
-            I32_WIDTH,
-            F32_WIDTH,
-        )
+        if RECORDED:
+            prefix, _, _ = _filter_recorded(
+                filter_i32_ptr,
+                filter_f32_ptr,
+                row,
+                SPLIT,
+                DIGIT_BITS,
+                I32_WIDTH,
+                F32_WIDTH,
+            )
+        elif TOP_BYTE:
+            prefix = tl.full((), 0, tl.uint32)
+        else:
+            prefix, _, _ = _filter_descend(
+                filter_i32_ptr,
+                filter_f32_ptr,
+                row,
+                num_tokens,
+                last_pass,
+                True,
+                top_k,
+                top_p,
+                SPLIT,
+                DIGIT_BITS,
+                I32_WIDTH,
+                F32_WIDTH,
+            )
         row_max = tl.load(row_max_ptr + row)
         inv_z = tl.load(row_inv_z_ptr + row)
         counts = tl.zeros((LAST_BINS,), dtype=tl.int32)
@@ -333,11 +434,16 @@ def _ratio_filter_floor_kernel(
                 other=float("-inf"),
             ).to(tl.float32)
             key = _logit_key(x, KEY_BITS)
-            under = vmask & ((key >> LAST_BITS) == prefix)
-            counts += tl.histogram(
-                (key & (LAST_BINS - 1)).to(tl.int32), LAST_BINS, mask=under
-            )
-            if not WEIGHED:
+            if TOP_BYTE:
+                counts += tl.histogram(
+                    (key >> (KEY_BITS - LAST_BITS)).to(tl.int32), LAST_BINS, mask=vmask
+                )
+            else:
+                under = vmask & ((key >> LAST_BITS) == prefix)
+                counts += tl.histogram(
+                    (key & (LAST_BINS - 1)).to(tl.int32), LAST_BINS, mask=under
+                )
+            if (not WEIGHED) and (not TOP_BYTE):
                 above = vmask & ((key >> LAST_BITS) > prefix)
                 mass = 0.0
                 if tl.max(above.to(tl.int32), axis=0) > 0:
@@ -392,9 +498,11 @@ def _ratio_filter_cut_kernel(
     P_PER_ROW: tl.constexpr,
     WEIGHED: tl.constexpr,
     COUNTED: tl.constexpr,
+    RECORDED: tl.constexpr = False,
 ):
     """One draft row: the floor, from the last count's splits added in
-    order. Each of its bins is a single logit, so counting weighs it too
+    order. ``RECORDED`` takes the prefix `_ratio_filter_byte_pick_kernel`
+    recorded rather than descending. Each of its bins is a single logit, so counting weighs it too
     (count times that logit's p) and the floor is exact. p_f's normalizer is
     the mass at or above the floor. An unfiltered row's floor is -inf and its
     p is left as it was."""
@@ -407,20 +515,31 @@ def _ratio_filter_cut_kernel(
     )
     floor = tl.full((), float("-inf"), tl.float32)
     if _descended_row(temp, top_k, top_p, vocab_size, greedy_temperature, COUNTED):
-        prefix, above_n, above_m = _filter_descend(
-            filter_i32_ptr,
-            filter_f32_ptr,
-            row,
-            num_tokens,
-            last_pass,
-            True,
-            top_k,
-            top_p,
-            SPLIT,
-            DIGIT_BITS,
-            I32_WIDTH,
-            F32_WIDTH,
-        )
+        if RECORDED:
+            prefix, above_n, above_m = _filter_recorded(
+                filter_i32_ptr,
+                filter_f32_ptr,
+                row,
+                SPLIT,
+                DIGIT_BITS,
+                I32_WIDTH,
+                F32_WIDTH,
+            )
+        else:
+            prefix, above_n, above_m = _filter_descend(
+                filter_i32_ptr,
+                filter_f32_ptr,
+                row,
+                num_tokens,
+                last_pass,
+                True,
+                top_k,
+                top_p,
+                SPLIT,
+                DIGIT_BITS,
+                I32_WIDTH,
+                F32_WIDTH,
+            )
         bins = tl.arange(0, LAST_BINS)
         counts = tl.zeros((LAST_BINS,), dtype=tl.int32)
         for split in range(splits):
@@ -486,8 +605,12 @@ def descend_floor(
     }
     passes = (key_bits - _FILTER_LAST_BITS) // _FILTER_DIGIT_BITS
     weigh = filters.weigh
+    # Unweighted bf16: the key's top byte is one 8-bit count (the floor
+    # kernel's) and a pick, instead of two 4-bit passes, so V is read once
+    # less. A weighing batch keeps the passes, which carry the mass down.
+    top_byte = key_bits == 2 * _FILTER_LAST_BITS and not weigh
     block_v = _FILTER_WEIGH_BLOCK_V if weigh else _FILTER_BLOCK_V
-    for filter_pass in range(passes):
+    for filter_pass in range(0 if top_byte else passes):
         _ratio_filter_pass_kernel[(num_tokens, _FILTER_SPLIT)](
             target_logits,
             cu_num_draft_tokens,
@@ -524,6 +647,50 @@ def descend_floor(
         **layout,
         "WEIGHED": weigh,
     }
+    if top_byte:
+        _ratio_filter_floor_kernel[(num_tokens, splits)](
+            target_logits,
+            cu_num_draft_tokens,
+            temperatures,
+            *request_filter,
+            row_max,
+            row_inv_z,
+            filter_i32,
+            filter_f32,
+            floor_counts,
+            floor_mass,
+            num_tokens,
+            vocab_size,
+            stride,
+            batch_size,
+            search_steps,
+            SAMPLER_EPS,
+            0,
+            tiles_per_split,
+            **floor,
+            TOP_BYTE=True,
+            num_warps=8,
+        )
+        pick_args = {
+            k: v
+            for k, v in floor.items()
+            if k not in ("BLOCK_V", "KEY_BITS", "WEIGHED")
+        }
+        _ratio_filter_byte_pick_kernel[(num_tokens,)](
+            cu_num_draft_tokens,
+            temperatures,
+            *request_filter,
+            filter_i32,
+            filter_f32,
+            floor_counts,
+            vocab_size,
+            batch_size,
+            search_steps,
+            SAMPLER_EPS,
+            splits,
+            **pick_args,
+            num_warps=4,
+        )
     _ratio_filter_floor_kernel[(num_tokens, splits)](
         target_logits,
         cu_num_draft_tokens,
@@ -544,6 +711,7 @@ def descend_floor(
         passes - 1,
         tiles_per_split,
         **floor,
+        RECORDED=top_byte,
         num_warps=8,
     )
     _ratio_filter_cut_kernel[(num_tokens,)](
@@ -566,5 +734,6 @@ def descend_floor(
         splits,
         BLOCK_TILE=triton.next_power_of_2(floor_n_tiles),
         **floor,
+        RECORDED=top_byte,
         num_warps=4,
     )
