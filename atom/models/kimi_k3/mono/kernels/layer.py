@@ -49,6 +49,7 @@ from atom.models.kimi_k3.mono.kernels.attention.kda import (
     stage_mix,
 )
 from atom.models.kimi_k3.mono.kernels.stages import mla_post as mp
+from atom.models.kimi_k3.mono.kernels.stages import mla_prep as pr
 from atom.models.kimi_k3.mono.kernels.stages import moe as k2b
 from atom.mono.device import gemv
 from atom.mono.device.ops import kernel_symbol, lds_bytes, load_ptr64, traced
@@ -83,7 +84,9 @@ TL_POINTS = 18  # + 14 route's logits polled, 15 lnorm's latent sums in, 16 down
 
 assert E0 + k2b.R_TASKS + k2b.L_TASKS <= BLOCKS and k2b.G_TASKS <= E0 - O0
 
-REGIONS = ("part", "wgt", "msq", "xrdy", "ar", "dg") + k2b.REGIONS + mp.REGIONS
+REGIONS = (
+    ("part", "wgt", "msq", "xrdy", "ar", "dg") + k2b.REGIONS + mp.REGIONS + pr.REGIONS
+)
 
 _STREAM = fx.Stream(None)
 
@@ -105,6 +108,13 @@ class K2Build:
     # this launch's first stage (``stages.mla_post``); in the symbol only when
     # set, so the default build's symbol is unchanged
     mla_post: bool = False
+    # ``ATOM_MONO_MLA_PREP``: the NEXT (MLA) layer's prep as this launch's tail
+    # stages (``stages.mla_prep``; 1: its attention seam, P0), on a seam of
+    # ``prep_nblocks`` blocks; in the symbol only when set
+    mla_prep: int = 0
+    prep_nblocks: int = 0
+    prep_eps: float = 1e-6
+    prep_out_eps: float = 1e-6
 
 
 ABI = KernelAbi(
@@ -145,9 +155,14 @@ ABI = KernelAbi(
 )
 # an ``mla_post`` build: the stage's inputs past K2's own
 ABI_POST = KernelAbi(ABI.names + mp.ARGS)
+# an ``mla_prep`` build: the post stage's (0 unless the key is also
+# ``mla_post``), then the prep stages'
+ABI_PREP = KernelAbi(ABI_POST.names + pr.ARGS)
 
 
 def abi_for(key: K2Build) -> KernelAbi:
+    if key.mla_prep:
+        return ABI_PREP
     return ABI_POST if key.mla_post else ABI
 
 
@@ -173,6 +188,10 @@ def scratch_layout(key: K2Build) -> dict:
     if key.mla_post:
         end = max(o + n for o, n in lay.values())
         lay.update(pair_layout(mp.scratch_pairs().items(), start=end))
+    if key.mla_prep:
+        end = max(o + n for o, n in lay.values())
+        pairs = pr.scratch_pairs(s, key.prep_nblocks + 1)
+        lay.update(pair_layout(pairs.items(), start=end))
     return lay
 
 
@@ -327,10 +346,11 @@ def _body(
     reset: Int32,
     diag: Int64,
     tl: Int64,
-    post=None,
+    ext=None,
 ):
     """K2's kernel body, given ``build``'s constants ``bk`` and the kernel's
-    arguments; ``post``: the MLA post stage's (an ``mla_post`` build's kernel)."""
+    arguments; ``ext``: the MLA post / prep stages' (an ``mla_post`` /
+    ``mla_prep`` build's kernel)."""
     key, s, G, ns = bk["key"], bk["s"], bk["G"], bk["ns"]
     lay, plain_lay, play = bk["lay"], bk["plain_lay"], bk["play"]
     Smem, RouteLds, StageLds = bk["Smem"], bk["RouteLds"], bk["StageLds"]
@@ -425,7 +445,7 @@ def _body(
             "ln_w": ln_w,
             "w_up": w_up,
             "out": out,
-            **({} if post is None else post),
+            **({} if ext is None else ext),
         },
     }
     for region in (
@@ -448,6 +468,9 @@ def _body(
         c["mpdone"] = sreg(scratch, lay["mpdone"][0], "mpdone")
         c["post_xl"] = st.post.peek().xq.ptr
         c["post_slabs"] = post_slabs
+    if const_expr(key.mla_prep):
+        for region in pr.REGIONS:
+            c[region] = sreg(scratch, lay[region][0], region)
     on, tls = key.timeline, lds.tls.ptr
     stamp_begin(on, tls, tid, TL_POINTS)
     # ---- o_proj on every CTA (``o_slot``)
@@ -523,6 +546,13 @@ def _body(
         if (bid >= k2b.RED0) & (bid < k2b.RED0 + k2b.RED_TASKS):
             k2b.stage_reduce(c, bid - k2b.RED0)
     stamp(on, tls, tid, 7)
+    if const_expr(key.mla_prep):
+        # the next (MLA) layer's prep: P0, its attention seam, on the AttnRes
+        # CTAs (which wrote prefix(M-1)'s slices) once FING is in
+        enter_stage("k2.mlaprep")
+        cp = pr.prep_context(c, key.prep_nblocks + 1, key.prep_eps, key.prep_out_eps)
+        if bid < NA:
+            pr.p0_seam(cp, bid)
     stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
 
@@ -564,6 +594,12 @@ def build(key: K2Build):
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
+    if key.mla_prep:
+        assert key.mla_prep == 1, f"MLA prep mode {key.mla_prep}: only P0 (1)"
+        assert s <= pr.MAX_ROWS, f"MLA prep: {s} rows past {pr.MAX_ROWS}"
+        # P0 stages layer M's sources in this build's ``vals``
+        assert 1 <= key.prep_nblocks < ns, (key.prep_nblocks, ns)
+        assert pr.red_fits(s, key.prep_nblocks + 1)
     if key.mla_post:
         assert s <= mp.MAX_ROWS, f"MLA post: {s} rows past {mp.MAX_ROWS}"
         # the post stage stages x in whatever LDS is left past the fixed parts
@@ -597,9 +633,10 @@ def build(key: K2Build):
             rsel: k2b.RouteSelLds
 
     keyed = key_tuple(key, _SOURCES)
-    name = kernel_symbol(
-        "k3_mono_k2", **symbol_params(key), **({"mp": 1} if key.mla_post else {})
-    )
+    ext_sym = {"mp": 1} if key.mla_post else {}
+    if key.mla_prep:
+        ext_sym["pp"] = key.mla_prep
+    name = kernel_symbol("k3_mono_k2", **symbol_params(key), **ext_sym)
 
     bk = {
         "key": key,
@@ -614,6 +651,8 @@ def build(key: K2Build):
         "StageLds": StageLds,
         "post_slabs": post_slabs,
     }
+    if key.mla_prep:
+        return _build_prep(key, name, keyed, bk)
     if key.mla_post:
         return _build_post(key, name, keyed, bk)
 
@@ -836,7 +875,7 @@ def _build_post(key, name, keyed, bk):
             reset,
             diag,
             tl,
-            post={
+            ext={
                 "olat": olat,
                 "olat_sr": olat_sr,
                 "w_v": w_v,
@@ -933,6 +972,213 @@ def _build_post(key, name, keyed, bk):
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI_POST.check(k2, launch)
+    _BUILDS[key] = launch
+    return launch
+
+
+def _build_prep(key, name, keyed, bk):
+    """``build`` for an ``mla_prep`` key: the same body, K2's arguments, the
+    post stage's (read only when the key is also ``mla_post``) and the prep
+    stages' (``ABI_PREP``)."""
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def k2(
+        core: Int64,
+        w_o: Int64,
+        prefix: Int64,
+        blocks: Int64,
+        blk_sm: Int32,
+        blk_sr: Int32,
+        ares_nw: Int64,
+        ares_qk: Int64,
+        in_nw: Int64,
+        w_gate: Int64,
+        bias: Int64,
+        w_ld: Int64,
+        w_sgu: Int64,
+        w_sd: Int64,
+        w13: Int64,
+        w13s: Int64,
+        w2: Int64,
+        w2s: Int64,
+        ln_w: Int64,
+        w_up: Int64,
+        out: Int64,
+        scratch: Int64,
+        plain: Int64,
+        queue: Int64,
+        peers: Int64,
+        rank: Int32,
+        layer: Int32,
+        reset: Int32,
+        diag: Int64,
+        tl: Int64,
+        olat: Int64,
+        olat_sr: Int32,
+        w_v: Int64,
+        w_v_s: Int64,
+        xg: Int64,
+        xg_s: Int64,
+        w_g: Int64,
+        w_g_s: Int64,
+        pref: Int64,
+        x8: Int64,
+        xs: Int64,
+        p_nw: Int64,
+        p_qk: Int64,
+        p_onw: Int64,
+    ):
+        _ = keyed
+        post = {
+            "olat": olat,
+            "olat_sr": olat_sr,
+            "w_v": w_v,
+            "w_v_s": w_v_s,
+            "xg": xg,
+            "xg_s": xg_s,
+            "w_g": w_g,
+            "w_g_s": w_g_s,
+        }
+        _body(
+            bk,
+            core,
+            w_o,
+            prefix,
+            blocks,
+            blk_sm,
+            blk_sr,
+            ares_nw,
+            ares_qk,
+            in_nw,
+            w_gate,
+            bias,
+            w_ld,
+            w_sgu,
+            w_sd,
+            w13,
+            w13s,
+            w2,
+            w2s,
+            ln_w,
+            w_up,
+            out,
+            scratch,
+            plain,
+            queue,
+            peers,
+            rank,
+            layer,
+            reset,
+            diag,
+            tl,
+            ext={
+                **(post if key.mla_post else {}),
+                "pref": pref,
+                "x8": x8,
+                "xs": xs,
+                "p_nw": p_nw,
+                "p_qk": p_qk,
+                "p_onw": p_onw,
+            },
+        )
+
+    @flyc.jit
+    def launch(
+        core: Int64,
+        w_o: Int64,
+        prefix: Int64,
+        blocks: Int64,
+        blk_sm: Int32,
+        blk_sr: Int32,
+        ares_nw: Int64,
+        ares_qk: Int64,
+        in_nw: Int64,
+        w_gate: Int64,
+        bias: Int64,
+        w_ld: Int64,
+        w_sgu: Int64,
+        w_sd: Int64,
+        w13: Int64,
+        w13s: Int64,
+        w2: Int64,
+        w2s: Int64,
+        ln_w: Int64,
+        w_up: Int64,
+        out: Int64,
+        scratch: Int64,
+        plain: Int64,
+        queue: Int64,
+        peers: Int64,
+        rank: Int32,
+        layer: Int32,
+        reset: Int32,
+        diag: Int64,
+        tl: Int64,
+        olat: Int64,
+        olat_sr: Int32,
+        w_v: Int64,
+        w_v_s: Int64,
+        xg: Int64,
+        xg_s: Int64,
+        w_g: Int64,
+        w_g_s: Int64,
+        pref: Int64,
+        x8: Int64,
+        xs: Int64,
+        p_nw: Int64,
+        p_qk: Int64,
+        p_onw: Int64,
+        stream: fx.Stream = _STREAM,
+    ):
+        _ = keyed
+        k2(
+            core,
+            w_o,
+            prefix,
+            blocks,
+            blk_sm,
+            blk_sr,
+            ares_nw,
+            ares_qk,
+            in_nw,
+            w_gate,
+            bias,
+            w_ld,
+            w_sgu,
+            w_sd,
+            w13,
+            w13s,
+            w2,
+            w2s,
+            ln_w,
+            w_up,
+            out,
+            scratch,
+            plain,
+            queue,
+            peers,
+            rank,
+            layer,
+            reset,
+            diag,
+            tl,
+            olat,
+            olat_sr,
+            w_v,
+            w_v_s,
+            xg,
+            xg_s,
+            w_g,
+            w_g_s,
+            pref,
+            x8,
+            xs,
+            p_nw,
+            p_qk,
+            p_onw,
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+
+    ABI_PREP.check(k2, launch)
     _BUILDS[key] = launch
     return launch
 
