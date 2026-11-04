@@ -30,6 +30,7 @@ from atom.model_ops.spec_sampling.ratio_target_p import (
 from atom.model_ops.spec_sampling.sampling_filter import (
     _FILTER_COUNT_MAX_K,
     RowFilters,
+    _count_below,
     row_filters,
 )
 from atom.model_ops.spec_sampling.sampling_scratch import Region, SamplingScratch
@@ -44,8 +45,6 @@ from atom.model_ops.verify_kernels import _draft_token, _finish_request
 _RATIO_ACCEPT_KEY = 1 << 32
 _RATIO_RESIDUAL_KEY = 2 << 32
 
-# Stored q entries one lookup iteration covers.
-_RATIO_BLOCK_Q = 1024
 # Stored q entries the residual race places per step, from the span its V
 # tile's binary searches found: each is compared against every lane of the
 # tile, so the step stays narrow.
@@ -121,17 +120,12 @@ def _rejecting_row_of(residual_row_ptr, q_row_base_ptr, req_idx):
 
 
 @triton.jit
-def _stored_q_of(q_ids_ptr, q_probs_ptr, q_row, n, x, BLOCK_Q: tl.constexpr):
+def _stored_q(q_ids_ptr, q_probs_ptr, q_row, n, x, SEARCH_STEPS: tl.constexpr):
     """x's q in one stored row: its probability among the first ``n``
-    entries, 0 when it is not one of them."""
-    q = 0.0
-    for start in range(0, n, BLOCK_Q):
-        offs = start + tl.arange(0, BLOCK_Q)
-        mask = offs < n
-        ids = tl.load(q_ids_ptr + q_row + offs, mask=mask, other=-1)
-        probs = tl.load(q_probs_ptr + q_row + offs, mask=mask, other=0.0)
-        q += tl.sum(tl.where(mask & (ids == x), probs, 0.0), axis=0)
-    return q
+    (ascending) entries, 0 when it is not one of them."""
+    at = _count_below(q_ids_ptr + q_row, n, x, SEARCH_STEPS)
+    held = (at < n) & (tl.load(q_ids_ptr + q_row + at, mask=at < n, other=-1) == x)
+    return tl.load(q_probs_ptr + q_row + at, mask=held, other=0.0)
 
 
 @triton.jit(do_not_specialize=["num_spec_steps", "q_width", "accept_seed"])
@@ -160,7 +154,7 @@ def _ratio_accept_kernel(
     greedy_temperature,
     accept_seed,
     BLOCK_T: tl.constexpr,
-    BLOCK_Q: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
     FILTER: tl.constexpr,
 ):
     """One request: walk its drafts until the first rejection.
@@ -229,13 +223,13 @@ def _ratio_accept_kernel(
                     # The emitted slot does not hold x (or there is no q).
                     # Not a reject on that alone: the rule needs x's true q,
                     # so look x up among the stored entries (0 if absent).
-                    q = _stored_q_of(
+                    q = _stored_q(
                         q_ids_ptr,
                         q_probs_ptr,
                         (q_base + pos).to(tl.int64) * q_width,
                         tl.sum(tl.where(at_pos, stored_n, 0), axis=0),
                         x,
-                        BLOCK_Q,
+                        SEARCH_STEPS,
                     )
                 u = tl.rand(accept_seed, row)
                 # x was drawn from q, so q(x) must be a positive probability;
@@ -294,22 +288,6 @@ def _target_p_tile(
     if FILTER:
         p = tl.where(x >= tl.load(row_floor_ptr + row), p, 0.0)
     return p
-
-
-@triton.jit
-def _lower_bound(ids_ptr, n, x, STEPS: tl.constexpr):
-    """The first of the ``n`` ascending ``ids`` that is at least ``x`` (``n``
-    if none): a binary search of ``STEPS`` probes, enough for ``n < 2**STEPS``."""
-    lo = n * 0
-    hi = n
-    for _ in tl.static_range(STEPS):
-        mid = (lo + hi) // 2
-        open_ = lo < hi
-        v = tl.load(ids_ptr + mid, mask=open_ & (mid < n), other=0)
-        right = open_ & (v < x)
-        lo = tl.where(right, mid + 1, lo)
-        hi = tl.where(open_ & ~right, mid, hi)
-    return lo
 
 
 @triton.jit(do_not_specialize=["batch_size", "q_width", "residual_seed"])
@@ -375,8 +353,8 @@ def _ratio_residual_race_kernel(
             q_row = (q_base + row - start_idx).to(tl.int64)
             n = tl.minimum(tl.maximum(tl.load(q_meta_ptr + q_row * 2), 0), q_width)
             row_ids = q_ids_ptr + q_row * q_width
-            first = _lower_bound(row_ids, n, tile_lo, SEARCH_STEPS)
-            last = _lower_bound(row_ids, n, tile_lo + BLOCK_V, SEARCH_STEPS)
+            first = _count_below(row_ids, n, tile_lo, SEARCH_STEPS)
+            last = _count_below(row_ids, n, tile_lo + BLOCK_V, SEARCH_STEPS)
             for start in range(first, last, BLOCK_Q):
                 e = start + tl.arange(0, BLOCK_Q)
                 inside = e < last
@@ -564,7 +542,7 @@ def _ratio_sample(
         SAMPLER_EPS,
         _RATIO_ACCEPT_KEY | ratio_step,
         BLOCK_T=triton.next_power_of_2(max(num_spec_steps, 1)),
-        BLOCK_Q=min(triton.next_power_of_2(q_width), _RATIO_BLOCK_Q),
+        SEARCH_STEPS=q_width.bit_length(),
         FILTER=filtered,
         num_warps=1,
     )

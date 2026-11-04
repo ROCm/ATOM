@@ -61,18 +61,30 @@ _BATCH_COUNTS = ["num_tokens", "batch_size"]
 
 
 @triton.jit
+def _count_below(values_ptr, n, x, steps):
+    """How many of the ``n`` ascending ``values`` are below ``x``: the index of
+    the first at least ``x`` (``n`` if none). A binary search of ``steps``
+    probes, enough for ``n < 2**steps``. The one search every verify kernel
+    shares: a draft row's request in ``cu_num_draft_tokens``, and an id's
+    place in a stored q row (`SparseQStore`: its ids ascend)."""
+    lo = n * 0
+    hi = n
+    for _ in range(steps):
+        mid = (lo + hi) // 2
+        open_ = lo < hi
+        v = tl.load(values_ptr + mid, mask=open_ & (mid < n), other=0)
+        right = open_ & (v < x)
+        lo = tl.where(right, mid + 1, lo)
+        hi = tl.where(open_ & ~right, mid, hi)
+    return lo
+
+
+@triton.jit
 def _request_of_row(cu_num_draft_tokens_ptr, row, batch_size, search_steps):
     """The request a draft row belongs to: the first ``r`` with
-    ``cu_num_draft_tokens[r] > row`` (a binary search, so requests with no
-    drafts are skipped). ``search_steps`` >= ceil(log2(batch_size)) + 1."""
-    lo = 0
-    hi = batch_size - 1
-    for _ in range(search_steps):
-        mid = (lo + hi) // 2
-        right = tl.load(cu_num_draft_tokens_ptr + mid) <= row
-        lo = tl.where(right, mid + 1, lo)
-        hi = tl.where(right, hi, mid)
-    return lo
+    ``cu_num_draft_tokens[r] > row``, so requests with no drafts are skipped.
+    ``search_steps`` >= ceil(log2(batch_size)) + 1."""
+    return _count_below(cu_num_draft_tokens_ptr, batch_size, row + 1, search_steps)
 
 
 @triton.jit
