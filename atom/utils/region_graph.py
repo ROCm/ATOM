@@ -62,6 +62,12 @@ def _recorder() -> "_Recorder | None":
     return getattr(_local, "recorder", None)
 
 
+def recording_segments() -> bool:
+    """Whether a `TokenGraph` recording is in progress: what runs now lands
+    in a segment graph, except the eager regions, which a replay calls again."""
+    return _recorder() is not None
+
+
 def _storage(t: torch.Tensor) -> int:
     return t.untyped_storage().data_ptr()
 

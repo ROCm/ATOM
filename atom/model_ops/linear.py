@@ -54,6 +54,13 @@ from atom.quantization.quark.utils import (
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
+try:  # aiter with consumer-side split-K reduction (gfx1250 PTPC)
+    from aiter import (
+        gemm_a8w8_bpreshuffle_splitk_deferred as aiter_gemm_a8w8_bpreshuffle_splitk_deferred,
+    )
+except ImportError:
+    aiter_gemm_a8w8_bpreshuffle_splitk_deferred = None
+
 logger = logging.getLogger("atom")
 
 
@@ -595,6 +602,53 @@ def gemm_a8w8_per_token_fake(
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
+def splitk_consumer_reduce_supported() -> bool:
+    """Whether a per-token FP8 bpreshuffle GEMM here may leave its split-K
+    reduction to its consumer (`LinearBase.splitk_consumer_max_m`): gfx1250 with
+    an aiter that has aiter.gemm_a8w8_bpreshuffle_splitk_deferred."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return (
+        aiter_gemm_a8w8_bpreshuffle_splitk_deferred is not None
+        and get_gfx_runtime() == "gfx1250"
+    )
+
+
+def gemm_a8w8_bpreshuffle_splitk_deferred_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    max_m: int = 0,
+) -> torch.Tensor:
+    return torch.empty((x.shape[0], weight.shape[0]), dtype=dtype, device=x.device)
+
+
+@torch_compile_guard(
+    gen_fake=gemm_a8w8_bpreshuffle_splitk_deferred_fake, mutates_args=[]
+)
+def gemm_a8w8_bpreshuffle_splitk_deferred_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    max_m: int = 0,
+) -> torch.Tensor:
+    # gemm_a8w8_bpreshuffle that may hand its split-K partials to the consumer
+    # (`LinearBase.splitk_consumer_max_m`). The hand-off is host state, so it must
+    # not cross a token-graph break: a replay would run the GEMM from its graph
+    # but the consumer, an eager region, without the partials it was recorded with.
+    from atom.utils.region_graph import recording_segments
+
+    if recording_segments():
+        max_m = 0
+    return aiter_gemm_a8w8_bpreshuffle_splitk_deferred(
+        x, weight, x_scale, w_scale, dtype=dtype, max_m=max_m
+    )
+
+
 @torch_compile_guard(gen_fake=gemm_a8w8_per_token_fake, mutates_args=[])
 def gemm_a8w8_per_token_impl(
     x: torch.Tensor,
@@ -766,6 +820,12 @@ class LinearBase(nn.Module):
         self.quant_config = quant_config
         super().__init__()
         self.reduce_results = reduce_results
+        # Rows up to which a per-token FP8 bpreshuffle GEMM may leave its split-K
+        # reduction to the consumer (aiter.gemm_a8w8_bpreshuffle_splitk_deferred);
+        # 0 keeps it in the GEMM. Set only by a model whose every consumer of this
+        # layer's output claims the partials (aiter.splitk_partials) first, and
+        # only where splitk_consumer_reduce_supported().
+        self.splitk_consumer_max_m = 0
         self.input_size = input_size
         self.output_size = (
             output_size if isinstance(output_size, int) else sum(output_size)
@@ -1680,6 +1740,19 @@ class LinearBase(nn.Module):
                         self.weight_scale,
                         bias=self.bias,
                         dtype=otype,
+                    )
+                elif (
+                    self.splitk_consumer_max_m > 0
+                    and self.bias is None
+                    and aiter_gemm_a8w8_bpreshuffle_splitk_deferred is not None
+                ):
+                    y = gemm_a8w8_bpreshuffle_splitk_deferred_impl(
+                        x,
+                        self.weight,
+                        x_scale,
+                        self.weight_scale,
+                        dtype=otype,
+                        max_m=self.splitk_consumer_max_m,
                     )
                 else:
                     y = gemm_a8w8_bpreshuffle(
