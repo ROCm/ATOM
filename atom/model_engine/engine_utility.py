@@ -27,6 +27,9 @@ FIRE_AND_FORGET_UTILITY_CMDS = frozenset(
 WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
     {"update_weights", "update_weights_shm", "update_weights_ipc"}
 )
+# As vLLM's pause_generation(mode="keep") / resume_generation.
+PAUSE_GENERATION_CMD = "pause_generation"
+RESUME_GENERATION_CMD = "resume_generation"
 
 
 def memory_tags(args) -> tuple[str, ...]:
@@ -60,7 +63,8 @@ def completes_weight_sync(cmd: str, args: dict) -> bool:
 # For a direct weight update whose sender gives no deadline of its own;
 # broadcast_utility_command_sync always does.
 _DIRECT_UPDATE_TIMEOUT_S = 300.0
-# How long a KV change waits for transfers in flight before refusing.
+# How long a KV change waits for transfers in flight, and a pause for the
+# pipeline to empty, before refusing.
 _KV_QUIESCE_TIMEOUT_S = 30.0
 _FAILED_SYNC_CLEANUP_TIMEOUT_S = 1.0
 
@@ -132,6 +136,8 @@ class EngineUtilityHandler:
         "abort_request": "_handle_abort_request",
         "release_structured_requests": "_handle_release_structured_requests",
         COLLECTIVE_RPC_CMD: "_handle_collective_rpc",
+        PAUSE_GENERATION_CMD: "_handle_pause_generation",
+        RESUME_GENERATION_CMD: "_handle_resume_generation",
     }
 
     def __init__(
@@ -141,6 +147,8 @@ class EngineUtilityHandler:
         self.output_queue = _ReplyQueue(output_queue)
         self.label = label
         self.scheduler = scheduler
+        # Set by process_queue to the engine whose queue it drains.
+        self.engine = None
         self._weight_sync_fenced = False
         self._weight_sync_in_progress = False
         # Why the current sync can no longer complete. Its later updates and
@@ -167,6 +175,8 @@ class EngineUtilityHandler:
         if not engine._has_pending_utility:
             return
         engine._has_pending_utility = False
+        # The engine whose queue this is; pause/resume and KV changes act on it.
+        self.engine = engine
 
         while True:
             try:
@@ -733,6 +743,38 @@ class EngineUtilityHandler:
 
     def _handle_release_structured_requests(self, args: dict):
         self.runner_mgr.call_func("release_structured_requests", args["request_ids"])
+
+    def _handle_pause_generation(self, args: dict) -> dict:
+        """Schedule nothing until ``resume_generation``.
+
+        What is running waits. A weight update in between preempts it (see
+        ``EngineCore.prepare_kv_change``), and once resumed it recomputes its
+        context on the new weights, keeping the tokens and logprobs it has.
+        """
+        args = args if isinstance(args, dict) else {}
+        try:
+            mode = args.get("mode", "keep")
+            if mode != "keep":
+                raise ValueError(f"unsupported pause mode {mode!r}; only 'keep'")
+            self.engine.pause_generation(
+                deadline=time.monotonic()
+                + _remaining_timeout(args, _KV_QUIESCE_TIMEOUT_S)
+            )
+            reply = {"cmd": PAUSE_GENERATION_CMD}
+            logger.info(f"{self.label}: generation paused")
+        except (ValueError, RuntimeError) as exc:
+            reply = self._error_reply(PAUSE_GENERATION_CMD, exc)
+            logger.error(f"{self.label}: pause_generation failed: {reply['error']}")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
+
+    def _handle_resume_generation(self, args: dict) -> dict:
+        """Let scheduling go on after ``pause_generation``."""
+        self.engine.resume_generation()
+        reply = {"cmd": RESUME_GENERATION_CMD}
+        logger.info(f"{self.label}: generation resumed")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
 
     def _handle_abort_request(self, args: dict):
         """Cancel queued work promptly; running forwards finish via postprocess."""

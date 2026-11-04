@@ -127,6 +127,10 @@ def test_features_are_reported_separately_from_methods():
     assert "vocab_masking" in rich["features"]
 
 
+def test_pause_generation_is_asked_for_where_every_feature_is():
+    assert "pause_generation" in _Runner().get_worker_capabilities()["features"]
+
+
 def test_fp8_is_claimed_by_the_weights_not_by_the_helper():
     """The helper's existence was the test, and every runner has it, so every
     BF16 runner advertised FP8 weight updates it does not do."""

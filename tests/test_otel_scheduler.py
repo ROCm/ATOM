@@ -209,6 +209,7 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
     core.is_head = engine_kind == "pp_head"
     core.kv_transfer_enabled = False
     core._is_rl_weights_offloaded = core._weight_sync_fenced = False
+    core._generation_paused = False
     core._sync_dp_state = lambda *a: (False, True, False)
     monkeypatch.setattr(tracing, "shutdown", lambda: calls.append("trace"))
     if failure in {"drain", "shutdown"} and not (

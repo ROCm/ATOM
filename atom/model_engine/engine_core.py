@@ -87,6 +87,8 @@ class EngineCore:
         # failed after an in-place write, must not serve.
         self._weight_sync_fenced = False
         self._rl_weights_inconsistent = False
+        # pause_generation .. resume_generation: nothing new is scheduled.
+        self._generation_paused = False
         self.input_address = input_address
         self.output_address = output_address
         # Control traffic arrives on its own socket so CoreManager can keep the
@@ -413,12 +415,16 @@ class EngineCore:
                 engine.exit()
 
     def _is_engine_held(self) -> bool:
-        """Whether this tick runs no forward: the weights are offloaded or a
-        weight sync is fenced.
+        """Whether this tick runs no forward: the weights are offloaded, a
+        weight sync is fenced, or generation is paused.
 
         Sleeps briefly when held, so the caller's loop does not spin.
         """
-        if self._is_rl_weights_offloaded or self._weight_sync_fenced:
+        if (
+            self._is_rl_weights_offloaded
+            or self._weight_sync_fenced
+            or self._generation_paused
+        ):
             time.sleep(0.01)
             return True
         return False
@@ -431,6 +437,13 @@ class EngineCore:
         """
         if not self._is_rl_weights_offloaded and self.has_pending_kv_work():
             self._advance_idle_kv_transfer(dispatch_new=False)
+
+    def pause_generation(self, deadline: float) -> None:
+        """Schedule nothing until ``resume_generation``; what runs stays put."""
+        self._generation_paused = True
+
+    def resume_generation(self) -> None:
+        self._generation_paused = False
 
     def prepare_weight_sync(self, deadline: float) -> None:
         """Get ready for a weight sync's first update, or raise.
@@ -1000,7 +1013,11 @@ class DPEngineCoreProc(EngineCore):
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
-                local_held = self._is_rl_weights_offloaded or self._weight_sync_fenced
+                local_held = (
+                    self._is_rl_weights_offloaded
+                    or self._weight_sync_fenced
+                    or self._generation_paused
+                )
                 local_unfinished = not self.scheduler.is_finished() and not local_held
 
                 # MAX-reduced: one held rank holds every rank of the group, so
