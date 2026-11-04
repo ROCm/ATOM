@@ -52,7 +52,7 @@ def make_impl(kv_mxfp4: bool, index_mxfp4: bool):
     impl.skip_index_topk = False
     impl.kv_cache_dtype = "fp8"
     impl.index_cache_dtype = "mxfp4" if index_mxfp4 else "auto"
-    impl.kv_nvfp4, impl.kv_mxfp4, impl.index_mxfp4 = False, kv_mxfp4, index_mxfp4
+    impl.kv_nvfp4, impl.kv_mxfp4 = False, kv_mxfp4
     impl.index_scale = impl.index_stage = impl.index_stage_slots = None
     impl.kv_stage = impl.kv_stage_slots = None
     impl._out_dtype = torch.bfloat16

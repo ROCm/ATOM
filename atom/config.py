@@ -2737,6 +2737,7 @@ class Config:
             str(a).startswith(("DeepseekV4For", "DeepseekV4MTP", "DeepseekV4DSpark"))
             for a in arches
         )
+        is_deepseek_v41 = self.hf_config.model_type == "deepseek_v41_text"
         # Before the CP fallback and the index default, which read these.
         self.kv_cache_dtype, self.kv_mxfp4, self.index_cache_dtype = (
             _resolve_fp4_caches(
@@ -2744,7 +2745,7 @@ class Config:
                 self.kv_mxfp4,
                 self.index_cache_dtype,
                 is_m3=any("MiniMaxM3" in str(a) for a in arches),
-                is_v41=self.hf_config.model_type == "deepseek_v41_text",
+                is_v41=is_deepseek_v41,
             )
         )
         if is_deepseek_v4:
@@ -2803,6 +2804,9 @@ class Config:
                         "override."
                     )
 
+        text_cfg = getattr(self.hf_config, "text_config", self.hf_config)
+        sparse_cfg = getattr(text_cfg, "sparse_attention_config", None) or {}
+
         # MiniMax-M3 indexer-only context parallelism. Off by default: it trades
         # a fixed per-layer all-to-all for a large long-context score win, so it
         # is a loss below roughly batch*context ~ 1M tokens. Warn and fall back
@@ -2811,8 +2815,6 @@ class Config:
         if envs.ATOM_M3_INDEXER_CP is not None:
             self.dcp_config.indexer_dcp_only = envs.ATOM_M3_INDEXER_CP == "1"
         if self.dcp_config.indexer_dcp_only:
-            text_cfg = getattr(self.hf_config, "text_config", self.hf_config)
-            sparse_cfg = getattr(text_cfg, "sparse_attention_config", None) or {}
             indexer_cp_off = indexer_cp_unsupported_reason(
                 arches,
                 self.tensor_parallel_size,
@@ -2858,7 +2860,7 @@ class Config:
                     self.index_cache_dtype = "fp8" if get_gfx() == "gfx942" else "fp4"
                 else:
                     self.index_cache_dtype = "fp8"
-            elif self.hf_config.model_type == "deepseek_v41_text":
+            elif is_deepseek_v41:
                 # CSA2 reads its index plane with the paged scorer and has no
                 # other, so the plane's format does not follow the main pool's.
                 # Only the default: an explicit value is carried through to the
@@ -2868,24 +2870,16 @@ class Config:
             else:
                 self.index_cache_dtype = self.kv_cache_dtype
 
-        m3_sparse_cfg = (
-            getattr(
-                getattr(self.hf_config, "text_config", self.hf_config),
-                "sparse_attention_config",
-                None,
-            )
-            or {}
-        )
         _check_m3_mxfp4(
             arches,
             self.index_cache_dtype,
             self.kv_mxfp4,
             self.kv_cache_block_size,
             is_plugin_mode(),
-            m3_sparse_cfg.get("sparse_local_block", 0),
+            sparse_cfg.get("sparse_local_block", 0),
         )
 
-        if self.hf_config.model_type == "deepseek_v41_text":
+        if is_deepseek_v41:
             # CSA2's index plane is paged by the same scorer GLM's is, so a
             # PAGE again has to hold a whole number of `MQA_LOGITS_PRESHUFFLE_ROWS`
             # tiles -- and its ratio-2 owners halve the PAGE before that count

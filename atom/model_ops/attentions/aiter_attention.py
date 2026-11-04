@@ -44,10 +44,9 @@ class _IndexCacheSpec(NamedTuple):
 
     rows: int
     dim: int
+    # uint8 is `--index-cache-dtype fp4`: one 8704 B page of data and scales a
+    # block (minimax_m3/kv_mxfp4), 68 B a token.
     dtype: torch.dtype
-    # `--index-cache-dtype fp4`: one 8704 B page of data and scales a block
-    # (minimax_m3/kv_mxfp4), 68 B a token.
-    mxfp4: bool = False
 
     def __str__(self) -> str:
         """How a row space names itself in a log line."""
@@ -699,7 +698,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             rows=self.row_counts().get(INDEX_ROWS, 0),
             dim=sparse_cfg["sparse_index_dim"],
             dtype=_resolve_index_cache_dtype(runner.config),
-            mxfp4=getattr(runner.config, "index_cache_dtype", None) == "mxfp4",
         )
 
     def _index_cache_fields(self, entry_tokens: int) -> tuple[EntryField, ...]:
@@ -713,7 +711,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         spec = self._index_cache_spec()
         if spec is None:
             return ()
-        if spec.mxfp4:
+        if spec.dtype == torch.uint8:
             from atom.model_ops.minimax_m3.kv_mxfp4 import HEAD_DIM, PAGE_BYTES
 
             if spec.dim != HEAD_DIM or entry_tokens != self.block_size:
@@ -801,7 +799,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             pool = next(p for p in self.kv_pools.values() if p.extra_fields)
             spec = self._index_cache_spec()
             row = self.pool_rows[INDEX_ROWS][module]
-            if spec.mxfp4:
+            if spec.dtype == torch.uint8:
                 from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES
 
                 module.impl.index_cache = pool.field_view(

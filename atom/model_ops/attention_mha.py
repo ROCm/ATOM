@@ -1318,7 +1318,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # directly together with an fp8 main q. `--index-cache-dtype fp4` makes
         # index_cache uint8 [pages, 8704] the same way.
         self.kv_mxfp4: bool = False
-        self.index_mxfp4: bool = self.index_cache_dtype == "mxfp4"
         self._out_dtype = torch.bfloat16
         # Optional shared dict bound by the metadata builder. It is scoped to the
         # current sparse metadata object and carries the last full layer top-k.
@@ -1398,26 +1397,21 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         fused_index_cache_dtype = (
             self.index_cache_dtype
             if self.index_cache_dtype in ("fp8", "mxfp4")
-            and not (self.skip_index_topk and self.kv_mxfp4)  # no index branch
+            and not self.skip_index_topk  # no index branch
             else "auto"
         )
 
         if self.kv_mxfp4:
-            fused_k_cache, fused_v_cache = k_cache, v_cache
-            fused_kv_slot_mapping = slot_mapping
             fused_kv_block_size = 128
             kv_cache_dtype = "mxfp4"
-            fused_k_scale = fused_v_scale = None
         else:
-            fused_k_cache, fused_v_cache = k_cache, v_cache
-            fused_kv_slot_mapping = slot_mapping
             # SHUFFLE page size (== ASM_PAGE_SIZE == 16)
             fused_kv_block_size = k_cache.shape[3]
-        fused_index_cache = self.index_cache
-        fused_index_slot_mapping = slot_mapping
         # e4m3 (cast as is) for the MXFP4 index's fp8-q scorer; the top-k reuse key
         # records it, so a reusing layer finds what a producing layer stored
-        index_q_dtype = torch.float8_e4m3fn if self.index_mxfp4 else qkv.dtype
+        index_q_dtype = (
+            torch.float8_e4m3fn if self.index_cache_dtype == "mxfp4" else qkv.dtype
+        )
 
         if self.skip_index_topk and not self.kv_mxfp4:
             from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
@@ -1487,14 +1481,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.index_q_norm.weight,
             self.index_k_norm.weight,
             self.num_idx_heads,
-            fused_kv_slot_mapping,
-            fused_k_cache,
-            fused_v_cache,
-            None if self.skip_index_topk else fused_index_cache,
+            slot_mapping,
+            k_cache,
+            v_cache,
+            None if self.skip_index_topk else self.index_cache,
             fused_kv_block_size,
             q_out,
             index_q,
-            None if self.skip_index_topk else fused_index_slot_mapping,
+            None if self.skip_index_topk else slot_mapping,
             kv_cache_dtype=kv_cache_dtype,
             index_cache_dtype=fused_index_cache_dtype,
             k_scale=fused_k_scale,
@@ -1639,7 +1633,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         kw = {}
         if self.kv_mxfp4:
             kw.update(pages_per_block=1, block_page_stride=1)
-        if self.index_mxfp4:
+        if self.index_cache_dtype == "mxfp4":
             kw["index_mxfp4"] = True
             if decode:
                 kw["index_score_work_map"] = sparse_metadata.index_score_work_map
