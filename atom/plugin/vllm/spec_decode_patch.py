@@ -85,7 +85,7 @@ def _patch_dspark_fused_markov_sample() -> None:
     Gated because the bias GEMV moves from fp32 matmul to bf16 MFMA with an fp32
     accumulator: equal up to accumulation order, not bit-identical.
     """
-    if not envs.ATOM_DSPARK_FUSED_MARKOV_ARGMAX:
+    if not envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE:
         return
     try:
         from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator

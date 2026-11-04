@@ -597,7 +597,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
             head is not None
             and head.tp_size > 1
             and head.bias is None
-            and markov.fused_argmax
+            and markov.fused_sample
             and markov.markov_w1.weight.dtype in (torch.bfloat16, torch.float16)
             and markov.markov_w2.weight.dtype is markov.markov_w1.weight.dtype
         )

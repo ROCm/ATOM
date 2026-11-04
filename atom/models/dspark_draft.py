@@ -116,7 +116,7 @@ class DSparkMarkovHead(nn.Module):
         self.markov_w2 = nn.Embedding(vocab_size, rank)
         # Read once here rather than per sampled position: envs re-reads the
         # environment on every attribute access.
-        self.fused_argmax = envs.ATOM_DSPARK_FUSED_MARKOV_ARGMAX
+        self.fused_sample = envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE
 
     def forward(self, token_ids: torch.Tensor):
         """Args:
@@ -154,7 +154,7 @@ class DSparkMarkovHead(nn.Module):
         Returns:
             markov_embed: [B, r]  W1[x_{k-1}].
         """
-        if self.fused_argmax:
+        if self.fused_sample:
             # Imported here, not at module scope: the op imports Triton and
             # AITER, and this module stays importable without them.
             from atom.model_ops.dspark_markov_argmax import dspark_markov_argmax

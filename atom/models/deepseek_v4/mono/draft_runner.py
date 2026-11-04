@@ -173,7 +173,7 @@ def _draft_scalar_contract(model, stages):
         scalars(model.head, ("norm_eps", "hc_eps")),
         scalars(
             getattr(stages[-1], "markov_head", None),
-            ("vocab_size", "rank", "fused_argmax"),
+            ("vocab_size", "rank", "fused_sample"),
         ),
     )
 

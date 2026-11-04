@@ -32,7 +32,7 @@ accumulator is what the existing "this bias lands inside the softmax that
 decides acceptance" guarantee asks for, and that is preserved; what no argument
 settles is whether an argmax anywhere flips on a pair of logits separated by
 less than the last-ulp disagreement. That one is answered by measurement rather
-than by proof, which is why ``ATOM_DSPARK_FUSED_MARKOV_ARGMAX`` remains a
+than by proof, which is why ``ATOM_DSPARK_FUSED_MARKOV_SAMPLE`` remains a
 switch after being turned on by default (see it for the acceptance-rate
 numbers).
 
