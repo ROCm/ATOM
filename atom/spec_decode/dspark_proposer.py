@@ -68,8 +68,9 @@ class DSparkProposer(Drafter):
         self.dcp_rank = get_dcp_rank()
         if self._with_draft:
             self._init_draft_block_buffers()
-        # Must run before any warmup or capture: the block sampler branches on
-        # the binding in python, so whichever side is bound is recorded.
+        # Allocates only; the runner binds the draft model (`bind_target`)
+        # before any warmup or capture, since the block sampler branches on
+        # that binding in python and whichever side is bound is recorded.
         self.lossless = DSparkLossless.arm(self)
 
     def _declare_draft_graphs(self):

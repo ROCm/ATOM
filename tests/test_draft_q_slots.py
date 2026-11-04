@@ -7,6 +7,8 @@ accept kernel answers by rejecting and drawing from the target alone. Pure
 python, so this runs wherever the unit suite does.
 """
 
+import pytest
+
 from atom.spec_decode.draft_q_slots import DraftQSlots
 
 T = 4
@@ -124,3 +126,10 @@ def test_a_skipped_member_may_be_expired_and_then_reads_only_the_sentinel():
     slots.claim_bases(["m", "c"], out, [True, False])
     assert out == [-1, m] and "m" not in slots
     assert bases(slots, ["m"], claim=False) == [-1]
+
+
+def test_sizes_must_be_positive():
+    with pytest.raises(ValueError):
+        DraftQSlots(0, T)
+    with pytest.raises(ValueError):
+        DraftQSlots(4, 0)

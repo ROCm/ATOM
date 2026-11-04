@@ -24,8 +24,9 @@ from atom.model_ops.spec_sampling.sampling_scratch import Region
 # last 8 bits are resolved apart (`_ratio_filter_floor_kernel` counts them,
 # `_ratio_filter_cut_kernel` picks the floor among them): each of their
 # bins is one logit, so its mass is its count times that logit's p, and
-# counting is all that pass does. A bf16 logit's 16 bits take two passes and
-# the floor kernels, an fp32 one's 32 take six.
+# counting is all that pass does. An fp32 logit's 32 bits take six passes and
+# the floor kernels, a bf16 one's 16 two, or, unweighted (top-k alone), one
+# 8-bit count of the top byte and the floor kernels.
 _FILTER_DIGIT_BITS = 4
 _FILTER_BINS = 1 << _FILTER_DIGIT_BITS
 _FILTER_LAST_BITS = 8

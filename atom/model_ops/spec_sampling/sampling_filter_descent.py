@@ -3,7 +3,8 @@
 
 Every filtered row but a counted one (`sampling_filter_count`): passes of
 ``_FILTER_DIGIT_BITS`` narrow the key prefix, then the last count and the cut
-resolve the final ``_FILTER_LAST_BITS``, where each bin is one logit.
+resolve the final ``_FILTER_LAST_BITS``, where each bin is one logit. An
+unweighted bf16 key skips the passes: one 8-bit count picks its top byte.
 """
 
 import torch

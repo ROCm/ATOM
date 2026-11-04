@@ -118,8 +118,9 @@ class DSparkLossless:
 
     @classmethod
     def arm(cls, drafter) -> "DSparkLossless | None":
-        """Arm lossless sampling for ``drafter`` and bind its draft model, or
-        return None and keep the greedy pair. See `ATOM_SPEC_LOSSLESS_SAMPLING`
+        """Arm lossless sampling for ``drafter`` (allocate its state; the
+        runner binds the draft model with `bind_target`), or return None and
+        keep the greedy pair. See `ATOM_SPEC_LOSSLESS_SAMPLING`
         in `docs/model_ops_guide.md`."""
         if not envs.ATOM_SPEC_LOSSLESS_SAMPLING:
             return None
