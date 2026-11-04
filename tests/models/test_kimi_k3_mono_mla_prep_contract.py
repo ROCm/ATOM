@@ -30,9 +30,13 @@ def _no_disk_cache(monkeypatch):
     monkeypatch.setattr(k2, "_BUILDS", {})
 
 
-def test_prep_build_adds_only_its_tail():
+P0_REGIONS = {"ppart", "pwgt", "pmsq", "pamx", "pxrdy"}
+
+
+@pytest.mark.parametrize("mode", [1, 2])
+def test_prep_build_adds_only_its_tail(mode):
     base_key = k2.K2Build(tokens=1, nblocks=2)
-    key = k2.K2Build(tokens=1, nblocks=2, mla_prep=1, prep_nblocks=2)
+    key = k2.K2Build(tokens=1, nblocks=2, mla_prep=mode, prep_nblocks=2)
     base = trace(k2.build(base_key), k2.abi_for(base_key))
     rec = trace(k2.build(key), k2.abi_for(key))
     assert not rec.unnamed
@@ -40,7 +44,9 @@ def test_prep_build_adds_only_its_tail():
     before = [(a.region, a.kind) for a in rec.accesses if a.stage != "k2.mlaprep"]
     assert before == [(a.region, a.kind) for a in base.accesses]
     tail = [a for a in rec.accesses if a.stage == "k2.mlaprep"]
-    assert {a.region for a in tail} == set(pr.REGIONS) | {"fing"}
+    regions = set(pr.REGIONS) if mode >= 2 else P0_REGIONS
+    assert regions <= set(pr.REGIONS)
+    assert {a.region for a in tail} == regions | {"fing"}
     for a in tail:
         if a.region == "fing":
             assert a.kind == "poll" and a.space is Space.PEER
@@ -50,8 +56,13 @@ def test_prep_build_adds_only_its_tail():
     assert {
         a.stage for a in base.accesses if a.region == "fing" and a.kind == "put"
     } == {"k2.up"}
-    # PXRDY is the next stage's (P1's): put here, polled by nobody yet
-    assert [a.kind for a in tail if a.region == "pxrdy"] == ["put"]
+    # PXRDY is P1's (mode 2): put by P0, then polled; mode 1 has no reader
+    pxrdy = [a.kind for a in tail if a.region == "pxrdy"]
+    assert pxrdy == (["put", "poll"] if mode >= 2 else ["put"])
+    if mode >= 2:
+        # P2 waits on P1's pairs; P2DONE is the host's (the launch's end)
+        assert [a.kind for a in tail if a.region == "p1done"] == ["put", "poll"]
+        assert [a.kind for a in tail if a.region == "p2done"] == ["put"]
     # every other region of the tail is put before it is polled
     for r in ("ppart", "pwgt", "pmsq", "pamx"):
         kinds = [a.kind for a in tail if a.region == r]

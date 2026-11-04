@@ -989,6 +989,38 @@ class KimiFullAttention(nn.Module):
         )
         return o, hidden_states, hidden_states_scale
 
+    def forward_prepped(
+        self,
+        positions: torch.Tensor,
+        x: torch.Tensor,
+        x_scale: torch.Tensor,
+        q: torch.Tensor,
+        q_scale: torch.Tensor,
+        kv: torch.Tensor,
+        k_rope: torch.Tensor,
+        latent_out: bool = False,
+    ) -> torch.Tensor:
+        """K3 mono decode, ``ATOM_MONO_MLA_PREP=2``: ``forward_pre_o`` (or, with
+        ``latent_out``, ``forward_latent``'s latent) from ``_mla_inputs``'
+        results, which the preceding layer's K2 launch made: ``q`` / ``q_scale``
+        (q_a_layernorm's per-token FP8), ``kv`` (kv_a_layernorm), ``k_rope``.
+        ``x`` / ``x_scale``: the seam's per-token FP8 activation, g_proj's
+        input."""
+        if latent_out:
+            return self.attn.impl.forward_impl(
+                q, kv, k_rope, positions=positions, q_scale=q_scale, latent_out=True
+            )
+        attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
+        gate = self.g_proj(x, x_scale)
+        attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
+            attn_out,
+            gate,
+            quant=self.fuse_sigmoid_mul_quant,
+            quant_type_value=self.o_proj_quant_type_value,
+        )
+        assert attn_scale is None, "o_proj is quantized; K2 reads it as bf16"
+        return attn_out
+
 
 def _kda_attention_with_output_fake(
     hidden_states: torch.Tensor,
