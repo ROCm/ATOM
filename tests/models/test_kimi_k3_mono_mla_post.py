@@ -249,3 +249,21 @@ def test_flags_default_off(monkeypatch):
         assert getattr(envs, name) is False
         monkeypatch.setenv(name, "1")
         assert getattr(envs, name) is True
+
+
+# ------------------------------------------------------- the FP8 weight layout
+def test_w8_dword_reads_the_shuffled_plane():
+    """Every lane's 8 bytes at ``w8_dword`` (and each q step 128 dwords on) of
+    ``shuffle16(w)`` are row ``row0 + lane % 16``'s columns ``kcol + 32 q +
+    8 (lane // 16)`` .. + 8 of ``w``."""
+    n, k = 64, 256
+    w = torch.randint(0, 256, (n, k), dtype=torch.uint8)
+    flat = pl.shuffle16(w).reshape(-1)
+    for row0 in range(0, n, pl.ROWS):
+        for kcol in range(0, k, pl.KCH):
+            for lane in range(64):
+                d = pl.w8_dword(row0, lane, k, kcol)
+                for q in range(4):
+                    got = flat[(d + 128 * q) * 4 : (d + 128 * q) * 4 + 8]
+                    c0 = kcol + 32 * q + 8 * (lane // pl.ROWS)
+                    assert torch.equal(got, w[row0 + lane % pl.ROWS, c0 : c0 + 8])
