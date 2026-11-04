@@ -17,8 +17,7 @@ __all__ = [
 # engine to read a dataclass, which is why the test suite hand-stubbed
 # `atom.config` instead of importing it.
 #
-# The two names above stay eager: both cost only dataclasses, logging and
-# typing.
+# The two names above stay eager: both keep package import side effects small.
 
 
 def __getattr__(name: str):
