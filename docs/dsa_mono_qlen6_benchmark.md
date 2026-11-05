@@ -1,4 +1,7 @@
-# DSA Mono qlen-6: FP8 and OPUS FP4
+# GLM-5.3-MXFP4: DSA Mono qlen-6 FP8 and OPUS FP4
+
+For K3.1 Pro results, see the separate
+[K3.1 Pro report](dsa_mono_k3_1_pro_qlen6_benchmark.md).
 
 ## Scope
 
@@ -121,7 +124,9 @@ counters and does not establish hardware MFMA or memory-bandwidth saturation.
   on all eight ranks: 8K, 8193, a long request in the last tile, 160K, then 8K.
 - 14 short cases ran rank0 alone with remote addresses zeroed; peer mailbox,
   epoch and shared winner slab remained unchanged.
-- Original and same-Q native/Mono TopK overlap is 100% for all 14 short cases.
+- Same-Q native/Mono TopK overlap is 100% for all 14 short cases.
+  Minimum original short-case overlap is 98.7060547%; Q projection rounding
+  differs in the small-batch paths.
 - Minimum same-Q native/Mono TopK overlap over all 42 cases: 100%.
 - Minimum original overlap over all cases: 96.7122396% (FP4 BS1, 160K/DCP8).
   The long-path native GEMM and Mono GEMV can round Q differently, as before.

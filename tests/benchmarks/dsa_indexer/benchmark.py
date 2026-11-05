@@ -22,7 +22,12 @@ from aiter.dist.parallel_state import (
     initialize_model_parallel,
 )
 
-from atom.config import Config, set_current_atom_config
+from atom.config import (
+    Config,
+    QuantizationConfig,
+    flatten_dsa_config,
+    set_current_atom_config,
+)
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.indexer.rows import fp4_rows, fp8_rows
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
@@ -54,30 +59,33 @@ def overlap(first, second, world):
 def run_case(args, cfg, weights, device, rank, world, batch, context):
     qlen, page, dcp = args.qlen, args.page, args.dcp
     rows = batch * qlen
+    text_config = getattr(cfg.hf_config, "text_config", cfg.hf_config)
     output = ROOT / "runs" / args.tag / f"bs{batch}_q{qlen}_c{context}"
     output.mkdir(parents=True, exist_ok=True)
     module = Indexer(
         cfg,
-        cfg.hf_config,
-        cfg.hf_config.hidden_size,
-        2048,
+        text_config,
+        text_config.hidden_size,
+        text_config.q_lora_rank,
         cfg.quant_config,
         "fp8",
         prefix=PREFIX,
         external_k_weights=True,
     ).to(device)
-    params = cfg.hf_config.rope_parameters
-    assert params.get("factor", 1.0) in (None, 1.0)
-    module.rotary_emb = get_rope(
-        cfg.hf_config.qk_rope_head_dim,
-        rotary_dim=cfg.hf_config.qk_rope_head_dim,
-        max_position=cfg.hf_config.max_position_embeddings,
-        base=params.get("rope_theta") or 10000,
-        rope_scaling=None,
-        is_neox_style=is_neox_rope_style(
-            cfg.hf_config, "indexer_rope_interleave", default_is_neox=True
-        ),
-    ).to(device)
+    if module.rope_dim:
+        params = text_config.rope_parameters
+        assert params.get("factor", 1.0) in (None, 1.0)
+        module.rotary_emb = get_rope(
+            text_config.qk_rope_head_dim,
+            rotary_dim=text_config.qk_rope_head_dim,
+            max_position=text_config.max_position_embeddings,
+            base=params.get("rope_theta") or 10000,
+            rope_scaling=None,
+            is_neox_style=is_neox_rope_style(
+                text_config, "indexer_rope_interleave", default_is_neox=True
+            ),
+        ).to(device)
+    assert (module.n_head, module.head_dim, module.topk_tokens) == (32, 128, 2048)
     for name in ("wq_b.weight", "k_norm.weight", "k_norm.bias"):
         module.get_parameter(name).copy_(weights[name])
     module.wq_b.process_weights_after_loading()
@@ -86,8 +94,8 @@ def run_case(args, cfg, weights, device, rank, world, batch, context):
     )
     assert module._indexer_fp4 == (args.cache == "fp4")
     torch.manual_seed(2701)
-    hidden = torch.randn(rows, cfg.hf_config.hidden_size, device=device)
-    qr = torch.randn(rows, 2048, device=device)
+    hidden = torch.randn(rows, text_config.hidden_size, device=device)
+    qr = torch.randn(rows, module.q_lora_rank, device=device)
     kw = torch.nn.functional.linear(
         hidden,
         torch.cat((weights["wk.weight"], weights["weights_proj.weight"])).bfloat16(),
@@ -457,6 +465,10 @@ def run_case(args, cfg, weights, device, rank, world, batch, context):
             "mono_includes_reset": True,
             "native_dcp_includes_exchange": dcp > 1,
             "checkpoint": str(MODEL),
+            "checkpoint_weight_prefix": PREFIX,
+            "q_lora": module.q_lora_rank,
+            "rope_dim": module.rope_dim,
+            "short_gemm": key.short_gemm,
             "online_quant_config": None,
             "repeats": args.repeats,
             "replays": args.replays,
@@ -485,9 +497,10 @@ def run_case(args, cfg, weights, device, rank, world, batch, context):
 
 
 def main():
-    global MODEL, ROOT
+    global MODEL, ROOT, PREFIX
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--weight-prefix", default=PREFIX)
     parser.add_argument("--output", type=Path, default=Path("dsa_indexer_results"))
     parser.add_argument("--cache", choices=("fp8", "fp4"), required=True)
     parser.add_argument("--dcp", type=int, choices=(1, 8), required=True)
@@ -501,7 +514,7 @@ def main():
     parser.add_argument("--tag", required=True)
     parser.add_argument("--boundary", action="store_true")
     args = parser.parse_args()
-    MODEL, ROOT = args.model, args.output
+    MODEL, ROOT, PREFIX = args.model, args.output, args.weight_prefix
     common.MODEL, common.PREFIX = MODEL, PREFIX
     args.page = 64 if args.cache == "fp4" else 128
     assert args.qlen == 6 and 0 < min(args.batches) <= max(args.batches) <= 42
@@ -526,6 +539,17 @@ def main():
         enable_prefix_caching=False,
     )
     checksum = hashlib.sha256((MODEL / "config.json").read_bytes()).hexdigest()
+    text_config = getattr(cfg.hf_config, "text_config", cfg.hf_config)
+    flatten_dsa_config(text_config)
+    # Multimodal wrappers may omit this field and trigger Config's 8K default.
+    # The standalone indexer must retain the same 160K capacity in every arm.
+    cfg.max_model_len = min(163840, text_config.max_position_embeddings)
+    assert cfg.max_model_len == 163840
+    if (
+        getattr(cfg.hf_config, "quantization_config", None) is None
+        and getattr(text_config, "quantization_config", None) is not None
+    ):
+        cfg.quant_config = QuantizationConfig(text_config, cfg.online_quant_config)
     set_current_atom_config(cfg)
     init_distributed_environment(world_size=world, rank=rank, local_rank=rank)
     initialize_model_parallel(

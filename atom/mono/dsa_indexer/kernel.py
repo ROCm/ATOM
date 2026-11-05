@@ -325,10 +325,10 @@ def unfit(key: IxBuild) -> str:
         or key.world <= 1
         or key.shape.heads != 32
         or key.shape.head_dim != 128
-        or key.shape.q_lora not in (1024, 2048)
+        or key.shape.q_lora not in (1024, 1536, 2048)
         or key.max_ctx > isel.SPLIT_MIN
     ):
-        return "short GEMM requires replicated 32x128 heads and Q LoRA 1024/2048"
+        return "short GEMM requires replicated 32x128 heads and Q LoRA 1024/1536/2048"
     if not 1 <= key.tokens <= limit:
         return f"{key.tokens} rows: qlen {key.qlen} built for 1 .. {limit}"
     if key.score_blocks not in (BLOCKS, 2 * BLOCKS):
