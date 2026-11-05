@@ -20,6 +20,7 @@ from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules
 from .base_attention import BaseAttention
+from .sp_attention import sp_fp8_attention_output_supported
 
 
 class Attention(BaseAttention):
@@ -45,6 +46,7 @@ class Attention(BaseAttention):
         q_norm: torch.nn.Module | None = None,
         k_norm: torch.nn.Module | None = None,
         impl_cls: type | None = None,
+        per_token_fp8_out: bool = False,
         **kwargs,
     ):
         assert (
@@ -100,6 +102,13 @@ class Attention(BaseAttention):
         # communicator of the long-prefill head exchange.
         self.sp_columns = sp_columns
         self.sp_head_exchange = sp_head_exchange
+        # Under SP, hand an FP8 o_proj per-token FP8 `(out, scale)` straight
+        # from the head exchange instead of quantizing BF16 after it.
+        self.per_token_fp8_out = (
+            per_token_fp8_out
+            and sp_columns is not None
+            and sp_fp8_attention_output_supported()
+        )
 
         atom_config = get_current_atom_config()
         dtype = atom_config.torch_dtype
@@ -145,6 +154,13 @@ class Attention(BaseAttention):
         qkv: torch.Tensor = None,
         **kwargs,
     ):
+        if self.per_token_fp8_out:
+            # Allocated outside the op, in the compiled segment before it.
+            scale = query.new_empty((query.shape[0], 1), dtype=torch.float32)
+            output = torch.ops.aiter.sp_attention_fp8(
+                query, key, value, positions, self.layer_name, qkv, scale
+            )
+            return output, scale
         output = torch.ops.aiter.unified_attention_with_output_base(
             query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
         )

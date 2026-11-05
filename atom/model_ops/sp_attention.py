@@ -254,12 +254,10 @@ def _attention_fp8_fake(
     v: torch.Tensor,
     positions: torch.Tensor,
     layer_name: str,
-    qkv: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        torch.empty(q.shape, device=q.device, dtype=dtypes.fp8),
-        torch.empty((q.shape[0], 1), device=q.device, dtype=torch.float32),
-    )
+    qkv: torch.Tensor | None,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(q.shape, device=q.device, dtype=dtypes.fp8)
 
 
 # Not an eager_region: TR_HYBRID records it inline in the decode token graphs,
@@ -267,18 +265,18 @@ def _attention_fp8_fake(
 # Config refuses spec decoding under SP, and prefill token graphs are recorded
 # only for a builder with `supports_token_graph` (DeepSeek-V4.1's, an attention
 # SP refuses); ModelRunner also refuses any such builder under SP.
-@mark_spliting_op(is_custom=True, gen_fake=_attention_fp8_fake, mutates_args=[])
+@mark_spliting_op(is_custom=True, gen_fake=_attention_fp8_fake, mutates_args=["scale"])
 def sp_attention_fp8(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     positions: torch.Tensor,
     layer_name: str,
-    qkv: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    qkv: torch.Tensor | None,
+    scale: torch.Tensor,
+) -> torch.Tensor:
     attn = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
     out, rows = ulysses_attention(attn, q, k, v, positions, None, qkv)
-    scale = torch.empty((q.shape[0], 1), device=q.device, dtype=torch.float32)
-    return gather_heads(out, rows, attn.sp_head_exchange, scale), scale
+    return gather_heads(out, rows, attn.sp_head_exchange, scale)

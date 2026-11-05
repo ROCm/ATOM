@@ -46,7 +46,6 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.sp_attention import sp_fp8_attention_output_supported
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
@@ -57,6 +56,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.quant_spec import effective_layer_quant
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
@@ -163,21 +163,6 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
         quant_type_value == QuantType.per_Token.value
         and getattr(linear, "params_dtype", None) == dtypes.fp8
     )
-
-
-def _minimax_m3_attend_and_project(attention, q, k, v, positions, qkv):
-    # Keep one output schema for all token counts; the opaque custom op selects
-    # the measured transport at runtime, including when a graph is reused.
-    if (
-        attention._fp8_head_exchange
-        and q.dtype == torch.bfloat16
-        and _linear_consumes_per_token_fp8(attention.o_proj)
-    ):
-        output, scale = torch.ops.aiter.sp_attention_fp8(
-            q, k, v, positions, attention.attn.layer_name, qkv
-        )
-        return attention.o_proj(output, x_scale=scale)
-    return attention.o_proj(attention.attn(q, k, v, positions=positions, qkv=qkv))
 
 
 def _minimax_m3_cos_sin_cache(
@@ -459,8 +444,9 @@ class MiniMaxM3Attention(nn.Module):
             q_norm=self.q_norm,
             k_norm=self.k_norm,
             prefix=f"{prefix}.attn",
+            per_token_fp8_out=effective_layer_quant(quant_config, f"{prefix}.o_proj")
+            == (QuantType.per_Token, dtypes.fp8),
         )
-        self._fp8_head_exchange = sp_fp8_attention_output_supported()
 
     def forward(
         self,
@@ -470,7 +456,10 @@ class MiniMaxM3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        return _minimax_m3_attend_and_project(self, q, k, v, positions, qkv)
+        attn_output = self.attn(q, k, v, positions=positions, qkv=qkv)
+        if isinstance(attn_output, tuple):
+            return self.o_proj(*attn_output)
+        return self.o_proj(attn_output)
 
 
 class MiniMaxM3SparseAttention(nn.Module):
@@ -608,8 +597,9 @@ class MiniMaxM3SparseAttention(nn.Module):
             skip_index_topk=self.skip_index_topk,
             sparse_layer_ordinal=self.sparse_layer_ordinal,
             index_cache_dtype=index_cache_config,
+            per_token_fp8_out=effective_layer_quant(quant_config, f"{prefix}.o_proj")
+            == (QuantType.per_Token, dtypes.fp8),
         )
-        self._fp8_head_exchange = sp_fp8_attention_output_supported()
 
     def forward(
         self,
@@ -630,7 +620,10 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
-        return _minimax_m3_attend_and_project(self, q, k, v, positions, qkv)
+        attn_output = self.attn(q, k, v, positions, qkv=qkv)
+        if isinstance(attn_output, tuple):
+            return self.o_proj(*attn_output)
+        return self.o_proj(attn_output)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
