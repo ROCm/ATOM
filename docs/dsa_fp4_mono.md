@@ -57,6 +57,29 @@ The predicate is evaluated inside the captured graph, not at capture time.
 The standalone DSA runner uses a matching conditional reset; runners that
 share buffers with whole-model Mono kernels retain their original fence.
 
+### Short-Context Qlen-6 Tuning
+
+On unmasked 256-CU gfx950 devices, replicated 32x128-head indexers with
+BF16 Q LoRA 1024/2048 and max_model_len <= 262144 additionally use the
+short-query specialization. Its runtime predicate remains inside the graph:
+long or mixed batches keep the original collaborative projection/scoring path.
+
+- At 96 or more query rows, each CTA projects complete heads for a 16/32-row
+  tile and quantizes from LDS, eliminating the cross-CTA Q/quantization rendezvous.
+- A one-time BF16 weight permutation preserves every checkpoint bit and the
+  original native weight. It adds 8 MiB per indexer for Q LoRA 1024, or
+  16 MiB for GLM's Q LoRA 2048. This is not weight quantization.
+- Short MQA work is balanced across the resident CTAs; FP8 uses a wider
+  gfx950 MFMA with unit internal scales and unchanged external Q/K scales.
+- The planner handles regular short batches directly; padding, contexts below
+  the TopK threshold, and mixed/long contexts retain the generic planner.
+- The standalone short reset clears only flags that the local step can read.
+
+The OPUS FP4 cache ABI above is unchanged. There is still one main Mono
+kernel plus the required reset, not a native fallback or four-kernel hybrid.
+The performance report qualifies GLM-5.3-MXFP4; it is not a performance
+guarantee for every admitted shape or model.
+
 ## Validation Status
 
 Tests include independent tensor-permutation checks, native/Mono cache-byte
@@ -70,4 +93,4 @@ Same-Q comparisons agree with OPUS. The existing small-batch native Q GEMM
 and Mono GEMV can round differently; FP4 amplifies threshold crossings.
 This and shape-dependent performance are reasons the FP4 route is opt-in,
 not a default replacement. See [the qlen-6 report](dsa_mono_qlen6_benchmark.md)
-for the FP8/FP4 comparison, known short-context regressions and reproduction.
+for the FP8/FP4 comparison, measurement scope and reproduction.
