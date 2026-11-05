@@ -33,9 +33,11 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
+from atom.mono.device.mx import mfma_scaled
 from atom.mono.device.ops import (
     CM_DEV,
     CM_SYS,
+    ballot,
     block_excl_scan,
     butterfly,
     head_sum,
@@ -228,6 +230,45 @@ def sflag_at(c, r):
 
 @traced
 def step_table(c):
+    # All rows need TopK but fit one local segment. The fixed short scorer
+    # does not consume a task prefix table, except BS1's two-query pieces.
+    if const_expr(c.get("fast_short", False)):
+        ql, s, tid, lane = c["qlen"], c["S"], c["tid"], c["lane"]
+        requests = s // ql
+        length = request_ctx(c, fx.min(lane, fx.Int32(requests - 1)) * ql)
+        bad = (lane < requests) & (
+            (length > SHORT_VERIFY_CTX) | (length < c["shape"].topk + ql)
+        )
+        fast = ballot(bad) == 0
+        if fast:
+            if tid < s:
+                ctx = request_ctx(c, tid) - (ql - 1 - tid % ql)
+                at = c["rows"] + ROW_WORDS * tid
+                fx.ptr_store(ctx, at)
+                fx.ptr_store(ctx, at + 1)
+                fx.ptr_store(fx.Int32(5), at + 2)
+                fx.ptr_store(tid, _seg_firsts(c) + tid)
+            if tid == 0:
+                tasks = fx.Int32(1)
+                if const_expr(s == ql):
+                    tasks = fx.Int32(0)
+                    for p in range_constexpr(ql // 2):
+                        fx.ptr_store(tasks, _score_firsts(c) + p)
+                        count = (length - ql + 2 * p + 2 + SCORE_KEYS - 1) // SCORE_KEYS
+                        tasks = tasks + count
+                fx.ptr_store(tasks, c["plan"] + PLAN_SCORE_TOTAL)
+                fx.ptr_store(fx.Int32(0), c["plan"] + PLAN_SCORE_LG)
+                fx.ptr_store(fx.Int32(s), c["plan"] + PLAN_SEG_TOTAL)
+                fx.ptr_store(fx.Int32(0), c["plan"] + PLAN_SEG_LG)
+            gpu.barrier()
+        else:
+            _step_table_generic(c)
+    else:
+        _step_table_generic(c)
+
+
+@traced
+def _step_table_generic(c):
     """The step's rows and tasks once a CTA, on wave 0, behind one barrier.
     Up to 64 rows use one lane each; wider plain decodes use 64-row tiles.
 
@@ -813,14 +854,25 @@ def _rows_store(c, vs):
             fx.ptr_store(v, c["qrows"] + at)
 
 
-def _dot_terms(sh, qs, ws, b64, ks):
+def _dot_terms(sh, qs, ws, b64, ks, wide=False):
     if sh.kv_dtype == "fp4":
         return fp4.terms(sh, qs, ws, b64, ks)
     terms = {}
     for hh in range_constexpr(sh.heads // TILE):
         acc = fx.Vector.filled(4, 0.0, fx.Float32)
-        for x in range_constexpr(4):
-            acc = mfma_fp8(qs[hh][x], b64[x], acc)
+        if const_expr(wide):
+            # Both operands share the K permutation. Unit MX scales preserve
+            # the existing FP8 data and external query/key scales.
+            acc = mfma_scaled(
+                qs[hh].bitcast(fx.Int32),
+                b64.bitcast(fx.Int32),
+                acc,
+                fx.Int32(127),
+                fx.Int32(127),
+            )
+        else:
+            for x in range_constexpr(4):
+                acc = mfma_fp8(qs[hh][x], b64[x], acc)
         for e in range_constexpr(4):
             terms[hh, e] = (fx.max(acc[e] * ks, fx.Float32(0.0)), ws[hh][e])
     return terms
@@ -903,7 +955,7 @@ def stage_score(c, p, u0, nu, width):
             nxt = _staged_query(c, r + 1, dg, lane)
         for i in range_constexpr(width):
             b64, ks = keys[i]
-            terms = _dot_terms(sh, qs, ws, b64, ks)
+            terms = _dot_terms(sh, qs, ws, b64, ks, wide=c.get("wide_fp8", False))
             col = SCORE_KEYS * (u0 + i) + TILE * wave + lane % 16
             score = fx.Float32(head_sum(terms))
             # the row's keys alone: the next row's ILOG starts past its last
@@ -919,7 +971,9 @@ def stage_score(c, p, u0, nu, width):
                 )
     c["stamp"](c["tl_score"] + 2)
     # thread k: the piece's row k // TASK_UNITS, unit k % TASK_UNITS
-    fr, fu = tid // TASK_UNITS, tid % TASK_UNITS
+    # Balanced short tasks can span 9..11 units instead of a power of two.
+    flag_width = max(TASK_UNITS, width)
+    fr, fu = tid // flag_width, tid % flag_width
     flag = sflag_at(c, lead + fx.min(fr, span - 1)) + u0 + fu
     publish(
         c["put"], c["sflag"], flag, fx.Int32(1), (fu < nu) & (fr < span)

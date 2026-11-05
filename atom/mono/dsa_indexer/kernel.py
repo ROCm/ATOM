@@ -122,6 +122,8 @@ class IxBuild:
     delay_ticks: int = field(default=0, metadata={"sym": "dt"})
     # 512 requires two resident CTAs per gfx950 CU. Wide buckets split Q too.
     score_blocks: int = BLOCKS
+    # gfx950 short verify: BF16 prepacked Q projection and local MQA scheduling.
+    short_gemm: bool = field(default=False, metadata={"sym": "sq"})
 
     @property
     def stream_scores(self) -> bool:
@@ -234,6 +236,7 @@ ABI = KernelAbi(
         "qr",
         "qr_ld",
         "w_qb",
+        "w_qb_packed",
         "kp",
         "wp",
         "kw_ld",
@@ -317,6 +320,15 @@ def plain_bytes(key: IxBuild) -> int:
 def unfit(key: IxBuild) -> str:
     """Why a build of ``key`` cannot exist, or ''."""
     limit = MAX_VERIFY_TOKENS if key.qlen == 6 else MAX_TOKENS
+    if key.short_gemm and (
+        not key.replicated
+        or key.world <= 1
+        or key.shape.heads != 32
+        or key.shape.head_dim != 128
+        or key.shape.q_lora not in (1024, 2048)
+        or key.max_ctx > isel.SPLIT_MIN
+    ):
+        return "short GEMM requires replicated 32x128 heads and Q LoRA 1024/2048"
     if not 1 <= key.tokens <= limit:
         return f"{key.tokens} rows: qlen {key.qlen} built for 1 .. {limit}"
     if key.score_blocks not in (BLOCKS, 2 * BLOCKS):
@@ -550,7 +562,7 @@ def stage_iquant(c, bid, tokens):
 @traced
 def iquant_task(c, task, lane):
     """Token task // heads, head task % heads on one wave, 2 dims a lane."""
-    a, sh = c["args"], c["shape"]
+    sh = c["shape"]
     t = task // sh.heads
     h = task % sh.heads
     at = t * sh.qrows + h * sh.head_dim + 2 * lane
@@ -560,6 +572,14 @@ def iquant_task(c, task, lane):
         )
     )
     x0, x1 = bf2_f32(qw)
+    iquant_values(c, task, lane, x0, x1)
+
+
+@traced
+def iquant_values(c, task, lane, x0, x1):
+    a, sh = c["args"], c["shape"]
+    t, h = task // sh.heads, task % sh.heads
+    at = t * sh.qrows + h * sh.head_dim + 2 * lane
     if const_expr(sh.rope_dim):
         x0, x1 = _rope_q(c, t, lane, x0, x1)
     scale = fx.Float32(1.0)
@@ -594,6 +614,124 @@ def iquant_task(c, task, lane):
 
 
 # ---------------------------------------------------------------- kernel
+@traced
+def stage_q_head(c, qr, qr_ld, w_qb):
+    """A CTA projects complete heads, then quantizes them without a global rendezvous."""
+    sh, tid, lane, wave = c["shape"], c["tid"], c["lane"], c["wave"]
+    rows = 32 if c["S"] > 128 else 16
+    head = c["bid"] % sh.heads
+    base = c["bid"] // sh.heads * rows
+    if base < c["S"]:
+        count = fx.min(fx.Int32(rows), c["S"] - base)
+        src = qr + fx.Int64(base) * fx.Int64(qr_ld) * fx.Int64(2)
+        # The last tile repeats its final live row on padded lanes.
+        for chunk in range_constexpr(rows * sh.q_lora // (8 * THREADS)):
+            at = tid + chunk * THREADS
+            token, col = at // (sh.q_lora // 8), at % (sh.q_lora // 8) * 8
+            value = fx.Vector(
+                bo.buffer_load(
+                    rsrc(src),
+                    (fx.min(token, count - 1) * qr_ld + col) // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=0,
+                )
+            )
+            fx.ptr_store(value, c["xl"] + (token * c["xrow"] + col) // 2)
+        gpu.barrier()
+        accumulators = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(rows // 16)]
+
+        def loads(k0):
+            packed = rsrc(w_qb)
+            return [
+                [
+                    fx.Vector(
+                        bo.buffer_load(
+                            packed,
+                            (
+                                (
+                                    (
+                                        head * (sh.q_lora // 32)
+                                        + k0 // 32
+                                        + ch * 4
+                                        + step
+                                    )
+                                    * 8
+                                    + wave
+                                )
+                                * 64
+                                + lane
+                            )
+                            * 4,
+                            vec_width=4,
+                            dtype=T.i32,
+                            cache_modifier=0,
+                        )
+                    )
+                    for step in range(4)
+                ]
+                for ch in range(4)
+            ]
+
+        pending = loads(0)
+        for slab in range_constexpr(sh.q_lora // 512):
+            operands = pending
+            if const_expr(slab + 1 < sh.q_lora // 512):
+                pending = loads((slab + 1) * 512)
+            for tile in range_constexpr(rows // 16):
+                acc = accumulators[tile]
+                for ch in range_constexpr(4):
+                    for step in range_constexpr(4):
+                        kk = slab * 512 + ch * 128 + step * 32 + lane // 16 * 8
+                        xb = fx.Vector(
+                            fx.ptr_load(
+                                c["xl"]
+                                + ((tile * 16 + lane % 16) * c["xrow"] + kk) // 2,
+                                result_type=fx.Vector.make_type(4, fx.Int32),
+                            )
+                        )
+                        acc = gemv.mfma_bf16(
+                            operands[ch][step].bitcast(fx.BFloat16),
+                            xb.bitcast(fx.BFloat16),
+                            acc,
+                        )
+                accumulators[tile] = acc
+        local = fx.recast_iter(fx.Int32, c["red"])
+        for tile in range_constexpr(rows // 16):
+            token = tile * 16 + lane % 16
+            for pair in range_constexpr(2):
+                value = (
+                    fx.Vector.from_elements(
+                        [
+                            accumulators[tile][2 * pair],
+                            accumulators[tile][2 * pair + 1],
+                        ],
+                        fx.Float32,
+                    )
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32)[0]
+                )
+                dim = wave * 16 + lane // 16 * 4 + 2 * pair
+                fx.ptr_store(value, local + (token * 128 + dim) // 2)
+                if token < count:
+                    bo.buffer_store(
+                        value,
+                        rsrc(c["iqb"]),
+                        ((base + token) * sh.qrows + head * 128 + dim) // 2,
+                        cache_modifier=CM_DEV,
+                    )
+        gpu.barrier()
+        for turn in range_constexpr(rows // WAVES):
+            token = wave + turn * WAVES
+            task = (base + token) * sh.heads + head
+            if token < count:
+                packed = fx.ptr_load(local + (token * 128 + 2 * lane) // 2)
+                x0, x1 = bf2_f32(packed)
+                iquant_values(c, task, lane, x0, x1)
+        flag_task = (base + tid) * sh.heads + head
+        publish(c["put"], c["qq"], flag_task, fx.Int32(1), tid < count)
+
+
 _BUILDS: dict = {}
 
 
@@ -626,11 +764,18 @@ def build(key: IxBuild):
         and (key.own_rows or key.world == 1)
     )
 
+    tuned_score = (
+        key.short_gemm and key.short_owned_verify and key.qlen == 6 and s >= 48
+    )
+    tiled_q = tuned_score and s >= 96
+
     @fx.struct
     class Smem:
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
-        # one 16-row group of the q latent at a time (``stage_qgemv``)
-        xl: fx.Array[fx.Int32, min(s, gemv.ROWS) * xrow // 2, 16]
+        # Tiled short Q uses up to 32 rows, then reuses this storage for MQA.
+        xl: fx.Array[
+            fx.Int32, min(s, 32 if tiled_q and s > 128 else gemv.ROWS) * xrow // 2, 16
+        ]
         hist: fx.Array[fx.Int32, radix.bins, 16]
         # a row's earlier segments' (above, equal) counts (``stage_segment``)
         if not reuse_q_scratch:
@@ -646,7 +791,7 @@ def build(key: IxBuild):
         plan: fx.Array[fx.Int32, isel.PLAN_FIRSTS + 2 * s, 16]
         # a score task's rows 1 .. rg - 1's queries and head weights
         # (``select._rows_loads``)
-        if isel.piece_rows(key.qlen) > 1:
+        if isel.piece_rows(key.qlen) > 1 and not tiled_q:
             qrows: fx.Array[
                 fx.Int32, (isel.piece_rows(key.qlen) - 1) * isel.qrow_words(sh), 16
             ]
@@ -661,6 +806,7 @@ def build(key: IxBuild):
         qr: Int64,
         qr_ld: Int32,
         w_qb: Int64,
+        w_qb_packed: Int64,
         kp: Int64,
         wp: Int64,
         kw_ld: Int32,
@@ -704,6 +850,8 @@ def build(key: IxBuild):
             "split_q": split_q,
             "short_owned_verify": key.short_owned_verify,
             "local_short": key.short_owned_verify,
+            "fast_short": tuned_score
+            or (key.short_gemm and key.qlen == 6 and s == key.qlen),
             "short_score": key.short_owned_verify and s == key.qlen,
             "max_ctx": key.max_ctx,
             "radix": radix,
@@ -744,7 +892,11 @@ def build(key: IxBuild):
             "scan": lds.scan.ptr,
             "rows": lds.rows.ptr,
             "plan": lds.plan.ptr,
-            "qrows": lds.qrows.ptr if isel.piece_rows(key.qlen) > 1 else None,
+            "qrows": (
+                lds.xl.ptr
+                if tiled_q
+                else (lds.qrows.ptr if isel.piece_rows(key.qlen) > 1 else None)
+            ),
             # the indexer's regions start ``peer_off`` into every rank's buffer
             "phist": [preg(b + peer_off, hist_at, "hist") for b in bases],
             "phist_own": preg(own + peer_off, hist_at, "hist"),
@@ -805,14 +957,11 @@ def build(key: IxBuild):
             # wq_b's rows in flight first; the per-token stage runs under them
             qgroup = bid % BLOCKS if const_expr(split_q) else bid
             qbase = bid // BLOCKS * (s // 2) if const_expr(split_q) else fx.Int32(0)
-            ops = gemv.loads(c["lane"], c["wave"], w_qb, qgroup * gemv.ROWS, sh.q_lora)
-            if bid < s:
-                stage_k(c, bid)
 
             # the token rows 16 at a time against the same wq_b rows; a group's
             # chunks all issued before any is stored, the next group's issued
             # before this one's MFMAs
-            def project(base, count):
+            def project(base, count, ops):
                 groups = [
                     (t0, min(gemv.ROWS, count - t0))
                     for t0 in range(0, count, gemv.ROWS)
@@ -830,10 +979,32 @@ def build(key: IxBuild):
                         xs = group_loads(*groups[i + 1])
                     stage_qgemv(c, qgroup, ops, base + t0, sg)
 
-            project(qbase, s // 2 if split_q else s)
-            publish(c["put"], c["qrdy"], bid, fx.Int32(1), tid == 0)
-            stamp(on, tls, tid, 1)
-            stage_iquant(c, bid, s)
+            if const_expr(tiled_q):
+                if isel.short_verify_step(c):
+                    if bid < s:
+                        stage_k(c, bid)
+                    stage_q_head(c, qr, qr_ld, w_qb_packed)
+                    stamp(on, tls, tid, 1)
+                else:
+                    ops = gemv.loads(
+                        c["lane"], c["wave"], w_qb, qgroup * gemv.ROWS, sh.q_lora
+                    )
+                    if bid < s:
+                        stage_k(c, bid)
+                    project(qbase, s, ops)
+                    publish(c["put"], c["qrdy"], bid, fx.Int32(1), tid == 0)
+                    stamp(on, tls, tid, 1)
+                    stage_iquant(c, bid, s)
+            else:
+                ops = gemv.loads(
+                    c["lane"], c["wave"], w_qb, qgroup * gemv.ROWS, sh.q_lora
+                )
+                if bid < s:
+                    stage_k(c, bid)
+                project(qbase, s // 2 if split_q else s, ops)
+                publish(c["put"], c["qrdy"], bid, fx.Int32(1), tid == 0)
+                stamp(on, tls, tid, 1)
+                stage_iquant(c, bid, s)
         else:
             if bid < s:
                 stage_k(c, bid)
@@ -843,10 +1014,35 @@ def build(key: IxBuild):
         else:
             if const_expr(key.short_owned_verify and s == key.qlen):
                 if isel.short_verify_step(c):
-                    narrow = {**c, "rg": 2, "ppr": key.qlen // 2}
+                    narrow = {
+                        **c,
+                        "rg": 2,
+                        "ppr": key.qlen // 2,
+                        "wide_fp8": key.short_gemm and key.qlen == 6,
+                    }
                     for task in range(bid, total, BLOCKS):
                         q, t = isel.locate_score(narrow, task)
                         isel.stage_score(narrow, q, t, fx.Int32(1), 1)
+                else:
+                    for task in range(bid, total, BLOCKS):
+                        q, t = isel.locate_score(c, task)
+                        isel.score_task(c, q, t, lg)
+            elif const_expr(tuned_score):
+                if isel.short_verify_step(c):
+                    requests = s // key.qlen
+                    per = BLOCKS // requests
+                    width = -(-isel.SHORT_VERIFY_CTX // (isel.SCORE_KEYS * per))
+                    p, part = bid % requests, bid // requests
+                    units = isel.score_units(c, p)
+                    u0 = part * width
+                    if (part < per) & (u0 < units):
+                        isel.stage_score(
+                            {**c, "wide_fp8": True},
+                            p,
+                            u0,
+                            fx.min(units - u0, fx.Int32(width)),
+                            width,
+                        )
                 else:
                     for task in range(bid, total, BLOCKS):
                         q, t = isel.locate_score(c, task)
@@ -896,6 +1092,7 @@ def build(key: IxBuild):
         qr: Int64,
         qr_ld: Int32,
         w_qb: Int64,
+        w_qb_packed: Int64,
         kp: Int64,
         wp: Int64,
         kw_ld: Int32,
@@ -930,6 +1127,7 @@ def build(key: IxBuild):
             qr,
             qr_ld,
             w_qb,
+            w_qb_packed,
             kp,
             wp,
             kw_ld,

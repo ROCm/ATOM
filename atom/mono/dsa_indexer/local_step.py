@@ -14,6 +14,7 @@ from flydsl.expr import gpu, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.mono.device.ops import CM_DEV, CM_SYS, ballot, load_ptr64, rsrc
+from atom.mono.dsa_indexer.kernel import scratch_layout
 from atom.mono.plan.execution import BLOCKS, THREADS
 from atom.mono.runtime.step_begin import (
     ARRIVED,
@@ -29,7 +30,7 @@ _STREAM = fx.Stream(None)
 
 
 @cache
-def build(rows, qlen, world, debug=False):
+def build(rows, qlen, world, debug=False, compact=()):
     assert rows <= (256 if qlen == 6 else 64) and rows % qlen == 0 and qlen in (6, 8)
 
     @flyc.kernel(
@@ -48,20 +49,14 @@ def build(rows, qlen, world, debug=False):
     ):
         tid, bid = fx.thread_idx.x, fx.block_idx.x
         lane = tid % 64
-        large = fx.Boolean(False)
-        for tile in fx.range_constexpr(-(-rows // 64)):
-            row = fx.min(lane + 64 * tile, fx.Int32(rows - 1))
-            request = fx.Int32(
-                bo.buffer_load(rsrc(bids), row, vec_width=1, dtype=T.i32)
+        row = fx.min(lane, fx.Int32(rows // qlen - 1)) * qlen
+        request = fx.Int32(bo.buffer_load(rsrc(bids), row, vec_width=1, dtype=T.i32))
+        length = fx.Int32(
+            bo.buffer_load(
+                rsrc(ctx), fx.max(request, fx.Int32(0)), vec_width=1, dtype=T.i32
             )
-            length = fx.Int32(
-                bo.buffer_load(
-                    rsrc(ctx), fx.max(request, fx.Int32(0)), vec_width=1, dtype=T.i32
-                )
-            )
-            large = large | (
-                (lane + 64 * tile < rows) & (request >= 0) & (length > 8192)
-            )
+        )
+        large = (lane < rows // qlen) & (request >= 0) & (length > 8192)
         local = ballot(large) == 0
         first, stride = bid * THREADS + tid, BLOCKS * THREADS
         if ~local:
@@ -79,7 +74,23 @@ def build(rows, qlen, world, debug=False):
             if (bid == 0) & (tid < 64):
                 _wait_arrived(state, epoch)
                 _fence(peers, peer_size, rank, state, epoch, world, debug)
-        _zero(scratch, size, first, stride)
+        if local:
+            prefix, flag_stride, suffix, total = compact
+            _zero(scratch, fx.Int64(prefix), first, stride)
+            _zero(scratch + fx.Int64(suffix), fx.Int64(total - suffix), first, stride)
+            # Only the first 64 units of a short row can be polled.
+            short_flags = min(64, flag_stride // 8)
+            for i in range(first, rows * short_flags, stride):
+                flag_row, chunk = i // short_flags, i % short_flags
+                at = prefix + flag_row * flag_stride + chunk * 8
+                bo.buffer_store(
+                    fx.Vector.filled(2, 0, fx.Int32),
+                    rsrc(scratch),
+                    at // 4,
+                    cache_modifier=CM_DEV,
+                )
+        else:
+            _zero(scratch, size, first, stride)
 
     @flyc.jit
     def launch(
@@ -106,8 +117,16 @@ def begin(runner, rows, qlen):
         runner.mailboxes.begin_step()
         return
     md = get_forward_context().attn_metadata
+    layout = scratch_layout(key)
+    start, size = layout["sflag"]
+    compact = (
+        start,
+        size // rows,
+        start + size,
+        max(o + n for o, n in layout.values()),
+    )
     _run_compiled(
-        build(rows, qlen, key.world, runner.mailboxes._debug),
+        build(rows, qlen, key.world, runner.mailboxes._debug, compact),
         runner.scratch.data_ptr(),
         runner.scratch.nbytes,
         runner.peers.addresses.data_ptr(),

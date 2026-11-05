@@ -52,6 +52,7 @@ class IndexerBinding:
     # the other kernels' (``kernel.peer_layout``), a launch argument
     peer_offset: int = 0
     dual_score: bool = False
+    short_gemm: bool = False
 
     def key(self, rows: int, qlen: int = 1) -> kix.IxBuild:
         dual = (
@@ -70,6 +71,7 @@ class IndexerBinding:
             self.replicated,
             qlen=qlen,
             score_blocks=512 if dual else 256,
+            short_gemm=self.short_gemm,
         )
 
     def serves(self, rows: int, qlen: int, ilog) -> bool:
@@ -230,8 +232,36 @@ def bind_indexers(inner, tp: int, rank: int) -> IndexerBinding | None:
         and device.type == "cuda"
     ):
         dual = kix.dual_score_device(device)
+    short_gemm = (
+        replicated
+        and tp > 1
+        and cfg.max_model_len <= kix.isel.SPLIT_MIN
+        and shape.heads == 32
+        and shape.head_dim == 128
+        and shape.q_lora in (1024, 2048)
+        and kix.dual_score_device(device)
+    )
+    if short_gemm:
+        for module in indexers.values():
+            weight = module.wq_b.weight.detach()
+            module._mono_indexer_wq_packed = pack_short_q(weight)
     return IndexerBinding(
-        indexers, shape, tp, cfg.max_model_len, replicated, dual_score=dual
+        indexers,
+        shape,
+        tp,
+        cfg.max_model_len,
+        replicated,
+        dual_score=dual,
+        short_gemm=short_gemm,
+    )
+
+
+def pack_short_q(weight: torch.Tensor) -> torch.Tensor:
+    """Reorder BF16 operands once; preserve checkpoint values and the native weight."""
+    return (
+        weight.view(-1, 8, 16, weight.shape[1] // 32, 4, 8)
+        .permute(0, 3, 1, 4, 2, 5)
+        .contiguous()
     )
 
 
@@ -413,6 +443,7 @@ def launch_args(
                 "cs_ld": cos.stride(0), "maxpos": cos.size(0)}  # fmt: skip
     return kix.ABI.pack({
         "qr": p(qr), "qr_ld": qr.stride(0), "w_qb": p(module.wq_b.weight),
+        "w_qb_packed": p(module._mono_indexer_wq_packed) if hasattr(module, "_mono_indexer_wq_packed") else 0,
         "kp": p(k), "wp": p(weights), "kw_ld": k.stride(0),
         "kn_w": p(module.k_norm.weight), "kn_b": p(module.k_norm.bias),
         "slots": p(md.slot_mapping), **rope, "cache": p(module.k_cache.kv_cache[0]),
