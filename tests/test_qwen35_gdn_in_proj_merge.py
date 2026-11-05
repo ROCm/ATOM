@@ -16,7 +16,7 @@ import torch
 
 from atom import quant_spec
 from atom.config import QuantizationConfig
-from atom.models.qwen3_5_gdn_in_proj import (
+from atom.models.qwen3_5 import (
     _QWEN3_5_PACKED_MODULES_MAPPING,
     _apply_merged_in_proj_mapping,
     gdn_in_proj_is_merged,
