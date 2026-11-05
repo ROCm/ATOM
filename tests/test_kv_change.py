@@ -22,9 +22,17 @@ with stubbed_aiter():
     from atom.model_engine.engine_core import EngineCore
     from atom.model_engine.pp_engine_core import PPEngineCoreProc
 from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
-from atom.model_engine.collective_rpc import RpcResponseRouter, RpcResult
+from atom.model_engine.collective_rpc import (
+    DISCARD_WEIGHT_SYNC_CMD,
+    RpcResponseRouter,
+    RpcResult,
+)
 from atom.model_engine.engine_core_mgr import CoreManager
-from atom.model_engine.engine_utility import EngineUtilityHandler, kv_change
+from atom.model_engine.engine_utility import (
+    RECEIVE_WEIGHTS_RDMA_CMD,
+    EngineUtilityHandler,
+    kv_change,
+)
 from atom.model_engine.scheduler import (
     DecodeScheduler,
     PrefillScheduler,
@@ -302,10 +310,20 @@ def test_a_weight_change_is_refused_with_an_offload_tier_a_kv_change_is_not():
 
 
 class _Runners:
-    """The TP ranks of one engine, each applying whatever it is sent."""
+    """The TP ranks of one engine, each applying whatever it is sent, and
+    reporting *unavailable* when asked what it supports."""
+
+    def __init__(self, unavailable=None):
+        self.unavailable = unavailable or {}
+        self.calls = []
 
     def utility_rpc(self, method, payload, timeout=300.0):
-        return [RpcResult(payload.request_id, 0, value=1)]
+        if method == "get_worker_capabilities":
+            value = {"unavailable": self.unavailable}
+        else:
+            self.calls.append((method, payload))
+            value = 1
+        return [RpcResult(payload.request_id, 0, value=value)]
 
 
 def _manager(engine_count):
@@ -320,15 +338,16 @@ def _manager(engine_count):
     return mgr
 
 
-def _wired(schedulers):
+def _wired(schedulers, runners=None):
     """A CoreManager whose DP engines are real utility handlers over
     *schedulers*, each control message delivered and answered in order."""
     mgr = _manager(len(schedulers))
     engines = [_engine(sched) for sched in schedulers]
     outs = [queue.Queue() for _ in schedulers]
+    runners = runners or [_Runners() for _ in schedulers]
     handlers = [
-        EngineUtilityHandler(_Runners(), out, label=f"dp{i}", scheduler=sched)
-        for i, (out, sched) in enumerate(zip(outs, schedulers))
+        EngineUtilityHandler(runner, out, label=f"dp{i}", scheduler=sched)
+        for i, (runner, out, sched) in enumerate(zip(runners, outs, schedulers))
     ]
 
     def send(dp_rank, payload, copy=False):
@@ -380,6 +399,42 @@ def test_a_peer_that_wrote_stays_fenced_until_the_next_sync(monkeypatch):
     _update(mgr)
 
     assert not any(e._weight_sync_fenced for e in (refused, wrote))
+
+
+def test_a_sync_the_runners_cannot_reload_is_refused_before_it_writes():
+    """The engine asks its runners first, so a model they cannot rewrite in
+    place is refused with nothing preempted or written, and no engine is
+    fenced for it."""
+    reason = "the model attends through MLA"
+    schedulers = [_running(2)[0], _running(2)[0]]
+    runners = [_Runners({"weight_reload": reason}) for _ in schedulers]
+    mgr, engines = _wired(schedulers, runners)
+
+    with pytest.raises(RuntimeError, match=reason):
+        _update(mgr)
+
+    assert not any(e._weight_sync_fenced or e._rl_weights_inconsistent for e in engines)
+    assert all(len(sched.running) == 2 for sched in schedulers)
+    assert [cmd for r in runners for cmd, _ in r.calls] == [DISCARD_WEIGHT_SYNC_CMD] * 2
+
+
+def test_a_weight_stream_the_runners_cannot_take_is_drained_and_fences_nothing():
+    """The trainer broadcasts regardless, so the runners still take the
+    stream in, told to discard it; the engine keeps serving what it holds."""
+    reason = "pipeline_parallel_size=2"
+    runner = _Runners({"rdma_weight_receive": reason})
+    mgr, (engine,) = _wired([_running(2)[0]], [runner])
+
+    with pytest.raises(RuntimeError, match=reason):
+        mgr.broadcast_utility_command_sync(
+            RECEIVE_WEIGHTS_RDMA_CMD, timeout=5, group_name="g", version=3
+        )
+
+    assert not (engine._weight_sync_fenced or engine._rl_weights_inconsistent)
+    assert len(engine.scheduler.running) == 2
+    (drain, drained), (discard, _) = runner.calls
+    assert (drain, drained.kwargs) == (RECEIVE_WEIGHTS_RDMA_CMD, {"refusal": reason})
+    assert discard == DISCARD_WEIGHT_SYNC_CMD
 
 
 # ── a pipeline: the head and a later stage running its own loop ────────────

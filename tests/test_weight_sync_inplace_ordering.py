@@ -59,6 +59,7 @@ def _updater(model=None, world_size=1):
             pass
 
     updater = _Updater()
+    updater._init_weight_updater()
     updater.world_size = world_size
     updater.model = model if model is not None else nn.Module()
     return updater
@@ -272,7 +273,7 @@ def test_expert_relayout_waits_first(monkeypatch):
         lambda *a, **k: order.append("shuffle"),
         raising=True,
     )
-    updater._pending_expert_relayout[(model.mlp.experts, "w13_weight")] = {
+    updater._expert_relayout_pending[(model.mlp.experts, "w13_weight")] = {
         0: {"w1", "w3"}
     }
 

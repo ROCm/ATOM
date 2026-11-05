@@ -36,21 +36,12 @@ COLLECTIVE_RPC_METHODS = frozenset(
         # Request admission; compilation only, no GPU work or collectives.
         "prepare_structured_output",
         "release_structured_requests",
-        # the trainer's RDMA weight stream (RDMAWeightReceiverMixin); the
-        # transaction steps it drives inside one call stay closed
-        "get_rdma_capabilities",
+        # Joining and leaving the trainer's RDMA weight group; the stream it
+        # carries is the receive_weights_rdma utility command.
         "init_rdma_weight_group",
-        "receive_weights_rdma",
         "destroy_rdma_weight_group",
-        # the reload fence, read-only
-        "get_weight_update_status",
     }
 )
-
-# Those of COLLECTIVE_RPC_METHODS that rewrite weights in place. They run as
-# collective RPCs, not as the weight-update commands that own the engine's
-# serving fence, so EngineUtilityHandler settles that fence on their outcome.
-WEIGHT_WRITING_RPC_METHODS = frozenset({"receive_weights_rdma"})
 
 # These methods have an EngineUtilityHandler command that owns engine state
 # around the worker call. Driving the worker method directly would bypass that
@@ -60,6 +51,7 @@ UTILITY_MANAGED_RUNNER_METHODS = frozenset(
         "update_weights",
         "update_weights_from_shm",
         "update_weights_from_ipc",
+        "receive_weights_rdma",
         DISCARD_WEIGHT_SYNC_CMD,
         "release_memory",
         "resume_memory",
