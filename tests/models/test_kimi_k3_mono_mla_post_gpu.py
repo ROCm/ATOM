@@ -176,6 +176,43 @@ def test_preshuffle_matches_aiter():
     )
 
 
+def _run_stage(s, olat, w_v, w_v_s, x, xs, w_g, ws):
+    """The stage alone on these inputs: its ``core``, after checking every task
+    published its pair with this launch's tag."""
+    w_g_shuf = pl.shuffle16(w_g.view(torch.uint8)).contiguous()
+    core = torch.full((s, pl.PROJ), float("nan"), device="cuda").to(torch.bfloat16)
+    scratch = torch.zeros(pl.PT * 8, dtype=torch.uint8, device="cuda")
+    p = torch.Tensor.data_ptr
+    _run_compiled(
+        _build(s), p(olat), olat.stride(0), p(w_v), p(w_v_s), p(x), p(xs),
+        p(w_g_shuf), p(ws), p(core), p(scratch), 1, torch.cuda.current_stream(),
+    )  # fmt: skip
+    torch.cuda.synchronize()
+    pairs = scratch.view(torch.int32).view(pl.PT, 2)
+    assert torch.equal(pairs[:, 1].cpu(), torch.full((pl.PT,), 2, dtype=torch.int32))
+    return core
+
+
+@pytest.mark.parametrize("s", [1, 16])
+def test_post_stage_ignores_nan_latent_columns(s):
+    """The MLA decode can return whole NaN latent columns (seen on live traffic
+    once KV blocks are recycled). The production v-up's quant ignores a NaN in
+    its amax and clamp, so its output stays finite; the stage must do the same,
+    or one NaN column makes every group's scale, hence the whole core, NaN."""
+    inputs = _inputs(s, seed=3)
+    olat = inputs[0]
+    olat[:, :, 7] = float("nan")
+    olat[:, :, 300] = float("nan")
+    core = _run_stage(s, *inputs)
+    _, _, ref = _reference(*inputs)
+    assert not ref.isnan().any(), "the production tail no longer absorbs NaN columns"
+    assert not core.isnan().any(), f"{int(core.isnan().sum())} NaN values in core"
+    d = _ulps(core, ref)
+    diff = (core.float() - ref.float()).abs()
+    bad = (d > 4) & (diff > ref.float().abs().max() * 2**-8)
+    assert not bad.any(), f"{int(bad.sum())} values off: {diff[bad][:8].tolist()}"
+
+
 @pytest.mark.parametrize("s", [1, 4, 16])
 def test_post_stage_matches_the_production_tail(s):
     olat, w_v, w_v_s, x, xs, w_g, ws = _inputs(s)
