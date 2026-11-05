@@ -220,33 +220,31 @@ class TestALayerMajorArenaCannotFillSomeoneElsesBuffer:
 
 
 def test_a_layer_major_arena_publishes_one_region_per_field_layer():
-    """Qwen3.8's QSA arena publishes its regions as `MhaKvPool` does: role
-    names and order, at the views, and at the declared offsets."""
+    """Qwen3.8's QSA arena publishes its regions as `MhaKvPool` does: one per
+    (field, layer), in field order, each one layer's run of `entries`."""
     fields = [
-        EntryField("k", 2, (4, 2, 8), torch.bfloat16),
-        EntryField("index_compressed", 2, (1, 1, 4), torch.bfloat16),
+        EntryField("k", 2, (4, 2, 8), torch.bfloat16),  # 128 B a layer
+        EntryField("index_compressed", 2, (1, 1, 4), torch.bfloat16),  # 8 B
     ]
     arena = LayerMajorArena(fields, entries=5, device="cpu")
-    expected = [
-        (view[layer].data_ptr(), view[layer].stride(0) * view.element_size())
-        for field in arena.fields
-        for view in (arena.view(field.name),)
-        for layer in range(field.layers)
-    ]
+    base = arena.buf.data_ptr()
+    # k's entry is 256 B, so index_compressed starts at 256 * 5 entries.
+    expected = [(base, 128), (base + 640, 128), (base + 1280, 8), (base + 1320, 8)]
     regions = arena.region_tensors()
     assert [role for role, _ in regions] == [
-        f"{field.name}.layer_{layer}"
-        for field in arena.fields
-        for layer in range(field.layers)
+        "k.layer_0",
+        "k.layer_1",
+        "index_compressed.layer_0",
+        "index_compressed.layer_1",
     ]
-    assert (
-        [
-            (tensor.data_ptr(), tensor.stride(0) * tensor.element_size())
-            for _, tensor in regions
-        ]
-        == arena.region_layout()
-        == expected
-    )
+    assert [
+        (tensor.data_ptr(), tensor.stride(0) * tensor.element_size())
+        for _, tensor in regions
+    ] == expected
+    assert [tuple(tensor.shape) for _, tensor in regions] == [(5, 4, 2, 8)] * 2 + [
+        (5, 1, 1, 4)
+    ] * 2
+    assert arena.region_layout() == expected
 
 
 class TestMixedDtypes:

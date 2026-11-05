@@ -69,7 +69,6 @@ def test_names_resolve_through_aliases():
 
 
 def test_the_lmcache_tiers_alone_read_page_images(pool_backend):
-    assert KVConnectorFactory.page_image_readers() == ["lmcache_mp", "lmcache_offload"]
     for spelling in ("LMCacheConnectorV1", " LMCache_MP", "LMCacheMPConnector"):
         name = KVConnectorFactory.canonical_name(spelling)
         assert KVConnectorFactory.reads_page_images(name)

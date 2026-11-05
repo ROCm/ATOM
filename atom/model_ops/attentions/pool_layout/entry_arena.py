@@ -530,7 +530,6 @@ class LayerMajorArena:
         self._align = max([_ALIGN] + [f.align for f in self.fields])
         self._offsets = {f.name: start for f, start, _ in field_extents(self.fields)}
         self._by_name = {f.name: f for f in self.fields}
-        self._regions: list[tuple[str, torch.Tensor]] | None = None
 
         want = self.entry_bytes * entries
         if buf is None:
@@ -605,13 +604,10 @@ class LayerMajorArena:
         return regions
 
     def region_tensors(self) -> list[tuple[str, torch.Tensor]]:
-        """One `(role, view(name)[layer])` per (field, layer), in field order.
-        Built once: the buffer never moves."""
-        if self._regions is None:
-            self._regions = [
-                (f"{field.name}.layer_{layer}", view[layer])
-                for field in self.fields
-                for view in (self.view(field.name),)
-                for layer in range(field.layers)
-            ]
-        return list(self._regions)
+        """One `(role, view(name)[layer])` per (field, layer), in field order."""
+        return [
+            (f"{field.name}.layer_{layer}", view[layer])
+            for field in self.fields
+            for view in (self.view(field.name),)
+            for layer in range(field.layers)
+        ]

@@ -290,9 +290,10 @@ class MhaKvPool:
         V) makes that worth having.
         """
         return [
-            (f"{name}.layer_{layer}", view[layer])
-            for name, view in self._views.items()
-            for layer in range(len(view))
+            region
+            for arena in (self.cache, self.scale, self.extra)
+            if arena is not None
+            for region in arena.region_tensors()
         ]
 
     def region_layout(self) -> list[tuple[int, int]]:

@@ -186,12 +186,6 @@ class KVConnectorFactory:
         return cls._reads_page_images.get(name, False)
 
     @classmethod
-    def page_image_readers(cls) -> list[str]:
-        """Every registered backend that carries PAGE checkpoint images."""
-
-        return sorted(name for name, reads in cls._reads_page_images.items() if reads)
-
-    @classmethod
     def connector_name(cls, kv_transfer_config: dict[str, Any] | None) -> str | None:
         """Canonical name of the configured connector; None without a transfer config."""
 

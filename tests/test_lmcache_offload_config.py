@@ -218,9 +218,6 @@ def test_gdn_page_namespace_names_ordinary_mha_pages(model_type):
 
 
 def _qwen38_config(*, image_input: bool):
-    # Its namespace reads the QSA field rules in `qwen4_exp_attn`, which
-    # imports AITER.
-    pytest.importorskip("aiter")
     config = _config()
     config.hf_config.compress_ratios = None
     config.hf_config.model_type = "qwen4_exp"

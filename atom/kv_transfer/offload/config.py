@@ -23,6 +23,10 @@ from typing import Any
 
 import torch
 
+from atom.model_ops.qwen4_exp.qsa_cache_rules import qsa_page_segments
+from atom.utils import get_hf_text_config
+from atom.utils.selector import Family, attn_family
+
 # Version 3 adds the effective index-cache dtype to the PAGE identity. FP4 and
 # FP8 DSV4 indexers have different region counts and byte layouts, so they must
 # never reuse one another's objects even when the HF model config is identical.
@@ -385,12 +389,7 @@ def build_page_namespace(
             getattr(config, "speculative_config", None)
         ),
     }
-    from atom.utils import get_hf_text_config
-    from atom.utils.selector import Family, attn_family
-
     if attn_family(get_hf_text_config(hf)) is Family.QSA_GDN:
-        from atom.model_ops.attentions.qwen4_exp_attn import qsa_page_segments
-
         document.update(qsa_page_segments(config))
     canonical = json.dumps(
         document,

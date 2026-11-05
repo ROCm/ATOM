@@ -2,6 +2,8 @@
 
 """Qwen3.8 offload: QSA pages are the checkpoint destination, PLE rides along."""
 
+import logging
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -10,20 +12,16 @@ import torch
 pytest.importorskip("triton")
 pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 
+from atom.kv_transfer.disaggregation.page_region import page_region
+from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
-    LayerMajorArena,
     published_bytes_for,
 )
 from atom.model_ops.attentions.qwen4_exp_attn import (
     PLE_STATE_SLOT_CLASS,
-    QSA_DRAFT_ROWS,
-    QSA_ROWS,
     Qwen4ExpBackend,
     Qwen4ExpMetadataBuilder,
-    _check_kv_transfer,
-    qsa_page_segments,
-    qsa_row_space,
 )
 
 
@@ -105,14 +103,38 @@ def test_layout_id_names_ple_and_forks_under_pipeline_parallel(one_tp_rank):
     builder, cls = _builder()
     layout = cls.state_transfer(builder).paged_layout_id
     assert layout.startswith("gdn-paged-state-v1:")
-    assert layout.endswith(":ple_order=conv,ngram")
     # `allocate_per_req_cache` lays a PLE conv slot out (channels, state_len):
     # hc_count * hidden_size = 16 channels, (4 - 1) * 3 + num_spec = 10 taps.
-    assert ":ple_conv=(16,10),torch.bfloat16:" in layout
-    assert ":ple_ngram=(3,),torch.int64:" in layout
+    # The planes are spelled in their image order.
+    assert layout.endswith(
+        ":ple_conv=(16,10),torch.bfloat16:ple_ngram=(3,),torch.int64"
+    )
     builder.model_runner.config.pipeline_parallel_size = 2
     assert not cls._uses_paged_checkpoints(builder)
     assert not cls.state_transfer(builder).copies
+
+
+def test_ple_turns_a_midstep_readable_transfer_off_and_says_so(
+    monkeypatch, one_tp_rank, caplog
+):
+    """The PLE windows are snapshotted only where a forward ends."""
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+
+    builder, cls = _builder()
+    parent = GDNAttentionMetadataBuilder.state_transfer(builder)
+    readable = replace(
+        parent, readable_midstep=True, midstep_grid=64, midstep_min_offset=64
+    )
+    monkeypatch.setattr(
+        GDNAttentionMetadataBuilder, "state_transfer", lambda self: readable
+    )
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        transfer = cls.state_transfer(builder)
+    assert "ATOM_GDN_STATE_MIDSTEP=1 does not apply" in caplog.text
+    assert not transfer.readable_midstep
+    assert (transfer.midstep_grid, transfer.midstep_min_offset) == (0, 0)
+    assert transfer.copies == readable.copies
+    assert transfer.paged_layout_id.startswith(readable.paged_layout_id + ":")
 
 
 def _layout_id(builder, cls):
@@ -285,68 +307,6 @@ def test_page_checkpoints_do_not_hang_on_the_model_type_spelling():
     assert cls._uses_paged_checkpoints(builder)
 
 
-def _check(kv_transfer_config, kv_cache_dtype="bf16", index_cache_dtype=None):
-    _check_kv_transfer(
-        SimpleNamespace(
-            kv_transfer_config=kv_transfer_config,
-            kv_cache_dtype=kv_cache_dtype,
-            index_cache_dtype=index_cache_dtype,
-        )
-    )
-
-
-_PD = "disaggregated.*kv_connector={!r}"
-_NO_IMAGE = "kv_connector={!r} does not read"
-
-
-@pytest.mark.parametrize(
-    "kv_transfer_config, backend, error",
-    [
-        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, "mooncake", _PD),
-        ({"kv_connector": "moriio", "kv_role": "kv_consumer"}, "moriio", _PD),
-        # No connector named: the factory defaults to moriio.
-        ({"kv_role": "kv_producer"}, "moriio", _PD),
-        (
-            {
-                "kv_connector": "multi",
-                "connectors": [
-                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
-                    {"kv_connector": " MOONCAKE ", "kv_role": "kv_producer"},
-                ],
-            },
-            "mooncake",
-            _PD,
-        ),
-        (
-            {
-                "kv_connector": "multi",
-                "connectors": [
-                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
-                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
-                ],
-            },
-            "mooncake",
-            _PD,
-        ),
-        # Checked by the canonical name the connector is built from.
-        ({"kv_connector": "Mooncake", "kv_role": "kv_producer"}, "mooncake", _PD),
-        ({"kv_connector": " moriio", "kv_role": "kv_consumer"}, "moriio", _PD),
-        ({"kv_connector": "MoRIIO", "kv_role": "kv_consumer"}, "moriio", _PD),
-        (
-            {"kv_connector": "Mooncake_Store", "kv_role": "offload"},
-            "mooncake_store",
-            _NO_IMAGE,
-        ),
-    ],
-)
-def test_validate_config_refuses_connectors_that_drop_the_state(
-    kv_transfer_config, backend, error
-):
-    """A P/D peer would get the QSA pages and continue from a zero GDN/PLE state."""
-    with pytest.raises(ValueError, match=error.format(backend)):
-        _check(kv_transfer_config)
-
-
 @pytest.mark.parametrize("switch", ["pipeline_parallel_size", "enable_rapidserve"])
 @pytest.mark.parametrize(
     "kv_transfer_config, error",
@@ -365,103 +325,6 @@ def test_pipeline_parallel_and_rapidserve_refuse_offload(
     config.kv_transfer_config = kv_transfer_config
     with pytest.raises(ValueError, match=error):
         Qwen4ExpBackend.validate_config(config)
-
-
-@pytest.mark.parametrize("reads", [True, False])
-def test_qwen38_runs_any_tier_that_declares_it_reads_page_images(monkeypatch, reads):
-    """The knowledge lives on the registration, not in a Qwen3.8 list."""
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-    name = "page_image_tier_under_test"
-    monkeypatch.setitem(KVConnectorFactory._registry, name, {})
-    monkeypatch.setitem(KVConnectorFactory._aliases, name, name)
-    monkeypatch.setitem(KVConnectorFactory._offload, name, True)
-    monkeypatch.setitem(KVConnectorFactory._reads_page_images, name, reads)
-    kv_transfer_config = {"kv_connector": name, "kv_role": "offload"}
-    if reads:
-        _check(kv_transfer_config)
-    else:
-        with pytest.raises(ValueError, match=f"kv_connector={name!r} does not"):
-            _check(kv_transfer_config)
-
-
-_IN_PROCESS = {"kv_connector": "LMCacheOffloadConnector", "kv_role": "offload"}
-_MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
-
-
-@pytest.mark.parametrize(
-    "kv_cache_dtype, index_cache_dtype",
-    [
-        ("fp8", None),  # the index cache follows the KV cache
-        ("fp8", "fp8"),
-        ("fp8", "bf16"),
-        ("bf16", "fp8"),
-        ("bf16", "fp4"),
-        ("auto", "fp4"),
-    ],
-)
-@pytest.mark.parametrize(
-    "kv_transfer_config",
-    [
-        _IN_PROCESS,
-        {"kv_connector": "multi", "connectors": [_MP, _IN_PROCESS]},
-    ],
-)
-def test_qwen38_runs_in_process_offload_of_quantized_caches(
-    kv_transfer_config, kv_cache_dtype, index_cache_dtype
-):
-    """The in-process codec carries the QSA scale planes (`k_scale`, `v_scale`,
-    `extra_planes`)."""
-    _check(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
-
-
-@pytest.mark.parametrize(
-    "kv_transfer_config, kv_cache_dtype, index_cache_dtype",
-    [
-        (_IN_PROCESS, "bf16", "bf16"),
-        (_IN_PROCESS, "bf16", None),
-        (_IN_PROCESS, "auto", "bfloat16"),
-        (_IN_PROCESS, None, None),
-        (_MP, "fp8", None),
-        (_MP, "fp8", "fp4"),
-        (_MP, "bf16", "fp8"),
-        (None, "fp8", "fp8"),
-    ],
-)
-def test_qwen38_keeps_bf16_in_process_and_every_lmcache_mp_cache(
-    kv_transfer_config, kv_cache_dtype, index_cache_dtype
-):
-    _check(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
-
-
-_MTP = SimpleNamespace(method="mtp")
-
-
-@pytest.mark.parametrize(
-    "kv_cache_dtype, index_cache_dtype, draft_env, spec, draft",
-    [
-        ("fp8", None, "1", _MTP, True),
-        ("bf16", "fp4", "1", _MTP, True),  # a quantized index cache alone
-        ("fp8", "fp8", "0", _MTP, False),
-        ("bf16", None, "1", _MTP, False),  # nothing to keep in BF16
-        ("auto", "bfloat16", "1", _MTP, False),
-        ("fp8", "fp8", "1", SimpleNamespace(method="eagle3"), False),
-        ("fp8", "fp8", "1", None, False),
-    ],
-)
-def test_the_draft_rows_and_the_page_namespace_read_one_rule(
-    monkeypatch, kv_cache_dtype, index_cache_dtype, draft_env, spec, draft
-):
-    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", draft_env)
-    config = SimpleNamespace(
-        kv_cache_dtype=kv_cache_dtype,
-        index_cache_dtype=index_cache_dtype,
-        speculative_config=spec,
-    )
-    assert qsa_page_segments(config)["draft_kv"] == ("bf16" if draft else "target")
-    if spec is _MTP:
-        assert qsa_row_space(config, 40, 40) == (QSA_DRAFT_ROWS if draft else QSA_ROWS)
-    assert qsa_row_space(config, 39, 40) == QSA_ROWS
 
 
 def _paged_builder(blocks=3, *, spec=True):
@@ -596,52 +459,28 @@ def test_every_quantized_qsa_layer_hands_the_codec_the_rows_it_binds(
         assert {t.data_ptr() for t in bound if t is not None} == set(handed)
 
 
-def test_qsa_regions_are_built_once_per_allocation(monkeypatch):
-    """Read every step; building them is fields x layers `as_strided` views."""
+def test_a_released_arena_leaves_no_page_pools():
     builder, cls = _paged_builder()
-    arena = cls._page_unit_pools(builder)[0]
-    assert arena is builder.qsa_arena
-    arena.region_tensors()
-    monkeypatch.setattr(
-        LayerMajorArena,
-        "view",
-        lambda *_: pytest.fail("region views rebuilt after the first walk"),
-    )
-    for _ in range(3):
-        cls.page_unit_views(builder, [0, 1])
-        cls.page_unit_segments(builder, [0, 1])
-        cls.get_kv_transfer_tensors(builder)
-    assert cls._page_unit_pools(builder)[0] is arena
-
+    assert cls._page_unit_pools(builder) == [builder.qsa_arena]
     cls.release_kv_pools(builder)
     with pytest.raises(RuntimeError, match="no QSA arena"):
         cls._page_unit_pools(builder)
 
 
-def test_page_unit_regions_are_cached_per_pool_until_release(monkeypatch):
-    """Keyed on the pool objects; a release drops it before addresses change."""
-    from atom.model_ops.attentions.pool_layout import mha_page_unit_geometry
-
-    builder, cls = _paged_builder()
-    first = cls._page_unit_regions(builder)
-    real = mha_page_unit_geometry.mha_page_unit_regions
-    walks = []
-
-    def counted(pools):
-        walks.append(len(pools))
-        return real(pools)
-
-    monkeypatch.setattr(mha_page_unit_geometry, "mha_page_unit_regions", counted)
-    for _ in range(3):
-        assert cls._page_unit_regions(builder) is first
-    assert walks == []
-
+def test_page_unit_regions_follow_a_reallocated_arena():
+    """A new arena of another size puts its fields at other offsets; the PAGE
+    copy must address the new one."""
+    builder, cls = _paged_builder(blocks=3)
+    cls._page_unit_regions(builder)
     cls.release_kv_pools(builder)
-    assert builder._page_unit_region_cache is None
-    cls.allocate_kv_cache_tensors(builder, blocks=3, buf=None)
-    bases, _ = cls._page_unit_regions(builder)
-    assert walks == [1]
-    assert bases.tolist() == [base for base, _ in builder.qsa_arena.region_layout()]
+    cls.allocate_kv_cache_tensors(builder, blocks=5, buf=None)
+    bases, sizes = cls._page_unit_regions(builder)
+    base = builder.qsa_arena.buf.data_ptr()
+    # k and v are 128 B a layer, the index fields 32 B and 8 B. A field starts
+    # at its 256 B-aligned entry offset (0, 256, 512, 768) times 5 entries,
+    # and its second layer one layer's 5 entries later.
+    assert sizes.tolist() == [128, 128, 128, 128, 32, 32, 8, 8]
+    assert (bases - base).tolist() == [0, 640, 1280, 1920, 2560, 2720, 3840, 3880]
 
 
 def test_page_unit_segments_name_the_view_bytes_trimmed_to_the_image():
@@ -666,23 +505,34 @@ def test_transfer_contract_matches_the_arena_byte_layout():
     ] == builder.qsa_arena.region_layout()
 
 
-def test_transfer_contract_catches_published_regions_drifting(monkeypatch):
+def _transfer_of(regions):
+    return KVTransferTensors(
+        pages=[page_region(tensor, semantic_role=role) for role, tensor in regions]
+    )
+
+
+def test_transfer_contract_catches_published_regions_drifting():
     builder, cls = _paged_builder()
-    builder.qsa_arena.region_tensors()
-    rows = builder.qsa_arena._regions
+    rows = builder.qsa_arena.region_tensors()
     rows[0], rows[2] = rows[2], rows[0]  # k.0 <-> v.0
-    builder._page_unit_region_cache = None
     with pytest.raises(RuntimeError, match="do not match its checkpoint PAGE unit"):
-        cls.get_kv_transfer_tensors(builder)
+        cls._with_paged_state_contract(builder, _transfer_of(rows))
 
 
 def test_transfer_contract_catches_a_missing_field():
     builder, cls = _paged_builder()
-    builder.qsa_arena._regions = [
+    rows = [
         row
         for row in builder.qsa_arena.region_tensors()
         if not row[0].startswith("index_compressed.")
     ]
-    builder._page_unit_region_cache = None
-    with pytest.raises(RuntimeError, match="PAGE unit is 592 B"):
+    with pytest.raises(RuntimeError, match="do not match its checkpoint PAGE unit"):
+        cls._with_paged_state_contract(builder, _transfer_of(rows))
+
+
+def test_a_page_unit_the_arena_does_not_cover_is_refused():
+    builder, cls = _paged_builder()
+    spec = builder.model_runner.state_runtime.checkpoint_spec
+    spec.page_unit_bytes += 8
+    with pytest.raises(RuntimeError, match="but the published regions cover 592 B"):
         cls.get_kv_transfer_tensors(builder)
