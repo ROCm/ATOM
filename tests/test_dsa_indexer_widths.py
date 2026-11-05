@@ -50,8 +50,12 @@ def test_legacy_replicated_and_uniform_verify_widths_are_unchanged():
 @pytest.mark.parametrize("replicated", [False, True])
 @pytest.mark.parametrize("cache", ["fp8", "fp4"])
 def test_qlen6_admits_complete_requests_through_252(replicated, cache):
-    shape = replace(_key(6).shape, kv_dtype=cache, block_rows=64,
-                    cache_layout="mfma" if cache == "fp4" else "preshuffle")
+    shape = replace(
+        _key(6).shape,
+        kv_dtype=cache,
+        block_rows=64,
+        cache_layout="mfma" if cache == "fp4" else "preshuffle",
+    )
     for rows in range(6, 253, 6):
         assert not unfit(IxBuild(shape, rows, 8, 163840, replicated, qlen=6))
     for rows in (64, 256, 258, 384):
@@ -183,9 +187,11 @@ def _expected_table(contexts, rank, world, replicated=False):
         not own_rows or (ctx > 262144 and 2 * world * ctx > total) for ctx in contexts
     ]
     n = [
-        local_len(max(ctx, 0), rank, world, 128 if replicated else 1)
-        if split[r]
-        else (max(ctx, 0) if r % world == rank else 0)
+        (
+            local_len(max(ctx, 0), rank, world, 128 if replicated else 1)
+            if split[r]
+            else (max(ctx, 0) if r % world == rank else 0)
+        )
         for r, ctx in enumerate(contexts)
     ]
     long = [ctx > 2048 and count > 0 for ctx, count in zip(contexts, n)]
