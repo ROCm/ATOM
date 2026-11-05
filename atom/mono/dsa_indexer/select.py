@@ -348,14 +348,18 @@ def _step_table_wide(c):
             ]
             # The split decision uses every live request, including upper tiles.
             lengths = [
-                ((tid + 64 * tile < s) & ((tid + 64 * tile) % ql == 0)).select(fx.max(ctx, fx.Int32(0)), fx.Int32(0))
+                ((tid + 64 * tile < s) & ((tid + 64 * tile) % ql == 0)).select(
+                    fx.max(ctx, fx.Int32(0)), fx.Int32(0)
+                )
                 for tile, ctx in enumerate(contexts)
             ]
             total = _rows_sum(sum(lengths[1:], lengths[0]), 64)
         short_step = fx.Boolean(False)
         if const_expr(local_short):
             large = [
-                ((tid + 64 * tile < s) & (ctx > SHORT_VERIFY_CTX)).select(fx.Int32(1), fx.Int32(0))
+                ((tid + 64 * tile < s) & (ctx > SHORT_VERIFY_CTX)).select(
+                    fx.Int32(1), fx.Int32(0)
+                )
                 for tile, ctx in enumerate(contexts)
             ]
             short_step = _rows_sum(sum(large[1:], large[0]), 64) == 0
@@ -398,7 +402,9 @@ def _step_table_wide(c):
             tasks = _rows_sum(sum(counts[1:], counts[0]), 64)
             lg = (tasks <= BLOCKS).select(fx.Int32(w), lg)
         counts = [(n + (fx.Int32(1) << lg) - 1) >> lg for n in units]
-        _lay_out_wide(c, _score_firsts(c), counts, PLAN_SCORE_TOTAL, PLAN_SCORE_LG, lg, score=True)
+        _lay_out_wide(
+            c, _score_firsts(c), counts, PLAN_SCORE_TOTAL, PLAN_SCORE_LG, lg, score=True
+        )
 
         total = _rows_sum(sum(chunks[1:], chunks[0]), 64)
         room = BLOCKS - _rows_sum(sum(longs[1:], longs[0]), 64)
@@ -1448,9 +1454,18 @@ def stage_short_selection(c, r, sid, n):
     gt_before, eq_before = (excl >> 16) & 0xFFFF, excl & 0xFFFF
     offset = fx.Int32(0)
     if const_expr(c.get("direct", False)):
-        offset = fx.Int32(bo.buffer_load(rsrc(c["args"]["out_ptr"]), r, vec_width=1, dtype=T.i32))
+        offset = fx.Int32(
+            bo.buffer_load(rsrc(c["args"]["out_ptr"]), r, vec_width=1, dtype=T.i32)
+        )
     _emit_chunk(
-        c, r, slots, gt, eq, offset + gt_before + fx.min(eq_before, take), eq_before, take
+        c,
+        r,
+        slots,
+        gt,
+        eq,
+        offset + gt_before + fx.min(eq_before, take),
+        eq_before,
+        take,
     )
     if const_expr(not c.get("direct", False)):
         _announce_row(c, r, fx.Int32(0), sid, fx.Boolean(True), fx.Int32(sh.topk))

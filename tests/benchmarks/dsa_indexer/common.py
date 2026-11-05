@@ -24,9 +24,17 @@ def sync():
 
 
 def checkpoint_tensors(device):
-    mapping = json.loads((MODEL / "model.safetensors.index.json").read_text())["weight_map"]
+    mapping = json.loads((MODEL / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
     result = {}
-    for suffix in ("wq_b.weight", "k_norm.weight", "k_norm.bias", "wk.weight", "weights_proj.weight"):
+    for suffix in (
+        "wq_b.weight",
+        "k_norm.weight",
+        "k_norm.bias",
+        "wk.weight",
+        "weights_proj.weight",
+    ):
         key = f"{PREFIX}.{suffix}"
         with safe_open(MODEL / mapping[key], framework="pt", device="cpu") as handle:
             result[suffix] = handle.get_tensor(key).to(device)
@@ -41,12 +49,25 @@ def make_cache(blocks, rank, device, row_bytes):
     flat = cache.view(blocks, -1)
     for start in range(0, blocks, 256):
         count = min(256, blocks - start)
-        values = torch.randn(count, PAGE, 128, generator=generator, device=device, dtype=torch.float32)
-        scale = (values.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448).log2().ceil().exp2()
+        values = torch.randn(
+            count, PAGE, 128, generator=generator, device=device, dtype=torch.float32
+        )
+        scale = (
+            (values.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448)
+            .log2()
+            .ceil()
+            .exp2()
+        )
         packed = (values / scale).to(torch.float8_e4m3fn).view(torch.uint8)
-        packed = packed.view(count, PAGE // 16, 16, 8, 16).permute(0, 1, 3, 2, 4).contiguous()
-        flat[start:start + count, :PAGE * 128] = packed.reshape(count, PAGE * 128)
-        flat[start:start + count, PAGE * 128:PAGE * 132] = scale.reshape(count, PAGE).view(torch.uint8)
+        packed = (
+            packed.view(count, PAGE // 16, 16, 8, 16)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+        )
+        flat[start : start + count, : PAGE * 128] = packed.reshape(count, PAGE * 128)
+        flat[start : start + count, PAGE * 128 : PAGE * 132] = scale.reshape(
+            count, PAGE
+        ).view(torch.uint8)
     return cache
 
 
@@ -82,14 +103,19 @@ def time_graph(graph, replays):
 
 def profile_graph(graph, path, replays):
     sync()
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                           torch.profiler.ProfilerActivity.CUDA]) as profiler:
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profiler:
         for _ in range(replays):
             graph.replay()
         torch.cuda.synchronize()
     profiler.export_chrome_trace(str(path))
     with path.open("rb") as source, gzip.open(str(path) + ".gz", "wb") as target:
         import shutil
+
         shutil.copyfileobj(source, target)
     path.unlink()
     sync()
@@ -113,4 +139,9 @@ def quant(x):
 
 
 def scales(s, rows):
-    return s.reshape(-1, rows // 32, 32, 2, 2).permute(0, 4, 2, 3, 1).reshape(-1, 2, 32, rows // 16).contiguous()
+    return (
+        s.reshape(-1, rows // 32, 32, 2, 2)
+        .permute(0, 4, 2, 3, 1)
+        .reshape(-1, 2, 32, rows // 16)
+        .contiguous()
+    )

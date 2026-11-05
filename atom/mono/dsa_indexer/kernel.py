@@ -169,7 +169,9 @@ class IxBuild:
             and self.world > 1
             and self.qlen in (6, 8)
             and 0 < self.max_ctx <= isel.SPLIT_MIN
-            and 0 < self.tokens <= (MAX_VERIFY_TOKENS if self.qlen == 6 else MAX_LEGACY_TOKENS)
+            and 0
+            < self.tokens
+            <= (MAX_VERIFY_TOKENS if self.qlen == 6 else MAX_LEGACY_TOKENS)
             and self.tokens % self.qlen == 0
             and (self.qlen == 6 or self.tokens // self.qlen <= self.world)
         )
@@ -733,9 +735,11 @@ def build(key: IxBuild):
             "xrow": xrow,
             "hist": lds.hist.ptr,
             # Q's final reduction barrier retires red before selection starts.
-            "before": fx.recast_iter(fx.Int32, lds.red.ptr)
-            if reuse_q_scratch
-            else lds.before.ptr,
+            "before": (
+                fx.recast_iter(fx.Int32, lds.red.ptr)
+                if reuse_q_scratch
+                else lds.before.ptr
+            ),
             "sel": lds.sel.ptr,
             "scan": lds.scan.ptr,
             "rows": lds.rows.ptr,
@@ -863,7 +867,9 @@ def build(key: IxBuild):
                     if g == 0:
                         if const_expr(key.short_owned_verify):
                             if isel.short_verify_step(c):
-                                isel.stage_short_selection({**c, "direct": True}, r, bid, n)
+                                isel.stage_short_selection(
+                                    {**c, "direct": True}, r, bid, n
+                                )
                             else:
                                 isel.stage_short_selection(c, r, bid, n)
                         else:

@@ -33,15 +33,28 @@ def planner(key):
         _ = keyed
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(Smem).peek()
-        select.step_table({
-            "S": s, "shape": key.shape, "tid": tid, "lane": tid % 64,
-            "rank": rank, "world": key.world, "inter": key.interleave,
-            "own_rows": key.own_rows, "short_owned_verify": key.short_owned_verify,
-            "local_short": key.short_owned_verify, "short_score": False,
-            "max_ctx": key.max_ctx, "qlen": ql, "rg": ql, "ppr": 1,
-            "args": {"ctx": ctx, "bids": bids},
-            "rows": lds.rows.ptr, "plan": lds.plan.ptr,
-        })
+        select.step_table(
+            {
+                "S": s,
+                "shape": key.shape,
+                "tid": tid,
+                "lane": tid % 64,
+                "rank": rank,
+                "world": key.world,
+                "inter": key.interleave,
+                "own_rows": key.own_rows,
+                "short_owned_verify": key.short_owned_verify,
+                "local_short": key.short_owned_verify,
+                "short_score": False,
+                "max_ctx": key.max_ctx,
+                "qlen": ql,
+                "rg": ql,
+                "ppr": 1,
+                "args": {"ctx": ctx, "bids": bids},
+                "rows": lds.rows.ptr,
+                "plan": lds.plan.ptr,
+            }
+        )
         for i in range(tid, 3 * s, 512):
             bo.buffer_store(fx.ptr_load(lds.rows.ptr + i), rsrc(out), i)
         for i in range(tid, words - 3 * s, 512):
@@ -63,16 +76,26 @@ def expected(key, lengths, rank):
         context = lengths[req] - (key.qlen - 1 - draft)
         split = not key.own_rows
         if key.own_rows:
-            split = lengths[req] > 262144 and 2 * key.world * lengths[req] > sum(lengths)
-        count = local_len(max(context, 0), rank, key.world, key.interleave) if split else (
-            max(context, 0) if req % key.world == rank else 0)
+            split = lengths[req] > 262144 and 2 * key.world * lengths[req] > sum(
+                lengths
+            )
+        count = (
+            local_len(max(context, 0), rank, key.world, key.interleave)
+            if split
+            else (max(context, 0) if req % key.world == rank else 0)
+        )
         if short:
             count, split = max(context, 0), False
         long = context > 2048 and count > 0
         flags = int(long) | (2 * int(split) if key.own_rows else 0) | 4 * int(short)
         rows.append((context, count, flags))
-    units = [(n + 127) // 128 if flags & 1 else 0 for _, n, flags in rows[key.qlen - 1::key.qlen]]
-    lg = next((w for w in range(3) if sum((u + (1 << w) - 1) >> w for u in units) <= 256), 3)
+    units = [
+        (n + 127) // 128 if flags & 1 else 0
+        for _, n, flags in rows[key.qlen - 1 :: key.qlen]
+    ]
+    lg = next(
+        (w for w in range(3) if sum((u + (1 << w) - 1) >> w for u in units) <= 256), 3
+    )
     scores = [(u + (1 << lg) - 1) >> lg for u in units]
     chunks = [(n + 4095) // 4096 if flags & 1 else 0 for _, n, flags in rows]
     room = 256 - sum(bool(flags & 1) for _, _, flags in rows)
@@ -107,26 +130,54 @@ def main():
     assert kix.unfit(replace(base, tokens=72, qlen=8))
     checked = 0
     for replica in (False, True):
-        for batch, qlen in ((11, 6), (16, 6), (22, 6), (32, 6), (40, 6), (42, 6), (256, 1)):
+        for batch, qlen in (
+            (11, 6),
+            (16, 6),
+            (22, 6),
+            (32, 6),
+            (40, 6),
+            (42, 6),
+            (256, 1),
+        ):
             key = replace(base, tokens=batch * qlen, qlen=qlen, replicated=replica)
             launch, words = planner(key)
             ctx = torch.empty(batch, device="cuda", dtype=torch.int32)
-            bids = torch.arange(batch, device="cuda", dtype=torch.int32).repeat_interleave(qlen)
+            bids = torch.arange(
+                batch, device="cuda", dtype=torch.int32
+            ).repeat_interleave(qlen)
             out = torch.empty(words, device="cuda", dtype=torch.int32)
             patterns = [[length] * batch for length in (0, 2048, 8192, 8193, 163840)]
-            patterns += [[8192] * (batch - 1) + [163840],
-                         [[0, 8192, 8193, 163840][r % 4] for r in range(batch)]]
+            patterns += [
+                [8192] * (batch - 1) + [163840],
+                [[0, 8192, 8193, 163840][r % 4] for r in range(batch)],
+            ]
             for lengths in patterns:
                 ctx.copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32))
                 for rank in (0, 3, 7):
                     launch(ctx.data_ptr(), bids.data_ptr(), out.data_ptr(), rank)
                     got = out.cpu().tolist()
                     want = expected(key, lengths, rank)
-                    assert got == want, (replica, batch, qlen, rank, lengths,
-                        [(i, a, b) for i, (a, b) in enumerate(zip(got, want)) if a != b][:12])
+                    assert got == want, (
+                        replica,
+                        batch,
+                        qlen,
+                        rank,
+                        lengths,
+                        [
+                            (i, a, b)
+                            for i, (a, b) in enumerate(zip(got, want))
+                            if a != b
+                        ][:12],
+                    )
                     checked += 1
-            print(f"PLANNER_PASS replica={replica} batch={batch} qlen={qlen}", flush=True)
-    result = {"planner_scenarios": checked, "admission_checks": True, "max_verify_rows": 252}
+            print(
+                f"PLANNER_PASS replica={replica} batch={batch} qlen={qlen}", flush=True
+            )
+    result = {
+        "planner_scenarios": checked,
+        "admission_checks": True,
+        "max_verify_rows": 252,
+    }
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print("PLANNER_DONE", result, flush=True)
 

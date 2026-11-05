@@ -69,9 +69,15 @@ class IndexerRunner:
         )
         if not self.rows:
             raise MonoUnsupported("no step width the kernel serves")
-        verify_limit = min(kix.MAX_VERIFY_TOKENS, get_current_atom_config().max_num_seqs * 6)
+        verify_limit = min(
+            kix.MAX_VERIFY_TOKENS, get_current_atom_config().max_num_seqs * 6
+        )
         self.verify_rows = max(
-            (r for r in range(6, verify_limit + 1, 6) if self.ix.serves(r, 6, self.ilog)),
+            (
+                r
+                for r in range(6, verify_limit + 1, 6)
+                if self.ix.serves(r, 6, self.ilog)
+            ),
             default=0,
         )
         built = max(r for r in range(1, max_rows + 1) if not kix.unfit(self.ix.key(r)))

@@ -128,7 +128,10 @@ def _planner(batch, qlen, world, maximum, short_score=False):
 
     @flyc.jit
     def launch(
-        ctx: Int64, bids: Int64, out: Int64, rank: Int32,
+        ctx: Int64,
+        bids: Int64,
+        out: Int64,
+        rank: Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008 - FlyDSL stream sentinel.
     ):
         planner(ctx, bids, out, rank).launch(grid=(1,), block=(512,), stream=stream)
@@ -199,7 +202,11 @@ def test_runtime_score_plan_keeps_segment_table_disjoint(qlen, batch):
 
     def call():
         _run_compiled(
-            launch, ctx.data_ptr(), bids.data_ptr(), out.data_ptr(), 0,
+            launch,
+            ctx.data_ptr(),
+            bids.data_ptr(),
+            out.data_ptr(),
+            0,
             torch.cuda.current_stream(),
         )
 
@@ -213,8 +220,8 @@ def test_runtime_score_plan_keeps_segment_table_disjoint(qlen, batch):
             ctx.fill_(length)
             graph.replay()
             result = out.cpu().tolist()
-            kinds = [result[3 * r:3 * r + 3] for r in range(rows)]
-            plan = result[3 * rows:]
+            kinds = [result[3 * r : 3 * r + 3] for r in range(rows)]
+            plan = result[3 * rows :]
             group = 2 if length <= 8192 else qlen
             counts = []
             for request in range(batch):
@@ -234,9 +241,7 @@ def test_runtime_score_plan_keeps_segment_table_disjoint(qlen, batch):
             first = 0
             for row, (_, n, flags) in enumerate(kinds):
                 assert plan[select.PLAN_FIRSTS + rows + row] == first
-                chunks = (
-                    (n + select.CHUNK - 1) // select.CHUNK if flags & 1 else 0
-                )
+                chunks = (n + select.CHUNK - 1) // select.CHUNK if flags & 1 else 0
                 lg = plan[select.PLAN_SEG_LG]
                 first += (chunks + (1 << lg) - 1) >> lg
             assert plan[select.PLAN_SEG_TOTAL] == first
