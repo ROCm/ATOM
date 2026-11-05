@@ -167,6 +167,8 @@ def _grid_barrier(scratch, ticket, blocks):
 
 def build_packed_finish(
     plan: Gfx1250KimiBuildPlan,
+    *,
+    gu_interleave: bool = False,
 ) -> K2FinishKernel:
     if plan.architecture is not GFX1250:
         raise ValueError("persistent K2 finish requires gfx1250")
@@ -227,7 +229,10 @@ def build_packed_finish(
         gate_up: GateUpRole
         down: DownRole
 
-    name = f"k3_k2_gfx1250_persistent_finish_s{rows}_b{plan.blocks}"
+    name = (
+        f"k3_k2_gfx1250_persistent_finish_s{rows}_b{plan.blocks}"
+        f"_gu{int(gu_interleave)}"
+    )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(
@@ -557,8 +562,17 @@ def build_packed_finish(
                             + tile * 256 * (ROUTED_INTERMEDIATE // 32) * 4
                         ),
                     }
-                    operands = moe_expert_gfx1250.ug_loads(context, task)
-                    moe_expert_gfx1250.stage_ug(context, task, operands)
+                    operands = moe_expert_gfx1250.ug_loads(
+                        context,
+                        task,
+                        gu_interleave,
+                    )
+                    moe_expert_gfx1250.stage_ug(
+                        context,
+                        task,
+                        operands,
+                        gu_interleave,
+                    )
                 task = task + plan.blocks
         rocdl.s_wait_storecnt(0)
         _grid_barrier(scratch, ticket, plan.blocks)

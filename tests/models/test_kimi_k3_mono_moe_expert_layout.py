@@ -262,6 +262,23 @@ def test_eight_wave_gate_up_preserves_half_accumulation_order():
     ]
 
 
+def test_interleaved_gate_up_reconstructs_logical_column_order():
+    for token in range(16):
+        lower = [
+            column // 2
+            for column in ex.GFX1250_FRAGMENT.output_columns_for_lane(token)
+            if column % 2 == 0
+        ]
+        upper = [
+            column // 2
+            for column in ex.GFX1250_FRAGMENT.output_columns_for_lane(token + 16)
+            if column % 2 == 0
+        ]
+        first_tile = lower[:4] + upper[:4] + lower[4:] + upper[4:]
+        second_tile = [column + 16 for column in first_tile]
+        assert first_tile + second_tile == list(range(32))
+
+
 @pytest.mark.parametrize("waves", [1, 2, 4, 8])
 def test_down_slot_schedules_are_complete(waves):
     tasks = ex.ExpertTaskContract(waves)

@@ -88,6 +88,7 @@ def common_refusals(
     refuse_tr_hybrid: bool = True,
     supported_gfx: tuple[str, ...] = ("gfx950",),
     refuse_decode_cp: bool = True,
+    multinode_gfx: tuple[str, ...] = (),
 ) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of the conditions every mono model needs: ``dims``
     (the model's ``Dims``) shards at this TP, which is one of ``supported_tp``,
@@ -113,7 +114,10 @@ def common_refusals(
     (its attention layers stay on the production path, which handles the
     split) or are written for that split and refuse any other themselves
     (the shared DSA indexer, ``dsa_indexer.bind``) passes
-    ``refuse_decode_cp=False``."""
+    ``refuse_decode_cp=False``.
+
+    ``multinode_gfx`` lists architecture-local runners whose TP communication
+    uses ordinary collectives instead of HIP IPC peer buffers."""
     tp = atom_config.tensor_parallel_size
     dpa = dp_attention_ranks(atom_config)
     if dpa not in (0, *supported_dpa):
@@ -143,6 +147,10 @@ def common_refusals(
             "decode CP",
         ),
         (atom_config.prefill_context_parallel_size == 1, "prefill CP"),
+        (
+            gfx in multinode_gfx or not getattr(atom_config, "is_multinode_tp", False),
+            "TP group spans nodes (HIP IPC peer memory)",
+        ),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
         (

@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.models.kimi_k3.mono.config import EXPERTS, LATENT, Dims
+from atom.models.kimi_k3.mono import weights as weights_module
+from atom.models.kimi_k3.mono.config import EXPERTS, LATENT, TOPK, Dims
 from atom.models.kimi_k3.mono.expert_scales import bind_expert_scale
 from atom.models.kimi_k3.mono.kernels.stages.moe_expert_layout import (
     ExpertScaleLayout,
@@ -114,23 +115,42 @@ def test_production_specs_cover_all_tp_slices_without_allocation(tp):
             )
 
 
-def _production_experts(*, is_gfx1250=True):
+def _production_experts(*, is_gfx1250=True, gu_interleave=False):
     dims = Dims(8)
     w13_shape = (EXPERTS, 2 * dims.inter // 32, (LATENT // 32) * 32)
     w2_shape = (EXPERTS, LATENT // 32, (dims.inter // 32) * 32)
     return SimpleNamespace(
         quant_method=SimpleNamespace(
             is_gfx1250=is_gfx1250,
-            is_guinterleave=False,
+            is_guinterleave=gu_interleave,
         ),
         w13_weight_scale=torch.empty(w13_shape, dtype=torch.uint8, device="meta"),
         w2_weight_scale=torch.empty(w2_shape, dtype=torch.uint8, device="meta"),
     )
 
 
-def test_runtime_binding_exposes_native_zero_copy_handles():
+def _bound_production_experts(*, gu_interleave):
     dims = Dims(8)
-    experts = _production_experts()
+
+    def shuffled(nbytes):
+        tensor = torch.empty(nbytes, dtype=torch.uint8, device="meta")
+        tensor.is_shuffled = True
+        return tensor
+
+    experts = _production_experts(gu_interleave=gu_interleave)
+    experts.top_k = TOPK
+    experts.quant_method.fp8_activations = False
+    experts.w13_weight = shuffled(EXPERTS * 2 * dims.inter * LATENT // 2)
+    experts.w2_weight = shuffled(EXPERTS * LATENT * dims.inter // 2)
+    experts.w13_swizzle_layout = None
+    experts._mega_w1 = None
+    return experts
+
+
+@pytest.mark.parametrize("gu_interleave", [False, True])
+def test_runtime_binding_exposes_native_zero_copy_handles(gu_interleave):
+    dims = Dims(8)
+    experts = _production_experts(gu_interleave=gu_interleave)
     handles = bind_k2_expert_scales(
         SimpleNamespace(experts=experts), 1, dims, 3, GFX1250
     )
@@ -139,6 +159,31 @@ def test_runtime_binding_exposes_native_zero_copy_handles():
     assert handles.w2.tensor.is_meta
     assert handles.w13.tensor.shape == experts.w13_weight_scale.shape
     assert handles.w2.tensor.shape == experts.w2_weight_scale.shape
+
+
+@pytest.mark.parametrize("gu_interleave", [False, True])
+def test_expert_binding_accepts_production_gfx1250_layouts(gu_interleave):
+    result = weights_module._experts(
+        SimpleNamespace(
+            experts=_bound_production_experts(
+                gu_interleave=gu_interleave,
+            )
+        ),
+        1,
+        Dims(8),
+    )
+    assert len(result) == 4
+
+
+def test_gfx950_binding_still_refuses_interleaved_gate_up():
+    experts = _bound_production_experts(gu_interleave=True)
+    experts.quant_method.is_gfx1250 = False
+    with pytest.raises(MonoUnsupported, match="requires the gfx1250"):
+        weights_module._experts(
+            SimpleNamespace(experts=experts),
+            1,
+            Dims(8),
+        )
 
 
 def test_runtime_binding_requires_explicit_native_layout_metadata():

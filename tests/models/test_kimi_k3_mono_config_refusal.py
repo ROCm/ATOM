@@ -128,6 +128,27 @@ def test_decode_context_parallelism_is_served(servable):
     assert config_refusal(atom_config) is None
 
 
+def test_gfx1250_collective_runner_serves_cross_node_tp(servable, monkeypatch):
+    monkeypatch.setattr(deployment, "_gfx", lambda: "gfx1250")
+    atom_config = _atom_config()
+    atom_config.is_multinode_tp = True
+    assert config_refusal(atom_config) is None
+
+
+def test_peer_memory_mono_still_refuses_cross_node_tp(servable, monkeypatch):
+    monkeypatch.setattr(deployment, "_gfx", lambda: "gfx950")
+    atom_config = _atom_config()
+    atom_config.is_multinode_tp = True
+    checks = deployment.common_refusals(
+        atom_config,
+        k3_config.Dims,
+        k3_config.SUPPORTED_TP,
+    )
+    assert deployment.first_refusal(checks) == (
+        "TP group spans nodes (HIP IPC peer memory)"
+    )
+
+
 def test_other_mono_models_still_refuse_decode_context_parallelism(servable):
     from atom.models.kimi_k3.mono.config import SUPPORTED_TP, Dims
 

@@ -191,7 +191,7 @@ def _pack8(values, reciprocal_scale):
     return packed
 
 
-def ug_loads(c, task):
+def ug_loads(c, task, gu_interleave=False):
     """Load this wave's gate/up N32 weight operands and n32k4 scales."""
 
     wave, lane = c["wave"], c["lane"]
@@ -203,10 +203,16 @@ def ug_loads(c, task):
         half * (LATENT // K_STEP // 2) + index for index in range(LATENT // K_STEP // 2)
     ]
     gate_row = group * 32
-    row = ((wave % 4) >= 2).select(
-        fx.Int32(ROUTED_INTERMEDIATE + gate_row),
-        fx.Int32(gate_row),
-    )
+    if const_expr(gu_interleave):
+        row = fx.Int32(2 * gate_row) + ((wave % 4) >= 2).select(
+            fx.Int32(32),
+            fx.Int32(0),
+        )
+    else:
+        row = ((wave % 4) >= 2).select(
+            fx.Int32(ROUTED_INTERMEDIATE + gate_row),
+            fx.Int32(gate_row),
+        )
     weights = [
         _weight_fragment(
             c["args"]["w13"],
@@ -234,7 +240,7 @@ def ug_loads(c, task):
 
 
 @traced
-def stage_ug(c, task, operands):
+def stage_ug(c, task, operands, gu_interleave=False):
     """N32 gate/up WMMA, SiTUv2, and one MXFP4 output group."""
 
     tokens, lane, wave = c["S"], c["lane"], c["wave"]
@@ -269,15 +275,42 @@ def stage_ug(c, task, operands):
     gpu.barrier()
 
     if wave == 0:
-        values = []
-        for element in range_constexpr(16):
-            gate = fx.ptr_load(
-                c["expert_red"] + _red_offset(0, lane) + element
-            ) + fx.ptr_load(c["expert_red"] + _red_offset(2, lane) + element)
-            up = fx.ptr_load(
-                c["expert_red"] + _red_offset(1, lane) + element
-            ) + fx.ptr_load(c["expert_red"] + _red_offset(3, lane) + element)
-            values.append(_situ(gate, up))
+        if const_expr(gu_interleave):
+            logical = []
+            for tile in range_constexpr(2):
+                physical = [
+                    fx.ptr_load(c["expert_red"] + _red_offset(tile, lane) + element)
+                    + fx.ptr_load(
+                        c["expert_red"] + _red_offset(tile + 2, lane) + element
+                    )
+                    for element in range_constexpr(16)
+                ]
+                logical.append(
+                    [
+                        _situ(physical[2 * element], physical[2 * element + 1])
+                        for element in range_constexpr(8)
+                    ]
+                )
+            peer = [
+                [value.shuffle_xor(16, GFX1250.wave_size) for value in tile]
+                for tile in logical
+            ]
+            lower = logical[0][:4] + peer[0][:4] + logical[1][:4] + peer[1][:4]
+            upper = peer[0][4:] + logical[0][4:] + peer[1][4:] + logical[1][4:]
+            values = [
+                (lane < 16).select(lower[element], upper[element])
+                for element in range_constexpr(16)
+            ]
+        else:
+            values = []
+            for element in range_constexpr(16):
+                gate = fx.ptr_load(
+                    c["expert_red"] + _red_offset(0, lane) + element
+                ) + fx.ptr_load(c["expert_red"] + _red_offset(2, lane) + element)
+                up = fx.ptr_load(
+                    c["expert_red"] + _red_offset(1, lane) + element
+                ) + fx.ptr_load(c["expert_red"] + _red_offset(3, lane) + element)
+                values.append(_situ(gate, up))
 
         maximum = fx.Float32(0.0)
         for element in range_constexpr(len(values)):
