@@ -307,7 +307,9 @@ class EngineArgs:
             help="Return per-request MoE expert ids on generate() as "
             "routed_experts int16 [seq_len-1, num_layers, top_k]. "
             "Requires DCP=PCP=PP=1, no plugin mode, and no KV transfer, "
-            "offload, or RapidServe.",
+            "offload, or RapidServe; after weight load, a MoE model whose "
+            "attention supplies per-token KV slots (not DeepSeek-V4 / V4.1). "
+            "Mono decode turns off for models that route in-kernel.",
         )
         parser.add_argument(
             "--port",

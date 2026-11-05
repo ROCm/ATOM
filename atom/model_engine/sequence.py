@@ -496,9 +496,6 @@ class Sequence:
         # `_routed_expert_rows` is the live length; the tail is unused.
         self._routed_expert_buf: np.ndarray | None = None
         self._routed_expert_rows: int = 0
-        # Set at finish: the buffer is trimmed to its rows, read-only, and
-        # handed out without a copy; late patches are dropped.
-        self._routed_experts_final: bool = False
         # Positions some scheduled forward already returns routes for; a
         # prefix-cache hit past it must have its rows read from the cache.
         self.routed_forwarded_end: int = 0
@@ -621,19 +618,16 @@ class Sequence:
     def routed_experts(self) -> np.ndarray | None:
         """int16 [rows, layers, top_k], or None if no patch ever arrived.
 
-        A copy while the request runs; the shared read-only array once
-        ``finish_routed_experts`` has run. A finished request has
-        ``num_tokens - 1`` rows, except an aborted one: its last step's
-        patch may never arrive, so it can have fewer.
+        A view of the live rows, read-only once ``finish_routed_experts`` has
+        run. A finished request has ``num_tokens - 1`` rows, except an aborted
+        one: its last step's patch may never arrive, so it can have fewer.
         """
         buf = self._routed_expert_buf
         # Zero rows is still [0, layers, top_k]; only a request no patch ever
         # reached has no shape to report.
         if buf is None:
             return None
-        if self._routed_experts_final:
-            return buf
-        return buf[: self._routed_expert_rows].copy()
+        return buf[: self._routed_expert_rows]
 
     def _ensure_routed_expert_capacity(
         self, need: int, layers: int, top_k: int
@@ -659,7 +653,7 @@ class Sequence:
         A patch starting past the rows already held would leave positions no
         step returned, so it raises rather than handing the trainer -1 rows.
         """
-        if rows is None or self._routed_experts_final:
+        if rows is None or self.is_finished:
             return
         arr = np.ascontiguousarray(rows, dtype=np.int16)
         n = int(arr.shape[0])
@@ -688,10 +682,9 @@ class Sequence:
         self._routed_expert_rows = keep
 
     def finish_routed_experts(self, keep_rows: int) -> None:
-        """Trim to ``keep_rows`` and freeze, so the pickle and every read
-        share the live rows instead of copying the growable buffer."""
+        """Trim to ``keep_rows`` and freeze, so the pickle carries the live rows
+        rather than the growable buffer's spare capacity."""
         self.truncate_routed_experts(keep_rows)
-        self._routed_experts_final = True
         buf = self._routed_expert_buf
         if buf is None:
             return

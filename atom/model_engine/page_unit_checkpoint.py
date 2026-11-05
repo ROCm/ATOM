@@ -91,7 +91,7 @@ class PagedStateCheckpointSpec:
         )
 
 
-def checkpoint_page_unit_bytes(builder: object) -> int:
+def resolve_checkpoint_page_unit_bytes(builder: object) -> int:
     """Bytes of one block that a PAGE-backed state checkpoint moves.
 
     The plan's PAGE `entry_bytes` is what a block id is charged, and other

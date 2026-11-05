@@ -11,7 +11,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from atom.config import Config, check_return_routed_experts
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.model_ops.fused_moe import routed_experts_capturer as cap_mod
 from atom.model_ops.fused_moe.routed_experts_capturer import (
     UNCAPTURED,
@@ -757,7 +757,7 @@ def test_finished_routes_are_read_without_copying():
     seq = _grown_seq(9)
     seq.finish_routed_experts(7)
     first, second = seq.routed_experts, seq.routed_experts
-    assert first is second
+    assert np.shares_memory(first, second)
     assert first.shape == (7, 4, 2)
     assert not first.flags.writeable
 
@@ -778,15 +778,10 @@ def test_late_patch_after_finish_is_dropped():
     """A deferred step scheduled before the finish still reports its routes."""
     seq = _grown_seq(5)
     seq.finish_routed_experts(4)
+    seq.status = SequenceStatus.FINISHED
     seq.apply_routed_expert_patch(4, np.full((2, 4, 2), 99, dtype=np.int16))
     assert seq.routed_expert_rows == 4
     assert (seq.routed_experts != 99).all()
-
-
-def test_running_routes_are_still_copies():
-    seq = _grown_seq(3)
-    seq.routed_experts[0] = 99
-    assert seq.routed_experts[0, 0, 0] == 0
 
 
 def _pending(req_id: int, start: int, n: int, fill: int) -> PendingRoutes:

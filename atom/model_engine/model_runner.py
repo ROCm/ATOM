@@ -55,7 +55,7 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
-    checkpoint_page_unit_bytes,
+    resolve_checkpoint_page_unit_bytes,
 )
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
@@ -2035,7 +2035,9 @@ class ModelRunner:
             # None means the backend has not narrowed its image: carry it all.
             narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
             checkpoint_spec = PagedStateCheckpointSpec(
-                page_unit_bytes=checkpoint_page_unit_bytes(self.attn_metadata_builder),
+                page_unit_bytes=resolve_checkpoint_page_unit_bytes(
+                    self.attn_metadata_builder
+                ),
                 slot_bytes=slot_bytes,
                 image_bytes=slot_bytes if narrowed is None else int(narrowed),
                 layout_id=transfer.paged_layout_id,

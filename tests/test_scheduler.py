@@ -3621,7 +3621,7 @@ class TestRoutedExpertPatches:
         assert finished == [seq]
         routes = seq.routed_experts
         assert routes.shape[0] == seq.num_tokens - 1
-        assert routes is seq.routed_experts
+        assert np.shares_memory(routes, seq.routed_experts)
         assert not routes.flags.writeable
 
     @staticmethod
@@ -3685,8 +3685,8 @@ class TestRoutedExpertPatches:
         scheduler.postprocess(
             in_flight, self._routes_only(self._patch((seq.id, 2, late)))
         )
-        assert seq.routed_experts is frozen
-        np.testing.assert_array_equal(frozen, rows)
+        assert np.shares_memory(seq.routed_experts, frozen)
+        np.testing.assert_array_equal(seq.routed_experts, rows)
 
     def test_short_routes_at_a_normal_finish_raise(self, scheduler, seq_factory):
         """Only an abort may finish with fewer than ``num_tokens - 1`` rows."""

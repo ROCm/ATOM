@@ -15,7 +15,7 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     PagedStateCheckpointSpec,
     PageUnitCheckpointStore,
-    checkpoint_page_unit_bytes,
+    resolve_checkpoint_page_unit_bytes,
 )
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     page_pool,
@@ -729,15 +729,15 @@ def test_page_unit_excludes_draft_kv_and_routed_expert_surcharge():
     surcharge = page_pool(capture_bytes_per_kv_block(16, 4, 2))
     plan = plan_pools(list(target.sub_pool_specs()) + draft + [surcharge], 1 << 30, 4)
     assert plan.entry_bytes[plan.paged_class] == 4096 + 1024 + surcharge.entry_bytes
-    assert checkpoint_page_unit_bytes(target) == 4096
+    assert resolve_checkpoint_page_unit_bytes(target) == 4096
 
 
 def test_page_unit_takes_the_backends_narrower_unit():
-    assert checkpoint_page_unit_bytes(_Builder([page_pool(4096)], 4000)) == 4000
-    assert checkpoint_page_unit_bytes(_Builder([page_pool(4096)])) == 4096
+    assert resolve_checkpoint_page_unit_bytes(_Builder([page_pool(4096)], 4000)) == 4000
+    assert resolve_checkpoint_page_unit_bytes(_Builder([page_pool(4096)])) == 4096
 
 
 @pytest.mark.parametrize("published", [0, 4097])
 def test_page_unit_refuses_a_unit_outside_the_builders_entry(published):
     with pytest.raises(RuntimeError, match="checkpoint PAGE unit"):
-        checkpoint_page_unit_bytes(_Builder([page_pool(4096)], published))
+        resolve_checkpoint_page_unit_bytes(_Builder([page_pool(4096)], published))

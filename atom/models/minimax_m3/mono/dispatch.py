@@ -26,7 +26,11 @@ from atom.models.minimax_m3.mono.config import (
     Dims,
 )
 from atom.models.minimax_m3.mono.runner import MonoDecodeRunner
-from atom.mono.runtime.deployment import common_refusals, first_refusal
+from atom.mono.runtime.deployment import (
+    common_refusals,
+    first_refusal,
+    routed_experts_refusal,
+)
 from atom.mono.runtime.route import LazyRunner
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -51,6 +55,7 @@ def _dspark_mode_supported(atom_config) -> bool:
 def _config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use mono, or None."""
     checks = common_refusals(atom_config, Dims, SUPPORTED_TP) + [
+        routed_experts_refusal(atom_config),
         (atom_config.kv_cache_dtype == "fp8", f"kv cache {atom_config.kv_cache_dtype}"),
         (
             (atom_config.index_cache_dtype or atom_config.kv_cache_dtype) == "fp8",

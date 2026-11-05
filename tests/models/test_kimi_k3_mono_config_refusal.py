@@ -129,6 +129,18 @@ def test_decode_context_parallelism_is_served(servable):
     assert config_refusal(atom_config) is None
 
 
+def test_routed_expert_capture_refuses_only_the_in_kernel_moe(servable):
+    """K3's K2 routes in-kernel and would never write the capture; the shared
+    checks the DSA indexer also uses must not refuse it."""
+    from atom.models.kimi_k3.mono.config import SUPPORTED_TP, Dims
+
+    atom_config = _atom_config()
+    atom_config.enable_return_routed_experts = True
+    assert config_refusal(atom_config) == "routed-expert capture"
+    checks = deployment.common_refusals(atom_config, Dims, SUPPORTED_TP)
+    assert deployment.first_refusal(checks) is None
+
+
 def test_other_mono_models_still_refuse_decode_context_parallelism(servable):
     from atom.models.kimi_k3.mono.config import SUPPORTED_TP, Dims
 
