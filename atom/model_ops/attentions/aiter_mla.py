@@ -174,8 +174,9 @@ def mla_qk_head_dim(hf_config) -> int:
 
 def aligned_index_cache_dim(hf_config) -> int:
     """Indexer key plus fp32 scale, padded to a 16-byte row."""
-    index_dim = hf_config.index_head_dim + 4
-    return ((index_dim + 15) // 16) * 16
+    from atom.model_ops.glm5_next.geometry import aligned_index_cache_row
+
+    return aligned_index_cache_row(hf_config.index_head_dim)
 
 
 def _pad_prefill_mla_draft_tail(

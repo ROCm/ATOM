@@ -92,3 +92,13 @@ def pool_plane_width(max_model_len: int, pool_size: int) -> int:
     if pool_size <= 0:
         raise ValueError(f"pool_size must be positive, got {pool_size}")
     return (max_model_len + pool_size - 1) // pool_size
+
+
+def aligned_index_cache_row(index_head_dim: int) -> int:
+    """Bytes per cached indexer row: key plus fp32 scale, padded to 16 bytes.
+
+    The same width `aligned_index_cache_dim` gives the native allocator; kept
+    here in terms of the head dim alone so plugin mode can ask for it without
+    a model-runner config, and so the two paths cannot drift apart.
+    """
+    return ((index_head_dim + 4 + 15) // 16) * 16
