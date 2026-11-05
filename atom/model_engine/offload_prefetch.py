@@ -119,6 +119,9 @@ class OffloadPrefetch:
                 # The pool cannot take it now; neither could Phase 2.
                 self.skip_until[seq.id] = tick + self.RETRY_TICKS
                 break
+            if self._over_watermark(seq, probe):
+                self.skip_until[seq.id] = tick + self.RETRY_TICKS
+                continue
             # Under a bounded replay the hit `can_allocate` offers moves with
             # the tier answer (`_tier_hit`): checked again once it is taken.
             rewalks = replays and seq.has_per_req_cache
@@ -140,8 +143,15 @@ class OffloadPrefetch:
                 if probe.num_cached_blocks < 0:
                     self.skip_until[seq.id] = tick + self.RETRY_TICKS
                     break
+                if self._over_watermark(seq, probe):
+                    self.skip_until[seq.id] = tick + self.RETRY_TICKS
+                    continue
             cached = probe.num_cached_blocks * hbs
             if chunk and cached % chunk:
+                # Permanent, so the taken answer goes back: nothing will use
+                # it before Phase 2 reaches the request, which answers from
+                # the remembered hit.
+                s.kv_connector.release_taken_lookup(seq)
                 self.skip_until[seq.id] = math.inf  # `_unaligned`
                 continue
             if s._should_wait_for_producer(
@@ -200,17 +210,23 @@ class OffloadPrefetch:
         admission_ready = getattr(s.kv_connector, "admission_ready", None)
         if callable(admission_ready) and not admission_ready(seq):
             return False
-        bm = s.block_manager
-        total = max(1, int(bm.kv.num_blocks))
-        # What `_admit_after_probe` allocates: the prompt and the draft
-        # lookahead past it.
-        need = bm.num_pool_blocks(len(seq)) + bm.draft_lookahead_blocks(len(seq))
-        if s._kv_usage() + need / total > self.max_kv_usage:
-            self.skip_until[seq.id] = tick + self.RETRY_TICKS
-            return False
         # A peek; `run` takes the answer (`take_ready_lookup`) only after its
         # other checks.
         return bool(s.kv_connector.lookup_ready(seq))
+
+    def _over_watermark(self, seq, probe) -> bool:
+        """Whether admitting `seq` would take the KV pool past the watermark.
+        The demand is the probe's own (`AdmissionProbe.num_new_blocks`: the
+        prompt and the draft lookahead, less the hit blocks already in use --
+        a shared prefix costs no new block), or the whole footprint when the
+        probe supplied none."""
+        s = self.sched
+        bm = s.block_manager
+        need = probe.num_new_blocks
+        if need is None:
+            need = bm.num_pool_blocks(len(seq)) + bm.draft_lookahead_blocks(len(seq))
+        total = max(1, int(bm.kv.num_blocks))
+        return s._kv_usage() + need / total > self.max_kv_usage
 
     def _prune(self, waiting_ids: set) -> None:
         self.skip_until = {k: v for k, v in self.skip_until.items() if k in waiting_ids}
