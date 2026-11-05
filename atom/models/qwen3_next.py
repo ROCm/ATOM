@@ -50,8 +50,11 @@ from atom.model_ops.moe_tail_norm import (
     MoEGatedSum,
     MoENormed,
     combine_tail_request,
+    fused_router_shared_available,
     gated_gemm_available,
     interleave_gate_up,
+    pad_router_weight,
+    router_shared_expert,
     silu_gate_up_gemm,
 )
 from atom.model_ops.qwen_mono_moe.integration import mono_moe_forward
@@ -191,7 +194,7 @@ class Qwen3NextMLP(nn.Module):
     def process_weights_after_loading(self):
         proj = self.gate_up_proj
         if (
-            envs.ATOM_SHARED_EXPERT_GATED_GEMM
+            (envs.ATOM_SHARED_EXPERT_GATED_GEMM or envs.ATOM_FUSED_ROUTER_SHARED_EXPERT)
             and not self.gated_gate_up
             and proj.quant_type.value == QuantType.No.value
             and proj.weight.dtype == torch.bfloat16
@@ -247,6 +250,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     mono_norm = None
     mono_parity = 0
     mono_layer = -1
+    # ATOM_FUSED_ROUTER_SHARED_EXPERT: the router weight padded to whole 16-row
+    # groups (gate.weight is a view of its first rows), set at load.
+    router_padded = None
 
     def __init__(
         self, config, quant_config, prefix: str = "", reduce_results: bool = True
@@ -371,6 +377,51 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         ):
             self.experts.online_quant_pad_align = 128
 
+    def process_weights_after_loading(self):
+        w = self.gate.weight
+        if (
+            envs.ATOM_FUSED_ROUTER_SHARED_EXPERT
+            and self.router_padded is None
+            and w.dtype == torch.bfloat16
+            and w.is_contiguous()
+        ):
+            padded = pad_router_weight(w.data)
+            w.data = padded[: w.shape[0]]
+            self.router_padded = padded
+
+    def fused_router_shared(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """ATOM_FUSED_ROUTER_SHARED_EXPERT: (router logits, shared expert
+        output) from one kernel, or None where it does not apply."""
+        mlp = self.shared_expert
+        m = hidden_states.shape[0]
+        if (
+            not envs.ATOM_FUSED_ROUTER_SHARED_EXPERT
+            or mlp is None
+            or self.tp_size != 1
+            or not mlp.gated_gate_up
+            or mlp.expert_gate is not None
+            or not 0 < m <= envs.ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS
+            or torch.compiler.is_compiling()
+            or hidden_states.dtype != torch.bfloat16
+            or self.gate.bias is not None
+            or self.gate.weight.dtype != torch.bfloat16
+            or not fused_router_shared_available()
+        ):
+            return None
+        w_router = self.gate.weight
+        padded = self.router_padded
+        if padded is None or padded.data_ptr() != w_router.data_ptr():
+            padded = w_router  # correct, only slower
+        return router_shared_expert(
+            hidden_states,
+            padded,
+            w_router.shape[0],
+            mlp.gate_up_proj.weight,
+            mlp.down_proj.weight,
+        )
+
     def combine_tail_forward(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
     ) -> MoENormed | MoEGatedSum:
@@ -379,8 +430,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         the MoE combine. A combine that cannot take them (another transport, a
         quantized combine wire) leaves the request unanswered, and the block
         returns the unsummed parts for the norm to finish."""
-        logits = self.gate(hidden_states)
-        shared_output = self.shared_expert(hidden_states)
+        fused = self.fused_router_shared(hidden_states)
+        if fused is not None:
+            logits, shared_output = fused
+        else:
+            logits = self.gate(hidden_states)
+            shared_output = self.shared_expert(hidden_states)
         gate_logits = logits[:, self.n_routed_experts :]
         norm = self.combine_tail_norm
         req = CombineTailRequest(
@@ -452,7 +507,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
     def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts + 1)
-        logits = self.gate(hidden_states)
+        fused = self.fused_router_shared(hidden_states)
+        shared_output = None
+        if fused is not None:
+            # The shared expert runs before the routed experts here.
+            logits, shared_output = fused
+        else:
+            logits = self.gate(hidden_states)
         if not self.is_rocm_aiter_fusion_shared_expert_enabled:
             router_logits = logits[:, : self.n_routed_experts]
         else:
@@ -464,7 +525,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 hidden_states=hidden_states, router_logits=router_logits
             )
         if not self.is_rocm_aiter_fusion_shared_expert_enabled:
-            shared_output = self.shared_expert(hidden_states)
+            if shared_output is None:
+                shared_output = self.shared_expert(hidden_states)
             # Apply shared expert gate: the merged gate output contains
             # [routed_logits, shared_expert_gate_logits], extract the tail
             shared_gate_logits = logits[:, self.n_routed_experts :]

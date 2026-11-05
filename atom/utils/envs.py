@@ -537,6 +537,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SHARED_EXPERT_GATED_GEMM": lambda: (
         os.getenv("ATOM_SHARED_EXPERT_GATED_GEMM", "0") == "1"
     ),
+    # Qwen3-Next / Qwen3.5 sparse MoE block at TP1 (gfx1250): the router GEMM
+    # and the whole bf16 shared expert (gate_up, SiLU-and-mul, down) in one
+    # aiter gluon kernel, before the routed experts, on steps of up to
+    # ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS rows (larger steps keep the
+    # separate GEMMs). Interleaves gate_up's rows as ATOM_SHARED_EXPERT_GATED_GEMM
+    # does. Bitwise the separate GEMMs. Off by default.
+    "ATOM_FUSED_ROUTER_SHARED_EXPERT": lambda: (
+        os.getenv("ATOM_FUSED_ROUTER_SHARED_EXPERT", "0") == "1"
+    ),
+    "ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS", "512")
+    ),
     # Qwen3.5 MTP drafter at TP > 1: the target's all-reduce fusions. o_proj, its
     # all-reduce and post_attention_layernorm run as aiter's gfx1250 GEMM +
     # all-reduce + RMSNorm (TP4, up to 128 rows; else the GEMM, then the fused
