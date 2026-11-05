@@ -31,7 +31,7 @@ def main():
     command[k] = json.dumps(transfer)
     env = os.environ.copy()
     for name in list(env):
-        if name.startswith(("ATOM_DP_PREFIX_", "ATOM_DP_SESSION_", "ATOM_KV_OFFLOAD")) or name == "ATOM_OFFLOAD_EARLY_LOAD":
+        if name.startswith(("ATOM_DP_PREFIX_", "ATOM_DP_SESSION_", "ATOM_KV_OFFLOAD")) or name in {"ATOM_OFFLOAD_EARLY_LOAD", "MC_DISABLE_HIP"}:
             env.pop(name)
     env.update(role["environment"])
     env.update(HIP_VISIBLE_DEVICES=a.gpus, ATOM_HOST_IP=a.host_ip,
