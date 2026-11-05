@@ -748,6 +748,7 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
+        prompt_block_hashes=None,
     ):
         """responsible for:
         1) Tokenize
@@ -772,6 +773,7 @@ class InputOutputProcessor:
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
+            prompt_block_hashes=prompt_block_hashes,
         )
         return seqs[0]
 
@@ -787,6 +789,7 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
+        prompt_block_hashes=None,
     ) -> list[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
@@ -803,6 +806,11 @@ class InputOutputProcessor:
         * Per-sibling ``stream_callbacks`` can be supplied to route streaming
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
+
+        ``prompt_block_hashes`` (a ``PrefixBlockHashes``) is the prompt's hash
+        chain when the caller already has it -- token ids prepared in an API
+        tokenize worker (`chat_offload`). ``ship_prompt_hash_chain`` takes it
+        only if its block size, seed and length fit this prompt.
         """
         request_validator = getattr(self.config.hf_config, "validate_request", None)
         if request_validator is not None:
@@ -897,7 +905,9 @@ class InputOutputProcessor:
                 seqs[0],
                 self.prefix_hash_block_size,
                 block_hashes=(
-                    None if prefix_encoding is None else prefix_encoding.block_hashes
+                    prompt_block_hashes
+                    if prefix_encoding is None
+                    else prefix_encoding.block_hashes
                 ),
             )
             for seq in seqs[1:]:

@@ -49,6 +49,20 @@ SYNTHETIC_TOKEN_TEXT = "synthetic "
 DEFAULT_AUDIT_EVERY = 1000
 
 
+class _BackendDecode:
+    """ATOM_API_STREAM_FAST: the stream detokenizer's decodes go straight to
+    the Rust tokenizer (`tokenizer._tokenizer.decode`), skipping the
+    transformers wrapper around it -- its `to_py_obj` framework checks and
+    kwargs handling cost 1.87 us of the 2.4 a short window takes on Qwen3.5,
+    once or twice per SSE frame, on the event loop. Set only by
+    `enable_backend_decode`, after the two agreed on a probe."""
+
+    decode: Callable[[Any], str] | None = None
+
+
+_BACKEND_DECODE = _BackendDecode()
+
+
 @dataclass
 class _DeltaReuse:
     """Whether `_decode` may skip its first `tokenizer.decode`, process-wide.
@@ -155,9 +169,14 @@ class IncrementalStreamDetokenizer:
         at sixty-four, on DeepSeek-V4-Pro.
         """
         self.tokens.extend(token_ids)
+        backend_decode = _BACKEND_DECODE.decode
         reuse = _DELTA_REUSE
         if reuse.enabled and not reuse.should_audit():
             prefix_text = self.last_delta
+        elif backend_decode is not None:
+            prefix_text = backend_decode(
+                self.tokens[self.prefix_offset : self.read_offset]
+            )
         else:
             prefix_text = self.tokenizer.decode(
                 self.tokens[self.prefix_offset : self.read_offset],
@@ -168,10 +187,13 @@ class IncrementalStreamDetokenizer:
                     reuse.audits += 1
                 if prefix_text != self.last_delta:
                     reuse.report_mismatch(self.last_delta, prefix_text)
-        new_text = self.tokenizer.decode(
-            self.tokens[self.prefix_offset :],
-            skip_special_tokens=True,
-        )
+        if backend_decode is not None:
+            new_text = backend_decode(self.tokens[self.prefix_offset :])
+        else:
+            new_text = self.tokenizer.decode(
+                self.tokens[self.prefix_offset :],
+                skip_special_tokens=True,
+            )
 
         if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):
             delta = new_text[len(prefix_text) :]
@@ -640,3 +662,63 @@ class StreamBatchDispatcher:
                 )
             payload = item.chunk if item.tag is None else (item.tag, item.chunk)
             item.collector.put_nowait(payload)
+
+
+def enable_backend_decode(tokenizer) -> bool:
+    """Decode stream deltas with the Rust tokenizer directly, if that is what
+    ``tokenizer.decode(ids, skip_special_tokens=True)`` returns for it.
+
+    Holds for a transformers fast tokenizer whose `_decode` is the library's
+    own (`TokenizersBackend._decode`: the backend's decode, then a cleanup that
+    is off for Qwen3.5 and skipped for BPE). Verified rather than assumed: every
+    probe stream (`_probe_streams`, plus the tokenizer's special tokens) and
+    every window the detokenizer can ask for of it must decode identically
+    both ways, or this stays off.
+    """
+    _BACKEND_DECODE.decode = None
+    backend = getattr(tokenizer, "_tokenizer", None)
+    if backend is None or not callable(getattr(backend, "decode", None)):
+        logger.info("[detokenizer] backend decode off: no Rust tokenizer")
+        return False
+
+    def backend_decode(ids, _decode=backend.decode):
+        return _decode(ids, skip_special_tokens=True)
+
+    try:
+        streams = _probe_streams(tokenizer)
+        specials = " ".join(getattr(tokenizer, "all_special_tokens", ()) or ())
+        if specials:
+            streams.append(
+                tokenizer.encode(f"a {specials} b {specials}", add_special_tokens=False)
+            )
+        compared = 0
+        for ids in streams:
+            ids = new_token_ids(ids)
+            for start in range(0, len(ids), 3):
+                for end in range(start, min(len(ids), start + 24) + 1):
+                    window = ids[start:end]
+                    if backend_decode(window) != tokenizer.decode(
+                        window, skip_special_tokens=True
+                    ):
+                        logger.warning(
+                            "[detokenizer] backend decode off: it differs from "
+                            "tokenizer.decode on a probe window"
+                        )
+                        return False
+                    compared += 1
+            if backend_decode(ids) != tokenizer.decode(ids, skip_special_tokens=True):
+                logger.warning(
+                    "[detokenizer] backend decode off: it differs from "
+                    "tokenizer.decode on a probe stream"
+                )
+                return False
+    except Exception:
+        logger.exception("[detokenizer] backend decode probe raised; leaving it off")
+        return False
+    _BACKEND_DECODE.decode = backend_decode
+    logger.info(
+        "[detokenizer] backend decode on: %d probe windows agreed with "
+        "tokenizer.decode",
+        compared,
+    )
+    return True
