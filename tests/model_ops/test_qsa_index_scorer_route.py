@@ -310,6 +310,8 @@ def fresh_process_state(monkeypatch):
     monkeypatch.setattr(R, "_PREWARMED", {})
     monkeypatch.setattr(CAP, "_LAUNCH_DRIFT_LOGGED", set())
     monkeypatch.setattr(CAP, "_CAPABILITIES", {})
+    # No exit-summary hook from tests (pytest has closed its streams by then).
+    monkeypatch.setattr(R, "_SUMMARY_REGISTERED", True)
 
 
 class FakeNative:
@@ -956,8 +958,15 @@ def test_contract_real_api_cpu_decisions(aiter_api, monkeypatch):
     )
     assert route.pinned is None
     assert route.prepare(cache) == "device_not_gpu"  # CPU tensors: never fused
-    assert select_style_call(route, a) == ("native", 4)
-    assert route.counts[("stock", "device_not_gpu")] == 1
+    out = select_style_call(route, a)
+    if route.aiter_native_path:
+        # aiter >= 1.2 (Decision.path): aiter's own native path serves it.
+        assert not native.calls and out[0].shape == (4, 64)
+        assert route.counts[("aiter-native", "device_not_gpu")] == 1
+    else:
+        # aiter <= 1.1: the interim stock scorer serves it.
+        assert out == ("native", 4)
+        assert route.counts[("stock", "device_not_gpu")] == 1
     bogus = R.QSAScorerRoute("no_such_profile_zz", api=aiter_api, native=FakeNative())
     assert bogus.prepare(cache) == "profile_not_found"
 
@@ -1273,8 +1282,9 @@ def test_aiter_native_path_serves_uncovered_calls_without_atom_fallback():
     route = R.QSAScorerRoute(P, api=api, native=native)
     assert route.aiter_native_path and route.summary()["uncovered"] == "aiter-native"
     assert select_style_call(route, call_args(max_columns=64)) == ("fused", 8)
+    a32 = call_args(max_columns=32)  # one cache object: one class
     for _ in range(2):
-        assert select_style_call(route, call_args(max_columns=32)) == ("native", 8)
+        assert select_style_call(route, a32) == ("native", 8)
     assert not native.calls and calls["launch"] == 3 and calls["decide"] == 2
     assert route.counts[("fused", "ok")] == 1
     assert route.counts[("aiter-native", "columns_uncovered")] == 2
