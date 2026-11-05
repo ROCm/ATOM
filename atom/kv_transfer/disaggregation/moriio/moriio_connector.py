@@ -273,10 +273,10 @@ class MoRIIOConnector(KVConnectorBase):
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
-        # None until a region backend (DeepSeek-V4) registers.
+        # Region mode (backends that publish KVTransferTensors and no
+        # per-layer block caches, e.g. DeepSeek-V4). None until registered.
         self._regions: list[_Region] | None = None
         self._region_sessions: dict[EngineId, dict[tuple[int, int, int], Any]] = {}
-        self._remote_regions_checked: dict[EngineId, list[_Region]] = {}
 
     def register_kv_caches(
         self,
@@ -294,16 +294,14 @@ class MoRIIOConnector(KVConnectorBase):
         chunk is registered independently with ``ibv_reg_mr``.  Per-layer
         metadata list layout:
         ``[k_chunk0, k_chunk1, ..., v_chunk0, v_chunk1, ...]``.
-        ``self.num_k_chunks`` marks the K/V boundary. No block layers means the
-        backend published regions; those are registered instead.
+        ``self.num_k_chunks`` marks the K/V boundary.
+
+        A backend with no per-layer block caches (DeepSeek-V4) publishes its
+        storage only as ``transfer_tensors`` regions; those are registered
+        instead, see :meth:`_register_regions`.
         """
         self.kv_caches = kv_caches
-        block_layers = [
-            cache
-            for cache in kv_caches.values()
-            if not getattr(cache, "per_request_state", False)
-        ]
-        if not block_layers:
+        if all(getattr(c, "per_request_state", False) for c in kv_caches.values()):
             self._start_handshake_listener(self._register_regions(transfer_tensors))
             return
         cache_tensor = None
@@ -416,9 +414,14 @@ class MoRIIOConnector(KVConnectorBase):
         self._handshake_listener_thread.start()
 
     def _register_regions(self, transfer_tensors: Any) -> MoRIIOAgentMetadata:
-        """Register PAGE regions by block and full SLOT regions by state slot.
+        """Register a backend's PAGE and full-SLOT regions for RDMA.
 
-        The staging pool is not registered; a full SLOT already holds that state.
+        PAGE regions (``transfer_tensors.pages``) are indexed forward by
+        scheduler block. Full per-request SLOT regions (``swa_block_regions``)
+        are indexed by state slot and may be reverse-indexed. Each region is
+        cut into unit-aligned chunks under the ``ibv_reg_mr`` limit, so no unit
+        straddles two registrations. The compressor-only staging pool is not
+        registered: a full SLOT already carries the compressor state.
         """
         tt = transfer_tensors
         if tt is None or not tt.block_regions:
@@ -454,8 +457,6 @@ class MoRIIOConnector(KVConnectorBase):
 
         self._regions = regions
         self.layer_name_to_local_kv_cache_metadata = local_meta
-        self.num_blocks = int(tt.num_blocks)
-        self.block_len = self.kv_cache_block_size
         return MoRIIOAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.moriio_wrapper.get_agent_metadata(),
@@ -463,10 +464,7 @@ class MoRIIOConnector(KVConnectorBase):
         )
 
     def _remote_regions(self, engine_id: EngineId) -> list[_Region]:
-        """The peer's regions, checked once against ours."""
-        checked = self._remote_regions_checked.get(engine_id)
-        if checked is not None:
-            return checked
+        """The peer's regions, checked against ours."""
         meta = self.remote_moriio_metadata[engine_id]
         if not meta.region_layout:
             raise ValueError(
@@ -474,18 +472,11 @@ class MoRIIOConnector(KVConnectorBase):
                 "registered transfer regions; P and D must run the same model"
             )
         remote = [_Region.from_layout(e) for e in json.loads(meta.region_layout)]
-        if len(remote) != len(self._regions):
+        if [r.shape() for r in remote] != [r.shape() for r in self._regions]:
             raise ValueError(
-                f"{engine_id} advertised {len(remote)} transfer regions, this "
-                f"rank has {len(self._regions)}"
+                f"transfer regions differ from {engine_id}: local "
+                f"{[r.layout() for r in self._regions]} vs remote {meta.region_layout}"
             )
-        for local, peer in zip(self._regions, remote):
-            if local.shape() != peer.shape():
-                raise ValueError(
-                    f"transfer region mismatch with {engine_id}: local "
-                    f"{local.layout()} vs remote {peer.layout()}"
-                )
-        self._remote_regions_checked[engine_id] = remote
         return remote
 
     def _region_session(
@@ -2060,7 +2051,6 @@ class MoRIIOConnector(KVConnectorBase):
             region_sessions = self._region_sessions.pop(engine_id, None)
             if region_sessions is not None:
                 self._retired_sessions.append(region_sessions)
-            self._remote_regions_checked.pop(engine_id, None)
             state_sessions = self._built_state_sessions.pop(engine_id, None)
             if state_sessions is not None:
                 self._retired_sessions.append(state_sessions)
@@ -2301,7 +2291,12 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
 
 @dataclass(frozen=True)
 class _Region:
-    """PAGE is indexed by block. SLOT is indexed by state slot."""
+    """One registered transfer region, as both ends address it.
+
+    ``kind`` is ``"page"`` (indexed by scheduler block) or ``"slot"`` (indexed
+    by per-request state slot). ``chunk_bytes`` is a whole number of units, so
+    a unit always sits inside a single registered chunk.
+    """
 
     name: str
     kind: str
@@ -2314,34 +2309,22 @@ class _Region:
     @classmethod
     def of(cls, name: str, kind: str, region: Any) -> _Region:
         unit = int(region.unit_bytes)
-        total = int(region.total_bytes)
         if unit > MAX_RDMA_CHUNK_BYTES:
-            raise ValueError(
-                f"region {name}: a {unit} B unit exceeds the RDMA registration "
-                f"limit of {MAX_RDMA_CHUNK_BYTES} B"
-            )
+            raise ValueError(f"region {name}: a {unit} B unit exceeds one RDMA chunk")
         return cls(
-            name=name,
-            kind=kind,
-            base=int(region.base_addr),
-            total=total,
-            unit=unit,
-            reverse=bool(region.reverse_indexed),
-            chunk_bytes=(MAX_RDMA_CHUNK_BYTES // unit) * unit,
+            name,
+            kind,
+            int(region.base_addr),
+            int(region.total_bytes),
+            unit,
+            bool(region.reverse_indexed),
+            (MAX_RDMA_CHUNK_BYTES // unit) * unit,
         )
 
     @classmethod
     def from_layout(cls, entry: list[Any]) -> _Region:
         name, kind, unit, total, reverse, chunk_bytes = entry
-        return cls(
-            name=str(name),
-            kind=str(kind),
-            base=0,
-            total=int(total),
-            unit=int(unit),
-            reverse=bool(reverse),
-            chunk_bytes=int(chunk_bytes),
-        )
+        return cls(name, kind, 0, total, unit, reverse, chunk_bytes)
 
     def layout(self) -> list[Any]:
         return [
@@ -2357,10 +2340,6 @@ class _Region:
         """What the handshake compares. Pool totals may differ."""
         return (self.name, self.kind, self.unit, self.reverse, self.chunk_bytes)
 
-    @property
-    def num_units(self) -> int:
-        return self.total // self.unit
-
     def chunks(self) -> list[tuple[int, int]]:
         return [
             (self.base + offset, min(self.chunk_bytes, self.total - offset))
@@ -2369,11 +2348,8 @@ class _Region:
 
     def locate(self, index: int) -> tuple[int, int]:
         """``(chunk, offset within chunk)`` of unit ``index``."""
-        if not 0 <= index < self.num_units:
-            raise ValueError(
-                f"region {self.name}: unit {index} is outside its "
-                f"{self.num_units} units"
-            )
+        if not 0 <= index < self.total // self.unit:
+            raise ValueError(f"region {self.name}: unit {index} is out of range")
         offset = KVTransferRegion.unit_offset(
             index, self.total, self.unit, self.reverse
         )

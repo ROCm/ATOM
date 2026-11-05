@@ -1656,6 +1656,7 @@ class RegionPlanTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        import dataclasses
         import json
 
         import numpy
@@ -1664,11 +1665,7 @@ class RegionPlanTest(unittest.TestCase):
 
         tree = ast.parse(CONNECTOR.read_text())
         classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
-        wanted = {
-            "_remote_regions",
-            "_region_plan",
-            "merge_contiguous_blocks",
-        }
+        wanted = {"_remote_regions", "_region_plan", "merge_contiguous_blocks"}
         methods = [
             n
             for n in classes["MoRIIOConnector"].body
@@ -1679,16 +1676,13 @@ class RegionPlanTest(unittest.TestCase):
             "EngineId": str,
             "KVTransferRegion": KVTransferRegion,
             "MAX_RDMA_CHUNK_BYTES": 40,
-            "dataclass": __import__("dataclasses").dataclass,
+            "dataclass": dataclasses.dataclass,
             "json": json,
             "np": numpy,
         }
-        exec(  # noqa: S102
-            compile(
-                ast.Module([classes["_Region"], *methods], []), "<regions>", "exec"
-            ),
-            scope,
-        )
+        module = ast.Module([classes["_Region"], *methods], [])
+        exec(compile(module, "<regions>", "exec"), scope)  # noqa: S102
+        cls.json = json
         cls.Region = scope["_Region"]
         cls.Planner = type("Planner", (), {name: scope[name] for name in wanted})
         cls.local = [
@@ -1697,36 +1691,26 @@ class RegionPlanTest(unittest.TestCase):
         ]
 
     def make(self, remote_regions):
+        import types
+
         conn = self.Planner()
         conn._regions = self.local
-        conn._remote_regions_checked = {}
+        layout = self.json.dumps([r.layout() for r in remote_regions])
         conn.remote_moriio_metadata = {
-            "decode": type(
-                "Meta",
-                (),
-                {
-                    "region_layout": __import__("json").dumps(
-                        [r.layout() for r in remote_regions]
-                    )
-                },
-            )()
+            "decode": types.SimpleNamespace(region_layout=layout)
         }
         conn._region_session = lambda _engine, ri, lc, rc: (ri, lc, rc)
         return conn
 
     def test_pairs_page_and_reverse_slot_regions(self):
-        plan = self.make(self.local)._region_plan(
-            {
-                "transfer_id": 1,
-                "src_block_ids": [3, 4],
-                "dst_block_ids": [0, 5],
-                "src_slot_index": 0,
-                "dst_slot_index": 5,
-            },
-            "decode",
-        )
+        request = {
+            "src_block_ids": [3, 4],
+            "dst_block_ids": [0, 5],
+            "src_slot_index": 0,
+            "dst_slot_index": 5,
+        }
         self.assertEqual(
-            plan,
+            self.make(self.local)._region_plan(request, "decode"),
             [
                 ((0, 0, 0), [30], [0], [10]),
                 ((0, 1, 1), [0], [10], [10]),
@@ -1740,36 +1724,24 @@ class RegionPlanTest(unittest.TestCase):
             self.make([other, self.local[1]])._remote_regions("decode")
 
     def test_of_keeps_each_unit_inside_one_chunk(self):
-        region = type(
-            "Region",
-            (),
-            {
-                "unit_bytes": 10,
-                "total_bytes": 80,
-                "base_addr": 1000,
-                "reverse_indexed": False,
-            },
-        )()
+        import types
+
+        region = types.SimpleNamespace(
+            unit_bytes=10, total_bytes=80, base_addr=1000, reverse_indexed=False
+        )
         built = self.Region.of("page.0.kv", "page", region)
-        self.assertEqual(built.chunk_bytes % built.unit, 0)
-        covered = 0
-        for ptr, size in built.chunks():
+        chunks = built.chunks()
+        self.assertEqual(sum(size for _, size in chunks), built.total)
+        for ptr, size in chunks:
             self.assertEqual((ptr - built.base) % built.unit, 0)
             self.assertEqual(size % built.unit, 0)
-            covered += size
-        self.assertEqual(covered, built.total)
 
     def test_of_rejects_a_unit_over_the_rdma_limit(self):
-        region = type(
-            "Region",
-            (),
-            {
-                "unit_bytes": 41,
-                "total_bytes": 41,
-                "base_addr": 0,
-                "reverse_indexed": False,
-            },
-        )()
+        import types
+
+        region = types.SimpleNamespace(
+            unit_bytes=41, total_bytes=41, base_addr=0, reverse_indexed=False
+        )
         with self.assertRaises(ValueError):
             self.Region.of("page.0.kv", "page", region)
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import threading
 from enum import Enum
+from typing import Optional
 
 import msgspec
 
@@ -58,7 +59,7 @@ class MoRIIOAgentMetadata(
 
     engine_id: str
     agent_metadata: bytes
-    kv_caches_base_addr: list[int] | None = None
+    kv_caches_base_addr: Optional[list[int]] = None
     num_blocks: int = 0
     block_len: int = 0
     attn_backend_name: str = "aiter"
@@ -67,7 +68,8 @@ class MoRIIOAgentMetadata(
     state_descs: dict[str, bytes] | None = None
     state_slot_bytes: dict[str, int] | None = None
     num_state_slots: int = 0
-    # JSON [name, kind, unit, total, reverse, chunk] per region. None per-layer.
+    # Region-mode layout (JSON list of [name, kind, unit_bytes, total_bytes,
+    # reverse_indexed, chunk_bytes]), or None for per-layer registration.
     region_layout: str | None = None
 
 
@@ -118,7 +120,7 @@ class _RoleManager:
     instead of accessing this class directly.
     """
 
-    _instance: _RoleManager | None = None
+    _instance: Optional[_RoleManager] = None
     _lock = threading.Lock()
 
     def __init__(self) -> None:
