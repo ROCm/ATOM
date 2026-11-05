@@ -144,6 +144,9 @@ class EngineCore:
             # adding an architecture never touches this line.
             config.pool_entries = block_info.get("pool_entries", {})
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
+            config.pd_admission_block_bytes = block_info.get(
+                "pd_admission_block_bytes", 0
+            )
             # Where a windowed draft's block pass reads, which only the runner's
             # drafter knows; the block manager frees the draft's blocks by it.
             config.draft_window_geometry = block_info.get("draft_window")
