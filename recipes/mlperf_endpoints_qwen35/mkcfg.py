@@ -74,6 +74,11 @@ if os.environ.get("CLIENT_MAX_IDLE"):
     cfg["settings"].setdefault("client", {})["max_idle_time"] = float(os.environ["CLIENT_MAX_IDLE"])
 if os.environ.get("METRICS_TOKENIZER_WORKERS"):
     cfg["settings"]["metrics_tokenizer_workers"] = int(os.environ["METRICS_TOKENIZER_WORKERS"])
+# METRICS_ISL=0: no client-side input-length metric. The metrics aggregator renders and re-tokenizes every full
+# prompt (~100k tokens) in one GIL-bound thread; at c1536 its backlog after a 10-minute cap was ~275k prompts and
+# the report never got written. ISL is not a reported metric (TPS / TPOT / TTFT are unaffected). Unset: base yaml.
+if os.environ.get("METRICS_ISL"):
+    cfg["settings"]["metrics_isl"] = os.environ["METRICS_ISL"] == "1"
 cfg["endpoint_config"]["endpoints"] = ["http://localhost:8000"]
 cfg["report_dir"] = report_dir
 
