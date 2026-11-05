@@ -482,54 +482,38 @@ class EngineCore:
 
     def _process_engine_step_inner(self):
         step_t0 = time.time()
-        result = self.scheduler.schedule()
+        inflight = self.__dict__.pop("_early_inflight", None)
+        if inflight is not None:
+            # A prefill batch `_dispatch_early_prefill` already sent while the
+            # previous decode forward was in flight: only its output is left.
+            scheduled_batch, seqs, step_key = inflight
+            has_seqs = True
+            fwd_out = self._wait_forward()
+        else:
+            result = self.scheduler.schedule()
+            self._surface_rejected()
 
-        # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
-        # the scheduler) through the same finished-seq path as normal seqs.
-        # Without this, `llm.generate()` blocks forever waiting for an output
-        # the rejected seq will never produce.
-        rejected = self.scheduler.take_rejected()
-        if rejected:
-            self._release_multimodal_requests(rejected)
-            self.output_queue.put_nowait(rejected)
+            if result is None:
+                self._advance_idle_kv_transfer()
+                return False
+            scheduled_batch, seqs = result
 
-        if result is None:
-            self._advance_idle_kv_transfer()
-            return False
-        scheduled_batch, seqs = result
-
-        if scheduled_batch is None:
-            logger.debug("%s: No sequences to schedule, skipping forward", self.label)
-            self._advance_idle_kv_transfer()
-            return False
-
-        # Dispatch KV connector metadata to workers (triggers async KV load)
-        if (
-            self.kv_transfer_enabled
-            and scheduled_batch.connector_meta_output is not None
-        ):
-            self.runner_mgr.call_func(
-                "process_kvconnector_output", scheduled_batch.connector_meta_output
+            if scheduled_batch is None:
+                logger.debug(
+                    "%s: No sequences to schedule, skipping forward", self.label
+                )
+                self._advance_idle_kv_transfer()
+                return False
+            has_seqs = len(scheduled_batch.req_ids) > 0
+            early = has_seqs and self._early_prefill_ok(scheduled_batch)
+            step_key, fwd_out = self._dispatch_forward(
+                scheduled_batch, seqs, step_t0, wait=not early
             )
+            if early:
+                self._dispatch_early_prefill()
+                fwd_out = self._wait_forward()
 
-        # Run the model forward pass if there are actual sequences
-        has_seqs = len(scheduled_batch.req_ids) > 0
-        step_key = None
-        if has_seqs and timeline.enabled():
-            self._timeline_step = getattr(self, "_timeline_step", 0) + 1
-            kind = "P" if scheduled_batch.total_seqs_num_prefill else "D"
-            step_key = (
-                f"e{self._timeline_step}:{kind}{scheduled_batch.total_tokens_num}"
-            )
-            timeline.mark(step_key, "step_start", step_t0)
-            timeline.mark(step_key, "scheduled")
         if has_seqs:
-            self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
-            tracing.record_forward(scheduled_batch, seqs)
-            self.scheduler.metrics.record_forward(scheduled_batch, seqs)
-            fwd_out = self.runner_mgr.call_func(
-                "forward", scheduled_batch, wait_out=True
-            )
             if step_key is not None:
                 timeline.mark(step_key, "forwarded")
             if (
@@ -552,6 +536,90 @@ class EngineCore:
         if step_key is not None:
             timeline.mark(step_key, "postprocessed")
         return True
+
+    def _surface_rejected(self):
+        # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
+        # the scheduler) through the same finished-seq path as normal seqs.
+        # Without this, `llm.generate()` blocks forever waiting for an output
+        # the rejected seq will never produce.
+        rejected = self.scheduler.take_rejected()
+        if rejected:
+            self._release_multimodal_requests(rejected)
+            self.output_queue.put_nowait(rejected)
+
+    def _dispatch_forward(self, scheduled_batch, seqs, step_t0, wait=True):
+        """Send `scheduled_batch`'s forward to the workers. Returns its timeline
+        key (None when the timeline is off) and, with `wait`, its output; without
+        it the output stays queued for `_wait_forward`."""
+        # Dispatch KV connector metadata to workers (triggers async KV load)
+        if (
+            self.kv_transfer_enabled
+            and scheduled_batch.connector_meta_output is not None
+        ):
+            self.runner_mgr.call_func(
+                "process_kvconnector_output", scheduled_batch.connector_meta_output
+            )
+        if not scheduled_batch.req_ids:
+            return None, None
+        step_key = None
+        if timeline.enabled():
+            self._timeline_step = getattr(self, "_timeline_step", 0) + 1
+            kind = "P" if scheduled_batch.total_seqs_num_prefill else "D"
+            step_key = (
+                f"e{self._timeline_step}:{kind}{scheduled_batch.total_tokens_num}"
+            )
+            timeline.mark(step_key, "step_start", step_t0)
+            timeline.mark(step_key, "scheduled")
+        self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
+        tracing.record_forward(scheduled_batch, seqs)
+        self.scheduler.metrics.record_forward(scheduled_batch, seqs)
+        if wait:
+            return step_key, self.runner_mgr.call_func(
+                "forward", scheduled_batch, wait_out=True
+            )
+        self.runner_mgr.call_func("forward", scheduled_batch)
+        return step_key, None
+
+    def _wait_forward(self):
+        """The output of the oldest forward still in flight."""
+        ret = self.runner_mgr.outputs_queue.get()
+        if isinstance(ret, SystemExit):
+            raise ret
+        return ret
+
+    def _early_prefill_ok(self, scheduled_batch) -> bool:
+        """ATOM_EARLY_PREFILL_SCHEDULE: may the next tick's prefill half run
+        while this batch's forward is in flight? Only after a pure decode
+        batch, with no partial prefill in flight, on a single TP group without
+        a KV connector or pipeline stages (see
+        `Scheduler.try_schedule_prefill_early`)."""
+        sch = self.scheduler
+        delayer = getattr(sch, "prefill_delayer", None)
+        return (
+            envs.ATOM_EARLY_PREFILL_SCHEDULE
+            and type(self) is EngineCore
+            and (delayer is None or delayer.is_local)
+            and not self.kv_transfer_enabled
+            and scheduled_batch.total_seqs_num_prefill == 0
+            and bool(sch.waiting)
+            and getattr(sch, "_partial_prefill_count", 1) == 0
+            and not getattr(sch, "advance_on_schedule", True)
+            and getattr(sch, "kv_connector", None) is None
+            and hasattr(sch, "try_schedule_prefill_early")
+        )
+
+    def _dispatch_early_prefill(self):
+        """Schedule and dispatch the next tick's prefill batch now, behind the
+        decode forward the workers are running, so neither the schedule nor
+        the dispatch sits between the two forwards."""
+        step_t0 = time.time()
+        result = self.scheduler.try_schedule_prefill_early()
+        self._surface_rejected()
+        if result is None:
+            return
+        scheduled_batch, seqs = result
+        step_key, _ = self._dispatch_forward(scheduled_batch, seqs, step_t0, wait=False)
+        self._early_inflight = (scheduled_batch, seqs, step_key)
 
     def _postprocess(self, seqs, fwd_out, batch):
         # Pass stream_output_queue to postprocess for streaming callbacks
