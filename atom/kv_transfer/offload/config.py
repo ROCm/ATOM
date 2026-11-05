@@ -448,7 +448,7 @@ def build_lmcache_config(
 
 
 def lmcache_engine_id(config) -> str:
-    """Return the LMCache engine id for this process, namespaced by DP rank.
+    """Return the LMCache engine id for this process: one per server and DP rank.
 
     A scheduler's ``LookupClient`` and its workers' ``LookupServer`` derive the
     same ZMQ ipc socket path from this id, so it must be identical inside one
@@ -460,6 +460,12 @@ def lmcache_engine_id(config) -> str:
     Under ``--enable-dp-attention`` this is the normal case, not a corner case:
     ``CoreManager`` folds TP into DP, so each GPU becomes its own replica with
     ``tensor_parallel_size == 1``.
+
+    The socket lives under a fixed host directory, so two servers on one host
+    would both bind ``dp0`` and a scheduler would follow the other server's
+    hits. ``data_parallel_base_port`` (the runners' TCPStore port, bound by
+    ``CoreManager`` for the server's lifetime) tells servers apart; unresolved
+    (0), the DP rank alone is used. The id is not part of a chunk's key.
     """
     dp_rank = int(
         getattr(
@@ -469,6 +475,16 @@ def lmcache_engine_id(config) -> str:
         )
         or 0
     )
+    port = int(
+        getattr(
+            getattr(config, "parallel_config", None),
+            "data_parallel_base_port",
+            0,
+        )
+        or 0
+    )
+    if port > 0:
+        return f"atom-offload-r{port}-dp{dp_rank}"
     return f"atom-offload-dp{dp_rank}"
 
 

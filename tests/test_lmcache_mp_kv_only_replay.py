@@ -167,7 +167,9 @@ def _scheduler(monkeypatch, *, chunks, replay=REPLAY, min_load=0):
         compute_hash=BlockManager.compute_hash,
         state_replay_tokens=replay,
         fall_back_to_hbm_replay=fallbacks.append,
+        anchor_grids=[],
     )
+    manager.align_checkpoint_anchor = manager.anchor_grids.append
     manager._hash_block_tokens = lambda seq, index: BlockManager._hash_block_tokens(
         manager, seq, index
     )
@@ -387,6 +389,14 @@ def test_no_replay_keeps_the_images(monkeypatch):
     scheduler, _, adapter, _ = _scheduler(monkeypatch, chunks=0, replay=0)
     assert not scheduler._page_only
     assert adapter.images is True
+
+
+def test_images_put_the_prompt_end_anchor_on_the_chunk_grid(monkeypatch):
+    """An image is stored only at a chunk boundary; PAGE alone at any."""
+    replays, _, _, _ = _scheduler(monkeypatch, chunks=0)
+    assert replays._block_manager.anchor_grids == []
+    images, _, _, _ = _scheduler(monkeypatch, chunks=0, replay=0)
+    assert images._block_manager.anchor_grids == [images.chunk_size]
 
 
 def test_a_page_only_save_stores_page_alone_with_no_checkpoint(monkeypatch):

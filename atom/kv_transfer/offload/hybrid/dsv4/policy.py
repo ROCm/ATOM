@@ -305,8 +305,10 @@ def _committed_sidecar_capacity(kvc) -> int:
 def _chained_prefix_hashes(
     token_ids: array.array,
     hash_block_size: int,
+    seed: int = -1,
 ) -> dict[int, int]:
-    """Return each full-block prefix hash using BlockManager's exact chain."""
+    """Return each full-block prefix hash using BlockManager's exact chain,
+    which starts from the request's ``cache_seed``."""
 
     if hash_block_size <= 0:
         raise ValueError("hash_block_size must be positive")
@@ -314,7 +316,7 @@ def _chained_prefix_hashes(
     from atom.model_engine.block_manager import BlockManager
 
     hashes: dict[int, int] = {}
-    parent = -1
+    parent = seed
     for boundary in range(hash_block_size, len(token_ids) + 1, hash_block_size):
         parent = BlockManager.compute_hash(
             token_ids[boundary - hash_block_size : boundary],

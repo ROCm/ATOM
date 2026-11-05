@@ -121,7 +121,9 @@ def make_scheduler(
         enable_prefix_caching=True,
         hash_block_size=4,
         compute_hash=BlockManager.compute_hash,
+        anchor_grids=[],
     )
+    manager.align_checkpoint_anchor = manager.anchor_grids.append
     # BlockManager's own chain walk (seed, algorithm, token slices).
     manager._hash_block_tokens = lambda seq, index: BlockManager._hash_block_tokens(
         manager, seq, index
@@ -305,6 +307,12 @@ def test_save_frontier_rescans_only_when_frontier_or_checkpoints_change(
     checkpoints.store.unindex(scheduler._boundary_hash(seq, 16))  # ours drops
     assert scheduler._save_frontier(seq) == 8
     assert len(calls) > rescanned
+
+
+def test_binding_puts_the_prompt_end_anchor_on_the_chunk_grid(monkeypatch):
+    """Images are stored only at a chunk boundary; the rebind is a no-op."""
+    scheduler, _, _ = make_scheduler(monkeypatch)
+    assert scheduler._block_manager.anchor_grids == [8]
 
 
 def test_default_min_save_tokens_skips_a_short_prompt(monkeypatch):
