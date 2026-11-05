@@ -76,6 +76,7 @@ from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import (
     eager_region,
     on_scheduled_rows,
+    on_scheduled_rows_into,
     padded_prefill_rows,
     token_graph,
 )
@@ -1045,21 +1046,20 @@ def _kda_recurrence(
     mixed_qkv: torch.Tensor,
     gate: torch.Tensor,
     beta: torch.Tensor,
+    out: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    """A prefill's causal conv and KDA recurrence, ``[T, heads, head_dim]``:
-    the TR-graph break of a split KDA layer, whose launches follow each
-    request's rows and state slots. ``gate`` and ``beta`` are ``[T, ...]``
-    so a padded bucket's rows slice like ``mixed_qkv``'s."""
+    """A prefill's causal conv and KDA recurrence, written into ``out``
+    (``[T, heads, head_dim]``) and handed back: the TR-graph break of a split
+    KDA layer, whose launches follow each request's rows and state slots.
+    ``gate`` and ``beta`` are ``[T, ...]`` so a padded bucket's rows slice like
+    ``mixed_qkv``'s. ``out`` comes zeroed from the recorded segment, so its
+    rows past the scheduled ones stay zero and a replay copies nothing."""
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return on_scheduled_rows(
-        self._prefill_recurrence_rows,
-        padded_prefill_rows(mixed_qkv.shape[0]),
-        mixed_qkv,
-        gate,
-        beta,
+    return on_scheduled_rows_into(
+        self._prefill_recurrence_rows, out, mixed_qkv, gate, beta
     )
 
 
@@ -1702,36 +1702,45 @@ class KimiKDAAttention(nn.Module):
         mixed_qkv, out_gate, beta, gate = self._project_in(
             hidden_states, hidden_states_scale
         )
-        out = _kda_recurrence(mixed_qkv, gate, beta, self.layer_name)
+        # Zeroed here, in the recorded segment: the region writes the scheduled
+        # rows in place, so neither it nor the replay copies the output.
+        out = mixed_qkv.new_zeros(
+            (mixed_qkv.shape[0], self.num_local_heads, self.head_dim)
+        )
+        out = _kda_recurrence(mixed_qkv, gate, beta, out, self.layer_name)
         return self._project_out(out, out_gate, True)
 
     def _prefill_recurrence_rows(
-        self, mixed_qkv: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor
-    ) -> torch.Tensor:
+        self,
+        out: torch.Tensor,
+        mixed_qkv: torch.Tensor,
+        gate: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> None:
         """`_prefill_recurrence` for `_kda_recurrence`, on ``[T, ...]`` inputs
-        and the live step's state; zeros on a step with no KDA metadata (the
-        recording's dummy prefill)."""
+        and the live step's state, written into ``out[:T]``. A step with no KDA
+        metadata (the recording's dummy prefill) leaves ``out`` as it is."""
         fwd_ctx = get_forward_context()
         kda_metadata = getattr(fwd_ctx.attn_metadata, "kda_metadata", None)
         if kda_metadata is None:
             kda_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
         if kda_metadata is None:
-            return mixed_qkv.new_zeros(
-                (mixed_qkv.shape[0], self.num_local_heads, self.head_dim)
-            )
+            return
         cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
         conv_state, ssm_state = cache.k_cache, cache.v_cache
         if conv_state.size(1) != self.local_proj_size * 3:
             conv_state = conv_state.transpose(-1, -2)
         n = kda_metadata.num_actual_tokens
-        return self._prefill_recurrence(
-            mixed_qkv[:n],
-            rearrange(gate[:n], "t (h d) -> 1 t h d", d=self.head_dim),
-            beta[:n].unsqueeze(0),
-            kda_metadata,
-            cache,
-            conv_state,
-            ssm_state,
+        out[:n].copy_(
+            self._prefill_recurrence(
+                mixed_qkv[:n],
+                rearrange(gate[:n], "t (h d) -> 1 t h d", d=self.head_dim),
+                beta[:n].unsqueeze(0),
+                kda_metadata,
+                cache,
+                conv_state,
+                ssm_state,
+            )
         )
 
 
