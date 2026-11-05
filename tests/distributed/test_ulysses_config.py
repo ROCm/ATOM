@@ -70,6 +70,7 @@ def test_gqa_rejects_partial_heads(query_heads, kv_heads, world):
         ({"speculative_config": object()}, "speculative decoding"),
         ({"kv_transfer_config": {"kv_connector": "mooncake"}}, "KV transfer"),
         ({"hf_config": SimpleNamespace(kv_lora_rank=512)}, "MHA models only"),
+        ({"hf_config": SimpleNamespace(_multimodal_config=object())}, "multimodal"),
     ],
 )
 def test_unsharded_execution_paths_are_rejected(overrides, reason):
@@ -90,12 +91,15 @@ def test_mega_moe_backend_needs_expert_parallelism_only_without_sp(sp, ep, error
         Config._init_moe_backend(config)
 
 
-def test_minimax_m3_builds_no_vision_tower_under_sp():
+def test_minimax_m3_serves_text_only_under_sp():
     config = atom_config_double(
         sequence_parallel_size=4,
-        hf_config=SimpleNamespace(vision_config=object()),
-        compilation_config=SimpleNamespace(cudagraph_mode=None),
+        hf_config=SimpleNamespace(
+            vision_config=object(), num_attention_heads=32, num_key_value_heads=4
+        ),
+        compilation_config=SimpleNamespace(level=0, cudagraph_mode=None),
     )
+    Config._init_sequence_parallel(config)
     assert image_input_refusal(config) == "Ulysses SP (--sequence-parallel-size > 1)"
     config.sequence_parallel_size = 1
     assert image_input_refusal(config) is None

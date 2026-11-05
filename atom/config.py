@@ -2377,6 +2377,13 @@ class Config:
                 "Ulysses SP does not support --enable-rapidserve: it hands KV "
                 "over by TP rank only."
             )
+        # Every vision tower but MiniMax-M3's is built from this config; M3
+        # builds none under SP (`image_input_refusal`) and serves text.
+        if getattr(self.hf_config, "_multimodal_config", None) is not None:
+            raise ValueError(
+                "Ulysses SP does not support multimodal checkpoints: it does "
+                "not shard the inputs_embeds a vision tower feeds the model."
+            )
         # Local import: atom.utils pulls in atom.config at module scope.
         from atom.utils import get_hf_text_config
         from atom.utils.selector import Family, attn_family
