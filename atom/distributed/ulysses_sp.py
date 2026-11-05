@@ -91,8 +91,9 @@ def sp_local_len(total_tokens: int) -> int:
 
 
 def sp_local_slice(total_tokens: int) -> slice:
-    """This rank's contiguous token range. The last rank's may run past
-    ``total_tokens``; attention and the final gather drop those rows."""
+    """This rank's contiguous token range. Trailing ranks' may run past
+    ``total_tokens``, some entirely; attention and the final gather drop those
+    rows."""
     from aiter.dist.parallel_state import get_pcp_group
 
     local = sp_local_len(total_tokens)

@@ -126,7 +126,7 @@ def test_runner_model_height_and_sampling_rows(
     sp_prefill = sp_rank is not None and prefill
 
     # SP runs on its range of the global ids, the address its graphs capture;
-    # the last range may run past the step into rows whose outputs are dropped.
+    # trailing ranges may run past the step into rows whose outputs are dropped.
     rows = (
         slice(0, expected_rows)
         if sp_rank is None

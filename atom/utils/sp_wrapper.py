@@ -23,7 +23,7 @@ class SPModelWrapper(nn.Module):
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor):
         num_tokens = input_ids.shape[0]
         rows = sp_local_slice(num_tokens)
-        # Every range has the same length, so the last one may run past the
+        # Every range has the same length, so trailing ones may run past the
         # batch into the runner's input buffer (`max_num_batched_tokens`
         # divides by SP); the gather drops those rows. Graphs keep the address.
         local_ids = input_ids.as_strided(

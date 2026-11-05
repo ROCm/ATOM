@@ -42,16 +42,19 @@ def test_rank_ranges_tile_the_sequence_in_order(monkeypatch, world, total):
 
 
 @pytest.mark.parametrize("world", [2, 4])
-def test_gather_rows_matches_full_gather(monkeypatch, world):
+@pytest.mark.parametrize("total", [13, 5])
+def test_gather_rows_matches_full_gather(monkeypatch, world, total):
     # Last rows of prompts of 1, 3, 3, 1, 2 and 3 tokens: they land on every
     # rank, on a range's first and last row, and next to the rows past the end.
+    # At 5 tokens on 4 ranks the last rank holds only pad rows.
     buffer, rows = torch.randn(16, 8), torch.tensor([0, 3, 6, 7, 9, 12])
-    hidden = buffer[:13]
+    rows = rows[rows < total]
+    hidden = buffer[:total]
 
     def on_each_rank(fn, all_gatherv=None):
         return _on_each_rank(monkeypatch, world, fn, all_gatherv)
 
-    shards = on_each_rank(lambda _: buffer[sp.sp_local_slice(13)])
+    shards = on_each_rank(lambda _: buffer[sp.sp_local_slice(total)])
     sent = []
     on_each_rank(
         lambda rank: sp.sp_gather_rows(shards[rank], rows),
