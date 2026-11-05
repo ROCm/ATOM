@@ -206,31 +206,19 @@ MiniMax-M3.1-Flash runs a different configuration from the M3 recipe above:
 
 The reference is the SemiAnalysis InferenceX SGLang recipe `minimaxm31flash-fp4-mi355x-sglang-agentic-dspark` (TP4, K=7, golden accepted length 4.04, CI run 40110172586).
 
-The concurrency range splits in two:
-
-| CONC | KV / index cache | prefill delayer | needs |
-|---|---|---|---|
-| 1–16 | FP8 / FP8 | `ATOM_PREFILL_DECODE_INTERVAL=20000` | `main` |
-| 32–48 | **NVFP4 / FP4** + fused verify top-k | off | #2744 (open as of 2026-10-28; on `main` without it the second band's flags do not exist) |
+Every concurrency runs the same configuration on `main`: FP8 KV and FP8 index cache. Only the prefill delayer changes: `ATOM_PREFILL_DECODE_INTERVAL=20000` up to CONC 16, off at 32 and 48.
 
 The command runs the checkpoint as shipped:
 - no `--online_quant_config`, so attention and the dense MLPs stay MXFP8;
 - the shared expert is not fused into the MXFP4 MoE (`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4` unset);
 - no quick-allreduce quantization (`AITER_QUICK_REDUCE_QUANTIZATION` unset).
 
-Mono decode (`ATOM_MONO_ENABLE=1`) needs per-token FP8 attention linears and a fused shared expert, so it declines this configuration. Every band therefore runs the production decode path.
+Mono decode (`ATOM_MONO_ENABLE=1`) needs per-token FP8 attention linears and a fused shared expert, so it declines this configuration. Every point therefore runs the production decode path.
 
-**Why the second band needs NVFP4.** With FP8 KV and FP8 index the cache cannot hold the agentic working set from CONC 48. At c48 with `--gpu-memory-utilization 0.8`:
-- the cache holds 6.06M tokens, against 7.97M tokens in flight at p50;
-- the token-weighted prefix hit collapses to 19.9% (the traces allow 96.6%);
-- TTFT p50 is 44 s and output is ~94 tok/s/GPU.
-
-KV block bytes for TP4 (from the server log, 128-token blocks) and the capacity at `--gpu-memory-utilization 0.9`:
-
-| KV | index | block_bytes | blocks | tokens |
-|---|---|---:|---:|---:|
-| FP8 | FP8 | 3,179,520 | 57,011 | 7.3M |
-| NVFP4 | FP4 | 1,827,840 | ~99,200 | **12.7M** |
+**Known limit: cache capacity at CONC 48.** The FP8 KV and index cache, TP4, 128-token blocks: `block_bytes=3179520`, 57,011 blocks (7.3M tokens) at `--gpu-memory-utilization 0.9`. That cannot hold the agentic working set at CONC 48. Measured earlier at c48 with `--gpu-memory-utilization 0.8`:
+- the cache held 6.06M tokens, against 7.97M tokens in flight at p50;
+- the token-weighted prefix hit collapsed to 19.9% (the traces allow 96.6%);
+- TTFT p50 was 44 s and output ~94 tok/s/GPU.
 
 ```bash
 MODEL=/shared/data/amd_int/models/amd/MiniMax-M3.1-Flash-Quark-MXFP4   # draft at $MODEL/dspark
@@ -241,23 +229,17 @@ Capture every batch size up to 8, then in steps of 2 / 4 / 8 / 16 up to the runn
 
 ```bash
 CAPTURE=$(python3 -c "m=2*$CONC; print([s for s in [1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128] if s<=max(m,2)])")
-BAND_ENV=""
-BAND_ARGS="--kv_cache_dtype fp8 --index-cache-dtype fp8"
-if [ "$CONC" -le 16 ]; then
-  BAND_ENV="ATOM_PREFILL_DECODE_INTERVAL=20000"
-elif [ "$CONC" -ge 32 ]; then
-  BAND_ENV="ATOM_M3_SPARSE_KV_NVFP4=1"                      # sparse layers' K/V go NVFP4
-  BAND_ARGS="--kv_cache_dtype fp8 --index-cache-dtype fp4"
-fi
+DELAYER=""
+[ "$CONC" -le 16 ] && DELAYER="ATOM_PREFILL_DECODE_INTERVAL=20000"
 
-env $BAND_ENV \
+env $DELAYER \
   AITER_LOG_LEVEL=WARNING \
   ATOM_FORCE_ATTN_TRITON=1 \
   ATOM_MONO_ENABLE=1 \
   python3 -u -m atom.entrypoints.openai_server \
     --model "$MODEL" --served-model-name MiniMaxAI/MiniMax-M3.1-Flash \
     --tensor-parallel-size 4 --host 0.0.0.0 --port 8006 --server-port 8000 \
-    --trust-remote-code $BAND_ARGS \
+    --trust-remote-code --kv_cache_dtype fp8 --index-cache-dtype fp8 \
     --block-size 128 --max-model-len 1048576 --max-num-seqs $((2 * CONC > 2 ? 2 * CONC : 2)) \
     --max-num-batched-tokens 32768 --gpu-memory-utilization 0.9 \
     --enable-prefix-caching \
@@ -268,14 +250,15 @@ env $BAND_ENV \
 ```
 
 - `--spec-decode-acceptance-length 4.04` is SGLang CI's golden accepted length, applied the way InferenceX applies it. It is performance-only. Drop it for accuracy runs.
-- `ATOM_PREFILL_DECODE_INTERVAL=20000` turns on the TP-local prefill delayer: while any request is decoding, no new prefill is admitted. It is on for every FP8 point because interactivity is the metric that matters here.
+- `ATOM_PREFILL_DECODE_INTERVAL=20000` turns on the TP-local prefill delayer: while any request is decoding, no new prefill is admitted. It is on up to CONC 16 because interactivity is the metric that matters here. Measured with the previous command (Mono on):
   - P90 interactivity rises at c1 / c2 / c4 / c8 / c16 by 3.5% / 25.8% / 30.5% / 22.6% / 29.2%.
   - Throughput moves −1.1% / +0.8% / −3.4% / −4.1% / −11.1%.
   - The cost is TTFT, and it grows with load: p90 goes from 0.88 to 2.1 s at c4, 0.73 to 6.6 s at c8, and 0.77 to 14.2 s at c16.
-- Check which band actually came up from the startup lines:
-  - FP8 band: `PrefillDelayer initialized`, and `MiniMax-M3 mono decode off: ...` (the reason names the first unmet Mono requirement).
-  - NVFP4 band: `block_bytes=1827840`, `sparse KV is NVFP4`, and `mono decode off`.
-- Leave `ATOM_M3_INDEXER_CP` unset. The FP4 index refuses it, and at c16 the decode batch × context (~0.84M tokens) is under its ~1M break-even.
+- Check the startup lines:
+  - `block_bytes=3179520`;
+  - `MiniMax-M3 mono decode off: ...`, where the reason names the first unmet Mono requirement;
+  - up to CONC 16, `PrefillDelayer initialized`.
+- `ATOM_M3_INDEXER_CP` is left unset. At c16 the decode batch × context (~0.84M tokens) is under its ~1M break-even; at c32 / c48 it has not been measured on M3.1.
 
 Client: the InferenceX AgentX harness (`agentx-harness` 1.0.12), which drives the same `semianalysis_cc_traces_weka_062126` replay as the aiperf command above:
 
@@ -292,7 +275,12 @@ agentx profile \
 
 ### Measured (M3.1)
 
-> **To be re-measured.** Every number below was taken with the previous command, which added three settings: `--online_quant_config` (`ptpc_fp8` attention and dense MLPs), `AITER_QUICK_REDUCE_QUANTIZATION=INT4`, and `ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1`. The FP8 band therefore ran with Mono decode. The command above drops all three, so Mono is off and these rows do not describe it. They will be replaced with runs of the command above.
+> **To be re-measured.** Every number below was taken with the previous command, not the one above. That command added:
+> - `--online_quant_config` (`ptpc_fp8` attention and dense MLPs);
+> - `AITER_QUICK_REDUCE_QUANTIZATION=INT4`;
+> - `ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1`.
+>
+> It also ran c32 / c48 with NVFP4 KV and FP4 index from #2744, which is not on `main`. So c1–c16 ran with Mono decode. The command above drops all of this, and these rows do not describe it. They will be replaced with runs of the command above.
 
 Setup:
 - one MI355X node, TP4, the previous command (see the note above), 3600 s per point, synthetic accepted length 4.04;
@@ -326,7 +314,7 @@ gsm8k (lm-eval, InferenceX CI's method: 5-shot, chat template, temperature 0, al
 | band | strict-match |
 |---|---|
 | FP8 + Mono, K=7 | 0.9682 ± 0.0048 |
-| NVFP4 (#2744 on main 035a78a4d) | 0.9644 ± 0.0051 |
+| NVFP4 (#2744 on main 035a78a4d, not on `main`) | 0.9644 ± 0.0051 |
 | SGLang CI | 0.9598 ± 0.0054 |
 
 ## Notes
