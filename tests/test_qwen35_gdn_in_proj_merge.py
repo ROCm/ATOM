@@ -16,14 +16,14 @@ import torch
 
 pytest.importorskip("aiter", reason="qwen3_5 model imports aiter at module level")
 
-from atom import quant_spec  # noqa: E402
-from atom.config import QuantizationConfig  # noqa: E402
-from atom.models.qwen3_5 import (  # noqa: E402
+from atom import quant_spec
+from atom.config import QuantizationConfig
+from atom.models.qwen3_5 import (
     _QWEN3_5_PACKED_MODULES_MAPPING,
     _apply_merged_in_proj_mapping,
     gdn_in_proj_is_merged,
 )
-from atom.quant_spec import LayerQuantConfig, QuantType  # noqa: E402
+from atom.quant_spec import LayerQuantConfig, QuantType
 
 
 class _FakeQuantType(enum.IntEnum):
