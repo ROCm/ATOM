@@ -22,6 +22,7 @@ topologies, each with optional EAGLE3 speculative decoding.
 | 1P+1D + EAGLE3 | 1 | 8 | TP=4, eagle3 | TP=4, eagle3 | 1–256 |
 | 2P+1D DPA | 3 | 4 each | TP=4, DPA+TBO | TP=4, DPA | 256–1024 |
 | 2P+1D DPA + EAGLE3 | 3 | 4 each | TP=4, DPA+TBO, eagle3 | TP=4, DPA, eagle3 | 256–1024 |
+| 1P+1D PP4 prefill (M3.1 + DSpark) | 1 | 8 | PP=4 (TP=1), dspark | TP=4, dspark | — |
 
 ## Environment Setup
 
@@ -284,6 +285,42 @@ Append these three flags to **both** the prefill and decode server commands:
 ```
 
 The router command stays the same.
+
+---
+
+## 1P+1D — PP4 Prefill + TP4 Decode (MiniMax-M3.1-Flash, DSpark)
+
+Prefill as four pipeline stages of one GPU each (GPU 0-3), decode at TP=4
+(GPU 4-7), both with the DSpark draft in the checkpoint's `dspark/`. Use the
+[Common Env Vars](#common-env-vars) plus:
+
+```bash
+model=amd/MiniMax-M3.1-Flash-Quark-MXFP4
+export ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1 MC_DISABLE_HIP=1
+OQ='{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}'
+ARGS=(--model $model --trust-remote-code --host 0.0.0.0 --kv_cache_dtype fp8
+  --index-cache-dtype fp8 --block-size 128 --gpu-memory-utilization 0.9
+  --max-model-len 131072 --max-num-seqs 128 --online_quant_config "$OQ"
+  --no-enable_prefix_caching --default-chat-template-kwargs '{"thinking_mode": "enabled"}'
+  --method dspark --draft-model $model/dspark --num-speculative-tokens 7)
+
+HIP_VISIBLE_DEVICES=0,1,2,3 python3 -m atom.entrypoints.openai_server "${ARGS[@]}" \
+  --server-port 8010 --port 18006 -tp 1 -pp 4 --enforce-eager \
+  --max-num-batched-tokens 8192 \
+  --kv-transfer-config '{"kv_role":"kv_producer","kv_connector":"mooncake","handshake_port":6301}'
+
+HIP_VISIBLE_DEVICES=4,5,6,7 python3 -m atom.entrypoints.openai_server "${ARGS[@]}" \
+  --server-port 8020 --port 28006 -tp 4 \
+  --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}'
+```
+
+Start the [router](#router) as for 1P+1D. Notes:
+
+- Keep the prefill's `--max-num-batched-tokens` at or below 16383: the sparse
+  prefill launches one `pa_fwd` row per (token, KV head), HIP caps a launch at
+  65535 rows, and a TP=1 stage holds all four KV heads.
+- Run both sides with the same speculative config: the decode drafts from the
+  context K/V the prefill writes.
 
 ---
 

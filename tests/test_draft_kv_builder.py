@@ -175,6 +175,8 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
     pool.allocate(2, "cpu")
     builder = DraftKvBuilder.__new__(DraftKvBuilder)
     builder._kv_pool = pool
+    # One draft layer bound to row 0, as the runner's walk would find it.
+    builder._pool_rows = {DRAFT_KV_ROWS: {object(): 0}}
 
     transfer = builder.get_kv_transfer_tensors()
     transfer.set_block_count(2)
