@@ -622,7 +622,9 @@ class Sequence:
         """int16 [rows, layers, top_k], or None if no patch ever arrived.
 
         A copy while the request runs; the shared read-only array once
-        ``finish_routed_experts`` has run.
+        ``finish_routed_experts`` has run. A finished request has
+        ``num_tokens - 1`` rows, except an aborted one: its last step's
+        patch may never arrive, so it can have fewer.
         """
         buf = self._routed_expert_buf
         # Zero rows is still [0, layers, top_k]; only a request no patch ever

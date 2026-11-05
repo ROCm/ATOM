@@ -511,8 +511,9 @@ def _select_logical(
     num_fused_shared_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The layer's routing over `num_routing_experts` logical experts,
-    `num_fused_shared_experts` shared columns widened in."""
-    return FusedMoE.select_experts(
+    `num_fused_shared_experts` shared columns widened in. Captured here, the
+    one place every quant method routes through, for routed-expert replay."""
+    topk_weights, topk_ids = FusedMoE.select_experts(
         hidden_states=x,
         router_logits=router_logits,
         use_grouped_topk=layer.use_grouped_topk,
@@ -528,6 +529,8 @@ def _select_logical(
         fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
         routed_scaling_factor=layer.routed_scaling_factor,
     )
+    maybe_capture_routed_experts(layer, topk_ids)
+    return topk_weights, topk_ids
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
@@ -5445,7 +5448,6 @@ class FusedMoE(torch.nn.Module):
         topk_weights, topk_ids = self.quant_method.select_experts(
             self, hidden_states, router_logits
         )
-        maybe_capture_routed_experts(self, topk_ids)
         x_scale = None
         if use_dp_gather_scatter:
             ctx = get_forward_context()
@@ -5521,7 +5523,6 @@ class FusedMoE(torch.nn.Module):
         topk_weights, topk_ids = self.quant_method.select_experts(
             self, hidden_states, router_logits
         )
-        maybe_capture_routed_experts(self, topk_ids)
         dp_repeat = self.moe_parallel_config.dp_logical_ratio
         local_rows = hidden_states.shape[0]
         if dp_repeat > 1:

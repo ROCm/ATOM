@@ -3688,6 +3688,14 @@ class TestRoutedExpertPatches:
         assert seq.routed_experts is frozen
         np.testing.assert_array_equal(frozen, rows)
 
+    def test_short_routes_at_a_normal_finish_raise(self, scheduler, seq_factory):
+        """Only an abort may finish with fewer than ``num_tokens - 1`` rows."""
+        scheduler._return_routed_experts = True
+        seq = seq_factory([1, 2, 3, 4])
+        seq.apply_routed_expert_patch(0, np.zeros((2, 1, 2), dtype=np.int16))
+        with pytest.raises(RuntimeError, match="2 of 4 rows"):
+            scheduler._mark_finished(seq, "eos", 5)
+
     def test_patch_for_a_request_no_longer_running_is_dropped(self, caplog):
         """Rows are matched by request id, never by position; a request that
         left ``running`` (one per finished request under deferred output) is

@@ -11,7 +11,6 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from atom.config import Config, check_return_routed_experts
-from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.model_ops.fused_moe import routed_experts_capturer as cap_mod
 from atom.model_ops.fused_moe.routed_experts_capturer import (
@@ -138,11 +137,31 @@ def test_dp_attention_refuses_a_builder_with_prefill_token_graphs(monkeypatch):
         runner._routed_experts_geometry()
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_only_tp_rank0_allocates_the_capture_buffer(rank):
+    """Every rank plans the same geometry; only rank 0 exports, so only it
+    holds a buffer and the other ranks' hook stays a no-op."""
+    mr = _import_runner()
+    runner = mr.ModelRunner.__new__(mr.ModelRunner)
+    runner._routed_experts_geo = (3, 2)
+    runner._routed_experts_capturer = None
+    runner.rank = rank
+    runner.block_size = 4
+    runner.device = "cpu"
+
+    runner._maybe_init_routed_experts_capturer(num_kvcache_blocks=2)
+
+    if rank == 0:
+        assert RoutedExpertsCapturer.get() is runner._routed_experts_capturer
+        assert runner._routed_experts_capturer.buffer.shape == (9, 3, 2)
+    else:
+        assert runner._routed_experts_capturer is None
+        assert RoutedExpertsCapturer.get() is None
+
+
 def test_flag_off_leaves_field_absent():
     seq = Sequence([1, 2, 3], 3)
     assert seq.routed_experts is None
-    ro = RequestOutput(request_id=0, output_tokens=[1], finished=True)
-    assert ro.routed_experts is None
 
 
 def test_two_request_batch_order_segments():
@@ -269,6 +288,46 @@ def test_prefix_hit_segment_reads_cached_slots():
     assert (r0, s0, r1, s1) == (2, 0, 2, 3)
     np.testing.assert_array_equal(cached, a.rows)
     np.testing.assert_array_equal(new[:, 0, :], [[5, 6]])
+
+
+def test_every_quant_methods_routing_is_captured(monkeypatch):
+    """Quant methods' `select_experts` all go through `_select_logical`, so
+    its capture covers FusedMoE and the comm-fused path alike."""
+    moe = pytest.importorskip(
+        "atom.model_ops.moe",
+        reason="moe imports aiter at module load",
+        exc_type=ImportError,
+    )
+    topk_weights = torch.rand(2, 2)
+    topk_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    monkeypatch.setattr(
+        moe.FusedMoE,
+        "select_experts",
+        staticmethod(lambda **_: (topk_weights, topk_ids)),
+    )
+    captured = []
+    monkeypatch.setattr(
+        moe,
+        "maybe_capture_routed_experts",
+        lambda layer, ids: captured.append((layer, ids)),
+    )
+    layer = SimpleNamespace(
+        use_grouped_topk=False,
+        top_k=2,
+        renormalize=True,
+        topk_group=None,
+        num_expert_group=None,
+        custom_routing_function=None,
+        scoring_func="softmax",
+        e_score_correction_bias=None,
+        shared_expert_scoring_func=None,
+        routed_scaling_factor=1.0,
+    )
+
+    out = moe._select_logical(layer, torch.zeros(2, 4), torch.zeros(2, 8), 8, 0)
+
+    assert out == (topk_weights, topk_ids)
+    assert captured == [(layer, topk_ids)]
 
 
 def test_maybe_capture_skips_when_uninitialized():
@@ -859,36 +918,27 @@ def _runner_with_held(*held: PendingRoutes):
     return runner, ModelRunner
 
 
-@pytest.mark.parametrize("deferred", [True, False])
-def test_middle_chunk_routes_reach_the_next_output_in_order(deferred):
-    """Chunks 0..2 of one prompt: the middle chunk's routes ride the next output.
-
-    Deferred, that output carries the previous batch's routes (chunk 0, older
-    than the held chunk 1); otherwise its own batch's (chunk 2, newer).
-    """
+def test_middle_chunk_routes_reach_the_next_output_in_order():
+    """Chunks 0..2 of one prompt: the middle chunk's routes ride the next output,
+    which carries the previous batch's routes (chunk 0, older than the held
+    chunk 1)."""
     from atom.model_engine.scheduler import Scheduler
 
     runner, cls = _runner_with_held(_pending(7, 4, 4, 1))
-    own = _pending(7, 0, 4, 0) if deferred else _pending(7, 8, 4, 2)
     output = SimpleNamespace(routed_experts=None)
-    cls._attach_routed_experts(runner, own, output, held_first=not deferred)
+    cls._attach_routed_experts(runner, _pending(7, 0, 4, 0), output)
     assert runner._held_routes == []
 
     seq = Sequence(list(range(12)), 4)
-    if not deferred:
-        seq.apply_routed_expert_patch(0, np.zeros((4, 1, 2), dtype=np.int16))
     Scheduler._apply_routed_experts_patch({7: seq}, output.routed_experts)
-    rows = 8 if deferred else 12
-    assert seq.routed_expert_rows == rows
-    np.testing.assert_array_equal(
-        seq.routed_experts[:, 0, 0], np.repeat(np.arange(rows // 4), 4)
-    )
+    assert seq.routed_expert_rows == 8
+    np.testing.assert_array_equal(seq.routed_experts[:, 0, 0], np.repeat([0, 1], 4))
 
 
 def test_held_routes_attach_without_a_batch_of_their_own():
     runner, cls = _runner_with_held(_pending(3, 0, 2, 9), _pending(3, 2, 2, 8))
     output = SimpleNamespace(routed_experts=None)
-    cls._attach_routed_experts(runner, None, output, held_first=False)
+    cls._attach_routed_experts(runner, None, output)
     np.testing.assert_array_equal(output.routed_experts.starts, [0, 2])
     np.testing.assert_array_equal(output.routed_experts.rows[:, 0, 0], [9, 9, 8, 8])
 
@@ -897,19 +947,17 @@ def test_dummy_output_leaves_held_routes_for_the_next_real_output():
     """An idle DP rank's dummy output can be discarded; the held rows must survive it."""
     runner, cls = _runner_with_held(_pending(8, 0, 2, 4))
     dummy_out = SimpleNamespace(routed_experts=None)
-    cls._attach_routed_experts(
-        runner, None, dummy_out, held_first=False, take_held=False
-    )
+    cls._attach_routed_experts(runner, None, dummy_out, take_held=False)
     assert dummy_out.routed_experts is None
     real_out = SimpleNamespace(routed_experts=None)
-    cls._attach_routed_experts(runner, None, real_out, held_first=False)
+    cls._attach_routed_experts(runner, None, real_out)
     np.testing.assert_array_equal(real_out.routed_experts.starts, [0])
 
 
 def test_no_routes_leaves_output_untouched():
     runner, cls = _runner_with_held()
     output = SimpleNamespace(routed_experts=None)
-    cls._attach_routed_experts(runner, None, output, held_first=True)
+    cls._attach_routed_experts(runner, None, output)
     assert output.routed_experts is None
 
 

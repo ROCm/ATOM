@@ -160,6 +160,8 @@ class MemoryManagerMixin:
       - self.label (str)
       - self.tokenID_processor — tokenIDProcessor instance
       - self.req_graph — the decode `ReqGraph` (CUDA graph state)
+      - self._routed_experts_capturer, self._held_routes,
+        self._deferred_routes — routed-expert replay state
       - self.allocate_kv_cache(num_blocks) — method
       - self.capture_cudagraph() — method
       - self.get_num_blocks() — method
@@ -191,6 +193,10 @@ class MemoryManagerMixin:
         # stale GPU tensor references (prev_token_ids, etc.)
         if hasattr(self, "tokenID_processor"):
             self.tokenID_processor.clean()
+        # Routes for the batch `clean()` just dropped; kept, the first
+        # deferred step after wake would attach them to a new batch's output.
+        self._held_routes = []
+        self._deferred_routes = None
 
         if "weights" in tags:
             self._release_weights()

@@ -2426,7 +2426,9 @@ class ModelRunner:
 
     def _maybe_init_routed_experts_capturer(self, num_kvcache_blocks: int) -> None:
         geo = self._routed_experts_geometry()
-        if geo is None:
+        # Only TP rank 0 exports routes; the others keep the KV-pool charge,
+        # so every rank plans the same block count, but capture nothing.
+        if geo is None or self.rank != 0:
             return
         num_layers, top_k = geo
         num_slots = int(num_kvcache_blocks) * int(self.block_size)
@@ -2452,7 +2454,7 @@ class ModelRunner:
         """
         if not self._return_routed_experts:
             return None
-        if getattr(batch, "is_dummy_run", False) or self.rank != 0:
+        if getattr(batch, "is_dummy_run", False):
             return None
         capturer = self._routed_experts_capturer
         if capturer is None:
@@ -2478,20 +2480,19 @@ class ModelRunner:
         own: PendingRoutes | None,
         output: ScheduledBatchOutput,
         *,
-        held_first: bool,
         take_held: bool = True,
     ) -> None:
         """Hand the scheduler ``own`` and the held routes, once.
 
         Oldest step first, since a request's rows must apply in order:
-        ``held_first`` when ``own``'s step ran after the held middle chunks. An
+        ``own`` is the previous batch's, older than any held middle chunk. An
         idle DP rank's dummy output may never reach the scheduler, so it passes
         ``take_held=False`` and leaves them for the next real output.
         """
         held = []
         if take_held:
             held, self._held_routes = self._held_routes, []
-        ordered = [*held, own] if held_first else [own, *held]
+        ordered = [own, *held]
         patches = [p.patch() for p in ordered if p is not None]
         if patches:
             output.routed_experts = merge_routed_patches(patches)
@@ -3644,20 +3645,16 @@ class ModelRunner:
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
         self.forward_done_event.record()
-        deferred = self.tokenID_processor.is_deferred_out
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
         own_routes = None
-        if self._return_routed_experts and deferred:
+        store_routes_after_recv = None
+        # R3 refuses PP and P/D, the only configs without deferred output.
+        if self._return_routed_experts:
             # prev_batch's routes; prepare_sampled_ids() stores this batch's.
             own_routes, self._deferred_routes = self._deferred_routes, None
-        store_routes_after_recv = None
-        store_routes = self._return_routed_experts and not getattr(
-            batch, "is_dummy_run", False
-        )
-        if store_routes:
-            slots = current_slot_mapping()
-            if deferred:
+            if not getattr(batch, "is_dummy_run", False):
+                slots = current_slot_mapping()
 
                 def store_routes_after_recv():
                     self._deferred_routes = self._store_routed_experts_step(
@@ -3674,8 +3671,6 @@ class ModelRunner:
             channel_states=channel_states,
             after_recv=store_routes_after_recv,
         )
-        if store_routes and not deferred:
-            own_routes = self._store_routed_experts_step(batch, slot_mapping=slots)
         # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
@@ -3758,7 +3753,6 @@ class ModelRunner:
             self._attach_routed_experts(
                 own_routes,
                 output,
-                held_first=not deferred,
                 take_held=not getattr(batch, "is_dummy_run", False),
             )
         return output
@@ -3863,6 +3857,14 @@ class ModelRunner:
         # Every KV write of this forward is enqueued; sampling is not needed.
         self._kv_after_forward()
         if pp_non_last or self._is_pure_middle_chunk(batch):
+            # Before the propose below: the drafter rewrites this forward's
+            # slot_mapping in place (its decode metadata views the same staging
+            # buffer), so a gather queued after it would read draft slots.
+            held = self._store_routed_experts_step(
+                batch, stream=self.tokenID_processor.async_copy_stream
+            )
+            if held is not None:
+                self._held_routes.append(held)
             # This return skips `postprocess`, hence propose() and the DP
             # collectives it carries. Run it for those and drop the ids.
             if will_align_draft:
@@ -3881,11 +3883,6 @@ class ModelRunner:
                     None,  # nothing verified -> segment's last row
                     align_only=True,
                 )
-            held = self._store_routed_experts_step(
-                batch, stream=self.tokenID_processor.async_copy_stream
-            )
-            if held is not None:
-                self._held_routes.append(held)
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()

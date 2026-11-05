@@ -4651,9 +4651,6 @@ class Scheduler:
                         seq, "kv_transfer_params_output", None
                     ),
                     num_cached_tokens=getattr(seq, "prefix_cache_hit_tokens", 0),
-                    routed_experts=(
-                        seq.routed_experts if leave_reason is not None else None
-                    ),
                 )
 
                 if request_output.kv_transfer_params_output is not None:
@@ -4775,7 +4772,15 @@ class Scheduler:
         seq.num_tokens = num_tokens
         if self._return_routed_experts:
             # Routes cover every position but the last token's, which never ran.
-            seq.finish_routed_experts(int(num_tokens) - 1)
+            keep = int(num_tokens) - 1
+            # An abort can land while the previous step's patch is in flight,
+            # so only an aborted request may return fewer rows.
+            if reason != "aborted" and seq.routed_expert_rows < keep:
+                raise RuntimeError(
+                    f"routed experts: request {seq.id} finished ({reason}) "
+                    f"with {seq.routed_expert_rows} of {keep} rows"
+                )
+            seq.finish_routed_experts(keep)
         seq.multimodal_data = None
         seq.status = SequenceStatus.FINISHED
         self.total_finished_requests += 1
