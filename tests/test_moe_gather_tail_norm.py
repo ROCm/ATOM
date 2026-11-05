@@ -112,6 +112,8 @@ def test_flag_defaults_off(monkeypatch):
     assert envs.ATOM_MOE_GATHER_TAIL_NORM is False
     monkeypatch.setenv("ATOM_MOE_GATHER_TAIL_NORM", "1")
     assert envs.ATOM_MOE_GATHER_TAIL_NORM is True
+    monkeypatch.delenv("ATOM_MOE_GATHER_TAIL_NORM_PIPE", raising=False)
+    assert envs.ATOM_MOE_GATHER_TAIL_NORM_PIPE is False
 
 
 def _moe_block(qn, *, tp=1, all2all=False, dp=1, replicate=True):
@@ -285,6 +287,51 @@ def _gfx1250():
     except ImportError:
         return False
     return torch.cuda.is_available() and get_gfx() == "gfx1250"
+
+
+@pytest.mark.skipif(not _gfx1250(), reason="the TDM kernel is gfx1250 only")
+@pytest.mark.parametrize("tokens", [8192, 9001])
+def test_pipelined_kernel_is_the_one_token_kernel(tokens, monkeypatch):
+    """ATOM_MOE_GATHER_TAIL_NORM_PIPE at prefill sizes: the TDM kernel, bitwise
+    the one-token kernel on every row (padding, dropped routes, no gate, a row
+    subset) and so moe_gather_reduce + the tail kernel."""
+    from atom.model_ops import moe_gather_tail_gluon as tdm
+
+    calls = []
+    launch = tdm.launch_gather_tail_tdm
+    monkeypatch.setattr(
+        tdm,
+        "launch_gather_tail_tdm",
+        lambda *a, **k: calls.append(1) or launch(*a, **k),
+    )
+    nvt = tokens - 37
+    t = _inputs(tokens, seed=tokens, device="cuda", nvt=nvt, drop=0.02)
+    rows = torch.randint(0, nvt, (tdm.PIPE_MIN_ROWS,), device="cuda", dtype=torch.int32)
+    for gate, sub in ((t.gate, None), (None, None), (t.gate, rows)):
+        moe = mt.MoEGatedSum(t.g, t.shared, gate)
+        args = (moe, t.residual, t.weight, EPS, sub, sub is None)
+        monkeypatch.setenv("ATOM_MOE_GATHER_TAIL_NORM_PIPE", "0")
+        ref = mt.moe_gather_tail_rmsnorm(*args)
+        monkeypatch.setenv("ATOM_MOE_GATHER_TAIL_NORM_PIPE", "1")
+        n = len(calls)
+        out = mt.moe_gather_tail_rmsnorm(*args)
+        assert len(calls) == n + 1
+        if sub is None:
+            assert torch.equal(out[0], ref[0]) and torch.equal(out[1], ref[1])
+            unfused = _unfused(t, gate)
+            assert torch.equal(out[0][:nvt], unfused[0][:nvt])
+        else:
+            assert torch.equal(out, ref)
+    # Decode sizes keep the one-token kernel.
+    small = _inputs(340, seed=3, device="cuda")
+    n = len(calls)
+    mt.moe_gather_tail_rmsnorm(
+        mt.MoEGatedSum(small.g, small.shared, small.gate),
+        small.residual,
+        small.weight,
+        EPS,
+    )
+    assert len(calls) == n
 
 
 @pytest.mark.skipif(not _gfx1250(), reason="aiter's grouped MoE is gfx1250 only")

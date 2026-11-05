@@ -504,6 +504,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MOE_GATHER_TAIL_NORM": lambda: (
         os.getenv("ATOM_MOE_GATHER_TAIL_NORM", "0") == "1"
     ),
+    # With ATOM_MOE_GATHER_TAIL_NORM, on gfx1250 at prefill sizes (>= 8192
+    # output rows, moe_gather_tail_gluon.PIPE_MIN_ROWS): the fused gather + tail
+    # runs as a software-pipelined Gluon kernel instead -- two programs a CU,
+    # each a run of tokens, its route map read up front into LDS and every
+    # token's MoE2 / shared / residual rows TDM-loaded one token ahead. Bitwise
+    # the one-token kernel (and so moe_gather_reduce + the tail kernel); fewer
+    # rows keep the one-token kernel. Off by default.
+    "ATOM_MOE_GATHER_TAIL_NORM_PIPE": lambda: (
+        os.getenv("ATOM_MOE_GATHER_TAIL_NORM_PIPE", "0") == "1"
+    ),
     # With ATOM_FUSED_MOE_TAIL_NORM, under mori EP on aiter's MegaMoEGfx1250
     # (bf16 combine wire): the gated shared-expert add, the residual add and the
     # next RMSNorm run inside aiter's one-kernel combine (its cross-device wait

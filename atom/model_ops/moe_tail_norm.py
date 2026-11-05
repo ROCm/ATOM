@@ -42,6 +42,7 @@ from torch import Tensor
 
 from atom.model_ops.mxfp8_act_quant import GROUP as _MX_GROUP
 from atom.model_ops.mxfp8_act_quant import e8m0_quant_group, scale_view
+from atom.utils import envs
 
 
 class MoEGatedSum(NamedTuple):
@@ -744,6 +745,15 @@ def moe_gather_tail_rmsnorm(
     res_out = torch.empty_like(out) if write_residual else None
     if n_out == 0:
         return (out, res_out) if write_residual else out
+    if envs.ATOM_MOE_GATHER_TAIL_NORM_PIPE:
+        # Prefill sizes: the software-pipelined TDM kernel (same bits).
+        from atom.model_ops import moe_gather_tail_gluon as tdm
+
+        if tdm.gather_tail_tdm_takes(g, shared, residual, n_out):
+            tdm.launch_gather_tail_tdm(
+                g, shared, gate, residual, weight, eps, rows, out, res_out
+            )
+            return (out, res_out) if write_residual else out
     nvt = g.num_valid_tokens
     ptrs = (
         g.grouped,
