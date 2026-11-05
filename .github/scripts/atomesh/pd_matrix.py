@@ -168,20 +168,56 @@ def packed_node_count(prefill_cfg: dict[str, Any], decode_cfg: dict[str, Any]) -
     return nodes
 
 
+def role_nodes(role_cfg: dict[str, Any]) -> int:
+    """Nodes one worker of this role spans: one DP-attention instance cut across them."""
+    return int(role_cfg.get("nodes_per_worker", 1))
+
+
+def validate_role_nodes(
+    cell_name: str, role: str, pd_worker_layout: str, role_cfg: dict[str, Any]
+) -> None:
+    """A worker spans nodes only as whole-node slices of one DP-attention instance."""
+    nodes = role_nodes(role_cfg)
+    if nodes < 1:
+        raise ValueError(f"{cell_name}: {role}.nodes_per_worker must be at least 1")
+    if nodes == 1:
+        return
+    prefix = f"{cell_name}: {role}.nodes_per_worker={nodes}"
+    if pd_worker_layout != "multi_node":
+        raise ValueError(
+            f"{prefix} needs pd_worker_layout multi_node, not {pd_worker_layout}"
+        )
+    if int(role_cfg.get("tp", 8)) != GPUS_PER_NODE:
+        raise ValueError(
+            f"{prefix} needs tp {GPUS_PER_NODE}: every node runs a whole-node slice"
+        )
+    if "--enable-dp-attention" not in str(role_cfg.get("extra_args", "")).split():
+        raise ValueError(
+            f"{prefix} needs --enable-dp-attention in {role}.extra_args: "
+            "DP attention is what splits one instance across nodes"
+        )
+
+
 def required_node_count(
     pd_worker_layout: str,
     prefill_cfg: dict[str, Any],
     decode_cfg: dict[str, Any],
+    aggregated: bool = False,
 ) -> int:
     if pd_worker_layout == "single_node":
         return 1
+    if aggregated:
+        # The aggregated server is configured by the decode block.
+        return role_nodes(decode_cfg)
     if pd_worker_layout == "packed_nodes":
         return packed_node_count(prefill_cfg, decode_cfg)
     if pd_worker_layout == "prefill_single_node":
         return 1 + int(decode_cfg.get("workers", 1))
     if pd_worker_layout == "decode_single_node":
         return int(prefill_cfg.get("workers", 1)) + 1
-    return int(prefill_cfg.get("workers", 1)) + int(decode_cfg.get("workers", 1))
+    prefill_nodes = int(prefill_cfg.get("workers", 1)) * role_nodes(prefill_cfg)
+    decode_nodes = int(decode_cfg.get("workers", 1)) * role_nodes(decode_cfg)
+    return prefill_nodes + decode_nodes
 
 
 def slug(value: str) -> str:
@@ -308,7 +344,18 @@ def build_cell(
     runner_cfg = resolve_runner(
         deep_merge(defaults.get("runner", {}), suite_cfg.get("runner", {}))
     )
-    required_nodes = required_node_count(pd_worker_layout, prefill_cfg, decode_cfg)
+    cell_name = str(suite_cfg.get("name", model_name))
+    aggregated = not is_disaggregated(str(suite_cfg["topology"]))
+    if aggregated and role_nodes(prefill_cfg) != 1:
+        raise ValueError(
+            f"{cell_name}: the decode block configures an aggregated server, "
+            "so set decode.nodes_per_worker instead of prefill's"
+        )
+    for role, role_cfg in (("prefill", prefill_cfg), ("decode", decode_cfg)):
+        validate_role_nodes(cell_name, role, pd_worker_layout, role_cfg)
+    required_nodes = required_node_count(
+        pd_worker_layout, prefill_cfg, decode_cfg, aggregated=aggregated
+    )
     slurm_submit_runner = str(runner_cfg.get("slurm_submit_runner", ""))
     allow_auto_nodes = slurm_submit_runner in {
         "atomesh-cicd",

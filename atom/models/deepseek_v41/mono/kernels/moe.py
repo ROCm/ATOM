@@ -67,7 +67,6 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     TILE,
     gemv_fp8_loads,
     gemv_fp8_mfmas,
-    ld_f32,
     lds_row,
     lds_tail,
     plus,
@@ -90,6 +89,7 @@ from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.token_par import own_count, own_view
 from atom.models.deepseek_v41.mono.sources import SOURCES
+from atom.mono.device import queue, route
 from atom.mono.device.mx import (
     FP4,
     FP8,
@@ -119,10 +119,12 @@ from atom.mono.device.ops import (
     lane_gather,
     lanes_below,
     launcher,
+    ld_f32,
     lds_bytes,
     popcount,
     row_sum,
     rsrc,
+    st_dev,
     traced,
     uniform,
 )
@@ -174,7 +176,7 @@ TL_POINTS = 1 + len(TL_STAGES)
 ABI = KernelAbi(
     (
         "x", "gate_w", "bias", "w13", "w13_s", "w2", "w2_s", "sgu", "sgu_s", "sw2",
-        "sw2_s", "out", "scratch", "sym", "peers", "rank", "layer", "tl",
+        "sw2_s", "out", "qoff", "scratch", "sym", "peers", "rank", "layer", "tl",
     )
 )  # fmt: skip
 
@@ -287,10 +289,10 @@ def put_mxfp8_group(c, words_mb, codes_mb, t, g, v, amax):
     for h in range_constexpr(2):
         st_dev(
             fx.Vector.from_elements(words[2 * h] + words[2 * h + 1], fx.Int32),
-            c[words_mb],
+            c[words_mb].value,
             t * X8_WORDS + g * 8 + 4 * h,
         )
-    st_dev(fx.Int32(code), c[codes_mb], t * (HIDDEN // 32) + g)
+    st_dev(fx.Int32(code), c[codes_mb].value, t * (HIDDEN // 32) + g)
 
 
 # ---------------------------------------------------------------- router
@@ -546,11 +548,7 @@ def load_route(c, tab):
 
 def mark_pick(tab, rs, t, eid):
     """Token t into expert eid's token bitmap (``load_route``)."""
-    fx.llvm.atomic_or(
-        tab + (rs.mask0 + eid * rs.mask_words + t // 32),
-        fx.Int32(1) << (t % 32),
-        syncscope="workgroup",
-    )
+    route.mark_token(tab + rs.mask0, rs.mask_words, eid, t)
 
 
 @traced
@@ -561,15 +559,7 @@ def place_pick(c, tab, tid, t, eid):
     slot = fx.ptr_load(tab + (rs.expert_slot0 + eid))
     fx.ptr_store(slot, tab + (2 * rs.picks + 1 + rs.max_u + tid))
     # the tokens below t that picked this expert: the picks before tid in it
-    rank = fx.Int32(0)
-    for w in range_constexpr(rs.mask_words):
-        word = fx.ptr_load(tab + (rs.mask0 + eid * rs.mask_words + w))
-        lo = t - 32 * w
-        keep = (lo >= 32).select(
-            fx.Int32(-1),
-            (lo > 0).select((fx.Int32(1) << fx.max(lo, 0)) - 1, fx.Int32(0)),
-        )
-        rank = rank + popcount(word & keep)
+    rank = route.tokens_below(tab + rs.mask0, rs.mask_words, eid, t)
     pos = fx.ptr_load(tab + (rs.first0 + slot)) + rank
     fx.ptr_store(tid, tab + (rs.order0 + pos))
 
@@ -884,12 +874,6 @@ def down_lds_words(n):
     return -(-n // 256) * 256
 
 
-def st_dev(v, region, i):
-    """Word i of scratch ``region`` (plain words, not tagged pairs) at device
-    scope: past the per-XCD L2, so another CTA reads it after the flag."""
-    bo.buffer_store(v, rsrc(region.value), i, cache_modifier=CM_DEV)
-
-
 @traced
 def take_ug_task(c):
     """This CTA's next ug task past the first round, from the launch's queue
@@ -897,13 +881,14 @@ def take_ug_task(c):
     router or route task come to it late and so take fewer, where a fixed
     placement gave every CTA the same count and down waited on theirs. A
     task's result is the same whichever CTA runs it."""
-    if c["tid"] == 0:
-        at = c["ugq"].value + fx.Int64(c["tag"] * 4)
-        ptr = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4), at)
-        task = fx.llvm.atomic_add(ptr, fx.Int32(1), syncscope="agent")
-        fx.ptr_store(fx.Int32(task), c["tab"] + c["rs"].queue0)
-    gpu.barrier()
-    return fx.ptr_load(c["tab"] + c["rs"].queue0)
+    return take_launch_queue(c, "ugq")
+
+
+def take_launch_queue(c, region):
+    """This launch's word of the queue ``region`` (a word a tag, at the
+    host's ``qoff``: ``queue.tag_offset``), taken for the whole CTA."""
+    word = queue.word(c[region].value + c["args"]["qoff"])
+    return queue.take_shared(word, c["tab"] + c["rs"].queue0, c["tid"])
 
 
 @traced
@@ -1103,9 +1088,9 @@ def ug_epilogue(c, part0, idx, first, count):
         word = fp8_pack4(q8, *nb)
         row = first + t
         if (i % 4 == 0) & (t < count):
-            st_dev(word, c["mid"], row * d.mid_words + part * 8 + i // 4)
+            st_dev(word, c["mid"].value, row * d.mid_words + part * 8 + i // 4)
         if (i == 0) & (t < count):
-            st_dev(code, c["mids"], mid_code_index(d, row, part))
+            st_dev(code, c["mids"].value, mid_code_index(d, row, part))
 
 
 # ---------------------------------------------------------------- down
@@ -1238,13 +1223,7 @@ def down_unit_next(c, unit, sl, parts, nst, total):
 def take_down_unit(c):
     """This CTA's next down unit past the first round, from the launch's queue
     (``dnq``, a word a tag, counting from 0), as ``take_ug_task``."""
-    if c["tid"] == 0:
-        at = c["dnq"].value + fx.Int64(c["tag"] * 4)
-        ptr = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4), at)
-        unit = fx.llvm.atomic_add(ptr, fx.Int32(1), syncscope="agent")
-        fx.ptr_store(fx.Int32(unit), c["tab"] + c["rs"].queue0)
-    gpu.barrier()
-    return fx.ptr_load(c["tab"] + c["rs"].queue0)
+    return take_launch_queue(c, "dnq")
 
 
 @traced
@@ -1314,7 +1293,7 @@ def down_store_dcon(c, accs, task, first, count):
         r = 4 * (lane // 16) + q
         if jj < count:
             word = bf16_pair(acc[q] * w, acc[q + 1] * w).bitcast(fx.Int32)
-            st_dev(word, c["dcon"], pick * (HIDDEN // 2) + (task * ROWS + r) // 2)
+            st_dev(word, c["dcon"].value, pick * (HIDDEN // 2) + (task * ROWS + r) // 2)
 
 
 @traced
@@ -1512,13 +1491,7 @@ def take_down_rank(c):
     """This CTA's arrival rank at the down stage (DQ, a word a tag): which
     CTAs take the extra tiles. A tile's result is the same whichever CTA
     computes it."""
-    if c["tid"] == 0:
-        at = c["dq"].value + fx.Int64(c["tag"] * 4)
-        ptr = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4), at)
-        rank = fx.llvm.atomic_add(ptr, fx.Int32(1), syncscope="agent")
-        fx.ptr_store(fx.Int32(rank), c["tab"] + c["rs"].queue0)
-    gpu.barrier()
-    return fx.ptr_load(c["tab"] + c["rs"].queue0)
+    return take_launch_queue(c, "dq")
 
 
 def down_weights(c, tasks, rnd, slots, nu, st0=0, nst=None):
@@ -1889,7 +1862,7 @@ def moe_context(s, rs, lds, mb, bases, layout, scratch, args, rank, sym):
         "wave": tid // 64,
         "red": lds.red.ptr, "tab": lds.tab.ptr, "pair": lds.pair.ptr,
         "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words,
-        "poll": mb.poll, "tag": mb.tag, "peer_addr": lambda p: bases[p],
+        "poll": mb.poll, "peer_addr": lambda p: bases[p],
         "rank": rank, "sym": sym, "peer": peer_offsets(s, rs.dims), "rs": rs,
         "d": rs.dims, "args": args,
         # x (``ffn_normed``) before this launch: plain loads, no readiness wait
@@ -2136,6 +2109,7 @@ def build_moe(key: MoeBuild):
     def moe(
         x: Int64, gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
+        qoff: Int64,
         scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
         tl: Int64,
     ):  # fmt: skip
@@ -2143,7 +2117,7 @@ def build_moe(key: MoeBuild):
         bid = fx.block_idx.x
         lds = fx.SharedAllocator().allocate(Smem).peek()
         args = moe_args(
-            x, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out
+            x, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, qoff
         )
         c = moe_context(
             s, rs, lds, mailbox(layer, scratch, key.diag_off, layout),
@@ -2160,12 +2134,13 @@ def build_moe(key: MoeBuild):
     def launch(
         x: Int64, gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
+        qoff: Int64,
         scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
         tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         moe(
-            x, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out,
+            x, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, qoff,
             scratch, sym, peers, rank, layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 

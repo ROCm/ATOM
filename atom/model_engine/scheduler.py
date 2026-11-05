@@ -66,6 +66,7 @@ from atom.model_engine.state_runtime import (
 )
 from atom.observability import tracing
 from atom.sampling_params import RequiredChannel
+from atom.structured_output import StructuredRequest
 from atom.utils import envs
 
 if TYPE_CHECKING:
@@ -219,6 +220,19 @@ class ScheduledBatch:
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
         self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
+        self.any_logprobs = any(self.return_logprobs)
+        self.top_logprobs = None
+        self.logprob_requested = ()
+        if self.any_logprobs:
+            self.top_logprobs = [seq.top_logprobs for seq in seqs.values()]
+            self.logprob_requested = tuple(
+                i for i, enabled in enumerate(self.return_logprobs) if enabled
+            )
+        self.structured_requests = {}
+        for i, seq in enumerate(seqs.values()):
+            if seq.json_schema is None:
+                continue
+            self.structured_requests[i] = StructuredRequest.capture(seq)
         # `context_lens` is set further down, once `num_cached_tokens` is known:
         # a chunked prefill's context ends at this chunk, not at the whole
         # prompt, so `seq.num_tokens` is only right for decode.
@@ -582,15 +596,17 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        structured_errors: dict[int, str] | None = None,
     ):
         self.req_ids = req_ids
+        self.structured_errors = structured_errors or {}
         self.token_ids = token_ids
         self.draft_token_ids = self._copy_array_view(draft_token_ids)
         self.num_rejected = self._copy_array_view(num_rejected)
         self.num_bonus = self._copy_array_view(num_bonus)
         self.is_deferred_out = is_deferred_out
         self.is_prev_prefill = is_prev_prefill
-        self.logprobs = logprobs  # Optional[dict[int, float]]
+        self.logprobs = logprobs
         # DSpark Phase 2: {req_id: ell_r} from this step's propose() — the
         # scheduler-chosen verify length per request. Rides back to the
         # (main-process) scheduler so the NEXT step can size each request's
@@ -1904,7 +1920,7 @@ class Scheduler:
         ) and num_tokens > self.max_num_batched_tokens:
             remedy = (
                 "Increase --max-num-batched-tokens or shorten the prompt "
-                "(multimodal prompts are never chunked)."
+                "(multimodal prompts without embedding spans are never chunked)."
                 if is_multimodal
                 else "Increase --max-num-batched-tokens, enable chunked "
                 "prefill, or shorten the prompt."
@@ -2103,6 +2119,13 @@ class Scheduler:
                     self._next_decode_completion_steps()
                     if not prefillable and not waiting_requests
                     else None
+                ),
+                # prefill_admit_policy adaptive: what a FIRE could add to the
+                # decode batch -- partials plus waiting heads up to free slots
+                admittable_requests=self._partial_prefill_count
+                + min(
+                    len(self.waiting),
+                    max(0, self.max_num_seqs - len(self.running)),
                 ),
             )
         else:
@@ -2693,6 +2716,9 @@ class Scheduler:
             if self.kv_connector is not None:
                 self._publish_state_loads()
                 self._publish_state_stores()
+                self._note_connector_scheduled_tokens(
+                    scheduled_seqs, num_scheduled_tokens
+                )
                 connector_meta_output = self.kv_connector.build_connector_meta()
 
             # Freeze, per seq, whether this chunk is the last one this prefill
@@ -2876,6 +2902,7 @@ class Scheduler:
         if self.kv_connector is not None:
             self._publish_state_loads()
             self._publish_state_stores()
+            self._note_connector_scheduled_tokens(scheduled_seqs, num_scheduled_tokens)
             connector_meta_output = self.kv_connector.build_connector_meta()
 
         self._check_draft_writes_allocated(scheduled_seqs.values())
@@ -3003,6 +3030,20 @@ class Scheduler:
         seq.offload_load_start_tokens = None
         seq.offload_load_failed = True
         return True
+
+    def _note_connector_scheduled_tokens(
+        self,
+        scheduled_seqs: dict[int, Sequence],
+        num_scheduled_tokens: list[int],
+    ) -> None:
+        """Tell the connector how many tokens this step's forward computes.
+
+        Lets lmcache_mp emit a prefill chunk's save in the step that computes
+        it (`note_scheduled_tokens`); other connectors do not define it.
+        """
+        note = getattr(self.kv_connector, "note_scheduled_tokens", None)
+        if callable(note):
+            note(scheduled_seqs, num_scheduled_tokens)
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
         self._inflight_prefix_wait.pop(seq.id, None)
@@ -3956,11 +3997,7 @@ class Scheduler:
             del seq.token_ids[-strip:]
             del seq.output_tokens[-strip:]
             seq.num_tokens -= strip
-            # Each placeholder pushed a 0.0 alongside it (postprocess patches
-            # that in place too), so they go together or the two lists stop
-            # describing the same tokens.
-            if seq.return_logprobs and len(seq.logprobs) >= strip:
-                del seq.logprobs[-strip:]
+            # Probabilities contain committed tokens only, never placeholders.
         seq.num_rejected = 0
         seq.num_bonus_tokens = 0
         seq.num_placeholder_tokens = 0
@@ -4172,7 +4209,7 @@ class Scheduler:
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
         is_deferred_out = fwd_output.is_deferred_out
-        token_logprobs = fwd_output.logprobs  # Optional[dict[int, float]]
+        token_logprobs = fwd_output.logprobs
         # update token_ids with the actual sampled token ids
 
         finished_seqs = []
@@ -4188,6 +4225,30 @@ class Scheduler:
             num_placeholder += 1
 
         for seq in self.running:
+            error = getattr(fwd_output, "structured_errors", {}).get(seq.id)
+            if error is not None:
+                logger.error(
+                    "Structured decoding failed for request %s: %s", seq.id, error
+                )
+                self._mark_finished(
+                    seq,
+                    "structured_output_error",
+                    seq.num_tokens - seq.num_placeholder_tokens,
+                )
+                finished_seqs.append(seq)
+                if stream_output_queue is not None:
+                    stream_outputs.append(
+                        (
+                            seq.id,
+                            RequestOutput(
+                                request_id=seq.id,
+                                output_tokens=[],
+                                finished=True,
+                                finish_reason="structured_output_error",
+                            ),
+                        )
+                    )
+                continue
             # Cancellation does not require sampled output. Middle prefill
             # chunks and the first deferred step may have none; waiting for
             # one keeps an aborted request alive without advancing its tokens.
@@ -4267,6 +4328,31 @@ class Scheduler:
             if token_logprobs is not None and seq.return_logprobs:
                 token_logprob = token_logprobs.get(seq.id)
 
+            # Check before mutating tokens. A malformed payload must terminate
+            # only its request, never escape into the engine's main loop.
+            if seq.return_logprobs and (
+                getattr(seq, "_injected_t0", None) is not None
+                or len(token_logprob or ()) != num_new_token
+            ):
+                logger.error("Missing or misaligned logprobs for request %s", seq.id)
+                self._mark_finished(
+                    seq, "logprob_error", seq.num_tokens - seq.num_placeholder_tokens
+                )
+                finished_seqs.append(seq)
+                if stream_output_queue is not None:
+                    stream_outputs.append(
+                        (
+                            seq.id,
+                            RequestOutput(
+                                request_id=seq.id,
+                                output_tokens=[],
+                                finished=True,
+                                finish_reason="logprob_error",
+                            ),
+                        )
+                    )
+                continue
+
             # In-place overwrite only when placeholders already exist.
             if is_deferred_out or (
                 self.spec_decode_local and seq.num_placeholder_tokens > 0
@@ -4330,18 +4416,11 @@ class Scheduler:
                 seq.num_placeholder_tokens = max(
                     0, required_placeholders - len(token_ids)
                 )
-                if seq.return_logprobs and token_logprob is not None:
-                    if seq.logprobs:
-                        seq.logprobs[-1] = token_logprob
-                    else:
-                        seq.logprobs.append(token_logprob)
             else:
                 num_rejected = 0
                 num_bonus = 0
                 for token_id in token_ids:
                     seq.append_token(token_id)
-                if seq.return_logprobs and token_logprob is not None:
-                    seq.logprobs.append(token_logprob)
             new_tokens = token_ids
 
             injected_t0 = getattr(seq, "_injected_t0", None)
@@ -4448,11 +4527,11 @@ class Scheduler:
                 # in stop_at_idx / num_new_token, so offset the cut by it.
                 keep = stop_at_idx + 1 + (1 if injected_t0 is not None else 0)
                 new_tokens = new_tokens[:keep]
-                if seq.return_logprobs:
-                    # LLMEngine.postprocess returns the complete logprobs
-                    # array rather than slicing it through num_tokens, so keep
-                    # it aligned explicitly with the cropped completion.
-                    del seq.logprobs[num_tokens - seq.num_prompt_tokens :]
+
+            committed_logprobs = None
+            if seq.return_logprobs:
+                committed_logprobs = (token_logprob or [])[: len(new_tokens)]
+                seq.logprobs.extend(item[0] for item in committed_logprobs)
 
             # Record TTFT from the finalized retained length, after rejected
             # speculative tokens and cap/stop overflow have been removed. A
@@ -4502,6 +4581,7 @@ class Scheduler:
                 request_output = RequestOutput(
                     request_id=seq.id,
                     output_tokens=output_tokens_list,
+                    logprobs=committed_logprobs,
                     finished=(leave_reason is not None),
                     finish_reason=leave_reason,
                     kv_transfer_params_output=getattr(
@@ -4538,8 +4618,6 @@ class Scheduler:
                     num = max(0, num_placeholder - seq.num_rejected)
                     for _ in range(num):
                         seq.append_token(self.eos_token_id)
-                        if seq.return_logprobs:
-                            seq.logprobs.append(0.0)
                     # Added to what the overwrite above left unconsumed, not
                     # replacing it: both runs are trailing `eos_token_id` and
                     # both are what `preempt` has to strip. `=` also undercounted
