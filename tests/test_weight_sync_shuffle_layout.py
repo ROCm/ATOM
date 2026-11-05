@@ -40,7 +40,7 @@ from atom.model_ops.linear import (
 from atom.rollout.weight_updater import WeightUpdaterMixin
 
 PRESHUFFLE_ENV = "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE"
-MXFP8_PRESHUFFLE_ENV = "ATOM_MXFP8_LINEAR_BPRESHUFFLE"
+MXFP8_PRESHUFFLE_ENV = "ATOM_MXFP8_GEMM_BPRESHUFFLE"
 
 # (quant_type, params_dtype, needs_preshuffled_weight)
 CASES = [

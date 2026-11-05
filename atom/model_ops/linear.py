@@ -73,7 +73,7 @@ def use_mxfp8_linear_bpreshuffle(
 ) -> bool:
     """Whether a native FP8 1x32 linear can use AITER's MXFP8 preshuffle path."""
     if (
-        not envs.ATOM_MXFP8_LINEAR_BPRESHUFFLE
+        not envs.ATOM_MXFP8_GEMM_BPRESHUFFLE
         or params_dtype != dtypes.fp8
         or native_group_rows != 1
         or input_size % 128
