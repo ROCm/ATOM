@@ -1022,7 +1022,7 @@ class TestSchedule:
         sched._count_inflight_load(seq)
         sched.finished_recving_kv_req_ids.append(seq.id)
 
-        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        assert sched._resolve_offload_load(seq) is None
         assert sched._num_parked_remote_kv == 1
         sched.waiting.append(seq)
 
@@ -1119,7 +1119,7 @@ class TestSchedule:
         sched._park_for_remote_load(seq, deque())
         sched._count_inflight_load(seq)
         sched.finished_recving_kv_req_ids.append(seq.id)
-        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        assert sched._resolve_offload_load(seq) is None
         sched.waiting.append(seq)
 
         sched.schedule()

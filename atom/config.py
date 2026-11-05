@@ -2154,8 +2154,9 @@ class Config:
     dp_load_balance: str = "least_requests"
     # Offload prefetch (`atom/model_engine/offload_prefetch.py`): start a
     # waiting request's tier load before its turn (`--offload-prefetch`).
-    # Unset (None) it follows the configured connector: on when it answers
-    # tier lookups asynchronously (`OffloadTierProfile.async_lookup`).
+    # Unset (None): on with prefix-spread DP routing when the configured
+    # connector answers tier lookups asynchronously
+    # (`OffloadTierProfile.async_lookup`).
     offload_prefetch: bool | None = None
     # No prefetch allocation once it would take the KV pool past this
     # fraction in use.
@@ -2714,7 +2715,12 @@ class Config:
         if self.offload_prefetch is None:
             from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-            self.offload_prefetch = KVConnectorFactory.offload_tier(self).async_lookup
+            # Measured only under prefix-spread routing, which moves requests
+            # onto ranks that must load their prefix: on there by default.
+            self.offload_prefetch = (
+                self.dp_load_balance == "prefix_spread"
+                and KVConnectorFactory.offload_tier(self).async_lookup
+            )
         if not 0.0 < self.offload_prefetch_max_kv_usage <= 1.0:
             raise ValueError(
                 "offload_prefetch_max_kv_usage must be in (0, 1], got "

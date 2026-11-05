@@ -32,8 +32,6 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
-# `_ask_tier`'s answer when the lookup raised (None is "did not answer").
-_LOOKUP_FAILED = object()
 
 DENSE_PAGE_SOURCE_SAFE_CHANNEL = "dense.page.source_safe"
 DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL = "dense.page.source_quiescent"
@@ -494,7 +492,19 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return held[0] is seq
         if self._repeat_load_suppressed(seq, sid) or self._lookup_len(seq) <= 0:
             return False
-        return self._fresh_tier_lookup(seq, sid, take=True) is not None
+        return self._take_tier_answer(seq, sid) is not None
+
+    def release_taken_lookup(self, seq) -> None:
+        """Give back an answer `take_ready_lookup` took for an admission that
+        did not happen: its read locks go now (`_release_lookup`), not when
+        Phase 2 reaches the request, which answers from the remembered hit
+        and re-takes the pin only for a load (`_ensure_lookup_pin`)."""
+        sid = str(seq.id)
+        held = self._lookup_results.get(sid)
+        if held is None or held[0] is not seq:
+            return
+        del self._lookup_results[sid]
+        self._release_lookup(sid)
 
     def cancel_preadmission(self, seq) -> None:
         """Forget an admission the scheduler refused after notifying this
@@ -514,44 +524,78 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """Run right before this request's lookup is asked or taken; a layout
         that must give back an earlier lookup first overrides it."""
 
-    def _fresh_tier_lookup(self, seq, sid: str, *, take: bool = False) -> int | None:
-        """Ask the tier, take its pin, and remember the hit. None if it did not answer.
+    def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
+        """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
+        token_ids = self._lookup_token_ids(seq)
+        return self._tier_lookup(
+            seq,
+            sid,
+            lambda: self._lookup_client.lookup(token_ids, lookup_id=sid),
+            token_ids,
+        )
 
-        `take`: only take an async lookup that has already answered
-        (`take_answer`, atomic in the client); None, with nothing done, if it
-        has not.
-        """
+    def _take_tier_answer(self, seq, sid: str) -> int | None:
+        """`_fresh_tier_lookup` for an async lookup that has already
+        answered, taken without waiting (`take_answer`, atomic in the client);
+        None, with nothing taken, if it has not."""
+        return self._tier_lookup(
+            seq,
+            sid,
+            lambda: self._lookup_client.take_answer(
+                sid,
+                lambda: self._lookup_token_ids(seq),
+                before=lambda: self._before_tier_lookup(sid),
+            ),
+            None,
+            take=True,
+        )
 
-        num_prompt = seq.num_prompt_tokens
-        token_ids = None
-        if take:
-
-            def tokens():
-                nonlocal token_ids
-                token_ids = self._lookup_token_ids(seq)
-                return token_ids
-
-            hit = self._lookup_client.take_answer(
-                sid, tokens, before=lambda: self._before_tier_lookup(sid)
-            )
-            if hit is None:
-                return None
-            if sid not in self._lookup_in_step:
-                self._lookup_in_step.append(sid)
-            self._perf_bump("lookup_taken")
-        else:
+    def _tier_lookup(self, seq, sid: str, ask, token_ids, *, take=False):
+        """The one lookup path: run `ask`, then hold and account the hit."""
+        if not take:
             self._before_tier_lookup(sid)
-            token_ids = self._lookup_token_ids(seq)
-            hit = self._ask_tier(seq, sid, token_ids)
-            if hit is _LOOKUP_FAILED:
-                return None
+        if sid not in self._lookup_in_step:
+            # Dispatch unpins whatever a lookup took if nothing loads under it.
+            self._lookup_in_step.append(sid)
+        held = self._lookup_results.get(sid)
+        self._lookup_results[sid] = (seq, 0)
+        _t0 = time.perf_counter()
+        try:
+            hit = ask()
+        except Exception:
+            logger.exception("LMCache offload lookup failed for seq %s", seq.id)
+            self._lookup_results.pop(sid, None)
+            self._remember_tier_hit(seq, sid, None)
+            return None
+        if take and hit is None:
+            # Not answered yet: nothing was taken.
+            if held is None:
+                self._lookup_results.pop(sid, None)
+            else:
+                self._lookup_results[sid] = held
+            return None
+        _us = int((time.perf_counter() - _t0) * 1e6)
+        self._perf_bump("lookup_taken" if take else "lookup_n")
+        self._perf_bump("lookup_us", _us)
+        if _us > self.__dict__.get("_perf_lookup_max_us", 0):
+            self._perf_lookup_max_us = _us
+            self._perf_counters["lookup_max_us"] = _us
+        self._perf_bump("lookup_prompt_tokens", seq.num_prompt_tokens)
+        self._perf_bump("lookup_hbm_tokens", int(seq.num_cached_tokens))
+        self._perf_bump("lookup_hit_tokens", int(hit or 0))
+        if hit is None:
+            self._perf_bump("lookup_none")
+        return self._hold_tier_hit(seq, sid, hit, token_ids)
+
+    def _hold_tier_hit(self, seq, sid: str, hit, token_ids) -> int | None:
+        """Hold the lookup's answer for the admission and remember it."""
         if hit is None:
             self._lookup_results.pop(sid, None)
         else:
             hit = int(hit)
             self._lookup_results[sid] = (seq, hit)
         self._remember_tier_hit(seq, sid, hit)
-        if logger.isEnabledFor(logging.DEBUG):
+        if token_ids is not None and logger.isEnabledFor(logging.DEBUG):
             _lh = None
             try:
                 tdb = getattr(self._lookup_client, "token_database", None)
@@ -567,40 +611,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             logger.debug(
                 "[OFFLOAD-LOOKUP] seq=%s num_prompt=%d hbm_cached=%d hit=%s lookuphash3=%s",
                 seq.id,
-                num_prompt,
+                seq.num_prompt_tokens,
                 int(seq.num_cached_tokens),
                 hit,
                 _lh,
             )
-        return hit
-
-    def _ask_tier(self, seq, sid: str, token_ids):
-        """The synchronous lookup, with its pin taken; `_LOOKUP_FAILED` if it
-        raised."""
-        if sid not in self._lookup_in_step:
-            self._lookup_in_step.append(sid)
-        self._lookup_results[sid] = (seq, 0)
-        _t0 = time.perf_counter()
-        try:
-            hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
-            _us = int((time.perf_counter() - _t0) * 1e6)
-            self._perf_bump("lookup_n")
-            self._perf_bump("lookup_us", _us)
-            if _us > self.__dict__.get("_perf_lookup_max_us", 0):
-                self._perf_lookup_max_us = _us
-                self._perf_counters["lookup_max_us"] = _us
-            self._perf_bump("lookup_prompt_tokens", seq.num_prompt_tokens)
-            self._perf_bump("lookup_hbm_tokens", int(seq.num_cached_tokens))
-            self._perf_bump("lookup_hit_tokens", int(hit or 0))
-            if hit is None:
-                self._perf_bump("lookup_none")
-        except Exception:
-            # The ID stays in `_lookup_in_step` so the dispatch unpins whatever
-            # a half-run lookup may have taken.
-            logger.exception("LMCache offload lookup failed for seq %s", seq.id)
-            self._lookup_results.pop(sid, None)
-            self._remember_tier_hit(seq, sid, None)
-            return _LOOKUP_FAILED
         return hit
 
     def _answer_from_tier_hit(self, seq, sid: str, hit: int) -> tuple[int, bool]:

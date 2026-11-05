@@ -179,7 +179,8 @@ def get_exit_sequence():
 
 
 def resumes_offload_prefill(seq) -> bool:
-    """True when an offload load already settled and `seq` keeps its blocks.
+    """True when an offload load already settled, or an admission made ahead
+    of its turn is held (`offload_held_local`), and `seq` keeps its blocks.
 
     Such a request resumes its suffix prefill without matching the prefix
     again. Shared by the scheduler's admission and the offload connector's
@@ -189,6 +190,7 @@ def resumes_offload_prefill(seq) -> bool:
     return (
         getattr(seq, "offload_loaded", False)
         or getattr(seq, "offload_load_failed", False)
+        or getattr(seq, "offload_held_local", False)
     ) and len(seq.block_table) > 0
 
 

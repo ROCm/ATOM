@@ -149,10 +149,7 @@ class LMCacheMPConnector(KVConnectorBase):
             self._impl.close()
 
     def start_load_kv(self, metadata: Any) -> None:
-        tokens = self.__dict__.get("_tokens")
-        if tokens is None:  # assembled without `__init__`
-            tokens = self._tokens = WorkerTokens()
-        tokens.resolve(metadata)
+        self._tokens.resolve(metadata)
         self._require_impl().start_load_kv(metadata)
 
     def get_finished(self) -> KVConnectorOutput:
@@ -254,6 +251,9 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
 
     def take_ready_lookup(self, seq: Any) -> bool:
         return self._require_impl().take_ready_lookup(seq)
+
+    def release_taken_lookup(self, seq: Any) -> None:
+        self._require_impl().release_taken_lookup(seq)
 
     def cancel_preadmission(self, seq: Any) -> None:
         self._require_impl().cancel_preadmission(seq)

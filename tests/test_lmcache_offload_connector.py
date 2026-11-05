@@ -7,7 +7,6 @@ import logging
 import sys
 import threading
 import types
-from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -3869,7 +3868,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
     host._rejected = []
 
     host._update_from_kv_xfer_finished(KVConnectorOutput(**{terminal_field: {seq.id}}))
-    assert host._resolve_waiting_remote_kv(seq, deque()) is False
+    assert host._resolve_offload_load(seq) is None
     assert getattr(seq, consumed_flag) is True
     assert host.finished_recving_kv_req_ids == []
     assert host.failed_recving_kv_req_ids == []

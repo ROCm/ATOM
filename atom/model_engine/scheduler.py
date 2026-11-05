@@ -987,9 +987,10 @@ class Scheduler:
         self._inflight_prefix_wait: dict[int, int] = {}
         # Offload prefetch (`atom/model_engine/offload_prefetch.py`).
         self._prefetch = self._make_offload_prefetch(config)
-        # The request Phase 2 last stopped at for want of KV blocks or a
-        # parked-load slot (`_head_blocked_on_resources`).
-        self._blocked_head = None
+        # Phase 2 last stopped for want of KV blocks or a parked-load slot:
+        # finished prefetches, which hold both, may move up
+        # (`_promote_ready_remote_kv_requests`).
+        self._blocked_head = False
         # This tick is the DP group's prefill step and this rank has none of its
         # own: EngineCore runs a dummy prefill instead of a decode.
         self.dummy_prefill = False
@@ -1018,9 +1019,14 @@ class Scheduler:
                 "tier lookup"
             )
             return None
+        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
         from atom.model_engine.offload_prefetch import OffloadPrefetch
 
-        return OffloadPrefetch(self, config.offload_prefetch_max_kv_usage)
+        return OffloadPrefetch(
+            self,
+            config.offload_prefetch_max_kv_usage,
+            KVConnectorFactory.offload_tier(config).min_load_tokens,
+        )
 
     def set_prefill_delayer(self, delayer: PrefillDelayer | None) -> None:
         self.prefill_delayer = delayer
@@ -1419,14 +1425,9 @@ class Scheduler:
             return True
         if not self.waiting:
             return False
-        prefetch = self._prefetch
         peeked = 0
         for seq in self.waiting:
-            if (
-                prefetch is not None
-                and seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-                and prefetch.holds(seq)
-            ):
+            if self._prefetch_in_flight(seq):
                 # A prefetch in flight keeps its place in line, and admission
                 # passes it (Phase 2): it does not use up the peek.
                 continue
@@ -2278,13 +2279,14 @@ class Scheduler:
                 num_scheduled_tokens.append(chunk)
 
         # ---- Phase 2: new requests from waiting ----
+        # Requests passed over in place: waiting on a lookup or a producer
+        # (`lookup_waiters` of them, which the bypass budget bounds), or a
+        # prefetch whose load is in flight (bounds nothing).
         prefix_waiters: deque[Sequence] = deque()
         prefix_bypass_left = min(16, self.max_num_seqs)
-        # Prefetching requests held in `prefix_waiters` (they keep their place
-        # but bound nothing: they are not waiting on a lookup).
-        prefetch_waiting = 0
+        lookup_waiters = 0
         if delayer_allows:
-            self._blocked_head = None
+            self._blocked_head = False
         while (
             delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
@@ -2293,7 +2295,14 @@ class Scheduler:
             and num_batched_tokens < self.max_num_batched_tokens
             and self._tick_cost < self._tick_cost_limit
         ):
-            if len(prefix_waiters) > prefetch_waiting:
+            if self._prefetch_in_flight(self.waiting[0]):
+                # Its prefetch is in flight (a finished one was resolved at the
+                # top of the tick): nothing to prefill yet. Keep its place in
+                # line (the tail would let later arrivals pass it once it
+                # lands) and let the requests behind it go first.
+                prefix_waiters.append(self.waiting.popleft())
+                continue
+            if lookup_waiters:
                 if prefix_bypass_left == 0:
                     break
                 prefix_bypass_left -= 1
@@ -2341,19 +2350,6 @@ class Scheduler:
                 self.waiting.appendleft(seq)
                 break
 
-            if (
-                seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-                and self._prefetch is not None
-                and self._prefetch.holds(seq)
-            ):
-                # Its prefetch is in flight (a finished one was resolved at the
-                # top of the tick): nothing to prefill yet. Keep its place in
-                # line (the tail would let later arrivals pass it once it
-                # lands) and let the requests behind it go first.
-                prefix_waiters.append(seq)
-                prefetch_waiting += 1
-                continue
-
             admission_ready = getattr(self.kv_connector, "admission_ready", None)
             if callable(admission_ready) and not admission_ready(seq):
                 # D may reserve a later request first. Unready P requests own no
@@ -2391,6 +2387,7 @@ class Scheduler:
                 and self._offload_lookup_pending(seq)
             ):
                 prefix_waiters.append(seq)
+                lookup_waiters += 1
                 continue
             needs_remote_load = self._query_connector_prefill_match(
                 seq,
@@ -2460,6 +2457,12 @@ class Scheduler:
                     self.waiting.appendleft(seq)
                     break
                 self._resume_prefill(seq, start, hit=replayed)
+                if getattr(seq, "offload_held_local", False):
+                    # Admitted ahead of its turn and held: what Phase 2 runs
+                    # right after `allocate` runs now (an unaligned hit's
+                    # hand-off boundary).
+                    seq.offload_held_local = False
+                    chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
                 chunk = self._finalize_prefill_chunk(seq, start, chunk)
                 self._assert_positive_prefill_chunk(
                     chunk, num_new_tokens, budget_remaining
@@ -2491,7 +2494,7 @@ class Scheduler:
                 continue
 
             if needs_remote_load and self._parked_slots_full():
-                self._blocked_head = seq.id
+                self._blocked_head = True
                 self.waiting.appendleft(seq)
                 break
 
@@ -2512,7 +2515,7 @@ class Scheduler:
                 hbm_probe = self._probe_hbm_prefix(seq)
             num_cached_blocks = hbm_probe.num_cached_blocks
             if num_cached_blocks < 0:
-                self._blocked_head = seq.id
+                self._blocked_head = True
                 self.waiting.appendleft(seq)
                 break
             if (
@@ -2523,7 +2526,7 @@ class Scheduler:
                 # A replay that loads its KV first parks for that load like any
                 # remote load (`needs_remote_load` knew only the state-carrying
                 # hit), so it needs a parked slot too.
-                self._blocked_head = seq.id
+                self._blocked_head = True
                 self.waiting.appendleft(seq)
                 break
 
@@ -2543,6 +2546,7 @@ class Scheduler:
                 needs_remote_load,
             ):
                 prefix_waiters.append(seq)
+                lookup_waiters += 1
                 continue
             atomic_prefill = self._requires_atomic_prefill(seq)
             budget_remaining = self._prefill_room(num_batched_tokens, start)
@@ -2574,8 +2578,6 @@ class Scheduler:
                 detach=lookup_detachable,
             )
             if outcome is Admit.REFUSED or outcome is Admit.REQUEUE:
-                if outcome is Admit.REFUSED:
-                    self._blocked_head = seq.id
                 self.waiting.appendleft(seq)
                 break
             if outcome is Admit.PARKED:
@@ -2958,7 +2960,10 @@ class Scheduler:
     def _resolve_waiting_remote_kv(
         self, seq: Sequence, skipped_waiting_requests: deque[Sequence]
     ) -> bool | None:
-        """Resolve a ``WAITING_FOR_REMOTE_KVS`` request before admission.
+        """Resolve a P/D consumer's ``WAITING_FOR_REMOTE_KVS`` request before
+        admission. An offload tier's loads are resolved at the top of the tick
+        (`_promote_ready_remote_kv_requests`), so one still waiting here is in
+        flight.
 
         Returns:
           - ``None`` when the request is still blocked and has been requeued.
@@ -2968,17 +2973,18 @@ class Scheduler:
         if seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
             return False
 
-        if self._consume_failed_remote_kv(seq):
+        if not self._connector_flag("is_offload") and self._consume_failed_remote_kv(
+            seq
+        ):
             return False
 
-        if not self._update_waiting_for_remote_kv(seq):
+        if self._connector_flag("is_offload") or not (
+            self._update_waiting_for_remote_kv(seq)
+        ):
             skipped_waiting_requests.append(seq)
             return None
 
         seq.status = SequenceStatus.WAITING
-        if self._connector_flag("is_offload"):
-            self._mark_offload_load_ready(seq)
-            return False
         self._uncount_inflight_load(seq)
         return True
 
@@ -3045,6 +3051,8 @@ class Scheduler:
             note(scheduled_seqs, num_scheduled_tokens)
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
+        # It may be the request Phase 2 stopped at (`_blocked_head`).
+        self._blocked_head = False
         if self._prefetch is not None:
             self._prefetch.note_gone(seq.id)
         self._inflight_prefix_wait.pop(seq.id, None)
@@ -4092,14 +4100,10 @@ class Scheduler:
     @staticmethod
     def _hold_for_local_prefill(seq: Sequence) -> None:
         """Keep an admission that prefills locally, made ahead of its turn
-        (the offload prefetch), as a resume at the hit it holds: Phase 2
-        resumes it in place (`_is_offload_prefill_resume`), as it does a
-        failed load (`_consume_failed_remote_kv`), instead of allocating
-        again."""
-        seq.offload_loaded = False
-        seq.offload_loaded_tokens = seq.num_cached_tokens
-        seq.offload_load_start_tokens = None
-        seq.offload_load_failed = True
+        (the offload prefetch), as a resume at the hit it holds
+        (`offload_held_local`): Phase 2 resumes it in place
+        (`_is_offload_prefill_resume`) instead of allocating again."""
+        seq.offload_held_local = True
 
     def _park_for_remote_load(
         self, seq: Sequence, requeue: deque[Sequence] | None
@@ -5110,13 +5114,13 @@ class Scheduler:
                 )
         return True
 
-    def _head_blocked_on_resources(self) -> bool:
-        """Whether Phase 2 last stopped at a waiting request for want of KV
-        blocks or a parked-load slot (`_blocked_head`, recorded where it
-        breaks, so this applies Phase 2's own test for what that request
-        needs). Finished prefetches hold both and release them only by
-        running."""
-        return self._blocked_head is not None
+    def _prefetch_in_flight(self, seq: Sequence) -> bool:
+        """`seq` holds a prefetch (`OffloadPrefetch`) whose load is in flight."""
+        return (
+            seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+            and self._prefetch is not None
+            and self._prefetch.holds(seq)
+        )
 
     def _resolve_offload_load(self, seq: Sequence) -> None:
         """Consume `seq`'s finished or failed tier load: a finished one
@@ -5124,9 +5128,14 @@ class Scheduler:
         one resumes at its HBM hit, recomputes, or parks again for its own
         state load (`_consume_failed_remote_kv`)."""
         if self._consume_failed_remote_kv(seq):
-            if not seq.block_table and self._prefetch is not None:
-                # Back to a plain waiting request holding nothing.
-                self._prefetch.note_gone(seq.id)
+            if not seq.block_table:
+                # Recomputes from scratch, holding nothing: it no longer waits
+                # for a load, so its parked slot goes (a resume gives it back
+                # when admitted, a request holding nothing never would), and
+                # it is no longer a prefetch.
+                self._uncount_inflight_load(seq)
+                if self._prefetch is not None:
+                    self._prefetch.note_gone(seq.id)
             return
         if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS and (
             self._update_waiting_for_remote_kv(seq)
@@ -5152,16 +5161,12 @@ class Scheduler:
         A prefetched request (`OffloadPrefetch`) keeps its place in line: it
         was not parked by the head of the queue, and moving it up would let it
         prefill ahead of earlier arrivals -- unless Phase 2 is stuck on what
-        finished prefetches hold (`_head_blocked_on_resources`).
+        finished prefetches hold (`_blocked_head`).
         """
         if not self.waiting:
             return
         prefetch = self._prefetch
-        early = bool(
-            prefetch is not None
-            and prefetch.entries
-            and self._head_blocked_on_resources()
-        )
+        early = bool(prefetch is not None and prefetch.entries and self._blocked_head)
         if not (
             early or self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids
         ):

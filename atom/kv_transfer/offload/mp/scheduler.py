@@ -232,7 +232,10 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     def _token_shipper(self) -> TokenShipper:
         """Incremental token shipping (`token_shipping.py`). Created on first
         use, so schedulers assembled without `__init__` (test doubles) work."""
-        return self.__dict__.setdefault("_token_shipper_state", TokenShipper())
+        shipper = self.__dict__.get("_token_shipper_state")
+        if shipper is None:
+            shipper = self._token_shipper_state = TokenShipper()
+        return shipper
 
     def _transfer_tokens(self, seq: Any, end: int) -> ShippedTokens:
         return self._token_shipper.ship(seq, end)
