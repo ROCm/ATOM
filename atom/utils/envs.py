@@ -559,6 +559,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS": lambda: int(
         os.getenv("ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS", "512")
     ),
+    # With ATOM_FUSED_ROUTER_SHARED_EXPERT, steps of at least
+    # ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL_MIN_TOKENS rows above the decode
+    # kernel's limit (prefill) run the router and the shared expert's gate_up
+    # as one GEMM over both weights (SiLU-and-mul epilogue on the gate_up
+    # tiles), then the down GEMM. Bitwise the separate GEMMs. On by default
+    # with the fused flag; 0 keeps the separate GEMMs at those sizes.
+    "ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL": lambda: (
+        os.getenv("ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL", "1") == "1"
+    ),
+    "ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL_MIN_TOKENS", "513")
+    ),
     # Qwen3.5 MTP drafter at TP > 1: the target's all-reduce fusions. o_proj, its
     # all-reduce and post_attention_layernorm run as aiter's gfx1250 GEMM +
     # all-reduce + RMSNorm (TP4, up to 128 rows; else the GEMM, then the fused

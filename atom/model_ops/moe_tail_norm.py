@@ -962,6 +962,18 @@ def fused_router_shared_available() -> bool:
     return get_gfx() == "gfx1250"
 
 
+def fused_router_shared_prefill_available() -> bool:
+    """aiter's prefill path of the fused router + shared expert (the router +
+    gate_up GEMM)."""
+    if not fused_router_shared_available():
+        return False
+    from aiter.ops.triton.gemm.fused import (
+        fused_gemm_a16w16_router_shared_expert as k,
+    )
+
+    return hasattr(k, "fused_gemm_a16w16_router_shared_expert_prefill")
+
+
 def pad_router_weight(weight: Tensor) -> Tensor:
     """`weight` [N, K] in a buffer of whole 16-row groups (zero rows past N):
     returns the padded buffer. Set the module weight to `padded[:N]`."""
@@ -973,15 +985,24 @@ def pad_router_weight(weight: Tensor) -> Tensor:
 
 
 def router_shared_expert(
-    x: Tensor, w_router_padded: Tensor, n_router: int, w_gate_up: Tensor, w_down: Tensor
+    x: Tensor,
+    w_router_padded: Tensor,
+    n_router: int,
+    w_gate_up: Tensor,
+    w_down: Tensor,
+    prefill: bool = False,
 ) -> tuple[Tensor, Tensor]:
-    """(x @ w_router.T [M, n_router], the shared expert's output [M, hidden])
-    in one launch, bitwise the router GEMM and the gated gate_up + down GEMMs.
-    `w_gate_up` is interleaved gate / up (`interleave_gate_up`)."""
-    from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_router_shared_expert import (
-        fused_gemm_a16w16_router_shared_expert,
-    )
+    """(x @ w_router.T [M, n_router], the shared expert's output [M, hidden]),
+    bitwise the router GEMM and the gated gate_up + down GEMMs. `w_gate_up`
+    is interleaved gate / up (`interleave_gate_up`). Decode sizes run one
+    persistent kernel; with `prefill`, the router and gate_up run as one GEMM
+    over both weights, then the down GEMM."""
+    from aiter.ops.triton.gemm.fused import fused_gemm_a16w16_router_shared_expert as k
 
-    return fused_gemm_a16w16_router_shared_expert(
+    if prefill:
+        return k.fused_gemm_a16w16_router_shared_expert_prefill(
+            x, w_router_padded, w_gate_up, w_down, None, None, None, n_router
+        )
+    return k.fused_gemm_a16w16_router_shared_expert(
         x, w_router_padded, w_gate_up, w_down, n_router=n_router
     )

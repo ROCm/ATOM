@@ -51,6 +51,7 @@ from atom.model_ops.moe_tail_norm import (
     MoENormed,
     combine_tail_request,
     fused_router_shared_available,
+    fused_router_shared_prefill_available,
     gated_gemm_available,
     interleave_gate_up,
     pad_router_weight,
@@ -393,7 +394,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """ATOM_FUSED_ROUTER_SHARED_EXPERT: (router logits, shared expert
-        output) from one kernel, or None where it does not apply."""
+        output) from one kernel (decode sizes) or from the router + gate_up
+        GEMM and the down GEMM (prefill sizes), or None where neither
+        applies."""
         mlp = self.shared_expert
         m = hidden_states.shape[0]
         if (
@@ -402,7 +405,15 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             or self.tp_size != 1
             or not mlp.gated_gate_up
             or mlp.expert_gate is not None
-            or not 0 < m <= envs.ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS
+            or m <= 0
+            or (
+                m > envs.ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS
+                and not (
+                    envs.ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL
+                    and m >= envs.ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL_MIN_TOKENS
+                    and fused_router_shared_prefill_available()
+                )
+            )
             or torch.compiler.is_compiling()
             or hidden_states.dtype != torch.bfloat16
             or self.gate.bias is not None
@@ -420,6 +431,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             w_router.shape[0],
             mlp.gate_up_proj.weight,
             mlp.down_proj.weight,
+            prefill=m > envs.ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS,
         )
 
     def combine_tail_forward(
