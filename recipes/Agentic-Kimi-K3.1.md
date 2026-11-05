@@ -4,8 +4,12 @@ This recipe runs the SemiAnalysis/Weka AgentX replay workload against
 Kimi-K3.1 Pro with ATOM on 8×AMD MI355X GPUs. The per-concurrency settings
 follow the Kimi-K3 ATOM AgentX recipe in
 [SemiAnalysisAI/InferenceX#4307](https://github.com/SemiAnalysisAI/InferenceX/pull/4307)
-(`kimik3/atom/mi355x-fp4-mtp/agentic.yaml`). The deviations are listed in
-[Deviations from InferenceX#4307](#deviations-from-inferencex4307).
+(`kimik3/atom/mi355x-fp4-mtp/agentic.yaml`), under the InferenceX
+[Kimi K3.1 Pro week-1 precision policy](#precision). The deviations are listed
+in [Deviations from InferenceX#4307](#deviations-from-inferencex4307). The
+InferenceX submission of this recipe is
+[SemiAnalysisAI/InferenceX#4830](https://github.com/SemiAnalysisAI/InferenceX/pull/4830)
+(`kimik3.1-fp4-mi355x-atom-agentic-dspark`).
 
 - `moonshotai/Kimi-K3.1-Pro` (MXFP4 routed experts, KDA + MLA with a DSA
   indexer on all 24 MLA layers), served by ATOM through the Kimi-K3 class
@@ -15,8 +19,9 @@ follow the Kimi-K3 ATOM AgentX recipe in
 - DSpark speculative decoding on every band, with the InferenceX synthetic
   acceptance length
 - mono decode at CONC 1/4
-- no `AITER_QUICK_REDUCE_QUANTIZATION`, no `--online_quant_config`: every
-  non-MoE linear stays BF16
+- BF16 linears, shared experts, MoE combine and all-reduce, FP32 KDA state:
+  no `--online_quant_config`, no `AITER_QUICK_REDUCE_QUANTIZATION`, no
+  `AITER_FLYDSL_STAGE2_FP8`
 
 The workload is the AIPerf scenario `inferencex-agentx-mvp` on the public
 dataset `semianalysis_cc_traces_weka_062126`. It replays long multi-turn coding
@@ -221,16 +226,32 @@ correctness run.
 
 ### Precision
 
-The recipe follows the InferenceX Kimi K3.1 Pro week-1 precision policy:
+InferenceX publishes official Kimi K3.1 Pro AgentX results only under its
+week-1 precision policy, agreed by the vLLM and SGLang communities:
+[`inferencex-e2e/docs/MODELS.md`, "Kimi K3.1 Pro week-1 precision policy"](https://github.com/SemiAnalysisAI/InferenceX/blob/main/inferencex-e2e/docs/MODELS.md#kimi-k31-pro-week-1-precision-policy),
+added in [SemiAnalysisAI/InferenceX#4792](https://github.com/SemiAnalysisAI/InferenceX/pull/4792).
+"Native" means the precision of the released checkpoint. Every band of this
+recipe meets it:
 
-| Component | Setting |
-|---|---|
-| Linear ops, shared experts | BF16 as shipped (no `--online_quant_config`) |
-| MoE weights / activations | MXFP4 as shipped; A4W4 (`AITER_SITUV2_A4W4=1`) |
-| MoE combine | BF16 (no `AITER_FLYDSL_STAGE2_FP8`) |
-| All-reduce | BF16 (no `AITER_QUICK_REDUCE_QUANTIZATION`) |
-| KDA state | FP32 (`ATOM_GDN_SSM_DTYPE=fp32`) on every band |
-| KV cache / DSA index cache | FP8 / FP8 |
+| Component | Policy rule | This recipe |
+|---|---|---|
+| Linear ops | Must match native (BF16) | BF16 as shipped: no `--online_quant_config` |
+| Shared expert | Must match native (BF16) | BF16 as shipped |
+| MoE weights | MXFP4 or NVFP4 | MXFP4 as shipped |
+| MoE activations | A4W4 allowed | A4W4 (`AITER_SITUV2_A4W4=1`) |
+| MoE dispatch | MX/NV-style quantization allowed | MXFP4 activation quantization inside the AITER MoE |
+| MoE combine | Must match native (BF16) | BF16: `AITER_FLYDSL_STAGE2_FP8` is not set |
+| AllReduce / AG / RS | Must match native (BF16) | BF16: `AITER_QUICK_REDUCE_QUANTIZATION` is not set |
+| KDA cache | FP32 | FP32 (`ATOM_GDN_SSM_DTYPE=fp32`) on every band |
+| Conv cache | Native (BF16) | BF16: ATOM keeps the KDA conv state at the model dtype (`bfloat16`) |
+| Indexer cache | FP4 allowed | FP8 (follows the FP8 KV cache) |
+| KV cache | FP8 allowed (FP4 only if the checkpoint ships an FP4 KV cache) | FP8 (`--kv_cache_dtype fp8`) |
+
+The same policy requires EPLB, if any, to be dynamic (this recipe uses none),
+and requires engines other than vLLM, SGLang, TileRT and TokenSpeed to pass the
+Kimi Vendor Verifier (KVV) before submitting. Do not add the Kimi-K3 recipe's
+`AITER_QUICK_REDUCE_QUANTIZATION=INT4`, `AITER_FLYDSL_STAGE2_FP8=1` or
+`--online_quant_config` back for an official run.
 
 ### Deviations from InferenceX#4307
 
@@ -317,9 +338,10 @@ Synthetic acceptance is performance-only. For GSM8K, launch the same band
 
 | CONC | Status |
 |---|---|
-| 1, 4 | 3600-second runs with these settings (mono on, KDA state fp32), with **real** DSpark acceptance. Not yet re-run at the synthetic AL. |
-| 14, 16 | 3600-second runs with these settings, with **real** DSpark acceptance and without the 2272/6284/18432 BF16 tuned rows. Not yet re-run at the synthetic AL. |
-| 48, 56, 72 | 3600-second runs at the Kimi-K3 synthetic AL 3.36 (not the K3.1 value) with LMCache 128/192 GiB, `ATOM_STATE_CHECKPOINT_DEMAND=0`, and HERD off (the pre-#4307 settings). The #4307 settings above (224 GiB, demand checkpoints, fp32 state, HERD) are not yet validated on K3.1. |
+| 1, 4 | 3600-second AgentX runs with this checkpoint at real DSpark acceptance, on earlier configurations. Not yet run with exactly this recipe. |
+| 14, 16 | 3600-second AgentX runs with this checkpoint at real DSpark acceptance, on earlier configurations. Not yet run with exactly this recipe. |
+| 48, 56, 72 | 3600-second AgentX runs with this checkpoint at a forced acceptance length, on earlier configurations (the pre-#4307 LMCache and checkpoint settings). Not yet run with exactly this recipe. |
 
-Throughput and interactivity numbers for this exact configuration will be added
-once every band has been re-run from this recipe.
+The InferenceX sweep of SemiAnalysisAI/InferenceX#4830 is the first run of
+every band with exactly this recipe. Throughput and interactivity numbers will
+be added from it.
