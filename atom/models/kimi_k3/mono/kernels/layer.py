@@ -27,7 +27,7 @@ shared gate/up GEMVs issue their weights before they first wait.
                      lnorm (56 .. 83), up (0 .. 55), reduce (200 .. 255)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -171,6 +171,27 @@ def abi_for(key: K2Build) -> KernelAbi:
     if key.mla_prep:
         return ABI_PREP
     return ABI_POST if key.mla_post else ABI
+
+
+# the fields only the MLA post / prep folds read
+FOLD_FIELDS = (
+    "mla_post",
+    "mla_prep",
+    "prep_nblocks",
+    "prep_eps",
+    "prep_out_eps",
+    "qa_eps",
+    "kva_eps",
+    "rope_neox",
+    "rope_maxpos",
+)
+
+
+def unfolded(key: K2Build) -> K2Build:
+    """``key`` without the MLA post / prep folds: the default build of its
+    layer (the same key, so the same launcher and code object)."""
+    fields = K2Build.__dataclass_fields__
+    return replace(key, **{name: fields[name].default for name in FOLD_FIELDS})
 
 
 def peer_layout(s):
