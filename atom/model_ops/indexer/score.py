@@ -21,6 +21,8 @@ requests, which a token bucket does not fix. Everything else -- the bands, the
 FP8 launch, the top-k -- follows the rows alone and is recorded.
 """
 
+import inspect
+
 import torch
 from aiter import cp_gather_indexer_k_quant_cache, dtypes
 from aiter.dist.parallel_state import get_tp_group
@@ -32,10 +34,15 @@ from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logi
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
 from atom.distributed.dcp_utils import get_dcp_group
+from atom.model_ops.sparse_indexer_chunk import concat_plane_width
 from atom.utils import forward_context
 from atom.utils.region_graph import eager_region
 
 from .rows import NATURAL, IndexCache, IndexRows
+
+# Whether aiter's dense FP8 scorer writes into a caller's plane (`logits=`).
+# Without it each prefill band's logits are allocated per call.
+FP8_MQA_LOGITS_TAKES_OUT = "logits" in inspect.signature(fp8_mqa_logits).parameters
 
 # gfx1250 scores the FP8 plane with FlyDSL's paged MQA logits (8-row pages
 # included); it reads the same packed preshuffled pages as the Triton kernel
@@ -233,11 +240,15 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
 
 
 def _gather_concat(query, cache, keys):
-    """The step's requests' committed keys, end to end."""
-    k_fp8 = torch.empty(
-        (keys.total, query.shape[-1]), device=query.device, dtype=dtypes.fp8
-    )
-    k_scale = torch.empty((keys.total, 1), device=query.device, dtype=torch.float32)
+    """The step's requests' committed keys, end to end: into `keys.workspace`
+    when it has one, else allocated for the step."""
+    if keys.workspace is not None:
+        k_fp8, k_scale = keys.workspace.keys(keys.total)
+    else:
+        k_fp8 = torch.empty(
+            (keys.total, query.shape[-1]), device=query.device, dtype=dtypes.fp8
+        )
+        k_scale = torch.empty((keys.total, 1), device=query.device, dtype=torch.float32)
     cp_gather_indexer_k_quant_cache(
         cache.values,
         k_fp8,
@@ -259,10 +270,19 @@ def _score_concat(
         _gather_concat(query, cache, keys) if gathered is None else gathered
     )
     ends = keys.row_starts + rows.row_ends
+    # The bands' plane: the workspace's, rows at `concat_plane_width` apart;
+    # without one, each band allocated by the kernel. Those allocations follow
+    # the step's context, which the memory profile (an 8K prefill with no
+    # history) never reaches, and grow every chunk of a long prefill.
+    plane = rows.workspace
+    pitch = concat_plane_width(keys.total)
     for first, end in rows.bands:
         span = slice(first, end)
-        # Allocated by the kernel, a band at a time: a prefill's temporaries
-        # are what the memory profile measures, so they are counted already.
+        out_plane = (
+            {}
+            if plane is None
+            else {"logits": plane.logits(end - first, pitch)[:, : keys.total]}
+        )
         scores = fp8_mqa_logits(
             Q=query[span],
             KV=k_fp8,
@@ -271,6 +291,7 @@ def _score_concat(
             cu_starts=keys.row_starts[span],
             cu_ends=ends[span],
             clean_logits=False,
+            **out_plane,
         )
         top_k_per_row_prefill(
             scores,

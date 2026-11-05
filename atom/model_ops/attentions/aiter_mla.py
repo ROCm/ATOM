@@ -65,6 +65,7 @@ from atom.model_ops.glm5_next.geometry import (
     topk_output_width,
 )
 from atom.model_ops.indexer import (
+    FP8_MQA_LOGITS_TAKES_OUT,
     ConcatKeys,
     Fp4LaunchStorages,
     IndexRows,
@@ -74,7 +75,12 @@ from atom.model_ops.indexer import (
     fp8_rows,
 )
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
-from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+from atom.model_ops.sparse_indexer_chunk import (
+    ConcatKeyWorkspace,
+    LogitsWorkspace,
+    concat_plane_width,
+    logits_rows,
+)
 from atom.model_ops.sparse_indexer_fp4 import (
     fp4_index_scale_rows,
     sparse_indexer_fp4_enabled,
@@ -493,6 +499,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         self.index_n_heads = hf_config.index_n_heads if self.is_sparse else 0
         self.index_logits_workspace: LogitsWorkspace | None = None
+        # The FP8 prefill indexer's gathered keys (`_concat_prefill_scored`).
+        self.index_prefill_key_workspace: ConcatKeyWorkspace | None = None
         self._fp4_launches = Fp4LaunchStorages(
             self.device, self.max_num_batched_tokens, self.max_bs
         )
@@ -874,12 +882,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # the step's rows are cut to. Allocated before the memory profile
             # so the KV budget counts it. DCP decode scores in its fused
             # exchange.
+            # The FP8 prefill (concat) scorer bands into the same plane: a
+            # forward publishes prefill or decode index rows, never both, so
+            # the plane is as large as the larger of the two needs.
+            capacity = 0
             if self._publishes_decode_index_rows():
-                self.index_logits_workspace = LogitsWorkspace.for_rows(
-                    self.max_bs * max_seqlen_qo,
-                    self._index_decode_width(),
-                    self.device,
-                )
+                width = self._index_decode_width()
+                capacity = logits_rows(self.max_bs * max_seqlen_qo, width) * width
+            if self._concat_prefill_scored():
+                capacity = max(capacity, self._alloc_prefill_concat_keys())
+            if capacity:
+                self.index_logits_workspace = LogitsWorkspace(capacity, self.device)
                 logger.info(
                     "Sparse indexer logits workspace: %.2f GiB",
                     self.index_logits_workspace.nbytes / (1 << 30),
@@ -2661,6 +2674,55 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         rows.view(running_bs, max_seqlen_q, -1).copy_(block_tables.unsqueeze(1))
         attn_metadata.token_block_tables = rows
 
+    def _concat_prefill_scored(self) -> bool:
+        """Whether a prefill scores FP8 index rows against its requests' keys
+        gathered end to end (`ConcatKeys`): every sparse indexer's but FP4's
+        and a pooled one's."""
+        return self.is_sparse and not self._indexer_fp4 and self.index_kpool == 1
+
+    def _prefill_concat_plane(self) -> LogitsWorkspace | None:
+        """The plane FP8 prefill bands are scored into; None when aiter's
+        scorer allocates its own."""
+        return self.index_logits_workspace if FP8_MQA_LOGITS_TAKES_OUT else None
+
+    def _alloc_prefill_concat_keys(self) -> int:
+        """Allocate the FP8 prefill indexer's gathered-key workspace and return
+        the logits plane (fp32 elements) its bands need -- a rank's share of a
+        step's rows (`RowSplit`) across a request of the model length.
+
+        Both follow the configuration, not the step: allocated per step they
+        are as long as the step's context, so every chunk of a long prefill
+        asks the caching allocator for a slightly larger block than the last,
+        which it never has, until HBM runs out. 0 when aiter's scorer cannot
+        write into a plane: its bands are then allocated per call."""
+        config = self.model_runner.config
+        hf_config = config.hf_config
+        world = self.dcp_world_size
+        keys = config.max_model_len + self.max_num_batched_tokens
+        gathered = 0
+        if world > 1:
+            # A request's shard is padded to its interleave super-block.
+            shard = -(-keys // world) + self.max_bs * self.cp_kv_cache_interleave_size
+            gathered = world * shard
+        self.index_prefill_key_workspace = ConcatKeyWorkspace(
+            keys, hf_config.index_head_dim, dtypes.fp8, self.device, gathered
+        )
+        logger.info(
+            "FP8 prefill indexer key workspace: %.2f GiB (%d keys)",
+            self.index_prefill_key_workspace.nbytes / (1 << 30),
+            keys,
+        )
+        if not FP8_MQA_LOGITS_TAKES_OUT:
+            logger.warning(
+                "aiter fp8_mqa_logits takes no logits buffer: FP8 prefill index "
+                "logits are allocated per band, a block that grows with the "
+                "context through a long prefill"
+            )
+            return 0
+        rows = -(-self.max_num_batched_tokens // world)
+        width = concat_plane_width(config.max_model_len)
+        return logits_rows(rows, width) * width
+
     def _publishes_decode_index_rows(self) -> bool:
         """Whether a decode step publishes its index rows (`IndexRows`): every
         sparse indexer's but DCP's, whose decode scores in its fused exchange."""
@@ -2783,8 +2845,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 ),
                 total=total_kv,
                 row_starts=attn_metadata.cu_seqlen_ks,
+                workspace=self.index_prefill_key_workspace,
             )
-            attn_metadata.index_rows = concat_rows(ends, keys, split)
+            attn_metadata.index_rows = concat_rows(
+                ends, keys, split, workspace=self._prefill_concat_plane()
+            )
             return
         # A prefill is eager, so its plane is as wide as its longest row.
         attn_metadata.index_rows = self._prefill_fp4_rows(
@@ -3678,7 +3743,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         split = RowSplit.of(ends.shape[0], self.dcp_rank, self.dcp_world_size)
         if rows.concat is not None:
             row_starts = rows.concat.row_starts[ts]
-            return concat_rows(ends, rows.concat._replace(row_starts=row_starts), split)
+            return concat_rows(
+                ends,
+                rows.concat._replace(row_starts=row_starts),
+                split,
+                workspace=rows.workspace,
+            )
         return self._prefill_fp4_rows(
             ends,
             rows.width,
