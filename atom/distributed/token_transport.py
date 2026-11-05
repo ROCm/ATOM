@@ -11,11 +11,8 @@ import torch
 from atom.distributed.custom_gather import custom_gather_ok, usable_ca_comm
 from atom.utils import envs
 
-# Below this, sending W times the bytes through the registered-buffer
-# all-gather still beats RCCL's all-to-all; above it, the all-to-all's smaller
-# payload wins. Measured on SP4 hidden rows: the two cross at ~3.7 MB per rank,
-# and the gather only falls further behind past it. `indexer_cp`'s 512 KiB is
-# for its key gather, a different payload and a different pair of kernels.
+# Per-rank payloads up to this take the registered-buffer all-gather over RCCL's
+# all-to-all. Measured on SP4 the two cross at ~3.7 MB; 2 MiB keeps a margin.
 ALLGATHER_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 # Output rows per rank from which an attention output takes the prefill head
 # exchange (FP8 with a gathered amax, the four-rank exchange kernel); decode
