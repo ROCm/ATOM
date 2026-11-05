@@ -238,7 +238,6 @@ models:
           run_eval: true
           eval_concurrency: [128, 512]
 
-      # Wide EP. Decode uses MoRI low latency. One node is DPA8+EP8.
       accuracy:
         - &dsv4_ep_moriio
           name: ds-v4-1p1d-dpa8-ep8-ll-moriio-gsm8k
@@ -268,7 +267,6 @@ models:
           eval_only: true
           accuracy:
             threshold: 0.90
-        # One prefill and one decode worker, each DPA16+EP16 across two nodes.
         - <<: *dsv4_ep_moriio
           name: ds-v4-2p2d-dpa16-ep16-ll-moriio-gsm8k
           topology: 1p1d_dpa16_ep16_ll_moriio
