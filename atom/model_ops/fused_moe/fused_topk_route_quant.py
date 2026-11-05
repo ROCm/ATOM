@@ -59,7 +59,7 @@ def try_defer_topk_route_quant(method, layer, x, logits):
         or layer.moe_parallel_config.pcp_merge
         # DP with every expert on every rank (ATOM_DP_REPLICATE_EXPERTS) runs
         # its own rows through the MoE: no gather, so it qualifies.
-        or (layer.dp_size > 1 and not layer.moe_parallel_config.replicate_experts)
+        or (layer.dp_size > 1 and not getattr(layer.moe_parallel_config, "replicate_experts", False))
         or config.eplb_enable
         or not layer.renormalize
         or layer.scoring_func != "softmax"
