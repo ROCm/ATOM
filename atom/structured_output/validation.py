@@ -5,10 +5,12 @@
 
 import asyncio
 import json
+import re
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from functools import cache
 from threading import Lock
 
 from atom import structured_output
@@ -47,8 +49,12 @@ def schema_from_format(fmt, *, responses=False):
     return json.dumps(schema, ensure_ascii=False)
 
 
-def structured_tool_format(parser_cls, tools, tool_choice):
-    """Describe the native tool alternative without accepting client grammars."""
+def structured_tool_format(parser_cls, tools, tool_choice, strict_schemas=None):
+    """Describe the native tool alternative without accepting client grammars.
+
+    A function named in ``strict_schemas`` (see :func:`strict_tool_schemas`)
+    also has its arguments constrained by that schema.
+    """
     if not tools or tool_choice == "none":
         return None
     from atom.entrypoints.openai.tool_parser.deepseekv4_tool_parser import DsmlParser
@@ -67,10 +73,117 @@ def structured_tool_format(parser_cls, tools, tool_choice):
         {
             "prefix": parser_cls.DSML_PREFIX,
             "section": parser_cls.SECTION,
-            "names": names,
+            "tools": [
+                {"name": name, "parameters": (strict_schemas or {}).get(name)}
+                for name in names
+            ],
             "required": required,
         }
     )
+
+
+def strict_tool_schemas(tools):
+    """``{name: parameters}`` for each function declaring ``strict: true``.
+
+    Keyed by the qualified name, the identity calls are parsed and validated by.
+    """
+    from atom.entrypoints.openai.tool_parser.tool_parser import qualified_tool_name
+
+    schemas = {}
+    for tool in tools or ():
+        parameters = strict_parameters(tool["function"])
+        if parameters is not None:
+            schemas[qualified_tool_name(tool)] = parameters
+    return schemas
+
+
+# RFC 1123 host name labels. jsonschema checks `hostname` only with its
+# optional `fqdn` dependency, and strict tools document it as supported.
+_HOSTNAME_LABEL = re.compile(r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)")
+
+
+def _is_hostname(value):
+    if not isinstance(value, str):
+        return True
+    name = value.removesuffix(".")
+    return 0 < len(name) <= 253 and all(
+        _HOSTNAME_LABEL.fullmatch(label) for label in name.split(".")
+    )
+
+
+@cache
+def _strict_format_checker():
+    """Format checks for strict tool arguments, hostname included."""
+    from jsonschema import Draft202012Validator, FormatChecker
+
+    checker = FormatChecker(formats=())
+    checker.checkers.update(Draft202012Validator.FORMAT_CHECKER.checkers)
+    if "hostname" not in checker.checkers:
+        checker.checks("hostname")(_is_hostname)
+    return checker
+
+
+# Keywords DeepSeek's strict mode rejects rather than enforces.
+_STRICT_UNSUPPORTED = ("minLength", "maxLength", "minItems", "maxItems")
+
+
+def strict_parameters(function):
+    """A strict function's ``parameters`` checked against DeepSeek's rules.
+
+    ``None`` for a function that is not strict. Every object must list all of
+    its properties in ``required`` and set ``additionalProperties: false``, so
+    the arguments are exactly the declared ones, in declared order.
+    """
+    strict = function.get("strict", False)
+    if not isinstance(strict, bool):
+        message = f"{function['name']}: strict must be a boolean"
+        raise ValueError(message)  # noqa: TRY004
+    if not strict:
+        return None
+    parameters = function.get("parameters") or {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
+    if not isinstance(parameters, dict) or parameters.get("type") != "object":
+        raise ValueError(f"{function['name']}: strict parameters must be an object")
+    schema_from_format(
+        {"type": "json_schema", "name": function["name"], "schema": parameters},
+        responses=True,
+    )
+    _check_strict(function["name"], parameters)
+    return parameters
+
+
+def _check_strict(name, schema):
+    if isinstance(schema, list):
+        for child in schema:
+            _check_strict(name, child)
+        return
+    if not isinstance(schema, dict):
+        return
+    for keyword in _STRICT_UNSUPPORTED:
+        if keyword in schema:
+            raise ValueError(f"{name}: {keyword} is not supported by strict tools")
+    if schema.get("type") == "object" or "properties" in schema:
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is not False:
+            raise ValueError(
+                f"{name}: every strict object must set additionalProperties: false"
+            )
+        if set(schema.get("required", ())) != set(properties):
+            raise ValueError(
+                f"{name}: every property of a strict object must be required"
+            )
+    for key, child in schema.items():
+        if key in {"properties", "$defs", "$def", "definitions"} and isinstance(
+            child, dict
+        ):
+            for subschema in child.values():
+                _check_strict(name, subschema)
+        elif key not in {"const", "enum", "default", "examples"}:
+            _check_strict(name, child)
 
 
 def structured_reasoning_marker(channel, tokenizer):
@@ -101,9 +214,12 @@ def raise_for_structured_error(finish_reason):
         raise RuntimeError("Structured decoding failed for this request")
 
 
+_TRUNCATED = {"length", "max_tokens", "max_new_tokens"}
+
+
 def validate_output(schema, text, finish_reason, *, tool_calls=False):
     raise_for_structured_error(finish_reason)
-    if schema is None or finish_reason in {"length", "max_tokens", "max_new_tokens"}:
+    if schema is None or finish_reason in _TRUNCATED:
         return
     if tool_calls and not text.strip():
         return  # A function-only turn has no response text to constrain.
@@ -140,10 +256,31 @@ def validate_responses_output(schema, response, finish_reason):
     )
 
 
-async def validate_chat_stream(source, schema):
+def validate_tool_calls(strict_schemas, tool_calls, finish_reason):
+    """Each call to a strict function must carry arguments its schema accepts."""
+    if not strict_schemas or finish_reason in _TRUNCATED:
+        return
+    from .schema import schema_validator
+
+    for call in tool_calls or ():
+        name = call["function"]["name"]
+        if name not in strict_schemas:
+            continue
+        try:
+            arguments = json.loads(call["function"]["arguments"])
+            schema_validator(strict_schemas[name]).evolve(
+                format_checker=_strict_format_checker()
+            ).validate(arguments)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Tool call {name} did not satisfy its strict parameters schema"
+            ) from exc
+
+
+async def validate_chat_stream(source, schema, strict_schemas=None):
     from atom.entrypoints.openai.sse import data_frame, iter_sse_data
 
-    texts = {}
+    texts, calls = {}, {}
     try:
         async for frame in source:
             for data in iter_sse_data(frame):
@@ -152,15 +289,27 @@ async def validate_chat_stream(source, schema):
                 payload = json.loads(data)
                 for choice in payload.get("choices", []):
                     index = choice.get("index", 0)
-                    texts.setdefault(index, []).append(
-                        choice.get("delta", {}).get("content") or ""
-                    )
+                    delta = choice.get("delta", {})
+                    texts.setdefault(index, []).append(delta.get("content") or "")
+                    for call in delta.get("tool_calls") or ():
+                        fn = call.get("function") or {}
+                        acc = calls.setdefault(index, {}).setdefault(
+                            call.get("index", 0),
+                            {"function": {"name": "", "arguments": ""}},
+                        )["function"]
+                        acc["name"] += fn.get("name") or ""
+                        acc["arguments"] += fn.get("arguments") or ""
                     if choice.get("finish_reason"):
                         validate_output(
                             schema,
                             "".join(texts[index]),
                             choice["finish_reason"],
                             tool_calls=choice["finish_reason"] == "tool_calls",
+                        )
+                        validate_tool_calls(
+                            strict_schemas,
+                            calls.get(index, {}).values(),
+                            choice["finish_reason"],
                         )
             yield frame
     except RuntimeError as exc:
@@ -323,8 +472,9 @@ async def configure_request(
     multimodal=False,
     relaxed_mtp=False,
     synthetic=False,
+    strict_schemas=None,
 ):
-    if schema is None:
+    if schema is None and not strict_schemas:
         return
     validate_execution_options(
         config,
@@ -334,7 +484,7 @@ async def configure_request(
         relaxed_mtp=relaxed_mtp,
         synthetic=synthetic,
     )
-    tool_format = structured_tool_format(parser_cls, tools, tool_choice)
+    tool_format = structured_tool_format(parser_cls, tools, tool_choice, strict_schemas)
     reasoning_end = structured_reasoning_marker(channel, tokenizer)
     sampling_params.json_schema = schema
     sampling_params.structured_tool_format = tool_format

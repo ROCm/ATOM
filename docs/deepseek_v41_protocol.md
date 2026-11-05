@@ -89,6 +89,38 @@ during decoding and allows declared DSML tool calls as a separate alternative.
 See [structured output](structured_output_capabilities.md) for supported formats
 and deployment limits.
 
+## Beta endpoints
+
+`/beta/chat/completions` is the chat endpoint plus DeepSeek's prefix
+completion: a final assistant message with `"prefix": true` is continued
+rather than answered, and the response carries only what the model adds.
+Earlier messages render exactly as for an ordinary request and the prefix is
+appended to the opened assistant turn, so the prompt equals the official
+encoder's unterminated (`wo_eos`) assistant turn. In thinking mode a
+`reasoning_content` alone continues the chain of thought; with `content` the
+channel is closed and the answer continues; `content` alone closes the channel
+empty. The flag is rejected on `/v1/chat/completions`, on any but the last
+message, after another assistant message, with `tool_calls`, with non-text
+content, with image input or `prompt_token_ids`, and `reasoning_content` is
+rejected when thinking is off.
+
+`/beta/completions` is the completions endpoint plus fill-in-the-middle: with
+`suffix`, the prompt is `BOS <｜fim▁begin｜>prompt<｜fim▁hole｜>suffix<｜fim▁end｜>`
+and the model writes the middle, ending at EOS. The format is recognised by
+those tokens in the vocabulary. V4.1 starts the middle with its line break
+rather than ending with one, so a cursor at the end of a line pairs with a
+suffix that begins with `\n`. `suffix` is rejected on `/v1/completions`, with
+token-ID prompts, and on a model without FIM tokens; without `suffix` the
+endpoint is an ordinary completion. `echo` returns the prompt ahead of the
+completion and is rejected with `suffix`. `logprobs` is rejected on
+`/beta/completions` until completions return token probabilities.
+`stream_options` requires `stream`; `include_usage` puts `usage` on every
+chunk, null until the final usage chunk.
+
+`stop` takes one string or a list of them on every endpoint. Stop strings
+are found in the decoded text, so one the model spells with other tokens
+than its own still ends the reply, and the returned text ends before it.
+
 ## Validation
 
 - The Rust mesh tool-parser regression and the Python streaming/complete parser

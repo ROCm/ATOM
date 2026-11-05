@@ -102,6 +102,12 @@ def prompt_starts_in_reasoning(prompt: str) -> bool:
     Model-agnostic: callers pass the rendered prompt and don't need to know which
     dialect's marker applies. Used to seed the streaming filter
     (:attr:`ReasoningFilter.starts_thinking`).
+    """
+    return dialect_opened_by(prompt) is not None
+
+
+def dialect_opened_by(prompt: str) -> ReasoningDialect | None:
+    """The dialect whose reasoning channel ``prompt`` ends by opening, if any.
 
     Offsets, not `prompt.rstrip()`, which copies the whole rendered prompt to
     read its last twenty bytes. That prompt is the largest string the server
@@ -112,7 +118,10 @@ def prompt_starts_in_reasoning(prompt: str) -> bool:
     end = len(prompt)
     while end > 0 and prompt[end - 1].isspace():
         end -= 1
-    return any(prompt.endswith(m, 0, end) for m in _REASONING_OPEN_MARKERS)
+    for dialect in DIALECTS:
+        if prompt.endswith(dialect.prompt_open_marker, 0, end):
+            return dialect
+    return None
 
 
 def prompt_tokens_start_in_reasoning(

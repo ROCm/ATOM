@@ -28,7 +28,8 @@ from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from functools import partial
 from typing import Any
 
 import uvicorn
@@ -59,13 +60,16 @@ from atom.observability.tracing import TraceMiddleware, set_request_id
 from atom.observability.tracing import initialize as initialize_tracing
 from atom.observability.tracing import shutdown as shutdown_tracing
 from atom.sampling_params import RequiredChannel
+from atom.structured_output import is_structured
 from atom.structured_output.validation import (
     configure_request,
     schema_from_format,
+    strict_tool_schemas,
     structured_response_channel,
     validate_chat_stream,
     validate_output,
     validate_responses_output,
+    validate_tool_calls,
 )
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
@@ -86,12 +90,16 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
+from .fim import FimFormat, resolve_fim_format
+from .images import chat_image_parts, check_image_roles, load_images
 from .metrics_setup import create_metrics_exporter
+from .prefix_completion import continue_prompt, take_assistant_prefix
 from .protocol import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
     ChatCompletionRequest,
+    ChatMessage,
     CompletionRequest,
     ModelCard,
     ModelList,
@@ -142,6 +150,7 @@ from .serving_chat import (
     stream_chat_response_fanout,
     validate_chat_request,
     validate_history_tool_calls,
+    validate_stream_options,
     validate_tool_list,
 )
 from .serving_completion import (
@@ -162,9 +171,11 @@ from .serving_responses import (
 )
 from .serving_responses import stream_failure_frames as responses_stream_failure_frames
 from .sse import event_frame, iter_sse_data
+from .stop_strings import StopStrings, check_stop_strings, stop_list
 from .streaming_dispatch import (
     SYNTHETIC_TOKEN_TEXT,
     FrameWait,
+    IncrementalStreamDetokenizer,
     StreamBatchDispatcher,
     StreamOutputCollector,
     enable_delta_reuse,
@@ -184,6 +195,11 @@ from .tool_parser.registry import (
 
 # Configure logging
 logger = logging.getLogger("atom")
+
+# Which roles may carry images, by API (DeepSeek's vision contract). A tool
+# role holds a tool result, which Responses and Anthropic allow images in.
+CHAT_IMAGE_ROLES = frozenset({"user"})
+TOOL_RESULT_IMAGE_ROLES = frozenset({"user", "tool"})
 
 # Constants
 DEFAULT_HOST = "0.0.0.0"
@@ -221,6 +237,9 @@ processor: Any | None = None
 model_name: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
 custom_message_encoder: Any | None = None
+# The model's fill-in-the-middle markers, found in its vocabulary at startup;
+# None when it has none and /beta/completions cannot honour a `suffix`.
+fim_format: FimFormat | None = None
 _seq_id_to_request_id: dict[int, str] = {}
 _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
@@ -245,6 +264,59 @@ def delivered_text(token_ids) -> str:
     if synthetic_token_text is None:
         return decoded
     return synthetic_token_text * len(token_ids)
+
+
+def _abort_at_stop_string(seq_id: int) -> None:
+    """Stop a sequence whose text reached a stop string its tokens did not."""
+    with contextlib.suppress(Exception):
+        engine.core_mgr.abort_request(seq_id)
+
+
+class _StopWatch:
+    """A non-streaming reply decoded as it arrives, to find its stop strings.
+
+    The text released on the way is the reply, cut before the first stop
+    string, so it is not decoded a second time at the end.
+    """
+
+    def __init__(self, stops: list[str]):
+        self.detokenizer = IncrementalStreamDetokenizer(
+            tokenizer, stop=StopStrings(stops)
+        )
+        self.released: list[str] = []
+
+    def reached(self, item: dict, seq_id: int) -> bool:
+        """Whether this step's text reached a stop string, stopping the engine
+        if so."""
+        self.released.append(
+            self.detokenizer.update(
+                item.get("token_ids") or [], bool(item.get("finished"))
+            )
+        )
+        if not self.detokenizer.stop.stopped:
+            return False
+        if not item.get("finished"):
+            _abort_at_stop_string(seq_id)
+        return True
+
+
+def _stop_watch(sampling_params: SamplingParams) -> _StopWatch | None:
+    """What finds the request's stop strings in its text, if it has any."""
+    stops = stop_list(sampling_params.stop_strings)
+    if not stops or synthetic_token_text is not None:
+        return None
+    return _StopWatch(stops)
+
+
+def _reached_stop(watch: _StopWatch | None, item: dict, seq_id: int) -> bool:
+    return watch is not None and watch.reached(item, seq_id)
+
+
+def _stopped_text(token_ids, watch: _StopWatch | None) -> str:
+    """The delivered text, ending before its first stop string."""
+    if watch is None:
+        return delivered_text(token_ids)
+    return "".join(watch.released)
 
 
 def reasoning_channel(
@@ -583,6 +655,7 @@ def _build_sampling_params(
 ) -> SamplingParams:
     from .model_capabilities import deployment_metadata
 
+    check_stop_strings(stop_strings)
     output_limit = deployment_metadata(
         _get_engine_config(), custom_message_encoder
     ).get("max_output_tokens")
@@ -717,6 +790,10 @@ def _has_multimodal_content(messages: list[Any]) -> bool:
     )
 
 
+def _role_contents(messages: list[ChatMessage]) -> list[dict[str, Any]]:
+    return [{"role": m.role, "content": m.content} for m in messages]
+
+
 def _get_multimodal_processor():
     global processor
     if processor is None:
@@ -742,15 +819,17 @@ def _prepare_multimodal_inputs(
     tools: Any = None,
 ) -> tuple[list[int], dict[str, Any]]:
     conversation, media = parse_chat_messages(
-        [
-            {
-                **message.to_template_dict(
-                    preserve_tool_call_arguments=preserve_tool_call_arguments
-                ),
-                "content": message.content,
-            }
-            for message in messages
-        ]
+        load_images(
+            [
+                {
+                    **message.to_template_dict(
+                        preserve_tool_call_arguments=preserve_tool_call_arguments
+                    ),
+                    "content": message.content,
+                }
+                for message in messages
+            ]
+        )
     )
     return prepare_multimodal_inputs(
         _get_engine_config(),
@@ -760,6 +839,78 @@ def _prepare_multimodal_inputs(
         chat_template_kwargs,
         tools=tools,
     )
+
+
+@dataclass(frozen=True)
+class RenderedPrompt:
+    """What generation starts from: the engine's input, with any images."""
+
+    prompt: PrefixEncoding | list[int] | str
+    multimodal_data: dict[str, Any] | None = None
+    # The rendered text, when there is one; it seeds the reasoning channel.
+    text: str | None = None
+
+    def opens_reasoning(self) -> bool:
+        if self.text is not None:
+            return prompt_starts_in_reasoning(self.text)
+        return prompt_tokens_start_in_reasoning(self.prompt, tokenizer.decode)
+
+    def generate(self, sampling_params, request_id, **kwargs):
+        """The non-streaming generator for this prompt."""
+        if self.multimodal_data is None:
+            return generate_async(self.prompt, sampling_params, request_id, **kwargs)
+        # Empty here: `_render_prompt` refuses images with a P/D handoff.
+        kwargs.pop("kv_transfer_params", None)
+        return generate_async_multimodal(
+            self.prompt, self.multimodal_data, sampling_params, request_id, **kwargs
+        )
+
+
+async def _render_prompt(
+    messages: list[ChatMessage],
+    template_kwargs: dict[str, Any],
+    *,
+    tools: Any,
+    image_roles: frozenset[str],
+    max_tokens: int,
+    kv_transfer_params: dict[str, Any] | None = None,
+) -> RenderedPrompt:
+    """Render chat-shaped messages, with any images loaded and placed.
+
+    Text goes through `_prepare_prompt`, which also cuts it to the context.
+    A prompt with images cannot be cut, so one too long is refused.
+    """
+    if not _has_multimodal_content(messages):
+        engine_input, text = await asyncio.to_thread(
+            _prepare_prompt,
+            messages,
+            template_kwargs,
+            tools=tools,
+            preserve_tool_call_arguments=preserve_tool_call_arguments,
+            max_tokens=max_tokens,
+            kv_transfer_params=kv_transfer_params,
+        )
+        return RenderedPrompt(engine_input, text=text)
+    check_image_roles(_role_contents(messages), image_roles)
+    if kv_transfer_params:
+        raise ValueError("image input is not supported with P/D transfer")
+    # Same off-loop preparation as the chat path.
+    _get_multimodal_processor()
+    tokens, data = await asyncio.get_running_loop().run_in_executor(
+        None,
+        _prepare_multimodal_inputs,
+        messages,
+        template_kwargs,
+        tools,
+    )
+    max_ctx = int(_get_engine_max_model_len() or 30720)
+    cap = max_ctx - _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
+    if len(tokens) > cap:
+        raise ValueError(
+            f"prompt with images is {len(tokens)} tokens, more than the {cap} "
+            "that fit the context"
+        )
+    return RenderedPrompt(tokens, data)
 
 
 # ── Batched stream dispatch ──────────────────────────────────────────────
@@ -833,7 +984,7 @@ def _send_stream_chunk_tagged(
 
 
 async def _submit_engine_requests(seqs):
-    if not any(getattr(seq, "json_schema", None) is not None for seq in seqs):
+    if not any(is_structured(seq) for seq in seqs):
         engine.core_mgr.add_request(seqs)
         return
     # Admission RPCs must not block the API event loop. If the client cancels,
@@ -880,6 +1031,7 @@ async def generate_async(
     all_token_ids = new_token_ids()
     finish_reason: str | None = None
     seq = None
+    watch = _stop_watch(sampling_params)
     kv_transfer_output_meta_info = None
     num_cached_tokens_seen = 0
 
@@ -932,6 +1084,10 @@ async def generate_async(
                     record_nonstream_first_token()
                 last_token_at = item.get("ts", time.time())
                 all_token_ids.extend(token_ids)
+            if _reached_stop(watch, item, seq.id):
+                finish_reason = "stop_sequence"
+                _finished_ok = True
+                break
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
                 _finished_ok = True
@@ -951,7 +1107,7 @@ async def generate_async(
                     engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
 
-    text = delivered_text(all_token_ids)
+    text = _stopped_text(all_token_ids, watch)
     num_tokens_input = (
         seq.num_prompt_tokens
         if seq is not None
@@ -1012,6 +1168,7 @@ async def generate_async_multimodal(
     all_token_ids = new_token_ids()
     finish_reason: str | None = None
     seq = None
+    watch = _stop_watch(sampling_params)
 
     def completion_callback(request_output: RequestOutput):
         now = time.time()
@@ -1055,6 +1212,10 @@ async def generate_async_multimodal(
                     record_nonstream_first_token()
                 last_token_at = item.get("ts", time.time())
                 all_token_ids.extend(token_ids_out)
+            if _reached_stop(watch, item, seq.id):
+                finish_reason = "stop_sequence"
+                _finished_ok = True
+                break
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
                 _finished_ok = True
@@ -1067,7 +1228,7 @@ async def generate_async_multimodal(
                     engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
 
-    text = delivered_text(all_token_ids)
+    text = _stopped_text(all_token_ids, watch)
     num_tokens_output = len(all_token_ids)
     finished_at = time.time()
     ttft = (first_token_at - started_at) if first_token_at is not None else 0.0
@@ -1128,6 +1289,7 @@ async def generate_async_fanout(
     per_last_token_at: list[float | None] = [None] * n
     per_finish_reason: list[str | None] = [None] * n
     finished = [False] * n
+    watches = [_stop_watch(sampling_params) for _ in range(n)]
 
     def make_callback(idx: int):
         def _cb(request_output: RequestOutput) -> None:
@@ -1186,7 +1348,10 @@ async def generate_async_fanout(
                     record_nonstream_first_token()
                 per_last_token_at[idx] = item.get("ts", time.time())
                 per_tokens[idx].extend(tokens)
-            if item.get("finished", False):
+            if _reached_stop(watches[idx], item, seqs[idx].id):
+                per_finish_reason[idx] = "stop_sequence"
+                finished[idx] = True
+            elif item.get("finished", False):
                 per_finish_reason[idx] = item.get("finish_reason")
                 finished[idx] = True
         _all_finished = True
@@ -1218,7 +1383,7 @@ async def generate_async_fanout(
         )
         outputs.append(
             {
-                "text": delivered_text(per_tokens[i]),
+                "text": _stopped_text(per_tokens[i], watches[i]),
                 "token_ids": per_tokens[i],
                 "finish_reason": per_finish_reason[i],
                 "num_tokens_input": num_tokens_input,
@@ -1384,7 +1549,7 @@ async def setup_streaming_request(
     # The detokenizer lives in this closure, so it is freed when the engine
     # drops the callback on the stream's last chunk -- no registry, no cleanup.
     assert _stream_batch_dispatcher is not None
-    detokenizer = _stream_batch_dispatcher.new_state()
+    detokenizer = _stream_batch_dispatcher.new_state(sampling_params.stop_strings)
 
     def stream_callback(request_output: RequestOutput) -> None:
         _send_stream_chunk_direct(
@@ -1419,6 +1584,7 @@ async def setup_streaming_request(
             engine.io_processor.requests.pop(seq.id, None)
         raise
     seq_id = seq.id
+    detokenizer.detokenizer.on_stop = partial(_abort_at_stop_string, seq_id)
 
     # debug, not info: this runs once per request, on the event loop, and
     # logging takes a lock the engine's output threads are also contending for.
@@ -1592,10 +1758,12 @@ async def setup_streaming_request_fanout(
     _request_start_times[request_id] = time.time()
 
     assert _stream_batch_dispatcher is not None
+    states = []
 
     def make_callback(idx: int):
         # One detokenizer per sibling, held by the closure that feeds it.
-        detokenizer = _stream_batch_dispatcher.new_state()
+        detokenizer = _stream_batch_dispatcher.new_state(sampling_params.stop_strings)
+        states.append(detokenizer)
 
         def _cb(request_output: RequestOutput) -> None:
             _send_stream_chunk_tagged(
@@ -1641,6 +1809,8 @@ async def setup_streaming_request_fanout(
             _seq_id_to_request_id.pop(seq.id, None)
             engine.io_processor.requests.pop(seq.id, None)
         raise
+    for state, seq in zip(states, seqs):
+        state.detokenizer.on_stop = partial(_abort_at_stop_string, seq.id)
     seq_ids = [seq.id for seq in seqs]
     # debug for the same reason as its single-sequence counterpart: per-request
     # logging on the event loop stalls it under load.
@@ -1748,18 +1918,24 @@ app.add_middleware(TraceMiddleware, model=lambda: model_name)
 
 # ---- Error handlers ----
 
+# Generation routes whose errors use the OpenAI envelope.
+_OPENAI_ERROR_ROUTES = frozenset(
+    {
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/responses",
+        "/beta/chat/completions",
+        "/beta/completions",
+    }
+)
+
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_error_handler(
     request: Request, exc: RequestValidationError
 ):
     path = request.url.path
-    if path not in {
-        "/v1/chat/completions",
-        "/v1/completions",
-        "/v1/responses",
-        "/v1/messages",
-    }:
+    if path not in _OPENAI_ERROR_ROUTES and path != "/v1/messages":
         return await request_validation_exception_handler(request, exc)
     # Do not serialize exc.body, input values or arbitrary Pydantic ctx objects.
     message = "; ".join(
@@ -1779,11 +1955,7 @@ async def request_validation_error_handler(
 async def openai_http_error_handler(request: Request, exc: HTTPException):
     # HTTPException bypasses the ValueError/Exception handlers. Keep its status
     # and headers, but use the same OpenAI error envelope on generation routes.
-    if request.url.path not in {
-        "/v1/chat/completions",
-        "/v1/completions",
-        "/v1/responses",
-    }:
+    if request.url.path not in _OPENAI_ERROR_ROUTES:
         return await http_exception_handler(request, exc)
     return JSONResponse(
         status_code=exc.status_code,
@@ -1858,10 +2030,11 @@ async def _configure_structured_output(
     *,
     tools=None,
     tool_choice=None,
+    strict_schemas=None,
     kv_transfer=None,
     multimodal=False,
 ):
-    if schema is None:
+    if schema is None and not strict_schemas:
         return
     await configure_request(
         engine,
@@ -1876,6 +2049,7 @@ async def _configure_structured_output(
         kv_transfer=kv_transfer,
         multimodal=multimodal,
         relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+        strict_schemas=strict_schemas,
         synthetic=synthetic_token_text is not None,
     )
 
@@ -1883,14 +2057,32 @@ async def _configure_structured_output(
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
+    return await _chat_completions(request, raw_request, beta=False)
 
+
+@app.post("/beta/chat/completions")
+async def beta_chat_completions(request: ChatCompletionRequest, raw_request: Request):
+    """Chat completions plus DeepSeek's beta assistant-prefix completion."""
+    return await _chat_completions(request, raw_request, beta=True)
+
+
+async def _chat_completions(
+    request: ChatCompletionRequest, raw_request: Request, *, beta: bool
+):
     validate_model(request.model)
     _validate_chunked_receive(request.kv_transfer_params)
 
     try:
         request.tools = normalize_chat_tools(request.tools)
         validate_chat_request(request)
-        messages = request.get_messages()
+        messages, assistant_prefix = take_assistant_prefix(request.get_messages())
+        if assistant_prefix is not None and not beta:
+            raise ValueError(
+                "assistant prefix completion is served by /beta/chat/completions"
+            )
+        for message in messages:
+            message.content = chat_image_parts(message.content)
+        check_image_roles(_role_contents(messages), CHAT_IMAGE_ROLES)
 
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
@@ -1936,6 +2128,19 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         )
 
         schema = schema_from_format(request.response_format)
+        # Strict function tools are a beta feature; /v1 keeps ignoring `strict`.
+        strict_schemas = (
+            strict_tool_schemas(request.tools)
+            if beta and request.tool_choice != "none"
+            else {}
+        )
+        if assistant_prefix is not None and (schema is not None or strict_schemas):
+            # The grammar constrains the reply from its first token, and a
+            # prefix has already written part of it.
+            raise ValueError(
+                "an assistant prefix cannot be combined with structured output "
+                "or strict tools"
+            )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         set_request_id(request_id)
@@ -1951,6 +2156,13 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         is_multimodal = _has_multimodal_content(messages)
         multimodal_data = None
         kv_transfer_params = request.kv_transfer_params
+        if assistant_prefix is not None and (
+            is_multimodal or request.get_prompt_token_ids() is not None
+        ):
+            raise ValueError(
+                "an assistant prefix cannot be combined with image input or "
+                "prompt_token_ids"
+            )
         if is_multimodal:
             # Media loading (blocking network I/O, up to a 30s urlopen) plus
             # processor preprocessing are heavy and would stall the event loop;
@@ -1991,6 +2203,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             ),
             template_kwargs=merged_kwargs,
         )
+        if assistant_prefix is not None:
+            prompt_or_tokens, continues_reasoning = continue_prompt(
+                prompt_or_tokens, assistant_prefix
+            )
+            _reasoning = replace(_reasoning, starts_open=continues_reasoning)
 
         await _configure_structured_output(
             sampling_params,
@@ -1998,6 +2215,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             _reasoning,
             tools=request.tools,
             tool_choice=request.tool_choice,
+            strict_schemas=strict_schemas,
             kv_transfer=request.kv_transfer_params,
             multimodal=_has_multimodal_content(messages),
         )
@@ -2064,9 +2282,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         (request.stream_options or {}).get("include_usage")
                     ),
                 )
-            if schema is not None:
+            if schema is not None or strict_schemas:
 
-                gen = validate_chat_stream(gen, schema)
+                gen = validate_chat_stream(gen, schema, strict_schemas)
             return StreamingResponse(
                 _client_stream(gen, request_id),
                 media_type="text/event-stream",
@@ -2172,7 +2390,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
             )
-        if schema is not None:
+        if schema is not None or strict_schemas:
 
             for choice in resp.choices:
                 validate_output(
@@ -2180,6 +2398,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     choice["message"].get("content") or "",
                     choice.get("finish_reason"),
                     tool_calls=bool(choice["message"].get("tool_calls")),
+                )
+                validate_tool_calls(
+                    strict_schemas,
+                    choice["message"].get("tool_calls"),
+                    choice.get("finish_reason"),
                 )
         _log_request_model("response", request_id, resp)
         # Bypass FastAPI's recursive conversion of the token ID list.
@@ -2199,13 +2422,46 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest, raw_request: Request):
     """Handle text completion requests (OpenAI-compatible)."""
+    return await _completions(request, raw_request, beta=False)
 
+
+@app.post("/beta/completions")
+async def beta_completions(request: CompletionRequest, raw_request: Request):
+    """Text completions plus DeepSeek's beta fill-in-the-middle (``suffix``)."""
+    return await _completions(request, raw_request, beta=True)
+
+
+def _fill_in_the_middle_prompt(request: CompletionRequest, *, beta: bool) -> str:
+    """Render a ``suffix`` request's prompt in the model's FIM format."""
+    if not beta:
+        raise ValueError("'suffix' (fill-in-the-middle) is served by /beta/completions")
+    if fim_format is None:
+        raise ValueError("this model has no fill-in-the-middle format")
+    if not isinstance(request.prompt, str) or request.get_prompt_token_ids():
+        raise ValueError("fill-in-the-middle needs 'prompt' as text, not token IDs")
+    return fim_format.render(request.prompt, request.suffix)
+
+
+def _echo_text(request: CompletionRequest) -> str:
+    """The prompt as `echo` returns it, ahead of the completion."""
+    prompt = request.get_prompt_or_tokens()
+    return prompt if isinstance(prompt, str) else tokenizer.decode(prompt)
+
+
+async def _completions(request: CompletionRequest, raw_request: Request, *, beta: bool):
     validate_model(request.model)
     _validate_chunked_receive(request.kv_transfer_params)
 
     try:
         effective_n = _coerce_n(request.n, request.temperature)
         _validate_return_token_ids(request.return_token_ids, request.stream)
+        validate_stream_options(request.stream, request.stream_options)
+        if beta and request.logprobs is not None:
+            raise ValueError("logprobs is not supported on /beta/completions yet")
+        if request.echo and request.suffix is not None:
+            raise ValueError("echo cannot be combined with suffix")
+        echo = _echo_text(request) if request.echo else ""
+        include_usage = bool((request.stream_options or {}).get("include_usage"))
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
@@ -2220,7 +2476,10 @@ async def completions(request: CompletionRequest, raw_request: Request):
             n=effective_n,
         )
         # Prefer pre-tokenized IDs; otherwise pass text to preprocessing.
-        prompt_or_tokens = request.get_prompt_or_tokens()
+        if request.suffix is not None:
+            prompt_or_tokens = _fill_in_the_middle_prompt(request, beta=beta)
+        else:
+            prompt_or_tokens = request.get_prompt_or_tokens()
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
@@ -2254,6 +2513,8 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     num_prompt_tokens,
                     cleanup_stream,
                     cleanup_request,
+                    echo=echo,
+                    include_usage=include_usage,
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
@@ -2273,6 +2534,8 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     num_prompt_tokens,
                     cleanup_stream,
                     cleanup_request,
+                    echo=echo,
+                    include_usage=include_usage,
                 )
             return StreamingResponse(
                 _client_stream(gen, request_id),
@@ -2295,7 +2558,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
             )
             if not outputs:
                 raise RuntimeError("No output generated")
-            resp = build_completion_response_multi(request_id, model_name, outputs)
+            resp = build_completion_response_multi(
+                request_id, model_name, outputs, echo=echo
+            )
         else:
             final_output = await _run_nonstream_with_disconnect(
                 generate_async(
@@ -2313,7 +2578,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
             if final_output is None:
                 raise RuntimeError("No output generated")
 
-            resp = build_completion_response(request_id, model_name, final_output)
+            resp = build_completion_response(
+                request_id, model_name, final_output, echo=echo
+            )
         _log_request_model("response", request_id, resp)
         return JSONResponse(content=resp.model_dump(mode="json"))
 
@@ -2426,12 +2693,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         request_id = uuid.uuid4().hex[:24]
         set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
-        engine_input, prompt = await asyncio.to_thread(
-            _prepare_prompt,
+        rendered = await _render_prompt(
             messages,
             merged_kwargs,
             tools=anthropic_to_openai_tools(request.tools),
-            preserve_tool_call_arguments=preserve_tool_call_arguments,
+            image_roles=TOOL_RESULT_IMAGE_ROLES,
             max_tokens=sampling_params.max_tokens,
             kv_transfer_params=kv_transfer_params,
         )
@@ -2439,10 +2705,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if request.stream:
             # Streaming response
             seq_id, stream_collector, input_tokens = await setup_streaming_request(
-                engine_input,
+                rendered.prompt,
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
+                multimodal_data=rendered.multimodal_data,
             )
 
             async def generate_anthropic_stream():
@@ -2461,7 +2728,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 # it is the model's, resolved at startup -- the filter used to
                 # carry none and closed on any registered dialect's marker.
                 reasoning_filter = reasoning_channel(
-                    prompt_starts_in_reasoning(prompt),
+                    rendered.opens_reasoning(),
                     template_kwargs=merged_kwargs,
                 ).stream()
                 tool_parser = ToolCallStreamParser(
@@ -2617,8 +2884,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         # Non-streaming response
         final_output = await _run_nonstream_with_disconnect(
-            generate_async(
-                engine_input,
+            rendered.generate(
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
@@ -2642,7 +2908,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # interleaving at that line.
         events = read_whole_blocks(
             reasoning_channel(
-                prompt_starts_in_reasoning(prompt),
+                rendered.opens_reasoning(),
                 template_kwargs=merged_kwargs,
             ),
             tool_call_parser_cls,
@@ -2840,19 +3106,18 @@ async def responses_create(raw_request: Request):
         schema = schema_from_format((text_config or {}).get("format"), responses=True)
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
         set_request_id(request_id)
-        engine_input, prompt = await asyncio.to_thread(
-            _prepare_prompt,
+        rendered = await _render_prompt(
             messages,
             merged_kwargs,
             tools=openai_tools,
-            preserve_tool_call_arguments=preserve_tool_call_arguments,
+            image_roles=TOOL_RESULT_IMAGE_ROLES,
             max_tokens=sampling_params.max_tokens,
             kv_transfer_params=kv_transfer_params,
         )
 
         created_at = int(time.time())
         _reasoning = reasoning_channel(
-            prompt_starts_in_reasoning(prompt), template_kwargs=merged_kwargs
+            rendered.opens_reasoning(), template_kwargs=merged_kwargs
         )
         await _configure_structured_output(
             sampling_params,
@@ -2867,10 +3132,11 @@ async def responses_create(raw_request: Request):
 
         if request.stream:
             seq_id, stream_collector, input_tokens = await setup_streaming_request(
-                engine_input,
+                rendered.prompt,
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
+                multimodal_data=rendered.multimodal_data,
             )
 
             async def generate_responses_stream():
@@ -2984,8 +3250,7 @@ async def responses_create(raw_request: Request):
             )
 
         final_output = await _run_nonstream_with_disconnect(
-            generate_async(
-                engine_input,
+            rendered.generate(
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
@@ -3239,7 +3504,7 @@ def main():
     global preserve_tool_call_arguments
     global model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect, synthetic_token_text
-    global custom_message_encoder, _stream_batch_dispatcher
+    global custom_message_encoder, _stream_batch_dispatcher, fim_format
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -3321,6 +3586,7 @@ def main():
 
     logger.info(f"Loading tokenizer from {args.model}...")
     tokenizer = load_tokenizer(args.model, args.trust_remote_code)
+    fim_format = resolve_fim_format(tokenizer)
     if args.chat_template:
         if os.path.isfile(args.chat_template):
             with open(args.chat_template, "r", encoding="utf-8") as f:

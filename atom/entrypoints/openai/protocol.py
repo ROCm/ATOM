@@ -267,7 +267,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float | None = DEFAULT_TOP_P
     max_tokens: int | None = DEFAULT_MAX_TOKENS
     max_completion_tokens: int | None = None
-    stop: list[str] | None = None
+    stop: str | list[str] | None = None
     ignore_eos: bool | None = False
     stream: bool | None = False
     stream_options: dict[str, Any] | None = None
@@ -332,14 +332,24 @@ class CompletionRequest(BaseModel):
     # pre-tokenized path (see get_prompt_or_tokens). The nested
     # array-of-token-arrays (batch) form is not supported.
     prompt: str | list[int] | None = None
+    # Text after the gap a fill-in-the-middle request asks the model to fill;
+    # served by /beta/completions only.
+    suffix: str | None = None
     temperature: float | None = DEFAULT_TEMPERATURE
     top_k: int | None = DEFAULT_TOP_K
     top_p: float | None = DEFAULT_TOP_P
     max_tokens: int | None = DEFAULT_MAX_TOKENS
     max_completion_tokens: int | None = None
-    stop: list[str] | None = None
+    stop: str | list[str] | None = None
     ignore_eos: bool | None = False
     stream: bool | None = False
+    # Only with `stream`: `include_usage` puts `usage` on every chunk.
+    stream_options: dict[str, Any] | None = None
+    # Return the prompt ahead of the completion; not with `suffix`.
+    echo: bool | None = False
+    # Completions return no token probabilities yet: /beta/completions refuses
+    # this instead of dropping it.
+    logprobs: int | None = None
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
     # Optional DPA routing hint inserted by atomesh for DP-aware workers.

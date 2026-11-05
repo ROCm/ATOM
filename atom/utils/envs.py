@@ -755,6 +755,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_MODEL_SENSITIVE_RMSNORM": lambda: (
         os.getenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "0") == "1"
     ),
+    # --- Serving API ---
+    # Let image URLs reach hosts that resolve to loopback, private,
+    # link-local or other non-public addresses, through the usual proxy
+    # settings. Off by default so a client cannot make the server fetch from
+    # its own network. See _read in atom/entrypoints/openai/images.py.
+    "ATOM_IMAGE_URL_ALLOW_PRIVATE": lambda: (
+        os.getenv("ATOM_IMAGE_URL_ALLOW_PRIVATE", "0") == "1"
+    ),
     # --- Shutdown ---
     # How long a shutting-down process waits for its children (EngineCore,
     # ModelRunner workers) to exit before it terminates them.

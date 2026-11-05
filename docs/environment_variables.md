@@ -473,6 +473,12 @@ the host, give each its own endpoints.
 | **ATOM_KV_EVENTS_REPLAY_ENDPOINT** | str | `""` | ZMQ ROUTER bind address for replay requests. Empty disables replay (PUB-only). A consumer sends an 8-byte big-endian start sequence and receives every retained batch with `seq >= start`, followed by a `REPLAY_DONE` terminal frame carrying the retained `[oldest, latest]` window. Offset per DP rank the same way as the PUB endpoint. Replay is serviced on the sender thread with non-blocking sends: a client that stops reading has its replay abandoned (counted in `replay_aborted`) rather than stalling live publication. |
 | **ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS** | int | 10000 | Number of most recently *sent* batches retained for replay. Independent of `ATOM_KV_EVENTS_BUFFER_STEPS`; each entry holds an encoded payload including token ids, so size it against the event rate and memory budget. Must be >= 1 when replay is enabled. |
 
+## Serving API
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_IMAGE_URL_ALLOW_PRIVATE** | bool | false | Set `1` to let image URLs in API requests reach hosts that resolve to loopback, private, link-local or other non-global addresses, and to fetch them through the `http_proxy`/`https_proxy` settings. Off by default, so a client cannot make the server fetch from its own network; every redirect hop is checked too. Read per request. |
+
 ## Shutdown
 
 | Variable | Type | Default | Description |

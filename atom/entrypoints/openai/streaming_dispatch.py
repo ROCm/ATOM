@@ -21,6 +21,8 @@ from typing import Any, NamedTuple
 
 from atom.model_engine.sequence import new_token_ids
 
+from .stop_strings import StopStrings, stop_list
+
 logger = logging.getLogger("atom")
 
 # How long one stream may go without a chunk before it is worth a line. Long
@@ -115,6 +117,13 @@ class IncrementalStreamDetokenizer:
     # it. Maintained whether or not reuse is on, so the two paths never diverge
     # in state -- only in whether they pay for the decode.
     last_delta: str = ""
+    # The client's stop strings, if any: text is released only once it cannot
+    # begin one, and the first one found ends the stream (`decode_into`).
+    stop: StopStrings | None = None
+    # Stops the request in the engine when the text, not the tokens, reached a
+    # stop string. Set once the sequence exists.
+    on_stop: Callable[[], None] | None = None
+    stop_reported: bool = False
 
     def update(self, token_ids: list[int], finished: bool) -> str:
         """The text this stream has not been given yet, from its next tokens.
@@ -136,10 +145,30 @@ class IncrementalStreamDetokenizer:
         """
         decoded = self._decode(token_ids, finished)
         if self.synthetic_text is None:
-            return decoded
+            if self.stop is None:
+                return decoded
+            released = self.stop.feed(decoded)
+            return released + self.stop.flush() if finished else released
         # Decoded and thrown away: the run is measuring throughput, and skipping
         # the work would make the server look faster than the one being measured.
         return self.synthetic_text * len(token_ids)
+
+    def decode_into(self, chunk: dict) -> None:
+        """Set ``chunk["text"]``; a stop string reached here ends the stream.
+
+        The engine finishes on a stop string's own tokens. When the text got
+        there first, the chunk is made the stream's last and the engine is
+        told to stop; later chunks from it carry no text.
+        """
+        finished = bool(chunk.get("finished"))
+        chunk["text"] = self.update(chunk.get("token_ids") or [], finished)
+        if self.stop is None or not self.stop.stopped or self.stop_reported:
+            return
+        self.stop_reported = True
+        chunk["finished"] = True
+        chunk["finish_reason"] = "stop_sequence"
+        if not finished and self.on_stop is not None:
+            self.on_stop()
 
     def _decode(self, token_ids: list[int], finished: bool) -> str:
         """Both decodes share a window start, so subtracting one from the other
@@ -431,9 +460,7 @@ class StreamOutputCollector:
         state = chunk.pop("_detokenizer", None)
         if state is not None:
             try:
-                chunk["text"] = state.update(
-                    chunk["token_ids"], bool(chunk.get("finished"))
-                )
+                state.decode_into(chunk)
             except Exception:
                 logger.exception(
                     "Error detokenizing stream %s (tag=%s)", self.request_id, tag
@@ -571,11 +598,14 @@ class StreamBatchDispatcher:
         self._observe_inter_token_latency = observe_inter_token_latency
         self._thread_local = threading.local()
 
-    def new_state(self) -> StreamState:
+    def new_state(self, stop: str | list[str] | None = None) -> StreamState:
         """Make decoding and delivery timing state for one stream's callback."""
+        stops = stop_list(stop)
         return StreamState(
             IncrementalStreamDetokenizer(
-                self.tokenizer, synthetic_text=self.synthetic_text
+                self.tokenizer,
+                synthetic_text=self.synthetic_text,
+                stop=StopStrings(stops) if stops else None,
             )
         )
 
@@ -612,10 +642,7 @@ class StreamBatchDispatcher:
             else:
                 # Queue consumers cannot decode on read and still receive a
                 # prepared chunk, as before.
-                item.chunk["text"] = item.state.detokenizer.update(
-                    item.chunk.get("token_ids") or [],
-                    bool(item.chunk.get("finished")),
-                )
+                item.state.detokenizer.decode_into(item.chunk)
             by_loop.setdefault(item.loop, []).append(item)
 
         for loop, items in by_loop.items():

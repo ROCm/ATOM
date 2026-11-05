@@ -558,7 +558,13 @@ def test_multimodal_chat_keeps_tool_call_arguments(server, monkeypatch):
         "role": "user",
         "content": [
             {"type": "text", "text": "Describe the image."},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            # A real image: the API decodes images before the media pipeline.
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+                },
+            },
         ],
     }
     call = {"id": "c1", "type": "function", "function": {"name": "f", "arguments": raw}}

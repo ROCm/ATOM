@@ -66,7 +66,7 @@ from atom.model_engine.state_runtime import (
 )
 from atom.observability import tracing
 from atom.sampling_params import RequiredChannel
-from atom.structured_output import StructuredRequest
+from atom.structured_output import StructuredRequest, is_structured
 from atom.utils import envs
 
 if TYPE_CHECKING:
@@ -222,7 +222,7 @@ class ScheduledBatch:
         self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
         self.structured_requests = {}
         for i, seq in enumerate(seqs.values()):
-            if seq.json_schema is None:
+            if not is_structured(seq):
                 continue
             self.structured_requests[i] = StructuredRequest.capture(seq)
         # `context_lens` is set further down, once `num_cached_tokens` is known:

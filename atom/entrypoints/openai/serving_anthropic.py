@@ -17,6 +17,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from .images import anthropic_image_part
 from .reasoning import ReasoningChannel
 from .sse import event_frame
 from .tool_parser import ToolCallStreamParser
@@ -74,6 +75,28 @@ def _block_field(block: dict, key: str) -> Any:
     return value
 
 
+_IMAGE_ROLES_ERROR = "images are not allowed in {role} messages; allowed in: user"
+
+
+def _user_content(blocks: list) -> str | list[dict]:
+    """User text joined as before, or Chat parts in order when there are images."""
+    if not any(isinstance(b, dict) and b.get("type") == "image" for b in blocks):
+        return "\n".join(
+            b.get("text", "")
+            for b in blocks
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return [
+        (
+            anthropic_image_part(b)
+            if b.get("type") == "image"
+            else {"type": "text", "text": b.get("text", "")}
+        )
+        for b in blocks
+        if isinstance(b, dict) and b.get("type") in ("text", "image")
+    ]
+
+
 def anthropic_to_openai_messages(
     messages: list[AnthropicMessage],
     system: Any | None = None,
@@ -88,6 +111,8 @@ def anthropic_to_openai_messages(
         elif isinstance(system, list):
             text_parts = []
             for b in system:
+                if b.get("type") == "image":
+                    raise ValueError(_IMAGE_ROLES_ERROR.format(role="system"))
                 if b.get("type") == "text":
                     text = _block_field(b, "text")
                     if text.startswith("x-anthropic-billing-header"):
@@ -109,6 +134,10 @@ def anthropic_to_openai_messages(
                 tool_calls = []
                 for block in content:
                     if isinstance(block, dict):
+                        if block.get("type") == "image":
+                            raise ValueError(
+                                _IMAGE_ROLES_ERROR.format(role="assistant")
+                            )
                         if block.get("type") == "text":
                             text_parts.append(_block_field(block, "text"))
                         elif block.get("type") == "thinking":
@@ -139,29 +168,33 @@ def anthropic_to_openai_messages(
             if isinstance(content, str):
                 result.append({"role": "user", "content": content})
             elif isinstance(content, list):
-                text_parts = []
+                parts = []
                 tool_results = []
                 for block in content:
                     if isinstance(block, dict):
                         if block.get("type") == "text":
-                            text_parts.append(_block_field(block, "text"))
+                            parts.append(
+                                {"type": "text", "text": _block_field(block, "text")}
+                            )
+                        elif block.get("type") == "image":
+                            parts.append(block)
                         elif block.get("type") == "tool_result":
                             tool_content = block.get("content", "")
                             if isinstance(tool_content, list):
-                                tool_content = "\n".join(
-                                    b.get("text", "")
-                                    for b in tool_content
-                                    if isinstance(b, dict) and b.get("type") == "text"
-                                )
+                                tool_content = _user_content(tool_content)
                             tool_results.append(
                                 {
                                     "role": "tool",
                                     "tool_call_id": _block_field(block, "tool_use_id"),
-                                    "content": str(tool_content),
+                                    "content": (
+                                        tool_content
+                                        if isinstance(tool_content, list)
+                                        else str(tool_content)
+                                    ),
                                 }
                             )
-                if text_parts:
-                    result.append({"role": "user", "content": "\n".join(text_parts)})
+                if parts:
+                    result.append({"role": "user", "content": _user_content(parts)})
                 result.extend(tool_results)
         else:
             result.append({"role": role, "content": str(content) if content else ""})

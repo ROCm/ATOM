@@ -100,7 +100,7 @@ def test_namespaced_tools_keep_dispatch_identity(choice):
         {"function": {"name": "lookup"}, "namespace": ns} for ns in ("search", "files")
     ]
     fmt = json.loads(structured_tool_format(DsmlV41Parser, tools, choice))
-    assert fmt["names"] == (
+    assert [tool["name"] for tool in fmt["tools"]] == (
         ["files::lookup"]
         if isinstance(choice, dict)
         else ["search::lookup", "files::lookup"]
@@ -184,7 +184,8 @@ def test_tool_format_matches_the_selected_parser_and_tool_name():
         )
     )
     assert spec["prefix"] == "｜DSML｜ " and spec["section"] == "calls"
-    assert spec["names"] == ["weather"] and spec["required"]
+    assert spec["tools"] == [{"name": "weather", "parameters": None}]
+    assert spec["required"]
     with pytest.raises(ValueError, match="declared"):
         structured_tool_format(
             DsmlV41Parser, tools, {"type": "function", "function": {"name": "unknown"}}
@@ -363,3 +364,153 @@ def test_chat_stream_grammar_error_never_emits_success_even_after_valid_json(mul
         assert raw.count("[DONE]") == 1
 
     asyncio.run(run())
+
+
+STRICT = {
+    "type": "object",
+    "properties": {"city": {"type": "string"}},
+    "required": ["city"],
+    "additionalProperties": False,
+}
+
+
+def _function(parameters=STRICT, strict=True):
+    return {
+        "type": "function",
+        "function": {"name": "weather", "strict": strict, "parameters": parameters},
+    }
+
+
+def test_strict_tool_schemas_keep_only_strict_functions():
+    from atom.structured_output.validation import strict_tool_schemas
+
+    tools = [
+        _function(),
+        {
+            **_function(strict=False),
+            "function": {**_function(strict=False)["function"], "name": "other"},
+        },
+    ]
+    assert strict_tool_schemas(tools) == {"weather": STRICT}
+
+
+@pytest.mark.parametrize(
+    "parameters, strict, message",
+    [
+        ({**STRICT, "required": []}, True, "required"),
+        (
+            {k: v for k, v in STRICT.items() if k != "additionalProperties"},
+            True,
+            "additionalProperties",
+        ),
+        (
+            {**STRICT, "properties": {"city": {"type": "string", "maxLength": 3}}},
+            True,
+            "maxLength",
+        ),
+        (
+            {
+                **STRICT,
+                "properties": {
+                    "city": {"type": "object", "properties": {"x": {"type": "integer"}}}
+                },
+            },
+            True,
+            "additionalProperties",
+        ),
+        ({"type": "array"}, True, "object"),
+        (STRICT, "yes", "boolean"),
+    ],
+)
+def test_strict_parameters_follow_deepseek_rules(parameters, strict, message):
+    from atom.structured_output.validation import strict_tool_schemas
+
+    with pytest.raises(ValueError, match=message):
+        strict_tool_schemas([_function(parameters, strict)])
+
+
+def test_property_named_like_a_keyword_is_not_a_keyword():
+    from atom.structured_output.validation import strict_tool_schemas
+
+    parameters = {
+        **STRICT,
+        "properties": {"maxLength": {"type": "integer"}},
+        "required": ["maxLength"],
+    }
+    assert strict_tool_schemas([_function(parameters)])
+
+
+def _call(arguments):
+    return {"function": {"name": "weather", "arguments": arguments}}
+
+
+def test_strict_tool_calls_are_validated_after_generation():
+    from atom.structured_output.validation import validate_tool_calls
+
+    schemas = {"weather": STRICT}
+    validate_tool_calls(schemas, [_call('{"city": "Paris"}')], "tool_calls")
+    # A truncated reply is reported as such, not as a schema violation.
+    validate_tool_calls(schemas, [_call('{"city": ')], "length")
+    emails = {
+        "weather": {
+            **STRICT,
+            "properties": {"city": {"type": "string", "format": "email"}},
+        }
+    }
+    with pytest.raises(RuntimeError, match="strict"):
+        validate_tool_calls(emails, [_call('{"city": "not an address"}')], "tool_calls")
+    for bad in ('{"city": 3}', '{"city": "a", "x": 1}', "not json"):
+        with pytest.raises(RuntimeError, match="strict"):
+            validate_tool_calls(schemas, [_call(bad)], "tool_calls")
+
+
+def test_strict_tools_alone_make_a_request_structured():
+    from atom.structured_output import is_structured
+
+    assert not is_structured(NS(json_schema=None, structured_tool_format=None))
+    assert is_structured(NS(json_schema="{}", structured_tool_format=None))
+    assert is_structured(NS(json_schema=None, structured_tool_format="{}"))
+
+
+@pytest.mark.parametrize(
+    "schema, good, bad",
+    [
+        ({"type": "string", "format": "hostname"}, "example.com", "bad host!"),
+        ({"type": "string", "format": "ipv6"}, "::1", "zz::1"),
+        (
+            {"type": "string", "format": "uuid"},
+            "123e4567-e89b-12d3-a456-426614174000",
+            "x",
+        ),
+        ({"type": "string", "pattern": "^[0-9]{5}$"}, "12345", "1234"),
+        ({"type": "integer", "multipleOf": 2}, 4, 3),
+        ({"type": "number", "exclusiveMinimum": 0}, 1, 0),
+        ({"anyOf": [{"type": "string"}, {"type": "integer"}]}, 7, [1]),
+    ],
+)
+def test_strict_arguments_are_rechecked_per_keyword(schema, good, bad):
+    from atom.structured_output.validation import validate_tool_calls
+
+    schemas = {"weather": {**STRICT, "properties": {"city": schema}}}
+    validate_tool_calls(schemas, [_call(json.dumps({"city": good}))], "tool_calls")
+    with pytest.raises(RuntimeError, match="strict"):
+        validate_tool_calls(schemas, [_call(json.dumps({"city": bad}))], "tool_calls")
+
+
+def test_def_definitions_follow_the_strict_rules_too():
+    from atom.structured_output.validation import strict_tool_schemas
+
+    author = {
+        "type": "object",
+        "properties": {"name": {"type": "string", "maxLength": 3}},
+        "required": ["name"],
+        "additionalProperties": False,
+    }
+    parameters = {
+        **STRICT,
+        "properties": {"a": {"$ref": "#/$def/author"}},
+        "required": ["a"],
+        "$def": {"author": author},
+    }
+    with pytest.raises(ValueError, match="maxLength"):
+        strict_tool_schemas([_function(parameters)])

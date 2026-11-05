@@ -21,6 +21,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from .images import responses_content
 from .protocol import openai_stop_reason
 from .sse import event_frame
 
@@ -370,9 +371,7 @@ def responses_to_openai_messages(request: ResponsesRequest) -> list[dict]:
         item_type = item.get("type")
         if item_type in (None, "message") and "role" in item:
             messages.append(
-                _role_message(
-                    item.get("role") or "user", _content_text(item.get("content"))
-                )
+                _role_message(item.get("role") or "user", _content(item.get("content")))
             )
         elif item_type == "function_call":
             call_id = item.get("call_id") or item.get("id") or ""
@@ -401,11 +400,12 @@ def responses_to_openai_messages(request: ResponsesRequest) -> list[dict]:
                     }
                 )
         elif item_type == "function_call_output":
+            output = item.get("output")
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": item.get("call_id") or item.get("id") or "",
-                    "content": _value_as_text(item.get("output")),
+                    "content": responses_content(output) or _value_as_text(output),
                 }
             )
         elif item_type == "reasoning":
@@ -418,19 +418,23 @@ def responses_to_openai_messages(request: ResponsesRequest) -> list[dict]:
             )
         elif "role" in item:
             messages.append(
-                _role_message(
-                    item.get("role") or "user", _content_text(item.get("content"))
-                )
+                _role_message(item.get("role") or "user", _content(item.get("content")))
             )
     if not messages:
         raise ValueError("Request must contain at least one message")
     return messages
 
 
-def _role_message(role: str, text: str) -> dict:
+def _role_message(role: str, content: str | list[dict]) -> dict:
     if role in ("user", "assistant", "system"):
-        return {"role": role, "content": text}
-    return {"role": "user", "content": text}
+        return {"role": role, "content": content}
+    # `developer`, and any other role, speaks as the user -- images included.
+    return {"role": "user", "content": content}
+
+
+def _content(content: Any) -> str | list[dict]:
+    """Text, or Chat parts in order when the content carries images."""
+    return responses_content(content) or _content_text(content)
 
 
 def _content_text(content: Any) -> str:

@@ -18,6 +18,7 @@ from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import RequiredChannel, SamplingParams
+from atom.structured_output import is_structured
 from atom.structured_output.validation import (
     WorkerGrammarPreflight,
     validate_execution_options,
@@ -212,7 +213,7 @@ class LLMEngine:
             self.core_mgr.close()
 
     def prepare_structured_request(self, params, kv_transfer=None, multimodal=False):
-        if params.json_schema is None:
+        if not is_structured(params):
             return
         validate_execution_options(
             self.config,
@@ -924,7 +925,7 @@ class InputOutputProcessor:
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
         """
-        if sampling_params.json_schema is not None:
+        if is_structured(sampling_params):
             if self.structured_admission is None:
                 raise ValueError("Structured output requires engine admission")
             self.structured_admission(

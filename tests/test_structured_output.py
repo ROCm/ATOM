@@ -206,7 +206,7 @@ def test_native_tool_header_does_not_allow_undeclared_whitespace(controller):
         {
             "prefix": "|DSML|",
             "section": "function_calls",
-            "names": ["get_weather"],
+            "tools": [{"name": "get_weather", "parameters": None}],
             "required": True,
         }
     )
@@ -564,3 +564,167 @@ def test_admitted_matcher_survives_compilation_cache_eviction(controller):
     assert torch.isfinite(logits[0, ord("{")])
     controller.release([11])
     assert not controller.states
+
+
+WEATHER = {
+    "type": "object",
+    "properties": {
+        "city": {"type": "string", "description": "free text"},
+        "unit": {"enum": ["c", "f"]},
+        "days": {"type": "integer", "minimum": 1, "maximum": 7},
+        "where": {"$ref": "#/$defs/point"},
+    },
+    "required": ["city", "unit", "days", "where"],
+    "additionalProperties": False,
+    "$defs": {
+        "point": {
+            "type": "object",
+            "properties": {"lat": {"type": "number"}},
+            "required": ["lat"],
+            "additionalProperties": False,
+        }
+    },
+}
+
+
+def strict_call(city="Paris", unit="c", days="3", where='{"lat": 1.5}', order=None):
+    params = {
+        "city": f'<parameter name="city" string="true">{city}</parameter>',
+        "unit": f'<parameter name="unit" string="true">{unit}</parameter>',
+        "days": f'<parameter name="days" string="false">{days}</parameter>',
+        "where": f'<parameter name="where" string="false">{where}</parameter>',
+    }
+    body = "\n".join(params[k] for k in order or params)
+    return f'<calls>\n<invoke name="weather">\n{body}\n</invoke>\n</calls>'
+
+
+def accepts(controller, compiled, text):
+    matcher = xgr.GrammarMatcher(compiled)
+    return all(matcher.accept_token(t) for t in [*text.encode(), 127])
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (strict_call(), True),
+        # Raw strings are exact: whatever the value, nothing is padded.
+        (strict_call(city=" Paris, FR "), True),
+        (strict_call(unit="k"), False),
+        (strict_call(days="9"), False),
+        (strict_call(days='"3"'), False),
+        (strict_call(where='{"lat": "north"}'), False),
+        (strict_call(where='{"lat": 1, "lon": 2}'), False),
+        (strict_call(order=["unit", "city", "days", "where"]), False),
+        (strict_call(order=["city", "unit", "days"]), False),
+        (strict_call().replace('"city" string="true"', '"city" string="false"'), False),
+        # Free text may precede the calls, but cannot open a call of its own.
+        ("Checking.\n\n" + strict_call(), True),
+        ("plain answer", True),
+        ('<invoke name="weather"></invoke>', False),
+    ],
+)
+def test_strict_tool_arguments_follow_the_parameters_schema(controller, text, expected):
+    spec = json.dumps(
+        {
+            "prefix": "",
+            "section": "calls",
+            "tools": [{"name": "weather", "parameters": WEATHER}],
+            "required": False,
+        }
+    )
+    assert accepts(controller, controller.compile(None, spec), text) == expected
+
+
+def test_strict_and_free_tools_share_one_reply(controller):
+    spec = json.dumps(
+        {
+            "prefix": "",
+            "section": "calls",
+            "tools": [
+                {"name": "weather", "parameters": WEATHER},
+                {"name": "search", "parameters": None},
+            ],
+            "required": True,
+        }
+    )
+    compiled = controller.compile(None, spec)
+    free = '<invoke name="search"><parameter name="q">anything</parameter></invoke>'
+    assert accepts(
+        controller, compiled, strict_call().replace("</calls>", free + "</calls>")
+    )
+    assert not accepts(controller, compiled, "plain answer")
+    assert not accepts(controller, compiled, strict_call(unit="k"))
+
+
+def _strict_spec(parameters):
+    return json.dumps(
+        {
+            "prefix": "",
+            "section": "calls",
+            "tools": [{"name": "f", "parameters": parameters}],
+            "required": True,
+        }
+    )
+
+
+def _strict_object(props, **extra):
+    return {
+        "type": "object",
+        "properties": props,
+        "required": list(props),
+        "additionalProperties": False,
+        **extra,
+    }
+
+
+def _invoke(key, value):
+    parameter = (
+        f'<parameter name="{key}" string="false">{json.dumps(value)}</parameter>'
+    )
+    return f'<calls>\n<invoke name="f">\n{parameter}\n</invoke>\n</calls>'
+
+
+# DeepSeek's documented strict-mode keywords: a valid value, then invalid ones.
+DOCUMENTED_STRICT_KEYWORDS = [
+    ({"type": "string", "pattern": "^[0-9]{5}$"}, "12345", ["1234"]),
+    ({"type": "string", "format": "email"}, "a@b.co", ["nope"]),
+    ({"type": "string", "format": "hostname"}, "example.com", ["bad host!"]),
+    ({"type": "string", "format": "ipv4"}, "10.1.2.3", ["999.1.1.1"]),
+    ({"type": "string", "format": "ipv6"}, "::1", ["zz::1"]),
+    (
+        {"type": "string", "format": "uuid"},
+        "123e4567-e89b-12d3-a456-426614174000",
+        ["not-a-uuid"],
+    ),
+    ({"type": "integer", "minimum": 2, "maximum": 10, "multipleOf": 2}, 4, [3, 12]),
+    ({"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 100}, 9.5, [0, 100]),
+    ({"type": "integer", "const": 3, "default": 3}, 3, [4]),
+    ({"type": "boolean"}, True, ["yes"]),
+    ({"type": "integer", "enum": [1, 2]}, 2, [3]),
+    ({"anyOf": [{"type": "string"}, {"type": "integer"}]}, 7, [[1]]),
+    ({"type": "array", "items": {"type": "string"}}, ["a"], [["a", 1]]),
+]
+
+
+@pytest.mark.parametrize("schema, good, bads", DOCUMENTED_STRICT_KEYWORDS)
+def test_documented_strict_keywords_constrain_arguments(controller, schema, good, bads):
+    compiled = controller.compile(None, _strict_spec(_strict_object({"v": schema})))
+    assert accepts(controller, compiled, _invoke("v", good))
+    for bad in bads:
+        assert not accepts(controller, compiled, _invoke("v", bad)), bad
+
+
+def test_def_references_resolve_and_may_recurse(controller):
+    author = _strict_object(
+        {
+            "name": {"type": "string"},
+            "mentor": {"anyOf": [{"$ref": "#/$def/author"}, {"type": "null"}]},
+        }
+    )
+    parameters = _strict_object(
+        {"author": {"$ref": "#/$def/author"}}, **{"$def": {"author": author}}
+    )
+    compiled = controller.compile(None, _strict_spec(parameters))
+    chain = {"name": "Ada", "mentor": {"name": "Bob", "mentor": None}}
+    assert accepts(controller, compiled, _invoke("author", chain))
+    assert not accepts(controller, compiled, _invoke("author", {"name": "Ada"}))
