@@ -135,38 +135,54 @@ def profile_mixed_memory(runner) -> int:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         fixed = torch.cuda.memory_allocated()
-        for long_context in (False, True):
-            for prefill, n_decode, q in shapes:
-                batch, needed = _batch(
-                    runner, prefill, n_decode, q, long_context=long_context
-                )
-                if needed > pages:
-                    raise RuntimeError(
-                        f"mixed profile needs {needed} pages, allocated {pages}"
-                    )
-                runner.tokenID_processor.clean()
-                torch.cuda.reset_peak_memory_stats()
-                runner.forward(batch)
-                torch.cuda.synchronize()
-                allocated = torch.cuda.max_memory_allocated()
-                reserved = torch.cuda.max_memory_reserved()
-                free, total = torch.cuda.mem_get_info()
-                max_non_torch = max(
-                    max_non_torch, total - free - torch.cuda.memory_reserved()
-                )
-                max_workspace = max(max_workspace, allocated - fixed, reserved - fixed)
-                logger.info(
-                    "mixed memory profile: prefill=%d decode=%dx%d long_context=%s "
-                    "workspace_peak=%.2f GiB reserved_workspace=%.2f GiB",
-                    prefill,
-                    n_decode,
-                    q,
-                    long_context,
-                    (allocated - fixed) / (1 << 30),
-                    (reserved - fixed) / (1 << 30),
-                )
-                del batch
-        runner.tokenID_processor.clean()
+        config = runner.config
+        tbo_flags = (config.enable_tbo, config.enable_tbo_decode)
+        # Serving can mix prefill/mixed ranks with a pure-decode rank that vetoes
+        # TBO. Identical synthetic batches never exercise that larger unsplit
+        # forward. Keep allocator caches across both sweeps, as serving does.
+        modes = (tbo_flags, (False, False)) if any(tbo_flags) else (tbo_flags,)
+        try:
+            for flags in modes:
+                config.enable_tbo, config.enable_tbo_decode = flags
+                for long_context in (False, True):
+                    for prefill, n_decode, q in shapes:
+                        batch, needed = _batch(
+                            runner, prefill, n_decode, q, long_context=long_context
+                        )
+                        if needed > pages:
+                            raise RuntimeError(
+                                f"mixed profile needs {needed} pages, allocated {pages}"
+                            )
+                        runner.tokenID_processor.clean()
+                        torch.cuda.reset_peak_memory_stats()
+                        runner.forward(batch)
+                        torch.cuda.synchronize()
+                        allocated = torch.cuda.max_memory_allocated()
+                        reserved = torch.cuda.max_memory_reserved()
+                        free, total = torch.cuda.mem_get_info()
+                        max_non_torch = max(
+                            max_non_torch,
+                            total - free - torch.cuda.memory_reserved(),
+                        )
+                        max_workspace = max(
+                            max_workspace, allocated - fixed, reserved - fixed
+                        )
+                        logger.info(
+                            "mixed memory profile: prefill=%d decode=%dx%d "
+                            "long_context=%s allow_tbo=%s "
+                            "workspace_peak=%.2f GiB reserved_workspace=%.2f GiB",
+                            prefill,
+                            n_decode,
+                            q,
+                            long_context,
+                            config.enable_tbo,
+                            (allocated - fixed) / (1 << 30),
+                            (reserved - fixed) / (1 << 30),
+                        )
+                        del batch
+        finally:
+            config.enable_tbo, config.enable_tbo_decode = tbo_flags
+            runner.tokenID_processor.clean()
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()

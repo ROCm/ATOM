@@ -2,6 +2,7 @@
 """Mixed startup profiling uses actual token/query/sequence limits."""
 
 import math
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -57,3 +58,80 @@ def test_profile_addresses_include_full_draft_lookahead(width, long_context):
         assert all(
             len(draft) == 7 for draft in batch.scheduled_spec_decode_tokens[-decodes:]
         )
+
+
+@pytest.mark.parametrize("tbo_flags", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("fail_unsplit", [False, True])
+def test_profile_budgets_unsplit_fallback_and_restores_config(
+    monkeypatch, tbo_flags, fail_unsplit
+):
+    from atom.model_engine import mixed_profile
+
+    config = SimpleNamespace(
+        enable_tbo=tbo_flags[0],
+        enable_tbo_decode=tbo_flags[1],
+        max_num_seqs=4,
+        max_model_len=128,
+    )
+    memory = {"allocated": 80, "reserved": 80, "peak": 85, "reserved_peak": 85}
+    observed = []
+    pool_open = False
+
+    @contextmanager
+    def temporary_pool(pages):
+        nonlocal pool_open
+        pool_open = True
+        memory.update(allocated=100, reserved=100)
+        try:
+            yield
+        finally:
+            pool_open = False
+            memory["allocated"] = 80
+
+    def forward(batch):
+        flags = (config.enable_tbo, config.enable_tbo_decode)
+        observed.append((flags, memory["reserved"]))
+        if not config.enable_tbo and fail_unsplit:
+            raise RuntimeError("unsplit forward failed")
+        # An unsplit forward needs a larger workspace at the SAME token budget.
+        allocated, reserved = (112, 116) if config.enable_tbo else (128, 140)
+        memory.update(peak=allocated, reserved_peak=reserved, reserved=reserved)
+
+    runner = SimpleNamespace(
+        config=config,
+        max_bs=4,
+        block_size=16,
+        warmup_max_tokens=lambda: 64,
+        attn_metadata_builder=SimpleNamespace(temporary_profile_cache=temporary_pool),
+        tokenID_processor=SimpleNamespace(clean=lambda: None),
+        forward=forward,
+    )
+    monkeypatch.setattr(mixed_profile, "_batch", lambda *args, **kwargs: (object(), 1))
+    cuda = mixed_profile.torch.cuda
+    monkeypatch.setattr(cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(cuda, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(
+        cuda, "empty_cache", lambda: memory.update(reserved=memory["allocated"])
+    )
+    monkeypatch.setattr(cuda, "memory_allocated", lambda: memory["allocated"])
+    monkeypatch.setattr(cuda, "memory_reserved", lambda: memory["reserved"])
+    monkeypatch.setattr(cuda, "max_memory_allocated", lambda: memory["peak"])
+    monkeypatch.setattr(cuda, "max_memory_reserved", lambda: memory["reserved_peak"])
+    monkeypatch.setattr(
+        cuda, "mem_get_info", lambda: (1000 - memory["reserved"] - 7, 1000)
+    )
+
+    if fail_unsplit:
+        with pytest.raises(RuntimeError, match="unsplit forward failed"):
+            mixed_profile.profile_mixed_memory(runner)
+    else:
+        # Include the unsplit reserved peak, excluding the temporary pool.
+        assert mixed_profile.profile_mixed_memory(runner) == 80 + (140 - 100)
+        assert runner._mixed_profile_non_torch == 7
+    assert not pool_open
+    assert (config.enable_tbo, config.enable_tbo_decode) == tbo_flags
+    assert {flags for flags, _ in observed} == {tbo_flags, (False, False)}
+    if any(tbo_flags):
+        # Transitioning out of TBO must retain the preceding allocator cache.
+        first_unsplit = next(reserved for flags, reserved in observed if not flags[0])
+        assert first_unsplit == 116
