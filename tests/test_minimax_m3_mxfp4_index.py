@@ -606,14 +606,13 @@ def test_an_eager_step_at_the_batch_block_count_selects_like_the_model_width(S, 
             index_score_eager=eager,
         )
         assert md.index_score.max_block == (-(-max_seq // 128) if eager else 64)
-        outs.append(
-            minimax_m3_index_topk_decode(
-                q, cache, table, seq, max_seq, TOPK, 0, 1, heads, SM_SCALE,
-                emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
-                index_mxfp4=True, pages_per_block=1,
-                n_valid_column_per_row=md.n_valid_column_per_row,
-                index_score=md.index_score,
-            )  # fmt: skip
-        )
+        out = minimax_m3_index_topk_decode(
+            q, cache, table, seq, max_seq, TOPK, 0, 1, heads, SM_SCALE,
+            emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
+            index_mxfp4=True, pages_per_block=1,
+            n_valid_column_per_row=md.n_valid_column_per_row,
+            index_score=md.index_score,
+        )  # fmt: skip
+        outs.append(out)
     for graph_width, eager_width in zip(*outs):
         assert torch.equal(graph_width, eager_width)
