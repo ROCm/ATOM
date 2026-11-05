@@ -158,8 +158,8 @@ def publish_tile_argmax(
     tile_max, tile_idx = argmax_lowest_id(
         vals, offs_v[None, :], v_mask[None, :], vocab_size
     )
-    # Global id; a padded lane's sentinel stays `vocab_size`, which stage 2
-    # recognizes before adding the offset back in.
+    # Global id; the no-hit sentinel stays `vocab_size`, unoffset and out of
+    # range, which `argmax_of_tiles` passes through to the caller.
     tile_idx = tl.where(tile_idx < vocab_size, tile_idx + vocab_offset, vocab_size)
     tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
     tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
