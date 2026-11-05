@@ -340,6 +340,25 @@ def validate_runtime_config(config):
     from atom.config import CUDAGraphMode
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
+    transfer = config.kv_transfer_config
+    connector = KVConnectorFactory.connector_name(transfer)
+    transfers = [transfer] if connector is not None else []
+    if connector == "multi":
+        # P/D with CPU offload composes one Mooncake leg and one MP tier.
+        # Validate the concrete legs, including Mooncake's explicit role.
+        transfers = transfer.get("connectors")
+        if (
+            not isinstance(transfers, (list, tuple))
+            or len(transfers) != 2
+            or not all(isinstance(leg, dict) for leg in transfers)
+            or sorted(KVConnectorFactory.connector_name(leg) or "" for leg in transfers)
+            != ["lmcache_mp", "mooncake"]
+        ):
+            raise ValueError(
+                "DeepSeek-V4.1 runtime does not support KV transfer other than "
+                "lmcache_mp or mooncake; multi requires exactly one of each"
+            )
+
     unsupported = []
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
     for name, enabled in (
@@ -375,16 +394,17 @@ def validate_runtime_config(config):
             config.enable_tbo and not config.enable_dp_attention,
         ),
         (
-            # The Store moves PAGEs and rebuilds STATE through replay (it is
-            # refused without bounded replay, below). `lmcache_mp` moves PAGEs
-            # and either replays STATE or, without bounded replay, carries
-            # native-state images. Mooncake P/D moves whole PAGE units plus the
-            # request's one STATE slot (`get_kv_transfer_tensors`). MoRI-IO and
+            # `lmcache_mp` checkpoints STATE through the backend's PAGE-backed
+            # copies; Mooncake P/D moves whole PAGE units plus the request's one
+            # STATE slot (`get_kv_transfer_tensors`), and the Mooncake Store
+            # restores PAGE bytes and rebuilds the state by replay. MoRI-IO and
             # in-process offload read SLOT codecs this runtime does not publish.
-            # A `multi` (P/D plus an offload tier) is not admitted.
             "KV transfer other than lmcache_mp, mooncake or mooncake_store",
-            KVConnectorFactory.connector_name(config.kv_transfer_config)
-            not in (None, "lmcache_mp", "mooncake", "mooncake_store"),
+            any(
+                KVConnectorFactory.connector_name(leg)
+                not in ("lmcache_mp", "mooncake", "mooncake_store")
+                for leg in transfers
+            ),
         ),
         (
             # Mooncake defaults a missing role to producer, but producer
@@ -392,10 +412,11 @@ def validate_runtime_config(config):
             # an implicit producer would keep deferred output and decode T0
             # into the slot before handing it over.
             "Mooncake P/D without an explicit kv_role",
-            KVConnectorFactory.connector_name(config.kv_transfer_config) == "mooncake"
-            and isinstance(config.kv_transfer_config, dict)
-            and config.kv_transfer_config.get("kv_role")
-            not in ("kv_producer", "kv_consumer"),
+            any(
+                KVConnectorFactory.connector_name(leg) == "mooncake"
+                and leg.get("kv_role") not in ("kv_producer", "kv_consumer")
+                for leg in transfers
+            ),
         ),
         (
             # The Store moves V4.1's PAGEs and relies on replay to rebuild the
