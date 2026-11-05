@@ -27,6 +27,7 @@ def create_completion_chunk(
     finish_reason: str | None = None,
     usage: dict | None = None,
     index: int = 0,
+    include_usage: bool = False,
     **extra_fields: Any,
 ) -> str:
     """Create a text completion chunk in SSE format.
@@ -39,6 +40,9 @@ def create_completion_chunk(
     the engine's own word on every *content* chunk while hardcoding `"stop"`
     on the terminal one, so a single response reported `max_tokens` in a place
     clients do not read and `stop` in the place they do.
+
+    ``include_usage`` puts ``usage`` on the chunk even when it is null, as
+    ``stream_options.include_usage`` asks of every chunk but the last.
     """
     chunk = {
         "id": request_id,
@@ -55,7 +59,7 @@ def create_completion_chunk(
         ],
     }
     chunk.update(extra_fields)
-    if usage is not None:
+    if usage is not None or include_usage:
         chunk["usage"] = usage
     return data_frame(chunk)
 
@@ -68,12 +72,20 @@ async def stream_completion_response(
     num_prompt_tokens: int,
     cleanup_stream,
     cleanup_request,
+    echo: str = "",
+    include_usage: bool = False,
+    final_usage: bool = True,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming text completion response.
 
     ``num_prompt_tokens`` is the engine-computed prompt length (``Sequence.
     num_prompt_tokens``); reusing it avoids re-tokenizing the prompt on the
     event loop at stream start.
+
+    ``echo`` leads the first chunk's text. ``include_usage`` puts ``usage``
+    (null) on every chunk, and ``final_usage`` sends the usage chunk before
+    ``[DONE]``: /v1 always has, and DeepSeek's ``stream_options`` asks for
+    it with ``include_usage``.
     """
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
@@ -89,7 +101,12 @@ async def stream_completion_response(
     try:
         while True:
             chunk_data = await stream_collector.get()
-            new_text = chunk_data["text"]
+            # The echo leads the first chunk rather than going out on its
+            # own: every stream waits on its collector before the first
+            # frame, which keeps queueing and prefill out of the silence
+            # watch (`FrameWait`).
+            new_text = echo + chunk_data["text"]
+            echo = ""
             num_tokens_output += len(chunk_data.get("token_ids", []))
             engine_reason = chunk_data.get("finish_reason") or engine_reason
 
@@ -102,6 +119,7 @@ async def stream_completion_response(
                 model,
                 new_text,
                 finish_reason=None,  # the terminal chunk carries it
+                include_usage=include_usage,
                 **extra_fields,
             )
 
@@ -130,8 +148,9 @@ async def stream_completion_response(
                         model,
                         "",
                         openai_stop_reason(engine_reason) or "stop",
+                        include_usage=include_usage,
                     )
-                    + data_frame(usage_chunk)
+                    + (data_frame(usage_chunk) if final_usage else "")
                     + STREAM_DONE_MESSAGE
                 )
                 return
@@ -146,8 +165,12 @@ def build_completion_response(
     request_id: str,
     model: str,
     final_output: dict[str, Any],
+    echo: str = "",
 ) -> CompletionResponse:
-    """Build a non-streaming text completion response (single choice)."""
+    """Build a non-streaming text completion response (single choice).
+
+    ``echo`` is the prompt, returned ahead of the completion when asked for.
+    """
     response = CompletionResponse(
         id=request_id,
         created=int(time.time()),
@@ -155,7 +178,7 @@ def build_completion_response(
         choices=[
             {
                 "index": 0,
-                "text": final_output["text"],
+                "text": echo + final_output["text"],
                 "finish_reason": openai_stop_reason(final_output["finish_reason"]),
             }
         ],
@@ -183,13 +206,14 @@ def build_completion_response_multi(
     request_id: str,
     model: str,
     final_outputs: list[dict[str, Any]],
+    echo: str = "",
 ) -> CompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling."""
     assert final_outputs, "build_completion_response_multi requires at least one output"
     choices = [
         {
             "index": i,
-            "text": out["text"],
+            "text": echo + out["text"],
             "finish_reason": openai_stop_reason(out["finish_reason"]),
         }
         for i, out in enumerate(final_outputs)
@@ -233,6 +257,9 @@ async def stream_completion_response_fanout(
     num_prompt_tokens: int,
     cleanup_stream,
     cleanup_request,
+    echo: str = "",
+    include_usage: bool = False,
+    final_usage: bool = True,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant multiplexing ``len(seq_ids)`` siblings into one SSE.
 
@@ -243,6 +270,10 @@ async def stream_completion_response_fanout(
     ``num_prompt_tokens`` is the engine-computed prompt length shared by all
     siblings; reusing it avoids re-tokenizing on the event loop at stream
     start.
+
+    ``echo``, ``include_usage`` and ``final_usage`` are as for
+    :func:`stream_completion_response`; each sibling's echo leads its own
+    first chunk.
     """
     n = len(seq_ids)
     num_tokens_input = num_prompt_tokens
@@ -254,12 +285,14 @@ async def stream_completion_response_fanout(
     # disconnect closes the generator first, leaving this True so the finally
     # aborts whichever siblings are still running.
     aborted = True
+    pending_echo = [echo] * n
     try:
         while not all(finished):
             idx, chunk_data = await shared_collector.get()
             if finished[idx]:
                 continue
-            new_text = chunk_data["text"]
+            new_text = pending_echo[idx] + chunk_data["text"]
+            pending_echo[idx] = ""
             num_tokens_output[idx] += len(chunk_data.get("token_ids", []))
             engine_reasons[idx] = chunk_data.get("finish_reason") or engine_reasons[idx]
 
@@ -273,6 +306,7 @@ async def stream_completion_response_fanout(
                 new_text,
                 finish_reason=None,  # the terminal chunk carries it
                 index=idx,
+                include_usage=include_usage,
                 **extra_fields,
             )
 
@@ -304,10 +338,11 @@ async def stream_completion_response_fanout(
                     "",
                     openai_stop_reason(engine_reasons[i]) or "stop",
                     index=i,
+                    include_usage=include_usage,
                 )
                 for i in range(n)
             )
-            + data_frame(usage_chunk)
+            + (data_frame(usage_chunk) if final_usage else "")
             + STREAM_DONE_MESSAGE
         )
     finally:

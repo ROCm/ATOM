@@ -86,12 +86,16 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
+from .fim import FimFormat, resolve_fim_format
 from .logprobs import LogprobCollector, TokenBytes
 from .metrics_setup import create_metrics_exporter
+from .prefix_completion import continue_prompt, take_assistant_prefix
 from .protocol import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
+    BetaChatCompletionRequest,
+    BetaCompletionRequest,
     ChatCompletionRequest,
     CompletionRequest,
     ModelCard,
@@ -143,6 +147,7 @@ from .serving_chat import (
     stream_chat_response_fanout,
     validate_chat_request,
     validate_history_tool_calls,
+    validate_stream_options,
     validate_tool_list,
 )
 from .serving_completion import (
@@ -223,6 +228,9 @@ processor: Any | None = None
 model_name: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
 custom_message_encoder: Any | None = None
+# The model's fill-in-the-middle markers, found in its vocabulary at startup;
+# None when it has none and /beta/completions cannot honour a `suffix`.
+fim_format: FimFormat | None = None
 _seq_id_to_request_id: dict[int, str] = {}
 _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
@@ -1858,18 +1866,24 @@ async def _relay_to_hub(request: Request) -> Response:
 
 # ---- Error handlers ----
 
+# Generation routes whose errors use the OpenAI envelope.
+_OPENAI_ERROR_ROUTES = frozenset(
+    {
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/responses",
+        "/beta/chat/completions",
+        "/beta/completions",
+    }
+)
+
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_error_handler(
     request: Request, exc: RequestValidationError
 ):
     path = request.url.path
-    if path not in {
-        "/v1/chat/completions",
-        "/v1/completions",
-        "/v1/responses",
-        "/v1/messages",
-    }:
+    if path not in _OPENAI_ERROR_ROUTES and path != "/v1/messages":
         return await request_validation_exception_handler(request, exc)
     # Do not serialize exc.body, input values or arbitrary Pydantic ctx objects.
     message = "; ".join(
@@ -1889,11 +1903,7 @@ async def request_validation_error_handler(
 async def openai_http_error_handler(request: Request, exc: HTTPException):
     # HTTPException bypasses the ValueError/Exception handlers. Keep its status
     # and headers, but use the same OpenAI error envelope on generation routes.
-    if request.url.path not in {
-        "/v1/chat/completions",
-        "/v1/completions",
-        "/v1/responses",
-    }:
+    if request.url.path not in _OPENAI_ERROR_ROUTES:
         return await http_exception_handler(request, exc)
     return JSONResponse(
         status_code=exc.status_code,
@@ -1993,7 +2003,24 @@ async def _configure_structured_output(
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
+    return await _chat_completions(request, raw_request)
 
+
+@app.post("/beta/chat/completions")
+async def beta_chat_completions(
+    request: BetaChatCompletionRequest, raw_request: Request
+):
+    """Chat completions plus DeepSeek's beta assistant-prefix completion."""
+    return await _chat_completions(request, raw_request)
+
+
+async def _chat_completions(
+    request: ChatCompletionRequest | BetaChatCompletionRequest, raw_request: Request
+):
+    # The beta contract comes with the beta request model; /v1 ignores a
+    # `prefix` flag, as it always has.
+    beta = isinstance(request, BetaChatCompletionRequest)
+    route = "beta_chat_completions" if beta else "chat_completions"
     validate_model(request.model)
     _validate_chunked_receive(request.kv_transfer_params)
 
@@ -2001,6 +2028,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         request.tools = normalize_chat_tools(request.tools)
         validate_chat_request(request)
         messages = request.get_messages()
+        assistant_prefix = None
+        if beta:
+            messages, assistant_prefix = take_assistant_prefix(messages)
         logprob_codec = None
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
@@ -2060,6 +2090,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 app.state.logprob_codec = logprob_codec
 
         schema = schema_from_format(request.response_format)
+        if assistant_prefix is not None and schema is not None:
+            # The grammar constrains the reply from its first token, and a
+            # prefix has already written part of it.
+            raise ValueError(
+                "an assistant prefix cannot be combined with structured output"
+            )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         set_request_id(request_id)
@@ -2075,6 +2111,14 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         is_multimodal = _has_multimodal_content(messages)
         multimodal_data = None
         kv_transfer_params = request.kv_transfer_params
+        if assistant_prefix is not None and (
+            is_multimodal or request.get_prompt_token_ids() is not None
+        ):
+            # Only rendered text can be continued.
+            raise ValueError(
+                "an assistant prefix cannot be combined with image input or "
+                "prompt_token_ids"
+            )
         if is_multimodal:
             # Media loading (blocking network I/O, up to a 30s urlopen) plus
             # processor preprocessing are heavy and would stall the event loop;
@@ -2115,6 +2159,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             ),
             template_kwargs=merged_kwargs,
         )
+        if assistant_prefix is not None:
+            prompt_or_tokens, continues_reasoning = continue_prompt(
+                prompt_or_tokens, assistant_prefix, _reasoning
+            )
+            _reasoning = replace(_reasoning, starts_open=continues_reasoning)
 
         await _configure_structured_output(
             sampling_params,
@@ -2301,23 +2350,72 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except ValueError as e:
-        logger.error(f"Validation error in chat_completions: {e}")
+        logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.exception("Error in chat_completions")
+        logger.exception("Error in %s", route)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest, raw_request: Request):
     """Handle text completion requests (OpenAI-compatible)."""
+    return await _completions(request, raw_request)
 
+
+@app.post("/beta/completions")
+async def beta_completions(request: BetaCompletionRequest, raw_request: Request):
+    """Text completions plus DeepSeek's beta fill-in-the-middle (``suffix``)."""
+    return await _completions(request, raw_request)
+
+
+def _check_beta_completion(request: BetaCompletionRequest) -> None:
+    """Refuse DeepSeek's completion parameters this server cannot honour."""
+    validate_stream_options(request.stream, request.stream_options)
+    if request.logprobs is not None:
+        raise ValueError(
+            "logprobs is not supported on /beta/completions yet; omit it or send null"
+        )
+    if request.echo and request.suffix is not None:
+        raise ValueError("echo cannot be combined with suffix")
+
+
+def _fill_in_the_middle_prompt(request: BetaCompletionRequest) -> str:
+    """Render a ``suffix`` request's prompt in the model's FIM format."""
+    if fim_format is None:
+        raise ValueError("this model has no fill-in-the-middle format")
+    if request.get_prompt_token_ids() is not None or isinstance(request.prompt, list):
+        raise ValueError("fill-in-the-middle needs 'prompt' as text, not token IDs")
+    if request.prompt is None:
+        raise ValueError("fill-in-the-middle needs a 'prompt' as well as the 'suffix'")
+    return fim_format.render(request.prompt, request.suffix)
+
+
+async def _echo_text(request: CompletionRequest) -> str:
+    """The prompt as `echo` returns it, ahead of the completion."""
+    prompt = request.get_prompt_or_tokens()
+    if isinstance(prompt, str):
+        return prompt
+    # A token prompt can be long: decode it off the event loop.
+    return await asyncio.to_thread(tokenizer.decode, prompt)
+
+
+async def _completions(
+    request: CompletionRequest | BetaCompletionRequest, raw_request: Request
+):
+    # DeepSeek's completion parameters come with the beta request model;
+    # /v1/completions does not declare them, so it ignores them, as it
+    # always has.
+    beta = isinstance(request, BetaCompletionRequest)
+    route = "beta_completions" if beta else "completions"
     validate_model(request.model)
     _validate_chunked_receive(request.kv_transfer_params)
 
     try:
         effective_n = _coerce_n(request.n, request.temperature)
         _validate_return_token_ids(request.return_token_ids, request.stream)
+        if beta:
+            _check_beta_completion(request)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
@@ -2331,8 +2429,16 @@ async def completions(request: CompletionRequest, raw_request: Request):
             top_p=request.top_p,
             n=effective_n,
         )
+        echo, include_usage = "", False
+        if beta:
+            include_usage = bool((request.stream_options or {}).get("include_usage"))
+            if request.echo:
+                echo = await _echo_text(request)
         # Prefer pre-tokenized IDs; otherwise pass text to preprocessing.
-        prompt_or_tokens = request.get_prompt_or_tokens()
+        if beta and request.suffix is not None:
+            prompt_or_tokens = _fill_in_the_middle_prompt(request)
+        else:
+            prompt_or_tokens = request.get_prompt_or_tokens()
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
@@ -2366,6 +2472,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     num_prompt_tokens,
                     cleanup_stream,
                     cleanup_request,
+                    echo=echo,
+                    include_usage=include_usage,
+                    final_usage=not beta or include_usage,
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
@@ -2385,6 +2494,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     num_prompt_tokens,
                     cleanup_stream,
                     cleanup_request,
+                    echo=echo,
+                    include_usage=include_usage,
+                    final_usage=not beta or include_usage,
                 )
             return StreamingResponse(
                 _client_stream(gen, request_id),
@@ -2407,7 +2519,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
             )
             if not outputs:
                 raise RuntimeError("No output generated")
-            resp = build_completion_response_multi(request_id, model_name, outputs)
+            resp = build_completion_response_multi(
+                request_id, model_name, outputs, echo=echo
+            )
         else:
             final_output = await _run_nonstream_with_disconnect(
                 generate_async(
@@ -2425,7 +2539,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
             if final_output is None:
                 raise RuntimeError("No output generated")
 
-            resp = build_completion_response(request_id, model_name, final_output)
+            resp = build_completion_response(
+                request_id, model_name, final_output, echo=echo
+            )
         _log_request_model("response", request_id, resp)
         return JSONResponse(content=resp.model_dump(mode="json"))
 
@@ -2433,10 +2549,10 @@ async def completions(request: CompletionRequest, raw_request: Request):
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except ValueError as e:
-        logger.error(f"Validation error in completions: {e}")
+        logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.exception("Error in completions")
+        logger.exception("Error in %s", route)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -3473,7 +3589,7 @@ def _setup_frontend(args) -> None:
     """Request log, tokenizer, chat template and model name: everything a
     front end needs before the engine exists (shared with front-end workers)."""
     global tokenizer, model_name, default_chat_template_kwargs, _request_logger
-    global custom_message_encoder
+    global custom_message_encoder, fim_format
     if args.request_log:
         _request_logger = logging.getLogger("atom.request_log")
         _request_logger.setLevel(logging.INFO)
@@ -3489,6 +3605,7 @@ def _setup_frontend(args) -> None:
 
     logger.info(f"Loading tokenizer from {args.model}...")
     tokenizer = load_tokenizer(args.model, args.trust_remote_code)
+    fim_format = resolve_fim_format(tokenizer)
     if args.chat_template:
         if os.path.isfile(args.chat_template):
             with open(args.chat_template, "r", encoding="utf-8") as f:

@@ -110,6 +110,8 @@ class RequestTimingMiddleware:
                 "/v1/completions",
                 "/v1/messages",
                 "/v1/responses",
+                "/beta/chat/completions",
+                "/beta/completions",
             }
         ):
             await self.app(scope, receive, send)
