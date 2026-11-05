@@ -11,6 +11,7 @@ and need ``aiter`` importable (CI's no-aiter job skips them); the scorer itself 
 in test_minimax_m3_mxfp4_index.py.
 """
 
+import sys
 import types
 
 import pytest
@@ -45,6 +46,71 @@ def builder(mod, mxfp4=True, tbo_decode=True, forward_vars=None):
         ),
     )
     return b
+
+
+# (max_bs, max_qlen, H, TRANSPOSE_MIN_F) -> rows of the score storage: only steps
+# with q * H below the scorer's threshold read it
+@pytest.mark.parametrize(
+    "max_bs,max_qlen,heads,want",
+    [
+        (16, 8, 1, 16 * 8),  # TP4: every width up to 8 reads it
+        (16, 8, 2, 16 * 7),  # TP2: S=8 is transposed
+        (16, 8, 4, 16 * 3),  # TP1: S >= 4 is transposed
+        (16, 1, 4, 16),  # no speculation
+        (16, 8, 16, 0),  # even S=1 is transposed
+        (0, 8, 1, 0),
+    ],
+)
+def test_the_score_storage_has_rows_only_for_the_widths_that_read_it(
+    max_bs, max_qlen, heads, want
+):
+    from atom.model_ops.minimax_m3.index_mxfp4 import index_score_rows
+
+    assert index_score_rows(max_bs, max_qlen, heads, 16) == want
+
+
+def _assert_rows_match_fresh_index_score(heads, transpose_min_f):
+    """`index_score_rows` and `fresh_index_score` apply one predicate: no step width
+    gets a view bigger than the buffer, and the wider ones get None."""
+    from atom.model_ops.minimax_m3.index_mxfp4 import (
+        fresh_index_score,
+        index_score_buffer,
+        index_score_rows,
+    )
+
+    max_bs, max_qlen, max_block = 4, 8, 3
+    rows = index_score_rows(max_bs, max_qlen, heads, transpose_min_f)
+    buf = index_score_buffer(rows, heads, max_block, "cpu")
+    for S in range(1, max_qlen + 1):
+        for batch in range(1, max_bs + 1):
+            out = fresh_index_score(buf, batch * S, heads, max_block, S)
+            assert (out is None) == (S * heads >= transpose_min_f)
+
+
+@pytest.mark.parametrize("heads", [1, 2, 4])
+def test_the_score_rows_formula_matches_fresh_index_score_with_a_stand_in_threshold(
+    monkeypatch, heads
+):
+    """Local formula only: the threshold is a stand-in (16), so this does NOT show
+    that aiter's TRANSPOSE_MIN_F agrees; see the next test for that."""
+    parents = ("aiter", "aiter.ops", "aiter.ops.flydsl", "aiter.ops.flydsl.kernels")
+    name = "aiter.ops.flydsl.kernels.minimax_m3_index_score"
+    for mod_name in (*parents, name):
+        monkeypatch.setitem(sys.modules, mod_name, types.ModuleType(mod_name))
+    sys.modules[name].NEG_INF = float("-inf")
+    sys.modules[name].TRANSPOSE_MIN_F = 16
+    _assert_rows_match_fresh_index_score(heads, 16)
+
+
+@pytest.mark.parametrize("heads", [1, 2, 4])
+def test_the_score_rows_formula_matches_fresh_index_score_with_aiters_threshold(heads):
+    """Same check against the installed aiter's own constant. Skipped, never
+    stubbed, when aiter is absent, too old for the scorer, or cannot probe a GPU."""
+    try:
+        from aiter.ops.flydsl.kernels.minimax_m3_index_score import TRANSPOSE_MIN_F
+    except (ImportError, RuntimeError) as e:
+        pytest.skip(f"aiter's scorer constant is not importable here: {e!r}"[:200])
+    _assert_rows_match_fresh_index_score(heads, TRANSPOSE_MIN_F)
 
 
 # (scheduled_bs, running_bs, running_tokens, q) -> the scorer's batch

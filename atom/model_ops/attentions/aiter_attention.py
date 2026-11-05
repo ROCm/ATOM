@@ -311,8 +311,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             self._has_sparse_attention
             and getattr(self.model_runner.config, "index_cache_dtype", None) == "fp4"
         ):
+            from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
+                TRANSPOSE_MIN_F,
+            )
+
             from atom.model_ops.minimax_m3.index_mxfp4 import (
                 index_score_buffer,
+                index_score_rows,
                 index_work_map_capacity,
             )
 
@@ -334,15 +339,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 torch.empty((rows, 2), **i32_kwargs)
             )
             # ... and its scores' storage: one for every layer of a step, refilled
-            # with -inf once in `make_sparse_decode_metadata` (fp32: 32 KiB a row and
-            # index head at a 1M model length, so 128 MiB at TP4's one head and 512
-            # x 8 rows, 1 GiB at 8 heads). Allocated before the KV budget is sized, so
-            # the budget counts it as overhead and the cache shrinks by it. decode TBO
-            # adds one pair a ubatch (`_allocate_ubatch_buffers`), the larger half of
-            # `max_bs` rows each.
+            # with -inf once in `make_sparse_decode_metadata`, with rows only for
+            # the step widths that read it (`index_score_rows`). Allocated before the
+            # KV budget is sized, so the cache shrinks by it. decode TBO adds one
+            # pair a ubatch (`_allocate_ubatch_buffers`).
             self.model_runner.forward_vars["sparse_attention_index_score_buf"] = (
                 index_score_buffer(
-                    self.max_bs * max_qlen,
+                    index_score_rows(
+                        self.max_bs, max_qlen, num_head_k, TRANSPOSE_MIN_F
+                    ),
                     num_head_k,
                     self._index_score_max_block,
                     self.device,

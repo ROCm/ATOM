@@ -23,7 +23,7 @@ which is why it must keep answering False.
 import pytest
 import torch
 
-from atom.config import indexer_cp_unsupported_reason
+from atom.config import DCPConfig, indexer_cp_unsupported_reason
 
 M3 = ["MiniMaxM3SparseForCausalLM"]
 
@@ -85,6 +85,25 @@ def test_topology_gate_reasons_are_human_readable():
     assert "decode_context_parallel_size" in indexer_cp_unsupported_reason(
         M3, 4, 4, 128, 2, False
     )
+
+
+def test_kv_only_mxfp4_also_falls_back_from_the_cp_scorer(monkeypatch, caplog):
+    """`--kv-cache-dtype fp4` alone (index stays fp8) must clear the CP flag too."""
+    from tests.test_v4_indexer_defaults import _m3
+
+    with caplog.at_level("WARNING", logger="atom"):
+        config = _m3(
+            monkeypatch,
+            kv_cache_dtype="fp4",
+            index_cache_dtype=None,
+            tensor_parallel_size=4,
+            hf={"num_key_value_heads": 4},
+            dcp_config=DCPConfig(indexer_dcp_only=True),
+        )
+
+    assert config.index_cache_dtype == "fp8"  # only the KV is MXFP4
+    assert config.dcp_config.indexer_dcp_only is False
+    assert "MXFP4 caches are not wired to the CP scorer" in caplog.text
 
 
 # ───────────────────────────────────────────────────── compilation key ──

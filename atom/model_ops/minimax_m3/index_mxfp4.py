@@ -73,6 +73,16 @@ def build_index_work_map(
     )
 
 
+def index_score_rows(max_batch, max_query_len, num_idx_heads, transpose_min_f):
+    """Rows of the persistent score storage for steps of up to ``max_query_len``
+    tokens a request. ``fresh_index_score`` hands the buffer out only when
+    ``q * H < transpose_min_f``; wider steps take its None branch and never read it."""
+    q_read = (
+        q for q in range(1, max_query_len + 1) if q * num_idx_heads < transpose_min_f
+    )
+    return max_batch * max(q_read, default=0)
+
+
 def index_score_buffer(max_rows, num_idx_heads, max_block, device):
     """Flat fp32 storage for the decode scorer's scores of up to ``max_rows`` rows,
     ``max_block`` wide: the persistent ``out`` of every layer of a captured step."""
