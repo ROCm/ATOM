@@ -32,6 +32,7 @@ from atom.kv_transfer.disaggregation.types import (
     LoadCompletionId,
     SaveCompletionId,
     SaveOperationId,
+    req_id_of,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import validated_kv_role
@@ -77,34 +78,32 @@ _TRANSFER_DRAIN_TIMEOUT_S = 60.0
 # How long `get_finished` waits, while a load is in flight, for a polling
 # transfer thread's round that is a pure poll: a load that lands during the
 # forward and misses it keeps its request in WAITING_FOR_REMOTE_KVS a step
-# longer. Without it, the plugin's c16 TTFT p50 rose from 302 to 324 ms.
+# longer.
 _LAST_LOOK_WAIT_S = 0.001
 # A handed-back future holds the server's imported IPC event, and on ROCm 7.2.x
 # destroying one synchronises every stream of the device, so the forward
-# thread drops them while its stream is idle: dropped mid-forward, the
-# plugin's c16 ITL p50 rose from 23.0 to 23.8 ms. A stream that is never idle
-# (async scheduling) drops a batch per call once this many are held.
+# thread drops them while its stream is idle, never mid-forward. A stream that
+# is never idle (async scheduling) drops a batch per call once this many are
+# held.
 _RETURNED_FUTURES_CAP = 8192
 _RETURNED_FUTURES_BATCH = 64
-
-
-def _req_id_of(completion: Any) -> str:
-    """The request id inside a completion id, which may be bare or structured."""
-    return str(getattr(completion, "req_id", completion))
 
 
 class LMCacheMPConnector(KVConnectorBase):
     """Worker-side LMCache MP connector for backend-published PAGE views."""
 
     is_producer = False
+    # Whether a checkpoint-image load restores into an Active SLOT, which every
+    # load then names and no save may. Here the image stays in the PAGE units a
+    # load fills, and the backend restores it from there.
+    restores_into_slot = False
 
     def __init__(self, config: Any, *, transfers_off_step: bool = False) -> None:
         _validate_mp_config(config)
         self._config = config
         # Submit and poll on the transfer thread, whatever
-        # OFFLOAD_MP_TRANSFER_THREAD says: for the vLLM plugin, where a submit
-        # cost 18.7 ms and a terminal poll 13.8 ms on the forward thread under
-        # its launch pressure.
+        # OFFLOAD_MP_TRANSFER_THREAD says: for a frontend whose forward thread
+        # cannot afford either (the vLLM plugin).
         self._transfers_off_step = transfers_off_step
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         self.kv_role = validated_kv_role(kvc)
@@ -148,16 +147,12 @@ class LMCacheMPConnector(KVConnectorBase):
         self._after_forward_saves: list[LMCacheReqMeta] = []
         self._after_forward_ran = False
         self._late_flush_logged = False
-        # Submissions queued on the transfer thread, by request: `fence` waits
-        # for them too, since they reach the server after the step that queued
-        # them.
+        # Polling transfer thread only. Submissions it has queued, by request:
+        # `fence` waits for them too, since they reach the server after the
+        # step that queued them. And what its rounds settled since the last
+        # `get_finished`, which swaps it out.
         self._queued_requests: dict[str, int] = {}
-        # What a round on a polling transfer thread settled since the last
-        # `get_finished`.
-        self._polled_done_save: set[SaveCompletionId] = set()
-        self._polled_completions: set[ConnectorCompletion] = set()
-        self._polled_done_load: set[LoadCompletionId] = set()
-        self._polled_failed_load: set[LoadCompletionId] = set()
+        self._polled = KVConnectorOutput()
 
     def register_kv_caches(
         self,
@@ -483,16 +478,20 @@ class LMCacheMPConnector(KVConnectorBase):
         event: Any,
         ready: Callable[[], bool] | None = None,
     ) -> None:
-        if self._transfer is None:
+        transfer = self._transfer
+        if transfer is None:
             submit(req, event)
+            return
+        if not transfer.polls:
+            transfer.submit(submit, req, event, ready=ready)
             return
         owner = str(req.req_id)
         with self._lock:
             self._queued_requests[owner] = self._queued_requests.get(owner, 0) + 1
-        self._transfer.submit(self._submit_queued, submit, req, event, ready=ready)
+        transfer.submit(self._submit_queued, submit, req, event, ready=ready)
 
     def _submit_queued(self, submit: Any, req: LMCacheReqMeta, event: Any) -> None:
-        """One queued submission, on the transfer thread."""
+        """One queued submission, on a polling transfer thread."""
         try:
             submit(req, event)
         finally:
@@ -585,25 +584,21 @@ class LMCacheMPConnector(KVConnectorBase):
             if state.unit_ids or state.destination_slot is not None:
                 raise ValueError("a KV-only native transfer moves no image")
             return [self._block_slice(req, start, end)]
-        self._check_state_destination(state, loading=loading)
+        if self.restores_into_slot:
+            if loading and state.destination_slot is None:
+                raise ValueError("native-state restore requires a destination SLOT")
+            if not loading and state.destination_slot is not None:
+                raise ValueError("native-state save must refer to immutable PAGE units")
+        elif state.destination_slot is not None:
+            raise ValueError(
+                "this LMCache MP worker restores no Active SLOT; a native-state "
+                "transfer must not name one"
+            )
         unit_ids = self._native_layout.validate_unit_ids(state.unit_ids)
         pages = self._block_slice(req, start, end)
         if set(pages) & set(unit_ids):
             raise ValueError("checkpoint PAGE units must not overlap KV PAGE blocks")
         return self._native_layout.transfer_block_ids(pages, unit_ids, count)
-
-    def _check_state_destination(self, state: Any, *, loading: bool) -> None:
-        """Refuse an image transfer that names an Active SLOT.
-
-        This worker restores no SLOT: a load leaves the image in the PAGE units
-        it names, and the backend restores it from there.
-        """
-        del loading
-        if state.destination_slot is not None:
-            raise ValueError(
-                "this LMCache MP worker restores no Active SLOT; a native-state "
-                "transfer must not name one"
-            )
 
     def _submit_load(self, req: LMCacheReqMeta, event: Any) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec
@@ -784,8 +779,9 @@ class LMCacheMPConnector(KVConnectorBase):
             self._fences.release_retired()
 
     def _poll_round(self) -> None:
-        """Advance every pending transfer once: on the forward thread at each
-        report, or on a polling transfer thread (``transfers_off_step``)."""
+        """Advance every pending transfer once, on a polling transfer thread
+        (``transfers_off_step``); what it settles waits in `_polled` for
+        `get_finished`."""
         self._poll_pending_loads()
         self._poll_pending_saves()
 
@@ -821,9 +817,9 @@ class LMCacheMPConnector(KVConnectorBase):
                     self._completed_load_operation_order,
                 )
                 if result is not True:
-                    self._polled_failed_load.add(entry.completion)
+                    self._polled.failed_loading.add(entry.completion)
                 else:
-                    self._polled_done_load.add(entry.completion)
+                    self._polled.finished_loading.add(entry.completion)
 
     def _poll_pending_saves(self) -> None:
         """Advance every pending save; see `_poll_pending_loads`."""
@@ -874,8 +870,8 @@ class LMCacheMPConnector(KVConnectorBase):
                             result is True,
                         )
                     )
-            self._polled_done_save |= done_save
-            self._polled_completions |= completions
+            self._polled.finished_saving |= done_save
+            self._polled.connector_completions |= completions
 
     def _transfers_in_flight_locked(self) -> bool:
         return bool(self._pending_loads or self._pending_saves or self._queued_requests)
@@ -891,7 +887,7 @@ class LMCacheMPConnector(KVConnectorBase):
         ]
         for pending in (self._pending_saves, self._pending_loads):
             for operation_id, entry in pending.items():
-                if _req_id_of(entry.completion) not in wanted:
+                if req_id_of(entry.completion) not in wanted:
                     continue
                 if isinstance(entry.future, _UnprovableSubmission):
                     raise RuntimeError(  # noqa: TRY004 - a state, not a bad argument
@@ -916,7 +912,7 @@ class LMCacheMPConnector(KVConnectorBase):
         if not wanted:
             return
         transfer = self._transfer
-        if transfer is None:
+        if transfer is None or not transfer.polls:
             raise NotImplementedError(
                 "LMCache MP fence: only a worker built with transfers_off_step "
                 "fences"
@@ -931,14 +927,11 @@ class LMCacheMPConnector(KVConnectorBase):
         )
 
     def _retire_future(self, future: Any) -> None:
-        """A terminal future; called with `_lock` held.
+        """A future a polling round finished; called with `_lock` held.
 
-        On a polling transfer thread, handed back to be dropped on the forward
-        thread. Elsewhere this is the forward thread, and the caller drops it.
+        Handed back to be dropped on the forward thread.
         """
-        transfer = self._transfer
-        if transfer is not None and transfer.polls:
-            transfer.hand_back(future)
+        self._transfer.hand_back(future)
 
     def get_finished(self) -> KVConnectorOutput:
         if self._adapter is None:
@@ -946,43 +939,124 @@ class LMCacheMPConnector(KVConnectorBase):
         self._finished_housekeeping()
         transfer = self._transfer
         if transfer is not None and transfer.polls:
-            with self._lock:
-                in_flight = self._transfers_in_flight_locked()
-                wait_s = _LAST_LOOK_WAIT_S if self._pending_loads else 0.0
-            if in_flight:
-                # A wake -- a step that queues nothing (an idle engine waiting
-                # on a load) raises none of its own -- and a last look at a load.
-                transfer.look(wait_s)
-        else:
-            self._poll_round()
-        output = KVConnectorOutput()
+            return self._finished_off_step(transfer)
+        done_load: set[LoadCompletionId] = set()
+        failed_load: set[LoadCompletionId] = set()
+        done_save: set[SaveCompletionId] = set()
+        connector_completions: set[ConnectorCompletion] = set()
         with self._lock:
             # Heartbeat health is a control-plane signal, not proof that GPU
-            # work has quiesced, so a save is only reported once its device
-            # event is terminal -- that check lives in `_poll_pending_saves`.
-            output.finished_saving |= self._polled_done_save
-            output.connector_completions |= self._polled_completions
-            output.finished_loading |= self._polled_done_load
-            output.failed_loading |= self._polled_failed_load
-            self._polled_done_save = set()
-            self._polled_completions = set()
-            self._polled_done_load = set()
-            self._polled_failed_load = set()
-            output.finished_saving.update(self._immediate_saves)
-            for completion, token_range in self._immediate_saves.items():
-                if isinstance(completion, SaveOperationId):
-                    if token_range is not None:
-                        output.connector_completions |= _source_safe_completions(
-                            completion,
-                            _chunk_ranges(*token_range, int(self.chunk_size)),
+            # work submitted before the failure has quiesced. Keep every real
+            # future until its device event is terminal. A pre-submit drop is
+            # represented by None, while LMCache's missing-registration path
+            # returns an event-free terminal False future.
+            for operation_id, pending in list(self._pending_saves.items()):
+                take_ranges = getattr(pending.future, "take_completed_ranges", None)
+                if callable(take_ranges) and isinstance(
+                    pending.completion, SaveOperationId
+                ):
+                    try:
+                        connector_completions |= _source_safe_completions(
+                            pending.completion, take_ranges()
                         )
-                    output.connector_completions.add(
-                        ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, completion, True)
+                    except Exception:
+                        logger.warning(
+                            "LMCache MP source-safe event polling failed",
+                            exc_info=True,
+                        )
+                terminal, result = _terminal_future_result(pending.future)
+                if not terminal:
+                    _enforce_transfer_deadline(
+                        operation_id, pending.started_at, self._transfer_deadline_s
                     )
-            output.failed_loading.update(self._immediate_load_failures)
-            self._immediate_saves.clear()
-            self._immediate_load_failures.clear()
+                if terminal:
+                    self._pending_saves.pop(operation_id, None)
+                    _remember_operation_tombstone(
+                        operation_id,
+                        self._completed_save_operations,
+                        self._completed_save_operation_order,
+                    )
+                    done_save.add(pending.completion)
+                    if isinstance(pending.completion, SaveOperationId):
+                        connector_completions |= _source_safe_completions(
+                            pending.completion,
+                            _chunk_ranges(
+                                pending.start, pending.end, int(self.chunk_size)
+                            ),
+                        )
+                        connector_completions.add(
+                            ConnectorCompletion(
+                                DENSE_PAGE_STORE_CHANNEL,
+                                pending.completion,
+                                result is True,
+                            )
+                        )
+
+            for operation_id, pending in list(self._pending_loads.items()):
+                terminal, result = _terminal_future_result(pending.future)
+                if not terminal:
+                    _enforce_transfer_deadline(
+                        operation_id, pending.started_at, self._transfer_deadline_s
+                    )
+                    continue
+                self._pending_loads.pop(operation_id, None)
+                _remember_operation_tombstone(
+                    operation_id,
+                    self._completed_load_operations,
+                    self._completed_load_operation_order,
+                )
+                if result is not True:
+                    failed_load.add(pending.completion)
+                else:
+                    done_load.add(pending.completion)
+            self._take_immediate_locked(done_save, failed_load, connector_completions)
+        return KVConnectorOutput(
+            finished_loading=done_load,
+            failed_loading=failed_load,
+            finished_saving=done_save,
+            connector_completions=connector_completions,
+        )
+
+    def _finished_off_step(self, transfer: _TransferThread) -> KVConnectorOutput:
+        """What the polling transfer thread's rounds settled, plus the
+        immediate completions."""
+        with self._lock:
+            in_flight = self._transfers_in_flight_locked()
+            wait_s = _LAST_LOOK_WAIT_S if self._pending_loads else 0.0
+        if in_flight:
+            # A wake -- a step that queues nothing (an idle engine waiting on a
+            # load) raises none of its own -- and a last look at a load.
+            transfer.look(wait_s)
+        with self._lock:
+            output, self._polled = self._polled, KVConnectorOutput()
+            self._take_immediate_locked(
+                output.finished_saving,
+                output.failed_loading,
+                output.connector_completions,
+            )
         return output
+
+    def _take_immediate_locked(
+        self,
+        done_save: set[SaveCompletionId],
+        failed_load: set[LoadCompletionId],
+        connector_completions: set[ConnectorCompletion],
+    ) -> None:
+        """Report what settled without the server; called with `_lock` held."""
+        done_save.update(self._immediate_saves)
+        for completion, token_range in self._immediate_saves.items():
+            if isinstance(completion, SaveOperationId):
+                if token_range is not None:
+                    connector_completions |= _source_safe_completions(
+                        completion,
+                        _chunk_ranges(*token_range, int(self.chunk_size)),
+                    )
+                connector_completions.add(
+                    ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, completion, True)
+                )
+        failed_load.update(self._immediate_load_failures)
+        self._immediate_saves.clear()
+        self._immediate_load_failures.clear()
 
 
 __all__ = ["LMCacheMPConnector"]

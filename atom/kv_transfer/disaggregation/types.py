@@ -102,6 +102,11 @@ class LoadOperationId:
 LoadCompletionId = ReqId | LoadOperationId
 
 
+def req_id_of(completion: Any) -> str:
+    """The request id of a completion id, bare or tagged with a generation."""
+    return str(getattr(completion, "req_id", completion))
+
+
 @dataclass(frozen=True)
 class StateStoreOperationId:
     """Exact identity of one hand-out of a state checkpoint to the CPU tier.

@@ -563,12 +563,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if ls is not None:
             ls.can_load = True
             self._reqs_need_recv[sid] = seq
-            # Recorded now, not at dispatch: a load that never goes out (the
-            # tier lost the prefix, a withdrawn promise) recomputes
-            # `[HBM, hit)` as well, and has to store it back.
-            self._load_save_floors[sid] = self._chunk_floor(
-                int(getattr(seq, "num_cached_tokens", 0) or 0)
-            )
         # Track for save; build_connector_meta stores chunks once the scheduler's
         # computed frontier (seq.num_cached_tokens) has advanced past them.
         #
@@ -598,8 +592,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
     def _release_lookup(self, sid: str) -> None:
         """Clear this request's lookup once no load spec needs it."""
-        # clear_lookup_status only clears the client's memo; it does not
-        # release worker pins. Keep the ID for the next metadata dispatch.
+        # The in-process client only clears its memo: the worker pins are
+        # released by the next metadata dispatch, which keeps the ID. The MP
+        # client also frees the lookup's read locks, unless a submitted
+        # retrieve has taken them over (`complete_retrieve`).
         if self._lookup_client is not None:
             try:
                 self._lookup_client.clear_lookup_status(sid)
@@ -674,8 +670,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         Gives back the suffix leased at teardown, except blocks another
         operation of this request may still read; `_release_operation_lease`
-        frees those when that operation becomes source-safe. The one rule for
-        every path that retires a finished request's save.
+        frees those when that operation becomes source-safe.
         """
         entry = self._save_tracker.get(sid)
         if entry is None or entry[0] is not seq:
@@ -697,8 +692,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """Give `blocks` back from the request lease `lease_key` names.
 
         The ones the lease still holds go to the next source-safe release, and
-        the lease is dropped once nothing is left in it. The one sequence every
-        lease release runs.
+        the lease is dropped once nothing is left in it. `abandon_save` and
+        `reclaim_stale_leases` drop a whole lease without it.
         """
         leased = self._save_lease_blocks.get(lease_key)
         releasable = set(blocks) & leased if leased is not None else set()
@@ -822,13 +817,15 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
                 continue
+            # The HBM frontier a load that fails from here on reopens saves to.
+            self._load_save_floors[sid] = self._chunk_floor(hbm)
             # This is the one place a retrieve is handed to the worker, so it
             # is where the load's lookup pin has to be live -- a spec derived
             # from a remembered hit has none yet.
             if not self._ensure_lookup_pin(seq, sid, ls):
                 self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
                 # The tier no longer holds the prefix this request recomputes.
-                self._reopen_saves(sid, hbm)
+                self._reopen_saves(sid)
                 self._clear_pending_load(sid)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
@@ -851,7 +848,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 len(list(seq.block_table)),
             )
             loading_sids.add(sid)
-            self._load_save_floors[sid] = self._chunk_floor(hbm)
             load_operation = self._new_load_operation(seq)
             seq._load_operation = load_operation
             self._active_load_operations[sid] = (seq, load_operation)
@@ -1410,12 +1406,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # ID cannot complete it (including after request-ID reuse).
             return False
         self._finish_load_statistics(req_id, succeeded=False)
-        floor = self._load_save_floors.get(sid)
-        if floor is not None:
-            # The LMCache hit was not actually loaded. Let the recomputed
-            # [HBM, LMC) chunks be saved again instead of permanently treating
-            # them as already persisted.
-            self._reopen_saves(sid, floor)
+        # The LMCache hit was not actually loaded.
+        self._reopen_saves(sid)
         self._record_failed_load_attempt(sid)
         # Drop the hit too. `_repeat_load_suppressed` already answers for this
         # request, but the memo must not outlive the load spec it would imply

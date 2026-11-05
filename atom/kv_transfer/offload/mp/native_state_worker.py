@@ -50,6 +50,8 @@ class _NativePending:
 class NativeStateLMCacheMPConnector(LMCacheMPConnector):
     """Transfer pinned native images; never read a request's active SLOT to save."""
 
+    restores_into_slot = True
+
     def __init__(self, config: Any) -> None:
         super().__init__(config)
         self._native_saves: dict[str, _NativePending] = {}
@@ -87,12 +89,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         reserve = getattr(builder, "reserve_checkpoint_descriptors", None)
         if callable(reserve):
             reserve(self._restore_descriptor_slots)
-
-    def _check_state_destination(self, state: Any, *, loading: bool) -> None:
-        if loading and state.destination_slot is None:
-            raise ValueError("native-state restore requires a destination SLOT")
-        if not loading and state.destination_slot is not None:
-            raise ValueError("native-state save must refer to immutable PAGE units")
 
     def _submit_native(self, req: LMCacheReqMeta, event: Any, *, loading: bool) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec

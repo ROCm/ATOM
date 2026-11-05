@@ -45,7 +45,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 
-from atom.kv_transfer.disaggregation.types import ConnectorCompletion
+from atom.kv_transfer.disaggregation.types import ConnectorCompletion, req_id_of
 from atom.kv_transfer.offload._offload_common import offload_save_abandon_timeout_s
 from atom.plugin.vllm.kv_transfer.kda_state import (
     KdaBoundaryPlanner,
@@ -460,8 +460,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 # the native-state worker, which restores an image into an
                 # Active SLOT, while here the plugin restores it from the PAGE
                 # units a load fills. Its transfers are submitted and polled
-                # off the step thread: there a submit cost 18.7 ms and a
-                # terminal poll 13.8 ms under the plugin's launch pressure.
+                # off the step thread: under the plugin's launch pressure both
+                # cost the step thread milliseconds.
                 self._worker = MPOffloadWorkerAdapter(
                     LMCacheMPConnector(self._config, transfers_off_step=True)
                 )
@@ -1376,8 +1376,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """
         out = self._worker.get_finished()
 
-        finished_recving = {_req_id_of(c) for c in out.finished_loading}
-        failed = {_req_id_of(c) for c in out.failed_loading}
+        finished_recving = {req_id_of(c) for c in out.finished_loading}
+        failed = {req_id_of(c) for c in out.failed_loading}
         if self._abandoned_loads:
             # Not a transfer failure -- no transfer was ever started -- but the
             # same two things have to happen: release the park and truncate to
@@ -1395,7 +1395,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 self._worker_load_failed.get(req_id, 0) + 1
             )
         for completion in out.finished_saving:
-            req_id = _req_id_of(completion)
+            req_id = req_id_of(completion)
             self._worker_saved[req_id] = self._worker_saved.get(req_id, 0) + 1
         # ATOM's connector-owned channels. `finished_saving` above is the
         # legacy terminal that clears `_save_inflight`; these are what release
@@ -1839,10 +1839,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
         # After this step's saves: an operation built here is in the live set
-        # the deadline walks. Only MP bounds its transfers this way.
-        enforce = getattr(self._scheduler, "enforce_transfer_deadlines", None)
-        if enforce is not None:
-            enforce()
+        # the deadline walks.
+        self._scheduler.enforce_transfer_deadlines()
         return AtomOffloadMetadata(
             inner,
             preempted,
@@ -2005,7 +2003,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             self._save_reports.pop(req_id, None)
             self._load_failure_reports.pop(req_id, None)
             for key in [
-                key for key in self._completion_reports if _req_id_of(key[1]) == req_id
+                key for key in self._completion_reports if req_id_of(key[1]) == req_id
             ]:
                 del self._completion_reports[key]
         logger.warning(
@@ -2474,11 +2472,6 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 return True, None
             self._seqs.drop(req_id)
         return False, None
-
-
-def _req_id_of(completion_id) -> str:
-    """Completion ids are a bare request id, or one tagged with a generation."""
-    return str(getattr(completion_id, "req_id", completion_id))
 
 
 def _group_block_ids(blocks) -> tuple[list[int], ...]:

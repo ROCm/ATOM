@@ -2073,12 +2073,6 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if ls is not None:
             ls.can_load = True
             self._reqs_need_recv[sid] = seq
-            # Recorded now, not at dispatch: a load that never goes out (the
-            # tier lost the prefix) recomputes `[HBM, hit)` as well, and has
-            # to store it back.
-            self._load_save_floors[sid] = self._chunk_floor(
-                int(getattr(seq, "num_cached_tokens", 0) or 0)
-            )
         # Track for save; build_connector_meta stores chunks once the scheduler's
         # computed frontier (seq.num_cached_tokens) has advanced past them.
         #
@@ -2314,13 +2308,15 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
                 continue
+            # The HBM frontier a load that fails from here on reopens saves to.
+            self._load_save_floors[sid] = self._chunk_floor(hbm)
             # This is the one place a retrieve is handed to the worker, so it
             # is where the load's lookup pin has to be live -- a spec derived
             # from a remembered hit has none yet.
             if not self._ensure_lookup_pin(seq, sid, ls):
                 self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
                 # The tier no longer holds the prefix this request recomputes.
-                self._reopen_saves(sid, hbm)
+                self._reopen_saves(sid)
                 self._clear_pending_load(sid)
                 continue
             slot_load_spec = None
@@ -2368,7 +2364,6 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 len(list(seq.block_table)),
             )
             loading_sids.add(sid)
-            self._load_save_floors[sid] = self._chunk_floor(hbm)
             load_operation = LoadOperationId(seq.id, self._load_nonce)
             self._load_nonce += 1
             seq.offload_loaded = False
@@ -2717,12 +2712,8 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         active_slot = self._active_slot_loads.pop(sid, None)
         if active_slot is not None:
             self._committed_sidecar_hashes.discard(active_slot[1])
-        floor = self._load_save_floors.get(sid)
-        if floor is not None:
-            # The LMCache hit was not actually loaded. Let the recomputed
-            # [HBM, LMC) chunks be saved again instead of permanently treating
-            # them as already persisted.
-            self._reopen_saves(sid, floor)
+        # The LMCache hit was not actually loaded.
+        self._reopen_saves(sid)
         self._record_failed_load_attempt(sid)
         # See the dense scheduler's `load_failed`: the remembered hit must not
         # outlive the load spec it would imply.

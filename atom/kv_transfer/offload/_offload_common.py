@@ -847,6 +847,8 @@ class OffloadSchedulerMixin(ABC):
                 hit,
                 int(spec.lmcache_cached_tokens),
             )
+            # The request recomputes what the tier lost.
+            self._reopen_saves(sid)
             self._clear_pending_load(sid)
             return False
         return True
@@ -875,12 +877,18 @@ class OffloadSchedulerMixin(ABC):
         if failed_seq is not None:
             self._load_failed_seqs[sid] = failed_seq
 
-    def _reopen_saves(self, sid: str, hbm: int) -> None:
-        """The tier hit will not be loaded, so `[hbm, hit)` is recomputed:
-        let its chunks be stored again rather than treated as persisted."""
+    def _reopen_saves(self, sid: str) -> None:
+        """A tier hit that is not loaded (the tier lost it, or the load failed)
+        is recomputed from the HBM frontier the dispatch recorded: let
+        `[hbm, hit)` be stored again rather than treated as persisted.
+
+        A promise withdrawn before dispatch records none and reopens nothing:
+        the tier still holds what the request recomputes.
+        """
+        floor = self._load_save_floors.get(sid)
         entry = self._save_tracker.get(sid)
-        if entry is not None:
-            entry[1] = min(int(entry[1]), self._chunk_floor(hbm))
+        if floor is not None and entry is not None:
+            entry[1] = min(int(entry[1]), int(floor))
 
     def _release_failed_load_attempt(self, sid: str, seq) -> None:
         """Drop the mark when its sequence is done with the request ID."""

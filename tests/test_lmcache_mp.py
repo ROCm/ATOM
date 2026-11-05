@@ -890,6 +890,8 @@ def test_a_withdrawn_promise_frees_its_lookup_locks(monkeypatch):
 
     freed = scheduler._mp_adapter.freed
     assert [(call["start"], call["end"]) for call in freed] == [(0, 12)]
+    # Never dispatched: the tier still holds what the request recomputes.
+    assert scheduler._save_tracker["9"][1] == 12
 
 
 def test_full_prompt_hit_of_exactly_one_chunk_asks_for_no_load_at_all(monkeypatch):
@@ -1450,6 +1452,10 @@ def test_worker_future_query_exception_preserves_inflight_transfers(
         worker.get_finished()
     assert set(worker._pending_loads) == {"load:10:1"}
     assert set(worker._pending_saves) == {"save:11:2"}
+    if off_step:
+        # A polling thread stops at its first failed round; the engine stops.
+        assert worker._transfer._poll_failed
+        return
 
     load_future.query_error = None
     save_future.query_error = None
@@ -2574,6 +2580,27 @@ def test_handed_back_futures_are_dropped_while_the_stream_is_idle(
     stream.idle = True
     worker._settle_transfer_thread()
     assert worker._transfer.returned == 0
+
+
+def test_a_submit_only_transfer_thread_keeps_no_fence_bookkeeping(
+    fake_lmcache_modules, monkeypatch
+):
+    """Native ATOM's OFFLOAD_MP_TRANSFER_THREAD submits as main does: nothing
+    counts its queued requests, which only the polling thread's fence reads,
+    and it has no fence."""
+    monkeypatch.setattr(mp_worker.envs, "OFFLOAD_MP_TRANSFER_THREAD", True)
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter, off_step=False)
+    counted = []
+    monkeypatch.setattr(
+        worker, "_submit_queued", lambda *a: counted.append(a), raising=False
+    )
+    worker.start_load_kv(_load_step(7))
+    assert worker._transfer.drain(5.0)
+    assert len(adapter.loads) == 1 and not counted
+    assert worker._queued_requests == {}
+    with pytest.raises(NotImplementedError, match="transfers_off_step"):
+        worker.fence(["7"])
 
 
 def test_the_fence_covers_queued_transfers_and_fails_stop(fake_lmcache_modules):

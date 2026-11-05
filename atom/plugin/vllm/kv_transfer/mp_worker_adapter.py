@@ -38,13 +38,8 @@ silent-corruption case above, and vLLM truncates to the first block regardless.
 
 from typing import Any
 
-from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+from atom.kv_transfer.disaggregation.types import KVConnectorOutput, req_id_of
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-
-
-def _req_id_of(completion: Any) -> str:
-    """The request id inside a completion id, which may be bare or structured."""
-    return str(getattr(completion, "req_id", completion))
 
 
 class MPOffloadWorkerAdapter:
@@ -107,11 +102,11 @@ class MPOffloadWorkerAdapter:
         """Drain the transport, converting failed loads into error blocks."""
         out = self._inner.get_finished()
         for completion in out.failed_loading:
-            blocks = self._load_blocks.pop(_req_id_of(completion), None)
+            blocks = self._load_blocks.pop(req_id_of(completion), None)
             if blocks:
                 self._error_blocks |= blocks
         for completion in out.finished_loading:
-            self._load_blocks.pop(_req_id_of(completion), None)
+            self._load_blocks.pop(req_id_of(completion), None)
         return out
 
     def take_load_error_blocks(self) -> set[int]:

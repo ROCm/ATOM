@@ -64,6 +64,11 @@ class PluginSchedulerMixin:
         self.declined_loads = queued - dispatched
         return meta
 
+    def enforce_transfer_deadlines(self) -> None:
+        """Bound transfers that never report, every step: vLLM calls no
+        `process_completions`, where ATOM's engine has the MP scheduler do it.
+        Only MP bounds its transfers this way."""
+
     def activate_block_leases(self, seq, block_ids: frozenset[int]) -> None:
         super().activate_block_leases(seq, block_ids)
         if id(seq) in self._save_lease_blocks:
@@ -122,6 +127,9 @@ class PluginSchedulerMixin:
 
 class PluginMPScheduler(PluginSchedulerMixin, LMCacheMPConnectorScheduler):
     """LMCache MP scheduler as the plugin drives it."""
+
+    def enforce_transfer_deadlines(self) -> None:
+        self._enforce_transfer_deadlines()
 
 
 class PluginDenseScheduler(PluginSchedulerMixin, DenseOffloadScheduler):

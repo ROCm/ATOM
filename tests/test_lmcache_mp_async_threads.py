@@ -324,6 +324,30 @@ def test_an_asked_round_polls_before_the_rest_of_the_queue():
         thread.close(5.0)
 
 
+def test_a_failed_poll_round_stops_the_polling(caplog):
+    """The failure is raised on the forward thread; another round would only
+    fail and log again, every `_IDLE_POLL_S`, until the engine stepped."""
+    rounds = []
+
+    def poll():
+        rounds.append(1)
+        raise RuntimeError("transfer deadline")
+
+    thread = transfer_thread._TransferThread("mp-transfer-test", poll=poll)
+    try:
+        thread.look(0)
+        time.sleep(3 * transfer_thread._IDLE_POLL_S)
+        thread.look(0)
+        assert thread.drain(5.0)
+        time.sleep(0.02)
+        assert len(rounds) == 1
+        assert caplog.text.count("transfer poll failed") == 1
+        with pytest.raises(RuntimeError, match="transfer deadline"):
+            thread.raise_error()
+    finally:
+        thread.close(5.0)
+
+
 def test_a_handed_back_future_is_dropped_once_nothing_else_holds_it():
     """One LMCache still references stays queued: its last reference would
     otherwise be dropped by LMCache's next submission, on the transfer

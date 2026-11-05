@@ -21,13 +21,14 @@ Given a ``poll`` callable (the vLLM plugin's worker), the thread also polls
 pending transfers: whenever its queue runs dry, when the forward thread asks
 (`look`, `fence`), and every `_IDLE_POLL_S` otherwise. An asked-for round runs
 after the submission in progress, whatever is still queued, so a backlog of
-submissions delays neither a finished load's report nor a fence. A conc16 step
-probe of the plugin priced the forward thread's share at 18.7 ms per submit and
-13.8 ms per terminal poll (the IPC handle import) under its own launch
-pressure. A future a poll finished holds the server's imported IPC event, so it
-is handed back (`hand_back`) for the forward thread to drop once nothing else
-holds it (`take_returned`): LMCache keeps each future until its next
-submission, on this thread. Native ATOM polls on its forward thread.
+submissions delays neither a finished load's report nor a fence. Submits and
+terminal polls (the IPC handle import) both cost the forward thread
+milliseconds under its own launch pressure. A failed round stops the polling;
+the forward thread raises the failure. A future a poll finished holds the
+server's imported IPC event, so it is handed back (`hand_back`) for the forward
+thread to drop once nothing else holds it (`take_returned`): LMCache keeps each
+future until its next submission, on this thread. Native ATOM polls on its
+forward thread.
 """
 
 from __future__ import annotations
@@ -52,9 +53,9 @@ _FENCE_MAX_RECORDS = 31
 # Poll period while a queued submission waits for its fence to complete.
 _READY_POLL_S = 0.0005
 # With ``poll``: the round period when nothing wakes the thread, a backstop for
-# a rank that has stopped stepping. Demand-driven otherwise: a 2 ms cadence
-# with loads outstanding cost more end to end (ITL p50 23.1 -> 28.8 ms) than
-# the forward-thread work it moved off.
+# a rank that has stopped stepping. Demand-driven otherwise: a fixed short
+# cadence with loads outstanding cost more end to end than the forward-thread
+# work it moved off.
 _IDLE_POLL_S = 0.05
 # Queued to wake a polling thread for a round; runs no call.
 _WAKE = object()
@@ -123,6 +124,7 @@ class _TransferThread:
         self._rounds_started = 0
         self._rounds_done = 0
         self._round_asked = False
+        self._poll_failed = False
         self._returned: deque[Any] = deque()
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._thread.start()
@@ -223,21 +225,15 @@ class _TransferThread:
         ``deadline_s``: returning would let the caller reuse blocks a transfer
         still reads.
         """
-        if self._poll is None:
-            raise NotImplementedError(
-                f"LMCache MP fence for {what}: only a polling transfer thread "
-                "fences (the vLLM plugin's)"
-            )
         deadline = time.monotonic() + deadline_s
         while True:
             self.raise_error()
             left = outstanding()
             if not left:
                 return
-            if not self._thread.is_alive():
+            if not self._thread.is_alive() or self._poll_failed:
                 raise RuntimeError(
-                    f"LMCache MP fence for {what}: no transfer thread to submit or "
-                    f"poll {left}"
+                    f"LMCache MP fence for {what}: no transfer thread polls {left}"
                 )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -259,7 +255,9 @@ class _TransferThread:
         with self._idle:
             return (
                 self._idle.wait_for(
-                    lambda: self._rounds_done >= target or not self._thread.is_alive(),
+                    lambda: self._rounds_done >= target
+                    or self._poll_failed
+                    or not self._thread.is_alive(),
                     timeout=timeout,
                 )
                 and self._rounds_done >= target
@@ -321,7 +319,7 @@ class _TransferThread:
                         self._outstanding -= 1
                         if not self._outstanding:
                             self._idle.notify_all()
-            if self._poll is None:
+            if self._poll is None or self._poll_failed:
                 continue
             with self._idle:
                 asked = self._round_asked
@@ -337,9 +335,11 @@ class _TransferThread:
             self._poll()
         except BaseException as exc:  # re-raised by raise_error
             # A transfer deadline is fail-stop, and only the forward thread can
-            # stop the engine.
-            logger.exception("LMCache MP transfer poll failed")
+            # stop the engine. Another round would only fail and log again.
+            logger.exception("LMCache MP transfer poll failed; polling stops")
             self._record_error(exc)
+            with self._idle:
+                self._poll_failed = True
         finally:
             with self._idle:
                 self._rounds_done = number

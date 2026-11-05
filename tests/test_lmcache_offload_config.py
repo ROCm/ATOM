@@ -59,6 +59,18 @@ def test_page_namespace_is_stable_for_equivalent_config():
     assert first.startswith("org/model::atom-page-v")
 
 
+def test_page_namespace_hashes_a_frontends_stable_speculative_form_even_empty():
+    """Supplied, it is what scheduler and workers agree on, empty or not: the
+    raw config it stands in for holds per-process fields."""
+    first, second = _config(), _config()
+    second.speculative_config.num_speculative_tokens = 5
+    for config in (first, second):
+        config.offload_speculative_config = {}
+    assert offcfg.build_page_namespace(
+        first, _lmcache_config(), 4
+    ) == offcfg.build_page_namespace(second, _lmcache_config(), 4)
+
+
 def test_page_namespace_supports_torch_dtype_in_speculative_config():
     torch = pytest.importorskip("torch")
     config = _config()

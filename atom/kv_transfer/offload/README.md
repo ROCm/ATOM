@@ -31,11 +31,12 @@ present (DSV4 PAGE+SLOT), and `dense` otherwise.
 `kv_transfer_config.offload_layout` can override compatible choices without
 giving scheduler and worker different connector names. MiniMax-M3 cannot be
 overridden away from `m3`, because the other codecs do not preserve its NSA
-index cache. A GDN or K3 model cannot be overridden onto a layout that owns
-no state tier (`dense`), because that would restore KV over a stale slot.
-DeepSeek-V4.1 resolves to `dsv41` (its PAGE+STATE pool, offloaded over
-`lmcache_mp` only), cannot be overridden onto any other layout, and no other
-model may name `dsv41`.
+index cache. A model with per-request state (GDN `qwen`, K3 `kimi_k3`,
+DeepSeek-V4.1 `dsv41`) accepts only its own layout as an override: any other
+one, `qwen` and `kimi_k3` for each other included, has no tier for its state
+and would restore KV over a stale slot. DeepSeek-V4.1 resolves to `dsv41` (its
+PAGE+STATE pool, offloaded over `lmcache_mp` only), and no other model may
+name `dsv41`.
 
 It is the **ATOM-native, in-engine** offload path: the connector plugs straight
 into ATOM's scheduler/worker via the shared

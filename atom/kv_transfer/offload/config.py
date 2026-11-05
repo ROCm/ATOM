@@ -185,7 +185,8 @@ def select_offload_layout(config) -> str:
 
 
 def _layout_from_model(config) -> str:
-    """The dense/hybrid/kimi_k3/qwen layout the model itself implies (no override).
+    """The layout the model itself implies, without an override: ``m3``,
+    ``kimi_k3``, ``dsv41``, ``hybrid``, ``qwen`` or ``dense``.
 
     GDN selects ``qwen``, a subclass of the K3 tier: that tier packs a PAGE
     image and does not assume KDA shapes. ``dense`` is refused for these
@@ -368,6 +369,12 @@ def build_page_namespace(
     base_model_name = str(
         getattr(config, "model_tag", None) or getattr(config, "model", "atom-model")
     )
+    # A frontend's own stable form when it supplies one
+    # (`Config.offload_speculative_config`): only it knows which of its fields
+    # are per-process.
+    speculative = getattr(config, "offload_speculative_config", None)
+    if speculative is None:
+        speculative = _stable_config_value(getattr(config, "speculative_config", None))
     document = {
         "schema": "atom-page-namespace",
         "layout_version": layout_version,
@@ -404,10 +411,7 @@ def build_page_namespace(
         # The config-time snapshot when there is one; see `Config.__post_init__`.
         "hf_geometry": getattr(config, "offload_page_hf_geometry", None)
         or _stable_hf_geometry(hf),
-        # A frontend's own stable form when it supplies one, as for the HF
-        # geometry above: only it knows which of its fields are per-process.
-        "speculative_config": getattr(config, "offload_speculative_config", None)
-        or _stable_config_value(getattr(config, "speculative_config", None)),
+        "speculative_config": speculative,
     }
     canonical = json.dumps(
         document,
