@@ -1,5 +1,8 @@
 # V4.1 单机 C256：#2755 + LMCache MP / Mooncake Store
 
+最新的 **P/D direct Store（无 CPU L1）** 实验代码和运行说明见
+[PD_DIRECT_STORE.md](PD_DIRECT_STORE.md)。下面保留的是旧单机 L1+Store 配方，不代表本轮 P/D 参数。
+
 此分支已同步#2755提交`0392e24daf7586cad7740d6db33247d66ae7df2e`的源码，保留本会话的V4.1/MP集成改动及诊断指标。不是纯main，不携带二进制、SDK、模型或数据。
 
 两组都使用`--dp-load-balance prefix_spread`，关闭session affinity。`local`只有256GiB MP L1；`store`在同一个L1后增加512GiB Mooncake Store。单机共享缓存服务允许rank之间恢复KV，但各GPU的显存KV仍独立。

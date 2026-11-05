@@ -64,8 +64,9 @@ KVConnectorFactory.register(
     scheduler_class="MooncakeStoreOffloadScheduler",
     requires_pd_staging=False,
     offload=True,
-    # One Mooncake Store for every DP rank.
+    # One Mooncake Store for every DP rank, queried before admission.
     shared_tier=True,
-    # The dense codec builds from `KVCacheTensor`s; the region map is unread.
-    reads_block_regions=False,
+    async_lookup=True,
+    reads_block_regions=True,
+    copies_whole_block_regions=True,
 )

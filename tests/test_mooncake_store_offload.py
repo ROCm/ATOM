@@ -1885,7 +1885,9 @@ def _park_after_a_wait_for_blocks(cluster, scheduler_clock, store_engine, meanwh
     seq = Sequence(list(range(41)), BLOCK, sampling_params=SamplingParams())
     engine.add(seq)
     store_engine.withheld.on = True
-    engine.schedule()  # looked up: a 40-token hit, but no KV blocks
+    engine.schedule()  # lookup offered, but no KV blocks
+    # Finish the asynchronous answer before simulating its lease expiry.
+    assert offload.get_num_new_matched_tokens(seq) == (40, True)
     assert seq.status == SequenceStatus.WAITING
     [store] = cluster.stores
     asked = sum(1 for call in store.calls if call[0] == "exists")
@@ -1988,7 +1990,13 @@ def test_a_loaded_prefix_is_published_and_the_suffix_hashes_onto_it(
     # A later turn finds the prefix in HBM and loads nothing.
     again = Sequence(list(range(49)), BLOCK, sampling_params=SamplingParams())
     engine.add(again)
-    batch, _ = engine.schedule()
+    # Arrival-time lookup is asynchronous; let its background query finish.
+    import time
+    for _ in range(100):
+        batch, _ = engine.schedule()
+        if again.status == SequenceStatus.RUNNING:
+            break
+        time.sleep(0.001)
     assert again.status == SequenceStatus.RUNNING
     assert [r for r in batch.connector_meta_output.requests if r.load_spec] == []
     assert again.num_cached_tokens >= 40
