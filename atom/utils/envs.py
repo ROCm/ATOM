@@ -613,6 +613,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QSA_GFX1250_SCORER": lambda: (
         os.getenv("ATOM_QSA_GFX1250_SCORER", "1") == "1"
     ),
+    # Router top-k softmax with fused sigmoid shared-expert gates (Qwen3.8):
+    # one-wave Triton kernel instead of aiter's 16-lane-per-row topkGatingSoftmax.
+    # Same ids/tie order and weights; "0" restores the aiter kernel.
+    "ATOM_TRITON_TOPK_SOFTMAX": lambda: (
+        os.getenv("ATOM_TRITON_TOPK_SOFTMAX", "1") == "1"
+    ),
     # --- ReplaySSM (linear-attention state) ---
     # Cache the SSM *inputs* (k, u, g) instead of one full recurrent state per
     # speculative token.  The state pool stops scaling with the MTP window --

@@ -190,6 +190,27 @@ def rocm_aiter_topk_softmax_impl(
         fused_shared_experts_for_kernel = 0
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
+    if envs.ATOM_TRITON_TOPK_SOFTMAX and fused_shared_experts_for_kernel > 0:
+        from atom.model_ops.topk_softmax_triton import (
+            topk_softmax_shared,
+            topk_softmax_shared_supported,
+        )
+
+        if topk_softmax_shared_supported(
+            gating_output,
+            topk,
+            renormalize,
+            fused_shared_experts_for_kernel,
+            fused_shared_experts_scoring_func,
+        ):
+            topk_softmax_shared(
+                topk_weights,
+                topk_ids,
+                gating_output,
+                topk,
+                fused_shared_experts_for_kernel,
+            )
+            return total_topk_weights, total_topk_ids
     topk_softmax(
         topk_weights,
         topk_ids,
