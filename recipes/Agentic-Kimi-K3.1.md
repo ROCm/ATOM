@@ -30,7 +30,7 @@ recipe), [`DSpark.md`](DSpark.md).
 | Band | CONC | Serving defaults |
 |---|---|---|
 | Interactive | 1, 4 | TP8, **DCP=1**, DSpark **7**, synthetic AL **3.21**, **mono decode on**, KDA state FP32, GPU prefix cache only |
-| Mid | 14, 16 | TP8, **DCP=8**, DSpark **4**, synthetic AL **2.92**, LMCache **128 GiB**, ReplaySSM, KDA state FP16 |
+| Mid | 14, 16 | TP8, **DCP=8**, DSpark **4**, synthetic AL **2.92**, LMCache **128 GiB**, ReplaySSM, KDA state FP32 |
 | Throughput | 48, 56, 72 | TP8, **DCP=8**, DSpark **4**, synthetic AL **2.92**, LMCache **224 GiB** with a **128 GiB** state cap, on-demand state checkpoints, ReplaySSM |
 
 ## 0. Container
@@ -68,7 +68,6 @@ unset AITER_QUICK_REDUCE_QUANTIZATION
 export PYTHONNOUSERSITE=1
 export AITER_LOG_LEVEL=WARNING
 export AITER_SITUV2_A4W4=1
-export AITER_FLYDSL_STAGE2_FP8=1
 export AITER_FLYDSL_USE_HERD=1
 export AITER_FLYDSL_HERD_MIN_M=64
 export ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1
@@ -80,7 +79,7 @@ SPEC_DECODE_ACCEPTANCE_LENGTH=3.21
 MAX_NUM_SEQS=32
 GRAPH_MAX=
 ENABLE_LMCACHE=0
-export ATOM_GDN_SSM_DTYPE=fp32          # KDA recurrent state; mono requires fp32
+export ATOM_GDN_SSM_DTYPE=fp32          # KDA recurrent state: precision policy; mono requires it
 export ATOM_MONO_ENABLE=0
 export ATOM_ENABLE_REPLAYSSM=0
 export ATOM_STATE_CHECKPOINT_DEMAND=0   # anchor-only state checkpoints
@@ -104,7 +103,6 @@ case "${CONC}" in
     GRAPH_MAX=$((8 * CONC))
     ENABLE_LMCACHE=1; export LMCACHE_MAX_LOCAL_CPU_SIZE=128
     export ATOM_ENABLE_REPLAYSSM=1
-    export ATOM_GDN_SSM_DTYPE=fp16      # deviation, see below
     if [[ "${CONC}" == "16" ]]; then
       export ATOM_PREFILL_DECODE_INTERVAL=4 ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000
     fi
@@ -187,8 +185,8 @@ rm -rf /root/.cache/atom/*
 |---:|---:|---:|---:|---|---|---|---:|---:|---:|---|---|---:|
 | 1 | 1 | 7 | 3.21 | on | fp32 | off | 0 | 0 | 2 | 1–2 | interval 1000000 | 0 |
 | 4 | 1 | 7 | 3.21 | on | fp32 | off | 0 | 0 | 8 | 1–64 | off | 0 |
-| 14 | 8 | 4 | 2.92 | off | fp16 | 128 GiB | 1 | 0 | 32 | 1–112 | off | 0 |
-| 16 | 8 | 4 | 2.92 | off | fp16 | 128 GiB | 1 | 0 | 32 | 1–128 | 4 / 5000 ms | 0 |
+| 14 | 8 | 4 | 2.92 | off | fp32 | 128 GiB | 1 | 0 | 32 | 1–112 | off | 0 |
+| 16 | 8 | 4 | 2.92 | off | fp32 | 128 GiB | 1 | 0 | 32 | 1–128 | 4 / 5000 ms | 0 |
 | 48 | 8 | 4 | 2.92 | off | fp32 | 224 GiB (128) | 1 | 1 | 96 | 1–96 | 4 / 5000 ms | 0 |
 | 56 | 8 | 4 | 2.92 | off | fp32 | 224 GiB (128) | 1 | 1 | 112 | 1–112 | 4 / 5000 ms | 1 |
 | 72 | 8 | 4 | 2.92 | off | fp32 | 224 GiB (128) | 1 | 1 | 144 | 1–144 | 4 / 5000 ms | 1 |
@@ -221,12 +219,24 @@ The server log shows whether the flag took effect: `[MTP Stats]` should report
 This mode is **performance-only**. Do not pass the flag for GSM8K or any other
 correctness run.
 
+### Precision
+
+The recipe follows the InferenceX Kimi K3.1 Pro week-1 precision policy:
+
+| Component | Setting |
+|---|---|
+| Linear ops, shared experts | BF16 as shipped (no `--online_quant_config`) |
+| MoE weights / activations | MXFP4 as shipped; A4W4 (`AITER_SITUV2_A4W4=1`) |
+| MoE combine | BF16 (no `AITER_FLYDSL_STAGE2_FP8`) |
+| All-reduce | BF16 (no `AITER_QUICK_REDUCE_QUANTIZATION`) |
+| KDA state | FP32 (`ATOM_GDN_SSM_DTYPE=fp32`) on every band |
+| KV cache / DSA index cache | FP8 / FP8 |
+
 ### Deviations from InferenceX#4307
 
 | Item | #4307 | This recipe | Reason |
 |---|---|---|---|
 | Model / draft | `moonshotai/Kimi-K3`, `Inferact/Kimi-K3-DSpark` | `moonshotai/Kimi-K3.1-Pro`, `Inferact/Kimi-K3.1-Pro-DSpark-preview` | K3.1 |
-| `ATOM_GDN_SSM_DTYPE` at CONC 14/16 | fp32 | fp16 | fp32 is a mono requirement and mono is off on these bands; these are the settings the CONC 14/16 runs were made with |
 | `PYTORCH_{HIP,CUDA}_ALLOC_CONF=expandable_segments:True` on DCP8 bands | unset | set | Without it, DCP8 prefill of long contexts (several hundred thousand tokens) failed with `HSA_STATUS_ERROR_OUT_OF_RESOURCES` (free memory 0 MB) or an NCCL watchdog timeout, at CONC 14 and CONC 72. With it set, a CONC 72 run completed prefills past 700K tokens without error. |
 | `--host` | `0.0.0.0` (behind the atomesh frontend) | `127.0.0.1` | Direct ATOM serving; do not expose the port |
 
@@ -309,7 +319,7 @@ Synthetic acceptance is performance-only. For GSM8K, launch the same band
 |---|---|
 | 1, 4 | 3600-second runs with these settings (mono on, KDA state fp32), with **real** DSpark acceptance. Not yet re-run at the synthetic AL. |
 | 14, 16 | 3600-second runs with these settings, with **real** DSpark acceptance and without the 2272/6284/18432 BF16 tuned rows. Not yet re-run at the synthetic AL. |
-| 48, 56, 72 | 3600-second runs at the Kimi-K3 synthetic AL 3.36 (not the K3.1 value) with LMCache 128/192 GiB, `ATOM_STATE_CHECKPOINT_DEMAND=0`, KDA state fp16 and HERD off (the pre-#4307 settings). The #4307 settings above (224 GiB, demand checkpoints, fp32 state, HERD) are not yet validated on K3.1. |
+| 48, 56, 72 | 3600-second runs at the Kimi-K3 synthetic AL 3.36 (not the K3.1 value) with LMCache 128/192 GiB, `ATOM_STATE_CHECKPOINT_DEMAND=0`, and HERD off (the pre-#4307 settings). The #4307 settings above (224 GiB, demand checkpoints, fp32 state, HERD) are not yet validated on K3.1. |
 
 Throughput and interactivity numbers for this exact configuration will be added
 once every band has been re-run from this recipe.
