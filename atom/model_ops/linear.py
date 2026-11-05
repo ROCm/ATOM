@@ -725,11 +725,7 @@ def weight_is_stored_preshuffled(
     side backwards.
     """
     if native_group_rows is not None:
-        if (
-            mxfp8_preshuffle
-            and native_group_rows == 1
-            and params_dtype == dtypes.fp8
-        ):
+        if mxfp8_preshuffle and native_group_rows == 1 and params_dtype == dtypes.fp8:
             return True
         if native_group_rows != 32 or params_dtype != dtypes.fp8:
             return False
