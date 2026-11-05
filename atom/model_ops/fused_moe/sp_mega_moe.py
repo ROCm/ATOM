@@ -15,7 +15,7 @@ import math
 
 import torch
 
-from atom.distributed.group_agreement import group_agree, group_max
+from atom.distributed.group_agreement import group_max
 
 logger = logging.getLogger("atom")
 
@@ -90,7 +90,6 @@ def _unsupported_layer(layer):
         if (
             tuple(value.shape) != shape
             or value.element_size() != 1
-            or not value.is_contiguous()
             or (name.endswith("weight") and not getattr(value, "is_shuffled", False))
         ):
             return f"{name} has an incompatible layout"
@@ -220,8 +219,6 @@ def _unsupported_config(config):
     # Config._init_sequence_parallel refuses the rest.
     if config.eplb_enable or config.fake_eplb:
         return "needs static expert placement, without EPLB"
-    if config.torch_dtype != torch.bfloat16:
-        return "needs BF16 activations"
     return None
 
 
@@ -235,8 +232,8 @@ def _model_layers(model):
 
 
 def _plan(config, layers):
-    """`(hidden, inter, experts, top_k, activation, swiglu_limit)` when this rank
-    can run every layer through MegaMoeTP, else why not."""
+    """`(hidden, inter, experts, top_k, activation, swiglu_limit)` when MegaMoeTP
+    can run every layer, else why not."""
     reason = _unsupported_config(config)
     if reason is not None:
         return reason
@@ -257,12 +254,6 @@ def _plan(config, layers):
     }
     if len(shapes) != 1:
         return "the shared runtime needs one expert shape across layers"
-    try:
-        from aiter.ops.flydsl.mega_moe_tp import mega_moe_tp_supported
-    except ImportError as exc:
-        return f"MegaMoeTP unavailable: {exc}"
-    if not mega_moe_tp_supported():
-        return "MegaMoeTP does not support this GPU"
     return shapes.pop()
 
 
@@ -274,8 +265,7 @@ def initialize_sp_mega_moe(model, config):
     """After weight processing, before warmup/capture.
 
     Returns the shared backend, or None without `--moe-backend mega` under SP.
-    Raises on every rank when any layer, rank or setting is outside what it
-    serves.
+    Raises on every rank when any layer or setting is outside what it serves.
     """
     from aiter.dist.parallel_state import get_pcp_group
 
@@ -286,10 +276,8 @@ def initialize_sp_mega_moe(model, config):
         raise _refuse("the model has no MoE layers")
     group = get_pcp_group()
     plan = _plan(config, layers)
-    # A rank-local verdict (an import, a layout) must not split the ranks before
-    # the collective MegaMoeTP setup.
-    if not group_agree(not isinstance(plan, str), group.cpu_group):
-        raise _refuse(plan if isinstance(plan, str) else "another SP rank refused it")
+    if isinstance(plan, str):
+        raise _refuse(plan)
     hidden, inter, experts, top_k, activation, swiglu_limit = plan
     from aiter.ops.flydsl.mega_moe_tp import (
         MegaMoeSetupError,

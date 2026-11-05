@@ -51,7 +51,6 @@ def test_head_exchange_requires_usable_collective(monkeypatch, modules, supporte
     transport = modules.token_transport
     ca = SimpleNamespace(
         disabled=False,
-        should_custom_ag=lambda x: True,
         should_head_exchange=lambda x: True,
         registered_input_view=lambda shape, dtype: torch.empty(shape, dtype=dtype),
     )
@@ -67,12 +66,10 @@ def test_head_exchange_requires_usable_collective(monkeypatch, modules, supporte
     assert view(12).shape == (12, 16)
     assert view(8, torch.float8_e4m3fn).dtype == torch.float8_e4m3fn
     assert transport.head_exchange_view(None, x, 8) is None
-    assert transport.head_exchange_view(ca, x.half(), 8) is None
-    for check in ("should_custom_ag", "should_head_exchange"):
-        setattr(ca, check, lambda x: False)
-        assert view(8) is None
-        setattr(ca, check, lambda x: True)
+    ca.should_head_exchange = lambda x: False
+    assert view(8) is None
+    ca.should_head_exchange = lambda x: True
     ca.registered_input_view = lambda shape, dtype: None
     assert view(12) is None and view(8) is x
-    monkeypatch.setattr(modules.chip_info, "get_gfx_runtime", lambda: "gfx942")
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "0")
     assert transport.head_exchange_comm(group) is None

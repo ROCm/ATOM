@@ -217,7 +217,6 @@ def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024):
     mega.MegaMoeTPConfig = dict
     mega.MegaMoeTP = runtime
     mega.MegaMoeSetupError = MegaMoeSetupError
-    mega.mega_moe_tp_supported = lambda: True
     monkeypatch.setitem(sys.modules, mega.__name__, mega)
     _pcp_group(
         monkeypatch, SimpleNamespace(world_size=4, rank_in_group=0, cpu_group=None)
@@ -239,23 +238,6 @@ def test_agreed_prepare_failure_closes_the_runtime_and_raises(monkeypatch, sp_mo
         initialize()
     assert factory.call_args.args[0]["max_local_tokens"] == 256
     runtime.close.assert_called_once_with()
-
-
-def test_a_refusing_peer_fails_every_rank(monkeypatch, sp_modules):
-    runtime = Mock()
-    _, initialize = _initialize(monkeypatch, sp_modules, runtime)
-    votes = []
-
-    def peer_refuses(ok, group):
-        votes.append(ok)
-        return False
-
-    monkeypatch.setattr(fusion, "group_agree", peer_refuses)
-    with pytest.raises(RuntimeError, match="another SP rank refused it"):
-        initialize()
-    # This rank could serve it.
-    assert votes == [True]
-    runtime.assert_not_called()
 
 
 def test_epoch_count_covers_every_tile_of_the_largest_shard(monkeypatch, sp_modules):

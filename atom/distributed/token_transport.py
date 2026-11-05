@@ -20,13 +20,9 @@ HEAD_EXCHANGE_MIN_LOCAL_ROWS = 2048
 
 
 def head_exchange_comm(group):
-    """The communicator of the four-rank head exchange, if the env and GPU
-    allow it. Static: a layer decides it once, when built."""
+    """The communicator of the four-rank head exchange, unless the env opts
+    out. Static: a layer decides it once, when built."""
     if not envs.ATOM_USE_CUSTOM_ALL_GATHER:
-        return None
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    if get_gfx_runtime() != "gfx950":
         return None
     return group.device_communicator.ca_comm
 
@@ -36,15 +32,12 @@ def head_exchange_view(ca, x: torch.Tensor, rows: int, dtype=None):
     from: ``x`` itself when it fits as is, else a registered staging view.
     None when the exchange does not take it."""
     dtype = x.dtype if dtype is None else dtype
-    if ca is None or x.dtype != torch.bfloat16:
+    if ca is None:
         return None
     if (rows, dtype) == (x.shape[0], x.dtype):
         view = x
     else:
         view = ca.registered_input_view((rows, x.shape[1]), dtype)
-        if view is None:
-            return None
-    wire = view.view(torch.bfloat16)
-    if ca.should_custom_ag(wire) and ca.should_head_exchange(wire):
+    if view is not None and ca.should_head_exchange(view):
         return view
     return None
