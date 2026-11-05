@@ -68,10 +68,14 @@ class OffloadTierProfile:
 
     `loads`: a rank can load a prefix another DP rank computed from the tier
     (some configured transport, ``multi`` expanded, is an offload backend
-    whose role loads and whose tier the DP ranks share). `async_lookup`: the configured connector itself (not ``multi``)
-    answers tier lookups asynchronously, so the offload prefetch can take an
-    answer without a round trip. `min_load_tokens`: the shortest tier hit,
-    beyond the HBM prefix, that the connector loads rather than recomputes.
+    whose role loads and whose tier the DP ranks share).
+
+    `async_lookup`: the configured connector itself (not ``multi``) answers
+    tier lookups asynchronously, so the offload prefetch can take an answer
+    without a round trip.
+
+    `min_load_tokens`: the shortest tier hit, beyond the HBM prefix, that the
+    connector loads rather than recomputes.
     """
 
     loads: bool = False

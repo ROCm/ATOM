@@ -512,13 +512,19 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         gives the lookup's read locks back (`_clear_pending_load`) -- and drop
         the held answer, so the next admission asks the tier again instead of
         reusing an answer nothing pins (`_ensure_lookup_pin` trusts a held
-        answer)."""
+        answer). And forget the save floor the admission set
+        (`update_state_after_alloc`): the re-admission may find less in the
+        tier, and a floor above what it finds would leave a hole -- chunks
+        recomputed but never saved, which truncates every later match."""
         self.cancel_pending_load(seq)
         sid = str(seq.id)
         held = self._lookup_results.get(sid)
         if held is not None and held[0] is seq:
             del self._lookup_results[sid]
         self._forget_tier_hit(sid)
+        entry = self._save_tracker.get(sid)
+        if entry is not None and entry[0] is seq:
+            del self._save_tracker[sid]
 
     def _before_tier_lookup(self, sid: str) -> None:
         """Run right before this request's lookup is asked or taken; a layout
@@ -554,9 +560,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """The one lookup path: run `ask`, then hold and account the hit."""
         if not take:
             self._before_tier_lookup(sid)
-        if sid not in self._lookup_in_step:
-            # Dispatch unpins whatever a lookup took if nothing loads under it.
-            self._lookup_in_step.append(sid)
         held = self._lookup_results.get(sid)
         self._lookup_results[sid] = (seq, 0)
         _t0 = time.perf_counter()
@@ -566,14 +569,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             logger.exception("LMCache offload lookup failed for seq %s", seq.id)
             self._lookup_results.pop(sid, None)
             self._remember_tier_hit(seq, sid, None)
+            # Whatever a half-run lookup took, dispatch unpins.
+            self._track_lookup(sid)
             return None
         if take and hit is None:
-            # Not answered yet: nothing was taken.
+            # Not answered (or expired meanwhile): nothing was taken.
             if held is None:
                 self._lookup_results.pop(sid, None)
             else:
                 self._lookup_results[sid] = held
             return None
+        # Dispatch unpins what the lookup took if nothing loads under it.
+        self._track_lookup(sid)
         _us = int((time.perf_counter() - _t0) * 1e6)
         self._perf_bump("lookup_taken" if take else "lookup_n")
         self._perf_bump("lookup_us", _us)
@@ -586,6 +593,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if hit is None:
             self._perf_bump("lookup_none")
         return self._hold_tier_hit(seq, sid, hit, token_ids)
+
+    def _track_lookup(self, sid: str) -> None:
+        if sid not in self._lookup_in_step:
+            self._lookup_in_step.append(sid)
 
     def _hold_tier_hit(self, seq, sid: str, hit, token_ids) -> int | None:
         """Hold the lookup's answer for the admission and remember it."""

@@ -179,8 +179,7 @@ def get_exit_sequence():
 
 
 def resumes_offload_prefill(seq) -> bool:
-    """True when an offload load already settled, or an admission made ahead
-    of its turn is held (`offload_held_local`), and `seq` keeps its blocks.
+    """True when an offload load already settled and `seq` keeps its blocks.
 
     Such a request resumes its suffix prefill without matching the prefix
     again. Shared by the scheduler's admission and the offload connector's
@@ -190,7 +189,6 @@ def resumes_offload_prefill(seq) -> bool:
     return (
         getattr(seq, "offload_loaded", False)
         or getattr(seq, "offload_load_failed", False)
-        or getattr(seq, "offload_held_local", False)
     ) and len(seq.block_table) > 0
 
 
@@ -424,6 +422,11 @@ class Sequence:
         # garbage sampled tokens from intermediate chunks and to skip the
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
+        # True once the scheduler dispatched the last chunk of this prompt's
+        # prefill: its KV is (or is being) written whatever happens to the
+        # request next (an abort before the first token, say). Read by the DP
+        # router to tell a prefix that exists from one that never will.
+        self.prefill_dispatched = False
         # `new_block_table` is main's: an array("i") rather than a list,
         # because every forward marshals these into the int32 buffer.
         self.block_table = new_block_table()

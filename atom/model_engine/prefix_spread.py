@@ -157,6 +157,18 @@ class PrefixSpreadRouter:
             return Route(rank, "prefix_owner_total")
         return Route(rank, "prefix_moved_total", max(0, est_hit - local), local > 0)
 
+    def place(self, seq: Any, rank: int, n_ranks: int) -> None:
+        """Index a request placed on `rank` from outside (an explicit
+        `data_parallel_rank`): it is credited the part of its prefix that
+        rank already holds, and `rank` becomes a holder of the rest."""
+        chain = getattr(seq, "prompt_hash_chain", None)
+        if chain is None or not 0 <= rank < n_ranks:
+            return
+        hits, _owner, source = self._rank_hits(chain, n_ranks)
+        local = hits.get(rank, 0)
+        self._est_hit[seq.id] = local
+        self._record(chain, rank, seq.id, local, source)
+
     def _idle_target(
         self,
         owner: int,

@@ -989,7 +989,8 @@ def _woken(engine, seq):
     engine._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_loading={request.load_operation})
     )
-    assert engine._resolve_offload_load(seq) is None
+    engine._resolve_offload_load(seq)
+    assert engine._is_offload_prefill_resume(seq)
     assert seq.status == SequenceStatus.WAITING and seq.replays_hit
     assert seq.num_cached_tokens == 32
 

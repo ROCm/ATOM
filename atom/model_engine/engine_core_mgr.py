@@ -806,7 +806,7 @@ class CoreManager:
                             # sequence's prompt prefill has completed. Keep the
                             # request count charged for decode pressure, but
                             # stop advertising its prompt as queued prefill.
-                            if self._completes_prefill(request_output):
+                            if request_output.prefill_complete:
                                 self._mark_seq_prefill_complete(seq_id)
                             callback = self._seq_id_to_callback.get(seq_id)
                             if dbg:
@@ -869,7 +869,7 @@ class CoreManager:
                         delivered = False
                         for seq in seqs:
                             delivered |= self._deliver_terminal_output(seq)
-                            self._release_seq_load(seq.id)
+                            self._release_terminal_seq(seq)
                         if delivered and self._flush_stream_batch_fn is not None:
                             # The callbacks above only buffer into a thread-local;
                             # without this flush the chunk never reaches the
@@ -1423,9 +1423,7 @@ class CoreManager:
                 # element-wise, so tokens only decide among request-count ties.
                 score = (self._rank_reqs[r], self._rank_tokens[r])
             else:  # "least_tokens"
-                score = (
-                    self._rank_tokens[r] + self._dp_lb_req_equiv * self._rank_reqs[r]
-                )
+                score = self._rank_load(r)
             if best_score is None or score < best_score:
                 best_score = score
                 best_rank = r
@@ -1519,6 +1517,12 @@ class CoreManager:
                         # The new rank cannot be assumed to own the old prefix.
                         self._dp_session_prompt_tokens.pop(session_id, None)
                     self._dp_session_owners[session_id] = explicit_rank
+            if self._prefix_router is not None:
+                # Its prefix lands there all the same: index it, so a later
+                # request with that prefix finds its owner.
+                self._prefix_router.place(
+                    seq, explicit_rank, self._routable_engine_count
+                )
             return self._record_dp_route_locked("explicit_total", explicit_rank)
 
         session_id = getattr(seq, "dp_session_id", None)
@@ -1670,12 +1674,14 @@ class CoreManager:
         self._rank_reqs[dp_rank] -= req_cost
         self._rank_tokens[dp_rank] -= tok_cost
 
-    @staticmethod
-    def _completes_prefill(request_output) -> bool:
-        """Whether a STREAM output shows its request's prefill completed. A
-        finished output with no tokens does not (a structured-output error
-        mid-prefill, say): its release takes the unprefilled path."""
-        return not request_output.finished or bool(request_output.output_tokens)
+    def _release_terminal_seq(self, seq) -> None:
+        """Release a finished sequence the engine handed back. One whose
+        prefill was dispatched to the end (an abort before its first token,
+        say) leaves its prefix behind: it completed that prefill, as a first
+        token would have shown."""
+        if getattr(seq, "prefill_dispatched", False):
+            self._mark_seq_prefill_complete(seq.id)
+        self._release_seq_load(seq.id)
 
     def _mark_seq_prefill_complete(self, seq_id) -> None:
         """Release only a sequence's prefill-token charge, once."""
