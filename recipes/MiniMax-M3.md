@@ -12,6 +12,22 @@ Pull the latest development image:
 docker pull rocm/atom-dev:latest
 ```
 
+## MiniMax-M3.1 Native MXFP8 1x32 Preshuffle (Optional)
+
+The Quark MiniMax-M3.1-Flash checkpoint stores the attention and shared-expert
+linears as native MXFP8: FP8 E4M3 weights with E8M0 scales over 1x32 K blocks.
+ATOM's default path remains the native group32 Triton GEMM. On gfx950, the
+following opt-in flag preshuffles the FP8 weights and routes eligible BF16
+linears through AITER's MXFP8 preshuffle backend:
+
+```bash
+export ATOM_MXFP8_LINEAR_BPRESHUFFLE=1
+```
+
+The opt-in path requires AITER's M3.1 `a8w8_blockscale_mxscale_bpreshuffle`
+model-config table and supports the validated TP4 shapes (`N % 16 == 0`,
+`K % 128 == 0`). Leave the flag unset to keep the default group32 path.
+
 ## MXFP4 on 4xMI355 GPUs
 
 ### Launching Server
