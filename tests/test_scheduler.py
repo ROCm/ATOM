@@ -723,9 +723,9 @@ class TestSchedule:
         assert list(batch.num_scheduled_tokens) == [128, 64]
         assert batch.total_tokens_num_prefill == 192
 
-    def test_prefill_dispatched_is_set_with_the_last_chunk(self, seq_factory):
+    def test_prefill_completed_is_set_with_the_last_chunk(self, seq_factory):
         """The DP router reads it to tell a prefix that exists (the last chunk
-        was dispatched, whatever becomes of the request) from one that never
+        has completed its forward) from one that never
         will."""
         sched = Scheduler(
             MockConfig(
@@ -737,11 +737,11 @@ class TestSchedule:
         )
         seq = seq_factory(list(range(10)))
         sched.add(seq)
-        assert seq.prefill_dispatched is False
+        assert seq.prefill_completed is False
 
         batch1, _ = sched.schedule()
         assert batch1.total_tokens_num_prefill == 6
-        assert seq.prefill_dispatched is False  # a middle chunk
+        assert seq.prefill_completed is False  # a middle chunk
         sched.postprocess(
             list(sched.running),
             ScheduledBatchOutput(
@@ -753,14 +753,26 @@ class TestSchedule:
             ),
             batch=batch1,
         )
-        sched.schedule()  # the last chunk
-        assert seq.prefill_dispatched is True
+        batch2, _ = sched.schedule()  # dispatch alone is not completion
+        assert seq.prefill_completed is False
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch2,
+        )
+        assert seq.prefill_completed is True
 
         # A preempted request prefills again: the flag describes that one.
         sched.running.remove(seq) if seq in sched.running else None
         sched.running.append(seq)
         assert sched.preempt(seq)
-        assert seq.prefill_dispatched is False
+        assert seq.prefill_completed is False
 
     def test_chunked_prefill_splits_prompt_across_steps(self, seq_factory):
         sched = Scheduler(
@@ -3427,3 +3439,37 @@ def test_scheduled_batch_logprob_gate(enabled):
     assert batch.any_logprobs is enabled
     assert batch.logprob_requested == ((1,) if enabled else ())
     assert batch.top_logprobs == ([0, 5] if enabled else None)
+
+
+@pytest.mark.parametrize("pp", [False, True])
+@pytest.mark.parametrize("final_chunk", [False, True])
+def test_abort_after_forward_keeps_actual_prefill_completion(
+    seq_factory, pp, final_chunk
+):
+    sched = Scheduler(
+        MockConfig(
+            enable_prefix_caching=True,
+            num_kvcache_blocks=40,
+            max_num_batched_tokens=8 if final_chunk else 4,
+        )
+    )
+    sched.advance_on_schedule = pp
+    seq = seq_factory(list(range(8)), sampling_params=SamplingParams(max_tokens=16))
+    sched.add(seq)
+    batch, _ = sched.schedule()
+    assert not seq.prefill_completed  # even PP schedule-time advancement is not proof
+    seq.status = SequenceStatus.ABORTED
+    finished = sched.postprocess(
+        list(sched.running),
+        ScheduledBatchOutput(
+            req_ids=[],
+            token_ids=[],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            is_deferred_out=True,
+        ),
+        batch=batch,
+    )
+    assert seq in finished
+    assert seq.prefill_completed == final_chunk

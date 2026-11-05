@@ -186,8 +186,8 @@ class OffloadPrefetch:
             # REQUEUE (a disown it could not back): hold nothing for a request
             # that prefills in its turn.
             if outcome is Admit.LOCAL:
-                s.block_manager.deallocate(seq)
                 s._cancel_preadmission(seq)
+                s.block_manager.deallocate(seq)
             seq.prefix_cache_hit_tokens = prev_hit
             self.skip_until[seq.id] = math.inf
         if parked:
