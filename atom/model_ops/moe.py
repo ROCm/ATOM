@@ -2082,10 +2082,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         """The base routing over the layer's logical experts, its prefilled
         shared column widened in where the legacy layout fuses one."""
         from atom.model_ops.fused_moe.fused_topk_dispatch import try_fused_topk
+        from atom.model_ops.fused_moe.fused_topk_route_quant import (
+            try_defer_topk_route_quant,
+        )
 
         fused = try_fused_topk(self, layer, router_logits)
         if fused is not None:
             return fused
+        deferred = try_defer_topk_route_quant(self, layer, x, router_logits)
+        if deferred is not None:
+            return deferred
         layout = layer.expert_layout
         return _select_logical(
             layer,
@@ -4246,6 +4252,12 @@ class FusedMoE(torch.nn.Module):
             self.quant_method = _make_mxfp4_moe_method(
                 online_quant_config, self.moe_config
             )
+            # A model that pads its natively quantized experts to `pad_align`
+            # can ask the same of experts quantized here (`online_quant_pad_align`,
+            # set by the model): the fresh method otherwise pads to its default.
+            online_pad_align = getattr(self, "online_quant_pad_align", None)
+            if online_pad_align is not None:
+                self.quant_method.pad_align = online_pad_align
         else:
             raise ValueError(
                 f"Unsupported online quant_dtype for MoE: {online_quant_dtype}"
