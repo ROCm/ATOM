@@ -155,6 +155,26 @@ class _AtomMetricsCollector:
             yield metric
 
         dp_router = snapshot.get("dp_router", {})
+        for key, documentation in (
+            ("prefix_owner_total", "Requests retained on their known prefix owner."),
+            (
+                "prefix_moved_total",
+                "Requests placed away from their known prefix owner.",
+            ),
+            ("prefix_cold_total", "Requests placed without a known prefix owner."),
+            (
+                "prefix_source_busy_total",
+                "Requests whose prefix source is still active.",
+            ),
+            (
+                "prefix_moved_tokens",
+                "Estimated prefix tokens on requests moved from their owner.",
+            ),
+        ):
+            name = "atom:dp_" + key.removesuffix("_total")
+            metric = CounterMetricFamily(name, documentation)
+            metric.add_metric([], float(dp_router.get(key, 0)))
+            yield metric
         for name, documentation, value in (
             (
                 "atom:dp_affinity_new",
