@@ -2617,3 +2617,880 @@ models:
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
             decode: *m31_flash_pp4_direct_decode_env
+
+  # Issue #382: experiment-only cells. A1/A2 measured the inference code of
+  # 1fb68bb34; A3 adds the free-KV watermark of ROCm/ATOM#2941 e90db5ac2.
+  # A7 needs the staging slot-fit fix (6ab0261b8) that e90db5ac2 lacks.
+  MiniMax-M3.1-Issue382-Round1:
+    backend: atom
+    image: rocm/atom-dev:m31-mxfp4-stack-20261031
+    model_path: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+    precision: MXFP4
+    env:
+      common:
+        ATOMESH_M31_AITER_REF: 1053d8d18e297543efda93f99375b2d51e9740f3
+        AITER_LOG_LEVEL: WARNING
+        ATOM_M3_SPARSE_KV_MXFP4: '1'
+        ATOM_M3_SPARSE_KV_NVFP4: '0'
+        ATOM_M3_INDEX_Q_FP8: '1'
+        ATOM_M3_FUSED_VERIFY_TOPK: '0'
+        ATOM_M3_DSPARK_DRAFT_PTPC: '0'
+        ATOM_MONO_ENABLE: '0'
+        ATOM_M3_INDEXER_CP: '0'
+        ATOM_DSPARK_DRAFT_KV_WINDOW: '0'
+        ATOM_PD_MHA_LANDING: '0'
+        ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4: '1'
+        MC_DISABLE_HIP: '1'
+        MC_NUM_QP_PER_EP: '1'
+        HF_HUB_CACHE: /tmp/issue382-hf-hub
+        HF_HUB_DOWNLOAD_TIMEOUT: '120'
+    server:
+      common_args:
+        served_model_name: MiniMaxAI/MiniMax-M3.1-Flash
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 128
+        enable_prefix_caching: true
+        gpu_memory_utilization: 0.9
+        max_model_len: 262144
+        max_num_seqs: 64
+        max_num_batched_tokens: 32768
+        online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","vision_tower","multi_modal_projector","patch_merge_mlp","*block_sparse_moe"]}'
+        method: dspark
+        draft_model: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c/dspark
+        num_speculative_tokens: 7
+        hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+        extra_args: --index-cache-dtype mxfp4
+    service:
+      prefill:
+        cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64]'
+      decode:
+        cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64]'
+    suites:
+      accuracy:
+      - name: issue382-a1-correctness64
+        topology: 1p1d
+        display_topology: 1P1D-CPP4-TP4-MXFP4-ISSUE382-A1
+        pd_worker_layout: single_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 16
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192
+        decode:
+          workers: 1
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 280
+            spec_decode_acceptance_length: ''
+        env:
+          common:
+            ATOMESH_M31_AITER_REF: ''
+            PYTHONNOUSERSITE: '1'
+            PYTHONHASHSEED: '0'
+            ATOMESH_TORCH_PROFILE_DURATION: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_ISSUE382_METRICS: '1'
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
+          prefill:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            MOONCAKE_STORE: '1'
+            MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+            MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
+            OFFLOAD_PROFILE: '1'
+            OFFLOAD_MIN_LOAD_TOKENS: '0'
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":false}'
+          decode:
+            HIP_VISIBLE_DEVICES: 4,5,6,7
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_requests":4,"max_pending_kv_fraction":null}}'
+        benchmark:
+          kind: random
+          agentx_harness_version: 1.0.12
+          agentx_recipe_defaults: true
+          scenario: agentx
+          max_context_length: 1048576
+          public_dataset: semianalysis_cc_traces_weka_062126
+          benchmark_duration: 3600
+          http_tcp_user_timeout: 900000
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        run_eval: true
+        runner:
+          exclude_nodes: pit2-p03-g08
+          time_limit: 02:00:00
+        eval_concurrency:
+        - 16
+        eval_limit: 64
+        eval_only: true
+        accuracy:
+          batch_size: 16
+          threshold: 0.9
+      - name: issue382-a2-correctness64
+        topology: 1p1d
+        display_topology: 1P1D-CPP4-TP4-MXFP4-ISSUE382-A2
+        pd_worker_layout: single_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 16
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192
+        decode:
+          workers: 1
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 280
+            spec_decode_acceptance_length: ''
+        env:
+          common:
+            ATOMESH_M31_AITER_REF: ''
+            PYTHONNOUSERSITE: '1'
+            PYTHONHASHSEED: '0'
+            ATOMESH_TORCH_PROFILE_DURATION: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_ISSUE382_METRICS: '1'
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
+          prefill:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            MOONCAKE_STORE: '1'
+            MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+            MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
+            OFFLOAD_PROFILE: '1'
+            OFFLOAD_MIN_LOAD_TOKENS: '0'
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":false}'
+          decode:
+            HIP_VISIBLE_DEVICES: 4,5,6,7
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_requests":4,"max_pending_kv_fraction":0.15}}'
+        benchmark:
+          kind: random
+          agentx_harness_version: 1.0.12
+          agentx_recipe_defaults: true
+          scenario: agentx
+          max_context_length: 1048576
+          public_dataset: semianalysis_cc_traces_weka_062126
+          benchmark_duration: 3600
+          http_tcp_user_timeout: 900000
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        run_eval: true
+        runner:
+          exclude_nodes: pit2-p03-g08
+          time_limit: 02:00:00
+        eval_concurrency:
+        - 16
+        eval_limit: 64
+        eval_only: true
+        accuracy:
+          batch_size: 16
+          threshold: 0.9
+      - name: issue382-a3-correctness64
+        topology: 1p1d
+        display_topology: 1P1D-CPP4-TP4-MXFP4-ISSUE382-A3
+        pd_worker_layout: single_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 16
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192
+        decode:
+          workers: 1
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 280
+            spec_decode_acceptance_length: ''
+        env:
+          common:
+            ATOMESH_M31_AITER_REF: ''
+            PYTHONNOUSERSITE: '1'
+            PYTHONHASHSEED: '0'
+            ATOMESH_TORCH_PROFILE_DURATION: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_ISSUE382_METRICS: '1'
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
+          prefill:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            MOONCAKE_STORE: '1'
+            MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+            MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
+            OFFLOAD_PROFILE: '1'
+            OFFLOAD_MIN_LOAD_TOKENS: '0'
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":false}'
+          decode:
+            HIP_VISIBLE_DEVICES: 4,5,6,7
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_requests":null,"max_pending_kv_fraction":0.15,"min_free_kv_fraction":0.1}}'
+        benchmark:
+          kind: random
+          agentx_harness_version: 1.0.12
+          agentx_recipe_defaults: true
+          scenario: agentx
+          max_context_length: 1048576
+          public_dataset: semianalysis_cc_traces_weka_062126
+          benchmark_duration: 3600
+          http_tcp_user_timeout: 900000
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        run_eval: true
+        runner:
+          # These nodes deny the privileged host cache drop (spur-authz).
+          exclude_nodes: pit2-p03-g08,pit2-p03-g12,pit2-p03-g23,pit2-p03-g25
+          time_limit: 02:00:00
+        eval_concurrency:
+        - 16
+        eval_limit: 64
+        eval_only: true
+        accuracy:
+          batch_size: 16
+          threshold: 0.9
+      # A4 = A3 + chunked P->D transfer (P waits up to 900 s for D's reservation).
+      - name: issue382-a4-correctness64
+        topology: 1p1d
+        display_topology: 1P1D-CPP4-TP4-MXFP4-ISSUE382-A4
+        pd_worker_layout: single_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 16
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192
+        decode:
+          workers: 1
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 280
+            spec_decode_acceptance_length: ''
+        env:
+          common:
+            ATOMESH_M31_AITER_REF: ''
+            PYTHONNOUSERSITE: '1'
+            PYTHONHASHSEED: '0'
+            ATOMESH_TORCH_PROFILE_DURATION: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_ISSUE382_METRICS: '1'
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
+          prefill:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            MOONCAKE_STORE: '1'
+            MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+            MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
+            OFFLOAD_PROFILE: '1'
+            OFFLOAD_MIN_LOAD_TOKENS: '0'
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true,"chunked_admission_timeout_s":900}'
+          decode:
+            HIP_VISIBLE_DEVICES: 4,5,6,7
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_requests":null,"max_pending_kv_fraction":0.15,"min_free_kv_fraction":0.1}}'
+        benchmark:
+          kind: random
+          agentx_harness_version: 1.0.12
+          agentx_recipe_defaults: true
+          scenario: agentx
+          max_context_length: 1048576
+          public_dataset: semianalysis_cc_traces_weka_062126
+          benchmark_duration: 3600
+          http_tcp_user_timeout: 900000
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        run_eval: true
+        runner:
+          # These nodes deny the privileged host cache drop (spur-authz).
+          exclude_nodes: pit2-p03-g08,pit2-p03-g10,pit2-p03-g12,pit2-p03-g23,pit2-p03-g25
+          time_limit: 02:00:00
+        eval_concurrency:
+        - 16
+        eval_limit: 64
+        eval_only: true
+        accuracy:
+          batch_size: 16
+          threshold: 0.9
+      mooncake_store:
+      - name: issue382-a1-c140
+        topology: 1p1d
+        display_topology: 1P1D-CPP4-TP4-MXFP4-ISSUE382-A1
+        pd_worker_layout: single_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 140
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192
+        decode:
+          workers: 1
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 280
+            spec_decode_acceptance_length: 4.04
+        env:
+          common:
+            ATOMESH_M31_AITER_REF: ''
+            PYTHONNOUSERSITE: '1'
+            PYTHONHASHSEED: '0'
+            ATOMESH_TORCH_PROFILE_DURATION: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_ISSUE382_METRICS: '1'
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
+          prefill:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            MOONCAKE_STORE: '1'
+            MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+            MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
+            OFFLOAD_PROFILE: '1'
+            OFFLOAD_MIN_LOAD_TOKENS: '0'
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":false}'
+          decode:
+            HIP_VISIBLE_DEVICES: 4,5,6,7
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_requests":4,"max_pending_kv_fraction":null}}'
+        benchmark:
+          kind: aiperf_agentic
+          agentx_harness_version: 1.0.12
+          agentx_recipe_defaults: true
+          scenario: agentx
+          max_context_length: 1048576
+          public_dataset: semianalysis_cc_traces_weka_062126
+          benchmark_duration: 3600
+          http_tcp_user_timeout: 900000
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        run_eval: false
+        runner:
+          exclude_nodes: pit2-p03-g08
+          time_limit: 04:00:00
+      - name: issue382-a2-c140
+        topology: 1p1d
+        display_topology: 1P1D-CPP4-TP4-MXFP4-ISSUE382-A2
+        pd_worker_layout: single_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 140
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192
+        decode:
+          workers: 1
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 280
+            spec_decode_acceptance_length: 4.04
+        env:
+          common:
+            ATOMESH_M31_AITER_REF: ''
+            PYTHONNOUSERSITE: '1'
+            PYTHONHASHSEED: '0'
+            ATOMESH_TORCH_PROFILE_DURATION: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_ISSUE382_METRICS: '1'
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
+          prefill:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            MOONCAKE_STORE: '1'
+            MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+            MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
+            OFFLOAD_PROFILE: '1'
+            OFFLOAD_MIN_LOAD_TOKENS: '0'
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":false}'
+          decode:
+            HIP_VISIBLE_DEVICES: 4,5,6,7
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_requests":4,"max_pending_kv_fraction":0.15}}'
+        benchmark:
+          kind: aiperf_agentic
+          agentx_harness_version: 1.0.12
+          agentx_recipe_defaults: true
+          scenario: agentx
+          max_context_length: 1048576
+          public_dataset: semianalysis_cc_traces_weka_062126
+          benchmark_duration: 3600
+          http_tcp_user_timeout: 900000
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        run_eval: false
+        runner:
+          exclude_nodes: pit2-p03-g08
+          time_limit: 04:00:00
+      - name: issue382-a3-c140
+        topology: 1p1d
+        display_topology: 1P1D-CPP4-TP4-MXFP4-ISSUE382-A3
+        pd_worker_layout: single_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 140
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192
+        decode:
+          workers: 1
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 280
+            spec_decode_acceptance_length: 4.04
+        env:
+          common:
+            ATOMESH_M31_AITER_REF: ''
+            PYTHONNOUSERSITE: '1'
+            PYTHONHASHSEED: '0'
+            ATOMESH_TORCH_PROFILE_DURATION: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_ISSUE382_METRICS: '1'
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
+          prefill:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            MOONCAKE_STORE: '1'
+            MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+            MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
+            OFFLOAD_PROFILE: '1'
+            OFFLOAD_MIN_LOAD_TOKENS: '0'
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":false}'
+          decode:
+            HIP_VISIBLE_DEVICES: 4,5,6,7
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_requests":null,"max_pending_kv_fraction":0.15,"min_free_kv_fraction":0.1}}'
+        benchmark:
+          kind: aiperf_agentic
+          agentx_harness_version: 1.0.12
+          agentx_recipe_defaults: true
+          scenario: agentx
+          max_context_length: 1048576
+          public_dataset: semianalysis_cc_traces_weka_062126
+          benchmark_duration: 3600
+          http_tcp_user_timeout: 900000
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        run_eval: false
+        runner:
+          # These nodes deny the privileged host cache drop (spur-authz).
+          exclude_nodes: pit2-p03-g08,pit2-p03-g12,pit2-p03-g23,pit2-p03-g25
+          time_limit: 04:00:00
+      # Single-factor arms around A3 at the same commit: A0 turns admission
+      # off, A4 adds chunked transfer, A5 = A4 with W 30%, A6 = A3 with W 30%.
+      - name: issue382-a0-c140
+        topology: 1p1d
+        display_topology: 1P1D-CPP4-TP4-MXFP4-ISSUE382-A0
+        pd_worker_layout: single_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 140
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192
+        decode:
+          workers: 1
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 280
+            spec_decode_acceptance_length: 4.04
+        env:
+          common:
+            ATOMESH_M31_AITER_REF: ''
+            PYTHONNOUSERSITE: '1'
+            PYTHONHASHSEED: '0'
+            ATOMESH_TORCH_PROFILE_DURATION: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_ISSUE382_METRICS: '1'
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
+          prefill:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            MOONCAKE_STORE: '1'
+            MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+            MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
+            OFFLOAD_PROFILE: '1'
+            OFFLOAD_MIN_LOAD_TOKENS: '0'
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":false}'
+          decode:
+            HIP_VISIBLE_DEVICES: 4,5,6,7
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":false}}'
+        benchmark:
+          kind: aiperf_agentic
+          agentx_harness_version: 1.0.12
+          agentx_recipe_defaults: true
+          scenario: agentx
+          max_context_length: 1048576
+          public_dataset: semianalysis_cc_traces_weka_062126
+          benchmark_duration: 3600
+          http_tcp_user_timeout: 900000
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        run_eval: false
+        runner:
+          # These nodes deny the privileged host cache drop (spur-authz).
+          exclude_nodes: pit2-p03-g08,pit2-p03-g10,pit2-p03-g12,pit2-p03-g23,pit2-p03-g25
+          time_limit: 04:00:00
+      - name: issue382-a4-c140
+        topology: 1p1d
+        display_topology: 1P1D-CPP4-TP4-MXFP4-ISSUE382-A4
+        pd_worker_layout: single_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 140
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192
+        decode:
+          workers: 1
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 280
+            spec_decode_acceptance_length: 4.04
+        env:
+          common:
+            ATOMESH_M31_AITER_REF: ''
+            PYTHONNOUSERSITE: '1'
+            PYTHONHASHSEED: '0'
+            ATOMESH_TORCH_PROFILE_DURATION: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_ISSUE382_METRICS: '1'
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
+          prefill:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            MOONCAKE_STORE: '1'
+            MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+            MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
+            OFFLOAD_PROFILE: '1'
+            OFFLOAD_MIN_LOAD_TOKENS: '0'
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true,"chunked_admission_timeout_s":900}'
+          decode:
+            HIP_VISIBLE_DEVICES: 4,5,6,7
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_requests":null,"max_pending_kv_fraction":0.15,"min_free_kv_fraction":0.1}}'
+        benchmark:
+          kind: aiperf_agentic
+          agentx_harness_version: 1.0.12
+          agentx_recipe_defaults: true
+          scenario: agentx
+          max_context_length: 1048576
+          public_dataset: semianalysis_cc_traces_weka_062126
+          benchmark_duration: 3600
+          http_tcp_user_timeout: 900000
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        run_eval: false
+        runner:
+          # These nodes deny the privileged host cache drop (spur-authz).
+          exclude_nodes: pit2-p03-g08,pit2-p03-g10,pit2-p03-g12,pit2-p03-g23,pit2-p03-g25
+          time_limit: 04:00:00
+      - name: issue382-a5-c140
+        topology: 1p1d
+        display_topology: 1P1D-CPP4-TP4-MXFP4-ISSUE382-A5
+        pd_worker_layout: single_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 140
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192
+        decode:
+          workers: 1
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 280
+            spec_decode_acceptance_length: 4.04
+        env:
+          common:
+            ATOMESH_M31_AITER_REF: ''
+            PYTHONNOUSERSITE: '1'
+            PYTHONHASHSEED: '0'
+            ATOMESH_TORCH_PROFILE_DURATION: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_ISSUE382_METRICS: '1'
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
+          prefill:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            MOONCAKE_STORE: '1'
+            MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+            MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
+            OFFLOAD_PROFILE: '1'
+            OFFLOAD_MIN_LOAD_TOKENS: '0'
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true,"chunked_admission_timeout_s":900}'
+          decode:
+            HIP_VISIBLE_DEVICES: 4,5,6,7
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_requests":null,"max_pending_kv_fraction":0.3,"min_free_kv_fraction":0.1}}'
+        benchmark:
+          kind: aiperf_agentic
+          agentx_harness_version: 1.0.12
+          agentx_recipe_defaults: true
+          scenario: agentx
+          max_context_length: 1048576
+          public_dataset: semianalysis_cc_traces_weka_062126
+          benchmark_duration: 3600
+          http_tcp_user_timeout: 900000
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        run_eval: false
+        runner:
+          # These nodes deny the privileged host cache drop (spur-authz).
+          exclude_nodes: pit2-p03-g08,pit2-p03-g10,pit2-p03-g12,pit2-p03-g23,pit2-p03-g25
+          time_limit: 04:00:00
+      - name: issue382-a6-c140
+        topology: 1p1d
+        display_topology: 1P1D-CPP4-TP4-MXFP4-ISSUE382-A6
+        pd_worker_layout: single_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 140
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192
+        decode:
+          workers: 1
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 280
+            spec_decode_acceptance_length: 4.04
+        env:
+          common:
+            ATOMESH_M31_AITER_REF: ''
+            PYTHONNOUSERSITE: '1'
+            PYTHONHASHSEED: '0'
+            ATOMESH_TORCH_PROFILE_DURATION: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_ISSUE382_METRICS: '1'
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
+          prefill:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            MOONCAKE_STORE: '1'
+            MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+            MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
+            OFFLOAD_PROFILE: '1'
+            OFFLOAD_MIN_LOAD_TOKENS: '0'
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":false}'
+          decode:
+            HIP_VISIBLE_DEVICES: 4,5,6,7
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_requests":null,"max_pending_kv_fraction":0.3,"min_free_kv_fraction":0.1}}'
+        benchmark:
+          kind: aiperf_agentic
+          agentx_harness_version: 1.0.12
+          agentx_recipe_defaults: true
+          scenario: agentx
+          max_context_length: 1048576
+          public_dataset: semianalysis_cc_traces_weka_062126
+          benchmark_duration: 3600
+          http_tcp_user_timeout: 900000
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        run_eval: false
+        runner:
+          # These nodes deny the privileged host cache drop (spur-authz).
+          exclude_nodes: pit2-p03-g08,pit2-p03-g10,pit2-p03-g12,pit2-p03-g23,pit2-p03-g25
+          time_limit: 04:00:00
+      - name: issue382-a7-c140
+        topology: 1p1d
+        display_topology: 1P1D-CPP4-TP4-MXFP4-ISSUE382-A7
+        pd_worker_layout: single_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 140
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192
+        decode:
+          workers: 1
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 280
+            spec_decode_acceptance_length: 4.04
+        env:
+          common:
+            ATOMESH_M31_AITER_REF: ''
+            PYTHONNOUSERSITE: '1'
+            PYTHONHASHSEED: '0'
+            ATOMESH_TORCH_PROFILE_DURATION: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_ISSUE382_METRICS: '1'
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
+            # P gathers PAGEs into staging slots; D lands them and scatters.
+            ATOM_PD_MHA_LANDING: '1'
+          prefill:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            MOONCAKE_STORE: '1'
+            MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+            MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
+            OFFLOAD_PROFILE: '1'
+            OFFLOAD_MIN_LOAD_TOKENS: '0'
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true,"chunked_admission_timeout_s":900}'
+          decode:
+            HIP_VISIBLE_DEVICES: 4,5,6,7
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_requests":null,"max_pending_kv_fraction":0.15,"min_free_kv_fraction":0.1}}'
+        benchmark:
+          kind: aiperf_agentic
+          agentx_harness_version: 1.0.12
+          agentx_recipe_defaults: true
+          scenario: agentx
+          max_context_length: 1048576
+          public_dataset: semianalysis_cc_traces_weka_062126
+          benchmark_duration: 3600
+          http_tcp_user_timeout: 900000
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        run_eval: false
+        runner:
+          # These nodes deny the privileged host cache drop (spur-authz).
+          exclude_nodes: pit2-p03-g08,pit2-p03-g10,pit2-p03-g12,pit2-p03-g23,pit2-p03-g25
+          time_limit: 04:00:00
+      - name: issue382-a8-c140
+        topology: 1p1d
+        display_topology: 1P1D-CPP4-TP4-MXFP4-ISSUE382-A8
+        pd_worker_layout: single_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 140
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192
+        decode:
+          workers: 1
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 280
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
+        env:
+          common:
+            ATOMESH_M31_AITER_REF: ''
+            PYTHONNOUSERSITE: '1'
+            PYTHONHASHSEED: '0'
+            ATOMESH_TORCH_PROFILE_DURATION: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_ISSUE382_METRICS: '1'
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
+            # P gathers PAGEs into staging slots; D lands them and scatters.
+            ATOM_PD_MHA_LANDING: '1'
+          prefill:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            # Every stage starts on a top-k computing layer (16/32/48), and the
+            # last stage, which also holds the DSpark draft, gets the fewest.
+            VLLM_PP_LAYER_PARTITION: '16,16,16,12'
+            MOONCAKE_STORE: '1'
+            MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
+            MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
+            OFFLOAD_PROFILE: '1'
+            OFFLOAD_MIN_LOAD_TOKENS: '0'
+            PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true,"chunked_admission_timeout_s":900}'
+          decode:
+            HIP_VISIBLE_DEVICES: 4,5,6,7
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_requests":null,"max_pending_kv_fraction":0.15,"min_free_kv_fraction":0.1}}'
+        benchmark:
+          kind: aiperf_agentic
+          agentx_harness_version: 1.0.12
+          agentx_recipe_defaults: true
+          scenario: agentx
+          max_context_length: 1048576
+          public_dataset: semianalysis_cc_traces_weka_062126
+          benchmark_duration: 3600
+          http_tcp_user_timeout: 900000
+          wait_server_timeout: 7200
+          wait_router_timeout: 600
+        run_eval: false
+        runner:
+          # These nodes deny the privileged host cache drop (spur-authz).
+          exclude_nodes: pit2-p03-g08,pit2-p03-g10,pit2-p03-g12,pit2-p03-g23,pit2-p03-g25
+          time_limit: 04:00:00
+    accuracy:
+      task: gsm8k
+      fewshot: 20
+      limit: null
+      model_type: local-chat-completions
+      endpoint: chat/completions
+      max_gen_toks: 16384
+      apply_chat_template: true
+      fewshot_as_multiturn: true
+      threshold: 0.94

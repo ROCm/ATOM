@@ -8,7 +8,7 @@ enabled="${ATOMESH_ENV_ATOMESH_DROP_HOST_CACHES:-${ATOMESH_DROP_HOST_CACHES:-0}}
 [[ "${enabled}" == "1" ]] || exit 0
 image="$1"
 container="${2}-host-cache-drop"
-cleanup_timeout="${ATOMESH_HOST_CACHE_DROP_TIMEOUT:-180}"
+cleanup_timeout="${ATOMESH_ENV_ATOMESH_HOST_CACHE_DROP_TIMEOUT:-${ATOMESH_HOST_CACHE_DROP_TIMEOUT:-180}}"
 if [[ ! "${cleanup_timeout}" =~ ^[1-9][0-9]*$ ]]; then
   echo "[host-memory][FAIL] ATOMESH_HOST_CACHE_DROP_TIMEOUT must be a positive integer" >&2
   exit 2
