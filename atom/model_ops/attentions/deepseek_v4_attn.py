@@ -3645,6 +3645,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         ub_dec = src.decode_attn_metadata
 
+        # Prefill/mixed TBO uses local request rows; only its MoE token height
+        # is DP-padded. Drafting happens after UBatchWrapper restores the parent
+        # context, whose carrier retains the full DP-padded request width.
         return _mixed_carrier(
             ub_pref,
             ub_dec,
