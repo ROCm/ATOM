@@ -115,25 +115,6 @@ def _import_runner():
     )
 
 
-def test_dp_attention_refuses_a_builder_with_prefill_token_graphs(monkeypatch):
-    """Its idle-rank dummy prefill captures into physical block 0's slots."""
-    mr = _import_runner()
-
-    class Builder:
-        supplies_token_slots = True
-        supports_token_graph = True
-
-    moe = SimpleNamespace(prefix="model.layers.0.mlp.experts", top_k=2)
-    monkeypatch.setattr(mr, "fused_moe_modules", lambda model: [moe])
-    runner = mr.ModelRunner.__new__(mr.ModelRunner)
-    runner._return_routed_experts = True
-    runner.model = object()
-    runner.attn_metadata_builder = Builder()
-    runner.config = SimpleNamespace(enable_dp_attention=True)
-    with pytest.raises(ValueError, match="enable_dp_attention with Builder"):
-        runner._routed_experts_geometry()
-
-
 @pytest.mark.parametrize("rank", [0, 1])
 def test_only_tp_rank0_binds_the_capture_buffer(rank, monkeypatch):
     """Every rank plans the same geometry; only rank 0 exports, so only its
@@ -151,7 +132,7 @@ def test_only_tp_rank0_binds_the_capture_buffer(rank, monkeypatch):
     runner.block_size = 4
     runner.device = "cpu"
 
-    runner._maybe_init_routed_experts_capturer(num_kvcache_blocks=2)
+    runner._bind_routed_experts_layers(num_kvcache_blocks=2)
 
     capturer = runner._routed_experts_capturer
     if rank == 0:

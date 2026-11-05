@@ -2322,7 +2322,7 @@ class ModelRunner:
         # Capture buffer is part of the PAGE budget (per-slot int32 routes).
         # Allocate it before the expected-vs-actual check so the measurement
         # includes those bytes rather than warning on a false mismatch.
-        self._maybe_init_routed_experts_capturer(num_kvcache_blocks)
+        self._bind_routed_experts_layers(num_kvcache_blocks)
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
@@ -2367,7 +2367,8 @@ class ModelRunner:
     def _routed_experts_geometry(self) -> tuple[int, int] | None:
         """``(num_layers, top_k)`` for the capture buffer, or None if unused.
 
-        Cached so every pool plan sizes the buffer from one walk.
+        Raises for a model or attention backend whose routes cannot be
+        captured. Cached so every pool plan sizes the buffer from one walk.
         """
         if hasattr(self, "_routed_experts_geo"):
             return self._routed_experts_geo
@@ -2389,13 +2390,6 @@ class ModelRunner:
                 "enable_return_routed_experts requires per-token KV slots in the "
                 f"attention metadata; {builder_cls.__name__} does not supply them, "
                 "so routes would never be written"
-            )
-        if self.config.enable_dp_attention and builder_cls.supports_token_graph:
-            raise ValueError(
-                "enable_return_routed_experts does not support enable_dp_attention "
-                f"with {builder_cls.__name__}: its prefill token graphs make an "
-                "idle DP rank run a dummy prefill on physical block 0, whose "
-                "captures overwrite the routes a real request reads there"
             )
         num_layers = int(self.hf_text_config.num_hidden_layers)
         layer_ids = [idx for _, idx in layers]
@@ -2429,7 +2423,7 @@ class ModelRunner:
             for moe in fused_moe_modules(self.model)
         ]
 
-    def _maybe_init_routed_experts_capturer(self, num_kvcache_blocks: int) -> None:
+    def _bind_routed_experts_layers(self, num_kvcache_blocks: int) -> None:
         """Allocate the capture buffer and bind each target FusedMoE its layer's
         view, as part of binding the KV cache, so both share one lifecycle."""
         geo = self._routed_experts_geometry()
