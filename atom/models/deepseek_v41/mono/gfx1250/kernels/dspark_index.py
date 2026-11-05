@@ -209,8 +209,11 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
                 first, count = ip.CHUNKS_PER_SEG * j, ip.seg_chunks(bound, j)
             else:
                 first, count = ip.block_chunks(raw, j)
-            if tid < count:
-                c["poll"]([(c["isf"], t * max_chunks + first + tid, 1)])
+            # a block segment has up to SEG * BLOCK_ROWS / CHUNK = 512 score
+            # flags, more than the CTA's threads: every thread polls a stride
+            for r in range_constexpr((ip.SEG * ip.BLOCK_ROWS // ip.CHUNK + THREADS - 1) // THREADS):
+                if tid + r * THREADS < count:
+                    c["poll"]([(c["isf"], t * max_chunks + first + tid + r * THREADS, 1)])
             gpu.barrier()
         else:
             below = ip.list_slots(kind, level - 1, bound_max)

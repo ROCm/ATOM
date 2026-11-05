@@ -82,44 +82,61 @@ def mhtjstest_plan_wide_scores(c, t0, n):
     """Original score_tasks plan, streamed through LDS with bounded live state.
 
     Lane 0 forms the original owner runs in reverse, then applies the same
-    together/width/count rules. Row arrays do not stay live in registers.
+    together/width/count rules. Row arrays do not stay live in registers; a
+    step reads four rows' words with one LDS load (one wait per four rows,
+    where a row a step waited one LDS round trip a row: 8 us of a 48-row
+    plan), same order and arithmetic.
     """
+    assert n % 4 == 0
     reindex = c['args']['ilift'] != 0
+    b0 = c['late_meta']+mhtjstest_index_row_offset(c,0)
+    b1 = c['late_meta']+mhtjstest_index_row_offset(c,1)
+    b2 = c['late_meta']+mhtjstest_index_row_offset(c,2)
+    quad = fx.Vector.make_type(4, fx.Int32)
     run, widest = fx.Int32(0), fx.Int32(0)
     shared_total, own_total = fx.Int32(0), fx.Int32(0)
     next_owner = fx.Int32(0)
-    for reverse in range(fx.Int32(n)):
-        row = n - 1 - reverse
-        bound = fx.Int32(fx.ptr_load(c['late_meta']+mhtjstest_index_row_offset(c,0)+row))
-        own = ip.score_chunks(bound)
-        owner = sel(reindex,t0+row,fx.Int32(fx.ptr_load(c['late_meta']+mhtjstest_index_row_offset(c,1)+row)))
-        same_next = (reverse != 0) & (owner == next_owner)
-        run = sel(same_next,run+1,fx.Int32(1))
-        widest = sel(same_next,fx.max(own,widest),own)
-        previous_row = fx.max(row-1,0)
-        previous_owner = sel(reindex,t0+previous_row,
-                             fx.Int32(fx.ptr_load(c['late_meta']+mhtjstest_index_row_offset(c,1)+previous_row)))
-        shared = sel((row == 0) | (owner != previous_owner),widest,fx.Int32(0))
-        fx.ptr_store(shared,c['late_meta']+mhtjstest_index_row_offset(c,1)+row)
-        fx.ptr_store(run,c['late_meta']+mhtjstest_index_row_offset(c,2)+row)
-        shared_total = shared_total+shared
-        own_total = own_total+own
-        next_owner = owner
+    for step in range(fx.Int32(n // 4)):
+        base = n - 4 - 4*step
+        bounds = fx.Vector(fx.ptr_load(b0+base, result_type=quad))
+        owners = fx.Vector(fx.ptr_load(b1+base, result_type=quad))
+        before = fx.Int32(fx.ptr_load(b1+fx.max(base-1, 0)))
+        for e in range_constexpr(3, -1, -1):
+            row = base + e
+            own = ip.score_chunks(fx.Int32(bounds[e]))
+            owner = sel(reindex, t0+row, fx.Int32(owners[e]))
+            # the last row (step 0's fourth) has no row after it
+            if const_expr(e == 3):
+                same_next = (step != 0) & (owner == next_owner)
+            else:
+                same_next = owner == next_owner
+            run = sel(same_next, run+1, fx.Int32(1))
+            widest = sel(same_next, fx.max(own, widest), own)
+            previous = fx.Int32(owners[e-1]) if e > 0 else before
+            previous_owner = sel(reindex, t0+fx.max(row-1, 0), previous)
+            shared = sel((row == 0) | (owner != previous_owner), widest, fx.Int32(0))
+            fx.ptr_store(shared, b1+row)
+            fx.ptr_store(run, b2+row)
+            shared_total = shared_total+shared
+            own_total = own_total+own
+            next_owner = owner
     together = shared_total >= BLOCKS
     need_total = sel(together,shared_total,own_total)
     width_log2 = fx.Int32(0)
     for group in range_constexpr(1,TASK_CHUNKS_LOG2+1):
         width_log2 = sel((need_total >> group) >= BLOCKS,group,width_log2)
     total = fx.Int32(0)
-    for row in range(fx.Int32(n)):
-        bound = fx.Int32(fx.ptr_load(c['late_meta']+mhtjstest_index_row_offset(c,0)+row))
-        shared = fx.Int32(fx.ptr_load(c['late_meta']+mhtjstest_index_row_offset(c,1)+row))
-        run = fx.Int32(fx.ptr_load(c['late_meta']+mhtjstest_index_row_offset(c,2)+row))
-        need = sel(together,shared,ip.score_chunks(bound))
-        count = (need+(fx.Int32(1)<<width_log2)-1)>>width_log2
-        fx.ptr_store(count,c['late_meta']+mhtjstest_index_row_offset(c,1)+row)
-        fx.ptr_store(sel(together,run,1),c['late_meta']+mhtjstest_index_row_offset(c,2)+row)
-        total = total+count
+    for step in range(fx.Int32(n // 4)):
+        base = 4*step
+        bounds = fx.Vector(fx.ptr_load(b0+base, result_type=quad))
+        shareds = fx.Vector(fx.ptr_load(b1+base, result_type=quad))
+        runs = fx.Vector(fx.ptr_load(b2+base, result_type=quad))
+        for e in range_constexpr(4):
+            need = sel(together, fx.Int32(shareds[e]), ip.score_chunks(fx.Int32(bounds[e])))
+            count = (need+(fx.Int32(1)<<width_log2)-1)>>width_log2
+            fx.ptr_store(count, b1+base+e)
+            fx.ptr_store(sel(together, fx.Int32(runs[e]), fx.Int32(1)), b2+base+e)
+            total = total+count
     fx.ptr_store(total,c['late_meta']+272+3*c['S'])
     fx.ptr_store(width_log2,c['late_meta']+273+3*c['S'])
 
@@ -321,27 +338,33 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
                 first, count = ip.CHUNKS_PER_SEG * j, ip.seg_chunks(bound, j)
             else:
                 first, count = ip.block_chunks(raw, j)
-            if (tid < count) & (bound > k):
-                c["poll"]([(c["isf"], t * max_chunks + first + tid, 1)])
+            # a block segment has up to SEG * BLOCK_ROWS / CHUNK = 512 score
+            # flags, more than the CTA's threads: every thread polls a stride
+            for r in range_constexpr((ip.SEG * ip.BLOCK_ROWS // ip.CHUNK + THREADS - 1) // THREADS):
+                if (tid + r * THREADS < count) & (bound > k):
+                    c["poll"]([(c["isf"], t * max_chunks + first + tid + r * THREADS, 1)])
             gpu.barrier()
         else:
             below = ip.list_slots(kind, level - 1, bound_max)
-            base = tid * PER_THREAD
-            got = c["poll"](
-                [
-                    (
-                        c[f"i{kind}{level - 1}"],
+
+            def merge_inputs(pt):
+                # each thread's pt inputs of the merged lists, flag-polled
+                base = tid * pt
+                return c["poll"](
+                    [
                         (
-                            (t * below + j * ip.fan(k) + fx.min(base + d, n - 1) // k)
-                            * k
-                            + fx.min(base + d, n - 1) % k
+                            c[f"i{kind}{level - 1}"],
+                            (
+                                (t * below + j * ip.fan(k) + fx.min(base + d, n - 1) // k)
+                                * k
+                                + fx.min(base + d, n - 1) % k
+                            )
+                            * 2,
+                            2,
                         )
-                        * 2,
-                        2,
-                    )
-                    for d in range(PER_THREAD)
-                ]
-            )
+                        for d in range(pt)
+                    ]
+                )
         src, stride = (
             (a["ilog"], a["lstride"]) if kind == "sel" else (a["ibmax"], a["bstride"])
         )
@@ -356,8 +379,8 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
         keys = c["sel_lds"]["keys"]
         first_i = tid * PER_THREAD
 
-        def ident_of(d, i):
-            return j * ip.SEG + i if level == 0 else got[d][1]
+        def ident_of(d, i, src=None):
+            return j * ip.SEG + i if level == 0 else (got if src is None else src)[d][1]
 
         # a selection's rows (``_selected_rows``), in flight during the passes
         def selected_rows():
@@ -378,12 +401,12 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
         # divisions a thread, 32 at 256 threads) for k winners of n.
         win = c["sel_lds"]["hist"]
 
-        def emit(pos, d, i, rows):
+        def emit(pos, d, i, rows, src=None):
             if const_expr(d is None):
                 ident, bits = fx.Int32(-1), fx.Float32(NEG).bitcast(fx.Int32)
                 picked = (fx.Int32(-1), fx.Int32(0))
             else:
-                ident = ident_of(d, i)
+                ident = ident_of(d, i, src)
                 bits = key_bits(fx.ptr_load(keys + i))
                 picked = None
             if to_final:
@@ -426,7 +449,18 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
             else:
                 lds_topk(n, k, load, emit, c["sel_lds"], tid, PER_THREAD, None)
         else:
-            lds_topk(n, k, load, emit, c["sel_lds"], tid, PER_THREAD, None)
+            # A merge of n <= 2048 inputs (a REINDEX row's two lists, a short
+            # row's few) ranks them 8 a thread, as level 0 does: same inputs in
+            # the same order, same winners and places.
+            def run_merge(pt):
+                g = merge_inputs(pt)
+                lds_topk(n, k, lambda q, i: [g[4 * q + e][0] for e in range(4)],
+                         lambda pos, d, i, rows: emit(pos, d, i, rows, g),
+                         c["sel_lds"], tid, pt, None)
+            if n <= THREADS * SMALL_PER_THREAD:
+                run_merge(SMALL_PER_THREAD)
+            else:
+                run_merge(PER_THREAD)
         if const_expr(kind == "sel"):
             if to_final:
                 c_sel=restore_late(c,pointers=('icand','table','kmeta'),
