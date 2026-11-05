@@ -104,7 +104,7 @@ Qwen4ExpAttention._select_tokens
 | KV block size / index page | 16 / 4, 32 / 8, 64 / 16 (page sizes the kernel reports) | `cache_shape_unsupported` → stock |
 | index cache | bf16, fp8 (E4M3 + fp32 row scale) | fp4 → `cache_format_unsupported` → stock |
 | query positions | int64 (ATOM's `logical_positions`) | — |
-| rows | decode, draft (tps 1), MTP verify 3 rows/request (aiter bucket, on by default), prefill chunks | per profile rule; uncovered → stock (interim) |
+| rows | decode, draft (tps 1), MTP verify (`num_speculative_tokens + 1` rows/request: 4 at MTP 3 = aiter's decode regime, 3 at MTP 2 = aiter's `rows == 3×requests` bucket, on by default), prefill chunks | per profile rule; uncovered → stock (interim) |
 | graph mode | eager and CUDA graph (decided at capture) | — |
 | arch | gfx1250 (profile) | `arch_unsupported` → stock |
 | frontends | native ATOM server / offline | plugin hosts (SGLang / RTP-LLM): switch not carried, stock |
