@@ -28,8 +28,8 @@ from test_mixed_decode_view import make_batch
 from atom.utils.forward_context import AttnState
 
 
-def _batch(n_p=2, n_d=3):
-    batch = make_batch()
+def _batch(n_p=2, n_d=3, num_spec_step=1):
+    batch = make_batch(num_spec_step=num_spec_step)
     batch.num_scheduled_tokens[2:] = 1
     batch.total_tokens_num_decode = 3
     batch.total_tokens_num = 19
@@ -76,7 +76,10 @@ def test_both_builders_assemble_the_carrier_through_the_helper(fn):
     assert "AttentionMetaData_DSV4(" not in src
 
 
-def test_prepare_mixed_calls_both_halves_with_their_real_signatures(monkeypatch):
+@pytest.mark.parametrize("num_spec_step", [0, 1])
+def test_prepare_mixed_calls_both_halves_with_their_real_signatures(
+    monkeypatch, num_spec_step
+):
     """Drives `prepare_mixed` with the two halves stubbed, each binding its
     arguments against the real method. A builder signature change that the
     mixed call does not follow then fails here instead of on the first mixed
@@ -90,7 +93,7 @@ def test_prepare_mixed_calls_both_halves_with_their_real_signatures(monkeypatch)
 
     builder_cls = v4.DeepseekV4AttentionMetadataBuilder
     n_p, n_d, p_tokens = 2, 3, 16
-    batch = _batch(n_p=n_p, n_d=n_d)
+    batch = _batch(n_p=n_p, n_d=n_d, num_spec_step=num_spec_step)
     batch.total_seqs_num_prefill = n_p
     batch.num_scheduled_tokens = np.array([8, 8, 1, 1, 1], dtype=np.int32)
     calls = {}
@@ -128,6 +131,8 @@ def test_prepare_mixed_calls_both_halves_with_their_real_signatures(monkeypatch)
     pre = calls["prepare_prefill"]
     assert (pre["running_bs"], pre["running_tokens"]) == (n_p, p_tokens)
     dec = calls["prepare_decode"]
+    if num_spec_step == 0:
+        assert dec["batch"].scheduled_spec_decode_tokens is None
     assert (dec["running_bs"], dec["running_tokens"], dec["max_seqlen_q"]) == (
         n_d,
         n_d,
