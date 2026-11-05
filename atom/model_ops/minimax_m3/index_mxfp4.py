@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 import torch
 
-from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_TOKENS, page_views
+from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_TOKENS
 
 
 def index_batch(scheduled_bs, running_bs, running_tokens, max_query_len):
@@ -41,44 +41,10 @@ def index_batch(scheduled_bs, running_bs, running_tokens, max_query_len):
     return batch
 
 
-def index_work_map_capacity(max_batch, max_block, max_query_len, num_idx_heads):
-    """Rows of a persistent work-map buffer serving every batch up to
-    ``max_batch`` (the exact grid is not monotonic in the batch)."""
-    if max_batch <= 0:
-        return 0
-    from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
-
-    return minimax_m3_index_score_work_map_capacity(
-        max_batch, max_block, max_query_len, num_idx_heads
-    )
-
-
-def build_index_work_map(
-    seq_lens, *, max_block, max_query_len, num_idx_heads, out=None
-):
-    """``[grid, 2]`` int32 dispatch order of the decode scorer; None on an empty
-    batch. ``out`` is the persistent buffer to fill (sliced to the grid)."""
-    if seq_lens.shape[0] <= 0:
-        return None
-    from aiter.ops.flydsl import minimax_m3_index_score_work_map
-
-    return minimax_m3_index_score_work_map(
-        seq_lens, max_block, max_query_len, num_idx_heads, out=out
-    )
-
-
-def index_score_buffer(max_rows, num_idx_heads, max_block, device):
-    """Flat fp32 storage for the decode scorer's scores of up to ``max_rows`` rows,
-    ``max_block`` wide: the persistent ``out`` of every layer of a captured step."""
-    return torch.empty(
-        num_idx_heads * max_rows * max_block, dtype=torch.float32, device=device
-    )
-
-
 def fresh_index_score(
     buf, rows, num_idx_heads, max_block, max_query_len, fill_blocks=None
 ):
-    """``[H, rows, max_block]`` view of ``buf`` for ``decode_score_mxfp4(out=...)``,
+    """``[H, rows, max_block]`` view of ``buf`` for the scorer's ``out=``,
     in the layout the scorer would allocate itself: feature-contiguous
     (``[max_block, rows, H]`` permuted) once S * H >= its TRANSPOSE_MIN_F, plain
     head-major below. Call it once a step, outside the graph.
@@ -132,13 +98,21 @@ class IndexScoreBuffers:
     ):
         """Storage for up to ``max_batch`` requests of up to ``max_query_len`` tokens.
         ``scores`` is existing storage to use instead of a new allocation."""
-        rows = index_work_map_capacity(
-            max_batch, max_block, max_query_len, num_idx_heads
-        )
+        rows = 0
+        if max_batch > 0:
+            from aiter.ops.flydsl import minimax_m3_index_score_work_map_capacity
+
+            rows = minimax_m3_index_score_work_map_capacity(
+                max_batch, max_block, max_query_len, num_idx_heads
+            )
         work_map = torch.empty((rows, 2), dtype=torch.int32, device=device)
         if scores is None:
-            scores = index_score_buffer(
-                max_batch * max_query_len, num_idx_heads, max_block, device
+            # flat, up to max_batch * max_query_len rows ``max_block`` wide: the
+            # persistent ``out`` of every layer of a captured step
+            scores = torch.empty(
+                num_idx_heads * max_batch * max_query_len * max_block,
+                dtype=torch.float32,
+                device=device,
             )
         return cls(work_map, scores, max_block, num_idx_heads)
 
@@ -150,18 +124,20 @@ class IndexScoreBuffers:
         length, which a captured graph bakes and which must not move between replays.
         ``eager``: this step's kernels are not recorded in a graph, so the batch's own
         block count serves, and the scorer's grid and score width shrink with it."""
+        if seq_lens.shape[0] <= 0:
+            return None
         max_block = self.max_block
         if eager:
             max_block = min(max_block, max(1, -(-max_seq_len // PAGE_TOKENS)))
-        work_map = build_index_work_map(
+        from aiter.ops.flydsl import minimax_m3_index_score_work_map
+
+        work_map = minimax_m3_index_score_work_map(
             seq_lens,
-            max_block=max_block,
-            max_query_len=max_query_len,
-            num_idx_heads=self.num_idx_heads,
+            max_block,
+            max_query_len,
+            self.num_idx_heads,
             out=self.work_map,
         )
-        if work_map is None:
-            return None
         out = fresh_index_score(
             self.scores,
             seq_lens.shape[0] * max_query_len,
@@ -171,68 +147,3 @@ class IndexScoreBuffers:
             fill_blocks=-(-max_seq_len // PAGE_TOKENS),
         )
         return IndexScoreStep(work_map, max_block, out)
-
-
-def decode_score_mxfp4(
-    idx_q,  # [batch * S, H, 128] bf16 or e4m3
-    index_cache,  # uint8 [pages, 8704]
-    block_table,  # [batch, >= max_block] int32
-    seq_lens,  # [batch] int32
-    max_block,
-    max_query_len,
-    num_idx_heads,
-    sm_scale,
-    work_map=None,
-    out=None,
-):
-    """``[H, batch * S, max_block]`` fp32 block scores of a uniform decode (S query
-    rows a request, causal per row). ``work_map`` is the step's; omitted, the
-    scorer builds its own on every call. ``out`` is
-    the step's ``fresh_index_score``; omitted, the scorer allocates and fills its
-    own with -inf (a launch a layer)."""
-    k_data, k_scale = page_views(index_cache)
-    from aiter.ops.flydsl import minimax_m3_index_score_fp4_flydsl
-
-    return minimax_m3_index_score_fp4_flydsl(
-        idx_q,
-        k_data,
-        k_scale,
-        block_table,
-        seq_lens,
-        max_query_len,
-        num_idx_heads,
-        sm_scale,
-        max_block,
-        out=out,
-        work_map=work_map,
-    )
-
-
-def prefill_score_mxfp4(
-    idx_q,  # [total_q, H, 128] bf16 or e4m3
-    index_cache,
-    block_table,
-    cu_seqlens_q,
-    seq_lens,
-    prefix_lens,
-    max_query_len,
-    max_seq_len,
-    sm_scale,
-):
-    """``[H, total_q, ceil(max_seq_len / 128)]`` fp32 block scores of a ragged
-    prefill batch. The pages stay MXFP4 through the scorer (scaled MFMA)."""
-    k_data, k_scale = page_views(index_cache)
-    from aiter.ops.flydsl import minimax_m3_index_score_prefill_fp4_flydsl
-
-    return minimax_m3_index_score_prefill_fp4_flydsl(
-        idx_q,
-        k_data,
-        k_scale,
-        block_table,
-        cu_seqlens_q,
-        seq_lens,
-        prefix_lens,
-        max_query_len,
-        max_seq_len,
-        sm_scale,
-    )

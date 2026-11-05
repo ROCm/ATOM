@@ -1177,11 +1177,15 @@ def minimax_m3_index_topk(
     _require_packable(max_block)
 
     if index_mxfp4:
-        from atom.model_ops.minimax_m3.index_mxfp4 import prefill_score_mxfp4
+        from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
-        score = prefill_score_mxfp4(
+        k_data, k_scale = page_views(index_kv_cache)
+        from aiter.ops.flydsl import minimax_m3_index_score_prefill_fp4_flydsl
+
+        score = minimax_m3_index_score_prefill_fp4_flydsl(
             idx_q,
-            index_kv_cache,
+            k_data,
+            k_scale,
             block_table,
             cu_seqlens_q,
             seq_lens,
@@ -1419,7 +1423,9 @@ def minimax_m3_index_topk_decode(
     )
 
     if index_mxfp4:
-        from atom.model_ops.minimax_m3.index_mxfp4 import decode_score_mxfp4
+        from aiter.ops.flydsl import minimax_m3_index_score_fp4_flydsl
+
+        from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
         step = index_score
         score_max_block = max(max_block, step.max_block if step else 0)
@@ -1433,17 +1439,19 @@ def minimax_m3_index_topk_decode(
                 f"index_score.out is {step.out.shape[-1]} blocks wide, the "
                 f"scorer's bound is {score_max_block}"
             )
-        score = decode_score_mxfp4(
+        k_data, k_scale = page_views(index_kv_cache)
+        score = minimax_m3_index_score_fp4_flydsl(
             idx_q,
-            index_kv_cache,
+            k_data,
+            k_scale,
             block_table,
             seq_lens,
-            score_max_block,
             max_query_len,
             num_idx_heads,
             sm_scale,
-            step.work_map if step else None,
-            step.out if step else None,
+            score_max_block,
+            out=step.out if step else None,
+            work_map=step.work_map if step else None,
         )
     else:
         score = _triton_decode_score(

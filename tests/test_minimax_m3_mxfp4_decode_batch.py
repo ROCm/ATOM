@@ -49,14 +49,11 @@ def builder(mod, mxfp4=True, tbo_decode=True, forward_vars=None):
 
 
 def _check_score_view(heads, S, transpose_min_f, neg_inf):
-    from atom.model_ops.minimax_m3.index_mxfp4 import (
-        fresh_index_score,
-        index_score_buffer,
-    )
+    from atom.model_ops.minimax_m3.index_mxfp4 import fresh_index_score
 
     batch, max_block, fill = 3, 6, 4
     rows = batch * S
-    buf = index_score_buffer(8 * 8, heads, max_block, "cpu").fill_(7.0)
+    buf = torch.empty(heads * 8 * 8 * max_block, dtype=torch.float32).fill_(7.0)
     out = fresh_index_score(buf, rows, heads, max_block, S, fill_blocks=fill)
     assert out.shape == (heads, rows, max_block)
     assert out.data_ptr() == buf.data_ptr()  # the persistent storage, no copy
@@ -78,6 +75,20 @@ def _stand_in_scorer_module(monkeypatch):
     sys.modules[name].TRANSPOSE_MIN_F = 16
 
 
+def _stand_in_flydsl(monkeypatch, capacity, work_map=None):
+    """aiter's work-map entry points, replaced for this test alone (the rest of
+    aiter is left as it is: only ``aiter.ops.flydsl`` is looked up by name)."""
+    name = "aiter.ops.flydsl"
+    flydsl = types.ModuleType(name)
+
+    def refuse(*a, **kw):
+        raise AssertionError("aiter's work map must not be asked for")
+
+    flydsl.minimax_m3_index_score_work_map_capacity = capacity
+    flydsl.minimax_m3_index_score_work_map = work_map or refuse
+    monkeypatch.setitem(sys.modules, name, flydsl)
+
+
 @pytest.mark.parametrize("S", [1, 3, 4, 8])
 @pytest.mark.parametrize("heads", [1, 2, 4])
 def test_the_score_view_follows_the_layout_of_its_step_width_with_a_stand_in_threshold(
@@ -96,11 +107,11 @@ def test_an_eager_step_scores_at_its_own_block_count_a_graph_step_at_the_models(
 
     _stand_in_scorer_module(monkeypatch)
     built = []
-    monkeypatch.setattr(index_mxfp4, "index_work_map_capacity", lambda *a: 4)
-    monkeypatch.setattr(
-        index_mxfp4,
-        "build_index_work_map",
-        lambda seq_lens, **kw: built.append(kw["max_block"]) or torch.zeros(1, 2),
+    _stand_in_flydsl(
+        monkeypatch,
+        lambda *a: 4,
+        lambda seq_lens, max_block, *a, **kw: built.append(max_block)
+        or torch.zeros(1, 2),
     )
     buffers = index_mxfp4.IndexScoreBuffers.alloc(4, 2, 1, 64, "cpu")
     seq = torch.tensor([300, 1000, 0])
@@ -113,6 +124,21 @@ def test_an_eager_step_scores_at_its_own_block_count_a_graph_step_at_the_models(
         assert step.out.shape == (1, 6, step.max_block)
     # one persistent storage under every view
     assert graph.out.data_ptr() == eager.out.data_ptr() == buffers.scores.data_ptr()
+
+
+def test_a_batch_of_zero_needs_nothing_from_aiter(monkeypatch):
+    """No requests: no map rows asked for, no map built, and no step state (the
+    scorer then builds its own) -- decided here, not by aiter's own empty case."""
+    from atom.model_ops.minimax_m3 import index_mxfp4
+
+    _stand_in_scorer_module(monkeypatch)
+    _stand_in_flydsl(monkeypatch, lambda *a: pytest.fail("capacity asked for"))
+    buffers = index_mxfp4.IndexScoreBuffers.alloc(0, 8, 2, 64, "cpu")
+    assert buffers.work_map.shape == (0, 2) and buffers.work_map.dtype == torch.int32
+    assert buffers.scores.numel() == 0 and buffers.scores.dtype == torch.float32
+    empty = torch.empty(0, dtype=torch.int32)
+    assert buffers.begin_step(empty, 8, 0) is None
+    assert buffers.begin_step(empty, 8, 0, eager=True) is None
 
 
 @pytest.mark.parametrize("S", [1, 3, 4, 8])
@@ -203,7 +229,7 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
         return 100
 
     monkeypatch.setattr(mod, "CpuGpuBuffer", _Buf)
-    monkeypatch.setattr(index_mxfp4, "index_work_map_capacity", capacity)
+    _stand_in_flydsl(monkeypatch, capacity)
     b = builder(mod, mxfp4=mxfp4, tbo_decode=tbo_decode)
     b.max_bs = max_bs
     max_qlen = 8  # a speculative config: the TBO sparse decode still runs one token

@@ -97,23 +97,24 @@ def reference(cache, table, seq, q, S):
 @pytest.mark.parametrize("fp8_q", [False, True])
 def test_decode_selection_and_block_table(batch, S, fp8_q):
     ppb = 8  # 16-pages a block of the page-16 SHUFFLE KV the MXFP4 index sits beside
+    from aiter.ops.flydsl import (
+        minimax_m3_index_score_work_map,
+        minimax_m3_index_score_work_map_capacity,
+    )
+
     from atom.model_ops.minimax_m3.index_mxfp4 import (
         IndexScoreStep,
-        build_index_work_map,
-        index_work_map_capacity,
     )
     from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
 
     cache, table, seq, q = make_case(batch, S, seed=batch * 10 + S, fp8_q=fp8_q)
     max_block = table.shape[1]
     buf = torch.empty(
-        (index_work_map_capacity(32, max_block, S, HEADS), 2),
+        (minimax_m3_index_score_work_map_capacity(32, max_block, S, HEADS), 2),
         dtype=torch.int32,
         device="cuda",
     )
-    wmap = build_index_work_map(
-        seq, max_block=max_block, max_query_len=S, num_idx_heads=HEADS, out=buf
-    )
+    wmap = minimax_m3_index_score_work_map(seq, max_block, S, HEADS, out=buf)
     topk_idx, sbt, sctx = minimax_m3_index_topk_decode(
         q, cache, table, seq, int(seq.max()), TOPK, 0, 1, HEADS, SM_SCALE,
         emit_sparse_block_table=True, max_query_len=S,
@@ -170,10 +171,13 @@ def test_prefill_selection_matches_the_decode_definition():
 
 def test_a_captured_decode_follows_the_refilled_work_map():
     """The graph bakes the map's pointer and grid; a replay refills it in place."""
+    from aiter.ops.flydsl import (
+        minimax_m3_index_score_work_map,
+        minimax_m3_index_score_work_map_capacity,
+    )
+
     from atom.model_ops.minimax_m3.index_mxfp4 import (
         IndexScoreStep,
-        build_index_work_map,
-        index_work_map_capacity,
     )
     from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
 
@@ -181,14 +185,12 @@ def test_a_captured_decode_follows_the_refilled_work_map():
     cache, table, seq, q = make_case(batch, S, seed=3)
     max_block = table.shape[1]
     buf = torch.empty(
-        (index_work_map_capacity(32, max_block, S, HEADS), 2),
+        (minimax_m3_index_score_work_map_capacity(32, max_block, S, HEADS), 2),
         dtype=torch.int32,
         device="cuda",
     )
     static_seq = seq.clone()
-    wmap = build_index_work_map(
-        static_seq, max_block=max_block, max_query_len=S, num_idx_heads=HEADS, out=buf
-    )
+    wmap = minimax_m3_index_score_work_map(static_seq, max_block, S, HEADS, out=buf)
 
     def run():
         return minimax_m3_index_topk_decode(
@@ -205,10 +207,7 @@ def test_a_captured_decode_follows_the_refilled_work_map():
         out = run()
     for new_seq in (seq, (seq // 2).clamp(min=S + 1).to(torch.int32)):
         static_seq.copy_(new_seq)
-        build_index_work_map(
-            static_seq, max_block=max_block, max_query_len=S, num_idx_heads=HEADS,
-            out=buf,
-        )  # fmt: skip
+        minimax_m3_index_score_work_map(static_seq, max_block, S, HEADS, out=buf)
         graph.replay()
         torch.cuda.synchronize()
         _, picks, ctx = reference(cache, table, new_seq, q, S)
@@ -239,13 +238,15 @@ def test_a_persistent_score_buffer_changes_nothing():
     """The scorer leaves a page no row reaches unstored, so the buffer holds -inf there
     only if refilled: one refill a step must give the very scores (and selection)
     a fresh -inf buffer per call does, across permuted, shorter and smaller steps."""
+    from aiter.ops.flydsl import (
+        minimax_m3_index_score_fp4_flydsl,
+        minimax_m3_index_score_work_map,
+        minimax_m3_index_score_work_map_capacity,
+    )
+
     from atom.model_ops.minimax_m3.index_mxfp4 import (
         IndexScoreStep,
-        build_index_work_map,
-        decode_score_mxfp4,
         fresh_index_score,
-        index_score_buffer,
-        index_work_map_capacity,
     )
     from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
 
@@ -253,18 +254,25 @@ def test_a_persistent_score_buffer_changes_nothing():
     cache, steps = _score_steps(batch, S, seed=21)
     max_block = steps[0][0].shape[1]
     wbuf = torch.empty(
-        (index_work_map_capacity(32, max_block, S, HEADS), 2),
+        (minimax_m3_index_score_work_map_capacity(32, max_block, S, HEADS), 2),
         dtype=torch.int32,
         device="cuda",
     )
-    sbuf = index_score_buffer(32 * S, HEADS, max_block, "cuda")
+    sbuf = torch.empty(HEADS * 32 * S * max_block, dtype=torch.float32, device="cuda")
 
     def run(table, seq, q, out):
-        wmap = build_index_work_map(
-            seq, max_block=max_block, max_query_len=S, num_idx_heads=HEADS, out=wbuf
-        )
-        score = decode_score_mxfp4(
-            q, cache, table, seq, max_block, S, HEADS, SM_SCALE, wmap, out
+        wmap = minimax_m3_index_score_work_map(seq, max_block, S, HEADS, out=wbuf)
+        score = minimax_m3_index_score_fp4_flydsl(
+            q,
+            *page_views(cache),
+            table,
+            seq,
+            S,
+            HEADS,
+            SM_SCALE,
+            max_block,
+            out=out,
+            work_map=wmap,
         )
         sel = minimax_m3_index_topk_decode(
             q, cache, table, seq, max_block * 128, TOPK, 0, 1, HEADS, SM_SCALE,
@@ -297,12 +305,14 @@ def test_a_persistent_score_buffer_changes_nothing():
 
 def test_a_captured_decode_follows_the_refilled_score_buffer():
     """The graph bakes the buffer's pointer; the refill between replays is outside it."""
+    from aiter.ops.flydsl import (
+        minimax_m3_index_score_work_map,
+        minimax_m3_index_score_work_map_capacity,
+    )
+
     from atom.model_ops.minimax_m3.index_mxfp4 import (
         IndexScoreStep,
-        build_index_work_map,
         fresh_index_score,
-        index_score_buffer,
-        index_work_map_capacity,
     )
     from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
 
@@ -311,21 +321,20 @@ def test_a_captured_decode_follows_the_refilled_score_buffer():
     table = steps[0][0]
     max_block = table.shape[1]
     wbuf = torch.empty(
-        (index_work_map_capacity(32, max_block, S, HEADS), 2),
+        (minimax_m3_index_score_work_map_capacity(32, max_block, S, HEADS), 2),
         dtype=torch.int32,
         device="cuda",
     )
-    sbuf = index_score_buffer(32 * S, HEADS, max_block, "cuda")
+    sbuf = torch.empty(HEADS * 32 * S * max_block, dtype=torch.float32, device="cuda")
     static_seq, static_q = steps[0][1].clone(), steps[0][2].clone()
     static_table = table.clone()
     rows = batch * S
 
     def prepare():
         out = fresh_index_score(sbuf, rows, HEADS, max_block, S)
-        wmap = build_index_work_map(
-            static_seq, max_block=max_block, max_query_len=S, num_idx_heads=HEADS,
-            out=wbuf,
-        )  # fmt: skip
+        wmap = minimax_m3_index_score_work_map(
+            static_seq, max_block, S, HEADS, out=wbuf
+        )
         return out, wmap
 
     def run(out, wmap):
@@ -391,9 +400,10 @@ def test_a_padded_step_builds_the_map_and_scores_of_the_padded_batch():
     """A graph captured at 8 requests replays 3 scheduled ones: its scorer's grid,
     the map's encoding and the score view's strides are the 8-request batch's, so
     the metadata is built from the 8 lengths, the 5 pad ones 0."""
+    from aiter.ops.flydsl import minimax_m3_index_score_work_map
+
     from atom.model_ops.minimax_m3.index_mxfp4 import (
         IndexScoreBuffers,
-        build_index_work_map,
     )
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 
@@ -411,12 +421,8 @@ def test_a_padded_step_builds_the_map_and_scores_of_the_padded_batch():
         max_query_len=S,
         index_score_buffers=buffers,
     )
-    want = build_index_work_map(
-        padded, max_block=bound, max_query_len=S, num_idx_heads=HEADS
-    )
-    scheduled = build_index_work_map(
-        padded[:batch], max_block=bound, max_query_len=S, num_idx_heads=HEADS
-    )
+    want = minimax_m3_index_score_work_map(padded, bound, S, HEADS)
+    scheduled = minimax_m3_index_score_work_map(padded[:batch], bound, S, HEADS)
     assert want.shape[0] > scheduled.shape[0]
     assert torch.equal(md.index_score.work_map, want)
     assert tuple(md.index_score.out.shape) == (HEADS, running * S, bound)
