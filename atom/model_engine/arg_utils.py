@@ -773,6 +773,27 @@ class EngineArgs:
                 "older batch-uniform q-bucket verify path.\n"
                 '  - "disable_sps_calib": bool, skip SPS calibration and use the '
                 "synthetic stub.\n"
+                '  - "varlen_verify": bool, DeepInfer-style adaptive ragged '
+                "verify: confidence + measured cost pick the step's total query "
+                "tokens, replayed on a token-count CUDA graph.\n"
+                '  - "varlen_graph_interval": int, token-count graph grid spacing '
+                "above the power-of-two sizes (default 8).\n"
+                '  - "varlen_gpu_alloc": bool, re-split the total on the GPU '
+                "from the freshest confidence; costs a host wait per step "
+                "(default false).\n"
+                '  - "varlen_explore_interval": int, verify every draft once '
+                "per this many varlen plans (default 16, 0 disables).\n"
+                '  - "varlen_calibrate": bool, calibrate the confidence head '
+                "against observed acceptance (default true).\n"
+                '  - "varlen_chunk_aware": bool, price the opus MLA row chunks '
+                "of the widest request in the plan (default: on with "
+                "ATOM_OPUS_MLA).\n"
+                '  - "varlen_chunk_cost": float, seed ms per million context '
+                "tokens per 1/columns of that price (default 8.0).\n"
+                '  - "varlen_chunk_free_q": int, widest request priced as before '
+                "(default 4).\n"
+                '  - "varlen_max_q": int, cap every request\'s verify width '
+                "(default 0: off).\n"
                 "Example:\n"
                 """  '{"confidence_schedule": true, "ragged": true, """
                 """"ragged_graph_sizes": "8"}'"""

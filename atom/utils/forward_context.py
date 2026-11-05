@@ -3,7 +3,7 @@
 
 import logging
 import threading
-from collections.abc import Container
+from collections.abc import Collection, Container
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -169,6 +169,10 @@ class ForwardMode:
     # TBO graph, which recorded that split; the scheduled requests on an eager
     # TBO split. None when the step does not split a decode.
     ubatch_split_bs: int | None = None
+    # Varlen verify: the token count of the request graph this step replays
+    # (keyed by tokens, not by `request_bucket(running_bs, q)`); 0 on every
+    # other step.
+    varlen_graph_tokens: int = 0
 
     @classmethod
     def decide(
@@ -187,6 +191,8 @@ class ForwardMode:
         running_tokens_per_dp_rank: np.ndarray,
         graph_shapes: Container[tuple[int, int]] | None = None,
         tbo_decode_graphs: bool = False,
+        varlen_graph_sizes: Collection[int] | None = None,
+        max_num_seqs: int = 0,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
@@ -201,6 +207,10 @@ class ForwardMode:
         `step_needs_eager` is this rank's attention backend refusing a graph for
         the step (`AttentionMetadataBuilder.step_needs_eager`); the DP group
         agrees on it.
+
+        `varlen_graph_sizes` (ascending) are the token counts captured for
+        varlen verify; a batch the planner sized (`batch.varlen_lens`) replays
+        the smallest one that holds it.
         """
         # Lazy: `atom.utils.tbo`'s package init reaches back into this module.
         from atom.utils.tbo.ubatch_splitting import decode_bucket_splits
@@ -231,6 +241,22 @@ class ForwardMode:
             # flavor keeps its own and the extra wire row is not sent.
             max_seqlen_q=max_seqlen_q if is_block_drafter else None,
         )
+        if (
+            varlen_graph_sizes is not None
+            and not is_prefill
+            and dp_size == 1
+            and getattr(batch, "varlen_lens", None) is not None
+        ):
+            return cls._decide_varlen(
+                scheduled_bs=scheduled_bs,
+                scheduled_tokens=scheduled_tokens,
+                eager=enforce_eager or sync.any_rank_needs_eager,
+                graph_sizes=varlen_graph_sizes,
+                max_num_seqs=max_num_seqs,
+                max_seqlen_q=max_seqlen_q,
+                sync=sync,
+                running_tokens_per_dp_rank=running_tokens_per_dp_rank,
+            )
         # The group's query length, taken BEFORE the rows are read off it: a
         # rank still on its local q settles on a different `running_tokens`
         # than its peers.
@@ -335,6 +361,55 @@ class ForwardMode:
             prefill_token_graph=bool(token_graph),
             req_graphs=req_graphs,
             ubatch_split_bs=ubatch_split_bs,
+        )
+
+    @classmethod
+    def _decide_varlen(
+        cls,
+        *,
+        scheduled_bs: int,
+        scheduled_tokens: int,
+        eager: bool,
+        graph_sizes: Collection[int],
+        max_num_seqs: int,
+        max_seqlen_q: int,
+        sync,
+        running_tokens_per_dp_rank: np.ndarray,
+    ) -> "ForwardMode":
+        """A varlen decode step on one rank (DeepInfer `select(total_q)`).
+
+        The graph for G tokens was captured over `min(G, max_num_seqs)`
+        sequences, which is at least `scheduled_bs`: every request forwards at
+        least one token. Rows past the real ones are zero-length, tokens past
+        `scheduled_tokens` are orphans nothing reads. A total no graph holds
+        runs eagerly at its own size.
+        """
+        from atom.spec_decode.mtp_varlen import graph_num_seqs, select_graph_size
+
+        graph_tokens = (
+            None if eager else select_graph_size(graph_sizes, scheduled_tokens)
+        )
+        if graph_tokens is None:
+            running_bs, running_tokens = scheduled_bs, scheduled_tokens
+        else:
+            running_bs = graph_num_seqs(graph_tokens, max_num_seqs)
+            running_tokens = graph_tokens
+        assert running_bs >= scheduled_bs, (running_bs, scheduled_bs, graph_tokens)
+        running_tokens_per_dp_rank.fill(running_tokens)
+        return cls(
+            use_cudagraph=graph_tokens is not None,
+            is_prefill=False,
+            scheduled_bs=scheduled_bs,
+            scheduled_tokens=scheduled_tokens,
+            running_bs=running_bs,
+            running_tokens=running_tokens,
+            running_tokens_are_unified=True,
+            max_seqlen_q=max_seqlen_q,
+            # Ubatch splits are not planned over a ragged step.
+            tbo_collective_active=False,
+            sync=sync,
+            req_graphs=graph_tokens is not None,
+            varlen_graph_tokens=graph_tokens or 0,
         )
 
     @staticmethod

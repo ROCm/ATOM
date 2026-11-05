@@ -540,6 +540,21 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
         return attn_metadata, context
 
+    def build_for_varlen_capture(self, seqlens_q):
+        attn_metadata, context = super().build_for_varlen_capture(seqlens_q)
+        assert self.use_spec_decode, "varlen verify needs the spec-decode KDA path"
+        bs = len(seqlens_q)
+        num_tokens = int(seqlens_q.sum())
+        gdn_metadata = self._build_gdn_capture_metadata(bs)
+        # The spec kernels walk sequences by these offsets; the rectangular
+        # default would run them past the graph's last token.
+        self.spec_query_start_loc[: bs + 1].copy_(attn_metadata.cu_seqlens_q)
+        gdn_metadata.num_spec_decode_tokens = num_tokens
+        gdn_metadata.num_actual_tokens = num_tokens
+        gdn_metadata.spec_token_indx = self.spec_token_indx[:num_tokens]
+        attn_metadata.gdn_metadata = gdn_metadata
+        return attn_metadata, context
+
 
 class KimiAiterMLAGDNMetadataBuilder(_KimiMLAGDNCommon, AiterMLAMetadataBuilder):
     def _supports_dcp_index_staging(self) -> bool:

@@ -13,8 +13,9 @@ What differs from the V4 flavor (all of it load-bearing):
 
   * Checkpoint. V4-Pro-DSpark lives inside the target checkpoint under ``mtp.*``.
     Kimi-K3-DSpark is a standalone checkpoint whose parameter names map 1:1 onto
-    this module tree. It ships an ``embed_tokens`` and a ``confidence_head`` that
-    are both deliberately NOT loaded -- see ``skip_weight_prefixes``.
+    this module tree. ``embed_tokens`` is not loaded. ``confidence_head`` is
+    loaded only when varlen verify is on and the checkpoint sets
+    ``enable_confidence_head`` -- see ``skip_weight_prefixes``.
 
   * Backbone. V4 reuses V4 decoder layers (MLA + mHC + MoE). This is a plain
     pre-norm stack: 5 x (MLA + dense SwiGLU MLP). No mHC, no MoE, no attention
@@ -48,7 +49,7 @@ Checkpoint layout (Inferact/Kimi-K3-DSpark, 68 tensors, single-file BF16):
   layers.{i}.mlp.{gate,up}_proj.weight          [14336, 7168] -> gate_up_proj
   layers.{i}.mlp.down_proj.weight               [7168, 14336]
   markov_head.markov_w{1,2}.weight              [163840, 256]
-  confidence_head.proj.{weight,bias}            SKIPPED (training-only)
+  confidence_head.proj.{weight,bias}            [1, 7424] / [1]  varlen verify only
   embed_tokens.weight                           SKIPPED (target's is shared)
 
 Inferact/Kimi-K3.1-DSpark (67 tensors) is the same tree with 96 heads (q_b_proj
@@ -56,6 +57,7 @@ Inferact/Kimi-K3.1-DSpark (67 tensors) is the same tree with 96 heads (q_b_proj
 and no embed_tokens; its ``rope_interleave: true`` is the same interleaved rope.
 """
 
+import logging
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -81,13 +83,20 @@ from atom.model_ops.linear import (
     uses_mxfp4_n32k4_scale,
 )
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
-from atom.models.dspark_draft import DSparkDraftModel, DSparkMarkovHead, linear_out
+from atom.models.dspark_draft import (
+    DSparkConfidenceHead,
+    DSparkDraftModel,
+    DSparkMarkovHead,
+    linear_out,
+)
 from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES
 from atom.models.utils import is_neox_rope_style
 from atom.quant_spec import effective_layer_quant
 
 if TYPE_CHECKING:
     from atom.config import Config
+
+logger = logging.getLogger("atom")
 
 
 def _dspark_block_width(draft_config, atom_config) -> int:
@@ -535,12 +544,11 @@ class KimiK3DSpark(DSparkDraftModel):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    # Both are present in the checkpoint and both are deliberately not loaded.
-    #   confidence_head: training-only. vLLM skips it by the same name and its
-    #     model card lists confidence-based scheduling as future work, so the
-    #     head is not calibrated for inference. ATOM's confidence-scheduled
-    #     ragged verify therefore has no trustworthy input with THIS checkpoint
-    #     -- run it with a fixed verify length.
+    # Both are present in the checkpoint and both stay unloaded unless a run
+    # asks for the confidence head.
+    #   confidence_head: per-position accept probability. Loaded only when
+    #     `--dspark-config` sets varlen_verify and the checkpoint sets
+    #     enable_confidence_head. A rectangular verify never reads it.
     #   embed_tokens: a 2.35GB copy of the target's table. The target's is
     #     shared instead (share_with_target), so loading it would just burn
     #     memory and risk drifting from the target's.
@@ -555,6 +563,15 @@ class KimiK3DSpark(DSparkDraftModel):
         self.atom_config = atom_config
         config = atom_config.hf_config
         self.hf_config = config
+        dspark = getattr(atom_config, "dspark", None)
+        self.emits_confidence = bool(
+            getattr(dspark, "varlen_verify", False)
+            and getattr(config, "enable_confidence_head", False)
+        )
+        if self.emits_confidence:
+            self.skip_weight_prefixes = [
+                p for p in self.skip_weight_prefixes if p != "confidence_head."
+            ]
 
         self.hidden_size = config.hidden_size
         self.noise_token_id = int(config.dspark_noise_token_id)
@@ -589,13 +606,22 @@ class KimiK3DSpark(DSparkDraftModel):
         # Markov-head vocab, exposed at the top level so the proposer can clamp
         # the anchor uniformly across DSpark flavors (V4 exposes it too).
         self.vocab_size = int(config.vocab_size)
+        self.confidence_head = (
+            DSparkConfidenceHead(self.hidden_size, self.markov_rank, bias=True)
+            if self.emits_confidence
+            else None
+        )
+        if dspark is not None and getattr(dspark, "varlen_verify", False):
+            logger.info(
+                "DSpark draft confidence head: %s (enable_confidence_head=%s)",
+                "loaded" if self.emits_confidence else "absent",
+                getattr(config, "enable_confidence_head", None),
+            )
 
-        # Bound by share_with_target(); both are skipped at load.
+        # Bound by share_with_target(); both are skipped at load unless the
+        # confidence head was armed above.
         self.embed_tokens = None
         self.lm_head = None
-        # vLLM 0.28 probes this attribute before enabling adaptive verification.
-        # This checkpoint deliberately skips the training-only head.
-        self.confidence_head = None
 
     # ---- weight-loading hooks ---------------------------------------------
 
@@ -648,9 +674,8 @@ class KimiK3DSpark(DSparkDraftModel):
         """One DSpark block: parallel backbone pass + sequential Markov sampling.
 
         Returns ``(draft_token_ids [B, T], confidence)``. ``confidence`` is
-        always ``None`` here -- this checkpoint's confidence head is
-        training-only (see ``skip_weight_prefixes``). The proposer already
-        handles ``None`` by leaving the verify length fixed.
+        ``None`` unless varlen verify loaded the checkpoint's confidence head.
+        The proposer already handles ``None`` by leaving the verify length fixed.
 
         The two halves below are also callable separately, which is how the
         proposer declares this block as a capturable pass: the backbone is the
@@ -704,8 +729,20 @@ class KimiK3DSpark(DSparkDraftModel):
         Batch comes from ``anchor_ids`` rather than from ``hidden``, which is
         flat over ``B*T`` and so cannot say which of the two axes it holds.
         """
-        base_logits = self.lm_head(hidden).view(anchor_ids.shape[0], num_draft, -1)
-        return self._sample_block(base_logits, anchor_ids), None
+        if self.confidence_head is None:
+            base_logits = self.lm_head(hidden).view(anchor_ids.shape[0], num_draft, -1)
+            return self._sample_block(base_logits, anchor_ids), None
+        bs = anchor_ids.shape[0]
+        base_logits = self.lm_head(hidden).view(bs, num_draft, -1)
+        draft_ids = self._sample_block(base_logits, anchor_ids)
+        # Draft k was sampled from row k conditioned on token k-1 (the anchor
+        # for k = 0); the head scores it from the same two inputs.
+        prev_ids = torch.cat([anchor_ids.view(bs, 1), draft_ids[:, :-1]], dim=1)
+        confidence = self.confidence_head(
+            hidden.view(bs, num_draft, -1),
+            self.markov_head.markov_w1(prev_ids.long()),
+        )
+        return draft_ids, confidence
 
     def _sample_block(
         self,
