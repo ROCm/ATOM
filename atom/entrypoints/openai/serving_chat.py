@@ -437,7 +437,8 @@ async def stream_chat_response(
         if usage_on_finish and include_usage
         else create_chat_chunk
     )
-    if isinstance(stream_collector, LogprobCollector):
+    any_logprobs = isinstance(stream_collector, LogprobCollector)
+    if any_logprobs:
         make_chunk = partial(make_chunk, with_logprobs=True)
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
@@ -461,13 +462,13 @@ async def stream_chat_response(
     # Assume abort until the engine's finished chunk arrives. A client
     # disconnect closes the generator before then, leaving this True so the
     # finally aborts the still-running seq; normal completion flips it to False.
-    pending = [] if isinstance(stream_collector, LogprobCollector) else None
+    pending = [] if any_logprobs else None
     aborted = True
     try:
         role_sent = False
         while True:
             chunk_data = await stream_collector.get()
-            if chunk_data.get("finish_reason") == "logprob_error":
+            if any_logprobs and chunk_data.get("finish_reason") == "logprob_error":
                 yield data_frame(
                     {
                         "error": {
@@ -563,7 +564,7 @@ async def stream_chat_response(
             include_usage=include_usage,
         )
     finally:
-        if isinstance(stream_collector, LogprobCollector):
+        if any_logprobs:
             for tracker in stream_collector.trackers:
                 tracker.close()
         cleanup_stream(seq_id, aborted=aborted)
@@ -664,7 +665,9 @@ def build_chat_response(
                 tool_parser_cls=tool_parser_cls,
                 logprob_codec=logprob_codec,
                 token_ids=final_output.get("token_ids", ()),
-                token_logprobs=final_output.get("logprobs"),
+                token_logprobs=(
+                    final_output.get("logprobs") if logprob_codec is not None else None
+                ),
                 top_logprobs=top_logprobs,
             )
         ],
@@ -722,7 +725,7 @@ def build_chat_response_multi(
             tool_parser_cls=tool_parser_cls,
             logprob_codec=logprob_codec,
             token_ids=out.get("token_ids", ()),
-            token_logprobs=out.get("logprobs"),
+            token_logprobs=(out.get("logprobs") if logprob_codec is not None else None),
             top_logprobs=top_logprobs,
         )
         for i, out in enumerate(final_outputs)
@@ -793,7 +796,8 @@ async def stream_chat_response_fanout(
         if usage_on_finish and include_usage
         else create_chat_chunk
     )
-    if isinstance(shared_collector, LogprobCollector):
+    any_logprobs = isinstance(shared_collector, LogprobCollector)
+    if any_logprobs:
         make_chunk = partial(make_chunk, with_logprobs=True)
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
@@ -817,11 +821,7 @@ async def stream_chat_response_fanout(
     # Assume abort until every sibling reports finished; a client disconnect
     # closes the generator first, leaving this True so the finally aborts
     # whichever siblings are still running.
-    pending = (
-        [[] for _ in range(n)]
-        if isinstance(shared_collector, LogprobCollector)
-        else None
-    )
+    pending = [[] for _ in range(n)] if any_logprobs else None
     aborted = True
     try:
         role_sent = [False] * n
@@ -829,7 +829,7 @@ async def stream_chat_response_fanout(
             idx, chunk_data = await shared_collector.get()
             if finished[idx]:
                 continue
-            if chunk_data.get("finish_reason") == "logprob_error":
+            if any_logprobs and chunk_data.get("finish_reason") == "logprob_error":
                 logger.error("Logprob processing failed for choice %s", idx)
                 cleanup_stream(seq_ids[idx], aborted=True)
                 finished[idx] = True
@@ -949,7 +949,7 @@ async def stream_chat_response_fanout(
             include_usage=include_usage,
         )
     finally:
-        if isinstance(shared_collector, LogprobCollector):
+        if any_logprobs:
             for tracker in shared_collector.trackers:
                 tracker.close()
         for sid in seq_ids:

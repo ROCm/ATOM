@@ -220,7 +220,14 @@ class ScheduledBatch:
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
         self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
-        self.top_logprobs = [seq.top_logprobs for seq in seqs.values()]
+        self.any_logprobs = any(self.return_logprobs)
+        self.top_logprobs = None
+        self.logprob_requested = ()
+        if self.any_logprobs:
+            self.top_logprobs = [seq.top_logprobs for seq in seqs.values()]
+            self.logprob_requested = tuple(
+                i for i, enabled in enumerate(self.return_logprobs) if enabled
+            )
         self.structured_requests = {}
         for i, seq in enumerate(seqs.values()):
             if seq.json_schema is None:

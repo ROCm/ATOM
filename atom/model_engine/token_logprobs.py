@@ -29,7 +29,9 @@ def _logprob_rows(batch, metadata, device, width):
     All indices stay on the device. Host draft counts supply only the allocation
     size; they are the existing scheduling metadata, never a GPU readback.
     """
-    requested = [i for i, enabled in enumerate(batch.return_logprobs) if enabled]
+    requested = getattr(batch, "logprob_requested", None)
+    if requested is None:
+        requested = [i for i, enabled in enumerate(batch.return_logprobs) if enabled]
     chosen = getattr(batch, "logprob_request_indices", None)
     if chosen is None:
         # Direct scorer/CPU callers do not run the runner's H2D preparation.
@@ -108,7 +110,9 @@ def gather_token_logprobs(
     Rows retain requesting-sequence order and each sampled-ID token width.
     The disabled path never calls here.
     """
-    requested = [i for i, enabled in enumerate(batch.return_logprobs) if enabled]
+    requested = getattr(batch, "logprob_requested", None)
+    if requested is None:
+        requested = [i for i, enabled in enumerate(batch.return_logprobs) if enabled]
     width = sampled_ids.shape[1] if sampled_ids.ndim == 2 else 1
     ids = sampled_ids.reshape(len(batch.return_logprobs), width)
     if rows is None:

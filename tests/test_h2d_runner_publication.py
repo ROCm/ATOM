@@ -626,6 +626,8 @@ def test_logprob_request_indices_share_sampling_publication(monkeypatch, transpo
             top_ps=np.ones(3),
             required_channel=None,
             return_logprobs=mask,
+            any_logprobs=any(mask),
+            logprob_requested=tuple(i for i, enabled in enumerate(mask) if enabled),
         )
         runner.prepare_sample(batch)
         expected = [i for i, enabled in enumerate(mask) if enabled]

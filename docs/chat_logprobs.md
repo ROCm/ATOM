@@ -60,7 +60,13 @@ logprob arrays contain committed tokens only, not speculative placeholders.
 
 ## Cost and implementation notes
 
-Disabled requests retain the original sampling path. In mixed batches, only
+Disabled batches retain the original sampling path. A cached `any_logprobs`
+batch flag gates top-K metadata, requested-row staging, scoring and transport;
+requested sequence indices are built once with the batch. Plain tool-parser
+text uses the native string join without source-span processing. Streaming
+requests select logprob handling once, and disabled chunks skip logprob error
+lookups and attribution. These are fast-path guarantees, not a claim of literally
+zero Python bookkeeping or a measured zero-percent overhead. In mixed batches, only
 requesting sequences have their vocabulary rows scored. Enabled requests add
 FP32 normalization, chosen-token ranking, optional top-K, and result serialization.
 Every participating rank computes these results. With deferred output and TP > 1,

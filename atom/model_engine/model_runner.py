@@ -2709,14 +2709,11 @@ class ModelRunner:
                 top_ps = top_p_buffer.gpu[:bs]
                 top_p_count = bs
 
-        requested = [
-            i
-            for i, enabled in enumerate(getattr(batch, "return_logprobs", ()))
-            if enabled
-        ]
-        logprob_count = len(requested) or None
+        logprob_count = None
         batch.logprob_request_indices = None
-        if requested:
+        if getattr(batch, "any_logprobs", False):
+            requested = batch.logprob_requested
+            logprob_count = len(requested)
             buffer = self.forward_vars["logprob_request_indices"]
             buffer.np[: len(requested)] = requested
             batch.logprob_request_indices = buffer.gpu[: len(requested)]
@@ -3363,7 +3360,7 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         # Keep probability payloads available on every participating rank.
-        need_logprobs = any(batch.return_logprobs)
+        need_logprobs = batch.any_logprobs
         logprob_snapshot = None
         logprob_rows = None
         if need_logprobs:

@@ -677,3 +677,23 @@ def test_token_byte_table_is_built_once_without_changing_cleanup(cleanup):
             assert codec.raw(0) == b" hello"
             assert codec.raw(99) == b""
         assert calls == [1]
+
+
+@pytest.mark.parametrize("size", [1, 3, 1000])
+def test_disabled_tool_parser_never_joins_source_spans(monkeypatch, size):
+    from atom.entrypoints.openai.tool_parser import stream
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("disabled requests must not process logprob spans")
+
+    monkeypatch.setattr(stream, "join_text", forbidden)
+    text = "left" + CALL + "right"
+    parser = ToolCallStreamParser(tools=TOOLS, parser_cls=DsmlV41Parser)
+    events = []
+    for start in range(0, len(text), size):
+        events.extend(parser.process(text[start : start + size]))
+    events.extend(parser.flush())
+    content, calls = stream.flatten_tool_events(events)
+    assert content == "leftright"
+    assert len(calls) == 1
+    assert calls[0].function["arguments"] == '{"x": "right"}'
