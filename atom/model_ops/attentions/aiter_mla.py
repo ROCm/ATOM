@@ -75,6 +75,7 @@ from atom.model_ops.indexer import (
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 from atom.model_ops.sparse_indexer_fp4 import (
+    fp4_cache_layout,
     fp4_index_scale_rows,
     sparse_indexer_fp4_enabled,
 )
@@ -2722,6 +2723,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             heads=self.index_n_heads,
             page_size=self.model_runner.block_size,
             storage=self._fp4_launches[ubatch],
+            layout=fp4_cache_layout(),
         )
 
     def _mtp_index_rows(self, rows: IndexRows | None, first: int) -> IndexRows | None:
@@ -2816,6 +2818,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             heads=self.index_n_heads,
             page_size=self.model_runner.block_size,
             split=split,
+            layout=fp4_cache_layout(),
         )
 
     def _publish_prefill_pool_rows(

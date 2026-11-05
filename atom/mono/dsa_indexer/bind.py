@@ -51,10 +51,25 @@ class IndexerBinding:
     # where its peer regions start in the peer buffer it shares (bytes): past
     # the other kernels' (``kernel.peer_layout``), a launch argument
     peer_offset: int = 0
+    dual_score: bool = False
 
     def key(self, rows: int, qlen: int = 1) -> kix.IxBuild:
+        dual = (
+            self.dual_score
+            and qlen == 1
+            and (
+                (rows == 128 and (self.max_ctx >= 65536 or self.shape.q_lora == 2048))
+                or rows in (160, 192, 224, 256)
+            )
+        )
         return kix.IxBuild(
-            self.shape, rows, self.world, self.max_ctx, self.replicated, qlen=qlen
+            self.shape,
+            rows,
+            self.world,
+            self.max_ctx,
+            self.replicated,
+            qlen=qlen,
+            score_blocks=512 if dual else 256,
         )
 
     def serves(self, rows: int, qlen: int, ilog) -> bool:
@@ -90,6 +105,7 @@ def shape_of(module, block_rows: int) -> IndexerShape:
         block_rows=block_rows,
         rope_dim=module.rope_dim,
         rope_neox=bool(module.rope_dim and module.rotary_emb.is_neox_style),
+        cache_layout=getattr(module, "_index_cache_layout", "preshuffle"),
     )
 
 
@@ -166,6 +182,18 @@ def _operand_refusal(m, shape: IndexerShape) -> str:
 
 def _cache_refusal(m, shape: IndexerShape) -> str:
     cache = m.k_cache.kv_cache[0]
+    if shape.kv_dtype == "fp4":
+        scales = getattr(m.k_cache, "kv_cache_scale", None)
+        if (
+            cache.dtype != torch.uint8
+            or cache.ndim != 4
+            or tuple(cache.shape[1:]) != (4, 64, 16)
+            or scales is None
+            or scales.dtype != torch.uint8
+            or tuple(scales.shape) != (cache.shape[0], 2, 32, 4)
+            or not scales.is_contiguous()
+        ):
+            return "FP4 cache must be OPUS [groups,4,64,16] / [groups,2,32,4] uint8"
     if cache.numel() % shape.block_bytes or not cache.is_contiguous():
         return f"index cache {tuple(cache.shape)}"
     return ""
@@ -193,7 +221,18 @@ def bind_indexers(inner, tp: int, rank: int) -> IndexerBinding | None:
     # without DCP every rank stores every key, the TP ranks split the scoring
     replicated = cfg.decode_context_parallel_size == 1
     shape = shape_of(next(iter(indexers.values())), cfg.kv_cache_block_size)
-    return IndexerBinding(indexers, shape, tp, cfg.max_model_len, replicated)
+    device = next(iter(indexers.values())).wq_b.weight.device
+    dual = False
+    if (
+        not replicated
+        and tp == 8
+        and kix.dual_score_shape(shape)
+        and device.type == "cuda"
+    ):
+        dual = kix.dual_score_device(device)
+    return IndexerBinding(
+        indexers, shape, tp, cfg.max_model_len, replicated, dual_score=dual
+    )
 
 
 # an Indexer's ``(hook, layer id)`` while hooked
@@ -282,6 +321,7 @@ def _routed_forward(module):
             weights,
             module.prefix,
             module.k_cache.kv_cache[0],
+            getattr(module.k_cache, "kv_cache_scale", None),
             module.sparse_kv_indices_buffer,
             module.dcp_sparse_kv_indptr_buffer,
             module.dcp_owned_counts_buffer,
@@ -299,6 +339,7 @@ def mono_dsa_indexer(
     weights: torch.Tensor,
     layer_name: str,
     kv_cache: torch.Tensor,
+    kv_cache_scale: torch.Tensor | None,
     sparse_kv_indices_buffer: torch.Tensor,
     dcp_sparse_kv_indptr_buffer: torch.Tensor,
     dcp_owned_counts_buffer: torch.Tensor,
@@ -318,6 +359,7 @@ direct_register_custom_op(
     op_func=mono_dsa_indexer,
     mutates_args=[
         "kv_cache",
+        "kv_cache_scale",
         "sparse_kv_indices_buffer",
         "dcp_sparse_kv_indptr_buffer",
         "dcp_owned_counts_buffer",
@@ -374,6 +416,7 @@ def launch_args(
         "kp": p(k), "wp": p(weights), "kw_ld": k.stride(0),
         "kn_w": p(module.k_norm.weight), "kn_b": p(module.k_norm.bias),
         "slots": p(md.slot_mapping), **rope, "cache": p(module.k_cache.kv_cache[0]),
+        "cache_scale": p(module.k_cache.kv_cache_scale) if module._indexer_fp4 else 0,
         "ctx": p(ctx), "bids": p(bids) if md.max_seqlen_q > 1 else 0,
         "bt": p(bt), "bt_ld": bt.stride(0),
         "out_idx": p(module.sparse_kv_indices_buffer),
