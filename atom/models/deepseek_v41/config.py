@@ -340,6 +340,25 @@ def validate_runtime_config(config):
     from atom.config import CUDAGraphMode
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
+    transfer = config.kv_transfer_config
+    connector = KVConnectorFactory.connector_name(transfer)
+    transfers = [transfer] if connector is not None else []
+    if connector == "multi":
+        # P/D with CPU offload composes one Mooncake leg and one MP tier.
+        # Validate the concrete legs, including Mooncake's explicit role.
+        transfers = transfer.get("connectors")
+        if (
+            not isinstance(transfers, (list, tuple))
+            or len(transfers) != 2
+            or not all(isinstance(leg, dict) for leg in transfers)
+            or sorted(KVConnectorFactory.connector_name(leg) or "" for leg in transfers)
+            != ["lmcache_mp", "mooncake"]
+        ):
+            raise ValueError(
+                "DeepSeek-V4.1 runtime does not support KV transfer other than "
+                "lmcache_mp or mooncake; multi requires exactly one of each"
+            )
+
     unsupported = []
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
     for name, enabled in (
@@ -380,8 +399,10 @@ def validate_runtime_config(config):
             # STATE slot (`get_kv_transfer_tensors`). MoRI-IO and in-process
             # offload read SLOT codecs this runtime does not publish.
             "KV transfer other than lmcache_mp or mooncake",
-            KVConnectorFactory.connector_name(config.kv_transfer_config)
-            not in (None, "lmcache_mp", "mooncake"),
+            any(
+                KVConnectorFactory.connector_name(leg) not in ("lmcache_mp", "mooncake")
+                for leg in transfers
+            ),
         ),
         (
             # Mooncake defaults a missing role to producer, but producer
@@ -389,10 +410,11 @@ def validate_runtime_config(config):
             # an implicit producer would keep deferred output and decode T0
             # into the slot before handing it over.
             "Mooncake P/D without an explicit kv_role",
-            KVConnectorFactory.connector_name(config.kv_transfer_config) == "mooncake"
-            and isinstance(config.kv_transfer_config, dict)
-            and config.kv_transfer_config.get("kv_role")
-            not in ("kv_producer", "kv_consumer"),
+            any(
+                KVConnectorFactory.connector_name(leg) == "mooncake"
+                and leg.get("kv_role") not in ("kv_producer", "kv_consumer")
+                for leg in transfers
+            ),
         ),
         ("RapidServe", config.enable_rapidserve),
         ("online quantization", config.online_quant_config is not None),
