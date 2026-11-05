@@ -1,11 +1,15 @@
 """ATOM eligibility for aiter's fused top-k + routing + activation quant.
 
-ATOM_MOE_FUSED_TOPK_ROUTE_QUANT: on the gfx1250 TP grouped MoE path at decode
-sizes, the routing top-k is not launched in `select_experts`. Its buffers are
-handed to aiter (`defer_topk_softmax`), whose grouped MoE then computes the
-top-k, the routing metadata and the MXFP4 activation quant in one launch in
-place of three (`topkGatingSoftmax`, `moe_route_psum_fused`,
-`moe_fused_quant_preshuffle_routeks`), with bit-identical outputs.
+ATOM_MOE_FUSED_TOPK_ROUTE_QUANT: on the gfx1250 TP grouped MoE path the
+routing top-k is not launched in `select_experts`. Its buffers are handed to
+aiter (`defer_topk_softmax`), whose grouped MoE then computes the top-k, the
+routing metadata and the MXFP4 activation quant fused, with bit-identical
+outputs: at decode sizes (up to 512 rows) in one launch in place of three
+(`topkGatingSoftmax`, `moe_route_psum_fused`, `moe_token_multidest_quant`), at
+prefill sizes (`fused_topk_route_quant_prefill`, up to 128 rows a CU) in two
+in place of eight (`topkGatingSoftmax`, the valid-row multiply, two fills,
+`moe_route`, `moe_contiguous_psum_remap`, `moe_token_multidest_quant_fusepre`,
+`moe_scatter_preshuffle_scale`).
 
 Only a path on which nothing reads the routing between `select_experts` and
 the experts qualifies: TP experts through aiter's `fused_moe` (no modular
@@ -18,9 +22,9 @@ import torch
 
 from atom.utils import envs
 
-# aiter's fused kernel serves at most this many rows (MAX_ROWS there): the DP
-# decode verify step (85-128 sequences x 4 rows) and the drafter; prefill keeps
-# the split path.
+# aiter's decode kernel serves at most this many rows (MAX_ROWS there): the DP
+# decode verify step (85-128 sequences x 4 rows) and the drafter. Larger steps
+# (prefill) take aiter's prefill kernel where it has one.
 _MAX_ROWS = 512
 
 
@@ -36,6 +40,12 @@ def try_defer_topk_route_quant(method, layer, x, logits):
         )
     except ImportError:
         return None
+    try:
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+            fused_topk_route_quant_prefill_supported,
+        )
+    except ImportError:  # an aiter without the prefill kernel
+        fused_topk_route_quant_prefill_supported = None
 
     from atom.config import get_current_atom_config
     from atom.utils.forward_context import (
@@ -71,8 +81,13 @@ def try_defer_topk_route_quant(method, layer, x, logits):
         or layer.expert_layout.num_routed != 256
         or layer.expert_layout.uses_dispatch_remap
         or layer.expert_layout.shared_is_routed
-        or not 0 < logits.shape[0] <= _MAX_ROWS
-        or not fused_topk_route_quant_supported(logits, x, layer.top_k, True)
+        or not _fusable_rows(
+            logits,
+            x,
+            layer.top_k,
+            fused_topk_route_quant_supported,
+            fused_topk_route_quant_prefill_supported,
+        )
     ):
         return None
     n = logits.shape[0]
@@ -80,3 +95,11 @@ def try_defer_topk_route_quant(method, layer, x, logits):
     ids = torch.empty((n, layer.top_k), dtype=torch.int32, device=x.device)
     defer_topk_softmax(weights, ids, logits, True, pass_scheduled_tokens_gpu(n))
     return weights, ids
+
+
+def _fusable_rows(logits, x, top_k, decode_supported, prefill_supported) -> bool:
+    """Whether one of aiter's fused kernels takes this many rows."""
+    rows = logits.shape[0]
+    if 0 < rows <= _MAX_ROWS:
+        return decode_supported(logits, x, top_k, True)
+    return prefill_supported is not None and prefill_supported(logits, x, top_k, True)

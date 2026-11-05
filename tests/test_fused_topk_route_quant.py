@@ -41,7 +41,11 @@ def env(monkeypatch):
     calls = []
     fake = types.ModuleType("aiter.ops.flydsl.grouped_moe_gfx1250")
     fake.defer_topk_softmax = lambda w, i, g, rn, nvr: calls.append((w, i, g, rn, nvr))
-    fake.fused_topk_route_quant_supported = lambda g, x, k, rn: True
+    fake.fused_topk_route_quant_supported = lambda g, x, k, rn: g.shape[0] <= 512
+    # aiter's prefill kernel: up to 1024 rows in this fake.
+    fake.fused_topk_route_quant_prefill_supported = (
+        lambda g, x, k, rn: 512 < g.shape[0] <= 1024
+    )
     monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.grouped_moe_gfx1250", fake)
     valid = torch.tensor([3], dtype=torch.int32)
     context = SimpleNamespace(
@@ -105,12 +109,42 @@ def test_ineligible_keeps_normal_route(env, change):
     assert not calls
 
 
+def test_prefill_rows_defer_to_the_prefill_kernel(env):
+    from atom.model_ops.fused_moe.fused_topk_route_quant import (
+        try_defer_topk_route_quant,
+    )
+
+    calls, _ = env
+    logits = torch.zeros((513, 256), dtype=torch.bfloat16)
+    x = torch.zeros((513, 2048), dtype=torch.bfloat16)
+    assert try_defer_topk_route_quant(_method(), _layer(), x, logits) is not None
+    assert len(calls) == 1
+
+
 def test_too_many_rows_keeps_normal_route(env):
     from atom.model_ops.fused_moe.fused_topk_route_quant import (
         try_defer_topk_route_quant,
     )
 
     calls, _ = env
+    logits = torch.zeros((1025, 256), dtype=torch.bfloat16)
+    x = torch.zeros((1025, 2048), dtype=torch.bfloat16)
+    assert try_defer_topk_route_quant(_method(), _layer(), x, logits) is None
+    assert not calls
+
+
+def test_aiter_without_prefill_kernel_keeps_normal_route(env, monkeypatch):
+    import sys
+
+    from atom.model_ops.fused_moe.fused_topk_route_quant import (
+        try_defer_topk_route_quant,
+    )
+
+    calls, _ = env
+    monkeypatch.delattr(
+        sys.modules["aiter.ops.flydsl.grouped_moe_gfx1250"],
+        "fused_topk_route_quant_prefill_supported",
+    )
     logits = torch.zeros((513, 256), dtype=torch.bfloat16)
     x = torch.zeros((513, 2048), dtype=torch.bfloat16)
     assert try_defer_topk_route_quant(_method(), _layer(), x, logits) is None
