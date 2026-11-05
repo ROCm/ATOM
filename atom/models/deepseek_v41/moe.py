@@ -134,5 +134,30 @@ class MoE(V4MoE):
         v41_record_tbo_expert_output(routed)
         return routed, is_complete
 
+    def takes_quantized_shared_input(self) -> bool:
+        """Whether the shared expert's gate_up reads MXFP8 rows with row-major
+        group-32 E8M0 scales: the FFN seam's fused output (`Block.prepare_ffn`)."""
+        shared = self.shared_experts
+        return (
+            shared is not None
+            and shared.gate_up_proj.native_a8_group_rows is not None
+            and shared.gate_up_proj.input_size == self.dim
+        )
+
     def forward(self, hidden):
-        return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
+        # The FFN seam's fused quant (`Block.hc_ffn_fuse_quant`): BF16 rows for
+        # the router and the routed experts, MXFP8 ones for the shared expert.
+        if not isinstance(hidden, tuple):
+            return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
+        hidden, hidden_fp8, hidden_scale = hidden
+        shared = self.shared_experts
+        shared.quantized_input = (
+            hidden_fp8.reshape(-1, hidden_fp8.shape[-1]),
+            hidden_scale.reshape(-1, hidden_scale.shape[-1]),
+        )
+        try:
+            return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
+        finally:
+            # A path that never calls the shared expert must not leave this
+            # step's rows for the next one.
+            shared.quantized_input = None

@@ -92,6 +92,9 @@ class Block(nn.Module):
         # Set with the packs: attention's fused MXFP8 norm output, where the
         # HIP kernel can write row-major scales (`fuse_quant_supported`).
         self.hc_fuse_quant = False
+        # The FFN seam's: the shared expert's gate_up takes it in place of
+        # quantizing the BF16 rows itself, to the same bits.
+        self.hc_ffn_fuse_quant = False
         self.engram = None
         if spec.layer_id in config.engram_layer_ids:
             width = (
@@ -119,6 +122,11 @@ class Block(nn.Module):
             )
         self.hc_fuse_quant = (
             self.hc_attn_fn_packed is not None and fuse_quant_supported()
+        )
+        self.hc_ffn_fuse_quant = (
+            self.hc_ffn_fn_packed is not None
+            and fuse_quant_supported()
+            and getattr(self.ffn, "takes_quantized_shared_input", lambda: False)()
         )
 
     def attention_forward(self, normed, cache, step, rope):
@@ -179,6 +187,7 @@ class Block(nn.Module):
             **self.hc_options,
             norm_eps=self.ffn_norm.eps,
             w_preshuffle_bf16=hc_fn is not None,
+            fuse_quant=self.hc_ffn_fuse_quant,
             sublayer_output=output,
             post_mix=post,
             combination=comb,

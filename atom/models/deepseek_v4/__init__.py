@@ -2759,6 +2759,7 @@ class Expert(nn.Module):
         # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
         # quant through a single aiter triton kernel. The fused kernel emits
         # FP8 + scale; w2 accepts `x_scale` and skips its own quant step.
+        self.quantized_input = None
         self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION
 
     def forward(
@@ -2772,7 +2773,13 @@ class Expert(nn.Module):
         # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
-        combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+        # `quantized_input`: x's MXFP8 rows and scales, set by the caller for this
+        # one call (V4.1's FFN seam quantizes them with its norm).
+        quantized, self.quantized_input = self.quantized_input, None
+        if quantized is not None and quantized[0].shape[0] == x.shape[0]:
+            combined = self.gate_up_proj(quantized[0], x_scale=quantized[1])
+        else:
+            combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
         if self.use_fused_clamp_act_mul:
             x_fp8, x_scale = fused_clamp_act_mul(
                 combined,
