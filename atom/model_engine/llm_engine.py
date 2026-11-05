@@ -915,6 +915,14 @@ class InputOutputProcessor:
             )
         if sampling_params.token_constraints:
             vocab_size = len(self.tokenizer)
+            text_config = getattr(self.config.hf_config, "text_config", None)
+            model_vocab_size = getattr(
+                text_config or self.config.hf_config, "vocab_size", None
+            )
+            if model_vocab_size is not None:
+                # Added tokenizer tokens may not have a row in the output head.
+                # Reject them before enqueue, not in the worker's batch step.
+                vocab_size = min(vocab_size, model_vocab_size)
             for rule in sampling_params.token_constraints:
                 if any(token >= vocab_size for token in rule.token_ids):
                     raise ValueError("Constraint token ID is outside the vocabulary")

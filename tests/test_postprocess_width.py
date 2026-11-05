@@ -358,6 +358,111 @@ def _payload_tensors(payload):
     )
 
 
+@pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize("schema", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_static_constraint_preserves_raw_logprobs(
+    monkeypatch, speculative, schema, enabled
+):
+    from atom.model_engine.token_logprobs import LogprobRows, host_logprob_rows
+    from atom.sampling_params import TokenConstraint
+
+    md = (
+        types.SimpleNamespace(
+            target_logits_indices=torch.tensor([0, 1, 3, 4]),
+            bonus_logits_indices=torch.tensor([2, 5]),
+            cu_num_draft_tokens=torch.tensor([2, 4]),
+            num_draft_tokens_np=np.array([2, 2]),
+        )
+        if speculative
+        else None
+    )
+    monkeypatch.setattr(
+        mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(spec_decode_metadata=md),
+    )
+    monkeypatch.setattr(
+        mod, "get_tp_group", lambda: types.SimpleNamespace(world_size=1)
+    )
+    batch = _batch(2, [enabled, False])
+    batch.top_logprobs = [3, 0]
+    batch.token_constraints = [(i, 1, TokenConstraint.force(0)) for i in range(2)]
+    if enabled:
+        batch.logprob_rows = LogprobRows(
+            *(
+                torch.from_numpy(a)
+                for a in host_logprob_rows(
+                    [0],
+                    np.array([3, 3]) if speculative else None,
+                    3 if speculative else 1,
+                )
+            )
+        )
+    runner = _runner({})
+    runner.forward_vars = {
+        "positions": types.SimpleNamespace(gpu=torch.arange(6 if speculative else 2)),
+        "cu_seqlens_q": types.SimpleNamespace(
+            gpu=torch.tensor([0, 3, 6] if speculative else [0, 1, 2])
+        ),
+    }
+    if schema:
+        batch.structured_requests = {0: ("schema", (), ())}
+
+        def grammar_mask(logits, *_):
+            logits[:, 4:] = -float("inf")
+            return {}
+
+        runner.structured_output = types.SimpleNamespace(
+            vocab_size=8, apply=grammar_mask, errors={}
+        )
+    if speculative:
+
+        def verify(_md, target, bonus, **_):
+            sampled = torch.cat(
+                (target.argmax(-1).reshape(2, 2), bonus[:, None]), dim=1
+            )
+            return sampled, torch.tensor([[2, 2], [0, 0], [0, 0]])
+
+        runner.rejection_sampler = types.SimpleNamespace(forward=verify)
+    seen = {}
+
+    def transfer(_batch, ids, _event, payload, **kwargs):
+        seen.update(
+            ids=ids.clone(), payload=payload, failed=kwargs["constraint_failed"]
+        )
+        return {}, None
+
+    runner.tokenID_processor.prepare_sampled_ids = transfer
+    if not enabled:
+        monkeypatch.setattr(
+            mod,
+            "capture_token_logits",
+            lambda *a, **kw: pytest.fail("disabled snapshot"),
+        )
+        monkeypatch.setattr(
+            mod,
+            "gather_token_logprobs",
+            lambda *a, **kw: pytest.fail("disabled scoring"),
+        )
+    raw = (
+        torch.arange((6 if speculative else 2) * 8, dtype=torch.float32).view(-1, 8)
+        / 10
+    )
+    runner.postprocess(batch, raw.clone(), torch.ones(2), None, None, True, None)
+    assert torch.all(seen["ids"] == 0)
+    assert not seen["failed"].any()
+    if not enabled:
+        assert seen["payload"] is None
+        return
+    values, ids, ranks = _payload_tensors(seen["payload"])
+    reference = torch.log_softmax(raw[: 3 if speculative else 1], dim=-1)
+    torch.testing.assert_close(values[0, :, 0], reference[:, 0])
+    top_values, top_ids = reference.topk(3)
+    torch.testing.assert_close(values[0, :, 1:], top_values)
+    torch.testing.assert_close(ids[0].long(), top_ids)
+    assert torch.all(ranks == 8)
+
 @pytest.mark.parametrize("context_kv_only", [False, True])
 def test_a_context_only_producer_leaves_dp_draft_lockstep(context_kv_only):
     """No DP peer is owed the collectives of a propose nobody runs."""

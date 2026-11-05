@@ -137,7 +137,7 @@ def test_failure_uses_output_copy_without_poisoning_gpu_carry(deferred, spec):
         p.pending = ids.clone()
 
     p.send_to_cpu_async = send
-    batch = SimpleNamespace(req_ids=[71, 42])
+    batch = SimpleNamespace(req_ids=[71, 42], return_logprobs=[False, False])
     tokens = torch.tensor([[3, -1], [2, 1]]) if spec else torch.tensor([3, 2])
     original = tokens.clone()
     output, _ = p.prepare_sampled_ids(
@@ -147,7 +147,7 @@ def test_failure_uses_output_copy_without_poisoning_gpu_carry(deferred, spec):
         assert output == {-1: 1}
         assert p.prev_token_ids is tokens
         output, _ = p.prepare_sampled_ids(
-            SimpleNamespace(req_ids=[99]), tokens[:1], None
+            SimpleNamespace(req_ids=[99], return_logprobs=[False]), tokens[:1], None
         )
     assert output[71][0] == -2
     assert output[42] == ((2, 1) if spec else (2,))
@@ -323,4 +323,23 @@ def test_rapidserve_rejects_explicit_rules_before_enqueue():
     with pytest.raises(ValueError, match="not supported by RapidServe"):
         processor.preprocess_fanout(
             [1, 2], SamplingParams(token_constraints=(TokenConstraint.force(2),))
+        )
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_added_token_without_output_head_row_rejected_before_enqueue(
+    monkeypatch, nested
+):
+    from atom.model_engine import llm_engine
+
+    monkeypatch.setattr(llm_engine.envs, "ATOM_ENABLE_RELAXED_MTP", False)
+    processor = object.__new__(llm_engine.InputOutputProcessor)
+    text_config = SimpleNamespace(vocab_size=8)
+    processor.config = SimpleNamespace(
+        hf_config=SimpleNamespace(text_config=text_config) if nested else text_config
+    )
+    processor.tokenizer = list(range(10))
+    with pytest.raises(ValueError, match="outside the vocabulary"):
+        processor.preprocess_fanout(
+            [1, 2], SamplingParams(token_constraints=(TokenConstraint.force(9),))
         )

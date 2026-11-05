@@ -3544,7 +3544,10 @@ class ModelRunner:
             structured_requests
             or (
                 spec_decode_metadata is None
-                and (batch.required_channel is not None or getattr(batch, "token_constraints", None))
+                and (
+                    batch.required_channel is not None
+                    or getattr(batch, "token_constraints", None)
+                )
             )
         ):
             logprob_snapshot = capture_token_logits(
@@ -3673,9 +3676,15 @@ class ModelRunner:
 
         # From the ids every rank now agrees on. Only a deferred step needs
         # it: otherwise the host has these ids before the next forward.
+        constraint_failed = (
+            constraints.failed(sampled_tokens) if constraints is not None else None
+        )
         channel_states = (
             constraints.commit(
-                sampled_tokens, batch, self.tokenID_processor.is_deferred_out
+                sampled_tokens,
+                batch,
+                self.tokenID_processor.is_deferred_out,
+                constraint_failed,
             )
             if constraints is not None
             else None
@@ -3709,9 +3718,7 @@ class ModelRunner:
             self.forward_done_event,
             sampled_logprobs,
             channel_states=channel_states,
-            constraint_failed=(
-                constraints.failed(sampled_tokens) if constraints is not None else None
-            ),
+            constraint_failed=constraint_failed,
         )
         output_errors = dict(structured.errors) if structured is not None else None
         # Read only the output already delivered by the existing D2H pipeline.
@@ -5353,7 +5360,11 @@ class RapidServeModelRunner(ModelRunner):
             if constraints is not None and constraints.invalid is not None:
                 sampled = sampled.masked_fill(constraints.failed(sampled), -2)
             sampled_cpu = sampled.view(-1).tolist()
-            if -2 in sampled_cpu:
+            if (
+                constraints is not None
+                and constraints.invalid is not None
+                and -2 in sampled_cpu
+            ):
                 raise ValueError("Token constraints leave no valid continuation")
             self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.

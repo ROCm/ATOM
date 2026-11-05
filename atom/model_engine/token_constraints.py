@@ -63,7 +63,7 @@ class TokenConstraints:
     """
 
     @classmethod
-    def apply(cls, runner, batch, logits, metadata, need_logprobs=False):
+    def apply(cls, runner, batch, logits, metadata):
         requests = getattr(batch, "structured_requests", None)
         rules = getattr(batch, "token_constraints", None)
         if not requests and batch.required_channel is None and not rules:
@@ -77,11 +77,6 @@ class TokenConstraints:
                 "Target logits do not match the prepared structured vocabulary"
             )
         bs = batch.total_seqs_num
-        step.premask_lse = (
-            torch.logsumexp(logits[:bs].float(), dim=-1)
-            if need_logprobs and metadata is None
-            else None
-        )
         step.prefixes = step.grammar.apply(logits, batch, metadata) if requests else {}
         if metadata is None:
             step.logits = logits[:bs]
@@ -125,7 +120,7 @@ class TokenConstraints:
                 step.target_invalid = _guard_empty_rows(step.target)
         return step
 
-    def commit(self, sampled_tokens, batch, deferred):
+    def commit(self, sampled_tokens, batch, deferred, failure):
         """Consume synchronized, accepted IDs, never unverified draft IDs."""
         channel_states = (
             advance_states(*self.channel, sampled_tokens)
@@ -133,7 +128,6 @@ class TokenConstraints:
             else None
         )
         if self.prefixes:
-            failure = self.failed(sampled_tokens)
             output = (
                 sampled_tokens
                 if failure is None
