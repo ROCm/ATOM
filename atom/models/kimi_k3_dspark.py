@@ -721,6 +721,8 @@ class KimiK3DSpark(DSparkDraftModel):
         hidden: torch.Tensor,  # [B*T, hidden] post-final-norm
         anchor_ids: torch.Tensor,  # [B]
         num_draft: int,
+        *,
+        greedy: bool = False,
     ):
         """The sequential half: LM head, then Markov sampling over the block.
 
@@ -728,18 +730,20 @@ class KimiK3DSpark(DSparkDraftModel):
         flat over ``B*T`` and so cannot say which of the two axes it holds.
         """
         base_logits = self.lm_head(hidden).view(anchor_ids.shape[0], num_draft, -1)
-        return self._sample_block(base_logits, anchor_ids), None
+        return self._sample_block(base_logits, anchor_ids, greedy), None
 
     def _sample_block(
         self,
         base_logits: torch.Tensor,  # [B, T, V]
         anchor_ids: torch.Tensor,  # [B]
+        greedy: bool,
     ) -> torch.Tensor:
         """Markov-biased left-to-right sampling over the already-computed block:
-        the head's ``sample_block`` with this model's ``draft_sampling``.
+        the head's ``sample_block`` with this model's ``draft_sampling``, or
+        with none when ``greedy``.
 
             logits_k <- U_k + B(x_{k-1}, .)
-            x_k      <- argmax(logits_k)                (``draft_sampling`` None)
+            x_k      <- argmax(logits_k)       (``greedy``, or ``draft_sampling`` None)
             x_k      <- drawn from the top of softmax(logits_k / T), its q
                         published for the accept rule   (lossless)
 
@@ -747,5 +751,5 @@ class KimiK3DSpark(DSparkDraftModel):
         than T backbone passes -- which is the entire point of DSpark.
         """
         return self.markov_head.sample_block(
-            base_logits, anchor_ids, self.draft_sampling
+            base_logits, anchor_ids, None if greedy else self.draft_sampling
         )

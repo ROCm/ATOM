@@ -7,6 +7,7 @@ numerics, and SpeculativeConfig DSpark detection/routing.
 
 import inspect
 import types
+from contextlib import nullcontext
 
 import numpy as np
 import pytest
@@ -925,7 +926,14 @@ def _install_block_halves(p, inner):
     p.model.model = inner
     p.model.prepare_block = types.MethodType(DeepseekV4DSpark.prepare_block, p.model)
     p.model.block_backbone = lambda ids, pos, num_draft: inner(ids, pos, num_draft)
-    p.model.head_and_sample = lambda out, ids, _: inner.head_and_sample(*out, ids)
+    # Which head each call asked for, `greedy` or the bound sampling.
+    p.model.greedy_heads = []
+
+    def head_and_sample(out, ids, _, *, greedy=False):
+        p.model.greedy_heads.append(greedy)
+        return inner.head_and_sample(*out, ids)
+
+    p.model.head_and_sample = head_and_sample
     return p
 
 
@@ -1472,6 +1480,61 @@ def test_both_flavors_declare_one_block_pass_bound_to_the_same_halves(monkeypatc
     assert p.draft_graphs == (p.block,)
     assert p.block.forward == p._block_backbone
     assert p.block.epilogue == p._block_head
+
+
+def _armed(draws_q):
+    """A lossless stand-in: only what `propose` and the declaration read."""
+    return types.SimpleNamespace(
+        staging=types.SimpleNamespace(draws_q=draws_q, consume=lambda: None)
+    )
+
+
+def test_an_armed_drafter_declares_a_greedy_block_beside_the_sampled_one(
+    monkeypatch,
+):
+    """Armed without DP: two passes over one backbone, the sampled head in
+    ``block`` and the greedy one in ``block_greedy``. With DP the choice
+    would be per rank, so only ``block`` is declared."""
+    p = _proposer_with_graph_bs(monkeypatch)
+    assert p.block_greedy is None
+    p.lossless = _armed(True)
+    p._build_draft_graphs()
+    assert p.draft_graphs == (p.block, p.block_greedy)
+    assert p.block_greedy.forward == p.block.forward == p._block_backbone
+    assert p.block.epilogue == p._block_head
+    assert p.block_greedy.epilogue == p._block_head_greedy
+    assert p.block_greedy.label(4, 8).endswith(" greedy")
+    assert not p.block.label(4, 8).endswith(" greedy")
+
+    p = _proposer_with_graph_bs(monkeypatch)
+    _on_two_dp_ranks(p)
+    p.lossless = _armed(True)
+    p._build_draft_graphs()
+    assert p.draft_graphs == (p.block,) and p.block_greedy is None
+
+
+@pytest.mark.parametrize("draws_q", [True, False])
+def test_a_step_that_draws_no_q_replays_the_greedy_block(monkeypatch, draws_q):
+    """The pass is picked once per step and carries the anchors, the run and
+    the profiler label; only the greedy one asks the head for ``greedy``."""
+    import atom.spec_decode.dspark_proposer as mod
+
+    seen, labels = {}, []
+    p = _proposer_with_graph_bs(monkeypatch)
+    p.lossless = _armed(draws_q)
+    p._build_draft_graphs()
+    monkeypatch.setattr(
+        mod, "record_function", lambda name: labels.append(name) or nullcontext()
+    )
+    fc = _stub_forward_context(scheduled_bs=8, target_bs=8)
+    _run_propose(p, fc, 8, monkeypatch, seen)
+
+    ran, idle = (p.block, p.block_greedy) if draws_q else (p.block_greedy, p.block)
+    assert p.model.greedy_heads == [not draws_q]
+    assert ran.buffer("anchor_ids", 8).tolist() == [5] * 8
+    assert idle.buffer("anchor_ids", 8).tolist() == [0] * 8
+    (label,) = [name for name in labels if name.startswith("propose_dspark")]
+    assert (" greedy" in label) is (not draws_q)
 
 
 def test_the_backbone_gets_the_positions_the_slot_mapping_was_built_from(monkeypatch):
@@ -2400,7 +2463,7 @@ def test_a_dp_sync_dummy_describes_every_row_of_the_block_as_pad(monkeypatch):
         type(p), "_publish_draft_shape", lambda self, *a, **k: None, raising=False
     )
     monkeypatch.setattr(type(p), "verify_scheduler", None, raising=False)
-    p.block = types.SimpleNamespace(
+    block = types.SimpleNamespace(
         label=lambda s, r: f"bs={s}/{r}",
         run=lambda bs, **staged: (torch.zeros(bs, T, dtype=torch.int32), None),
     )
@@ -2409,6 +2472,7 @@ def test_a_dp_sync_dummy_describes_every_row_of_the_block_as_pad(monkeypatch):
         fc = _paged_fc(is_dummy_run=dummy)
         fc.context.running_bs = 4
         out = p._propose_with_draft(
+            block,
             fc,
             fc.attn_metadata,
             {"anchor_positions": torch.zeros(4, dtype=torch.int64)},

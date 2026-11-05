@@ -54,6 +54,8 @@ class DraftQStaging:
         self._dest_hi = 0
         # Staged since the last propose consumed a staging.
         self._fresh = False
+        # Some row of the staged step names a q destination.
+        self._draws_q = False
 
     def stage(self, batch, bs: int, *, drafts_verifiable: bool, verifies: bool):
         """Stage one step and return the rows to publish (`StagedRows`).
@@ -100,10 +102,20 @@ class DraftQStaging:
             self.slots.claim_bases(req_ids, self._dest, skip if skip.any() else None)
             self._dest[bs:hi] = -1
             self._dest_hi = bs
+            self._draws_q = not skip.all()
         else:
             self._dest[:hi] = -1
             self._dest_hi = 0
+            self._draws_q = False
         return StagedRows(seed=1, q_row_base=hi or None, verify_q_row_base=verify_rows)
+
+    @property
+    def draws_q(self) -> bool:
+        """Whether some row of the staged step names a q destination. False
+        for an all-greedy, dummy or align-only step, or one whose every row is
+        mid-prompt: its draft writes no q, so the greedy block drafts the same
+        ids."""
+        return self._draws_q
 
     def consume(self) -> None:
         """Claim the staging for the propose about to run, or refuse one that
@@ -122,3 +134,4 @@ class DraftQStaging:
         """Point every host-side destination row at no q row."""
         self._dest[:] = -1
         self._dest_hi = 0
+        self._draws_q = False

@@ -183,6 +183,44 @@ def test_a_request_still_mid_prompt_claims_no_slot():
     assert "mid" in st.slots and a.q_row_base[0] >= 0
 
 
+@pytest.mark.parametrize(
+    "b, verifiable, draws_q",
+    [
+        (batch(["s", "g"], [1.0, 0.0]), True, True),
+        (batch(["g", "h"], [0.0, 0.0]), True, False),
+        (batch(["e"], [EPS]), True, False),
+        (batch(["a", "b"]), False, False),
+        (batch(["m", "n"], final_chunk=[False, False]), True, False),
+        (batch(["d", "m"], final_chunk=[True, False]), True, True),
+        (batch([]), True, False),
+    ],
+    ids=[
+        "mixed",
+        "all-greedy",
+        "eps-temperature",
+        "dummy-or-align-only",
+        "all-mid-prompt",
+        "one-final-chunk",
+        "empty",
+    ],
+)
+def test_a_step_draws_q_only_where_some_row_names_a_destination(b, verifiable, draws_q):
+    """`draws_q` is what picks the greedy block: False exactly when no row of
+    the step was handed a q destination."""
+    st, a = staging()
+    stage(st, b, verifiable=verifiable, verifies=False)
+    assert st.draws_q is draws_q
+    assert draws_q is bool((a.q_row_base >= 0).any())
+
+
+def test_clearing_the_destinations_draws_no_q():
+    st, _ = staging()
+    stage(st, batch(["a"]))
+    assert st.draws_q
+    st.clear_destinations()
+    assert not st.draws_q
+
+
 def test_a_smaller_batch_clears_the_larger_ones_pad_rows():
     """The block runs at `running_bs >= scheduled_bs`; a pad row still naming a
     previous batch's slot would write its q into a live request's rows."""

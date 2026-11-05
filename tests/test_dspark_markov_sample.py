@@ -510,7 +510,7 @@ def test_the_block_sampler_chains_the_op_through_its_bound_buffers():
         top_p=top_p,
     )
     model = SimpleNamespace(markov_head=head, draft_sampling=sampling)
-    drafts = KimiK3DSpark._sample_block(model, base, anchors)
+    drafts = KimiK3DSpark._sample_block(model, base, anchors, False)
 
     store = empty_store(3 * steps, width)
     prev = anchors
@@ -533,4 +533,38 @@ def test_the_block_sampler_chains_the_op_through_its_bound_buffers():
         assert torch.equal(drafts[:, k].long(), out), k
         prev = out
     for a, b in zip(sampling.q_store, store):
+        assert torch.equal(a, b)
+
+
+@requires_gpu
+def test_the_greedy_block_ignores_the_bound_sampling():
+    """K3's ``greedy`` block, the second pass an armed drafter declares:
+    the argmax chain whatever ``draft_sampling`` holds, and no q written."""
+    from types import SimpleNamespace
+
+    from atom.models.dspark_draft import DraftSampling
+    from atom.models.kimi_k3_dspark import DSparkMarkovHead, KimiK3DSpark
+
+    max_bs, bs, steps, vocab, rank, width = 4, 3, 3, 3000, 32, 64
+    head = DSparkMarkovHead(vocab, rank).to(DEV, torch.bfloat16)
+    torch.manual_seed(23)
+    base = torch.randn(bs, steps, vocab, device=DEV).to(torch.bfloat16)
+    anchors = torch.randint(0, vocab, (bs,), dtype=torch.int32, device=DEV)
+    temps, _, seed = draft_args(max_bs, temperature=0.9, step=4)
+    top_k, top_p = filters(max_bs)
+    sampling = DraftSampling(
+        q_store=empty_store(3 * steps, width),
+        q_row_base=torch.tensor([6, 3, 0, -1], dtype=torch.int32, device=DEV),
+        seed=seed,
+        scratch=dspark_markov_sample_scratch(max_bs, vocab, DEV),
+        temperatures=temps,
+        top_k=top_k,
+        top_p=top_p,
+    )
+    before = [t.clone() for t in sampling.q_store]
+    model = SimpleNamespace(markov_head=head, draft_sampling=sampling)
+    drafts = KimiK3DSpark._sample_block(model, base, anchors, True)
+
+    assert torch.equal(drafts, head.sample_block(base, anchors, None))
+    for a, b in zip(sampling.q_store, before):
         assert torch.equal(a, b)

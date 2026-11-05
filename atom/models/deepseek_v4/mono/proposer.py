@@ -188,7 +188,11 @@ class MonoDSparkProposer(DSparkProposer):
                 target_positions=target_positions,
             )
         staged = self._stage_anchors(
-            running_bs, next_token_ids, target_positions, last_token_indices
+            self.block,
+            running_bs,
+            next_token_ids,
+            target_positions,
+            last_token_indices,
         )
         width = self.draft_tokens_per_seq
         self.model.prepare_block(

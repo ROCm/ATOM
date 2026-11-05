@@ -190,8 +190,9 @@ class DSparkMarkovHead(nn.Module):
         position's ``W1[x_{k-1}]``, which the sampled op does not produce.
         Lossless, each row writes its q
         straight into the row block its request owns (``sampling.q_row_base``),
-        which the accept kernel reads a step later. ``sampling`` is the
-        model's binding, fixed before capture, so one side is recorded.
+        which the accept kernel reads a step later. The branch on
+        ``sampling`` is python, so a recording holds one side; an armed
+        drafter records both (`DSparkProposer.block_greedy`).
         """
         bs, num_draft, vocab = base_logits.shape
         if sampling is not None:
@@ -303,8 +304,9 @@ class DSparkDraftModel(nn.Module):
 
     #: The buffers the block sampler draws into, set once lossless speculative
     #: sampling arms (`DSparkLossless.bind_target`), before any warmup or
-    #: capture; None keeps the greedy block sampler. The branch is python, so
-    #: a captured graph holds whichever side was set at capture.
+    #: capture; None keeps the greedy block sampler, as does
+    #: ``head_and_sample(..., greedy=True)`` whatever is set. The branch is
+    #: python, so a captured graph holds whichever side it was recorded with.
     draft_sampling: "DraftSampling | None" = None
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
@@ -415,10 +417,14 @@ class DSparkDraftModel(nn.Module):
         """
         raise NotImplementedError
 
-    def head_and_sample(self, out, anchor_ids: torch.Tensor, num_draft: int):
+    def head_and_sample(
+        self, out, anchor_ids: torch.Tensor, num_draft: int, *, greedy: bool = False
+    ):
         """The sequential half: LM head, then Markov sampling over the block.
 
         ``out`` is what ``block_backbone`` returned; ``anchor_ids`` is the one
-        argument whose shape says how many requests there are.
+        argument whose shape says how many requests there are. ``greedy``
+        takes the greedy sampler whatever ``draft_sampling`` holds; only a
+        flavor with ``supports_lossless_draft`` is asked for it.
         """
         raise NotImplementedError

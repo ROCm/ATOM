@@ -277,6 +277,9 @@ class Drafter(abc.ABC):
             self.config.max_num_seqs, self.mtp_k, self.device
         )
 
+        # Before the passes are declared: which passes there are may depend on
+        # whether lossless sampling armed.
+        self.lossless = self._arm_lossless_draft()
         self._build_draft_graphs()
 
     @staticmethod
@@ -293,6 +296,11 @@ class Drafter(abc.ABC):
             ),
             "bonus_logits_indices": CpuGpuBuffer(max_bs, dtype=torch.int64, **kwargs),
         }
+
+    def _arm_lossless_draft(self) -> "DSparkLossless | None":
+        """Arm lossless speculative sampling, or return None and keep the
+        greedy pair. Only a DSpark drafter arms it."""
+        return None
 
     # ---- draft passes ----
     def _declare_draft_graphs(self) -> tuple[DraftGraph, ...]:

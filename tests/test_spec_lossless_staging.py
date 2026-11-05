@@ -172,6 +172,37 @@ def test_the_draft_reads_the_targets_own_temperatures_and_filters(monkeypatch):
     assert sampling.top_p is forward_vars["top_ps"].gpu
 
 
+@pytest.mark.parametrize(
+    "lossless, dp, passes",
+    [(True, 1, 2), (True, 2, 1), (False, 1, 1)],
+    ids=["armed", "armed-dp2", "flag-off"],
+)
+def test_an_armed_drafter_declares_a_greedy_block_only_without_dp(
+    monkeypatch, lossless, dp, passes
+):
+    """The greedy block is a second pass over the same backbone, not a term
+    of the graph key: replay is decided on the DP-agreed batch alone, and
+    which head a step needs is a per-rank fact."""
+    model = FakeDraftModel()
+    model.supports_block_graph = True
+    prop = proposer(
+        monkeypatch,
+        lossless=lossless,
+        model=model,
+        parallel_config=SimpleNamespace(data_parallel_size=dp),
+    )
+    declared = prop._declare_draft_graphs()
+    assert len(declared) == passes and declared[0] is prop.block
+    assert prop.block.epilogue == prop._block_head and not prop.block.variant
+    if passes == 1:
+        assert prop.block_greedy is None
+        return
+    assert declared[1] is prop.block_greedy
+    assert prop.block_greedy.forward == prop.block.forward
+    assert prop.block_greedy.epilogue == prop._block_head_greedy
+    assert prop.block_greedy.name != prop.block.name
+
+
 @pytest.mark.parametrize("topk, width", [(None, VOCAB), (5, 5), (99999, VOCAB)])
 def test_the_q_store_is_k_wide_and_never_wider_than_the_vocab(monkeypatch, topk, width):
     if topk is not None:
@@ -505,3 +536,4 @@ def test_a_plain_drafter_starts_with_both_flags_set(monkeypatch):
     )
     drafter = _Bare(config, torch.device("cpu"), None)
     assert drafter.mtp_k == 1
+    assert drafter.lossless is None
