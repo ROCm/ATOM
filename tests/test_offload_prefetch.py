@@ -683,3 +683,53 @@ def test_a_taken_answer_that_is_not_admitted_is_given_back(setup):
     assert seq.status == SequenceStatus.WAITING and len(seq.block_table) == 0
     assert sched.kv_connector.released == [seq.id]
     assert sched.kv_connector.allocs == []
+
+
+def test_the_watermark_counts_only_the_blocks_an_admission_adds(
+    monkeypatch, seq_factory
+):
+    """A prompt that reuses live blocks takes no new block for them: the
+    probe's own demand decides, not the prompt's whole footprint."""
+    sched, _, (seq,) = _make(monkeypatch, seq_factory)
+    sched._prefetch.max_kv_usage = 0.01
+    real = sched._probe_hbm_prefix
+
+    def probe(s):
+        p = real(s)
+        p.num_new_blocks = 0  # everything it needs is already live
+        return p
+
+    monkeypatch.setattr(sched, "_probe_hbm_prefix", probe)
+    sched.schedule()
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+    # Without the probe's demand, the whole footprint counts.
+    sched2, _, (seq2,) = _make(monkeypatch, seq_factory)
+    sched2._prefetch.max_kv_usage = 0.01
+    sched2.schedule()
+    assert seq2.status == SequenceStatus.WAITING
+
+
+def test_a_misaligned_hit_found_after_the_answer_gives_the_answer_back(
+    monkeypatch, seq_factory
+):
+    """Under a bounded replay the HBM hit is only known once the answer is
+    taken. If it is then off the tier's chunk grid, the refusal is permanent
+    (Phase 2 runs the hand-off prefill), so the answer's read locks go back
+    rather than pin the prefix until Phase 2 gets there."""
+    from atom.model_engine.block_manager import AdmissionProbe
+
+    sched, _, (seq,) = _make(monkeypatch, seq_factory)
+    sched.kv_connector.chunk_size = 8  # a one-block hit (4 tokens) is off the grid
+    seq.has_per_req_cache = True
+    monkeypatch.setattr(sched.block_manager, "state_replay_tokens", 8, raising=False)
+    monkeypatch.setattr(
+        sched,
+        "_probe_hbm_prefix",
+        lambda s: AdmissionProbe(num_cached_blocks=1, num_new_blocks=1),
+    )
+    sched.schedule()
+    conn = sched.kv_connector
+    assert conn.released == [seq.id] and conn.taken == set()
+    assert seq.status == SequenceStatus.WAITING and not sched._prefetch.holds(seq)
+    assert sched._prefetch.skip_until[seq.id] == float("inf")
