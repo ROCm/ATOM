@@ -16481,6 +16481,8 @@ models:
         ROCPROFILER_REGISTER_ENABLED: "0"
         # Wait out a full send queue instead of failing the transfer (50 ms killed P at C64).
         MORI_IO_SQ_BACKOFF_TIMEOUT_US: "1000000"
+        # Start the second D on a node after the first has bound its ports (TCPStore EADDRINUSE otherwise).
+        ATOMESH_DECODE_START_STAGGER_S: "120"
         MORI_IO_QP_MAX_SEND_WR: "16384"
         MORI_IO_QP_MAX_CQE: "32768"
         MORI_IO_QP_MAX_SGE: "2"

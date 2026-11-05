@@ -1526,6 +1526,8 @@ elif [[ "${NODE_RANK}" -eq 0 ]]; then
 elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
   decode_pids=()
   for idx in $(seq 0 $((yD - 1))); do
+    # vLLM probes free ports (e.g. its TCPStore) and binds them later; D started together can pick the same one.
+    ((idx > 0)) && sleep "${ATOMESH_DECODE_START_STAGGER_S:-0}"
     gpu_start=$((idx * DECODE_TP_SIZE))
     gpu_end=$((gpu_start + DECODE_TP_SIZE - 1))
     export HIP_VISIBLE_DEVICES="$(seq -s, "${gpu_start}" "${gpu_end}")"
