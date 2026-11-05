@@ -40,6 +40,13 @@ def test_loader_thread_resolves_omp_from_torch_extension(monkeypatch):
     assert calls == [1]
 
 
+def _work_then_report():
+    a = torch.randn(512, 512)
+    _ = a @ a
+    _ = a.to(torch.float16).to(torch.float32)
+    return torch.get_num_threads()
+
+
 def test_a_loader_thread_runs_one_omp_thread_and_no_other_thread_does():
     default = torch.get_num_threads()
     if default < 2:
@@ -48,6 +55,7 @@ def test_a_loader_thread_runs_one_omp_thread_and_no_other_thread_does():
         max_workers=2, initializer=_one_omp_thread
     ) as pool:
         assert pool.submit(torch.get_num_threads).result() == 1
+        assert pool.submit(_work_then_report).result() == 1
         seen = {}
         other = threading.Thread(target=lambda: seen.update(n=torch.get_num_threads()))
         other.start()

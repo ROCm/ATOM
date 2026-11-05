@@ -152,6 +152,10 @@ its end marker — not a stall: it is reasoning, and it is delivered as
 region* appears, everything from it onward belongs to the format until it can
 parse the region.
 
+One case is sent twice instead of held: a dialect that declares
+`answer_end_markers` replays a think channel the model used as its reply as
+`content` once that is known (see `ReasoningFilter._close_channel`).
+
 ##### What is held, and for how long
 
 The rule is that a byte is buffered only while its **destination field** is
@@ -343,6 +347,10 @@ bug above, in the stage before it. A model writes `</think>\n\nThe answer.`;
 chunking) comparisons, the two agreed byte-for-byte on 50% of them; they now
 agree on all of them, and the property that says so is byte-exact rather than
 word-level.
+
+There is one reader: the non-streaming split is the streaming filter run over
+the whole output, once, and the filter is chunk-invariant, so the two delivery
+modes cannot disagree.
 
 The streaming filter also stopped eating the newline after its end marker. It
 only ever saw what happened to be buffered when the marker arrived, so the
