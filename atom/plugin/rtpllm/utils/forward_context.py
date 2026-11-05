@@ -673,7 +673,7 @@ class RTPForwardContext:
                 )
             has_initial_state = prefix_lengths > 0
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(query_start_loc)
+                compute_causal_conv1d_metadata(query_start_loc, num_tokens)
             )
             return GDNAttentionMetadata(
                 num_prefills=int(prefix_lengths.numel()),

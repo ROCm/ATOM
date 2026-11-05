@@ -87,6 +87,10 @@ class SpecDecodeMetadata:
     cu_num_draft_tokens: torch.Tensor
     target_logits_indices: torch.Tensor
     bonus_logits_indices: torch.Tensor
+    # Optional host mirrors for CPU grammar matching. GPU input_ids remain the
+    # authority for deferred tokens; their CPU staging mirror can be stale.
+    target_logits_indices_np: np.ndarray | None = None
+    bonus_logits_indices_np: np.ndarray | None = None
 
 
 _uncaptured_decode_shape_warned = False
@@ -631,6 +635,9 @@ class AttentionMetaData:
     # DSA + DCP indexer: MTP verify gives each draft position its own window.
     # The padded running-width buffer is shared by eager, graph and TBO paths.
     dcp_local_context_lens: torch.Tensor | None = None
+    # Whether this prefill runs sparse (DSA) MLA, decided once a step by the
+    # attention builder: the indexer, MLA and PCP all follow it.
+    run_sparse: bool = False
     # The step's index query rows as `score_topk` scores them, published once
     # a step by the attention builder for every indexer layer.
     index_rows: "IndexRows | None" = None

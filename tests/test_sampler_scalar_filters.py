@@ -69,6 +69,7 @@ def test_runner_uniform_filters_reach_sampler_without_readback(monkeypatch, tran
         temperatures=np.ones(3, dtype=np.float32),
         top_ks=np.full(3, 3, dtype=np.int32),
         top_ps=np.full(3, 0.75, dtype=np.float32),
+        required_channel=None,
     )
     runner._gate_staging_reuse()
     group = runner.h2d_groups.get("token_inputs")

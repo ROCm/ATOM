@@ -63,6 +63,11 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
     these units in response to elapsed time.
     """
 
+    # A native save also stores the boundary image of the request's SLOT,
+    # which the following forwards overwrite; its ordering with the forward
+    # that computes the chunk has not been worked out. Next-step emission.
+    _supports_same_step_save = False
+
     _supports_early_block_release = True
 
     def __init__(self, config: Any) -> None:

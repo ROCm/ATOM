@@ -36,6 +36,43 @@ def test_global_index_cache_layout_without_schedule_is_unchanged():
     assert aiter_mla._global_index_cache_layer_ids(None, 4, 1) == (0, 1, 2, 3, 4)
 
 
+def test_dsa_layers_price_only_the_real_index_layers(monkeypatch):
+    from atom.config import flatten_dsa_config
+
+    # A hybrid stack: every fourth layer is full attention and owns an index
+    # plane; the layers between are linear attention.
+    full_layers = [4, 8, 12]
+    hf = SimpleNamespace(
+        num_hidden_layers=12,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        index_head_dim=128,
+        linear_attn_config={"full_attn_layers": full_layers},
+        dsa_config={
+            "dsa_layers": full_layers,
+            "index_topk": 2048,
+            "index_num_heads": 32,
+            "index_head_dim": 128,
+            "index_rope_dim": 0,
+            "index_topk_freq": 1,
+        },
+    )
+    flatten_dsa_config(hf)
+    builder, runner = _builder(None, total_local_layers=len(full_layers))
+    runner.config.hf_config = hf
+    runner.config.speculative_config = None
+    runner.config.kv_cache_dtype = "bf16"
+    runner.block_size = 128
+    _mock_pp(monkeypatch, rank=0, world_size=1)
+    expected = tuple(layer - 1 for layer in full_layers)
+    assert builder._index_cache_layout() == (expected, expected)
+    # This exercises the actual pool declaration/pricing consumer, not just
+    # the config attribute. Index planes on the linear-attention layers would
+    # inflate this by 128 * 144 bytes each for every scheduler PAGE unit.
+    pool = builder._declare_kv_pool()
+    assert pool.entry_bytes == len(full_layers) * 128 * (576 * 2 + 144)
+
+
 def test_padded_prefill_mla_rows_have_empty_initialized_kv_ranges():
     kv_indptr = torch.tensor([0, 3, 7, 101, 202], dtype=torch.int32)
     kv_last_page_lens = np.array([3, 4, 9, 9], dtype=np.int32)
@@ -161,8 +198,10 @@ def _builder(
             hf_config=hf_config,
             kv_cache_dtype="fp8",
             speculative_config=SimpleNamespace(
+                # an MTP draft of a sparse target: the target's indexer fields
                 draft_model_hf_config=SimpleNamespace(
                     num_nextn_predict_layers=1,
+                    index_topk=2048,
                 ),
                 use_dspark_with_draft=lambda: False,
             ),
@@ -196,8 +235,9 @@ def test_pp_shared_indexer_uses_the_producer_buffer_width(monkeypatch):
             num_hidden_layers=4,
             indexer_types=("full", "shared", "shared", "full"),
             index_topk=2048,
-            index_topk_freq=1,
-            index_skip_topk_offset=1,
+            # As GLM-5.2 ships it: index_topk_freq > 1 turns the index cache on.
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
         )
     )
     runner.attn_metadata_builder = SimpleNamespace(index_topk_out=2176)
@@ -268,6 +308,26 @@ def test_a_hybrid_stage_still_finds_its_shared_draft(monkeypatch):
     # which is the difference the subtraction could not see.
     assert global_layer_ids == (1, 3, 5, 6)
     assert local_layer_ids == (3, 5, 6)
+
+
+def test_a_dense_dspark_draft_has_kv_rows_and_no_index_slices(monkeypatch):
+    """Kimi-K3-DSpark on K3.1: five dense MLA layers of its own (no indexer),
+    sharing the target's pool. Its rows are its `num_hidden_layers`, not an MTP
+    predict count, and it owns no index-key slice: the layout is the target's
+    alone. Counting one draft layer with a slice failed K3.1 + DSpark at
+    startup ("5 MLA modules ... declares 1 layers")."""
+    builder, runner = _builder(("full",) * 6, total_local_layers=11, draft_layers=5)
+    runner.config.speculative_config = SimpleNamespace(
+        draft_model_hf_config=SimpleNamespace(num_hidden_layers=5),
+        use_dspark_with_draft=lambda: True,
+    )
+    _mock_pp(monkeypatch, rank=0, world_size=1)
+
+    local_layer_ids, global_layer_ids = builder._index_cache_layout()
+
+    assert builder._local_draft_rows() == builder._global_num_draft_layers() == 5
+    assert builder._global_num_draft_index_layers() == 0
+    assert global_layer_ids == local_layer_ids == (0, 1, 2, 3, 4, 5)
 
 
 def test_a_draft_cannot_appear_on_a_stage_that_is_not_the_last(monkeypatch):

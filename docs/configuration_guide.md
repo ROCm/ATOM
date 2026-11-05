@@ -44,6 +44,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
 | `enable_log_stats` | `bool` | `True` | Emit the periodic engine-status line (running/waiting reqs, KV usage, prefix-cache hit rate, prompt/generation throughput). Applies to offline `LLM(...)` as well as to the server. Scoped to that line: `[MTP Stats]` and `[Cache Stats]` have their own gates |
 | `throughput_log_interval` | `float` | `10.0` | Seconds between engine-status lines. Must be > 0 |
+| `throughput_log_interval_steps` | `int` | `0` | Forwards between engine-status lines, replacing the clock above when > 0. For offline / MLPerf runs comparing one DP rank's lines against another's: the clock lands on a different step number on each rank, a forward count lands on the same one (an idle DP rank counts its dummy). The line reports a cumulative forward count, which is the quantity two ranks share; an all-dummy window still emits its line, since a missing line is what a comparison cannot recover from. Because the window closes on a count rather than a deadline it can span any amount of wall clock, so stretches where no forward ran — idle, stalled on a deferred save or PrefillDone, weights parked by an RL rollout — are subtracted from the `tokens/s` divisor. The first line is warmup: a DP rank's window one opens before its first `_sync_dp_state`, so the barrier waiting for the slowest rank lands in that divisor. Base and DP engines only — pipeline parallel replaces the busy loop that counts, and RapidServe and P/D are not covered yet; all three fall back to the clock with a warning. A decode step is milliseconds, so an interval below ~20 will dominate the log |
 | `cache_hit_rate_window` | `int` | `1000` | Requests in the sliding window behind the engine-status line's prefix-cache hit rate. Must be > 0. Only that line is windowed; `/metrics` and `[Cache Stats]` stay cumulative |
 | `enable_dynamic_chunking` | `bool` | `False` | Size pipeline-parallel prefill chunks from a calibrated equal-latency model. Needs `pipeline_parallel_size > 1` and chunked prefill, and does not apply to RapidServe or a P/D decode instance (`kv_role: kv_consumer`); otherwise the flag is turned off with a warning and chunking stays fixed |
 | `dynamic_chunking_smooth_factor` | `float \| None` | `None` | Blend from the initial chunk (`0`) to the equal-latency chunk (`1`). `None` takes `ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR`, read only when the feature is on. Must be in `[0, 1]` when the feature is on |
@@ -369,6 +370,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--enable_prefix_caching` | | flag | `False` | Enable prefix caching |
 | `--enable-log-stats` / `--no-enable-log-stats` | | flag | `True` | Emit the periodic engine-status line |
 | `--throughput-log-interval` | | `float` | `10.0` | Seconds between engine-status lines |
+| `--throughput-log-interval-steps` | | `int` | `0` | Forwards between engine-status lines instead of seconds; base and DP engines only |
 | `--port` | | `int` | `8006` | Engine internal port |
 | `--kv_cache_dtype` | | `str` | `"bf16"` | KV cache dtype; choices: `bf16`, `fp8` |
 | `--index-cache-dtype`, `--index_cache_dtype` | | `str` | `None` | Indexer-cache dtype; choices: `bf16`, `fp8`, `fp4`. When omitted, uses the architecture- and integration-aware `Config.index_cache_dtype` defaults described above. |
@@ -390,6 +392,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--max-num-seqs` | | `int` | `512` | Maximum number of sequences to batch together |
 | `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 — 1.0) |
 | `--scheduler-delay-factor` | | `float` | `0.0` | Delay factor multiplied by previous prompt latency before scheduling next prompt |
+| `--prefill-admit-policy` | | `str` | `interval` | When the prefill delayer admits new prefills. `interval` (default) keeps `ATOM_PREFILL_DECODE_INTERVAL` and the coalescer. `adaptive` replaces both, after the must-fire bounds (no decode, KV, `MAX_QUEUE_MS`, `TTFT_MAX_TICKS`): it fits the decode step as `T0 + c*b` and the prefill step as `A + k*n` from measured step times, and fires once the held requests' accumulated cost (sum over held ticks of admittable requests × `T0`) reaches the fixed prefill cost × decode batch (`A × B`), i.e. the EOQ / rent-or-buy point. `T0` is taken as 0.75 × the mean decode step and `A` is clamped to 0.3–1.5 × the mean prefill step; a FIRE comes on the 4th decision after the previous one at the earliest (3 held ticks), and at the latest once about 600 ms of decode steps have passed (cold start: 24 decisions; at most 200). These are fixed constants in `prefill_delayer.py`. Fits and counts ride the delayer's existing all_reduce, so DP ranks decide in lockstep. Like a positive interval, it enables local coalescing on DP=1, PP=1, i.e. on plain TP runs too; the measurements so far are DEP4 only, so TP-only gains are unverified. Counterpart of vLLM's `--prefill-schedule-interval` (off by default there too). |
 | `--online_quant_config` | | JSON string | `None` | Load-time online quantization override; see Section 3.7 |
 
 **Example:**
@@ -427,6 +430,7 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION` | `bool` | `True` | Enable fused input RMSNorm + quantization for DeepSeek models |
 | `ATOM_ENABLE_DS_QKNORM_QUANT_FUSION` | `bool` | `True` | Enable fused QK-norm + quantization for DeepSeek models |
 | `ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION` | `bool` | `True` | Enable fused all-reduce + RMSNorm kernel |
+| `ATOM_ENABLE_GLUON_FUSED_AR` | `bool` | `True` | Use aiter's Gluon fused all-reduce + RMSNorm for decode at TP4 (sets `AITER_GLUON_FUSED_AR=1`; aiter uses it on gfx1250 only) |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT` | `bool` | `True` | Enable AITER Triton fused RMSNorm + quantization for LLaMA models |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT` | `bool` | `True` | Enable AITER Triton fused SiLU + multiply + quantization for LLaMA models |
 

@@ -562,7 +562,9 @@ def test_real_config_accepts_tbo_before_dpa_rank_expansion(
     # The quantization parser resolves AITER enums. Only bypass that GPU
     # dependency; execute the real Config.__post_init__, HF config load,
     # V4.1 admission check and engine rank planner on CPU.
-    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
+    monkeypatch.setattr(
+        config_module, "QuantizationConfig", lambda *args, **kwargs: None
+    )
     cfg = Config(
         model=str(fixture),
         tensor_parallel_size=tp,
@@ -609,7 +611,9 @@ def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
     monkeypatch.setattr(config_module, "get_hf_config", lambda *args, **kwargs: hf)
     monkeypatch.setattr(config_module, "get_generation_config", lambda *args: None)
     # Quantization resolves AITER enums; keep this admission test CPU-only.
-    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
+    monkeypatch.setattr(
+        config_module, "QuantizationConfig", lambda *args, **kwargs: None
+    )
     validated = []
 
     def start_core(config):
@@ -621,11 +625,12 @@ def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
         )
         assert config.parallel_config.data_parallel_master_port == 27123
         validated.append(config.parallel_config)
+        return SimpleNamespace()
 
     monkeypatch.setattr(engine_module, "CoreManager", start_core)
     monkeypatch.setattr(
         engine_module,
-        "_load_tokenizer",
+        "load_tokenizer",
         lambda *args: SimpleNamespace(bos_token_id=0, eos_token_id=1),
     )
     kwargs = {"data_parallel_size": 4, "data_parallel_master_port": 27123}

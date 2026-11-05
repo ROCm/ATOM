@@ -27,12 +27,14 @@ class Qwen3NextGatedDeltaNetVllm(Qwen3NextGatedDeltaNet, MambaBase):
         quant_config=None,
         speculative_config=None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__(
             atom_config=atom_config,
             quant_config=quant_config,
             speculative_config=speculative_config,
             prefix=prefix,
+            reduce_results=reduce_results,
         )
         self.model_config = atom_config.plugin_config.vllm_config.model_config
         self.cache_config = atom_config.plugin_config.vllm_config.cache_config

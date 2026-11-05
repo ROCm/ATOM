@@ -14,6 +14,12 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
+from atom.model_loader.weight_utils import (
+    checkpoint_layer_key,
+    unquantized_layer_keys,
+)
+
 # plugin-related utilities
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
@@ -302,7 +308,12 @@ class QuantizationConfig:
         self,
         config: PretrainedConfig = None,
         online_quant_config: dict | None = None,
+        model: str | None = None,
     ):
+        # Layers the checkpoint at `model` stores in a plain float dtype.
+        self._stored_unquantized = (
+            unquantized_layer_keys(model) if model else frozenset()
+        )
         if config is None:
             self.torch_dtype = torch.bfloat16
             self.hf_quant_config = None
@@ -439,8 +450,14 @@ class QuantizationConfig:
             global_spec = self.global_spec
             exclude_layers = self.exclude_layers
 
-        # 1. Exclude list
+        # 1. Exclude list, and (checkpoint specs only) a layer stored
+        # unquantized whatever the config's patterns say.
         if self._is_excluded(layer_name, exclude_layers, check_children=check_children):
+            return LayerQuantConfig(quant_dtype=self.torch_dtype)
+        if (
+            not use_online_quant
+            and checkpoint_layer_key(layer_name) in self._stored_unquantized
+        ):
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
 
         # 2. Pattern match
@@ -734,9 +751,17 @@ _CONFIG_REGISTRY: dict[str, str] = {
 # as a bare PretrainedConfig instead (see get_hf_config).
 _PLAIN_CONFIG_MODEL_TYPES: frozenset[str] = frozenset({"k3_dspark"})
 
+# a checkpoint architecture that is another's model under a new name: loaded
+# as that one (``get_hf_config``), so every table keyed by architecture holds
+# one entry for both
+ARCH_ALIASES: dict[str, str] = {
+    "KimiK31ForConditionalGeneration": "KimiK3ForConditionalGeneration",
+}
+
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     "kimi_k3": "text_config",
+    "kimi_k31": "text_config",
     "kimi_k25": "text_config",
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
@@ -761,7 +786,32 @@ _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
 }
 
 
+def flatten_dsa_config(hf_config) -> None:
+    """Publish a nested ``dsa_config`` as the flat fields the shared DSA code
+    reads: its ``index_*`` entries (``index_num_heads`` as ``index_n_heads``)
+    and the zero-based ``dsa_layer_indices`` of its one-based ``dsa_layers``.
+    Done before the attention backend is chosen, which keys on ``index_topk``."""
+    dsa = getattr(hf_config, "dsa_config", None)
+    if not dsa:
+        return
+    for name, value in dsa.items():
+        if name != "dsa_layers":
+            dest = "index_n_heads" if name == "index_num_heads" else name
+            setattr(hf_config, dest, value)
+    hf_config.dsa_layer_indices = tuple(sorted(i - 1 for i in dsa["dsa_layers"]))
+
+
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
+    """``model``'s config, its architecture the one ATOM's tables key
+    (``ARCH_ALIASES``)."""
+    hf_config = _load_hf_config(model, trust_remote_code)
+    architectures = getattr(hf_config, "architectures", None)
+    if architectures and architectures[0] in ARCH_ALIASES:
+        hf_config.architectures = [ARCH_ALIASES[architectures[0]]]
+    return hf_config
+
+
+def _load_hf_config(model: str, trust_remote_code: bool) -> PretrainedConfig:
     config_dict, _ = PretrainedConfig.get_config_dict(
         model,
     )
@@ -815,6 +865,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         original_arch = config_dict.get("architectures", [])
         if original_arch:
             hf_config.architectures = original_arch
+        flatten_dsa_config(hf_config)
         # Propagate top-level token IDs if missing in text config
         for field in ("bos_token_id", "eos_token_id", "pad_token_id"):
             if getattr(hf_config, field, None) is None and field in config_dict:
@@ -2006,6 +2057,10 @@ class Config:
     # --no-encoder-swa-bounded-replay keeps checkpoints. No effect on other models.
     enable_encoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
+    # Prefill admission (`--prefill-admit-policy`): "interval" keeps
+    # ATOM_PREFILL_DECODE_INTERVAL and the coalescer; "adaptive" replaces both
+    # with the rent-or-buy rule in prefill_delayer.py.
+    prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
@@ -2047,8 +2102,13 @@ class Config:
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
+    enable_request_context_metrics: bool = False
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
     throughput_log_interval: float = 10.0
+    # Forwards between engine-status lines, replacing the clock above when
+    # positive. For offline / MLPerf runs comparing one DP rank's lines against
+    # another's; the clock lands on a different step number on each rank.
+    throughput_log_interval_steps: int = 0
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
@@ -2066,6 +2126,9 @@ class Config:
     compilation_config: CompilationConfig = field(default_factory=CompilationConfig)
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
+    # Queue finished sequences on outputs_queue; only its readers turn it on
+    # (LLMEngine.add_request for step / generate, and asyncio_mode).
+    keep_finished_outputs: bool = False
     mark_trace: bool = False
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
@@ -2187,6 +2250,71 @@ class Config:
             return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
 
+    def _resolve_throughput_step_interval(self) -> None:
+        """Keep the step trigger to the topologies it has been validated on.
+
+        Two different reasons, and only the first is a hard one. PP replaces
+        `busy_loop` outright (`pp_engine_core.py`), so `bump_step` is never
+        reached and the line would go silent after announcing a logging mode.
+        RapidServe and P/D are a scope choice: `PrefillEngineCore` and
+        `DecodeEngineCore` inherit the base loop and override only
+        `_process_engine_step`, so the counter would in fact advance there --
+        it is simply untested, and a step number nobody has lined up across a
+        disaggregated pair is worth less than the clock. Degrade rather than
+        raise: a stale flag in a shared launch script must not stop a server
+        from starting.
+        """
+        if self.throughput_log_interval_steps <= 0 or not self.enable_log_stats:
+            # Nothing to warn about with the line itself off: the fallback a
+            # warning would name is the clock, which is equally silent.
+            self.throughput_log_interval_steps = 0
+            return
+        # Shared with the P/D classifier rather than re-derived here. It walks
+        # a MultiConnector's nested entries (a prefill node carries `kv_role`
+        # one level down with nothing at the top) and tolerates any shape,
+        # which this blob needs: it is user-supplied CLI JSON, and raising
+        # would take the server down at construction. It also keys on the
+        # connector name, because an offload tier legally takes `kv_producer`
+        # and `kv_consumer` while running the loop that counts.
+        from atom.kv_transfer.disaggregation.pd_producer import (
+            disaggregated_kv_role,
+        )
+
+        kv_role = disaggregated_kv_role(self)
+        if self.pipeline_parallel_size > 1:
+            reason = (
+                f"pipeline_parallel_size is {self.pipeline_parallel_size}, which "
+                "replaces the busy loop that counts the forwards"
+            )
+        elif self.enable_rapidserve:
+            reason = "RapidServe is not covered by the step counter yet"
+        elif kv_role is not None:
+            reason = f"a P/D engine (kv_role={kv_role}) is not covered yet"
+        else:
+            return
+        logger.warning(
+            "throughput_log_interval_steps=%d ignored because %s; the "
+            "engine-status line stays on the %.1fs clock. Step-aligned "
+            "windows are supported on the base and DP engines only.",
+            self.throughput_log_interval_steps,
+            reason,
+            self.throughput_log_interval,
+        )
+        self.throughput_log_interval_steps = 0
+
+    @property
+    def end_token_ids(self) -> tuple[int, ...]:
+        """Every token ID that terminates generation on this deployment."""
+        return tuple(
+            sorted(
+                {
+                    i
+                    for i in (self.eos_token_id, *self.stop_token_ids)
+                    if i is not None and i >= 0
+                }
+            )
+        )
+
     def __post_init__(self):
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
@@ -2204,6 +2332,13 @@ class Config:
             )
             self.enable_tbo = False
             self.enable_tbo_decode = False
+
+        self.prefill_admit_policy = self.prefill_admit_policy.strip().lower()
+        if self.prefill_admit_policy not in PREFILL_ADMIT_POLICIES:
+            raise ValueError(
+                f"prefill_admit_policy must be one of {PREFILL_ADMIT_POLICIES}, "
+                f"got {self.prefill_admit_policy!r}"
+            )
 
         self.moe_backend = self.moe_backend.strip().lower()
         if self.moe_backend not in ("standard", "mega"):
@@ -2389,6 +2524,7 @@ class Config:
         self.quant_config = QuantizationConfig(
             self.hf_config,
             self.online_quant_config,
+            model=self.model,
         )
         # In plugin mode, supplement exclude_layers with vLLM's ignored_layers when
         # the HF quant config didn't produce any exclusions (non-quark quant methods).
@@ -2467,6 +2603,9 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        # After the parse above: the P/D clause reads `kv_role` off
+        # `kv_transfer_config`, which arrives from the CLI as a string.
+        self._resolve_throughput_step_interval()
         if self.kv_transfer_config:
             # The offload namespace hashes the model's cache geometry. A worker
             # normalises `hf_config` while it builds the model (Kimi-K3 derives
@@ -2485,6 +2624,7 @@ class Config:
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
         self._resolve_dynamic_chunking()
+        self._check_pp_support()
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
@@ -2695,6 +2835,52 @@ class Config:
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+    def _check_pp_support(self) -> None:
+        """Refuse what PP does not wire yet: TBO, P/D consumers, and speculation
+        an architecture does not declare in ``pp_speculative_methods`` (a P/D
+        producer does not speculate); anything else fails mid-serving or drafts
+        from zero buffers.
+        """
+        if self.pipeline_parallel_size <= 1:
+            return
+        # UBatchWrapper.forward takes no intermediate_tensors.
+        if self.enable_tbo:
+            raise ValueError(
+                "TBO (enable_tbo) is not supported with pipeline_parallel_size > 1."
+            )
+        from atom.kv_transfer.disaggregation.pd_producer import (
+            disaggregated_kv_role,
+        )
+
+        # A consumer's first decode leaves T0 plus mtp_k placeholders, not the
+        # mtp_k + 1 the PP verify window assumes, and the PP loop has no
+        # remote-KV path at all.
+        role = disaggregated_kv_role(self)
+        if role == "kv_consumer":
+            raise ValueError(
+                "A P/D kv_consumer is not supported with pipeline_parallel_size > 1."
+            )
+        # A producer never speculates; it loads the drafter only to write the
+        # draft layer's KV.
+        if self.speculative_config is None or role == "kv_producer":
+            return
+        from atom.models.registry import pp_speculative_methods
+
+        archs = getattr(self.hf_config, "architectures", None) or ()
+        spec = self.speculative_config
+        method = "dspark" if spec.use_dspark() else spec.method
+        if not any(method in pp_speculative_methods.get(a, ()) for a in archs):
+            raise ValueError(
+                "pipeline_parallel_size > 1 with speculative decoding supports "
+                "only the methods registry.pp_speculative_methods declares, got "
+                f"architectures={list(archs)}, method={method!r}."
+            )
+        if self.dspark.confidence_schedule:
+            raise ValueError(
+                "The DSpark confidence scheduler (confidence_schedule) is not "
+                "supported with pipeline_parallel_size > 1."
+            )
 
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.

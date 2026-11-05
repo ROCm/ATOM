@@ -15,7 +15,7 @@ import weakref
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Lock, RLock, Thread, local
+from threading import Event, Lock, RLock, Thread, local
 
 import zmq
 import zmq.asyncio
@@ -224,16 +224,19 @@ class CoreManager:
         """
         self.label = label
         self._closed = False  # Track whether already closed
+        self._engine_failed = Event()
         self.local_engine_count = local_engine_count
         self.global_engine_count = (
             local_engine_count if global_engine_count is None else global_engine_count
         )
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
+        self.keep_finished_outputs = config.keep_finished_outputs or config.asyncio_mode
         # Utility replies are matched to their caller by request id, not by
         # position on a shared queue, where a late or unasked-for reply became
         # the next caller's answer.
         self._rpc_router = RpcResponseRouter()
+        self.structured_request_prepare = None
         # Held across every bucket plus FINISH/abort. RLock lets the sender's
         # outer session call the same synchronous command method per bucket.
         self._weight_sync_lock = RLock()
@@ -732,6 +735,7 @@ class CoreManager:
                         )
                         continue
                     if request_type == EngineCoreRequestType.SHUTDOWN:
+                        self._engine_failed.set()
                         logger.debug(
                             f"{self.label} (DP {dp_rank}): output thread receive SHUTDOWN request"
                         )
@@ -831,7 +835,8 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
-                        self.outputs_queue.put_nowait(seqs)
+                        if self.keep_finished_outputs:
+                            self.outputs_queue.put_nowait(seqs)
                         # These completions freed slots on their ranks — re-feed
                         # from the pending pool so a fast rank never drains to
                         # empty while peers still have work. No-op when
@@ -996,6 +1001,38 @@ class CoreManager:
             )
 
     def add_request(self, seqs: list[Sequence]):
+        structured = [
+            seq for seq in seqs if getattr(seq, "json_schema", None) is not None
+        ]
+        if structured:
+            try:
+                if self.structured_request_prepare is None:
+                    raise ValueError("Structured output requires engine admission")
+                self.structured_request_prepare(structured)
+                self._add_prepared_requests(seqs)
+            except BaseException:
+                self._release_structured_requests(structured)
+                raise
+        else:
+            self._add_prepared_requests(seqs)
+
+    def _release_structured_requests(self, seqs):
+        # The submitted/finished sequences own the cleanup information. There
+        # is no cross-thread registry: workers tolerate repeated releases.
+        ids = [seq.id for seq in seqs if getattr(seq, "json_schema", None) is not None]
+        if not ids:
+            return
+        try:
+            # Never wait for an RPC reply on the output receiver thread.
+            self.broadcast_utility_command(
+                "release_structured_requests", request_ids=ids
+            )
+        except Exception:
+            # Cleanup must neither interrupt terminal delivery nor hide the
+            # original admission failure. Worker teardown also frees state.
+            logger.exception("%s: structured cleanup failed for %s", self.label, ids)
+
+    def _add_prepared_requests(self, seqs: list[Sequence]):
         tracing.bind_sequences(seqs)
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
@@ -1271,7 +1308,23 @@ class CoreManager:
         ``LLMEngine.generate`` waits while the engine is alive and any request
         is unfinished. A dropped seq never finishes, so that wait never ends.
         The seqs are still in ``_bp_pending``; this only surfaces the error.
+        A pending seq with a stream callback is not reading that queue, so it
+        is taken out and ended through its callback, as abort does.
         """
+        with self._lb_lock:
+            waiting = [s for s in self._bp_pending if s.id in self._seq_id_to_callback]
+            for seq in waiting:
+                self._bp_pending.remove(seq)
+        delivered = False
+        for seq in waiting:
+            if not getattr(seq, "leave_reason", None):
+                seq.leave_reason = "aborted"
+            delivered |= self._deliver_terminal_output(seq)
+        if delivered and self._flush_stream_batch_fn is not None:
+            try:
+                self._flush_stream_batch_fn()
+            except Exception as e:  # noqa: BLE001 - the error below must still go out
+                logger.warning("%s: flush_stream_batch failed: %s", self.label, e)
         pending = len(getattr(self, "_bp_pending", ()))
         logger.error(
             "%s: backpressure send failed with nothing in flight; "
@@ -1495,6 +1548,7 @@ class CoreManager:
         and normal completions have had theirs popped by the STREAM that
         delivered them, so both answer False and keep their existing path.
         """
+        self._release_structured_requests([seq])
         callback = self._seq_id_to_callback.pop(seq.id, None)
         if callback is None:
             return False
@@ -1688,6 +1742,8 @@ class CoreManager:
             return
         try:
             self.broadcast_utility_command("abort_request", req_id=req_id)
+            # Waiting/running cancellations return a finished Sequence through
+            # the ordinary output path, which releases grammar on every rank.
         except Exception as e:  # noqa: BLE001 - disconnect cleanup must not raise
             logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
 
@@ -2089,6 +2145,16 @@ class CoreManager:
         return any(
             proc is not None and proc.is_alive() for proc in self.engine_core_processes
         )
+
+    def is_healthy(self) -> bool:
+        """Include reported nested-worker failures, even during slow teardown."""
+        if self._closed or self._engine_failed.is_set():
+            return False
+        local_procs = [p for p in self.engine_core_processes if p is not None]
+        try:
+            return bool(local_procs) and all(p.is_alive() for p in local_procs)
+        except ValueError:  # A concurrent shutdown closed a process handle.
+            return False
 
     def finished_procs(self):
         return any(

@@ -19,6 +19,7 @@ from atom.entrypoints.openai.protocol import (
     ChatMessage,
     CompletionRequest,
 )
+from atom.sampling_params import SamplingParams
 
 PROMPT_IDS = [101, 102, 103, 104]
 
@@ -304,7 +305,10 @@ class TestHttpResponseSerialization:
 
 
 @pytest.mark.parametrize("return_ids", [False, True])
-def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return_ids):
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_generate_async_reads_prompt_ids_from_local_sequence(
+    monkeypatch, return_ids, multimodal
+):
     seq = SimpleNamespace(
         id=7,
         prompt_token_ids=list(PROMPT_IDS),
@@ -317,6 +321,7 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return
         stream_callback(
             SimpleNamespace(
                 output_tokens=[5],
+                logprobs=None,
                 finished=True,
                 finish_reason="eos",
                 num_cached_tokens=0,
@@ -330,18 +335,25 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return
     )
     monkeypatch.setattr(api_server, "engine", engine)
     monkeypatch.setattr(
-        api_server, "_validate_sequence_context_length", lambda _s: None
+        api_server, "_validate_sequence_context_length", lambda _s, _sampling=None: None
     )
     monkeypatch.setattr(api_server, "delivered_text", lambda _ids: "hello")
     monkeypatch.setattr(api_server, "record_nonstream_first_token", lambda: None)
 
     async def collect():
-        return [
-            output
-            async for output in api_server.generate_async(
-                PROMPT_IDS, object(), "req-1", return_token_ids=return_ids
-            )
-        ]
+        # Read the IDs retained by preprocessing, rather than echoing its
+        # input: multimodal preprocessing may have expanded placeholders.
+        generate = (
+            api_server.generate_async_multimodal
+            if multimodal
+            else api_server.generate_async
+        )
+        args = (
+            ([11, 12], {"image": "fixture"}, SamplingParams(), "req-1")
+            if multimodal
+            else ([11, 12], SamplingParams(), "req-1")
+        )
+        return [output async for output in generate(*args, return_token_ids=return_ids)]
 
     outputs = asyncio.run(collect())
     assert len(outputs) == 1
@@ -481,3 +493,131 @@ class TestChunkedAdmissionTopology:
     ):
         monkeypatch.setattr(api_server, "engine", None)
         api_server._validate_chunked_receive(params)
+
+
+@pytest.mark.parametrize("return_ids", [False, True])
+@pytest.mark.parametrize("n", [1, 2])
+def test_multimodal_chat_returns_requested_prompt_ids(
+    monkeypatch, server, return_ids, n
+):
+    media = {"image": "fixture"}
+    calls = []
+
+    def output():
+        result = {
+            "text": "red",
+            "finish_reason": "stop",
+            "num_tokens_input": len(PROMPT_IDS),
+            "num_tokens_output": 1,
+        }
+        if return_ids:
+            result["prompt_token_ids"] = list(PROMPT_IDS)
+        return result
+
+    async def single(ids, images, _sampling, _request_id, **kwargs):
+        assert ids == PROMPT_IDS and images is media
+        assert kwargs["return_token_ids"] is return_ids
+        calls.append("single")
+        yield output()
+
+    async def fanout(ids, _sampling, _request_id, **kwargs):
+        assert ids == PROMPT_IDS and kwargs["multimodal_data"] is media
+        assert kwargs["return_token_ids"] is return_ids
+        calls.append("fanout")
+        return [output() for _ in range(n)]
+
+    monkeypatch.setattr(api_server, "_get_multimodal_processor", lambda: object())
+    monkeypatch.setattr(
+        api_server,
+        "_prepare_multimodal_inputs",
+        lambda *_args: (list(PROMPT_IDS), media),
+    )
+    monkeypatch.setattr(api_server, "generate_async_multimodal", single)
+    monkeypatch.setattr(api_server, "generate_async_fanout", fanout)
+    payload = {
+        "model": "m",
+        "temperature": 1.0,
+        "n": n,
+        "return_token_ids": return_ids,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe the image."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AA=="},
+                    },
+                ],
+            }
+        ],
+    }
+
+    async def post():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_server.app), base_url="http://test"
+        ) as client:
+            return await client.post("/v1/chat/completions", json=payload)
+
+    response = asyncio.run(post())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["prompt_token_ids"] == (PROMPT_IDS if return_ids else None)
+    assert body["usage"]["prompt_tokens"] == len(PROMPT_IDS)
+    assert len(body["choices"]) == n
+    assert calls == ["single" if n == 1 else "fanout"] and server.templates == 0
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "completion"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "cap",
+    [
+        {},
+        {"max_tokens": None},
+        {"max_tokens": 512},
+        {"max_completion_tokens": 512},
+        {"max_tokens": 8192},
+    ],
+)
+def test_output_cap_default_presence_reaches_sampling(
+    server, monkeypatch, endpoint, stream, cap
+):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(
+        api_server, "_get_engine_config", lambda: SimpleNamespace(max_model_len=4096)
+    )
+    original = api_server._build_sampling_params
+    seen = []
+
+    def capture(**kwargs):
+        result = original(**kwargs)
+        seen.append(result)
+        return result
+
+    monkeypatch.setattr(api_server, "_build_sampling_params", capture)
+    req, handler = _request(endpoint, stream=stream, **cap)
+    if endpoint == "completion":
+        req.prompt = "hi"
+
+    # Stop after sampling construction; generation is covered by this module's
+    # endpoint tests and the context-budget tests exercise engine prompt lengths.
+    def stop(*args, **kwargs):
+        raise RuntimeError("sampling captured")
+
+    monkeypatch.setattr(api_server, "apply_chat_template", stop)
+    monkeypatch.setattr(type(req), "get_prompt_or_tokens", stop, raising=False)
+    if cap.get("max_tokens") == 8192:
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(handler(req, SimpleNamespace()))
+        assert exc.value.status_code == 400
+        return
+    try:
+        asyncio.run(handler(req, SimpleNamespace()))
+    except (RuntimeError, HTTPException):
+        pass
+    assert len(seen) == 1
+    explicit = any(value is not None for value in cap.values())
+    assert seen[0].max_tokens_is_default == (not explicit)
+    assert seen[0].max_tokens == (512 if explicit else 4096)

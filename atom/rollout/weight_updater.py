@@ -768,6 +768,30 @@ class WeightUpdaterMixin:
             and getattr(module, "weight_scale", None) is not None
         )
 
+    @staticmethod
+    def _logical_weight_shape(
+        module: torch.nn.Module, param: torch.nn.Parameter
+    ) -> tuple:
+        """Parameter shape without the E8M0 per_1x128 output-row pad.
+
+        Other layouts, including per-token FP8 padding, keep ``param.shape``:
+        their scale rows are padded too, and zero-filling before quantize would
+        not reproduce that scale.
+        """
+        from aiter import dtypes
+
+        shape = tuple(param.shape)
+        if (
+            module.weight_scale.dtype != dtypes.fp8_e8m0
+            or not getattr(module, "is_output_padded", False)
+            or len(shape) != 2
+        ):
+            return shape
+        logical_n = getattr(module, "_output_size_before_padding", None)
+        if not isinstance(logical_n, int) or not 0 < logical_n < shape[0]:
+            return shape
+        return (logical_n, shape[1])
+
     def _requantize_fp8_weight(
         self,
         module: torch.nn.Module,
@@ -787,15 +811,23 @@ class WeightUpdaterMixin:
 
         tensor_gpu = tensor.to(device=self.device, dtype=torch.float32)
 
+        # E8M0 per_1x128 stores N padded up to a multiple of 128. The
+        # training weight is the logical, unpadded shape, so shard and compare
+        # against that and restore the pad rows before the shape check below.
+        logical_shape = self._logical_weight_shape(module, param)
         tp_size = self.world_size
         if tp_size > 1 and tensor_gpu.shape != param.shape:
             for dim in range(len(param.shape)):
-                if tensor_gpu.shape[dim] == param.shape[dim] * tp_size:
-                    shard_size = param.shape[dim]
+                if tensor_gpu.shape[dim] == logical_shape[dim] * tp_size:
+                    shard_size = logical_shape[dim]
                     tensor_gpu = tensor_gpu.narrow(
                         dim, self.rank * shard_size, shard_size
                     )
                     break
+        if tensor_gpu.shape == logical_shape and logical_shape != tuple(param.shape):
+            tensor_gpu = torch.nn.functional.pad(
+                tensor_gpu, (0, 0, 0, param.shape[0] - tensor_gpu.shape[0])
+            )
 
         if tensor_gpu.shape != param.shape:
             logger.warning(
@@ -814,12 +846,23 @@ class WeightUpdaterMixin:
             # produced a 1x128-along-K scale (N, K//128) and sliced it into the
             # (N//128, K//128) buffer, which is inconsistent with the blockscale
             # GEMM and collapses generation after the first weight update.
+            # ``scale_dtype`` has to be decided here too. Casting an FP32 scale
+            # to E8M0 afterwards does not round it up to a power of two, and
+            # the weight would have been quantized against the unrounded scale.
             from atom.quantization.quark.utils import (
                 quantize_weight_to_fp8_128x128_blockscale,
             )
 
             q_weight, scale = quantize_weight_to_fp8_128x128_blockscale(
-                tensor_gpu, fp8_dtype
+                tensor_gpu,
+                fp8_dtype,
+                # Online quant rebuilds its own (maybe E8M0) scale; a
+                # checkpoint's scale keeps main's FP32 requantize.
+                scale_dtype=(
+                    module.weight_scale.dtype
+                    if getattr(module.quant_config, "online_quant", False)
+                    else torch.float32
+                ),
             )
             # The scale writes ride on the weight's fence: `_await_readers_of`
             # synchronizes the device, so the reader that held the weight held

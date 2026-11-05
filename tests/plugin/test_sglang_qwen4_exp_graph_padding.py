@@ -13,6 +13,7 @@ from atom.plugin.sglang.qwen4_exp_bridge import (
     _NO_WRITE,
     _eager_qsa_max_seq_len,
     _fill_block_tables_into,
+    _flydsl_prefill_layout,
     _lift_qsa_seq_lens,
     _ple_state_pool_slots,
     _query_start_loc,
@@ -775,6 +776,70 @@ def test_ple_state_pool_slots_uses_mamba_pool_size():
     assert _ple_state_pool_slots(fb, idx) >= 64
 
 
+def test_ple_state_pool_slots_ignores_kv_token_budget(monkeypatch):
+    """`--max-total-tokens` sizes the KV cache, not the mamba pool; as a PLE
+    row floor it allocated one 184 KB row per KV token."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    monkeypatch.setattr(
+        bridge,
+        "_server_args",
+        lambda: SimpleNamespace(
+            max_mamba_cache_size=330, max_total_tokens=65536, max_running_requests=4
+        ),
+    )
+    fb = SimpleNamespace(
+        batch_size=4,
+        attn_backend=None,
+        req_to_token_pool=SimpleNamespace(size=64, req_to_token=torch.zeros(64, 8)),
+        token_to_kv_pool=None,
+    )
+    idx = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    slots = _ple_state_pool_slots(fb, idx)
+    assert 330 <= slots < 65536
+
+
+def _batch_with_mamba_pool(slots_axis: int, num_layers: int = 3):
+    """A batch whose mamba pool tensors are [num_layers, size + 1, ...]."""
+    cache = SimpleNamespace(
+        conv=[torch.zeros(num_layers, slots_axis, 2, 3)],
+        temporal=torch.zeros(num_layers, slots_axis, 2, 2),
+    )
+    pool = SimpleNamespace(
+        size=8,
+        req_to_token=torch.zeros(8, 8),
+        mamba_pool=SimpleNamespace(mamba_cache=cache),
+    )
+    return SimpleNamespace(
+        batch_size=4, attn_backend=None, req_to_token_pool=pool, token_to_kv_pool=None
+    )
+
+
+@pytest.mark.parametrize(
+    "max_mamba_cache_size,max_running_requests",
+    [(1024, 4), (330, 64)],
+)
+def test_ple_state_pool_slots_follow_physical_slot_axis(
+    monkeypatch, max_mamba_cache_size, max_running_requests
+):
+    """Axis 1 of the full pool counts slots (reserved row included); axis 0
+    counts layers. A resolved pool sizes PLE exactly: covering slot `size`,
+    without the running-requests floor that overallocated 12x at 64/330."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    monkeypatch.setattr(
+        bridge,
+        "_server_args",
+        lambda: SimpleNamespace(
+            max_mamba_cache_size=max_mamba_cache_size,
+            max_running_requests=max_running_requests,
+        ),
+    )
+    fb = _batch_with_mamba_pool(max_mamba_cache_size + 1)
+    idx = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    assert _ple_state_pool_slots(fb, idx) == max_mamba_cache_size + 1
+
+
 def test_plugin_ple_metadata_is_native():
     """Plugin PLE metadata is Native Qwen4ExpPLEMetadata, including num_accepted_tokens."""
     from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpPLEMetadata
@@ -1292,3 +1357,34 @@ def test_checkpoint_context_resolved_once_per_config(monkeypatch):
     other = _flash_checkpoint_config(max_position_embeddings=32768)
     assert bridge._serving_context_len(other, 2048) == 32768
     assert len(walks) > first
+
+
+def _flydsl_layout(extends, seqs, live_bs, num_tokens):
+    fb = SimpleNamespace(extend_seq_lens_cpu=extends, seq_lens_cpu=seqs)
+    tables = torch.zeros((max(live_bs, 1), 4), dtype=torch.int32)
+    return _flydsl_prefill_layout(fb, live_bs, num_tokens, tables, 64)
+
+
+def test_flydsl_prefill_layout_unprefixed_batch_has_no_context_slots():
+    assert _flydsl_layout([3, 5], [3, 5], 2, 8) == (((3, 5), (3, 5)), None)
+
+
+@pytest.mark.parametrize(
+    "extends,seqs,live_bs,num_tokens",
+    [
+        # CUDA-graph / DP padding: more packed tokens than scheduled extends.
+        ([3, 5], [3, 5], 2, 12),
+        # Partial batch: fewer host lengths than live requests.
+        ([3], [3], 2, 3),
+        # Host lengths missing.
+        (None, [3, 5], 2, 8),
+        ([3, 5], None, 2, 8),
+        # An extend longer than its sequence is not a prefill layout.
+        ([3, 5], [3, 4], 2, 8),
+    ],
+    ids=["padded-tokens", "partial-batch", "no-extends", "no-seqs", "extend-gt-seq"],
+)
+def test_flydsl_prefill_layout_falls_back_unless_tokens_are_the_extends(
+    extends, seqs, live_bs, num_tokens
+):
+    assert _flydsl_layout(extends, seqs, live_bs, num_tokens) == (None, None)
