@@ -93,13 +93,8 @@ def _lean_width(
 
     replacements: dict[int, Gfx1250K1LocalRunner] = {}
     for layer, runner in built.k1.items():
-        if (
-            runner.entrypoint.launcher in spilled
-            and runner.spec.gemv_unit > 1
-        ):
-            lean = runner.plan.make_k1_local_runner(
-                replace(runner.spec, gemv_unit=1)
-            )
+        if runner.entrypoint.launcher in spilled and runner.spec.gemv_unit > 1:
+            lean = runner.plan.make_k1_local_runner(replace(runner.spec, gemv_unit=1))
             scratch = getattr(runner, "_scratch", None)
             if scratch is not None:
                 lean.prepare(scratch.device)
@@ -240,7 +235,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
     def _build_width(self, key: int) -> Gfx1250WidthBuild:
         rows, qlen = _width(key)
         k1_cache: dict[tuple, Gfx1250K1LocalRunner] = {}
-        k2_cache: dict[tuple[int, bool], Gfx1250K2Build] = {}
+        k2_cache: dict[tuple[int, bool, bool], Gfx1250K2Build] = {}
         k1_by_layer: dict[int, Gfx1250K1LocalRunner] = {}
         k2_by_layer: dict[int, Gfx1250K2Build] = {}
 
@@ -261,29 +256,42 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 cache_key = (weight.blocks, spec)
                 local = k1_cache.get(cache_key)
                 if local is None:
-                    local = self._plan(rows, weight.blocks).make_k1_local_runner(
-                        spec
-                    ).prepare(self.device)
+                    local = (
+                        self._plan(rows, weight.blocks)
+                        .make_k1_local_runner(spec)
+                        .prepare(self.device)
+                    )
                     k1_cache[cache_key] = local
                 k1_by_layer[layer.layer_id] = local
 
             if layer.moe is not None:
                 reset = layer.moe.write_idx >= 0
                 nblocks = layer.moe.blocks + reset
-                cache_key = (nblocks, reset)
+                cache_key = (nblocks, reset, layer.moe.gu_interleave)
                 local = k2_cache.get(cache_key)
                 if local is None:
-                    local = self._build_k2(rows, nblocks, reset)
+                    local = self._build_k2(
+                        rows,
+                        nblocks,
+                        reset,
+                        layer.moe.gu_interleave,
+                    )
                     k2_cache[cache_key] = local
                 k2_by_layer[layer.layer_id] = local
 
         return Gfx1250WidthBuild(k1_by_layer, k2_by_layer)
 
-    def _build_k2(self, rows: int, nblocks: int, reset: bool) -> Gfx1250K2Build:
+    def _build_k2(
+        self,
+        rows: int,
+        nblocks: int,
+        reset: bool,
+        gu_interleave: bool,
+    ) -> Gfx1250K2Build:
         plan = self._plan(rows, nblocks)
         oproj = build_oproj_local(plan)
         front = build_role_lds_front(plan, reset=reset)
-        finish = build_packed_finish(plan)
+        finish = build_packed_finish(plan, gu_interleave=gu_interleave)
         finalize = build_finalize_local(plan)
         buffers = self._allocate_k2_buffers(
             plan, front.scratch_bytes, finish.scratch_bytes

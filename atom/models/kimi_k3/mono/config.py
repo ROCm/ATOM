@@ -253,6 +253,7 @@ def config_refusal(atom_config) -> str | None:
             SUPPORTED_TP,
             supported_gfx=("gfx950", "gfx1250"),
             refuse_decode_cp=False,
+            multinode_gfx=("gfx1250",),
         )
         + resident_grid_refusals(atom_config)
     ) + [
