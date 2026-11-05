@@ -74,7 +74,7 @@ async def stream_completion_response(
     cleanup_request,
     echo: str = "",
     include_usage: bool = False,
-    final_usage: bool = True,
+    usage_on_finish: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming text completion response.
 
@@ -82,13 +82,15 @@ async def stream_completion_response(
     num_prompt_tokens``); reusing it avoids re-tokenizing the prompt on the
     event loop at stream start.
 
-    ``echo`` leads the first chunk's text. ``include_usage`` puts ``usage``
-    (null) on every chunk, and ``final_usage`` sends the usage chunk before
-    ``[DONE]``: /v1 always has, and DeepSeek's ``stream_options`` asks for
-    it with ``include_usage``.
+    ``echo`` leads the first chunk's text. With ``usage_on_finish`` (the
+    deployment's choice, as for Chat) the usage rides on the finish chunk
+    and no usage-only chunk follows, and ``include_usage`` puts ``usage:
+    null`` on every chunk before it. Otherwise a usage-only chunk precedes
+    ``[DONE]``, as /v1 always has.
     """
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
+    null_usage = usage_on_finish and include_usage
 
     # Assume abort until the engine's finished chunk arrives. On client
     # disconnect the generator is closed (GeneratorExit) before we get there,
@@ -119,7 +121,7 @@ async def stream_completion_response(
                 model,
                 new_text,
                 finish_reason=None,  # the terminal chunk carries it
-                include_usage=include_usage,
+                include_usage=null_usage,
                 **extra_fields,
             )
 
@@ -141,18 +143,17 @@ async def stream_completion_response(
                         "total_tokens": num_tokens_input + num_tokens_output,
                     },
                 }
-                yield (
-                    content_chunk
-                    + create_completion_chunk(
-                        request_id,
-                        model,
-                        "",
-                        openai_stop_reason(engine_reason) or "stop",
-                        include_usage=include_usage,
-                    )
-                    + (data_frame(usage_chunk) if final_usage else "")
-                    + STREAM_DONE_MESSAGE
+                finish = create_completion_chunk(
+                    request_id,
+                    model,
+                    "",
+                    openai_stop_reason(engine_reason) or "stop",
+                    usage=usage_chunk["usage"] if usage_on_finish else None,
+                    include_usage=null_usage,
                 )
+                if not usage_on_finish:
+                    finish += data_frame(usage_chunk)
+                yield content_chunk + finish + STREAM_DONE_MESSAGE
                 return
 
             yield content_chunk
@@ -259,7 +260,7 @@ async def stream_completion_response_fanout(
     cleanup_request,
     echo: str = "",
     include_usage: bool = False,
-    final_usage: bool = True,
+    usage_on_finish: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant multiplexing ``len(seq_ids)`` siblings into one SSE.
 
@@ -271,9 +272,9 @@ async def stream_completion_response_fanout(
     siblings; reusing it avoids re-tokenizing on the event loop at stream
     start.
 
-    ``echo``, ``include_usage`` and ``final_usage`` are as for
+    ``echo``, ``include_usage`` and ``usage_on_finish`` are as for
     :func:`stream_completion_response`; each sibling's echo leads its own
-    first chunk.
+    first chunk, and the usage rides on the last sibling's finish chunk.
     """
     n = len(seq_ids)
     num_tokens_input = num_prompt_tokens
@@ -286,6 +287,7 @@ async def stream_completion_response_fanout(
     # aborts whichever siblings are still running.
     aborted = True
     pending_echo = [echo] * n
+    null_usage = usage_on_finish and include_usage
     try:
         while not all(finished):
             idx, chunk_data = await shared_collector.get()
@@ -306,7 +308,7 @@ async def stream_completion_response_fanout(
                 new_text,
                 finish_reason=None,  # the terminal chunk carries it
                 index=idx,
-                include_usage=include_usage,
+                include_usage=null_usage,
                 **extra_fields,
             )
 
@@ -330,21 +332,21 @@ async def stream_completion_response_fanout(
             "usage": usage,
         }
         # Coalesce the per-sibling stop chunks + usage + [DONE] into one send.
-        yield (
-            "".join(
-                create_completion_chunk(
-                    request_id,
-                    model,
-                    "",
-                    openai_stop_reason(engine_reasons[i]) or "stop",
-                    index=i,
-                    include_usage=include_usage,
-                )
-                for i in range(n)
+        finish = "".join(
+            create_completion_chunk(
+                request_id,
+                model,
+                "",
+                openai_stop_reason(engine_reasons[i]) or "stop",
+                usage=usage if usage_on_finish and i == n - 1 else None,
+                index=i,
+                include_usage=null_usage,
             )
-            + (data_frame(usage_chunk) if final_usage else "")
-            + STREAM_DONE_MESSAGE
+            for i in range(n)
         )
+        if not usage_on_finish:
+            finish += data_frame(usage_chunk)
+        yield finish + STREAM_DONE_MESSAGE
     finally:
         for sid in seq_ids:
             cleanup_stream(sid, aborted=aborted)

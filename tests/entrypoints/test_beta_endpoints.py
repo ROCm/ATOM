@@ -18,6 +18,7 @@ import pytest
 from fastapi import HTTPException
 
 from atom.entrypoints.openai import api_server
+from atom.entrypoints.openai.api_compatibility import DEEPSEEK_API_COMPATIBILITY
 from atom.entrypoints.openai.chat_encoders import (
     _load_encoder_from_dir,
     apply_chat_template,
@@ -574,30 +575,27 @@ def test_routes_bind_their_own_request_models():
         assert annotation in (model, model.__name__), path
 
 
+NO_ECHO = {"echo": "", "include_usage": False, "usage_on_finish": False}
+
+
 @pytest.mark.parametrize(
-    "handler, kwargs, expected",
+    "handler, kwargs, deepseek, expected",
     [
-        # /v1 streams as it always has: no echo, no usage keys, a usage chunk.
-        (
-            api_server.completions,
-            {},
-            {"echo": "", "include_usage": False, "final_usage": True},
-        ),
-        # /beta sends usage only when stream_options asks for it.
-        (
-            api_server.beta_completions,
-            {},
-            {"echo": "", "include_usage": False, "final_usage": False},
-        ),
+        # /v1 streams as it always has, on every deployment.
+        (api_server.completions, {}, False, NO_ECHO),
+        (api_server.completions, {}, True, NO_ECHO),
+        # /beta takes the deployment's streamed-usage shape, as Chat does.
+        (api_server.beta_completions, {}, False, NO_ECHO),
         (
             api_server.beta_completions,
             {"echo": True, "stream_options": {"include_usage": True}},
-            {"echo": "def f(a):", "include_usage": True, "final_usage": True},
+            True,
+            {"echo": "def f(a):", "include_usage": True, "usage_on_finish": True},
         ),
     ],
 )
 def test_completion_streams_get_their_routes_options(
-    engine, monkeypatch, handler, kwargs, expected
+    engine, monkeypatch, handler, kwargs, deepseek, expected
 ):
     seen = {}
 
@@ -614,11 +612,14 @@ def test_completion_streams_get_their_routes_options(
 
     monkeypatch.setattr(api_server, "setup_streaming_request", setup)
     monkeypatch.setattr(api_server, "stream_completion_response", stream)
-    model = (
-        BetaCompletionRequest
-        if handler is api_server.beta_completions
-        else CompletionRequest
-    )
+    if deepseek:
+        monkeypatch.setattr(
+            api_server,
+            "api_compatibility_for",
+            lambda _encoder: DEEPSEEK_API_COMPATIBILITY,
+        )
+    beta = handler is api_server.beta_completions
+    model = BetaCompletionRequest if beta else CompletionRequest
     request = model(model="m", prompt="def f(a):", stream=True, **kwargs)
     asyncio.run(handler(request, None))
     assert {key: seen.get(key) for key in expected} == expected
@@ -650,28 +651,38 @@ def _stream_payloads(**options):
     ]
 
 
-def test_stream_echo_leads_the_first_chunk_and_usage_is_on_every_chunk():
-    payloads = _stream_payloads(echo="def f():", include_usage=True)
+def test_deepseek_stream_carries_usage_on_its_finish_chunk():
+    """DeepSeek's contract: the last chunk, with `finish_reason`, carries the
+    usage, and no usage-only chunk follows."""
+    payloads = _stream_payloads(
+        echo="def f():", include_usage=True, usage_on_finish=True
+    )
     assert payloads[0]["choices"][0]["text"] == "def f():tail"
-    assert all("usage" in payload for payload in payloads)
-    # Null on the content and finish chunks; counted on the last one.
-    assert [p["usage"] for p in payloads if p["choices"]] == [None, None]
-    assert payloads[-1]["usage"]["completion_tokens"] == 1
+    assert all(payload["choices"] for payload in payloads)
+    *before, last = payloads
+    # `include_usage` puts a null usage on every chunk before the last.
+    assert [payload["usage"] for payload in before] == [None]
+    assert last["choices"][0]["finish_reason"] == "stop"
+    assert last["usage"]["completion_tokens"] == 1
 
 
-def test_beta_stream_without_include_usage_carries_no_usage():
-    payloads = _stream_payloads(include_usage=False, final_usage=False)
-    assert all("usage" not in payload and payload["choices"] for payload in payloads)
+def test_deepseek_stream_without_include_usage_still_ends_with_usage():
+    *before, last = _stream_payloads(usage_on_finish=True)
+    assert all("usage" not in payload and payload["choices"] for payload in before)
+    assert last["choices"][0]["finish_reason"] == "stop"
+    assert last["usage"]["completion_tokens"] == 1
 
 
 def test_v1_stream_frames_are_unchanged():
-    # The defaults are /v1's: no usage on the choice chunks, then a usage chunk.
-    payloads = _stream_payloads()
-    assert [("usage" in p, bool(p["choices"])) for p in payloads] == [
-        (False, True),
-        (False, True),
-        (True, False),
-    ]
+    # /v1's defaults: no usage on the choice chunks, then a usage-only chunk,
+    # whatever include_usage says -- as Chat streams without usage_on_finish.
+    for options in ({}, {"include_usage": True}):
+        payloads = _stream_payloads(**options)
+        assert [("usage" in p, bool(p["choices"])) for p in payloads] == [
+            (False, True),
+            (False, True),
+            (True, False),
+        ]
 
 
 def test_stream_sends_nothing_before_the_first_token():
@@ -697,7 +708,7 @@ def test_stream_sends_nothing_before_the_first_token():
     asyncio.run(first_frame())
 
 
-def test_fanout_echo_leads_each_siblings_first_chunk():
+def _fanout_payloads(**options):
     collector = StreamOutputCollector("r")
 
     async def frames():
@@ -721,21 +732,33 @@ def test_fanout_echo_leads_each_siblings_first_chunk():
             4,
             lambda *_args, **_kwargs: None,
             lambda _request_id: None,
-            echo="P:",
+            **options,
         )
         return "".join([frame async for frame in stream])
 
-    payloads = [
+    return [
         json.loads(data)
         for data in iter_sse_data(asyncio.run(frames()))
         if data != "[DONE]"
     ]
+
+
+def test_fanout_echo_leads_each_siblings_first_chunk():
     texts = {
         p["choices"][0]["index"]: p["choices"][0]["text"]
-        for p in payloads
+        for p in _fanout_payloads(echo="P:")
         if p["choices"] and p["choices"][0]["text"]
     }
     assert texts == {0: "P:t0", 1: "P:t1"}
+
+
+def test_fanout_deepseek_usage_rides_on_the_last_finish_chunk():
+    payloads = _fanout_payloads(include_usage=True, usage_on_finish=True)
+    assert all(payload["choices"] for payload in payloads)
+    *before, last = payloads
+    assert all(payload["usage"] is None for payload in before)
+    assert last["choices"][0]["finish_reason"] == "stop"
+    assert last["usage"]["completion_tokens"] == 2
 
 
 # --- against the official V4.1 encoder ------------------------------------------

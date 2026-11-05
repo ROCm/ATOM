@@ -117,9 +117,12 @@ pairs with a suffix that begins with `\n`. `suffix` is rejected with token-ID
 prompts and on a model without FIM tokens; without `suffix` the endpoint is an
 ordinary completion. `echo` returns the prompt ahead of the completion and is
 rejected with `suffix`. `logprobs` (0 to 20) is rejected until completions
-return token probabilities. `stream_options` requires `stream`; with
-`include_usage` every chunk carries `usage`, null until the usage chunk sent
-before `[DONE]`, and without it the stream carries no usage.
+return token probabilities. On a V4.1 deployment the stream ends as DeepSeek
+documents it, as Chat already does there: the last chunk, the one with
+`finish_reason`, carries the request's `usage` and no usage-only chunk
+follows; `stream_options` requires `stream`, and its `include_usage` adds
+`usage: null` to every earlier chunk. Other deployments keep the usage chunk
+`/v1` sends.
 
 On both beta endpoints `stop` takes one string or a list. The `/v1`
 endpoints are unchanged: they ignore `prefix`, `suffix`, `echo`, `logprobs`

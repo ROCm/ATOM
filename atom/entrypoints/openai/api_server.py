@@ -2214,7 +2214,7 @@ async def _chat_completions(
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
-                usage_on_finish=compatibility.chat_usage_on_finish,
+                usage_on_finish=compatibility.usage_on_finish,
                 include_usage=bool((request.stream_options or {}).get("include_usage")),
             )
             if schema is not None:
@@ -2429,9 +2429,13 @@ async def _completions(
             top_p=request.top_p,
             n=effective_n,
         )
-        echo, include_usage = "", False
+        echo, include_usage, usage_on_finish = "", False, False
         if beta:
             include_usage = bool((request.stream_options or {}).get("include_usage"))
+            # The deployment's streamed-usage shape, as Chat has it.
+            usage_on_finish = api_compatibility_for(
+                custom_message_encoder
+            ).usage_on_finish
             if request.echo:
                 echo = await _echo_text(request)
         # Prefer pre-tokenized IDs; otherwise pass text to preprocessing.
@@ -2474,7 +2478,7 @@ async def _completions(
                     cleanup_request,
                     echo=echo,
                     include_usage=include_usage,
-                    final_usage=not beta or include_usage,
+                    usage_on_finish=usage_on_finish,
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
@@ -2496,7 +2500,7 @@ async def _completions(
                     cleanup_request,
                     echo=echo,
                     include_usage=include_usage,
-                    final_usage=not beta or include_usage,
+                    usage_on_finish=usage_on_finish,
                 )
             return StreamingResponse(
                 _client_stream(gen, request_id),
