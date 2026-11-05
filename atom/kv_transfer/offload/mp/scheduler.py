@@ -92,6 +92,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 _transfer_deadline_s(config) + _SCHEDULER_DEADLINE_MARGIN_S
             )
             self._transfer_seen_at: dict[Any, float] = {}
+            # Live loads, in the order the watchdog first saw them.
+            self._load_order: dict[Any, int] = {}
+            self._next_load_order = 0
             super().__init__(
                 config,
                 chunk_size=int(adapter.lmcache_tokens_per_chunk),
@@ -343,10 +346,34 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         for operation in [op for op in seen if op not in live]:
             del seen[operation]
         now = time.monotonic()
+        self._restart_loads_queued_behind_a_finished_one(now)
         for operation in live:
             _enforce_transfer_deadline(
                 operation, seen.setdefault(operation, now), self._scheduler_deadline_s
             )
+
+    def _restart_loads_queued_behind_a_finished_one(self, now: float) -> None:
+        """A native-state worker restores a few loads at a time, in the order
+        it received them, and advances them only between forwards. A burst of
+        loads on a cold server can therefore wait out several slow forwards
+        before its last restore starts, with nothing in flight. A finished load
+        shows that queue moving, so every load seen after it starts its bound
+        again. A load is restarted only by loads seen before it, so one whose
+        completion is lost still stops the engine one bound after the last of
+        those finishes."""
+        loads = {operation for _, operation in self._active_load_operations.values()}
+        order = self._load_order
+        finished = [order.pop(op) for op in [op for op in order if op not in loads]]
+        for operation in loads:
+            if operation not in order:
+                order[operation] = self._next_load_order
+                self._next_load_order += 1
+        if not finished:
+            return
+        first = min(finished)
+        for operation, position in order.items():
+            if position > first and operation in self._transfer_seen_at:
+                self._transfer_seen_at[operation] = now
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         output = super().process_completions(output)
