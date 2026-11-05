@@ -82,6 +82,8 @@ def use_mxfp8_linear_bpreshuffle(
         return False
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
+    # TODO: add gfx1250 after AITER exposes the matching MXFP8 1x32
+    # preshuffle scale/layout contract.
     return get_gfx_runtime() == "gfx950"
 
 
