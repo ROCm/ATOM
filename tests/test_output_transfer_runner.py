@@ -206,7 +206,7 @@ def test_a_uniform_k_reaches_the_sampler_as_a_scalar(ks, ps):
             ("top_ps", np.float32),
         )
     }
-    names = [*buffers, "required_channel_states"]
+    names = [*buffers, "required_channel_states", "logprob_request_indices"]
     group = SimpleNamespace(
         counts=[None] * len(names), indices={n: i for i, n in enumerate(names)}
     )
@@ -242,7 +242,7 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
             ("top_ps", np.float32),
         )
     }
-    names = [*buffers, "required_channel_states"]
+    names = [*buffers, "required_channel_states", "logprob_request_indices"]
     group = SimpleNamespace(
         counts=[None] * len(names), indices={n: i for i, n in enumerate(names)}
     )
@@ -358,7 +358,7 @@ def test_sampled_sources_are_held_until_recv_has_waited_on_copy_done(
     assert all(ref() is None for ref in refs)
     assert processor.token_ids_cpu == []
     assert token_ids.tolist() == [3, 4]
-    assert processor.recv_logprobs() == [-0.5, -1.5]
+    assert processor.recv_logprobs().tolist() == [-0.5, -1.5]
 
 
 def test_clean_waits_for_every_queued_copy_before_dropping_it(cpu_processor):

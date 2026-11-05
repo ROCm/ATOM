@@ -504,6 +504,9 @@ This means each GPU runs an independent attention computation (no TP AllReduce f
 | `atom/model_ops/linear.py` | `ColumnParallelLinear`, `RowParallelLinear`, `QKVParallelLinear`, `MergedColumnParallelLinear` |
 | `atom/model_ops/moe.py` | `FusedMoE`, `FusedMoEParallelConfig` (EP configuration and expert distribution) |
 | `atom/model_ops/fused_moe/mori_prepare_finalize.py` | `MoriPrepareAndFinalize` (MORI dispatch/combine for EP) |
+| `atom/model_engine/pp_engine_core.py` | Pipeline-parallel stage loops (head / downstream) |
+| `atom/distributed/pp_comm.py` | What crosses a PP stage boundary: `_PP_PROXY_KEYS` (`hidden_states`, `residual`, `block_residual`, ...) plus `PP_AUX_KEY` (`pp_aux`) |
+| `atom/spec_decode/pp_aux_relay.py` | `PPAuxRelay`: speculative decoding under PP. The drafter lives on the last stage; earlier stages capture the target aux hidden states they own and send them on under `pp_aux` |
 
 ---
 
