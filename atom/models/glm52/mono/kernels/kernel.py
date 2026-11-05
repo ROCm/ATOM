@@ -109,6 +109,7 @@ from atom.models.glm52.mono.kernels.layout import (
     XQ_BLOCKS,
     XQ_GROUPS,
     XQ_WAVES,
+    dcp_split_groups,
     dcp_summary_index,
     dn_tile,
     down_prefetch_batch,
@@ -423,6 +424,8 @@ def build_glm5_monokernel(
     # in the up/gate stage, for an in-process A/B. Both are bit-identical; see
     # ``atom_mxfp4_scale_pair`` and the comment in ``ug8_units``.
     _UG_SCALE_PAIR = not _R2_OFF and os.environ.get("MONO_UG_SCALE_PAIR", "1") == "1"
+    # DCP: head groups a split task runs (``dcp_split_groups``); 0 for D == 1
+    DCP_SPLIT_GROUPS = dcp_split_groups(S, heads, topk, dcp_size) if dcp_size > 1 else 0
     QHEADS = (
         WAVES
         if (_SPLIT_QHEADS and heads % WAVES == 0 and (WAVES * KV_LORA // 4) % THREADS == 0)
@@ -2945,16 +2948,34 @@ def build_glm5_monokernel(
         SPLIT_MERGE = bool(split_head_merge) and N_HEAD_GROUPS > 1
         SPLIT_GROUPS = N_HEAD_GROUPS if SPLIT_MERGE else 1
         SPLIT_QH = H if SPLIT_MERGE else QHEADS
+        QH_STRIDE = SPLIT_QH
+        if const_expr(D > 1):
+            # Under DCP a rank holds about a quarter of each sample's keys, so
+            # only the first ~N_SPLIT / D splits have any. The tasks are
+            # numbered split-major, those splits first, so they spread over
+            # the grid; and each runs DCP_SPLIT_GROUPS head groups, as many
+            # as still fill the grid (``dcp_split_groups``).
+            SPLIT_GROUPS = DCP_SPLIT_GROUPS
+            SPLIT_MERGE = SPLIT_GROUPS > 1
+            SPLIT_QH = SPLIT_GROUPS * WAVES
+            QH_STRIDE = WAVES
+        SPLIT_BLOCKS = N_HEAD_GROUPS // SPLIT_GROUPS
         for tt in range(start("split"), S * (N_HEAD_GROUPS // SPLIT_GROUPS) * N_SPLIT, G):
             tt = fx.Int32(tt)
             stamp("split", tt, 0)
-            if const_expr(SPLIT_MERGE):
-                s = tt // N_SPLIT
-                hg0 = fx.Int32(0)
+            if const_expr(D > 1):
+                t = tt // (S * SPLIT_BLOCKS)
+                blk = tt % (S * SPLIT_BLOCKS)
+                s = blk // SPLIT_BLOCKS
+                hg0 = (blk % SPLIT_BLOCKS) * SPLIT_GROUPS
             else:
-                s = tt // (N_HEAD_GROUPS * N_SPLIT)
-                hg0 = (tt // N_SPLIT) % N_HEAD_GROUPS
-            t = tt % N_SPLIT
+                if const_expr(SPLIT_MERGE):
+                    s = tt // N_SPLIT
+                    hg0 = fx.Int32(0)
+                else:
+                    s = tt // (N_HEAD_GROUPS * N_SPLIT)
+                    hg0 = (tt // N_SPLIT) % N_HEAD_GROUPS
+                t = tt % N_SPLIT
 
             def split_body(nkeys):
                 gpu.barrier()
@@ -2993,7 +3014,7 @@ def build_glm5_monokernel(
                 PE_WORDS = SPLIT_QH * PE_DIM // 4
                 NPE = -(-PE_WORDS // THREADS)
                 tpe = fx.min(tid, PE_WORDS - 1)
-                qh0 = hg0 * SPLIT_QH if const_expr(SPLIT_QH != H) else fx.Int32(0)
+                qh0 = hg0 * QH_STRIDE if const_expr(SPLIT_QH != H) else fx.Int32(0)
                 qv = poll(
                     [(mb("q_lat"), ((s * H + qh0) * KV_LORA + (tid + i * THREADS) * 4) // 2, 2) for i in range(NQ)]
                     + [(mb("q_pe"), ((s * H + qh0) * PE_DIM + tpe * 4) // 2, 2)]
@@ -3109,9 +3130,12 @@ def build_glm5_monokernel(
                 if t < live_split_count(s):
                     split_body(split_keys(t, s)[0])
                 else:
-                    if tid < H:
-                        put(mb("sp_m"), (s * N_SPLIT + t) * H + tid, fx.Float32(NEG))
-                        put(mb("sp_l"), (s * N_SPLIT + t) * H + tid, fx.Float32(0.0))
+                    # this task's heads only: the other head blocks' tasks
+                    # publish theirs
+                    if tid < SPLIT_QH:
+                        hd = hg0 * WAVES + tid
+                        put(mb("sp_m"), (s * N_SPLIT + t) * H + hd, fx.Float32(NEG))
+                        put(mb("sp_l"), (s * N_SPLIT + t) * H + hd, fx.Float32(0.0))
                     stamp("split", tt, 4)
 
         # ========================== 6. split merge + W_UV: o = W_UV (softmax . KV)

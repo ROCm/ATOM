@@ -243,6 +243,19 @@ def sparse_keys_per_task(samples: int, heads: int = WAVES) -> int:
     return 32 if heads > 2 * WAVES or (heads == WAVES and samples > 4) else 64
 
 
+def dcp_split_groups(samples: int, heads: int, topk: int, dcp_size: int) -> int:
+    """Head groups a DCP split task runs back to back: the most that still
+    fill the grid with the tasks that hold keys (a rank holds about topk / D
+    of a sample's selected keys). Fewer groups a task only re-gather the same
+    keys."""
+    groups = heads // WAVES
+    live = topk // sparse_keys_per_task(samples, heads) // dcp_size
+    g = groups
+    while g > 1 and samples * live * (groups // g) < BLOCKS:
+        g //= 2
+    return g
+
+
 def sample_wave_batches(samples: int) -> int:
     return (samples + WAVES - 1) // WAVES
 
@@ -512,12 +525,16 @@ def stage_tasks(
             )
             for level in range(depth + 1)
         ]
+    if dcp_size > 1:
+        head_blocks = heads // WAVES // dcp_split_groups(
+            samples, heads, sparse_attention_topk, dcp_size
+        )
+    else:
+        head_blocks = 1 if split_head_merge else heads // WAVES
     tasks += [
         (
             "split",
-            samples
-            * (1 if split_head_merge else heads // WAVES)
-            * (sparse_attention_topk // sparse_keys_per_task(samples, heads)),
+            samples * head_blocks * (sparse_attention_topk // sparse_keys_per_task(samples, heads)),
         ),
     ]
     if dcp_size > 1:

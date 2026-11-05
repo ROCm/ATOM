@@ -247,3 +247,36 @@ def test_the_runner_hands_the_kernel_the_dcp_indptr_under_dcp():
     assert torch.equal(
         runner._sparse_indptr(meta, layers, 8), meta.sparse_kv_indptr[:9]
     )
+
+
+@pytest.mark.parametrize(
+    "samples,groups", [(1, 1), (2, 1), (4, 2), (5, 2), (6, 2), (8, 4), (10, 4), (12, 4)]
+)
+def test_dcp_split_tasks_fill_the_grid_with_the_splits_that_hold_keys(samples, groups):
+    """A DCP4 rank holds about 16 of a sample's 64 splits' keys; each split
+    task runs as many of the 8 head groups as still leave >= 256 tasks with
+    keys, so they spread over the whole grid."""
+    from atom.models.glm52.mono.kernels.layout import (
+        dcp_split_groups,
+        stage_tasks,
+    )
+
+    assert dcp_split_groups(samples, 64, 2048, 4) == groups
+    live = samples * 16 * (8 // groups)
+    assert live >= 256 or groups == 1
+    tasks = dict(
+        stage_tasks(
+            samples, 64, 2048, npes=4, inter=512, split_head_merge=True, dcp_size=4
+        )
+    )
+    assert tasks["split"] == samples * (8 // groups) * 64
+
+
+def test_the_split_table_without_dcp_is_unchanged():
+    from atom.models.glm52.mono.kernels.layout import stage_tasks
+
+    for merge, blocks in ((True, 1), (False, 2)):
+        tasks = dict(
+            stage_tasks(8, 16, 2048, npes=4, inter=512, split_head_merge=merge)
+        )
+        assert tasks["split"] == 8 * blocks * 32
