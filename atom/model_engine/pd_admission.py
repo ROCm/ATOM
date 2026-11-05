@@ -36,7 +36,6 @@ class PdAdmissionController:
             return None
         unknown = options.keys() - {
             "enabled",
-            "max_pending_requests",
             "max_pending_kv_bytes",
             "max_pending_kv_fraction",
             "min_free_kv_fraction",
@@ -57,20 +56,15 @@ class PdAdmissionController:
         block_bytes = getattr(config, "pd_admission_block_bytes", 0)
         if block_bytes <= 0:
             raise ValueError("pd_admission requires a single paged KV pool layout")
-        count = options.get("max_pending_requests")
         byte_limit = options.get("max_pending_kv_bytes")
         fraction = options.get(
             "max_pending_kv_fraction", None if byte_limit is not None else 0.15
         )
         free_fraction = options.get("min_free_kv_fraction")
-        for name, value in (
-            ("max_pending_requests", count),
-            ("max_pending_kv_bytes", byte_limit),
-        ):
-            if value is not None and (type(value) is not int or value <= 0):
-                raise ValueError(
-                    f"pd_admission.{name} must be a positive integer or null"
-                )
+        if byte_limit is not None and (type(byte_limit) is not int or byte_limit <= 0):
+            raise ValueError(
+                "pd_admission.max_pending_kv_bytes must be a positive integer or null"
+            )
         for name, value, closed in (
             ("max_pending_kv_fraction", fraction, True),
             ("min_free_kv_fraction", free_fraction, False),
@@ -94,16 +88,11 @@ class PdAdmissionController:
             if free_fraction is None
             else math.ceil(config.num_kvcache_blocks * free_fraction)
         )
-        if count is None and byte_limit is None and reserve_blocks is None:
+        if byte_limit is None and reserve_blocks is None:
             raise ValueError("pd_admission requires at least one limit")
-        return cls(
-            count, byte_limit, block_bytes, metrics, reserve_blocks=reserve_blocks
-        )
+        return cls(byte_limit, block_bytes, metrics, reserve_blocks=reserve_blocks)
 
-    def __init__(
-        self, max_requests, max_bytes, block_bytes, metrics=None, *, reserve_blocks=None
-    ):
-        self.max_requests = max_requests
+    def __init__(self, max_bytes, block_bytes, metrics=None, *, reserve_blocks=None):
         self.max_bytes = max_bytes
         self.block_bytes = block_bytes
         # Free blocks kept for the running batch's decode growth.
@@ -112,14 +101,13 @@ class PdAdmissionController:
         self.pending: dict[str, PendingReceive] = {}
         self._block_refs: dict[int, int] = {}
         # Requests deferred at least once, per limit.
-        self.deferred = {"requests": 0, "bytes": 0, "free_kv": 0}
+        self.deferred = {"bytes": 0, "free_kv": 0}
         self.oversized_admissions = 0
         self._publish()
         logger.info(
-            "PD admission enabled: pending_requests=%s, pending_kv_bytes=%s "
-            "per D rank, reserved_free_blocks=%s, block_bytes=%d; credits held "
-            "until first forward",
-            max_requests,
+            "PD admission enabled: pending_kv_bytes=%s per D rank, "
+            "reserved_free_blocks=%s, block_bytes=%d; credits held until first "
+            "forward",
             max_bytes,
             reserve_blocks,
             block_bytes,
@@ -131,12 +119,10 @@ class PdAdmissionController:
 
     def can_admit(self, seq, receive_blocks: int, free_blocks: int) -> bool:
         reason = None
-        if self.max_requests is not None and len(self.pending) >= self.max_requests:
-            reason = "requests"
-        # With no pending receive, allow a single request past the soft limits
-        # below. The normal allocator still enforces the hard capacity and
+        # With no pending receive, allow a single request past either soft
+        # limit. The normal allocator still enforces the hard capacity and
         # lookahead checks.
-        elif (
+        if (
             self.max_bytes is not None
             and self.pending_bytes + receive_blocks * self.block_bytes > self.max_bytes
             and self.pending

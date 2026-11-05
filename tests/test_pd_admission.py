@@ -47,14 +47,11 @@ def build(monkeypatch, mooncake_module, seq_factory):
                 "kv_connector": "mooncake",
                 "kv_role": "kv_consumer",
                 "enable_chunked_transfer": chunked,
+                # By default, exactly one 8-token request (2 blocks) fits.
                 "pd_admission": (
                     options
                     if options is not None
-                    else {
-                        "enabled": True,
-                        "max_pending_requests": 1,
-                        "max_pending_kv_fraction": None,
-                    }
+                    else {"enabled": True, "max_pending_kv_bytes": 2048}
                 ),
             },
         )
@@ -108,7 +105,7 @@ def receive_success(seq, *, as_str=False):
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_count_limit_holds_ready_credit_until_first_batch(build, chunked):
+def test_ready_credit_held_until_first_batch(build, chunked):
     sched, request = build(chunked=chunked)
     a, b = request(), request()
     sched.extend([a, b])
@@ -136,11 +133,7 @@ def test_count_limit_holds_ready_credit_until_first_batch(build, chunked):
 def test_bytes_limit_and_isolated_large_request(build, chunked):
     sched, request = build(
         chunked=chunked,
-        options={
-            "enabled": True,
-            "max_pending_requests": 4,
-            "max_pending_kv_bytes": 3072,
-        },
+        options={"enabled": True, "max_pending_kv_bytes": 3072},
     )
     a, b = request(), request(16)
     sched.extend([a, b])
@@ -159,10 +152,9 @@ def test_bytes_limit_and_isolated_large_request(build, chunked):
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_default_limits_bound_bytes_not_count(build, chunked):
+def test_default_limit_bounds_receive_bytes(build, chunked):
     sched, request = build(chunked=chunked, options={"enabled": True})
     policy = sched.pd_admission
-    assert policy.max_requests is None
     assert policy.max_bytes == int(64 * 1024 * 0.15)
     assert policy.reserve_blocks is None
     a, b = request(), request()
@@ -191,7 +183,7 @@ def test_free_kv_watermark_keeps_room_for_running_requests(build, chunked):
     assert not c.block_table
     sched.schedule()
     assert not c.block_table
-    assert sched.pd_admission.deferred == {"requests": 0, "bytes": 0, "free_kv": 1}
+    assert sched.pd_admission.deferred == {"bytes": 0, "free_kv": 1}
     sched._update_from_kv_xfer_finished(receive_success(a))
     sched._update_from_kv_xfer_finished(receive_success(b))
     batch, _ = sched.schedule()
@@ -211,11 +203,7 @@ def test_prefix_hits_charge_only_receive_targets(
     sched, request = build(
         chunked=chunked,
         prefix=True,
-        options={
-            "enabled": True,
-            "max_pending_requests": 4,
-            "max_pending_kv_bytes": 2048,
-        },
+        options={"enabled": True, "max_pending_kv_bytes": 2048},
     )
     seed = seq_factory(list(range(8)))
     bm = sched.block_manager
@@ -390,13 +378,7 @@ def test_ready_preempted_before_first_forward_releases_credit(build, chunked):
 
 
 def test_fraction_uses_physical_pool_bytes(build):
-    sched, _ = build(
-        options={
-            "enabled": True,
-            "max_pending_requests": None,
-            "max_pending_kv_fraction": 0.25,
-        }
-    )
+    sched, _ = build(options={"enabled": True, "max_pending_kv_fraction": 0.25})
     assert sched.pd_admission.max_bytes == 64 * 1024 // 4
 
 
@@ -572,17 +554,14 @@ def test_multiconnector_uses_load_winner(build):
     "options",
     [
         {"enabled": "false"},
-        {"enabled": True, "max_pending_requests": 0},
-        {"enabled": True, "max_pending_requests": True},
+        # There is no pending-request count; the option is unknown.
+        {"enabled": True, "max_pending_requests": 4},
         {"enabled": True, "max_pending_kv_bytes": -1},
+        {"enabled": True, "max_pending_kv_bytes": True},
         {"enabled": True, "max_pending_kv_fraction": float("nan")},
         {"enabled": True, "max_pending_kv_fraction": 1.1},
         {"enabled": True, "max_pending_kv_fraction": 0.1, "max_pending_kv_bytes": 10},
-        {
-            "enabled": True,
-            "max_pending_requests": None,
-            "max_pending_kv_fraction": None,
-        },
+        {"enabled": True, "max_pending_kv_fraction": None},
         {"enabled": True, "extra_growth_blocks_per_request": 1},
         {"enabled": True, "min_free_kv_fraction": 0},
         {"enabled": True, "min_free_kv_fraction": 1},
@@ -609,7 +588,7 @@ def test_unsupported_layout_rejected(build, override):
 
 
 def test_physical_targets_are_deduplicated_and_release_is_idempotent():
-    policy = PdAdmissionController(4, 4096, 1024)
+    policy = PdAdmissionController(4096, 1024)
     a, b = SimpleNamespace(id=1), SimpleNamespace(id=2)
     policy.admit(a, [1, 2])
     policy.admit(b, [2, 3])
@@ -634,7 +613,7 @@ def test_admission_metrics_follow_credit_lifecycle(monkeypatch):
     monkeypatch.setattr(pd_admission.time, "perf_counter", lambda: clock[0])
     registry = CollectorRegistry()
     metrics = SchedulerMetrics(registry=registry)
-    policy = PdAdmissionController(1, 4096, 1024, metrics)
+    policy = PdAdmissionController(2048, 1024, metrics)
     seq, other = SimpleNamespace(id=1), SimpleNamespace(id=2)
     labels = {"dp_rank": "0", "engine_role": "default"}
     policy.admit(seq, [1, 2])
@@ -649,7 +628,7 @@ def test_admission_metrics_follow_credit_lifecycle(monkeypatch):
     assert not policy.can_admit(other, 1, 64)
     assert (
         registry.get_sample_value(
-            "atom:pd_admission_deferred_total", {**labels, "reason": "requests"}
+            "atom:pd_admission_deferred_total", {**labels, "reason": "bytes"}
         )
         == 1
     )
