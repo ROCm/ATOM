@@ -67,3 +67,13 @@ def unified_attention_takes_output_epilogue() -> bool:
 
     params = inspect.signature(unified_attention).parameters
     return "output_gate" in params and "output_rows" in params
+
+
+@functools.lru_cache(maxsize=1)
+def unified_attention_takes_split_reduce() -> bool:
+    """Whether aiter's unified_attention has `split_reduce`."""
+    import inspect
+
+    from aiter.ops.triton.unified_attention import unified_attention
+
+    return "split_reduce" in inspect.signature(unified_attention).parameters

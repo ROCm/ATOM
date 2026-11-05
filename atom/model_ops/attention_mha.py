@@ -16,6 +16,7 @@ from atom.config import get_current_atom_config
 from atom.model_ops.attn_output_epilogue import (
     current_attention_output_epilogue,
     unified_attention_takes_output_epilogue,
+    unified_attention_takes_split_reduce,
 )
 from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
@@ -879,6 +880,9 @@ class PagedAttentionImpl(nn.Module):
             tiles = getattr(attn_metadata, "gfx12_token_split_tiles", None)
             if tiles is not None:
                 split["gfx12_token_split_tiles"] = tiles
+        # ATOM_UA_SPLIT_REDUCE: aiter's split-KV reduce for the token split's grid.
+        if envs.ATOM_UA_SPLIT_REDUCE and unified_attention_takes_split_reduce():
+            split["split_reduce"] = True
         unified_attention(
             q,
             k_cache,

@@ -552,6 +552,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Unified-attention decode only (else the separate kernel); eager / CUDA
     # graphs (the drafter is not torch.compiled). Off by default.
     "ATOM_MTP_ATTN_GATE_IN_REDUCE": lambda: _flag_env("ATOM_MTP_ATTN_GATE_IN_REDUCE"),
+    # gfx1250 unified-attention decode / spec-decode verify: the split-KV reduce
+    # after the 3D kernel through aiter's reduce_segments_split_gluon
+    # (unified_attention(split_reduce=True)) instead of the Triton reduce_segments,
+    # for the token split's 128-256-segment grid (AITER_GFX12_TOKEN_SPLIT). Not
+    # bitwise (another fp32 summation order). No-op on an aiter without it. Off by
+    # default.
+    "ATOM_UA_SPLIT_REDUCE": lambda: _flag_env("ATOM_UA_SPLIT_REDUCE"),
     # With ATOM_FUSED_MOE_TAIL_NORM at TP > 1 (gfx1250, TP4): a sparse MoE block
     # whose next norm all-reduces (the Qwen3.5 MTP drafter's final norm with
     # ATOM_MTP_FUSE_ALLREDUCE_NORM) leaves `routed + sigmoid(gate) * shared` to
