@@ -5382,9 +5382,10 @@ class FusedMoE(torch.nn.Module):
         (`pass_scheduled_tokens_gpu`), and so are an SP gather's: its shards
         are contiguous, so the step's real rows lead."""
         context = get_forward_context().context
-        pcp = self.moe_parallel_config.pcp_merge and not context.is_dummy_run
+        merge = self.moe_parallel_config.pcp_merge
+        pcp = merge and not context.is_dummy_run
         # SP marks its dummy and captured passes split too.
-        split = (pcp or sp_is_enabled()) and context.pcp_split
+        split = merge and context.pcp_split and (pcp or sp_is_enabled())
         if split:
             rows = pack_routed_rows(
                 self.quant_method.routed_rows_wire,
