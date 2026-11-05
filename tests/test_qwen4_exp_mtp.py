@@ -20,6 +20,27 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
 )
 
 
+def test_qwen_mrope_declares_a_capturable_serial_draft_step():
+    from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
+    from atom.spec_decode.eagle_proposer import EagleProposer
+
+    proposer = object.__new__(EagleProposer)
+    proposer.runner = SimpleNamespace(use_mrope=True)
+    proposer.mtp_k = 3
+    proposer.speculative_config = SimpleNamespace(
+        draft_model_hf_config=SimpleNamespace(hc_count=4, hidden_size=2560)
+    )
+    proposer.model = Qwen4ExpMTP
+
+    graphs = proposer._declare_draft_graphs()
+
+    assert graphs == (proposer.step,)
+    assert proposer.step.inputs["positions"].batch_dim == 1
+    assert proposer.step.inputs["positions"].shape == (3,)
+    assert proposer.step.inputs["hidden_states"].shape == (4, 2560)
+    assert proposer._reuse_step_buffers
+
+
 @pytest.fixture
 def qsa_rope():
     from atom.model_ops.qwen4_exp.qsa_attention import build_qwen4_exp_rope
