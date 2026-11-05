@@ -102,6 +102,26 @@ def fused_gdn_gating(
     return g, beta_output
 
 
+def replayssm_gate_in_kernel(
+    use_replayssm: bool, num_prefills: int, num_decodes: int, has_spec: bool
+) -> bool:
+    """Whether this GDN forward folds the gating into the ReplaySSM kernel
+    (ATOM_GDN_REPLAYSSM_FUSED_GATING) instead of launching `fused_gdn_gating`.
+
+    Only for batches whose tokens are all of one kind -- pure spec-verify (the
+    graph-captured MTP case) or pure decode -- so g/beta would be consumed
+    whole. A mixed batch index_selects them by spec_token_indx and keeps the
+    separate launch; so do prefill, FlyDSL and the lossy path (none of which is
+    ReplaySSM).
+    """
+    return (
+        envs.ATOM_GDN_REPLAYSSM_FUSED_GATING
+        and use_replayssm
+        and num_prefills == 0
+        and ((has_spec and num_decodes == 0) or (not has_spec and num_decodes > 0))
+    )
+
+
 class GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -369,7 +389,19 @@ class GatedDeltaNet(nn.Module):
                 non_spec_state_indices_tensor,
             )
 
-        if use_lossy_gdn_decode or use_flydsl_decode:
+        gate_in_replayssm = replayssm_gate_in_kernel(
+            use_replayssm,
+            gdn_metadata.num_prefills,
+            gdn_metadata.num_decodes,
+            has_spec=spec_sequence_masks is not None,
+        )
+        replayssm_gate_args = (
+            {"a": a, "b": b, "A_log": self.A_log, "dt_bias": self.dt_bias}
+            if gate_in_replayssm
+            else {}
+        )
+
+        if use_lossy_gdn_decode or use_flydsl_decode or gate_in_replayssm:
             g_spec = None
             beta_spec = None
             g_non_spec = None
@@ -428,6 +460,7 @@ class GatedDeltaNet(nn.Module):
                     is_kda=False,
                     route=gdn_metadata.replayssm_route,
                     o=(core_attn_out[: query_spec.shape[1]] if spec_only else None),
+                    **replayssm_gate_args,
                 )
                 last_recurrent_state = None
             else:
@@ -616,6 +649,7 @@ class GatedDeltaNet(nn.Module):
                 use_qk_l2norm_in_kernel=True,
                 is_kda=False,
                 route=gdn_metadata.replayssm_route,
+                **replayssm_gate_args,
             )
             last_recurrent_state = None
         elif gdn_metadata.num_decodes > 0:

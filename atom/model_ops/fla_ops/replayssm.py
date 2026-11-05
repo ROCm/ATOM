@@ -663,6 +663,31 @@ def replayssm_materialize(
 # --------------------------------------------------------------------------- #
 
 
+@triton.jit
+def _gdn_gate_g(a_ptr, A_log_ptr, dt_bias_ptr):
+    """GDN log-decay of one (token, v-head): -exp(A_log) * softplus(a + dt_bias).
+
+    The same expression, in the same order, as `fused_gdn_gating_kernel`
+    (`attention_gdn.py`) with its defaults beta=1, threshold=20, so the value
+    is bit-identical to the fp32 `g` that kernel stores.
+    """
+    x = tl.load(a_ptr).to(tl.float32) + tl.load(dt_bias_ptr).to(tl.float32)
+    softplus_x = tl.where(x <= 20.0, tl.log(1 + tl.exp(x)), x)
+    return -tl.exp(tl.load(A_log_ptr).to(tl.float32)) * softplus_x
+
+
+@triton.jit
+def _gdn_gate_beta(b_ptr):
+    """sigmoid(b), rounded through b's dtype first.
+
+    `fused_gdn_gating` stores beta in `b.dtype` (bf16), and the unfused
+    kernel reads that rounded value back; rounding here keeps the two paths
+    bit-identical.
+    """
+    b_raw = tl.load(b_ptr)
+    return tl.sigmoid(b_raw.to(tl.float32)).to(b_raw.dtype).to(tl.float32)
+
+
 @triton.jit(do_not_specialize=["N", "T_TOT", "T_MAX", "CAP"])
 def _replayssm_fwd_kernel(
     q,
@@ -670,6 +695,10 @@ def _replayssm_fwd_kernel(
     v,
     g,
     beta,
+    a,
+    b,
+    A_log,
+    dt_bias,
     o,
     ckpt,
     buf_k,
@@ -701,13 +730,22 @@ def _replayssm_fwd_kernel(
     stride_bufg_pos: tl.constexpr,
     stride_bufg_hv: tl.constexpr,
     stride_beta_tok: tl.constexpr,
+    stride_a_tok: tl.constexpr,
+    stride_b_tok: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_KDA: tl.constexpr,
     IS_BETA_HEADWISE: tl.constexpr,
     DOT_MODE: tl.constexpr,
     T1_FAST: tl.constexpr,
     T1_TILED: tl.constexpr,
+    GATE_IN_KERNEL: tl.constexpr,
 ):
+    # GATE_IN_KERNEL: g and beta are computed here from the raw in_proj
+    # columns `a`, `b` ([T_tot, HV] views, row stride `stride_a_tok` /
+    # `stride_b_tok`) and the per-head `A_log`, `dt_bias`, instead of being
+    # read from the `g` / `beta` tensors `fused_gdn_gating` would have
+    # written; that saves one launch per layer. Scalar-gate GDN only (not
+    # KDA, not head-wise beta); `g` / `beta` are then not read.
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
@@ -782,7 +820,12 @@ def _replayssm_fwd_kernel(
             other=0.0,
         ).to(tl.float32)
 
-        b_gt = tl.load(g + bos * HV + i_hv).to(tl.float32)
+        if GATE_IN_KERNEL:
+            b_gt = _gdn_gate_g(
+                a + bos * stride_a_tok + i_hv, A_log + i_hv, dt_bias + i_hv
+            )
+        else:
+            b_gt = tl.load(g + bos * HV + i_hv).to(tl.float32)
         b_eg = exp(b_gt)
 
         # The l2 norms need the whole vector, so take them before tiling; the
@@ -870,7 +913,9 @@ def _replayssm_fwd_kernel(
         b_v = tl.load(v + (bos * HV + i_hv) * V + o_v, mask=mask_v, other=0.0).to(
             tl.float32
         )
-        if IS_BETA_HEADWISE:
+        if GATE_IN_KERNEL:
+            b_beta = _gdn_gate_beta(b + bos * stride_b_tok + i_hv)
+        elif IS_BETA_HEADWISE:
             b_beta = tl.load(
                 beta + (bos * HV + i_hv) * V + o_v, mask=mask_v, other=0.0
             ).to(tl.float32)
@@ -960,6 +1005,10 @@ def _replayssm_fwd_kernel(
             b_g = tl.load(g + (bos * HV + i_hv) * K + o_k, mask=mask_k, other=0.0).to(
                 tl.float32
             )
+        elif GATE_IN_KERNEL:
+            b_g = _gdn_gate_g(
+                a + bos * stride_a_tok + i_hv, A_log + i_hv, dt_bias + i_hv
+            )
         else:
             b_g = tl.load(g + bos * HV + i_hv).to(tl.float32)
         # (diag(e^g) S_h)^T x == S_h^T (e^g . x), so this step's gate rides on
@@ -975,7 +1024,9 @@ def _replayssm_fwd_kernel(
         b_sk += tl.sum(tl.sum(b_kw * b_xk[:, None], 0)[:, None] * b_ru, 0)
         b_sq += tl.sum(tl.sum(b_kw * b_xq[:, None], 0)[:, None] * b_ru, 0)
 
-        if IS_BETA_HEADWISE:
+        if GATE_IN_KERNEL:
+            b_beta = _gdn_gate_beta(b + bos * stride_b_tok + i_hv)
+        elif IS_BETA_HEADWISE:
             b_beta = tl.load(
                 beta + (bos * HV + i_hv) * V + o_v, mask=mask_v, other=0.0
             ).to(tl.float32)
@@ -1040,6 +1091,8 @@ def _replayssm_fwd_kernel(
         p_g = g + (bos * HV + i_hv) * K + o_k
     else:
         p_g = g + bos * HV + i_hv
+    p_a = a + bos * stride_a_tok + i_hv
+    p_b = b + bos * stride_b_tok + i_hv
 
     for i_t in range(T):
         b_q = tl.load(p_q, mask=mask_k, other=0.0).to(tl.float32)
@@ -1055,11 +1108,16 @@ def _replayssm_fwd_kernel(
             b_g = tl.load(p_g, mask=mask_k, other=0.0).to(tl.float32)
             b_h *= exp(b_g)[:, None]
         else:
-            b_g = tl.load(p_g).to(tl.float32)
+            if GATE_IN_KERNEL:
+                b_g = _gdn_gate_g(p_a, A_log + i_hv, dt_bias + i_hv)
+            else:
+                b_g = tl.load(p_g).to(tl.float32)
             b_h *= exp(b_g)
 
         b_v -= tl.sum(b_h * b_k[:, None], 0)
-        if IS_BETA_HEADWISE:
+        if GATE_IN_KERNEL:
+            b_beta = _gdn_gate_beta(p_b)
+        elif IS_BETA_HEADWISE:
             b_beta = tl.load(p_beta, mask=mask_v, other=0.0).to(tl.float32)
         else:
             b_beta = tl.load(p_beta).to(tl.float32)
@@ -1107,6 +1165,8 @@ def _replayssm_fwd_kernel(
         p_o += HV * V
         p_beta += stride_beta_tok
         p_g += HV * K if IS_KDA else HV
+        p_a += stride_a_tok
+        p_b += stride_b_tok
 
 
 # --------------------------------------------------------------------------- #
@@ -1354,8 +1414,8 @@ def replayssm_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
+    g: torch.Tensor | None,
+    beta: torch.Tensor | None,
     ckpt: torch.Tensor,
     buf_k: torch.Tensor,
     buf_u: torch.Tensor,
@@ -1369,6 +1429,10 @@ def replayssm_gated_delta_rule(
     is_kda: bool = False,
     route: str = "auto",
     o: torch.Tensor | None = None,
+    a: torch.Tensor | None = None,
+    b: torch.Tensor | None = None,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ReplaySSM forward for one linear-attention layer.
 
@@ -1390,6 +1454,15 @@ def replayssm_gated_delta_rule(
         o: optional contiguous ``[T_tot, HV, V]`` destination (e.g. a slice of
             the layer's output buffer); the kernel writes into it directly
             instead of a fresh tensor, saving the caller a device copy.
+        a, b, A_log, dt_bias: pass these with ``g = beta = None`` to compute
+            the GDN gate inside the serial kernel instead of reading a
+            precomputed one (scalar gate only, not KDA). ``a`` / ``b`` are the
+            raw ``[T_tot, HV]`` in_proj columns and may be strided views
+            (unit stride along HV); they are deliberately not made contiguous,
+            which would cost the two copy launches the fusion removes.
+            ``A_log`` / ``dt_bias`` are ``[HV]``. Bit-identical to calling
+            ``fused_gdn_gating`` first. The UT route falls back to that
+            separate gating launch.
 
     Returns:
         ``o`` of shape ``[1, T_tot, HV, V]`` -- same leading-batch convention
@@ -1411,7 +1484,20 @@ def replayssm_gated_delta_rule(
     BK = triton.next_power_of_2(K)
     assert triton.cdiv(K, BK) == 1, "K must fit one block"
 
-    q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
+    gate_in_kernel = g is None
+    if gate_in_kernel:
+        assert beta is None, "pass both g and beta, or neither"
+        assert not is_kda, "in-kernel gating is the scalar GDN gate only"
+        for name, x in (("a", a), ("b", b), ("A_log", A_log), ("dt_bias", dt_bias)):
+            assert x is not None, f"g=None needs {name} for in-kernel gating"
+        assert a.shape == (T_tot, HV) and b.shape == (T_tot, HV), (a.shape, b.shape)
+        assert a.stride(1) == 1 and b.stride(1) == 1, (a.stride(), b.stride())
+        assert A_log.numel() == HV and dt_bias.numel() == HV
+        A_log, dt_bias = A_log.contiguous(), dt_bias.contiguous()
+
+    q, k, v = (x.contiguous() for x in (q, k, v))
+    if not gate_in_kernel:
+        g, beta = g.contiguous(), beta.contiguous()
     if o is None:
         o = q.new_empty(1, T_tot, HV, V)
     else:
@@ -1420,7 +1506,9 @@ def replayssm_gated_delta_rule(
 
     if route not in ("auto", "serial", "ut"):
         raise ValueError(f"unknown replayssm route {route!r}; expected auto|serial|ut")
-    ut_eligible = (not is_kda) and beta.ndim != v.ndim and max_query_len > 1
+    ut_eligible = (
+        (not is_kda) and (gate_in_kernel or beta.ndim != v.ndim) and max_query_len > 1
+    )
     if route == "auto":
         # Measured crossover on gfx950 (MI355X), Qwen3.5-like shape
         # H=2 HV=16 K=V=128 bf16, bs=128, best config per route:
@@ -1438,6 +1526,12 @@ def replayssm_gated_delta_rule(
                 "replayssm route='ut' requires a scalar gate (not KDA), "
                 "non-headwise beta, and max_query_len > 1"
             )
+        if gate_in_kernel:
+            # The UT kernel has no in-kernel gate; take the separate launch.
+            # Imported here: attention_gdn imports this module.
+            from atom.model_ops.attention_gdn import fused_gdn_gating
+
+            g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
         # One program per (sequence, v-head): the [T, K] work (loads, l2norm,
         # the K.K^T and Q.K^T gemms) does not depend on the V split, so
         # splitting V would replicate it NV times.  Measured 2.9x worse at
@@ -1495,12 +1589,22 @@ def replayssm_gated_delta_rule(
     # flush resets it, and `tl.dot` wants at least 16 rows on CDNA, so a
     # short buffer pads rather than shrinks.
     BH = max(16, triton.next_power_of_2(cap - max_query_len))
+    if gate_in_kernel:
+        # Never dereferenced under GATE_IN_KERNEL; any pointer will do.
+        g = beta = a
+    else:
+        # Likewise unused without GATE_IN_KERNEL.
+        a, b, A_log, dt_bias = g, beta, g, g
     _replayssm_fwd_kernel[(NV, N * HV)](
         q=q,
         k=k,
         v=v,
         g=g,
         beta=beta,
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
         o=o,
         ckpt=ckpt,
         buf_k=buf_k,
@@ -1531,13 +1635,16 @@ def replayssm_gated_delta_rule(
         stride_bufg_slot=buf_g.stride(0),
         stride_bufg_pos=buf_g.stride(2),
         stride_bufg_hv=buf_g.stride(1),
-        stride_beta_tok=beta.stride(1),
+        stride_beta_tok=0 if gate_in_kernel else beta.stride(1),
+        stride_a_tok=a.stride(0) if gate_in_kernel else 0,
+        stride_b_tok=b.stride(0) if gate_in_kernel else 0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
-        IS_BETA_HEADWISE=beta.ndim == v.ndim,
+        IS_BETA_HEADWISE=(not gate_in_kernel) and beta.ndim == v.ndim,
         DOT_MODE=_replay_dot_mode(buf_u.dtype),
         T1_FAST=max_query_len == 1,
         T1_TILED=(max_query_len == 1) and not is_kda,
+        GATE_IN_KERNEL=gate_in_kernel,
         num_warps=num_warps,
         num_stages=num_stages,
     )

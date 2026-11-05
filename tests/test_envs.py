@@ -25,6 +25,7 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION",
     "ATOM_ENABLE_GLUON_FUSED_AR",
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST",
+    "ATOM_GDN_REPLAYSSM_FUSED_GATING",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT",
     "ATOM_USE_MODEL_SENSITIVE_RMSNORM",
@@ -148,6 +149,9 @@ class TestEnvsDefaults:
 
     def test_atom_enable_gdn_decode_lossy_fast_default(self):
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is False
+
+    def test_gdn_replayssm_fused_gating_default_disabled(self):
+        assert _get_envs().ATOM_GDN_REPLAYSSM_FUSED_GATING is False
 
     def test_use_flydsl_gather_kv_b_proj_default(self):
         assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is True
@@ -333,6 +337,22 @@ def test_mla_fp8_prefill_flag(monkeypatch):
     for value, expected in [("0", False), ("1", True), ("true", False)]:
         monkeypatch.setenv(name, value)
         assert getattr(_get_envs(), name) is expected
+
+
+def test_gdn_replayssm_fused_gating_flag_is_opt_in_and_documented(monkeypatch):
+    """Only "1" turns the in-kernel GDN gate on, and the switch is in the
+    central env reference. The dispatch itself is covered (with aiter) in
+    tests/test_qwen35_gdn_decode_fusion_switches.py."""
+    import pathlib
+
+    name = "ATOM_GDN_REPLAYSSM_FUSED_GATING"
+    for value, expected in [("0", False), ("1", True), ("true", False)]:
+        monkeypatch.setenv(name, value)
+        assert getattr(_get_envs(), name) is expected
+    doc = (
+        pathlib.Path(__file__).parents[1] / "docs" / "environment_variables.md"
+    ).read_text()
+    assert f"**{name}**" in doc
 
 
 def test_offload_env_vars_are_documented():
