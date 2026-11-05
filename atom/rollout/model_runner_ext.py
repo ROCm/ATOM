@@ -56,6 +56,8 @@ class RLHFModelRunner(
         # padded", which is the right answer for almost every model and costs
         # one comparison per step.
         self._true_vocab_size = config.true_vocab_size
+        self._init_weight_updater()
+        self._init_rdma_receiver(config)
         super().__init__(rank, config)
         self._check_true_vocab_size(config)
 
@@ -191,10 +193,7 @@ class RLHFModelRunner(
         # DP is handled at the EngineCore level (DPEngineCoreProc), not
         # within ModelRunner. Override so downstream code (ForwardMode.decide /
         # sync_dp_metadata) sees dp_size=1 and skips cross-DP collectives that
-        # would fail on the isolated process group. Kept first for what has to
-        # see the whole deployment: an RDMA weight group would span every DP
-        # engine of it.
-        self._deployment_data_parallel_size = config.parallel_config.data_parallel_size
+        # would fail on the isolated process group.
         config.parallel_config.data_parallel_size = 1
 
         # aiter's init_dist_env creates a signal tensor on device=rankID
@@ -350,11 +349,6 @@ class RLHFModelRunner(
         input_ids: torch.Tensor,
         batch: ScheduledBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Every serving forward runs the model through here -- this runner's
-        # forward, and RapidServe's prefill_forward and decode forward, which a
-        # disaggregated EngineCore calls instead -- so none of them serves a
-        # fenced runner's weights. Graph capture bypasses run_model.
-        self.assert_weight_update_ready()
         if not self._extract_mode:
             return super().run_model(input_ids, batch)
 
@@ -393,11 +387,6 @@ class RLHFModelRunner(
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        # Refuse to serve mid-reload or after a partial one. Weights are applied
-        # in place, so without this a failed stream would keep serving from a
-        # mix of two versions -- visible much later as unexplained divergence
-        # rather than as an error here.
-        self.assert_weight_update_ready()
         result = super().forward(batch)
 
         if self._extract_mode and self._captured_hidden_states is not None:

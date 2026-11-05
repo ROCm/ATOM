@@ -123,6 +123,7 @@ class _ModelDouble(nn.Module):
 
 class _Runner(WeightUpdaterMixin):
     def __init__(self, model):
+        self._init_weight_updater()
         self.model = model
         self.device = DEVICE
         self.rank = 0

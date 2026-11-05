@@ -22,9 +22,19 @@ with stubbed_aiter():
     from atom.model_engine.engine_core import EngineCore
     from atom.model_engine.pp_engine_core import PPEngineCoreProc
 from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
-from atom.model_engine.collective_rpc import RpcResponseRouter, RpcResult
+from atom.model_engine.collective_rpc import (
+    DISCARD_WEIGHT_SYNC_CMD,
+    RpcResponseRouter,
+    RpcResult,
+    WeightReloadRefused,
+)
 from atom.model_engine.engine_core_mgr import CoreManager
-from atom.model_engine.engine_utility import EngineUtilityHandler, kv_change
+from atom.model_engine.engine_utility import (
+    RECEIVE_WEIGHTS_RDMA_CMD,
+    WEIGHT_UPDATE_UTILITY_CMDS,
+    EngineUtilityHandler,
+    kv_change,
+)
 from atom.model_engine.scheduler import (
     DecodeScheduler,
     PrefillScheduler,
@@ -303,10 +313,57 @@ def test_a_weight_change_is_refused_with_an_offload_tier_a_kv_change_is_not():
 
 
 class _Runners:
-    """The TP ranks of one engine, each applying whatever it is sent."""
+    """The TP ranks of one engine, each applying whatever it is sent, and
+    reporting *unavailable* when asked what it supports.
+
+    With *unanswered* that query times out instead. Of its *ranks*, those in
+    *refusing* refuse every update before writing, with *refusal*, as a
+    runner whose model a reload cannot rewrite does; unless *marked* is
+    false, when only their error's text says so.
+    """
+
+    def __init__(
+        self,
+        unavailable=None,
+        unanswered=False,
+        refusal=None,
+        refusing=(),
+        ranks=1,
+        marked=True,
+    ):
+        self.unavailable = unavailable or {}
+        self.unanswered = unanswered
+        self.refusal = refusal
+        self.refusing = set(refusing)
+        self.ranks = ranks
+        self.marked = marked
+        self.calls = []
 
     def utility_rpc(self, method, payload, timeout=300.0):
-        return [RpcResult(payload.request_id, 0, value=1)]
+        if method == "get_worker_capabilities":
+            if self.unanswered:
+                raise TimeoutError("no reply from TP rank 0")
+            return [
+                RpcResult(
+                    payload.request_id, rank, value={"unavailable": self.unavailable}
+                )
+                for rank in range(self.ranks)
+            ]
+        self.calls.append((method, payload))
+        if method not in WEIGHT_UPDATE_UTILITY_CMDS:
+            return [
+                RpcResult(payload.request_id, r, value=1) for r in range(self.ranks)
+            ]
+        refused = WeightReloadRefused(self.refusal)
+        error = f"{type(refused).__name__}: {refused}"
+
+        def reply(rank):
+            if rank in self.refusing:
+                marked = {"refused_before_writing": True} if self.marked else {}
+                return RpcResult(payload.request_id, rank, error=error, **marked)
+            return RpcResult(payload.request_id, rank, value=1)
+
+        return [reply(rank) for rank in range(self.ranks)]
 
 
 def _manager(engine_count):
@@ -321,15 +378,16 @@ def _manager(engine_count):
     return mgr
 
 
-def _wired(schedulers):
+def _wired(schedulers, runners=None):
     """A CoreManager whose DP engines are real utility handlers over
     *schedulers*, each control message delivered and answered in order."""
     mgr = _manager(len(schedulers))
     engines = [_engine(sched) for sched in schedulers]
     outs = [queue.Queue() for _ in schedulers]
+    runners = runners or [_Runners() for _ in schedulers]
     handlers = [
-        EngineUtilityHandler(_Runners(), out, label=f"dp{i}", scheduler=sched)
-        for i, (out, sched) in enumerate(zip(outs, schedulers))
+        EngineUtilityHandler(runner, out, label=f"dp{i}", scheduler=sched)
+        for i, (runner, out, sched) in enumerate(zip(runners, outs, schedulers))
     ]
 
     def send(dp_rank, payload, copy=False):
@@ -381,6 +439,97 @@ def test_a_peer_that_wrote_stays_fenced_until_the_next_sync(monkeypatch):
     _update(mgr)
 
     assert not any(e._weight_sync_fenced for e in (refused, wrote))
+
+
+def test_a_sync_the_runners_cannot_reload_is_refused_before_it_writes():
+    """The engine asks its runners first, so a model they cannot rewrite in
+    place is refused with nothing preempted or written, and no engine is
+    fenced for it."""
+    reason = "the model attends through MLA"
+    schedulers = [_running(2)[0], _running(2)[0]]
+    runners = [_Runners({"weight_reload": reason}) for _ in schedulers]
+    mgr, engines = _wired(schedulers, runners)
+
+    with pytest.raises(RuntimeError, match=reason):
+        _update(mgr)
+
+    assert not any(e._weight_sync_fenced or e._rl_weights_inconsistent for e in engines)
+    assert all(len(sched.running) == 2 for sched in schedulers)
+    assert [cmd for r in runners for cmd, _ in r.calls] == [DISCARD_WEIGHT_SYNC_CMD] * 2
+
+
+def test_a_refusal_after_an_unanswered_query_fences_no_engine():
+    """The engines could not ask, so each sent the update and its runners
+    refused it before writing. DISCARD found every fence up and kept it, for
+    good: the refusal is the model's, and so is every later one."""
+    reason = "the model attends through MLA"
+    schedulers = [_running(2)[0], _running(2)[0]]
+    runners = [
+        _Runners(unanswered=True, refusal=reason, refusing={0}) for _ in schedulers
+    ]
+    mgr, engines = _wired(schedulers, runners)
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match=reason):
+            _update(mgr)
+        assert not any(
+            e._weight_sync_fenced or e._rl_weights_inconsistent for e in engines
+        )
+
+
+def test_a_stream_refused_after_an_unanswered_query_fences_nothing():
+    reason = "the model attends through MLA"
+    runner = _Runners(unanswered=True, refusal=reason, refusing={0})
+    mgr, (engine,) = _wired([_running(2)[0]], [runner])
+
+    with pytest.raises(RuntimeError, match=reason):
+        mgr.broadcast_utility_command_sync(
+            RECEIVE_WEIGHTS_RDMA_CMD, timeout=5, group_name="g", version=3
+        )
+
+    assert not (engine._weight_sync_fenced or engine._rl_weights_inconsistent)
+
+
+def test_an_engine_one_of_whose_ranks_wrote_stays_fenced():
+    """Rank 1 wrote what rank 0 refused, so the weights are not whole."""
+    runner = _Runners(unanswered=True, refusal="rank 0 only", refusing={0}, ranks=2)
+    mgr, (engine,) = _wired([_running(2)[0]], [runner])
+
+    with pytest.raises(RuntimeError, match="rank 0 only"):
+        _update(mgr)
+
+    assert engine._weight_sync_fenced and engine._rl_weights_inconsistent
+
+
+def test_an_error_that_only_reads_like_a_refusal_keeps_the_fence():
+    """Read off the text, any error that began with the refusal's name took
+    the fence down, whatever had been written."""
+    runner = _Runners(unanswered=True, refusal="MLA", refusing={0}, marked=False)
+    mgr, (engine,) = _wired([_running(2)[0]], [runner])
+
+    with pytest.raises(RuntimeError, match="MLA"):
+        _update(mgr)
+
+    assert engine._weight_sync_fenced and engine._rl_weights_inconsistent
+
+
+def test_a_weight_stream_the_runners_cannot_take_is_drained_and_fences_nothing():
+    """The trainer broadcasts regardless, so the runners still take the
+    stream in, told to discard it; the engine keeps serving what it holds."""
+    reason = "pipeline_parallel_size=2"
+    runner = _Runners({"rdma_weight_receive": reason})
+    mgr, (engine,) = _wired([_running(2)[0]], [runner])
+
+    with pytest.raises(RuntimeError, match=reason):
+        mgr.broadcast_utility_command_sync(
+            RECEIVE_WEIGHTS_RDMA_CMD, timeout=5, group_name="g", version=3
+        )
+
+    assert not (engine._weight_sync_fenced or engine._rl_weights_inconsistent)
+    assert len(engine.scheduler.running) == 2
+    (drain, drained), (discard, _) = runner.calls
+    assert (drain, drained.kwargs) == (RECEIVE_WEIGHTS_RDMA_CMD, {"refusal": reason})
+    assert discard == DISCARD_WEIGHT_SYNC_CMD
 
 
 # ── a pipeline: the head and a later stage running its own loop ────────────

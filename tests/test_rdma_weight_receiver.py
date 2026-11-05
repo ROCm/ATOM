@@ -1,22 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The RDMA weight receiver: wire format and transaction semantics.
+"""The RDMA weight receiver: the wire format, and keeping every rank in step.
 
 The wire format is frozen by the sender
 (``lumenrl.engine.inference.rdma_weight_transfer``) and is reproduced here from
 its own constants rather than copied by eye, so a drift on either side shows up
 as a test failure instead of a 61 GB transfer that decodes to garbage.
 
-The transaction exists because weights are applied *in place*. A stream that
-fails halfway leaves the model a mix of two versions, and inference would keep
-serving -- quietly wrong. So a failure must fence serving, not just log.
+What a stream writes, and the fence around it, are the engine's weight sync:
+``test_weight_sync_coverage.py`` and ``test_collective_rpc_dispatch.py``.
 """
 
 import json
-import os
-import re
 import sys
+from datetime import timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -27,67 +25,28 @@ from aiter_stub import stubbed_aiter
 
 with stubbed_aiter():
     import atom.rollout.rdma_weight_receiver as receiver
-    from atom.model_engine.collective_rpc import COLLECTIVE_RPC_METHODS
+    from atom.model_engine.collective_rpc import (
+        COLLECTIVE_RPC_METHODS,
+        UTILITY_MANAGED_RUNNER_METHODS,
+    )
+    from atom.rollout.capabilities import CapabilityProviderMixin
     from atom.rollout.rdma_weight_receiver import (
         _CMD_BUCKET,
         _CMD_END,
         _HEADER_WORDS,
-        _decode_bucket,
+        _decode_frame,
     )
+    from atom.rollout.weight_updater import WeightUpdaterMixin
 
 
-def test_an_orchestrator_can_reach_every_receiver_rpc():
-    """collective_rpc runs only COLLECTIVE_RPC_METHODS, so a receiver RPC
-    missing from it is refused before any worker sees the call."""
-    public = {
-        name
-        for name in vars(receiver.RDMAWeightReceiverMixin)
-        if not name.startswith("_")
-    }
-    assert public == {
-        "get_rdma_capabilities",
-        "init_rdma_weight_group",
-        "receive_weights_rdma",
-        "destroy_rdma_weight_group",
-    }
-    assert public <= COLLECTIVE_RPC_METHODS
-
-
-def test_the_rdma_capability_probe_says_what_this_receiver_takes():
-    """LumenRL's orchestrator probes each worker with get_rdma_capabilities,
-    and collective_rpc refused the call. Answered now, as this receiver is:
-    full-precision streams, on an engine that takes RDMA reloads at all, and
-    no prequantised ones."""
-    from atom.model_engine.collective_rpc import is_plain_rpc_value
-
-    report = _Worker(0, 0, tp=1, tp_world=1, pcp=1).get_rdma_capabilities()
-
-    assert report == {
-        "protocol_version": 2,
-        "module_path": "atom.rollout.rdma_weight_receiver",
-        "online_quant_reload": True,
-        "prequantized_stream": False,
-        "refusal": None,
-    }
-    assert is_plain_rpc_value(report)
-
-    refused = _Worker(0, 0, tp=2, tp_world=2, pcp=2).get_rdma_capabilities()
-    assert refused["online_quant_reload"] is False
-    assert "prefill_context_parallel_size=2" in refused["refusal"]
-
-
-def test_the_reload_transaction_steps_stay_off_the_public_path():
-    """receive_weights_rdma runs them in order inside one call. Driven one at
-    a time from outside, a commit could follow no apply at all."""
-    steps = {
-        "begin_weight_update",
-        "apply_weight_bucket",
-        "prepare_weight_commit",
-        "finish_weight_commit",
-        "abort_weight_update",
-        "fence_weight_update",
-    }
-    assert not steps & COLLECTIVE_RPC_METHODS
+def test_only_the_group_lifecycle_is_on_the_public_rpc_path():
+    """The stream writes weights, so it is the engine's command, inside the
+    weight sync that owns the fence; joining and leaving the group are not."""
+    assert {"init_rdma_weight_group", "destroy_rdma_weight_group"} <= (
+        COLLECTIVE_RPC_METHODS
+    )
+    assert "receive_weights_rdma" not in COLLECTIVE_RPC_METHODS
+    assert "receive_weights_rdma" in UTILITY_MANAGED_RUNNER_METHODS
 
 
 # ── the frozen wire format ─────────────────────────────────────────────────
@@ -114,8 +73,7 @@ def _encode(entries_and_bytes):
             {
                 "name": name,
                 "shape": list(tensor.shape),
-                # The sender strips the "torch." prefix; getattr(torch, ...) on
-                # the receiving side is what has to match.
+                # The sender strips the "torch." prefix.
                 "dtype": str(tensor.dtype).removeprefix("torch."),
                 "offset": offset,
                 "nbytes": raw.numel(),
@@ -125,11 +83,16 @@ def _encode(entries_and_bytes):
         offset += raw.numel()
 
     payload = torch.cat(blobs) if blobs else torch.empty(0, dtype=torch.uint8)
-    meta = torch.tensor(
+    return _metadata(entries), payload
+
+
+def _metadata(entries):
+    import torch
+
+    return torch.tensor(
         list(json.dumps(entries, separators=(",", ":")).encode("utf-8")),
         dtype=torch.uint8,
     )
-    return meta, payload
 
 
 def test_a_bucket_round_trips_through_the_real_encoding():
@@ -137,16 +100,11 @@ def test_a_bucket_round_trips_through_the_real_encoding():
 
     a = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
     b = torch.tensor([5.0, 6.0, 7.0], dtype=torch.float32)
-    meta, payload = _encode([("layer.a", a), ("layer.b", b)])
 
-    decoded = _decode_bucket(meta, payload)
+    decoded = _decode_frame(*_encode([("layer.a", a), ("layer.b", b)]))
 
     assert [name for name, _ in decoded] == ["layer.a", "layer.b"]
-    got_a, got_b = decoded[0][1], decoded[1][1]
-    assert got_a.dtype == torch.bfloat16 and tuple(got_a.shape) == (2, 2)
-    assert got_b.dtype == torch.float32 and tuple(got_b.shape) == (3,)
-    assert torch.equal(got_a, a)
-    assert torch.equal(got_b, b)
+    assert torch.equal(decoded[0][1], a) and torch.equal(decoded[1][1], b)
 
 
 def test_metadata_is_decoded_without_a_list_entry_per_byte():
@@ -157,15 +115,13 @@ def test_metadata_is_decoded_without_a_list_entry_per_byte():
     import torch
 
     meta, payload = _encode([("w" * (1 << 20), torch.zeros(1))])
-    _decode_bucket(meta, payload)  # any lazy import, outside the measurement
+    _decode_frame(meta, payload)  # any lazy import, outside the measurement
     tracemalloc.start()
     try:
-        _decode_bucket(meta, payload)
+        _decode_frame(meta, payload)
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
-    # The bytes, their text and the name decoded from it: a few copies of the
-    # frame, where the list alone was eight.
     assert peak < 6 * meta.numel()
 
 
@@ -173,23 +129,22 @@ def test_the_decoded_tensors_are_views_not_copies():
     """A 61 GB transfer cannot afford to double its peak footprint."""
     import torch
 
-    a = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
-    meta, payload = _encode([("w", a)])
-    ((_, view),) = _decode_bucket(meta, payload)
+    meta, payload = _encode([("w", torch.tensor([1.0, 2.0], dtype=torch.bfloat16))])
+    ((_, view),) = _decode_frame(meta, payload)
     assert view.data_ptr() == payload.data_ptr()
 
 
 def test_a_tensor_packed_off_its_alignment_is_decoded_too():
     """The sender packs tensors back to back, so an FP32 tensor after three
-    BF16 values starts six bytes in, which view() cannot reinterpret: a valid
-    bucket failed. That tensor is copied; the rest are still views."""
+    BF16 values starts six bytes in, which view() cannot reinterpret. That
+    tensor is copied; the rest are still views."""
     import torch
 
     a = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
     b = torch.tensor([4.5, 5.5], dtype=torch.float32)
     meta, payload = _encode([("a", a), ("b", b)])
 
-    (_, got_a), (_, got_b) = _decode_bucket(meta, payload)
+    (_, got_a), (_, got_b) = _decode_frame(meta, payload)
 
     assert torch.equal(got_a, a) and torch.equal(got_b, b)
     assert got_a.data_ptr() == payload.data_ptr()
@@ -201,33 +156,29 @@ def test_an_out_of_bounds_offset_is_rejected_not_truncated():
 
     meta, payload = _encode([("w", torch.tensor([1.0], dtype=torch.float32))])
     entries = json.loads(bytes(meta.tolist()).decode())
-    entries[0]["nbytes"] = 4096  # past the end
-    bad = torch.tensor(list(json.dumps(entries).encode()), dtype=torch.uint8)
-    with pytest.raises(RuntimeError, match="out of bounds"):
-        _decode_bucket(bad, payload)
+    entries[0]["nbytes"] = 4096
+    with pytest.raises(ValueError, match="out of bounds"):
+        _decode_frame(_metadata(entries), payload)
 
 
 @pytest.mark.parametrize(
     ("mutate", "expect"),
     [
         (lambda e: e.update({"shape": [99]}), "size mismatch"),
-        (lambda e: e.pop("name"), "invalid RDMA weight metadata entry"),
-        (
-            lambda e: e.update({"dtype": "not_a_dtype"}),
-            "invalid RDMA weight metadata entry",
-        ),
+        (lambda e: e.pop("name"), "invalid weight bucket entry"),
+        (lambda e: e.update({"dtype": "not_a_dtype"}), "invalid weight bucket entry"),
         (lambda e: e.update({"nbytes": 0}), "out of bounds"),
-        (lambda e: e.update({"offset": -1}), "invalid RDMA weight metadata entry"),
+        (lambda e: e.update({"offset": -1}), "invalid weight bucket entry"),
         # Each of these int() coerced into a different layout that still fit
         # the bytes, or into one view() reshapes to fit.
-        (lambda e: e.update({"shape": [2.5]}), "invalid RDMA weight metadata entry"),
-        (lambda e: e.update({"shape": [-1]}), "invalid RDMA weight metadata entry"),
-        (lambda e: e.update({"shape": [True]}), "invalid RDMA weight metadata entry"),
-        (lambda e: e.update({"shape": "2"}), "invalid RDMA weight metadata entry"),
-        (lambda e: e.update({"offset": 0.5}), "invalid RDMA weight metadata entry"),
-        (lambda e: e.update({"nbytes": 8.0}), "invalid RDMA weight metadata entry"),
-        (lambda e: e.update({"name": 7}), "invalid RDMA weight metadata entry"),
-        (lambda e: e.update({"dtype": "tensor"}), "invalid RDMA weight metadata entry"),
+        (lambda e: e.update({"shape": [2.5]}), "invalid weight bucket entry"),
+        (lambda e: e.update({"shape": [-1]}), "invalid weight bucket entry"),
+        (lambda e: e.update({"shape": [True]}), "invalid weight bucket entry"),
+        (lambda e: e.update({"shape": "2"}), "invalid weight bucket entry"),
+        (lambda e: e.update({"offset": 0.5}), "invalid weight bucket entry"),
+        (lambda e: e.update({"nbytes": 8.0}), "invalid weight bucket entry"),
+        (lambda e: e.update({"name": 7}), "invalid weight bucket entry"),
+        (lambda e: e.update({"dtype": "tensor"}), "invalid weight bucket entry"),
     ],
 )
 def test_corrupt_metadata_is_rejected(mutate, expect):
@@ -236,23 +187,15 @@ def test_corrupt_metadata_is_rejected(mutate, expect):
     meta, payload = _encode([("w", torch.tensor([1.0, 2.0], dtype=torch.float32))])
     entries = json.loads(bytes(meta.tolist()).decode())
     mutate(entries[0])
-    bad = torch.tensor(list(json.dumps(entries).encode()), dtype=torch.uint8)
-    with pytest.raises(RuntimeError, match=expect):
-        _decode_bucket(bad, payload)
+    with pytest.raises(ValueError, match=expect):
+        _decode_frame(_metadata(entries), payload)
 
 
 def test_an_empty_metadata_list_is_rejected():
     import torch
 
-    bad = torch.tensor(list(b"[]"), dtype=torch.uint8)
-    with pytest.raises(RuntimeError, match="non-empty list"):
-        _decode_bucket(bad, torch.empty(0, dtype=torch.uint8))
-
-
-def _metadata(entries):
-    import torch
-
-    return torch.tensor(list(json.dumps(entries).encode()), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="non-empty list"):
+        _decode_frame(_metadata([]), torch.empty(0, dtype=torch.uint8))
 
 
 def test_a_repeated_name_is_rejected():
@@ -266,12 +209,12 @@ def test_a_repeated_name_is_rejected():
             ("w", torch.tensor([2.0], dtype=torch.float32)),
         ]
     )
-    with pytest.raises(RuntimeError, match="repeats weight names"):
-        _decode_bucket(meta, payload)
+    with pytest.raises(ValueError, match="repeats names"):
+        _decode_frame(meta, payload)
 
 
 def test_overlapping_ranges_are_rejected():
-    """The same bytes handed to two parameters, with coverage none the wiser."""
+    """The same bytes handed to two parameters."""
     import torch
 
     meta, payload = _encode(
@@ -282,12 +225,11 @@ def test_overlapping_ranges_are_rejected():
     )
     entries = json.loads(bytes(meta.tolist()).decode())
     entries[1]["offset"] = 4  # inside a's [0, 8)
-    with pytest.raises(RuntimeError, match="overlap"):
-        _decode_bucket(_metadata(entries), payload)
+    with pytest.raises(ValueError, match="overlap"):
+        _decode_frame(_metadata(entries), payload)
 
 
 def test_a_gap_between_ranges_is_not_an_overlap():
-    """Only overlap is refused; padding between entries is not corruption."""
     import torch
 
     payload = torch.zeros(12, dtype=torch.uint8)
@@ -297,8 +239,16 @@ def test_a_gap_between_ranges_is_not_an_overlap():
         {"name": n, "shape": [1], "dtype": "float32", "offset": o, "nbytes": 4}
         for n, o in (("a", 0), ("b", 8))
     ]
-    decoded = dict(_decode_bucket(_metadata(entries), payload))
+    decoded = dict(_decode_frame(_metadata(entries), payload))
     assert decoded["a"].item() == 1.0 and decoded["b"].item() == 2.0
+
+
+def test_the_receiver_reads_the_header_in_the_documented_order(monkeypatch):
+    import torch
+
+    trainer = _Trainer([torch.tensor([1, 10, 20, 7], dtype=torch.int64)])
+    monkeypatch.setattr(receiver, "dist", SimpleNamespace(broadcast=trainer.broadcast))
+    assert receiver._recv_header(None, device=torch.device("cpu")) == (1, 10, 20, 7)
 
 
 # ── the stream: one rank's failure must not strand the others ──────────────
@@ -331,37 +281,41 @@ def _frames(buckets, version=1):
 
 
 class _Runner:
-    """The transaction surface ``receive_weight_stream`` drives."""
+    """The updater surface ``receive_weight_stream`` drives."""
 
-    def __init__(self, fail_on_bucket=None, refuse_begin=False):
+    def __init__(self, fail_on_bucket=None, refuse=False, fail_complete=False):
+        self._sync = None
         self.events = []
         self.fail_on_bucket = fail_on_bucket
-        self.refuse_begin = refuse_begin
+        self.refuse = refuse
+        self.fail_complete = fail_complete
         self.applied = 0
 
-    def begin_weight_update(self, version):
-        self.events.append("begin")
-        if self.refuse_begin:
-            raise RuntimeError(f"weight update version must increase, got {version}")
+    def _open_sync(self):
+        if self.refuse:
+            raise RuntimeError("weights cannot be reloaded: MLA")
+        self._sync = object()
+        self.events.append("open")
 
-    def apply_weight_bucket(self, weights, payload_bytes=0):
+    def _apply_named_tensors(self, weights):
         self.applied += 1
         self.events.append(f"apply{self.applied}")
         if self.applied == self.fail_on_bucket:
             raise RuntimeError(f"bucket {self.applied} rejected")
+        return {"updated": len(weights), "unwritten": []}
 
-    def prepare_weight_commit(self, version):
-        self.events.append("prepare")
+    def _refuse_unwritten(self, counts):
+        pass
 
-    def finish_weight_commit(self, version):
-        self.events.append("commit")
-        return {"loaded_internal": 1}
+    def _complete_sync(self, require_full):
+        self.events.append(f"complete(require_full={require_full})")
+        self._sync = None
+        if self.fail_complete:
+            raise RuntimeError("left 3 parameter(s) as they were")
 
-    def abort_weight_update(self, version, error):
-        self.events.append(f"abort: {error}")
-
-    def fence_weight_update(self, error):
-        self.events.append(f"fence: {error}")
+    def _discard_failed_weight_sync(self):
+        self.events.append("discard")
+        self._sync = None
 
 
 def _three_buckets():
@@ -373,54 +327,71 @@ def _three_buckets():
     ]
 
 
+def _alone(ballot):
+    return ballot
+
+
 def _receive(
     monkeypatch,
     trainer,
     runner,
-    synchronize=lambda *a, **k: None,
+    *,
     version=1,
-    agree=receiver._alone,
-    leave=None,
+    require_full=False,
+    agree=_alone,
+    leave=lambda: None,
+    refusal=None,
 ):
     import torch
 
     monkeypatch.setattr(receiver, "dist", SimpleNamespace(broadcast=trainer.broadcast))
-    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
     return receiver.receive_weight_stream(
         None,
         runner,
         device=torch.device("cpu"),
-        expected_version=version,
+        version=version,
+        require_full=require_full,
         agree=agree,
         leave=leave,
+        refusal=refusal,
     )
 
 
-def _peers_decide(all_ready, any_began, *, take_frames=None):
+def _peers(*, take_frames=None, at_end=receiver._ENDED):
     """Peers that take every frame, or the first *take_frames* of them, and
-    then decide as given; records the ballots this rank cast."""
+    cast *at_end* at the end marker; records the ballots this rank cast."""
 
-    def agree(ballot, began):
-        agree.ballots.append((ballot, began))
-        frames = sum(cast == receiver._RECEIVING for cast, _ in agree.ballots)
-        if ballot == receiver._RECEIVING and (
-            take_frames is None or frames <= take_frames
-        ):
-            return receiver._RECEIVING, any_began
-        if ballot == receiver._PREPARED and all_ready:
-            return receiver._PREPARED, any_began
-        return receiver._BROKEN_OFF, any_began
+    def agree(ballot):
+        agree.ballots.append(ballot)
+        frames = agree.ballots.count(receiver._RECEIVING)
+        if ballot == receiver._RECEIVING:
+            if take_frames is None or frames <= take_frames:
+                return ballot
+            return receiver._BROKEN_OFF
+        if ballot == receiver._ENDED:
+            return min(ballot, at_end)
+        return ballot
 
     agree.ballots = []
     return agree
 
 
-def test_a_clean_stream_commits(monkeypatch):
+def test_a_clean_stream_is_written_as_one_sync(monkeypatch):
     trainer = _Trainer(_frames(_three_buckets()))
     runner = _Runner()
-    stats = _receive(monkeypatch, trainer, runner)
-    assert runner.events == ["begin", "apply1", "apply2", "apply3", "prepare", "commit"]
-    assert stats["buckets"] == 3.0
+    agree = _peers()
+
+    stats = _receive(monkeypatch, trainer, runner, require_full=True, agree=agree)
+
+    assert runner.events == [
+        "open",
+        "apply1",
+        "apply2",
+        "apply3",
+        "complete(require_full=True)",
+    ]
+    assert stats["updated"] == 3 and stats["buckets"] == 3
+    assert agree.ballots == [receiver._RECEIVING] * 3 + [receiver._ENDED]
     assert trainer.frames == [], "the end marker was never read"
 
 
@@ -440,10 +411,8 @@ def test_a_bucket_is_released_before_the_next_is_allocated(monkeypatch, fail_on_
 
     def tracking_empty(*args, **kwargs):
         if kwargs.get("dtype") is torch.uint8:
-            # A bucket's payload is allocated just after its own metadata,
-            # which may still be alive; nothing older may be. By storage, not
-            # by tensor: the decoded views keep the bytes alive without
-            # keeping the tensor they were sliced from.
+            # A payload is allocated just after its own metadata, which may
+            # still be alive; nothing older may be.
             older = buffers[: len(buffers) - len(buffers) % 2]
             alive = sum(not ref.expired() for ref in older)
             assert not alive, f"{alive} buffer(s) of an earlier bucket still alive"
@@ -466,12 +435,27 @@ def test_a_failed_bucket_is_raised_only_after_the_stream_ends(monkeypatch):
     broadcast, so the caller saw a timeout naming nobody."""
     trainer = _Trainer(_frames(_three_buckets()))
     runner = _Runner(fail_on_bucket=1)
+    agree = _peers()
 
     with pytest.raises(RuntimeError, match="bucket 1 rejected"):
-        _receive(monkeypatch, trainer, runner)
+        _receive(monkeypatch, trainer, runner, agree=agree)
 
     assert trainer.frames == [], "every remaining broadcast must still be joined"
-    assert runner.events == ["begin", "apply1", "abort: bucket 1 rejected"]
+    assert runner.events == ["open", "apply1", "discard"]
+    assert agree.ballots[-1] == receiver._ENDED, "still in step at the end"
+
+
+def test_a_sync_that_cannot_complete_is_raised_once_the_ranks_are_done(monkeypatch):
+    """Left as they were by a stream short of the whole model, where the
+    weights were not whole: still in step, so the group is kept."""
+    trainer = _Trainer(_frames(_three_buckets()))
+    runner = _Runner(fail_complete=True)
+
+    with pytest.raises(RuntimeError, match="as they were") as raised:
+        _receive(monkeypatch, trainer, runner)
+
+    assert not isinstance(raised.value, receiver.RDMAStreamOutOfStep)
+    assert runner.events[-1] == "discard"
 
 
 def test_a_version_mismatch_drains_before_raising(monkeypatch):
@@ -482,7 +466,7 @@ def test_a_version_mismatch_drains_before_raising(monkeypatch):
         _receive(monkeypatch, trainer, runner)
 
     assert trainer.frames == []
-    assert runner.events[:1] == ["begin"] and "apply1" not in runner.events
+    assert runner.events == ["open", "discard"]
 
 
 @pytest.mark.parametrize(
@@ -498,8 +482,7 @@ def test_a_frame_that_cannot_be_allocated_for_fails_at_its_header(
     monkeypatch, metadata_bytes, payload_bytes, reason
 ):
     """A broadcast is received whole, so a frame no buffer can be posted for
-    leaves no step to keep. Tried anyway, the allocation raised past the
-    stream's own handling, and the bad header was never named."""
+    leaves no step to keep."""
     import torch
 
     bad = torch.tensor([_CMD_BUCKET, metadata_bytes, payload_bytes, 1])
@@ -517,17 +500,14 @@ def test_a_frame_that_cannot_be_allocated_for_fails_at_its_header(
     with pytest.raises(receiver.RDMAStreamOutOfStep, match=reason):
         _receive(monkeypatch, trainer, runner)
     assert allocated == [], "nothing may be allocated for the frame"
-    assert runner.events[-1].startswith("abort")
+    assert runner.events == ["open", "discard"]
 
 
 def test_an_allocation_that_fails_anyway_is_out_of_step_too(monkeypatch):
-    """Within the bounds, memory can still run out -- fragmentation, another
-    allocation in between. That is the same position: the frame cannot be
-    received, so the stream cannot be followed."""
+    """Within the bounds, memory can still run out."""
     import torch
 
     trainer = _Trainer(_frames(_three_buckets()))
-    runner = _Runner()
     empty = torch.empty
 
     def exhausted(*args, **kwargs):
@@ -537,8 +517,7 @@ def test_an_allocation_that_fails_anyway_is_out_of_step_too(monkeypatch):
 
     monkeypatch.setattr(torch, "empty", exhausted)
     with pytest.raises(receiver.RDMAStreamOutOfStep, match="out of memory"):
-        _receive(monkeypatch, trainer, runner)
-    assert runner.events[-1].startswith("abort")
+        _receive(monkeypatch, trainer, _Runner())
 
 
 @pytest.mark.parametrize(
@@ -547,10 +526,8 @@ def test_an_allocation_that_fails_anyway_is_out_of_step_too(monkeypatch):
     ids=["unknown", "unknown-without-sizes", "no-metadata", "no-payload"],
 )
 def test_a_header_that_frames_no_bucket_breaks_the_stream_off(monkeypatch, header):
-    """The sender follows a bucket with its two broadcasts and the end marker
-    with none, so any other header says nothing of what comes next. Received
-    as if it framed a bucket, its broadcasts were ones the sender may never
-    post, and every later frame was read out of step."""
+    """Received as if it framed a bucket, its broadcasts were ones the sender
+    may never post, and every later frame was read out of step."""
     import torch
 
     trainer = _Trainer(
@@ -563,347 +540,57 @@ def test_a_header_that_frames_no_bucket_breaks_the_stream_off(monkeypatch, heade
         _receive(monkeypatch, trainer, runner)
 
     assert len(trainer.frames) == after_the_header, "a broadcast was posted for it"
-    assert not [e for e in runner.events if e.startswith("apply")]
-    assert runner.events[-1].startswith("abort")
-
-
-def test_a_refused_begin_still_receives_the_stream(monkeypatch):
-    """begin refused a replayed version before the loop was entered, so this
-    rank left while the trainer and every other rank sat in the next
-    broadcast."""
-    trainer = _Trainer(_frames(_three_buckets()))
-    runner = _Runner(refuse_begin=True)
-
-    with pytest.raises(RuntimeError, match="must increase"):
-        _receive(monkeypatch, trainer, runner)
-
-    assert trainer.frames == [], "every remaining broadcast must still be joined"
-    assert runner.events == ["begin"], "nothing applied, and nothing aborted"
-
-
-def _transacting_runner():
-    """The real transaction and RDMA entry points, over a model of one weight."""
-    import torch
-    from torch import nn
-
-    from atom.rollout.weight_updater import WeightUpdaterMixin
-
-    class _Real(WeightUpdaterMixin, receiver.RDMAWeightReceiverMixin):
-        device = torch.device("cpu")
-        label = "test"
-        rank = 0
-        world_size = 1
-
-        def __init__(self):
-            self.model = nn.Module()
-            self.model.w = nn.Parameter(torch.zeros(1), requires_grad=False)
-
-        def clear_kv_cache(self):
-            pass
-
-        def _sync_target_model(self):
-            return self.model
-
-    return _Real()
-
-
-def test_a_refused_stream_leaves_a_reload_another_caller_has_open(monkeypatch):
-    """The abort on the way out ends whatever reload is open, and the one that
-    refused this stream was not this stream's."""
-    import torch
-
-    runner = _transacting_runner()
-    runner.begin_weight_update(1)
-    trainer = _Trainer(_frames(_three_buckets(), version=2))
-
-    with pytest.raises(RuntimeError, match="already in progress"):
-        _receive(monkeypatch, trainer, runner, version=2)
-
-    assert trainer.frames == []
-    assert runner.get_weight_update_status()["in_progress"] == 1
-    runner.apply_weight_bucket([("w", torch.ones(1))])
-    runner.commit_weight_update(1)
-    runner.assert_weight_update_ready()
-
-
-def test_a_replayed_stream_leaves_the_committed_weights_serving(monkeypatch):
-    """It wrote nothing, so there is nothing to fence; fenced anyway, serving
-    stopped until a reload the weights did not need."""
-    import torch
-
-    runner = _transacting_runner()
-    runner.begin_weight_update(1)
-    runner.apply_weight_bucket([("w", torch.ones(1))])
-    runner.commit_weight_update(1)
-    trainer = _Trainer(_frames(_three_buckets(), version=1))
-
-    with pytest.raises(RuntimeError, match="must increase"):
-        _receive(monkeypatch, trainer, runner, version=1)
-
-    runner.assert_weight_update_ready()
-    assert runner.get_weight_update_status()["last_committed"] == 1
-
-
-def test_a_rank_out_of_step_leaves_the_group(monkeypatch):
-    """The sender is mid-broadcast in a frame this rank never posted, so a later
-    stream on the same group would be read out of step from its first header."""
-    import torch
-
-    group = object()
-    destroyed = []
-    trainer = _Trainer([torch.tensor([_CMD_BUCKET, -1, 8, 1])])
-    monkeypatch.setattr(
-        receiver,
-        "dist",
-        SimpleNamespace(
-            broadcast=trainer.broadcast, destroy_process_group=destroyed.append
-        ),
-    )
-    runner = _transacting_runner()
-    runner._rdma_weight_groups = {"g": group}
-
-    with pytest.raises(receiver.RDMAStreamOutOfStep):
-        runner.receive_weights_rdma("g", 1)
-
-    assert destroyed == [group]
-    with pytest.raises(RuntimeError, match="not initialized"):
-        runner.receive_weights_rdma("g", 2)
-
-
-def _rdma_runner(monkeypatch, trainer):
-    """The real entry points over one weight, its group joined, fed by *trainer*."""
-    import torch
-
-    monkeypatch.setattr(
-        receiver,
-        "dist",
-        SimpleNamespace(
-            broadcast=trainer.broadcast, destroy_process_group=lambda group: None
-        ),
-    )
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
-    runner = _transacting_runner()
-    runner._rdma_weight_groups = {"g": object()}
-    return runner
-
-
-def test_the_vllm_callers_arguments_are_taken(monkeypatch):
-    """LumenRL drives this RPC with the vLLM worker's arguments, and
-    prequantized_fp8 was not among this one's: the call raised TypeError on
-    every rank before it read a header."""
-    import torch
-
-    trainer = _Trainer(_frames([_encode([("w", torch.tensor([5.0]))])]))
-    runner = _rdma_runner(monkeypatch, trainer)
-
-    stats = runner.receive_weights_rdma(
-        group_name="g", version=1, verify_full_load=True, prequantized_fp8=False
-    )
-
-    assert stats["buckets"] == 1.0
-    assert runner.model.w.item() == 5.0
-
-
-def test_a_prequantized_stream_is_received_then_refused(monkeypatch):
-    """Nothing here maps its weight_scale_inv onto the resident scales, so it
-    is refused; received first, or the trainer would wait in its broadcast,
-    and with nothing written, so the runner serves on."""
-    import torch
-
-    trainer = _Trainer(_frames([_encode([("w", torch.tensor([5.0]))])]))
-    runner = _rdma_runner(monkeypatch, trainer)
-
-    with pytest.raises(NotImplementedError, match="prequantized FP8"):
-        runner.receive_weights_rdma(
-            group_name="g", version=1, verify_full_load=True, prequantized_fp8=True
-        )
-
-    assert trainer.frames == [], "the stream was not received"
-    assert runner.model.w.item() == 0.0
-    runner.assert_weight_update_ready()
-    assert "g" in runner._rdma_weight_groups, "a group still in step was dropped"
-
-
-def test_a_stream_the_engine_refuses_is_received_then_refused(monkeypatch):
-    """Refused by the engine while a sync of another path is open: received
-    first all the same, or the trainer would wait in its first broadcast."""
-    import torch
-
-    trainer = _Trainer(_frames([_encode([("w", torch.tensor([5.0]))])]))
-    runner = _rdma_runner(monkeypatch, trainer)
-
-    with pytest.raises(RuntimeError, match="refused: weight sync 's1' .* is open"):
-        runner.receive_weights_rdma(
-            "g", 1, engine_refusal="weight sync 's1' of the SHM path is open"
-        )
-
-    assert trainer.frames == [], "the stream was not received"
-    assert runner.model.w.item() == 0.0
-    runner.assert_weight_update_ready()
-    assert "g" in runner._rdma_weight_groups, "a group still in step was dropped"
-
-
-def test_a_worker_without_the_group_votes_before_it_refuses():
-    """Raising alone, it left the workers that had the group waiting for it in
-    the stream's first vote."""
-    runner = _transacting_runner()
-    cast = []
-
-    def vote(ballot, began):
-        cast.append(ballot)
-        return ballot, began
-
-    runner._vote_with_engine_peers = vote
-
-    with pytest.raises(RuntimeError, match="not initialized"):
-        runner.receive_weights_rdma("g", 1)
-    assert cast == [receiver._BROKEN_OFF]
-
-
-def test_a_stream_is_refused_on_every_worker_if_one_lacks_the_group(monkeypatch):
-    import torch
-
-    trainer = _Trainer(_frames([_encode([("w", torch.tensor([5.0]))])]))
-    runner = _rdma_runner(monkeypatch, trainer)
-    runner._vote_with_engine_peers = lambda ballot, began: (receiver._BROKEN_OFF, began)
-    frames = len(trainer.frames)
-
-    with pytest.raises(RuntimeError, match="not initialized on every worker"):
-        runner.receive_weights_rdma("g", 1)
-
-    assert len(trainer.frames) == frames, "a header was read"
-    runner.assert_weight_update_ready()
-
-
-def test_a_peer_whose_broadcast_failed_leaves_the_group_too(monkeypatch):
-    """Only the rank whose own frame could not be received tore its end down.
-    Its peers failed in the broadcast it never joined, kept the group, and the
-    next stream rode it out of step."""
-    group = object()
-    destroyed = []
-
-    def peer_left(tensor, src=0, group=None):
-        raise RuntimeError("peer left the broadcast")
-
-    monkeypatch.setattr(
-        receiver,
-        "dist",
-        SimpleNamespace(broadcast=peer_left, destroy_process_group=destroyed.append),
-    )
-    runner = _transacting_runner()
-    runner._rdma_weight_groups = {"g": group}
-
-    with pytest.raises(receiver.RDMAStreamOutOfStep, match="peer left"):
-        runner.receive_weights_rdma("g", 1)
-
-    assert destroyed == [group]
-
-
-def test_verify_full_load_false_does_not_waive_the_check(monkeypatch, caplog):
-    """Accepted because the caller drives the vLLM worker with the same
-    arguments. Honoured, it committed part of the model and served the rest
-    from another version."""
-    import logging
-
-    import torch
-
-    trainer = _Trainer(_frames(_three_buckets()))  # nothing this model has
-    monkeypatch.setattr(receiver, "dist", SimpleNamespace(broadcast=trainer.broadcast))
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
-    runner = _transacting_runner()
-    runner._rdma_weight_groups = {"g": object()}
-
-    with (
-        caplog.at_level(logging.WARNING, logger="atom"),
-        pytest.raises(RuntimeError, match="incomplete weight reload"),
-    ):
-        runner.receive_weights_rdma("g", 1, verify_full_load=False)
-
-    assert "verify_full_load=False ignored" in caplog.text
-    with pytest.raises(RuntimeError, match="fenced"):
-        runner.assert_weight_update_ready()
+    assert runner.events == ["open", "discard"]
 
 
 def test_an_end_marker_carrying_sizes_is_not_a_clean_finish(monkeypatch):
-    """The contract is [END, 0, 0, version]; one with sizes was taken as a
-    successful end and committed."""
     import torch
 
     frames = _frames(_three_buckets())
     frames[-1] = torch.tensor([_CMD_END, 5, 7, 1], dtype=torch.int64)
-    trainer = _Trainer(frames)
     runner = _Runner()
 
     with pytest.raises(RuntimeError, match="end marker"):
+        _receive(monkeypatch, _Trainer(frames), runner)
+
+    assert runner.events[-1] == "discard"
+    assert not any(e.startswith("complete") for e in runner.events)
+
+
+@pytest.mark.parametrize(
+    "runner",
+    [_Runner(refuse=True), None],
+    ids=["model-refused", "engine-refused"],
+)
+def test_a_refused_stream_is_received_and_writes_nothing(monkeypatch, runner):
+    """Refused before the loop, this rank left while the trainer and every
+    other rank sat in the next broadcast."""
+    trainer = _Trainer(_frames(_three_buckets()))
+    refusal = None
+    if runner is None:
+        runner, refusal = _Runner(), RuntimeError("1 batch(es) in the pipeline")
+
+    with pytest.raises(RuntimeError, match="MLA|in the pipeline"):
+        _receive(monkeypatch, trainer, runner, refusal=refusal)
+
+    assert trainer.frames == [], "every remaining broadcast must still be joined"
+    assert runner.events == [], "nothing applied, and nothing discarded"
+
+
+def test_a_stream_leaves_a_sync_another_caller_has_open(monkeypatch):
+    """Discarding on the way out ended the reload that refused this stream,
+    which was not this stream's."""
+    trainer = _Trainer(_frames(_three_buckets()))
+    runner = _Runner()
+    runner._sync = theirs = object()
+
+    with pytest.raises(RuntimeError, match="another weight sync is open"):
         _receive(monkeypatch, trainer, runner)
 
-    assert "commit" not in runner.events
-    assert runner.events[-1].startswith("abort")
+    assert runner._sync is theirs and runner.events == []
 
 
-def test_a_device_fault_keeps_the_stream_from_being_committed(monkeypatch):
-    """The copies are asynchronous, so a fault in them surfaces at the
-    synchronize -- which came after commit, leaving a version declared good
-    over writes that never landed. It now comes before the vote."""
-
-    def fault(*args, **kwargs):
-        raise RuntimeError("device fault")
-
-    trainer = _Trainer(_frames(_three_buckets()))
-    runner = _Runner()
-    agree = _peers_decide(False, True)
-
-    with pytest.raises(RuntimeError, match="device fault"):
-        _receive(monkeypatch, trainer, runner, synchronize=fault, agree=agree)
-
-    assert runner.events[-2:] == ["prepare", "abort: device fault"]
-    assert agree.ballots[-1] == (receiver._BROKEN_OFF, True)
-
-
-# ── the ranks taking one stream decide on it together ──────────────────────
-
-
-def test_a_rank_that_could_commit_does_not_when_a_peer_cannot(monkeypatch):
-    """One rank's version alone serves the engine mixed: its peers' shards of
-    the same layers would still be the old version."""
-    trainer = _Trainer(_frames(_three_buckets()))
-    runner = _Runner()
-    agree = _peers_decide(False, True)
-
-    with pytest.raises(RuntimeError, match="another rank taking it could not"):
-        _receive(monkeypatch, trainer, runner, agree=agree)
-
-    assert agree.ballots == [(receiver._RECEIVING, True)] * 3 + [
-        (receiver._PREPARED, True)
-    ]
-    assert "commit" not in runner.events
-    assert runner.events[-1].startswith("abort")
-
-
-def test_a_rank_that_refused_what_its_peers_took_is_fenced(monkeypatch):
-    """Refused, it kept its old weights and went on serving them, beside peers
-    that had taken the new version -- and a rank still serving would also wait
-    in its next forward's collectives for peers that refuse to."""
-    trainer = _Trainer(_frames(_three_buckets()))
-    runner = _Runner(refuse_begin=True)
-    agree = _peers_decide(False, True)
-
-    with pytest.raises(RuntimeError, match="must increase"):
-        _receive(monkeypatch, trainer, runner, agree=agree)
-
-    assert agree.ballots[-1] == (receiver._BROKEN_OFF, False)
-    assert runner.events[0] == "begin" and runner.events[-1].startswith("fence")
-
-
-def test_a_stream_every_rank_refused_fences_none_of_them(monkeypatch):
-    """Nothing was written anywhere, so every rank still holds one version."""
-    trainer = _Trainer(_frames(_three_buckets()))
-    runner = _Runner(refuse_begin=True)
-
-    with pytest.raises(RuntimeError, match="must increase"):
-        _receive(monkeypatch, trainer, runner, agree=_peers_decide(False, False))
-
-    assert runner.events == ["begin"]
+# ── the ranks taking one stream stay in step ───────────────────────────────
 
 
 def test_a_rank_that_breaks_off_still_votes(monkeypatch):
@@ -911,23 +598,23 @@ def test_a_rank_that_breaks_off_still_votes(monkeypatch):
     waited until its group timed out."""
     import torch
 
-    trainer = _Trainer([torch.tensor([_CMD_BUCKET, -1, 8, 1])])
-    runner = _Runner()
-    agree = _peers_decide(False, True)
-
+    agree = _peers()
     with pytest.raises(receiver.RDMAStreamOutOfStep):
-        _receive(monkeypatch, trainer, runner, agree=agree)
-
-    assert agree.ballots == [(receiver._BROKEN_OFF, True)]
+        _receive(
+            monkeypatch,
+            _Trainer([torch.tensor([_CMD_BUCKET, -1, 8, 1])]),
+            _Runner(),
+            agree=agree,
+        )
+    assert agree.ballots == [receiver._BROKEN_OFF]
 
 
 def test_a_frame_a_peer_cannot_receive_is_broken_off_here_too(monkeypatch):
-    """Free memory differs between ranks. One that could not allocate for a
-    frame broke off alone, and its peers went on into the frame's broadcasts,
-    held there for it while it waited for them in the vote."""
+    """One rank that could not allocate broke off alone, and its peers went on
+    into the frame's broadcasts, held there for it."""
     trainer = _Trainer(_frames(_three_buckets()))
     runner = _Runner()
-    agree = _peers_decide(False, True, take_frames=1)
+    agree = _peers(take_frames=1)
     left = []
 
     with pytest.raises(receiver.RDMAStreamOutOfStep, match="not by every rank"):
@@ -935,10 +622,9 @@ def test_a_frame_a_peer_cannot_receive_is_broken_off_here_too(monkeypatch):
             monkeypatch, trainer, runner, agree=agree, leave=lambda: left.append(1)
         )
 
-    assert agree.ballots == [(receiver._RECEIVING, True)] * 2
+    assert agree.ballots == [receiver._RECEIVING] * 2
     assert len(trainer.frames) == 6, "the frame's broadcasts were entered"
-    assert runner.events[:2] == ["begin", "apply1"]
-    assert runner.events[-1].startswith("abort")
+    assert runner.events == ["open", "apply1", "discard"]
     # Every rank left at that vote, so none is in a broadcast to release.
     assert left == []
 
@@ -947,8 +633,7 @@ def test_a_rank_whose_broadcast_failed_leaves_the_group_before_it_votes(
     monkeypatch,
 ):
     """A peer may still be in the broadcast that failed here, held there until
-    this rank's end of the group is gone. Voting first, this rank waited for
-    that peer until the group timed out, with nothing left to tear it down."""
+    this rank's end of the group is gone."""
     trainer = _Trainer(_frames(_three_buckets()))
     calls, order = [], []
 
@@ -958,11 +643,11 @@ def test_a_rank_whose_broadcast_failed_leaves_the_group_before_it_votes(
             raise RuntimeError("broadcast timed out")
         trainer.broadcast(tensor, src=src, group=group)
 
-    peers = _peers_decide(False, True)
+    peers = _peers()
 
-    def agree(ballot, began):
+    def agree(ballot):
         order.append("vote")
-        return peers(ballot, began)
+        return peers(ballot)
 
     with pytest.raises(receiver.RDMAStreamOutOfStep, match="broadcast timed out"):
         _receive(
@@ -974,33 +659,103 @@ def test_a_rank_whose_broadcast_failed_leaves_the_group_before_it_votes(
         )
 
     assert order == ["vote", "vote", "leave", "vote"]
-    assert peers.ballots[-1] == (receiver._LEFT, True)
+    assert peers.ballots[-1] == receiver._LEFT
 
 
 def test_a_rank_that_left_the_group_takes_its_peers_out_of_it_too(monkeypatch):
-    """A rank whose broadcast failed left the group and voted the stream off,
-    while a peer that had reached the end marker only refused it: that peer
-    kept a group the other was gone from, and the next stream waited for it."""
-    trainer = _Trainer(_frames(_three_buckets()))
+    """A peer that had reached the end marker kept a group the other was gone
+    from, and the next stream waited for it."""
     runner = _Runner()
-
-    def agree(ballot, began):
-        return (ballot if ballot == receiver._RECEIVING else receiver._LEFT), True
-
     with pytest.raises(receiver.RDMAStreamOutOfStep, match="left its group"):
-        _receive(monkeypatch, trainer, runner, agree=agree)
-    assert runner.events[-1].startswith("abort")
+        _receive(
+            monkeypatch,
+            _Trainer(_frames(_three_buckets())),
+            runner,
+            agree=_peers(at_end=receiver._LEFT),
+        )
+    assert runner.events[-1] == "discard"
 
 
-def test_a_vote_that_failed_leaves_the_group_to_be_joined_again(monkeypatch):
-    """A peer gone during the vote at the end marker. Raised as it was, the
-    error kept receive_weights_rdma from tearing the group down, and the next
-    stream rode a group that still listed the dead rank."""
+def test_a_vote_that_failed_puts_the_rank_out_of_step(monkeypatch):
+    """A peer gone during the vote: the group still lists the dead rank, and
+    is not voted on again."""
+    ballots = []
+
+    def agree(ballot):
+        ballots.append(ballot)
+        if ballot == receiver._ENDED:
+            raise RuntimeError("peer gone mid-vote")
+        return ballot
+
+    with pytest.raises(receiver.RDMAStreamOutOfStep, match="peer gone"):
+        _receive(
+            monkeypatch, _Trainer(_frames(_three_buckets())), _Runner(), agree=agree
+        )
+    assert ballots == [receiver._RECEIVING] * 3 + [receiver._ENDED]
+
+
+# ── the worker: the group, and the stream as the engine drives it ──────────
+
+
+def _config(*, tp_world=1, pcp=1, pp=1, dp=1):
+    return SimpleNamespace(
+        tp_world_size=tp_world,
+        prefill_context_parallel_size=pcp,
+        pipeline_parallel_size=pp,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=dp, data_parallel_rank_local=0
+        ),
+    )
+
+
+class _Worker(
+    WeightUpdaterMixin, receiver.RDMAWeightReceiverMixin, CapabilityProviderMixin
+):
+    """One engine worker over a model of one weight."""
+
+    label = "test"
+    world_size = 1
+
+    def __init__(self, rank=0, **config):
+        import torch
+        from torch import nn
+
+        self.rank = rank
+        self.device = torch.device("cpu")
+        self.config = _config(**config)
+        self._init_weight_updater()
+        self._init_rdma_receiver(self.config)
+        self.model = nn.Module()
+        self.model.w = nn.Parameter(torch.zeros(1), requires_grad=False)
+
+    def clear_kv_cache(self):
+        pass
+
+    def _sync_target_model(self):
+        return self.model
+
+
+def _joins(monkeypatch):
+    """The groups init_rdma_weight_group builds, with no rendezvous behind."""
+    import atom.utils.distributed.utils as dist_utils
+
+    joined = []
+
+    def build(host, port, rank, world_size, backend, **kw):
+        joined.append({"master": f"{host}:{port}", "rank": rank, **kw})
+        return object()
+
+    monkeypatch.setattr(
+        dist_utils, "stateless_init_torch_distributed_process_group", build
+    )
+    return joined
+
+
+def _joined_worker(monkeypatch, trainer, **config):
     import torch
 
-    group = object()
+    _joins(monkeypatch)
     destroyed = []
-    trainer = _Trainer(_frames([_encode([("w", torch.tensor([5.0]))])]))
     monkeypatch.setattr(
         receiver,
         "dist",
@@ -1009,84 +764,188 @@ def test_a_vote_that_failed_leaves_the_group_to_be_joined_again(monkeypatch):
         ),
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
-    runner = _transacting_runner()
-    runner._rdma_weight_groups = {"g": group}
-    ballots = []
-
-    def vote(ballot, began):
-        ballots.append(ballot)
-        if ballot != receiver._RECEIVING:
-            raise RuntimeError("peer gone mid-vote")
-        return ballot, began
-
-    runner._vote_with_engine_peers = vote
-
-    with pytest.raises(receiver.RDMAStreamOutOfStep, match="could not vote"):
-        runner.receive_weights_rdma("g", 1)
-
-    # Not voted on again over a group that had just failed to vote.
-    # The group's own check, the frame, the end marker: none cast twice.
-    assert ballots == [receiver._RECEIVING, receiver._RECEIVING, receiver._PREPARED]
-    assert destroyed == [group]
-    runner._vote_with_engine_peers = lambda ballot, began: (ballot, began)
-    with pytest.raises(RuntimeError, match="not initialized"):
-        runner.receive_weights_rdma("g", 2)
-    with pytest.raises(RuntimeError, match="fenced"):
-        runner.assert_weight_update_ready()
-
-
-def test_a_broadcast_that_fails_puts_the_rank_out_of_step(monkeypatch):
-    """Typically a peer that left: this rank's own frames are fine, but the
-    group is no longer in step, so it is out of step all the same."""
-    trainer = _Trainer(_frames(_three_buckets()))
-    calls = []
-
-    def failing(tensor, src=0, group=None):
-        calls.append(1)
-        if len(calls) == 5:
-            raise RuntimeError("broadcast timed out")
-        trainer.broadcast(tensor, src=src, group=group)
-
-    trainer_failing = SimpleNamespace(broadcast=failing)
-    runner = _Runner()
-
-    with pytest.raises(receiver.RDMAStreamOutOfStep, match="broadcast timed out"):
-        _receive(monkeypatch, trainer_failing, runner)
-    assert runner.events[-1].startswith("abort")
-
-
-class _Worker(receiver.RDMAWeightReceiverMixin):
-    """One engine worker, as init_rdma_weight_group sees it."""
-
-    def __init__(self, rank, dp_local, *, tp, tp_world, pcp, dp=1):
-        self.rank = rank
-        self.world_size = tp  # the logical TP width, as on ModelRunner
-        self.label = f"worker{rank}"
-        self.config = SimpleNamespace(
-            tensor_parallel_size=tp,
-            tp_world_size=tp_world,
-            prefill_context_parallel_size=pcp,
-            parallel_config=SimpleNamespace(
-                data_parallel_rank_local=dp_local, data_parallel_size=dp
-            ),
-        )
-
-
-def _joins(monkeypatch):
-    """The ranks init_rdma_weight_group joins as, with no rendezvous behind."""
-    import atom.utils.independent_process_group as ipg
-
-    joined = []
-    monkeypatch.setattr(
-        ipg,
-        "init_independent_process_group",
-        lambda **kw: joined.append(kw["rank"]) or object(),
+    worker = _Worker(**config)
+    worker.init_rdma_weight_group(
+        "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
     )
-    return joined
+    worker.destroyed = destroyed
+    return worker
+
+
+def _stream_of_w(value, version=1):
+    import torch
+
+    return _frames([_encode([("w", torch.tensor([value]))])], version=version)
+
+
+def test_the_group_is_built_with_the_callers_name_and_one_timeout(monkeypatch):
+    """A second process-group builder had its own rendezvous, store prefix and
+    torch-version handling, and two default timeouts."""
+    joined = _joins(monkeypatch)
+    _Worker(rank=1).init_rdma_weight_group(
+        "10.0.0.1", 29500, base_rank=1, world_size=3, group_name="g", timeout_s=42
+    )
+    assert joined == [
+        {
+            "master": "10.0.0.1:29500",
+            "rank": 2,
+            "group_name": "g",
+            "timeout": timedelta(seconds=42),
+        }
+    ]
+
+
+def test_a_stream_is_written_into_the_model(monkeypatch):
+    trainer = _Trainer(_stream_of_w(5.0))
+    worker = _joined_worker(monkeypatch, trainer)
+
+    assert worker.receive_weights_rdma("g", 1) == 1
+
+    assert worker.model.w.item() == 5.0
+    assert trainer.frames == [] and worker._sync is None
+
+
+def test_a_stream_the_engine_refuses_is_received_and_writes_nothing(monkeypatch):
+    trainer = _Trainer(_stream_of_w(5.0))
+    worker = _joined_worker(monkeypatch, trainer)
+
+    with pytest.raises(RuntimeError, match="in the pipeline"):
+        worker.receive_weights_rdma("g", 1, refusal="1 batch(es) in the pipeline")
+
+    assert trainer.frames == [], "the stream was not received"
+    assert worker.model.w.item() == 0.0
+    assert "g" in worker._rdma_groups, "a group still in step was dropped"
+
+
+def test_a_stream_reaches_a_weight_its_module_writes(monkeypatch):
+    """A module that writes its own weight (``sync_weight``) waits for the
+    readers once per update; a stream is one."""
+    import torch
+    from torch import nn
+
+    class _WritesItsWeight(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(1), requires_grad=False)
+
+        def sync_weight(self, param_name, tensor, shard_id=None):
+            self.weight.data.copy_(tensor)
+            return True
+
+    trainer = _Trainer(_frames([_encode([("table.weight", torch.tensor([5.0]))])]))
+    worker = _joined_worker(monkeypatch, trainer)
+    worker.model = nn.Module()
+    worker.model.table = _WritesItsWeight()
+
+    assert worker.receive_weights_rdma("g", 1, require_full=True) == 1
+    assert worker.model.table.weight.item() == 5.0
+
+
+def test_versions_rise_within_a_group(monkeypatch):
+    """A replayed or reordered stream is received and refused, not written."""
+    trainer = _Trainer([*_stream_of_w(5.0, version=3), *_stream_of_w(9.0, version=3)])
+    worker = _joined_worker(monkeypatch, trainer)
+    worker.receive_weights_rdma("g", 3)
+
+    with pytest.raises(RuntimeError, match="must rise.*last=3, got=3"):
+        worker.receive_weights_rdma("g", 3)
+
+    assert trainer.frames == [] and worker.model.w.item() == 5.0
+
+
+def test_a_new_group_starts_its_own_version_count(monkeypatch):
+    """A restarted trainer counts from 1 again; every stream it sent was
+    refused for good."""
+    trainer = _Trainer([*_stream_of_w(5.0, version=7), *_stream_of_w(9.0)])
+    worker = _joined_worker(monkeypatch, trainer)
+    worker.receive_weights_rdma("g", 7)
+    worker.destroy_rdma_weight_group("g")
+    worker.init_rdma_weight_group(
+        "127.0.0.1", 29501, base_rank=1, world_size=2, group_name="g"
+    )
+
+    worker.receive_weights_rdma("g", 1)
+
+    assert worker.model.w.item() == 9.0
+
+
+def test_a_failed_stream_discards_what_it_opened(monkeypatch):
+    import torch
+
+    trainer = _Trainer(_frames([_encode([("w", torch.ones(3))])]))
+    worker = _joined_worker(monkeypatch, trainer)
+
+    with pytest.raises(RuntimeError, match="could not be written"):
+        worker.receive_weights_rdma("g", 1)
+
+    assert worker._sync is None and "g" in worker._rdma_groups
+
+
+def test_a_partial_stream_cannot_make_the_weights_whole_again(monkeypatch):
+    """Only a stream that rewrites every parameter, as any sync."""
+    trainer = _Trainer(_frames([_encode([("other", __import__("torch").ones(1))])]))
+    worker = _joined_worker(monkeypatch, trainer)
+
+    with pytest.raises(RuntimeError, match=r"not whole.*\['w'\]"):
+        worker.receive_weights_rdma("g", 1, require_full=True)
+
+
+def test_a_worker_without_the_group_votes_before_it_refuses():
+    """Raising alone, it left the workers that had the group waiting for it in
+    the stream's first vote."""
+    worker = _Worker()
+    cast = []
+    worker._vote_with_engine_peers = lambda *ballots: cast.extend(ballots) or ballots
+
+    with pytest.raises(RuntimeError, match="not joined on every worker"):
+        worker.receive_weights_rdma("g", 1)
+    assert cast == [receiver._BROKEN_OFF]
+
+
+def test_a_stream_is_refused_on_every_worker_if_one_lacks_the_group(monkeypatch):
+    trainer = _Trainer(_stream_of_w(5.0))
+    worker = _joined_worker(monkeypatch, trainer)
+    worker._vote_with_engine_peers = lambda *ballots: (receiver._BROKEN_OFF,)
+    frames = len(trainer.frames)
+
+    with pytest.raises(RuntimeError, match="not joined on every worker"):
+        worker.receive_weights_rdma("g", 1)
+    assert len(trainer.frames) == frames, "a header was read"
+
+
+def test_a_rank_out_of_step_leaves_the_group(monkeypatch):
+    """The sender is mid-broadcast in a frame this rank never posted, so a later
+    stream on the same group would be read out of step from its first header."""
+    import torch
+
+    trainer = _Trainer([torch.tensor([_CMD_BUCKET, -1, 8, 1])])
+    worker = _joined_worker(monkeypatch, trainer)
+    (group,) = [g.group for g in worker._rdma_groups.values()]
+
+    with pytest.raises(receiver.RDMAStreamOutOfStep):
+        worker.receive_weights_rdma("g", 1)
+
+    assert worker.destroyed == [group]
+    with pytest.raises(RuntimeError, match="not joined"):
+        worker.receive_weights_rdma("g", 2)
+
+
+def test_a_peer_whose_broadcast_failed_leaves_the_group_too(monkeypatch):
+    def peer_left(tensor, src=0, group=None):
+        raise RuntimeError("peer left the broadcast")
+
+    worker = _joined_worker(monkeypatch, SimpleNamespace(broadcast=peer_left))
+
+    with pytest.raises(receiver.RDMAStreamOutOfStep, match="peer left"):
+        worker.receive_weights_rdma("g", 1)
+    assert len(worker.destroyed) == 1 and not worker._rdma_groups
+
+
+# ── joining the group ──────────────────────────────────────────────────────
 
 
 def _mla_attention(monkeypatch):
-    """MLAAttention as the receiver finds it, with no aiter to import it from."""
+    """MLAAttention as the updater finds it, with no aiter to import it from."""
     from torch import nn
 
     mla = ModuleType("atom.model_ops.attention_mla")
@@ -1095,402 +954,148 @@ def _mla_attention(monkeypatch):
     return mla.MLAAttention
 
 
-def test_a_dp_engine_refuses_the_weight_group_before_joining(monkeypatch):
-    """One group spanned every DP engine, and each entered its broadcast and
-    decided the stream on its own: one could block in it while another waited
-    in the DP all-reduce, or commit a version another had rejected."""
-    joined = _joins(monkeypatch)
-    for dp_local in range(2):
-        worker = _Worker(0, dp_local, tp=1, tp_world=1, pcp=1, dp=2)
-        with pytest.raises(RuntimeError, match="data_parallel_size=2"):
-            worker.init_rdma_weight_group(
-                "127.0.0.1", 29500, base_rank=1, world_size=3, group_name="g"
-            )
-    assert joined == []
+def _unsafe(monkeypatch, which):
+    """A worker of an engine that cannot take weights over RDMA."""
+    import torch
+    from torch import nn
 
-
-def test_a_prefill_context_parallel_engine_refuses_the_weight_group(monkeypatch):
-    """A worker's rank counts every prefill-context rank of its stage, and the
-    updater took it for the TP rank when slicing a full tensor: with TP=2 and
-    PCP=2, worker 2 asked for a third TP shard of a tensor that has two."""
-    joined = _joins(monkeypatch)
-    worker = _Worker(2, 0, tp=2, tp_world=2, pcp=2)
-
-    with pytest.raises(RuntimeError, match="prefill_context_parallel_size=2"):
-        worker.init_rdma_weight_group(
-            "127.0.0.1", 29500, base_rank=1, world_size=5, group_name="g"
+    worker = _Worker(
+        dp=2 if which == "dp" else 1,
+        pp=2 if which == "pp" else 1,
+        pcp=2 if which == "pcp" else 1,
+    )
+    if which == "mla":
+        worker.model.attn = _mla_attention(monkeypatch)()
+    if which == "int8":
+        worker.model.q = nn.Parameter(
+            torch.zeros(2, dtype=torch.int8), requires_grad=False
         )
-    assert joined == []
+    return worker
 
 
-def test_a_pipeline_stage_refuses_the_weight_group_before_joining(monkeypatch):
-    """A stage holds its own layers, and its workers alone were counted: with
-    TP=1 it took the stream without a vote, so a stage that failed left the
-    others serving a newer version than its own."""
+_UNSAFE = {
+    "dp": "data_parallel_size=2",
+    "pp": "pipeline_parallel_size=2",
+    "pcp": "prefill_context_parallel_size=2",
+    "mla": "through MLA",
+    "int8": "full-precision write cannot produce",
+}
+
+
+@pytest.mark.parametrize("which", list(_UNSAFE))
+def test_an_engine_that_cannot_take_a_stream_refuses_before_joining(monkeypatch, which):
+    """Refused at its first stream instead, every rank joined the group only
+    for the stream to fail -- or, under DP, two engines to commit different
+    versions."""
     joined = _joins(monkeypatch)
-    worker = _Worker(0, 0, tp=1, tp_world=1, pcp=1)
-    worker.config.pipeline_parallel_size = 2
-
-    with pytest.raises(RuntimeError, match="pipeline_parallel_size=2"):
-        worker.init_rdma_weight_group(
+    with pytest.raises(RuntimeError, match=_UNSAFE[which]):
+        _unsafe(monkeypatch, which).init_rdma_weight_group(
             "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
         )
     assert joined == []
 
 
-def test_a_dp_engine_is_refused_though_its_world_was_isolated_to_one(monkeypatch):
+def test_the_deployments_dp_size_is_read_before_the_runner_hides_it():
     """Once a DP engine's workers have a world of their own, their config says
-    data_parallel_size=1, and the refusal, reading that, let every DP engine
-    of the deployment join one weight group."""
-    joined = _joins(monkeypatch)
-    worker = _Worker(0, 1, tp=1, tp_world=1, pcp=1, dp=1)
-    worker._deployment_data_parallel_size = 2
-
-    with pytest.raises(RuntimeError, match="data_parallel_size=2"):
-        worker.init_rdma_weight_group(
-            "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
-        )
-    assert joined == []
-
-
-def test_the_rlhf_runner_keeps_the_deployments_dp_size_before_hiding_it():
-    """The runner that builds those worlds is what rewrites the config, so it
-    has to keep the deployment's size first. Read, not run: importing the
-    runner needs aiter on a ROCm device."""
+    data_parallel_size=1. Read, not run: importing the runner needs aiter."""
     import ast
 
     src = (
-        Path(__file__).resolve().parent.parent
-        / "atom"
-        / "rollout"
-        / "model_runner_ext.py"
+        Path(__file__).resolve().parent.parent / "atom/rollout/model_runner_ext.py"
     ).read_text()
     runner = next(
         n
         for n in ast.parse(src).body
         if isinstance(n, ast.ClassDef) and n.name == "RLHFModelRunner"
     )
-    setup = next(
+    init = next(
         n
         for n in runner.body
-        if isinstance(n, ast.FunctionDef) and n.name == "_setup_device_and_distributed"
+        if isinstance(n, ast.FunctionDef) and n.name == "__init__"
     )
-    writes = sorted(
-        (node.lineno, ast.unparse(target), ast.unparse(node.value))
-        for node in ast.walk(setup)
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if ast.unparse(target)
-        in (
-            "self._deployment_data_parallel_size",
-            "config.parallel_config.data_parallel_size",
-        )
+    calls = [ast.unparse(n.value) for n in init.body if isinstance(n, ast.Expr)]
+    assert calls.index("self._init_rdma_receiver(config)") < calls.index(
+        "super().__init__(rank, config)"
     )
-
-    assert [(target, value) for _, target, value in writes] == [
-        (
-            "self._deployment_data_parallel_size",
-            "config.parallel_config.data_parallel_size",
-        ),
-        ("config.parallel_config.data_parallel_size", "1"),
-    ]
-
-
-def test_every_serving_forward_goes_through_the_fence():
-    """The fence was checked in RLHFModelRunner.forward alone, and a
-    disaggregated EngineCore serves through prefill_forward instead. It is
-    checked in run_model now, which every serving forward runs the model
-    through and graph capture does not. Read, not run, as above."""
-    import ast
-
-    root = Path(__file__).resolve().parent.parent / "atom"
-
-    def method(path, cls_name, name):
-        tree = ast.parse((root / path).read_text())
-        cls = next(
-            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls_name
-        )
-        return next(
-            n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name
-        )
-
-    def calls(function):
-        return {
-            ast.unparse(n.func) for n in ast.walk(function) if isinstance(n, ast.Call)
-        }
-
-    gate = method("rollout/model_runner_ext.py", "RLHFModelRunner", "run_model")
-    assert ast.unparse(gate.body[0]) == "self.assert_weight_update_ready()"
-    runner = "model_engine/model_runner.py"
-    for cls_name, name in [
-        ("ModelRunner", "forward"),
-        ("RapidServeModelRunner", "forward"),
-        ("RapidServeModelRunner", "prefill_forward"),
-    ]:
-        assert "self.run_model" in calls(method(runner, cls_name, name)), name
-    assert "self.run_model" not in calls(
-        method(runner, "ModelRunner", "capture_cudagraph")
-    )
-
-
-def test_an_mla_model_refuses_the_weight_group_before_joining(monkeypatch):
-    """MLA decodes through W_K and W_V, derived from kv_b_proj once at load.
-    A reload rewrote kv_b_proj and left them, and the engine served old and
-    new weights together."""
-    from torch import nn
-
-    joined = _joins(monkeypatch)
-    worker = _Worker(0, 0, tp=1, tp_world=1, pcp=1)
-    worker.model = nn.Sequential(nn.Linear(2, 2), _mla_attention(monkeypatch)())
-
-    with pytest.raises(RuntimeError, match="through MLA"):
-        worker.init_rdma_weight_group(
-            "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
-        )
-    assert joined == []
-
-    worker.model = nn.Sequential(nn.Linear(2, 2))
-    assert worker.init_rdma_weight_group(
-        "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
-    )
-    assert joined == [1]
-
-
-def _attention(*, use_mla=None, kv_b_proj=False):
-    """An attention module as a model defines one, with no MLAAttention in it."""
-    from torch import nn
-
-    module = type("DeepseekV2MLAAttention", (nn.Module,), {})()
-    if use_mla is not None:
-        module.use_mla = use_mla
-    if kv_b_proj:
-        module.kv_b_proj = nn.Linear(2, 2)
-    return module
-
-
-def _runner_holding(weight, quant_type=None):
-    """The real updater, receiver and capability report over one layer whose
-    weight is *weight*; an FP8 one gets the scale an FP8 layer has."""
-    import torch
-    from torch import nn
-
-    from atom.rollout.capabilities import CapabilityProviderMixin
-    from atom.rollout.weight_updater import WeightUpdaterMixin
-
-    class _Real(
-        WeightUpdaterMixin, receiver.RDMAWeightReceiverMixin, CapabilityProviderMixin
-    ):
-        device = torch.device("cpu")
-        label = "test"
-        rank = 0
-        world_size = 1
-
-    runner = _Real()
-    runner.model = nn.Module()
-    runner.model.layer = nn.Module()
-    runner.model.layer.weight = nn.Parameter(weight, requires_grad=False)
-    if weight.dtype.is_floating_point and weight.element_size() == 1:
-        runner.model.layer.weight_scale = nn.Parameter(
-            torch.ones(1), requires_grad=False
-        )
-    if quant_type is not None:
-        runner.model.layer.quant_type = quant_type
-    return runner
-
-
-@pytest.mark.parametrize(
-    ("resident", "refused"),
-    [
-        ("fp4-packed", True),
-        ("int8", True),
-        ("fp8-per_1x32", True),
-        ("fp8-per_1x128", False),
-        ("bf16", False),
-    ],
-)
-def test_a_format_the_updater_cannot_rewrite_is_refused_before_joining(
-    monkeypatch, resident, refused
-):
-    """The updater writes full-precision parameters as sent and requantises
-    the FP8 schemes it knows, and nothing else. An FP4 or integer model was
-    advertised all the same, so every worker joined the group only for the
-    stream to fail -- or, where the shapes agreed, to be cast into garbage."""
-    import enum
-
-    import torch
-
-    quant_types = enum.Enum("QuantType", ["per_1x128", "per_1x32"])
-    weight = {
-        "fp4-packed": lambda: torch.zeros(4, 2, dtype=torch.uint8),
-        "int8": lambda: torch.zeros(4, 4, dtype=torch.int8),
-        "bf16": lambda: torch.zeros(4, 4, dtype=torch.bfloat16),
-    }.get(resident, lambda: torch.zeros(4, 4).to(torch.float8_e4m3fn))()
-    quant_type = quant_types[resident[4:]] if resident.startswith("fp8-") else None
-    runner = _runner_holding(weight, quant_type)
-    joined = _joins(monkeypatch)
-
-    refusal = runner._rdma_reload_refusal()
-    features = runner.get_worker_capabilities()["features"]
-
-    if not refused:
-        assert refusal is None
-        assert "rdma_weight_receive" in features
-        return
-    assert "cannot rewrite in place" in refusal and "layer.weight" in refusal
-    assert "rdma_weight_receive" not in features
-    with pytest.raises(RuntimeError, match="cannot rewrite in place"):
-        runner.init_rdma_weight_group(
-            "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
-        )
-    assert joined == []
-
-
-def test_a_static_activation_scale_is_refused_before_joining(monkeypatch):
-    """Calibrated, not trained: no trainer's stream carries one, so no reload
-    could rewrite every parameter. Each stream failed at its commit and
-    fenced the runner, and no later reload could lift that fence either."""
-    import enum
-
-    import torch
-
-    quant_types = enum.Enum("QuantType", ["per_Tensor"])
-    weight = torch.zeros(4, 4).to(torch.float8_e4m3fn)
-    runner = _runner_holding(weight, quant_types.per_Tensor)
-    runner.model.layer.input_scale = torch.nn.Parameter(
-        torch.ones(1), requires_grad=False
-    )
-    joined = _joins(monkeypatch)
-
-    refusal = runner._rdma_reload_refusal()
-
-    assert "layer.input_scale" in refusal and "static activation scale" in refusal
-    assert "layer.weight" not in refusal, "its FP8 weight is requantised"
-    assert "rdma_weight_receive" not in runner.get_worker_capabilities()["features"]
-    with pytest.raises(RuntimeError, match="static activation scale"):
-        runner.init_rdma_weight_group(
-            "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
-        )
-    assert joined == []
-
-
-@pytest.mark.parametrize(
-    "layer",
-    [{"kv_b_proj": True}, {"use_mla": True}],
-    ids=["its-own-kv_b_proj", "attention-built-with-use_mla"],
-)
-def test_an_mla_model_is_known_by_its_layers_not_one_class(layer):
-    """Each model defines its own MLA attention module, and an
-    Attention(use_mla=True) may be given an impl other than MLAAttention: the
-    check looked for MLAAttention alone, and would have let such a model take
-    a reload its derived W_K and W_V do not follow."""
-    from torch import nn
-
-    worker = _Worker(0, 0, tp=1, tp_world=1, pcp=1)
-    worker.model = nn.Sequential(_attention(**layer))
-    assert "through MLA" in worker._rdma_reload_refusal()
-
-    worker.model = nn.Sequential(_attention(use_mla=False))
-    assert worker._rdma_reload_refusal() is None
 
 
 def test_a_repeated_init_reuses_its_group_only_for_the_same_join(monkeypatch):
-    """Retried under the same name, init returned success whatever it was
-    asked: after a trainer restart on a new endpoint, a worker kept the old
-    group while its peers joined the new one, and the next broadcast hung."""
-    import atom.utils.independent_process_group as ipg
-
-    joined = []
-    monkeypatch.setattr(
-        ipg,
-        "init_independent_process_group",
-        lambda **kw: joined.append(kw["init_method"]) or object(),
-    )
+    """After a trainer restart on a new endpoint, a worker kept the old group
+    while its peers joined the new one, and the next broadcast hung."""
+    joined = _joins(monkeypatch)
     monkeypatch.setattr(receiver.dist, "destroy_process_group", lambda group: None)
-    worker = _Worker(0, 0, tp=1, tp_world=1, pcp=1)
+    worker = _Worker()
     join = {"base_rank": 1, "world_size": 2, "group_name": "g"}
 
     assert worker.init_rdma_weight_group("10.0.0.1", 29500, **join)
     assert worker.init_rdma_weight_group("10.0.0.1", 29500, **join)  # a retry
     with pytest.raises(RuntimeError, match="already joined"):
         worker.init_rdma_weight_group("10.0.0.2", 29500, **join)
-    assert joined == ["tcp://10.0.0.1:29500"]
-
     worker.destroy_rdma_weight_group("g")
     assert worker.init_rdma_weight_group("10.0.0.2", 29500, **join)
-    assert joined == ["tcp://10.0.0.1:29500", "tcp://10.0.0.2:29500"]
+    assert [j["master"] for j in joined] == ["10.0.0.1:29500", "10.0.0.2:29500"]
 
 
 def _voting_worker(outcome):
     """A worker whose engine's vote on joining comes out as *outcome* gives it;
     records the ballots it cast."""
-    worker = _Worker(0, 0, tp=1, tp_world=1, pcp=1)
+    worker = _Worker()
     worker.cast = []
 
-    def vote(ballot, will_join):
+    def vote(ballot, none_will_join):
         worker.cast.append(ballot)
-        return outcome(ballot, will_join)
+        return outcome(ballot, none_will_join)
 
     worker._vote_with_engine_peers = vote
     return worker
 
 
 def test_no_worker_joins_while_another_of_its_engine_cannot(monkeypatch):
-    """Each worker checked its own rank, then joined: one whose rank was out
-    of range raised, and the others waited in the rendezvous for it."""
     joined = _joins(monkeypatch)
-    worker = _voting_worker(lambda ballot, will_join: (receiver._CANNOT_JOIN, True))
+    worker = _voting_worker(lambda ballot, n: (receiver._CANNOT_JOIN, 0))
 
     with pytest.raises(RuntimeError, match="another worker of this engine cannot"):
         worker.init_rdma_weight_group(
             "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
         )
-
-    assert worker.cast == [receiver._WILL_JOIN]
-    assert joined == []
+    assert worker.cast == [receiver._WILL_JOIN] and joined == []
 
 
 def test_a_worker_that_cannot_join_says_so_before_any_joins(monkeypatch):
     joined = _joins(monkeypatch)
-    worker = _voting_worker(lambda ballot, will_join: (ballot, will_join))
+    worker = _voting_worker(lambda ballot, n: (ballot, n))
 
     with pytest.raises(ValueError, match="invalid RDMA rank"):
         worker.init_rdma_weight_group(
             "127.0.0.1", 29500, base_rank=1, world_size=1, group_name="g"
         )
-
-    assert worker.cast == [receiver._CANNOT_JOIN]
-    assert joined == []
+    assert worker.cast == [receiver._CANNOT_JOIN] and joined == []
 
 
 def test_a_worker_that_refuses_casts_its_refusal_as_a_ballot(monkeypatch):
     """Raised before the vote, a refusal one worker found in its own model
     left the peers that found none in the vote's all-reduce."""
     joined = _joins(monkeypatch)
-    worker = _voting_worker(lambda ballot, will_join: (ballot, will_join))
-    worker._rdma_reload_refusal = lambda: "1 parameter(s) held as MXFP4"
+    worker = _voting_worker(lambda ballot, n: (ballot, n))
+    worker._rdma_receive_refusal = lambda: "1 parameter(s) held as MXFP4"
 
     with pytest.raises(RuntimeError, match="cannot receive.*MXFP4"):
         worker.init_rdma_weight_group(
             "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
         )
-
-    assert worker.cast == [receiver._CANNOT_JOIN]
-    assert joined == []
+    assert worker.cast == [receiver._CANNOT_JOIN] and joined == []
 
 
 def test_a_refusal_is_still_raised_where_the_vote_cannot_be_taken(monkeypatch):
     """Under PP the world spans stages the engine does not count, so the vote
-    fails on every worker alike; each raises the refusal, not the vote's
-    failure."""
+    fails on every worker alike; each raises the refusal."""
     joined = _joins(monkeypatch)
-    worker = _voting_worker(lambda ballot, will_join: (ballot, will_join))
-    worker._rdma_reload_refusal = lambda: "pipeline_parallel_size=2"
+    worker = _Worker(pp=2)
 
-    def untakeable(ballot, will_join):
+    def untakeable(*ballots):
         raise RuntimeError("the process world has 4 rank(s), the engine 2")
 
     worker._vote_with_engine_peers = untakeable
-
     with pytest.raises(RuntimeError, match="pipeline_parallel_size=2"):
         worker.init_rdma_weight_group(
             "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
@@ -1502,18 +1107,17 @@ def test_a_group_joined_on_only_some_workers_is_not_reused(monkeypatch):
     """Retried after a partial failure, a worker that had joined reused its
     group while one that had not joined it anew, alone in a rendezvous."""
     joined = _joins(monkeypatch)
-    worker = _voting_worker(lambda ballot, will_join: (ballot, will_join))
+    worker = _voting_worker(lambda ballot, n: (ballot, n))
     join = {"base_rank": 1, "world_size": 2, "group_name": "g"}
-    assert worker.init_rdma_weight_group("127.0.0.1", 29500, **join)
+    worker.init_rdma_weight_group("127.0.0.1", 29500, **join)
 
-    worker._vote_with_engine_peers = lambda ballot, will_join: (
+    worker._vote_with_engine_peers = lambda ballot, n: (
         min(ballot, receiver._JOINED_ALREADY),
-        True,
+        0,
     )
     with pytest.raises(RuntimeError, match="joined on only some workers"):
         worker.init_rdma_weight_group("127.0.0.1", 29500, **join)
-
-    assert joined == [1]
+    assert len(joined) == 1
 
 
 def _world(monkeypatch, size):
@@ -1524,11 +1128,11 @@ def _world(monkeypatch, size):
     monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
     voted = []
 
-    def vote(group, ready, began):
+    def vote(group, *ballots):
         voted.append(group)
-        return ready, began
+        return ballots
 
-    monkeypatch.setattr(receiver, "vote_on_stream", vote)
+    monkeypatch.setattr(receiver, "vote", vote)
     return world.cpu_group, voted
 
 
@@ -1536,153 +1140,43 @@ def _world(monkeypatch, size):
     ("tp_world", "pcp"), [(1, 2), (2, 2), (2, 1)], ids=["pcp", "tp-and-pcp", "tp"]
 )
 def test_every_worker_of_the_engine_decides_the_stream(monkeypatch, tp_world, pcp):
-    """The vote was over the TP group, which holds one prefill-context rank of
-    the receivers: under PCP one TP group could commit while another failed,
-    and the engine served two versions. At TP=1 nobody voted at all."""
+    """Over the TP group, one prefill-context rank's receivers decided alone."""
     world, voted = _world(monkeypatch, tp_world * pcp)
-    worker = _Worker(0, 0, tp=tp_world, tp_world=tp_world, pcp=pcp)
+    worker = _Worker(tp_world=tp_world, pcp=pcp)
 
-    assert worker._vote_with_engine_peers(True, True) == (True, True)
+    assert worker._vote_with_engine_peers(2, 1) == (2, 1)
     assert voted == [world]
 
 
 def test_a_single_worker_engine_decides_alone(monkeypatch):
     _, voted = _world(monkeypatch, 1)
-    worker = _Worker(0, 0, tp=1, tp_world=1, pcp=1)
-
-    assert worker._vote_with_engine_peers(False, True) == (False, True)
+    assert _Worker()._vote_with_engine_peers(0) == (0,)
     assert voted == []
 
 
 def test_a_world_that_is_not_the_engine_is_not_voted_in(monkeypatch):
     """With ranks beyond the stream's the vote would hang; without some of its
-    receivers it would let the rest commit alone."""
+    receivers it would let the rest decide alone."""
     _, voted = _world(monkeypatch, 2)
-    worker = _Worker(0, 0, tp=2, tp_world=2, pcp=2)
-
     with pytest.raises(RuntimeError, match=r"world has 2 rank.*engine 4 worker"):
-        worker._vote_with_engine_peers(True, True)
+        _Worker(tp_world=2, pcp=2)._vote_with_engine_peers(2)
     assert voted == []
-
-
-def test_the_receiver_reads_the_header_in_the_documented_order(monkeypatch):
-    import torch
-
-    trainer = _Trainer([torch.tensor([1, 10, 20, 7], dtype=torch.int64)])
-    monkeypatch.setattr(receiver, "dist", SimpleNamespace(broadcast=trainer.broadcast))
-    assert receiver._recv_header(None, device=torch.device("cpu")) == (1, 10, 20, 7)
 
 
 # ── discovery ──────────────────────────────────────────────────────────────
 
 
-def test_the_lifecycle_the_real_mixins_define_is_advertised():
-    """Methods are listed only where the runner has them, so a name the list
-    spells differently from the mixin would drop out of the report silently."""
-    from atom.rollout.capabilities import CapabilityProviderMixin
-    from atom.rollout.weight_updater import WeightUpdaterMixin
-
-    class _Composed(
-        WeightUpdaterMixin, receiver.RDMAWeightReceiverMixin, CapabilityProviderMixin
-    ):
-        rank = 0
-
-    report = _Composed().get_worker_capabilities()
-    assert {
-        "init_rdma_weight_group",
-        "receive_weights_rdma",
-        "destroy_rdma_weight_group",
-        "get_weight_update_status",
-    } <= set(report["methods"])
+def test_the_feature_is_advertised_where_the_engine_takes_a_stream():
+    report = _Worker().get_worker_capabilities()
     assert "rdma_weight_receive" in report["features"]
+    assert {"init_rdma_weight_group", "destroy_rdma_weight_group"} <= set(
+        report["methods"]
+    )
 
 
-@pytest.mark.parametrize("unsafe", ["dp", "isolated-dp", "pp", "pcp", "mla"])
-def test_the_feature_is_withheld_where_init_would_refuse(monkeypatch, unsafe):
-    """The methods are still there; the feature is what says they work here,
-    so an orchestrator can choose another path before a rendezvous that
+@pytest.mark.parametrize("which", list(_UNSAFE))
+def test_the_feature_is_withheld_where_init_would_refuse(monkeypatch, which):
+    """So an orchestrator can choose another path before a rendezvous that
     cannot complete."""
-    from torch import nn
-
-    from atom.rollout.capabilities import CapabilityProviderMixin
-
-    class _Composed(_Worker, CapabilityProviderMixin):
-        pass
-
-    worker = _Composed(0, 0, tp=1, tp_world=1, pcp=1, dp=2 if unsafe == "dp" else 1)
-    if unsafe == "isolated-dp":
-        worker._deployment_data_parallel_size = 2
-    if unsafe == "pp":
-        worker.config.pipeline_parallel_size = 2
-    if unsafe == "pcp":
-        worker.config.prefill_context_parallel_size = 2
-    if unsafe == "mla":
-        worker.model = nn.Sequential(_mla_attention(monkeypatch)())
-    report = worker.get_worker_capabilities()
-
-    assert "receive_weights_rdma" in report["methods"]
+    report = _unsafe(monkeypatch, which).get_worker_capabilities()
     assert "rdma_weight_receive" not in report["features"]
-
-
-# ── against the sender's own source ────────────────────────────────────────
-#
-# Read, not imported: LumenRL is a separate repo, and an import would couple
-# the two. CI reads a snapshot -- everything above receive_weight_stream in
-# lumenrl/engine/inference/rdma_weight_transfer.py, copied verbatim -- and with
-# LUMENRL_ROOT naming a checkout, the snapshot is held to the sender itself.
-
-_SENDER_SNAPSHOT = Path(__file__).parent / "fixtures" / "lumenrl_rdma_sender.txt"
-_HEADER_ORDER = r"\[\s*command,\s*metadata_bytes,\s*payload_bytes,\s*version\s*,?\s*\]"
-
-
-def _protocol(src: str) -> dict:
-    """What the receiver depends on, as the sender's source states it."""
-    facts = {}
-    for const in ("_CMD_END", "_CMD_BUCKET", "_HEADER_WORDS"):
-        m = re.search(rf"^{const}\s*=\s*(\d+)", src, re.MULTILINE)
-        facts[const] = int(m[1]) if m else None
-    facts["header order"] = re.search(_HEADER_ORDER, src) is not None
-    entry = re.search(r"entries\.append\(\s*\{(.*?)\}\s*\)", src, re.DOTALL)
-    facts["entry keys"] = sorted(re.findall(r'"(\w+)":', entry[1])) if entry else None
-    return facts
-
-
-def test_the_sender_and_receiver_agree_on_the_constants():
-    facts = _protocol(_SENDER_SNAPSHOT.read_text())
-    for const, value in (
-        ("_CMD_END", _CMD_END),
-        ("_CMD_BUCKET", _CMD_BUCKET),
-        ("_HEADER_WORDS", _HEADER_WORDS),
-    ):
-        assert (
-            facts[const] == value
-        ), f"{const}: sender says {facts[const]}, receiver says {value}"
-
-
-def test_the_sender_packs_the_header_in_the_order_it_is_read():
-    """The part of the contract no bounds check can see: swapped sizes make the
-    two sides post broadcasts of different lengths, which RCCL does not check."""
-    assert _protocol(_SENDER_SNAPSHOT.read_text())["header order"], (
-        "the sender no longer builds its header as "
-        "[command, metadata_bytes, payload_bytes, version]"
-    )
-
-
-def test_the_sender_describes_each_tensor_by_what_the_decoder_reads():
-    keys = _protocol(_SENDER_SNAPSHOT.read_text())["entry keys"]
-    assert keys == ["dtype", "name", "nbytes", "offset", "shape"]
-
-
-def test_the_snapshot_still_states_the_senders_protocol():
-    """The snapshot stands in for the sender only while it says what the
-    sender says. Opt-in, since ATOM's CI has no LumenRL checkout; named but
-    missing fails rather than skips, as the check was asked for."""
-    root = os.environ.get("LUMENRL_ROOT")
-    if not root:
-        pytest.skip("set LUMENRL_ROOT to a LumenRL checkout to check the snapshot")
-    sender = Path(root, "lumenrl", "engine", "inference", "rdma_weight_transfer.py")
-    assert sender.is_file(), f"LUMENRL_ROOT={root} has no {sender}"
-    assert _protocol(sender.read_text()) == _protocol(_SENDER_SNAPSHOT.read_text()), (
-        f"the sender's protocol changed: refresh {_SENDER_SNAPSHOT.name} from "
-        f"{sender} and check the receiver against it"
-    )

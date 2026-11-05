@@ -181,7 +181,9 @@ def _updater_double():
         rank = 0
         world_size = 1
 
-    return _Updater()
+    updater = _Updater()
+    updater._init_weight_updater()
+    return updater
 
 
 def _loader_shuffles(monkeypatch, case, *, dim=2):

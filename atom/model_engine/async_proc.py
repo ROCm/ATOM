@@ -41,6 +41,7 @@ from atom.model_engine.collective_rpc import (
     UTILITY_MANAGED_RUNNER_METHODS,
     RpcPayload,
     RpcResult,
+    WeightReloadRefused,
     checked_timeout,
     is_plain_rpc_value,
 )
@@ -393,7 +394,12 @@ class AsyncIOProc:
         try:
             value = func(*call_args, **call_kwargs)
         except Exception as exc:  # noqa: BLE001 - reported to the caller instead
-            return self._failure(payload, f"{type(exc).__name__}: {exc}")
+            return RpcResult(
+                payload.request_id,
+                self.rank,
+                error=f"{type(exc).__name__}: {exc}",
+                refused_before_writing=isinstance(exc, WeightReloadRefused),
+            )
         if not is_plain_rpc_value(value):
             return self._failure(
                 payload,

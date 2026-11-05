@@ -28,7 +28,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.model_engine.collective_rpc import COLLECTIVE_RPC_METHODS
+from atom.model_engine.collective_rpc import (
+    COLLECTIVE_RPC_METHODS,
+    WeightReloadRefused,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aiter_stub import stubbed_aiter
@@ -291,6 +294,34 @@ def test_a_return_that_is_not_plain_data_is_refused_on_the_worker(value):
     )
     assert not out.ok
     assert "not plain data" in out.error
+
+
+class _NotWritten(WeightReloadRefused):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("exc", "refused"),
+    [
+        (WeightReloadRefused("MLA"), True),
+        (_NotWritten("a subclass"), True),
+        (RuntimeError("WeightReloadRefused: only the text"), False),
+    ],
+    ids=["refusal", "subclass", "lookalike-text"],
+)
+def test_a_refusal_before_writing_is_marked_on_the_reply(exc, refused):
+    """The engine read the refusal off the error text, which a subclass's
+    name changes and any message could imitate."""
+
+    def raise_it():
+        raise exc
+
+    runner = SimpleNamespace(raise_it=raise_it)
+    out = _proc(runners=[runner])._run_generic_rpc(
+        runner, "raise_it", (), {}, RpcPayload("refused")
+    )
+    assert not out.ok
+    assert out.refused_before_writing is refused
 
 
 @pytest.mark.parametrize(
