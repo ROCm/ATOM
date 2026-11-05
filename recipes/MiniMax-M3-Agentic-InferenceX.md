@@ -208,14 +208,17 @@ The reference is the SemiAnalysis InferenceX SGLang recipe `minimaxm31flash-fp4-
 
 The concurrency range splits in two:
 
-| CONC | KV / index cache | decode | prefill delayer | needs |
-|---|---|---|---|---|
-| 1–16 | FP8 / FP8 | Mono (fused per-layer decode) | `ATOM_PREFILL_DECODE_INTERVAL=20000` | #2686 |
-| 32–48 | **NVFP4 / FP4** + fused verify top-k | production path (Mono refuses NVFP4 KV) | off | #2744 |
+| CONC | KV / index cache | prefill delayer | needs |
+|---|---|---|---|
+| 1–16 | FP8 / FP8 | `ATOM_PREFILL_DECODE_INTERVAL=20000` | `main` |
+| 32–48 | **NVFP4 / FP4** + fused verify top-k | off | #2744 (open as of 2026-10-28; on `main` without it the second band's flags do not exist) |
 
-Both PRs are open as of 2026-10-28. On `main` without them:
-- the first band runs without Mono;
-- the second band's flags do not exist.
+The command runs the checkpoint as shipped:
+- no `--online_quant_config`, so attention and the dense MLPs stay MXFP8;
+- the shared expert is not fused into the MXFP4 MoE (`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4` unset);
+- no quick-allreduce quantization (`AITER_QUICK_REDUCE_QUANTIZATION` unset).
+
+Mono decode (`ATOM_MONO_ENABLE=1`) needs per-token FP8 attention linears and a fused shared expert, so it declines this configuration. Every band therefore runs the production decode path.
 
 **Why the second band needs NVFP4.** With FP8 KV and FP8 index the cache cannot hold the agentic working set from CONC 48. At c48 with `--gpu-memory-utilization 0.8`:
 - the cache holds 6.06M tokens, against 7.97M tokens in flight at p50;
@@ -250,8 +253,6 @@ fi
 env $BAND_ENV \
   AITER_LOG_LEVEL=WARNING \
   ATOM_FORCE_ATTN_TRITON=1 \
-  AITER_QUICK_REDUCE_QUANTIZATION=INT4 \
-  ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1 \
   ATOM_MONO_ENABLE=1 \
   python3 -u -m atom.entrypoints.openai_server \
     --model "$MODEL" --served-model-name MiniMaxAI/MiniMax-M3.1-Flash \
@@ -261,7 +262,6 @@ env $BAND_ENV \
     --max-num-batched-tokens 32768 --gpu-memory-utilization 0.9 \
     --enable-prefix-caching \
     --cudagraph-capture-sizes "$CAPTURE" \
-    --online_quant_config '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","vision_tower","multi_modal_projector","patch_merge_mlp","*block_sparse_moe"]}' \
     --method dspark --draft-model "$MODEL/dspark" --num-speculative-tokens 7 \
     --spec-decode-acceptance-length 4.04 \
   > server_c${CONC}.log 2>&1 &
@@ -273,8 +273,8 @@ env $BAND_ENV \
   - Throughput moves −1.1% / +0.8% / −3.4% / −4.1% / −11.1%.
   - The cost is TTFT, and it grows with load: p90 goes from 0.88 to 2.1 s at c4, 0.73 to 6.6 s at c8, and 0.77 to 14.2 s at c16.
 - Check which band actually came up from the startup lines:
-  - FP8 band: `MiniMax-M3 mono decode on` on all four ranks, and `PrefillDelayer initialized`.
-  - NVFP4 band: `block_bytes=1827840`, `sparse KV is NVFP4`, and `mono decode off: sparse KV is NVFP4`.
+  - FP8 band: `PrefillDelayer initialized`, and `MiniMax-M3 mono decode off: ...` (the reason names the first unmet Mono requirement).
+  - NVFP4 band: `block_bytes=1827840`, `sparse KV is NVFP4`, and `mono decode off`.
 - Leave `ATOM_M3_INDEXER_CP` unset. The FP4 index refuses it, and at c16 the decode batch × context (~0.84M tokens) is under its ~1M break-even.
 
 Client: the InferenceX AgentX harness (`agentx-harness` 1.0.12), which drives the same `semianalysis_cc_traces_weka_062126` replay as the aiperf command above:
@@ -292,14 +292,16 @@ agentx profile \
 
 ### Measured (M3.1)
 
+> **To be re-measured.** Every number below was taken with the previous command, which added three settings: `--online_quant_config` (`ptpc_fp8` attention and dense MLPs), `AITER_QUICK_REDUCE_QUANTIZATION=INT4`, and `ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1`. The FP8 band therefore ran with Mono decode. The command above drops all three, so Mono is off and these rows do not describe it. They will be replaced with runs of the command above.
+
 Setup:
-- one MI355X node, TP4, the command above, 3600 s per point, synthetic accepted length 4.04;
+- one MI355X node, TP4, the previous command (see the note above), 3600 s per point, synthetic accepted length 4.04;
 - output tok/s/GPU = output token throughput / 4;
 - interactivity = 1000 / ITL at the stated percentile;
 - prefix hit = `atom:prefix_cache_cached_tokens / atom:prompt_tokens` (token-weighted);
 - SGLang is CI run 40110172586 on the same recipe.
 
-| CONC | band | tok/s/GPU | SGLang | P90 intvty | SGLang | p50 intvty | SGLang | prefix hit | TTFT p50 |
+| CONC | band (previous command) | tok/s/GPU | SGLang | P90 intvty | SGLang | p50 intvty | SGLang | prefix hit | TTFT p50 |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1 | FP8 + Mono + delayer | 43.6 | 41.42 | 558.3 | 420.2 | 588.5 | 460.8 | 98.3% | 621 ms |
 | 2 | FP8 + Mono + delayer | 51.0 | 50.11 | 566.7 | 365.0 | 611.1 | 467.3 | 98.2% | 431 ms |
@@ -315,11 +317,11 @@ When and on what each row was measured:
 - c1–c16: 2026-10-27, image `rocm/atom-dev:nightly_202610261558`.
 - c32 and c48: 2026-10-26, image `nightly_202610251529`.
 
-All rows were measured with the DSpark draft's linears re-quantized to per-channel FP8. `main` keeps the draft MXFP8 under `--online_quant_config`. In a c1 A/B over 1200 s, the MXFP8 draft gave 41.5 tok/s/GPU and P90 384.9, against 42.6 and 408.4 with per-channel FP8.
+All rows were measured with the DSpark draft's linears re-quantized to per-channel FP8. With the command above the draft stays MXFP8, as shipped. In a c1 A/B over 1200 s, the MXFP8 draft gave 41.5 tok/s/GPU and P90 384.9, against 42.6 and 408.4 with per-channel FP8.
 
 The NVFP4 rows predate #2744's rework. The reworked #2744 reproduces c48 over 1200 s on `nightly_202610261558`: 397.6 tok/s/GPU and P90 71.4, against 396.7 and 70.5 before.
 
-gsm8k (lm-eval, InferenceX CI's method: 5-shot, chat template, temperature 0, all 1319 samples, real acceptance), strict-match:
+gsm8k (lm-eval, InferenceX CI's method: 5-shot, chat template, temperature 0, all 1319 samples, real acceptance), strict-match, also with the previous command (to be re-measured):
 
 | band | strict-match |
 |---|---|
