@@ -38,10 +38,12 @@ import os
 import sys
 import threading
 
-from .route import regime_of
+from .route import cache_dtype_name, regime_of
 
 SCHEMA = "atom.qsa_index_scorer.capture/1"
 logger = logging.getLogger("atom")
+#: Index page sizes aiter's kernel serves: KV block 16 / 32 / 64 at ratio 4.
+PAGES = (4, 8, 16)
 
 #: Phase-1 golden cases (aiter ``op_tests/test_qsa_index_scorer.py::CASES``,
 #: the same specs as the Phase-1 GPU suite) as coverage keys:
@@ -77,19 +79,6 @@ def _rank() -> int:
         if os.environ.get(var, "").isdigit():
             return int(os.environ[var])
     return 0
-
-
-def _cache_dtype(cache, scale) -> str:
-    name = str(cache.dtype).replace("torch.", "")
-    if name == "bfloat16" and scale is None:
-        return "bf16"
-    if name.startswith("float8_e4m3") and scale is not None:
-        if str(scale.dtype) == "torch.float32" and scale.ndim == 3:
-            return "fp8"
-        return "mxfp8"
-    if name == "uint8":
-        return "fp4"
-    return name
 
 
 def _t(t, align: int = 0) -> dict | None:
@@ -131,7 +120,7 @@ def describe_call(args: tuple) -> dict:
     rows = int(q.shape[0]) if q.ndim >= 1 else 0
     requests = int(table.shape[0]) if table.ndim >= 1 else 0
     return {
-        "cache_dtype": _cache_dtype(cache, scale),
+        "cache_dtype": cache_dtype_name(cache, scale),
         "rows": rows,
         "requests": requests,
         "columns": columns,
@@ -155,10 +144,13 @@ def describe_call(args: tuple) -> dict:
 
 
 def plan_row(sig: dict) -> dict | None:
-    """aiter ``gen_profile --plan-file`` row, or None outside the kernel domain."""
-    if sig["cache_dtype"] not in ("bf16", "fp8") or sig["page_size"] != 4:
+    """aiter ``gen_profile --plan-file`` row, or None outside the kernel domain.
+
+    Index pages 4 / 8 / 16 (KV block 16 / 32 / 64); a page other than aiter's
+    default 4 is carried as ``page_size`` (aiter ``profiles.page_of``)."""
+    if sig["cache_dtype"] not in ("bf16", "fp8") or sig["page_size"] not in PAGES:
         return None
-    return {
+    row = {
         k: sig[k]
         for k in (
             "cache_dtype",
@@ -169,6 +161,9 @@ def plan_row(sig: dict) -> dict | None:
             "cache_pages",
         )
     }
+    if sig["page_size"] != 4:
+        row["page_size"] = sig["page_size"]
+    return row
 
 
 def golden_case_of(sig: dict) -> str | None:

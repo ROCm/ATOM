@@ -1021,7 +1021,7 @@ def run_fallbacks(profile):
             )
             cmp = native_defined_equal(out, ref)
             same = cmp["visible_equal"] and cmp["defined_bitwise"]
-            native_only = all(p == "native" for p, _ in route.counts)
+            native_only = all(p == "stock" for p, _ in route.counts)
             recs.append(
                 {
                     "name": "fallback:" + name,

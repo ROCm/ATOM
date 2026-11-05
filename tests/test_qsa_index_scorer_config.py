@@ -116,3 +116,33 @@ def test_cli_flags_round_trip():
     assert kw["qsa_index_scorer"] == QSAIndexScorerConfig(
         profile="qsa_page4_gfx1250_v1", capture="/tmp/c_{rank}.json"
     )
+
+
+def test_env_override_only_when_flag_absent(monkeypatch):
+    try:
+        from atom.model_engine.arg_utils import EngineArgs
+    except Exception as exc:  # noqa: BLE001 -- engine deps (zmq, aiter) absent
+        pytest.skip(f"arg_utils not importable: {exc!r}")
+    parser = EngineArgs.add_cli_args(argparse.ArgumentParser())
+    monkeypatch.delenv("ATOM_QSA_INDEX_SCORER_PROFILE", raising=False)
+    kw = EngineArgs.from_cli_args(parser.parse_args([]))._get_engine_kwargs()
+    assert not kw["qsa_index_scorer"].enabled
+    monkeypatch.setenv("ATOM_QSA_INDEX_SCORER_PROFILE", "qsa_page4_gfx1250_v1")
+    kw = EngineArgs.from_cli_args(parser.parse_args([]))._get_engine_kwargs()
+    assert kw["qsa_index_scorer"].profile == "qsa_page4_gfx1250_v1"
+    flag = parser.parse_args(["--qsa-index-scorer-profile", "other_profile"])
+    kw = EngineArgs.from_cli_args(flag)._get_engine_kwargs()
+    assert kw["qsa_index_scorer"].profile == "other_profile"  # the flag wins
+
+
+@pytest.mark.parametrize("block,page", [(16, 4), (32, 8), (64, 16)])
+def test_block_size_maps_to_index_page(block, page):
+    """KV block 16 / 32 / 64 with Qwen3.8's compress ratio 4 -> index page
+    4 / 8 / 16: the page sizes aiter's profile serves (and prewarm builds)."""
+    from atom.model_ops.qwen4_exp.qsa_index_scorer.capability import index_page_size
+
+    cfg = SimpleNamespace(
+        kv_cache_block_size=block,
+        hf_config=SimpleNamespace(indexer_compress_ratio=4),
+    )
+    assert index_page_size(cfg) == page

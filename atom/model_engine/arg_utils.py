@@ -854,7 +854,8 @@ class EngineArgs:
                 "(aiter.ops.qsa_index_scorer) under this profile name or JSON "
                 "path, e.g. qsa_page4_gfx1250_v1. Calls the profile does not "
                 "cover run ATOM's native scorer with a logged reason. Default "
-                "empty = OFF (nothing imported, stock behaviour). See "
+                "empty = OFF (nothing imported, stock behaviour); when absent, "
+                "$ATOM_QSA_INDEX_SCORER_PROFILE is used. See "
                 "docs/qsa_index_scorer.md."
             ),
         )
@@ -969,10 +970,12 @@ class EngineArgs:
         # Config.dcp_config.
         kwargs["dcp_config"] = DCPConfig.from_dict(kwargs.pop("dcp_config"))
         # --qsa-index-scorer-{profile,capture} → QSAIndexScorerConfig, passed
-        # through as Config.qsa_index_scorer (default OFF).
+        # through as Config.qsa_index_scorer (default OFF). An absent flag takes
+        # the operator override ATOM_QSA_INDEX_SCORER_PROFILE, read once here.
+        qsa_profile = (kwargs.pop("qsa_index_scorer_profile", "") or "").strip()
         kwargs["qsa_index_scorer"] = QSAIndexScorerConfig.from_dict(
             {
-                "profile": kwargs.pop("qsa_index_scorer_profile", ""),
+                "profile": qsa_profile or envs.ATOM_QSA_INDEX_SCORER_PROFILE,
                 "capture": kwargs.pop("qsa_index_scorer_capture", ""),
             }
         )

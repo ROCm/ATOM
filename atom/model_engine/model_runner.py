@@ -28,6 +28,7 @@ from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
 from atom import structured_output
+from atom.aiter_fused_ops import check_aiter_fused_ops
 from atom.config import Config, set_current_atom_config
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
@@ -778,6 +779,10 @@ class ModelRunner:
 
         self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)
+        # Opt-in in-tree aiter fused ops (default off: nothing imported): one
+        # capability check per worker process, before the model is built and
+        # long before warm-up / KV allocation / CUDA-graph capture.
+        self.aiter_fused_ops = check_aiter_fused_ops(config, rank_name=self.rank_name)
 
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what

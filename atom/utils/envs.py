@@ -940,6 +940,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen QSA: the MTP draft layer keeps BF16 KV / index caches while the
     # target's are FP8 / FP4 (an FP8 draft KV lowers the acceptance length).
     "ATOM_QSA_DRAFT_KV_BF16": lambda: _flag_env("ATOM_QSA_DRAFT_KV_BF16", "1"),
+    # Qwen QSA: operator override for --qsa-index-scorer-profile. Read once
+    # when EngineArgs builds the Config, only when the flag is absent; the
+    # Config field is the contract. Empty (default) = OFF.
+    "ATOM_QSA_INDEX_SCORER_PROFILE": lambda: os.getenv(
+        "ATOM_QSA_INDEX_SCORER_PROFILE", ""
+    ).strip(),
     # Qwen3.8-Flash-Next under TP: forwards with at least this many tokens
     # (eager prefill) keep the hyper-connection residual streams token-sharded
     # across the TP ranks (reduce-scatter + all-gather instead of all-reduce),
