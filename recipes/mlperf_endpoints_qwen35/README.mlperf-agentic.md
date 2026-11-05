@@ -3,6 +3,37 @@
 How to reproduce the numbers below: the exact code, the settings, the run, and how each number is computed.
 They are 10-minute measurement points, not official results (see [What these numbers are](#what-these-numbers-are)).
 
+## 2026-11-05: DP4 with replicated experts, API offload, MoE fusions
+
+`agentic_20261105.env` on top of `agentic_20261101.env`: DP4 attention with every routed expert on every GPU and
+independent ranks, the A8K4V8 KV cache with 128-token blocks, MTP-3, the MoE / attention fusion flags of this PR, and
+request preparation in 64 tokenize workers (`ATOM_API_OFFLOAD_PREPROCESS=1`, #3018). Client: the submission settings
+(`STOP_FIRST=0 ACC_INLINE=1`, 6743 trajectories, `CAP_MIN=10`, a 10-minute issue cap).
+
+| concurrency | decode interval | output tok/s | tps_per_user (1000 / p90 TPOT) | requests/s |
+|---|---|---:|---:|---:|
+| 1536 | 10, 20,480-token prefill budget | 65,987 | 137.2 | 190.7 |
+| 1024 | 8 | 63,723 | 137.0 | 180.1 |
+| 768 | 16 | 56,503 | 181.2 | 157.3 |
+| 512 | 24 | 46,440 | 239.8 | 130.5 |
+| 256 | 32 | 29,326 | 380.2 | 82.0 |
+| 128 | 48 | 16,993 | 578.3 | 47.0 |
+
+Scored with `quick_score.sh <run dir>` (run inside the container next to a `bench_point.sh` run started with
+`STOP_S=0`): when the client's performance window closes and its tracked turns complete, `replay_report.py` scores
+`events.jsonl` with the client's own code (the same window, OSL and TPOT rules as `result_summary.json`), writes
+`<run dir>.quick_summary.json` and stops the run, about 15 minutes a point instead of 35-40. A run the client ends by
+itself (c128: no user finishes before the issue cap) is read from its `result_summary.json` (c128: complete, inline
+accuracy 55.48%, full-run OSL 361.3). Not official results: Qwen3.5 MXFP4 is not an approved checkpoint, and the
+Qwen3.5 chat template drops earlier turns' reasoning.
+
+```bash
+set -a; . ./agentic_20261101.env; . ./agentic_20261105.env; set +a
+export ATOM_PREFILL_DECODE_INTERVAL=8 PREFILL_TOKENS=16384 NUM_TRAJ=6743 STOP_FIRST=0 ACC_INLINE=1 CAP_MIN=10
+STOP_S=0 ./bench_point.sh 1024 /work/qwen35_ep/c1024_1105 &
+./quick_score.sh /work/qwen35_ep/c1024_1105
+```
+
 ## Results
 
 DP4 attention + EP4 MoE, MTP with 3 draft tokens, fp8 KV cache. Minutes 2-8 of 10-minute points.
