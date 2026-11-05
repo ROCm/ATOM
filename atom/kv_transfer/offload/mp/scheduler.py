@@ -92,7 +92,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 _transfer_deadline_s(config) + _SCHEDULER_DEADLINE_MARGIN_S
             )
             self._transfer_seen_at: dict[Any, float] = {}
-            # Live loads, in the order the watchdog first saw them.
+            # Live loads, in dispatch order: the order the worker restores them.
             self._load_order: dict[Any, int] = {}
             self._next_load_order = 0
             super().__init__(
@@ -357,13 +357,15 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         it received them, and advances them only between forwards. A burst of
         loads on a cold server can therefore wait out several slow forwards
         before its last restore starts, with nothing in flight. A finished load
-        shows that queue moving, so every load seen after it starts its bound
-        again. A load is restarted only by loads seen before it, so one whose
-        completion is lost still stops the engine one bound after the last of
-        those finishes."""
-        loads = {operation for _, operation in self._active_load_operations.values()}
+        shows that queue moving, so every load dispatched after it starts its
+        bound again. `_active_load_operations` keeps dispatch order, also
+        within one step. A load is restarted only by loads dispatched before
+        it, so one whose completion is lost still stops the engine one bound
+        after the last of those finishes."""
+        loads = [operation for _, operation in self._active_load_operations.values()]
+        live = set(loads)
         order = self._load_order
-        finished = [order.pop(op) for op in [op for op in order if op not in loads]]
+        finished = [order.pop(op) for op in [op for op in order if op not in live]]
         for operation in loads:
             if operation not in order:
                 order[operation] = self._next_load_order

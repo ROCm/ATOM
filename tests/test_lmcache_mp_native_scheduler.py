@@ -490,6 +490,30 @@ def test_a_load_queued_behind_a_finished_one_starts_its_bound_again(
         scheduler.process_completions(KVConnectorOutput())
 
 
+def test_loads_dispatched_together_restart_in_dispatch_order(monkeypatch):
+    """One step can dispatch many loads (a restart's first burst), and the
+    worker restores them in dispatch order, so each finished load restarts
+    every load dispatched after it, whatever their ids hash to."""
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    scheduler, _, _ = make_scheduler(monkeypatch)
+    bound = scheduler._scheduler_deadline_s
+    for request_id in range(1, 9):
+        seq = sequence(request_id, computed=0, token_offset=100 * request_id)
+        scheduler.get_num_new_matched_tokens(seq)
+        scheduler.update_state_after_alloc(seq)
+        assert scheduler.should_park_for_load_after_alloc(seq)
+    loads = [r.load_operation for r in scheduler.build_connector_meta().requests]
+    assert len(loads) == 8
+    scheduler.process_completions(KVConnectorOutput())
+
+    for done in loads[:-1]:
+        now[0] += bound - 1
+        scheduler.process_completions(KVConnectorOutput(finished_loading={done}))
+    now[0] += bound - 1
+    scheduler.process_completions(KVConnectorOutput(finished_loading={loads[-1]}))
+
+
 @pytest.mark.parametrize("prompt", [8, 16, 19, 24])
 def test_load_queries_safe_chunk_boundary_before_reserving_state(monkeypatch, prompt):
     scheduler, checkpoints, adapter = make_scheduler(monkeypatch)
