@@ -686,7 +686,6 @@ def weight_is_stored_preshuffled(
     *,
     needs_preshuffled_weight: bool = False,
     native_group_rows: int | None = None,
-    mxfp8_preshuffle: bool = False,
 ) -> bool:
     """Whether a quantized 2D GEMM weight of this kind is held preshuffled.
 
@@ -703,11 +702,12 @@ def weight_is_stored_preshuffled(
     forward.
 
     ``native_group_rows`` marks a native group32 weight, otherwise read as
-    checkpoint bytes. Only an FP8 32x32 one is shuffled: on gfx950 for AITER's
+    checkpoint bytes. Native 32x32 weights are shuffled on gfx950 for AITER's
     preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by default),
     always on gfx1250, whose only group32 GEMM is AITER's preshuffled FlyDSL
-    one (it reads the 32x32 scales as stored), and always under
-    ``needs_preshuffled_weight`` (V4.1's grouped ``wo_a``).
+    one. Native 1x32 weights are shuffled only when the existing
+    ``needs_preshuffled_weight`` override is set, as the M3.1 shape-gated
+    opt-in path does.
 
     Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
     conv1d expands its weight to 3D and must stay row-major -- so the caller
@@ -727,9 +727,11 @@ def weight_is_stored_preshuffled(
     side backwards.
     """
     if native_group_rows is not None:
-        if mxfp8_preshuffle and native_group_rows == 1 and params_dtype == dtypes.fp8:
-            return True
-        if native_group_rows != 32 or params_dtype != dtypes.fp8:
+        if params_dtype != dtypes.fp8:
+            return False
+        if native_group_rows == 1:
+            return needs_preshuffled_weight
+        if native_group_rows != 32:
             return False
         if needs_preshuffled_weight:
             return True
@@ -916,6 +918,8 @@ class LinearBase(nn.Module):
             self.params_dtype,
             self.native_a8_group_rows,
         )
+        if self.mxfp8_linear_bpreshuffle:
+            self.needs_preshuffled_weight = True
 
         if quant_type != QuantType.No and self.source_quant_dtype is None:
             if is_nvfp4:
@@ -1372,7 +1376,6 @@ class LinearBase(nn.Module):
                     self, "needs_preshuffled_weight", False
                 ),
                 native_group_rows=self.native_a8_group_rows,
-                mxfp8_preshuffle=getattr(self, "mxfp8_linear_bpreshuffle", False),
             ):
                 shuffle_weights(self.weight)
             return

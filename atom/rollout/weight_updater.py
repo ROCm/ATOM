@@ -957,7 +957,6 @@ class WeightUpdaterMixin:
             getattr(module, "params_dtype", param.dtype),
             needs_preshuffled_weight=getattr(module, "needs_preshuffled_weight", False),
             native_group_rows=getattr(module, "native_a8_group_rows", None),
-            mxfp8_preshuffle=getattr(module, "mxfp8_linear_bpreshuffle", False),
         )
 
         # And the same rank check. 3D is Qwen3-Next's GDN conv1d, which the
