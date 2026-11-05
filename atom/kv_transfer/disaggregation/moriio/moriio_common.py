@@ -67,8 +67,7 @@ class MoRIIOAgentMetadata(
     state_descs: dict[str, bytes] | None = None
     state_slot_bytes: dict[str, int] | None = None
     num_state_slots: int = 0
-    # Region-mode layout (JSON list of [name, kind, unit_bytes, total_bytes,
-    # reverse_indexed, chunk_bytes]), or None for per-layer registration.
+    # JSON [name, kind, unit, total, reverse, chunk] per region. None per-layer.
     region_layout: str | None = None
 
 

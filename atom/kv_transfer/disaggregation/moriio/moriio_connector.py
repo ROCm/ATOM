@@ -273,8 +273,7 @@ class MoRIIOConnector(KVConnectorBase):
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
-        # Region mode (backends that publish KVTransferTensors and no
-        # per-layer block caches, e.g. DeepSeek-V4). None until registered.
+        # None until a region backend (DeepSeek-V4) registers.
         self._regions: list[_Region] | None = None
         self._region_sessions: dict[EngineId, dict[tuple[int, int, int], Any]] = {}
         self._remote_regions_checked: dict[EngineId, list[_Region]] = {}
@@ -295,11 +294,8 @@ class MoRIIOConnector(KVConnectorBase):
         chunk is registered independently with ``ibv_reg_mr``.  Per-layer
         metadata list layout:
         ``[k_chunk0, k_chunk1, ..., v_chunk0, v_chunk1, ...]``.
-        ``self.num_k_chunks`` marks the K/V boundary.
-
-        A backend with no per-layer block caches (DeepSeek-V4) publishes its
-        storage only as ``transfer_tensors`` regions; those are registered
-        instead, see :meth:`_register_regions`.
+        ``self.num_k_chunks`` marks the K/V boundary. No block layers means the
+        backend published regions; those are registered instead.
         """
         self.kv_caches = kv_caches
         block_layers = [
@@ -420,14 +416,9 @@ class MoRIIOConnector(KVConnectorBase):
         self._handshake_listener_thread.start()
 
     def _register_regions(self, transfer_tensors: Any) -> MoRIIOAgentMetadata:
-        """Register a backend's PAGE and full-SLOT regions for RDMA.
+        """Register PAGE regions by block and full SLOT regions by state slot.
 
-        PAGE regions (``transfer_tensors.pages``) are indexed forward by
-        scheduler block. Full per-request SLOT regions (``swa_block_regions``)
-        are indexed by state slot and may be reverse-indexed. Each region is
-        cut into unit-aligned chunks under the ``ibv_reg_mr`` limit, so no unit
-        straddles two registrations. The compressor-only staging pool is not
-        registered: a full SLOT already carries the compressor state.
+        The staging pool is not registered; a full SLOT already holds that state.
         """
         tt = transfer_tensors
         if tt is None or not tt.block_regions:
@@ -489,19 +480,7 @@ class MoRIIOConnector(KVConnectorBase):
                 f"rank has {len(self._regions)}"
             )
         for local, peer in zip(self._regions, remote):
-            if (
-                local.name,
-                local.kind,
-                local.unit,
-                local.reverse,
-                local.chunk_bytes,
-            ) != (
-                peer.name,
-                peer.kind,
-                peer.unit,
-                peer.reverse,
-                peer.chunk_bytes,
-            ):
+            if local.shape() != peer.shape():
                 raise ValueError(
                     f"transfer region mismatch with {engine_id}: local "
                     f"{local.layout()} vs remote {peer.layout()}"
@@ -2322,12 +2301,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
 
 @dataclass(frozen=True)
 class _Region:
-    """One registered transfer region, as both ends address it.
-
-    ``kind`` is ``"page"`` (indexed by scheduler block) or ``"slot"`` (indexed
-    by per-request state slot). ``chunk_bytes`` is a whole number of units, so
-    a unit always sits inside a single registered chunk.
-    """
+    """PAGE is indexed by block. SLOT is indexed by state slot."""
 
     name: str
     kind: str
@@ -2378,6 +2352,10 @@ class _Region:
             self.reverse,
             self.chunk_bytes,
         ]
+
+    def shape(self) -> tuple[Any, ...]:
+        """What the handshake compares. Pool totals may differ."""
+        return (self.name, self.kind, self.unit, self.reverse, self.chunk_bytes)
 
     @property
     def num_units(self) -> int:
