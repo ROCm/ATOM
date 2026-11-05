@@ -345,4 +345,23 @@ def test_a_head_cut_matches_names_up_to_the_head_count_only():
     assert not same("mha.h4d128.k.layer_3", "mha.h1d128.k.layer_3", False)
     assert not same("mha.h4d128.k.layer_3", "mha.h1d128.v.layer_3", True)
     assert not same("mha.h4d128.k.layer_3", "mha.h1d128.k.layer_4", True)
+    # As wide per head as an fp8 d128, but another head.
+    assert not same("mha.h4d64.k.layer_3", "mha.h1d128.k.layer_3", True)
     assert not same("draft.k.layer_0", "draft.v.layer_0", True)
+
+
+@pytest.mark.parametrize("heads, refusal", [(4, "state slots"), (2, "TP1 producer")])
+def test_a_producer_with_state_slots_refuses_another_consumer_tp(
+    export, heads, refusal
+):
+    """A GDN hybrid's per-request state is TP-sharded and never cut, so its
+    block+slot path refuses a consumer at another TP size before any write."""
+    mem = _Memory()
+    producer = _producer(export(heads, 3, (3, 2, 2, 1)), mem, 4, heads)
+    theirs = _layout(export(1))
+    request = _request(theirs, [mem.add(4 * b, False) for _, _, b in theirs], 0)
+    with pytest.raises((NotImplementedError, RuntimeError), match=refusal):
+        producer._execute_block_slot_transfer(
+            request, "consumer", [0], [0], {"slot_index": 0}, "slot-consumer"
+        )
+    assert mem.writes == 0

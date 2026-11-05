@@ -860,8 +860,8 @@ def _same_unit_role(producer_role, consumer_role, cutting_heads: bool) -> bool:
 
     The MHA backend names a unit by its per-rank geometry
     (``mha.h{heads}d{dim}.{field}.layer_{row}``), and a head cut changes
-    exactly the head count; the rest of the name must still agree. The byte
-    checks of the cut catch a head-dim difference.
+    exactly the head count; the head dim and the rest of the name must still
+    agree. Bytes alone cannot tell: a bf16 d64 head is as wide as an fp8 d128.
     """
     if producer_role == consumer_role:
         return True
@@ -871,6 +871,7 @@ def _same_unit_role(producer_role, consumer_role, cutting_heads: bool) -> bool:
     return (
         len(produced) == len(consumed) == 3
         and produced[0] == consumed[0] == "mha"
+        and produced[1].partition("d")[2] == consumed[1].partition("d")[2]
         and produced[2] == consumed[2]
     )
 
@@ -3636,6 +3637,19 @@ class MooncakeConnector(KVConnectorBase):
         blocks_only: bool = False,
     ) -> bool:
         """Two-phase RDMA for backends with per-request state: block regions first, then slot regions."""
+        # The state slots are TP-sharded and never cut by head, so a consumer
+        # at another TP size is refused here whatever the producer's TP
+        # (`_consumer_head_cut` refuses a non-TP1 producer itself).
+        if (
+            self._consumer_head_cut(
+                request_data, max(1, request_data.get("consumer_dcp_size", 1))
+            )
+            is not None
+        ):
+            raise NotImplementedError(
+                f"Cutting KV heads between TP sizes for req {req_id} is not "
+                "supported with per-request state slots, which are TP-sharded"
+            )
         consumer_is_fp4 = "consumer_block_base_addrs_fp4" in request_data
         addr_key = (
             "consumer_block_base_addrs_fp4"
