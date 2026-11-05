@@ -284,3 +284,16 @@ def test_binding_the_kda_state_sizes_the_tail_buffers(monkeypatch):
         assert buf.shape == (33, 2, 4, 128)
         assert buf.dtype == torch.bfloat16
         assert not buf.any()
+
+
+def test_plugin_classes_replace_native_ones_only_during_construction():
+    """The plugin subclasses the native KDA layer and indexer and swaps them in
+    while the model is built; importing it must leave the native module alone,
+    so a native ATOM engine in the same process keeps its own classes."""
+    from atom.models import glm5_next as native
+    from atom.plugin.vllm.models import glm5_next as mod
+
+    assert issubclass(mod.Glm5NextIndexerVllm, native.Glm5NextIndexer)
+    assert issubclass(mod.Glm5NextKDAAttentionVllm, native.Glm5NextKDAAttention)
+    assert native.Glm5NextIndexer is not mod.Glm5NextIndexerVllm
+    assert native.Glm5NextKDAAttention is not mod.Glm5NextKDAAttentionVllm

@@ -25,12 +25,18 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.models.interfaces import IsHybrid
 
-from atom.model_ops.glm5_next.geometry import pooled_path_enabled
+from atom.model_ops.attentions.aiter_mla import aligned_index_cache_dim
+from atom.model_ops.glm5_next import kpool as kpool_ops
+from atom.model_ops.glm5_next.geometry import (
+    effective_kpool_size,
+    pooled_path_enabled,
+)
 from atom.models import glm5_next as glm5_next_base
 from atom.models.glm5_next import (
     Glm5NextForConditionalGeneration as Glm5NextBase,
 )
 from atom.models.glm5_next import (
+    Glm5NextIndexer,
     Glm5NextKDAAttention,
     _normalize_glm5_next_config,
 )
@@ -184,21 +190,111 @@ class Glm5NextKDAAttentionVllm(KimiKDAAttentionVllm, Glm5NextKDAAttention):
             )
 
 
-class Glm5NextForConditionalGeneration_(Glm5NextBase):
-    """ATOM's GLM-5.3-Flash with the KDA layer swapped for the vLLM-state one.
+class Glm5NextIndexerVllm(Glm5NextIndexer):
+    """GLM-5.3-Flash's DSA indexer, run from vLLM's metadata.
 
-    The decoder layer resolves ``Glm5NextKDAAttention`` as a module global, so
-    rebinding it for the duration of construction is enough; it is restored
-    afterwards so a native ATOM engine in the same process is unaffected.
+    The dense path needs nothing here: the shared indexer already dispatches to
+    the plugin op (`IndexerDecoratorForPluginMode`). The pooled (kpool) path
+    keeps the native projections and kernels but replaces the op that consumes
+    them, because the native one reads ATOM's forward context and ATOM's own
+    tail buffer, neither of which exists under vLLM.
+    """
+
+    def __init__(self, atom_config, config, *args, **kwargs):
+        super().__init__(atom_config, config, *args, **kwargs)
+        # The cache module's head_dim becomes the MLAAttentionSpec head_size,
+        # the bytes vLLM budgets per cached row. Declare the 16-byte-aligned
+        # width native ATOM allocates (144), not index_head_dim + 4 (132): 144
+        # divides the 576-byte MLA row, so the indexer page divides the MLA
+        # page and is never padded -- aiter's index-cache write takes sizes,
+        # not stride(0), and would write a padded page to the wrong block.
+        self.k_cache.head_dim = aligned_index_cache_dim(config)
+        # Tokens per cached row, which `_deepseek_v32_indexer_get_kv_cache_spec`
+        # publishes as tokens_per_state; 1 when the pooled path is off.
+        self.k_cache.tokens_per_state = effective_kpool_size(self.index_kpool)
+        # Bound here, not looked up in the traced forward, and importing the
+        # module is what registers the op: left unimported,
+        # `torch.ops.aiter.<op>` raises inside the traced frame, Dynamo falls
+        # back to eager for it, and the extra graph trips ATOM's "VllmBackend
+        # can only be called once", which names neither the op nor the model.
+        from atom.plugin.vllm.attention import glm5_kpool_indexer  # noqa: F401
+
+        self._kpool_plugin_op = torch.ops.aiter.sparse_attn_indexer_kpool_plugin_mode
+        # The KDA layer whose state slots key the pooled tail buffer; set by
+        # `_lend_kda_state_slots_to_indexers` once the model is built.
+        self.kda_layer_name: str | None = None
+
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        qr_scale: torch.Tensor | None,
+        positions,
+        rotary_emb=None,
+        *,
+        projected_k_weights=None,
+    ) -> None:
+        if not self.use_kpool():
+            return super().forward_impl(
+                hidden_states,
+                qr,
+                qr_scale,
+                positions,
+                rotary_emb,
+                projected_k_weights=projected_k_weights,
+            )
+        # The pooled query, key and weights, exactly as the native pooled path
+        # computes them (`Glm5NextIndexer.forward_impl`); keep the two in step.
+        q = self.wq_b(qr, qr_scale)
+        q = q.view(-1, self.n_head, self.head_dim)
+        k = self.k_norm(self.wk(hidden_states))
+        weights = self.weights_proj(hidden_states)
+        q_fp8, q_scale = kpool_ops.fwht128_quant_fp8(q.view(-1, self.head_dim))
+        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+        q_scale = q_scale.view(-1, self.n_head, 1)
+        weights = (weights.unsqueeze(-1) * q_scale * self._weights_scale).squeeze(-1)
+        self._kpool_plugin_op(
+            hidden_states,
+            self.k_cache.prefix,
+            self.kda_layer_name,
+            self.k_cache.kv_cache[0],
+            q_fp8,
+            k,
+            self.index_kpool_compress_gate(hidden_states),
+            weights,
+            self.index_kpool_compress_ape,
+            positions,
+            self.sparse_kv_indices_buffer,
+            self.topk_tokens,
+            self.index_kpool,
+            self.head_dim,
+            self.max_model_len,
+            self.topk_out_width,
+            self.scale_fmt,
+            self.stable_topk,
+        )
+
+
+class Glm5NextForConditionalGeneration_(Glm5NextBase):
+    """ATOM's GLM-5.3-Flash with its KDA layers and indexers swapped for the
+    vLLM-backed ones.
+
+    The model resolves ``Glm5NextKDAAttention`` and ``Glm5NextIndexer`` as
+    module globals, so rebinding them for the duration of construction is
+    enough; they are restored afterwards, so a native ATOM engine in the same
+    process is unaffected.
     """
 
     def __init__(self, *args, **kwargs):
         original_kda_cls = glm5_next_base.Glm5NextKDAAttention
+        original_indexer_cls = glm5_next_base.Glm5NextIndexer
         glm5_next_base.Glm5NextKDAAttention = Glm5NextKDAAttentionVllm
+        glm5_next_base.Glm5NextIndexer = Glm5NextIndexerVllm
         try:
             super().__init__(*args, **kwargs)
         finally:
             glm5_next_base.Glm5NextKDAAttention = original_kda_cls
+            glm5_next_base.Glm5NextIndexer = original_indexer_cls
         _lend_kda_state_slots_to_indexers(self)
 
 
@@ -211,8 +307,6 @@ def _lend_kda_state_slots_to_indexers(model) -> None:
     only means something within one group -- every indexer therefore borrows the
     same layer's, and the buffer is sized from that layer's state pool.
     """
-    from atom.models.glm5_next import Glm5NextIndexer
-
     kda_layer = next(
         (
             module
@@ -225,7 +319,7 @@ def _lend_kda_state_slots_to_indexers(model) -> None:
         return
     pooled = []
     for module in model.modules():
-        if isinstance(module, Glm5NextIndexer):
+        if isinstance(module, Glm5NextIndexerVllm):
             module.kda_layer_name = kda_layer.layer_name
             if module.use_kpool():
                 pooled.append(

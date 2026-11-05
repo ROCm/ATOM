@@ -99,7 +99,6 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
@@ -602,26 +601,6 @@ class Glm5NextIndexer(Indexer):
         )
         self.index_kpool = int(getattr(config, "index_kpool", 1) or 1)
         self.is_mtp = is_mtp
-        # Widen the paged index-cache row from `index_head_dim + 4` (132) to the
-        # 16-byte-aligned 144 the native path already allocates
-        # (`aligned_index_cache_dim`). Only plugin mode reads this attribute --
-        # it becomes the MLAAttentionSpec head_size, i.e. the bytes vLLM budgets
-        # per cached row -- and 144 is what makes the indexer page DIVIDE the
-        # MLA page (144 | 576) for every block size, kpool and KV dtype. At 132
-        # it divides neither, so vLLM's `unify_kv_cache_spec_page_size` falls to
-        # its `page_size_padded` branch, and aiter's write kernel takes only
-        # sizes, never `stride(0)` (cache_kernels.cu:1336-1352) -- so a padded
-        # page would read right and WRITE to the wrong block. The 12 spare bytes
-        # per row sit at the block tail and are never addressed: keys occupy
-        # `block_size*128` bytes and scales the next `block_size*4`.
-        self.k_cache.head_dim = kpool_geometry.aligned_index_cache_row(self.head_dim)
-        # Tell plugin mode how many tokens share one cached row, so vLLM sizes
-        # the paged index cache in POOLS (MLAAttentionSpec.tokens_per_state).
-        # One when the pooled path is off, which is what keeps the dense path
-        # unchanged.
-        self.k_cache.tokens_per_state = kpool_geometry.effective_kpool_size(
-            self.index_kpool
-        )
         always_select_tail = bool(
             getattr(config, "index_kpool_always_select_tail", True)
         )
@@ -645,29 +624,8 @@ class Glm5NextIndexer(Indexer):
                 quant_config=None,
                 prefix=f"{prefix}.index_kpool_compress_gate",
             )
-        # Resolve the pooled implementation once, here. Two reasons, both of
-        # which cost a debugging cycle when skipped: the forward is traced, so
-        # a framework check there is a call the tracer has to reason about
-        # (the dense indexer binds its implementation the same way, see
-        # IndexerDecoratorForPluginMode); and importing the plugin module is
-        # what REGISTERS the op. Left unimported, `torch.ops.aiter.<op>` raises
-        # inside the traced frame, Dynamo falls back to eager for that frame,
-        # and the extra graph trips ATOM's "VllmBackend can only be called
-        # once" -- which names neither this op nor this model.
-        self._kpool_plugin_op = None
-        if is_vllm():
-            from atom.plugin.vllm.attention import glm5_kpool_indexer  # noqa: F401
-
-            self._kpool_plugin_op = (
-                torch.ops.aiter.sparse_attn_indexer_kpool_plugin_mode
-            )
         # Bound by the metadata builder alongside the index K cache.
         self.kpool_tail_cache: torch.Tensor | None = None
-        # Plugin mode only: the KDA layer whose per-request state slot keys the
-        # pooled tail buffer. vLLM splits the 34 KDA layers across several cache
-        # groups with independent block tables, so the slot ids are only
-        # comparable within one group -- every indexer borrows the SAME layer's.
-        self.kda_layer_name: str | None = None
         # One helper owns the producer/metadata width contract, including the
         # ATOM_GLM5_KPOOL off-switch.
         self.topk_out_width = kpool_geometry.topk_output_width(
@@ -724,33 +682,6 @@ class Glm5NextIndexer(Indexer):
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
         weights = (weights.unsqueeze(-1) * q_scale * self._weights_scale).squeeze(-1)
-
-        if self._kpool_plugin_op is not None:
-            # Plugin mode keeps the same kernels but reads vLLM's metadata: the
-            # tail buffer and the KDA state slot it is keyed on come from the
-            # vLLM forward context rather than from ATOM's, and the buffer is
-            # owned by the op (this call site is traced; the op body is not).
-            self._kpool_plugin_op(
-                hidden_states,
-                self.k_cache.prefix,
-                self.kda_layer_name,
-                self.k_cache.kv_cache[0],
-                q_fp8,
-                k,
-                self.index_kpool_compress_gate(hidden_states),
-                weights,
-                self.index_kpool_compress_ape,
-                positions,
-                self.sparse_kv_indices_buffer,
-                self.topk_tokens,
-                self.index_kpool,
-                self.head_dim,
-                self.max_model_len,
-                self.topk_out_width,
-                self.scale_fmt,
-                self.stable_topk,
-            )
-            return
 
         # The memory-profiling forward runs BEFORE the KV cache (and the
         # tail buffer with it) exists, so "unbound" is expected there and
