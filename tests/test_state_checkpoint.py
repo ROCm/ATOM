@@ -19,11 +19,7 @@ from types import SimpleNamespace
 import pytest
 from conftest import MockConfig
 
-from atom.model_engine.block_manager import (
-    AdmissionProbe,
-    BlockManager,
-    JointBoundaryDecision,
-)
+from atom.model_engine.block_manager import AdmissionProbe, BlockManager
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.page_unit_checkpoint import (
@@ -3283,26 +3279,6 @@ class TestPromptEndAnchor:
         seq = Sequence(list(range(8300)), 64, has_per_req_cache=True)
         seq.offload_joint.kv_prefix_tokens = 8192
         assert bm.can_allocate(seq) == 0
-        assert seq.checkpoint_end_pos == 8256
-
-    def test_a_joint_boundary_on_the_tier_grid_keeps_the_anchor_past_it(
-        self, monkeypatch
-    ):
-        """`can_allocate` saw no HBM hit and floored the anchor to 8192, where
-        the joint then lands."""
-        bm = self._tier_grid_manager()
-        seq = Sequence(list(range(8300)), 64, has_per_req_cache=True)
-        probe = AdmissionProbe()
-        bm.can_allocate(seq, record=False, probe=probe)
-        assert probe.num_cached_blocks == 0
-        assert seq.checkpoint_end_pos == 8192
-        joint = JointBoundaryDecision(
-            boundary_tokens=8192, boundary_hash=1, kv_tokens=8192, claim_tokens=0
-        )
-        monkeypatch.setattr(bm, "_joint_kv_boundary", lambda *_: joint)
-        monkeypatch.setattr(bm, "_fit_joint", lambda decision, _probe: decision)
-        bm.record_allocation(seq, probe)
-        assert seq.offload_joint.boundary_tokens == 8192
         assert seq.checkpoint_end_pos == 8256
 
     def test_an_anchor_grid_off_the_hash_grid_is_refused(self):

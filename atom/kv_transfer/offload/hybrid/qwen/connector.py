@@ -29,19 +29,3 @@ class QwenOffloadScheduler(KimiK3OffloadScheduler):
     Inherits ``StateOffloadFace`` through K3, so ``isinstance`` routing still
     sends state stores and loads here.
     """
-
-    def _withholds_last_prompt_token(self, seq) -> bool:
-        """Not when the joint boundary lies in the withheld chunk.
-
-        A hybrid claims the joint boundary, which already leaves a token to
-        compute. Withholding would floor a chunk-aligned prompt a whole chunk
-        below the rungs it kept near its end, so no boundary forms. A hit no
-        boundary backs is still withheld: `_decide_load_after_alloc` refuses it.
-        """
-        if not getattr(seq, "has_per_req_cache", False):
-            return super()._withholds_last_prompt_token(seq)
-        num_prompt = int(seq.num_prompt_tokens)
-        withheld = self._chunk_floor(num_prompt - 1)
-        if self._block_manager is None or withheld == self._chunk_floor(num_prompt):
-            return True
-        return self._block_manager.joint_boundary_tokens(seq, num_prompt) <= withheld

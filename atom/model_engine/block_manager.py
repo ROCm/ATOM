@@ -1580,10 +1580,6 @@ class BlockManager:
             )
             decision = self._fit_joint(decision, probe)
             self._commit_joint_boundary(seq, decision)
-            # The prefill resumes at the joint boundary.
-            hbm_tokens = probe.num_cached_blocks * self.hash_block_size
-            if decision.boundary_tokens > hbm_tokens:
-                self._record_checkpoint_end(seq, decision.boundary_tokens)
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
         """Drop a failed unaligned joint and resume at the HBM hit it lowered.
@@ -2883,17 +2879,23 @@ class BlockManager:
         than one batch, the anchor along with them. Giving back under one
         block of this forward's budget keeps the next start on the grid.
 
-        Unchanged when the chunk finishes the prompt, or when it is shorter
-        than reaching the next boundary.
+        Under a tier anchor grid, a chunk that crosses a prompt-end anchor on
+        that grid ends at the anchor when the forward would snapshot it
+        elsewhere: the tier keeps the image only there. That includes the
+        prompt's last chunk, where the anchor usually lies, at the cost of one
+        more forward. An anchor `_record_checkpoint_end` left off the grid is
+        not cut for; the tier would not keep it.
 
-        Under a tier anchor grid the chunk ends at the prompt-end anchor when
-        the forward would snapshot it elsewhere (off the tier grid).
+        Otherwise unchanged when the chunk finishes the prompt, or when it is
+        shorter than reaching the next boundary.
         """
         if not self._midstep_applies(seq):
             return chunk
         anchor = seq.checkpoint_end_pos
+        grid = self.checkpoint_anchor_grid
         if (
-            self.checkpoint_anchor_grid != self.hash_block_size
+            grid != self.hash_block_size
+            and anchor % grid == 0
             and start < anchor < start + chunk
             and snap_midstep_position(anchor, start, start + chunk, self.midstep_grid)
             != anchor

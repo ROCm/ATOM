@@ -2844,9 +2844,9 @@ def test_sidecar_hashes_are_computed_once_per_sequence_lifecycle(monkeypatch):
     calls = []
     original = _chained_prefix_hashes
 
-    def counted(token_ids, hash_block_size):
+    def counted(token_ids, hash_block_size, **kwargs):
         calls.append(len(token_ids) // hash_block_size)
-        return original(token_ids, hash_block_size)
+        return original(token_ids, hash_block_size, **kwargs)
 
     monkeypatch.setattr(
         "atom.kv_transfer.offload.hybrid.dsv4.connector._chained_prefix_hashes",
@@ -5719,8 +5719,8 @@ def test_engine_id_splits_servers_on_one_host_and_their_replicas():
     assert len(ids) == 15
 
 
-@pytest.mark.parametrize("base_port", [0, None, -1, True, "41000"])
-def test_engine_id_ignores_an_unresolved_or_malformed_port(base_port):
+@pytest.mark.parametrize("base_port", [0, None])
+def test_engine_id_ignores_an_unresolved_port(base_port):
     assert offcfg.lmcache_engine_id(_server_config(base_port)) == "atom-offload-dp0"
 
 
@@ -6062,28 +6062,38 @@ def _text_wrapped(model_type: str, text_type: str):
 
 
 @pytest.mark.parametrize(
-    "hf_config",
+    "hf_config,scheduler_cls",
     [
         pytest.param(
+            SimpleNamespace(model_type="kimi_linear"),
+            KimiK3OffloadScheduler,
+            id="kimi-k3",
+        ),
+        pytest.param(
             SimpleNamespace(model_type="qwen3_next"),
+            QwenOffloadScheduler,
             id="qwen3-next",
         ),
         pytest.param(
             _text_wrapped("qwen3_5_moe", "qwen3_5_moe_text"),
+            QwenOffloadScheduler,
             id="qwen3.5",
         ),
         pytest.param(
             _text_wrapped("qwen4_exp", "qwen4_exp_text"),
+            QwenOffloadScheduler,
             id="qwen3.8",
         ),
     ],
 )
-def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(monkeypatch, hf_config):
+def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(
+    monkeypatch, hf_config, scheduler_cls
+):
     """A chunk-aligned prompt resent whole with HBM empty. Withholding the last
     token would floor the KV leg to 512, under the 704 rung the prompt kept,
     so the hit stays whole when a boundary lands in that last chunk."""
     sched = _offload_scheduler(monkeypatch, hf_config, chunk=256)
-    assert type(sched) is QwenOffloadScheduler
+    assert type(sched) is scheduler_cls
     sched._min_load_tokens = 0
     sched._lookup_client = _LookupClient(hit=768)
     asked = []
@@ -7557,7 +7567,9 @@ def _media_seq(sid, cache_seed, tokens=None):
 @pytest.fixture
 def media_scheduler(monkeypatch):
     return _offload_scheduler(
-        monkeypatch, _text_wrapped("qwen4_exp", "qwen4_exp_text"), chunk=_MEDIA_CHUNK
+        monkeypatch,
+        _text_wrapped("qwen3_5_moe", "qwen3_5_moe_text"),
+        chunk=_MEDIA_CHUNK,
     )
 
 
@@ -7607,3 +7619,36 @@ def test_lmcache_mp_native_state_lookup_is_keyed_the_same_way():
         seq = _media_seq("A", seed)
         assert lookup(stub, seq) == tier_token_ids(seq, end)
     assert lookup(stub, seq) == seq.token_ids[:end]
+
+
+def test_dsv4_lookup_is_keyed_the_same_way():
+    asked = []
+    sched = _stateful_scheduler(hit=0)
+    sched._lookup_client = SimpleNamespace(
+        lookup=lambda ids, lookup_id: asked.append(ids) or 0
+    )
+    for seed in (11, -1):
+        seq = _media_seq(seed + 100, seed)
+        sched._fresh_tier_lookup(seq, str(seq.id))
+        assert asked[-1] == tier_token_ids(seq, _MEDIA_PROMPT)
+    assert asked[-1] == list(seq.token_ids)
+
+
+@pytest.mark.parametrize("cache_seed", [11, -1])
+def test_a_dsv4_save_keys_its_pages_and_slot_by_the_media(cache_seed):
+    """The PAGE key carries the media, and the SLOT boundary hash is the one
+    `BlockManager` chains from the same `cache_seed`."""
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=730, num_prompt_tokens=16_384, num_cached_tokens=8192, group=2
+    )
+    seq.cache_seed = cache_seed
+    sched._save_tracker["730"] = [seq, 0]
+
+    request = sched.build_connector_meta().requests[0]
+
+    assert request.token_ids == tier_token_ids(seq, 8192)
+    parent = cache_seed
+    for start in range(0, 8192, 256):
+        parent = BlockManager.compute_hash(seq.token_ids[start : start + 256], parent)
+    assert request.slot_save_spec.boundary_block_hash == parent

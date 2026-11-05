@@ -354,6 +354,15 @@ class TestPagedMidstep:
         bm.complete_previous_state_batch()
         assert bm.can_allocate(stateful_seq(PROMPT)) == 40 // BLOCK
 
+        # An anchor left off the grid (the prefill resumed past its floor) is
+        # not cut for: the tier would not keep it.
+        off_grid = self.bm()
+        off_grid.align_checkpoint_anchor(3 * BLOCK)
+        left = admitted(off_grid)
+        assert left.checkpoint_end_pos == 36
+        left.checkpoint_end_pos = 40
+        assert off_grid.align_midstep_chunk(left, 0, 44) == 44
+
         plain = self.bm()
         assert plain.align_midstep_chunk(admitted(plain), 0, 44) == 44
 

@@ -720,14 +720,14 @@ class OffloadSchedulerMixin(ABC):
         del seq
         return True
 
-    def _loadable_hit(self, hit: int, num_prompt: int, seq=None) -> int:
+    def _loadable_hit(self, hit: int, num_prompt: int, seq) -> int:
         """Turn a lookup hit into a length the external tier can actually serve.
 
         Two steps, in this order:
 
         * A hit covering the whole prompt leaves nothing to compute, so step
-          back one token -- unless `seq` is given and
-          `_withholds_last_prompt_token(seq)` says its claim stops short.
+          back one token -- unless `_withholds_last_prompt_token(seq)` says
+          the layout's claim stops short of it.
         * Floor to a chunk. `retrieve` resolves the tier at chunk granularity,
           so a `hit` that is not a chunk multiple names tokens the tier does
           not hold and the load's `ret_mask[hbm:lmc].all()` check can never
@@ -740,9 +740,7 @@ class OffloadSchedulerMixin(ABC):
         """
 
         hit = int(hit)
-        if hit == int(num_prompt) and (
-            seq is None or self._withholds_last_prompt_token(seq)
-        ):
+        if hit == int(num_prompt) and self._withholds_last_prompt_token(seq):
             hit -= 1
         return self._chunk_floor(hit)
 
@@ -1109,8 +1107,9 @@ class OffloadSchedulerMixin(ABC):
         seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
         return True
 
-    def _save_frontier(self, seq) -> int:
-        computed = min(
+    def _save_computed_tokens(self, seq) -> int:
+        """Prompt tokens whose KV a save emitted now may read."""
+        return min(
             int(
                 getattr(
                     seq,
@@ -1120,7 +1119,9 @@ class OffloadSchedulerMixin(ABC):
             ),
             int(getattr(seq, "num_prompt_tokens", 0)),
         )
-        return self._chunk_floor(computed)
+
+    def _save_frontier(self, seq) -> int:
+        return self._chunk_floor(self._save_computed_tokens(seq))
 
     def _has_pending_save(self, seq) -> bool:
         sid = str(seq.id)
