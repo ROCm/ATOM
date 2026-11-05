@@ -75,14 +75,13 @@ def lossless_unsupported_reason(drafter) -> str | None:
             "handoff and verifies nothing. The decode engine still arms."
         )
     if config.pipeline_parallel_size > 1:
-        # PP rings the `sampling` publication while the block head binds one
-        # address, and a PP engine (`spec_decode_local = pp_size == 1`) never
-        # reaches the ratio accept rule anyway.
+        # PP rings `forward_vars` (one slot per stage in flight), while
+        # `bind_target` binds the draft to one slot's temperatures and filters.
         return (
             "is not implemented under pipeline parallelism "
-            f"(pp={config.pipeline_parallel_size}): such an engine "
-            "drafts for handoff and verifies nothing, so the ratio accept "
-            "rule it pairs with is never reached."
+            f"(pp={config.pipeline_parallel_size}): the runner rings its "
+            "sampling buffers per in-flight step, and the draft reads one "
+            "slot's."
         )
     if get_pcp_world_size() > 1:
         # PCP broadcasts the draft ids across ranks but not their q, so
