@@ -151,7 +151,7 @@ class GDNAttentionMetadata:
     # mapping the chunk kernel builds internally. Only computed when there are
     # checkpoints to place against it.
     ssm_chunk_offsets: torch.Tensor | None = None
-    # Kimi-K3 midstep checkpoints (ATOM_K3_KDA_MIDSTEP_CKPT=1) this prefill
+    # Kimi-K3 midstep checkpoints (ATOM_K3_KDA_STATE_MIDSTEP=1) this prefill
     # writes, as `_KimiMLAGDNCommon._kda_snapshots` builds them, else None.
     kda_snapshots: object | None = None
     # Conv tokens a checkpoint holds, `conv_kernel - 1`; see `_conv_state_len`.

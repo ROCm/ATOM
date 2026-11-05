@@ -485,8 +485,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # position into its own scratch state slot, the layer copies the conv window
     # beside it, and the PAGE image is stored from that slot -- the same image,
     # filed under the same hash, one forward earlier. Needs the FlashKDA path.
-    "ATOM_K3_KDA_MIDSTEP_CKPT": lambda: (
-        os.getenv("ATOM_K3_KDA_MIDSTEP_CKPT", "0") == "1"
+    "ATOM_K3_KDA_STATE_MIDSTEP": lambda: (
+        os.getenv("ATOM_K3_KDA_STATE_MIDSTEP", "0") == "1"
     ),
     # Tokens kept between the prompt-end state checkpoint and the prompt end,
     # at least; the backend's own successor room still applies when it is

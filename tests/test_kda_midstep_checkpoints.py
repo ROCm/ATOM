@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Kimi-K3 midstep KDA checkpoints (ATOM_K3_KDA_MIDSTEP_CKPT=1) on #2591's framework.
+"""Kimi-K3 midstep KDA checkpoints (ATOM_K3_KDA_STATE_MIDSTEP=1) on #2591's framework.
 
 The framework places the positions and borrows their scratch slots;
 test_gdn_midstep_checkpoints.py pins that for any readable backend. What is
@@ -37,6 +37,7 @@ from atom.models.kimi_k3.midstep import (
     kda_midstep_enabled,
     kda_midstep_transfer,
     kda_snapshots,
+    require_flash_kda_snapshots,
 )
 from atom.utils import envs
 
@@ -53,7 +54,7 @@ ANCHOR = 40
 @pytest.fixture(autouse=True)
 def _clean_switches(monkeypatch):
     for name in (
-        "ATOM_K3_KDA_MIDSTEP_CKPT",
+        "ATOM_K3_KDA_STATE_MIDSTEP",
         "AITER_FDA_ENABLE",
         "ATOM_STATE_CHECKPOINT_DEMAND",
     ):
@@ -94,16 +95,38 @@ def saves_of(seq):
 
 
 def test_the_switch_is_off_by_default():
-    assert envs.ATOM_K3_KDA_MIDSTEP_CKPT is False
+    assert envs.ATOM_K3_KDA_STATE_MIDSTEP is False
     assert kda_midstep_enabled() is False
 
 
 def test_the_switch_needs_flash_kda(monkeypatch):
-    monkeypatch.setenv("ATOM_K3_KDA_MIDSTEP_CKPT", "1")
+    monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
     assert kda_midstep_enabled() is True
     monkeypatch.setenv("AITER_FDA_ENABLE", "0")
     with pytest.raises(ValueError, match="AITER_FDA_ENABLE"):
         kda_midstep_enabled()
+
+
+def test_an_aiter_without_snapshot_arguments_is_refused_at_startup():
+    def with_snapshots(q, k, v, *, snapshot_targets=None, snapshot_out=None):
+        pass
+
+    def without(q, k, v, *, initial_state=None):
+        pass
+
+    def half(q, k, v, *, snapshot_targets=None):
+        pass
+
+    def catch_all(q, k, v, **kwargs):
+        pass
+
+    require_flash_kda_snapshots(with_snapshots)
+    with pytest.raises(RuntimeError, match="no snapshot_targets, snapshot_out"):
+        require_flash_kda_snapshots(without)
+    with pytest.raises(RuntimeError, match="no snapshot_out$"):
+        require_flash_kda_snapshots(half)
+    with pytest.raises(RuntimeError, match="aiter#7413"):
+        require_flash_kda_snapshots(catch_all)
 
 
 def test_the_transfer_reads_midstep_on_the_flash_kda_grid():
@@ -133,7 +156,7 @@ def test_one_scheduler_pass(on, monkeypatch):
     forward covers it, and its anchor, moved onto the 32-token grid, becomes
     one snapshot target."""
     if on:
-        monkeypatch.setenv("ATOM_K3_KDA_MIDSTEP_CKPT", "1")
+        monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
     scheduler = make_scheduler(
         k3_config(), state_runtime=k3_runtime(kda_midstep_enabled())
     )
