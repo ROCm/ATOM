@@ -1075,38 +1075,12 @@ jobs:
             bash -lc '
               set -euo pipefail
               python3 - <<'"'"'PY'"'"'
-          import json
           import os
+          import sys
           from pathlib import Path
 
-
-          def incomplete_reason(path):
-              # An interrupted download can leave config.json and some shards but
-              # no index or tokenizer. Without a completion marker, require both
-              # so such a directory falls through to the resumable download.
-              index_path = path / "model.safetensors.index.json"
-              if index_path.is_file():
-                  try:
-                      weight_map = json.loads(index_path.read_text()).get("weight_map", {})
-                  except Exception as exc:
-                      return f"invalid safetensors index ({exc})"
-                  expected = {Path(name).name for name in weight_map.values()}
-                  present = {shard.name for shard in path.glob("*.safetensors")}
-                  missing = sorted(expected - present)
-                  if missing:
-                      return f"{len(missing)} safetensors shards missing, e.g. {missing[0]}"
-              if any(
-                  (path / name).is_file()
-                  for name in (".download-complete", ".atom_download_complete")
-              ):
-                  return None
-              if not index_path.is_file() and not (path / "model.safetensors").is_file():
-                  return "no download completion marker or safetensors index"
-              tokenizer_files = ("tokenizer.json", "tokenizer.model", "tiktoken.model", "tokenizer_config.json")
-              if not any((path / name).is_file() for name in tokenizer_files):
-                  return "no download completion marker or tokenizer files"
-              return None
-
+          sys.path.insert(0, "/workspace/.github/scripts")
+          from check_model_dir import incomplete_reason
 
           model_path = os.environ["MODEL_PATH"].strip().strip("/")
           normalized = model_path.rstrip("/")
@@ -1268,19 +1242,29 @@ jobs:
                   use_model_lock="false"
                 fi
 
+                model_dir_is_complete() {
+                  python3 /workspace/.github/scripts/check_model_dir.py "$MODEL_DIR"
+                }
+
                 download_model() {
                   if [ -f "$MODEL_DIR/config.json" ]; then
-                    echo "Model directory exists without a completion marker under ${MODEL_DIR}; validating download"
+                    echo "Model directory exists without a complete download under ${MODEL_DIR}; resuming download"
                   else
                     echo "Model not found under ${MODEL_DIR}; downloading model"
                   fi
 
                   rm -f "$completion_flag"
                   hf download "$MODEL_PATH" --local-dir "$MODEL_DIR"
+                  # Mark first so the check validates the downloaded shards rather
+                  # than the unmarked-directory heuristics; unmark if it fails.
                   touch "$completion_flag"
+                  if ! model_dir_is_complete; then
+                    rm -f "$completion_flag"
+                    exit 1
+                  fi
                 }
 
-                if [ -f "$completion_flag" ]; then
+                if [ -f "$completion_flag" ] && model_dir_is_complete; then
                   echo "Model already exists under ${MODEL_DIR}; skip download"
                 elif [ "$use_model_lock" != "true" ]; then
                   echo "Baremetal runner ${RUNNER_NAME} detected; skipping shared model download lock"
@@ -1296,7 +1280,7 @@ jobs:
                     exit 1
                   fi
 
-                  if [ -f "$completion_flag" ]; then
+                  if [ -f "$completion_flag" ] && model_dir_is_complete; then
                     echo "Model became available under ${MODEL_DIR} while waiting for the lock; skip download"
                   else
                     download_model
