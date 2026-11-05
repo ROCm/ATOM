@@ -48,6 +48,7 @@ from atom.model_ops.qwen4_exp.ple_host_table import (
     check_fp8_rows,
 )
 from atom.model_ops.utils import atom_parameter
+from atom.plugin import is_plugin_mode
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -196,6 +197,11 @@ def _host_table_available() -> bool:
     a ROCm device's HBM (the kernel reads it through HIP's unified
     addressing)."""
     if torch.version.hip is None or torch.empty(0).device.type != "cuda":
+        return False
+    if is_plugin_mode():
+        # A framework's own loader (e.g. SGLang --load-format dummy) runs no
+        # process_weights_after_loading, so shard_bases would stay zero.
+        logger.info("PLE n-gram table: in HBM (plugin mode)")
         return False
     if not envs.ATOM_ENGRAM_UVA:
         logger.info("PLE n-gram table: in HBM (ATOM_ENGRAM_UVA=0)")

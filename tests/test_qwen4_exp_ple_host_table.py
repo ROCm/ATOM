@@ -839,7 +839,8 @@ def test_weight_sync_reaches_the_rows_a_captured_lookup_reads(ngram_layer, shard
 def test_the_host_table_stays_off_where_not_validated_or_for_a_dummy_load(
     ngram_layer, monkeypatch
 ):
-    """gfx90a, for one, and `--load_dummy`: the table stays the HBM embedding."""
+    """gfx90a, for one, a framework plugin and `--load_dummy`: the table stays
+    the HBM embedding."""
     from atom.model_ops.qwen4_exp import ple_layer
 
     monkeypatch.setattr(ple_layer, "get_gfx_runtime", lambda: "gfx90a")
@@ -849,6 +850,10 @@ def test_the_host_table_stays_off_where_not_validated_or_for_a_dummy_load(
         monkeypatch.setattr(ple_layer, "get_gfx_runtime", lambda arch=arch: arch)
         layer = ngram_layer(True)
         assert isinstance(layer.ngram_embedding, ple_layer._Qwen4ExpHostEmbedding)
+    monkeypatch.setattr(ple_layer, "is_plugin_mode", lambda: True)
+    layer = ngram_layer(True)
+    assert isinstance(layer.ngram_embedding, ple_layer._Qwen4ExpEmbedding)
+    monkeypatch.setattr(ple_layer, "is_plugin_mode", lambda: False)
     monkeypatch.setattr(
         ple_layer, "get_current_atom_config", lambda: SimpleNamespace(load_dummy="zero")
     )
