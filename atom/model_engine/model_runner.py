@@ -35,6 +35,7 @@ from atom.distributed.pcp_utils import (
     get_pcp_group,
     get_pcp_world_size,
     pcp_allgather_rerange,
+    pcp_is_enabled,
     pcp_pad_len,
     pcp_round_robin_split,
 )
@@ -3466,10 +3467,9 @@ class ModelRunner:
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
 
-        # The ids feed the next forward and must agree across the group: PCP
-        # near-tie argmaxes differ (~1 bf16 ULP), and SP samples with each
-        # process's own RNG, then embeds its rows from its own ids.
-        if get_pcp_world_size() > 1 and _needs_id_sync(
+        # The ids feed the next forward: PCP near-tie argmaxes differ (~1 bf16
+        # ULP), and each SP rank samples with its own RNG.
+        if (pcp_is_enabled() or sp_is_enabled()) and _needs_id_sync(
             self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
         ):
             sampled_tokens = get_pcp_group().broadcast(
@@ -3636,7 +3636,7 @@ class ModelRunner:
         Call right after `run_model`."""
         if getattr(self, "drafter", None) is not None:
             ctx = get_forward_context().context
-            ctx.target_pcp_split = bool(ctx.pcp_split)
+            ctx.target_pcp_split = bool(ctx.pcp_split) and pcp_is_enabled()
 
     @_profile_runner_stage
     @torch.inference_mode()

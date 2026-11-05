@@ -4,9 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 from conftest import atom_config_double
 
-from atom.config import Config
+from atom.config import Config, use_custom_atom_config
 from atom.distributed.ulysses_sp import check_sp_attention_layer, sp_head_shards
 from atom.models.minimax_m3.image_processing import image_input_refusal
 
@@ -24,6 +25,19 @@ def test_gqa_kv_heads_can_replicate_to_query_owners(world):
     # SP keeps -pcp's value and widens only the process group it runs over.
     assert config.prefill_context_parallel_size == 1
     assert Config.pcp_group_size.fget(config) == world
+
+
+@pytest.mark.parametrize("pcp,sp", [(4, 1), (1, 4)])
+def test_sp_runs_over_the_pcp_group_without_enabling_pcp(monkeypatch, pcp, sp):
+    with atom_without_aiter() as load:
+        pcp_utils = load("atom.distributed.pcp_utils")
+    config = atom_config_double(
+        prefill_context_parallel_size=pcp, sequence_parallel_size=sp
+    )
+    group_size = Config.pcp_group_size.fget(config)
+    monkeypatch.setattr(pcp_utils, "get_pcp_world_size", lambda: group_size)
+    with use_custom_atom_config(config):
+        assert group_size == 4 and pcp_utils.pcp_is_enabled() is (pcp > 1)
 
 
 @pytest.mark.parametrize(
