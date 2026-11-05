@@ -3,6 +3,7 @@
 
 """Chat completion handler for the OpenAI-compatible API."""
 
+import asyncio
 import logging
 import time
 from collections.abc import AsyncGenerator
@@ -287,6 +288,8 @@ async def stream_chat_response(
     tool_choice=None,
     reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
+    frames_per_chunk: bool = False,
+    min_frame_interval: float = 0.0,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming chat completion response with reasoning and tool calls.
 
@@ -298,6 +301,15 @@ async def stream_chat_response(
     ``num_prompt_tokens`` is the engine-computed prompt length (``Sequence.
     num_prompt_tokens``); reusing it avoids re-tokenizing the prompt on the
     event loop at stream start.
+
+    ``frames_per_chunk`` (ATOM_API_STREAM_FAST): every SSE event one collector
+    chunk produces -- the opening role event included -- goes out as one
+    yield, so as one send through the middleware stack, instead of one each.
+    ``min_frame_interval`` (seconds, with it): after a send that did not end
+    the stream, wait that long before reading the next chunk. The collector
+    merges what arrives meanwhile, so a stream sends at most one event batch
+    per interval; the text, the events' order and the totals are the same,
+    and no token waits longer than the interval.
     """
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
@@ -324,11 +336,17 @@ async def stream_chat_response(
     aborted = True
     try:
         role_sent = False
+        # One chunk's SSE events, in order; sent once the chunk is processed.
+        out: list[str] = []
+
+        def emit_chunk(*args, **kwargs) -> None:
+            out.append(create_chat_chunk(*args, **kwargs))
+
         while True:
             chunk_data = await stream_collector.get()
 
             if not role_sent:
-                yield create_chat_chunk(
+                emit_chunk(
                     request_id, model, delta={"role": "assistant", "content": ""}
                 )
                 role_sent = True
@@ -352,26 +370,22 @@ async def stream_chat_response(
             for field, text in segments:
                 if field == "reasoning_content":
                     if text:
-                        yield create_chat_chunk(
-                            request_id, model, delta={"reasoning_content": text}
-                        )
+                        emit_chunk(request_id, model, delta={"reasoning_content": text})
                 elif field == "content":
                     # Run through tool parser
                     events = tool_parser.process(text)
                     for event_type, data in events:
                         if event_type == "content":
-                            yield create_chat_chunk(
-                                request_id, model, delta={"content": data}
-                            )
+                            emit_chunk(request_id, model, delta={"content": data})
                         elif event_type == "tool_call_start":
-                            yield create_chat_chunk(
+                            emit_chunk(
                                 request_id,
                                 model,
                                 delta={"tool_calls": [data]},
                             )
                         elif event_type == "tool_call_args":
                             has_tool_calls = True
-                            yield create_chat_chunk(
+                            emit_chunk(
                                 request_id,
                                 model,
                                 delta={"tool_calls": [data]},
@@ -381,18 +395,26 @@ async def stream_chat_response(
                 # Flush tool parser
                 for event_type, data in tool_parser.flush():
                     if event_type == "content":
-                        yield create_chat_chunk(
-                            request_id, model, delta={"content": data}
-                        )
+                        emit_chunk(request_id, model, delta={"content": data})
                     elif event_type == "tool_call_start":
-                        yield create_chat_chunk(
-                            request_id, model, delta={"tool_calls": [data]}
-                        )
+                        emit_chunk(request_id, model, delta={"tool_calls": [data]})
                     elif event_type == "tool_call_args":
                         has_tool_calls = True
-                        yield create_chat_chunk(
-                            request_id, model, delta={"tool_calls": [data]}
-                        )
+                        emit_chunk(request_id, model, delta={"tool_calls": [data]})
+            finished = chunk_data.get("finished", False)
+            if frames_per_chunk:
+                if out:
+                    yield "".join(out)
+                    out.clear()
+                    if not finished and min_frame_interval > 0:
+                        # No read before the interval is up: whatever the
+                        # engine sends meanwhile merges into one chunk.
+                        await asyncio.sleep(min_frame_interval)
+            else:
+                for frame in out:
+                    yield frame
+                out.clear()
+            if finished:
                 break
 
         aborted = False

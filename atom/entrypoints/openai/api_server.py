@@ -147,6 +147,7 @@ from .streaming_dispatch import (
     FrameWait,
     StreamBatchDispatcher,
     StreamOutputCollector,
+    enable_backend_decode,
     enable_delta_reuse,
 )
 from .tool_parser import (
@@ -176,6 +177,8 @@ engine = None
 _tokenize_pool = None
 # `chat_offload.ChatOffload` when ATOM_API_OFFLOAD_PREPROCESS=1 (and the pool runs).
 _chat_offload: ChatOffload | None = None
+# `stream_chat_response` options under ATOM_API_STREAM_FAST; empty without it.
+_stream_fast_kwargs: dict[str, Any] = {}
 tokenizer: AutoTokenizer | None = None
 # The tool-call format this model emits, resolved once at startup from its
 # chat template. `None` means none was recognised and tool calls, if any, are
@@ -1919,6 +1922,7 @@ async def _chat_completions(
                     tool_choice=request.tool_choice,
                     reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
+                    **_stream_fast_kwargs,
                 )
             return StreamingResponse(
                 _client_stream(gen, request_id),
@@ -3101,7 +3105,7 @@ def main():
     global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect, synthetic_token_text
     global custom_message_encoder, _stream_batch_dispatcher, _tokenize_pool
-    global _chat_offload
+    global _chat_offload, _stream_fast_kwargs
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -3349,6 +3353,20 @@ def main():
         envs.ATOM_DETOKENIZER_DELTA_REUSE,
         envs.ATOM_DETOKENIZER_AUDIT_EVERY,
     )
+    if envs.ATOM_API_STREAM_FAST:
+        enable_backend_decode(tokenizer)
+        _stream_fast_kwargs = {
+            "frames_per_chunk": True,
+            "min_frame_interval": max(0.0, envs.ATOM_API_STREAM_MIN_FRAME_MS) / 1e3,
+        }
+        logger.info(
+            "ATOM_API_STREAM_FAST: one write per engine chunk, %s",
+            (
+                f"at most one per {envs.ATOM_API_STREAM_MIN_FRAME_MS:g} ms a chat stream"
+                if _stream_fast_kwargs["min_frame_interval"] > 0
+                else "every chunk sent as it arrives"
+            ),
+        )
 
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
     # their chunks into a thread-local; the engine core manager's output thread

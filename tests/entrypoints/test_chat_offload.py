@@ -552,6 +552,23 @@ def test_offloaded_requests_reach_the_engine_unchanged(server, bodies, monkeypat
     assert not hashed_here
 
 
+def test_fast_streaming_answers_as_before(server, bodies, monkeypatch):
+    """ATOM_API_STREAM_FAST: the backend decode and one write per chunk leave
+    every streamed answer as it was (events may share a write)."""
+    from atom.entrypoints.openai import streaming_dispatch
+
+    before = _answers(_run(server, True, bodies))
+    monkeypatch.setattr(streaming_dispatch._BACKEND_DECODE, "decode", None)
+    assert streaming_dispatch.enable_backend_decode(server.tokenizer)
+    monkeypatch.setattr(
+        api_server,
+        "_stream_fast_kwargs",
+        {"frames_per_chunk": True, "min_frame_interval": 0.001},
+    )
+    after = _answers(_run(server, True, bodies))
+    assert before == after
+
+
 HI = [{"role": "user", "content": "hi"}]
 ERROR_AND_FALLBACK_BODIES = [
     b'{"model": "m", "messages": [}',

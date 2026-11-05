@@ -967,6 +967,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_API_OFFLOAD_PREPROCESS": lambda: (
         os.getenv("ATOM_API_OFFLOAD_PREPROCESS", "0") == "1"
     ),
+    # Cheaper SSE streaming of chat completions on the API event loop: the stream
+    # detokenizer decodes through the Rust tokenizer directly once a startup
+    # probe shows it returns what `tokenizer.decode` does, and every SSE event
+    # one engine chunk produces is sent as one write. Same text, events and
+    # usage as without it.
+    "ATOM_API_STREAM_FAST": lambda: os.getenv("ATOM_API_STREAM_FAST", "0") == "1",
+    # With ATOM_API_STREAM_FAST: a chat stream sends at most one batch of SSE
+    # events per this many ms; tokens arriving meanwhile merge into the next
+    # batch (no token waits longer). Fewer frames per request on the event
+    # loop; chunk boundaries change, the streamed text does not. 0: every chunk.
+    "ATOM_API_STREAM_MIN_FRAME_MS": lambda: float(
+        os.getenv("ATOM_API_STREAM_MIN_FRAME_MS", "0")
+    ),
     # Keep the prompt block-hash chain (frontend prefix hashing) with each
     # tokenizer-cached prefix and extend it on the next turn instead of
     # rehashing the whole prompt. Content hashes only: KV residency is still
