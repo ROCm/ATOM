@@ -541,10 +541,6 @@ def test_producer_reentry_preserves_sources_and_first_consumer(
                 top_ks=np.array([4, 5, 6]) + changed,
                 top_ps=np.array([0.7, 0.8, 0.9]) - changed * 0.1,
                 required_channel=None,
-                # Read by the draft staging hook prepare_sample calls.
-                is_dummy_run=False,
-                total_tokens_num_prefill=0,
-                produces_output=lambda: True,
             )
             runner.prepare_sample(batch, publication_group=combined)
             if combined is not None:

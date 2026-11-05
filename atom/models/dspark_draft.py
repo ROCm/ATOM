@@ -184,8 +184,11 @@ class DSparkMarkovHead(nn.Module):
             x_k      <- drawn from the top of softmax(logits_k / T),
                         that q stored at q_store[base + k]     (lossless)
 
-        One loop for both and for every flavor, so the column convention and
-        the noise counters cannot drift apart. Lossless, each row writes its q
+        Kimi-K3's loop: one for greedy and lossless, so the column convention
+        and the noise counters cannot drift apart. V4, V4.1 and MiniMax-M3.1
+        keep their own greedy loops, because their confidence head reads each
+        position's ``W1[x_{k-1}]``, which the sampled op does not produce.
+        Lossless, each row writes its q
         straight into the row block its request owns (``sampling.q_row_base``),
         which the accept kernel reads a step later. ``sampling`` is the
         model's binding, fixed before capture, so one side is recorded.

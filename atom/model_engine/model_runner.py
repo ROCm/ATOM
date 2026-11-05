@@ -1670,15 +1670,16 @@ class ModelRunner:
                 config.torch_dtype,
                 self.device,
             )
-        elif envs.ATOM_SPEC_LOSSLESS_SAMPLING and not getattr(
-            getattr(self, "drafter", None), "is_block_drafter", False
-        ):
-            # A DSpark drafter says why it did not arm (`DSparkLossless.arm`).
-            logger.warning(
-                "ATOM_SPEC_LOSSLESS_SAMPLING is set but only a DSpark drafter "
-                "arms it; this engine (%s) samples and verifies as without it.",
-                type(getattr(self, "drafter", None)).__name__,
-            )
+        elif envs.ATOM_SPEC_LOSSLESS_SAMPLING:
+            # Without a drafter there is no draft to sample, and a DSpark
+            # drafter says why it did not arm (`DSparkLossless.arm`).
+            drafter = getattr(self, "drafter", None)
+            if drafter is not None and not getattr(drafter, "is_block_drafter", False):
+                logger.warning(
+                    "ATOM_SPEC_LOSSLESS_SAMPLING is set but only a DSpark drafter "
+                    "arms it; this engine (%s) samples and verifies as without it.",
+                    type(drafter).__name__,
+                )
 
     def _advance_forward_vars(self):
         """Rotate to the next in-flight slot before any buffer is written.

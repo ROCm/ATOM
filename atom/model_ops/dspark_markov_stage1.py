@@ -17,11 +17,10 @@ import triton.language as tl
 
 from atom.model_ops.tile_argmax import argmax_lowest_id
 
-# Untuned, and chosen for headroom rather than peak: the stage-1 accumulator is
+# Chosen for headroom rather than peak: the stage-1 accumulator is
 # [BLOCK_ROW, BLOCK_V] fp32 (64x128 -> 16 VGPR/lane at 8 warps) and one pipeline
 # stage stages [BLOCK_ROW, BLOCK_K] + [BLOCK_K, BLOCK_V] bf16 = 24KB of the 64KB
-# LDS. Left as-is once these shapes measured 145us/step of savings at B=1 and
-# 235us at B=64 on Kimi-K3; a sweep is the obvious next thing if that matters.
+# LDS.
 BLOCK_V = 128
 BLOCK_K = 64
 # MFMA needs M >= 16, so a batch smaller than that runs padded-and-masked

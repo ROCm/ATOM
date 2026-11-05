@@ -110,8 +110,8 @@ def test_semi_autoregressive_bias_changes_argmax():
 
 
 def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch):
-    """`DSparkMarkovHead.sample_block`, the one sampled loop every flavor
-    shares: position k draws from x_{k-1} into its own column, at store
+    """`DSparkMarkovHead.sample_block`, the block loop Kimi-K3 samples
+    through: position k draws from x_{k-1} into its own column, at store
     position k, with the noise counter strided by the buffers' max batch."""
     max_bs, bs, steps, V = 4, 3, 3, 10
     head = DSparkMarkovHead(vocab_size=V, rank=2)

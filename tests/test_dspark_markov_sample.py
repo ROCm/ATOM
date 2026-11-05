@@ -482,7 +482,7 @@ def test_unsupported_weights_raise_rather_than_drafting_off_the_global_rng():
 
 @requires_gpu
 def test_the_block_sampler_chains_the_op_through_its_bound_buffers():
-    """K3's sampled block, the head's shared `sample_block`: position k
+    """K3's sampled block, Kimi-K3's `sample_block`: position k
     drafts from x_{k-1} into row base + k, with the per-row inputs sliced to
     the running batch and the noise counter strided by the buffers' max batch,
     exactly as calling the op directly."""

@@ -735,15 +735,17 @@ class KimiK3DSpark(DSparkDraftModel):
         base_logits: torch.Tensor,  # [B, T, V]
         anchor_ids: torch.Tensor,  # [B]
     ) -> torch.Tensor:
-        """Markov-biased left-to-right sampling over the already-computed block.
+        """Markov-biased left-to-right sampling over the already-computed block:
+        the head's ``sample_block`` with this model's ``draft_sampling``.
 
-            logits_k <- U_k + B(x_{k-1}, .);  x_k <- argmax(logits_k)
+            logits_k <- U_k + B(x_{k-1}, .)
+            x_k      <- argmax(logits_k)                (``draft_sampling`` None)
+            x_k      <- drawn from the top of softmax(logits_k / T), its q
+                        published for the accept rule   (lossless)
 
         Only this loop is sequential, and it is T tiny rank-256 matmuls rather
         than T backbone passes -- which is the entire point of DSpark.
         """
-        # Lossless speculative sampling draws x_k from softmax(biased / T) and
-        # publishes that q for the accept rule (`draft_sampling` bound).
         return self.markov_head.sample_block(
             base_logits, anchor_ids, self.draft_sampling
         )
