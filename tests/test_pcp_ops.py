@@ -268,7 +268,9 @@ def test_aux_gathers_exactly_when_the_target_forward_split(monkeypatch):
     monkeypatch.setattr(dr, "get_pcp_world_size", lambda: ws)
     monkeypatch.setattr(dr, "pcp_allgather_rerange", fake_gather)
     monkeypatch.setattr(dr, "get_forward_context", lambda: ctx)
-    drafter = SimpleNamespace(_captures_aux=True, _aux_buffers=[torch.ones(16, 2)])
+    drafter = SimpleNamespace(
+        _captures_aux=True, _aux_buffers=[torch.ones(16, 2)], _relayed_aux=None
+    )
     hidden = torch.zeros(n, 2)
 
     (aux,) = dr.Drafter.aux_for(drafter, hidden)

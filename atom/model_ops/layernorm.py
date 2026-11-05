@@ -764,6 +764,34 @@ def fused_ar_gemma_per_group_supported() -> bool:
     return "gemma_norm" in inspect.signature(method).parameters
 
 
+def fused_ar_gemma_per_token_supported() -> bool:
+    """Whether aiter's fused AR + RMSNorm + per-token FP8 quant takes `gemma_norm`.
+
+    Same failure this guards for per-group -- an aiter that drops the flag
+    normalizes with `x * w` instead of Gemma's `x * (1 + w)` and says nothing --
+    but read off the registered torch.library schema rather than a Python
+    signature, because the per-token branch of
+    `GroupCoordinator.fused_allreduce_rmsnorm_quant` dispatches to ops declared
+    as `(*args, **kwargs)`.
+    """
+    import aiter.dist.parallel_state  # noqa: F401  (importing registers the ops)
+
+    ops = getattr(torch.ops, "aiter", None)
+    if ops is None:
+        return False
+    for name in (
+        "fused_allreduce_rmsnorm_quant_",
+        "fused_allreduce_rmsnorm_quant_emit_bf16_",
+    ):
+        op = getattr(ops, name, None)
+        if op is None:
+            return False
+        schema = str(getattr(op, "_schemas", "")) or str(op.default._schema)
+        if "gemma_norm" not in schema:
+            return False
+    return True
+
+
 class GemmaRMSNorm(nn.Module):
     """RMS normalization for Gemma.
 
@@ -784,27 +812,38 @@ class GemmaRMSNorm(nn.Module):
         self.weight = atom_parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
         self.use_fused_quant = False
+        self.per_token_quant = False
         self.write_bf16 = write_bf16
         if quant_config is not None:
             from aiter import QuantType
 
             if quant_config.quant_type == QuantType.per_1x128:
                 self.use_fused_quant = True
+            elif (
+                quant_config.quant_type == QuantType.per_Token
+                and envs.ATOM_FUSED_NORM_PER_TOKEN_QUANT
+            ):
+                self.use_fused_quant = True
+                self.per_token_quant = True
         # Fold the TP all-reduce of the input (the un-reduced output of the
         # previous row-parallel layer) into this norm.
         self.fused_allreduce = (
             fused_allreduce and get_tensor_model_parallel_world_size() > 1
         )
-        if (
-            self.fused_allreduce
-            and self.use_fused_quant
-            and not fused_ar_gemma_per_group_supported()
-        ):
-            raise ValueError(
-                "GemmaRMSNorm(fused_allreduce=True) with per-group FP8 quant needs "
-                "an aiter whose fused AR + RMSNorm + per-group quant takes "
-                "gemma_norm; this one would silently normalize with x * w"
+        if self.fused_allreduce and self.use_fused_quant:
+            granularity = "per-token" if self.per_token_quant else "per-group"
+            supported = (
+                fused_ar_gemma_per_token_supported()
+                if self.per_token_quant
+                else fused_ar_gemma_per_group_supported()
             )
+            if not supported:
+                raise ValueError(
+                    f"GemmaRMSNorm(fused_allreduce=True) with {granularity} FP8 "
+                    f"quant needs an aiter whose fused AR + RMSNorm + "
+                    f"{granularity} quant takes gemma_norm; this one would "
+                    "silently normalize with x * w"
+                )
 
     @staticmethod
     def forward_static(
@@ -881,6 +920,26 @@ class GemmaRMSNorm(nn.Module):
         from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
         from aiter.utility.dtypes import fp8
 
+        if self.per_token_quant:
+            # No gemma_norm on aiter's rmsnorm_quant, so the norm and the quant
+            # stay two kernels here -- the same two this path runs today. The
+            # saving is on `_forward_fused_allreduce`, which has a one-kernel
+            # per-token variant; this branch exists so layer 0 and any
+            # all-reduce-free configuration return the same contract.
+            from aiter import get_hip_quant
+
+            normed = self.forward_cuda(x, residual)
+            res_out = None
+            if residual is not None:
+                normed, res_out = normed
+            out_fp8, out_scale = get_hip_quant(QuantType.per_Token)(
+                normed, quant_dtype=fp8
+            )
+            out_bf16 = normed if self.write_bf16 else None
+            if residual is not None:
+                return out_fp8, out_scale, out_bf16, res_out
+            return out_fp8, out_scale, out_bf16
+
         transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         group_size = 128
         M = x.shape[0]
@@ -927,16 +986,27 @@ class GemmaRMSNorm(nn.Module):
         # reads the raw weight and applies (1 + w) itself (gemma_norm), so an
         # in-place weight update (rollout sync) is seen on the next call.
         if self.use_fused_quant:
+            # group_size stays at aiter's default 128 for per-token: its fast
+            # one-kernel branch is keyed on `quant_type == "per_token" and
+            # group_size == 128`, and the value is unused there. transpose_scale
+            # is per-group only -- a per-token scale is one column.
+            quant_kwargs = (
+                {"quant_type": "per_token"}
+                if self.per_token_quant
+                else {
+                    "quant_type": "per_group",
+                    "group_size": 128,
+                    "transpose_scale": envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+                }
+            )
             outs = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
                 x.contiguous(),
                 residual,
                 self.weight,
                 self.variance_epsilon,
-                quant_type="per_group",
-                group_size=128,
                 emit_bf16=self.write_bf16,
-                transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
                 gemma_norm=True,
+                **quant_kwargs,
             )
             out_fp8, res_out, out_scale = outs[:3]
             out_bf16 = outs[3] if self.write_bf16 else None

@@ -319,6 +319,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # moe_gemm_a16w4 / a4w4 / a8w4 path. Defaults to on for gfx94x, and for
     # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    # Qwen3.8-Flash-Next eager prefill on SGLang-ATOM: run QSA sparse attention
+    # with aiter's FlyDSL kernel (gfx942, BF16 D256, one KV head per rank)
+    # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel.
+    "ATOM_QSA_FLYDSL_ATTN": lambda: os.getenv("ATOM_QSA_FLYDSL_ATTN", "0") == "1",
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
     # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
@@ -485,6 +489,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # interior states instead of cutting prefill chunks onto them. PAGE path
     # only (Qwen3-Next / Qwen3.5); see `PagedStateCheckpointCoordinator`.
     "ATOM_GDN_STATE_MIDSTEP": lambda: os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1",
+    # Set to 0 to keep Qwen3.5's GDN input projection as two layers
+    # (`in_proj_qkvz` + `in_proj_ba`) when the checkpoint quantizes them with
+    # per-token FP8. The default merges them into one `in_proj_qkvzba`, which
+    # saves one GEMM and one activation quant per GDN layer. Block-scale
+    # checkpoints never merge: `in_proj_ba` is 32 columns per rank and
+    # concatenating it onto `in_proj_qkvz` would break the 128-column scale
+    # blocks. BF16 checkpoints always merge and ignore this.
+    "ATOM_QWEN35_GDN_MERGE_QKVZBA": lambda: (
+        os.getenv("ATOM_QWEN35_GDN_MERGE_QKVZBA", "1") == "1"
+    ),
+    # Set to 1 to let `GemmaRMSNorm` fold a per-token FP8 activation quant into
+    # the norm, the way it already does for per_1x128 block scales. On the
+    # fused all-reduce path this makes the all-reduce, the Gemma RMSNorm and
+    # the quant one kernel instead of two; off that path the norm and the quant
+    # stay two kernels, as today. Default 0 until measured on GPU: this changes
+    # the norm's return arity for every per-token model that reads
+    # `use_fused_quant`, Qwen3-Next as well as Qwen3.5.
+    "ATOM_FUSED_NORM_PER_TOKEN_QUANT": lambda: (
+        os.getenv("ATOM_FUSED_NORM_PER_TOKEN_QUANT", "0") == "1"
+    ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
@@ -940,6 +964,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen QSA: the MTP draft layer keeps BF16 KV / index caches while the
     # target's are FP8 / FP4 (an FP8 draft KV lowers the acceptance length).
     "ATOM_QSA_DRAFT_KV_BF16": lambda: _flag_env("ATOM_QSA_DRAFT_KV_BF16", "1"),
+    # Qwen3.8-Flash-Next under TP: forwards with at least this many tokens
+    # (eager prefill) keep the hyper-connection residual streams token-sharded
+    # across the TP ranks (reduce-scatter + all-gather instead of all-reduce),
+    # so the replicated HC norm/GEMM work is split TP ways. 0 disables.
+    "ATOM_QWEN4_EXP_SP_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_QWEN4_EXP_SP_MIN_TOKENS", "1024")
+    ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
