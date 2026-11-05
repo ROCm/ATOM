@@ -157,6 +157,7 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
+    s._prefetch = None
     s.kv_connector = conn
     s._local_prefill_coalescing = False
     s._connector_flag = lambda name: getattr(conn, name, False)
@@ -227,39 +228,6 @@ def test_session_outlives_an_unanswered_fire_and_forget_lookup(monkeypatch):
     kinds = [k for k, _ in events]
     assert kinds == ["free", "end"], events
     assert "7" not in sched._pending_session_ends()
-
-
-def test_a_late_save_token_prefix_is_dropped_when_the_session_ends(monkeypatch):
-    """A save emitted after `request_finished` re-creates the shipped-token
-    state the finish already dropped; ending the session drops it again, so
-    the workers' token cache cannot keep a finished request's prefix."""
-    sched, _client, adapter = _scheduler(monkeypatch, lookup_done=True)
-    adapter.end_session = lambda rid: None
-    seq = _seq()
-    sched._ship_tokens(seq, 32)
-    sched.request_finished(seq)
-    assert 7 not in sched._shipped_tokens
-    assert sched._shipped_drops == [7]
-    sched._shipped_drops = []
-
-    sched._ship_tokens(seq, 64)  # the late save
-    assert 7 in sched._shipped_tokens
-    sched._pending_session_ends()["7"] = seq
-    sched._end_finished_sessions()
-    assert 7 not in sched._shipped_tokens
-    assert sched._shipped_drops == [7]
-
-    # The drop alone keeps an idle engine stepping the connector, and the
-    # next metadata build ships it to the workers even with no transfer.
-    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
-
-    assert sched.has_pending_work()
-    meta = sched.build_connector_meta()
-    assert not meta.requests
-    assert meta.token_cache_drops == [7]
-    assert connector_metadata_has_work(meta)
-    assert not sched.__dict__.get("_shipped_drops")
-    assert not sched.has_pending_work()
 
 
 # ── review findings (#2547) ──────────────────────────────────────────────
@@ -529,6 +497,7 @@ def test_a_declined_detach_turns_the_request_back_to_the_ordinary_path(monkeypat
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
+    s._prefetch = None
     s.kv_connector = conn = _Conn()
     s._connector_flag = lambda name: getattr(conn, name, False)
     s.block_manager = SimpleNamespace(state_offload=None)
@@ -554,6 +523,7 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
         return 2
 
     s = Scheduler.__new__(Scheduler)
+    s._prefetch = None
     s.kv_connector = _Conn()
     s._local_prefill_coalescing = False
     s.block_manager = SimpleNamespace(hash_block_size=4, can_allocate=can_allocate)

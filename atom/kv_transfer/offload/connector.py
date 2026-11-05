@@ -163,12 +163,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
         if callable(callback):
             callback()
 
-    def release_deferred_events(self) -> None:
-        """Forward safe-point reclamation when the backend owns IPC events."""
-        callback = getattr(self._impl, "release_deferred_events", None)
-        if callable(callback):
-            callback()
-
     def close(self) -> None:
         """Join the impl's save/load executors at worker teardown.
 
@@ -229,16 +223,21 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         """The tier's transfer granule in tokens; 0 when the impl has none."""
         return int(getattr(self._impl, "chunk_size", 0) or 0)
 
+    @property
+    def supports_async_lookup(self) -> bool:
+        return bool(getattr(self._impl, "supports_async_lookup", False))
+
     def lookup_ready(self, seq) -> bool:
-        callback = getattr(self._impl, "lookup_ready", None)
-        return bool(callback(seq)) if callable(callback) else False
+        return self._impl.lookup_ready(seq)
+
+    def take_ready_lookup(self, seq) -> bool:
+        return self._impl.take_ready_lookup(seq)
+
+    def release_taken_lookup(self, seq) -> None:
+        self._impl.release_taken_lookup(seq)
 
     def cancel_preadmission(self, seq) -> None:
-        callback = getattr(self._impl, "cancel_preadmission", None)
-        if callable(callback):
-            callback(seq)
-        else:
-            self._impl.cancel_pending_load(seq)
+        self._impl.cancel_preadmission(seq)
 
     def can_detach_lookup(self, seq, num_hbm_tokens: int) -> bool:
         callback = getattr(self._impl, "can_detach_lookup", None)

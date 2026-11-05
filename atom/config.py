@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
     checkpoint_layer_key,
     unquantized_layer_keys,
@@ -2038,6 +2039,10 @@ class Config:
     # --no-encoder-swa-bounded-replay keeps checkpoints. No effect on other models.
     enable_encoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
+    # Prefill admission (`--prefill-admit-policy`): "interval" keeps
+    # ATOM_PREFILL_DECODE_INTERVAL and the coalescer; "adaptive" replaces both
+    # with the rent-or-buy rule in prefill_delayer.py.
+    prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
@@ -2115,12 +2120,22 @@ class Config:
     master_addr: str = "127.0.0.1"
     enable_dp_attention: bool = False
     # DP request-routing strategy used by CoreManager to pick an engine rank:
-    # "round_robin" | "least_requests" (default) | "least_tokens". Only has an
-    # effect when more than one DP engine rank is launched. See
-    # atom/model_engine/engine_core_mgr.py:_select_dp_rank_locked. The literal
+    # "round_robin" | "least_requests" (default) | "least_tokens" |
+    # "prefix_spread". Only has an effect when more than one DP engine rank is
+    # launched. See atom/model_engine/engine_core_mgr.py:_select_dp_rank_locked
+    # and, for "prefix_spread", atom/model_engine/prefix_spread.py. The literal
     # default must stay in sync with engine_core_mgr.DP_LB_DEFAULT (config.py
     # cannot import it without a cycle: engine_core_mgr imports Config).
     dp_load_balance: str = "least_requests"
+    # Offload prefetch (`atom/model_engine/offload_prefetch.py`): start a
+    # waiting request's tier load before its turn (`--offload-prefetch`).
+    # Unset (None): on with prefix-spread DP routing when the configured
+    # connector answers tier lookups asynchronously
+    # (`OffloadTierProfile.async_lookup`).
+    offload_prefetch: bool | None = None
+    # No prefetch allocation once it would take the KV pool past this
+    # fraction in use.
+    offload_prefetch_max_kv_usage: float = 0.8
     # MoE expert-parallel layout policy. When True, MoE EP computes ranks in the
     # flattened DP x TP device space (and shared-expert fusion is disabled,
     # because the fused shared expert assumes the per-DP MoE layout). The vLLM
@@ -2306,6 +2321,13 @@ class Config:
             )
             self.enable_tbo = False
             self.enable_tbo_decode = False
+
+        self.prefill_admit_policy = self.prefill_admit_policy.strip().lower()
+        if self.prefill_admit_policy not in PREFILL_ADMIT_POLICIES:
+            raise ValueError(
+                f"prefill_admit_policy must be one of {PREFILL_ADMIT_POLICIES}, "
+                f"got {self.prefill_admit_policy!r}"
+            )
 
         self.moe_backend = self.moe_backend.strip().lower()
         if self.moe_backend not in ("standard", "mega"):
@@ -2570,6 +2592,20 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        if self.offload_prefetch is None:
+            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+            # Measured only under prefix-spread routing, which moves requests
+            # onto ranks that must load their prefix: on there by default.
+            self.offload_prefetch = (
+                self.dp_load_balance == "prefix_spread"
+                and KVConnectorFactory.offload_tier(self).async_lookup
+            )
+        if not 0.0 < self.offload_prefetch_max_kv_usage <= 1.0:
+            raise ValueError(
+                "offload_prefetch_max_kv_usage must be in (0, 1], got "
+                f"{self.offload_prefetch_max_kv_usage}"
+            )
         # After the parse above: the P/D clause reads `kv_role` off
         # `kv_transfer_config`, which arrives from the CLI as a string.
         self._resolve_throughput_step_interval()

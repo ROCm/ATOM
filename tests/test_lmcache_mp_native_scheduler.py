@@ -2,7 +2,6 @@
 
 """Native-state MP admission and PAGE-image lifetime contracts."""
 
-from collections import deque
 from types import SimpleNamespace
 from weakref import WeakKeyDictionary
 
@@ -35,6 +34,19 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Replay, Sequence, SequenceStatus, SequenceType
 from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+
+
+def _shipped_tokens(req):
+    """The token ids a worker hands the transfer for `req` (a request's first
+    shipment carries its whole prefix: `token_shipping.WorkerTokens`)."""
+    import copy
+    from types import SimpleNamespace as _NS
+
+    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
+
+    meta = _NS(requests=[copy.copy(req)])
+    WorkerTokens().resolve(meta)
+    return meta.requests[0].token_ids
 
 
 @pytest.fixture(autouse=True)
@@ -202,7 +214,7 @@ def test_save_uses_ready_native_hash_and_never_copies_active_slot(monkeypatch):
     assert request.native_state.boundary_tokens == 16
     assert request.native_state.unit_ids == image.unit_ids
     assert request.native_state.destination_slot is None
-    assert request.token_ids == list(seq.token_ids[:16])
+    assert _shipped_tokens(request) == list(seq.token_ids[:16])
     assert request.save_spec.skip_leading_tokens == 0
     assert checkpoints.take_checkpoint_ops() == ((), ())
     checkpoints.clear_index()
@@ -238,7 +250,7 @@ def test_save_frontier_selects_existing_checkpoint_below_computed_tokens(monkeyp
     checkpoint(scheduler, checkpoints, seq, 8)
     scheduler.update_state_after_alloc(seq)
     [request] = scheduler.build_connector_meta().requests
-    assert len(request.token_ids) == 8
+    assert len(_shipped_tokens(request)) == 8
     assert request.native_state.boundary_tokens == 8
     assert scheduler._save_tracker["1"][1] == 8
 
@@ -461,7 +473,7 @@ def test_load_queries_safe_chunk_boundary_before_reserving_state(monkeypatch, pr
     assert request.native_state.destination_slot == seq.state_slot
     assert request.load_spec.lmcache_cached_tokens == expected
     assert request.load_spec.transfer_end_tokens is None
-    assert request.token_ids == list(seq.token_ids[:expected])
+    assert _shipped_tokens(request) == list(seq.token_ids[:expected])
     assert (
         scheduler.load_finished(LoadOperationId(seq.id, operation.generation + 1))
         is False
@@ -485,7 +497,7 @@ def test_aligned_hbm_hit_uses_incremental_native_restore(monkeypatch):
     [request] = scheduler.build_connector_meta().requests
     assert request.load_spec.hbm_cached_tokens == 8
     assert request.load_spec.lmcache_cached_tokens == 16
-    assert request.token_ids == list(seq.token_ids[:16])
+    assert _shipped_tokens(request) == list(seq.token_ids[:16])
     assert seq.offload_load_start_tokens == 8
     assert checkpoints.store.pool.num_free == 27
 
@@ -594,10 +606,7 @@ def test_save_admission_returns_lease_when_it_raises(monkeypatch):
     def boom(*_args, **_kwargs):
         raise RuntimeError("request construction failed")
 
-    from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
-
     monkeypatch.setattr(ChunkedOffloadSchedulerBase, "_build_save_request", boom)
-    monkeypatch.setattr(LMCacheMPConnectorScheduler, "_build_save_request", boom)
     with pytest.raises(RuntimeError, match="request construction failed"):
         scheduler.build_connector_meta()
     assert scheduler._native_saves == {}
@@ -980,7 +989,7 @@ def _woken(engine, seq):
     engine._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_loading={request.load_operation})
     )
-    assert engine._resolve_waiting_remote_kv(seq, deque()) is False
+    assert engine._resolve_offload_load(seq) is None
     assert seq.status == SequenceStatus.WAITING and seq.replays_hit
     assert seq.num_cached_tokens == 32
 
@@ -1044,7 +1053,7 @@ def test_engine_unaligned_hbm_hit_replays_without_a_load(monkeypatch):
     assert list(batch.num_cached_tokens) == [12 - _REPLAY]
 
 
-# -- early tier load (ATOM_OFFLOAD_EARLY_LOAD) on the native-state engine ------
+# -- offload prefetch on the native-state engine ----------------------------
 
 
 class _EarlyDelayer:
@@ -1053,9 +1062,9 @@ class _EarlyDelayer:
     is_local = False
     max_queue_ms = None
     kv_high_watermark = 0.9
-    rank_prefill_costs = []
 
     def __init__(self):
+        self.rank_prefill_costs = []
         self.allow = False
 
     def protects_decode(self, running_decode_batch):
@@ -1092,11 +1101,11 @@ def _async_adapter(chunks, base=Adapter):
 
 
 def _holding_engine(monkeypatch, adapter, **overrides):
-    monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD", "1")
-    # A 40-block pool: the default 15% cap would not fit one prompt.
-    monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", "0.9")
-    monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK", "0.95")
-    engine, connector, _ = engine_scheduler(monkeypatch, adapter=adapter, **overrides)
+    engine, connector, _ = engine_scheduler(
+        monkeypatch, adapter=adapter, offload_prefetch=True, **overrides
+    )
+    # A 40-block pool: the default watermark would not fit one prompt.
+    engine._prefetch.max_kv_usage = 0.95
     delayer = _EarlyDelayer()
     engine.set_prefill_delayer(delayer)
     return engine, connector, delayer
@@ -1107,12 +1116,10 @@ def _until_parked(engine, seq, ticks=6):
         batch, scheduled = engine.schedule()
         if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
             return batch, scheduled
-    raise AssertionError(
-        f"never parked {dict(engine._early_load.skips)} {engine._early_load.settled}"
-    )
+    raise AssertionError(f"never parked: skipped={engine._prefetch.skip_until}")
 
 
-def test_early_load_page_only_replay_parks_on_a_hold_tick_and_prefills_on_fire(
+def test_prefetch_page_only_replay_parks_on_a_hold_tick_and_prefills_on_fire(
     monkeypatch,
 ):
     """PAGE-only + bounded replay (DeepSeek-V4): the KV-only load is submitted on
@@ -1138,14 +1145,14 @@ def test_early_load_page_only_replay_parks_on_a_hold_tick_and_prefills_on_fire(
     [request] = batch.connector_meta_output.requests  # shipped with this tick
     assert request.native_state.kv_only and not request.native_state.unit_ids
     assert request.native_state.boundary_tokens == 32
-    assert engine._early_load.submitted == 1
+    assert seq.id in engine._prefetch.entries
 
     engine._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_loading={request.load_operation})
     )
     batch, scheduled = engine.schedule()  # loaded, still HOLD: no prefill
     assert scheduled == {}
-    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert seq.status == SequenceStatus.WAITING and seq.offload_loaded
 
     delayer.allow = True
     batch, scheduled = engine.schedule()
@@ -1153,65 +1160,4 @@ def test_early_load_page_only_replay_parks_on_a_hold_tick_and_prefills_on_fire(
     assert seq.replay == Replay(32, True, (), 32 - _REPLAY)
     assert list(batch.num_cached_tokens) == [32 - _REPLAY]
     assert engine._num_parked_remote_kv == 0
-    assert seq.id not in engine._early_load.entries
-
-
-def test_early_load_waits_for_an_answered_lookup(monkeypatch):
-    """No answer yet (the server has not acked): nothing is allocated, and the
-    engine does not block on a synchronous lookup."""
-    adapter = _async_adapter(4, _ReachAdapter)(32)
-    adapter._client.lookup_future.done = False
-    engine, _, _ = _holding_engine(monkeypatch, adapter, state_replay_tokens=_REPLAY)
-    seq = Sequence(list(range(40)), 4, has_per_req_cache=True)
-    engine.add(seq)
-
-    for _ in range(4):
-        engine.schedule()
-
-    assert seq.status == SequenceStatus.WAITING and not seq.block_table
-    assert engine._early_load.skips["lookup_not_ready"] == 1
-    assert len(adapter._client.lookups) == 1  # one async lookup, no sync ones
-    adapter._client.lookup_future.done = True
-    _until_parked(engine, seq)
-
-
-def test_early_load_state_image_load_follows_the_state_flag(monkeypatch):
-    """Without a replay the load carries a state image. Off by default for it
-    (ATOM_OFFLOAD_EARLY_LOAD_STATE=0): the request waits for its admission
-    pass. On: it is parked early exactly as the admission pass would."""
-    for flag, early in (("0", False), ("1", True)):
-        monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD_STATE", flag)
-        adapter = _async_adapter(2)()
-        engine, _, delayer = _holding_engine(monkeypatch, adapter)
-        seq = Sequence(list(range(24)), 4, has_per_req_cache=True)
-        engine.add(seq)
-        for _ in range(4):
-            engine.schedule()
-        assert (seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS) is early
-        if early:
-            assert seq.state_slot >= 0 and len(seq.block_table) == 6
-        else:
-            assert not seq.block_table
-            delayer.allow = True  # a FIRE then parks it the old way
-            engine.schedule()
-            assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-
-
-def test_early_load_abort_gives_the_native_load_back(monkeypatch):
-    adapter = _async_adapter(4, _ReachAdapter)(32)
-    engine, _, _ = _holding_engine(monkeypatch, adapter, state_replay_tokens=_REPLAY)
-    free = engine.block_manager.kv.num_free
-    seq = Sequence(list(range(40)), 4, has_per_req_cache=True)
-    engine.add(seq)
-    batch, _ = _until_parked(engine, seq)
-    [request] = batch.connector_meta_output.requests
-
-    assert engine.abort_request(seq.id)
-    engine._update_from_kv_xfer_finished(
-        KVConnectorOutput(finished_loading={request.load_operation})
-    )
-    engine.schedule()
-
-    assert engine._num_parked_remote_kv == 0
-    assert not engine._early_load.entries
-    assert engine.block_manager.kv.num_free == free
+    assert seq.id not in engine._prefetch.entries

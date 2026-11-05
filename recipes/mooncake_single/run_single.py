@@ -19,8 +19,16 @@ assert len(cfg['gpus'])==4 and len(set(cfg['gpus']))==4,'four distinct GPU IDs r
 assert a.l1_gib>0 and a.store_gib>0 and a.buffer_gib>0
 mp_port=a.port+300
 out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
-env={k:v for k,v in os.environ.items() if not k.startswith('MORI_')}
-env.update(ATOM_DISABLE_MORI_EP='1',ATOM_ENABLE_METRICS_REQUEST_CONTEXT='0',HIP_VISIBLE_DEVICES=','.join(map(str,cfg['gpus'])),ATOM_HOST_IP=a.ip,NCCL_IB_DISABLE='1',ATOM_DISABLE_MMAP='true',AITER_LOG_LEVEL='WARNING',OMP_NUM_THREADS='4',ATOM_DSPARK_DISABLE_COMPILE='1',ATOM_MONO_ENABLE='0',PYTHONFAULTHANDLER='1',PYTHONDONTWRITEBYTECODE='1',MC_DISABLE_HIP='1',ATOM_ENABLE_METRICS_DEVICE_TIMER='1',PYTHONUNBUFFERED='1',ATOM_DP_SESSION_AFFINITY='1',ATOM_DP_PREFIX_SPREAD='1',ATOM_DP_PREFIX_POLICY='idle_ratio',ATOM_DP_PREFIX_IDLE_TOKENS='32768',ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS='65536',ATOM_DP_PREFIX_RATIO='0',ATOM_DP_PREFIX_SIMILAR_TOKENS='16384',ATOM_OFFLOAD_EARLY_LOAD='1',ATOM_USE_CUSTOM_ALL_GATHER='0')
+# Do not inherit the old experimental routing switches or session affinity.
+legacy_routing_env = {
+    'ATOM_DP_SESSION_AFFINITY', 'ATOM_DP_PREFIX_SPREAD',
+    'ATOM_DP_PREFIX_POLICY', 'ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS',
+    'ATOM_DP_PREFIX_RATIO', 'ATOM_DP_PREFIX_SIMILAR_TOKENS',
+    'ATOM_OFFLOAD_EARLY_LOAD',
+}
+env={k:v for k,v in os.environ.items()
+     if not k.startswith('MORI_') and k not in legacy_routing_env}
+env.update(ATOM_DISABLE_MORI_EP='1',ATOM_ENABLE_METRICS_REQUEST_CONTEXT='0',HIP_VISIBLE_DEVICES=','.join(map(str,cfg['gpus'])),ATOM_HOST_IP=a.ip,NCCL_IB_DISABLE='1',ATOM_DISABLE_MMAP='true',AITER_LOG_LEVEL='WARNING',OMP_NUM_THREADS='4',ATOM_DSPARK_DISABLE_COMPILE='1',ATOM_MONO_ENABLE='0',PYTHONFAULTHANDLER='1',PYTHONDONTWRITEBYTECODE='1',MC_DISABLE_HIP='1',ATOM_ENABLE_METRICS_DEVICE_TIMER='1',PYTHONUNBUFFERED='1',ATOM_DP_PREFIX_IDLE_TOKENS='32768',ATOM_USE_CUSTOM_ALL_GATHER='0')
 requested_stop=False;children=[];reason=None
 def stop(sig,frame):
     global requested_stop
@@ -54,7 +62,7 @@ try:
     api=cfg["api"]
     pc=["-tp","4","--data-parallel-master-ip",a.ip,"--data-parallel-master-port",str(cfg["dp_master"]),"--data-parallel-base-port",str(cfg["dp_base"])]
     seqs,tokens=(64,16384) if a.role=="prefill" else (64,1024)
-    cmd=["python3","-m","atom.entrypoints.openai_server","--model",a.model,"--trust-remote-code",*pc,"--enable-dp-attention","--moe-backend","standard","--all2all-backend","none","--dp-load-balance","least_requests","--server-port",str(api),"--kv_cache_dtype","bf16","--index-cache-dtype","fp8","--gpu-memory-utilization",str(a.gpu_util),"--max-num-seqs",str(seqs),"--max-num-batched-tokens",str(tokens),"--attn-prefill-chunk-size","16384","--enable_prefix_caching","--block-size","16","--state-checkpoint-interval-tokens","8192","--level","3","--cudagraph-mode","FULL","--cudagraph-capture-sizes","[1,2,4,8,16,24,32,40,48,64]","--method","dspark","--num-speculative-tokens","5","--tool-call-parser","dsml_v41","--kv-transfer-config",json.dumps({"kv_role":"offload","kv_connector":"lmcache_mp"})]
+    cmd=["python3","-m","atom.entrypoints.openai_server","--model",a.model,"--trust-remote-code",*pc,"--enable-dp-attention","--moe-backend","standard","--all2all-backend","none","--dp-load-balance","prefix_spread","--server-port",str(api),"--kv_cache_dtype","bf16","--index-cache-dtype","fp8","--gpu-memory-utilization",str(a.gpu_util),"--max-num-seqs",str(seqs),"--max-num-batched-tokens",str(tokens),"--attn-prefill-chunk-size","16384","--enable_prefix_caching","--block-size","16","--state-checkpoint-interval-tokens","8192","--level","3","--cudagraph-mode","FULL","--cudagraph-capture-sizes","[1,2,4,8,16,24,32,40,48,64]","--method","dspark","--num-speculative-tokens","5","--tool-call-parser","dsml_v41","--kv-transfer-config",json.dumps({"kv_role":"offload","kv_connector":"lmcache_mp"})]
     k = cmd.index("--kv-transfer-config"); del cmd[k:k+2]
     (out/"launch.json").write_text(json.dumps({"command":cmd,"environment":{k:v for k,v in env.items() if k.startswith(("ATOM","MORI","NCCL","LMCACHE","OFFLOAD","HIP","MC_","GLOO"))},"role":a.role,"rank_start":a.rank_start,"start_utc":datetime.datetime.now(datetime.timezone.utc).isoformat()},indent=2))
     child=start("engine",cmd)

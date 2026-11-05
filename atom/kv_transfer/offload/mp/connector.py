@@ -12,7 +12,6 @@ architecture string participates in the decision.
 
 from __future__ import annotations
 
-import array
 from copy import copy
 from typing import Any
 
@@ -25,6 +24,7 @@ from atom.kv_transfer.offload._offload_common import validated_kv_role
 from atom.kv_transfer.offload.mp import deployment
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
+from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
 
 
 def _publishes_native_state(transfer_tensors: Any) -> bool:
@@ -92,6 +92,9 @@ class LMCacheMPConnector(KVConnectorBase):
         validated_kv_role(getattr(config, "kv_transfer_config", {}) or {})
         self._config = config
         self._impl: KVConnectorBase | None = None
+        # Each request's token prefix, rebuilt from incremental shipments
+        # (`token_shipping.py`).
+        self._tokens = WorkerTokens()
 
     def _require_impl(self) -> KVConnectorBase:
         if self._impl is None:
@@ -152,34 +155,8 @@ class LMCacheMPConnector(KVConnectorBase):
         if self._impl is not None:
             self._impl.close()
 
-    def _resolve_shipped_tokens(self, metadata: Any) -> None:
-        """Rebuild each request's token prefix from incremental shipping."""
-        cache = self.__dict__.setdefault("_token_cache", {})
-        for req_id in getattr(metadata, "token_cache_drops", None) or ():
-            cache.pop(req_id, None)
-        for req in getattr(metadata, "requests", None) or ():
-            base = getattr(req, "token_base", -1)
-            if base is None or base < 0:
-                continue
-            tokens = cache.get(req.req_id)
-            if tokens is None:
-                tokens = cache[req.req_id] = array.array("q")
-            if len(tokens) > base:
-                # The scheduler restarted this request's shipping (a late save
-                # after a drop that has not reached us yet). A request's
-                # tokens are a fixed prompt, so its prefix is unchanged.
-                del tokens[base:]
-            if len(tokens) != base:
-                raise RuntimeError(
-                    f"LMCache MP token cache for {req.req_id!r} holds "
-                    f"{len(tokens)} tokens, the scheduler shipped from {base}"
-                )
-            tokens.extend(req.token_ids)
-            req.token_ids = tokens[: req.token_end].tolist()
-            req.token_base = -1
-
     def start_load_kv(self, metadata: Any) -> None:
-        self._resolve_shipped_tokens(metadata)
+        self._tokens.resolve(metadata)
         self._require_impl().start_load_kv(metadata)
 
     def get_finished(self) -> KVConnectorOutput:
@@ -272,16 +249,21 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
         pending = getattr(self._require_impl(), "lookup_pending", None)
         return bool(pending(seq)) if callable(pending) else False
 
+    @property
+    def supports_async_lookup(self) -> bool:
+        return bool(getattr(self._require_impl(), "supports_async_lookup", False))
+
     def lookup_ready(self, seq: Any) -> bool:
-        ready = getattr(self._require_impl(), "lookup_ready", None)
-        return bool(ready(seq)) if callable(ready) else False
+        return self._require_impl().lookup_ready(seq)
+
+    def take_ready_lookup(self, seq: Any) -> bool:
+        return self._require_impl().take_ready_lookup(seq)
+
+    def release_taken_lookup(self, seq: Any) -> None:
+        self._require_impl().release_taken_lookup(seq)
 
     def cancel_preadmission(self, seq: Any) -> None:
-        cancel = getattr(self._require_impl(), "cancel_preadmission", None)
-        if callable(cancel):
-            cancel(seq)
-        else:
-            self._require_impl().cancel_pending_load(seq)
+        self._require_impl().cancel_preadmission(seq)
 
     def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
         check = getattr(self._require_impl(), "can_detach_lookup", None)

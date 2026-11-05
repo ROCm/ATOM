@@ -41,6 +41,19 @@ from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
 
 
+def _shipped_tokens(req):
+    """The token ids a worker hands the transfer for `req` (a request's first
+    shipment carries its whole prefix: `token_shipping.WorkerTokens`)."""
+    import copy
+    from types import SimpleNamespace as _NS
+
+    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
+
+    meta = _NS(requests=[copy.copy(req)])
+    WorkerTokens().resolve(meta)
+    return meta.requests[0].token_ids
+
+
 def _config(
     *,
     model_type: str = "test_model",
@@ -795,7 +808,7 @@ def test_full_prompt_hit_loads_to_the_chunk_boundary_below_the_last_token(monkey
 
     scheduler.update_state_after_alloc(seq)
     request = scheduler.build_connector_meta().requests[0]
-    assert request.token_ids == list(range(8))
+    assert _shipped_tokens(request) == list(range(8))
     assert request.load_spec.lmcache_cached_tokens == 4
     assert request.load_spec.transfer_end_tokens == 8
     assert seq.offload_loaded_tokens == 4
@@ -1057,36 +1070,6 @@ def _worker(adapter: _WorkerAdapter) -> mp_worker.LMCacheMPConnector:
     return worker
 
 
-def test_completed_device_event_survives_adapter_future_pruning():
-    import gc
-
-    from atom.kv_transfer.offload.mp.event_reclaimer import IPCEventReclaimer
-
-    destroyed = []
-
-    class Event:
-        def __del__(self):
-            destroyed.append(True)
-
-    adapter = _WorkerAdapter()
-    worker = _worker(adapter)
-    worker._event_reclaimer = IPCEventReclaimer()
-    future = _WorkerFuture()
-    future.ready = True
-    future.event_ = Event()
-    worker._pending_loads["load:test"] = transfer._PendingLoad(
-        completion="test", future=future
-    )
-    assert worker.get_finished().finished_loading == {"test"}
-    # LMCache may retain a finished future until the next submission; its
-    # destruction there must enqueue the IPC event, not synchronize the GPU.
-    del future
-    gc.collect()
-    assert destroyed == []
-    worker._event_reclaimer.release()
-    assert destroyed == [True]
-
-
 def test_close_unregisters_the_worker_once(monkeypatch):
     """`ModelRunner.exit` closes the connector before the KV pool is freed.
 
@@ -1288,11 +1271,9 @@ def test_worker_unhealthy_preserves_pending_until_device_futures_are_terminal(
     assert worker._pending_saves == {}
 
 
-@pytest.mark.parametrize("ipc_reclamation", [False, True])
 def test_worker_pre_submit_drops_are_immediately_terminal(
     fake_lmcache_modules,
     monkeypatch,
-    ipc_reclamation,
 ):
     adapter = _WorkerAdapter()
     monkeypatch.setattr(
@@ -1306,12 +1287,6 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
         lambda _request_id, _op, _event: None,
     )
     worker = _worker(adapter)
-    ready_event = object()
-    if ipc_reclamation:
-        from atom.kv_transfer.offload.mp.event_reclaimer import IPCEventReclaimer
-
-        worker._event_reclaimer = IPCEventReclaimer()
-        ready_event = worker._event_reclaimer.acquire_ready_event(object)
     load_operation = LoadOperationId(req_id=14, generation=1)
     save_operation = SaveOperationId(req_id=15, generation=1)
     worker._submit_load(
@@ -1322,7 +1297,7 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
             load_spec=LoadSpec(0, 8, can_load=True),
             load_operation=load_operation,
         ),
-        ready_event,
+        object(),
     )
     worker._submit_save(
         LMCacheReqMeta(
@@ -1332,7 +1307,7 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
             save_spec=SaveSpec(skip_leading_tokens=0),
             save_operation=save_operation,
         ),
-        ready_event,
+        object(),
     )
 
     output = worker.get_finished()
@@ -1341,10 +1316,6 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
     assert output.finished_saving == {save_operation}
     assert worker._pending_loads == {}
     assert worker._pending_saves == {}
-    if ipc_reclamation:
-        # Both transfers are terminal: the next batch retires the event.
-        worker._event_reclaimer.acquire_ready_event(object)
-        assert ready_event in worker._event_reclaimer._retired
 
 
 def _unprovable_request(kind: str) -> LMCacheReqMeta:
@@ -2085,63 +2056,125 @@ def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
     assert target.tp_replication_factor == 1
 
 
-def _incremental_pair():
+# -- incremental token shipping (`token_shipping.py`) ------------------------
+
+
+def _shipping_pair():
     from atom.kv_transfer.offload.mp.connector import LMCacheMPConnector
     from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
 
-    return (
-        LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler),
-        LMCacheMPConnector.__new__(LMCacheMPConnector),
+    sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
+    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
+
+    shell = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    shell._tokens = WorkerTokens()
+    received = []
+    shell._impl = SimpleNamespace(
+        start_load_kv=lambda meta: received.extend(r.token_ids for r in meta.requests)
     )
+    return sched, shell, received
 
 
-def _ship_save(sched, worker, seq, end, drops=False):
+def _send(shell, *reqs):
+    import pickle
+
     from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
 
-    req = sched._build_save_request(seq, 0, end, None, [0], False)
+    meta = LMCacheOffloadMetadata()
+    meta.requests = list(reqs)
+    shell.start_load_kv(pickle.loads(pickle.dumps(meta)))
+
+
+def test_incremental_tokens_round_trip_through_the_worker_shell():
+    """A load, growing saves, a shorter transfer after a longer one, and an id
+    reused after its drop: each transfer hands the worker exactly its prefix,
+    while only tokens past what the workers hold travel, as raw bytes."""
+    import array
+    import pickle
+
+    from atom.kv_transfer.offload.mp.token_shipping import ShippedTokens
+
+    sched, shell, received = _shipping_pair()
+    seq = SimpleNamespace(
+        id=7, token_ids=array.array("i", range(1000)), block_table=[0]
+    )
+    load = sched._build_load_request(seq, LoadSpec(0, 256, can_load=True), None, 256)
+    assert isinstance(load.token_ids, ShippedTokens)
+    assert isinstance(load.token_ids.tokens, array.array)
+    _send(shell, load)
+    sizes = []
+    for end in (512, 768, 512, 1000):
+        save = sched._build_save_request(seq, 0, end, None, [0], False)
+        sizes.append(len(save.token_ids.tokens))
+        _send(shell, save)
+    assert sizes == [256, 256, 0, 232]
+    assert [len(t) for t in received] == [256, 512, 768, 512, 1000]
+    assert all(t == list(range(len(t))) for t in received)
+    assert all(type(t) is list for t in received)
+    # Raw bytes on the wire, not a pickled list of ints.
+    assert len(pickle.dumps(save.token_ids)) < 232 * 4 + 200
+
+    # The session ends; the drop rides on the next shipment, here a reused id.
+    sched._token_shipper.drop(7, seq)
+    other = SimpleNamespace(
+        id=7, token_ids=array.array("i", range(5000, 5600)), block_table=[0]
+    )
+    save = sched._build_save_request(other, 0, 600, None, [0], False)
+    assert save.token_ids.drops == (7,) and save.token_ids.base == 0
+    _send(shell, save)
+    assert received[-1] == list(range(5000, 5600))
+
+
+def test_a_reused_id_restarts_its_copy_and_a_late_drop_spares_it():
+    import array
+
+    sched, _shell, _ = _shipping_pair()
+    old = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
+    new = SimpleNamespace(id=7, token_ids=array.array("i", range(100, 164)))
+    shipper = sched._token_shipper
+    assert shipper.ship(old, 32).base == 0
+    shipped = shipper.ship(new, 32)  # reused id: old's copy goes first
+    assert shipped.base == 0 and shipped.drops == (7,)
+    shipper.drop(7, old)  # old's session ends late: new's copy stays
+    assert shipper.ship(new, 64).base == 32
+
+
+def test_incremental_tokens_desync_raises():
+    from atom.kv_transfer.offload.mp.token_shipping import ShippedTokens
+
+    _, shell, _ = _shipping_pair()
+    req = SimpleNamespace(req_id=7, token_ids=ShippedTokens(50, 52, [1, 2]))
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
     meta = LMCacheOffloadMetadata()
     meta.requests = [req]
-    if drops:
-        meta.token_cache_drops = sched._shipped_drops
-        sched._shipped_drops = []
-    worker._resolve_shipped_tokens(meta)
-    return req
+    with pytest.raises(RuntimeError, match="shipped from 50"):
+        shell.start_load_kv(meta)
 
 
-def test_incremental_token_shipping_roundtrip():
-    """Saves ship only new tokens; the worker rebuilds each prefix exactly."""
-    import types
+def test_the_session_end_drops_the_workers_copy(monkeypatch):
+    """`_end_finished_sessions` is where no save can follow: it drops the
+    request's shipped prefix, and only then."""
+    import array
 
-    sched, worker = _incremental_pair()
-    seq = types.SimpleNamespace(id=7, token_ids=list(range(1000)), block_table=[0])
-    shipped = []
-    for end in (256, 512, 512, 1000):
-        before = sched.__dict__.get("_shipped_tokens", {}).get(7, (None, 0))[1]
-        req = _ship_save(sched, worker, seq, end)
-        shipped.append(sched._shipped_tokens[7][1] - before)
-        assert req.token_ids == list(range(end))
-    assert shipped == [256, 256, 0, 488]
-    sched._drop_shipped_tokens(7)
-    assert _ship_save(sched, worker, seq, 300, drops=True).token_ids == list(range(300))
+    from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
 
-
-def test_incremental_tokens_restart_from_zero_resets_worker_cache():
-    import types
-
-    sched, worker = _incremental_pair()
-    seq = types.SimpleNamespace(id=9, token_ids=list(range(800)), block_table=[0])
-    _ship_save(sched, worker, seq, 512)
-    sched._shipped_tokens.clear()  # the drop has not reached the worker
-    assert _ship_save(sched, worker, seq, 256).token_ids == list(range(256))
-    assert _ship_save(sched, worker, seq, 800).token_ids == list(range(800))
-
-
-def test_token_cache_drops_alone_are_dispatchable_work():
-    """A drop must reach the workers even when no transfer runs this step."""
-    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
-    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-
-    meta = LMCacheOffloadMetadata()
-    assert not connector_metadata_has_work(meta)
-    meta.token_cache_drops = [7]
-    assert connector_metadata_has_work(meta)
+    sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
+    seq = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
+    sched._token_shipper.ship(seq, 32)
+    sched._lookup_client = SimpleNamespace()
+    sched._save_tracker, sched._save_inflight = {}, {}
+    sched._mp_adapter = SimpleNamespace(end_session=lambda rid: None)
+    sched._config = SimpleNamespace()
+    monkeypatch.setattr(sched, "reconcile_detached_lookups", lambda: None)
+    monkeypatch.setattr(sched, "_pending_session_ends", lambda: {"7": seq})
+    monkeypatch.setattr(
+        "atom.kv_transfer.offload.mp.scheduler._mp_session_id", lambda c, i: str(i)
+    )
+    sched._save_inflight["7"] = object()  # a save is still in flight
+    sched._end_finished_sessions()
+    assert 7 in sched._token_shipper._shipped
+    del sched._save_inflight["7"]
+    sched._end_finished_sessions()
+    assert 7 not in sched._token_shipper._shipped
+    assert sched._token_shipper._drops == [7]

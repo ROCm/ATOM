@@ -578,6 +578,18 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self._reqs_need_save.clear()
         return meta
 
+    def cancel_preadmission(self, seq: Sequence) -> None:
+        """Undo the receive `update_state_after_alloc` queued for an admission
+        the scheduler refused before dispatch (under `multi`, an offload
+        sub's state load): its blocks are freed, so the receive must not run,
+        and the re-admission queues it again."""
+        entry = self._reqs_need_recv.get(seq.id)
+        if entry is None or entry[0] is not seq:
+            return
+        del self._reqs_need_recv[seq.id]
+        if seq.kv_transfer_params is not None:
+            seq.kv_transfer_params["do_remote_prefill"] = True
+
     def update_state_after_alloc(self, seq: Sequence) -> None:
         self._chunked_waiting.pop(seq.id, None)
         self._chunked_ready.discard(seq.id)

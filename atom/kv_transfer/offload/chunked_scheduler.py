@@ -32,6 +32,7 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
+
 DENSE_PAGE_SOURCE_SAFE_CHANNEL = "dense.page.source_safe"
 DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL = "dense.page.source_quiescent"
 DENSE_PAGE_STORE_CHANNEL = "dense.page.store"
@@ -446,38 +447,72 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._perf_bump("lookup_deferred")
         return True
 
-    def lookup_ready(self, seq) -> bool:
-        """Whether `seq`'s tier answer can be consumed without a round trip.
+    @property
+    def supports_async_lookup(self) -> bool:
+        """Whether the lookup client hands over an answered async lookup
+        (`take_answer`), so `take_ready_lookup` never waits."""
+        client = self._lookup_client
+        supported = getattr(client, "supports_async", None)
+        return (
+            self._do_load
+            and callable(getattr(client, "take_answer", None))
+            and callable(supported)
+            and bool(supported())
+        )
 
-        True when the answer is already held (`_lookup_results`) or its async
-        lookup has answered and waits to be consumed (submitted, no longer in
-        flight). `Scheduler._early_load_tier_prefixes` asks this so that it
-        never blocks the scheduler thread -- and with it every DP rank -- on a
-        synchronous lookup. It does not advance the lookup: call it after
-        `lookup_pending`, or after a lookup driver thread answered.
-        """
+    def lookup_ready(self, seq) -> bool:
+        """Whether `seq`'s tier answer can be consumed without a round trip:
+        already held (`_lookup_results`), or answered by its async lookup and
+        waiting to be consumed (`has_answer`; a failed lookup has no answer).
+        A peek for the offload prefetch, which takes the answer with
+        `take_ready_lookup`. It does not advance the lookup."""
         sid = str(seq.id)
         held = self._lookup_results.get(sid)
         if held is not None:
             return held[0] is seq
-        client = self._lookup_client
-        is_pending = getattr(client, "is_pending", None)
-        pending_ids = getattr(client, "pending_ids", None)
-        if not callable(is_pending) or not callable(pending_ids):
+        has_answer = getattr(self._lookup_client, "has_answer", None)
+        return callable(has_answer) and bool(has_answer(sid))
+
+    def take_ready_lookup(self, seq) -> bool:
+        """Take `seq`'s answered async lookup for its admission, as the
+        admission's own lookup would (`_fresh_tier_lookup`: the pin, the held
+        answer and the memo), if it has answered; never waits. The client
+        checks and consumes in one step (`take_answer`), so a driver thread
+        cannot expire the answer in between. True if the answer is now held,
+        so the admission's `get_num_new_matched_tokens` asks no round trip."""
+        if not self._do_load or not callable(
+            getattr(self._lookup_client, "take_answer", None)
+        ):
             return False
-        return sid in pending_ids() and not is_pending(sid)
+        # The admission's own preconditions (`_get_num_new_matched_tokens`).
+        self._begin_load_lifecycle(seq)
+        sid = str(seq.id)
+        held = self._lookup_results.get(sid)
+        if held is not None:
+            return held[0] is seq
+        if self._repeat_load_suppressed(seq, sid) or self._lookup_len(seq) <= 0:
+            return False
+        return self._take_tier_answer(seq, sid) is not None
+
+    def release_taken_lookup(self, seq) -> None:
+        """Give back an answer `take_ready_lookup` took for an admission that
+        did not happen: its read locks go now (`_release_lookup`), not when
+        Phase 2 reaches the request, which answers from the remembered hit
+        and re-takes the pin only for a load (`_ensure_lookup_pin`)."""
+        sid = str(seq.id)
+        held = self._lookup_results.get(sid)
+        if held is None or held[0] is not seq:
+            return
+        del self._lookup_results[sid]
+        self._release_lookup(sid)
 
     def cancel_preadmission(self, seq) -> None:
-        """Forget an admission the scheduler takes back before any dispatch.
-
-        `Scheduler._early_load_tier_prefixes` allocates and notifies this
-        connector like a normal admission, then hands the request back to
-        `waiting` when the outcome is not a load it can park for. Cancel its
-        pending load -- which also gives the lookup's read locks back
-        (`_clear_pending_load`) -- and drop the held answer, so the next
-        admission asks the tier again instead of reusing an answer nothing pins
-        (`_ensure_lookup_pin` trusts a held answer).
-        """
+        """Forget an admission the scheduler refused after notifying this
+        connector (`Admit.REQUEUE`). Cancel its pending load -- which also
+        gives the lookup's read locks back (`_clear_pending_load`) -- and drop
+        the held answer, so the next admission asks the tier again instead of
+        reusing an answer nothing pins (`_ensure_lookup_pin` trusts a held
+        answer)."""
         self.cancel_pending_load(seq)
         sid = str(seq.id)
         held = self._lookup_results.get(sid)
@@ -485,42 +520,82 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             del self._lookup_results[sid]
         self._forget_tier_hit(sid)
 
+    def _before_tier_lookup(self, sid: str) -> None:
+        """Run right before this request's lookup is asked or taken; a layout
+        that must give back an earlier lookup first overrides it."""
+
     def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
         """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
-
-        num_prompt = seq.num_prompt_tokens
         token_ids = self._lookup_token_ids(seq)
+        return self._tier_lookup(
+            seq,
+            sid,
+            lambda: self._lookup_client.lookup(token_ids, lookup_id=sid),
+            token_ids,
+        )
+
+    def _take_tier_answer(self, seq, sid: str) -> int | None:
+        """`_fresh_tier_lookup` for an async lookup that has already
+        answered, taken without waiting (`take_answer`, atomic in the client);
+        None, with nothing taken, if it has not."""
+        return self._tier_lookup(
+            seq,
+            sid,
+            lambda: self._lookup_client.take_answer(
+                sid,
+                lambda: self._lookup_token_ids(seq),
+                before=lambda: self._before_tier_lookup(sid),
+            ),
+            None,
+            take=True,
+        )
+
+    def _tier_lookup(self, seq, sid: str, ask, token_ids, *, take=False):
+        """The one lookup path: run `ask`, then hold and account the hit."""
+        if not take:
+            self._before_tier_lookup(sid)
         if sid not in self._lookup_in_step:
+            # Dispatch unpins whatever a lookup took if nothing loads under it.
             self._lookup_in_step.append(sid)
+        held = self._lookup_results.get(sid)
         self._lookup_results[sid] = (seq, 0)
         _t0 = time.perf_counter()
         try:
-            hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
-            _us = int((time.perf_counter() - _t0) * 1e6)
-            self._perf_bump("lookup_n")
-            self._perf_bump("lookup_us", _us)
-            if _us > self.__dict__.get("_perf_lookup_max_us", 0):
-                self._perf_lookup_max_us = _us
-                self._perf_counters["lookup_max_us"] = _us
-            self._perf_bump("lookup_prompt_tokens", num_prompt)
-            self._perf_bump("lookup_hbm_tokens", int(seq.num_cached_tokens))
-            self._perf_bump("lookup_hit_tokens", int(hit or 0))
-            if hit is None:
-                self._perf_bump("lookup_none")
+            hit = ask()
         except Exception:
-            # The ID stays in `_lookup_in_step` so the dispatch unpins whatever
-            # a half-run lookup may have taken.
             logger.exception("LMCache offload lookup failed for seq %s", seq.id)
             self._lookup_results.pop(sid, None)
             self._remember_tier_hit(seq, sid, None)
             return None
+        if take and hit is None:
+            # Not answered yet: nothing was taken.
+            if held is None:
+                self._lookup_results.pop(sid, None)
+            else:
+                self._lookup_results[sid] = held
+            return None
+        _us = int((time.perf_counter() - _t0) * 1e6)
+        self._perf_bump("lookup_taken" if take else "lookup_n")
+        self._perf_bump("lookup_us", _us)
+        if _us > self.__dict__.get("_perf_lookup_max_us", 0):
+            self._perf_lookup_max_us = _us
+            self._perf_counters["lookup_max_us"] = _us
+        self._perf_bump("lookup_prompt_tokens", seq.num_prompt_tokens)
+        self._perf_bump("lookup_hbm_tokens", int(seq.num_cached_tokens))
+        self._perf_bump("lookup_hit_tokens", int(hit or 0))
+        if hit is None:
+            self._perf_bump("lookup_none")
+        return self._hold_tier_hit(seq, sid, hit, token_ids)
+
+    def _hold_tier_hit(self, seq, sid: str, hit, token_ids) -> int | None:
+        """Hold the lookup's answer for the admission and remember it."""
         if hit is None:
             self._lookup_results.pop(sid, None)
         else:
             hit = int(hit)
             self._lookup_results[sid] = (seq, hit)
         self._remember_tier_hit(seq, sid, hit)
-        if logger.isEnabledFor(logging.DEBUG):
+        if token_ids is not None and logger.isEnabledFor(logging.DEBUG):
             _lh = None
             try:
                 tdb = getattr(self._lookup_client, "token_database", None)
@@ -536,7 +611,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             logger.debug(
                 "[OFFLOAD-LOOKUP] seq=%s num_prompt=%d hbm_cached=%d hit=%s lookuphash3=%s",
                 seq.id,
-                num_prompt,
+                seq.num_prompt_tokens,
                 int(seq.num_cached_tokens),
                 hit,
                 _lh,
@@ -695,7 +770,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """Admit any layout-specific sources before advancing the watermark."""
         return LMCacheReqMeta(
             req_id=seq.id,
-            token_ids=list(seq.token_ids[:aligned]),
+            token_ids=self._transfer_tokens(seq, aligned),
             block_ids=block_ids,
             save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
             is_last_prefill=is_last_prefill,
@@ -716,11 +791,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """
         return LMCacheReqMeta(
             req_id=seq.id,
-            token_ids=list(seq.token_ids[:transfer_end]),
+            token_ids=self._transfer_tokens(seq, transfer_end),
             block_ids=list(seq.block_table),
             load_spec=load_spec,
             load_operation=load_operation,
         )
+
+    def _transfer_tokens(self, seq, end: int):
+        """The token ids a transfer covering ``[0, end)`` ships; a transport
+        that keeps the prefix worker-side overrides it (LMCache MP)."""
+        return list(seq.token_ids[:end])
 
     def _late_save_frontier(self, seq, saved: int, available: int) -> int:
         """Return the largest layout-valid boundary for a late-acquired source."""

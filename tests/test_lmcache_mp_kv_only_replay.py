@@ -43,6 +43,19 @@ REPLAY = 6
 SESSION = "atom-offload-dp0:1"
 
 
+def _shipped_tokens(req):
+    """The token ids a worker hands the transfer for `req` (a request's first
+    shipment carries its whole prefix: `token_shipping.WorkerTokens`)."""
+    import copy
+    from types import SimpleNamespace as _NS
+
+    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
+
+    meta = _NS(requests=[copy.copy(req)])
+    WorkerTokens().resolve(meta)
+    return meta.requests[0].token_ids
+
+
 @dataclass(frozen=True)
 class _Key:
     token_ids: tuple
@@ -400,7 +413,7 @@ def test_a_page_only_save_stores_page_alone_with_no_checkpoint(monkeypatch):
     assert request.native_state.kv_only
     assert request.native_state.unit_ids == ()
     assert request.native_state.boundary_tokens == 32
-    assert request.token_ids == list(seq.token_ids[:32])
+    assert _shipped_tokens(request) == list(seq.token_ids[:32])
     assert request.save_spec.skip_leading_tokens == 0
     assert checkpoints.store.pool.num_free == free
     operation = request.save_operation

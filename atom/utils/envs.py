@@ -222,71 +222,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and reads as 0. Keep it >= max_num_seqs; a smaller cap truncates every
     # rank's running batch. CoreManager warns when that happens.
     "ATOM_DP_DISPATCH_DEPTH": lambda: _nonnegative_int_env("ATOM_DP_DISPATCH_DEPTH", 0),
-    # Prefix-spread DP routing (replaces sticky sessions when set): every
-    # request goes to the least-loaded rank (`least_tokens` score), except that
-    # the rank which last ran its longest prompt prefix -- found through the
-    # frontend prompt block-hash chain -- keeps it while within
-    # ATOM_DP_PREFIX_OWNER_MARGIN load tokens of the lightest rank. A request
-    # placed away from its prefix is queued first on its rank, so the tier
-    # (LMCache) load of that prefix starts on arrival.
-    "ATOM_DP_PREFIX_SPREAD": lambda: os.getenv("ATOM_DP_PREFIX_SPREAD", "0") == "1",
-    # Load tokens by which the prefix's rank may
-    # exceed the lightest rank and still keep the request.
-    "ATOM_DP_PREFIX_OWNER_MARGIN": lambda: int(
-        os.getenv("ATOM_DP_PREFIX_OWNER_MARGIN", "65536")
-    ),
-    # Prefix-spread rule "margin": also leave the prefix's rank
-    # when it runs more than this many requests over the lightest rank, so
-    # decode stays balanced across the lockstep DP ranks. -1 disables.
-    "ATOM_DP_PREFIX_MAX_REQ_GAP": lambda: int(
-        os.getenv("ATOM_DP_PREFIX_MAX_REQ_GAP", "4")
-    ),
-    # Prefix-spread margins relative to the lightest rank: the owner keeps a
-    # request while its load is within max(OWNER_MARGIN, REL * lightest load)
-    # and its in-flight requests within max(MAX_REQ_GAP, REQ_GAP_REL *
-    # lightest in-flight requests). 0 keeps the fixed margins only.
-    "ATOM_DP_PREFIX_OWNER_MARGIN_REL": lambda: float(
-        os.getenv("ATOM_DP_PREFIX_OWNER_MARGIN_REL", "0.5")
-    ),
-    "ATOM_DP_PREFIX_MAX_REQ_GAP_REL": lambda: float(
-        os.getenv("ATOM_DP_PREFIX_MAX_REQ_GAP_REL", "0.1")
-    ),
-    # Prefix-spread rule: "idle_ratio" (default, below), "margin" (above) or
-    # "cost". "cost" places each
-    # request on the rank minimizing its estimated time to first token (the
-    # rank's queued prefill, its own uncached prefill, a tier load where the
-    # prefix is not resident) plus ATOM_DP_PREFIX_IMBALANCE_S seconds per
-    # request of in-flight imbalance the placement leaves between the ranks.
-    "ATOM_DP_PREFIX_POLICY": lambda: os.getenv("ATOM_DP_PREFIX_POLICY", "idle_ratio"),
-    # "idle_ratio" policy: leave the prefix's rank when the lightest rank has
-    # under IDLE_TOKENS queued prefill (about to idle) and the owner over
-    # OWNER_BACKLOG_TOKENS, or when the owner's queued prefill exceeds RATIO x
-    # the lightest rank's. RATIO <= 0 (default) disables the ratio rule.
-    "ATOM_DP_PREFIX_IDLE_TOKENS": lambda: int(
-        os.getenv("ATOM_DP_PREFIX_IDLE_TOKENS", "32768")
-    ),
-    "ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS": lambda: int(
-        os.getenv("ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS", "65536")
-    ),
-    "ATOM_DP_PREFIX_RATIO": lambda: float(os.getenv("ATOM_DP_PREFIX_RATIO", "0")),
-    # "idle_ratio" with more than two ranks: a request leaving its prefix's
-    # rank goes to a rank within this many load tokens of the lightest that
-    # holds the longest part of its prefix (so only the rest is loaded from
-    # the tier); the lightest on a tie. 0 always picks the lightest.
-    "ATOM_DP_PREFIX_SIMILAR_TOKENS": lambda: int(
-        os.getenv("ATOM_DP_PREFIX_SIMILAR_TOKENS", "16384")
-    ),
-    "ATOM_DP_PREFIX_IMBALANCE_S": lambda: float(
-        os.getenv("ATOM_DP_PREFIX_IMBALANCE_S", "0.1")
-    ),
-    # Prefill work rate (`prefill_cost` units / s) and tier load rate
-    # (tokens / s) the "cost" rule converts work into seconds with.
-    "ATOM_DP_PREFIX_PREFILL_WORK_PER_S": lambda: float(
-        os.getenv("ATOM_DP_PREFIX_PREFILL_WORK_PER_S", "2.5e10")
-    ),
-    "ATOM_DP_PREFIX_LOAD_TOKENS_PER_S": lambda: float(
-        os.getenv("ATOM_DP_PREFIX_LOAD_TOKENS_PER_S", "2e6")
-    ),
+    # `--dp-load-balance prefix_spread`: a rank with less queued prefill than
+    # this is about to idle and may take requests from a prefix's rank with
+    # over twice this queued. Must be positive; the default is two 16k prefill
+    # chunks.
+    "ATOM_DP_PREFIX_IDLE_TOKENS": lambda: _optional_int_env(
+        "ATOM_DP_PREFIX_IDLE_TOKENS", min_value=1
+    )
+    or 32768,
     # Place a new agent session on the lightest DP rank, then keep every later
     # request on that immutable cache owner. Existing sessions never spill;
     # child correlation ids are independently load-placed rather than
@@ -695,10 +638,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DeepSeek-V4.1's decoder on a bounded-replay prefill's tail, recorded as a
     # request graph (`models/deepseek_v41/decoder_graph.py`): the comma-separated
     # `running_bs` to record at. Any other runs the same tail eagerly; empty
-    # records none.
+    # records none. `ForwardMode.decide` rounds a step's batch up the cudagraph
+    # capture ladder, so `running_bs` is always a capture size: the default is
+    # the usual ladder (1..8, 12, 16, ...) up to 16. Without 5, 6, 7 and 12,
+    # steps of 5-7 and 9-12 requests ran the decoder eagerly.
     "ATOM_DECODER_GRAPH_SIZES": lambda: tuple(
         int(s)
-        for s in os.getenv("ATOM_DECODER_GRAPH_SIZES", "1,2,3,4,8,16").split(",")
+        for s in os.getenv("ATOM_DECODER_GRAPH_SIZES", "1,2,3,4,5,6,7,8,12,16").split(
+            ","
+        )
         if s.strip()
     ),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
@@ -1258,11 +1206,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
     # claims. "0" walks block by block with a token compare per block.
     "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",
-    # `lmcache_mp`: ship only the tokens a worker does not yet hold with each
-    # transfer instead of the whole prefix. "0" ships whole prefixes.
-    "ATOM_MP_INCREMENTAL_TOKENS": lambda: (
-        os.getenv("ATOM_MP_INCREMENTAL_TOKENS", "1") == "1"
-    ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.
@@ -1355,34 +1298,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Minimum external-tier hit worth loading, in tokens. And the shortest
     # prefix native lmcache_mp stores: an absolute boundary, for normal and
     # late saves alike (other connectors ignore it).
-    # Early tier load: a waiting request whose async lookup answered and that
-    # must load its prefix from the external tier gets its blocks and its load
-    # on any tick (prefill-delayer HOLD or FIRE), wherever it sits in `waiting`.
-    # Its prefill still waits for its turn and a FIRE. 1 (default): on, and a
-    # moved request is no longer queued first. 0: the old path (queue first,
-    # allocate and load only in the admission pass).
-    "ATOM_OFFLOAD_EARLY_LOAD": lambda: _flag_env("ATOM_OFFLOAD_EARLY_LOAD", "1"),
-    # No early allocation once the KV pool would be fuller than this fraction.
-    "ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK": lambda: _finite_float_env(
-        "ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK", 0.8, allow_zero=True
-    ),
-    # Cap on the blocks held by early-loaded requests, as a fraction of the pool
-    # (1.0, default: only the watermark limits early loads).
-    "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
-        "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 1.0, allow_zero=True
-    ),
-    # Also load early when the load carries a state leg (state images / joint
-    # boundary), the default. 0: only plain KV and PAGE-only (replay) loads go
-    # early.
-    "ATOM_OFFLOAD_EARLY_LOAD_STATE": lambda: _flag_env(
-        "ATOM_OFFLOAD_EARLY_LOAD_STATE", "1"
-    ),
-    # Prefix-spread: queue a moved request first only while its rank's queued
-    # prefill is at most this many tokens; -1 always queues it first. Only with
-    # ATOM_OFFLOAD_EARLY_LOAD=0 (early loading replaces the queue jump).
-    "ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE": lambda: int(
-        os.getenv("ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE", "-1")
-    ),
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: max(
         0, _int_env_or_default("OFFLOAD_MIN_LOAD_TOKENS", 8192)
     ),

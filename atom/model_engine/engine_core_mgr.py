@@ -12,7 +12,7 @@ import queue
 import time
 import uuid
 import weakref
-from collections import OrderedDict, deque
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Event, Lock, RLock, Thread, local
@@ -21,6 +21,7 @@ import zmq
 import zmq.asyncio
 
 from atom.config import Config
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
@@ -37,6 +38,7 @@ from atom.model_engine.engine_utility import (
     completes_weight_sync,
 )
 from atom.model_engine.prefix_hash import take_shipped_chains
+from atom.model_engine.prefix_spread import PrefixSpreadRouter
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
@@ -59,7 +61,7 @@ _WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
 # the Config field can never diverge.
-DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens")
+DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens", "prefix_spread")
 DP_LB_DEFAULT = "least_requests"
 
 # Engine sockets for a multi-node run cannot use IPC paths, and the two ends
@@ -294,41 +296,7 @@ class CoreManager:
         # growth is new prefill debt.  Keeping this small scalar per session
         # avoids charging the complete cached conversation on every turn.
         self._dp_session_prompt_tokens: dict[str, int] = {}
-        # Prefix-spread routing (`_select_prefix_spread_locked`): prompt-prefix
-        # block hash, sampled every `_prefix_stride_tokens`, -> the rank that
-        # last ran it. A bounded LRU of routing history, not KV residency.
-        self._prefix_spread = envs.ATOM_DP_PREFIX_SPREAD
-        self._prefix_owner_margin = envs.ATOM_DP_PREFIX_OWNER_MARGIN
-        self._prefix_max_req_gap = envs.ATOM_DP_PREFIX_MAX_REQ_GAP
-        # Both margins scale with the lighter rank's load: a fixed gap that
-        # marks a real imbalance at low concurrency is noise once queues grow.
-        self._prefix_margin_rel = envs.ATOM_DP_PREFIX_OWNER_MARGIN_REL
-        self._prefix_req_gap_rel = envs.ATOM_DP_PREFIX_MAX_REQ_GAP_REL
-        self._prefix_policy = envs.ATOM_DP_PREFIX_POLICY
-        self._prefix_idle_tokens = envs.ATOM_DP_PREFIX_IDLE_TOKENS
-        self._prefix_owner_backlog_tokens = envs.ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS
-        self._prefix_ratio = envs.ATOM_DP_PREFIX_RATIO
-        self._prefix_similar_tokens = envs.ATOM_DP_PREFIX_SIMILAR_TOKENS
-        if self._prefix_policy not in ("margin", "cost", "idle_ratio"):
-            raise ValueError(
-                f"ATOM_DP_PREFIX_POLICY must be margin, cost or idle_ratio, not "
-                f"{self._prefix_policy!r}"
-            )
-        self._prefix_imbalance_s = envs.ATOM_DP_PREFIX_IMBALANCE_S
-        self._prefix_work_per_s = envs.ATOM_DP_PREFIX_PREFILL_WORK_PER_S
-        self._prefix_load_tok_per_s = envs.ATOM_DP_PREFIX_LOAD_TOKENS_PER_S
-        self._prefill_token_weight = envs.ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT
-        # Sampled prompt-block hash -> {rank: request that ran it there}.
-        self._prefix_owner: OrderedDict[int, dict] = OrderedDict()
-        self._prefix_owner_cap = 1 << 19
-        self._prefix_stride_tokens = 4096
         self._dp_route_counters = {
-            "prefix_owner_total": 0,
-            "prefix_moved_total": 0,
-            "prefix_moved_tokens": 0,
-            "prefix_cold_total": 0,
-            "prefix_source_busy_total": 0,
-            "prefix_moved_partial_total": 0,
             "affinity_new_total": 0,
             "affinity_owner_hit_total": 0,
             # Kept as an explicit invariant/metric: strict affinity must leave
@@ -339,6 +307,41 @@ class CoreManager:
             "explicit_total": 0,
             "load_balanced_total": 0,
         }
+        # Prefix-spread routing (`atom/model_engine/prefix_spread.py`): keeps a
+        # request on the rank holding its prompt's prefix unless that rank has
+        # a prefill backlog and another is about to idle. Set exactly when
+        # dp_load_balance is "prefix_spread".
+        self._prefix_router: PrefixSpreadRouter | None = None
+        if self._dp_lb_strategy == "prefix_spread":
+            if self._dp_session_affinity_enabled:
+                # Both place every request by their own rule; a session pin
+                # would undo every move.
+                raise ValueError(
+                    "--dp-load-balance prefix_spread and ATOM_DP_SESSION_AFFINITY=1 "
+                    "are two routing policies; set only one"
+                )
+            if not (
+                getattr(config, "enable_prefix_caching", False)
+                and envs.ATOM_FRONTEND_PREFIX_HASH
+            ):
+                # No prompt hash chain reaches the router: every request is
+                # cold and goes to the lightest rank.
+                raise ValueError(
+                    "--dp-load-balance prefix_spread needs --enable_prefix_caching "
+                    "and ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
+                )
+            self._prefix_router = PrefixSpreadRouter(
+                envs.ATOM_DP_PREFIX_IDLE_TOKENS,
+                KVConnectorFactory.offload_tier(config),
+                config.max_num_seqs,
+            )
+            self._dp_route_counters.update(
+                dict.fromkeys(
+                    PrefixSpreadRouter.DECISIONS
+                    + ("prefix_moved_tokens", "prefix_moved_partial_total"),
+                    0,
+                )
+            )
         self._rank_routed_total = [0] * self.global_engine_count
         # Authoritative local load per rank. Request count is in-flight until
         # finish/abort; token count is queued/in-flight PREFILL work and is
@@ -350,10 +353,6 @@ class CoreManager:
         # seq_id -> (dp_rank, req_cost, tok_cost) so release subtracts exactly
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
-        # Seqs whose prefill has not produced a first output yet. Kept apart
-        # from the token charge, which is 0 for a fully cached prompt that is
-        # nevertheless still prefilling (prefix-spread busy-source guard).
-        self._seq_prefilling = set()
         self._lb_lock = Lock()
         # --- Backpressure (lazy) DP dispatch --------------------------------
         # ATOM_DP_DISPATCH_DEPTH > 0 holds load-balanced seqs in _bp_pending and
@@ -377,7 +376,15 @@ class CoreManager:
         # after the caller has already seen the error. ``reset_dp_router``
         # clears it.
         self._bp_dispatch_paused = False
-        if self._bp_depth > 0 and self._dp_lb_strategy != "least_requests":
+        if self._bp_depth > 0 and self._prefix_router is not None:
+            logger.warning(
+                "%s: ATOM_DP_DISPATCH_DEPTH=%d is ignored under "
+                "dp_load_balance=prefix_spread, which places every request "
+                "itself (offline batches are sent at once)",
+                label,
+                self._bp_depth,
+            )
+        elif self._bp_depth > 0 and self._dp_lb_strategy != "least_requests":
             logger.warning(
                 "%s: ATOM_DP_DISPATCH_DEPTH=%d balances on in-flight request "
                 "count and ignores dp_load_balance=%s",
@@ -798,7 +805,8 @@ class CoreManager:
                             # sequence's prompt prefill has completed. Keep the
                             # request count charged for decode pressure, but
                             # stop advertising its prompt as queued prefill.
-                            self._mark_seq_prefill_complete(seq_id)
+                            if self._completes_prefill(request_output):
+                                self._mark_seq_prefill_complete(seq_id)
                             callback = self._seq_id_to_callback.get(seq_id)
                             if dbg:
                                 logger.debug(
@@ -1154,19 +1162,16 @@ class CoreManager:
             getattr(self, "_bp_depth", 0) > 0
             and getattr(self, "_bp_offline_batch", False)
             and not self._dp_session_affinity_enabled
+            and self._prefix_router is None
             and all(h is None for h in hints)
         ):
             self._bp_dispatch_or_refill(new_seqs=seqs, raise_on_error=True)
             return
 
-        # round_robin normally skips load bookkeeping. Session affinity and
-        # prefix-spread routing still need the in-flight counters (prefix-spread
-        # scores ranks by them whatever the strategy), even if the fallback
-        # strategy is RR.
+        # round_robin normally skips load bookkeeping. Session affinity still
+        # needs queued-prefill counters even if the fallback strategy is RR.
         track_load = (
-            self._dp_lb_strategy != "round_robin"
-            or self._dp_session_affinity_enabled
-            or getattr(self, "_prefix_spread", False)
+            self._dp_lb_strategy != "round_robin" or self._dp_session_affinity_enabled
         )
         engine_count = self._routable_engine_count
         dp_seqs = [[] for _ in range(engine_count)]
@@ -1409,6 +1414,10 @@ class CoreManager:
         self._rank_rotation_cursor += 1
         return best_rank
 
+    def _rank_load(self, rank: int) -> int:
+        """The `least_tokens` score: queued prefill plus decode slots."""
+        return self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
+
     def _stable_session_rank(self, session_id: str) -> int:
         """Map a session to a stable rank with rendezvous hashing.
 
@@ -1444,9 +1453,7 @@ class CoreManager:
         best_load = None
         best_hash = -1
         for rank in range(self._routable_engine_count):
-            load = (
-                self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
-            )
+            load = self._rank_load(rank)
             tie_hash = int.from_bytes(
                 hashlib.blake2b(
                     session_key + rank.to_bytes(4, "little"), digest_size=8
@@ -1498,7 +1505,7 @@ class CoreManager:
 
         session_id = getattr(seq, "dp_session_id", None)
         parent_id = getattr(seq, "dp_parent_session_id", None)
-        if getattr(self, "_prefix_spread", False):
+        if self._prefix_router is not None:
             return self._select_prefix_spread_locked(seq)
         if not self._dp_session_affinity_enabled or not session_id:
             rank = self._select_dp_rank_locked()
@@ -1517,8 +1524,7 @@ class CoreManager:
                 session_id,
                 parent_id,
                 owner,
-                self._rank_tokens[owner]
-                + self._dp_lb_req_equiv * self._rank_reqs[owner],
+                self._rank_load(owner),
                 self._rank_tokens[owner],
                 self._rank_reqs[owner],
             )
@@ -1526,226 +1532,20 @@ class CoreManager:
 
         return self._record_dp_route_locked("affinity_owner_hit_total", owner)
 
-    def _prefix_rank_hits(self, chain) -> tuple[dict[int, int], int | None, object]:
-        """Per rank, the longest sampled prefix of this prompt it last ran.
-
-        Returns ({rank: tokens}, owner, source): the owner is the rank with the
-        longest prefix (the most recent one on a tie), source the request that
-        ran it there. Each sampled hash keeps every rank that ran it, so with
-        more than two ranks a rank holding part of the prefix can be preferred
-        and only the rest needs loading from the tier.
-        """
-        if chain is None or not self._prefix_owner:
-            return {}, None, None
-        hbs = int(chain.hash_block_size)
-        stride = max(1, self._prefix_stride_tokens // hbs)
-        hashes = chain.hashes
-        n = self._routable_engine_count
-        hits: dict[int, int] = {}
-        owner, source = None, None
-        for i in range((len(hashes) // stride) * stride - 1, -1, -stride):
-            holders = self._prefix_owner.get(hashes[i])
-            if not holders:
-                continue
-            for rank, seq_id in reversed(holders.items()):
-                if 0 <= rank < n and rank not in hits:
-                    hits[rank] = (i + 1) * hbs
-                    if owner is None:
-                        owner, source = rank, seq_id
-            if len(hits) == n:
-                break
-        return hits, owner, source
-
-    def _prefix_owner_lookup(self, chain) -> tuple[int | None, int, object]:
-        """(rank that last ran this prompt's longest sampled prefix, its tokens,
-        the request that ran it)."""
-        hits, owner, source = self._prefix_rank_hits(chain)
-        if owner is None:
-            return None, 0, None
-        return owner, hits[owner], source
-
-    def _prefix_owner_record(self, chain, rank: int, seq_id=None) -> None:
-        if chain is None:
-            return
-        hbs = int(chain.hash_block_size)
-        stride = max(1, self._prefix_stride_tokens // hbs)
-        index = self._prefix_owner
-        hashes = chain.hashes
-        for i in range(stride - 1, len(hashes), stride):
-            holders = index.get(hashes[i])
-            if holders is None:
-                holders = index[hashes[i]] = {}
-            else:
-                index.move_to_end(hashes[i])
-                holders.pop(rank, None)
-            holders[rank] = seq_id  # last = most recent
-        while len(index) > self._prefix_owner_cap:
-            index.popitem(last=False)
-
-    def _prefix_cost_rank(self, seq: Sequence, owner: int, hit: int) -> int:
-        """The "cost" rule: minimum estimated TTFT plus decode-imbalance penalty.
-
-        A rank's queued prefill is its charged tokens (each with the
-        per-token weight of `prefill_cost`); the request's own prefill is its
-        uncached suffix attending to the prefix; a rank other than the
-        prefix's pays the tier load of the prefix. The penalty prices, in
-        seconds, each request of in-flight imbalance the placement leaves.
-        """
-        weight = self._prefill_token_weight
-        prompt = int(getattr(seq, "num_prompt_tokens", 0) or 0)
-        n = self._routable_engine_count
-        best_rank, best_score = owner, None
-        for r in range(n):
-            prefix = hit if r == owner else 0
-            loaded = 0 if r == owner else hit
-            new = max(0, prompt - prefix - loaded)
-            queued = self._rank_tokens[r] * weight / self._prefix_work_per_s
-            own = new * (weight + prefix + loaded + new / 2) / self._prefix_work_per_s
-            load_s = loaded / self._prefix_load_tok_per_s if loaded else 0.0
-            reqs = list(self._rank_reqs)
-            reqs[r] += 1
-            imbalance = max(reqs) - min(reqs)
-            score = queued + own + load_s + self._prefix_imbalance_s * imbalance
-            if best_score is None or score < best_score:
-                best_rank, best_score = r, score
-        return best_rank
-
-    def _prefix_stays_idle_ratio(self, owner: int, lightest: int) -> bool:
-        """The "idle_ratio" rule: leave the prefix's rank only to use idle
-        prefill capacity or to cut a severe backlog imbalance.
-
-        Moving a request does not add prefill capacity while both ranks have
-        queued prefill to run in lockstep; it only reorders who waits. So move
-        (A) when the lightest rank is about to run out of prefill work (below
-        IDLE_TOKENS queued) while the owner has a backlog (above
-        OWNER_BACKLOG_TOKENS), or (B) when the owner's queued prefill exceeds
-        RATIO x the lightest rank's (RATIO <= 0, the default, disables B: once
-        both ranks have queued prefill, moving only reorders who waits).
-        """
-        if owner == lightest:
-            return True
-        q_owner = self._rank_tokens[owner]
-        q_light = self._rank_tokens[lightest]
-        if q_light < self._prefix_idle_tokens:
-            return q_owner <= self._prefix_owner_backlog_tokens
-        if self._prefix_ratio <= 0:
-            return True
-        return q_owner <= self._prefix_ratio * q_light
-
-    def _prefix_idle_target(self, lightest: int, hits: dict[int, int], load) -> int:
-        """Which rank a request leaving its prefix's rank goes to.
-
-        Load first: only ranks about to idle (under IDLE_TOKENS queued) whose
-        load is within SIMILAR_TOKENS of the lightest are candidates. Among them, the one holding the longest part
-        of the prefix, which then loads only the rest from the tier; the
-        lightest on a tie. With two ranks this is the lightest rank.
-        """
-        similar = getattr(self, "_prefix_similar_tokens", 0)
-        if similar <= 0 or not hits:
-            return lightest
-        floor = load(lightest)
-        best, best_hit = lightest, hits.get(lightest, 0)
-        for r in range(self._routable_engine_count):
-            if (
-                r == lightest
-                or self._rank_tokens[r] >= self._prefix_idle_tokens
-                or load(r) > floor + similar
-            ):
-                continue
-            h = hits.get(r, 0)
-            if h > best_hit:
-                best, best_hit = r, h
-        return best
-
     def _select_prefix_spread_locked(self, seq: Sequence) -> int:
-        """Least-loaded rank, unless the prefix's last rank is within the margin.
-
-        No session stickiness: the frontend prompt-hash chain names the rank
-        that last ran this prefix. A request sent elsewhere carrying a loadable
-        prefix is flagged so its rank queues it first and the tier load into
-        that rank's HBM starts on arrival, not when it reaches the queue head.
-        """
-        chain = getattr(seq, "prompt_hash_chain", None)
-        hits, owner, source = self._prefix_rank_hits(chain)
-        hit = hits.get(owner, 0) if owner is not None else 0
-
-        def load(rank: int) -> int:
-            return (
-                self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
-            )
-
-        # The `least_tokens` score whatever the strategy: prefill debt plus
-        # decode slots, ties rotated so equal ranks share new prefixes.
-        n = self._routable_engine_count
-        offset = self._rank_rotation_cursor % n
-        self._rank_rotation_cursor += 1
-        lightest = min(((offset + i) % n for i in range(n)), key=load)
-        rank = lightest
-        if owner is not None and source is not None and source in self._seq_prefilling:
-            # The request that ran this prefix is still prefilling it: its KV
-            # is not in the offload tier yet, so another rank would recompute
-            # what the tier cannot supply. Share the prefix's rank instead.
-            rank = owner
-            self._dp_route_counters["prefix_source_busy_total"] += 1
-        elif owner is not None and getattr(self, "_prefix_policy", "margin") == "cost":
-            rank = self._prefix_cost_rank(seq, owner, hit)
-        elif (
-            owner is not None
-            and getattr(self, "_prefix_policy", "margin") == "idle_ratio"
-        ):
-            if self._prefix_stays_idle_ratio(owner, lightest):
-                rank = owner
-            else:
-                rank = self._prefix_idle_target(lightest, hits, load)
-        elif (
-            owner is not None
-            and load(owner)
-            <= load(lightest)
-            + max(
-                self._prefix_owner_margin,
-                getattr(self, "_prefix_margin_rel", 0.0) * load(lightest),
-            )
-            and (
-                getattr(self, "_prefix_max_req_gap", -1) < 0
-                or self._rank_reqs[owner] - self._rank_reqs[lightest]
-                <= max(
-                    self._prefix_max_req_gap,
-                    getattr(self, "_prefix_req_gap_rel", 0.0)
-                    * self._rank_reqs[lightest],
-                )
-            )
-        ):
-            rank = owner
-        # The prefix is not prefill on the owner, nor on a rank that loads it
-        # from the tier. A moved request whose hit is below the load threshold
-        # is not loaded (the connector skips it), so that rank recomputes it
-        # and is charged the full prompt.
-        # A rank holding part of the prefix reuses that part from HBM and
-        # loads only the rest; a rest below the load threshold is recomputed.
-        local = hits.get(rank, 0)
-        loaded = hit - local >= envs.OFFLOAD_MIN_LOAD_TOKENS
-        if owner is None:
-            seq._dp_est_hit = 0
-        elif rank == owner or loaded:
-            seq._dp_est_hit = hit
-        else:
-            seq._dp_est_hit = local
-        if owner is None or hit <= 0:
-            decision = "prefix_cold_total"
-        elif rank == owner:
-            decision = "prefix_owner_total"
-        else:
-            decision = "prefix_moved_total"
-            self._dp_route_counters["prefix_moved_tokens"] += max(0, hit - local)
-            if local > 0:
-                self._dp_route_counters["prefix_moved_partial_total"] += 1
-            # Queue it first only while the rank's prefill queue is short:
-            # with a long queue every jump delays all requests behind it.
-            cap = envs.ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE
-            if loaded and (cap < 0 or self._rank_tokens[rank] <= cap):
-                seq.dp_prefetch_priority = True
-        self._prefix_owner_record(chain, rank, seq.id)
-        return self._record_dp_route_locked(decision, rank)
+        """Prefix-spread placement (`PrefixSpreadRouter.select`); a new prefix
+        goes where `least_tokens` would put it."""
+        route = self._prefix_router.select(
+            seq,
+            self._rank_tokens,
+            self._rank_reqs,
+            self._rank_load,
+            self._select_dp_rank_locked,
+        )
+        if route.decision == "prefix_moved_total":
+            self._dp_route_counters["prefix_moved_tokens"] += route.moved_tokens
+            self._dp_route_counters["prefix_moved_partial_total"] += route.partial
+        return self._record_dp_route_locked(route.decision, route.rank)
 
     def get_dp_router_statistics(self) -> dict:
         """Return a consistent, non-mutating snapshot of DP routing state."""
@@ -1769,8 +1569,8 @@ class CoreManager:
         prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
         tok_cost = prompt_tokens
         session_id = getattr(seq, "dp_session_id", None)
-        if getattr(self, "_prefix_spread", False):
-            tok_cost = max(0, prompt_tokens - int(getattr(seq, "_dp_est_hit", 0)))
+        if self._prefix_router is not None:
+            tok_cost = max(0, prompt_tokens - self._prefix_router.charge(seq.id))
         elif self._dp_session_affinity_enabled and session_id:
             previous_prompt_tokens = self._dp_session_prompt_tokens.get(session_id)
             if previous_prompt_tokens is not None:
@@ -1782,7 +1582,6 @@ class CoreManager:
         self._rank_reqs[dp_rank] += req_cost
         self._rank_tokens[dp_rank] += tok_cost
         self._seq_load[seq.id] = (dp_rank, req_cost, tok_cost)
-        self._seq_prefilling.add(seq.id)
 
     def _deliver_terminal_output(self, seq) -> bool:
         """Give an online client the terminal output for a seq that never streamed.
@@ -1826,18 +1625,26 @@ class CoreManager:
         )
         return True
 
-    def _release_seq_load(self, seq_id) -> None:
+    def _release_seq_load(self, seq_id, *, route: bool = True) -> None:
         """Undo a seq's in-flight load when it finishes or is aborted.
 
         Idempotent: a seq is only charged once and released once, so a repeated
         call (e.g. finish followed by abort) is a no-op.
+
+        `route=False` (an abort, on the API thread) leaves the prefix router
+        alone. Its state moves only on the output threads, in order with the
+        STREAM that completes the prefill: an abort racing that STREAM would
+        otherwise see the request still prefilling and drop prefix entries its
+        prefill did produce. The terminal output the abort leads to releases
+        it there.
         """
         with self._lb_lock:
-            self._release_seq_load_locked(seq_id)
+            self._release_seq_load_locked(seq_id, route=route)
 
-    def _release_seq_load_locked(self, seq_id) -> None:
+    def _release_seq_load_locked(self, seq_id, *, route: bool = True) -> None:
         """``_release_seq_load`` for a caller that already holds ``_lb_lock``."""
-        self._seq_prefilling.discard(seq_id)
+        if route and self._prefix_router is not None:
+            self._prefix_router.release(seq_id)
         entry = self._seq_load.pop(seq_id, None)
         if entry is None:
             return
@@ -1845,20 +1652,28 @@ class CoreManager:
         self._rank_reqs[dp_rank] -= req_cost
         self._rank_tokens[dp_rank] -= tok_cost
 
+    @staticmethod
+    def _completes_prefill(request_output) -> bool:
+        """Whether a STREAM output shows its request's prefill completed. A
+        finished output with no tokens does not (a structured-output error
+        mid-prefill, say): its release takes the unprefilled path."""
+        return not request_output.finished or bool(request_output.output_tokens)
+
     def _mark_seq_prefill_complete(self, seq_id) -> None:
         """Release only a sequence's prefill-token charge, once."""
         # Every decode token reaches this path. The prefill charge may be zero
-        # at admission, or already released by the first output. Avoid taking
+        # at admission, or already released by the first output (or by an
+        # abort, which leaves the router's state to this thread). Avoid taking
         # the router lock for a no-op; re-read under the lock before changing
         # counters because abort/finish may release the charge concurrently.
-        entry = self._seq_load.get(seq_id)
-        if entry is None:
-            return
-        _, _, tok_cost = entry
-        if tok_cost == 0 and seq_id not in self._seq_prefilling:
-            return
+        router = self._prefix_router
+        if router is None or not router.prefilling(seq_id):
+            entry = self._seq_load.get(seq_id)
+            if entry is None or entry[2] == 0:
+                return
         with self._lb_lock:
-            self._seq_prefilling.discard(seq_id)
+            if router is not None:
+                router.prefill_complete(seq_id)
             entry = self._seq_load.get(seq_id)
             if entry is None:
                 return
@@ -1894,7 +1709,8 @@ class CoreManager:
             self._rank_reqs = [0] * self._routable_engine_count
             self._rank_tokens = [0] * self._routable_engine_count
             self._seq_load.clear()
-            self._seq_prefilling.clear()
+            if self._prefix_router is not None:
+                self._prefix_router.reset()
             pending = getattr(self, "_bp_pending", None)
             if pending:
                 logger.warning(
@@ -1976,8 +1792,9 @@ class CoreManager:
         # Release DP load bookkeeping now: an aborted seq may never emit a
         # finished STREAM output, so relying on the finish path alone would leak
         # its in-flight count. _release_seq_load is idempotent. A pending seq
-        # was never charged, so this is a no-op for it.
-        self._release_seq_load(req_id)
+        # was never charged, so this is a no-op for it. The prefix router is
+        # released by the terminal output the abort leads to.
+        self._release_seq_load(req_id, route=False)
         if pending_seq is not None:
             if not getattr(pending_seq, "leave_reason", None):
                 pending_seq.leave_reason = "aborted"

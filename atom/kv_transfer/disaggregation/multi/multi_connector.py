@@ -358,12 +358,6 @@ class MultiConnector(KVConnectorBase):
             blocks.extend(c.get_finished_recv_blocks())
         return blocks
 
-    def release_deferred_events(self) -> None:
-        for connector in self._connectors:
-            release = getattr(connector, "release_deferred_events", None)
-            if release is not None:
-                release()
-
     def close(self) -> None:
         """Tear down every sub-connector at worker teardown.
 
@@ -402,23 +396,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if callable(pending) and pending(seq):
                 return True
         return False
-
-    @property
-    def chunk_size(self) -> int:
-        """The first sub-connector's transfer granule in tokens; 0 if none has one."""
-        for connector in self._connectors:
-            size = int(getattr(connector, "chunk_size", 0) or 0)
-            if size > 0:
-                return size
-        return 0
-
-    def lookup_ready(self, seq: Any) -> bool:
-        """Never: the early tier load (`Scheduler._early_load_tier_prefixes`)
-        is not offered under `multi`, where a P/D sub shares the admission."""
-        return False
-
-    def cancel_preadmission(self, seq: Any) -> None:
-        self.cancel_pending_load(seq)
 
     def _sub_methods(self, name: str) -> list:
         """Bound `name` of every sub-connector that implements it."""
@@ -570,6 +547,15 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         else:
             self._load_winner.pop(sid, None)
         return result
+
+    def cancel_preadmission(self, seq: Any) -> None:
+        """Forward to every sub: each was notified of the admission
+        (`update_state_after_alloc` fans out), so each undoes its own record."""
+        self._load_winner.pop(getattr(seq, "id", None), None)
+        for c in self._connectors:
+            fn = getattr(c, "cancel_preadmission", None)
+            if callable(fn):
+                fn(seq)
 
     def cancel_pending_load(self, seq: Any) -> None:
         """Forward a load cancellation to every sub that arms loads.
