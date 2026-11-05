@@ -17,6 +17,7 @@ from .protocol import (
     TOOL_CHOICE_VALUES,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ended_by_stop,
     openai_stop_reason_with_calls,
 )
 from .reasoning import (
@@ -405,7 +406,9 @@ async def stream_chat_response(
             # Phase 1: Process through reasoning filter
             segments = reasoning_filter.process(new_text)
             if chunk_data.get("finished", False):
-                segments.extend(reasoning_filter.flush())
+                segments.extend(
+                    reasoning_filter.flush(stopped=ended_by_stop(engine_finish_reason))
+                )
 
             # Phase 2: For content segments, check for tool calls
             for field, text in segments:
@@ -493,7 +496,9 @@ def _build_chat_choice(
     without duplicating the logic.
     """
     raise_for_structured_error(finish_reason)
-    reasoning_content, content_with_tools = reasoning.split(raw_text)
+    reasoning_content, content_with_tools = reasoning.split(
+        raw_text, stopped=ended_by_stop(finish_reason)
+    )
     content, tool_calls = parse_tool_calls(
         content_with_tools,
         tools,
@@ -722,7 +727,11 @@ async def stream_chat_response_fanout(
 
             segments = reasoning_filters[idx].process(new_text)
             if chunk_data.get("finished", False):
-                segments.extend(reasoning_filters[idx].flush())
+                segments.extend(
+                    reasoning_filters[idx].flush(
+                        stopped=ended_by_stop(engine_finish_reasons[idx])
+                    )
+                )
 
             for field, text in segments:
                 if field == "reasoning_content":

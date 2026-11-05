@@ -248,12 +248,12 @@ def test_grammar_answer_keeps_literal_reasoning_tags(opened, width):
     raw = ("initial reasoning</think>" if opened else "") + answer
     channel = structured_response_channel(ReasoningChannel(starts_open=opened), "{}")
     expected_reasoning = "initial reasoning" if opened else None
-    assert channel.split(raw) == (expected_reasoning, answer)
+    assert channel.split(raw, stopped=True) == (expected_reasoning, answer)
     reader = channel.stream()
     events = []
     for start in range(0, len(raw), width):
         events.extend(reader.process(raw[start : start + width]))
-    events.extend(reader.flush())
+    events.extend(reader.flush(stopped=True))
     assert "".join(v for k, v in events if k == "content") == answer
     assert (
         "".join(v for k, v in events if k == "reasoning_content") or None
