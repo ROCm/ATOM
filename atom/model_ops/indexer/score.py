@@ -26,7 +26,6 @@ from aiter import cp_gather_indexer_k_quant_cache, dtypes
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits, flydsl_pa_mqa_logits_fp4
-from aiter.ops.opus.pa_mqa_logits_mxfp4 import mqa_logits_mxfp4
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -304,6 +303,8 @@ def _fp4_band_logits(
     (`IndexRows.fp4_bands`): a token graph's break. `offsets`: packed rows."""
     launch = rows.fp4_bands[band]
     if cache.layout in (NATURAL, MFMA):
+        from aiter.ops.opus.pa_mqa_logits_mxfp4 import mqa_logits_mxfp4
+
         if weights.dtype != torch.bfloat16:
             raise TypeError(f"OPUS FP4 MQA reads BF16 weights, got {weights.dtype}")
         mqa_logits_mxfp4(

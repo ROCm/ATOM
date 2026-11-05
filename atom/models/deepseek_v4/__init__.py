@@ -75,7 +75,6 @@ from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: 
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     FP4_GFX950_OPUS,
     FP4_GFX1250_NATURAL,
-    fp4_indexer_layout_for_arch,
 )
 from atom.model_ops.communication_op import (
     tensor_model_parallel_all_reduce,
@@ -1458,11 +1457,7 @@ class Indexer(nn.Module):
         # The writer's `quant_mode` must match the scorer's `indexer_layout`:
         # AITER's generic "fp4" writes natural rows, regardless of preshuffle.
         self.indexer_layout = (
-            fp4_indexer_layout_for_arch(
-                get_gfx_runtime(), backend=envs.ATOM_V4_UNIFIED_MQA
-            )
-            if self._indexer_fp4
-            else "fp8"
+            get_current_atom_config().index_cache_layout if self._indexer_fp4 else "fp8"
         )
         self._layout = (
             NATURAL

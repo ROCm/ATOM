@@ -25,8 +25,10 @@ def test_layout_exports_and_v41_plane_import_without_aiter():
             IndexUnits, fp4_index_layout_for_arch,
         )
 
-        assert fp4_index_layout_for_arch("gfx950") == PRESHUFFLE
-        assert fp4_index_layout_for_arch("gfx1250") == NATURAL
+        assert fp4_index_layout_for_arch("gfx950", backend="flydsl") == PRESHUFFLE
+        assert fp4_index_layout_for_arch("gfx950", backend="opus") == MFMA
+        assert fp4_index_layout_for_arch("gfx1250", backend="opus") == NATURAL
+        assert fp4_index_layout_for_arch("gfx1250", backend="flydsl") == NATURAL
         assert IndexUnits(None).layout == PRESHUFFLE
         assert len({MFMA, NATURAL, PRESHUFFLE}) == 3
         assert "atom.model_ops.indexer.rows" not in sys.modules

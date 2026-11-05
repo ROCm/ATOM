@@ -3,6 +3,7 @@
 import ast
 import importlib.util
 import sys
+from copy import copy
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -37,6 +38,7 @@ def _install_chip_info_stub(monkeypatch, get_gfx) -> None:
     utils.__path__ = []
     chip_info = ModuleType("aiter.jit.utils.chip_info")
     chip_info.get_gfx = get_gfx
+    chip_info.get_gfx_runtime = get_gfx
 
     aiter.jit = jit
     jit.utils = utils
@@ -122,6 +124,7 @@ def _make_config(
         compilation_config=CompilationConfig(level=0, use_cudagraph=False),
         **overrides,
     )
+    config.quant_config = None
     return config, probe
 
 
@@ -131,7 +134,7 @@ def test_native_v4_defaults_indexer_to_fp4(monkeypatch, gfx):
 
     assert config.index_cache_dtype == "fp4"
     assert config.kv_cache_block_size == 256
-    assert probe.calls == 1
+    assert probe.calls == 2
 
 
 def test_native_v4_defaults_indexer_to_fp8_on_gfx942(monkeypatch):
@@ -168,7 +171,7 @@ def test_v4_preserves_explicit_indexer_dtype(monkeypatch, requested, gfx):
     )
 
     assert config.index_cache_dtype == requested
-    assert probe.calls == 0
+    assert probe.calls == int(requested == "fp4")
 
 
 def test_non_v4_indexer_defaults_to_kv_cache_dtype(monkeypatch):
@@ -179,6 +182,46 @@ def test_non_v4_indexer_defaults_to_kv_cache_dtype(monkeypatch):
 
     assert config.index_cache_dtype == config.kv_cache_dtype == "fp8"
     assert probe.calls == 0
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["DeepseekV4ForCausalLM", "DeepseekV4MTPModel", "DeepseekV4DSparkModel"],
+)
+@pytest.mark.parametrize("gfx", ["gfx950", "gfx1250"])
+@pytest.mark.parametrize("backend", ["opus", "flydsl"])
+def test_v4_layout_snapshot_keys_page_and_compile_caches(
+    monkeypatch, architecture, gfx, backend
+):
+    from atom.kv_transfer.offload.config import build_page_namespace
+
+    monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", backend)
+    config, _ = _make_config(
+        monkeypatch, gfx=gfx, architectures=[architecture], index_cache_dtype="fp4"
+    )
+    expected = (
+        "fp4-gfx1250-natural"
+        if gfx == "gfx1250"
+        else "fp4-gfx950-opus" if backend == "opus" else "fp4-gfx950-preshuffle"
+    )
+    assert config.index_cache_layout == expected
+    offload = SimpleNamespace(chunk_size=8192)
+    namespace = build_page_namespace(config, offload, 4)
+    compile_hash = config.compute_hash()
+    # Old persisted FP4 pages did not identify their physical layout.
+    legacy = copy(config)
+    legacy.index_cache_layout = None
+    assert build_page_namespace(legacy, offload, 4) != namespace
+
+    monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", "flydsl" if backend == "opus" else "opus")
+    assert build_page_namespace(config, offload, 4) == namespace
+    assert config.compute_hash() == compile_hash
+    other, _ = _make_config(
+        monkeypatch, gfx=gfx, architectures=[architecture], index_cache_dtype="fp4"
+    )
+    same_layout = gfx == "gfx1250"
+    assert (build_page_namespace(other, offload, 4) == namespace) is same_layout
+    assert (other.compute_hash() == compile_hash) is same_layout
 
 
 @pytest.mark.parametrize(
@@ -224,6 +267,9 @@ def test_indexer_initializes_compressor_writer_layout(
     config = SimpleNamespace(
         max_model_len=64,
         index_cache_dtype=dtype,
+        index_cache_layout=v4_pool_fields.fp4_indexer_layout_for_arch(
+            gfx, backend=backend
+        ),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     path = _V4_KERNELS_INIT.parents[2] / "models/deepseek_v4/__init__.py"
@@ -250,7 +296,10 @@ def test_indexer_initializes_compressor_writer_layout(
         get_current_atom_config=lambda: config,
         fp4_indexer_enabled=v4_kernels.fp4_indexer_enabled,
         get_gfx_runtime=lambda: gfx,
-        envs=SimpleNamespace(ATOM_V4_UNIFIED_MQA=backend),
+        # A later environment change must not reinterpret the allocated cache.
+        envs=SimpleNamespace(
+            ATOM_V4_UNIFIED_MQA="flydsl" if backend == "opus" else "opus"
+        ),
         NATURAL="natural",
         MFMA="mfma",
         PRESHUFFLE="preshuffle",

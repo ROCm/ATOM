@@ -1097,8 +1097,14 @@ def test_opus_index_rows_keep_request_starts_and_split(
             return object()
 
     cfg, schedule = Config(), object()
-    monkeypatch.setattr(rows, "mqa_logits_mxfp4_config", lambda *a, **kw: cfg)
-    monkeypatch.setattr(rows, "mqa_logits_mxfp4_schedule", lambda *a, **kw: schedule)
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.opus.pa_mqa_logits_mxfp4",
+        SimpleNamespace(
+            mqa_logits_mxfp4_config=lambda *a, **kw: cfg,
+            mqa_logits_mxfp4_schedule=lambda *a, **kw: schedule,
+        ),
+    )
     builder = v4_builder_cls.__new__(v4_builder_cls)
     builder._indexer_fp4 = True
     builder.indexer_layout = layout

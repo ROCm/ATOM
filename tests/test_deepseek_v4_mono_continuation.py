@@ -1,36 +1,62 @@
 # SPDX-License-Identifier: MIT
 """A padded decode tail must keep its live-row execution on every step."""
 
+import ast
+import runpy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("aiter")
-pytest.importorskip("flydsl")
+MONO = Path(__file__).parents[1] / "atom/models/deepseek_v4/mono"
 
-from atom.models.deepseek_v4.mono.contract import BatchContinuation, ContinuationRow
-from atom.models.deepseek_v4.mono.profile import ORDINARY_PROFILE
-from atom.models.deepseek_v4.mono.session import V4MonoSession
+
+@pytest.fixture
+def session_types():
+    # Exercise the production session class and frontier/profile definitions
+    # without importing the model, cache adapter or GPU kernel builders.
+    namespace = {
+        **runpy.run_path(str(MONO / "contract.py")),
+        **runpy.run_path(str(MONO / "profile.py")),
+    }
+    path = MONO / "session.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    declarations = [
+        node
+        for node in tree.body
+        if (isinstance(node, ast.ImportFrom) and node.module == "__future__")
+        or (isinstance(node, ast.ClassDef) and node.name == "V4MonoSession")
+    ]
+    exec(  # noqa: S102 -- executes the production class, without its GPU imports
+        compile(ast.Module(body=declarations, type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    return SimpleNamespace(**namespace)
 
 
 @pytest.mark.parametrize("live_rows", [3, 4])
-def test_continuation_reselects_live_rows_after_forward_clears_route(live_rows):
+def test_continuation_reselects_live_rows_after_forward_clears_route(
+    live_rows, session_types
+):
     # The first C3 tail step already selected eager execution under the C4
     # capture key. Model forward clears that selection before the next step.
     key = (4, 1)
-    mono = V4MonoSession.__new__(V4MonoSession)
-    mono.profile = ORDINARY_PROFILE
+    mono = session_types.V4MonoSession.__new__(session_types.V4MonoSession)
+    mono.profile = session_types.ORDINARY_PROFILE
     mono.owner_generation = 1
     mono.graph_keys = {key}
     mono.graph_generations = {key: 1}
     mono.graph_layouts = {key: (4, ())}
     mono.graph_is_current = lambda candidate: candidate == key
     mono.slot_generations = {slot: 1 for slot in range(live_rows)}
-    mono.batch_continuation = BatchContinuation(
+    mono.batch_continuation = session_types.BatchContinuation(
         1,
         key,
         1,
-        tuple(ContinuationRow(slot, 1, 400, (0, 1)) for slot in range(live_rows)),
+        tuple(
+            session_types.ContinuationRow(slot, 1, 400, (0, 1))
+            for slot in range(live_rows)
+        ),
     )
     mono.builder = SimpleNamespace(
         model_runner=SimpleNamespace(capture_sizes=[1, 2, 4])

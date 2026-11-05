@@ -52,7 +52,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx
 
 from atom.distributed.pcp_utils import (
     get_pcp_rank,
@@ -102,7 +102,6 @@ from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     FP4_GFX1250_NATURAL,
     MAIN_KV_NOPE,
     fp4_indexer_block_fields,
-    fp4_indexer_layout_for_arch,
     fp8_indexer_block_fields,
     indexer_block_regions,
     main_kv_plane_fields,
@@ -560,11 +559,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             getattr(model_runner.config, "index_cache_dtype", None), warn=True
         )
         self.indexer_layout = (
-            fp4_indexer_layout_for_arch(
-                get_gfx_runtime(), backend=envs.ATOM_V4_UNIFIED_MQA
-            )
-            if self._indexer_fp4
-            else "fp8"
+            model_runner.config.index_cache_layout if self._indexer_fp4 else "fp8"
         )
         # A collective on the TP group when the run splits: every TP rank
         # builds this builder.

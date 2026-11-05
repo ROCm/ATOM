@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
 """New OPUS API: band mapping, schedule ownership and packed output."""
 
+import ast
+import sys
 from functools import lru_cache
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -48,8 +52,14 @@ def test_opus_bands_keep_sequence_mapping_and_schedule_identity(
         calls.append((cfg, starts, ends, buffers))
         return object()
 
-    monkeypatch.setattr(rows_module, "mqa_logits_mxfp4_config", config)
-    monkeypatch.setattr(rows_module, "mqa_logits_mxfp4_schedule", schedule)
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.opus.pa_mqa_logits_mxfp4",
+        SimpleNamespace(
+            mqa_logits_mxfp4_config=config,
+            mqa_logits_mxfp4_schedule=schedule,
+        ),
+    )
     sequences = rows_module.Fp4MqaRaggedMetadata(
         torch.tensor([0, 2, 5], dtype=torch.int32),
         max_qlen,
@@ -98,13 +108,32 @@ def test_opus_bands_keep_sequence_mapping_and_schedule_identity(
 
 
 def test_v41_candidate_band_forwards_packed_offsets(monkeypatch):
-    from atom.model_ops.indexer import score as scoring
+    # Run the production argument mapping without loading unrelated FP8
+    # kernels, whose Triton imports probe a GPU even for this host-only test.
+    path = Path(__file__).parents[2] / "atom/model_ops/indexer/score.py"
+    function = next(
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_fp4_band_logits"
+    )
+    function.decorator_list = []
+    namespace = {
+        "torch": torch,
+        "NATURAL": rows_module.NATURAL,
+        "MFMA": rows_module.MFMA,
+    }
+    exec(  # noqa: S102 -- executes the production OPUS argument mapping
+        compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
 
     seen = {}
-    monkeypatch.setattr(
-        scoring,
-        "mqa_logits_mxfp4",
-        lambda *args, **kwargs: seen.update(args=args, **kwargs),
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.opus.pa_mqa_logits_mxfp4",
+        SimpleNamespace(
+            mqa_logits_mxfp4=lambda *args, **kwargs: seen.update(args=args, **kwargs)
+        ),
     )
     values = torch.empty(3, 1, 32, 64, dtype=torch.uint8)
     scales = torch.empty(3, 1, 32, 4, dtype=torch.uint8)
@@ -129,7 +158,7 @@ def test_v41_candidate_band_forwards_packed_offsets(monkeypatch):
     )
     out = torch.empty(48)
     offsets = torch.tensor([0, 8, 24], dtype=torch.int64)
-    scoring._fp4_band_logits(
+    namespace["_fp4_band_logits"](
         values, scales, weights, cache, out, offsets, 0.125, 0, rows
     )
     assert seen["out"] is out and seen["out_offsets"] is offsets

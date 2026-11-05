@@ -24,20 +24,24 @@ from typing import NamedTuple
 
 import torch
 
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    FP4_GFX950_OPUS,
+    FP4_GFX950_PRESHUFFLE,
+    FP4_GFX1250_NATURAL,
+    fp4_indexer_layout_for_arch,
+)
 from atom.model_ops.indexer.layout import MFMA as FP4_MFMA
 from atom.model_ops.indexer.layout import NATURAL as FP4_OPUS
 from atom.model_ops.indexer.layout import PRESHUFFLE as FP4_FLYDSL
 
 
-def fp4_index_layout_for_arch(arch, *, backend="flydsl"):
-    if arch == "gfx950":
-        if backend not in ("opus", "flydsl"):
-            raise ValueError(
-                f"ATOM_V4_UNIFIED_MQA must be opus or flydsl, got {backend!r}"
-            )
-        if backend == "opus":
-            return FP4_MFMA
-    return FP4_OPUS if arch == "gfx1250" else FP4_FLYDSL
+def fp4_index_layout_for_arch(arch, *, backend):
+    """Use the shared layout policy with V4.1's index-plane names."""
+    return {
+        FP4_GFX950_OPUS: FP4_MFMA,
+        FP4_GFX950_PRESHUFFLE: FP4_FLYDSL,
+        FP4_GFX1250_NATURAL: FP4_OPUS,
+    }[fp4_indexer_layout_for_arch(arch, backend=backend)]
 
 
 FP4_KEYS_A_LANE = 4  # the keys of a lane that sit adjacent in a page

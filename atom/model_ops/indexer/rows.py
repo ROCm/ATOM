@@ -8,10 +8,6 @@ step (`attn_metadata.index_rows`); a model reads both and computes neither."""
 from typing import Any, Literal, NamedTuple
 
 import torch
-from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
-    mqa_logits_mxfp4_config,
-    mqa_logits_mxfp4_schedule,
-)
 
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.sparse_indexer_chunk import (
@@ -271,6 +267,14 @@ def fp4_rows(
     split = split or RowSplit.of(rows)
     if bands is None:
         bands = _plane_bands(split.first, split.end, width, workspace)
+    if layout in (NATURAL, MFMA):
+        # FP8 and FlyDSL callers also import this module. Only OPUS needs
+        # the config API supplied by the newer AITER MQA kernels.
+        from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
+            mqa_logits_mxfp4_config,
+            mqa_logits_mxfp4_schedule,
+        )
+
     launches = []
     for index, (first, end) in enumerate(bands):
         ends = row_ends[first:end]

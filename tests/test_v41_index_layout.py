@@ -78,11 +78,13 @@ def test_startup_snapshots_runtime_layout_for_scheduler_and_worker(
         torch_profiler_dir=None,
         compilation_config=CompilationConfig(level=0, use_cudagraph=False),
     )
+    config.quant_config = None
     assert config.index_cache_layout == expected
     chip.get_gfx_runtime.assert_called_once()
     chip.get_gfx.assert_not_called()
     cfg = SimpleNamespace(chunk_size=8192)
     scheduler_namespace = offcfg.build_page_namespace(config, cfg, 4)
+    compile_hash = config.compute_hash()
 
     # Spawned workers receive the resolved value; subsequent environment
     # changes cannot silently reinterpret persistent PAGE objects.
@@ -91,8 +93,10 @@ def test_startup_snapshots_runtime_layout_for_scheduler_and_worker(
     chip.get_gfx_runtime.side_effect = AssertionError("namespace queried a device")
     assert worker.index_cache_layout == expected
     assert offcfg.build_page_namespace(worker, cfg, 4) == scheduler_namespace
+    assert worker.compute_hash() == compile_hash
     worker.index_cache_layout = "natural" if expected != "natural" else "mfma"
     assert offcfg.build_page_namespace(worker, cfg, 4) != scheduler_namespace
+    assert worker.compute_hash() != compile_hash
 
 
 def test_equal_size_fp4_layouts_have_distinct_checkpoint_identities():
