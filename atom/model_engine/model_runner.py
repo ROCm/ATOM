@@ -4238,8 +4238,7 @@ class ModelRunner:
                     # The bucket's rows, which every DP rank records alike.
                     running_tokens = bs * max_q_len
                     if tr_hybrid and (
-                        sp_local_len(running_tokens)
-                        in TokenGraph.captured_sizes("decode")
+                        running_tokens in TokenGraph.captured_sizes("decode")
                         or self._skip_token_bucket(sp_local_len(running_tokens))
                     ):
                         continue

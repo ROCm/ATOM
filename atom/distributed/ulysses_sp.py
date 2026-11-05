@@ -15,7 +15,7 @@ from atom.config import get_current_atom_config_or_none
 from atom.distributed.custom_gather import custom_gather_ok
 from atom.distributed.token_transport import ALLGATHER_MAX_PAYLOAD_BYTES
 
-# AITER is imported where used: `forward_context` imports this module on CPU.
+# AITER is imported where used: `Config` imports this module on CPU.
 
 
 def get_sp_world_size() -> int:

@@ -18,9 +18,14 @@ from aiter_stub import atom_without_aiter
 
 
 @pytest.fixture(scope="module")
-def model_runner():
+def load():
     with atom_without_aiter() as load:
-        yield load("atom.model_engine.model_runner")
+        yield load
+
+
+@pytest.fixture(scope="module")
+def model_runner(load):
+    return load("atom.model_engine.model_runner")
 
 
 @pytest.fixture
@@ -95,6 +100,73 @@ def test_split_rows_graph_ladder_covers_every_schedulable_batch(
     )
     assert max(ladder) == max_bs
     assert len({-(-r // sp) for r in ladder}) == len(ladder)
+
+
+def test_sp_token_graphs_are_bucketed_by_step_rows(monkeypatch, load, model_runner):
+    # Under SP the recording unit runs this rank's shard of the step; its bucket
+    # is the step's rows, which capture dedups on and a decode step looks up.
+    region_graph = load("atom.utils.region_graph")
+    forward_context = load("atom.utils.forward_context")
+    sp_wrapper = load("atom.utils.sp_wrapper")
+    ulysses_sp = load("atom.distributed.ulysses_sp")
+    monkeypatch.setattr(ulysses_sp, "get_sp_world_size", lambda: 4)
+    monkeypatch.setattr(
+        load("aiter.dist.parallel_state"),
+        "get_pcp_group",
+        lambda: SimpleNamespace(rank_in_group=3),
+    )
+    state = SimpleNamespace(tr_graph=None, context=None)
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: state)
+    monkeypatch.setattr(sp_wrapper, "get_forward_context", lambda: state)
+    monkeypatch.setattr(sp_wrapper, "sp_gather_tokens", lambda x, rows: x)
+    monkeypatch.setattr(region_graph, "graph_pool", lambda: None)
+    monkeypatch.setattr(region_graph, "drain_nccl_works", lambda: None)
+
+    def record(forward, *args, pool=None, **kwargs):
+        output = forward(*args, **kwargs)
+        return SimpleNamespace(replay=output.clone), output
+
+    monkeypatch.setattr(region_graph.TokenGraph, "_record", staticmethod(record))
+
+    @region_graph.token_graph
+    class Shard(torch.nn.Module):
+        runs = 0
+
+        def forward(self, ids, positions):
+            Shard.runs += 1
+            return torch.full((ids.shape[0], 1), positions.shape[0])
+
+    model = sp_wrapper.SPModelWrapper(Shard())
+    ids = torch.zeros(64, dtype=torch.int64)
+
+    def step(rows, mode):
+        state.tr_graph = mode
+        state.context = forward_context.Context(positions=ids[:rows])
+        return model(ids[:rows], ids[:rows])
+
+    def recorded(rows):
+        return forward_context.ForwardMode._running_tokens(
+            is_prefill=False,
+            unified=True,
+            running_bs=rows,
+            scheduled_tokens=rows,
+            scheduled_tokens_per_dp_rank=None,
+            is_block_drafter=False,
+            max_seqlen_q=1,
+        )
+
+    ladder = model_runner.split_rows_graph_ladder([1, 2, 4, 8, 16, 32], 4, 30)
+    for rows in ladder:
+        step(rows, "record")
+    assert region_graph.TokenGraph.captured_sizes("decode") == (4, 8, 16, 30)
+    runs = Shard.runs
+    for rows in ladder:
+        assert recorded(rows) == (rows, True)
+        assert step(rows, "replay").unique().tolist() == [rows]
+    assert Shard.runs == runs
+    # 29 rows shard like 30 but no graph was recorded at 29.
+    assert recorded(29) == (29, False)
+    model.model.__dict__["_token_graph"].release_graphs()
 
 
 def test_memory_guard_skips_a_bucket_any_pcp_rank_cannot_fit(monkeypatch, model_runner):

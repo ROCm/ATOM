@@ -13,7 +13,6 @@ import numpy as np
 import torch
 
 from atom.config import Config, KVCacheTensor, ParallelConfig
-from atom.distributed.ulysses_sp import sp_local_len
 
 # A module, not its names: `region_graph` reads this one back at call time.
 from atom.utils import region_graph
@@ -399,8 +398,7 @@ class ForwardMode:
             # Rectangular layout: one row per (seq, query), which every per-token
             # buffer spans and `slot_mapping[i * q + j]` addresses through. Anything
             # under the product would leave the tail of that rectangle unwritten.
-            # Under SP a bucket is this rank's shard of it.
-            return running_tokens, sp_local_len(running_tokens) in captured
+            return running_tokens, running_tokens in captured
 
         # Marker-driven layout: the rows are one flat run, so the width is the
         # smallest recorded one that holds it, not a product -- q-divisible
@@ -545,6 +543,9 @@ class Context:
     # FusedMoE reads it to gather its routed rows across the PCP group
     # (`ATOM_PCP_MOE_MERGE`, or SP).
     pcp_split: bool = False
+    # The step's rows, set where the forward runs a shard of them (SP): the
+    # token-graph bucket a recording is listed under (`TokenGraph.captured_sizes`).
+    step_rows: int = 0
     # Whether this step's TARGET forward row-split, fixed by ModelRunner right
     # after it. Unlike `pcp_split` it survives drafting, which clears that per
     # pass; the drafter's aux gather and draft prefill split read this one.

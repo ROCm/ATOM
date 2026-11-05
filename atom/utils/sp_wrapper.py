@@ -32,6 +32,7 @@ class SPModelWrapper(nn.Module):
         context = get_forward_context().context
         # Dummy and captured passes run on a range too; FusedMoE gathers on this.
         context.pcp_split = True
+        context.step_rows = num_tokens
         hidden_states = self.model(local_ids, positions)
         if context.is_prefill:
             return hidden_states
