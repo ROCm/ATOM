@@ -130,7 +130,7 @@ a time: a server uses all four GPUs.
 | `AITER_GFX12_TOKEN_SPLIT=1`, tiles 16-128 | Decode attention split into equal-size KV segments, so the longest contexts do not leave a tail. |
 | `ATOM_DP_LM_HEAD_MODE=default` | The LM head runs on each DP rank's own rows: no per-step hidden and logits all-gathers (~0.7 ms a decode step). |
 | `MEGA_DISPATCH_WIRE=fp4`, `ATOM_MEGA_STAGE1_FUSED=0` | MoE activations go over the EP dispatch in MXFP4. The compact stage-1 path stays off. |
-| `ATOM_STATE_CHECKPOINT_GPU_SIZE=32` | GDN state checkpoint images get a 32 GiB budget an engine and keep each conversation's chain root and tip; without a budget they fill ~70% of the KV pool by minute 7. |
+| `ATOM_STATE_CHECKPOINT_GPU_SIZE=128` | GDN state checkpoint images get a 128 GiB budget an engine (3,936 images) and keep each conversation's chain root and tip; without a budget they fill ~70% of the KV pool by minute 7. At 32 GiB (984 images) the pool turns over in seconds from c1024 up: an image is released before the conversation's next turn reads it, and the turn re-prefills its whole history (`[Image Diag]` short resumes: 11% of all prefill tokens at c1536, 73-75% at c2048; `[Cache Pools]` binding: state). 128 GiB, client-scored 10-minute points: c2048 26.0-30.3k -> 57.4k output tok/s, c1536 57.4k -> 58.7k. |
 | `ATOM_PREFILL_DECODE_INTERVAL=16`, `ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT=28000` | 16 decode steps after any rank prefills; DP prefill balance. |
 | `CLIENT_MAX_IDLE=4` | The client keeps idle connections 4 s (its own default) instead of the example's 0.5 s. |
 | `CAP_MIN=600 STOP_FIRST=0 TURN_TIMEOUT=14400` | The example's issue cap and turn timeout; `bench_point.sh` stops the point after `STOP_S`. |
