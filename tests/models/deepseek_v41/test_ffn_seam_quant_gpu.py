@@ -150,7 +150,7 @@ def test_moe_hands_the_seam_pair_to_the_shared_gate_up(monkeypatch, path):
     else:
         moe((hidden, fp8, scale))
     torch.cuda.synchronize()
-    (x, x_scale), = moe.shared_experts.gate_up_proj.calls
+    ((x, x_scale),) = moe.shared_experts.gate_up_proj.calls
     assert x.dtype == torch.float8_e4m3fn and x.data_ptr() == fp8.data_ptr()
     assert x_scale is not None and x_scale.data_ptr() == scale.data_ptr()
     (routed_in,) = moe.routed_inputs
@@ -163,7 +163,7 @@ def test_bf16_rows_keep_the_shared_expert_quantizing_itself():
     moe = _moe(dim)
     hidden, _, _ = _seam_rows(5, dim)
     moe(hidden)
-    (x, x_scale), = moe.shared_experts.gate_up_proj.calls
+    ((x, x_scale),) = moe.shared_experts.gate_up_proj.calls
     assert x.dtype == torch.bfloat16 and x_scale is None
 
 
