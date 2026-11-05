@@ -10,7 +10,7 @@ place of three (`topkGatingSoftmax`, `moe_route_psum_fused`,
 Only a path on which nothing reads the routing between `select_experts` and
 the experts qualifies: TP experts through aiter's `fused_moe` (no modular
 kernel / all-to-all, no Triton experts, no EP mask), no EPLB, no DP gather, no
-PCP merge, no micro-batching, plain renormalized softmax top-k over 256 routed
+PCP merge (DP with replicated experts has none), no micro-batching, plain renormalized softmax top-k over 256 routed
 experts. aiter runs the plain top-k itself whenever its own path declines.
 """
 
@@ -18,8 +18,10 @@ import torch
 
 from atom.utils import envs
 
-# aiter's fused kernel serves at most this many rows (MAX_ROWS there).
-_MAX_ROWS = 128
+# aiter's fused kernel serves at most this many rows (MAX_ROWS there): the DP
+# decode verify step (85-128 sequences x 4 rows) and the drafter; prefill keeps
+# the split path.
+_MAX_ROWS = 512
 
 
 def try_defer_topk_route_quant(method, layer, x, logits):
@@ -55,7 +57,9 @@ def try_defer_topk_route_quant(method, layer, x, logits):
         or getattr(layer, "balance_router_logits", None) is not None
         or tbo_active()
         or layer.moe_parallel_config.pcp_merge
-        or layer.dp_size > 1
+        # DP with every expert on every rank (ATOM_DP_REPLICATE_EXPERTS) runs
+        # its own rows through the MoE: no gather, so it qualifies.
+        or (layer.dp_size > 1 and not layer.moe_parallel_config.replicate_experts)
         or config.eplb_enable
         or not layer.renormalize
         or layer.scoring_func != "softmax"
