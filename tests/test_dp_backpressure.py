@@ -121,7 +121,12 @@ def test_refill_feeds_fast_rank_more():
 def _init_with_strategy(strategy):
     mgr = CoreManager.__new__(CoreManager)
     mgr._init_shared_state(
-        SimpleNamespace(dp_load_balance=strategy, max_num_seqs=1536),
+        SimpleNamespace(
+            dp_load_balance=strategy,
+            max_num_seqs=1536,
+            keep_finished_outputs=False,
+            asyncio_mode=False,
+        ),
         label="test",
         local_engine_count=2,
     )
@@ -309,3 +314,23 @@ def test_concurrent_add_and_refill_dispatches_once():
     assert pending == []
     assert sorted(sent) == sorted(seq.id for seq in seqs)
     assert len(sent) == len(set(sent))
+
+
+def test_a_stalled_run_ends_pending_seqs_that_wait_on_a_callback():
+    # The stalled-run error goes to outputs_queue, which a callback-driven
+    # client never reads: such a pending seq is ended through its callback.
+    mgr = make_mgr(n_ranks=2, depth=1)
+    mgr.outputs_queue = queue.Queue()
+    delivered = {}
+    seqs = [Seq() for _ in range(4)]
+    seqs[-1].stream_callback = lambda out: delivered.update(
+        {out.request_id: out.finish_reason}
+    )
+    mgr.add_request(seqs)
+    mgr.fail_ranks.update({0, 1})
+    for sid in list(mgr._seq_load):
+        mgr._release_seq_load(sid)
+    mgr._bp_dispatch_or_refill(raise_on_error=False)
+    assert delivered == {seqs[-1].id: "aborted"}
+    assert all(seq.id != seqs[-1].id for seq in mgr._bp_pending)
+    assert isinstance(mgr.outputs_queue.get_nowait(), RuntimeError)

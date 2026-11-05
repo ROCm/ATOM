@@ -671,7 +671,10 @@
       "bench_args": "",
       "runner": "atom-mi308-8gpu-plugins-benchmark",
       "nightly_group": "B",
-      "env_vars": "qwen_common"
+      "env_vars": [
+        "qwen_common",
+        "AITER_BYPASS_TUNE_CONFIG=1"
+      ]
     },
     {
       "display": "DeepSeek-V4-Flash FP8 TP8 MI308",

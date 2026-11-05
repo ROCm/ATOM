@@ -63,6 +63,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 publication_group="draft_ctx_slots",
             )
 
+    def spec_honours_state_fork(self) -> bool:
+        # K3's KDA forward reads the fork table; glm5_next's does not.
+        return self.model_runner.hf_text_config.model_type == "kimi_linear"
+
     def _module_kinds(self, module) -> tuple:
         """Two row spaces: the MLA pool's rows, and the KDA state slots.
 

@@ -112,6 +112,10 @@ def _engine_io():
         stop_token_ids=[END_OF_MSG, 7],
         enable_dp_attention=False,
     )
+    from atom.config import Config
+
+    io.config.end_token_ids = Config.end_token_ids.fget(io.config)
+    io.prefix_hash_block_size = 0
     io.block_size = 16
     io.num_speculative_tokens = 0
     io.has_per_req_cache = False

@@ -180,6 +180,30 @@ change only `ATOM_MONO_ENABLE` between `0` and `1`. Pin
 `--spec-decode-acceptance-length` on both arms, or the two runs do different
 amounts of work and the comparison means nothing.
 
+### Pipeline parallel (PP2 × TP4) with DSpark
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model Kimi-K3 \
+  --kv_cache_dtype fp8 -tp 4 --pipeline-parallel-size 2 \
+  --enforce-eager \
+  --trust-remote-code \
+  --gpu-memory-utilization 0.9 \
+  --block-size 128 \
+  --enable_prefix_caching \
+  --method dspark \
+  --draft-model "${DRAFT_MODEL_PATH}" \
+  --num-speculative-tokens 7 \
+  --max-num-seqs 64 \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*", "*vision_tower*", "*mm_projector*", "context_proj", "layers"]}'
+```
+
+`--enforce-eager` is required: PP decode has no CUDA graphs yet. The drafter
+lives on the last stage, and earlier stages relay the target hidden states it
+reads (`atom/spec_decode/pp_aux_relay.py`). `"context_proj"` and `"layers"` are
+the draft's own unprefixed module names; they keep the draft out of online
+quant without touching the target. This is the CI case `Kimi-K3 DSpark PP2`.
+
 ---
 
 ## Accuracy test
@@ -221,7 +245,16 @@ The tower is replicated on every TP rank rather than sharded, costing ~0.9 GB bf
 - Kimi-K3's processor takes `messages` plus a separate `medias` list (chat rendering is Python, not Jinja) and returns `grid_thws` rather than `image_grid_thw`;
 - it emits **one** `<|media_pad|>` token per image, leaving the expansion to the model. ATOM expands it to `(h // 2) * (w // 2)` tokens up front so the scheduler, KV blocks and positions all see the real prompt length.
 
-Multimodal prefills are never chunked — the vision embeddings cover the whole prompt — so `--max-num-batched-tokens` is a hard cap on an image prompt's length even with chunked prefill enabled. A 512x512 image is 256 tokens; the default 10240 leaves ample room. Lifting this is a known TODO (see the merge site in `ModelRunner.run_model` and the admission check in `Scheduler.schedule`); it needs the encoder output cached per request and sliced per chunk.
+ATOM also records where each expanded run starts (`embedding_spans`), so an image prompt is chunked like a text one: the first prefill chunk encodes the whole image once into a per-request cache, and every chunk scatters only the rows it covers. `--max-num-batched-tokens` therefore no longer caps an image prompt's length. The processor caps one image at 65,536 patches (`in_patch_limit`) before padding, so a single image can reach ~16.5K tokens (a 4961x7016 A4 scan is 16,524).
+
+Both copies of an image live until its request finishes, through decode and any preemption:
+
+| Copy | Where | Per image token | 4961x7016 A4 scan |
+|---|---|---|---|
+| `pixel_values` (fp32 14x14 patches, 4 per token), kept to re-encode on retry | engine-core host RAM | 9.2 KiB | 148 MiB |
+| encoded embeddings (7168 x bf16), the per-request vision cache | every TP rank's GPU | 14 KiB | 226 MiB |
+
+The vision cache has no size cap and is not part of the KV-cache sizing, so it comes out of the HBM that `--gpu-memory-utilization` leaves free, as does the vision tower's activations while it encodes an image. For scale, the TP8 server with `--gpu-memory-utilization 0.9`, `--max-num-seqs 64`, `--max-num-batched-tokens 8192` and the DSpark draft, serving text, had 23.8-24.9 GiB free per GPU and 1.59M tokens of KV. 64 concurrent A4 scans hold 14.1 GiB of cache; KV filled entirely with image tokens would hold 21.2 GiB. Each 0.01 of `--gpu-memory-utilization` is ~2.9 GiB of that headroom, so for image-heavy traffic keep it at 0.9 or lower, or lower `--max-num-seqs`.
 
 On a **cold AITER JIT cache**, the first image request builds the varlen attention kernel and pays ~35 s of TTFT; once that kernel is cached it drops to ~2 s for the first request of a fresh server and ~0.3 s steady-state. Send one throwaway image before timing anything or starting an eval.
 

@@ -845,16 +845,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             blocked = self._save_retry_blocked.get(sid)
             if blocked is not None and self._save_previous_owner.get(blocked) is seq:
                 continue  # failed source may still be in use on another rank
-            computed = min(
-                int(
-                    getattr(
-                        seq,
-                        "_offload_finished_cached_tokens",
-                        getattr(seq, "num_cached_tokens", 0),
-                    )
-                ),
-                int(seq.num_prompt_tokens),
-            )
+            computed = self._save_computed_tokens(seq)
             is_last_prefill = computed >= int(seq.num_prompt_tokens)
             aligned = self._save_frontier(seq)
             if aligned <= saved:
