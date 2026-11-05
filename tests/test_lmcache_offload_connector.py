@@ -33,7 +33,7 @@ except ModuleNotFoundError:
     _torch_stub = types.ModuleType("torch")
     sys.modules["torch"] = _torch_stub
 
-from conftest import MockConfig
+from conftest import MockConfig, atom_config_double
 
 from atom.kv_transfer.disaggregation import (
     ConnectorCompletion,
@@ -5739,12 +5739,12 @@ def test_two_default_tp1_servers_on_one_host_get_distinct_engine_ids(monkeypatch
         for _ in range(2):
             manager = CoreManager.__new__(CoreManager)
             manager._init_shared_state(
-                SimpleNamespace(dp_load_balance="round_robin"),
+                atom_config_double(dp_load_balance="round_robin"),
                 label="test",
                 local_engine_count=0,
             )
             managers.append(manager)
-            config = SimpleNamespace(
+            config = atom_config_double(
                 port=8006,
                 pipeline_parallel_size=1,
                 tensor_parallel_size=1,

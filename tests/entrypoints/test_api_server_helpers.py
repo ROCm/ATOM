@@ -75,7 +75,7 @@ def _install_api_server_stubs() -> list[str]:
         def from_cli_args(cls, args):
             return cls()
 
-        def create_engine(self, tokenizer=None):
+        def create_engine(self, tokenizer=None, **kwargs):
             return None
 
     _try_import_else_stub(
@@ -874,6 +874,84 @@ def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
 
     asyncio.run(drive())
     assert events == ["initialize", "serving", "shutdown"]
+
+
+class TestPreparePrompt:
+    """`_prepare_prompt`: render, tokenize the engine's way, cut to the
+    context, on the executor, for /v1/messages and /v1/responses."""
+
+    @pytest.fixture
+    def prepare(self, monkeypatch):
+        from atom.model_engine.segment_tokenizer import PrefixEncoding
+
+        encoded = {}
+
+        def encode_prompt(text):
+            # One id per character; with a block-hash chain when asked.
+            ids = list(range(len(text)))
+            return PrefixEncoding(ids, "chain") if encoded.get("chain") else ids
+
+        monkeypatch.setattr(
+            api_server,
+            "engine",
+            SimpleNamespace(
+                config=SimpleNamespace(max_model_len=100),
+                io_processor=SimpleNamespace(encode_prompt=encode_prompt),
+            ),
+        )
+        monkeypatch.setattr(
+            api_server,
+            "tokenizer",
+            SimpleNamespace(decode=lambda ids, **_kw: "k" * len(ids)),
+        )
+        monkeypatch.setattr(api_server, "custom_message_encoder", None)
+        rendered = {}
+        monkeypatch.setattr(
+            api_server,
+            "apply_chat_template",
+            lambda _tok, _enc, messages, **kwargs: rendered.setdefault(
+                "text", messages
+            ),
+        )
+
+        def run(prompt, max_tokens, chain=False, kv=None):
+            encoded["chain"] = chain
+            rendered.clear()
+            return api_server._prepare_prompt(
+                prompt,
+                {},
+                tools=None,
+                preserve_tool_call_arguments=False,
+                max_tokens=max_tokens,
+                kv_transfer_params=kv,
+            )
+
+        return run
+
+    def test_a_prompt_that_fits_goes_to_the_engine_as_encoded(self, prepare):
+        engine_input, text = prepare("x" * 50, max_tokens=10, chain=True)
+        # The engine's own encoding, chain included, so preprocess reuses it.
+        assert engine_input.token_ids == list(range(50))
+        assert engine_input.block_hashes == "chain"
+        assert text == "x" * 50
+
+    def test_an_over_long_prompt_is_cut_to_the_context(self, prepare):
+        # 100-token context, 10 reserved for output: 90 kept.
+        engine_input, text = prepare("x" * 150, max_tokens=10, chain=True)
+        assert engine_input == list(range(90))
+        assert text == "k" * 90
+
+    @pytest.mark.parametrize("max_tokens", [100, 1024])
+    def test_no_room_for_a_prompt_is_refused(self, prepare, max_tokens):
+        with pytest.raises(ValueError, match="no room for a prompt"):
+            prepare("x" * 5, max_tokens=max_tokens)
+
+    def test_an_empty_cut_is_refused(self, prepare, monkeypatch):
+        monkeypatch.setattr(
+            api_server, "tokenizer", SimpleNamespace(decode=lambda ids, **_kw: "")
+        )
+        with pytest.raises(ValueError, match="empty after truncation"):
+            prepare("x" * 150, max_tokens=10)
 
 
 class TestDeploymentDefaultOutputCap:

@@ -31,7 +31,11 @@ def manager(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     manager = CoreManager.__new__(CoreManager)
     manager._init_shared_state(
-        SimpleNamespace(dp_load_balance="round_robin"),
+        SimpleNamespace(
+            dp_load_balance="round_robin",
+            keep_finished_outputs=False,
+            asyncio_mode=False,
+        ),
         label="test",
         local_engine_count=0,
     )
