@@ -128,12 +128,12 @@ def sp_gather_rows(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
     return gathered[owner * n + torch.arange(n, device=x.device)]
 
 
-def _exchange(send, group):
-    """All-to-all a ``[W, S/W, width]`` send buffer into global token order."""
+def all_to_all_blocks(send, group):
+    """All-to-all a ``[W, rows, width]`` buffer: block i goes to rank i, and
+    block i of the result came from rank i."""
     recv = torch.empty_like(send)
     group.device_communicator.all_to_all(recv, send)
-    # Rank-major receive order is global token order for contiguous shards.
-    return recv.reshape(recv.shape[0] * recv.shape[1], recv.shape[2])
+    return recv
 
 
 def send_columns(fields, device) -> torch.Tensor:
@@ -157,5 +157,6 @@ def exchange_columns(source, group, columns):
     if not custom_gather_ok(source, group, ALLGATHER_MAX_PAYLOAD_BYTES):
         from atom.distributed.sp_kernels import pack_columns
 
-        return _exchange(pack_columns(source, columns), group)
+        # Rank-major receive order is global token order for contiguous shards.
+        return all_to_all_blocks(pack_columns(source, columns), group).flatten(0, 1)
     return group.custom_all_gather(source).index_select(1, columns[group.rank_in_group])

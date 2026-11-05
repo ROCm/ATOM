@@ -43,7 +43,8 @@ def test_shard_quantization_matches_full_row_quantization(world, padded):
     amax = torch.cat([head_amax(s, tokens) for s in shards])
     local = tokens // world
     for rank, shard in enumerate(shards):
-        q, scale = quantize_with_gathered_amax(shard, amax, world, rank)
+        scale = torch.empty((local, 1), device="cuda")
+        q = quantize_with_gathered_amax(shard, amax, world, rank, scale)
         columns = slice(rank * width, (rank + 1) * width)
         assert torch.equal(
             q.view(torch.uint8), expected_q[:, columns].contiguous().view(torch.uint8)
