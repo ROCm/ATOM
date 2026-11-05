@@ -23,6 +23,7 @@ import enum
 import itertools
 import logging
 import math
+import os
 import struct
 import threading
 import time
@@ -65,6 +66,7 @@ if TYPE_CHECKING:
     from atom.model_engine.prefill_delayer import PrefillDelayer
 
 logger = logging.getLogger("atom")
+_CHECKPOINT_DEBUG = os.getenv("ATOM_CHECKPOINT_DEBUG") == "1"
 
 _DYNAMIC_CHUNKING_SUPPLY_WINDOW = 16
 
@@ -3367,6 +3369,7 @@ class Scheduler:
         than one checkpoint interval.
         """
         bm = self.block_manager
+        original_chunk = chunk
         if self._requires_atomic_prefill(seq):
             return chunk
         target = bm.checkpoint_cut(seq, _cut_floor(seq, start, start), start + chunk)
@@ -3385,6 +3388,19 @@ class Scheduler:
             and not bm.cancel_state_fork(seq)
         ):
             chunk = bm.state.min_fork_tokens
+        if _CHECKPOINT_DEBUG:
+            logger.info(
+                "checkpoint-debug finalize seq=%s start=%s requested=%s "
+                "target=%s final=%s prompt=%s cached=%s fork_src=%s",
+                seq.id,
+                start,
+                original_chunk,
+                target,
+                chunk,
+                seq.num_prompt_tokens,
+                seq.num_cached_tokens,
+                seq.state_fork_src,
+            )
         return chunk
 
     def _checkpoint_room(self, seq: Sequence, finished: bool) -> int:

@@ -9,9 +9,9 @@ right call for those tests -- they are about the mechanism -- but it leaves
 nothing watching the default itself. This is that watch, for the half of it
 that a CPU-only runner can see.
 
-Qwen3-Next / Qwen3.5 turn it on with `ATOM_GDN_STATE_MIDSTEP=1`, on the PAGE
-checkpoint path only. The four defects that kept it off are fixed, and each
-has its own test:
+Qwen GDN models turn it on with `ATOM_GDN_STATE_MIDSTEP=1`. Qwen3-Next /
+Qwen3.5 use the PAGE checkpoint path; Qwen4Exp uses the fork path. The four
+defects that kept it off are fixed, and each has its own test:
 
   * the runner declined to write on conditions `commit_midstep` could not
     see, and the hash was published regardless. Both ends now share
@@ -25,9 +25,9 @@ has its own test:
   * the conv window was `conv_kernel-1+num_spec` wide and written at the wrong
     positions. It is now `conv_kernel-1`, passed explicitly (GPU test).
 
-`GDNStateMixin.state_transfer` (the fork path) still declares False, and is
-NOT checked here: reaching it means importing `gdn_attn`, which imports aiter
-at module level, and this suite runs on a plain CPU runner without it.
+The fork-path declaration is checked by `test_gdn_midstep_checkpoints.py`,
+which runs where aiter is available. This file stays importable on a plain CPU
+runner.
 """
 
 

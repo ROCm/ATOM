@@ -3,6 +3,7 @@
 
 import array
 import logging
+import os
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -49,6 +50,7 @@ from atom.model_engine.state_runtime import (
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+_CHECKPOINT_DEBUG = os.getenv("ATOM_CHECKPOINT_DEBUG") == "1"
 
 
 def _make_block_stored(
@@ -413,6 +415,16 @@ class BlockManager:
         # Kept plural because GDN's recurrent state is a second member the
         # moment it stops forking (see the state-cache protocol).
         self.state_caches: tuple[StateCache, ...] = (self._state_checkpoint_cache,)
+        if _CHECKPOINT_DEBUG:
+            logger.info(
+                "checkpoint-debug runtime transfer=%s cache=%s "
+                "cache_readable_midstep=%s grid=%s min_offset=%s",
+                state_runtime.transfer,
+                type(self._state_checkpoint_cache).__name__,
+                self._state_checkpoint_cache.readable_midstep,
+                self.midstep_grid,
+                self.midstep_min_offset,
+            )
 
         # Class names already warned about in `state_checkpoint_fates`. See
         # there for why the warning latches.
@@ -2680,6 +2692,17 @@ class BlockManager:
         """
         applicable = [c for c in self.state_caches if c.applies(seq)]
         if all(c.readable_midstep for c in applicable):
+            if _CHECKPOINT_DEBUG:
+                logger.info(
+                    "checkpoint-debug no-cut seq=%s range=(%s,%s] caches=%s",
+                    seq.id,
+                    start,
+                    end,
+                    [
+                        (type(c).__name__, c.readable_midstep)
+                        for c in applicable
+                    ],
+                )
             return 0
         rung = 0
         if limit := self.checkpoint_limit(seq):
@@ -2711,6 +2734,27 @@ class BlockManager:
         if not candidates:
             return 0
         target = min(candidates)
+        if _CHECKPOINT_DEBUG:
+            reason = (
+                "demand"
+                if target == demand
+                else "anchor"
+                if target == anchor
+                else "rung"
+            )
+            logger.info(
+                "checkpoint-debug cut seq=%s range=(%s,%s] target=%s "
+                "reason=%s rung=%s demand=%s anchor=%s caches=%s",
+                seq.id,
+                start,
+                end,
+                target,
+                reason,
+                rung,
+                demand,
+                anchor,
+                [(type(c).__name__, c.readable_midstep) for c in applicable],
+            )
         # Beating the grid means an off-grid position chose this cut and the
         # grid would not have. `target < end` is the other half: at `end` the
         # chunk is not shortened and the cut cost nothing, and counting those

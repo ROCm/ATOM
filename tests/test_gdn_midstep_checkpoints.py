@@ -66,6 +66,25 @@ def admitted(bm, tokens=PROMPT):
 
 
 class TestMidstepGeometry:
+    def test_the_gdn_fork_path_is_midstep_readable_only_when_enabled(
+        self, monkeypatch
+    ):
+        from atom.model_ops.attentions.gdn_attn import GDNStateMixin
+        from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
+
+        builder = SimpleNamespace(_conv_state_len=lambda: MIN_OFFSET)
+        monkeypatch.delenv("ATOM_GDN_STATE_MIDSTEP", raising=False)
+        transfer = GDNStateMixin.state_transfer(builder)
+        assert transfer.forks
+        assert not transfer.readable_midstep
+
+        monkeypatch.setenv("ATOM_GDN_STATE_MIDSTEP", "1")
+        transfer = GDNStateMixin.state_transfer(builder)
+        assert transfer.forks
+        assert transfer.readable_midstep
+        assert transfer.midstep_grid == CHUNK_SIZE
+        assert transfer.midstep_min_offset == MIN_OFFSET
+
     def test_interior_positions_must_sit_on_the_forward_s_own_grid(self):
         # A forward from 16: its states are at 16 + 64k, not at 64k.
         assert midstep_target_ok(80, 16, 200, 64, 3)

@@ -480,24 +480,14 @@ class GDNStateMixin(PoolRowsMixin):
         rather than one contiguous entry, so there is no single range to
         duplicate — and at one token the fork binds almost nothing anyway.
 
-        NOT midstep-readable, though the machinery for it is present and its
-        numerical claim holds. The chunk kernel materializes the recurrent
-        state at every 64-token boundary, `write_state_checkpoints` copies
-        those out, and `tests/test_gdn_midstep_state_gpu.py` shows a slice of
-        `h` is bit-exact against a forward stopped there. What is missing is
-        everything between: the write path declines on six conditions that
-        `commit_midstep` cannot see, its row index spans three differently
-        scoped sequence lists, and its SSM read floors to a 64 grid that
-        `midstep_positions` does not enforce (`hash_block_size` defaults to
-        16). Each of those stores a findable image holding the wrong state,
-        which is worse than storing nothing.
-
-        None of it has ever run under a server: Kimi-K3 takes the PAGE path and
-        cannot reach this one, so every measurement in this area is of the
-        other mechanism. Declaring `False` costs a shortened prefill chunk per
-        placement — the cost every backend paid before — and is what the
-        evidence supports. Flip it back with the fixes and an end-to-end run,
-        not before.
+        Midstep checkpointing is opt-in. The chunk kernel materializes the
+        recurrent state at every 64-token boundary and
+        `write_state_checkpoints` copies those states into reserved fork slots.
+        The scheduler and runner share `midstep_checkpoint_targets`, which
+        rejects any target that is off the forward's grid or lacks enough
+        tokens for the convolution window. Keep the default conservative:
+        setting `ATOM_GDN_STATE_MIDSTEP=1` is required until this path has had
+        enough end-to-end coverage across every GDN model.
 
         Exact, not approximate, when it is turned back on: `h` is `k.new_empty`
         and `_state_dtypes` returns `config.torch_dtype`, so slicing `h` rounds
@@ -506,7 +496,16 @@ class GDNStateMixin(PoolRowsMixin):
         not, so it overrides unconditionally
         (`_KimiMLAGDNCommon.state_transfer`).
         """
-        return StateTransfer.fork(1, readable_midstep=False)
+        if not envs.ATOM_GDN_STATE_MIDSTEP:
+            return StateTransfer.fork(1, readable_midstep=False)
+        from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
+
+        return StateTransfer.fork(
+            1,
+            readable_midstep=True,
+            midstep_grid=CHUNK_SIZE,
+            midstep_min_offset=self._conv_state_len(),
+        )
 
     def num_state_layers(self) -> int:
         """Layers holding a recurrent state, one slot each.
