@@ -6,7 +6,7 @@
 A mixed batch is `[prefill rows | decode rows]`. Under spec, a prefill row
 verifies as a 0-draft span sampling one logit row, and a decode row as its
 usual anchor + drafts; everything downstream of the LM head indexes the batch
-by request. See docs/mixed_dspark_design.md for the design these pin.
+by request. See docs/scheduling_kv_cache_guide.md for the design these pin.
 
 Layout used throughout: two prefill rows of 5 and 3 tokens, then two decode
 rows of anchor + 3 drafts (mtp_k = 3):
@@ -229,7 +229,8 @@ def test_mixed_ragged_shrink_preserves_prefill_even_under_full_cudagraphs(
             verify_scheduler=SimpleNamespace(ell_by_req={3: 0, 4: 2}),
         ),
         config=SimpleNamespace(
-            dspark=SimpleNamespace(ragged=True, ragged_graph_sizes="4")
+            dspark=SimpleNamespace(ragged=True, ragged_graph_sizes="4"),
+            enable_mixed_prefill_decode=True,
         ),
         tokenID_processor=SimpleNamespace(
             prev_batch=SimpleNamespace(

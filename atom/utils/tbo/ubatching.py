@@ -211,7 +211,7 @@ def local_tbo_precompute(
     if not config.enable_tbo:
         return False, False, 0, 0
 
-    if getattr(batch, "is_mixed", False):
+    if batch.is_mixed:
         from atom.utils import envs
 
         # With TBO on, a mixed batch takes the mixed split. Whatever it cannot

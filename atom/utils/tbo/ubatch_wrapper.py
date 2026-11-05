@@ -481,7 +481,6 @@ class UBatchWrapper(nn.Module):
             # ordinary prefill path. On a non-mixed parent the slice carries
             # None and everything below is the Context default, so single-mode
             # TBO is untouched.
-            is_mixed=ub_is_mixed,
             num_prefill_tokens=ub_slice.num_prefill_tokens if ub_is_mixed else 0,
             num_prefill_seqs=ub_slice.num_prefill_seqs if ub_is_mixed else 0,
         )

@@ -3000,7 +3000,7 @@ class Config:
             # Speculative decoding runs mixed only as V4 + DSpark: a prefill row
             # verifies as a 0-draft spec row and the V4 decode half is the
             # unmodified, spec-shaped `prepare_decode`. See
-            # docs/mixed_dspark_design.md.
+            # docs/scheduling_kv_cache_guide.md#mixed-prefill-and-decode-on-deepseek-v4.
             (
                 spec is not None and spec_method != "dspark",
                 f"speculative decoding via {spec_method!r}",

@@ -550,10 +550,8 @@ class Context:
     # step whatever shape it was recorded at. A draft re-points it with
     # `scheduled_tokens` (`Drafter._publish_draft_shape`).
     scheduled_tokens_gpu: torch.Tensor | None = None
-    # Mixed prefill+decode (Phase 2). When True, the first num_prefill_tokens
-    # rows of q/k/v are prefill chunks and the rest are decode tokens; the
-    # attention backend splits them via prefill_attn_metadata / decode_attn_metadata.
-    is_mixed: bool = False
+    # Mixed batches place prefill tokens first. The boundary also determines
+    # is_mixed; pure batches leave these fields at zero.
     num_prefill_tokens: int = 0
     num_prefill_seqs: int = 0
 
@@ -581,7 +579,6 @@ class Context:
         pcp_split: bool = False,
         target_pcp_split: bool = False,
         scheduled_tokens_gpu: torch.Tensor | None = None,
-        is_mixed: bool = False,
         num_prefill_tokens: int = 0,
         num_prefill_seqs: int = 0,
     ):
@@ -602,9 +599,12 @@ class Context:
         self.pcp_split = pcp_split
         self.target_pcp_split = target_pcp_split
         self.scheduled_tokens_gpu = scheduled_tokens_gpu
-        self.is_mixed = is_mixed
         self.num_prefill_tokens = num_prefill_tokens
         self.num_prefill_seqs = num_prefill_seqs
+
+    @property
+    def is_mixed(self) -> bool:
+        return 0 < self.num_prefill_tokens < self.scheduled_tokens
 
 
 @dataclass
