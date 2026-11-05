@@ -35,13 +35,13 @@ from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 
 
-def spec(k):
-    return SimpleNamespace(num_speculative_tokens=k, use_dspark=lambda: False)
+def spec(k, dspark=False):
+    return SimpleNamespace(num_speculative_tokens=k, use_dspark=lambda: dspark)
 
 
-def make_scheduler(k, block, **overrides):
+def make_scheduler(k, block, dspark=False, **overrides):
     cfg = {
-        "speculative_config": spec(k),
+        "speculative_config": spec(k, dspark),
         "kv_cache_block_size": block,
         "num_kvcache_blocks": 256,
         "max_model_len": 8192,
@@ -62,13 +62,15 @@ def output(seq, tokens, rejected, k):
     )
 
 
-def run(prompt_len, k, block, accepts):
+def run(prompt_len, k, block, accepts, dspark=False):
     """Prefill then one decode per entry of `accepts` (tokens emitted, 1..k+1).
 
     Returns, per forward, the KV positions the runner writes and the number of
-    blocks in the row's table when it does.
+    blocks in the row's table when it does. EAGLE's draft round writes
+    `[end, end + k - 1)`; a DSpark block writes its `k` rows at anchor + 1 ..
+    anchor + k with the anchor at `end - 1`, i.e. `[end, end + k)`.
     """
-    sched = make_scheduler(k, block)
+    sched = make_scheduler(k, block, dspark)
     seq = Sequence(
         list(range(10, 10 + prompt_len)),
         block,
@@ -88,7 +90,7 @@ def run(prompt_len, k, block, accepts):
         else:
             end = ctx - r_prev
             target = range(end - k - 1, end)
-        draft = range(end, end + k - 1)
+        draft = range(end, end + k) if dspark else range(end, end + k - 1)
         steps.append(
             SimpleNamespace(
                 prefill=bool(batch.total_seqs_num_prefill),
@@ -160,6 +162,24 @@ def test_every_write_of_every_forward_is_allocated(block, k, pattern):
     if k > 1:
         # The draft round really did cross into a block past the target's.
         assert crossings > 0
+
+
+@pytest.mark.parametrize("block", [16, 128])
+@pytest.mark.parametrize("k", [1, 3, 5])
+@pytest.mark.parametrize("pattern", sorted(PATTERNS))
+def test_every_dspark_block_row_is_allocated(block, k, pattern):
+    """DSpark writes one row more than EAGLE's mid-steps. Under-allocated, the
+    last row lands, whenever it starts a new page, on the zeroed block-table
+    tail: slot 0 of block 0, which may hold another request's or a state
+    checkpoint's data."""
+    for prompt_len in range(1, 2 * block + 1):
+        for i, step in enumerate(
+            run(prompt_len, k, block, PATTERNS[pattern](k), dspark=True)
+        ):
+            assert not unallocated(step, block), (
+                f"prompt {prompt_len}, forward {i}: {step} writes "
+                f"{unallocated(step, block)} past {step.blocks} blocks"
+            )
 
 
 @pytest.mark.parametrize("k", [2, 3, 5])
