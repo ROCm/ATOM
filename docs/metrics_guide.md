@@ -183,6 +183,8 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 | `atom:requests_partial_prefill` | Gauge, requests | Requests currently in chunked prefill. |
 | `atom:kv_cache_blocks_used` / `_free` / `_total` / `_indexed` | Gauge, blocks | Aggregate KV block pool. `indexed` = blocks reachable by prefix hash; it spans both in-use and free blocks and is **not** an occupancy figure. |
 | `atom:kv_cache_usage_ratio` | Gauge, ratio | Fraction of KV blocks currently allocated. |
+| `atom:requests_deferred_free` | Gauge, requests | Finished or aborted requests whose KV blocks are held until every transfer reading or writing them completes. |
+| `atom:kv_cache_blocks_deferred_free` | Gauge, blocks | Physical KV blocks those requests hold, shared prefix blocks counted once. On P/D prefill this is the source KV decode has not pulled yet. |
 | `atom:requests_finished` | Counter, requests | Requests completed by the scheduler. |
 | `atom:prompt_tokens` / `atom:generation_tokens` | Counter, tokens | Tokens in completed requests. |
 | `atom:preemptions` | Counter | Scheduler preemptions. |
