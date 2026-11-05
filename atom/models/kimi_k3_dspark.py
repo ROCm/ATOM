@@ -50,6 +50,10 @@ Checkpoint layout (Inferact/Kimi-K3-DSpark, 68 tensors, single-file BF16):
   markov_head.markov_w{1,2}.weight              [163840, 256]
   confidence_head.proj.{weight,bias}            SKIPPED (training-only)
   embed_tokens.weight                           SKIPPED (target's is shared)
+
+Inferact/Kimi-K3.1-DSpark (67 tensors) is the same tree with 96 heads (q_b_proj
+[18432, 1536], kv_b_proj [24576, 512], o_proj [7168, 12288]), Markov rank 512
+and no embed_tokens; its ``rope_interleave: true`` is the same interleaved rope.
 """
 
 from typing import TYPE_CHECKING, ClassVar
@@ -73,11 +77,14 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    mxfp4_k_pad_align,
     uses_mxfp4_n32k4_scale,
 )
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
 from atom.models.dspark_draft import DSparkDraftModel, DSparkMarkovHead, linear_out
-from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES, _effective_layer_quant
+from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES
+from atom.models.utils import is_neox_rope_style
+from atom.quant_spec import effective_layer_quant
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -226,8 +233,10 @@ class K3DSparkMLAAttention(nn.Module):
             max_position=config.max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            # DeepSeek-style MLA rope is interleaved unless told otherwise.
-            is_neox_style=bool(getattr(config, "rope_interleave", False)),
+            # DeepSeek's MLA rope: interleaved when unspecified
+            is_neox_style=is_neox_rope_style(
+                config, "rope_interleave", default_is_neox=False
+            ),
         )
         if rope_scaling:
             mscale = yarn_get_mscale(
@@ -282,7 +291,7 @@ class K3DSparkMLAAttention(nn.Module):
         # norms instead of feeding a GEMM the wrong layout.
         #
         # q side: q_b_proj consumes the normed query, inside the MLA impl.
-        qknorm_type, qknorm_dtype = _effective_layer_quant(
+        qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
         self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
@@ -294,7 +303,7 @@ class K3DSparkMLAAttention(nn.Module):
         # decoder's input_layernorm here (the draft has no g_proj gate), so one
         # scheme decides it. The layer reads these two back off the attention.
         self.fuse_input_norm_quant = (
-            _effective_layer_quant(quant_config, f"{prefix}.fused_qkv_a_proj")[0]
+            effective_layer_quant(quant_config, f"{prefix}.fused_qkv_a_proj")[0]
             in _RMS_FUSABLE_QUANT_TYPES
         )
         self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
@@ -401,12 +410,16 @@ class K3DSparkMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # An MXFP4 down_proj cannot take an unaligned K (its per-rank
+        # intermediate); the pair pads it together. See mxfp4_k_pad_align.
+        intermediate_pad = mxfp4_k_pad_align(quant_config, f"{prefix}.down_proj")
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            output_pad_align=intermediate_pad,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -414,6 +427,7 @@ class K3DSparkMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
+            input_pad_align=intermediate_pad,
         )
         self.act_fn = SiluAndMul()
 
@@ -464,7 +478,7 @@ class K3DSparkDecoderLayer(nn.Module):
             prefix=self.self_attn.input_quant_prefix,
         )
         self.fuse_ffn_norm_quant = (
-            _effective_layer_quant(quant_config, f"{prefix}.mlp.gate_up_proj")[0]
+            effective_layer_quant(quant_config, f"{prefix}.mlp.gate_up_proj")[0]
             in _RMS_FUSABLE_QUANT_TYPES
         )
         self.post_attention_layernorm = RMSNorm(

@@ -5,15 +5,36 @@ tensor. CPU only: the group is a stand-in for two ranks, rank 1 holding
 `peer_rows` rows of zeros."""
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import pytest
 import torch
-from import_guard import skip_if_dependency_missing
+from aiter_stub import stubbed_aiter
 
-try:
-    # aiter/triton absent under bare non-GPU pytest
-    from atom.model_ops import moe
-except ImportError as exc:
-    skip_if_dependency_missing(exc, "requires full atom import env")
+from atom.utils import forward_context as fc
+
+with (
+    stubbed_aiter(
+        "aiter.fused_moe",
+        "aiter.jit.utils.chip_info",
+        "aiter.jit.utils.torch_guard",
+        "aiter.ops.flydsl.moe_common",
+        "aiter.ops.shuffle",
+        "aiter.ops.triton.quant",
+        "aiter.utility.fp4_utils",
+        "triton",
+        "triton.language",
+        # `topK` imports `triton_topk_softmax`, which takes `libdevice` from here.
+        "triton.language.extra",
+        "triton.language.extra.hip",
+    ),
+    # These CPU contracts never call CUDA custom ops. Registering them would
+    # infer schemas from the fake AITER enum defaults and retain stub kernels
+    # in torch's process-wide registry after stubbed_aiter removes its modules.
+    patch("atom.utils.custom_register.direct_register_custom_op"),
+):
+    from atom.model_ops import eplb, moe, topK
+    from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
 
 
 class _TwoRankGroup:
@@ -109,9 +130,6 @@ def test_gathered_shared_ids_split_the_rows_between_ep_ranks(monkeypatch):
     only where i % ep == r. Routed on their own ranks, the rows carry their
     owners' marks through the gather -- every rank would run the same rows'
     shared expert. Re-marked by gathered position, the ranks split the rows."""
-    from atom.model_ops import topK
-    from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
-
     ep, top_k, shared, fake, local = 2, 2, 8, 9, 2
     layer = SimpleNamespace(
         expert_layout=SimpleNamespace(mode=SharedExpertMode.LEGACY_AITER),
@@ -138,9 +156,11 @@ def test_gathered_shared_ids_split_the_rows_between_ep_ranks(monkeypatch):
     assert runs[0] == {0, 2} and runs[1] == {1, 3}
 
 
-def test_gathered_rows_are_placed_after_the_gather_and_uncounted(monkeypatch):
+@pytest.mark.parametrize("use_ep", [False, True], ids=["tp", "ep"])
+def test_gathered_rows_are_placed_after_the_gather_and_uncounted(monkeypatch, use_ep):
     """Placement (the EPLB remap, which shifts the shared column) follows the
-    gather and the shared-id re-mark, and gathered rows carry no count."""
+    gather and the shared-id re-mark. Only the pass's whole ungathered rows
+    carry its count, under both TP and EP."""
     calls = []
     method = SimpleNamespace(
         place_experts=lambda layer, w, ids, gathered: (
@@ -156,8 +176,7 @@ def test_gathered_rows_are_placed_after_the_gather_and_uncounted(monkeypatch):
         activation=None,
         apply_router_weight_on_input=False,
         prefix="t",
-        # Only an expert-parallel layer hands its experts the row count.
-        use_ep=True,
+        use_ep=use_ep,
     )
     count = torch.tensor([2], dtype=torch.int32)
     context = SimpleNamespace(
@@ -166,30 +185,28 @@ def test_gathered_rows_are_placed_after_the_gather_and_uncounted(monkeypatch):
         running_tokens=3,
         scheduled_tokens_gpu=count,
     )
-    monkeypatch.setattr(
-        moe, "get_forward_context", lambda: SimpleNamespace(context=context)
-    )
-    monkeypatch.setattr(
-        moe, "pass_scheduled_tokens_gpu", lambda rows: count if rows == 3 else None
-    )
+    forward = SimpleNamespace(context=context)
+    monkeypatch.setattr(moe, "get_forward_context", lambda: forward)
+    monkeypatch.setattr(fc, "get_forward_context", lambda: forward)
     w, ids = torch.rand(3, 2), torch.zeros(3, 2, dtype=torch.int32)
 
     moe.FusedMoE._run_experts(layer, torch.zeros(3, 8), w, ids, gathered=True)
     moe.FusedMoE._run_experts(layer, torch.zeros(3, 8), w, ids)
+    moe.FusedMoE._run_experts(layer, torch.zeros(1, 8), w[:1], ids[:1])
 
     assert calls == [
         ("place", True),
         ("apply", None),
         ("place", False),
         ("apply", count),
+        ("place", False),
+        ("apply", None),
     ]
 
 
 def test_gathered_rows_pick_one_replica_on_every_rank(monkeypatch):
     """The forced-remote replica hash mixes in the DP rank only for a rank's
     own rows; gathered rows are hashed by the row alone."""
-    from atom.model_ops import eplb
-
     monkeypatch.setattr(eplb, "_MANAGER", SimpleNamespace(replica_spread=(4, 3)))
     assert eplb._replica_spread() == (4, 3)
     assert eplb._replica_spread(gathered=True) == (1, 0)

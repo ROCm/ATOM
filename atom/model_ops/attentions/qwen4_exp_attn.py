@@ -71,6 +71,12 @@ class Qwen4ExpQSAMetadata:
     # Host-side longest sequence in the batch. Bounds the scored/selected width
     # so a short request does not pay for the whole engine context.
     max_seq_len: int
+    # Eager prefill only, for the aiter FlyDSL sparse attention: host per-request
+    # (query_lens, seq_lens) of the packed tokens, and, when any request has a
+    # prefix, the flat token-cache rows of every request's full context in
+    # request-major order. None elsewhere.
+    host_lens: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+    context_slots: torch.Tensor | None = None
 
     def for_tokens(self, num_tokens: int) -> "Qwen4ExpQSAMetadata":
         """Draft step zero uses real rows, without the target graph's padding."""

@@ -65,6 +65,8 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
 )
 from atom.observability import tracing
+from atom.sampling_params import RequiredChannel
+from atom.structured_output import StructuredRequest
 from atom.utils import envs
 
 if TYPE_CHECKING:
@@ -218,6 +220,11 @@ class ScheduledBatch:
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
         self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
+        self.structured_requests = {}
+        for i, seq in enumerate(seqs.values()):
+            if seq.json_schema is None:
+                continue
+            self.structured_requests[i] = StructuredRequest.capture(seq)
         # `context_lens` is set further down, once `num_cached_tokens` is known:
         # a chunked prefill's context ends at this chunk, not at the whole
         # prompt, so `seq.num_tokens` is only right for decode.
@@ -290,6 +297,28 @@ class ScheduledBatch:
         self.needs_independent_noise = np.asarray(
             [getattr(seq, "needs_independent_noise", False) for seq in seqs.values()],
             dtype=bool,
+        )
+        # The channel the batch's requests must still open, when any row has
+        # one left to open (a request whose channel is open is
+        # `UNCONSTRAINED`), and then each row's committed state towards it.
+        # A batch with none stages no states and runs no channel kernels. One
+        # per engine: `InputOutputProcessor` refuses a request naming another
+        # at admission, so the engine loop never meets two.
+        channels = {
+            seq.required_channel
+            for seq in seqs.values()
+            if seq.required_channel_state >= 0
+        }
+        assert len(channels) <= 1, f"one batch holds {len(channels)} channels"
+        self.required_channel: RequiredChannel | None = (
+            channels.pop() if channels else None
+        )
+        self.required_channel_states = (
+            None
+            if self.required_channel is None
+            else np.asarray(
+                [seq.required_channel_state for seq in seqs.values()], dtype=np.int32
+            )
         )
 
         self.is_first_decode_without_local_prefill = [
@@ -559,8 +588,10 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        structured_errors: dict[int, str] | None = None,
     ):
         self.req_ids = req_ids
+        self.structured_errors = structured_errors or {}
         self.token_ids = token_ids
         self.draft_token_ids = self._copy_array_view(draft_token_ids)
         self.num_rejected = self._copy_array_view(num_rejected)
@@ -1452,6 +1483,23 @@ class Scheduler:
                 break  # all partials summed; skip the rest of the decode tail
         return total
 
+    def _next_decode_completion_steps(self) -> int | None:
+        """Decode steps until the first running decode reaches max_tokens if
+        every step accepts all its draft tokens; None without decode. EOS can
+        come sooner, rejected drafts make it later. Only an engine that
+        verifies drafts (`spec_decode_local`) gains more than a token a step."""
+        fewest = None
+        for seq in self.running:
+            if seq.is_partial_prefill:
+                continue
+            left = seq.max_tokens - seq.num_completion_tokens
+            if fewest is None or left < fewest:
+                fewest = left
+        if fewest is None:
+            return None
+        tokens_per_step = 1 + (self.mtp_k if self.spec_decode_local else 0)
+        return -(-fewest // tokens_per_step)
+
     def _oldest_waiting_prefill_age_ms(self) -> float:
         """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
         or 0.0 if none.
@@ -1864,7 +1912,7 @@ class Scheduler:
         ) and num_tokens > self.max_num_batched_tokens:
             remedy = (
                 "Increase --max-num-batched-tokens or shorten the prompt "
-                "(multimodal prompts are never chunked)."
+                "(multimodal prompts without embedding spans are never chunked)."
                 if is_multimodal
                 else "Increase --max-num-batched-tokens, enable chunked "
                 "prefill, or shorten the prompt."
@@ -2039,6 +2087,7 @@ class Scheduler:
                 if self.cost_balance and prefillable
                 else 0.0
             )
+            waiting_requests = len(self.waiting) + self._partial_prefill_count
             decision = self.prefill_delayer.should_allow_prefill(
                 prefillable=prefillable,
                 pending_tokens=pending_tokens,
@@ -2055,8 +2104,21 @@ class Scheduler:
                     else 0.0
                 ),
                 prefill_cost=prefill_cost,
-                waiting_requests=len(self.waiting) + self._partial_prefill_count,
+                waiting_requests=waiting_requests,
                 arrived_requests=self._arrived_requests,
+                # read only by a rank with no prefill and nothing waiting
+                next_completion_steps=(
+                    self._next_decode_completion_steps()
+                    if not prefillable and not waiting_requests
+                    else None
+                ),
+                # prefill_admit_policy adaptive: what a FIRE could add to the
+                # decode batch -- partials plus waiting heads up to free slots
+                admittable_requests=self._partial_prefill_count
+                + min(
+                    len(self.waiting),
+                    max(0, self.max_num_seqs - len(self.running)),
+                ),
             )
         else:
             decision = PrefillDecision(allow=True, prefillable_ranks=0)
@@ -2646,6 +2708,9 @@ class Scheduler:
             if self.kv_connector is not None:
                 self._publish_state_loads()
                 self._publish_state_stores()
+                self._note_connector_scheduled_tokens(
+                    scheduled_seqs, num_scheduled_tokens
+                )
                 connector_meta_output = self.kv_connector.build_connector_meta()
 
             # Freeze, per seq, whether this chunk is the last one this prefill
@@ -2829,6 +2894,7 @@ class Scheduler:
         if self.kv_connector is not None:
             self._publish_state_loads()
             self._publish_state_stores()
+            self._note_connector_scheduled_tokens(scheduled_seqs, num_scheduled_tokens)
             connector_meta_output = self.kv_connector.build_connector_meta()
 
         self._check_draft_writes_allocated(scheduled_seqs.values())
@@ -2956,6 +3022,20 @@ class Scheduler:
         seq.offload_load_start_tokens = None
         seq.offload_load_failed = True
         return True
+
+    def _note_connector_scheduled_tokens(
+        self,
+        scheduled_seqs: dict[int, Sequence],
+        num_scheduled_tokens: list[int],
+    ) -> None:
+        """Tell the connector how many tokens this step's forward computes.
+
+        Lets lmcache_mp emit a prefill chunk's save in the step that computes
+        it (`note_scheduled_tokens`); other connectors do not define it.
+        """
+        note = getattr(self.kv_connector, "note_scheduled_tokens", None)
+        if callable(note):
+            note(scheduled_seqs, num_scheduled_tokens)
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
         self._inflight_prefix_wait.pop(seq.id, None)
@@ -3208,6 +3288,10 @@ class Scheduler:
         if first_token_id is not None:
             seq.append_token(first_token_id)
             seq._injected_t0 = first_token_id
+            if seq.required_channel is not None:
+                seq.required_channel_state = seq.required_channel.step(
+                    seq.required_channel_state, first_token_id
+                )
             if self.mtp_k > 0:
                 drafts = list(
                     (seq.kv_transfer_params or {}).get("draft_token_ids") or []
@@ -4137,6 +4221,30 @@ class Scheduler:
             num_placeholder += 1
 
         for seq in self.running:
+            error = getattr(fwd_output, "structured_errors", {}).get(seq.id)
+            if error is not None:
+                logger.error(
+                    "Structured decoding failed for request %s: %s", seq.id, error
+                )
+                self._mark_finished(
+                    seq,
+                    "structured_output_error",
+                    seq.num_tokens - seq.num_placeholder_tokens,
+                )
+                finished_seqs.append(seq)
+                if stream_output_queue is not None:
+                    stream_outputs.append(
+                        (
+                            seq.id,
+                            RequestOutput(
+                                request_id=seq.id,
+                                output_tokens=[],
+                                finished=True,
+                                finish_reason="structured_output_error",
+                            ),
+                        )
+                    )
+                continue
             # Cancellation does not require sampled output. Middle prefill
             # chunks and the first deferred step may have none; waiting for
             # one keeps an aborted request alive without advancing its tokens.
@@ -4206,6 +4314,12 @@ class Scheduler:
                 seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
+            # Over the forward's own tokens only: a P/D consumer's T0 joins
+            # `new_tokens` below but was counted when it was appended.
+            if seq.required_channel is not None:
+                seq.required_channel_state = seq.required_channel.advance(
+                    seq.required_channel_state, token_ids
+                )
             token_logprob = None
             if token_logprobs is not None and seq.return_logprobs:
                 token_logprob = token_logprobs.get(seq.id)
@@ -5371,6 +5485,10 @@ class DecodeScheduler(Scheduler):
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
+            if seq.required_channel is not None:
+                seq.required_channel_state = seq.required_channel.step(
+                    seq.required_channel_state, sampled_token_id
+                )
             seq.is_first_decode = True
             # Decode schedules a full target verification window.  The remote
             # prefill producer normally sends only T0, so pad the missing draft
