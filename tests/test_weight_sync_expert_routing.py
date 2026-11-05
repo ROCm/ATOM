@@ -226,19 +226,6 @@ def test_the_mappings_reached_by_attribute_are_unaffected(wrap):
     assert updater._get_packed_shard_order() == {"gate_up_proj": [0]}
 
 
-def test_a_weight_update_under_ulysses_sp_is_refused():
-    """SP's wrapper is refused, not peeled, beneath the compile shell too: the
-    sync would otherwise match nothing and keep the old weights."""
-    from atom.utils.sp_wrapper import SPModelWrapper
-
-    model, _ = _moe_model()
-    updater = _updater(model)
-    updater.model = _compiled(SPModelWrapper(model))
-
-    with pytest.raises(NotImplementedError, match="Ulysses SP"):
-        updater.update_weights([("mlp.experts.w13_weight", torch.zeros(1))])
-
-
 def test_a_sync_that_matched_nothing_says_so_above_debug(caplog):
     """What the wrapper bug looked like from outside: `updated=0, skipped=N` on
     an info line, indistinguishable from a bucket that legitimately held

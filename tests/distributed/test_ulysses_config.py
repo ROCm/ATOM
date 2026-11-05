@@ -3,7 +3,6 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
-import torch
 from aiter_stub import atom_without_aiter
 from conftest import atom_config_double
 
@@ -102,20 +101,11 @@ def test_minimax_m3_builds_no_vision_tower_under_sp():
     assert image_input_refusal(config) is None
 
 
-def test_dp_isolated_rlhf_workers_refuse_sp(monkeypatch):
-    # Importing the runner resolves the chip architecture through aiter.
-    if not torch.cuda.is_available():
-        pytest.skip("RLHFModelRunner needs a ROCm device to import")
-    from atom.rollout.model_runner_ext import RLHFModelRunner
-
-    monkeypatch.setenv(RLHFModelRunner.DP_DEVICE_MAP_ENV, "0,1,2,3")
-    config = atom_config_double(
-        sequence_parallel_size=4,
-        parallel_config=SimpleNamespace(data_parallel_size=1),
-    )
-    runner = object.__new__(RLHFModelRunner)
+def test_rlhf_rollout_refuses_sp_at_construction():
+    with atom_without_aiter() as load:
+        runner = load("atom.rollout.model_runner_ext").RLHFModelRunner
     with pytest.raises(ValueError, match="Ulysses SP"):
-        runner._setup_device_and_distributed(0, config)
+        runner(0, atom_config_double(sequence_parallel_size=4))
 
 
 def test_sp_attention_needs_rope_in_the_impl():
