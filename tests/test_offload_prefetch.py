@@ -589,11 +589,19 @@ def test_a_non_resource_refusal_does_not_promote(monkeypatch, seq_factory):
     monkeypatch.setattr(
         sched,
         "_admit_after_probe",
-        lambda s, *x, **k: Admit.REFUSED if s is a else real(s, *x, **k),
+        lambda s, *x, **k: Admit.DETACH_DECLINED if s is a else real(s, *x, **k),
     )
     delayer.allow = True
     sched.schedule()
     assert not sched._blocked_head
+    # A pool refusal (no blocks to privatise a shared prefix) is one.
+    monkeypatch.setattr(
+        sched,
+        "_admit_after_probe",
+        lambda s, *x, **k: Admit.REFUSED if s is a else real(s, *x, **k),
+    )
+    sched.schedule()
+    assert sched._blocked_head
     sched._blocked_head = True
     sched.abort_request(a.id)
     assert not sched._blocked_head

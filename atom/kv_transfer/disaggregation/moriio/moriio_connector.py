@@ -2031,6 +2031,10 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         del self._reqs_need_recv[seq.id]
         if seq.kv_transfer_params is not None:
             seq.kv_transfer_params["do_remote_prefill"] = True
+        # The lookup tags a request once (`get_num_new_matched_tokens`): the
+        # re-admission must report and wait for its remote load again.
+        if hasattr(seq, "kv_async_tagged"):
+            del seq.kv_async_tagged
 
     def update_state_after_alloc(self, seq: Sequence) -> None:
         """Update internal state after the scheduler allocates blocks for a sequence.
