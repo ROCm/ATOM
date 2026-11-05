@@ -94,6 +94,7 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    ended_by_stop,
     validate_max_tokens,
 )
 from .reasoning import (
@@ -2515,7 +2516,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                         # into the tool parser.
                         segments = reasoning_filter.process(new_text)
                         if finished:
-                            segments.extend(reasoning_filter.flush())
+                            segments.extend(
+                                reasoning_filter.flush(
+                                    stopped=ended_by_stop(engine_reason)
+                                )
+                            )
 
                         for field, text in segments:
                             if not text:
@@ -2627,10 +2632,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # and what keeps a chain of thought out of the tool parser. Only
         # whether the client is shown it is a question, and the same one the
         # streaming branch above asks.
-        # Both stages over one chunk, in the order the branch above streams
-        # them: reasoning filter, then the tool parser on the content segments
-        # it yields. Calling `.split()` here instead flattened the two into
-        # `(reasoning, content)` and lost the interleaving at that line.
+        # Both stages over the whole output, once, in the order the branch
+        # above streams them: reasoning filter, then the tool parser on the
+        # content segments it yields. Calling `.split()` here instead
+        # flattened the two into `(reasoning, content)` and lost the
+        # interleaving at that line.
         events = read_whole_blocks(
             reasoning_channel(
                 prompt_starts_in_reasoning(prompt),
@@ -2640,6 +2646,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             raw_text,
             anthropic_to_openai_tools(request.tools),
             suppress_calls=forbids_tool_calls(request.tool_choice),
+            stopped=ended_by_stop(final_output.get("finish_reason")),
         )
         if drop_reasoning:
             events = [e for e in events if e[0] != "reasoning"]
@@ -2921,7 +2928,13 @@ async def responses_create(raw_request: Request):
 
                         segments = reasoning_filter.process(new_text)
                         if finished:
-                            segments.extend(reasoning_filter.flush())
+                            segments.extend(
+                                reasoning_filter.flush(
+                                    stopped=ended_by_stop(
+                                        chunk_data.get("finish_reason")
+                                    )
+                                )
+                            )
 
                         for field, text in segments:
                             if not text:
@@ -3013,6 +3026,7 @@ async def responses_create(raw_request: Request):
             raw_text,
             openai_tools,
             suppress_calls=forbids_tool_calls(request.tool_choice),
+            stopped=ended_by_stop(final_output.get("finish_reason")),
         )
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)

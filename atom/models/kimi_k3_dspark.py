@@ -51,6 +51,10 @@ Checkpoint layout (Inferact/Kimi-K3-DSpark, 68 tensors, single-file BF16):
   confidence_head.proj.{weight,bias}            SKIPPED (training-only)
   embed_tokens.weight                           SKIPPED (target's is shared;
                                                 loaded on PP stages > 0)
+
+Inferact/Kimi-K3.1-DSpark (67 tensors) is the same tree with 96 heads (q_b_proj
+[18432, 1536], kv_b_proj [24576, 512], o_proj [7168, 12288]), Markov rank 512
+and no embed_tokens; its ``rope_interleave: true`` is the same interleaved rope.
 """
 
 from typing import TYPE_CHECKING, ClassVar
@@ -82,6 +86,7 @@ from atom.model_ops.linear import (
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
 from atom.models.dspark_draft import DSparkDraftModel, DSparkMarkovHead, linear_out
 from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES
+from atom.models.utils import is_neox_rope_style
 from atom.quant_spec import effective_layer_quant
 
 if TYPE_CHECKING:
@@ -231,8 +236,10 @@ class K3DSparkMLAAttention(nn.Module):
             max_position=config.max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            # DeepSeek-style MLA rope is interleaved unless told otherwise.
-            is_neox_style=bool(getattr(config, "rope_interleave", False)),
+            # DeepSeek's MLA rope: interleaved when unspecified
+            is_neox_style=is_neox_rope_style(
+                config, "rope_interleave", default_is_neox=False
+            ),
         )
         if rope_scaling:
             mscale = yarn_get_mscale(

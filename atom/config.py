@@ -751,9 +751,17 @@ _CONFIG_REGISTRY: dict[str, str] = {
 # as a bare PretrainedConfig instead (see get_hf_config).
 _PLAIN_CONFIG_MODEL_TYPES: frozenset[str] = frozenset({"k3_dspark"})
 
+# a checkpoint architecture that is another's model under a new name: loaded
+# as that one (``get_hf_config``), so every table keyed by architecture holds
+# one entry for both
+ARCH_ALIASES: dict[str, str] = {
+    "KimiK31ForConditionalGeneration": "KimiK3ForConditionalGeneration",
+}
+
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     "kimi_k3": "text_config",
+    "kimi_k31": "text_config",
     "kimi_k25": "text_config",
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
@@ -794,6 +802,16 @@ def flatten_dsa_config(hf_config) -> None:
 
 
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
+    """``model``'s config, its architecture the one ATOM's tables key
+    (``ARCH_ALIASES``)."""
+    hf_config = _load_hf_config(model, trust_remote_code)
+    architectures = getattr(hf_config, "architectures", None)
+    if architectures and architectures[0] in ARCH_ALIASES:
+        hf_config.architectures = [ARCH_ALIASES[architectures[0]]]
+    return hf_config
+
+
+def _load_hf_config(model: str, trust_remote_code: bool) -> PretrainedConfig:
     config_dict, _ = PretrainedConfig.get_config_dict(
         model,
     )
