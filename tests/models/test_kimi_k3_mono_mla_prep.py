@@ -75,6 +75,17 @@ def test_prep_key_only_on_the_preceding_layer_and_inside_the_width(
     assert r._prep_key(3, 1) == {}
 
 
+def test_prep_key_none_where_p0s_sums_do_not_fit_red(runner_module):
+    """16 rows on 7+ blocks overflow K2's ``red`` (``build`` asserts, which
+    would refuse the whole width): that layer keeps its own seam there."""
+    from atom.models.kimi_k3.mono.kernels.stages import mla_prep as k2pr
+
+    r = _runner(runner_module, _prep(blocks=7))
+    assert not k2pr.red_fits(16, 8) and k2pr.red_fits(12, 8)
+    assert r._prep_key(2, 16) == {}
+    assert r._prep_key(2, 12)["prep_nblocks"] == 7
+
+
 def test_an_unknown_sub_mode_is_refused(runner_module, monkeypatch):
     from atom.mono.runtime.consensus import MonoUnsupported
 

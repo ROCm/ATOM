@@ -432,3 +432,34 @@ def test_a_lean_width_restages_only_the_spilled_k1_builds(monkeypatch):
     # a K2 spill, or a K1 already at one group a unit: nothing leaner
     assert runner._lean_width(built, ["k2f"]) is None
     assert runner._lean_width(lean, [("lean", 2)]) is None
+
+
+def test_a_lean_width_unfolds_only_the_spilled_mla_fold_k2_builds(monkeypatch):
+    """``_lean_width``: a K2 build with the MLA post / prep folds whose launcher
+    needs scratch is replaced by its layer's default build (shared with the
+    layers already on it), every layer keyed on it moved; a fold build that fits
+    keeps its folds, K1 untouched."""
+    pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL")
+    pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
+    from atom.models.kimi_k3.mono import runner
+    from atom.models.kimi_k3.mono.kernels import layer as k2
+
+    monkeypatch.setattr(k2, "build", lambda key: ("plain", key.nblocks))
+    plain8 = k2.K2Build(tokens=6, nblocks=8)
+    both = replace(plain8, mla_post=True, mla_prep=3, prep_nblocks=8, rope_maxpos=64)
+    prep2 = k2.K2Build(tokens=6, nblocks=2, mla_prep=3, prep_nblocks=2, qa_eps=1e-5)
+    post2 = k2.K2Build(tokens=6, nblocks=2, mla_post=True)
+    built = runner.WidthBuild(
+        k1_keys={1: "k1"},
+        k1_launchers={"k1": "k1f"},
+        k2_keys={88: plain8, 90: prep2, 91: both, 15: post2},
+        k2_launchers={plain8: "p8", prep2: "s1", both: "s2", post2: "fits"},
+    )
+    lean = runner._lean_width(built, ["s1", "s2"])
+    plain2 = k2.K2Build(tokens=6, nblocks=2)
+    assert k2.unfolded(both) == plain8 and k2.unfolded(prep2) == plain2
+    assert lean.k2_keys == {88: plain8, 90: plain2, 91: plain8, 15: post2}
+    assert lean.k2_launchers == {plain8: "p8", plain2: ("plain", 2), post2: "fits"}
+    assert lean.k1_keys == built.k1_keys and lean.k1_launchers == built.k1_launchers
+    # a default K2 build that spills: nothing leaner
+    assert runner._lean_width(built, ["p8"]) is None

@@ -142,23 +142,50 @@ def ix_peer_offset(max_rows: int) -> int:
 def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
     """``built`` with each K1 build whose launcher spilled staged a column group
     a GEMV unit (``KdaPreBuild.gemv_unit``): half the weights in flight, slower
-    where ``kda.gemv_staging`` keeps two groups, so only where those do not fit.
-    None when no spilled launcher is such a K1 build (a K2 or indexer spill, or
-    a K1 at one group a unit already): there is nothing leaner to build."""
+    where ``kda.gemv_staging`` keeps two groups, so only where those do not fit;
+    and each K2 build with the MLA post / prep folds whose launcher spilled
+    replaced by its layer's default build (``k2.unfolded``): those layers run
+    their attention tail / seam unfolded at this width (the forward follows the
+    width's K2 keys), the width stays mono. The fold builds sit at K2's
+    register limit, where the backend can leave an unreferenced SGPR spill slot
+    (a private segment, never accessed) that the scratch guard refuses.
+    None when no spilled launcher is such a K1 or K2 build (a default K2 or
+    indexer spill, or a K1 at one group a unit already): there is nothing
+    leaner to build."""
     lean = {
         key: replace(key, gemv_unit=1)
         for key, launcher in built.k1_launchers.items()
         if launcher in spilled and key.gemv_unit > 1
     }
-    if not lean:
+    plain = {
+        key: k2.unfolded(key)
+        for key, launcher in built.k2_launchers.items()
+        if launcher in spilled
+        and isinstance(key, k2.K2Build)
+        and (key.mla_post or key.mla_prep)
+    }
+    if not lean and not plain:
         return None
+    if plain:
+        logger.info(
+            "Kimi-K3 mono: %d-row K2 of layers %s without the MLA folds (their"
+            " fold builds need scratch)",
+            next(iter(plain)).tokens,
+            sorted(layer for layer, key in built.k2_keys.items() if key in plain),
+        )
     k1_keys = {layer: lean.get(key, key) for layer, key in built.k1_keys.items()}
+    k2_keys = {layer: plain.get(key, key) for layer, key in built.k2_keys.items()}
     return replace(
         built,
         k1_keys=k1_keys,
         k1_launchers={
             key: k1.build(key) if key in lean.values() else built.k1_launchers[key]
             for key in set(k1_keys.values())
+        },
+        k2_keys=k2_keys,
+        k2_launchers={
+            key: built.k2_launchers.get(key) or k2.build(key)
+            for key in set(k2_keys.values())
         },
     )
 
@@ -872,11 +899,15 @@ class K3MonoDecodeRunner:
 
     def _prep_key(self, layer_id: int, rows: int) -> dict:
         """K2 build-key fields for layer ``layer_id`` (an M - 1) at ``rows``, or
-        none (past the stage's width the next layer keeps its own seam)."""
+        none (past the stage's width the next layer keeps its own seam; so does
+        a layer whose P0 sums do not fit K2's ``red`` at this width, e.g. 16 rows
+        on 7+ blocks: ``build`` would refuse the whole width)."""
         m = self.mla_prep_prev.get(layer_id)
         if m is None or rows > k2pr.MAX_ROWS:
             return {}
         w = self.mla_prep[m]
+        if not k2pr.red_fits(rows, w.blocks + 1):
+            return {}
         key = {
             "mla_prep": w.mode,
             "prep_nblocks": w.blocks,
