@@ -220,6 +220,14 @@ class ScheduledBatch:
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
         self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
+        self.any_logprobs = any(self.return_logprobs)
+        self.top_logprobs = None
+        self.logprob_requested = ()
+        if self.any_logprobs:
+            self.top_logprobs = [seq.top_logprobs for seq in seqs.values()]
+            self.logprob_requested = tuple(
+                i for i, enabled in enumerate(self.return_logprobs) if enabled
+            )
         self.structured_requests = {}
         for i, seq in enumerate(seqs.values()):
             if seq.json_schema is None:
@@ -598,7 +606,7 @@ class ScheduledBatchOutput:
         self.num_bonus = self._copy_array_view(num_bonus)
         self.is_deferred_out = is_deferred_out
         self.is_prev_prefill = is_prev_prefill
-        self.logprobs = logprobs  # Optional[dict[int, float]]
+        self.logprobs = logprobs
         # DSpark Phase 2: {req_id: ell_r} from this step's propose() — the
         # scheduler-chosen verify length per request. Rides back to the
         # (main-process) scheduler so the NEXT step can size each request's
@@ -3989,11 +3997,7 @@ class Scheduler:
             del seq.token_ids[-strip:]
             del seq.output_tokens[-strip:]
             seq.num_tokens -= strip
-            # Each placeholder pushed a 0.0 alongside it (postprocess patches
-            # that in place too), so they go together or the two lists stop
-            # describing the same tokens.
-            if seq.return_logprobs and len(seq.logprobs) >= strip:
-                del seq.logprobs[-strip:]
+            # Probabilities contain committed tokens only, never placeholders.
         seq.num_rejected = 0
         seq.num_bonus_tokens = 0
         seq.num_placeholder_tokens = 0
@@ -4205,7 +4209,7 @@ class Scheduler:
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
         is_deferred_out = fwd_output.is_deferred_out
-        token_logprobs = fwd_output.logprobs  # Optional[dict[int, float]]
+        token_logprobs = fwd_output.logprobs
         # update token_ids with the actual sampled token ids
 
         finished_seqs = []
@@ -4324,6 +4328,31 @@ class Scheduler:
             if token_logprobs is not None and seq.return_logprobs:
                 token_logprob = token_logprobs.get(seq.id)
 
+            # Check before mutating tokens. A malformed payload must terminate
+            # only its request, never escape into the engine's main loop.
+            if seq.return_logprobs and (
+                getattr(seq, "_injected_t0", None) is not None
+                or len(token_logprob or ()) != num_new_token
+            ):
+                logger.error("Missing or misaligned logprobs for request %s", seq.id)
+                self._mark_finished(
+                    seq, "logprob_error", seq.num_tokens - seq.num_placeholder_tokens
+                )
+                finished_seqs.append(seq)
+                if stream_output_queue is not None:
+                    stream_outputs.append(
+                        (
+                            seq.id,
+                            RequestOutput(
+                                request_id=seq.id,
+                                output_tokens=[],
+                                finished=True,
+                                finish_reason="logprob_error",
+                            ),
+                        )
+                    )
+                continue
+
             # In-place overwrite only when placeholders already exist.
             if is_deferred_out or (
                 self.spec_decode_local and seq.num_placeholder_tokens > 0
@@ -4387,18 +4416,11 @@ class Scheduler:
                 seq.num_placeholder_tokens = max(
                     0, required_placeholders - len(token_ids)
                 )
-                if seq.return_logprobs and token_logprob is not None:
-                    if seq.logprobs:
-                        seq.logprobs[-1] = token_logprob
-                    else:
-                        seq.logprobs.append(token_logprob)
             else:
                 num_rejected = 0
                 num_bonus = 0
                 for token_id in token_ids:
                     seq.append_token(token_id)
-                if seq.return_logprobs and token_logprob is not None:
-                    seq.logprobs.append(token_logprob)
             new_tokens = token_ids
 
             injected_t0 = getattr(seq, "_injected_t0", None)
@@ -4505,11 +4527,11 @@ class Scheduler:
                 # in stop_at_idx / num_new_token, so offset the cut by it.
                 keep = stop_at_idx + 1 + (1 if injected_t0 is not None else 0)
                 new_tokens = new_tokens[:keep]
-                if seq.return_logprobs:
-                    # LLMEngine.postprocess returns the complete logprobs
-                    # array rather than slicing it through num_tokens, so keep
-                    # it aligned explicitly with the cropped completion.
-                    del seq.logprobs[num_tokens - seq.num_prompt_tokens :]
+
+            committed_logprobs = None
+            if seq.return_logprobs:
+                committed_logprobs = (token_logprob or [])[: len(new_tokens)]
+                seq.logprobs.extend(item[0] for item in committed_logprobs)
 
             # Record TTFT from the finalized retained length, after rejected
             # speculative tokens and cap/stop overflow have been removed. A
@@ -4559,6 +4581,7 @@ class Scheduler:
                 request_output = RequestOutput(
                     request_id=seq.id,
                     output_tokens=output_tokens_list,
+                    logprobs=committed_logprobs,
                     finished=(leave_reason is not None),
                     finish_reason=leave_reason,
                     kv_transfer_params_output=getattr(
@@ -4595,8 +4618,6 @@ class Scheduler:
                     num = max(0, num_placeholder - seq.num_rejected)
                     for _ in range(num):
                         seq.append_token(self.eos_token_id)
-                        if seq.return_logprobs:
-                            seq.logprobs.append(0.0)
                     # Added to what the overwrite above left unconsumed, not
                     # replacing it: both runs are trailing `eos_token_id` and
                     # both are what `preempt` has to strip. `=` also undercounted

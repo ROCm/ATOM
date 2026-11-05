@@ -86,6 +86,7 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
+from .logprobs import LogprobCollector, TokenBytes
 from .metrics_setup import create_metrics_exporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
@@ -580,6 +581,8 @@ def _build_sampling_params(
     n: int = 1,
     required_channel: RequiredChannel | None = None,
     max_tokens_is_default: bool = False,
+    logprobs: bool = False,
+    top_logprobs: int = 0,
 ) -> SamplingParams:
     from .model_capabilities import deployment_metadata
 
@@ -603,6 +606,8 @@ def _build_sampling_params(
         ignore_eos=ignore_eos,
         n=n,
         required_channel=required_channel,
+        logprobs=logprobs,
+        top_logprobs=top_logprobs,
     )
 
 
@@ -776,6 +781,8 @@ def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
         "started_at": started_at,
         "num_cached_tokens": getattr(request_output, "num_cached_tokens", 0),
     }
+    if request_output.logprobs is not None:
+        chunk_data["logprobs"] = request_output.logprobs
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
     return chunk_data
@@ -878,6 +885,7 @@ async def generate_async(
     # the counters and never `token_ids`, so nothing serializes it. A
     # consumer that starts reading that key has to convert.
     all_token_ids = new_token_ids()
+    all_logprobs = [] if sampling_params.logprobs else None
     finish_reason: str | None = None
     seq = None
     kv_transfer_output_meta_info = None
@@ -896,6 +904,7 @@ async def generate_async(
             token_queue.put_nowait,
             {
                 "token_ids": request_output.output_tokens,
+                "logprobs": request_output.logprobs,
                 "finished": request_output.finished,
                 "finish_reason": request_output.finish_reason,
                 "ts": now,
@@ -932,6 +941,8 @@ async def generate_async(
                     record_nonstream_first_token()
                 last_token_at = item.get("ts", time.time())
                 all_token_ids.extend(token_ids)
+                if all_logprobs is not None:
+                    all_logprobs.extend(item.get("logprobs") or [])
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
                 _finished_ok = True
@@ -951,7 +962,7 @@ async def generate_async(
                     engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
 
-    text = delivered_text(all_token_ids)
+    text = "" if sampling_params.logprobs else delivered_text(all_token_ids)
     num_tokens_input = (
         seq.num_prompt_tokens
         if seq is not None
@@ -976,6 +987,7 @@ async def generate_async(
     response = {
         "text": text,
         "token_ids": all_token_ids,
+        "logprobs": all_logprobs,
         "finish_reason": finish_reason,
         "num_tokens_input": num_tokens_input,
         "num_tokens_output": num_tokens_output,
@@ -1124,6 +1136,7 @@ async def generate_async_fanout(
 
     started_at = time.time()
     per_tokens = [new_token_ids() for _ in range(n)]
+    per_logprobs = [[] for _ in range(n)] if sampling_params.logprobs else None
     per_first_token_at: list[float | None] = [None] * n
     per_last_token_at: list[float | None] = [None] * n
     per_finish_reason: list[str | None] = [None] * n
@@ -1138,6 +1151,7 @@ async def generate_async_fanout(
                     idx,
                     {
                         "token_ids": request_output.output_tokens,
+                        "logprobs": request_output.logprobs,
                         "finished": request_output.finished,
                         "finish_reason": request_output.finish_reason,
                         "ts": now,
@@ -1186,6 +1200,8 @@ async def generate_async_fanout(
                     record_nonstream_first_token()
                 per_last_token_at[idx] = item.get("ts", time.time())
                 per_tokens[idx].extend(tokens)
+                if per_logprobs is not None:
+                    per_logprobs[idx].extend(item.get("logprobs") or [])
             if item.get("finished", False):
                 per_finish_reason[idx] = item.get("finish_reason")
                 finished[idx] = True
@@ -1218,8 +1234,11 @@ async def generate_async_fanout(
         )
         outputs.append(
             {
-                "text": delivered_text(per_tokens[i]),
+                "text": (
+                    "" if sampling_params.logprobs else delivered_text(per_tokens[i])
+                ),
                 "token_ids": per_tokens[i],
+                "logprobs": per_logprobs[i] if per_logprobs is not None else None,
                 "finish_reason": per_finish_reason[i],
                 "num_tokens_input": num_tokens_input,
                 "num_tokens_output": num_tokens_output,
@@ -1384,7 +1403,9 @@ async def setup_streaming_request(
     # The detokenizer lives in this closure, so it is freed when the engine
     # drops the callback on the stream's last chunk -- no registry, no cleanup.
     assert _stream_batch_dispatcher is not None
-    detokenizer = _stream_batch_dispatcher.new_state()
+    detokenizer = _stream_batch_dispatcher.new_state(
+        decode=not sampling_params.logprobs
+    )
 
     def stream_callback(request_output: RequestOutput) -> None:
         _send_stream_chunk_direct(
@@ -1595,7 +1616,9 @@ async def setup_streaming_request_fanout(
 
     def make_callback(idx: int):
         # One detokenizer per sibling, held by the closure that feeds it.
-        detokenizer = _stream_batch_dispatcher.new_state()
+        detokenizer = _stream_batch_dispatcher.new_state(
+            decode=not sampling_params.logprobs
+        )
 
         def _cb(request_output: RequestOutput) -> None:
             _send_stream_chunk_tagged(
@@ -1891,7 +1914,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         request.tools = normalize_chat_tools(request.tools)
         validate_chat_request(request)
         messages = request.get_messages()
-
+        logprob_codec = None
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
             merged_kwargs.update(request.chat_template_kwargs)
@@ -1930,10 +1953,24 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            logprobs=bool(request.logprobs),
+            top_logprobs=request.top_logprobs or 0,
             required_channel=channel_for_request(
                 required_tool_channel, request.tool_choice, request_tools(request)
             ),
         )
+
+        if request.logprobs:
+            sampling_params.validate_logprob_options(
+                _get_engine_config(),
+                kv_transfer=request.kv_transfer_params,
+                multimodal=_has_multimodal_content(messages),
+                synthetic=synthetic_token_text is not None,
+            )
+            logprob_codec = getattr(app.state, "logprob_codec", None)
+            if logprob_codec is None or logprob_codec.tokenizer is not tokenizer:
+                logprob_codec = TokenBytes(tokenizer)
+                app.state.logprob_codec = logprob_codec
 
         schema = schema_from_format(request.response_format)
 
@@ -2006,64 +2043,44 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         # Streaming
         if request.stream:
-            stream_input = prompt_or_tokens
-            stream_multimodal_data = multimodal_data
-            if effective_n > 1:
-                seq_ids, stream_collector, num_prompt_tokens = (
-                    await setup_streaming_request_fanout(
-                        stream_input,
-                        sampling_params,
-                        request_id,
-                        multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=kv_transfer_params,
-                        **dp_routing,
-                    )
-                )
-                gen = stream_chat_response_fanout(
-                    request_id,
-                    model_name,
+            setup = (
+                setup_streaming_request_fanout
+                if effective_n > 1
+                else setup_streaming_request
+            )
+            sequences, stream_collector, num_prompt_tokens = await setup(
+                prompt_or_tokens,
+                sampling_params,
+                request_id,
+                multimodal_data=multimodal_data,
+                kv_transfer_params=kv_transfer_params,
+                **dp_routing,
+            )
+            if logprob_codec is not None:
+                stream_collector = LogprobCollector(
                     stream_collector,
-                    seq_ids,
-                    num_prompt_tokens,
-                    cleanup_stream,
-                    cleanup_request,
-                    tools=request.tools,
-                    tool_choice=request.tool_choice,
-                    reasoning=_reasoning,
-                    tool_parser_cls=tool_call_parser_cls,
-                    usage_on_finish=compatibility.chat_usage_on_finish,
-                    include_usage=bool(
-                        (request.stream_options or {}).get("include_usage")
-                    ),
+                    logprob_codec,
+                    sampling_params.top_logprobs,
+                    effective_n,
                 )
-            else:
-                seq_id, stream_collector, num_prompt_tokens = (
-                    await setup_streaming_request(
-                        stream_input,
-                        sampling_params,
-                        request_id,
-                        multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=kv_transfer_params,
-                        **dp_routing,
-                    )
-                )
-                gen = stream_chat_response(
-                    request_id,
-                    model_name,
-                    stream_collector,
-                    seq_id,
-                    num_prompt_tokens,
-                    cleanup_stream,
-                    cleanup_request,
-                    tools=request.tools,
-                    tool_choice=request.tool_choice,
-                    reasoning=_reasoning,
-                    tool_parser_cls=tool_call_parser_cls,
-                    usage_on_finish=compatibility.chat_usage_on_finish,
-                    include_usage=bool(
-                        (request.stream_options or {}).get("include_usage")
-                    ),
-                )
+            stream_response = (
+                stream_chat_response_fanout if effective_n > 1 else stream_chat_response
+            )
+            gen = stream_response(
+                request_id,
+                model_name,
+                stream_collector,
+                sequences,
+                num_prompt_tokens,
+                cleanup_stream,
+                cleanup_request,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+                reasoning=_reasoning,
+                tool_parser_cls=tool_call_parser_cls,
+                usage_on_finish=compatibility.chat_usage_on_finish,
+                include_usage=bool((request.stream_options or {}).get("include_usage")),
+            )
             if schema is not None:
 
                 gen = validate_chat_stream(gen, schema)
@@ -2097,6 +2114,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=sampling_params.top_logprobs,
             )
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
@@ -2122,6 +2141,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=sampling_params.top_logprobs,
             )
         elif effective_n > 1:
             outputs = await _race_disconnect(
@@ -2146,6 +2167,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=sampling_params.top_logprobs,
             )
         else:
             final_output = await _run_nonstream_with_disconnect(
@@ -2171,6 +2194,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=sampling_params.top_logprobs,
             )
         if schema is not None:
 

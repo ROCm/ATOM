@@ -369,6 +369,8 @@ def merge_chunk(into: dict, new: dict) -> None:
     and rebuilding them walked the whole accumulation on every merge.
     """
     into["token_ids"].extend(new.get("token_ids") or ())
+    if new.get("logprobs") is not None:
+        into.setdefault("logprobs", []).extend(new["logprobs"])
     # Popped so the string has one reference and CPython grows it in place;
     # assigning `into["text"] + ...` back reallocates and copies per merge.
     text = into.pop("text", "")
@@ -415,6 +417,8 @@ class StreamOutputCollector:
             # A merge extends this list, so it has to be ours. The scheduler
             # already copies per step, but that is too far away to rely on.
             chunk["token_ids"] = list(chunk.get("token_ids") or ())
+            if chunk.get("logprobs") is not None:
+                chunk["logprobs"] = list(chunk["logprobs"])
             self._pending[tag] = chunk
         else:
             merge_chunk(waiting, chunk)
@@ -528,7 +532,7 @@ class StreamDeliveryTiming:
 
 @dataclass
 class StreamState:
-    detokenizer: IncrementalStreamDetokenizer
+    detokenizer: IncrementalStreamDetokenizer | None
     timing: StreamDeliveryTiming = field(default_factory=StreamDeliveryTiming)
 
 
@@ -571,12 +575,14 @@ class StreamBatchDispatcher:
         self._observe_inter_token_latency = observe_inter_token_latency
         self._thread_local = threading.local()
 
-    def new_state(self) -> StreamState:
+    def new_state(self, *, decode: bool = True) -> StreamState:
         """Make decoding and delivery timing state for one stream's callback."""
         return StreamState(
             IncrementalStreamDetokenizer(
                 self.tokenizer, synthetic_text=self.synthetic_text
             )
+            if decode
+            else None
         )
 
     def enqueue(
@@ -589,6 +595,10 @@ class StreamBatchDispatcher:
         tag: int | None = None,
     ) -> None:
         """Buffer a raw chunk until the current engine step is flushed."""
+        if state.detokenizer is None and not isinstance(
+            collector, StreamOutputCollector
+        ):
+            raise ValueError("Raw streams require StreamOutputCollector")
         buf = getattr(self._thread_local, "buf", None)
         if buf is None:
             buf = self._thread_local.buf = []
