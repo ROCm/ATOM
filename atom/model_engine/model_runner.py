@@ -27,7 +27,7 @@ from aiter.dist.parallel_state import (
 from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
-from atom.config import Config, _is_minimax_m3_config, set_current_atom_config
+from atom.config import Config, set_current_atom_config
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     get_pcp_world_size,
@@ -3021,11 +3021,7 @@ class ModelRunner:
         self._pp_recv_needs_sparse = False
         self._pp_index_topk = 0
         self._pp_rank_local_keys = ()
-        hf = self.config.hf_config
-        hf = getattr(hf, "text_config", hf)
-        m3 = _is_minimax_m3_config(hf) and getattr(hf, "use_index_cache", False)
-        if not (self.has_mla_indexer or m3):
-            return
+        self._pp_shared_indexer = None
         pp = get_pp_group()
         if pp.world_size <= 1:
             return
@@ -3043,34 +3039,17 @@ class ModelRunner:
         if not hasattr(inner, "start_layer"):
             return
 
-        if m3:
-            from atom.models.minimax_m3.model import (
-                _should_skip_minimax_m3_index_topk,
-                _sparse_attention_layer_ids,
-            )
-
-            sparse_layers = sorted(_sparse_attention_layer_ids(hf))
-            if not sparse_layers:
-                return
-
-            def needs_topk(boundary):
-                # Dense-only stages relay until the next sparse layer.
-                return next(
-                    (
-                        _should_skip_minimax_m3_index_topk(hf, i)[0]
-                        for i in sparse_layers
-                        if i >= boundary
-                    ),
-                    False,
-                )
-
-            self._pp_recv_needs_sparse = not pp.is_first_rank and needs_topk(
-                inner.start_layer
-            )
-            self._pp_send_needs_sparse = not pp.is_last_rank and needs_topk(
-                inner.end_layer
-            )
-            self._pp_rank_local_keys = ("sparse_kv_indices",)
+        # Models adapt their cache layout behind one factory hook. The runner
+        # only controls when it is loaded/stored and how its tensors travel.
+        factory = getattr(inner, "make_pp_shared_indexer", None)
+        if factory is not None:
+            self._pp_shared_indexer = adapter = factory(pp)
+            if adapter is not None:
+                self._pp_recv_needs_sparse = adapter.recv_needs_sparse
+                self._pp_send_needs_sparse = adapter.send_needs_sparse
+                self._pp_rank_local_keys = adapter.rank_local_keys
+            return
+        if not self.has_mla_indexer:
             return
 
         # Replicate the model's per-layer shared/full classification
@@ -3126,14 +3105,8 @@ class ModelRunner:
             )
 
     def _load_pp_shared_indexer(self, intermediate_tensors):
-        if self._pp_rank_local_keys:
-            # Only logical selections cross PP; attention owns local page metadata.
-            md = get_forward_context().attn_metadata.sparse_attention_metadata
-            md._index_topk_cache_state = {}
-            if self._pp_recv_needs_sparse:
-                md._index_topk_cache_state["pp_topk"] = (
-                    intermediate_tensors.tensors.pop("sparse_kv_indices")
-                )
+        if self._pp_shared_indexer is not None:
+            self._pp_shared_indexer.load(intermediate_tensors, get_forward_context())
         elif intermediate_tensors is not None:
             recv_sparse = intermediate_tensors.tensors.pop("sparse_kv_indices", None)
             if recv_sparse is not None and self._pp_recv_needs_sparse:
@@ -3143,18 +3116,8 @@ class ModelRunner:
     def _store_pp_shared_indexer(self, model_output):
         if not self._pp_send_needs_sparse:
             return
-        if self._pp_rank_local_keys:
-            fwd_ctx = get_forward_context()
-            if fwd_ctx.context.is_dummy_run:
-                # Dummy forwards skip attention and produce no top-k memo.
-                indices = None
-            else:
-                md = fwd_ctx.attn_metadata.sparse_attention_metadata
-                state = md._index_topk_cache_state
-                indices = (
-                    state["topk"]["value"][0] if "topk" in state else state["pp_topk"]
-                )
-            model_output.tensors["sparse_kv_indices"] = indices
+        if self._pp_shared_indexer is not None:
+            self._pp_shared_indexer.store(model_output, get_forward_context())
         else:
             # Use the physical producer row width and the PCP-local token count.
             n = model_output.tensors["hidden_states"].shape[0] * self._pp_index_topk
