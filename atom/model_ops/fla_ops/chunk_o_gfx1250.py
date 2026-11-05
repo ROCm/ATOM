@@ -5,9 +5,16 @@
 Each program computes one chunk of one value head:
     o = scale * (exp(g) * (q @ h) + tril(exp(g_i - g_j) * (q @ k.T)) @ v)
 The gated epilogue computes RMSNorm(bf16(o)) * weight * SiLU(z).
+
+OUT_FP8 (opt-in, for an FP8 per_1x128 e8m0 out_proj): instead of the bf16 output, write the bf16-rounded result as
+fp8 e4m3 [rows, H * V] plus one e8m0 scale per (row, value head) -- V = 128 is one quant group -- in the transposed
+layout (byte of row m, head g at g * scale_rows + m), bit-identical to the bf16 output followed by aiter's
+per_group_quant_hip(group_size=128, transpose_scale=True, scale_type=fp8_e8m0); see model_ops/mxfp8_act_quant.py.
 """
 
 import functools
+
+import torch
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -29,6 +36,9 @@ def _chunk_o_gfx1250_kernel(
     o,
     z,
     norm_weight,
+    o_fp8,
+    o_scale,
+    scale_rows,
     cu_seqlens,
     chunk_indices,
     nt_ptr,
@@ -57,6 +67,9 @@ def _chunk_o_gfx1250_kernel(
     SMEM_G: gl.constexpr,
     NORM_LAYOUT: gl.constexpr,
     FAST_NORM_LAYOUT: gl.constexpr,
+    OUT_FP8: gl.constexpr,
+    SMEM_FP8: gl.constexpr,
+    ROW_LAYOUT: gl.constexpr,
 ):
     # Adjacent value heads reuse the same Q and K tiles.
     pid_bh = gl.program_id(0)
@@ -107,18 +120,29 @@ def _chunk_o_gfx1250_kernel(
         block_shape=(K, V),
         layout=SMEM_H,
     )
-    o_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=o + (start_token * H + head) * V,
-        shape=(T, V),
-        strides=(H * V, 1),
-        block_shape=(BLOCK_M, V),
-        layout=SMEM_ROW_K,
-    )
+    if OUT_FP8:
+        o_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=o_fp8 + (start_token * H + head) * V,
+            shape=(T, V),
+            strides=(H * V, 1),
+            block_shape=(BLOCK_M, V),
+            layout=SMEM_FP8,
+        )
+    else:
+        o_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=o + (start_token * H + head) * V,
+            shape=(T, V),
+            strides=(H * V, 1),
+            block_shape=(BLOCK_M, V),
+            layout=SMEM_ROW_K,
+        )
     q_smem = gl.allocate_shared_memory(q.type.element_ty, [BLOCK_M, K], SMEM_ROW_K)
     k_smem = gl.allocate_shared_memory(k.type.element_ty, [BLOCK_M, K], SMEM_ROW_K)
     h_smem = gl.allocate_shared_memory(h.type.element_ty, [K, V], SMEM_H)
     v_smem = h_smem.slice(0, BLOCK_M, dim=0)
     a_smem = gl.allocate_shared_memory(v.type.element_ty, [BLOCK_M, BLOCK_M], SMEM_A)
+    if OUT_FP8:
+        o8_smem = gl.allocate_shared_memory(o_fp8.dtype.element_ty, [BLOCK_M, V], SMEM_FP8)
     gl.amd.gfx1250.tdm.async_load(q_desc, [start_m, 0], q_smem)
     gl.amd.gfx1250.tdm.async_load(h_desc, [0, 0], h_smem)
     gl.amd.gfx1250.tdm.async_load(k_desc, [start_m, 0], k_smem)
@@ -196,7 +220,7 @@ def _chunk_o_gfx1250_kernel(
     b_o = b_o * scale + b_pv * scale
     if GATED_NORM:
         # Normalize the bf16 output, as in the unfused epilogue.
-        x_bf16 = b_o.to(o.dtype.element_ty)
+        x_bf16 = b_o.to(v.dtype.element_ty)
         x = x_bf16.to(gl.float32)
         if FAST_NORM:
             # Keep the complete-row reduction order across the WMMA layout.
@@ -234,12 +258,33 @@ def _chunk_o_gfx1250_kernel(
             b_z = z_smem.load(WMMA).to(gl.float32)
             silu = b_z * (1.0 / (1.0 + gl.exp(-b_z)))
         b_o = x * rstd[:, None] * weight[None, :] * silu
-    # The A barrier released Q's buffer for the output tile.
-    o_smem = q_smem
-    o_smem.store(b_o.to(o_smem.dtype))
-    gl.barrier()
-    gl.amd.gfx1250.tdm.async_store(o_desc, [start_m, 0], o_smem)
-    gl.amd.gfx1250.tdm.async_wait(0)
+    if OUT_FP8:
+        # mxfp8 per (row, value head): amax of the bf16-rounded row from aiter's kAmaxFloor, capped at 448 * 2^119;
+        # e8m0 exponent of ceil_pow2(amax / 448) (RoundUp); values RNE(x * 2^-(e - 127)) to e4m3.
+        y = b_o.to(v.dtype.element_ty).to(gl.float32)
+        amax = gl.minimum(gl.maximum(gl.max(gl.abs(y), axis=1), 1e-10), 448.0 * 6.646139978924579e35)
+        u = (amax * (1.0 / 448.0)).to(gl.uint32, bitcast=True)
+        e = ((u >> 23) & 0xFF).to(gl.int32)
+        e = e + (((u & 0x7FFFFF) != 0) & (e < 0xFF)).to(gl.int32)
+        inv = ((254 - gl.minimum(e, 253)).to(gl.uint32) << 23).to(gl.float32, bitcast=True)
+        # The tile goes out as the bf16 one does, through LDS and one TDM store that clips the rows past the
+        # sequence end. Its own 9 KiB buffer: a TDM store pads once per row, so Q's bf16 buffer (16 B every 256 B)
+        # cannot be reinterpreted for 128-byte fp8 rows.
+        o_smem = o8_smem
+        o_smem.store((y * inv[:, None]).to(o_fp8.dtype.element_ty))
+        gl.barrier()
+        gl.amd.gfx1250.tdm.async_store(o_desc, [start_m, 0], o_smem)
+        offs_r = gl.arange(0, BLOCK_M, layout=ROW_LAYOUT)
+        e_r = gl.convert_layout(e, ROW_LAYOUT).to(gl.uint8)
+        gl.store(o_scale + head * scale_rows + start_token + start_m + offs_r, e_r, mask=offs_r < num_rows)
+        gl.amd.gfx1250.tdm.async_wait(0)
+    else:
+        # The A barrier released Q's buffer for the output tile.
+        o_smem = q_smem
+        o_smem.store(b_o.to(o_smem.dtype))
+        gl.barrier()
+        gl.amd.gfx1250.tdm.async_store(o_desc, [start_m, 0], o_smem)
+        gl.amd.gfx1250.tdm.async_wait(0)
 
 
 @functools.cache
@@ -264,6 +309,9 @@ def _layouts(K, V, BLOCK_M):
     # Match layer_norm_fwd's layout for bf16 rows.
     norm_layout = gl.BlockedLayout([1, 8], [2, 16], [_NUM_WARPS, 1], [1, 0])
     fast_norm_layout = gl.BlockedLayout([1, 8], [16, 2], [_NUM_WARPS, 1], [0, 1])
+    # fp8 output tile ([BLOCK_M, V] e4m3 through Q's buffer) and one-row-per-lane scale vector
+    smem_fp8 = gl.PaddedSharedLayout.with_identity_for([[V, 16]], [BLOCK_M, V], [1, 0])
+    row_layout = gl.BlockedLayout([1], [32], [_NUM_WARPS], [0])
     return (
         wmma,
         op_a,
@@ -275,6 +323,8 @@ def _layouts(K, V, BLOCK_M):
         smem_g,
         norm_layout,
         fast_norm_layout,
+        smem_fp8,
+        row_layout,
     )
 
 
@@ -298,12 +348,19 @@ def chunk_o_gfx1250(
     V,
     BLOCK_M,
     gate,
+    out_fp8=None,
 ):
     """Write and return chunked attention output in the contiguous bf16 buffer o.
 
     Q/K have Hg heads; V/H/O have H heads and K=V=128, BLOCK_M=64.
     gate is None or (z, weight[V], eps); z has contiguous [H, V] rows.
     With a gate, write RMSNorm(bf16(o)) * weight * SiLU(z).
+
+    out_fp8: None (default: the bf16 output above), or (o_fp8, o_scale) from mxfp8_act_quant.alloc_mxfp8(rows,
+    H * V) with rows >= the B * T token rows written here (rows = the out_proj GEMM's M; extra rows are padding).
+    Then o is not written (may be None); the bf16-rounded result goes to o_fp8 [rows, H * V] fp8 e4m3 and its
+    e8m0 scales to o_scale at head * rows + token, and (o_fp8, mxfp8_act_quant.scale_view(o_scale, rows, H * V))
+    is returned. Padding rows are left alone: fill them with fill_mxfp8_padding.
     """
     layouts = _layouts(K, V, BLOCK_M)
     if gate is not None:
@@ -317,6 +374,15 @@ def chunk_o_gfx1250(
         z = weight = None
         eps = 0.0
         stride_zm = 0
+    if out_fp8 is not None:
+        o_fp8, o_scale = out_fp8
+        rows = o_fp8.shape[0]
+        assert gate is not None, "the fp8 output is the gated-norm (out_proj input) epilogue"
+        assert o_fp8.dtype == torch.float8_e4m3fn and o_fp8.is_contiguous() and o_fp8.shape[1] == H * V
+        assert o_scale.dtype == torch.uint8 and o_scale.numel() == H * rows and rows >= B * T
+    else:
+        o_fp8 = o_scale = None
+        rows = 0
     _chunk_o_gfx1250_kernel[(B * H, NT)](
         q,
         k,
@@ -326,6 +392,9 @@ def chunk_o_gfx1250(
         o,
         z,
         weight,
+        o_fp8,
+        o_scale,
+        rows,
         cu_seqlens,
         chunk_indices,
         nt_ptr,
@@ -354,7 +423,24 @@ def chunk_o_gfx1250(
         SMEM_G=layouts[7],
         NORM_LAYOUT=layouts[8],
         FAST_NORM_LAYOUT=layouts[9],
+        OUT_FP8=out_fp8 is not None,
+        SMEM_FP8=layouts[10],
+        ROW_LAYOUT=layouts[11],
         num_warps=_NUM_WARPS,
         waves_per_eu=_WAVES_PER_EU,
     )
+    if out_fp8 is not None:
+        from atom.model_ops.mxfp8_act_quant import scale_view
+
+        return o_fp8, scale_view(o_scale, rows, H * V)
     return o
+
+
+def fill_mxfp8_padding(o_fp8, o_scale, num_actual_tokens):
+    """The fp8-mode counterpart of `core_attn_out[num_actual_tokens:].zero_()`: rows past num_actual_tokens become
+    what the unfused quant makes of zero rows -- fp8 0 and e8m0 byte 85 (aiter's kAmaxFloor 1e-10 -> 2^-42)."""
+    rows, cols = o_fp8.shape
+    if num_actual_tokens >= rows:
+        return
+    o_fp8[num_actual_tokens:].view(torch.uint8).zero_()
+    o_scale.view(cols // 128, rows)[:, num_actual_tokens:].fill_(85)

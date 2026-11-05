@@ -1093,6 +1093,7 @@ def linear_attention_into_output_fake(
     core_attn_out: torch.Tensor,
     layer_name: str,
     z: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
 ) -> None:
     return None
 
@@ -1103,7 +1104,7 @@ def linear_attention_into_output_fake(
 @mark_spliting_op(
     is_custom=True,
     gen_fake=linear_attention_into_output_fake,
-    mutates_args=["core_attn_out"],
+    mutates_args=["core_attn_out", "out_scale"],
 )
 @eager_region(unless=_gdn_records_inline)
 def linear_attention_into_output(
@@ -1113,11 +1114,14 @@ def linear_attention_into_output(
     core_attn_out: torch.Tensor,
     layer_name: str,
     z: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
 ) -> None:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
     # The output gate goes only to impls that apply the gated RMSNorm.
     gate = {} if z is None else {"z": z}
+    if out_scale is not None:  # MXFP8 out (ATOM_MXFP8_FUSED_ACT_QUANT): fp8 core_attn_out + e8m0 bytes
+        gate["out_scale"] = out_scale
     self.impl.forward(mixed_qkv, b, a, core_attn_out, layer_name, **gate)
 
 
@@ -1228,7 +1232,30 @@ class LinearAttention(nn.Module):
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
         z: torch.Tensor | None = None,
+        out_scale: torch.Tensor | None = None,
     ):
+        """`out_scale` (ATOM_MXFP8_FUSED_ACT_QUANT): `core_attn_out` is fp8 [T, VH, V] and `out_scale` receives the
+        e8m0 bytes ([VH, T] order) of the out_proj's MXFP8 input."""
+        if out_scale is not None:
+            if torch.compiler.is_compiling():
+                # the returning op has no MXFP8 form: bf16, then the standalone quant (the same bytes)
+                from aiter import dtypes as _dt
+
+                from atom.model_ops.linear import per_1x128_e8m0_quant
+
+                rows = core_attn_out.shape[0]
+                y = torch.ops.aiter.linear_attention_with_output_base(
+                    mixed_qkv, b, a, torch.empty(core_attn_out.shape, dtype=torch.bfloat16,
+                                                 device=core_attn_out.device), self.layer_name, z
+                )
+                q, s = per_1x128_e8m0_quant(y.view(rows, -1), quant_dtype=_dt.fp8, transpose_scale=True)
+                core_attn_out.view(rows, -1).copy_(q)
+                out_scale.view(torch.uint8)[: s.numel()].copy_(s.view(torch.uint8).reshape(-1))
+                return core_attn_out
+            torch.ops.aiter.linear_attention_into_output(
+                mixed_qkv, b, a, core_attn_out, self.layer_name, z, out_scale
+            )
+            return core_attn_out
         if torch.compiler.is_compiling():
             # The piecewise backend splits at the returning op; a mutating op
             # traces as auto_functionalized and would not split.

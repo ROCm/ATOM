@@ -7,6 +7,7 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import contextlib
 import functools
 
 import torch
@@ -176,6 +177,25 @@ def chunk_fwd_kernel_o(
     )
 
 
+# MXFP8 out_proj input (ATOM_MXFP8_FUSED_ACT_QUANT): while set, the gated gfx1250 chunk_o writes fp8 + e8m0 scales
+# into these buffers instead of bf16 into `o` (see `mxfp8_output`).
+_MXFP8_OUT = None
+
+
+@contextlib.contextmanager
+def mxfp8_output(o_fp8: torch.Tensor, o_scale: torch.Tensor):
+    """Within this block a gated `chunk_fwd_o` on the gfx1250 kernel writes the out_proj's MXFP8 input --
+    `o_fp8` [rows, H * V] fp8 and `o_scale` (e8m0 bytes at g * rows + m) -- and leaves its `o` unwritten. Yields
+    a list that is non-empty once a kernel took the buffers; the caller quantizes `o` itself otherwise."""
+    global _MXFP8_OUT
+    used: list = []
+    prev, _MXFP8_OUT = _MXFP8_OUT, (o_fp8, o_scale, used)
+    try:
+        yield used
+    finally:
+        _MXFP8_OUT = prev
+
+
 def chunk_fwd_o(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -252,6 +272,14 @@ def chunk_fwd_o(
     ):
         from .chunk_o_gfx1250 import chunk_o_gfx1250
 
+        if _MXFP8_OUT is not None and gate is not None:
+            o_fp8, o_scale, used = _MXFP8_OUT
+            chunk_o_gfx1250(
+                q, k, v, h, g, o, scale, cu_seqlens, chunk_indices, nt_ptr, NT, T, B, H, Hg, K, V, BT,
+                gate=gate, out_fp8=(o_fp8, o_scale),
+            )
+            used.append(True)
+            return o
         return chunk_o_gfx1250(
             q,
             k,

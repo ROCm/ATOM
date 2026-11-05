@@ -312,6 +312,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
+    # MXFP8 activations for e8m0 per_1x128 projections: the kernel that produces a projection's input (the MoE-tail
+    # RMSNorm, the attention output gate, the GDN output kernels) writes fp8 + e8m0 scales itself, so the Linear
+    # skips its standalone activation quant. Bit-identical to the unfused path.
+    # Online-quantize the fused GDN in_proj (in_proj_qkvzba) too: a quantized checkpoint builds it bf16, and its
+    # prefix is not the one the online quant config's patterns name.
+    "ATOM_GDN_IN_PROJ_ONLINE_QUANT": lambda: (
+        os.getenv("ATOM_GDN_IN_PROJ_ONLINE_QUANT", "0") == "1"
+    ),
+    "ATOM_MXFP8_FUSED_ACT_QUANT": lambda: (
+        os.getenv("ATOM_MXFP8_FUSED_ACT_QUANT", "0") == "1"
+    ),
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
         os.getenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", "0") == "1"
     ),

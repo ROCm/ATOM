@@ -1070,6 +1070,11 @@ class LinearBase(nn.Module):
             self.quant_type, self.params_dtype, online_layer_quant_config
         ):
             return
+        # 128x128 block FP8 with E8M0 (power-of-two) weight scales (ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE) applies to
+        # online-quantized layers too; blockscale_e8m0_scale was decided at init from the unquantized source type.
+        _online_e8m0 = bool(
+            online_quant_type == QuantType.per_1x128 and envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+        )
 
         assert online_quant_dtype in [
             dtypes.fp8,
@@ -1176,7 +1181,7 @@ class LinearBase(nn.Module):
             # quant_weight_online would cast an FP32 weight down anyway.
             weight = dequantize_nvfp4(weight, weight_scale, per_row_scale_2)
             q_weight, weight_scale = quant_weight_online(
-                weight, online_quant_type, online_quant_dtype
+                weight, online_quant_type, online_quant_dtype, e8m0_scale=_online_e8m0
             )
         else:
             weight = dequant_weight_online(
@@ -1187,7 +1192,7 @@ class LinearBase(nn.Module):
                 self.output_partition_sizes,
             )
             q_weight, weight_scale = quant_weight_online(
-                weight, online_quant_type, online_quant_dtype
+                weight, online_quant_type, online_quant_dtype, e8m0_scale=_online_e8m0
             )
         if need_gather:
             q_weight, weight_scale = self._shard_quantized_weight(
@@ -1204,6 +1209,10 @@ class LinearBase(nn.Module):
 
         # Update quant state
         self.quant_type = online_quant_type
+        if _online_e8m0:
+            self.blockscale_e8m0_scale = True
+            logger.info("OQ e8m0 blockscale: %s weight %s scale %s %s", self.prefix, tuple(self.weight.shape),
+                        tuple(self.weight_scale.shape), self.weight_scale.dtype)
         self.params_dtype = online_quant_dtype
         self.layer_quant_config = online_layer_quant_config
         self._stream_online_quant = False
@@ -1436,6 +1445,16 @@ class LinearBase(nn.Module):
             return True
         return self.quant_type.value == QuantType.per_1x128.value and bool(
             envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        )
+
+    def takes_mxfp8_input(self) -> bool:
+        """A per_1x128 layer with e8m0 activation scales on the preshuffle GEMM: its input producer may hand it
+        `(x_fp8, x_scale)` as `mxfp8_act_quant` writes them (group 128, e8m0, transposed scale) -- the bytes its own
+        `per_1x128_e8m0_quant` would produce -- instead of bf16 rows."""
+        return (
+            self.quant_type.value == QuantType.per_1x128.value
+            and bool(getattr(self, "blockscale_e8m0_scale", False))
+            and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
 
     @mark_trace
