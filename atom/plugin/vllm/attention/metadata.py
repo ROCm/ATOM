@@ -17,7 +17,11 @@ from vllm.v1.attention.backend import (
 
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import dcp_persistent_supported
-from atom.model_ops.attention_mla import _MLA_MIN_HEADS, mla_dcp_kernel_num_heads
+from atom.model_ops.attention_mla import (
+    _MLA_MIN_HEADS,
+    mla_dcp_kernel_num_heads,
+    mla_kernel_num_heads,
+)
 from atom.plugin.vllm.attention.layer_mla import (
     disabled_mla_persistent_metadata,
     mla_fold_kv_metadata_triton,
@@ -1340,8 +1344,10 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 self.num_attention_heads,
             )
 
-        self.padded_num_attention_heads = max(
-            self.num_attention_heads, self.min_query_heads
+        # Must equal `MLAAttention.padded_num_heads`, which the plugin's MLA
+        # layer inherits: that pads the query, this plans the work for it.
+        self.padded_num_attention_heads = mla_kernel_num_heads(
+            max(self.num_attention_heads, self.min_query_heads)
         )
         # Whether DCP decode can run in persistent mode on this GPU (gfx950 has
         # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
