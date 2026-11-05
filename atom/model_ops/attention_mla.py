@@ -88,7 +88,9 @@ from atom.utils.forward_context import (
     AttentionMetaData,
     ForwardContext,
     get_forward_context,
+    pass_scheduled_tokens_gpu,
 )
+from atom.utils.region_graph import eager_region, on_scheduled_rows_into
 
 # Cap on the KV-split budget: aiter cuts the KV walk into
 # `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
@@ -560,6 +562,48 @@ def _mla_output_width(impl: _MLAOutputShape, hidden_size: int) -> int:
     return hidden_size
 
 
+@eager_region()
+def _mla_prefill_core(
+    out: torch.Tensor,
+    prefill_q: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q8: torch.Tensor | None,
+    k8: torch.Tensor | None,
+    v8: torch.Tensor | None,
+    fp8_scales: tuple[torch.Tensor, ...] | None,
+    layer_name: str,
+) -> torch.Tensor:
+    """The TR-graph break of a split dense MLA prefill
+    (`MLAAttention.forward_prefill_split`): the KV-cache write and the
+    attention over the new tokens and any cached prefix, whose launches follow
+    the requests. Writes the scheduled rows of ``out`` (``[T, heads,
+    v_head_dim]``) and hands it back. ``out`` comes zeroed from the recorded
+    segment, so a padded bucket's rows past them stay zero and a replay copies
+    nothing. The FP8 operands are passed flat so they slice with the rows; the
+    scales are ``(q, k, v, gather k, gather v)``."""
+    impl = (
+        get_current_atom_config()
+        .compilation_config.static_forward_context[layer_name]
+        .impl
+    )
+    return on_scheduled_rows_into(
+        impl._prefill_attend,
+        out,
+        prefill_q,
+        k_new,
+        v_new,
+        k_nope,
+        k_rope,
+        q8,
+        k8,
+        v8,
+        fp8_scales,
+    )
+
+
 def supports_dpa_persistent_mode(
     atom_config,
     mla_modules: MLAModules,
@@ -611,6 +655,10 @@ class MLAAttention(nn.Module):
         super().__init__()
         self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
         self._flydsl_fp8_mha_ok: bool | None = None
+        # Set by a model whose dense prefill a token graph records up to the
+        # attention core rather than around the whole layer
+        # (`records_prefill_split`).
+        self.split_prefill_recording = False
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = float(scale)
@@ -1867,11 +1915,38 @@ class MLAAttention(nn.Module):
         new_lse). The cached prefix is the "prefix" side (smaller token
         positions), new tokens are the "suffix".
         """
-        from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
+        # Step 1's inputs: new-token K/V via kv_b_proj on the latent.
+        prefill_q, k_new, v_new, quant_k_rope = self._new_token_kv(
+            prefill_q, kv_c_normed_new, k_rope_new
+        )
+        # Quantize Q once and reuse it across the new tokens and cached chunks.
+        q_fp8, new_kv_fp8, kv_out_scales = self._quantize_new_tokens(
+            prefill_q, k_new, v_new, quant_k_rope
+        )
+        output = self._chunked_prefill_attention(
+            prefill_q,
+            k_new,
+            v_new,
+            q_fp8,
+            new_kv_fp8,
+            kv_out_scales,
+            kv_cache,
+            attn_metadata,
+            chunk_meta,
+        )
+        return self.o_proj(output.flatten(start_dim=-2))
 
+    def _new_token_kv(
+        self,
+        prefill_q: torch.Tensor,
+        kv_c_normed_new: torch.Tensor,
+        k_rope_new: torch.Tensor,
+    ):
+        """The new tokens' K/V from ``kv_b_proj`` on their latent, as a dense
+        prefill's attention takes them: ``(prefill_q, k_new, v_new,
+        quant_k_rope)``, with Q and K past the rope pad dropped. Sized by the
+        rows alone."""
         self._check_flydsl_fp8_mha(prefill_q)
-
-        # Step 1: new-tokens self-attn via kv_b_proj on the latent.
         if k_rope_new.dim() == 2:
             k_rope_new = k_rope_new.unsqueeze(1)
         kv_nope_new = self.kv_b_proj(kv_c_normed_new).view(
@@ -1882,17 +1957,45 @@ class MLAAttention(nn.Module):
         )
         k_new, quant_k_rope = self._prepare_prefill_k(k_nope_new, k_rope_new)
         prefill_q, k_new = self._drop_rope_pad(prefill_q, k_new)
-        # Quantize Q once and reuse it across the new tokens and cached chunks.
-        q_fp8 = None
-        new_kv_fp8 = None
-        kv_out_scales = None
-        if self._flydsl_fp8_mha_ok:
-            q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = fused_qkv_per_tensor_quant(
-                prefill_q, k_new, v_new, k_rope=quant_k_rope
-            )
-            q_fp8 = (q8, qs)
-            new_kv_fp8 = (k8, v8, ks, vs)
-            kv_out_scales = (gather_ks, gather_vs)
+        return prefill_q, k_new, v_new, quant_k_rope
+
+    def _quantize_new_tokens(
+        self,
+        prefill_q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        quant_k_rope: torch.Tensor | None,
+        num_rows: torch.Tensor | None = None,
+    ):
+        """The new tokens' FP8 Q/K/V for the FlyDSL FP8 attention:
+        ``(q_fp8, new_kv_fp8, kv_out_scales)``, or Nones on the BF16 path.
+        ``num_rows`` counts the real rows of a padded token-graph bucket
+        (`fused_qkv_per_tensor_quant`)."""
+        if not self._flydsl_fp8_mha_ok:
+            return None, None, None
+        q8, k8, v8, qs, ks, vs, gather_ks, gather_vs = fused_qkv_per_tensor_quant(
+            prefill_q, k_new, v_new, k_rope=quant_k_rope, num_rows=num_rows
+        )
+        return (q8, qs), (k8, v8, ks, vs), (gather_ks, gather_vs)
+
+    def _chunked_prefill_attention(
+        self,
+        prefill_q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        q_fp8,
+        new_kv_fp8,
+        kv_out_scales,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+        chunk_meta,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Steps 1-3 of `_forward_prefill_cached_chunked` on the new tokens'
+        Q/K/V: ``[tokens, heads, v_head_dim]``, written into ``output`` when
+        one is given."""
+        from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
+
         new_out, new_lse = self._flash_attn_prefill(
             prefill_q,
             k_new,
@@ -1995,17 +2098,20 @@ class MLAAttention(nn.Module):
         # back to the new-only output (should not happen since has_cached
         # implies ≥1 seq has cached_len > 0).
         if chunked_out is None:
-            output = new_out
-        else:
+            if output is None:
+                return new_out
+            output.copy_(new_out)
+            return output
+        if output is None:
             output = torch.empty_like(new_out)
-            merge_attn_states(
-                output=output,
-                prefix_output=chunked_out,
-                prefix_lse=chunked_lse,
-                suffix_output=new_out,
-                suffix_lse=new_lse,
-            )
-        return self.o_proj(output.flatten(start_dim=-2))
+        merge_attn_states(
+            output=output,
+            prefix_output=chunked_out,
+            prefix_lse=chunked_lse,
+            suffix_output=new_out,
+            suffix_lse=new_lse,
+        )
+        return output
 
     def _dcp_compute_prefill_context(
         self,
@@ -3017,6 +3123,225 @@ class MLAAttention(nn.Module):
         _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
         self._pcp_write_full_kv(kv_cache, kv_c, k_pe, slot_mapping)
 
+    def _prefill_q(
+        self,
+        q: torch.Tensor,
+        q_scale: torch.Tensor | None,
+        k_rope: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """A dense prefill's query, ``[T, heads, qk_head_dim]``, RoPE applied
+        to its positional lanes and, in place, to ``k_rope``."""
+        # QREP: q_proj emits the whole DCP-group head set, but dense prefill
+        # needs only this rank's heads: its MHA path never gathers q, so there
+        # is no AllGather Q for QREP to remove here.
+        proj = self._local_q_proj() if self.qrep_enabled else self.q_proj
+        prefill_q = proj(q, x_scale=q_scale).view(-1, self.num_heads, self.qk_head_dim)
+        prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
+        self.rotary_emb(positions, prefill_q_pe, k_rope)
+        return prefill_q
+
+    def _write_prefill_kv(
+        self,
+        kv_cache: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+    ) -> None:
+        """A dense prefill's new tokens written to the paged KV cache, in the
+        layout the decode kernels read."""
+        if kv_cache.numel() == 0:
+            return
+        if self.kv_shuffled:
+            shuffled_cache = self._shuffled_kv_view(kv_cache)
+            triton_cat_and_cache_mla(
+                k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
+                k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
+                shuffled_cache,
+                attn_metadata.slot_mapping.flatten(),
+                self._k_scale,
+                apply_scale=True,
+                shuffled_kv_cache=True,
+            )
+        elif self.use_seg_mla:
+            # Write the KV cache in the segmented layout so the decode-phase
+            # mla_decode_fwd (which reads seg layout) sees a consistent cache
+            # for tokens written during prefill. kv_cache is flattened to
+            # [num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)] so the
+            # kernel derives page_size from stride(0).
+            kv_cache_seg = self._seg_kv_cache_view(kv_cache)
+            concat_and_cache_mla_seg(
+                k_nope,
+                k_rope.squeeze(1),
+                kv_cache_seg,
+                attn_metadata.slot_mapping.flatten(),
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=self._k_scale,
+            )
+        else:
+            concat_and_cache_mla(
+                k_nope,
+                k_rope.squeeze(1),
+                kv_cache,
+                attn_metadata.slot_mapping.flatten(),
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=self._k_scale,
+            )
+
+    # ---- Dense prefill split for token graphs -----------------------------
+    # A prefill token-graph recording (`atom/utils/region_graph.py`) breaks
+    # only where launches follow the requests. In a dense prefill that is the
+    # KV-cache write and the attention, whose varlen and chunked-prefix calls
+    # (DCP's context all-gather among them) take the step's lengths. The Q
+    # projection, the new tokens' kv_b_proj and their FP8 quantization take
+    # the rows alone, so a model that opts in (`split_prefill_recording`)
+    # records them instead of running them eagerly on every replay.
+
+    def records_prefill_split(self) -> bool:
+        """Whether this forward runs the dense prefill split
+        (`forward_prefill_split`) instead of the whole layer as one TR-graph
+        break: a prefill token-graph recording, and the capture's warmup
+        forward before it -- so the head's kernels compile and load there, and
+        the recording only records them."""
+        if not self.split_prefill_recording:
+            return False
+        fwd_ctx = get_forward_context()
+        context = getattr(fwd_ctx, "context", None)
+        if context is None or not context.is_prefill:
+            return False
+        recording = getattr(fwd_ctx, "tr_graph", None) == "record"
+        # The warmup forward: the capture's synthetic dummy prefill, which
+        # runs under `in_hipgraph` but is not recorded.
+        warmup = fwd_ctx.in_hipgraph and context.is_dummy_run
+        return (recording or warmup) and self._prefill_split_supported()
+
+    def _prefill_split_supported(self) -> bool:
+        """The dense prefills the split serves: not sparse (its prefill is the
+        MLA kernel over the cache), no ``o_proj`` inside (the output is the
+        attention itself), and no PCP (its shards are not the rows the step's
+        count covers)."""
+        return (
+            not self.is_sparse_mla
+            and isinstance(self.o_proj, nn.Identity)
+            and not (pcp_is_enabled() and get_pcp_world_size() > 1)
+        )
+
+    def forward_prefill_split(
+        self,
+        q: torch.Tensor,
+        q_scale: torch.Tensor | None,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        positions: torch.Tensor,
+        layer_name: str,
+    ) -> torch.Tensor:
+        """A dense prefill as a token graph records it
+        (`records_prefill_split`): the head -- Q projection and RoPE, the new
+        tokens' ``kv_b_proj`` and their FP8 quantization -- is sized by the
+        rows alone and lands in the recorded segment; the KV-cache write and
+        the attention break (`_mla_prefill_core`). Returns ``[T, heads *
+        v_head_dim]``, as `forward_impl` does."""
+        prefill_q = self._prefill_q(q, q_scale, k_rope, positions)
+        prefill_q, k_new, v_new, quant_k_rope = self._new_token_kv(
+            prefill_q, k_nope, k_rope
+        )
+        # A padded bucket's per-tensor descales cover its real rows alone: the
+        # live step's count, which every replay reads in place.
+        q_fp8, new_kv_fp8, kv_out_scales = self._quantize_new_tokens(
+            prefill_q,
+            k_new,
+            v_new,
+            quant_k_rope,
+            num_rows=pass_scheduled_tokens_gpu(prefill_q.shape[0]),
+        )
+        q8 = k8 = v8 = fp8_scales = None
+        if q_fp8 is not None:
+            (q8, q_descale), (k8, v8, k_descale, v_descale) = q_fp8, new_kv_fp8
+            fp8_scales = (q_descale, k_descale, v_descale, *kv_out_scales)
+        # Zeroed here, in the recorded segment: the core writes the scheduled
+        # rows in place, so neither it nor the replay copies the output.
+        out = prefill_q.new_zeros((prefill_q.shape[0], self.num_heads, self.v_head_dim))
+        out = _mla_prefill_core(
+            out,
+            prefill_q,
+            k_new,
+            v_new,
+            k_nope,
+            k_rope,
+            q8,
+            k8,
+            v8,
+            fp8_scales,
+            layer_name,
+        )
+        return out.flatten(start_dim=-2)
+
+    def _prefill_attend(
+        self,
+        out: torch.Tensor,
+        prefill_q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        q8: torch.Tensor | None,
+        k8: torch.Tensor | None,
+        v8: torch.Tensor | None,
+        fp8_scales: tuple[torch.Tensor, ...] | None,
+    ) -> None:
+        """`_mla_prefill_core` on ``[T, ...]`` rows and the live step: the
+        KV-cache write, then the attention `forward_impl` dispatches to -- the
+        new tokens alone, or with the cached prefix by chunks or in one pass
+        -- written into ``out``. The recording's dummy step leaves ``out`` as
+        it is."""
+        fwd_ctx = get_forward_context()
+        if fwd_ctx.context.is_dummy_run:
+            return
+        attn_metadata = fwd_ctx.attn_metadata
+        kv_cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"].k_cache
+        self._write_prefill_kv(kv_cache, k_nope, k_rope, attn_metadata)
+        q_fp8 = new_kv_fp8 = kv_out_scales = None
+        if fp8_scales is not None:
+            q_descale, k_descale, v_descale, gather_k, gather_v = fp8_scales
+            q_fp8 = (q8, q_descale)
+            new_kv_fp8 = (k8, v8, k_descale, v_descale)
+            kv_out_scales = (gather_k, gather_v)
+        chunk_meta = getattr(attn_metadata, "mla_chunk_meta", None)
+        if attn_metadata.has_cached and chunk_meta is not None:
+            self._chunked_prefill_attention(
+                prefill_q,
+                k_new,
+                v_new,
+                q_fp8,
+                new_kv_fp8,
+                kv_out_scales,
+                kv_cache,
+                attn_metadata,
+                chunk_meta,
+                output=out,
+            )
+            return
+        if attn_metadata.has_cached:
+            output = self._forward_prefill_cached_single_pass(
+                prefill_q, kv_cache, attn_metadata
+            )
+        else:
+            output = self._flash_attn_prefill(
+                prefill_q,
+                k_new,
+                v_new,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                cu_seqlens_k=attn_metadata.cu_seqlens_k,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_seqlen_k=attn_metadata.max_seqlen_k,
+                min_seqlen_q=attn_metadata.min_seqlen_q,
+                dropout_p=attn_metadata.dropout_p,
+                causal=True,
+                q_fp8=q_fp8,
+                kv_fp8=new_kv_fp8,
+            )
+        out.view(output.shape).copy_(output)
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -3043,53 +3368,8 @@ class MLAAttention(nn.Module):
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
-            # QREP: q_proj emits the whole DCP-group head set, but dense prefill
-            # needs only this rank's heads: its MHA path never gathers q, so there
-            # is no AllGather Q for QREP to remove here.
-            proj = self._local_q_proj() if self.qrep_enabled else self.q_proj
-            prefill_q = proj(q, x_scale=q_scale).view(
-                -1, self.num_heads, self.qk_head_dim
-            )
-            prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
-            self.rotary_emb(positions, prefill_q_pe, k_rope)
-
-            if kv_cache.numel() > 0:
-                if self.kv_shuffled:
-                    shuffled_cache = self._shuffled_kv_view(kv_cache)
-                    triton_cat_and_cache_mla(
-                        k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
-                        k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
-                        shuffled_cache,
-                        attn_metadata.slot_mapping.flatten(),
-                        self._k_scale,
-                        apply_scale=True,
-                        shuffled_kv_cache=True,
-                    )
-                elif self.use_seg_mla:
-                    # Write the KV cache in the segmented layout so the
-                    # decode-phase mla_decode_fwd (which reads seg layout) sees a
-                    # consistent cache for tokens written during prefill.
-                    # kv_cache is flattened to
-                    # [num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)] so
-                    # the kernel derives page_size from stride(0).
-                    kv_cache_seg = self._seg_kv_cache_view(kv_cache)
-                    concat_and_cache_mla_seg(
-                        k_nope,
-                        k_rope.squeeze(1),
-                        kv_cache_seg,
-                        attn_metadata.slot_mapping.flatten(),
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        scale=self._k_scale,
-                    )
-                else:
-                    concat_and_cache_mla(
-                        k_nope,
-                        k_rope.squeeze(1),
-                        kv_cache,
-                        attn_metadata.slot_mapping.flatten(),
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        scale=self._k_scale,
-                    )
+            prefill_q = self._prefill_q(q, q_scale, k_rope, positions)
+            self._write_prefill_kv(kv_cache, k_nope, k_rope, attn_metadata)
 
             if attn_metadata.has_cached:
                 # Shuffled KV takes either path too: the builder gives the chunked

@@ -1009,8 +1009,31 @@ def fake_(
 # This way, although attention operation is complicated,
 # we can still capture the model's computation graph as a full-graph
 @mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
-@eager_region()
 def unified_attention_with_output_base(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+) -> torch.Tensor:
+    """The attention as one TR-graph break (`_attention_region`), or, for an
+    MLA layer whose dense prefill a token graph records up to its core, that
+    split (`MLAAttention.records_prefill_split`)."""
+    if use_mla:
+        atom_config = get_current_atom_config()
+        bound = atom_config.compilation_config.static_forward_context[layer_name]
+        impl = getattr(bound, "impl", bound)
+        records_split = getattr(impl, "records_prefill_split", None)
+        if records_split is not None and records_split():
+            return impl.forward_prefill_split(q, q_scale, k, v, positions, layer_name)
+    return _attention_region(q, q_scale, k, v, positions, layer_name, use_mla, qkv)
+
+
+@eager_region()
+def _attention_region(
     q: torch.Tensor,
     q_scale: torch.Tensor | None,
     k: torch.Tensor,
