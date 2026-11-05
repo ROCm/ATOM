@@ -421,6 +421,7 @@ class ScheduledBatch:
         # or rebind it, so the staging buffer can be the buffer.
         self.scheduled_tokens = np.frombuffer(staged, dtype=np.int32)
 
+        self.scheduled_spec_decode_tokens = None
         if num_spec_step > 0 and scheduled_spec_decode_tokens is not None:
             # One row per sequence, in batch order. The caller's dict is keyed
             # by request id and holds only sequences that DO have drafts, so
@@ -557,6 +558,7 @@ class ScheduledBatch:
             "num_scheduled_tokens",
             "temperatures",
             "return_logprobs",
+            "top_logprobs",
             "num_rejected",
             "num_bonus",
             "top_ks",
@@ -599,6 +601,10 @@ class ScheduledBatch:
     )
     _SEGMENT_FIELDS = frozenset(
         (
+            "any_logprobs",
+            "logprob_requested",
+            "logprob_request_indices",
+            "logprob_rows",
             "scheduled_tokens",
             "block_tables",
             "block_table_rows",
@@ -677,6 +683,14 @@ class ScheduledBatch:
             for i, v in self.structured_requests.items()
             if start <= i < stop
         }
+        result.any_logprobs = any(result.return_logprobs)
+        result.logprob_requested = tuple(
+            i for i, enabled in enumerate(result.return_logprobs) if enabled
+        )
+        # Sampling belongs to the parent step. Device indices address its
+        # compact logits and must not be inherited by an attention segment.
+        result.logprob_request_indices = None
+        result.logprob_rows = None
         result.total_seqs_num = stop - start
         result.total_seqs_num_prefill = max(
             0, min(stop, self.total_seqs_num_prefill) - start

@@ -2847,8 +2847,9 @@ class ModelRunner:
         batch.logprob_rows = None
         if getattr(batch, "any_logprobs", False):
             lengths, width = None, 1
-            if self._verifies_drafts(batch, batch.total_tokens_num_prefill > 0):
-                _, lengths, _ = self.attn_metadata_builder.decode_spans(batch)
+            spans = self._verify_spans(batch)
+            if spans is not None:
+                lengths, _, _ = spans
                 width = self.drafter.mtp_k + 1
             requested, model_rows, sample_rows = host_logprob_rows(
                 batch.logprob_requested, lengths, width
