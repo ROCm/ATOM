@@ -66,6 +66,9 @@ class UBatchWrapper(nn.Module):
                 if job is not None:
                     job()
             finally:
+                # A job closes over the microbatch results. Release it before
+                # waiting for more work, including when later steps skip TBO.
+                job = None
                 self._worker_job_done[idx].set()
 
     def _ensure_workers(self, device: torch.device):

@@ -879,8 +879,12 @@ Mixed startup therefore binds a temporary KV pool and runs real forwards
 before the serving pool is sized. It samples prefill-heavy, balanced, and
 decode-heavy shapes within the configured token and sequence limits, at
 short and maximum valid contexts. DSpark covers both full-width verification
-and q=1, retaining the full draft width in both cases. The configured TBO
-path executes as part of these forwards.
+and q=1, retaining the full draft width in both cases. With TBO enabled, it
+profiles both the configured path and unsplit forwards: a decode-only DP
+rank can veto splitting for the whole group, increasing the per-forward
+workspace without changing the scheduled token budget. Allocator caches
+are retained across both sweeps, and the original TBO settings are restored
+before serving.
 
 Old history can share a read-only zero page during this allocation profile;
 current writes use private pages and state slots. Temporary KV bindings are
