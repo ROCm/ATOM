@@ -34,13 +34,15 @@ the bf16 roundings, the product) is the torch kernels' bit for bit given equal
 different order (bf16 MFMAs of the exactly widened FP8 operands, wave-chunked K)
 than the triton / FlyDSL kernels: fp32-ulp differences, rarely one bf16 ulp of
 ``gate`` / ``av``. The v-up quantization itself (amax, scale, reciprocal, RNE
-E4M3) is the triton kernel's operation for operation.
+E4M3) is the triton kernel's operation for operation, NaN handling included
+(a NaN is ignored by the amax and the clamp).
 """
 
 import struct
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl.expr import arith as farith
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
@@ -85,6 +87,26 @@ from atom.mono.device.ops import (
 )
 from atom.mono.device.sync import publish
 from atom.mono.plan.execution import THREADS, WAVES
+
+
+def _fmaxnum(a, b):
+    """max that ignores a NaN operand (``arith.maxnumf``), as triton's
+    ``tl.maximum`` / ``tl.max`` / ``tl.clamp`` do by default; ``fx.max`` propagates
+    NaN (``arith.maximumf``)."""
+    return fx.Float32(
+        farith.maxnumf(
+            farith.as_ir_value(fx.Float32(a)), farith.as_ir_value(fx.Float32(b))
+        )
+    )
+
+
+def _fminnum(a, b):
+    """min that ignores a NaN operand (``arith.minnumf``); see ``_fmaxnum``."""
+    return fx.Float32(
+        farith.minnumf(
+            farith.as_ir_value(fx.Float32(a)), farith.as_ir_value(fx.Float32(b))
+        )
+    )
 
 
 def _bf16_rne(x: float) -> float:
@@ -241,7 +263,10 @@ def post_task(c, j):
                     accs[jt] = mfma_bf16(wa, xb, accs[jt])
     # ---- v-up: the triton kernel's per-token 128-group FP8 quant, in registers.
     # Lanes lane % 16 == t of the 4 lane groups hold token t's 128 values of
-    # this wave's chunk; their amax is the group's.
+    # this wave's chunk; their amax is the group's. The amax and the clamp ignore
+    # a NaN as triton's do: the MLA decode can return whole NaN latent columns,
+    # which the production v-up turns into finite values, and a propagated NaN
+    # amax would make every value of the group (so the whole core) NaN.
     vaccs = []
     vscs = []
     for jt in range_constexpr(len(tiles)):
@@ -252,15 +277,15 @@ def post_task(c, j):
                 vals += [bf_lo(w), bf_hi(w)]
         lm = abs(vals[0])
         for e in range_constexpr(1, 32):
-            lm = fx.max(lm, abs(vals[e]))
-        am = butterfly(lm, (16, 32), fx.max)
-        m = fx.max(am, _f32(AMAX_FLOOR))
+            lm = _fmaxnum(lm, abs(vals[e]))
+        am = butterfly(lm, (16, 32), _fmaxnum)
+        m = _fmaxnum(am, _f32(AMAX_FLOOR))
         sc = m * _f32(INV_FP8_MAX)
         rcp = _f32(1.0) / sc
         acc = fx.Vector.filled(4, 0.0, fx.Float32)
         for q in range_constexpr(4):
             qv = [
-                fx.min(fx.max(vals[8 * q + e] * rcp, _f32(-FP8_MAX)), _f32(FP8_MAX))
+                _fminnum(_fmaxnum(vals[8 * q + e] * rcp, _f32(-FP8_MAX)), _f32(FP8_MAX))
                 for e in range(8)
             ]
             d0 = fp8_pack4(qv[0], qv[1], qv[2], qv[3])
