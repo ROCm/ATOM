@@ -300,16 +300,24 @@ def verify(
     temperatures,
     q_row_base,
     ratio_scratch,
+    step=0,
     top_ks=None,
     top_ps=None,
     **args,
 ):
     """`rejection_sample` on `verify_batch` arguments: the ratio verify of
-    ``q`` under these filters, or exact match where ``q`` is None."""
+    ``q`` at Philox ``step`` under these filters, or exact match where ``q``
+    is None."""
     ratio = None
     if q is not None:
         ratio = RatioVerifyInputs(
-            q, q_row_base, temperatures, top_ks, top_ps, ratio_scratch
+            q,
+            q_row_base,
+            step,
+            temperatures,
+            top_ks,
+            top_ps,
+            ratio_scratch,
         )
     return rejection_sample(**args, ratio=ratio)
 
@@ -516,7 +524,7 @@ def _dense_residual_race_kernel(
         tl.store(part_idx_ptr + part, best_id)
 
 
-def dense_verify(args, q_dense, ratio_step):
+def dense_verify(args, q_dense, step):
     """The verify over a dense q: the same stats, race and pick kernels the
     sparse path runs, around `_dense_accept_kernel` and
     `_dense_residual_race_kernel`, the race reading the rejecting position's
@@ -591,7 +599,7 @@ def dense_verify(args, q_dense, ratio_step):
         vocab,
         vocab,
         SAMPLER_EPS,
-        _RATIO_ACCEPT_KEY | ratio_step,
+        _RATIO_ACCEPT_KEY | step,
         num_warps=1,
     )
     # The rejecting position's own q row at its request's row. A request without one gets some row the race masks
@@ -613,7 +621,7 @@ def dense_verify(args, q_dense, ratio_step):
         batch_n,
         vocab,
         vocab,
-        _RATIO_RESIDUAL_KEY | ratio_step,
+        _RATIO_RESIDUAL_KEY | step,
         BLOCK_V=_RATIO_BLOCK_V,
         FILTER=False,
         num_warps=8,
@@ -635,7 +643,7 @@ def dense_verify(args, q_dense, ratio_step):
         steps,
         vocab,
         vocab,
-        _RATIO_RESIDUAL_KEY | ratio_step,
+        _RATIO_RESIDUAL_KEY | step,
         BLOCK_TILE=triton.next_power_of_2(tiles),
         BLOCK_V=_RATIO_BLOCK_V,
         FILTER=False,
@@ -742,7 +750,7 @@ def first_token_law(target, temps, top_ks, top_ps, width=1024, step=41):
     out, (accepted, _, _) = verify(
         **verify_batch(drafts.to(torch.int32), 1, target.expand(n, -1), temps),
         q=store,
-        ratio_step=step,
+        step=step,
         top_ks=top_ks,
         top_ps=top_ps,
     )

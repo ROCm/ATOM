@@ -59,13 +59,17 @@ class RatioVerifyInputs(NamedTuple):
     q: SparseQStore
     #: [batch_size] int32: each request's first q row, or < 0 for no live q.
     q_row_base: torch.Tensor
+    #: The Philox step this forward staged, < 2**32: the same on every TP
+    #: rank, it keys the accept coins and the residual race.
+    step: int
     #: [batch_size] fp32, pre-clamped: p is softmax(target_logits / T).
     temperatures: torch.Tensor
     #: `Sampler`'s filters for the batch, so the verify targets the same p_f.
     top_ks: int | torch.Tensor | None
     top_ps: float | torch.Tensor | None
-    #: Preallocated device scratch (`ratio_verify_scratch`).
-    scratch: SamplingScratch
+    #: Preallocated device scratch (`ratio_verify_scratch`). The verifier's,
+    #: not the drafter's: `RejectionSampler` fills it in.
+    scratch: SamplingScratch | None = None
 
 
 class VerifyScratch(NamedTuple):
@@ -493,7 +497,6 @@ def _ratio_sample(
     bonus_token_ids: torch.Tensor,
     bonus_logits_indices: torch.Tensor,
     num_spec_steps: int,
-    ratio_step: int,
 ) -> None:
     """Launch the probability-ratio verify: stats, combine, the filter where
     the batch has one, accept, residual, carving its partials out of
@@ -550,7 +553,7 @@ def _ratio_sample(
         q_width,
         stride,
         SAMPLER_EPS,
-        _RATIO_ACCEPT_KEY | ratio_step,
+        _RATIO_ACCEPT_KEY | ratio.step,
         BLOCK_T=triton.next_power_of_2(max(num_spec_steps, 1)),
         BLOCK_Q=min(triton.next_power_of_2(q_width), _RATIO_ACCEPT_BLOCK_Q),
         FILTER=filtered,
@@ -572,7 +575,7 @@ def _ratio_sample(
         vocab_size,
         stride,
         q_width,
-        _RATIO_RESIDUAL_KEY | ratio_step,
+        _RATIO_RESIDUAL_KEY | ratio.step,
         BLOCK_V=_RATIO_BLOCK_V,
         BLOCK_Q=_RATIO_RACE_BLOCK_Q,
         SEARCH_STEPS=q_width.bit_length(),
@@ -596,7 +599,7 @@ def _ratio_sample(
         num_spec_steps,
         vocab_size,
         stride,
-        _RATIO_RESIDUAL_KEY | ratio_step,
+        _RATIO_RESIDUAL_KEY | ratio.step,
         BLOCK_TILE=triton.next_power_of_2(n_tiles),
         BLOCK_V=_RATIO_BLOCK_V,
         FILTER=filtered,
@@ -654,8 +657,8 @@ def warmup_ratio_verify(
     width and ``scratch``'s alignment (batch counts are not specialized on,
     `_BATCH_COUNTS`).
 
-    It touches no state: the coins use step 0 of the keys rather than the
-    draft's published step, the store is its own and
+    It touches no state: the coins use step 0 of the keys rather than a
+    staged step, the store is its own and
     never read (the row base is -1), and ``scratch`` holds nothing across a
     verify. It has no collective and takes no input from the device, so every
     rank runs it alike.
@@ -683,6 +686,7 @@ def warmup_ratio_verify(
             RatioVerifyInputs(
                 store,
                 ints([-1]),
+                0,
                 torch.ones(1, dtype=torch.float32, device=device),
                 top_ks,
                 top_ps,
@@ -691,5 +695,4 @@ def warmup_ratio_verify(
             ints([0]),
             ints([num_tokens], torch.int64),
             num_spec_steps,
-            0,
         )

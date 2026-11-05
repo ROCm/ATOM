@@ -59,6 +59,7 @@ def two_token_ratio(q, drafts, width):
     return RatioVerifyInputs(
         store,
         torch.arange(batch, device="cuda", dtype=torch.int32) * width,
+        0,
         torch.ones(batch, device="cuda"),
         None,
         None,

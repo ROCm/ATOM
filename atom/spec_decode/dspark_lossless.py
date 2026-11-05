@@ -19,6 +19,7 @@ from atom.model_ops.sampler import AITER_TOPK_TOPP_AVAILABLE, SAMPLER_EPS
 from atom.model_ops.spec_sampling.dspark_markov_sample import (
     dspark_markov_sample_scratch,
 )
+from atom.model_ops.spec_sampling.ratio_verify import RatioVerifyInputs
 from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore, store_width
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_q_slots import DraftQSlots
@@ -255,12 +256,27 @@ class DSparkLossless:
         counts[at["draft_q_row_base"]] = rows.q_row_base
         counts[at["draft_verify_q_row_base"]] = rows.verify_q_row_base
 
-    def verify_inputs(self, bs: int) -> tuple[SparseQStore, torch.Tensor, int]:
-        """What the verify reads of the draft: the q store, each of the ``bs``
-        requests' first q row (-1: none), and the Philox step this forward
-        staged, which keys the verify's draws as it keys the draft's. Only for
-        a forward staged with ``verifies``: any other publishes no q rows."""
-        return self.q_store, self.verify_q_row_base.gpu[:bs], int(self.seed.np[0])
+    def verify_inputs(
+        self,
+        bs: int,
+        temperatures: torch.Tensor,
+        top_ks: int | torch.Tensor | None,
+        top_ps: float | torch.Tensor | None,
+    ) -> RatioVerifyInputs:
+        """The probability-ratio verify's inputs for ``bs`` requests: the q
+        store, each request's first q row (-1: none) and the Philox step this
+        forward staged, with the batch's ``temperatures`` and filters as
+        `Sampler` took them (a uniform filter is a scalar). The scratch is the
+        verifier's (`RejectionSampler.arm_ratio`). Only for a forward staged
+        with ``verifies``: any other publishes no q rows."""
+        return RatioVerifyInputs(
+            self.q_store,
+            self.verify_q_row_base.gpu[:bs],
+            int(self.seed.np[0]),
+            temperatures,
+            top_ks,
+            top_ps,
+        )
 
     def clear_destinations(self) -> None:
         """Point every draft row at no q row, on the host and the device (on

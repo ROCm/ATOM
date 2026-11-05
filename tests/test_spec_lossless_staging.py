@@ -19,6 +19,7 @@ pytest.importorskip("aiter", reason="the proposer imports the AITER sampler ops"
 
 from atom.model_ops.sampler import Sampler
 from atom.model_ops.spec_sampling import sparse_q_store
+from atom.model_ops.spec_sampling.ratio_verify import RatioVerifyInputs
 from atom.spec_decode import dspark_lossless, dspark_proposer
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.dspark_proposer import DSparkProposer
@@ -330,11 +331,17 @@ def test_the_verify_refuses_logits_it_was_not_warmed_for(monkeypatch):
         cu_num_draft_tokens=None,
         bonus_logits_indices=None,
     )
-    draft_q = (None, torch.full((2,), -1, dtype=torch.int32), 0)
-    sampler(meta, torch.zeros(2, VOCAB, dtype=torch.bfloat16), None, draft_q=draft_q)
+    ratio = RatioVerifyInputs(
+        None, torch.full((2,), -1, dtype=torch.int32), 0, None, None, None
+    )
+    sampler(meta, torch.zeros(2, VOCAB, dtype=torch.bfloat16), None, ratio=ratio)
     assert len(reached) == 1
+    # The drafter's inputs, verified in the scratch the sampler owns.
+    passed = reached[0][4]
+    assert passed.scratch is sampler._ratio_scratch
+    assert passed._replace(scratch=None) == ratio
     with pytest.raises(RuntimeError, match="warmed up for torch.bfloat16"):
-        sampler(meta, torch.zeros(2, VOCAB), None, draft_q=draft_q)
+        sampler(meta, torch.zeros(2, VOCAB), None, ratio=ratio)
     # Exact match reads no ratio kernel, so any dtype goes.
     sampler(meta, torch.zeros(2, VOCAB), None)
     assert len(reached) == 2
@@ -418,14 +425,21 @@ def test_the_verify_reads_the_store_and_each_requests_first_q_row(monkeypatch):
     prop = proposer(monkeypatch)
     stage(prop, batch(["a", "b"]))
     stage(prop, batch(["b", "a"]))
-    store, q_row_base, step = prop.lossless.verify_inputs(2)
+    temps, top_ks, top_ps = torch.ones(2), 5, torch.tensor([0.9, 0.7])
+    ratio = prop.lossless.verify_inputs(2, temps, top_ks, top_ps)
     # The sparse store itself; the verify borrows nothing of the draft's.
-    assert store is prop.lossless.q_store
-    # The step the last stage published: the draft's and the verify's one key.
-    assert step == prop.metadata_buffers["draft_seed"].np[0] == 1
+    assert ratio.q is prop.lossless.q_store
+    # The step the last stage published: this forward's draft and verify key.
+    assert ratio.step == prop.metadata_buffers["draft_seed"].np[0] == 1
     # The published verify bases, read where the H2D lands them.
     gpu = prop.metadata_buffers["draft_verify_q_row_base"].gpu
+    q_row_base = ratio.q_row_base
     assert q_row_base.shape == (2,) and q_row_base.data_ptr() == gpu.data_ptr()
+    # The batch's own sampling inputs, as `postprocess` took them.
+    assert ratio.temperatures is temps
+    assert ratio.top_ks is top_ks and ratio.top_ps is top_ps
+    # The scratch is the rejection sampler's.
+    assert ratio.scratch is None
     assert min(verify(prop)[:2]) >= 0
 
 

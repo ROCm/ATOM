@@ -10,7 +10,7 @@ from atom.model_ops.spec_sampling.ratio_verify import (
     ratio_verify_scratch,
     warmup_ratio_verify,
 )
-from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore, store_width
+from atom.model_ops.spec_sampling.sparse_q_store import store_width
 from atom.model_ops.verify_kernels import _draft_token, _finish_request
 from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata
@@ -161,22 +161,15 @@ class RejectionSampler(nn.Module):
         bonus_token_ids: torch.Tensor,
         *,
         target_token_ids: torch.Tensor | None = None,
-        # The draft's q store, each request's first q row and the Philox step
-        # the draft published; None selects exact match. With it, p is
-        # softmax(target_logits / temperatures), filtered as `Sampler` filters
-        # it with top_ks / top_ps.
-        draft_q: tuple[SparseQStore, torch.Tensor, int] | None = None,
-        temperatures: torch.Tensor | None = None,
-        top_ks: int | torch.Tensor | None = None,
-        top_ps: float | torch.Tensor | None = None,
+        # The drafter's probability-ratio inputs (`DSparkLossless.verify_inputs`);
+        # None selects exact match.
+        ratio: RatioVerifyInputs | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
         # need to ensure it's contiguous to satisfy the assertion in rejection_sample.
         target_logits = target_logits.contiguous()
-        ratio = None
-        ratio_step = 0
-        if draft_q is not None:
+        if ratio is not None:
             if target_logits.dtype != self._ratio_logits_dtype:
                 # The kernels were compiled for another logits dtype (or not at
                 # all); this verify would JIT them mid-serving while the TP/DP
@@ -185,17 +178,9 @@ class RejectionSampler(nn.Module):
                     f"ratio verify was warmed up for {self._ratio_logits_dtype} "
                     f"logits but the LM head emits {target_logits.dtype}"
                 )
-            # The draft's step keys the verify's draws too; the key's high word
-            # keeps the two streams apart (`ratio_verify`).
-            store, q_row_base, ratio_step = draft_q
-            ratio = RatioVerifyInputs(
-                store,
-                q_row_base,
-                temperatures,
-                top_ks,
-                top_ps,
-                self._ratio_scratch,
-            )
+            # The verify carves its partials out of the scratch this sampler
+            # owns (`arm_ratio`).
+            ratio = ratio._replace(scratch=self._ratio_scratch)
 
         output_token_ids = rejection_sample(
             metadata.input_ids,
@@ -210,7 +195,6 @@ class RejectionSampler(nn.Module):
             synthetic_acceptance_rates=self.synthetic_acceptance_rates,
             synthetic_step=self._synthetic_step,
             target_token_ids=target_token_ids,
-            ratio_step=ratio_step,
         )
         if self.synthetic_acceptance_rates is not None:
             self._synthetic_step += 1
@@ -242,10 +226,6 @@ def rejection_sample(
     # Per-step seed for the (rank-consistent) synthetic RNG; ignored otherwise.
     synthetic_step: int = 0,
     target_token_ids: torch.Tensor | None = None,
-    *,
-    # Per-step key for the (rank-consistent) accept coins and residual race,
-    # < 2**32.
-    ratio_step: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert input_ids.ndim == 1 and target_logits_indices.ndim == 1
     assert cu_num_draft_tokens.ndim == 1
@@ -341,7 +321,6 @@ def rejection_sample(
             bonus_token_ids,
             bonus_logits_indices,
             num_spec_steps,
-            ratio_step,
         )
     elif target_token_ids is not None or RELAXED_TOP_N <= 1:
         # Match the actual target draw for stochastic requests; greedy requests

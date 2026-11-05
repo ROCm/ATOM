@@ -121,7 +121,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
     bonus and an unarmed exact-match draw stay `Sampler`'s, one law per
     process. An all-greedy verify asks for neither."""
     bs = 2
-    top_ks, top_ps = torch.tensor([5, 0]), 0.9
+    temperatures, top_ks, top_ps = torch.ones(bs), torch.tensor([5, 0]), 0.9
     spec = (
         SimpleNamespace(
             bonus_logits_indices=torch.tensor([1, 3]),
@@ -139,8 +139,8 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
     monkeypatch.setattr(
         runner_module, "get_tp_group", lambda: SimpleNamespace(world_size=1)
     )
-    draft_q = (object(), object()) if armed else None
-    lossless = SimpleNamespace(verify_inputs=mock.Mock(return_value=draft_q))
+    ratio = object() if armed else None
+    lossless = SimpleNamespace(verify_inputs=mock.Mock(return_value=ratio))
     drafter = SimpleNamespace(lossless=lossless)
     runner = SimpleNamespace(
         tokenID_processor=SimpleNamespace(zero_spec_counts=torch.zeros(8)),
@@ -164,7 +164,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
                 required_channel=None,
             ),
             torch.zeros(4, 8),
-            torch.ones(bs),
+            temperatures,
             top_ks,
             top_ps,
             all_greedy,
@@ -175,13 +175,15 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
         return
     if all_greedy:
         lossless.verify_inputs.assert_not_called()
-        assert runner.rejection_sampler.forward.call_args.kwargs["draft_q"] is None
+        assert runner.rejection_sampler.forward.call_args.kwargs["ratio"] is None
         assert not runner.sampler.sample_verification_tokens.called
         return
-    assert lossless.verify_inputs.call_args.args == (bs,)
-    passed = runner.rejection_sampler.forward.call_args.kwargs
-    assert passed["draft_q"] is draft_q
-    assert passed["top_ks"] is top_ks and passed["top_ps"] is top_ps
+    passed_bs, passed_temps, passed_ks, passed_ps = (
+        lossless.verify_inputs.call_args.args
+    )
+    assert passed_bs == bs and passed_temps is temperatures
+    assert passed_ks is top_ks and passed_ps is top_ps
+    assert runner.rejection_sampler.forward.call_args.kwargs["ratio"] is ratio
     # Unarmed, the exact-match draw is the flag-off law, as the bonus is.
     assert runner.sampler.sample_verification_tokens.called is not armed
 
