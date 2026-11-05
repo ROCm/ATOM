@@ -55,6 +55,7 @@ from atom.plugin.sglang.deepseek_v4_bridge import (
     _publish_fp4_decode_topk,
     _resolve_v4_pool_geometry,
     _write_dense_only_prefill_indices,
+    build_atom_v4_verify_graph_metadata_from_sglang,
 )
 
 SGLANG_BRIDGE = (
@@ -81,6 +82,8 @@ def test_proxy_geometry_matches_per_layer_cache_views():
         compression_ratios=[0, 4, 128],
         device="cpu",
     )
+    assert pool.needs_paged_swa_allocator is True
+    assert pool.request_window is None
     geometry = _proxy_pool_geometry(pool)
 
     assert geometry.classes == (DENSE_RATIO, CSA_RATIO, HCA_RATIO)
@@ -266,6 +269,66 @@ def test_dense_only_prefill_indices_write_swa_without_calling_shared_writer():
     assert "_geometry_supports_shared_prefill_writer" in SGLANG_BRIDGE
 
 
+def test_draft_extend_graph_metadata_uses_reconstructed_positions():
+    """Capture buffers keep positions at 0 while seq_lens hold the fill value.
+
+    The dense-only writer used to mix those zeros with a chunk start taken
+    from the reconstructed positions, and torch.arange rejected the negative
+    span. The graph metadata must describe the reconstructed positions.
+    """
+    bs = 2
+    tokens_per_req = 4
+    seq_fill = 1024
+    pool = ATOMDeepSeekV4ProxyKVPool(
+        max_num_reqs=bs,
+        num_req_slots=bs,
+        swa_size=8,
+        c4_size=0,
+        c128_size=0,
+        c4_state_pool_size=0,
+        c128_state_pool_size=0,
+        page_size=256,
+        swa_page_size=256,
+        dtype=torch.bfloat16,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=8,
+        indexer_head_dim=8,
+        layer_num=1,
+        compression_ratios=[DENSE_RATIO],
+        device="cpu",
+    )
+    pool._atom_v4_index_topk = 4
+    req_to_token = torch.arange(
+        bs * ATOM_DEEPSEEK_V4_BLOCK_SIZE, dtype=torch.int32
+    ).reshape(bs, ATOM_DEEPSEEK_V4_BLOCK_SIZE)
+    forward_batch = SimpleNamespace(
+        batch_size=bs,
+        forward_mode=SimpleNamespace(
+            is_draft_extend=lambda include_v2=False: True,
+            is_decode_or_idle=lambda: False,
+            is_target_verify=lambda: False,
+        ),
+        spec_info=SimpleNamespace(num_tokens_per_req=tokens_per_req),
+        seq_lens=torch.full((bs,), seq_fill, dtype=torch.int32),
+        seq_lens_cpu=torch.full((bs,), seq_fill, dtype=torch.int32),
+        req_pool_indices=torch.arange(bs, dtype=torch.int64),
+        out_cache_loc=torch.arange(bs * tokens_per_req, dtype=torch.int64),
+    )
+    md = build_atom_v4_verify_graph_metadata_from_sglang(
+        forward_batch,
+        torch.zeros(bs * tokens_per_req, dtype=torch.int64),
+        proxy_pool=pool,
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+    )
+    prefix = seq_fill - tokens_per_req
+    chunk_start = torch.as_tensor(md.chunk_start_per_seq_cpu)
+    assert torch.equal(chunk_start, torch.full((bs,), prefix))
+    # In-chunk rows, not a negative span from the zeroed capture buffer.
+    # Four tokens at the chunk start contribute 1+2+3+4 extend rows per request.
+    assert int(md.kv_indices_extend[0]) == 0
+    assert int(md.kv_indptr_extend[-1]) == bs * 10
+
+
 def test_sglang_v4_metadata_declares_fp4_decode_topk():
     metadata = SimpleNamespace()
     _init_v4_split_plans(metadata)
@@ -275,3 +338,35 @@ def test_sglang_v4_metadata_declares_fp4_decode_topk():
     _publish_fp4_decode_topk(metadata, 2, storage)
     # No ATOM config in this test, so the FP4 scorer stays off.
     assert metadata.fp4_decode_topk is None
+
+
+def test_draft_extend_swa_patch_does_not_pass_removed_kernel_kwargs():
+    from atom.plugin.sglang.models.deepseek_v4_attention import (
+        _draft_extend_fused_swa_kwargs,
+    )
+
+    attn = SimpleNamespace(
+        compress_ratio=0,
+        kv_fp8=True,
+        swa_kv="nope",
+        swa_kv_rope="rope",
+        swa_cache_size=128,
+    )
+    # Draft-extend graph metadata has no precomputed rows. The patch must not
+    # invent the removed kernel arguments; swa_write still persists the window.
+    assert _draft_extend_fused_swa_kwargs(attn, SimpleNamespace()) is None
+
+    dest = torch.zeros(4, dtype=torch.int32)
+    extra = _draft_extend_fused_swa_kwargs(
+        attn,
+        SimpleNamespace(
+            swa_dest_rows={0: dest},
+            batch_id_per_q_token=torch.zeros(4, dtype=torch.int32),
+        ),
+    )
+    assert extra is not None
+    assert extra["swa_dest_rows"] is dest
+    assert extra["swa_nope_scale_buff"] == "nope"
+    assert "swa_cache_size" not in extra
+    assert "swa_cu_seqlens_q" not in extra
+    assert "swa_write_per_batch" not in extra

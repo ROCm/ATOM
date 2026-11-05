@@ -6,7 +6,8 @@
 A model owns its query projection, how it writes index keys, and what it does
 with the selection; the attention builder publishes the step's rows once,
 cut to the logits plane it owns (`IndexRows.workspace`). Scoring and top-k --
-under DCP, each rank's share of the rows and their all-gather -- are here.
+split across DCP or TP ranks, each rank's share of the rows and their
+all-gather -- are here.
 
 The names below are loaded on first use, so importing a submodule that needs
 no kernels (``schedule``) does not import AITER."""
@@ -17,10 +18,10 @@ _EXPORTS = {
     "NATURAL": ".rows",
     "PRESHUFFLE": ".rows",
     "ConcatKeys": ".rows",
-    "DcpSplit": ".rows",
     "Fp4LaunchStorages": ".rows",
     "IndexCache": ".rows",
     "IndexRows": ".rows",
+    "RowSplit": ".rows",
     "concat_rows": ".rows",
     "fp4_rows": ".rows",
     "fp8_rows": ".rows",
@@ -34,10 +35,10 @@ __all__ = [
     "NATURAL",
     "PRESHUFFLE",
     "ConcatKeys",
-    "DcpSplit",
     "Fp4LaunchStorages",
     "IndexCache",
     "IndexRows",
+    "RowSplit",
     "concat_rows",
     "fold_query_scale",
     "fp4_rows",

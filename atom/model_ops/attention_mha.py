@@ -711,11 +711,8 @@ class PagedAttentionImpl(nn.Module):
 
         num_seqs = attn_metadata.context_lens.shape[0]
 
-        _, num_q_heads_total, head_size = q.shape
+        _, num_q_heads_total, _ = q.shape
         _, num_kv_heads, _, _, _ = k_cache.shape
-        query_group_size = attn_metadata.max_seqlen_q * (
-            num_q_heads_total // num_kv_heads
-        )
         assert num_q_heads_total % num_kv_heads == 0
 
         max_context_partition_num = dense_decode_splits(num_seqs, num_kv_heads)
@@ -725,23 +722,6 @@ class PagedAttentionImpl(nn.Module):
         if self.sliding_window > 0:
             max_context_partition_num = 1
             context_partition_size = 128
-
-        intermediate_shape = (
-            num_seqs,
-            num_kv_heads,
-            max_context_partition_num,
-            query_group_size,
-        )
-        exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
-        max_logits = torch.empty(
-            intermediate_shape, dtype=torch.float32, device=q.device
-        )
-        temporary_output = torch.empty(
-            *intermediate_shape,
-            head_size,
-            dtype=q.dtype,
-            device=q.device,
-        )
 
         if k_scale is not None and k_scale.numel() > 1:
             k_scale = k_scale.unsqueeze(-1)
@@ -765,9 +745,6 @@ class PagedAttentionImpl(nn.Module):
             q_scale=None,
             k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
             v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
-            exp_sums=exp_sums,
-            max_logits=max_logits,
-            temporary_output=temporary_output,
             alibi_slopes=None,
             sinks=self.sinks,
             sliding_window=self.sliding_window,

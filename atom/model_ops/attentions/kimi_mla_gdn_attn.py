@@ -50,6 +50,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def __init__(self, model_runner):
         super().__init__(model_runner=model_runner)
 
+    def spec_honours_state_fork(self) -> bool:
+        # K3's KDA forward reads the fork table; glm5_next's does not.
+        return self.model_runner.hf_text_config.model_type == "kimi_linear"
+
     def _module_kinds(self, module) -> tuple:
         """Two row spaces: the MLA pool's rows, and the KDA state slots.
 
@@ -133,16 +137,16 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         config = self.model_runner.config
         model_type = config.hf_config.model_type
 
-        if connector != "mooncake":
+        # Mooncake moves the slot regions published below; MoRIIO registers the
+        # same pools itself, from the `per_request_state` tensors in kv_caches.
+        if connector not in ("mooncake", "moriio"):
             raise NotImplementedError(
-                f"{model_type} disaggregated serving requires the mooncake "
-                f"connector, but kv_connector={connector!r} is configured. Only "
-                "mooncake transfers the slot-indexed regions the KDA recurrent "
-                f"state lives in; every other connector would move the "
-                f"{len(self.mla_idx_by_layer)} full-attention layers and "
-                f"silently drop the state of the other "
-                f"{len(self.kda_idx_by_layer)}. Set "
-                'kv_transfer_config["kv_connector"] = "mooncake".'
+                f"{model_type} disaggregated serving requires the mooncake or "
+                f"moriio connector, but kv_connector={connector!r} is configured. "
+                "Only those two move the slot-indexed KDA recurrent state; any "
+                f"other connector would move the {len(self.mla_idx_by_layer)} "
+                "full-attention layers and silently drop the state of the other "
+                f"{len(self.kda_idx_by_layer)}."
             )
 
         if getattr(config, "pipeline_parallel_size", 1) > 1:

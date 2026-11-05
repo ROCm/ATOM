@@ -50,6 +50,7 @@ from atom.model_ops.attention_mla import (
     MLAAttention,
     mla_dcp_kernel_num_heads,
     mla_dcp_sparse_prefill_num_heads,
+    mla_kernel_num_heads,
 )
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     HEADS as HEAD_GROUP_HEADS,
@@ -65,9 +66,9 @@ from atom.model_ops.glm5_next.geometry import (
 )
 from atom.model_ops.indexer import (
     ConcatKeys,
-    DcpSplit,
     Fp4LaunchStorages,
     IndexRows,
+    RowSplit,
     concat_rows,
     fp4_rows,
     fp8_rows,
@@ -350,7 +351,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         draft_hf_config = spec_config.draft_model_hf_config
         # Every PP stage sees the whole draft stack: a draft is not split, so
         # `get_pp_indices` never covers it and this count is the same on each.
+        # A standalone DSpark draft (Kimi-K3-DSpark) is a model of its own
+        # layers; an MTP draft names its predict layers.
+        if spec_config.use_dspark_with_draft():
+            return draft_hf_config.num_hidden_layers
         return getattr(draft_hf_config, "num_nextn_predict_layers", 1)
+
+    def _global_num_draft_index_layers(self) -> int:
+        """Draft layers that own an index-key cache slice: all of them when the
+        draft declares an indexer (an MTP layer of a sparse target), none when
+        it does not (Kimi-K3-DSpark's dense MLA layers)."""
+        spec_config = getattr(self.model_runner.config, "speculative_config", None)
+        if spec_config is None or not getattr(
+            spec_config.draft_model_hf_config, "index_topk", None
+        ):
+            return 0
+        return self._global_num_draft_layers()
 
     def _local_draft_rows(self) -> int:
         """Rows of this stage's pool that a shared draft's stack holds.
@@ -402,11 +418,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         start_layer, end_layer = get_pp_indices(
             num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
         )
-        num_local_draft_layers = self._local_draft_rows()
+        num_local_draft_layers = (
+            self._local_draft_rows() if self._global_num_draft_index_layers() else 0
+        )
         global_layer_ids = _global_index_cache_layer_ids(
             getattr(hf_config, "indexer_types", None),
             num_hidden_layers,
-            self._global_num_draft_layers(),
+            self._global_num_draft_index_layers(),
             getattr(hf_config, "layer_types", None),
             getattr(hf_config, "dsa_layer_indices", None),
         )
@@ -448,7 +466,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         config = model_runner.config
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
-        self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
+        # Must equal `MLAAttention.padded_num_heads`: that pads the query, this
+        # sizes the kernel's work descriptors for it.
+        self.padded_num_attention_heads = mla_kernel_num_heads(
+            max(self.num_attention_heads, _MLA_MIN_HEADS)
+        )
         self.is_sparse = model_runner.has_mla_indexer
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
         # GLM-5.3's pooled indexer selects `index_topk // index_kpool` POOLS --
@@ -1634,9 +1656,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # P/D transfer writes index bytes into KV rows. The length check below
             # cannot catch it because both sides derive from the same empty list.
             hybrid_mla_layers = getattr(runner, "full_attention_layers", None) or None
-            num_global_draft_layers = sum(
-                layer_id >= num_hidden_layers for layer_id in global_index_layer_ids
-            )
+            # the draft's KV rows, not its index slices: a dense draft
+            # (Kimi-K3-DSpark) has rows and no slices
+            num_global_draft_layers = self._global_num_draft_layers()
             # Index-cache regions are numbered after the KV regions, so this
             # offset must count the KV rows that actually exist -- the MLA
             # layers for a hybrid, every layer otherwise.
@@ -2750,7 +2772,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         rows = len(row_ends)
         var["index_row_ends"].np[:rows] = row_ends
         ends = var["index_row_ends"].copy_to_gpu(rows)
-        split = DcpSplit.of(rows, self.dcp_rank, self.dcp_world_size)
+        split = RowSplit.of(rows, self.dcp_rank, self.dcp_world_size)
         if not self._indexer_fp4:
             keys = ConcatKeys(
                 block_tables=attn_metadata.block_tables,
@@ -2856,12 +2878,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables
         if not batch.is_dummy_run and max_seqlen_q > 1:
-            # Get num_rejected (already mapped to current batch order in prepare_input_ids)
-            num_rejected = self.model_runner.tokenID_processor.num_rejected
-            if num_rejected is not None:
-                context_lens -= num_rejected
-                num_blocks = cdiv(context_lens, self.model_runner.block_size)
-                block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
+            # Already in current batch order (prepare_input_ids).
+            context_lens = self.model_runner.tokenID_processor.verify_ctx_lens(
+                context_lens
+            )
+            num_blocks = cdiv(context_lens, self.model_runner.block_size)
+            block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
         positions = decode_positions(context_lens, max_seqlen_q)
 
         # Before the slots, not after: `slot_mapping` reads this packed table.
@@ -2951,7 +2973,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 )
                 for i, (ctx_len, is_first) in enumerate(
                     zip(
-                        batch.context_lens,
+                        context_lens,
                         batch.is_first_decode_without_local_prefill,
                     )
                 )
@@ -3648,12 +3670,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """A TBO prefill ubatch's share of the step's index `rows`: its rows,
         against the step's keys as the step reads them -- a request a token
         split cuts in two keeps every key its rows see -- and under DCP this
-        rank's share of them (`DcpSplit`)."""
+        rank's share of them (`RowSplit`)."""
         if rows is None:
             return None
         ts = ub_slice.token_slice
         ends = rows.row_ends[ts]
-        split = DcpSplit.of(ends.shape[0], self.dcp_rank, self.dcp_world_size)
+        split = RowSplit.of(ends.shape[0], self.dcp_rank, self.dcp_world_size)
         if rows.concat is not None:
             row_starts = rows.concat.row_starts[ts]
             return concat_rows(ends, rows.concat._replace(row_starts=row_starts), split)

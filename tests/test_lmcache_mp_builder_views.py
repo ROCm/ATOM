@@ -153,6 +153,7 @@ def mla_builder_cls():
             MLAAttention=type("MLAAttention", (), {}),
             mla_dcp_kernel_num_heads=noop,
             mla_dcp_sparse_prefill_num_heads=noop,
+            mla_kernel_num_heads=lambda heads: max(16, -(-heads // 16) * 16),
         ),
         "atom.model_ops.glm5_next.geometry": _module(
             "atom.model_ops.glm5_next.geometry",
@@ -192,7 +193,7 @@ def mla_builder_cls():
         "atom.model_ops.indexer": _module(
             "atom.model_ops.indexer",
             ConcatKeys=noop,
-            DcpSplit=noop,
+            RowSplit=noop,
             Fp4LaunchStorages=noop,
             IndexRows=object,
             concat_rows=noop,
