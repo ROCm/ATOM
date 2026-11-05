@@ -200,6 +200,49 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
                 raise ValueError("response_format.json_schema.schema must be an object")
 
 
+def merge_chat_template_kwargs(
+    request: ChatCompletionRequest,
+    defaults: dict[str, Any],
+    reasoning_toggle: tuple[str, Any, Any] | None,
+) -> dict[str, Any]:
+    """The kwargs the chat template renders ``request`` with.
+
+    The server's ``defaults`` (``--default-chat-template-kwargs``), then the
+    request's own ``chat_template_kwargs``, then the controls the template
+    needs but pydantic does not otherwise thread through. One function for the
+    request handler and the tokenize workers (`chat_offload`), so both render
+    the same prompt.
+    """
+    merged_kwargs = dict(defaults)
+    if request.chat_template_kwargs:
+        merged_kwargs.update(request.chat_template_kwargs)
+    # Forward K3 template controls the chat template needs but that pydantic
+    # does not otherwise thread through: structured-output response_format,
+    # a string tool_choice ("auto"/"none"/"required"), and thinking/effort.
+    if request.response_format is not None:
+        merged_kwargs["response_format"] = request.response_format
+    if isinstance(request.tool_choice, str):
+        merged_kwargs["tool_choice"] = request.tool_choice
+    th_enabled, th_effort = resolve_thinking(request)
+    if request.thinking is not None or request.reasoning_effort is not None:
+        # By the name this template actually reads. `thinking` was
+        # hardcoded, which is right for Kimi-K3 and a silent no-op for the
+        # whole Qwen family, whose templates read `enable_thinking` --
+        # measured, `thinking=False` left the `<think>` prefill in place.
+        # A template ignores a kwarg it does not know, so the failure was
+        # invisible: the model reasoned anyway.
+        # Only when the request said something about it. An effort is
+        # not an opt-in, and this is merged after the server defaults and
+        # after the client's own `chat_template_kwargs` -- so writing it
+        # unconditionally overrode both.
+        if reasoning_toggle is not None and th_enabled is not None:
+            name, off_value, on_value = reasoning_toggle
+            merged_kwargs[name] = on_value if th_enabled else off_value
+        if th_effort is not None:
+            merged_kwargs["thinking_effort"] = th_effort
+    return merged_kwargs
+
+
 def create_chat_chunk(
     request_id: str,
     model: str,

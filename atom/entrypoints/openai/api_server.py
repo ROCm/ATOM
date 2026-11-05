@@ -20,6 +20,7 @@ if __name__ == "__main__":
 import asyncio
 import contextlib
 import contextvars
+import functools
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette._exception_handler import wrap_app_handling_exceptions
 from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
@@ -65,6 +67,12 @@ from .chat_encoders import (
     load_custom_message_encoder,
     render_probe_prompt,
     resolve_reasoning_toggle,
+)
+from .chat_offload import (
+    ChatOffload,
+    ChatPrepareSettings,
+    PreparedChat,
+    prepare_chat,
 )
 from .metrics_setup import create_metrics_exporter
 from .protocol import (
@@ -109,8 +117,8 @@ from .serving_anthropic import (
 from .serving_chat import (
     build_chat_response,
     build_chat_response_multi,
+    merge_chat_template_kwargs,
     normalize_chat_tools,
-    resolve_thinking,
     stream_chat_response,
     stream_chat_response_fanout,
     validate_chat_request,
@@ -166,6 +174,8 @@ DEFAULT_PORT = 8000
 engine = None
 # `tokenize_pool.TokenizePool` when ATOM_TOKENIZE_PROCESSES > 0.
 _tokenize_pool = None
+# `chat_offload.ChatOffload` when ATOM_API_OFFLOAD_PREPROCESS=1 (and the pool runs).
+_chat_offload: ChatOffload | None = None
 tokenizer: AutoTokenizer | None = None
 # The tool-call format this model emits, resolved once at startup from its
 # chat template. `None` means none was recognised and tool calls, if any, are
@@ -834,8 +844,13 @@ async def generate_async(
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
     return_token_ids: bool = False,
+    prompt_block_hashes=None,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Generate non-streaming output, optionally echoing local prompt token IDs."""
+    """Generate non-streaming output, optionally echoing local prompt token IDs.
+
+    ``prompt_block_hashes``: the prompt's hash chain, when a tokenize worker
+    already hashed these ids (`chat_offload`).
+    """
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -873,6 +888,12 @@ async def generate_async(
             },
         )
 
+    prompt_hashes = (
+        {}
+        if prompt_block_hashes is None
+        else {"prompt_block_hashes": prompt_block_hashes}
+    )
+
     def do_preprocess():
         return engine.io_processor.preprocess(
             prompt_or_tokens,
@@ -882,6 +903,7 @@ async def generate_async(
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
+            **prompt_hashes,
         )
 
     prompt_or_tokens = await _pool_tokenized(prompt_or_tokens)
@@ -1282,13 +1304,15 @@ async def setup_streaming_request(
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    prompt_block_hashes=None,
 ) -> tuple[int, StreamOutputCollector, int]:
     """Set up a streaming request with the engine.
 
     Returns ``(seq_id, stream_collector, num_prompt_tokens)``.
     ``num_prompt_tokens`` is the engine-computed prompt length so the stream
     response generator does not have to re-tokenize the prompt on the event
-    loop.
+    loop. ``prompt_block_hashes``: the prompt's hash chain, when a tokenize
+    worker already hashed these ids (`chat_offload`).
     """
     stream_collector = StreamOutputCollector(request_id)
     stream_loop = asyncio.get_running_loop()
@@ -1320,6 +1344,11 @@ async def setup_streaming_request(
         )
 
     executor_loop = asyncio.get_event_loop()
+    prompt_hashes = (
+        {}
+        if prompt_block_hashes is None
+        else {"prompt_block_hashes": prompt_block_hashes}
+    )
 
     def do_preprocess():
         timeline.mark(request_id, "prep_start")
@@ -1332,6 +1361,7 @@ async def setup_streaming_request(
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
+            **prompt_hashes,
         )
         _seq_id_to_request_id[seq.id] = request_id
         timeline.mark(request_id, "prep_end")
@@ -1721,56 +1751,58 @@ async def general_error_handler(request: Request, exc: Exception):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
+    return await _chat_completions(request, raw_request)
 
+
+def _chat_sampling_params(
+    request: ChatCompletionRequest, effective_n: int
+) -> SamplingParams:
+    return _build_sampling_params(
+        temperature=request.temperature,
+        max_tokens=request.get_max_tokens(),
+        stop_strings=request.stop,
+        ignore_eos=request.ignore_eos,
+        top_k=request.top_k,
+        top_p=request.top_p,
+        n=effective_n,
+        presence_penalty=getattr(request, "presence_penalty", None),
+    )
+
+
+def _offloaded_chat_sampling_params(request: ChatCompletionRequest) -> SamplingParams:
+    """What the handler builds from an offloaded request (always n == 1)."""
+    return _chat_sampling_params(request, _coerce_n(request.n, request.temperature))
+
+
+async def _chat_completions(
+    request: ChatCompletionRequest,
+    raw_request: Request | None,
+    prepared: PreparedChat | None = None,
+):
+    """The chat completion handler.
+
+    ``prepared``: the request as a tokenize worker already validated, rendered
+    and encoded it (`chat_offload`, ATOM_API_OFFLOAD_PREPROCESS); ``request``
+    is then ``prepared.request``. None does all of that here.
+    """
     if _PRE_ENGINE_TIMING:
         _t_handler_entry.set(time.monotonic())
     validate_model(request.model)
 
     try:
-        request.tools = normalize_chat_tools(request.tools)
-        validate_chat_request(request)
-        messages = request.get_messages()
-
-        merged_kwargs = dict(default_chat_template_kwargs)
-        if request.chat_template_kwargs:
-            merged_kwargs.update(request.chat_template_kwargs)
-        # Forward K3 template controls the chat template needs but that pydantic
-        # does not otherwise thread through: structured-output response_format,
-        # a string tool_choice ("auto"/"none"/"required"), and thinking/effort.
-        if request.response_format is not None:
-            merged_kwargs["response_format"] = request.response_format
-        if isinstance(request.tool_choice, str):
-            merged_kwargs["tool_choice"] = request.tool_choice
-        _th_enabled, _th_effort = resolve_thinking(request)
-        if request.thinking is not None or request.reasoning_effort is not None:
-            # By the name this template actually reads. `thinking` was
-            # hardcoded, which is right for Kimi-K3 and a silent no-op for the
-            # whole Qwen family, whose templates read `enable_thinking` --
-            # measured, `thinking=False` left the `<think>` prefill in place.
-            # A template ignores a kwarg it does not know, so the failure was
-            # invisible: the model reasoned anyway.
-            # Only when the request said something about it. An effort is
-            # not an opt-in, and this is merged after the server defaults and
-            # after the client's own `chat_template_kwargs` -- so writing it
-            # unconditionally overrode both.
-            if reasoning_toggle is not None and _th_enabled is not None:
-                name, off_value, on_value = reasoning_toggle
-                merged_kwargs[name] = on_value if _th_enabled else off_value
-            if _th_effort is not None:
-                merged_kwargs["thinking_effort"] = _th_effort
+        if prepared is None:
+            request.tools = normalize_chat_tools(request.tools)
+            validate_chat_request(request)
+            messages = request.get_messages()
+            merged_kwargs = merge_chat_template_kwargs(
+                request, default_chat_template_kwargs, reasoning_toggle
+            )
+        else:
+            merged_kwargs = prepared.template_kwargs
 
         effective_n = _coerce_n(request.n, request.temperature)
         _validate_return_token_ids(request.return_token_ids, request.stream)
-        sampling_params = _build_sampling_params(
-            temperature=request.temperature,
-            max_tokens=request.get_max_tokens(),
-            stop_strings=request.stop,
-            ignore_eos=request.ignore_eos,
-            top_k=request.top_k,
-            top_p=request.top_p,
-            n=effective_n,
-            presence_penalty=getattr(request, "presence_penalty", None),
-        )
+        sampling_params = _chat_sampling_params(request, effective_n)
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         set_request_id(request_id)
@@ -1783,10 +1815,16 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         _log_request_model("request", request_id, request)
 
-        is_multimodal = _has_multimodal_content(messages)
+        is_multimodal = prepared is None and _has_multimodal_content(messages)
         multimodal_data = None
         kv_transfer_params = request.kv_transfer_params
-        if is_multimodal:
+        # The worker's hash chain, for the single-sequence engine request.
+        prompt_hashes = {}
+        if prepared is not None:
+            prompt_or_tokens = prepared.prompt_ids
+            if prepared.block_hashes is not None:
+                prompt_hashes["prompt_block_hashes"] = prepared.block_hashes
+        elif is_multimodal:
             # Media loading (blocking network I/O, up to a 30s urlopen) plus
             # processor preprocessing are heavy and would stall the event loop;
             # run them in a worker thread. Warm the processor on the loop first
@@ -1816,10 +1854,14 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         # The K3 template may open the reasoning channel in text or token IDs.
         _reasoning = reasoning_channel(
             (
-                prompt_starts_in_reasoning(prompt_or_tokens)
-                if isinstance(prompt_or_tokens, str)
-                else prompt_tokens_start_in_reasoning(
-                    prompt_or_tokens, tokenizer.decode
+                prepared.prompt_opens_reasoning
+                if prepared is not None
+                else (
+                    prompt_starts_in_reasoning(prompt_or_tokens)
+                    if isinstance(prompt_or_tokens, str)
+                    else prompt_tokens_start_in_reasoning(
+                        prompt_or_tokens, tokenizer.decode
+                    )
                 )
             ),
             template_kwargs=merged_kwargs,
@@ -1862,6 +1904,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         multimodal_data=stream_multimodal_data,
                         kv_transfer_params=kv_transfer_params,
                         **dp_routing,
+                        **prompt_hashes,
                     )
                 )
                 gen = stream_chat_response(
@@ -1965,6 +2008,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     kv_transfer_params=kv_transfer_params,
                     return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
+                    **prompt_hashes,
                 ),
                 raw_request,
                 request_id,
@@ -1994,6 +2038,90 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     except Exception as e:
         logger.exception("Error in chat_completions")
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _has_json_body(scope) -> bool:
+    """The request declares a JSON body (`application/json`, `+json`).
+
+    Anything else -- no Content-Type included -- stays with FastAPI, which
+    decides how to read it.
+    """
+    for name, value in scope.get("headers", ()):
+        if name == b"content-type":
+            mime = value.split(b";", 1)[0].strip().lower()
+            return mime == b"application/json" or (
+                mime.startswith(b"application/") and mime.endswith(b"+json")
+            )
+    return False
+
+
+def _replayed_body(body: bytes, receive):
+    """`receive` with an already-read body handed back as its first message."""
+    pending = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def replay():
+        if pending:
+            return pending.pop()
+        return await receive()
+
+    return replay
+
+
+async def _body_unreadable(request: Request) -> Response:
+    # FastAPI's answer to a body it could not read.
+    raise HTTPException(status_code=400, detail="There was an error parsing the body")
+
+
+class _OffloadedChatRoute:
+    """The ASGI app of `POST /v1/chat/completions` while `_chat_offload` runs.
+
+    Reads the body bytes and has a tokenize worker prepare the request
+    (`ChatOffload.prepare`), instead of FastAPI parsing and validating it on
+    the event loop and the handler rendering it there. Whatever the worker
+    does not take goes to FastAPI's own route app with the body replayed, so
+    every error response, and every request the offload does not cover, is
+    exactly what the server answers without the offload.
+    """
+
+    def __init__(self, route_app):
+        self.route_app = route_app
+
+    async def __call__(self, scope, receive, send) -> None:
+        offload = _chat_offload
+        if offload is None or not offload.enabled or not _has_json_body(scope):
+            await self.route_app(scope, receive, send)
+            return
+        request = Request(scope, receive, send)
+        try:
+            body = await request.body()
+        except Exception:  # noqa: BLE001  # answered below, as FastAPI does
+            body = None
+        prepared = None if not body else await offload.prepare(body)
+        if prepared is None and body is not None:
+            await self.route_app(scope, _replayed_body(body, receive), send)
+            return
+
+        async def app(scope, receive, send) -> None:
+            if prepared is None:
+                response = await _body_unreadable(request)
+            else:
+                response = await _chat_completions(prepared.request, request, prepared)
+            await response(scope, receive, send)
+
+        # The exception handlers FastAPI's route app runs a handler under.
+        await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+
+
+def _offload_chat_completions_route() -> None:
+    """Serve `POST /v1/chat/completions` through `_OffloadedChatRoute`."""
+    for route in app.router.routes:
+        if getattr(route, "path", None) == "/v1/chat/completions" and "POST" in (
+            getattr(route, "methods", None) or ()
+        ):
+            if not isinstance(route.app, _OffloadedChatRoute):
+                route.app = _OffloadedChatRoute(route.app)
+            return
+    raise RuntimeError("no POST /v1/chat/completions route to offload")
 
 
 @app.post("/v1/completions")
@@ -2973,6 +3101,7 @@ def main():
     global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect, synthetic_token_text
     global custom_message_encoder, _stream_batch_dispatcher, _tokenize_pool
+    global _chat_offload
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -3121,15 +3250,68 @@ def main():
     )
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
+    offload_chat = envs.ATOM_API_OFFLOAD_PREPROCESS
+    if offload_chat and envs.ATOM_TOKENIZE_PROCESSES <= 0:
+        logger.warning(
+            "ATOM_API_OFFLOAD_PREPROCESS=1 needs ATOM_TOKENIZE_PROCESSES > 0; "
+            "chat completions are prepared on the event loop."
+        )
+        offload_chat = False
+    if offload_chat and _request_logger is not None:
+        # The request log records whole requests, messages included, which an
+        # offloaded request no longer carries past its worker.
+        logger.warning(
+            "--request-log is set: chat completions are prepared on the event "
+            "loop, not in the tokenize workers (ATOM_API_OFFLOAD_PREPROCESS)."
+        )
+        offload_chat = False
     if envs.ATOM_TOKENIZE_PROCESSES > 0:
         from atom.entrypoints.openai.tokenize_pool import TokenizePool
 
+        chat_settings = None
+        if offload_chat:
+            chat_settings = ChatPrepareSettings(
+                chat_template=tokenizer.chat_template if args.chat_template else None,
+                default_chat_template_kwargs=default_chat_template_kwargs,
+                reasoning_toggle=reasoning_toggle,
+                prefix_hash_block_size=(
+                    engine.io_processor.prefix_hash_block_size
+                    if envs.ATOM_FRONTEND_PREFIX_HASH
+                    else 0
+                ),
+            )
         _tokenize_pool = TokenizePool(
-            args.model, args.trust_remote_code, envs.ATOM_TOKENIZE_PROCESSES, tokenizer
+            args.model,
+            args.trust_remote_code,
+            envs.ATOM_TOKENIZE_PROCESSES,
+            tokenizer,
+            chat_settings=chat_settings,
         )
         logger.info(
             "Tokenizing prompts in %d worker processes", envs.ATOM_TOKENIZE_PROCESSES
         )
+        if chat_settings is not None:
+            _chat_offload = ChatOffload(
+                _tokenize_pool,
+                functools.partial(
+                    prepare_chat,
+                    tokenizer=tokenizer,
+                    custom_encoder=custom_message_encoder,
+                    settings=chat_settings,
+                ),
+                _offloaded_chat_sampling_params,
+            )
+            _offload_chat_completions_route()
+            logger.info(
+                "Preparing chat completions in the tokenize workers "
+                "(ATOM_API_OFFLOAD_PREPROCESS): parse, validation, chat template, "
+                "encode%s",
+                (
+                    " and prefix block hashes"
+                    if chat_settings.prefix_hash_block_size
+                    else ""
+                ),
+            )
     # Responses go out through per-request callbacks; nothing here reads
     # `get_output()`.
     engine.core_mgr.keep_finished_outputs = False

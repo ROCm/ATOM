@@ -953,6 +953,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (`entrypoints/openai/tokenize_pool.py`). 0 tokenizes in the server's own
     # preprocessing threads, which cannot encode in parallel.
     "ATOM_TOKENIZE_PROCESSES": lambda: int(os.getenv("ATOM_TOKENIZE_PROCESSES", "0")),
+    # Chat completions prepared in those worker processes instead of on the API
+    # server's event loop (`entrypoints/openai/chat_offload.py`): the loop takes
+    # the raw body bytes, and a worker parses and validates the request, renders
+    # the chat template, encodes the prompt and hashes its prefix blocks. An
+    # agentic turn resends the whole conversation (~300 KB, ~100k tokens), and
+    # that per-request work on the one loop thread is what capped the server's
+    # request rate. Needs ATOM_TOKENIZE_PROCESSES > 0. Multimodal, pre-tokenized,
+    # n > 1 and invalid requests stay on the in-process path, which also answers
+    # every error. The first results are checked against the in-process path
+    # and a difference turns this off. With ATOM_PRE_ENGINE_TIMING its
+    # "arrival->handler" segment then includes the worker's whole job.
+    "ATOM_API_OFFLOAD_PREPROCESS": lambda: (
+        os.getenv("ATOM_API_OFFLOAD_PREPROCESS", "0") == "1"
+    ),
     # Keep the prompt block-hash chain (frontend prefix hashing) with each
     # tokenizer-cached prefix and extend it on the next turn instead of
     # rehashing the whole prompt. Content hashes only: KV residency is still

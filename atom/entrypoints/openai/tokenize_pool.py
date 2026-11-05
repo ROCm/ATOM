@@ -12,6 +12,9 @@ request from them as before (`LLMEngine.preprocess` takes ids as well as text).
 
 The first few results are compared with the server's own tokenizer, and a
 difference turns the pool off.
+
+Given `chat_settings`, each worker can also prepare whole chat completions
+(`chat_offload.prepare_chat_in_worker`, ATOM_API_OFFLOAD_PREPROCESS).
 """
 
 import array
@@ -39,12 +42,18 @@ def _exit_with(parent: int) -> None:
     os._exit(0)
 
 
-def _init_worker(model: str, trust_remote_code: bool, parent: int) -> None:
+def _init_worker(
+    model: str, trust_remote_code: bool, parent: int, chat_settings=None
+) -> None:
     global _tokenizer
     threading.Thread(target=_exit_with, args=(parent,), daemon=True).start()
     from atom.model_engine.tokenizer_loader import load_tokenizer
 
     _tokenizer = load_tokenizer(model, trust_remote_code)
+    if chat_settings is not None:
+        from atom.entrypoints.openai.chat_offload import init_chat_worker
+
+        init_chat_worker(_tokenizer, model, chat_settings)
 
 
 def _encode(prompt: str) -> bytes:
@@ -54,12 +63,21 @@ def _encode(prompt: str) -> bytes:
 class TokenizePool:
     """`await encode(prompt)` -> `array("i")` ids, computed in a worker process."""
 
-    def __init__(self, model: str, trust_remote_code: bool, processes: int, reference):
+    def __init__(
+        self,
+        model: str,
+        trust_remote_code: bool,
+        processes: int,
+        reference,
+        chat_settings=None,
+    ):
+        # `chat_settings` (`chat_offload.ChatPrepareSettings`): also build the
+        # state `chat_offload.prepare_chat_in_worker` renders prompts with.
         self._pool = concurrent.futures.ProcessPoolExecutor(
             max_workers=processes,
             mp_context=multiprocessing.get_context("spawn"),
             initializer=_init_worker,
-            initargs=(model, trust_remote_code, os.getpid()),
+            initargs=(model, trust_remote_code, os.getpid(), chat_settings),
         )
         self._reference = reference
         self._verify_left = _VERIFY_FIRST
@@ -82,6 +100,10 @@ class TokenizePool:
                 self.enabled = False
                 return array.array("i", ref)
         return ids
+
+    async def run(self, fn, *args):
+        """`fn(*args)` in a worker process; `fn` must be a module-level function."""
+        return await asyncio.get_running_loop().run_in_executor(self._pool, fn, *args)
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
