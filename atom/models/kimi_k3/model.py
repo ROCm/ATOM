@@ -70,6 +70,7 @@ from atom.models.utils import (
     maybe_prefix,
     pp_holds_embedding,
 )
+from atom.plugin.prepare import is_plugin_mode
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
@@ -852,6 +853,13 @@ class KimiFullAttention(nn.Module):
             mla_modules=mla_modules,
             prefix=prefix,
         )
+        # A prefill token-graph recording breaks only around this layer's
+        # KV-cache write and attention; its Q projection, kv_b_proj and FP8
+        # quantization land in the graph (`MLAAttention.forward_prefill_split`).
+        # ATOM's own token graphs only: a plugin's host records its own way.
+        impl = getattr(self.attn, "impl", None)
+        if not is_plugin_mode() and hasattr(impl, "split_prefill_recording"):
+            impl.split_prefill_recording = True
 
         qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"

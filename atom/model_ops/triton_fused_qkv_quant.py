@@ -17,8 +17,15 @@ def _load_tensor(
     Rope=None,
     ROPE_DIM: tl.constexpr = 0,
     ROPE_STRIDE: tl.constexpr = (0, 0, 0),
+    Rows=None,
+    MASK_ROWS: tl.constexpr = False,
 ):
     heads, dim = SHAPE
+    live = offsets < N
+    if MASK_ROWS:
+        # Tokens past the step's real ones (a token-graph bucket's padding)
+        # read as zero, so they move neither the amax nor the descale.
+        live = live & (offsets // (heads * dim) < tl.load(Rows))
     if ROPE_DIM:
         # K is logically cat(k_nope, k_rope), without a BF16 intermediate.
         token = offsets // (heads * dim)
@@ -27,7 +34,7 @@ def _load_tensor(
         nope_dim = dim - ROPE_DIM
         nope = tl.load(
             X + token * STRIDE[0] + head * STRIDE[1] + col * STRIDE[2],
-            (offsets < N) & (col < nope_dim),
+            live & (col < nope_dim),
             0,
         ).to(tl.float32)
         rope = tl.load(
@@ -35,7 +42,7 @@ def _load_tensor(
             + token * ROPE_STRIDE[0]
             + head * ROPE_STRIDE[1]
             + (col - nope_dim) * ROPE_STRIDE[2],
-            (offsets < N) & (col >= nope_dim),
+            live & (col >= nope_dim),
             0,
         ).to(tl.float32)
         return tl.where(col < nope_dim, nope, rope)
@@ -44,7 +51,7 @@ def _load_tensor(
         + offsets // dim % heads * STRIDE[1]
         + offsets % dim * STRIDE[2]
     )
-    return tl.load(X + physical, offsets < N, 0).to(tl.float32)
+    return tl.load(X + physical, live, 0).to(tl.float32)
 
 
 @triton.jit
@@ -59,6 +66,8 @@ def _partial_amax(
     Rope=None,
     ROPE_DIM: tl.constexpr = 0,
     ROPE_STRIDE: tl.constexpr = (0, 0, 0),
+    Rows=None,
+    MASK_ROWS: tl.constexpr = False,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     acc = tl.full((BLOCK,), 0, tl.float32)
@@ -72,6 +81,8 @@ def _partial_amax(
             Rope,
             ROPE_DIM,
             ROPE_STRIDE,
+            Rows,
+            MASK_ROWS,
         )
         acc = tl.maximum(acc, tl.abs(x))
     tl.store(Partial + tl.program_id(0), tl.max(acc, 0))
@@ -93,10 +104,22 @@ def _fused_qkv_amax(
     K_ROPE=None,
     ROPE_DIM: tl.constexpr = 0,
     ROPE_STRIDE: tl.constexpr = (0, 0, 0),
+    Rows=None,
+    MASK_ROWS: tl.constexpr = False,
 ):
     kind = tl.program_id(1)
     if kind == 0:
-        _partial_amax(Q, Partial, NQ, SHAPES[0], STRIDES[0], PARTS, BLOCK)
+        _partial_amax(
+            Q,
+            Partial,
+            NQ,
+            SHAPES[0],
+            STRIDES[0],
+            PARTS,
+            BLOCK,
+            Rows=Rows,
+            MASK_ROWS=MASK_ROWS,
+        )
     elif kind == 1:
         _partial_amax(
             K,
@@ -109,9 +132,21 @@ def _fused_qkv_amax(
             K_ROPE,
             ROPE_DIM,
             ROPE_STRIDE,
+            Rows,
+            MASK_ROWS,
         )
     else:
-        _partial_amax(V, Partial + 2 * PARTS, NV, SHAPES[2], STRIDES[2], PARTS, BLOCK)
+        _partial_amax(
+            V,
+            Partial + 2 * PARTS,
+            NV,
+            SHAPES[2],
+            STRIDES[2],
+            PARTS,
+            BLOCK,
+            Rows=Rows,
+            MASK_ROWS=MASK_ROWS,
+        )
 
 
 @triton.jit
@@ -131,9 +166,22 @@ def _quant_tensor(
     Rope=None,
     ROPE_DIM: tl.constexpr = 0,
     ROPE_STRIDE: tl.constexpr = (0, 0, 0),
+    Rows=None,
+    MASK_ROWS: tl.constexpr = False,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    x = _load_tensor(X, offsets, N, SHAPE, STRIDE, Rope, ROPE_DIM, ROPE_STRIDE)
+    x = _load_tensor(
+        X,
+        offsets,
+        N,
+        SHAPE,
+        STRIDE,
+        Rope,
+        ROPE_DIM,
+        ROPE_STRIDE,
+        Rows,
+        MASK_ROWS,
+    )
     if SINGLE_PASS:
         amax = tl.max(tl.abs(x), 0)
     else:
@@ -178,6 +226,8 @@ def _fused_qkv_quant(
     K_ROPE=None,
     ROPE_DIM: tl.constexpr = 0,
     ROPE_STRIDE: tl.constexpr = (0, 0, 0),
+    Rows=None,
+    MASK_ROWS: tl.constexpr = False,
 ):
     kind = tl.program_id(1)
     if kind == 0:
@@ -194,6 +244,8 @@ def _fused_qkv_quant(
             BLOCK,
             False,
             SINGLE_PASS,
+            Rows=Rows,
+            MASK_ROWS=MASK_ROWS,
         )
     elif kind == 1:
         _quant_tensor(
@@ -212,6 +264,8 @@ def _fused_qkv_quant(
             K_ROPE,
             ROPE_DIM,
             ROPE_STRIDE,
+            Rows,
+            MASK_ROWS,
         )
     else:
         _quant_tensor(
@@ -227,10 +281,12 @@ def _fused_qkv_quant(
             BLOCK,
             True,
             SINGLE_PASS,
+            Rows=Rows,
+            MASK_ROWS=MASK_ROWS,
         )
 
 
-def fused_qkv_per_tensor_quant(q, k, v, *, k_rope=None):
+def fused_qkv_per_tensor_quant(q, k, v, *, k_rope=None, num_rows=None):
     """Quantize 3-D Q/K/V to E4M3 with independent per-tensor FP32 descales.
 
     Returns ``(q8, k8, v8, qs, ks, vs, gather_ks, gather_vs)`` with contiguous
@@ -241,8 +297,20 @@ def fused_qkv_per_tensor_quant(q, k, v, *, k_rope=None):
     With ``k_rope``, ``k`` is the NoPE part and K8 is the quantized logical
     concatenation along the last dimension. K's amax includes both parts.
     ``k_rope`` may have one head (broadcast) or the same head count as K.
+
+    ``num_rows``, a one-element int32 device tensor, counts the leading tokens
+    that are real; the rest read as zero, so they move no descale and quantize
+    to zero. A recorded token graph pads a prefill to its bucket and reads the
+    step's count in place (`Context.scheduled_tokens_gpu`), so the real rows
+    quantize exactly as an eager forward over them alone does.
     """
     tensors = (q, k, v)
+    if num_rows is not None and (
+        num_rows.numel() != 1
+        or num_rows.dtype != torch.int32
+        or num_rows.device != q.device
+    ):
+        raise ValueError("num_rows must be a one-element int32 tensor on Q's device")
     if any(x.ndim != 3 or x.shape[1] == 0 or x.shape[2] == 0 for x in tensors):
         raise ValueError("Q/K/V must have shape [tokens, nonzero heads, nonzero dim]")
     if not q.is_cuda or any(
@@ -289,6 +357,7 @@ def fused_qkv_per_tensor_quant(q, k, v, *, k_rope=None):
     )
     parts = min(128, triton.next_power_of_2(triton.cdiv(n, block))) if n else 1
     partial = torch.empty((3, parts), device=q.device, dtype=torch.float32)
+    mask_rows = num_rows is not None
     if not single_pass:
         _fused_qkv_amax[(parts, 3)](
             *tensors,
@@ -301,6 +370,8 @@ def fused_qkv_per_tensor_quant(q, k, v, *, k_rope=None):
             k_rope,
             rope_dim,
             rope_stride,
+            num_rows,
+            mask_rows,
             num_warps=4,
         )
     _fused_qkv_quant[(max(1, triton.cdiv(n, block)), 3)](
@@ -317,6 +388,8 @@ def fused_qkv_per_tensor_quant(q, k, v, *, k_rope=None):
         k_rope,
         rope_dim,
         rope_stride,
+        num_rows,
+        mask_rows,
         num_warps=4,
     )
     return (*outputs, *(scales[i : i + 1] for i in range(5)))
