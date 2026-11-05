@@ -39,6 +39,9 @@ from atom.utils.forward_context import plugin_graph_is_piecewise
 #   - `_use_dual_stream: bool`
 #   - `single_stream_moe_forward(hidden_states) -> Tensor`
 #   - `dual_stream_moe_forward(hidden_states) -> Tensor`
+#   - with `shared_fp8` / `shared_scale` (V4.1's FFN seam): both also take
+#     `shared_quantized=(shared_fp8, shared_scale)`, the shared expert's MXFP8
+#     input. Other callers leave them None.
 #
 # Per-token gating: decode benefits from dual-stream, prefill doesn't —
 # threshold from `envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`.
@@ -66,18 +69,25 @@ def _dual_stream_is_active(self, num_tokens: int) -> bool:
 def maybe_dual_stream_forward(
     hidden_states: torch.Tensor,
     layer_name: str,
+    shared_fp8: torch.Tensor | None = None,
+    shared_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
+    kwargs = (
+        {} if shared_fp8 is None else {"shared_quantized": (shared_fp8, shared_scale)}
+    )
     if _dual_stream_is_active(self, hidden_states.shape[0]):
-        return self.dual_stream_moe_forward(hidden_states)
-    return self.single_stream_moe_forward(hidden_states)
+        return self.dual_stream_moe_forward(hidden_states, **kwargs)
+    return self.single_stream_moe_forward(hidden_states, **kwargs)
 
 
 def _maybe_dual_stream_forward_fake(
     hidden_states: torch.Tensor,
     layer_name: str,
+    shared_fp8: torch.Tensor | None = None,
+    shared_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 

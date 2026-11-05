@@ -150,14 +150,12 @@ class MoE(V4MoE):
         if not isinstance(hidden, tuple):
             return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
         hidden, hidden_fp8, hidden_scale = hidden
-        shared = self.shared_experts
-        shared.quantized_input = (
+        shared_quantized = (
             hidden_fp8.reshape(-1, hidden_fp8.shape[-1]),
             hidden_scale.reshape(-1, hidden_scale.shape[-1]),
         )
-        try:
-            return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
-        finally:
-            # A path that never calls the shared expert must not leave this
-            # step's rows for the next one.
-            shared.quantized_input = None
+        return (
+            super()
+            .forward(hidden.reshape(-1, hidden.shape[-1]), shared_quantized)
+            .view_as(hidden)
+        )

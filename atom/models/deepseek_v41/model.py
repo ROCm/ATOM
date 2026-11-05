@@ -126,7 +126,7 @@ class Block(nn.Module):
         self.hc_ffn_fuse_quant = (
             self.hc_ffn_fn_packed is not None
             and fuse_quant_supported()
-            and getattr(self.ffn, "takes_quantized_shared_input", lambda: False)()
+            and self.ffn.takes_quantized_shared_input()
         )
 
     def attention_forward(self, normed, cache, step, rope):
