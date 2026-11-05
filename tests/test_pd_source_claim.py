@@ -160,3 +160,25 @@ def test_nothing_is_claimed_when_nothing_will_be_sent(build):
         seq.leave_reason = "stop_sequence"
         local_only.request_finished(seq)
         assert local_only.should_defer_free(seq) is False
+
+
+@pytest.mark.parametrize("build", BACKENDS)
+def test_cancel_preadmission_drops_the_queued_receive_and_rearms_it(build):
+    """Under `multi`, an offload sub can refuse an admission after the P/D
+    consumer queued its receive. The receive must not run into the freed
+    blocks, and the re-admission must report and wait for the load again."""
+    sched = build(is_producer=False)
+    sched.state_slot = -1
+    seq = _seq(do_remote_prefill=True, remote_block_ids=[1, 2, 3])
+    seq.prompt_token_ids = [0] * 48
+    seq.num_cached_tokens = 0
+    seq.has_per_req_cache = False
+    assert sched.get_num_new_matched_tokens(seq)[1]
+    sched.update_state_after_alloc(seq)
+    assert seq.id in sched._reqs_need_recv
+
+    sched.cancel_preadmission(seq)
+
+    assert seq.id not in sched._reqs_need_recv
+    assert seq.kv_transfer_params["do_remote_prefill"] is True
+    assert sched.get_num_new_matched_tokens(seq)[1]

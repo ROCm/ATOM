@@ -118,11 +118,16 @@ class ChunkKind(enum.Enum):
 class Admit(enum.Enum):
     """Outcome of `Scheduler._admit_after_probe`."""
 
-    # The pool (or a declined lookup detach) refused it before the connector
-    # heard of it; nothing is held.
+    # The pool refused it before the connector heard of it (no blocks to
+    # privatise a shared prefix); nothing is held.
     REFUSED = enum.auto()
-    # Refused after the connector heard of it; its blocks and the connector's
-    # record of the admission are released.
+    # `allocate` kept less HBM prefix than the probe offered, so the detached
+    # lookup is declined and the next pass takes the ordinary path; nothing
+    # is held. Not a resource refusal.
+    DETACH_DECLINED = enum.auto()
+    # Refused after the connector heard of it (no blocks to privatise a
+    # claimed prefix); its blocks and the connector's record of the
+    # admission are released.
     REQUEUE = enum.auto()
     # Parked for its remote / tier KV (or state) load.
     PARKED = enum.auto()
@@ -2577,7 +2582,10 @@ class Scheduler:
                 skipped_waiting_requests,
                 detach=lookup_detachable,
             )
-            if outcome is Admit.REFUSED or outcome is Admit.REQUEUE:
+            if outcome is not Admit.PARKED and outcome is not Admit.LOCAL:
+                # REFUSED / REQUEUE: the pool could not back the admission,
+                # which finished prefetches hold blocks against.
+                self._blocked_head = outcome is not Admit.DETACH_DECLINED
                 self.waiting.appendleft(seq)
                 break
             if outcome is Admit.PARKED:
@@ -3986,7 +3994,7 @@ class Scheduler:
             # remote-load capacity check run before `allocate`.
             self._decline_lookup_detach(seq)
             self.block_manager.deallocate(seq)
-            return Admit.REFUSED
+            return Admit.DETACH_DECLINED
 
         # The hit the request kept, not the one `can_allocate` offered:
         # `allocate` may disown the boundary, and `num_cached_blocks` is the
