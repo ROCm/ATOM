@@ -2899,8 +2899,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # decode retains its existing max-query-width rollback condition.
         if not batch.is_dummy_run and (max_seqlen_q > 1 or num_rejected is not None):
             if num_rejected is None:
-                num_rejected = self.model_runner.tokenID_processor.num_rejected
-            if num_rejected is not None:
+                context_lens_np = self.model_runner.tokenID_processor.verify_ctx_lens(
+                    context_lens_np
+                )
+            else:
                 if len(num_rejected) != len(context_lens_np):
                     raise ValueError("num_rejected is not aligned with decode rows")
                 context_lens_np = context_lens_np - num_rejected.astype(np.int32)
