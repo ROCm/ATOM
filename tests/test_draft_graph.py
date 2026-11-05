@@ -166,23 +166,17 @@ def test_staging_a_wrong_dtype_fails_loudly():
         g._stage_one("row", 4, torch.zeros(2, dtype=torch.int64))
 
 
-def test_staging_supports_a_nonleading_batch_axis_for_mrope():
-    """MRoPE keeps its token/batch axis last: [3, N]."""
-    g = _graph(
-        inputs={
-            "positions": StagedInput(
-                shape=(3,), dtype=torch.int64, batch_dim=1
-            )
-        }
-    )
-    src = torch.arange(9, dtype=torch.int64).view(3, 3)
+def test_staging_a_source_whose_leading_axis_is_not_the_batch_fails_loudly():
+    """Every staged source is indexed as `[rows, *StagedInput.shape]`.
 
-    staged = g._stage_one("positions", 8, src)
-
-    assert staged.shape == (3, 8)
-    torch.testing.assert_close(staged[:, :3], src)
-    torch.testing.assert_close(staged[:, 3:], src[:, -1:].expand(3, 5))
-    assert g.buffer("positions", 5).shape == (3, 5)
+    MRoPE positions are the live case: they keep the token axis LAST (`[3, N]`),
+    so a drafter must not hand them to a pass at all. Without this the mismatch
+    surfaced as a `copy_` size error two frames down, which reads like a
+    batch-size bug rather than a layout one.
+    """
+    g = _graph()
+    with pytest.raises(AssertionError, match="leading axis is not the batch"):
+        g._stage_one("row", 8, torch.zeros(3, 8, dtype=torch.int32))
 
 
 def test_sources_that_disagree_on_the_batch_are_refused():

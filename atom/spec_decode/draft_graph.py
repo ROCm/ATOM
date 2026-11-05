@@ -37,11 +37,10 @@ def _owned(value: Any, staged: tuple[torch.Tensor, ...] = ()) -> Any:
 
 @dataclass(frozen=True)
 class StagedInput:
-    """One staged input's type: shape excludes its configurable batch axis."""
+    """One staged input's type: everything but the leading batch axis."""
 
     shape: tuple[int, ...] = ()
     dtype: torch.dtype = torch.int32
-    batch_dim: int = 0
 
 
 @dataclass
@@ -110,34 +109,13 @@ class DraftGraph:
         )
         self._buffers = {
             role: torch.zeros(
-                self._buffer_shape(config.max_num_seqs, staged),
+                (config.max_num_seqs, *staged.shape),
                 dtype=staged.dtype,
                 device=device,
             )
             for role, staged in self.inputs.items()
         }
         return self
-
-    @staticmethod
-    def _buffer_shape(max_bs: int, staged: StagedInput) -> tuple[int, ...]:
-        ndim = len(staged.shape) + 1
-        dim = staged.batch_dim if staged.batch_dim >= 0 else staged.batch_dim + ndim
-        assert 0 <= dim < ndim, (
-            f"staged batch_dim {staged.batch_dim} is outside a {ndim}-D tensor"
-        )
-        shape = list(staged.shape)
-        shape.insert(dim, max_bs)
-        return tuple(shape)
-
-    def _batch_dim(self, role: str, tensor: torch.Tensor) -> int:
-        dim = self.inputs[role].batch_dim
-        if dim < 0:
-            dim += tensor.ndim
-        assert 0 <= dim < tensor.ndim, (
-            f"draft input {role!r} batch_dim {self.inputs[role].batch_dim} "
-            f"is outside {tensor.ndim}-D shape {tuple(tensor.shape)}"
-        )
-        return dim
 
     @property
     def will_capture(self) -> bool:
@@ -165,9 +143,7 @@ class DraftGraph:
         How many rows are real comes from the sources, never from the caller: a
         count that cannot disagree with the tensor it describes.
         """
-        counts = {
-            src.shape[self._batch_dim(role, src)] for role, src in srcs.items()
-        }
+        counts = {t.shape[0] for t in srcs.values()}
         assert len(counts) <= 1, (
             f"{self.name} was handed batches of {sorted(counts)}; they "
             f"describe one step, so one of them is not this step's"
@@ -188,12 +164,11 @@ class DraftGraph:
             f"declared roles are {sorted(self._buffers)}"
         )
         buf = self._buffers[role]
-        dim = self._batch_dim(role, buf)
-        assert 0 <= bs <= buf.shape[dim], (
+        assert 0 <= bs <= buf.shape[0], (
             f"{self.name} requested {bs} rows from draft input {role!r}, "
-            f"whose capacity is {buf.shape[dim]}"
+            f"whose capacity is {buf.shape[0]}"
         )
-        return buf.narrow(dim, 0, bs)
+        return buf[:bs]
 
     def _stage_one(self, role: str, running_bs: int, src: torch.Tensor | None):
         """Copy ``src`` into this input's fixed buffer, tail-repeating its last row.
@@ -207,8 +182,7 @@ class DraftGraph:
         batch, not a particular one.
         """
         buf = self._buffers[role]
-        dim = self._batch_dim(role, buf)
-        out = buf.narrow(dim, 0, running_bs)
+        out = buf[:running_bs]
         if src is None:
             return out
         assert src.dtype == buf.dtype, (
@@ -217,29 +191,22 @@ class DraftGraph:
         )
         assert src.ndim == buf.ndim, (
             f"draft input '{role}' of {self.name} arrived as {tuple(src.shape)}, "
-            f"but its declared storage is {tuple(buf.shape)} with batch axis "
-            f"{self.inputs[role].batch_dim}"
+            f"whose leading axis is not the batch; this pass stages "
+            f"{tuple(buf.shape[1:])} per sequence. MRoPE positions ([3, N]) are "
+            f"the case that reaches here"
         )
-        src_dim = self._batch_dim(role, src)
-        assert src_dim == dim, (
-            f"draft input {role!r} batch axis resolved to {src_dim}, "
-            f"but its fixed storage uses {dim}"
-        )
-        scheduled_bs = src.shape[dim]
-        dst = out.narrow(dim, 0, scheduled_bs)
+        scheduled_bs = src.shape[0]
+        dst = out[:scheduled_bs]
         assert src.shape == dst.shape, (
             f"draft input '{role}' of {self.name} arrived as {tuple(src.shape)}, "
-            f"but its fixed storage expects {tuple(dst.shape)} with batch "
-            f"axis {dim}"
+            f"but its fixed storage expects {tuple(dst.shape)}"
         )
         # A producer may have written straight into this exact fixed-storage
         # view. Do not turn that into a self-copy launch.
         if src.data_ptr() != dst.data_ptr() or src.stride() != dst.stride():
             dst.copy_(src)
         if running_bs > scheduled_bs:
-            tail = out.narrow(dim, scheduled_bs, running_bs - scheduled_bs)
-            last = src.narrow(dim, scheduled_bs - 1, 1)
-            tail.copy_(last.expand_as(tail))
+            out[scheduled_bs:].copy_(src[-1])  # broadcasts; no expand needed
         return out
 
     def is_captured(self, running_bs: int) -> bool:
