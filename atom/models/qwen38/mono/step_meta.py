@@ -6,7 +6,8 @@
 - ``StepMeta`` / ``meta_buffers`` / ``target_puts``: the kernels' int32 metadata args and how a step fills them
   (one fused launch, ``prep.fused_puts``);
 - ``GDNPools`` / ``QSAPools``: ATOM's pools a layer reads and writes in place, checked against the geometry;
-- ``draft_rows_error``: the addressing contract of a served draft step.
+- ``draft_rows_error``: the addressing contract of a served draft step;
+- ``draft_attention_fused``: which path the fallback draft's QSA attention takes.
 
 A step has ``rows = batch * spec`` rows; row ``r`` is request ``r // spec`` at offset ``r % spec``. Classic verify
 (the GDN state snapshotted per verify row): with slots ``idx = spec_state_indices [batch, SPEC]`` and ``a`` accepted
@@ -245,6 +246,19 @@ class QSAPools:
             raise ValueError(
                 f"QSA block size {bs} is not a multiple of {g.index_compress}"
             )
+
+
+def draft_attention_fused(
+    meta, is_prefill: bool, rows: int, rope_position_cache
+) -> bool:
+    """Whether the fallback draft's QSA attention takes its fused path (``draft_fallback.attention``): a decode step
+    of one or ``SPEC`` rows a request, with the three-axis RoPE position cache the fused index preparation reads.
+    Otherwise ATOM's module: a prefill, no QSA metadata, another row count, or a text-only pool (no position cache;
+    ATOM's module rebuilds text positions arithmetically)."""
+    if meta is None or is_prefill or rope_position_cache is None:
+        return False
+    requests = meta.block_tables.shape[0]
+    return rows in (requests, SPEC * requests)
 
 
 def draft_rows_error(
