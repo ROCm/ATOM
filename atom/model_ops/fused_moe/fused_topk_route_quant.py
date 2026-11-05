@@ -58,7 +58,12 @@ def try_defer_topk_route_quant(method, layer, x, logits):
     config = get_current_atom_config()
     if (
         context is None
-        or context.is_dummy_run
+        # Qwen3.5's prefill token graphs are recorded on a dummy step
+        # (GDN `build_for_token_graph_capture`); refusing dummy steps would
+        # bake the split path into every prefill graph. Idle DP peers' dummy
+        # steps qualify too: with replicated experts each rank routes its own
+        # rows. Under DP without replication the dp_size check below refuses.
+        or (context.is_dummy_run and not _dummy_ok(layer))
         or method.fused_experts is not None
         or method.use_triton
         or method.use_triton_ep
@@ -69,7 +74,10 @@ def try_defer_topk_route_quant(method, layer, x, logits):
         or layer.moe_parallel_config.pcp_merge
         # DP with every expert on every rank (ATOM_DP_REPLICATE_EXPERTS) runs
         # its own rows through the MoE: no gather, so it qualifies.
-        or (layer.dp_size > 1 and not getattr(layer.moe_parallel_config, "replicate_experts", False))
+        or (
+            layer.dp_size > 1
+            and not getattr(layer.moe_parallel_config, "replicate_experts", False)
+        )
         or config.eplb_enable
         or not layer.renormalize
         or layer.scoring_func != "softmax"
@@ -95,6 +103,14 @@ def try_defer_topk_route_quant(method, layer, x, logits):
     ids = torch.empty((n, layer.top_k), dtype=torch.int32, device=x.device)
     defer_topk_softmax(weights, ids, logits, True, pass_scheduled_tokens_gpu(n))
     return weights, ids
+
+
+def _dummy_ok(layer) -> bool:
+    """Dummy steps (graph recording, idle DP peers) may defer: single-rank
+    MoE or DP with every expert on every rank."""
+    return layer.dp_size == 1 or getattr(
+        layer.moe_parallel_config, "replicate_experts", False
+    )
 
 
 def _fusable_rows(logits, x, top_k, decode_supported, prefill_supported) -> bool:
