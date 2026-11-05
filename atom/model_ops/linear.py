@@ -80,6 +80,10 @@ def use_mxfp8_linear_bpreshuffle(
         or output_size % 16
     ):
         return False
+    from atom.model_ops.blockscale import aiter_group32_gemm_available
+
+    if not aiter_group32_gemm_available():
+        return False
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     # TODO: add gfx1250 after AITER exposes the matching MXFP8 1x32
