@@ -8,8 +8,8 @@ import pytest
 from conftest import MockConfig
 
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
-from atom.model_engine.token_logprobs import TokenLogprob
 from atom.sampling_params import SamplingParams
+from tests.logprob_helpers import token_logprob
 
 
 class TestMTPMaxTokens:
@@ -52,7 +52,7 @@ class TestMTPMaxTokens:
                 logprobs=(
                     {
                         seq.id: [
-                            TokenLogprob(-0.1 * (i + 1), 1) for i in range(len(tokens))
+                            token_logprob(-0.1 * (i + 1), 1) for i in range(len(tokens))
                         ]
                     }
                     if seq.return_logprobs
@@ -82,7 +82,7 @@ class TestMTPMaxTokens:
         assert len(finished[0].logprobs) == finished[0].num_completion_tokens
         emitted = stream_queue.put_nowait.call_args.args[0][0][1]
         assert emitted.output_tokens == [10, 11]
-        assert [p.logprob for p in emitted.logprobs] == [-0.1, -0.2]
+        assert [p[0] for p in emitted.logprobs] == [-0.1, -0.2]
         assert emitted.finish_reason == "max_tokens"
 
     @pytest.mark.parametrize(
@@ -194,8 +194,8 @@ def test_bad_logprobs_do_not_terminate_sibling_requests(seq_factory, injected):
             num_bonus=None,
             draft_token_ids=None,
             logprobs={
-                bad.id: [TokenLogprob(-1, 1)] if injected else [],
-                good.id: [TokenLogprob(-0.5, 1)],
+                bad.id: [token_logprob(-1, 1)] if injected else [],
+                good.id: [token_logprob(-0.5, 1)],
             },
         ),
         stream_output_queue=queue,

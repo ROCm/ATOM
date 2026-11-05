@@ -54,11 +54,9 @@ def test_ragged_acceptance_correction_and_bonus_rows(accepted):
     records = unpack_token_logprobs(pack_token_logprobs(*payload), [12, 7], tokens)
     reference = logits.double().log_softmax(-1)
     for i, token in enumerate(tokens[12]):
-        assert records[12][i].logprob == pytest.approx(
-            reference[i, token].item(), abs=1e-6
-        )
-    assert records[7][0].logprob == pytest.approx(reference[4, 5].item(), abs=1e-6)
-    assert records[7][1].logprob == pytest.approx(reference[5, 6].item(), abs=1e-6)
+        assert records[12][i][0] == pytest.approx(reference[i, token].item(), abs=1e-6)
+    assert records[7][0][0] == pytest.approx(reference[4, 5].item(), abs=1e-6)
+    assert records[7][1][0] == pytest.approx(reference[5, 6].item(), abs=1e-6)
     assert len(records[12]) == accepted + 1
 
 
@@ -199,9 +197,11 @@ def test_packed_payload_preserves_float_and_int32_bits(k):
     assert packed.is_contiguous() and packed.dtype == torch.float32
     result = unpack_token_logprobs(packed, [4, 9], {4: (1, 2, 3), 9: (4,)})
     assert len(result[4]) == 3 and len(result[9]) == 1
-    assert result[4][1].logprob == values[0, 1, 0].item()
-    assert result[4][1].rank == 2**30 + 3
-    assert result[4][1].top == tuple((2**24 + 17, v) for v in values[0, 1, 1:].tolist())
+    assert result[4][1][0] == values[0, 1, 0].item()
+    assert result[4][1][1] == 2**30 + 3
+    assert tuple(zip(result[4][1][2::2], result[4][1][3::2])) == tuple(
+        (2**24 + 17, v) for v in values[0, 1, 1:].tolist()
+    )
 
 
 @pytest.mark.parametrize("counts", [[0, 0, 0], [0, 3, 1], [5, 0, 2]])
@@ -263,3 +263,25 @@ def test_staged_row_plan_needs_no_pageable_h2d_or_readback(monkeypatch):
         plan = _logprob_rows(batch, metadata, torch.device("cuda"), 4)
     assert plan.model_rows.tolist() == [1, 2, 3]
     assert plan.sample_rows.tolist() == [[0, 1, 2, 2]]
+
+
+@pytest.mark.parametrize("lengths", [[4, 1, 3], [1, 1, 1], [2, 4, 2]])
+@pytest.mark.parametrize("requested", [(0, 2), (1,), (0, 1, 2)])
+def test_host_row_plan_matches_target_distribution(lengths, requested):
+    from atom.model_engine.token_logprobs import LogprobRows, host_logprob_rows
+
+    width = 4
+    host = host_logprob_rows(requested, np.asarray(lengths), width)
+    rows = LogprobRows(*(torch.from_numpy(part) for part in host))
+    logits = torch.randn(sum(lengths), 11)
+    ids = torch.arange(3 * width).reshape(3, width) % 11
+    batch = SimpleNamespace(
+        return_logprobs=[i in requested for i in range(3)], top_logprobs=[3] * 3
+    )
+    actual = gather_token_logprobs(logits, ids, batch, rows=rows)[0]
+    starts = np.cumsum([0] + lengths[:-1])
+    for compact, request in enumerate(requested):
+        for slot in range(width):
+            row = starts[request] + min(slot, lengths[request] - 1)
+            expected = torch.log_softmax(logits[row], dim=-1)[ids[request, slot]]
+            torch.testing.assert_close(actual[compact, slot, 0], expected)

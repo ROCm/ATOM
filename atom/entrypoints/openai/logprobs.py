@@ -12,6 +12,7 @@ Chat wire-format assembly lives in serving_chat.py.
 import codecs
 import json
 import logging
+from array import array
 from bisect import bisect_left, bisect_right
 
 from transformers.convert_slow_tokenizer import bytes_to_unicode
@@ -21,19 +22,61 @@ class LogprobError(RuntimeError):
     """An internal decoding/attribution failure, never a client validation error."""
 
 
+class _ByteOffsets:
+    """One character-to-source-byte index, shared by every slice of a decoded span."""
+
+    def __init__(self, text, start, end):
+        self.start = start
+        self.offsets = None
+        if text.isascii() and end - start == len(text):
+            return
+        offsets = array("Q", [start])
+        for char in text:
+            code = ord(char)
+            start += (
+                1 if code < 0x80 else 2 if code < 0x800 else 3 if code < 0x10000 else 4
+            )
+            offsets.append(start)
+        if start != end:
+            # The UTF-8 decoder maps each malformed byte sequence to one U+FFFD.
+            if text != "\ufffd":
+                raise LogprobError("Invalid decoded source span")
+            offsets[-1] = end
+        self.offsets = offsets
+
+    def at(self, character):
+        return (
+            self.start + character if self.offsets is None else self.offsets[character]
+        )
+
+
 class LogprobText(str):
-    """Decoded text retaining byte spans for token-logprob attribution after parsing."""
+    """Text whose slices share source-byte indices rather than re-encoding prefixes."""
 
     def __new__(cls, parts, owner):
         parts = tuple(p for p in parts if p[0])
-        obj = super().__new__(cls, "".join(p[0] for p in parts))
-        obj.parts = parts
+        spans = tuple(
+            (_ByteOffsets(text, lo, hi), 0, len(text)) for text, lo, hi in parts
+        )
+        return cls._from_spans("".join(p[0] for p in parts), spans, owner)
+
+    @classmethod
+    def _from_spans(cls, text, spans, owner):
+        obj = super().__new__(cls, text)
+        obj.spans = tuple(spans)
         obj.owner = owner
+        ends, total = [], 0
+        for _, left, right in obj.spans:
+            total += right - left
+            ends.append(total)
+        obj._ends = ends
         return obj
 
     @property
     def source_ranges(self):
-        return [(lo, hi) for _, lo, hi in self.parts]
+        return [
+            (source.at(left), source.at(right)) for source, left, right in self.spans
+        ]
 
     def __getitem__(self, key):
         if not isinstance(key, slice):
@@ -41,21 +84,20 @@ class LogprobText(str):
         start, end, step = key.indices(len(self))
         if step != 1:
             raise ValueError("Logprob text requires contiguous slices")
-        parts, at = [], 0
-        for text, lo, hi in self.parts:
-            left, right = max(0, start - at), min(len(text), end - at)
-            if left < right:
-                if hi - lo == len(text.encode("utf-8")):
-                    first = lo + len(text[:left].encode("utf-8"))
-                    last = lo + len(text[:right].encode("utf-8"))
-                else:
-                    # A replacement part is one character mapped to the bytes
-                    # that caused it. Never infer its source length from U+FFFD.
-                    assert len(text) == 1 and left == 0 and right == 1
-                    first, last = lo, hi
-                parts.append((text[left:right], first, last))
-            at += len(text)
-        return LogprobText(parts, self.owner)
+        if end <= start:
+            return self._from_spans("", (), self.owner)
+        spans = []
+        index = bisect_right(self._ends, start)
+        at = self._ends[index - 1] if index else 0
+        while index < len(self.spans) and at < end:
+            source, left, _right = self.spans[index]
+            stop = self._ends[index]
+            spans.append(
+                (source, left + max(0, start - at), left + min(end, stop) - at)
+            )
+            at = stop
+            index += 1
+        return self._from_spans(str.__getitem__(self, key), spans, self.owner)
 
     def __add__(self, other):
         return join_text((self, other))
@@ -77,8 +119,8 @@ def join_text(parts):
             continue
         if not isinstance(part, LogprobText) or part.owner is not traced.owner:
             raise LogprobError("Parser lost source-byte provenance")
-        spans.extend(part.parts)
-    return LogprobText(spans, traced.owner)
+        spans.extend(part.spans)
+    return LogprobText._from_spans("".join(parts), spans, traced.owner)
 
 
 class _LogprobStore:
@@ -91,9 +133,7 @@ class _LogprobStore:
         self.cursor = 0
 
     def append(self, start, end, token, record):
-        top = record.top[: self.top_k]
-        values = (start, end, token, record.logprob, record.rank)
-        self.records.append(values + tuple(value for pair in top for value in pair))
+        self.records.append((start, end, token) + record[: 2 + 2 * self.top_k])
         self.ends.append(end)
 
     def within(self, start, end):
@@ -117,7 +157,8 @@ class _LogprobStore:
             self.cursor = 0
 
     def discard_before(self, offset):
-        count = bisect_right(self.ends, offset)
+        # A zero-byte token at the current boundary may belong to the next chunk.
+        count = bisect_left(self.ends, offset)
         if count:
             del self.records[:count]
             del self.ends[:count]
@@ -229,8 +270,11 @@ class LogprobsProcessor:
             return []
         if not isinstance(text, LogprobText) or text.owner is not self:
             raise LogprobError("Visible text has no token-byte source spans")
+        return self.take_ranges(text.source_ranges)
+
+    def take_ranges(self, ranges):
         result = []
-        for start, end in text.source_ranges:
+        for start, end in ranges:
             for record in self.store.within(start, end):
                 _, _, token, logprob, rank, *top = record
                 entry = self.codec.candidate(token, logprob if rank <= 20 else -9999.0)
@@ -310,8 +354,8 @@ def claim_logprobs(deltas):
                 continue
             if not isinstance(text, LogprobText):
                 raise LogprobError("Visible text has no token-byte source spans")
-            for value, start, end in text.parts:
-                spans.append((start, i, priority, end, field, value, text.owner))
-    for start, i, _, end, field, value, owner in sorted(spans):
-        values[i][field].extend(owner.take(LogprobText([(value, start, end)], owner)))
+            for start, end in text.source_ranges:
+                spans.append((start, i, priority, end, field, text.owner))
+    for start, i, _, end, field, owner in sorted(spans):
+        values[i][field].extend(owner.take_ranges(((start, end),)))
     return values

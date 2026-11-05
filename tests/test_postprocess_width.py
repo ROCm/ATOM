@@ -28,12 +28,24 @@ mod = pytest.importorskip(
 )
 
 
-def _batch(seqs):
+def _batch(seqs, mask=None):
+    from atom.model_engine.token_logprobs import LogprobRows, host_logprob_rows
+
+    mask = [False] * seqs if mask is None else mask
+    requested = tuple(i for i, enabled in enumerate(mask) if enabled)
+    rows = (
+        LogprobRows(*(torch.from_numpy(part) for part in host_logprob_rows(requested)))
+        if requested
+        else None
+    )
     return types.SimpleNamespace(
         total_seqs_num=seqs,
         total_tokens_num=seqs,
         req_ids=list(range(seqs)),
-        return_logprobs=[False] * seqs,
+        return_logprobs=mask,
+        any_logprobs=any(mask),
+        logprob_requested=requested,
+        logprob_rows=rows,
         required_channel=None,
     )
 
@@ -139,8 +151,7 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
     )
 
     scheduled_bs, running_bs = 3, 4
-    batch = _batch(scheduled_bs)
-    batch.return_logprobs = [True] * scheduled_bs
+    batch = _batch(scheduled_bs, [True] * scheduled_bs)
     captured = {}
     runner = _runner(seen)
     runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp, **_: (
@@ -196,8 +207,7 @@ def test_deferred_tp_broadcasts_complete_probability_payload(
         "get_tp_group",
         lambda: types.SimpleNamespace(world_size=2, broadcast=broadcast),
     )
-    batch = _batch(2)
-    batch.return_logprobs = [False, enabled]
+    batch = _batch(2, [False, enabled])
     batch.top_logprobs = [0, top_k]
     runner = _runner({})
     runner.rank = rank
@@ -253,8 +263,7 @@ def test_a_masked_row_still_reports_the_models_logprob(
     monkeypatch.setattr(
         mod, "get_tp_group", lambda: types.SimpleNamespace(world_size=1)
     )
-    batch = _batch(2)
-    batch.return_logprobs = [True, True]
+    batch = _batch(2, [True, True])
     batch.required_channel = object() if with_channel else None
     batch.top_logprobs = [3, 3]
     captured = {}

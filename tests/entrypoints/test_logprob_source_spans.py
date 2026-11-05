@@ -11,7 +11,7 @@ from atom.entrypoints.openai.serving_chat import _build_chat_choice, create_chat
 from atom.entrypoints.openai.sse import iter_sse_data
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser
 from atom.entrypoints.openai.tool_parser.deepseekv41_tool_parser import DsmlV41Parser
-from atom.model_engine.token_logprobs import TokenLogprob
+from tests.logprob_helpers import token_logprob
 
 
 def response_logprobs(response, outputs, codec, top_k, **kwargs):
@@ -54,7 +54,7 @@ CALL = '<calls><invoke name="f"><parameter name="x">right</parameter></invoke></
 
 
 def records(text):
-    return [TokenLogprob(-float(i + 1), 1, ()) for i in range(len(text))]
+    return [token_logprob(-float(i + 1), 1, ()) for i in range(len(text))]
 
 
 @pytest.mark.parametrize(
@@ -130,7 +130,7 @@ def test_stream_hidden_repeated_text_uses_visible_occurrence(size):
 
 def test_claiming_later_text_keeps_buffered_earlier_records():
     tracker = LogprobsProcessor(Codec(), 20)
-    record = TokenLogprob(-1.0, 1, ((97, -1.0),))
+    record = token_logprob(-1.0, 1, ((97, -1.0),))
     first = tracker.feed([97], [record])
     last = tracker.feed([98], [record])
     assert tracker.take(last)[0]["token"] == "b"
@@ -147,7 +147,7 @@ def test_truncated_multibyte_source_keeps_original_bytes():
         candidate=lambda t, p: {"bytes": [228], "token": "\ufffd", "logprob": p},
     )
     tracker = LogprobsProcessor(codec)
-    assert tracker.feed([0], [TokenLogprob(-0.25, 1)]) == ""
+    assert tracker.feed([0], [token_logprob(-0.25, 1)]) == ""
     source = tracker.feed([], None, finished=True)
     assert source == "\ufffd"
     assert tracker.take(source)[0]["bytes"] == [228]
@@ -209,7 +209,7 @@ def test_boundary_tokens_owned_once_in_json_and_stream(pieces, size):
             }
 
     channel = ReasoningChannel(starts_open=pieces[0].startswith(b"."))
-    probabilities = [TokenLogprob(-float(i + 1), 1, ()) for i in range(len(pieces))]
+    probabilities = [token_logprob(-float(i + 1), 1, ()) for i in range(len(pieces))]
     response = SimpleNamespace(choices=[{"message": {}}])
     response_logprobs(
         response,
@@ -284,7 +284,7 @@ def test_raw_logprob_dispatch_coalesces_without_ordinary_decode(tag):
                 tag=tag,
                 chunk={
                     "token_ids": [token],
-                    "logprobs": [TokenLogprob(-1, 1, ())],
+                    "logprobs": [token_logprob(-1, 1, ())],
                     "finished": token == 98,
                 },
             )
@@ -331,14 +331,14 @@ def test_buffered_older_content_owns_shared_token(fanout):
         tool_parser_cls=DsmlV41Parser,
         logprob_codec=codec,
         token_ids=[0],
-        token_logprobs=[TokenLogprob(-0.25, 1)],
+        token_logprobs=[token_logprob(-0.25, 1)],
     )
 
     async def run():
         source = StreamOutputCollector()
         chunk = {
             "token_ids": [0],
-            "logprobs": [TokenLogprob(-0.25, 1)],
+            "logprobs": [token_logprob(-0.25, 1)],
             "finished": False,
         }
         source.put_nowait((0, chunk) if fanout else chunk)
@@ -393,7 +393,7 @@ def test_bad_logprobs_terminate_only_the_failing_fanout_choice():
                 1,
                 {
                     "token_ids": [98],
-                    "logprobs": [TokenLogprob(-1, 1)],
+                    "logprobs": [token_logprob(-1, 1)],
                     "finished": True,
                     "finish_reason": "stop",
                 },
@@ -449,7 +449,7 @@ def test_added_special_tokens_and_padded_vocab_candidates():
     codec = TokenBytes(tokenizer)
     tracker = LogprobsProcessor(codec, 1)
     text = tracker.feed(
-        [8, 0, 7], [TokenLogprob(-1, 1, ((99, -2),))] * 3, finished=True
+        [8, 0, 7], [token_logprob(-1, 1, ((99, -2),))] * 3, finished=True
     )
     assert text == "hello"
     assert tracker.take(text)[0]["top_logprobs"] == [
@@ -600,7 +600,7 @@ def test_zero_width_tokens_at_visible_span_boundaries(position):
     tracker = LogprobsProcessor(EmptyCodec())
     ids = [97, 98]
     ids.insert(position, 0)
-    text = tracker.feed(ids, [TokenLogprob(-1, 1)] * 3, finished=True)
+    text = tracker.feed(ids, [token_logprob(-1, 1)] * 3, finished=True)
     assert text == "ab"
     assert len(tracker.take(text)) == 3
 
@@ -697,3 +697,44 @@ def test_disabled_tool_parser_never_joins_source_spans(monkeypatch, size):
     assert content == "leftright"
     assert len(calls) == 1
     assert calls[0].function["arguments"] == '{"x": "right"}'
+
+
+@pytest.mark.parametrize("prefix", ["", "x"])
+def test_zero_width_token_survives_separate_stream_chunk(prefix):
+    class EmptyCodec(Codec):
+        def raw(self, token):
+            return b"" if token == 0 else super().raw(token)
+
+    tracker = LogprobsProcessor(EmptyCodec())
+    if prefix:
+        text = tracker.feed([ord(prefix)], [token_logprob(-1, 1)])
+        assert len(tracker.take(text)) == 1
+        tracker.discard_resolved("")
+    assert tracker.feed([0], [token_logprob(-2, 1)]) == ""
+    tracker.discard_resolved("")
+    text = tracker.feed([97], [token_logprob(-3, 1)], finished=True)
+    result = tracker.take(text)
+    assert [row["bytes"] for row in result] == [[], [97]]
+    assert [row["logprob"] for row in result] == [-2, -3]
+
+
+def test_slices_and_joins_reuse_byte_indices(monkeypatch):
+    from atom.entrypoints.openai.logprobs import LogprobText, _ByteOffsets, join_text
+
+    text = "中a🙂" * 10000
+    source = LogprobText([(text, 11, 11 + len(text.encode()))], object())
+
+    def forbidden(*args):
+        raise AssertionError("a slice must reuse its original byte index")
+
+    monkeypatch.setattr(_ByteOffsets, "__init__", forbidden)
+    for start in range(0, 3000, 3):
+        piece = source[start : start + 3][1:]
+        assert piece == "a🙂"
+        assert piece.source_ranges == [
+            (11 + start // 3 * 8 + 3, 11 + start // 3 * 8 + 8)
+        ]
+    joined = join_text([source[:3], source[-3:]])
+    assert joined[2:4] == "🙂中"
+    assert joined[2:4].source_ranges == [(15, 19), (11 + 9999 * 8, 14 + 9999 * 8)]
+    assert source[4:2].source_ranges == []

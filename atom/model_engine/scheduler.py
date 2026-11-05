@@ -4531,7 +4531,7 @@ class Scheduler:
             committed_logprobs = None
             if seq.return_logprobs:
                 committed_logprobs = (token_logprob or [])[: len(new_tokens)]
-                seq.logprobs.extend(item.logprob for item in committed_logprobs)
+                seq.logprobs.extend(item[0] for item in committed_logprobs)
 
             # Record TTFT from the finalized retained length, after rejected
             # speculative tokens and cap/stop overflow have been removed. A

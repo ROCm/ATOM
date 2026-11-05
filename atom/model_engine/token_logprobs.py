@@ -8,12 +8,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-
-@dataclass(frozen=True)
-class TokenLogprob:
-    logprob: float
-    rank: int
-    top: tuple[tuple[int, float], ...] = ()
+# Flat wire record: (logprob, rank, top_id_0, top_logprob_0, ...).
+TokenLogprob = tuple[float | int, ...]
 
 
 @dataclass
@@ -21,6 +17,26 @@ class LogprobRows:
     requests: torch.Tensor
     model_rows: torch.Tensor
     sample_rows: torch.Tensor
+
+
+def host_logprob_rows(requested, num_sampled_tokens=None, width=1):
+    """Build row indices from settled host query lengths, before H2D publication."""
+    requested = np.asarray(requested, dtype=np.int64)
+    if num_sampled_tokens is None:
+        return requested, requested, np.arange(len(requested), dtype=np.int64)[:, None]
+    lengths = np.asarray(num_sampled_tokens, dtype=np.int64)
+    ends = lengths.cumsum()
+    starts = ends - lengths
+    drafts = np.clip(lengths - 1, 0, width - 1)
+    model_rows = []
+    sample_rows = np.empty((len(requested), width), dtype=np.int64)
+    slots = np.arange(width)
+    for compact, request in enumerate(requested):
+        count = int(drafts[request])
+        sample_rows[compact] = len(model_rows) + np.minimum(slots, count)
+        model_rows.extend(range(int(starts[request]), int(starts[request]) + count))
+        model_rows.append(int(ends[request]) - 1)
+    return requested, np.asarray(model_rows, dtype=np.int64), sample_rows
 
 
 def _logprob_rows(batch, metadata, device, width):
@@ -150,10 +166,20 @@ def unpack_token_logprobs(payload, req_ids, token_ids, requested=None):
     # A structured NumPy view converts mixed floats/ints in one tolist call.
     # No numeric cast of IDs: ranks and candidates remain bit-exact, even for
     # int32 values outside FP32's exact integer range.
+    names = ["logprob", "rank"]
+    formats = [np.float32, np.int32]
+    offsets = [0, (2 * k + 1) * 4]
+    for i in range(k):
+        names.extend((f"id{i}", f"value{i}"))
+        formats.extend((np.int32, np.float32))
+        offsets.extend(((k + 1 + i) * 4, (i + 1) * 4))
     dtype = np.dtype(
-        [(f"value{i}", np.float32) for i in range(k + 1)]
-        + [(f"id{i}", np.int32) for i in range(k)]
-        + [("rank", np.int32)]
+        {
+            "names": names,
+            "formats": formats,
+            "offsets": offsets,
+            "itemsize": (2 * k + 2) * 4,
+        }
     )
     records = payload.numpy().view(dtype).reshape(payload.shape[:2]).tolist()
     if requested is not None:
@@ -161,13 +187,5 @@ def unpack_token_logprobs(payload, req_ids, token_ids, requested=None):
     if len(records) != len(req_ids):
         raise ValueError("Token/logprob batch identity mismatch")
     return {
-        req_id: [
-            TokenLogprob(
-                record[0],
-                record[-1],
-                tuple(zip(record[k + 1 : 2 * k + 1], record[1 : k + 1])),
-            )
-            for record in records[i][: len(token_ids[req_id])]
-        ]
-        for i, req_id in enumerate(req_ids)
+        req_id: records[i][: len(token_ids[req_id])] for i, req_id in enumerate(req_ids)
     }

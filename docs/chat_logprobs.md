@@ -83,10 +83,12 @@ All logprob scoring uses native PyTorch operations on both CPU and GPU,
 including `top_logprobs=0`. The scorer has no `torch.compile` wrapper or
 compilation cache. Optional snapshots and ragged row mapping are resolved
 before scoring; disabled requests do not invoke the scorer. Snapshot capture and
-scoring share one GPU row plan. Requested sequence indices use the runner's
-existing staged H2D publication; disabled batches do not publish that optional
-buffer. Ragged draft counts already on the host determine allocation sizes;
-building the plan does not read GPU metadata back to the CPU.
+scoring share one row plan. The runner builds requesting/model/sample row indices
+from settled CPU query lengths during preparation, after any DSpark q-bucket
+adjustment. All three arrays share one staged buffer and the existing sampling
+H2D publication; disabled batches omit it. Postprocess uses these device views
+without launching row-mapping kernels or reading GPU metadata back to the CPU.
+The staging slot's existing completion event protects buffer reuse.
 
 The implementation avoids explicitly retaining a full log-softmax matrix, but
 the native selected-logit gather/conversion still allocates vocabulary-sized workspace.
@@ -95,8 +97,14 @@ avoiding their computation is a later optimization opportunity.
 
 Only selected probabilities and candidate IDs/scores are copied to the host,
 not full vocabularies. Records live in request-local memory, with no temporary
-files or per-record disk I/O. Resolved records are retired after parsing and
-serialization. Unresolved tool regions retain their records until classified;
+files or per-record disk I/O. The completed payload's structured NumPy view
+produces flat tuples directly, without constructing and unpacking per-token
+objects. Offline scalar logprob arrays are retained for `generate()` callers.
+Text slices share a character-to-byte index built once per decoded span; ASCII
+spans use arithmetic offsets. Malformed UTF-8 keeps its original byte mapping.
+Slicing still materializes Python strings, but does not re-encode source prefixes.
+Resolved records are retired after parsing and serialization; zero-byte records
+at the current source boundary remain until that boundary advances. Unresolved tool regions retain their records until classified;
 there is no constant-memory guarantee for an arbitrarily long unfinished region.
 This is not a zero-overhead claim: throughput, tail latency, temporary device
 memory and CPU/SSE cost require on/off comparisons at representative loads.

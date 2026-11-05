@@ -15,7 +15,7 @@ from atom.entrypoints.openai.logprobs import (
 )
 from atom.entrypoints.openai.sse import iter_sse_data
 from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
-from atom.model_engine.token_logprobs import TokenLogprob
+from tests.logprob_helpers import token_logprob
 
 from .test_api_compatibility import post
 from .test_api_compatibility import server as _server_fixture
@@ -47,7 +47,7 @@ def codec():
 
 
 def rec(rank=1):
-    return TokenLogprob(-0.25, rank, ((0, -0.25), (1, -1.5)))
+    return token_logprob(-0.25, rank, ((0, -0.25), (1, -1.5)))
 
 
 def test_bytes_across_chinese_tokens_and_special_eos():

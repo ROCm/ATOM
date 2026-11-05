@@ -63,10 +63,11 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_engine.token_logprobs import (
+    LogprobRows,
     TokenLogprob,
-    _logprob_rows,
     capture_token_logits,
     gather_token_logprobs,
+    host_logprob_rows,
     pack_token_logprobs,
     unpack_token_logprobs,
 )
@@ -1440,6 +1441,7 @@ class ModelRunner:
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         f32_kwargs = {"dtype": torch.float, "device": self.device}
 
+        logprob_width = getattr(getattr(self, "drafter", None), "mtp_k", 0) + 1
         # TODO: remove it in forward_context
         self.forward_vars = {
             "input_ids": self.tokenID_processor.input_ids,
@@ -1457,8 +1459,11 @@ class ModelRunner:
             "top_ps": CpuGpuBuffer(
                 self.max_bs, publication_group="sampling", **f32_kwargs
             ),
+            # One staged buffer: requesting rows + model rows + sample rows.
             "logprob_request_indices": CpuGpuBuffer(
-                self.max_bs, publication_group="sampling", **i64_kwargs
+                self.max_bs * (1 + 2 * logprob_width),
+                publication_group="sampling",
+                **i64_kwargs,
             ),
             "required_channel_states": CpuGpuBuffer(
                 self.max_bs, publication_group="sampling", **i32_kwargs
@@ -2711,12 +2716,27 @@ class ModelRunner:
 
         logprob_count = None
         batch.logprob_request_indices = None
+        batch.logprob_rows = None
         if getattr(batch, "any_logprobs", False):
-            requested = batch.logprob_requested
-            logprob_count = len(requested)
+            lengths, width = None, 1
+            if self._verifies_drafts(batch, batch.total_tokens_num_prefill > 0):
+                _, lengths, _ = self.attn_metadata_builder.decode_spans(batch)
+                width = self.drafter.mtp_k + 1
+            requested, model_rows, sample_rows = host_logprob_rows(
+                batch.logprob_requested, lengths, width
+            )
             buffer = self.forward_vars["logprob_request_indices"]
-            buffer.np[: len(requested)] = requested
-            batch.logprob_request_indices = buffer.gpu[: len(requested)]
+            n, m = len(requested), len(model_rows)
+            logprob_count = n + m + sample_rows.size
+            buffer.np[:n] = requested
+            buffer.np[n : n + m] = model_rows
+            buffer.np[n + m : logprob_count] = sample_rows.ravel()
+            batch.logprob_request_indices = buffer.gpu[:n]
+            batch.logprob_rows = LogprobRows(
+                batch.logprob_request_indices,
+                buffer.gpu[n : n + m],
+                buffer.gpu[n + m : logprob_count].view(n, width),
+            )
 
         # Read back by `postprocess` through `_constrain_required_channel`.
         channel_count = None
@@ -3364,14 +3384,7 @@ class ModelRunner:
         logprob_snapshot = None
         logprob_rows = None
         if need_logprobs:
-            width = (
-                1
-                if spec_decode_metadata is None
-                else spec_decode_metadata.num_spec_steps + 1
-            )
-            logprob_rows = _logprob_rows(
-                batch, spec_decode_metadata, logits.device, width
-            )
+            logprob_rows = batch.logprob_rows
         structured = getattr(self, "structured_output", None)
         structured_requests = getattr(batch, "structured_requests", None)
         if structured_requests and structured is None:
