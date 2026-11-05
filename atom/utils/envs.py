@@ -292,9 +292,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GROUP32_WEIGHT_PRESHUFFLE": lambda: (
         os.getenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "1") == "1"
     ),
-    "ATOM_GROUP1X32_WEIGHT_PRESHUFFLE": lambda: (
-        os.getenv("ATOM_GROUP1X32_WEIGHT_PRESHUFFLE", "0") == "1"
-    ),
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),

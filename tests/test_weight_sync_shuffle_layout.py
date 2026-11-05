@@ -40,7 +40,7 @@ from atom.model_ops.linear import (
 from atom.rollout.weight_updater import WeightUpdaterMixin
 
 PRESHUFFLE_ENV = "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE"
-MXFP8_PRESHUFFLE_ENV = "ATOM_GROUP1X32_WEIGHT_PRESHUFFLE"
+MXFP8_PRESHUFFLE_ENV = "ATOM_GROUP32_WEIGHT_PRESHUFFLE"
 
 # (quant_type, params_dtype, needs_preshuffled_weight)
 CASES = [
@@ -114,10 +114,13 @@ def test_unquantized_and_per_tensor_are_not_shuffled():
 
 
 def test_mxfp8_linear_preshuffle_is_opt_in_and_shape_gated(monkeypatch):
-    monkeypatch.setenv(MXFP8_PRESHUFFLE_ENV, "1")
+    monkeypatch.delenv(MXFP8_PRESHUFFLE_ENV, raising=False)
     monkeypatch.setattr(
         "aiter.jit.utils.chip_info.get_gfx_runtime", lambda: "gfx950"
     )
+    assert use_mxfp8_linear_bpreshuffle(128, 16, dtypes.fp8, 1)
+
+    monkeypatch.setenv(MXFP8_PRESHUFFLE_ENV, "1")
     assert use_mxfp8_linear_bpreshuffle(128, 16, dtypes.fp8, 1)
     assert not use_mxfp8_linear_bpreshuffle(64, 16, dtypes.fp8, 1)
     assert not use_mxfp8_linear_bpreshuffle(128, 15, dtypes.fp8, 1)
