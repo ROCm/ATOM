@@ -13,21 +13,17 @@ if TYPE_CHECKING:
     from PIL import Image
 
 
-def load_image(
-    data: ImageItem, connector: MediaConnector, *, keep_alpha: bool = False
-) -> Image.Image:
-    """Decode an image to RGB, or to RGBA when ``keep_alpha`` and some pixel is
-    not fully opaque (an alpha band or palette transparency in use).
+def load_image(data: ImageItem, connector: MediaConnector) -> Image.Image:
+    """Decode an image and return it in its decoded mode.
 
-    Converting a transparent image straight to RGB composites it on black, so
-    dark content on a transparent background disappears. Processors that apply
-    their model's own background fill (Kimi-K3) need the alpha channel; callers
-    opt in per model through the input builder's ``keeps_alpha``.
+    Color conversion is left to the model's processor: converting here would
+    drop the alpha channel and palette transparency before a processor that
+    handles them sees the image.
     """
-    from PIL import Image, UnidentifiedImageError
+    from PIL import Image
 
     if isinstance(data, Image.Image):
-        return _decoded(data, keep_alpha)
+        return data
     if isinstance(data, EncodedMedia):
         image_bytes = data.data
     elif isinstance(data, bytes):
@@ -35,16 +31,9 @@ def load_image(
     else:
         image_bytes = connector.read(data)
     try:
-        with Image.open(io.BytesIO(image_bytes)) as image:
-            return _decoded(image, keep_alpha)
-    except UnidentifiedImageError as exc:
+        image = Image.open(io.BytesIO(image_bytes))
+        # Decode now, so invalid data fails here rather than in the processor.
+        image.load()
+    except OSError as exc:  # UnidentifiedImageError included
         raise ValueError("Invalid image data") from exc
-
-
-def _decoded(image: Image.Image, keep_alpha: bool) -> Image.Image:
-    if keep_alpha and ("A" in image.getbands() or "transparency" in image.info):
-        rgba = image.convert("RGBA")
-        # An alpha band that is fully opaque carries nothing to fill.
-        if rgba.getchannel("A").getextrema()[0] < 255:
-            return rgba
-    return image.convert("RGB")
+    return image

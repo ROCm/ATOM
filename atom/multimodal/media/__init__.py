@@ -29,8 +29,8 @@ class MediaLoader:
     def __init__(self, timeout: float = 30):
         self.connector = MediaConnector(timeout)
 
-    def load_image(self, data: ImageItem, *, keep_alpha: bool = False):
-        return load_image(data, self.connector, keep_alpha=keep_alpha)
+    def load_image(self, data: ImageItem):
+        return load_image(data, self.connector)
 
     def load_audio(self, data: AudioItem) -> AudioData:
         if isinstance(data, tuple):
@@ -50,27 +50,20 @@ class MediaLoader:
             "or implement MediaLoader.load_video"
         )
 
-    def load(self, modality: Modality, data: MediaData, *, keep_alpha: bool = False):
-        if modality == "image":
-            return self.load_image(data, keep_alpha=keep_alpha)
-        loaders = {"audio": self.load_audio, "video": self.load_video}
+    def load(self, modality: Modality, data: MediaData):
+        loaders = {
+            "image": self.load_image,
+            "audio": self.load_audio,
+            "video": self.load_video,
+        }
         return loaders[modality](data)
 
 
 def load_multimodal_data(
-    data: MultiModalDataItems, loader: MediaLoader, *, keep_alpha: bool = False
+    data: MultiModalDataItems, loader: MediaLoader
 ) -> MultiModalDataItems:
-    """Decode normalized media, retaining the order within each modality.
-
-    ``keep_alpha`` keeps transparent images as RGBA (see ``load_image``).
-    """
-    # Pass keep_alpha only when it applies, so loaders that override ``load``
-    # without it keep working for every other request.
-    extra = {"keep_alpha": True} if keep_alpha else {}
+    """Decode normalized media, retaining the order within each modality."""
     return {
-        modality: [
-            loader.load(modality, item, **(extra if modality == "image" else {}))
-            for item in items
-        ]
+        modality: [loader.load(modality, item) for item in items]
         for modality, items in data.items()
     }
