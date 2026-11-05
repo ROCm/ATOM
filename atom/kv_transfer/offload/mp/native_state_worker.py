@@ -359,6 +359,11 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 logger.exception("LMCache MP native restore failed")
             finally:
                 event.record(self._restore_stream)
+        # The retrieve is terminal, so the deadline now bounds only this copy.
+        # Counting from the retrieve's submission would also count whatever the
+        # host ran before polling it, such as a cold first forward that spends
+        # ~30 s compiling kernels.
+        pending.started_at = time.monotonic()
         return True
 
     def _emit_page_source_safe(
