@@ -246,20 +246,21 @@ def load_config(path: Path) -> dict[str, Any]:
         return yaml.safe_load(handle) or {}
 
 
-def role_env(
+def merged_role_env(
     defaults: dict[str, Any],
     backend_cfg: dict[str, Any],
     model_cfg: dict[str, Any],
     suite_cfg: dict[str, Any],
     role: str,
     slurm_submit_runner: str = "",
-) -> dict[str, str]:
+) -> dict[str, Any]:
+    """A role's env layers merged in precedence order, references unresolved."""
     # env_by_runner.<runner> overrides every plain env layer, so a hardware
     # limit set on the model (e.g. host memory per NUMA node) also caps values
     # that individual suites set.
     model_runner_env = model_cfg.get("env_by_runner", {}).get(slurm_submit_runner, {})
     suite_runner_env = suite_cfg.get("env_by_runner", {}).get(slurm_submit_runner, {})
-    env = deep_merge(
+    return deep_merge(
         defaults.get("env", {}).get("common", {}),
         backend_cfg.get("env", {}).get("common", {}),
         model_cfg.get("env", {}).get("common", {}),
@@ -272,10 +273,49 @@ def role_env(
         model_runner_env.get(role, {}),
         suite_runner_env.get(role, {}),
     )
+
+
+def role_env(
+    defaults: dict[str, Any],
+    backend_cfg: dict[str, Any],
+    model_cfg: dict[str, Any],
+    suite_cfg: dict[str, Any],
+    role: str,
+    slurm_submit_runner: str = "",
+) -> dict[str, str]:
+    env = merged_role_env(
+        defaults, backend_cfg, model_cfg, suite_cfg, role, slurm_submit_runner
+    )
     # ROLE_IP and HANDSHAKE_PORT are filled in by pd_server_atom.sh at
     # launch time (host IP and 6301 + ATOMESH_SERVICE_PORT_OFFSET).
     env = resolve_env_refs_in_value(env, preserve_names={"ROLE_IP", "HANDSHAKE_PORT"})
     return {str(key): str(value) for key, value in env.items()}
+
+
+def cell_kv_connector(
+    cfg: dict[str, Any], model_cfg: dict[str, Any], suite_cfg: dict[str, Any]
+) -> str:
+    """The KV connector a cell runs, read from the env layers it gets.
+
+    Needs none of the checks building the cell runs, so a connector filter can
+    drop a cell before its node count or layout is validated.
+    """
+    defaults = cfg.get("defaults", {})
+    backend_name = str(model_cfg.get("backend", "atom"))
+    backend_cfg = cfg.get("backends", {}).get(backend_name) or {}
+    runner_cfg = resolve_runner(
+        deep_merge(defaults.get("runner", {}), suite_cfg.get("runner", {}))
+    )
+    env = merged_role_env(
+        defaults,
+        backend_cfg,
+        model_cfg,
+        suite_cfg,
+        "common",
+        str(runner_cfg.get("slurm_submit_runner", "")),
+    )
+    # Unset, pd_server_atom.sh transfers the KV over Mooncake.
+    return resolve_env_refs(str(env.get("KV_CONNECTOR", "mooncake")))
 
 
 def build_cell(
@@ -537,21 +577,22 @@ def build_cells(
             benchmark_kind = str(benchmark_cfg.get("kind", "random"))
             if benchmark_kind_filter and benchmark_kind not in benchmark_kind_filter:
                 continue
-            cell = build_cell(
-                cfg=cfg,
-                model_name=str(model_name),
-                model_cfg=model_cfg,
-                suite_name=suite,
-                suite_cfg=suite_cfg,
-                override_image=override_image,
-                override_benchmark_concurrency=override_benchmark_concurrency,
-                override_eval_concurrency=override_eval_concurrency,
-            )
-            # Unset, pd_server_atom.sh transfers the KV over Mooncake.
-            connector = cell["env"]["common"].get("KV_CONNECTOR", "mooncake")
-            if kv_connector_filter and connector not in kv_connector_filter:
+            if kv_connector_filter and (
+                cell_kv_connector(cfg, model_cfg, suite_cfg) not in kv_connector_filter
+            ):
                 continue
-            cells.append(cell)
+            cells.append(
+                build_cell(
+                    cfg=cfg,
+                    model_name=str(model_name),
+                    model_cfg=model_cfg,
+                    suite_name=suite,
+                    suite_cfg=suite_cfg,
+                    override_image=override_image,
+                    override_benchmark_concurrency=override_benchmark_concurrency,
+                    override_eval_concurrency=override_eval_concurrency,
+                )
+            )
     return cells
 
 

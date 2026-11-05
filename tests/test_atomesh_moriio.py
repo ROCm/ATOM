@@ -54,18 +54,18 @@ def generate_cells(
                 str(output),
             ],
             cwd=ROOT,
-            env=dict(
-                os.environ,
-                ATOMESH_SLURM_SUBMIT_RUNNER="atomesh-cicd-mi350",
-                ATOMESH_SLURM_ACCOUNT="",
-                ATOMESH_SLURM_PARTITION="",
-                ATOMESH_LOG_ROOT="/data/${USER}/logs/ATOMESH_LOG/",
-                ATOMESH_MODEL_ROOT=model_root,
-                ATOMESH_1P1D_NODES=SPUR_NODES,
-                ATOMESH_2P1D_NODES=SPUR_NODES,
-                ATOMESH_PD_RANK_MAPPING_POLICY="idx2idx",
+            env={
+                **os.environ,
+                "ATOMESH_SLURM_SUBMIT_RUNNER": "atomesh-cicd-mi350",
+                "ATOMESH_SLURM_ACCOUNT": "",
+                "ATOMESH_SLURM_PARTITION": "",
+                "ATOMESH_LOG_ROOT": "/data/${USER}/logs/ATOMESH_LOG/",
+                "ATOMESH_MODEL_ROOT": model_root,
+                "ATOMESH_1P1D_NODES": SPUR_NODES,
+                "ATOMESH_2P1D_NODES": SPUR_NODES,
+                "ATOMESH_PD_RANK_MAPPING_POLICY": "idx2idx",
                 **(env or {}),
-            ),
+            },
             check=True,
             capture_output=True,
             text=True,
@@ -431,6 +431,25 @@ class MoriIOScheduleTest(unittest.TestCase):
         self.assertEqual(
             [cell["id"] for cell in mooncake], [cell["id"] for cell in nightly]
         )
+
+    def test_a_connector_filter_drops_a_cell_before_checking_its_nodes(self):
+        # Two candidate nodes: the four-node MoRI 2P2D cell fails its node check
+        # unless --kv-connector mooncake drops it first.
+        two_nodes = ",".join(SPUR_NODES.split(",")[:2])
+        pool = {"ATOMESH_1P1D_NODES": two_nodes, "ATOMESH_2P1D_NODES": two_nodes}
+        mooncake = generate_cells(
+            "DeepSeek-V3",
+            "accuracy",
+            SPUR_MODEL_ROOT,
+            extra_args=("--kv-connector", "mooncake"),
+            env=pool,
+        )
+        names = [cell["name"] for cell in mooncake]
+        self.assertIn("ds-v3-1p1d-tp8-mooncake-gsm8k", names)
+        self.assertNotIn("ds-v3-2p2d-dpa16-ep16-ll-moriio-gsm8k", names)
+        with self.assertRaises(subprocess.CalledProcessError) as unfiltered:
+            generate_cells("DeepSeek-V3", "accuracy", SPUR_MODEL_ROOT, env=pool)
+        self.assertIn("needs at least 4 node(s)", unfiltered.exception.stderr)
 
     def test_atomesh_kv_connector_sets_the_filter_like_the_flag(self):
         flag = generate_cells(
