@@ -894,9 +894,9 @@ class KimiFullAttention(nn.Module):
         """The attention output and the ungated ``g_proj`` output: ``_gated_core``
         before its sigmoid/mul, for a mono K2 that applies the gate itself.
 
-        With the attention's ``dcp_merge_sink`` armed (the mono K2 DCP merge),
-        the first value is the unmerged per-shard partial ``[S, 96, 128]`` and
-        the merge inputs are in the sink: it is not ``_gated_core``'s input."""
+        With the attention's ``dcp_defer_merge`` set (the mono K2 DCP merge),
+        the first value holds no data: the partial and its LSE are in the
+        attention's ``dcp_partial_out`` / ``dcp_partial_lse``."""
         # deepseek_v2 pattern: one _fuse_rmsnorm_quant kernel does q_a norm +
         # kv_a norm (+ q-activation quant), then q's scale is forwarded into the
         # MLA module (q_proj consumes it).

@@ -237,7 +237,6 @@ def _build_ready_runner(
     )
     runner = object.__new__(Glm52MonoRunner)
     runner._dcp = 1
-    runner._tl_prefix = None
     runner._lm = SimpleNamespace(model=model)
     runner._atom_config = SimpleNamespace(
         hf_config=SimpleNamespace(index_topk=128),

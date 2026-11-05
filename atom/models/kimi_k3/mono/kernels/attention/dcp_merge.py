@@ -30,18 +30,19 @@ o_proj, which waited for that peer's merge.
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from atom.models.kimi_k3.mono.config import TOKEN_GROUP, group_rows, groups
+from atom.models.kimi_k3.mono.config import HEAD_DIM, MLA_HEADS, TOKEN_GROUP, groups
 from atom.models.kimi_k3.mono.kernels.attention.back import TP
 from atom.models.kimi_k3.mono.kernels.attention.kda import HD, NH, PROJ, sigmoid
 from atom.mono.device import dcp_merge as merge
-from atom.mono.device.ops import CM_DEV, bf16_round, rsrc, traced
+from atom.mono.device.ops import CM_DEV, bf16_round, bf_hi, bf_lo, rsrc, traced
 from atom.mono.device.sync import publish
 from atom.mono.plan.execution import BLOCKS, THREADS
 
-HEADS = TP * NH  # 96: a rank's decode heads under DCP = TP
+HEADS = MLA_HEADS  # a rank's decode heads under DCP = TP
+assert HEADS == TP * NH and HD == HEAD_DIM
 WORDS = HD // 2  # bf16 pair words a head row
 SLOT = WORDS + 1  # pairs a (source, token, head): o, then the LSE
 QUADS = HD // 4  # threads a merged (token, head) row: 4 columns each
@@ -126,11 +127,10 @@ def stage_push(c, bid):
 
 
 @traced
-def stage_merge(c, g, h):
-    """Token group g, local head h: the 8 sources merged and gated -> core rows
-    (thread: token, 4 columns); then CRDY flag (g, h)."""
+def stage_merge(c, g, h, sg):
+    """Token group g (``sg`` rows), local head h: the 8 sources merged and
+    gated -> core rows (thread: token, 4 columns); then CRDY flag (g, h)."""
     a, tid = c["args"], c["tid"]
-    sg = group_rows(c["S"], g)
     if tid < sg * QUADS:
         tl = tid // QUADS
         q = tid % QUADS
@@ -154,22 +154,12 @@ def stage_merge(c, g, h):
                 )
             f = merge.lse_factor(lses[src], total)
             w0, w1 = rows[src % MERGE_BATCH]
-            vals = [
-                (w0 << 16).bitcast(fx.Float32),
-                (w0 & fx.Int32(-65536)).bitcast(fx.Float32),
-                (w1 << 16).bitcast(fx.Float32),
-                (w1 & fx.Int32(-65536)).bitcast(fx.Float32),
-            ]
+            vals = [bf_lo(w0), bf_hi(w0), bf_lo(w1), bf_hi(w1)]
             acc = merge.lse_accumulate(acc, vals, f)
         # aiter's ``_fused_sigmoid_mul_kernel`` on the bf16 merged row
         at = t * (PROJ // 2) + h * WORDS + 2 * q
         gw = fx.Vector(bo.buffer_load(rsrc(a["gate"]), at, vec_width=2, dtype=T.i32))
-        gates = [
-            (gw[0] << 16).bitcast(fx.Float32),
-            (gw[0] & fx.Int32(-65536)).bitcast(fx.Float32),
-            (gw[1] << 16).bitcast(fx.Float32),
-            (gw[1] & fx.Int32(-65536)).bitcast(fx.Float32),
-        ]
+        gates = [bf_lo(gw[0]), bf_hi(gw[0]), bf_lo(gw[1]), bf_hi(gw[1])]
         outs = []
         for j in range_constexpr(4):
             # aiter's ``_sigmoid_exp2``: its 1.44269504089 is 1 / ln 2 in fp32
@@ -184,11 +174,16 @@ def stage_merge(c, g, h):
 
 @traced
 def stage_dcp_merge(c, task):
-    """Merge task ``task`` (< ``merge_tasks``), after the grid's push. The group
-    is a build constant of its stages (its row count), so it is matched here."""
-    for g in range_constexpr(groups(c["S"])):
-        if (task >= g * NH) & (task < (g + 1) * NH):
-            stage_merge(c, g, task - g * NH)
+    """Merge task ``task`` (< ``merge_tasks``), after the grid's push: one body
+    for the whole groups, one for a last group of fewer rows."""
+    full, rest = divmod(c["S"], TOKEN_GROUP)
+    g, h = task // NH, task % NH
+    if const_expr(full > 0):  # noqa: SIM102 (a build constant, then the task)
+        if g < full:
+            stage_merge(c, g, h, TOKEN_GROUP)
+    if const_expr(rest > 0):  # noqa: SIM102
+        if g == full:
+            stage_merge(c, g, h, rest)
 
 
 @traced

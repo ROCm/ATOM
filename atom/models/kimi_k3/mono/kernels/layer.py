@@ -77,9 +77,8 @@ E0 = 160  # router / latent CTAs (their weights in flight under their o_proj)
 # timeline points: 0 start, 1 o_proj done / AR reduced, 2 early done / slice,
 # 3 ug, 4 down/sdown, 5 lnorm, 6 up, 7 reduce, 8 gate, 9 mix (x published),
 # 10 route, 11 route table, 12 latent quant, 13 route starts
-TL_POINTS = 21  # + 14 route's logits polled, 15 lnorm's latent sums in, 16 down done,
-# 17 the latent's first block polled; a DCP build's 18 pushed, 19 merged (merge
-# CTAs), 20 the first group's core in (o_proj CTAs)
+TL_POINTS = 18  # + 14 route's logits polled, 15 lnorm's latent sums in, 16 down done,
+# 17 the latent's first block polled
 
 assert E0 + k2b.R_TASKS + k2b.L_TASKS <= BLOCKS and k2b.G_TASKS <= E0 - O0
 
@@ -213,8 +212,6 @@ def stage_oproj(c, gi):
         cg = k2a.group_view(c, g)
         if const_expr(c["DCP"]):
             dcp_merge.wait_core(c, g)
-            if g == 0:
-                stamp(c["tl_on"], c["tls"], c["tid"], 20)
         k2a.load_core(cg)
         for j in range_constexpr(O_ROUNDS):
             t = gi + BLOCKS * j
@@ -280,7 +277,7 @@ def build(key: K2Build):
     assert s >= 1 and NA * G <= THREADS
     # the merge CTAs are AttnRes CTAs (below O0), which take their o_proj last:
     # the merge does not hold up the first o_proj round
-    assert dcp_merge.merge_tasks(s) <= O0
+    assert not key.dcp or dcp_merge.merge_tasks(s) <= O0
     # the early GEMVs stage their K slice a slab at a time; ``xl`` holds the
     # widest slab any of the three kinds asks for (one slab, i.e. the whole
     # slice, at every row count up to 8)
@@ -483,10 +480,8 @@ def build(key: K2Build):
         if const_expr(key.dcp):
             enter_stage("k2.dcp")
             dcp_merge.stage_push(c, bid)
-            stamp(on, tls, tid, 18)
             if bid < dcp_merge.merge_tasks(s):
                 dcp_merge.stage_dcp_merge(c, bid)
-                stamp(on, tls, tid, 19)
         # o_proj first (every AttnRes CTA waits on the slowest partial; loads
         # retire in order), the early weights after: they land before x does
         if bid >= O0:

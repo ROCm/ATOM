@@ -50,10 +50,10 @@ from atom.model_ops.triton_fused_sigmoid_mul_quant import sigmoid_mul
 from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
     Dims,
+    inner_model,
     layer_block,
     num_blocks,
 )
-from atom.models.kimi_k3.mono.dcp import inner_model
 from atom.models.kimi_k3.mono.kernels import layer as k2
 from atom.models.kimi_k3.mono.kernels.attention import dcp_merge
 from atom.models.kimi_k3.mono.kernels.attention import kda as k1
@@ -78,7 +78,6 @@ from atom.mono.runtime.debug import (
 )
 from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
-from atom.mono.runtime.timeline import LayerTimeline
 from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils import envs
@@ -196,19 +195,6 @@ class K3MonoDecodeRunner:
         self.debug = envs.ATOM_MONO_DEBUG
         self.check = envs.ATOM_MONO_CHECK
         self.inner = inner_model(model)
-        # debug: K2's per-CTA phase stamps (``atom.mono.runtime.timeline``)
-        tl_prefix = envs.ATOM_MONO_TIMELINE
-        self.timeline = (
-            LayerTimeline(
-                tl_prefix,
-                len(self.inner.layers),
-                k2.TL_POINTS,
-                get_tensor_model_parallel_rank(),
-                torch.device("cuda", torch.cuda.current_device()),
-            )
-            if tl_prefix
-            else None
-        )
         self.plans = bind_model(self.inner, self.dims, self.rank)
         self.num_blocks = num_blocks(len(self.inner.layers))
         # a DSpark drafter taps hidden states; a plain-decode deployment has none
@@ -219,6 +205,8 @@ class K3MonoDecodeRunner:
         )
         first = next(p for p in self.plans if p.mono)
         self.device = first.kda.w_in.device
+        if self.dcp_merge:
+            self._bind_dcp_merge()
         self.state_len = self._state_len()
         self.replay_cap = self._replay_cap()
         self._replay_tables = {}  # layer id -> (K1's ReplaySSM table, its pointers)
@@ -235,6 +223,27 @@ class K3MonoDecodeRunner:
             logger.info("mono DSA indexer off: %s", why)
             self.ix = None
         self._allocate()
+
+    def _bind_dcp_merge(self) -> None:
+        """The buffer the attention writes its DCP partial into
+        (``MLAAttention._dcp_defer_merge``), one for every full-attention
+        layer, read by K2 before the next one's attention. Static shapes are
+        checked here, once."""
+        heads, hd = dcp_merge.HEADS, dcp_merge.HD
+        self.dcp_out = torch.empty(
+            self.max_rows, heads, hd, dtype=torch.bfloat16, device=self.device
+        )
+        for i, layer in enumerate(self.inner.layers):
+            if layer.is_linear_attn:
+                continue
+            width = layer.self_attn.g_proj.output_size
+            if width != self.dims.proj:
+                raise MonoUnsupported(
+                    f"layer {i}: g_proj width {width}, K2's DCP merge gates "
+                    f"{self.dims.proj}"
+                )
+            impl = layer.self_attn.attn.impl
+            impl.dcp_partial_out = self.dcp_out
 
     def _state_len(self) -> int:
         """The conv state's window, a build constant: ``CONV_WIDTH - 1`` plus the
@@ -434,7 +443,6 @@ class K3MonoDecodeRunner:
                 ln_eps=p.moe.ln_eps,
                 dcp=self.dcp_merge and p.ffn_only,
                 diag=self.debug,
-                timeline=self.timeline is not None,
             )
             for p in self.plans
             if p.moe is not None
@@ -489,8 +497,6 @@ class K3MonoDecodeRunner:
                 )
         hidden, _ = self.inner.output_attn_res(prefix, blocks, add, add2)
         self._raise_on_given_up_waits(rows)
-        if self.timeline is not None and not torch.cuda.is_current_stream_capturing():
-            self.timeline.step_done(rows)
         return hidden
 
     def _diag_ptr(self) -> int:
@@ -575,44 +581,25 @@ class K3MonoDecodeRunner:
 
     def _pre_o_dcp(self, plan, positions, prefix, blocks, add, add2):
         """``_pre_o_core`` with the DCP merge and the output gate left to K2:
-        the attention's unmerged partial, LSE and owned counts
-        (``MLAAttention._dcp_defer_merge``) and the ungated ``g_proj``, with a
-        fresh core buffer for K2 to merge into."""
+        the attention's partial in ``dcp_out`` (``_bind_dcp_merge``), its LSE,
+        owned counts and the ungated ``g_proj``, with a fresh core buffer for
+        K2 to merge into."""
         layer, normed, prefix, _, _ = self._seam(plan, prefix, blocks, add, add2)
         attn = layer.self_attn
         impl = attn.attn.impl
-        impl.dcp_merge_sink = sink = {}
+        impl.dcp_defer_merge, impl.dcp_partial_lse = True, None
         try:
             _, gate = attn.attn_and_gate(positions, normed)
+            lse = impl.dcp_partial_lse
         finally:
-            impl.dcp_merge_sink = None
-        rows = prefix.size(0)
-        o, lse = sink.get("o"), sink.get("lse")
-        owned = sink.get("owned_counts")
-        owned = self.ones if owned is None else owned
-        heads, hd = dcp_merge.HEADS, dcp_merge.HD
-        checks = (
-            (o, (heads, hd), torch.bfloat16),
-            (lse, (heads,), torch.float32),
-            (gate, (self.dims.proj,), torch.bfloat16),
-            (owned, (), torch.int32),
-        )
-        for t, tail, dtype in checks:
-            # K2 reads the first ``rows`` rows of each, contiguous
-            if (
-                t is None
-                or t.size(0) < rows
-                or tuple(t.shape[1:]) != tail
-                or t.dtype != dtype
-                or not t.is_contiguous()
-            ):
-                raise MonoUnsupported(
-                    f"layer {plan.layer_id}: DCP merge input "
-                    f"{None if t is None else (tuple(t.shape), t.dtype)} for an "
-                    f"{rows}-row step"
-                )
-        core = prefix.new_empty(rows, self.dims.proj)
-        return core, prefix, (o, lse, owned, gate)
+            impl.dcp_defer_merge, impl.dcp_partial_lse = False, None
+        # the decode took the deferred path (a Python check, nothing synced)
+        assert lse is not None, f"layer {plan.layer_id}: the DCP decode merged itself"
+        owned = impl.dcp_owned_counts_buffer
+        if not impl.is_sparse_mla or owned is None:
+            owned = self.ones
+        core = prefix.new_empty(prefix.size(0), self.dims.proj)
+        return core, prefix, (self.dcp_out, lse, owned, gate)
 
     def _check_dcp_merge(self, plan, core, dcp) -> None:
         """``ATOM_MONO_CHECK``: K2's merged, gated core against the production
@@ -804,8 +791,7 @@ class K3MonoDecodeRunner:
             # a block-write layer's MLP seam restarts its prefix
             "reset": int(plan.moe.write_idx >= 0),
             "part_o": part_o, "part_lse": part_lse, "owned": owned, "gate": gate,
-            "diag": self._diag_ptr(),
-            "tl": 0 if self.timeline is None else self.timeline.ptr(plan.layer_id),
+            "diag": self._diag_ptr(), "tl": 0,
         })  # fmt: skip
         _run_compiled(build.k2_launchers[key], *args, torch.cuda.current_stream())
         return out

@@ -857,9 +857,13 @@ class MLAAttention(nn.Module):
         )
         # Which collective pattern the output merge uses; see _dcp_merge.
         self.dcp_comm_backend = get_current_atom_config().dcp_config.comm_backend
-        # A dict while a caller merges this layer's decode output itself
-        # (``_dcp_defer_merge``); None otherwise.
-        self.dcp_merge_sink = None
+        # Set while a caller merges this layer's DCP decode itself: the decode
+        # writes its PBM-projected partial into the caller's ``dcp_partial_out``
+        # [rows, heads, v_head_dim] bf16 and leaves its LSE [rows, heads] fp32
+        # in ``dcp_partial_lse`` (``_dcp_defer_merge``).
+        self.dcp_defer_merge = False
+        self.dcp_partial_out = None
+        self.dcp_partial_lse = None
         # Set by a caller whose own merge must match this layer's decode merge
         # bit for bit (the Kimi-K3 mono DCP merge): the decode's a2a combine
         # sums in rank order. Prefill keeps the production combine.
@@ -1459,8 +1463,8 @@ class MLAAttention(nn.Module):
             if self.is_sparse_mla and self.dcp_owned_counts_buffer is not None
             else None
         )
-        if self.dcp_merge_sink is not None:
-            return self._dcp_defer_merge(o, lse, owned_counts)
+        if self.dcp_defer_merge:
+            return self._dcp_defer_merge(o, lse)
         return self._dcp_project_merge_out(
             o,
             lse,
@@ -1469,22 +1473,33 @@ class MLAAttention(nn.Module):
             rank_order=self.dcp_rank_order_merge,
         )
 
-    def _dcp_defer_merge(self, o, lse, owned_counts):
-        """A decode step whose merge a later kernel does (the Kimi-K3 mono K2):
-        the PBM-projected partial ``[B, H_group, v_head_dim]``, its LSE and the
-        sparse owned counts go to ``dcp_merge_sink``; the partial is returned
-        unmerged, for a caller that reads the sink instead."""
+    def _dcp_defer_merge(self, o, lse):
+        """A decode step whose merge the caller does: the PBM-projected partial
+        into ``dcp_partial_out``, the decode's LSE in ``dcp_partial_lse`` (the
+        owned counts are ``dcp_owned_counts_buffer`` already). The LSE is the
+        attention kernel's own output, handed over rather than copied: a copy
+        into a fixed buffer costs a launch a layer. The returned output has the
+        op's shape and no data."""
         assert self.pbm_enabled, "a deferred DCP merge needs project-before-merge"
-        o = self._v_up_proj(o, self.W_V_dcp, self.W_V_dcp_scale, num_heads=o.shape[1])
-        self.dcp_merge_sink.update(o=o, lse=lse, owned_counts=owned_counts)
-        return o
+        rows = o.shape[0]
+        self._v_up_proj(
+            o,
+            self.W_V_dcp,
+            self.W_V_dcp_scale,
+            num_heads=o.shape[1],
+            out=self.dcp_partial_out[:rows],
+        )
+        self.dcp_partial_lse = lse
+        width = _mla_output_width(self, get_current_atom_config().hf_config.hidden_size)
+        return o.new_empty(rows, width)
 
-    def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
+    def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None, out=None):
         """V up-projection only: ``[B, N, kv_lora_rank] -> [B, N, v_head_dim]``.
 
         Split out so DCP decode can run it BEFORE the merge (project-before-
         merge). Weight and head count are arguments because that path projects
         the whole group with ``W_V_dcp``; every other caller uses ``self.W_V``.
+        ``out``: a ``[B, N, v_head_dim]`` bf16 tensor to write into.
         """
         W_V = self.W_V if W_V is None else W_V
         W_V_scale = self.W_V_scale if W_V_scale is None else W_V_scale
@@ -1497,13 +1512,15 @@ class MLAAttention(nn.Module):
         # x = torch.bmm(x, self.W_UV).transpose(0, 1)
         # Convert from (B, N, L) to (N, B, L)
         if is_rocm_aiter_fp4bmm_enabled():
-            output = torch.empty(
-                x.shape[1],
-                x.shape[0],
-                W_V.shape[1],
-                device=x.device,
-                dtype=torch.bfloat16,
-            )
+            output = out
+            if output is None:
+                output = torch.empty(
+                    x.shape[1],
+                    x.shape[0],
+                    W_V.shape[1],
+                    device=x.device,
+                    dtype=torch.bfloat16,
+                )
             output = batched_gemm_a16wfp4(
                 x,
                 W_V,
@@ -1517,7 +1534,7 @@ class MLAAttention(nn.Module):
             x = output
         else:
             x = _aiter_triton_fp8_bmm(
-                x, W_V, W_V_scale, group_size=128, transpose_bm=True
+                x, W_V, W_V_scale, group_size=128, transpose_bm=True, YQ=out
             )
         return x.reshape(-1, num_heads, self.v_head_dim)
 

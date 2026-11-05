@@ -22,7 +22,8 @@ import logging
 import torch
 from torch import nn
 
-from atom.models.kimi_k3.mono.config import config_refusal
+from atom.models.kimi_k3.mono import dcp
+from atom.models.kimi_k3.mono.config import config_refusal, inner_model
 from atom.models.kimi_k3.mono.plan import kda_metadata, step_shape
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.route import LazyRunner
@@ -130,8 +131,15 @@ def install_mono_decode(
         logger.info("Kimi-K3 mono decode off: %s", why)
         return model
     logger.info("Kimi-K3 mono decode armed (TP%d)", atom_config.tensor_parallel_size)
-    from atom.models.kimi_k3.mono import dcp
+    # in the function, like every aiter import on this installer's path: a
+    # deployment that never reaches mono must not need aiter to import it
+    from aiter.dist.parallel_state import get_tensor_model_parallel_rank, get_tp_group
 
     # collective, before any graph capture (``mono.dcp``)
-    dcp_merge = dcp.arm_dcp_merge(dcp.inner_model(model), *dcp.tp_context())
+    dcp_merge = dcp.arm_dcp_merge(
+        inner_model(model),
+        get_tensor_model_parallel_rank(),
+        atom_config.tensor_parallel_size,
+        get_tp_group().cpu_group,
+    )
     return MonoDecodeModel(model, drafter, metadata_builder, dcp_merge=dcp_merge)

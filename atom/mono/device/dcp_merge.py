@@ -19,28 +19,19 @@ merged row goes are the kernel's.
 """
 
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import T
 
-from atom.mono.device.ops import exp, hw_exp2, rcp
+from atom.mono.device.ops import exp, hw_exp2, llvm_log2, rcp
 
 NEG_INF = float("-inf")
 LOG2E = 1.4426950408889634
 LN2 = 0.6931471805599453
 
 
-# What Triton 3.8 lowers ``tl.exp2`` / ``tl.log2`` to on gfx950 (checked on its
-# LLVM IR): ``llvm.amdgcn.exp2.f32`` (no denormal fix-up, ``ops.hw_exp2``) and
-# ``llvm.log2.f32``. Another Triton could lower them otherwise; Kimi-K3's check
-# mode (``ATOM_MONO_CHECK``) compares the two paths bit for bit.
-exp2 = hw_exp2
-
-
-def log2(x):
-    return fx.Float32(
-        llvm.call_intrinsic(T.f32, "llvm.log2.f32", [fx.Float32(x).ir_value()], [], [])
-    )
+# ``hw_exp2`` / ``llvm_log2`` are what Triton 3.8 lowers ``tl.exp2`` /
+# ``tl.log2`` to on gfx950 (checked on its LLVM IR). Another Triton could lower
+# them otherwise; Kimi-K3's check mode (``ATOM_MONO_CHECK``) compares the two
+# paths bit for bit.
 
 
 # ------------------------------------------------------------------- LSE form
@@ -60,14 +51,14 @@ def lse_total(lses):
     m = (m == fx.Float32(NEG_INF)).select(fx.Float32(0.0), m)
     total = fx.Float32(0.0)
     for lse in lses:
-        total = total + exp2((lse - m) * fx.Float32(LOG2E))
-    return fx.Float32(fmath.fma(log2(total), fx.Float32(LN2), m))
+        total = total + hw_exp2((lse - m) * fx.Float32(LOG2E))
+    return fx.Float32(fmath.fma(llvm_log2(total), fx.Float32(LN2), m))
 
 
 def lse_factor(lse, total):
     """A source's weight: exp(lse - total), 0 where that is NaN (every source
     empty, so ``total`` is -inf)."""
-    f = exp2((lse - total) * fx.Float32(LOG2E))
+    f = hw_exp2((lse - total) * fx.Float32(LOG2E))
     return (f != f).select(fx.Float32(0.0), f)  # noqa: PLR0124
 
 

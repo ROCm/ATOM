@@ -579,10 +579,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GLM-5.2 mono under DCP == TP4 (query replication on). Off by default: at
     # 64K it measured C1 -22% but C2 +4.4% against the production DCP4 path.
     "ATOM_GLM52_MONO_DCP": lambda: os.getenv("ATOM_GLM52_MONO_DCP", "0") == "1",
-    # Kimi-K3 mono under DCP = TP: merge a full-attention layer's decode partials
-    # (and apply its output gate) inside K2 instead of the production pack ->
-    # all-to-all -> combine -> sigmoid-mul. 0 keeps the production merge.
-    "ATOM_MONO_DCP_MERGE": lambda: os.getenv("ATOM_MONO_DCP_MERGE", "1") == "1",
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",

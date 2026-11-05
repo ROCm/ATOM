@@ -100,8 +100,7 @@ def _merge_ok(impls, *, rank=3, tp=8):
     return dcp_merge_ok(impls, rank, tp)
 
 
-def test_dcp_equal_to_tp_merges_in_k2(monkeypatch):
-    monkeypatch.setenv("ATOM_MONO_DCP_MERGE", "1")
+def test_dcp_equal_to_tp_merges_in_k2():
     assert _merge_ok([_impl(), _impl()])
 
 
@@ -130,49 +129,45 @@ def test_the_full_attention_layers_are_the_ones_checked():
         {"v_head_dim": 512},
     ],
 )
-def test_any_other_deployment_keeps_the_production_merge(monkeypatch, over):
-    monkeypatch.setenv("ATOM_MONO_DCP_MERGE", "1")
+def test_any_other_deployment_keeps_the_production_merge(over):
     # one layer that does not fit turns the merge off for all of them: the
     # build key is the deployment's, not a layer's
     assert not _merge_ok([_impl(), _impl(**over)])
 
 
-def test_the_switch_turns_it_off(monkeypatch):
-    monkeypatch.setenv("ATOM_MONO_DCP_MERGE", "0")
-    assert not _merge_ok([_impl()])
-
-
-def _armed(monkeypatch, impls, switch="1"):
+def _armed(impls):
     from atom.models.kimi_k3.mono.dcp import arm_dcp_merge
 
-    monkeypatch.setenv("ATOM_MONO_DCP_MERGE", switch)
     for impl in impls:
         impl.dcp_rank_order_merge = False
     layers = [_layer(True)] + [_layer(False, m) for m in impls]
     return arm_dcp_merge(SimpleNamespace(layers=layers), 3, 8, None)
 
 
-def test_arming_flags_every_full_attention_layer(monkeypatch):
+def test_arming_flags_every_full_attention_layer():
     """Installing mono flags the layers' unserved decode steps for the
-    rank-order combine before any graph is captured; off, nothing is flagged."""
+    rank-order combine before any graph is captured; a deployment K2 does not
+    merge flags nothing."""
     impls = [_impl(), _impl()]
-    assert _armed(monkeypatch, impls)
+    assert _armed(impls)
     assert all(m.dcp_rank_order_merge for m in impls)
-    assert not _armed(monkeypatch, impls, switch="0")
-    assert not any(m.dcp_rank_order_merge for m in impls)
+    other = [_impl(), _impl(pbm_enabled=False)]
+    assert not _armed(other)
+    assert not any(m.dcp_rank_order_merge for m in other)
 
 
-def test_a_check_that_raises_votes_no(monkeypatch):
+def test_a_check_that_raises_votes_no():
     """A rank whose check fails must still reach the vote: raising before it
     would leave the other ranks waiting in it."""
     broken = SimpleNamespace(dcp_rank_order_merge=False)  # no DCP attributes
-    assert not _armed(monkeypatch, [broken])
+    assert not _armed([broken])
     assert not broken.dcp_rank_order_merge
 
 
 def test_the_installer_arms_before_the_runner_exists(monkeypatch):
     """The decision is made in ``install_mono_decode`` and handed to the runner
     the first eligible step builds, not taken there."""
+    pytest.importorskip("aiter", reason="the installer's TP context is aiter's")
     from atom.models.kimi_k3.mono import dcp, dispatch
 
     seen = {}
@@ -183,7 +178,12 @@ def test_the_installer_arms_before_the_runner_exists(monkeypatch):
 
     monkeypatch.setattr(dcp, "arm_dcp_merge", arm)
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
-    monkeypatch.setattr(dcp, "tp_context", lambda: (0, 8, None))
+    from aiter.dist import parallel_state
+
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parallel_state, "get_tp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
     inner = SimpleNamespace(layers=[])
     model = SimpleNamespace(model=inner)
     cfg = SimpleNamespace(tensor_parallel_size=8)
@@ -201,7 +201,6 @@ def test_dcp_builds_are_the_full_attention_layers_only(runner_module):
     runner = object.__new__(runner_module.K3MonoDecodeRunner)
     runner.debug = False
     runner.plans = [plan(1, False), plan(3, True)]
-    runner.timeline = None
     runner.dcp_merge = True
     keys = runner._k2_keys(8)
     assert (keys[1].dcp, keys[3].dcp) == (False, True)
@@ -210,36 +209,35 @@ def test_dcp_builds_are_the_full_attention_layers_only(runner_module):
 
 
 # --------------------------------------------------------------- _pre_o_dcp
-def _sinking_layer(calls, sink_out, gate, raise_in_attn=False):
-    impl = SimpleNamespace(dcp_merge_sink=None)
+def _deferring_layer(calls, gate, counts=None, raise_in_attn=False, defers=True):
+    impl = SimpleNamespace(
+        dcp_defer_merge=False,
+        dcp_partial_lse=None,
+        is_sparse_mla=counts is not None,
+        dcp_owned_counts_buffer=counts,
+    )
+    calls["lse"] = torch.zeros(ROWS, 96, dtype=torch.float32)
 
     def seam(prefix, blocks, add, add2):
         return "normed", calls["new_prefix"]
 
     def attn_and_gate(positions, normed):
-        calls["attn"] = (positions, normed)
-        calls["sink_during"] = dict(impl.dcp_merge_sink)
+        calls["armed"] = impl.dcp_defer_merge
         if raise_in_attn:
             raise RuntimeError("attention failed")
-        impl.dcp_merge_sink.update(sink_out)
-        return "unmerged", gate
+        if defers:
+            impl.dcp_partial_lse = calls["lse"]  # what the deferred decode leaves
+        return "no data", gate
 
     attn = SimpleNamespace(attn=SimpleNamespace(impl=impl), attn_and_gate=attn_and_gate)
     return impl, SimpleNamespace(self_attention_attn_res=seam, self_attn=attn)
-
-
-def _dcp_inputs(rows=ROWS, owned=True):
-    o = torch.zeros(rows, 96, 128, dtype=torch.bfloat16)
-    lse = torch.zeros(rows, 96, dtype=torch.float32)
-    counts = torch.ones(rows, dtype=torch.int32) if owned else None
-    gate = torch.zeros(rows, Dims(8).proj, dtype=torch.bfloat16)
-    return {"o": o, "lse": lse, "owned_counts": counts}, gate
 
 
 def _dcp_runner(runner_module, layer):
     runner = object.__new__(runner_module.K3MonoDecodeRunner)
     runner.dims = Dims(8)
     runner.ones = torch.ones(MAX_ROWS, dtype=torch.int32)
+    runner.dcp_out = torch.zeros(MAX_ROWS, 96, 128, dtype=torch.bfloat16)
     runner.inner = SimpleNamespace(layers={3: layer})
     return runner
 
@@ -250,69 +248,79 @@ def _pre_o(runner):
     return runner._pre_o_dcp(plan, "positions", prefix, blocks, None, None)
 
 
-def test_the_attention_hands_k2_its_partials_and_gate(runner_module):
-    sink_out, gate = _dcp_inputs()
-    calls = {"new_prefix": torch.zeros(ROWS, HIDDEN, dtype=torch.bfloat16)}
-    impl, layer = _sinking_layer(calls, sink_out, gate)
-    core, prefix, dcp = _pre_o(_dcp_runner(runner_module, layer))
+def _gate():
+    return torch.zeros(ROWS, Dims(8).proj, dtype=torch.bfloat16)
 
-    assert calls["sink_during"] == {}  # armed while the attention ran
-    assert impl.dcp_merge_sink is None  # and disarmed after
+
+def test_the_attention_hands_k2_its_partials_and_gate(runner_module):
+    gate, counts = _gate(), torch.ones(ROWS, dtype=torch.int32)
+    calls = {"new_prefix": torch.zeros(ROWS, HIDDEN, dtype=torch.bfloat16)}
+    impl, layer = _deferring_layer(calls, gate, counts)
+    runner = _dcp_runner(runner_module, layer)
+    core, prefix, dcp = _pre_o(runner)
+
+    assert calls["armed"] and not impl.dcp_defer_merge  # armed while it ran
+    assert impl.dcp_partial_lse is None  # handed over, not left behind
     o, lse, owned, g = dcp
-    assert o is sink_out["o"] and lse is sink_out["lse"]
-    assert owned is sink_out["owned_counts"] and g is gate
+    assert o is runner.dcp_out and lse is calls["lse"]
+    assert owned is counts and g is gate
     assert prefix is calls["new_prefix"]
     assert core.shape == (ROWS, Dims(8).proj) and core.dtype == torch.bfloat16
 
 
 def test_a_dense_layer_is_handed_counts_of_one(runner_module):
-    sink_out, gate = _dcp_inputs(owned=False)
     calls = {"new_prefix": torch.zeros(ROWS, HIDDEN, dtype=torch.bfloat16)}
-    _, layer = _sinking_layer(calls, sink_out, gate)
+    _, layer = _deferring_layer(calls, _gate())
     runner = _dcp_runner(runner_module, layer)
     _, _, (_, _, owned, _) = _pre_o(runner)
     assert owned is runner.ones
 
 
-def test_the_sink_is_disarmed_when_the_attention_raises(runner_module):
-    sink_out, gate = _dcp_inputs()
+def test_the_deferral_is_disarmed_when_the_attention_raises(runner_module):
     calls = {"new_prefix": torch.zeros(ROWS, HIDDEN, dtype=torch.bfloat16)}
-    impl, layer = _sinking_layer(calls, sink_out, gate, raise_in_attn=True)
+    impl, layer = _deferring_layer(calls, _gate(), raise_in_attn=True)
     with pytest.raises(RuntimeError, match="attention failed"):
         _pre_o(_dcp_runner(runner_module, layer))
-    assert impl.dcp_merge_sink is None
+    assert not impl.dcp_defer_merge
 
 
-@pytest.mark.parametrize(
-    "key,bad",
-    [
-        ("o", torch.zeros(ROWS, 96, 512, dtype=torch.bfloat16)),
-        ("o", torch.zeros(ROWS, 96, 128, dtype=torch.float16)),
-        ("lse", torch.zeros(ROWS - 1, 96, dtype=torch.float32)),
-        ("lse", torch.zeros(96, ROWS, dtype=torch.float32).t()),
-        ("owned_counts", torch.ones(ROWS, dtype=torch.int64)),
-        ("gate", torch.zeros(ROWS, Dims(8).proj + 8, dtype=torch.bfloat16)),
-    ],
-)
-def test_inputs_k2_cannot_read_are_refused(runner_module, key, bad):
-    sink_out, gate = _dcp_inputs()
-    if key == "gate":
-        gate = bad
-    else:
-        sink_out[key] = bad
+def test_a_decode_that_merged_itself_is_caught(runner_module):
+    """K2 would merge the previous layer's partial: the deferral is checked,
+    on the host, every step."""
     calls = {"new_prefix": torch.zeros(ROWS, HIDDEN, dtype=torch.bfloat16)}
-    _, layer = _sinking_layer(calls, sink_out, gate)
-    with pytest.raises(MonoUnsupported, match="DCP merge input"):
+    _, layer = _deferring_layer(calls, _gate(), defers=False)
+    with pytest.raises(AssertionError, match="merged itself"):
         _pre_o(_dcp_runner(runner_module, layer))
 
 
-def test_an_attention_that_merged_anyway_is_refused(runner_module):
-    """A decode that never reached ``_dcp_defer_merge`` left the sink empty."""
-    _, gate = _dcp_inputs()
-    calls = {"new_prefix": torch.zeros(ROWS, HIDDEN, dtype=torch.bfloat16)}
-    _, layer = _sinking_layer(calls, {}, gate)
-    with pytest.raises(MonoUnsupported, match="DCP merge input"):
-        _pre_o(_dcp_runner(runner_module, layer))
+def _bind_layers(g_width):
+    def full():
+        g_proj = SimpleNamespace(output_size=g_width)
+        attn = SimpleNamespace(attn=SimpleNamespace(impl=SimpleNamespace()))
+        attn.g_proj = g_proj
+        return SimpleNamespace(is_linear_attn=False, self_attn=attn)
+
+    kda = SimpleNamespace(is_linear_attn=True, self_attn=None)
+    return [kda, full(), kda, full()]
+
+
+def test_bind_hands_every_full_attention_layer_the_merge_buffers(runner_module):
+    runner = object.__new__(runner_module.K3MonoDecodeRunner)
+    runner.dims, runner.device = Dims(8), torch.device("cpu")
+    runner.inner = SimpleNamespace(layers=_bind_layers(Dims(8).proj))
+    runner._bind_dcp_merge()
+    assert runner.dcp_out.shape == (MAX_ROWS, 96, 128)
+    assert runner.dcp_out.dtype == torch.bfloat16
+    for layer in runner.inner.layers[1::2]:
+        assert layer.self_attn.attn.impl.dcp_partial_out is runner.dcp_out
+
+
+def test_bind_refuses_a_gate_k2_cannot_read(runner_module):
+    runner = object.__new__(runner_module.K3MonoDecodeRunner)
+    runner.dims, runner.device = Dims(8), torch.device("cpu")
+    runner.inner = SimpleNamespace(layers=_bind_layers(Dims(8).proj + 8))
+    with pytest.raises(MonoUnsupported, match="g_proj width"):
+        runner._bind_dcp_merge()
 
 
 def test_k2_is_handed_the_merge_inputs(runner_module, monkeypatch):
@@ -337,32 +345,73 @@ def test_k2_is_handed_the_merge_inputs(runner_module, monkeypatch):
 
 
 # ------------------------------------------------------------ the attention
-def test_a_deferred_decode_hands_over_the_projected_partial():
+def test_a_deferred_decode_writes_the_callers_buffers(monkeypatch):
     try:
+        from atom.model_ops import attention_mla
         from atom.model_ops.attention_mla import MLAAttention
     except ImportError as error:
         pytest.skip(f"attention_mla needs the GPU stack: {error}")
 
+    monkeypatch.setattr(
+        attention_mla,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(hf_config=SimpleNamespace(hidden_size=HIDDEN)),
+    )
     o = torch.zeros(ROWS, 96, 512)
-    projected = torch.ones(ROWS, 96, 128)
-    lse, counts = torch.zeros(ROWS, 96), torch.ones(ROWS, dtype=torch.int32)
+    lse = torch.arange(ROWS * 96, dtype=torch.float32).view(ROWS, 96)
     seen = {}
 
-    def v_up_proj(x, W_V, W_V_scale, num_heads):
-        seen.update(x=x, w=(W_V, W_V_scale), heads=num_heads)
-        return projected
+    def v_up_proj(x, W_V, W_V_scale, num_heads, out):
+        seen.update(x=x, w=(W_V, W_V_scale), heads=num_heads, out=out)
+        out.fill_(1.0)
+        return out
 
     fake = SimpleNamespace(
         pbm_enabled=True,
         W_V_dcp="W",
         W_V_dcp_scale="S",
         _v_up_proj=v_up_proj,
-        dcp_merge_sink={},
+        dcp_partial_out=torch.zeros(MAX_ROWS, 96, 128, dtype=torch.bfloat16),
+        dcp_partial_lse=None,
+        o_proj=torch.nn.Identity(),
+        num_heads=12,
+        v_head_dim=128,
     )
-    out = MLAAttention._dcp_defer_merge(fake, o, lse, counts)
-    assert out is projected
-    assert seen == {"x": o, "w": ("W", "S"), "heads": 96}
-    assert fake.dcp_merge_sink == {"o": projected, "lse": lse, "owned_counts": counts}
+    out = MLAAttention._dcp_defer_merge(fake, o, lse)
+    # the op's declared shape (``_mla_output_width``), no data
+    assert out.shape == (ROWS, 12 * 128)
+    assert seen["x"] is o and seen["w"] == ("W", "S") and seen["heads"] == 96
+    assert seen["out"].data_ptr() == fake.dcp_partial_out.data_ptr()
+    assert seen["out"].shape == (ROWS, 96, 128)
+    assert fake.dcp_partial_lse is lse  # handed over, not copied
+    assert fake.dcp_partial_out[:ROWS].eq(1).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="runs AITER's fp8 bmm")
+def test_the_v_projection_writes_the_buffer_it_is_given():
+    """The deferred merge's partial reaches K2 only through ``out``: the bmm
+    must write that buffer, with the bits it would return on its own."""
+    try:
+        from aiter import dtypes
+
+        from atom.model_ops.attention_mla import MLAAttention
+        from atom.model_ops.utils import dynamic_per_batched_tensor_quant
+    except ImportError as error:
+        pytest.skip(f"attention_mla needs the GPU stack: {error}")
+
+    heads, lora, v, rows = 96, 512, 128, 5
+    g = torch.Generator(device="cuda").manual_seed(3)
+    x = torch.randn(rows, heads, lora, generator=g, device="cuda").bfloat16()
+    w = torch.randn(heads, v, lora, generator=g, device="cuda") * 0.05
+    w, scale = dynamic_per_batched_tensor_quant(w, dtype=dtypes.fp8)
+    fake = SimpleNamespace(kv_lora_rank=lora, v_head_dim=v, num_heads=heads)
+
+    ref = MLAAttention._v_up_proj(fake, x, w, scale, num_heads=heads)
+    buf = torch.full((MAX_ROWS, heads, v), float("nan"), device="cuda").bfloat16()
+    got = MLAAttention._v_up_proj(fake, x, w, scale, num_heads=heads, out=buf[:rows])
+    assert got.data_ptr() == buf.data_ptr()
+    assert torch.equal(buf[:rows].view(torch.int16), ref.view(torch.int16))
+    assert buf[rows:].isnan().all()  # nothing past the step's rows
 
 
 def test_a_deferred_merge_without_pbm_is_refused():
@@ -371,9 +420,9 @@ def test_a_deferred_merge_without_pbm_is_refused():
     except ImportError as error:
         pytest.skip(f"attention_mla needs the GPU stack: {error}")
 
-    fake = SimpleNamespace(pbm_enabled=False, dcp_merge_sink={})
+    fake = SimpleNamespace(pbm_enabled=False)
     with pytest.raises(AssertionError, match="project-before-merge"):
-        MLAAttention._dcp_defer_merge(fake, None, None, None)
+        MLAAttention._dcp_defer_merge(fake, None, None)
 
 
 def test_the_rank_order_combine_is_what_the_caller_asks_for(monkeypatch):
@@ -396,9 +445,9 @@ def test_the_rank_order_combine_is_what_the_caller_asks_for(monkeypatch):
     assert seen == [True, False, False]
 
 
-def test_an_armed_sink_takes_the_decode_before_its_merge():
-    """``_dcp_decode`` hands a step to ``_dcp_defer_merge`` while the sink is
-    armed and merges it otherwise."""
+def test_a_deferring_layer_skips_its_merge():
+    """``_dcp_decode`` hands a step to ``_dcp_defer_merge`` while the caller
+    defers the merge and merges it otherwise."""
     try:
         from atom.model_ops.attention_mla import MLAAttention
     except ImportError as error:
@@ -410,15 +459,15 @@ def test_an_armed_sink_takes_the_decode_before_its_merge():
         is_sparse_mla=False,
         dcp_owned_counts_buffer=None,
         _cp_triton_ctx=None,
-        _dcp_defer_merge=lambda o, lse, owned: calls.append("defer") or "partial",
+        _dcp_defer_merge=lambda o, lse: calls.append("defer") or "partial",
         _dcp_project_merge_out=lambda *a, **k: calls.append(k["rank_order"])
         or "merged",
-        dcp_merge_sink={},
+        dcp_defer_merge=True,
         dcp_rank_order_merge=True,
     )
     q = torch.zeros(ROWS, 96, 8)
     assert MLAAttention._dcp_decode(fake, q, None, None, True) == "partial"
-    fake.dcp_merge_sink = None
+    fake.dcp_defer_merge = False
     assert MLAAttention._dcp_decode(fake, q, None, None, True) == "merged"
     # a flagged layer's decode merge combines in rank order
     assert calls == ["defer", True]

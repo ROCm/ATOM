@@ -12,20 +12,10 @@ installer does not pull FlyDSL in.
 
 import logging
 
+from atom.models.kimi_k3.mono.config import HEAD_DIM, MLA_HEADS
 from atom.mono.runtime.consensus import tp_agree
-from atom.utils import envs
 
 logger = logging.getLogger("atom")
-
-HEADS = 96  # a rank's decode heads under DCP = TP (``dcp_merge.HEADS``)
-HEAD_DIM = 128  # v_head_dim, what project-before-merge exchanges
-
-
-def inner_model(model):
-    """The layer stack under whatever outer class the checkpoint registered.
-    K3's text-only and vision classes both hold it one level deeper than the
-    usual ``model.model``."""
-    return getattr(model, "language_model", model).model
 
 
 def mla_impls(inner) -> list:
@@ -39,7 +29,7 @@ def dcp_merge_ok(impls, rank: int, tp: int) -> bool:
     """This rank's verdict: a DCP group that is the TP group in rank order,
     every rank decoding all 96 heads (128 wide after project-before-merge),
     and the a2a backend -- the production merge K2's arithmetic matches."""
-    if not envs.ATOM_MONO_DCP_MERGE or not impls:
+    if not impls:
         return False
     why = None
     for impl in impls:
@@ -50,7 +40,7 @@ def dcp_merge_ok(impls, rank: int, tp: int) -> bool:
             why = "the DCP group's rank order is not the TP group's"
         elif not impl.pbm_enabled or impl.dcp_comm_backend != "a2a":
             why = "the merge is not the project-before-merge a2a one"
-        elif impl.num_heads * tp != HEADS or impl.v_head_dim != HEAD_DIM:
+        elif impl.num_heads * tp != MLA_HEADS or impl.v_head_dim != HEAD_DIM:
             why = f"{impl.num_heads} x {impl.v_head_dim} heads a rank"
         if why is not None:
             break
@@ -58,21 +48,6 @@ def dcp_merge_ok(impls, rank: int, tp: int) -> bool:
         logger.info("Kimi-K3 mono DCP merge off: %s", why)
         return False
     return True
-
-
-def tp_context() -> tuple:
-    """This rank's TP rank, the TP size and the TP CPU group."""
-    from aiter.dist.parallel_state import (
-        get_tensor_model_parallel_rank,
-        get_tensor_model_parallel_world_size,
-        get_tp_group,
-    )
-
-    return (
-        get_tensor_model_parallel_rank(),
-        get_tensor_model_parallel_world_size(),
-        get_tp_group().cpu_group,
-    )
 
 
 def arm_dcp_merge(inner, rank: int, tp: int, group) -> bool:
