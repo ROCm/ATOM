@@ -1694,7 +1694,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
     def checkpoint_page_unit_bytes(self) -> int | None:
-        """Bytes of one MHA page that a transfer actually publishes.
+        """Bytes of one PAGE block that a transfer actually publishes.
 
         ``ModelRunner`` sizes the checkpoint unit from the paged pool's
         ``entry_bytes`` unless a backend returns a number here. ``None`` keeps

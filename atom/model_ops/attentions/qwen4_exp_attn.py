@@ -48,6 +48,7 @@ from atom.model_ops.qwen4_exp.qsa_cache_rules import (
     kv_transfer_leaves,
     qsa_cache_formats,
     qsa_caches_rope_positions,
+    qsa_paged_layout_id,
 )
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_tables import block_table_state
@@ -86,11 +87,6 @@ class _PlePlane(NamedTuple):
     @property
     def slot_bytes(self) -> int:
         return math.prod(self.shape) * self.dtype.itemsize
-
-
-def _shape_and_dtype(field) -> str:
-    """`(shape),dtype` of one slot or entry, as the layout id spells it."""
-    return f"{tuple(field.shape)},{field.dtype}".replace(" ", "")
 
 
 @dataclass
@@ -457,12 +453,11 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         # What the parent's id cannot see: the PAGE fields, the SSM's physical
         # order and the PLE planes.
         planes = self._ple_planes
-        layout_id = (
-            transfer.paged_layout_id
-            + f":ssm_storage={self._ssm_storage}"
-            + ":page="
-            + ";".join(f"{f.name}={_shape_and_dtype(f)}" for f in self._qsa_fields())
-            + "".join(f":ple_{p.tag}={_shape_and_dtype(p)}" for p in planes)
+        layout_id = qsa_paged_layout_id(
+            transfer.paged_layout_id,
+            self._ssm_storage,
+            [(f.name, f.shape, f.dtype) for f in self._qsa_fields()],
+            [(p.tag, p.shape, p.dtype) for p in planes],
         )
         if not (planes and transfer.readable_midstep):
             return replace(transfer, paged_layout_id=layout_id)

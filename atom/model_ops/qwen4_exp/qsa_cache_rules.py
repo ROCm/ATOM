@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Which QSA caches a Qwen3.8 engine keeps, and which KV transfer may move them.
+"""Which QSA caches a Qwen3.8 engine keeps, which KV transfer may move them,
+and how the PAGE layout id spells them.
 
-The arena, the layers binding its rows, the PAGE namespace and
+The arena, the layers binding its rows, the PAGE namespace, the layout id and
 `Qwen4ExpBackend.validate_config` all read these. Kept out of `qwen4_exp_attn`
 and `ops/qsa.py`, which import Triton and AITER, so `kv_transfer` can import
 them and CPU CI runs their tests.
@@ -73,6 +74,24 @@ def qsa_page_segments(config) -> dict:
         "image_input": qsa_caches_rope_positions(config),
         "draft_kv": "bf16" if draft else "target",
     }
+
+
+def _shape_and_dtype(shape, dtype) -> str:
+    """`(shape),dtype` of one slot or entry, as the layout id spells it."""
+    return f"{tuple(shape)},{dtype}".replace(" ", "")
+
+
+def qsa_paged_layout_id(base: str, ssm_storage: str, page_fields, ple_planes) -> str:
+    """`base` plus what it cannot see: the SSM's physical order, the PAGE
+    fields `(name, shape, dtype)` and the PLE planes `(tag, shape, dtype)`,
+    each in image order."""
+    return (
+        base
+        + f":ssm_storage={ssm_storage}"
+        + ":page="
+        + ";".join(f"{n}={_shape_and_dtype(s, d)}" for n, s, d in page_fields)
+        + "".join(f":ple_{t}={_shape_and_dtype(s, d)}" for t, s, d in ple_planes)
+    )
 
 
 def kv_transfer_leaves(config) -> list[str]:

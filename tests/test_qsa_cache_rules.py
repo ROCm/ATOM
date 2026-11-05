@@ -6,6 +6,7 @@ transfer may move them. No kernels, so these run without a GPU."""
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from atom.model_ops.qwen4_exp.qsa_cache_rules import (
     QSA_DRAFT_ROWS,
@@ -13,6 +14,7 @@ from atom.model_ops.qwen4_exp.qsa_cache_rules import (
     check_kv_transfer,
     qsa_cache_formats,
     qsa_page_segments,
+    qsa_paged_layout_id,
     qsa_row_space,
 )
 
@@ -198,3 +200,44 @@ def test_the_draft_rows_and_the_page_namespace_read_one_rule(
     if spec is _MTP:
         assert qsa_row_space(config, 40, 40) == (QSA_DRAFT_ROWS if draft else QSA_ROWS)
     assert qsa_row_space(config, 39, 40) == QSA_ROWS
+
+
+_KV = ((4, 2, 8), torch.bfloat16)
+_PLE = [("conv", (16, 10), torch.bfloat16), ("ngram", (3,), torch.int64)]
+
+
+def test_the_layout_id_spells_the_storage_the_page_fields_and_the_ple_planes():
+    layout = qsa_paged_layout_id(
+        "gdn-paged-state-v1:base", "vk", [("k", *_KV), ("v", *_KV)], _PLE
+    )
+    kv = "(4,2,8),torch.bfloat16"
+    assert layout == (
+        f"gdn-paged-state-v1:base:ssm_storage=vk:page=k={kv};v={kv}"
+        ":ple_conv=(16,10),torch.bfloat16:ple_ngram=(3,),torch.int64"
+    )
+    assert qsa_paged_layout_id("base", "kv", [("k", *_KV)], []) == (
+        f"base:ssm_storage=kv:page=k={kv}"
+    )
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        [("k", (4, 2, 4), torch.bfloat16)],  # same name, other shape
+        [("k", (4, 2, 8), torch.uint8)],  # same name, other dtype
+        [("v", *_KV)],
+    ],
+)
+def test_the_layout_id_tells_page_fields_apart(other):
+    assert qsa_paged_layout_id("base", "kv", [("k", *_KV)], _PLE) != (
+        qsa_paged_layout_id("base", "kv", other, _PLE)
+    )
+
+
+def test_the_layout_id_tells_the_ssm_storage_and_the_ple_planes_apart():
+    ids = {
+        qsa_paged_layout_id("base", storage, [("k", *_KV)], planes)
+        for storage in ("kv", "vk")
+        for planes in (_PLE, _PLE[:1], _PLE[::-1], [])
+    }
+    assert len(ids) == 8
