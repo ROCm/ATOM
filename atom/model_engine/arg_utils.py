@@ -311,9 +311,8 @@ class EngineArgs:
             type=str,
             default="bf16",
             help="KV cache type. Default is 'bf16'. 'fp4' is MiniMax-M3's MXFP4 "
-            "K/V for every paged attention layer (e2m1 + e8m0 per 32, gfx950, "
-            "--block-size 128; EAGLE3/DSpark drafts are still refused with it), "
-            "or DeepSeek-V4.1's own FP4 KV.",
+            "sparse-layer K/V (e2m1 + e8m0 per 32, gfx950, --block-size 128; "
+            "other layers use 'fp8'), or DeepSeek-V4.1's own FP4 KV.",
         )
         parser.add_argument(
             "--index-cache-dtype",

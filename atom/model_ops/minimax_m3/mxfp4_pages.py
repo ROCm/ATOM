@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""MXFP4 page geometry of MiniMax-M3's paged-attention KV and sparse index caches
+"""MXFP4 page geometry of MiniMax-M3's sparse KV and index caches
 (``--kv-cache-dtype fp4`` / ``--index-cache-dtype fp4``).
 
 One 128-token page of one head holds, for K (or V, or the index key), the
@@ -58,7 +58,7 @@ def page_views(pages: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 @dataclass(frozen=True)
 class Mxfp4KvLayout:
-    """MiniMax-M3's paged attention layers' K/V under ``--kv-cache-dtype fp4``, as an
+    """MiniMax-M3's sparse layers' K/V under ``--kv-cache-dtype fp4``, as an
     ``MhaKvPool`` layout: per (page, kv head) one 8704 B field of e2m1 data and e8m0
     scales, K and V a field each, no scale planes."""
 

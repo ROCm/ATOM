@@ -5,21 +5,10 @@ the way DeepSeek-V4.1's are (``models/deepseek_v41/config.py``). GPU-free: it
 imports neither the model nor AITER until the architecture check needs it."""
 
 
-def mxfp4_kv_layout(config):
-    """The ``MhaKvPool`` layout of every paged attention layer under
-    ``--kv-cache-dtype fp4`` on MiniMax-M3, else None (the dtype-wide cache).
-
-    Read from the TARGET's config, also for its draft: the draft's own hf_config
-    does not name M3, but its KV follows the target's flag."""
-    from atom.config import _is_minimax_m3_config
-
-    if config.kv_cache_dtype != "fp4" or not _is_minimax_m3_config(
-        getattr(config, "hf_config", None)
-    ):
-        return None
-    from atom.model_ops.minimax_m3.mxfp4_pages import Mxfp4KvLayout
-
-    return Mxfp4KvLayout()
+def dense_kv_cache_dtype(kv_cache_dtype: str) -> str:
+    """The KV dtype of a layer that is not MXFP4: ``--kv-cache-dtype fp4`` makes only
+    the indexed sparse layers' pages MXFP4, the rest stay fp8."""
+    return "fp8" if kv_cache_dtype == "fp4" else kv_cache_dtype
 
 
 def validate_runtime_config(config):
@@ -37,22 +26,6 @@ def validate_runtime_config(config):
         raise ValueError(
             "MXFP4 KV / index caches do not run under the vLLM/SGLang bridges"
         )
-    spec = config.speculative_config
-    if kv_fp4 and spec is not None:
-        # A draft keeps the target's fp4 (`Config.draft_config`) and has no fp8 pages to
-        # fall back on, so a flavor whose MXFP4 path is not yet GPU-validated refuses
-        # here. TEMPORARY: each branch goes when its path is validated.
-        if spec.method == "eagle3":
-            raise ValueError(
-                "--kv-cache-dtype fp4 with EAGLE3 drafts remains disabled pending GPU "
-                "validation; prefix caching also needs a safe draft-KV policy before "
-                "enabling"
-            )
-        if spec.use_dspark():
-            raise ValueError(
-                "--kv-cache-dtype fp4 with DSpark drafts remains disabled pending GPU "
-                "validation of the MXFP4 window reader"
-            )
     if kv_fp4 and config.torch_dtype != torch.bfloat16:
         # aiter's MXFP4 pa_decode only writes bf16; the attention output takes the
         # model dtype, so an fp16 checkpoint would fail in its first forward.

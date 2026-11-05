@@ -956,6 +956,18 @@ def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
     return False
 
 
+def dense_kv_dtype(config) -> str:
+    """The KV dtype of the pages that are not MXFP4, from the one user flag
+    ``kv_cache_dtype``. On MiniMax-M3 ``fp4`` makes only the indexed sparse
+    layers' pages MXFP4; dense / sliding layers (and a draft's) keep fp8 pages,
+    since no dense FP4 page layout or writer exists. Other models: unchanged."""
+    if _is_minimax_m3_config(getattr(config, "hf_config", None)):
+        from atom.models.minimax_m3.config import dense_kv_cache_dtype
+
+        return dense_kv_cache_dtype(config.kv_cache_dtype)
+    return config.kv_cache_dtype
+
+
 _MINIMAX_M3_MLP_LAYER_TYPES = {"dense": 0, "sparse": 1}
 
 
@@ -1940,8 +1952,8 @@ def qrep_for_step(
 
 
 def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
-    """``--kv-cache-dtype fp4`` is MiniMax-M3's (K/V of every attention layer as
-    MXFP4 pages) or DeepSeek-V4.1's own; refused elsewhere.
+    """``--kv-cache-dtype fp4`` is MiniMax-M3's (its indexed sparse layers' K/V as
+    MXFP4 pages, the other layers fp8) or DeepSeek-V4.1's own; refused elsewhere.
     The index ``fp4`` is left as it is: its layout is per model."""
     if kv_cache_dtype == "fp4" and not (is_m3 or is_v41):
         raise ValueError(
@@ -2826,13 +2838,7 @@ class Config:
                 # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
             else:
-                # M3's fp4 KV keeps an FP8 index plane: its own choice, not the
-                # KV dtype's.
-                self.index_cache_dtype = (
-                    "fp8"
-                    if is_m3 and self.kv_cache_dtype == "fp4"
-                    else self.kv_cache_dtype
-                )
+                self.index_cache_dtype = dense_kv_dtype(self)
         if is_m3:
             from atom.models.minimax_m3.config import validate_runtime_config
 
@@ -2868,10 +2874,12 @@ class Config:
 
     def draft_config(self, hf_config) -> "Config":
         """A shallow copy for a draft model built from its own ``hf_config``:
-        uncompiled. It keeps the target's ``kv_cache_dtype``: under M3's ``fp4`` a
-        draft's KV is MXFP4 pages too. Shallow rather than deep: MLA targets hold
-        non-picklable cuda.Stream objects in fields a deepcopy cannot walk."""
+        uncompiled, and with the KV dtype of the layers that are not MXFP4 -- a
+        draft has no MXFP4 layers (and its own architecture is not the target's, so
+        `dense_kv_dtype` could not tell). Shallow rather than deep: MLA targets
+        hold non-picklable cuda.Stream objects in fields a deepcopy cannot walk."""
         draft = copy.copy(self)
+        draft.kv_cache_dtype = dense_kv_dtype(self)
         draft.hf_config = hf_config
         draft.compilation_config = copy.copy(self.compilation_config)
         draft.compilation_config.level = CompilationLevel.NO_COMPILATION

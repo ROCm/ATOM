@@ -11,10 +11,9 @@ import triton
 import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.config import _is_minimax_m3_config
+from atom.config import _is_minimax_m3_config, dense_kv_dtype
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
-from atom.models.minimax_m3.config import mxfp4_kv_layout
 from atom.utils import CpuGpuBuffer, envs, pack_rows, upload_numpy
 from atom.utils.block_convert import (
     block_table_convert_triton,
@@ -163,7 +162,6 @@ class AiterBackend(AttentionBackend):
         target_block_size: int,
         layers: int,
         kv_dtype,
-        layout=None,
     ):
         """An MHA pool, which is the one this backend's kernels read."""
         return MhaKvPool.from_hf_config(
@@ -172,7 +170,6 @@ class AiterBackend(AttentionBackend):
             block_size=target_block_size,
             layers=layers,
             kv_dtype=kv_dtype,
-            layout=layout,
         )
 
 
@@ -186,7 +183,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     # EagleProposer fuses the per-draft-step position bump into
     # prepare_mtp_decode's kernel when this is set (block-paged MHA draft).
     fuse_mtp_decode_position_update = True
-    _mxfp4_kv = False
 
     def __init__(
         self,
@@ -202,8 +198,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         self._has_sparse_attention = bool(sparse_cfg) and _is_minimax_m3_config(
             hf_config
         )
-        # Fixed by the config, so no per-step Python state a graph could bake in.
-        self._mxfp4_kv = mxfp4_kv_layout(model_runner.config) is not None
         # The backend's own, from the one rule `make_kv_pool` also reads, so a
         # draft resolving here gets it from its own config the same way.
         # `CommonAttentionBuilder` holds it to dividing the scheduler's.
@@ -213,16 +207,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if envs.ATOM_USE_UNIFIED_ATTN:
             # The two coincide there, and only one scheduler block reads well:
             # fp8 packs x=16 -> 128, bf16 x=8 -> 64, both a 128 B physical page.
-            # fp4 is a 128-token MXFP4 page, so 128 as fp8 is.
-            kv_dtype = model_runner.config.kv_cache_dtype
-            expected = 128 if kv_dtype in ("fp8", "fp4") else 64
+            expected = 128 if dense_kv_dtype(model_runner.config) == "fp8" else 64
             if model_runner.block_size != expected:
                 logger.warning(
                     "ATOM_USE_UNIFIED_ATTN=1 expects --block-size %s for %s KV "
                     "cache, got --block-size %s. Continuing with the requested "
                     "block size.",
                     expected,
-                    kv_dtype,
+                    dense_kv_dtype(model_runner.config),
                     model_runner.block_size,
                 )
         super().__init__(model_runner)
@@ -585,8 +577,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and hasattr(module, "use_mla")
             and not module.use_mla
         ):
-            # Every paged layer of an M3 under fp4, dense and sliding included.
-            layout = mxfp4_kv_layout(self.model_runner.config)
+            layout = None
+            if (
+                _is_indexed_sparse_attention(module)
+                and self.model_runner.config.kv_cache_dtype == "fp4"
+            ):
+                from atom.model_ops.minimax_m3.mxfp4_pages import Mxfp4KvLayout
+
+                layout = Mxfp4KvLayout()
             kinds.append(KvGeometry(module.num_kv_heads, module.head_dim, layout))
         return tuple(kinds)
 
@@ -626,12 +624,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 blocks_per_entry=self.block_ratio,
                 num_kv_heads=geometry.num_kv_heads,
                 head_dim=geometry.head_dim,
-                # A layout owns its bytes; the dtype table is for the dtype-wide cache.
-                kv_dtype=(
-                    torch.uint8
-                    if geometry.layout is not None
-                    else dtypes.d_dtypes[runner.config.kv_cache_dtype]
-                ),
+                kv_dtype=dtypes.d_dtypes[dense_kv_dtype(runner.config)],
                 extra_fields=extra_fields,
                 layout=geometry.layout,
             )
@@ -1081,12 +1074,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 self.model_runner.forward_vars["block_tables"]
             ).publish(bs)
         # `prefill_attention_triton` reads the paged KV cache, so it needs a
-        # block_table even with no cached tokens; so do the MXFP4 pages, which the
-        # dense prefill gathers back out of the cache. The base builder marshals
-        # one every step but only uploads it when `has_cached`.
+        # block_table even with no cached tokens. The base builder marshals one
+        # every step but only uploads it when `has_cached`.
         if (
             attn_metadata.block_tables is None
-            and (envs.ATOM_USE_UNIFIED_ATTN or self._mxfp4_kv)
+            and envs.ATOM_USE_UNIFIED_ATTN
             and batch.block_tables
         ):
             bs = batch.total_seqs_num_prefill

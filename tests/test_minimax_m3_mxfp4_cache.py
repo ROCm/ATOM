@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""MiniMax-M3's MXFP4 KV pool and its startup refusals.
+"""MiniMax-M3's MXFP4 sparse KV pool and its startup refusals.
 
 The pool lays one (page, kv head) of K, of V and of the index key out as one
 8704 B field -- [128 x 64 B e2m1][128 x 4 B e8m0] -- which is what the aiter
@@ -17,7 +17,7 @@ import torch
 from transformers import PretrainedConfig
 
 from atom import config as config_module
-from atom.config import CompilationConfig, Config, _check_fp4_kv
+from atom.config import CompilationConfig, Config, _check_fp4_kv, dense_kv_dtype
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.minimax_m3.mxfp4_pages import (
     PAGE_BYTES,
@@ -160,7 +160,6 @@ def check(**kw):
         kv_cache_block_size=a["block_size"],
         torch_dtype=a["torch_dtype"],
         hf_config=types.SimpleNamespace(),
-        speculative_config=None,
     )
     with mock.patch.object(config_module, "is_plugin_mode", lambda: a["plugin_mode"]):
         validate_runtime_config(config)
@@ -223,6 +222,23 @@ def test_m3_fp4_keeps_the_kv_and_defaults_the_index_to_its_storage(
     assert (config.kv_cache_dtype, config.index_cache_dtype) == want
 
 
+def test_the_dense_kv_dtype_is_fp8_only_for_an_m3_fp4_kv(monkeypatch):
+    assert dense_kv_dtype(_m3(monkeypatch, kv_cache_dtype="fp4")) == "fp8"
+    assert dense_kv_dtype(_m3(monkeypatch, kv_cache_dtype="bf16")) == "bf16"
+    assert dense_kv_dtype(_m3(monkeypatch, kv_cache_dtype="fp8")) == "fp8"
+    assert not hasattr(Config, "kv_storage_dtype")
+
+
+def test_the_dense_kv_dtype_leaves_other_models_and_bare_configs_alone():
+    other = types.SimpleNamespace(
+        hf_config=PretrainedConfig(architectures=["LlamaForCausalLM"]),
+        kv_cache_dtype="fp4",
+    )
+    assert dense_kv_dtype(other) == "fp4"  # e.g. DeepSeek-V4.1's own FP4 KV
+    # a plugin-style config object without hf_config must not raise
+    assert dense_kv_dtype(types.SimpleNamespace(kv_cache_dtype="fp8")) == "fp8"
+
+
 def test_m3_fp4_keeps_the_m3_startup_refusals(monkeypatch):
     with pytest.raises(ValueError, match="MXFP4 pages are 128 tokens"):
         _make_config(monkeypatch, kv_cache_dtype="fp4", kv_cache_block_size=16)
@@ -270,15 +286,15 @@ def test_an_m3_export_named_only_by_model_type_gets_the_m3_mapping(monkeypatch):
 @pytest.mark.parametrize(
     "draft_arch", ["LlamaForCausalLMEagle3", "DSparkMiniMaxDraftModel"]
 )
-def test_a_draft_of_an_mxfp4_target_keeps_the_fp4_kv(monkeypatch, draft_arch):
-    """A draft's KV is MXFP4 pages like the target's: `draft_config` carries the
-    flag over and does not rewrite it to fp8 for the draft's own architecture."""
+def test_a_draft_of_an_mxfp4_target_gets_the_fp8_storage_dtype(monkeypatch, draft_arch):
+    """The draft has no MXFP4 layers and its own architecture, so a dtype derived
+    from its hf_config could not tell: `draft_config` fixes it on the target."""
     target = _m3(monkeypatch, kv_cache_dtype="fp4")
     target.compilation_config.level = config_module.CompilationLevel.PIECEWISE
     level = target.compilation_config.level
     draft = target.draft_config(PretrainedConfig(architectures=[draft_arch]))
 
-    assert draft.kv_cache_dtype == "fp4"
+    assert draft.kv_cache_dtype == dense_kv_dtype(draft) == "fp8"
     assert (
         draft.compilation_config.level == config_module.CompilationLevel.NO_COMPILATION
     )

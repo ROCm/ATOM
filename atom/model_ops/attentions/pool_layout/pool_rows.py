@@ -33,8 +33,8 @@ class KvGeometry(NamedTuple):
     num_kv_heads: int
     head_dim: int
     # None for the dtype-wide cache; a layout for layers whose pages read another
-    # way (MiniMax-M3's paged attention layers under --kv-cache-dtype fp4).
-    # Hashable, with a `tag` naming it.
+    # way (MiniMax-M3's sparse layers under --kv-cache-dtype fp4) -- a separate
+    # pool beside any dense layers' one. Hashable, with a `tag` naming it.
     layout: object | None = None
 
     def __str__(self) -> str:

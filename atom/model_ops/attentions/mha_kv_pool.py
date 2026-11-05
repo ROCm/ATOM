@@ -110,7 +110,7 @@ class KvLayout(Protocol):
 
 @dataclass(frozen=True)
 class ShuffleLayout:
-    """The dtype-wide SHUFFLE cache every MHA model but MiniMax-M3's MXFP4
+    """The dtype-wide SHUFFLE cache every MHA model but MiniMax-M3's MXFP4 sparse
     layers uses."""
 
     kv_dtype: torch.dtype
@@ -233,7 +233,6 @@ class MhaKvPool:
         layers: int,
         blocks_per_entry: int = 1,
         kv_dtype: torch.dtype,
-        layout: KvLayout | None = None,
     ) -> MhaKvPool:
         """A pool at the geometry a model config declares, for `layers` of them.
 
@@ -267,7 +266,6 @@ class MhaKvPool:
             num_kv_heads=per_rank,
             head_dim=hf_config.head_dim,
             kv_dtype=kv_dtype,
-            layout=layout,
         )
 
     def pool_bytes(self, entries: int) -> int:

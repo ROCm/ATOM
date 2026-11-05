@@ -324,13 +324,6 @@ def snapshot_kv_encoding(hf: object) -> str:
     return json.dumps(fields, sort_keys=True, default=str)
 
 
-def _is_m3_fp4_kv(config) -> bool:
-    return (
-        select_offload_layout(config) == "m3"
-        and str(getattr(config, "kv_cache_dtype", "auto")) == "fp4"
-    )
-
-
 def build_page_namespace(
     config,
     cfg,
@@ -386,11 +379,6 @@ def build_page_namespace(
             getattr(config, "speculative_config", None)
         ),
     }
-    if _is_m3_fp4_kv(config):
-        # Old M3 `fp4` pages were fp4 sparse / fp8 dense; these are MXFP4 on every
-        # attention layer. Only this field tells the two apart, so it is added for
-        # M3+fp4 alone and every other namespace keeps its digest.
-        document["m3_kv_page_format"] = "all-layer-mxfp4"
     canonical = json.dumps(
         document,
         sort_keys=True,
@@ -672,6 +660,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     from aiter import dtypes
     from lmcache.v1.metadata import LMCacheMetadata
 
+    from atom.config import dense_kv_dtype
     from atom.models.utils import get_pp_indices
 
     hf = config.hf_config
@@ -703,11 +692,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     worker_id = _strict_integer("LMCache worker id", worker_id)
     if worker_id >= world_size:
         raise ValueError("LMCache worker id must be within the world")
-    # M3 fp4 pages are opaque MXFP4 bytes (no `d_dtypes['fp4']`); the real sizes
-    # come from the block regions, so uint8 is bookkeeping only.
-    kv_dtype = (
-        torch.uint8 if _is_m3_fp4_kv(config) else dtypes.d_dtypes[config.kv_cache_dtype]
-    )
+    kv_dtype = dtypes.d_dtypes[dense_kv_dtype(config)]
     model_name = build_page_namespace(config, cfg, world_size)
 
     # MLA (DeepSeek R1/V3, Kimi) stores a single replicated per-layer latent
