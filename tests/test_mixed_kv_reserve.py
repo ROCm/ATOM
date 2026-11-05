@@ -33,6 +33,37 @@ def test_impossible_mixed_shape_is_not_profiled():
     assert mixed_profile_shapes(2048, 1, 8, 4096) == []
 
 
+def test_million_token_profile_does_not_materialize_history(monkeypatch):
+    from atom.model_engine import mixed_profile
+
+    original = mixed_profile.Sequence
+    rows = []
+
+    def bounded_sequence(tokens, **kwargs):
+        # Fail before an accidental full-context allocation can multiply by 1024.
+        assert len(tokens) <= 16384
+        seq = original(tokens, **kwargs)
+        rows.append(seq)
+        return seq
+
+    monkeypatch.setattr(mixed_profile, "Sequence", bounded_sequence)
+    runner = SimpleNamespace(
+        config=SimpleNamespace(max_model_len=1048576, max_num_seqs=1024),
+        block_size=256,
+        drafter=SimpleNamespace(mtp_k=7),
+        pool_plan=SimpleNamespace(entries_per_req={STATE_SLOT_CLASS: 2}),
+    )
+    batch, _ = _batch(runner, 8192, 1023, 8, long_context=True)
+    assert batch.total_seqs_num == 1024
+    assert batch.total_tokens_num == 8192 + 1023 * 8
+    assert batch.context_lens.tolist() == [1048570] * 1024
+    assert not batch.scheduled_tokens.any()
+    assert all(isinstance(seq.token_ids, mixed_profile._ProfileTokens) for seq in rows)
+    assert all(len(seq.token_ids) == seq.num_tokens == 1048570 for seq in rows)
+    assert all(seq.token_ids[-1] == 0 for seq in rows)
+    assert list(rows[-1].token_ids[-8:]) == [0] * 8
+
+
 @pytest.mark.parametrize("width", [1, 8])
 @pytest.mark.parametrize("long_context", [False, True])
 def test_profile_addresses_include_full_draft_lookahead(width, long_context):

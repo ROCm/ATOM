@@ -8,7 +8,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence, SequenceType
 
 
-def make_batch():
+def make_batch(num_spec_step=1):
     seqs = []
     for i in range(5):
         s = Sequence(
@@ -19,16 +19,17 @@ def make_batch():
         s.state_fork_src = 50 + i
         s.block_table = [70 + i]
         seqs.append(s)
+    decode_lens = [2, 1, 2] if num_spec_step else [1, 1, 1]
     return ScheduledBatch(
         {s.id: s for s in seqs},
-        [8, 8, 2, 1, 2],
-        21,
+        [8, 8] + decode_lens,
+        16 + sum(decode_lens),
         total_tokens_num_prefill=16,
-        total_tokens_num_decode=5,
+        total_tokens_num_decode=sum(decode_lens),
         total_seqs_num=5,
         total_seqs_num_prefill=2,
         total_seqs_num_decode=3,
-        num_spec_step=1,
+        num_spec_step=num_spec_step,
     )
 
 
@@ -49,6 +50,14 @@ def test_decode_slice_owns_all_row_fields_and_counts():
     assert child.total_tokens_num_prefill == child.total_seqs_num_prefill == 0
     assert not child.is_mixed
     assert batch.is_mixed and batch.total_tokens_num == 21
+
+
+def test_non_spec_slice_has_no_draft_token_table():
+    batch = make_batch(num_spec_step=0)
+    assert batch.scheduled_spec_decode_tokens is None
+    child = batch.slice_rows(2, 5)
+    assert child.scheduled_spec_decode_tokens is None
+    assert child.num_spec_step == 0
 
 
 def test_filtered_state_rows_are_gathered_by_their_batch_index():
@@ -97,3 +106,26 @@ def test_structured_request_row_keys_are_filtered_and_rebased():
     assert child.structured_requests == {0: captures[2], 2: captures[4]}
     assert batch.structured_requests is captures
     assert batch.slice_rows(5, 5).structured_requests == {}
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_logprob_fields_follow_request_rows_without_parent_device_indices(prepared):
+    batch = make_batch()
+    batch.return_logprobs = [True, False, False, True, False]
+    batch.any_logprobs = True
+    batch.top_logprobs = [2, 0, 0, 5, 0]
+    batch.logprob_requested = (0, 3)
+    if prepared:
+        batch.logprob_request_indices = object()
+        batch.logprob_rows = object()
+    child = batch.slice_rows(2, 5)
+    assert child.return_logprobs == [False, True, False]
+    assert child.top_logprobs == [0, 5, 0]
+    assert child.any_logprobs and child.logprob_requested == (1,)
+    assert child.logprob_request_indices is child.logprob_rows is None
+    disabled = batch.slice_rows(4, 5)
+    assert not disabled.any_logprobs and disabled.logprob_requested == ()
+    assert batch.logprob_requested == (0, 3)
+    if prepared:
+        assert batch.logprob_request_indices is not None
+        assert batch.logprob_rows is not None

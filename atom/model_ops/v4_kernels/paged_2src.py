@@ -79,6 +79,22 @@ from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
 # raises there rather than dispatching, so we filter on it up front.
 _PREFILL_ASM_HEADS = 128
 
+
+def _prefill_with_output(kernel, args, out):
+    """Keep older AITER kernels usable when they allocate their own output."""
+    if out is None:
+        return kernel(*args)
+    try:
+        return kernel(*args, out=out)
+    except TypeError as exc:
+        # Retry only an unsupported output keyword, never a kernel's unrelated
+        # type error. Preserve the caller's output slice on the legacy path.
+        if "unexpected keyword argument 'out'" not in str(exc):
+            raise
+        out.copy_(kernel(*args))
+        return out
+
+
 # Fixed best-known Triton meta for DeepSeek-V4 TP=8 / local H=8 prefill.
 _BLOCK_H = 16
 _BLOCK_K = 32
@@ -650,11 +666,9 @@ def sparse_attn_v4_paged_2src(
         # Native fp8 prefill (op4): 2buff fp8 prefix pool + op-quantized fp8 Q
         # and extend K fed directly. No dequant of the prefix, no torch quant.
         #
-        # `out` is forwarded here, as the bf16 opus and Triton branches below
-        # do, so a caller that passes an output buffer gets the kernel's write
-        # into it rather than a copy afterwards: a mixed batch's prefill
-        # segment lands straight in its rows of the whole batch's output
-        # (`_attn_mixed`).
+        # Current AITER writes directly into the caller's output slice. Older
+        # versions allocate their own output, which the compatibility helper
+        # copies into the same slice for mixed attention.
         from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
 
         # aiter's asm kernel is signature-compatible with the OPUS one, so the
@@ -682,13 +696,13 @@ def sparse_attn_v4_paged_2src(
             and q_packed.shape[1] == _PREFILL_ASM_HEADS
         ):
             try:
-                return mla_sparse_prefill_fp8_asm(*args, out=out)
+                return _prefill_with_output(mla_sparse_prefill_fp8_asm, args, out)
             except RuntimeError:
                 # The ASM path has stricter runtime dtype/shape constraints;
                 # OPUS covers configurations it cannot serve.
                 pass
 
-        return pa_sparse_prefill_fp8_opus(*args, out=out)  # [S, H, head_dim] bf16
+        return _prefill_with_output(pa_sparse_prefill_fp8_opus, args, out)
     # Backend selection: prefer OPUS when available; fall back to Triton on
     # import failure, env override, or runtime error (e.g. unsupported GPU).
     # OPUS covers both archs: gfx950 from source, gfx1250 from a prebuilt code

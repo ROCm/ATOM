@@ -5,6 +5,7 @@
 
 import logging
 import math
+from array import array
 
 import numpy as np
 import torch
@@ -14,6 +15,23 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence, SequenceType
 
 logger = logging.getLogger("atom")
+
+
+class _ProfileTokens:
+    """Read-only zero history; materialize only the scheduled token window."""
+
+    def __init__(self, length):
+        self.length = length
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return array("i", [0]) * len(range(*index.indices(self.length)))
+        if not -self.length <= index < self.length:
+            raise IndexError(index)
+        return 0
 
 
 def mixed_profile_shapes(
@@ -62,7 +80,9 @@ def _batch(runner, prefill_tokens, decode_seqs, width, *, long_context):
         # The short sweep varies allocation shapes; the long sweep exercises
         # max-context indexer chunks and sparse attention metadata.
         context = max_len if long_context else min(max_len, max(n, 8192))
-        seq = Sequence([0] * context, block_size=block, has_per_req_cache=True)
+        seq = Sequence([0], block_size=block, has_per_req_cache=True)
+        seq.token_ids = _ProfileTokens(context)
+        seq.num_tokens = seq.num_prompt_tokens = seq.num_finalized_tokens = context
         seq.type = SequenceType.PREFILL if prefill else SequenceType.DECODE
         seq.num_cached_tokens = context - n if prefill else context - full_q
         seq.state_slots = list(range(row * slots_per_req, (row + 1) * slots_per_req))
