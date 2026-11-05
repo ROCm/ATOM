@@ -61,9 +61,11 @@ def tensor_model_parallel_all_reduce(x: torch.Tensor) -> torch.Tensor:
 def tensor_model_parallel_all_reduce_add(
     x: torch.Tensor, y: torch.Tensor
 ) -> torch.Tensor:
-    """TP all_reduce of ``x + y``. Where the device communicator folds the add into
-    the all-reduce the sum is never materialized; on the TBO path, and where aiter
-    predates the fused op, it is the add followed by `tensor_model_parallel_all_reduce`.
+    """TP all_reduce of ``x + y``: the sum over ranks of each rank's ``x + y``, not
+    ``all_reduce(x) + y``. aiter's ``tensor_model_parallel_all_reduce_add``
+    (ROCm/aiter#7488) adds each rank's pair as the gfx1250 Gluon all-reduce loads it,
+    to the bits of `tensor_model_parallel_all_reduce(x + y)`. On the TBO path, and
+    with an aiter that predates the op, it is that add and all-reduce.
     """
     from aiter.dist import communication_op as aiter_comm
     from aiter.dist.parallel_state import get_tp_group
