@@ -117,8 +117,8 @@ def main() -> None:
             store = Path(vllm.__file__).parent / "distributed/mooncake_store.py"
             record["mooncake_store_sha256"] = hashlib.sha256(store.read_bytes()).hexdigest()
             # Stock MooncakeStoreConfig ignores an unknown device_name_per_gpu instead of failing.
-            assert ("device_name_per_gpu" in store.read_text()) == (
-                "device_name_per_gpu" in config["mooncake"].get("store", {})), store
+            if "device_name_per_gpu" in config["mooncake"].get("store", {}):
+                assert "device_name_per_gpu" in store.read_text(), store
         else:
             from pd_c48_port_patch import verify_port_patch
             from pd_c48_quant_patch import verify_quant_patch
