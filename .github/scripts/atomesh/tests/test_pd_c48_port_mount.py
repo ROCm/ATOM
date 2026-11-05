@@ -56,14 +56,17 @@ def mounts(case, root=REPO):
 
 class PortMountTest(unittest.TestCase):
     def test_stock_cases_mount_only_the_pr_under_test(self):
-        for image in ("40941", "DD4E"):
-            rc, numa0 = mounts(f"V-STOCK{image}-C88-NUMA0-MC")
-            self.assertEqual((rc, [m for m in numa0 if m]), (0, []))
-            rc, pergpu = mounts(f"V-STOCK{image}-C88-PERGPU-MC")
-            self.assertEqual(rc, 0)
-            self.assertEqual(len(pergpu), 1)
-            self.assertIn("/pr65076/mooncake_store.py,target=/usr/local/lib/python3.12/dist-packages/vllm/distributed/"
-                          "mooncake_store.py,readonly", pergpu[0])
+        cases = sorted(p.stem for p in (REPO / ".github/benchmark/c48-model-gap").glob("V-STOCK*-MC.json"))
+        self.assertGreaterEqual(len(cases), 4)
+        for case in cases + ["V-STOCKNEW-C88-PERGPU-MC"]:
+            rc, got = mounts(case)
+            got = [m for m in got if m]
+            if case.startswith(("V-STOCK40941-", "V-STOCKDD4E-")) and "-PERGPU-" in case:
+                self.assertEqual((rc, len(got)), (0, 1))
+                self.assertIn("/pr65076/mooncake_store.py,target=/usr/local/lib/python3.12/dist-packages/vllm/"
+                              "distributed/mooncake_store.py,readonly", got[0])
+            else:
+                self.assertEqual((rc, got), (0, []), case)
         with tempfile.TemporaryDirectory() as temp:
             gap = Path(temp) / ".github/benchmark/c48-model-gap"
             shutil.copytree(REPO / ".github/benchmark/c48-model-gap", gap)

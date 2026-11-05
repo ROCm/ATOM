@@ -51,11 +51,11 @@ PY
 # A case without a wheel uses the image's Mooncake.
 c48_start_mooncake() {
   local role="$1" config="$2" site="/tmp/atomesh-c48-mooncake"
-  local wheel sha store digest
-  read -r wheel sha store < <(python3 -c 'import json, sys
+  local wheel sha store prep digest
+  read -r wheel sha store prep < <(python3 -c 'import json, sys
 m = json.load(open(sys.argv[1]))["mooncake"]
 w = m.get("wheel", {"name": "-", "sha256": "-"})
-print(w["name"], w["sha256"], int("store" in m))' "${config}") || return 2
+print(w["name"], w["sha256"], int("store" in m), int(m.get("store_memory_prep", True)))' "${config}") || return 2
   if [[ "${wheel}" == - ]]; then
     site="$(python3 -c 'import importlib.util, os; print(os.path.dirname(importlib.util.find_spec("mooncake").submodule_search_locations[0]))')" || return 2
     echo "[mooncake] image $(python3 -c 'import importlib.metadata as m; print(m.version("mooncake-transfer-engine-rocm"))') at ${site}"
@@ -87,8 +87,9 @@ print(json.dumps({**c, "master_server_address": "127.0.0.1:" + sys.argv[2]}))' "
     sleep 1
   done
   echo "[mooncake] master pid=${mooncake_master_pid} port=${master_port} config=$(cat "${MOONCAKE_CONFIG_PATH}")"
-  # Patched cases prepare from the worker after loading; stock ones before vLLM starts, as an SA setup_script would.
-  [[ "${wheel}" == - ]] || return 0
+  # Patched cases prepare from the worker after loading; stock ones before vLLM starts, as an SA setup_script would,
+  # unless the case sets store_memory_prep false to run the image with no setup at all.
+  [[ "${wheel}" == - && "${prep}" == 1 ]] || return 0
   python3 "${ATOMESH_SCRIPT_DIR}/store_memory_prep.py" "$(python3 -c 'import json, sys
 c = json.load(open(sys.argv[1]))
 print(c["mooncake"]["store"]["global_segment_size"] * c["roles"]["prefill"]["args"]["tensor-parallel-size"])' "${config}")" \
