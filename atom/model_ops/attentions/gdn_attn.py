@@ -37,6 +37,14 @@ from .aiter_attention import (
     _mtp_prepare_decode_metadata_kernel,
     kv_indices_generate_triton,
 )
+from .pool_layout.entry_arena import published_bytes_for
+from .pool_layout.layer_major_page_unit_geometry import (
+    layer_major_page_unit_bases,
+    layer_major_page_unit_regions,
+    layer_major_page_unit_segments,
+    layer_major_page_unit_stream_sizes,
+    layer_major_page_unit_views,
+)
 from .pool_layout.paged_state_copy import (
     SegmentedCopyPlan,
     launch_copy_descriptor,
@@ -1728,10 +1736,6 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
     def _published_page_unit_bytes(self) -> int:
         """Bytes one block publishes; asked at sizing, before any pool exists."""
-        from atom.model_ops.attentions.pool_layout.entry_arena import (
-            published_bytes_for,
-        )
-
         return sum(
             published_bytes_for(group)
             for pool in self._declare_kv_pools().values()
@@ -1756,11 +1760,6 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         addresses have to match ``get_kv_transfer_tensors`` or the copy and
         ``lmcache_mp`` would name different bytes.
         """
-
-        from atom.model_ops.attentions.pool_layout.layer_major_page_unit_geometry import (
-            layer_major_page_unit_regions,
-        )
-
         pools = self._page_unit_pools()
         # Keyed on the pool objects, whose regions do not move while they are
         # allocated: walking ~120 region tensors per call cost more than the
@@ -1786,17 +1785,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         return regions
 
     def _page_unit_bases(self, unit_ids):
-        from atom.model_ops.attentions.pool_layout.layer_major_page_unit_geometry import (
-            layer_major_page_unit_bases,
-        )
-
         return layer_major_page_unit_bases(self._page_unit_regions(), unit_ids)
 
     def _page_unit_stream_sizes(self, units: int):
-        from atom.model_ops.attentions.pool_layout.layer_major_page_unit_geometry import (
-            layer_major_page_unit_stream_sizes,
-        )
-
         return layer_major_page_unit_stream_sizes(self._page_unit_regions(), units)
 
     def page_unit_views(self, unit_ids):
@@ -1807,11 +1798,6 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         the two orders are the same byte sequence once the tail is trimmed to
         ``image_bytes``.
         """
-
-        from atom.model_ops.attentions.pool_layout.layer_major_page_unit_geometry import (
-            layer_major_page_unit_views,
-        )
-
         self._page_unit_regions()
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
@@ -1822,11 +1808,6 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
     def page_unit_segments(self, unit_ids):
         """``page_unit_views`` as raw addresses and sizes, for the store's gather."""
-
-        from atom.model_ops.attentions.pool_layout.layer_major_page_unit_geometry import (
-            layer_major_page_unit_segments,
-        )
-
         regions = self._page_unit_regions()
         spec = self.model_runner.state_runtime.checkpoint_spec
         first_region = self._page_unit_pools()[0].region_tensors()[0][1]
