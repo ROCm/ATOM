@@ -97,6 +97,29 @@ def test_drafter_step0_rows_below_the_padded_plan_are_refused(monkeypatch):
     assert seen == [], "the kernel must not be reached with a plan past q"
 
 
+def test_dcp_rebuild_plans_only_the_rows_q_holds(monkeypatch):
+    """Under DCP the sparse_mtp_ plan is rebuilt per layer; its inputs must be
+    cut to the drafter's unpadded rows, not the padded running_tokens."""
+    _stub_decode(monkeypatch, [])
+    layer = _layer()
+    layer.dcp_world_size = 4
+    layer.sparse_dcp_metadata_rebuild = True
+    layer.owns_sparse_indexer = True
+    layer.dcp_kernel_num_heads = HEADS
+    layer.dcp_sparse_kv_indptr_buffer = torch.zeros(64 * Q_LEN, dtype=torch.int32)
+    seen = []
+
+    def fake_rebuild(md, q, kv, cu_seqlens_q, kv_indptr, last_page_lens, *a, **k):
+        seen.append((len(cu_seqlens_q), len(kv_indptr), len(last_page_lens)))
+        raise StopIteration
+
+    layer._rebuild_sparse_dcp_persistent_metadata = fake_rebuild
+    q = torch.zeros(39 * Q_LEN, HEADS, RANK + ROPE)
+    with pytest.raises(StopIteration):
+        layer._forward_decode(q, torch.zeros(8, RANK + ROPE), _metadata(40 * Q_LEN))
+    assert seen == [(39 * Q_LEN + 1, 39 * Q_LEN + 1, 39 * Q_LEN)]
+
+
 @pytest.mark.parametrize("q_rows", [39 * Q_LEN, 40 * Q_LEN])
 def test_a_plan_within_q_reaches_the_kernel(monkeypatch, q_rows):
     """Plan over the real tokens (#287): the drafter's unpadded stream and the

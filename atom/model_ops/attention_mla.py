@@ -2670,9 +2670,12 @@ class MLAAttention(nn.Module):
                 if attn_metadata.max_seqlen_q > 1:
                     # MTP verify: per-token layout with max_q_len=1.
                     # Persistent metadata is per-token (from _set_mla_persistent_worker_buffers_sparse_mtp).
-                    paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
+                    # Cut to q's rows: the drafter's step 0 runs fewer than the
+                    # padded running_tokens these are published for, and the
+                    # DCP rebuild below plans from them.
+                    paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q[: B + 1]
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
-                    paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+                    paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     max_q_len = 1
                     # The persistent kernel reads q and writes o for every work
