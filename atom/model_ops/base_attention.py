@@ -20,6 +20,7 @@ from atom.config import get_current_atom_config
 from atom.utils import envs, mark_spliting_op
 from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
+from atom.utils.token_graph_rows import padded_prefill_rows, real_rows, to_rows
 
 from .attention_mla import MLAModules, _mla_output_width
 
@@ -1060,8 +1061,16 @@ def unified_attention_with_output_base(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
+    rows, real = q.shape[0], padded_prefill_rows()
+    if real is not None and real < rows:
+        # A padded prefill: the metadata covers the real rows only, so attention
+        # runs on those, and its FP8 group scales must not see the pad rows.
+        q, k, v, positions, qkv = (
+            real_rows(t, real, rows) for t in (q, k, v, positions, qkv)
+        )
+        q_scale = real_rows(q_scale, real, rows, groups_major=True)
     if use_mla:
-        return self.impl.forward(
+        out = self.impl.forward(
             query=q,
             k_nope=k,
             k_rope=v,
@@ -1069,7 +1078,7 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
         )
     else:
-        return self.impl.forward(
+        out = self.impl.forward(
             query=q,
             key=k,
             value=v,
@@ -1077,6 +1086,7 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
             qkv=qkv,
         )
+    return out if real is None else to_rows(out, rows)
 
 
 def linear_attention_with_output_base_fake(
