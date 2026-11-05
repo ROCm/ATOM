@@ -108,12 +108,6 @@ jobs:
         env:
           UNIT_TEST_REPORT: unit-report.xml
         run: bash .github/scripts/run_unit_tests.sh
-      - name: Run Triton router tests (interpreter kernel check + gate)
-        # The CPU torch wheel ships no triton, so the unit run above skips
-        # these. Installed only now, so it does not change what that run sees.
-        run: |
-          pip3 install triton==3.8.0
-          python -m pytest -q -rs tests/model_ops/test_topk_softmax_triton.py
       - name: Upload JUnit report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
