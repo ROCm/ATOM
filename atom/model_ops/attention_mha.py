@@ -181,6 +181,17 @@ class PagedAttentionImpl(nn.Module):
             return False
         return q.shape[1] % k.shape[1] == 0
 
+    def _refuse_mxfp4(self, where: str):
+        """The base runners read SHUFFLE / NHD caches; MXFP4 pages (``kv_cache_dtype``
+        fp4) are read only by the M3 impls that override ``rope_cache`` and
+        ``dispatch_backend``. Reaching one of these with fp4 would misread the
+        pages, not fail."""
+        if self.kv_cache_dtype == "fp4":
+            raise NotImplementedError(
+                f"layer {self.layer_num}: {where} cannot read MXFP4 KV pages "
+                "(kv_cache_dtype fp4)"
+            )
+
     def _reject_per_token_scales_on_unified(self, k_scale, v_scale, phase: str):
         """unified_attention carries one descale for the whole tensor.
 
@@ -243,6 +254,7 @@ class PagedAttentionImpl(nn.Module):
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
+        self._refuse_mxfp4("the base rope_cache")
         attn_metadata = fwd_ctx.attn_metadata
         kv_cache_data = fwd_ctx.kv_cache_data
 
@@ -656,6 +668,7 @@ class PagedAttentionImpl(nn.Module):
         so the per-token check belongs to arriving here rather than to any one
         of the reasons for it.
         """
+        self._refuse_mxfp4("unified_attention")
         attn_metadata = fwd_ctx.attn_metadata
         if self._flydsl_takes_decode(q, k_cache, v_cache, attn_metadata):
             return self.paged_attention_triton(
@@ -995,6 +1008,7 @@ class PagedAttentionImpl(nn.Module):
     def prefill_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
+        self._refuse_mxfp4("unified_attention")
         # unified_attention supports both prefill and decode, over either the 4D
         # flash layout (shuffled_kv_cache=False) or the 5D SHUFFLE layout
         # (shuffled_kv_cache=True):
@@ -1157,6 +1171,7 @@ class PagedAttentionImpl(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
     ):
+        self._refuse_mxfp4("the base attention dispatch")
         if fwd_ctx.context.is_prefill:
             # q/k/v here still hold only the new tokens (the prefix gather happens
             # inside prefill_attention), so the q.shape[0] == k.shape[0] check in
@@ -1890,3 +1905,350 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self._index_q_cache_key_info = None
         output = output.view(*q.shape)
         return output
+
+
+def dense_decode_rows(
+    context_lens: torch.Tensor, block_tables: torch.Tensor, query_len: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One length-1 "sequence" per query token, for MXFP4 ``pa_decode`` (query_length 1).
+
+    Token ``j`` of a request sits at position ``context_len - query_len + j``, so it
+    attends ``context_len - (query_len - 1 - j)`` keys: the same ``causal_len`` the
+    M3 index selector uses (``index_topk``: ``seq_len - max_query_len + tok + 1``)
+    over the same ``attn_metadata.context_lens``. Its block table row is the
+    request's, repeated. A padded request (context 0) stays 0, which ``pa_decode``
+    zero-fills.
+    """
+    if query_len == 1:
+        return context_lens, block_tables
+    back = torch.arange(
+        query_len - 1, -1, -1, dtype=context_lens.dtype, device=context_lens.device
+    )
+    rows = (context_lens[:, None] - back[None, :]).clamp_(min=0).reshape(-1)
+    return rows, block_tables.repeat_interleave(query_len, dim=0)
+
+
+@torch.no_grad()
+def dense_pa_mxfp4(
+    q: torch.Tensor,  # [rows, H, 128] float8_e4m3fn or bfloat16, contiguous
+    k_pages: torch.Tensor,  # uint8 [pages, Hkv, 8704]
+    v_pages: torch.Tensor,
+    context_lens: torch.Tensor,  # [rows] int32
+    block_tables: torch.Tensor,  # [rows, max_blocks] int32, 128-token pages
+    sm_scale: float,
+    *,
+    plan_step_owner=None,
+) -> torch.Tensor:
+    """Dense decode over the whole page table of every row; bf16 ``[rows, H, 128]``.
+
+    ``sparse_pa_mxfp4`` minus the (token, kv head) collapse: the pool's real
+    ``[pages, Hkv, .]`` views go to ``pa_decode``, which takes Hkv > 1 with 1..16
+    query heads per kv head, an e4m3 query as stored or a bf16 one it quantizes
+    per head row itself. Planned like the sparse decode, in segments of at most
+    ``_FLYDSL_PLAN_MAX_BATCH`` rows.
+
+    ``plan_step_owner`` is the step's metadata when every layer of the step shares
+    ``context_lens`` (the plan is then refreshed once per step). Pass None where the
+    lengths change within one owner's life (a draft model's mutable metadata): the
+    plan is then refreshed from ``context_lens`` on every call.
+    """
+    from atom.model_ops.minimax_m3.mxfp4_pages import HEAD_DIM, PAGE_TOKENS, page_views
+
+    rows, num_heads, head_dim = q.shape
+    num_kv_heads = k_pages.shape[1]
+    if head_dim != HEAD_DIM or not q.is_contiguous():
+        raise ValueError(f"MXFP4 dense decode wants contiguous q [rows, H, {HEAD_DIM}]")
+    if q.dtype not in (torch.float8_e4m3fn, torch.bfloat16):
+        raise TypeError(f"the MXFP4 path takes an e4m3 or bf16 query, got {q.dtype}")
+    if num_heads % num_kv_heads or num_heads // num_kv_heads > 16:
+        raise ValueError(
+            "MXFP4 pa_decode takes 1..16 query heads per kv head, got "
+            f"{num_heads}/{num_kv_heads}"
+        )
+    from aiter.ops.flydsl.pa_decode import pa_decode
+
+    from atom.model_ops.base_attention import (
+        _FLYDSL_PLAN_MAX_BATCH,
+        _flydsl_plan_scratch,
+        _flydsl_prepare_explicit_plan,
+    )
+
+    group = num_heads // num_kv_heads
+    k_data, k_scale = page_views(k_pages)
+    v_data, v_scale = page_views(v_pages)
+    out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+    # a task spans at most 4096 pages; a longer real context is still attended
+    bound = min(block_tables.shape[1], 4096) * PAGE_TOKENS
+    for seg, start in enumerate(range(0, rows, _FLYDSL_PLAN_MAX_BATCH)):
+        end = min(start + _FLYDSL_PLAN_MAX_BATCH, rows)
+        ctx = context_lens[start:end]
+        plan = _flydsl_prepare_explicit_plan(
+            q=q[start:end],
+            k_cache=k_data,
+            context_lens=ctx,
+            num_seqs=end - start,
+            query_length=1,
+            plan_partition_cap=dense_decode_splits(end - start, num_kv_heads),
+            context_bound=bound,
+            existing_plan=None,
+            plan_step_owner=plan_step_owner,
+            plan_segment=seg,
+        )
+        exp_sums, max_logits, tmp = _flydsl_plan_scratch(
+            plan, 1, group, HEAD_DIM, torch.bfloat16, q.device
+        )
+        pa_decode(
+            out[start:end],
+            q[start:end],
+            k_data,
+            v_data,
+            ctx,
+            block_tables[start:end],
+            sm_scale,
+            1,
+            key_scale=k_scale,
+            value_scale=v_scale,
+            work_plan=plan,
+            max_context_length=bound,
+            exp_sums=exp_sums,
+            max_logits=max_logits,
+            temporary_output=tmp,
+        )
+    return out
+
+
+class MiniMaxM3DenseMxfp4PagedAttentionImpl(PagedAttentionImpl):
+    """MiniMax-M3 DENSE attention layer under ``--kv-cache-dtype fp4``.
+
+    The indexed sparse layers' MXFP4 pages (``SparseMHAPagedAttentionImpl``), for a
+    layer with no indexer: all of the history is attended.
+
+    * write: ``aiter.fused_qknorm_idxrqknorm`` in its no-index form
+      (``kv_cache_dtype="mxfp4"``, ``num_index_heads=0``): Gemma qk-norm + RoPE,
+      K/V into the pages. Q comes out e4m3 for decode, bf16 for prefill.
+    * decode: ``pa_decode`` MXFP4 over the full block table (``dense_pa_mxfp4``).
+      A request's q_len > 1 query tokens run as q_len length-1 rows
+      (``dense_decode_rows``): only ``query_length == 1`` exists for MXFP4 KV.
+    * prefill: bf16 q against K/V of EVERY token (new and cached prefix) gathered
+      back from the pages (``gather_mxfp4_prefix``), then ``flash_attn_varlen_func``.
+      This differs from the bf16/fp8 dense prefill, which attends the new tokens'
+      un-quantized K/V: here a new token is attended at its MXFP4 value, what every
+      later decode step reads (the writer returns no BF16 K). A token the writer
+      skips (slot_mapping -1) would read back as an unwritten page. The -1 slots of
+      a prefill are a DCP rank's foreign tokens (refused at init), a TBO ubatch's
+      pad tokens (``split_attn_metadata`` appends them past the last
+      ``cu_seqlens_q`` / ``cu_seqlens_k`` entry, so no request's K covers them) and
+      a batch with no block tables (a dummy run, which returns before attention).
+
+    Not supported (raised, never approximated): sliding window, sinks, alibi,
+    head_dim != 128, a q/k norm other than the Gemma pair, non-bf16 qkv, decode
+    context parallelism, ATOM_USE_UNIFIED_ATTN / flash layout.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_triton_attn = False
+        self._cache_format = "SHUFFLE"  # unread: no base reader sees these pages
+        self._check_supported()
+
+    def _check_supported(self) -> None:
+        from atom.distributed.dcp_utils import get_dcp_world_size
+        from atom.model_ops.layernorm import GemmaRMSNorm
+        from atom.model_ops.minimax_m3.mxfp4_pages import HEAD_DIM
+
+        def refuse(why: str):
+            raise NotImplementedError(
+                f"layer {self.layer_num}: dense MiniMax-M3 MXFP4 attention {why}"
+            )
+
+        if self.kv_cache_dtype != "fp4":
+            refuse(f"needs kv_cache_dtype fp4, got {self.kv_cache_dtype}")
+        if self.head_dim != HEAD_DIM:
+            refuse(f"needs head_dim {HEAD_DIM}, got {self.head_dim}")
+        if self.sliding_window != -1 or self.sinks is not None:
+            refuse("has no sliding window or sinks")
+        if self.alibi_slopes is not None:
+            refuse("has no alibi")
+        if not (
+            isinstance(self.q_norm, GemmaRMSNorm)
+            and isinstance(self.k_norm, GemmaRMSNorm)
+            and self.rotary_emb is not None
+        ):
+            # the writer always applies an RMSNorm: a norm-free attention (EAGLE3's)
+            # would be silently normalized
+            refuse("needs the Gemma q/k norm and rotary_emb the writer applies")
+        if (
+            self.num_heads % self.num_kv_heads
+            or self.num_heads // self.num_kv_heads > 16
+        ):
+            refuse(
+                "needs 1..16 query heads per kv head, got "
+                f"{self.num_heads}/{self.num_kv_heads}"
+            )
+        if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
+            refuse("does not run with ATOM_USE_UNIFIED_ATTN / flash layout")
+        if get_dcp_world_size() > 1:
+            # a DCP rank writes -1 slots for tokens it does not own, which the
+            # prefill gather would read as unwritten pages
+            refuse("does not run under decode context parallelism")
+
+    def _pages(self, fwd_ctx: ForwardContext):
+        from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_BYTES
+
+        layer = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        k_pages, v_pages = layer.k_cache, layer.v_cache
+        for name, pages in (("k", k_pages), ("v", v_pages)):
+            if (
+                pages.dtype != torch.uint8
+                or pages.dim() != 3
+                or pages.shape[1] != self.num_kv_heads
+                or pages.shape[2] != PAGE_BYTES
+            ):
+                raise RuntimeError(
+                    f"layer {self.layer_num}: the {name} cache must be MXFP4 pages "
+                    f"uint8 [pages, {self.num_kv_heads}, {PAGE_BYTES}], got "
+                    f"{pages.dtype} {tuple(pages.shape)}"
+                )
+        return k_pages, v_pages
+
+    @mark_trace(prefix="rope_cache", torch_compile=False)
+    def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
+        """Fused qk-norm + RoPE + MXFP4 K/V insert (no index branch).
+
+        Returns the parent 7-tuple with the rotated ``q`` (e4m3 on decode, bf16 on
+        prefill); ``k`` / ``v`` are returned unchanged, the readers use the pages.
+        """
+        from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_TOKENS
+        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
+
+        if qkv is None or qkv.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                f"layer {self.layer_num}: dense MXFP4 attention needs a packed bf16 qkv"
+            )
+        k_pages, v_pages = self._pages(fwd_ctx)
+        qkv = qkv.contiguous()
+        cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
+        decode = not fwd_ctx.context.is_prefill
+        q_out = torch.empty(
+            (qkv.shape[0], self.num_heads * self.head_dim),
+            dtype=torch.float8_e4m3fn if decode else qkv.dtype,
+            device=qkv.device,
+        )
+        aiter.fused_qknorm_idxrqknorm(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            cos_sin_cache,
+            position,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_emb.rotary_dim,
+            self.q_norm.variance_epsilon,
+            None,  # index_q_norm_weight
+            None,  # index_k_norm_weight
+            0,  # num_index_heads: the dense qkv has no index columns
+            fwd_ctx.attn_metadata.slot_mapping,
+            k_pages,
+            v_pages,
+            None,  # index_cache
+            PAGE_TOKENS,
+            q_out,
+            kv_cache_dtype="mxfp4",
+            asm_layout=False,
+        )
+        q = q_out.view(-1, self.num_heads, self.head_dim)
+        return q, k, v, k_pages, v_pages, None, None
+
+    def dispatch_backend(self, fwd_ctx: ForwardContext, q, k, v):
+        if fwd_ctx.context.is_prefill:
+            return self.prefill_attention
+        return self._dense_decode
+
+    @mark_trace(prefix="prefill_attention", torch_compile=False)
+    def prefill_attention(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+        from atom.model_ops.minimax_m3.gather_mxfp4 import gather_mxfp4_prefix
+
+        md = fwd_ctx.attn_metadata
+        if md.block_tables is None:
+            # AiterAttentionMetadataBuilder.prepare_prefill publishes it on every
+            # prefill of an MXFP4 pool; None is a builder that does not know the pool
+            raise RuntimeError(
+                f"layer {self.layer_num}: dense MXFP4 prefill reads every token back "
+                "from the pages and needs attn_metadata.block_tables"
+            )
+        # The builder uploads the key-side map and zero seq_starts only on a prefix
+        # hit. Without one a request's keys are its query tokens from position 0,
+        # so the same two tensors are built here: per call, never cached on the
+        # metadata (prefill is eager, and a ubatch gets metadata of its own).
+        batch_ids = md.batch_id_per_k_token
+        # A TBO ubatch without a cached prefix carries total_kv=None (see
+        # split_attn_metadata): its keys are its query tokens, one id each. Both
+        # fallbacks are host-known shapes, so no device sync.
+        total = md.total_kv
+        if total is None:
+            total = batch_ids.numel() if batch_ids is not None else q.shape[0]
+        if batch_ids is None:
+            from atom.model_ops.attentions.token_layout.batch_ids import (
+                build_batch_ids_device,
+            )
+
+            batch_ids = build_batch_ids_device(md.context_lens, total=total)
+        seq_starts = md.seq_starts
+        if seq_starts is None:
+            seq_starts = torch.zeros_like(md.context_lens)
+        k_full, v_full = gather_mxfp4_prefix(
+            k_cache,
+            v_cache,
+            md.block_tables,
+            md.cu_seqlens_k,
+            batch_ids,
+            seq_starts,
+            total,
+        )
+        return aiter.flash_attn_varlen_func(
+            q,
+            k_full,
+            v_full,
+            cu_seqlens_q=md.cu_seqlens_q,
+            cu_seqlens_k=md.cu_seqlens_k,
+            max_seqlen_q=md.max_seqlen_q,
+            max_seqlen_k=md.max_seqlen_k,
+            min_seqlen_q=md.min_seqlen_q,
+            dropout_p=md.dropout_p,
+            softmax_scale=self.scale,
+            causal=True,
+            window_size=(-1, -1, 0),
+        )
+
+    @mark_trace(prefix="paged_attention_mxfp4", torch_compile=False)
+    def _dense_decode(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+        md = fwd_ctx.attn_metadata
+        query_len = max(1, int(md.max_seqlen_q))
+        # q_len tokens a request, for the requests this step runs: a padded step
+        # (graph bucket) carries more context_lens / block table rows than that
+        num_seqs, ragged = divmod(q.shape[0], query_len)
+        if ragged or num_seqs > md.context_lens.shape[0]:
+            # a ragged decode (requests with other q_len) has no row fold
+            raise NotImplementedError(
+                f"layer {self.layer_num}: dense MXFP4 decode needs q_len "
+                f"{query_len} tokens for each request, got {q.shape[0]} query "
+                f"tokens over {md.context_lens.shape[0]} requests"
+            )
+        ctx, block_tables = dense_decode_rows(
+            md.context_lens[:num_seqs], md.block_tables[:num_seqs], query_len
+        )
+        return dense_pa_mxfp4(
+            q,
+            k_cache,
+            v_cache,
+            ctx,
+            block_tables,
+            self.scale,
+            # per-layer refresh: a step-owned dense plan shares its key with sparse
+            # decode (Hkv/rank=1, batch>=128) and would clobber its lengths
+            plan_step_owner=None,
+        )

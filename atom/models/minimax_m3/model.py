@@ -20,7 +20,10 @@ from transformers import PretrainedConfig
 from atom.config import Config, QuantizationConfig
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
-from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
+from atom.model_ops.attention_mha import (
+    MiniMaxM3DenseMxfp4PagedAttentionImpl,
+    SparseMHAPagedAttentionImpl,
+)
 from atom.model_ops.base_attention import (
     Attention,
     _flydsl_arch_supported,
@@ -47,7 +50,6 @@ from atom.model_ops.minimax_m3.sparse_attn import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
-from atom.models.minimax_m3.config import dense_kv_cache_dtype
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
     IntermediateTensors,
@@ -381,6 +383,18 @@ class MiniMaxM3MoE(nn.Module):
         return routed_output.view(orig_shape)
 
 
+def _dense_attention_kwargs(cache_config: str) -> dict:
+    """``Attention`` kwargs of a dense M3 layer: ``--kv-cache-dtype fp4`` takes the
+    MXFP4 impl (written by the AITER fused writer, read by MXFP4 ``pa_decode`` /
+    the prefill gather); every other KV dtype is unchanged."""
+    if cache_config == "fp4":
+        return {
+            "kv_cache_dtype": "fp4",
+            "impl_cls": MiniMaxM3DenseMxfp4PagedAttentionImpl,
+        }
+    return {"kv_cache_dtype": cache_config}
+
+
 class MiniMaxM3Attention(nn.Module):
     def __init__(
         self,
@@ -437,13 +451,13 @@ class MiniMaxM3Attention(nn.Module):
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
-            kv_cache_dtype=dense_kv_cache_dtype(cache_config),
             layer_num=layer_id,
             use_mla=False,
             rotary_emb=self.rotary_emb,
             q_norm=self.q_norm,
             k_norm=self.k_norm,
             prefix=f"{prefix}.attn",
+            **_dense_attention_kwargs(cache_config),
         )
 
     def forward(

@@ -122,6 +122,15 @@ class Eagle3LlamaAttention(nn.Module):
             config, "sliding_window", None
         ):
             sliding_window = config.sliding_window
+        attn_kwargs = {}
+        if cache_config == "fp4":
+            # --kv-cache-dtype fp4 (MiniMax-M3): the draft's KV is MXFP4 pages, which
+            # only this norm-free impl writes and reads; every other impl refuses fp4.
+            from atom.model_ops.minimax_m3.eagle3_attn_mxfp4 import (
+                Eagle3Mxfp4PagedAttentionImpl,
+            )
+
+            attn_kwargs["impl_cls"] = Eagle3Mxfp4PagedAttentionImpl
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -132,6 +141,7 @@ class Eagle3LlamaAttention(nn.Module):
             prefix=f"{prefix}.attn",
             rotary_emb=self.rotary_emb,
             per_layer_sliding_window=sliding_window,
+            **attn_kwargs,
         )
 
     def forward(

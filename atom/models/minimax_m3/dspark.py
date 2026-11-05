@@ -52,15 +52,17 @@ The draft ships no embedding or LM head; both are the target's.
 
 from typing import TYPE_CHECKING, ClassVar
 
+import aiter
 import torch
 from aiter import QuantType, dtypes
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
-from atom.config import QuantizationConfig, dense_kv_dtype
+from atom.config import QuantizationConfig
 from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
+from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_BYTES, PAGE_TOKENS, page_views
 from atom.model_ops.minimax_m3.sparse_attn import (
     ASM_PAGE_SIZE,
     PAGES_PER_SPARSE_BLOCK,
@@ -76,11 +78,16 @@ from atom.models.dspark_draft import (
     DSparkMarkovHead,
     linear_out,
 )
-from atom.models.minimax_m3.model import MiniMaxM3MLP
+from atom.models.minimax_m3.model import MiniMaxM3MLP, _minimax_m3_cos_sin_cache
 from atom.utils.forward_context import get_forward_context
 
 if TYPE_CHECKING:
     from atom.config import Config
+
+# Widest `max_context_length` aiter's ranged MXFP4 `pa_decode` takes: it stages
+# 2 * ceil((span + 255) / 256) page ids in LDS, at most 4096 (its
+# PAGE_ID_STAGE_LIMIT), so span <= 2048 * 256 - 255. A hint past it fails the compile.
+_MXFP4_MAX_STAGED_SPAN = 2048 * 256 - 255
 
 
 def _draft_rope_theta(config) -> float:
@@ -170,6 +177,41 @@ def _window_rows(
     torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
 
 
+def _mxfp4_rows(
+    block_tables: torch.Tensor,  # [rb, W] page-128 ids
+    ctx_eff: torch.Tensor,  # [rb] int32, keys each request can read (absolute end)
+    positions: torch.Tensor,  # [rb * T] each row's own position
+    row_req: torch.Tensor,  # [rb * T] the request each row belongs to
+    window: int,  # 0: attend the whole context
+    real_rows: int,  # rows past this are padding
+    start64: torch.Tensor,  # [rb * T] int64 scratch
+    out_tables: torch.Tensor,  # [rb * T, W] int32
+    out_lens: torch.Tensor,  # [rb * T] int32
+    out_starts: torch.Tensor,  # [rb * T] int32
+) -> None:
+    """Each block row's page-128 table, absolute end and exact first key.
+
+    The MXFP4 reader takes a row's keys as ``[start, end)`` of its request's
+    table, so unlike the fp8 path there is no page rounding: a row at position
+    p starts at key ``p - window + 1`` exactly. Pad rows are empty (length 0:
+    the reader writes zeros and touches neither table nor pages, so nothing
+    stale or unwritten is read for them).
+    """
+    torch.index_select(block_tables, 0, row_req, out=out_tables)
+    torch.index_select(ctx_eff, 0, row_req, out=out_lens)
+    out_lens[real_rows:].zero_()
+    if window:
+        torch.sub(positions, window - 1, out=start64)
+        start64.clamp_(min=0)
+        start64[real_rows:].zero_()
+        out_starts.copy_(start64)
+        # A row whose own position is past the allocated pages still reads its
+        # last key; a zero-length row starts at 0 (an empty range).
+        torch.minimum(out_starts, (out_lens - 1).clamp_(min=0), out=out_starts)
+    else:
+        out_starts.zero_()
+
+
 class KVCacheBinding(nn.Module):
     """What the draft KV pool binds one layer's cache onto, and nothing else.
 
@@ -223,7 +265,15 @@ class M3DSparkAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.kv_cache_dtype = dense_kv_dtype(atom_config)
+        # The target's flag, copied onto the draft's config: fp4 is MXFP4 pages
+        # here, never fp8 (its own hf_config does not name M3, so
+        # `mxfp4_kv_layout` cannot tell).
+        self.kv_cache_dtype = atom_config.kv_cache_dtype
+        self.mxfp4 = self.kv_cache_dtype == "fp4"
+        if self.mxfp4 and self.head_dim != 128:
+            raise ValueError(
+                f"MXFP4 KV pages hold head_dim 128, the draft has {self.head_dim}."
+            )
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -257,6 +307,15 @@ class M3DSparkAttention(nn.Module):
             base=_draft_rope_theta(config),
             rope_scaling=None,
         )
+        if self.mxfp4:
+            if not 0 < rotary_dim <= 128 or rotary_dim % 8:
+                raise ValueError(
+                    "the fused MXFP4 writer takes a rotary_dim that is a positive "
+                    f"multiple of 8 up to 128, the draft has {rotary_dim}."
+                )
+            # Built now, as the target's layers do: the first call inside a graph
+            # capture would register a capture-pool tensor as the cache.
+            _minimax_m3_cos_sin_cache(self.rotary_emb, self.q_norm.weight)
         self.kv = KVCacheBinding(layer_num)
 
     def _bound_cache(self):
@@ -272,7 +331,64 @@ class M3DSparkAttention(nn.Module):
         kv = self.kv
         if kv.k_cache.numel() == 0:
             return None
+        if self.mxfp4:
+            # [pages, kv heads, 8704] uint8, scales inside the pages: read and
+            # written as bound, 128-token pages, never as page-16.
+            for name, pages in (("k", kv.k_cache), ("v", kv.v_cache)):
+                if (
+                    pages.dtype != torch.uint8
+                    or pages.dim() != 3
+                    or tuple(pages.shape[1:]) != (self.num_kv_heads, PAGE_BYTES)
+                ):
+                    raise ValueError(
+                        f"the draft's {name} cache is {pages.dtype} "
+                        f"{tuple(pages.shape)}, not MXFP4 pages "
+                        f"[pages, {self.num_kv_heads}, {PAGE_BYTES}]: the pool's "
+                        "per-rank KV heads must be this layer's."
+                    )
+            if kv.k_scale is not None or kv.v_scale is not None:
+                raise ValueError("MXFP4 pages carry their scales; none are bound.")
+            return kv.k_cache, kv.v_cache, None, None
         return to_page16_shuffle(kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale)
+
+    def _mxfp4_write(self, qkv, positions, slot_mapping, cache):
+        """Norm + RoPE + MXFP4 page write of the block's or the context's K/V.
+
+        ``qkv`` is the whole ``[q | k | v]`` projection: the aiter writer needs
+        query heads (the context's q is computed and dropped). Returns the
+        normed, roped q as e4m3. The norm weights go in as stored: the kernel
+        applies ``x * (1 + w)``, the Gemma norm.
+        """
+        k_cache, v_cache, _, _ = cache
+        q_out = torch.empty(
+            (qkv.shape[0], self.q_size), dtype=torch.float8_e4m3fn, device=qkv.device
+        )
+        aiter.fused_qknorm_idxrqknorm(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            _minimax_m3_cos_sin_cache(self.rotary_emb, qkv),
+            positions,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_emb.rotary_dim,
+            self.q_norm.variance_epsilon,
+            None,
+            None,
+            0,
+            slot_mapping,
+            k_cache,
+            v_cache,
+            None,
+            PAGE_TOKENS,
+            q_out,
+            None,
+            None,
+            kv_cache_dtype="mxfp4",
+            index_cache_dtype="auto",
+            asm_layout=False,
+        )
+        return q_out
 
     def _norm_rope_write(self, q, k, v, num_heads, positions, slot_mapping, cache):
         k_cache, v_cache, k_scale, v_scale = cache
@@ -303,13 +419,17 @@ class M3DSparkAttention(nn.Module):
     ) -> None:
         """K/V rows for the target context: k_norm + RoPE on K, V as is.
 
-        The q third of the fused projection is computed and dropped; the kernel
-        writes K/V only when told it has zero query heads.
+        The q third of the fused projection is computed and dropped; the Triton
+        kernel writes K/V only when told it has zero query heads, the MXFP4
+        writer needs the heads and drops its q output.
         """
         cache = self._bound_cache()
         if cache is None:
             return
         qkv = linear_out(self.qkv_proj(ctx_hidden))
+        if self.mxfp4:
+            self._mxfp4_write(qkv, positions, slot_mapping, cache)
+            return
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         self._norm_rope_write(k, k, v, 0, positions, slot_mapping, cache)
 
@@ -331,6 +451,10 @@ class M3DSparkAttention(nn.Module):
             return linear_out(self.o_proj(out))
 
         md = get_forward_context().attn_metadata
+        if self.mxfp4:
+            q = self._mxfp4_write(qkv, positions, md.slot_mapping, cache)
+            out = self._block_attention_mxfp4(q, md, cache)
+            return linear_out(self.o_proj(out))
         # The block's K/V go into the cache at the block's slots (positions
         # past the allocated pages are -1, dropped), then every block position
         # decodes as its own q_len=1 row.
@@ -339,6 +463,39 @@ class M3DSparkAttention(nn.Module):
         )
         out = self._block_attention_paged(q, md, cache)
         return linear_out(self.o_proj(out))
+
+    def _block_attention_mxfp4(self, q: torch.Tensor, md, cache) -> torch.Tensor:
+        """The block as ``B * T`` q_len=1 rows over the MXFP4 pages.
+
+        Each row reads keys ``[start, end)`` of its request's page-128 table: its
+        own first key under the window, the request's length as the end. The pool
+        holds this layer's one KV head per page (`_bound_cache` checks it), so a
+        table entry is the page.
+        """
+        from aiter.ops.flydsl.pa_decode import pa_decode
+
+        k_pages, v_pages, _, _ = cache
+        rows = q.shape[0]
+        q = q.view(rows, self.num_heads, self.head_dim)
+        out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+        k_data, k_scale = page_views(k_pages)
+        v_data, v_scale = page_views(v_pages)
+        pa_decode(
+            out,
+            q,
+            k_data,
+            v_data,
+            md.dspark_ctx_rows,
+            md.dspark_bt_rows,
+            self.scaling,
+            1,
+            key_scale=k_scale,
+            value_scale=v_scale,
+            work_plan=None,
+            max_context_length=md.dspark_max_span,
+            context_starts=md.dspark_start_rows,
+        )
+        return out.view(rows, -1)
 
     def _block_attention_paged(self, q: torch.Tensor, md, cache) -> torch.Tensor:
         """``[context | block]`` attention as ``B * T`` q_len=1 paged decode rows.
@@ -496,7 +653,13 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         # first call.
         self.max_num_seqs = atom_config.max_num_seqs
         self.block_size = atom_config.kv_cache_block_size
-        self._bt16 = None
+        self.mxfp4 = atom_config.kv_cache_dtype == "fp4"
+        if self.mxfp4 and self.block_size != PAGE_TOKENS:
+            raise ValueError(
+                f"MXFP4 KV pages are {PAGE_TOKENS} tokens, block size is "
+                f"{self.block_size}."
+            )
+        self._block_cols = 0
 
     @property
     def first_attention_layer_num(self) -> int:
@@ -534,12 +697,24 @@ class MiniMaxM3DSpark(DSparkDraftModel):
     def _alloc_block_rows(self, P: int, T: int, device) -> None:
         """The first call is the warmup, ahead of any capture: these addresses
         are the ones every recording bakes in."""
+        self._block_cols = P
         max_bs = self.max_num_seqs
         self._alloc = torch.zeros(max_bs, dtype=torch.int32, device=device)
         self._alloc_host = torch.zeros(max_bs, dtype=torch.int32, pin_memory=True)
         # Recorded after each copy out of `_alloc_host`; a fresh event has
         # nothing to wait for.
         self._alloc_copied = torch.cuda.Event()
+        self._row_req = torch.arange(
+            max_bs, dtype=torch.int64, device=device
+        ).repeat_interleave(T)
+        self._start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=device)
+        self._ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        self._ctx_rows = torch.zeros(max_bs * T, dtype=torch.int32, device=device)
+        if self.mxfp4:
+            # P page-128 columns: no sub-pages, a row's start is a key.
+            self._bt_rows = torch.zeros(max_bs * T, P, dtype=torch.int32, device=device)
+            self._start_rows = torch.zeros(max_bs * T, dtype=torch.int32, device=device)
+            return
         # One row of slack past the last request: `_window_rows` reads every
         # row as a P-wide window of this buffer.
         self._bt16_flat = torch.zeros(
@@ -547,15 +722,9 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         self._bt16 = self._bt16_flat[: max_bs * P].view(max_bs, P)
         self._bt16_rows = torch.zeros(max_bs * T, P, dtype=torch.int32, device=device)
-        self._ctx_rows = torch.zeros(max_bs * T, dtype=torch.int32, device=device)
-        self._row_req = torch.arange(
-            max_bs, dtype=torch.int64, device=device
-        ).repeat_interleave(T)
         self._sub_pages = torch.arange(
             PAGES_PER_SPARSE_BLOCK, dtype=torch.int32, device=device
         )
-        self._start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=device)
-        self._ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=device)
 
     def prepare_paged_block(
         self,
@@ -585,8 +754,8 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         is allocated): their draft rows simply miss a few of their own keys.
         """
         running_bs, T = block_positions.shape
-        P = PAGES_PER_SPARSE_BLOCK * block_tables.shape[1]
-        if self._bt16 is None or self._bt16.shape[1] != P:
+        P = (1 if self.mxfp4 else PAGES_PER_SPARSE_BLOCK) * block_tables.shape[1]
+        if self._block_cols != P:
             self._alloc_block_rows(P, T, block_tables.device)
 
         # Allocated tokens per request. At least one page: the warmup batch and
@@ -609,12 +778,31 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         ctx_eff = self._ctx_eff[:running_bs]
         torch.minimum(ctx_lens, alloc, out=ctx_eff)
 
+        rows = running_bs * T
+        if self.mxfp4:
+            _mxfp4_rows(
+                block_tables,
+                ctx_eff,
+                block_positions.view(-1),
+                self._row_req[:rows],
+                self.sliding_window,
+                scheduled_bs * T,
+                self._start16[:rows],
+                self._bt_rows[:rows],
+                self._ctx_rows[:rows],
+                self._start_rows[:rows],
+            )
+            attn_metadata.dspark_bt_rows = self._bt_rows[:rows]
+            attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
+            attn_metadata.dspark_start_rows = self._start_rows[:rows]
+            attn_metadata.dspark_max_span = self._mxfp4_max_span(P, T)
+            return
+
         bt16 = _page16_table(block_tables, self._bt16[:running_bs], self._sub_pages)
         if running_bs > scheduled_bs:
             # A pad row reads one page: page 0.
             bt16[scheduled_bs:, :PAGES_PER_SPARSE_BLOCK].copy_(self._sub_pages)
 
-        rows = running_bs * T
         _window_rows(
             self._bt16_flat,
             ctx_eff,
@@ -628,6 +816,18 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
+
+    def _mxfp4_max_span(self, cols: int, T: int) -> int:
+        """``max_context_length`` of the MXFP4 reader: an upper bound of
+        ``end - start`` over the rows, not of the context. A windowed row at
+        position p spans ``window + (end - 1 - p)``, at most ``window + T``; a
+        whole-context row spans the table. Both within the table's capacity, and
+        within what aiter can stage: a hint past `_MXFP4_MAX_STAGED_SPAN` fails
+        its compile (cols >= 4095). Only the hint is clamped; the rows' own
+        start/context, so the attended keys, are not."""
+        cap = cols * PAGE_TOKENS
+        span = min(cap, self.sliding_window + T) if self.sliding_window else cap
+        return min(span, _MXFP4_MAX_STAGED_SPAN)
 
     def forward_spec(self, input_ids, positions, num_draft):
         return self.head_and_sample(
