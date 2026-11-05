@@ -2204,10 +2204,7 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
         self.mla_dims = get_mla_dims(self.model_config)
-        # hf_TEXT_config: a multimodal checkpoint (GLM-5.3-Flash) keeps the
-        # indexer fields on its text tower, and vLLM resolves that for us.
-        # For a flat config it is the same object, so DeepSeek is unaffected.
-        self.topk_tokens = config.model_config.hf_text_config.index_topk
+        self.topk_tokens = config.model_config.hf_config.index_topk
         # GLM-5.3-Flash's pooled indexer emits a WIDER row than index_topk: the
         # selected pools expand back to their tokens and the open tail rides
         # along, rounded to 128. Every buffer the indexer writes and sparse MLA
@@ -2646,23 +2643,6 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         )
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
-        # The decode scorer calls aiter's `deepgemm_fp8_paged_mqa_logits` with a
-        # fixed ChunkK=256 (layer_sparse_mla.py), and that kernel asserts the
-        # chunk and the KV block size are multiples of one another. Block size
-        # 64 always was; a hybrid model whose block size vLLM raises to cover
-        # the mamba page (GLM-5.3-Flash) is not guaranteed to be -- TP=2 lands
-        # on 1920. Say so here, where the number is final and the cause is
-        # still visible, rather than inside a Triton assert mid-decode.
-        block_size = getattr(kv_cache_spec, "block_size", None)
-        if block_size and 256 % block_size != 0 and block_size % 256 != 0:
-            raise ValueError(
-                f"Sparse indexer KV block size {block_size} is neither a "
-                "divisor nor a multiple of the decode scorer's ChunkK=256. "
-                "vLLM chose it to fit this model's mamba state page; pass an "
-                "explicit --block-size that is a multiple of 256 (and large "
-                "enough for that page), or run a tensor-parallel size whose "
-                "state page lands on one."
-            )
         # GLM-5.3-Flash's pooled cache holds one row per `tokens_per_state`
         # tokens, and the decode scorer pages over those rows. It computes
         # correctly only in the preshuffled layout, which needs the rows per
@@ -2670,6 +2650,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         # check native ATOM makes in `kimi_mla_gdn_attn._index_rows_per_block`.
         # `block_size` here is the KERNEL block vLLM split the manager block
         # into, which is what `block_table` and the cache view are paged in.
+        block_size = getattr(kv_cache_spec, "block_size", None)
         tokens_per_state = int(getattr(kv_cache_spec, "tokens_per_state", 1) or 1)
         if block_size and tokens_per_state > 1:
             from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
@@ -2691,7 +2672,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         # num_speculative_tokens should be 0 for its builders.
         is_draft_layer = False
         if layer_names:
-            num_hidden_layers = config.model_config.hf_text_config.num_hidden_layers
+            num_hidden_layers = config.model_config.hf_config.num_hidden_layers
             layer_indices = [
                 extract_layer_index(layer_name) for layer_name in layer_names
             ]

@@ -202,6 +202,14 @@ class Glm5NextIndexerVllm(Glm5NextIndexer):
 
     def __init__(self, atom_config, config, *args, **kwargs):
         super().__init__(atom_config, config, *args, **kwargs)
+        # A NoPE indexer (rope_dim 0, head_dim 128) turns on the shared
+        # indexer's nope-cache fusion, which hands the op the BF16 query and
+        # leaves norm and quantization to the native fused kernel. The plugin's
+        # dense op (`sparse_attn_indexer_plugin_mode`) has no such kernel: it
+        # takes an FP8 query and writes the cache itself, and fails to compile
+        # on a BF16 one. Turn the fusion off so the dense path (ATOM_GLM5_KPOOL=0)
+        # quantizes before the op, as GLM-5.2's roped indexer always does.
+        self.use_nope_cache_fusion = False
         # The cache module's head_dim becomes the MLAAttentionSpec head_size,
         # the bytes vLLM budgets per cached row. Declare the 16-byte-aligned
         # width native ATOM allocates (144), not index_head_dim + 4 (132): 144

@@ -297,3 +297,19 @@ def test_plugin_classes_replace_native_ones_only_during_construction():
     assert issubclass(mod.Glm5NextKDAAttentionVllm, native.Glm5NextKDAAttention)
     assert native.Glm5NextIndexer is not mod.Glm5NextIndexerVllm
     assert native.Glm5NextKDAAttention is not mod.Glm5NextKDAAttentionVllm
+
+
+def test_rebinding_keeps_the_tail_buffer_pointer(monkeypatch):
+    """A KV cache re-initialization after graph capture must not move the tail
+    buffer: captured graphs hold its address. Same shape -> cleared in place."""
+    from atom.plugin.vllm.attention import glm5_kpool_indexer as op
+
+    monkeypatch.setattr(op, "_TAIL_CACHES", {})
+    op.allocate_tail_cache("x.indexer.k_cache", 8, 4, 128, torch.device("cpu"))
+    first = op._TAIL_CACHES["x.indexer.k_cache"]
+    first.fill_(1)
+    op.allocate_tail_cache("x.indexer.k_cache", 8, 4, 128, torch.device("cpu"))
+    assert op._TAIL_CACHES["x.indexer.k_cache"].data_ptr() == first.data_ptr()
+    assert not first.any()
+    op.allocate_tail_cache("x.indexer.k_cache", 16, 4, 128, torch.device("cpu"))
+    assert op._TAIL_CACHES["x.indexer.k_cache"].shape[0] == 16

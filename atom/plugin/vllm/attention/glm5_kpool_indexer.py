@@ -60,10 +60,18 @@ def _kda_state_slots(attn_metadata_dict, kda_layer_name: str, num_reqs: int):
 
 
 def _pooled_cache_view(kv_cache: torch.Tensor, pool_rows: int) -> torch.Tensor:
-    """[num_blocks, pool_rows, row_bytes], which the aiter kernels index by row."""
-    if kv_cache.dim() == 3 and kv_cache.shape[1] == pool_rows:
-        return kv_cache
-    return kv_cache.view(-1, pool_rows, kv_cache.shape[-1])
+    """[num_blocks, pool_rows, row_bytes], which the aiter kernels index by row.
+
+    vLLM already views the cache that way; a different row count means the
+    builder's `rows_per_block` and vLLM's allocation disagree, and re-viewing
+    the tensor would silently address the wrong rows.
+    """
+    if kv_cache.dim() != 3 or kv_cache.shape[1] != pool_rows:
+        raise RuntimeError(
+            f"pooled index cache is viewed as {tuple(kv_cache.shape)}, but the "
+            f"indexer metadata pages it at {pool_rows} rows per block"
+        )
+    return kv_cache
 
 
 # One pooled tail buffer per indexer layer, kept for the process. It lives here,
@@ -97,15 +105,21 @@ def allocate_tail_cache(
     MB in total -- and follows a request only while that request keeps its slot,
     which is why prefix caching and speculative decoding are refused: both move
     mamba state between slots and neither migration knows this buffer exists.
-    Rebinding (a KV cache re-initialization) replaces the buffer.
+    Rebinding (a KV cache re-initialization) clears the buffer in place when
+    its shape is unchanged, so CUDA graphs captured against it keep a valid
+    pointer; only a different slot count allocates a new one.
     """
+    shape = (num_state_slots, 2, index_kpool, head_dim)
+    existing = _TAIL_CACHES.get(k_cache_prefix)
+    if (
+        existing is not None
+        and tuple(existing.shape) == shape
+        and existing.device == torch.device(device)
+    ):
+        existing.zero_()
+        return
     _TAIL_CACHES[k_cache_prefix] = torch.zeros(
-        num_state_slots,
-        2,
-        index_kpool,
-        head_dim,
-        dtype=torch.bfloat16,
-        device=device,
+        shape, dtype=torch.bfloat16, device=device
     )
     logger.info(
         "[glm5 kpool] allocated tail buffer for %s: %d slots x %d x %d",
