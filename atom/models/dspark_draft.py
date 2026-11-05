@@ -177,6 +177,26 @@ class DSparkConfidenceHead(nn.Module):
         return aiter.sigmoid(logit).view(x.shape[:-1])
 
 
+class KVCacheBinding(nn.Module):
+    """What a draft KV pool binds one layer's cache onto, and nothing else.
+
+    ``DraftKvBuilder`` recognizes a non-MLA attention module by these
+    attributes and sets ``k_cache`` / ``v_cache`` (in the layout that draft's
+    pool binds), the scales and ``max_model_len`` on it; the layer then reads
+    and writes the cache itself.
+    """
+
+    base_attention = None
+    use_mla = False
+
+    def __init__(self, layer_num: int) -> None:
+        super().__init__()
+        self.layer_num = layer_num
+        self.max_model_len = 0
+        self.k_cache = self.v_cache = torch.tensor([])
+        self.k_scale = self.v_scale = None
+
+
 class DSparkDraftModel(nn.Module):
     """What a DSpark draft model must provide to ``DSparkProposer``."""
 

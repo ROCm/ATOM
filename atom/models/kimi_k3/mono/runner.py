@@ -570,7 +570,9 @@ class K3MonoDecodeRunner:
         apart -- which is exactly what that method's docstring asks of a caller.
         ``out`` is ``(prefix, add, add2)``; the layer's own return carries the
         block residual in a fourth slot that the reconstruction ignores, and
-        mono keeps that in ``blocks``.
+        mono keeps that in ``blocks``. That is the prefix feature; a draft that
+        taps something else through its own ``target_aux_capture_spec`` (the
+        DFlash draft's aggregate) is refused in ``config_refusal``.
         """
         if layer_id not in self.aux.layer_ids:
             return

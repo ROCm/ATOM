@@ -74,6 +74,7 @@ from atom.models.dspark_draft import (
     DSparkConfidenceHead,
     DSparkDraftModel,
     DSparkMarkovHead,
+    KVCacheBinding,
     linear_out,
 )
 from atom.models.minimax_m3.model import MiniMaxM3MLP
@@ -168,26 +169,6 @@ def _window_rows(
     out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
     start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
     torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
-
-
-class KVCacheBinding(nn.Module):
-    """What the draft KV pool binds one layer's cache onto, and nothing else.
-
-    ``DraftKvBuilder`` recognizes a non-MLA attention module by these
-    attributes and sets ``k_cache`` / ``v_cache`` (5-D SHUFFLE), the fp8
-    per-token scales and ``max_model_len`` on it; the layer then reads and
-    writes the cache itself.
-    """
-
-    base_attention = None
-    use_mla = False
-
-    def __init__(self, layer_num: int) -> None:
-        super().__init__()
-        self.layer_num = layer_num
-        self.max_model_len = 0
-        self.k_cache = self.v_cache = torch.tensor([])
-        self.k_scale = self.v_scale = None
 
 
 class M3DSparkAttention(nn.Module):

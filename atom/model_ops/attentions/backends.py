@@ -85,6 +85,8 @@ class AttentionBackend(ABC):
         target_block_size: int,
         layers: int,
         kv_dtype,
+        blocks_per_entry: int = 1,
+        per_tensor_scales: bool = False,
     ):
         """A pool of `layers` rows at this config's geometry.
 
@@ -93,6 +95,12 @@ class AttentionBackend(ABC):
         told rather than read: `layers` only the walk knows, and the block only
         the target builder, whose it is and not this backend's for the reason
         in `DraftKvBuilder.kv_pool`.
+
+        `blocks_per_entry` widens the ENTRY one block id addresses, which is
+        what a draft needs when the target it rides shards that id's span
+        across a DCP group; `per_tensor_scales` says the owner quantizes at one
+        scale for the whole cache, so no per-token plane is stored. Both are
+        the caller's for the same reason the block size is.
         """
         raise NotImplementedError
 
