@@ -17,7 +17,7 @@ boundary = pytest.importorskip(
 def test_unconstrained_step_does_not_touch_backend_or_logits():
     runner = SimpleNamespace(structured_output=Mock())
     batch = SimpleNamespace(required_channel=None)
-    assert boundary.TokenConstraints.apply(runner, batch, None, None, True) is None
+    assert boundary.TokenConstraints.apply(runner, batch, None, None) is None
     boundary.prepare_token_constraints(runner, batch, None)
     assert runner.structured_output.mock_calls == []
 
@@ -68,19 +68,17 @@ def test_masks_precede_sampling_and_commit_uses_final_ids(
     states = torch.tensor([3, 5])
     advance = Mock(return_value=states)
     monkeypatch.setattr(boundary, "advance_states", advance)
-    step = boundary.TokenConstraints.apply(runner, batch, logits, metadata, True)
+    step = boundary.TokenConstraints.apply(runner, batch, logits, metadata)
     assert events == ["grammar", "channel"]
     if speculative:
-        assert step.premask_lse is None
         # Channel constraints must not change the source used by verification logprobs.
         torch.testing.assert_close(logits[:, 6], raw[:, 6])
         assert torch.isneginf(step.target[:, 6:]).all()
     else:
-        torch.testing.assert_close(step.premask_lse, torch.logsumexp(raw[:2], dim=-1))
         assert step.logits.shape == (2, 8)
         torch.testing.assert_close(logits[2:, 6], raw[2:, 6])
     final_ids = torch.tensor([[1, 2], [3, -1]])
-    result = step.commit(final_ids, batch, deferred)
+    result = step.commit(final_ids, batch, deferred, step.failed(final_ids))
     assert result is states if deferred else result is None
     grammar.commit.assert_called_once()
     committed, committed_batch, committed_prefixes = grammar.commit.call_args.args
