@@ -30,10 +30,11 @@ def _get_aiter_fp8_gemm():
         from aiter.jit.utils.chip_info import get_gfx
     except ImportError:
         return None
-    # aiter's group32 FP8 path asserts gfx950; MI308 (gfx942) must use the
-    # local Triton GEMM below instead of calling into that stub.
+    # gfx942 has no aiter group32 MXFP8 path; keep the local BF16/Triton GEMM.
+    # Do not gate on ``!= gfx950``: gfx1250 stores group32 weights preshuffled
+    # and must still call into aiter, not the row-major local fallback.
     try:
-        if get_gfx() != "gfx950":
+        if str(get_gfx()).startswith("gfx942"):
             return None
     except RuntimeError:
         return None
@@ -135,13 +136,17 @@ def _e8m0_codes_to_float(scale: torch.Tensor) -> torch.Tensor:
 
 
 def _use_group32_bf16_fallback() -> bool:
-    """True off gfx950: no CDNA4 MXFP8 MFMA / aiter group32 path."""
+    """True on gfx942 only: no CDNA4 MXFP8 MFMA / aiter group32 path.
+
+    gfx1250 keeps aiter's preshuffled group32 GEMM; treating it like gfx942
+    would feed a row-major local kernel a shuffled weight.
+    """
     try:
         from aiter.jit.utils.chip_info import get_gfx
 
-        return get_gfx() != "gfx950"
+        return str(get_gfx()).startswith("gfx942")
     except (ImportError, RuntimeError):
-        return True
+        return False
 
 
 def _group32_bf16_gemm(
@@ -287,9 +292,7 @@ def native_quant_linear(
     k = stored_k * (2 if fp4 else 1)
     if k <= 0 or k % 32 or x.shape[-1] != k or n <= 0:
         raise ValueError("Invalid matrix dimensions for group32 GEMM")
-    if not fp4:
-        x, x_scale = _activations_for_ocp_group32(x, x_scale)
-    elif x_scale is None:
+    if fp4 and x_scale is None:
         x, x_scale = quantize_fp8(x)
     m = x.numel() // k
     if split_k is not None and (not isinstance(split_k, int) or split_k < 1):
@@ -306,6 +309,9 @@ def native_quant_linear(
             "no split_k and BF16 output"
         )
     if not fp4 and _aiter_fp8_gemm is not None:
+        # OCP re-encode is only required by aiter's MX kernel; the gfx942 BF16
+        # fallback below can consume FNUZ activations without this round-trip.
+        x, x_scale = _activations_for_ocp_group32(x, x_scale)
         batched = x.ndim > 2
         output = _aiter_fp8_gemm(
             x.view(m, k) if batched else x,
@@ -318,6 +324,18 @@ def native_quant_linear(
         )
         return output.view(*x.shape[:-1], n) if batched else output
 
+    if not fp4 and _use_group32_bf16_fallback():
+        return _group32_bf16_gemm(
+            x,
+            weight,
+            x_scale,
+            weight_scale,
+            weight_group_rows=weight_group_rows,
+            dtype=dtype,
+        )
+
+    if not fp4:
+        x, x_scale = _activations_for_ocp_group32(x, x_scale)
     if (
         x.dtype != torch.float8_e4m3fn
         or x_scale.dtype != torch.float8_e8m0fnu
@@ -336,15 +354,6 @@ def native_quant_linear(
             "GEMM operands must be contiguous on the same CUDA/ROCm device"
         )
     if not fp4:
-        if _use_group32_bf16_fallback():
-            return _group32_bf16_gemm(
-                x,
-                weight,
-                x_scale,
-                weight_scale,
-                weight_group_rows=weight_group_rows,
-                dtype=dtype,
-            )
         from .blockscale_kernels.fp8 import gemm_fp8_local
 
         return gemm_fp8_local(

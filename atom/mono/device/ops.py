@@ -490,6 +490,9 @@ def mfma_bf16(a, b, c):
     only ``v_mfma_f32_16x16x16_bf16``, so the same operand is two K=16
     fragments accumulated in order. The fragment layout matches aiter's
     gfx942 split of a v8bf16 K-step.
+
+    Callers: ``atom.mono.device.gemv`` and DSA indexer kernels that import
+    this helper for portable bf16 MFMA across CDNA3/4.
     """
     if _has_bf16_mfma_k32():
         return fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))

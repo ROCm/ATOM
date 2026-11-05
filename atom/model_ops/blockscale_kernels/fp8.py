@@ -5,8 +5,6 @@ Keep the original packed-K and split-K launch policy as a compatibility path.
 The preferred AITER backend owns subsequent tuning and configuration dispatch.
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
@@ -422,7 +420,7 @@ def blockscale_gemm_fp8_bf16_dequant_kernel(
     bs_row = col // B_GROUP_N
 
     acc = tl.zeros((BM, BN), tl.float32)
-    for g in range(0, groups):
+    for g in range(groups):
         offs = g * 32 + ks
         a = tl.load(
             A + row[:, None] * K + offs[None, :], rows & (offs[None, :] < K), other=0.0
@@ -475,7 +473,7 @@ def blockscale_batched_gemm_fp8_bf16_dequant_kernel(
     C_b = C + batch * stride_cg
 
     acc = tl.zeros((BM, BN), tl.float32)
-    for g in range(0, groups):
+    for g in range(groups):
         offs = g * 32 + ks
         a = tl.load(
             A_b + row[:, None] * K + offs[None, :],
@@ -553,6 +551,7 @@ def gemm_fp8_bf16_dequant(
     dtype: torch.dtype,
     weight_group_rows: int,
     cu_num: int,
+    weight_bf16: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """In-kernel e8m0 dequant + BF16 GEMM for arches without MXFP8 MFMA."""
     n, k = weight.shape
@@ -562,8 +561,13 @@ def gemm_fp8_bf16_dequant(
         return output
     # hipBLAS wins the decode-width regime; Triton pays for the weight traffic
     # once M is large enough that the MFMA path amortizes.
-    # Prefer a weight-side BF16 cache when present (filled once on gfx942 load).
-    cached = getattr(weight, "_atom_group32_bf16_cache", None)
+    # Prefer an explicit BF16 view (avoids setattr on a weight slice under
+    # torch.compile) or the cache hung on the parameter at load.
+    cached = (
+        weight_bf16
+        if weight_bf16 is not None
+        else getattr(weight, "_atom_group32_bf16_cache", None)
+    )
     if cached is not None:
         # Decode is a handful of rows: the cast/mul/cast chain is more kernels
         # than math. One dequant kernel plus hipBLAS. Prefill keeps the bulk
@@ -579,7 +583,9 @@ def gemm_fp8_bf16_dequant(
     # Triton BF16-dequant GEMM is wired above for follow-up tuning; the host
     # path is the correctness baseline on gfx942 until that kernel matches
     # hipBLAS across the prefill M range.
-    use_triton = os.environ.get("ATOM_GFX942_GROUP32_TRITON", "0") == "1"
+    from atom.utils import envs
+
+    use_triton = envs.ATOM_GFX942_GROUP32_TRITON
     if use_triton and m > 16:
         bm, bn, warps, stages = _select_fp8_bf16_tile(m, n, k, cu_num)
         blockscale_gemm_fp8_bf16_dequant_kernel[(-(-m // bm), -(-n // bn))](
@@ -632,9 +638,7 @@ def gemm_fp8_bf16_dequant_batched(
     if m == 0 or g == 0:
         return out
     bm, bn, warps, stages = _select_fp8_bf16_tile(m, n, k, cu_num)
-    blockscale_batched_gemm_fp8_bf16_dequant_kernel[
-        (g, -(-m // bm), -(-n // bn))
-    ](
+    blockscale_batched_gemm_fp8_bf16_dequant_kernel[(g, -(-m // bm), -(-n // bn))](
         x,
         weight,
         x_scale.view(torch.uint8),
