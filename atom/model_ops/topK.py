@@ -9,6 +9,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
+from atom.model_ops.triton_topk_softmax import triton_topk_softmax
 from atom.model_ops.utils import _has_module
 from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
 from atom.utils import envs
@@ -290,8 +291,6 @@ def rocm_aiter_topk_softmax_impl(
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
     if triton_max_rows is not None and token <= triton_max_rows:
-        from atom.model_ops.triton_topk_softmax import triton_topk_softmax
-
         triton_topk_softmax(
             topk_weights,
             topk_ids,

@@ -11,10 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-try:
-    from triton.language.extra.hip import libdevice
-except ImportError:
-    libdevice = None
+from triton.language.extra.hip import libdevice
 
 
 @triton.jit
@@ -60,7 +57,7 @@ def _topk_softmax_kernel(
         v = (hi ^ ((hi >> 31) & 0x7FFFFFFF)).to(tl.float32, bitcast=True)
         if k == 0:
             row_max = v
-        e = tl.exp(v - row_max)
+        e = libdevice.exp(v - row_max)
         wv = tl.where(kk == k, e, wv)
         iv = tl.where(kk == k, idx, iv)
         total += e
@@ -68,7 +65,7 @@ def _topk_softmax_kernel(
     if RENORMALIZE:
         wv = wv * (1.0 / total)
     else:
-        ex = tl.exp(x - row_max)
+        ex = libdevice.exp(x - row_max)
         full_denom = tl.sum(tl.where(nan, 0.0, ex), axis=0)
         wv = wv * (1.0 / full_denom)
     if HAS_NUM_VALID_ROWS:
@@ -80,7 +77,7 @@ def _topk_softmax_kernel(
     if NSH > 0:
         sh = tl.arange(0, NSH)
         lg = tl.load(logits_ptr + row * stride_l + E + sh).to(tl.float32)
-        tl.store(w_ptr + row * stride_w + K + sh, 1.0 / (1.0 + tl.exp(-lg)))
+        tl.store(w_ptr + row * stride_w + K + sh, 1.0 / (1.0 + libdevice.exp(-lg)))
 
 
 def triton_topk_softmax(
