@@ -956,6 +956,18 @@ def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
     return False
 
 
+def dense_kv_dtype(config) -> str:
+    """The KV dtype of the pages that are not MXFP4, from the one user flag
+    ``kv_cache_dtype``. On MiniMax-M3 ``fp4`` makes only the indexed sparse
+    layers' pages MXFP4; dense / sliding layers (and a draft's) keep fp8 pages,
+    since no dense FP4 page layout or writer exists. Other models: unchanged."""
+    if _is_minimax_m3_config(getattr(config, "hf_config", None)):
+        from atom.models.minimax_m3.config import dense_kv_cache_dtype
+
+        return dense_kv_cache_dtype(config.kv_cache_dtype)
+    return config.kv_cache_dtype
+
+
 _MINIMAX_M3_MLP_LAYER_TYPES = {"dense": 0, "sparse": 1}
 
 
@@ -2578,7 +2590,6 @@ class Config:
                 self.torch_profiler_dir
             ), f"torch_profiler_dir {self.torch_profiler_dir} is not a valid directory"
 
-        is_deepseek_v41 = self.hf_config.model_type == "deepseek_v41_text"
         # only for server mode or plugin mode(vllm)
         # for torch compile policy, plugin mode(vllm) uses the ATOM compile policy
         # for cuda graph capture, plugin mode(vllm) uses the vLLM's cuda graph capture policy
@@ -2592,7 +2603,9 @@ class Config:
             # splitting_ops/sizes still configure the level-3 backend.
             if self.compilation_config.cudagraph_mode is None:
                 self.compilation_config.cudagraph_mode = (
-                    CUDAGraphMode.FULL if is_deepseek_v41 else CUDAGraphMode.TR_HYBRID
+                    CUDAGraphMode.FULL
+                    if self.hf_config.model_type == "deepseek_v41_text"
+                    else CUDAGraphMode.TR_HYBRID
                 )
             self.compilation_config.init_with_cudagraph_sizes()
 
@@ -2704,7 +2717,11 @@ class Config:
         # MXFP4 gate cannot disagree with them on an export that names itself
         # only in `text_config` or `model_type`.
         is_m3 = _is_minimax_m3_config(self.hf_config)
-        _check_fp4_kv(self.kv_cache_dtype, is_m3=is_m3, is_v41=is_deepseek_v41)
+        _check_fp4_kv(
+            self.kv_cache_dtype,
+            is_m3=is_m3,
+            is_v41=self.hf_config.model_type == "deepseek_v41_text",
+        )
         if is_deepseek_v4:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
@@ -2761,9 +2778,6 @@ class Config:
                         "override."
                     )
 
-        text_cfg = getattr(self.hf_config, "text_config", self.hf_config)
-        sparse_cfg = getattr(text_cfg, "sparse_attention_config", None) or {}
-
         # MiniMax-M3 indexer-only context parallelism. Off by default: it trades
         # a fixed per-layer all-to-all for a large long-context score win, so it
         # is a loss below roughly batch*context ~ 1M tokens. Warn and fall back
@@ -2772,6 +2786,8 @@ class Config:
         if envs.ATOM_M3_INDEXER_CP is not None:
             self.dcp_config.indexer_dcp_only = envs.ATOM_M3_INDEXER_CP == "1"
         if self.dcp_config.indexer_dcp_only:
+            text_cfg = getattr(self.hf_config, "text_config", self.hf_config)
+            sparse_cfg = getattr(text_cfg, "sparse_attention_config", None) or {}
             indexer_cp_off = indexer_cp_unsupported_reason(
                 arches,
                 self.tensor_parallel_size,
@@ -2822,13 +2838,13 @@ class Config:
                 # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
             else:
-                self.index_cache_dtype = self.kv_storage_dtype
+                self.index_cache_dtype = dense_kv_dtype(self)
         if is_m3:
             from atom.models.minimax_m3.config import validate_runtime_config
 
             validate_runtime_config(self)
 
-        if is_deepseek_v41:
+        if self.hf_config.model_type == "deepseek_v41_text":
             # CSA2's index plane is paged by the same scorer GLM's is, so a
             # PAGE again has to hold a whole number of `MQA_LOGITS_PRESHUFFLE_ROWS`
             # tiles -- and its ratio-2 owners halve the PAGE before that count
@@ -2860,25 +2876,14 @@ class Config:
         """A shallow copy for a draft model built from its own ``hf_config``:
         uncompiled, and with the KV dtype of the layers that are not MXFP4 -- a
         draft has no MXFP4 layers (and its own architecture is not the target's, so
-        `kv_storage_dtype` could not tell). Shallow rather than deep: MLA targets
+        `dense_kv_dtype` could not tell). Shallow rather than deep: MLA targets
         hold non-picklable cuda.Stream objects in fields a deepcopy cannot walk."""
         draft = copy.copy(self)
-        draft.kv_cache_dtype = self.kv_storage_dtype
+        draft.kv_cache_dtype = dense_kv_dtype(self)
         draft.hf_config = hf_config
         draft.compilation_config = copy.copy(self.compilation_config)
         draft.compilation_config.level = CompilationLevel.NO_COMPILATION
         return draft
-
-    @property
-    def kv_storage_dtype(self) -> str:
-        """The dtype of the KV pages that are not MXFP4. On MiniMax-M3,
-        ``--kv-cache-dtype fp4`` makes only the indexed sparse layers' pages MXFP4;
-        the dense layers (and a draft's) keep fp8."""
-        if _is_minimax_m3_config(self.hf_config):
-            from atom.models.minimax_m3.config import dense_kv_cache_dtype
-
-            return dense_kv_cache_dtype(self.kv_cache_dtype)
-        return self.kv_cache_dtype
 
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.

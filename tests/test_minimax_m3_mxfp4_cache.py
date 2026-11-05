@@ -17,7 +17,7 @@ import torch
 from transformers import PretrainedConfig
 
 from atom import config as config_module
-from atom.config import CompilationConfig, Config, _check_fp4_kv
+from atom.config import CompilationConfig, Config, _check_fp4_kv, dense_kv_dtype
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.minimax_m3.mxfp4_pages import (
     PAGE_BYTES,
@@ -222,10 +222,21 @@ def test_m3_fp4_keeps_the_kv_and_defaults_the_index_to_its_storage(
     assert (config.kv_cache_dtype, config.index_cache_dtype) == want
 
 
-def test_the_storage_dtype_is_fp8_only_for_an_m3_fp4_kv(monkeypatch):
-    assert _m3(monkeypatch, kv_cache_dtype="fp4").kv_storage_dtype == "fp8"
-    assert _m3(monkeypatch, kv_cache_dtype="bf16").kv_storage_dtype == "bf16"
-    assert _m3(monkeypatch, kv_cache_dtype="fp8").kv_storage_dtype == "fp8"
+def test_the_dense_kv_dtype_is_fp8_only_for_an_m3_fp4_kv(monkeypatch):
+    assert dense_kv_dtype(_m3(monkeypatch, kv_cache_dtype="fp4")) == "fp8"
+    assert dense_kv_dtype(_m3(monkeypatch, kv_cache_dtype="bf16")) == "bf16"
+    assert dense_kv_dtype(_m3(monkeypatch, kv_cache_dtype="fp8")) == "fp8"
+    assert not hasattr(Config, "kv_storage_dtype")
+
+
+def test_the_dense_kv_dtype_leaves_other_models_and_bare_configs_alone():
+    other = types.SimpleNamespace(
+        hf_config=PretrainedConfig(architectures=["LlamaForCausalLM"]),
+        kv_cache_dtype="fp4",
+    )
+    assert dense_kv_dtype(other) == "fp4"  # e.g. DeepSeek-V4.1's own FP4 KV
+    # a plugin-style config object without hf_config must not raise
+    assert dense_kv_dtype(types.SimpleNamespace(kv_cache_dtype="fp8")) == "fp8"
 
 
 def test_m3_fp4_keeps_the_m3_startup_refusals(monkeypatch):
@@ -283,7 +294,7 @@ def test_a_draft_of_an_mxfp4_target_gets_the_fp8_storage_dtype(monkeypatch, draf
     level = target.compilation_config.level
     draft = target.draft_config(PretrainedConfig(architectures=[draft_arch]))
 
-    assert (draft.kv_cache_dtype, draft.kv_storage_dtype) == ("fp8", "fp8")
+    assert draft.kv_cache_dtype == dense_kv_dtype(draft) == "fp8"
     assert (
         draft.compilation_config.level == config_module.CompilationLevel.NO_COMPILATION
     )

@@ -53,7 +53,6 @@ def make_impl(kv_mxfp4: bool, index_cache_dtype: str):
     impl.skip_index_topk = False
     impl.kv_cache_dtype = "fp4" if kv_mxfp4 else "fp8"
     impl.index_cache_dtype = index_cache_dtype
-    impl.kv_nvfp4, impl.kv_mxfp4 = False, kv_mxfp4
     impl.index_scale = impl.index_stage = impl.index_stage_slots = None
     impl.kv_stage = impl.kv_stage_slots = None
     impl._index_q = impl._index_q_cache_key_info = None

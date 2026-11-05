@@ -660,6 +660,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     from aiter import dtypes
     from lmcache.v1.metadata import LMCacheMetadata
 
+    from atom.config import dense_kv_dtype
     from atom.models.utils import get_pp_indices
 
     hf = config.hf_config
@@ -691,9 +692,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     worker_id = _strict_integer("LMCache worker id", worker_id)
     if worker_id >= world_size:
         raise ValueError("LMCache worker id must be within the world")
-    kv_dtype = dtypes.d_dtypes[
-        getattr(config, "kv_storage_dtype", config.kv_cache_dtype)
-    ]
+    kv_dtype = dtypes.d_dtypes[dense_kv_dtype(config)]
     model_name = build_page_namespace(config, cfg, world_size)
 
     # MLA (DeepSeek R1/V3, Kimi) stores a single replicated per-layer latent

@@ -6,6 +6,7 @@ import triton.language as tl
 from torch import nn
 from torch.profiler import record_function
 
+from atom.config import dense_kv_dtype
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
@@ -464,7 +465,7 @@ class DSparkProposer(Drafter):
 
         # d_dtypes maps the "auto" cache dtype to None, and torch.empty would
         # silently read that as float32 rather than the model dtype.
-        from_config = dtypes.d_dtypes.get(self.config.kv_storage_dtype) or self.dtype
+        from_config = dtypes.d_dtypes.get(dense_kv_dtype(self.config)) or self.dtype
 
         bound = self._bound_draft_k_cache(forward_context)
         if bound is None:
@@ -483,7 +484,7 @@ class DSparkProposer(Drafter):
                 "resolved to a draft row and not to a target layer.",
                 layer_num,
                 bound.dtype,
-                self.config.kv_storage_dtype,
+                dense_kv_dtype(self.config),
                 from_config,
                 layer_num,
             )

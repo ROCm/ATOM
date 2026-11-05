@@ -87,9 +87,7 @@ def mha_kv_scale_fields(
 class KvLayout(Protocol):
     """How one entry's K and V are declared and read: the pool names no model, a
     backend passes in the layout its layers use. Hashable, so a row space can be
-    keyed by it; `tag` is how that row space is named wherever one is logged."""
-
-    tag: str
+    keyed by it."""
 
     def check(self, block_size: int, head_dim: int, blocks_per_entry: int) -> None:
         """Refuse a geometry this layout cannot hold."""
@@ -116,7 +114,6 @@ class ShuffleLayout:
     layers uses."""
 
     kv_dtype: torch.dtype
-    tag: str = ""
 
     @property
     def x(self) -> int:
@@ -205,7 +202,6 @@ class MhaKvPool:
         self.layout.check(block_size, head_dim, blocks_per_entry)
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.kv_dtype = kv_dtype
         # Every field is priced per entry, and an entry is `blocks_per_entry`
         # blocks. Charging per block instead would multiply `entry_bytes_for`'s
         # 256 B field alignment by the same factor -- 9% of the pool at 8

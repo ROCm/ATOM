@@ -1318,7 +1318,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # directly together with an fp8 main q. `--index-cache-dtype fp4` makes
         # index_cache uint8 [pages, 8704] the same way. Fixed here: every layer of
         # this impl is an indexed sparse one, which is what the flag makes MXFP4.
-        self.kv_mxfp4: bool = kv_cache_dtype == "fp4"
         # Optional shared dict bound by the metadata builder. It is scoped to the
         # current sparse metadata object and carries the last full layer top-k.
         self.index_topk_cache_state: dict | None = None
@@ -1336,7 +1335,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         ``[q | k | v | index_q | index_k]``. Writes:
           * normed+roped main K/V          -> the K/V cache: SHUFFLE (asm_layout=True),
                                               or one MXFP4 page per (page, kv head)
-                                              under ``kv_mxfp4``
+                                              under ``kv_cache_dtype == "fp4"``
           * normed+roped index_k           -> index_cache (page-128, or MXFP4 pages)
           * fp8 per-token dequant scales   -> k_scale / v_scale (fp8 SHUFFLE only;
                                               MXFP4 pages carry their own e8m0 scales)
@@ -1352,19 +1351,19 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         kv_cache_data = fwd_ctx.kv_cache_data
 
         # The KV cache is bound by the STANDARD MHA path (same allocation as every
-        # other MHA model): page-128 SHUFFLE views, unless `kv_mxfp4` (below)
+        # other MHA model): page-128 SHUFFLE views, unless `kv_cache_dtype` is fp4 (below)
         #   K: [N, nkv, hd//x, 128, x]   V: [N, nkv, 128//x, hd, x]
         #   scale (fp8): [N, nkv, 128]
         # The M3 paged kernels index this storage as page-16 SHUFFLE: each
         # logical 128-block is 8 contiguous physical 16-pages. 128 == 8*16, so the
         # page-16 view is a pure zero-copy reinterpretation of the page-128 view.
         # We re-view here (at attention time) instead of at bind time. Under
-        # `kv_mxfp4` the pool's pages are [N, nkv, 8704] uint8 (data + e8m0 scales,
+        # `kv_cache_dtype` fp4 the pool's pages are [N, nkv, 8704] uint8 (data + e8m0 scales,
         # no scale planes) and are used as they are.
         from atom.model_ops.minimax_m3.sparse_attn import to_page16_shuffle
 
         layer = kv_cache_data[f"layer_{self.layer_num}"]
-        if self.kv_mxfp4:
+        if self.kv_cache_dtype == "fp4":
             k_cache, v_cache, k_scale, v_scale = (
                 layer.k_cache,
                 layer.v_cache,
@@ -1409,7 +1408,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if fused_index_cache_dtype == "fp4":  # the AITER writer's name for it
             fused_index_cache_dtype = "mxfp4"
 
-        if self.kv_mxfp4:
+        if self.kv_cache_dtype == "fp4":
             from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_TOKENS
 
             fused_kv_block_size = PAGE_TOKENS
@@ -1423,7 +1422,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             torch.float8_e4m3fn if self.index_cache_dtype == "fp4" else qkv.dtype
         )
 
-        if self.skip_index_topk and not self.kv_mxfp4:
+        if self.skip_index_topk and self.kv_cache_dtype != "fp4":
             from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
                 triton_fused_norm_rope_cache,
             )
@@ -1463,7 +1462,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # as is, scale 1.0) and no bf16 copy of it, nor write it back into qkv.
         q_out = torch.empty(
             (num_tokens, self.num_heads * self.head_dim),
-            dtype=torch.float8_e4m3fn if self.kv_mxfp4 else qkv.dtype,
+            dtype=torch.float8_e4m3fn if self.kv_cache_dtype == "fp4" else qkv.dtype,
             device=qkv.device,
         )
         index_q = None
@@ -1498,7 +1497,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             index_cache_dtype=fused_index_cache_dtype,
             k_scale=fused_k_scale,
             v_scale=fused_v_scale,
-            asm_layout=not self.kv_mxfp4,
+            asm_layout=self.kv_cache_dtype != "fp4",
             skip_index_branch=self.skip_index_topk,
         )
 
@@ -1623,7 +1622,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         of one page-128 page a block for the MXFP4 KV, the MXFP4 scorer (and, on
         decode, the step's work map and scores) for the MXFP4 index."""
         kw = {}
-        if self.kv_mxfp4:
+        if self.kv_cache_dtype == "fp4":
             kw.update(pages_per_block=1, block_page_stride=1)
         if self.index_cache_dtype == "fp4":
             kw["index_mxfp4"] = True
@@ -1691,7 +1690,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
-        if self.kv_mxfp4:
+        if self.kv_cache_dtype == "fp4":
             from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
 
             # plan-free: a prefill chunk's row count is new almost every forward
@@ -1853,7 +1852,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
-        if self.kv_mxfp4:
+        if self.kv_cache_dtype == "fp4":
             from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
 
             output = sparse_pa_mxfp4(

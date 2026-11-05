@@ -1,7 +1,7 @@
 import logging
 from functools import partial
 
-from atom.config import KVCacheTensor
+from atom.config import KVCacheTensor, dense_kv_dtype
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec, page_pool
 
@@ -35,7 +35,7 @@ def draft_kv_builder(model_runner, draft_hf):
         backend.make_kv_pool,
         draft_hf,
         world_size=model_runner.world_size,
-        kv_dtype=dtypes.d_dtypes[model_runner.config.kv_storage_dtype],
+        kv_dtype=dtypes.d_dtypes[dense_kv_dtype(model_runner.config)],
     )
     # A way to build it, not the pool: how many rows it has is the walk's to
     # say, and this runs from the proposer's `__init__` -- `build_drafter`
@@ -175,7 +175,7 @@ class DraftKvBuilder(PoolRowsMixin):
         idx = self.pool_rows[DRAFT_KV_ROWS][module]
         k_cache, v_cache = self.kv_pool.kv_views(idx)
         module.max_model_len = runner.config.max_model_len
-        if runner.config.kv_storage_dtype == "fp8":
+        if dense_kv_dtype(runner.config) == "fp8":
             module.k_scale, module.v_scale = self.kv_pool.scale_views(idx)
         module.k_cache = k_cache
         module.v_cache = v_cache
