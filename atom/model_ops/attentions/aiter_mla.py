@@ -1077,7 +1077,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "sparse_mtp_reduce_final_map": reduce_final_map,
             "sparse_mtp_reduce_partial_map": reduce_partial_map,
             # Rows the plan addresses; every consumer's q / o must hold at
-            # least this many (checked in MLAAttention._forward_decode).
+            # least this many. MLAAttention._forward_decode asserts it without
+            # DCP, on eager steps and at capture (a host check: not on replay).
             "sparse_mtp_num_tokens": num_tokens,
         }
 
