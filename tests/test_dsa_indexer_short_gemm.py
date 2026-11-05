@@ -4,12 +4,14 @@
 
 from dataclasses import replace
 from functools import lru_cache
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 pytest.importorskip("flydsl")
 
+from atom.mono.dsa_indexer import bind
 from atom.mono.dsa_indexer.bind import pack_short_q
 from atom.mono.dsa_indexer.kernel import ABI, IxBuild, scratch_layout, unfit
 from atom.mono.dsa_indexer.plan import IndexerShape
@@ -20,7 +22,7 @@ def key(rows=96, context=163840):
     return IxBuild(shape, rows, 8, context, True, qlen=6, short_gemm=True)
 
 
-@pytest.mark.parametrize("rank", [1024, 2048])
+@pytest.mark.parametrize("rank", [1024, 1536, 2048])
 def test_packed_q_preserves_every_checkpoint_bit(rank):
     weight = (
         (torch.arange(4096 * rank, dtype=torch.int32) % 251)
@@ -53,10 +55,44 @@ def test_short_gemm_refuses_other_execution_layouts(changes):
     assert unfit(replace(key(), **changes))
 
 
-def test_short_gemm_requires_a_supported_projection_shape():
-    assert not unfit(key())
-    assert unfit(replace(key(), shape=replace(key().shape, q_lora=1536)))
+@pytest.mark.parametrize("rank", [1024, 1536, 2048])
+def test_short_gemm_requires_a_supported_projection_shape(rank):
+    assert not unfit(replace(key(), shape=replace(key().shape, q_lora=rank)))
+    assert unfit(replace(key(), shape=replace(key().shape, q_lora=1280)))
     assert "w_qb_packed" in ABI.names
+
+
+@pytest.mark.parametrize("cache", ["fp8", "fp4"])
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_k3_1_pro_binding_packs_nope_q_only_for_replicated_short_path(
+    monkeypatch, cache, dcp
+):
+    shape = replace(
+        key().shape,
+        q_lora=1536,
+        rope_dim=0,
+        kv_dtype=cache,
+        block_rows=64 if cache == "fp4" else 128,
+        cache_layout="mfma" if cache == "fp4" else "preshuffle",
+    )
+    module = SimpleNamespace(
+        wq_b=SimpleNamespace(weight=torch.zeros(4096, 1536, dtype=torch.bfloat16))
+    )
+    cfg = SimpleNamespace(
+        decode_context_parallel_size=dcp,
+        kv_cache_block_size=shape.block_rows,
+        max_model_len=163840,
+    )
+    monkeypatch.setattr(bind, "indexer_modules", lambda inner: {3: module})
+    monkeypatch.setattr(bind, "get_current_atom_config", lambda: cfg)
+    monkeypatch.setattr(bind, "_refusal", lambda *args: "")
+    monkeypatch.setattr(bind, "shape_of", lambda *args: shape)
+    monkeypatch.setattr(bind.kix, "dual_score_device", lambda device: True)
+    binding = bind.bind_indexers(None, 8, 0)
+    assert binding.short_gemm == (dcp == 1)
+    assert hasattr(module, "_mono_indexer_wq_packed") == (dcp == 1)
+    for rows in (6, 48, 96, 144, 192, 240, 252):
+        assert not unfit(binding.key(rows, 6))
 
 
 @pytest.mark.parametrize("batch", range(8, 43))

@@ -238,7 +238,7 @@ def bind_indexers(inner, tp: int, rank: int) -> IndexerBinding | None:
         and cfg.max_model_len <= kix.isel.SPLIT_MIN
         and shape.heads == 32
         and shape.head_dim == 128
-        and shape.q_lora in (1024, 2048)
+        and shape.q_lora in (1024, 1536, 2048)
         and kix.dual_score_device(device)
     )
     if short_gemm:
