@@ -20,11 +20,13 @@ Given `chat_settings`, each worker can also prepare whole chat completions
 import array
 import asyncio
 import concurrent.futures
+import itertools
 import logging
 import multiprocessing
 import os
 import threading
 import time
+import zlib
 
 logger = logging.getLogger("atom")
 
@@ -70,25 +72,50 @@ class TokenizePool:
         processes: int,
         reference,
         chat_settings=None,
+        affinity: bool = False,
     ):
         # `chat_settings` (`chat_offload.ChatPrepareSettings`): also build the
         # state `chat_offload.prepare_chat_in_worker` renders prompts with.
-        self._pool = concurrent.futures.ProcessPoolExecutor(
-            max_workers=processes,
-            mp_context=multiprocessing.get_context("spawn"),
-            initializer=_init_worker,
-            initargs=(model, trust_remote_code, os.getpid(), chat_settings),
+        # `affinity`: one single-process executor a worker, so `run(key=...)`
+        # can send a session's every request to the same worker (whose
+        # per-process caches then hold that session); otherwise one shared pool.
+        def executor(workers: int):
+            return concurrent.futures.ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_init_worker,
+                initargs=(model, trust_remote_code, os.getpid(), chat_settings),
+            )
+
+        self._pools = (
+            [executor(1) for _ in range(processes)]
+            if affinity
+            else [executor(processes)]
         )
+        self._pool = self._pools[0]
+        self._next = itertools.count()
         self._reference = reference
         self._verify_left = _VERIFY_FIRST
         self.enabled = True
         # Start every worker (a tokenizer load each) now, not on the first requests.
-        list(self._pool.map(_encode, ["warm up"] * processes))
+        if affinity:
+            for f in [p.submit(_encode, "warm up") for p in self._pools]:
+                f.result()
+        else:
+            list(self._pool.map(_encode, ["warm up"] * processes))
+
+    def _executor(self, key=None):
+        if len(self._pools) == 1:
+            return self._pool
+        if key is None:
+            return self._pools[next(self._next) % len(self._pools)]
+        # zlib.crc32, not hash(): stable across runs, so a rerun routes alike.
+        return self._pools[zlib.crc32(str(key).encode()) % len(self._pools)]
 
     async def encode(self, prompt: str) -> array.array:
         loop = asyncio.get_running_loop()
         ids = array.array("i")
-        ids.frombytes(await loop.run_in_executor(self._pool, _encode, prompt))
+        ids.frombytes(await loop.run_in_executor(self._executor(), _encode, prompt))
         if self._verify_left > 0:
             self._verify_left -= 1
             ref = await loop.run_in_executor(None, self._reference.encode, prompt)
@@ -101,9 +128,14 @@ class TokenizePool:
                 return array.array("i", ref)
         return ids
 
-    async def run(self, fn, *args):
-        """`fn(*args)` in a worker process; `fn` must be a module-level function."""
-        return await asyncio.get_running_loop().run_in_executor(self._pool, fn, *args)
+    async def run(self, fn, *args, key=None):
+        """`fn(*args)` in a worker process; `fn` must be a module-level function.
+        With affinity, `key` (e.g. a session id) picks the worker: equal keys,
+        the same worker."""
+        return await asyncio.get_running_loop().run_in_executor(
+            self._executor(key), fn, *args
+        )
 
     def shutdown(self) -> None:
-        self._pool.shutdown(wait=False, cancel_futures=True)
+        for p in self._pools:
+            p.shutdown(wait=False, cancel_futures=True)

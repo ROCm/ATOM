@@ -40,6 +40,7 @@ from typing import Any, NamedTuple
 from atom.entrypoints.chat_utils import has_multimodal_content
 from atom.model_engine.prefix_block_hashes import PrefixBlockHashes
 from atom.model_engine.prefix_hash import chained_block_hashes
+from atom.utils import envs
 
 from .chat_encoders import (
     PROBE_MESSAGES,
@@ -93,6 +94,7 @@ def prepare_chat(
     tokenizer: Any,
     custom_encoder: Any,
     settings: ChatPrepareSettings,
+    encode: Callable[[str], Any] | None = None,
 ) -> PreparedChat | None:
     """What `/v1/chat/completions` does with ``body`` before the engine request.
 
@@ -123,7 +125,9 @@ def prepare_chat(
             tools=request.tools,
             **template_kwargs,
         )
-        prompt_ids = array.array("i", tokenizer.encode(prompt))
+        # `encode`: the worker's `SegmentTokenizer.encode` (the same ids as
+        # `tokenizer.encode`, reusing the session's earlier turns), if any.
+        prompt_ids = array.array("i", (encode or tokenizer.encode)(prompt))
     except Exception:  # noqa: BLE001  # the in-process path answers it
         return None
     block_hashes = None
@@ -155,6 +159,10 @@ def prepare_chat(
 # ---- worker side ----
 
 _worker_state: tuple[Any, Any, ChatPrepareSettings] | None = None
+# ATOM_API_OFFLOAD_TOKENIZE_CACHE_MB: this worker's prompt-tokenization cache.
+# The pool sends a session's requests to one worker, so the cache holds that
+# session's earlier prompts and a new turn encodes only what it added.
+_worker_segment_tokenizer: Any = None
 
 
 def init_chat_worker(tokenizer: Any, model: str, settings: ChatPrepareSettings):
@@ -164,6 +172,16 @@ def init_chat_worker(tokenizer: Any, model: str, settings: ChatPrepareSettings):
         tokenizer.chat_template = settings.chat_template
     custom_encoder = load_custom_message_encoder(model)
     _worker_state = (tokenizer, custom_encoder, settings)
+    global _worker_segment_tokenizer
+    budget_mb = envs.ATOM_API_OFFLOAD_TOKENIZE_CACHE_MB
+    if budget_mb > 0:
+        from atom.model_engine.segment_tokenizer import SegmentTokenizer
+
+        _worker_segment_tokenizer = SegmentTokenizer.maybe_create(
+            tokenizer,
+            budget_mb << 20,
+            per_segment_normalizer=envs.ATOM_TOKENIZE_CACHE_PER_SEGMENT_NORMALIZER,
+        )
     # Compile the template now rather than on the worker's first request.
     try:
         apply_chat_template(
@@ -178,7 +196,14 @@ def init_chat_worker(tokenizer: Any, model: str, settings: ChatPrepareSettings):
 
 def prepare_chat_in_worker(body: bytes) -> PreparedChat | None:
     tokenizer, custom_encoder, settings = _worker_state
-    return prepare_chat(body, tokenizer, custom_encoder, settings)
+    seg = _worker_segment_tokenizer
+    return prepare_chat(
+        body,
+        tokenizer,
+        custom_encoder,
+        settings,
+        encode=seg.encode if seg is not None else None,
+    )
 
 
 # ---- server side ----
@@ -234,9 +259,11 @@ class ChatOffload:
         # The workers' tokenizer failing its own check rules this out too.
         return self._on and self._pool.enabled
 
-    async def prepare(self, body: bytes) -> PreparedChat | None:
+    async def prepare(self, body: bytes, key: Any = None) -> PreparedChat | None:
+        """`key`: the request's session id, which picks the worker when the pool
+        routes by session (ATOM_API_OFFLOAD_TOKENIZE_CACHE_MB)."""
         try:
-            prepared = await self._pool.run(prepare_chat_in_worker, body)
+            prepared = await self._pool.run(prepare_chat_in_worker, body, key=key)
         except Exception:
             logger.warning(
                 "chat offload: a tokenize worker failed; preparing chat "
