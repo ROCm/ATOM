@@ -1207,7 +1207,6 @@ class ModelRunner:
                 del self.model
             if hasattr(self, "drafter"):
                 del self.drafter
-            RoutedExpertsCapturer.reset(owner=self)
             self._routed_experts_capturer = None
             self._held_routes = []
             self._deferred_routes = None
@@ -2368,8 +2367,7 @@ class ModelRunner:
     def _routed_experts_geometry(self) -> tuple[int, int] | None:
         """``(num_layers, top_k)`` for the capture buffer, or None if unused.
 
-        Assigns ``moe_capture_layer_id`` on each FusedMoE. Cached so pool
-        planning and capturer init share one walk.
+        Cached so every pool plan sizes the buffer from one walk.
         """
         if hasattr(self, "_routed_experts_geo"):
             return self._routed_experts_geo
@@ -2378,8 +2376,8 @@ class ModelRunner:
             return None
         if not hasattr(self, "model"):
             return None
-        moes: list = fused_moe_modules(self.model)
-        if not moes:
+        layers = self._routed_experts_layers()
+        if not layers:
             raise ValueError(
                 "enable_return_routed_experts requires at least one FusedMoE "
                 "module; this model has none (dense checkpoints cannot "
@@ -2399,19 +2397,14 @@ class ModelRunner:
                 "idle DP rank run a dummy prefill on physical block 0, whose "
                 "captures overwrite the routes a real request reads there"
             )
-        # The exported layer axis is the decoder's, dense layers included, so a
-        # consumer indexes it by decoder layer.
         num_layers = int(self.hf_text_config.num_hidden_layers)
-        layer_ids: list[int] = []
-        for moe in moes:
-            idx = extract_layer_index(moe.prefix)
+        layer_ids = [idx for _, idx in layers]
+        for moe, idx in layers:
             if not 0 <= idx < num_layers:
                 raise ValueError(
                     f"FusedMoE {moe.prefix!r} resolves to layer {idx}, outside the "
                     f"model's {num_layers} decoder layers"
                 )
-            moe.moe_capture_layer_id = idx
-            layer_ids.append(idx)
         if len(set(layer_ids)) != len(layer_ids):
             dup = sorted({i for i in layer_ids if layer_ids.count(i) > 1})
             raise ValueError(
@@ -2420,25 +2413,41 @@ class ModelRunner:
             )
         self._routed_experts_geo = (
             num_layers,
-            max(int(m.top_k) for m in moes),
+            max(int(moe.top_k) for moe, _ in layers),
         )
         return self._routed_experts_geo
 
+    def _routed_experts_layers(self) -> list[tuple[Any, int]]:
+        """The target model's FusedMoE modules and their decoder layers.
+
+        The exported layer axis is the decoder's, dense layers included, so a
+        consumer indexes it by decoder layer. The drafter is not walked: its
+        MoE must not write over the target's routes.
+        """
+        return [
+            (moe, extract_layer_index(moe.prefix))
+            for moe in fused_moe_modules(self.model)
+        ]
+
     def _maybe_init_routed_experts_capturer(self, num_kvcache_blocks: int) -> None:
+        """Allocate the capture buffer and bind each target FusedMoE its layer's
+        view, as part of binding the KV cache, so both share one lifecycle."""
         geo = self._routed_experts_geometry()
         # Only TP rank 0 exports routes; the others keep the KV-pool charge,
-        # so every rank plans the same block count, but capture nothing.
+        # so every rank plans the same block count, but bind nothing.
         if geo is None or self.rank != 0:
             return
         num_layers, top_k = geo
         num_slots = int(num_kvcache_blocks) * int(self.block_size)
-        self._routed_experts_capturer = RoutedExpertsCapturer.init(
+        capturer = RoutedExpertsCapturer(
             num_slots=num_slots,
             num_layers=num_layers,
             top_k=top_k,
             device=self.device,
-            owner=self,
         )
+        for moe, idx in self._routed_experts_layers():
+            capturer.bind(moe, idx)
+        self._routed_experts_capturer = capturer
 
     def _store_routed_experts_step(
         self,
@@ -2459,11 +2468,6 @@ class ModelRunner:
         capturer = self._routed_experts_capturer
         if capturer is None:
             return None
-        if RoutedExpertsCapturer.get() is not capturer:
-            raise RuntimeError(
-                "enable_return_routed_experts: the MoE layers are capturing "
-                "into another runner's buffer"
-            )
         lens = batch.num_scheduled_tokens
         first = np.cumsum(lens) - lens
         return capturer.store_step(

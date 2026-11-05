@@ -17,6 +17,7 @@ from atom.config import Config
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fused_moe.routed_experts_capturer import (
+    ROUTES_VIEW_ATTR,
     maybe_capture_routed_experts,
 )
 from atom.model_ops.linear import (
@@ -418,7 +419,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             and ex.routed_scaling_factor == 1.0
             and n == self.n_routed_experts + 1
         ):
-            capturing = getattr(ex, "moe_capture_layer_id", None) is not None
+            capturing = getattr(ex, ROUTES_VIEW_ATTR, None) is not None
             out = moe_decode_single_token(
                 hidden_states,
                 None,

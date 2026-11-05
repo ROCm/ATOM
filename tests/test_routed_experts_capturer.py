@@ -27,13 +27,6 @@ from atom.model_ops.fused_moe.routed_experts_capturer import (
 from atom.utils import forward_context as fc
 
 
-@pytest.fixture(autouse=True)
-def _reset_capturer():
-    RoutedExpertsCapturer.reset()
-    yield
-    RoutedExpertsCapturer.reset()
-
-
 def _device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -62,9 +55,12 @@ def _forward(slots):
         fc.reset_forward_context()
 
 
-def _capture(capturer, layer_id, ids, slots, **kw):
+def _capture(capturer, layer_id, ids, slots, top_k=None):
+    """What a FusedMoE bound to ``layer_id`` does in a forward over ``slots``."""
+    layer = SimpleNamespace(top_k=capturer.top_k if top_k is None else top_k)
+    capturer.bind(layer, layer_id)
     with _forward(slots):
-        capturer.capture(layer_id, ids, **kw)
+        maybe_capture_routed_experts(layer, ids)
 
 
 def test_config_flag_defaults_off():
@@ -127,7 +123,8 @@ def test_dp_attention_refuses_a_builder_with_prefill_token_graphs(monkeypatch):
         supplies_token_slots = True
         supports_token_graph = True
 
-    monkeypatch.setattr(mr, "fused_moe_modules", lambda model: [object()])
+    moe = SimpleNamespace(prefix="model.layers.0.mlp.experts", top_k=2)
+    monkeypatch.setattr(mr, "fused_moe_modules", lambda model: [moe])
     runner = mr.ModelRunner.__new__(mr.ModelRunner)
     runner._return_routed_experts = True
     runner.model = object()
@@ -138,11 +135,16 @@ def test_dp_attention_refuses_a_builder_with_prefill_token_graphs(monkeypatch):
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_only_tp_rank0_allocates_the_capture_buffer(rank):
-    """Every rank plans the same geometry; only rank 0 exports, so only it
-    holds a buffer and the other ranks' hook stays a no-op."""
+def test_only_tp_rank0_binds_the_capture_buffer(rank, monkeypatch):
+    """Every rank plans the same geometry; only rank 0 exports, so only its
+    MoE layers get a view and the other ranks' hook stays a no-op."""
     mr = _import_runner()
+    moes = [
+        SimpleNamespace(prefix=f"model.layers.{i}.mlp.experts", top_k=2) for i in (0, 2)
+    ]
+    monkeypatch.setattr(mr, "fused_moe_modules", lambda model: moes)
     runner = mr.ModelRunner.__new__(mr.ModelRunner)
+    runner.model = object()
     runner._routed_experts_geo = (3, 2)
     runner._routed_experts_capturer = None
     runner.rank = rank
@@ -151,12 +153,15 @@ def test_only_tp_rank0_allocates_the_capture_buffer(rank):
 
     runner._maybe_init_routed_experts_capturer(num_kvcache_blocks=2)
 
+    capturer = runner._routed_experts_capturer
     if rank == 0:
-        assert RoutedExpertsCapturer.get() is runner._routed_experts_capturer
-        assert runner._routed_experts_capturer.buffer.shape == (9, 3, 2)
+        assert capturer.buffer.shape == (9, 3, 2)
+        for moe, layer in zip(moes, (0, 2)):
+            view = getattr(moe, cap_mod.ROUTES_VIEW_ATTR)
+            assert view.data_ptr() == capturer.buffer[:, layer].data_ptr()
     else:
-        assert runner._routed_experts_capturer is None
-        assert RoutedExpertsCapturer.get() is None
+        assert capturer is None
+        assert not any(hasattr(m, cap_mod.ROUTES_VIEW_ATTR) for m in moes)
 
 
 def test_flag_off_leaves_field_absent():
@@ -167,9 +172,7 @@ def test_flag_off_leaves_field_absent():
 def test_two_request_batch_order_segments():
     """A step's rows come back in batch token order, one segment per request."""
     device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=64, num_layers=3, top_k=2, device=device
-    )
+    capturer = RoutedExpertsCapturer(num_slots=64, num_layers=3, top_k=2, device=device)
     # Request A on block 0, request B on block 1, two prefill tokens each.
     slots = torch.tensor([0, 1, 16, 17], device=device)
     ids = torch.tensor(
@@ -200,9 +203,7 @@ def test_patches_rebuild_request_history():
     seq = Sequence([1, 2, 3], 3)
     seq.id = 7
     device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=32, num_layers=1, top_k=1, device=device
-    )
+    capturer = RoutedExpertsCapturer(num_slots=32, num_layers=1, top_k=1, device=device)
     for start, n in ((0, 3), (3, 1), (4, 1)):
         slots = torch.arange(start, start + n, device=device)
         ids = slots.to(torch.int32).unsqueeze(-1) + 40
@@ -215,9 +216,7 @@ def test_patches_rebuild_request_history():
 
 def test_length_contract_prompt_plus_completion_minus_one():
     device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=32, num_layers=1, top_k=1, device=device
-    )
+    capturer = RoutedExpertsCapturer(num_slots=32, num_layers=1, top_k=1, device=device)
     prompt_len, completion_len = 4, 2
     # Routes exist for every forwarded token: all prompt tokens plus every
     # completion token except the last sampled id (never forwarded).
@@ -232,9 +231,7 @@ def test_length_contract_prompt_plus_completion_minus_one():
 def test_graph_dummy_does_not_clobber_slot_zero():
     """Trailing -1 must not restore the pre-write value of physical slot 0."""
     device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=2, device=device
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=2, device=device)
     capturer.buffer[:, 0, :] = -7
     slots = torch.tensor([0, -1], device=device)
     ids = torch.tensor([[9, 8], [1, 2]], dtype=torch.int32, device=device)
@@ -245,9 +242,7 @@ def test_graph_dummy_does_not_clobber_slot_zero():
 
 def test_graph_dummy_negative_slots_ignored():
     device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=2, device=device
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=2, device=device)
     capturer.buffer[:, 0, :] = -7
     slots = torch.tensor([-1, -1, 3], device=device)
     ids = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32, device=device)
@@ -262,9 +257,7 @@ def test_graph_dummy_negative_slots_ignored():
 def test_prefix_hit_segment_reads_cached_slots():
     """B prefix-hits A's block: its cached rows come first, then its new token."""
     device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=32, num_layers=1, top_k=2, device=device
-    )
+    capturer = RoutedExpertsCapturer(num_slots=32, num_layers=1, top_k=2, device=device)
     slots = torch.tensor([0, 1, 2], device=device)
     ids = torch.tensor([[7, 8], [9, 10], [11, 12]], dtype=torch.int32, device=device)
     _capture(capturer, 0, ids, slots)
@@ -330,20 +323,17 @@ def test_every_quant_methods_routing_is_captured(monkeypatch):
     assert captured == [(layer, topk_ids)]
 
 
-def test_maybe_capture_skips_when_uninitialized():
-    class _Layer:
-        moe_capture_layer_id = 0
-
-    maybe_capture_routed_experts(_Layer(), torch.zeros((2, 2), dtype=torch.int32))
-    assert RoutedExpertsCapturer.get() is None
+def test_maybe_capture_skips_an_unbound_layer():
+    """Outside a forward, so reading slots would raise: it must not get that far."""
+    layer = SimpleNamespace(top_k=2)
+    maybe_capture_routed_experts(layer, torch.zeros((2, 2), dtype=torch.int32))
 
 
 def test_moe_hook_writes_its_layer_at_this_forwards_slots():
     device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=2, top_k=2, device=device
-    )
-    layer = SimpleNamespace(moe_capture_layer_id=1, top_k=2)
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=2, top_k=2, device=device)
+    layer = SimpleNamespace(top_k=2)
+    capturer.bind(layer, 1)
     with _forward(torch.tensor([3], device=device)):
         maybe_capture_routed_experts(
             layer, torch.tensor([[5, 6]], dtype=torch.int32, device=device)
@@ -353,11 +343,9 @@ def test_moe_hook_writes_its_layer_at_this_forwards_slots():
 
 
 def test_moe_outside_the_target_model_never_captures():
-    """A drafter's MoE has a `layer_id` but no `moe_capture_layer_id`."""
+    """A drafter's MoE has a `layer_id` but is never bound a view."""
     device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=2, top_k=2, device=device
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=2, top_k=2, device=device)
 
     class _DraftMoE:
         layer_id = 0
@@ -414,9 +402,7 @@ def test_prefix_slots_match_gpu_formula():
 def test_store_step_drops_graph_pad_tail():
     """Graph-padded slot_mapping: only the step's real tokens are returned."""
     device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=2, device=device
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=2, device=device)
     slots = torch.tensor([0, -1, -1], device=device)
     _capture(
         capturer,
@@ -431,9 +417,7 @@ def test_store_step_drops_graph_pad_tail():
 def test_uncaptured_rows_are_minus_one():
     """Layers or slots no MoE layer wrote read back as UNCAPTURED, not expert 0."""
     device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=2, top_k=2, device=device
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=2, top_k=2, device=device)
     slots = torch.tensor([0, 1], device=device)
     _capture(
         capturer,
@@ -449,9 +433,7 @@ def test_uncaptured_rows_are_minus_one():
 def test_short_slot_mapping_raises_at_store():
     """A metadata builder exposing fewer slots than tokens is an error, not -1 rows."""
     device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=1, device=device
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=1, device=device)
     slots = torch.tensor([2], device=device)
     _capture(capturer, 0, torch.tensor([[5]], dtype=torch.int32, device=device), slots)
     with pytest.raises(
@@ -462,9 +444,7 @@ def test_short_slot_mapping_raises_at_store():
 
 @pytest.mark.parametrize("slot_count", [2, 4])
 def test_capture_raises_when_topk_rows_and_slots_differ(slot_count):
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=2, device="cpu"
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=2, device="cpu")
     with pytest.raises(RuntimeError, match="routed 3 tokens"):
         _capture(
             capturer,
@@ -476,9 +456,7 @@ def test_capture_raises_when_topk_rows_and_slots_differ(slot_count):
 
 @pytest.mark.parametrize("layer_id", [-1, 2])
 def test_capture_raises_on_layer_outside_buffer(layer_id):
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=2, top_k=2, device="cpu"
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=2, top_k=2, device="cpu")
     with pytest.raises(RuntimeError, match="outside the buffer's 2 layers"):
         _capture(
             capturer,
@@ -489,9 +467,7 @@ def test_capture_raises_on_layer_outside_buffer(layer_id):
 
 
 def test_capture_raises_when_fewer_columns_than_layer_top_k():
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=4, device="cpu"
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=4, device="cpu")
     with pytest.raises(RuntimeError, match="top_k=4 with 3 top-k columns"):
         _capture(
             capturer,
@@ -505,9 +481,7 @@ def test_capture_raises_when_fewer_columns_than_layer_top_k():
 def test_capture_drops_fused_shared_columns_past_layer_top_k():
     """A top-2 layer with one fused shared column, in a buffer sized for a top-3
     layer: the shared id must not land in the third route column."""
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=3, device="cpu"
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=3, device="cpu")
     slots = torch.tensor([1])
     _capture(capturer, 0, torch.tensor([[4, 7, 99]], dtype=torch.int32), slots, top_k=2)
     patch = _store_take(capturer, slots, [1], [0], [1])
@@ -515,9 +489,7 @@ def test_capture_drops_fused_shared_columns_past_layer_top_k():
 
 
 def test_empty_step_stores_nothing():
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=2, device="cpu"
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=2, device="cpu")
     assert capturer.store_step(torch.tensor([], dtype=torch.long), [], [], []) is None
     # Outside a forward there are no slots to read: refused, not an empty step.
     with pytest.raises(RuntimeError, match="no single per-token slot_mapping"):
@@ -526,9 +498,7 @@ def test_empty_step_stores_nothing():
 
 def test_stored_steps_are_independent():
     """A later store neither replaces nor reorders an earlier one."""
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=1, device="cpu"
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=1, device="cpu")
     _capture(capturer, 0, torch.tensor([[4]], dtype=torch.int32), torch.tensor([1]))
     a = capturer.store_step(torch.tensor([1]), [1], [0], [1])
     _capture(capturer, 0, torch.tensor([[6]], dtype=torch.int32), torch.tensor([2]))
@@ -544,9 +514,7 @@ def test_async_store_snapshots_slots_before_staging_reuse():
     """The next forward rewrites slot_mapping in place on the compute stream;
     a stalled copy stream must still return this step's rows."""
     device = torch.device("cuda")
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=2, device=device
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=1, top_k=2, device=device)
     slots = torch.tensor([1], device=device)
     _capture(
         capturer, 0, torch.tensor([[7, 8]], dtype=torch.int32, device=device), slots
@@ -590,9 +558,7 @@ def test_cached_prefix_slots_refuse_a_dropped_block_table():
 def test_reused_slot_keeps_dense_layers_uncaptured():
     """Layer 1 is dense: no request writes it, so a reused slot reads -1."""
     device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=3, top_k=2, device=device
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=3, top_k=2, device=device)
     slot = torch.tensor([3], device=device)
     for ids in ([[1, 2]], [[5, 6]]):  # request A, then B on the same slot
         for layer in (0, 2):
@@ -606,54 +572,10 @@ def test_reused_slot_keeps_dense_layers_uncaptured():
     assert row == [[5, 6], [UNCAPTURED, UNCAPTURED], [5, 6]]
 
 
-class _Owner:
-    pass
-
-
-def test_second_runner_cannot_take_the_capturer():
-    a, b = _Owner(), _Owner()
-    mine = RoutedExpertsCapturer.init(
-        num_slots=4, num_layers=1, top_k=1, device="cpu", owner=a
-    )
-    with pytest.raises(RuntimeError, match="one capturing runner"):
-        RoutedExpertsCapturer.init(
-            num_slots=4, num_layers=1, top_k=1, device="cpu", owner=b
-        )
-    assert RoutedExpertsCapturer.get() is mine
-    # Another runner's teardown leaves it alone; the owner's drops it.
-    RoutedExpertsCapturer.reset(owner=b)
-    assert RoutedExpertsCapturer.get() is mine
-    RoutedExpertsCapturer.reset(owner=a)
-    assert RoutedExpertsCapturer.get() is None
-
-
-def test_owner_reinit_and_dead_owner_replaced():
-    a = _Owner()
-    first = RoutedExpertsCapturer.init(
-        num_slots=4, num_layers=1, top_k=1, device="cpu", owner=a
-    )
-    # Wake re-allocates for the same runner.
-    again = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=1, device="cpu", owner=a
-    )
-    assert again is not first and RoutedExpertsCapturer.get() is again
-    del a, first
-    import gc
-
-    gc.collect()
-    b = _Owner()
-    assert (
-        RoutedExpertsCapturer.init(
-            num_slots=4, num_layers=1, top_k=1, device="cpu", owner=b
-        )
-        is RoutedExpertsCapturer.get()
-    )
-
-
 def test_capture_buffer_matches_its_budget():
     """The pool charge and the allocation come from one element type."""
     block_size, num_blocks, layers, top_k = 16, 3, 5, 4
-    capturer = RoutedExpertsCapturer.init(
+    capturer = RoutedExpertsCapturer(
         num_slots=block_size * num_blocks,
         num_layers=layers,
         top_k=top_k,
@@ -734,9 +656,7 @@ def test_in_place_slot_rewrite_between_forwards():
     """The staging slot buffer is rewritten in place between forwards; each
     forward's layers write and read that forward's slots."""
     device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=32, num_layers=3, top_k=2, device=device
-    )
+    capturer = RoutedExpertsCapturer(num_slots=32, num_layers=3, top_k=2, device=device)
     staging = torch.tensor([0, 1, -1], device=device)
     ids = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32, device=device)
     for layer in range(3):
@@ -990,9 +910,7 @@ def test_qwen4_exp_single_token_moe_captures_its_routes(
         exc_type=ImportError,
     )
 
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=2, top_k=2, device="cpu"
-    )
+    capturer = RoutedExpertsCapturer(num_slots=8, num_layers=2, top_k=2, device="cpu")
     kernel_ids = torch.tensor([[3, 1, 4]], dtype=torch.int32)
     selected_ids = torch.tensor([[2, 0, 4]], dtype=torch.int32)
     monkeypatch.setattr(
@@ -1025,7 +943,7 @@ def test_qwen4_exp_single_token_moe_captures_its_routes(
         num_fused_shared_experts=1,
     )
     if capturing:
-        experts.moe_capture_layer_id = 1
+        capturer.bind(experts, 1)
     block = q4.Qwen4ExpSparseMoeBlock.__new__(q4.Qwen4ExpSparseMoeBlock)
     torch.nn.Module.__init__(block)
     block.experts = experts

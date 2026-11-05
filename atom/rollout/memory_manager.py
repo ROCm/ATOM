@@ -6,7 +6,7 @@ import os
 
 import torch
 
-from atom.model_ops.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
+from atom.model_ops.fused_moe.routed_experts_capturer import ROUTES_VIEW_ATTR
 from atom.utils.forward_context import set_kv_cache_data
 from atom.utils.graph_holders import release_registered_graphs
 
@@ -15,7 +15,8 @@ logger = logging.getLogger("atom")
 # Every name a binder may have set to a view of the KV pool. Not just the cache
 # ones: the pool is a single buffer now, so one surviving scale plane or
 # indexer slice pins all of it -- what used to leak a scale tensor leaks the
-# whole pool.
+# whole pool. The routed-expert capture view is not part of the pool but is
+# charged to its budget, so it is bound and released with it.
 _POOL_VIEW_ATTRS = (
     "k_cache",
     "v_cache",
@@ -24,6 +25,7 @@ _POOL_VIEW_ATTRS = (
     "k_scale",
     "v_scale",
     "index_cache",
+    ROUTES_VIEW_ATTR,
 )
 
 
@@ -334,11 +336,9 @@ class MemoryManagerMixin:
         ):
             if hasattr(self, attr) and getattr(self, attr) is not None:
                 delattr(self, attr)
-        # Graphs that wrote capture slots are already dropped above. The
-        # singleton GPU buffer is not a view of `kv_cache`; leaving it live
-        # makes wake's get_num_blocks() treat it as overhead and allocate_kv_cache
-        # create a second buffer before replacing it.
-        RoutedExpertsCapturer.reset(owner=self)
+        # The MoE layers' views were cleared with the pool's above. Left live,
+        # the capture buffer makes wake's get_num_blocks() treat it as
+        # overhead and allocate_kv_cache create a second one.
         self._routed_experts_capturer = None
         torch.cuda.empty_cache()
         logger.info(f"{self.label}: KV cache released (GPU memory freed)")

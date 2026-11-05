@@ -158,27 +158,29 @@ def test_release_kv_cache_leaves_the_indexer_rebindable(monkeypatch):
     owner.indexer.k_cache.kv_cache[0] = torch.empty(1)  # what waking does
 
 
-def test_release_kv_cache_resets_routed_experts_capturer(monkeypatch):
-    """Sleep must drop the capture singleton or wake under-counts free KV."""
-    from atom.model_ops.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
-
-    class _Runner:
-        pass
-
-    runner = _Runner()
-    runner.kv_cache = torch.empty(1)
-    runner.config = SimpleNamespace(num_kvcache_blocks=7)
-    runner.model = nn.Sequential()
-    runner.label = "test"
-    runner._get_models_with_kv = lambda: [runner.model]
-    runner._routed_experts_capturer = RoutedExpertsCapturer.init(
-        num_slots=4, num_layers=2, top_k=2, device="cpu", owner=runner
+def test_release_kv_cache_unbinds_the_routed_experts_capture(monkeypatch):
+    """Sleep must drop the capture buffer or wake under-counts free KV: its
+    MoE views go with the KV views, and the runner's reference with them."""
+    from atom.model_ops.fused_moe.routed_experts_capturer import (
+        ROUTES_VIEW_ATTR,
+        RoutedExpertsCapturer,
     )
-    assert RoutedExpertsCapturer.get() is not None
+
+    capturer = RoutedExpertsCapturer(num_slots=4, num_layers=2, top_k=2, device="cpu")
+    moe = nn.Module()
+    capturer.bind(moe, 1)
+    runner = SimpleNamespace(
+        kv_cache=torch.empty(1),
+        config=SimpleNamespace(num_kvcache_blocks=7),
+        model=nn.Sequential(moe),
+        label="test",
+        _routed_experts_capturer=capturer,
+    )
+    runner._get_models_with_kv = lambda: [runner.model]
     monkeypatch.setattr(memory_manager, "set_kv_cache_data", lambda _value: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
 
     MemoryManagerMixin._release_kv_cache(runner)
 
-    assert RoutedExpertsCapturer.get() is None
+    assert getattr(moe, ROUTES_VIEW_ATTR) is None
     assert runner._routed_experts_capturer is None

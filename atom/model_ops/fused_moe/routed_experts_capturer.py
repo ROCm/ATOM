@@ -12,7 +12,6 @@ slots to the first step that forwards the request.
 
 from __future__ import annotations
 
-import weakref
 from collections.abc import Sequence as AbcSequence
 from typing import Any, NamedTuple
 
@@ -22,7 +21,9 @@ import torch
 from atom.model_ops.attentions.token_layout.slots import slot_mapping
 from atom.utils.forward_context import get_forward_context
 
-_INSTANCE: RoutedExpertsCapturer | None = None
+# The FusedMoE attribute holding its layer's ``buffer[:, layer]``. Bound with
+# the KV cache and cleared with it on sleep.
+ROUTES_VIEW_ATTR = "routed_experts_view"
 
 # Missed captures read as this, never as a valid expert id.
 UNCAPTURED = -1
@@ -168,8 +169,10 @@ class RoutedExpertsCapturer:
     """Persistent GPU buffer: ``[num_kv_slots + 1, num_layers, top_k]``.
 
     The extra row is a sacrificial pad target: slots index the buffer directly,
-    so a graph dummy slot (``PAD_SLOT_ID``, -1) wraps to it. Each step's rows are gathered in batch token order by ``store_step``,
-    which returns them as ``PendingRoutes`` for the caller to keep.
+    so a graph dummy slot (``PAD_SLOT_ID``, -1) wraps to it. ``bind`` hands
+    each target FusedMoE its layer's view; each step's rows are gathered in
+    batch token order by ``store_step``, which returns them as
+    ``PendingRoutes`` for the caller to keep.
     """
 
     def __init__(
@@ -202,95 +205,14 @@ class RoutedExpertsCapturer:
                 f"KV pool budget charged {charged} B"
             )
 
-    @classmethod
-    def init(
-        cls,
-        num_slots: int,
-        num_layers: int,
-        top_k: int,
-        device: torch.device | str,
-        owner: object | None = None,
-    ) -> RoutedExpertsCapturer:
-        """Install the process's capturer.
-
-        The MoE hook finds it through this global, so one process holds one.
-        ``owner`` (the runner) is recorded; another live owner's ``init``
-        raises rather than redirecting the first runner's routes.
-        """
-        global _INSTANCE
-        held = _INSTANCE._live_owner() if _INSTANCE is not None else None
-        if held is not None and held is not owner:
+    def bind(self, layer: Any, layer_idx: int) -> None:
+        """Give ``layer``'s MoE hook its ``buffer[:, layer_idx]`` to write."""
+        if not 0 <= layer_idx < self.num_layers:
             raise RuntimeError(
-                "enable_return_routed_experts: the routed-expert capturer is "
-                f"held by {type(held).__name__} {id(held):#x}; one process "
-                "supports one capturing runner"
-            )
-        capturer = cls(num_slots, num_layers, top_k, device)
-        capturer._owner = weakref.ref(owner) if owner is not None else None
-        _INSTANCE = capturer
-        return capturer
-
-    _owner: weakref.ref | None = None
-
-    def _live_owner(self) -> object | None:
-        return self._owner() if self._owner is not None else None
-
-    @classmethod
-    def get(cls) -> RoutedExpertsCapturer | None:
-        return _INSTANCE
-
-    @classmethod
-    def reset(cls, owner: object | None = None) -> None:
-        """Drop the process-local GPU/CPU buffers. Sleep KV teardown uses this
-        so wake does not size a new pool against a still-live capture tensor.
-
-        With ``owner``, only that owner's capturer is dropped.
-        """
-        global _INSTANCE
-        if owner is not None and _INSTANCE is not None:
-            held = _INSTANCE._live_owner()
-            if held is not None and held is not owner:
-                return
-        _INSTANCE = None
-
-    def capture(
-        self,
-        layer_id: int,
-        topk_ids: torch.Tensor,
-        top_k: int | None = None,
-    ) -> None:
-        """Scatter logical expert ids. Pad slots (``-1``) write the pad row.
-
-        Only this layer's first ``top_k`` columns are routes; the rest are
-        fused shared experts.
-        """
-        if not 0 <= layer_id < self.num_layers:
-            raise RuntimeError(
-                f"routed-expert capture: layer {layer_id} is outside the "
+                f"routed-expert capture: layer {layer_idx} is outside the "
                 f"buffer's {self.num_layers} layers"
             )
-        slots = current_slot_mapping()
-        n = int(topk_ids.shape[0])
-        if int(slots.shape[0]) != n:
-            raise RuntimeError(
-                f"routed-expert capture: layer {layer_id} routed {n} tokens but "
-                f"this forward's slot_mapping has {int(slots.shape[0])} slots"
-            )
-        k = self.top_k if top_k is None else int(top_k)
-        if not 0 < k <= self.top_k or int(topk_ids.shape[-1]) < k:
-            raise RuntimeError(
-                f"routed-expert capture: layer {layer_id} top_k={k} with "
-                f"{int(topk_ids.shape[-1])} top-k columns does not fit the "
-                f"buffer's top_k={self.top_k}"
-            )
-        if n == 0:
-            return
-        ids = topk_ids[:, :k].to(device=self.buffer.device, dtype=self.buffer.dtype)
-        if k < self.top_k:
-            row = self.buffer.new_full((n, self.top_k), UNCAPTURED)
-            row[:, :k] = ids
-            ids = row
-        self.buffer[slots.reshape(-1), layer_id, :] = ids
+        setattr(layer, ROUTES_VIEW_ATTR, self.buffer[:, layer_idx])
 
     def store_step(
         self,
@@ -353,15 +275,38 @@ class RoutedExpertsCapturer:
 
 
 def maybe_capture_routed_experts(layer: Any, topk_ids: torch.Tensor) -> None:
-    """No-op when capture is off, uninitialized, or still in dummy warmup.
+    """Scatter ``layer``'s logical expert ids at this forward's slots.
 
-    Only the target model's FusedMoE layers carry ``moe_capture_layer_id``; a
-    drafter's MoE has none and must not write over the target's routes.
+    A no-op on a layer with no bound view: capture off, a TP rank other than
+    0, a drafter's MoE (which must not write over the target's routes), or
+    before the KV cache is bound. Pad slots (``-1``) write the pad row. Only
+    the layer's first ``top_k`` columns are routes; the rest are fused shared
+    experts.
     """
-    capturer = RoutedExpertsCapturer.get()
-    if capturer is None or topk_ids is None:
+    view = getattr(layer, ROUTES_VIEW_ATTR, None)
+    if view is None or topk_ids is None:
         return
-    layer_id = getattr(layer, "moe_capture_layer_id", None)
-    if layer_id is None:
+    name = getattr(layer, "prefix", type(layer).__name__)
+    slots = current_slot_mapping()
+    n = int(topk_ids.shape[0])
+    if int(slots.shape[0]) != n:
+        raise RuntimeError(
+            f"routed-expert capture: {name} routed {n} tokens but this "
+            f"forward's slot_mapping has {int(slots.shape[0])} slots"
+        )
+    width = int(view.shape[-1])
+    k = int(layer.top_k)
+    if not 0 < k <= width or int(topk_ids.shape[-1]) < k:
+        raise RuntimeError(
+            f"routed-expert capture: {name} top_k={k} with "
+            f"{int(topk_ids.shape[-1])} top-k columns does not fit the "
+            f"buffer's top_k={width}"
+        )
+    if n == 0:
         return
-    capturer.capture(int(layer_id), topk_ids, top_k=int(layer.top_k))
+    ids = topk_ids[:, :k].to(device=view.device, dtype=view.dtype)
+    if k < width:
+        row = view.new_full((n, width), UNCAPTURED)
+        row[:, :k] = ids
+        ids = row
+    view[slots.reshape(-1)] = ids
