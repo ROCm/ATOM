@@ -2,6 +2,7 @@
 
 """Native-state MP admission and PAGE-image lifetime contracts."""
 
+import re
 from collections import deque
 from types import SimpleNamespace
 from weakref import WeakKeyDictionary
@@ -444,6 +445,49 @@ def test_a_transfer_that_reports_leaves_the_watchdog(monkeypatch):
     assert scheduler._transfer_seen_at == {}
     now[0] += scheduler._scheduler_deadline_s + 1
     scheduler.process_completions(KVConnectorOutput())
+
+
+def _dispatch_load(scheduler, request_id):
+    seq = sequence(request_id, computed=0, token_offset=100 * request_id)
+    scheduler.get_num_new_matched_tokens(seq)
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler.should_park_for_load_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    scheduler.process_completions(KVConnectorOutput())
+    return request.load_operation
+
+
+@pytest.mark.parametrize("finished", ["earlier", "later"])
+def test_a_load_queued_behind_a_finished_one_starts_its_bound_again(
+    monkeypatch, finished
+):
+    """The worker restores loads a few at a time, in order, between forwards,
+    so a burst on a cold server queues. A finished load restarts the bound of
+    the loads seen after it, and only of those: a load whose completion is
+    lost still stops the engine one bound after the loads ahead of it."""
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    scheduler, _, _ = make_scheduler(monkeypatch)
+    bound = scheduler._scheduler_deadline_s
+    first = _dispatch_load(scheduler, 1)
+    second = _dispatch_load(scheduler, 2)
+    done, waiting = (first, second) if finished == "earlier" else (second, first)
+
+    now[0] += bound - 5
+    scheduler.process_completions(KVConnectorOutput(finished_loading={done}))
+    now[0] += 10
+    if finished == "later":
+        with pytest.raises(
+            transfer.LMCacheTransferUnprovable, match=re.escape(str(waiting))
+        ):
+            scheduler.process_completions(KVConnectorOutput())
+        return
+    scheduler.process_completions(KVConnectorOutput())
+    now[0] += bound - 9
+    with pytest.raises(
+        transfer.LMCacheTransferUnprovable, match=re.escape(str(waiting))
+    ):
+        scheduler.process_completions(KVConnectorOutput())
 
 
 @pytest.mark.parametrize("prompt", [8, 16, 19, 24])
