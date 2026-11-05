@@ -79,6 +79,22 @@ def resolve_prompt_token_ids(
     return ids
 
 
+# The leave reasons that mean the model ended the output itself: its EOS, one
+# of the request's stop sequences, or one of the model's stop tokens
+# (`stop_<token_id>`), and `stop`, the same fact in OpenAI's words. Every other
+# reason -- `max_tokens`, `aborted`, `unschedulable: ...` -- cut it off.
+MODEL_STOP_REASONS = ("eos", "stop", "stop_sequence")
+STOP_TOKEN_REASON_PREFIX = "stop_"
+
+
+def ended_by_stop(finish_reason: str | None) -> bool:
+    """Did the model end its output itself, rather than being cut off?"""
+    return finish_reason is not None and (
+        finish_reason in MODEL_STOP_REASONS
+        or finish_reason.startswith(STOP_TOKEN_REASON_PREFIX)
+    )
+
+
 def openai_stop_reason(finish_reason: str | None) -> str | None:
     """The engine's leave reason as OpenAI spells it.
 
@@ -94,7 +110,9 @@ def openai_stop_reason(finish_reason: str | None) -> str | None:
     """
     if finish_reason is None:
         return None
-    if finish_reason in ("stop", "length", "tool_calls"):
+    if ended_by_stop(finish_reason):
+        return "stop"
+    if finish_reason in ("length", "tool_calls"):
         return finish_reason
     if finish_reason in ("max_tokens", "max_new_tokens"):
         return "length"
@@ -205,11 +223,18 @@ class ChatMessage(BaseModel):
                 parts.append(part.get("text", ""))
         return "\n".join(parts)
 
-    def to_template_dict(self, *, preserve_content: bool = False) -> dict[str, Any]:
+    def to_template_dict(
+        self,
+        *,
+        preserve_content: bool = False,
+        preserve_tool_call_arguments: bool = False,
+    ) -> dict[str, Any]:
         """Convert to dict for chat template, preserving tool-related fields.
 
         Returns a dict with role, content, and any extra fields (tool_calls,
         tool_call_id, name, reasoning_content, tools) that the chat template needs.
+        ``preserve_tool_call_arguments`` keeps ``function.arguments`` strings
+        as sent, for templates that render them verbatim (Kimi-K3).
         """
         d: dict[str, Any] = {
             "role": self.role,
@@ -223,7 +248,7 @@ class ChatMessage(BaseModel):
             if key in extras:
                 d[key] = (
                     _normalize_tool_call_arguments(extras[key])
-                    if key == "tool_calls"
+                    if key == "tool_calls" and not preserve_tool_call_arguments
                     else extras[key]
                 )
         return d

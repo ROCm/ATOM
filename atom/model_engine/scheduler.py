@@ -2112,6 +2112,13 @@ class Scheduler:
                     if not prefillable and not waiting_requests
                     else None
                 ),
+                # prefill_admit_policy adaptive: what a FIRE could add to the
+                # decode batch -- partials plus waiting heads up to free slots
+                admittable_requests=self._partial_prefill_count
+                + min(
+                    len(self.waiting),
+                    max(0, self.max_num_seqs - len(self.running)),
+                ),
             )
         else:
             decision = PrefillDecision(allow=True, prefillable_ranks=0)

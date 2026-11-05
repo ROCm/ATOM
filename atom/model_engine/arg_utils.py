@@ -18,6 +18,7 @@ from atom.config import (
 )
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -154,6 +155,7 @@ class EngineArgs:
     dynamic_chunking_smooth_factor: float | None = None
     dynamic_chunking_min_chunk_size: int = 4096
     scheduler_delay_factor: float = 0.0
+    prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
@@ -683,6 +685,17 @@ class EngineArgs:
             default=0.0,
             help="Apply a delay (of delay factor multiplied by previous"
             "prompt latency) before scheduling next prompt.",
+        )
+        parser.add_argument(
+            "--prefill-admit-policy",
+            choices=list(PREFILL_ADMIT_POLICIES),
+            default="interval",
+            help="When the prefill delayer admits new prefills. 'interval' "
+            "(default) keeps ATOM_PREFILL_DECODE_INTERVAL and the coalescer. "
+            "'adaptive' fires once the held requests' accumulated cost reaches "
+            "the fixed prefill cost times the decode batch, fitted from measured "
+            "step times; on DP=1, PP=1 it enables the delayer as a positive "
+            "interval does.",
         )
         parser.add_argument(
             "--mark-trace",

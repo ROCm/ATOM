@@ -94,6 +94,7 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    ended_by_stop,
     validate_max_tokens,
 )
 from .reasoning import (
@@ -134,10 +135,12 @@ from .serving_chat import (
     build_chat_response,
     build_chat_response_multi,
     normalize_chat_tools,
+    request_tools,
     resolve_thinking,
     stream_chat_response,
     stream_chat_response_fanout,
     validate_chat_request,
+    validate_history_tool_calls,
     validate_tool_list,
 )
 from .serving_completion import (
@@ -175,6 +178,7 @@ from .tool_parser.registry import (
     forbids_tool_calls,
     required_call_channel,
     resolve_tool_call_parser,
+    template_keeps_tool_call_arguments,
 )
 
 # Configure logging
@@ -195,6 +199,10 @@ tokenizer: AutoTokenizer | None = None
 # chat template. `None` means none was recognised and tool calls, if any, are
 # delivered as plain text -- said out loud at startup, never discovered here.
 tool_call_parser_cls: type | None = None
+# Whether history tool-call argument strings reach the template as sent. Read
+# off the chat template at startup (Kimi-K3 renders them verbatim), not off
+# --tool-call-parser.
+preserve_tool_call_arguments: bool = False
 # The channel `tool_choice="required"` holds output to in that format, derived
 # with it at startup; None where the format defines none (all but Kimi-K3).
 required_tool_channel: RequiredChannel | None = None
@@ -734,7 +742,12 @@ def _prepare_multimodal_inputs(
 ) -> tuple[list[int], dict[str, Any]]:
     conversation, media = parse_chat_messages(
         [
-            {**message.to_template_dict(), "content": message.content}
+            {
+                **message.to_template_dict(
+                    preserve_tool_call_arguments=preserve_tool_call_arguments
+                ),
+                "content": message.content,
+            }
             for message in messages
         ]
     )
@@ -1873,7 +1886,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             top_p=request.top_p,
             n=effective_n,
             required_channel=channel_for_request(
-                required_tool_channel, request.tool_choice, request.tools
+                required_tool_channel, request.tool_choice, request_tools(request)
             ),
         )
 
@@ -1917,6 +1930,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 custom_message_encoder,
                 messages,
                 tools=request.tools,
+                preserve_tool_call_arguments=preserve_tool_call_arguments,
                 **merged_kwargs,
             )
 
@@ -2301,6 +2315,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     try:
         # Convert Anthropic messages to OpenAI format
         openai_messages = anthropic_to_openai_messages(request.messages, request.system)
+        validate_history_tool_calls(openai_messages)
 
         # Apply chat template
         from .protocol import ChatMessage
@@ -2342,6 +2357,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             custom_message_encoder,
             messages,
             tools=anthropic_to_openai_tools(request.tools),
+            preserve_tool_call_arguments=preserve_tool_call_arguments,
             **merged_kwargs,
         )
 
@@ -2489,7 +2505,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                         # into the tool parser.
                         segments = reasoning_filter.process(new_text)
                         if finished:
-                            segments.extend(reasoning_filter.flush())
+                            segments.extend(
+                                reasoning_filter.flush(
+                                    stopped=ended_by_stop(engine_reason)
+                                )
+                            )
 
                         for field, text in segments:
                             if not text:
@@ -2601,10 +2621,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # and what keeps a chain of thought out of the tool parser. Only
         # whether the client is shown it is a question, and the same one the
         # streaming branch above asks.
-        # Both stages over one chunk, in the order the branch above streams
-        # them: reasoning filter, then the tool parser on the content segments
-        # it yields. Calling `.split()` here instead flattened the two into
-        # `(reasoning, content)` and lost the interleaving at that line.
+        # Both stages over the whole output, once, in the order the branch
+        # above streams them: reasoning filter, then the tool parser on the
+        # content segments it yields. Calling `.split()` here instead
+        # flattened the two into `(reasoning, content)` and lost the
+        # interleaving at that line.
         events = read_whole_blocks(
             reasoning_channel(
                 prompt_starts_in_reasoning(prompt),
@@ -2614,6 +2635,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             raw_text,
             anthropic_to_openai_tools(request.tools),
             suppress_calls=forbids_tool_calls(request.tool_choice),
+            stopped=ended_by_stop(final_output.get("finish_reason")),
         )
         if drop_reasoning:
             events = [e for e in events if e[0] != "reasoning"]
@@ -2745,6 +2767,7 @@ async def responses_create(raw_request: Request):
 
     try:
         openai_messages = responses_to_openai_messages(request)
+        validate_history_tool_calls(openai_messages)
         from .protocol import ChatMessage
 
         messages = [ChatMessage(**m) for m in openai_messages]
@@ -2772,6 +2795,7 @@ async def responses_create(raw_request: Request):
             custom_message_encoder,
             messages,
             tools=openai_tools,
+            preserve_tool_call_arguments=preserve_tool_call_arguments,
             **merged_kwargs,
         )
 
@@ -2893,7 +2917,13 @@ async def responses_create(raw_request: Request):
 
                         segments = reasoning_filter.process(new_text)
                         if finished:
-                            segments.extend(reasoning_filter.flush())
+                            segments.extend(
+                                reasoning_filter.flush(
+                                    stopped=ended_by_stop(
+                                        chunk_data.get("finish_reason")
+                                    )
+                                )
+                            )
 
                         for field, text in segments:
                             if not text:
@@ -2985,6 +3015,7 @@ async def responses_create(raw_request: Request):
             raw_text,
             openai_tools,
             suppress_calls=forbids_tool_calls(request.tool_choice),
+            stopped=ended_by_stop(final_output.get("finish_reason")),
         )
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
@@ -3216,6 +3247,7 @@ def main():
     """Main entry point for the server."""
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
     global tool_call_parser_cls, required_tool_channel
+    global preserve_tool_call_arguments
     global model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect, synthetic_token_text
     global custom_message_encoder, _stream_batch_dispatcher
@@ -3359,12 +3391,15 @@ def main():
             "arrives is still separated and reported, never discarded."
         )
 
+    tools_probe = render_probe_prompt(tokenizer, custom_message_encoder, tools=True)
     tool_call_parser_cls = resolve_tool_call_parser(
         args.tool_call_parser,
         tokenizer,
         custom_message_encoder,
         model=args.model,
+        rendered_probe=tools_probe,
     )
+    preserve_tool_call_arguments = template_keeps_tool_call_arguments(tools_probe)
     required_tool_channel = required_call_channel(tool_call_parser_cls, tokenizer)
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
