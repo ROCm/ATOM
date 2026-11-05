@@ -16,6 +16,7 @@ from atom.model_ops.required_channel import (
     advance_states,
     constrain_logits,
 )
+from atom.model_ops.token_constraints import TokenRuleBuffer
 
 
 def prepare_token_constraints(runner, batch, metadata):
@@ -42,6 +43,7 @@ def apply_required_channel(runner, batch, logits, metadata=None, target=None):
         logits,
         carried_from=tp.decode_src.gpu[:bs] if carried else None,
         carried_states=tp.prev_channel_states if carried else None,
+        preserve_masks=bool(getattr(batch, "structured_requests", None)),
         target_logits=target,
         cu_num_draft_tokens=None if metadata is None else metadata.cu_num_draft_tokens,
         input_ids=None if metadata is None else metadata.input_ids,
@@ -63,7 +65,8 @@ class TokenConstraints:
     @classmethod
     def apply(cls, runner, batch, logits, metadata, need_logprobs=False):
         requests = getattr(batch, "structured_requests", None)
-        if not requests and batch.required_channel is None:
+        rules = getattr(batch, "token_constraints", None)
+        if not requests and batch.required_channel is None and not rules:
             return None
         step = cls()
         step.grammar = getattr(runner, "structured_output", None) if requests else None
@@ -89,6 +92,37 @@ class TokenConstraints:
         step.channel = apply_required_channel(
             runner, batch, step.logits, metadata, step.target
         )
+        step.invalid = None
+        step.target_invalid = None
+        step.metadata = metadata
+        if rules:
+            buffer = getattr(runner, "token_rule_buffer", None)
+            if buffer is None:
+                runner.token_rule_buffer = buffer = TokenRuleBuffer()
+            buffer.apply(
+                rules,
+                step.logits,
+                step.target,
+                runner.forward_vars["positions"].gpu,
+                runner.forward_vars["cu_seqlens_q"].gpu,
+                metadata,
+            )
+        # A sparse deny on the unmasked model row leaves other finite logits,
+        # just like the standalone channel's EOS deny path. Only intersections,
+        # allow lists, or a vocabulary-sized deny can remove every candidate.
+        check_empty = rules and (
+            requests
+            or step.channel is not None
+            or any(rule.mode == "allow" for _, _, rule in rules)
+            or sum(len(rule.token_ids) for _, _, rule in rules) >= logits.shape[-1]
+        )
+        if check_empty or (requests and step.channel is not None):
+            # Conflicting hard rules must fail, never silently relax a rule or
+            # let an all-infinite row produce NaNs. The safe ID stays GPU-only;
+            # failure travels with the existing asynchronous output copy.
+            step.invalid = _guard_empty_rows(step.logits)
+            if step.target is not None:
+                step.target_invalid = _guard_empty_rows(step.target)
         return step
 
     def commit(self, sampled_tokens, batch, deferred):
@@ -99,5 +133,42 @@ class TokenConstraints:
             else None
         )
         if self.prefixes:
-            self.grammar.commit(sampled_tokens, batch, self.prefixes)
+            failure = self.failed(sampled_tokens)
+            output = (
+                sampled_tokens
+                if failure is None
+                else _error_tokens(sampled_tokens, failure)
+            )
+            self.grammar.commit(output, batch, self.prefixes)
         return channel_states
+
+    def failed(self, sampled):
+        if self.invalid is None:
+            return None
+        if self.metadata is None:
+            return self.invalid
+        tokens = sampled.reshape(self.logits.shape[0], -1)
+        md = self.metadata
+        end = md.cu_num_draft_tokens
+        start = torch.cat((torch.zeros_like(end[:1]), end[:-1]))
+        width = torch.arange(tokens.shape[1], device=tokens.device)[None, :]
+        rows = start[:, None] + width
+        draft = width < (end - start)[:, None]
+        bad = self.invalid[:, None].expand_as(tokens)
+        if self.target_invalid.numel():
+            target_bad = self.target_invalid[
+                rows.clamp(max=self.target_invalid.numel() - 1).long()
+            ]
+            bad = torch.where(draft, target_bad, bad)
+        return (bad & (tokens >= 0)).any(dim=1)
+
+
+def _guard_empty_rows(logits):
+    invalid = ~torch.isfinite(logits).any(dim=-1)
+    logits[:, 0] = torch.where(invalid, 0.0, logits[:, 0])
+    return invalid
+
+
+def _error_tokens(tokens, failure):
+    mask = failure if tokens.ndim == 1 else failure[:, None]
+    return tokens.masked_fill(mask, -2)

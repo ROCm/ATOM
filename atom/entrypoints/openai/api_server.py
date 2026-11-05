@@ -583,6 +583,7 @@ def _build_sampling_params(
     max_tokens_is_default: bool = False,
     logprobs: bool = False,
     top_logprobs: int = 0,
+    min_tokens: int = 0,
 ) -> SamplingParams:
     from .model_capabilities import deployment_metadata
 
@@ -608,6 +609,7 @@ def _build_sampling_params(
         required_channel=required_channel,
         logprobs=logprobs,
         top_logprobs=top_logprobs,
+        min_tokens=min_tokens,
     )
 
 
@@ -708,6 +710,8 @@ def _validate_sequence_context_length(seq, sampling_params=None) -> None:
         if remaining <= 0:
             raise ValueError("The prompt leaves no context space for output tokens")
         seq.max_tokens = min(seq.max_tokens, remaining)
+        if getattr(sampling_params, "min_tokens", 0) > seq.max_tokens:
+            raise ValueError("min_tokens exceeds the remaining output context budget")
     _validate_context_length(
         seq.num_prompt_tokens,
         seq.max_tokens,
@@ -1950,6 +1954,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             ),
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
+            min_tokens=request.min_tokens,
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
@@ -2240,6 +2245,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
             ),
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
+            min_tokens=request.min_tokens,
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
