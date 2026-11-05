@@ -318,6 +318,8 @@ class DSparkDraftModel(nn.Module):
     # A pool of the draft's own, outside the target's DCP group. None is the
     # generic pool, inside the group.
     kv_pool_spec: ClassVar[DraftKvPoolSpec | None] = None
+    # A draft that loads its own embedding (K3 DSpark on PP stage > 0) keeps it.
+    own_embed_tokens: bool = False
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
         """Mask padded writes for models whose draft pass mutates private KV."""
@@ -469,12 +471,15 @@ class DSparkDraftModel(nn.Module):
         ``.model``. The vocabularies must agree or the shared LM head would
         silently score the wrong rows.
         """
-        target_vocab = int(target_base.model.embed_tokens.num_embeddings)
+        # The head the draft scores with; embed_tokens may be a PPMissingLayer
+        # under PP.
+        target_vocab = int(target_base.lm_head.num_embeddings)
         if target_vocab != self.vocab_size:
             raise ValueError(
                 f"{type(self).__name__} draft vocab {self.vocab_size} != target "
                 f"vocab {target_vocab}. The draft shares the target's embedding "
                 "and LM head, so the two must agree."
             )
-        self.embed_tokens = target_base.model.embed_tokens
+        if not self.own_embed_tokens:
+            self.embed_tokens = target_base.model.embed_tokens
         self.lm_head = target_base.lm_head

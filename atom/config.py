@@ -1267,17 +1267,28 @@ def _standalone_dspark_field(hf_config: PretrainedConfig, field: str):
 K3_DFLASH_ARCH = "K3DFlashModel"
 
 # Checked against the target separately: the rename sees only the draft, and
-# SpecForge stamps the same arch on every DFlash draft.
+# SpecForge stamps the same arch on every DFlash draft. Kimi-K3.1 arrives here
+# as Kimi-K3 (ARCH_ALIASES).
 _K3_DFLASH_TARGET_ARCHS: frozenset[str] = frozenset({"KimiK3ForConditionalGeneration"})
 
 
 def _check_dflash_draft_target(
-    target_hf: PretrainedConfig, draft_hf: PretrainedConfig | None
+    target_hf: PretrainedConfig,
+    draft_hf: PretrainedConfig | None,
+    pipeline_parallel_size: int = 1,
 ) -> None:
-    """Refuse a SpecForge DFlash draft paired with a non-Kimi-K3 target."""
+    """Refuse a SpecForge DFlash draft paired with a non-Kimi-K3 target or
+    run with pipeline parallelism."""
     draft_arch = (getattr(draft_hf, "architectures", None) or [""])[0]
     if draft_arch != K3_DFLASH_ARCH:
         return
+    if pipeline_parallel_size > 1:
+        raise ValueError(
+            "A SpecForge DFlash draft is not supported with "
+            "pipeline_parallel_size > 1: its aggregate tap is scored by the next "
+            "target layer, which another stage may own, and it shares the "
+            "target's embedding, a PPMissingLayer on the drafter's stage."
+        )
     target_arch = (getattr(target_hf, "architectures", None) or [""])[0]
     if target_arch not in _K3_DFLASH_TARGET_ARCHS:
         raise ValueError(
@@ -2670,7 +2681,9 @@ class Config:
             num_spec = self.speculative_config.num_speculative_tokens
             is_dspark = getattr(self.speculative_config, "use_dspark", lambda: False)()
             draft_cfg = self.speculative_config.draft_model_hf_config
-            _check_dflash_draft_target(self.hf_config, draft_cfg)
+            _check_dflash_draft_target(
+                self.hf_config, draft_cfg, self.pipeline_parallel_size
+            )
             if not is_dspark:
                 # Sequential drafters (MTP / Eagle): one drafted token per
                 # backbone pass, and the drafter just repeats that pass, so the
