@@ -21,7 +21,9 @@ logger = logging.getLogger("atom")
 
 # Commands whose senders never wait, so their handlers answer nothing and a
 # synchronous caller could only wait out its timeout on them.
-FIRE_AND_FORGET_UTILITY_CMDS = frozenset({"abort_request", "get_mtp_stats"})
+FIRE_AND_FORGET_UTILITY_CMDS = frozenset(
+    {"abort_request", "get_mtp_stats", "release_structured_requests"}
+)
 WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
     {"update_weights", "update_weights_shm", "update_weights_ipc"}
 )
@@ -105,6 +107,7 @@ class EngineUtilityHandler:
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
         "abort_request": "_handle_abort_request",
+        "release_structured_requests": "_handle_release_structured_requests",
         COLLECTIVE_RPC_CMD: "_handle_collective_rpc",
     }
 
@@ -633,6 +636,9 @@ class EngineUtilityHandler:
         logger.info(f"{self.label}: KV cache cleared")
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
+
+    def _handle_release_structured_requests(self, args: dict):
+        self.runner_mgr.call_func("release_structured_requests", args["request_ids"])
 
     def _handle_abort_request(self, args: dict):
         """Cancel queued work promptly; running forwards finish via postprocess."""

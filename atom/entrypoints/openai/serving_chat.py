@@ -9,12 +9,15 @@ from collections.abc import AsyncGenerator
 from functools import partial
 from typing import Any
 
+from atom.structured_output.validation import raise_for_structured_error
+
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
     STREAM_DONE_MESSAGE,
     TOOL_CHOICE_VALUES,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ended_by_stop,
     openai_stop_reason_with_calls,
 )
 from .reasoning import (
@@ -127,6 +130,63 @@ def validate_tool_list(tools: Any) -> None:
         seen.add(name)
 
 
+def _message_field(msg: Any, key: str) -> Any:
+    return msg.get(key) if isinstance(msg, dict) else getattr(msg, key, None)
+
+
+def request_tools(request: ChatCompletionRequest) -> list:
+    """Every tool the request declares: the top-level list plus the tools
+    Kimi-K3 lets a message declare (dynamic tools), in order."""
+    messages = request.messages if request.messages is not None else request.prompt
+    declared = [_message_field(m, "tools") for m in messages or []]
+    return [
+        *(request.tools or []),
+        *(t for tools in declared if isinstance(tools, list) for t in tools),
+    ]
+
+
+def _validate_message_tools(messages: Any) -> None:
+    """Each message's dynamic tools pass the same shape check as top-level
+    tools. Names are checked for duplicates within one declaration only."""
+    for i, msg in enumerate(messages or []):
+        tools = _message_field(msg, "tools")
+        if tools is None:
+            continue
+        try:
+            validate_tool_list(tools)
+        except ValueError as exc:
+            sep = "." if str(exc).startswith("tools") else ".tools: "
+            raise ValueError(f"messages[{i}]{sep}{exc}") from exc
+
+
+def validate_history_tool_calls(messages: Any) -> None:
+    """History tool_calls must carry a function name and renderable arguments."""
+    for i, msg in enumerate(messages or []):
+        tool_calls = _message_field(msg, "tool_calls")
+        if tool_calls is None:
+            continue
+        if not isinstance(tool_calls, list):
+            raise ValueError(  # noqa: TRY004
+                f"messages[{i}].tool_calls must be an array"
+            )
+        for j, tc in enumerate(tool_calls):
+            where = f"messages[{i}].tool_calls[{j}]"
+            if not isinstance(tc, dict):
+                raise ValueError(f"{where} must be an object")  # noqa: TRY004
+            # Kimi-K3's encoder also takes the flat {"name", "arguments"} form.
+            fn = tc.get("function", tc)
+            if not isinstance(fn, dict):
+                raise ValueError(f"{where}.function must be an object")  # noqa: TRY004
+            name = fn.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"{where}.function.name must be a non-empty string")
+            args = fn.get("arguments")
+            if args is not None and not isinstance(args, (str, dict)):
+                raise ValueError(
+                    f"{where}.function.arguments must be a string or an object"
+                )
+
+
 def validate_chat_request(request: ChatCompletionRequest) -> None:
     """Validate tool / tool_choice / response_format shape before dispatch.
 
@@ -140,6 +200,9 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
         if include_usage is not None and type(include_usage) is not bool:
             raise ValueError("stream_options.include_usage must be a boolean")
     validate_tool_list(request.tools)
+    messages = request.messages if request.messages is not None else request.prompt
+    _validate_message_tools(messages)
+    validate_history_tool_calls(messages)
 
     tool_choice = request.tool_choice
     if tool_choice is not None:
@@ -148,6 +211,8 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
                 raise ValueError(
                     f"tool_choice string must be one of {sorted(TOOL_CHOICE_VALUES)}"
                 )
+            if tool_choice == "required" and not request_tools(request):
+                raise ValueError("tool_choice 'required' needs a non-empty tools list")
         elif isinstance(tool_choice, dict):
             if tool_choice.get("type") != "function":
                 raise ValueError("tool_choice object must have type 'function'")
@@ -156,10 +221,11 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
                 raise ValueError(  # noqa: TRY004
                     "tool_choice.function.name must be a string"
                 )
-            # A named tool_choice must reference a declared tool.
+            # A named tool_choice must reference a declared tool, top-level or
+            # declared in a message.
             names = {
                 qualified_tool_name(t)
-                for t in (request.tools or [])
+                for t in request_tools(request)
                 if isinstance(t, dict) and isinstance(t.get("function"), dict)
             }
             if qualified_tool_name(tool_choice) not in names:
@@ -180,6 +246,8 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
             js = rf.get("json_schema")
             if not isinstance(js, dict) or not isinstance(js.get("schema"), dict):
                 raise ValueError("response_format.json_schema.schema must be an object")
+            if js.get("strict") is not None and type(js["strict"]) is not bool:
+                raise ValueError("response_format.json_schema.strict must be a boolean")
 
 
 def create_chat_chunk(
@@ -317,6 +385,7 @@ async def stream_chat_response(
         role_sent = False
         while True:
             chunk_data = await stream_collector.get()
+            raise_for_structured_error(chunk_data.get("finish_reason"))
 
             if not role_sent:
                 yield make_chunk(
@@ -337,7 +406,9 @@ async def stream_chat_response(
             # Phase 1: Process through reasoning filter
             segments = reasoning_filter.process(new_text)
             if chunk_data.get("finished", False):
-                segments.extend(reasoning_filter.flush())
+                segments.extend(
+                    reasoning_filter.flush(stopped=ended_by_stop(engine_finish_reason))
+                )
 
             # Phase 2: For content segments, check for tool calls
             for field, text in segments:
@@ -424,7 +495,10 @@ def _build_chat_choice(
     (SamplingParams.n>1) can reuse the reasoning + tool-call separation
     without duplicating the logic.
     """
-    reasoning_content, content_with_tools = reasoning.split(raw_text)
+    raise_for_structured_error(finish_reason)
+    reasoning_content, content_with_tools = reasoning.split(
+        raw_text, stopped=ended_by_stop(finish_reason)
+    )
     content, tool_calls = parse_tool_calls(
         content_with_tools,
         tools,
@@ -626,6 +700,7 @@ async def stream_chat_response_fanout(
         role_sent = [False] * n
         while not all(finished):
             idx, chunk_data = await shared_collector.get()
+            raise_for_structured_error(chunk_data.get("finish_reason"))
 
             if not role_sent[idx]:
                 yield make_chunk(
@@ -652,7 +727,11 @@ async def stream_chat_response_fanout(
 
             segments = reasoning_filters[idx].process(new_text)
             if chunk_data.get("finished", False):
-                segments.extend(reasoning_filters[idx].flush())
+                segments.extend(
+                    reasoning_filters[idx].flush(
+                        stopped=ended_by_stop(engine_finish_reasons[idx])
+                    )
+                )
 
             for field, text in segments:
                 if field == "reasoning_content":

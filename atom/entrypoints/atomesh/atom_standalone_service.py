@@ -35,6 +35,7 @@ from atom.entrypoints.openai.protocol import (
     STREAM_DONE_MESSAGE,
     TEXT_COMPLETION_OBJECT,
     CompletionRequest,
+    ended_by_stop,
     openai_stop_reason,
     openai_stop_reason_with_calls,
 )
@@ -801,7 +802,11 @@ class ChatCompletionStreamState:
 
         segments = self.reasoning_filters[index].process(text)
         if event.get("finished", False):
-            segments.extend(self.reasoning_filters[index].flush())
+            segments.extend(
+                self.reasoning_filters[index].flush(
+                    stopped=ended_by_stop(self.engine_finish_reasons[index])
+                )
+            )
 
         for field, segment_text in segments:
             if field == "reasoning_content":
@@ -1683,6 +1688,11 @@ class AtomStandaloneService:
         *,
         chat: bool = False,
     ) -> SamplingParams:
+        response_format = self._request_field(request, "response_format")
+        if response_format is not None and response_format.get("type") != "text":
+            raise ValueError(
+                "Structured response_format requires the native OpenAI entrypoint"
+            )
         # Only a chat request can be held to the tools channel, as on the
         # OpenAI server: a completion's prompt is not in the chat format.
         required_channel = (

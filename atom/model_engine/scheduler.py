@@ -66,6 +66,7 @@ from atom.model_engine.state_runtime import (
 )
 from atom.observability import tracing
 from atom.sampling_params import RequiredChannel
+from atom.structured_output import StructuredRequest
 from atom.utils import envs
 
 if TYPE_CHECKING:
@@ -219,6 +220,11 @@ class ScheduledBatch:
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
         self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
+        self.structured_requests = {}
+        for i, seq in enumerate(seqs.values()):
+            if seq.json_schema is None:
+                continue
+            self.structured_requests[i] = StructuredRequest.capture(seq)
         # `context_lens` is set further down, once `num_cached_tokens` is known:
         # a chunked prefill's context ends at this chunk, not at the whole
         # prompt, so `seq.num_tokens` is only right for decode.
@@ -582,8 +588,10 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        structured_errors: dict[int, str] | None = None,
     ):
         self.req_ids = req_ids
+        self.structured_errors = structured_errors or {}
         self.token_ids = token_ids
         self.draft_token_ids = self._copy_array_view(draft_token_ids)
         self.num_rejected = self._copy_array_view(num_rejected)
@@ -2103,6 +2111,13 @@ class Scheduler:
                     self._next_decode_completion_steps()
                     if not prefillable and not waiting_requests
                     else None
+                ),
+                # prefill_admit_policy adaptive: what a FIRE could add to the
+                # decode batch -- partials plus waiting heads up to free slots
+                admittable_requests=self._partial_prefill_count
+                + min(
+                    len(self.waiting),
+                    max(0, self.max_num_seqs - len(self.running)),
                 ),
             )
         else:
@@ -4206,6 +4221,30 @@ class Scheduler:
             num_placeholder += 1
 
         for seq in self.running:
+            error = getattr(fwd_output, "structured_errors", {}).get(seq.id)
+            if error is not None:
+                logger.error(
+                    "Structured decoding failed for request %s: %s", seq.id, error
+                )
+                self._mark_finished(
+                    seq,
+                    "structured_output_error",
+                    seq.num_tokens - seq.num_placeholder_tokens,
+                )
+                finished_seqs.append(seq)
+                if stream_output_queue is not None:
+                    stream_outputs.append(
+                        (
+                            seq.id,
+                            RequestOutput(
+                                request_id=seq.id,
+                                output_tokens=[],
+                                finished=True,
+                                finish_reason="structured_output_error",
+                            ),
+                        )
+                    )
+                continue
             # Cancellation does not require sampled output. Middle prefill
             # chunks and the first deferred step may have none; waiting for
             # one keeps an aborted request alive without advancing its tokens.
