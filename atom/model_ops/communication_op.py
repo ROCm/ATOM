@@ -56,3 +56,19 @@ def tensor_model_parallel_all_reduce(x: torch.Tensor) -> torch.Tensor:
     from aiter.dist.communication_op import tensor_model_parallel_all_reduce as ar
 
     return ar(x)
+
+
+def tensor_model_parallel_all_reduce_add(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """TP all_reduce of ``x + y``. Where the device communicator folds the add into
+    the all-reduce the sum is never materialized; on the TBO path, and where aiter
+    predates the fused op, it is the add followed by `tensor_model_parallel_all_reduce`.
+    """
+    from aiter.dist import communication_op as aiter_comm
+    from aiter.dist.parallel_state import get_tp_group
+
+    fused = getattr(aiter_comm, "tensor_model_parallel_all_reduce_add", None)
+    if fused is None or _tbo_aware_tp_reduce(get_tp_group().world_size):
+        return tensor_model_parallel_all_reduce(x + y)
+    return fused(x, y)
