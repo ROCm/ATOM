@@ -17,3 +17,17 @@ def native_quant_config(*, fp4=False):
         activation_dtype=torch.float8_e4m3fn,
     )
     return config
+
+
+def ptpc_quant_config():
+    """Per-channel FP8 weights, dynamic per-token activations."""
+    from aiter import dtypes
+
+    config = QuantizationConfig()
+    config.global_spec = LayerQuantConfig(
+        quant_type=QuantType.per_Token,
+        quant_dtype=dtypes.fp8,
+        activation_dtype=dtypes.fp8,
+        is_dynamic=True,
+    )
+    return config

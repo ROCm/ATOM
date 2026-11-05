@@ -32,8 +32,8 @@ from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 from .attention import Attention
-from .config import build_attention_topology
-from .layers import native_quant_config
+from .config import build_attention_topology, is_fp4_ptpc
+from .layers import native_quant_config, ptpc_quant_config
 from .moe import MoE
 
 
@@ -105,7 +105,11 @@ class Block(nn.Module):
                 width,
                 hc,
                 config.rms_norm_eps,
-                quant_config=native_quant_config(),
+                quant_config=(
+                    ptpc_quant_config()
+                    if is_fp4_ptpc(config)
+                    else native_quant_config()
+                ),
             )
 
     def process_weights_after_loading(self):

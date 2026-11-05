@@ -665,6 +665,14 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
     routed_spec = _detect_v4_routed_quant_spec(
         hf_config, base, fp4_spec, fp8_block_spec
     )
+    quant = getattr(hf_config, "quantization_config", None) or {}
+    ptpc_shared = None
+    if isinstance(quant, dict) and quant.get("quant_method") == "w8a8_fp8":
+        ptpc_shared = LayerQuantConfig(
+            quant_type=QuantType.per_Token,
+            quant_dtype=dtypes.fp8,
+            is_dynamic=True,
+        )
 
     # V4-Flash-FP8 ships ``wo_a`` already dequanted to BF16 on disk (no
     # ``.scale`` companion). Probe the ckpt; when wo_a is BF16, allocate it
@@ -694,6 +702,15 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
         # crash on the moe assert or further damage already-quantized weights).
         if ".ffn.experts" in layer_name:
             return routed_spec
+        # FP4PTPC converts the shared expert off 32x32 FP8 onto per-channel
+        # scales. Routed experts stay on the FP4 spec above. MTP keeps the
+        # source block scales (`keep_rules` prefix `mtp.`).
+        if (
+            ptpc_shared
+            and ".shared_experts" in layer_name
+            and not layer_name.startswith("mtp")
+        ):
+            return ptpc_shared
         # BF16 / fp32 raw paths
         if (
             ".compressor.wkv" in layer_name
@@ -741,7 +758,14 @@ def _detect_v4_routed_quant_spec(hf_config, base, fp4_spec, fp8_block_spec):
     """
 
     # ── 1. HF config expert_dtype hint ──
+    # V4.1 writes this inside quantization_config (native fp8 and FP4PTPC
+    # both set "fp4"). A top-level attribute is accepted too. Check fp4
+    # before the w8a8_fp8 heuristic, which would otherwise see "fp8" in
+    # the method name and pick a 128-block FP8 expert.
+    qc = getattr(hf_config, "quantization_config", None) or {}
     expert_dtype = getattr(hf_config, "expert_dtype", None) or ""
+    if isinstance(qc, dict) and not expert_dtype:
+        expert_dtype = qc.get("expert_dtype") or ""
     if isinstance(expert_dtype, str):
         ed = expert_dtype.lower()
         if "fp4" in ed:
@@ -2759,7 +2783,12 @@ class Expert(nn.Module):
         # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
         # quant through a single aiter triton kernel. The fused kernel emits
         # FP8 + scale; w2 accepts `x_scale` and skips its own quant step.
-        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION
+        # A per-channel PTPC w2 quantizes the BF16 activation itself. The
+        # fused kernel's scale is a group scale, not that per-token scale.
+        self.use_fused_clamp_act_mul = (
+            _V4_USE_TRITON_FUSION
+            and self.w2.quant_type.value != QuantType.per_Token.value
+        )
 
     def forward(
         self,

@@ -35,8 +35,24 @@ from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 from atom.utils import forward_context
 from atom.utils.region_graph import eager_region, forks, join_stream
 
-from .config import AttentionMode
-from .layers import native_quant_config
+from .config import AttentionMode, is_fp4_ptpc
+from .layers import native_quant_config, ptpc_quant_config
+
+
+class _Bf16QKNorm:
+    """BF16 Q and K norms for a PTPC query GEMM.
+
+    The MXFP8 dual norm feeds a group-32 GEMM. A per-channel weight quantizes
+    its own BF16 activation, so the Q latent stays in BF16 and the scale slot
+    the rest of the forward still unpacks is empty.
+    """
+
+    def __init__(self, q_norm, k_norm):
+        self.q_norm = q_norm
+        self.k_norm = k_norm
+
+    def __call__(self, q, k):
+        return self.q_norm(q), None, self.k_norm(k)
 
 
 def _live_step():
@@ -62,10 +78,11 @@ class Indexer(nn.Module):
             config.candidate_block_size,
             config.candidate_topk_blocks,
         )
+        self.ptpc = is_fp4_ptpc(config) and spec.layer_id < config.num_hidden_layers
         self.wq_b = ReplicatedLinear(
             config.q_lora_rank,
             self.heads * self.head_dim,
-            quant_config=native_quant_config(),
+            quant_config=ptpc_quant_config() if self.ptpc else native_quant_config(),
         )
         self.weights_proj = ReplicatedLinear(config.hidden_size, self.heads, bias=False)
         if spec.mode == AttentionMode.FULL:
@@ -234,36 +251,45 @@ class Attention(nn.Module):
         )
         self.softmax_scale = self.head_dim**-0.5
         self.attn_sink = atom_parameter(torch.empty(self.heads, dtype=torch.float32))
+        # Backbone FP4PTPC stores these dense linears per-channel. wo_a and the
+        # draft layers stay on the native 32x32 contract the checkpoint kept.
+        self.ptpc = is_fp4_ptpc(config) and spec.layer_id < config.num_hidden_layers
+        dense = ptpc_quant_config() if self.ptpc else native_quant_config()
         # Fused [wq_a; wkv], as V4 declares it: one GEMM, and one
         # quantization of the residual instead of two of each.
         self.wqkv_a = MergedReplicatedLinear(
             config.hidden_size,
             [config.q_lora_rank, self.head_dim],
             bias=False,
-            quant_config=native_quant_config(),
+            quant_config=dense,
         )
         # Fused: the norm emits `(qr, qr_scale)` in the one launch, and both
         # readers of `qr` -- this layer's `wq_b` and the indexer's -- take that
-        # pair instead of quantizing the same tensor once each.
+        # pair instead of quantizing the same tensor once each. PTPC readers
+        # quantize a BF16 latent themselves, so that fuse stays off.
         self.q_norm = RMSNorm(
             config.q_lora_rank,
             config.rms_norm_eps,
-            fused_quant=True,
-            quant_config=native_quant_config(),
+            fused_quant=not self.ptpc,
+            quant_config=None if self.ptpc else native_quant_config(),
         )
         self.wq_b = ColumnParallelLinear(
             config.q_lora_rank,
             config.num_attention_heads * self.head_dim,
-            quant_config=native_quant_config(),
+            quant_config=dense,
         )
         self.kv_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         # Both latents are slices of the one `wqkv_a` output and neither norm
         # reads the other's result, so they are one launch rather than two.
-        self.qk_norm = DualRMSNormMXFP8(
-            self.q_norm,
-            self.kv_norm,
-            f"layers.{spec.layer_id}.qk_norm",
-            amax_floor=AMAX_FLOOR.value,
+        self.qk_norm = (
+            _Bf16QKNorm(self.q_norm, self.kv_norm)
+            if self.ptpc
+            else DualRMSNormMXFP8(
+                self.q_norm,
+                self.kv_norm,
+                f"layers.{spec.layer_id}.qk_norm",
+                amax_floor=AMAX_FLOOR.value,
+            )
         )
         # wo_a: grouped LoRA, FP8 + 32x32 e8m0 block scale. Allocated as a
         # quantized ColumnParallelLinear so both tensors load through the
@@ -280,7 +306,7 @@ class Attention(nn.Module):
         self.wo_b = RowParallelLinear(
             config.o_groups * self.o_rank,
             config.hidden_size,
-            quant_config=native_quant_config(),
+            quant_config=dense,
             reduce_results=True,
         )
         self.compressor = (
@@ -364,6 +390,8 @@ class Attention(nn.Module):
         return self.wo_b(y.view(*output.shape[:-2], -1))
 
     def _wo_a_group32_batched(self, x_fp8, x_scale, weight, weight_scale, dtype):
+        import os
+
         from atom.model_ops.blockscale import (
             _activations_for_ocp_group32,
             _units,
@@ -374,8 +402,6 @@ class Attention(nn.Module):
             gemm_fp8_bf16_dequant_batched,
             gemm_fp8_local,
         )
-
-        import os
 
         cu_num = _units(x_fp8.device.index)
         if _use_group32_bf16_fallback() and os.environ.get(
@@ -524,15 +550,24 @@ class Attention(nn.Module):
         """``queries``: bounded replay's `QueryRows`, the rows of ``step`` this
         layer is asked outputs for; KV is still every row's."""
         compressed = self._fork_compress(hidden, cache, step, rope)
-        q_lora, kv_pre = self.project_qkv(
-            hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
-        )
+        # PTPC wqkv_a quantizes the BF16 residual. The MXFP8 pair from the
+        # seam is the native group-32 activation, and feeding it here would
+        # apply a block scale to a per-channel GEMM.
+        if self.ptpc:
+            q_lora, kv_pre = self.project_qkv(hidden, None)
+        else:
+            q_lora, kv_pre = self.project_qkv(
+                hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
+            )
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         self._fork_select(
             hidden, qr, qr_scale, cache, step, rope, compressed=compressed
         )
         if queries is not None:
-            qr, qr_scale = queries.take(qr, qr_scale)
+            if qr_scale is None:
+                (qr,) = queries.take(qr)
+            else:
+                qr, qr_scale = queries.take(qr, qr_scale)
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
