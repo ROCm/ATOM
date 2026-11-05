@@ -13,6 +13,7 @@ import types
 import pytest
 import torch
 
+pytest.importorskip("aiter")
 import atom.models.minimax_m3.dspark as m3
 from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_BYTES
 
