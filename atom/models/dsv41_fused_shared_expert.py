@@ -26,24 +26,31 @@ def fused_scale_kwargs(native_a8_group_rows: Any | None) -> dict:
     return _FUSED_SCALE_BLOCKSCALE
 
 
-def shared_expert_fused_act_enabled(intermediate_per_rank: int) -> bool:
+def shared_expert_fused_act_enabled(
+    intermediate_per_rank: int, native_mx: bool = False
+) -> bool:
     """Whether this rank's shared expert takes ``fused_clamp_act_mul``.
 
-    The kernel asserts the half width is at least 128 and a multiple of 128.
-    With the flag on and a width that fails that, log once and keep the
-    unfused path (V4.1-Flash at TP4 is 576, at TP8 is 288).
+    The kernel quantizes whole scale groups of the half width: 32 columns for a
+    native MX ``w2`` (1x32 E8M0 activations), 128 for a blockscale one. With the
+    flag on and a width that is not a whole number of groups, log once and keep
+    the unfused path. V4.1-Flash's shared expert (2304) is native MX, so every TP
+    up to 8 qualifies (576 at TP4, 288 at TP8).
     """
     global _fused_width_fallback_logged
     if not envs.ATOM_V4_USE_TRITON_FUSION:
         return False
-    if intermediate_per_rank >= 128 and intermediate_per_rank % 128 == 0:
+    group = 32 if native_mx else 128
+    if intermediate_per_rank >= group and intermediate_per_rank % group == 0:
         return True
     if not _fused_width_fallback_logged:
         _fused_width_fallback_logged = True
         logger.info(
             "ATOM_V4_USE_TRITON_FUSION is set, but this rank's shared-expert "
-            "intermediate is %d (fused_clamp_act_mul needs a multiple of 128, "
-            "at least 128). Using the unfused path.",
+            "intermediate is %d (fused_clamp_act_mul needs a multiple of %d, "
+            "at least %d). Using the unfused path.",
             intermediate_per_rank,
+            group,
+            group,
         )
     return False
