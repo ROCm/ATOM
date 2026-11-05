@@ -29,9 +29,9 @@ recipe), [`DSpark.md`](DSpark.md).
 
 | Band | CONC | Serving defaults |
 |---|---|---|
-| Interactive | 1, 4 | TP8, **DCP=1**, DSpark **7**, synthetic AL **3.84**, **mono decode on**, KDA state FP32, GPU prefix cache only |
-| Mid | 14, 16 | TP8, **DCP=8**, DSpark **4**, synthetic AL **3.36**, LMCache **128 GiB**, ReplaySSM, KDA state FP16 |
-| Throughput | 48, 56, 72 | TP8, **DCP=8**, DSpark **4**, synthetic AL **3.36**, LMCache **224 GiB** with a **128 GiB** state cap, on-demand state checkpoints, ReplaySSM |
+| Interactive | 1, 4 | TP8, **DCP=1**, DSpark **7**, synthetic AL **3.21**, **mono decode on**, KDA state FP32, GPU prefix cache only |
+| Mid | 14, 16 | TP8, **DCP=8**, DSpark **4**, synthetic AL **2.92**, LMCache **128 GiB**, ReplaySSM, KDA state FP16 |
+| Throughput | 48, 56, 72 | TP8, **DCP=8**, DSpark **4**, synthetic AL **2.92**, LMCache **224 GiB** with a **128 GiB** state cap, on-demand state checkpoints, ReplaySSM |
 
 ## 0. Container
 
@@ -49,7 +49,9 @@ are now on `main` as #3003.
 ## 1. Start the ATOM Server
 
 Set `CONC` to one of 1, 4, 14, 16, 48, 56 or 72, and set `DRAFT_MODEL_PATH` to a
-local directory holding the Kimi-K3.1 DSpark draft. Then run the launcher below.
+local directory holding the Kimi-K3.1 DSpark draft
+([`Inferact/Kimi-K3.1-Pro-DSpark-preview`](https://huggingface.co/Inferact/Kimi-K3.1-Pro-DSpark-preview),
+the draft the InferenceX golden curve was measured with). Then run the launcher below.
 
 ```bash
 export MODEL_PATH="${MODEL_PATH:-/data/Kimi-K3.1-Pro}"
@@ -74,7 +76,7 @@ export ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1
 # Defaults shared by every band; the case below overrides what differs.
 DCP=1
 NUM_SPECULATIVE_TOKENS=7
-SPEC_DECODE_ACCEPTANCE_LENGTH=3.84
+SPEC_DECODE_ACCEPTANCE_LENGTH=3.21
 MAX_NUM_SEQS=32
 GRAPH_MAX=
 ENABLE_LMCACHE=0
@@ -98,7 +100,7 @@ case "${CONC}" in
     export ATOM_MONO_ENABLE=1
     ;;
   14|16)
-    DCP=8; NUM_SPECULATIVE_TOKENS=4; SPEC_DECODE_ACCEPTANCE_LENGTH=3.36
+    DCP=8; NUM_SPECULATIVE_TOKENS=4; SPEC_DECODE_ACCEPTANCE_LENGTH=2.92
     GRAPH_MAX=$((8 * CONC))
     ENABLE_LMCACHE=1; export LMCACHE_MAX_LOCAL_CPU_SIZE=128
     export ATOM_ENABLE_REPLAYSSM=1
@@ -108,7 +110,7 @@ case "${CONC}" in
     fi
     ;;
   48|56|72)
-    DCP=8; NUM_SPECULATIVE_TOKENS=4; SPEC_DECODE_ACCEPTANCE_LENGTH=3.36
+    DCP=8; NUM_SPECULATIVE_TOKENS=4; SPEC_DECODE_ACCEPTANCE_LENGTH=2.92
     MAX_NUM_SEQS=$((2 * CONC)); GRAPH_MAX=$((2 * CONC))
     ENABLE_LMCACHE=1
     # On-demand state checkpoints at shared-prefix targets; the state cap is a
@@ -183,13 +185,13 @@ rm -rf /root/.cache/atom/*
 
 | CONC | DCP | spec | AL | mono | KDA state | LMCache (state cap) | ReplaySSM | demand ckpt | `max-num-seqs` | graph sizes | delayer | reuse comm groups |
 |---:|---:|---:|---:|---|---|---|---:|---:|---:|---|---|---:|
-| 1 | 1 | 7 | 3.84 | on | fp32 | off | 0 | 0 | 2 | 1–2 | interval 1000000 | 0 |
-| 4 | 1 | 7 | 3.84 | on | fp32 | off | 0 | 0 | 8 | 1–64 | off | 0 |
-| 14 | 8 | 4 | 3.36 | off | fp16 | 128 GiB | 1 | 0 | 32 | 1–112 | off | 0 |
-| 16 | 8 | 4 | 3.36 | off | fp16 | 128 GiB | 1 | 0 | 32 | 1–128 | 4 / 5000 ms | 0 |
-| 48 | 8 | 4 | 3.36 | off | fp32 | 224 GiB (128) | 1 | 1 | 96 | 1–96 | 4 / 5000 ms | 0 |
-| 56 | 8 | 4 | 3.36 | off | fp32 | 224 GiB (128) | 1 | 1 | 112 | 1–112 | 4 / 5000 ms | 1 |
-| 72 | 8 | 4 | 3.36 | off | fp32 | 224 GiB (128) | 1 | 1 | 144 | 1–144 | 4 / 5000 ms | 1 |
+| 1 | 1 | 7 | 3.21 | on | fp32 | off | 0 | 0 | 2 | 1–2 | interval 1000000 | 0 |
+| 4 | 1 | 7 | 3.21 | on | fp32 | off | 0 | 0 | 8 | 1–64 | off | 0 |
+| 14 | 8 | 4 | 2.92 | off | fp16 | 128 GiB | 1 | 0 | 32 | 1–112 | off | 0 |
+| 16 | 8 | 4 | 2.92 | off | fp16 | 128 GiB | 1 | 0 | 32 | 1–128 | 4 / 5000 ms | 0 |
+| 48 | 8 | 4 | 2.92 | off | fp32 | 224 GiB (128) | 1 | 1 | 96 | 1–96 | 4 / 5000 ms | 0 |
+| 56 | 8 | 4 | 2.92 | off | fp32 | 224 GiB (128) | 1 | 1 | 112 | 1–112 | 4 / 5000 ms | 1 |
+| 72 | 8 | 4 | 2.92 | off | fp32 | 224 GiB (128) | 1 | 1 | 144 | 1–144 | 4 / 5000 ms | 1 |
 
 All bands use FP8 KV, block size 128, `--max-num-batched-tokens 8192`,
 `--gpu-memory-utilization 0.9`, `--state-checkpoint-interval-tokens -1`,
@@ -206,12 +208,15 @@ follows the KV cache and is FP8, which is what the NoPE index writer needs.
 DSpark draft still runs, but the rejection sampler commits draft tokens so that
 the mean accepted length per forward converges to the given value, whatever the
 draft actually predicts. The values are the InferenceX golden lengths for
-Kimi-K3 DSpark: **3.84** at `--num-speculative-tokens 7` and **3.36** at 4. The
+Kimi-K3.1 Pro DSpark (curve
+`kimi-k3.1-pro__dspark__kimi-k3.1-pro-dspark-preview__probabilistic-block`,
+thinking on): **3.21** at `--num-speculative-tokens 7` and **2.92** at 4. They
+are lower than the Kimi-K3 values (3.84 and 3.36). The
 InferenceX harness injects them into every AgentX performance job, and they are
 written here so that a local run measures the same thing.
 
 The server log shows whether the flag took effect: `[MTP Stats]` should report
-`Average toks/fwd` at the target value (3.36 or 3.84).
+`Average toks/fwd` at the target value (2.92 or 3.21).
 
 This mode is **performance-only**. Do not pass the flag for GSM8K or any other
 correctness run.
@@ -220,7 +225,7 @@ correctness run.
 
 | Item | #4307 | This recipe | Reason |
 |---|---|---|---|
-| Model / draft | `moonshotai/Kimi-K3`, `Inferact/Kimi-K3-DSpark` | `moonshotai/Kimi-K3.1-Pro`, Kimi-K3.1 DSpark draft | K3.1 |
+| Model / draft | `moonshotai/Kimi-K3`, `Inferact/Kimi-K3-DSpark` | `moonshotai/Kimi-K3.1-Pro`, `Inferact/Kimi-K3.1-Pro-DSpark-preview` | K3.1 |
 | `ATOM_GDN_SSM_DTYPE` at CONC 14/16 | fp32 | fp16 | fp32 is a mono requirement and mono is off on these bands; these are the settings the CONC 14/16 runs were made with |
 | `PYTORCH_{HIP,CUDA}_ALLOC_CONF=expandable_segments:True` on DCP8 bands | unset | set | Without it, DCP8 prefill of long contexts (several hundred thousand tokens) failed with `HSA_STATUS_ERROR_OUT_OF_RESOURCES` (free memory 0 MB) or an NCCL watchdog timeout, at CONC 14 and CONC 72. With it set, a CONC 72 run completed prefills past 700K tokens without error. |
 | `--host` | `0.0.0.0` (behind the atomesh frontend) | `127.0.0.1` | Direct ATOM serving; do not expose the port |
@@ -304,7 +309,7 @@ Synthetic acceptance is performance-only. For GSM8K, launch the same band
 |---|---|
 | 1, 4 | 3600-second runs with these settings (mono on, KDA state fp32), with **real** DSpark acceptance. Not yet re-run at the synthetic AL. |
 | 14, 16 | 3600-second runs with these settings, with **real** DSpark acceptance and without the 2272/6284/18432 BF16 tuned rows. Not yet re-run at the synthetic AL. |
-| 48, 56, 72 | 3600-second runs at the synthetic AL 3.36 with LMCache 128/192 GiB, `ATOM_STATE_CHECKPOINT_DEMAND=0`, KDA state fp16 and HERD off (the pre-#4307 settings). The #4307 settings above (224 GiB, demand checkpoints, fp32 state, HERD) are not yet validated on K3.1. |
+| 48, 56, 72 | 3600-second runs at the Kimi-K3 synthetic AL 3.36 (not the K3.1 value) with LMCache 128/192 GiB, `ATOM_STATE_CHECKPOINT_DEMAND=0`, KDA state fp16 and HERD off (the pre-#4307 settings). The #4307 settings above (224 GiB, demand checkpoints, fp32 state, HERD) are not yet validated on K3.1. |
 
 Throughput and interactivity numbers for this exact configuration will be added
 once every band has been re-run from this recipe.
