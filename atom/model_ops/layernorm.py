@@ -764,6 +764,81 @@ def fused_ar_gemma_per_group_supported() -> bool:
     return "gemma_norm" in inspect.signature(method).parameters
 
 
+# aiter's Gluon GEMM + all-reduce + RMSNorm runs up to this many tokens. A larger
+# call runs the GEMM, then the fused all-reduce + RMSNorm.
+_GLUON_GEMM_AR_MAX_TOKENS = 128
+_gluon_gemm_ar_state = None  # the TP CPU group, inboxes and call counters of the kernel
+
+
+@functools.lru_cache(maxsize=1)
+def _gluon_gemm_ar_in_aiter() -> bool:
+    """Whether this aiter has the Gluon GEMM + all-reduce + RMSNorm kernel."""
+    import importlib.util
+
+    name = "aiter.ops.triton.comms.fused.gemm_a16w16_all_reduce_rmsnorm"
+    return importlib.util.find_spec(name) is not None
+
+
+def gluon_gemm_ar_supported(hidden_size: int, k: int) -> bool:
+    """Whether an o_proj / out_proj with this hidden size and K per rank can run with
+    the all-reduce + RMSNorm after it in aiter's gemm_a16w16_all_reduce_rmsnorm:
+    gfx1250, 4 ranks, a hidden size that is a power of 2, and a K that the tiles of
+    the kernel up to 128 tokens divide (a multiple of 512, at least 1024)."""
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return (
+        envs.ATOM_ENABLE_GLUON_GEMM_AR
+        and get_gfx() == "gfx1250"
+        and get_tensor_model_parallel_world_size() == 4
+        and hidden_size >= 256
+        and hidden_size & (hidden_size - 1) == 0
+        and k % 512 == 0
+        and k >= 1024
+        and _gluon_gemm_ar_in_aiter()
+    )
+
+
+def gluon_gemm_ar_init() -> None:
+    """Makes the inboxes of the kernel once. It is collective: all ranks build the
+    layers in the same order."""
+    global _gluon_gemm_ar_state
+    if _gluon_gemm_ar_state is None:
+        from aiter.dist.parallel_state import get_tp_group
+        from aiter.ops.triton.comms.all_reduce import all_reduce_init
+
+        group = get_tp_group().cpu_group
+        _gluon_gemm_ar_state = (group, *all_reduce_init(group, 1 << 20))
+
+
+def _gluon_gemm_allreduce_gemma_rmsnorm_fake(
+    x: Tensor, w: Tensor, residual: Tensor, weight: Tensor, eps: float
+) -> tuple[Tensor, Tensor]:
+    return torch.empty_like(residual), torch.empty_like(residual)
+
+
+@torch_compile_guard(gen_fake=_gluon_gemm_allreduce_gemma_rmsnorm_fake)
+def gluon_gemm_allreduce_gemma_rmsnorm(
+    x: Tensor, w: Tensor, residual: Tensor, weight: Tensor, eps: float
+) -> tuple[Tensor, Tensor]:
+    """Returns the Gemma RMSNorm of residual + all-reduce(x @ w.T), and that sum: a
+    bf16 o_proj / out_proj (w is the (hidden, K) part of this rank) and the norm after
+    it, in one aiter kernel up to 128 tokens."""
+    if x.shape[0] > _GLUON_GEMM_AR_MAX_TOKENS:
+        from aiter.tuned_gemm import tgemm
+
+        y = tgemm.mm(x, w, None, otype=torch.bfloat16)
+        return tensor_model_parallel_fused_allreduce_rmsnorm(
+            y, residual, weight, eps, gemma_norm=True
+        )
+    from aiter.ops.triton.comms.fused.gemm_a16w16_all_reduce_rmsnorm import (
+        gemm_a16w16_all_reduce_rmsnorm,
+    )
+
+    return gemm_a16w16_all_reduce_rmsnorm(
+        x, w, residual, weight, eps, True, *_gluon_gemm_ar_state
+    )
+
+
 class GemmaRMSNorm(nn.Module):
     """RMS normalization for Gemma.
 

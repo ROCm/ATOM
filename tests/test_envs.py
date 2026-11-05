@@ -104,6 +104,9 @@ class TestEnvsDefaults:
     def test_gluon_fused_ar_default_enabled(self):
         assert _get_envs().ATOM_ENABLE_GLUON_FUSED_AR is True
 
+    def test_gluon_gemm_ar_default_enabled(self):
+        assert _get_envs().ATOM_ENABLE_GLUON_GEMM_AR is True
+
     def test_model_sensitive_rmsnorm_default_disabled(self):
         assert _get_envs().ATOM_USE_MODEL_SENSITIVE_RMSNORM is False
 
