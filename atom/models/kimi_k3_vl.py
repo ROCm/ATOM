@@ -490,55 +490,6 @@ class KimiK3VisionTower(nn.Module):
         return tpool_patch_merge(hidden_states, grid_thws, self.merge_kernel_size)
 
 
-def encode_media_in_passes(
-    vision_tower: nn.Module,
-    mm_projector: nn.Module,
-    pixel_values: torch.Tensor,
-    grid_thws: torch.Tensor,
-    max_patches: int | None,
-) -> torch.Tensor:
-    """Vision embeddings for ``grid_thws``, bounding activation memory per pass.
-
-    Every tower op is per grid (position embedding, 2D RoPE, varlen attention
-    bounded by ``cu_seqlens``, temporal pooling) or per token, so encoding whole
-    grids in consecutive groups returns the same rows in the same order. A long
-    video encoded at once (about 490k patches for 40 s at 640x480) runs the
-    tower out of HBM and takes every model runner down with it.
-    """
-    sizes = [int(t) * int(h) * int(w) for t, h, w in grid_thws.tolist()]
-    if sum(sizes) != pixel_values.shape[0]:
-        raise ValueError(
-            f"pixel_values has {pixel_values.shape[0]} patches but the grids "
-            f"describe {sum(sizes)}"
-        )
-    if max_patches is None:
-        # No processor config to size passes from: one grid per pass is still
-        # bounded by the largest grid the processor admits.
-        max_patches = max(sizes)
-    if max(sizes) > max_patches:
-        raise ValueError(
-            f"a media grid of {max(sizes)} patches exceeds the {max_patches}-patch "
-            "vision pass; the processor config must cap each grid at one pass"
-        )
-    if sum(sizes) <= max_patches:
-        return mm_projector(vision_tower(pixel_values, grid_thws))
-    outputs = []
-    first = start = patches = 0
-    for index, size in enumerate(sizes + [None]):
-        if size is None or (patches and patches + size > max_patches):
-            outputs.append(
-                mm_projector(
-                    vision_tower(
-                        pixel_values[start : start + patches], grid_thws[first:index]
-                    )
-                )
-            )
-            first, start, patches = index, start + patches, 0
-        if size is not None:
-            patches += size
-    return torch.cat(outputs, dim=0)
-
-
 class KimiK3PatchMergerProjector(nn.Module):
     """PatchMergerMLPV2: projects merged vision patches into the text width."""
 

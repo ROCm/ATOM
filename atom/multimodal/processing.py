@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING, Any
 
 from atom.multimodal import MediaLoader, MultiModalDataDict, normalize_multimodal_data
 from atom.multimodal.media import load_multimodal_data
-from atom.multimodal.registry import get_multimodal_input_builder
+from atom.multimodal.registry import (
+    get_multimodal_input_builder,
+    get_multimodal_modalities,
+)
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -67,8 +70,8 @@ def prepare_multimodal_inputs(
     Chat callers supply a conversation with image markers, in the same order as
     multi_modal_data['image']. Qwen-style processors also accept a rendered text
     prompt, with one image placeholder per item and no chat template applied.
-    Video is accepted when the model's builder declares ``supports_video``
-    (chat conversations only); audio is rejected before any media is loaded.
+    Video is accepted for architectures the registry lists with it (chat
+    conversations only); audio is rejected before any media is loaded.
     """
     media_items = normalize_multimodal_data(multi_modal_data)
     if not media_items:
@@ -76,34 +79,19 @@ def prepare_multimodal_inputs(
     builder = get_multimodal_input_builder(
         atom_config, is_text_prompt=isinstance(prompt, str)
     )
-    supported = {"image"}
-    if getattr(builder, "supports_video", False) and not isinstance(prompt, str):
-        supported.add("video")
+    supported = get_multimodal_modalities(atom_config)
     unsupported = media_items.keys() - supported
     if unsupported:
         raise ValueError(
             f"Native multimodal inference does not support {', '.join(sorted(unsupported))} "
             f"inputs yet; supported modalities: {', '.join(sorted(supported))}"
         )
-    loader = media_loader or MediaLoader()
-    if "video" in media_items:
-        # The builder samples and decodes video with its model's own policy;
-        # hand it the encoded bytes, never a full-rate decode.
-        videos = [_encoded_video(item, loader) for item in media_items["video"]]
-        images = [loader.load_image(item) for item in media_items.get("image", [])]
-        return builder(
-            atom_config,
-            processor,
-            _bind_media_to_messages(prompt, images, videos),
-            images,
-            dict(chat_template_kwargs or {}),
-            tools=tools,
-            videos=videos,
-        )
-    media = load_multimodal_data(media_items, loader)
-    images = media["image"]
+    media = load_multimodal_data(media_items, media_loader or MediaLoader())
+    images = media.get("image", [])
+    videos = media.get("video", [])
     if not isinstance(prompt, str):
-        prompt = _bind_media_to_messages(prompt, images)
+        # Videos reach the builder bound to their conversation parts.
+        prompt = _bind_media_to_messages(prompt, images, videos)
     return builder(
         atom_config,
         processor,
@@ -112,18 +100,6 @@ def prepare_multimodal_inputs(
         dict(chat_template_kwargs or {}),
         tools=tools,
     )
-
-
-def _encoded_video(item: Any, loader: MediaLoader) -> Any:
-    from atom.multimodal import EncodedMedia, VideoData
-
-    if isinstance(item, VideoData):
-        return item
-    if isinstance(item, EncodedMedia):
-        return item.data
-    if isinstance(item, bytes):
-        return item
-    return loader.connector.read(item)
 
 
 def _bind_media_to_messages(
@@ -161,15 +137,3 @@ def _bind_media_to_messages(
                 f"Conversation has {used[kind]} {kind} markers but {len(values)} {kind}s"
             )
     return messages
-
-
-def check_multimodal_processor(atom_config: Config, processor: Any) -> list[str]:
-    """Load-time check of a builder's processor coupling; returns the problems.
-
-    Builders that reach past the processor's public call (Kimi-K3 video) declare
-    ``check_processor``. Problems only disable that path: its requests fail with
-    a ValueError naming them, and the rest of multimodal serving is unaffected.
-    """
-    builder = get_multimodal_input_builder(atom_config)
-    check = getattr(builder, "check_processor", None)
-    return list(check(processor)) if check is not None else []

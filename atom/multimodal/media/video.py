@@ -1,19 +1,35 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Decode an encoded video into uniformly sampled RGB frames (PyAV)."""
+"""Encoded video: probe it, then decode only the sampled frames (PyAV).
+
+The model's input builder chooses the sampling and the frame size; this module
+only reads the container. Probing demuxes packets without decoding them, so a
+request can be refused before any frame is decoded.
+"""
 
 from __future__ import annotations
 
 import io
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
-from ..inputs import VideoData
-
-# A request may carry an arbitrary container; refuse absurd frame counts
-# before any frame is converted to RGB.
+# A request may carry an arbitrary container; refuse absurd frame counts while
+# probing, before anything is decoded.
 MAX_SOURCE_FRAMES = 100_000
+
+
+@dataclass(frozen=True)
+class VideoInfo:
+    """What probing reports: frame count, average frame rate and frame size."""
+
+    num_frames: int
+    fps: float
+    width: int
+    height: int
 
 
 def sample_frame_indices(
@@ -21,9 +37,9 @@ def sample_frame_indices(
 ) -> list[int]:
     """Uniform indices at most ``sample_fps`` per second of source video.
 
-    Matches the Kimi-K3 reference sampler: ``round(total * fps / avg_fps)``
-    frames (at least one, at most ``max_frames`` and ``total``), spread over
-    the whole clip with ``linspace`` and rounded to the nearest frame.
+    ``round(total * fps / avg_fps)`` frames (at least one, at most
+    ``max_frames`` and ``total``), spread over the whole clip with ``linspace``
+    and rounded to the nearest frame.
     """
     if total_frames <= 0:
         raise ValueError("Video input must contain at least one frame")
@@ -50,7 +66,6 @@ def _import_av():
 
 def _open(data: bytes):
     av = _import_av()
-
     try:
         container = av.open(io.BytesIO(data), mode="r")
     except (av.error.FFmpegError, ValueError) as exc:  # type: ignore[attr-defined]
@@ -61,55 +76,68 @@ def _open(data: bytes):
     return container
 
 
-def decode_video(
-    data: bytes, *, sample_fps: float, max_frames: int | None = None
-) -> VideoData:
-    """Sampled frames (THWC uint8 RGB) and each frame's source timestamp.
-
-    Two passes: the first counts decodable frames without converting them,
-    the second keeps only the sampled indices, so memory scales with the
-    sampled frames rather than the clip length.
-    """
+def probe_video(data: bytes) -> VideoInfo:
+    """Count the video stream's frames by demuxing, without decoding."""
     av = _import_av()
-
     container = _open(data)
     try:
         stream = container.streams.video[0]
         rate = stream.average_rate or stream.guessed_rate
-        avg_fps = float(rate) if rate else 0.0
-        total = 0
+        width, height = stream.codec_context.width, stream.codec_context.height
+        count = 0
         try:
-            for _ in container.decode(stream):
-                total += 1
-                if total > MAX_SOURCE_FRAMES:
-                    raise ValueError(f"Video has more than {MAX_SOURCE_FRAMES} frames")
+            for packet in container.demux(stream):
+                # The demuxer ends with an empty flush packet.
+                if packet.size:
+                    count += 1
+                    if count > MAX_SOURCE_FRAMES:
+                        raise ValueError(
+                            f"Video has more than {MAX_SOURCE_FRAMES} frames"
+                        )
         except av.error.FFmpegError as exc:  # type: ignore[attr-defined]
             raise ValueError("Invalid video data") from exc
     finally:
         container.close()
+    if count == 0:
+        raise ValueError("Video input must contain at least one frame")
+    if not width or not height:
+        raise ValueError("Video stream reports no frame size")
+    return VideoInfo(count, float(rate) if rate else 0.0, width, height)
 
-    indices = sample_frame_indices(total, avg_fps, sample_fps, max_frames)
-    wanted = set(indices)
+
+def decode_video_frames(
+    data: bytes,
+    indices: Sequence[int],
+    transform: Callable[[int, Any], np.ndarray],
+) -> tuple[list[np.ndarray], int]:
+    """Decode once, keeping ``transform(position, image)`` of each wanted frame.
+
+    ``indices`` are ascending source frame indices; ``position`` is the
+    frame's place in them and ``image`` is the decoded RGB ``PIL.Image``.
+    Only the transformed frames are kept, so host memory follows the size the
+    transform produces, not the source resolution. Returns the kept frames and
+    the number of frames decoded, which can fall short of the probed count
+    when trailing packets carry no frame.
+    """
+    av = _import_av()
+    wanted = {index: position for position, index in enumerate(indices)}
     last = indices[-1]
-    frames = []
+    frames: list[np.ndarray] = []
+    decoded = 0
     container = _open(data)
     try:
         stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
         try:
             for index, frame in enumerate(container.decode(stream)):
-                if index in wanted:
-                    frames.append(frame.to_ndarray(format="rgb24"))
+                decoded = index + 1
+                position = wanted.get(index)
+                if position is not None:
+                    frames.append(transform(position, frame.to_image()))
                 if index >= last:
                     break
         except av.error.FFmpegError as exc:  # type: ignore[attr-defined]
             raise ValueError("Invalid video data") from exc
     finally:
         container.close()
-    if len(frames) != len(indices):
-        raise ValueError("Video frames changed between decoding passes")
-    if any(frame.shape != frames[0].shape for frame in frames):
-        raise ValueError("Video frames must share one size")
-    return VideoData(
-        frames=np.stack(frames).astype(np.uint8, copy=False),
-        timestamps=tuple(index / avg_fps for index in indices),
-    )
+    return frames, decoded
