@@ -479,12 +479,6 @@ class ScheduledBatch:
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
 
-        # True iff this batch packs at least one prefill chunk together with
-        # at least one decode seq. Consumed by attention backends to dispatch
-        # the prefill rows and decode rows to different kernels (see
-        # docs/mixed_dspark_design.md).
-        self.is_mixed = total_seqs_num_prefill > 0 and total_seqs_num_decode > 0
-
         self.connector_meta_output = connector_meta_output
         self.finished_recving_kv_req_ids: list[int] = []
 
@@ -622,7 +616,6 @@ class ScheduledBatch:
             "total_seqs_num",
             "total_seqs_num_prefill",
             "total_seqs_num_decode",
-            "is_mixed",
             "connector_meta_output",
             "state_maintenance_ops",
             "finished_recving_kv_req_ids",
@@ -703,9 +696,6 @@ class ScheduledBatch:
         result.total_tokens_num_decode = (
             result.total_tokens_num - result.total_tokens_num_prefill
         )
-        result.is_mixed = (
-            result.total_seqs_num_prefill > 0 and result.total_seqs_num_decode > 0
-        )
         result.connector_meta_output = None
         result.state_maintenance_ops = StateMaintenanceOps()
         result.finished_recving_kv_req_ids = []
@@ -716,6 +706,10 @@ class ScheduledBatch:
         result.prefill_gpu_requests = []
         result.detailed_sqsq = result.detailed_sqsk = result.detailed_sk = None
         return result
+
+    @property
+    def is_mixed(self) -> bool:
+        return self.total_seqs_num_prefill > 0 and self.total_seqs_num_decode > 0
 
     def produces_output(self) -> bool:
         """True if this batch yields a token the head must consume.
@@ -1263,6 +1257,7 @@ class Scheduler:
                     resume,
                     pending,
                     cap_from=max(resume, seq.replay_until),
+                    budget=budget,
                 )
                 if not chunk:
                     break
@@ -1420,7 +1415,17 @@ class Scheduler:
         room = max(room, self._balance_min_tokens - batched_tokens)
         return max(min(room, cap_room), 0)
 
-    def _prefill_budget(self) -> int:
+    def _decode_candidates(self, scheduled_seqs=()):
+        """Running rows eligible for decode in this step, in scheduling order."""
+        return (
+            seq
+            for seq in self.running
+            if not seq.is_partial_prefill
+            and seq.id not in self._pp_inflight_token_block
+            and seq.id not in scheduled_seqs
+        )
+
+    def _prefill_budget(self, scheduled_seqs=()) -> int:
         """Tokens this step's prefill may take: the batch budget less the
         decode-first reserve. Under mixed batching every running decode the
         decode loop can schedule this step keeps the width it spends on it
@@ -1436,12 +1441,7 @@ class Scheduler:
         budget = self.max_num_batched_tokens
         if not self.enable_mixed_prefill_decode:
             return budget
-        in_flight = self._pp_inflight_token_block
-        n_decode = sum(
-            1
-            for s in self.running
-            if not s.is_partial_prefill and s.id not in in_flight
-        )
+        n_decode = sum(1 for _ in self._decode_candidates(scheduled_seqs))
         n_decode = min(n_decode, self.max_num_seqs)
         floor = max(1, budget // 8)
         reserve = min(n_decode * (self.decode_spec_width + 1), budget - floor)
@@ -2539,7 +2539,7 @@ class Scheduler:
                 and not offload_resume
                 and self._lookup_detach_enabled(seq)
             ):
-                hbm_probe = self._probe_hbm_prefix(seq)
+                hbm_probe = self._probe_hbm_prefix(seq, scheduled_seqs)
                 probed_tier_kv = self._tier_hit(seq)
                 lookup_detachable = self._can_detach_tier_lookup(seq, hbm_probe)
             if (
@@ -2673,7 +2673,7 @@ class Scheduler:
                 and seq.has_per_req_cache
                 and self._tier_hit(seq) != probed_tier_kv
             ):
-                hbm_probe = self._probe_hbm_prefix(seq)
+                hbm_probe = self._probe_hbm_prefix(seq, scheduled_seqs)
             num_cached_blocks = hbm_probe.num_cached_blocks
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
@@ -3175,6 +3175,13 @@ class Scheduler:
         # which ScheduledBatch.slice_rows preserves for attention segments.
         prefill_seqs = list(scheduled_seqs.values())[:num_seqs_prefill]
 
+        connector_meta_output = None
+        if self.kv_connector is not None:
+            self._publish_state_loads()
+            self._publish_state_stores()
+            self._note_connector_scheduled_tokens(scheduled_seqs, num_scheduled_tokens)
+            connector_meta_output = self.kv_connector.build_connector_meta()
+
         is_final_chunk: list[bool] | None = None
         next_token_ids: list[int] | None = None
         if num_seqs_prefill > 0:
@@ -3192,8 +3199,8 @@ class Scheduler:
                     f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "
                     f"req_ids: {tuple(scheduled_seqs.keys())}"
                 )
-            # Before connector metadata and the batch snapshot: plan_midstep
-            # reserves checkpoints consumed by both.
+            # Connector metadata describes transfers already queued. Midstep
+            # checkpoints are reserved afterwards, before the batch snapshot.
             is_final_chunk, next_token_ids = self._settle_prefill_chunks(
                 prefill_seqs,
                 num_scheduled_tokens[:num_seqs_prefill],
@@ -3214,13 +3221,6 @@ class Scheduler:
                 # check refuses the others -- but leaving the list short would
                 # make that a positional mismatch rather than a clear refusal.)
                 next_token_ids = next_token_ids + [-1] * num_seqs_decode
-
-        connector_meta_output = None
-        if self.kv_connector is not None:
-            self._publish_state_loads()
-            self._publish_state_stores()
-            self._note_connector_scheduled_tokens(scheduled_seqs, num_scheduled_tokens)
-            connector_meta_output = self.kv_connector.build_connector_meta()
 
         self._check_draft_writes_allocated(scheduled_seqs.values())
         batch = ScheduledBatch(
@@ -3555,7 +3555,7 @@ class Scheduler:
             or (seq.kv_transfer_params or {}).get("do_remote_prefill")
         )
 
-    def _probe_hbm_prefix(self, seq: Sequence) -> AdmissionProbe:
+    def _probe_hbm_prefix(self, seq: Sequence, scheduled_seqs=()) -> AdmissionProbe:
         """`can_allocate(record=False)`: the HBM hit in blocks (-1 if the
         request does not fit), the hash chain it walked and the demand its fit
         passed, which `record_allocation` commits.
@@ -3573,14 +3573,10 @@ class Scheduler:
             width = self.decode_spec_width + 1
             seats = min(
                 self.max_num_seqs,
-                (self.max_num_batched_tokens - self._prefill_budget()) // width,
+                (self.max_num_batched_tokens - self._prefill_budget(scheduled_seqs))
+                // width,
             )
-            for running in self.running:
-                if (
-                    running.is_partial_prefill
-                    or running.id in self._pp_inflight_token_block
-                ):
-                    continue
+            for running in self._decode_candidates(scheduled_seqs):
                 if seats == 0:
                     break
                 reserved += self.block_manager.append_blocks_needed(

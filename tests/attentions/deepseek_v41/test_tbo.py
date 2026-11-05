@@ -388,11 +388,14 @@ def test_prefill_microbatches_keep_workspace_tiles_across_layer_interleaving():
 
     builder = make_builder("cuda")
     workspace = ScoreWorkspace(builder.geometry, 32, 4, "cuda")
-    builder.cache.workspace = workspace
-    _, parent = make_parent(
-        "cuda", parts=cut_prefill_ubatches(2, [10, 4], 14), builder=builder
-    )
-    children = parent.ubatches
+    parent.cache.workspace = workspace
+    parts = _split_prefill_token_midpoint(2, [10, 4], 2)
+    children = [
+        builder.build_ubatch_prefill_metadata(
+            parent, part, part.request_slice.stop - part.request_slice.start, i
+        )
+        for i, part in enumerate(parts)
+    ]
     for ratio in (1, 2):
         first = parent.cache.unit_tiles(children[0].step, ratio)
         expected = first.clone()
@@ -457,6 +460,7 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
 
     wrapper = UBatchWrapper(Model(), builder)
     ids = torch.arange(14, device="cuda", dtype=torch.int32)
+    slices = _split_prefill_token_midpoint(2, [9, 5], 2)
     for seed in (7, 31):
         _, tokens, histories, masks = make_batch(mapping, [9, 5], seed)
         fill_step(engram_step, tokens, histories, masks, starts=(3, 8))
@@ -588,7 +592,7 @@ def test_microbatch_steps_are_freed_with_their_step(monkeypatch):
             scheduled_tokens=14,
             running_tokens=14,
         ),
-        ubatch_slices=slices,
+        ubatch_slices=_split_prefill_token_midpoint(2, [9, 5], 2),
     )
     monkeypatch.setattr(_forward_context_local, "ctx", ctx, raising=False)
     gc.collect()
@@ -639,7 +643,7 @@ def test_microbatch_failing_on_the_comm_stream_still_fences_buffer_reuse(
             scheduled_tokens=14,
             running_tokens=14,
         ),
-        ubatch_slices=slices,
+        ubatch_slices=_split_prefill_token_midpoint(2, [9, 5], 2),
     )
     monkeypatch.setattr(_forward_context_local, "ctx", ctx, raising=False)
     waits = []
@@ -928,7 +932,7 @@ def test_dp_moe_original_schedule_preserves_outputs(
             scheduled_tokens=14,
             running_tokens=14,
         ),
-        ubatch_slices=slices,
+        ubatch_slices=_split_prefill_token_midpoint(2, [10, 4], 2),
     )
     monkeypatch.setattr(_forward_context_local, "ctx", ctx, raising=False)
     model = Model(config)
@@ -979,7 +983,8 @@ def test_prefill_microbatch_runs_its_own_tokens(monkeypatch, parent_unified):
             running_tokens=14,
             running_tokens_are_unified=parent_unified,
         ),
-        ubatch_slices=slices,
+        ubatch_slices=_split_prefill_token_midpoint(2, [10, 4], 2),
+        ub_max_tokens_across_dp=(11, 12),
     )
     wrapper = UBatchWrapper(torch.nn.Identity(), builder, dp_gather_scatter=True)
     for i, part in enumerate(ctx.ubatch_slices):

@@ -48,7 +48,6 @@
           "suffix": "-dpa-tbo",
           "extra_args": "--enable-dp-attention --enable-tbo",
           "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1",
-          "bench_args": "--metric-percentiles 50,99,99.9,100",
           "conc_min": 256,
           "conc_max": 2048
         },

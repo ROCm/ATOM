@@ -8,7 +8,6 @@ from typing import Any, Literal
 import numpy as np
 import torch
 from aiter.dist.parallel_state import get_pp_group
-from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import nn
 
 from atom.config import Config
@@ -223,35 +222,6 @@ support_draft_model_arch_dict = {
     "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
     "DSparkMiniMaxDraftModel": "atom.models.minimax_m3.dspark.MiniMaxM3DSpark",
 }
-
-
-@torch_compile_guard(mutates_args=["buffer"], gen_fake=lambda tensor, buffer: None)
-def drafter_aux_capture(tensor: torch.Tensor, buffer: torch.Tensor) -> None:
-    """Write one target layer's aux rows into `buffer` at this forward's offset.
-
-    An OPAQUE op because the hook calling it runs inside the target model's
-    `@support_torch_compile` region, and ATOM calls compiled code without
-    guards: any Python value the hook read -- `ubatch_token_offset`,
-    `is_draft` -- was baked to its trace-time answer. The offset baked to 0, so
-    under TBO both micro-batches wrote their rows from row 0, the later one
-    over the earlier, and every row past the longer ubatch kept the PREVIOUS
-    step's aux. The draft window was then built from stale hidden states: on
-    V4 + DSpark, drafts proposed on a TBO-split step were accepted at 0.1 per
-    row against ~3.1 unsplit, while the target -- which never reads these
-    buffers -- stayed accurate. Inside an opaque op the body runs eagerly every
-    time and reads the live (per-ubatch, thread-local) context.
-
-    Target forwards only: the `-1` tap sits on the embedding, which the draft
-    model shares, and its forward_spec would otherwise clobber these rows with
-    noise-token embeddings.
-    """
-    ctx = get_forward_context().context
-    if ctx.is_draft:
-        return
-    # 0 except under TBO, where the hook fires once per micro-batch on a
-    # disjoint token slice.
-    off = ctx.ubatch_token_offset
-    buffer[off : off + tensor.shape[0]].copy_(tensor)
 
 
 class Drafter(abc.ABC):
@@ -542,6 +512,15 @@ class Drafter(abc.ABC):
 
     def _make_aux_hook(self, buf_idx: int, extract):
         buffer = self._aux_buffers[buf_idx]
+        if getattr(getattr(self, "config", None), "enable_mixed_prefill_decode", False):
+            from atom.spec_decode.mixed_aux import capture_aux
+
+            def mixed_hook(module, _inputs, output):
+                tensor = extract(output, module)
+                if tensor is not None:
+                    capture_aux(tensor, buffer)
+
+            return mixed_hook
 
         def write(tensor, tokens):
             # In-place write into the fixed buffer (cudagraph-safe).

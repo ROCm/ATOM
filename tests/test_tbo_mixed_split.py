@@ -250,9 +250,7 @@ def test_precompute_and_split_agree_on_random_batches():
         n_pref_tokens = int(toks[:n_pref].sum())
 
         _, can, ub0, ub1 = _precompute_prefill_token_split(toks, n_pref, 0)
-        slices = (
-            _split_prefill_token_midpoint(n_pref, toks, 2, None) if n_pref else None
-        )
+        slices = _split_prefill_token_midpoint(n_pref, toks, 2) if n_pref else None
         assert can == (slices is not None)
         if can:
             assert [s.token_slice.stop - s.token_slice.start for s in slices] == [
@@ -269,13 +267,3 @@ def test_precompute_and_split_agree_on_random_batches():
                 ub1,
             ]
             assert slices[0].num_prefill_tokens == ub0  # ubatch 0 is pure prefill
-
-
-def test_a_mixed_split_honours_the_ubatch_token_cap():
-    from atom.utils.tbo.ubatch_splitting import split_mixed_token_midpoint
-
-    toks = np.asarray([600, 600, 1, 1], dtype=np.int64)
-    assert split_mixed_token_midpoint(4, 2, 1200, toks) is not None
-    assert (
-        split_mixed_token_midpoint(4, 2, 1200, toks, max_tokens_per_ubatch=500) is None
-    )

@@ -3,13 +3,43 @@
 
 import dataclasses
 import itertools
-import logging
 from dataclasses import dataclass
 
 import numpy as np
 
-# The micro-batches a TBO step splits into.
-NUM_TBO_UBATCHES = 2
+from atom.utils import envs
+from atom.utils.forward_context import AttentionMetaData
+
+
+def derive_prefill_lens_from_positions(
+    positions,
+    full_cu_seqlens_q,
+    ub_slice,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (extend_lens, seq_lens) for a prefill ubatch.
+
+    ``positions`` are the absolute positions for this ubatch's new tokens.
+    ``seq_lens`` are the total visible sequence lengths for sparse metadata,
+    preserving the absolute prefix length of a straddled request instead of
+    treating the ubatch as a standalone prompt.
+    """
+    rs = ub_slice.request_slice
+    ts = ub_slice.token_slice
+    ub_num_reqs = rs.stop - rs.start
+    positions_np = np.asarray(positions)
+    full_cu = np.asarray(full_cu_seqlens_q)
+
+    req_global_starts = full_cu[rs.start : rs.stop].astype(np.int64)
+    req_global_ends = full_cu[rs.start + 1 : rs.stop + 1].astype(np.int64)
+    clamped_starts = np.maximum(req_global_starts, ts.start)
+    clamped_ends = np.minimum(req_global_ends, ts.stop)
+    extend_lens = (clamped_ends - clamped_starts).astype(np.int32)
+
+    ub_cu = np.zeros(ub_num_reqs + 1, dtype=np.int32)
+    np.cumsum(extend_lens, dtype=np.int32, out=ub_cu[1:])
+    start_positions = positions_np[ub_cu[:ub_num_reqs]].astype(np.int32)
+    seq_lens = (start_positions + extend_lens).astype(np.int32)
+    return extend_lens, seq_lens
 
 
 @dataclass
@@ -120,7 +150,6 @@ def decode_ubatch_token_order(
     num_ubatches: int = 2,
     is_prefill: bool = False,
     num_scheduled_tokens: np.ndarray | None = None,
-    max_tokens_per_ubatch: int | None = None,
     force: bool = False,
     num_prefill_seqs: int | None = None,
     num_prefill_tokens: int | None = None,
@@ -133,8 +162,7 @@ def decode_ubatch_token_order(
     For mixed (`num_prefill_*` given): token midpoint over the whole batch,
                  with each slice recording its own prefill boundary.
 
-    Returns None if the batch is too small to split or if the split
-    would produce a ubatch exceeding max_tokens_per_ubatch.
+    Returns None if the batch is too small to split.
 
     ``force`` bypasses the ATOM_TBO_PREFILL_MIN_TOKENS gate: the cross-DP
     decision is OR-reduced, so a rank below the min-token bar can still be
@@ -159,7 +187,6 @@ def decode_ubatch_token_order(
             num_prefill_tokens,
             num_scheduled_tokens,
             num_ubatches,
-            max_tokens_per_ubatch,
         )
 
     # Token-midpoint prefill split can cut *inside* a request, so it works
@@ -187,13 +214,11 @@ def decode_ubatch_token_order(
                 num_reqs,
                 num_scheduled_tokens,
                 num_ubatches,
-                max_tokens_per_ubatch,
             )
         return _split_prefill_balanced(
             num_reqs,
             num_scheduled_tokens,
             num_ubatches,
-            max_tokens_per_ubatch,
         )
         pad = ub.running_tokens - ub.scheduled_tokens
         token_order[start + ub.scheduled_tokens : ub.token_slice.stop] = np.arange(
@@ -203,16 +228,47 @@ def decode_ubatch_token_order(
     return slices[-1].token_slice.stop
 
 
-def prefill_token_halves(tokens: int) -> tuple[int, int] | None:
-    """A prefill's ``tokens`` cut at the midpoint: each micro-batch's count,
-    or None when fewer than two would leave one empty. The one cut a rank's
-    vote (`prefill_tbo_vote`) gathers and its split (`cut_prefill_ubatches`)
-    runs: were they two, the micro-batches' collectives would gather sizes the
-    slices do not run."""
-    if tokens < 2:
-        return None
-    half = tokens // 2
-    return half, tokens - half
+def _split_prefill_balanced(
+    num_reqs: int,
+    num_scheduled_tokens: list[int],
+    num_ubatches: int,
+) -> list[UBatchSlice] | None:
+    """Split prefill requests into ubatches balanced by token count.
+
+    Finds the request boundary closest to total_tokens / num_ubatches.
+    """
+    total_tokens = sum(num_scheduled_tokens)
+    target = total_tokens // num_ubatches
+
+    # Find split point where cumulative tokens first reaches target
+    cumsum = 0
+    split_idx = 1  # at least 1 request in first ubatch
+    for j in range(num_reqs):
+        cumsum += num_scheduled_tokens[j]
+        if cumsum >= target:
+            # Pick the boundary (j or j+1) closer to the target
+            prev = cumsum - num_scheduled_tokens[j]
+            if j > 0 and (target - prev) < (cumsum - target):
+                split_idx = j
+            else:
+                split_idx = j + 1
+            break
+
+    # Ensure at least 1 request per ubatch
+    split_idx = max(1, min(split_idx, num_reqs - 1))
+
+    tok_boundary = sum(num_scheduled_tokens[:split_idx])
+
+    return [
+        UBatchSlice(
+            request_slice=slice(0, split_idx),
+            token_slice=slice(0, tok_boundary),
+        ),
+        UBatchSlice(
+            request_slice=slice(split_idx, num_reqs),
+            token_slice=slice(tok_boundary, total_tokens),
+        ),
+    ]
 
 
 def token_midpoint_cuts(total_tokens: int, num_ubatches: int) -> list[int] | None:
@@ -246,8 +302,8 @@ def mixed_cut_inside_prefill(cuts: list[int], num_prefill_tokens: int) -> bool:
 
 def _split_prefill_token_midpoint(
     num_reqs: int,
-    num_scheduled_tokens: np.ndarray,
-    running_tokens: int,
+    num_scheduled_tokens: list[int],
+    num_ubatches: int,
 ) -> list[UBatchSlice] | None:
     """A prefill's two micro-batches, its ``running_tokens`` cut at the
     midpoint (`prefill_token_halves`), through a request if one straddles it,
@@ -290,16 +346,6 @@ def _split_prefill_token_midpoint(
             )
         )
 
-    if max_tokens_per_ubatch is not None:
-        for s in slices:
-            if (s.token_slice.stop - s.token_slice.start) > max_tokens_per_ubatch:
-                logger.info(
-                    "[TBO] token-midpoint split rejected: ubatch tokens "
-                    "exceed buffer %s",
-                    max_tokens_per_ubatch,
-                )
-                return None
-
     return slices
 
 
@@ -309,7 +355,6 @@ def split_mixed_token_midpoint(
     num_prefill_tokens: int,
     num_scheduled_tokens,
     num_ubatches: int = 2,
-    max_tokens_per_ubatch: int | None = None,
 ) -> list[UBatchSlice] | None:
     """Split a mixed ``[prefill | decode]`` batch at the token midpoint.
 
@@ -329,9 +374,7 @@ def split_mixed_token_midpoint(
     cuts = token_midpoint_cuts(int(toks.sum()), num_ubatches)
     if cuts is None or not mixed_cut_inside_prefill(cuts, num_prefill_tokens):
         return None
-    slices = _split_prefill_token_midpoint(
-        num_reqs, toks, num_ubatches, max_tokens_per_ubatch
-    )
+    slices = _split_prefill_token_midpoint(num_reqs, toks, num_ubatches)
     if slices is None:
         return None
     return [

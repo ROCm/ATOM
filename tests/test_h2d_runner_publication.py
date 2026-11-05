@@ -217,6 +217,7 @@ def test_input_ids_deferred_and_new_requests_share_one_publication(monkeypatch):
     processor.prev_batch = SimpleNamespace(req_ids=[10, 20], is_dummy_run=False)
     processor.prev_token_ids = torch.tensor([71, 82], dtype=torch.int32, device="cuda")
     batch = SimpleNamespace(
+        is_mixed=False,
         scheduled_tokens=np.array([-1, 93, -1], dtype=np.int32),
         total_tokens_num=3,
         has_prefill=False,
@@ -260,6 +261,7 @@ def test_prefill_and_first_decode_ids_rotate_with_the_runner(monkeypatch, pp_siz
         assert processor.batch_info is runner.forward_vars["batch_info"]
         prefill = i % 2 == 0
         batch = SimpleNamespace(
+            is_mixed=False,
             scheduled_tokens=np.array([i + 1, i + 2], dtype=np.int32),
             total_tokens_num=2,
             total_seqs_num=1 if prefill else 2,
@@ -451,6 +453,7 @@ def test_prepare_model_publishes_sampling_and_query_prefix_before_token_consumer
             [71, 82], dtype=torch.int32, device="cuda"
         )
     batch = SimpleNamespace(
+        is_mixed=False,
         scheduled_tokens=np.array([51, 93, 61], dtype=np.int32),
         total_tokens_num=3,
         has_prefill=prefill,
@@ -556,14 +559,14 @@ def test_packed_spec_indices_follow_decode_prefill_and_dummy_transitions(monkeyp
         # An idle DP rank's step: no request.
         bs, tokens = (0, 0) if idle else (3, 7)
         batch = SimpleNamespace(
-            scheduled_tokens=(np.arange(7, dtype=np.int32) + 10)[:tokens],
-            total_tokens_num=tokens,
-            has_prefill=prefill,
-            total_tokens_num_prefill=tokens if prefill else 0,
-            total_tokens_num_decode=0 if prefill else tokens,
-            total_seqs_num_prefill=bs if prefill else 0,
-            total_seqs_num_decode=0 if prefill else bs,
-            total_seqs_num=bs,
+            is_mixed=False,
+            scheduled_tokens=np.arange(7, dtype=np.int32) + 10,
+            total_tokens_num=7,
+            total_tokens_num_prefill=7 if prefill else 0,
+            total_tokens_num_decode=0 if prefill else 7,
+            total_seqs_num_prefill=3 if prefill else 0,
+            total_seqs_num_decode=0 if prefill else 3,
+            total_seqs_num=3,
             num_spec_step=3,
             req_ids=[20, 30, 10][:bs],
             is_dummy_run=False,
@@ -654,6 +657,7 @@ def test_producer_reentry_preserves_sources_and_first_consumer(
         elif producer in ("prefill_ids", "deferred_ids"):
             prefill = producer == "prefill_ids"
             batch = SimpleNamespace(
+                is_mixed=False,
                 scheduled_tokens=np.array([11, 12, 13], dtype=np.int32) + changed * 10,
                 total_tokens_num=3,
                 has_prefill=prefill,

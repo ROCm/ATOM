@@ -1695,23 +1695,10 @@ _profiler_enabled = getattr(torch.autograd, "_profiler_enabled", None) or (
 
 @contextmanager
 def _segment_forward_context(fc, ctx, seg_md, *, is_prefill: bool, input_ids):
-    """Point the forward context at ONE half of a mixed batch, for the segment
-    tail (`_launch_compressors`, `_qk_norm_rope`, `_sparse_attention`).
+    """Select segment metadata, phase and input IDs, restoring them on exit.
 
-    Swapped: `attn_metadata` (the segment's own), `is_prefill` and `input_ids`
-    (sliced). That is everything the tail reads -- it sizes every launch off
-    `seg_md` and the tensors it is handed. NOT swapped, and still the whole
-    batch's: `positions`, `scheduled_tokens`, `running_tokens`, `scheduled_bs`,
-    `scheduled_tokens_gpu` and `is_mixed` (True). A segment op that sized
-    itself off the context would launch the decode half's rows at the whole
-    batch's height, so one that needs any of these must have it swapped here
-    first. Named and scoped rather than inlined because the swap is otherwise
-    invisible: nothing in a signature says the context describes one segment.
-
-    Restoring is this block's own job, not its caller's. It used to be the
-    caller's, which meant a segment that returned normally still left the
-    context pointing at its own sub-metadata until the enclosing `finally` ran.
-    """
+    Other context fields describe the whole batch. Segment operations must
+    size their work from the supplied tensors and metadata."""
     saved_md = fc.attn_metadata
     saved_is_prefill = ctx.is_prefill
     saved_input_ids = ctx.input_ids
@@ -2403,33 +2390,15 @@ class DeepseekV4Attention(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Run the segment-dependent attention tail once per half of a mixed batch.
+        """Run QK-norm/RoPE once, then compressors and sparse attention per segment.
 
-        The batch is `[prefill | decode]`. `_attn_pre` already ran once on the
-        whole thing -- every tensor here is num_tokens-major and simply sliced.
-        What cannot be shared is everything that reads `attn_metadata`:
-
-          _launch_compressors  each half has its own compress_plans
-          _sparse_attention    prefill and decode run different paged kernels,
-                               and it joins the launch above
-
-        QK-norm/RoPE runs once. The carrier masks prefill SWA stores until
-        its attention has consumed the preceding chunk's window.
-
-        Each segment re-enters with its own complete sub-metadata (is_mixed
-        False), so there is no recursion.
-        """
+        The carrier masks prefill SWA writes until attention has consumed the
+        preceding window. BF16 output reuses Q; FP8 uses a separate BF16 buffer."""
         fc = get_forward_context()
         ctx = fc.context
         n_p = attn_md.num_prefill_tokens
         n_d = x.size(0) - n_p
-        # `n_d` is derived from the tensor, but the metadata handed to the decode
-        # segment describes a row count of its own. Under TBO those are two
-        # independent splits. If they disagree the decode segment indexes an
-        # N-row plan into an M-row tensor, which is an out-of-bounds read, not
-        # an exception. Check it here, where the numbers are still readable.
-        # `raise`, not `assert`: `python -O` would strip the check and leave
-        # the out-of-bounds read it exists to stop.
+        # Validate the independently sliced tensor and metadata token counts.
         _declared_d = getattr(attn_md, "num_decode_tokens", None)
         if _declared_d is not None and _declared_d != n_d:
             raise RuntimeError(
@@ -2443,14 +2412,14 @@ class DeepseekV4Attention(nn.Module):
         saved_input_ids = ctx.input_ids
         qkn = self._qk_norm_rope(q, kv_pre, positions)
 
-        # One combined output; each half's attention lands in its own rows
-        # (`_sparse_attention(out=)`), so nothing is copied for the prefill
-        # segment. Decode has no output argument and copies its few rows in.
-        out = torch.empty(
-            (n_p + n_d, self.n_local_heads, self.head_dim),
-            dtype=x.dtype,
-            device=x.device,
-        )
+        # Each segment writes only its own rows, preserving the other query slice.
+        out = qkn.q_sa
+        if out is None:
+            out = torch.empty(
+                (n_p + n_d, self.n_local_heads, self.head_dim),
+                dtype=x.dtype,
+                device=x.device,
+            )
 
         def _seg(lo: int, hi: int, seg_md, is_prefill: bool) -> None:
             sl = slice(lo, hi)

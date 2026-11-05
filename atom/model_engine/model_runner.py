@@ -122,7 +122,6 @@ from atom.utils import (
     envs,
     get_hf_text_config,
     init_exit_handler,
-    register_crash_release,
     resolve_obj_by_qualname,
     worker_process_name,
 )
@@ -573,7 +572,7 @@ class tokenIDProcessor:
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
-        is_mixed = getattr(batch, "is_mixed", False)
+        is_mixed = batch.is_mixed
 
         # Both paths stage the whole batch once. Only decode rows may gather
         # last step's GPU outputs; prefill tokens always keep the scheduler's
@@ -754,29 +753,12 @@ def _profile_runner_stage(method):
     return wrapped
 
 
-def close_kv_connector() -> None:
-    """Close this process's KV connector, if it has one that closes.
-
-    Only offload workers define `close()` (moriio etc. do not). It joins their
-    copy threads and, for the LMCache MP connector, unregisters this rank from
-    the MP server, which otherwise keeps its GPU IPC mapping of the KV pool --
-    and the memory -- until its reaper times out. Idempotent: the connectors
-    drop what they released."""
-    connector = get_kvconnector()
-    close = getattr(connector, "close", None) if connector is not None else None
-    if callable(close):
-        close()
-
-
 class ModelRunner:
     def __init__(self, rank: int, config: Config):
         self.config = config
         self.structured_output = None
         self.structured_compile_executor = None
         self.structured_compilations = OrderedDict()
-        # A crash exits without `exit()`; the connector's close is the part of
-        # it a server outside this process waits on (`run_exiting_on_crash`).
-        register_crash_release(close_kv_connector)
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()
@@ -1204,7 +1186,10 @@ class ModelRunner:
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV
         #    pool it copies out of is dropped and before the dist env goes away.
-        close_kv_connector()
+        connector = get_kvconnector()
+        close = getattr(connector, "close", None) if connector is not None else None
+        if callable(close):
+            close()
         builder = getattr(self, "attn_metadata_builder", None)
         if builder is not None:
             builder.close()
@@ -2528,7 +2513,7 @@ class ModelRunner:
         # `total_seqs_num_prefill` would hide the decode rows from the cut and
         # from `num_scheduled_tokens`, leaving slices that do not cover the
         # tokens actually forwarded.
-        is_mixed = getattr(batch, "is_mixed", False)
+        is_mixed = batch.is_mixed
         if is_mixed:
             tbo_num_reqs = batch.total_seqs_num
         else:
@@ -2583,7 +2568,7 @@ class ModelRunner:
             # Config._validate_mixed_prefill_decode rejects this at launch.
             # Keep a backstop for callers that construct a runner directly:
             # the PCP split below only sizes the prefill rows.
-            if getattr(batch, "is_mixed", False):
+            if batch.is_mixed:
                 raise NotImplementedError(
                     "mixed prefill+decode is not supported with PCP"
                 )
@@ -2642,7 +2627,15 @@ class ModelRunner:
         row0 = batch.total_seqs_num_prefill
         cur_req = list(batch.req_ids[row0 : row0 + scheduled_bs])
         prev_req = (
-            list(prev_b.req_ids[getattr(prev_b, "total_seqs_num_prefill", 0) :])
+            list(
+                prev_b.req_ids[
+                    (
+                        prev_b.total_seqs_num_prefill
+                        if self.config.enable_mixed_prefill_decode
+                        else 0
+                    ) :
+                ]
+            )
             if prev_b is not None and not prev_b.is_dummy_run
             else None
         )
@@ -2759,7 +2752,7 @@ class ModelRunner:
         `prepare_spec_decode_indices` and the rejection sampler already accept.
         """
         n_p = batch.total_seqs_num_prefill
-        is_mixed = n_p > 0 and getattr(batch, "is_mixed", False)
+        is_mixed = n_p > 0 and batch.is_mixed
         # A mixed step verifies its decode rows as a pure decode would, so it
         # asks `_verifies_drafts` the decode question; pure prefill samples
         # without verification.
@@ -2792,7 +2785,7 @@ class ModelRunner:
         # lives). The q-bucket shrink ran there too, so `batch` is already
         # reduced here.
         is_prefill = batch.total_tokens_num_prefill > 0
-        is_mixed = getattr(batch, "is_mixed", False)
+        is_mixed = batch.is_mixed
         scheduled_bs = batch.total_seqs_num
         scheduled_tokens = batch.total_tokens_num
         sync = forward_mode.sync
@@ -2832,7 +2825,6 @@ class ModelRunner:
             running_tokens_are_unified=running_tokens_are_unified,
             forward_mode=forward_mode,
             scheduled_tokens_gpu=self.forward_vars["batch_info"].gpu[1:2],
-            is_mixed=is_mixed,
             num_prefill_tokens=batch.total_tokens_num_prefill if is_mixed else 0,
             num_prefill_seqs=batch.total_seqs_num_prefill if is_mixed else 0,
         )
@@ -3518,7 +3510,7 @@ class ModelRunner:
           its chunk's last TOKEN row, not its logit row.
         * a decode row's logit row `n_p + j` is token row `n_p_tokens + j`.
         """
-        if not getattr(batch, "is_mixed", False):
+        if not batch.is_mixed:
             return
         n_p = batch.total_seqs_num_prefill
         num_reject_tokens[:n_p] = 0
@@ -3644,7 +3636,7 @@ class ModelRunner:
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             # Only a mixed step's verdict needs re-expressing in token rows; a
             # pure step keeps postprocess free of the mixed path entirely.
-            if getattr(batch, "is_mixed", False):
+            if batch.is_mixed:
                 self._settle_mixed_verdict(batch, num_reject_tokens, anchors)
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
