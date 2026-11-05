@@ -959,8 +959,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         workinfos = {"slot_mapping": slot_mapping}
         if self._has_sparse_attention:
             # `attention_mha` picks this up off the shared metadata with a plain
-            # `getattr`, and `prepare_decode` cut it at `scheduled_bs` -- so a
-            # mid-step would read seq_lens for fewer rows than it runs.
+            # `getattr`; the one `prepare_decode` built is the verify forward's,
+            # with its query width and slot mapping, not this step's.
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_sparse_decode_metadata,
             )
@@ -1300,9 +1300,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # the DECODE sparse path; the decode kernels handle q>1 per-token
             # causal internally via max_query_len.
             sparse_block_tables = self._get_sparse_attention_block_tables(
-                attn_metadata.block_tables[:scheduled_bs],
-                attn_metadata.context_lens[:scheduled_bs],
-                scheduled_bs,
+                attn_metadata.block_tables[:running_bs],
+                attn_metadata.context_lens[:running_bs],
+                running_bs,
             )
             # token -> request, -1 on the graph's pad tail: the mono kernels keep
             # a pad row out of every cross-row decision (``row_live``)
@@ -1311,7 +1311,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 pad_to=running_tokens,
             )
             attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
-                seq_lens=attn_metadata.context_lens[:scheduled_bs],
+                seq_lens=attn_metadata.context_lens[:running_bs],
                 block_table=sparse_block_tables,
                 slot_mapping=attn_metadata.slot_mapping,
                 max_seq_len=int(max_seqlen_k),
