@@ -211,6 +211,7 @@ def capture_fixture(monkeypatch):
     proposer.max_num_tokens, proposer.device, proposer.dtype = 9, "cpu", torch.float32
     target = nn.Module()
     target.layers = nn.ModuleList([ShiftBlock()])
+    proposer.runner = SimpleNamespace(model=target)
     context = SimpleNamespace(is_draft=False, ubatch_token_offset=2)
     monkeypatch.setattr(
         "atom.spec_decode.drafter.get_forward_context",
@@ -431,6 +432,6 @@ def test_armed_capture_keeps_the_extract_its_hooks_run(monkeypatch):
     def extract(output, block):
         return output.residual.mean(-2).squeeze(0)
 
-    proposer._aux_capture_spec = lambda _: AuxCaptureSpec((0,), 8, extract)
+    proposer._aux_capture_spec = lambda: AuxCaptureSpec((0,), 8, extract)
     proposer.arm_aux_capture(target)
     assert proposer.aux_extract is extract

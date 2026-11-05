@@ -196,9 +196,12 @@ def _lift_fn(module_file, name, ns):
 
 def _draft_rope_kwargs_fn(module_file):
     """A draft module's `_draft_rope_kwargs`, bound to the shared parser."""
-    from atom.models import dspark_draft
+    from atom.models import dspark_draft, utils
 
-    ns = {"draft_rope_scaling": dspark_draft.draft_rope_scaling}
+    ns = {
+        "draft_rope_scaling": dspark_draft.draft_rope_scaling,
+        "is_neox_rope_style": utils.is_neox_rope_style,
+    }
     return _lift_fn(module_file, "_draft_rope_kwargs", ns)
 
 
@@ -246,14 +249,17 @@ def test_k3_dspark_mla_rope_kwargs_are_unchanged():
         "mscale_all_dim",
     ]
 
-    # `rope_interleave` is the config's neox switch; a factor alone is YaRN and
-    # a missing original length falls back to the max position.
+    # `rope_interleave=true` is the same interleaved rope (K3.1 sets it); only
+    # an explicit false selects neox. A factor alone is YaRN and a missing
+    # original length falls back to the max position.
     cfg = _inferact_rope_cfg(
         rope_interleave=True,
         rope_parameters={"factor": 4.0, "rope_theta": 20000.0},
     )
     kw = kwargs_fn(cfg)
-    assert kw["is_neox_style"] is True
+    assert kw["is_neox_style"] is False
+    assert kwargs_fn(_inferact_rope_cfg(rope_interleave=False))["is_neox_style"]
+    assert kwargs_fn(_inferact_rope_cfg(rope_interleave=None))["is_neox_style"] is False
     assert kw["base"] == 20000.0
     assert kw["rope_scaling"] == {
         "factor": 4.0,
@@ -298,7 +304,7 @@ def _target_base(vocab):
     import torch
 
     model = types.SimpleNamespace(embed_tokens=torch.nn.Embedding(vocab, 4))
-    return types.SimpleNamespace(model=model, lm_head=object())
+    return types.SimpleNamespace(model=model, lm_head=torch.nn.Embedding(vocab, 4))
 
 
 def test_default_share_with_target_binds_the_targets_embedding_and_head():
@@ -314,6 +320,33 @@ def test_default_share_with_target_refuses_a_vocab_mismatch():
     with pytest.raises(ValueError, match="StubDraft draft vocab 163840"):
         draft.share_with_target(_target_base(200064), set())
     assert draft.embed_tokens is None and draft.lm_head is None
+
+
+def test_default_share_with_target_keeps_a_drafts_own_embedding():
+    """A draft that loaded its own embedding (K3 DSpark past PP stage 0)
+    keeps it and still scores with the target's head."""
+    draft = _stub_draft(163840)
+    own = object()
+    draft.own_embed_tokens, draft.embed_tokens = True, own
+    target = _target_base(163840)
+    draft.share_with_target(target, set())
+    assert draft.embed_tokens is own
+    assert draft.lm_head is target.lm_head
+
+
+def test_default_share_with_target_reads_the_vocab_off_the_head_under_pp():
+    """Under PP the drafter's stage holds a PPMissingLayer for the target's
+    embedding; the vocab check reads the head the draft scores with."""
+    from atom.models.utils import PPMissingLayer
+
+    draft = _stub_draft(163840)
+    draft.own_embed_tokens = True
+    target = _target_base(163840)
+    target.model.embed_tokens = PPMissingLayer()
+    draft.share_with_target(target, set())
+    assert draft.lm_head is target.lm_head
+    with pytest.raises(ValueError, match="target vocab 200064"):
+        _stub_draft(163840).share_with_target(_target_base(200064), set())
 
 
 def test_default_sample_block_chains_each_token_into_the_next():
@@ -836,6 +869,21 @@ def test_dflash_arms_the_embedding_tap_without_a_successor():
     assert spec.layer_ids == (-1,)
 
 
+def _dspark_proposer_config(**kwargs):
+    """The config `DSparkProposer.aux_capture_spec` reads: a DSpark draft
+    tapping target layers 7 and 11 of a 16-wide target."""
+    return types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(hidden_size=16),
+        speculative_config=types.SimpleNamespace(
+            use_dspark=lambda: True,
+            draft_model_hf_config=types.SimpleNamespace(
+                dspark_target_layer_ids=[7, 11]
+            ),
+        ),
+        **kwargs,
+    )
+
+
 def test_k3_dspark_mla_draft_resolves_to_the_generic_extractor():
     """(b) REGRESSION GUARD. The Inferact MLA draft must NOT get the aggregate.
 
@@ -853,13 +901,8 @@ def test_k3_dspark_mla_draft_resolves_to_the_generic_extractor():
     # ...and that absence must actually route it to the generic extractor.
     proposer = DSparkProposer.__new__(DSparkProposer)
     proposer.model = dspark.KimiK3DSpark.__new__(dspark.KimiK3DSpark)
-    proposer.speculative_config = types.SimpleNamespace(
-        draft_model_hf_config=types.SimpleNamespace(dspark_target_layer_ids=[7, 11])
-    )
-    proposer.config = types.SimpleNamespace(
-        hf_config=types.SimpleNamespace(hidden_size=16)
-    )
-    spec = proposer._aux_capture_spec(_k3_target_stub())
+    proposer.config = _dspark_proposer_config()
+    spec = proposer._aux_capture_spec()
     assert spec.extract is DSparkProposer._extract_layer_hidden
     assert spec.capture == "output"
     assert spec.layer_ids == (7, 11)
@@ -910,18 +953,32 @@ def test_dspark_proposer_hands_the_target_layers_to_the_draft():
 
     proposer = proposer_mod.DSparkProposer.__new__(proposer_mod.DSparkProposer)
     proposer.model = types.SimpleNamespace(target_aux_capture_spec=own)
-    proposer.speculative_config = types.SimpleNamespace(
-        draft_model_hf_config=types.SimpleNamespace(dspark_target_layer_ids=[7, 11])
-    )
-    proposer.config = types.SimpleNamespace(
-        hf_config=types.SimpleNamespace(hidden_size=16)
-    )
+    proposer.config = _dspark_proposer_config()
     target = _k3_target_stub()
+    proposer.runner = types.SimpleNamespace(model=target)
 
-    proposer._aux_capture_spec(target)
+    proposer._aux_capture_spec()
     assert seen["layer_ids"] == (7, 11)
     assert seen["hidden_size"] == 16
     assert seen["target_layers"] is target.layers
+
+
+def test_dspark_proposer_refuses_a_drafts_own_spec_under_pp_before_reading_layers():
+    """Under PP a drafterless stage can only rebuild the default spec, so a
+    draft with its own contract is refused -- before the target's layers are
+    resolved, which a non-last stage may not even have."""
+    proposer_mod = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    calls = []
+
+    proposer = proposer_mod.DSparkProposer.__new__(proposer_mod.DSparkProposer)
+    proposer.model = types.SimpleNamespace(
+        target_aux_capture_spec=lambda *args: calls.append(args)
+    )
+    proposer.config = _dspark_proposer_config(pipeline_parallel_size=2)
+
+    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        proposer._aux_capture_spec()
+    assert calls == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1481,6 +1538,22 @@ def test_dflash_draft_is_refused_on_a_non_k3_target():
         types.SimpleNamespace(architectures=["Eagle3LlamaModel"]),
     )
     cfg._check_dflash_draft_target(types.SimpleNamespace(architectures=[]), None)
+
+
+def test_dflash_draft_is_refused_under_pipeline_parallelism():
+    """Refused on every rank before weights load: the aggregate tap is scored
+    by the next target layer, which another PP stage may own."""
+    import atom.config as cfg
+
+    k3 = types.SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
+    draft = types.SimpleNamespace(architectures=["K3DFlashModel"])
+    with pytest.raises(ValueError, match="pipeline_parallel_size > 1"):
+        cfg._check_dflash_draft_target(k3, draft, 2)
+    cfg._check_dflash_draft_target(k3, draft, 1)
+    # Other drafts keep main's PP checks.
+    cfg._check_dflash_draft_target(
+        k3, types.SimpleNamespace(architectures=["K3DSparkModel"]), 2
+    )
 
 
 def test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments(monkeypatch):
