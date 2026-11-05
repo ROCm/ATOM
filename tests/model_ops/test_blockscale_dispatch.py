@@ -80,7 +80,6 @@ def test_mxfp8_preshuffle_dispatches_through_aiter_blockscale(monkeypatch):
         x_scale=torch.empty((2, 4), dtype=torch.float8_e8m0fnu),
         weight_group_rows=1,
         weight_preshuffled=True,
-        mxfp8_preshuffle=True,
     )
 
     assert len(calls) == 1
@@ -98,5 +97,4 @@ def test_mxfp8_preshuffle_rejects_unsupported_k(monkeypatch):
             x_scale=torch.empty((2, 2), dtype=torch.float8_e8m0fnu),
             weight_group_rows=1,
             weight_preshuffled=True,
-            mxfp8_preshuffle=True,
         )

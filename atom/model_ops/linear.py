@@ -1607,7 +1607,6 @@ class LinearBase(nn.Module):
                 x_scale=x_scale,
                 weight_group_rows=self.native_a8_group_rows,
                 weight_preshuffled=getattr(self.weight, "is_shuffled", False),
-                mxfp8_preshuffle=getattr(self, "mxfp8_linear_bpreshuffle", False),
                 dtype=otype,
             )
             if self.bias is not None:

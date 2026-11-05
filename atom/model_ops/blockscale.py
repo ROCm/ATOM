@@ -157,7 +157,6 @@ def native_quant_linear(
     dtype=torch.bfloat16,
     split_k=None,
     weight_preshuffled=False,
-    mxfp8_preshuffle=False,
 ):
     """FP8 32x32/1x32 or W4A8 1x32 GEMM; inputs and weights stay native.
 
@@ -191,15 +190,17 @@ def native_quant_linear(
         raise ValueError("split_k must be a positive integer")
     if weight_scale.shape != (-(-n // weight_group_rows), k // 32):
         raise ValueError("Weight scale shape does not match the declared source blocks")
-    if mxfp8_preshuffle and (
-        fp4
-        or weight_group_rows != 1
-        or not weight_preshuffled
-        or _aiter_fp8_gemm is None
-        or split_k is not None
-        or dtype != torch.bfloat16
-        or k % 128
-        or n % 16
+    if (
+        weight_preshuffled
+        and weight_group_rows == 1
+        and (
+            fp4
+            or _aiter_fp8_gemm is None
+            or split_k is not None
+            or dtype != torch.bfloat16
+            or k % 128
+            or n % 16
+        )
     ):
         raise ValueError(
             "MXFP8 preshuffle requires a shuffled FP8 1x32 weight, "
