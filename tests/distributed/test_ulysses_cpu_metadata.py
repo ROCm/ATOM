@@ -19,7 +19,7 @@ def embed_head():
 
 def _on_each_rank(monkeypatch, world, fn, all_gatherv=None):
     settings = SimpleNamespace(sequence_parallel_size=world)
-    monkeypatch.setattr(sp, "get_current_atom_config_or_none", lambda: settings)
+    monkeypatch.setattr(sp, "get_current_atom_config", lambda: settings)
     parallel_state = ModuleType("aiter.dist.parallel_state")
     monkeypatch.setitem(sys.modules, parallel_state.__name__, parallel_state)
     out = []

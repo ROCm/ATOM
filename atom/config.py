@@ -3113,19 +3113,14 @@ def _get_current_atom_config_from_vllm_forward_context() -> Config | None:
         return None
 
 
-def get_current_atom_config_or_none() -> Config | None:
+def get_current_atom_config() -> Config:
     # Try to get the atom config from forward context first in vLLM plugin mode.
     if is_vllm():
         forward_atom_config = _get_current_atom_config_from_vllm_forward_context()
         if forward_atom_config is not None:
             return forward_atom_config
+    assert _current_atom_config is not None, "Current atom config is not set"
     return _current_atom_config
-
-
-def get_current_atom_config() -> Config:
-    config = get_current_atom_config_or_none()
-    assert config is not None, "Current atom config is not set"
-    return config
 
 
 @contextmanager

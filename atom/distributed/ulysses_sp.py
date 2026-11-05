@@ -11,7 +11,7 @@ rank dimension and runs with ``-tp 1 -sp W``.
 
 import torch
 
-from atom.config import get_current_atom_config_or_none
+from atom.config import get_current_atom_config
 from atom.distributed.custom_gather import custom_gather_ok
 from atom.distributed.token_transport import ALLGATHER_MAX_PAYLOAD_BYTES
 
@@ -19,9 +19,7 @@ from atom.distributed.token_transport import ALLGATHER_MAX_PAYLOAD_BYTES
 
 
 def get_sp_world_size() -> int:
-    config = get_current_atom_config_or_none()
-    # No config: layers built alone, as on CPU.
-    return 1 if config is None else config.sequence_parallel_size
+    return get_current_atom_config().sequence_parallel_size
 
 
 def sp_is_enabled() -> bool:
