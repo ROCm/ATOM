@@ -16,6 +16,8 @@ Also here: the sparse indexer's DCP support -- the decode candidate exchange
 (fused into one aiter op) and the sparse-prefill owned-slot filter.
 """
 
+import logging
+
 import numpy as np
 import torch
 import triton
@@ -849,6 +851,87 @@ def mask_empty_dcp_lse(
     return cp_attn_lse.masked_fill(owned_counts[:, None] == 0, float("-inf"))
 
 
+# ─────────────────────────────────────────── mailbox merge backend ──
+#
+# aiter's ``dcp_lse_combine`` (FlyDSL, aiter PR #6972): one launch in which
+# every rank stores each owner's head rows and LSEs straight into the owner's
+# IPC-mapped mailbox as (value, launch tag) pairs, then polls its own heads and
+# combines them. It replaces pack -> all_to_all_single -> combine. Decode only:
+# its peer buffer is sized for the widest decode step, and its launch epoch
+# lives on each rank, so every rank must launch it the same number of times in
+# the same order -- which a DCP group's lock-step decode does.
+
+_MAILBOX_WORKSPACES: dict = {}
+logger = logging.getLogger("atom")
+
+
+def _mailbox_key(cp_group, heads, dim):
+    return (id(cp_group), heads, dim)
+
+
+def dcp_mailbox_max_tokens(atom_config) -> int:
+    """The widest decode step: every sequence verifying all its draft tokens."""
+    spec = atom_config.speculative_config
+    drafts = (spec.num_speculative_tokens or 0) if spec is not None else 0
+    return atom_config.max_num_seqs * (1 + drafts)
+
+
+def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
+    """Create the shared mailbox workspace of (group, heads a rank, head dim).
+
+    Collective (it maps every rank's peer buffer): call it on every rank of
+    ``cp_group`` in the same order, before any CUDA graph is captured. Its
+    memory sits outside torch's allocator, so it must exist before the KV
+    cache is sized. Returns False, and the merge stays on all-to-all, when
+    aiter has no mailbox combine.
+    """
+    key = _mailbox_key(cp_group, heads, dim)
+    if key in _MAILBOX_WORKSPACES:
+        return True
+    try:
+        from aiter.ops.flydsl.dcp_mailbox import CombineWorkspace
+    except ImportError:
+        return False
+    device = torch.device("cuda", torch.cuda.current_device())
+    ws = CombineWorkspace(cp_group, device, heads, dim, max_tokens)
+    _MAILBOX_WORKSPACES[key] = ws
+    logger.info(
+        "DCP mailbox merge ready: %d heads a rank x %d, up to %d decode tokens, "
+        "%.1f MiB of peer memory",
+        heads,
+        dim,
+        max_tokens,
+        ws.peers.bytes.numel() / (1 << 20),
+    )
+    return True
+
+
+def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype):
+    """The mailbox merge, or None when this call cannot take it."""
+    if cp_group.world_size == 1:
+        return None
+    tokens, heads, dim = cp_attn_out.shape
+    ws = _MAILBOX_WORKSPACES.get(
+        _mailbox_key(cp_group, heads // cp_group.world_size, dim)
+    )
+    if (
+        ws is None
+        or tokens == 0
+        or tokens > ws.max_tokens
+        or cp_attn_out.dtype != torch.bfloat16
+    ):
+        return None
+    from aiter.ops.flydsl.dcp_mailbox import dcp_lse_combine
+
+    lse = cp_attn_lse.to(torch.float32)
+    if owned_counts is not None:
+        lse = mask_empty_dcp_lse(lse, owned_counts)
+    out = dcp_lse_combine(ws, cp_attn_out.contiguous(), lse.contiguous(), base_e=True)
+    # No quantizing combine here: hand back the bf16 rows unquantized, which
+    # the caller then quantizes as it would without the fused path.
+    return out if quant_dtype is None else (out, None)
+
+
 def dcp_lse_merge(
     cp_attn_out,
     cp_attn_lse,
@@ -873,7 +956,18 @@ def dcp_lse_merge(
 
     ``ctx`` is the Triton context the AG+RS backend caches its launches in; the
     a2a backend does not use one.
+
+    ``backend="mailbox"`` takes aiter's mailbox combine when its workspace was
+    prepared (``prepare_dcp_mailbox``) and the call fits it, else all-to-all.
+    Every input to that choice is the same on every rank of the group.
     """
+    if backend == "mailbox":
+        merged = _dcp_mailbox_merge(
+            cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype
+        )
+        if merged is not None:
+            return merged
+        backend = "a2a"
     if backend == "a2a":
         return cp_lse_a2a(
             cp_attn_out,

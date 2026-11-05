@@ -329,7 +329,7 @@ nothing.
 | `interleave_size` | int | `1` | KV-cache interleave granularity `S`: token `i` lives on DCP rank `(i // S) % W`. `1` = token-level round-robin |
 | `enable_query_replication` | bool | `true` | Replicate the MLA query projection across the DCP group at load time, so each rank produces the whole group's head set locally and the per-step decode AllGather Q disappears |
 | `enable_project_before_merge` | bool | `true` | Apply the V up-projection *before* the DCP output merge, so the merge exchanges `v_head_dim` per head instead of `kv_lora_rank` |
-| `comm_backend` | str | `"a2a"` | Which collective pattern merges the per-rank partial attention: `"a2a"` or `"ag_rs"` |
+| `comm_backend` | str | `"a2a"` | Which collective pattern merges the per-rank partial attention: `"a2a"`, `"ag_rs"` or `"mailbox"` |
 
 > **Three of the four default to the new behaviour.** A control run that wants
 > the old path must say so **explicitly** — passing nothing re-runs the new
@@ -427,7 +427,7 @@ Covers both decode and sparse prefill. Costs a DCP-group-wide copy of `W_V`
 
 ### `comm_backend`
 
-Both backends compute the same thing and are **mathematically equivalent but not
+All backends compute the same thing and are **mathematically equivalent but not
 bitwise identical** (different summation order, and `a2a` round-trips the fp32
 LSE through two 16-bit halves of a bf16 buffer).
 
@@ -435,9 +435,17 @@ LSE through two 16-bit halves of a bf16 buffer).
 |-------|---------|-------------|
 | `a2a` (default) | one all-to-all with the LSE packed alongside the output, combine done locally | **1** |
 | `ag_rs` | AllGather LSE + local correct + ReduceScatter output | 2 |
+| `mailbox` | decode only: aiter's FlyDSL `dcp_lse_combine`, one launch that stores each owner's rows and LSEs into its IPC-mapped mailbox and combines them there | **0** (no collective launch) |
 
 Byte counts are about the same; what `a2a` saves is one collective's launch and
 sync.
+
+`mailbox` needs an aiter with `aiter.ops.flydsl.dcp_mailbox`; without it, and in
+plugin mode, the layer logs a warning and merges with `a2a`. Prefill always
+merges with `a2a`. Its peer buffer, `2 x ranks x max_num_seqs x (1 +
+num_speculative_tokens) x local heads x (4 x head dim + 8)` bytes, is mapped at
+model build, so it comes out of the KV budget. The combine does not quantize:
+with a per-token FP8 `o_proj` its output is quantized by `o_proj` itself.
 
 ## Launching server
 

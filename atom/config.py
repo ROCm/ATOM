@@ -1783,7 +1783,7 @@ class EPLBConfig:
         return cls(**cfg)
 
 
-DCP_COMM_BACKENDS = ("ag_rs", "a2a")
+DCP_COMM_BACKENDS = ("ag_rs", "a2a", "mailbox")
 
 
 @dataclass
