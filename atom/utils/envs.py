@@ -587,6 +587,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
+    # Experimental DSA MXFP4 cache ABI, OPUS gfx950's 64-row MFMA layout.
+    "ATOM_DSA_FP4_OPUS": lambda: os.getenv("ATOM_DSA_FP4_OPUS", "0") == "1",
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
     # with with_indexer=True), which does index Q/K/W projection, paged FP8

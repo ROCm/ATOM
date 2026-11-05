@@ -95,6 +95,8 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.sparse_indexer_fp4 import (
     assert_fp4_indexer_supported,
+    fp4_cache_layout,
+    require_opus_api,
     sparse_indexer_fp4_enabled,
 )
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
@@ -1524,11 +1526,23 @@ class Indexer(nn.Module):
         self._indexer_fp4 = sparse_indexer_fp4_enabled(
             atom_config.index_cache_dtype, config
         )
+        self._index_cache_layout = (
+            fp4_cache_layout() if self._indexer_fp4 else "preshuffle"
+        )
+        self._indexer_opus = self._indexer_fp4 and self._index_cache_layout == "mfma"
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
         self.head_dim = config.index_head_dim  # 128
         self.rope_dim = getattr(config, "index_rope_dim", config.qk_rope_head_dim)
+        if self._indexer_opus:
+            require_opus_api()
+            if self.n_head not in (32, 64) or self.rope_dim not in (0, 64):
+                raise ValueError("OPUS DSA FP4 requires 32/64 heads and RoPE 0/64")
+            if atom_config.kv_transfer_config or atom_config.plugin_config:
+                raise ValueError(
+                    "OPUS DSA FP4 cache transfer and plugin routes are not yet supported"
+                )
         # A NoPE FP8 cache has its own writer: the RoPE writer requires 64
         # rotary lanes and uses a different Q scale policy. Under DCP every
         # rank still projects all Q rows; the writer skips negative K slots.
@@ -1601,7 +1615,7 @@ class Indexer(nn.Module):
         self._weights_scale = self.softmax_scale * self.n_head**-0.5
         if self._indexer_fp4:
             assert_fp4_indexer_supported(
-                fused_writer=self.use_qk_rope_cache_fusion,
+                fused_writer=self.use_qk_rope_cache_fusion or self._indexer_opus,
                 prefill_context_parallel=pcp_is_enabled(),
                 prefill_ubatching=get_current_atom_config().enable_tbo,
             )
@@ -1721,7 +1735,7 @@ class Indexer(nn.Module):
         # for padded rows, and only the owner rank writes K cache.
         unfused_qk_rope = (not self.use_qk_rope_cache_fusion) or pcp
         positions_op = positions
-        if self.use_nope_cache_fusion:
+        if self.use_nope_cache_fusion or self._indexer_opus:
             # The custom op publishes the normalized K and folds Q scales into
             # head weights in one launch. Pass the unnormalized BF16 projections.
             q_input = q
@@ -1796,6 +1810,11 @@ class Indexer(nn.Module):
             rotary_emb.is_neox_style if self.rope_dim else False,
             not unfused_qk_rope,
             self.stable_topk,
+            **(
+                {"kv_cache_scale": self.k_cache.kv_cache_scale}
+                if self._indexer_opus
+                else {}
+            ),
         )
 
 
