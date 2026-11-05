@@ -551,11 +551,21 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         self._stage_draft_ctx_slots(batch, lengths, running_tokens, group)
         return built
 
-    # Every launch outside the model's eager regions -- the KDA mixer and MLA
-    # attention -- is sized by the token count alone, so a prefill may pad to a
-    # recorded token-graph bucket; the regions run its scheduled rows
-    # (`region_graph.padded_prefill_rows`).
-    supports_token_graph = True
+    @property
+    def supports_token_graph(self) -> bool:
+        """Every launch outside the model's eager regions -- the KDA recurrence
+        and MLA attention -- is sized by the token count alone, so a prefill
+        may pad to a recorded token-graph bucket; the regions run its scheduled
+        rows (`region_graph.padded_prefill_rows`).
+
+        Not under DP. A step some DP rank prefills pads every rank to the
+        prefill bucket (`ForwardMode._pad_to_token_graph`), so a decoding or
+        idle rank would replay the prefill recording, and these regions serve a
+        prefill alone: the KDA recurrence would run the prefill conv and chunked
+        recurrence on a decode step's state slots, and hand the bucket fewer
+        rows than it records."""
+        config = getattr(self.model_runner, "config", None)
+        return config is not None and config.parallel_config.data_parallel_size == 1
 
     def build_for_token_graph_capture(self, tokens: int):
         """A request-less prefill of ``tokens`` rows for recording that
