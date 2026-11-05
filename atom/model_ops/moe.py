@@ -5378,8 +5378,9 @@ class FusedMoE(torch.nn.Module):
         same rows: a split pass (every SP pass) gathers its rows rank-major
         first, in that wire, and reduce-scatters the partial sums back; any
         other real pass already holds the same rows on every PCP rank and
-        all-reduces. Only rows no gather moved are counted
-        (`pass_scheduled_tokens_gpu`)."""
+        all-reduces. Rows no gather moved are counted
+        (`pass_scheduled_tokens_gpu`), and so are an SP gather's: its shards
+        are contiguous, so the step's real rows lead."""
         context = get_forward_context().context
         pcp = self.moe_parallel_config.pcp_merge and not context.is_dummy_run
         # SP marks its dummy and captured passes split too.
@@ -5425,7 +5426,9 @@ class FusedMoE(torch.nn.Module):
             # sentinel at the real token count instead of scattering every
             # padded expert slot into that row.
             scheduled_tokens_gpu=(
-                None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
+                context.scheduled_tokens_gpu
+                if split and sp_is_enabled()
+                else None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
             ),
         )
         if split:

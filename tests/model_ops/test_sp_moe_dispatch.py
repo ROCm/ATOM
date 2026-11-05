@@ -4,10 +4,15 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 
-def test_sp_gathers_every_pass_once_and_scatters_it_back(monkeypatch, sp_modules):
+# SP marks its dummy passes split too; plain PCP runs only real ones.
+@pytest.mark.parametrize("sp", [True, False], ids=["sp-dummy", "pcp"])
+def test_split_pass_gathers_once_and_counts_only_sp_real_rows(
+    monkeypatch, sp_modules, sp
+):
     moe = sp_modules.moe
     rows, world, hidden_size = 8, 4, 64
     method = SimpleNamespace(
@@ -32,8 +37,13 @@ def test_sp_gathers_every_pass_once_and_scatters_it_back(monkeypatch, sp_modules
     gatherv = Mock(side_effect=lambda ts, sizes, g: [t.repeat(world, 1) for t in ts])
     scatter = Mock(side_effect=lambda value: value[:rows])
     reassign = Mock()
-    # A dummy pass, which SPModelWrapper marks split like any other.
-    context = SimpleNamespace(is_dummy_run=True, pcp_split=True)
+    # SP shards are contiguous: the gathered step's real rows lead, its pads
+    # trail. Plain PCP shards are not, so it runs every row.
+    count = torch.tensor([rows * world - 3], dtype=torch.int32)
+    context = SimpleNamespace(
+        is_dummy_run=sp, pcp_split=True, scheduled_tokens_gpu=count
+    )
+    monkeypatch.setattr(moe, "sp_is_enabled", lambda: sp)
     monkeypatch.setattr(
         moe, "get_forward_context", lambda: SimpleNamespace(context=context)
     )
@@ -51,7 +61,7 @@ def test_sp_gathers_every_pass_once_and_scatters_it_back(monkeypatch, sp_modules
     assert gatherv.call_args.args[1:] == ([rows] * world, group)
     applied = method.apply.call_args.kwargs
     assert method.place_experts.call_args.args[3] is True
-    assert applied["scheduled_tokens_gpu"] is None
+    assert applied["scheduled_tokens_gpu"] is (count if sp else None)
     assert torch.equal(applied["x"], hidden.repeat(world, 1))
     assert applied["x_scale"] is None
     assert torch.equal(applied["topk_weights"], weights.repeat(world, 1))
