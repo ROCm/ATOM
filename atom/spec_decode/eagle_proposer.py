@@ -127,7 +127,8 @@ class EagleProposer(Drafter):
         capture a ONE-dimensional-positions shape that serving never runs --
         graphs nobody replays, paid for at every startup.
         A draft model that sets ``draft_graph_supports_mrope`` is the exception:
-        it stages them batch-last.
+        ``StagedInput.batch_dim`` stages them with the batch at axis 1. Other
+        MRoPE drafts have not been validated with draft graphs and stay eager.
         """
         self.step = None
         mrope = self.runner.use_mrope
@@ -154,7 +155,7 @@ class EagleProposer(Drafter):
             # two agree.
             "input_ids": StagedInput(dtype=torch.int32),
             "positions": (
-                StagedInput(shape=(3,), dtype=torch.int64, batch_last=True)
+                StagedInput(shape=(3,), dtype=torch.int64, batch_dim=1)
                 if mrope
                 else StagedInput(dtype=torch.int64)
             ),
@@ -777,7 +778,7 @@ class EagleProposer(Drafter):
                 ):
                     # (`_step_forward`) Step 0 of a decode runs every row but
                     # hands back only each sequence's last one; a step 1+ that
-                    # no declared pass covers (MRoPE) runs here, eagerly.
+                    # no declared pass covers runs here, eagerly.
                     ret_hidden_states, head_input = self.model.forward_with_head(
                         d_input_ids,
                         d_positions,

@@ -292,7 +292,7 @@ def test_decode_mrope_storage_matches_padded_graph_stride(monkeypatch, k):
 
 
 @pytest.mark.parametrize("opted_in", [True, False])
-def test_mrope_draft_graph_declares_positions_batch_last(opted_in):
+def test_mrope_draft_graph_declares_positions_with_the_batch_at_axis_1(opted_in):
     """Qwen3.8's MTP head declares its steps 1+ with `[3, bs]` positions; an
     MRoPE draft model that has not opted in still declares no pass."""
     from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
@@ -316,7 +316,7 @@ def test_mrope_draft_graph_declares_positions_batch_last(opted_in):
         return
     (graph,) = graphs
     assert graph.inputs["positions"] == StagedInput(
-        shape=(3,), dtype=torch.int64, batch_last=True
+        shape=(3,), dtype=torch.int64, batch_dim=1
     )
     assert graph.inputs["hidden_states"].shape == (2, 8)
     assert proposer._reuse_step_buffers
