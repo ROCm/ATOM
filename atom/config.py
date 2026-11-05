@@ -2319,10 +2319,10 @@ class Config:
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
-        if self.moe_all2all_backend not in ("auto", "mori", "rccl", "none"):
+        if self.moe_all2all_backend not in ("auto", "mori", "rccl", "flydsl", "none"):
             raise ValueError(
                 "moe_all2all_backend must be one of "
-                "{'auto', 'mori', 'rccl', 'none'}, "
+                "{'auto', 'mori', 'rccl', 'flydsl', 'none'}, "
                 f"got {self.moe_all2all_backend!r}"
             )
         if self.moe_all2all_backend == "rccl" and self.enable_tbo:
@@ -2351,10 +2351,13 @@ class Config:
                 "moe_backend='mega' requires expert parallelism; "
                 "pass --enable-expert-parallel."
             )
-        if self.moe_backend == "mega" and self.moe_all2all_backend == "rccl":
+        if self.moe_backend == "mega" and self.moe_all2all_backend in (
+            "rccl",
+            "flydsl",
+        ):
             raise ValueError(
                 "moe_backend='mega' owns its MoRI transport and cannot use the "
-                "experimental RCCL prepare/finalize backend"
+                f"{self.moe_all2all_backend} prepare/finalize backend"
             )
 
         if isinstance(self.compilation_config, dict):

@@ -75,7 +75,9 @@ class LLMEngine:
         # those streams can enter the collectives in opposite order and hang.
         # Keep the fallback usable by serializing it until it has dedicated
         # per-ubatch communicators, analogous to the PCP/TP guard below.
-        mori_ep_enabled = (
+        mori_ep_enabled = getattr(
+            config, "moe_all2all_backend", "auto"
+        ) == "flydsl" or (
             getattr(config, "moe_all2all_backend", "auto") in {"auto", "mori"}
             and not envs.ATOM_DISABLE_MORI_EP
             and importlib.util.find_spec("mori") is not None

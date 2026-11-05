@@ -36,7 +36,8 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     # not be inferred from the mere presence of the ``mori`` Python package.
     # EPLB always fuses, otherwise the env decides.
     requested_all2all = getattr(config, "moe_all2all_backend", "auto")
-    mori_selected = (
+    # The FlyDSL transport stands in for MoRI's IntraNode op: same switch.
+    mori_selected = requested_all2all == "flydsl" or (
         requested_all2all in {"auto", "mori"}
         and not envs.ATOM_DISABLE_MORI_EP
         and _has_module("mori")

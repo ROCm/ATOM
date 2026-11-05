@@ -415,10 +415,11 @@ class EngineArgs:
             nargs="?",
             const="high-throughput",
             default=None,
-            choices=["high-throughput", "low-latency", "rccl", "none"],
+            choices=["high-throughput", "low-latency", "rccl", "flydsl", "none"],
             help="Routed MoE transport. 'high-throughput' and 'low-latency' "
             "select MORI modes, 'rccl' selects ATOM's native RCCL MoE "
-            "transport, and 'none' forces the DP "
+            "transport, 'flydsl' selects aiter's FlyDSL intra-node "
+            "dispatch/combine (HIP IPC, no mori), and 'none' forces the DP "
             "AllGather/ReduceScatter fallback. Default is auto-detect MORI.",
         )
         parser.add_argument(
@@ -914,6 +915,7 @@ class EngineArgs:
             "high-throughput": "mori",
             "low-latency": "mori",
             "rccl": "rccl",
+            "flydsl": "flydsl",
             "none": "none",
         }[all2all_backend]
 

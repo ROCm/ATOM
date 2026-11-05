@@ -244,6 +244,8 @@ class FusedMoEParallelConfig:
             return None
         if self.requested_all2all_backend == "rccl":
             return "rccl"
+        if self.requested_all2all_backend == "flydsl":
+            return "flydsl"
         if not envs.ATOM_DISABLE_MORI_EP and _has_module("mori"):
             return "mori"
         return None
@@ -261,6 +263,10 @@ class FusedMoEParallelConfig:
     @property
     def use_rccl_kernels(self):
         return self.selected_all2all_backend == "rccl"
+
+    @property
+    def use_flydsl_a2a_kernels(self):
+        return self.selected_all2all_backend == "flydsl"
 
     @staticmethod
     def make(
@@ -656,12 +662,20 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 ep_group.device_communicator.get_or_create_all2all_manager("mori_v2"),
             )
 
-        all2all_manager = ep_group.device_communicator.all2all_manager
+        use_flydsl_a2a = moe.moe_parallel_config.use_flydsl_a2a_kernels
+        if use_flydsl_a2a:
+            # Named before anything reads .all2all_manager (which would build
+            # the default MoRI manager and its shmem heap).
+            all2all_manager = (
+                ep_group.device_communicator.get_or_create_all2all_manager("flydsl")
+            )
+        else:
+            all2all_manager = ep_group.device_communicator.all2all_manager
         assert all2all_manager is not None
 
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
-        if moe.use_mori_kernels:
+        if moe.use_mori_kernels or use_flydsl_a2a:
             assert quant_config is not None
 
             # One branch decides the whole wire format: the dtype dispatch() will
@@ -689,7 +703,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # dtype above -- MoRI infers dispatch from the tensor, combine from this.
             mori_combine_quant_type = envs.ATOM_MORI_COMBINE_QUANT
             tbo_is_enabled = tbo_enabled()
-            low_latency = use_mori_low_latency(
+            low_latency = (not use_flydsl_a2a) and use_mori_low_latency(
                 moe.moe_parallel_config.low_latency, all2all_manager.internode
             )
             if all2all_manager.internode and mori_combine_quant_type != "none":
@@ -733,6 +747,17 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 for slot in range(num_mori_ops)
             ]
 
+            if use_flydsl_a2a:
+                from atom.model_ops.fused_moe.flydsl_prepare_finalize import (
+                    FlyDSLPrepareAndFinalize,
+                )
+
+                return FlyDSLPrepareAndFinalize(
+                    mori_ops,
+                    max_tokens_per_rank=moe.max_num_tokens,
+                    num_dispatchers=all2all_manager.world_size,
+                    dispatch_format=dispatch_format,
+                )
             prepare_finalize = MoriPrepareAndFinalize(
                 mori_ops,
                 max_tokens_per_rank=moe.max_num_tokens,
