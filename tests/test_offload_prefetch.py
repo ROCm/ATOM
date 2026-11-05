@@ -23,6 +23,7 @@ from test_lmcache_mp_async_threads import (
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
+from atom.kv_transfer.offload.mp.token_shipping import TokenShipper
 from atom.model_engine.offload_prefetch import OffloadPrefetch
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import Admit, Scheduler
@@ -49,6 +50,7 @@ class _Connector(OffloadSchedulerMixin):
         self.cancelled = []
         self.pending_cancelled = []
         self.released = []
+        self.taken = set()
 
     def prefetch_lookups(self, seqs):
         list(seqs)
@@ -57,10 +59,13 @@ class _Connector(OffloadSchedulerMixin):
         return False
 
     def lookup_ready(self, seq):
-        return self.ready and seq.id not in self.not_ready_ids
+        return seq.id in self.taken or (self.ready and seq.id not in self.not_ready_ids)
 
     def take_ready_lookup(self, seq):
-        return self.lookup_ready(seq)
+        if not self.lookup_ready(seq):
+            return False
+        self.taken.add(seq.id)
+        return True
 
     def get_num_new_matched_tokens(self, seq):
         return self.match
@@ -76,6 +81,7 @@ class _Connector(OffloadSchedulerMixin):
 
     def release_taken_lookup(self, seq):
         self.released.append(seq.id)
+        self.taken.discard(seq.id)
 
     def build_connector_meta(self):
         return META
@@ -226,7 +232,7 @@ def test_loaded_request_passes_admission_stuck_on_resources(monkeypatch, seq_fac
     sched.kv_connector.not_ready_ids = set()
     sched.kv_connector.match = (0, False)  # a prefills locally
     _fire_blocked_on(sched, delayer, a, monkeypatch)
-    assert sched._blocked_head
+    assert sched._blocked_head == a.id
     assert list(sched.waiting) == [a, b]  # recorded at this FIRE, not yet used
     sched._promote_ready_remote_kv_requests()
     assert list(sched.waiting) == [b, a]
@@ -254,7 +260,7 @@ def test_a_failed_prefetch_back_to_waiting_is_forgotten(monkeypatch, seq_factory
     assert sched._prefetch.holds(b) and b.offload_loaded
     assert list(sched.waiting) == [a, b]
     _fire_blocked_on(sched, delayer, a, monkeypatch)
-    assert sched._blocked_head
+    assert sched._blocked_head == a.id
     sched._promote_ready_remote_kv_requests()
     assert list(sched.waiting) == [b, a]
 
@@ -264,7 +270,7 @@ def test_promotion_never_probes(monkeypatch, seq_factory):
     sched.kv_connector.not_ready_ids = {a.id}
     sched.schedule()
     sched.finished_recving_kv_req_ids.append(b.id)
-    sched._blocked_head = True
+    sched._blocked_head = a.id
 
     def no_probe(*_a, **_k):
         raise AssertionError("promotion must not probe")
@@ -301,6 +307,7 @@ def test_prefetch_off_keeps_mains_delayer_signal(monkeypatch, seq_factory):
     P/D consumer's finished receive is not resolved early (it decodes)."""
     sched, delayer, (seq,) = _make(monkeypatch, seq_factory)
     sched._prefetch = None
+    sched._blocked_head = None
     delayer.allow = True
     sched.schedule()  # Phase 2 parks it
     assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
@@ -339,34 +346,66 @@ def test_prefetch_waits_for_a_producer_only_as_phase_2_would(setup, monkeypatch)
     assert calls == [] and sched._prefetch.holds(seq)
 
 
-def test_a_producer_wait_is_retried_later_without_touching_the_tier(setup, monkeypatch):
+def test_a_producer_wait_follows_the_answer_and_keeps_it(setup, monkeypatch):
+    """Phase 2's order: the answer is taken and the hit refreshed first, then
+    the producer wait is decided -- with the refreshed hit and the connector's
+    own `needs_remote_load`. A wait keeps the answer (Phase 2, or the retry,
+    uses it as it is) and looks again later."""
     sched, _, seq = setup
     sched._local_prefill_coalescing = True
-    asked = []
-    conn = sched.kv_connector
-    take = conn.take_ready_lookup
-    conn.take_ready_lookup = lambda s: asked.append(s.id) or take(s)
-    monkeypatch.setattr(sched, "_wait_for_inflight_prefix", lambda *a, **k: True)
+    seen = []
+
+    def wait(s, cached, needs_remote_load, *, record=True):
+        seen.append((s.offload_joint.kv_prefix_tokens, needs_remote_load, record))
+        return True
+
+    monkeypatch.setattr(sched, "_should_wait_for_producer", wait)
     sched.schedule()
-    assert asked == [] and not sched._prefetch.holds(seq)
+    # The hit (8 tokens, from the double's match) was in place when asked.
+    assert seen == [(8, True, False)]
+    assert not sched._prefetch.holds(seq)
+    assert sched.kv_connector.taken == {seq.id} and sched.kv_connector.released == []
     retry = sched._prefetch.skip_until[seq.id]
     assert retry == sched._schedule_tick + OffloadPrefetch.RETRY_TICKS
     sched.schedule()
-    assert asked == []  # not looked at again before then
+    assert len(seen) == 1  # not looked at again before then
 
 
-def test_a_local_admission_is_kept_as_a_resume_in_place(monkeypatch, seq_factory):
-    """The connector refuses the load after `allocate`: the prefetch keeps the
-    admission (no take-back) and the request resumes in place at its hit."""
+def test_a_refusal_the_pool_may_lift_keeps_the_taken_answer(monkeypatch, seq_factory):
+    """`allocate` refused (no blocks to privatise a shared prefix): the answer
+    stays held, so the retry -- or Phase 2 -- needs no second lookup, and the
+    retry takes nothing new."""
+    from atom.model_engine.scheduler import Admit
+
+    sched, _, (seq,) = _make(monkeypatch, seq_factory)
+    monkeypatch.setattr(sched, "_admit_after_probe", lambda *a, **k: Admit.REFUSED)
+    sched.schedule()
+    conn = sched.kv_connector
+    assert conn.taken == {seq.id} and conn.released == []
+    assert not sched._prefetch.holds(seq)
+    retry = sched._prefetch.skip_until[seq.id]
+    assert retry == sched._schedule_tick + OffloadPrefetch.RETRY_TICKS
+
+
+def test_a_local_admission_is_given_back_and_admitted_in_its_turn(
+    monkeypatch, seq_factory
+):
+    """The connector refuses the load after `allocate`: the prefetch does not
+    hold the blocks across ticks (nothing counts them against `running` or the
+    parked slots, and decode growth cannot reclaim them). The admission is
+    undone, and Phase 2 admits the request in its turn."""
     sched, delayer, (a, b) = _make(monkeypatch, seq_factory, n=2)
     sched.kv_connector.not_ready_ids = {a.id}
     sched.kv_connector.parks = False
+    b.prefix_cache_hit_tokens = 3
+    free = _free(sched)
     sched.schedule()
-    assert b.status == SequenceStatus.WAITING and len(b.block_table) > 0
-    assert b.offload_held_local and not getattr(b, "offload_load_failed", False)
-    assert sched._is_offload_prefill_resume(b)
-    assert sched._prefetch.holds(b) and sched.kv_connector.cancelled == []
-    assert sched._num_parked_remote_kv == 0
+    assert b.status == SequenceStatus.WAITING and len(b.block_table) == 0
+    assert _free(sched) == free
+    assert sched.kv_connector.cancelled == [b.id]
+    assert b.prefix_cache_hit_tokens == 3  # as unadmitted
+    assert not sched._prefetch.holds(b) and sched._num_parked_remote_kv == 0
+    assert sched._prefetch.skip_until[b.id] == float("inf")
     assert list(sched.waiting) == [a, b]
 
     sched.kv_connector.not_ready_ids = set()
@@ -374,8 +413,7 @@ def test_a_local_admission_is_kept_as_a_resume_in_place(monkeypatch, seq_factory
     delayer.allow = True
     _, scheduled = sched.schedule()
     assert list(scheduled) == [a.id, b.id]
-    assert sched.kv_connector.allocs.count(b.id) == 1
-    assert not b.offload_held_local
+    assert sched.kv_connector.allocs.count(b.id) == 2  # prefetch's, then Phase 2's
 
 
 def test_requeue_cancels_the_pre_admission(setup, monkeypatch):
@@ -519,6 +557,7 @@ def test_lookup_ready_and_take_in_lookup_thread_mode(
     sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
+    sched._token_shipper = TokenShipper()
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client
@@ -575,8 +614,7 @@ def test_in_flight_prefetches_do_not_spend_the_lookup_bypass_budget(
 def test_a_non_resource_refusal_does_not_promote(monkeypatch, seq_factory):
     """Only a break for KV blocks or a parked slot marks Phase 2 blocked: a
     refused admission for another reason (a declined lookup detach, say)
-    does not let finished prefetches pass earlier arrivals; neither does a
-    blocked request that was aborted."""
+    does not let finished prefetches pass earlier arrivals."""
     from atom.model_engine.scheduler import Admit
 
     sched, delayer, (a, b) = _make(monkeypatch, seq_factory, n=2)
@@ -593,7 +631,7 @@ def test_a_non_resource_refusal_does_not_promote(monkeypatch, seq_factory):
     )
     delayer.allow = True
     sched.schedule()
-    assert not sched._blocked_head
+    assert sched._blocked_head is None
     # A pool refusal (no blocks to privatise a shared prefix) is one.
     monkeypatch.setattr(
         sched,
@@ -601,10 +639,39 @@ def test_a_non_resource_refusal_does_not_promote(monkeypatch, seq_factory):
         lambda s, *x, **k: Admit.REFUSED if s is a else real(s, *x, **k),
     )
     sched.schedule()
-    assert sched._blocked_head
-    sched._blocked_head = True
-    sched.abort_request(a.id)
-    assert not sched._blocked_head
+    assert sched._blocked_head == a.id
+
+
+def test_only_the_blocked_head_going_away_clears_the_mark(monkeypatch, seq_factory):
+    """An abort of some other waiting request must not drop the mark (the
+    finished prefetches would wait a whole delayer cycle more); the head
+    itself leaving does, however it leaves."""
+    sched, _, (a, b, c) = _make(monkeypatch, seq_factory, n=3)
+    sched._blocked_head = a.id
+    assert sched.abort_request(c.id)
+    assert sched._blocked_head == a.id
+    assert sched._blocked_head_waits()
+    # It left without an abort (admitted, rejected): the next promote sees it.
+    sched.waiting.remove(a)
+    assert not sched._blocked_head_waits() and sched._blocked_head is None
+    sched._blocked_head = b.id
+    assert sched.abort_request(b.id)
+    assert sched._blocked_head is None
+
+
+def test_the_lookup_window_skips_requests_a_prefetch_holds(monkeypatch, seq_factory):
+    """Parked and loaded prefetches keep their place in `waiting` but have had
+    their answer: they must not use up the window the lookups are sent for,
+    or the requests behind them never get one."""
+    sched, _, seqs = _make(monkeypatch, seq_factory, n=6)
+    for s in seqs[:4]:
+        sched._prefetch.entries[s.id] = s
+    seqs[0].status = SequenceStatus.WAITING_FOR_REMOTE_KVS  # in flight
+    window = sched._lookup_window(3)
+    assert window == seqs[4:6]
+    assert sched._lookup_window(1) == [seqs[4]]
+    sched._prefetch = None
+    assert sched._lookup_window(2) == seqs[:2]
 
 
 def test_a_taken_answer_that_is_not_admitted_is_given_back(setup):

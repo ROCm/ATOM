@@ -55,6 +55,8 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         self, config: Any, *, checkpoint_spec: Any = None, images: bool = True
     ) -> None:
         _validate_mp_config(config)
+        # Incremental token shipping (`token_shipping.py`).
+        self._token_shipper = TokenShipper()
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         validated_kv_role(kvc)
         offcfg._strict_integer(
@@ -227,15 +229,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         # post-allocate HBM frontier, so this is always a hash-block boundary.
         seq.offload_load_start_tokens = int(seq.num_cached_tokens)
         return operation
-
-    @property
-    def _token_shipper(self) -> TokenShipper:
-        """Incremental token shipping (`token_shipping.py`). Created on first
-        use, so schedulers assembled without `__init__` (test doubles) work."""
-        shipper = self.__dict__.get("_token_shipper_state")
-        if shipper is None:
-            shipper = self._token_shipper_state = TokenShipper()
-        return shipper
 
     def _transfer_tokens(self, seq: Any, end: int) -> ShippedTokens:
         return self._token_shipper.ship(seq, end)

@@ -39,6 +39,7 @@ from atom.kv_transfer.offload.mp import deployment, page_views, transfer
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
+from atom.kv_transfer.offload.mp.token_shipping import TokenShipper
 
 
 def _shipped_tokens(req):
@@ -691,6 +692,7 @@ def test_mp_lookup_releases_hit_suffix_outside_retrieve_range(monkeypatch):
     scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
+    scheduler._token_shipper = TokenShipper()
     scheduler._lookup_client = client
     monkeypatch.setattr(
         ChunkedOffloadSchedulerBase,
@@ -778,6 +780,7 @@ def _full_prompt_hit_scheduler(monkeypatch, chunk_size, hit=8):
     scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
+    scheduler._token_shipper = TokenShipper()
     scheduler._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         scheduler,
@@ -933,6 +936,7 @@ def test_stale_load_failure_does_not_release_current_generation_locks():
     scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
+    scheduler._token_shipper = TokenShipper()
     scheduler._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         scheduler,
@@ -2064,6 +2068,10 @@ def _shipping_pair():
     from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
 
     sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
+
+    sched._token_shipper = TokenShipper()
+
+    sched._token_shipper = TokenShipper()
     from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
 
     shell = LMCacheMPConnector.__new__(LMCacheMPConnector)
@@ -2160,6 +2168,10 @@ def test_the_session_end_drops_the_workers_copy(monkeypatch):
     from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
 
     sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
+
+    sched._token_shipper = TokenShipper()
+
+    sched._token_shipper = TokenShipper()
     seq = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
     sched._token_shipper.ship(seq, 32)
     sched._lookup_client = SimpleNamespace()

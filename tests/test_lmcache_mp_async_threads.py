@@ -24,6 +24,7 @@ from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import transfer_thread
 from atom.kv_transfer.offload.mp import worker as mp_worker
 from atom.kv_transfer.offload.mp.lookup_driver import _LockedAdapter
+from atom.kv_transfer.offload.mp.token_shipping import TokenShipper
 from atom.model_engine.sequence import SequenceStatus
 
 
@@ -217,6 +218,7 @@ def test_scheduler_offers_only_waiting_requests_to_the_driver():
     sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
+    sched._token_shipper = TokenShipper()
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client
@@ -487,6 +489,7 @@ def _same_step_scheduler():
     sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
+    sched._token_shipper = TokenShipper()
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client

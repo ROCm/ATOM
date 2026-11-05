@@ -88,6 +88,24 @@ class KVConnectorBase(ABC):
         return []
 
 
+def cancel_queued_receive(reqs_need_recv: dict, seq: Any) -> bool:
+    """Drop the receive a P/D consumer queued for `seq` and re-arm it.
+
+    For `cancel_preadmission`: the admission is refused after
+    `update_state_after_alloc` queued the receive, its blocks are freed, and
+    the re-admission queues it again -- so the receive must not run into them,
+    and `do_remote_prefill` (which the alloc cleared) is set again. True if a
+    receive of this request was queued.
+    """
+    entry = reqs_need_recv.get(seq.id)
+    if entry is None or entry[0] is not seq:
+        return False
+    del reqs_need_recv[seq.id]
+    if seq.kv_transfer_params is not None:
+        seq.kv_transfer_params["do_remote_prefill"] = True
+    return True
+
+
 class KVConnectorSchedulerBase(ABC):
     """Scheduler-side KV connector interface.
 

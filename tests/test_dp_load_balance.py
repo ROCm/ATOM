@@ -973,20 +973,58 @@ def test_a_rank_full_of_decodes_is_not_idle():
     assert _route(mgr, [_chain_seq(3, 110_000)]) == [other]
 
 
-def test_a_finished_output_without_tokens_does_not_complete_the_prefill():
-    """A structured-output error ends a request with an empty finished output
-    mid-prefill: the prefix it was computing is dropped, not confirmed."""
-    from atom.model_engine.request import RequestOutput
+def test_a_terminal_output_completes_the_prefill_only_if_it_was_dispatched():
+    """The scheduler's own fact decides (`Sequence.prefill_dispatched`), not
+    whether a token came out. An error mid-prefill left no prefix: the prefix
+    entries are dropped. An abort after the last chunk was dispatched did:
+    the entries stay, though no first token ever came."""
+    from types import SimpleNamespace
 
     mgr = _make_spread_mgr()
-    _route(mgr, [_chain_seq(1, 100_000)])
-    out = RequestOutput(request_id=1, output_tokens=[], finished=True)
-    assert not mgr._completes_prefill(out)
-    assert mgr._completes_prefill(
-        RequestOutput(request_id=1, output_tokens=[7], finished=True)
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    out = SimpleNamespace(finished=True, output_tokens=[], prefill_complete=False)
+    assert not out.prefill_complete  # the STREAM handler's test
+    mgr._release_terminal_seq(SimpleNamespace(id=1, prefill_dispatched=False))
+    assert not mgr._prefix_router.index  # dropped: its KV was never written
+
+    (owner,) = _route(mgr, [_chain_seq(2, 100_000)])
+    mgr._release_terminal_seq(SimpleNamespace(id=2, prefill_dispatched=True))
+    hits, src_owner, _ = mgr._prefix_router._rank_hits(
+        _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
-    assert mgr._completes_prefill(
-        RequestOutput(request_id=1, output_tokens=[], finished=False)
+    assert src_owner == owner and hits[owner] == 98_304
+    assert mgr._rank_reqs == [0, 0] and mgr._rank_tokens == [0, 0]
+
+
+def test_request_output_says_whether_a_prefill_completed():
+    """Outputs carrying a token complete it by default; the structured-output
+    error the scheduler builds mid-prefill says otherwise."""
+    from atom.model_engine.request import RequestOutput
+
+    assert RequestOutput(
+        request_id=1, output_tokens=[7], finished=False
+    ).prefill_complete
+    err = RequestOutput(
+        request_id=1, output_tokens=[], finished=True, prefill_complete=False
     )
-    mgr._release_seq_load(1)  # the error's release
-    assert not mgr._prefix_router.index
+    assert not err.prefill_complete
+
+
+def test_an_explicit_rank_indexes_the_prefix_it_lands():
+    """A proxy pins a prompt to a rank: that rank caches it, so a later
+    unhinted request with the prefix finds its owner instead of going cold."""
+    mgr = _make_spread_mgr()
+    pinned = _chain_seq(1, 100_000)
+    pinned.data_parallel_rank = 1
+    assert _route(mgr, [pinned]) == [1]
+    assert _count(mgr, "explicit_total") == 1
+    mgr._mark_seq_prefill_complete(1)
+    follower = _chain_seq(2, 110_000)
+    assert _route(mgr, [follower]) == [1]
+    assert _count(mgr, "prefix_owner_total") == 1
+    assert _est(mgr, follower) == 98_304
+    # A second pinned request credits what that rank holds, as a kept one.
+    again = _chain_seq(3, 100_000)
+    again.data_parallel_rank = 1
+    _route(mgr, [again])
+    assert _est(mgr, again) == 98_304
