@@ -13,7 +13,7 @@ never fires again. On GLM-5.2 with a 16,384-token budget that meant 20k-token
 prompts stored exactly 16,384 tokens and nothing else -- half of every long
 prefix invisible to the external tier, with every metric reporting success.
 
-Driven against the REAL `DenseOffloadScheduler`, so what is asserted is the
+Driven against the REAL `PluginDenseScheduler`, so what is asserted is the
 saves it actually emits, not the adapter's view of its own bookkeeping.
 """
 
@@ -33,9 +33,11 @@ dense_mod = pytest.importorskip(
     "atom.kv_transfer.offload.dense.connector",
     reason="the dense scheduler pulls the offload stack",
 )
-
 from atom.kv_transfer.disaggregation.types import ConnectorCompletion
 from atom.kv_transfer.offload import config as offcfg
+from atom.plugin.vllm.kv_transfer.plugin_schedulers import (
+    PluginDenseScheduler,
+)
 
 BLOCK, CHUNK, WORLD = 64, 64, 4
 BUDGET = 256  # one prefill chunk: four blocks
@@ -43,7 +45,7 @@ PROMPT = 1024  # four budgets, so three saves are hidden behind the first
 
 
 def _adapter(monkeypatch, dcp=1, *, block_size=BLOCK, chunk_size=CHUNK):
-    """The adapter wired to a real `DenseOffloadScheduler`.
+    """The adapter wired to a real `PluginDenseScheduler`.
 
     Built without `__init__` for the same reason the sibling files do it: a real
     construction needs a VllmConfig and a live LMCache engine.
@@ -63,7 +65,7 @@ def _adapter(monkeypatch, dcp=1, *, block_size=BLOCK, chunk_size=CHUNK):
         tensor_parallel_size=WORLD,
     )
     adapter = object.__new__(connector_mod.AtomLMCacheOffloadConnector)
-    adapter._scheduler = dense_mod.DenseOffloadScheduler(config)
+    adapter._scheduler = PluginDenseScheduler(config)
     adapter._config = config
     adapter._seqs = SeqViewRegistry()
     adapter._requests = {}
