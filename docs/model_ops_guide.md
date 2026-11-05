@@ -496,7 +496,7 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 - `greedy_sample()`: `aiter.ops.triton.topk.topk(logits, 1)`
 - `random_sample()`: `aiter.ops.triton.softmax.softmax(logits)` followed by exponential sampling and `topk`.
 
-**Fused unfiltered draw (`ATOM_SPEC_BONUS_FUSED=1`, default off).** For an unfiltered batch with per-row noise (the speculative bonus token, and the verification rows of a non-greedy batch), `bonus_temperature_sample` (`bonus_sample.py`) replaces `mixed_sample_outer_exponential` + `topk_select` + `<=` + `where` with two vocab-tiled launches: a `(row, tile)` kernel keeps each tile's best race key and raw-logit argmax, and a `(row,)` kernel combines the tiles. The noise is the same `exponential_` draw and the race is the same, so the distribution is unchanged; greedy rows are bit-identical (lowest id on ties); a sampling row can differ only when its two best race keys are within ~1e-7 relative. Rows with top-k/top-p keep the aiter path.
+**Fused unfiltered draw (`ATOM_SPEC_BONUS_FUSED=1`, default off).** For an unfiltered batch with per-row noise (the speculative bonus token, and the verification rows of a non-greedy batch), the sampler calls aiter's `fused_mixed_sample` (ROCm/aiter#7416) instead of `mixed_sample_outer_exponential` + `topk_select` + `<=` + `where`: two vocab-tiled launches, a `(row, tile)` kernel that keeps each tile's best race key and raw-logit argmax, and a `(row,)` kernel that combines the tiles. The noise is the same `exponential_` draw and the race is the same, so the distribution is unchanged; greedy rows are bit-identical (lowest id on ties); a sampling row can differ only when its two best race keys are within a few 1e-7 relative. Rows with top-k/top-p keep the aiter path, and so does every row when aiter has no `fused_mixed_sample` or no tuned config for the GPU.
 
 ### Required channel (`required_channel.py`)
 
@@ -574,7 +574,6 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `topK.py` | `rocm_aiter_topk_softmax`, `rocm_aiter_grouped_topk`, `init_aiter_topK_meta_data` |
 | `triton_topk_softmax.py` | `triton_topk_softmax` -- renormalized softmax top-k, bit-identical to AITER's `topk_softmax` |
 | `sampler.py` | `Sampler` — unified greedy/random sampling |
-| `bonus_sample.py` | `bonus_temperature_sample` — the unfiltered per-row-noise draw in two vocab-tiled Triton launches (`ATOM_SPEC_BONUS_FUSED`) |
 | `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling |
 | `required_channel.py` | `constrain_logits`, `advance_states` — `tool_choice="required"` channel mask (Kimi-K3) |
 | `base_config.py` | `QuantizeMethodBase` abstract class |
