@@ -14,13 +14,9 @@ from atom import config
 def modules():
     with atom_without_aiter() as load:
         yield SimpleNamespace(
-            aiter=load("aiter"),
             chip_info=load("aiter.jit.utils.chip_info"),
-            norm_ops=load("aiter.ops.fused_qk_rmsnorm_group_quant"),
-            dtypes=load("aiter.utility.dtypes"),
             token_transport=load("atom.distributed.token_transport"),
             sp_attention=load("atom.model_ops.sp_attention"),
-            layernorm=load("atom.model_ops.layernorm"),
         )
 
 
@@ -83,40 +79,3 @@ def test_head_exchange_requires_usable_collective(monkeypatch, modules, supporte
     ca.disabled = False
     monkeypatch.setattr(modules.chip_info, "get_gfx_runtime", lambda: "gfx942")
     assert transport.head_exchange_comm(group) is None
-
-
-class _Norm:
-    weight = torch.ones(8, dtype=torch.bfloat16)
-    variance_epsilon = 1e-6
-
-    def __call__(self, hidden_states, residual):
-        return hidden_states, residual
-
-
-def test_fp32_norm_quant_only_when_asked(monkeypatch, modules):
-    """Plain TP keeps the BF16-rounded quantization that mono matches."""
-    norm_ops, dtypes, layernorm = modules.norm_ops, modules.dtypes, modules.layernorm
-    calls = []
-    monkeypatch.setattr(layernorm, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(dtypes, "fp8", torch.float8_e4m3fn)
-    monkeypatch.setattr(
-        norm_ops,
-        "fused_qk_rmsnorm_per_token_quant",
-        lambda *args, **kwargs: calls.append("fp32"),
-    )
-
-    def quant(x, **kwargs):
-        calls.append("bf16")
-        return x, x
-
-    monkeypatch.setattr(modules.aiter, "get_hip_quant", lambda quant_type: quant)
-    x = torch.ones(2, 8, dtype=torch.bfloat16)
-    layernorm.fused_allreduce_gemma_rms_norm_quant(x, x, _Norm())
-    layernorm.gemma_rms_norm_quant(x, x, _Norm())
-    layernorm.gemma_rms_norm_quant(x, x, _Norm(), quantize_fp32_norm=True)
-    assert calls == ["bf16", "bf16", "fp32"]
-    # No silent fallback to the BF16-rounded quantization.
-    with pytest.raises(ValueError, match="quantize_fp32_norm"):
-        layernorm.gemma_rms_norm_quant(
-            x.float(), None, _Norm(), quantize_fp32_norm=True
-        )

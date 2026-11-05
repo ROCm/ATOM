@@ -19,7 +19,7 @@ from transformers import PretrainedConfig
 
 from atom.config import Config, QuantizationConfig
 from atom.distributed.indexer_cp import indexer_cp_enabled
-from atom.distributed.ulysses_sp import local_num_kv_heads, sp_is_enabled
+from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.base_attention import (
@@ -33,7 +33,6 @@ from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
     fused_allreduce_gemma_rms_norm_quant,
-    gemma_rms_norm_quant,
 )
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
@@ -634,30 +633,6 @@ class MiniMaxM3SparseAttention(nn.Module):
         return _minimax_m3_attend_and_project(self, q, k, v, positions, qkv)
 
 
-def _minimax_m3_norm(norm, hidden_states, residual, *, quant, quantize_fp32_norm):
-    """Gemma RMSNorm of `hidden_states + residual`, quantized per token when
-    `quant`. A residual's increment is all-reduced first, except under
-    `quantize_fp32_norm`, which runs on TP 1 with no all-reduce pending.
-
-    Returns ``(hidden_states, scale, residual)``; scale is None without `quant`.
-    """
-    if quant:
-        if residual is None or quantize_fp32_norm:
-            return gemma_rms_norm_quant(
-                hidden_states,
-                residual,
-                norm,
-                quantize_fp32_norm=quantize_fp32_norm,
-            )
-        return fused_allreduce_gemma_rms_norm_quant(hidden_states, residual, norm)
-    if residual is None:
-        return norm(hidden_states), None, hidden_states
-    hidden_states, residual = fused_allreduce_gemma_rms_norm(
-        hidden_states, residual, norm
-    )
-    return hidden_states, None, residual
-
-
 class MiniMaxM3DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -706,10 +681,6 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        # SP runs on TP 1 (Config); the fused FP32-norm quant takes OCP FP8 only.
-        # Plain TP keeps main's BF16-rounded quantization (TP4 mono matches it),
-        # and so does -tp 1, whose FP8 activations differ from SP's bit for bit.
-        self._quantize_fp32_norm = sp_is_enabled() and dtypes.fp8 == torch.float8_e4m3fn
 
     def forward(
         self,
@@ -721,13 +692,27 @@ class MiniMaxM3DecoderLayer(nn.Module):
         tuple[torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ):
-        hidden_states, hidden_states_scale, residual = _minimax_m3_norm(
-            self.input_layernorm,
-            hidden_states,
-            residual,
-            quant=_linear_consumes_per_token_fp8(self.self_attn.qkv_proj),
-            quantize_fp32_norm=self._quantize_fp32_norm,
+        hidden_states_scale = None
+        fuse_input_ar_rmsnorm_quant = _linear_consumes_per_token_fp8(
+            self.self_attn.qkv_proj
         )
+        fuse_post_attention_ar_rmsnorm_quant = (
+            not self.is_moe_layer
+            and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
+        )
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        elif fuse_input_ar_rmsnorm_quant:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_quant(
+                    hidden_states, residual, self.input_layernorm
+                )
+            )
+        else:
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.input_layernorm
+            )
 
         # Eagle3 aux hidden state = the all-reduced residual stream entering this
         # layer (post input-norm). Captured here, not as `hidden_states + residual`
@@ -740,18 +725,19 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
         )
-        hidden_states, hidden_states_scale, residual = _minimax_m3_norm(
-            self.post_attention_layernorm,
-            hidden_states,
-            residual,
-            quant=not self.is_moe_layer
-            and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj),
-            quantize_fp32_norm=self._quantize_fp32_norm,
-        )
-        if self.is_moe_layer:
-            hidden_states = self.block_sparse_moe(hidden_states)
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        if fuse_post_attention_ar_rmsnorm_quant:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_quant(
+                    hidden_states, residual, self.post_attention_layernorm
+                )
+            )
+            hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
         else:
-            hidden_states = self.mlp(hidden_states, x_scale=hidden_states_scale)
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.post_attention_layernorm
+            )
+            hidden_states = ffn(hidden_states)
         if aux_hidden_state is not None:
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual

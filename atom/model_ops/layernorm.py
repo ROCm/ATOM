@@ -997,59 +997,11 @@ def fused_allreduce_gemma_rms_norm_quant(
             )
         )
         return out_fp8, scale_out, residual_out
-    return gemma_rms_norm_quant(hidden_states, residual, norm)
 
-
-def gemma_rms_norm_quant(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor | None,
-    norm: GemmaRMSNorm,
-    *,
-    quantize_fp32_norm: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Gemma RMSNorm + per-token FP8 quant of rows with no all-reduce pending.
-
-    By default the norm is rounded to BF16 before quantization, as on the TP
-    all-reduce path. `quantize_fp32_norm` quantizes the FP32 norm instead, in
-    one AITER kernel, and raises on rows that kernel cannot take.
-    """
     from aiter import get_hip_quant
-    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_per_token_quant
     from aiter.utility.dtypes import fp8
 
-    x = hidden_states
-    if quantize_fp32_norm:
-        if not (
-            fp8 == torch.float8_e4m3fn
-            and x.dtype == norm.weight.dtype == torch.bfloat16
-            and x.ndim == 2
-            and x.stride(1) == 1
-            # the kernel keeps one row in registers
-            and x.shape[1] <= 8192
-        ):
-            raise ValueError(
-                "quantize_fp32_norm needs unit-stride 2-D BF16 rows of at most "
-                f"8192 columns and FP8 e4m3fn; got {tuple(x.shape)} {x.dtype} "
-                f"(weight {norm.weight.dtype}) to {fp8}."
-            )
-        out = torch.empty(x.shape, dtype=fp8, device=x.device)
-        scale = torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device)
-        residual_out = x if residual is None else torch.empty_like(x)
-        fused_qk_rmsnorm_per_token_quant(
-            out,
-            scale,
-            x,
-            norm.weight,
-            norm.variance_epsilon,
-            q_res_out=None if residual is None else residual_out,
-            q_residual=residual,
-            gemma_norm=True,
-        )
-        return out, scale, residual_out
-    if residual is None:
-        normed, residual_out = norm(x), x
-    else:
-        normed, residual_out = norm(x, residual)
+    normed, residual_out = norm(hidden_states, residual)
     out_fp8, scale_out = get_hip_quant(QuantType.per_Token)(
         normed,
         quant_dtype=fp8,
