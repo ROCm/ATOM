@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 """Ulysses SP integration for AITER's MegaMoeTP ag_rs kernel.
 
-`FusedMoE.forward_impl` hands it the row counts it serves, on every MoE layer
-built with `allow_sp_mega_moe`. One runtime is shared by the sequential MoE
-layers; its collective buffers and launch epochs must survive layer/graph
-boundaries.
+Enabled by `--moe-backend mega` with `--sequence-parallel-size` > 1.
+`FusedMoE.forward_impl` hands it the row counts it serves, on every MoE layer.
+One runtime is shared by the sequential MoE layers; its collective buffers and
+launch epochs must survive layer/graph boundaries.
 Large token shards are tiled locally, with the same tiles on every SP rank.
 """
 
@@ -16,8 +16,6 @@ import math
 import torch
 
 from atom.distributed.group_agreement import group_agree, group_max
-from atom.distributed.ulysses_sp import get_sp_world_size
-from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -224,16 +222,12 @@ def _unsupported_config(config):
 
 
 def _model_layers(model):
-    """The MoE layers their model allows SP MegaMoE on.
+    """The FusedMoE layers, by the slot each one has for the backend.
 
     Not `isinstance(module, FusedMoE)`: that name is the plugin-mode lazy
     wrapper, a subclass the built layers are not instances of.
     """
-    return [
-        module
-        for module in model.modules()
-        if getattr(module, "allow_sp_mega_moe", False)
-    ]
+    return [module for module in model.modules() if hasattr(module, "sp_mega_moe")]
 
 
 def _plan(config, layers):
@@ -268,29 +262,30 @@ def _plan(config, layers):
     return shapes.pop()
 
 
+def _refuse(reason):
+    return RuntimeError(f"--moe-backend mega with Ulysses SP: {reason}")
+
+
 def initialize_sp_mega_moe(model, config):
     """After weight processing, before warmup/capture.
 
-    Returns the shared backend, or None when the native MoE is kept. It is
-    all or nothing: one layer it cannot serve keeps every layer native.
+    Returns the shared backend, or None without `--moe-backend mega` under SP.
+    Raises on every rank when any layer, rank or setting is outside what it
+    serves.
     """
     from aiter.dist.parallel_state import get_pcp_group
 
-    if not envs.ATOM_SP_MOE_MEGA or get_sp_world_size() < 2:
+    if config.moe_backend != "mega" or config.sequence_parallel_size < 2:
         return
-
-    def skip(reason, log=logger.warning):
-        log("SP MegaMoE disabled, native MoE kept on every layer: %s", reason)
-
     layers = _model_layers(model)
     if not layers:
-        return skip("the model has no MoE layers it can run through it", logger.info)
+        raise _refuse("the model has no MoE layers")
     group = get_pcp_group()
     plan = _plan(config, layers)
     # A rank-local verdict (an import, a layout) must not split the ranks before
     # the collective MegaMoeTP setup.
     if not group_agree(not isinstance(plan, str), group.cpu_group):
-        return skip(plan if isinstance(plan, str) else "another SP rank refused it")
+        raise _refuse(plan if isinstance(plan, str) else "another SP rank refused it")
     hidden, inter, experts, top_k, activation, swiglu_limit = plan
     from aiter.ops.flydsl.mega_moe_tp import (
         MegaMoeSetupError,
@@ -324,17 +319,15 @@ def initialize_sp_mega_moe(model, config):
         # capture.
         runtime.prepare_all()
     except MegaMoeSetupError as exc:
-        # AITER raises it on every rank alike. Any other failure (OOM, a
-        # compile error) may hit one rank while its peers wait in a collective;
-        # falling back there alone would desync them.
+        # AITER raises it on every rank alike, so the collective close() is safe.
         if runtime is not None:
             runtime.close()
-        return skip(f"MegaMoeTP setup failed on every rank: {exc}")
+        raise _refuse(f"MegaMoeTP setup failed: {exc}") from exc
     # The big-M warmup leaves a timed-out wait in the sticky bits only.
     bits = group_max(runtime.poll_errors(), group.cpu_group)
     if bits:
         runtime.close()
-        return skip(f"a MegaMoeTP warmup wait timed out (error bits {bits:#x})")
+        raise _refuse(f"a MegaMoeTP warmup wait timed out (error bits {bits:#x})")
     backend = SPMegaMoE(runtime, layers[0], len(layers), group.cpu_group)
     for layer in layers:
         layer.sp_mega_moe = backend

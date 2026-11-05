@@ -65,6 +65,18 @@ def test_unsharded_execution_paths_are_rejected(overrides, reason):
         Config._init_sequence_parallel(config)
 
 
+@pytest.mark.parametrize(
+    "sp,ep,error", [(4, False, None), (1, False, "expert"), (1, True, None)]
+)
+def test_mega_moe_backend_needs_expert_parallelism_only_without_sp(sp, ep, error):
+    # Under SP it selects SP MegaMoE; _init_sequence_parallel refuses EP there.
+    config = atom_config_double(
+        moe_backend="mega", sequence_parallel_size=sp, enable_expert_parallel=ep
+    )
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        Config._init_moe_backend(config)
+
+
 def test_minimax_m3_builds_no_vision_tower_under_sp():
     config = atom_config_double(
         sequence_parallel_size=4,

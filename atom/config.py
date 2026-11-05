@@ -2397,6 +2397,27 @@ class Config:
             )
         sp_head_shards(getattr(hf_text, "num_key_value_heads", None) or heads, sp)
 
+    def _init_moe_backend(self) -> None:
+        self.moe_backend = self.moe_backend.strip().lower()
+        if self.moe_backend not in ("standard", "mega"):
+            raise ValueError(
+                "moe_backend must be one of {'standard', 'mega'}, "
+                f"got {self.moe_backend!r}"
+            )
+        # Under Ulysses SP, `mega` selects SP MegaMoE (sp_mega_moe.py) instead.
+        if self.moe_backend != "mega" or self.sequence_parallel_size > 1:
+            return
+        if not self.enable_expert_parallel:
+            raise ValueError(
+                "moe_backend='mega' requires expert parallelism; pass "
+                "--enable-expert-parallel, or --sequence-parallel-size for SP MegaMoE."
+            )
+        if self.moe_all2all_backend == "rccl":
+            raise ValueError(
+                "moe_backend='mega' owns its MoRI transport and cannot use the "
+                "experimental RCCL prepare/finalize backend"
+            )
+
     def __post_init__(self):
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
@@ -2424,22 +2445,7 @@ class Config:
                 f"got {self.prefill_admit_policy!r}"
             )
 
-        self.moe_backend = self.moe_backend.strip().lower()
-        if self.moe_backend not in ("standard", "mega"):
-            raise ValueError(
-                "moe_backend must be one of {'standard', 'mega'}, "
-                f"got {self.moe_backend!r}"
-            )
-        if self.moe_backend == "mega" and not self.enable_expert_parallel:
-            raise ValueError(
-                "moe_backend='mega' requires expert parallelism; "
-                "pass --enable-expert-parallel."
-            )
-        if self.moe_backend == "mega" and self.moe_all2all_backend == "rccl":
-            raise ValueError(
-                "moe_backend='mega' owns its MoRI transport and cannot use the "
-                "experimental RCCL prepare/finalize backend"
-            )
+        self._init_moe_backend()
 
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)

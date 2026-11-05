@@ -359,7 +359,6 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.experts",
             config=config,
             shared_expert_prefix=f"{prefix}.shared_experts",
-            allow_sp_mega_moe=True,
         )
         if hasattr(self.experts.quant_method, "intermediate_pad"):
             # MiniMax-M3 pads expert weights at load time; computing the full

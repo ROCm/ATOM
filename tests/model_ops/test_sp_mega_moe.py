@@ -2,6 +2,7 @@
 """CPU checks of SP MegaMoE dispatch, tiling and setup agreement."""
 
 import sys
+from functools import partial
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -167,7 +168,7 @@ def _servable_layer(moe):
         value = torch.empty(shape, dtype=torch.uint8)
         value.is_shuffled = True
         setattr(layer, name, value)
-    layer.allow_sp_mega_moe = True
+    layer.sp_mega_moe = None
     return layer
 
 
@@ -181,20 +182,29 @@ def _model(layer):
     return SimpleNamespace(modules=lambda: [torch.nn.Identity(), layer])
 
 
-def test_layer_shapes_follow_the_model_and_ineligible_layers_stay_native(
-    monkeypatch, sp_modules
+def _config(backend="mega", mnbt=1024):
+    return SimpleNamespace(
+        moe_backend=backend, sequence_parallel_size=4, max_num_batched_tokens=mnbt
+    )
+
+
+@pytest.mark.parametrize("backend", ["standard", "mega"])
+def test_only_the_mega_backend_runs_it_and_refuses_ineligible_layers(
+    monkeypatch, sp_modules, backend
 ):
     layer = _servable_layer(sp_modules.moe)
     assert fusion._unsupported_layer(layer) is None
     layer.w2_weight = layer.w2_weight.view(5, 128, 128)
     assert "w2_weight" in fusion._unsupported_layer(layer)
 
-    # Enabled by default: an ineligible model must load on the native MoE.
-    monkeypatch.setattr(fusion, "get_sp_world_size", lambda: 4)
     _pcp_group(monkeypatch, SimpleNamespace(cpu_group=None))
     monkeypatch.setattr(fusion, "_unsupported_config", lambda config: None)
-    assert fusion.initialize_sp_mega_moe(_model(layer), SimpleNamespace()) is None
-    assert getattr(layer, "sp_mega_moe", None) is None
+    initialize = partial(fusion.initialize_sp_mega_moe, _model(layer), _config(backend))
+    if backend == "standard":
+        assert initialize() is None
+        return
+    with pytest.raises(RuntimeError, match="experts: w2_weight"):
+        initialize()
 
 
 class MegaMoeSetupError(RuntimeError):
@@ -209,53 +219,31 @@ def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024):
     mega.MegaMoeSetupError = MegaMoeSetupError
     mega.mega_moe_tp_supported = lambda: True
     monkeypatch.setitem(sys.modules, mega.__name__, mega)
-    monkeypatch.setattr(fusion, "get_sp_world_size", lambda: 4)
     _pcp_group(
         monkeypatch, SimpleNamespace(world_size=4, rank_in_group=0, cpu_group=None)
     )
     monkeypatch.setattr(fusion, "_unsupported_config", lambda config: None)
-    config = SimpleNamespace(max_num_batched_tokens=mnbt)
-    return layer, lambda: fusion.initialize_sp_mega_moe(_model(layer), config)
+    return layer, partial(
+        fusion.initialize_sp_mega_moe, _model(layer), _config(mnbt=mnbt)
+    )
 
 
-@pytest.mark.parametrize(
-    "error,falls_back",
-    [
-        (MegaMoeSetupError("SdmaComm: MORI unavailable on ranks {2: ...}"), True),
-        # One rank's compile error, lazy import or OOM leaves its peers inside
-        # a collective.
-        (RuntimeError("compile failed"), False),
-        (ImportError("lazy import failed"), False),
-        (torch.OutOfMemoryError("HIP out of memory"), False),
-    ],
-)
-def test_runtime_setup_failure_keeps_the_native_moe(
-    monkeypatch, sp_modules, error, falls_back
-):
-    runtime = Mock(side_effect=error)
-    layer, initialize = _initialize(monkeypatch, sp_modules, runtime)
-    if not falls_back:
-        with pytest.raises(type(error)):
-            initialize()
-        return
-    assert initialize() is None
-    assert runtime.call_args.args[0]["max_local_tokens"] == 256
-    assert getattr(layer, "sp_mega_moe", None) is None
-
-
-def test_agreed_prepare_failure_closes_the_runtime(monkeypatch, sp_modules):
+def test_agreed_prepare_failure_closes_the_runtime_and_raises(monkeypatch, sp_modules):
     runtime = Mock(max_local_tokens=256, bigm_m=0)
     runtime.prepare_all.side_effect = MegaMoeSetupError(
         "MegaMoeTP.prepare: warmup launches timed out"
     )
-    _, initialize = _initialize(monkeypatch, sp_modules, Mock(return_value=runtime))
-    assert initialize() is None
+    factory = Mock(return_value=runtime)
+    _, initialize = _initialize(monkeypatch, sp_modules, factory)
+    with pytest.raises(RuntimeError, match="setup failed: MegaMoeTP.prepare"):
+        initialize()
+    assert factory.call_args.args[0]["max_local_tokens"] == 256
     runtime.close.assert_called_once_with()
 
 
-def test_a_refusing_peer_keeps_every_rank_native(monkeypatch, sp_modules):
+def test_a_refusing_peer_fails_every_rank(monkeypatch, sp_modules):
     runtime = Mock()
-    layer, initialize = _initialize(monkeypatch, sp_modules, runtime)
+    _, initialize = _initialize(monkeypatch, sp_modules, runtime)
     votes = []
 
     def peer_refuses(ok, group):
@@ -263,10 +251,10 @@ def test_a_refusing_peer_keeps_every_rank_native(monkeypatch, sp_modules):
         return False
 
     monkeypatch.setattr(fusion, "group_agree", peer_refuses)
-    assert initialize() is None
+    with pytest.raises(RuntimeError, match="another SP rank refused it"):
+        initialize()
     # This rank could serve it.
     assert votes == [True]
-    assert getattr(layer, "sp_mega_moe", None) is None
     runtime.assert_not_called()
 
 
@@ -287,14 +275,17 @@ def test_epoch_count_covers_every_tile_of_the_largest_shard(monkeypatch, sp_modu
     assert backend.launches == 8
 
 
-def test_warmup_timeout_on_any_rank_keeps_the_native_moe(monkeypatch, sp_modules):
+def test_warmup_timeout_on_any_rank_closes_the_runtime_and_raises(
+    monkeypatch, sp_modules
+):
     # The big-M warmup raises nothing: a timed-out wait is only in the bits.
     runtime = Mock(max_local_tokens=256, bigm_m=0, **{"poll_errors.return_value": 0})
     layer, initialize = _initialize(monkeypatch, sp_modules, Mock(return_value=runtime))
     monkeypatch.setattr(fusion, "group_max", lambda bits, group: max(bits, 32))
-    assert initialize() is None
+    with pytest.raises(RuntimeError, match="warmup wait timed out"):
+        initialize()
     runtime.close.assert_called_once_with()
-    assert getattr(layer, "sp_mega_moe", None) is None
+    assert layer.sp_mega_moe is None
 
 
 @pytest.fixture

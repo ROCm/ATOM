@@ -19,19 +19,6 @@ limitations](observability/README.md).
 |----------|------|---------|-------------|
 | **ATOM_H2D_BACKEND** | str | `packed` | `packed` combines forward metadata into one H2D and GPU scatter per consumer group. `direct` copies each member separately. Both preserve source reuse gates and full cudagraph padding. Set before starting the runner. See [metadata publication](h2d_publication.md). |
 
-## SP MegaMoE
-
-`ATOM_SP_MOE_MEGA=1` (default) runs the Ulysses SP MXFP4 MoE through AITER `MegaMoeTP`
-with `--tensor-parallel-size 1 --sequence-parallel-size N` on gfx950, on every step whose
-native MoE quantizes activations to FP4: prefill, and decode batches from 256 global rows.
-Smaller batches keep the native MoE. Models opt in per decoder layer. It is all or nothing:
-if any layer, rank or deployment setting is outside what it serves, every layer keeps the
-native MoE and a warning says why. SP needs AITER with
-[ROCm/aiter#7346](https://github.com/ROCm/aiter/pull/7346), checked at startup, and
-MegaMoE also needs MORI built with `BUILD_CCO_SDMA=ON`. Each launch covers at most
-`min(ceil(max_num_batched_tokens / N), 8192)` local rows, and a larger local shard runs as
-several launches.
-
 ## Data parallelism
 
 | Variable | Type | Default | Description |

@@ -2633,7 +2633,8 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
 def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
-    if get_current_atom_config().moe_backend == "mega":
+    # Under SP, `mega` runs SP MegaMoE over the native weights instead.
+    if get_current_atom_config().moe_backend == "mega" and not sp_is_enabled():
         return MegaMxfp4MoEMethod(quant_config, moe)
     return Mxfp4MoEMethod(quant_config, moe)
 
@@ -3515,7 +3516,6 @@ class FusedMoE(torch.nn.Module):
         pad_align: int | None = None,
         enable_comm_fused: bool = False,
         mxfp4_fp8_activations: bool = False,
-        allow_sp_mega_moe: bool = False,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -3549,8 +3549,7 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
-        # The model's opt-in; `initialize_sp_mega_moe` attaches the backend.
-        self.allow_sp_mega_moe = allow_sp_mega_moe
+        # Attached by `initialize_sp_mega_moe` under -sp --moe-backend mega.
         self.sp_mega_moe = None
         self._comm_fused_moe = None
         if enable_comm_fused:
@@ -3914,7 +3913,7 @@ class FusedMoE(torch.nn.Module):
         self._validate_moe_backend()
 
     def _validate_moe_backend(self) -> None:
-        if get_current_atom_config().moe_backend != "mega":
+        if get_current_atom_config().moe_backend != "mega" or sp_is_enabled():
             return
         if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
             raise TypeError(
