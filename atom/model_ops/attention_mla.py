@@ -72,6 +72,7 @@ from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
+from atom.model_ops.mla_decode_heads import MLA_MIN_HEADS, mla_decode_min_heads
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
@@ -217,7 +218,7 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 
 logger = logging.getLogger("atom")
 
-_MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+_MLA_MIN_HEADS = MLA_MIN_HEADS  # AITER MLA kernels require >= 16 attention heads
 
 
 def check_kv_shuffled_supported(
@@ -601,7 +602,14 @@ class MLAAttention(nn.Module):
         self.kv_cache_dtype = "fp8" if kv_cache_dtype.startswith("fp8") else "auto"
         self.dtype = dtype
 
-        self.min_query_heads = kwargs.get("min_query_heads", _MLA_MIN_HEADS)
+        self.min_query_heads = kwargs.get(
+            "min_query_heads",
+            mla_decode_min_heads(
+                self.kv_cache_dtype,
+                mla_modules.is_sparse or mla_modules.indexer is not None,
+                get_dcp_world_size(),
+            ),
+        )
         self.padded_num_heads = max(num_heads, self.min_query_heads)
         # Heads past num_heads are dead lanes: the MLA kernels compute them and
         # `_restore_query_heads` throws them away. They are zeros rather than
