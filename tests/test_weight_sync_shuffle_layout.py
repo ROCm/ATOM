@@ -125,12 +125,11 @@ def test_mxfp8_linear_preshuffle_is_opt_in_and_shape_gated(monkeypatch):
 
     monkeypatch.setenv(MXFP8_PRESHUFFLE_ENV, "0")
     assert not use_mxfp8_linear_bpreshuffle(128, 16, dtypes.fp8, 1)
-
-
-def test_native_mxfp8_preshuffle_is_a_separate_layout_decision():
     assert not weight_is_stored_preshuffled(
         QuantType.per_1x32, dtypes.fp8, native_group_rows=1
     )
+
+    monkeypatch.setenv(MXFP8_PRESHUFFLE_ENV, "1")
     assert weight_is_stored_preshuffled(
         QuantType.per_1x32,
         dtypes.fp8,

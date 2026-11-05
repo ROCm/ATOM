@@ -65,7 +65,7 @@ def test_aiter_execution_errors_are_not_hidden(monkeypatch, error_type):
     assert raised.value is error
 
 
-def test_mxfp8_preshuffle_dispatches_to_dedicated_aiter_op(monkeypatch):
+def test_mxfp8_preshuffle_dispatches_through_aiter_blockscale(monkeypatch):
     calls = []
 
     def run(*args, **kwargs):
