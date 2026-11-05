@@ -11,10 +11,16 @@ pytest.importorskip("aiter")
 
 
 @pytest.mark.parametrize(
-    "width,explicit,expected",
-    [(1, False, [20, 24]), (4, False, [19, 22]), (1, True, [19, 22])],
+    "width,explicit,deferred,expected",
+    [
+        (1, False, True, [20, 24]),
+        (4, False, True, [19, 22]),
+        (1, True, True, [19, 22]),
+        (4, False, False, [19, 23]),
+    ],
 )
-def test_decode_rollback_and_positions(width, explicit, expected):
+def test_decode_rollback_and_positions(width, explicit, deferred, expected):
+    from atom.model_engine.model_runner import tokenIDProcessor
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
     )
@@ -30,11 +36,13 @@ def test_decode_rollback_and_positions(width, explicit, expected):
         "context_lens": SimpleNamespace(np=np.zeros(2, dtype=np.int32)),
     }
     lens = np.full(2, width, dtype=np.int32)
+    processor = SimpleNamespace(num_rejected=np.array([1, 2]), is_deferred_out=deferred)
+    processor.verify_ctx_lens = tokenIDProcessor.verify_ctx_lens.__get__(processor)
     builder = SimpleNamespace(
         model_runner=SimpleNamespace(
             forward_vars=variables,
             arange_np=np.arange(8, dtype=np.int32),
-            tokenID_processor=SimpleNamespace(num_rejected=np.array([1, 2])),
+            tokenID_processor=processor,
         ),
         decode_spans=lambda batch: (2, lens, np.array([0, width, 2 * width])),
         prepare_block_tables=stop_after_positions,

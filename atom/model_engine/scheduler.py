@@ -2430,8 +2430,8 @@ class Scheduler:
         # mixed batching is enabled; flag-off => reserve 0 => byte-identical to
         # the old prefill-first behavior.
         # Reserved at what the decode loop below actually spends per seq
-        # (`decode_spec_width + 1`), not at `mtp_k + 1`: the two differ under
-        # PP, where the loop spends no draft rows.
+        # (`decode_spec_width + 1`); a P/D producer keeps a drafter but does
+        # not schedule draft rows for local verification.
         prefill_budget = self._prefill_budget()
 
         # ---- Phase 1: resume partial prefills from running ----

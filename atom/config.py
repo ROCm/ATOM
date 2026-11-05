@@ -3308,8 +3308,8 @@ class Config:
                 spec is not None and self.pipeline_parallel_size > 1,
                 "speculative decoding with pipeline parallel",
                 (
-                    "under PP the decode loop spends no draft rows "
-                    "(spec_width 0), so the spec-shaped mixed split never forms"
+                    "mixed speculative input staging and attention rollback "
+                    "are not wired for PP's undeferred output"
                 ),
             ),
             # The decode-first `prefill_budget` holds only while prefill is

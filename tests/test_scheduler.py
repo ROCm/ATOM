@@ -3849,7 +3849,9 @@ class TestMixedSpecDecodeReserve:
     def _sched(self, mtp_k, **overrides):
         return Scheduler(
             MockConfig(
-                enable_mixed_prefill_decode=True,
+                enable_mixed_prefill_decode=overrides.pop(
+                    "enable_mixed_prefill_decode", True
+                ),
                 num_kvcache_blocks=64,
                 max_num_seqs=4,
                 max_num_batched_tokens=16,
@@ -3861,8 +3863,14 @@ class TestMixedSpecDecodeReserve:
 
     def test_spend_and_reserve_share_one_width(self):
         assert self._sched(3).decode_spec_width == 3
-        # Drafting-only under PP: no draft rows are forwarded, none reserved.
-        assert self._sched(3, pipeline_parallel_size=2).decode_spec_width == 0
+        # PP now verifies drafts locally. Mixed + PP speculation is gated
+        # separately; the ordinary PP scheduler must retain the draft width.
+        assert (
+            self._sched(
+                3, pipeline_parallel_size=2, enable_mixed_prefill_decode=False
+            ).decode_spec_width
+            == 3
+        )
 
     def test_a_pure_prefill_step_verifies_nothing(self, seq_factory):
         """With the flag on a pure-prefill batch leaves through the decode
