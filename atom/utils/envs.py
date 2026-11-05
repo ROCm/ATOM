@@ -494,6 +494,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_MOE_TAIL_NORM": lambda: (
         os.getenv("ATOM_FUSED_MOE_TAIL_NORM", "0") == "1"
     ),
+    # With ATOM_FUSED_MOE_TAIL_NORM, TP1 on aiter's gfx1250 grouped MoE (no EP
+    # scatter): the routed experts' top-k gather-reduce runs in the tail norm's
+    # kernel too (moe_tail_norm.moe_gather_tail_rmsnorm): one program a token
+    # loads its MoE2 rows, weights and sums them, adds sigmoid(gate) * shared
+    # and the residual and normalizes, bitwise moe_gather_reduce + the tail
+    # kernel. The shared expert still runs between MoE2 and this kernel.
+    # Eager / CUDA graphs only. Off by default.
+    "ATOM_MOE_GATHER_TAIL_NORM": lambda: (
+        os.getenv("ATOM_MOE_GATHER_TAIL_NORM", "0") == "1"
+    ),
     # With ATOM_FUSED_MOE_TAIL_NORM, under mori EP on aiter's MegaMoEGfx1250
     # (bf16 combine wire): the gated shared-expert add, the residual add and the
     # next RMSNorm run inside aiter's one-kernel combine (its cross-device wait

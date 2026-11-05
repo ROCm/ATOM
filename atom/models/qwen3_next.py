@@ -46,6 +46,7 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.moe_tail_norm import (
     CombineTailRequest,
+    GatheredRouted,
     MoEGatedSum,
     MoENormed,
     combine_tail_request,
@@ -231,6 +232,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     # is known to fold the gated shared-expert add in (ATOM_FUSED_MOE_TAIL_NORM):
     # forward then returns a MoEGatedSum instead of the summed tensor.
     defer_gated_sum = False
+    # ATOM_MOE_GATHER_TAIL_NORM (set with defer_gated_sum, TP1): the routed
+    # experts' top-k gather-reduce is left to the norm's kernel too.
+    defer_gather = False
     # ATOM_MEGA_COMBINE_TAIL (set with defer_gated_sum): the norm that reads this
     # block's output (not a registered submodule: it is the next layer's), run
     # by the MoE combine itself, and whether its new residual is read.
@@ -396,6 +400,56 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             return MoENormed(*req.result)
         return MoEGatedSum(routed_output, shared_output, gate_logits)
 
+    def _experts_deferred_gather(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor | GatheredRouted:
+        """The routed experts with their top-k gather-reduce left to the next
+        norm (ATOM_MOE_GATHER_TAIL_NORM): MoE2's rows and the route map as a
+        `GatheredRouted` where aiter's grouped MoE deferred it, else the sum."""
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import defer_gather_reduce
+
+        with defer_gather_reduce() as req:
+            routed_output = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
+        if not req.taken:
+            return routed_output
+        # aiter's unwritten stand-in must come back untouched: no gather,
+        # collective or slice between it and here (see `gather_deferrable`).
+        if (
+            routed_output.data_ptr() != req.placeholder.data_ptr()
+            or req.route_rows.shape[0] != hidden_states.shape[0]
+        ):
+            raise RuntimeError(
+                f"{self.prefix}: the MoE call moved the rows of a deferred gather"
+            )
+        return GatheredRouted(
+            req.grouped, req.route_rows, req.weights, req.num_valid_tokens
+        )
+
+    @property
+    def gather_deferrable(self) -> bool:
+        """Whether the routed sum comes straight out of the grouped MoE's
+        gather-reduce on this rank's own rows: TP1, no all-to-all, no DP
+        gather / reduce-scatter, no simulated DP ranks, no PCP merge; and an
+        aiter that can defer the reduce."""
+        try:
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import (  # noqa: F401
+                defer_gather_reduce,
+            )
+        except ImportError:
+            return False
+        cfg = self.experts.moe_parallel_config
+        return (
+            self.tp_size == 1
+            and self.shared_expert is not None
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
+            and not cfg.use_all2all_kernels
+            and (cfg.dp_size <= 1 or cfg.replicate_experts)
+            and cfg.dp_logical_ratio == 1
+            and not getattr(cfg, "pcp_merge", False)
+        )
+
     def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts + 1)
         logits = self.gate(hidden_states)
@@ -403,9 +457,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             router_logits = logits[:, : self.n_routed_experts]
         else:
             router_logits = logits
-        routed_output = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        if self.defer_gather and not torch.compiler.is_compiling():
+            routed_output = self._experts_deferred_gather(hidden_states, router_logits)
+        else:
+            routed_output = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
         if not self.is_rocm_aiter_fusion_shared_expert_enabled:
             shared_output = self.shared_expert(hidden_states)
             # Apply shared expert gate: the merged gate output contains
@@ -527,6 +584,13 @@ def defer_moe_gated_sums(
             and not getattr(layer, "layer_scale", False)
         ):
             mlp.defer_gated_sum = True
+            # The norm's own kernel, not the all-reduce one, and aiter's TP
+            # grouped path (no EP scatter) reduces the routed rows.
+            mlp.defer_gather = (
+                envs.ATOM_MOE_GATHER_TAIL_NORM
+                and mlp.gather_deferrable
+                and not (envs.ATOM_MEGA_COMBINE_TAIL and combine_tail)
+            )
             deferred += 1
             if envs.ATOM_MEGA_COMBINE_TAIL and combine_tail and mlp.tp_size == 1:
                 # Not a submodule: the norm belongs to the next layer / model.
@@ -538,9 +602,15 @@ def defer_moe_gated_sums(
     if moe_blocks:
         logger.info(
             "ATOM_FUSED_MOE_TAIL_NORM: %d of %d MoE blocks fold their gated "
-            "shared-expert add into the next norm",
+            "shared-expert add into the next norm (%d also their top-k "
+            "gather-reduce)",
             deferred,
             moe_blocks,
+            sum(
+                getattr(ly.mlp, "defer_gather", False)
+                for ly in layers
+                if hasattr(ly, "mlp")
+            ),
         )
     return deferred
 

@@ -29,10 +29,13 @@ from atom.config import QuantizationConfig
 from atom.model_ops.moe_tail_norm import (
     MoEGatedSum,
     MoENormed,
+    can_fuse_gather_tail,
     can_fuse_moe_tail,
     gated_sum,
+    moe_gather_tail_rmsnorm,
     moe_tail_rmsnorm,
     moe_tail_rmsnorm_rows,
+    resolve_gathered,
 )
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
@@ -1243,7 +1246,18 @@ class GemmaRMSNorm(nn.Module):
         `write_residual=False` (a final norm, whose new residual nobody reads)
         returns the normed rows alone, and only rows `rows` when given
         (`out[i]` is row `rows[i]`); otherwise `(normed, new_residual)`.
+
+        A deferred gather (`GatheredRouted` routed, ATOM_MOE_GATHER_TAIL_NORM)
+        is reduced in the same launch where the kernel can take it, and by
+        aiter's gather-reduce first everywhere else.
         """
+        if not self.fused_allreduce and can_fuse_gather_tail(
+            moe, residual, self.weight, rows
+        ):
+            return moe_gather_tail_rmsnorm(
+                moe, residual, self.weight, self.variance_epsilon, rows, write_residual
+            )
+        moe = resolve_gathered(moe)
         if self.fused_allreduce:
             # TP-partial addends (ATOM_FUSED_MOE_TAIL_AR_NORM): the gated add and
             # the all-reduce in the norm's kernel, over every row.
@@ -1277,6 +1291,7 @@ class GemmaRMSNorm(nn.Module):
         """The MoE-tail kernel with its MXFP8 epilogue, or None where it does not apply."""
         if not isinstance(x, MoEGatedSum) or residual is None or not self.takes_moe_gated_sum:
             return None
+        x = resolve_gathered(x)
         if not can_fuse_moe_tail(x, residual, self.weight, None):
             return None
         from atom.model_ops.moe_tail_norm import moe_tail_rmsnorm_mxfp8
