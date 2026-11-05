@@ -113,7 +113,7 @@ def test_unquantized_and_per_tensor_are_not_shuffled():
     assert weight_is_stored_preshuffled(QuantType.per_Tensor, dtypes.fp8) is False
 
 
-def test_mxfp8_linear_preshuffle_is_opt_in_and_shape_gated(monkeypatch):
+def test_mxfp8_linear_preshuffle_is_default_on_and_shape_gated(monkeypatch):
     monkeypatch.delenv(MXFP8_PRESHUFFLE_ENV, raising=False)
     monkeypatch.setattr("aiter.jit.utils.chip_info.get_gfx_runtime", lambda: "gfx950")
     assert use_mxfp8_linear_bpreshuffle(128, 16, dtypes.fp8, 1)
