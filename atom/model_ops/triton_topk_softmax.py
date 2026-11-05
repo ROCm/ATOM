@@ -10,7 +10,6 @@ experts, not just the K winners.  This is used by Qwen3.5 / Qwen3-Next."""
 import torch
 import triton
 import triton.language as tl
-
 from triton.language.extra.hip import libdevice
 
 
