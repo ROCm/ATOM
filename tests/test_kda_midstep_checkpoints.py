@@ -45,6 +45,22 @@ KDA_SPEC = PagedStateCheckpointSpec(10, 25, "kda-paged-state-v1:test", image_byt
 #: Kimi-K3's `linear_conv_kernel_dim`.
 CONV_KERNEL = 4
 CONV_LEN = CONV_KERNEL - 1
+
+
+def window_rows(snaps):
+    """The flat conv-input rows each interior target's window reads, as
+    `write_state_checkpoints` addresses them: `conv_len` rows ending at
+    `cu_seqlens[row] + off`."""
+    cu = snaps.cu_seqlens.tolist()
+    rows = []
+    for row, off, end in zip(
+        snaps.rows.tolist(), snaps.offs.tolist(), snaps.is_end.tolist(), strict=True
+    ):
+        if not end:
+            rows.extend(range(cu[row] + off - CONV_LEN, cu[row] + off))
+    return rows
+
+
 GRID = FLASH_KDA_CHUNK
 # PROMPT is 44 tokens; a PAGE class needs no successor room, so its prompt-end
 # anchor is the last hittable block's end.
@@ -183,8 +199,8 @@ def test_one_scheduler_pass(on, monkeypatch):
     assert snaps.targets == ((0, pos),)
     assert snaps.slots.tolist() == [slot]
     assert snaps.runtime_slots.tolist() == batch.state_slots_committed
-    assert snaps.conv_rows.tolist() == list(range(pos - CONV_LEN, pos))
-    assert snaps.end_slots is None
+    assert window_rows(snaps) == list(range(pos - CONV_LEN, pos))
+    assert snaps.is_end.tolist() == [0]
 
 
 # ── switch on: what one forward's positions become ───────────────────────────
@@ -214,8 +230,8 @@ def test_several_positions_in_one_forward_become_several_targets():
     assert snaps.slots.tolist() == [slot for slot, _pos in saves]
     assert seq.state_slot not in snaps.slots.tolist()
     assert snaps.runtime_slots.tolist() == [seq.state_slot] * 2
-    assert snaps.conv_rows.tolist() == [29, 30, 31, 93, 94, 95]
-    assert snaps.end_slots is None
+    assert window_rows(snaps) == [29, 30, 31, 93, 94, 95]
+    assert snaps.is_end.tolist() == [0, 0] and snaps.h_rows.tolist() == [0, 1]
 
 
 def test_an_interior_and_an_end_position_in_one_forward():
@@ -237,8 +253,10 @@ def test_an_interior_and_an_end_position_in_one_forward():
         device="cpu",
     )
     assert snaps.targets == ((0, 32),)
-    assert snaps.end_slots.tolist() == [saves[1][0]]
-    assert snaps.end_runtime_slots.tolist() == [seq.state_slot]
+    assert snaps.slots.tolist() == [slot for slot, _pos in saves]
+    assert snaps.offs.tolist() == [32, ANCHOR]
+    assert snaps.is_end.tolist() == [0, 1]
+    assert snaps.runtime_slots.tolist() == [seq.state_slot] * 2
 
 
 def test_targets_follow_the_batch_row_of_each_state_holding_seq():
@@ -257,7 +275,8 @@ def test_targets_follow_the_batch_row_of_each_state_holding_seq():
     )
     assert snaps.targets == ((2, 32),)
     assert snaps.slots.tolist() == [5] and snaps.runtime_slots.tolist() == [2]
-    assert snaps.conv_rows.tolist() == [79, 80, 81]
+    assert snaps.rows.tolist() == [2] and snaps.cu_seqlens.tolist() == [0, 40, 50, 114]
+    assert window_rows(snaps) == [79, 80, 81]
 
 
 def test_a_step_without_saves_builds_nothing():
@@ -295,45 +314,41 @@ def test_a_full_state_pool_drops_the_checkpoint():
 
 
 # ── how a KDA layer writes them ──────────────────────────────────────────────
+#
+# One `write_state_checkpoints` launch per layer (the kernel itself is pinned
+# in test_kda_midstep_ckpt_kernel.py, which needs Triton).
 
 
-def _planes(slots=6, heads=2, width=4, dim=5, rollback=2):
-    torch.manual_seed(0)
-    ssm = torch.randn(slots, heads, width, width)
-    conv = torch.randn(slots, dim, CONV_LEN + rollback)
-    return ssm, conv
-
-
-def test_write_puts_each_snapshot_and_its_conv_window_in_its_slot():
-    ssm, conv = _planes()
-    before_ssm, before_conv = ssm.clone(), conv.clone()
-    mixed_qkv = torch.randn(80, conv.shape[1])
+def test_interior_and_end_targets_share_one_launch():
+    """Interior targets first, in aiter's snapshot order, each reading its row
+    of `snapshot_out`; the anchor at the forward's end reads the runtime slot."""
     snaps = kda_snapshots(
-        [[(4, 32), (5, 64)]],
+        [[(4, 32), (5, 64), (6, 96)]],
         [0],
         [0],
-        [80],
+        [96],
         [1],
-        num_slots=6,
+        num_slots=8,
         conv_len=CONV_LEN,
         device="cpu",
     )
-    snap_out = torch.randn(2, *ssm.shape[1:])
-    snaps.write(ssm, conv, snap_out, mixed_qkv)
-    assert torch.equal(ssm[4], snap_out[0]) and torch.equal(ssm[5], snap_out[1])
-    assert torch.equal(conv[4, :, :CONV_LEN], mixed_qkv[29:32].T)
-    assert torch.equal(conv[5, :, :CONV_LEN], mixed_qkv[61:64].T)
-    # The rollback columns a prefill leaves alone come from the runtime slot.
-    assert torch.equal(conv[4, :, CONV_LEN:], before_conv[1, :, CONV_LEN:])
-    assert torch.equal(conv[5, :, CONV_LEN:], before_conv[1, :, CONV_LEN:])
-    for slot in (0, 1, 2, 3):
-        assert torch.equal(ssm[slot], before_ssm[slot])
-        assert torch.equal(conv[slot], before_conv[slot])
+    assert snaps.targets == ((0, 32), (0, 64))
+    assert snaps.slots.tolist() == [4, 5, 6]
+    assert snaps.offs.tolist() == [32, 64, 96]
+    assert snaps.is_end.tolist() == [0, 0, 1]
+    assert snaps.h_rows.tolist()[:2] == [0, 1]
+    assert snaps.runtime_slots.tolist() == [1, 1, 1]
+    ssm, conv = torch.zeros(8, 2, 4, 4), torch.zeros(8, 5, CONV_LEN + 2)
+    snap_out, mixed_qkv = torch.zeros(2, 2, 4, 4), torch.zeros(96, 5)
+    args = snaps.checkpoint_args(snap_out, ssm, mixed_qkv, conv)
+    assert args["h"] is snap_out and args["h_rows"] is snaps.h_rows
+    assert args["ssm_state"] is ssm and args["conv_state"] is conv
+    assert args["x"] is mixed_qkv and args["cu_seqlens"] is snaps.cu_seqlens
+    assert args["chunk_offsets"] is None and args["chunk_size"] is None
+    assert args["conv_state_len"] == CONV_LEN
 
 
-def test_write_copies_an_end_position_from_the_runtime_slot():
-    ssm, conv = _planes()
-    before_ssm, before_conv = ssm.clone(), conv.clone()
+def test_an_end_position_alone_reads_the_pool():
     snaps = kda_snapshots(
         [[(4, 64)]],
         [0],
@@ -344,10 +359,9 @@ def test_write_copies_an_end_position_from_the_runtime_slot():
         conv_len=CONV_LEN,
         device="cpu",
     )
-    assert snaps.targets == () and snaps.end_slots.tolist() == [4]
-    snaps.write(ssm, conv, None, torch.randn(64, conv.shape[1]))
-    assert torch.equal(ssm[4], before_ssm[1])
-    assert torch.equal(conv[4], before_conv[1])
-    for slot in (0, 1, 2, 3, 5):
-        assert torch.equal(ssm[slot], before_ssm[slot])
-        assert torch.equal(conv[slot], before_conv[slot])
+    assert snaps.targets == () and snaps.is_end.tolist() == [1]
+    ssm = torch.zeros(6, 2, 4, 4)
+    args = snaps.checkpoint_args(
+        None, ssm, torch.zeros(64, 5), torch.zeros(6, 5, CONV_LEN)
+    )
+    assert args["h"] is ssm

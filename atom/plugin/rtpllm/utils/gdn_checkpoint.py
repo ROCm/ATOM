@@ -236,7 +236,28 @@ def install_rtp_gdn_checkpoint_writer() -> None:
         chunk_size,
         conv_state_len,
         h_vk=False,
+        *,
+        h_rows=None,
     ):
+        # Per-target states (Kimi-K3's midstep checkpoints) are laid out as
+        # the pool is, so the shared writer takes them under RTP-LLM too.
+        if h_rows is not None:
+            return original(
+                h,
+                state,
+                x,
+                conv,
+                rows,
+                slots,
+                offsets,
+                is_end,
+                runtime_slots,
+                chunk_offsets,
+                cu_seqlens,
+                chunk_size,
+                conv_state_len,
+                h_rows=h_rows,
+            )
         if not is_rtpllm():
             return original(
                 h,

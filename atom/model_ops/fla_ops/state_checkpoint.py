@@ -39,6 +39,7 @@ def _copy_checkpoints_kernel(
     offs,  # [T] token offset of the target within its slice of this step
     is_end,  # [T] 1 if the target sits AT the end of the row's tokens
     runtime_slots,  # [T] the row's runtime slot, the source when is_end
+    h_rows,  # [T] H_PER_TARGET: the row of `h` holding the target's state
     chunk_offsets,  # [N + 1] first chunk index of each sequence in `h`
     cu_seqlens,  # [N + 1] first token of each sequence in `x`
     stride_x_t,  # row (token) stride of `x`; NOT D — see write_state_checkpoints
@@ -54,6 +55,9 @@ def _copy_checkpoints_kernel(
     K: tl.constexpr,
     V: tl.constexpr,
     STATE_VK: tl.constexpr = False,
+    # `h` holds one state per target, already in the pool's layout (FlashKDA's
+    # `snapshot_out`), rather than every chunk boundary in K-first order.
+    H_PER_TARGET: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
     i_blk = tl.program_id(1)
@@ -81,6 +85,12 @@ def _copy_checkpoints_kernel(
         if tl.load(is_end + i_t) != 0:
             src_slot = tl.load(runtime_slots + i_t).to(tl.int64)
             sv = tl.load(ssm_dst + src_slot * HKV + dst_idx, mask=mask, other=0.0).to(
+                ssm_dst.dtype.element_ty
+            )
+        elif H_PER_TARGET:
+            # Laid out as the pool is, so it is read at the pool's index.
+            src = tl.load(h_rows + i_t).to(tl.int64)
+            sv = tl.load(h + src * HKV + dst_idx, mask=mask, other=0.0).to(
                 ssm_dst.dtype.element_ty
             )
         else:
@@ -117,10 +127,12 @@ def write_state_checkpoints(
     offs: torch.Tensor,
     is_end: torch.Tensor,
     runtime_slots: torch.Tensor,
-    chunk_offsets: torch.Tensor,
+    chunk_offsets: torch.Tensor | None,
     cu_seqlens: torch.Tensor,
-    chunk_size: int,
+    chunk_size: int | None,
     conv_state_len: int,
+    *,
+    h_rows: torch.Tensor | None = None,
 ) -> None:
     """Write both halves of every checkpoint this step reached, in one launch.
 
@@ -134,6 +146,12 @@ def write_state_checkpoints(
     intermediates (an interior position), 1 reads ``runtime_slots[i]`` (a
     position at the end of the row's tokens, which is only ever in the runtime
     slot). The conv half is the same window slice either way.
+
+    ``h_rows`` switches the interior source from a chunk kernel's
+    intermediates to one state per target, as FlashKDA's ``snapshot_out``
+    returns them: target ``i`` reads row ``h_rows[i]`` of ``h``, which is laid
+    out as ``ssm_state`` is, and ``chunk_offsets`` / ``chunk_size`` are unused.
+    Kimi-K3's midstep checkpoints write through this.
 
     ``conv_state_len`` is ``conv_kernel - 1`` and is passed, not read off
     ``conv_state``: the pool is ``conv_kernel - 1 + num_spec`` wide for the
@@ -157,6 +175,12 @@ def write_state_checkpoints(
     d, state_len = conv_state.shape[1], conv_state_len
     assert 0 < state_len <= conv_state.shape[2], "conv window wider than the pool"
     assert x.stride(-1) == 1, "conv input must be contiguous along the feature dim"
+    if h_rows is not None:
+        assert h.shape[1:] == ssm_state.shape[1:] and h.stride() == (
+            hkv,
+            *ssm_state.stride()[1:],
+        ), "per-target states must be laid out as the pool is"
+        chunk_offsets, chunk_size = h_rows, 1
     BLOCK = 1024
     nblk_ssm = triton.cdiv(hkv, BLOCK)
     grid = (n, nblk_ssm + triton.cdiv(d, BLOCK))
@@ -170,6 +194,7 @@ def write_state_checkpoints(
         offs,
         is_end,
         runtime_slots,
+        rows if h_rows is None else h_rows,
         chunk_offsets,
         cu_seqlens,
         x.stride(0),
@@ -185,4 +210,5 @@ def write_state_checkpoints(
         K=ssm_state.shape[-2],
         V=ssm_state.shape[-1],
         STATE_VK=ssm_state.stride(-2) == 1,
+        H_PER_TARGET=h_rows is not None,
     )

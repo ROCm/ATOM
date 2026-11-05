@@ -37,6 +37,7 @@ from atom.model_ops.fla_ops.fused_sigmoid_gating import (
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_sigmoid_gating_delta_rule,
 )
+from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -1436,7 +1437,9 @@ class KimiKDAAttention(nn.Module):
             # so no .to() cast is needed.
             ssm_state[state_indices] = last_state
             if snaps is not None:
-                snaps.write(ssm_state, conv_state, snap_out, mixed_qkv)
+                write_state_checkpoints(
+                    **snaps.checkpoint_args(snap_out, ssm_state, mixed_qkv, conv_state)
+                )
             # o_norm only reads this tensor, so keep the contiguous KDA output
             # instead of materializing an identical copy into `out`.
             assert kda_out.dtype == fused_in.dtype, (
