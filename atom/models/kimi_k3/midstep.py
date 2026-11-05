@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Kimi-K3 midstep KDA state checkpoints (``ATOM_K3_KDA_MIDSTEP_CKPT``).
+"""Kimi-K3 midstep KDA state checkpoints (``ATOM_K3_KDA_STATE_MIDSTEP``).
 
 The part of the midstep path that needs no kernel: the switch, the
 `StateTransfer` the backend declares, the snapshot targets of one prefill step,
@@ -11,6 +11,7 @@ and how a KDA layer writes them into their slots. The backend
 reaches it.
 """
 
+import inspect
 import os
 from dataclasses import dataclass
 
@@ -23,18 +24,40 @@ from atom.utils import envs
 #: counted from each forward's first token.
 FLASH_KDA_CHUNK = 32
 
+#: The `chunk_kimi_delta_attn` keywords a snapshot step passes (ROCm/aiter#7413).
+SNAPSHOT_KWARGS = ("snapshot_targets", "snapshot_out")
+
 
 def kda_midstep_enabled() -> bool:
-    """ATOM_K3_KDA_MIDSTEP_CKPT=1, which needs aiter's FlashKDA recurrence:
+    """ATOM_K3_KDA_STATE_MIDSTEP=1, which needs aiter's FlashKDA recurrence:
     only it can hand back the state at an interior chunk boundary."""
-    if not envs.ATOM_K3_KDA_MIDSTEP_CKPT:
+    if not envs.ATOM_K3_KDA_STATE_MIDSTEP:
         return False
     if os.getenv("AITER_FDA_ENABLE", "1").lower() not in ("1", "true", "yes", "on"):
         raise ValueError(
-            "ATOM_K3_KDA_MIDSTEP_CKPT=1 needs AITER_FDA_ENABLE on: only the "
+            "ATOM_K3_KDA_STATE_MIDSTEP=1 needs AITER_FDA_ENABLE on: only the "
             "FlashKDA recurrence snapshots the state inside the forward"
         )
     return True
+
+
+def require_flash_kda_snapshots(chunk_kimi_delta_attn) -> None:
+    """Refuse the switch at startup on an aiter that cannot take snapshots.
+
+    Without this, an older aiter fails at the first prefill that has a snapshot
+    target, with a `TypeError` from inside the forward. Takes the function
+    rather than importing it, so this module stays importable without AITER.
+    Named parameters only: a `**kwargs` catch-all would accept the keywords
+    and still not store anything.
+    """
+    params = inspect.signature(chunk_kimi_delta_attn).parameters
+    missing = [name for name in SNAPSHOT_KWARGS if name not in params]
+    if missing:
+        raise RuntimeError(
+            "ATOM_K3_KDA_STATE_MIDSTEP=1 needs an aiter whose "
+            "chunk_kimi_delta_attn takes snapshot_targets and snapshot_out "
+            f"(ROCm/aiter#7413); the installed one has no {', '.join(missing)}"
+        )
 
 
 def kda_midstep_transfer(layout_id: str, conv_kernel_dim: int) -> StateTransfer:
@@ -57,7 +80,7 @@ def kda_midstep_transfer(layout_id: str, conv_kernel_dim: int) -> StateTransfer:
 class KdaSnapshots:
     """Midstep KDA checkpoints of one prefill step, for every KDA layer.
 
-    Interior targets (`ATOM_K3_KDA_MIDSTEP_CKPT=1`): `targets[i] = (row, off)`
+    Interior targets (`ATOM_K3_KDA_STATE_MIDSTEP=1`): `targets[i] = (row, off)`
     -- the state of prefill row `row` after `off` of this step's tokens goes to
     scratch slot `slots[i]`. The SSM half comes out of the recurrence
     (`chunk_kimi_delta_attn(snapshot_targets=...)`); the conv half is the

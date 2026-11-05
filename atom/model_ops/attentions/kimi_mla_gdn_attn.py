@@ -4,6 +4,7 @@
 import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
+from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
@@ -22,6 +23,7 @@ from atom.models.kimi_k3.midstep import (
     kda_midstep_enabled,
     kda_midstep_transfer,
     kda_snapshots,
+    require_flash_kda_snapshots,
 )
 from atom.utils import CpuGpuBuffer, envs
 
@@ -220,25 +222,25 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         127 ordinary KV blocks — 0.112% of the paged pool — drawn from the same
         free list as everything else, and evicted by the same LRU.
 
-        Not midstep-readable, for want of plumbing rather than of state: KDA
-        goes through aiter's `chunk_kimi_delta_attn`, whose returned tuple
-        carries only the final state. The per-chunk `h` an interior checkpoint
-        would be sliced out of *is* computed — by the same
-        `chunk_gated_delta_rule_fwd_h` the GDN path uses — and then dropped
-        before the return. Exposing it is what this backend would need to
-        answer `True`. `PagedStateCheckpointCoordinator` says `False` for its
-        own reasons, so the two agree meanwhile.
+        Midstep-readable only under `ATOM_K3_KDA_STATE_MIDSTEP=1`
+        (`atom.models.kimi_k3.midstep`): aiter's `chunk_kimi_delta_attn` then
+        also stores the state at each interior position the coordinator
+        reserves (`snapshot_targets`), so a forward no longer has to end there.
+        Off, the call returns only the final state, and the coordinator cuts
+        each prefill chunk onto its checkpoint positions.
 
-        Dtype-safe by construction, which a checkpoint cut from `h` would not
-        be here — `_state_dtypes` gives kimi_linear a v side of its own dtype
-        (`ATOM_GDN_SSM_DTYPE`). An image is copied slot to slot with no kernel
-        output in between, so it round-trips exactly whatever that dtype is.
-        Both dtypes are named in the layout id, so a build that changed either
-        cannot read another's images.
+        Dtype-safe by construction: `_state_dtypes` gives kimi_linear a v side
+        of its own dtype (`ATOM_GDN_SSM_DTYPE`). An image is either copied slot
+        to slot or, at an interior position, written by the recurrence in the
+        final state's dtype and layout, so it round-trips exactly whatever that
+        dtype is. Both dtypes are named in the layout id, so a build that
+        changed either cannot read another's images.
         """
         if not self._uses_paged_checkpoints():
             return StateTransfer.fork(1)
         midstep = kda_midstep_enabled()
+        if midstep:
+            require_flash_kda_snapshots(chunk_kimi_delta_attn)
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         # Everything a reader needs to reassemble the image at the same byte
