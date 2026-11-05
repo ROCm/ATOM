@@ -4202,6 +4202,9 @@ class Scheduler:
         if seq.is_partial_prefill:
             seq.is_partial_prefill = False
             self._partial_prefill_count -= 1
+        # Its next admission prefills again; the flag says whether *that* one
+        # was dispatched to the end.
+        seq.prefill_dispatched = False
         # This free runs no `request_finished`; drop any stall-escaped save
         # tracker now so the connector's save loop cannot later read these
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).

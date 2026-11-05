@@ -756,6 +756,12 @@ class TestSchedule:
         sched.schedule()  # the last chunk
         assert seq.prefill_dispatched is True
 
+        # A preempted request prefills again: the flag describes that one.
+        sched.running.remove(seq) if seq in sched.running else None
+        sched.running.append(seq)
+        assert sched.preempt(seq)
+        assert seq.prefill_dispatched is False
+
     def test_chunked_prefill_splits_prompt_across_steps(self, seq_factory):
         sched = Scheduler(
             MockConfig(
