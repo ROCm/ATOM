@@ -36,13 +36,12 @@ recipe), [`DSpark.md`](DSpark.md).
 ## 0. Container
 
 Use `rocm/atom-dev:kimi-k31-pro`. On top of ATOM `main` (083891e93), it carries
-the following changes, none of them merged upstream yet:
+the following changes that `main` does not have yet:
 
 | Change | Why AgentX needs it |
 |---|---|
 | State offload gathers the DSA index-cache planes of a PAGE unit | Required on every LMCache band (CONC ≥ 14). Without it, the first CPU-tier store of a K3.1 state entry fails on a size mismatch, because the unit views miss the 24 index-cache layers. |
-| Router gate + latent down projection packed into one 4480×7168 BF16 GEMM | Performance, CONC 1/4. Controlled by `ATOM_KIMI_FUSE_GATE_DOWN`: `auto` (default) packs only when DCP=1, `1` always, `0` never. DCP=8 keeps the two GEMMs, because the packed build has hung CUDA-graph capture there. |
-| AITER `model_configs/kimik31pro_bf16_tuned_gemm.csv` (296 rows, gfx950, 256 CUs) | Performance. Without the online quant config, K3.1 serves BF16 GEMMs that the stock tables do not cover: 2272×7168 (MLA `fused_qkv_a` + indexer), 6284×7168 (KDA fused `in_proj`), 18432×1536 (`q_b_proj` under DCP8), 4096×1536 (indexer `wq_b`) and 4480×7168 (the packed gate/down). Those shapes otherwise fall back to torch. |
+| AITER `model_configs/kimik31pro_bf16_tuned_gemm.csv` (239 rows, gfx950, 256 CUs) | Performance. Without the online quant config, K3.1 serves BF16 GEMMs that the stock tables do not cover: 2272×7168 (MLA `fused_qkv_a` + indexer), 6284×7168 (KDA fused `in_proj`), 18432×1536 (`q_b_proj` under DCP8), 4096×1536 (indexer `wq_b`), plus the M 80–768 buckets missing for the router gate (896×7168) and the latent down projection (3584×7168). Those shapes otherwise fall back to torch. |
 
 It also carries the K3.1 architecture alias and the DSpark draft RoPE fix. Both
 are now on `main` as #3003.
@@ -303,7 +302,7 @@ Synthetic acceptance is performance-only. For GSM8K, launch the same band
 
 | CONC | Status |
 |---|---|
-| 1, 4 | 3600-second runs with these settings (mono on, KDA state fp32, gate/down packed, AITER rows for the packed shape), with **real** DSpark acceptance. Not yet re-run at the synthetic AL. |
+| 1, 4 | 3600-second runs with these settings (mono on, KDA state fp32), with **real** DSpark acceptance. Not yet re-run at the synthetic AL. |
 | 14, 16 | 3600-second runs with these settings, with **real** DSpark acceptance and without the 2272/6284/18432 BF16 tuned rows. Not yet re-run at the synthetic AL. |
 | 48, 56, 72 | 3600-second runs at the synthetic AL 3.36 with LMCache 128/192 GiB, `ATOM_STATE_CHECKPOINT_DEMAND=0`, KDA state fp16 and HERD off (the pre-#4307 settings). The #4307 settings above (224 GiB, demand checkpoints, fp32 state, HERD) are not yet validated on K3.1. |
 
