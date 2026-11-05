@@ -910,13 +910,6 @@ class ModelRunner:
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             model_runner=self
         )
-        # SP attention ops are recorded inline in token graphs
-        # (`sp_attention.sp_attention_fp8`): only decode buckets may hold them.
-        if sp_is_enabled() and self.attn_metadata_builder.supports_token_graph:
-            raise ValueError(
-                f"Ulysses SP does not support {type(self.attn_metadata_builder).__name__}"
-                ", which records prefill token graphs."
-            )
         # Sub-pool sizing needs a memory profile, so it cannot run until after
         # warmup. Install the empty plan now: `warmup_model` below drives the
         # builder through paths that ask for their entry counts, and those must
