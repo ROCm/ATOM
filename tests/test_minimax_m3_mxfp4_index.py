@@ -16,11 +16,23 @@ from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_BYTES, page_views
 from atom.mono.weights.formats import dequantize_mxfp4
 
 aiter = pytest.importorskip("aiter")
+
+
+def _has_fp4_index_ops():
+    """The MXFP4 index scorers and writer mode ship together; an older aiter has
+    neither, and its writer aborts the process on an `mxfp4` index cache."""
+    try:
+        from aiter.ops.flydsl import minimax_m3_index_score_fp4_flydsl  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName
-    or not hasattr(aiter.ops, "flydsl"),
-    reason="needs gfx950 and aiter's FlyDSL",
+    or not _has_fp4_index_ops(),
+    reason="needs gfx950 and aiter's FlyDSL MXFP4 index scorer",
 )
 
 TOPK, HEADS, DIM = 16, 1, 128
