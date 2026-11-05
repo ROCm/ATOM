@@ -7652,3 +7652,30 @@ def test_a_dsv4_save_keys_its_pages_and_slot_by_the_media(cache_seed):
     for start in range(0, 8192, 256):
         parent = BlockManager.compute_hash(seq.token_ids[start : start + 256], parent)
     assert request.slot_save_spec.boundary_block_hash == parent
+
+
+@pytest.mark.parametrize("cache_seed", [11, -1])
+def test_a_dsv4_load_keys_its_pages_by_the_media(cache_seed):
+    """The load names the PAGE KV with the media-keyed ids the save stored it
+    under, so a prompt with other images never reads this one's chunks."""
+    sched = _scheduler()
+    sched.kv_role = "kv_consumer"
+    sched._do_save = False
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = SimpleNamespace(
+        id=737,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+        has_per_req_cache=False,
+        cache_seed=cache_seed,
+    )
+
+    assert sched.get_num_new_matched_tokens(seq) == (12, True)
+    sched.update_state_after_alloc(seq)
+    [load] = [r for r in sched.build_connector_meta().requests if r.load_spec]
+
+    assert load.load_spec.lmcache_cached_tokens == 12
+    assert load.token_ids == tier_token_ids(seq, 12)
+    assert (load.token_ids == seq.token_ids[:12]) is (cache_seed == -1)
