@@ -111,7 +111,7 @@ def test_too_many_rows_keeps_normal_route(env):
     )
 
     calls, _ = env
-    logits = torch.zeros((129, 256), dtype=torch.bfloat16)
-    x = torch.zeros((129, 2048), dtype=torch.bfloat16)
+    logits = torch.zeros((513, 256), dtype=torch.bfloat16)
+    x = torch.zeros((513, 2048), dtype=torch.bfloat16)
     assert try_defer_topk_route_quant(_method(), _layer(), x, logits) is None
     assert not calls
