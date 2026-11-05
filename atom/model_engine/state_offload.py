@@ -280,8 +280,8 @@ class StateOffloadIndex:
                 logger.warning(
                     "state offload: no touch verdict for a CPU state image "
                     "within OFFLOAD_LOOKUP_DEFER_S=%.1fs; admitting without it. "
-                    "Touch verdicts are being lost (counted as "
-                    "state_offload_verify_holds_expired).",
+                    "Touch verdicts are lost or late, e.g. a stalled step "
+                    "(counted as state_offload_verify_holds_expired).",
                     defer_s,
                 )
             return False
@@ -385,8 +385,10 @@ class StateOffloadIndex:
             "hashes_evicted": self.hashes_evicted,
             # Hit refresh. `touch_misses`: images a touch found gone, which
             # left the index (one a load was already offered on also counts in
-            # `loads_failed`). `verify_holds_expired`: holds that got no
-            # verdict within `defer_s`; non-zero means verdicts are being lost.
+            # `loads_failed`). `loads_deferred_for_verify`: admission passes
+            # held. `verify_holds_expired`: holds that got no verdict within
+            # `defer_s`; non-zero means verdicts are lost or late (e.g. a
+            # stalled step).
             "touches_sent": self.touches_sent,
             "touch_misses": self.touch_misses,
             "loads_deferred_for_verify": self.loads_deferred_for_verify,

@@ -2435,8 +2435,9 @@ class Scheduler:
             ):
                 # Held a pass for the state offload's verdict on the image it
                 # would load; a gone image is forgotten and the retry plans
-                # without it. Base scheduler only: DecodeScheduler never
-                # publishes touches, so it never holds.
+                # without it. Base scheduler only: DecodeScheduler's
+                # `allocate_waiting` never passes `defer_unverified`, so it
+                # never holds.
                 prefix_waiters.append(seq)
                 continue
             if not self.block_manager.allocate(seq, num_cached_blocks):

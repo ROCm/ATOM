@@ -75,6 +75,8 @@ from atom.kv_transfer.offload.hybrid.dsv4.policy import (
 )
 from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
     STATE_INDEX_CHANNEL,
+    STATE_TOUCH_CHANNEL,
+    STATE_TOUCH_REFRESH_CHANNEL,
     KimiK3OffloadConnector,
     KimiK3OffloadScheduler,
     save_stall_seconds,
@@ -7427,10 +7429,6 @@ class TestCodecRefresh:
 
 
 def _touch_worker(tier):
-    from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
-        KimiK3OffloadConnector,
-    )
-
     c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
     c._state_tier = tier
     c._touch_verdicts = {}
@@ -7498,10 +7496,6 @@ class TestConnectorTouches:
         assert s.build_connector_meta().state_touches == []
 
     def test_one_rank_missing_the_image_makes_it_gone(self, monkeypatch):
-        from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
-            STATE_TOUCH_CHANNEL,
-        )
-
         s = self._scheduler(monkeypatch)
         for op, ok in ((StateTouchId(5, 0), True), (StateTouchId(5, 1), False)):
             handled = s.connector_completion(
@@ -7518,13 +7512,6 @@ class TestConnectorTouches:
         """Each rank files a residency and a refresh report per touch; one
         rank that only found the image present counts the touch unrefreshed
         without making it gone."""
-        from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
-        from atom.kv_transfer.disaggregation.types import KVConnectorOutput
-        from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
-            STATE_TOUCH_CHANNEL,
-            STATE_TOUCH_REFRESH_CHANNEL,
-        )
-
         touch = StateTouchId(5, 0)
         outputs = []
         for result in (TouchResult.REFRESHED, TouchResult.PRESENT):

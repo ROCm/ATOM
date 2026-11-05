@@ -128,6 +128,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # with it (super().start_load_kv never ran).
         self._store_failed_no_tier: set[StateStoreOperationId] = set()
         # Touch verdicts since the last `get_finished`: (resident, refreshed).
+        # GONE counts as refreshed: nothing was left unrefreshed.
         self._touch_verdicts: dict[StateTouchId, tuple[bool, bool]] = {}
         # Only the first touch whose codec call raised is logged.
         self._warned_touch_failure = False
