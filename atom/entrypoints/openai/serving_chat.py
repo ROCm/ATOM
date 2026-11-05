@@ -11,6 +11,13 @@ from typing import Any
 
 from atom.structured_output.validation import raise_for_structured_error
 
+from .logprobs import (
+    LogprobCollector,
+    LogprobError,
+    LogprobsProcessor,
+    LogprobText,
+    claim_logprobs,
+)
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
     STREAM_DONE_MESSAGE,
@@ -193,6 +200,8 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
     Raises ``ValueError`` (surfaced as HTTP 400) on malformed input so the
     engine is never handed a request the chat template cannot render.
     """
+    if request.top_logprobs is not None and not request.logprobs:
+        raise ValueError("top_logprobs requires logprobs=true")
     if request.stream_options is not None:
         if request.stream is not True:
             raise ValueError("stream_options requires stream=true")
@@ -260,6 +269,8 @@ def create_chat_chunk(
     *,
     include_usage: bool = False,
     kv_transfer_params: dict | None = None,
+    with_logprobs: bool = False,
+    logprob_values: dict | None = None,
 ) -> str:
     """Create a chat completion chunk in SSE format.
 
@@ -280,11 +291,77 @@ def create_chat_chunk(
             }
         ],
     }
+    if with_logprobs and delta:
+        if any(
+            value and not isinstance(value, LogprobText)
+            for key, value in delta.items()
+            if key in ("content", "reasoning_content")
+        ):
+            raise LogprobError("Visible text has no token-byte source spans")
+        probabilities = logprob_values
+        if probabilities:
+            chunk["choices"][0]["logprobs"] = probabilities
+        chunk["choices"][0]["delta"] = {
+            field: str(text) if isinstance(text, LogprobText) else text
+            for field, text in delta.items()
+        }
     if usage is not None or include_usage:
         chunk["usage"] = usage
     if kv_transfer_params is not None:
         chunk["kv_transfer_params"] = kv_transfer_params
     return data_frame(chunk)
+
+
+def _chat_deltas(reader, parser, text, finished, finish_reason):
+    segments = reader.process(text)
+    if finished:
+        segments.extend(reader.flush(stopped=ended_by_stop(finish_reason)))
+    for field, value in segments:
+        if field == "reasoning_content":
+            if value:
+                yield field, {field: value}
+        else:
+            for kind, data in parser.process(value):
+                if kind == "content":
+                    yield kind, {"content": data}
+                elif kind in ("tool_call_start", "tool_call_args"):
+                    yield kind, {"tool_calls": [data]}
+    if finished:
+        for kind, data in parser.flush():
+            if kind == "content":
+                yield kind, {"content": data}
+            elif kind in ("tool_call_start", "tool_call_args"):
+                yield kind, {"tool_calls": [data]}
+
+
+def _logprob_frames(pending, make_chunk, request_id, model, index=0, held_text=""):
+    # A tool region may hold older content while reasoning is already emitted.
+    # Resolve all available spans in source order, then serialize the deltas in
+    # their existing event order. A boundary token belongs to one field only.
+    cutoff = (
+        min(start for start, _ in held_text.source_ranges)
+        if isinstance(held_text, LogprobText) and held_text
+        else float("inf")
+    )
+    ready, held = [], []
+    for delta in pending:
+        spans = [
+            end
+            for field, text in delta.items()
+            if field in ("content", "reasoning_content")
+            and isinstance(text, LogprobText)
+            for _, end in text.source_ranges
+        ]
+        (ready if all(end <= cutoff for end in spans) else held).append(delta)
+    pending[:] = held
+    values = claim_logprobs(ready)
+    frames = [
+        make_chunk(
+            request_id, model, delta=delta, index=index, logprob_values=probabilities
+        )
+        for delta, probabilities in zip(ready, values)
+    ]
+    return frames
 
 
 def chat_finish_frames(
@@ -299,8 +376,10 @@ def chat_finish_frames(
 ):
     """Serialize final choices once, with aggregate usage on the last choice."""
     frames = []
-    for index, reason in enumerate(reasons):
-        last = usage_on_finish and index == len(reasons) - 1
+    successful = [i for i, reason in enumerate(reasons) if reason is not None]
+    for index in successful:
+        reason = reasons[index]
+        last = usage_on_finish and index == successful[-1]
         frames.append(
             create_chat_chunk(
                 request_id,
@@ -358,6 +437,9 @@ async def stream_chat_response(
         if usage_on_finish and include_usage
         else create_chat_chunk
     )
+    any_logprobs = isinstance(stream_collector, LogprobCollector)
+    if any_logprobs:
+        make_chunk = partial(make_chunk, with_logprobs=True)
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
     num_cached_tokens = 0
@@ -380,11 +462,27 @@ async def stream_chat_response(
     # Assume abort until the engine's finished chunk arrives. A client
     # disconnect closes the generator before then, leaving this True so the
     # finally aborts the still-running seq; normal completion flips it to False.
+    pending = [] if any_logprobs else None
     aborted = True
     try:
         role_sent = False
         while True:
             chunk_data = await stream_collector.get()
+            if any_logprobs and chunk_data.get("finish_reason") == "logprob_error":
+                yield data_frame(
+                    {
+                        "error": {
+                            "type": "server_error",
+                            "code": "logprob_error",
+                            "message": chunk_data.get(
+                                "logprob_error", "Token logprob processing failed"
+                            ),
+                            "index": 0,
+                        }
+                    }
+                )
+                yield STREAM_DONE_MESSAGE
+                return
             raise_for_structured_error(chunk_data.get("finish_reason"))
 
             if not role_sent:
@@ -403,55 +501,45 @@ async def stream_chat_response(
             if "kv_transfer_params" in chunk_data:
                 kv_transfer_params_value = chunk_data["kv_transfer_params"]
 
-            # Phase 1: Process through reasoning filter
-            segments = reasoning_filter.process(new_text)
-            if chunk_data.get("finished", False):
-                segments.extend(
-                    reasoning_filter.flush(stopped=ended_by_stop(engine_finish_reason))
+            try:
+                done = bool(chunk_data.get("finished"))
+                for kind, delta in _chat_deltas(
+                    reasoning_filter, tool_parser, new_text, done, engine_finish_reason
+                ):
+                    has_tool_calls |= kind == "tool_call_args"
+                    if pending is None:
+                        yield make_chunk(request_id, model, delta=delta)
+                    else:
+                        pending.append(delta)
+                if pending is not None:
+                    for frame in _logprob_frames(
+                        pending,
+                        make_chunk,
+                        request_id,
+                        model,
+                        held_text=tool_parser.held_text if not done else "",
+                    ):
+                        yield frame
+                    if not tool_parser.has_pending_text:
+                        stream_collector.trackers[0].discard_resolved(
+                            reasoning_filter.held_text
+                        )
+                if done:
+                    break
+            except LogprobError as exc:
+                logger.exception("Logprob attribution failed for %s", request_id)
+                yield data_frame(
+                    {
+                        "error": {
+                            "type": "server_error",
+                            "code": "logprob_error",
+                            "message": str(exc),
+                            "index": 0,
+                        }
+                    }
                 )
-
-            # Phase 2: For content segments, check for tool calls
-            for field, text in segments:
-                if field == "reasoning_content":
-                    if text:
-                        yield make_chunk(
-                            request_id, model, delta={"reasoning_content": text}
-                        )
-                elif field == "content":
-                    # Run through tool parser
-                    events = tool_parser.process(text)
-                    for event_type, data in events:
-                        if event_type == "content":
-                            yield make_chunk(request_id, model, delta={"content": data})
-                        elif event_type == "tool_call_start":
-                            yield make_chunk(
-                                request_id,
-                                model,
-                                delta={"tool_calls": [data]},
-                            )
-                        elif event_type == "tool_call_args":
-                            has_tool_calls = True
-                            yield make_chunk(
-                                request_id,
-                                model,
-                                delta={"tool_calls": [data]},
-                            )
-
-            if chunk_data.get("finished", False):
-                # Flush tool parser
-                for event_type, data in tool_parser.flush():
-                    if event_type == "content":
-                        yield make_chunk(request_id, model, delta={"content": data})
-                    elif event_type == "tool_call_start":
-                        yield make_chunk(
-                            request_id, model, delta={"tool_calls": [data]}
-                        )
-                    elif event_type == "tool_call_args":
-                        has_tool_calls = True
-                        yield make_chunk(
-                            request_id, model, delta={"tool_calls": [data]}
-                        )
-                break
+                yield STREAM_DONE_MESSAGE
+                return
 
         aborted = False
 
@@ -476,6 +564,9 @@ async def stream_chat_response(
             include_usage=include_usage,
         )
     finally:
+        if any_logprobs:
+            for tracker in stream_collector.trackers:
+                tracker.close()
         cleanup_stream(seq_id, aborted=aborted)
         cleanup_request(request_id)
 
@@ -488,6 +579,10 @@ def _build_chat_choice(
     tool_choice=None,
     reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
+    logprob_codec=None,
+    token_ids=(),
+    token_logprobs=None,
+    top_logprobs=0,
 ) -> dict[str, Any]:
     """Build one entry of ``choices[...]`` from a raw output string.
 
@@ -496,6 +591,12 @@ def _build_chat_choice(
     without duplicating the logic.
     """
     raise_for_structured_error(finish_reason)
+    if finish_reason == "logprob_error":
+        raise LogprobError("Engine returned missing or misaligned token logprobs")
+    tracker = None
+    if logprob_codec is not None:
+        tracker = LogprobsProcessor(logprob_codec, top_logprobs)
+        raw_text = tracker.feed(token_ids, token_logprobs, finished=True)
     reasoning_content, content_with_tools = reasoning.split(
         raw_text, stopped=ended_by_stop(finish_reason)
     )
@@ -521,11 +622,19 @@ def _build_chat_choice(
         if (tool_calls or finish_reason is not None)
         else None
     )
-    return {
+    choice = {
         "index": index,
         "message": message,
         "finish_reason": effective_finish_reason,
     }
+    if tracker is not None:
+        fields = {"content": content}
+        if reasoning_content is not None:
+            fields["reasoning_content"] = reasoning_content
+        choice["logprobs"] = tracker.take_fields(fields)
+        message.update({field: str(value) for field, value in fields.items()})
+        tracker.close()
+    return choice
 
 
 def build_chat_response(
@@ -537,6 +646,8 @@ def build_chat_response(
     tool_choice=None,
     reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
+    logprob_codec=None,
+    top_logprobs=0,
 ) -> ChatCompletionResponse:
     """Build a non-streaming chat completion response (single choice)."""
     response = ChatCompletionResponse(
@@ -552,6 +663,12 @@ def build_chat_response(
                 tool_choice=tool_choice,
                 reasoning=reasoning,
                 tool_parser_cls=tool_parser_cls,
+                logprob_codec=logprob_codec,
+                token_ids=final_output.get("token_ids", ()),
+                token_logprobs=(
+                    final_output.get("logprobs") if logprob_codec is not None else None
+                ),
+                top_logprobs=top_logprobs,
             )
         ],
         usage={
@@ -585,6 +702,8 @@ def build_chat_response_multi(
     tool_choice=None,
     reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
+    logprob_codec=None,
+    top_logprobs=0,
 ) -> ChatCompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling.
 
@@ -604,6 +723,10 @@ def build_chat_response_multi(
             tool_choice=tool_choice,
             reasoning=reasoning,
             tool_parser_cls=tool_parser_cls,
+            logprob_codec=logprob_codec,
+            token_ids=out.get("token_ids", ()),
+            token_logprobs=(out.get("logprobs") if logprob_codec is not None else None),
+            top_logprobs=top_logprobs,
         )
         for i, out in enumerate(final_outputs)
     ]
@@ -673,6 +796,9 @@ async def stream_chat_response_fanout(
         if usage_on_finish and include_usage
         else create_chat_chunk
     )
+    any_logprobs = isinstance(shared_collector, LogprobCollector)
+    if any_logprobs:
+        make_chunk = partial(make_chunk, with_logprobs=True)
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
     # Every sibling answers the same prompt, so they start in the same state.
@@ -695,11 +821,32 @@ async def stream_chat_response_fanout(
     # Assume abort until every sibling reports finished; a client disconnect
     # closes the generator first, leaving this True so the finally aborts
     # whichever siblings are still running.
+    pending = [[] for _ in range(n)] if any_logprobs else None
     aborted = True
     try:
         role_sent = [False] * n
         while not all(finished):
             idx, chunk_data = await shared_collector.get()
+            if finished[idx]:
+                continue
+            if any_logprobs and chunk_data.get("finish_reason") == "logprob_error":
+                logger.error("Logprob processing failed for choice %s", idx)
+                cleanup_stream(seq_ids[idx], aborted=True)
+                finished[idx] = True
+                engine_finish_reasons[idx] = "error"
+                yield data_frame(
+                    {
+                        "error": {
+                            "type": "server_error",
+                            "code": "logprob_error",
+                            "message": chunk_data.get(
+                                "logprob_error", "Token logprob processing failed"
+                            ),
+                            "index": idx,
+                        }
+                    }
+                )
+                continue
             raise_for_structured_error(chunk_data.get("finish_reason"))
 
             if not role_sent[idx]:
@@ -725,67 +872,53 @@ async def stream_chat_response_fanout(
             if "kv_transfer_params" in chunk_data:
                 kv_transfer_params_value = chunk_data["kv_transfer_params"]
 
-            segments = reasoning_filters[idx].process(new_text)
-            if chunk_data.get("finished", False):
-                segments.extend(
-                    reasoning_filters[idx].flush(
-                        stopped=ended_by_stop(engine_finish_reasons[idx])
-                    )
+            try:
+                done = bool(chunk_data.get("finished"))
+                for kind, delta in _chat_deltas(
+                    reasoning_filters[idx],
+                    tool_parsers[idx],
+                    new_text,
+                    done,
+                    engine_finish_reasons[idx],
+                ):
+                    has_tool_calls[idx] |= kind == "tool_call_args"
+                    if pending is None:
+                        yield make_chunk(request_id, model, delta=delta, index=idx)
+                    else:
+                        pending[idx].append(delta)
+                if pending is not None:
+                    for frame in _logprob_frames(
+                        pending[idx],
+                        make_chunk,
+                        request_id,
+                        model,
+                        idx,
+                        held_text=tool_parsers[idx].held_text if not done else "",
+                    ):
+                        yield frame
+                    if not tool_parsers[idx].has_pending_text:
+                        shared_collector.trackers[idx].discard_resolved(
+                            reasoning_filters[idx].held_text
+                        )
+                if done:
+                    finished[idx] = True
+            except LogprobError as exc:
+                logger.exception(
+                    "Logprob attribution failed for %s choice %s", request_id, idx
                 )
-
-            for field, text in segments:
-                if field == "reasoning_content":
-                    if text:
-                        yield make_chunk(
-                            request_id,
-                            model,
-                            delta={"reasoning_content": text},
-                            index=idx,
-                        )
-                elif field == "content":
-                    for event_type, data in tool_parsers[idx].process(text):
-                        if event_type == "content":
-                            yield make_chunk(
-                                request_id, model, delta={"content": data}, index=idx
-                            )
-                        elif event_type == "tool_call_start":
-                            yield make_chunk(
-                                request_id,
-                                model,
-                                delta={"tool_calls": [data]},
-                                index=idx,
-                            )
-                        elif event_type == "tool_call_args":
-                            has_tool_calls[idx] = True
-                            yield make_chunk(
-                                request_id,
-                                model,
-                                delta={"tool_calls": [data]},
-                                index=idx,
-                            )
-
-            if chunk_data.get("finished", False):
-                for event_type, data in tool_parsers[idx].flush():
-                    if event_type == "content":
-                        yield make_chunk(
-                            request_id, model, delta={"content": data}, index=idx
-                        )
-                    elif event_type == "tool_call_start":
-                        yield make_chunk(
-                            request_id,
-                            model,
-                            delta={"tool_calls": [data]},
-                            index=idx,
-                        )
-                    elif event_type == "tool_call_args":
-                        has_tool_calls[idx] = True
-                        yield make_chunk(
-                            request_id,
-                            model,
-                            delta={"tool_calls": [data]},
-                            index=idx,
-                        )
+                cleanup_stream(seq_ids[idx], aborted=True)
                 finished[idx] = True
+                engine_finish_reasons[idx] = "error"
+                yield data_frame(
+                    {
+                        "error": {
+                            "type": "server_error",
+                            "code": "logprob_error",
+                            "message": str(exc),
+                            "index": idx,
+                        }
+                    }
+                )
 
         aborted = False
 
@@ -801,8 +934,12 @@ async def stream_chat_response_fanout(
             request_id,
             model,
             [
-                openai_stop_reason_with_calls(
-                    engine_finish_reasons[i], has_tool_calls[i]
+                (
+                    None
+                    if engine_finish_reasons[i] == "error"
+                    else openai_stop_reason_with_calls(
+                        engine_finish_reasons[i], has_tool_calls[i]
+                    )
                 )
                 for i in range(n)
             ],
@@ -812,6 +949,9 @@ async def stream_chat_response_fanout(
             include_usage=include_usage,
         )
     finally:
+        if any_logprobs:
+            for tracker in shared_collector.trackers:
+                tracker.close()
         for sid in seq_ids:
             cleanup_stream(sid, aborted=aborted)
         cleanup_request(request_id)

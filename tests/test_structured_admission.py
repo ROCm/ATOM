@@ -326,6 +326,7 @@ def test_engine_boundary_checks_structured_requests_before_tokenization():
     from atom.sampling_params import SamplingParams
 
     processor = InputOutputProcessor.__new__(InputOutputProcessor)
+    processor.config = NS()
     processor.structured_admission = Mock(side_effect=ValueError("admission rejected"))
     with pytest.raises(ValueError, match="admission rejected"):
         processor.preprocess_fanout("prompt", SamplingParams(json_schema="{}"))
@@ -340,7 +341,9 @@ def test_speculative_schema_logprobs_refused_instead_of_wrong_distribution():
     config = NS(
         speculative_config=NS(num_speculative_tokens=5, synthetic_acceptance_rates=None)
     )
-    with pytest.raises(ValueError, match="token-level logprob"):
+    with pytest.raises(
+        ValueError, match="JSON Schema, speculative decoding and logprobs"
+    ):
         validate_execution_options(config, params)
     params.logprobs = False
     validate_execution_options(config, params)

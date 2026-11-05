@@ -3340,3 +3340,26 @@ def test_cancel_without_sampled_output_releases_state_and_pages(partial):
     assert scheduler.total_finished_requests == 1
     scheduler.kv_connector.request_finished.assert_called_once_with(seq)
     scheduler.kv_connector.send_finished.assert_called_once_with(seq.id)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_scheduled_batch_logprob_gate(enabled):
+    seqs = [Sequence([1, 2], block_size=16) for _ in range(2)]
+    for seq in seqs:
+        seq.return_logprobs = False
+        del seq.top_logprobs
+    if enabled:
+        seqs[1].return_logprobs = True
+        seqs[0].top_logprobs = 0
+        seqs[1].top_logprobs = 5
+    batch = ScheduledBatch(
+        seqs={seq.id: seq for seq in seqs},
+        num_scheduled_tokens=[2, 2],
+        total_tokens_num=4,
+        total_seqs_num=2,
+        total_seqs_num_prefill=2,
+        total_tokens_num_prefill=4,
+    )
+    assert batch.any_logprobs is enabled
+    assert batch.logprob_requested == ((1,) if enabled else ())
+    assert batch.top_logprobs == ([0, 5] if enabled else None)

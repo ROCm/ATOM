@@ -9,6 +9,7 @@ from conftest import MockConfig
 
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.sampling_params import SamplingParams
+from tests.logprob_helpers import token_logprob
 
 
 class TestMTPMaxTokens:
@@ -40,8 +41,6 @@ class TestMTPMaxTokens:
         seq.num_placeholder_tokens = sched.mtp_k
         for token in (87, 88, 89, 90, 91, 92, 93):
             seq.append_token(token)
-            if seq.return_logprobs:
-                seq.logprobs.append(-0.1 * len(seq.logprobs))
         return sched.postprocess(
             list(sched.running),
             ScheduledBatchOutput(
@@ -52,6 +51,15 @@ class TestMTPMaxTokens:
                 draft_token_ids=np.asarray([[20, 21, 22]]),
                 # pp=1 output is deferred (drafts + lagging provisional run).
                 is_deferred_out=True,
+                logprobs=(
+                    {
+                        seq.id: [
+                            token_logprob(-0.1 * (i + 1), 1) for i in range(len(tokens))
+                        ]
+                    }
+                    if seq.return_logprobs
+                    else None
+                ),
             ),
             stream_output_queue=stream_queue,
         )
@@ -76,6 +84,7 @@ class TestMTPMaxTokens:
         assert len(finished[0].logprobs) == finished[0].num_completion_tokens
         emitted = stream_queue.put_nowait.call_args.args[0][0][1]
         assert emitted.output_tokens == [10, 11]
+        assert [p[0] for p in emitted.logprobs] == [-0.1, -0.2]
         assert emitted.finish_reason == "max_tokens"
 
     @pytest.mark.parametrize(
@@ -285,3 +294,41 @@ class TestUndeferredSpecPlaceholders:
         )
         assert seq.num_placeholder_tokens == 0
         assert seq.num_tokens == 32
+
+
+@pytest.mark.parametrize("injected", [False, True])
+def test_bad_logprobs_do_not_terminate_sibling_requests(seq_factory, injected):
+    sched = Scheduler(MockConfig(num_kvcache_blocks=64))
+    bad = seq_factory(
+        [1, 2, 3], sampling_params=SamplingParams(max_tokens=8, logprobs=True)
+    )
+    good = seq_factory(
+        [1, 2, 4], sampling_params=SamplingParams(max_tokens=8, logprobs=True)
+    )
+    sched.add(bad)
+    sched.add(good)
+    sched.schedule()
+    if injected:
+        bad._injected_t0 = 99
+    queue = mock.Mock()
+    finished = sched.postprocess(
+        list(sched.running),
+        ScheduledBatchOutput(
+            req_ids=[bad.id, good.id],
+            token_ids=[(10,), (11,)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            logprobs={
+                bad.id: [token_logprob(-1, 1)] if injected else [],
+                good.id: [token_logprob(-0.5, 1)],
+            },
+        ),
+        stream_output_queue=queue,
+    )
+    assert bad in finished and good not in finished
+    assert bad.leave_reason == "logprob_error"
+    assert list(good.logprobs) == [-0.5]
+    outputs = dict(queue.put_nowait.call_args.args[0])
+    assert outputs[bad.id].finish_reason == "logprob_error"
+    assert outputs[good.id].output_tokens == [11]

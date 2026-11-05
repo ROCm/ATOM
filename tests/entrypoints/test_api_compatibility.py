@@ -73,7 +73,8 @@ def server(monkeypatch):
         "engine": SimpleNamespace(
             config=SimpleNamespace(
                 generation_config=SimpleNamespace(), max_model_len=8192
-            )
+            ),
+            io_processor=SimpleNamespace(encode_prompt=lambda text: [1, 2]),
         ),
     }.items():
         monkeypatch.setattr(api_server, name, value)
@@ -106,6 +107,8 @@ def server(monkeypatch):
         return 1, Collector(), 2
 
     class Reasoning:
+        held_text = ""
+
         def stream(self):
             return self
 
@@ -1084,6 +1087,8 @@ def test_responses_engine_failure_is_not_success(
             "text": "partial" if partial else "",
             "finish_reason": reason,
             "num_cached_tokens": 0,
+            "num_tokens_input": 2,
+            "num_tokens_output": 1 if partial else 0,
         }
 
     monkeypatch.setattr(api_server, "generate_async", generate)
