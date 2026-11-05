@@ -4149,13 +4149,16 @@ class Scheduler:
         ):
             seq = seq_map.get(req_id)
             if seq is None:
-                logger.warning(
-                    "routed experts: dropping %d rows from position %d for "
-                    "request %s, which is not in the batch it was scheduled in",
-                    offsets[j + 1] - offsets[j],
-                    start,
-                    req_id,
-                )
+                # ``seq_map`` holds the running requests, so this one has left
+                # ``running``. It needs none of these rows; they are dropped:
+                # - Finished: with deferred output, the step after its final
+                #   token was already in flight and forwarded that token. That
+                #   row is past the ``num_tokens - 1`` routes it returns.
+                # - Preempted: it is back in ``waiting`` and
+                #   ``routed_forwarded_end`` was rewound, so these positions
+                #   are asked for again when it resumes.
+                # Rows missing for a request still running are not silent:
+                # ``apply_routed_expert_patch`` raises on the gap.
                 continue
             seq.apply_routed_expert_patch(start, rows[offsets[j] : offsets[j + 1]])
 

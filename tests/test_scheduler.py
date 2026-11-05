@@ -3688,13 +3688,24 @@ class TestRoutedExpertPatches:
         assert seq.routed_experts is frozen
         np.testing.assert_array_equal(frozen, rows)
 
-    def test_patch_for_a_request_outside_the_batch_is_dropped(self, caplog):
-        """Rows are matched by request id, never by position."""
-        with caplog.at_level(logging.WARNING, logger="atom"):
+    def test_patch_for_a_request_no_longer_running_is_dropped(self, caplog):
+        """Rows are matched by request id, never by position; a request that
+        left ``running`` (one per finished request under deferred output) is
+        dropped without logging."""
+        live = mock.Mock()
+        with caplog.at_level(logging.DEBUG, logger="atom"):
             Scheduler._apply_routed_experts_patch(
-                {}, self._patch((42, 0, np.zeros((3, 1, 2), np.int16)))
+                {7: live},
+                self._patch(
+                    (42, 0, np.zeros((3, 1, 2), np.int16)),
+                    (7, 5, np.ones((1, 1, 2), np.int16)),
+                ),
             )
-        assert "dropping 3 rows from position 0 for request 42" in caplog.text
+        assert not caplog.records
+        live.apply_routed_expert_patch.assert_called_once()
+        start, rows = live.apply_routed_expert_patch.call_args.args
+        assert start == 5
+        np.testing.assert_array_equal(rows, np.ones((1, 1, 2), np.int16))
 
     @pytest.mark.parametrize("mtp_k,accepted", [(1, 0), (2, 1), (3, 3)])
     def test_verify_steps_keep_only_accepted_positions(
