@@ -2064,7 +2064,10 @@ def _shipping_pair():
     from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
 
     sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
+    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
+
     shell = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    shell._tokens = WorkerTokens()
     received = []
     shell._impl = SimpleNamespace(
         start_load_kv=lambda meta: received.extend(r.token_ids for r in meta.requests)

@@ -14,7 +14,7 @@ and that loads from the tier. Nothing else moves earlier:
 - the request keeps its place in `waiting`, and Phase 2 reaches it in arrival
   order: a load in flight does not push it to the tail, and a finished
   prefetch moves up only when Phase 2 is stuck on KV blocks or parked-load
-  slots (`Scheduler._head_blocked_on_resources`), which prefetches hold and
+  slots (`Scheduler._blocked_head`), which prefetches hold and
   release only by running;
 - it is not prefillable while its load is in flight, and once loaded it
   prefills only when a FIRE admits it;
@@ -55,9 +55,15 @@ class OffloadPrefetch:
     # How often (in ticks) to forget requests that left `waiting`.
     PRUNE_TICKS = 256
 
-    def __init__(self, sched: Scheduler, max_kv_usage: float) -> None:
+    def __init__(
+        self, sched: Scheduler, max_kv_usage: float, min_load_tokens: int
+    ) -> None:
         self.sched = sched
         self.max_kv_usage = max_kv_usage
+        # The shortest tier hit past the HBM prefix the connector loads
+        # (`OffloadTierProfile.min_load_tokens`): a shorter one would be
+        # admitted only to prefill locally.
+        self.min_load_tokens = min_load_tokens
         # seq id -> seq holding prefetched blocks, until it is scheduled for
         # prefill, aborted or otherwise gone.
         self.entries: dict[Any, Any] = {}
@@ -78,7 +84,8 @@ class OffloadPrefetch:
 
     def run(self) -> int:
         """Admit-and-park waiting requests whose tier lookup answered and that
-        load a prefix from the tier. Returns how many parked."""
+        load a prefix from the tier. Returns how many it admitted (parked, or
+        held for a local prefill), bounded by `PER_TICK`."""
         s = self.sched
         tick = s._schedule_tick
         if tick % self.PRUNE_TICKS == 0:
@@ -89,9 +96,9 @@ class OffloadPrefetch:
         chunk = int(getattr(s.kv_connector, "chunk_size", 0) or 0)
         hbs = bm.hash_block_size
         replays = bool(getattr(bm, "state_replay_tokens", 0))
-        parked = 0
+        admitted = 0
         for seq in list(itertools.islice(s.waiting, self.SCAN)):
-            if parked >= self.PER_TICK or s._parked_slots_full():
+            if admitted >= self.PER_TICK or s._parked_slots_full():
                 break
             if not self._candidate(seq, tick):
                 continue
@@ -115,7 +122,9 @@ class OffloadPrefetch:
                 self.skip_until[seq.id] = math.inf  # no load possible
                 continue
             # The tier answer last: once taken it holds the lookup's read
-            # locks until admission consumes it.
+            # locks until admission consumes it, so every outcome below that
+            # does not admit gives them back (`release_taken_lookup`; the hit
+            # stays remembered for Phase 2).
             probed_tier = s._tier_hit(seq)
             if not s.kv_connector.take_ready_lookup(seq):
                 continue
@@ -125,31 +134,43 @@ class OffloadPrefetch:
             if rewalks and s._tier_hit(seq) != probed_tier:
                 probe = s._probe_hbm_prefix(seq)
                 if probe.num_cached_blocks < 0:
-                    self.skip_until[seq.id] = tick + self.RETRY_TICKS
+                    self._give_back(seq, tick + self.RETRY_TICKS)
                     break
-            if chunk and probe.num_cached_blocks * hbs % chunk:
-                self._unaligned(seq)
+            cached = probe.num_cached_blocks * hbs
+            if chunk and cached % chunk:
+                self._give_back(seq, math.inf)  # `_unaligned`
                 continue
-            if not (needs_remote_load or seq.replay_kv_load):
-                # Nothing to load: it prefills when Phase 2 admits it, with
-                # the answer it now holds.
-                self.skip_until[seq.id] = math.inf
+            # The connector loads only a rest of at least `min_load_tokens`
+            # (`_decide_load_after_alloc`); a shorter one would only hold
+            # blocks for a local prefill.
+            loads = needs_remote_load and (
+                seq.offload_joint.kv_prefix_tokens - cached >= self.min_load_tokens
+            )
+            if not (loads or seq.replay_kv_load):
+                # Nothing to load: it prefills when Phase 2 admits it, from
+                # the remembered answer.
+                self._give_back(seq, math.inf)
                 continue
             outcome = s._admit_after_probe(seq, probe, needs_remote_load, None)
             if outcome is Admit.REFUSED:
-                self.skip_until[seq.id] = tick + self.RETRY_TICKS
+                self._give_back(seq, tick + self.RETRY_TICKS)
                 break
             if outcome is Admit.REQUEUE:
                 self.skip_until[seq.id] = math.inf
                 continue
             if outcome is Admit.LOCAL:
                 s._hold_for_local_prefill(seq)
-            else:
-                parked += 1
+            admitted += 1
             self.entries[seq.id] = seq
-        if parked:
-            logger.debug("[OFFLOAD-PREFETCH] parked %d tier load(s)", parked)
-        return parked
+        if admitted:
+            logger.debug("[OFFLOAD-PREFETCH] admitted %d request(s)", admitted)
+        return admitted
+
+    def _give_back(self, seq, until: float) -> None:
+        """Not admitted after taking its tier answer: release the answer's read
+        locks, and look again at `until`."""
+        self.sched.kv_connector.release_taken_lookup(seq)
+        self.skip_until[seq.id] = until
 
     def _unaligned(self, seq) -> None:
         """An HBM hit off the tier's chunk grid runs its hand-off prefill
@@ -174,7 +195,10 @@ class OffloadPrefetch:
             return False
         bm = s.block_manager
         total = max(1, int(bm.kv.num_blocks))
-        if s._kv_usage() + bm.num_pool_blocks(len(seq)) / total > self.max_kv_usage:
+        # What `_admit_after_probe` allocates: the prompt and the draft
+        # lookahead past it.
+        need = bm.num_pool_blocks(len(seq)) + bm.draft_lookahead_blocks(len(seq))
+        if s._kv_usage() + need / total > self.max_kv_usage:
             self.skip_until[seq.id] = tick + self.RETRY_TICKS
             return False
         # A peek; `run` takes the answer (`take_ready_lookup`) only after its

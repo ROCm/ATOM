@@ -41,10 +41,15 @@ class PrefixSpreadRouter:
     # Route counters `select` returns, for `CoreManager`'s route statistics.
     DECISIONS = ("prefix_owner_total", "prefix_moved_total", "prefix_cold_total")
 
-    def __init__(self, idle_tokens: int, tier: OffloadTierProfile) -> None:
+    def __init__(
+        self, idle_tokens: int, tier: OffloadTierProfile, max_seqs: int
+    ) -> None:
         # A rank with under `idle_tokens` queued prefill is about to idle; a
         # prefix's rank with over twice that has a backlog.
         self.idle_tokens = idle_tokens
+        # A rank with this many requests in flight cannot start another
+        # (`max_num_seqs`): it is not idle, however little prefill it queues.
+        self.max_seqs = max_seqs
         # Whether (and from how many tokens) a rank loads a prefix it does not
         # hold from an offload tier. Without one a moved request recomputes
         # what it does not hold.
@@ -64,7 +69,8 @@ class PrefixSpreadRouter:
         self._est_hit: dict = {}
 
     def reset(self) -> None:
-        self.index.clear()
+        """Forget in-flight state. The index stays: it describes the ranks'
+        prefix caches, which outlive a batch."""
         self.seq_hashes.clear()
         self.pending.clear()
         self._prefilling.clear()
@@ -106,6 +112,7 @@ class PrefixSpreadRouter:
         self,
         seq: Any,
         rank_tokens: list[int],
+        rank_reqs: list[int],
         rank_load: Callable[[int], int],
         lightest: Callable[[], int],
     ) -> Route:
@@ -131,7 +138,7 @@ class PrefixSpreadRouter:
         hit = hits[owner]
         rank = owner
         if rank_tokens[owner] > 2 * self.idle_tokens:
-            target = self._idle_target(owner, hits, rank_tokens, rank_load)
+            target = self._idle_target(owner, hits, rank_tokens, rank_reqs, rank_load)
             if target is not None:
                 rank = target
 
@@ -155,19 +162,24 @@ class PrefixSpreadRouter:
         owner: int,
         hits: dict[int, int],
         rank_tokens: list[int],
+        rank_reqs: list[int],
         rank_load: Callable[[int], int],
     ) -> int | None:
         """The rank a request leaving its prefix's rank goes to, or None.
 
         Candidates are the ranks other than the owner with under idle queued
-        prefill -- chosen by queued prefill, the quantity the rule is about,
+        prefill and a free request slot (a rank full of decodes queues no
+        prefill tokens, but cannot start the request) -- chosen by queued
+        prefill, the quantity the rule is about,
         not by the combined load. Among those within idle / 2 of the least
         queued, the one holding the longest part of the prefix (it loads only
         the rest), then the least queued, then the lowest `least_tokens` load.
         """
         idle = self.idle_tokens
         cands = [
-            r for r in range(len(rank_tokens)) if r != owner and rank_tokens[r] < idle
+            r
+            for r in range(len(rank_tokens))
+            if r != owner and rank_tokens[r] < idle and rank_reqs[r] < self.max_seqs
         ]
         if not cands:
             return None

@@ -139,14 +139,16 @@ class KVConnectorSchedulerBase(ABC):
         True if the answer is now held for the admission."""
         return False
 
+    def release_taken_lookup(self, seq: Any) -> None:
+        """Give back an answer `take_ready_lookup` took for an admission that
+        did not happen (its read locks)."""
+
     def cancel_preadmission(self, seq: Any) -> None:
         """Undo what `update_state_after_alloc` recorded for `seq` when the
         scheduler refuses the admission before any dispatch and returns the
         request to `waiting` (`Admit.REQUEUE`). The default records nothing
-        to undo. A P/D consumer does record a receive (Mooncake's and
-        MoRIIO's `_reqs_need_recv`), but the scheduler refuses an admission
-        after the notification only over an offload tier's state load, which
-        such a consumer never has."""
+        to undo; a connector that queues work at the notification (a P/D
+        consumer's receive, an offload tier's load) overrides it."""
 
     def abort_send(self, seq: Any) -> None:
         """Retire an unsent abort; streaming senders must wait for reader drain."""

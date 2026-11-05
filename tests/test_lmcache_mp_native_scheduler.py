@@ -2,7 +2,6 @@
 
 """Native-state MP admission and PAGE-image lifetime contracts."""
 
-from collections import deque
 from types import SimpleNamespace
 from weakref import WeakKeyDictionary
 
@@ -990,7 +989,7 @@ def _woken(engine, seq):
     engine._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_loading={request.load_operation})
     )
-    assert engine._resolve_waiting_remote_kv(seq, deque()) is False
+    assert engine._resolve_offload_load(seq) is None
     assert seq.status == SequenceStatus.WAITING and seq.replays_hit
     assert seq.num_cached_tokens == 32
 

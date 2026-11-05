@@ -229,10 +229,8 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         if self._lookup_client.hit_tokens(sid) is not None:
             self._lookup_client.clear_lookup_status(sid)
 
-    def _fresh_tier_lookup(
-        self, seq: Any, sid: str, *, take: bool = False
-    ) -> int | None:
-        reach = super()._fresh_tier_lookup(seq, sid, take=take)
+    def _hold_tier_hit(self, seq: Any, sid: str, hit, token_ids) -> int | None:
+        reach = super()._hold_tier_hit(seq, sid, hit, token_ids)
         if not self._page_only or reach is None:
             return reach
         self._kv_reach[sid] = (seq, int(reach))
@@ -243,6 +241,23 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         self._lookup_results[sid] = (seq, 0)
         self._remember_tier_hit(seq, sid, 0)
         return 0
+
+    def take_ready_lookup(self, seq: Any) -> bool:
+        # The admission's own gates (`get_num_new_matched_tokens`): no answer
+        # is taken for a request it would not ask for.
+        if not getattr(seq, "has_per_req_cache", False):
+            return False
+        if self._native_load_operations.get(str(seq.id)) is not None:
+            return False
+        return super().take_ready_lookup(seq)
+
+    def release_taken_lookup(self, seq: Any) -> None:
+        # Its reach holds the lookup (`_release_lookup` keeps it for
+        # `update_state_after_alloc`): with no admission, it goes too.
+        entry = self._kv_reach.get(str(seq.id))
+        if entry is not None and entry[0] is seq:
+            del self._kv_reach[str(seq.id)]
+        super().release_taken_lookup(seq)
 
     def _kv_only_reach(self, seq: Any) -> int:
         """This request's KV-only reach in tokens, or 0 if unknown."""

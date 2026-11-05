@@ -560,7 +560,7 @@ def _make_spread_mgr(n_ranks=2, tier=None):
     if tier is None:
         tier = OffloadTierProfile(loads=True, async_lookup=True, min_load_tokens=8192)
     mgr = _make_mgr(n_ranks, strategy="prefix_spread")
-    mgr._prefix_router = PrefixSpreadRouter(32768, tier)
+    mgr._prefix_router = PrefixSpreadRouter(32768, tier, max_seqs=256)
     mgr._dp_route_counters.update(
         dict.fromkeys(
             PrefixSpreadRouter.DECISIONS
@@ -933,8 +933,60 @@ def test_offload_tier_profile_reads_the_kv_transfer_config(monkeypatch):
     assert not tier({"kv_connector": "lmcache_mp", "kv_role": "kv_producer"}).loads
     pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
     assert not tier({"kv_connector": "multi", "connectors": [pd]}).loads
+    assert tier({"kv_connector": "mooncake_store", "kv_role": "offload"}).loads
+    # Per-rank tiers (local CPU / disk): another rank's prefix is not loadable.
     dense = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
-    assert tier(dense).loads and not tier(dense).async_lookup
+    assert not tier(dense).loads and not tier(dense).async_lookup
+    assert tier(dense).min_load_tokens == 4096
     # `multi` answers no async lookup, whatever it wraps.
     both = tier({"kv_connector": "multi", "connectors": [pd, mp]})
     assert both.loads and not both.async_lookup
+
+
+def test_reset_keeps_the_prefix_index_across_batches():
+    """`reset_dp_router` runs before every offline batch; the ranks' prefix
+    caches outlive it, so the second batch still finds the shared prefix."""
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 65_536)])
+    mgr._mark_seq_prefill_complete(1)
+    mgr._release_seq_load(1)
+    mgr.reset_dp_router()
+    second = _chain_seq(2, 70_000)
+    assert _route(mgr, [second]) == [owner]
+    assert _est(mgr, second) == 65_536
+    assert _count(mgr, "prefix_owner_total") == 1
+
+
+def test_a_rank_full_of_decodes_is_not_idle():
+    """A rank at `max_num_seqs` queues no prefill tokens but cannot start the
+    request: the owner keeps it."""
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._mark_seq_prefill_complete(1)
+    other = 1 - owner
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_tokens[owner] = 200_000
+    mgr._rank_reqs = [0, 0]
+    mgr._rank_reqs[other] = 256
+    assert _route(mgr, [_chain_seq(2, 110_000)]) == [owner]
+    mgr._rank_reqs[other] = 255
+    assert _route(mgr, [_chain_seq(3, 110_000)]) == [other]
+
+
+def test_a_finished_output_without_tokens_does_not_complete_the_prefill():
+    """A structured-output error ends a request with an empty finished output
+    mid-prefill: the prefix it was computing is dropped, not confirmed."""
+    from atom.model_engine.request import RequestOutput
+
+    mgr = _make_spread_mgr()
+    _route(mgr, [_chain_seq(1, 100_000)])
+    out = RequestOutput(request_id=1, output_tokens=[], finished=True)
+    assert not mgr._completes_prefill(out)
+    assert mgr._completes_prefill(
+        RequestOutput(request_id=1, output_tokens=[7], finished=True)
+    )
+    assert mgr._completes_prefill(
+        RequestOutput(request_id=1, output_tokens=[], finished=False)
+    )
+    mgr._release_seq_load(1)  # the error's release
+    assert not mgr._prefix_router.index

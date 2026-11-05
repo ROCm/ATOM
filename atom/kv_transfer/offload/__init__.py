@@ -49,6 +49,8 @@ KVConnectorFactory.register(
     offload=True,
     # The MP lookup client answers lookups sent ahead of admission.
     async_lookup=True,
+    # One LMCache server for every DP rank.
+    shared_tier=True,
     # Groups regions by per-block shape and copies whole blocks, so a layer may
     # publish extra planes (the FP4 indexer's e8m0 scale) as more regions.
     copies_whole_block_regions=True,
@@ -62,6 +64,8 @@ KVConnectorFactory.register(
     scheduler_class="MooncakeStoreOffloadScheduler",
     requires_pd_staging=False,
     offload=True,
+    # One Mooncake Store for every DP rank.
+    shared_tier=True,
     # The dense codec builds from `KVCacheTensor`s; the region map is unread.
     reads_block_regions=False,
 )

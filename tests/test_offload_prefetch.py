@@ -48,6 +48,7 @@ class _Connector(OffloadSchedulerMixin):
         self.allocs = []
         self.cancelled = []
         self.pending_cancelled = []
+        self.released = []
 
     def prefetch_lookups(self, seqs):
         list(seqs)
@@ -72,6 +73,9 @@ class _Connector(OffloadSchedulerMixin):
 
     def cancel_preadmission(self, seq):
         self.cancelled.append(seq.id)
+
+    def release_taken_lookup(self, seq):
+        self.released.append(seq.id)
 
     def build_connector_meta(self):
         return META
@@ -131,7 +135,7 @@ def _make(monkeypatch, seq_factory, n=1, blocks=100, **env):
     sched.kv_connector = _Connector()
     # Built here: `__init__` saw MockConfig's connector, which answers no
     # async lookup.
-    sched._prefetch = OffloadPrefetch(sched, 0.8)
+    sched._prefetch = OffloadPrefetch(sched, 0.8, min_load_tokens=0)
     delayer = _Delayer()
     sched.set_prefill_delayer(delayer)
     seqs = [seq_factory(list(range(16))) for _ in range(n)]
@@ -222,7 +226,7 @@ def test_loaded_request_passes_admission_stuck_on_resources(monkeypatch, seq_fac
     sched.kv_connector.not_ready_ids = set()
     sched.kv_connector.match = (0, False)  # a prefills locally
     _fire_blocked_on(sched, delayer, a, monkeypatch)
-    assert sched._blocked_head == a.id
+    assert sched._blocked_head
     assert list(sched.waiting) == [a, b]  # recorded at this FIRE, not yet used
     sched._promote_ready_remote_kv_requests()
     assert list(sched.waiting) == [b, a]
@@ -245,10 +249,12 @@ def test_a_failed_prefetch_back_to_waiting_is_forgotten(monkeypatch, seq_factory
 
     assert a.status == SequenceStatus.WAITING and len(a.block_table) == 0
     assert not sched._prefetch.holds(a)
+    # It waits for no load now: its parked slot is given back (b keeps one).
+    assert sched._num_parked_remote_kv == 1
     assert sched._prefetch.holds(b) and b.offload_loaded
     assert list(sched.waiting) == [a, b]
     _fire_blocked_on(sched, delayer, a, monkeypatch)
-    assert sched._blocked_head == a.id
+    assert sched._blocked_head
     sched._promote_ready_remote_kv_requests()
     assert list(sched.waiting) == [b, a]
 
@@ -258,7 +264,7 @@ def test_promotion_never_probes(monkeypatch, seq_factory):
     sched.kv_connector.not_ready_ids = {a.id}
     sched.schedule()
     sched.finished_recving_kv_req_ids.append(b.id)
-    sched._blocked_head = a.id
+    sched._blocked_head = True
 
     def no_probe(*_a, **_k):
         raise AssertionError("promotion must not probe")
@@ -357,6 +363,7 @@ def test_a_local_admission_is_kept_as_a_resume_in_place(monkeypatch, seq_factory
     sched.kv_connector.parks = False
     sched.schedule()
     assert b.status == SequenceStatus.WAITING and len(b.block_table) > 0
+    assert b.offload_held_local and not getattr(b, "offload_load_failed", False)
     assert sched._is_offload_prefill_resume(b)
     assert sched._prefetch.holds(b) and sched.kv_connector.cancelled == []
     assert sched._num_parked_remote_kv == 0
@@ -368,6 +375,7 @@ def test_a_local_admission_is_kept_as_a_resume_in_place(monkeypatch, seq_factory
     _, scheduled = sched.schedule()
     assert list(scheduled) == [a.id, b.id]
     assert sched.kv_connector.allocs.count(b.id) == 1
+    assert not b.offload_held_local
 
 
 def test_requeue_cancels_the_pre_admission(setup, monkeypatch):
@@ -519,6 +527,7 @@ def test_lookup_ready_and_take_in_lookup_thread_mode(
         seq = SimpleNamespace(
             id=1,
             num_prompt_tokens=10,
+            num_cached_tokens=0,
             token_ids=list(range(10)),
             status=SequenceStatus.WAITING,
         )
@@ -540,3 +549,62 @@ def test_lookup_ready_and_take_in_lookup_thread_mode(
         assert not sched.take_ready_lookup(seq)
     finally:
         client.close()
+
+
+def test_in_flight_prefetches_do_not_spend_the_lookup_bypass_budget(
+    monkeypatch, seq_factory
+):
+    """A head waiting on its lookup, then 20 prefetches in flight, then a
+    ready request: passing the prefetches costs none of the 16-request
+    bypass budget, so the ready request is still admitted."""
+    sched, delayer, seqs = _make(monkeypatch, seq_factory, n=22)
+    sched.max_num_seqs = 64
+    head, prefetched, ready = seqs[0], seqs[1:21], seqs[21]
+    for s in prefetched:
+        s.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched._prefetch.entries[s.id] = s
+    sched._prefetch.run = lambda: 0
+    sched.kv_connector.match = (0, False)
+    monkeypatch.setattr(sched, "_offload_lookup_pending", lambda s: s is head)
+    delayer.allow = True
+    _, scheduled = sched.schedule()
+    assert list(scheduled) == [ready.id]
+    assert list(sched.waiting) == [head] + prefetched
+
+
+def test_a_non_resource_refusal_does_not_promote(monkeypatch, seq_factory):
+    """Only a break for KV blocks or a parked slot marks Phase 2 blocked: a
+    refused admission for another reason (a declined lookup detach, say)
+    does not let finished prefetches pass earlier arrivals; neither does a
+    blocked request that was aborted."""
+    from atom.model_engine.scheduler import Admit
+
+    sched, delayer, (a, b) = _make(monkeypatch, seq_factory, n=2)
+    sched.kv_connector.not_ready_ids = {a.id}
+    sched.schedule()  # b parks
+    sched.finished_recving_kv_req_ids.append(b.id)
+    sched.kv_connector.not_ready_ids = set()
+    sched.kv_connector.match = (0, False)
+    real = sched._admit_after_probe
+    monkeypatch.setattr(
+        sched,
+        "_admit_after_probe",
+        lambda s, *x, **k: Admit.REFUSED if s is a else real(s, *x, **k),
+    )
+    delayer.allow = True
+    sched.schedule()
+    assert not sched._blocked_head
+    sched._blocked_head = True
+    sched.abort_request(a.id)
+    assert not sched._blocked_head
+
+
+def test_a_taken_answer_that_is_not_admitted_is_given_back(setup):
+    """Nothing to load (here: a hit shorter than the connector's minimum
+    load): the answer prefetch took is released, not held until Phase 2."""
+    sched, _, seq = setup
+    sched._prefetch.min_load_tokens = 64
+    sched.schedule()
+    assert seq.status == SequenceStatus.WAITING and len(seq.block_table) == 0
+    assert sched.kv_connector.released == [seq.id]
+    assert sched.kv_connector.allocs == []

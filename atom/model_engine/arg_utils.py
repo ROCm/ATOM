@@ -425,8 +425,8 @@ class EngineArgs:
             help="Start a waiting request's offload-tier KV load on any "
             "scheduler tick once its tier lookup answers, instead of when "
             "admission reaches it; it still prefills in its turn. Default: on "
-            "when the KV connector answers tier lookups asynchronously "
-            "(lmcache_mp, not under multi).",
+            "with --dp-load-balance prefix_spread when the KV connector answers "
+            "tier lookups asynchronously (lmcache_mp, not under multi).",
         )
         parser.add_argument(
             "--enable-tbo",

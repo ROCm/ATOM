@@ -233,6 +233,9 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def take_ready_lookup(self, seq) -> bool:
         return self._impl.take_ready_lookup(seq)
 
+    def release_taken_lookup(self, seq) -> None:
+        self._impl.release_taken_lookup(seq)
+
     def cancel_preadmission(self, seq) -> None:
         self._impl.cancel_preadmission(seq)
 
