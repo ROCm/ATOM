@@ -30,7 +30,6 @@ def test_rank_receives_its_query_heads_kv_groups_and_indexer(monkeypatch, world)
 
     settings = SimpleNamespace(sequence_parallel_size=world)
     monkeypatch.setattr(ulysses_sp, "get_current_atom_config", lambda: settings)
-    monkeypatch.setattr(ulysses_sp, "custom_gather_ok", lambda x, group, limit: True)
     columns = ulysses_sp.send_columns(fields, source.device)
     packed = pack_columns(source, columns)
     for rank in range(world):
@@ -46,6 +45,7 @@ def test_rank_receives_its_query_heads_kv_groups_and_indexer(monkeypatch, world)
             dim=1,
         )
         assert torch.equal(packed[rank], expected)
-        group = SimpleNamespace(rank_in_group=rank, custom_all_gather=lambda x: x)
+        comm = SimpleNamespace(all_gather=lambda x, dim: x)
+        group = SimpleNamespace(rank_in_group=rank, device_communicator=comm)
         gathered = ulysses_sp.exchange_columns(source, group, columns)
         assert torch.equal(gathered, expected)

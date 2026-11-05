@@ -12,7 +12,6 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
-from atom.distributed.custom_gather import custom_gather_ok
 from atom.distributed.ulysses_sp import sp_gather_rows, sp_is_enabled
 from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
 from atom.model_ops.utils import atom_parameter
@@ -266,7 +265,7 @@ class ParallelLMHead(VocabParallelEmbedding):
                 x = sp_gather_rows(x, last_indices)
             if self._can_use_dp_sharded_head(context):
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
-            if sp_is_enabled() and self._sp_vocab_gather_ok(x):
+            if sp_is_enabled() and not self.num_embeddings % get_pcp_group().world_size:
                 return self._sp_sharded_logits(x)
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
@@ -357,28 +356,13 @@ class ParallelLMHead(VocabParallelEmbedding):
         bias = None if self.bias is None else self.bias[vocab]
         return tgemm.mm(x, self.weight[vocab], bias)
 
-    def _sp_vocab_gather_ok(self, x: torch.Tensor) -> bool:
-        """Whether the custom all-gather `graph_capture()` arms takes this
-        rank's equal vocab slice of ``x``'s logits. Otherwise every SP rank
-        reads the whole head, which runs no collective, so decode logits still
-        record."""
-        group = get_pcp_group()
-        if self.num_embeddings % group.world_size:
-            return False
-        vshard = self.num_embeddings // group.world_size
-        # AITER's last-dimension gather requires 16-byte rows.
-        if vshard * x.element_size() % 16:
-            return False
-        shard = torch.empty((x.shape[0], vshard), dtype=x.dtype, device="meta")
-        return custom_gather_ok(shard, group)
-
     def _sp_sharded_logits(self, x: torch.Tensor) -> torch.Tensor:
         """Every Ulysses SP rank (TP1) holds the same rows here: project them
         onto this rank's vocab slice and gather the slices, rather than have
         every rank read the whole LM head."""
         group = get_pcp_group()
         shard = self._vocab_shard_logits(x, group.rank_in_group, group.world_size)
-        return group.all_gather(shard, dim=-1, use_custom=True)
+        return group.device_communicator.all_gather(shard, -1)
 
     # ------------------------------------------------------------------
     # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all).

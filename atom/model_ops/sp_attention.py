@@ -16,7 +16,6 @@ from aiter.dist.parallel_state import get_pcp_group
 from aiter.ops.quant import dynamic_per_token_scaled_quant
 
 from atom.config import get_current_atom_config
-from atom.distributed.custom_gather import custom_gather_ok
 from atom.distributed.pcp_utils import pcp_pad_dense
 from atom.distributed.token_transport import (
     ALLGATHER_MAX_PAYLOAD_BYTES,
@@ -75,9 +74,7 @@ def gather_heads(x, rows, ca=None, scale=None):
     w, rank = group.world_size, group.rank_in_group
     x = x.reshape(x.shape[0], -1)
     s_local = rows // w
-    row_bytes = x.shape[1] * x.element_size()
-    # AITER's last-dimension gather requires 16-byte alignment.
-    small = row_bytes % 16 == 0 and rows * row_bytes <= ALLGATHER_MAX_PAYLOAD_BYTES
+    small = rows * x.shape[1] * x.element_size() <= ALLGATHER_MAX_PAYLOAD_BYTES
     long_rows = not small and rows >= w * HEAD_EXCHANGE_MIN_LOCAL_ROWS
     fp8_wire = long_rows and scale is not None
     view = None
@@ -99,8 +96,8 @@ def gather_heads(x, rows, ca=None, scale=None):
 
     if view is not None:
         out = ca.head_exchange(x, registered=registered)
-    elif small and custom_gather_ok(x, group):
-        out = group.all_gather(x, use_custom=True, dim=1)
+    elif small:
+        out = group.device_communicator.all_gather(x, 1)
         out = out[rank * s_local : (rank + 1) * s_local]
     else:
         send = x.reshape(w, s_local, x.shape[1]).contiguous()

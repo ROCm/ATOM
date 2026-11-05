@@ -74,8 +74,5 @@ def test_head_exchange_requires_usable_collective(monkeypatch, modules, supporte
         setattr(ca, check, lambda x: True)
     ca.registered_input_view = lambda shape, dtype: None
     assert view(12) is None and view(8) is x
-    ca.disabled = True
-    assert transport.head_exchange_comm(group) is None
-    ca.disabled = False
     monkeypatch.setattr(modules.chip_info, "get_gfx_runtime", lambda: "gfx942")
     assert transport.head_exchange_comm(group) is None

@@ -12,7 +12,6 @@ rank dimension and runs with ``-tp 1 -sp W``.
 import torch
 
 from atom.config import get_current_atom_config
-from atom.distributed.custom_gather import custom_gather_ok
 from atom.distributed.token_transport import ALLGATHER_MAX_PAYLOAD_BYTES
 
 # AITER is imported where used: `Config` imports this module on CPU.
@@ -152,9 +151,10 @@ def send_columns(fields, device) -> torch.Tensor:
 
 def exchange_columns(source, group, columns):
     """Give each rank its ``columns`` row of ``source`` for every token."""
-    if not custom_gather_ok(source, group, ALLGATHER_MAX_PAYLOAD_BYTES):
+    if source.numel() * source.element_size() > ALLGATHER_MAX_PAYLOAD_BYTES:
         from atom.distributed.sp_kernels import pack_columns
 
         # Rank-major receive order is global token order for contiguous shards.
         return all_to_all_blocks(pack_columns(source, columns), group).flatten(0, 1)
-    return group.custom_all_gather(source).index_select(1, columns[group.rank_in_group])
+    gathered = group.device_communicator.all_gather(source.contiguous(), 0)
+    return gathered.index_select(1, columns[group.rank_in_group])

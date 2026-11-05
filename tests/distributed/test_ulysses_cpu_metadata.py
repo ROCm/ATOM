@@ -79,35 +79,15 @@ def test_vocab_sharded_lm_head_matches_the_full_head(monkeypatch, embed_head, wo
     def on_each_rank(all_gather):
         out = []
         for rank in range(world):
+            comm = SimpleNamespace(all_gather=all_gather)
             group = SimpleNamespace(
-                world_size=world, rank_in_group=rank, all_gather=all_gather
+                world_size=world, rank_in_group=rank, device_communicator=comm
             )
             monkeypatch.setattr(embed_head, "get_pcp_group", lambda g=group: g)
             out.append(head._sp_sharded_logits(x))
         return out
 
     sent = []
-    on_each_rank(lambda s, dim, use_custom: sent.append(s) or s.repeat(1, world))
-    for logits in on_each_rank(lambda s, dim, use_custom: torch.cat(sent, dim)):
+    on_each_rank(lambda s, dim: sent.append(s) or s.repeat(1, world))
+    for logits in on_each_rank(lambda s, dim: torch.cat(sent, dim)):
         torch.testing.assert_close(logits, x @ weight.t())
-
-
-@pytest.mark.parametrize(
-    "case", ["usable", "env_off", "no_ca", "refused", "uneven", "unaligned"]
-)
-def test_vocab_shards_gather_only_on_the_custom_all_gather(
-    monkeypatch, embed_head, case
-):
-    """Otherwise the head runs whole on every rank: an RCCL gather would not
-    record in the decode graph."""
-    ca = SimpleNamespace(disabled=False, should_custom_ag=lambda x: case != "refused")
-    comm = SimpleNamespace(ca_comm=None if case == "no_ca" else ca)
-    group = SimpleNamespace(world_size=4, device_communicator=comm)
-    monkeypatch.setattr(embed_head, "get_pcp_group", lambda: group)
-    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", str(int(case != "env_off")))
-    head = embed_head.ParallelLMHead.__new__(embed_head.ParallelLMHead)
-    torch.nn.Module.__init__(head)
-    # 8 bf16 logits per rank make a 16-byte row; 4 do not.
-    head.num_embeddings = {"uneven": 33, "unaligned": 16}.get(case, 32)
-    x = torch.empty(3, 8, dtype=torch.bfloat16)
-    assert head._sp_vocab_gather_ok(x) is (case == "usable")

@@ -8,11 +8,10 @@ the same on every rank, so all ranks pick the same collective.
 
 import torch
 
-from atom.distributed.custom_gather import usable_ca_comm
 from atom.utils import envs
 
-# Per-rank payloads up to this take the registered-buffer all-gather over RCCL's
-# all-to-all. Measured on SP4 the two cross at ~3.7 MB; 2 MiB keeps a margin.
+# Per-rank payloads up to this are all-gathered rather than sent all-to-all.
+# Measured on SP4 the two cross at ~3.7 MB; 2 MiB keeps a margin.
 ALLGATHER_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 # Output rows per rank from which an attention output takes the prefill head
 # exchange (FP8 with a gathered amax, the four-rank exchange kernel); decode
@@ -27,7 +26,9 @@ def head_exchange_comm(group):
         return None
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    return usable_ca_comm(group) if get_gfx_runtime() == "gfx950" else None
+    if get_gfx_runtime() != "gfx950":
+        return None
+    return group.device_communicator.ca_comm
 
 
 def head_exchange_view(ca, x: torch.Tensor, rows: int, dtype=None):
