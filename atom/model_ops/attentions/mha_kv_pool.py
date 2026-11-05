@@ -289,8 +289,13 @@ class MhaKvPool:
         layer 12, not region 37 -- and the folded order (all of K, then all of
         V) makes that worth having.
         """
+        return [(f"{name}.layer_{row}", t) for name, row, t in self.field_regions()]
+
+    def field_regions(self) -> list[tuple[str, int, torch.Tensor]]:
+        """`region_tensors` with each name left in its parts, `(field, row,
+        tensor)`, for a caller that numbers or describes the units itself."""
         return [
-            (f"{name}.layer_{layer}", view[layer])
+            (name, row, view[row])
             for name, view in self._views.items()
-            for layer in range(len(view))
+            for row in range(len(view))
         ]

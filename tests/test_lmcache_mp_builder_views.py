@@ -99,7 +99,8 @@ def mha_export_method():
         for node in builder.body
         if isinstance(node, ast.FunctionDef) and node.name == "get_kv_transfer_tensors"
     )
-    namespace = {}
+    # The exporter's one module global: the indexer keys' row space.
+    namespace = {"INDEX_ROWS": "index"}
     exec(  # noqa: S102 -- execute the local exporter under the CPU fixture
         compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
         namespace,
@@ -244,13 +245,24 @@ def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
         extra_fields=(EntryField("index", 1, (128 * 128,), torch.uint8),),
     )
     pool.allocate(num_blocks, "cpu")
-    builder = SimpleNamespace(kv_pools={"gqa4": pool})
+    layers = [object(), object()]
+    builder = SimpleNamespace(
+        kv_pools={"gqa4": pool},
+        # Both layers' KV and the first one's indexer keys, not split by PP.
+        pool_rows={"gqa4": dict(zip(layers, range(2))), "index": {layers[0]: 0}},
+        block_size=128,
+        block_ratio=1,
+        _pp_num_global_layers=lambda: None,
+    )
 
     transfer = mha_export_method(builder)
     transfer.set_block_count(num_blocks)
 
     assert transfer.tp_replication_factor == 1
     assert len(transfer.block_regions) == 4 * 2 + 1
+    # Every KV unit is one head-major run of the rank's one head; the indexer
+    # keys are the same on every rank.
+    assert [page.head_major_runs for page in transfer.pages] == [(1, 1)] * 8 + [None]
     assert all(
         region.semantic_role.startswith("mha.gqa4.")
         for region in transfer.block_regions

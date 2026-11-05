@@ -991,9 +991,7 @@ def test_explicit_region_map_supports_compact_index_group():
     explicit = list(range(18, 38)) + [83, 84, 85, 86, 87]
 
     assert (
-        conn._consumer_region_map(
-            len(explicit), len(explicit), explicit_indices=explicit
-        )
+        conn._consumer_region_map(len(explicit), 98, explicit_indices=explicit)
         == explicit
     )
 
@@ -1028,6 +1026,20 @@ def test_explicit_region_map_rejects_length_mismatch():
 
     with pytest.raises(ValueError, match="length does not match"):
         conn._consumer_region_map(3, 2, explicit_indices=[0, 1])
+
+
+@pytest.mark.parametrize(
+    "indices, refusal", [([0, 2], "exceeds"), ([-1, 0], "exceeds"), ([1, 1], "two")]
+)
+def test_explicit_region_map_rejects_a_region_the_consumer_lacks_or_repeats(
+    indices, refusal
+):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    conn = object.__new__(mc.MooncakeConnector)
+    with pytest.raises(ValueError, match=refusal):
+        conn._consumer_region_map(2, 2, explicit_indices=indices)
 
 
 # ---------------------------------------------------------------------------
