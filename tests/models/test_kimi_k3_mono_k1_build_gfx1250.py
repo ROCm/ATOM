@@ -38,6 +38,15 @@ def _spec(qlen=16):
     )
 
 
+@pytest.mark.parametrize("qlen", [1, 5, 16])
+def test_local_spec_takes_atoms_conv_window(qlen):
+    """ATOM sizes the KDA conv pool `kernel - 1 + num_spec` (`_state_shape`):
+    qlen + 2 under speculation, 3 for plain decode."""
+    replace(_spec(qlen), state_len=qlen + 2).validate(_plan(qlen))
+    with pytest.raises(ValueError, match="state_len"):
+        replace(_spec(qlen), state_len=qlen + 1).validate(_plan(qlen))
+
+
 def test_build_local_loads_complete_product_pipeline(monkeypatch):
     plan = _plan()
     spec = replace(_spec(), kda0=7)

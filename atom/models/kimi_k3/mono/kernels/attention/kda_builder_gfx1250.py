@@ -353,10 +353,13 @@ class K1LocalBuildSpec:
             raise TypeError("local K1 delta must be bool")
         if self.debug:
             raise ValueError("resident gfx1250 K1 does not expose debug taps")
-        if self.state_len < self.qlen + 3:
+        # ATOM's conv pool keeps the last `kernel - 1 + num_spec` inputs
+        # (`_state_shape`): the history read at `acc_idx <= qlen - 1` ends at
+        # `acc_idx + 2`, so qlen + 2 entries serve every accepted count.
+        if self.state_len < self.qlen + 2:
             raise ValueError(
-                "local K1 state_len must cover qlen plus the three-entry "
-                "causal-convolution history"
+                "local K1 state_len must cover qlen plus the two history "
+                "entries the conv window keeps"
             )
         for name, value in (
             ("eps", self.eps),
