@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.config import _is_minimax_m3_config, dense_kv_dtype
+from atom.config import _is_minimax_m3_config
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.utils import CpuGpuBuffer, envs, pack_rows, upload_numpy
@@ -207,14 +207,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if envs.ATOM_USE_UNIFIED_ATTN:
             # The two coincide there, and only one scheduler block reads well:
             # fp8 packs x=16 -> 128, bf16 x=8 -> 64, both a 128 B physical page.
-            expected = 128 if dense_kv_dtype(model_runner.config) == "fp8" else 64
+            expected = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
             if model_runner.block_size != expected:
                 logger.warning(
                     "ATOM_USE_UNIFIED_ATTN=1 expects --block-size %s for %s KV "
                     "cache, got --block-size %s. Continuing with the requested "
                     "block size.",
                     expected,
-                    dense_kv_dtype(model_runner.config),
+                    model_runner.kv_cache_dtype,
                     model_runner.block_size,
                 )
         super().__init__(model_runner)
@@ -577,15 +577,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and hasattr(module, "use_mla")
             and not module.use_mla
         ):
-            layout = None
-            if (
-                _is_indexed_sparse_attention(module)
-                and self.model_runner.config.kv_cache_dtype == "fp4"
-            ):
-                from atom.model_ops.minimax_m3.mxfp4_pages import Mxfp4KvLayout
-
-                layout = Mxfp4KvLayout()
-            kinds.append(KvGeometry(module.num_kv_heads, module.head_dim, layout))
+            kinds.append(KvGeometry(module.num_kv_heads, module.head_dim))
         return tuple(kinds)
 
     def _declare_kv_pools(self) -> dict[KvGeometry, MhaKvPool]:
@@ -624,9 +616,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 blocks_per_entry=self.block_ratio,
                 num_kv_heads=geometry.num_kv_heads,
                 head_dim=geometry.head_dim,
-                kv_dtype=dtypes.d_dtypes[dense_kv_dtype(runner.config)],
+                kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
                 extra_fields=extra_fields,
-                layout=geometry.layout,
             )
             extra_fields = ()
         return pools
@@ -780,10 +771,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         row = self.pool_rows[geometry][module]
 
         k_cache, v_cache = pool.kv_views(row)
-        # A layout with scale planes hands them over; an MXFP4 pool has none, its
-        # pages carry their own (the sparse impl takes the (data, scale) views of
-        # them, mxfp4_pages.page_views).
-        if pool.scale_fields:
+        if config.kv_cache_dtype == "fp8":
             module.k_scale, module.v_scale = pool.scale_views(row)
 
         module.max_model_len = config.max_model_len
@@ -1372,14 +1360,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
             # the DECODE sparse path; the decode kernels handle q>1 per-token
             # causal internally via max_query_len.
-            # Every index cache: the selector's bounds are laid out head-major over
-            # the rows the captured scorer runs, whichever cache scored them.
-            index_bs = index_batch(
-                scheduled_bs,
-                running_bs,
-                running_tokens,
-                max_seqlen_q,
-                strict=bool(self._index_score_kwargs()),
+            # The MXFP4 scorer's selector bounds are laid out head-major over the
+            # rows the captured scorer runs; the other index caches keep the
+            # padded batch.
+            index_bs = (
+                index_batch(scheduled_bs, running_bs, running_tokens, max_seqlen_q)
+                if self._index_score_kwargs()
+                else running_bs
             )
             sparse_block_tables = self._get_sparse_attention_block_tables(
                 attn_metadata.block_tables[:index_bs],

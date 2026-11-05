@@ -694,13 +694,13 @@ def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
 
     def run(bounds):
         topk_idx = torch.empty((heads, total_q, TOPK), dtype=torch.int32, device=dev)
-        (sbt, sctx), args = m._alloc_emit(total_q, heads, TOPK, table, True, dev, 1)
+        (sbt, sctx), args = m._alloc_emit(total_q, heads, TOPK, table, True, dev)
         m._launch_select(
             score, topk_idx, seq, seq, batch, TOPK, 0, 1, table, (sbt, sctx, *args[2:]),
             heads, rows_per_req=S, decode_max_q=S,
             block_size_k=m.DECODE_TOPK_BLOCK_SIZE_K, num_warps=m.DECODE_TOPK_NUM_WARPS,
-            emit=True, block_page_stride=1, n_valid_column_per_row=bounds,
-            pages_per_block=1,
+            emit=True, block_page_stride=m.PAGES_PER_SPARSE_BLOCK,
+            n_valid_column_per_row=bounds,
         )  # fmt: skip
         return topk_idx, sbt, sctx
 

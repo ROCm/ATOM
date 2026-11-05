@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import copy
 import enum
 import fnmatch
 import hashlib
@@ -954,18 +953,6 @@ def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
         if "minimax_m3" in model_type or "minimaxm3" in model_type:
             return True
     return False
-
-
-def dense_kv_dtype(config) -> str:
-    """The KV dtype of the pages that are not MXFP4, from the one user flag
-    ``kv_cache_dtype``. On MiniMax-M3 ``fp4`` makes only the indexed sparse
-    layers' pages MXFP4; dense / sliding layers (and a draft's) keep fp8 pages,
-    since no dense FP4 page layout or writer exists. Other models: unchanged."""
-    if _is_minimax_m3_config(getattr(config, "hf_config", None)):
-        from atom.models.minimax_m3.config import dense_kv_cache_dtype
-
-        return dense_kv_cache_dtype(config.kv_cache_dtype)
-    return config.kv_cache_dtype
 
 
 _MINIMAX_M3_MLP_LAYER_TYPES = {"dense": 0, "sparse": 1}
@@ -1951,14 +1938,12 @@ def qrep_for_step(
     return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
 
 
-def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
-    """``--kv-cache-dtype fp4`` is MiniMax-M3's (its indexed sparse layers' K/V as
-    MXFP4 pages, the other layers fp8) or DeepSeek-V4.1's own; refused elsewhere.
-    The index ``fp4`` is left as it is: its layout is per model."""
-    if kv_cache_dtype == "fp4" and not (is_m3 or is_v41):
-        raise ValueError(
-            "--kv-cache-dtype fp4 is supported by MiniMax-M3 and DeepSeek-V4.1 only"
-        )
+def _check_fp4_kv(kv_cache_dtype: str, *, is_v41: bool) -> None:
+    """``--kv-cache-dtype fp4`` is DeepSeek-V4.1's own FP4 KV; refused elsewhere,
+    MiniMax-M3 included (it has an MXFP4 *index* cache only, ``--index-cache-dtype
+    fp4``). The index ``fp4`` is left as it is: its layout is per model."""
+    if kv_cache_dtype == "fp4" and not is_v41:
+        raise ValueError("--kv-cache-dtype fp4 is supported by DeepSeek-V4.1 only")
 
 
 def indexer_cp_unsupported_reason(
@@ -1969,7 +1954,7 @@ def indexer_cp_unsupported_reason(
     dcp_size: int,
     enable_tbo: bool,
     plugin_mode: bool = False,
-    mxfp4_caches: bool = False,
+    mxfp4_index: bool = False,
 ) -> str | None:
     """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
 
@@ -1997,8 +1982,8 @@ def indexer_cp_unsupported_reason(
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
         # flag so nothing downstream (log line, compile hash) disagrees.
         return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
-    if mxfp4_caches:
-        return "the MXFP4 caches are not wired to the CP scorer"
+    if mxfp4_index:
+        return "the MXFP4 index cache is not wired to the CP scorer"
     if dcp_size > 1:
         return (
             "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
@@ -2714,12 +2699,11 @@ class Config:
             for a in arches
         )
         # The same test the attention builder and the offload layout use, so the
-        # MXFP4 gate cannot disagree with them on an export that names itself
+        # MXFP4 index gate cannot disagree with them on an export that names itself
         # only in `text_config` or `model_type`.
         is_m3 = _is_minimax_m3_config(self.hf_config)
         _check_fp4_kv(
             self.kv_cache_dtype,
-            is_m3=is_m3,
             is_v41=self.hf_config.model_type == "deepseek_v41_text",
         )
         if is_deepseek_v4:
@@ -2796,7 +2780,7 @@ class Config:
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
-                "fp4" in (self.index_cache_dtype, self.kv_cache_dtype),
+                self.index_cache_dtype == "fp4",
             )
             if indexer_cp_off is not None:
                 logger.warning(
@@ -2838,7 +2822,7 @@ class Config:
                 # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
             else:
-                self.index_cache_dtype = dense_kv_dtype(self)
+                self.index_cache_dtype = self.kv_cache_dtype
         if is_m3:
             from atom.models.minimax_m3.config import validate_runtime_config
 
@@ -2871,19 +2855,6 @@ class Config:
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
-
-    def draft_config(self, hf_config) -> "Config":
-        """A shallow copy for a draft model built from its own ``hf_config``:
-        uncompiled, and with the KV dtype of the layers that are not MXFP4 -- a
-        draft has no MXFP4 layers (and its own architecture is not the target's, so
-        `dense_kv_dtype` could not tell). Shallow rather than deep: MLA targets
-        hold non-picklable cuda.Stream objects in fields a deepcopy cannot walk."""
-        draft = copy.copy(self)
-        draft.kv_cache_dtype = dense_kv_dtype(self)
-        draft.hf_config = hf_config
-        draft.compilation_config = copy.copy(self.compilation_config)
-        draft.compilation_config.level = CompilationLevel.NO_COMPILATION
-        return draft
 
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.
@@ -2978,7 +2949,6 @@ class Config:
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(self.index_cache_dtype)
-        factors.append(self.kv_cache_dtype == "fp4")
         # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
         # graphs (early + late layers) instead of one; both compile under the
         # `backbone` tag, so the flag must key the artifacts.

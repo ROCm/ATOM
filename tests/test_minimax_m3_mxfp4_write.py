@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""`SparseMHAPagedAttentionImpl.rope_cache` with the MXFP4 caches (gfx950).
+"""`SparseMHAPagedAttentionImpl.rope_cache` with the MXFP4 index cache (gfx950).
 
-The fused aiter kernel quantizes K, V and the index key into 8704 B pages and
-emits an e4m3 main q. This pins the plumbing around it against the same kernel
-writing bf16: what lands in the pool pages, at which slots, and the q handed
-on. The kernel's own numerics are aiter's tests'.
+The fused aiter kernel quantizes the index key into 8704 B pages and emits an
+e4m3 index q; K/V stay in the fp8 SHUFFLE cache. This pins the plumbing around
+it against the same kernel writing bf16: what lands in the index pages, at which
+slots, and the index q handed on. The kernel's own numerics are aiter's tests'.
 """
 
 import types
@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(
 NQ, NKV, D, NIQ, PAGES = 16, 1, 128, 1, 6
 
 
-def make_impl(kv_mxfp4: bool, index_cache_dtype: str):
+def make_impl(index_cache_dtype: str):
     from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 
     dev = "cuda"
@@ -51,7 +51,7 @@ def make_impl(kv_mxfp4: bool, index_cache_dtype: str):
     impl.num_heads, impl.num_kv_heads, impl.head_dim = NQ, NKV, D
     impl.num_idx_heads, impl.index_q_size, impl.index_head_dim = NIQ, NIQ * D, D
     impl.skip_index_topk = False
-    impl.kv_cache_dtype = "fp4" if kv_mxfp4 else "fp8"
+    impl.kv_cache_dtype = "fp8"
     impl.index_cache_dtype = index_cache_dtype
     impl.index_scale = impl.index_stage = impl.index_stage_slots = None
     impl.kv_stage = impl.kv_stage_slots = None
@@ -97,7 +97,7 @@ def inputs(T, seed):
 def reference(qkv, position, slots):
     """The same kernel writing bf16 (plain page-128 layout): rk, rv, ri, q, index q."""
     T = qkv.shape[0]
-    ref = make_impl(False, "auto")  # only carries the norm weights and rotary tables
+    ref = make_impl("auto")  # only carries the norm weights and rotary tables
     rk = torch.zeros(PAGES, 128, NKV, D, device="cuda", dtype=torch.bfloat16)
     rv = torch.zeros_like(rk)
     ri = torch.zeros(PAGES, 128, D, device="cuda", dtype=torch.bfloat16)
@@ -118,98 +118,12 @@ def rel(got, want):
     return ((got - want).norm() / want.norm()).item()
 
 
-def test_mxfp4_pages_match_the_bf16_write():
-    T = 37
-    qkv, position, slots = inputs(T, 1)
-    rk, rv, ri, q_bf16, iq_bf16 = reference(qkv, position, slots)
-
-    impl = make_impl(True, "fp4")
-    kp = torch.zeros(PAGES, NKV, PAGE_BYTES, device="cuda", dtype=torch.uint8)
-    vp = torch.zeros_like(kp)
-    ip = torch.zeros(PAGES, PAGE_BYTES, device="cuda", dtype=torch.uint8)
-    q, _, _, kc, vc, ks, vs = run(impl, qkv, position, slots, kp, vp, ip)
-
-    assert kc is kp and vc is vp and ks is None and vs is None
-    assert q.dtype == torch.float8_e4m3fn and q.shape == (T, NQ, D)
-    assert impl._index_q.dtype == torch.float8_e4m3fn
-    got_iq, want_iq = impl._index_q.float(), iq_bf16.view(T, NIQ, D).float()
-    assert (got_iq - want_iq).norm() / want_iq.norm() < 0.04  # the e4m3 cast
-    qd = q.float().view(T, NQ * D)
-    assert (qd - q_bf16.float()).norm() / q_bf16.float().norm() < 0.04  # e4m3 cast
-
-    valid = slots >= 0
-    page, off = slots[valid] // 128, slots[valid] % 128
-
-    for pages_u8, want in ((kp, rk), (vp, rv)):
-        got = dequantize_mxfp4(*page_views(pages_u8))[page, 0, off]  # [n, 128]
-        assert rel(got, want[page, off, 0].float()) < 0.15
-    got = dequantize_mxfp4(*page_views(ip))[page, off]
-    assert rel(got, ri[page, off].float()) < 0.15
-    # padding and untouched slots stay zero-bytes
-    written = torch.zeros(PAGES * 128, dtype=torch.bool, device="cuda")
-    written[slots[valid]] = True
-    untouched = dequantize_mxfp4(*page_views(kp))[:, 0].reshape(-1, D)[~written]
-    assert (untouched == 0).all()
-
-
-def test_a_top_k_reusing_layer_writes_kv_and_skips_the_index():
-    T = 21
-    g = torch.Generator(device="cuda").manual_seed(2)
-    width = (NQ + 2 * NKV + NIQ + 1) * D
-    qkv = torch.randn(T, width, device="cuda", generator=g, dtype=torch.bfloat16)
-    position = torch.arange(T, device="cuda", dtype=torch.int64)
-    slots = torch.arange(T, device="cuda", dtype=torch.int64) + 128  # page 1
-
-    full = make_impl(True, "fp4")
-    kp = torch.zeros(PAGES, NKV, PAGE_BYTES, device="cuda", dtype=torch.uint8)
-    vp = torch.zeros_like(kp)
-    ip = torch.zeros(PAGES, PAGE_BYTES, device="cuda", dtype=torch.uint8)
-    q_full = run(full, qkv, position, slots, kp, vp, ip)[0]
-
-    skip = make_impl(True, "fp4")
-    skip.skip_index_topk = True
-    kp2 = torch.zeros_like(kp)
-    vp2 = torch.zeros_like(vp)
-    ip2 = torch.zeros_like(ip)
-    q_skip = run(skip, qkv, position, slots, kp2, vp2, ip2)[0]
-
-    assert skip._index_q is None and skip._index_q_cache_key_info is not None
-    assert torch.equal(kp, kp2) and torch.equal(vp, vp2)  # the same K/V pages
-    assert torch.equal(q_full.view(torch.uint8), q_skip.view(torch.uint8))
-    assert (ip2 == 0).all() and (ip != 0).any()  # no index key written
-    # the key a reusing layer looks the producer's selection up by
-    bt = torch.zeros(2, 4, dtype=torch.int32, device="cuda")
-    for impl in (full, skip):
-        impl.topk, impl.init_blocks, impl.local_blocks = 16, 1, 1
-        impl.indexer_cp_group = None
-    args = (bt, bt[:, 0], 1, 512)
-    assert full._index_q.dtype == torch.float8_e4m3fn
-    assert skip._topk_cache_key("decode", None, *args) == full._topk_cache_key(
-        "decode", full._index_q, *args
-    )
-
-
-def test_kv_only_mxfp4_writes_an_fp8_index_cache():
-    T = 37
-    qkv, position, slots = inputs(T, 3)
-    rk, rv, ri, _, iq_bf16 = reference(qkv, position, slots)
-
-    impl = make_impl(True, "fp8")
-    kp = torch.zeros(PAGES, NKV, PAGE_BYTES, device="cuda", dtype=torch.uint8)
-    vp = torch.zeros_like(kp)
-    ip = torch.zeros(PAGES, 128, D, device="cuda", dtype=aiter.dtypes.fp8)
-    q, _, _, kc, vc, ks, vs = run(impl, qkv, position, slots, kp, vp, ip)
-
-    assert kc is kp and vc is vp and ks is None and vs is None
-    assert q.dtype == torch.float8_e4m3fn  # the MXFP4 KV's main q
-    assert impl._index_q.dtype == torch.bfloat16  # only the MXFP4 index takes fp8 q
-    assert rel(impl._index_q.float(), iq_bf16.view(T, NIQ, D).float()) < 0.02
-    valid = slots >= 0
-    page, off = slots[valid] // 128, slots[valid] % 128
-    for pages_u8, want in ((kp, rk), (vp, rv)):
-        got = dequantize_mxfp4(*page_views(pages_u8))[page, 0, off]
-        assert rel(got, want[page, off, 0].float()) < 0.15
-    assert rel(ip.float()[page, off], ri[page, off].float()) < 0.1  # the e4m3 cast
+def shuffle_cache():
+    # the page-128 SHUFFLE views (x = 16 fp8 elements) and per-token scales
+    k = torch.zeros(PAGES, NKV, D // 16, 128, 16, device="cuda", dtype=aiter.dtypes.fp8)
+    v = torch.zeros(PAGES, NKV, 128 // 16, D, 16, device="cuda", dtype=aiter.dtypes.fp8)
+    scale = torch.zeros(PAGES, NKV, 128, device="cuda", dtype=torch.float32)
+    return k, v, scale, torch.zeros_like(scale)
 
 
 def test_index_only_mxfp4_leaves_the_fp8_shuffle_kv_write_alone():
@@ -217,20 +131,9 @@ def test_index_only_mxfp4_leaves_the_fp8_shuffle_kv_write_alone():
     qkv, position, slots = inputs(T, 4)
     _, _, ri, _, iq_bf16 = reference(qkv, position, slots)
 
-    def shuffle_cache():
-        # the page-128 SHUFFLE views (x = 16 fp8 elements) and per-token scales
-        k = torch.zeros(
-            PAGES, NKV, D // 16, 128, 16, device="cuda", dtype=aiter.dtypes.fp8
-        )
-        v = torch.zeros(
-            PAGES, NKV, 128 // 16, D, 16, device="cuda", dtype=aiter.dtypes.fp8
-        )
-        scale = torch.zeros(PAGES, NKV, 128, device="cuda", dtype=torch.float32)
-        return k, v, scale, torch.zeros_like(scale)
-
     runs = {}
     for name, index_dtype in (("mxfp4", "fp4"), ("none", "auto")):
-        impl = make_impl(False, index_dtype)
+        impl = make_impl(index_dtype)
         k, v, ksc, vsc = shuffle_cache()
         index = (
             torch.zeros(PAGES, PAGE_BYTES, device="cuda", dtype=torch.uint8)
@@ -242,7 +145,7 @@ def test_index_only_mxfp4_leaves_the_fp8_shuffle_kv_write_alone():
 
     impl, q, k, v, ksc, vsc, index = runs["mxfp4"]
     _, q0, k0, v0, ksc0, vsc0, _ = runs["none"]
-    assert q.dtype == torch.bfloat16  # no MXFP4 KV: the main q stays as it was
+    assert q.dtype == torch.bfloat16  # the main q stays as it was
     for got, want in ((q, q0), (k, k0), (v, v0), (ksc, ksc0), (vsc, vsc0)):
         assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
     assert (ksc != 0).any() and (k.view(torch.uint8) != 0).any()
@@ -253,4 +156,34 @@ def test_index_only_mxfp4_leaves_the_fp8_shuffle_kv_write_alone():
     assert (
         rel(dequantize_mxfp4(*page_views(index))[page, off], ri[page, off].float())
         < 0.15
+    )
+
+
+def test_a_top_k_reusing_layer_keys_its_reuse_on_the_e4m3_index_q():
+    T = 21
+    qkv, position, _ = inputs(T, 2)
+    slots = torch.arange(T, device="cuda", dtype=torch.int64) + 128  # page 1
+
+    full = make_impl("fp4")
+    k, v, ksc, vsc = shuffle_cache()
+    ip = torch.zeros(PAGES, PAGE_BYTES, device="cuda", dtype=torch.uint8)
+    run(full, qkv, position, slots, k, v, ip, ksc, vsc)
+
+    skip = make_impl("fp4")
+    skip.skip_index_topk = True
+    k2, v2, ksc2, vsc2 = shuffle_cache()
+    ip2 = torch.zeros_like(ip)
+    run(skip, qkv, position, slots, k2, v2, ip2, ksc2, vsc2)
+
+    assert skip._index_q is None and skip._index_q_cache_key_info is not None
+    assert (ip2 == 0).all() and (ip != 0).any()  # no index key written
+    # the key a reusing layer looks the producer's selection up by
+    bt = torch.zeros(2, 4, dtype=torch.int32, device="cuda")
+    for impl in (full, skip):
+        impl.topk, impl.init_blocks, impl.local_blocks = 16, 1, 1
+        impl.indexer_cp_group = None
+    args = (bt, bt[:, 0], 1, 512)
+    assert full._index_q.dtype == torch.float8_e4m3fn
+    assert skip._topk_cache_key("decode", None, *args) == full._topk_cache_key(
+        "decode", full._index_q, *args
     )

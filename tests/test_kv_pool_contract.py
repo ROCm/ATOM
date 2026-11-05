@@ -237,12 +237,6 @@ def test_a_geometry_row_space_names_itself_readably():
     its error messages. Pinned by value because a shape is what a reader
     recognizes."""
     from atom.model_ops.attentions.pool_layout.pool_rows import KvGeometry
-    from atom.model_ops.minimax_m3.mxfp4_pages import Mxfp4KvLayout
 
     assert str(KvGeometry(2, 256)) == "h2d256"
     assert f"mha.{KvGeometry(8, 128)}.k.layer_0" == "mha.h8d128.k.layer_0"
-    # MiniMax-M3's MXFP4 sparse-layer pool is named by its format too
-    assert (
-        f"mha.{KvGeometry(8, 128, Mxfp4KvLayout())}.k.layer_0"
-        == "mha.h8d128fp4.k.layer_0"
-    )

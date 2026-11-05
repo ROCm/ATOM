@@ -18,7 +18,6 @@ def _hash(spec=None):
         dcp_config=None,
         enable_dp_attention=True,
         index_cache_dtype="fp4",
-        kv_cache_dtype="fp8",
         enable_decoder_swa_bounded_replay=True,
         hf_config=SimpleNamespace(),
         max_model_len=4096,

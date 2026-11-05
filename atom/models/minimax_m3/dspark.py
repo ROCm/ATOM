@@ -58,7 +58,7 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
-from atom.config import QuantizationConfig, dense_kv_dtype
+from atom.config import QuantizationConfig
 from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.minimax_m3.sparse_attn import (
@@ -223,7 +223,7 @@ class M3DSparkAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.kv_cache_dtype = dense_kv_dtype(atom_config)
+        self.kv_cache_dtype = atom_config.kv_cache_dtype
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,

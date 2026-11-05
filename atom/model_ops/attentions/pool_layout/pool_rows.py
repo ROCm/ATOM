@@ -32,17 +32,12 @@ class KvGeometry(NamedTuple):
 
     num_kv_heads: int
     head_dim: int
-    # None for the dtype-wide cache; a layout for layers whose pages read another
-    # way (MiniMax-M3's sparse layers under --kv-cache-dtype fp4) -- a separate
-    # pool beside any dense layers' one. Hashable, with a `tag` naming it.
-    layout: object | None = None
 
     def __str__(self) -> str:
         """What this row space is called, wherever one is named -- the startup
         log, and the `semantic_role` its transfer regions carry. Both are for a
         person: the default repr would print the class and field names."""
-        tag = self.layout.tag if self.layout is not None else ""
-        return f"h{self.num_kv_heads}d{self.head_dim}{tag}"
+        return f"h{self.num_kv_heads}d{self.head_dim}"
 
 
 class PoolRowsMixin:

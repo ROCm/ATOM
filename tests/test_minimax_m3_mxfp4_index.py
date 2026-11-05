@@ -4,9 +4,9 @@
 Scores come from aiter's FlyDSL scorers; what is pinned here is the ATOM side:
 the views of the pool page, the work map built once per step into a persistent
 buffer (and still right when a captured graph replays it with new lengths), and
-the page-128 block table the selection emits for the MXFP4 KV (one page a block,
-exact context with the tail block last). The oracle is the op's definition on the
-dequantized cache, not another kernel.
+the page-16 block table the selection emits for the SHUFFLE KV (eight pages a
+block, exact context with the tail block last). The oracle is the op's definition
+on the dequantized cache, not another kernel.
 """
 
 import pytest
@@ -81,13 +81,10 @@ def reference(cache, table, seq, q, S):
     return score, picks, ctx
 
 
-# `ppb` 16-pages a block: 1 for the MXFP4 KV, 8 for the page-16 SHUFFLE KV that
-# an index-only MXFP4 run keeps (stride 8: its blocks are contiguous)
-@pytest.mark.parametrize(
-    "batch,S,ppb", [(1, 8, 1), (5, 8, 1), (17, 8, 1), (6, 1, 1), (5, 8, 8)]
-)
+@pytest.mark.parametrize("batch,S", [(1, 8), (5, 8), (17, 8), (6, 1)])
 @pytest.mark.parametrize("fp8_q", [False, True])
-def test_decode_selection_and_block_table(batch, S, ppb, fp8_q):
+def test_decode_selection_and_block_table(batch, S, fp8_q):
+    ppb = 8  # 16-pages a block of the page-16 SHUFFLE KV the MXFP4 index sits beside
     from atom.model_ops.minimax_m3.index_mxfp4 import (
         IndexScoreStep,
         build_index_work_map,
@@ -107,8 +104,8 @@ def test_decode_selection_and_block_table(batch, S, ppb, fp8_q):
     )
     topk_idx, sbt, sctx = minimax_m3_index_topk_decode(
         q, cache, table, seq, int(seq.max()), TOPK, 0, 1, HEADS, SM_SCALE,
-        emit_sparse_block_table=True, max_query_len=S, block_page_stride=ppb,
-        index_mxfp4=True, pages_per_block=ppb,
+        emit_sparse_block_table=True, max_query_len=S,
+        index_mxfp4=True,
         index_score=IndexScoreStep(wmap, max_block, None),
     )  # fmt: skip
     _, picks, ctx = reference(cache, table, seq, q, S)
@@ -137,8 +134,8 @@ def test_prefill_selection_matches_the_decode_definition():
     prefix = (seq - S).to(torch.int32)
     topk_idx, _, sctx = minimax_m3_index_topk(
         q, cache, table, cu, seq, prefix, S, int(seq.max()), TOPK, 0, 1, HEADS,
-        SM_SCALE, emit_sparse_block_table=True, block_page_stride=1,
-        index_mxfp4=True, pages_per_block=1,
+        SM_SCALE, emit_sparse_block_table=True,
+        index_mxfp4=True,
     )  # fmt: skip
     score, picks, ctx = reference(cache, table, seq, q, S)
     for r in range(batch * S):
@@ -184,8 +181,8 @@ def test_a_captured_decode_follows_the_refilled_work_map():
     def run():
         return minimax_m3_index_topk_decode(
             q, cache, table, static_seq, max_block * 128, TOPK, 0, 1, HEADS, SM_SCALE,
-            emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
-            index_mxfp4=True, pages_per_block=1,
+            emit_sparse_block_table=True, max_query_len=S,
+            index_mxfp4=True,
             index_score=IndexScoreStep(wmap, max_block, None),
         )  # fmt: skip
 
@@ -259,8 +256,8 @@ def test_a_persistent_score_buffer_changes_nothing():
         )
         sel = minimax_m3_index_topk_decode(
             q, cache, table, seq, max_block * 128, TOPK, 0, 1, HEADS, SM_SCALE,
-            emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
-            index_mxfp4=True, pages_per_block=1,
+            emit_sparse_block_table=True, max_query_len=S,
+            index_mxfp4=True,
             index_score=IndexScoreStep(wmap, max_block, out),
         )  # fmt: skip
         return score.clone(), sel
@@ -323,7 +320,7 @@ def test_a_captured_decode_follows_the_refilled_score_buffer():
         return minimax_m3_index_topk_decode(
             static_q, cache, static_table, static_seq, max_block * 128, TOPK, 0, 1,
             HEADS, SM_SCALE, emit_sparse_block_table=True, max_query_len=S,
-            block_page_stride=1, index_mxfp4=True, pages_per_block=1,
+            index_mxfp4=True,
             index_score=IndexScoreStep(wmap, max_block, out),
         )  # fmt: skip
 
@@ -342,8 +339,8 @@ def test_a_captured_decode_follows_the_refilled_score_buffer():
         torch.cuda.synchronize()
         want = minimax_m3_index_topk_decode(
             q, cache, t, s, max_block * 128, TOPK, 0, 1, HEADS, SM_SCALE,
-            emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
-            index_mxfp4=True, pages_per_block=1,
+            emit_sparse_block_table=True, max_query_len=S,
+            index_mxfp4=True,
         )  # fmt: skip
         for g, w in zip(got, want):
             assert torch.equal(g, w)
@@ -493,8 +490,8 @@ def _select(q, cache, table, seq, S, md, heads=HEADS):
     bound = table.shape[1]
     return minimax_m3_index_topk_decode(
         q, cache, table, seq, bound * 128, TOPK, 0, 1, heads, SM_SCALE,
-        emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
-        index_mxfp4=True, pages_per_block=1,
+        emit_sparse_block_table=True, max_query_len=S,
+        index_mxfp4=True,
         n_valid_column_per_row=md.n_valid_column_per_row,
         index_score=md.index_score,
     )  # fmt: skip
@@ -608,8 +605,8 @@ def test_an_eager_step_at_the_batch_block_count_selects_like_the_model_width(S, 
         assert md.index_score.max_block == (-(-max_seq // 128) if eager else 64)
         out = minimax_m3_index_topk_decode(
             q, cache, table, seq, max_seq, TOPK, 0, 1, heads, SM_SCALE,
-            emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
-            index_mxfp4=True, pages_per_block=1,
+            emit_sparse_block_table=True, max_query_len=S,
+            index_mxfp4=True,
             n_valid_column_per_row=md.n_valid_column_per_row,
             index_score=md.index_score,
         )  # fmt: skip

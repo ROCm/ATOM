@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""Which requests the decode index scorer and selector run (any index cache), and the
-MXFP4 scorer's per-ubatch buffers (CPU, bar one GPU case).
+"""Which requests the MXFP4 decode index scorer and selector run, and its
+per-ubatch buffers (CPU).
 
 The scorer takes its batch off the rows of ``idx_q``, so a padded decode step
 (a graph bucket, or an eager step padded for DP) must hand it that many lengths
@@ -166,60 +166,6 @@ def test_rows_that_are_not_a_batch_are_refused_not_clamped(
 
     with pytest.raises(ValueError, match="index decode"):
         index_batch(scheduled, running, tokens, q)
-
-
-@pytest.mark.parametrize(
-    "scheduled,running,tokens,q",
-    [(3, 8, 13, 8), (3, 8, 16, 8), (3, 4, 64, 8)],
-)
-def test_a_cache_without_the_scorer_buffers_takes_the_padded_batch_instead(
-    scheduled, running, tokens, q
-):
-    """The row counts a token graph makes (a block drafter's flat run, a prefill
-    bucket on decode rows) are no product of the ladder: the padded batch the base
-    cut its tables at stands for an index cache with no scorer buffers."""
-    from atom.model_ops.minimax_m3.index_mxfp4 import index_batch
-
-    assert index_batch(scheduled, running, tokens, q, strict=False) == running
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU and triton")
-@pytest.mark.parametrize("heads", [1, 2])
-@pytest.mark.parametrize("S", [1, 8])
-def test_a_padded_replay_of_any_index_cache_lays_bounds_out_at_the_captured_batch(
-    heads, S
-):
-    """BF16/FP8 index (no work map) at a width the aiter selector serves: 3 of 8
-    rows scheduled. The selector reads head h at offset h * 8 * S, so the builder's
-    `index_batch` must hand `make_sparse_decode_metadata` the 8 padded lengths for
-    this cache too, not the 3 scheduled ones."""
-    pytest.importorskip("triton")
-    from atom.model_ops.minimax_m3.index_mxfp4 import index_batch
-    from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
-
-    scheduled, running = 3, 8
-    lens = [300, 1000, 5000]
-    ctx = torch.zeros(running, dtype=torch.int32, device="cuda")  # pad rows 0
-    ctx[:scheduled] = torch.tensor(lens, dtype=torch.int32)
-    index_bs = index_batch(scheduled, running, running * S, S)
-    assert index_bs == running
-    md = make_sparse_decode_metadata(
-        seq_lens=ctx[:index_bs],
-        block_table=torch.zeros((index_bs, 4), dtype=torch.int32, device="cuda"),
-        slot_mapping=torch.zeros(running * S, dtype=torch.int64, device="cuda"),
-        max_seq_len=max(lens),
-        num_idx_heads=heads,
-        max_query_len=S,
-    )
-    assert md.index_score is None  # not the MXFP4 index
-    got = md.n_valid_column_per_row.view(heads, running * S).cpu()
-    # token t of request b sees ceil((len - S + t + 1) / 128) blocks; a pad row, 0
-    want = [
-        max(0, -(-(n - S + t + 1) // 128)) if n else 0
-        for n in ctx.tolist()
-        for t in range(S)
-    ]
-    assert got.tolist() == [want] * heads
 
 
 def test_each_ubatch_has_its_own_map_and_scores(mod):

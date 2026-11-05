@@ -63,16 +63,11 @@ def identity_of(tmp_path, monkeypatch, **kw):
     return calibration_identity(config, 0)
 
 
-def test_mxfp4_kv_does_not_share_an_fp8_identity(tmp_path, monkeypatch):
+def test_mxfp4_index_does_not_share_an_fp8_identity(tmp_path, monkeypatch):
     fp8 = identity_of(tmp_path, monkeypatch)
-    kv_mx = identity_of(tmp_path, monkeypatch, kv_cache_dtype="fp4")
-    assert fp8 != kv_mx
-    both = identity_of(
-        tmp_path, monkeypatch, kv_cache_dtype="fp4", index_cache_dtype="fp4"
-    )
-    index_only = identity_of(tmp_path, monkeypatch, index_cache_dtype="fp4")
-    assert both != index_only
+    index_mx = identity_of(tmp_path, monkeypatch, index_cache_dtype="fp4")
+    assert fp8 != index_mx
 
     data = {**profile(), "identity": fp8}
     with pytest.raises(ValueError):
-        validate_calibration(data, kv_mx, width=5, max_batch=4)
+        validate_calibration(data, index_mx, width=5, max_batch=4)

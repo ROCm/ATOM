@@ -496,7 +496,6 @@ def _flydsl_prepare_explicit_plan(
     existing_plan,
     plan_step_owner=None,
     plan_cache_owner=None,
-    plan_segment: int = 0,
 ):
     """Return the explicit plan aiter #5809 requires.
 
@@ -505,9 +504,6 @@ def _flydsl_prepare_explicit_plan(
     default budget.
     ``plan_step_owner``: a per-step object whose calls all share the same
     lengths; the plan is then refreshed once per step instead of every call.
-    ``plan_segment``: which slice of one call's rows this is, for a caller that
-    runs more rows than one plan takes in segments of equal size, each with a plan
-    of its own.
     ``plan_cache_owner``: the object that owns plan/scratch storage. Omit it
     for process-lifetime storage (required by captured decode graphs); sparse
     prefill passes its ephemeral metadata so variable row counts are released.
@@ -548,7 +544,6 @@ def _flydsl_prepare_explicit_plan(
         workgroup_budget,
         device.index,
         plan_step_owner is not None,
-        plan_segment,
     )
     plans = _FLYDSL_RUNTIME_PLANS
     if plan_cache_owner is not None:

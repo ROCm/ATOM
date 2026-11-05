@@ -18,7 +18,6 @@ def _hash(**overrides):
         "dcp_config": None,
         "enable_dp_attention": False,
         "index_cache_dtype": None,
-        "kv_cache_dtype": "fp8",
         "hf_config": SimpleNamespace(),
         "max_model_len": 4096,
         "max_num_seqs": 256,
@@ -35,11 +34,6 @@ def test_hash_is_stable():
 def test_hash_changes_with_max_model_len():
     # The sparse-attention indexer bakes max_model_len into the graph.
     assert _hash(max_model_len=12288) != _hash()
-
-
-def test_hash_changes_with_an_fp4_kv_cache():
-    # the MXFP4 KV graph differs from the fp8 one
-    assert _hash(kv_cache_dtype="fp4") != _hash()
 
 
 def test_hash_changes_with_max_num_seqs():
