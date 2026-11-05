@@ -69,6 +69,15 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
+from atom.model_engine.token_logprobs import (
+    LogprobRows,
+    TokenLogprob,
+    capture_token_logits,
+    gather_token_logprobs,
+    host_logprob_rows,
+    pack_token_logprobs,
+    unpack_token_logprobs,
+)
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
@@ -279,17 +288,14 @@ class tokenIDProcessor:
         cpu_tensor_handle.pop(0)
         return cpu_tensor
 
-    def recv_logprobs(self) -> list[float] | None:
+    def recv_logprobs(self) -> torch.Tensor | None:
         """Pop and return the earliest logprobs from the async copy queue.
         Must be called after recv_async_output, which waits for the copy that
         fills this tensor (the same copy_done covers both).
         """
         if not self.logprobs_cpu:
             return None
-        logprob_tensor = self.logprobs_cpu.pop(0)
-        if logprob_tensor is not None:
-            return logprob_tensor.tolist()
-        return None
+        return self.logprobs_cpu.pop(0)
 
     def send_draft_token_ids_to_cpu(self, gpu_tensor: torch.Tensor):
         # The next replay of this draft output follows a whole target forward.
@@ -381,7 +387,7 @@ class tokenIDProcessor:
         sync_event: torch.cuda.Event,
         sampled_logprobs: torch.Tensor | None = None,
         channel_states: torch.Tensor | None = None,
-    ) -> tuple[dict[int, tuple[int, ...]], dict[int, float] | None]:
+    ) -> tuple[dict[int, tuple[int, ...]], dict[int, list[TokenLogprob]] | None]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
@@ -391,12 +397,12 @@ class tokenIDProcessor:
                 processed = [(tid,) for tid in token_ids]
             ret = dict(zip(req_ids, processed))
             ret[-1] = 0  # is_deferred_out flag
-            logprobs_map = None
-            if sampled_logprobs is not None:
-                logprobs = sampled_logprobs.tolist()
-                logprobs_map = {
-                    seq_id: logprob for seq_id, logprob in zip(req_ids, logprobs)
-                }
+            payload = (
+                sampled_logprobs.to("cpu") if sampled_logprobs is not None else None
+            )
+            logprobs_map = unpack_token_logprobs(
+                payload, req_ids, ret, batch.return_logprobs
+            )
             return ret, logprobs_map
 
         token_ids = self.recv_async_output(self.token_ids_cpu)
@@ -421,10 +427,12 @@ class tokenIDProcessor:
                 processed = [(tid,) for tid in token_ids_list]
             token_id_dict = dict(zip(self.prev_req_ids, processed))
             if logprobs is not None:
-                logprobs_map = {
-                    seq_id: logprob
-                    for seq_id, logprob in zip(self.prev_req_ids, logprobs)
-                }
+                logprobs_map = unpack_token_logprobs(
+                    logprobs,
+                    self.prev_req_ids,
+                    token_id_dict,
+                    self.prev_batch.return_logprobs,
+                )
         else:
             # first time, no previous tokens
             token_ids = {}
@@ -1460,6 +1468,7 @@ class ModelRunner:
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         f32_kwargs = {"dtype": torch.float, "device": self.device}
 
+        logprob_width = getattr(getattr(self, "drafter", None), "mtp_k", 0) + 1
         # TODO: remove it in forward_context
         self.forward_vars = {
             "input_ids": self.tokenID_processor.input_ids,
@@ -1476,6 +1485,12 @@ class ModelRunner:
             ),
             "top_ps": CpuGpuBuffer(
                 self.max_bs, publication_group="sampling", **f32_kwargs
+            ),
+            # One staged buffer: requesting rows + model rows + sample rows.
+            "logprob_request_indices": CpuGpuBuffer(
+                self.max_bs * (1 + 2 * logprob_width),
+                publication_group="sampling",
+                **i64_kwargs,
             ),
             "required_channel_states": CpuGpuBuffer(
                 self.max_bs, publication_group="sampling", **i32_kwargs
@@ -2806,6 +2821,30 @@ class ModelRunner:
                 top_ps = top_p_buffer.gpu[:bs]
                 top_p_count = bs
 
+        logprob_count = None
+        batch.logprob_request_indices = None
+        batch.logprob_rows = None
+        if getattr(batch, "any_logprobs", False):
+            lengths, width = None, 1
+            if self._verifies_drafts(batch, batch.total_tokens_num_prefill > 0):
+                _, lengths, _ = self.attn_metadata_builder.decode_spans(batch)
+                width = self.drafter.mtp_k + 1
+            requested, model_rows, sample_rows = host_logprob_rows(
+                batch.logprob_requested, lengths, width
+            )
+            buffer = self.forward_vars["logprob_request_indices"]
+            n, m = len(requested), len(model_rows)
+            logprob_count = n + m + sample_rows.size
+            buffer.np[:n] = requested
+            buffer.np[n : n + m] = model_rows
+            buffer.np[n + m : logprob_count] = sample_rows.ravel()
+            batch.logprob_request_indices = buffer.gpu[:n]
+            batch.logprob_rows = LogprobRows(
+                batch.logprob_request_indices,
+                buffer.gpu[n : n + m],
+                buffer.gpu[n + m : logprob_count].view(n, width),
+            )
+
         # Read back by `postprocess` through `_constrain_required_channel`.
         channel_count = None
         if batch.required_channel is not None:
@@ -2824,6 +2863,7 @@ class ModelRunner:
         counts[group.indices["top_ks"]] = top_k_count
         counts[group.indices["top_ps"]] = top_p_count
         counts[group.indices["required_channel_states"]] = channel_count
+        counts[group.indices["logprob_request_indices"]] = logprob_count
         if publication_group is None:
             group.publish(counts)
         temperatures = temp_buffer.gpu[:bs]
@@ -3459,8 +3499,12 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
-        # Compute logprobs if any sequence requested them
-        need_logprobs = any(batch.return_logprobs)
+        # Keep probability payloads available on every participating rank.
+        need_logprobs = batch.any_logprobs
+        logprob_snapshot = None
+        logprob_rows = None
+        if need_logprobs:
+            logprob_rows = batch.logprob_rows
         structured = getattr(self, "structured_output", None)
         structured_requests = getattr(batch, "structured_requests", None)
         if structured_requests and structured is None:
@@ -3470,12 +3514,13 @@ class ModelRunner:
                 "Target logits do not match the prepared structured vocabulary"
             )
         structured_prefixes = {}
-        premask_lse = None
-        if structured_requests and need_logprobs and spec_decode_metadata is None:
-            # Keep main's scalar engine logprobs normalized to the raw model
-            # distribution, before either grammar or required-channel masks.
-            premask_lse = torch.logsumexp(logits[:bs].float(), dim=-1)
         if structured_requests:
+            if need_logprobs:
+                # Snapshot requested rows before either grammar or channel
+                # masking, including raw top candidates and token ranks.
+                logprob_snapshot = capture_token_logits(
+                    logits, batch, spec_decode_metadata, rows=logprob_rows
+                )
             structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
@@ -3490,9 +3535,11 @@ class ModelRunner:
             if (
                 need_logprobs
                 and batch.required_channel is not None
-                and premask_lse is None
+                and logprob_snapshot is None
             ):
-                premask_lse = torch.logsumexp(logits.float(), dim=-1)
+                logprob_snapshot = capture_token_logits(
+                    logits, batch, rows=logprob_rows
+                )
             channel = self._constrain_required_channel(batch, logits)
             sampled_tokens = self.sampler(
                 logits,
@@ -3517,7 +3564,6 @@ class ModelRunner:
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
-            premask_lse = None
             channel = self._constrain_required_channel(
                 batch, bonus_logits, spec_decode_metadata, target_logits
             )
@@ -3582,18 +3628,17 @@ class ModelRunner:
 
         sampled_logprobs = None
         if need_logprobs:
-            sampled_ids = sampled_tokens.to(torch.long).unsqueeze(-1)
-            if premask_lse is not None:
-                sampled_logprobs = (
-                    logits.gather(-1, sampled_ids).squeeze(-1).float() - premask_lse
-                )
-            else:
-                logits_fp32 = logits.float()
-                log_probs = torch.log_softmax(logits_fp32, dim=-1)
-                sampled_logprobs = log_probs.gather(-1, sampled_ids).squeeze(-1)
-            # No PCP broadcast: logprobs never feed the next forward and only
-            # worker 0's leave.
+            sampled_logprobs = gather_token_logprobs(
+                logits,
+                sampled_tokens,
+                batch,
+                spec_decode_metadata,
+                snapshot=logprob_snapshot,
+                rows=logprob_rows,
+            )
+            sampled_logprobs = pack_token_logprobs(*sampled_logprobs)
             if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
+                # One bit-preserving broadcast for scores, candidate IDs and ranks.
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
         self.forward_done_event.record()

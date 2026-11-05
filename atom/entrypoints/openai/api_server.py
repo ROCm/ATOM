@@ -51,6 +51,7 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import InputOutputProcessor, load_tokenizer
 from atom.model_engine.request import RequestOutput
+from atom.model_engine.segment_tokenizer import PrefixEncoding
 from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.multimodal.registry import get_native_multimodal_processor
@@ -85,6 +86,7 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
+from .logprobs import LogprobCollector, TokenBytes
 from .metrics_setup import create_metrics_exporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
@@ -579,6 +581,8 @@ def _build_sampling_params(
     n: int = 1,
     required_channel: RequiredChannel | None = None,
     max_tokens_is_default: bool = False,
+    logprobs: bool = False,
+    top_logprobs: int = 0,
 ) -> SamplingParams:
     from .model_capabilities import deployment_metadata
 
@@ -602,6 +606,8 @@ def _build_sampling_params(
         ignore_eos=ignore_eos,
         n=n,
         required_channel=required_channel,
+        logprobs=logprobs,
+        top_logprobs=top_logprobs,
     )
 
 
@@ -775,6 +781,8 @@ def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
         "started_at": started_at,
         "num_cached_tokens": getattr(request_output, "num_cached_tokens", 0),
     }
+    if request_output.logprobs is not None:
+        chunk_data["logprobs"] = request_output.logprobs
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
     return chunk_data
@@ -854,7 +862,7 @@ async def _submit_engine_requests(seqs):
 
 
 async def generate_async(
-    prompt_or_tokens: str | list[int],
+    prompt_or_tokens: str | list[int] | PrefixEncoding,
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
@@ -877,6 +885,7 @@ async def generate_async(
     # the counters and never `token_ids`, so nothing serializes it. A
     # consumer that starts reading that key has to convert.
     all_token_ids = new_token_ids()
+    all_logprobs = [] if sampling_params.logprobs else None
     finish_reason: str | None = None
     seq = None
     kv_transfer_output_meta_info = None
@@ -895,6 +904,7 @@ async def generate_async(
             token_queue.put_nowait,
             {
                 "token_ids": request_output.output_tokens,
+                "logprobs": request_output.logprobs,
                 "finished": request_output.finished,
                 "finish_reason": request_output.finish_reason,
                 "ts": now,
@@ -931,6 +941,8 @@ async def generate_async(
                     record_nonstream_first_token()
                 last_token_at = item.get("ts", time.time())
                 all_token_ids.extend(token_ids)
+                if all_logprobs is not None:
+                    all_logprobs.extend(item.get("logprobs") or [])
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
                 _finished_ok = True
@@ -950,7 +962,7 @@ async def generate_async(
                     engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
 
-    text = delivered_text(all_token_ids)
+    text = "" if sampling_params.logprobs else delivered_text(all_token_ids)
     num_tokens_input = (
         seq.num_prompt_tokens
         if seq is not None
@@ -975,6 +987,7 @@ async def generate_async(
     response = {
         "text": text,
         "token_ids": all_token_ids,
+        "logprobs": all_logprobs,
         "finish_reason": finish_reason,
         "num_tokens_input": num_tokens_input,
         "num_tokens_output": num_tokens_output,
@@ -1123,6 +1136,7 @@ async def generate_async_fanout(
 
     started_at = time.time()
     per_tokens = [new_token_ids() for _ in range(n)]
+    per_logprobs = [[] for _ in range(n)] if sampling_params.logprobs else None
     per_first_token_at: list[float | None] = [None] * n
     per_last_token_at: list[float | None] = [None] * n
     per_finish_reason: list[str | None] = [None] * n
@@ -1137,6 +1151,7 @@ async def generate_async_fanout(
                     idx,
                     {
                         "token_ids": request_output.output_tokens,
+                        "logprobs": request_output.logprobs,
                         "finished": request_output.finished,
                         "finish_reason": request_output.finish_reason,
                         "ts": now,
@@ -1185,6 +1200,8 @@ async def generate_async_fanout(
                     record_nonstream_first_token()
                 per_last_token_at[idx] = item.get("ts", time.time())
                 per_tokens[idx].extend(tokens)
+                if per_logprobs is not None:
+                    per_logprobs[idx].extend(item.get("logprobs") or [])
             if item.get("finished", False):
                 per_finish_reason[idx] = item.get("finish_reason")
                 finished[idx] = True
@@ -1217,8 +1234,11 @@ async def generate_async_fanout(
         )
         outputs.append(
             {
-                "text": delivered_text(per_tokens[i]),
+                "text": (
+                    "" if sampling_params.logprobs else delivered_text(per_tokens[i])
+                ),
                 "token_ids": per_tokens[i],
+                "logprobs": per_logprobs[i] if per_logprobs is not None else None,
                 "finish_reason": per_finish_reason[i],
                 "num_tokens_input": num_tokens_input,
                 "num_tokens_output": num_tokens_output,
@@ -1318,6 +1338,50 @@ def _prompt_headroom(
     return headroom
 
 
+def _prepare_prompt(
+    messages,
+    template_kwargs: dict[str, Any],
+    *,
+    tools,
+    preserve_tool_call_arguments: bool,
+    max_tokens: int,
+    kv_transfer_params: dict[str, Any] | None,
+) -> tuple[PrefixEncoding | list[int], str]:
+    """Render, tokenize the engine's way and cut to the context, in one
+    executor step for ``/v1/messages`` and ``/v1/responses``.
+
+    Returns ``(engine_input, text)``: what preprocess takes in place of the
+    prompt (no second tokenize), and the text the engine runs, which seeds the
+    reasoning channel. A prompt longer than the context minus the output
+    headroom is cut from the end; a context with no room for any prompt is
+    refused (ValueError, a 400)."""
+    prompt = apply_chat_template(
+        tokenizer,
+        custom_message_encoder,
+        messages,
+        tools=tools,
+        preserve_tool_call_arguments=preserve_tool_call_arguments,
+        **template_kwargs,
+    )
+    encoded = engine.io_processor.encode_prompt(prompt)
+    max_ctx = int(_get_engine_max_model_len() or 30720)
+    cap = max_ctx - _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
+    if cap < 1:
+        raise ValueError(
+            f"max_tokens={max_tokens} leaves no room for a prompt in this "
+            f"model's {max_ctx}-token context"
+        )
+    token_ids = encoded.token_ids if isinstance(encoded, PrefixEncoding) else encoded
+    if len(token_ids) <= cap:
+        return encoded, prompt
+    logger.warning("Prompt too long (%d > %d), truncating", len(token_ids), cap)
+    token_ids = list(token_ids[:cap])
+    text = tokenizer.decode(token_ids, skip_special_tokens=False)
+    if not text:
+        raise ValueError("The prompt is empty after truncation to the context")
+    return token_ids, text
+
+
 def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
     """Return the prefill's KV location to the PD router, as chat does."""
     if "kv_transfer_output_meta_info" in final_output:
@@ -1326,7 +1390,7 @@ def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
 
 
 async def setup_streaming_request(
-    prompt_or_tokens: str | list[int],
+    prompt_or_tokens: str | list[int] | PrefixEncoding,
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
@@ -1350,7 +1414,9 @@ async def setup_streaming_request(
     # The detokenizer lives in this closure, so it is freed when the engine
     # drops the callback on the stream's last chunk -- no registry, no cleanup.
     assert _stream_batch_dispatcher is not None
-    detokenizer = _stream_batch_dispatcher.new_state()
+    detokenizer = _stream_batch_dispatcher.new_state(
+        decode=not sampling_params.logprobs
+    )
 
     def stream_callback(request_output: RequestOutput) -> None:
         _send_stream_chunk_direct(
@@ -1561,7 +1627,9 @@ async def setup_streaming_request_fanout(
 
     def make_callback(idx: int):
         # One detokenizer per sibling, held by the closure that feeds it.
-        detokenizer = _stream_batch_dispatcher.new_state()
+        detokenizer = _stream_batch_dispatcher.new_state(
+            decode=not sampling_params.logprobs
+        )
 
         def _cb(request_output: RequestOutput) -> None:
             _send_stream_chunk_tagged(
@@ -1857,7 +1925,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         request.tools = normalize_chat_tools(request.tools)
         validate_chat_request(request)
         messages = request.get_messages()
-
+        logprob_codec = None
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
             merged_kwargs.update(request.chat_template_kwargs)
@@ -1896,10 +1964,24 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            logprobs=bool(request.logprobs),
+            top_logprobs=request.top_logprobs or 0,
             required_channel=channel_for_request(
                 required_tool_channel, request.tool_choice, request_tools(request)
             ),
         )
+
+        if request.logprobs:
+            sampling_params.validate_logprob_options(
+                _get_engine_config(),
+                kv_transfer=request.kv_transfer_params,
+                multimodal=_has_multimodal_content(messages),
+                synthetic=synthetic_token_text is not None,
+            )
+            logprob_codec = getattr(app.state, "logprob_codec", None)
+            if logprob_codec is None or logprob_codec.tokenizer is not tokenizer:
+                logprob_codec = TokenBytes(tokenizer)
+                app.state.logprob_codec = logprob_codec
 
         schema = schema_from_format(request.response_format)
 
@@ -1936,7 +2018,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             prompt_or_tokens = pretokenized
             kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
         else:
-            prompt_or_tokens = apply_chat_template(
+            prompt_or_tokens = await asyncio.to_thread(
+                apply_chat_template,
                 tokenizer,
                 custom_message_encoder,
                 messages,
@@ -1971,64 +2054,44 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         # Streaming
         if request.stream:
-            stream_input = prompt_or_tokens
-            stream_multimodal_data = multimodal_data
-            if effective_n > 1:
-                seq_ids, stream_collector, num_prompt_tokens = (
-                    await setup_streaming_request_fanout(
-                        stream_input,
-                        sampling_params,
-                        request_id,
-                        multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=kv_transfer_params,
-                        **dp_routing,
-                    )
-                )
-                gen = stream_chat_response_fanout(
-                    request_id,
-                    model_name,
+            setup = (
+                setup_streaming_request_fanout
+                if effective_n > 1
+                else setup_streaming_request
+            )
+            sequences, stream_collector, num_prompt_tokens = await setup(
+                prompt_or_tokens,
+                sampling_params,
+                request_id,
+                multimodal_data=multimodal_data,
+                kv_transfer_params=kv_transfer_params,
+                **dp_routing,
+            )
+            if logprob_codec is not None:
+                stream_collector = LogprobCollector(
                     stream_collector,
-                    seq_ids,
-                    num_prompt_tokens,
-                    cleanup_stream,
-                    cleanup_request,
-                    tools=request.tools,
-                    tool_choice=request.tool_choice,
-                    reasoning=_reasoning,
-                    tool_parser_cls=tool_call_parser_cls,
-                    usage_on_finish=compatibility.chat_usage_on_finish,
-                    include_usage=bool(
-                        (request.stream_options or {}).get("include_usage")
-                    ),
+                    logprob_codec,
+                    sampling_params.top_logprobs,
+                    effective_n,
                 )
-            else:
-                seq_id, stream_collector, num_prompt_tokens = (
-                    await setup_streaming_request(
-                        stream_input,
-                        sampling_params,
-                        request_id,
-                        multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=kv_transfer_params,
-                        **dp_routing,
-                    )
-                )
-                gen = stream_chat_response(
-                    request_id,
-                    model_name,
-                    stream_collector,
-                    seq_id,
-                    num_prompt_tokens,
-                    cleanup_stream,
-                    cleanup_request,
-                    tools=request.tools,
-                    tool_choice=request.tool_choice,
-                    reasoning=_reasoning,
-                    tool_parser_cls=tool_call_parser_cls,
-                    usage_on_finish=compatibility.chat_usage_on_finish,
-                    include_usage=bool(
-                        (request.stream_options or {}).get("include_usage")
-                    ),
-                )
+            stream_response = (
+                stream_chat_response_fanout if effective_n > 1 else stream_chat_response
+            )
+            gen = stream_response(
+                request_id,
+                model_name,
+                stream_collector,
+                sequences,
+                num_prompt_tokens,
+                cleanup_stream,
+                cleanup_request,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+                reasoning=_reasoning,
+                tool_parser_cls=tool_call_parser_cls,
+                usage_on_finish=compatibility.chat_usage_on_finish,
+                include_usage=bool((request.stream_options or {}).get("include_usage")),
+            )
             if schema is not None:
 
                 gen = validate_chat_stream(gen, schema)
@@ -2062,6 +2125,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=sampling_params.top_logprobs,
             )
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
@@ -2087,6 +2152,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=sampling_params.top_logprobs,
             )
         elif effective_n > 1:
             outputs = await _race_disconnect(
@@ -2111,6 +2178,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=sampling_params.top_logprobs,
             )
         else:
             final_output = await _run_nonstream_with_disconnect(
@@ -2136,6 +2205,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=sampling_params.top_logprobs,
             )
         if schema is not None:
 
@@ -2363,15 +2434,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # no such spelling, and are not answered here or on the chat path.
         if forbids_tool_calls(request.tool_choice):
             merged_kwargs["tool_choice"] = "none"
-        prompt = apply_chat_template(
-            tokenizer,
-            custom_message_encoder,
-            messages,
-            tools=anthropic_to_openai_tools(request.tools),
-            preserve_tool_call_arguments=preserve_tool_call_arguments,
-            **merged_kwargs,
-        )
-
         generation_config = engine.config.generation_config
         model_temperature = getattr(generation_config, "temperature", None)
         model_top_p = getattr(generation_config, "top_p", None)
@@ -2400,47 +2462,23 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         request_id = uuid.uuid4().hex[:24]
         set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
-        input_tokens = len(tokenizer.encode(prompt))
-
-        max_ctx = None
-        for _path in (
-            lambda: engine.config.max_model_len,
-            lambda: engine.model_config.max_model_len,
-            lambda: engine.scheduler.max_model_len,
-            lambda: engine.max_model_len,
-        ):
-            try:
-                _v = _path()
-                if _v:
-                    max_ctx = int(_v)
-                    break
-            except Exception:
-                logger.debug("max_ctx candidate rejected", exc_info=True)
-                continue
-        if not max_ctx:
-            max_ctx = 30720
-        logger.warning(f"[anthropic] resolved max_ctx={max_ctx}")
-        headroom = _prompt_headroom(
-            sampling_params.max_tokens, max_ctx, kv_transfer_params
+        engine_input, prompt = await asyncio.to_thread(
+            _prepare_prompt,
+            messages,
+            merged_kwargs,
+            tools=anthropic_to_openai_tools(request.tools),
+            preserve_tool_call_arguments=preserve_tool_call_arguments,
+            max_tokens=sampling_params.max_tokens,
+            kv_transfer_params=kv_transfer_params,
         )
-        max_input = max_ctx - headroom
-        if input_tokens > max_input:
-            logger.warning(
-                f"Prompt too long ({input_tokens} > {max_input}), truncating"
-            )
-            token_ids = tokenizer.encode(prompt)[:max_input]
-            prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
-            input_tokens = max_input
 
         if request.stream:
             # Streaming response
-            seq_id, stream_collector, _num_prompt_tokens = (
-                await setup_streaming_request(
-                    prompt,
-                    sampling_params,
-                    request_id,
-                    kv_transfer_params=kv_transfer_params,
-                )
+            seq_id, stream_collector, input_tokens = await setup_streaming_request(
+                engine_input,
+                sampling_params,
+                request_id,
+                kv_transfer_params=kv_transfer_params,
             )
 
             async def generate_anthropic_stream():
@@ -2616,7 +2654,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # Non-streaming response
         final_output = await _run_nonstream_with_disconnect(
             generate_async(
-                prompt,
+                engine_input,
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
@@ -2626,6 +2664,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
         if final_output is None:
             raise RuntimeError("No output generated")
+        input_tokens = final_output["num_tokens_input"]
 
         raw_text = final_output["text"]
         # Separating is unconditional -- the same call the chat path makes,
@@ -2651,7 +2690,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if drop_reasoning:
             events = [e for e in events if e[0] != "reasoning"]
         _, tool_calls = flatten_tool_events(events)
-        output_tokens = len(tokenizer.encode(raw_text))
+        output_tokens = final_output["num_tokens_output"]
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         response = build_anthropic_response(
             request_id=request_id,
@@ -2801,15 +2840,6 @@ async def responses_create(raw_request: Request):
             rules=rules,
         )
 
-        prompt = apply_chat_template(
-            tokenizer,
-            custom_message_encoder,
-            messages,
-            tools=openai_tools,
-            preserve_tool_call_arguments=preserve_tool_call_arguments,
-            **merged_kwargs,
-        )
-
         generation_config = engine.config.generation_config
         model_temperature = getattr(generation_config, "temperature", None)
         model_top_p = getattr(generation_config, "top_p", None)
@@ -2846,30 +2876,15 @@ async def responses_create(raw_request: Request):
         schema = schema_from_format((text_config or {}).get("format"), responses=True)
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
         set_request_id(request_id)
-        input_tokens = len(tokenizer.encode(prompt))
-
-        max_ctx = 30720
-        for obj in (
-            getattr(engine, "config", None),
-            getattr(engine, "model_config", None),
-            getattr(engine, "scheduler", None),
-            engine,
-        ):
-            value = getattr(obj, "max_model_len", None) if obj is not None else None
-            if value:
-                max_ctx = int(value)
-                break
-        headroom = _prompt_headroom(
-            sampling_params.max_tokens, max_ctx, kv_transfer_params
+        engine_input, prompt = await asyncio.to_thread(
+            _prepare_prompt,
+            messages,
+            merged_kwargs,
+            tools=openai_tools,
+            preserve_tool_call_arguments=preserve_tool_call_arguments,
+            max_tokens=sampling_params.max_tokens,
+            kv_transfer_params=kv_transfer_params,
         )
-        max_input = max_ctx - headroom
-        if input_tokens > max_input:
-            logger.warning(
-                f"Prompt too long ({input_tokens} > {max_input}), truncating"
-            )
-            token_ids = tokenizer.encode(prompt)[:max_input]
-            prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
-            input_tokens = max_input
 
         created_at = int(time.time())
         _reasoning = reasoning_channel(
@@ -2887,13 +2902,11 @@ async def responses_create(raw_request: Request):
         _reasoning = structured_response_channel(_reasoning, schema)
 
         if request.stream:
-            seq_id, stream_collector, _num_prompt_tokens = (
-                await setup_streaming_request(
-                    prompt,
-                    sampling_params,
-                    request_id,
-                    kv_transfer_params=kv_transfer_params,
-                )
+            seq_id, stream_collector, input_tokens = await setup_streaming_request(
+                engine_input,
+                sampling_params,
+                request_id,
+                kv_transfer_params=kv_transfer_params,
             )
 
             async def generate_responses_stream():
@@ -3008,7 +3021,7 @@ async def responses_create(raw_request: Request):
 
         final_output = await _run_nonstream_with_disconnect(
             generate_async(
-                prompt,
+                engine_input,
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
@@ -3018,6 +3031,7 @@ async def responses_create(raw_request: Request):
         )
         if final_output is None:
             raise RuntimeError("No output generated")
+        input_tokens = final_output["num_tokens_input"]
 
         raw_text = final_output["text"]
         events = read_whole_blocks(
@@ -3028,7 +3042,7 @@ async def responses_create(raw_request: Request):
             suppress_calls=forbids_tool_calls(request.tool_choice),
             stopped=ended_by_stop(final_output.get("finish_reason")),
         )
-        output_tokens = len(tokenizer.encode(raw_text))
+        output_tokens = final_output["num_tokens_output"]
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         response = build_responses_response(
             request_id=request_id,

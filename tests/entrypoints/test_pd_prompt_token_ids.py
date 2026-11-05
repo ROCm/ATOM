@@ -321,6 +321,7 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(
         stream_callback(
             SimpleNamespace(
                 output_tokens=[5],
+                logprobs=None,
                 finished=True,
                 finish_reason="eos",
                 num_cached_tokens=0,

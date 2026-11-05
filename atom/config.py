@@ -2126,6 +2126,9 @@ class Config:
     compilation_config: CompilationConfig = field(default_factory=CompilationConfig)
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
+    # Queue finished sequences on outputs_queue; only its readers turn it on
+    # (LLMEngine.add_request for step / generate, and asyncio_mode).
+    keep_finished_outputs: bool = False
     mark_trace: bool = False
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
