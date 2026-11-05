@@ -113,8 +113,10 @@ class SPMegaMoE:
         # A copy not read yet; launches enqueued after the last copy.
         self._copy_pending = self._uncopied = False
         self._runs = {}
+        self.failed = False
 
     def _timed_out(self, bits):
+        self.failed = True
         raise RuntimeError(
             f"SP MegaMoE rank {self.runtime.cfg.rank}: a MegaMoeTP wait timed out "
             f"(error bits {bits:#x}); the output of a recent step is invalid."
@@ -171,8 +173,10 @@ class SPMegaMoE:
 
     def close(self):
         """Collective over the SP group: every rank calls it before the group
-        is destroyed."""
-        self.runtime.close()
+        is destroyed. Skipped after a timeout, which peers may not have seen:
+        its CPU barrier would block this rank's exit instead."""
+        if not self.failed:
+            self.runtime.close()
 
     def runs(self, rows):
         """Whether MegaMoE takes a step: only where the native MoE quantizes

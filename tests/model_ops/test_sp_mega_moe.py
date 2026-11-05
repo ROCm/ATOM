@@ -321,11 +321,11 @@ def test_only_megamoe_steps_are_counted(monkeypatch, host_copies):
     assert backend.launches == 0
 
 
-def test_timed_out_launch_fails_a_later_step(host_copies):
+def test_timed_out_launch_fails_a_later_step_and_skips_the_close(host_copies):
     # The step's output is already invalid; later steps must not run on.
     flag = torch.zeros(1, dtype=torch.int32)
     runtime = SimpleNamespace(
-        error_flag=lambda: flag, cfg=Mock(rank=2), max_local_tokens=16
+        error_flag=lambda: flag, cfg=Mock(rank=2), max_local_tokens=16, close=Mock()
     )
     backend = _counted(runtime)
     backend.before_step(16)
@@ -333,6 +333,11 @@ def test_timed_out_launch_fails_a_later_step(host_copies):
     backend.before_step(1)
     with pytest.raises(RuntimeError, match="rank 2: a MegaMoeTP wait timed out"):
         backend.before_step(1)
+    # Peers still in the step would never reach the collective close().
+    backend.close()
+    runtime.close.assert_not_called()
+    _counted(runtime).close()
+    runtime.close.assert_called_once_with()
 
 
 @pytest.mark.parametrize("local,peer", [(4, 0), (0, 4)])
