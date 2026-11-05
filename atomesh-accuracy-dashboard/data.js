@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793810682533,
+  "lastUpdate": 1793897758234,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4762,6 +4762,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8976,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41864849595 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611041513 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1721 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "IvanShan177",
+            "username": "IvanShan177",
+            "email": "ivans@neuro-spark.ai"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "76cd90aa1c74113e09f77c7e3bf09ff1bf815e39",
+          "message": "[Kimi-K3] Keep image alpha for processors that fill transparent backgrounds (#3002)\n\n* [Kimi-K3] Keep image alpha for processors that fill transparent backgrounds\n\n`load_image` converted every image to RGB, which composites transparent\npixels on black: dark content on a transparent background (text, diagrams,\nlogos) disappears before the model sees it. The Kimi-K3 processor has its own\ntransparent-background fill (a configured chessboard) but only applies it to\nRGBA input, so it never ran.\n\n`load_image` / `MediaLoader.load_image` take `keep_alpha` (default False), which\nkeeps transparent images (alpha band or palette transparency) as RGBA.\n`prepare_multimodal_inputs` requests it when the model's input builder declares\n`keeps_alpha`; the Kimi-K3 builder does. Every other model and every opaque\nimage is unchanged.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* [Kimi-K3] Address review: one load path, keep alpha only when it is used\n\n- keep_alpha is threaded through load_multimodal_data / MediaLoader.load\n  instead of a second image loop in prepare_multimodal_inputs. It is passed\n  to image loads only when requested, so a loader that overrides `load`\n  without it still serves every other request.\n- An image is kept as RGBA only when some pixel is not fully opaque: an\n  alpha band (or palette transparency) that is all 255 now returns RGB.\n  Tests cover the opaque RGBA case and the threaded flag.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* [Kimi-K3] Address review: the loader keeps the decoded mode, processors convert\n\nload_image no longer converts to RGB; each model's processor owns color\nconversion (DeepSeek-V4.1 converts explicitly, Qwen and MiniMax-M3 through\ndo_convert_rgb, Kimi-K3's processor fills transparent backgrounds itself).\nThis drops keep_alpha, keeps_alpha and the load() shim. The tests move into\ntest_multimodal_inputs.py and compare against the Kimi-K3 checkpoint\nprocessor when ATOM_KIMI_K3_REFERENCE is set.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-05T16:38:57Z",
+          "url": "https://github.com/ROCm/ATOM/commit/76cd90aa1c74113e09f77c7e3bf09ff1bf815e39"
+        },
+        "date": 1793897757616,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9477,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/42062283041 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611051503 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9447 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8939,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/42062283041 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611051503 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1585 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
