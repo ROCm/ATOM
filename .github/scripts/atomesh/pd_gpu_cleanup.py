@@ -146,11 +146,10 @@ class Cleanup:
     def stop_containers(self):
         suffix = r"(?:-benchmark|-eval|-router|-benchmark-router|-eval-router)?"
         if self.targets is None:
-            patterns = [
-                re.compile(
-                    rf"atomesh-{re.escape(self.args.cell_id)}-([0-9]+)-[0-9]+" + suffix
-                )
-            ]
+            cell = re.escape(self.args.cell_id)
+            if self.args.cell_prefix:
+                cell = re.escape(self.args.cell_prefix) + r"[a-zA-Z0-9_.-]*"
+            patterns = [re.compile(rf"atomesh-{cell}-([0-9]+)-[0-9]+" + suffix)]
         else:
             patterns = [
                 re.compile(rf"atomesh-{re.escape(cell)}-({job})-[0-9]+" + suffix)
@@ -256,6 +255,11 @@ def main():
         type=Path,
         help="Optional exact cell/job allowlist from terminal archives",
     )
+    parser.add_argument(
+        "--cell-prefix",
+        default="",
+        help="Also stop finished jobs' containers of sibling cells with this prefix",
+    )
     parser.add_argument("--required-free-ratio", type=float, default=0.88)
     args = parser.parse_args()
     if None in (
@@ -269,6 +273,8 @@ def main():
         parser.error("cleanup requires allocation, node, rank, token and output path")
     if not 0 < args.required_free_ratio < 1:
         parser.error("required-free-ratio must be between zero and one")
+    if not args.cell_id.startswith(args.cell_prefix):
+        parser.error("cell-prefix must be a prefix of cell-id")
     cleanup = Cleanup(args)
     try:
         cleanup.run()

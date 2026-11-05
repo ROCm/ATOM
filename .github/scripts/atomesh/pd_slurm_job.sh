@@ -247,6 +247,8 @@ pre_cleanup_local() {
   if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
     cleanup_args=(--targets "${REPO_ROOT}/.github/benchmark/c48-model-gap/cleanup-targets.json"
                   --required-free-ratio 0.95)
+  elif [[ -n "${ATOMESH_ENV_ATOMESH_PRE_CLEAN_CELL_PREFIX:-}" ]]; then
+    cleanup_args=(--cell-prefix "${ATOMESH_ENV_ATOMESH_PRE_CLEAN_CELL_PREFIX}")
   fi
   timeout --kill-after=2s 120s python3 \
     "${REPO_ROOT}/.github/scripts/atomesh/pd_gpu_cleanup.py" \

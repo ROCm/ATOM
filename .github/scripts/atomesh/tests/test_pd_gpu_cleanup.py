@@ -39,6 +39,7 @@ class CleanupTest(unittest.TestCase):
             cell_id="c48-vq",
             out=root / "result.json",
             targets=self.manifest,
+            cell_prefix="",
             required_free_ratio=0.95,
         )
         self.calls = []
@@ -101,6 +102,21 @@ class CleanupTest(unittest.TestCase):
         kinds = [e["kind"] for e in result.report["events"]]
         self.assertIn("skip_active_container", kinds)
         self.assertIn("skip_different_owner", kinds)
+
+    def test_cell_prefix_removes_inactive_sibling_cells_only(self):
+        self.args.targets, self.args.cell_id, self.args.cell_prefix = (
+            None,
+            "m31-c64-vllm",
+            "m31-",
+        )
+        sibling = self.add_container(1, "atomesh-m31-c96-vllm-12222-0-router")
+        active = self.add_container(2, "atomesh-m31-c48-vllm-9001-0")
+        other_task = self.add_container(3, "atomesh-k3-c48-vllm-8068-0")
+        other_user = self.add_container(4, "atomesh-m31-c96-vllm-12222-1", "101:200")
+        self.active.add("9001")
+        self.invoke()
+        self.assertEqual(set(self.containers), {active, other_task, other_user})
+        self.assertNotIn(sibling, self.containers)
 
     def test_rechecks_queue_after_inspection_before_stopping(self):
         self.add_container(1, "atomesh-c48-v0-8068-0")
