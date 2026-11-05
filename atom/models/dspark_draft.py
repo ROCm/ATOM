@@ -185,6 +185,11 @@ class DSparkDraftModel(nn.Module):
     # the proposer plans. A draft that attends its block another way (MiniMax-
     # M3.1's per-row MHA decode) builds what it reads in `prepare_paged_block`.
     block_attention_is_mla = True
+    # Whether `project_context` works row by row and every context layer splits
+    # `write_context_kv` into `context_kv_rows` (also row by row) and
+    # `write_context_kv_rows`, so a PCP prefill projects each rank's own rows
+    # and gathers the projected KV, not the aux states.
+    context_kv_by_rows = False
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
         """Mask padded writes for models whose draft pass mutates private KV."""

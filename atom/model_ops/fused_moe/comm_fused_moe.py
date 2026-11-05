@@ -17,7 +17,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode
 
 from atom.config import get_current_atom_config
-from atom.model_ops.fused_moe.routed_rows import gather_rows
+from atom.distributed.pcp_utils import gather_rows
 from atom.model_ops.topK import reassign_gathered_shared_ids
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op

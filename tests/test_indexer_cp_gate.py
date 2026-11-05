@@ -112,6 +112,7 @@ def _hash_with(indexer_dcp_only: bool) -> str:
         dcp_config=SimpleNamespace(indexer_dcp_only=indexer_dcp_only),
         enable_dp_attention=False,
         index_cache_dtype="fp8",
+        kv_cache_dtype="fp8",
         hf_config=SimpleNamespace(),
         max_model_len=4096,
         max_num_seqs=256,
