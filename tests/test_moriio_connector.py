@@ -1739,6 +1739,40 @@ class RegionPlanTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.make([other, self.local[1]])._remote_regions("decode")
 
+    def test_of_keeps_each_unit_inside_one_chunk(self):
+        region = type(
+            "Region",
+            (),
+            {
+                "unit_bytes": 10,
+                "total_bytes": 80,
+                "base_addr": 1000,
+                "reverse_indexed": False,
+            },
+        )()
+        built = self.Region.of("page.0.kv", "page", region)
+        self.assertEqual(built.chunk_bytes % built.unit, 0)
+        covered = 0
+        for ptr, size in built.chunks():
+            self.assertEqual((ptr - built.base) % built.unit, 0)
+            self.assertEqual(size % built.unit, 0)
+            covered += size
+        self.assertEqual(covered, built.total)
+
+    def test_of_rejects_a_unit_over_the_rdma_limit(self):
+        region = type(
+            "Region",
+            (),
+            {
+                "unit_bytes": 41,
+                "total_bytes": 41,
+                "base_addr": 0,
+                "reverse_indexed": False,
+            },
+        )()
+        with self.assertRaises(ValueError):
+            self.Region.of("page.0.kv", "page", region)
+
 
 if __name__ == "__main__":
     unittest.main()

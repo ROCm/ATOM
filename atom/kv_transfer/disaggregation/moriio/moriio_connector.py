@@ -576,6 +576,7 @@ class MoRIIOConnector(KVConnectorBase):
         except Exception:
             if not statuses:
                 raise
+            # The queued write has to settle before the source blocks are released.
             logger.exception(
                 "transfer %s: could not post every write", request["transfer_id"]
             )
