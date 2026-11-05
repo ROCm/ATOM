@@ -1375,18 +1375,14 @@ def minimax_m3_index_topk_decode(
     n_valid_column_per_row: torch.Tensor | None = None,
     index_mxfp4: bool = False,
     pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
-    index_score_work_map: torch.Tensor | None = None,
-    index_score_max_block: int = 0,
-    index_score_out: torch.Tensor | None = None,
+    index_score=None,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
     ``index_mxfp4`` and ``pages_per_block`` as in :func:`minimax_m3_index_topk`.
-    The MXFP4 scorer takes the step's ``index_score_work_map``
-    (``MiniMaxM3SparseMetadata``) and stores the scores ``index_score_max_block`` wide -- the bound the map was built against,
-    which does not move between graph replays; omitted, it builds its own. It stores
-    them into the step's ``index_score_out`` (-inf filled once a step); omitted, it
-    allocates and fills its own.
+    The MXFP4 scorer takes the step's ``index_score`` (``IndexScoreStep``: work map,
+    the block bound it was built against, which does not move between graph replays,
+    and the -inf filled score storage); omitted, it builds and allocates its own.
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
@@ -1443,8 +1439,18 @@ def minimax_m3_index_topk_decode(
     if index_mxfp4:
         from atom.model_ops.minimax_m3.index_mxfp4 import decode_score_mxfp4
 
-        score_max_block = max(max_block, index_score_max_block)
+        step = index_score
+        score_max_block = max(max_block, step.max_block if step else 0)
         _require_packable(score_max_block)
+        if (
+            step is not None
+            and step.out is not None
+            and step.out.shape[-1] != score_max_block
+        ):
+            raise ValueError(
+                f"index_score.out is {step.out.shape[-1]} blocks wide, the "
+                f"scorer's bound is {score_max_block}"
+            )
         score = decode_score_mxfp4(
             idx_q,
             index_kv_cache,
@@ -1454,14 +1460,8 @@ def minimax_m3_index_topk_decode(
             max_query_len,
             num_idx_heads,
             sm_scale,
-            index_score_work_map,
-            # a buffer for another bound is the scorer's to refuse, not ours to feed
-            (
-                index_score_out
-                if index_score_out is not None
-                and index_score_out.shape[-1] == score_max_block
-                else None
-            ),
+            step.work_map if step else None,
+            step.out if step else None,
         )
     else:
         score = _triton_decode_score(

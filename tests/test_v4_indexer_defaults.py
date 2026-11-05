@@ -7,7 +7,6 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
-import torch
 from transformers import PretrainedConfig
 
 import atom.config as config_module
@@ -37,7 +36,6 @@ def _install_chip_info_stub(monkeypatch, get_gfx) -> None:
     utils.__path__ = []
     chip_info = ModuleType("aiter.jit.utils.chip_info")
     chip_info.get_gfx = get_gfx
-    chip_info.get_gfx_runtime = get_gfx
 
     aiter.jit = jit
     jit.utils = utils
@@ -89,7 +87,6 @@ def _make_config(
     *,
     gfx: str = "gfx950",
     architectures: list[str] | None = None,
-    hf: dict | None = None,
     **overrides,
 ):
     hf_config = PretrainedConfig(
@@ -97,8 +94,6 @@ def _make_config(
             ["DeepseekV4ForCausalLM"] if architectures is None else architectures
         ),
         max_position_embeddings=8192,
-        sparse_attention_config={"sparse_local_block": 1, "sparse_block_size": 128},
-        **(hf or {}),
     )
     monkeypatch.setattr(
         config_module,
@@ -109,9 +104,7 @@ def _make_config(
     monkeypatch.setattr(
         config_module,
         "QuantizationConfig",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            exclude_layers=[], compute_hash=lambda: ""
-        ),
+        lambda *_args, **_kwargs: SimpleNamespace(exclude_layers=[]),
     )
     monkeypatch.setattr(
         config_module,
@@ -208,125 +201,9 @@ def test_non_fp4_indexer_predicate_does_not_query_arch(monkeypatch):
     assert probe.calls == 0
 
 
-M3 = ["MiniMaxM3SparseForConditionalGeneration"]
-
-
-def _m3(monkeypatch, **overrides):
-    return _make_config(
-        monkeypatch, architectures=M3, kv_cache_block_size=128, **overrides
-    )[0]
-
-
-@pytest.mark.parametrize(
-    ("kv", "index", "want"),
-    [
-        # KV-only: the index default follows the fp8 storage dtype.
-        ("fp4", None, ("fp8", True, "fp8")),
-        # index-only: KV stays as asked.
-        ("bf16", "fp4", ("bf16", False, "fp4")),
-        ("fp4", "fp4", ("fp8", True, "fp4")),
-        ("fp4", "fp8", ("fp8", True, "fp8")),
-        ("fp8", None, ("fp8", False, "fp8")),
-    ],
-)
-def test_m3_public_fp4_keeps_the_index_and_maps_the_kv(monkeypatch, kv, index, want):
-    config = _m3(monkeypatch, kv_cache_dtype=kv, index_cache_dtype=index)
-
-    assert (
-        config.kv_cache_dtype,
-        config.kv_mxfp4,
-        config.index_cache_dtype,
-    ) == want
-
-
-def test_m3_fp4_caches_are_normalised_before_the_cp_fallback(monkeypatch, caplog):
-    with caplog.at_level("WARNING", logger="atom"):
-        config = _m3(
-            monkeypatch,
-            kv_cache_dtype="fp4",
-            index_cache_dtype="fp4",
-            tensor_parallel_size=4,
-            hf={"num_key_value_heads": 4},
-            dcp_config=config_module.DCPConfig(indexer_dcp_only=True),
-        )
-
-    assert config.dcp_config.indexer_dcp_only is False
-    assert "MXFP4 caches are not wired to the CP scorer" in caplog.text
-
-
-def test_m3_fp4_keeps_the_m3_startup_refusals(monkeypatch):
-    with pytest.raises(ValueError, match="MXFP4 pages are 128 tokens"):
-        _make_config(
-            monkeypatch, architectures=M3, kv_cache_dtype="fp4", kv_cache_block_size=16
-        )
-
-
-def test_m3_fp4_hashes_apart_from_fp8(monkeypatch):
-    fp8 = _m3(monkeypatch, kv_cache_dtype="fp8", index_cache_dtype="fp8")
-    fp4 = _m3(monkeypatch, kv_cache_dtype="fp4", index_cache_dtype="fp4")
-    kv_only = _m3(monkeypatch, kv_cache_dtype="fp4", index_cache_dtype="fp8")
-
-    assert len({fp8.compute_hash(), fp4.compute_hash(), kv_only.compute_hash()}) == 3
-
-
-def test_an_fp16_m3_refuses_mxfp4_kv_at_startup(monkeypatch):
-    # aiter's MXFP4 pa_decode writes bf16 only, so the KV flavor needs a bf16 model
-    for kv in ("fp4", "fp8"):
-        flag = {"kv_mxfp4": True} if kv == "fp8" else {}
-        with pytest.raises(ValueError, match="needs a bfloat16 model"):
-            _m3(
-                monkeypatch,
-                kv_cache_dtype="fp4" if kv == "fp4" else "fp8",
-                hf={"dtype": torch.float16},
-                **flag,
-            )
-    # bf16 passes; the MXFP4 index alone (and fp8 KV) never reach that kernel
-    assert _m3(monkeypatch, kv_cache_dtype="fp4").kv_mxfp4
-    for dtype in (torch.bfloat16, torch.float16):
-        config = _m3(
-            monkeypatch,
-            kv_cache_dtype="bf16",
-            index_cache_dtype="fp4",
-            hf={"dtype": dtype},
-        )
-        assert (config.kv_mxfp4, config.index_cache_dtype) == (False, "fp4")
-
-
-def test_an_m3_export_named_only_by_model_type_gets_the_m3_mapping(monkeypatch):
-    # `_is_minimax_m3_config` (the builder's and the offload layout's test) also
-    # reads `model_type`; the MXFP4 gate must agree with it.
-    config = _make_config(
-        monkeypatch,
-        architectures=["SomeOtherForCausalLM"],
-        hf={"model_type": "minimax_m3"},
-        kv_cache_block_size=128,
-        kv_cache_dtype="fp4",
-        index_cache_dtype="fp4",
-    )[0]
-
-    assert (config.kv_cache_dtype, config.kv_mxfp4, config.index_cache_dtype) == (
-        "fp8",
-        True,
-        "fp4",
-    )
-
-
-def test_a_kv_mxfp4_flag_on_another_model_is_refused(monkeypatch):
-    # not reachable from the CLI (only M3 derives it), but the field is settable
-    with pytest.raises(ValueError, match="MiniMax-M3 only"):
-        _make_config(monkeypatch, kv_cache_dtype="fp8", kv_mxfp4=True)
-
-
 def test_v4_keeps_its_fp4_indexer_and_refuses_a_fp4_kv(monkeypatch):
     config, _ = _make_config(monkeypatch, index_cache_dtype="fp4")
-    assert (config.kv_mxfp4, config.index_cache_dtype) == (False, "fp4")
+    assert (config.kv_cache_dtype, config.index_cache_dtype) == ("fp8", "fp4")
 
     with pytest.raises(ValueError, match="MiniMax-M3 and DeepSeek-V4.1 only"):
         _make_config(monkeypatch, kv_cache_dtype="fp4")
-
-
-def test_other_models_refuse_a_fp4_kv(monkeypatch):
-    with pytest.raises(ValueError, match="MiniMax-M3 and DeepSeek-V4.1 only"):
-        _make_config(
-            monkeypatch, architectures=["Glm5NextForCausalLM"], kv_cache_dtype="fp4"
-        )

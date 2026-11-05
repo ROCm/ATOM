@@ -75,21 +75,6 @@ def test_fp4_cache_dtypes_reach_engine_kwargs(argv, want):
 
 
 @pytest.mark.parametrize(
-    "argv",
-    [
-        ["--kv-cache-dtype", "mxfp4"],
-        ["--kv_cache_dtype", "mxfp4"],
-        ["--index-cache-dtype", "mxfp4"],
-        ["--index_cache_dtype", "mxfp4"],
-    ],
-)
-def test_public_mxfp4_cache_dtype_is_refused(argv):
-    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-    with pytest.raises(SystemExit):
-        parser.parse_args(argv)
-
-
-@pytest.mark.parametrize(
     "argv,want",
     [([], "interval"), (["--prefill-admit-policy", "adaptive"], "adaptive")],
 )

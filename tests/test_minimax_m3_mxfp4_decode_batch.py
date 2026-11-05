@@ -48,69 +48,90 @@ def builder(mod, mxfp4=True, tbo_decode=True, forward_vars=None):
     return b
 
 
-# (max_bs, max_qlen, H, TRANSPOSE_MIN_F) -> rows of the score storage: only steps
-# with q * H below the scorer's threshold read it
-@pytest.mark.parametrize(
-    "max_bs,max_qlen,heads,want",
-    [
-        (16, 8, 1, 16 * 8),  # TP4: every width up to 8 reads it
-        (16, 8, 2, 16 * 7),  # TP2: S=8 is transposed
-        (16, 8, 4, 16 * 3),  # TP1: S >= 4 is transposed
-        (16, 1, 4, 16),  # no speculation
-        (16, 8, 16, 0),  # even S=1 is transposed
-        (0, 8, 1, 0),
-    ],
-)
-def test_the_score_storage_has_rows_only_for_the_widths_that_read_it(
-    max_bs, max_qlen, heads, want
-):
-    from atom.model_ops.minimax_m3.index_mxfp4 import index_score_rows
-
-    assert index_score_rows(max_bs, max_qlen, heads, 16) == want
-
-
-def _assert_rows_match_fresh_index_score(heads, transpose_min_f):
-    """`index_score_rows` and `fresh_index_score` apply one predicate: no step width
-    gets a view bigger than the buffer, and the wider ones get None."""
+def _check_score_view(heads, S, transpose_min_f, neg_inf):
     from atom.model_ops.minimax_m3.index_mxfp4 import (
         fresh_index_score,
         index_score_buffer,
-        index_score_rows,
     )
 
-    max_bs, max_qlen, max_block = 4, 8, 3
-    rows = index_score_rows(max_bs, max_qlen, heads, transpose_min_f)
-    buf = index_score_buffer(rows, heads, max_block, "cpu")
-    for S in range(1, max_qlen + 1):
-        for batch in range(1, max_bs + 1):
-            out = fresh_index_score(buf, batch * S, heads, max_block, S)
-            assert (out is None) == (S * heads >= transpose_min_f)
+    batch, max_block, fill = 3, 6, 4
+    rows = batch * S
+    buf = index_score_buffer(8 * 8, heads, max_block, "cpu").fill_(7.0)
+    out = fresh_index_score(buf, rows, heads, max_block, S, fill_blocks=fill)
+    assert out.shape == (heads, rows, max_block)
+    assert out.data_ptr() == buf.data_ptr()  # the persistent storage, no copy
+    if S * heads >= transpose_min_f:  # feature-contiguous, as the scorer allocates
+        assert out.stride() == (1, heads, rows * heads)
+    else:
+        assert out.stride() == (rows * max_block, max_block, 1)
+    assert (out[..., :fill] == neg_inf).all() and (out[..., fill:] == 7.0).all()
+    return out
 
 
-@pytest.mark.parametrize("heads", [1, 2, 4])
-def test_the_score_rows_formula_matches_fresh_index_score_with_a_stand_in_threshold(
-    monkeypatch, heads
-):
-    """Local formula only: the threshold is a stand-in (16), so this does NOT show
-    that aiter's TRANSPOSE_MIN_F agrees; see the next test for that."""
+def _stand_in_scorer_module(monkeypatch):
+    """A stand-in for aiter's scorer constants (threshold 16): local logic only."""
     parents = ("aiter", "aiter.ops", "aiter.ops.flydsl", "aiter.ops.flydsl.kernels")
     name = "aiter.ops.flydsl.kernels.minimax_m3_index_score"
     for mod_name in (*parents, name):
         monkeypatch.setitem(sys.modules, mod_name, types.ModuleType(mod_name))
     sys.modules[name].NEG_INF = float("-inf")
     sys.modules[name].TRANSPOSE_MIN_F = 16
-    _assert_rows_match_fresh_index_score(heads, 16)
 
 
+@pytest.mark.parametrize("S", [1, 3, 4, 8])
 @pytest.mark.parametrize("heads", [1, 2, 4])
-def test_the_score_rows_formula_matches_fresh_index_score_with_aiters_threshold(heads):
-    """Same check against the installed aiter's own constant. Skipped, never
-    stubbed, when aiter is absent, too old for the scorer, or cannot probe a GPU."""
+def test_the_score_view_follows_the_layout_of_its_step_width_with_a_stand_in_threshold(
+    monkeypatch, heads, S
+):
+    """Local logic only: the threshold is a stand-in (16), so this does NOT show that
+    aiter's layout agrees; see the next test."""
+    _stand_in_scorer_module(monkeypatch)
+    _check_score_view(heads, S, 16, float("-inf"))
+
+
+def test_an_eager_step_scores_at_its_own_block_count_a_graph_step_at_the_models(
+    monkeypatch,
+):
+    from atom.model_ops.minimax_m3 import index_mxfp4
+
+    _stand_in_scorer_module(monkeypatch)
+    built = []
+    monkeypatch.setattr(index_mxfp4, "index_work_map_capacity", lambda *a: 4)
+    monkeypatch.setattr(
+        index_mxfp4,
+        "build_index_work_map",
+        lambda seq_lens, **kw: built.append(kw["max_block"]) or torch.zeros(1, 2),
+    )
+    buffers = index_mxfp4.IndexScoreBuffers.alloc(4, 2, 1, 64, "cpu")
+    seq = torch.tensor([300, 1000, 0])
+    graph = buffers.begin_step(seq, 2, 1000)
+    eager = buffers.begin_step(seq, 2, 1000, eager=True)
+    huge = buffers.begin_step(seq, 2, 10**9, eager=True)  # never past the model's
+    assert [graph.max_block, eager.max_block, huge.max_block] == [64, 8, 64]
+    assert built == [64, 8, 64]
+    for step in (graph, eager, huge):  # the view is as wide as the map's bound
+        assert step.out.shape == (1, 6, step.max_block)
+    # one persistent storage under every view
+    assert graph.out.data_ptr() == eager.out.data_ptr() == buffers.scores.data_ptr()
+
+
+@pytest.mark.parametrize("S", [1, 3, 4, 8])
+@pytest.mark.parametrize("heads", [1, 2, 4])
+def test_the_score_view_has_the_strides_aiters_own_allocation_has(heads, S):
+    """Same check against the installed aiter: its threshold, and the shape and
+    strides of the score it would allocate. Skipped, never stubbed, when aiter is
+    absent, too old for the scorer, or cannot probe a GPU."""
     try:
-        from aiter.ops.flydsl.kernels.minimax_m3_index_score import TRANSPOSE_MIN_F
+        from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
+            NEG_INF,
+            TRANSPOSE_MIN_F,
+            alloc_score,
+        )
     except (ImportError, RuntimeError) as e:
-        pytest.skip(f"aiter's scorer constant is not importable here: {e!r}"[:200])
-    _assert_rows_match_fresh_index_score(heads, TRANSPOSE_MIN_F)
+        pytest.skip(f"aiter's scorer is not importable here: {e!r}"[:200])
+    out = _check_score_view(heads, S, TRANSPOSE_MIN_F, NEG_INF)
+    own = alloc_score(3, S, heads, 6, "cpu")
+    assert (out.shape, out.stride()) == (own.shape, own.stride())
 
 
 # (scheduled_bs, running_bs, running_tokens, q) -> the scorer's batch
@@ -175,7 +196,7 @@ def test_a_padded_replay_of_any_index_cache_lays_bounds_out_at_the_captured_batc
         num_idx_heads=heads,
         max_query_len=S,
     )
-    assert md.index_score_work_map is None  # not the MXFP4 index
+    assert md.index_score is None  # not the MXFP4 index
     got = md.n_valid_column_per_row.view(heads, running * S).cpu()
     # token t of request b sees ceil((len - S + t + 1) / 128) blocks; a pad row, 0
     want = [
@@ -187,21 +208,15 @@ def test_a_padded_replay_of_any_index_cache_lays_bounds_out_at_the_captured_batc
 
 
 def test_each_ubatch_has_its_own_map_and_scores(mod):
-    names = (
-        "sparse_attention_index_score_work_map",
-        "sparse_attention_index_score_buf",
-    )
+    name = "sparse_attention_index_score"
     prefixes = ("", "ub0_", "ub1_")
-    var = {p + n: torch.empty(1) for p in prefixes for n in names}
+    var = {p + name: object() for p in prefixes}
     b = builder(mod, forward_vars=var)
-    got = [b._index_score_work_map_kwargs(p) for p in prefixes]
+    got = [b._index_score_kwargs(p) for p in prefixes]
     for kw, p in zip(got, prefixes):
-        assert kw["index_score_work_map_out"] is var[p + names[0]]
-        assert kw["index_score_buf"] is var[p + names[1]]
-        assert kw["index_score_max_block"] == BOUND
-    assert len({id(kw["index_score_buf"]) for kw in got}) == 3
+        assert kw == {"index_score_buffers": var[p + name]}
     # another index cache allocated none: nothing to pass
-    assert builder(mod)._index_score_work_map_kwargs("ub0_") == {}
+    assert builder(mod)._index_score_kwargs("ub0_") == {}
 
 
 class _Buf:
@@ -230,36 +245,43 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     monkeypatch.setattr(index_mxfp4, "index_work_map_capacity", capacity)
     b = builder(mod, mxfp4=mxfp4, tbo_decode=tbo_decode)
     b.max_bs = max_bs
-    half = (max_bs + 1) // 2  # the larger ubatch of a split of up to max_bs requests
     max_qlen = 8  # a speculative config: the TBO sparse decode still runs one token
+    var = b.model_runner.forward_vars
+    if mxfp4:
+        var["sparse_attention_index_score"] = index_mxfp4.IndexScoreBuffers.alloc(
+            max_bs, max_qlen, HEADS, BOUND, "cpu"
+        )
+        capacity_args.clear()
+    # each ubatch's requests, from the split every backend's ubatch metadata follows
+    from atom.utils.tbo.ubatch_splitting import decode_ubatch_request_ranges
+
+    rows = [hi - lo for lo, hi in decode_ubatch_request_ranges(max_bs, 2)]
     # the work plan sizes are not under test
     b._allocate_ubatch_buffers(max_qlen, *([1, torch.int32] * 6))
-    var = b.model_runner.forward_vars
     # `enable_tbo` alone is the prefill split, which never scores a decode
-    names = [
-        f"ub{i}_sparse_attention_index_score_{n}"
-        for i in (0, 1)
-        for n in ("work_map", "buf")
-    ]
+    names = [f"ub{i}_sparse_attention_index_score" for i in (0, 1)]
     if not (mxfp4 and tbo_decode):
         assert not [n for n in names if n in var] and not capacity_args
         return
+    main = var["sparse_attention_index_score"]
     for i in (0, 1):
-        wmap = var[f"ub{i}_sparse_attention_index_score_work_map"]
-        sbuf = var[f"ub{i}_sparse_attention_index_score_buf"]
-        assert wmap.shape == (100, 2) and wmap.dtype == torch.int32
-        assert sbuf.dtype == torch.float32
-        assert sbuf.numel() == HEADS * half * BOUND  # q == 1, not max_qlen
-    assert capacity_args == [(half, BOUND, 1, HEADS)] * 2
+        ub = var[names[i]]
+        assert ub.work_map.shape == (100, 2) and ub.work_map.dtype == torch.int32
+        assert ub.scores.dtype == torch.float32
+        assert ub.scores.numel() == HEADS * rows[i] * BOUND  # q == 1, not max_qlen
+        assert (ub.max_block, ub.num_idx_heads) == (BOUND, HEADS)
+    assert capacity_args == [(rows[0], BOUND, 1, HEADS), (rows[1], BOUND, 1, HEADS)]
+    # the score storage is the main buffer's, the two ubatches' views not overlapping
+    base = main.scores.data_ptr()
+    step = main.scores.element_size()
+    assert var[names[0]].scores.data_ptr() == base
+    assert var[names[1]].scores.data_ptr() == base + rows[0] * HEADS * BOUND * step
+    assert var[names[1]].work_map.data_ptr() != var[names[0]].work_map.data_ptr()
     # the other per-ubatch buffers stay at max_bs
     assert var["ub0_context_lens"].gpu.numel() == max_bs
-    assert (
-        var["ub0_sparse_attention_index_score_buf"].data_ptr()
-        != var["ub1_sparse_attention_index_score_buf"].data_ptr()
-    )
 
 
-def test_the_ubatch_metadata_is_built_with_its_own_pair(mod, monkeypatch):
+def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
     from atom.model_ops.minimax_m3 import sparse_attn
 
     var = {"max_qlen": 1}
@@ -280,8 +302,7 @@ def test_the_ubatch_metadata_is_built_with_its_own_pair(mod, monkeypatch):
         ):
             var[p + name] = None
         var[p + "sparse_attention_n_valid_column_per_row"] = torch.zeros(1)
-        var[p + "sparse_attention_index_score_work_map"] = torch.zeros(1, 2)
-        var[p + "sparse_attention_index_score_buf"] = torch.zeros(1)
+        var[p + "sparse_attention_index_score"] = object()
     seen = []
     monkeypatch.setattr(
         sparse_attn, "make_sparse_decode_metadata", lambda **kw: seen.append(kw)
@@ -290,10 +311,5 @@ def test_the_ubatch_metadata_is_built_with_its_own_pair(mod, monkeypatch):
     for i in (0, 1):
         b.build_ubatch_metadata(i, rows)
     for i, kw in enumerate(seen):
-        assert (
-            kw["index_score_work_map_out"]
-            is var[f"ub{i}_sparse_attention_index_score_work_map"]
-        )
-        assert kw["index_score_buf"] is var[f"ub{i}_sparse_attention_index_score_buf"]
-        assert kw["index_score_max_block"] == BOUND
-    assert seen[0]["index_score_buf"] is not seen[1]["index_score_buf"]
+        assert kw["index_score_buffers"] is var[f"ub{i}_sparse_attention_index_score"]
+    assert seen[0]["index_score_buffers"] is not seen[1]["index_score_buffers"]

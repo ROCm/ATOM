@@ -52,7 +52,6 @@ def _config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use mono, or None."""
     checks = common_refusals(atom_config, Dims, SUPPORTED_TP) + [
         (atom_config.kv_cache_dtype == "fp8", f"kv cache {atom_config.kv_cache_dtype}"),
-        (not atom_config.kv_mxfp4, "sparse KV is MXFP4"),
         (
             (atom_config.index_cache_dtype or atom_config.kv_cache_dtype) == "fp8",
             "index cache not fp8",

@@ -13,61 +13,24 @@ page index of the collapsed ``[pages * Hkv, 1, 128, .]`` views taken here.
 
 Decode (a captured graph, a fixed set of row counts) runs planned: aiter's planner
 takes at most ``_FLYDSL_PLAN_MAX_BATCH`` sequences, so more rows are run in
-segments, each with a plan of its own, refreshed from the rows' context lengths
-once per step (they do not depend on the layer: the tail block is always
-selected) and recorded in the graph when one is being captured.
+segments, each with a plan of its own from the shared plan cache
+(``_flydsl_prepare_explicit_plan``, the one the fp8 sparse and dense paths use,
+including its once-a-step refresh under a step owner). There is no gluon fallback
+for MXFP4 pages, hence the segments rather than a refusal past one plan.
 
 Prefill runs plan-free (``plan_owner=None``): a chunk has a new row count nearly
-every forward, and ``plan_pa_decode`` JIT-compiles a kernel per batch size (~300 ms,
-stalling every rank), so one task a row -- a row reads at most ``topk`` pages -- and
+every forward, and ``plan_pa_decode`` JIT-compiles a kernel per batch size, so one task a row -- a row reads at most ``topk`` pages -- and
 one specialization whatever the rows.
 """
 
 import torch
 
-from atom.model_ops.base_attention import _FLYDSL_PLAN_MAX_BATCH, _flydsl_plan_scratch
-from atom.model_ops.minimax_m3.kv_mxfp4 import HEAD_DIM, PAGE_TOKENS, page_views
-
-# Plans outlive a step -- a captured graph keeps reading its plan's buffers -- so
-# they are keyed by what shapes them, never by a step's objects. TBO ubatches share
-# one compute stream, so the ubatch id keeps their plans (and lengths) apart.
-_PLANS: dict[tuple, object] = {}
-
-
-def _refreshed(owner) -> set:
-    marks = getattr(owner, "_mxfp4_pa_refreshed", None)
-    if marks is None:
-        marks = set()
-        owner._mxfp4_pa_refreshed = marks
-    return marks
-
-
-def _plan(owner, context, segment, num_kv_heads):
-    """The segment's plan, refreshed from its context lengths once per step."""
-    from aiter.ops.flydsl.pa_decode import plan_pa_decode
-
-    from atom.utils.tbo.ubatching import tbo_current_ubatch_id
-
-    device = context.device
-    key = (
-        int(torch.cuda.current_stream(device).cuda_stream),
-        tbo_current_ubatch_id(),
-        segment,
-        int(context.shape[0]),
-        num_kv_heads,
-        device.index,
-    )
-    mark = (key, torch.cuda.is_current_stream_capturing())
-    plan = _PLANS.get(key)
-    marks = _refreshed(owner)
-    if plan is not None and mark in marks:
-        return plan
-    marks.add(mark)
-    if plan is None:
-        plan = _PLANS[key] = plan_pa_decode(context, num_kv_heads, query_length=1)
-    else:
-        plan_pa_decode(context, num_kv_heads, query_length=1, plan=plan)
-    return plan
+from atom.model_ops.base_attention import (
+    _FLYDSL_PLAN_MAX_BATCH,
+    _flydsl_plan_scratch,
+    _flydsl_prepare_explicit_plan,
+)
+from atom.model_ops.minimax_m3.mxfp4_pages import HEAD_DIM, PAGE_TOKENS, page_views
 
 
 @torch.no_grad()
@@ -80,16 +43,21 @@ def sparse_pa_mxfp4(
     num_kv_heads: int,
     sm_scale: float,
     out_dtype: torch.dtype,
-    plan_owner=None,
+    *,
+    planned: bool = False,
+    plan_step_owner=None,
 ) -> torch.Tensor:
     """Attention of every row over its selected pages; ``[rows, num_heads, 128]``.
 
-    ``plan_owner`` is an object that lives exactly one forward (the sparse
-    metadata): the plans are refreshed once per owner and capture state. None runs
-    plan-free, one task a row, written directly (prefill); every row then needs a
-    context of at most ``sparse_bt.shape[1]`` pages, which index_topk's emit gives.
+    ``planned`` runs the decode path, with plans from the shared cache. Not planned
+    runs plan-free, one task a row, written directly (prefill); every row then needs
+    a context of at most ``sparse_bt.shape[1]`` pages, which index_topk's emit gives.
+    ``plan_step_owner`` is the sparse metadata, which lives one forward, when every
+    layer's rows have the same lengths (the tail block is always selected), so a
+    plan is refreshed once a step; None refreshes it on every call.
     """
     from aiter.ops.flydsl.pa_decode import pa_decode
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
     rows, num_heads, head_dim = q.shape
     if head_dim != HEAD_DIM or not q.is_contiguous():
@@ -110,7 +78,7 @@ def sparse_pa_mxfp4(
     q_rows = q.view(n, group, HEAD_DIM)
     out = torch.empty((n, group, HEAD_DIM), dtype=out_dtype, device=q.device)
     bound = sparse_bt.shape[1] * PAGE_TOKENS
-    if plan_owner is None:
+    if not planned:
         pa_decode(
             out,
             q_rows,
@@ -129,7 +97,19 @@ def sparse_pa_mxfp4(
     for seg, start in enumerate(range(0, n, _FLYDSL_PLAN_MAX_BATCH)):
         end = min(start + _FLYDSL_PLAN_MAX_BATCH, n)
         ctx = sparse_ctx[start:end]
-        plan = _plan(plan_owner, ctx, seg, 1)
+        plan = _flydsl_prepare_explicit_plan(
+            q=q_rows[start:end],
+            k_cache=k_data,
+            context_lens=ctx,
+            num_seqs=end - start,
+            query_length=1,
+            # the static split count, as the fp8 sparse path caps its plans
+            plan_partition_cap=get_recommended_splits(end - start, 1),
+            context_bound=bound,
+            existing_plan=None,
+            plan_step_owner=plan_step_owner,
+            plan_segment=seg,
+        )
         exp_sums, max_logits, tmp = _flydsl_plan_scratch(
             plan, 1, group, HEAD_DIM, out_dtype, q.device
         )

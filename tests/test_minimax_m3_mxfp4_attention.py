@@ -13,7 +13,7 @@ import types
 import pytest
 import torch
 
-from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, page_views
+from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_BYTES, page_views
 from atom.mono.weights.formats import dequantize_mxfp4
 
 aiter = pytest.importorskip("aiter")
@@ -87,8 +87,9 @@ def test_rows_attend_their_selected_pages(hkv):
 
     k, v, bt, ctx, q = make(37, hkv, seed=hkv)
     out = sparse_pa_mxfp4(
-        q, k, v, bt, ctx, hkv, SCALE, torch.bfloat16, types.SimpleNamespace()
-    )
+        q, k, v, bt, ctx, hkv, SCALE, torch.bfloat16,
+        planned=True, plan_step_owner=types.SimpleNamespace(),
+    )  # fmt: skip
     assert out.shape == q.shape and out.dtype == torch.bfloat16
     assert rel(out, reference(k, v, bt, ctx, q, hkv)) < 3e-3
 
@@ -98,28 +99,35 @@ def test_plans_are_refreshed_once_a_step_and_segmented(monkeypatch):
 
     monkeypatch.setattr(m, "_FLYDSL_PLAN_MAX_BATCH", 16)  # 37 rows -> 3 segments
     k, v, bt, ctx, q = make(37, 1, seed=5)
-    calls = []
-    real = m._plan
+    from atom.model_ops.base_attention import _flydsl_step_refreshed
 
-    def spy(owner, context, segment, hkv):
-        before = len(m._refreshed(owner))
-        plan = real(owner, context, segment, hkv)
-        calls.append(len(m._refreshed(owner)) - before)  # 1 = refreshed
+    calls = []
+    real = m._flydsl_prepare_explicit_plan
+
+    def spy(**kw):
+        owner = kw["plan_step_owner"]
+        before = len(_flydsl_step_refreshed(owner))
+        plan = real(**kw)
+        calls.append(len(_flydsl_step_refreshed(owner)) - before)  # 1 = refreshed
         return plan
 
-    monkeypatch.setattr(m, "_plan", spy)
+    monkeypatch.setattr(m, "_flydsl_prepare_explicit_plan", spy)
     step = types.SimpleNamespace()
     ref = reference(k, v, bt, ctx, q, 1)
     for _layer in range(3):
-        out = m.sparse_pa_mxfp4(q, k, v, bt, ctx, 1, SCALE, torch.bfloat16, step)
+        out = m.sparse_pa_mxfp4(
+            q, k, v, bt, ctx, 1, SCALE, torch.bfloat16,
+            planned=True, plan_step_owner=step,
+        )  # fmt: skip
         assert rel(out, ref) < 3e-3
     assert calls == [1, 1, 1, 0, 0, 0, 0, 0, 0]
     # the next step has other lengths: its first layer refreshes, and is right
     ctx2 = (ctx // 2).clamp(min=1)
     bt2 = bt.clone()
     out = m.sparse_pa_mxfp4(
-        q, k, v, bt2, ctx2, 1, SCALE, torch.bfloat16, types.SimpleNamespace()
-    )
+        q, k, v, bt2, ctx2, 1, SCALE, torch.bfloat16,
+        planned=True, plan_step_owner=types.SimpleNamespace(),
+    )  # fmt: skip
     assert rel(out, reference(k, v, bt2, ctx2, q, 1)) < 3e-3
 
 
@@ -132,19 +140,29 @@ def test_tbo_ubatches_keep_their_own_plans(monkeypatch):
     cases = [make(8, 1, seed=11), make(8, 1, seed=12)]
     assert not torch.equal(cases[0][3], cases[1][3])
     owners = [types.SimpleNamespace(), types.SimpleNamespace()]
+    plans = {}
+    real = m._flydsl_prepare_explicit_plan
+
+    def spy(**kw):
+        plan = real(**kw)
+        plans.setdefault(ub_now[0], plan)
+        return plan
+
+    monkeypatch.setattr(m, "_flydsl_prepare_explicit_plan", spy)
+    ub_now = [0]
 
     def layer(ub):
+        ub_now[0] = ub
         monkeypatch.setattr(ubatching, "tbo_current_ubatch_id", lambda: ub)
         k, v, bt, ctx, q = cases[ub]
-        out = m.sparse_pa_mxfp4(q, k, v, bt, ctx, 1, SCALE, torch.bfloat16, owners[ub])
+        out = m.sparse_pa_mxfp4(
+            q, k, v, bt, ctx, 1, SCALE, torch.bfloat16,
+            planned=True, plan_step_owner=owners[ub],
+        )  # fmt: skip
         return rel(out, reference(k, v, bt, ctx, q, 1))
 
     # ubatch 0 layer 0, ubatch 1 layer 0, ubatch 0 layer 1, ubatch 1 layer 1
     assert all(layer(ub) < 3e-3 for ub in (0, 1, 0, 1))
-    plans = []
-    for ub in (0, 1):
-        monkeypatch.setattr(ubatching, "tbo_current_ubatch_id", lambda ub=ub: ub)
-        plans.append(m._plan(owners[ub], cases[ub][3], 0, 1))
     assert plans[0] is not plans[1]
 
 
@@ -155,7 +173,7 @@ def test_plan_free_rows_attend_their_selected_pages(rows, hkv):
     from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
 
     k, v, bt, ctx, q = make(rows, hkv, seed=rows + hkv, pages=64)
-    out = sparse_pa_mxfp4(q, k, v, bt, ctx, hkv, SCALE, torch.bfloat16, None)
+    out = sparse_pa_mxfp4(q, k, v, bt, ctx, hkv, SCALE, torch.bfloat16)
     assert out.shape == q.shape and out.dtype == torch.bfloat16
     assert rel(out, reference(k, v, bt, ctx, q, hkv)) < 3e-3
 
@@ -165,11 +183,11 @@ def test_plan_free_is_the_planned_path_with_one_task_a_row():
     and the production planned split (default partitions) agrees to bf16 rounding."""
     from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
 
-    from atom.model_ops.minimax_m3.kv_mxfp4 import page_views
+    from atom.model_ops.minimax_m3.mxfp4_pages import page_views
     from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
 
     k, v, bt, ctx, q = make(37, 1, seed=9)
-    free = sparse_pa_mxfp4(q, k, v, bt, ctx, 1, SCALE, torch.bfloat16, None)
+    free = sparse_pa_mxfp4(q, k, v, bt, ctx, 1, SCALE, torch.bfloat16)
     kd, ks = page_views(k.view(-1, 1, PAGE_BYTES))
     vd, vs = page_views(v.view(-1, 1, PAGE_BYTES))
     out = torch.empty(37, GROUP, 128, dtype=torch.bfloat16, device="cuda")
@@ -180,8 +198,9 @@ def test_plan_free_is_the_planned_path_with_one_task_a_row():
     )  # fmt: skip
     assert torch.equal(free, out.view(q.shape))
     planned = sparse_pa_mxfp4(
-        q, k, v, bt, ctx, 1, SCALE, torch.bfloat16, types.SimpleNamespace()
-    )
+        q, k, v, bt, ctx, 1, SCALE, torch.bfloat16,
+        planned=True, plan_step_owner=types.SimpleNamespace(),
+    )  # fmt: skip
     # the two splits round the partial sums differently (bf16 partials): each is within
     # 3e-3 of the oracle, so within 6e-3 of each other; measured 2.3e-3
     assert rel(free, planned.float()) < 4e-3
@@ -194,21 +213,22 @@ def test_plan_free_builds_nothing_per_row_count():
     from aiter.ops.flydsl.kernels.pa_decode_kernel import _PA_DECODE_TILE_CACHE
     from aiter.ops.flydsl.kernels.pa_decode_plan import compile_pa_decode_plan
 
+    from atom.model_ops import base_attention as ba
     from atom.model_ops.minimax_m3 import sparse_attn_mxfp4 as m
 
     k, v, bt, ctx, q = make(8, 1, seed=3, pages=64)
-    m.sparse_pa_mxfp4(q, k, v, bt, ctx, 1, SCALE, torch.bfloat16, None)  # first build
+    m.sparse_pa_mxfp4(q, k, v, bt, ctx, 1, SCALE, torch.bfloat16)  # first build
     state = (
         compile_pa_decode_plan.cache_info().currsize,
         len(_PA_DECODE_TILE_CACHE),
-        len(m._PLANS),
+        len(ba._FLYDSL_RUNTIME_PLANS),
     )
     for rows in (1, 9, 31, 100, 255, 256, 257, 300, 511, 513, 1000, 1023):
         k, v, bt, ctx, q = make(rows, 1, seed=rows, pages=64)
-        out = m.sparse_pa_mxfp4(q, k, v, bt, ctx, 1, SCALE, torch.bfloat16, None)
+        out = m.sparse_pa_mxfp4(q, k, v, bt, ctx, 1, SCALE, torch.bfloat16)
         assert out.shape == q.shape
     assert state == (
         compile_pa_decode_plan.cache_info().currsize,
         len(_PA_DECODE_TILE_CACHE),
-        len(m._PLANS),
+        len(ba._FLYDSL_RUNTIME_PLANS),
     )

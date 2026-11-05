@@ -1314,11 +1314,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # the page-128 indexer-key cache. None until the runner binds it.
         self.index_cache: torch.Tensor | None = None
         # --kv-cache-dtype fp4: the bound k/v caches are uint8 [pages, Hkv,
-        # 8704] MXFP4 pages (minimax_m3/kv_mxfp4.py), written by the fused kernel
+        # 8704] MXFP4 pages (minimax_m3/mxfp4_pages.py), written by the fused kernel
         # directly together with an fp8 main q. `--index-cache-dtype fp4` makes
-        # index_cache uint8 [pages, 8704] the same way.
-        self.kv_mxfp4: bool = False
-        self._out_dtype = torch.bfloat16
+        # index_cache uint8 [pages, 8704] the same way. Fixed here: every layer of
+        # this impl is an indexed sparse one, which is what the flag makes MXFP4.
+        self.kv_mxfp4: bool = kv_cache_dtype == "fp4"
         # Optional shared dict bound by the metadata builder. It is scoped to the
         # current sparse metadata object and carries the last full layer top-k.
         self.index_topk_cache_state: dict | None = None
@@ -1352,7 +1352,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         kv_cache_data = fwd_ctx.kv_cache_data
 
         # The KV cache is bound by the STANDARD MHA path (same allocation as every
-        # other MHA model): page-128 SHUFFLE views
+        # other MHA model): page-128 SHUFFLE views, unless `kv_mxfp4` (below)
         #   K: [N, nkv, hd//x, 128, x]   V: [N, nkv, 128//x, hd, x]
         #   scale (fp8): [N, nkv, 128]
         # The M3 paged kernels index this storage as page-16 SHUFFLE: each
@@ -1379,8 +1379,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # M3 sparse attention is fixed to head_dim == 128 and the AITER fused
         # path; there is no model-local Triton fallback here.
         self.use_triton_attn = False
-        # The layout of the non-MXFP4 cache; under `kv_mxfp4` the pages are read
-        # through `sparse_pa_mxfp4` instead.
+        # The layout the base class's SHUFFLE readers assume. Not read for MXFP4
+        # pages, which only `sparse_pa_mxfp4` reads.
         self._cache_format = "SHUFFLE"
 
         sparse_metadata = getattr(attn_metadata, "sparse_attention_metadata", None)
@@ -1410,7 +1410,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             fused_index_cache_dtype = "mxfp4"
 
         if self.kv_mxfp4:
-            fused_kv_block_size = 128
+            from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_TOKENS
+
+            fused_kv_block_size = PAGE_TOKENS
             kv_cache_dtype = "mxfp4"
         else:
             # SHUFFLE page size (== ASM_PAGE_SIZE == 16)
@@ -1454,12 +1456,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             q = q_out.view(-1, self.num_heads, self.head_dim)
             k = k_out.view(-1, self.num_kv_heads, self.head_dim)
             v = v_raw.view(-1, self.num_kv_heads, self.head_dim)
-            self._index_q = None
-            self._index_q_cache_key_info = (
-                (num_tokens, self.num_idx_heads, self.index_head_dim),
-                index_q_dtype,
-                qkv.device,
-            )
+            self._stash_index_q(None, num_tokens, index_q_dtype, qkv.device)
             return q, k, v, k_cache, v_cache, k_scale, v_scale
 
         # MXFP4 KV: an e4m3 q_out makes the kernel write the main q as e4m3 (cast
@@ -1506,26 +1503,27 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         )
 
         q = q_out.view(-1, self.num_heads, self.head_dim)
-        self._out_dtype = qkv.dtype
+        self._stash_index_q(index_q, num_tokens, index_q_dtype, qkv.device)
+        return q, k, v, k_cache, v_cache, k_scale, v_scale
+
+    def _stash_index_q(self, index_q, num_tokens, index_q_dtype, device) -> None:
+        """Keep the rotated indexer query for dispatch_backend (same-forward,
+        single-threaded; cleared after the sparse backend consumes it). A top-k
+        reusing layer has none: only what its top-k reuse key records."""
         if index_q is None:
-            # top-k-reusing layer: no indexer query, as the Triton branch above
             self._index_q = None
             self._index_q_cache_key_info = (
                 (num_tokens, self.num_idx_heads, self.index_head_dim),
                 index_q_dtype,
-                qkv.device,
+                device,
             )
-            return q, k, v, k_cache, v_cache, k_scale, v_scale
-        # Stash the rotated indexer query for dispatch_backend (same-forward,
-        # single-threaded; cleared after the sparse backend consumes it).
+            return
         self._index_q = index_q.view(-1, self.num_idx_heads, self.index_head_dim)
         self._index_q_cache_key_info = (
             tuple(self._index_q.shape),
             self._index_q.dtype,
             self._index_q.device,
         )
-
-        return q, k, v, k_cache, v_cache, k_scale, v_scale
 
     def dispatch_backend(
         self,
@@ -1620,34 +1618,17 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 "sparse_layer_ordinal": self.sparse_layer_ordinal,
             }
 
-    def _sparse_pa_mxfp4(self, q, k_cache, v_cache, sparse_bt, sparse_ctx, plan_owner):
-        from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
-
-        return sparse_pa_mxfp4(
-            q,
-            k_cache,
-            v_cache,
-            sparse_bt,
-            sparse_ctx,
-            self.num_kv_heads,
-            self.scale,
-            self._out_dtype,
-            plan_owner,
-        )
-
     def _mxfp4_select_kwargs(self, sparse_metadata, decode: bool) -> dict:
         """What the selection needs to know about the MXFP4 caches: a block table
         of one page-128 page a block for the MXFP4 KV, the MXFP4 scorer (and, on
-        decode, the step's work map) for the MXFP4 index."""
+        decode, the step's work map and scores) for the MXFP4 index."""
         kw = {}
         if self.kv_mxfp4:
             kw.update(pages_per_block=1, block_page_stride=1)
         if self.index_cache_dtype == "fp4":
             kw["index_mxfp4"] = True
             if decode:
-                kw["index_score_work_map"] = sparse_metadata.index_score_work_map
-                kw["index_score_max_block"] = sparse_metadata.index_score_max_block
-                kw["index_score_out"] = sparse_metadata.index_score_out
+                kw["index_score"] = sparse_metadata.index_score
         return kw
 
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)
@@ -1711,9 +1692,18 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
         if self.kv_mxfp4:
+            from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
+
             # plan-free: a prefill chunk's row count is new almost every forward
-            output = self._sparse_pa_mxfp4(
-                q, k_cache, v_cache, sparse_bt, sparse_ctx, None
+            output = sparse_pa_mxfp4(
+                q,
+                k_cache,
+                v_cache,
+                sparse_bt,
+                sparse_ctx,
+                self.num_kv_heads,
+                self.scale,
+                v.dtype,
             )
         else:
             output = torch.empty_like(q)
@@ -1864,8 +1854,19 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
         if self.kv_mxfp4:
-            output = self._sparse_pa_mxfp4(
-                q, k_cache, v_cache, sparse_bt, sparse_ctx, sparse_metadata
+            from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
+
+            output = sparse_pa_mxfp4(
+                q,
+                k_cache,
+                v_cache,
+                sparse_bt,
+                sparse_ctx,
+                self.num_kv_heads,
+                self.scale,
+                v.dtype,
+                planned=True,
+                plan_step_owner=sparse_metadata if self.local_blocks >= 1 else None,
             )
         else:
             output = torch.empty_like(q)

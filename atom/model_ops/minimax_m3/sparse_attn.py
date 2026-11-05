@@ -22,6 +22,7 @@ import triton
 import triton.language as tl
 from aiter.ops.attention import pa_fwd_asm_supports_arch
 
+from atom.model_ops.minimax_m3.index_mxfp4 import IndexScoreBuffers, IndexScoreStep
 from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
 
 # One sparse block == one KV page.
@@ -97,23 +98,12 @@ class MiniMaxM3SparseMetadata:
     `deepseek_v4_attn.csa_n_committed_per_token` hoists out for the sibling
     indexer. `index_topk` consumes it and never derives its own.
     """
-    index_score_work_map: torch.Tensor | None = None
-    """[grid, 2] int32 GPU -- the MXFP4 decode index scorer's dispatch order
-    (index_mxfp4), built once per step (~120us a call). None on prefill, on an
-    empty batch and wherever the index cache is not MXFP4; the scorer then builds
-    its own, correctly but per layer.
-    """
-    index_score_max_block: int = 0
-    """The bound `index_score_work_map` was built against, in 128-token blocks.
-
-    NOT `ceil(max_seq_len / 128)`: the map's row count is the grid baked at
-    capture, so the bound is `ceil(max_model_len / 128)` and must not move.
-    """
-    index_score_out: torch.Tensor | None = None
-    """[H, rows, index_score_max_block] fp32 GPU -- the MXFP4 decode scorer's
-    persistent output, refilled with -inf once a step here instead of by a
-    `torch.full` in every layer. None where the scorer lays its scores out
-    transposed, and wherever the index cache is not MXFP4.
+    index_score: IndexScoreStep | None = None
+    """The MXFP4 decode index scorer's step state (index_mxfp4): its work map, the
+    block bound it was built against (`ceil(max_model_len / 128)`, which must not move
+    between graph replays) and the score storage view, all built once a step. None
+    on prefill, on an empty batch and wherever the index cache is not MXFP4; the
+    scorer then builds its own, correctly but per layer.
     """
 
 
@@ -171,15 +161,14 @@ def make_sparse_decode_metadata(
     num_idx_heads: int,
     max_query_len: int = 1,
     n_valid_column_per_row_out: torch.Tensor | None = None,
-    index_score_work_map_out: torch.Tensor | None = None,
-    index_score_max_block: int = 0,
-    index_score_buf: torch.Tensor | None = None,
+    index_score_buffers: IndexScoreBuffers | None = None,
+    index_score_eager: bool = False,
 ) -> MiniMaxM3SparseMetadata:
-    """``index_score_work_map_out`` is the persistent buffer of an MXFP4 index
-    cache (the builder allocates it only then): given, the decode scorer's work
-    map is built into it here, once, with ``index_score_max_block`` as its bound.
-    ``index_score_buf`` is the scorer's persistent score storage: its view for this
-    step's rows is refilled with -inf here, once.
+    """``index_score_buffers`` is the persistent storage of an MXFP4 index cache's
+    scorer (the builder allocates it only then): given, the step's work map and score
+    view are built into it here, once. ``index_score_eager``: the step is not
+    replayed from a graph, so they are built at the batch's own block count (see
+    `IndexScoreBuffers.begin_step`).
     ``seq_lens`` and ``block_table`` must hold every row the scorer and selector run
     (pad rows of a padded step: length 0): the map's encoding and grid, the score
     view's strides and the head offsets of ``n_valid_column_per_row`` all follow that
@@ -188,28 +177,13 @@ def make_sparse_decode_metadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )
     batch = seq_lens.shape[0]
-    work_map = None
-    if index_score_work_map_out is not None:
-        from atom.model_ops.minimax_m3.index_mxfp4 import build_index_work_map
-
-        work_map = build_index_work_map(
-            seq_lens,
-            max_block=index_score_max_block,
-            max_query_len=max_query_len,
-            num_idx_heads=num_idx_heads,
-            out=index_score_work_map_out,
+    index_score = (
+        index_score_buffers.begin_step(
+            seq_lens, max_query_len, max_seq_len, index_score_eager
         )
-    score_out = None
-    if work_map is not None and index_score_buf is not None:
-        from atom.model_ops.minimax_m3.index_mxfp4 import fresh_index_score
-
-        score_out = fresh_index_score(
-            index_score_buf,
-            batch * max_query_len,
-            num_idx_heads,
-            index_score_max_block,
-            max_query_len,
-        )
+        if index_score_buffers is not None
+        else None
+    )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
         max_seq_len=max_seq_len,
@@ -228,9 +202,7 @@ def make_sparse_decode_metadata(
             decode_max_q=max_query_len,
             out=n_valid_column_per_row_out,
         ),
-        index_score_work_map=work_map,
-        index_score_max_block=index_score_max_block if work_map is not None else 0,
-        index_score_out=score_out,
+        index_score=index_score,
     )
 
 

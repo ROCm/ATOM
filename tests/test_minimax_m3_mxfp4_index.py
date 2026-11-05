@@ -12,7 +12,7 @@ dequantized cache, not another kernel.
 import pytest
 import torch
 
-from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, page_views
+from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_BYTES, page_views
 from atom.mono.weights.formats import dequantize_mxfp4
 
 aiter = pytest.importorskip("aiter")
@@ -89,6 +89,7 @@ def reference(cache, table, seq, q, S):
 @pytest.mark.parametrize("fp8_q", [False, True])
 def test_decode_selection_and_block_table(batch, S, ppb, fp8_q):
     from atom.model_ops.minimax_m3.index_mxfp4 import (
+        IndexScoreStep,
         build_index_work_map,
         index_work_map_capacity,
     )
@@ -108,7 +109,7 @@ def test_decode_selection_and_block_table(batch, S, ppb, fp8_q):
         q, cache, table, seq, int(seq.max()), TOPK, 0, 1, HEADS, SM_SCALE,
         emit_sparse_block_table=True, max_query_len=S, block_page_stride=ppb,
         index_mxfp4=True, pages_per_block=ppb,
-        index_score_work_map=wmap, index_score_max_block=max_block,
+        index_score=IndexScoreStep(wmap, max_block, None),
     )  # fmt: skip
     _, picks, ctx = reference(cache, table, seq, q, S)
     assert sbt.shape == (batch * S, TOPK * ppb) and sctx.shape == (batch * S,)
@@ -161,6 +162,7 @@ def test_prefill_selection_matches_the_decode_definition():
 def test_a_captured_decode_follows_the_refilled_work_map():
     """The graph bakes the map's pointer and grid; a replay refills it in place."""
     from atom.model_ops.minimax_m3.index_mxfp4 import (
+        IndexScoreStep,
         build_index_work_map,
         index_work_map_capacity,
     )
@@ -184,7 +186,7 @@ def test_a_captured_decode_follows_the_refilled_work_map():
             q, cache, table, static_seq, max_block * 128, TOPK, 0, 1, HEADS, SM_SCALE,
             emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
             index_mxfp4=True, pages_per_block=1,
-            index_score_work_map=wmap, index_score_max_block=max_block,
+            index_score=IndexScoreStep(wmap, max_block, None),
         )  # fmt: skip
 
     run()  # warm up: JIT compile outside the capture
@@ -229,6 +231,7 @@ def test_a_persistent_score_buffer_changes_nothing():
     only if refilled: one refill a step must give the very scores (and selection)
     a fresh -inf buffer per call does, across permuted, shorter and smaller steps."""
     from atom.model_ops.minimax_m3.index_mxfp4 import (
+        IndexScoreStep,
         build_index_work_map,
         decode_score_mxfp4,
         fresh_index_score,
@@ -257,8 +260,8 @@ def test_a_persistent_score_buffer_changes_nothing():
         sel = minimax_m3_index_topk_decode(
             q, cache, table, seq, max_block * 128, TOPK, 0, 1, HEADS, SM_SCALE,
             emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
-            index_mxfp4=True, pages_per_block=1, index_score_work_map=wmap,
-            index_score_max_block=max_block, index_score_out=out,
+            index_mxfp4=True, pages_per_block=1,
+            index_score=IndexScoreStep(wmap, max_block, out),
         )  # fmt: skip
         return score.clone(), sel
 
@@ -286,6 +289,7 @@ def test_a_persistent_score_buffer_changes_nothing():
 def test_a_captured_decode_follows_the_refilled_score_buffer():
     """The graph bakes the buffer's pointer; the refill between replays is outside it."""
     from atom.model_ops.minimax_m3.index_mxfp4 import (
+        IndexScoreStep,
         build_index_work_map,
         fresh_index_score,
         index_score_buffer,
@@ -320,8 +324,7 @@ def test_a_captured_decode_follows_the_refilled_score_buffer():
             static_q, cache, static_table, static_seq, max_block * 128, TOPK, 0, 1,
             HEADS, SM_SCALE, emit_sparse_block_table=True, max_query_len=S,
             block_page_stride=1, index_mxfp4=True, pages_per_block=1,
-            index_score_work_map=wmap, index_score_max_block=max_block,
-            index_score_out=out,
+            index_score=IndexScoreStep(wmap, max_block, out),
         )  # fmt: skip
 
     out, wmap = prepare()
@@ -347,15 +350,12 @@ def test_a_captured_decode_follows_the_refilled_score_buffer():
 
 
 def test_the_decode_metadata_refills_the_score_view_once():
-    from atom.model_ops.minimax_m3.index_mxfp4 import (
-        index_score_buffer,
-        index_work_map_capacity,
-    )
+    from atom.model_ops.minimax_m3.index_mxfp4 import IndexScoreBuffers
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 
     batch, S, bound = 3, 8, 64
-    sbuf = index_score_buffer(8 * S, HEADS, bound, "cuda")
-    sbuf.fill_(1.0)  # an earlier step's scores
+    buffers = IndexScoreBuffers.alloc(8, S, HEADS, bound, "cuda")
+    buffers.scores.fill_(1.0)  # an earlier step's scores
     seq = torch.tensor([300, 1000, 5000], dtype=torch.int32, device="cuda")
     kw = {
         "seq_lens": seq,
@@ -365,21 +365,17 @@ def test_the_decode_metadata_refills_the_score_view_once():
         "num_idx_heads": HEADS,
         "max_query_len": S,
     }
-    wmap = torch.empty(
-        (index_work_map_capacity(8, bound, S, HEADS), 2),
-        dtype=torch.int32,
-        device="cuda",
-    )
-    md = make_sparse_decode_metadata(
-        **kw, index_score_work_map_out=wmap, index_score_max_block=bound,
-        index_score_buf=sbuf,
-    )  # fmt: skip
-    out = md.index_score_out
+    step = make_sparse_decode_metadata(**kw, index_score_buffers=buffers).index_score
+    out = step.out
     assert tuple(out.shape) == (HEADS, batch * S, bound)
-    assert out.data_ptr() == sbuf.data_ptr() and bool((out == float("-inf")).all())
-    assert bool((sbuf[out.numel() :] == 1.0).all())  # nothing past this step's rows
-    # another index cache: no map, so no score storage either
-    assert make_sparse_decode_metadata(**kw).index_score_out is None
+    assert out.data_ptr() == buffers.scores.data_ptr()
+    # the batch's own 40 blocks are reset, the columns past them (read by no row) not
+    assert bool((out[..., :40] == float("-inf")).all())
+    assert bool((out[..., 40:] == 1.0).all())
+    n = out.numel()
+    assert bool((buffers.scores[n:] == 1.0).all())  # nothing past this step's rows
+    # another index cache: no buffers, so no step state either
+    assert make_sparse_decode_metadata(**kw).index_score is None
 
 
 def test_a_padded_step_builds_the_map_and_scores_of_the_padded_batch():
@@ -387,22 +383,16 @@ def test_a_padded_step_builds_the_map_and_scores_of_the_padded_batch():
     the map's encoding and the score view's strides are the 8-request batch's, so
     the metadata is built from the 8 lengths, the 5 pad ones 0."""
     from atom.model_ops.minimax_m3.index_mxfp4 import (
+        IndexScoreBuffers,
         build_index_work_map,
-        index_score_buffer,
-        index_work_map_capacity,
     )
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 
     batch, running, S, bound = 3, 8, 8, 64
     padded = torch.zeros(running, dtype=torch.int32, device="cuda")
     padded[:batch] = torch.tensor([300, 1000, 5000], dtype=torch.int32)
-    sbuf = index_score_buffer(running * S, HEADS, bound, "cuda")
-    sbuf.fill_(1.0)
-    wmap = torch.empty(
-        (index_work_map_capacity(running, bound, S, HEADS), 2),
-        dtype=torch.int32,
-        device="cuda",
-    )
+    buffers = IndexScoreBuffers.alloc(running, S, HEADS, bound, "cuda")
+    buffers.scores.fill_(1.0)
     md = make_sparse_decode_metadata(
         seq_lens=padded,
         block_table=torch.zeros((running, bound), dtype=torch.int32, device="cuda"),
@@ -410,9 +400,7 @@ def test_a_padded_step_builds_the_map_and_scores_of_the_padded_batch():
         max_seq_len=5000,
         num_idx_heads=HEADS,
         max_query_len=S,
-        index_score_work_map_out=wmap,
-        index_score_max_block=bound,
-        index_score_buf=sbuf,
+        index_score_buffers=buffers,
     )
     want = build_index_work_map(
         padded, max_block=bound, max_query_len=S, num_idx_heads=HEADS
@@ -421,9 +409,9 @@ def test_a_padded_step_builds_the_map_and_scores_of_the_padded_batch():
         padded[:batch], max_block=bound, max_query_len=S, num_idx_heads=HEADS
     )
     assert want.shape[0] > scheduled.shape[0]
-    assert torch.equal(md.index_score_work_map, want)
-    assert tuple(md.index_score_out.shape) == (HEADS, running * S, bound)
-    assert bool((md.index_score_out == float("-inf")).all())
+    assert torch.equal(md.index_score.work_map, want)
+    assert tuple(md.index_score.out.shape) == (HEADS, running * S, bound)
+    assert bool((md.index_score.out[..., :40] == float("-inf")).all())
 
 
 def test_a_padded_step_publishes_the_selector_bounds_of_the_padded_batch():
@@ -481,7 +469,7 @@ def _assert_live_rows_match(got, want, live, heads):
     assert torch.equal(got[2][: live * heads], want[2])
 
 
-def _metadata(table, seq, S, wbuf, sbuf, nvalid, heads=HEADS):
+def _metadata(table, seq, S, buffers, nvalid, heads=HEADS):
     """What the builder refills each step, outside any graph."""
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 
@@ -494,9 +482,7 @@ def _metadata(table, seq, S, wbuf, sbuf, nvalid, heads=HEADS):
         num_idx_heads=heads,
         max_query_len=S,
         n_valid_column_per_row_out=nvalid,
-        index_score_work_map_out=wbuf,
-        index_score_max_block=bound,
-        index_score_buf=sbuf,
+        index_score_buffers=buffers,
     )
 
 
@@ -510,26 +496,16 @@ def _select(q, cache, table, seq, S, md, heads=HEADS):
         emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
         index_mxfp4=True, pages_per_block=1,
         n_valid_column_per_row=md.n_valid_column_per_row,
-        index_score_work_map=md.index_score_work_map,
-        index_score_max_block=md.index_score_max_block,
-        index_score_out=md.index_score_out,
+        index_score=md.index_score,
     )  # fmt: skip
 
 
 def _buffers(running, S, bound, heads=HEADS):
-    from atom.model_ops.minimax_m3.index_mxfp4 import (
-        index_score_buffer,
-        index_work_map_capacity,
-    )
+    from atom.model_ops.minimax_m3.index_mxfp4 import IndexScoreBuffers
 
-    wbuf = torch.empty(
-        (index_work_map_capacity(running, bound, S, heads), 2),
-        dtype=torch.int32,
-        device="cuda",
-    )
-    sbuf = index_score_buffer(running * S, heads, bound, "cuda")
+    buffers = IndexScoreBuffers.alloc(running, S, heads, bound, "cuda")
     nvalid = torch.empty(heads * running * S, dtype=torch.int32, device="cuda")
-    return wbuf, sbuf, nvalid
+    return buffers, nvalid
 
 
 @pytest.mark.parametrize("fill", PAD_FILLS)
@@ -566,11 +542,11 @@ def test_a_graph_replays_a_padded_step_like_the_scheduled_batch(S, heads, fill):
     running, scheduled = 8, 3
     cache, table, seq, q = make_case(running, S, seed=80 + S, heads=heads)
     bound = table.shape[1]
-    wbuf, sbuf, nvalid = _buffers(running, S, bound, heads)
+    buffers, nvalid = _buffers(running, S, bound, heads)
     static = [x.clone() for x in (table, seq, q)]
 
     def refill():
-        return _metadata(static[0], static[1], S, wbuf, sbuf, nvalid, heads)
+        return _metadata(static[0], static[1], S, buffers, nvalid, heads)
 
     def run(md):
         return _select(static[2], cache, static[0], static[1], S, md, heads)
@@ -594,3 +570,50 @@ def test_a_graph_replays_a_padded_step_like_the_scheduled_batch(S, heads, fill):
     want = _select(q[: scheduled * S], cache, table[:scheduled], seq[:scheduled], S, md, heads)  # fmt: skip
     _assert_live_rows_match(got, want, scheduled * S, heads)
     _assert_pad_rows_are_empty(got, scheduled * S, heads)
+
+
+@pytest.mark.parametrize("heads", [1, 2])
+@pytest.mark.parametrize("S", [1, 8])
+def test_an_eager_step_at_the_batch_block_count_selects_like_the_model_width(S, heads):
+    """The step's own block count (`eager`) must not change what is selected: the
+    scorer's grid, the score width and the selector's inputs shrink, the selection
+    does not. The batch is much shorter than the buffers' model-length bound."""
+    from atom.model_ops.minimax_m3.index_mxfp4 import IndexScoreBuffers
+    from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
+    from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
+
+    batch = 5
+    cache, table, seq, q = make_case(
+        batch, S, seed=90 + S, max_len=128 * 12, heads=heads
+    )
+    model_blocks = 64  # the buffers' bound: far past this batch's 12 blocks
+    # the block table is as wide as the model, as the builder's is
+    table = torch.nn.functional.pad(table, (0, model_blocks - table.shape[1]))
+    max_seq = int(seq.max())
+    buffers = IndexScoreBuffers.alloc(batch, S, heads, model_blocks, "cuda")
+    nvalid = torch.empty(heads * batch * S, dtype=torch.int32, device="cuda")
+    outs = []
+    for eager in (False, True):
+        md = make_sparse_decode_metadata(
+            seq_lens=seq,
+            block_table=table,
+            slot_mapping=torch.zeros(batch * S, dtype=torch.int64, device="cuda"),
+            max_seq_len=max_seq,
+            num_idx_heads=heads,
+            max_query_len=S,
+            n_valid_column_per_row_out=nvalid,
+            index_score_buffers=buffers,
+            index_score_eager=eager,
+        )
+        assert md.index_score.max_block == (-(-max_seq // 128) if eager else 64)
+        outs.append(
+            minimax_m3_index_topk_decode(
+                q, cache, table, seq, max_seq, TOPK, 0, 1, heads, SM_SCALE,
+                emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
+                index_mxfp4=True, pages_per_block=1,
+                n_valid_column_per_row=md.n_valid_column_per_row,
+                index_score=md.index_score,
+            )  # fmt: skip
+        )
+    for graph_width, eager_width in zip(*outs):
+        assert torch.equal(graph_width, eager_width)

@@ -13,7 +13,7 @@ import torch
 def calibration_identity(config, device):
     model = Path(config.model)
     files = ("config.json", "model.safetensors.index.json")
-    identity = {
+    return {
         "model_files": {
             name: hashlib.sha256((model / name).read_bytes()).hexdigest()
             for name in files
@@ -27,12 +27,6 @@ def calibration_identity(config, device):
         "torch_version": torch.__version__,
         "hip_version": torch.version.hip,
     }
-    # `--kv-cache-dtype fp4` on MiniMax-M3 leaves kv_cache_dtype at "fp8", so the
-    # keys above cannot tell MXFP4 KV from fp8 KV. Added only when set, so every
-    # profile calibrated without it still matches.
-    if getattr(config, "kv_mxfp4", False):
-        identity["kv_mxfp4"] = True
-    return identity
 
 
 def validate_calibration(profile, identity, *, width, max_batch):

@@ -2602,6 +2602,7 @@ class ModelRunner:
             running_tokens=running_tokens,
             max_seqlen_q=forward_mode.max_seqlen_q,
             ubatch_split_bs=forward_mode.ubatch_split_bs,
+            use_cudagraph=forward_mode.use_cudagraph,
         )
         self.attn_metadata_builder.prepare_model_inputs(input_ids, attn_metadata)
         context = Context(

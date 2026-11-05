@@ -11,11 +11,14 @@ element) and one e8m0 scale per 32 elements::
 
 This is the page the aiter writer (``fused_qknorm_idxrqknorm`` with
 ``kv_cache_dtype="mxfp4"``) produces and ``pa_decode`` (MXFP4 K/V) /
-``score_flydsl_fp4`` read: 68 B a token, 136 B for K and V together, against
-the 264 B an fp8 K/V token costs (128 B of values and a 4 B scale, twice).
+``score_flydsl_fp4`` read.
 """
 
+from dataclasses import dataclass
+
 import torch
+
+from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
 
 PAGE_TOKENS = 128
 HEAD_DIM = 128
@@ -51,3 +54,37 @@ def page_views(pages: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         off + DATA_PAGE_BYTES,
     )
     return data, scale
+
+
+@dataclass(frozen=True)
+class Mxfp4KvLayout:
+    """MiniMax-M3's sparse layers' K/V under ``--kv-cache-dtype fp4``, as an
+    ``MhaKvPool`` layout: per (page, kv head) one 8704 B field of e2m1 data and e8m0
+    scales, K and V a field each, no scale planes."""
+
+    tag: str = "fp4"
+
+    def check(self, block_size: int, head_dim: int, blocks_per_entry: int) -> None:
+        if block_size != PAGE_TOKENS or head_dim != HEAD_DIM or blocks_per_entry != 1:
+            raise ValueError(
+                f"an MXFP4 KV page is {PAGE_TOKENS} tokens of head_dim {HEAD_DIM}, "
+                f"one block an entry; got block_size {block_size}, head_dim "
+                f"{head_dim}, {blocks_per_entry} blocks an entry"
+            )
+
+    def cache_fields(self, layers, entry_tokens, num_kv_heads, head_dim):
+        per_entry = num_kv_heads * PAGE_BYTES
+        return [
+            EntryField("k", layers, (per_entry,), torch.uint8),
+            EntryField("v", layers, (per_entry,), torch.uint8),
+        ]
+
+    def scale_fields(self, layers, entry_tokens, num_kv_heads):
+        return []
+
+    def kv_views(self, pool, layer):
+        shape = (-1, pool.num_kv_heads, PAGE_BYTES)
+        return (
+            pool.field_view("k", layer, torch.uint8, shape),
+            pool.field_view("v", layer, torch.uint8, shape),
+        )

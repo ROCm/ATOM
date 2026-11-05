@@ -1,11 +1,9 @@
-import copy
 import logging
 
 import torch
 from torch import nn
 from torch.profiler import record_function
 
-from atom.config import CompilationLevel
 from atom.distributed.dcp_utils import get_dcp_world_size
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
@@ -206,17 +204,9 @@ class EagleProposer(Drafter):
             # Eagle3 draft has its own architecture, so build it from the
             # draft hf_config. Disable torch.compile for the draft to avoid
             # Dynamo tracing issues with the separate KV cache binding.
-            # Shallow-copy instead of deepcopy: with MLA targets (K2.6), the
-            # atom_config holds non-picklable cuda.Stream objects under
-            # downstream fields that deepcopy can't traverse. We only mutate
-            # hf_config and compilation_config.level on the draft, so
-            # isolating just those two attrs is sufficient.
-            draft_atom_config = copy.copy(self.config)
-            draft_atom_config.hf_config = draft_model_hf_config
-            draft_atom_config.compilation_config = copy.copy(
-                self.config.compilation_config
-            )
-            draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
+            # `draft_config` is a shallow copy (see there): the draft gets its own
+            # hf_config, no compilation and the storage KV dtype.
+            draft_atom_config = self.config.draft_config(draft_model_hf_config)
             # Draft attention layer_num must continue from the target model's
             # layer count so it maps to the correct kv_cache_data entry.
             model = model_class(

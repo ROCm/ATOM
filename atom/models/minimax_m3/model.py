@@ -47,6 +47,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
+from atom.models.minimax_m3.config import dense_kv_cache_dtype
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
     IntermediateTensors,
@@ -436,7 +437,7 @@ class MiniMaxM3Attention(nn.Module):
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
-            kv_cache_dtype=cache_config,
+            kv_cache_dtype=dense_kv_cache_dtype(cache_config),
             layer_num=layer_id,
             use_mla=False,
             rotary_emb=self.rotary_emb,

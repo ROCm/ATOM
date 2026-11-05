@@ -380,15 +380,9 @@ class DSparkProposer(Drafter):
         # EagleProposer does for eagle3. Shallow-copy rather than deepcopy --
         # atom_config can hold non-picklable cuda.Stream objects, and only
         # hf_config / compilation_config are mutated here.
-        import copy
-
-        from atom.config import CompilationLevel
 
         draft_hf = self.speculative_config.draft_model_hf_config
-        draft_atom_config = copy.copy(self.config)
-        draft_atom_config.hf_config = draft_hf
-        draft_atom_config.compilation_config = copy.copy(self.config.compilation_config)
-        draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
+        draft_atom_config = self.config.draft_config(draft_hf)
         model = model_class(
             draft_atom_config,
             layer_offset=self.config.hf_config.num_hidden_layers,
@@ -470,7 +464,7 @@ class DSparkProposer(Drafter):
 
         # d_dtypes maps the "auto" cache dtype to None, and torch.empty would
         # silently read that as float32 rather than the model dtype.
-        from_config = dtypes.d_dtypes.get(self.config.kv_cache_dtype) or self.dtype
+        from_config = dtypes.d_dtypes.get(self.config.kv_storage_dtype) or self.dtype
 
         bound = self._bound_draft_k_cache(forward_context)
         if bound is None:
@@ -489,7 +483,7 @@ class DSparkProposer(Drafter):
                 "resolved to a draft row and not to a target layer.",
                 layer_num,
                 bound.dtype,
-                self.config.kv_cache_dtype,
+                self.config.kv_storage_dtype,
                 from_config,
                 layer_num,
             )
