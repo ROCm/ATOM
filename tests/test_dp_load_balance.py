@@ -973,10 +973,10 @@ def test_a_rank_full_of_decodes_is_not_idle():
     assert _route(mgr, [_chain_seq(3, 110_000)]) == [other]
 
 
-def test_a_terminal_output_completes_the_prefill_only_if_it_was_dispatched():
-    """The scheduler's own fact decides (`Sequence.prefill_dispatched`), not
+def test_a_terminal_output_completes_the_prefill_only_after_forward():
+    """The scheduler's own fact decides (`Sequence.prefill_completed`), not
     whether a token came out. An error mid-prefill left no prefix: the prefix
-    entries are dropped. An abort after the last chunk was dispatched did:
+    entries are dropped. An abort after the last chunk completed did:
     the entries stay, though no first token ever came."""
     from types import SimpleNamespace
 
@@ -984,11 +984,11 @@ def test_a_terminal_output_completes_the_prefill_only_if_it_was_dispatched():
     (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
     out = SimpleNamespace(finished=True, output_tokens=[], prefill_complete=False)
     assert not out.prefill_complete  # the STREAM handler's test
-    mgr._release_terminal_seq(SimpleNamespace(id=1, prefill_dispatched=False))
+    mgr._release_terminal_seq(SimpleNamespace(id=1, prefill_completed=False))
     assert not mgr._prefix_router.index  # dropped: its KV was never written
 
     (owner,) = _route(mgr, [_chain_seq(2, 100_000)])
-    mgr._release_terminal_seq(SimpleNamespace(id=2, prefill_dispatched=True))
+    mgr._release_terminal_seq(SimpleNamespace(id=2, prefill_completed=True))
     hits, src_owner, _ = mgr._prefix_router._rank_hits(
         _chain_seq(9, 100_000).prompt_hash_chain, 2
     )

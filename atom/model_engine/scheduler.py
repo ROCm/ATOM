@@ -2740,9 +2740,6 @@ class Scheduler:
                 >= seq.num_tokens
                 for i, seq in enumerate(scheduled_seqs.values())
             ]
-            for seq, final in zip(scheduled_seqs.values(), is_final_chunk):
-                if final:
-                    seq.prefill_dispatched = True
             next_token_ids = None
             if self.drafter_needs_next_token:
                 next_token_ids = []
@@ -4204,7 +4201,7 @@ class Scheduler:
             self._partial_prefill_count -= 1
         # Its next admission prefills again; the flag says whether *that* one
         # was dispatched to the end.
-        seq.prefill_dispatched = False
+        seq.prefill_completed = False
         # This free runs no `request_finished`; drop any stall-escaped save
         # tracker now so the connector's save loop cannot later read these
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
@@ -4392,6 +4389,8 @@ class Scheduler:
                     start_tokens=start_tokens,
                     replay_until=_scheduled_replay_until(batch, i),
                 )
+                if start_tokens + chunk >= seq.num_prompt_tokens:
+                    seq.prefill_completed = True
                 if not is_final:
                     pp_middle_chunk_ids.add(req_id)
                 elif i >= batch.total_seqs_num_decode:
@@ -4414,6 +4413,8 @@ class Scheduler:
                     seq, chunk, replay_until=_scheduled_replay_until(batch, i)
                 )
                 seq.num_cached_tokens += chunk
+                if seq.num_cached_tokens >= seq.num_prompt_tokens:
+                    seq.prefill_completed = True
                 # Ask the scheduler what it decided rather than re-deriving it
                 # from lengths here. It froze `is_final_chunk` at pre-advance
                 # offsets, against the whole admitted length -- which for a
@@ -4473,7 +4474,7 @@ class Scheduler:
                                 output_tokens=[],
                                 finished=True,
                                 finish_reason="structured_output_error",
-                                prefill_complete=seq.prefill_dispatched,
+                                prefill_complete=seq.prefill_completed,
                             ),
                         )
                     )
@@ -4799,6 +4800,9 @@ class Scheduler:
                 # output. Aborts without sampled output use the same helper.
                 self._mark_finished(seq, leave_reason, num_tokens)
 
+            # Decode output also proves prompt availability on a P/D consumer.
+            seq.prefill_completed = True
+
             # Prepare stream output
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
@@ -4821,7 +4825,7 @@ class Scheduler:
                         seq, "kv_transfer_params_output", None
                     ),
                     num_cached_tokens=getattr(seq, "prefix_cache_hit_tokens", 0),
-                    prefill_complete=seq.prefill_dispatched or bool(new_tokens),
+                    prefill_complete=seq.prefill_completed,
                 )
 
                 if request_output.kv_transfer_params_output is not None:

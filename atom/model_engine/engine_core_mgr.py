@@ -1634,6 +1634,7 @@ class CoreManager:
                     output_tokens=[],
                     finished=True,
                     finish_reason=reason,
+                    prefill_complete=getattr(seq, "prefill_completed", False),
                 )
             )
         except Exception as e:
@@ -1675,11 +1676,9 @@ class CoreManager:
         self._rank_tokens[dp_rank] -= tok_cost
 
     def _release_terminal_seq(self, seq) -> None:
-        """Release a finished sequence the engine handed back. One whose
-        prefill was dispatched to the end (an abort before its first token,
-        say) leaves its prefix behind: it completed that prefill, as a first
-        token would have shown."""
-        if getattr(seq, "prefill_dispatched", False):
+        """Release a returned sequence using its completed-forward fact,
+        including an abort before its first sampled token."""
+        if getattr(seq, "prefill_completed", False):
             self._mark_seq_prefill_complete(seq.id)
         self._release_seq_load(seq.id)
 
