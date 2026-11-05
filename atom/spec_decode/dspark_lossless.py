@@ -239,6 +239,7 @@ class DSparkLossless:
         group,
         *,
         drafts_verifiable: bool,
+        verifies: bool,
     ) -> None:
         """Stage this step's draft inputs and both q row bases into the host
         buffers and claim their counts in ``group``, the `sampling`
@@ -247,6 +248,7 @@ class DSparkLossless:
             batch,
             bs,
             drafts_verifiable=drafts_verifiable,
+            verifies=verifies,
         )
         counts, at = group.counts, group.indices
         counts[at["draft_seed"]] = rows.seed
@@ -256,7 +258,8 @@ class DSparkLossless:
     def verify_inputs(self, bs: int) -> tuple[SparseQStore, torch.Tensor, int]:
         """What the verify reads of the draft: the q store, each of the ``bs``
         requests' first q row (-1: none), and the Philox step this forward
-        staged, which keys the verify's draws as it keys the draft's."""
+        staged, which keys the verify's draws as it keys the draft's. Only for
+        a forward staged with ``verifies``: any other publishes no q rows."""
         return self.q_store, self.verify_q_row_base.gpu[:bs], int(self.seed.np[0])
 
     def clear_destinations(self) -> None:

@@ -125,10 +125,12 @@ def batch(
     )
 
 
-def stage(prop, b, *, verifiable=True):
+def stage(prop, b, *, verifiable=True, verifies=True):
     """One forward's staging."""
     g = group(prop)
-    prop.lossless.stage(b, len(b.req_ids), g, drafts_verifiable=verifiable)
+    prop.lossless.stage(
+        b, len(b.req_ids), g, drafts_verifiable=verifiable, verifies=verifies
+    )
     return {name: g.counts[g.indices[name]] for name in LOSSLESS}
 
 

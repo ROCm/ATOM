@@ -55,13 +55,20 @@ class DraftQStaging:
         # Staged since the last propose consumed a staging.
         self._fresh = False
 
-    def stage(self, batch, bs: int, *, drafts_verifiable: bool):
+    def stage(self, batch, bs: int, *, drafts_verifiable: bool, verifies: bool):
         """Stage one step and return the rows to publish (`StagedRows`).
 
         ``drafts_verifiable``: this step's propose emits drafts a later verify
         may read. False for a dummy forward and an align-only middle chunk:
         those claim no slot and write no q, so their ids (warmup's 0..n-1, the
         DP dummy's -1) never enter the slot map.
+
+        ``verifies``: this forward's verify reads q: it scores drafts
+        (`ModelRunner._verifies_drafts`) and the batch is not all greedy, the
+        gate `postprocess` asks `DSparkLossless.verify_inputs` under. False for
+        a prefill, align-only, dummy or all-greedy forward: no lookup is made
+        and no verify row is published, so the device rows keep an earlier
+        step's bases, which nothing reads.
         """
         # The Philox key. A plain SPMD counter, so every TP rank reaches the
         # same number without exchanging it.
@@ -71,8 +78,10 @@ class DraftQStaging:
         req_ids = batch.req_ids[:bs]
         # Verify bases before claims: a claim may hand a slot to a new request,
         # and a request's verify must still read the slot its drafts came from.
-        # Written every step; one whose verify reads no q ignores them.
-        self.slots.verify_bases(req_ids, self._verify)
+        verify_rows = None
+        if verifies:
+            self.slots.verify_bases(req_ids, self._verify)
+            verify_rows = bs or None
         # Every row the block runs must name a destination, the pad rows up to
         # `running_bs` included, and a pad row left holding a larger previous
         # batch's base would write its q into a live request's slot. So clear
@@ -94,7 +103,7 @@ class DraftQStaging:
         else:
             self._dest[:hi] = -1
             self._dest_hi = 0
-        return StagedRows(seed=1, q_row_base=hi or None, verify_q_row_base=bs or None)
+        return StagedRows(seed=1, q_row_base=hi or None, verify_q_row_base=verify_rows)
 
     def consume(self) -> None:
         """Claim the staging for the propose about to run, or refuse one that

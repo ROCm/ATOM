@@ -10,6 +10,7 @@ around it.
 """
 
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -56,9 +57,9 @@ def batch(
     )
 
 
-def stage(st, b, *, verifiable=True):
+def stage(st, b, *, verifiable=True, verifies=True):
     """One forward's staging."""
-    return st.stage(b, len(b.req_ids), drafts_verifiable=verifiable)
+    return st.stage(b, len(b.req_ids), drafts_verifiable=verifiable, verifies=verifies)
 
 
 def test_a_verify_finds_the_rows_its_drafts_were_written_to():
@@ -77,9 +78,9 @@ def test_a_dummy_forward_claims_nothing_and_verifies_nothing():
     """Warmup and DP dummies carry ids 0..n-1 and -1; none may enter the map,
     or a real request 0 would later verify against a dummy's q."""
     st, a = staging()
-    stage(st, batch([0, 1, -1], dummy=True), verifiable=False)
+    rows = stage(st, batch([0, 1, -1], dummy=True), verifiable=False, verifies=False)
     assert a.q_row_base[:3].tolist() == [-1, -1, -1]
-    assert a.verify_q_row_base[:3].tolist() == [-1, -1, -1]
+    assert rows.verify_q_row_base is None
     assert len(st.slots) == 0
     stage(st, batch([0]))
     assert a.verify_q_row_base[0] == -1
@@ -89,7 +90,7 @@ def test_an_align_only_propose_writes_no_q_and_keeps_other_slots():
     st, a = staging()
     stage(st, batch(["d"]))
     d = a.q_row_base[0]
-    rows = stage(st, batch(["m1", "m2"]), verifiable=False)
+    rows = stage(st, batch(["m1", "m2"]), verifiable=False, verifies=False)
     assert a.q_row_base[:2].tolist() == [-1, -1]
     assert rows.q_row_base == 2
     assert "m1" not in st.slots and "m2" not in st.slots
@@ -104,10 +105,8 @@ def test_a_request_re_prefilled_after_its_slot_expired_reads_its_new_slot():
     st, a = staging(slots=1)
     stage(st, batch(["a"]))
     stage(st, batch(["b"]))  # a expires
-    stage(st, batch(["a"]), verifiable=False)  # middle chunk
-    assert a.verify_q_row_base[0] == -1
-    stage(st, batch(["a"], final_chunk=[True]))
-    assert a.verify_q_row_base[0] == -1
+    stage(st, batch(["a"]), verifiable=False, verifies=False)  # middle chunk
+    stage(st, batch(["a"], final_chunk=[True]), verifies=False)
     claimed = a.q_row_base[0]
     stage(st, batch(["a"]))
     assert a.verify_q_row_base[0] == claimed
@@ -123,14 +122,36 @@ def test_a_mid_prompt_member_expired_by_its_own_batch_loses_nothing():
     stage(
         st,
         batch(["m", "c"], final_chunk=[False, True]),
+        verifies=False,
     )
     assert "m" not in st.slots
     assert a.q_row_base[0] == -1
-    stage(st, batch(["m"], final_chunk=[True]))
+    stage(st, batch(["m"], final_chunk=[True]), verifies=False)
     claimed = a.q_row_base[0]
     assert claimed >= 0
     stage(st, batch(["m"]))
     assert a.verify_q_row_base[0] == claimed
+
+
+def test_an_all_greedy_step_does_not_touch_the_slots():
+    """The runner passes ``verifies`` False for an all-greedy batch, whose
+    exact-match verify reads no q: no lookup, no host write, no verify row
+    published. The next sampled verify still finds its q."""
+    st, a = staging()
+    stage(st, batch(["s", "g"], [1.0, 0.0]))
+    drafted = a.q_row_base[0]
+    before = a.verify_q_row_base.copy()
+    with mock.patch.object(
+        st.slots, "verify_bases", wraps=st.slots.verify_bases
+    ) as lookup:
+        rows = stage(st, batch(["g"], [0.0]), verifies=False)
+        lookup.assert_not_called()
+        assert rows.verify_q_row_base is None
+        np.testing.assert_array_equal(a.verify_q_row_base, before)
+        rows = stage(st, batch(["s", "g"], [1.0, 0.0]))
+        lookup.assert_called_once()
+    assert rows.verify_q_row_base == 2
+    assert a.verify_q_row_base[:2].tolist() == [drafted, -1]
 
 
 def test_a_greedy_request_claims_no_slot_and_writes_no_q():
@@ -150,11 +171,15 @@ def test_a_request_still_mid_prompt_claims_no_slot():
     """In a prefill batch where some requests finish their prompt and others
     do not, the unfinished ones' drafts are dropped, so they claim nothing."""
     st, a = staging()
-    stage(st, batch(["done", "mid", "done2"], final_chunk=[True, False, True]))
+    stage(
+        st,
+        batch(["done", "mid", "done2"], final_chunk=[True, False, True]),
+        verifies=False,
+    )
     assert a.q_row_base[1] == -1
     assert a.q_row_base[0] >= 0 and a.q_row_base[2] >= 0
     assert "mid" not in st.slots
-    stage(st, batch(["mid"], final_chunk=[True]))
+    stage(st, batch(["mid"], final_chunk=[True]), verifies=False)
     assert "mid" in st.slots and a.q_row_base[0] >= 0
 
 

@@ -82,7 +82,10 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         runner_module.ModelRunner.postprocess(
             runner,
             SimpleNamespace(
-                total_seqs_num=bs, return_logprobs=[False] * bs, required_channel=None
+                total_seqs_num=bs,
+                return_logprobs=[False] * bs,
+                any_logprobs=False,
+                required_channel=None,
             ),
             torch.zeros(4, 8),
             torch.ones(bs),
@@ -157,6 +160,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
             SimpleNamespace(
                 total_seqs_num=bs,
                 return_logprobs=[False] * bs,
+                any_logprobs=False,
                 required_channel=None,
             ),
             torch.zeros(4, 8),
@@ -249,6 +253,7 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
     runner = SimpleNamespace(
         forward_vars=buffers,
         drafter=SimpleNamespace(lossless=SimpleNamespace(stage=mock.Mock())),
+        _verifies_drafts=lambda batch, is_prefill: not is_prefill,
         _is_pure_middle_chunk=lambda batch: False,
     )
     batch = SimpleNamespace(
@@ -258,6 +263,7 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
         top_ps=np.array(ps, np.float32),
         required_channel=None,
         is_dummy_run=False,
+        total_tokens_num_prefill=0,
     )
     _, top_ks, top_ps, _, _ = runner_module.ModelRunner.prepare_sample(
         runner, batch, publication_group=group
@@ -272,6 +278,52 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
         assert top_ps == np.float32(ps[0])
     if len(set(ps)) > 1:
         assert top_ps.data_ptr() == buffers["top_ps"].gpu.data_ptr()
+
+
+@pytest.mark.parametrize(
+    "temps, prefill, verifies",
+    [([0.0, 0.0], 0, False), ([0.0, 0.7], 0, True), ([0.0, 0.7], 3, False)],
+    ids=["all-greedy", "sampled", "prefill"],
+)
+def test_the_draft_q_lookup_is_gated_like_its_consumer(temps, prefill, verifies):
+    """`postprocess` asks for the ratio verify's q only on a forward that
+    scores drafts and is not all greedy; staging looks q up under the same
+    gate, so no verify reads bases a skipped step left stale."""
+    bs = len(temps)
+    buffers = {
+        name: SimpleNamespace(np=np.zeros(4, dtype), gpu=torch.zeros(4))
+        for name, dtype in (
+            ("temperatures", np.float32),
+            ("top_ks", np.int32),
+            ("top_ps", np.float32),
+        )
+    }
+    names = [*buffers, "required_channel_states", "logprob_request_indices"]
+    group = SimpleNamespace(
+        counts=[None] * len(names), indices={n: i for i, n in enumerate(names)}
+    )
+    staged = mock.Mock()
+    runner = SimpleNamespace(
+        forward_vars=buffers,
+        drafter=SimpleNamespace(lossless=SimpleNamespace(stage=staged)),
+        _verifies_drafts=lambda batch, is_prefill: not is_prefill,
+        _is_pure_middle_chunk=lambda batch: False,
+    )
+    batch = SimpleNamespace(
+        total_seqs_num=bs,
+        temperatures=np.array(temps, np.float32),
+        top_ks=np.full(bs, -1, np.int32),
+        top_ps=np.ones(bs, np.float32),
+        required_channel=None,
+        is_dummy_run=False,
+        total_tokens_num_prefill=prefill,
+    )
+    *_, all_greedy, _ = runner_module.ModelRunner.prepare_sample(
+        runner, batch, publication_group=group
+    )
+    consumer_reads_q = not all_greedy and runner._verifies_drafts(batch, prefill > 0)
+    assert consumer_reads_q is verifies
+    assert staged.call_args.kwargs["verifies"] is verifies
 
 
 @pytest.mark.parametrize("max_num_seqs", [1, 64])
