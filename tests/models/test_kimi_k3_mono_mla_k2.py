@@ -265,6 +265,7 @@ def test_k2_builds_cover_full_attention_layers_and_k1_builds_do_not(runner_modul
     runner = object.__new__(runner_module.K3MonoDecodeRunner)
     runner.debug = False
     runner.state_len = 3
+    runner.replay_cap = 0  # no ReplaySSM record buffers
     runner.plans = [
         _plan(1, kda=_stub_kda(), moe=_stub_moe()),
         _plan(3, kda=None, moe=_stub_moe()),

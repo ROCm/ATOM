@@ -632,9 +632,9 @@ def run_pa_decode(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
     *,
-    exp_sums: torch.Tensor,
-    max_logits: torch.Tensor,
-    temporary_output: torch.Tensor,
+    exp_sums: torch.Tensor | None = None,
+    max_logits: torch.Tensor | None = None,
+    temporary_output: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
@@ -655,6 +655,10 @@ def run_pa_decode(
     domain covers the call: ``_flydsl_pa_decode_num_seqs`` mirrors the kernel's
     own validation. Unsupported shapes fall back on GPUs with gluon support;
     a GPU without gluon raises an explicit error.
+
+    ``exp_sums`` / ``max_logits`` / ``temporary_output`` are gluon scratch.
+    Omitted, ``pa_decode_gluon`` sizes and allocates its own, so a FlyDSL
+    call, which uses its plan's cached scratch, allocates none.
     """
     flydsl_seqs = flydsl_decode_seqs(
         output=output,

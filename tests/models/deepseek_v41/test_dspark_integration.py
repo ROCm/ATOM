@@ -201,9 +201,13 @@ def capture_fixture(monkeypatch):
     proposer = DSparkProposer.__new__(DSparkProposer)
     proposer.model = draft
     proposer.speculative_config = SimpleNamespace(
-        draft_model_hf_config=SimpleNamespace(dspark_target_layer_ids=(0,))
+        draft_model_hf_config=SimpleNamespace(dspark_target_layer_ids=(0,)),
+        use_dspark=lambda: True,
     )
-    proposer.config = SimpleNamespace(hf_config=SimpleNamespace(hidden_size=8))
+    proposer.config = SimpleNamespace(
+        hf_config=SimpleNamespace(hidden_size=8),
+        speculative_config=proposer.speculative_config,
+    )
     proposer.max_num_tokens, proposer.device, proposer.dtype = 9, "cpu", torch.float32
     target = nn.Module()
     target.layers = nn.ModuleList([ShiftBlock()])
@@ -236,7 +240,7 @@ def test_input_capture_uses_stream_mean_and_respects_offset_and_draft(monkeypatc
 
 def test_output_capture_remains_default(monkeypatch):
     proposer, target, _ = capture_fixture(monkeypatch)
-    proposer._aux_capture_spec = lambda _: AuxCaptureSpec(
+    proposer._aux_capture_spec = lambda: AuxCaptureSpec(
         (0,), 8, lambda output, block: output.residual.mean(-2).squeeze(0)
     )
     proposer.arm_aux_capture(target)
@@ -269,7 +273,11 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
     builder.cache = PagedAttentionCache(builder.geometry, 20, 5, "cpu")
     builder.block_size, builder.device = 16, "cpu"
     builder.model_runner = SimpleNamespace(
-        tokenID_processor=SimpleNamespace(num_rejected=np.array([0, 4])),
+        # Deferred output (pp == 1): the verify window's shift is num_rejected.
+        tokenID_processor=SimpleNamespace(
+            num_rejected=np.array([0, 4]),
+            verify_ctx_lens=lambda ctx: ctx - np.array([0, 4]),
+        ),
         forward_vars=metadata_buffers(2, 4, 10, geometry=builder.geometry),
     )
     batch = SimpleNamespace(
