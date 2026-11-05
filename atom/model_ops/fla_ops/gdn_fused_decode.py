@@ -147,7 +147,8 @@ def decode(layer, mixed_qkv, b, a, z, conv_state, ssm_state, state_indices, out)
     return True
 
 
-def verify(layer, mixed_qkv, b, a, z, conv_state, ssm_state, layer_cache, md, out):
+def verify(layer, mixed_qkv, b, a, z, conv_state, ssm_state, layer_cache, md, out, out_scale=None,
+           out_scale_rows=None):
     """Run a speculative-verify batch on ReplaySSM state and write
     ``norm(core) * silu(z)`` into ``out``.
 
@@ -190,6 +191,8 @@ def verify(layer, mixed_qkv, b, a, z, conv_state, ssm_state, layer_cache, md, ou
         scale=layer.head_k_dim**-0.5,
         norm_eps=layer.gated_norm.eps,
         out=out,
+        # MXFP8 out (fp8 `out`): e8m0 bytes at g * out_scale_rows + m, the out_proj GEMM's transposed layout
+        **({} if out_scale is None else {"out_scale": out_scale, "out_scale_rows": out_scale_rows}),
     )
     return True
 

@@ -291,6 +291,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # `num_valid_routes`: the gfx1250 grouped TP path then skips the
     # `num_local_tokens * topk` multiply it launches in every MoE layer. Needs
     # an aiter whose fused_moe takes `num_valid_routes`; off, nothing passes it.
+    # Schedule and dispatch the next step's prefill while a pure decode forward is
+    # still in flight (EngineCore._early_prefill_ok gates it), and let a pure
+    # prefill take the previous step's speculative status after its launch
+    # instead of before it. Hides the prefill schedule() and the dispatch behind
+    # the decode on the GPU.
+    "ATOM_EARLY_PREFILL_SCHEDULE": lambda: (
+        os.getenv("ATOM_EARLY_PREFILL_SCHEDULE", "0") == "1"
+    ),
     "ATOM_MOE_PRECOMPUTED_NVR": lambda: (
         os.getenv("ATOM_MOE_PRECOMPUTED_NVR", "0") == "1"
     ),
@@ -312,6 +320,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
+    # MXFP8 activations for e8m0 per_1x128 projections: the kernel that produces a projection's input (the MoE-tail
+    # RMSNorm, the attention output gate, the GDN output kernels) writes fp8 + e8m0 scales itself, so the Linear
+    # skips its standalone activation quant. Bit-identical to the unfused path.
+    # Online-quantize the fused GDN in_proj (in_proj_qkvzba) too: a quantized checkpoint builds it bf16, and its
+    # prefix is not the one the online quant config's patterns name.
+    "ATOM_GDN_IN_PROJ_ONLINE_QUANT": lambda: (
+        os.getenv("ATOM_GDN_IN_PROJ_ONLINE_QUANT", "0") == "1"
+    ),
+    "ATOM_MXFP8_FUSED_ACT_QUANT": lambda: (
+        os.getenv("ATOM_MXFP8_FUSED_ACT_QUANT", "0") == "1"
+    ),
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
         os.getenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", "0") == "1"
     ),
@@ -1003,6 +1022,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (`entrypoints/openai/tokenize_pool.py`). 0 tokenizes in the server's own
     # preprocessing threads, which cannot encode in parallel.
     "ATOM_TOKENIZE_PROCESSES": lambda: int(os.getenv("ATOM_TOKENIZE_PROCESSES", "0")),
+    # Chat completions prepared in those worker processes instead of on the API
+    # server's event loop (`entrypoints/openai/chat_offload.py`): the loop takes
+    # the raw body bytes, and a worker parses and validates the request, renders
+    # the chat template, encodes the prompt and hashes its prefix blocks. An
+    # agentic turn resends the whole conversation (~300 KB, ~100k tokens), and
+    # that per-request work on the one loop thread is what capped the server's
+    # request rate. Needs ATOM_TOKENIZE_PROCESSES > 0. Multimodal, pre-tokenized,
+    # n > 1 and invalid requests stay on the in-process path, which also answers
+    # every error. The first results are checked against the in-process path
+    # and a difference turns this off. With ATOM_PRE_ENGINE_TIMING its
+    # "arrival->handler" segment then includes the worker's whole job.
+    "ATOM_API_OFFLOAD_PREPROCESS": lambda: (
+        os.getenv("ATOM_API_OFFLOAD_PREPROCESS", "0") == "1"
+    ),
+    # Cheaper SSE streaming of chat completions on the API event loop: the stream
+    # detokenizer decodes through the Rust tokenizer directly once a startup
+    # probe shows it returns what `tokenizer.decode` does, and every SSE event
+    # one engine chunk produces is sent as one write. Same text, events and
+    # usage as without it.
+    "ATOM_API_STREAM_FAST": lambda: os.getenv("ATOM_API_STREAM_FAST", "0") == "1",
+    # With ATOM_API_STREAM_FAST: a chat stream sends at most one batch of SSE
+    # events per this many ms; tokens arriving meanwhile merge into the next
+    # batch (no token waits longer). Fewer frames per request on the event
+    # loop; chunk boundaries change, the streamed text does not. 0: every chunk.
+    "ATOM_API_STREAM_MIN_FRAME_MS": lambda: float(
+        os.getenv("ATOM_API_STREAM_MIN_FRAME_MS", "0")
+    ),
     # Keep the prompt block-hash chain (frontend prefix hashing) with each
     # tokenizer-cached prefix and extend it on the next turn instead of
     # rehashing the whole prompt. Content hashes only: KV residency is still

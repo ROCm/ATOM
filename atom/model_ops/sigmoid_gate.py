@@ -21,6 +21,7 @@ import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import Tensor
 
+from atom.model_ops.mxfp8_act_quant import GROUP, alloc_mxfp8, e8m0_quant_group, scale_view
 from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul
 
 
@@ -85,6 +86,84 @@ def output_gate_mul(attn_output: Tensor, gate: Tensor, fused: bool) -> Tensor:
         return fused_sigmoid_gate(attn_output, gate)
     gate = torch.sigmoid(gate)
     return attn_output * gate
+
+
+# --------------------------------------------------------------------------------------------------
+# Output gate + MXFP8 quant for an e8m0 per_1x128 o_proj (one launch instead of gate, then quant).
+# --------------------------------------------------------------------------------------------------
+@triton.jit
+def _gated_mxfp8_kernel(
+    x_ptr,
+    gate_ptr,
+    q_ptr,
+    s_ptr,
+    M,
+    stride_x,
+    stride_gate,
+    WIDTH: tl.constexpr,
+    GATE_WIDTH: tl.constexpr,
+    ROWS: tl.constexpr,
+    NG: tl.constexpr,
+):
+    """`x * sigmoid(gate)` with `_gated_pointwise_kernel`'s roundings (sigmoid to the gate dtype, product to x's
+    dtype), then e8m0 group quant of that bf16 product: a ROWS x (NG * 128) tile per program."""
+    r = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    g = tl.program_id(1) * NG + tl.arange(0, NG)
+    cols = g[None, :, None] * 128 + tl.arange(0, 128)[None, None, :]
+    rows = r[:, None, None]
+    mask = (rows < M) & (cols < WIDTH)
+    x = tl.load(x_ptr + rows * stride_x + cols, mask, 0).to(tl.float32)
+    gate_cols = cols * 0 if GATE_WIDTH == 1 else cols
+    gate = tl.load(gate_ptr + rows * stride_gate + gate_cols, mask, 0)
+    gate = tl.sigmoid(gate.to(tl.float32)).to(gate.dtype).to(tl.float32)
+    result = (x * gate).to(x_ptr.dtype.element_ty).to(tl.float32)
+    q, e = e8m0_quant_group(result)
+    tl.store(q_ptr + rows * WIDTH + cols, q, mask)
+    tl.store(s_ptr + g[None, :] * M + r[:, None], e, r[:, None] < M)
+
+
+def can_fuse_output_gate_mxfp8(attn_output: Tensor, gate: Tensor) -> bool:
+    return can_fuse_sigmoid_gate(attn_output, gate, None) and attn_output.shape[1] % GROUP == 0
+
+
+def _output_gate_mul_mxfp8_fake(attn_output: Tensor, gate: Tensor) -> tuple[Tensor, Tensor]:
+    m, k = attn_output.shape
+    q, s = alloc_mxfp8(m, k, attn_output.device)
+    return q, scale_view(s, m, k)
+
+
+@torch_compile_guard(gen_fake=_output_gate_mul_mxfp8_fake, mutates_args=[])
+def output_gate_mul_mxfp8(attn_output: Tensor, gate: Tensor) -> tuple[Tensor, Tensor]:
+    """`attn_output * sigmoid(gate)` as fp8 e4m3 [M, K] plus e8m0 scales [M, K // 128] (transposed storage, the
+    layout per_group_quant_hip(transpose_scale=True) gives), for `o_proj(x, x_scale=scale)` on an e8m0
+    per_1x128 o_proj. Bit-identical to `output_gate_mul(..., fused=True)` followed by that quant. Callers check
+    `can_fuse_output_gate_mxfp8` first."""
+    m, k = attn_output.shape
+    q, s = alloc_mxfp8(m, k, attn_output.device)
+    if m:
+        rows, ng, warps = _gate_mxfp8_tile(m, k)
+        _gated_mxfp8_kernel[(triton.cdiv(m, rows), k // (ng * GROUP))](
+            attn_output, gate, q, s, m, attn_output.stride(0), gate.stride(0),
+            k, gate.shape[1], rows, ng, num_warps=warps, enable_fp_fusion=False,
+        )
+    return q, scale_view(s, m, k)
+
+
+_TILE_OVERRIDE = None  # (rows, groups, warps) for tuning only
+
+
+def _gate_mxfp8_tile(m: int, k: int) -> tuple[int, int, int]:
+    if _TILE_OVERRIDE is not None:
+        return _TILE_OVERRIDE
+    # (rows, 128-col groups, warps) per program, from a sweep on gfx1250 (K = 4096): one row of 8 groups for
+    # decode sizes; from 256 rows on, tall 1-group tiles so the transposed scale stores of a program are contiguous.
+    if m <= 64:
+        return (1, 8 if k % (8 * GROUP) == 0 else 1, 4)
+    if m <= 512:
+        return (8, 1, 4)
+    if m <= 1024:
+        return (16, 1, 4)
+    return (32, 1, 4)
 
 
 @triton.jit

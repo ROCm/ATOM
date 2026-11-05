@@ -210,6 +210,84 @@ class GatedDeltaNet(nn.Module):
         """The gated RMSNorm as the chunked prefill's ``output_gate``."""
         return (z, self.gated_norm.weight, self.gated_norm.eps)
 
+    def _forward_mxfp8(self, mixed_qkv, b, a, out, layer_name, z, out_scale):
+        """The gated-normed output as the out_proj's MXFP8 input (ATOM_MXFP8_FUSED_ACT_QUANT): `out` is fp8
+        [T, VH, V] (T = the out_proj's rows), `out_scale` receives the e8m0 bytes at g * T + m. The fused verify
+        kernel quantizes in its epilogue; every other path runs in bf16 and then the standalone quant -- the same
+        bytes either way. Rows past the step's tokens get what quantizing a zero row gives (0, byte 85)."""
+        from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata  # noqa: F401
+
+        rows, heads = out.shape[0], out.shape[1]
+        scale = out_scale.view(torch.uint8)
+        fwd_ctx: ForwardContext = get_forward_context()
+        md = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
+        if (
+            md is not None
+            and z is not None
+            and self.gdn_fused_verify
+            and getattr(md, "replayssm", False)
+            and md.spec_sequence_masks is not None
+            and md.num_prefills == 0
+            and md.num_decodes == 0
+            and md.replayssm_route in ("auto", "serial")
+            and md.replayssm_max_query_len < UT_MIN_QUERY_LEN
+        ):
+            n = md.num_actual_tokens
+            layer_cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+            conv_state = layer_cache.k_cache
+            if conv_state.size(1) != self.conv1d.weight.size(0):
+                conv_state = conv_state.transpose(-1, -2)
+            if gdn_fused_decode.verify(
+                self,
+                mixed_qkv[:n],
+                b[:n],
+                a[:n],
+                z[:n],
+                conv_state,
+                layer_cache.v_cache,
+                layer_cache,
+                md,
+                out[:n],
+                out_scale=scale,
+                out_scale_rows=rows,
+            ):
+                if n < rows:
+                    out[n:].view(torch.uint8).zero_()
+                    scale[: heads * rows].view(heads, rows)[:, n:].fill_(85)
+                return out
+        from aiter import dtypes as _dt
+
+        from atom.model_ops.linear import per_1x128_e8m0_quant
+
+        tmp = torch.empty(out.shape, dtype=torch.bfloat16, device=out.device)
+        if (
+            md is not None
+            and z is not None
+            and md.num_prefills > 0
+            and md.num_decodes == 0
+            and md.spec_sequence_masks is None
+        ):
+            # pure prefill: the gated chunk_o writes the fp8 rows itself (its `o`, tmp, then stays unwritten)
+            from atom.model_ops.fla_ops import chunk_o as _chunk_o
+            from atom.model_ops.fla_ops.chunk_o_gfx1250 import fill_mxfp8_padding
+
+            with _chunk_o.mxfp8_output(out.view(rows, -1), scale) as used:
+                self.forward(mixed_qkv, b, a, tmp, layer_name, z=z)
+            if used:
+                fill_mxfp8_padding(out.view(rows, -1), scale, md.num_actual_tokens)
+                return out
+            # no chunk_o took the buffers (another prefill route): quantize its bf16 result below
+            q, s = per_1x128_e8m0_quant(tmp.view(rows, -1), quant_dtype=_dt.fp8, transpose_scale=True)
+            out.view(rows, -1).copy_(q)
+            scale[: s.numel()].copy_(s.view(torch.uint8).reshape(-1))
+            return out
+        gate = {} if z is None else {"z": z}
+        self.forward(mixed_qkv, b, a, tmp, layer_name, **gate)
+        q, s = per_1x128_e8m0_quant(tmp.view(rows, -1), quant_dtype=_dt.fp8, transpose_scale=True)
+        out.view(rows, -1).copy_(q)
+        scale[: s.numel()].copy_(s.view(torch.uint8).reshape(-1))
+        return out
+
     def forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -218,8 +296,11 @@ class GatedDeltaNet(nn.Module):
         core_attn_out: torch.Tensor,
         layer_name: str,
         z: torch.Tensor | None = None,
+        out_scale: torch.Tensor | None = None,
     ):
         """``z`` (with ``gated_norm`` set) makes the result norm(core) * silu(z)."""
+        if out_scale is not None:
+            return self._forward_mxfp8(mixed_qkv, b, a, core_attn_out, layer_name, z, out_scale)
         from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 
         fwd_ctx: ForwardContext = get_forward_context()

@@ -1273,11 +1273,46 @@ class GemmaRMSNorm(nn.Module):
             routed, shared, gate, residual, self.weight, self.variance_epsilon, rows
         )
 
+    def _moe_tail_mxfp8(self, x, residual):
+        """The MoE-tail kernel with its MXFP8 epilogue, or None where it does not apply."""
+        if not isinstance(x, MoEGatedSum) or residual is None or not self.takes_moe_gated_sum:
+            return None
+        if not can_fuse_moe_tail(x, residual, self.weight, None):
+            return None
+        from atom.model_ops.moe_tail_norm import moe_tail_rmsnorm_mxfp8
+
+        routed, shared, gate = x
+        q, scale, res, _ = moe_tail_rmsnorm_mxfp8(
+            routed, shared, gate, residual, self.weight, self.variance_epsilon
+        )
+        return q, scale, None, res
+
+    def _forward_mxfp8(self, x, residual):
+        """The normed rows as MXFP8 for an e8m0 per_1x128 consumer (ATOM_MXFP8_FUSED_ACT_QUANT), in the
+        `use_fused_quant` contract: `(x_fp8, x_scale, None)` or `(x_fp8, x_scale, None, residual)`. The MoE-tail
+        kernel quantizes in its epilogue where it can; any other input is normalized in bf16 and then quantized
+        by the standalone op the Linear would have run -- the same bytes either way."""
+        assert not self.fused_allreduce and not self.use_fused_quant, "mxfp8 mode is for the plain norm"
+        fused = self._moe_tail_mxfp8(x, residual)
+        if fused is not None:
+            return fused
+        from aiter import dtypes as _dt
+
+        from atom.model_ops.linear import per_1x128_e8m0_quant
+
+        out = self.forward(x, residual)
+        y, res = (out, None) if residual is None else out
+        q, s = per_1x128_e8m0_quant(y, quant_dtype=_dt.fp8, transpose_scale=True)
+        return (q, s, None) if residual is None else (q, s, None, res)
+
     def forward(
         self,
         x: torch.Tensor | MoEGatedSum | MoENormed,
         residual: torch.Tensor | None = None,
+        mxfp8: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if mxfp8:
+            return self._forward_mxfp8(x, residual)
         if isinstance(x, MoENormed):
             # The MoE combine already ran this norm (ATOM_MEGA_COMBINE_TAIL).
             return x.out, x.residual

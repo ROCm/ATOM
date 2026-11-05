@@ -951,8 +951,11 @@ class TestAnEffortIsNotAnOptIn:
 
     def test_the_toggle_is_written_only_when_stated(self):
         """Read off the syntax tree, not grepped: the guard has to be on the
-        resolved value, not on the toggle merely existing."""
-        tree = ast.parse(pathlib.Path(api_server.__file__).read_text())
+        resolved value, not on the toggle merely existing. The chat handler's
+        template kwargs are `serving_chat.merge_chat_template_kwargs`'s."""
+        from atom.entrypoints.openai import serving_chat
+
+        tree = ast.parse(pathlib.Path(serving_chat.__file__).read_text())
         writes = [
             n
             for n in ast.walk(tree)
@@ -965,8 +968,7 @@ class TestAnEffortIsNotAnOptIn:
         guarded = [
             n
             for n in ast.walk(tree)
-            if isinstance(n, ast.If)
-            and "_th_enabled is not None" in ast.unparse(n.test)
+            if isinstance(n, ast.If) and "th_enabled is not None" in ast.unparse(n.test)
         ]
         assert guarded, "the toggle is written without asking whether it was stated"
 

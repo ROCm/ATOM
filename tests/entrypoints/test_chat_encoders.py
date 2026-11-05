@@ -322,18 +322,24 @@ class TestResolveReasoningToggle:
         assert "thinking" not in kwargs, "a hardcoded kwarg name came back"
 
     def test_the_chat_path_writes_no_hardcoded_reasoning_kwarg(self):
-        """That body is inside a route handler no unit test reaches, so this
-        reads the source -- but for the shape of the answer, not a literal:
-        no `merged_kwargs["<anything about thinking>"] = ...` at all."""
+        """The chat handler's template kwargs (`merge_chat_template_kwargs`,
+        which the tokenize workers run too). This reads the source -- but for
+        the shape of the answer, not a literal: no
+        `merged_kwargs["<anything about thinking>"] = ...` at all."""
         import ast
         import inspect
         import textwrap
+
+        from atom.entrypoints.openai.serving_chat import merge_chat_template_kwargs
 
         # Only the on/off names. `thinking_effort` is a separate control --
         # an effort level, validated against the dialects' own vocabulary --
         # and is not what the resolved toggle answers.
         _TOGGLE_NAMES = {name for name, _, _ in REASONING_TOGGLES}
-        src = inspect.getsource(api_server.chat_completions)
+        src = inspect.getsource(merge_chat_template_kwargs)
+        assert "merge_chat_template_kwargs(" in inspect.getsource(
+            api_server._chat_completions
+        )
         tree = ast.parse(textwrap.dedent(src))
         hardcoded = [
             n.slice.value

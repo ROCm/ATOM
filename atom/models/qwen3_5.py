@@ -330,7 +330,15 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             # The exclude list names in_proj_qkvz / in_proj_ba, not the fused
             # module, so a quantized checkpoint builds it unquantized here.
             if self.quant_config.global_quant_config.quant_dtype != torch.bfloat16:
-                quant_config = None
+                if envs.ATOM_GDN_IN_PROJ_ONLINE_QUANT and getattr(
+                    self.quant_config, "online_quant", False
+                ):
+                    # Keep the config so online quantization can re-quantize this bf16 weight; its prefix is
+                    # excluded from the checkpoint's (MXFP4) quant config so it still loads as bf16.
+                    if prefix not in self.quant_config.exclude_layers:
+                        self.quant_config.exclude_layers.append(prefix)
+                else:
+                    quant_config = None
             self.in_proj_qkvzba = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
                 output_sizes=[
@@ -393,7 +401,10 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         a_size = v_heads_tp
 
         if hasattr(self, "in_proj_qkvzba"):
-            qkvzba = self.in_proj_qkvzba(hidden_states)
+            if x_fp8 is not None:  # MXFP8 rows from the input norm (ATOM_MXFP8_FUSED_ACT_QUANT)
+                qkvzba = self.in_proj_qkvzba(x_fp8, x_scale=x_scale)
+            else:
+                qkvzba = self.in_proj_qkvzba(hidden_states)
             # Qwen3.5 layout is already contiguous [q|k|v|z|b|a]
             mixed_qkv, z_flat, b, a = torch.split(
                 qkvzba, [qkv_size, z_size, b_size, a_size], dim=-1
@@ -409,6 +420,20 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             b, a = torch.split(projected_ba, [b_size, a_size], dim=-1)
 
         z = z_flat.view(num_tokens, v_heads_tp, self.head_v_dim)
+        if (
+            envs.ATOM_MXFP8_FUSED_ACT_QUANT
+            and self.fuse_gated_norm
+            and not self.skip_out_proj
+            and self.out_proj.takes_mxfp8_input()
+        ):
+            # the GDN op writes out_proj's MXFP8 input itself (fp8 + e8m0 scales)
+            core_fp8 = torch.empty(z.shape, dtype=torch.float8_e4m3fn, device=z.device)
+            out_scale = torch.empty(v_heads_tp * num_tokens, dtype=torch.uint8, device=z.device)
+            self.attn(mixed_qkv, b, a, core_fp8, z=z, out_scale=out_scale)
+            return self.out_proj(
+                core_fp8.view(num_tokens, -1),
+                x_scale=out_scale.view(torch.float8_e8m0fnu).view(num_tokens, -1),
+            )
         core_attn_out = torch.empty_like(z)
 
         # ============================================================
