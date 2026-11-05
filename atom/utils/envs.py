@@ -615,9 +615,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Router top-k softmax with fused sigmoid shared-expert gates (Qwen3.8):
     # one-wave Triton kernel instead of aiter's 16-lane-per-row topkGatingSoftmax.
-    # Same ids/tie order and weights; "0" restores the aiter kernel.
+    # Same ids/tie order and weights. Off by default: 2.4 vs 7.3 us per call,
+    # but c16 AgentX 1200 s showed no ITL p50 gain and worse ITL/TTFT p90.
     "ATOM_TRITON_TOPK_SOFTMAX": lambda: (
-        os.getenv("ATOM_TRITON_TOPK_SOFTMAX", "1") == "1"
+        os.getenv("ATOM_TRITON_TOPK_SOFTMAX", "0") == "1"
     ),
     # --- ReplaySSM (linear-attention state) ---
     # Cache the SSM *inputs* (k, u, g) instead of one full recurrent state per
