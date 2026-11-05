@@ -107,6 +107,8 @@ def server(monkeypatch):
         return 1, Collector(), 2
 
     class Reasoning:
+        held_text = ""
+
         def stream(self):
             return self
 

@@ -2669,6 +2669,7 @@ class Config:
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
         self._resolve_dynamic_chunking()
+        self._check_pp_support()
 
         check_return_routed_experts(self)
 
@@ -2881,6 +2882,52 @@ class Config:
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+    def _check_pp_support(self) -> None:
+        """Refuse what PP does not wire yet: TBO, P/D consumers, and speculation
+        an architecture does not declare in ``pp_speculative_methods`` (a P/D
+        producer does not speculate); anything else fails mid-serving or drafts
+        from zero buffers.
+        """
+        if self.pipeline_parallel_size <= 1:
+            return
+        # UBatchWrapper.forward takes no intermediate_tensors.
+        if self.enable_tbo:
+            raise ValueError(
+                "TBO (enable_tbo) is not supported with pipeline_parallel_size > 1."
+            )
+        from atom.kv_transfer.disaggregation.pd_producer import (
+            disaggregated_kv_role,
+        )
+
+        # A consumer's first decode leaves T0 plus mtp_k placeholders, not the
+        # mtp_k + 1 the PP verify window assumes, and the PP loop has no
+        # remote-KV path at all.
+        role = disaggregated_kv_role(self)
+        if role == "kv_consumer":
+            raise ValueError(
+                "A P/D kv_consumer is not supported with pipeline_parallel_size > 1."
+            )
+        # A producer never speculates; it loads the drafter only to write the
+        # draft layer's KV.
+        if self.speculative_config is None or role == "kv_producer":
+            return
+        from atom.models.registry import pp_speculative_methods
+
+        archs = getattr(self.hf_config, "architectures", None) or ()
+        spec = self.speculative_config
+        method = "dspark" if spec.use_dspark() else spec.method
+        if not any(method in pp_speculative_methods.get(a, ()) for a in archs):
+            raise ValueError(
+                "pipeline_parallel_size > 1 with speculative decoding supports "
+                "only the methods registry.pp_speculative_methods declares, got "
+                f"architectures={list(archs)}, method={method!r}."
+            )
+        if self.dspark.confidence_schedule:
+            raise ValueError(
+                "The DSpark confidence scheduler (confidence_schedule) is not "
+                "supported with pipeline_parallel_size > 1."
+            )
 
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.

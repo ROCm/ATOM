@@ -924,6 +924,11 @@ class InputOutputProcessor:
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
         """
+        sampling_params.validate_logprob_options(
+            self.config,
+            kv_transfer=kv_transfer_params,
+            multimodal=multimodal_data is not None,
+        )
         if sampling_params.json_schema is not None:
             if self.structured_admission is None:
                 raise ValueError("Structured output requires engine admission")
