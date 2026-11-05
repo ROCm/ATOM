@@ -20,16 +20,6 @@ ALLGATHER_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 HEAD_EXCHANGE_MIN_LOCAL_ROWS = 2048
 
 
-def _pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
-    """``x`` followed by zero rows up to ``rows``."""
-    if x.shape[0] == rows:
-        return x
-    out = x.new_empty((rows, *x.shape[1:]))
-    out[: x.shape[0]].copy_(x)
-    out[x.shape[0] :].zero_()
-    return out
-
-
 def gather_heads(
     x: torch.Tensor, group, rows: int | None = None, ca=None
 ) -> torch.Tensor:
@@ -58,7 +48,9 @@ def gather_heads(
         view[: x.shape[0]].copy_(x)
         view[x.shape[0] :].zero_()
         return ca.head_exchange(view, registered=True)
-    x = _pad_rows(x, rows)
+    from atom.distributed.pcp_utils import pcp_pad_dense
+
+    x = pcp_pad_dense(x, rows - x.shape[0])
     if small and custom_gather_ok(x, group):
         start = group.rank_in_group * s_local
         return group.all_gather(x, use_custom=True, dim=1)[start : start + s_local]
