@@ -145,9 +145,13 @@ case $MODE in
 esac
 # SPEC=<n>: MTP speculative decoding (graphed draft steps); the checkpoint keeps the MTP
 # layer BF16 and gfx1250 has no BF16 fused MoE, so its routed experts are quantized to MXFP4 at load
+# ONLINE_QUANT_CONFIG overrides the online quant config (default: only the MTP experts to MXFP4), e.g. e8m0 FP8
+# projections: the MTP-expert entry plus "*language_model*.linear_attn", ".linear_attn.out_proj",
+# ".self_attn.qkv_proj", ".self_attn.o_proj": "per_block_fp8" (with ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1).
 SPEC=${SPEC:-0}
+OQC=${ONLINE_QUANT_CONFIG:-'{"layer_quant_config":{"mtp.layers.*.mlp.experts":"mxfp4"}}'}
 [ "$SPEC" -gt 0 ] && ARGS+=(--method mtp --num-speculative-tokens $SPEC
-  --online_quant_config '{"layer_quant_config":{"mtp.layers.*.mlp.experts":"mxfp4"}}')
+  --online_quant_config "$OQC")
 # TRACE_DIR=<dir>: torch profiler on every rank, armed only; run_ep.sh's TRACE_AT_MIN takes the window
 # (traces under $TRACE_DIR/rank_<r>/). Unset, nothing changes.
 [ -n "$TRACE_DIR" ] && mkdir -p $TRACE_DIR && ARGS+=(--torch-profiler-dir $TRACE_DIR --mark-trace)
