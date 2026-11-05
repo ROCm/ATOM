@@ -115,10 +115,15 @@ class Harness:
                 if self.device.type == "cpu":
                     ctypes.memmove(dst, src, n)
                 else:
-                    source = c._kv_staging.view(-1)[
+                    source_owner = next(
+                        v
+                        for v in [c._kv_staging, *self.src_views]
+                        if v.data_ptr() <= src and src + n <= v.data_ptr() + v.numel()
+                    )
+                    source = source_owner.view(-1)[
                         src
-                        - c._kv_staging.data_ptr() : src
-                        - c._kv_staging.data_ptr()
+                        - source_owner.data_ptr() : src
+                        - source_owner.data_ptr()
                         + n
                     ]
                     owner = next(
@@ -197,6 +202,61 @@ def test_credit_exhaustion_gathers_remaining_pages_to_direct_destinations():
     assert h.finished == []
     h.pump()
     h.check([3, 1, 2], [2, 0, 3])
+    assert h.finished == [(21, False)]
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("chunks", [False, True])
+@pytest.mark.parametrize("capacity", ["source_too_small", "landing_too_small", "exact"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="GPU gather/scatter"
+            ),
+        ),
+    ],
+)
+def test_page_capacity_fallback_preserves_bytes_and_completion(
+    rank, chunks, capacity, device
+):
+    h = Harness([6, 7], rank, device=device)
+    page_bytes = max(
+        h.req["consumer_block_bpb"][i] for i in h.tt.block_region_consumer_indices
+    )
+    # A full P PAGE is wider than its destination head slice. The exact-fit
+    # case must still stage, even though P's PAGE would not fit in the slot.
+    assert max(h.c._per_block_bytes_list) > page_bytes
+    slot_bytes = page_bytes - 4 if capacity == "source_too_small" else page_bytes
+    h.c._kv_staging = torch.empty((1, slot_bytes), dtype=torch.uint8, device=device)
+    if capacity == "landing_too_small":
+        h.req["mla_landing"]["slot_bytes"] = page_bytes - 4
+    src, dst = [3, 1, 2], [2, 0, 3]
+    if chunks:
+        for offset in range(3):
+            assert h.send(src[offset : offset + 1], dst[offset : offset + 1], offset)
+            assert h.finished == []
+    else:
+        assert h.send(src, dst)
+    h.check(src, dst)
+    assert bool(h.ready) == (capacity == "exact")
+    base = h.c._kv_staging.data_ptr()
+    staged_sources = [
+        base <= address < base + slot_bytes
+        for sources, _, _ in h.writes
+        for address in sources
+    ]
+    assert staged_sources
+    assert (
+        all(staged_sources)
+        if capacity != "source_too_small"
+        else not any(staged_sources)
+    )
+    assert h.c._kv_staging_slots.free == [0]
+    h.recv.stage_done(21, 0, 3, True, h.req.get("_landed_slots", []))
     assert h.finished == [(21, False)]
 
 

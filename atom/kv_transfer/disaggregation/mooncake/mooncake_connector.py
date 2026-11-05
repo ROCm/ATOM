@@ -62,6 +62,7 @@ from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEngine
 from atom.kv_transfer.disaggregation.pd_producer import (
     STAGING_SLOT_BYTES,
     send_worker_count,
+    staging_slot_count,
 )
 from atom.kv_transfer.disaggregation.port_offset import (
     consumer_region_indices,
@@ -1601,7 +1602,9 @@ class MooncakeConnector(KVConnectorBase):
             if self._page_staging_enabled
             else max(widest, STAGING_SLOT_BYTES // widest * widest)
         )
-        slots = min(self._num_send_workers, self._kv_staging_reserve // slot_bytes)
+        slots = staging_slot_count(
+            self._num_send_workers, slot_bytes, reserve_bytes=self._kv_staging_reserve
+        )
         if not slots:
             logger.warning(
                 "PD KV staging: PAGE exceeds the reserved pool; using direct writes"
@@ -3244,9 +3247,18 @@ class MooncakeConnector(KVConnectorBase):
             plan = self._make_staging_plan(
                 request_data, src_block_ids, dst_block_ids, cmap, range(num_regions)
             )
-            return self._execute_staged_transfer(
-                request_data, target, plan, req_id, kv_cache_ready_event, engine=engine
-            )
+            # P's full PAGE may be wider than a slot while D's head slice fits.
+            # Decide after ownership mapping; oversized destination PAGEs keep
+            # the direct head-slice descriptors below.
+            if plan.minimum_slot_bytes <= self._kv_staging.shape[1]:
+                return self._execute_staged_transfer(
+                    request_data,
+                    target,
+                    plan,
+                    req_id,
+                    kv_cache_ready_event,
+                    engine=engine,
+                )
         source_blocks = np.asarray(src_block_ids, dtype=np.int64)
         destination_blocks = np.asarray(dst_block_ids, dtype=np.int64)
         for region_idx in range(num_regions):
@@ -3324,7 +3336,11 @@ class MooncakeConnector(KVConnectorBase):
                     "a single token needs its bytes contiguous, which holds for "
                     "the MLA layout the token-unit relayout is built on."
                 )
-            if stages_token_units and region_idx in self._kv_source_views:
+            if (
+                stages_token_units
+                and region_idx in self._kv_source_views
+                and bpb <= self._kv_staging.shape[1]
+            ):
                 staged_token_regions.append((region_idx, dst_base, bpb))
                 continue
             unit = bpb // self.block_size
@@ -3473,8 +3489,13 @@ class MooncakeConnector(KVConnectorBase):
         if landing is not None:
             if landing.get("layout", TOKEN_UNITS) != plan.wire_layout:
                 raise ValueError("KV landing wire layout mismatch")
-            slot_bytes = min(slot_bytes, int(landing["slot_bytes"]))
-            self._landing_credits.sync(target, landing)
+            if plan.minimum_slot_bytes <= int(landing["slot_bytes"]):
+                slot_bytes = min(slot_bytes, int(landing["slot_bytes"]))
+                self._landing_credits.sync(target, landing)
+            else:
+                # P can gather this PAGE, but D cannot land it. Use staged
+                # direct writes without acquiring credits or sending READYs.
+                landing = None
         slots = plan.pack(slot_bytes)
         stream = self._send_worker_stream()
         stream.wait_event(ready_event)

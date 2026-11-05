@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml
+
 SCRIPT = Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/pd_matrix.py"
 SPEC = importlib.util.spec_from_file_location("atomesh_pd_matrix", SCRIPT)
 pd_matrix = importlib.util.module_from_spec(SPEC)
@@ -54,6 +56,51 @@ def expand_cell(
 
 
 class NodeSelectionTest(unittest.TestCase):
+    def test_minimax_landing_recipes_preserve_runner_node_selection(self):
+        cfg = yaml.safe_load(
+            (SCRIPT.parents[2] / "benchmark/models_atomesh.yaml").read_text()
+        )
+        model = "MiniMax-M3.1-Flash-Quark-MXFP4"
+        for runner, candidates, override, expected in (
+            ("atomesh-cicd-mi350", "n1,n2", "auto", ["n1", "n2"]),
+            ("atomesh-cicd", "", "auto", []),
+            ("atomesh-cicd", "n1,n2", "n3", ["n3"]),
+        ):
+            with patch.dict(
+                os.environ,
+                {
+                    "ATOMESH_SLURM_ACCOUNT": "parse-only",
+                    "ATOMESH_SLURM_PARTITION": "parse-only",
+                    "ATOMESH_SLURM_SUBMIT_RUNNER": runner,
+                    "ATOMESH_LOG_ROOT": "/parse-only/logs",
+                    "ATOMESH_MODEL_ROOT": "/parse-only/models",
+                    "ATOMESH_PD_RANK_MAPPING_POLICY": "none",
+                    "ATOMESH_1P1D_NODES": candidates,
+                    "ATOMESH_SINGLE_NODE": override,
+                },
+            ):
+                for suite in ("accuracy", "mooncake_store"):
+                    names = {
+                        c["name"]
+                        for c in cfg["models"][model]["suites"][suite]
+                        if "landing" in c["name"]
+                    }
+                    with self.subTest(runner=runner, suite=suite, override=override):
+                        cells = pd_matrix.build_cells(
+                            cfg,
+                            suite=suite,
+                            model_filter={model},
+                            case_filter=names,
+                            benchmark_kind_filter=None,
+                            override_image=None,
+                            override_benchmark_concurrency=None,
+                            override_eval_concurrency=None,
+                        )
+                        self.assertEqual(len(cells), 4 if suite == "accuracy" else 2)
+                        for cell in cells:
+                            self.assertEqual(cell["nodes"], expected)
+                            self.assertEqual(cell["num_nodes"], 1)
+
     def test_tw_automatic_selection_preserves_required_node_count(self):
         cases = [
             ("single_node", 1, 1, 1),

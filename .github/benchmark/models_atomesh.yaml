@@ -1625,7 +1625,6 @@ models:
         - &m31_flash_pp4_landing_accuracy
           <<: *m31_flash_pp4_accuracy
           name: minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-gsm8k-5shot-landing-c32
-          nodes: []
           env:
             common: &m31_flash_pp4_landing_accuracy_env
               <<: *m31_flash_pp4_accuracy_env
@@ -1761,7 +1760,6 @@ models:
         - &m31_flash_pp4_landing_mcstore
           <<: *m31_flash_pp4_mcstore
           name: minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-mcstore-agentx-landing-c32
-          nodes: []
           env:
             common: &m31_flash_pp4_landing_mcstore_env
               <<: *m31_flash_pp4_mcstore_common_env

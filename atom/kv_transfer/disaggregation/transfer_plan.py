@@ -70,6 +70,14 @@ class TransferPlan:
     units_per_page: int
     wire_layout: str
 
+    @property
+    def minimum_slot_bytes(self) -> int:
+        """Space for one destination PAGE after token/head ownership mapping."""
+        return max(
+            (r.gather.unit_bytes * self.units_per_page for r in self.regions),
+            default=0,
+        )
+
     def pack(self, slot_bytes: int) -> list[list[tuple[int, int, int, int]]]:
         return pack_slots(
             [r.gather.unit_bytes for r in self.regions],

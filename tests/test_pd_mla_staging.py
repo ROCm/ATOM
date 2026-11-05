@@ -518,6 +518,28 @@ def test_staged_mla_needs_the_ready_event(monkeypatch):
     assert conn._stream.waited == []
 
 
+@pytest.mark.parametrize("source_too_small", [False, True])
+def test_dcp_page_capacity_fallback_matches_direct_bytes(source_too_small):
+    mc = _mooncake()
+    regions = _source_regions(1, 8)
+    old = _producer(mc, regions)
+    new = _producer(mc, regions, pool_size=1, slot_pages=4)
+    if source_too_small:
+        new._kv_staging = new._kv_staging[:, : PAGE_BYTES - 4]
+    expected = [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8)]
+    actual = [torch.zeros_like(expected[0])]
+    request = _request(1, 2, 1, 1, actual)
+    # Fits individual rows but not one destination PAGE. No credit metadata
+    # is needed: an undersized offer must not reach the landing credit path.
+    request["mla_landing"] = {"slot_bytes": PAGE_BYTES - 4}
+    assert _run(mc, old, _request(1, 2, 1, 1, expected), range(4), [3, 5], None)
+    assert _run(mc, new, request, range(4), [3, 5], object())
+    assert torch.equal(actual[0], expected[0])
+    assert "_landed_slots" not in request
+    assert set(new._nic.labels) == ({"block"} if source_too_small else {"staged-kv"})
+    assert new._kv_staging_slots.free == [0]
+
+
 def test_staged_mla_leaves_index_regions_to_index_staging(monkeypatch):
     mc = _mooncake()
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
