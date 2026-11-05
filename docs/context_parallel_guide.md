@@ -440,9 +440,12 @@ LSE through two 16-bit halves of a bf16 buffer).
 Byte counts are about the same; what `a2a` saves is one collective's launch and
 sync.
 
-`mailbox` needs an aiter with `aiter.ops.flydsl.dcp_mailbox`; without it, and in
-plugin mode, the layer logs a warning and merges with `a2a`. Prefill always
-merges with `a2a`. Its peer buffer, `2 x ranks x max_num_seqs x (1 +
+`mailbox` needs an aiter with `aiter.ops.flydsl.dcp_mailbox` (aiter PR #6972)
+on every rank; without it, when the peer memory cannot be mapped (e.g. a DCP
+group spanning nodes), and in plugin mode, the layer logs a warning and merges
+with `a2a`. Only graph-captured decode steps take it (each token count is its
+own kernel build, ~0.4-0.8 s on first use, so eager steps and prefill merge
+with `a2a`), and it is refused together with decode TBO (`--enable-tbo all`). Its peer buffer, `2 x ranks x max_num_seqs x (1 +
 num_speculative_tokens) x local heads x (4 x head dim + 8)` bytes, is mapped at
 model build, so it comes out of the KV budget. The combine does not quantize:
 with a per-token FP8 `o_proj` its output is quantized by `o_proj` itself.

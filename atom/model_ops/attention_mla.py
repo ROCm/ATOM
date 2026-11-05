@@ -1348,10 +1348,12 @@ class MLAAttention(nn.Module):
         )
 
     def _dcp_fused_quant_dtype(self):
-        """o_proj's activation dtype if the combine can emit it, else None.
+        """o_proj's activation dtype if the combine may emit it, else None.
 
         The combine can only absorb the quant when o_proj reads its output
-        directly (PBM) and wants exactly a per-token FP8 activation. A static
+        directly (PBM) and wants exactly a per-token FP8 activation. The
+        mailbox combine emits bf16 even then (``(rows, None)``); the a2a
+        combine it falls back to quantizes. A static
         input_scale is not a per-token scale, and the block schemes need a scale
         per channel GROUP with a layout choice; all of those keep the standalone
         quant kernel they have today.
@@ -1416,8 +1418,8 @@ class MLAAttention(nn.Module):
                 return self.o_proj(
                     o.reshape(-1, self.num_heads * self.v_head_dim), o_scale
                 )
-            # Single-rank DCP: there was no combine to fold into, so the tensor
-            # came back unquantized and o_proj quantizes it as it always has.
+            # Single-rank DCP, or the mailbox combine: the rows came back
+            # unquantized and o_proj quantizes them as it always has.
         if self.pbm_enabled:
             return self.o_proj(o.reshape(-1, self.num_heads * self.v_head_dim))
         return self._v_up_proj_and_o_proj(o)

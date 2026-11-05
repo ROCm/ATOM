@@ -2437,6 +2437,14 @@ class Config:
                     "decode and DCP is unverified. Use --enable-tbo (prefill "
                     "only), or drop DCP or speculative decode."
                 )
+            # The mailbox combine spins in-kernel on its peers; next to decode
+            # TBO's comm-stream collectives that is unverified.
+            assert not (
+                self.enable_tbo_decode and self.dcp_config.comm_backend == "mailbox"
+            ), (
+                "DCP comm_backend 'mailbox' with decode TBO (--enable-tbo all) is "
+                "unverified. Use --enable-tbo (prefill only) or comm_backend 'a2a'."
+            )
         # DCP KV-cache interleave granularity S. S=1 (default) = token-level
         # round-robin (unchanged). S>1 = block-level interleave; must divide the
         # KV block so each physical block holds an integer number of S-groups

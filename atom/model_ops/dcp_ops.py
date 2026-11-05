@@ -859,7 +859,9 @@ def mask_empty_dcp_lse(
 # combines them. It replaces pack -> all_to_all_single -> combine. Decode only:
 # its peer buffer is sized for the widest decode step, and its launch epoch
 # lives on each rank, so every rank must launch it the same number of times in
-# the same order -- which a DCP group's lock-step decode does.
+# the same order -- which a DCP group's lock-step decode does. Each token count
+# is its own kernel build (~0.4-0.8 s on first use), so only graph-captured
+# steps take it: the build lands in capture, and eager steps stay on a2a.
 
 _MAILBOX_WORKSPACES: dict = {}
 logger = logging.getLogger("atom")
@@ -882,8 +884,9 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
     Collective (it maps every rank's peer buffer): call it on every rank of
     ``cp_group`` in the same order, before any CUDA graph is captured. Its
     memory sits outside torch's allocator, so it must exist before the KV
-    cache is sized. Returns False, and the merge stays on all-to-all, when
-    aiter has no mailbox combine.
+    cache is sized. Returns False on every rank, and the merge stays on
+    all-to-all, when any rank's aiter has no mailbox combine or the peer
+    memory cannot be mapped.
     """
     key = _mailbox_key(cp_group, heads, dim)
     if key in _MAILBOX_WORKSPACES:
@@ -891,9 +894,22 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
     try:
         from aiter.ops.flydsl.dcp_mailbox import CombineWorkspace
     except ImportError:
+        CombineWorkspace = None
+    # agree first: a rank that skipped the mapping would leave its peers
+    # waiting in it
+    ok = torch.tensor([int(CombineWorkspace is not None)], dtype=torch.int32)
+    torch.distributed.all_reduce(
+        ok, op=torch.distributed.ReduceOp.MIN, group=cp_group.cpu_group
+    )
+    if not ok.item():
         return False
     device = torch.device("cuda", torch.cuda.current_device())
-    ws = CombineWorkspace(cp_group, device, heads, dim, max_tokens)
+    try:
+        # its handshake agrees across the group before raising
+        ws = CombineWorkspace(cp_group, device, heads, dim, max_tokens)
+    except RuntimeError as error:
+        logger.warning("DCP mailbox peer memory: %s", error)
+        return False
     _MAILBOX_WORKSPACES[key] = ws
     logger.info(
         "DCP mailbox merge ready: %d heads a rank x %d, up to %d decode tokens, "
@@ -908,7 +924,7 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
 
 def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype):
     """The mailbox merge, or None when this call cannot take it."""
-    if cp_group.world_size == 1:
+    if cp_group.world_size == 1 or not torch.cuda.is_current_stream_capturing():
         return None
     tokens, heads, dim = cp_attn_out.shape
     ws = _MAILBOX_WORKSPACES.get(
@@ -926,7 +942,7 @@ def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_d
     lse = cp_attn_lse.to(torch.float32)
     if owned_counts is not None:
         lse = mask_empty_dcp_lse(lse, owned_counts)
-    out = dcp_lse_combine(ws, cp_attn_out.contiguous(), lse.contiguous(), base_e=True)
+    out = dcp_lse_combine(ws, cp_attn_out, lse.contiguous(), base_e=True)
     # No quantizing combine here: hand back the bf16 rows unquantized, which
     # the caller then quantizes as it would without the fused path.
     return out if quant_dtype is None else (out, None)
@@ -957,9 +973,10 @@ def dcp_lse_merge(
     ``ctx`` is the Triton context the AG+RS backend caches its launches in; the
     a2a backend does not use one.
 
-    ``backend="mailbox"`` takes aiter's mailbox combine when its workspace was
-    prepared (``prepare_dcp_mailbox``) and the call fits it, else all-to-all.
-    Every input to that choice is the same on every rank of the group.
+    ``backend="mailbox"`` takes aiter's mailbox combine in a graph capture
+    when its workspace was prepared (``prepare_dcp_mailbox``) and the call
+    fits it, else all-to-all. Every input to that choice is the same on every
+    rank of the group.
     """
     if backend == "mailbox":
         merged = _dcp_mailbox_merge(
