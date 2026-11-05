@@ -55,7 +55,6 @@ def test_the_sampled_op_checks_its_tables_as_the_greedy_one_does():
     i32 = {"dtype": torch.int32}
     rest = (
         *store,
-        torch.empty(rows, vocab),
         torch.zeros(rows, **i32),
         0,
         torch.ones(rows),
@@ -63,7 +62,7 @@ def test_the_sampled_op_checks_its_tables_as_the_greedy_one_does():
         torch.ones(rows),
         torch.zeros(1, **i32),
         0,
-        scratch.buf,
+        scratch,
     )
     with pytest.raises(ValueError, match="markov_w2"):
         dspark_markov_sample(base, prev, w1, w2[:-1], _ids(rows, "cpu"), *rest)
@@ -342,7 +341,6 @@ def test_two_runs_and_a_graph_replay_store_and_draft_bit_for_bit_alike():
     row_base[3::7] = -1
     scratch = dspark_markov_sample_scratch(rows, vocab, DEV)
     out = torch.empty(rows, dtype=torch.int64, device=DEV)
-    s = torch.empty(rows, vocab, device=DEV)
     store = empty_store(rows + 1, width)  # position 1
 
     def call():
@@ -353,7 +351,6 @@ def test_two_runs_and_a_graph_replay_store_and_draft_bit_for_bit_alike():
             w2,
             out,
             *store,
-            s,
             row_base,
             1,
             greedy_at_eps(temps, greedy),
@@ -361,7 +358,7 @@ def test_two_runs_and_a_graph_replay_store_and_draft_bit_for_bit_alike():
             top_p,
             seed,
             rows * vocab,
-            scratch.buf,
+            scratch,
         )
 
     snapshots = []
@@ -505,7 +502,6 @@ def test_the_block_sampler_chains_the_op_through_its_bound_buffers():
     row_base = torch.tensor([6, -1, 0, -1], dtype=torch.int32, device=DEV)
     sampling = DraftSampling(
         q_store=empty_store(3 * steps, width),
-        s_scratch=torch.empty(max_bs, vocab, device=DEV),
         q_row_base=row_base,
         seed=seed,
         scratch=dspark_markov_sample_scratch(max_bs, vocab, DEV),

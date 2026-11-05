@@ -236,8 +236,8 @@ def test_a_reused_scratch_verifies_exactly_what_a_fresh_one_does(dtype, filters)
     plain = verify(**args, q=q, step=11, top_ks=ks, top_ps=ps)
     scratch = ratio_verify_scratch(64, width, vocab, DEV)  # sized above the batch
     for garbage in (float("nan"), -1.0):
-        scratch.buf.view(torch.float32).fill_(garbage)
-        scratch.buf[::7].random_(0, 256)
+        scratch.view(torch.float32).fill_(garbage)
+        scratch[::7].random_(0, 256)
         reused = verify(
             **{**args, "ratio_scratch": scratch},
             q=q,

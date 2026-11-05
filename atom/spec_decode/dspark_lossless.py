@@ -163,15 +163,13 @@ class DSparkLossless:
             t = drafter.draft_tokens_per_seq
             logger.info(
                 "Lossless speculative sampling armed: draft q store %d slots x "
-                "[%d, top %d of %d] (%.1f MiB) + %.1f MiB draft scores + %.1f "
-                "MiB draft scratch",
+                "[%d, top %d of %d] (%.1f MiB) + %.1f MiB draft scratch",
                 q_rows // t,
                 t,
                 q_width,
                 int(drafter.model.vocab_size),
                 store.nbytes() / 2**20,
-                lossless.s_scratch.numel() * 4 / 2**20,
-                lossless.draft_scratch.nbytes() / 2**20,
+                lossless.draft_scratch.nbytes / 2**20,
             )
         return lossless
 
@@ -188,9 +186,6 @@ class DSparkLossless:
         # it a step later, after the batch may have been reordered.
         self.q_store = SparseQStore.allocate(q_slots * t, store_width(vocab), device)
         # The draft's own: the verify reads q from the store, not from here.
-        self.s_scratch = torch.empty(
-            (max_bs, vocab), dtype=torch.float32, device=device
-        )
         self.draft_scratch = dspark_markov_sample_scratch(max_bs, vocab, device)
         # Members of the runner's `sampling` publication, uploaded by the H2D
         # `prepare_sample` issues; its `begin()` waits out the previous upload.
@@ -223,7 +218,6 @@ class DSparkLossless:
         recorded block reads them."""
         sampling = DraftSampling(
             q_store=self.q_store,
-            s_scratch=self.s_scratch,
             q_row_base=self.q_row_base.gpu,
             seed=self.seed.gpu,
             scratch=self.draft_scratch,

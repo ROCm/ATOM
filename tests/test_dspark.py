@@ -118,13 +118,12 @@ def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch)
     per_row = torch.zeros(max_bs)
     sampling = types.SimpleNamespace(
         q_store=(None, None, None),
-        s_scratch=torch.empty(max_bs, V),
         q_row_base=torch.zeros(max_bs, dtype=torch.int32),
         temperatures=per_row,
         top_k=per_row,
         top_p=per_row,
         seed=None,
-        scratch=types.SimpleNamespace(buf=None),
+        scratch=None,
     )
     calls = []
     # The op's own parameters, as its fake (which torch requires to match) has
@@ -144,8 +143,6 @@ def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch)
     drafts = head.sample_block(base_logits, anchors, sampling)
     assert torch.equal(drafts, anchors[:, None] + torch.arange(1, steps + 1))
     assert calls == [(bs, k, k * max_bs * V) for k in range(steps)]
-    with pytest.raises(AssertionError, match="score scratch"):
-        head.sample_block(torch.randn(bs, steps, V + 1), anchors, sampling)
 
 
 def _real_hf_config_override():

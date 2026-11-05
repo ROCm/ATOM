@@ -37,7 +37,6 @@ from torch import nn
 from atom.utils import envs
 
 if TYPE_CHECKING:
-    from atom.model_ops.spec_sampling.sampling_scratch import SamplingScratch
     from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
 
 
@@ -61,17 +60,15 @@ class DraftSampling:
     #: request. Read a step later by the accept kernel, so it outlives the pass
     #: and cannot live in the graph's private pool.
     q_store: "SparseQStore"
-    #: [max_bs, V] fp32, the scaled scores between the sampled op's launches.
-    #: Dense and per batch row, so it is reused by every block position.
-    s_scratch: torch.Tensor
     #: [max_bs] int32, the first ``q_store`` row each batch row writes; block
     #: position k goes to row ``base + k``. Negative writes nothing.
     q_row_base: torch.Tensor
     #: [1] int32, the Philox key. Must hold the same value on every TP rank.
     seed: torch.Tensor
-    #: Preallocated partials for the sampled op (`dspark_markov_sample_scratch`),
-    #: so the draft step allocates nothing and the profiling run sees it.
-    scratch: "SamplingScratch"
+    #: Preallocated scores and partials for the sampled op
+    #: (`dspark_markov_sample_scratch`), so the draft step allocates nothing and
+    #: the profiling run sees it.
+    scratch: torch.Tensor
     #: The target's own per-row sampling inputs (`ModelRunner.forward_vars`),
     #: so draft and target cannot disagree on them. [max_bs] fp32 temperatures,
     #: clamped to ``SAMPLER_EPS``, where a row at ``SAMPLER_EPS`` is greedy
@@ -200,10 +197,6 @@ class DSparkMarkovHead(nn.Module):
                 dspark_markov_sample,
             )
 
-            assert sampling.s_scratch.shape[1] == vocab, (
-                f"the score scratch is {sampling.s_scratch.shape[1]} wide but "
-                f"the block scores {vocab} ids"
-            )
             # The noise counter stride is the buffer's max batch, not this
             # step's, so the uniform a (position, row, id) draws does not move
             # with the batch, and no two positions of one block share one.
@@ -224,7 +217,6 @@ class DSparkMarkovHead(nn.Module):
                 self.markov_w2.weight,
                 out_ids[:, k + 1],
                 *sampling.q_store,
-                sampling.s_scratch,
                 sampling.q_row_base[:bs],
                 k,
                 sampling.temperatures[:bs],
@@ -232,7 +224,7 @@ class DSparkMarkovHead(nn.Module):
                 sampling.top_p[:bs],
                 sampling.seed,
                 k * position_stride,
-                sampling.scratch.buf,
+                sampling.scratch,
             )
         return out_ids[:, 1:]
 

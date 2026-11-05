@@ -21,6 +21,7 @@ import triton.language as tl
 from atom.model_ops.rejection_sampler import rejection_sample
 from atom.model_ops.sampler import SAMPLER_EPS
 from atom.model_ops.spec_sampling.dspark_markov_sample import (
+    _sample_scratch,
     dspark_markov_sample,
     dspark_markov_sample_scratch,
 )
@@ -39,7 +40,7 @@ from atom.model_ops.spec_sampling.ratio_verify import (
     _target_p_tile,
     ratio_verify_scratch,
 )
-from atom.model_ops.spec_sampling.sampling_scratch import SamplingScratch
+from atom.model_ops.spec_sampling.sampling_scratch import carve, scratch_buffer
 from atom.model_ops.spec_sampling.softmax_tiles import race_key, softmax_combine_kernel
 from atom.model_ops.spec_sampling.sparse_q_select import (
     _Q_BINS,
@@ -191,9 +192,11 @@ def sample(
     noise_offset=0,
     scratch=None,
 ):
-    """One `dspark_markov_sample` call; ``(out, s_scratch)``. Its scratch is
-    sized to ``base``'s rows unless one is given. A ``greedy`` row drafts at
-    ``SAMPLER_EPS``, the clamped temperature the op reads as greedy."""
+    """One `dspark_markov_sample` call; ``(out, s)``, ``s`` a copy of the
+    scores the call carved from its scratch, NaN on rows it did not write. Its
+    scratch is sized to ``base``'s rows unless one is given. A ``greedy`` row
+    drafts at ``SAMPLER_EPS``, the clamped temperature the op reads as
+    greedy."""
     rows, vocab = base.shape
     temps = greedy_at_eps(temps, greedy)
     if scratch is None:
@@ -203,7 +206,8 @@ def sample(
     if top_p is None:
         _, top_p = filters(rows)
     out = torch.empty(rows, dtype=torch.int64, device=DEV)
-    s = torch.full((rows, vocab), float("nan"), device=DEV)
+    s = carve(scratch, _sample_scratch(rows, vocab)).s
+    s.fill_(float("nan"))
     dspark_markov_sample(
         base,
         prev,
@@ -211,7 +215,6 @@ def sample(
         w2,
         out,
         *store,
-        s,
         row_base,
         position,
         temps,
@@ -219,9 +222,9 @@ def sample(
         top_p,
         seed,
         noise_offset,
-        scratch.buf,
+        scratch,
     )
-    return out, s
+    return out, s.clone()
 
 
 def stored(store, row):
@@ -667,7 +670,7 @@ def filtered_p(logits, temps, top_ks=None, top_ps=None, widths=None):
     cu = widths.cumsum(0).to(device=DEV, dtype=torch.int32)
     assert int(cu[-1]) == rows
     spec = target_p_scratch(rows, vocab)
-    work = SamplingScratch.for_spec(spec, DEV).carve(spec)
+    work = carve(scratch_buffer(spec, DEV), spec)
     temps = temps.float().contiguous()
     assert _ratio_target_p(logits, cu, temps, top_ks, top_ps, work)
     row_max, row_inv_z, row_floor = work.row_max, work.row_inv_z, work.row_floor

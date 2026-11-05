@@ -48,22 +48,10 @@ def scratch_bytes(spec) -> int:
     return plan_regions([r.nbytes for r in _regions(spec)])[1]
 
 
-class SamplingScratch:
-    """One flat byte buffer, handed out as named, aligned views."""
-
-    def __init__(self, nbytes: int, device):
-        self.buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
-
-    @classmethod
-    def for_spec(cls, spec, device) -> "SamplingScratch":
-        """Room to carve this spec, or any spec of smaller regions."""
-        return cls(scratch_bytes(spec), device)
-
-    def nbytes(self) -> int:
-        return self.buf.numel()
-
-    def carve(self, spec: Spec) -> Spec:
-        return carve(self.buf, spec)
+def scratch_buffer(spec, device) -> torch.Tensor:
+    """A byte buffer with room to `carve` this spec, or any spec of smaller
+    regions."""
+    return torch.empty(scratch_bytes(spec), dtype=torch.uint8, device=device)
 
 
 def carve(buf: torch.Tensor, spec: Spec) -> Spec:

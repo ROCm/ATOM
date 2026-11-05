@@ -32,7 +32,11 @@ from atom.model_ops.spec_sampling.sampling_filter import (
     _count_below,
     row_filters,
 )
-from atom.model_ops.spec_sampling.sampling_scratch import Region, SamplingScratch
+from atom.model_ops.spec_sampling.sampling_scratch import (
+    Region,
+    carve,
+    scratch_buffer,
+)
 from atom.model_ops.spec_sampling.softmax_tiles import race_key
 from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
 from atom.model_ops.tile_argmax import argmax_lowest_id
@@ -69,7 +73,7 @@ class RatioVerifyInputs(NamedTuple):
     top_ps: float | torch.Tensor | None
     #: Preallocated device scratch (`ratio_verify_scratch`). The verifier's,
     #: not the drafter's: `RejectionSampler` fills it in.
-    scratch: SamplingScratch | None = None
+    scratch: torch.Tensor | None = None
 
 
 class VerifyScratch(NamedTuple):
@@ -95,11 +99,11 @@ def _verify_scratch(num_tokens: int, batch_size: int, vocab_size: int) -> Verify
 
 def ratio_verify_scratch(
     max_bs: int, num_spec_steps: int, vocab_size: int, device
-) -> SamplingScratch:
+) -> torch.Tensor:
     """Scratch for any ratio verify of up to ``max_bs`` requests of
     ``num_spec_steps`` drafts each, allocated once."""
     spec = _verify_scratch(max_bs * num_spec_steps, max_bs, vocab_size)
-    return SamplingScratch.for_spec(spec, device)
+    return scratch_buffer(spec, device)
 
 
 @triton.jit
@@ -515,7 +519,7 @@ def _ratio_sample(
     q_row_base = ratio.q_row_base.contiguous()
     q_width = store.ids.shape[1]
 
-    work = ratio.scratch.carve(_verify_scratch(num_tokens, batch_size, vocab_size))
+    work = carve(ratio.scratch, _verify_scratch(num_tokens, batch_size, vocab_size))
     target = work.target
     row_max, row_inv_z = target.row_max, target.row_inv_z
     row_argmax, row_floor = target.row_argmax, target.row_floor
@@ -643,7 +647,7 @@ def warmup_ratio_verify(
     vocab_size: int,
     q_width: int,
     logits_dtype: torch.dtype,
-    scratch: SamplingScratch,
+    scratch: torch.Tensor,
 ) -> None:
     """Compile every ratio verify variant serving can launch, before it does.
 
@@ -663,7 +667,7 @@ def warmup_ratio_verify(
     verify. It has no collective and takes no input from the device, so every
     rank runs it alike.
     """
-    device = scratch.buf.device
+    device = scratch.device
     num_tokens = num_spec_steps
 
     def ints(values, dtype=torch.int32):

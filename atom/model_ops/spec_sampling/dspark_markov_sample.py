@@ -35,7 +35,11 @@ from atom.model_ops.dspark_markov_stage1 import (
     publish_tile_argmax,
 )
 from atom.model_ops.sampler import SAMPLER_EPS
-from atom.model_ops.spec_sampling.sampling_scratch import Region, SamplingScratch, carve
+from atom.model_ops.spec_sampling.sampling_scratch import (
+    Region,
+    carve,
+    scratch_buffer,
+)
 from atom.model_ops.spec_sampling.softmax_tiles import softmax_combine_kernel
 from atom.model_ops.spec_sampling.sparse_q_select import (
     QSelectScratch,
@@ -148,7 +152,6 @@ def _dspark_markov_sample_fake(
     q_ids: torch.Tensor,
     q_probs: torch.Tensor,
     q_meta: torch.Tensor,
-    s_scratch: torch.Tensor,
     q_row_base: torch.Tensor,
     position: int,
     temperatures: torch.Tensor,
@@ -164,6 +167,7 @@ def _dspark_markov_sample_fake(
 class SampleScratch(NamedTuple):
     """One `dspark_markov_sample` call's work buffers."""
 
+    s: torch.Tensor  # [B, V] fp32, the scaled scores between launches
     part_max: torch.Tensor  # [gemv tiles, B] fp32, each tile's max of s
     part_amax_val: torch.Tensor  # [gemv tiles, B] fp32, raw max
     part_amax_idx: torch.Tensor  # [gemv tiles, B] int32, its lowest id
@@ -177,6 +181,7 @@ def _sample_scratch(num_rows: int, vocab_size: int) -> SampleScratch:
     gemv_tiles = triton.cdiv(vocab_size, BLOCK_V)
     f32, i32 = torch.float32, torch.int32
     return SampleScratch(
+        Region((num_rows, vocab_size), f32),
         Region((gemv_tiles, num_rows), f32),
         Region((gemv_tiles, num_rows), f32),
         Region((gemv_tiles, num_rows), i32),
@@ -188,10 +193,8 @@ def _sample_scratch(num_rows: int, vocab_size: int) -> SampleScratch:
 
 def dspark_markov_sample_scratch(max_rows: int, vocab_size: int, device):
     """Scratch for any `dspark_markov_sample` call of up to ``max_rows`` rows,
-    allocated once. One call runs at a time, so a block's positions share it.
-    The dense ``s`` scratch is not part of it: it is the caller's, sized
-    ``[max_rows, V]``."""
-    return SamplingScratch.for_spec(_sample_scratch(max_rows, vocab_size), device)
+    allocated once. One call runs at a time, so a block's positions share it."""
+    return scratch_buffer(_sample_scratch(max_rows, vocab_size), device)
 
 
 def _check_rows(name, t, rows, dtype):
@@ -208,7 +211,6 @@ def _check_rows(name, t, rows, dtype):
         "q_ids",
         "q_probs",
         "q_meta",
-        "s_scratch",
         "scratch",
     ],
 )
@@ -221,7 +223,6 @@ def dspark_markov_sample(
     q_ids: torch.Tensor,
     q_probs: torch.Tensor,
     q_meta: torch.Tensor,
-    s_scratch: torch.Tensor,
     q_row_base: torch.Tensor,
     position: int,
     temperatures: torch.Tensor,
@@ -246,7 +247,6 @@ def dspark_markov_sample(
                               a `SparseQStore`'s three tensors; row
                               ``q_row_base[b] + position`` receives row b's q.
                               Their width K bounds how many ids a row stores.
-        s_scratch:    [>=B, V] fp32, the scaled scores between launches.
         q_row_base:   [B]     int32; negative writes nothing.
         position:             host int, this block position.
         temperatures: [B]     fp32, clamped to ``SAMPLER_EPS`` from below as
@@ -264,7 +264,7 @@ def dspark_markov_sample(
                               does not make the launch data-dependent.
         scratch:              the byte buffer of a
                               `dspark_markov_sample_scratch`, which the call's
-                              partials are carved from.
+                              scaled scores and partials are carved from.
 
     Raises rather than falling back: an eager fallback would draw from the
     global RNG, which TP ranks do not share, and the drafts would fork.
@@ -290,17 +290,6 @@ def dspark_markov_sample(
             f"{tuple(q_probs.shape)} {q_probs.dtype}, q_meta "
             f"{tuple(q_meta.shape)} {q_meta.dtype} are not a contiguous "
             "[N, K] int32 / [N, K] fp32 / [N, 2] int32 SparseQStore"
-        )
-    if (
-        s_scratch.dim() != 2
-        or s_scratch.shape[0] < num_rows
-        or s_scratch.shape[1] != vocab_size
-        or s_scratch.dtype is not torch.float32
-        or not s_scratch.is_contiguous()
-    ):
-        raise ValueError(
-            f"s_scratch {tuple(s_scratch.shape)} {s_scratch.dtype} is not a "
-            f"contiguous [>= {num_rows}, {vocab_size}] fp32"
         )
     _check_rows("q_row_base", q_row_base, num_rows, torch.int32)
     _check_rows("temperatures", temperatures, num_rows, torch.float32)
@@ -328,7 +317,7 @@ def dspark_markov_sample(
         work.part_amax_idx,
         temperatures,
         q_row_base,
-        s_scratch,
+        work.s,
         work.part_max,
         num_rows,
         vocab_size,
@@ -337,7 +326,7 @@ def dspark_markov_sample(
         stride_prev=prev_ids.stride(0),
         stride_w1_vocab=markov_w1.stride(0),
         stride_w2_vocab=markov_w2.stride(0),
-        stride_s_row=s_scratch.stride(0),
+        stride_s_row=work.s.stride(0),
         min_temperature=SAMPLER_EPS,
         BLOCK_ROW=geometry.block_row,
         BLOCK_V=BLOCK_V,
@@ -362,7 +351,7 @@ def dspark_markov_sample(
         num_stages=1,
     )
     select_and_draw_q(
-        s_scratch,
+        work.s,
         work.row_max,
         work.row_argmax,
         q_row_base,

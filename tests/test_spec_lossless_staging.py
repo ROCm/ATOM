@@ -19,7 +19,9 @@ pytest.importorskip("aiter", reason="the proposer imports the AITER sampler ops"
 
 from atom.model_ops.sampler import Sampler
 from atom.model_ops.spec_sampling import sparse_q_store
+from atom.model_ops.spec_sampling.dspark_markov_sample import _sample_scratch
 from atom.model_ops.spec_sampling.ratio_verify import RatioVerifyInputs
+from atom.model_ops.spec_sampling.sampling_scratch import carve
 from atom.spec_decode import dspark_lossless, dspark_proposer
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.dspark_proposer import DSparkProposer
@@ -179,7 +181,8 @@ def test_the_q_store_is_k_wide_and_never_wider_than_the_vocab(monkeypatch, topk,
     assert store.ids.shape == store.probs.shape == (2 * MAX_BS * T, width)
     assert store.meta.shape == (2 * MAX_BS * T, 2)
     # The draft's dense scores are per batch row, whatever K is.
-    assert sampling.s_scratch.shape == (MAX_BS, VOCAB)
+    s = carve(sampling.scratch, _sample_scratch(MAX_BS, VOCAB)).s
+    assert s.shape == (MAX_BS, VOCAB)
 
 
 @pytest.mark.parametrize(
@@ -293,7 +296,7 @@ def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):
     """Next to the q store, before the KV cache is sized: the profiling run
     sees it and no step allocates."""
     prop = proposer(monkeypatch)
-    assert prop.lossless.draft_scratch.nbytes()
+    assert prop.lossless.draft_scratch.nbytes
 
 
 def test_the_rejection_sampler_owns_the_verify_scratch_and_warmup(monkeypatch):
@@ -307,7 +310,7 @@ def test_the_rejection_sampler_owns_the_verify_scratch_and_warmup(monkeypatch):
     calls = []
     monkeypatch.setattr(rs_mod, "warmup_ratio_verify", lambda *a: calls.append(a))
     sampler.arm_ratio(MAX_BS, T, VOCAB, torch.bfloat16, "cpu")
-    assert sampler._ratio_scratch.nbytes()
+    assert sampler._ratio_scratch.nbytes
     ((steps, vocab, width, dtype, scratch),) = calls
     # The store's width, as the drafter sizes it (`store_width`).
     assert (steps, vocab, width, dtype) == (T, VOCAB, 8, torch.bfloat16)
