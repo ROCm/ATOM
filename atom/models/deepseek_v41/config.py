@@ -61,9 +61,7 @@ def validate_native_quantization(config):
         if config.get("activation_scheme") != "dynamic":
             raise ValueError("DeepSeek-V4.1 FP4PTPC requires dynamic activations")
         if config.get("expert_dtype") != "fp4":
-            raise ValueError(
-                "DeepSeek-V4.1 routed experts must use native fp4 weights"
-            )
+            raise ValueError("DeepSeek-V4.1 routed experts must use native fp4 weights")
         return
     if config.get("quant_method") != "fp8":
         raise ValueError("DeepSeek-V4.1 requires the native FP8 checkpoint format")
