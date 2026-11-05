@@ -217,3 +217,77 @@ def test_the_count_tracks_the_model_it_walked(draft_layers):
     assert builder.kv_pool is not None
 
     assert asked == [(draft_layers, TARGET_BLOCK)]
+
+
+def _own_pool(monkeypatch, owns: bool):
+    from atom.utils import selector
+
+    monkeypatch.setattr(selector, "attn_family", lambda hf: "x")
+    monkeypatch.setattr(
+        selector, "get_attn_backend", lambda f: SimpleNamespace(DRAFT_OWNS_KV_POOL=owns)
+    )
+
+
+def _config(target: str, spec_dtype=None, method="dspark"):
+    return SimpleNamespace(
+        kv_cache_dtype=target,
+        speculative_config=SimpleNamespace(method=method, kv_cache_dtype=spec_dtype),
+    )
+
+
+@pytest.mark.parametrize("target", ["bf16", "fp8", "fp4"])
+def test_an_own_pool_draft_defaults_to_fp8_whatever_the_target(monkeypatch, target):
+    from atom.spec_decode.draft_kv import draft_kv_cache_dtype
+
+    _own_pool(monkeypatch, True)
+    assert draft_kv_cache_dtype(_config(target), object()) == "fp8"
+
+
+@pytest.mark.parametrize("target", ["bf16", "fp8", "fp4"])
+def test_an_own_pool_draft_takes_the_spec_dtype(monkeypatch, target):
+    from atom.spec_decode.draft_kv import draft_kv_cache_dtype
+
+    _own_pool(monkeypatch, True)
+    assert draft_kv_cache_dtype(_config(target, "bf16"), object()) == "bf16"
+
+
+@pytest.mark.parametrize("target", ["bf16", "fp8", "fp4"])
+def test_a_shared_pool_or_other_drafter_keeps_the_target_dtype(monkeypatch, target):
+    from atom.spec_decode.draft_kv import draft_kv_cache_dtype
+
+    _own_pool(monkeypatch, False)
+    assert draft_kv_cache_dtype(_config(target, "fp8"), object()) == target
+    _own_pool(monkeypatch, True)
+    assert draft_kv_cache_dtype(_config(target, "fp8", "eagle3"), object()) == target
+    assert draft_kv_cache_dtype(_config(target, "fp8"), None) == target
+
+
+class _FakePool:
+    def kv_views(self, idx):
+        return torch.zeros(1), torch.zeros(1)
+
+    def scale_views(self, idx):
+        return torch.ones(1), torch.ones(1)
+
+
+@pytest.mark.parametrize(
+    "target,draft,scaled",
+    [
+        ("fp4", "fp8", True),  # the draft's dtype, not the target's, decides
+        ("bf16", "fp8", True),
+        ("fp8", "bf16", False),
+        ("bf16", None, False),  # unset: the target's
+        ("fp8", None, True),
+    ],
+)
+def test_scales_are_bound_by_the_drafts_dtype(target, draft, scaled):
+    runner = _runner(draft_layers=1)
+    runner.config = SimpleNamespace(kv_cache_dtype=target, max_model_len=64)
+    builder = DraftKvBuilder(runner, None, draft)
+    builder._kv_pool = _FakePool()
+    module = next(iter(builder.pool_rows[DRAFT_KV_ROWS]))
+    module.layer_num = 0
+
+    tensor = builder.build_kv_cache_tensor(module)
+
+    assert (tensor.k_scale is not None) is scaled

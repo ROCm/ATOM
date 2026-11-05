@@ -59,9 +59,9 @@ def test_topology_gate_truth_table(arches, tp, kv_heads, block, dcp, tbo, expect
         assert reason is not None and expected in reason
 
 
-def test_topology_gate_refuses_an_mxfp4_index():
+def test_topology_gate_refuses_mxfp4_caches():
     assert indexer_cp_unsupported_reason(M3, 4, 4, 128, 1, False) is None
-    reason = indexer_cp_unsupported_reason(M3, 4, 4, 128, 1, False, mxfp4_index=True)
+    reason = indexer_cp_unsupported_reason(M3, 4, 4, 128, 1, False, mxfp4_caches=True)
     assert reason is not None and "MXFP4" in reason
 
 
@@ -93,23 +93,25 @@ def test_topology_gate_reasons_are_human_readable():
     )
 
 
-def test_an_mxfp4_index_falls_back_from_the_cp_scorer(monkeypatch, caplog):
-    """The MXFP4 index cache clears the CP flag."""
-    from tests.test_minimax_m3_mxfp4_cache import _m3
+@pytest.mark.parametrize("kv, index", [("fp8", "fp4"), ("fp4", None), ("fp4", "fp4")])
+def test_mxfp4_caches_fall_back_from_the_cp_scorer(monkeypatch, caplog, kv, index):
+    """Any MXFP4 cache (the index, the KV, or both) clears the CP flag, and does so
+    after `--kv-cache-dtype fp4` is normalised, not before."""
+    from tests.test_minimax_m3_mxfp4_cache import _m3, sparse_hf
 
     with caplog.at_level("WARNING", logger="atom"):
         config = _m3(
             monkeypatch,
-            kv_cache_dtype="fp8",
-            index_cache_dtype="fp4",
+            kv_cache_dtype=kv,
+            index_cache_dtype=index,
             tensor_parallel_size=4,
-            hf={"num_key_value_heads": 4},
+            hf={**sparse_hf(), "num_key_value_heads": 4},
             dcp_config=DCPConfig(indexer_dcp_only=True),
         )
 
-    assert config.index_cache_dtype == "fp4"
+    assert config.kv_cache_dtype == kv
     assert config.dcp_config.indexer_dcp_only is False
-    assert "MXFP4 index cache is not wired to the CP scorer" in caplog.text
+    assert "MXFP4 caches are not wired to the CP scorer" in caplog.text
 
 
 # ───────────────────────────────────────────────────── compilation key ──
@@ -137,6 +139,7 @@ def _hash_with(indexer_dcp_only: bool) -> str:
         dcp_config=SimpleNamespace(indexer_dcp_only=indexer_dcp_only),
         enable_dp_attention=False,
         index_cache_dtype="fp8",
+        kv_cache_dtype="fp8",
         hf_config=SimpleNamespace(),
         max_model_len=4096,
         max_num_seqs=256,

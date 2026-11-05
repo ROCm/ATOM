@@ -577,7 +577,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and hasattr(module, "use_mla")
             and not module.use_mla
         ):
-            kinds.append(KvGeometry(module.num_kv_heads, module.head_dim))
+            layout = None
+            # Only an indexed sparse layer's pages read as MXFP4; any other MHA
+            # module under the same dtype keeps the dtype-wide cache.
+            if (
+                _is_indexed_sparse_attention(module)
+                and self.model_runner.config.kv_cache_dtype == "fp4"
+            ):
+                from atom.model_ops.minimax_m3.mxfp4_pages import Mxfp4KvLayout
+
+                layout = Mxfp4KvLayout()
+            kinds.append(KvGeometry(module.num_kv_heads, module.head_dim, layout))
         return tuple(kinds)
 
     def _declare_kv_pools(self) -> dict[KvGeometry, MhaKvPool]:
@@ -616,8 +626,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 blocks_per_entry=self.block_ratio,
                 num_kv_heads=geometry.num_kv_heads,
                 head_dim=geometry.head_dim,
-                kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
+                # An MXFP4 layout declares its own bytes (uint8 pages); the dtype
+                # is read only by the dtype-wide cache, which `fp4` is not.
+                kv_dtype=(
+                    torch.uint8
+                    if geometry.layout is not None
+                    else dtypes.d_dtypes[runner.config.kv_cache_dtype]
+                ),
                 extra_fields=extra_fields,
+                layout=geometry.layout,
             )
             extra_fields = ()
         return pools
@@ -771,7 +788,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         row = self.pool_rows[geometry][module]
 
         k_cache, v_cache = pool.kv_views(row)
-        if config.kv_cache_dtype == "fp8":
+        # A layout with scale planes hands them over; an MXFP4 pool has none, its
+        # pages carry their own (the sparse impl takes the (data, scale) views of
+        # them, mxfp4_pages.page_views).
+        if pool.scale_fields:
             module.k_scale, module.v_scale = pool.scale_views(row)
 
         module.max_model_len = config.max_model_len

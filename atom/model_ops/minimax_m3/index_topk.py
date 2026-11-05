@@ -133,8 +133,8 @@ def _emit_sparse_block_table_row(
     topk,
     pid_h,
     block_size: tl.constexpr,
-    pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
-    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (>= pages_per_block)
+    pages_per_block: tl.constexpr,  # pages per sparse block (8 of 16 tokens; 1 for page-128)
+    block_page_stride: tl.constexpr,  # pages between logical blocks (>= pages_per_block)
     NUM_KV_HEADS: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
 ):
@@ -157,8 +157,10 @@ def _emit_sparse_block_table_row(
     bt_slot = tl.where(bt_is_full, bt_earlier_full, bt_n_full)  # tail -> n_full
 
     bt_logical_page = tl.load(bt_row + bt_blk, mask=bt_valid, other=0).to(tl.int32)
-    # block_page_stride (16) > pages_per_block (8): consecutive logical blocks sit
-    # 16 physical pages apart because the K and V planes overlap half a block.
+    # block_page_stride > pages_per_block only for a fused-K/V cache (the vLLM
+    # plugin's 16 > 8): consecutive logical blocks then sit 16 physical pages apart
+    # because the K and V planes overlap half a block. 8 / 8 for the page-16
+    # SHUFFLE cache, 1 / 1 for a page-128 (MXFP4) one.
     bt_base_phys = bt_logical_page * block_page_stride * NUM_KV_HEADS + pid_h
     bt_dst_base = bt_slot * pages_per_block
 
@@ -696,7 +698,15 @@ def _require_packable(max_block: int) -> None:
         )
 
 
-def _alloc_emit(total_q, num_idx_heads, topk, block_table, emit, device):
+def _alloc_emit(
+    total_q,
+    num_idx_heads,
+    topk,
+    block_table,
+    emit,
+    device,
+    pages_per_block=PAGES_PER_SPARSE_BLOCK,
+):
     """Buffers for the fused page-16 emit, as (what to return, what to pass).
 
     One row per (query token, kv-head): the ASM/gluon path collapses kv-head
@@ -714,7 +724,7 @@ def _alloc_emit(total_q, num_idx_heads, topk, block_table, emit, device):
         return None, (dummy, dummy, 0, 0)
     rows = total_q * num_idx_heads
     sparse_bt = torch.empty(
-        (rows, topk * PAGES_PER_SPARSE_BLOCK), dtype=torch.int32, device=device
+        (rows, topk * pages_per_block), dtype=torch.int32, device=device
     )
     sparse_ctx = torch.empty((rows,), dtype=torch.int32, device=device)
     args = (sparse_bt, sparse_ctx, block_table.stride(0), sparse_bt.stride(0))
@@ -800,6 +810,7 @@ def _launch_select(
     emit,
     block_page_stride,
     n_valid_column_per_row=None,
+    pages_per_block=PAGES_PER_SPARSE_BLOCK,
 ):
     """The one selection pass, launched the same way by both phases.
 
@@ -836,7 +847,7 @@ def _launch_select(
                 SPARSE_BLOCK_SIZE,
                 NUM_KV_HEADS=num_idx_heads,
                 DECODE_MAX_Q=decode_max_q,
-                pages_per_block=PAGES_PER_SPARSE_BLOCK,
+                pages_per_block=pages_per_block,
                 # Not PAGES_PER_SPARSE_BLOCK: a caller whose cache packs
                 # several planes into one block has a stride wider than the
                 # pages a block fills. Hard-coding the two to the same constant
@@ -875,7 +886,7 @@ def _launch_select(
         NUM_KV_HEADS=num_idx_heads,
         DECODE_MAX_Q=decode_max_q,
         BLOCK_SIZE_K=block_size_k,
-        pages_per_block=PAGES_PER_SPARSE_BLOCK,
+        pages_per_block=pages_per_block,
         block_page_stride=block_page_stride,
         EMIT_SPARSE_BT=emit,
         num_warps=num_warps,
@@ -923,8 +934,8 @@ def _topk_index_packed_kernel(
     DECODE_MAX_Q: tl.constexpr,  # 0 = prefill; else query rows per request
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
-    pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
-    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (>= pages_per_block)
+    pages_per_block: tl.constexpr,  # pages per sparse block (8 of 16 tokens; 1 for page-128)
+    block_page_stride: tl.constexpr,  # pages between logical blocks (>= pages_per_block)
     EMIT_SPARSE_BT: tl.constexpr,  # fuse compaction (per-kv-head row + encoded page)
 ):
     tl.static_assert(BLOCK_SIZE_K >= BLOCK_SIZE_T)
@@ -1138,12 +1149,15 @@ def minimax_m3_index_topk(
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
     index_mxfp4: bool = False,
+    pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
     With ``index_mxfp4`` (``--index-cache-dtype fp4``) ``index_kv_cache`` is the
     uint8 ``[num_blocks, 8704]`` MXFP4 page cache and the scores come from aiter's
     FlyDSL scorer (index_mxfp4.py); the selection after it is this module's.
+    ``pages_per_block`` / ``block_page_stride`` describe the emitted block table:
+    8 / 8 for the page-16 SHUFFLE cache, 1 / 1 for page-128 caches (MXFP4 KV).
 
     Returns topk_idx [num_kv_heads, total_q, topk] of 0-indexed block ids
     (right-padded with -1). M3 has num_idx_heads == num_kv_heads, so the
@@ -1217,6 +1231,7 @@ def minimax_m3_index_topk(
         block_table,
         emit_sparse_block_table,
         idx_q.device,
+        pages_per_block,
     )
     _launch_select(
         score,
@@ -1237,6 +1252,7 @@ def minimax_m3_index_topk(
         emit=emit_sparse_block_table,
         block_page_stride=block_page_stride,
         n_valid_column_per_row=n_valid_column_per_row,
+        pages_per_block=pages_per_block,
     )
     return (topk_idx, *emit_out) if emit_out else topk_idx
 
@@ -1362,11 +1378,12 @@ def minimax_m3_index_topk_decode(
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
     index_mxfp4: bool = False,
+    pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
     index_score=None,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
-    ``index_mxfp4`` as in :func:`minimax_m3_index_topk`.
+    ``index_mxfp4`` and ``pages_per_block`` as in :func:`minimax_m3_index_topk`.
     The MXFP4 scorer takes the step's ``index_score`` (``IndexScoreStep``: work map,
     the block bound it was built against, which does not move between graph replays,
     and the -inf filled score storage); omitted, it builds and allocates its own.
@@ -1420,6 +1437,7 @@ def minimax_m3_index_topk_decode(
         block_table,
         emit_sparse_block_table,
         idx_q.device,
+        pages_per_block,
     )
 
     if index_mxfp4:
@@ -1483,5 +1501,6 @@ def minimax_m3_index_topk_decode(
         emit=emit_sparse_block_table,
         block_page_stride=block_page_stride,
         n_valid_column_per_row=n_valid_column_per_row,
+        pages_per_block=pages_per_block,
     )
     return (topk_idx, *emit_out) if emit_out else topk_idx

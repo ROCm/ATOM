@@ -176,6 +176,7 @@ class EngineArgs:
     draft_model: str | None = None
     spec_decode_acceptance_rate: float | None = None
     spec_decode_acceptance_length: float | None = None
+    spec_decode_kv_cache_dtype: str | None = None
     mark_trace: bool = False
     enable_rapidserve: bool = False
     disagg_prefill_max_num_seqs: int | None = None
@@ -310,8 +311,11 @@ class EngineArgs:
             choices=["bf16", "fp8", "fp4"],
             type=str,
             default="bf16",
-            help="KV cache type. Default is 'bf16'. 'fp4' is DeepSeek-V4.1's own "
-            "FP4 KV; other models refuse it.",
+            help="KV cache type. Default is 'bf16'. 'fp4' is MiniMax-M3.1's MXFP4 "
+            "K/V (e2m1 + e8m0 per 32; every layer an indexed sparse one; gfx950, "
+            "--block-size 128, bf16; no KV offload or "
+            "--kv-transfer-config), or DeepSeek-V4.1's own FP4 KV; other models "
+            "refuse it.",
         )
         parser.add_argument(
             "--index-cache-dtype",
@@ -321,9 +325,9 @@ class EngineArgs:
             default=None,
             help="Index cache type. Native single-node DeepSeek-V4 defaults to "
             "'fp4' except on gfx942, which defaults to 'fp8'; other models "
-            "default to --kv_cache_dtype. 'fp4' is MXFP4 (e2m1 + e8m0 per 32, "
-            "gfx950, --block-size 128) on MiniMax-M3; other models use their "
-            "own FP4 layout.",
+            "default to --kv_cache_dtype ('fp8' for MiniMax-M3's fp4 KV). 'fp4' "
+            "is MXFP4 (e2m1 + e8m0 per 32, gfx950, --block-size 128) on "
+            "MiniMax-M3; other models use their own FP4 layout.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
@@ -453,6 +457,18 @@ class EngineArgs:
             "--method eagle3; optional for --method dspark (needed for the "
             "DFlash-backbone drafts such as Kimi-K3-DSpark, omitted for "
             "V4-Pro-DSpark which ships inside the target checkpoint).",
+        )
+        parser.add_argument(
+            "--spec-decode-kv-cache-dtype",
+            type=str,
+            default=None,
+            choices=["bf16", "fp8", "fp4"],
+            help="KV dtype of the speculative draft's pages (the draft's setting "
+            "inside SpeculativeConfig.kv_cache_dtype). A draft with a KV pool of "
+            "its own -- MiniMax-M3.1's DSpark -- takes 'bf16' or 'fp8' (default "
+            "'fp8'; 'fp4' is refused, no draft FP4 layout). A draft in the "
+            "target's pool always has --kv_cache_dtype, and a different value "
+            "here is an error. Needs --method.",
         )
         parser.add_argument(
             "--spec-decode-acceptance-length",
@@ -894,6 +910,7 @@ class EngineArgs:
                 method=method,
                 model=draft_model or self.model,
                 num_speculative_tokens=num_spec_tokens,
+                kv_cache_dtype=kwargs.pop("spec_decode_kv_cache_dtype"),
                 synthetic_acceptance_rate=synthetic_acceptance_rate,
                 synthetic_acceptance_length=synthetic_acceptance_length,
             )
@@ -903,6 +920,8 @@ class EngineArgs:
             kwargs.pop("draft_model")
             kwargs.pop("spec_decode_acceptance_rate")
             kwargs.pop("spec_decode_acceptance_length")
+            if kwargs.pop("spec_decode_kv_cache_dtype") is not None:
+                raise ValueError("--spec-decode-kv-cache-dtype needs --method.")
             kwargs["speculative_config"] = None
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode
