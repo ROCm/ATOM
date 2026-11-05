@@ -83,7 +83,6 @@ from atom.model_engine.sequence import (
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_engine.token_constraints import (
     TokenConstraints,
-    apply_required_channel,
     prepare_token_constraints,
 )
 from atom.model_engine.token_logprobs import (
@@ -433,9 +432,22 @@ class tokenIDProcessor:
         sync_event: torch.cuda.Event,
         sampled_logprobs: torch.Tensor | None = None,
         channel_states: torch.Tensor | None = None,
+        constraint_failed: torch.Tensor | None = None,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, list[TokenLogprob]] | None]:
+        output_ids = sampled_token_ids
+        if constraint_failed is not None:
+            failure = (
+                constraint_failed
+                if sampled_token_ids.ndim == 1
+                else constraint_failed[:, None]
+            )
+            output_ids = sampled_token_ids.masked_fill(failure, -2)
+            if self.is_deferred_out and sampled_token_ids.is_cuda:
+                # The caller recorded before this output-only transform. D2H
+                # must wait for its completion too, not copy uninitialized IDs.
+                sync_event.record()
         if not self.is_deferred_out:
-            token_ids = sampled_token_ids.tolist()
+            token_ids = output_ids.tolist()
             req_ids = batch.req_ids
             if token_ids and isinstance(token_ids[0], list):
                 processed = self._batch_process_token_ids(token_ids)
@@ -453,7 +465,7 @@ class tokenIDProcessor:
         token_ids = self.recv_async_output(self.token_ids_cpu)
         logprobs = self.recv_logprobs()
         self.send_to_cpu_async(
-            sampled_token_ids,
+            output_ids,
             self.token_ids_cpu,
             sync_event,
             gpu_logprobs=sampled_logprobs,
@@ -3697,7 +3709,26 @@ class ModelRunner:
             self.forward_done_event,
             sampled_logprobs,
             channel_states=channel_states,
+            constraint_failed=(
+                constraints.failed(sampled_tokens) if constraints is not None else None
+            ),
         )
+        output_errors = dict(structured.errors) if structured is not None else None
+        # Read only the output already delivered by the existing D2H pipeline.
+        # Keep safe sampled IDs for GPU carry; never feed the error sentinel back.
+        delivered = prev_batch if self.tokenID_processor.is_deferred_out else batch
+        if delivered is not None and (
+            getattr(delivered, "token_constraints", None)
+            or getattr(delivered, "structured_requests", None)
+        ):
+            for req_id, ids in tuple(token_id_dict.items()):
+                if req_id != -1 and -2 in ids:
+                    if output_errors is None:
+                        output_errors = {}
+                    output_errors[req_id] = (
+                        "Token constraints leave no valid continuation"
+                    )
+                    token_id_dict[req_id] = ()
         req_ids_out = list(token_id_dict)
         token_ids_out = list(token_id_dict.values())
 
@@ -3765,9 +3796,7 @@ class ModelRunner:
             num_bonus=prev_bonus_num,
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
-            structured_errors=(
-                dict(structured.errors) if structured is not None else None
-            ),
+            structured_errors=output_errors or None,
         )
 
     def _kv_after_forward(self) -> None:
@@ -5319,9 +5348,13 @@ class RapidServeModelRunner(ModelRunner):
             # Masked in place with no pre-mask copy, unlike `postprocess`: this
             # path returns token ids only and computes no logprobs, so nothing
             # reads the unmasked row.
-            apply_required_channel(self, batch, logits)
+            constraints = TokenConstraints.apply(self, batch, logits, None)
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
+            if constraints is not None and constraints.invalid is not None:
+                sampled = sampled.masked_fill(constraints.failed(sampled), -2)
             sampled_cpu = sampled.view(-1).tolist()
+            if -2 in sampled_cpu:
+                raise ValueError("Token constraints leave no valid continuation")
             self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()

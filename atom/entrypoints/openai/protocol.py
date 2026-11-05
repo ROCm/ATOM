@@ -270,6 +270,7 @@ class ChatCompletionRequest(BaseModel):
     max_completion_tokens: int | None = None
     stop: list[str] | None = None
     ignore_eos: bool | None = False
+    min_tokens: Annotated[int, Field(strict=True, ge=0)] = 0
     stream: bool | None = False
     stream_options: dict[str, Any] | None = None
     logprobs: Annotated[bool, Field(strict=True)] | None = False
@@ -342,6 +343,7 @@ class CompletionRequest(BaseModel):
     max_completion_tokens: int | None = None
     stop: list[str] | None = None
     ignore_eos: bool | None = False
+    min_tokens: Annotated[int, Field(strict=True, ge=0)] = 0
     stream: bool | None = False
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None

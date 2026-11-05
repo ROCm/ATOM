@@ -481,6 +481,8 @@ class Sequence:
         # by the scheduler over each token it commits, so on a deferred step it
         # trails the GPU's copy by one forward; the runner reads this one only
         # for rows whose last tokens the host already has.
+        self.min_tokens = sampling_params.min_tokens
+        self.token_constraints = sampling_params.token_constraints
         self.required_channel = sampling_params.required_channel
         self.required_channel_state = (
             UNCONSTRAINED if self.required_channel is None else 0

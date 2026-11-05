@@ -287,7 +287,14 @@ class ScheduledBatch:
         # every list positionally aligned with this one.
         state_rows: list[int] = []
         state_seqs: list[Sequence] = []
+        self.token_constraints = None
         for row, seq in enumerate(seqs.values()):
+            if seq.token_constraints:
+                if self.token_constraints is None:
+                    self.token_constraints = []
+                self.token_constraints.extend(
+                    (row, seq.num_prompt_tokens, rule) for rule in seq.token_constraints
+                )
             if seq.has_per_req_cache and seq.state_slot >= 0:
                 state_rows.append(row)
                 state_seqs.append(seq)
@@ -4675,7 +4682,10 @@ class Scheduler:
                     is_stop = False
                     for i in range(num_new_token):
                         offset = num_tokens - i
-                        if seq.token_ids[offset - stop_len : offset] == stop_seq:
+                        if (
+                            offset - seq.num_prompt_tokens >= seq.min_tokens
+                            and seq.token_ids[offset - stop_len : offset] == stop_seq
+                        ):
                             is_stop = True
                             # `i` counts back from the last sampled token
                             # (i=0 = last). Truncate to include this stop

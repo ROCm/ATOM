@@ -497,6 +497,56 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 - `greedy_sample()`: `aiter.ops.triton.topk.topk(logits, 1)`
 - `random_sample()`: `aiter.ops.triton.softmax.softmax(logits)` followed by exponential sampling and `topk`.
 
+### Shared token constraints
+
+`TokenConstraints` in `atom/model_engine/token_constraints.py` is the sampling
+boundary for Kimi-K3 required channels, llguidance JSON Schema masks, and static
+token-ID rules. `SamplingParams.token_constraints` accepts a tuple of
+`TokenConstraint.allow(ids)`, `.deny(ids)`, or `.force(id)` rules. These are hard
+constraints: rules intersect; they do not add a probability bias. An optional
+`until=N` on allow/deny rules applies the rule until N output tokens have been
+generated. The unconstrained batch returns before allocating a constraint step
+or launching masking kernels.
+
+Chat and Completions accept `min_tokens` (default 0, no greater than
+`max_tokens`). Admission translates it into a deny rule for the deployment's
+EOS and stop-token IDs until that minimum is reached. Custom stop strings are
+ignored before the minimum; the output and context limits still apply. Native
+callers can also supply token-ID rules through `SamplingParams`; those lists
+are not new Chat/Responses request fields. Explicit token-ID lists are rejected
+on RapidServe before enqueue because its prefill handoff cannot carry a
+per-request constraint error; this does not disable the built-in `min_tokens`
+rule. For example:
+
+```python
+from atom.sampling_params import SamplingParams, TokenConstraint
+
+params = SamplingParams(
+    max_tokens=128,
+    min_tokens=32,
+    token_constraints=(TokenConstraint.deny([42, 43]),),
+)
+```
+
+Small deny lists upload only rule metadata and IDs; their kernel writes just
+the denied logits. Allow lists mask their complement. JSON Schema retains its
+packed vocabulary masks, and K3 retains its fused GPU state machine. All three
+run before sampling, including speculative verification and bonus rows. Each
+row's actual input-token position determines whether a timed rule is active,
+so rejected drafts and deferred host output do not advance the minimum early.
+Synthetic acceptance and relaxed MTP cannot guarantee hard rules and are
+rejected when a static rule or `min_tokens` is requested.
+
+If the intersection has no valid continuation, sampling uses a safe internal
+ID and returns a request error via the existing output-copy pipeline. The
+error marker never becomes a next-forward token. The D2H-ready event covers
+this output-only encoding as well as sampling. Grammar input copies still
+overlap target forward; this adds no host read of current GPU token IDs.
+
+Enabled constraints incur metadata preparation, H2D and masking. Combinations that can remove every candidate also run an
+empty-row check; a sparse deny on otherwise unmasked model logits skips it. This is distinct from the default path, which runs none of these
+kernels. A force operation cannot restore a token forbidden by a Schema mask.
+
 ### Required channel (`required_channel.py`)
 
 Holds a request with a `RequiredChannel` (`atom/sampling_params.py`; today only

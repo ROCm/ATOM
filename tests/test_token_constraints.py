@@ -44,6 +44,7 @@ def test_masks_precede_sampling_and_commit_uses_final_ids(
     )
     metadata = (
         SimpleNamespace(
+            cu_num_draft_tokens=torch.tensor([1, 2]),
             bonus_logits_indices=torch.tensor([1, 3]),
             target_logits_indices=torch.tensor([0, 2]),
         )
@@ -81,7 +82,11 @@ def test_masks_precede_sampling_and_commit_uses_final_ids(
     final_ids = torch.tensor([[1, 2], [3, -1]])
     result = step.commit(final_ids, batch, deferred)
     assert result is states if deferred else result is None
-    grammar.commit.assert_called_once_with(final_ids, batch, prefixes)
+    grammar.commit.assert_called_once()
+    committed, committed_batch, committed_prefixes = grammar.commit.call_args.args
+    torch.testing.assert_close(committed, final_ids)
+    assert committed_batch is batch
+    assert committed_prefixes is prefixes
     if deferred:
         advance.assert_called_once_with(*channel_state, final_ids)
     else:
