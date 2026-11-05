@@ -423,6 +423,7 @@ def _updater(model, device="cpu"):
 
     updater = _Updater()
     updater.model, updater.device = model, torch.device(device)
+    updater._init_weight_updater()
     return updater
 
 

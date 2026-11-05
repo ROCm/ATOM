@@ -87,6 +87,7 @@ def _updater(**kwargs):
         world_size = 1
 
     updater = _Updater()
+    updater._init_weight_updater()
     for name, value in kwargs.items():
         setattr(updater, name, value)
     return updater

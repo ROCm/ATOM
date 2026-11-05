@@ -25,6 +25,7 @@ import queue
 
 import pytest
 
+from atom.model_engine import engine_utility
 from atom.model_engine.collective_rpc import RpcPayload, RpcResult
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
@@ -55,6 +56,12 @@ class _RunnerMgr:
         ]
 
     def utility_rpc(self, method, payload, timeout=300.0):
+        if method == "get_worker_capabilities":
+            # Asked once, before the first sync: every runner takes every sync.
+            return [
+                RpcResult(payload.request_id, r, value={"unavailable": {}})
+                for r in range(self.proc_num)
+            ]
         self.calls.append((method, payload, timeout))
         if method == "discard_failed_weight_sync":
             return [
@@ -91,7 +98,10 @@ class _Engine:
 def _handler(**kw):
     mgr = _RunnerMgr(**kw)
     out = queue.Queue()
-    return EngineUtilityHandler(mgr, out, label="test"), mgr, out
+    handler = EngineUtilityHandler(mgr, out, label="test")
+    # As process_queue sets it before running any handler.
+    handler.engine = _Engine()
+    return handler, mgr, out
 
 
 def _responses(out):
@@ -256,11 +266,13 @@ _DIRECT_UPDATES = [
         "update_weights_ipc",
         {"ipc_handle": "h", "bucket_meta": {"w": 1}, "is_last": False},
     ),
+    ("receive_weights_rdma", {"group_name": "g", "version": 3}),
 ]
 _DIRECT_UPDATE_CALLS = {
     "update_weights": ("update_weights", (["t"], False)),
     "update_weights_shm": ("update_weights_from_shm", ("s", {"w": 1}, True)),
     "update_weights_ipc": ("update_weights_from_ipc", ("h", {"w": 1}, False, None)),
+    "receive_weights_rdma": ("receive_weights_rdma", ("g", 3)),
 }
 
 
@@ -273,6 +285,9 @@ def test_a_direct_update_runs_on_every_rank(cmd, args):
 
     ((method, payload, _),) = mgr.calls
     assert (method, payload.args) == _DIRECT_UPDATE_CALLS[cmd]
+    # By name: appended to the arguments, it reached whichever parameter came
+    # last in each runner method.
+    assert payload.call_kwargs() == {"require_full": False}
     assert _responses(out) == [{"cmd": cmd, "result": 4}]
 
 
@@ -282,6 +297,7 @@ def test_a_direct_update_runs_on_every_rank(cmd, args):
         ("update_weights", False),
         ("update_weights_shm", True),
         ("update_weights_ipc", True),
+        ("receive_weights_rdma", False),
     ],
 )
 def test_the_shared_buffer_updates_keep_their_barrier(cmd, barrier):
@@ -404,188 +420,6 @@ _ONE_RANK_FAILED = [RpcResult("u", 0, value=4), RpcResult("u", 1, error="boom")]
 
 def _bucket(request_id, is_last, sync_id="s1"):
     return {"sync_id": sync_id, "request_id": request_id, "is_last": is_last}
-
-
-# ── a weight stream over collective_rpc settles the serving fence ──────────
-
-
-class _StreamRunners(_RunnerMgr):
-    """Runners that answer a weight stream as given, and their reload fence
-    status as given; other commands as ``_RunnerMgr`` does."""
-
-    def __init__(self, stream, healthy):
-        super().__init__(proc_num=len(stream))
-        self.stream, self.healthy = stream, healthy
-
-    def collective_rpc(self, method, payload, timeout=300.0):
-        self.calls.append((method, payload, timeout))
-        if method == "get_weight_update_status":
-            return [
-                RpcResult(payload.request_id, r, value={"healthy": ok})
-                for r, ok in enumerate(self.healthy)
-            ]
-        return [
-            RpcResult(
-                payload.request_id, r, value=None if e else {"buckets": 1.0}, error=e
-            )
-            for r, e in enumerate(self.stream)
-        ]
-
-
-def _stream_handler(stream, healthy):
-    mgr = _StreamRunners(stream, healthy)
-    out = queue.Queue()
-    return EngineUtilityHandler(mgr, out, label="test"), mgr, out
-
-
-def _stream_rpc(handler, out, engine, method="receive_weights_rdma"):
-    args = {"method": method, "request_id": "r1", "kwargs": {"version": 1}}
-    return _process_one(handler, out, engine, "collective_rpc", args)
-
-
-def test_a_failed_weight_stream_fences_the_engine_not_just_its_runners():
-    """The stream runs as a collective RPC, so a failed one fenced the runners
-    alone: the engine went on scheduling, and its next forward met a fenced
-    runner and took the worker down instead of idling."""
-    h, _, out = _stream_handler(stream=[None, "bucket 2 rejected"], healthy=[0, 0])
-    engine = _Engine()
-
-    (reply,) = _stream_rpc(h, out, engine)
-
-    assert reply["results"][1]["error"] == "bucket 2 rejected"
-    assert engine._weight_sync_fenced and engine._rl_weights_inconsistent
-
-
-def test_a_stream_every_rank_refused_leaves_the_engine_serving():
-    """Refused before anything was written, every runner still holds one
-    whole version, so there is nothing to fence."""
-    refused = ["version must increase"] * 2
-    h, mgr, out = _stream_handler(stream=refused, healthy=[1, 1])
-    engine = _Engine()
-
-    _stream_rpc(h, out, engine)
-
-    assert not engine._weight_sync_fenced and not engine._rl_weights_inconsistent
-    assert [call[0] for call in mgr.calls] == [
-        "receive_weights_rdma",
-        "get_weight_update_status",
-    ]
-
-
-def test_a_committed_weight_stream_lifts_a_fence_a_failed_sync_left():
-    """Committed on every rank, the stream rewrote every parameter, yet the
-    fence a failed bucket of another path had put up stayed up: recovering
-    over RDMA left the engine idle for good."""
-    h, mgr, out = _stream_handler(stream=[None, None], healthy=[1, 1])
-    mgr._replies = _ONE_RANK_FAILED
-    engine = _Engine()
-    _process_one(h, out, engine, "update_weights_shm", _bucket("u1", False))
-    assert engine._weight_sync_fenced and engine._rl_weights_inconsistent
-    # As the failed sync's sender does once it stops.
-    _process_one(h, out, engine, "discard_failed_weight_sync", {})
-
-    _stream_rpc(h, out, engine)
-
-    assert not engine._weight_sync_fenced and not engine._rl_weights_inconsistent
-
-
-def test_a_stream_is_refused_until_a_failed_sync_is_discarded():
-    """A failed bucket ended the sync's progress, but not the sync. A stream
-    taken before its discard committed and served, and the discard then
-    fenced the engine again over the model that stream had made whole."""
-    h, mgr, out = _stream_handler(stream=[None, None], healthy=[1, 1])
-    mgr._replies = _ONE_RANK_FAILED
-    engine = _Engine()
-    _process_one(h, out, engine, "update_weights_shm", _bucket("u1", False))
-
-    _stream_rpc(h, out, engine)
-    assert engine._weight_sync_fenced
-    _process_one(h, out, engine, "discard_failed_weight_sync", {})
-    _stream_rpc(h, out, engine)
-
-    sent = [call[1].kwargs for call in mgr.calls if call[0] == "receive_weights_rdma"]
-    assert "'s1'" in sent[0]["engine_refusal"]
-    assert "engine_refusal" not in sent[1]
-    assert not engine._weight_sync_fenced
-
-
-def test_a_new_sync_first_clears_a_failed_one_never_discarded():
-    """A failed bucket ended the sync's progress, so the next sync took the
-    old one for over and cleared nothing: a rank whose own cleanup had failed
-    kept that sync's reload open, for the new sync's buckets to continue."""
-    h, mgr, out = _handler(replies=_ONE_RANK_FAILED)
-    engine = _Engine()
-    _process_one(h, out, engine, "update_weights_shm", _bucket("a1", False))
-    mgr.calls.clear()
-
-    mgr._replies = _TWO_RANKS_OK
-    _process_one(
-        h, out, engine, "update_weights_shm", _bucket("b1", True, sync_id="s2")
-    )
-
-    assert [call[0] for call in mgr.calls] == [
-        "discard_failed_weight_sync",
-        "update_weights_from_shm",
-    ]
-
-
-def test_a_committed_weight_stream_leaves_an_open_sync_to_its_finish():
-    """A bucket of another path is in and its sync not finished: lifting the
-    fence then would serve a model that sync has only partly rewritten."""
-    h, mgr, out = _stream_handler(stream=[None, None], healthy=[1, 1])
-    mgr._replies = _TWO_RANKS_OK
-    engine = _Engine()
-    _process_one(h, out, engine, "update_weights_shm", _bucket("u1", False))
-
-    _stream_rpc(h, out, engine)
-
-    assert engine._weight_sync_fenced
-
-
-def test_a_committed_stream_leaves_the_engine_fenced_while_a_runner_is():
-    """A commit can leave a runner fenced: a fence put off while its reload
-    was open goes up as that reload commits. The engine served again, and its
-    next forward met that runner fenced and took the worker down."""
-    h, mgr, out = _stream_handler(stream=[None, None], healthy=[1, 0])
-    engine = _Engine()
-
-    _stream_rpc(h, out, engine)
-
-    assert engine._weight_sync_fenced and engine._rl_weights_inconsistent
-    assert "committed, but left a runner fenced" in h._weight_sync_failure
-    assert [call[0] for call in mgr.calls] == [
-        "receive_weights_rdma",
-        "get_weight_update_status",
-    ]
-
-
-def test_the_runners_refuse_a_stream_while_a_sync_of_another_path_is_open():
-    """Taken after that sync's last bucket but before its FINISH, or between
-    its buckets, the stream committed, and the sync went on over it. Refused
-    by the runners, it is still received: the trainer is not left in its
-    broadcast."""
-    h, mgr, out = _stream_handler(stream=[None, None], healthy=[1, 1])
-    mgr._replies = _TWO_RANKS_OK
-    engine = _Engine()
-    _stream_rpc(h, out, engine)
-    _process_one(h, out, engine, "update_weights_shm", _bucket("u1", True))
-    _stream_rpc(h, out, engine)
-
-    sent = [call[1].kwargs for call in mgr.calls if call[0] == "receive_weights_rdma"]
-    assert "engine_refusal" not in sent[0]
-    assert sent[0] == {"version": 1}
-    assert "'s1'" in sent[1]["engine_refusal"]
-    assert "FINISH" in sent[1]["engine_refusal"]
-
-
-def test_another_collective_rpc_leaves_the_fence_as_it_was():
-    h, mgr, out = _stream_handler(stream=["boom", "boom"], healthy=[0, 0])
-    engine = _Engine()
-
-    _stream_rpc(h, out, engine, method="get_worker_capabilities")
-
-    assert not engine._weight_sync_fenced
-    assert [call[0] for call in mgr.calls] == ["get_worker_capabilities"]
 
 
 def test_a_failed_sync_recovers_through_sleep_wake_up_and_a_new_sync():
@@ -800,7 +634,103 @@ def test_weight_sync_status_explains_a_fence():
         "fenced": True,
         "in_progress": True,
         "failure": None,
+        "whole": True,
     }
+
+
+# ── one fence, one lift rule, for every transport ──────────────────────────
+
+
+def _require_full(call):
+    """What the engine told the runners: that the weights were not whole."""
+    return call[1].call_kwargs()["require_full"]
+
+
+def test_a_weight_stream_is_a_sync_the_engine_fences_and_finish_lifts():
+    """It ran as a collective RPC, outside the session that owns the fence, so
+    a fence of its own settled on its outcome next to FINISH/DISCARD."""
+    h, _, out = _handler(replies=_counts(435, 435))
+    engine = _Engine()
+    stream = {"sync_id": "s1", "request_id": "r1", "group_name": "g", "version": 1}
+
+    (reply,) = _process_one(h, out, engine, "receive_weights_rdma", stream)
+    assert reply == {"cmd": "receive_weights_rdma", "result": 435, "request_id": "r1"}
+    assert engine._weight_sync_fenced
+
+    finish = {"sync_id": "s1", "completed_request_id": "r1"}
+    _process_one(h, out, engine, "finish_weight_sync", finish)
+    assert not engine._weight_sync_fenced
+
+
+def test_a_weight_stream_waits_for_its_runners_not_its_callers_deadline():
+    """Under the caller's budget a long stream was recorded as failed and
+    fenced, then written on every runner."""
+    h, mgr, _ = _handler(replies=_counts(1, 1))
+    h._execute_utility_command(
+        "receive_weights_rdma", {"group_name": "g", "version": 1, "timeout": 5.0}
+    )
+    ((method, _, timeout),) = mgr.calls
+    assert method == "receive_weights_rdma"
+    assert timeout == engine_utility._WEIGHT_STREAM_TIMEOUT_S
+
+
+class _RefusingEngine(_Engine):
+    def prepare_kv_change(self, *, weights, deadline):
+        raise RuntimeError("1 batch(es) still in the pipeline")
+
+
+def test_a_refused_weight_stream_is_still_drained_and_changes_nothing():
+    """The trainer is already broadcasting; a stream refused without the
+    runners taking it in left the trainer in its first broadcast."""
+    h, mgr, out = _handler(replies=_counts(1, 1))
+    engine = _RefusingEngine()
+    stream = {"sync_id": "s1", "request_id": "r1", "group_name": "g", "version": 7}
+
+    (reply,) = _process_one(h, out, engine, "receive_weights_rdma", stream)
+
+    assert reply["error"] == "refused: 1 batch(es) still in the pipeline"
+    ((method, payload, _),) = mgr.calls
+    assert (method, payload.args) == ("receive_weights_rdma", ("g", 7))
+    assert payload.kwargs == {"refusal": "1 batch(es) still in the pipeline"}
+    assert not engine._weight_sync_fenced and not engine._rl_weights_inconsistent
+
+
+def test_after_a_failed_sync_only_a_full_one_can_lift_the_fence():
+    """An SHM sync failed halfway, then one tensor went through a direct
+    update and its FINISH served half the model at each version. Now the
+    runners are told the weights are not whole, and refuse to complete a sync
+    that leaves any parameter as it was."""
+    h, mgr, out = _handler(replies=_ONE_RANK_FAILED)
+    engine = _Engine()
+    _process_one(h, out, engine, "update_weights_shm", _bucket("u1", False))
+    assert _require_full(mgr.calls[0]) is False
+    mgr._replies = _TWO_RANKS_OK
+
+    direct = {"sync_id": "s2", "request_id": "u2", "named_tensors": [("w", 1)]}
+    _process_one(h, out, engine, "update_weights", direct)
+
+    (update,) = [call for call in mgr.calls if call[0] == "update_weights"]
+    assert _require_full(update) is True
+    _process_one(
+        h,
+        out,
+        engine,
+        "finish_weight_sync",
+        {"sync_id": "s2", "completed_request_id": "u2"},
+    )
+    assert not engine._rl_weights_inconsistent and not engine._weight_sync_fenced
+
+
+def test_a_sync_abandoned_between_its_buckets_leaves_the_weights_not_whole():
+    h, mgr, out = _handler(replies=_TWO_RANKS_OK)
+    engine = _Engine()
+    _process_one(h, out, engine, "update_weights_shm", _bucket("a1", False))
+    assert not engine._rl_weights_inconsistent
+
+    _process_one(h, out, engine, "update_weights_shm", _bucket("b1", True, "s2"))
+
+    assert engine._rl_weights_inconsistent
+    assert _require_full(mgr.calls[-1]) is True
 
 
 def test_every_answered_utility_command_stamps_the_callers_request_id():

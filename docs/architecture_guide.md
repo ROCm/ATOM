@@ -253,19 +253,22 @@ RPC targets must not perform cross-DP collectives: each EngineCore dequeues
 control work independently, so another DP engine may already be waiting in the
 busy loop's state all-reduce.
 
-Direct, SHM and IPC weight updates are fenced sessions. The first bucket stops
-serving; CoreManager clears the fence only after every DP engine completes the
-final bucket. Built-in senders abort from ``finally`` if iteration stops early,
-and asynchronous weight-update utility sends are rejected because they have no
-owner to finish or abort them. ``AsyncLLMEngine.get_weight_sync_status()``
-reports a fence, an in-progress session and its last failure.
+Direct, SHM, IPC and RDMA (``AsyncLLMEngine.receive_weights_rdma``) weight
+updates are fenced sessions. The first bucket stops serving; CoreManager clears
+the fence only after every DP engine completes the final bucket. Built-in
+senders abort from ``finally`` if iteration stops early, and asynchronous
+weight-update utility sends are rejected because they have no owner to finish
+or abort them. ``AsyncLLMEngine.get_weight_sync_status()`` reports a fence, an
+in-progress session, its last failure, and whether the weights are whole.
 
 Every update carries the id of the sync it belongs to: one per
 ``weight_sync_session()`` until that sync finishes, and one per update sent
 outside a session. A session whose update failed sends nothing more, and an
 engine refuses the remaining updates and the finish of a failed or aborted
 sync, so the rest of a failed sync cannot commit as a new one. Recovering takes
-a new, complete sync. Weights may be resumed while fenced, since after
+a new sync that rewrites every parameter: once a sync has failed or been
+abandoned between buckets, the runners refuse to complete one that leaves any
+parameter as it was. Weights may be resumed while fenced, since after
 ``sleep(level=2)`` only a resume gives released parameters storage again; the
 fence keeps serving off until that complete sync commits.
 
