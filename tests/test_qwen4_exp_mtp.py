@@ -27,6 +27,7 @@ def test_qwen_mrope_declares_a_capturable_serial_draft_step():
     proposer = object.__new__(EagleProposer)
     proposer.runner = SimpleNamespace(use_mrope=True)
     proposer.mtp_k = 3
+    proposer.dtype = torch.bfloat16
     proposer.speculative_config = SimpleNamespace(
         draft_model_hf_config=SimpleNamespace(hc_count=4, hidden_size=2560)
     )
