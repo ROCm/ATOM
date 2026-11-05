@@ -52,11 +52,18 @@ jobs:
           ruff check --isolated --no-cache --select F,E9 .claude/skills/review-pr/ \
             .claude/skills/validate-atom-pr/
 
-      - name: SKILL.md stays inside its 500-line budget
+      - name: SKILL.md stays inside its 505-line budget
         run: |
+          # 500 -> 505 once, for the Coverage line and the card format it belongs to.
+          # SKILL.md's own rule is that raising this is a decision to make the file less
+          # likely to be read in full, to be made in a commit that says why: the card had
+          # no way to say a diff is too large for one pass to cover, so five findings on a
+          # 16,000-line PR read exactly like five on a 400-line one. Two lines were
+          # compressed first; this is the remainder. The budget still binds -- it is not a
+          # number that moves whenever something new wants in.
           n=$(wc -l < .claude/skills/review-pr/SKILL.md)
           echo "SKILL.md is $n lines"
-          [ "$n" -le 500 ] || { echo "::error::SKILL.md is $n lines, budget is 500"; exit 1; }
+          [ "$n" -le 505 ] || { echo "::error::SKILL.md is $n lines, budget is 505"; exit 1; }
 
       - name: run_one.sh guards hold
         run: bash .claude/skills/review-pr/selftest.sh

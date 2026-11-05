@@ -37,6 +37,7 @@ The Step 8 output rules are reproduced verbatim below, because the most-violated
 **[One sentence: what this PR does, in plain terms. E.g. "Wraps the per_group emit_bf16 AllReduce path in a torch.library op so Dynamo can trace it."]**
 
 Review: [✅ LGTM | ⚠️ NEEDS WORK | 🔴 BLOCK]
+Coverage: [rules.txt's `coverage:` line, verbatim — above the findings, because it says whether they are all of them]
 Validation (deterministic): [<verdict> — target, exact runtime, skipped-stage evidence | N/A — no runtime surface changed | NOT RUN — <reason>]
   ...or, with no $WORK/validation_report.json and you ran something yourself, this line instead:
 Validation (advisory): [<what, where> — one run, this box, unverified | N/A — ... | NOT RUN — ...]

@@ -1197,6 +1197,35 @@ def hardcoded_launch_knob(files):
     return False
 
 
+# Measured over 40 merged ATOM PRs (2026-11): files median 4, p90 11, max 19; added
+# lines median 230, p90 708, max 3369. A diff past the top of that range is not a harder
+# review, it is a review a single pass cannot sweep -- and the card does not show that.
+# On ATOM#2762 (47 files / 16,647 added) seven consecutive reviews each reported five
+# findings, the same count a 385-line PR gets: the number saturates, so five reads as
+# "these are the problems" when it means "these are five of them". Saying so is itself a
+# finding, and it belongs above the others because it changes what they mean.
+BIG_FILES, BIG_ADDED = 20, 3500
+
+
+def coverage_line(files):
+    """One line for the card: whether a single pass can cover this diff."""
+    nf = len(files)
+    na = sum(len(f["add"]) for f in files.values())
+    if nf <= BIG_FILES and na <= BIG_ADDED:
+        return f"  coverage: {nf} files / {na} added lines -- within one review pass"
+    over = []
+    if nf > BIG_FILES:
+        over.append(f"{nf} files (no ATOM PR merged in the last 40 exceeded 19)")
+    if na > BIG_ADDED:
+        over.append(f"{na} added lines (the largest merged was 3369)")
+    return (
+        "  coverage: BEYOND ONE PASS -- " + "; ".join(over) + ". Findings below are a "
+        "sample, not a sweep: re-reviews of a diff this size return a similar count each "
+        "time without converging. Recommend splitting along the seams the diff already "
+        "has -- a reader cannot tell a complete review from a partial one by reading it."
+    )
+
+
 def derive(files, title="", raw_diff=""):
     """P0 minimal deriver. The full ATOM family axis is P1 -- see the spec, S7.
 
@@ -3465,4 +3494,5 @@ if __name__ == "__main__":
         raise SystemExit(0)
     rules = sorted({r for _, rs in types for r in rs.split()})
     print(f"  files={len(files)}  types={len(types)}  rules={len(rules)}/{len(ALL_RULES.split())}")
+    print(coverage_line(files))
     for n, rs in types: print(f"    [{n:20s}] {rs}")

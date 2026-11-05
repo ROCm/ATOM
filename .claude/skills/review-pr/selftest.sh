@@ -370,6 +370,27 @@ _skillcode='diff --git a/.claude/skills/review-pr/triage.py b/.claude/skills/rev
 '
 t "a skills-only diff derives no rules" "$(_fams2 "$_skillcode")" "infra-only"
 
+# A diff too large for one pass must SAY so, above the findings. Seven consecutive reviews
+# of ATOM#2762 (47 files / 16.6k added) each reported five findings -- the same count a
+# 385-line PR gets. The number saturates, so five reads as "these are the problems" when
+# it means "five of them". Thresholds are the measured top of 40 merged ATOM PRs (max 19
+# files, 3369 added), not a guess.
+_cov() {  # <files> <added-lines-per-file> -> the coverage verdict word
+  python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+n, per = int(sys.argv[2]), int(sys.argv[3])
+d = "".join(
+    f"diff --git a/f{i}.py b/f{i}.py\n--- a/f{i}.py\n+++ b/f{i}.py\n@@ -1,1 +1,{per} @@\n"
+    + "".join(f"+line{j}\n" for j in range(per))
+    for i in range(n)
+)
+line = triage.coverage_line(triage.parse(d))
+print("BEYOND" if "BEYOND ONE PASS" in line else "OK")' "$S" "$1" "$2"
+}
+t "a normal-sized diff is within one pass"   "$(_cov 6 50)"    "OK"
+t "too many files is flagged as a sample"    "$(_cov 40 10)"   "BEYOND"
+t "too many added lines is flagged too"      "$(_cov 5 1000)"  "BEYOND"
+
 # The pollution case needs REAL skill prose, not a one-line stand-in: a synthetic hunk
 # trips no family and the test passes with the filter removed -- it did, until this was
 # measured. testdata/skill_prose.diff is three files cut from ATOM#2762's own diff, and
