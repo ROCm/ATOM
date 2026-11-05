@@ -24,16 +24,21 @@ import torch
 from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_TOKENS, page_views
 
 
-def index_batch(scheduled_bs, running_bs, running_tokens, max_query_len):
+def index_batch(scheduled_bs, running_bs, running_tokens, max_query_len, strict=True):
     """Requests the decode scorer and selector run, for every index cache: they take
     their batch off the rows of ``idx_q``, which a padded step (a graph bucket, or an
     eager step padded for DP) runs more of than were scheduled -- the pad requests
     have length 0 and dispatch nothing -- and the selector's bounds are laid out
     head-major over those rows. ``running_tokens`` rows of ``max_query_len`` tokens
     are that many requests; anything that is not between the scheduled and the
-    padded batch is a builder bug, refused rather than clamped."""
+    padded batch is a builder bug, refused rather than clamped. ``strict=False``
+    (an index cache without the persistent scorer buffers, which has no layout of
+    its own to protect) takes the whole padded batch instead, the rows the tables
+    covered before this function."""
     batch, rem = divmod(running_tokens, max_query_len)
     if rem or not scheduled_bs <= batch <= running_bs:
+        if not strict:
+            return running_bs
         raise ValueError(
             f"index decode: {running_tokens} rows of {max_query_len} query "
             f"tokens is not {scheduled_bs}..{running_bs} requests"

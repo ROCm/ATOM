@@ -168,6 +168,21 @@ def test_rows_that_are_not_a_batch_are_refused_not_clamped(
         index_batch(scheduled, running, tokens, q)
 
 
+@pytest.mark.parametrize(
+    "scheduled,running,tokens,q",
+    [(3, 8, 13, 8), (3, 8, 16, 8), (3, 4, 64, 8)],
+)
+def test_a_cache_without_the_scorer_buffers_takes_the_padded_batch_instead(
+    scheduled, running, tokens, q
+):
+    """The row counts a token graph makes (a block drafter's flat run, a prefill
+    bucket on decode rows) are no product of the ladder: the padded batch the base
+    cut its tables at stands for an index cache with no scorer buffers."""
+    from atom.model_ops.minimax_m3.index_mxfp4 import index_batch
+
+    assert index_batch(scheduled, running, tokens, q, strict=False) == running
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU and triton")
 @pytest.mark.parametrize("heads", [1, 2])
 @pytest.mark.parametrize("S", [1, 8])

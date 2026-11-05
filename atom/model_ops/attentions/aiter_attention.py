@@ -1031,8 +1031,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         workinfos = {"slot_mapping": slot_mapping}
         if self._has_sparse_attention:
             # `attention_mha` picks this up off the shared metadata with a plain
-            # `getattr`, and `prepare_decode` cut it at `scheduled_bs` -- so a
-            # mid-step would read seq_lens for fewer rows than it runs.
+            # `getattr`; the one `prepare_decode` built is the verify forward's,
+            # with its query width and slot mapping, not this step's.
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_sparse_decode_metadata,
             )
@@ -1375,7 +1375,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # Every index cache: the selector's bounds are laid out head-major over
             # the rows the captured scorer runs, whichever cache scored them.
             index_bs = index_batch(
-                scheduled_bs, running_bs, running_tokens, max_seqlen_q
+                scheduled_bs,
+                running_bs,
+                running_tokens,
+                max_seqlen_q,
+                strict=bool(self._index_score_kwargs()),
             )
             sparse_block_tables = self._get_sparse_attention_block_tables(
                 attn_metadata.block_tables[:index_bs],
