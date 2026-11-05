@@ -29,12 +29,16 @@ def test_verify_prep_graph_replay_selects_accepted_state(batch):
     idx_in = torch.flip(idx.clone(), [0]) + 100
     accepted = torch.ones(batch, device="cuda", dtype=torch.int32)
     slots = torch.arange(batch * spec, device="cuda", dtype=torch.int64)
+    # MRoPE positions [3, rows]: request b's rows sit `delta` past its cache rows (an image request's offset)
+    context = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32) * 100
+    delta = torch.tensor([0, -900, 7, -3][:batch], device="cuda", dtype=torch.int64)
+    rows = (context.long() - spec)[:, None] + torch.arange(spec, device="cuda")
+    positions = (rows + delta[:, None]).reshape(1, -1).repeat(3, 1).contiguous()
     prep = VerifyPrep(batch)
 
     def launch():
-        return prep(
-            ids, embedding, out, accepted, idx, idx_in, batch, streams, slots, spec
-        )
+        return prep(ids, embedding, out, accepted, idx, idx_in, batch, streams, slots, spec,
+                    positions, context)  # fmt: skip
 
     launch()
     graph = torch.cuda.CUDAGraph()
@@ -52,6 +56,9 @@ def test_verify_prep_graph_replay_selects_accepted_state(batch):
         assert torch.equal(prep.slot, idx[:, 0])
         assert torch.equal(prep.ssm_read, idx_in[:, count - 1])
         assert torch.equal(prep.valid, slots[::spec] >= 0)
+        assert torch.equal(
+            prep.rope_off, torch.where(prep.valid, delta, 0).to(torch.int32)
+        )
 
 
 @pytest.mark.parametrize("spec", [1, 4])

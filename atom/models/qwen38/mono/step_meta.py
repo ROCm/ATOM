@@ -64,6 +64,9 @@ class StepMeta:
     ssm_read: torch.Tensor  # [batch]: the state slot read
     ssm_write: torch.Tensor  # [batch, SPEC]: the state slot after each row
     spec: int = SPEC
+    # [batch]: ATOM's RoPE position of the request's rows minus their cache rows (an image request's MRoPE
+    # offset; 0 for text)
+    rope_off: torch.Tensor | None = None
 
 
 @dataclass
@@ -93,6 +96,7 @@ def meta_buffers(batch: int, spec: int, width: int, io_width: int, device) -> di
         "gdn.ssm_read": torch.zeros(batch, dtype=i32, device=device),
         "gdn.ssm_write": torch.zeros(rows, dtype=i32, device=device),
         "seq_lens": torch.zeros(batch, dtype=i32, device=device),
+        "rope_off": torch.zeros(batch, dtype=i32, device=device),
         "block_table": torch.zeros(batch, width, dtype=i32, device=device),
         "sel": torch.zeros(batch, dtype=i32, device=device),
         "h1_mem": torch.zeros(rows, io_width, dtype=torch.bfloat16, device=device),
@@ -102,9 +106,10 @@ def meta_buffers(batch: int, spec: int, width: int, io_width: int, device) -> di
 
 def target_puts(m: dict, meta: StepMeta) -> list[Put]:
     """A target step's metadata args: the kernels place the step's K / V and index keys at ``seq_lens[b] + s``
-    through the block table (ATOM's ``slot_mapping``)."""
+    through the block table (ATOM's ``slot_mapping``) and rotate them at ``seq_lens[b] + s + rope_off[b]``
+    (ATOM's positions)."""
     bt = meta.block_tables
-    return [
+    puts = [
         Put(m["gdn.conv_slot"], meta.conv_slot),
         Put(m["gdn.conv_off"], meta.conv_off, masked=False),
         Put(m["gdn.ssm_read"], meta.ssm_read),
@@ -118,6 +123,9 @@ def target_puts(m: dict, meta: StepMeta) -> list[Put]:
             stride=bt.stride(0),
         ),
     ]
+    if meta.rope_off is not None:
+        puts.append(Put(m["rope_off"], meta.rope_off, fill=0))
+    return puts
 
 
 @dataclass

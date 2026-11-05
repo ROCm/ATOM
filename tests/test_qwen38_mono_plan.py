@@ -261,6 +261,7 @@ def test_target_puts_fill_every_metadata_arg_but_the_selection():
         torch.tensor([0, 1], dtype=torch.int32),
         torch.tensor([5, 6], dtype=torch.int32),
         torch.arange(8, dtype=torch.int32).view(2, 4),
+        rope_off=torch.tensor([0, -900], dtype=torch.int32),
     )
     puts = {id(p.dst): p for p in step_meta.target_puts(m, meta)}
     assert set(puts) == {
@@ -271,6 +272,7 @@ def test_target_puts_fill_every_metadata_arg_but_the_selection():
     bt = puts[id(m["block_table"])]
     assert (bt.group, bt.inner, bt.stride) == (width, width, width + 3)
     assert puts[id(m["gdn.ssm_write"])].group == 4
+    assert puts[id(m["rope_off"])].fill == 0
 
 
 def test_draft_rows_must_be_consecutive_block_table_slots():
