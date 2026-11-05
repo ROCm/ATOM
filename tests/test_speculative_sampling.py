@@ -256,47 +256,6 @@ def test_target_prefixes_cover_every_ragged_acceptance_length(stochastic):
 
 
 @gpu
-def test_ratio_acceptance_emits_the_target_law_from_a_draft_that_drew_another():
-    """q deliberately != p: the emitted token still carries the TARGET's law.
-
-    This is the losslessness claim, and it is only true of a draft token drawn
-    from the q the kernel is handed. Pinning the draft to one id instead
-    measures that id's conditional accept rate, `min(1, p0/q0) = 0.778`, and
-    the test then reads as a kernel failure for a reason that is in the
-    harness -- so the drafts are DRAWN from q, and armed below to say so.
-
-    Both halves are asserted because they fail separately: the marginal at
-    position 0 catches a residual that does not correct the accept bias, and
-    the law at position 1 among the rows that got there catches a chain whose
-    later positions are conditioned on the accept decision before them.
-    """
-    torch.manual_seed(4471)
-    n = 20000
-    p = torch.tensor([0.7, 0.3], device="cuda")
-    q = torch.tensor([0.9, 0.1], device="cuda")
-    drafts = draw(q, n * 2)
-    # Armed: a proposal that happened to be p would make the ratio rule accept
-    # everything and prove nothing about the residual.
-    torch.testing.assert_close(
-        torch.bincount(drafts.long(), minlength=2).float() / drafts.numel(),
-        q,
-        rtol=0,
-        atol=0.015,
-    )
-    output, (accepted, _, _) = rejection_sample(
-        **two_token_batch(p, drafts, 2), ratio=two_token_ratio(q, drafts, 2)
-    )
-    marginal = torch.bincount(output[:, 0].long(), minlength=2).float() / n
-    torch.testing.assert_close(marginal, p, rtol=0, atol=0.015)
-    # Position 1 exists for every request that got past position 0, whether it
-    # holds the accepted draft or the residual correction.
-    reached = output[accepted >= 1, 1].long()
-    assert (reached >= 0).all()
-    conditional = torch.bincount(reached, minlength=2).float() / reached.numel()
-    torch.testing.assert_close(conditional, p, rtol=0, atol=0.015)
-
-
-@gpu
 @pytest.mark.parametrize("q0", (0.9, 0.7, 0.3))
 def test_ratio_acceptance_accepts_at_least_as_often_as_exact_match(q0):
     """The PR's motivation, made testable: same drafts, same target, two rules.

@@ -19,25 +19,28 @@ pytest.importorskip("aiter", reason="the samplers are AITER/Triton ops")
 if not torch.cuda.is_available():
     pytest.skip("ROCm GPU required", allow_module_level=True)
 
-
+import triton
+import triton.language as tl
 from spec_lossless_reference import (
     DEV,
     VOCAB,
     P,
     Q,
-    dense_verify,
     draft_args,
     draft_q,
     draw,
     empty_store,
     filtered_p,
     first_token_law,
+    philox,
+    ratio_verify_reference,
     sample,
     sampler_kept,
     sparse,
     tables,
     tied_logits,
     top_of,
+    triton_rand,
     verify,
     verify_batch,
 )
@@ -48,6 +51,8 @@ from atom.model_ops.spec_sampling.ratio_target_p import (
     _ratio_stats_kernel,
 )
 from atom.model_ops.spec_sampling.ratio_verify import (
+    _RATIO_ACCEPT_KEY,
+    _RATIO_RESIDUAL_KEY,
     _ratio_accept_kernel,
     _ratio_residual_pick_kernel,
     _ratio_residual_race_kernel,
@@ -91,20 +96,28 @@ def test_no_verify_kernel_specializes_on_the_batch(kernel):
 
 
 def test_the_emitted_token_follows_p_across_vocab_tiles():
+    """q != p, the drafts drawn from q: the first token follows p, and so does
+    the second among the requests that reached it, whether it is the accepted
+    draft or the residual's -- a chain whose later positions leaned on the
+    accept before them would not."""
     torch.manual_seed(91)
     n = 40000
     p, q = sparse(VOCAB, P), sparse(VOCAB, Q)
-    drafts = draw(q, n)
+    drafts = draw(q, 2 * n)
     out, (accepted, _, _) = verify(
-        **verify_batch(drafts, 1, p.log().expand(n, -1), torch.ones(n, device=DEV)),
+        **verify_batch(drafts, 2, p.log().expand(2 * n, -1), torch.ones(n, device=DEV)),
         q=draft_q(q, drafts),
         step=5,
     )
     freq = torch.bincount(out[:, 0].long(), minlength=VOCAB).float() / n
     torch.testing.assert_close(freq, p, rtol=0, atol=0.01)
+    reached = out[accepted >= 1, 1].long()
+    assert (reached >= 0).all()
+    freq = torch.bincount(reached, minlength=VOCAB).float() / reached.numel()
+    torch.testing.assert_close(freq, p, rtol=0, atol=0.015)
     # Accepted at the rate sum min(p, q).
     rate = torch.minimum(p, q).sum().item()
-    assert abs(accepted.float().mean().item() - rate) < 0.01
+    assert abs((accepted >= 1).float().mean().item() - rate) < 0.01
 
 
 def test_a_residual_draw_never_lands_on_an_id_without_residual_mass():
@@ -422,11 +435,62 @@ def test_the_target_law_holds_at_the_real_vocab():
     torch.testing.assert_close(freq, p_bf16, rtol=0, atol=0.025)
 
 
-def test_the_sparse_store_verifies_bit_for_bit_as_its_dense_q():
-    """Densified, the store is a dense q; the verify over the store and the
-    verify over that q must emit the same tokens and verdicts, coin for coin:
-    greedy rows, requests without q, an emitted slot that does not hold the
-    draft, and a draft the store does not hold all included."""
+def test_the_reference_philox_reproduces_random123():
+    """`philox` against Random123's known-answer vectors for Philox4x32-10."""
+    known = [
+        ((0, 0, 0, 0), (0, 0), (0x6627E8D5, 0xE169C58D, 0xBC57AC4C, 0x9B00DBD8)),
+        (
+            (0xFFFFFFFF,) * 4,
+            (0xFFFFFFFF,) * 2,
+            (0x408F276D, 0x41C83B0E, 0xA20BC7C6, 0x6D5451FD),
+        ),
+        (
+            (0x243F6A88, 0x85A308D3, 0x13198A2E, 0x03707344),
+            (0xA4093822, 0x299F31D0),
+            (0xD16CFE09, 0x94FDCCEB, 0x5001E420, 0x24126EA1),
+        ),
+    ]
+    for counter, key, words in known:
+        out = philox(
+            tuple(torch.tensor([c]) for c in counter),
+            tuple(torch.tensor([k]) for k in key),
+        )
+        assert [int(w) for w in out] == list(words), counter
+
+
+@triton.jit
+def _tl_rand_kernel(out_ptr, offsets_ptr, seed, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    offsets = tl.load(offsets_ptr + offs, mask=mask, other=0)
+    tl.store(out_ptr + offs, tl.rand(seed, offsets), mask=mask)
+
+
+@pytest.mark.parametrize("seed", [7, _RATIO_ACCEPT_KEY | 5, _RATIO_RESIDUAL_KEY | 9])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_the_reference_coins_are_tl_rand_bit_for_bit(seed, dtype):
+    """`triton_rand` is the compiled `tl.rand`, at an int32 offset (the
+    accept's draft row) and an int64 one (the race's ``row * V + id``, past
+    2**32), under a key with and without a high word."""
+    torch.manual_seed(97)
+    n, block = 1 << 16, 1024
+    high = 1 << 31 if dtype == torch.int32 else 1 << 40
+    offsets = torch.randint(0, high, (n,), dtype=torch.int64, device=DEV).to(dtype)
+    offsets[:block] = torch.arange(block, device=DEV)
+    out = torch.empty(n, device=DEV)
+    _tl_rand_kernel[(triton.cdiv(n, block),)](out, offsets, seed, n, BLOCK=block)
+    assert torch.equal(out, triton_rand(seed, offsets))
+
+
+@pytest.mark.parametrize("filtered", [False, True], ids=["p", "p_f"])
+def test_the_verify_decides_as_the_fp64_reference_on_the_same_coins(filtered):
+    """The verify against `ratio_verify_reference`, which shares none of its
+    code: on the same Philox coins every request emits the reference's tokens
+    and verdict, save one whose decision lies within rounding of its threshold
+    (at most one a step). Greedy rows, requests without q, an emitted slot
+    that does not hold the draft, a draft the store does not hold, stored
+    entries that are not probabilities and, filtered, per-request top-k and
+    top-p cuts are all included."""
     torch.manual_seed(61)
     batch_n, width, vocab = 96, 4, 2 * _RATIO_BLOCK_V + 500
     rows = batch_n * width
@@ -442,11 +506,24 @@ def test_the_sparse_store_verifies_bit_for_bit_as_its_dense_q():
     n, xslot = q.meta.unbind(1)
     # Slots that name another stored id: the walk must find x's true q.
     xslot[1::9] = (xslot[1::9] + 1) % n[1::9]
+    # Entries that are not probabilities, at the emitted slot: q is 0 there.
+    for start, value in ((3, 1.5), (6, float("nan"))):
+        q.probs[start::13].scatter_(1, xslot[start::13, None].long(), value)
+    top_ks = top_ps = None
+    if filtered:
+        top_ks = torch.tensor([-1, 30, 300, 5, -1], dtype=torch.int32, device=DEV)
+        top_ps = torch.tensor([1.0, 0.9, 1.0, 0.6, 0.95, 0.8, 1.0], device=DEV)
+        top_ks = top_ks.repeat(batch_n)[:batch_n]
+        top_ps = top_ps.repeat(batch_n)[:batch_n]
     for step in (0, 1, 2):
-        out, verdict = verify(**args, q=q, step=step)
-        ref_out, ref_verdict = dense_verify(args, q_rows, step)
-        assert torch.equal(out, ref_out), step
-        assert torch.equal(verdict, ref_verdict), step
+        out, verdict = verify(**args, q=q, step=step, top_ks=top_ks, top_ps=top_ps)
+        ref_out, ref_verdict, undecided = ratio_verify_reference(
+            args, q, step, top_ks, top_ps
+        )
+        assert undecided.sum() <= 1, step
+        decided = ~undecided
+        assert torch.equal(out[decided], ref_out[decided]), step
+        assert torch.equal(verdict[:, decided], ref_verdict[:, decided]), step
     sampled = temps > SAMPLER_EPS
     accepted = verdict[0][sampled]
     assert (accepted > 0).any() and (accepted < width).any()

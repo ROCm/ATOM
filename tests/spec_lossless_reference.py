@@ -15,8 +15,6 @@ guards.
 """
 
 import torch
-import triton
-import triton.language as tl
 
 from atom.model_ops.rejection_sampler import rejection_sample
 from atom.model_ops.sampler import SAMPLER_EPS
@@ -27,7 +25,6 @@ from atom.model_ops.spec_sampling.dspark_markov_sample import (
 )
 from atom.model_ops.spec_sampling.ratio_target_p import (
     _RATIO_BLOCK_V,
-    _ratio_stats_kernel,
     _ratio_target_p,
     target_p_scratch,
 )
@@ -35,21 +32,15 @@ from atom.model_ops.spec_sampling.ratio_verify import (
     _RATIO_ACCEPT_KEY,
     _RATIO_RESIDUAL_KEY,
     RatioVerifyInputs,
-    _ratio_residual_pick_kernel,
-    _rejecting_row_of,
-    _target_p_tile,
     ratio_verify_scratch,
 )
 from atom.model_ops.spec_sampling.sampling_scratch import carve, scratch_buffer
-from atom.model_ops.spec_sampling.softmax_tiles import race_key, softmax_combine_kernel
 from atom.model_ops.spec_sampling.sparse_q_select import (
     _Q_BINS,
     _Q_LEVELS_PER_NAT,
     _Q_MAX_GAP,
 )
 from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
-from atom.model_ops.tile_argmax import argmax_lowest_id
-from atom.model_ops.verify_kernels import _draft_token, _finish_request
 
 
 def sparse_q_reference(
@@ -382,277 +373,226 @@ def tied_logits(rows, vocab, low, high):
     return logits
 
 
-@triton.jit(do_not_specialize=["num_spec_steps", "accept_seed"])
-def _dense_accept_kernel(
-    output_token_ids_ptr,
-    verdict_ptr,
-    residual_row_ptr,
-    cu_num_draft_tokens_ptr,
-    input_ids_ptr,
-    target_logits_indices_ptr,
-    logits_ptr,
-    temperatures_ptr,
-    row_max_ptr,
-    row_inv_z_ptr,
-    row_argmax_ptr,
-    q_ptr,
-    q_row_base_ptr,
-    bonus_token_ids_ptr,
-    bonus_logits_indices_ptr,
-    num_spec_steps,
-    vocab_size,
-    logits_row_stride,
-    greedy_temperature,
-    accept_seed,
-):
-    """The accept walk as it was over a dense ``[rows, V]`` q, kept as the
-    reference the sparse walk must reproduce verdict for verdict."""
-    req_idx = tl.program_id(0)
-    if req_idx == 0:
-        start_idx = 0
-    else:
-        start_idx = tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
-    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
-    num_draft_tokens = end_idx - start_idx
-    temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
-    greedy = temp <= greedy_temperature
-    q_base = tl.load(q_row_base_ptr + req_idx)
-    has_q = q_base >= 0
-    out_row = output_token_ids_ptr + req_idx * (num_spec_steps + 1)
-    INVALID_TOKEN: tl.constexpr = -1
-    rejected = False
-    reject_pos = -1
-    last_checked = -1
-    for pos in range(num_draft_tokens):
-        if rejected:
-            tl.store(out_row + pos, INVALID_TOKEN)
-        else:
-            row = start_idx + pos
-            x = _draft_token(input_ids_ptr, target_logits_indices_ptr, row)
-            target_argmax = tl.load(row_argmax_ptr + row)
-            if greedy:
-                accept = x == target_argmax
-            else:
-                logit = tl.load(logits_ptr + row.to(tl.int64) * logits_row_stride + x)
-                p = tl.exp(
-                    logit.to(tl.float32) / temp - tl.load(row_max_ptr + row)
-                ) * tl.load(row_inv_z_ptr + row)
-                q = tl.load(
-                    q_ptr + (q_base + pos).to(tl.int64) * vocab_size + x,
-                    mask=has_q,
-                    other=0.0,
-                )
-                u = tl.rand(accept_seed, row)
-                accept = (q > 0.0) & (q <= 1.0) & (u * q < p)
-            if accept:
-                tl.store(out_row + pos, tl.cast(x, tl.int32))
-            else:
-                rejected = True
-                reject_pos = pos
-                if greedy:
-                    tl.store(out_row + pos, tl.cast(target_argmax, tl.int32))
-            last_checked += 1
-    residual_row = -1
-    if rejected and not greedy:
-        residual_row = start_idx + reject_pos
-    tl.store(residual_row_ptr + req_idx, residual_row)
-    _finish_request(
-        output_token_ids_ptr,
-        verdict_ptr,
-        bonus_token_ids_ptr,
-        bonus_logits_indices_ptr,
-        req_idx,
-        num_draft_tokens,
-        last_checked,
-        rejected,
-        num_spec_steps,
+# Triton's Philox4x32-10 (`triton.language.random.philox_impl`): the round
+# multipliers, and the constants the key advances by after each round.
+_PHILOX_ROUND = (0xD2511F53, 0xCD9E8D57)
+_PHILOX_BUMP = (0x9E3779B9, 0xBB67AE85)
+_PHILOX_ROUNDS = 10
+_U32 = 0xFFFFFFFF
+# `uint_to_uniform_float`'s scale for a 32-bit word, applied in fp32.
+_RAND_SCALE = 4.6566127342e-10
+
+# A decision of the verify is compared only where it clears its threshold by
+# this much: the verify's p is fp32 (GPU exp and log, 1/Z summed in its own
+# order), the reference's fp64, so a decision closer than that may go either
+# way. ``u * q < p`` and a race key carry it relative to p; a top-p cut, an
+# fp32 sum of at most 1 against top_p, carries it absolutely.
+_P_RTOL = 1e-5
+_MASS_ATOL = 2**-20
+
+
+def _mul_hi_lo(a, b):
+    """``(hi, lo)`` 32-bit words of ``a * b``: ``a`` an int64 tensor of uint32
+    words, ``b`` a uint32 constant, multiplied by the 16-bit halves of ``b`` so
+    no product leaves int64."""
+    low = a * (b & 0xFFFF)
+    high = a * (b >> 16) + (low >> 16)
+    return high >> 16, ((high & 0xFFFF) << 16) | (low & 0xFFFF)
+
+
+def philox(counter, key):
+    """Philox4x32-10 as Triton runs it: four counter and two key words, int64
+    tensors holding uint32 values; the four output words."""
+    c0, c1, c2, c3 = counter
+    k0, k1 = key
+    a, b = _PHILOX_ROUND
+    for _ in range(_PHILOX_ROUNDS):
+        hi_a, lo_a = _mul_hi_lo(c0, a)
+        hi_b, lo_b = _mul_hi_lo(c2, b)
+        c0, c1, c2, c3 = hi_b ^ c1 ^ k0, lo_b, hi_a ^ c3 ^ k1, lo_a
+        k0 = (k0 + _PHILOX_BUMP[0]) & _U32
+        k1 = (k1 + _PHILOX_BUMP[1]) & _U32
+    return c0, c1, c2, c3
+
+
+def triton_rand(seed: int, offsets: torch.Tensor) -> torch.Tensor:
+    """``tl.rand(seed, offsets)`` in torch, bit for bit: fp32 in [0, 1).
+
+    Written from Triton's definition, not from ATOM's kernels: the counter is
+    the offset's low and high words, the key the seed's, and the first output
+    word, read as int32 and complemented if negative, is scaled in fp32.
+    ``offsets`` are non-negative, so an int32 offset is the same counter as
+    its int64 value."""
+    offsets = offsets.to(torch.int64)
+    zero = torch.zeros_like(offsets)
+    word, _, _, _ = philox(
+        (offsets & _U32, offsets >> 32, zero, zero),
+        (zero + (seed & _U32), zero + (seed >> 32)),
     )
+    word = torch.where(word >= 1 << 31, _U32 - word, word)
+    scale = torch.tensor(_RAND_SCALE, dtype=torch.float32, device=word.device)
+    return word.to(torch.int32).float() * scale
 
 
-@triton.jit(do_not_specialize=["batch_size", "residual_seed"])
-def _dense_residual_race_kernel(
-    residual_row_ptr,  # [batch_size] int32, the rejecting row, or -1
-    logits_ptr,  # [num_tokens, V] raw target logits
-    temperatures_ptr,  # [batch_size] fp32
-    row_max_ptr,  # [num_tokens] fp32
-    row_inv_z_ptr,  # [num_tokens] fp32
-    row_floor_ptr,  # [num_tokens] fp32, the lowest logit p_f keeps (FILTER)
-    dense_ptr,  # [>= batch_size, V] fp32: a rejecting request's q at its row
-    q_row_base_ptr,  # [batch_size] int32, this request's first q row, or < 0
-    part_key_ptr,  # [n_tiles, batch_size] fp32: best residual key
-    part_idx_ptr,  # [n_tiles, batch_size] int32: its lowest id
-    batch_size,
-    vocab_size,
-    logits_row_stride,
-    residual_seed,
-    BLOCK_V: tl.constexpr,
-    FILTER: tl.constexpr,
-):
-    """`_ratio_residual_race_kernel` over a dense q row per request, the
-    reference the sparse race is held to bit for bit."""
-    req_idx = tl.program_id(0)
-    tile = tl.program_id(1)
-    row, _, has_q = _rejecting_row_of(residual_row_ptr, q_row_base_ptr, req_idx)
-    if row >= 0:
-        temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
-        offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
-        vmask = offs < vocab_size
-        p = _target_p_tile(
-            logits_ptr,
-            row,
-            logits_row_stride,
-            offs,
-            vmask,
-            temp,
-            tl.load(row_max_ptr + row),
-            tl.load(row_inv_z_ptr + row),
-            row_floor_ptr,
-            FILTER,
-        )
-        q = tl.load(
-            dense_ptr + req_idx.to(tl.int64) * vocab_size + offs,
-            mask=vmask & has_q,
-            other=0.0,
-        )
-        # Anything that is not a probability (NaN, inf, negative) counts as 0,
-        # so the residual falls back toward p rather than inheriting garbage.
-        q = tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
-        residual = tl.maximum(p - q, 0.0)
-        key = race_key(
-            residual, residual_seed, row.to(tl.int64) * vocab_size, offs, vmask
-        )
-        best, best_id = argmax_lowest_id(key, offs, vmask, 2147483647)
-        part = tile * batch_size + req_idx
-        tl.store(part_key_ptr + part, best)
-        tl.store(part_idx_ptr + part, best_id)
+def target_p_reference(logits, temps, top_ks=None, top_ps=None):
+    """`Sampler`'s p_f per row, in fp64: ``(p_f, undecided)``.
+
+    softmax(logits / T) over the ids with fewer than top_k logits strictly
+    above them and whose p (unfiltered) above them sums to less than top_p,
+    renormalized. ``temps`` and the filters are per row, a top-k <= 0 or a
+    top-p >= 1 off, or None. ``undecided`` marks a row with a tie group whose
+    mass above lies within `_MASS_ATOL` of its top_p."""
+    rows, vocab = logits.shape
+    x = logits.double()
+    p = torch.softmax(x / temps.double()[:, None], -1)
+    sorted_x, order = x.sort(-1, descending=True)
+    starts = torch.ones_like(sorted_x, dtype=torch.bool)
+    starts[:, 1:] = sorted_x[:, 1:] != sorted_x[:, :-1]
+    slot = torch.arange(vocab, device=x.device).expand(rows, vocab)
+    # Ids strictly above each id: the slot its tie group starts at.
+    higher = torch.where(starts, slot, 0).cummax(-1).values
+    sorted_p = p.gather(1, order)
+    mass = (sorted_p.cumsum(-1) - sorted_p).gather(1, higher)
+    k = torch.full((rows, 1), vocab + 1, device=x.device)
+    if top_ks is not None:
+        k = torch.where(top_ks > 0, top_ks, vocab + 1).view(-1, 1)
+    top_p = torch.full((rows, 1), 2.0, dtype=torch.float64, device=x.device)
+    if top_ps is not None:
+        top_p = torch.where(top_ps < 1, top_ps.double(), 2.0).view(-1, 1)
+    keep = (higher < k) & (mass < top_p)
+    near = (higher < k) & ((mass - top_p).abs() <= _MASS_ATOL)
+    p_f = torch.zeros_like(p).scatter_(1, order, torch.where(keep, sorted_p, 0.0))
+    return p_f / p_f.sum(-1, keepdim=True), near.any(-1)
 
 
-def dense_verify(args, q_dense, step):
-    """The verify over a dense q: the same stats, race and pick kernels the
-    sparse path runs, around `_dense_accept_kernel` and
-    `_dense_residual_race_kernel`, the race reading the rejecting position's
-    row of ``q_dense`` copied to the request's row."""
+def _race_reference(mass, bound, e):
+    """``(winner, has_mass, near)`` of the exponential race ``argmax mass /
+    e``, lowest id on a tie: whether any key is positive, and whether the
+    winner fails to clear 0 and every other key by their ``bound / e``."""
+    key = mass / e
+    err = bound / e
+    winner = int(key.argmax())
+    above = key + err
+    above[winner] = 0.0
+    near = bool(key[winner] - err[winner] <= above.max())
+    return winner, bool(key[winner] > 0), near
+
+
+def _residual_reference(p_row, q_row, raw_argmax, e):
+    """``(token, near)`` the residual draws at a rejecting row: the race of
+    relu(p_f - q), else of p_f where the residual has no mass, else the raw
+    argmax where p_f has none either."""
+    bound = _P_RTOL * p_row
+    token, has_mass, near = _race_reference((p_row - q_row).clamp(min=0), bound, e)
+    if has_mass:
+        return token, near
+    # The verify's fp32 p may still leave mass where p_f is within rounding of q.
+    near = bool(((p_row > 0) & (q_row - p_row <= bound)).any())
+    token, has_mass, near_p = _race_reference(p_row, bound, e)
+    if has_mass:
+        return token, near or near_p
+    return raw_argmax, near
+
+
+def ratio_verify_reference(args, q, step, top_ks=None, top_ps=None):
+    """The ratio verify of `verify_batch` ``args`` over the store ``q`` at
+    Philox ``step``, under per-request filters (or None), in fp64 torch with
+    none of the verify's code: ``(out, verdict, undecided)``, ``undecided``
+    [batch] marking a request one of whose decisions lies within rounding of
+    its threshold (`_P_RTOL`, `_MASS_ATOL`), which the verify may take either
+    way.
+
+    p_f is dense (`target_p_reference`); q is the store densified, an entry
+    that is not a probability 0, and 0 throughout for a request whose row base
+    is negative; the coins are `triton_rand` at the verify's counters, the
+    accept's at the draft row and the race's at ``row * V + id``. A sampled
+    request accepts x iff ``q(x) > 0`` and ``u * q(x) < p_f(x)``, a greedy one
+    iff x is the raw logits' lowest-id argmax, and at the first rejection
+    emits that argmax (greedy) or `_residual_reference`'s draw. Then the bonus
+    or -1, the -1 tail, and the verdict `_finish_request` writes."""
     logits = args["target_logits"]
-    cu = args["cu_num_draft_tokens"]
+    rows, vocab = logits.shape
     steps = args["num_spec_steps"]
-    temps = args["temperatures"].float().contiguous()
-    base = args["q_row_base"]
-    num_tokens, vocab = logits.shape
-    batch_n = cu.numel()
-    tiles = triton.cdiv(vocab, _RATIO_BLOCK_V)
+    cu = args["cu_num_draft_tokens"].tolist()
+    batch = len(cu)
+    widths = torch.tensor([0] + cu, device=DEV).diff()
+    # Compared in fp32, as the verify compares its fp32 temperatures.
+    temps = args["temperatures"].float()
+    greedy = (temps <= SAMPLER_EPS).tolist()
 
-    def f32(*shape):
-        return torch.empty(shape, device=DEV)
+    def per_row(values):
+        return None if values is None else values.repeat_interleave(widths)
 
-    def i32(*shape):
-        return torch.empty(shape, dtype=torch.int32, device=DEV)
+    row_temps = per_row(torch.where(temps > SAMPLER_EPS, temps, 1.0).double())
+    p_f, cut_near = target_p_reference(
+        logits, row_temps, per_row(top_ks), per_row(top_ps)
+    )
+    raw_argmax = logits.float().argmax(-1)
+    drafts = args["input_ids"][args["target_logits_indices"] + 1].long()
 
-    part_max, part_sum, part_val = (f32(tiles, num_tokens) for _ in range(3))
-    part_idx, row_argmax = i32(tiles, num_tokens), i32(num_tokens)
-    row_max, row_inv_z = f32(num_tokens), f32(num_tokens)
-    out, verdict, residual = i32(batch_n, steps + 1), i32(3, batch_n), i32(batch_n)
-    keys, key_idx = f32(tiles, batch_n), i32(tiles, batch_n)
-    _ratio_stats_kernel[(num_tokens, tiles)](
-        logits,
-        cu,
-        temps,
-        part_max,
-        part_sum,
-        part_val,
-        part_idx,
-        num_tokens,
-        vocab,
-        vocab,
-        batch_n,
-        batch_n.bit_length() + 1,
-        BLOCK_V=_RATIO_BLOCK_V,
-        num_warps=8,
+    n = q.meta[:, 0].clamp(0, q.ids.shape[1])
+    held = torch.arange(q.ids.shape[1], device=DEV) < n[:, None]
+    probs = q.probs.double()
+    probs = torch.where(held & (probs >= 0) & (probs <= 1), probs, 0.0)
+    q_dense = torch.zeros(q.ids.shape[0], vocab, dtype=torch.float64, device=DEV)
+    q_dense.scatter_add_(1, torch.where(held, q.ids.long(), 0), probs)
+
+    # Every row's accept decision, as if the walk reached it.
+    base = per_row(args["q_row_base"].long())
+    q_row = (
+        base
+        + torch.arange(rows, device=DEV)
+        - per_row(torch.tensor([0] + cu[:-1], device=DEV))
     )
-    softmax_combine_kernel[(num_tokens,)](
-        part_max,
-        part_sum,
-        row_max,
-        row_inv_z,
-        part_val,
-        part_idx,
-        row_argmax,
-        num_tokens,
-        tiles,
-        BLOCK_TILE=triton.next_power_of_2(tiles),
-        WITH_ARGMAX=True,
-        num_warps=4,
-    )
-    _dense_accept_kernel[(batch_n,)](
-        out,
-        verdict,
-        residual,
-        cu,
-        args["input_ids"],
-        args["target_logits_indices"],
-        logits,
-        temps,
-        row_max,
-        row_inv_z,
-        row_argmax,
-        q_dense,
-        base,
-        args["bonus_token_ids"],
-        args["bonus_logits_indices"],
-        steps,
-        vocab,
-        vocab,
-        SAMPLER_EPS,
-        _RATIO_ACCEPT_KEY | step,
-        num_warps=1,
-    )
-    # The rejecting position's own q row at its request's row. A request without one gets some row the race masks
-    # off, since it decides from ``residual`` and ``base`` alone.
-    start = torch.cat((cu.new_zeros(1), cu[:-1]))
-    has_row = (residual >= 0) & (base >= 0)
-    q_row = torch.where(has_row, base + residual - start, 0)
-    _dense_residual_race_kernel[(batch_n, tiles)](
-        residual,
-        logits,
-        temps,
-        row_max,
-        row_inv_z,
-        None,  # no floor: unfiltered
-        q_dense[q_row.long()],
-        base,
-        keys,
-        key_idx,
-        batch_n,
-        vocab,
-        vocab,
-        _RATIO_RESIDUAL_KEY | step,
-        BLOCK_V=_RATIO_BLOCK_V,
-        FILTER=False,
-        num_warps=8,
-    )
-    _ratio_residual_pick_kernel[(batch_n,)](
-        out,
-        residual,
-        cu,
-        keys,
-        key_idx,
-        logits,
-        temps,
-        row_max,
-        row_inv_z,
-        row_argmax,
-        None,
-        batch_n,
-        tiles,
-        steps,
-        vocab,
-        vocab,
-        _RATIO_RESIDUAL_KEY | step,
-        BLOCK_TILE=triton.next_power_of_2(tiles),
-        BLOCK_V=_RATIO_BLOCK_V,
-        FILTER=False,
-        num_warps=1,
-    )
-    return out, verdict
+    has_q = base >= 0
+    q_x = torch.where(has_q, q_dense[q_row.clamp(min=0), drafts], 0.0)
+    p_x = p_f.gather(1, drafts[:, None]).view(-1)
+    coins = triton_rand(_RATIO_ACCEPT_KEY | step, torch.arange(rows, device=DEV))
+    u_q = coins.double() * q_x
+    sampled_accept = ((q_x > 0) & (u_q < p_x)).tolist()
+    accept_near = ((q_x > 0) & ((u_q - p_x).abs() <= _P_RTOL * p_x)).tolist()
+    greedy_accept = (drafts == raw_argmax).tolist()
+    cut_near = cut_near.tolist()
+    draft_ids, argmax_ids = drafts.tolist(), raw_argmax.tolist()
+
+    out = torch.full((batch, steps + 1), -1, dtype=torch.int32)
+    verdict = torch.zeros((3, batch), dtype=torch.int32)
+    undecided = torch.zeros(batch, dtype=torch.bool)
+    bonus = args["bonus_token_ids"].view(-1).tolist()
+    bonus_rows = args["bonus_logits_indices"].tolist()
+    start = 0
+    for b, end in enumerate(cu):
+        near = False
+        accepted = 0
+        for row in range(start, end):
+            if greedy[b]:
+                ok = greedy_accept[row]
+            else:
+                ok = sampled_accept[row]
+                near = near or accept_near[row] or cut_near[row]
+            if not ok:
+                break
+            out[b, accepted] = draft_ids[row]
+            accepted += 1
+        if accepted == end - start:
+            out[b, accepted] = bonus[b]
+        elif greedy[b]:
+            out[b, accepted] = argmax_ids[row]
+        else:
+            race = start + accepted
+            offsets = race * vocab + torch.arange(vocab, device=DEV)
+            e = -triton_rand(_RATIO_RESIDUAL_KEY | step, offsets).double().log()
+            q_race = q_dense[q_row[race]] if has_q[race] else torch.zeros_like(e)
+            token, race_near = _residual_reference(
+                p_f[race], q_race, argmax_ids[race], e
+            )
+            out[b, accepted] = token
+            near = near or race_near
+        undecided[b] = near
+        anchor = bonus_rows[b] - (end - start)
+        verdict[:, b] = torch.tensor([accepted, steps - accepted, anchor + accepted])
+        start = end
+    return out.to(DEV), verdict.to(DEV), undecided.to(DEV)
 
 
 def top_of(logits, k):
