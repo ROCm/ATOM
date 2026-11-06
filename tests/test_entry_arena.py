@@ -180,6 +180,20 @@ class TestInitialFill:
         for i in range(arena.entries):
             assert (arena.entry(i)[12:] == 0).all()
 
+    def test_refill_live_undoes_a_write(self):
+        """A CUDA graph capture's warmup runs on real slots before any request
+        owns them, and may leave NaN there; the slots go out as if fresh."""
+        arena = build()
+        for field in V4_LIKE:
+            arena.view(field.name).fill_(float("nan"))
+        arena.refill_live()
+        for field in V4_LIKE:
+            view = arena.view(field.name)
+            if field.fill == 0.0:
+                assert torch.equal(view, torch.zeros_like(view))
+            else:
+                assert torch.isneginf(view).all()
+
 
 def test_carving_more_than_the_buffer_holds_is_refused():
     """Python truncates an over-long slice instead of raising, so a short
