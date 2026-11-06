@@ -504,6 +504,15 @@ class Drafter(abc.ABC):
 
     def _make_aux_hook(self, buf_idx: int, extract):
         buffer = self._aux_buffers[buf_idx]
+        if getattr(getattr(self, "config", None), "enable_mixed_prefill_decode", False):
+            from atom.spec_decode.mixed_aux import capture_aux
+
+            def mixed_hook(module, _inputs, output):
+                tensor = extract(output, module)
+                if tensor is not None:
+                    capture_aux(tensor, buffer)
+
+            return mixed_hook
 
         def write(tensor, off):
             # In-place write into the fixed buffer (cudagraph-safe).

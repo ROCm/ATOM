@@ -403,6 +403,127 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     kv_indptr_extend: torch.Tensor | None = None
     """[total_tokens + 1] int32 GPU — packed cumsum of `extend_count`."""
 
+    # ----- Mixed prefill+decode split dispatch (set by `prepare_mixed`) -----
+    # When `is_mixed`, `prefill_attn_metadata` / `decode_attn_metadata` (on the
+    # base class) carry the two per-segment metadata sets; the forward splits
+    # the flat q/kv tensor at `num_prefill_tokens` and runs each segment through
+    # its own path. None/False for non-mixed batches.
+    num_prefill_tokens: int = 0
+    num_prefill_seqs: int = 0
+    num_decode_tokens: int = 0
+    num_decode_seqs: int = 0
+
+    @property
+    def is_mixed(self) -> bool:
+        return (
+            self.prefill_attn_metadata is not None
+            and self.decode_attn_metadata is not None
+        )
+
+
+def _mixed_carrier_spans(
+    prefill_meta,
+    decode_meta,
+    n_p_seqs: int,
+    n_d_seqs: int,
+    n_p_tokens: int,
+    running_bs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A mixed carrier's whole-batch `(cu_seqlens_q, state_slot_out)`.
+
+    The target forward never reads these on a mixed step: each segment runs
+    under `_segment_forward_context`, which swaps in its own metadata. What
+    reads the carrier is everything around it -- the LM head's mixed gather,
+    and the DSpark drafter (`write_context_kv`, `Drafter.prepare_inputs`, the
+    block pass), which index the whole `[prefill | decode]` batch by request.
+    Built on the device from the two published halves: no H2D, so nothing is
+    published twice.
+
+    `cu_seqlens_q` is the prefill spans, then the decode spans shifted past the
+    prefill tokens; its first `n_p_seqs + 1` entries ARE the prefill spans,
+    which is all the LM head reads. `state_slot_out` is per request, padded to
+    `running_bs` with 0 as `prepare_decode` pads it: under DP `running_bs` is
+    the group's ladder rung and can exceed this rank's batch, and the draft
+    block runs at that width and masks the pad rows' writes itself
+    (`prepare_block`).
+    """
+    cu_seqlens_q = torch.cat(
+        [
+            prefill_meta.cu_seqlens_q[: n_p_seqs + 1],
+            decode_meta.cu_seqlens_q[1 : n_d_seqs + 1] + n_p_tokens,
+        ]
+    )
+    n = n_p_seqs + n_d_seqs
+    state_slot_out = torch.zeros(
+        max(running_bs, n),
+        dtype=prefill_meta.state_slot_out.dtype,
+        device=prefill_meta.state_slot_out.device,
+    )
+    state_slot_out[:n_p_seqs] = prefill_meta.state_slot_out[:n_p_seqs]
+    state_slot_out[n_p_seqs:n] = decode_meta.state_slot_out[:n_d_seqs]
+    return cu_seqlens_q, state_slot_out
+
+
+def _mixed_carrier(
+    prefill_meta: "AttentionMetaData_DSV4",
+    decode_meta: "AttentionMetaData_DSV4",
+    n_p_seqs: int,
+    n_d_seqs: int,
+    n_p_tokens: int,
+    n_d_tokens: int,
+    running_bs: int,
+) -> "AttentionMetaData_DSV4":
+    """The top-level metadata of a mixed batch, or of a TBO ubatch of one.
+
+    The one place it is assembled: `prepare_mixed` builds it for the whole
+    batch and `_build_ubatch_mixed_metadata` for the straddling ubatch, and a
+    field added to one and not the other is what a second copy invites.
+    """
+    if (
+        prefill_meta.state is AttnState.DECODE
+        or decode_meta.state is not AttnState.DECODE
+    ):
+        raise ValueError("mixed attention requires prefill then decode metadata")
+    cu_seqlens_q, state_slot_out = _mixed_carrier_spans(
+        prefill_meta, decode_meta, n_p_seqs, n_d_seqs, n_p_tokens, running_bs
+    )
+    merged = AttentionMetaData_DSV4(
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=None,
+        max_seqlen_q=max(prefill_meta.max_seqlen_q, decode_meta.max_seqlen_q),
+        max_seqlen_k=max(prefill_meta.max_seqlen_k, decode_meta.max_seqlen_k),
+        min_seqlen_q=0,
+        dropout_p=0.0,
+        has_cached=prefill_meta.has_cached,
+        total_kv=(prefill_meta.total_kv or 0) + (decode_meta.total_kv or 0),
+        state=AttnState.PREFILL_PREFIX,  # mixed always carries a prefill row
+    )
+    merged.prefill_attn_metadata = prefill_meta
+    merged.decode_attn_metadata = decode_meta
+    merged.state_slot_out = state_slot_out
+    # Marker the forward reads to take the mixed branch.
+    merged.num_prefill_tokens = n_p_tokens
+    merged.num_prefill_seqs = n_p_seqs
+    merged.num_decode_tokens = n_d_tokens
+    merged.num_decode_seqs = n_d_seqs
+    # One QK-norm/RoPE launch for the whole batch. Negative row IDs mask
+    # prefill's SWA stores: its prefix must survive until prefill attention
+    # finishes. Decode stores remain fused, including in the mixed TBO tail.
+    if decode_meta.swa_dest_rows is not None:
+        merged.batch_id_per_q_token = torch.cat(
+            [
+                torch.full(
+                    (n_p_tokens,), -1, dtype=torch.int32, device=cu_seqlens_q.device
+                ),
+                decode_meta.batch_id_per_q_token[:n_d_tokens],
+            ]
+        )
+        merged.swa_dest_rows = {
+            ratio: torch.cat([rows.new_zeros(n_p_tokens), rows[:n_d_tokens]])
+            for ratio, rows in decode_meta.swa_dest_rows.items()
+        }
+    return merged
+
 
 class DeepseekV4Backend(AttentionBackend):
     """Backend selector entry for V4 hybrid attention.
@@ -434,6 +555,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     kv_block_size (= the CSA row count) to be 64 for N_PHYS=1. Must equal
     `config.kv_cache_block_size` (config.py forces the same value for V4).
     """
+
+    # The prefill builder also publishes compressor/indexer metadata. TBO
+    # rebuilds need their own input, state, indexer and plan groups, but never
+    # the decode-only destination/attention buffers or sampling/input-id groups.
+    mixed_prefill_groups = (
+        frozenset(("early", "prefill", "positions"))
+        | frozenset(
+            f"{prefix}{group}"
+            for prefix in ("", "ub0_", "ub1_")
+            for group in ("v4_state", "v4_indexer", "v4_plans")
+        )
+        | frozenset(("ub0_v4_inputs", "ub1_v4_inputs"))
+    )
 
     capture_owns_cu_seqlens_q = True
     block_size = 256
@@ -1455,6 +1589,64 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ]
         return [(runner.v4_csa_idx_kv, "dsv4.csa_indexer")]
 
+    @contextmanager
+    def temporary_profile_cache(self, blocks: int):
+        """Bind scratch KV before sizing the serving pool; no graph uses it."""
+        runner = self.model_runner
+        old_plan = runner.pool_plan
+        old_geometry, old_blocks = self.pool_geometry, self.num_blocks
+        missing = object()
+        saved_runner = {}
+        saved_modules = []
+        try:
+            runner.pool_plan = old_plan.with_paged_entries(blocks)
+            pools = self.allocate_kv_cache_tensors(blocks=blocks, buf=None)
+            for name, value in pools.items():
+                saved_runner[name] = getattr(runner, name, missing)
+                setattr(runner, name, value)
+            pools = self.allocate_per_req_cache(runner.pool_plan.entries)
+            for name, value in pools.items():
+                saved_runner[name] = getattr(runner, name, missing)
+                setattr(runner, name, value)
+            del pools, value
+            self.warmup_per_req_cache()
+            models = [runner.model]
+            if hasattr(runner, "drafter"):
+                models.append(runner.drafter.model)
+            for model in models:
+                for module in model.modules():
+                    before = dict(module.__dict__)
+                    # Assigning an existing registered buffer changes the
+                    # _buffers mapping, not module.__dict__. Keep both axes
+                    # so no warmup placeholder retains the temporary pool.
+                    buffers = dict(module._buffers)
+                    self.build_kv_cache_tensor(module)
+                    changes = {
+                        name: before.get(name, missing)
+                        for name, value in module.__dict__.items()
+                        if value is not before.get(name, missing)
+                    }
+                    saved_modules.append((module, changes, buffers))
+            yield
+        finally:
+            torch.cuda.synchronize()
+            for module, changes, buffers in reversed(saved_modules):
+                for name, value in changes.items():
+                    if value is missing:
+                        delattr(module, name)
+                    else:
+                        setattr(module, name, value)
+                module._buffers.clear()
+                module._buffers.update(buffers)
+            self._invalidate_pool_caches()
+            for name, value in saved_runner.items():
+                if value is missing:
+                    delattr(runner, name)
+                else:
+                    setattr(runner, name, value)
+            self.pool_geometry, self.num_blocks = old_geometry, old_blocks
+            runner.pool_plan = old_plan
+
     def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict[str, torch.Tensor]:
         """Allocate KV pools that depend only on `num_blocks`.
 
@@ -2466,6 +2658,207 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         #   - v4 indexer meta (Indexer — only present when ratio == 4)
         return {}
 
+    def _get_mixed_prefill_bank(self):
+        """Return the preallocated metadata publication bank for this ring slot.
+
+        Prefill uploads and decode staging use separate buffers. The bank shares
+        the slot lifetime; uploads and forward reads are ordered on its stream."""
+        banks = getattr(self, "_mixed_prefill_banks", None)
+        if banks is None:
+            # Building here would allocate mid-serve, after the KV cache took
+            # the memory the profile left.
+            raise RuntimeError(
+                "mixed prefill banks were not built: the runner calls "
+                "build_mixed_prefill_banks() before warmup when "
+                "--enable-mixed-prefill-decode is set"
+            )
+        return banks[getattr(self.model_runner, "_fv_idx", 0)]
+
+    def build_mixed_prefill_banks(self) -> None:
+        """Allocate V4 prefill metadata banks before warmup so memory profiling includes them."""
+        runner = self.model_runner
+        ring = getattr(runner, "_fv_ring", None) or [runner.forward_vars]
+        private_groups = getattr(
+            self, "mixed_prefill_groups", self.mixed_prefill_groups
+        )
+        banks = {}
+        for slot, forward_vars in enumerate(ring):
+            # `clone()` carries `pin_memory`: an unpinned source would make
+            # `copy_(non_blocking=True)` synchronous.
+            private = {
+                name: val.clone()
+                for name, val in forward_vars.items()
+                if isinstance(val, CpuGpuBuffer)
+                and (
+                    val.publication_group in private_groups
+                    or name == "batch_id_per_q_token"
+                )
+            }
+            variables = {**forward_vars, **private}
+            owner = groups = None
+            if getattr(runner, "h2d_groups", None) is not None:
+                # Binding a shared buffer again would steal it from the live
+                # slot's owner. Only the clones belong to this publication slot.
+                owner, groups = runner.build_h2d_slot(
+                    private, torch.cuda.Event(), partial=True
+                )
+            banks[slot] = (variables, owner, groups)
+        self._mixed_prefill_banks = banks
+
+    @contextmanager
+    def mixed_prefill_bank_selected(self):
+        """Select and restore the V4 prefill bank and its H2D publication state."""
+        runner = self.model_runner
+        variables, owner, groups = self._get_mixed_prefill_bank()
+        saved = (
+            runner.forward_vars,
+            getattr(runner, "h2d_owner", None),
+            getattr(runner, "h2d_groups", None),
+        )
+        runner.forward_vars = variables
+        if owner is not None:
+            runner.h2d_owner, runner.h2d_groups = owner, groups
+        try:
+            yield variables
+        finally:
+            # Restore even on error so a failed mixed build can't leave the
+            # runner pointed at the bank.
+            runner.forward_vars = saved[0]
+            if owner is not None:
+                runner.h2d_owner, runner.h2d_groups = saved[1], saved[2]
+
+    @contextmanager
+    def mixed_prefill_bank_active(self, batch: ScheduledBatch):
+        """Build the prefill half of a mixed batch inside the bank.
+
+        Selects the bank, and opens one publication epoch on its owner, sealed
+        on exit, so the prefill producers publish into it under the same ledger
+        rules as an ordinary step. A failure fails the bank's owner, as it would
+        the runner's.
+
+        Also publishes the bank's `cu_seqlens_q`. It is the one buffer the
+        prefill path READS rather than fills (`prepare_prefill` cross-checks
+        against it), and `publish_cu_seqlens_q` gives the runner's own copy the
+        decode segment's spans on a mixed step -- so the prefill segment's spans
+        are written here, from the same `num_scheduled_tokens`.
+        """
+        _, owner, _ = self._get_mixed_prefill_bank()
+        if owner is not None:
+            owner.begin()
+        try:
+            with self.mixed_prefill_bank_selected() as variables:
+                n_p_seqs = batch.total_seqs_num_prefill
+                cu = variables["cu_seqlens_q"]
+                cu.np[1 : n_p_seqs + 1] = np.cumsum(
+                    batch.num_scheduled_tokens[:n_p_seqs]
+                )
+                cu.copy_to_gpu(n_p_seqs + 1)
+                yield variables
+        except BaseException:
+            if owner is not None:
+                owner.fail()
+            raise
+        else:
+            if owner is not None:
+                owner.finish()
+
+    @h2d_producer("early", runner="model_runner")
+    def prepare_cu_seqlens_q(self, batch: ScheduledBatch, forward_mode) -> int:
+        if not batch.is_mixed:
+            return super().prepare_cu_seqlens_q(batch, forward_mode)
+        # Only V4 dispatches mixed attention in two independent segments.
+        # Its decode spans occupy the live bank; prefill uses its own bank.
+        cu = self.model_runner.forward_vars["cu_seqlens_q"]
+        lens = batch.num_scheduled_tokens[batch.total_seqs_num_prefill :]
+        n = len(lens)
+        cu.np[1 : n + 1] = np.cumsum(lens)
+        cu.np[n + 1 : forward_mode.running_bs + 1] = cu.np[n]
+        return forward_mode.running_bs + 1
+
+    def prepare_mixed(self, batch: ScheduledBatch, bs: int):
+        """Build prefill and decode metadata in separate banks and combine their token spans."""
+        var = self.model_runner.forward_vars
+        n_p_seqs = batch.total_seqs_num_prefill
+        n_p_tokens = batch.total_tokens_num_prefill
+        n_d_seqs = batch.total_seqs_num_decode
+        n_d_tokens = batch.total_tokens_num_decode
+
+        # Separate pinned sources and GPU destinations prevent decode staging
+        # from overwriting prefill metadata or racing its pending uploads.
+        with self.mixed_prefill_bank_active(batch):
+            # Same reasoning as the `prepare_decode` call below: a mixed batch is
+            # never padded to a captured graph width or a token-graph bucket, so
+            # the prefill segment's running sizes ARE its scheduled ones.
+            prefill_meta, prefill_positions = self.prepare_prefill(
+                batch, running_bs=n_p_seqs, running_tokens=n_p_tokens
+            )
+
+        # ---- Decode half: present rows [n_p_seqs:] as a standalone batch so
+        # the unmodified prepare_decode builds decode metadata into shared
+        # buffer rows [0:n_d_seqs]. Mixed runs eager, so bs == n_d_seqs (no CG
+        # padding). ----
+        decode_batch = batch.slice_rows(n_p_seqs, batch.total_seqs_num)
+        if decode_batch.block_table_rows != list(
+            range(n_d_seqs)
+        ) or decode_batch.state_rows != list(range(n_d_seqs)):
+            raise ValueError("V4 decode rows must each have KV pages and a state slot")
+        rejected = self.model_runner.tokenID_processor.num_rejected
+        if rejected is not None and len(rejected) != batch.total_seqs_num:
+            raise ValueError("num_rejected is not aligned with mixed batch rows")
+        rejected = (
+            np.zeros(n_d_seqs, dtype=np.int32)
+            if rejected is None
+            else rejected[n_p_seqs:]
+        )
+        # prepare_decode READS var["cu_seqlens_q"] (it never writes it) as a
+        # device view, and on a mixed step `publish_cu_seqlens_q` has already
+        # published the DECODE segment's spans into it (anchor + drafts per
+        # decode seq) -- so swa_write / paged-decode index the decode kv from 0
+        # instead of running off the end (GPU OOB in swa_write). The check below
+        # validates the producer's host layout; device publication and bank
+        # isolation are checked by the H2D GPU regression tests.
+        #
+        # Query shrinking keeps the prefill prefix and repacks only decode
+        # tokens. Validate every decode-local boundary, not just a rectangular
+        # product, so equal totals cannot hide shifted request spans.
+        lens = np.asarray(batch.num_scheduled_tokens[n_p_seqs:])
+        cu = var["cu_seqlens_q"].np[: n_d_seqs + 1]
+        if cu[0] != 0 or not np.array_equal(cu[1:], np.cumsum(lens)):
+            raise RuntimeError("cu_seqlens_q does not contain decode-local spans")
+        decode_max_q = int(lens.max())
+        decode_meta, decode_positions = self.prepare_decode(
+            decode_batch,
+            running_bs=n_d_seqs,
+            running_tokens=n_d_tokens,
+            max_seqlen_q=decode_max_q,
+            num_rejected=rejected,
+            build_ubatches=False,
+        )
+
+        # ---- Merge positions ([prefill | decode]) on the device. ----
+        # Both halves are already published: prefill's into the bank, decode's
+        # into the runner's buffer. Concatenating the two device views needs no
+        # host round-trip (the old `decode_positions.cpu()` stalled the host on
+        # the stream, ~12 ms of GPU idle per mixed step) and no third upload --
+        # re-staging either buffer would be a second publish of it this epoch.
+        positions = torch.cat(
+            [prefill_positions[:n_p_tokens], decode_positions[:n_d_tokens]]
+        )
+
+        merged = _mixed_carrier(
+            prefill_meta, decode_meta, n_p_seqs, n_d_seqs, n_p_tokens, n_d_tokens, bs
+        )
+        return merged, positions
+
+    def commit_speculative_state(self, metadata, last_token_indices):
+        """Publish whole-batch state slots to the draft graph's fixed input buffer."""
+        del last_token_indices
+        if not getattr(metadata, "is_mixed", False):
+            return
+        slots = metadata.state_slot_out
+        buf = self.model_runner.forward_vars["v4_meta_state_slot_out"].gpu
+        buf[: slots.shape[0]].copy_(slots)
+
     @h2d_producer("prefill", "positions", "v4_state", runner="model_runner")
     def prepare_decode(
         self,
@@ -2473,9 +2866,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         running_bs: int,
         running_tokens: int,
         max_seqlen_q: int,
+        *,
+        num_rejected: np.ndarray | None = None,
+        build_ubatches: bool = True,
     ):
-        """V4-style decode prep: populates positions, cu_seqlens_q,
-        block_tables, and state_slot_out.
+        """V4-style decode prep: populates positions, block_tables, and
+        state_slot_out.
+
+        NOT `cu_seqlens_q`: this reads it. Its one writer is
+        `publish_cu_seqlens_q`, which uploads before calling here -- with the
+        decode segment's spans on a mixed step.
 
         Publishes metadata on the current compute stream. Host sources remain
         borrowed until the runner's preparation completion event.
@@ -2495,10 +2895,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # full_q`, below), and every compress count is now `visible_*(pos)`, so
         # a rejected slot's KV falls out of range on its own — `block_tables`
         # needs no truncation here.
-        if not batch.is_dummy_run and max_seqlen_q > 1:
-            context_lens_np = self.model_runner.tokenID_processor.verify_ctx_lens(
-                context_lens_np
-            )
+        # Explicit counts belong to a mixed segment, including q=1. Ordinary
+        # decode retains its existing max-query-width rollback condition.
+        if not batch.is_dummy_run and (max_seqlen_q > 1 or num_rejected is not None):
+            if num_rejected is None:
+                context_lens_np = self.model_runner.tokenID_processor.verify_ctx_lens(
+                    context_lens_np
+                )
+            else:
+                if len(num_rejected) != len(context_lens_np):
+                    raise ValueError("num_rejected is not aligned with decode rows")
+                context_lens_np = context_lens_np - num_rejected.astype(np.int32)
         # DSpark q-shrink: anchor the forwarded q tokens to the draft span HEAD
         # (ctx-full_q), not the tail, so they stay in [ctx-full_q .. ctx-1] (never
         # OOB); dropped tail slots are re-drafted next step (lossless). No-op when
@@ -2561,7 +2968,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         # Publish before the first GPU metadata consumer.
         positions = var["positions"].copy_to_gpu(running_tokens)
-        # Uploaded once by `publish_cu_seqlens_q`; this is a view.
+        # Uploaded once by `publish_cu_seqlens_q` -- the decode segment's spans
+        # on a mixed step -- so this is a view.
         cu_seqlens_q_gpu = var["cu_seqlens_q"].gpu[: running_bs + 1]
         context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
         # As many rows as `cu_seqlens_q` has sequences: the FP4 indexer's ragged
@@ -2617,10 +3025,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         self._ubatch_decode_meta = None
+        # Not for a mixed batch's decode half: a mixed TBO split rebuilds its
+        # ubatches itself, and publishing the live `ub0_`/`ub1_` buffers here
+        # would be a second publish in the same epoch once it does.
         if (
             self.model_runner.config.enable_tbo_decode
             and decode_bucket_splits(self._ubatch_split_bs or scheduled_bs)
             and not batch.is_dummy_run
+            and build_ubatches
         ):
             self._prepare_ubatch_decode(
                 scheduled_bs=scheduled_bs,
@@ -3107,6 +3519,109 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     else:
                         group.check_writable()
 
+    def _rebuild_prefill_segment(
+        self,
+        prefill_meta: AttentionMetaData,
+        pref_slice,
+        padded_bs: int,
+        ubatch_idx: int,
+    ) -> AttentionMetaData_DSV4:
+        """Rebuild a prefill slice against its bank's buffers and publication owner."""
+        with self.mixed_prefill_bank_selected():
+            return self.build_ubatch_prefill_metadata(
+                prefill_meta, pref_slice, padded_bs, ubatch_idx=ubatch_idx
+            )
+
+    def _build_ubatch_prefill_of_mixed(
+        self,
+        attn_metadata: AttentionMetaData,
+        ub_slice,
+        ubatch_idx: int,
+    ) -> AttentionMetaData_DSV4:
+        """Rebuild a pure-prefill microbatch from the parent's prefill segment."""
+        src = cast(AttentionMetaData_DSV4, attn_metadata)
+        if src.prefill_attn_metadata is None:
+            raise RuntimeError(
+                "pure-prefill ubatch of a mixed batch needs the parent's "
+                "prefill segment metadata"
+            )
+        from atom.utils.tbo.ubatch_splitting import UBatchSlice
+
+        rs = ub_slice.request_slice
+        # Strip the mixed markers before recursing. `build_ubatch_prefill_
+        # metadata` dispatches on their presence, so passing `ub_slice` through
+        # unchanged would land right back here -- unbounded recursion. The
+        # ranges are all the rebuild needs.
+        plain_slice = UBatchSlice(
+            request_slice=ub_slice.request_slice,
+            token_slice=ub_slice.token_slice,
+        )
+        return self._rebuild_prefill_segment(
+            src.prefill_attn_metadata, plain_slice, rs.stop - rs.start, ubatch_idx
+        )
+
+    def _build_ubatch_mixed_metadata(
+        self,
+        attn_metadata: AttentionMetaData,
+        ub_slice,
+        ubatch_idx: int,
+    ) -> AttentionMetaData_DSV4:
+        """Rebuild the prefill tail and retain all decode rows in the final microbatch."""
+        from atom.utils.tbo.ubatch_splitting import UBatchSlice
+
+        src = cast(AttentionMetaData_DSV4, attn_metadata)
+        rs = ub_slice.request_slice
+        ts = ub_slice.token_slice
+        ub_pref_tokens = ub_slice.num_prefill_tokens
+        ub_pref_seqs = ub_slice.num_prefill_seqs
+        ub_dec_tokens = (ts.stop - ts.start) - ub_pref_tokens
+        ub_dec_seqs = (rs.stop - rs.start) - ub_pref_seqs
+
+        # `raise`, not `assert`: these hold the ubatch's slices inside the
+        # parent's, and `python -O` would let a bad split truncate silently.
+        if src.prefill_attn_metadata is None or src.decode_attn_metadata is None:
+            raise RuntimeError(
+                "mixed ubatch rebuild needs the parent's prefill and decode "
+                "segment metadata"
+            )
+        # The gate in split_mixed_token_midpoint should make both true.
+        if ub_pref_tokens <= 0 or ub_dec_tokens <= 0:
+            raise RuntimeError(
+                f"ubatch is not mixed: {ub_pref_tokens} prefill + "
+                f"{ub_dec_tokens} decode tokens"
+            )
+        if ts.stop > src.num_prefill_tokens + src.num_decode_tokens:
+            raise RuntimeError(
+                f"ubatch token slice ends at {ts.stop}, past the parent's "
+                f"{src.num_prefill_tokens} + {src.num_decode_tokens} tokens"
+            )
+
+        # ---- prefill tail, in the PARENT's prefill coordinates ----
+        # Prefill rows lead in both the merged axis and the prefill-only axis,
+        # so this ubatch's prefill span is the same `[ts.start, ...)` in each;
+        # it simply ends where the parent's prefill does.
+        pref_slice = UBatchSlice(
+            request_slice=slice(rs.start, src.num_prefill_seqs),
+            token_slice=slice(ts.start, src.num_prefill_tokens),
+        )
+        ub_pref = self._rebuild_prefill_segment(
+            src.prefill_attn_metadata, pref_slice, ub_pref_seqs, ubatch_idx
+        )
+        ub_dec = src.decode_attn_metadata
+
+        # Prefill/mixed TBO uses local request rows; only its MoE token height
+        # is DP-padded. Drafting happens after UBatchWrapper restores the parent
+        # context, whose carrier retains the full DP-padded request width.
+        return _mixed_carrier(
+            ub_pref,
+            ub_dec,
+            ub_pref_seqs,
+            ub_dec_seqs,
+            ub_pref_tokens,
+            ub_dec_tokens,
+            ub_pref_seqs + ub_dec_seqs,
+        )
+
     def build_ubatch_prefill_metadata(
         self, attn_metadata, ub_slice, running_bs, ubatch_idx=0
     ) -> AttentionMetaData_DSV4:
@@ -3133,6 +3648,33 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         - Token-split TBO (default, §11): uses `ub_slice` / `running_bs`.
         """
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
+
+        # Both ubatches of a split MIXED batch have to be rebuilt from the
+        # parent's prefill SEGMENT metadata, never from the parent itself. The
+        # parent of a mixed batch is a thin carrier -- `prepare_mixed` gives it
+        # the two segment metadatas, the markers and little else, so the
+        # per-request fields the rebuild below reads (`state_slot_out` first
+        # among them) are None on it and it dies with
+        # `'NoneType' object is not subscriptable`.
+        #
+        # The straddling ubatch additionally needs the nested two-segment
+        # shape put back together; the pure-prefill one is an ordinary prefill
+        # rebuild once it is pointed at the right source.
+        #
+        # Reached when TBO splits a mixed batch (`local_tbo_precompute` takes
+        # the mixed split for it).
+        _ub_pref_tok = getattr(ub_slice, "num_prefill_tokens", None)
+        if _ub_pref_tok is not None:
+            _ub_tok = ub_slice.token_slice.stop - ub_slice.token_slice.start
+            if 0 < _ub_pref_tok < _ub_tok:
+                return self._build_ubatch_mixed_metadata(
+                    attn_metadata, ub_slice, ubatch_idx
+                )
+            # Pure-prefill ubatch of a mixed parent: same redirect to the
+            # prefill segment (and its staging bank), minus the reassembly.
+            return self._build_ubatch_prefill_of_mixed(
+                attn_metadata, ub_slice, ubatch_idx
+            )
 
         # PCP+TBO request-boundary split: each ubatch = one request group processed as an
         # independent non-TBO PCP mini-batch. Slice the FULL (un-reindexed)

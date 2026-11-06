@@ -23,6 +23,8 @@ def test_drafts_fill_only_their_rows_columns():
         scheduled_tokens=anchors,
         total_tokens_num_prefill=0,
         total_tokens_num_decode=6,
+        total_tokens_num=6,
+        is_mixed=False,
         total_seqs_num_prefill=0,
         num_spec_step=2,
         scheduled_spec_decode_tokens=spec,

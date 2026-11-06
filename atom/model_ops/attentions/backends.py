@@ -711,13 +711,15 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             "ForwardMode.decide invariant violated"
         )
         cu = self.model_runner.forward_vars["cu_seqlens_q"]
-        cu.np[1 : scheduled_bs + 1] = np.cumsum(batch.num_scheduled_tokens)
-        cu.np[scheduled_bs + 1 : forward_mode.running_bs + 1] = batch.total_tokens_num
+        lens = batch.num_scheduled_tokens
+        n = len(lens)
+        cu.np[1 : n + 1] = np.cumsum(lens)
+        cu.np[n + 1 : forward_mode.running_bs + 1] = cu.np[n]
         # Caller publishes alone or with sampling/IDs before token assembly.
         return forward_mode.running_bs + 1
 
     def decode_spans(self, batch: ScheduledBatch) -> tuple[int, np.ndarray, np.ndarray]:
-        """A pure-decode step's `(bs, per-request lengths, exclusive prefix sum)`.
+        """The decode region's `(bs, per-request lengths, exclusive prefix sum)`.
 
         One place, so no caller can pair a length vector with someone else's
         cumsum: both come off `num_scheduled_tokens` and the buffer
@@ -727,7 +729,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         bs = batch.total_seqs_num_decode
         return (
             bs,
-            batch.num_scheduled_tokens[:bs],
+            batch.num_scheduled_tokens[batch.total_seqs_num_prefill :],
             self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
         )
 
@@ -1038,6 +1040,11 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             self.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
+
+        # Mixed dispatch comes AFTER state maintenance: it returns early, and a
+        # mixed batch needs the same relocations / checkpoint copies as any other.
+        if batch.is_mixed:
+            return self.prepare_mixed(batch, running_bs)
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             if (
@@ -1065,6 +1072,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
     # `ReqGraph`s, each on `build_for_req_graph_capture`'s step
     # (`ModelRunner._record_prefill_req_graphs`). Empty: none.
     prefill_req_graph_sizes: tuple[int, ...] = ()
+
+    def prepare_mixed(self, batch: ScheduledBatch, bs: int):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support mixed prefill+decode "
+            "batches: this metadata builder has no prepare_mixed. Disable "
+            "--enable-mixed-prefill-decode."
+        )
 
 
 class AttentionImpl(nn.Module):
