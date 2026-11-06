@@ -1739,10 +1739,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     def checkpoint_page_unit_bytes(self) -> int | None:
         """Bytes of one MHA page that a transfer actually publishes.
 
-        ``ModelRunner`` sizes the checkpoint unit from the paged pool's
-        ``entry_bytes`` unless a backend returns a number here. ``None`` keeps
-        that charged size. Kimi's MLA pool needs no override: its charged
-        entry is exactly the rows the page geometry walks.
+        ``resolve_checkpoint_page_unit_bytes`` sizes the checkpoint unit from
+        this builder's own PAGE specs' ``entry_bytes`` unless a backend returns
+        a number here. ``None`` keeps that size. Kimi's MLA pool needs no
+        override: its entry is exactly the rows the page geometry walks.
 
         Qwen's ``MhaKvPool`` does not work that way. The pool is one
         allocation ATOM lays out itself. Each field (K, V, scale) is rounded
@@ -2066,8 +2066,13 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
             ctx_pa_ps = {}
+        # The graph runs bs * max_qlen tokens (max_qlen > 1 for an MTP verify),
+        # so slot_mapping needs one entry per token, as in `prepare_decode`:
+        # routed-expert capture refuses a slot_mapping shorter than the
+        # tokens it routes.
+        capture_tokens = bs * int(var["max_qlen"])
         attn_metadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[:bs],
+            slot_mapping=var["slot_mapping"].gpu[:capture_tokens],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
             max_seqlen_q=var["max_qlen"],
@@ -2089,7 +2094,6 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         # A capture runs a full synthetic batch, so nothing is padded and the
         # scheduled shape is the running one.
-        capture_tokens = bs * int(var["max_qlen"])
         positions = var["positions"].copy_to_gpu(capture_tokens)
         context = Context(
             positions=positions,

@@ -112,6 +112,19 @@ def test_dummy_forward_participates_in_staging_lifetime():
     )
 
 
+def test_output_less_forward_stores_routes_before_the_aligning_propose():
+    """The aligning propose rewrites this forward's slot_mapping in place, so
+    the routes of a pure middle chunk must be gathered ahead of it."""
+    method = _method("forward")
+    (store,) = _attribute_calls(method, "_store_routed_experts_step")
+    (align,) = [
+        call
+        for call in _attribute_calls(method, "propose_draft_token_ids")
+        if any(kw.arg == "align_only" for kw in call.keywords)
+    ]
+    assert store.lineno < align.lineno
+
+
 def test_draft_lockstep_reads_pipeline_parallel_not_deferred_output():
     """Only PP may be excluded from DP draft lockstep, and only by name.
 

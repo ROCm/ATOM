@@ -73,6 +73,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         ),
         drafter=object(),
         forward_done_event=mock.Mock(),
+        _return_routed_experts=False,
     )
     runner._constrain_required_channel = MethodType(
         runner_module.ModelRunner._constrain_required_channel, runner

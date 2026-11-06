@@ -67,6 +67,9 @@ from atom.model_ops.fused_moe.mori_prepare_finalize import (
     use_mori_low_latency,
 )
 from atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4 import Mxfp8SharedIntoMxfp4
+from atom.model_ops.fused_moe.routed_experts_capturer import (
+    maybe_capture_routed_experts,
+)
 from atom.model_ops.fused_moe.routed_rows import (
     RoutedRowsWire,
     gather_rows,
@@ -507,8 +510,9 @@ def _select_logical(
     num_fused_shared_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The layer's routing over `num_routing_experts` logical experts,
-    `num_fused_shared_experts` shared columns widened in."""
-    return FusedMoE.select_experts(
+    `num_fused_shared_experts` shared columns widened in. Captured here, the
+    one place every quant method routes through, for routed-expert replay."""
+    topk_weights, topk_ids = FusedMoE.select_experts(
         hidden_states=x,
         router_logits=router_logits,
         use_grouped_topk=layer.use_grouped_topk,
@@ -524,6 +528,8 @@ def _select_logical(
         fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
         routed_scaling_factor=layer.routed_scaling_factor,
     )
+    maybe_capture_routed_experts(layer, topk_ids)
+    return topk_weights, topk_ids
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):

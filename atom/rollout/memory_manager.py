@@ -6,6 +6,7 @@ import os
 
 import torch
 
+from atom.model_ops.fused_moe.routed_experts_capturer import ROUTES_VIEW_ATTR
 from atom.utils.forward_context import set_kv_cache_data
 from atom.utils.graph_holders import release_registered_graphs
 
@@ -14,7 +15,8 @@ logger = logging.getLogger("atom")
 # Every name a binder may have set to a view of the KV pool. Not just the cache
 # ones: the pool is a single buffer now, so one surviving scale plane or
 # indexer slice pins all of it -- what used to leak a scale tensor leaks the
-# whole pool.
+# whole pool. The routed-expert capture view is not part of the pool but is
+# charged to its budget, so it is bound and released with it.
 _POOL_VIEW_ATTRS = (
     "k_cache",
     "v_cache",
@@ -23,6 +25,7 @@ _POOL_VIEW_ATTRS = (
     "k_scale",
     "v_scale",
     "index_cache",
+    ROUTES_VIEW_ATTR,
 )
 
 
@@ -159,6 +162,8 @@ class MemoryManagerMixin:
       - self.label (str)
       - self.tokenID_processor — tokenIDProcessor instance
       - self.req_graph — the decode `ReqGraph` (CUDA graph state)
+      - self._routed_experts_capturer, self._held_routes,
+        self._deferred_routes — routed-expert replay state
       - self.allocate_kv_cache(num_blocks) — method
       - self.capture_cudagraph() — method
       - self.get_num_blocks() — method
@@ -190,6 +195,10 @@ class MemoryManagerMixin:
         # stale GPU tensor references (prev_token_ids, etc.)
         if hasattr(self, "tokenID_processor"):
             self.tokenID_processor.clean()
+        # Routes for the batch `clean()` just dropped; kept, the first
+        # deferred step after wake would attach them to a new batch's output.
+        self._held_routes = []
+        self._deferred_routes = None
 
         if "weights" in tags:
             self._release_weights()
@@ -327,6 +336,10 @@ class MemoryManagerMixin:
         ):
             if hasattr(self, attr) and getattr(self, attr) is not None:
                 delattr(self, attr)
+        # The MoE layers' views were cleared with the pool's above. Left live,
+        # the capture buffer makes wake's get_num_blocks() treat it as
+        # overhead and allocate_kv_cache create a second one.
+        self._routed_experts_capturer = None
         torch.cuda.empty_cache()
         logger.info(f"{self.label}: KV cache released (GPU memory freed)")
 

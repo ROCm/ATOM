@@ -179,6 +179,7 @@ class ScheduledBatch:
 | `is_dummy_run` | `bool` | Whether this is a dummy/warmup run |
 | `num_spec_step` | `int` | Number of speculative decode steps (`mtp_k`) |
 | `scheduled_spec_decode_tokens` | `np.ndarray[int32]` | Draft tokens from the prior speculative step, densified to `[bs, num_spec_step]` in batch order (the constructor takes them keyed by request ID) |
+| `routed_prefix_ranges` | `list[tuple[int, int, int]] \| None` | `enable_return_routed_experts` only: `(batch index, lo, hi)` for each prefix-cache hit whose positions `[lo, hi)` no earlier step returned routes for; the runner reads them from the cached blocks once. See [Routed-expert replay](#routed-expert-replay) |
 
 ### ScheduledBatchOutput
 
@@ -193,6 +194,7 @@ Returned by the model runner after a forward pass:
 | `is_deferred_out`, `is_prev_prefill` | Deferred-output and previous-prefill state |
 | `logprobs` | Optional sampled-token log probabilities |
 | `dspark_ell` | Optional request-ID-to-verification-length map from the DSpark scheduler |
+| `routed_experts` | Optional `RoutedExpertsPatch` (`enable_return_routed_experts` only): the step's route rows, one segment per request, each starting at an absolute position. See [Routed-expert replay](#routed-expert-replay) |
 
 The output owns the storage of `draft_token_ids`, `num_rejected`, and
 `num_bonus`. The constructor copies non-owning NumPy views and retains
@@ -238,6 +240,32 @@ existing overlap. Ordinary sampled-token and logprob transfers are unchanged.
 
 `token_ids` contains accepted-token rows, not the runner's intermediate mapping:
 the runner extracts the deferred-output sentinel before constructing this object.
+
+### Routed-expert replay
+
+With `enable_return_routed_experts`, each request accumulates its MoE routes
+(int16 `[seq_len - 1, num_hidden_layers, top_k]`) on its `Sequence`, and
+`generate()` returns them as `routed_experts`.
+
+- **Capture.** `allocate_kv_cache` allocates one buffer indexed by KV slot,
+  `[num_slots + 1, num_hidden_layers, top_k]` (the extra row absorbs CUDA-graph
+  pad slots), and binds each target `FusedMoE` its layer's view on TP rank 0.
+  The MoE hook scatters `topk_ids` there at the forward's `slot_mapping`. Sleep
+  clears the views with the KV views; wake rebinds them.
+- **Export.** After each forward the runner gathers that step's slots in batch
+  token order and copies them to the host on the async copy stream. The rows
+  ride the next `ScheduledBatchOutput` as `routed_experts`, the same deferral as
+  the tokens. A prefix-cache hit adds its `routed_prefix_ranges`, read from the
+  cached blocks; a pure middle prefill chunk's rows are held until the next
+  output.
+- **Merge.** `postprocess` applies each segment to its request by id.
+  Overlap overwrites; a segment starting past the rows held raises. Rows for a
+  request that has left `running` are dropped: a finished request's extra row
+  is past its routes, and a preempted request rewinds `routed_forwarded_end`
+  and asks for them again. Rejected speculative rows are trimmed each step.
+- **Finish.** The routes are trimmed to `num_tokens - 1` rows and frozen. A
+  finish other than abort with fewer rows raises; an abort can land while its
+  last step's rows are in flight, so it may return fewer.
 
 ## Block manager
 

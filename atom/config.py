@@ -2013,6 +2013,43 @@ def indexer_cp_unsupported_reason(
     return None
 
 
+def check_return_routed_experts(config: "Config") -> None:
+    """Refuse topologies that cannot assemble a full [seq_len-1] route tensor."""
+    if not config.enable_return_routed_experts:
+        return
+    plugin = config.plugin_config
+    if (plugin is not None and plugin.is_plugin_mode) or is_plugin_mode():
+        raise ValueError(
+            "enable_return_routed_experts is not supported in plugin mode: "
+            "capture lives in ATOM's ModelRunner, which a host framework does "
+            "not run"
+        )
+    if (
+        config.decode_context_parallel_size != 1
+        or config.prefill_context_parallel_size != 1
+    ):
+        raise ValueError(
+            "enable_return_routed_experts requires decode_context_parallel_size "
+            "== 1 and prefill_context_parallel_size == 1"
+        )
+    if config.pipeline_parallel_size != 1:
+        raise ValueError(
+            "enable_return_routed_experts requires pipeline_parallel_size == 1"
+        )
+    if config.kv_transfer_config:
+        raise ValueError(
+            "enable_return_routed_experts does not support KV transfer "
+            "(prefill/decode disaggregation or KV offload); routed-expert "
+            "metadata is not moved with KV blocks"
+        )
+    if config.enable_rapidserve:
+        raise ValueError(
+            "enable_return_routed_experts does not support RapidServe "
+            "prefill/decode disaggregation; decode skips KV allocation and "
+            "never initializes the process-local capture buffer"
+        )
+
+
 @dataclass
 class Config:
     model: str
@@ -2104,6 +2141,14 @@ class Config:
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
+    # Return per-request MoE routes from generate() as int16
+    # [seq_len - 1, num_layers, top_k]. Scatter is CUDA-graph-safe (device
+    # write inside fused MoE). Refused here: DCP/PCP/PP != 1, plugin mode, KV
+    # transfer / offload, RapidServe P/D. Refused after weight load: a model
+    # without FusedMoE, an attention backend without per-token slots
+    # (DeepSeek-V4 / V4.1). Mono decode turns off for models whose kernels
+    # route in-kernel. Prefix cache stays on.
+    enable_return_routed_experts: bool = False
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
     enable_request_context_metrics: bool = False
@@ -2724,6 +2769,8 @@ class Config:
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
         self._resolve_dynamic_chunking()
         self._check_pp_support()
+
+        check_return_routed_experts(self)
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens

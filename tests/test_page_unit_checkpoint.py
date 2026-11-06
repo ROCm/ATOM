@@ -15,6 +15,15 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     PagedStateCheckpointSpec,
     PageUnitCheckpointStore,
+    resolve_checkpoint_page_unit_bytes,
+)
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
+    page_pool,
+    plan_pools,
+    state_pool,
+)
+from atom.model_ops.fused_moe.routed_experts_capturer import (
+    capture_bytes_per_kv_block,
 )
 
 
@@ -700,3 +709,35 @@ class TestTheTierVotes:
         assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 2
         index.hashes.discard(77)  # what `fail_load` -> `forget` does
         assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 0
+
+
+class _Builder:
+    def __init__(self, specs, published=None):
+        self._specs = specs
+        if published is not None:
+            self.checkpoint_page_unit_bytes = lambda: published
+
+    def sub_pool_specs(self):
+        return self._specs
+
+
+def test_page_unit_excludes_draft_kv_and_routed_expert_surcharge():
+    """The draft pool and the R3 capture rows share the PAGE block id, so the
+    plan charges them, but they are not part of the state image."""
+    target = _Builder([page_pool(4096), state_pool("ssm", 777, entries_per_req=1)])
+    draft = [page_pool(1024)]
+    surcharge = page_pool(capture_bytes_per_kv_block(16, 4, 2))
+    plan = plan_pools(list(target.sub_pool_specs()) + draft + [surcharge], 1 << 30, 4)
+    assert plan.entry_bytes[plan.paged_class] == 4096 + 1024 + surcharge.entry_bytes
+    assert resolve_checkpoint_page_unit_bytes(target) == 4096
+
+
+def test_page_unit_takes_the_backends_narrower_unit():
+    assert resolve_checkpoint_page_unit_bytes(_Builder([page_pool(4096)], 4000)) == 4000
+    assert resolve_checkpoint_page_unit_bytes(_Builder([page_pool(4096)])) == 4096
+
+
+@pytest.mark.parametrize("published", [0, 4097])
+def test_page_unit_refuses_a_unit_outside_the_builders_entry(published):
+    with pytest.raises(RuntimeError, match="checkpoint PAGE unit"):
+        resolve_checkpoint_page_unit_bytes(_Builder([page_pool(4096)], published))

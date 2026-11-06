@@ -394,6 +394,10 @@ class ScheduledBatch:
             dtype=np.int32,
         )
 
+        # `(batch index, lo, hi)` cached-prefix route ranges the runner returns
+        # with this step; set by `Scheduler._plan_routed_prefixes`.
+        self.routed_prefix_ranges = None
+
         # Each sequence's window, staged into one array rather than assigned
         # per sequence: a numpy slice-assign costs ~245ns of dispatch whatever
         # its length, and at decode a window is a single token. `extend`
@@ -625,6 +629,7 @@ class ScheduledBatchOutput:
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
         structured_errors: dict[int, str] | None = None,
+        routed_experts=None,
     ):
         self.req_ids = req_ids
         self.structured_errors = structured_errors or {}
@@ -640,6 +645,8 @@ class ScheduledBatchOutput:
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
+        # This step's MoE routes in batch token order, a `RoutedExpertsPatch`.
+        self.routed_experts = routed_experts
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
 
@@ -678,6 +685,7 @@ class Scheduler:
 
     _ENGINE_LABEL = ""
     _METRICS_ROLE = ""
+    _return_routed_experts: bool = False
 
     def __init__(
         self,
@@ -727,6 +735,10 @@ class Scheduler:
         self.config = config
         # tokens a replaying forward carries from before it (`Replay.history_ids`)
         self.replay_history_tokens = getattr(config, "replay_history_tokens", 0)
+
+        self._return_routed_experts = bool(
+            getattr(config, "enable_return_routed_experts", False)
+        )
         pc = getattr(config, "parallel_config", None)
         self.metrics = SchedulerMetrics(
             getattr(pc, "data_parallel_rank", 0)
@@ -2051,8 +2063,29 @@ class Scheduler:
         quiet, which is indistinguishable from an idle engine.
         """
         result = self._schedule()
+        if result is not None and self._return_routed_experts:
+            self._plan_routed_prefixes(*result)
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
+
+    @staticmethod
+    def _plan_routed_prefixes(batch: ScheduledBatch, seqs: dict[int, Sequence]) -> None:
+        """Mark cached prefixes whose routes no earlier step returned.
+
+        The runner sends only the rows a step forwards, so a prefix-cache hit
+        names its ``[forwarded_end, first_position)`` range for the runner to
+        read from the cached blocks once.
+        """
+        ranges = []
+        for i, seq in enumerate(seqs.values()):
+            if seq.type != SequenceType.PREFILL:
+                continue
+            n = int(batch.num_scheduled_tokens[i])
+            first = int(batch.context_lens[i]) - n
+            if first > seq.routed_forwarded_end:
+                ranges.append((i, seq.routed_forwarded_end, first))
+            seq.routed_forwarded_end = max(seq.routed_forwarded_end, first + n)
+        batch.routed_prefix_ranges = ranges
 
     def _schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
         """Select the next batch of sequences for a forward pass.
@@ -3090,6 +3123,8 @@ class Scheduler:
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
+        if self._return_routed_experts:
+            seq.finish_routed_experts(seq.num_tokens - 1)
         seq.multimodal_data = None
         tracing.finish(seq, reason="aborted")
         self._rejected.append(seq)
@@ -4049,6 +4084,13 @@ class Scheduler:
         if seq.is_partial_prefill:
             seq.is_partial_prefill = False
             self._partial_prefill_count -= 1
+        if self._return_routed_experts:
+            # The marker counts rows planned, not delivered. Fall back to what
+            # was delivered, so a range whose patch is lost is asked for again
+            # on resume (read from the cache on a hit, else recomputed).
+            seq.routed_forwarded_end = min(
+                seq.routed_forwarded_end, seq.routed_expert_rows
+            )
         # This free runs no `request_finished`; drop any stall-escaped save
         # tracker now so the connector's save loop cannot later read these
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
@@ -4172,6 +4214,29 @@ class Scheduler:
             >= self._checkpoint_holds[req_id]
         ]
 
+    @staticmethod
+    def _apply_routed_experts_patch(seq_map: dict[int, Sequence], patch) -> None:
+        """Write each segment of a step's ``RoutedExpertsPatch`` onto its seq."""
+        rows = patch.rows
+        offsets = patch.offsets.tolist()
+        for j, (req_id, start) in enumerate(
+            zip(patch.req_ids.tolist(), patch.starts.tolist())
+        ):
+            seq = seq_map.get(req_id)
+            if seq is None:
+                # ``seq_map`` holds the running requests, so this one has left
+                # ``running``. It needs none of these rows; they are dropped:
+                # - Finished: with deferred output, the step after its final
+                #   token was already in flight and forwarded that token. That
+                #   row is past the ``num_tokens - 1`` routes it returns.
+                # - Preempted: it is back in ``waiting`` and
+                #   ``routed_forwarded_end`` was rewound, so these positions
+                #   are asked for again when it resumes.
+                # Rows missing for a request still running are not silent:
+                # ``apply_routed_expert_patch`` raises on the gap.
+                continue
+            seq.apply_routed_expert_patch(start, rows[offsets[j] : offsets[j + 1]])
+
     def postprocess(
         self,
         seqs: list[Sequence],
@@ -4204,6 +4269,18 @@ class Scheduler:
                 seq = running_by_id.get(request_id)
                 if seq is not None and "embedding_spans" in data:
                     seq.multimodal_cache_ready = True
+        routed = getattr(fwd_output, "routed_experts", None)
+        if routed is not None:
+            # A dummy prefill's output carries the previous step's routes with
+            # ``batch=None``, where ``running_by_id`` is empty.
+            self._apply_routed_experts_patch(
+                (
+                    running_by_id
+                    if batch is not None
+                    else {seq.id: seq for seq in self.running}
+                ),
+                routed,
+            )
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
         prefill_ids = set(batch.req_ids[:num_prefill]) if num_prefill else set()
         if self._connector_flag("is_offload") and num_prefill:
@@ -4642,6 +4719,18 @@ class Scheduler:
                 # output. Aborts without sampled output use the same helper.
                 self._mark_finished(seq, leave_reason, num_tokens)
 
+            # Drop rejected drafts' rows each step: the held count must stay the
+            # live length, or `apply_routed_expert_patch`'s gap check misses a
+            # lost patch under speculative decoding.
+            if (
+                self._return_routed_experts
+                and leave_reason is None
+                and not seq.is_partial_prefill
+            ):
+                keep = max(int(num_tokens) - 1, 0)
+                if keep < seq.routed_expert_rows:
+                    seq.truncate_routed_experts(keep)
+
             # Prepare stream output
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
@@ -4792,6 +4881,17 @@ class Scheduler:
             if reason == "aborted":
                 self._connector_abort_send(seq)
         seq.num_tokens = num_tokens
+        if self._return_routed_experts:
+            # Routes cover every position but the last token's, which never ran.
+            keep = int(num_tokens) - 1
+            # An abort can land while the previous step's patch is in flight,
+            # so only an aborted request may return fewer rows.
+            if reason != "aborted" and seq.routed_expert_rows < keep:
+                raise RuntimeError(
+                    f"routed experts: request {seq.id} finished ({reason}) "
+                    f"with {seq.routed_expert_rows} of {keep} rows"
+                )
+            seq.finish_routed_experts(keep)
         seq.multimodal_data = None
         seq.status = SequenceStatus.FINISHED
         self.total_finished_requests += 1
