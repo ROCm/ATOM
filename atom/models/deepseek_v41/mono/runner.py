@@ -127,7 +127,7 @@ def f32_bits(x: float) -> int:
 
 class V41MonoDecodeRunner:
     """Binds every rank's weights and buffers, or none: a rank that cannot is a
-    refusal every rank agrees on (``tp_agree``) before anything collective.
+    refusal every rank agrees on (``group_agree``) before anything collective.
 
     A step is up to ``max_rows`` rows, whatever requests they belong to (a
     row's window comes from its own batch id, ``write_step_meta``); the buffers
