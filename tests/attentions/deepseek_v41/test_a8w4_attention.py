@@ -190,12 +190,13 @@ def test_a8w4_graph_replay_changes_live_rows(decode):
         )
 
 
-@pytest.mark.parametrize("cache_dtype", ["fp4", "fp8"])
+@pytest.mark.parametrize("cache_dtype", ["bf16", "fp4", "fp8"])
+@pytest.mark.parametrize("capture_empty", [False, True])
 @torch.inference_mode()
 @pytest.mark.parametrize("side_stream", [False, True])
 @pytest.mark.parametrize("a8w4", [False, True])
 def test_native_token_graph_replays_different_request_counts(
-    cache_dtype, side_stream, a8w4, monkeypatch
+    cache_dtype, capture_empty, side_stream, a8w4, monkeypatch
 ):
     from types import MethodType
 
@@ -222,13 +223,17 @@ def test_native_token_graph_replays_different_request_counts(
         index_topk=4,
     )
     cache = PagedAttentionCache(geo, 4, 3, "cuda", max_tokens=width)
-    data, scales = cache.ring_view(0)
-    values, steps = quantize_fp8(
-        torch.randn(data.shape, device="cuda", dtype=torch.bfloat16)
-    )
-    data.copy_(values.view(torch.uint8))
-    scales.copy_(steps.view(torch.uint8))
-    history = tuple(p.clone() for p in cache.ring_view(0))
+    if cache_dtype == "bf16":
+        cache.pool.normal_()
+        history = (cache.pool.clone(),)
+    else:
+        data, scales = cache.ring_view(0)
+        values, steps = quantize_fp8(
+            torch.randn(data.shape, device="cuda", dtype=torch.bfloat16)
+        )
+        data.copy_(values.view(torch.uint8))
+        scales.copy_(steps.view(torch.uint8))
+        history = tuple(p.clone() for p in cache.ring_view(0))
     rope = RotaryEmbedding(64, 512, base=10000).cuda()
     positions = torch.empty(width, dtype=torch.int32, device="cuda")
     batch_ids = torch.empty_like(positions)
@@ -265,7 +270,8 @@ def test_native_token_graph_replays_different_request_counts(
         )
         step.begin_forward()
         ctx.attn_metadata = SimpleNamespace(cache=cache, step=step, queries=None)
-        for dst, saved in zip(cache.ring_view(0), history):
+        planes = (cache.pool,) if cache_dtype == "bf16" else cache.ring_view(0)
+        for dst, saved in zip(planes, history):
             dst.copy_(saved)
         return step
 
@@ -302,8 +308,22 @@ def test_native_token_graph_replays_different_request_counts(
 
         owner._fork_select = MethodType(select, owner)
     owner._a8w4_attention_backend = MethodType(Attention._a8w4_attention_backend, owner)
-    owner._prepare_attention = MethodType(Attention._prepare_attention, owner)
-    owner._attend = MethodType(Attention._attend, owner)
+    for name in (
+        "_prepare_attention",
+        "_prepare_attention_live",
+        "_attention_inputs",
+        "_attend",
+    ):
+        setattr(owner, name, MethodType(getattr(Attention, name), owner))
+
+    preparation_calls = []
+    prepare_window = cache.rope_quant_window
+
+    def track_preparation(*args, **kwargs):
+        preparation_calls.append(torch.cuda.is_current_stream_capturing())
+        return prepare_window(*args, **kwargs)
+
+    monkeypatch.setattr(cache, "rope_quant_window", track_preparation)
 
     def forward(q, kv):
         return Attention.forward(owner, q, kv, cache, ctx.attn_metadata.step, rope)
@@ -314,6 +334,9 @@ def test_native_token_graph_replays_different_request_counts(
         prepare(requests)
         forward(query, kv)
     prepare(2)
+    if capture_empty:
+        ctx.attn_metadata.step.requests = ()
+    preparation_calls.clear()
     graph = TokenGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -325,10 +348,17 @@ def test_native_token_graph_replays_different_request_counts(
             ctx.in_hipgraph = False
         torch.cuda.current_stream().wait_stream(stream)
         ctx.main_stream = torch.cuda.current_stream()
+        live_preparation = cache_dtype == "fp8" or (cache_dtype == "fp4" and a8w4)
+        expected_capture = (
+            [] if capture_empty and live_preparation else [not live_preparation]
+        )
+        assert preparation_calls == expected_capture
         for requests in (2, 1, 2):
             fresh_q, fresh_kv = torch.randn_like(query), torch.randn_like(kv)
             prepare(requests)
+            preparation_calls.clear()
             got = graph.replay((fresh_q, fresh_kv)).clone()
+            assert preparation_calls == ([False] if live_preparation else [])
             prepare(requests)
             expected = forward(fresh_q, fresh_kv)
             torch.testing.assert_close(

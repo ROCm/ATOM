@@ -191,7 +191,13 @@ def test_native_and_plugin_use_same_sources_and_commit_order(
     else:
         scope = functions(
             "atom/models/deepseek_v41/attention.py",
-            ["forward", "_prepare_attention", "_attend"],
+            [
+                "forward",
+                "_prepare_attention",
+                "_prepare_attention_live",
+                "_attention_inputs",
+                "_attend",
+            ],
             scope,
             class_name="Attention",
         )
@@ -258,8 +264,13 @@ def test_native_and_plugin_use_same_sources_and_commit_order(
         result = torch.empty_like(query)
         scope["_attend_block"](model, result, None, None, cache, step, None, queries)
     else:
-        model._prepare_attention = MethodType(scope["_prepare_attention"], model)
-        model._attend = MethodType(scope["_attend"], model)
+        for name in (
+            "_prepare_attention",
+            "_prepare_attention_live",
+            "_attention_inputs",
+            "_attend",
+        ):
+            setattr(model, name, MethodType(scope[name], model))
         result = scope["forward"](model, None, None, cache, step, None, queries)
     assert events == ["prepare", "join"] + (
         ["commit", "attention"] if decode else ["attention", "commit"]
@@ -273,6 +284,39 @@ def test_native_and_plugin_use_same_sources_and_commit_order(
     index_call = queries.indices if bounded else cache.attention_indices
     assert index_call.call_args.kwargs == {"a8w4": True}
     assert torch.all(result == 3)
+
+
+@pytest.mark.parametrize(
+    "kv_fp8,backend", [(False, None), (False, "opus"), (True, None)]
+)
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("bounded", [False, True])
+def test_preparation_only_runs_live_for_variable_sources(
+    kv_fp8, backend, decode, bounded
+):
+    scope = functions(
+        "atom/models/deepseek_v41/attention.py",
+        ["_prepare_attention"],
+        class_name="Attention",
+    )
+    prepared = object()
+    model = SimpleNamespace(
+        _a8w4_attention_backend=Mock(return_value=backend),
+        _prepare_attention_live=Mock(),
+        _attention_inputs=Mock(return_value=prepared),
+    )
+    cache, step = SimpleNamespace(kv_fp8=kv_fp8), SimpleNamespace(decode=decode)
+    args = (object(), object(), cache, step, object(), object() if bounded else None)
+    result = scope["_prepare_attention"](model, *args)
+    live = bounded or (not decode and (kv_fp8 or backend is not None))
+    if live:
+        model._prepare_attention_live.assert_called_once_with(*args)
+        model._attention_inputs.assert_not_called()
+        assert result is None
+    else:
+        model._prepare_attention_live.assert_not_called()
+        model._attention_inputs.assert_called_once_with(*args)
+        assert result is prepared
 
 
 def test_bounded_queries_do_not_reuse_full_step_a8w4_indptrs():

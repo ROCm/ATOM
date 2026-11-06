@@ -432,29 +432,44 @@ class Attention(nn.Module):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        self._prepare_attention(query, kv_normed, cache, step, rope, queries)
+        prepared = self._prepare_attention(query, kv_normed, cache, step, rope, queries)
         # A forked compressor was already waited at the scorer; it is named
         # too because a TR recording holds every forked stream until it is
         # joined -- with or without a forked scorer (`ATOM_DSV41_SIDE_STREAMS`
         # 1 forks the compressor alone).
         join_stream(self.index_stream, self.compress_stream)
-        output = self._attend(query, cache, step, queries)
+        output = self._attend(query, cache, step, queries, prepared)
         return self._project_out(
             output.view_as(query),
             rope,
             cache.rope_positions(step) if queries is None else queries.positions,
         )
 
-    @eager_region(live=_live_rows)
     def _prepare_attention(self, query, kv_normed, cache, step, rope, queries):
-        """Prepare live Q/KV while the indexer runs on its side stream.
+        """Capture fixed-shape preparation; stage variable sources live.
 
-        Token buckets do not fix the request count or SWA tail offset. Keep
-        the prepared tensors on the live step until the attention region
-        consumes them, rather than returning capture-time source addresses.
+        A token bucket fixes ordinary BF16/fallback Q and current-KV buffers.
+        Quantized prefill also stages per-request SWA history, and bounded
+        replay may change the query rows, so those paths need live preparation.
         """
+        backend = self._a8w4_attention_backend(query, cache)
+        if queries is not None or (
+            not step.decode and (cache.kv_fp8 or backend is not None)
+        ):
+            self._prepare_attention_live(query, kv_normed, cache, step, rope, queries)
+            return None
+        return self._attention_inputs(query, kv_normed, cache, step, rope, queries)
+
+    @eager_region(live=_live_rows)
+    def _prepare_attention_live(self, query, kv_normed, cache, step, rope, queries):
+        """Keep request-dependent source addresses on the live step."""
         if not step.requests:
             return
+        step.attention_inputs = self._attention_inputs(
+            query, kv_normed, cache, step, rope, queries
+        )
+
+    def _attention_inputs(self, query, kv_normed, cache, step, rope, queries):
         a8w4_backend = self._a8w4_attention_backend(query, cache)
         a8w4 = a8w4_backend is not None
         query_fp8 = cache.query_fp8(query, a8w4=a8w4)
@@ -467,13 +482,15 @@ class Attention(nn.Module):
                 self.spec.layer_id, None, kv_normed, rope, step, a8w4=a8w4
             )
             cache.rotate_query(query, rope, queries.positions, query_fp8)
-        step.attention_inputs = (a8w4_backend, query_fp8, kv, window_kv)
+        return a8w4_backend, query_fp8, kv, window_kv
 
     @eager_region(live=_live_rows)
-    def _attend(self, query, cache, step, queries):
+    def _attend(self, query, cache, step, queries, prepared=None):
         if not step.requests:  # a dummy prefill on a token graph
             return query
-        a8w4_backend, query_fp8, kv, window_kv = step.attention_inputs
+        if prepared is None:
+            prepared = step.attention_inputs
+        a8w4_backend, query_fp8, kv, window_kv = prepared
         step.attention_inputs = None
         prefix, prefix_indptr, second, second_indptr = (
             cache.attention_indices(self.spec, step, a8w4=a8w4_backend is not None)
