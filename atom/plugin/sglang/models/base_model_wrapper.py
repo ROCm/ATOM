@@ -61,6 +61,45 @@ class _ComputeLogitsHeadAdapter(nn.Module):
         return self.model.compute_logits(hidden_states)
 
 
+class _VocabShardIndices:
+    def __init__(self, start: int, end: int) -> None:
+        self.org_vocab_start_index = start
+        self.org_vocab_end_index = end
+
+
+class _AtomDSparkLmHeadView(nn.Module):
+    """Present ATOM's sharded vocabulary head in SGLang's DSpark ABI.
+
+    The view keeps ATOM's parameter storage and only supplies the partition
+    metadata SGLang uses for the local matmul, vocab gather, and optional
+    Markov TP shard. It does not run ATOM's mHC reduction.
+    """
+
+    def __init__(self, head: nn.Module) -> None:
+        super().__init__()
+        self.head = head
+        self.quant_method = None
+        vocab_size = int(head.num_embeddings)
+        per_partition = int(head.num_embeddings_per_partition)
+        if per_partition * int(head.tp_size) != vocab_size:
+            raise RuntimeError(
+                "ATOM DSpark head partition does not cover the vocabulary: "
+                f"{per_partition} * {int(head.tp_size)} != {vocab_size}."
+            )
+        self.org_vocab_size = vocab_size
+        self.tp_size = int(head.tp_size)
+        self.num_embeddings_per_partition = per_partition
+        self.num_embeddings_padded = vocab_size
+        self.use_attn_tp_group = False
+        self.shard_indices = _VocabShardIndices(
+            int(head.vocab_start_idx), int(head.vocab_end_idx)
+        )
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.head.weight
+
+
 class _AtomCausalLMBaseForSglang(nn.Module):
     """Base ATOM model wrapper conforming to sglang's model interface.
 
@@ -244,6 +283,70 @@ class _AtomCausalLMBaseForSglang(nn.Module):
 
         embed_owner, head_owner = self._embed_and_head_owners()
         return embed_owner.embed_tokens.weight, head_owner.lm_head.weight
+
+    def get_dspark_shared_modules(self):
+        """Expose DeepSeek-V4 vocabulary modules to SGLang's DSpark draft.
+
+        DSpark shares the target embedding and the raw vocabulary projection
+        weight.  The ATOM outer wrapper intentionally has no ``lm_head``
+        attribute because its target forward also performs mHC reduction.
+        Returning the concrete modules avoids teaching SGLang to depend on
+        ATOM's internal model layout or accidentally reusing that target-only
+        reduction in the draft path.
+        """
+        if self.model_arch != "DeepseekV4ForCausalLM":
+            raise RuntimeError(
+                "ATOM DSpark module sharing is only supported for "
+                f"DeepseekV4ForCausalLM, got {self.model_arch!r}."
+            )
+        base = getattr(self.model, "model", None)
+        embed = getattr(base, "embed", None)
+        head = getattr(base, "head", None)
+        if embed is None or head is None or not hasattr(head, "weight"):
+            raise RuntimeError(
+                "ATOM DeepSeek-V4 target does not expose the embedding and "
+                "raw vocabulary head required by the SGLang DSpark draft."
+            )
+        return embed, _AtomDSparkLmHeadView(head)
+
+    def get_input_embeddings(self):
+        """Return the target embedding DSpark samples from when sharing weights."""
+        shared = getattr(self, "get_dspark_shared_modules", None)
+        if self.model_arch == "DeepseekV4ForCausalLM" and shared is not None:
+            return self.get_dspark_shared_modules()[0]
+        if hasattr(self.model, "get_input_embeddings"):
+            return self.model.get_input_embeddings()
+        embed_owner, _ = self._embed_and_head_owners()
+        return embed_owner.embed_tokens
+
+    def set_dspark_layers_to_capture(self, layer_ids: Iterable[int] | None = None):
+        """Capture the target layers DSpark uses as draft context.
+
+        SGLang calls this before the first forward. The ATOM V4 model returns
+        those completed layer states alongside its normal residual, and this
+        wrapper already forwards that second value as auxiliary hidden states.
+        """
+        if self.model_arch != "DeepseekV4ForCausalLM":
+            raise RuntimeError(
+                "ATOM DSpark layer capture is only supported for "
+                f"DeepseekV4ForCausalLM, got {self.model_arch!r}."
+            )
+        if layer_ids is None:
+            raise ValueError("DSPARK requires explicit layer_ids for aux hidden capture.")
+        inner = getattr(self.model, "model", None)
+        layers = getattr(inner, "layers", None)
+        if layers is None:
+            raise RuntimeError("ATOM DeepSeek-V4 model does not expose decoder layers.")
+        requested = tuple(int(layer_id) for layer_id in layer_ids)
+        if any(layer_id < 0 or layer_id >= len(layers) for layer_id in requested):
+            raise ValueError(
+                "DSPARK capture layer ids are outside the ATOM decoder: "
+                f"{requested}, num_layers={len(layers)}."
+            )
+        self.capture_aux_hidden_states = True
+        inner.dspark_capture_mask = tuple(
+            layer_id in requested for layer_id in range(len(layers))
+        )
 
     def _embed_and_head_owners(self):
         if hasattr(self.model, "language_model"):
@@ -474,13 +577,20 @@ class _AtomCausalLMBaseForSglang(nn.Module):
 
                 if self.pp_group.is_last_rank:
                     if self.model_arch == "DeepseekV4ForCausalLM":
+                        # DSpark stores the captured layer states. Passing the
+                        # final residual as hidden_states_before_norm would
+                        # replace those states in the logits output.
                         return self.logits_processor(
                             logits_input_ids,
                             hidden_states,
                             self.logits_head,
                             forward_batch,
                             aux_hidden_states=aux_hidden_states,
-                            hidden_states_before_norm=hidden_states,
+                            hidden_states_before_norm=(
+                                None
+                                if aux_hidden_states is not None
+                                else hidden_states
+                            ),
                         )
                     return self.logits_processor(
                         logits_input_ids,
