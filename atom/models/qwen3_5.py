@@ -90,6 +90,18 @@ def allreduce_norm_fusion_enabled() -> bool:
     return enabled
 
 
+def input_norm_all_reduces(
+    fuse_allreduce_norm: bool, layer_num: int, input_is_reduced: bool | None
+) -> bool:
+    """Whether a decoder layer's input_layernorm folds in the all-reduce of its
+    input: with the fusion on, unless the input is already complete on every
+    rank -- by default layer 0's (the embedding); the MTP drafter's layer (index
+    num_hidden_layers) reads the replicated fc output."""
+    if input_is_reduced is None:
+        input_is_reduced = layer_num == 0
+    return fuse_allreduce_norm and not input_is_reduced
+
+
 def get_qwen3_5_text_config(atom_config: Config):
     hf_config = atom_config.hf_config
     return hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
@@ -451,7 +463,11 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         prefix: str = "",
         layer_num: int = 0,
         fuse_allreduce_norm: bool = False,
+        input_is_reduced: bool | None = None,
     ) -> None:
+        """`input_is_reduced`: whether this layer's input is already complete on
+        every rank, so the input norm does not all-reduce. By default only layer
+        0's (the embedding); the MTP drafter's layer reads its replicated fc."""
         super(Qwen3NextDecoderLayer, self).__init__()
 
         config = get_qwen3_5_text_config(atom_config)
@@ -522,8 +538,9 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             eps=config.rms_norm_eps,
             quant_config=input_norm_quant,
             write_bf16=self.layer_type == "linear_attention",
-            # Layer 0's input is the embedding, already complete on every rank.
-            fused_allreduce=fuse_allreduce_norm and layer_num > 0,
+            fused_allreduce=input_norm_all_reduces(
+                fuse_allreduce_norm, layer_num, input_is_reduced
+            ),
         )
         self.post_attention_layernorm = Qwen3_5RMSNorm(
             config.hidden_size,
@@ -620,7 +637,15 @@ class Qwen3_5Model(Qwen3NextModel):
             eps=config.rms_norm_eps,
             fused_allreduce=fuse_allreduce_norm,
         )
-        defer_moe_gated_sums(self.layers, self.norm)
+        defer_moe_gated_sums(
+            self.layers,
+            self.norm,
+            tp_partial=envs.ATOM_FUSED_MOE_TAIL_AR_NORM_TARGET,
+        )
+        if envs.ATOM_QWEN_MONO_MOE:
+            from atom.model_ops.qwen_mono_moe.integration import enable_mono_moe
+
+            enable_mono_moe(self.layers, self.norm)
 
 
 _QWEN3_5_PACKED_MODULES_MAPPING = {

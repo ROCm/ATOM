@@ -78,7 +78,11 @@ from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
-from atom.model_ops.presence_penalty import PresencePenaltyState, PresencePenaltyStep
+from atom.model_ops.presence_penalty import (
+    DraftPresencePenalty,
+    PresencePenaltyState,
+    PresencePenaltyStep,
+)
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import (
     SAMPLER_EPS,
@@ -952,6 +956,10 @@ class ModelRunner:
             torch.set_default_device(None)
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
+            if envs.ATOM_MTP_DRAFT_PRESENCE_PENALTY:
+                self._install_draft_presence_penalty()
+            if envs.ATOM_MTP_DRAFT_LM_HEAD_FP8:
+                self._install_draft_lm_head_fp8()
             # A block drafter's width reads the loaded draft model's window.
             self.tokenID_processor.draft_tokens_per_seq = (
                 self.drafter.draft_tokens_per_seq
@@ -3375,6 +3383,12 @@ class ModelRunner:
         pens = getattr(batch, "presence_penalties", None)
         if pens is None or not np.any(pens != 0):
             return None
+        return self._ensure_presence_state().begin_step(batch, input_ids)
+
+    def _ensure_presence_state(self) -> PresencePenaltyState:
+        """The per-request generated-token masks, made once (on the first
+        penalized step, or before the draft passes are recorded with
+        ATOM_MTP_DRAFT_PRESENCE_PENALTY, which read the mask by address)."""
         if self._presence_state is None:
             if (
                 self.config.parallel_config.data_parallel_size > 1
@@ -3389,7 +3403,61 @@ class ModelRunner:
             self._presence_state = PresencePenaltyState(
                 vocab, self.config.max_num_seqs, max_extra=8, device=self.device
             )
-        return self._presence_state.begin_step(batch, input_ids)
+        return self._presence_state
+
+    def _install_draft_lm_head_fp8(self) -> None:
+        """ATOM_MTP_DRAFT_LM_HEAD_FP8: the draft passes' logits from an FP8 copy of
+        the draft LM head (`draft_lm_head_fp8.DraftLMHeadFP8`); TP1 heads only."""
+        from atom.model_ops.draft_lm_head_fp8 import DraftLMHeadFP8
+
+        drafter = getattr(self, "drafter", None)
+        head = getattr(getattr(drafter, "model", None), "lm_head", None)
+        if head is None or not hasattr(head, "compute_argmax_token"):
+            logger.warning(
+                "ATOM_MTP_DRAFT_LM_HEAD_FP8: no MTP draft LM head; not applied"
+            )
+            return
+        if getattr(head, "tp_size", 1) != 1 or head.bias is not None:
+            logger.warning(
+                "ATOM_MTP_DRAFT_LM_HEAD_FP8: TP %d / biased draft LM head; not applied",
+                getattr(head, "tp_size", 1),
+            )
+            return
+        head.draft_fp8 = DraftLMHeadFP8(head.weight.data)
+        logger.info(
+            "ATOM_MTP_DRAFT_LM_HEAD_FP8: draft logits from a %s FP8 copy (scales %s)",
+            tuple(head.draft_fp8.weight.shape),
+            tuple(head.draft_fp8.weight_scale.shape),
+        )
+
+    def _install_draft_presence_penalty(self) -> None:
+        """ATOM_MTP_DRAFT_PRESENCE_PENALTY: the draft LM head penalizes its argmax
+        as the verifier will (`presence_penalty.DraftPresencePenalty`)."""
+        drafter = getattr(self, "drafter", None)
+        head = getattr(getattr(drafter, "model", None), "lm_head", None)
+        mtp_k = getattr(drafter, "mtp_k", 0)
+        if head is None or not hasattr(head, "compute_argmax_token") or mtp_k <= 0:
+            logger.warning(
+                "ATOM_MTP_DRAFT_PRESENCE_PENALTY: no MTP draft LM head; not applied"
+            )
+            return
+        if getattr(head, "tp_size", 1) != 1:
+            logger.warning(
+                "ATOM_MTP_DRAFT_PRESENCE_PENALTY: TP %d draft LM head; not applied",
+                head.tp_size,
+            )
+            return
+        state = self._ensure_presence_state()
+        sizes = self.config.compilation_config.cudagraph_capture_sizes or []
+        rows = max([self.config.max_num_seqs, *sizes])
+        head.draft_presence = DraftPresencePenalty(state, rows, mtp_k, self.device)
+        drafter.draft_presence = head.draft_presence
+        logger.info(
+            "ATOM_MTP_DRAFT_PRESENCE_PENALTY: draft argmax penalized like the verify "
+            "rows (%d rows, %d drafts)",
+            rows,
+            mtp_k,
+        )
 
     def _greedy_ids_step(self, batch: ScheduledBatch | None, all_greedy: bool) -> bool:
         """Whether this step's LM head may hand back argmax ids instead of logits.
