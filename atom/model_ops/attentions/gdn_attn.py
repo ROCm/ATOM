@@ -1762,8 +1762,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         """
         pools = self._page_unit_pools()
         # Keyed on the pool objects, whose regions do not move while they are
-        # allocated: walking ~120 region tensors per call cost more than the
-        # step's copy bookkeeping.
+        # allocated (`release_kv_pools` drops it).
         cached = getattr(self, "_page_unit_region_cache", None)
         if (
             cached is not None

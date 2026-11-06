@@ -43,12 +43,10 @@ def qsa_cache_formats(atom_config) -> tuple[str, str]:
     return kv, index
 
 
-def qsa_caches_quantized(config) -> bool:
-    return qsa_cache_formats(config) != ("bf16", "bf16")
-
-
 def qsa_draft_rows(config) -> bool:
-    return bool(envs.ATOM_QSA_DRAFT_KV_BF16) and qsa_caches_quantized(config)
+    if not envs.ATOM_QSA_DRAFT_KV_BF16:
+        return False
+    return qsa_cache_formats(config) != ("bf16", "bf16")
 
 
 def qsa_row_space(config, layer_num: int, num_target_layers: int) -> str:
@@ -62,7 +60,7 @@ def qsa_caches_rope_positions(config) -> bool:
     # Image/video requests give mRoPE three genuinely different position rows,
     # and then a compressed key's group position cannot be recomputed
     # arithmetically. Cache the per-token axes only when the engine can
-    # actually be handed an image -- it costs ~1.4 GB of the paged budget.
+    # actually be handed an image: they take paged budget.
     return getattr(config, "multimodal_config", None) is not None
 
 

@@ -94,8 +94,8 @@ class KVConnectorFactory:
     # completion sets it is handed (`process_completions`). Absent means no.
     _offload: ClassVar[dict[str, bool]] = {}
     # Whether a backend stores and restores a PAGE checkpoint image, the
-    # per-request state behind a hybrid's pages (Qwen3.8's GDN and PLE).
-    # Absent means no: a model whose state rides that image refuses it.
+    # per-request state behind a hybrid's pages. Absent means no: a model
+    # whose state rides that image refuses it.
     _reads_page_images: ClassVar[dict[str, bool]] = {}
 
     @classmethod

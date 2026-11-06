@@ -68,7 +68,7 @@ class KVCacheTensor:
     # doing it. Whatever moves one must move the other.
     index_scale: torch.Tensor | None = None
     # Per-block planes a layer's pages carry beyond the fields above, in stored
-    # byte order (Qwen3.8's QSA side caches). Empty on most models.
+    # byte order.
     extra_planes: tuple[torch.Tensor, ...] = ()
     # ReplaySSM record buffers for linear-attention layers: this layer's slice
     # of the (k, u, g) pools.  None for every other attention type.  Carried
