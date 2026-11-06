@@ -139,6 +139,60 @@ CPU and disk contention exists too, and gets worse once P2's validation step nee
 
 ---
 
+## 0. Going live on ROCm/ATOM — the whole list
+
+Everything below is detail. This is what has to happen, and in what order.
+
+**The one hard gate: the workflow must be on `main`.** GitHub runs `issue_comment`
+workflows only from the default branch, so until ROCm/ATOM#2762 merges, nobody writing
+`atom-bot review` triggers anything — configured runner or not. Merging is the
+prerequisite for going live, not the result of it.
+
+**Three admin actions, none of which wait for the merge.** Do them now and they are
+ready when it lands:
+
+1. **Register a runner on ROCm/ATOM.** Needs **repo admin** on ROCm/ATOM (a `maintain`
+   or `push` role gets 403 from the registration-token endpoint). It coexists with
+   aiter's runner on the same box -- a repo-scoped runner serves one repo, so ATOM needs
+   its own service; what is shared is the machine, the GLM server and the disk, not the
+   runner.
+
+   ```bash
+   env -u GH_TOKEN -u GITHUB_TOKEN gh api -X POST \
+     repos/ROCm/ATOM/actions/runners/registration-token --jq .token
+
+   cd /mnt/raid0/zufa/atom-runner
+   ./config.sh --url https://github.com/ROCm/ATOM --token <token-from-above> \
+     --labels self-hosted,atom-bot --name srdc-8-atom-review --work _work \
+     --unattended --replace
+   ```
+
+   The labels are not cosmetic: the review job is `runs-on: [self-hosted, atom-bot]`.
+
+2. **Secret `ATOM_BOT_TOKEN`** (Settings -> Secrets and variables -> Actions -> Secrets)
+   = the token of whichever account posts. `rocm-atom-bot` is suspended by GitHub, so
+   this is currently `aiter-bot`'s token -- the same one ROCm/aiter already uses. Add it
+   directly; it never needs to leave GitHub or pass through anyone's workstation.
+
+   A classic PAT with `public_repo` is enough (both repos are public); a fine-grained PAT
+   needs **Pull requests: Read and write**. Repo permission `read` for the account is
+   sufficient to create a `COMMENT` review -- write access is not required.
+
+3. **Variable `ATOM_BOT_LOGIN`** = `aiter-bot`. Optional (the code defaults to it) but
+   set it anyway: it is what the dedup marker and the self-trigger guard key on, and an
+   explicit value is what makes a later account switch a one-field edit.
+
+**Then:** anyone on `authorized.txt` (109 logins) writes `atom-bot review` on a line of
+its own in a PR comment. No `@` needed -- the trigger is text, not a mention, and it
+matches `atom-bot review` whatever account answers. The reply will come from `aiter-bot`
+while that is the configured login; the trigger word and the answering account do not
+have to match.
+
+**What is still unproven at that point:** whether `aiter-bot`'s token can create a
+review. Nothing has exercised it yet -- aiter's own bot has posted zero reviews since
+its PR merged. The first run answers it, and answers it loudly: a refused post exits
+non-zero with the API's own words rather than failing quietly.
+
 ## 1. Register the runner (host only — needs your GitHub credentials)
 
 ### On srdc-24 (testing)
