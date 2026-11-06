@@ -1,0 +1,89 @@
+{
+  "name": "dsv41-dashboard-random-fp8-tp4",
+  "reference": {
+    "repository": "https://github.com/ROCm/ATOM",
+    "commit": "646da00fe322d28cb7971082d2a8af6905c57cd8",
+    "aiter_commit": "c90842add033fb3f9dbe0c6c53187a023faff1ee",
+    "run_url": "https://github.com/ROCm/ATOM/actions/runs/40724946700",
+    "summary_artifact_id": 12853757650,
+    "summary_artifact_sha256": "58028d07bbf4881a8a319e0e689667b0ae47fc047d9210b14370ff0645a382cf",
+    "catalog": ".github/benchmark/models.json",
+    "driver": ".github/scripts/atom_test.sh",
+    "scope": "Public random-serving configuration on the selected local source; not a reproduction of the public commit or its measured throughput."
+  },
+  "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+  "engine": {
+    "tensor_parallel_size": 4,
+    "data_parallel_size": 1,
+    "pipeline_parallel_size": 1,
+    "prefill_context_parallel_size": 1,
+    "decode_context_parallel_size": 1,
+    "kv_cache_dtype": "fp8",
+    "index_cache_dtype": "fp4",
+    "method": "dspark",
+    "num_speculative_tokens": 5,
+    "enable_expert_parallel": false,
+    "enable_dp_attention": false,
+    "max_num_seqs": 512,
+    "max_num_batched_tokens": 16384,
+    "attn_prefill_chunk_size": 16384,
+    "gpu_memory_utilization": 0.9,
+    "enable_prefix_caching": true,
+    "level": 3,
+    "cudagraph_mode": "FULL"
+  },
+  "benchmark": {
+    "backend": "vllm",
+    "dataset_name": "random",
+    "random_input_len": 8192,
+    "random_output_len": 1024,
+    "random_range_ratio": 0.8,
+    "max_concurrency": 256,
+    "num_prompts": 2560,
+    "num_warmups": 512,
+    "request_rate": "inf",
+    "ignore_eos": true,
+    "use_chat_template": true,
+    "trust_remote_code": true,
+    "seed": 0,
+    "percentile_metrics": "ttft,tpot,itl,e2el"
+  },
+  "environment": {
+    "AITER_LOG_LEVEL": "WARNING",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUNBUFFERED": "1"
+  },
+  "owner_execution": {
+    "capacity": "full",
+    "scope": "Opt-in FP8 TP4/EP1 owner plus retained prefill; no EP4, packed policy or stable performance/accuracy acceptance.",
+    "environment": {
+      "DSV41_FP8_OWNER_ENTRY": "1",
+      "DSV41_OWNER_SERVING": "1",
+      "DSV41_OWNER_STABLE_GRAPHS": "1",
+      "DSV41_OWNER_PACKET_PUBLICATION": "1",
+      "DSV41_OWNER_SELECTIVE_RECONCILIATION": "1",
+      "DSV41_OWNER_ACCEPTED_PREFILL": "1",
+      "ATOM_DSV41_ROW_SHARDED_MHC": "1",
+      "ATOM_DSV41_PREFILL_TAIL_MODE": "settled",
+      "ATOM_DSV41_PREFILL_TAIL_TRANSPORT": "packet",
+      "ATOM_DSV41_SIDE_STREAMS": "0",
+      "ATOM_DSV41_PREFILL_QUANTIZED_FFN": "1",
+      "ATOM_DSV41_PREFILL_LOCAL_ROUTER": "1",
+      "ATOM_DSV41_PREFILL_ROUTE_PACKET": "0",
+      "ATOM_DSV41_EP_PROFILED_PLACEMENT": "0",
+      "ATOM_DSV41_MHC_BACKEND": "hip",
+      "ATOM_LOADER_NUM_THREADS": "1",
+      "ATOM_SHUTDOWN_TIMEOUT_S": "30",
+      "ATOM_USE_TRITON_MOE": "0"
+    }
+  },
+  "acceptance": {
+    "synthetic_acceptance": false,
+    "fixed_query_rows": null,
+    "owner_ep4_enabled": false,
+    "performance_baseline": "same deployment, DSpark5 on both arms",
+    "mtp_stats_scope": "Native benchmark stats are cumulative and include warmup; not formal-only acceptance length.",
+    "executed_rows": "Must be measured from the actual target/draft and graph routes before kernel attribution; C256 does not imply M768."
+  }
+}
