@@ -200,7 +200,11 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
         f"but {rows} rows were gathered."
     )
     top_k = layer.top_k
-    topk_ids[:, top_k:] = total_topk_ids[:rows, top_k:]
+    # Routing has already marked padded and DP-dummy rows with -1. Restoring
+    # a shared id on those rows would make the gathered dummy run that expert.
+    topk_ids[:, top_k:] = torch.where(
+        topk_ids[:, :1] >= 0, total_topk_ids[:rows, top_k:], -1
+    )
 
 
 # Rows per CU up to which `triton_topk_softmax` is faster than AITER's

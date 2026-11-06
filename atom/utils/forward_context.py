@@ -553,7 +553,8 @@ class Context:
     # `scheduled_tokens` on the device (`[1]` int32), an entry of the step's
     # `forward_vars["batch_info"]` read in place, so a replay reads its own
     # step whatever shape it was recorded at. A draft re-points it with
-    # `scheduled_tokens` (`Drafter._publish_draft_shape`).
+    # `scheduled_tokens` (`Drafter._publish_draft_shape`). An idle DP dummy
+    # publishes zero here while retaining its placeholder execution shape.
     scheduled_tokens_gpu: torch.Tensor | None = None
 
     # Optional speculative-decoding inputs staged alongside the target

@@ -250,8 +250,8 @@ class tokenIDProcessor:
         )
         # [scheduled requests, scheduled tokens, scheduled draft tokens]: each
         # pass's real row count (its `Context.scheduled_tokens_gpu` is the
-        # entry). Not `cu_seqlens_q[-1]`: a token-graph bucket was recorded at
-        # its own request count.
+        # entry), zero on an idle DP placeholder. Not `cu_seqlens_q[-1]`: a
+        # token-graph bucket was recorded at its own request count.
         self.batch_info = CpuGpuBuffer(
             3, dtype=torch.int32, device=device, publication_group="input_ids"
         )
@@ -538,11 +538,18 @@ class tokenIDProcessor:
         `num_rejected`) reads the status.
         """
         bs = batch.total_seqs_num
-        self.batch_info.np[:] = (
-            bs,
-            batch.total_tokens_num,
-            bs * self.draft_tokens_per_seq,
-        )
+        # Keep the placeholder's execution shape for DP collectives, but route
+        # none of its target or draft rows. Publish through the same buffers a
+        # recorded graph reads, so real -> dummy -> real replays see each step's
+        # count without baking a rank-local Python branch into the graph.
+        if getattr(batch, "is_dp_dummy", False):
+            self.batch_info.np.fill(0)
+        else:
+            self.batch_info.np[:] = (
+                bs,
+                batch.total_tokens_num,
+                bs * self.draft_tokens_per_seq,
+            )
         input_ids, locs = self._stage_input_ids(batch, max_seqlen_q, publication_group)
         self.carries_over = locs is not None
         # The speculative status queue is filled in postprocess but drained here, so a
@@ -1408,6 +1415,7 @@ class ModelRunner:
                 total_seqs_num_prefill=int(prefill),
                 total_seqs_num_decode=int(not prefill),
                 is_dummy_run=True,
+                is_dp_dummy=True,
                 num_spec_step=mtp_k,
                 scheduled_spec_decode_tokens=(
                     {seq.id: np.zeros(mtp_k, dtype=np.int32)} if mtp_k else None
