@@ -7,7 +7,7 @@ import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import nn
 
-from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
+from atom.model_ops.deepseek_v41.mhc import SinglePassHCState, res_preshuffle_rows
 from atom.model_ops.engram.device.staging import EngramStagedRows
 from atom.utils.backends import set_model_tag
 from atom.utils.decorators import support_torch_compile
@@ -121,14 +121,48 @@ def v41_attention(
 # recorded segment cannot wait on that stream's events.
 @torch_compile_guard(mutates_args=[], gen_fake=_fake_layer_output)
 @eager_region()
-def v41_engram(residual: torch.Tensor, layer_name: str) -> torch.Tensor:
+def v41_engram(
+    residual: torch.Tensor, layer_name: str, res_preshuffle: bool = False
+) -> torch.Tensor:
     context = get_forward_context()
     metadata = context.attn_metadata
     if not metadata.step.requests:
         return residual.clone()
     layer, _ = context.no_compile_layers[layer_name]
     embeddings = metadata.engram_embeddings.get(layer.engram.layer_id)
-    return Block.engram_forward(layer, residual, embeddings, metadata.image_mask)
+    return Block.engram_forward(
+        layer, residual, embeddings, metadata.image_mask, res_preshuffle=res_preshuffle
+    )
+
+
+def _res_shuffled_forward(rows: int) -> bool:
+    """Whether this forward carries the shuffled residual: a decode step's
+    (no prefill, draft or TBO split, whose rows replays and microbatches cut).
+    Decided from the step and the row count alone, so a recorded graph and the
+    eager code around it agree."""
+    if not res_preshuffle_rows(rows):
+        return False
+    forward = get_forward_context()
+    context = forward.context
+    if (
+        context is None
+        or context.is_prefill
+        or context.is_draft
+        or forward.ubatch_slices is not None
+    ):
+        return False
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if tbo_active():
+        return False
+    global _RES_SHUFFLE_LOGGED
+    if not _RES_SHUFFLE_LOGGED:
+        _RES_SHUFFLE_LOGGED = True
+        logger.info("[ATOM_DSV41_RES_PRESHUFFLE] shuffled mHC residual: %d rows", rows)
+    return True
+
+
+_RES_SHUFFLE_LOGGED = False
 
 
 class RuntimeBlock(Block):
@@ -140,8 +174,8 @@ class RuntimeBlock(Block):
             return v41_attention(hidden, self.layer_name, hidden_fp8, hidden_scale)
         return v41_attention(normed, self.layer_name)
 
-    def engram_forward(self, residual, embeddings, image_mask):
-        return v41_engram(residual, self.layer_name)
+    def engram_forward(self, residual, embeddings, image_mask, res_preshuffle=False):
+        return v41_engram(residual, self.layer_name, res_preshuffle)
 
 
 class _Stage(nn.Module):
@@ -205,7 +239,13 @@ class _EarlyLayers(_Stage):
         m = self.owner
         hidden = (m.embed(input_ids) if inputs_embeds is None else inputs_embeds)[None]
         m.begin_forward(hidden, None)
-        state = self.run(SinglePassHCState.from_embeddings(hidden, m.config.hc_mult))
+        state = self.run(
+            SinglePassHCState.from_embeddings(
+                hidden,
+                m.config.hc_mult,
+                res_shuffled=_res_shuffled_forward(hidden.shape[-2]),
+            )
+        )
         return _rows_first(state.fields())
 
 
@@ -226,7 +266,8 @@ class _LateLayers(_Stage):
 
     def forward(self, residual, pre_mix, pending, post_mix, combination):
         state = SinglePassHCState(
-            *_batched((residual, pre_mix, pending, post_mix, combination))
+            *_batched((residual, pre_mix, pending, post_mix, combination)),
+            res_shuffled=_res_shuffled_forward(residual.shape[0]),
         )
         return _rows_first(self.run(state).fields())
 
@@ -349,13 +390,19 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         )
 
     def _late_layers(self, state):
-        return SinglePassHCState(*_batched(self.late(*_rows_first(state.fields()))))
+        return SinglePassHCState(
+            *_batched(self.late(*_rows_first(state.fields()))),
+            res_shuffled=state.res_shuffled,
+        )
 
     def forward(self, input_ids, positions, inputs_embeds=None):
         """Tensor-only serving entry; guarded ops read the live forward context."""
         if not self.replay:
             return self.backbone(input_ids, positions, inputs_embeds)
-        state = SinglePassHCState(*_batched(self.early(input_ids, inputs_embeds)))
+        early = self.early(input_ids, inputs_embeds)
+        state = SinglePassHCState(
+            *_batched(early), res_shuffled=_res_shuffled_forward(early[0].shape[0])
+        )
         forward, running_tokens = get_forward_context(), input_ids.numel()
         if replayable(forward, running_tokens):
             step = forward.attn_metadata.step
