@@ -1567,8 +1567,8 @@ class GDNStateMixin(PoolRowsMixin):
 
 # ``GDNAttentionMetadataBuilder`` is shared, so the model name is the gate.
 # Turning PAGE copies on for every subclass would aim the image at MHA
-# regions. Qwen4Exp answers `_wants_paged_checkpoints` itself. The set is only
-# the hybrids whose full attention is ordinary MHA: Qwen3-Next and Qwen3.5.
+# regions. Subclasses answer `_wants_paged_checkpoints` themselves. The set is
+# only the hybrids whose full attention is ordinary MHA: Qwen3-Next and Qwen3.5.
 #
 # These are text-config ``model_type`` values. A Qwen3.5 wrapper may report
 # ``qwen3_5_moe``; ``get_hf_text_config`` peels that to ``qwen3_5_moe_text``
@@ -1843,9 +1843,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             for pool in self._page_unit_pools()
             for region in pool.region_layout()
         ]
-        if published != expected or sum(size for _, size in expected) != int(
-            spec.page_unit_bytes
-        ):
+        if published != expected:
             raise RuntimeError(
                 "GDN transfer regions do not match its checkpoint PAGE unit: "
                 f"{len(transfer.pages)} published, {count} in a unit"

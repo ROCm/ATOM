@@ -165,16 +165,21 @@ def test_gdn_linear_model_offload_uses_the_page_image_tier(model_type):
     assert offcfg.select_offload_layout(config) == "qwen"
 
 
-def test_qwen38_offload_uses_the_qwen_tier():
-    # Text config, not the wrapper name: `get_hf_text_config` peels it.
-    # `dense` must still be refused, or QSA KV comes back over a stale slot.
+def _qwen38_config(*, image_input: bool):
     config = _config()
     config.hf_config.compress_ratios = None
     config.hf_config.model_type = "qwen4_exp"
     config.hf_config.text_config = SimpleNamespace(
-        model_type="qwen4_exp_text",
-        num_attention_heads=32,
+        model_type="qwen4_exp_text", num_attention_heads=32
     )
+    config.multimodal_config = SimpleNamespace() if image_input else None
+    return config
+
+
+def test_qwen38_offload_uses_the_qwen_tier():
+    # Text config, not the wrapper name: `get_hf_text_config` peels it.
+    # `dense` must still be refused, or QSA KV comes back over a stale slot.
+    config = _qwen38_config(image_input=False)
 
     assert offcfg.select_offload_layout(config) == "qwen"
     config.kv_transfer_config = {"offload_layout": "dense"}
@@ -215,17 +220,6 @@ def test_gdn_page_namespace_names_ordinary_mha_pages(model_type):
     config.kv_transfer_config = {"offload_layout": "dense"}
     with pytest.raises(ValueError, match="owns no tier"):
         offcfg.build_page_namespace(config, _lmcache_config(), 4)
-
-
-def _qwen38_config(*, image_input: bool):
-    config = _config()
-    config.hf_config.compress_ratios = None
-    config.hf_config.model_type = "qwen4_exp"
-    config.hf_config.text_config = SimpleNamespace(
-        model_type="qwen4_exp_text", num_attention_heads=32
-    )
-    config.multimodal_config = SimpleNamespace() if image_input else None
-    return config
 
 
 def test_qwen38_page_namespace_separates_image_input():

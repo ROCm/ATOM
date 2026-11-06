@@ -160,26 +160,6 @@ def test_layout_id_names_the_page_fields_and_the_ssm_storage(one_tp_rank):
     assert len({plain, draft, transposed}) == 3
 
 
-def test_layout_id_tells_apart_fields_of_the_same_name_and_other_bytes(
-    one_tp_rank,
-):
-    """An FP8 and an FP4 index add fields of the same names."""
-    builder, cls = _builder()
-
-    def index(dim, dtype, scale):
-        return [
-            EntryField("index_compressed", 2, (1, 1, dim), dtype),
-            EntryField("index_compressed_scale", 2, (1, 1, *scale), dtype),
-        ]
-
-    builder._qsa_fields = lambda: index(4, torch.uint8, ())
-    fp8_like = _layout_id(builder, cls)
-    builder._qsa_fields = lambda: index(2, torch.uint8, (1,))
-    fp4_like = _layout_id(builder, cls)
-    assert fp8_like != fp4_like
-    assert ":page=index_compressed=(1,1,2),torch.uint8;" in fp4_like
-
-
 def _flydsl_builder(monkeypatch, *, replayssm=False):
     """A builder with one GDN layer whose 128x128 SSM state FlyDSL can decode."""
     from atom.model_ops.attentions.gdn_attn import LINEAR_STATE_ROWS

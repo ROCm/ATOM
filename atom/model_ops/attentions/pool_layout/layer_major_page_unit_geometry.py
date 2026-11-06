@@ -5,10 +5,10 @@
 
 The layer-major counterpart of ``page_unit_geometry``. That module is a mixin
 over an MLA cache ``(rows, blocks, block_size, entry)`` and only
-``_KimiMLAGDNCommon`` mixes it in. A layer-major pool -- ``MhaKvPool``, or the
-QSA arena's ``LayerMajorArena`` -- publishes one contiguous region per field per
-layer, with alignment padding between fields that is not a region, so these
-are free functions over the pool's ``region_tensors`` rather than methods on
+``_KimiMLAGDNCommon`` mixes it in. A layer-major pool -- ``MhaKvPool`` or a
+``LayerMajorArena`` -- publishes one contiguous region per field per layer, with
+alignment padding between fields that is not a region, so these are free
+functions over the pool's ``region_tensors`` rather than methods on
 ``self.model_runner``.
 
 ``GDNAttentionMetadataBuilder`` is the caller, the same role
@@ -123,11 +123,10 @@ def layer_major_page_unit_views(
 ) -> list[torch.Tensor]:
     """Tensor views of one checkpoint image, unit major and region minor.
 
-    The layer-major counterpart of
-    ``PageUnitGeometryMixin.page_unit_views``. The
-    in-process state tier packs these and later unpacks the same byte stream
-    into an Active Slot. Order matches ``layer_major_page_unit_bases``. A whole unit
-    is ``ceil(image / unit)`` scheduler blocks, so the tail past
+    The layer-major counterpart of ``PageUnitGeometryMixin.page_unit_views``.
+    The in-process state tier packs these and later unpacks the same byte
+    stream into an Active Slot. Order matches ``layer_major_page_unit_bases``.
+    A whole unit is ``ceil(image / unit)`` scheduler blocks, so the tail past
     ``image_bytes`` is padding and must not be offered to the packer.
     """
 

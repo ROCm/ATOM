@@ -36,6 +36,7 @@ from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_ops.fla_ops.gdn_flydsl import select_policy
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_cache_row_layout,
     qsa_compressed_slots,
@@ -193,8 +194,6 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     BACKEND = Qwen4ExpBackend
 
     def _gdn_flydsl_policy(self, module, state):
-        from atom.model_ops.fla_ops.gdn_flydsl import select_policy
-
         attention = module.impl
         return select_policy(
             allowed=attention.allow_aiter_flydsl,
@@ -459,21 +458,17 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             [(f.name, f.shape, f.dtype) for f in self._qsa_fields()],
             [(p.tag, p.shape, p.dtype) for p in planes],
         )
-        if not (planes and transfer.readable_midstep):
-            return replace(transfer, paged_layout_id=layout_id)
-        # Nothing snapshots the PLE windows inside a forward, so prefill stays
-        # cut onto rungs.
-        logger.warning(
-            "ATOM_GDN_STATE_MIDSTEP=1 does not apply to Qwen3.8: its PLE "
-            "windows are checkpointed only where a forward ends"
-        )
-        return replace(
-            transfer,
-            paged_layout_id=layout_id,
-            readable_midstep=False,
-            midstep_grid=0,
-            midstep_min_offset=0,
-        )
+        if planes and transfer.readable_midstep:
+            # Nothing snapshots the PLE windows inside a forward, so prefill
+            # stays cut onto rungs.
+            logger.warning(
+                "ATOM_GDN_STATE_MIDSTEP=1 does not apply to Qwen3.8: its PLE "
+                "windows are checkpointed only where a forward ends"
+            )
+            transfer = replace(
+                transfer, readable_midstep=False, midstep_grid=0, midstep_min_offset=0
+            )
+        return replace(transfer, paged_layout_id=layout_id)
 
     def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
         return super()._checkpoint_plane_shapes() + [
@@ -576,19 +571,11 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             name += sfx
             return arena.view(name)[row] if name in names else None
 
-        key, value, k_scale, v_scale, raw, compressed, rope, compressed_scale = map(
-            optional,
-            (
-                "k",
-                "v",
-                "k_scale",
-                "v_scale",
-                "index_raw",
-                "index_compressed",
-                "rope_positions",
-                "index_compressed_scale",
-            ),
-        )
+        key, value = optional("k"), optional("v")
+        k_scale, v_scale = optional("k_scale"), optional("v_scale")
+        raw, compressed = optional("index_raw"), optional("index_compressed")
+        rope = optional("rope_positions")
+        compressed_scale = optional("index_compressed_scale")
         module.bind_caches(
             key,
             value,

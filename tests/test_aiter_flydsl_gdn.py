@@ -268,9 +268,8 @@ def test_qwen_backend_binds_zero_copy_vk_state(
     )
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     builder.replayssm = replayssm
-    # No offload configured: binding has no checkpoint layout id to agree with.
-    monkeypatch.setattr(
-        Qwen4ExpMetadataBuilder, "_uses_paged_checkpoints", lambda self: False
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(kv_transfer_config=None)
     )
     from atom.utils import envs
 
@@ -415,9 +414,8 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
         setattr(attention, name, value)
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     builder.replayssm = mode == "replayssm"
-    # No offload configured: binding has no checkpoint layout id to agree with.
-    monkeypatch.setattr(
-        Qwen4ExpMetadataBuilder, "_uses_paged_checkpoints", lambda self: False
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(kv_transfer_config=None)
     )
     monkeypatch.setattr(envs, "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", False)
     monkeypatch.setattr(
