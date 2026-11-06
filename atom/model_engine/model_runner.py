@@ -774,6 +774,8 @@ def _profile_runner_stage(method):
 
 
 class ModelRunner:
+    gemm_fusion = None
+
     def __init__(self, rank: int, config: Config):
         self.config = config
         self.structured_output = None
@@ -903,6 +905,9 @@ class ModelRunner:
         self._build_and_load_model(model_class)
         # After weight processing, before warmup and capture. Here rather than in
         # the loader so a runner that builds its model differently still sets it.
+        from atom.model_ops.gemm_fusion import initialize_gemm_fusion
+
+        self.gemm_fusion = initialize_gemm_fusion(self.model, config)
         from atom.model_ops.fused_moe.sp_mega_moe import initialize_sp_mega_moe
 
         self.sp_mega_moe = initialize_sp_mega_moe(self.model, config)
@@ -1215,9 +1220,13 @@ class ModelRunner:
         if builder is not None:
             builder.close()
         # MegaMoE's arenas live on the EP all2all manager's cco communicator,
-        # and SP MegaMoE's runtime on the SP group; destroy_dist_env() destroys
-        # both. A close error propagates once the rest of the teardown has run.
+        # and the SP MegaMoE and gemm_fusion runtimes on the SP group;
+        # destroy_dist_env() destroys both. A close error propagates once the
+        # rest of the teardown has run.
         try:
+            gemm_fusion = getattr(self, "gemm_fusion", None)
+            if gemm_fusion is not None:
+                gemm_fusion.close()
             sp_mega_moe = getattr(self, "sp_mega_moe", None)
             if sp_mega_moe is not None:
                 sp_mega_moe.close()
@@ -2355,6 +2364,8 @@ class ModelRunner:
             transfer_tensors,
             num_blocks=num_kvcache_blocks,
         )
+        if self.gemm_fusion is not None:
+            self.gemm_fusion.prepare(kv_cache_data)
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
@@ -3185,6 +3196,8 @@ class ModelRunner:
                 input_ids, positions, _pcp_bal_groups, _pcp_size, forward_context
             )
 
+        if self.gemm_fusion is not None:
+            self.gemm_fusion.before_step()
         if self.sp_mega_moe is not None:
             self.sp_mega_moe.before_step(sp_local_len(forward_mode.running_tokens))
 
@@ -4460,6 +4473,8 @@ class ModelRunner:
                     end_draft_trace if prof is not None else None,
                 )
             self._record_prefill_graphs()
+        if self.gemm_fusion is not None:
+            self.gemm_fusion.clean_point()
         self.capture_sizes.sort()
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
 

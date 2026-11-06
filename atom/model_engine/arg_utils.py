@@ -171,6 +171,7 @@ class EngineArgs:
     enable_tbo: str | None = None
     all2all_backend: str | None = None
     moe_backend: str = "standard"
+    gemm_fusion_profile: str | None = None
     method: str | None = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
@@ -441,6 +442,14 @@ class EngineArgs:
             help="MoE implementation. 'standard' uses the existing "
             "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE, "
             "or AITER MegaMoeTP under --sequence-parallel-size.",
+        )
+        parser.add_argument(
+            "--gemm-fusion-profile",
+            type=str,
+            default=None,
+            help="AITER gemm_fusion profile (e.g. minimax_m3_sp4_gfx950_v1) "
+            "that fuses the attention QKV GEMM with the Ulysses SP exchange. "
+            "Requires --sequence-parallel-size > 1. Default: off.",
         )
         parser.add_argument(
             "--method",

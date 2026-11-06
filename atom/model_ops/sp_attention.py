@@ -41,26 +41,30 @@ def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
     # The impl's declared fields cover the fused qkv, indexer columns included.
     source = torch.cat([query, key, value], -1) if qkv is None else qkv
     packed = exchange_columns(source, get_pcp_group(), attn.sp_columns)
+    out = attend_exchanged(attn, packed, positions, q_scale, qkv is not None)
+    return out, packed.shape[0]
 
+
+def attend_exchanged(attn, packed, positions, q_scale=None, fused_qkv=True):
+    """Run the impl on ``packed``, this rank's head columns of the whole
+    (possibly padded) sequence as `exchange_columns` lays them out."""
     # Global positions and attention metadata exclude the divisibility pad.
     real_tokens = positions.shape[-1]
-    padded_tokens = packed.shape[0]
-    if real_tokens < padded_tokens:
+    if real_tokens < packed.shape[0]:
         packed = packed[:real_tokens]
 
     # Attention accepts column views, so avoid another Q/K/V copy.
     q_width = attn.num_heads * attn.head_dim
     kv_width = attn.num_kv_heads * attn.head_dim
-    out = attn.impl.forward(
+    return attn.impl.forward(
         query=packed[:, :q_width],
         key=packed[:, q_width : q_width + kv_width],
         value=packed[:, q_width + kv_width : q_width + 2 * kv_width],
         position=positions,
         q_scale=q_scale,
         # Preserve the caller's choice of fused or separate Q/K/V kernels.
-        qkv=packed if qkv is not None else None,
+        qkv=packed if fused_qkv else None,
     )
-    return out, padded_tokens
 
 
 def head_exchange_comm(group):
