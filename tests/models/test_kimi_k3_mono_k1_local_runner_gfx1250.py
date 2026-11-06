@@ -34,7 +34,7 @@ def _spec():
     return builder.K1LocalBuildSpec(
         qlen=1,
         delta=True,
-        state_len=4,
+        state_len=3,
         eps=1e-5,
         out_eps=1e-5,
         onorm_eps=1e-5,
@@ -100,9 +100,7 @@ def test_product_runner_packs_exact_local_abi_and_owns_scratch():
         declaration=declaration,
         launch_count=1,
     )
-    runner = Gfx1250K1LocalRunner(plan, _spec(), result).prepare(
-        torch.device("cpu")
-    )
+    runner = Gfx1250K1LocalRunner(plan, _spec(), result).prepare(torch.device("cpu"))
     runtime = _runtime()
 
     assert runner._scratch is not None

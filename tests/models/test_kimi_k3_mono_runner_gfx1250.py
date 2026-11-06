@@ -3,6 +3,7 @@
 """CPU-only contracts for gfx1250 Kimi runner admission and compilation."""
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -71,7 +72,7 @@ def test_width_build_replaces_only_spilled_k1_with_lean_gemv():
     spec = K1LocalBuildSpec(
         qlen=1,
         delta=True,
-        state_len=4,
+        state_len=3,
         eps=1e-5,
         out_eps=1e-5,
         onorm_eps=1e-5,
@@ -117,6 +118,14 @@ def test_resident_resource_hazards_include_explicit_spills(monkeypatch):
         "2 vgpr spill",
         "3 sgpr spill",
     )
+
+
+def test_k2_uses_the_production_tp_all_reduce_dispatch():
+    source = (
+        Path(__file__).parents[2] / "atom/models/kimi_k3/mono/runner_gfx1250.py"
+    ).read_text()
+    assert "tp_group.all_reduce(tensor, ca_fp8_quant=False)" in source
+    assert "torch.distributed.all_reduce(" not in source
 
 
 def test_runner_admits_only_supported_rows_and_query_lengths():

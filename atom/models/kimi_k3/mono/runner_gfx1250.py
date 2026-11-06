@@ -302,8 +302,11 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             return tp_group.all_gather(tensor, dim=0, use_custom=False)
 
         def all_reduce(tensor: torch.Tensor) -> torch.Tensor:
-            torch.distributed.all_reduce(tensor, group=tp_group.device_group)
-            return tensor
+            # Match the production TP path: this selects the best available
+            # small-message backend (LL/custom AR, symmetric memory, or RCCL)
+            # and falls back safely.  Calling torch.distributed directly here
+            # forced every K2 boundary onto generic cross-node RCCL.
+            return tp_group.all_reduce(tensor, ca_fp8_quant=False)
 
         runner = ExternalCollectiveK2Runner(
             ExternalCollectivePlan(rows),

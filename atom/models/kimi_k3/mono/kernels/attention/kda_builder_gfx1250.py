@@ -353,10 +353,14 @@ class K1LocalBuildSpec:
             raise TypeError("local K1 delta must be bool")
         if self.debug:
             raise ValueError("resident gfx1250 K1 does not expose debug taps")
-        if self.state_len < self.qlen + 3:
+        # ATOM's conv pool keeps ``kernel - 1 + num_spec`` entries.  The
+        # three-tap history starts at ``acc_idx <= qlen - 1`` and ends at
+        # ``acc_idx + 2 <= qlen + 1``, so qlen + 2 entries cover every
+        # accepted-token count.
+        if self.state_len < self.qlen + 2:
             raise ValueError(
-                "local K1 state_len must cover qlen plus the three-entry "
-                "causal-convolution history"
+                "local K1 state_len must cover qlen plus the two retained "
+                "history entries"
             )
         for name, value in (
             ("eps", self.eps),
@@ -378,9 +382,7 @@ class K1LocalBuildSpec:
         if self.gemv_unit not in (1, 2):
             raise ValueError("local K1 gemv_unit must be 1 or 2")
         if self.timeline:
-            raise ValueError(
-                "local K1 resident kernel does not expose timeline taps"
-            )
+            raise ValueError("local K1 resident kernel does not expose timeline taps")
 
     @property
     def stage_order(self) -> tuple[str, ...]:
@@ -428,8 +430,7 @@ def role_lds_plan(
     contract = plan.kda_matrix_contract()
     groups = contract.projection_groups
     slabs = tuple(
-        (first, min(gemv_unit, groups - first))
-        for first in range(0, groups, gemv_unit)
+        (first, min(gemv_unit, groups - first)) for first in range(0, groups, gemv_unit)
     )
     widest_groups = max(groups for _, groups in slabs)
     xrow = widest_groups * contract.group_columns + LDS_PAD

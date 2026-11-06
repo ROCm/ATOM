@@ -29,7 +29,7 @@ def _spec(qlen=16):
     return builder.K1LocalBuildSpec(
         qlen=qlen,
         delta=True,
-        state_len=qlen + 3,
+        state_len=qlen + 2,
         eps=1e-5,
         out_eps=1e-5,
         onorm_eps=1e-5,
@@ -116,9 +116,9 @@ def test_resident_launch_pins_one_eight_wave_cta_per_cu():
         / "kda_resident_gfx1250.py"
     ).read_text()
     assert 'CompilationContext.compile_hints({"waves_per_eu": 2})' in source
-    generation = source[source.index("def _opening_generation") : source.index(
-        "def _task_start"
-    )]
+    generation = source[
+        source.index("def _opening_generation") : source.index("def _task_start")
+    ]
     load = generation.index("generation = fx.ptr_load(ticket)")
     barrier = generation.index("gpu.barrier()", load)
     returned = generation.index("return generation", barrier)
@@ -136,3 +136,10 @@ def test_resident_launch_pins_one_eight_wave_cta_per_cu():
 def test_resident_attention_refuses_more_than_sixteen_sources():
     with pytest.raises(ValueError, match="at most 16 sources"):
         builder.declare_local(replace(_plan(), nblocks=16), qlen=16)
+
+
+def test_local_build_accepts_the_production_conv_window():
+    plan = _plan()
+    _spec(qlen=16).validate(plan)
+    with pytest.raises(ValueError, match="two retained history"):
+        replace(_spec(qlen=16), state_len=17).validate(plan)
