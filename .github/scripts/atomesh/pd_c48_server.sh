@@ -47,7 +47,7 @@ PY
 }
 
 # Install the pinned ROCm Mooncake wheel (the workflow downloads it) over the
-# image, and on Prefill start the embedded Store's master when the case has one.
+# image, and on Prefill start the Store's master (and its owners, for a standalone-store case) when the case has one.
 # A case without a wheel uses the image's Mooncake.
 c48_start_mooncake() {
   local role="$1" config="$2" site="/tmp/atomesh-c48-mooncake"
@@ -87,13 +87,19 @@ print(json.dumps({**c, "master_server_address": "127.0.0.1:" + sys.argv[2]}))' "
     sleep 1
   done
   echo "[mooncake] master pid=${mooncake_master_pid} port=${master_port} config=$(cat "${MOONCAKE_CONFIG_PATH}")"
-  # Patched cases prepare from the worker after loading; stock ones before vLLM starts, as an SA setup_script would,
-  # unless the case sets store_memory_prep false to run the image with no setup at all.
-  [[ "${wheel}" == - && "${prep}" == 1 ]] || return 0
-  python3 "${ATOMESH_SCRIPT_DIR}/store_memory_prep.py" "$(python3 -c 'import json, sys
+  # Patched cases prepare from the worker after loading; stock ones before vLLM starts (and before the owners mount),
+  # as an SA setup_script would, unless the case sets store_memory_prep false to run the image with no setup at all.
+  if [[ "${wheel}" == - && "${prep}" == 1 ]]; then
+    python3 "${ATOMESH_SCRIPT_DIR}/store_memory_prep.py" "$(python3 -c 'import json, sys
 c = json.load(open(sys.argv[1]))
-print(c["mooncake"]["store"]["global_segment_size"] * c["roles"]["prefill"]["args"]["tensor-parallel-size"])' "${config}")" \
-    "$(dirname "$(dirname "${MODEL_PATH}")")"
+o = c["mooncake"].get("store_owners")
+print(len(o["devices"]) * o["segment_size"] if o else
+      c["mooncake"]["store"]["global_segment_size"] * c["roles"]["prefill"]["args"]["tensor-parallel-size"])' "${config}")" \
+      "$(dirname "$(dirname "${MODEL_PATH}")")" || return $?
+  fi
+  python3 -c 'import json, sys; sys.exit("store_owners" not in json.load(open(sys.argv[1]))["mooncake"])' "${config}" || return 0
+  python3 "${ATOMESH_SCRIPT_DIR}/store_owners.py" "${config}" "${site}/mooncake/mooncake_client" "${host_ip}" \
+    "${master_port}" $((19151 + ATOMESH_SERVICE_PORT_OFFSET)) $((19251 + ATOMESH_SERVICE_PORT_OFFSET)) "${RUNTIME_LOG_DIR}"
 }
 
 if [[ "${ATOMESH_C48_CASE}" == *-MC ]]; then
