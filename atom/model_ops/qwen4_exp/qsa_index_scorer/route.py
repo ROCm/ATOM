@@ -537,7 +537,8 @@ class QSAScorerRoute:
         #: class key -> (reason, detail, aiter Decision when aiter serves the
         #: class else None, counts key (path, reason)).
         self._decisions: dict[tuple, tuple] = {}
-        self._logged: set[str] = set()
+        #: (reason, path or None) already logged.
+        self._logged: set[tuple[str, str | None]] = set()
         #: (path, reason) -> calls; path in :data:`PATHS`.
         self.counts: collections.Counter = collections.Counter()
         self.decide_calls = 0
@@ -588,11 +589,14 @@ class QSAScorerRoute:
         self.pinned = (reason, detail)
         self._log_once(reason, detail, warn=reason != CAPTURE_ONLY)
 
-    def _log_once(self, reason: str, detail: str, warn: bool = False) -> None:
-        if reason in self._logged:
+    def _log_once(
+        self, reason: str, detail: str, warn: bool = False, path: str | None = None
+    ) -> None:
+        if (reason, path) in self._logged:
             return
-        self._logged.add(reason)
-        path = FUSED if reason == OK else STOCK
+        self._logged.add((reason, path))
+        if path is None:
+            path = FUSED if reason == OK else STOCK
         (logger.warning if warn else logger.info)(
             "QSA index scorer [%s] -> %s (%s)%s",
             self.site,
@@ -693,7 +697,7 @@ class QSAScorerRoute:
             entry = (reason, detail, None, (STOCK, reason))
         if entry[3] != FUSED_OK:
             # Logged here, once: every later call of the class is a cache hit.
-            self._log_once(reason, detail)
+            self._log_once(reason, detail, path=entry[3][0])
         if len(self._decisions) >= MAX_CACHED_DECISIONS:
             self._decisions.clear()
         self._decisions[key] = entry
@@ -858,7 +862,7 @@ class QSAScorerRoute:
                                 compressed_k_scale,
                             )
                         self.counts[count_key] += 1
-                        if OK not in self._logged and count_key is FUSED_OK:
+                        if (OK, None) not in self._logged and count_key is FUSED_OK:
                             self._log_once(OK, entry[1])
                         return out
                     reason, count_key = OK, (STOCK, OK)
