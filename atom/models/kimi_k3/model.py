@@ -68,6 +68,7 @@ from atom.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    pp_holds_embedding,
 )
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs, mark_spliting_op
@@ -1808,12 +1809,7 @@ class KimiLinearModel(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
 
-        # The drafter runs on the last stage and shares this table, and not
-        # every draft checkpoint (Kimi-K3.1-DSpark) ships its own.
-        pp = get_pp_group()
-        if pp.is_first_rank or (
-            pp.is_last_rank and atom_config.speculative_config is not None
-        ):
+        if pp_holds_embedding(atom_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size, config.hidden_size
             )

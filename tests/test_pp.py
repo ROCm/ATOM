@@ -66,6 +66,7 @@ from atom.models.utils import (
     PPMissingLayer,
     get_pp_indices,
     make_layers,
+    pp_holds_embedding,
 )
 from tests.conftest import MockConfig
 
@@ -205,6 +206,28 @@ def test_send_packs_only_proxy_keys_to_group_relative_next(monkeypatch):
     assert set(sent["tensors"].keys()) == {"hidden_states", "residual"}
     assert sent["dst"] == 1
     assert torch.equal(sent["tensors"]["hidden_states"], torch.ones(3, 4))
+
+
+@pytest.mark.parametrize(
+    "pp_rank,pp_size,speculative,holds",
+    [
+        (0, 2, False, True),
+        (0, 2, True, True),
+        (1, 2, False, False),
+        # The last stage's drafter shares the target's embedding.
+        (1, 2, True, True),
+        (1, 4, True, False),
+        (3, 4, True, True),
+        (0, 1, True, True),
+    ],
+)
+def test_pp_holds_embedding(monkeypatch, pp_rank, pp_size, speculative, holds):
+    grp = MagicMock(is_first_rank=pp_rank == 0, is_last_rank=pp_rank == pp_size - 1)
+    fake_ps = MagicMock()
+    fake_ps.get_pp_group.return_value = grp
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", fake_ps)
+    config = types.SimpleNamespace(speculative_config=object() if speculative else None)
+    assert pp_holds_embedding(config) is holds
 
 
 def test_send_tolerates_missing_residual(monkeypatch):
