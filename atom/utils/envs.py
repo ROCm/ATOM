@@ -998,6 +998,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_API_OFFLOAD_PREPROCESS": lambda: (
         os.getenv("ATOM_API_OFFLOAD_PREPROCESS", "0") == "1"
     ),
+    # With ATOM_API_OFFLOAD_PREPROCESS: host memory (MB) each tokenize worker
+    # keeps for a `segment_tokenizer.SegmentTokenizer`, and chat completions
+    # carrying a session header (X-Session-ID and the like) go to the worker
+    # that session hashes to, so a conversation's next turn re-encodes only
+    # what it added. 0 (default): every worker encodes whole prompts and any
+    # worker takes any request.
+    "ATOM_API_OFFLOAD_TOKENIZE_CACHE_MB": lambda: int(
+        os.getenv("ATOM_API_OFFLOAD_TOKENIZE_CACHE_MB", "0")
+    ),
     # Cheaper SSE streaming of chat completions on the API event loop: the stream
     # detokenizer decodes through the Rust tokenizer directly once a startup
     # probe shows it returns what `tokenizer.decode` does, and every SSE event

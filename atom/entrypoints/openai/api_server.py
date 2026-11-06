@@ -2100,7 +2100,8 @@ class _OffloadedChatRoute:
             body = await request.body()
         except Exception:  # noqa: BLE001  # answered below, as FastAPI does
             body = None
-        prepared = None if not body else await offload.prepare(body)
+        key = _offload_session_key(request)
+        prepared = None if not body else await offload.prepare(body, key)
         if prepared is None and body is not None:
             await self.route_app(scope, _replayed_body(body, receive), send)
             return
@@ -2114,6 +2115,20 @@ class _OffloadedChatRoute:
 
         # The exception handlers FastAPI's route app runs a handler under.
         await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+
+
+def _offload_session_key(request) -> str | None:
+    """The session a chat completion belongs to, for the tokenize pool's
+    routing (ATOM_API_OFFLOAD_TOKENIZE_CACHE_MB): the same headers DP session
+    affinity reads; None without one, or with the cache off."""
+    if envs.ATOM_API_OFFLOAD_TOKENIZE_CACHE_MB <= 0:
+        return None
+    h = request.headers
+    return (
+        h.get("x-dynamo-session-id")
+        or h.get("x-session-id")
+        or h.get("x-correlation-id")
+    )
 
 
 def _offload_chat_completions_route() -> None:
@@ -3290,6 +3305,9 @@ def main():
             envs.ATOM_TOKENIZE_PROCESSES,
             tokenizer,
             chat_settings=chat_settings,
+            # A worker keeps its sessions' earlier prompts: route by session.
+            affinity=chat_settings is not None
+            and envs.ATOM_API_OFFLOAD_TOKENIZE_CACHE_MB > 0,
         )
         logger.info(
             "Tokenizing prompts in %d worker processes", envs.ATOM_TOKENIZE_PROCESSES
