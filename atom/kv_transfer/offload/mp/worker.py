@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import Any
@@ -523,7 +524,8 @@ class LMCacheMPConnector(KVConnectorBase):
 
         Drops the events finished submissions referenced (an interprocess
         event must not be destroyed on that thread) and the futures its polls
-        finished, and surfaces a submission that raised.
+        finished, and surfaces a submission that raised. With a polling
+        thread, also fail-stops a transfer past its deadline.
         """
         transfer = self._transfer
         if transfer is None:
@@ -536,15 +538,30 @@ class LMCacheMPConnector(KVConnectorBase):
                 transfer.take_returned(_RETURNED_FUTURES_BATCH)
         transfer.raise_error()
         if transfer.polls:
-            # A round enforces deadlines too, but rounds run between
-            # submissions on that thread: a submit that never returns would
-            # stop them.
-            with self._lock:
-                pending = [*self._pending_saves.items(), *self._pending_loads.items()]
-            for operation_id, entry in pending:
-                _enforce_transfer_deadline(
-                    operation_id, entry.started_at, self._transfer_deadline_s
+            transfer.between_rounds(self._enforce_overdue_deadlines)
+
+    def _enforce_overdue_deadlines(self) -> None:
+        """Fail-stop, from the forward thread, a transfer past its deadline.
+
+        Rounds enforce deadlines too, but run between submissions on the
+        transfer thread, so a slow or hung submit holds them back. Only a
+        transfer already past its deadline is polled here, as a round polls
+        it: a finished one is left for the next round to settle. The others
+        are not polled at all; a terminal poll imports the peer's IPC event,
+        which stays off this thread.
+        """
+        now = time.monotonic()
+        with self._lock:
+            overdue = [
+                (operation_id, entry)
+                for operation_id, entry in (
+                    *self._pending_saves.items(),
+                    *self._pending_loads.items(),
                 )
+                if now - entry.started_at >= self._transfer_deadline_s
+            ]
+        for operation_id, entry in overdue:
+            self._poll_entry(operation_id, entry)
 
     def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:
         if start < 0 or end < start:
@@ -835,23 +852,25 @@ class LMCacheMPConnector(KVConnectorBase):
                     logger.warning(
                         "LMCache MP source-safe event polling failed", exc_info=True
                     )
-            terminal, result = _terminal_future_result(pending.future)
-            if not terminal:
-                _enforce_transfer_deadline(
-                    operation_id, pending.started_at, self._transfer_deadline_s
-                )
-                continue
-            terminal_saves.append((operation_id, pending, result))
+            terminal, result = self._poll_entry(operation_id, pending)
+            if terminal:
+                terminal_saves.append((operation_id, pending, result))
         terminal_loads = []
         for operation_id, pending in loads:
-            terminal, result = _terminal_future_result(pending.future)
-            if not terminal:
-                _enforce_transfer_deadline(
-                    operation_id, pending.started_at, self._transfer_deadline_s
-                )
-                continue
-            terminal_loads.append((operation_id, pending, result))
+            terminal, result = self._poll_entry(operation_id, pending)
+            if terminal:
+                terminal_loads.append((operation_id, pending, result))
         return terminal_saves, terminal_loads
+
+    def _poll_entry(self, operation_id: str, pending: Any) -> tuple[bool, Any]:
+        """Poll one transfer: ``(terminal, result)``, or a fail-stop when it
+        is past its deadline and not terminal."""
+        terminal, result = _terminal_future_result(pending.future)
+        if not terminal:
+            _enforce_transfer_deadline(
+                operation_id, pending.started_at, self._transfer_deadline_s
+            )
+        return terminal, result
 
     def _settle_terminal_locked(
         self,

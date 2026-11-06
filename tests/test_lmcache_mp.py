@@ -2622,19 +2622,31 @@ def test_a_round_during_close_settles_without_the_worker_s_handle(
     assert worker._transfer is None
 
 
+def _hold_the_transfer_thread(worker):
+    """Park the transfer thread in a submission; returns the release."""
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_submit():
+        entered.set()
+        release.wait(5.0)
+
+    worker._transfer.submit(slow_submit)
+    assert entered.wait(5.0)
+    return release
+
+
 def test_a_stuck_submit_cannot_hide_a_transfer_past_its_deadline(
     fake_lmcache_modules, monkeypatch
 ):
     """Rounds enforce deadlines but run between submissions, so a submit that
-    never returns stops them: the forward thread enforces every deadline too."""
+    never returns stops them: the forward thread enforces an overdue one."""
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
     worker = _worker(_WorkerAdapter())
     worker._transfer_deadline_s = 30.0
     worker._submit_load(_unprovable_request("load"), _step_event(worker))
     _settle(worker)
-    stuck = threading.Event()
-    worker._transfer.submit(stuck.wait, 5.0)  # a submit RPC that hangs
+    release = _hold_the_transfer_thread(worker)
     try:
         now[0] = 1029.0
         worker._settle_transfer_thread()
@@ -2642,7 +2654,84 @@ def test_a_stuck_submit_cannot_hide_a_transfer_past_its_deadline(
         with pytest.raises(transfer.LMCacheTransferUnprovable, match="not terminal"):
             worker._settle_transfer_thread()
     finally:
-        stuck.set()
+        release.set()
+
+
+@pytest.mark.parametrize("kind", ["load", "save"])
+def test_a_transfer_that_finished_is_not_failed_while_rounds_are_held(
+    fake_lmcache_modules, monkeypatch, kind
+):
+    """A slow submit holds back the round that would settle a finished
+    transfer; past its deadline, the forward thread sees it finished."""
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker = _worker(_WorkerAdapter())
+    worker._transfer_deadline_s = 30.0
+    request = _unprovable_request(kind)
+    getattr(worker, f"_submit_{kind}")(request, _step_event(worker))
+    _settle(worker)
+    pending = getattr(worker, f"_pending_{kind}s")
+    release = _hold_the_transfer_thread(worker)
+    try:
+        [entry] = pending.values()
+        entry.future.ready = True
+        now[0] = 1031.0
+        worker._settle_transfer_thread()
+    finally:
+        release.set()
+    _settle(worker)
+    finished = worker.get_finished()
+    operation = request.load_operation if kind == "load" else request.save_operation
+    assert operation in (
+        finished.finished_loading if kind == "load" else finished.finished_saving
+    )
+
+
+def test_the_forward_thread_polls_no_transfer_before_its_deadline(
+    fake_lmcache_modules, monkeypatch
+):
+    """A terminal poll imports the peer's IPC event, which the polling thread
+    keeps off the forward thread: only an overdue transfer is polled there."""
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker = _worker(_WorkerAdapter())
+    worker._transfer_deadline_s = 30.0
+    worker._submit_load(_unprovable_request("load"), _step_event(worker))
+    _settle(worker)
+    [entry] = worker._pending_loads.values()
+    queries = []
+    query = entry.future.query
+    entry.future.query = lambda: queries.append(1) or query()
+    release = _hold_the_transfer_thread(worker)
+    try:
+        entry.future.ready = True
+        now[0] = 1029.0
+        worker._settle_transfer_thread()
+        assert queries == []
+    finally:
+        release.set()
+
+
+def test_the_forward_thread_leaves_deadlines_to_a_running_round(
+    fake_lmcache_modules, monkeypatch
+):
+    """A running round polls the same transfers, and a future is not polled
+    from two threads at once."""
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker = _worker(_WorkerAdapter())
+    worker._transfer_deadline_s = 30.0
+    worker._submit_load(_unprovable_request("load"), _step_event(worker))
+    _settle(worker)
+    release = _hold_the_transfer_thread(worker)
+    try:
+        now[0] = 1031.0
+        with worker._transfer._polling:  # as a round holds it
+            worker._settle_transfer_thread()
+        with pytest.raises(transfer.LMCacheTransferUnprovable, match="not terminal"):
+            worker._settle_transfer_thread()
+    finally:
+        release.set()
 
 
 def test_close_leaves_the_adapter_to_a_thread_that_did_not_stop(
