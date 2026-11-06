@@ -1047,6 +1047,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep that expert placement for the rest of the process. Rebalances the
     # balancedness gate skips do not count. 0 (default) = no limit.
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
+    # --- Structured output ---
+    # Hold tool calls to the declared schemas when the tool parser declares a
+    # grammar for them (Kimi-K3) and the structured-output extra is installed.
+    "ATOM_TOOL_CALL_GRAMMAR": lambda: (
+        os.getenv("ATOM_TOOL_CALL_GRAMMAR", "1").lower() == "1"
+    ),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"

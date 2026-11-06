@@ -308,6 +308,12 @@ that ever changes, so a fusion left inert by an unrecognised layout says so.
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_RELAXED_MTP** | bool | 0 (false) | Accept a draft token when it lands in the target's top 10 within 0.6 of the top logit, instead of requiring the argmax. Intended for quantized MTP heads, whose drafts are right about the region and wrong about the exact winner often enough that strict acceptance throws away usable tokens. Read once at `rejection_sampler` import, so it must be set before the server starts. |
 
+## Structured output
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_TOOL_CALL_GRAMMAR** | bool | 1 (true) | On a request that declares tools and sets no `response_format`, hold each tool call to its tool's schema when the tool parser declares a grammar for its format (Kimi-K3: a call cannot close before its required arguments). Needs the `atom[structured-output]` extra; without it, or where structured output cannot run (P/D, relaxed MTP, custom stop strings, speculative logprobs), the output stays unconstrained. `0` turns it off. |
+
 ## Engram (DeepSeek-V4.1)
 
 The n-gram tables are per-layer and large enough that where they live, and
