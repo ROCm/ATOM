@@ -1732,6 +1732,36 @@ models:
           run_eval: true
           eval_concurrency: [128, 768]
 
+      accuracy:
+        - name: kimi-k26-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          display_topology: 1P1D-TP8-MORIIO
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill:
+            workers: 1
+            tp: 8
+            extra_args: "--enforce-eager"
+          decode:
+            workers: 1
+            tp: 8
+          server:
+            common_args:
+              gpu_memory_utilization: 0.8
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              ATOM_MORIIO_MODE: write
+            decode:
+              DECODE_KV_TRANSFER_CONFIG: ""
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_only: true
+
     accuracy:
       task: gsm8k
       fewshot: 3
