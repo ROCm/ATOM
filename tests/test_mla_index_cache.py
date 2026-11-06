@@ -464,6 +464,8 @@ class _FakePool:
 
 
 class _FakeCacheSlice:
+    shape = (8, 64, 144)  # Kimi-K3's binder reads it to flatten the slice.
+
     def __init__(self, identity):
         self.identity = identity
 
@@ -477,14 +479,14 @@ def _transfer_stack(num_layers):
     return [torch.zeros(8, dtype=torch.uint8) for _ in range(num_layers)]
 
 
-def _bind_builder(module, index_cache_layer_map, *, rows_before: int):
+def _bind_builder(module, index_cache_layer_map, *, rows_before: int, cls=None):
     """A builder whose walk reaches `module` after `rows_before` MLA layers.
 
     The row is that position, deliberately not the module's `layer_num` -- the
     two agree only while every layer of the model is MLA, which is what the map
-    exists to stop being assumed.
+    exists to stop being assumed. `cls` overrides the builder class.
     """
-    builder = object.__new__(AiterMLAMetadataBuilder)
+    builder = object.__new__(cls or AiterMLAMetadataBuilder)
     layers = [_MlaLayer() for _ in range(rows_before)] + [module]
     runner = SimpleNamespace(
         index_cache_layer_map=index_cache_layer_map,
@@ -557,6 +559,43 @@ def test_build_shared_layer_keeps_main_kv_without_index_slice():
         indexer=None,
     )
     builder = _bind_builder(module, {0: 0}, rows_before=1)
+
+    cache_tensor = builder.build_kv_cache_tensor(module)
+
+    assert module.kv_cache == (("kv", 1), (-1, 1, 576))
+    assert cache_tensor.index_cache is None
+
+
+def _kimi_builder_cls():
+    from atom.model_ops.attentions.kimi_mla_gdn_attn import (
+        KimiAiterMLAGDNMetadataBuilder,
+    )
+
+    return KimiAiterMLAGDNMetadataBuilder
+
+
+def test_kimi_k3_publishes_its_index_slice_on_the_kv_cache_tensor():
+    """Offload codecs read the index slice only from the `KVCacheTensor`."""
+    module = _MlaLayer(
+        layer_num=5,
+        indexer=SimpleNamespace(k_cache=SimpleNamespace(kv_cache=[None])),
+    )
+    builder = _bind_builder(
+        module, {3: 0, 5: 1}, rows_before=2, cls=_kimi_builder_cls()
+    )
+
+    cache_tensor = builder.build_kv_cache_tensor(module)
+
+    assert module.kv_cache == (("kv", 2), (-1, 1, 576))
+    assert module.indexer.k_cache.kv_cache[0][0] == ("index", 1)
+    assert cache_tensor.index_cache.identity == ("index", 1)
+    assert cache_tensor.index_scale is None
+
+
+def test_kimi_k3_layer_without_an_indexer_publishes_no_index_slice():
+    """E.g. the K3.1 DSpark draft's dense MLA layers."""
+    module = _MlaLayer(layer_num=1, indexer=None)
+    builder = _bind_builder(module, {0: 0}, rows_before=1, cls=_kimi_builder_cls())
 
     cache_tensor = builder.build_kv_cache_tensor(module)
 
