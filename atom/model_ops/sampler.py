@@ -53,7 +53,10 @@ def _apply_greedy_tokens(
 
 def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     """Returns a tensor of shape (1, vocab_size) filled with exponential random values.
-    This is key to deterministic inference, as it ensures that the same random values are used for each token across different runs.
+
+    A fresh row is drawn on every call.  The shared-noise temperature path
+    broadcasts it with stride 0, so every row sampled in that call uses the
+    same values.
     """
     return torch.empty((1, vocab_size), dtype=torch.float, device=device).exponential_(
         1
@@ -62,9 +65,18 @@ def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
 
 class Sampler(nn.Module):
 
-    def __init__(self):
+    def __init__(self, *, always_independent_noise: bool = False):
+        """
+        Args:
+            always_independent_noise: Use per-row exponential noise for
+                unfiltered stochastic sampling even when the caller does not
+                request it (``--sampler-independent-noise``). False preserves
+                the shared-row policy. The top-k/top-p path does not honor it,
+                and all-greedy batches never draw noise.
+        """
         super().__init__()
         self.eps = SAMPLER_EPS
+        self.always_independent_noise = always_independent_noise
 
     def sample_verification_tokens(
         self,
@@ -128,8 +140,10 @@ class Sampler(nn.Module):
             needs_independent_noise: True when the batch contains fan-out
                 siblings (SamplingParams.n>1). Forces fresh per-row random
                 exponential noise so sibling sequences with identical logits
-                do not produce identical tokens. Adds an O(bs * vocab_size)
-                allocation, so only enabled when actually needed.
+                are sampled independently. Adds an O(bs * vocab_size)
+                allocation, so only enabled when actually needed;
+                ``Sampler(always_independent_noise=True)`` also enables it for
+                every unfiltered stochastic batch.
 
         Returns:
             Sampled token IDs (num_tokens,)
@@ -181,10 +195,19 @@ class Sampler(nn.Module):
         When ``needs_independent_noise`` is True the per-row exponential noise
         tensor is freshly drawn with shape ``(num_tokens, vocab_size)`` so that
         fan-out siblings produced by ``SamplingParams.n > 1`` diverge instead
-        of collapsing onto the same token when they share logits. Otherwise we
-        keep the cached ``(1, vocab_size)`` row broadcasted across the batch,
-        which preserves the existing run-to-run determinism optimization.
+        of collapsing onto the same token when they share logits. The same
+        happens for every call when the sampler was built with
+        ``always_independent_noise``. Otherwise one fresh ``(1, vocab_size)``
+        row is drawn and broadcast with stride 0, so every row of that call
+        uses the same noise.
+
+        Both branches materialize the noise in torch and score it with AITER's
+        ``mixed_sample_outer_exponential``. AITER's in-kernel ``mixed_sample``
+        is not used here, see #2928.
         """
+        needs_independent_noise = (
+            needs_independent_noise or self.always_independent_noise
+        )
         num_tokens, vocab_size = logits.shape
         sampled_tokens = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
         if needs_independent_noise:
@@ -214,6 +237,8 @@ class Sampler(nn.Module):
         or aiter's sampling ops that draw from torch's default RNG stream per
         batch row, so fan-out siblings already diverge naturally and the
         ``needs_independent_noise`` flag is accepted purely for API symmetry.
+        The ``always_independent_noise`` sampler option does not apply here
+        either: this path neither reads nor honors it.
         """
         # Accepted but unused here; see docstring.
         del needs_independent_noise
@@ -369,3 +394,13 @@ class Sampler(nn.Module):
         logits = probs.div_(torch.empty_like(probs).exponential_(1) + self.eps)
         _, sampled_tokens = topk(logits, 1)
         return sampled_tokens.view(-1)
+
+
+def sampler_from_config(config) -> Sampler:
+    """Build the runner's sampler under the engine's sampling policy.
+
+    ``--sampler-independent-noise`` lands in ``Config.sampler_independent_noise``
+    and is read here, apart from ``ModelRunner.__init__``, so the CPU test gate
+    can check the option reaches the sampler without a GPU.
+    """
+    return Sampler(always_independent_noise=config.sampler_independent_noise)
