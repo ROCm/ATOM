@@ -464,8 +464,9 @@ else
     slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
     SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
   else
-    # GPUs held outside Slurm; g24's Docker also fails the Mesh build with rc=125.
-    AUTO_EXCLUDE="pit2-p03-g08,pit2-p03-g15,pit2-p03-g24,pit2-p03-g40"
+    # GPUs held outside Slurm; g24's Docker also fails the Mesh build with rc=125,
+    # and the g25 -> g27 KV RDMA hung the prefill engine.
+    AUTO_EXCLUDE="pit2-p03-g08,pit2-p03-g15,pit2-p03-g24,pit2-p03-g25,pit2-p03-g27,pit2-p03-g40"
     SBATCH_CMD+=(--exclude "${AUTO_EXCLUDE}")
   fi
   SBATCH_CMD+=(
