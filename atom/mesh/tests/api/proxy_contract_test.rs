@@ -24,6 +24,64 @@ async fn http_preserves_all_api_requests_and_json_sse_errors() {
 }
 
 #[tokio::test]
+async fn a_worker_with_an_unusable_key_fails_over_and_counts_against_that_worker() {
+    use mesh::{
+        app_context::AppContext,
+        config::{PolicyConfig, RouterConfig},
+        core::{prepare_pool::PreparePoolRuntime, BasicWorkerBuilder, Worker},
+    };
+    use std::sync::Arc;
+
+    let mut backend = multi_api::Backend::start().await;
+    let mut config = RouterConfig {
+        policy: PolicyConfig::RoundRobin,
+        ..Default::default()
+    };
+    config.retry.initial_backoff_ms = 1;
+    config.retry.max_backoff_ms = 1;
+    let _runtime = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
+    let context = Arc::new(
+        AppContext::from_config(config, 5, _runtime.handle())
+            .await
+            .unwrap(),
+    );
+    // A newline cannot appear in a header value, so this worker is never sent to.
+    let broken: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://127.0.0.1:1")
+            .model_id("test-model")
+            .api_key("bad\nkey")
+            .build(),
+    );
+    let good: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(&backend.url)
+            .model_id("test-model")
+            .build(),
+    );
+    context.worker_registry.register(broken.clone());
+    context.worker_registry.register(good.clone());
+    let app = multi_api::http_app(context).await;
+    for path in multi_api::APIS {
+        // Round robin places one of every two requests on the broken worker.
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(*path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(multi_api::request(path, false).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert!(backend.captured.try_recv().is_ok(), "{path}");
+        }
+    }
+    assert!(broken.circuit_breaker().total_failures() > 0);
+    assert_eq!(good.circuit_breaker().total_failures(), 0);
+}
+
+#[tokio::test]
 async fn malformed_requests_and_uploads_return_protocol_errors() {
     let backend = multi_api::Backend::start().await;
     let (context, _, _prepare_runtime) = backend.context(None).await;

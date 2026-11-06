@@ -102,7 +102,12 @@ impl Router {
             worker.api_key().as_deref(),
         ) {
             Ok(headers) => headers,
-            Err(err) => return err.response(metadata.route),
+            Err(err) => {
+                // This worker's key is bad; another worker's may not be.
+                worker.record_outcome(false);
+                policy.on_request_complete(worker.url(), false);
+                return err.response(metadata.route);
+            }
         };
         let mut builder = self
             .client
@@ -340,12 +345,16 @@ impl Router {
 
 const CONNECTION_FAILED_CODE: &str = "call_upstream_connection_failed";
 
-/// Mesh-local errors caused by configuration or the request itself; retrying
-/// another worker cannot change the outcome.
-const NON_RETRYABLE_ERROR_CODES: &[&str] = &[
-    "invalid_backend_credentials",
-    "worker_request_preparation_failed",
-    "invalid_request",
+/// Mesh-local errors caused by the request itself; retrying another worker
+/// cannot change the outcome. Per-worker failures, such as a worker's invalid
+/// credentials, stay retryable.
+const NON_RETRYABLE_ERROR_CODES: &[&str] =
+    &["worker_request_preparation_failed", "invalid_request"];
+
+/// Failures that happened before anything was sent to the worker.
+const UNSENT_ERROR_CODES: &[&str] = &[
+    CONNECTION_FAILED_CODE,
+    header_utils::INVALID_BACKEND_CREDENTIALS,
 ];
 
 /// Decide whether an inference attempt should be retried on another worker.
@@ -355,9 +364,9 @@ pub(super) fn should_retry_inference(route: &str, response: &Response) -> bool {
         return false;
     }
     // A Responses submission that reached a backend may already have created
-    // stored work, so only fail over when the connection was never made.
+    // stored work, so only fail over when nothing was sent.
     if route == "/v1/responses" {
-        return code == CONNECTION_FAILED_CODE;
+        return UNSENT_ERROR_CODES.contains(&code);
     }
     is_retryable_status(response.status())
 }
@@ -565,6 +574,14 @@ mod tests {
         ));
         assert!(should_retry_inference("/v1/responses", &unsent));
         assert!(!should_retry_inference("/v1/responses", &backend_failure));
+        // A worker's bad key fails only that worker, and nothing was sent.
+        let credentials = mesh_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            header_utils::INVALID_BACKEND_CREDENTIALS,
+        );
+        for route in ["/v1/chat/completions", "/v1/responses"] {
+            assert!(should_retry_inference(route, &credentials), "{route}");
+        }
     }
 
     fn create_test_regular_router() -> Router {

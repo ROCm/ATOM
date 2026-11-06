@@ -80,6 +80,10 @@ pub fn extract_sticky_routing_key(headers: Option<&HeaderMap>) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// A worker's configured key is not a valid header value. The key belongs to
+/// that worker, so routers count it against the worker and fail over.
+pub const INVALID_BACKEND_CREDENTIALS: &str = "invalid_backend_credentials";
+
 /// Resolve client headers and worker credentials once for HTTP and Envoy mutation.
 pub fn inference_request_headers(
     original: &HeaderMap,
@@ -90,7 +94,7 @@ pub fn inference_request_headers(
         http::HeaderValue::from_str(value).map_err(|_| {
             super::error::IngressError::new(
                 http::StatusCode::SERVICE_UNAVAILABLE,
-                "invalid_backend_credentials",
+                INVALID_BACKEND_CREDENTIALS,
                 "configured worker credential is not a valid HTTP header",
             )
         })

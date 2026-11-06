@@ -1868,7 +1868,11 @@ impl PDRouter {
             route,
             worker.api_key().as_deref(),
         )
-        .map_err(|error| error.response(route))?;
+        .map_err(|error| {
+            // This worker's key is bad; another worker's may not be.
+            worker.record_outcome(false);
+            error.response(route)
+        })?;
         let mut request = client
             .post(worker.endpoint_url(route))
             .headers(headers)
