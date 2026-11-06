@@ -2744,6 +2744,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
             attn_metadata.context_lens, create=True
         )
+        # ATOM_UA_DECODE_TOKEN_SPLIT, the same rule: the graph reads the buffer
+        # every replay's prepare_decode publishes first.
+        attn_metadata.decode_token_split_tiles = self._decode_token_split_metadata(
+            attn_metadata.context_lens
+        )
 
         positions = var["positions"].copy_to_gpu(capture_tokens)
         context = Context(

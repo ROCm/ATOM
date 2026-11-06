@@ -38,6 +38,38 @@ def cdiv(a, b):
     return (a + b - 1) // b
 
 
+class DecodeTokenSplit(NamedTuple):
+    """ATOM_UA_DECODE_TOKEN_SPLIT: a decode forward's gfx1250 token split, the
+    [1] int32 ``tiles`` per segment aiter's unified attention would compute from
+    ``seqused_k`` at ``tile`` tokens a tile and ``heads`` KV heads. Valid for an
+    attention whose ``seqused_k`` is that tensor and still holds the lengths it
+    was computed from (the forward's layers and the MTP draft's step 0)."""
+
+    tiles: torch.Tensor
+    tile: int
+    heads: int
+    seqused_k: torch.Tensor
+
+    def metadata(self) -> tuple:
+        """`unified_attention`'s ``gfx12_token_split_tiles``."""
+        return (self.tiles, self.tile, self.heads)
+
+
+def decode_token_split_tiles(
+    context_lens: np.ndarray, constants: tuple, sum_tiles: int | None = None
+) -> int:
+    """aiter's gfx1250 token-split tiles per segment over ``context_lens``,
+    clamp(cdiv(sum_i cdiv(len_i, tile) * heads, programs), min, max), as Python
+    integers: the int32 its torch / Triton expressions give (floor divisions,
+    an int64 sum). ``constants`` is (tile, heads, programs, min, max);
+    ``sum_tiles``, when given, is the sum of cdiv(len_i, tile) already."""
+    tile, heads, programs, lo, hi = constants
+    if sum_tiles is None:
+        sum_tiles = int(((context_lens.astype(np.int64) + (tile - 1)) // tile).sum())
+    want = (int(sum_tiles) * heads + programs - 1) // programs
+    return min(max(want, lo), hi)
+
+
 class _IndexCacheSpec(NamedTuple):
     """MiniMax-M3's indexer key cache: one `dim`-wide key per token, on `rows`
     of this stage's layers. The pool is told its bytes and nothing else."""
@@ -364,6 +396,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 "positions",
             ),
         }
+        # ATOM_UA_DECODE_TOKEN_SPLIT: (tile, heads, programs, min, max) of the
+        # decode forward's token split, or None. Its [1] int32 is published
+        # with the decode metadata; until the first decode it holds aiter's
+        # minimum, a valid split for any lengths (graph capture reads it).
+        self._decode_token_split = self._decode_token_split_constants(num_head_k)
+        if self._decode_token_split is not None:
+            split = CpuGpuBuffer(1, publication_group="mha_token_split", **i32_kwargs)
+            split.np[0] = self._decode_token_split[3]
+            split.copy_to_gpu()
+            self.model_runner.forward_vars["decode_token_split_tiles"] = split
+            self.h2d_group_members["mha_decode"] += ("decode_token_split_tiles",)
         # Per-ubatch buffers for CUDAGraph TBO
         if model_runner.config.enable_tbo:
             self._allocate_ubatch_buffers(
@@ -814,6 +857,33 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             tp_replication_factor=1,
         )
 
+    def _decode_token_split_constants(self, num_kv_heads: int) -> tuple | None:
+        """ATOM_UA_DECODE_TOKEN_SPLIT's (tile, heads, programs, min, max), or
+        None when it is off or aiter's gfx1250 token split is. The tile is the
+        one aiter's split takes at this page size; at another tile or head
+        count aiter ignores the value and computes its own."""
+        if not envs.ATOM_UA_DECODE_TOKEN_SPLIT:
+            return None
+        try:
+            from aiter.ops.triton.attention.unified_attention import (
+                gfx12_token_split_constants,
+            )
+        except ImportError:
+            return None
+        constants = gfx12_token_split_constants()
+        if constants is None:
+            return None
+        return (triton.next_power_of_2(self.block_size), num_kv_heads, *constants)
+
+    def _decode_token_split_metadata(self, context_lens) -> DecodeTokenSplit | None:
+        """The attention metadata's ``decode_token_split_tiles``: the buffer
+        `prepare_decode` publishes, for the attention over ``context_lens``."""
+        if self._decode_token_split is None:
+            return None
+        tile, heads = self._decode_token_split[:2]
+        tiles = self.model_runner.forward_vars["decode_token_split_tiles"].gpu
+        return DecodeTokenSplit(tiles, tile, heads, context_lens)
+
     def refresh_flydsl_plan(self, context_lens, *, create=False):
         """Build or refresh aiter's FlyDSL work plan for this forward.
 
@@ -1212,7 +1282,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         running_tokens: int,
         max_seqlen_q: int,
     ):
-        self._check_metadata_writable("mha_csr", "prefill", "positions", "mrope")
+        self._check_metadata_writable(
+            "mha_csr", "prefill", "positions", "mrope", "mha_token_split"
+        )
         scheduled_bs = batch.total_seqs_num_decode
         self.total_blocks = 0
         dropout_p = 0.0
@@ -1282,6 +1354,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         group.counts[group.indices["positions"]] = (
             None if self.model_runner.use_mrope else scheduled_tokens
         )
+        token_split = self._decode_token_split
+        if token_split is not None:
+            # The pad rows' lengths are 0, so the real rows' sum is the padded
+            # one; at a tile of one page it is the page count just summed.
+            var["decode_token_split_tiles"].np[0] = decode_token_split_tiles(
+                context_lens,
+                token_split,
+                sum_blocks if token_split[0] == self.block_size else None,
+            )
+            group.counts[group.indices["decode_token_split_tiles"]] = 1
         block_table_state(var["block_tables"]).publish(running_bs, group=group)
         ctx = {el: var[el].gpu[:num] for el, num in vars_used}
         # A view: `publish_cu_seqlens_q` already uploaded it this step, and
@@ -1311,6 +1393,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             **ctx,
         )
         attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
+            attn_metadata.context_lens
+        )
+        attn_metadata.decode_token_split_tiles = self._decode_token_split_metadata(
             attn_metadata.context_lens
         )
         if self._has_sparse_attention:
@@ -1567,6 +1652,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             kv_indices=var["kv_indices"].gpu,
             max_seqlen_k=max_seqlen_k,
             **ctx_pa_ps,
+        )
+        # Every replay's prepare_decode publishes the batch's own first.
+        attn_metadata.decode_token_split_tiles = self._decode_token_split_metadata(
+            attn_metadata.context_lens
         )
         if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (

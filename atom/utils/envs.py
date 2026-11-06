@@ -611,6 +611,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bitwise (another fp32 summation order). No-op on an aiter without it. Off by
     # default.
     "ATOM_UA_SPLIT_REDUCE": lambda: _flag_env("ATOM_UA_SPLIT_REDUCE"),
+    # With aiter's gfx1250 token split (AITER_GFX12_TOKEN_SPLIT=1) on unified
+    # attention: a decode forward's tiles per segment, computed once on the host
+    # by the attention builder from the context lengths it uploads and published
+    # with them, instead of a gfx12_token_split_tiles launch before every layer's
+    # attention. The same int32. Every target layer and the MTP draft's step 0
+    # (the same lengths) read it; the draft's later passes take theirs from
+    # ATOM_MTP_ADVANCE_TOKEN_SPLIT. Off by default.
+    "ATOM_UA_DECODE_TOKEN_SPLIT": lambda: _flag_env("ATOM_UA_DECODE_TOKEN_SPLIT"),
     # With ATOM_FUSED_MOE_TAIL_NORM at TP > 1 (gfx1250, TP4): a sparse MoE block
     # whose next norm all-reduces (the Qwen3.5 MTP drafter's final norm with
     # ATOM_MTP_FUSE_ALLREDUCE_NORM) leaves `routed + sigmoid(gate) * shared` to

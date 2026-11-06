@@ -934,6 +934,13 @@ class PagedAttentionImpl(nn.Module):
             tiles = getattr(attn_metadata, "gfx12_token_split_tiles", None)
             if tiles is not None:
                 split["gfx12_token_split_tiles"] = tiles
+        else:
+            # The decode forward's, computed once by the builder from the lengths
+            # this call reads (ATOM_UA_DECODE_TOKEN_SPLIT): every target layer and
+            # the draft's step 0, before any pass advances them.
+            tiles = getattr(attn_metadata, "decode_token_split_tiles", None)
+            if tiles is not None and tiles.seqused_k is attn_metadata.context_lens:
+                split["gfx12_token_split_tiles"] = tiles.metadata()
         # ATOM_UA_SPLIT_REDUCE: aiter's split-KV reduce for the token split's grid.
         if envs.ATOM_UA_SPLIT_REDUCE and unified_attention_takes_split_reduce():
             split["split_reduce"] = True
