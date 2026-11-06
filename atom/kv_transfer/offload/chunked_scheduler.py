@@ -422,6 +422,25 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return True
         return False
 
+    def lookup_is_pending(self, seq) -> bool:
+        """Side-effect-free: whether a lookup for `seq` is in flight, without
+        polling the connector or starting the deferral clock.
+
+        Mirrors ``lookup_pending``'s deadline: once ``OFFLOAD_LOOKUP_DEFER_S``
+        has elapsed since the first deferral, returns False so the dry pass
+        stops deferring past the cutoff.
+        """
+        client = self._lookup_client
+        if getattr(client, "is_pending", None) is None:
+            return False
+        sid = str(seq.id)
+        if not client.is_pending(sid):
+            return False
+        first = self._lookup_defer_since.get(sid)
+        return not (
+            first is not None and time.monotonic() - first > envs.OFFLOAD_LOOKUP_DEFER_S
+        )
+
     def lookup_pending(self, seq) -> bool:
         """True while admission should pass over `seq`: its lookup is in flight.
 

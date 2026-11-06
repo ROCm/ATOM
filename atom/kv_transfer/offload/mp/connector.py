@@ -233,6 +233,10 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
         if callable(prefetch):
             prefetch(seqs)
 
+    def lookup_is_pending(self, seq: Any) -> bool:
+        cb = getattr(self._require_impl(), "lookup_is_pending", None)
+        return bool(cb(seq)) if callable(cb) else False
+
     def lookup_pending(self, seq: Any) -> bool:
         pending = getattr(self._require_impl(), "lookup_pending", None)
         return bool(pending(seq)) if callable(pending) else False

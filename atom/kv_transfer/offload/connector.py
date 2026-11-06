@@ -214,6 +214,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         if callable(callback):
             callback(scheduled_seqs, num_scheduled_tokens)
 
+    def lookup_is_pending(self, seq) -> bool:
+        callback = getattr(self._impl, "lookup_is_pending", None)
+        return bool(callback(seq)) if callable(callback) else False
+
     def lookup_pending(self, seq) -> bool:
         callback = getattr(self._impl, "lookup_pending", None)
         return bool(callback(seq)) if callable(callback) else False
