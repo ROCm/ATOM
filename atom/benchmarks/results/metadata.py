@@ -20,6 +20,10 @@ PERFORMANCE_KEYS = {
     "OMP_NUM_THREADS",
     "GPU_MAX_HW_QUEUES",
     "MORI_SHMEM_HEAP_SIZE",
+    # AITER's fused all-reduce one-stage limit (ROCm/aiter#7357): the byte-named
+    # setting, then its deprecated KB-named alias, whose integer was always a
+    # byte count.
+    "AITER_AR_1STAGE_MAX_BYTES",
     "AITER_AR_1STAGE_MAX_KB",
     "AITER_BF16_FP8_MOE_BOUND",
     "AITER_LOG_LEVEL",

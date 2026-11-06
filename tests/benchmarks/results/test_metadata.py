@@ -10,9 +10,27 @@ import pytest
 
 from atom.benchmarks.results.bundle import build_bundle, rebuild_bundle, verify_bundle
 from atom.benchmarks.results.io import read_json, write_json
-from atom.benchmarks.results.metadata import capture_hf_dataset, git_sha
+from atom.benchmarks.results.metadata import (
+    capture_hf_dataset,
+    git_sha,
+    performance_env,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def test_all_reduce_limit_is_captured_under_both_names(monkeypatch):
+    """A run records the byte-named all-reduce limit and its legacy alias.
+
+    ROCm/aiter#7357 introduced AITER_AR_1STAGE_MAX_BYTES and kept the KB-named
+    setting, whose integer has always been a byte count, as a deprecated alias,
+    so a recipe on either name stays part of the captured run identity.
+    """
+    monkeypatch.setenv("AITER_AR_1STAGE_MAX_BYTES", "14336")
+    monkeypatch.setenv("AITER_AR_1STAGE_MAX_KB", "512")
+    captured = performance_env()
+    assert captured["AITER_AR_1STAGE_MAX_BYTES"] == "14336"
+    assert captured["AITER_AR_1STAGE_MAX_KB"] == "512"
 
 
 def test_git_sha_of_checkout_with_different_owner(tmp_path, monkeypatch):
