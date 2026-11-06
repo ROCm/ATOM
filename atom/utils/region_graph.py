@@ -22,8 +22,9 @@ host value it cannot take from the device. Such a region is called at replay
 with the tensors it was recorded with -- graph-owned addresses -- and with
 its per-step arguments (``live``) read afresh, so it serves whatever step is
 running. Its result reaches the next segment through the address that segment
-was recorded reading: either it wrote one of its inputs in place (`out=`), or
-the replay copies it there.
+was recorded reading: either it wrote one of its inputs in place (`out=`), it
+claims that address and writes it (`on_scheduled_rows`), or the replay copies
+it there.
 
 A region declared with a stream runs beside the main one: the replay forks to
 that stream before the call and the model's `join_stream` joins it back. Until
@@ -101,10 +102,22 @@ class _EagerStep:
         arguments = self._arguments
         if self._live is not None:
             arguments = {**arguments, **self._live()}
-        result = self._fn(**arguments)
         target = self._target
-        if target is not None and result.data_ptr() != target.data_ptr():
-            target.copy_(result)
+        # The region may write its result there itself (`_claim_delivery`).
+        _local.delivery = target
+        try:
+            result = self._fn(**arguments)
+            claimed = target is not None and _local.delivery is None
+        finally:
+            _local.delivery = None
+        if target is None or result.data_ptr() == target.data_ptr():
+            return
+        if claimed:
+            raise RuntimeError(
+                "an eager region claimed the tensor its result is delivered "
+                "to, then returned another"
+            )
+        target.copy_(result)
 
 
 class _Segments:
@@ -305,24 +318,55 @@ def padded_prefill_rows(rows: int) -> int | None:
     return scheduled if 0 < scheduled < rows else None
 
 
-def on_scheduled_rows(fn: Callable[..., torch.Tensor], rows: int | None, *args):
+def _claim_delivery(height: int) -> torch.Tensor | None:
+    """In a replayed region (`_EagerStep`), the tensor the next segment reads
+    the region's result from, when it is a dense one of ``height`` rows; None
+    anywhere else. Claimed once: the region must then return it."""
+    target = getattr(_local, "delivery", None)
+    if target is None or target.shape[0] != height or not target.is_contiguous():
+        return None
+    _local.delivery = None
+    return target
+
+
+def on_scheduled_rows(
+    fn: Callable[..., torch.Tensor],
+    rows: int | None,
+    *args,
+    writes_out: bool = False,
+):
     """``fn(*args)`` on the first ``rows`` rows of each tensor argument whose
     leading dim is the bucket, its result raised back to the bucket with zero
     rows past ``rows``; ``fn(*args)`` itself when ``rows`` is None
-    (`padded_prefill_rows`)."""
-    if rows is None:
-        return fn(*args)
+    (`padded_prefill_rows`).
+
+    In a replayed region the bucket is the tensor the next segment reads
+    (`_claim_delivery`): the result lands there and only the rows past
+    ``rows`` are zeroed, so nothing is allocated or copied twice. With
+    ``writes_out``, ``fn`` also takes those rows as ``out=``; a result it
+    returns elsewhere is copied in."""
     height = next(a.shape[0] for a in args if isinstance(a, torch.Tensor))
-    result = fn(
-        *(
+    target = _claim_delivery(height)
+    if rows is not None:
+        args = tuple(
             a[:rows] if isinstance(a, torch.Tensor) and a.shape[0] == height else a
             for a in args
         )
-    )
-    padded = result.new_empty((height, *result.shape[1:]))
-    padded[:rows].copy_(result)
-    padded[rows:].zero_()
-    return padded
+    if target is None:
+        result = fn(*args)
+        if rows is None:
+            return result
+        padded = result.new_empty((height, *result.shape[1:]))
+        padded[:rows].copy_(result)
+        padded[rows:].zero_()
+        return padded
+    out = target if rows is None else target[:rows]
+    result = fn(*args, out=out) if writes_out else fn(*args)
+    if result.data_ptr() != out.data_ptr():
+        out.copy_(result)
+    if rows is not None:
+        target[rows:].zero_()
+    return target
 
 
 def forks(stream: torch.cuda.Stream | None) -> bool:

@@ -1116,7 +1116,7 @@ def unified_attention_with_output_base(
         # Rows are positions' last dim (an mrope table leads with its axes).
         positions = positions[..., :rows]
 
-    def attend(q, q_scale, k, v, qkv):
+    def attend(q, q_scale, k, v, qkv, out=None):
         if use_mla:
             return self.impl.forward(
                 query=q,
@@ -1137,9 +1137,13 @@ def unified_attention_with_output_base(
             position=positions,
             q_scale=q_scale,
             qkv=qkv,
+            output=out,
         )
 
-    return on_scheduled_rows(attend, rows, q, q_scale, k, v, qkv)
+    # A token-graph replay hands MHA the rows the next segment reads as `out`.
+    return on_scheduled_rows(
+        attend, rows, q, q_scale, k, v, qkv, writes_out=not use_mla
+    )
 
 
 def unified_attention_with_output_quant_base_fake(
