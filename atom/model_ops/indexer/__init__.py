@@ -17,7 +17,11 @@ import importlib
 _EXPORTS = {
     "NATURAL": ".rows",
     "PRESHUFFLE": ".rows",
+    "ConcatGroup": ".rows",
     "ConcatKeys": ".rows",
+    "DcpConcatGather": ".rows",
+    "concat_groups": ".rows",
+    "ubatch_concat_keys": ".rows",
     "Fp4LaunchStorages": ".rows",
     "IndexCache": ".rows",
     "IndexRows": ".rows",
@@ -29,16 +33,21 @@ _EXPORTS = {
     "quantize_query": ".query",
     "quantize_query_rows": ".query",
     "score_topk": ".score",
+    "FP8_MQA_LOGITS_TAKES_OUT": ".score",
 }
 
 __all__ = [
+    "FP8_MQA_LOGITS_TAKES_OUT",
     "NATURAL",
     "PRESHUFFLE",
+    "ConcatGroup",
     "ConcatKeys",
+    "DcpConcatGather",
     "Fp4LaunchStorages",
     "IndexCache",
     "IndexRows",
     "RowSplit",
+    "concat_groups",
     "concat_rows",
     "fold_query_scale",
     "fp4_rows",
@@ -46,6 +55,7 @@ __all__ = [
     "quantize_query",
     "quantize_query_rows",
     "score_topk",
+    "ubatch_concat_keys",
 ]
 
 

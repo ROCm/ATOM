@@ -12,9 +12,13 @@ so a burst of long-context requests can push one allocation to tens of GiB
 owns the one rule they all need to agree on.
 """
 
+import logging
+
 import torch
 
 from atom.utils import envs
+
+logger = logging.getLogger("atom")
 
 # A buffer resource descriptor addresses at most 2^31 bytes, so aiter's
 # fp8_mqa_logits drops to plain global load/store once the logits tensor reaches
@@ -231,3 +235,122 @@ class LogitsWorkspace:
     def logits(self, rows: int, width: int) -> torch.Tensor:
         """`[rows, width]` fp32, one band of the plane; fails past it."""
         return flat_view(self._logits, rows, width)
+
+
+# aiter allocates a dense prefill plane with rows padded to this many columns;
+# a plane carved from a workspace keeps the same row pitch.
+CONCAT_PLANE_ROW_ALIGN = 256
+
+
+def concat_plane_width(keys: int) -> int:
+    """Row pitch of an FP8 prefill (concat) logits band over `keys` gathered
+    keys: `keys` rounded up to `CONCAT_PLANE_ROW_ALIGN`."""
+    align = CONCAT_PLANE_ROW_ALIGN
+    return max(align, -(-keys // align) * align)
+
+
+def concat_group_capacity(key_capacity: int, logits_capacity: int | None) -> int:
+    """Keys that fit both the gathered-key buffer and one aligned logits row.
+
+    `logits_capacity` counts fp32 elements, not bytes. A partial row-alignment
+    tile cannot hold another key. None means aiter allocates its own logits.
+    """
+    if logits_capacity is None:
+        return key_capacity
+    return min(
+        key_capacity,
+        logits_capacity // CONCAT_PLANE_ROW_ALIGN * CONCAT_PLANE_ROW_ALIGN,
+    )
+
+
+def pack_concat_groups(cu_committed, capacity: int) -> list[tuple[int, int]]:
+    """Pack consecutive requests into groups of at most `capacity` keys.
+
+    The fixed workspaces must hold one max-model-length request at startup.
+    An oversized request is a configuration error; splitting its query rows
+    cannot make even one logits row fit.
+    """
+    requests = len(cu_committed) - 1
+    runs, first = [], 0
+    for end in range(1, requests + 1):
+        length = int(cu_committed[end] - cu_committed[end - 1])
+        if length > capacity:
+            raise ValueError(
+                f"prefill request {end - 1} has {length} keys, exceeding the "
+                f"concat workspace capacity of {capacity}; the workspace must "
+                "hold one max-model-length request"
+            )
+        if end - 1 > first and cu_committed[end] - cu_committed[first] > capacity:
+            runs.append((first, end - 1))
+            first = end - 1
+    if requests:
+        runs.append((first, requests))
+    return runs
+
+
+class ConcatKeyWorkspace:
+    """The FP8 prefill indexer's gathered keys (`ConcatKeys`): every scheduled
+    request's committed keys end to end, as FP8 rows and their fp32 scales,
+    and under DCP the all-gathered rank shards they are de-interleaved from.
+    Held for the server's life, like `LogitsWorkspace`.
+
+    Allocated per step these are as long as the step's context, so each chunk
+    of a long prefill asks for a slightly larger block than the last one: the
+    caching allocator never finds one to reuse and reserves another, chunk
+    after chunk, until HBM runs out. Sized from the configuration before the
+    memory profile, they are counted in it. One request's keys are at most
+    the model length, so a step whose requests together outgrow the buffers
+    is gathered and scored a group of requests at a time
+    (`ConcatKeys.groups`). Callers without group metadata retain a growing
+    buffer for compatibility."""
+
+    def __init__(
+        self, capacity: int, dim: int, dtype, device, gathered_capacity: int = 0
+    ):
+        self.dim, self.dtype, self.device = dim, dtype, device
+        self._keys = self._buffers(capacity)
+        self._gathered = self._buffers(gathered_capacity)
+
+    def _buffers(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty((rows, self.dim), dtype=self.dtype, device=self.device),
+            torch.empty((rows, 1), dtype=torch.float32, device=self.device),
+        )
+
+    @property
+    def capacity(self) -> int:
+        """Keys the key buffer holds: a step, or a group of its requests
+        (`ConcatKeys.groups`), of at most this many keys fits without growth."""
+        return self._keys[0].shape[0]
+
+    @property
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in (*self._keys, *self._gathered))
+
+    def _grown(self, buffers, rows: int, what: str):
+        held = buffers[0].shape[0]
+        if rows <= held:
+            return buffers
+        grown = max(rows, 2 * held)
+        logger.warning(
+            "FP8 prefill indexer %s workspace: a step of %d keys outgrew %d; "
+            "growing it to %d",
+            what,
+            rows,
+            held,
+            grown,
+        )
+        return self._buffers(grown)
+
+    def keys(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """`[rows, dim]` FP8 keys and `[rows, 1]` fp32 scales the scorer reads."""
+        self._keys = self._grown(self._keys, rows, "key")
+        values, scales = self._keys
+        return values[:rows], scales[:rows]
+
+    def gathered(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """`[rows, dim]` FP8 and `[rows, 1]` fp32: DCP's all-gathered shards,
+        rank-major, which `keys` is de-interleaved from."""
+        self._gathered = self._grown(self._gathered, rows, "gathered-shard")
+        values, scales = self._gathered
+        return values[:rows], scales[:rows]

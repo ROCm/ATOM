@@ -15,6 +15,7 @@ from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
 
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.sparse_indexer_chunk import (
+    concat_plane_width,
     decode_band_rows,
     logits_rows,
     qsplit_rows,
@@ -40,15 +41,73 @@ class IndexCache(NamedTuple):
         return self.scales is not None
 
 
+class DcpConcatGather(NamedTuple):
+    """A group's DCP key gather: every rank's padded shard of the group's
+    requests is `local_total` rows, read off its index cache with
+    `local_cu_seqlens`, and `gather_index` de-interleaves the all-gathered
+    shards back to the group's keys end to end."""
+
+    local_total: int
+    local_cu_seqlens: torch.Tensor
+    gather_index: torch.Tensor
+
+
+class ConcatGroup(NamedTuple):
+    """Requests `[first, end)` of a step whose keys are gathered and scored
+    together: their query rows `[row_first, row_end)` and keys
+    `[key_first, key_first + total)` of the step's run. `end` None: every
+    request. `dcp`: under DCP, the group's own gather (`DcpConcatGather`);
+    None, the step's."""
+
+    first: int
+    end: int | None
+    row_first: int
+    row_end: int
+    key_first: int
+    total: int
+    dcp: Any = None
+
+
 class ConcatKeys(NamedTuple):
     """FP8 prefill: the step's requests' committed keys gathered end to end
     (`cu_committed` [requests + 1], `total` rows) and scored densely, row r
-    over `[row_starts[r], row_starts[r] + row_ends[r])` of them."""
+    over `[row_starts[r], row_starts[r] + row_ends[r])` of them. `workspace`:
+    where they are gathered (`ConcatKeyWorkspace`); None, allocated per step.
+    `groups`: when the step's keys together outgrow the workspace, its
+    requests in runs that each fit it, gathered and scored one after another
+    (`ConcatGroup`); None, one run of every request."""
 
     block_tables: torch.Tensor
     cu_committed: torch.Tensor
     total: int
     row_starts: torch.Tensor
+    workspace: Any = None
+    groups: tuple[ConcatGroup, ...] | None = None
+
+
+def concat_groups(keys: ConcatKeys, rows: int) -> tuple[ConcatGroup, ...]:
+    """`keys.groups`, or the one group of all `rows` against every key."""
+    if keys.groups is not None:
+        return keys.groups
+    return (ConcatGroup(0, None, 0, rows, 0, keys.total),)
+
+
+def ubatch_concat_keys(keys: ConcatKeys, start: int, stop: int) -> ConcatKeys:
+    """`keys` as a TBO ubatch of the step's rows `[start, stop)` reads them:
+    its rows' starts, and the groups its rows fall in with those rows
+    rebased to the ubatch. A group keeps all its keys."""
+    row_starts = keys.row_starts[start:stop]
+    if keys.groups is None:
+        return keys._replace(row_starts=row_starts)
+    groups = tuple(
+        group._replace(
+            row_first=max(group.row_first, start) - start,
+            row_end=min(group.row_end, stop) - start,
+        )
+        for group in keys.groups
+        if group.row_first < stop and group.row_end > start
+    )
+    return keys._replace(row_starts=row_starts, groups=groups)
 
 
 def _check_split_group(group: str) -> None:
@@ -224,18 +283,41 @@ def fp8_rows(row_ends, width, workspace, row_tables, *, next_n=1) -> IndexRows:
     )
 
 
-def concat_rows(row_ends, keys: ConcatKeys, split: RowSplit | None = None):
-    """FP8 prefill rows against their requests' gathered keys, banded by the
-    logits budget alone: a prefill's temporaries are allocated as it runs.
-    This rank's rows of them, `split` (every row by default)."""
+def concat_rows(
+    row_ends, keys: ConcatKeys, split: RowSplit | None = None, workspace=None
+):
+    """FP8 prefill rows against their requests' gathered keys. This rank's
+    rows of them, `split` (every row by default).
+
+    With `workspace` (`LogitsWorkspace`) each band is scored into the plane,
+    as many rows as it holds at `concat_plane_width` of its group's keys.
+    Without one, banded by the logits budget alone and each band's logits
+    allocated as it is scored -- a block whose size follows the step's
+    context, which a long prefill grows chunk by chunk. A band never spans
+    two groups (`ConcatKeys.groups`)."""
     split = split or RowSplit.of(row_ends.shape[0])
-    band = max(1, logits_rows(split.end - split.first, keys.total))
+    bands = []
+    # A group's rows band against that group's keys alone.
+    for group in concat_groups(keys, row_ends.shape[0]):
+        first = max(split.first, group.row_first)
+        end = min(split.end, group.row_end)
+        if first >= end:
+            continue
+        if workspace is None:
+            band = max(1, logits_rows(end - first, group.total))
+            bands += _uniform_bands(first, end, band)
+        else:
+            bands += _plane_bands(
+                first, end, concat_plane_width(group.total), workspace
+            )
+    bands = tuple(bands)
     return IndexRows(
         row_ends,
         keys.total,
-        _uniform_bands(split.first, split.end, band),
+        bands,
         split,
         concat=keys,
+        workspace=workspace,
     )
 
 

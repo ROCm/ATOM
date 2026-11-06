@@ -10,6 +10,8 @@ conversion otherwise. The `Indexer` module (models/deepseek_v2.py) owns the
 projections and calls this op.
 """
 
+import functools
+
 import torch
 from aiter import cp_gather_indexer_k_quant_cache, dtypes, indexer_k_quant_and_cache
 
@@ -40,6 +42,8 @@ def _dcp_gather_indexer_k_prefill(
     prefill_metadata,
     head_dim: int,
     device: torch.device,
+    keys=None,
+    group=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather the full-sequence indexer K under DCP for prefill top-k.
 
@@ -49,14 +53,39 @@ def _dcp_gather_indexer_k_prefill(
     exactly the round-robin write layout), all-gather it, then de-interleave back
     to global order -- the same local-shard + all-gather the decode path uses, on
     k rather than logits. Returns (k_fp8, k_scale) in global order.
+
+    With `keys.workspace` (`ConcatKeyWorkspace`) the shard is gathered straight
+    into this rank's slot of the workspace's all-gather buffer, all-gathered in
+    place and de-interleaved into its key buffer: nothing here is allocated per
+    step. `group` (`ConcatGroup`): gather only its requests, by its own
+    `DcpConcatGather` when it has one; every request by the step's otherwise.
     """
-    local_total = prefill_metadata.dcp_indexer_local_total
-    local_cu_seqlens = prefill_metadata.dcp_indexer_local_cu_seqlens
-    # Cached prefill pads block tables to running_bs for later consumers,
-    # while these local cums contain only the scheduled requests. AITER takes
-    # its request count from the table height: passing the padded rows would
-    # read beyond local_cu_seqlens and can gather another request's keys.
-    block_tables = prefill_metadata.block_tables[: local_cu_seqlens.numel() - 1]
+    workspace = getattr(keys, "workspace", None)
+    plan = getattr(group, "dcp", None)
+    if plan is None:
+        local_total = prefill_metadata.dcp_indexer_local_total
+        local_cu_seqlens = prefill_metadata.dcp_indexer_local_cu_seqlens
+        gather_index = prefill_metadata.dcp_indexer_gather_index
+        # Cached prefill pads block tables to running_bs for later consumers,
+        # while these local cums contain only the scheduled requests. AITER
+        # takes its request count from the table height: passing the padded
+        # rows would read beyond local_cu_seqlens and can gather another
+        # request's keys.
+        block_tables = prefill_metadata.block_tables[: local_cu_seqlens.numel() - 1]
+    else:
+        local_total, local_cu_seqlens, gather_index = plan
+        # The step's tables (`ConcatKeys`): a TBO ubatch's metadata holds only
+        # its own requests' rows, and a group counts the step's requests.
+        block_tables = keys.block_tables[group.first : group.end]
+    if workspace is not None:
+        return _dcp_gather_indexer_k_prefill_into(
+            workspace,
+            kv_cache,
+            block_tables,
+            local_total,
+            local_cu_seqlens,
+            gather_index,
+        )
     k_fp8_local = torch.empty([local_total, head_dim], device=device, dtype=dtypes.fp8)
     k_scale_local = torch.empty([local_total, 1], device=device, dtype=torch.float32)
     cp_gather_indexer_k_quant_cache(
@@ -73,9 +102,46 @@ def _dcp_gather_indexer_k_prefill(
         dtypes.fp8
     )
     gathered_scale = dcp_group.all_gather(k_scale_local, dim=0)
-    gather_index = prefill_metadata.dcp_indexer_gather_index
     k_fp8 = gathered_k.index_select(0, gather_index)
     k_scale = gathered_scale.index_select(0, gather_index)
+    return k_fp8, k_scale
+
+
+def _dcp_gather_indexer_k_prefill_into(
+    workspace,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    local_total: int,
+    local_cu_seqlens: torch.Tensor,
+    gather_index: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`_dcp_gather_indexer_k_prefill` into `workspace`: the local shard read
+    into this rank's slot of the all-gather buffer, which RCCL then gathers in
+    place, and de-interleaved into the key buffer by `index_select(out=)`."""
+    dcp_group = get_dcp_group()
+    world, rank = dcp_group.world_size, dcp_group.rank_in_group
+    gathered_k, gathered_scale = workspace.gathered(world * local_total)
+    slot = slice(rank * local_total, (rank + 1) * local_total)
+    cp_gather_indexer_k_quant_cache(
+        kv_cache,
+        gathered_k[slot],
+        gathered_scale[slot].view(dtypes.fp8),
+        block_tables,
+        local_cu_seqlens,
+        preshuffle=True,
+    )
+    # fp8 has no collective support; move the bytes as uint8.
+    gathered_bytes = gathered_k.view(torch.uint8)
+    group = dcp_group.device_group
+    torch.distributed.all_gather_into_tensor(
+        gathered_bytes, gathered_bytes[slot], group=group
+    )
+    torch.distributed.all_gather_into_tensor(
+        gathered_scale, gathered_scale[slot], group=group
+    )
+    k_fp8, k_scale = workspace.keys(gather_index.numel())
+    torch.index_select(gathered_bytes, 0, gather_index, out=k_fp8.view(torch.uint8))
+    torch.index_select(gathered_scale, 0, gather_index, out=k_scale)
     return k_fp8, k_scale
 
 
@@ -335,7 +401,14 @@ def sparse_attn_indexer(
         stable=stable_topk,
         out=topk_indices[: rows.out_rows],
         keys=(
-            _dcp_gather_indexer_k_prefill(kv_cache, attn_metadata, head_dim, k.device)
+            functools.partial(
+                _dcp_gather_indexer_k_prefill,
+                kv_cache,
+                attn_metadata,
+                head_dim,
+                k.device,
+                rows.concat,
+            )
             if rows.concat is not None
             and rows.split.world > 1
             and rows.split.group == "dcp"
