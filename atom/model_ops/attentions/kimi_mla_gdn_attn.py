@@ -169,6 +169,18 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
             return tensors
 
+        if getattr(config, "pipeline_parallel_size", 1) > 1 and getattr(
+            self.model_runner, "has_mla_indexer", False
+        ):
+            # A PP stage places its MLA rows and KDA slots by layer; a sparse
+            # MLA model's indexer regions have no such placement.
+            raise NotImplementedError(
+                f"{model_type} disaggregated serving does not support pipeline "
+                "parallelism with a sparse MLA indexer (pipeline_parallel_size="
+                f"{config.pipeline_parallel_size}). Run the P and D instances "
+                "with PP=1."
+            )
+
         tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
         tensors.slot_region_tp_segments = self._kda_slot_tp_segments(
             len(tensors.slot_regions)
@@ -264,6 +276,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         its MLA rows over the full-attention layers and its slots over the KDA
         layers, group by group (conv, SSM, then ReplaySSM's records and its
         one cursor), the same order `state_slot_regions` publishes here.
+
+        Only dense MLA rows are placed, as Kimi-K3 has: `get_kv_transfer_tensors`
+        refuses a sparse MLA model (`has_mla_indexer`, e.g. `glm5_next_text`)
+        under PP before this.
         """
         runner = self.model_runner
         num_hidden_layers = runner.config.hf_config.num_hidden_layers
