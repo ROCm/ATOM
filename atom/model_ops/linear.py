@@ -65,32 +65,6 @@ def use_fp4_non_shuffle_triton_gemm() -> bool:
     return envs.ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM
 
 
-def use_mxfp8_linear_bpreshuffle(
-    input_size: int,
-    output_size: int,
-    params_dtype: torch.dtype,
-    native_group_rows: int | None,
-) -> bool:
-    """Whether a native FP8 1x32 linear can use AITER's MXFP8 preshuffle path."""
-    if (
-        not envs.ATOM_GROUP32_WEIGHT_PRESHUFFLE
-        or params_dtype != dtypes.fp8
-        or native_group_rows != 1
-        or input_size % 128
-        or output_size % 16
-    ):
-        return False
-    from atom.model_ops.blockscale import aiter_group32_gemm_available
-
-    if not aiter_group32_gemm_available():
-        return False
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    # TODO: add gfx1250 after AITER exposes the matching MXFP8 1x32
-    # preshuffle scale/layout contract.
-    return get_gfx_runtime() == "gfx950"
-
-
 def use_mxfp4_n32k4_scale(weight: torch.Tensor) -> bool:
     """Select the 32x4 E8M0 scale layout for an eligible per_1x32 FP4 weight at load.
 
@@ -731,11 +705,7 @@ def weight_is_stored_preshuffled(
     side backwards.
     """
     if native_group_rows is not None:
-        if params_dtype != dtypes.fp8:
-            return False
-        if native_group_rows == 1:
-            return needs_preshuffled_weight
-        if native_group_rows != 32:
+        if params_dtype != dtypes.fp8 or native_group_rows not in (1, 32):
             return False
         if needs_preshuffled_weight:
             return True
@@ -916,13 +886,6 @@ class LinearBase(nn.Module):
                 raise ValueError(
                     "TP partitions must align with the native source blocks"
                 )
-        if use_mxfp8_linear_bpreshuffle(
-            self.input_size,
-            self.output_size,
-            self.params_dtype,
-            self.native_a8_group_rows,
-        ):
-            self.needs_preshuffled_weight = True
 
         if quant_type != QuantType.No and self.source_quant_dtype is None:
             if is_nvfp4:

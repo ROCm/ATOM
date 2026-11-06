@@ -43,11 +43,6 @@ def _get_aiter_fp8_gemm():
 _aiter_fp8_gemm = _get_aiter_fp8_gemm()
 
 
-def aiter_group32_gemm_available() -> bool:
-    """Whether the AITER group32 GEMM interface supports the native contract."""
-    return _aiter_fp8_gemm is not None
-
-
 def _check_quant_input(x, group):
     if x.ndim < 1 or x.shape[-1] % group:
         raise ValueError(f"Last dimension must be divisible by {group}")
