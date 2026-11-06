@@ -63,3 +63,40 @@ def test_aiter_execution_errors_are_not_hidden(monkeypatch, error_type):
             x_scale=torch.empty((3, 2), dtype=torch.float8_e8m0fnu),
         )
     assert raised.value is error
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="runs the FlyDSL and Triton GEMMs"
+)
+@pytest.mark.parametrize(
+    "n,k",
+    [(2304, 6144), (6144, 2048), (6144, 6144), (6144, 3072)],  # DSpark draft, TP4
+)
+@pytest.mark.parametrize("m", [1, 9, 200])
+def test_preshuffled_1x32_matches_the_row_major_gemm_bit_for_bit(n, k, m):
+    """The MiniMax-M3.1 DSpark draft's MXFP8 linears on AITER's preshuffled
+    group32 GEMM: same bytes, scales and products as the row-major (Triton)
+    path, so the output is identical."""
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.shuffle import shuffle_weight
+
+    if get_gfx() != "gfx950":
+        pytest.skip("the preshuffled 1x32 GEMM is gfx950's")
+    torch.manual_seed(0)
+    w = torch.randn(n, k, device="cuda") * 0.05
+    exp = torch.ceil(
+        torch.log2(w.view(n, k // 32, 32).abs().amax(-1).clamp_min(1e-12) / 448.0)
+    )
+    wq = (w.view(n, k // 32, 32) / torch.pow(2.0, exp)[..., None]).view(n, k)
+    wq = wq.clamp(-448, 448).to(torch.float8_e4m3fn)
+    ws = (exp + 127).to(torch.uint8).view(torch.float8_e8m0fnu)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    row_major = blockscale.native_quant_linear(x, wq, ws, weight_group_rows=1)
+    preshuffled = blockscale.native_quant_linear(
+        x,
+        shuffle_weight(wq, (16, 16)),
+        ws,
+        weight_group_rows=1,
+        weight_preshuffled=True,
+    )
+    torch.testing.assert_close(preshuffled, row_major, rtol=0, atol=0)
