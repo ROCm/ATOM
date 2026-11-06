@@ -155,14 +155,26 @@ def _prob_markov_stage1(
     BLOCK_ROW: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    PACKED_CHAIN: tl.constexpr = False,
+    FROM_PACKED: tl.constexpr = False,
 ):
-    """`_dspark_markov_argmax_stage1` + store z + Gumbel-max on the scores."""
+    """Shared bias/q/RNG arithmetic, with partial or packed winner output.
+
+    ``PACKED_CHAIN`` reduces into a uint64 row key in ``part_val_ptr``;
+    ``part_idx_ptr`` is unused. Otherwise publish the native tile partials.
+    ``FROM_PACKED`` reads the predecessor from a completed chain stage.
+    Both switches specialize at compile time; the numerical path is shared.
+    """
     tile = tl.program_id(0)
     offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     row_mask = offs_row < num_rows
     v_mask = offs_v < vocab_size
-    prev = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
+    previous = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
+    if FROM_PACKED:
+        prev = _unpack_prob_markov_id(previous).to(tl.int64)
+    else:
+        prev = previous
 
     acc = tl.zeros((BLOCK_ROW, BLOCK_V), dtype=tl.float32)
     for k in range(tl.cdiv(rank, BLOCK_K)):
@@ -216,8 +228,66 @@ def _prob_markov_stage1(
     )
     tile_idx = tl.min(cand, axis=1)
     tile_idx = tl.where(tile_idx < vocab_size, tile_idx + vocab_offset, vocab_size)
-    tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
-    tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
+    if PACKED_CHAIN:
+        # Ordered fp32 bits are the high word; inverse id makes smaller ids
+        # win exact score ties. Canonicalize -0/+0 to the same key.
+        tile_max = tl.where(tile_max == 0.0, 0.0, tile_max)
+        bits = tile_max.to(tl.uint32, bitcast=True)
+        ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000).to(
+            tl.uint32
+        )
+        key = (ordered.to(tl.uint64) << 32) | (~tile_idx.to(tl.uint32)).to(tl.uint64)
+        # A tile without a valid argmax (all NaNs, including a partial tile)
+        # contributes no key. Every numeric score, including -inf, beats 0.
+        # The next launch on this stream sees the completed reduction.
+        tl.atomic_max(
+            part_val_ptr + offs_row,
+            key,
+            mask=row_mask & (tile_idx < vocab_size),
+            sem="relaxed",
+        )
+    else:
+        tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
+        tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
+
+
+@triton.jit
+def _unpack_prob_markov_id(key):
+    # Zero is the empty/all-NaN row's key. Keep its gather in bounds.
+    return tl.where(key == 0, 0, ~key.to(tl.uint32))
+
+
+@triton.jit
+def _finish_prob_markov_chain(
+    keys_ptr,
+    out_ptr,
+    saved_ptr,
+    B: tl.constexpr,
+    T: tl.constexpr,
+    stride_key_pos,
+    stride_out_row,
+    stride_out_pos,
+    stride_saved_row,
+    stride_saved_pos,
+    SAVE_IDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = i < B * T
+    pos, row = i // B, i % B
+    ptr = keys_ptr + pos * stride_key_pos + row
+    key = tl.load(ptr, mask=mask, other=0)
+    token = _unpack_prob_markov_id(key)
+    tl.store(out_ptr + row * stride_out_row + pos * stride_out_pos, token, mask=mask)
+    if SAVE_IDS:
+        tl.store(
+            saved_ptr + row * stride_saved_row + pos * stride_saved_pos,
+            token,
+            mask=mask,
+        )
+    # All scoring kernels have completed before this launch. Each key has
+    # exactly one owner here, so reset needs neither atomics nor a barrier.
+    tl.store(ptr, tl.full((BLOCK,), 0, tl.uint64), mask=mask)
 
 
 def prob_markov_sample(

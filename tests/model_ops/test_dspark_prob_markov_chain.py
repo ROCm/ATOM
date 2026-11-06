@@ -102,7 +102,7 @@ class _Case:
             )
         self.saved.copy_(self.out)
 
-    def fused(self):
+    def fused(self, *, save_ids=True):
         prob_markov_sample_chain(
             self.base,
             self.anchor,
@@ -114,7 +114,7 @@ class _Case:
             self.seed,
             self.emb,
             self.keys,
-            self.saved,
+            self.saved if save_ids else None,
         )
 
     def check_guards(self):
@@ -145,6 +145,22 @@ def test_matches_native_ids_q_bits_and_embeddings(weights, b, strided):
         reference.reference()
         fused.fused()
         _compare(reference, fused)
+
+
+def test_optional_verifier_ids_and_unused_workspace_are_untouched(weights):
+    reference, fused = _Case(3, weights), _Case(3, weights, strided=True)
+    fused.copy_inputs(reference)
+    # Active keys start at zero; padding belongs to no scoring/final CTA.
+    fused.keys.view(torch.int64).fill_(17)
+    fused.keys[:T, : fused.b].view(torch.int64).zero_()
+    expected_keys = fused.keys.clone()
+    reference.reference()
+    fused.fused(save_ids=False)
+    for name in ("out", "q", "emb"):
+        assert _bits_equal(getattr(reference, name), getattr(fused, name)), name
+    assert torch.equal(fused.keys.view(torch.int64), expected_keys.view(torch.int64))
+    assert fused.saved.eq(-888).all().item()
+    fused.check_guards()
 
 
 @pytest.mark.parametrize(
@@ -240,12 +256,14 @@ def test_model_dispatch_preserves_native_and_verifier_buffers(
         head=SimpleNamespace(get_logits=lambda _: base.flatten(0, 1)),
         _sharded_markov_sample=lambda: False,
     )
-    reference = native.ProbDraftState.allocate(b, width, V, "cuda")
-    candidate = native.ProbDraftState.allocate(b, width, V, "cuda")
+    # Warmup allocates the maximum width even when a call drafts less.
+    reference = native.ProbDraftState.allocate(b, T, V, "cuda")
+    candidate = native.ProbDraftState.allocate(b, T, V, "cuda")
     reference.markov_keys = None
     for state in (reference, candidate):
         state.seed.fill_(1729)
         state.temps.fill_(0.6)
+        state.ids.fill_(7)  # unused tail must not retain an earlier proposal
     expected_ids, expected_emb = DeepseekV41DSpark._head_and_sample_prob(
         model, normed, hidden, anchors, reference
     )
@@ -263,6 +281,8 @@ def test_model_dispatch_preserves_native_and_verifier_buffers(
     assert len(calls) == int(b <= 32 and width == T)
     assert torch.equal(ids, expected_ids)
     assert torch.equal(candidate.ids, reference.ids)
+    assert torch.equal(candidate.ids[:, :width], ids.to(torch.int32))
+    assert candidate.ids[:, width:].eq(-1).all().item()
     assert _bits_equal(candidate.q, reference.q)
     assert _bits_equal(emb, expected_emb)
     assert not candidate.markov_keys.view(torch.int64).ne(0).any().item()

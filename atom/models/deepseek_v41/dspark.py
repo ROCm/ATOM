@@ -638,6 +638,9 @@ class DeepseekV41DSpark(DSparkDraftModel):
         fused_chain = tp_group is None and can_use_prob_markov_chain(
             base_logits, markov_w1, markov_w2, st.markov_keys
         )
+        if T < st.ids.shape[1]:
+            # A shorter block has no proposal/q pair for the unused tail.
+            st.ids[:B, T:].fill_(-1)
         if fused_chain:
             prob_markov_sample_chain(
                 base_logits,
@@ -669,7 +672,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
                     tp_group=tp_group,
                     use_custom=use_custom,
                 )
-            st.ids[:B].copy_(out_ids)
+            st.ids[:B, :T].copy_(out_ids)
         confidence = last.confidence_head(hc_hidden, markov_embeds)
         return out_ids, confidence
 
