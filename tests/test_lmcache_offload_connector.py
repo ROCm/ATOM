@@ -1258,6 +1258,9 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
         def record(self, stream):
             trace.append(("record", self.name, stream.name))
 
+        def synchronize(self):
+            trace.append(("host_wait", self.name))
+
     class _StreamContext:
         def __init__(self, state, stream):
             self.state = state
@@ -1355,6 +1358,9 @@ def test_staged_pipeline_skips_the_handshake_on_a_shared_stream(shared_stream):
         def record(self, stream):
             calls.append(("record", self.name))
 
+        def synchronize(self):
+            calls.append(("host_wait", self.name))
+
     class _FakeState:
         def __init__(self):
             self.staging_buffer = SimpleNamespace(
@@ -1392,15 +1398,15 @@ def test_staged_pipeline_skips_the_handshake_on_a_shared_stream(shared_stream):
     else:
         assert calls == [
             ("record", "ready"),
-            ("wait", "ready"),
+            ("host_wait", "ready"),
             ("record", "free"),
-            ("wait", "free"),
+            ("host_wait", "free"),
             ("record", "ready"),
-            ("wait", "ready"),
+            ("host_wait", "ready"),
             ("record", "free"),
-            ("wait", "free"),
+            ("host_wait", "free"),
             ("record", "ready"),
-            ("wait", "ready"),
+            ("host_wait", "ready"),
             ("record", "free"),
         ]
         assert state.staging_buffer.free_event_valid is True
@@ -1429,6 +1435,9 @@ def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | Non
 
         def record(self, stream) -> None:
             self.record_calls += 1
+
+        def synchronize(self) -> None:
+            pass
 
     class _FakeState:
         def __init__(self) -> None:

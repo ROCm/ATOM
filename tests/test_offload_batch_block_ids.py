@@ -137,6 +137,9 @@ class _Case:
         def record(self, stream):
             self.case.trace.append(("record", self.name, stream.name))
 
+        def synchronize(self):
+            self.case.trace.append(("host_wait", self.name))
+
     def ensure_buffer(self, staging_buffer, nbytes):
         self.trace.append(("allocate", nbytes))
         if self.fail_allocation:

@@ -3454,6 +3454,16 @@ def _page_pattern(block: int) -> bytes:
     return bytes((block * 11 + i) % 253 for i in range(PAGE_BLOCK_BYTES))
 
 
+class _HostFence:
+    """A producer event the save path must wait on from the host."""
+
+    def __init__(self) -> None:
+        self.waits = 0
+
+    def synchronize(self) -> None:
+        self.waits += 1
+
+
 class FakeStream:
     def __init__(self) -> None:
         self.waited: list = []
@@ -3596,14 +3606,16 @@ def test_in_place_save_packs_each_window_once(cluster, make_in_place_worker):
     worker, gpu, codec, stream = make_in_place_worker(save_slots=8)
     request = _save_req(41, 40)
     operation = request.save_operation
-    worker._do_save_req(request, producer_event="fence")
+    fence = _HostFence()
+    worker._do_save_req(request, producer_event=fence)
 
     # Windows of two chunks (a quarter of 8 slots), highest first, one pack each;
     # the staging path is never used.
     assert gpu.calls == []
     packs = [call[1] for call in codec.calls if call[0] == "pack"]
     assert packs == [[6, 7, 8, 9], [2, 3, 4, 5], [0, 1]]
-    assert stream.waited == ["fence"] * 3 and stream.synchronized == 3
+    # The producer fence is a host wait, never a device-side stream wait.
+    assert fence.waits == 3 and stream.waited == [] and stream.synchronized == 3
     objects = cluster.objects[MASTER]
     for index in range(5):
         expected = _page_pattern(2 * index) + _page_pattern(2 * index + 1)

@@ -906,7 +906,9 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         chunk = self.chunk_size
         stream = self._in_place_stream()
         if producer_event is not None:
-            stream.wait_event(producer_event)
+            # A host wait, never a device-side one: see
+            # `BlockGPUConnector._wait_for_save_source`.
+            producer_event.synchronize()
         # Only the window's part of the block table, with token offsets from
         # its first chunk: converting the whole table would cost every window
         # time in proportion to the prompt's length.
