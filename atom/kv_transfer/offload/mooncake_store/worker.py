@@ -877,7 +877,13 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         """This copy thread's stream for in-place packs and unpacks."""
         stream = getattr(self._in_place_tls, "stream", None)
         if stream is None:
-            stream = torch.cuda.Stream(device=self._codec.device)
+            from atom.kv_transfer.offload.atom_lmcache_staging import (
+                load_stream_priority,
+            )
+
+            stream = torch.cuda.Stream(
+                device=self._codec.device, priority=load_stream_priority()
+            )
             self._in_place_tls.stream = stream
         return stream
 

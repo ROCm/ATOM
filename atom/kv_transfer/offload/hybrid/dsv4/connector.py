@@ -1247,7 +1247,13 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         slot_codec, _, _ = self._require_slot_components()
         if slot_codec.device.type != "cuda":
             return None
-        return torch.cuda.Stream(device=slot_codec.device)
+        from atom.kv_transfer.offload.atom_lmcache_staging import (
+            load_stream_priority,
+        )
+
+        return torch.cuda.Stream(
+            device=slot_codec.device, priority=load_stream_priority()
+        )
 
     @staticmethod
     def _slot_stream_context(stream):

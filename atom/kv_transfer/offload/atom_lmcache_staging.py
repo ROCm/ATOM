@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -41,6 +44,33 @@ def memory_object_as_uint8(memory_obj: Any, nbytes: int) -> torch.Tensor:
     return flat[: int(nbytes)]
 
 
+_LOAD_PRIORITY_LOGGED = False
+
+
+def load_stream_priority() -> int:
+    """Stream priority for a transfer stream created on the calling thread.
+
+    With OFFLOAD_LOAD_STREAM_HIGH_PRIORITY=1, streams created on a load worker
+    (thread name ``*-load_*``) get the device's highest priority, so a load's
+    copy and scatter kernels are dispatched ahead of queued forward kernels.
+    Save threads and everything else keep the default priority (0).
+    """
+    global _LOAD_PRIORITY_LOGGED
+    if os.environ.get("OFFLOAD_LOAD_STREAM_HIGH_PRIORITY", "0") not in ("1", "true"):
+        return 0
+    if "-load" not in threading.current_thread().name:
+        return 0
+    _, greatest = torch.cuda.Stream.priority_range()
+    if not _LOAD_PRIORITY_LOGGED:
+        _LOAD_PRIORITY_LOGGED = True
+        logging.getLogger(__name__).info(
+            "Offload load streams use priority %d (thread %s)",
+            greatest,
+            threading.current_thread().name,
+        )
+    return int(greatest)
+
+
 class _NullCtx:
     def __enter__(self):
         return None
@@ -70,9 +100,10 @@ class _ThreadTransferState:
         self.pack_stream = None
         self.copy_stream = None
         if use_cuda:
+            priority = load_stream_priority()
             with torch.cuda.device(device):
-                self.pack_stream = torch.cuda.Stream()
-                self.copy_stream = torch.cuda.Stream()
+                self.pack_stream = torch.cuda.Stream(priority=priority)
+                self.copy_stream = torch.cuda.Stream(priority=priority)
         self.staging_buffer = _StagingBuffer(use_cuda)
 
     def stream_ctx(self, stream):
