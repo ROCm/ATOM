@@ -3514,7 +3514,7 @@ models:
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
         env:
-          common:
+          common: &issue382_a9_env_common
             ATOMESH_M31_AITER_REF: ''
             PYTHONNOUSERSITE: '1'
             PYTHONHASHSEED: '0'
@@ -3524,7 +3524,7 @@ models:
             ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
             # P gathers PAGEs into staging slots; D lands them and scatters.
             ATOM_PD_MHA_LANDING: '1'
-          prefill:
+          prefill: &issue382_a9_env_prefill
             HIP_VISIBLE_DEVICES: 0,1,2,3
             # The last stage also holds the DSpark draft, so it gets the fewest.
             VLLM_PP_LAYER_PARTITION: '16,16,16,12'
@@ -3535,7 +3535,7 @@ models:
             OFFLOAD_PROFILE: '1'
             OFFLOAD_MIN_LOAD_TOKENS: '0'
             PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true,"chunked_admission_timeout_s":900}'
-          decode:
+          decode: &issue382_a9_env_decode
             HIP_VISIBLE_DEVICES: 4,5,6,7
             DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_kv_fraction":0.15,"min_free_kv_fraction":0.1}}'
         benchmark:
@@ -3594,6 +3594,70 @@ models:
           common_args:
             max_model_len: 1048576
             max_num_seqs: 320
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+      # A9 with three decodes behind the one prefill: packed_nodes puts P and
+      # D1 on the first node (the Store stays there) and D2, D3 on the second.
+      # Each decode keeps A9's per-decode load, so C264 is three A9 C88s.
+      # packed_nodes sets each worker's HIP_VISIBLE_DEVICES, over the role env.
+      # The issue382 metrics sampler only runs single-node.
+      - &issue382_a9_1p3d_c264
+        <<: *issue382_a9_c140
+        name: issue382-a9-1p3d-c264
+        topology: 1p3d
+        display_topology: 1P3D-CPP4-TP4-MXFP4-ISSUE382-A9
+        pd_worker_layout: packed_nodes
+        nodes: ${ATOMESH_2P1D_NODES}
+        concurrency:
+        - 264
+        router:
+          policy: cache_aware
+          balance_abs_threshold: 2
+        decode:
+          workers: 3
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 528
+            decode_max_num_seqs: 176
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+        env:
+          common:
+            <<: *issue382_a9_env_common
+            ATOMESH_ISSUE382_METRICS: '0'
+          prefill: *issue382_a9_env_prefill
+          decode: *issue382_a9_env_decode
+      - <<: *issue382_a9_1p3d_c264
+        name: issue382-a9-1p3d-c180
+        concurrency:
+        - 180
+        decode:
+          workers: 3
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,120]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 360
+            decode_max_num_seqs: 120
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+      - <<: *issue382_a9_1p3d_c264
+        name: issue382-a9-1p3d-c330
+        concurrency:
+        - 330
+        decode:
+          workers: 3
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,220]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 660
+            decode_max_num_seqs: 220
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
     accuracy:
