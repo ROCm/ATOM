@@ -18,8 +18,14 @@ from types import SimpleNamespace
 
 import pytest
 from conftest import MockConfig
+from test_state_offload_index import STALE
 
-from atom.model_engine.block_manager import AdmissionProbe, BlockManager
+from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+from atom.model_engine.block_manager import (
+    AdmissionProbe,
+    BlockManager,
+    JointBoundaryDecision,
+)
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.page_unit_checkpoint import (
@@ -30,6 +36,7 @@ from atom.model_engine.prefix_hash import full_prompt_blocks
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
+from atom.model_engine.state_offload import StateOffloadIndex
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
     StateRuntime,
@@ -1404,6 +1411,9 @@ class TestPagedCopyCheckpoint:
 
         def could_serve(self, h):
             return h in self.hashes
+
+        def want_touch(self, h):
+            pass
 
         def request_load(self, req_id, h):
             if h not in self.hashes:
@@ -4493,6 +4503,9 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
         def could_serve(self, h):
             return self.can_load and h in self.hashes
 
+        def want_touch(self, h):
+            pass
+
         def request_load(self, req_id, h):
             if h not in self.hashes:
                 return False
@@ -4550,3 +4563,290 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
 
         assert seq.state_slot >= 0
         assert bm.state_gate_lost_boundary == before
+
+
+# ── state tier hit refresh: the admission hold and the voters ──────────────
+
+
+def _paged_bm():
+    bm = make_block_manager(
+        ckpt_config(num_kvcache_blocks=160, pool_entries={"state": 8}),
+        state_runtime=PAGED_COPY_RUNTIME,
+    )
+    bm.state_offload = StateOffloadIndex(verified_for_s=5.0)
+    return bm
+
+
+def _seq():
+    return stateful_seq(list(range(40)))
+
+
+class TestAdmissionHold:
+    """`record_allocation(defer_unverified=True)` holds an admission that
+    would load an unconfirmed image, and commits nothing while it does."""
+
+    def _joint(self, bm, monkeypatch, *, h=77, from_hbm=False):
+        decision = JointBoundaryDecision(
+            boundary_tokens=16,
+            boundary_hash=h,
+            kv_tokens=16,
+            claim_tokens=16,
+            state_from_hbm=from_hbm,
+        )
+        commits = []
+        monkeypatch.setattr(bm, "_joint_kv_boundary", lambda *a: decision)
+        monkeypatch.setattr(bm, "_fit_joint", lambda d, probe: d)
+        monkeypatch.setattr(
+            bm, "_commit_joint_boundary", lambda seq, d: commits.append(d)
+        )
+        return commits
+
+    def test_an_unconfirmed_joint_image_is_held(self, offload_clock, monkeypatch):
+        bm = _paged_bm()
+        commits = self._joint(bm, monkeypatch)
+        bm.state_offload.note_stored(77)
+        offload_clock[0] += STALE
+        seq = _seq()
+
+        assert not bm.record_allocation(
+            seq, AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+        assert commits == [] and bm.state_offload.loads_deferred_for_verify == 1
+        assert bm.state_offload.take_touches() == [77]
+
+        bm.state_offload.apply_touch_verdict(77, True)
+        assert bm.record_allocation(
+            seq, AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+        assert len(commits) == 1
+
+    def test_a_gone_image_is_not_parked_on(self, offload_clock, monkeypatch):
+        """The verdict drops the hash; the retry's boundary search no longer
+        sees the tier rung (`could_serve` is False), so it plans a lower one."""
+        bm = _paged_bm()
+        self._joint(bm, monkeypatch)
+        bm.state_offload.note_stored(77)
+        offload_clock[0] += STALE
+        assert not bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+        bm.state_offload.take_touches()
+        bm.state_offload.apply_touch_verdict(77, False)
+        assert not bm._tier_can_serve(77)
+
+    def test_a_recently_confirmed_image_goes_straight_through(
+        self, offload_clock, monkeypatch
+    ):
+        bm = _paged_bm()
+        commits = self._joint(bm, monkeypatch)
+        bm.state_offload.note_stored(77)
+        assert bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+        assert len(commits) == 1
+
+    def test_a_state_resident_in_hbm_is_never_held(self, offload_clock, monkeypatch):
+        bm = _paged_bm()
+        self._joint(bm, monkeypatch, from_hbm=True)
+        bm.state_offload.note_stored(77)
+        offload_clock[0] += STALE
+        assert bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+
+    def test_the_fit_probe_path_never_holds(self, offload_clock, monkeypatch):
+        bm = _paged_bm()
+        self._joint(bm, monkeypatch)
+        bm.state_offload.note_stored(77)
+        offload_clock[0] += STALE
+        assert bm.record_allocation(_seq(), AdmissionProbe(2, [1, 2]))
+
+    def _hbm_hit(self, bm, monkeypatch, resident):
+        """No joint; the HBM hit's state (hash 2) is stale on the tier and in
+        HBM while `resident` holds it."""
+        monkeypatch.setattr(
+            bm,
+            "_joint_kv_boundary",
+            lambda *a: JointBoundaryDecision(skip_reason="no_kv_reach"),
+        )
+        monkeypatch.setattr(bm, "_commit_joint_boundary", lambda seq, d: None)
+        monkeypatch.setattr(
+            bm.paged_state_checkpoints, "contains", lambda h: h in resident
+        )
+        bm.state_offload.note_stored(2)
+
+    def test_an_hbm_hit_holds_only_for_a_tier_sourced_state(
+        self, offload_clock, monkeypatch
+    ):
+        bm = _paged_bm()
+        resident = {2}
+        self._hbm_hit(bm, monkeypatch, resident)
+        offload_clock[0] += STALE
+        assert bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+        resident.clear()
+        assert not bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+
+    def test_a_replayed_hit_is_not_held(self, offload_clock, monkeypatch):
+        bm = _paged_bm()
+        self._hbm_hit(bm, monkeypatch, set())
+        monkeypatch.setattr(bm, "state_replay_tokens", 8)
+        offload_clock[0] += STALE
+        seq = _seq()
+        seq.replays_hit = True
+        assert bm.record_allocation(
+            seq, AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+
+    def test_the_hold_judges_the_joint_fit_kept(self, offload_clock, monkeypatch):
+        """A joint `_fit_joint` drops is not loaded, so its stale image must not
+        hold an admission that resumes at an HBM-resident hit."""
+        bm = _paged_bm()
+        commits = self._joint(bm, monkeypatch)
+        monkeypatch.setattr(
+            bm, "_fit_joint", lambda d, probe: bm._no_joint("partial_chunk_no_room")
+        )
+        monkeypatch.setattr(bm.paged_state_checkpoints, "contains", lambda h: h == 2)
+        bm.state_offload.note_stored(77)
+        offload_clock[0] += STALE
+        assert bm.record_allocation(
+            _seq(), AdmissionProbe(2, [1, 2], 1), defer_unverified=True
+        )
+        assert [d.skip_reason for d in commits] == ["partial_chunk_no_room"]
+        assert bm.state_offload.loads_deferred_for_verify == 0
+
+
+class TestVotersRegisterTouches:
+    """`could_serve` only answers; the voters register the hits they count."""
+
+    def _bm(self):
+        bm = _paged_bm()
+        bm.paged_state_checkpoints.attach_offload(bm.state_offload)
+        bm.state_offload.note_stored(77)
+        return bm
+
+    def test_the_resumable_scan_registers_a_tier_hit(self, offload_clock):
+        bm = self._bm()
+        assert bm.paged_state_checkpoints._reachable(77)
+        assert bm.state_offload.take_touches() == [77]
+
+    def test_an_hbm_hit_is_not_a_tier_vote(self, offload_clock, monkeypatch):
+        bm = self._bm()
+        monkeypatch.setattr(
+            bm.paged_state_checkpoints.store, "contains", lambda h: True
+        )
+        assert bm.paged_state_checkpoints._reachable(77)
+        assert bm.state_offload.take_touches() == []
+
+    def test_asking_whether_the_tier_can_serve_registers_nothing(self, offload_clock):
+        bm = self._bm()
+        assert bm._tier_can_serve(77)
+        assert bm.state_offload.take_touches() == []
+
+
+class TestResumeHash:
+    """`allocate` and the admission hold pick the state to resume from with
+    one helper, `_state_resume_hash`."""
+
+    def test_the_joint_boundary_wins_then_a_replay_then_the_hit(self, monkeypatch):
+        bm = _paged_bm()
+        seq = _seq()
+        assert bm._state_resume_hash(seq, 77, 2) == 77
+        assert bm._state_resume_hash(seq, -1, 2) == 2
+        assert bm._state_resume_hash(seq, -1, -1) == -1
+        monkeypatch.setattr(bm, "state_replay_tokens", 8)
+        seq.replays_hit = True
+        assert bm._state_resume_hash(seq, -1, 2) == -1, "a replay restores none"
+        assert bm._state_resume_hash(seq, 77, 2) == 77
+
+    def test_the_hold_judges_the_hash_allocate_then_loads(
+        self, offload_clock, monkeypatch
+    ):
+        bm = _paged_bm()
+        offload = bm.state_offload
+        bm.paged_state_checkpoints.attach_offload(offload)
+        first = _seq()
+        bm.allocate(first, bm.can_allocate(first))
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        # The image left HBM; only the tier has it, and not confirmed lately.
+        bm.paged_state_checkpoints.unindex(h)
+        offload.note_stored(h)
+        offload_clock[0] += STALE
+
+        asked, attached = [], []
+        hold, attach = offload.hold_admission, bm._attach_state_slots
+        monkeypatch.setattr(
+            offload, "hold_admission", lambda x: asked.append(x) or hold(x)
+        )
+        monkeypatch.setattr(
+            bm, "_attach_state_slots", lambda s, x: attached.append(x) or attach(s, x)
+        )
+        second = stateful_seq(list(range(48)))
+        probe = AdmissionProbe()
+        probe.num_cached_blocks = bm.can_allocate(second, record=False, probe=probe)
+        assert probe.num_cached_blocks > 0
+        assert not bm.record_allocation(second, probe, defer_unverified=True)
+        offload.apply_touch_verdict(h, True)
+        assert bm.record_allocation(second, probe, defer_unverified=True)
+        assert bm.allocate(second, probe.num_cached_blocks)
+        assert set(asked) == {h} and attached == [h]
+        assert second.offload_joint.load_hash == h
+
+
+def test_the_scheduler_retries_a_held_admission(monkeypatch):
+    """A held seq stays waiting and is admitted on a later pass."""
+    sched = make_scheduler(ckpt_config())
+    bm = sched.block_manager
+    real = bm.record_allocation
+    holds = [True]
+
+    def record(seq, probe, *, defer_unverified=False):
+        assert defer_unverified, "admission asks to hold unverified loads"
+        if holds.pop() if holds else False:
+            return False
+        return real(seq, probe, defer_unverified=defer_unverified)
+
+    monkeypatch.setattr(bm, "record_allocation", record)
+    seq = stateful_seq(list(range(12)))
+    sched.add(seq)
+    _, scheduled = sched.schedule()
+    assert scheduled == {}
+    assert list(sched.waiting) == [seq] and len(seq.block_table) == 0
+    _, scheduled = sched.schedule()
+    assert seq.id in scheduled and not sched.waiting
+
+
+def test_the_scheduler_publishes_touches_with_the_state_loads(offload_clock):
+    idx = StateOffloadIndex(verified_for_s=5.0)
+    idx.note_stored(7)
+    idx.want_touch(7)
+    sent = []
+    s = Scheduler.__new__(Scheduler)
+    s.kv_connector = SimpleNamespace(
+        enqueue_state_touches=lambda hs: sent.extend(hs) or True
+    )
+    s.block_manager = SimpleNamespace(state_offload=idx)
+    s._publish_state_loads()
+    assert sent == [7]
+
+
+def test_the_scheduler_applies_touch_verdicts(offload_clock):
+    idx = StateOffloadIndex(verified_for_s=5.0)
+    idx.note_stored(7)
+    offload_clock[0] += 1
+    idx.want_touch(7)
+    assert idx.take_touches() == [7]
+    s = Scheduler.__new__(Scheduler)
+    s.kv_connector = SimpleNamespace(take_state_touch_verdicts=lambda: {7: False})
+    s.block_manager = SimpleNamespace(state_offload=idx)
+    s.finished_recving_kv_req_ids = []
+    s.failed_recving_kv_req_ids = []
+    s.deferred_free_blocks = {}
+    s._update_from_kv_xfer_finished(KVConnectorOutput())
+    assert not idx.could_serve(7)
