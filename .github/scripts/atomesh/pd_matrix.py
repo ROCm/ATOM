@@ -523,6 +523,11 @@ def build_cell(
         },
         "server_args": server_args,
         "env": env,
+        # ATOM settings (atom.utils.envs names) the cell is measured with; the
+        # launcher fails the cell on an ATOM that does not define one.
+        "requires_atom_env": [
+            str(name) for name in normalize_list(suite_cfg.get("requires_atom_env"))
+        ],
         "run_eval": bool(suite_cfg.get("run_eval", False)),
         "eval_only": eval_only,
         "accuracy": {
