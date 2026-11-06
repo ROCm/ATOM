@@ -2230,12 +2230,12 @@ def test_a_block_position_past_the_block_table_is_dropped_not_clamped():
     offset, so the block would scatter its KV into whatever request owns that
     page. These rows want the pad tail's `-1`.
     """
-    from atom.spec_decode.draft_kv import block_page_idx
+    from atom.spec_decode.dspark_proposer import DSparkProposer
 
     block_tables = torch.zeros(1, 4, dtype=torch.int32)
     # Columns 0..3 exist; positions 254..258 straddle the end at block_size=64.
     positions = torch.tensor([[254, 255, 256, 257, 258]])
-    page_idx, in_table = block_page_idx(positions, 64, block_tables)
+    page_idx, in_table = DSparkProposer._block_page_idx(positions, 64, block_tables)
 
     assert page_idx.max().item() <= 3, "the gather index must stay in bounds"
     assert in_table.tolist() == [[True, True, False, False, False]]
@@ -2683,7 +2683,9 @@ def test_dcp_sharding_is_read_from_the_pool_spec(module, cls_name, sharded):
     assert proposer.DSparkProposer._draft_is_dcp_sharded.fget(stub) is False
 
 
-def _compute_draft_kv(kv_pool_spec, n_tok, n_rows=None, target_slots=True):
+def _compute_draft_kv(
+    kv_pool_spec, n_tok, n_rows=None, target_slots=True, publish_ctx_slots=True
+):
     """Drive the real `compute_draft_kv`; return what reached the model."""
     import torch
 
@@ -2696,7 +2698,9 @@ def _compute_draft_kv(kv_pool_spec, n_tok, n_rows=None, target_slots=True):
     stub = types.SimpleNamespace(
         # Two taps, so the trim is checked on each before the concat.
         aux_for=lambda h: [h, h + 1],
-        runner=types.SimpleNamespace(forward_vars={"draft_ctx_slots": slots}),
+        runner=types.SimpleNamespace(
+            forward_vars={"draft_ctx_slots": slots} if publish_ctx_slots else {}
+        ),
         model=types.SimpleNamespace(
             kv_pool_spec=kv_pool_spec,
             write_context_kv=lambda aux, pos, slot_mapping: seen.update(
@@ -2728,6 +2732,15 @@ def test_the_proposer_hands_a_pooled_draft_its_own_slots():
     seen = _compute_draft_kv(DraftKvPoolSpec(), 5)
     assert seen["aux"].shape == (5, 8)
     assert seen["slots"].tolist() == [100, 101, 102, 103, 104]
+
+
+def test_a_pooled_draft_on_a_builder_without_ctx_slots_is_named():
+    """A draft that declares a pool needs the target's builder to publish
+    `draft_ctx_slots`; a builder that does not is named, not a KeyError."""
+    from atom.spec_decode.draft_kv import DraftKvPoolSpec
+
+    with pytest.raises(RuntimeError, match="draft_ctx_slots"):
+        _compute_draft_kv(DraftKvPoolSpec(), 5, publish_ctx_slots=False)
 
 
 def test_the_proposer_hands_other_drafts_the_target_slots():
@@ -2810,6 +2823,7 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
         _blk_kv_indptr=torch.zeros(running_bs + 1, **i32),
         _blk_kv_indices=torch.zeros(0, **i32),
         _blk_last_page_lens=torch.ones(running_bs, **i32),
+        _block_page_idx=proposer.DSparkProposer._block_page_idx,
         model=types.SimpleNamespace(
             block_attention_is_mla=draft_cls.block_attention_is_mla,
             prepare_paged_block=lambda md, bt_, pos, slots, ctx, *a: seen.update(

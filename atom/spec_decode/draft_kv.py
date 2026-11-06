@@ -40,47 +40,6 @@ class DraftKvPoolSpec:
         return model_runner.block_size
 
 
-def block_page_idx(
-    block_positions: torch.Tensor,
-    tokens_per_entry: int,
-    block_tables: torch.Tensor,
-) -> "tuple[torch.Tensor, torch.Tensor]":
-    """Block-table column per position, and which columns exist.
-
-    The block drafts T positions PAST the anchor, so a request whose anchor
-    sits in its final page addresses a column the table does not have. The
-    index is clamped to keep the gather in bounds, but the clamp is not an
-    answer: it names the row's LAST column, which this request may never
-    have been given, and the slot derived from it keeps the original
-    position's in-page offset. Writing that would carry this block's KV
-    into whatever request owns the page that column points at.
-
-    So the mask is the real return value. Those rows want the same `-1` the
-    pad tail uses -- their draft tokens sit past the model length and cannot
-    survive verification anyway, so dropping them costs nothing.
-    """
-    page_idx = torch.div(block_positions, tokens_per_entry, rounding_mode="floor")
-    in_table = page_idx < block_tables.shape[1]
-    return page_idx.clamp_(max=block_tables.shape[1] - 1), in_table
-
-
-def entry_slots(out, block_tables, positions, vblock):
-    """Every position's slot at ``vblock``-token entries, into ``out``.
-
-        slot = block_tables[r, pos // vblock] * vblock + pos % vblock
-
-    ``positions`` is laid out one row per table row, ``[rows, n]``. A column
-    the table does not have is ``-1`` (see `block_page_idx`). On the device, no
-    host sync.
-    """
-    page_idx, in_table = block_page_idx(positions, vblock, block_tables)
-    out.copy_(torch.gather(block_tables, 1, page_idx))
-    out.mul_(vblock)
-    out.add_(torch.remainder(positions, vblock))
-    out.masked_fill_(~in_table, -1)
-    return out
-
-
 def draft_kv_builder(model_runner, draft_hf, model):
     """The KV builder a draft needs of its own, or None if it needs none.
 

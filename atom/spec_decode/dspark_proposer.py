@@ -8,7 +8,6 @@ from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
-from atom.spec_decode.draft_kv import block_page_idx, entry_slots
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter, _resolve_decoder_layers
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
@@ -239,7 +238,7 @@ class DSparkProposer(Drafter):
         self._blk_kv_indices = torch.zeros(
             (
                 max_bs * (self.config.max_model_len + t)
-                if getattr(self.model, "block_attention_is_mla", True)
+                if self.model.block_attention_is_mla
                 else 0
             ),
             **i32,
@@ -688,7 +687,15 @@ class DSparkProposer(Drafter):
                 [h[:num_rows] for h in aux_hidden_states], dim=-1
             )
         if self.model.kv_pool_spec is not None:
-            slot_mapping = self.runner.forward_vars["draft_ctx_slots"].gpu[:num_rows]
+            ctx_slots = self.runner.forward_vars.get("draft_ctx_slots")
+            if ctx_slots is None:
+                raise RuntimeError(
+                    f"{type(self.model).__name__} declares a kv_pool_spec, so the "
+                    "target's attention metadata builder must publish its context "
+                    "slots as forward_vars['draft_ctx_slots'] (the Kimi MLA/GDN "
+                    "builders in kimi_mla_gdn_attn.py do); this target's does not."
+                )
+            slot_mapping = ctx_slots.gpu[:num_rows]
         else:
             # None on a target whose metadata addresses KV another way (V4.1);
             # its draft addresses by position too.
@@ -925,7 +932,7 @@ class DSparkProposer(Drafter):
             # positions p with p % dcp_world_size == r, packed densely into its
             # page. Rows this rank does not own go to -1 (dropped).
             virtual_block = block_size * self.dcp_world_size
-            page_idx, in_table = block_page_idx(
+            page_idx, in_table = self._block_page_idx(
                 block_positions, virtual_block, block_tables
             )
             local_off = torch.div(
@@ -954,8 +961,18 @@ class DSparkProposer(Drafter):
             )
         else:
             # Unfiltered: this rank holds the whole token axis, so `ctx_lens`
-            # is the global length.
-            entry_slots(slots, block_tables, block_positions, entry_tokens)
+            # is the global length. slot = page_id * entry_tokens +
+            # offset_in_entry, derived on-device from the block table so there
+            # is no host sync.
+            page_idx, in_table = self._block_page_idx(
+                block_positions, entry_tokens, block_tables
+            )
+            slots.copy_(torch.gather(block_tables, 1, page_idx))
+            slots.mul_(entry_tokens)
+            slots.add_(torch.remainder(block_positions, entry_tokens))
+            # Positions the table cannot address are dropped, not clamped --
+            # see `_block_page_idx`.
+            slots.masked_fill_(~in_table, -1)
             ctx_lens.copy_(global_lens)
 
         # The CSR generator skips entries past the block table's width, so
@@ -1091,6 +1108,30 @@ class DSparkProposer(Drafter):
                 block + self.dcp_world_size - 1 - self.dcp_rank
             ) // self.dcp_world_size
         return min(max(block, 1), self._draft_entry_tokens)
+
+    @staticmethod
+    def _block_page_idx(
+        block_positions: torch.Tensor,
+        tokens_per_entry: int,
+        block_tables: torch.Tensor,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Block-table column per block position, and which columns exist.
+
+        The block drafts T positions PAST the anchor, so a request whose anchor
+        sits in its final page addresses a column the table does not have. The
+        index is clamped to keep the gather in bounds, but the clamp is not an
+        answer: it names the row's LAST column, which this request may never
+        have been given, and the slot derived from it keeps the original
+        position's in-page offset. Writing that would carry this block's KV
+        into whatever request owns the page that column points at.
+
+        So the mask is the real return value. Those rows want the same `-1` the
+        pad tail uses -- their draft tokens sit past the model length and cannot
+        survive verification anyway, so dropping them costs nothing.
+        """
+        page_idx = torch.div(block_positions, tokens_per_entry, rounding_mode="floor")
+        in_table = page_idx < block_tables.shape[1]
+        return page_idx.clamp_(max=block_tables.shape[1] - 1), in_table
 
     def _propose_with_draft(
         self,
