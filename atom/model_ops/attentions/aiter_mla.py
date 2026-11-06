@@ -44,6 +44,7 @@ from atom.kv_transfer.disaggregation.pd_producer import (
 from atom.kv_transfer.disaggregation.pd_producer import mooncake_pd_producer_configured
 from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_ops import opus_mla
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
     _MLA_SPLIT_BUDGET_AUTO,
@@ -2863,6 +2864,40 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             row_ends=staged[mtp_ends]
         )
 
+    def _uses_opus_mla(self, bs: int, cp_round_robin: bool) -> bool:
+        """Whether a DCP + MTP decode batch of ``bs`` running requests runs
+        ``opus_mla``. Graph capture and ``prepare_decode`` both decide with it,
+        so a replayed graph always gets a plan for the kernel it captured. A
+        TBO micro-batch would need its own plan, so decode TBO keeps the
+        default kernel."""
+        return (
+            cp_round_robin
+            and not self.is_sparse
+            and not self.model_runner.config.enable_tbo_decode
+            and opus_mla.enabled()
+            and opus_mla.uses_opus_for_batch(bs)
+        )
+
+    def _opus_mla_dcp1_heads(self, bs: int, max_q_len: int) -> int:
+        """The query heads a DCP1 (no decode context parallelism) MTP decode
+        batch of ``bs`` running requests runs ``opus_mla`` with (this rank's
+        padded heads, which the layer's ``q`` has), or 0 to keep
+        ``mla_decode_fwd``.
+        Graph capture and ``prepare_decode`` both decide with it, as with
+        ``_uses_opus_mla``; decode TBO keeps the default kernel for the same
+        reason."""
+        # the switch first: off (the default), nothing else is read
+        if not opus_mla.enabled() or self.dcp_world_size != 1:
+            return 0
+        heads = self.padded_num_attention_heads
+        uses = (
+            not self.is_sparse
+            and not self.model_runner.config.enable_tbo_decode
+            and opus_mla.dcp1_shape_ok(heads, max_q_len)
+            and opus_mla.uses_opus_for_batch(bs)
+        )
+        return heads if uses else 0
+
     def prepare_decode(
         self,
         batch: ScheduledBatch,
@@ -3099,6 +3134,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # nothing here writes the host copy.
         ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
 
+        opus_plan = None
         if is_sparse_mtp:
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
                 running_bs, max_seqlen_q
@@ -3125,6 +3161,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 meta_bs, max_seqlen_q, is_cp_round_robin=cp_round_robin
             )
             ctx_mla_ps_sparse = None
+            # Decided on running_bs (the graph's size); planned over the
+            # scheduled requests, as the cprr metadata above.
+            if self._uses_opus_mla(running_bs, cp_round_robin):
+                opus_mla.update_plan(
+                    var["kv_indptr"].np,
+                    scheduled_bs,
+                    max_seqlen_q,
+                    self.dcp_world_size,
+                )
+                opus_plan = opus_mla.make_marker(running_bs, max_seqlen_q)
+            elif heads := self._opus_mla_dcp1_heads(running_bs, max_seqlen_q):
+                # DCP1: the same, over this rank's whole KV and its own heads
+                opus_mla.update_plan(
+                    var["kv_indptr"].np, scheduled_bs, max_seqlen_q, 1, heads
+                )
+                opus_plan = opus_mla.make_marker(running_bs, max_seqlen_q, heads)
         ctx.update(ctx_mla_ps)
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
@@ -3133,6 +3185,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx,
         )
         attn_metadata.dtype_q = self.dtype_q
+        attn_metadata.opus_plan = opus_plan
 
         # Round-robin CP global kv_indptr (only under DCP; None otherwise so the
         # non-DCP / qlen=1 paths keep the plain kernel). Consumed by
@@ -3463,6 +3516,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.g_kv_indptr = (
             var["g_kv_indptr"].gpu[: bs + 1] if self.dcp_world_size > 1 else None
         )
+        # Replays read each step's plan, published by prepare_decode.
+        opus_plan = None
+        if not is_sparse_mtp:
+            if self._uses_opus_mla(bs, cp_round_robin):
+                opus_plan = opus_mla.capture_marker(bs, max_q_len)
+            elif heads := self._opus_mla_dcp1_heads(bs, max_q_len):
+                opus_plan = opus_mla.capture_marker(bs, max_q_len, heads)
+        attn_metadata.opus_plan = opus_plan
         if ctx_mla_ps_sparse is not None:
             for k, v in ctx_mla_ps_sparse.items():
                 setattr(attn_metadata, k, v)

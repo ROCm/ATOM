@@ -65,6 +65,7 @@ from atom.distributed.pcp_utils import (
     pcp_allgather_rerange,
     pcp_is_enabled,
 )
+from atom.model_ops import opus_mla
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     MLA_WORK_NAMES,
 )
@@ -205,6 +206,9 @@ if fused_qk_rope_concat_and_cache_mla_seg is not None:
     )
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
+opus_mla_decode = mark_trace(
+    opus_mla.decode, prefix="mla_decode_opus", torch_compile=False
+)
 
 # Paged Triton decode supports both interleaved and shuffled KV caches.
 triton_mla_decode_fwd = mark_trace(
@@ -2826,7 +2830,23 @@ class MLAAttention(nn.Module):
                 )
 
             seg_kv_buffer_4d = kv_buffer.view(-1, page_size, 1, q.shape[-1])
-            _, final_lse = mla_decode_fwd(
+            decode_fwd = (
+                opus_mla_decode
+                if opus_mla.wanted(
+                    attn_metadata,
+                    q=q,
+                    kv_buffer=seg_kv_buffer_4d,
+                    o=o,
+                    q_scale=self._q_scale,
+                    kv_scale=self._k_scale,
+                    causal=causal,
+                    cp_world_size=cp_world_size,
+                    max_q_len=max_q_len,
+                    page_size=page_size,
+                )
+                else mla_decode_fwd
+            )
+            _, final_lse = decode_fwd(
                 q,
                 seg_kv_buffer_4d,
                 o,
