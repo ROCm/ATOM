@@ -1311,6 +1311,16 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # The indexer's queries (one head per kv head), then its one key head.
         return fields + [(num_kv_heads, index_head_dim), (1, index_head_dim)]
 
+    @property
+    def writes_quantized_pad_rows(self) -> bool:
+        """Whether a padded prefill may hand the whole token bucket's FP8
+        output and descales: the PA then writes the rows past the scheduled
+        ones as zeros with a unit descale (`unified_attention_with_output_quant_base`).
+        """
+        from atom.model_ops.base_attention import _flydsl_output_quant_option
+
+        return _flydsl_output_quant_option("quantized_pad_rows")
+
     def __init__(
         self,
         num_heads,
@@ -1749,8 +1759,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
             plan_cache_owner=prefill_md,
         )
-        result = quantized_output if quantized_output is not None else output
-        result = result.view(*q.shape)
+        if quantized_output is not None:
+            # May cover a padded bucket past q's rows (`writes_quantized_pad_rows`).
+            result = quantized_output.view(-1, *q.shape[1:])
+        else:
+            result = output.view(*q.shape)
         self._index_q = None
         self._index_q_cache_key_info = None
         from atom.utils.tbo.ubatching import tbo_active
