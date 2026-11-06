@@ -991,7 +991,7 @@ class BlockManager:
         gated = self._gated_hit(seq, compressed, walk.hashes)
         hit, _, _ = self._replay_decision(seq, compressed, gated, kv_prefix_tokens)
         return self._joint_kv_boundary(
-            seq, hit, walk.hashes, kv_prefix_tokens=kv_prefix_tokens
+            seq, hit, walk.hashes, kv_prefix_tokens
         ).boundary_tokens
 
     def _joint_kv_boundary(
@@ -999,8 +999,7 @@ class BlockManager:
         seq: Sequence,
         hbm_boundary: int,
         block_hashes: list[int],
-        *,
-        kv_prefix_tokens: int | None = None,
+        kv_prefix_tokens: int,
     ) -> JointBoundaryDecision:
         """The boundary above the HBM hit that BOTH legs can reach, as a value.
 
@@ -1041,8 +1040,6 @@ class BlockManager:
         # `get_kvconnector` returned, and one without `chunk_size` would zero
         # this and disable the feature silently.
         chunk = self._joint_chunk_tokens
-        if kv_prefix_tokens is None:
-            kv_prefix_tokens = seq.offload_joint.kv_prefix_tokens
         lmc_tokens = int(kv_prefix_tokens or 0)
         if chunk <= 0:
             return self._no_joint("no_chunk_size")
@@ -1576,7 +1573,10 @@ class BlockManager:
         """Commit the fit probe before any allocation changes the pool."""
         if self.enable_prefix_caching:
             decision = self._joint_kv_boundary(
-                seq, probe.num_cached_blocks, probe.block_hashes
+                seq,
+                probe.num_cached_blocks,
+                probe.block_hashes,
+                seq.offload_joint.kv_prefix_tokens,
             )
             decision = self._fit_joint(decision, probe)
             self._commit_joint_boundary(seq, decision)

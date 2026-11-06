@@ -150,8 +150,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             )
         else:
             # Images are saved only at a chunk boundary, so an anchor off the
-            # chunk grid never reaches LMCache and the next turn resumes from
-            # the ladder (8192 tokens apart by default) or from nothing.
+            # chunk grid never reaches LMCache.
             block_manager.align_checkpoint_anchor(self.chunk_size)
         # sid -> (seq, KV-only reach in tokens) of the request's lookup, from
         # its answer until admission weighs it. The lookup keeps the PAGE KV

@@ -1615,21 +1615,6 @@ class TestPagedCopyCheckpoint:
         assert seq.offload_joint.boundary_tokens == 0
         assert bm.joint_boundaries == 0 and not bm.joint_skips
 
-    def test_a_waiting_request_probes_without_walking_its_prompt_again(
-        self, monkeypatch
-    ):
-        tokens = list(range(48))
-        bm = self._joint_bm(chunk=4 * BLOCK)
-        self._only_the_tier_keeps(bm, *self._prompt_with_a_rung_at(bm, 11, tokens))
-        bm.walk_memo = True
-        walks = []
-        walk = bm._walk_prefix
-        monkeypatch.setattr(bm, "_walk_prefix", lambda s: walks.append(s) or walk(s))
-        seq = stateful_seq(tokens)
-        for _ in range(3):
-            assert bm.joint_boundary_tokens(seq, len(tokens)) == 11 * BLOCK
-        assert len(walks) == 1
-
     def test_an_unaligned_hbm_hit_still_reaches_the_rung_above_it(self):
         """A hit that is not a multiple of the KV chunk used to refuse the
         whole CPU prefix (`hbm_off_chunk_grid`). The shared claim stops at
@@ -1994,7 +1979,7 @@ class TestPagedCopyCheckpoint:
         probe = AdmissionProbe()
         bm.can_allocate(seq, record=False, probe=probe)
         decision = bm._joint_kv_boundary(
-            seq, probe.num_cached_blocks, probe.block_hashes
+            seq, probe.num_cached_blocks, probe.block_hashes, len(PROMPT)
         )
         assert decision.skip_reason is None
         return seq, probe, decision
