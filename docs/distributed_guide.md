@@ -285,7 +285,7 @@ drained and warns if it is invoked while requests are still charged.
 - `ParallelConfig.data_parallel_rank` (int, default `0`): This rank's DP index.
 - `ParallelConfig.data_parallel_rank_local` (int, default `None`): Local DP rank on this node.
 - `Config.dp_load_balance` (str, default `"least_requests"`): DP routing strategy.
-- CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens,prefix_spread}`
+- CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens,prefix_spread,store_tokens}`
 - Env: `ATOM_DP_LB_REQ_EQUIV` (int, default `512`): token-equivalent cost of one in-flight request for `least_tokens`.
 - Env: `ATOM_DP_DISPATCH_DEPTH` (int, default `0`): per-rank in-flight cap for lazy dispatch of an offline batch (`LLMEngine.generate` / `generate_multimodal`). Online API admission is unchanged. While it is positive, that offline routing balances on in-flight request count and ignores `round_robin` and `least_tokens`; init warns when `dp_load_balance` is not `least_requests`. Under `prefix_spread` the depth is ignored (init warns). A failed send returns the requests to the pending pool. `abort_request` removes a request that has not been sent yet.
 - Env: `ATOM_DP_SESSION_AFFINITY` (bool, default `0`): load-place each new
