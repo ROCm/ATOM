@@ -61,12 +61,13 @@ def chunk_fwd_kernel_o(
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HAS_NT: tl.constexpr,
+    H_VK: tl.constexpr,
     HEAD_MAJOR_VK: tl.constexpr = False,
     USE_EXP2: tl.constexpr = False,
 ):
     T_FLAT = T
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    if IS_VARLEN and HAS_NT:
+    if IS_VARLEN and HAS_NT:  # noqa: SIM102 (a constexpr, then a device load)
         if i_t >= tl.load(nt_ptr):
             return
     i_b, i_h = i_bh // H, i_bh % H
@@ -122,7 +123,7 @@ def chunk_fwd_kernel_o(
         _p_h_0 = (i_k * BK) + tl.arange(0, BK)
         _p_h_1 = (i_v * BV) + tl.arange(0, BV)
         h_offsets = _p_h_0[:, None] * V + _p_h_1[None, :]
-        if HEAD_MAJOR_VK:
+        if HEAD_MAJOR_VK or H_VK:
             h_offsets = _p_h_0[:, None] + _p_h_1[None, :] * K
         b_h = tl.load(
             h + h_offsets,
@@ -186,7 +187,8 @@ _MXFP8_OUT = None
 def mxfp8_output(o_fp8: torch.Tensor, o_scale: torch.Tensor):
     """Within this block a gated `chunk_fwd_o` on the gfx1250 kernel writes the out_proj's MXFP8 input --
     `o_fp8` [rows, H * V] fp8 and `o_scale` (e8m0 bytes at g * rows + m) -- and leaves its `o` unwritten. Yields
-    a list that is non-empty once a kernel took the buffers; the caller quantizes `o` itself otherwise."""
+    a list that is non-empty once a kernel took the buffers; the caller quantizes `o` itself otherwise.
+    """
     global _MXFP8_OUT
     used: list = []
     prev, _MXFP8_OUT = _MXFP8_OUT, (o_fp8, o_scale, used)
@@ -272,15 +274,12 @@ def chunk_fwd_o(
     ):
         from .chunk_o_gfx1250 import chunk_o_gfx1250
 
+        out_fp8 = None
         if _MXFP8_OUT is not None and gate is not None:
             o_fp8, o_scale, used = _MXFP8_OUT
-            chunk_o_gfx1250(
-                q, k, v, h, g, o, scale, cu_seqlens, chunk_indices, nt_ptr, NT, T, B, H, Hg, K, V, BT,
-                gate=gate, out_fp8=(o_fp8, o_scale),
-            )
+            out_fp8 = (o_fp8, o_scale)
             used.append(True)
-            return o
-        return chunk_o_gfx1250(
+        chunk_o_gfx1250(
             q,
             k,
             v,
@@ -299,8 +298,10 @@ def chunk_fwd_o(
             K,
             V,
             BT,
-            gate=gate,
+            gate,
+            out_fp8,
         )
+        return o
 
     chunk_fwd_kernel_o[(triton.cdiv(V, _TRITON_BV), NT, B * H)](
         q,
@@ -322,6 +323,7 @@ def chunk_fwd_o(
         BK=_TRITON_BK,
         BV=_TRITON_BV,
         HEAD_MAJOR_VK=head_major_vk,
+        H_VK=h.stride(-2) == 1,
         USE_EXP2=head_major_vk,
         num_warps=_TRITON_NUM_WARPS,
         num_stages=_TRITON_NUM_STAGES,

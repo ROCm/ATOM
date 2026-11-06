@@ -7,7 +7,8 @@ gfx1250 and Triton kernels, by slot and under a bucket-shaped plan. The per-chun
 `h` they used to be copied from holds that state rounded to bf16. And the copy
 kernel, told the interior states are already stored, copies only the
 end-of-sequence states and the conv windows, skipping the padding rows of a
-fixed-capacity table."""
+fixed-capacity table. It reads K-major h (gfx1250 chunk_h's [.., V, K] storage)
+into either pool layout."""
 
 import pytest
 import torch
@@ -229,3 +230,28 @@ def test_copy_kernel_skips_stored_states_and_padding():
     # padding rows wrote nothing
     others = [s for s in range(12) if s not in (5, 6)]
     torch.testing.assert_close(ssm[others], before[others], rtol=0, atol=0)
+
+
+def test_copy_kernel_reads_k_major_h():
+    gen = torch.Generator(device=DEV).manual_seed(2)
+    i32 = torch.int32
+    h = torch.randn(1, 4, 6, 128, 128, device=DEV, generator=gen).to(torch.bfloat16)
+    h_vk = h.transpose(-1, -2).contiguous().transpose(-1, -2)
+    x = torch.randn(256, 4, device=DEV, generator=gen).to(torch.bfloat16)
+    # (row, slot, offset, is_end, runtime slot) per target, chunk offsets, cu_seqlens
+    args = [
+        torch.tensor(t, dtype=i32, device=DEV)
+        for t in ([0, 1], [4, 5], [64, 64], [0, 0], [0, 1], [0, 2, 4], [0, 128, 256])
+    ]
+    pools = []
+    for src in (h, h_vk):
+        for vk in (False, True):
+            pool = torch.zeros(8, 6, 128, 128, device=DEV)
+            pool = pool.transpose(-1, -2).contiguous().transpose(-1, -2) if vk else pool
+            conv = torch.zeros(8, 4, 3, device=DEV, dtype=torch.bfloat16)
+            write_state_checkpoints(src, pool, x, conv, *args, 64, 3)
+            pools.append(pool)
+    assert torch.equal(pools[0][4], h[0, 1].float())
+    assert torch.equal(pools[0][5], h[0, 3].float())
+    for pool in pools[1:]:
+        assert torch.equal(pool, pools[0])

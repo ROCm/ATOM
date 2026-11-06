@@ -52,6 +52,7 @@ def chunk_gated_delta_rule_fwd(
     T = q.shape[1]
 
     assert gating is None or (is_amd and T >= 64)
+    decay = None
     if is_amd and T >= 64:
         if (
             envs.ATOM_GDN_GLUON_INVERSE
@@ -67,8 +68,8 @@ def chunk_gated_delta_rule_fwd(
         ):
             from .fused_kkt_inverse_gfx1250 import fused_kkt_inverse_gfx1250
 
-            g, w, u, beta_hm, scale_hm = fused_kkt_inverse_gfx1250(
-                k, v, cu_seqlens, plan, gating
+            g, decay, w, u, beta_hm, scale_hm = fused_kkt_inverse_gfx1250(
+                k, v, cu_seqlens, plan, gating, envs.ATOM_GDN_CHUNK_H_DECAY
             )
             A = None
         else:
@@ -126,6 +127,7 @@ def chunk_gated_delta_rule_fwd(
         w=w,
         u=u,
         g=g,
+        decay=decay,
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
@@ -146,7 +148,8 @@ def chunk_gated_delta_rule_fwd(
         gate=output_gate,
     )
     # `h` is the recurrent state at EVERY chunk boundary — [B, NT, H, K, V],
-    # where h[:, j] is the state after j*chunk_size tokens. The SSM state cache
+    # where h[:, j] is the state after j*chunk_size tokens (on gfx1250 a view of
+    # K-major [B, NT, H, V, K] storage; consumers read its strides). The SSM state cache
     # reads checkpoints straight out of it, which is what lets a checkpoint be
     # taken at an interior position without splitting the prefill into two
     # forwards.

@@ -10,6 +10,10 @@ fp64 conv (with the q / k norm applied to the bf16 conv output, as `l2norm_fwd`
 after the conv does), up to its fast SiLU: at most one bf16 step, on almost no
 values. A step in a conv output can become two once its head is normalized and
 rounded again, so q and k may be two steps off when the norm is fused.
+
+The gfx1250 persistent kernel normalizes q and k from the fp32 SiLU, so its q,
+k, v must be within one bf16 step of the fp64 conv + SiLU + norm, except in the
+far negative SiLU tail (|y| < 2^-14), where the absolute error is below 2^-18.
 """
 
 import pytest
@@ -130,7 +134,7 @@ def test_rows_kernel_matches_fp64(k_heads, v_heads, norm, fork):
 
 
 @pytest.mark.parametrize("fork", [False, True])
-def test_persistent_kernel_matches_rows_with_padded_metadata(fork):
+def test_persistent_kernel_matches_fp64_with_padded_metadata(fork):
     if (
         torch.version.hip is None
         or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx1250"
@@ -192,5 +196,26 @@ def test_persistent_kernel_matches_rows_with_padded_metadata(fork):
         )
         pools.append(current_pool)
     assert torch.equal(pools[0], pools[1])
-    for expected, actual in zip(outputs[0], outputs[1]):
-        assert torch.equal(expected, actual)
+    refs = _fp64_conv(
+        projection[:, :dim],
+        weight,
+        torch.zeros(dim, device=DEV),
+        pool,
+        lengths,
+        slots_in,
+        has_init,
+        k_dim,
+        False,
+    )
+    refs = [
+        (t := u.reshape(-1, HEAD)) / torch.sqrt((t * t).sum(-1, keepdim=True) + 1e-6)
+        for u in refs[:2]
+    ] + refs[2:]
+    for got, ref in zip(outputs[1], refs):
+        got = got.reshape(ref.shape)
+        # h + h * tanh(h) cancels in the far negative tail: an absolute bound there
+        tail = ref.abs() < 2**-14
+        steps = _bf16_steps(got, ref)[~tail]
+        assert steps.max() <= 1
+        assert (steps > 0).double().mean() < 1e-4
+        assert (got.double() - ref).abs()[tail].max() < 2**-18
