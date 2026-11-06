@@ -194,8 +194,15 @@ def load_core(c):
     row = OK + LDS_PAD
     for i in range_constexpr((words + THREADS - 1) // THREADS):
         e = fx.min(tid + THREADS * i, words - 1)
+        # device scope when this launch's DCP merge wrote them (``dcp_merge``)
         v = fx.Vector(
-            bo.buffer_load(rsrc(c["args"]["core"]), e * 4, vec_width=4, dtype=T.i32)
+            bo.buffer_load(
+                rsrc(c["args"]["core"]),
+                e * 4,
+                vec_width=4,
+                dtype=T.i32,
+                cache_modifier=c.get("core_cm", 0),
+            )
         )
         t = e // (OK // 8)
         k = e % (OK // 8) * 8

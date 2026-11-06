@@ -168,6 +168,11 @@ def hw_log2(x):
     return _hw_f32("llvm.amdgcn.log.f32", x)
 
 
+def llvm_log2(x):
+    """``llvm.log2.f32``: what Triton 3.8 lowers ``tl.log2`` to on gfx950."""
+    return _hw_f32("llvm.log2.f32", x)
+
+
 def div_rn(x, d, r):
     """``x / d`` rounded to nearest, bit-identical to the IEEE division, given
     ``r = 1.0 / d`` from one true division per divisor (Markstein: a quotient

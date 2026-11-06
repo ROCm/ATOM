@@ -22,6 +22,7 @@ from atom.models.glm52.mono.runner import Glm52MonoRunner
 
 def _runner(query_length, ops, refused):
     runner = object.__new__(Glm52MonoRunner)
+    runner._dcp = 1
     runner._query_length = query_length
     runner._ops = {(0, chunk): object() for chunk in ops}
     runner._refused = set(refused)

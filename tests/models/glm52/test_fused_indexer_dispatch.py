@@ -87,6 +87,7 @@ def _fused_servable_atom_config(**overrides):
         "index_cache_dtype": "fp8",
         "max_model_len": FUSED_INDEX_MAX_SEQ,
         "kv_cache_block_size": FUSED_INDEX_PAGE_SIZE,
+        "decode_context_parallel_size": 1,
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -235,6 +236,7 @@ def _build_ready_runner(
         norm=SimpleNamespace(weight=torch.zeros(1)),
     )
     runner = object.__new__(Glm52MonoRunner)
+    runner._dcp = 1
     runner._lm = SimpleNamespace(model=model)
     runner._atom_config = SimpleNamespace(
         hf_config=SimpleNamespace(index_topk=128),
@@ -272,7 +274,7 @@ def _build_ready_runner(
     monkeypatch.setattr(runner_mod, "glm5_kernel_samples", lambda rows, ql: rows)
     monkeypatch.setattr(runner_mod, "bf16_vector", lambda *a, **k: None)
 
-    def _fake_layer_weights(layer, rank, npes, with_indexer=False):
+    def _fake_layer_weights(layer, rank, npes, with_indexer=False, dcp_size=1):
         return SimpleNamespace(layer_idx=layer.layer_idx, with_indexer=with_indexer)
 
     monkeypatch.setattr(runner_mod, "layer_weights", _fake_layer_weights)
@@ -433,7 +435,7 @@ def test_fused_weight_mapping_failure_falls_back_without_refusing_rows(monkeypat
         monkeypatch, fused_indexer_on=True, full_layers=2, shared_layers=1
     )
 
-    def _failing_fused_layer_weights(layer, rank, npes, with_indexer=False):
+    def _failing_fused_layer_weights(layer, rank, npes, with_indexer=False, dcp_size=1):
         if with_indexer:
             raise MonoUnsupported("indexer weights missing")
         return SimpleNamespace(layer_idx=layer.layer_idx, with_indexer=with_indexer)

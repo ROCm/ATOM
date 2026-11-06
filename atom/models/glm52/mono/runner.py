@@ -35,7 +35,7 @@ from atom.models.glm52.mono.config import (
     indexer_cp_refusal,
     native_config,
 )
-from atom.models.glm52.mono.contract import mono_layers
+from atom.models.glm52.mono.contract import mono_layers, shared_dcp_indptr
 from atom.models.glm52.mono.contract import (
     shared_sparse_buffer as _shared_sparse_buffer,
 )
@@ -92,6 +92,7 @@ class _GlmLayerOp:
         prepared_weights,
         runtime,
         launches_per_step: int,
+        dcp_size: int = 1,
     ) -> None:
         from atom.models.glm52.mono.kernels.op import Glm5MonoKernel
 
@@ -112,6 +113,7 @@ class _GlmLayerOp:
             prepared_weights=prepared_weights,
             runtime=runtime,
             native_fp4_mfma=True,
+            dcp_size=dcp_size,
             # ``Glm5MonoKernel`` defaults to FP32 RoPE tables and validates the
             # dtype it is handed (``glm/op.py``); the tables ATOM passes to
             # ``forward`` are ``attn.rotary_emb.{cos,sin}_cache``, which are
@@ -318,6 +320,7 @@ class Glm52MonoRunner:
     def __init__(self, causal_lm, atom_config) -> None:
         self._lm = causal_lm
         self._atom_config = atom_config
+        self._dcp = atom_config.decode_context_parallel_size
         spec = atom_config.speculative_config
         self._query_length = 1 if spec is None else spec.num_speculative_tokens + 1
         is_mtp = spec is not None and spec.method == "mtp"
@@ -492,6 +495,14 @@ class Glm52MonoRunner:
             )
             if native is None:
                 raise MonoUnsupported("layer backend")
+            if self._dcp > 1:
+                # the kernel takes its TP rank and peer table as the DCP group's
+                # (and places a rank's q at head rank * 16 + h); with DCP == TP
+                # required by ``config_refusal`` this cannot fire today
+                from atom.distributed.dcp_utils import get_dcp_group
+
+                if get_dcp_group() is not get_tp_group():
+                    raise MonoUnsupported("the DCP group is not the TP group")
             for layer in layers:
                 if layer.layer_idx not in self._weights:
                     # Always the base (with_indexer=False) mapping: every
@@ -501,7 +512,9 @@ class Glm52MonoRunner:
                     # validated pass below -- see `_GlmFusedLayerOp`'s
                     # docstring and the "falls back, does not refuse `rows`"
                     # contract that pass must honor.
-                    weights = layer_weights(layer, rank, npes, with_indexer=False)
+                    weights = layer_weights(
+                        layer, rank, npes, with_indexer=False, dcp_size=self._dcp
+                    )
                     mapped.append(
                         (
                             layer.layer_idx,
@@ -684,6 +697,7 @@ class Glm52MonoRunner:
                         self._prepared[layer.layer_idx],
                         runtime,
                         launches_per_step=base_launches,
+                        dcp_size=self._dcp,
                     )
                     if runtime is None:
                         runtime = owned.op
@@ -785,6 +799,13 @@ class Glm52MonoRunner:
             projected_k_weights=tuple(index_kw) or None,
         )
 
+    def _sparse_indptr(self, metadata, layers, samples: int) -> torch.Tensor:
+        """The sparse attention's row bounds: under DCP this rank's compacted
+        local slots, not the step's global ones."""
+        if self._dcp == 1:
+            return metadata.sparse_kv_indptr[: samples + 1]
+        return shared_dcp_indptr(layers, samples)[: samples + 1]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -806,7 +827,7 @@ class Glm52MonoRunner:
         cur_pos = self._cur_pos
         shared_indices = _shared_sparse_buffer(model.layers)
         slot_mapping = metadata.slot_mapping[:samples]
-        sparse_indptr = metadata.sparse_kv_indptr[: samples + 1]
+        sparse_indptr = self._sparse_indptr(metadata, model.layers, samples)
         # One mailbox epoch per decode step, not per layer. `step` is a device
         # tensor, so bumping it once per layer cost 75 one-element int32 adds
         # per step -- 485 us of pure launch overhead on a serialized stream,

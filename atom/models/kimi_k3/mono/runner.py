@@ -45,13 +45,17 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+from atom.model_ops.dcp_ops import cp_lse_a2a
+from atom.model_ops.triton_fused_sigmoid_mul_quant import sigmoid_mul
 from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
     Dims,
+    inner_model,
     layer_block,
     num_blocks,
 )
 from atom.models.kimi_k3.mono.kernels import layer as k2
+from atom.models.kimi_k3.mono.kernels.attention import dcp_merge
 from atom.models.kimi_k3.mono.kernels.attention import kda as k1
 from atom.models.kimi_k3.mono.kernels.stages import moe as k2b
 from atom.models.kimi_k3.mono.plan import (
@@ -65,7 +69,7 @@ from atom.models.kimi_k3.mono.weights import bind_model
 from atom.mono.dsa_indexer import kernel as kix
 from atom.mono.dsa_indexer.runner import IndexerRunner
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
-from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
+from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed, tp_agree
 from atom.mono.runtime.debug import (
     DIAG_BYTES,
     given_up_waits,
@@ -86,13 +90,6 @@ logger = logging.getLogger("atom")
 K2_TAG0 = 128
 # the DSA layers' indexer launches, past every K2's
 IX_TAG0 = 2 * K2_TAG0
-
-
-def inner_model(model):
-    """The layer stack under whatever outer class the checkpoint registered.
-    K3's text-only and vision classes both hold it one level deeper than the
-    usual ``model.model``."""
-    return getattr(model, "language_model", model).model
 
 
 @dataclass(frozen=True)
@@ -116,12 +113,12 @@ class WidthBuild:
         )
 
 
-def ix_peer_offset(max_rows: int) -> int:
+def ix_peer_offset(max_rows: int, dcp: bool = False) -> int:
     """Where the DSA indexer's regions start in the peer buffer it shares with
     K2: past every K2 width's (up to ``max_rows``). A rank already in the next
     layer's K2 (its AR pushes from offset 0) then cannot land on hist pairs a
     peer's indexer is still polling; at a shared 0 they overlapped from 2 rows."""
-    return -(-k2.peer_bytes(max_rows) // 256) * 256
+    return -(-k2.peer_bytes(max_rows, dcp) // 256) * 256
 
 
 def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
@@ -154,10 +151,14 @@ class K3MonoDecodeRunner:
 
     max_rows = MAX_ROWS
 
-    def __init__(self, model, drafter=None, metadata_builder=None) -> None:
+    def __init__(
+        self, model, drafter=None, metadata_builder=None, dcp_merge=False
+    ) -> None:
         group = get_tp_group().cpu_group
+        # agreed when mono was installed (``mono.dcp.arm_dcp_merge``)
+        self.dcp_merge = dcp_merge
         bind_agreed(lambda: self._bind(model, drafter, metadata_builder), group)
-        peer_bytes = k2.peer_bytes(self.max_rows)
+        peer_bytes = k2.peer_bytes(self.max_rows, self.dcp_merge)
         if self.ix is not None:
             peer_bytes = max(peer_bytes, self.ix.peer_bytes)
         self.peers, self._finalizer = owned_peer_buffer(
@@ -192,6 +193,7 @@ class K3MonoDecodeRunner:
         self.tp = get_tensor_model_parallel_world_size()
         self.dims = Dims(self.tp)
         self.debug = envs.ATOM_MONO_DEBUG
+        self.check = envs.ATOM_MONO_CHECK
         self.inner = inner_model(model)
         self.plans = bind_model(self.inner, self.dims, self.rank)
         self.num_blocks = num_blocks(len(self.inner.layers))
@@ -203,6 +205,8 @@ class K3MonoDecodeRunner:
         )
         first = next(p for p in self.plans if p.mono)
         self.device = first.kda.w_in.device
+        if self.dcp_merge:
+            self._bind_dcp_merge()
         self.state_len = self._state_len()
         self.replay_cap = self._replay_cap()
         self._replay_tables = {}  # layer id -> (K1's ReplaySSM table, its pointers)
@@ -212,13 +216,34 @@ class K3MonoDecodeRunner:
             self.ix = IndexerRunner(
                 self.inner,
                 metadata_builder,
-                peer_offset=ix_peer_offset(self.max_rows),
+                peer_offset=ix_peer_offset(self.max_rows, self.dcp_merge),
                 max_rows=self.max_rows,
             )
         except MonoUnsupported as why:
             logger.info("mono DSA indexer off: %s", why)
             self.ix = None
         self._allocate()
+
+    def _bind_dcp_merge(self) -> None:
+        """The buffer the attention writes its DCP partial into
+        (``MLAAttention._dcp_defer_merge``), one for every full-attention
+        layer, read by K2 before the next one's attention. Static shapes are
+        checked here, once."""
+        heads, hd = dcp_merge.HEADS, dcp_merge.HD
+        self.dcp_out = torch.empty(
+            self.max_rows, heads, hd, dtype=torch.bfloat16, device=self.device
+        )
+        for i, layer in enumerate(self.inner.layers):
+            if layer.is_linear_attn:
+                continue
+            width = layer.self_attn.g_proj.output_size
+            if width != self.dims.proj:
+                raise MonoUnsupported(
+                    f"layer {i}: g_proj width {width}, K2's DCP merge gates "
+                    f"{self.dims.proj}"
+                )
+            impl = layer.self_attn.attn.impl
+            impl.dcp_partial_out = self.dcp_out
 
     def _state_len(self) -> int:
         """The conv state's window, a build constant: ``CONV_WIDTH - 1`` plus the
@@ -416,6 +441,7 @@ class K3MonoDecodeRunner:
                 eps=p.moe.seam.eps,
                 out_eps=p.moe.seam.out_eps,
                 ln_eps=p.moe.ln_eps,
+                dcp=self.dcp_merge and p.ffn_only,
                 diag=self.debug,
             )
             for p in self.plans
@@ -507,7 +533,12 @@ class K3MonoDecodeRunner:
                     f"an {rows}-row step"
                 )
         else:
-            if plan.ffn_only:
+            dcp = None
+            if plan.ffn_only and self.dcp_merge:
+                core, prefix, dcp = self._pre_o_dcp(
+                    plan, positions, prefix, blocks, add, add2
+                )
+            elif plan.ffn_only:
                 core, prefix = self._pre_o_core(
                     plan, positions, prefix, blocks, add, add2
                 )
@@ -516,7 +547,9 @@ class K3MonoDecodeRunner:
                 core = self._k1(build, plan, prefix, delta, blocks, metadata)
             # K2 updates ``prefix`` in place: on a block-write layer it restarts
             # it at the all-reduced o_proj output, which K1 has already banked
-            out = (prefix, self._k2(build, plan, core, prefix, blocks), None)
+            out = (prefix, self._k2(build, plan, core, prefix, blocks, dcp), None)
+            if dcp is not None and self.check:
+                self._check_dcp_merge(plan, core, dcp)
         self._write_aux(plan.layer_id, out)
         return out
 
@@ -545,6 +578,62 @@ class K3MonoDecodeRunner:
                 f"{core.dtype} stride {core.stride()} for an {rows}-row step"
             )
         return core, prefix
+
+    def _pre_o_dcp(self, plan, positions, prefix, blocks, add, add2):
+        """``_pre_o_core`` with the DCP merge and the output gate left to K2:
+        the attention's partial in ``dcp_out`` (``_bind_dcp_merge``), its LSE,
+        owned counts and the ungated ``g_proj``, with a fresh core buffer for
+        K2 to merge into."""
+        layer, normed, prefix, _, _ = self._seam(plan, prefix, blocks, add, add2)
+        attn = layer.self_attn
+        impl = attn.attn.impl
+        impl.dcp_defer_merge, impl.dcp_partial_lse = True, None
+        try:
+            _, gate = attn.attn_and_gate(positions, normed)
+            lse = impl.dcp_partial_lse
+        finally:
+            impl.dcp_defer_merge, impl.dcp_partial_lse = False, None
+        # the decode took the deferred path (a Python check, nothing synced)
+        assert lse is not None, f"layer {plan.layer_id}: the DCP decode merged itself"
+        owned = impl.dcp_owned_counts_buffer
+        if not impl.is_sparse_mla or owned is None:
+            owned = self.ones
+        core = prefix.new_empty(prefix.size(0), self.dims.proj)
+        return core, prefix, (self.dcp_out, lse, owned, gate)
+
+    def _check_dcp_merge(self, plan, core, dcp) -> None:
+        """``ATOM_MONO_CHECK``: K2's merged, gated core against the production
+        rank-order merge and gate on the same inputs, which it must equal bit
+        for bit; raises otherwise. Collective (every rank runs it on the same
+        layers) and synchronizing: an ``--enforce-eager`` aid."""
+        if torch.cuda.is_current_stream_capturing():
+            return
+        o, lse, owned, gate = dcp
+        rows = core.size(0)
+        group = self.inner.layers[plan.layer_id].self_attn.attn.impl.dcp_group
+        merged = cp_lse_a2a(
+            o[:rows], lse[:rows], group, owned_counts=owned[:rows], rank_order=True
+        )
+        ref = sigmoid_mul(merged.reshape(rows, -1), gate[:rows])
+        bad = (core.view(torch.int16) != ref.view(torch.int16)).sum().item()
+        err = (core.float() - ref.float()).abs().max().item()
+        logger.info(
+            "mono check layer %d rank %d rows %d: DCP merge %d / %d bf16 differ, "
+            "max |diff| %.3g",
+            plan.layer_id,
+            self.rank,
+            rows,
+            bad,
+            core.numel(),
+            err,
+        )
+        # every rank raises together: one rank alone leaving the step would
+        # leave its peers waiting on it in the next layer's mailboxes
+        if not tp_agree(bad == 0, get_tp_group().cpu_group):
+            raise RuntimeError(
+                f"layer {plan.layer_id}: K2's DCP merge differs from the production "
+                f"merge on some rank ({bad} of {core.numel()} values on this one)"
+            )
 
     def _seam(self, plan, prefix, blocks, add, add2):
         """The layer's attention-side AttnRes seam, on the blocks behind it."""
@@ -675,11 +764,14 @@ class K3MonoDecodeRunner:
             self._replay_tables[layer_id] = (table, ptrs)
         return table.data_ptr()
 
-    def _k2(self, build, plan, core, prefix, blocks) -> torch.Tensor:
+    def _k2(self, build, plan, core, prefix, blocks, dcp=None) -> torch.Tensor:
+        """``dcp``: a DCP layer's ``(o, lse, owned, gate)`` (``_pre_o_dcp``), merged
+        into ``core`` by K2 itself."""
         w = plan.moe
         key = build.k2_keys[plan.layer_id]
         out = torch.empty_like(prefix)
         p = torch.Tensor.data_ptr
+        part_o, part_lse, owned, gate = (0, 0, 0, 0) if dcp is None else map(p, dcp)
         args = k2.ABI.pack({
             "core": p(core), "w_o": p(w.w_o), "prefix": p(prefix),
             "blocks": p(blocks), "blk_sm": blocks.stride(0),
@@ -698,6 +790,7 @@ class K3MonoDecodeRunner:
             "layer": K2_TAG0 + plan.layer_id,
             # a block-write layer's MLP seam restarts its prefix
             "reset": int(plan.moe.write_idx >= 0),
+            "part_o": part_o, "part_lse": part_lse, "owned": owned, "gate": gate,
             "diag": self._diag_ptr(), "tl": 0,
         })  # fmt: skip
         _run_compiled(build.k2_launchers[key], *args, torch.cuda.current_stream())

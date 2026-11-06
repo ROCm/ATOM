@@ -50,6 +50,9 @@ HIDDEN = 7168
 # the KDA mixer: 96 heads of 128, the hidden projections fused into one GEMM
 KDA_HEADS = 96
 HEAD_DIM = 128
+# the full-attention (MLA) layers: 96 heads, a value head of HEAD_DIM; under
+# DCP = TP every rank decodes all of them
+MLA_HEADS = 96
 CONV_WIDTH = 4
 # the latent MoE
 EXPERTS = 896
@@ -333,3 +336,10 @@ def config_refusal(atom_config) -> str | None:
         ),
     ]
     return first_refusal(checks)
+
+
+def inner_model(model):
+    """The layer stack under whatever outer class the checkpoint registered.
+    K3's text-only and vision classes both hold it one level deeper than the
+    usual ``model.model``."""
+    return getattr(model, "language_model", model).model

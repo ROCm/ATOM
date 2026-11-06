@@ -14,6 +14,7 @@ from atom.models.glm52.mono.runner import Glm52MonoRunner
 def _bare_runner():
     """A runner with only the fields ``prepare`` reads: no model, no GPU."""
     runner = object.__new__(Glm52MonoRunner)
+    runner._dcp = 1
     runner._ops = {}
     runner._refused = set()
     runner._query_length = 5

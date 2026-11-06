@@ -12,7 +12,6 @@ is silent wrong numerics on a GPU, not a compile error.
 from __future__ import annotations
 
 import torch
-from aiter import dtypes
 
 from atom.models.glm52.mono.kernels.geometry_config import (
     EPS,
@@ -90,6 +89,8 @@ def _block128_fp8(
         rows % 128 == 0 and cols % 128 == 0,
         f"{name} must align to 128x128 scale blocks, got {(rows, cols)}",
     )
+    from aiter import dtypes
+
     fp8_max = torch.finfo(dtypes.fp8).max
     blocked = matrix.to(torch.float32).view(rows // 128, 128, cols // 128, 128)
     amax = blocked.abs().amax(dim=(1, 3)).clamp_min(1e-4)
@@ -166,6 +167,29 @@ def indexer_weights(layer, cfg) -> dict[str, torch.Tensor]:
     }
 
 
+def query_weights(attn, impl, cfg, dcp_size: int):
+    """q_b and W_UK of the heads this rank computes q for: its own. Under DCP
+    the kernel receives the group's other heads from its peers (the runner
+    requires the DCP group to be the TP group); query replication widens
+    q_b_proj to the whole group, so take this rank's rows of it."""
+    q_b = attn.q_b_proj
+    if dcp_size > 1 and getattr(impl, "qrep_enabled", False):
+        q_b = impl._local_q_proj()
+    w_q_b, s_q_b = linear_ptpc_fp8(
+        q_b,
+        name="q_b_proj",
+        logical_rows=cfg.local_heads * (cfg.nope_dim + cfg.pe_dim),
+        logical_cols=cfg.q_lora,
+    )
+    w_uk, s_uk = _batched_fp8(
+        impl.W_K,
+        impl.W_K_scale,
+        name="W_K",
+        shape=(cfg.local_heads, cfg.kv_lora, cfg.nope_dim),
+    )
+    return w_q_b, s_q_b, w_uk, s_uk
+
+
 def _batched_fp8(
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -201,7 +225,7 @@ def _atom_byte_view(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def layer_weights(
-    layer, rank: int, npes: int, *, with_indexer: bool = False
+    layer, rank: int, npes: int, *, with_indexer: bool = False, dcp_size: int = 1
 ) -> LayerWeights:
     cfg = glm5_tp_config(npes)
     attn = layer.self_attn
@@ -284,12 +308,9 @@ def layer_weights(
     )
 
     impl = attention_impl(layer)
-    w_uk, s_uk = _batched_fp8(
-        impl.W_K,
-        impl.W_K_scale,
-        name="W_K",
-        shape=(cfg.local_heads, cfg.kv_lora, cfg.nope_dim),
-    )
+    # the heads this rank decodes; it computes q for its own only
+    heads = cfg.local_heads * dcp_size
+    w_q_b, s_q_b, w_uk, s_uk = query_weights(attn, impl, cfg, dcp_size)
     w_uv, s_uv = _batched_fp8(
         impl.W_V,
         impl.W_V_scale,
@@ -301,12 +322,6 @@ def layer_weights(
         name="fused_qkv_a_proj",
         logical_rows=cfg.qkv_a_rows,
         logical_cols=cfg.hidden,
-    )
-    w_q_b, s_q_b = linear_ptpc_fp8(
-        attn.q_b_proj,
-        name="q_b_proj",
-        logical_rows=cfg.local_heads * (cfg.nope_dim + cfg.pe_dim),
-        logical_cols=cfg.q_lora,
     )
     w_o, s_o = linear_ptpc_fp8(
         attn.o_proj,
@@ -364,7 +379,7 @@ def layer_weights(
     if with_indexer:
         tensors.update(indexer_weights(layer, cfg))
     return LayerWeights(
-        cfg.local_heads,
+        heads,
         tensors,
         cfg,
         rank,

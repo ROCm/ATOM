@@ -115,13 +115,13 @@ def test_tp1_has_no_cp_group(fused_on):
 
 
 def test_decode_context_parallel_is_refused_by_name(fused_on):
-    # "Fused indexer CP currently requires dcp_size=1." config_refusal's
-    # common_refusals already rejects decode CP for GLM-5.2 mono as a whole,
-    # but the two are independent mechanisms and the kernel contract names
-    # this one, so relaxing the former must not silently enable CP.
+    # "Fused indexer CP currently requires dcp_size=1." GLM-5.2 mono itself
+    # now serves DCP == TP4, and the fused indexer refuses DCP first
+    # (``fused_indexer_refusal``); this one still names the kernel contract,
+    # so relaxing either must not silently enable CP under DCP.
     fused_on.setenv("ATOM_GLM52_INDEXER_CP", "1")
     why = indexer_cp_refusal(_servable_atom_config(decode_context_parallel_size=4))
-    assert why is not None and "dcp_size=1" in why
+    assert why is not None and ("dcp_size=1" in why or "under DCP" in why)
 
 
 def test_cp_cannot_outlive_the_capacity_refusal(fused_on):

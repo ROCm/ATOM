@@ -80,6 +80,7 @@ try:
     from atom.model_ops.dcp_ops import (
         _dcp_a2a_pack_kernel,
         _dcp_a2a_unpack_combine_kernel,
+        _dcp_a2a_unpack_combine_rank_order_kernel,
         _lse_pack_slots,
         correct_attn_out,
         dcp_global_pos,
@@ -637,7 +638,9 @@ def test_projection_does_not_defeat_the_empty_rank_scrub():
 # ──────────────────────────────────────────────────────── A2A merge backend ──
 
 
-def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None):
+def _a2a_roundtrip(
+    o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None, rank_order=False
+):
     """pack -> all-to-all -> combine, with the collective done as a local permute.
 
     ``all_to_all_single`` needs a real process group, which a single-process test
@@ -686,7 +689,12 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None
         recv = torch.stack([sends[r][j] for r in range(n_ranks)]).contiguous()
         out = torch.empty((b, h_local, d), dtype=dtype, device=DEV)
         out_lse = torch.empty((b, h_local), dtype=torch.float32, device=DEV)
-        _dcp_a2a_unpack_combine_kernel[(b, h_local)](
+        combine = (
+            _dcp_a2a_unpack_combine_rank_order_kernel
+            if rank_order
+            else _dcp_a2a_unpack_combine_kernel
+        )
+        combine[(b, h_local)](
             recv,
             out,
             out_lse,
@@ -708,9 +716,10 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None
 
 
 @needs_gpu
+@pytest.mark.parametrize("rank_order", [False, True])
 @pytest.mark.parametrize("n_ranks", [2, 8])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_a2a_reproduces_the_ag_rs_merge(n_ranks, dtype):
+def test_a2a_reproduces_the_ag_rs_merge(n_ranks, dtype, rank_order):
     """The two backends must agree: same weighted sum, same head ownership.
 
     They arrive there differently -- ag_rs pre-multiplies each rank's partial and
@@ -728,7 +737,7 @@ def test_a2a_reproduces_the_ag_rs_merge(n_ranks, dtype):
     ]
     lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
 
-    got = _a2a_roundtrip(o, lse, n_ranks)
+    got = _a2a_roundtrip(o, lse, n_ranks, rank_order=rank_order)
     ref = _merge_partials(torch.stack(o), torch.stack(lse))
 
     tol = 1e-5 if dtype == torch.float32 else 3e-2
@@ -736,7 +745,8 @@ def test_a2a_reproduces_the_ag_rs_merge(n_ranks, dtype):
 
 
 @needs_gpu
-def test_a2a_lse_survives_the_16_bit_split():
+@pytest.mark.parametrize("rank_order", [False, True])
+def test_a2a_lse_survives_the_16_bit_split(rank_order):
     """A bf16 buffer stores the fp32 LSE as two raw 16-bit halves.
 
     Nothing does arithmetic on those slots -- the collective copies bits -- so the
@@ -755,7 +765,7 @@ def test_a2a_lse_survives_the_16_bit_split():
         for r in range(n_ranks)
     ]
 
-    got = _a2a_roundtrip(o, lse, n_ranks).float()
+    got = _a2a_roundtrip(o, lse, n_ranks, rank_order=rank_order).float()
 
     stacked = torch.stack(lse)  # [N, B, H]
     w = torch.softmax(stacked, dim=0)  # exp(lse_r - global_lse)
@@ -766,7 +776,8 @@ def test_a2a_lse_survives_the_16_bit_split():
 
 
 @needs_gpu
-def test_a2a_scrubs_the_empty_rank():
+@pytest.mark.parametrize("rank_order", [False, True])
+def test_a2a_scrubs_the_empty_rank(rank_order):
     """A dummy-backed empty rank has finite LSE and a meaningless output.
 
     The existing pack kernel must use the true count to send LSE=-inf, after
@@ -785,10 +796,26 @@ def test_a2a_scrubs_the_empty_rank():
         torch.tensor([1, 1], dtype=torch.int32, device=DEV),
     ]
 
-    got = _a2a_roundtrip(o, lse, n_ranks, owned_counts)
+    got = _a2a_roundtrip(o, lse, n_ranks, owned_counts, rank_order=rank_order)
     assert torch.isfinite(got).all(), "empty-rank NaN reached the a2a output"
     # Rank 0 contributed nothing, so the row is rank 1 alone (weight 1).
     torch.testing.assert_close(got[0].float(), o[1][0].float(), rtol=8e-3, atol=8e-3)
+
+
+@needs_gpu
+def test_rank_order_combine_keeps_an_all_empty_row_finite():
+    """Every rank empty: the rank-order kernel's max is -inf and its total 0, so
+    global_lse is -inf and every factor NaN -- which must come out as a zero row,
+    not NaN (the mono K2 merge has the same guards)."""
+    b, h, d, n_ranks = 2, 4, 32, 4
+    o = [
+        torch.full((b, h, d), float("nan"), device=DEV).bfloat16()
+        for _ in range(n_ranks)
+    ]
+    lse = [torch.zeros(b, h, device=DEV) for _ in range(n_ranks)]
+    empty = [torch.zeros(b, dtype=torch.int32, device=DEV) for _ in range(n_ranks)]
+    got = _a2a_roundtrip(o, lse, n_ranks, empty, rank_order=True)
+    assert torch.equal(got.float(), torch.zeros_like(got.float()))
 
 
 @needs_dcp_ops

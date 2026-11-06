@@ -589,6 +589,105 @@ def _dcp_a2a_unpack_combine_kernel(
 
 
 @triton.jit
+def _a2a_merge_exp(x):
+    """exp(x) as the mono K2 DCP merge computes it (``exp2`` of x * log2 e)."""
+    return tl.exp2(x * 1.4426950408889634)
+
+
+@triton.jit
+def _a2a_load_lse(base, valid, HEAD_DIM: tl.constexpr, LSE_PACK: tl.constexpr):
+    """One source's packed fp32 LSE; -inf for a padding source or a non-finite
+    LSE (a rank that owns no KV for the row reports -inf, and o = NaN)."""
+    if LSE_PACK == 1:
+        lse = tl.load(base + HEAD_DIM, mask=valid, other=float("-inf"))
+        lse = lse.to(tl.float32)
+    else:
+        hi = tl.load(base + HEAD_DIM, mask=valid, other=0).to(tl.uint16, bitcast=True)
+        lo = tl.load(base + HEAD_DIM + 1, mask=valid, other=0).to(
+            tl.uint16, bitcast=True
+        )
+        bits = (hi.to(tl.uint32) << 16) | lo.to(tl.uint32)
+        lse = bits.to(tl.float32, bitcast=True)
+    # `x != x` is the NaN test: this Triton has no tl.math.isnan, and it is the
+    # same idiom dcp_ops.py already uses.
+    bad = (lse != lse) | (lse == float("inf")) | (~valid)  # noqa: PLR0124
+    return tl.where(bad, float("-inf"), lse)
+
+
+@triton.jit
+def _dcp_a2a_unpack_combine_rank_order_kernel(
+    recv_ptr,  # [N, B, H_LOCAL, D + LSE_PACK]  N = source rank (KV shard)
+    out_ptr,  # [B, H_LOCAL, D]
+    out_lse_ptr,  # [B, H_LOCAL] fp32, or unused
+    recv_stride_n,
+    recv_stride_b,
+    recv_stride_h,
+    out_stride_b,
+    out_stride_h,
+    lse_stride_b,
+    lse_stride_h,
+    N_RANKS,
+    HEAD_DIM: tl.constexpr,
+    LSE_PACK: tl.constexpr,
+    N_ROUNDED: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
+):
+    """``_dcp_a2a_unpack_combine_kernel``'s combine with its sums one source at a
+    time in rank order 0 .. N-1 and explicit FMAs (``cp_lse_a2a(rank_order=True)``).
+
+    The Kimi-K3 mono K2 merges a DCP decode step in-kernel with this arithmetic
+    (``atom/mono/device/dcp_merge.py``'s ``lse_*``); a layer whose mono merge is
+    armed takes this kernel for every step mono does not serve, so a token's
+    output does not depend on which path its step took.
+    """
+    b = tl.program_id(axis=0).to(tl.int64)
+    h = tl.program_id(axis=1).to(tl.int64)
+    row = recv_ptr + b * recv_stride_b + h * recv_stride_h
+    d = tl.arange(0, HEAD_DIM)
+
+    # A padding source is folded onto source 0 so no pointer is ever FORMED
+    # outside `recv`; its loads are masked as well.
+    lse_max = float("-inf")
+    for n in tl.static_range(N_ROUNDED):
+        valid = n < N_RANKS
+        base = row + tl.where(valid, n, 0).to(tl.int64) * recv_stride_n
+        lse_max = tl.maximum(lse_max, _a2a_load_lse(base, valid, HEAD_DIM, LSE_PACK))
+    # Every rank empty -> max is -inf; subtracting it would make 0/0 = NaN.
+    lse_max = tl.where(lse_max == float("-inf"), 0.0, lse_max)
+    total = 0.0
+    for n in tl.static_range(N_ROUNDED):
+        valid = n < N_RANKS
+        base = row + tl.where(valid, n, 0).to(tl.int64) * recv_stride_n
+        lse = _a2a_load_lse(base, valid, HEAD_DIM, LSE_PACK)
+        total = total + _a2a_merge_exp(lse - lse_max)
+    global_lse = tl.fma(tl.log2(total), 0.6931471805599453, lse_max)
+
+    if WRITE_LSE:
+        tl.store(out_lse_ptr + b * lse_stride_b + h * lse_stride_h, global_lse)
+
+    acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+    for n in tl.static_range(N_ROUNDED):
+        valid = n < N_RANKS
+        base = row + tl.where(valid, n, 0).to(tl.int64) * recv_stride_n
+        lse = _a2a_load_lse(base, valid, HEAD_DIM, LSE_PACK)
+        # An empty rank lands on factor == 0 by itself (exp(-inf - finite));
+        # the NaN select covers every rank empty, where global_lse is -inf.
+        factor = _a2a_merge_exp(lse - global_lse)
+        factor = tl.where(factor != factor, 0.0, factor)  # noqa: PLR0124
+        vals = tl.load(base + d, mask=valid, other=0.0).to(tl.float32)
+        # THIS is what stops an empty rank from poisoning the row. aiter returns
+        # o=NaN alongside lse=-inf, and NaN * 0 = NaN, so the NaN has to be
+        # replaced BEFORE the multiply -- zeroing the weight is not enough.
+        vals = tl.where(factor == 0.0, 0.0, vals)
+        acc = tl.fma(vals, factor, acc)
+
+    tl.store(
+        out_ptr + b * out_stride_b + h * out_stride_h + d,
+        acc.to(out_ptr.dtype.element_ty),
+    )
+
+
+@triton.jit
 def _dcp_a2a_unpack_combine_quant_kernel(
     recv_ptr,  # [N, B, H_LOCAL, D + LSE_PACK]  N = source rank (KV shard)
     out_ptr,  # [B, H_LOCAL, D] fp8
@@ -713,6 +812,7 @@ def cp_lse_a2a(
     return_lse: bool = False,
     owned_counts=None,
     quant_dtype=None,
+    rank_order: bool = False,
 ):
     """A2A backend: pack -> one all-to-all -> local LSE combine.
 
@@ -733,6 +833,8 @@ def cp_lse_a2a(
             ``scale is None`` in the return means the output came back
             UNQUANTIZED and the caller must quantize as before; that is the
             single-rank shortcut below, not an error.
+        rank_order: combine with ``_dcp_a2a_unpack_combine_rank_order_kernel``
+            (the Kimi-K3 mono DCP merge's arithmetic). Not with ``quant_dtype``.
     """
     # Checked before the single-rank shortcut, not after: that path returns
     # early, so an assertion below it would let the one caller combination this
@@ -740,6 +842,9 @@ def cp_lse_a2a(
     assert (
         quant_dtype is None or not return_lse
     ), "cp_lse_a2a: the fused-quant combine does not emit LSE"
+    assert (
+        quant_dtype is None or not rank_order
+    ), "cp_lse_a2a: the fused-quant combine has no rank-order form"
 
     n_ranks = cp_group.world_size
     if n_ranks == 1:
@@ -822,7 +927,12 @@ def cp_lse_a2a(
         if return_lse
         else send
     )
-    _dcp_a2a_unpack_combine_kernel[(b, h_local)](
+    combine = (
+        _dcp_a2a_unpack_combine_rank_order_kernel
+        if rank_order
+        else _dcp_a2a_unpack_combine_kernel
+    )
+    combine[(b, h_local)](
         recv,
         out,
         out_lse,
@@ -857,6 +967,7 @@ def dcp_lse_merge(
     ctx=None,
     owned_counts=None,
     quant_dtype=None,
+    rank_order=False,
 ):
     """Reconstruct the global softmax from the per-rank partials.
 
@@ -881,10 +992,12 @@ def dcp_lse_merge(
             cp_group,
             owned_counts=owned_counts,
             quant_dtype=quant_dtype,
+            rank_order=rank_order,
         )
     assert (
         quant_dtype is None
     ), "dcp_lse_merge: fused-quant combine is only implemented for backend=a2a"
+    assert not rank_order, "dcp_lse_merge: rank-order combine is backend=a2a only"
     if owned_counts is not None:
         # AG+RS has no existing kernel before its LSE AllGather. The default
         # A2A path above fuses this mask and remains launch-free.

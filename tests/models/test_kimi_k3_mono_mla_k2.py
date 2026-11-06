@@ -169,11 +169,13 @@ def _ffn_only_runner(runner_module, calls, core):
 
     runner = object.__new__(runner_module.K3MonoDecodeRunner)
     runner.dims = Dims(8)
+    runner.dcp_merge = False
     runner.aux = AuxTaps((), ())
     runner.inner = SimpleNamespace(layers={3: _k2_layer(calls, core)})
     runner._k1 = runner._fallback = lambda *a, **k: pytest.fail("not this layer's path")
 
-    def k2(build, plan, core_in, prefix, blocks):
+    def k2(build, plan, core_in, prefix, blocks, dcp=None):
+        assert dcp is None
         calls["k2"] = (build, plan, core_in, prefix, blocks)
         return "k2 out"
 
@@ -264,6 +266,7 @@ def _stub_kda(blocks=1):
 def test_k2_builds_cover_full_attention_layers_and_k1_builds_do_not(runner_module):
     runner = object.__new__(runner_module.K3MonoDecodeRunner)
     runner.debug = False
+    runner.dcp_merge = False
     runner.state_len = 3
     runner.replay_cap = 0  # no ReplaySSM record buffers
     runner.plans = [

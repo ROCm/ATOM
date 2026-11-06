@@ -260,9 +260,24 @@ def config_refusal(atom_config) -> str | None:
         query_length=query_length,
     )
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
+    dcp = atom_config.decode_context_parallel_size
     checks += common_refusals(
-        atom_config, Dims, SUPPORTED_TP, refuse_tr_hybrid=False
+        atom_config, Dims, SUPPORTED_TP, refuse_tr_hybrid=False, refuse_decode_cp=False
     ) + [
+        # DCP: the kernel decodes every head of the DCP group on each rank and
+        # merges the latent across them (``kernels.kernel.dcp_merge_latent``)
+        (dcp == 1 or (dcp == tp_size == 4), f"DCP {dcp} with TP {tp_size}"),
+        # Only the measured shape is served under DCP: MTP3, i.e. decode
+        # widths 4 / 8. No speculation (widths 1 / 2) and MTP4 / MTP5 (5, 6,
+        # 10, 12) are untested there and keep the production DCP path.
+        (
+            dcp == 1 or query_length == 4,
+            f"DCP with decode width {query_length} (untested)",
+        ),
+        (
+            dcp == 1 or atom_config.dcp_config.interleave_size == 1,
+            "DCP interleave size above 1",
+        ),
         (geometry is not None, "native geometry"),
         (getattr(hf, "model_type", None) == "glm_moe_dsa", "model type"),
         (not atom_config.enable_dp_attention, "DP attention"),
@@ -353,6 +368,10 @@ def fused_indexer_refusal(atom_config) -> str | None:
                 f"{atom_config.kv_cache_block_size}"
             ),
         ),
+        (
+            atom_config.decode_context_parallel_size == 1,
+            "fused indexer under DCP (it writes the global sparse indices)",
+        ),
     ]
     return first_refusal(checks)
 
@@ -382,10 +401,11 @@ def indexer_cp_refusal(atom_config) -> str | None:
       ``FUSED_INDEX_MAX_SEQ``; the "accommodates every query" half is already
       enforced by ``fused_indexer_refusal``'s ``max_model_len`` check, which
       this refusal requires to have passed.
-    - **``dcp_size == 1``.** Redundant with ``common_refusals``' "decode CP"
-      entry, which ``config_refusal`` already applies, but named here because
-      the kernel contract names it: the two are independent mechanisms and a
-      future relaxation of the former must not silently enable CP.
+    - **``dcp_size == 1``.** Redundant with ``fused_indexer_refusal``'s DCP
+      entry (``config_refusal`` lets DCP through to the external indexer),
+      but named here because the kernel contract names it: the two are
+      independent mechanisms and a future relaxation of the former must not
+      silently enable CP.
 
     Two further contract items are **invariants of ATOM's fused path, not
     checks**, and are recorded here rather than tested because there is no

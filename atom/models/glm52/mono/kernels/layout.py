@@ -3,7 +3,6 @@
 
 """Compile-time storage layout and CTA schedule for the GLM-5 MonoKernel."""
 
-import math
 import os
 
 from atom.models.glm52.mono.kernels.geometry_config import (
@@ -244,6 +243,29 @@ def sparse_keys_per_task(samples: int, heads: int = WAVES) -> int:
     return 32 if heads > 2 * WAVES or (heads == WAVES and samples > 4) else 64
 
 
+def dcp_split_groups(samples: int, heads: int, topk: int, dcp_size: int) -> int:
+    """Head groups a DCP split task runs back to back: the most that still
+    fill the grid with the tasks that hold keys (a rank holds about topk / D
+    of a sample's selected keys). Fewer groups a task only re-gather the same
+    keys."""
+    groups = heads // WAVES
+    live = topk // sparse_keys_per_task(samples, heads) // dcp_size
+    g = groups
+    while g > 1 and samples * live * (groups // g) < BLOCKS:
+        g //= 2
+    return g
+
+
+def dcp_split_task(tt, samples: int, split_blocks: int, split_groups: int):
+    """(key split, sample, first head group) of DCP split task ``tt``.
+
+    Numbered split-major, so the splits holding a rank's keys come first and
+    spread over the grid; a task runs ``split_groups`` head groups."""
+    t = tt // (samples * split_blocks)
+    blk = tt % (samples * split_blocks)
+    return t, blk // split_blocks, (blk % split_blocks) * split_groups
+
+
 def sample_wave_batches(samples: int) -> int:
     return (samples + WAVES - 1) // WAVES
 
@@ -315,23 +337,9 @@ def down_x_words(samples: int, inter: int, expert_mxfp4: bool, native_fp4_mfma: 
     return samples * MOE_SLOTS * inter // (4 if native_fp4_mfma or not expert_mxfp4 else 2)
 
 
-def dcp_softmax_weights(maxima, sums):
-    global_max = max(maxima)
-    scaled = [total * math.exp(maximum - global_max) for maximum, total in zip(maxima, sums)]
-    denominator = sum(scaled)
-    return [value / denominator if denominator else 0.0 for value in scaled]
-
-
-def dcp_summary_index(source, sample, tile, item, samples, n_uv):
-    return ((source * samples + sample) * n_uv + tile) * DCP_SUMMARY_PAIRS + item
-
-
-def dcp_uv_owner(tile, output_heads, rank):
-    return tile // (V_DIM // UV_TILE) // output_heads == rank
-
-
-def dcp_local_uv_tile(tile, output_heads):
-    return tile % (output_heads * V_DIM // UV_TILE)
+def dcp_summary_index(source, sample, head, item, samples, output_heads):
+    """Pair ``item`` of ``source``'s partial latent of (sample, owned head)."""
+    return ((source * samples + sample) * output_heads + head) * DCP_SUMMARY_PAIRS + item
 
 
 def ug_split(samples: int, inter: int = INTER):
@@ -440,7 +448,7 @@ def layout(
 
     part = npes * samples * HIDDEN * pair_bytes
     region = 2 * part
-    dcp_part = dcp_size * samples * (heads * V_DIM // UV_TILE) * DCP_SUMMARY_PAIRS * pair_bytes if dcp_size > 1 else 0
+    dcp_part = dcp_size * samples * output_heads * DCP_SUMMARY_PAIRS * pair_bytes if dcp_size > 1 else 0
     symmetric = {
         "attn": 0,
         "ffn": region,
@@ -449,6 +457,18 @@ def layout(
         "_dcp_part_stride": dcp_part,
         "_bytes": 2 * region + 2 * dcp_part,
     }
+    if dcp_size > 1:
+        # Under DCP each rank computes only its own heads' q and pushes them
+        # into every peer's copy of these, at the global head index.
+        offset = symmetric["_bytes"]
+        for name, size in (
+            ("q_lat", samples * heads * KV_LORA * pair_bytes),
+            ("q_pe", samples * heads * PE_DIM * pair_bytes),
+        ):
+            symmetric[name] = offset
+            symmetric[name + "_stride"] = _align(size)
+            offset += 2 * _align(size)
+        symmetric["_bytes"] = offset
     if tiled_indexer or (with_indexer and indexer_cp):
         # Two launch slots, like the attention/FFN peer buffers. Distinct radix
         # rounds must not overwrite a histogram or threshold still being read.
@@ -487,21 +507,34 @@ def stage_tasks(
     indexer_cp: bool = False,
     npes: int = 1,
     split_head_merge: bool = False,
+    dcp_size: int = 1,
 ):
     """Return ``(stage name, task count)`` pairs in execution order.
 
+    Under DCP, ``q_b`` / ``uk`` cover only this rank's heads, ``uvl`` builds
+    each (sample, head) partial latent once and sends it to the head's owner,
+    and ``uv`` covers only the owned heads.
+
     ``split_head_merge`` folds the two head groups of an (sample, key-chunk)
-    cell into one task, halving ``split``. It must be given the same value the
+    cell into one task, halving ``split``; under DCP it is ignored and
+    ``dcp_split_groups`` sets the head groups a task runs. It must be given the same value the
     kernel was built with: these counts set the CTA placement rotation and the
     timeline's per-stage offsets, so a disagreement silently mis-seats both.
     """
 
     index_ranks = index_cp_world(npes, samples, index_max_seq) if indexer_cp else 1
-    tasks = [("qkv_a", N_QKV_A), ("q_norm", samples), ("cache", 1), ("q_b", heads * (NOPE_DIM + PE_DIM) // Q_B_TILE)]
+    # q_b / uk cover this rank's own heads: under DCP the other ranks send theirs
+    local_heads = heads // dcp_size
+    tasks = [
+        ("qkv_a", N_QKV_A),
+        ("q_norm", samples),
+        ("cache", 1),
+        ("q_b", local_heads * (NOPE_DIM + PE_DIM) // Q_B_TILE),
+    ]
     if with_indexer:
         shard_q = indexer_cp and not indexer_uses_tiles(index_max_seq, indexer_cp)
         tasks += [("index_q", INDEX_Q_ROWS // INDEX_TILE // (index_ranks if shard_q else 1))]
-    tasks += [("uk", heads * KV_LORA // UK_TILE)]
+    tasks += [("uk", local_heads * KV_LORA // UK_TILE)]
     if with_indexer:
         capacity = index_cp_capacity(index_max_seq, index_ranks) if indexer_cp else index_max_seq
         tasks += [("index_score", samples * ((capacity + INDEX_KEYS_PER_TASK - 1) // INDEX_KEYS_PER_TASK))]
@@ -523,14 +556,22 @@ def stage_tasks(
             )
             for level in range(depth + 1)
         ]
+    if dcp_size > 1:
+        head_blocks = heads // WAVES // dcp_split_groups(
+            samples, heads, sparse_attention_topk, dcp_size
+        )
+    else:
+        head_blocks = 1 if split_head_merge else heads // WAVES
     tasks += [
         (
             "split",
-            samples
-            * (1 if split_head_merge else heads // WAVES)
-            * (sparse_attention_topk // sparse_keys_per_task(samples, heads)),
+            samples * head_blocks * (sparse_attention_topk // sparse_keys_per_task(samples, heads)),
         ),
-        ("uv", samples * (heads * V_DIM // UV_TILE)),
+    ]
+    if dcp_size > 1:
+        tasks += [("uvl", samples * heads)]
+    tasks += [
+        ("uv", samples * (heads // dcp_size * V_DIM // UV_TILE)),
         ("o", N_ROW_TILES),
         ("router", samples * N_ROUTER),
         (

@@ -19,6 +19,15 @@ prepared sparse indices::
       -> mid FP8 quant -> expert down + route weighting
       -> MoE TP peer reduce + residual -> x_out                   (sym_ffn)
 
+Under decode context parallelism (DCP == TP4, ATOM only) every rank decodes the
+group's heads over its KV shard: ``q_b`` / ``uk`` compute the rank's own heads
+and push them into every peer's symmetric q buffer, ``uvl`` rebuilds each
+head's partial latent once and pushes it to the head's owner rank, ``uv``
+merges the ranks' partials (max / sum, rank order) before W_UV, and split
+tasks past a rank's keys only publish empty statistics. This, the 64-head q_pe
+staging and the PTPC-after-merge order are ATOM's divergence from upstream
+FlyDSL.
+
 Scheduling: every stage is a list of tasks; task ``t`` of a stage runs on CTA
 ``(stage_base + t) % 256`` and every CTA walks the stages in order.  There is
 no grid-wide barrier: dependencies only point to earlier stages and all CTAs
@@ -102,9 +111,9 @@ from atom.models.glm52.mono.kernels.layout import (
     XQ_BLOCKS,
     XQ_GROUPS,
     XQ_WAVES,
-    dcp_local_uv_tile,
+    dcp_split_groups,
+    dcp_split_task,
     dcp_summary_index,
-    dcp_uv_owner,
     dn_tile,
     down_prefetch_batch,
     down_x_words,
@@ -157,6 +166,7 @@ from atom.mono.device.ops import (
     wave_umax_dpp,
     write_lane_i32,
 )
+from atom.mono.device import dcp_merge
 from atom.mono.device.ops import exp as _exp
 from atom.mono.device.ops import fp8_roundtrip as _fp8_roundtrip
 from atom.mono.device.ops import fp8_to_bf16x8 as _fp8_to_bf16x8
@@ -307,7 +317,7 @@ def build_glm5_monokernel(
     expert_inter = inter
     assert expert_inter in (256, 512), "GLM TP8/TP4 requires complete 256-CTA expert rounds"
     paired_ug_rows = expert_mxfp4 and not atom_experts
-    assert D == 1 or (D == W and H == L * D)
+    assert H == L * D and (D == 1 or D == W)
     I_PER_SLOT = expert_inter // UG_TILE
     G = BLOCKS
     SC, SY = layout(
@@ -338,13 +348,15 @@ def build_glm5_monokernel(
     SHARD_INDEX_Q = indexer_cp and not TILED_INDEXER and W > 1
     CP_PARTS = index_cp_partitions(index_max_seq, CP_RANKS) if TILED_INDEXER else 0
     N_SPLIT = topk // SPLIT_KEYS
-    QB_ROWS = H * (NOPE_DIM + PE_DIM)
+    # q_b / uk run this rank's L heads; under DCP every rank pushes its q into
+    # each peer's symmetric copy (``q_lat`` / ``q_pe``) at the global head
+    QB_ROWS = L * (NOPE_DIM + PE_DIM)
     N_QB = QB_ROWS // Q_B_TILE
     # The index-Q row space is fixed at 256 tiles.  TP8 produces half from
     # q_b CTAs; TP4 produces all of them, one per CTA.
     assert not with_indexer or (INDEX_Q_ROWS // INDEX_TILE == BLOCKS and N_QB in (BLOCKS // 2, BLOCKS))
     QB_PER_HEAD = (NOPE_DIM + PE_DIM) // Q_B_TILE
-    N_UK = H * KV_LORA // UK_TILE
+    N_UK = L * KV_LORA // UK_TILE
     UK_PER_HEAD = KV_LORA // UK_TILE
     N_UV = H * V_DIM // UV_TILE
     O_K = L * V_DIM
@@ -417,6 +429,8 @@ def build_glm5_monokernel(
     # in the up/gate stage, for an in-process A/B. Both are bit-identical; see
     # ``atom_mxfp4_scale_pair`` and the comment in ``ug8_units``.
     _UG_SCALE_PAIR = not _R2_OFF and os.environ.get("MONO_UG_SCALE_PAIR", "1") == "1"
+    # DCP: head groups a split task runs (``dcp_split_groups``); 0 for D == 1
+    DCP_SPLIT_GROUPS = dcp_split_groups(S, heads, topk, dcp_size) if dcp_size > 1 else 0
     QHEADS = (
         WAVES
         if (_SPLIT_QHEADS and heads % WAVES == 0 and (WAVES * KV_LORA // 4) % THREADS == 0)
@@ -494,7 +508,7 @@ def build_glm5_monokernel(
     base, first, acc = {}, {}, 0
     for name, n in stage_tasks(
         S, H, topk, with_indexer, index_max_seq, expert_mxfp4, indexer_cp=indexer_cp, npes=W,
-        inter=expert_inter, split_head_merge=bool(split_head_merge) and H // WAVES > 1,
+        inter=expert_inter, split_head_merge=bool(split_head_merge) and H // WAVES > 1, dcp_size=D,
     ):
         first[name] = acc
         acc += n
@@ -503,11 +517,13 @@ def build_glm5_monokernel(
     tasks = dict(
         stage_tasks(
             S, H, topk, with_indexer, index_max_seq, expert_mxfp4, indexer_cp=indexer_cp, npes=W,
-        inter=expert_inter, split_head_merge=bool(split_head_merge) and H // WAVES > 1,
+        inter=expert_inter, split_head_merge=bool(split_head_merge) and H // WAVES > 1, dcp_size=D,
         )
     )
+    assert tasks["q_b"] == N_QB and tasks["uk"] == N_UK
     acc = 0
-    for name in ("qkv_a", "q_norm", "cache", "q_b", "split", "uk", "uv", "o", "router", "ug", "down"):
+    uv_stages = ("uvl", "uv") if D > 1 else ("uv",)
+    for name in ("qkv_a", "q_norm", "cache", "q_b", "split", "uk", *uv_stages, "o", "router", "ug", "down"):
         base[name] = acc % G
         acc += tasks[name]
     if with_indexer:
@@ -1430,6 +1446,19 @@ def build_glm5_monokernel(
             if lane % 2 == 0:
                 lds_st(xs, k // 4, (w | (nb << 16)).bitcast(fx.Float32))
 
+        def ptpc_latent(uv_valid, uv0, uv1):
+            """The bf16 latent (uv0, uv1 a thread's pair) -> PTPC: a scale per
+            128 columns in ``misc``, the FP8 pairs in ``xs``. Ends at a barrier."""
+            uv_max = wave_max(uv_valid.select(fx.max(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)))
+            if (lane == 0) & (wave < KV_LORA // 128):
+                lds_st(misc, N_SPLIT + 2 + wave, (uv_max == 0.0).select(fx.Float32(1.0), uv_max * (1.0 / FP8_MAX)))
+            gpu.barrier()
+            if uv_valid:
+                uv_scale = lds_ld(misc, N_SPLIT + 2 + tid // 64)
+                uv_rcp = 1.0 / uv_scale
+                st_ptpc(tid * 2, div_rn(uv0, uv_scale, uv_rcp), div_rn(uv1, uv_scale, uv_rcp))
+            gpu.barrier()
+
         def st_ptpc(k, q0, q1):
             """Store one wave's PTPC FP8 pairs in the AITER GEMM's linear K order."""
             word = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)) & 0xFFFF
@@ -1543,50 +1572,57 @@ def build_glm5_monokernel(
                     t1 = t1 + parts[src][1]
                 out_fn(s, row, r0 + t0, r1 + t1)
 
-        def dcp_merge_latent(s, t):
-            if const_expr(D == 1):
-                return True
-            region_base = fx.Int64(SY["dcp"]) + fx.Int64(peer_slot) * fx.Int64(SY["_dcp_part_stride"])
-            summary_base = dcp_summary_index(rank, s, t, 0, S, N_UV)
-            if wave < D:
-                for batch in range_constexpr((DCP_SUMMARY_PAIRS + 63) // 64):
-                    item = lane + batch * 64
-                    if item < DCP_SUMMARY_PAIRS:
-                        value = fx.Float32(0.0)
-                        if item < KV_LORA // 2:
-                            value = lds_ld(xs, item)
-                        elif item == KV_LORA // 2:
-                            value = lds_ld(misc, N_SPLIT)
-                        else:
-                            value = lds_ld(misc, N_SPLIT + 1)
-                        put(peer_dst + region_base, summary_base + item, value, CM_SYS)
-            gpu.barrier()
-            owner = dcp_uv_owner(t, L, rank)
-            if owner:
-                own = sym + region_base
-                if wave == 0:
-                    src = fx.min(lane, D - 1)
-                    src_base = dcp_summary_index(src, s, t, 0, S, N_UV)
-                    values = poll([(own, src_base + KV_LORA // 2, 1), (own, src_base + KV_LORA // 2 + 1, 1)], "one-as")
-                    valid = lane < D
-                    m = valid.select(values[0][0].bitcast(fx.Float32), fx.Float32(NEG))
-                    local_sum = valid.select(values[1][0].bitcast(fx.Float32), fx.Float32(0.0))
-                    m_all = wave_max(m)
-                    z = local_sum * _exp(m - m_all)
-                    den = wave_sum(z)
-                    if valid:
-                        lds_st(misc, lane, z * (den > 0.0).select(_rcp(den), fx.Float32(0.0)))
-                gpu.barrier()
+        def dcp_region():
+            return fx.Int64(SY["dcp"]) + fx.Int64(peer_slot) * fx.Int64(SY["_dcp_part_stride"])
+
+        def dcp_peer(p):
+            words = fx.Vector(bo.buffer_load(r_peers, fx.Int32(p) * 2, vec_width=2, dtype=T.i32))
+            return (fx.Int64(_uniform(words[1])) << 32) | fx.Int64(fx.Uint32(_uniform(words[0])))
+
+        def dcp_push_q(name, element, vals):
+            """Element ``element`` of the group-wide q buffer ``name``, on every rank."""
+            for p in range_constexpr(D):
+                put_bf(cp_buffer(name, dcp_peer(p)), element, vals, CM_SYS)
+
+        def dcp_push_latent(s, head):
+            """Send this rank's partial latent of (s, head) (``xs`` bf16 pairs, then
+            the split max and sum in ``misc``) to the head's owner."""
+            words = fx.Vector(bo.buffer_load(r_peers, (head // L) * 2, vec_width=2, dtype=T.i32))
+            dst = (fx.Int64(_uniform(words[1])) << 32) | fx.Int64(fx.Uint32(_uniform(words[0])))
+            if tid < DCP_SUMMARY_PAIRS:
+                value = fx.Float32(0.0)
                 if tid < KV_LORA // 2:
-                    parts = poll([(own, dcp_summary_index(src, s, t, tid, S, N_UV), 1) for src in range(D)], "one-as")
-                    o0, o1 = fx.Float32(0.0), fx.Float32(0.0)
-                    for src in range_constexpr(D):
-                        a0, a1 = bf2_f32(parts[src][0])
-                        weight = lds_ld(misc, src)
-                        o0, o1 = o0 + a0 * weight, o1 + a1 * weight
-                    lds_st(xs, tid, bf16_pair(o0, o1))
-                gpu.barrier()
-            return owner
+                    value = lds_ld(xs, tid)
+                elif tid == KV_LORA // 2:
+                    value = lds_ld(misc, N_SPLIT)
+                else:
+                    value = lds_ld(misc, N_SPLIT + 1)
+                put(dst + dcp_region(), dcp_summary_index(rank, s, head % L, tid, S, L), value, CM_SYS)
+
+        def dcp_merge_latent(s, lh):
+            """Merge the ranks' partial latents of (s, owned head lh) in rank order
+            into ``xs`` as bf16 pairs. Ends at a barrier."""
+            own = sym + dcp_region()
+            if wave == 0:
+                src = fx.min(lane, D - 1)
+                src_base = dcp_summary_index(src, s, lh, 0, S, L)
+                values = poll([(own, src_base + KV_LORA // 2, 1), (own, src_base + KV_LORA // 2 + 1, 1)], "one-as")
+                valid = lane < D
+                m = valid.select(values[0][0].bitcast(fx.Float32), fx.Float32(NEG))
+                local_sum = valid.select(values[1][0].bitcast(fx.Float32), fx.Float32(0.0))
+                weight = dcp_merge.maxsum_weight(m, local_sum, wave_max, wave_sum)
+                if valid:
+                    lds_st(misc, lane, weight)
+            gpu.barrier()
+            if tid < KV_LORA // 2:
+                parts = poll([(own, dcp_summary_index(src, s, lh, tid, S, L), 1) for src in range(D)], "one-as")
+                o = [fx.Float32(0.0), fx.Float32(0.0)]
+                for src in range_constexpr(D):
+                    a0, a1 = bf2_f32(parts[src][0])
+                    weight = lds_ld(misc, src)
+                    o = dcp_merge.maxsum_accumulate(o, [a0, a1], weight)
+                lds_st(xs, tid, bf16_pair(o[0], o[1]))
+            gpu.barrier()
 
         def start(name):
             return (bid + (G - base[name])) & (G - 1)
@@ -1967,7 +2003,7 @@ def build_glm5_monokernel(
                     r = (tid % (Q_B_TILE // 4)) * 4
                     put_bf(
                         mb("q_nope"),
-                        (s * H + head) * NOPE_DIM + hoff + r,
+                        (s * L + head) * NOPE_DIM + hoff + r,
                         [lds_ld(outs, s * Q_B_TILE + r + j) for j in range(4)],
                     )
             else:
@@ -1979,7 +2015,10 @@ def build_glm5_monokernel(
                     x1 = lds_ld(outs, s * Q_B_TILE + pr * 2 + 1)
                     c = ld_rope(_rsrc(rope_cos), row_position(s) * (PE_DIM // 2) + i // 2)
                     sn = ld_rope(_rsrc(rope_sin), row_position(s) * (PE_DIM // 2) + i // 2)
-                    put_bf(mb("q_pe"), (s * H + head) * PE_DIM + i, [x0 * c - x1 * sn, x0 * sn + x1 * c])
+                    if const_expr(D == 1):
+                        put_bf(mb("q_pe"), (s * H + head) * PE_DIM + i, [x0 * c - x1 * sn, x0 * sn + x1 * c])
+                    else:
+                        dcp_push_q("q_pe", (s * H + rank * L + head) * PE_DIM + i, [x0 * c - x1 * sn, x0 * sn + x1 * c])
             stamp("q_b", t, 4)
 
             if const_expr(with_indexer and not SHARD_INDEX_Q):
@@ -2095,15 +2134,15 @@ def build_glm5_monokernel(
             pre = [u_uk(c) for c in range(UK_NKC)]
             hint_wait(
                 NOPE_DIM // Q_B_TILE,
-                lambda k: (mb("q_nope"), ((S - 1) * H + head) * NOPE_DIM + k * Q_B_TILE + Q_B_TILE - 1),
+                lambda k: (mb("q_nope"), ((S - 1) * L + head) * NOPE_DIM + k * Q_B_TILE + Q_B_TILE - 1),
                 mark=("uk", t),
             )
             if const_expr(attention_ptpc):
                 uk_scales = stage_x_pairs_ptpc(
-                    "q_nope", S, NOPE_DIM, lambda k: ((k // NOPE_DIM) * H + head) * NOPE_DIM + k % NOPE_DIM, group=128
+                    "q_nope", S, NOPE_DIM, lambda k: ((k // NOPE_DIM) * L + head) * NOPE_DIM + k % NOPE_DIM, group=128
                 )
             else:
-                stage_x_pairs("q_nope", S * NOPE_DIM, lambda k: ((k // NOPE_DIM) * H + head) * NOPE_DIM + k % NOPE_DIM)
+                stage_x_pairs("q_nope", S * NOPE_DIM, lambda k: ((k // NOPE_DIM) * L + head) * NOPE_DIM + k % NOPE_DIM)
             stamp("uk", t, 2)
             gpu.barrier()
             acc = run_units(u_uk, UK_NKC, UK_NKC, pre)
@@ -2124,7 +2163,10 @@ def build_glm5_monokernel(
                     if const_expr(attention_ptpc):
                         value = bf16_round(value * ptpc_scale)
                     vals.append(value)
-                put_bf(mb("q_lat"), (s * H + head) * KV_LORA + (t % UK_PER_HEAD) * UK_TILE + r0, vals)
+                if const_expr(D == 1):
+                    put_bf(mb("q_lat"), (s * H + head) * KV_LORA + (t % UK_PER_HEAD) * UK_TILE + r0, vals)
+                else:
+                    dcp_push_q("q_lat", (s * H + rank * L + head) * KV_LORA + (t % UK_PER_HEAD) * UK_TILE + r0, vals)
             stamp("uk", t, 4)
 
         # ====================== 4b. fused sparse index score + exact top-2048
@@ -2792,8 +2834,9 @@ def build_glm5_monokernel(
         r_idx = _rsrc(indices)
         KPW = SPLIT_KEYS // WAVES
 
-        def split_keys(t, s):
-            """(nkeys, sparse) of sample s; wave 0 writes this split's cache rows to LDS."""
+        def split_key_range(s):
+            """(index base, nkeys, sparse) of sample s: the one key count both the
+            split producers and the DCP merge's live-split bound read."""
             if const_expr(use_atom_kv_cache):
                 index_base, index_end = row_index_bounds(s)
                 nkeys = index_end - index_base
@@ -2803,6 +2846,16 @@ def build_glm5_monokernel(
                 kv_len = pos0 + s + 1
                 sparse = kv_len > topk
                 nkeys = sparse.select(fx.Int32(topk), kv_len)
+            return index_base, nkeys, sparse
+
+        def live_split_count(s):
+            """Splits of sample s holding keys, at least one (DCP only)."""
+            nkeys = _uniform(split_key_range(s)[1])
+            return fx.max((nkeys + SPLIT_KEYS - 1) // SPLIT_KEYS, fx.Int32(1))
+
+        def split_keys(t, s):
+            """(nkeys, sparse) of sample s; wave 0 writes this split's cache rows to LDS."""
+            index_base, nkeys, sparse = split_key_range(s)
             if const_expr(with_indexer):
                 if sparse:
                     if wave == 0:
@@ -2916,145 +2969,206 @@ def build_glm5_monokernel(
         SPLIT_MERGE = bool(split_head_merge) and N_HEAD_GROUPS > 1
         SPLIT_GROUPS = N_HEAD_GROUPS if SPLIT_MERGE else 1
         SPLIT_QH = H if SPLIT_MERGE else QHEADS
+        QH_STRIDE = SPLIT_QH
+        if const_expr(D > 1):
+            # Under DCP a rank holds about a quarter of each sample's keys, so
+            # only the first ~N_SPLIT / D splits have any. The tasks are
+            # numbered split-major, those splits first, so they spread over
+            # the grid; and each runs DCP_SPLIT_GROUPS head groups, as many
+            # as still fill the grid (``dcp_split_groups``).
+            SPLIT_GROUPS = DCP_SPLIT_GROUPS
+            SPLIT_MERGE = SPLIT_GROUPS > 1
+            SPLIT_QH = SPLIT_GROUPS * WAVES
+            QH_STRIDE = WAVES
+        SPLIT_BLOCKS = N_HEAD_GROUPS // SPLIT_GROUPS
+        assert S * SPLIT_BLOCKS * N_SPLIT == tasks["split"]
         for tt in range(start("split"), S * (N_HEAD_GROUPS // SPLIT_GROUPS) * N_SPLIT, G):
             tt = fx.Int32(tt)
             stamp("split", tt, 0)
-            if const_expr(SPLIT_MERGE):
-                s = tt // N_SPLIT
-                hg0 = fx.Int32(0)
+            if const_expr(D > 1):
+                t, s, hg0 = dcp_split_task(tt, S, SPLIT_BLOCKS, SPLIT_GROUPS)
             else:
-                s = tt // (N_HEAD_GROUPS * N_SPLIT)
-                hg0 = (tt // N_SPLIT) % N_HEAD_GROUPS
-            t = tt % N_SPLIT
-            nkeys, sparse = split_keys(t, s)
-            gpu.barrier()
-            gather_old_kv()  # before waiting for q: these rows are from earlier launches
-            if const_expr(True):
-                N_PE_T = PE_DIM // Q_B_TILE
-                hint_wait(
-                    N_UK + H * N_PE_T + 1,
-                    lambda k: (
-                        (k < N_UK).select(
-                            fx.Int64(SC["q_lat"]),
-                            (k < N_UK + H * N_PE_T).select(fx.Int64(SC["q_pe"]), fx.Int64(SC["penew"])),
+                if const_expr(SPLIT_MERGE):
+                    s = tt // N_SPLIT
+                    hg0 = fx.Int32(0)
+                else:
+                    s = tt // (N_HEAD_GROUPS * N_SPLIT)
+                    hg0 = (tt // N_SPLIT) % N_HEAD_GROUPS
+                t = tt % N_SPLIT
+
+            def split_body(nkeys):
+                gpu.barrier()
+                gather_old_kv()  # before waiting for q: these rows are from earlier launches
+                if const_expr(True):
+                    N_PE_T = PE_DIM // Q_B_TILE
+                    # q of all H heads: uk / q_b tasks of every rank under DCP
+                    N_QL = H * UK_PER_HEAD
+
+                    def q_hint_base(k):
+                        if const_expr(D == 1):
+                            return (k < N_QL).select(
+                                fx.Int64(SC["q_lat"]),
+                                (k < N_QL + H * N_PE_T).select(fx.Int64(SC["q_pe"]), fx.Int64(SC["penew"])),
+                            ) + scratch
+                        return (k < N_QL).select(
+                            cp_buffer("q_lat", sym),
+                            (k < N_QL + H * N_PE_T).select(cp_buffer("q_pe", sym), mb("penew")),
                         )
-                        + scratch,
-                        (k < N_UK).select(
-                            (s * H + k // UK_PER_HEAD) * KV_LORA + (k % UK_PER_HEAD) * UK_TILE + UK_TILE - 1,
-                            (k < N_UK + H * N_PE_T).select(
-                                (s * H + (k - N_UK) // N_PE_T) * PE_DIM
-                                + ((k - N_UK) % N_PE_T) * Q_B_TILE
-                                + Q_B_TILE
-                                - 1,
-                                s * PE_DIM + PE_DIM - 1,
+
+                    hint_wait(
+                        N_QL + H * N_PE_T + 1,
+                        lambda k: (
+                            q_hint_base(k),
+                            (k < N_QL).select(
+                                (s * H + k // UK_PER_HEAD) * KV_LORA + (k % UK_PER_HEAD) * UK_TILE + UK_TILE - 1,
+                                (k < N_QL + H * N_PE_T).select(
+                                    (s * H + (k - N_QL) // N_PE_T) * PE_DIM
+                                    + ((k - N_QL) % N_PE_T) * Q_B_TILE
+                                    + Q_B_TILE
+                                    - 1,
+                                    s * PE_DIM + PE_DIM - 1,
+                                ),
                             ),
                         ),
-                    ),
-                    mark=("split", tt),
-                )
-            # q -> bf16 Q[h][576] (words h * 288 + d / 2): latent 512 then pe 64.
-            # A task only ever reads its own head group's WAVES rows (``hn`` and
-            # ``h`` are both ``head_group * WAVES + ...``), so stage only those:
-            # with N_HEAD_GROUPS = 2 the old all-H staging polled and stored
-            # twice the q words it used, in every one of the S * 2 * N_SPLIT
-            # tasks. Bit-identical -- the skipped LDS rows are never read.
-            NQ = SPLIT_QH * KV_LORA // 4 // THREADS
-            tpe = fx.min(tid, SPLIT_QH * PE_DIM // 4 - 1)
-            qh0 = hg0 * SPLIT_QH if const_expr(SPLIT_QH != H) else fx.Int32(0)
-            qv = poll(
-                [(mb("q_lat"), ((s * H + qh0) * KV_LORA + (tid + i * THREADS) * 4) // 2, 2) for i in range(NQ)]
-                + [(mb("q_pe"), ((s * H + qh0) * PE_DIM + tpe * 4) // 2, 2)]
-            )
-            for i in range_constexpr(NQ):
-                w4 = tid + i * THREADS
-                qw = (qh0 + w4 // (KV_LORA // 4)) * QS + (w4 % (KV_LORA // 4)) * 2
-                lds_st(xs, qw, qv[i][0].bitcast(fx.Float32))
-                lds_st(xs, qw + 1, qv[i][1].bitcast(fx.Float32))
-            if tid < SPLIT_QH * PE_DIM // 4:
-                hh = qh0 + tid // (PE_DIM // 4)
-                qw = hh * QS + KV_LORA // 2 + (tid % (PE_DIM // 4)) * 2
-                lds_st(xs, qw, qv[NQ][0].bitcast(fx.Float32))
-                lds_st(xs, qw + 1, qv[NQ][1].bitcast(fx.Float32))
-            patch_new_kv()
-            if const_expr(True):
-                stamp("split", tt, 2)
-            gpu.barrier()
-            stamp("split", tt, 5)
-            # scores = K Q^T on MFMA.  The 64-key tile maps the eight waves to
-            # (four row groups, two K halves); the batch-8 32-key tile uses two
-            # row groups and four waves per K half.  All waves subsequently own
-            # one attention head for softmax and P@V.
-            for hgi in range_constexpr(SPLIT_GROUPS):
-                head_group = (hg0 + hgi) if const_expr(SPLIT_MERGE) else hg0
-                h = head_group * WAVES + wave
-                if const_expr(hgi):
-                    # the previous group's softmax read ``red``; this one
-                    # overwrites it with its own scores
-                    gpu.barrier()
-                hn = head_group * WAVES + fx.min(lane % 16, WAVES - 1)
-                rgk = wave % (SPLIT_KEYS // 16)
-                c = fx.Vector.filled(4, 0.0, fx.Float32)
-                for st in range_constexpr(QK_DIM // 32 // 2):
-                    kst = ((wave // (SPLIT_KEYS // 16)) % 2) * (QK_DIM // 32 // 2) + st
-                    key = rgk * 16 + lane % 16
-                    kw = (kst < KV_LORA // 32).select(
-                        KT_OFF + key * KS + kst * 16, PT_OFF + key * PS + (kst - KV_LORA // 32) * 16
+                        mark=("split", tt),
                     )
-                    a = fx.ptr_load(xs + (kw + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
-                    b = fx.ptr_load(xs + (hn * QS + kst * 16 + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
-                    c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
-                if const_expr(SPLIT_KEYS == 64) or wave < 4:
-                    fx.ptr_store(c, red + (wave * 64 + lane) * 4)
-                gpu.barrier()
-                stamp("split", tt, 6)
-                # split-local softmax: wave h, lane = key j (score = sum of the two K halves)
-                kidx = t * SPLIT_KEYS + lane
-                valid = (lane < SPLIT_KEYS) & (kidx < nkeys)
-                r16 = lane % 16
-                cl = split_score_column(wave, lane)
-                key_rg = fx.min(lane // 16, SPLIT_KEYS // 16 - 1)
-                half_stride = SPLIT_KEYS // 16
-                raw = lds_ld(red, (key_rg * 64 + cl) * 4 + r16 % 4) + lds_ld(
-                    red, ((key_rg + half_stride) * 64 + cl) * 4 + r16 % 4
+                # q -> bf16 Q[h][576] (words h * 288 + d / 2): latent 512 then pe 64.
+                # A task only ever reads its own head group's WAVES rows (``hn`` and
+                # ``h`` are both ``head_group * WAVES + ...``), so stage only those:
+                # with N_HEAD_GROUPS = 2 the old all-H staging polled and stored
+                # twice the q words it used, in every one of the S * 2 * N_SPLIT
+                # tasks. Bit-identical -- the skipped LDS rows are never read.
+                NQ = SPLIT_QH * KV_LORA // 4 // THREADS
+                # pe words: one pass up to 32 heads; 64 heads (DCP4) need two
+                PE_WORDS = SPLIT_QH * PE_DIM // 4
+                NPE = -(-PE_WORDS // THREADS)
+                tpe = fx.min(tid, PE_WORDS - 1)
+                qh0 = hg0 * QH_STRIDE if const_expr(SPLIT_QH != H) else fx.Int32(0)
+                # under DCP every rank's heads, pushed here by their uk / q_b tasks
+                q_src = mb if D == 1 else (lambda name: cp_buffer(name, sym))
+                qv = poll(
+                    [(q_src("q_lat"), ((s * H + qh0) * KV_LORA + (tid + i * THREADS) * 4) // 2, 2) for i in range(NQ)]
+                    + [(q_src("q_pe"), ((s * H + qh0) * PE_DIM + tpe * 4) // 2, 2)]
+                    + [
+                        (q_src("q_pe"), ((s * H + qh0) * PE_DIM + fx.min(tid + i * THREADS, PE_WORDS - 1) * 4) // 2, 2)
+                        for i in range(1, NPE)
+                    ],
+                    "agent" if D == 1 else "system",
                 )
-                sc_v = valid.select(raw * scale, fx.Float32(NEG))
-                m = wave_max(sc_v)
-                p = valid.select(_exp(sc_v - m), fx.Float32(0.0))
-                lsum = wave_sum(p)
-                p_n = _xshfl(p, 1)
-                if (lane < SPLIT_KEYS) & (lane % 2 == 0):
-                    lds_st(pl, h * (SPLIT_KEYS // 2) + lane // 2, bf16_pair(p, p_n))
+                for i in range_constexpr(NQ):
+                    w4 = tid + i * THREADS
+                    qw = (qh0 + w4 // (KV_LORA // 4)) * QS + (w4 % (KV_LORA // 4)) * 2
+                    lds_st(xs, qw, qv[i][0].bitcast(fx.Float32))
+                    lds_st(xs, qw + 1, qv[i][1].bitcast(fx.Float32))
+                if tid < SPLIT_QH * PE_DIM // 4:
+                    hh = qh0 + tid // (PE_DIM // 4)
+                    qw = hh * QS + KV_LORA // 2 + (tid % (PE_DIM // 4)) * 2
+                    lds_st(xs, qw, qv[NQ][0].bitcast(fx.Float32))
+                    lds_st(xs, qw + 1, qv[NQ][1].bitcast(fx.Float32))
+                for i in range_constexpr(1, NPE):
+                    pw = tid + i * THREADS
+                    if pw < PE_WORDS:
+                        hh = qh0 + pw // (PE_DIM // 4)
+                        qw = hh * QS + KV_LORA // 2 + (pw % (PE_DIM // 4)) * 2
+                        lds_st(xs, qw, qv[NQ + i][0].bitcast(fx.Float32))
+                        lds_st(xs, qw + 1, qv[NQ + i][1].bitcast(fx.Float32))
+                patch_new_kv()
+                if const_expr(True):
+                    stamp("split", tt, 2)
                 gpu.barrier()
-                stamp("split", tt, 3)
-                # O = P V on MFMA: heads M, keys K, latent dims N.  Each V word holds
-                # a dim pair (even dim low), so one read feeds two MFMAs (even / odd dims):
-                # each wave owns 2 groups of 32 dims.  V is read key-strided from the tile.
-                for g in range_constexpr(KV_LORA // 32 // WAVES):
-                    dw = (wave * (KV_LORA // 32 // WAVES) + g) * 16 + lane % 16  # dim pair word
-                    c0 = fx.Vector.filled(4, 0.0, fx.Float32)
-                    c1 = fx.Vector.filled(4, 0.0, fx.Float32)
-                    for js in range_constexpr(SPLIT_KEYS // 32):
-                        a = fx.ptr_load(
-                            pl + (hn * (SPLIT_KEYS // 2) + js * 16 + (lane // 16) * 4), result_type=v4f
-                        ).bitcast(fx.BFloat16)
-                        ws = [
-                            fx.ptr_load(ktile + ((js * 32 + (lane // 16) * 8 + i) * KS + dw)).bitcast(fx.Int32)
-                            for i in range(8)
-                        ]
-                        w_lo = [(ws[2 * i] & 0xFFFF) | (ws[2 * i + 1] << 16) for i in range(4)]
-                        w_hi = [fx.Int32(fx.Uint32(ws[2 * i]) >> 16) | (ws[2 * i + 1] & -65536) for i in range(4)]
-                        b0 = fx.Vector.from_elements(w_lo, fx.Int32).bitcast(fx.BFloat16)
-                        b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(fx.BFloat16)
-                        c0 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b0, c0]))
-                        c1 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b1, c1]))
-                    if lane < 32:
-                        for e in range_constexpr(4):
-                            hh = split_acc_head(head_group, lane // 16, e)
-                            put_bf(mb("sp_acc"), ((s * N_SPLIT + t) * H + hh) * KV_LORA + dw * 2, [c0[e], c1[e]])
-                if lane == 0:  # written last: the merge's readiness hint
-                    put(mb("sp_m"), (s * N_SPLIT + t) * H + h, m)
-                    put(mb("sp_l"), (s * N_SPLIT + t) * H + h, lsum)
-                stamp("split", tt, 4)
+                stamp("split", tt, 5)
+                # scores = K Q^T on MFMA.  The 64-key tile maps the eight waves to
+                # (four row groups, two K halves); the batch-8 32-key tile uses two
+                # row groups and four waves per K half.  All waves subsequently own
+                # one attention head for softmax and P@V.
+                for hgi in range_constexpr(SPLIT_GROUPS):
+                    head_group = (hg0 + hgi) if const_expr(SPLIT_MERGE) else hg0
+                    h = head_group * WAVES + wave
+                    if const_expr(hgi):
+                        # the previous group's softmax read ``red``; this one
+                        # overwrites it with its own scores
+                        gpu.barrier()
+                    hn = head_group * WAVES + fx.min(lane % 16, WAVES - 1)
+                    rgk = wave % (SPLIT_KEYS // 16)
+                    c = fx.Vector.filled(4, 0.0, fx.Float32)
+                    for st in range_constexpr(QK_DIM // 32 // 2):
+                        kst = ((wave // (SPLIT_KEYS // 16)) % 2) * (QK_DIM // 32 // 2) + st
+                        key = rgk * 16 + lane % 16
+                        kw = (kst < KV_LORA // 32).select(
+                            KT_OFF + key * KS + kst * 16, PT_OFF + key * PS + (kst - KV_LORA // 32) * 16
+                        )
+                        a = fx.ptr_load(xs + (kw + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
+                        b = fx.ptr_load(xs + (hn * QS + kst * 16 + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
+                        c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
+                    if const_expr(SPLIT_KEYS == 64) or wave < 4:
+                        fx.ptr_store(c, red + (wave * 64 + lane) * 4)
+                    gpu.barrier()
+                    stamp("split", tt, 6)
+                    # split-local softmax: wave h, lane = key j (score = sum of the two K halves)
+                    kidx = t * SPLIT_KEYS + lane
+                    valid = (lane < SPLIT_KEYS) & (kidx < nkeys)
+                    r16 = lane % 16
+                    cl = split_score_column(wave, lane)
+                    key_rg = fx.min(lane // 16, SPLIT_KEYS // 16 - 1)
+                    half_stride = SPLIT_KEYS // 16
+                    raw = lds_ld(red, (key_rg * 64 + cl) * 4 + r16 % 4) + lds_ld(
+                        red, ((key_rg + half_stride) * 64 + cl) * 4 + r16 % 4
+                    )
+                    sc_v = valid.select(raw * scale, fx.Float32(NEG))
+                    m = wave_max(sc_v)
+                    p = valid.select(_exp(sc_v - m), fx.Float32(0.0))
+                    lsum = wave_sum(p)
+                    p_n = _xshfl(p, 1)
+                    if (lane < SPLIT_KEYS) & (lane % 2 == 0):
+                        lds_st(pl, h * (SPLIT_KEYS // 2) + lane // 2, bf16_pair(p, p_n))
+                    gpu.barrier()
+                    stamp("split", tt, 3)
+                    # O = P V on MFMA: heads M, keys K, latent dims N.  Each V word holds
+                    # a dim pair (even dim low), so one read feeds two MFMAs (even / odd dims):
+                    # each wave owns 2 groups of 32 dims.  V is read key-strided from the tile.
+                    for g in range_constexpr(KV_LORA // 32 // WAVES):
+                        dw = (wave * (KV_LORA // 32 // WAVES) + g) * 16 + lane % 16  # dim pair word
+                        c0 = fx.Vector.filled(4, 0.0, fx.Float32)
+                        c1 = fx.Vector.filled(4, 0.0, fx.Float32)
+                        for js in range_constexpr(SPLIT_KEYS // 32):
+                            a = fx.ptr_load(
+                                pl + (hn * (SPLIT_KEYS // 2) + js * 16 + (lane // 16) * 4), result_type=v4f
+                            ).bitcast(fx.BFloat16)
+                            ws = [
+                                fx.ptr_load(ktile + ((js * 32 + (lane // 16) * 8 + i) * KS + dw)).bitcast(fx.Int32)
+                                for i in range(8)
+                            ]
+                            w_lo = [(ws[2 * i] & 0xFFFF) | (ws[2 * i + 1] << 16) for i in range(4)]
+                            w_hi = [fx.Int32(fx.Uint32(ws[2 * i]) >> 16) | (ws[2 * i + 1] & -65536) for i in range(4)]
+                            b0 = fx.Vector.from_elements(w_lo, fx.Int32).bitcast(fx.BFloat16)
+                            b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(fx.BFloat16)
+                            c0 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b0, c0]))
+                            c1 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b1, c1]))
+                        if lane < 32:
+                            for e in range_constexpr(4):
+                                hh = split_acc_head(head_group, lane // 16, e)
+                                put_bf(mb("sp_acc"), ((s * N_SPLIT + t) * H + hh) * KV_LORA + dw * 2, [c0[e], c1[e]])
+                    if lane == 0:  # written last: the merge's readiness hint
+                        put(mb("sp_m"), (s * N_SPLIT + t) * H + h, m)
+                        put(mb("sp_l"), (s * N_SPLIT + t) * H + h, lsum)
+                    stamp("split", tt, 4)
+
+            if const_expr(D == 1):
+                nkeys, sparse = split_keys(t, s)
+                split_body(nkeys)
+            else:
+                # under DCP a rank holds about topk / D of the keys: a split
+                # past them only publishes the empty-split statistics
+                if t < live_split_count(s):
+                    split_body(split_keys(t, s)[0])
+                else:
+                    # this task's heads only: the other head blocks' tasks
+                    # publish theirs
+                    if tid < SPLIT_QH:
+                        hd = hg0 * WAVES + tid
+                        put(mb("sp_m"), (s * N_SPLIT + t) * H + hd, fx.Float32(NEG))
+                        put(mb("sp_l"), (s * N_SPLIT + t) * H + hd, fx.Float32(0.0))
+                    stamp("split", tt, 4)
 
         # ========================== 6. split merge + W_UV: o = W_UV (softmax . KV)
         # 4 row groups x 8 chunks: 2 waves per row group, 4 chunks each
@@ -3063,33 +3177,10 @@ def build_glm5_monokernel(
         UV_R = UV_TILE // 16
         UV_WPR = WAVES // UV_R
         UV_UNITS = UV_NKC // (attention_k_chunks_per_unit * UV_WPR)
-        for tt in range(start("uv"), S * N_UV, G):
-            tt = fx.Int32(tt)
-            stamp("uv", tt, 0)
-            s = tt // N_UV  # sample
-            t = tt % N_UV  # global 64-row tile
-            local_t = dcp_local_uv_tile(t, L)
-            head = t // (V_DIM // UV_TILE)
-
-            def u_uv(c):
-                kc = ((wave % UV_WPR) * UV_UNITS + c) * attention_k_chunks_per_unit
-                return unit_attention(
-                    r_wuv,
-                    r_suv,
-                    local_t * UV_R + wave // UV_WPR,
-                    kc,
-                    UV_NKC,
-                    KV_LORA,
-                    128,
-                    attention_b_word(kc * 64),
-                    scale_rows=uv_scale_rows,
-                    coef=((lambda: lds_ld(misc, N_SPLIT + 2 + kc // 2)) if const_expr(attention_ptpc) else None),
-                )
-
-            pre = [u_uv(c) for c in range(UV_UNITS)]
-            hint_wait(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head), mark=("uv", tt))
-            pre_poll(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
-            stamp("uv", tt, 5)
+        def uv_latent(s, head):
+            """This rank's attention latent of (s, head), merged over its splits:
+            (valid, lo, hi) of a thread's bf16 pair, also stored to ``xs`` unless
+            the caller quantizes it to PTPC (D == 1)."""
             # Four 16-split quarters keep each poll and its live payload bounded.
             # Every thread owns one (quarter, half-of-latent) pair and processes
             # its two latent-pair positions sequentially; red holds quarter sums.
@@ -3112,14 +3203,31 @@ def build_glm5_monokernel(
                     lds_st(misc, N_SPLIT, m_all)
                     lds_st(misc, N_SPLIT + 1, den)
             gpu.barrier()
+            if const_expr(D > 1):
+                # splits past this rank's keys published no partials and weigh
+                # exp(NEG - M) = 0 (or 0 through ``den > 0`` when no split has
+                # a key): read the last live one in their place
+                last = live_split_count(s) - 1
             for dh in range_constexpr(2):
                 dp = dp_lo + dh * (KV_LORA // 4)
-                got = poll(
-                    [
-                        (mb("sp_acc"), ((s * N_SPLIT + hf * SPH + j) * H + head) * (KV_LORA // 2) + dp, 1)
-                        for j in range(SPH)
-                    ]
-                )
+                if const_expr(D == 1):
+                    got = poll(
+                        [
+                            (mb("sp_acc"), ((s * N_SPLIT + hf * SPH + j) * H + head) * (KV_LORA // 2) + dp, 1)
+                            for j in range(SPH)
+                        ]
+                    )
+                else:
+                    got = poll(
+                        [
+                            (
+                                mb("sp_acc"),
+                                ((s * N_SPLIT + fx.min(hf * SPH + j, last)) * H + head) * (KV_LORA // 2) + dp,
+                                1,
+                            )
+                            for j in range(SPH)
+                        ]
+                    )
                 o0 = fx.Float32(0.0)
                 o1 = fx.Float32(0.0)
                 for j in range_constexpr(SPH):
@@ -3139,22 +3247,75 @@ def build_glm5_monokernel(
                     o0 = o0 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2)
                     o1 = o1 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2 + 1)
                 uv0, uv1 = bf16_round(o0), bf16_round(o1)
-                if const_expr(not attention_ptpc):
+                # under DCP the latent is merged across the ranks as bf16
+                # first (``dcp_merge_latent``); PTPC quantizes the merged one
+                if const_expr(not attention_ptpc or D > 1):
                     lds_st(xs, tid, bf16_pair(uv0, uv1))
-            if const_expr(attention_ptpc):
-                uv_max = wave_max(uv_valid.select(fx.max(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)))
-                if (lane == 0) & (wave < KV_LORA // 128):
-                    lds_st(misc, N_SPLIT + 2 + wave, (uv_max == 0.0).select(fx.Float32(1.0), uv_max * (1.0 / FP8_MAX)))
-            gpu.barrier()
-            if const_expr(attention_ptpc):
-                if uv_valid:
-                    uv_scale = lds_ld(misc, N_SPLIT + 2 + tid // 64)
-                    uv_rcp = 1.0 / uv_scale
-                    st_ptpc(tid * 2, div_rn(uv0, uv_scale, uv_rcp), div_rn(uv1, uv_scale, uv_rcp))
-                gpu.barrier()
+            return uv_valid, uv0, uv1
+
+        if const_expr(D > 1):
+            # each (sample, head) partial latent once, to its owner only
+            assert S * H == tasks["uvl"]
+            for tt in range(start("uvl"), S * H, G):
+                tt = fx.Int32(tt)
+                stamp("uvl", tt, 0)
+                s = tt // H
+                head = tt % H
+                hint_wait(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head), mark=("uvl", tt))
+                pre_poll(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
+                stamp("uvl", tt, 5)
+                uv_latent(s, head)
+                stamp("uvl", tt, 2)
+                dcp_push_latent(s, head)
+                stamp("uvl", tt, 4)
+
+        N_UV_OWN = L * V_DIM // UV_TILE
+        assert S * N_UV_OWN == tasks["uv"]
+        for tt in range(start("uv"), S * N_UV_OWN, G):
+            tt = fx.Int32(tt)
+            stamp("uv", tt, 0)
+            s = tt // N_UV_OWN  # sample
+            t = tt % N_UV_OWN  # this rank's 64-row tile
+            local_t = t
+            head = t // (V_DIM // UV_TILE)
+
+            def u_uv(c):
+                kc = ((wave % UV_WPR) * UV_UNITS + c) * attention_k_chunks_per_unit
+                return unit_attention(
+                    r_wuv,
+                    r_suv,
+                    local_t * UV_R + wave // UV_WPR,
+                    kc,
+                    UV_NKC,
+                    KV_LORA,
+                    128,
+                    attention_b_word(kc * 64),
+                    scale_rows=uv_scale_rows,
+                    coef=((lambda: lds_ld(misc, N_SPLIT + 2 + kc // 2)) if const_expr(attention_ptpc) else None),
+                )
+
+            pre = [u_uv(c) for c in range(UV_UNITS)]
+            if const_expr(D == 1):
+                hint_wait(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head), mark=("uv", tt))
+                pre_poll(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
+                stamp("uv", tt, 5)
+                uv_valid, uv0, uv1 = uv_latent(s, head)
+                if const_expr(attention_ptpc):
+                    ptpc_latent(uv_valid, uv0, uv1)
+                else:
+                    gpu.barrier()
+            else:
+                hint_wait(D, None, mark=("uv", tt))
+                dcp_merge_latent(s, head)
+                if const_expr(attention_ptpc):
+                    uv_valid = tid < KV_LORA // 2
+                    uv0, uv1 = bf2_f32(lds_ld(xs, fx.min(tid, KV_LORA // 2 - 1)).bitcast(fx.Int32))
+                    gpu.barrier()
+                    ptpc_latent(uv_valid, uv0, uv1)
             # Debug stamp placed HERE, not after the per-split weights where it
             # used to sit, so ``timeline_report``'s "stage" and "compute" cut
-            # this stage where the question is: everything above reconstructs
+            # this stage where the question is: everything above (D == 1; under
+            # DCP only the cross-rank merge, ``uvl`` rebuilt it) reconstructs
             # ONE sample's attention latent (two polls of `sp_acc`, the
             # weighted sum, the FP8 quant) and is per (sample, head); every-
             # thing below is the UV GEMM, whose weight tile depends only on
@@ -3164,18 +3325,16 @@ def build_glm5_monokernel(
             # stage to ``N_UV`` tasks, a quarter of the grid. So it pays only
             # if "compute" dominates "stage"; this stamp is what says which.
             stamp("uv", tt, 2)
-            owner = dcp_merge_latent(s, t)
-            if owner:
-                acc = run_units(u_uv, UV_UNITS, UV_UNITS, pre)
-                if const_expr(attention_ptpc):
-                    reduce_rows(UV_R, acc, emit_ptpc_scalar(UV_TILE, ld_f32(r_suv, 0)))
-                else:
-                    reduce_rows(UV_R, acc, emit_out(UV_TILE))
-                stamp("uv", tt, 3)
-                gpu.barrier()
-                if tid < UV_TILE // 4:
-                    r = tid * 4
-                    put_bf(mb("o"), s * O_K + local_t * UV_TILE + r, [lds_ld(outs, r + j) for j in range(4)])
+            acc = run_units(u_uv, UV_UNITS, UV_UNITS, pre)
+            if const_expr(attention_ptpc):
+                reduce_rows(UV_R, acc, emit_ptpc_scalar(UV_TILE, ld_f32(r_suv, 0)))
+            else:
+                reduce_rows(UV_R, acc, emit_out(UV_TILE))
+            stamp("uv", tt, 3)
+            gpu.barrier()
+            if tid < UV_TILE // 4:
+                r = tid * 4
+                put_bf(mb("o"), s * O_K + local_t * UV_TILE + r, [lds_ld(outs, r + j) for j in range(4)])
             stamp("uv", tt, 4)
 
         # ====================== 7. W_o + attention TP peer reduce + residual -> a
@@ -3197,7 +3356,9 @@ def build_glm5_monokernel(
 
             pre = [u_o(c) for c in range(O_UNITS)]
             hint_wait(
-                S * N_UV, lambda k: (mb("o"), (k // N_UV) * O_K + (k % N_UV) * UV_TILE + UV_TILE - 1), mark=("o", t)
+                S * N_UV_OWN,
+                lambda k: (mb("o"), (k // N_UV_OWN) * O_K + (k % N_UV_OWN) * UV_TILE + UV_TILE - 1),
+                mark=("o", t),
             )
             if const_expr(attention_ptpc):
                 o_scales = stage_x_pairs_ptpc("o", S, O_K, lambda k: k)
