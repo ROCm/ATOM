@@ -247,43 +247,100 @@ def test_kpool_disabled_is_allowed():
     mod._check_unsupported(_vllm_config(_config(index_kpool=1)))
 
 
-def test_tail_buffer_is_not_allocated_from_the_forward():
-    """The op must not create the tail buffer itself: the first forward that
-    carries metadata is a CUDA graph capture, and a buffer born there has its
-    zero-fill replayed every step."""
+def test_tail_ring_is_one_pool_without_speculation_and_native_depth_with_it():
+    """Without speculation a ring of one pool holds the open pool. With it the
+    ring must be as deep as native ATOM's bound, because the plugin runs
+    native's verification kernels, which are only correct at that depth."""
+    from atom.plugin.vllm.attention.glm5_kpool_indexer import tail_ring_rows
+
+    assert tail_ring_rows(4, 0) == 4
+    assert tail_ring_rows(4, 1) == 8  # 4 + 2 * 2
+    assert tail_ring_rows(4, 3) == 16  # 4 + 2 * 4 = 12, rounded up
+    assert tail_ring_rows(4, 4) == 16  # 4 + 2 * 5 = 14, rounded up
+
+
+def _tail_ring_layer(block_size=1024, index_kpool=4):
+    from atom.plugin.vllm.attention.glm5_kpool_indexer import Glm5NextTailRingVllm
+
+    layer = Glm5NextTailRingVllm.__new__(Glm5NextTailRingVllm)
+    torch.nn.Module.__init__(layer)
+    layer.head_dim = 128
+    layer._index_kpool = index_kpool
+    layer.cache_config = SimpleNamespace(block_size=block_size)
+    return layer
+
+
+def test_tail_ring_is_a_per_request_block_vllm_never_prefix_caches():
+    """The ring is vLLM's KpoolTailSpec: one block per request for its
+    lifetime, never prefix-cached, so a request's tail follows the request
+    rather than its KDA state slot, and an MTP draft layer gets one too."""
+    from vllm.v1.kv_cache_interface import KpoolTailSpec
+
+    spec = _tail_ring_layer().get_kv_cache_spec(
+        SimpleNamespace(num_speculative_tokens=3)
+    )
+    assert isinstance(spec, KpoolTailSpec)
+    assert (spec.block_size, spec.sliding_window) == (16, 16)
+    assert (spec.num_kv_heads, spec.head_size, spec.dtype) == (2, 128, torch.bfloat16)
+    assert not spec.prefix_cacheable
+    assert spec.max_num_blocks_per_req(None, 8192) == 1
+
+
+def test_tail_ring_must_divide_the_block_size():
+    with pytest.raises(ValueError, match="must divide the KV block size"):
+        _tail_ring_layer(block_size=1032).get_kv_cache_spec(
+            SimpleNamespace(num_speculative_tokens=3)
+        )
+
+
+def _padded_tail_view(num_blocks=8, ring=4, head_dim=8, page_elems=96):
+    """Rings inside wider pages, the way vLLM aliases them into the indexer."""
+    pages = torch.zeros(num_blocks, page_elems, dtype=torch.bfloat16)
+    view = pages[:, : 2 * ring * head_dim].view(num_blocks, 2, ring, head_dim)
+    view.copy_(torch.arange(view.numel(), dtype=torch.bfloat16).view_as(view))
+    return pages, view
+
+
+def test_tail_ring_view_accepts_padded_pages_and_rejects_other_rings():
     from atom.plugin.vllm.attention import glm5_kpool_indexer as op
 
-    with pytest.raises(RuntimeError, match="never allocated"):
-        op._tail_cache("model.layers.999.self_attn.indexer.k_cache")
+    _, view = _padded_tail_view()
+    assert op._tail_ring_view(view, 4, 8) is view
+    with pytest.raises(RuntimeError, match="expected"):
+        op._tail_ring_view(view, 8, 8)
 
 
-def test_binding_the_kda_state_sizes_the_tail_buffers(monkeypatch):
-    """One tail buffer per pooled indexer, sized off the bound KDA state slots,
-    allocated when the state is bound -- before warmup and graph capture."""
+def test_tail_rings_round_trip_and_skip_requests_without_a_ring():
+    """Requests 0 and 2 own blocks 5 and 2; request 1 has no tokens and request
+    3 is CUDA-graph padding (slot -1). Only the two owners get a kernel slot,
+    and only their blocks change on the way back."""
     from atom.plugin.vllm.attention import glm5_kpool_indexer as op
-    from atom.plugin.vllm.models import glm5_next as mod
 
-    monkeypatch.setattr(op, "_TAIL_CACHES", {})
-    layer = mod.Glm5NextKDAAttentionVllm.__new__(mod.Glm5NextKDAAttentionVllm)
-    object.__setattr__(
-        layer,
-        "pooled_tail_indexers",
-        (("a.indexer.k_cache", 4, 128), ("b.indexer.k_cache", 4, 128)),
+    pages, view = _padded_tail_view()
+    before = pages.clone()
+    ring = 4
+    qsl = torch.tensor([0, 3, 3, 5, 6])
+    positions = torch.tensor([6, 7, 8, 1, 2, 0])
+    blocks_of_tokens = torch.tensor([5, 5, 5, 2, 2, -1])
+    slot_mapping = torch.where(
+        blocks_of_tokens >= 0,
+        blocks_of_tokens * ring + positions % ring,
+        torch.full_like(positions, -1),
     )
 
-    def bind_state(self, kv_cache):
-        object.__setattr__(self, "kv_cache", (torch.empty(33, 3, 8), kv_cache))
+    rings, slots, blocks = op._gather_tail_rings(view, slot_mapping, qsl, 4, ring)
+    assert slots.tolist() == [0, -1, 2, -1]
+    assert torch.equal(rings[0], view[5]) and torch.equal(rings[2], view[2])
+    assert rings.is_contiguous()
 
-    # Stand in for vLLM's MambaBase unpacking; the override's own work is what
-    # is under test.
-    monkeypatch.setattr(mod.KimiKDAAttentionVllm, "bind_kv_cache", bind_state)
-    layer.bind_kv_cache(torch.empty(0))
-
-    assert set(op._TAIL_CACHES) == {"a.indexer.k_cache", "b.indexer.k_cache"}
-    for buf in op._TAIL_CACHES.values():
-        assert buf.shape == (33, 2, 4, 128)
-        assert buf.dtype == torch.bfloat16
-        assert not buf.any()
+    rings[0].fill_(-1)
+    rings[2].fill_(-2)
+    op._scatter_tail_rings(view, rings, blocks)
+    assert (view[5] == -1).all() and (view[2] == -2).all()
+    untouched = [b for b in range(8) if b not in (2, 5)]
+    assert torch.equal(pages[untouched], before[untouched])
+    # The padding past each ring (the rest of the indexer page) is never written.
+    assert torch.equal(pages[:, 64:], before[:, 64:])
 
 
 def test_plugin_classes_replace_native_ones_only_during_construction():
@@ -297,22 +354,6 @@ def test_plugin_classes_replace_native_ones_only_during_construction():
     assert issubclass(mod.Glm5NextKDAAttentionVllm, native.Glm5NextKDAAttention)
     assert native.Glm5NextIndexer is not mod.Glm5NextIndexerVllm
     assert native.Glm5NextKDAAttention is not mod.Glm5NextKDAAttentionVllm
-
-
-def test_rebinding_keeps_the_tail_buffer_pointer(monkeypatch):
-    """A KV cache re-initialization after graph capture must not move the tail
-    buffer: captured graphs hold its address. Same shape -> cleared in place."""
-    from atom.plugin.vllm.attention import glm5_kpool_indexer as op
-
-    monkeypatch.setattr(op, "_TAIL_CACHES", {})
-    op.allocate_tail_cache("x.indexer.k_cache", 8, 4, 128, torch.device("cpu"))
-    first = op._TAIL_CACHES["x.indexer.k_cache"]
-    first.fill_(1)
-    op.allocate_tail_cache("x.indexer.k_cache", 8, 4, 128, torch.device("cpu"))
-    assert op._TAIL_CACHES["x.indexer.k_cache"].data_ptr() == first.data_ptr()
-    assert not first.any()
-    op.allocate_tail_cache("x.indexer.k_cache", 16, 4, 128, torch.device("cpu"))
-    assert op._TAIL_CACHES["x.indexer.k_cache"].shape[0] == 16
 
 
 def _prefill_chunk(seq_lens, q_lens, reqs_start=0, reqs_end=None, tokens_per_state=4):

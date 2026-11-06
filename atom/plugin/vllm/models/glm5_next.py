@@ -16,7 +16,7 @@ state spec instead of an attention spec.
 """
 
 import torch
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -162,33 +162,8 @@ class Glm5NextKDAAttentionVllm(KimiKDAAttentionVllm, Glm5NextKDAAttention):
     each adapter method still reaches GLM's specialization through `super()`.
     """
 
-    # (k_cache_prefix, index_kpool, head_dim) of every pooled indexer whose tail
-    # buffer is keyed on THIS layer's state slots; set on one layer only, by
-    # `_lend_kda_state_slots_to_indexers`.
-    pooled_tail_indexers: tuple[tuple[str, int, int], ...] = ()
-
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         return _get_glm5_state_dtype(self.vllm_config)
-
-    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        """Bind the KDA state, then size the pooled tail buffers off its slots.
-
-        Here rather than on the first forward: vLLM binds the KV cache before it
-        warms up kernels and captures CUDA graphs, and a buffer first allocated
-        inside a capture would have its zero-fill replayed every step.
-        """
-        super().bind_kv_cache(kv_cache)
-        if not self.pooled_tail_indexers:
-            return
-        from atom.plugin.vllm.attention.glm5_kpool_indexer import (
-            allocate_tail_cache,
-        )
-
-        state = self.kv_cache[0]
-        for prefix, index_kpool, head_dim in self.pooled_tail_indexers:
-            allocate_tail_cache(
-                prefix, state.shape[0], index_kpool, head_dim, state.device
-            )
 
 
 class Glm5NextIndexerVllm(Glm5NextIndexer):
@@ -226,12 +201,24 @@ class Glm5NextIndexerVllm(Glm5NextIndexer):
         # `torch.ops.aiter.<op>` raises inside the traced frame, Dynamo falls
         # back to eager for it, and the extra graph trips ATOM's "VllmBackend
         # can only be called once", which names neither the op nor the model.
-        from atom.plugin.vllm.attention import glm5_kpool_indexer  # noqa: F401
+        from atom.plugin.vllm.attention import glm5_kpool_indexer
 
         self._kpool_plugin_op = torch.ops.aiter.sparse_attn_indexer_kpool_plugin_mode
-        # The KDA layer whose state slots key the pooled tail buffer; set by
-        # `_lend_kda_state_slots_to_indexers` once the model is built.
-        self.kda_layer_name: str | None = None
+        # Each request's open pool, in a ring vLLM allocates per request.
+        self.tail_cache = None
+        if self.use_kpool():
+            vllm_config = get_current_vllm_config()
+            prefix = self.k_cache.prefix.removesuffix(".k_cache")
+            self.tail_cache = glm5_kpool_indexer.Glm5NextTailRingVllm(
+                head_dim=self.head_dim,
+                dtype=torch.bfloat16,
+                prefix=f"{prefix}.tail_cache",
+                cache_config=vllm_config.cache_config,
+                index_kpool=self.index_kpool,
+            )
+            self.tail_ring = glm5_kpool_indexer.tail_ring_rows(
+                self.index_kpool, vllm_config.num_speculative_tokens
+            )
 
     def forward_impl(
         self,
@@ -265,8 +252,10 @@ class Glm5NextIndexerVllm(Glm5NextIndexer):
         self._kpool_plugin_op(
             hidden_states,
             self.k_cache.prefix,
-            self.kda_layer_name,
+            self.tail_cache.prefix,
             self.k_cache.kv_cache[0],
+            self.tail_cache.kv_cache,
+            self.tail_ring,
             q_fp8,
             k,
             self.index_kpool_compress_gate(hidden_states),
@@ -304,37 +293,6 @@ class Glm5NextForConditionalGeneration_(Glm5NextBase):
         finally:
             glm5_next_base.Glm5NextKDAAttention = original_kda_cls
             glm5_next_base.Glm5NextIndexer = original_indexer_cls
-        _lend_kda_state_slots_to_indexers(self)
-
-
-def _lend_kda_state_slots_to_indexers(model) -> None:
-    """Point every indexer at ONE KDA layer, whose state slots key its tail buffer.
-
-    The pooled indexer holds each request's still-open pool in a side buffer
-    indexed by that request's KDA state slot. vLLM splits the 34 KDA layers
-    across several KV-cache groups with independent block tables, so a slot id
-    only means something within one group -- every indexer therefore borrows the
-    same layer's, and the buffer is sized from that layer's state pool.
-    """
-    kda_layer = next(
-        (
-            module
-            for module in model.modules()
-            if isinstance(module, Glm5NextKDAAttentionVllm)
-        ),
-        None,
-    )
-    if kda_layer is None:
-        return
-    pooled = []
-    for module in model.modules():
-        if isinstance(module, Glm5NextIndexerVllm):
-            module.kda_layer_name = kda_layer.layer_name
-            if module.use_kpool():
-                pooled.append(
-                    (module.k_cache.prefix, module.index_kpool, module.head_dim)
-                )
-    kda_layer.pooled_tail_indexers = tuple(pooled)
 
 
 class Glm5NextForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid):

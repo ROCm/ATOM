@@ -16,8 +16,11 @@ Three things differ from the native path and account for all the extra code:
   plugin indexer (`layer_sparse_mla.sparse_attn_indexer_plugin_mode`) does.
 * The pooled cache is allocated by vLLM's block pool, one row per pool, which
   the indexer's `MLAAttentionSpec.tokens_per_state` declares.
-* The per-request tail buffer is keyed on the KDA state slot, which lives in
-  the KDA layer's metadata rather than in an ATOM forward context.
+* Each request's open pool (the tail) lives in a ring that vLLM allocates as
+  its own KV cache group (`KpoolTailSpec`, one block per request), the layout
+  vLLM's own GLM-5.3-Flash uses. The native kernels address a contiguous
+  `[slot, 2, rows, head_dim]` buffer, so each step gathers the batch's rings
+  into one and scatters them back.
 """
 
 from __future__ import annotations
@@ -33,8 +36,11 @@ from aiter.ops.cache import (
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from vllm.models.glm5next.common.attention import Glm5NextTailCache
+from vllm.v1.kv_cache_interface import KpoolTailSpec
 
 from atom.model_ops.glm5_next import kpool
+from atom.model_ops.glm5_next.geometry import speculative_kpool_history_size
 from atom.model_ops.glm5_next.indexer import (
     _kpool_request_index,
     _kpool_write_completed_pools,
@@ -46,17 +52,106 @@ from atom.utils.custom_register import direct_register_custom_op
 logger = logging.getLogger("atom")
 
 
-def _kda_state_slots(attn_metadata_dict, kda_layer_name: str, num_reqs: int):
-    """Per-request KDA state slot ids, which is what the tail buffer is keyed on.
+def tail_ring_rows(index_kpool: int, num_speculative_tokens: int) -> int:
+    """Rows of each request's tail ring.
 
-    vLLM orders the non-spec batch decodes-first, the same order the indexer
-    metadata uses, so one slice serves both classes.
+    One pool without speculation. With it, native ATOM's bound
+    (`speculative_kpool_history_size`): the verification algorithm the plugin
+    shares with native is only correct for a ring at least that deep, which is
+    deeper than the `kpool + num_spec` vLLM sizes its own ring for.
     """
-    kda_meta = attn_metadata_dict.get(kda_layer_name)
-    slots = getattr(kda_meta, "non_spec_state_indices_tensor", None)
-    if slots is None:
-        return None
-    return slots[:num_reqs].to(torch.int64)
+    return speculative_kpool_history_size(index_kpool, num_speculative_tokens or None)
+
+
+class Glm5NextTailRingVllm(Glm5NextTailCache):
+    """vLLM's GLM-5.3-Flash tail cache, with native ATOM's ring depth.
+
+    vLLM allocates it as one block per request for the request's lifetime,
+    never prefix-caches it, and frees it with the request, which is what lets
+    the tail follow a request whatever happens to its KDA state slot, and gives
+    an MTP draft layer (which has no KDA state) a tail of its own.
+    """
+
+    def get_kv_cache_spec(self, vllm_config) -> KpoolTailSpec:
+        ring = tail_ring_rows(self._index_kpool, vllm_config.num_speculative_tokens)
+        if self.cache_config.block_size % ring != 0:
+            raise ValueError(
+                f"GLM-5.3-Flash's tail ring ({ring} rows) must divide the KV "
+                f"block size ({self.cache_config.block_size})"
+            )
+        return KpoolTailSpec(
+            block_size=ring,
+            num_kv_heads=2,
+            head_size=self.head_dim,
+            head_size_v=0,
+            dtype=torch.bfloat16,
+            sliding_window=ring,
+        )
+
+
+def _tail_ring_view(tail_kv_cache: torch.Tensor, ring: int, head_dim: int):
+    """[num_blocks, 2 (K, gate), ring, head_dim], one block per request.
+
+    vLLM pads each tail block to the indexer page and aliases it into the
+    indexer layer's tensor, so the block stride is the padded page; only the
+    inner three dims are contiguous.
+    """
+    if (
+        tail_kv_cache.dim() != 4
+        or tuple(tail_kv_cache.shape[1:]) != (2, ring, head_dim)
+        or tuple(tail_kv_cache.stride()[1:]) != (ring * head_dim, head_dim, 1)
+    ):
+        raise RuntimeError(
+            f"tail ring cache is {tuple(tail_kv_cache.shape)} with strides "
+            f"{tuple(tail_kv_cache.stride())}; expected [blocks, 2, {ring}, "
+            f"{head_dim}] with contiguous inner dims"
+        )
+    return tail_kv_cache
+
+
+def _gather_tail_rings(
+    tail_view: torch.Tensor,
+    tail_slot_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_reqs: int,
+    ring: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Copy the batch's tail rings into one contiguous `[num_reqs, 2, ring, D]`.
+
+    Returns the gathered rings, each request's slot in them (its batch index,
+    or -1 for a request with no tokens or no ring, which every native kernel
+    skips), and the block each one came from, for `_scatter_tail_rings`.
+
+    The tail group's slot mapping is `block * ring + pos % ring` for every
+    token, so a request's block is its first token's slot over `ring`.
+    Device-side only: no host sync, so this records into a CUDA graph.
+    """
+    device = tail_view.device
+    starts = query_start_loc[:num_reqs].to(torch.int64)
+    has_tokens = query_start_loc[1 : num_reqs + 1] > query_start_loc[:num_reqs]
+    first = starts.clamp(max=tail_slot_mapping.numel() - 1)
+    tail_slots = tail_slot_mapping.to(torch.int64)[first]
+    valid = has_tokens & (tail_slots >= 0)
+    blocks = torch.where(valid, tail_slots // ring, torch.zeros_like(tail_slots))
+    rings = tail_view.index_select(0, blocks)
+    slots = torch.where(
+        valid,
+        torch.arange(num_reqs, device=device, dtype=torch.int64),
+        torch.full_like(blocks, -1),
+    )
+    return rings, slots, blocks
+
+
+def _scatter_tail_rings(
+    tail_view: torch.Tensor, rings: torch.Tensor, blocks: torch.Tensor
+) -> None:
+    """Write the gathered rings back to their blocks.
+
+    A request without a ring was gathered from block 0 and skipped by the
+    kernels, so it writes block 0's own bytes back. Block 0 is vLLM's null
+    block and never a request's, so no live ring shares that index.
+    """
+    tail_view.index_copy_(0, blocks, rings)
 
 
 def _pooled_cache_view(kv_cache: torch.Tensor, pool_rows: int) -> torch.Tensor:
@@ -72,73 +167,6 @@ def _pooled_cache_view(kv_cache: torch.Tensor, pool_rows: int) -> torch.Tensor:
             f"indexer metadata pages it at {pool_rows} rows per block"
         )
     return kv_cache
-
-
-# One pooled tail buffer per indexer layer, kept for the process. It lives here,
-# not on the module, because the module's forward is traced: a tensor attribute
-# read there is a graph input whose pointer the capture bakes in, while the op
-# body is a graph break that reads this dict eagerly.
-_TAIL_CACHES: dict[str, torch.Tensor] = {}
-
-
-def allocate_tail_cache(
-    k_cache_prefix: str,
-    num_state_slots: int,
-    index_kpool: int,
-    head_dim: int,
-    device: torch.device,
-) -> None:
-    """Allocate the per-state-slot buffer holding each request's open pool.
-
-    Called when the KDA layer whose slots key it is bound to its state
-    (`Glm5NextKDAAttentionVllm.bind_kv_cache`), because vLLM binds the KV cache
-    BEFORE it warms up kernels and captures CUDA graphs. Allocated lazily from
-    the first forward instead, it would be created inside a capture: the
-    zero-fill would be recorded into the graph and rerun on every replay,
-    silently dropping every request's open pool each step.
-
-    Sized off the KDA state pool and keyed by its slot ids, rather than ridden
-    into the KDA state page as a third plane: that page is shared with attention
-    and its size decides the manager block size, so widening it moves numbers
-    that are hard to see moving. A side buffer costs
-    `num_state_slots * 2 * kpool * head_dim` bf16 per indexer layer -- tens of
-    MB in total -- and follows a request only while that request keeps its slot,
-    which is why prefix caching and speculative decoding are refused: both move
-    mamba state between slots and neither migration knows this buffer exists.
-    Rebinding (a KV cache re-initialization) clears the buffer in place when
-    its shape is unchanged, so CUDA graphs captured against it keep a valid
-    pointer; only a different slot count allocates a new one.
-    """
-    shape = (num_state_slots, 2, index_kpool, head_dim)
-    existing = _TAIL_CACHES.get(k_cache_prefix)
-    if (
-        existing is not None
-        and tuple(existing.shape) == shape
-        and existing.device == torch.device(device)
-    ):
-        existing.zero_()
-        return
-    _TAIL_CACHES[k_cache_prefix] = torch.zeros(
-        shape, dtype=torch.bfloat16, device=device
-    )
-    logger.info(
-        "[glm5 kpool] allocated tail buffer for %s: %d slots x %d x %d",
-        k_cache_prefix,
-        num_state_slots,
-        index_kpool,
-        head_dim,
-    )
-
-
-def _tail_cache(k_cache_prefix: str) -> torch.Tensor:
-    cached = _TAIL_CACHES.get(k_cache_prefix)
-    if cached is None:
-        raise RuntimeError(
-            f"pooled tail buffer for {k_cache_prefix!r} was never allocated; it "
-            "is created when the KDA state is bound, and allocating it here "
-            "could land inside a CUDA graph capture"
-        )
-    return cached
 
 
 def _prefill_chunk_topk(
@@ -230,8 +258,10 @@ def _prefill_chunk_topk(
 def sparse_attn_indexer_kpool_plugin_mode(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
-    kda_layer_name: str,
+    tail_prefix: str,
     kv_cache: torch.Tensor,
+    tail_kv_cache: torch.Tensor,
+    tail_ring: int,
     q_fp8: torch.Tensor,
     k: torch.Tensor,
     gate_score: torch.Tensor,
@@ -290,13 +320,20 @@ def sparse_attn_indexer_kpool_plugin_mode(
     if n_actual == 0:
         return result
     num_reqs = indexer_meta.num_reqs
-    state_slots = _kda_state_slots(attn_metadata_dict, kda_layer_name, num_reqs)
-    tail_cache = _tail_cache(k_cache_prefix)
-    if state_slots is None:
+    tail_meta = attn_metadata_dict.get(tail_prefix)
+    if tail_meta is None:
         raise RuntimeError(
-            "pooled indexer needs the KDA state slots (tail buffer key); "
-            f"layer {kda_layer_name!r} published none"
+            f"pooled indexer {k_cache_prefix!r} has no metadata for its tail "
+            f"ring {tail_prefix!r}"
         )
+    tail_view = _tail_ring_view(tail_kv_cache, tail_ring, head_dim)
+    tail_cache, state_slots, tail_blocks = _gather_tail_rings(
+        tail_view,
+        tail_meta.slot_mapping,
+        indexer_meta.query_start_loc,
+        num_reqs,
+        tail_ring,
+    )
 
     topk_indices = torch.full(
         (n_tokens, topk_out_width), -1, dtype=torch.int32, device=device
@@ -452,6 +489,8 @@ def sparse_attn_indexer_kpool_plugin_mode(
                 out=topk_indices[tok_a:tok_b],
             )
 
+    _scatter_tail_rings(tail_view, tail_cache, tail_blocks)
+
     # Local token indices -> global KV slots, the same conversion and buffer the
     # dense plugin indexer uses; only the row width differs.
     triton_convert_req_index_to_global_index(
@@ -469,8 +508,10 @@ def sparse_attn_indexer_kpool_plugin_mode(
 def sparse_attn_indexer_kpool_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
-    kda_layer_name: str,
+    tail_prefix: str,
     kv_cache: torch.Tensor,
+    tail_kv_cache: torch.Tensor,
+    tail_ring: int,
     q_fp8: torch.Tensor,
     k: torch.Tensor,
     gate_score: torch.Tensor,
@@ -492,6 +533,6 @@ def sparse_attn_indexer_kpool_fake(
 direct_register_custom_op(
     op_name="sparse_attn_indexer_kpool_plugin_mode",
     op_func=sparse_attn_indexer_kpool_plugin_mode,
-    mutates_args=["sparse_kv_indices_buffer", "kv_cache"],
+    mutates_args=["sparse_kv_indices_buffer", "kv_cache", "tail_kv_cache"],
     fake_impl=sparse_attn_indexer_kpool_fake,
 )
