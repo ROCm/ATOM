@@ -23,8 +23,7 @@ def _load_tensor(
     heads, dim = SHAPE
     live = offsets < N
     if MASK_ROWS:
-        # Tokens past the step's real ones (a token-graph bucket's padding)
-        # read as zero, so they move neither the amax nor the descale.
+        # A token-graph bucket's pad rows read as zero.
         live = live & (offsets // (heads * dim) < tl.load(Rows))
     if ROPE_DIM:
         # K is logically cat(k_nope, k_rope), without a BF16 intermediate.
@@ -298,11 +297,8 @@ def fused_qkv_per_tensor_quant(q, k, v, *, k_rope=None, num_rows=None):
     concatenation along the last dimension. K's amax includes both parts.
     ``k_rope`` may have one head (broadcast) or the same head count as K.
 
-    ``num_rows``, a one-element int32 device tensor, counts the leading tokens
-    that are real; the rest read as zero, so they move no descale and quantize
-    to zero. A recorded token graph pads a prefill to its bucket and reads the
-    step's count in place (`Context.scheduled_tokens_gpu`), so the real rows
-    quantize exactly as an eager forward over them alone does.
+    ``num_rows`` (one-element int32 device tensor) counts the real leading
+    tokens of a padded token-graph bucket; the rest read as zero.
     """
     tensors = (q, k, v)
     if num_rows is not None and (
