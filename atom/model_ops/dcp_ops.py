@@ -3,11 +3,14 @@
 
 """DCP (Decode Context Parallel) communication ops for ATOM.
 
-Two backends combine the per-rank partial attention outputs into the global
+Three backends combine the per-rank partial attention outputs into the global
 softmax, selected by ``DCPConfig.comm_backend``:
 
-  * ``ag_rs`` -- AllGather LSE -> correct local output -> ReduceScatter (2 calls)
-  * ``a2a``   -- one all-to-all carrying output+LSE, combine locally (1 call)
+  * ``ag_rs``   -- AllGather LSE -> correct local output -> ReduceScatter (2 calls)
+  * ``a2a``     -- one all-to-all carrying output+LSE, combine locally (1 call)
+  * ``mailbox`` -- small decode merges in aiter's FlyDSL mailbox combine, which
+    stores straight into the owners' IPC-mapped memory (no collective call);
+    everything else as ``a2a``
 
 They are mathematically equivalent but not bitwise identical; see the A2A
 section below for why one collective can replace two.
@@ -894,15 +897,18 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
     memory cannot be mapped.
     """
     key = _mailbox_key(cp_group, heads, dim)
-    if key in _MAILBOX_WORKSPACES:
-        return True
+    if key in _MAILBOX_WORKSPACES:  # None: tried, and it fell back
+        return _MAILBOX_WORKSPACES[key] is not None
+    _MAILBOX_WORKSPACES[key] = None
     try:
         from aiter.ops.flydsl.dcp_mailbox import CombineWorkspace
     except ImportError:
         CombineWorkspace = None
     # agree first: a rank that skipped the mapping would leave its peers
     # waiting in it
-    ok = torch.tensor([int(CombineWorkspace is not None)], dtype=torch.int32)
+    ok = torch.tensor(
+        [int(CombineWorkspace is not None)], dtype=torch.int32, device="cpu"
+    )
     torch.distributed.all_reduce(
         ok, op=torch.distributed.ReduceOp.MIN, group=cp_group.cpu_group
     )
@@ -965,7 +971,7 @@ def dcp_lse_merge(
 ):
     """Reconstruct the global softmax from the per-rank partials.
 
-    Dispatches to one of the two backends above. Both compute the same weighted
+    Dispatches to one of the backends above. All compute the same weighted
     sum over KV shards and leave this rank owning the same head slice; they
     differ only in how many collectives it takes (see the A2A section above for
     why one all-to-all can replace AllGather-LSE + ReduceScatter). Equivalent

@@ -116,6 +116,27 @@ def test_an_eager_step_is_all_to_all(monkeypatch, a2a_calls):
 
 
 @needs_dcp_ops
+def test_an_unavailable_mailbox_is_voted_once_on_the_cpu(monkeypatch):
+    """The layers share one attempt: a fallback is remembered, not retried per
+    layer. The vote crosses a gloo group, so it must stay on the CPU even
+    though the model is built under a GPU default device."""
+    votes = []
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.dcp_mailbox", None)
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda t, op, group: votes.append(t.device)
+    )
+    monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
+    group = SimpleNamespace(world_size=4, rank_in_group=0, cpu_group="gloo")
+    torch.set_default_device("meta")
+    try:
+        for _ in range(3):  # three MLA layers
+            assert not dcp_ops.prepare_dcp_mailbox(group, 16, 256, 64)
+    finally:
+        torch.set_default_device(None)
+    assert votes == [torch.device("cpu")]
+
+
+@needs_dcp_ops
 def test_max_tokens_is_the_widest_decode_step():
     spec = SimpleNamespace(num_speculative_tokens=3)
     cfg = SimpleNamespace(max_num_seqs=16, speculative_config=spec)
