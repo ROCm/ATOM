@@ -989,7 +989,7 @@ class DPEngineCoreProc(EngineCore):
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
-                if self._report_backlog:
+                if getattr(self, "_report_backlog", False):
                     self._report_prefill_backlog()
                 local_unfinished = not self.scheduler.is_finished() and not (
                     self._is_rl_weights_offloaded or self._weight_sync_fenced

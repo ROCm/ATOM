@@ -1019,6 +1019,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
+    # PrefillDelayer: ticks to hold a FIRE for a rank whose only blocker is an
+    # in-flight offload-tier lookup/load, so both ranks prefill on one tick
+    # instead of each on its own. 0 disables the wait.
+    "ATOM_PREFILL_TIER_WAIT_TICKS": lambda: max(
+        0, int(os.getenv("ATOM_PREFILL_TIER_WAIT_TICKS", "3"))
+    ),
+    # Scheduler: ticks a vacuous delayer FIRE (no rank prefillable at the
+    # decision) may keep a prefill that became admissible after the decision
+    # out of the step, so it joins the next aligned FIRE instead of running
+    # alone. 0 disables the veto.
+    "ATOM_PREFILL_VACUOUS_VETO_TICKS": lambda: max(
+        0, int(os.getenv("ATOM_PREFILL_VACUOUS_VETO_TICKS", "2"))
+    ),
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),

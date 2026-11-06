@@ -1387,6 +1387,11 @@ class Scheduler:
                 SequenceStatus.WAITING_FOR_REMOTE_KVS,
             ):
                 continue
+            if self._head_waits_on_tier_lookup(seq):
+                # Phase 2 skips it until its lookup answers (`prefix_waiters`),
+                # so reporting it prefillable would make the delayer count a
+                # rank that then runs a dummy prefill.
+                continue
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
                 not self.enable_chunked_prefill
@@ -1402,6 +1407,37 @@ class Scheduler:
             # an admission: it records nothing, and runs every tick, so the
             # walk is memoised across ticks.
             return self.block_manager.can_allocate_memoized(seq) >= 0
+        return False
+
+    def _head_waits_on_tier_lookup(self, seq: Sequence) -> bool:
+        """Whether Phase 2 would skip `seq` for its in-flight tier lookup
+        (`prefix_waiters`): same conditions, same order of the cheap checks."""
+        if (
+            self.kv_connector is None
+            or self._is_offload_prefill_resume(seq)
+            or not self._offload_lookup_pending(seq)
+        ):
+            return False
+        return not (
+            self._lookup_detach_enabled(seq)
+            and self._can_detach_tier_lookup(seq, self._probe_hbm_prefix(seq))
+        )
+
+    def _tier_pending_head(self) -> bool:
+        """Whether one of the first waiting heads waits only on the offload
+        tier: its lookup is in flight or its load is still running. The
+        delayer holds a FIRE briefly for such a rank (`tier_pending`)."""
+        if self.kv_connector is None:
+            return False
+        for i, seq in enumerate(self.waiting):
+            if i >= 4:
+                break
+            if seq.status == SequenceStatus.ABORTED:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                return True
+            if self._head_waits_on_tier_lookup(seq):
+                return True
         return False
 
     def _kv_usage(self) -> float:
@@ -2163,12 +2199,32 @@ class Scheduler:
                     len(self.waiting),
                     max(0, self.max_num_seqs - len(self.running)),
                 ),
+                tier_pending=(not prefillable and self._tier_pending_head()),
             )
         else:
             decision = PrefillDecision(allow=True, prefillable_ranks=0)
             prefill_cost = 0.0
         self._arrived_requests = 0
         delayer_allows = decision.allow
+        # A vacuous FIRE (no rank prefillable at the decision) admits nothing
+        # the delayer saw. A prefill that became admissible after it -- most
+        # often a tier lookup that answered in between -- would run on this
+        # rank alone, while every peer's decode waits for it, and its peers'
+        # prefills on later ticks interrupt those decodes again. Keep it for the
+        # next tick, where the delayer sees it and aligns it, up to
+        # ATOM_PREFILL_VACUOUS_VETO_TICKS in a row. The streak follows the
+        # reduced decision, so it is the same on every rank.
+        if (
+            self.prefill_delayer is not None
+            and not self.prefill_delayer.is_local
+            and decision.allow
+            and decision.prefillable_ranks == 0
+        ):
+            self._vacuous_streak = getattr(self, "_vacuous_streak", 0) + 1
+            if self._vacuous_streak <= envs.ATOM_PREFILL_VACUOUS_VETO_TICKS:
+                delayer_allows = False
+        else:
+            self._vacuous_streak = 0
 
         # Before the early return below: an idle rank keeps its peers' prefill
         # company too.
