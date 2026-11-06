@@ -1435,6 +1435,27 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         assert len(planes) == len(self._plane_row_widths())
         return planes
 
+    def reset_cache_after_capture(self) -> None:
+        """Give back the cache the capture's warmups wrote, as allocation left it.
+
+        `build_for_cudagraph_capture` runs its synthetic batch on real state
+        slots and points every block table at block 0, so each captured bucket
+        leaves compressor state in slots `0..bs-1` and KV rows in block 0. A
+        warmup can leave NaN there (the wide buckets do on gfx1250), and a
+        request later given such a slot reads it: the compress kernels clamp
+        their padding rows to ring 0 and weight them by zero, and 0 * NaN is
+        NaN. Nothing owns a slot or a block yet, so every plane goes back to
+        zeros and every state field to its own fill (`-inf` for the scores).
+        """
+        runner = self.model_runner
+        if getattr(runner, "v4_state_arena", None) is None:
+            return  # no cache allocated, nothing written
+        for plane in self._kv_planes():
+            plane.zero_()
+        for pool, _ in self._indexer_page_pools():
+            pool.zero_()
+        runner.v4_state_arena.refill_live()
+
     def _indexer_page_pools(self) -> list[tuple[torch.Tensor, str]]:
         """Indexer pools and semantic-role prefixes in PAGE stream order.
 
