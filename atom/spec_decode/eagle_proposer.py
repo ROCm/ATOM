@@ -126,9 +126,15 @@ class EagleProposer(Drafter):
         pad and nothing a graph could pin. Declaring anyway used to warm and
         capture a ONE-dimensional-positions shape that serving never runs --
         graphs nobody replays, paid for at every startup.
+        A draft model that sets ``draft_graph_supports_mrope`` is the exception:
+        ``StagedInput.batch_dim`` stages them with the batch at axis 1. Other
+        MRoPE drafts have not been validated with draft graphs and stay eager.
         """
         self.step = None
-        if self.runner.use_mrope or self.mtp_k < 2:
+        mrope = self.runner.use_mrope
+        if (
+            mrope and not getattr(self.model, "draft_graph_supports_mrope", False)
+        ) or self.mtp_k < 2:
             # mtp_k == 1 has no step 1+, so warming one would capture a graph
             # `propose` can never reach.
             self._reuse_step_buffers = False
@@ -148,7 +154,11 @@ class EagleProposer(Drafter):
             # `input_ids` from that buffer to this one, and `stage` asserts the
             # two agree.
             "input_ids": StagedInput(dtype=torch.int32),
-            "positions": StagedInput(dtype=torch.int64),
+            "positions": (
+                StagedInput(shape=(3,), dtype=torch.int64, batch_dim=1)
+                if mrope
+                else StagedInput(dtype=torch.int64)
+            ),
             "hidden_states": StagedInput(
                 shape=hidden_shape,
                 dtype=self.dtype,
@@ -178,7 +188,15 @@ class EagleProposer(Drafter):
         already masked where it matters: `prepare_mtp_decode` writes `-1` into
         `batch_id_per_q_token`, and the index kernel returns on `bid < 0` before it
         ever loads a ring slot.
+
+        A draft model that sets ``draft_returns_head_input`` (Qwen3.8's mono
+        drafter) returns ``(state, head input)`` from ``forward_with_head``,
+        here and in ``propose``'s other steps: its step already mixes the
+        head's input, which its ``compute_draft_ids_from_head`` takes. On step
+        0 of a decode it takes ``selected_rows`` and returns only those rows.
         """
+        if getattr(self.model, "draft_returns_head_input", False):
+            return self.model.forward_with_head(input_ids, positions, hidden_states)
         return self.model(
             input_ids=input_ids, positions=positions, hidden_states=hidden_states
         )
@@ -191,6 +209,12 @@ class EagleProposer(Drafter):
         `[:scheduled_bs]`: a capture bakes the length it was made at. Slicing
         is the caller's, on the way out.
         """
+        if getattr(self.model, "draft_returns_head_input", False):
+            state, head_input = fwd_out
+            assert self._reuse_step_buffers
+            hidden_states.copy_(state[:running_bs])
+            self.model.compute_draft_ids_from_head(head_input, out=input_ids)
+            return hidden_states, input_ids
         if self._reuse_step_buffers:
             hidden_states.copy_(fwd_out[:running_bs])
             self.model.compute_draft_ids(hidden_states, out=input_ids)
@@ -738,6 +762,7 @@ class EagleProposer(Drafter):
                 # steps 1+ skip it and read the compacted sparse_kv buffer.
                 if self._share_mtp_indices and i == 0:
                     self.model.model.set_skip_topk(False)
+                head_input = None
                 if i and self.step is not None:
                     # Steps 1+ are the declared pass: one row per sequence, at
                     # a batch the startup sweep already warmed. The head rides
@@ -748,6 +773,19 @@ class EagleProposer(Drafter):
                             running_bs, d_input_ids, d_positions, d_hidden
                         ),
                     )
+                elif getattr(self.model, "draft_returns_head_input", False) and (
+                    i or not (forward_context.context.is_prefill or pcp_draft_prefill)
+                ):
+                    # (`_step_forward`) Step 0 of a decode runs every row but
+                    # hands back only each sequence's last one; a step 1+ that
+                    # no declared pass covers runs here, eagerly.
+                    ret_hidden_states, head_input = self.model.forward_with_head(
+                        d_input_ids,
+                        d_positions,
+                        d_hidden,
+                        selected_rows=None if i else last_token_indices,
+                    )
+                    graphed_ids = None
                 else:
                     ret_hidden_states = self.model(
                         input_ids=d_input_ids,
@@ -772,10 +810,17 @@ class EagleProposer(Drafter):
                         if self._reuse_step_buffers
                         else None
                     )
-                    # out=None is index_select's own default: it allocates.
-                    sample_hidden_states = torch.index_select(
-                        ret_hidden_states, 0, last_token_indices, out=hidden_out
-                    )
+                    if head_input is not None:
+                        sample_hidden_states = (
+                            ret_hidden_states
+                            if hidden_out is None
+                            else hidden_out.copy_(ret_hidden_states)
+                        )
+                    else:
+                        # out=None is index_select's own default: it allocates.
+                        sample_hidden_states = torch.index_select(
+                            ret_hidden_states, 0, last_token_indices, out=hidden_out
+                        )
                 else:
                     sample_hidden_states = ret_hidden_states[:scheduled_bs]
                 # This step's row is owned storage -- the assembled matrix's
@@ -784,6 +829,10 @@ class EagleProposer(Drafter):
                 if graphed_ids is not None:
                     next_input_ids = graphed_ids[:scheduled_bs]
                     exported.copy_(next_input_ids)
+                elif head_input is not None:
+                    next_input_ids = self.model.compute_draft_ids_from_head(
+                        head_input, out=exported
+                    )
                 else:
                     # Every draft model EagleProposer can build implements this
                     # (DSpark's do not, but they never reach here), and it is
@@ -809,10 +858,6 @@ class EagleProposer(Drafter):
                         # from it, so it has to be `running_bs` long before THAT --
                         # padding it with the other rows, just before the
                         # forward, is a step too late.
-                        #
-                        # No MRoPE case to guard: a model whose positions keep
-                        # the token axis last declares no pass, so `self.step` is
-                        # None and these stay the target's own 2-D positions.
                         if self.step is not None:
                             positions = self.step.stage(
                                 running_bs, {"positions": positions}

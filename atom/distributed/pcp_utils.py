@@ -24,6 +24,8 @@ from aiter.dist.parallel_state import (
     get_prefill_context_model_parallel_world_size,
 )
 
+from atom.distributed.ulysses_sp import sp_is_enabled
+
 
 class PcpBalGroup(NamedTuple):
     """One request group for PCP+TBO request-boundary split prefill.
@@ -56,7 +58,8 @@ def get_pcp_rank() -> int:
 
 
 def pcp_is_enabled() -> bool:
-    return get_pcp_world_size() > 1
+    # Ulysses SP borrows the PCP process group; it is not PCP.
+    return get_pcp_world_size() > 1 and not sp_is_enabled()
 
 
 def pcp_pad_len(

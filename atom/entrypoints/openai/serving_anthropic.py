@@ -221,15 +221,21 @@ def read_whole_blocks(
     tools: list | None = None,
     *,
     suppress_calls: bool = False,
+    stopped: bool,
 ) -> list:
     """One complete output as ordered events, reasoning included.
 
-    The streaming branch's own loop over a single chunk: the reasoning filter
-    first, the tool parser on the content segments it yields. `split()`
+    The streaming branch's own loop over the whole output: the reasoning
+    filter first, the tool parser on the content segments it yields. `split()`
     returns `(reasoning, content)` and loses the interleaving at that line, so
     blocks rebuilt from the pair put a whole answer in one block ahead of a
     `thinking` that belonged in the middle of it -- two blocks where streaming
     sent three, for the same generation.
+
+    Adjacent reasoning segments are one event. The filter splits a chain of
+    thought wherever it drops framing inside it, and each event becomes a
+    `thinking` block or a Responses reasoning item, while streaming sends the
+    same run as one. ``stopped`` is as for `ReasoningFilter.flush`.
 
     Not Anthropic-specific except that Anthropic is the only endpoint whose
     wire format has an order to lose; the chat path's fields are flat.
@@ -239,13 +245,19 @@ def read_whole_blocks(
         tools=tools, parser_cls=parser_cls, suppress_calls=suppress_calls
     )
     out: list = []
-    for field, segment in reader.process(text) + reader.flush():
+    thought: list[str] = []
+    for field, segment in reader.read_whole_events(text, stopped=stopped):
         if not segment:
             continue
         if field == "reasoning_content":
-            out.append(("reasoning", segment))
-        else:
-            out.extend(engine.process(segment))
+            thought.append(segment)
+            continue
+        if thought:
+            out.append(("reasoning", "".join(thought)))
+            thought = []
+        out.extend(engine.process(segment))
+    if thought:
+        out.append(("reasoning", "".join(thought)))
     out.extend(engine.flush())
     return out
 

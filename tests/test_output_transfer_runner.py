@@ -187,7 +187,7 @@ def test_sampled_sources_are_held_until_recv_has_waited_on_copy_done(
     assert all(ref() is None for ref in refs)
     assert processor.token_ids_cpu == []
     assert token_ids.tolist() == [3, 4]
-    assert processor.recv_logprobs() == [-0.5, -1.5]
+    assert processor.recv_logprobs().tolist() == [-0.5, -1.5]
 
 
 def test_clean_waits_for_every_queued_copy_before_dropping_it(cpu_processor):
