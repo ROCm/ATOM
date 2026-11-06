@@ -147,10 +147,10 @@ class ReasoningFilter:
     output then begins *inside* the channel with no opening tag, so nothing in
     the text says so and the filter must be told.
 
-    ``answer_started`` is for a prompt that has closed the channel and begun
-    the answer itself (a content prefix continued in thinking mode): the
-    output is read as the text after the channel's end marker is, its
-    framing removed and any think markers in it the model's own words.
+    ``answer_started`` is for a prompt that has begun the answer itself (an
+    assistant prefix's content): the output is read as the text after the
+    channel's end marker is, its framing removed and any think markers in it
+    the model's own words.
 
     ``dialect`` is the one this model speaks. Go through
     :class:`ReasoningChannel` rather than passing it by hand.
@@ -374,9 +374,9 @@ class ReasoningChannel:
     model-level fact in regardless made an ordinary answer come back as
     ``reasoning_content`` with empty ``content``. The caller resolves it.
 
-    ``answer_started``: the prompt closed the channel and began the answer
-    itself -- an assistant prefix's content (``prefix_completion``) -- so the
-    output reads as it would after the model's own end marker.
+    ``answer_started``: the prompt has begun the answer itself -- an
+    assistant prefix's content (``prefix_completion``) -- so the output reads
+    as it would after the model's own end marker.
     """
 
     dialect: ReasoningDialect | None = None

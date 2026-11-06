@@ -122,6 +122,7 @@ from .request_timing import (
     get_stream_timing,
     has_generated_output,
     record_nonstream_first_token,
+    skip_first_token,
 )
 from .serving_anthropic import (
     AnthropicBlocks,
@@ -2408,8 +2409,10 @@ async def _zero_token_output(
     the reply is its ``echo`` alone, ended by its length cap. The prompt is
     tokenized as the engine would (``encode_prompt``) for its usage and the
     context check, and the output goes to the builders a generated one does,
-    so the response has the same shape.
+    so the response has the same shape. No first token comes, so none is
+    timed: an echoed prompt is not one.
     """
+    skip_first_token()
     if isinstance(prompt_or_tokens, str):
         encoded = await asyncio.to_thread(
             engine.io_processor.encode_prompt, prompt_or_tokens

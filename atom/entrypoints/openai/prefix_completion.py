@@ -80,9 +80,11 @@ def continue_prompt(
     A content prefix in a reply that begins in reasoning has the channel
     closed empty first: the reply continues that content, not reasoning
     about it. A format that frames the answer in a channel of its own
-    (Kimi-K3) has that channel opened before the content. The continuation
-    is then read as the answer: a think marker in it is the model's own
-    words, as it is when the model closes the channel itself.
+    (Kimi-K3) has that channel opened before the content.
+
+    In either mode, a content prefix has begun the answer, so the
+    continuation is read as the answer: a think marker in it is the model's
+    own words, as it is when the model closes the channel itself.
     """
     if not channel.starts_open:
         if prefix.reasoning_content is not None:
@@ -90,7 +92,9 @@ def continue_prompt(
                 "reasoning_content in an assistant prefix requires thinking mode, "
                 "in which the reply begins in the reasoning channel"
             )
-        return prompt + prefix.content, channel
+        if not prefix.content:
+            return prompt, channel  # nothing has begun: an ordinary reply
+        return prompt + prefix.content, replace(channel, answer_started=True)
     reasoning = prefix.reasoning_content or ""
     if prefix.reasoning_content is not None and not prefix.content:
         return prompt + reasoning, channel

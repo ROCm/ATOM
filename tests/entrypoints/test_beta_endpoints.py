@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from atom.entrypoints.openai import api_server
+from atom.entrypoints.openai import api_server, request_timing
 from atom.entrypoints.openai.api_compatibility import DEEPSEEK_API_COMPATIBILITY
 from atom.entrypoints.openai.chat_encoders import (
     _load_encoder_from_dir,
@@ -162,6 +162,8 @@ def _closed(dialect=THINK):
         # Reasoning off: the reply starts with the content.
         ("<A></think>", _closed(), AssistantPrefix("x"), ("<A></think>x", False)),
         ("<A>", _closed(), AssistantPrefix("x"), ("<A>x", False)),
+        # An empty content prefix has begun nothing: an ordinary reply.
+        ("<A></think>", _closed(), AssistantPrefix(""), ("<A></think>", False)),
         # Reasoning on, content only: the channel is closed empty first.
         ("<A><think>", _opened(), AssistantPrefix("x"), ("<A><think></think>x", False)),
         # A chain-of-thought prefix is continued inside the channel...
@@ -220,9 +222,8 @@ def test_prefix_continues_the_rendered_turn(prompt, channel, prefix, expected):
     assert continued == expected_prompt
     assert reading.dialect is channel.dialect
     assert reading.starts_open is in_reasoning
-    # Only a channel the prefix closed has begun the answer; with thinking
-    # off the continuation reads as an ordinary reply does.
-    assert reading.answer_started is (channel.starts_open and not in_reasoning)
+    # A content prefix has begun the answer, with thinking on or off.
+    assert reading.answer_started is (bool(prefix.content) and not in_reasoning)
 
 
 @pytest.mark.parametrize("dialect", DIALECTS)
@@ -269,6 +270,20 @@ def test_a_continued_answer_reads_as_the_models_own_would(dialect, reasoning, ch
         prefix.content + words,
     )
     assert _read(channel, continuation, chunk) == (None, words)
+
+
+@pytest.mark.parametrize("chunk", [None, 1, 4])
+@pytest.mark.parametrize("dialect", [THINK, MINIMAX, K3])
+def test_a_continued_answer_reads_the_same_with_thinking_off(dialect, chunk):
+    """The content began the answer in either mode, so the continuation is
+    read alike: think markers in it are the model's words."""
+    prefix = AssistantPrefix("XML example: ")
+    words = f"<a>{dialect.output_open_marker}x{dialect.think_end_marker}</a>"
+    continuation = words + "".join(dialect.answer_end_markers)
+    _, thinking = continue_prompt("<A>", prefix, _opened(dialect))
+    _, chat = continue_prompt("<A>", prefix, _closed(dialect))
+    assert _read(chat, continuation, chunk) == (None, words)
+    assert _read(chat, continuation, chunk) == _read(thinking, continuation, chunk)
 
 
 # --- fill-in-the-middle format -------------------------------------------------
@@ -459,15 +474,25 @@ def test_implicit_reasoning_model_continues_a_reasoning_prefix(engine, monkeypat
     assert (message["reasoning_content"], message["content"]) == (" more.", "answer")
 
 
-def test_think_tags_after_a_content_prefix_stay_in_the_content(engine, monkeypatch):
-    """Thinking mode: the prefix closed the channel, so tags the model then
-    writes are its answer's words."""
-    _template(monkeypatch, engine, "<A><think>")
-    monkeypatch.setattr(api_server, "model_starts_in_reasoning", True)
+@pytest.mark.parametrize(
+    "rendered, starts_in_reasoning, prompt",
+    [
+        ("<A><think>", True, "<A><think></think>XML example: "),
+        ("<A></think>", False, "<A></think>XML example: "),
+    ],
+    ids=["thinking", "chat"],
+)
+def test_think_tags_after_a_content_prefix_stay_in_the_content(
+    engine, monkeypatch, rendered, starts_in_reasoning, prompt
+):
+    """The content prefix began the answer, so tags the model then writes are
+    its answer's words, with thinking on or off."""
+    _template(monkeypatch, engine, rendered)
+    monkeypatch.setattr(api_server, "model_starts_in_reasoning", starts_in_reasoning)
     engine.reply = "<think>x</think>"
     prefix = {"role": "assistant", "content": "XML example: ", "prefix": True}
     message = _chat(api_server.beta_chat_completions, [USER, prefix])
-    assert engine.prompts == ["<A><think></think>XML example: "]
+    assert engine.prompts == [prompt]
     assert message["content"] == "<think>x</think>"
     assert not message.get("reasoning_content")
 
@@ -692,6 +717,24 @@ def test_zero_max_tokens_streams_the_echo_alone(no_generation, monkeypatch, n):
     assert last["choices"][0]["finish_reason"] == "length"
     assert last["usage"]["prompt_tokens"] == len("return 42")
     assert last["usage"]["completion_tokens"] == 0
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("n", [1, 2])
+def test_zero_max_tokens_records_no_time_to_first_token(no_generation, stream, n):
+    """The echoed prompt is not a generated token."""
+    observed = []
+    timing = request_timing.RequestTiming(
+        0.0, lambda *sample: observed.append(sample), streaming_response=stream
+    )
+    token = request_timing._request_timing.set(timing)
+    try:
+        _beta_complete(
+            prompt="p", echo=True, max_tokens=0, stream=stream, n=n, temperature=0.7
+        )
+    finally:
+        request_timing._request_timing.reset(token)
+    assert observed == []
 
 
 def test_zero_max_tokens_still_needs_the_prompt_to_fit(no_generation):
@@ -945,7 +988,9 @@ def test_v41_prefix_matches_official_unterminated_assistant_turn(
         {"role": "system", "content": "Be brief."},
         USER,
     ]
-    _chat(
+    # The answer has begun in both modes: tags the model writes stay in it.
+    engine.reply = "<think>x</think>"
+    message = _chat(
         api_server.beta_chat_completions,
         [*history, prefix],
         chat_template_kwargs={"thinking_mode": mode},
@@ -965,3 +1010,5 @@ def test_v41_prefix_matches_official_unterminated_assistant_turn(
         thinking_mode=mode,
     )
     assert engine.prompts == [official]
+    assert message["content"] == "<think>x</think>"
+    assert not message.get("reasoning_content")
