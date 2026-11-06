@@ -19,6 +19,7 @@ per-rank flag such as ``is_dummy_run`` must never gate this).
 """
 
 import logging
+import os
 
 import torch
 from torch import nn
@@ -155,6 +156,10 @@ def install_mono_decode(
     """``model`` wrapped for mono decode (and ``drafter``'s DSpark draft model
     for its backbone), or ``model`` itself when this deployment is one mono
     does not serve."""
+    if os.environ.get("DSV41_OWNER_SERVING") == "1":
+        from atom.models.deepseek_v41.owner_service import install
+
+        install()
     why = config_refusal(atom_config)
     if why is not None:
         logger.info("V4.1 mono decode off: %s", why)
