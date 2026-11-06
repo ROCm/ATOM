@@ -187,6 +187,7 @@ Currently, the plugin backend supports the following model architectures:
 | `Glm4MoeForCausalLM` | `atom.models.glm4_moe.Glm4MoeForCausalLM` | GLM-4-MoE |
 | `KimiK3ForConditionalGeneration` | `atom.plugin.vllm.models.kimi_k3.KimiK3ForConditionalGenerationVllm` | Kimi-K3 multimodal KDA + MLA hybrid MoE |
 | `DeepseekV41ForCausalLM` | `atom.plugin.vllm.models.deepseek_v41.DeepseekV41RuntimeModelVllm` | DeepSeek-V4.1-Flash (CSA2), text only |
+| `Glm5NextForConditionalGeneration` | `atom.plugin.vllm.models.glm5_next.Glm5NextForCausalLMVllm` | GLM-5.3-Flash (KDA + pooled sparse MLA hybrid), text only |
 
 `Kimi-K2` is also supported. Although it is usually loaded with `--trust-remote-code`, it shares the same DeepSeek-style MLA+MoE architecture path and reuses `atom.models.deepseek_v2.DeepseekV3ForCausalLM` in the ATOM vLLM OOT backend.
 
@@ -194,6 +195,13 @@ Kimi-K3 uses vLLM's hybrid/Mamba cache contract for KDA recurrent state and
 ATOM's MLA backend for full-attention layers. See the
 [Kimi-K3 vLLM recipe](../recipes/atom_vllm/Kimi-K3.md) for its TP8, FLA,
 prefix-caching, and text-only requirements.
+
+GLM-5.3-Flash reuses Kimi-K3's KDA state contract and runs its DSA indexer in
+pooled (kpool) form: the index cache declares `tokens_per_state = index_kpool`,
+and each request's open pool is kept in a side buffer keyed on its KDA state
+slot. The plugin path serves the text backbone; PCP, DCP, speculative decoding,
+prefix caching and KV transfer are refused at startup. The PR CI cell runs it at
+TP4 with `--kv-cache-dtype bfloat16`.
 
 DeepSeek-V4.1 pages out of a proxy KV cache: ATOM declares one fake attention
 layer whose block is exactly one 256-token CSA2 PAGE, lets vLLM size and

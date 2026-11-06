@@ -178,6 +178,9 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "KimiK3ForConditionalGeneration": (
         "atom.plugin.vllm.models.kimi_k3:KimiK3ForConditionalGeneration_"
     ),
+    "Glm5NextForConditionalGeneration": (
+        "atom.plugin.vllm.models.glm5_next:Glm5NextForConditionalGeneration_"
+    ),
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
     "DeepseekV4ForCausalLM": "atom.plugin.vllm.models.deepseek_v4:DeepseekV4ForCausalLM",
     "DeepseekV41ForCausalLM": (
