@@ -901,7 +901,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     ):
         """Per-draft-step metadata for a block-paged MHA Eagle3 draft.
 
-        Called by EagleProposer.propose at mid-step iters. The draft's decode
+        Called by EagleProposer._propose at mid-step iters. The draft's decode
         kernels (``paged_attention_{asm,triton}``) read ``block_tables`` +
         ``context_lens``. Eagle can pre-bump ``context_lens`` before this call,
         or ask this fused kernel to update it in place. The block_size==1024

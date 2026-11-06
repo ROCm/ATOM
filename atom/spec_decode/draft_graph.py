@@ -85,6 +85,8 @@ class DraftGraph:
     capture_supported: bool = True
     inputs: "Mapping[str, StagedInput]" = field(default_factory=dict)
     warmup_inputs: Callable[..., None] | None = None
+    # Tells apart two passes declared over one forward, in `name` and `label`.
+    variant: str = ""
 
     _buffers: dict[str, torch.Tensor] = field(init=False, default_factory=dict)
     # Keyed by `running_bs` alone: a pass drafts the same tokens per sequence
@@ -100,7 +102,8 @@ class DraftGraph:
         across the repo on its own, and the words available -- "block", "step"
         -- are the three most overloaded in it.
         """
-        return self.forward.__qualname__
+        name = self.forward.__qualname__
+        return f"{name}[{self.variant}]" if self.variant else name
 
     def bind(self, config: "Config", device) -> "DraftGraph":
         """Give the declared pass its storage. Once, at drafter init.
@@ -133,7 +136,8 @@ class DraftGraph:
         return self.capture_supported and envs.ATOM_DRAFT_CUDAGRAPH
 
     def label(self, scheduled_bs: int, running_bs: int) -> str:
-        """``bs=<scheduled>/<running>``, plus ``graph`` when this step replays.
+        """``bs=<scheduled>/<running>``, plus ``graph`` when this step replays,
+        plus the ``variant`` when there is one.
 
         One convention, one implementation: "did the draft get into a graph" is
         then a single grep across every flavor, rather than each flavor writing
@@ -141,9 +145,10 @@ class DraftGraph:
         predicate `run` does, so the mark cannot claim a replay that did not
         happen.
         """
-        return f"bs={scheduled_bs}/{running_bs}" + (
+        label = f"bs={scheduled_bs}/{running_bs}" + (
             " graph" if self.is_captured(running_bs) else ""
         )
+        return f"{label} {self.variant}" if self.variant else label
 
     def stage(
         self, running_bs: int, srcs: "Mapping[str, torch.Tensor]"

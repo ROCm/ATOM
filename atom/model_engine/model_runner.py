@@ -188,6 +188,12 @@ def split_rows_graph_ladder(sizes, step: int, max_bs: int) -> list[int]:
 _kv_config_has_producer = kv_config_has_producer
 
 
+def _draft_lossless(runner):
+    """The runner's drafter's armed lossless sampling state, or None."""
+    drafter = getattr(runner, "drafter", None)
+    return None if drafter is None else drafter.lossless
+
+
 def _needs_id_sync(is_deferred_out: bool, has_drafter: bool) -> bool:
     """Whether sampled ids feed the next forward on device (deferred-out or a
     drafter), so they must agree across a group. Shared by the PCP and TP
@@ -944,6 +950,7 @@ class ModelRunner:
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
         self.allocate_forward_vars()
+        self._arm_lossless(config)
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             model_runner=self
         )
@@ -1679,6 +1686,35 @@ class ModelRunner:
             self._h2d_groups.append(groups)
         self.h2d_owner = self._h2d_owners[self._fv_idx]
         self.h2d_groups = self._h2d_groups[self._fv_idx]
+
+    def _arm_lossless(self, config) -> None:
+        """Wire an armed lossless DSpark draft to this runner, before any warmup
+        or capture: the draft reads the target's own temperatures and filters
+        (`DSparkLossless.bind_target`), the bonus draws keep top-k ties as the
+        verify's p_f does, and the ratio verify is armed (scratch and compile).
+        Its logits are the LM head's, which keeps the hidden states' dtype; the
+        verify refuses logits of any other dtype rather than JIT mid-serving."""
+        lossless = _draft_lossless(self)
+        if lossless is not None:
+            lossless.bind_target(self.forward_vars, self.drafter.model)
+            self.sampler.keep_ties(self.forward_vars["top_ks"].gpu)
+            self.rejection_sampler.arm_ratio(
+                config.max_num_seqs,
+                self.drafter.mtp_k,
+                int(self.drafter.model.vocab_size),
+                config.torch_dtype,
+                self.device,
+            )
+        elif envs.ATOM_SPEC_LOSSLESS_SAMPLING:
+            # Without a drafter there is no draft to sample, and a DSpark
+            # drafter says why it did not arm (`DSparkLossless.arm`).
+            drafter = getattr(self, "drafter", None)
+            if drafter is not None and not getattr(drafter, "is_block_drafter", False):
+                logger.warning(
+                    "ATOM_SPEC_LOSSLESS_SAMPLING is set but only a DSpark drafter "
+                    "arms it; this engine (%s) samples and verifies as without it.",
+                    type(drafter).__name__,
+                )
 
     def _advance_forward_vars(self):
         """Rotate to the next in-flight slot before any buffer is written.
@@ -2766,6 +2802,17 @@ class ModelRunner:
                 top_ps = top_p_buffer.gpu[:bs]
                 top_p_count = bs
 
+        lossless = _draft_lossless(self)
+        if lossless is not None:
+            # The lossless draft samples within every row's own filters, so it
+            # needs each row's, off (-1 / 1.0) and uniform ones included.
+            if top_k_count is None:
+                self.forward_vars["top_ks"].np[:bs] = batch.top_ks
+                top_k_count = bs
+            if top_p_count is None:
+                self.forward_vars["top_ps"].np[:bs] = batch.top_ps
+                top_p_count = bs
+
         logprob_count = None
         batch.logprob_request_indices = None
         batch.logprob_rows = None
@@ -2809,6 +2856,23 @@ class ModelRunner:
         counts[group.indices["top_ps"]] = top_p_count
         counts[group.indices["required_channel_states"]] = channel_count
         counts[group.indices["logprob_request_indices"]] = logprob_count
+        # The draft's own inputs (its Philox key and where its q goes), staged into
+        # the same publication so the upload stays a single batched H2D and is
+        # covered by this forward's staging window.
+        if lossless is not None:
+            lossless.stage(
+                batch,
+                bs,
+                group,
+                # A dummy forward's and an align-only propose's drafts are
+                # dropped, so they must not claim q slots or write q.
+                drafts_verifiable=not batch.is_dummy_run
+                and not self._is_pure_middle_chunk(batch),
+                # Only a forward whose verify reads q looks it up: the gate
+                # `postprocess` asks `verify_inputs` under.
+                verifies=not all_greedy
+                and self._verifies_drafts(batch, batch.total_tokens_num_prefill > 0),
+            )
         if publication_group is None:
             group.publish(counts)
         temperatures = temp_buffer.gpu[:bs]
@@ -3515,8 +3579,15 @@ class ModelRunner:
             channel = self._constrain_required_channel(
                 batch, bonus_logits, spec_decode_metadata, target_logits
             )
+            # Lossless (`u * q < p`) inputs, asked first: they decide whether the
+            # verification sample below runs. All-greedy batches keep exact match.
+            ratio = None
+            lossless = _draft_lossless(self)
+            if lossless is not None and not all_greedy:
+                ratio = lossless.verify_inputs(bs, temperatures, top_ks, top_ps)
             target_token_ids = None
-            if not all_greedy:
+            # Only exact match on a sampled batch reads the target's own draw.
+            if not all_greedy and ratio is None:
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
                     spec_decode_metadata.cu_num_draft_tokens,
@@ -3539,6 +3610,7 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
+                ratio=ratio,
             )
             # PCP ranks decode redundantly but not bit-identically, so their
             # accept counts can differ: take rank 0's verdict. Ids are synced
