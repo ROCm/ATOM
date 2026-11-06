@@ -693,6 +693,8 @@ class Qwen3NextAttention(nn.Module):
     # Set by the MTP drafter (ATOM_MTP_ATTN_GATE_IN_REDUCE): the output gate goes
     # to the attention's own epilogue where it can take it.
     gate_in_attention = False
+    # ATOM_UA_FUSED_OUTPUT_GATE, set in __init__ (off for a layer built without it).
+    fused_output_gate = False
 
     def __init__(
         self,
