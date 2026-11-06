@@ -359,9 +359,8 @@ def sharded_table_lookup(
     if ids.numel() == 0:
         return output
     units = get_cu_num()
-    # Rows per program: spread a small batch over as many programs as there
-    # are rows, up to a row per compute unit (bs 1 decode, 16 rows: 3.3 us at
-    # 1, 5.1 us at 16 on MI355X), then up to 16 (from 4k rows, 2-16 are even).
+    # Rows per program: one per compute unit while the batch is small, then
+    # up to 16.
     block_rows = min(16, triton.next_power_of_2(triton.cdiv(ids.numel(), units)))
     grid = min(triton.cdiv(ids.numel(), block_rows), 4 * units)
     _sharded_table_lookup_kernel[(grid,)](

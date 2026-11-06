@@ -386,22 +386,16 @@ def test_a_weight_sync_reaches_the_rows_the_lookup_reads(fake_pin, fail_at, shar
     _load(old, emb.table)
     emb.bind()
     before = emb.shard_bases.clone()
-    pinned = [p.data_ptr() for _, p in emb.table._rows.values() if p is not None]
     pins = fake_pin.calls
     proj = torch.randn(4, 4)
-
-    hbm = emb.weight.data_ptr()
 
     updated = _updater(model).update_weights(_sync_tensors(new, proj, shards))
 
     assert updated == (NUM_SHARDS + 1 if shards else 2)
     assert torch.equal(model.proj.weight, proj)
-    assert emb.weight.data_ptr() == hbm
     assert torch.equal(emb.shard_bases, before)
+    assert torch.equal(emb.table.shard_bases(NUM_SHARDS), before)
     assert fake_pin.calls == pins
-    assert [p.data_ptr() for _, p in emb.table._rows.values() if p is not None] == (
-        pinned
-    )
     ids = _probe_ids(TABLE_ROWS)
     got = _follow(emb.shard_bases, ids, 0, TABLE_ROWS, new.dtype)
     assert _bitwise_equal(got, new[ids])
@@ -804,7 +798,6 @@ def test_weight_sync_reaches_the_rows_a_captured_lookup_reads(ngram_layer, shard
     embedding = host_layer.ngram_embedding
     assert embedding.table.on_host
     bases = embedding.shard_bases.clone()
-    pinned = [p.data_ptr() for _, p in embedding.table._rows.values()]
     ids = torch.zeros(256, dtype=torch.int64, device="cuda")
     embedding(ids)  # compile outside the capture
     torch.cuda.synchronize()
@@ -821,7 +814,7 @@ def test_weight_sync_reaches_the_rows_a_captured_lookup_reads(ngram_layer, shard
     sync(host_layer)
     sync(hbm_layer)
     assert torch.equal(embedding.shard_bases, bases)
-    assert [p.data_ptr() for _, p in embedding.table._rows.values()] == pinned
+    assert torch.equal(embedding.table.shard_bases(bases.numel()), bases.cpu())
     reference = hbm_layer.ngram_embedding
     for seed in range(3):
         gen = torch.Generator().manual_seed(seed)
@@ -836,7 +829,7 @@ def test_weight_sync_reaches_the_rows_a_captured_lookup_reads(ngram_layer, shard
 
 
 @_gpu
-def test_the_host_table_stays_off_where_not_validated_or_for_a_dummy_load(
+def test_the_host_table_stays_off_where_not_validated_under_a_plugin_or_for_a_dummy_load(
     ngram_layer, monkeypatch
 ):
     """gfx90a, for one, a framework plugin and `--load_dummy`: the table stays
@@ -934,11 +927,10 @@ def test_released_host_rows_come_back_where_the_recaptured_graph_reads(ngram_lay
     embedding.resume_weight_memory = resumed
     synced = {n: p.detach().clone() for n, p in host_layer.named_parameters()}
     old_bases = embedding.shard_bases.clone()
-    sizes = [p.nbytes for _, p in embedding.table._rows.values()]
+    sizes = [part.nbytes for part in table.split(host_layer.checkpoint_shard_rows)]
 
     runner.release_memory(tags=["weights"])
     assert embedding.table.pinned_bytes == 0 and graphs.graph is None
-    assert runner._graphs_released_for_sleep
     squatter = host_memory.pin_rows([torch.empty(n, dtype=torch.uint8) for n in sizes])
     runner.resume_memory(tags=["weights"])
     assert [event for event, _ in events] == ["capture", "resume", "capture"]

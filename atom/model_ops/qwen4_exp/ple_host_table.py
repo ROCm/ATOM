@@ -108,20 +108,16 @@ class PleHostTable:
                 "weights are resumed"
             )
 
-    def check_rows(self, rows: torch.Tensor) -> None:
-        """Raise unless `rows` can be written into the table as they are."""
+    def sync_rows(self, first: int, rows: torch.Tensor) -> None:
+        """Write this rank's part of global rows `[first, first + len(rows))`
+        in place, so `shard_bases` and the graphs that captured it stay valid.
+        The caller makes sure no lookup is still reading the rows."""
         if rows.dim() != 2 or rows.shape[1] != self.dim:
             raise ValueError(
                 f"{self.prefix}: expected [rows, {self.dim}] n-gram rows, "
                 f"got {tuple(rows.shape)}"
             )
         check_fp8_rows(self.prefix, rows, self.dtype)
-
-    def sync_rows(self, first: int, rows: torch.Tensor) -> None:
-        """Write this rank's part of global rows `[first, first + len(rows))`
-        in place, so `shard_bases` and the graphs that captured it stay valid.
-        The caller makes sure no lookup is still reading the rows."""
-        self.check_rows(rows)
         lo = max(first, self.vocab_start)
         hi = min(first + rows.shape[0], self.vocab_end)
         with self._lock:

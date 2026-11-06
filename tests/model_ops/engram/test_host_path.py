@@ -1523,17 +1523,9 @@ def test_copy_without_an_allocator_is_a_failure(monkeypatch, shared):
 
     cudart = FakeCudart()
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    registered = []
-    register = host_memory._register
-
-    def spy(sources, leases):
-        registered.append(len(sources))
-        return register(sources, leases)
-
-    monkeypatch.setattr(host_memory, "_register", spy)
     rows = torch.ones(1 << 18)
     assert host_memory.pin_rows([rows], shared=shared, copy=True) is None
-    assert registered == [] and cudart.registered == []
+    assert cudart.calls == 0
 
 
 def test_a_shared_read_only_mapping_registers_in_place_read_only(monkeypatch, tmp_path):

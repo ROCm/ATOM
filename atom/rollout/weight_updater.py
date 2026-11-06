@@ -320,7 +320,7 @@ class WeightUpdaterMixin:
         sync = getattr(module, "sync_weight", None)
         if not callable(sync):
             return False
-        if not getattr(self, "_module_readers_awaited", False):
+        if not self._module_readers_awaited:
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
             self._module_readers_awaited = True
