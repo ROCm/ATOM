@@ -1385,8 +1385,9 @@ class LinearBase(nn.Module):
                 )
             ):
                 shuffle_weights(self.weight)
-            # gfx942 has no MXFP8 MFMA: dequant the weight once to BF16 so every
-            # decode step only scales activations and calls hipBLAS.
+            # Temporary resident BF16 copy of the FP8 group32 weight. gfx942 has
+            # no aiter group32 GEMM, so decode scales activations and calls
+            # hipBLAS on this cache. Delete the cache once that GEMM exists.
             if (
                 gfx942
                 and self.weight.numel()
@@ -1520,7 +1521,11 @@ class LinearBase(nn.Module):
                 self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
     def _rebuild_group32_bf16_cache(self) -> None:
-        """Refresh the gfx942 BF16 weight cache after load or an in-place FP8 write."""
+        """Refresh the gfx942 BF16 weight cache after load or an in-place FP8 write.
+
+        Temporary, same lifetime as ``ATOM_GFX942_CACHE_BF16_WEIGHT``: drop it
+        when aiter can run the group32 GEMM on the FP8 weight directly.
+        """
         if self.weight_scale is None or not self.weight.numel():
             if hasattr(self.weight, "_atom_group32_bf16_cache"):
                 delattr(self.weight, "_atom_group32_bf16_cache")

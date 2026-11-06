@@ -292,9 +292,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GROUP32_WEIGHT_PRESHUFFLE": lambda: (
         os.getenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "1") == "1"
     ),
-    # gfx942 group32 has no MXFP8 MFMA: cache a BF16 dequant of each native
-    # group32 weight once at load (and rebuild after weight sync). Set 0 to
-    # force per-step host dequant (debug / memory).
+    # Temporary. gfx942 group32 has no aiter GEMM: cache a BF16 dequant of each
+    # native group32 weight once at load (and rebuild after weight sync).
+    # Delete the cache once aiter ships that GEMM. Set 0 to force per-step
+    # host dequant (debug / memory).
     "ATOM_GFX942_CACHE_BF16_WEIGHT": lambda: (
         os.getenv("ATOM_GFX942_CACHE_BF16_WEIGHT", "1") != "0"
     ),

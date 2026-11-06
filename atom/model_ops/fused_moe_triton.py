@@ -51,7 +51,10 @@ from atom.utils import envs
 def _gfx942_moe_bn_floor(orig_cfg):
     """Keep decode BN from shrinking to 32 on gfx942 (underfills CUs).
 
-    Temporary ATOM-side floor until aiter owns per-arch tile policy.
+    Temporary ATOM patch. This replaces aiter's global ``get_kernel_config_triton``.
+    Delete it once aiter's per-arch config raises gfx942 ``block_n`` to 64
+    (128 when N is wide and the grid covers the CUs). Measured on MI308
+    decode M=1: the stock loop landed on BN=32.
     """
 
     def _wrapped(m, n, k, routing_data):
@@ -70,8 +73,8 @@ def _gfx942_moe_bn_floor(orig_cfg):
     return _wrapped
 
 
-# Default a16w4/a4w4 configs use `while block_n >= 64 and grid < 256`,
-# which lands on BN=32 for decode M=1. Prefer BN>=64 (128 when N is wide).
+# Temporary: monkeypatch aiter's tile function. Remove with _gfx942_moe_bn_floor
+# once the same floor lives in aiter's per-arch config.
 _moe_a16w4.get_kernel_config_triton = _gfx942_moe_bn_floor(
     _moe_a16w4.get_kernel_config_triton
 )

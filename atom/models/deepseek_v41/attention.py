@@ -386,12 +386,15 @@ class Attention(nn.Module):
                 x_fp8, w, x_scale, w_scale, dtype=output.dtype
             )
         else:
-            # aiter has no 32x32 mxscale BMM on gfx942; one batched local GEMM
-            # covers every LoRA group (no Python per-group launch loop).
+            # Temporary. aiter has no 32x32 mxscale BMM on gfx942, so this rank
+            # runs the local group32 GEMM. Delete _wo_a_group32_batched once
+            # that BMM exists; gfx942 should then take the same
+            # batched_gemm_a8w8_mxscale_bpreshuffle path as gfx950 and gfx1250.
             y = self._wo_a_group32_batched(x_fp8, x_scale, w, w_scale, output.dtype)
         return self.wo_b(y.view(*output.shape[:-2], -1))
 
     def _wo_a_group32_batched(self, x_fp8, x_scale, weight, weight_scale, dtype):
+        """Temporary gfx942 wo_a. Remove once aiter has the 32x32 mxscale BMM."""
         from atom.model_ops.blockscale import (
             _activations_for_ocp_group32,
             _units,

@@ -138,6 +138,8 @@ def _e8m0_codes_to_float(scale: torch.Tensor) -> torch.Tensor:
 def _use_group32_bf16_fallback() -> bool:
     """True on gfx942 only: no CDNA4 MXFP8 MFMA / aiter group32 path.
 
+    Temporary. gfx942 dequants the group32 weight to a resident BF16 copy and
+    calls hipBLAS. Delete this path once aiter ships a gfx942 group32 GEMM.
     gfx1250 keeps aiter's preshuffled group32 GEMM; treating it like gfx942
     would feed a row-major local kernel a shuffled weight.
     """
