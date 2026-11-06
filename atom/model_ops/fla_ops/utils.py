@@ -51,8 +51,9 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         nonlocal cache_entries, cache_size
-        for i, entry in enumerate(cache_entries):
-            last_args, last_kwargs, last_result = entry
+        # Newest first: the calls of a step hit the entry its first call (or the engine's prime) added.
+        for i in range(len(cache_entries) - 1, -1, -1):
+            last_args, last_kwargs, last_result = cache_entries[i]
             if (
                 len(args) == len(last_args)
                 and len(kwargs) == len(last_kwargs)
@@ -61,11 +62,12 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
                     k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items()
                 )
             ):
-                cache_entries = (
-                    cache_entries[:i]
-                    + cache_entries[i + 1 :]
-                    + [(args, kwargs, last_result)]
-                )
+                if i != len(cache_entries) - 1:
+                    cache_entries = (
+                        cache_entries[:i]
+                        + cache_entries[i + 1 :]
+                        + [(args, kwargs, last_result)]
+                    )
                 return last_result
 
         result = fn(*args, **kwargs)

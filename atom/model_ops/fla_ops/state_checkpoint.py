@@ -30,7 +30,7 @@ import triton.language as tl
 
 @triton.jit
 def _copy_checkpoints_kernel(
-    h,  # [1, NT_total, H, K, V] per-chunk states, batch-concatenated
+    h,  # [1, NT_total, H, K, V] per-chunk states, batch-concatenated (a view of [.., V, K] when H_VK)
     ssm_dst,  # [num_slots, H, K, V] the state pool
     x,  # [total_tokens, D] the conv input, batch-concatenated
     conv_dst,  # [num_slots, D, >= STATE_LEN] the conv state pool
@@ -55,6 +55,7 @@ def _copy_checkpoints_kernel(
     V: tl.constexpr,
     STATE_VK: tl.constexpr = False,
     SSM_FROM_H: tl.constexpr = True,
+    H_VK: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
     i_blk = tl.program_id(1)
@@ -73,27 +74,33 @@ def _copy_checkpoints_kernel(
         # the end, and `chunk_offsets[row] + T // CHUNK` is the NEXT
         # sequence's first chunk. The final state exists only in the row's
         # runtime slot, which the chunk kernel just wrote.
+        # idx walks the pool's order; h_idx is the same element in h's order.
         idx = i_blk * BLOCK + tl.arange(0, BLOCK)
         mask = (idx < HKV) & valid
-        dst_idx = idx
-        if STATE_VK:
-            dst_idx = idx // (K * V) * (K * V) + (idx % V) * K + (idx % (K * V)) // V
+        h_idx = idx
+        if STATE_VK != H_VK:
+            INNER: tl.constexpr = K if STATE_VK else V
+            h_idx = (
+                idx // (K * V) * (K * V)
+                + (idx % INNER) * (K * V // INNER)
+                + (idx % (K * V)) // INNER
+            )
         # Both branches cast to the pool's dtype: `h` is bf16 (the chunk
         # kernel allocates it with `k.new_empty`) while the pool is fp32, so
         # the two loads have different types and Triton requires them to
         # agree before the store.
         if tl.load(is_end + i_t) != 0:
             src_slot = tl.load(runtime_slots + i_t).to(tl.int64)
-            sv = tl.load(ssm_dst + src_slot * HKV + dst_idx, mask=mask, other=0.0).to(
+            sv = tl.load(ssm_dst + src_slot * HKV + idx, mask=mask, other=0.0).to(
                 ssm_dst.dtype.element_ty
             )
-            tl.store(ssm_dst + slot * HKV + dst_idx, sv, mask=mask)
+            tl.store(ssm_dst + slot * HKV + idx, sv, mask=mask)
         elif SSM_FROM_H:
             src = tl.load(chunk_offsets + row).to(tl.int64) + off // CHUNK
-            sv = tl.load(h + src * HKV + idx, mask=mask, other=0.0).to(
+            sv = tl.load(h + src * HKV + h_idx, mask=mask, other=0.0).to(
                 ssm_dst.dtype.element_ty
             )
-            tl.store(ssm_dst + slot * HKV + dst_idx, sv, mask=mask)
+            tl.store(ssm_dst + slot * HKV + idx, sv, mask=mask)
         # Otherwise the chunk kernel already stored this interior state, in
         # fp32, straight into `slot` (`chunk_gated_delta_rule`'s
         # `checkpoint_slots`).
@@ -200,5 +207,6 @@ def write_state_checkpoints(
         K=ssm_state.shape[-2],
         V=ssm_state.shape[-1],
         STATE_VK=ssm_state.stride(-2) == 1,
+        H_VK=h.stride(-2) == 1,
         SSM_FROM_H=ssm_from_h,
     )

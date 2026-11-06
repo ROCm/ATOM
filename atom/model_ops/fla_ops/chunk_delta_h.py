@@ -78,7 +78,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
-    if IS_VARLEN and HAS_N:
+    if IS_VARLEN and HAS_N:  # noqa: SIM102 (a constexpr, then a device load)
         # a bucket-shaped grid: programs past the step's sequence count have no work
         if i_n >= tl.load(n_ptr):
             return
@@ -410,6 +410,7 @@ def chunk_gated_delta_rule_fwd_h(
     u: torch.Tensor,
     g: torch.Tensor | None = None,
     gk: torch.Tensor | None = None,
+    decay: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
@@ -427,7 +428,9 @@ def chunk_gated_delta_rule_fwd_h(
     ``checkpoint_slots`` = (state pool, int32 slot per chunk of the batch, -1
     for none): the kernel also stores the fp32 state entering each named chunk
     into that slot of the pool, the exact state for a checkpoint at the chunk's
-    first token (``h`` holds it only rounded to its dtype)."""
+    first token (``h`` holds it only rounded to its dtype).
+    ``decay`` (fp32 [NT, H, 2, 64] from the fused KKT kernel, or None): the gfx1250
+    kernel's per-chunk factors exp(g_last - g_i) and exp(g_last) in place of g."""
     ckpt_pool, ckpt_slot = (
         checkpoint_slots if checkpoint_slots is not None else (None, None)
     )
@@ -461,7 +464,21 @@ def chunk_gated_delta_rule_fwd_h(
             h0_idx, ht_idx, h0_flag = state_slots
     in_place = plan is not None or state_slots is not None
     assert K <= 256, "current kernel does not support head dimension larger than 256."
-    h = k.new_empty(B, NT, H, K, V)
+    gfx1250 = (
+        _use_gfx1250_kernel(k.device.index)
+        and g is not None
+        and gk is None
+        and K == 128
+        and V % 16 == 0
+        and BT == 64
+        and k.dtype == torch.bfloat16
+    )
+    # gfx1250: K-major chunk states, h is [B, NT, H, K, V] with [B, NT, H, V, K] storage.
+    h = (
+        k.new_empty_strided((B, NT, H, K, V), (NT * H * V * K, H * V * K, V * K, 1, K))
+        if gfx1250
+        else k.new_empty(B, NT, H, K, V)
+    )
     if in_place:
         final_state = initial_state if output_final_state else None
     else:
@@ -471,14 +488,7 @@ def chunk_gated_delta_rule_fwd_h(
 
     v_new = torch.empty_like(u) if save_new_value else None
 
-    if (
-        _use_gfx1250_kernel(k.device.index)
-        and gk is None
-        and K == 128
-        and V % 16 == 0
-        and BT == 64
-        and k.dtype == torch.bfloat16
-    ):
+    if gfx1250:
         from .chunk_delta_h_gfx1250 import chunk_h_gfx1250
 
         # chunks of the longest walk; a planned (graph) launch knows only its capacity
@@ -493,6 +503,7 @@ def chunk_gated_delta_rule_fwd_h(
             w,
             u,
             g,
+            decay,
             h,
             v_new,
             initial_state,

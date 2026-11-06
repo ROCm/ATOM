@@ -621,6 +621,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GDN_CHUNK_O_FAST_NORM": lambda: (
         os.getenv("ATOM_GDN_CHUNK_O_FAST_NORM", "0") == "1"
     ),
+    # gfx1250 GDN prefill: the fused KKT kernel also writes the state walk's
+    # per-chunk factors exp(g_last - g_i) and exp(g_last); chunk_h reads them
+    # instead of the gates. Bit-identical outputs. On by default; 0 = chunk_h reads the gates.
+    "ATOM_GDN_CHUNK_H_DECAY": lambda: os.getenv("ATOM_GDN_CHUNK_H_DECAY", "1") == "1",
 
     # Both zeroings above in one Triton launch each (`pool_layout/zero_spans.py`)
     # instead of an `index_fill_` per pool field -- per field AND per layer once
