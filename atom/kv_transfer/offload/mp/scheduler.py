@@ -93,8 +93,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             )
             self._transfer_seen_at: dict[Any, float] = {}
             # Live loads, in dispatch order: the order the worker restores them.
-            self._load_order: dict[Any, int] = {}
-            self._next_load_order = 0
+            self._load_order: dict[Any, None] = {}
             super().__init__(
                 config,
                 chunk_size=int(adapter.lmcache_tokens_per_chunk),
@@ -353,29 +352,22 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             )
 
     def _restart_loads_queued_behind_a_finished_one(self, now: float) -> None:
-        """A native-state worker restores a few loads at a time, in the order
-        it received them, and advances them only between forwards. A burst of
-        loads on a cold server can therefore wait out several slow forwards
-        before its last restore starts, with nothing in flight. A finished load
-        shows that queue moving, so every load dispatched after it starts its
-        bound again. `_active_load_operations` keeps dispatch order, also
-        within one step. A load is restarted only by loads dispatched before
-        it, so one whose completion is lost still stops the engine one bound
+        """A native-state worker restores loads in dispatch order, advancing
+        them only between forwards. When a load finishes, every load dispatched
+        after it starts its bound again (`_active_load_operations` keeps
+        dispatch order, also within one step). Only earlier loads restart a
+        load, so one whose completion is lost still stops the engine one bound
         after the last of those finishes."""
         loads = [operation for _, operation in self._active_load_operations.values()]
         live = set(loads)
-        order = self._load_order
-        finished = [order.pop(op) for op in [op for op in order if op not in live]]
-        for operation in loads:
-            if operation not in order:
-                order[operation] = self._next_load_order
-                self._next_load_order += 1
-        if not finished:
-            return
-        first = min(finished)
-        for operation, position in order.items():
-            if position > first and operation in self._transfer_seen_at:
+        behind_a_finished_one = False
+        for operation in list(self._load_order):
+            if operation not in live:
+                del self._load_order[operation]
+                behind_a_finished_one = True
+            elif behind_a_finished_one and operation in self._transfer_seen_at:
                 self._transfer_seen_at[operation] = now
+        self._load_order.update(dict.fromkeys(loads))
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         output = super().process_completions(output)

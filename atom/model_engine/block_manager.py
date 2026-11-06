@@ -121,6 +121,16 @@ class JointBoundaryDecision:
     skip_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class _ReplayDecision:
+    """Where `_replay_hit` resumes the forward: at `hit`, replaying if
+    `replays`, after loading LMCache KV past the HBM hit if `kv_load`."""
+
+    hit: int
+    replays: bool = False
+    kv_load: bool = False
+
+
 @dataclass
 class AdmissionProbe:
     """One `can_allocate` answer, carried to the `record_allocation` that
@@ -814,19 +824,19 @@ class BlockManager:
         the connector loads the KV past the HBM hit first (`replay_kv_load`).
         Records on `seq` whether the hit it returns replays (`replay_start`).
         """
-        hit, seq.replays_hit, seq.replay_kv_load = self._replay_decision(
+        decision = self._replay_decision(
             seq, compressed_hit, hit, int(seq.offload_joint.kv_prefix_tokens or 0)
         )
-        return hit
+        seq.replays_hit, seq.replay_kv_load = decision.replays, decision.kv_load
+        return decision.hit
 
     def _replay_decision(
         self, seq: Sequence, compressed_hit: int, hit: int, tier_hit: int
-    ) -> tuple[int, bool, bool]:
-        """`_replay_hit` for a tier hit of `tier_hit` tokens, writing nothing:
-        `(hit, replays_hit, replay_kv_load)`."""
+    ) -> _ReplayDecision:
+        """`_replay_hit` for a tier hit of `tier_hit` tokens, writing nothing."""
         hbs = self.hash_block_size
         if not self.state_replay_tokens or not seq.has_per_req_cache:
-            return hit, False, False
+            return _ReplayDecision(hit)
         # The connector skips a load under OFFLOAD_MIN_LOAD_TOKENS, so neither
         # LMCache figure counts unless it clears that above where it starts.
         min_load = envs.OFFLOAD_MIN_LOAD_TOKENS
@@ -839,8 +849,8 @@ class BlockManager:
         if tier_kv - in_hbm >= min_load:
             end = tier_kv
         if end - resume <= self.state_replay_tokens:
-            return hit, False, False
-        return compressed_hit, True, end > in_hbm
+            return _ReplayDecision(hit)
+        return _ReplayDecision(compressed_hit, replays=True, kv_load=end > in_hbm)
 
     def fall_back_to_hbm_replay(self, seq: Sequence) -> None:
         """A replay's KV-only load will not run: replay below the HBM hit.
@@ -989,9 +999,9 @@ class BlockManager:
         walk = (self._memoised_walk if self.walk_memo else self._walk_prefix)(seq)
         compressed = len(walk.hashes)
         gated = self._gated_hit(seq, compressed, walk.hashes)
-        hit, _, _ = self._replay_decision(seq, compressed, gated, kv_prefix_tokens)
+        hit = self._replay_decision(seq, compressed, gated, kv_prefix_tokens).hit
         return self._joint_kv_boundary(
-            seq, hit, walk.hashes, kv_prefix_tokens=kv_prefix_tokens
+            seq, hit, walk.hashes, kv_prefix_tokens
         ).boundary_tokens
 
     def _joint_kv_boundary(
@@ -999,8 +1009,7 @@ class BlockManager:
         seq: Sequence,
         hbm_boundary: int,
         block_hashes: list[int],
-        *,
-        kv_prefix_tokens: int | None = None,
+        kv_prefix_tokens: int,
     ) -> JointBoundaryDecision:
         """The boundary above the HBM hit that BOTH legs can reach, as a value.
 
@@ -1041,8 +1050,6 @@ class BlockManager:
         # `get_kvconnector` returned, and one without `chunk_size` would zero
         # this and disable the feature silently.
         chunk = self._joint_chunk_tokens
-        if kv_prefix_tokens is None:
-            kv_prefix_tokens = seq.offload_joint.kv_prefix_tokens
         lmc_tokens = int(kv_prefix_tokens or 0)
         if chunk <= 0:
             return self._no_joint("no_chunk_size")
@@ -1576,7 +1583,10 @@ class BlockManager:
         """Commit the fit probe before any allocation changes the pool."""
         if self.enable_prefix_caching:
             decision = self._joint_kv_boundary(
-                seq, probe.num_cached_blocks, probe.block_hashes
+                seq,
+                probe.num_cached_blocks,
+                probe.block_hashes,
+                seq.offload_joint.kv_prefix_tokens,
             )
             decision = self._fit_joint(decision, probe)
             self._commit_joint_boundary(seq, decision)
@@ -2513,13 +2523,7 @@ class BlockManager:
         """Put the prompt-end anchor on a multiple of `tokens`, for an offload
         tier that stores checkpoints only on its own grid. A prompt too short
         to reach the grid keeps its hash-block anchor."""
-        tokens = int(tokens)
-        if tokens <= 0 or tokens % self.hash_block_size:
-            raise ValueError(
-                f"checkpoint anchor grid {tokens} is not a positive multiple of "
-                f"the hash block size {self.hash_block_size}"
-            )
-        self.checkpoint_anchor_grid = tokens
+        self.checkpoint_anchor_grid = int(tokens)
 
     def checkpoint_limit(self, seq: Sequence) -> int:
         """Rightmost prompt position any state class may checkpoint at, 0 none.
@@ -2660,7 +2664,7 @@ class BlockManager:
             self.demands_recorded += not seq.checkpoint_demand_counted
             seq.checkpoint_demand_counted = True
 
-    def _record_checkpoint_end(self, seq: Sequence, cached_tokens: int) -> None:
+    def _record_checkpoint_end(self, seq: Sequence, resume_tokens: int) -> None:
         """Reserve this prompt's own end as a resume point.
 
         The ladder guesses where reuse will resume and the demand learns it one
@@ -2679,8 +2683,6 @@ class BlockManager:
         position keepable, and `checkpointers_at` re-checks it against the
         forward that actually lands. Applying it here as well keeps the cut and
         the keep from disagreeing, which is the standing contract between them.
-
-        `cached_tokens` is where this request's prefill resumes.
         """
         seq.checkpoint_end_pos = 0
         if not self.state.enabled:
@@ -2744,9 +2746,9 @@ class BlockManager:
         # one block of reuse — the same trade `room` above already takes.
         end = min(end, (self._n_hash_blocks(seq) - 1) * self.hash_block_size)
         # Floored onto a tier grid after the cap; moving left keeps both tests
-        # above. Not onto or below `cached_tokens`: no forward reaches it there.
+        # above. Not onto or below `resume_tokens`: no forward reaches it there.
         aligned = end - end % self.checkpoint_anchor_grid
-        if aligned > cached_tokens:
+        if aligned > resume_tokens:
             end = aligned
         if end > 0:
             seq.checkpoint_end_pos = end

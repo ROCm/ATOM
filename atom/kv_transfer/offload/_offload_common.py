@@ -82,7 +82,7 @@ def tier_token_ids(seq, end: int) -> list[int]:
     """
     tokens = list(seq.token_ids[:end])
     seed = getattr(seq, "cache_seed", -1)
-    if seed is None or int(seed) == -1:
+    if seed == -1:
         return tokens
     salt = int(seed).to_bytes(16, "little", signed=True)
     for i in range(min(_MEDIA_KEY_TOKENS, len(tokens))):
