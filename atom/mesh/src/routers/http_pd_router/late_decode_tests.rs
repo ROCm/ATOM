@@ -138,4 +138,3 @@ async fn late_decode_cached_prefill_preserves_backend_rank_and_full_context_budg
     wait_load(&d.worker, 0).await;
     assert_eq!(router.late_decode.as_ref().unwrap().outstanding_tokens(), 0);
 }
-

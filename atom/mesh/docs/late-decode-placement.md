@@ -134,4 +134,3 @@ The design takes inspiration from independent P/D routing and Decode workload
 accounting; it does not claim to reproduce DeepInfer or Dynamo's production
 schedulers. Request count is primary, with context as a tie-breaker, rather than
 assuming context length alone predicts Decode compute cost.
-
