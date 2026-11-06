@@ -1385,6 +1385,8 @@ def minimax_m3_sparse_attn_decode_asm(
         quantized_output=quantized_output,
         output_scale=output_scale,
         plan_step_owner=plan_step_owner,
+        # Decode rows attend a full top-k window: keep the PA's split.
+        quantized_direct=False,
     )
 
 
@@ -1404,6 +1406,7 @@ def sparse_pa_per_row(
     output_scale: torch.Tensor | None = None,
     plan_step_owner=None,
     plan_cache_owner=None,
+    quantized_direct: bool = True,
 ) -> None:
     """Run one sparse selection per row, on ASM where it pays and PA decode else.
 
@@ -1470,12 +1473,19 @@ def sparse_pa_per_row(
     num_seqs = T * num_kv_heads
     num_kv_heads_view = 1
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
-    if quantized_output is not None and max_context_partition_num != 8:
+    if (
+        quantized_output is not None
+        and max_context_partition_num != 8
+        and quantized_direct
+    ):
         # The fused epilogue is intentionally implemented only in the traced
-        # cluster8 decode and direct prefill kernels. Once the row count is too
-        # large to need eight splits, one CTA per token still fills the device
-        # and selects `_direct` instead of an unsupported cluster2/4 or
-        # last-arriver merge specialization.
+        # cluster8 decode and direct prefill kernels. Prefill rows (short
+        # causal contexts) take one CTA per token and `_direct` instead of an
+        # unsupported cluster2/4 or last-arriver merge specialization. Decode
+        # rows (``quantized_direct=False``) attend a full top-k window: one CTA
+        # per row there leaves CUs idle (128 rows: 20.1 us direct vs 13.2 us
+        # cluster4 per layer), so they keep the split and the PA quantizes
+        # after its merge.
         max_context_partition_num = 1
     context_partition_size = 256
     # compute_type / scales follow the actual KV-cache dtype (this helper serves

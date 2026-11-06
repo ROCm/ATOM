@@ -285,3 +285,40 @@ def test_padded_prefill_fills_pad_rows_when_the_pa_cannot(monkeypatch):
     )
     assert torch.equal(scale[:_ROWS], torch.full((_ROWS, 1), 0.5))
     assert torch.equal(scale[_ROWS:], torch.ones((_BUCKET - _ROWS, 1)))
+
+
+def test_sparse_decode_keeps_a_non_cluster8_split_for_the_fp8_output(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        base_attention, "run_pa_decode", lambda **kwargs: captured.update(kwargs)
+    )
+    monkeypatch.setattr(base_attention, "_flydsl_output_quant_option", lambda _: True)
+    monkeypatch.setattr(
+        "aiter.ops.triton.gluon.pa_decode_gluon.get_recommended_splits",
+        lambda *_: 4,
+    )
+    rows = 128
+    q = torch.randn(rows, 16, 128, dtype=torch.bfloat16)
+    args = (
+        q,
+        torch.empty((1, 1, 8, 16, 16), dtype=torch.uint8),
+        torch.empty((1, 1, 1, 128, 16), dtype=torch.uint8),
+        torch.zeros((rows, 8), dtype=torch.int32),
+        torch.ones(rows, dtype=torch.int32),
+        1,
+        128**-0.5,
+        torch.empty_like(q),
+        None,
+        None,
+    )
+    quant = {
+        "quantized_output": torch.empty((rows, 16, 128), dtype=torch.uint8),
+        "output_scale": torch.empty((rows, 1), dtype=torch.float32),
+    }
+
+    sparse_attn.sparse_pa_per_row(*args, **quant, quantized_direct=False)
+    assert captured["max_context_partition_num"] == 4
+    assert captured["plan_partition_cap"] == 4
+
+    sparse_attn.sparse_pa_per_row(*args, **quant)
+    assert captured["max_context_partition_num"] == 1
