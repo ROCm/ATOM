@@ -2594,6 +2594,7 @@ class Config:
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
+        self._check_kv_cache_dtype()
         if hasattr(self, "kv_transfer_config") and isinstance(
             self.kv_transfer_config, str
         ):
@@ -2934,6 +2935,18 @@ class Config:
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+    def _check_kv_cache_dtype(self) -> None:
+        """FP4 KV requires the CSA2 cache's model-specific data/scale layout."""
+        if self.kv_cache_dtype != "fp4":
+            return
+        from atom.utils.selector import Family, attn_family
+
+        if attn_family(self.hf_config) is not Family.CSA2:
+            raise ValueError(
+                "--kv_cache_dtype=fp4 is only supported by the DeepSeek-V4.1 "
+                "(CSA2) attention backend; use bf16 or fp8 for this model."
+            )
 
     def _check_pp_support(self) -> None:
         """Refuse what PP does not wire yet: TBO, P/D consumers, and speculation

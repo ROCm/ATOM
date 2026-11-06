@@ -27,6 +27,22 @@ from atom.utils import CpuGpuBuffer
 from tests.attentions.deepseek_v41.helpers import geometry
 
 
+def logical_entry(cache, slot):
+    return torch.cat(cache.state_views(slot))
+
+
+def fill_slot(cache, slot, value):
+    for view in cache.state_views(slot):
+        view.fill_(value)
+
+
+def randomize_slot(cache, slot):
+    for view in cache.state_views(slot):
+        view.copy_(
+            torch.randint(0, 256, view.shape, dtype=torch.uint8, device=view.device)
+        )
+
+
 def carried(geo, entry):
     """The bytes of a STATE entry a checkpoint image holds, in image order."""
     return torch.cat([entry[at : at + n] for at, n in geo.checkpoint_image_ranges])
@@ -104,44 +120,50 @@ def test_checkpoint_fork_rollback_relocation_and_slot_reuse(
     # rows of a CUDAGraph-sized compression plan are skipped rather than
     # landed somewhere, so the pool buys nothing for them.
     assert cache.num_pages == pages
-    assert cache.backing.numel() == geo.paged_extents(pages)[1] + 4 * geo.state_bytes
+    assert (
+        sum(buf.numel() for buf in cache.allocations)
+        == geo.paged_extents(pages)[1] + 4 * geo.state_bytes
+    )
     copies = StateCopies(cache, spec, 4)
     copies.warmup()
     # Fill ALL bytes, including padding and FP32 compressor tails. The cursor
     # remains interpretable while the rest proves byte-exact recovery.
-    cache.state_bytes[2].copy_(
-        torch.randint(
-            0, 256, cache.state_bytes[2].shape, dtype=torch.uint8, device=device
-        )
-    )
+    randomize_slot(cache, 2)
     cache.cursor[2] = torch.tensor([3, 19, -1, 27], device=device)
-    original = carried(geo, copies.entry(2))
+    original = carried(geo, logical_entry(cache, 2))
     units = tuple(range(1, 2 * spec.units_per_checkpoint, 2))
     store = CheckpointStoreOp(2, units, spec.image_bytes, spec.layout_id)
     restore = CheckpointRestoreOp(1, units, spec.image_bytes, spec.layout_id)
     copies.execute([store], [restore])
-    torch.testing.assert_close(carried(geo, copies.entry(1)), original, rtol=0, atol=0)
-    cache.state_bytes[1].fill_(93)  # rejected / cancelled tentative suffix
+    torch.testing.assert_close(
+        carried(geo, logical_entry(cache, 1)), original, rtol=0, atol=0
+    )
+    fill_slot(cache, 1, 93)  # rejected / cancelled tentative suffix
     copies.execute([], [restore])
-    torch.testing.assert_close(carried(geo, copies.entry(1)), original, rtol=0, atol=0)
+    torch.testing.assert_close(
+        carried(geo, logical_entry(cache, 1)), original, rtol=0, atol=0
+    )
     # The compressor tails are not in the image: a restore leaves the slot's own.
     image_bytes = torch.zeros(geo.state_bytes, dtype=torch.bool, device=device)
     for at, n in geo.checkpoint_image_ranges:
         image_bytes[at : at + n] = True
-    assert (copies.entry(1)[~image_bytes] == 93).all()
-    restored = copies.entry(1).clone()
-    cache.state_bytes[0].fill_(71)
-    old_zero = copies.entry(0).clone()
+    assert (logical_entry(cache, 1)[~image_bytes] == 93).all()
+    restored = logical_entry(cache, 1).clone()
+    fill_slot(cache, 0, 71)
+    old_zero = logical_entry(cache, 0).clone()
     copies.relocate([(1, 0), (0, 1)])
-    torch.testing.assert_close(copies.entry(0), restored, rtol=0, atol=0)
-    torch.testing.assert_close(copies.entry(1), old_zero, rtol=0, atol=0)
+    torch.testing.assert_close(logical_entry(cache, 0), restored, rtol=0, atol=0)
+    torch.testing.assert_close(logical_entry(cache, 1), old_zero, rtol=0, atol=0)
     span = PagedRequest(27, 3, 0, 1, 0, (32, 33))
     step = begin_step(cache, [span])
     np.testing.assert_array_equal(cache.prepare_state(step), [[19, -1, 27]])
     # Recycled slot begins at zero and drops every old state field.
     fresh = begin_step(cache, [replace(span, request_id=28, position=0)])
     np.testing.assert_array_equal(cache.prepare_state(fresh), [[-1, -1, -1]])
-    assert cache.state.view("window")[:, 0].count_nonzero() == 0
+    assert (
+        sum(cache.window_view(layer)[0].count_nonzero() for layer in range(geo.layers))
+        == 0
+    )
     assert cache.state.view("compress_kv")[:, 0].count_nonzero() == 0
     assert cache.cursor[0, 0] == 0
     with pytest.raises(ValueError, match="recoverable boundary"):
@@ -154,7 +176,7 @@ def test_checkpoint_fork_rollback_relocation_and_slot_reuse(
         with pytest.raises(ValueError):
             copies.execute([], [bad])
     with pytest.raises(IndexError):
-        copies.entry(-1)
+        cache.state_views(-1)
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -206,9 +228,7 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
         transfer, block_size=geo.block_size, chunk_size=geo.block_size
     )
 
-    cache.state_bytes[2].copy_(
-        torch.randint(0, 256, cache.state_bytes[2].shape, dtype=torch.uint8)
-    )
+    randomize_slot(cache, 2)
     units = tuple(range(1, 2 * spec.units_per_checkpoint, 2))
     transfer.execute_paged_state_copies(
         [CheckpointStoreOp(2, units, spec.image_bytes, spec.layout_id)], []
@@ -226,7 +246,7 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
     )
     torch.testing.assert_close(
         image,
-        carried(geo, cache.state_bytes[2]),
+        carried(geo, logical_entry(cache, 2)),
         rtol=0,
         atol=0,
     )
@@ -235,7 +255,8 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
     assert builder.get_kv_transfer_tensors() is None
 
 
-def test_pd_transfer_publishes_the_state_slot(small_config):
+@pytest.mark.parametrize("dtype", ["bf16", "fp4", "fp8"])
+def test_pd_transfer_publishes_the_state_slot(small_config, dtype):
     """Mooncake P/D: PAGE units plus the whole STATE slot, slot-indexed.
 
     The connector writes `src_slot * unit` to `dst_slot * unit`, and sends the
@@ -247,7 +268,7 @@ def test_pd_transfer_publishes_the_state_slot(small_config):
         DeepseekV41MetadataBuilder,
     )
 
-    geo = replace(geometry(small_config), window_size=32)
+    geo = replace(geometry(small_config), window_size=32, kv_dtype=dtype)
     cache = PagedAttentionCache(geo, 8, 4, "cpu")
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.model_runner = SimpleNamespace(
@@ -260,11 +281,12 @@ def test_pd_transfer_publishes_the_state_slot(small_config):
     builder.cache = cache
     transfer = builder.get_kv_transfer_tensors()
     assert not transfer.swa_block_regions and transfer.staging_region is None
-    (region,) = transfer.slot_regions
     assert transfer.num_slots == 4
-    assert region.unit_bytes == geo.state_bytes and not region.reverse_indexed
-    for slot in range(4):
-        assert region.unit_addr(slot) == cache.state_bytes[slot].data_ptr()
+    assert sum(region.unit_bytes for region in transfer.slot_regions) == geo.state_bytes
+    for region, (_, view) in zip(transfer.slot_regions, cache.state_regions):
+        assert not region.reverse_indexed
+        for slot in range(4):
+            assert region.unit_addr(slot) == view[slot].data_ptr()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -394,8 +416,9 @@ def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
         return rows
 
     alone, grouped = built(1), built(layers)
-    # Two layers' rings must differ, or every stride passes.
-    assert not torch.equal(alone[0], alone[1])
+    # Layer-local planes share row coordinates but have distinct storage.
+    assert torch.equal(alone[0], alone[1])
+    assert cache.ring_view(0)[0].data_ptr() != cache.ring_view(1)[0].data_ptr()
     assert all(torch.equal(a, b) for a, b in zip(alone, grouped, strict=True))
 
 
@@ -654,7 +677,7 @@ def test_a_forward_recomputing_below_its_state_keeps_it(
         pytest.skip("ROCm GPU required")
     geo = replace(geometry(small_config), window_size=32)
     cache = PagedAttentionCache(geo, 8, 4, device)
-    cache.state_bytes[0].fill_(5)
+    fill_slot(cache, 0, 5)
     cache.cursor[0] = torch.tensor([48, 19, -1, 27], device=device)
     kept = [cache.state.view(name)[:, 0].clone() for name in ("window", "compress_kv")]
     request = PagedRequest(41, 32, 0, 20, 0, (0, 1))

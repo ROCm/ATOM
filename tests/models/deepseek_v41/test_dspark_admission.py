@@ -40,16 +40,17 @@ def test_static_and_explicitly_calibrated_native_dspark(tp_size):
     validate_speculative_config(value)
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("kv_cache_dtype", "fp4"),
-    ],
-)
-def test_unvalidated_runtime_combinations_are_rejected(field, value):
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8", "fp4"])
+def test_dspark_accepts_supported_target_kv_cache_dtypes(kv_dtype):
     cfg = config()
-    setattr(cfg, field, value)
-    with pytest.raises(ValueError):
+    cfg.kv_cache_dtype = kv_dtype
+    validate_speculative_config(cfg)
+
+
+def test_dspark_rejects_unsupported_kv_cache_dtype():
+    cfg = config()
+    cfg.kv_cache_dtype = "fp16"
+    with pytest.raises(ValueError, match="KV cache"):
         validate_speculative_config(cfg)
 
 

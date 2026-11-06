@@ -31,7 +31,9 @@ def packed_prefill(
     out=None,
     query_tile=32,
 ):
-    if pool.dtype != torch.uint8 or indices.dtype != torch.int64:
+    if (
+        not isinstance(pool, tuple) and pool.dtype != torch.uint8
+    ) or indices.dtype != torch.int64:
         raise ValueError(
             "Packed prefill requires byte storage and tagged int64 addresses"
         )
@@ -68,7 +70,9 @@ def packed_prefill(
 
 
 def packed_decode(q, pool, indices, indptr, sink, scale):
-    if pool.dtype != torch.uint8 or indices.dtype != torch.int64:
+    if (
+        not isinstance(pool, tuple) and pool.dtype != torch.uint8
+    ) or indices.dtype != torch.int64:
         raise ValueError(
             "Packed decode requires byte storage and tagged int64 addresses"
         )
