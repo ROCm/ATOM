@@ -13,7 +13,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    sync::{Arc, LazyLock, Weak},
+    sync::{Arc, LazyLock, OnceLock, Weak},
 };
 
 use parking_lot::Mutex;
@@ -28,9 +28,22 @@ use crate::{
 
 const WORKERS_PER_COPY: usize = 4;
 
-/// A group's copy as `GROUP_COPIES` holds it: the only strong reference to the
-/// loaded copy outside in-flight requests, so dropping it releases the copy.
-#[derive(Clone)]
+/// A group's copy of one registered instance. The first worker to need it
+/// loads it while the others in the group wait, so a group loads one copy.
+/// `GROUP_COPIES` holds the only long-lived strong reference to the copy, so
+/// removing the slot releases it once in-flight requests finish.
+struct GroupSlot {
+    shared: Weak<dyn Tokenizer>,
+    local: OnceLock<Option<Arc<dyn Tokenizer>>>,
+}
+
+impl GroupSlot {
+    fn made_for(&self, entry: &TokenizerEntry) -> bool {
+        std::ptr::addr_eq(self.shared.as_ptr(), Arc::as_ptr(&entry.tokenizer))
+    }
+}
+
+/// A group's loaded copy, as handed to a worker.
 struct Copy {
     /// The registered instance this copy was made for; a re-registration under
     /// the same id replaces it, and a removal drops it.
@@ -41,10 +54,6 @@ struct Copy {
 }
 
 impl Copy {
-    fn made_for(&self, entry: &TokenizerEntry) -> bool {
-        std::ptr::addr_eq(self.shared.as_ptr(), Arc::as_ptr(&entry.tokenizer))
-    }
-
     fn encoder(&self, entry: &TokenizerEntry) -> Arc<dyn Tokenizer> {
         self.local
             .clone()
@@ -88,9 +97,10 @@ impl ThreadCopy {
     }
 }
 
-/// Copies keyed by (tokenizer id, worker group).
-static GROUP_COPIES: LazyLock<Mutex<HashMap<(String, usize), Copy>>> =
-    LazyLock::new(Default::default);
+/// Group slots keyed by (tokenizer id, worker group).
+type GroupSlots = HashMap<(String, usize), Arc<GroupSlot>>;
+
+static GROUP_COPIES: LazyLock<Mutex<GroupSlots>> = LazyLock::new(Default::default);
 
 thread_local! {
     /// This thread's view of its group's copies, so encoding takes no lock.
@@ -113,7 +123,7 @@ pub(crate) fn encoder(entry: &TokenizerEntry) -> Arc<dyn Tokenizer> {
 pub(crate) fn release_copies(tokenizer_id: &str) {
     GROUP_COPIES
         .lock()
-        .retain(|(id, _), copy| id != tokenizer_id && copy.shared.strong_count() > 0);
+        .retain(|(id, _), slot| id != tokenizer_id && slot.shared.strong_count() > 0);
 }
 
 fn group_encoder(entry: &TokenizerEntry, group: usize) -> Arc<dyn Tokenizer> {
@@ -126,25 +136,36 @@ fn group_encoder(entry: &TokenizerEntry, group: usize) -> Arc<dyn Tokenizer> {
             return encoder;
         }
         copies.retain(|_, copy| copy.is_live());
-        let copy = group_copy(entry, group);
+        let copy = group_copy(entry, group, || factory::create_tokenizer(&entry.source));
         copies.insert(entry.id.clone(), ThreadCopy::of(&copy));
         copy.encoder(entry)
     })
 }
 
-fn group_copy(entry: &TokenizerEntry, group: usize) -> Copy {
+fn group_copy<E: std::fmt::Display>(
+    entry: &TokenizerEntry,
+    group: usize,
+    load: impl FnOnce() -> Result<Arc<dyn Tokenizer>, E>,
+) -> Copy {
     let key = (entry.id.clone(), group);
-    if let Some(copy) = GROUP_COPIES
-        .lock()
-        .get(&key)
-        .filter(|copy| copy.made_for(entry))
-    {
-        return copy.clone();
-    }
-    // Load outside the lock; if another worker of the group raced us, keep its copy.
-    let loaded = Copy {
-        shared: Arc::downgrade(&entry.tokenizer),
-        local: factory::create_tokenizer(&entry.source)
+    let slot = {
+        let mut slots = GROUP_COPIES.lock();
+        match slots.get(&key).filter(|slot| slot.made_for(entry)) {
+            Some(slot) => slot.clone(),
+            None => {
+                slots.retain(|_, slot| slot.shared.strong_count() > 0);
+                let slot = Arc::new(GroupSlot {
+                    shared: Arc::downgrade(&entry.tokenizer),
+                    local: OnceLock::new(),
+                });
+                slots.insert(key, slot.clone());
+                slot
+            }
+        }
+    };
+    // Load outside the map lock; only this group's other workers wait on it.
+    let local = slot.local.get_or_init(|| {
+        load()
             .inspect_err(|error| {
                 warn!(
                     tokenizer = %entry.name,
@@ -152,16 +173,11 @@ fn group_copy(entry: &TokenizerEntry, group: usize) -> Copy {
                     "Failed to load a tokenizer copy for preparation workers; encoding with the shared instance"
                 );
             })
-            .ok(),
-    };
-    let mut copies = GROUP_COPIES.lock();
-    copies.retain(|_, copy| copy.shared.strong_count() > 0);
-    match copies.get(&key).filter(|copy| copy.made_for(entry)) {
-        Some(existing) => existing.clone(),
-        None => {
-            copies.insert(key, loaded.clone());
-            loaded
-        }
+            .ok()
+    });
+    Copy {
+        shared: slot.shared.clone(),
+        local: local.clone(),
     }
 }
 
@@ -238,5 +254,38 @@ mod tests {
         let reloaded = group_encoder(&entry, 0);
         assert!(!Arc::ptr_eq(&reloaded, &entry.tokenizer));
         assert!(GROUP_COPIES.lock().contains_key(&(entry.id.clone(), 0)));
+    }
+
+    #[test]
+    fn concurrent_misses_in_a_group_load_one_copy() {
+        let entry = TokenizerEntry {
+            id: "single-flight".into(),
+            name: "single-flight".into(),
+            source: hf_tokenizer_path().into(),
+            tokenizer: hf_tokenizer(),
+        };
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let start = Arc::new(std::sync::Barrier::new(WORKERS_PER_COPY));
+        let copies: Vec<_> = (0..WORKERS_PER_COPY)
+            .map(|_| {
+                let (entry, loads, start) = (entry.clone(), loads.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    let copy = group_copy(&entry, 0, || {
+                        loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Keep the load slow enough for every worker to miss.
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        factory::create_tokenizer(&entry.source)
+                    });
+                    copy.encoder(&entry)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(!Arc::ptr_eq(&copies[0], &entry.tokenizer));
+        assert!(copies.iter().all(|copy| Arc::ptr_eq(copy, &copies[0])));
     }
 }
