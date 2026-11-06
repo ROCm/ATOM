@@ -1057,8 +1057,13 @@ fn untyped_item_references_are_accepted_as_state_references() {
         let parsed = ParsedInference::parse("/v1/responses", &body).unwrap();
         assert_eq!(parsed.requires_state_domain(), state, "{input}");
     }
-    // An untyped item with neither an id nor a message shape is still invalid.
+    // Item shapes are the backend's to validate, but an item must be an object
+    // for the reference check to read it.
     let body = serde_json::to_vec(&json!({"model": "m", "input": [{"content": "hi"}]})).unwrap();
+    assert!(!ParsedInference::parse("/v1/responses", &body)
+        .unwrap()
+        .requires_state_domain());
+    let body = serde_json::to_vec(&json!({"model": "m", "input": ["hi"]})).unwrap();
     assert!(ParsedInference::parse("/v1/responses", &body).is_err());
 }
 

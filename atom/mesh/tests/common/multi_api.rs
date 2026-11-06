@@ -64,57 +64,23 @@ pub fn request(path: &str, stream: bool) -> Value {
 }
 pub fn invalid_requests(path: &str) -> Vec<Value> {
     let mut cases = Vec::new();
-    let common = [
-        ("model", json!(" ")),
-        ("stream", json!(42)),
-        ("tools", json!({})),
-    ];
+    let common = [("model", json!(" ")), ("stream", json!(42))];
     for (key, value) in common {
         let mut body = request(path, false);
         body[key] = value;
         cases.push(body);
     }
+    // Messages and Responses bodies are otherwise the backend's to validate;
+    // only Responses state keys steer routing.
     let invalid = match path {
-        "/v1/messages" => vec![
-            (
-                "messages",
-                json!([{"role":"system","content":"wrong role"}]),
-            ),
-            ("messages", json!([{"role":"user","content":42}])),
-            (
-                "messages",
-                json!([{"role":"user","content":[{"type":"text","text":42}]}]),
-            ),
-            (
-                "messages",
-                json!([{"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"lookup","input":"bad"}]}]),
-            ),
-            ("max_tokens", json!(0)),
-            ("max_tokens", json!(1.5)),
-            ("system", json!({"text":"bad shape"})),
-            ("temperature", json!(1.1)),
-            ("top_p", json!(-0.1)),
-            ("stop_sequences", json!([42])),
-        ],
         "/v1/responses" => vec![
+            ("input", json!(42)),
             ("input", json!([42])),
-            (
-                "input",
-                json!([{"type":"message","role":"bad","content":"text"}]),
-            ),
-            (
-                "input",
-                json!([{"role":"user","content":[{"type":"input_text","text":42}]}]),
-            ),
-            ("input", json!([{}])),
             ("previous_response_id", json!(42)),
             ("conversation", json!({})),
-            ("instructions", json!(42)),
-            ("max_output_tokens", json!(0)),
-            ("background", json!("true")),
-            ("temperature", json!(2.1)),
         ],
-        _ => Vec::new(),
+        "/v1/messages" => Vec::new(),
+        _ => vec![("tools", json!({}))],
     };
     for (key, value) in invalid {
         let mut body = request(path, false);

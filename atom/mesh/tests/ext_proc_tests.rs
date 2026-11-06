@@ -2273,7 +2273,7 @@ async fn messages_and_responses_preserve_raw_input_and_use_api_errors() {
     stream.request_headers("/v1/messages").await;
     stream
         .body(
-            br#"{"model":"test-model","messages":[],"max_tokens":3}"#,
+            br#"{"model":"test-model","messages":[],"stream":"yes"}"#,
             true,
         )
         .await;

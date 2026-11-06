@@ -184,6 +184,10 @@ impl ParsedInference {
         }
     }
 
+    /// Validate only what routing reads: the body shape, `model`, `stream` and
+    /// the Responses state keys. Everything else is the backend's to accept or
+    /// reject, since backends extend these APIs (optional `max_tokens`,
+    /// `top_k: -1`, other roles and sampling ranges).
     fn validate_api_body(body: &serde_json::Value, messages: bool) -> Result<(), String> {
         use serde_json::Value;
         if !body.is_object() {
@@ -193,98 +197,16 @@ impl ParsedInference {
             return Err("model must be a nonempty string".into());
         }
         Self::validate_optional_field(body, "stream", Value::is_boolean, "a boolean")?;
-        Self::validate_optional_field(body, "metadata", Value::is_object, "an object")?;
-        Self::validate_optional_field(
-            body,
-            "tools",
-            |v| v.as_array().is_some_and(|a| a.iter().all(Value::is_object)),
-            "an array of objects",
-        )?;
-        Self::validate_optional_field(
-            body,
-            "temperature",
-            |v| {
-                v.as_f64()
-                    .is_some_and(|n| (0.0..=if messages { 1.0 } else { 2.0 }).contains(&n))
-            },
-            "within the API temperature range",
-        )?;
-        Self::validate_optional_field(
-            body,
-            "top_p",
-            |v| v.as_f64().is_some_and(|n| (0.0..=1.0).contains(&n)),
-            "between 0 and 1",
-        )?;
         if messages {
-            Self::validate_messages(body)
+            Ok(())
         } else {
-            Self::validate_responses(body)
+            Self::validate_state_keys(body)
         }
     }
 
-    fn validate_messages(body: &serde_json::Value) -> Result<(), String> {
-        use serde_json::Value;
-        if body
-            .get("max_tokens")
-            .and_then(Value::as_u64)
-            .is_none_or(|n| n == 0)
-        {
-            return Err("max_tokens must be a positive integer".into());
-        }
-        let items = body
-            .get("messages")
-            .and_then(Value::as_array)
-            .filter(|a| !a.is_empty())
-            .ok_or("messages must be a nonempty array")?;
-        for item in items {
-            if !matches!(
-                item.get("role").and_then(Value::as_str),
-                Some("user" | "assistant")
-            ) {
-                return Err("messages[].role must be user or assistant".into());
-            }
-            if !item.get("content").is_some_and(|v| {
-                v.is_string()
-                    || v.as_array()
-                        .is_some_and(|a| !a.is_empty() && a.iter().all(Self::is_message_block))
-            }) {
-                return Err("messages[].content must be text or an array of content blocks".into());
-            }
-        }
-        Self::validate_optional_field(
-            body,
-            "system",
-            |v| {
-                v.is_string()
-                    || v.as_array().is_some_and(|a| {
-                        a.iter().all(|b| {
-                            b.get("type").and_then(Value::as_str) == Some("text")
-                                && b.get("text").is_some_and(Value::is_string)
-                        })
-                    })
-            },
-            "text or an array of text blocks",
-        )?;
-        Self::validate_optional_field(
-            body,
-            "top_k",
-            |v| v.as_u64().is_some(),
-            "a nonnegative integer",
-        )?;
-        Self::validate_optional_field(
-            body,
-            "stop_sequences",
-            |v| {
-                v.as_array()
-                    .is_some_and(|a| a.iter().all(Self::is_nonempty_string))
-            },
-            "an array of nonempty strings",
-        )?;
-        Self::validate_optional_field(body, "tool_choice", Value::is_object, "an object")?;
-        Ok(())
-    }
-
-    fn validate_responses(body: &serde_json::Value) -> Result<(), String> {
+    /// The keys `requires_state_domain` reads to keep stateful requests on
+    /// their owner.
+    fn validate_state_keys(body: &serde_json::Value) -> Result<(), String> {
         use serde_json::Value;
         Self::validate_optional_field(
             body,
@@ -292,11 +214,10 @@ impl ParsedInference {
             |v| {
                 v.is_string()
                     || v.as_array()
-                        .is_some_and(|items| items.iter().all(Self::is_response_item))
+                        .is_some_and(|items| items.iter().all(Value::is_object))
             },
             "text or an array of input items",
         )?;
-        Self::validate_optional_field(body, "instructions", Value::is_string, "a string")?;
         Self::validate_optional_field(
             body,
             "previous_response_id",
@@ -315,23 +236,6 @@ impl ParsedInference {
         {
             return Err("conversation and previous_response_id are mutually exclusive".into());
         }
-        for key in ["background", "store", "parallel_tool_calls"] {
-            Self::validate_optional_field(body, key, Value::is_boolean, "a boolean")?;
-        }
-        for key in ["max_output_tokens", "max_tool_calls"] {
-            Self::validate_optional_field(
-                body,
-                key,
-                |v| v.as_u64().is_some_and(|n| n > 0),
-                "a positive integer",
-            )?;
-        }
-        Self::validate_optional_field(
-            body,
-            "tool_choice",
-            |v| v.is_string() || v.is_object(),
-            "a string or object",
-        )?;
         Ok(())
     }
 
@@ -351,61 +255,6 @@ impl ParsedInference {
 
     fn is_nonempty_string(value: &serde_json::Value) -> bool {
         value.as_str().is_some_and(|s| !s.trim().is_empty())
-    }
-
-    fn is_response_item(value: &serde_json::Value) -> bool {
-        use serde_json::Value;
-        if Self::is_item_reference(value) {
-            return true;
-        }
-        match value.get("type").and_then(Value::as_str) {
-            None | Some("message") => {
-                matches!(
-                    value.get("role").and_then(Value::as_str),
-                    Some("user" | "assistant" | "system" | "developer")
-                ) && value.get("content").is_some_and(|v| {
-                    v.is_string()
-                        || v.as_array().is_some_and(|blocks| {
-                            blocks.iter().all(|block| {
-                                match block.get("type").and_then(Value::as_str) {
-                                    Some("input_text" | "output_text") => {
-                                        block.get("text").is_some_and(Value::is_string)
-                                    }
-                                    Some(kind) => !kind.trim().is_empty(),
-                                    None => false,
-                                }
-                            })
-                        })
-                })
-            }
-            Some(kind) => !kind.trim().is_empty(),
-        }
-    }
-
-    fn is_message_block(value: &serde_json::Value) -> bool {
-        use serde_json::Value;
-        match value.get("type").and_then(Value::as_str) {
-            Some("text") => value.get("text").is_some_and(Value::is_string),
-            Some("tool_use") => {
-                ["id", "name"]
-                    .iter()
-                    .all(|k| value.get(*k).is_some_and(Self::is_nonempty_string))
-                    && value.get("input").is_some_and(Value::is_object)
-            }
-            Some("tool_result") => {
-                value
-                    .get("tool_use_id")
-                    .is_some_and(Self::is_nonempty_string)
-                    && value.get("content").is_none_or(|v| {
-                        v.is_string()
-                            || v.as_array()
-                                .is_some_and(|blocks| blocks.iter().all(Self::is_message_block))
-                    })
-            }
-            // New block types and their extensions remain backend-defined.
-            Some(kind) => !kind.trim().is_empty(),
-            None => false,
-        }
     }
 
     pub fn input_tokens(&self) -> Result<Option<Vec<u32>>, &'static str> {
@@ -553,6 +402,43 @@ mod tests {
                     execution.return_logprob
                 ),
                 (route, batch, stream, logprobs)
+            );
+        }
+    }
+
+    #[test]
+    fn messages_and_responses_leave_backend_fields_to_the_backend() {
+        for (route, body) in [
+            // No max_tokens, a system role, top_k -1 and backend sampling ranges.
+            (
+                "/v1/messages",
+                r#"{"model":"m","messages":[{"role":"system","content":"s"},{"role":"tool","content":42}],"temperature":1.5,"top_k":-1,"top_p":2}"#,
+            ),
+            ("/v1/messages", r#"{"model":"m"}"#),
+            (
+                "/v1/responses",
+                r#"{"model":"m","input":[{"role":"bad","content":42}],"temperature":3,"max_output_tokens":0,"background":"yes"}"#,
+            ),
+        ] {
+            assert!(
+                ParsedInference::parse(route, body.as_bytes()).is_ok(),
+                "{body}"
+            );
+        }
+        for (route, body) in [
+            ("/v1/messages", r#"[]"#),
+            ("/v1/messages", r#"{"model":" "}"#),
+            ("/v1/messages", r#"{"model":"m","stream":"yes"}"#),
+            ("/v1/responses", r#"{"model":"m","input":[42]}"#),
+            ("/v1/responses", r#"{"model":"m","previous_response_id":7}"#),
+            (
+                "/v1/responses",
+                r#"{"model":"m","previous_response_id":"r","conversation":"c"}"#,
+            ),
+        ] {
+            assert!(
+                ParsedInference::parse(route, body.as_bytes()).is_err(),
+                "{body}"
             );
         }
     }
