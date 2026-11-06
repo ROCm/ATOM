@@ -40,8 +40,9 @@ import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import Tensor
 
-from atom.model_ops.mxfp8_act_quant import GROUP as _MX_GROUP
-from atom.model_ops.mxfp8_act_quant import e8m0_quant_group, scale_view
+from atom.model_ops.mxfp8_1x32 import alloc as mx32_alloc
+from atom.model_ops.mxfp8_1x32 import mx32_quant_groups, mx32_scale_offset
+from atom.model_ops.mxfp8_1x32 import note as mx32_note
 
 
 class MoEGatedSum(NamedTuple):
@@ -58,8 +59,7 @@ class MoEGatedSum(NamedTuple):
 
 
 @triton.jit
-def _moe_tail_row(
-    row,
+def _moe_tail_rmsnorm_kernel(
     shared_ptr,
     gate_ptr,
     routed_ptr,
@@ -80,10 +80,8 @@ def _moe_tail_row(
     HAS_GATE: tl.constexpr,
     GATHER: tl.constexpr,
     WRITE_RESIDUAL: tl.constexpr,
-    WRITE_OUT: tl.constexpr,
 ):
-    """One output row: stores the new residual / bf16 normed row as asked and
-    returns the normed row (activation dtype)."""
+    row = tl.program_id(0).to(tl.int64)
     if GATHER:
         src = tl.load(rows_ptr + row).to(tl.int64)
     else:
@@ -115,82 +113,11 @@ def _moe_tail_row(
         )
     rstd = tl.rsqrt(tl.sum(x * x, axis=0) / N + eps)
     weight = tl.load(weight_ptr + cols, mask, other=0.0).to(tl.float32) + 1.0
-    normed = ((x * rstd) * weight).to(out_ptr.dtype.element_ty)
-    if WRITE_OUT:
-        tl.store(out_ptr + row * stride_out + cols, normed, mask)
-    return normed
-
-
-@triton.jit
-def _moe_tail_rmsnorm_kernel(
-    shared_ptr,
-    gate_ptr,
-    routed_ptr,
-    residual_ptr,
-    weight_ptr,
-    rows_ptr,
-    out_ptr,
-    res_out_ptr,
-    stride_shared,
-    stride_gate,
-    stride_routed,
-    stride_residual,
-    stride_out,
-    stride_res_out,
-    eps,
-    q_ptr,
-    s_ptr,
-    M,
-    N: tl.constexpr,
-    BLOCK: tl.constexpr,
-    HAS_GATE: tl.constexpr,
-    GATHER: tl.constexpr,
-    WRITE_RESIDUAL: tl.constexpr,
-    WRITE_OUT: tl.constexpr = True,
-    QUANT_OUT: tl.constexpr = False,
-    QUANT_ROWS: tl.constexpr = 1,
-):
-    """Default: one program per output row. QUANT_OUT: also the normed rows as
-    MXFP8 (mxfp8_act_quant) for the next per_1x128 e8m0 projection -- fp8
-    [M, N] dense, e8m0 byte of (row m, group g) at g * M + m; QUANT_ROWS rows a
-    program, so each group's scales go out as QUANT_ROWS contiguous bytes
-    instead of one byte M apart (a single-byte transposed store per row cost
-    more than the rest of the quant). Every row is still the default kernel's
-    1-D row computation, so the normed values (and with them the quant) are
-    bitwise the default kernel's."""
-    if not QUANT_OUT:
-        row = tl.program_id(0).to(tl.int64)
-        _moe_tail_row(
-            row, shared_ptr, gate_ptr, routed_ptr, residual_ptr, weight_ptr, rows_ptr,
-            out_ptr, res_out_ptr, stride_shared, stride_gate, stride_routed,
-            stride_residual, stride_out, stride_res_out, eps,
-            N, BLOCK, HAS_GATE, GATHER, WRITE_RESIDUAL, WRITE_OUT,
-        )
-    else:
-        NG: tl.constexpr = N // 128
-        cols = tl.arange(0, BLOCK)
-        # Offsets provably contiguous only in runs of 8: a 16-wide fp8 store
-        # would pull the row into a 16-per-thread layout and change the order
-        # of the sum of squares (the default kernel reduces 8 per thread).
-        qcols = (cols // 8) * 8 + cols % 8
-        rid = tl.arange(0, QUANT_ROWS)
-        row0 = tl.program_id(0).to(tl.int64) * QUANT_ROWS
-        scales = tl.zeros((NG, QUANT_ROWS), dtype=tl.uint8)
-        for r in tl.static_range(QUANT_ROWS):
-            row = row0 + r
-            if row < M:
-                normed = _moe_tail_row(
-                    row, shared_ptr, gate_ptr, routed_ptr, residual_ptr, weight_ptr,
-                    rows_ptr, out_ptr, res_out_ptr, stride_shared, stride_gate,
-                    stride_routed, stride_residual, stride_out, stride_res_out, eps,
-                    N, BLOCK, HAS_GATE, GATHER, WRITE_RESIDUAL, WRITE_OUT,
-                )
-                q, e = e8m0_quant_group(tl.reshape(normed.to(tl.float32), (NG, 128)))
-                tl.store(q_ptr + row * N + qcols, tl.reshape(q, (BLOCK,)))
-                scales = tl.where(rid[None, :] == r, e[:, None], scales)
-        g = tl.arange(0, NG)
-        rows_v = row0 + rid
-        tl.store(s_ptr + g[:, None] * M + rows_v[None, :], scales, rows_v[None, :] < M)
+    tl.store(
+        out_ptr + row * stride_out + cols,
+        ((x * rstd) * weight).to(out_ptr.dtype.element_ty),
+        mask,
+    )
 
 
 def can_fuse_moe_tail(
@@ -232,25 +159,13 @@ def _launch(
     weight: Tensor,
     eps: float,
     rows: Tensor | None,
-    out: Tensor | None,
+    out: Tensor,
     res_out: Tensor | None,
-    q_out: Tensor | None = None,
-    s_out: Tensor | None = None,
 ) -> None:
-    """`out` None: no bf16 normed store (then `q_out` / `s_out` must be given).
-    `q_out` [n_out, hidden] fp8 e4m3 and `s_out` (n_out * hidden / 128 bytes):
-    also write the normed rows as MXFP8 (see `moe_tail_rmsnorm_mxfp8`)."""
-    quant = q_out is not None
-    assert out is not None or quant
-    n_out = rows.shape[0] if rows is not None else routed.shape[0]
-    hidden = routed.shape[1]
+    n_out, hidden = out.shape
     if n_out == 0:
         return
     block = triton.next_power_of_2(hidden)
-    if quant:
-        assert hidden == block and hidden % _MX_GROUP == 0, hidden
-        assert q_out.shape == (n_out, hidden) and q_out.is_contiguous(), q_out.shape
-        assert s_out.numel() == n_out * (hidden // _MX_GROUP) and s_out.is_contiguous()
     ptrs = (
         shared,
         gate if gate is not None else shared,
@@ -258,36 +173,17 @@ def _launch(
         residual,
         weight,
         rows if rows is not None else routed,
-        # without a bf16 output the pointer only carries the activation dtype
-        out if out is not None else routed,
-        res_out if res_out is not None else (out if out is not None else routed),
+        out,
+        res_out if res_out is not None else out,
     )
     strides = (
         shared.stride(0),
         gate.stride(0) if gate is not None else 0,
         routed.stride(0),
         residual.stride(0),
-        out.stride(0) if out is not None else 0,
+        out.stride(0),
         res_out.stride(0) if res_out is not None else 0,
     )
-    # Rows a program in the MXFP8 mode. A program's rows run one after another,
-    # so more rows cost latency, but each group's scale bytes then go out
-    # together instead of one byte M apart (gfx1250, 2048 hidden, measured:
-    # one row is best up to 1k rows, 2 / 4 / 8 at 2k / 4k-8k / 16k).
-    if not quant:
-        qrows = 1
-    elif n_out <= 1024:
-        qrows = 1
-    elif n_out <= 2048:
-        qrows = 2
-    elif n_out <= 8192:
-        qrows = 4
-    else:
-        qrows = 8
-    grid = triton.cdiv(n_out, qrows)
-    # q, s and the row count are runtime args only in the MXFP8 mode (None, a
-    # constexpr, otherwise -- the default kernel keeps its signature).
-    qargs = (q_out, s_out, n_out) if quant else ()
     # Eager prefill is host-bound, and Triton's own dispatch (argument binding,
     # specialization, cache lookup) is most of this launch's host time. So the
     # compiled kernel is kept and launched directly, under a key at least as
@@ -295,7 +191,7 @@ def _launch(
     # only cached when every pointer is 16-byte aligned and reaches no further
     # than 2 GiB from itself (the AMD buffer-op attribute) -- pointer alignment
     # and reach. Anything else, and a new key, takes Triton's own path.
-    reach = (max(n_out, routed.shape[0]) * max(strides) + hidden) * routed.element_size()
+    reach = (max(n_out, routed.shape[0]) * max(strides) + hidden) * out.element_size()
     cacheable = reach <= _INT32_MAX and not any(t.data_ptr() % 16 for t in ptrs)
     key = (
         hidden,
@@ -305,37 +201,20 @@ def _launch(
         None if rows is None else rows.dtype,
         res_out is not None,
         tuple((v == 1, v % 16 == 0) for v in strides),
-        out is not None,
-        quant,
-        qrows,
-        # Triton specializes the row count (== 1: a constexpr, not a runtime
-        # arg; % 16: an alignment hint), so the key carries both
-        quant and n_out == 1,
-        quant and n_out % 16 == 0,
     )
-    if quant:
-        cacheable = cacheable and not any(t.data_ptr() % 16 for t in (q_out, s_out))
-        if n_out == 1:
-            qargs = (q_out, s_out)
     kernel = _COMPILED.get(key) if cacheable else None
     if kernel is not None:
-        kernel[(grid, 1, 1)](*ptrs, *strides, eps, *qargs)
+        kernel[(n_out, 1, 1)](*ptrs, *strides, eps)
         return
-    kernel = _moe_tail_rmsnorm_kernel[(grid,)](
+    kernel = _moe_tail_rmsnorm_kernel[(n_out,)](
         *ptrs,
         *strides,
         eps,
-        q_out,
-        s_out,
-        n_out if quant else None,
         N=hidden,
         BLOCK=block,
         HAS_GATE=gate is not None,
         GATHER=rows is not None,
         WRITE_RESIDUAL=res_out is not None,
-        WRITE_OUT=out is not None,
-        QUANT_OUT=quant,
-        QUANT_ROWS=qrows,
         num_warps=4 if block <= 2048 else 8,
         # The products and sums round where the unfused kernels round; no FMA
         # contraction across them.
@@ -465,88 +344,170 @@ def moe_tail_rmsnorm_rows(
     )
 
 
-def _moe_tail_rmsnorm_mxfp8_impl(
-    routed: Tensor,
-    shared: Tensor,
-    gate_logits: Tensor | None,
-    residual: Tensor,
-    weight: Tensor,
-    eps: float,
-    write_normed: bool,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    m, hidden = routed.shape
-    dev = routed.device
-    q = torch.empty((m, hidden), dtype=torch.float8_e4m3fn, device=dev)
-    s = torch.empty((hidden // _MX_GROUP) * m, dtype=torch.uint8, device=dev)
-    res_out = torch.empty(routed.shape, dtype=routed.dtype, device=dev)
-    out = torch.empty(routed.shape, dtype=routed.dtype, device=dev) if write_normed else None
-    _launch(routed, shared, gate_logits, residual, weight, eps, None, out, res_out, q, s)
-    if out is None:
-        out = routed.new_empty((0, hidden))
-    return q, scale_view(s, m, hidden), res_out, out
-
-
-def _moe_tail_rmsnorm_mxfp8_fake(
-    routed: Tensor,
-    shared: Tensor,
-    gate_logits: Tensor | None,
-    residual: Tensor,
-    weight: Tensor,
-    eps: float,
-    write_normed: bool,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    m, hidden = routed.shape
-    return (
-        routed.new_empty((m, hidden), dtype=torch.float8_e4m3fn),
-        routed.new_empty((m, hidden // _MX_GROUP), dtype=torch.float8_e8m0fnu),
-        torch.empty_like(routed),
-        routed.new_empty((m if write_normed else 0, hidden)),
-    )
-
-
-@torch_compile_guard(gen_fake=_moe_tail_rmsnorm_mxfp8_fake, mutates_args=[])
-def moe_tail_rmsnorm_mxfp8_op(
-    routed: Tensor,
-    shared: Tensor,
-    gate_logits: Tensor | None,
-    residual: Tensor,
-    weight: Tensor,
-    eps: float,
-    write_normed: bool,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    return _moe_tail_rmsnorm_mxfp8_impl(
-        routed, shared, gate_logits, residual, weight, eps, write_normed
-    )
-
-
-def moe_tail_rmsnorm_mxfp8(
-    routed: Tensor,
-    shared: Tensor,
-    gate_logits: Tensor | None,
-    residual: Tensor,
-    weight: Tensor,
-    eps: float,
-    write_normed: bool = False,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """`moe_tail_rmsnorm` with the normed rows also written as MXFP8 for the next
-    layer's per_1x128 e8m0 projection: returns `(x_fp8, x_scale, residual, normed)`.
-
-    `x_fp8` [M, hidden] fp8 e4m3 and `x_scale` [M, hidden / 128] e8m0 (the
-    transposed layout: storage byte of row m, group g at g * M + m, viewed as
-    (M, hidden / 128)) are bitwise `per_group_quant_hip(normed, group_size=128,
-    transpose_scale=True, scale_type=fp8_e8m0)` of the bf16 normed rows, so
-    `linear(x_fp8, x_scale=x_scale)` matches the unfused Linear. `residual` is
-    the new residual, bitwise `moe_tail_rmsnorm`'s. `normed` (the bf16 rows,
-    bitwise `moe_tail_rmsnorm`'s) is only written when `write_normed`; otherwise
-    an empty [0, hidden] tensor. hidden: a power of two, a multiple of 128.
-    Only for a norm whose sole consumer is such a projection -- not the final
-    norm / MTP drafter norm (`moe_tail_rmsnorm_rows`)."""
-    if torch.compiler.is_compiling():
-        return moe_tail_rmsnorm_mxfp8_op(
-            routed, shared, gate_logits, residual, weight, eps, write_normed
+# ---------------------------------------------------------------------------
+# ATOM_MXFP8_1X32: the normed rows written as 1x32 MXFP8 for the next projection
+# ---------------------------------------------------------------------------
+@triton.jit
+def _moe_tail_rmsnorm_mx32_kernel(
+    shared_ptr,
+    gate_ptr,
+    routed_ptr,
+    residual_ptr,
+    weight_ptr,
+    res_out_ptr,
+    q_ptr,
+    s_ptr,
+    stride_shared,
+    stride_gate,
+    stride_routed,
+    stride_residual,
+    stride_res_out,
+    eps,
+    M,
+    N: tl.constexpr,
+    BLOCK: tl.constexpr,
+    HAS_GATE: tl.constexpr,
+    N32K4: tl.constexpr,
+):
+    """`_moe_tail_rmsnorm_kernel` (no gather, residual written) whose normed row goes out as fp8
+    e4m3 [M, N] plus one e8m0 scale per 32 columns in the 1x32 GEMM's x-scale layout
+    (mxfp8_1x32: n32k4 for M >= 32, row-major below) instead of bf16. The row math is the
+    default kernel's line for line, so the quantized values are those of its bf16 output.
+    Programs past M (the n32k4 pad rows, up to a multiple of 32) write scale byte 0x7F.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    KG: tl.constexpr = N // 32
+    g = tl.arange(0, KG)
+    if row < M:
+        cols = tl.arange(0, BLOCK)
+        mask = cols < N
+        shared = tl.load(shared_ptr + row * stride_shared + cols, mask, other=0.0).to(
+            tl.float32
         )
-    return _moe_tail_rmsnorm_mxfp8_impl(
-        routed, shared, gate_logits, residual, weight, eps, write_normed
+        if HAS_GATE:
+            gate = tl.load(gate_ptr + row * stride_gate)
+            gate = tl.sigmoid(gate.to(tl.float32)).to(gate.dtype).to(tl.float32)
+            shared = (shared * gate).to(shared_ptr.dtype.element_ty).to(tl.float32)
+        routed = tl.load(routed_ptr + row * stride_routed + cols, mask, other=0.0).to(
+            tl.float32
+        )
+        moe = (shared + routed).to(routed_ptr.dtype.element_ty).to(tl.float32)
+        x = moe + tl.load(
+            residual_ptr + row * stride_residual + cols, mask, other=0.0
+        ).to(tl.float32)
+        tl.store(
+            res_out_ptr + row * stride_res_out + cols,
+            x.to(res_out_ptr.dtype.element_ty),
+            mask,
+        )
+        rstd = tl.rsqrt(tl.sum(x * x, axis=0) / N + eps)
+        weight = tl.load(weight_ptr + cols, mask, other=0.0).to(tl.float32) + 1.0
+        normed = ((x * rstd) * weight).to(routed_ptr.dtype.element_ty)
+        q, e = mx32_quant_groups(tl.reshape(normed.to(tl.float32), (KG, 32)))
+        qcols = g[:, None] * 32 + tl.arange(0, 32)[None, :]
+        tl.store(q_ptr + row * N + qcols, q)
+        tl.store(s_ptr + mx32_scale_offset(row, g, KG, N32K4), e)
+    else:
+        tl.store(
+            s_ptr + mx32_scale_offset(row, g, KG, N32K4),
+            tl.full([KG], 0x7F, dtype=tl.uint8),
+        )
+
+
+def can_fuse_moe_tail_mx32(moe: MoEGatedSum, residual: Tensor, weight: Tensor) -> bool:
+    """`can_fuse_moe_tail` plus what the 1x32 epilogue needs: a power-of-2 hidden, K % 128."""
+    if not can_fuse_moe_tail(moe, residual, weight, None):
+        return False
+    hidden = moe.routed.shape[1]
+    return hidden == triton.next_power_of_2(hidden) and hidden % 128 == 0
+
+
+def _moe_tail_rmsnorm_mx32_impl(
+    routed: Tensor,
+    shared: Tensor,
+    gate_logits: Tensor | None,
+    residual: Tensor,
+    weight: Tensor,
+    eps: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    m, hidden = routed.shape
+    mx32_note("fused: moe_tail_rmsnorm (qkv_proj / GDN in_proj input)")
+    q, s = mx32_alloc(m, hidden, routed.device)
+    res_out = torch.empty(routed.shape, dtype=routed.dtype, device=routed.device)
+    if m:
+        grid = (m + 31) // 32 * 32 if m >= 32 else m
+        _moe_tail_rmsnorm_mx32_kernel[(grid,)](
+            shared,
+            gate_logits if gate_logits is not None else shared,
+            routed,
+            residual,
+            weight,
+            res_out,
+            q,
+            s,
+            shared.stride(0),
+            gate_logits.stride(0) if gate_logits is not None else 0,
+            routed.stride(0),
+            residual.stride(0),
+            res_out.stride(0),
+            eps,
+            m,
+            N=hidden,
+            BLOCK=triton.next_power_of_2(hidden),
+            HAS_GATE=gate_logits is not None,
+            N32K4=m >= 32,
+            num_warps=4 if hidden <= 2048 else 8,
+            enable_fp_fusion=False,
+        )
+    return q, s, res_out
+
+
+def _moe_tail_rmsnorm_mx32_fake(
+    routed: Tensor,
+    shared: Tensor,
+    gate_logits: Tensor | None,
+    residual: Tensor,
+    weight: Tensor,
+    eps: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    m, hidden = routed.shape
+    q, s = mx32_alloc(m, hidden, routed.device)
+    return q, s, torch.empty_like(routed)
+
+
+@torch_compile_guard(gen_fake=_moe_tail_rmsnorm_mx32_fake, mutates_args=[])
+def moe_tail_rmsnorm_mx32_op(
+    routed: Tensor,
+    shared: Tensor,
+    gate_logits: Tensor | None,
+    residual: Tensor,
+    weight: Tensor,
+    eps: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    return _moe_tail_rmsnorm_mx32_impl(
+        routed, shared, gate_logits, residual, weight, eps
+    )
+
+
+def moe_tail_rmsnorm_mx32(
+    routed: Tensor,
+    shared: Tensor,
+    gate_logits: Tensor | None,
+    residual: Tensor,
+    weight: Tensor,
+    eps: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """`moe_tail_rmsnorm` with the normed rows as 1x32 MXFP8 for the next projection:
+    `(x_fp8 [M, hidden], x_scale (flat uint8, mxfp8_1x32 layout), new_residual)`. Bitwise
+    `moe_tail_rmsnorm`'s normed rows followed by mxfp8_1x32.quant_standalone (scale pad rows 0x7F);
+    the residual is bitwise `moe_tail_rmsnorm`'s. Callers check `can_fuse_moe_tail_mx32`.
+    """
+    if torch.compiler.is_compiling():
+        return moe_tail_rmsnorm_mx32_op(
+            routed, shared, gate_logits, residual, weight, eps
+        )
+    return _moe_tail_rmsnorm_mx32_impl(
+        routed, shared, gate_logits, residual, weight, eps
     )
 
 

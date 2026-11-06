@@ -20,6 +20,7 @@ from atom.model_config.qwen3_5_moe import (
     Qwen3_5MoeConfig,  # noqa: F401
     Qwen3_5MoeTextConfig,
 )
+from atom.model_ops import mxfp8_1x32
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fla_ops import gdn_fused_decode
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
@@ -52,7 +53,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.plugin.prepare import is_plugin_mode
-from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
 
@@ -261,6 +261,8 @@ def load_fused_expert_weights(
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
     # Set by the decoder layer: it runs out_proj in one kernel with its next norm.
     skip_out_proj = False
+    # forward feeds (x_fp8, x_scale) to a 1x32 MXFP8 in_proj_qkvzba (ATOM_MXFP8_1X32)
+    takes_mx32_input = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -318,15 +320,7 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             # The exclude list names in_proj_qkvz / in_proj_ba, not the fused
             # module, so a quantized checkpoint builds it unquantized here.
             if self.quant_config.global_quant_config.quant_dtype != torch.bfloat16:
-                if envs.ATOM_GDN_IN_PROJ_ONLINE_QUANT and getattr(
-                    self.quant_config, "online_quant", False
-                ):
-                    # Keep the config so online quantization can re-quantize this bf16 weight; its prefix is
-                    # excluded from the checkpoint's (MXFP4) quant config so it still loads as bf16.
-                    if prefix not in self.quant_config.exclude_layers:
-                        self.quant_config.exclude_layers.append(prefix)
-                else:
-                    quant_config = None
+                quant_config = None
             self.in_proj_qkvzba = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
                 output_sizes=[
@@ -389,7 +383,8 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         a_size = v_heads_tp
 
         if hasattr(self, "in_proj_qkvzba"):
-            if x_fp8 is not None:  # MXFP8 rows from the input norm (ATOM_MXFP8_FUSED_ACT_QUANT)
+            if x_scale is not None and mxfp8_1x32.takes_mx32(self.in_proj_qkvzba):
+                # 1x32 MXFP8 rows from the input norm (ATOM_MXFP8_1X32)
                 qkvzba = self.in_proj_qkvzba(x_fp8, x_scale=x_scale)
             else:
                 qkvzba = self.in_proj_qkvzba(hidden_states)
@@ -409,19 +404,22 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
 
         z = z_flat.view(num_tokens, v_heads_tp, self.head_v_dim)
         if (
-            envs.ATOM_MXFP8_FUSED_ACT_QUANT
-            and self.fuse_gated_norm
+            self.fuse_gated_norm
             and not self.skip_out_proj
-            and self.out_proj.takes_mxfp8_input()
+            and mxfp8_1x32.fused_act_quant()
+            and mxfp8_1x32.takes_mx32(self.out_proj)
         ):
-            # the GDN op writes out_proj's MXFP8 input itself (fp8 + e8m0 scales)
-            core_fp8 = torch.empty(z.shape, dtype=torch.float8_e4m3fn, device=z.device)
-            out_scale = torch.empty(v_heads_tp * num_tokens, dtype=torch.uint8, device=z.device)
-            self.attn(mixed_qkv, b, a, core_fp8, z=z, out_scale=out_scale)
-            return self.out_proj(
-                core_fp8.view(num_tokens, -1),
-                x_scale=out_scale.view(torch.float8_e8m0fnu).view(num_tokens, -1),
+            # The GDN op writes out_proj's 1x32 MXFP8 input itself (fp8 + e8m0 scales).
+            core_fp8, out_scale = mxfp8_1x32.alloc(num_tokens, z_size, z.device)
+            core_fp8, out_scale = self.attn(
+                mixed_qkv,
+                b,
+                a,
+                core_fp8.view(num_tokens, v_heads_tp, self.head_v_dim),
+                z=z,
+                out_scale=out_scale,
             )
+            return self.out_proj(core_fp8.view(num_tokens, -1), x_scale=out_scale)
         core_attn_out = torch.empty_like(z)
 
         # ============================================================
@@ -559,6 +557,8 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             fuse_allreduce_norm
             and not self.layer_scale
             and proj.quant_type.value == QuantType.No.value
+            # a 1x32 MXFP8 projection runs its own GEMM (ATOM_MXFP8_1X32)
+            and not mxfp8_1x32.takes_mx32(proj)
             and gluon_gemm_ar_supported(config.hidden_size, proj.input_size)
         )
         if self.fuse_gemm_ar:

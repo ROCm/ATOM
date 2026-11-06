@@ -178,24 +178,24 @@ def chunk_fwd_kernel_o(
     )
 
 
-# MXFP8 out_proj input (ATOM_MXFP8_FUSED_ACT_QUANT): while set, the gated gfx1250 chunk_o writes fp8 + e8m0 scales
-# into these buffers instead of bf16 into `o` (see `mxfp8_output`).
-_MXFP8_OUT = None
+# ATOM_MXFP8_1X32 out_proj input: while set, the gated gfx1250 chunk_o writes fp8 + 1x32 e8m0
+# scales into these buffers instead of bf16 into `o` (see `mx32_output`).
+_MX32_OUT = None
 
 
 @contextlib.contextmanager
-def mxfp8_output(o_fp8: torch.Tensor, o_scale: torch.Tensor):
-    """Within this block a gated `chunk_fwd_o` on the gfx1250 kernel writes the out_proj's MXFP8 input --
-    `o_fp8` [rows, H * V] fp8 and `o_scale` (e8m0 bytes at g * rows + m) -- and leaves its `o` unwritten. Yields
-    a list that is non-empty once a kernel took the buffers; the caller quantizes `o` itself otherwise.
-    """
-    global _MXFP8_OUT
+def mx32_output(o_fp8: torch.Tensor, o_scale: torch.Tensor):
+    """Within this block a gated `chunk_fwd_o` on the gfx1250 kernel writes the out_proj's 1x32
+    MXFP8 input -- `o_fp8` [rows, H * V] fp8 and the flat `o_scale` (mxfp8_1x32 layout) -- and
+    leaves its `o` unwritten. Yields a list that is non-empty once a kernel took the buffers; the
+    caller quantizes `o` itself otherwise."""
+    global _MX32_OUT
     used: list = []
-    prev, _MXFP8_OUT = _MXFP8_OUT, (o_fp8, o_scale, used)
+    prev, _MX32_OUT = _MX32_OUT, (o_fp8, o_scale, used)
     try:
         yield used
     finally:
-        _MXFP8_OUT = prev
+        _MX32_OUT = prev
 
 
 def chunk_fwd_o(
@@ -274,10 +274,10 @@ def chunk_fwd_o(
     ):
         from .chunk_o_gfx1250 import chunk_o_gfx1250
 
-        out_fp8 = None
-        if _MXFP8_OUT is not None and gate is not None:
-            o_fp8, o_scale, used = _MXFP8_OUT
-            out_fp8 = (o_fp8, o_scale)
+        out_mx32 = None
+        if _MX32_OUT is not None and gate is not None:
+            o_fp8, o_scale, used = _MX32_OUT
+            out_mx32 = (o_fp8, o_scale)
             used.append(True)
         chunk_o_gfx1250(
             q,
@@ -299,7 +299,7 @@ def chunk_fwd_o(
             V,
             BT,
             gate,
-            out_fp8,
+            out_mx32,
         )
         return o
 

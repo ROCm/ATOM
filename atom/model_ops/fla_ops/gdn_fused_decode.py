@@ -147,8 +147,20 @@ def decode(layer, mixed_qkv, b, a, z, conv_state, ssm_state, state_indices, out)
     return True
 
 
-def verify(layer, mixed_qkv, b, a, z, conv_state, ssm_state, layer_cache, md, out, out_scale=None,
-           out_scale_rows=None):
+def verify(
+    layer,
+    mixed_qkv,
+    b,
+    a,
+    z,
+    conv_state,
+    ssm_state,
+    layer_cache,
+    md,
+    out,
+    out_scale=None,
+    out_scale_rows=None,
+):
     """Run a speculative-verify batch on ReplaySSM state and write
     ``norm(core) * silu(z)`` into ``out``.
 
@@ -165,6 +177,24 @@ def verify(layer, mixed_qkv, b, a, z, conv_state, ssm_state, layer_cache, md, ou
     if rows is None:
         return False
     sequences = md.num_spec_decodes
+    mx32 = {}
+    if out_scale is not None:
+        # ATOM_MXFP8_1X32: fp8 `out` and the 1x32 e8m0 bytes of the out_proj's input (flat
+        # `out_scale`, mxfp8_1x32 layout over the GEMM's `out_scale_rows` rows). Only the
+        # chunk-form kernel has that epilogue; otherwise nothing is launched here.
+        from aiter.ops.triton.gated_delta_net.fused_gdn_verify_qkvz import (
+            fused_gdn_verify_mx32_supported,
+        )
+
+        if not fused_gdn_verify_mx32_supported(
+            ssm_state,
+            conv_state,
+            layer_cache.replay_buf_k,
+            md.replayssm_max_query_len,
+            sequences,
+        ):
+            return False
+        mx32 = {"out_scale": out_scale, "out_scale_rows": out_scale_rows}
     weight = layer.conv1d.weight
     args = (
         *rows,
@@ -191,8 +221,7 @@ def verify(layer, mixed_qkv, b, a, z, conv_state, ssm_state, layer_cache, md, ou
         scale=layer.head_k_dim**-0.5,
         norm_eps=layer.gated_norm.eps,
         out=out,
-        # MXFP8 out (fp8 `out`): e8m0 bytes at g * out_scale_rows + m, the out_proj GEMM's transposed layout
-        **({} if out_scale is None else {"out_scale": out_scale, "out_scale_rows": out_scale_rows}),
+        **mx32,
     )
     return True
 

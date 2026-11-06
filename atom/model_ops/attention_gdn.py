@@ -210,15 +210,18 @@ class GatedDeltaNet(nn.Module):
         """The gated RMSNorm as the chunked prefill's ``output_gate``."""
         return (z, self.gated_norm.weight, self.gated_norm.eps)
 
-    def _forward_mxfp8(self, mixed_qkv, b, a, out, layer_name, z, out_scale):
-        """The gated-normed output as the out_proj's MXFP8 input (ATOM_MXFP8_FUSED_ACT_QUANT): `out` is fp8
-        [T, VH, V] (T = the out_proj's rows), `out_scale` receives the e8m0 bytes at g * T + m. The fused verify
-        kernel quantizes in its epilogue; every other path runs in bf16 and then the standalone quant -- the same
-        bytes either way. Rows past the step's tokens get what quantizing a zero row gives (0, byte 85)."""
-        from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata  # noqa: F401
+    def _forward_mx32(self, mixed_qkv, b, a, out, layer_name, z, out_scale):
+        """The gated-normed output as the out_proj's 1x32 MXFP8 input (ATOM_MXFP8_1X32 with its
+        fused act quant): `out` is fp8 [T, VH, V] (T = the out_proj GEMM's rows), `out_scale` the
+        flat e8m0 buffer (model_ops/mxfp8_1x32.py layout over T rows). The fused verify kernel
+        (spec decode) and the gated gfx1250 chunk_o (pure prefill) quantize in their epilogues;
+        every other route runs in bf16 and then the standalone quant -- the same bytes either
+        way. Rows past the step's tokens get what quantizing the bf16 path's zero rows gives
+        (fp8 0, byte 85); n32k4 pad rows 0x7F."""
+        from atom.model_ops import mxfp8_1x32 as mx
 
-        rows, heads = out.shape[0], out.shape[1]
-        scale = out_scale.view(torch.uint8)
+        rows = out.shape[0]
+        out2 = out.view(rows, -1)
         fwd_ctx: ForwardContext = get_forward_context()
         md = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
         if (
@@ -248,17 +251,12 @@ class GatedDeltaNet(nn.Module):
                 layer_cache,
                 md,
                 out[:n],
-                out_scale=scale,
+                out_scale=out_scale,
                 out_scale_rows=rows,
             ):
-                if n < rows:
-                    out[n:].view(torch.uint8).zero_()
-                    scale[: heads * rows].view(heads, rows)[:, n:].fill_(85)
+                mx.note("fused: GDN verify (GDN out_proj input, spec decode)")
+                mx.fill_rows(out2, out_scale, n)
                 return out
-        from aiter import dtypes as _dt
-
-        from atom.model_ops.linear import per_1x128_e8m0_quant
-
         tmp = torch.empty(out.shape, dtype=torch.bfloat16, device=out.device)
         if (
             md is not None
@@ -267,25 +265,23 @@ class GatedDeltaNet(nn.Module):
             and md.num_decodes == 0
             and md.spec_sequence_masks is None
         ):
-            # pure prefill: the gated chunk_o writes the fp8 rows itself (its `o`, tmp, then stays unwritten)
+            # Pure prefill: the gated gfx1250 chunk_o writes the fp8 rows itself (its bf16 `o`,
+            # tmp, then stays unwritten).
             from atom.model_ops.fla_ops import chunk_o as _chunk_o
-            from atom.model_ops.fla_ops.chunk_o_gfx1250 import fill_mxfp8_padding
 
-            with _chunk_o.mxfp8_output(out.view(rows, -1), scale) as used:
+            with _chunk_o.mx32_output(out2, out_scale) as used:
                 self.forward(mixed_qkv, b, a, tmp, layer_name, z=z)
             if used:
-                fill_mxfp8_padding(out.view(rows, -1), scale, md.num_actual_tokens)
+                mx.note("fused: chunk_o gfx1250 (GDN out_proj input, prefill)")
+                mx.fill_rows(out2, out_scale, md.num_actual_tokens)
                 return out
-            # no chunk_o took the buffers (another prefill route): quantize its bf16 result below
-            q, s = per_1x128_e8m0_quant(tmp.view(rows, -1), quant_dtype=_dt.fp8, transpose_scale=True)
-            out.view(rows, -1).copy_(q)
-            scale[: s.numel()].copy_(s.view(torch.uint8).reshape(-1))
-            return out
-        gate = {} if z is None else {"z": z}
-        self.forward(mixed_qkv, b, a, tmp, layer_name, **gate)
-        q, s = per_1x128_e8m0_quant(tmp.view(rows, -1), quant_dtype=_dt.fp8, transpose_scale=True)
-        out.view(rows, -1).copy_(q)
-        scale[: s.numel()].copy_(s.view(torch.uint8).reshape(-1))
+            # no gfx1250 chunk_o took the buffers (another prefill route): quantize tmp below
+            mx.note("GDN prefill without the gfx1250 chunk_o: bf16 + standalone quant")
+        else:
+            mx.note("other GDN route: bf16 + standalone quant")
+            gate = {} if z is None else {"z": z}
+            self.forward(mixed_qkv, b, a, tmp, layer_name, **gate)
+        mx.quant_into(tmp.view(rows, -1), out2, out_scale)
         return out
 
     def forward(
@@ -298,9 +294,13 @@ class GatedDeltaNet(nn.Module):
         z: torch.Tensor | None = None,
         out_scale: torch.Tensor | None = None,
     ):
-        """``z`` (with ``gated_norm`` set) makes the result norm(core) * silu(z)."""
+        """``z`` (with ``gated_norm`` set) makes the result norm(core) * silu(z).
+        ``out_scale`` (ATOM_MXFP8_1X32): ``core_attn_out`` is fp8 and receives, with
+        ``out_scale``, the out_proj's 1x32 MXFP8 input (see ``_forward_mx32``)."""
         if out_scale is not None:
-            return self._forward_mxfp8(mixed_qkv, b, a, core_attn_out, layer_name, z, out_scale)
+            return self._forward_mx32(
+                mixed_qkv, b, a, core_attn_out, layer_name, z, out_scale
+            )
         from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 
         fwd_ctx: ForwardContext = get_forward_context()

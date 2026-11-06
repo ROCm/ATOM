@@ -320,16 +320,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
-    # MXFP8 activations for e8m0 per_1x128 projections: the kernel that produces a projection's input (the MoE-tail
-    # RMSNorm, the attention output gate, the GDN output kernels) writes fp8 + e8m0 scales itself, so the Linear
-    # skips its standalone activation quant. Bit-identical to the unfused path.
-    # Online-quantize the fused GDN in_proj (in_proj_qkvzba) too: a quantized checkpoint builds it bf16, and its
-    # prefix is not the one the online quant config's patterns name.
-    "ATOM_GDN_IN_PROJ_ONLINE_QUANT": lambda: (
-        os.getenv("ATOM_GDN_IN_PROJ_ONLINE_QUANT", "0") == "1"
-    ),
-    "ATOM_MXFP8_FUSED_ACT_QUANT": lambda: (
-        os.getenv("ATOM_MXFP8_FUSED_ACT_QUANT", "0") == "1"
+    # Qwen3.5: 1x32 MXFP8 language-model projections (attn qkv_proj / o_proj, GDN in_proj /
+    # out_proj; not MTP): fp8 e4m3 + one e8m0 scale per 32 K elements on activations and weights,
+    # aiter's gfx1250 Gluon gemm_afp8wfp8_preshuffle. Weights quantize at load. Default off.
+    "ATOM_MXFP8_1X32": lambda: os.getenv("ATOM_MXFP8_1X32", "0") == "1",
+    # With ATOM_MXFP8_1X32: the kernel that produces a projection's input (the MoE-tail RMSNorm,
+    # the attention output gate, the GDN verify / chunk_o output kernels) writes it as 1x32 MXFP8
+    # itself, bit-identical to its bf16 output followed by the standalone quant. 0 = the
+    # standalone quant in the Linear (for A/B).
+    "ATOM_MXFP8_1X32_FUSED_ACT_QUANT": lambda: (
+        os.getenv("ATOM_MXFP8_1X32_FUSED_ACT_QUANT", "1") == "1"
     ),
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
         os.getenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", "0") == "1"
@@ -599,7 +599,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A GDN prefill zeroes the speculative tail of its slots' conv window, which
     # it neither reads nor writes, so no checkpoint image carries stale bytes.
     "ATOM_GDN_ZERO_DEAD_CONV": lambda: os.getenv("ATOM_GDN_ZERO_DEAD_CONV", "1") == "1",
-
     # Qwen3-Next / Qwen3.5 GDN prefill without speculative tokens (64 tokens or
     # more): the chunk KKT kernel computes the gates g and beta of its key
     # head's value heads from the in_proj rows, in place of the
@@ -609,7 +608,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # vectors (w, u) from the Gluon kernel fused_inverse_recompute_gfx1250
     # instead of the Triton fused_inverse_recompute. Off by default.
     "ATOM_GDN_GLUON_INVERSE": lambda: os.getenv("ATOM_GDN_GLUON_INVERSE", "0") == "1",
-
     # gfx1250 GDN prefill state walk (chunk_h): the four operand copies of a
     # chunk as two fused TDM loads, k^T's operand read before the first product.
     "ATOM_GDN_CHUNK_H_PAIRED_LOADS": lambda: (
@@ -625,7 +623,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-chunk factors exp(g_last - g_i) and exp(g_last); chunk_h reads them
     # instead of the gates. Bit-identical outputs. On by default; 0 = chunk_h reads the gates.
     "ATOM_GDN_CHUNK_H_DECAY": lambda: os.getenv("ATOM_GDN_CHUNK_H_DECAY", "1") == "1",
-
     # Both zeroings above in one Triton launch each (`pool_layout/zero_spans.py`)
     # instead of an `index_fill_` per pool field -- per field AND per layer once
     # a pool passes 2 GiB, each writing a byte a lane. The same bytes zeroed,
@@ -1098,7 +1095,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A step that writes state checkpoints, or holds more prefill requests than
     # ATOM_GDN_GRAPH_MAX_SEQS, runs eagerly as before. 0 keeps every GDN
     # prefill eager.
-    "ATOM_GDN_PREFILL_IN_GRAPH": lambda: os.getenv("ATOM_GDN_PREFILL_IN_GRAPH", "1") == "1",
+    "ATOM_GDN_PREFILL_IN_GRAPH": lambda: os.getenv("ATOM_GDN_PREFILL_IN_GRAPH", "1")
+    == "1",
     # Drain the compute stream before a step's state maintenance copies
     # (checkpoint stores / restores, slot relocations). 1 (the default) keeps
     # the host from running ahead of the GPU across them; see

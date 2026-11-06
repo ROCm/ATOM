@@ -20,7 +20,10 @@ from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_config.qwen3_next import Qwen3NextConfig
 
 # registers torch.ops.aiter.maybe_dual_stream_forward
-from atom.model_ops import module_dispatch_ops  # noqa: F401
+from atom.model_ops import (
+    module_dispatch_ops,  # noqa: F401
+    mxfp8_1x32,
+)
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -47,15 +50,17 @@ from atom.model_ops.moe_tail_norm import (
     CombineTailRequest,
     MoEGatedSum,
     MoENormed,
+    can_fuse_moe_tail_mx32,
     combine_tail_request,
     gated_gemm_available,
     interleave_gate_up,
+    moe_tail_rmsnorm_mx32,
     silu_gate_up_gemm,
 )
 from atom.model_ops.sigmoid_gate import (
-    can_fuse_output_gate_mxfp8,
+    can_fuse_output_gate_mx32,
     output_gate_mul,
-    output_gate_mul_mxfp8,
+    output_gate_mul_mx32,
     shared_expert_gate_add,
 )
 from atom.model_ops.topK import (
@@ -648,6 +653,15 @@ class Qwen3NextAttention(nn.Module):
             and self.attn_output_gate
             and self.o_proj.quant_type == QuantType.per_1x128
         )
+        # ATOM_MXFP8_1X32 with its fused act quant: the output gate kernel writes the 1x32
+        # o_proj's MXFP8 input (gate + quant in one launch), so the attention returns the
+        # ungated output instead of gating in its epilogue.
+        self.mx32_output_gate = (
+            self.attn_output_gate
+            and not self.use_fused_sigmoid_mul_quant
+            and mxfp8_1x32.fused_act_quant()
+            and mxfp8_1x32.takes_mx32(self.o_proj)
+        )
         # ATOM_UA_FUSED_OUTPUT_GATE: the attention returns o * sigmoid(gate), the
         # gate in the unified attention's epilogue (attention_mha: the paths that
         # end on another kernel gate after it). ATOM native attention only.
@@ -655,6 +669,7 @@ class Qwen3NextAttention(nn.Module):
             envs.ATOM_UA_FUSED_OUTPUT_GATE
             and self.attn_output_gate
             and not self.use_fused_sigmoid_mul_quant
+            and not self.mx32_output_gate
             and not is_plugin_mode()
             and getattr(getattr(self.attn, "impl", None), "accepts_output_gate", False)
         )
@@ -678,14 +693,7 @@ class Qwen3NextAttention(nn.Module):
             q, k, v = torch.split(
                 qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
-        # The MXFP8 o_proj path keeps its own gate + quant kernel.
-        mxfp8_out = (
-            self.attn_output_gate
-            and envs.ATOM_MXFP8_FUSED_ACT_QUANT
-            and not self.skip_out_proj
-            and self.o_proj.takes_mxfp8_input()
-        )
-        gate_in_attention = self.gate_in_attention and not mxfp8_out
+        gate_in_attention = self.gate_in_attention
         attn_gate = {"output_gate": gate} if gate_in_attention else {}
         if self.fuse_qk_norm_rope_cache:
             # Pass the packed [q, k, v] tensor (gate excluded) for smuggling
@@ -730,9 +738,13 @@ class Qwen3NextAttention(nn.Module):
 
             attn_output, attn_scale = sigmoid_mul_fp8_group_quant(attn_output, gate)
             output = self.o_proj(attn_output, x_scale=attn_scale)
-        elif mxfp8_out and can_fuse_output_gate_mxfp8(attn_output, gate):
-            # the gate writes o_proj's MXFP8 input itself (fp8 + e8m0 scales)
-            x_fp8, x_scale = output_gate_mul_mxfp8(attn_output, gate)
+        elif (
+            self.mx32_output_gate
+            and not self.skip_out_proj
+            and can_fuse_output_gate_mx32(attn_output, gate)
+        ):
+            # the gate writes o_proj's 1x32 MXFP8 input itself (fp8 + e8m0 scales)
+            x_fp8, x_scale = output_gate_mul_mx32(attn_output, gate)
             output = self.o_proj(x_fp8, x_scale=x_scale)
         elif self.attn_output_gate:
             if not gate_in_attention:
@@ -1095,19 +1107,35 @@ class Qwen3NextDecoderLayer(nn.Module):
                 )
             )
 
-    def _first_proj_takes_mxfp8(self) -> bool:
-        """Whether this layer's first projection (the fused GDN in_proj, or qkv_proj) is an e8m0 per_1x128 Linear
-        that takes the input norm's MXFP8 rows (ATOM_MXFP8_FUSED_ACT_QUANT)."""
+    def _input_norm_mx32(self, hidden_states, residual):
+        """ATOM_MXFP8_1X32 with its fused act quant: the MoE-tail RMSNorm writing this layer's
+        first projection's (qkv_proj / fused GDN in_proj) 1x32 MXFP8 input --
+        `(x_fp8, x_scale, residual)` -- or None where it does not apply (then the norm runs in
+        bf16 and the Linear quantizes: the same bytes)."""
+        if residual is None or not isinstance(hidden_states, MoEGatedSum):
+            return None
+        if not mxfp8_1x32.fused_act_quant():
+            return None
         norm = self.input_layernorm
-        if norm.use_fused_quant or getattr(norm, "fused_allreduce", False):
-            return False
+        if not isinstance(norm, GemmaRMSNorm) or not norm.takes_moe_gated_sum:
+            return None
         if self.layer_type == "linear_attention":
+            # only a GDN whose forward feeds x_fp8 / x_scale to its fused in_proj (Qwen3.5)
+            if not getattr(self.linear_attn, "takes_mx32_input", False):
+                return None
             proj = getattr(self.linear_attn, "in_proj_qkvzba", None)
         elif self.layer_type == "full_attention":
             proj = getattr(self.self_attn, "qkv_proj", None)
         else:
-            return False
-        return proj is not None and hasattr(proj, "takes_mxfp8_input") and proj.takes_mxfp8_input()
+            return None
+        if not mxfp8_1x32.takes_mx32(proj):
+            return None
+        if not can_fuse_moe_tail_mx32(hidden_states, residual, norm.weight):
+            return None
+        routed, shared, gate = hidden_states
+        return moe_tail_rmsnorm_mx32(
+            routed, shared, gate, residual, norm.weight, norm.variance_epsilon
+        )
 
     def forward(
         self,
@@ -1120,17 +1148,19 @@ class Qwen3NextDecoderLayer(nn.Module):
         their KV), keep only these rows for the MLP; the layer then returns
         `len(select_rows)` rows (the MTP drafter's step 0)."""
         # Self Attention
-        mxfp8_in = envs.ATOM_MXFP8_FUSED_ACT_QUANT and self._first_proj_takes_mxfp8()
-        if self.input_layernorm.use_fused_quant or mxfp8_in:
-            norm_kw = {"mxfp8": True} if mxfp8_in else {}
+        mx32_in = self._input_norm_mx32(hidden_states, residual)
+        if mx32_in is not None:
+            hidden_states, x_scale, residual = mx32_in
+            hidden_bf16 = None
+        elif self.input_layernorm.use_fused_quant:
             if residual is None:
                 residual = hidden_states
                 hidden_states, x_scale, hidden_bf16 = self.input_layernorm(
-                    hidden_states, **norm_kw
+                    hidden_states
                 )
             else:
                 hidden_states, x_scale, hidden_bf16, residual = self.input_layernorm(
-                    hidden_states, residual, **norm_kw
+                    hidden_states, residual
                 )
         else:
             x_scale = hidden_bf16 = None

@@ -665,25 +665,6 @@ def quant_mxfp4_online_even(
     return q_weight.view(dtypes.fp4x2), weight_scale.view(_mx_block_scale_dtype())
 
 
-def quantize_weight_to_fp8_128x128_blockscale_e8m0(weight, quant_dtype):
-    """128x128 block FP8 with E8M0 (power-of-two) scales: scale = 2^ceil(log2(amax / fp8_max)), so the
-    quantized block never exceeds the FP8 range. Returns (q_weight, scale as dtypes.fp8_e8m0)."""
-    from aiter import dtypes
-
-    w = weight.to(torch.float32).contiguous()
-    n, k = w.shape
-    n_blocks, k_blocks = (n + 127) // 128, (k + 127) // 128
-    if n_blocks * 128 != n or k_blocks * 128 != k:
-        w = torch.nn.functional.pad(w, (0, k_blocks * 128 - k, 0, n_blocks * 128 - n))
-    w_blocks = w.view(n_blocks, 128, k_blocks, 128).permute(0, 2, 1, 3).contiguous()
-    finfo = torch.finfo(quant_dtype)
-    amax = w_blocks.abs().amax(dim=(2, 3)).clamp_min(torch.finfo(torch.float32).tiny)
-    scale = torch.exp2(torch.ceil(torch.log2(amax / finfo.max))).clamp(2.0 ** -127, 2.0 ** 127)
-    q_blocks = torch.clamp(w_blocks / scale[:, :, None, None], min=finfo.min, max=finfo.max).to(quant_dtype)
-    q_weight = q_blocks.permute(0, 2, 1, 3).reshape(n_blocks * 128, k_blocks * 128)[:n, :k].contiguous()
-    return q_weight, scale.to(dtypes.fp8_e8m0)
-
-
 def quantize_weight_to_fp8_128x128_blockscale(weight, quant_dtype):
     """Quantize a 2D weight to FP8 with 128x128 block scales.
 
@@ -726,7 +707,6 @@ def quant_weight_online(
     weight: torch.Tensor,
     online_quant_type: QuantType,
     online_quant_dtype: torch.dtype,
-    e8m0_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dispatch online weight quantization by target dtype / scheme.
 
@@ -756,8 +736,6 @@ def quant_weight_online(
     if online_quant_dtype == dtypes.fp4x2:
         return quant_mxfp4_online_even(weight)
     if online_quant_type == QuantType.per_1x128:
-        if e8m0_scale:
-            return quantize_weight_to_fp8_128x128_blockscale_e8m0(weight, online_quant_dtype)
         return quantize_weight_to_fp8_128x128_blockscale(weight, online_quant_dtype)
     quant_func = get_hip_quant(online_quant_type)
     # A per_1x32 scheme *is* MX (microscaling): its block scale is E8M0 by

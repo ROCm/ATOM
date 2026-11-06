@@ -426,6 +426,11 @@ def load_model(
                 full_name = f"{module_name}.{param_name}" if module_name else param_name
                 loaded_weights_record.add(prefix + full_name)
 
+    # ATOM_MXFP8_1X32: every in-scope projection converted at load (asserts 2 a decoder layer).
+    from atom.model_ops import mxfp8_1x32
+
+    mxfp8_1x32.check_converted(model)
+
     # Post-processing (AITER shuffle/swizzle, per-quant-method hooks) runs inside
     # the load time the caller reports, so it is timed unconditionally: without
     # this line a shuffle-dominated load is indistinguishable from a slow read.

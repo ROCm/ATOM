@@ -5,8 +5,8 @@ replace there: varlen with a state pool by slot (eager) or a bucket-shaped plan,
 and a fixed-length batch; the output with and without the fused gated RMSNorm.
 chunk_h stores h K-major ([.., V, K] storage, returned as a [.., K, V] view); its
 value tile widths and ring depths, and the fused KKT kernel's decay rows in place of the gates
-(bitwise the same). chunk_o reads K-major h (the Triton kernel too) and its fp8
-output is the bf16 output followed by the unfused quant, byte for byte."""
+(bitwise the same). chunk_o reads K-major h (the Triton kernel too) and its 1x32
+MXFP8 output is the bf16 output followed by the standalone quant, byte for byte."""
 
 import pytest
 import torch
@@ -392,29 +392,34 @@ def test_triton_output_reads_k_major_states(monkeypatch):
 
 
 @pytest.mark.parametrize("fast_norm", ["0", "1"])
-def test_fp8_output_is_bf16_output_then_quant(fast_norm, monkeypatch):
-    """OUT_FP8 (mxfp8_output): fp8 values and e8m0 scales are byte for byte the bf16 output's
-    unfused quant; the padding rows past the tokens are left alone."""
-    from atom.model_ops.mxfp8_act_quant import alloc_mxfp8, reference
+def test_mx32_output_is_bf16_output_then_quant(fast_norm, monkeypatch):
+    """OUT_MX32 (mx32_output): fp8 values and 1x32 e8m0 scales (n32k4) are byte for byte the
+    bf16 output's standalone quant; the rows past the tokens are left alone."""
+    from atom.model_ops import mxfp8_1x32 as mx
 
     monkeypatch.setenv("ATOM_GDN_CHUNK_O_FAST_NORM", fast_norm)
     x = _inputs([3000, 700, 5, 64], 32, 16)
     out, pool, _ = _run(True, *x, "slots", True, monkeypatch)
     T, HV = out.shape[1], 32 * 128
     rows = T + 9
-    o_fp8, o_scale = alloc_mxfp8(rows, HV, DEV)
+    o_fp8, o_scale = mx.alloc(rows, HV, DEV)
     o_fp8.view(torch.uint8).fill_(0x5A)
     o_scale.fill_(0x5A)
-    with chunk_o.mxfp8_output(o_fp8, o_scale) as used:
+    with chunk_o.mx32_output(o_fp8, o_scale) as used:
         _, pool8, _ = _run(True, *x, "slots", True, monkeypatch)
     assert used
     assert torch.equal(pool8, pool)
-    ref_q, ref_s = reference(out.view(T, HV))
-    assert torch.equal(o_fp8[:T].view(torch.uint8), ref_q.view(torch.uint8))
-    # both store the byte of (row m, head g) at g * rows + m
-    scales = o_scale.view(HV // 128, rows)
-    assert torch.equal(
-        scales[:, :T], ref_s.view(torch.uint8).flatten().view(HV // 128, T)
-    )
+    y = torch.zeros(rows, HV, dtype=torch.bfloat16, device=DEV)
+    y[:T] = out.view(T, HV)
+    ref_q, ref_s = mx.reference(y)
+    assert torch.equal(o_fp8[:T].view(torch.uint8), ref_q[:T].view(torch.uint8))
+
+    def by_row(flat):
+        # n32k4: the byte of (row m, group g) at (m // 32, g // 4, m % 32, g % 4)
+        n32 = flat.view(-1, HV // 128, 32, 4).permute(0, 2, 1, 3)
+        return n32.reshape(-1, HV // 32)
+
+    scales = by_row(o_scale)
+    assert torch.equal(scales[:T], by_row(ref_s)[:T])
     assert (o_fp8[T:].view(torch.uint8) == 0x5A).all()
-    assert (scales[:, T:] == 0x5A).all()
+    assert (scales[T:] == 0x5A).all()
