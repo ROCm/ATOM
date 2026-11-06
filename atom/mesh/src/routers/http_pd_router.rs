@@ -16,6 +16,8 @@ use axum::{
 };
 use futures_util::StreamExt;
 
+mod late_decode;
+
 #[cfg(test)]
 mod load_tests;
 
@@ -75,6 +77,8 @@ pub struct PDRouter {
     pub adapter: Arc<dyn BackendAdapter>,
     /// Set when backend == Atom. enrich_decode_kv is ATOM-specific and not on the trait.
     atom_adapter: Option<Arc<AtomAdapter>>,
+    late_decode: Option<Arc<late_decode::DecodeBalancer>>,
+    late_decode_admission: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for PDRouter {
@@ -404,6 +408,13 @@ impl PDRouter {
             }
         };
 
+        if ctx.router_config.atom_pd_late_decode
+            && atom_adapter
+                .as_ref()
+                .is_some_and(|a| !a.prefill_info.chunked_transfer.is_empty())
+        {
+            return Err("late Decode placement requires non-chunked ATOM transfer".into());
+        }
         let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
             Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
             Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
@@ -419,6 +430,12 @@ impl PDRouter {
             planner,
             adapter,
             atom_adapter,
+            late_decode: ctx.router_config.atom_pd_late_decode.then(|| {
+                Arc::new(late_decode::DecodeBalancer::new(
+                    ctx.router_config.atom_pd_decode_balance,
+                ))
+            }),
+            late_decode_admission: Arc::new(tokio::sync::Semaphore::new(2048)),
         })
     }
 
@@ -714,6 +731,9 @@ impl PDRouter {
             }
             info!("ATOM prefill {} tp_size={}", base_url, tp);
             if let Some(meta) = data.get("chunked_transfer").filter(|v| v.is_object()) {
+                if worker.is_dp_aware() && worker.dp_rank().is_none() {
+                    return Err(format!("{}: backend-routed prefill requires non-chunked relay; disable chunked transfer", base_url));
+                }
                 chunked_transfer.insert(base_url.clone(), meta.clone());
                 chunked_transfer.insert(worker_url.clone(), meta.clone());
             }
@@ -749,6 +769,13 @@ impl PDRouter {
             context.route,
             context.is_stream,
         );
+        if self.late_decode.is_some() {
+            // A handoff is single-use: never replay the whole P leg after D failure.
+            let response = self
+                .dispatch_atom_late_decode(headers, request, context)
+                .await;
+            return observation.wrap_response(response);
+        }
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             |_attempt| {
@@ -1257,6 +1284,341 @@ impl PDRouter {
 
         self.finish_atom_decode_response(res, context, decode, decode_guard)
             .await
+    }
+
+    fn late_candidates(
+        &self,
+        model_id: Option<&str>,
+        kind: crate::core::WorkerType,
+    ) -> Vec<Arc<dyn Worker>> {
+        use crate::core::placement::traits::WorkerSource;
+        WorkerRegistryAdapter::new(self.worker_registry.clone())
+            .workers_filtered(
+                model_id,
+                Some(kind),
+                Some(crate::core::ConnectionMode::Http),
+            )
+            .into_iter()
+            .filter(|w| w.is_available())
+            .collect()
+    }
+
+    async fn dispatch_atom_late_decode(
+        &self,
+        headers: Option<&HeaderMap>,
+        mut decode_request_json: Value,
+        context: PDRequestContext<'_>,
+    ) -> Response {
+        if context.batch_size.is_some_and(|n| n > 1)
+            || decode_request_json
+                .get("n")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                != 1
+            || decode_request_json
+                .get("best_of")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                != 1
+        {
+            return error::create_error(
+                StatusCode::BAD_REQUEST,
+                "late_decode_single_request_only",
+                "Late Decode currently requires one sequence per request",
+            );
+        }
+        let admission = match self.late_decode_admission.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return error::create_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "pd_admission_full",
+                    "Late Decode admission limit reached",
+                )
+            }
+        };
+        // Availability check is not selection or reservation: no D is pinned.
+        if self
+            .late_candidates(context.model_id, crate::core::WorkerType::Decode)
+            .is_empty()
+        {
+            return error::create_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_decode_worker",
+                "No healthy Decode workers",
+            );
+        }
+        let candidates = self.late_candidates(
+            context.model_id,
+            crate::core::WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        let policy = self.policy_registry.get_prefill_policy();
+        let info = crate::policies::SelectWorkerInfo {
+            request_text: context.request_text.as_deref(),
+            tokens: None,
+            headers,
+            hash_ring: context
+                .model_id
+                .and_then(|m| self.worker_registry.get_hash_ring(m)),
+        };
+        let Some(index) = policy.select_worker(&candidates, &info).await else {
+            return error::create_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_prefill_worker",
+                "No healthy Prefill worker",
+            );
+        };
+        let Some(prefill) = candidates.get(index).cloned() else {
+            return error::internal_error(
+                "invalid_prefill_selection",
+                "Prefill policy returned an invalid candidate",
+            );
+        };
+        let prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
+        // Non-chunked P injection has no D fields. Recreate the pair context
+        // with the real D only after P returns; never dispatch this placeholder.
+        let prepare_ctx = match self
+            .adapter
+            .prepare_pair(prefill.as_ref(), prefill.as_ref())
+        {
+            Ok(ctx) => ctx,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
+        let mut prefill_request_json = decode_request_json.clone();
+        if let Err(e) = self
+            .adapter
+            .inject_prefill_fields(&mut prefill_request_json, &prepare_ctx)
+        {
+            return Self::handle_serialization_error(e);
+        }
+        let prefill_post = match self
+            .build_worker_post_with_headers(
+                &self.client,
+                prefill.as_ref(),
+                context.route,
+                prefill_request_json,
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(req) => req,
+            Err(resp) => return resp,
+        };
+        let correlation_for_log = self
+            .adapter
+            .correlation_id(&prepare_ctx)
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let prefill_result = self.send_worker(prefill_post, prefill.clone()).await;
+        let prefill_resp = match prefill_result {
+            Ok(r) => r,
+            Err(e) => {
+                error!(
+                    "ATOM prefill {} request_id={} failed: {}",
+                    prefill.url(),
+                    correlation_for_log,
+                    e
+                );
+
+                return error::bad_gateway(
+                    "prefill_server_error",
+                    format!("Prefill server error: {}", e),
+                );
+            }
+        };
+
+        let prefill_status = prefill_resp.status();
+
+        if !prefill_status.is_success() {
+            let body_text = prefill_resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            error!(
+                "ATOM prefill {} request_id={} status={} body={}",
+                prefill.url(),
+                correlation_for_log,
+                prefill_status,
+                body_text
+            );
+            let code = StatusCode::from_u16(prefill_status.as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return error::create_error(
+                code,
+                "prefill_error",
+                format!("Prefill server error ({}): {}", prefill_status, body_text),
+            );
+        }
+
+        let prefill_body: Value = match prefill_resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                error!(
+                    "ATOM prefill {} request_id={} response parse failed: {}",
+                    prefill.url(),
+                    correlation_for_log,
+                    e
+                );
+                return error::bad_gateway(
+                    "prefill_parse_error",
+                    format!("Prefill response parse error: {}", e),
+                );
+            }
+        };
+
+        // P has completed its work; D's output stream must not keep P loaded.
+        drop(prefill_guard);
+
+        let mut kv_params = match prefill_body.get("kv_transfer_params").cloned() {
+            Some(v) => v,
+            None => {
+                error!(
+                    "ATOM prefill {} request_id={} response missing kv_transfer_params",
+                    prefill.url(),
+                    correlation_for_log
+                );
+                return error::bad_gateway(
+                    "prefill_missing_kv_transfer_params",
+                    "Prefill response missing kv_transfer_params",
+                );
+            }
+        };
+
+        // The returned token IDs/usage describe the actual formatted prompt.
+        let prompt_tokens = prefill_body
+            .get("prompt_token_ids")
+            .and_then(Value::as_array)
+            .map(|ids| ids.len() as u64)
+            .or_else(|| {
+                prefill_body
+                    .pointer("/usage/prompt_tokens")
+                    .and_then(Value::as_u64)
+            });
+        let Some(prompt_tokens) = prompt_tokens else {
+            return error::bad_gateway(
+                "prefill_missing_token_count",
+                "Prefill must return prompt token IDs or usage for Decode placement",
+            );
+        };
+        let output_budget = decode_request_json
+            .get("max_completion_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                decode_request_json
+                    .get("max_tokens")
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(0);
+        let candidates = self.late_candidates(context.model_id, crate::core::WorkerType::Decode);
+        let Some((decode, reservation)) = self.late_decode.as_ref().expect("late mode").reserve(
+            &candidates,
+            prompt_tokens,
+            output_budget,
+        ) else {
+            return error::create_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_decode_worker",
+                "No healthy Decode worker at handoff",
+            );
+        };
+        let decode_guard = WorkerLoadGuard::new(decode.clone(), headers);
+        let ctx = match self.adapter.prepare_pair(prefill.as_ref(), decode.as_ref()) {
+            Ok(ctx) => ctx,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
+        if let Err(e) = self
+            .adapter
+            .inject_decode_fields(&mut decode_request_json, &ctx)
+        {
+            return Self::handle_serialization_error(e);
+        }
+        events::RequestPDSentEvent {
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
+        }
+        .emit();
+
+        let atom_adapter = match self.atom_adapter.as_ref() {
+            Some(a) => a,
+            None => {
+                error!("atom_adapter is None but backend == Atom — programming error");
+                return error::internal_error(
+                    "atom_adapter_missing",
+                    "Internal: ATOM adapter not initialized",
+                );
+            }
+        };
+        if let Err(e) = atom_adapter.enrich_decode_kv(&mut kv_params, &ctx) {
+            error!(
+                "ATOM enrich_decode_kv failed for prefill {} request_id={}: {}",
+                prefill.url(),
+                correlation_for_log,
+                e
+            );
+            return error::internal_error(
+                "enrich_decode_kv_failed",
+                format!("Failed to enrich decode kv: {}", e),
+            );
+        }
+        let carried_ids = AtomAdapter::carry_prompt_token_ids(&prefill_body, &mut kv_params);
+        debug!(
+            "ATOM PD request_id={} carried {} prompt token ids to decode {}",
+            correlation_for_log,
+            carried_ids,
+            decode.url()
+        );
+
+        let decode_obj = match decode_request_json.as_object_mut() {
+            Some(o) => o,
+            None => {
+                return error::internal_error(
+                    "decode_body_not_object",
+                    "Decode request body must be a JSON object",
+                );
+            }
+        };
+        decode_obj.insert("kv_transfer_params".to_string(), kv_params);
+
+        let decode_post = match self
+            .build_worker_post_with_headers(
+                &self.client,
+                decode.as_ref(),
+                context.route,
+                decode_request_json,
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(req) => req,
+            Err(resp) => return resp,
+        };
+        let decode_result = self.send_worker(decode_post, decode.clone()).await;
+        events::RequestReceivedEvent {}.emit();
+
+        let res = match decode_result {
+            Ok(r) => r,
+            Err(e) => {
+                error!(
+                    decode_url = %decode.url(),
+                    error = %e,
+                    "ATOM decode request failed"
+                );
+
+                return error::bad_gateway(
+                    "decode_server_error",
+                    format!("Decode server error: {}", e),
+                );
+            }
+        };
+
+        let response = self
+            .finish_atom_decode_response(res, context, decode, decode_guard)
+            .await;
+        crate::core::AttachedBody::wrap_response(response, (reservation, admission))
     }
 
     async fn dispatch_atom_chunked_internal(
@@ -2457,6 +2819,8 @@ mod tests {
             planner,
             adapter,
             atom_adapter: None,
+            late_decode: None,
+            late_decode_admission: Arc::new(tokio::sync::Semaphore::new(2048)),
         }
     }
 

@@ -50,6 +50,14 @@ impl std::str::FromStr for AtomPdRankMappingPolicy {
     }
 }
 
+/// Decode placement uses reservations, not scheduler running counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AtomDecodeBalancePolicy {
+    #[default]
+    RequestCount,
+}
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -65,6 +73,14 @@ pub struct RouterConfig {
     pub atom_standalone: bool,
     #[serde(default)]
     pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
+    /// Select P services in the router, and let ATOM select their internal DP rank.
+    #[serde(default)]
+    pub atom_pd_prefill_backend_routing: bool,
+    /// Experimental ATOM non-chunked late Decode selection. Disabled by default.
+    #[serde(default)]
+    pub atom_pd_late_decode: bool,
+    #[serde(default)]
+    pub atom_pd_decode_balance: AtomDecodeBalancePolicy,
 
     pub policy: PolicyConfig,
     pub host: String,
@@ -405,6 +421,9 @@ impl Default for RouterConfig {
             connection_mode: ConnectionMode::Http,
             atom_standalone: false,
             atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
+            atom_pd_prefill_backend_routing: false,
+            atom_pd_late_decode: false,
+            atom_pd_decode_balance: AtomDecodeBalancePolicy::RequestCount,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,

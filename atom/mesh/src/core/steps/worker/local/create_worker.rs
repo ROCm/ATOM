@@ -113,6 +113,15 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
             );
         }
 
+        if app_context.router_config.atom_pd_prefill_backend_routing
+            && matches!(worker_type, WorkerType::Prefill { .. })
+            && !config.dp_aware
+        {
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("create_worker"),
+                message: "Backend-routed P services require DP discovery".into(),
+            });
+        }
         // Create workers - always output as Vec for unified downstream handling
         let workers = if config.dp_aware {
             create_dp_aware_workers(
@@ -241,15 +250,26 @@ fn create_dp_aware_workers(
         .as_ref()
         .ok_or_else(|| WorkflowError::ContextValueNotFound("dp_info".to_string()))?;
 
+    let backend_routing = matches!(worker_type, WorkerType::Prefill { .. })
+        && data
+            .app_context
+            .as_ref()
+            .is_some_and(|ctx| ctx.router_config.atom_pd_prefill_backend_routing);
+    let count = if backend_routing { 1 } else { dp_info.dp_size };
+    if dp_info.dp_size == 0 {
+        return Err(WorkflowError::ContextValueNotFound(
+            "dp_size must be positive".into(),
+        ));
+    }
     debug!(
-        "Creating {} DP-aware workers for {} (dp_size: {})",
-        dp_info.dp_size, normalized_url, dp_info.dp_size
+        "Creating {} workers for {} (dp_size: {}, backend_routing: {})",
+        count, normalized_url, dp_info.dp_size, backend_routing
     );
-
-    let mut workers = Vec::with_capacity(dp_info.dp_size);
-    for rank in 0..dp_info.dp_size {
+    let mut workers = Vec::with_capacity(count);
+    for rank in 0..count {
         let mut builder =
             DPAwareWorkerBuilder::new(normalized_url.to_string(), rank, dp_info.dp_size)
+                .backend_rank_selection(backend_routing)
                 .model_id(model_id)
                 .worker_type(worker_type.clone())
                 .connection_mode(connection_mode.clone())
@@ -282,12 +302,13 @@ fn create_dp_aware_workers(
         } else {
             worker.set_healthy(false);
         }
-        workers.push(worker);
-
         debug!(
-            "Created DP-aware worker {}@{}/{} ({:?})",
-            normalized_url, rank, dp_info.dp_size, connection_mode
+            "Created DP-aware worker {} (dp_size: {}, {:?})",
+            worker.url(),
+            dp_info.dp_size,
+            connection_mode
         );
+        workers.push(worker);
     }
 
     Ok(workers)
@@ -349,4 +370,65 @@ fn create_single_worker(
     );
 
     vec![worker]
+}
+
+#[cfg(test)]
+mod backend_routing_tests {
+    use super::*;
+    use crate::config::{BackendType, RouterConfig, RoutingMode};
+    use crate::core::steps::worker::local::{create_local_worker_workflow_data, DpInfo};
+
+    #[tokio::test]
+    async fn backend_prefill_discovery_registers_one_service_but_all_decode_ranks() {
+        let mut router = RouterConfig::default();
+        router.backend = BackendType::Atom;
+        router.dp_aware = true;
+        router.atom_pd_prefill_backend_routing = true;
+        router.mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let app = Arc::new(AppContext::from_config(router, 5).await.unwrap());
+        let config: WorkerConfigRequest =
+            serde_json::from_value(serde_json::json!({"url":"http://p:80","dp_aware":true}))
+                .unwrap();
+        let mut data = create_local_worker_workflow_data(config.clone(), app.clone());
+        data.dp_info = Some(DpInfo {
+            dp_size: 4,
+            model_id: "model".into(),
+        });
+        for role in [
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            WorkerType::Decode,
+        ] {
+            let workers = create_dp_aware_workers(
+                &data,
+                "http://p:80",
+                "model",
+                role.clone(),
+                &ConnectionMode::Http,
+                RuntimeType::Sglang,
+                build_circuit_breaker_config(&app),
+                HealthConfig::default(),
+                &config,
+                &HashMap::new(),
+            )
+            .unwrap();
+            if matches!(role, WorkerType::Prefill { .. }) {
+                assert_eq!(workers.len(), 1);
+                assert_eq!(workers[0].url(), "http://p:80");
+                assert_eq!(workers[0].dp_rank(), None);
+                assert_eq!(workers[0].dp_size(), Some(4));
+            } else {
+                assert_eq!(workers.len(), 4);
+                for (rank, w) in workers.iter().enumerate() {
+                    assert_eq!(w.dp_rank(), Some(rank));
+                }
+            }
+        }
+    }
 }
