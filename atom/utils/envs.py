@@ -1411,6 +1411,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MTP_DRAFT_PRESENCE_PENALTY": lambda: _flag_env(
         "ATOM_MTP_DRAFT_PRESENCE_PENALTY", "0"
     ),
+    # The MTP draft passes' LM head from a 128x128-block FP8 (e8m0 scales) copy of
+    # the head (TP1): half the bytes a pass. The verify rows keep the bf16 head, so
+    # only how often drafts are accepted can change, not the output distribution.
+    "ATOM_MTP_DRAFT_LM_HEAD_FP8": lambda: _flag_env("ATOM_MTP_DRAFT_LM_HEAD_FP8", "0"),
     # With ATOM_MTP_FUSED_DRAFT_GLUE: skip the per-pass kv_indices generation
     # where no draft attention reads kv_indices (page sizes other than 256 / 1024,
     # whose persistent ASM decode is its only reader). kv_indptr is still written.

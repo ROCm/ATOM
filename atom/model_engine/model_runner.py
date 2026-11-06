@@ -958,6 +958,8 @@ class ModelRunner:
             self.drafter.load_model(self.model)
             if envs.ATOM_MTP_DRAFT_PRESENCE_PENALTY:
                 self._install_draft_presence_penalty()
+            if envs.ATOM_MTP_DRAFT_LM_HEAD_FP8:
+                self._install_draft_lm_head_fp8()
             # A block drafter's width reads the loaded draft model's window.
             self.tokenID_processor.draft_tokens_per_seq = (
                 self.drafter.draft_tokens_per_seq
@@ -3402,6 +3404,31 @@ class ModelRunner:
                 vocab, self.config.max_num_seqs, max_extra=8, device=self.device
             )
         return self._presence_state
+
+    def _install_draft_lm_head_fp8(self) -> None:
+        """ATOM_MTP_DRAFT_LM_HEAD_FP8: the draft passes' logits from an FP8 copy of
+        the draft LM head (`draft_lm_head_fp8.DraftLMHeadFP8`); TP1 heads only."""
+        from atom.model_ops.draft_lm_head_fp8 import DraftLMHeadFP8
+
+        drafter = getattr(self, "drafter", None)
+        head = getattr(getattr(drafter, "model", None), "lm_head", None)
+        if head is None or not hasattr(head, "compute_argmax_token"):
+            logger.warning(
+                "ATOM_MTP_DRAFT_LM_HEAD_FP8: no MTP draft LM head; not applied"
+            )
+            return
+        if getattr(head, "tp_size", 1) != 1 or head.bias is not None:
+            logger.warning(
+                "ATOM_MTP_DRAFT_LM_HEAD_FP8: TP %d / biased draft LM head; not applied",
+                getattr(head, "tp_size", 1),
+            )
+            return
+        head.draft_fp8 = DraftLMHeadFP8(head.weight.data)
+        logger.info(
+            "ATOM_MTP_DRAFT_LM_HEAD_FP8: draft logits from a %s FP8 copy (scales %s)",
+            tuple(head.draft_fp8.weight.shape),
+            tuple(head.draft_fp8.weight_scale.shape),
+        )
 
     def _install_draft_presence_penalty(self) -> None:
         """ATOM_MTP_DRAFT_PRESENCE_PENALTY: the draft LM head penalizes its argmax

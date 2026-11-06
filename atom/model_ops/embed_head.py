@@ -423,19 +423,22 @@ class ParallelLMHead(VocabParallelEmbedding):
         assert (
             out.dtype == torch.int32 and out.device == x.device
         ), "argmax out must be an int32 tensor on the input device"
-        # ATOM_MTP_DRAFT_PRESENCE_PENALTY: a draft pass's argmax over the logits
-        # its verify row's penalty would leave, so the logits must be written.
+        # Draft passes only: ATOM_MTP_DRAFT_PRESENCE_PENALTY (the argmax over the
+        # logits its verify row's penalty would leave) and ATOM_MTP_DRAFT_LM_HEAD_FP8
+        # (the logits from the FP8 copy of this head). Either needs written logits.
         draft_presence = getattr(self, "draft_presence", None)
-        if draft_presence is not None and not getattr(
+        draft_fp8 = getattr(self, "draft_fp8", None)
+        if (draft_presence is not None or draft_fp8 is not None) and not getattr(
             get_forward_context().context, "is_draft", False
         ):
-            draft_presence = None
+            draft_presence = draft_fp8 = None
+        draft_options_off = draft_presence is None and draft_fp8 is None
         # Pure-DP draft: shard the vocab across the DP group instead of a
         # replicated full-vocab GEMM. Skip plugin mode -- its caller decides the
         # collective count per chunk (a mismatch would deadlock DP) -- and skip
         # the context lookup entirely when the env is off.
         if (
-            draft_presence is None
+            draft_options_off
             and envs.ATOM_DP_DRAFT_ARGMAX
             and not is_plugin_mode()
             and self._can_use_dp_sharded_argmax(get_forward_context().context)
@@ -443,7 +446,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             return out.copy_(self._dp_sharded_logits(x, "argmax"))
         exchange = getattr(self, "_argmax_exchange", None)
         if (
-            draft_presence is None
+            draft_options_off
             and exchange is not None
             and out.is_contiguous()
             and self._argmax_epilogue_serves(x)
@@ -461,7 +464,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             argmax_exchange_pick(keys, self.vocab_start_idx, out.view(-1), *exchange)
             return out
         if (
-            draft_presence is None
+            draft_options_off
             and envs.ATOM_LM_HEAD_ARGMAX_EPILOGUE
             and self.tp_size > 1
             and envs.ATOM_ARGMAX_HEAD_AR_GATHER
@@ -478,7 +481,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             units = tensor_model_parallel_all_reduce(units)
             lm_head_argmax_pick(units, self.tp_size, out.view(-1))
             return out
-        logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
+        if draft_fp8 is not None:
+            logits = draft_fp8.mm(x)  # [N, vocab], TP1 only
+        else:
+            logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
         if self.tp_size <= 1:
             # `output_idx=out` rather than a returned tensor: a draft pass is
             # recorded, and a capture bakes the address the answer lands at.
@@ -508,8 +514,8 @@ class ParallelLMHead(VocabParallelEmbedding):
                 draft_presence.record(out)
             return out
         assert (
-            draft_presence is None
-        ), "ATOM_MTP_DRAFT_PRESENCE_PENALTY penalizes the TP1 LM head's argmax only"
+            draft_options_off
+        ), "ATOM_MTP_DRAFT_PRESENCE_PENALTY / _LM_HEAD_FP8 serve the TP1 LM head only"
         if envs.ATOM_ARGMAX_HEAD_AR_GATHER and out.is_contiguous():
             # The packs' all-gather as an exact all-reduce of their byte images
             # (lm_head_argmax.py): the plain all-reduce is the cheaper collective
