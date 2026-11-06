@@ -33,7 +33,7 @@ except ModuleNotFoundError:
     _torch_stub = types.ModuleType("torch")
     sys.modules["torch"] = _torch_stub
 
-from conftest import MockConfig
+from conftest import MockConfig, atom_config_double
 
 from atom.kv_transfer.disaggregation import (
     ConnectorCompletion,
@@ -49,7 +49,10 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
-from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.kv_transfer.offload._offload_common import (
+    OffloadSchedulerMixin,
+    tier_token_ids,
+)
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
@@ -84,6 +87,7 @@ from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
+    LoadSpec,
     SlotLoadSpec,
     SlotSaveSpec,
 )
@@ -2820,9 +2824,9 @@ def test_sidecar_hashes_are_computed_once_per_sequence_lifecycle(monkeypatch):
     calls = []
     original = _chained_prefix_hashes
 
-    def counted(token_ids, hash_block_size):
+    def counted(token_ids, hash_block_size, **kwargs):
         calls.append(len(token_ids) // hash_block_size)
-        return original(token_ids, hash_block_size)
+        return original(token_ids, hash_block_size, **kwargs)
 
     monkeypatch.setattr(
         "atom.kv_transfer.offload.hybrid.dsv4.connector._chained_prefix_hashes",
@@ -5672,6 +5676,73 @@ def test_engine_id_defaults_to_replica_zero():
     assert offcfg.lmcache_engine_id(SimpleNamespace()) == "atom-offload-dp0"
 
 
+def _server_config(base_port, dp_rank: int = 0, **kw):
+    cfg = _dp_config(dp_rank, **kw)
+    cfg.parallel_config.data_parallel_base_port = base_port
+    # `--port`: every default launch leaves it at 8006, so it must not matter.
+    cfg.port = 8006
+    return cfg
+
+
+def test_engine_id_splits_servers_on_one_host_and_their_replicas():
+    # One TP1 server per GPU: every one is DP rank 0 under one host directory.
+    same = {
+        offcfg.lmcache_engine_id(
+            _server_config(41000, 3, pp_size=2, tp_size=4, pp_rank=pp)
+        )
+        for pp in range(2)
+    }
+    assert same == {"atom-offload-r41000-dp3"}
+    servers = [_server_config(41000 + gpu) for gpu in range(8)]
+    replicas = [_server_config(41000, rank) for rank in range(1, 8)]
+    ids = {offcfg.lmcache_engine_id(cfg) for cfg in servers + replicas}
+    assert len(ids) == 15
+
+
+@pytest.mark.parametrize("base_port", [0, None])
+def test_engine_id_ignores_an_unresolved_port(base_port):
+    assert offcfg.lmcache_engine_id(_server_config(base_port)) == "atom-offload-dp0"
+
+
+def test_two_default_tp1_servers_on_one_host_get_distinct_engine_ids(monkeypatch):
+    """No --port, no --data-parallel-base-port: each `CoreManager` resolves a
+    port before spawning, and every process of one server copies it."""
+    import copy
+
+    from atom.config import ParallelConfig
+    from atom.model_engine.engine_core_mgr import CoreManager
+
+    for name in ("ATOM_DP_BASE_PORT", "ATOM_DP_RANK", "ATOM_DP_SIZE"):
+        monkeypatch.delenv(name, raising=False)
+    managers, ids = [], []
+    try:
+        for _ in range(2):
+            manager = CoreManager.__new__(CoreManager)
+            manager._init_shared_state(
+                atom_config_double(dp_load_balance="round_robin"),
+                label="test",
+                local_engine_count=0,
+            )
+            managers.append(manager)
+            config = atom_config_double(
+                port=8006,
+                pipeline_parallel_size=1,
+                tensor_parallel_size=1,
+                parallel_config=ParallelConfig(),
+            )
+            assert offcfg.lmcache_engine_id(config) == "atom-offload-dp0"
+            manager._start_distributed_store(config)
+            engine = copy.deepcopy(config)
+            assert offcfg.lmcache_engine_id(engine) == offcfg.lmcache_engine_id(config)
+            ids.append(offcfg.lmcache_engine_id(engine))
+    finally:
+        for manager in managers:
+            manager.close()
+            manager.ctx.term()
+    assert ids[0] != ids[1]
+    assert all(i.startswith("atom-offload-r") and i.endswith("-dp0") for i in ids)
+
+
 def test_replica_world_size_counts_pp_and_tp_but_not_dp():
     # Worker ids index the replica-local PP x TP grid. Folding DP in would push
     # every replica but the first past lookup_server_worker_ids=[0], leaving
@@ -5940,6 +6011,119 @@ def test_a_joint_load_clamps_the_kv_leg_to_the_covering_chunk():
     assert (ok, reason) == (True, "joint_state_and_kv")
     assert (hbm, lmc, need) == (512, 1024, 512)
     assert ls.lmcache_cached_tokens == 1024
+
+
+def _offload_scheduler(monkeypatch, hf_config, *, chunk):
+    """The in-process scheduler the layout selection builds for `hf_config`."""
+    from atom.kv_transfer.offload.connector import _build_scheduler
+
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _config=None: SimpleNamespace(chunk_size=chunk),
+    )
+    monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
+    return _build_scheduler(
+        SimpleNamespace(
+            hf_config=hf_config,
+            kv_transfer_config={"kv_role": "offload"},
+            kv_cache_block_size=64,
+            decode_context_parallel_size=1,
+            tensor_parallel_size=1,
+        )
+    )
+
+
+def _text_wrapped(model_type: str, text_type: str):
+    return SimpleNamespace(
+        model_type=model_type,
+        text_config=SimpleNamespace(model_type=text_type, num_attention_heads=16),
+    )
+
+
+@pytest.mark.parametrize(
+    "hf_config,scheduler_cls",
+    [
+        pytest.param(
+            SimpleNamespace(model_type="kimi_linear"),
+            KimiK3OffloadScheduler,
+            id="kimi-k3",
+        ),
+        pytest.param(
+            SimpleNamespace(model_type="qwen3_next"),
+            QwenOffloadScheduler,
+            id="qwen3-next",
+        ),
+        pytest.param(
+            _text_wrapped("qwen3_5_moe", "qwen3_5_moe_text"),
+            QwenOffloadScheduler,
+            id="qwen3.5",
+        ),
+    ],
+)
+def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(
+    monkeypatch, hf_config, scheduler_cls
+):
+    """A chunk-aligned prompt resent whole with HBM empty. Withholding the last
+    token would floor the KV leg to 512, under the 704 rung the prompt kept,
+    so the hit stays whole when a boundary lands in that last chunk."""
+    sched = _offload_scheduler(monkeypatch, hf_config, chunk=256)
+    assert type(sched) is scheduler_cls
+    sched._min_load_tokens = 0
+    sched._lookup_client = _LookupClient(hit=768)
+    asked = []
+    joint = {7: 704, 9: 448, 10: 0}
+    sched.bind_block_manager(
+        SimpleNamespace(
+            joint_boundary_tokens=lambda seq, tokens: (
+                asked.append((seq.id, tokens)) or joint[seq.id]
+            )
+        )
+    )
+
+    def stateful(request_id):
+        return SimpleNamespace(
+            id=request_id,
+            num_prompt_tokens=768,
+            token_ids=list(range(768)),
+            num_cached_tokens=0,
+            has_per_req_cache=True,
+            offload_joint=OffloadJointRecord(),
+        )
+
+    # A boundary at or below the withheld floor, or none: withholding loses
+    # nothing, and the hit reports no more than a boundary can back.
+    for request_id in (9, 10):
+        assert sched.get_num_new_matched_tokens(stateful(request_id)) == (512, True)
+
+    hybrid = stateful(7)
+    assert sched.get_num_new_matched_tokens(hybrid) == (768, True)
+    assert asked == [(9, 768), (10, 768), (7, 768)]
+    ls = sched._load_specs["7"]
+    assert ls.lmcache_cached_tokens == 768
+
+    # The whole-prompt hit is not a claim: with no boundary formed nothing
+    # loads, so the request recomputes rather than skipping its prompt.
+    refused = sched._decide_load_after_alloc(hybrid, SimpleNamespace(**vars(ls)))
+    assert refused[:2] == (False, "per_req_cache_state_boundary")
+
+    # `_joint_kv_boundary` puts the boundary on the 704 rung and aims the KV
+    # leg at the chunk covering it; the claim stops at the boundary.
+    hybrid.offload_joint = OffloadJointRecord(boundary_tokens=704, kv_tokens=768)
+    ok, reason, start, lmc, _, _ = sched._decide_load_after_alloc(hybrid, ls)
+    assert (ok, reason, start, lmc) == (True, "joint_state_and_kv", 0, 768)
+    assert sched._claim_after_load(hybrid, 0, 768) == 704
+
+    # A request without per-request state claims what it loads, so it still
+    # leaves a token to compute: 768 -> 767 -> 512.
+    dense = SimpleNamespace(
+        id=8,
+        num_prompt_tokens=768,
+        token_ids=list(range(768)),
+        num_cached_tokens=0,
+        has_per_req_cache=False,
+    )
+    assert sched.get_num_new_matched_tokens(dense) == (512, True)
 
 
 def test_the_kv_leg_starts_where_the_claim_ended_not_where_the_hit_did():
@@ -7335,3 +7519,138 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             assert tier.take_store_reports() == (set(), {op})
         finally:
             tier.shutdown()
+
+
+# -- multimodal prompts: LMCache chunk keys carry the media identity ---------
+
+_MEDIA_CHUNK = 256
+_MEDIA_PROMPT = 3 * _MEDIA_CHUNK
+
+
+def _media_seq(sid, cache_seed, tokens=None):
+    tokens = list(range(100, 100 + _MEDIA_PROMPT)) if tokens is None else tokens
+    return SimpleNamespace(
+        id=sid,
+        token_ids=tokens,
+        num_prompt_tokens=len(tokens),
+        num_tokens=len(tokens),
+        cache_seed=cache_seed,
+        block_table=list(range(len(tokens) // 64)),
+    )
+
+
+@pytest.fixture
+def media_scheduler(monkeypatch):
+    return _offload_scheduler(
+        monkeypatch,
+        _text_wrapped("qwen3_5_moe", "qwen3_5_moe_text"),
+        chunk=_MEDIA_CHUNK,
+    )
+
+
+@pytest.mark.parametrize("cache_seed", [11, -1])
+def test_lookup_save_and_load_all_key_by_tier_token_ids(media_scheduler, cache_seed):
+    """One key per request: an image's KV is found only by the same image."""
+    seq = _media_seq("A", cache_seed)
+    keyed = tier_token_ids(seq, _MEDIA_PROMPT)
+    assert media_scheduler._lookup_token_ids(seq) == keyed
+    save = media_scheduler._build_save_request(
+        seq, 0, _MEDIA_PROMPT, SimpleNamespace(), list(seq.block_table), True
+    )
+    assert save.token_ids == keyed
+    load = media_scheduler._build_load_request(
+        seq,
+        LoadSpec(hbm_cached_tokens=0, lmcache_cached_tokens=_MEDIA_PROMPT),
+        SimpleNamespace(),
+        _MEDIA_PROMPT,
+    )
+    assert load.token_ids == keyed
+    # A text prompt keys on its ids alone.
+    assert (keyed == seq.token_ids) is (cache_seed == -1)
+
+
+def test_media_keys_touch_only_the_leading_ids_and_keep_prefixes():
+    seq = _media_seq("A", 11)
+    keyed = tier_token_ids(seq, _MEDIA_PROMPT)
+    assert keyed[4:] == seq.token_ids[4:]
+    assert all(1 << 31 <= t < 1 << 32 for t in keyed[:4])
+    for end in (1, 3, 4, _MEDIA_CHUNK, _MEDIA_PROMPT - 1):
+        assert tier_token_ids(seq, end) == keyed[:end]
+    assert tier_token_ids(_media_seq("B", 22), _MEDIA_PROMPT)[:4] != keyed[:4]
+    other_text = _media_seq("A", 11, [7] + seq.token_ids[1:])
+    assert tier_token_ids(other_text, _MEDIA_PROMPT)[0] != keyed[0]
+    assert seq.token_ids[0] == 100  # the request's own ids are untouched
+
+
+def test_lmcache_mp_native_state_lookup_is_keyed_the_same_way():
+    from atom.kv_transfer.offload.mp.native_state_scheduler import (
+        NativeStateLMCacheMPConnectorScheduler,
+    )
+
+    lookup = NativeStateLMCacheMPConnectorScheduler._lookup_token_ids
+    stub = SimpleNamespace(_chunk_floor=lambda t: t // _MEDIA_CHUNK * _MEDIA_CHUNK)
+    end = _MEDIA_PROMPT - _MEDIA_CHUNK
+    for seed in (11, -1):
+        seq = _media_seq("A", seed)
+        assert lookup(stub, seq) == tier_token_ids(seq, end)
+    assert lookup(stub, seq) == seq.token_ids[:end]
+
+
+def test_dsv4_lookup_is_keyed_the_same_way():
+    asked = []
+    sched = _stateful_scheduler(hit=0)
+    sched._lookup_client = SimpleNamespace(
+        lookup=lambda ids, lookup_id: asked.append(ids) or 0
+    )
+    for seed in (11, -1):
+        seq = _media_seq(seed + 100, seed)
+        sched._fresh_tier_lookup(seq, str(seq.id))
+        assert asked[-1] == tier_token_ids(seq, _MEDIA_PROMPT)
+    assert asked[-1] == list(seq.token_ids)
+
+
+@pytest.mark.parametrize("cache_seed", [11, -1])
+def test_a_dsv4_save_keys_its_pages_and_slot_by_the_media(cache_seed):
+    """The PAGE key carries the media, and the SLOT boundary hash is the one
+    `BlockManager` chains from the same `cache_seed`."""
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=730, num_prompt_tokens=16_384, num_cached_tokens=8192, group=2
+    )
+    seq.cache_seed = cache_seed
+    sched._save_tracker["730"] = [seq, 0]
+
+    request = sched.build_connector_meta().requests[0]
+
+    assert request.token_ids == tier_token_ids(seq, 8192)
+    parent = cache_seed
+    for start in range(0, 8192, 256):
+        parent = BlockManager.compute_hash(seq.token_ids[start : start + 256], parent)
+    assert request.slot_save_spec.boundary_block_hash == parent
+
+
+@pytest.mark.parametrize("cache_seed", [11, -1])
+def test_a_dsv4_load_keys_its_pages_by_the_media(cache_seed):
+    """The load names the PAGE KV with the media-keyed ids the save stored it
+    under, so a prompt with other images never reads this one's chunks."""
+    sched = _scheduler()
+    sched.kv_role = "kv_consumer"
+    sched._do_save = False
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = SimpleNamespace(
+        id=737,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+        has_per_req_cache=False,
+        cache_seed=cache_seed,
+    )
+
+    assert sched.get_num_new_matched_tokens(seq) == (12, True)
+    sched.update_state_after_alloc(seq)
+    [load] = [r for r in sched.build_connector_meta().requests if r.load_spec]
+
+    assert load.load_spec.lmcache_cached_tokens == 12
+    assert load.token_ids == tier_token_ids(seq, 12)
+    assert (load.token_ids == seq.token_ids[:12]) is (cache_seed == -1)

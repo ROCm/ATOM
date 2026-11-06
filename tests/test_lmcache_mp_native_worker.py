@@ -631,6 +631,40 @@ def test_native_restore_reports_success_and_returns_its_slot(worker, cuda):
     assert worker._native_loads == {}
 
 
+def test_restore_deadline_counts_from_the_restore_not_the_retrieve(
+    worker, cuda, monkeypatch
+):
+    """The host may first poll a retrieve long after submitting it. The
+    retrieve is terminal by then and its restore only just enqueued: the
+    deadline bounds the restore from there, and still stops the engine if that
+    copy never completes."""
+    from atom.kv_transfer.offload.mp import transfer
+
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker._restore_descriptor_slots = [3]
+    worker._native_copy = lambda stores, restores, descriptor_slot=0: None
+    req = request(loading=True)
+    worker._submit_load(req, object())
+
+    now[0] += worker._transfer_deadline_s + 5
+    worker.future.value, worker.future.ready = True, True
+    first = worker.get_finished()
+    assert not first.finished_loading and not first.failed_loading
+    assert len(worker._native_loads) == 1
+
+    now[0] += worker._transfer_deadline_s - 1
+    assert not worker.get_finished().finished_loading
+    now[0] += 2
+    with pytest.raises(transfer.LMCacheTransferUnprovable):
+        worker.get_finished()
+    assert worker._restore_descriptor_slots == []
+
+    cuda.events[-1].done = True
+    assert worker.get_finished().finished_loading == {req.load_operation}
+    assert worker._restore_descriptor_slots == [3]
+
+
 def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
     """Pinned staging allocation synchronizes; the restore slots are reserved
     while registering, not on the connector thread mid-serving."""

@@ -2,6 +2,7 @@
 
 """Native-state MP admission and PAGE-image lifetime contracts."""
 
+import re
 from collections import deque
 from types import SimpleNamespace
 from weakref import WeakKeyDictionary
@@ -121,7 +122,9 @@ def make_scheduler(
         enable_prefix_caching=True,
         hash_block_size=4,
         compute_hash=BlockManager.compute_hash,
+        anchor_grids=[],
     )
+    manager.align_checkpoint_anchor = manager.anchor_grids.append
     # BlockManager's own chain walk (seed, algorithm, token slices).
     manager._hash_block_tokens = lambda seq, index: BlockManager._hash_block_tokens(
         manager, seq, index
@@ -307,6 +310,12 @@ def test_save_frontier_rescans_only_when_frontier_or_checkpoints_change(
     assert len(calls) > rescanned
 
 
+def test_binding_puts_the_prompt_end_anchor_on_the_chunk_grid(monkeypatch):
+    """Images are stored only at a chunk boundary; the rebind is a no-op."""
+    scheduler, _, _ = make_scheduler(monkeypatch)
+    assert scheduler._block_manager.anchor_grids == [8]
+
+
 def test_default_min_save_tokens_skips_a_short_prompt(monkeypatch):
     scheduler, checkpoints, _ = make_scheduler(monkeypatch, min_save_tokens=None)
     seq = sequence(computed=24)
@@ -436,6 +445,73 @@ def test_a_transfer_that_reports_leaves_the_watchdog(monkeypatch):
     assert scheduler._transfer_seen_at == {}
     now[0] += scheduler._scheduler_deadline_s + 1
     scheduler.process_completions(KVConnectorOutput())
+
+
+def _dispatch_load(scheduler, request_id):
+    seq = sequence(request_id, computed=0, token_offset=100 * request_id)
+    scheduler.get_num_new_matched_tokens(seq)
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler.should_park_for_load_after_alloc(seq)
+    [request] = scheduler.build_connector_meta().requests
+    scheduler.process_completions(KVConnectorOutput())
+    return request.load_operation
+
+
+@pytest.mark.parametrize("finished", ["earlier", "later"])
+def test_a_load_queued_behind_a_finished_one_starts_its_bound_again(
+    monkeypatch, finished
+):
+    """The worker restores loads a few at a time, in order, between forwards,
+    so a burst on a cold server queues. A finished load restarts the bound of
+    the loads seen after it, and only of those: a load whose completion is
+    lost still stops the engine one bound after the loads ahead of it."""
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    scheduler, _, _ = make_scheduler(monkeypatch)
+    bound = scheduler._scheduler_deadline_s
+    first = _dispatch_load(scheduler, 1)
+    second = _dispatch_load(scheduler, 2)
+    done, waiting = (first, second) if finished == "earlier" else (second, first)
+
+    now[0] += bound - 5
+    scheduler.process_completions(KVConnectorOutput(finished_loading={done}))
+    now[0] += 10
+    if finished == "later":
+        with pytest.raises(
+            transfer.LMCacheTransferUnprovable, match=re.escape(str(waiting))
+        ):
+            scheduler.process_completions(KVConnectorOutput())
+        return
+    scheduler.process_completions(KVConnectorOutput())
+    now[0] += bound - 9
+    with pytest.raises(
+        transfer.LMCacheTransferUnprovable, match=re.escape(str(waiting))
+    ):
+        scheduler.process_completions(KVConnectorOutput())
+
+
+def test_loads_dispatched_together_restart_in_dispatch_order(monkeypatch):
+    """One step can dispatch many loads (a restart's first burst), and the
+    worker restores them in dispatch order, so each finished load restarts
+    every load dispatched after it, whatever their ids hash to."""
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    scheduler, _, _ = make_scheduler(monkeypatch)
+    bound = scheduler._scheduler_deadline_s
+    for request_id in range(1, 9):
+        seq = sequence(request_id, computed=0, token_offset=100 * request_id)
+        scheduler.get_num_new_matched_tokens(seq)
+        scheduler.update_state_after_alloc(seq)
+        assert scheduler.should_park_for_load_after_alloc(seq)
+    loads = [r.load_operation for r in scheduler.build_connector_meta().requests]
+    assert len(loads) == 8
+    scheduler.process_completions(KVConnectorOutput())
+
+    for done in loads[:-1]:
+        now[0] += bound - 1
+        scheduler.process_completions(KVConnectorOutput(finished_loading={done}))
+    now[0] += bound - 1
+    scheduler.process_completions(KVConnectorOutput(finished_loading={loads[-1]}))
 
 
 @pytest.mark.parametrize("prompt", [8, 16, 19, 24])
