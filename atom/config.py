@@ -955,6 +955,49 @@ def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
     return False
 
 
+def minimax_m3_prefill_token_graph_refusal(config: "Config") -> str | None:
+    """Why MiniMax-M3 prefill token graphs must stay off.
+
+    This is a performance feature, so every unsupported deployment falls back
+    to the existing eager-prefill path instead of failing startup. Keep this
+    gate narrower than MiniMax-M3's general model support until each topology
+    has its metadata, collective, and padding behavior covered independently.
+    """
+
+    hf_config = getattr(config, "hf_config", None)
+    if hf_config is None or not _is_minimax_m3_config(hf_config):
+        return "the active model is not MiniMax-M3"
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if not getattr(text_config, "sparse_attention_config", None):
+        return "MiniMax-M3 sparse-attention metadata is unavailable"
+
+    if getattr(config, "plugin_config", None) is not None:
+        return "plugin mode is unsupported; only native ATOM is enabled"
+
+    parallel = getattr(config, "parallel_config", None)
+    dp_size = int(getattr(parallel, "data_parallel_size", 1))
+    if dp_size != 1:
+        return f"data_parallel_size must be 1, got {dp_size}"
+
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1))
+    if pp_size != 1:
+        return f"pipeline_parallel_size must be 1, got {pp_size}"
+
+    pcp_size = int(getattr(config, "prefill_context_parallel_size", 1))
+    if pcp_size != 1:
+        return f"prefill_context_parallel_size must be 1, got {pcp_size}"
+
+    if bool(getattr(config, "enable_expert_parallel", False)):
+        return "expert parallelism is unsupported"
+
+    if bool(getattr(config, "enable_tbo", False)) or bool(
+        getattr(config, "enable_tbo_decode", False)
+    ):
+        return "TBO is active"
+
+    return None
+
+
 _MINIMAX_M3_MLP_LAYER_TYPES = {"dense": 0, "sparse": 1}
 
 

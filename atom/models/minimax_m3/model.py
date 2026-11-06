@@ -743,7 +743,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         return hidden_states + residual
 
 
-@token_graph
+@token_graph(per_phase=True)
 @support_torch_compile
 class MiniMaxM3Model(nn.Module):
     def __init__(

@@ -45,6 +45,7 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
+    "ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH",
 ]
 
 _PROFILER_DETAIL_VARS = [
@@ -154,6 +155,9 @@ class TestEnvsDefaults:
 
     def test_use_flydsl_fp8_prefill_attn_default(self):
         assert _get_envs().ATOM_USE_FLYDSL_FP8_PREFILL_ATTN is False
+
+    def test_minimax_m3_prefill_token_graph_default_disabled(self):
+        assert _get_envs().ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH is False
 
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
@@ -287,6 +291,10 @@ class TestEnvsOverrides:
     def test_atom_enable_gdn_decode_lossy_fast_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "1")
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is True
+
+    def test_minimax_m3_prefill_token_graph_is_explicitly_opt_in(self, monkeypatch):
+        monkeypatch.setenv("ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH", "1")
+        assert _get_envs().ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH is True
 
     def test_use_flydsl_gather_kv_b_proj_disabled(self, monkeypatch):
         # The interesting lever now that the default is on: "1" would pass even
