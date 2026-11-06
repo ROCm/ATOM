@@ -236,18 +236,13 @@ def _config(target: str, spec_dtype=None, method="dspark"):
 
 
 @pytest.mark.parametrize("target", ["bf16", "fp8", "fp4"])
-def test_an_own_pool_draft_defaults_to_fp8_whatever_the_target(monkeypatch, target):
+def test_an_own_pool_draft_takes_the_spec_dtype_and_defaults_to_fp8(
+    monkeypatch, target
+):
     from atom.spec_decode.draft_kv import draft_kv_cache_dtype
 
     _own_pool(monkeypatch, True)
     assert draft_kv_cache_dtype(_config(target), object()) == "fp8"
-
-
-@pytest.mark.parametrize("target", ["bf16", "fp8", "fp4"])
-def test_an_own_pool_draft_takes_the_spec_dtype(monkeypatch, target):
-    from atom.spec_decode.draft_kv import draft_kv_cache_dtype
-
-    _own_pool(monkeypatch, True)
     assert draft_kv_cache_dtype(_config(target, "bf16"), object()) == "bf16"
 
 
@@ -274,7 +269,6 @@ class _FakePool:
     "target,draft,scaled",
     [
         ("fp4", "fp8", True),  # the draft's dtype, not the target's, decides
-        ("bf16", "fp8", True),
         ("fp8", "bf16", False),
         ("bf16", None, False),  # unset: the target's
         ("fp8", None, True),

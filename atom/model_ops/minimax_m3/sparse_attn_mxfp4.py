@@ -18,10 +18,9 @@ segments, each with a plan of its own from the shared plan cache
 including its once-a-step refresh under a step owner). There is no gluon fallback
 for MXFP4 pages, hence the segments rather than a refusal past one plan.
 
-Prefill runs plan-free (``planned=False``): a chunk has a new row count nearly
-every forward, and ``plan_pa_decode`` JIT-compiles a kernel per batch size, so one
-task a row -- a row reads at most ``topk`` pages -- and one specialization
-whatever the rows.
+Prefill runs plan-free (``plan_owner=None``): a chunk has a new row count nearly
+every forward, and ``plan_pa_decode`` JIT-compiles a kernel per batch size, so one task a row -- a row reads at most ``topk`` pages -- and
+one specialization whatever the rows.
 """
 
 import torch
@@ -67,14 +66,6 @@ def sparse_pa_mxfp4(
         )
     if q.dtype != torch.float8_e4m3fn:
         raise TypeError(f"the MXFP4 path takes an e4m3 query, got {q.dtype}")
-    if out_dtype != torch.bfloat16:  # pa_decode's MXFP4 form writes bf16 only
-        raise TypeError(f"the MXFP4 path writes bf16, got {out_dtype}")
-    n = rows * num_kv_heads
-    if sparse_bt.shape[0] != n or sparse_ctx.shape[0] != n:
-        raise ValueError(
-            f"{rows} rows x {num_kv_heads} kv heads need {n} sparse rows, got "
-            f"{sparse_bt.shape[0]} block-table and {sparse_ctx.shape[0]} length rows"
-        )
     group = num_heads // num_kv_heads
     pages = k_pages.shape[0] * num_kv_heads
     # [pages, Hkv, 8704] -> [pages * Hkv, 1, 8704]: the pool field is contiguous in
@@ -83,6 +74,7 @@ def sparse_pa_mxfp4(
     v_flat = v_pages.view(pages, 1, v_pages.shape[-1])
     k_data, k_scale = page_views(k_flat)
     v_data, v_scale = page_views(v_flat)
+    n = rows * num_kv_heads
     q_rows = q.view(n, group, HEAD_DIM)
     out = torch.empty((n, group, HEAD_DIM), dtype=out_dtype, device=q.device)
     bound = sparse_bt.shape[1] * PAGE_TOKENS

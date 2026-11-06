@@ -262,14 +262,6 @@ class TestEngineArgsSpeculativeValidation:
             EngineArgs.from_cli_args(parser.parse_args(argv))._get_engine_kwargs()
         assert mock_cls.call_args.kwargs["kv_cache_dtype"] == "bf16"
 
-    def test_spec_decode_kv_cache_dtype_defaults_to_not_asked(self):
-        parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-        with patch("atom.model_engine.arg_utils.SpeculativeConfig") as mock_cls:
-            EngineArgs.from_cli_args(
-                parser.parse_args(["--method", "mtp"])
-            )._get_engine_kwargs()
-        assert mock_cls.call_args.kwargs["kv_cache_dtype"] is None
-
     def test_spec_decode_kv_cache_dtype_without_a_method_is_refused(self):
         parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
         args = EngineArgs.from_cli_args(

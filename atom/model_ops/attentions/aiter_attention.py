@@ -578,8 +578,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and not module.use_mla
         ):
             layout = None
-            # Only an indexed sparse layer's pages read as MXFP4; any other MHA
-            # module under the same dtype keeps the dtype-wide cache.
             if (
                 _is_indexed_sparse_attention(module)
                 and self.model_runner.config.kv_cache_dtype == "fp4"

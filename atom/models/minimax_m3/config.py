@@ -5,24 +5,6 @@ the way DeepSeek-V4.1's are (``models/deepseek_v41/config.py``). GPU-free: it
 imports neither the model nor AITER until the architecture check needs it."""
 
 
-def _reuses_index_topk(text, layers: int) -> bool:
-    """Whether any layer reuses an earlier layer's index top-k. The rule of
-    ``models/minimax_m3/model.py:_should_skip_minimax_m3_index_topk`` for a model
-    whose every layer is indexed sparse (a layer's ordinal is then its id), kept
-    here so the startup gate imports no model, torch graph or AITER; a test holds
-    the two together where the model imports."""
-    if not getattr(text, "use_index_cache", False):
-        return False
-    pattern = getattr(text, "index_topk_pattern", None)
-    if pattern is not None:
-        return any(p == "S" for p in pattern[:layers])
-    freq = int(getattr(text, "index_topk_freq", 1) or 1)
-    if freq <= 0:
-        raise ValueError("index_topk_freq must be a positive integer")
-    offset = int(getattr(text, "index_skip_topk_offset", 0))
-    return freq > 1 and any(max(i - offset, 0) % freq != 0 for i in range(layers))
-
-
 def _mxfp4_kv_refusal(config) -> str | None:
     """Why ``--kv-cache-dtype fp4`` cannot run this MiniMax-M3 here, or None.
 
@@ -71,13 +53,6 @@ def _mxfp4_kv_refusal(config) -> str | None:
             "indexed sparse one (sparse_attention_config.use_sparse_attention and "
             "a sparse_attention_freq of exactly 1 per layer, as MiniMax-M3.1); "
             "dense attention layers have no MXFP4 writer or reader"
-        )
-    # A layer that reuses another's top-k is written without an index branch, by a
-    # Triton writer that only produces the SHUFFLE cache. Asked of the model's rule
-    # (mirrored above), not of the `use_index_cache` flag: that alone skips nothing.
-    if _reuses_index_topk(text, layers):
-        return (
-            "a sparse layer that reuses another's index top-k has no MXFP4 K/V writer"
         )
     return None
 

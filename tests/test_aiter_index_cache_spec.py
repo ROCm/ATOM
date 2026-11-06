@@ -49,14 +49,15 @@ def test_bf16_is_two_bytes_a_key(monkeypatch):
     assert spec.field_shape == (256 * 128 * 2,) and spec.view_dtype is torch.bfloat16
 
 
-def test_an_unknown_index_dtype_is_refused(monkeypatch):
-    with pytest.raises(ValueError, match="index_cache_dtype"):
-        builder(monkeypatch, "fp6")._index_cache_spec(128)
-
-
-def test_the_mxfp4_index_page_is_one_block_of_128_wide_keys(monkeypatch):
-    with pytest.raises(ValueError, match="128-wide keys"):
-        builder(monkeypatch, "fp4")._index_cache_spec(256)
+@pytest.mark.parametrize(
+    "index, tokens, match",
+    [("fp6", 128, "index_cache_dtype"), ("fp4", 256, "128-wide keys")],
+)
+def test_an_index_cache_the_page_cannot_hold_is_refused(
+    monkeypatch, index, tokens, match
+):
+    with pytest.raises(ValueError, match=match):
+        builder(monkeypatch, index)._index_cache_spec(tokens)
 
 
 def test_no_sparse_attention_no_index_cache(monkeypatch):

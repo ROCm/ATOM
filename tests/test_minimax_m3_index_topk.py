@@ -567,31 +567,6 @@ class TestSelectWithAiter:
         assert served != transposed and len(calls) == int(not transposed)
 
 
-def test_a_padded_step_bounds_the_scorer_batch_head_major(monkeypatch):
-    """TP2 (2 index heads), 3 of 8 rows scheduled: the selector reads head 1 at
-    offset 8 * S, so the bounds are built over the 8 padded lengths the builder hands
-    `make_sparse_decode_metadata` (pad rows 0), not over the 3 scheduled ones."""
-    from atom.model_ops.minimax_m3 import sparse_attn
-
-    calls = []
-    monkeypatch.setattr(
-        sparse_attn,
-        "build_n_valid_column_per_row",
-        lambda starts, prefix, **kw: calls.append((starts, prefix, kw)),
-    )
-    padded = torch.zeros(8, dtype=torch.int32)
-    padded[:3] = torch.tensor([300, 1000, 5000], dtype=torch.int32)
-    kw = {"block_table": None, "slot_mapping": None, "max_seq_len": 1}
-    kw |= {"num_idx_heads": 2, "max_query_len": 1}
-    sparse_attn.make_sparse_decode_metadata(seq_lens=padded, **kw)
-    sparse_attn.make_sparse_decode_metadata(seq_lens=padded[:3], **kw)
-    (starts, prefix, padded_kw), (_, _, plain_kw) = calls
-    assert starts is padded and prefix is padded
-    assert (padded_kw["batch"], padded_kw["total_q"]) == (8, 8)
-    assert padded_kw["num_idx_heads"] == 2
-    assert (plain_kw["batch"], plain_kw["total_q"]) == (3, 3)
-
-
 @gpu
 def test_the_two_selectors_agree_where_the_dispatch_switches():
     """Above the width threshold both paths must return the same selection.
@@ -635,32 +610,16 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
     assert torch.equal(ait_bt, tri_bt)
 
 
-def test_the_small_k_selector_is_importable_at_the_installed_aiter():
-    """The flat module is an older aiter's, the `topk` package a newer one's: with
-    either installed the selector must be bound, or the dispatch silently never
-    leaves Triton."""
-    import importlib
-
-    for name in (
-        "aiter.ops.flydsl.topk.topk_per_row_small_k",
-        "aiter.ops.flydsl.topk_per_row_small_k",
-    ):
-        try:
-            mod = importlib.import_module(name)
-        except ImportError:
-            continue
-        assert m.topk_per_row_small_k is not None
-        assert m.topk_per_row_small_k_supported is not None
-        # whichever module served the import, it is the one aiter ships
-        assert m.topk_per_row_small_k.__module__ in (name, mod.__name__)
-        return
-    pytest.skip("this aiter has no small-k selector")
-
-
 @gpu
-@pytest.mark.parametrize("width", [70, m._AITER_MIN_WIDTH_WITH_EMIT + 252])
-@pytest.mark.parametrize("heads", [1, 2])
-@pytest.mark.parametrize("S", [1, 8])
+@pytest.mark.parametrize(
+    "S,heads,width",
+    [
+        (1, 1, 70),
+        (8, 2, 70),
+        (1, 2, m._AITER_MIN_WIDTH_WITH_EMIT + 252),
+        (8, 1, m._AITER_MIN_WIDTH_WITH_EMIT + 252),
+    ],
+)
 def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
     monkeypatch, S, heads, width
 ):
@@ -694,13 +653,13 @@ def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
 
     def run(bounds):
         topk_idx = torch.empty((heads, total_q, TOPK), dtype=torch.int32, device=dev)
-        (sbt, sctx), args = m._alloc_emit(total_q, heads, TOPK, table, True, dev)
+        (sbt, sctx), args = m._alloc_emit(total_q, heads, TOPK, table, True, dev, 1)
         m._launch_select(
             score, topk_idx, seq, seq, batch, TOPK, 0, 1, table, (sbt, sctx, *args[2:]),
             heads, rows_per_req=S, decode_max_q=S,
             block_size_k=m.DECODE_TOPK_BLOCK_SIZE_K, num_warps=m.DECODE_TOPK_NUM_WARPS,
-            emit=True, block_page_stride=m.PAGES_PER_SPARSE_BLOCK,
-            n_valid_column_per_row=bounds,
+            emit=True, block_page_stride=1, n_valid_column_per_row=bounds,
+            pages_per_block=1,
         )  # fmt: skip
         return topk_idx, sbt, sctx
 

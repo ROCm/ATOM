@@ -205,5 +205,5 @@ def test_v4_keeps_its_fp4_indexer_and_refuses_a_fp4_kv(monkeypatch):
     config, _ = _make_config(monkeypatch, index_cache_dtype="fp4")
     assert (config.kv_cache_dtype, config.index_cache_dtype) == ("fp8", "fp4")
 
-    with pytest.raises(ValueError, match="DeepSeek-V4.1 only"):
+    with pytest.raises(ValueError, match="MiniMax-M3 and DeepSeek-V4.1 only"):
         _make_config(monkeypatch, kv_cache_dtype="fp4")

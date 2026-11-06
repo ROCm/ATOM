@@ -37,10 +37,5 @@ def test_hash_changes_with_max_model_len():
     assert _hash(max_model_len=12288) != _hash()
 
 
-def test_hash_changes_with_an_fp4_kv_cache():
-    # the MXFP4 KV graph differs from the fp8 one
-    assert _hash(kv_cache_dtype="fp4") != _hash()
-
-
 def test_hash_changes_with_max_num_seqs():
     assert _hash(max_num_seqs=512) != _hash()

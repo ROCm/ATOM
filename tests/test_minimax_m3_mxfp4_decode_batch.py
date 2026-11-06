@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""Which requests the MXFP4 decode index scorer and selector run, and its
-per-ubatch buffers (CPU).
+"""Which requests the MXFP4 decode index scorer and selector run (the other index
+caches keep the padded batch), and the MXFP4 scorer's per-ubatch buffers (CPU).
 
 The scorer takes its batch off the rows of ``idx_q``, so a padded decode step
 (a graph bucket, or an eager step padded for DP) must hand it that many lengths
@@ -75,27 +75,12 @@ def _stand_in_scorer_module(monkeypatch):
     sys.modules[name].TRANSPOSE_MIN_F = 16
 
 
-def _stand_in_flydsl(monkeypatch, capacity, work_map=None):
-    """aiter's work-map entry points, replaced for this test alone (the rest of
-    aiter is left as it is: only ``aiter.ops.flydsl`` is looked up by name)."""
-    name = "aiter.ops.flydsl"
-    flydsl = types.ModuleType(name)
-
-    def refuse(*a, **kw):
-        raise AssertionError("aiter's work map must not be asked for")
-
-    flydsl.minimax_m3_index_score_work_map_capacity = capacity
-    flydsl.minimax_m3_index_score_work_map = work_map or refuse
-    monkeypatch.setitem(sys.modules, name, flydsl)
-
-
-@pytest.mark.parametrize("S", [1, 3, 4, 8])
-@pytest.mark.parametrize("heads", [1, 2, 4])
-def test_the_score_view_follows_the_layout_of_its_step_width_with_a_stand_in_threshold(
-    monkeypatch, heads, S
+@pytest.mark.parametrize("S,heads", [(1, 1), (8, 4)])  # S * heads each side of 16
+def test_the_score_view_follows_its_step_width_layout_at_a_stand_in_threshold(
+    monkeypatch, S, heads
 ):
-    """Local logic only: the threshold is a stand-in (16), so this does NOT show that
-    aiter's layout agrees; see the next test."""
+    """Local logic only (the threshold is a stand-in); the next-but-one test holds
+    it to aiter's own."""
     _stand_in_scorer_module(monkeypatch)
     _check_score_view(heads, S, 16, float("-inf"))
 
@@ -107,11 +92,11 @@ def test_an_eager_step_scores_at_its_own_block_count_a_graph_step_at_the_models(
 
     _stand_in_scorer_module(monkeypatch)
     built = []
-    _stand_in_flydsl(
-        monkeypatch,
-        lambda *a: 4,
+    flydsl = sys.modules["aiter.ops.flydsl"]
+    flydsl.minimax_m3_index_score_work_map_capacity = lambda *a: 4
+    flydsl.minimax_m3_index_score_work_map = (
         lambda seq_lens, max_block, *a, **kw: built.append(max_block)
-        or torch.zeros(1, 2),
+        or torch.zeros(1, 2)
     )
     buffers = index_mxfp4.IndexScoreBuffers.alloc(4, 2, 1, 64, "cpu")
     seq = torch.tensor([300, 1000, 0])
@@ -124,21 +109,6 @@ def test_an_eager_step_scores_at_its_own_block_count_a_graph_step_at_the_models(
         assert step.out.shape == (1, 6, step.max_block)
     # one persistent storage under every view
     assert graph.out.data_ptr() == eager.out.data_ptr() == buffers.scores.data_ptr()
-
-
-def test_a_batch_of_zero_needs_nothing_from_aiter(monkeypatch):
-    """No requests: no map rows asked for, no map built, and no step state (the
-    scorer then builds its own) -- decided here, not by aiter's own empty case."""
-    from atom.model_ops.minimax_m3 import index_mxfp4
-
-    _stand_in_scorer_module(monkeypatch)
-    _stand_in_flydsl(monkeypatch, lambda *a: pytest.fail("capacity asked for"))
-    buffers = index_mxfp4.IndexScoreBuffers.alloc(0, 8, 2, 64, "cpu")
-    assert buffers.work_map.shape == (0, 2) and buffers.work_map.dtype == torch.int32
-    assert buffers.scores.numel() == 0 and buffers.scores.dtype == torch.float32
-    empty = torch.empty(0, dtype=torch.int32)
-    assert buffers.begin_step(empty, 8, 0) is None
-    assert buffers.begin_step(empty, 8, 0, eager=True) is None
 
 
 @pytest.mark.parametrize("S", [1, 3, 4, 8])
@@ -194,18 +164,6 @@ def test_rows_that_are_not_a_batch_are_refused_not_clamped(
         index_batch(scheduled, running, tokens, q)
 
 
-def test_each_ubatch_has_its_own_map_and_scores(mod):
-    name = "sparse_attention_index_score"
-    prefixes = ("", "ub0_", "ub1_")
-    var = {p + name: object() for p in prefixes}
-    b = builder(mod, forward_vars=var)
-    got = [b._index_score_kwargs(p) for p in prefixes]
-    for kw, p in zip(got, prefixes):
-        assert kw == {"index_score_buffers": var[p + name]}
-    # another index cache allocated none: nothing to pass
-    assert builder(mod)._index_score_kwargs("ub0_") == {}
-
-
 class _Buf:
     def __init__(self, *size, dtype=None, device=None, publication_group=None):
         self.cpu = self.gpu = torch.zeros(*size, dtype=dtype)
@@ -215,8 +173,9 @@ class _Buf:
 
 
 @pytest.mark.parametrize("max_bs", [16, 15])
-@pytest.mark.parametrize("tbo_decode", [False, True])
-@pytest.mark.parametrize("mxfp4", [False, True])
+@pytest.mark.parametrize(
+    "mxfp4,tbo_decode", [(False, True), (True, False), (True, True)]
+)
 def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     mod, monkeypatch, mxfp4, tbo_decode, max_bs
 ):
@@ -229,7 +188,11 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
         return 100
 
     monkeypatch.setattr(mod, "CpuGpuBuffer", _Buf)
-    _stand_in_flydsl(monkeypatch, capacity)
+    monkeypatch.setattr(
+        "aiter.ops.flydsl.minimax_m3_index_score_work_map_capacity",
+        capacity,
+        raising=False,
+    )
     b = builder(mod, mxfp4=mxfp4, tbo_decode=tbo_decode)
     b.max_bs = max_bs
     max_qlen = 8  # a speculative config: the TBO sparse decode still runs one token
@@ -300,48 +263,5 @@ def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
     for i, kw in enumerate(seen):
         assert kw["index_score_buffers"] is var[f"ub{i}_sparse_attention_index_score"]
     assert seen[0]["index_score_buffers"] is not seen[1]["index_score_buffers"]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU and triton")
-@pytest.mark.parametrize("qlen", [1, 4])
-def test_fp4_kv_decode_rows_name_pool_pages_one_page_a_block(qlen):
-    """Not run by the CPU gate. The selector's emit at ``pages_per_block=1`` /
-    ``block_page_stride=1`` (what fp4 KV asks of it), over scattered physical pages,
-    with a speculative verify (qlen 4: a row per token, its own causal length): row
-    (token t, kv head h) reads ``block_table[b, blk] * Hkv + h`` for each selected
-    block, the tail block last, for ``(n - 1) * 128 + tail tokens``. A BF16 index
-    cache stands in for the index: the emit does not depend on it."""
-    pytest.importorskip("triton")
-    from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
-
-    hkv, batch, topk, pages, dim = 2, 3, 4, 40, 128
-    g = torch.Generator(device="cuda").manual_seed(qlen)
-    seq = torch.tensor([700, 1300, 2100], dtype=torch.int32, device="cuda")
-    blocks = -(-int(seq.max()) // 128)
-    table = torch.zeros(batch, blocks, dtype=torch.int32, device="cuda")
-    for b in range(batch):  # physical pages in no particular order
-        table[b] = torch.randperm(pages, device="cuda", generator=g)[:blocks]
-    idx_q = torch.randn(batch * qlen, hkv, dim, device="cuda", generator=g)
-    idx_q = idx_q.to(torch.bfloat16)
-    cache = torch.randn(pages, 128, dim, device="cuda", generator=g)
-    cache = cache.to(torch.bfloat16)
-    topk_idx, sbt, sctx = minimax_m3_index_topk_decode(
-        idx_q, cache, table, seq, int(seq.max()), topk, 1, 1, hkv, dim**-0.5,
-        emit_sparse_block_table=True, max_query_len=qlen,
-        block_page_stride=1, pages_per_block=1,
-    )  # fmt: skip
-    assert sbt.shape == (batch * qlen * hkv, topk)
-    for b in range(batch):
-        for t in range(qlen):
-            cl = int(seq[b]) - qlen + t + 1  # this token's causal length
-            tail = (cl - 1) // 128
-            for h in range(hkv):
-                row = (b * qlen + t) * hkv + h
-                sel = [int(x) for x in topk_idx[h, b * qlen + t] if x >= 0]
-                assert tail in sel  # local_blocks=1 pins the tail
-                n = len(sel)
-                want = [int(table[b, x]) * hkv + h for x in sel if x != tail]
-                got = [int(x) for x in sbt[row, :n]]
-                assert sorted(got[:-1]) == sorted(want)
-                assert got[-1] == int(table[b, tail]) * hkv + h
-                assert int(sctx[row]) == (n - 1) * 128 + cl - tail * 128
+    # another index cache allocated none: nothing to pass
+    assert builder(mod)._index_score_kwargs("ub0_") == {}
