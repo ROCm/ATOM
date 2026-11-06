@@ -43,6 +43,10 @@ from atom.kv_transfer.disaggregation.chunked_prefill import (
     PrefillHandoff,
     chunked_topology_supported,
 )
+from atom.kv_transfer.disaggregation.kv_staging import (
+    MLAShardStaging,
+    mla_staging_for,
+)
 from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     DEFAULT_HANDSHAKE_PORT,
     producer_endpoint,
@@ -63,6 +67,7 @@ from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
 from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
 from atom.kv_transfer.disaggregation.pd_producer import (
     MLA_STAGING_SLOT_BYTES,
+    mla_shard_staging_reserve_bytes,
     mla_staging_pool_bytes,
     mla_staging_reserve_bytes,
     mla_staging_slot_count,
@@ -155,7 +160,8 @@ class SlotPool:
     is permanent: every later ``acquire`` raises too, free rows or not, since
     the consumer that reports it cannot run on (see
     ``MooncakeConnector._post_queued_write_requests``). The consumer staging
-    rows, the DSA index staging slots and the MLA staging slots each keep one.
+    rows, the DSA index staging slots and both MLA staging pools' slots each
+    keep one.
     """
 
     def __init__(self, size: int = 0, exhausted_warning: str | None = None) -> None:
@@ -1086,6 +1092,12 @@ class MooncakeConnector(KVConnectorBase):
         self._mla_landing_table_segments = (
             mla_landing_table_segments(config) if mla_landing_configured(config) else 0
         )
+        # The same staging for the per-request-state path, which the pool above
+        # does not serve (see _build_kv_staging), within what the KV budget
+        # held back for it.
+        self._kv_staging: MLAShardStaging | None = None
+        self._kv_staging_slots = SlotPool()
+        self._kv_staging_reserve = mla_shard_staging_reserve_bytes(config)
 
         # --- Producer: completed prefill block_ids cache ---
         # Populated from ConnectorMetadata.reqs_to_save each step.
@@ -1263,11 +1275,15 @@ class MooncakeConnector(KVConnectorBase):
 
     @classmethod
     def kv_budget_reserve_bytes(cls, config) -> int:
-        """The MLA staging pool (producer) and landing pool (DCP consumer).
+        """The MLA staging pools (producer) and landing pool (DCP consumer).
 
-        ``register_kv_caches`` allocates both after the KV cache is sized.
+        ``register_kv_caches`` allocates them after the KV cache is sized.
         """
-        return mla_staging_reserve_bytes(config) + mla_landing_reserve_bytes(config)
+        return (
+            mla_staging_reserve_bytes(config)
+            + mla_shard_staging_reserve_bytes(config)
+            + mla_landing_reserve_bytes(config)
+        )
 
     def register_kv_caches(
         self,
@@ -1312,6 +1328,7 @@ class MooncakeConnector(KVConnectorBase):
             )
             self._prepare_sharded_index = tt.prepare_sharded_index
             self._gather_sharded_index = tt.gather_sharded_index
+        self._kv_staging = self._build_kv_staging(tt)
 
         # Populate block/slot region lists for transfer offset computation
         self._block_regions = [(r.base_addr, r.unit_bytes) for r in tt.block_regions]
@@ -1416,6 +1433,8 @@ class MooncakeConnector(KVConnectorBase):
         self._mla_landing = self._build_mla_landing()
         if self._mla_landing is not None:
             all_regions.append(self._mla_landing.region())
+        if self._kv_staging is not None:
+            all_regions.append(self._kv_staging.region)
         for r in all_regions:
             offset = 0
             for chunk in self._rdma_chunk_sizes(r.total_bytes, r.unit_bytes):
@@ -1645,6 +1664,58 @@ class MooncakeConnector(KVConnectorBase):
             semantic_role="mla.kv_staging",
         )
 
+    def _build_kv_staging(self, tt) -> MLAShardStaging | None:
+        """MLA staging for the per-request-state path; None keeps token runs.
+
+        `_build_mla_staging` serves block-only backends. A hybrid such as
+        Kimi-K3 also publishes slot regions and sends through
+        `_execute_block_slot_transfer`, so from a producer without DCP its MLA
+        rows to a DCP consumer below a page of interleave would otherwise go
+        as one descriptor per token run per layer.
+
+        Its slots fit what ``mla_shard_staging_reserve_bytes`` held back from
+        the KV cache; without that reserve it builds nothing.
+        """
+        chunk_pages = envs.ATOM_PD_MLA_STAGING_CHUNK_PAGES
+        if (
+            not self.is_producer
+            or self.dcp_size > 1
+            or not self._has_slot_regions
+            or not self._kv_staging_reserve
+        ):
+            return None
+        staging = MLAShardStaging.build(
+            tt.pages,
+            block_size=self.block_size,
+            pool_size=self._num_send_workers,
+            chunk_pages=chunk_pages,
+            max_bytes=self._kv_staging_reserve,
+            device=torch.device("cuda", self._cuda_device),
+            stream_priority=envs.ATOM_PD_MLA_STAGING_STREAM_PRIORITY,
+        )
+        if staging is None:
+            logger.warning(
+                "MLA DCP staging off: no token-contiguous MLA page, or a "
+                "%d-page slot does not fit the %.1f MiB reserve; MLA rows to "
+                "DCP decode ranks go as token runs",
+                chunk_pages,
+                self._kv_staging_reserve / 2**20,
+            )
+        else:
+            # A worker holds at most one slot, so fewer slots than workers
+            # (a row wider than the reserve assumed) only makes it wait.
+            self._kv_staging_slots = SlotPool(staging.pool_size)
+            logger.info(
+                "MLA DCP staging: %d slots x %d pages (%.1f MiB) for %d MLA "
+                "regions, stream priority %d",
+                staging.pool_size,
+                chunk_pages,
+                staging.region.total_bytes / 2**20,
+                sum(map(staging.stages, range(len(tt.pages)))),
+                envs.ATOM_PD_MLA_STAGING_STREAM_PRIORITY,
+            )
+        return staging
+
     # -----------------------------------------------------------------
     # KVConnectorBase: start_load_kv
     # -----------------------------------------------------------------
@@ -1667,7 +1738,11 @@ class MooncakeConnector(KVConnectorBase):
         """Record when this prefill batch's KV writes become visible to staging."""
         if (
             not self.is_producer
-            or (self._index_staging_pool_size == 0 and self._mla_staging is None)
+            or (
+                self._index_staging_pool_size == 0
+                and self._mla_staging is None
+                and self._kv_staging is None
+            )
             or not req_ids
         ):
             return
@@ -2575,6 +2650,7 @@ class MooncakeConnector(KVConnectorBase):
                     dst_block_ids,
                     prefill_data,
                     req_id,
+                    kv_cache_ready_event,
                     engine=engine,
                 )
             else:
@@ -3553,6 +3629,72 @@ class MooncakeConnector(KVConnectorBase):
         finally:
             self._index_staging_slots.release(pool_idx)
 
+    def _execute_staged_kv_transfer(
+        self,
+        target: str,
+        plan,
+        dst_block_ids: list[int],
+        regions: list[tuple[int, int, int]],
+        req_id: str,
+        kv_cache_ready_event: torch.cuda.Event,
+        *,
+        engine=None,
+        deadline: float | None = None,
+    ) -> bool:
+        """Write MLA ``(region, dst_base, bpb)`` regions as GPU-repacked pages."""
+        staging = self._kv_staging
+        dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
+        descriptors = 0
+        slot = self._kv_staging_slots.acquire()
+        try:
+            shard = staging.prepare(plan, kv_cache_ready_event, slot)
+            for region_idx, dst_base, bpb in regions:
+                for start in range(0, shard.pages, staging.chunk_pages):
+                    stop = min(start + staging.chunk_pages, shard.pages)
+                    slot_addr, page_bytes = staging.gather(
+                        region_idx, shard, start, stop, slot
+                    )
+                    if page_bytes != bpb:
+                        raise RuntimeError(
+                            f"Staged region {region_idx} packs {page_bytes}-byte "
+                            f"pages, but its blocks are {bpb} bytes"
+                        )
+                    src, dst, sizes = coalesce_contiguous(
+                        slot_addr
+                        + np.arange(stop - start, dtype=np.int64) * page_bytes,
+                        dst_base + dst_ids[start:stop] * bpb,
+                        shard.page_tokens(start, stop) * (bpb // self.block_size),
+                    )
+                    descriptors += src.size
+                    if not self._rdma_write(
+                        target,
+                        src.tolist(),
+                        dst.tolist(),
+                        sizes.tolist(),
+                        req_id,
+                        "staged-kv",
+                        engine=engine,
+                        deadline=deadline,
+                    ):
+                        logger.error(
+                            "[PRODUCER] staged MLA transfer failed for req %s "
+                            "region %d",
+                            req_id,
+                            region_idx,
+                        )
+                        return False
+        finally:
+            self._kv_staging_slots.release(slot)
+        logger.debug(
+            "[PRODUCER] staged MLA RDMA write: req=%s, regions=%d, pages=%d, "
+            "descriptors=%d",
+            req_id,
+            len(regions),
+            shard.pages,
+            descriptors,
+        )
+        return True
+
     def _execute_block_slot_transfer(
         self,
         request_data: dict,
@@ -3561,6 +3703,7 @@ class MooncakeConnector(KVConnectorBase):
         dst_block_ids: list[int],
         prefill_data: dict,
         req_id: str,
+        kv_cache_ready_event: torch.cuda.Event | None = None,
         *,
         engine=None,
         blocks_only: bool = False,
@@ -3714,16 +3857,24 @@ class MooncakeConnector(KVConnectorBase):
         # producer pushes its token runs instead of whole blocks, exactly as
         # the block-only path does.
         consumer_dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
+        sharded_plan = None
         sharded_runs = None
+        staging = None
         if consumer_dcp_size > 1 and self.dcp_size == 1:
-            sharded_runs = build_dcp_shard_plan(
+            sharded_plan = build_dcp_shard_plan(
                 src_block_ids,
                 block_size=self.block_size,
                 dcp_size=consumer_dcp_size,
                 dcp_rank=request_data["consumer_dcp_rank"],
                 interleave_size=request_data.get("consumer_dcp_interleave", 1),
                 dst_pages=len(dst_block_ids),
-            ).token_runs(dst_block_ids)
+            )
+            sharded_runs = sharded_plan.token_runs(dst_block_ids)
+            # Without the ready event the gather could read KV still being
+            # written, so such a request keeps the per-token path.
+            if kv_cache_ready_event is not None:
+                staging = mla_staging_for(self._kv_staging, sharded_plan)
+        staged_kv: list[tuple[int, int, int]] = []
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
             cidx = block_cmap[region_idx]
             dst_base = consumer_block_addrs[cidx]
@@ -3752,6 +3903,9 @@ class MooncakeConnector(KVConnectorBase):
                     f"(semantic_role={role!r}, {bpb} bytes per block): it "
                     f"needs token-contiguous {MLA_KV_ROLE} pages"
                 )
+            if staging is not None and staging.stages(region_idx):
+                staged_kv.append((region_idx, dst_base, bpb))
+                continue
             unit = bpb // self.block_size
             run_src, run_dst, run_len = sharded_runs
             block_src.extend((src_base + run_src * unit).tolist())
@@ -3759,6 +3913,17 @@ class MooncakeConnector(KVConnectorBase):
             block_sizes.extend((run_len * unit).tolist())
 
         deadline = request_data.get("_deadline")
+        if staged_kv and not self._execute_staged_kv_transfer(
+            target,
+            sharded_plan,
+            dst_block_ids,
+            staged_kv,
+            req_id,
+            kv_cache_ready_event,
+            engine=engine,
+            deadline=deadline,
+        ):
+            return False
         if blocks_only:
             return self._rdma_write(
                 target,

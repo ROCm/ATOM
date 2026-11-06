@@ -1089,8 +1089,8 @@ def _make_transfer_connector(prefill_data, captured):
     conn.done_sending = set()
     conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
     conn._execute_block_slot_transfer = (
-        lambda request, target, src, dst, data, req_id, *, engine=None: captured.append(
-            (request, target, src, dst, data, req_id, engine)
+        lambda request, target, src, dst, data, req_id, _ready=None, *, engine=None: (
+            captured.append((request, target, src, dst, data, req_id, engine))
         )
         or True
     )
@@ -1511,6 +1511,7 @@ def _fake_head(batch):
         _in_flight=deque(),
         _defer_prefix_hash=False,
         pp_size=4,
+        pp_max_inflight=4,
         kv_transfer_enabled=True,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
@@ -1708,6 +1709,7 @@ def _head_for_batch(batch, *, dynamic_chunking_active=False):
         _in_flight=deque(),
         _defer_prefix_hash=False,
         pp_size=2,
+        pp_max_inflight=2,
         kv_transfer_enabled=False,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
