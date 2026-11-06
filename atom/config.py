@@ -1783,6 +1783,75 @@ class EPLBConfig:
         return cls(**cfg)
 
 
+_QSA_INDEX_SCORER_PROFILE_NAME = re.compile(r"[A-Za-z0-9_.\-]+")
+
+
+@dataclass
+class QSAIndexScorerConfig:
+    """Opt-in routing of the Qwen QSA index scorer to aiter's fused kernel.
+
+    OFF by default. With ``profile`` empty nothing is imported, the indexer
+    calls ATOM's own ``qsa_paged_mqa_logits`` through the stock
+    ``qsa_select_paged_tokens``, and the config hash is unchanged.
+
+    Fields:
+      - profile: aiter ``qsa_index_scorer`` profile name (e.g.
+        ``qsa_page4_gfx1250_v1``) or a path to a profile JSON. Passed as
+        ``profile=`` to every aiter call -- ATOM never relies on aiter's
+        ``AITER_QSA_INDEX_SCORER_PROFILE`` env var. Calls the profile does not
+        cover run ATOM's native scorer, with a logged reason.
+      - capture: path of a JSON file that receives every scorer call class
+        (shapes, dtypes, strides, buckets, cache layouts, rank, decision) for
+        the coverage matrix and aiter's ``gen_profile --plan-file``. May hold
+        ``{rank}`` / ``{pid}``; without them ``.rank<r>.pid<p>`` is appended.
+        Works with ``profile`` empty too (every call then runs native).
+    """
+
+    profile: str = ""
+    capture: str = ""
+
+    def __post_init__(self):
+        self.profile = "" if self.profile is None else str(self.profile).strip()
+        self.capture = "" if self.capture is None else str(self.capture).strip()
+        if self.profile and not (
+            self.profile.endswith(".json")
+            or _QSA_INDEX_SCORER_PROFILE_NAME.fullmatch(self.profile)
+        ):
+            raise ValueError(
+                "qsa_index_scorer.profile must be a profile name "
+                f"([A-Za-z0-9_.-]+) or a path ending in .json, got {self.profile!r}"
+            )
+
+    @property
+    def enabled(self) -> bool:
+        """The fused scorer may run (a profile is named)."""
+        return bool(self.profile)
+
+    @property
+    def active(self) -> bool:
+        """A call-site route is installed (fused scorer and/or capture)."""
+        return bool(self.profile or self.capture)
+
+    def hash_factors(self) -> list:
+        """Contribution to ``Config.compute_hash``: empty while OFF, so turning
+        the feature off leaves every existing cache key unchanged. Capture only
+        observes, so it never keys anything."""
+        return [("qsa_index_scorer", self.profile)] if self.enabled else []
+
+    @classmethod
+    def from_dict(cls, cfg: dict | None) -> "QSAIndexScorerConfig":
+        """Build from the CLI values; unknown keys raise so typos fail fast."""
+        cfg = cfg or {}
+        allowed = {f.name for f in fields(cls)}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown qsa_index_scorer key(s): {sorted(unknown)}. "
+                f"Supported keys: {sorted(allowed)}"
+            )
+        return cls(**cfg)
+
+
 DCP_COMM_BACKENDS = ("ag_rs", "a2a")
 
 
@@ -2162,6 +2231,9 @@ class Config:
     # EngineArgs) and pickled into every worker. Read sites use `config.dspark.*`
     # (no os.environ lookups). Defaults to all-off.
     dspark: DSparkConfig = field(default_factory=DSparkConfig)
+    # Opt-in aiter fused QSA index scorer (--qsa-index-scorer-profile /
+    # --qsa-index-scorer-capture). Default OFF: nothing imported, stock path.
+    qsa_index_scorer: QSAIndexScorerConfig = field(default_factory=QSAIndexScorerConfig)
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
@@ -2373,6 +2445,19 @@ class Config:
             self.dcp_config = DCPConfig(**self.dcp_config.__dict__)
         else:
             raise TypeError("dcp_config must be DCPConfig or dict")
+        if self.qsa_index_scorer is None:
+            self.qsa_index_scorer = QSAIndexScorerConfig()
+        elif isinstance(self.qsa_index_scorer, dict):
+            self.qsa_index_scorer = QSAIndexScorerConfig.from_dict(
+                self.qsa_index_scorer
+            )
+        elif isinstance(self.qsa_index_scorer, QSAIndexScorerConfig):
+            # Normalize/validate even when constructed programmatically.
+            self.qsa_index_scorer = QSAIndexScorerConfig(
+                **self.qsa_index_scorer.__dict__
+            )
+        else:
+            raise TypeError("qsa_index_scorer must be QSAIndexScorerConfig or dict")
         # assert os.path.isdir(self.model)
 
         # The forced-acceptance schedule spends its whole budget on the first
@@ -3020,6 +3105,11 @@ class Config:
         # faults on the first decode past the old width.
         factors.append(self.max_model_len)
         factors.append(self.max_num_seqs)
+        # The fused QSA index scorer swaps the scorer kernel. Keyed only while
+        # ON, so every hash computed with the feature off is unchanged.
+        qsa_index_scorer = getattr(self, "qsa_index_scorer", None)
+        if qsa_index_scorer is not None:
+            factors.extend(qsa_index_scorer.hash_factors())
         # The drafter graph bakes its draft width in as a constant (DSpark traces
         # `[bs, num_draft]`), so a run that only changes --num-speculative-tokens
         # would otherwise load the other width's artifact: draft 6 over a draft 3

@@ -330,6 +330,16 @@ class Qwen4ExpAttention(nn.Module):
             self.kv_format = self.index_format = "bf16"
             self.qsa_row_space = "qsa_draft"
         self.profile_block_size = getattr(atom_config, "kv_cache_block_size", 64)
+        # Opt-in aiter fused index scorer (`--qsa-index-scorer-profile`). OFF:
+        # None, nothing imported, `_select_tokens` keeps the stock call.
+        self.qsa_scorer = None
+        scorer_cfg = getattr(atom_config, "qsa_index_scorer", None)
+        if scorer_cfg is not None and scorer_cfg.active:
+            from atom.model_ops.qwen4_exp.qsa_index_scorer import build_route
+
+            self.qsa_scorer = build_route(
+                scorer_cfg, site=prefix or f"layer{layer_num}"
+            )
 
     def bind_caches(
         self,
@@ -351,6 +361,9 @@ class Qwen4ExpAttention(nn.Module):
         self.k_scale_cache = k_scale_cache
         self.v_scale_cache = v_scale_cache
         self.compressed_key_scale = compressed_key_scale
+        if self.qsa_scorer is not None:
+            # Prepare-time (rank-uniform) layout check of the index cache.
+            self.qsa_scorer.prepare(compressed_key_cache, compressed_key_scale)
 
     def _store_kv(self, key, value, slots) -> None:
         if self.k_scale_cache is None:
@@ -429,7 +442,12 @@ class Qwen4ExpAttention(nn.Module):
                 normalized,
             )
 
-        return qsa_select_paged_tokens(
+        select = (
+            qsa_select_paged_tokens
+            if self.qsa_scorer is None
+            else self.qsa_scorer.select_paged_tokens
+        )
+        return select(
             index_q,
             self.compressed_key_cache,
             qsa.block_tables,

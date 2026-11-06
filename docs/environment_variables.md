@@ -162,6 +162,14 @@ cannot affect a server that does not use the feature.
 | **ATOM_QSA_STACKED_DECODE_SCORER** | bool | 1 (true) | Score decode-sized QSA index calls (at most 256 query rows: the target's MTP verify and the draft) with the MFMA kernel that stacks every row's index heads into the M dimension, so each key tile is read once per 4 rows instead of once per row; BF16, FP8 and MXFP4 index keys. Needs power-of-two index heads (at least 4) and head dim; other shapes keep the CUDA-core scorer. Set `0` to force the CUDA-core scorer. |
 | **ATOM_QSA_DRAFT_KV_BF16** | bool | 1 (true) | With `--kv_cache_dtype fp8` or `--index-cache-dtype fp8/fp4`, keep the MTP draft layer's K/V and index caches in BF16, in a row space (`qsa_draft`) of their own, while the target's 12 QSA layers use the quantized caches. On Qwen3.8-Flash-Next an FP8 draft KV lowers the real acceptance length by about 3.5% (3.05 vs 3.17 tokens a forward at MTP 3); a BF16 one keeps it, at about 6% of the KV pool. Set `0` to quantize the draft's caches like the target's. |
 
+#### aiter in-tree QSA index scorer (`aiter.ops.qsa_index_scorer`)
+
+The contract is the `--qsa-index-scorer-profile` flag (`Config.qsa_index_scorer.profile`, keyed into `Config.compute_hash()`); the variable below is only an operator override for deployments that cannot change the launch command. It is read once, when `EngineArgs` builds the `Config`, and only when the flag is absent; a worker never reads it.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_QSA_INDEX_SCORER_PROFILE** | str | "" (off) | Profile name or JSON path for aiter's QSA index scorer (e.g. `qsa_page4_gfx1250_v1`) when `--qsa-index-scorer-profile` is not given. Empty keeps ATOM's stock scorer and imports nothing of aiter's op. Every worker checks the op once (module present, `API_VERSION` 1.x, signature, profile loads) and falls back to the stock scorer with one log line on any failure. ATOM never sets aiter's own `AITER_QSA_INDEX_SCORER_*` variables (the profile is passed as `profile=`); aiter's `QSA_*` kernel switches must stay unset (`kernel_env_mismatch` otherwise). |
+
 ### GLM-5.3
 
 | Variable | Type | Default | Description |
