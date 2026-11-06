@@ -702,6 +702,8 @@ class Qwen3NextAttention(nn.Module):
     gate_in_attention = False
     # ATOM_UA_FUSED_OUTPUT_GATE, set in __init__ (off for a layer built without it).
     fused_output_gate = False
+    # ATOM_MXFP8_1X32's gate + quant into o_proj, set in __init__ (likewise).
+    mx32_output_gate = False
 
     def __init__(
         self,
