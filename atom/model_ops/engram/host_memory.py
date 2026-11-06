@@ -89,20 +89,25 @@ _MAX_COPY_THREADS = 16
 # does not return when several ranks issue it together.
 _REG_CHUNK_BYTES = 1 << 30
 # How long a waiter tolerates a registration lock whose holder shows no
-# progress (the holder touches the file after every chunk) before giving up.
-# Once a path has timed out it is never waited on again in this process.
+# progress (the holder touches the file after every faulted-in piece and every
+# registered chunk) before giving up. Once a path has timed out it is never
+# waited on again in this process.
 _REG_LOCK_TIMEOUT_S = 600
 _logged_lock_paths: set[str] = set()
 _timed_out_lock_paths: set[str] = set()
-# Descriptors of the registration lock files this process holds.
+# Descriptors of the registration lock files this process holds. Fault-in
+# worker threads touch them, so the list and each touch are under the lock: a
+# descriptor leaves the list before it is closed and is never touched after.
 _held_lock_fds: list[int] = []
+_held_lock_fds_lock = threading.Lock()
 
 
 def _lock_heartbeat() -> None:
-    """Touch the held registration lock file, so waiters see progress."""
-    for fd in _held_lock_fds:
-        with contextlib.suppress(OSError):
-            os.utime(fd)
+    """Touch the held registration lock files, so waiters see progress."""
+    with _held_lock_fds_lock:
+        for fd in _held_lock_fds:
+            with contextlib.suppress(OSError):
+                os.utime(fd)
 
 
 @functools.cache
@@ -634,9 +639,10 @@ def _flock_logging_wait(fd: int, path: str) -> None:
     """Exclusive `flock` on `fd`.
 
     A wait is logged. It is bounded by the holder's progress, not by its
-    total hold time: the holder touches the file after every chunk, and only
-    `_REG_LOCK_TIMEOUT_S` without a touch raises `TimeoutError` (an `OSError`
-    subclass; callers must not swallow it with `except OSError`).
+    total hold time: the holder touches the file after every faulted-in piece
+    and every registered chunk, and only `_REG_LOCK_TIMEOUT_S` without a
+    touch raises `TimeoutError` (an `OSError` subclass; callers must not
+    swallow it with `except OSError`).
     """
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -711,13 +717,15 @@ def _register_lock_file(path: str):
             )
         else:
             held = True
-            _held_lock_fds.append(fd)
+            with _held_lock_fds_lock:
+                _held_lock_fds.append(fd)
             _lock_heartbeat()
     try:
         yield
     finally:
         if held:
-            _held_lock_fds.remove(fd)
+            with _held_lock_fds_lock:
+                _held_lock_fds.remove(fd)
             fcntl.flock(fd, fcntl.LOCK_UN)
         if fd is not None:
             os.close(fd)
@@ -871,13 +879,20 @@ def _fault_and_lock(lo: int, hi: int, populate: bool) -> None:
 
 
 def _populate(lo: int, hi: int) -> None:
-    """`MADV_POPULATE_READ` over `[lo, hi)`, one chunk per thread."""
+    """`MADV_POPULATE_READ` over `[lo, hi)`, one chunk per thread.
+
+    Each finished chunk touches any registration lock this process holds:
+    `acquire` faults in under the lock what reclaim took back, and on a cold
+    cache that can outlast `_REG_LOCK_TIMEOUT_S` with no chunk registered.
+    """
     libc = _libc()
     pieces = _chunks(lo, hi - lo, _CHUNK_BYTES)
 
     def fault(piece) -> bool:
         o, n = piece
-        return libc.madvise(lo + o, n, _MADV_POPULATE_READ) == 0
+        ok = libc.madvise(lo + o, n, _MADV_POPULATE_READ) == 0
+        _lock_heartbeat()
+        return ok
 
     threads = min(copy_threads(hi - lo), len(pieces))
     if threads <= 1:

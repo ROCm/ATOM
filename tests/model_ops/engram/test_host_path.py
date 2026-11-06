@@ -880,6 +880,57 @@ def test_a_progressing_holder_is_waited_on_past_the_timeout(tmp_path, monkeypatc
     assert path not in host_memory._timed_out_lock_paths
 
 
+def test_fault_in_touches_a_held_lock(tmp_path, monkeypatch):
+    """`acquire` faults in under the lock what reclaim took back; on a cold
+    cache that can outlast the timeout before a chunk is registered, so every
+    faulted-in piece touches the held lock file."""
+    from atom.model_ops.engram import host_memory
+
+    advised = []
+
+    class Libc:
+        def madvise(self, addr, nbytes, advice):
+            advised.append(nbytes)
+            return 0
+
+    monkeypatch.setattr(host_memory, "_libc", lambda: Libc())
+    beats = []
+    heartbeat = host_memory._lock_heartbeat
+    monkeypatch.setattr(
+        host_memory, "_lock_heartbeat", lambda: (beats.append(1), heartbeat())
+    )
+    path = str(tmp_path / "register.lock")
+    pieces = 4
+    lo = 1 << 30
+    with host_memory._register_lock_file(path):
+        os.utime(path, (0, 0))
+        beats.clear()
+        host_memory._populate(lo, lo + pieces * host_memory._CHUNK_BYTES)
+        assert os.stat(path).st_mtime > 0
+    assert len(advised) == pieces
+    assert len(beats) == pieces
+
+
+def test_heartbeat_touches_under_the_fd_list_lock():
+    """Fault-in workers touch the held lock files while the main thread adds
+    and removes them: a touch waits for the list's lock, so a descriptor that
+    is being removed and closed is never touched."""
+    from atom.model_ops.engram import host_memory
+
+    done = threading.Event()
+
+    def beat():
+        host_memory._lock_heartbeat()
+        done.set()
+
+    with host_memory._held_lock_fds_lock:
+        thread = threading.Thread(target=beat)
+        thread.start()
+        assert not done.wait(0.2)
+    assert done.wait(5)
+    thread.join(5)
+
+
 def test_release_after_a_lock_timeout_still_unregisters(monkeypatch, tmp_path):
     from atom.model_ops.engram import host_memory
 
