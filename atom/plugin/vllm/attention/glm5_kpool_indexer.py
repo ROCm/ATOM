@@ -220,9 +220,10 @@ def sparse_attn_indexer_kpool_plugin_mode(
     has_decode = indexer_meta.num_decodes > 0
     has_prefill = indexer_meta.num_prefills > 0
 
-    if os.getenv("ATOM_GLM5_KPOOL_CHECK") == "1" and not (
+    kpool_check = os.getenv("ATOM_GLM5_KPOOL_CHECK") == "1" and not (
         torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-    ):
+    )
+    if kpool_check:
         # Debug-only, and only here: every index below is consumed by a Triton
         # kernel, where an out-of-range slot is an illegal access reported at
         # some later launch rather than at its cause. Reading the extremes costs
@@ -342,6 +343,19 @@ def sparse_attn_indexer_kpool_plugin_mode(
             # closing pool must come from the tail buffer rather than from this
             # batch's rows.
             chunk_start = rows_pos[cu_q[:-1].to(torch.int64)].to(torch.int64)
+            if kpool_check:
+                # The cases the pooled write must stitch from the tail buffer:
+                # a request contributing fewer rows than one pool to this
+                # chunk, and one resuming mid-pool after an earlier chunk.
+                q_lens = (cu_q[1:] - cu_q[:-1]).tolist()
+                starts = chunk_start.tolist()
+                logger.info(
+                    "[glm5 kpool] prefill chunk reqs=%d short_q=%d "
+                    "mid_pool_starts=%d",
+                    len(q_lens),
+                    sum(q < index_kpool for q in q_lens),
+                    sum(st % index_kpool != 0 for st in starts),
+                )
 
             _kpool_write_completed_pools(
                 kv_cache,

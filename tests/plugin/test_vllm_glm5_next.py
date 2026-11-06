@@ -313,3 +313,53 @@ def test_rebinding_keeps_the_tail_buffer_pointer(monkeypatch):
     assert not first.any()
     op.allocate_tail_cache("x.indexer.k_cache", 16, 4, 128, torch.device("cpu"))
     assert op._TAIL_CACHES["x.indexer.k_cache"].shape[0] == 16
+
+
+def _prefill_chunk(seq_lens, q_lens, reqs_start=0, reqs_end=None, tokens_per_state=4):
+    from atom.plugin.vllm.attention.metadata import (
+        AiterMlaSparseIndexerMetadataBuilder as Builder,
+    )
+
+    reqs_end = len(seq_lens) if reqs_end is None else reqs_end
+    qsl = torch.tensor([0, *torch.tensor(q_lens).cumsum(0).tolist()], dtype=torch.int32)
+    builder = SimpleNamespace(
+        device=torch.device("cpu"), max_prefill_buffer_size=1 << 20
+    )
+    return Builder._build_indexer_one_prefill_chunk(
+        builder,
+        reqs_start,
+        reqs_end,
+        qsl,
+        torch.tensor(seq_lens, dtype=torch.int32),
+        torch.zeros(len(seq_lens), 8, dtype=torch.int32),
+        tokens_per_state=tokens_per_state,
+    )
+
+
+def test_prefill_chunks_shorter_than_a_pool_publish_only_complete_pools():
+    """Whole prompts shorter than index_kpool, one exactly a pool, and chunks
+    that resume an earlier chunk and end mid-pool. Only COMPLETE pools are
+    cached and scored, counted over each request's whole context so far."""
+    # seq_lens: tokens known after this chunk; q_lens: rows this chunk adds.
+    m = _prefill_chunk(seq_lens=[1, 3, 4, 9, 7, 6], q_lens=[1, 3, 4, 2, 3, 1])
+    assert m.pool_cu_seq_lens.tolist() == [0, 0, 0, 1, 3, 4, 5]
+    assert m.total_pools == 5
+    assert (m.token_start, m.token_end, m.num_reqs) == (0, 14, 6)
+
+
+def test_prefill_chunk_of_a_later_request_range_offsets_its_rows():
+    """A chunk covering requests 2.. of the batch: its row range starts after
+    the earlier requests' rows and its pooled offsets restart at zero."""
+    m = _prefill_chunk(
+        seq_lens=[5, 2, 3, 8], q_lens=[5, 2, 3, 1], reqs_start=2, reqs_end=4
+    )
+    assert (m.reqs_start, m.reqs_end) == (2, 4)
+    assert (m.token_start, m.token_end) == (7, 11)
+    assert m.pool_cu_seq_lens.tolist() == [0, 0, 2]
+    assert m.total_pools == 2
+
+
+def test_unpooled_prefill_chunk_has_no_pool_metadata():
+    m = _prefill_chunk(seq_lens=[3, 9], q_lens=[3, 9], tokens_per_state=1)
+    assert m.pool_cu_seq_lens is None
+    assert m.total_pools == 0
