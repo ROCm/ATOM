@@ -2160,10 +2160,9 @@ async def _chat_completions(
             template_kwargs=merged_kwargs,
         )
         if assistant_prefix is not None:
-            prompt_or_tokens, continues_reasoning = continue_prompt(
+            prompt_or_tokens, _reasoning = continue_prompt(
                 prompt_or_tokens, assistant_prefix, _reasoning
             )
-            _reasoning = replace(_reasoning, starts_open=continues_reasoning)
 
         await _configure_structured_output(
             sampling_params,
@@ -2400,6 +2399,71 @@ async def _echo_text(request: CompletionRequest) -> str:
     return await asyncio.to_thread(tokenizer.decode, prompt)
 
 
+async def _zero_token_output(
+    request: BetaCompletionRequest, prompt_or_tokens: str | list[int]
+) -> dict[str, Any]:
+    """The output ``max_tokens: 0`` asks for, made without the engine.
+
+    DeepSeek's completions take ``max_tokens >= 0``, and 0 generates nothing:
+    the reply is its ``echo`` alone, ended by its length cap. The prompt is
+    tokenized as the engine would (``encode_prompt``) for its usage and the
+    context check, and the output goes to the builders a generated one does,
+    so the response has the same shape.
+    """
+    if isinstance(prompt_or_tokens, str):
+        encoded = await asyncio.to_thread(
+            engine.io_processor.encode_prompt, prompt_or_tokens
+        )
+        prompt_ids = list(
+            encoded.token_ids if isinstance(encoded, PrefixEncoding) else encoded
+        )
+    else:
+        prompt_ids = list(prompt_or_tokens)
+    _validate_context_length(len(prompt_ids), 0, _get_engine_max_model_len())
+    output: dict[str, Any] = {
+        "text": "",
+        "finish_reason": "max_tokens",
+        "num_tokens_input": len(prompt_ids),
+        "num_tokens_output": 0,
+    }
+    if request.return_token_ids:
+        output["prompt_token_ids"] = prompt_ids
+    return output
+
+
+def _nothing_to_clean_up(*_args, **_kwargs) -> None:
+    """The cleanup of a stream the engine never ran."""
+
+
+def _zero_token_stream(
+    request_id: str, output: dict[str, Any], n: int, **options
+) -> AsyncGenerator[str, None]:
+    """``output`` streamed for each of ``n`` choices, as the engine's last
+    chunk would be."""
+    collector = StreamOutputCollector(request_id)
+    ended = {
+        "token_ids": [],
+        "text": output["text"],
+        "finished": True,
+        "finish_reason": output["finish_reason"],
+    }
+    stream_args = (
+        output["num_tokens_input"],
+        _nothing_to_clean_up,
+        _nothing_to_clean_up,
+    )
+    if n == 1:
+        collector.put_nowait(ended)
+        return stream_completion_response(
+            request_id, model_name, collector, 0, *stream_args, **options
+        )
+    for index in range(n):
+        collector.put_nowait((index, dict(ended)))
+    return stream_completion_response_fanout(
+        request_id, model_name, collector, list(range(n)), *stream_args, **options
+    )
+
+
 async def _completions(
     request: CompletionRequest | BetaCompletionRequest, raw_request: Request
 ):
@@ -2416,9 +2480,12 @@ async def _completions(
         _validate_return_token_ids(request.return_token_ids, request.stream)
         if beta:
             _check_beta_completion(request)
+        max_tokens = request.get_max_tokens()
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
-            max_tokens=request.get_max_tokens(),
+            # 0 (only /beta takes it) is answered without the engine, below;
+            # the other parameters are checked all the same.
+            max_tokens=max(max_tokens, 1),
             max_tokens_is_default=not any(
                 name in request.model_fields_set and getattr(request, name) is not None
                 for name in ("max_tokens", "max_completion_tokens")
@@ -2458,7 +2525,16 @@ async def _completions(
 
         # Streaming
         if request.stream:
-            if effective_n > 1:
+            if max_tokens == 0:
+                gen = _zero_token_stream(
+                    request_id,
+                    await _zero_token_output(request, prompt_or_tokens),
+                    effective_n,
+                    echo=echo,
+                    include_usage=include_usage,
+                    usage_on_finish=usage_on_finish,
+                )
+            elif effective_n > 1:
                 seq_ids, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request_fanout(
                         prompt_or_tokens,
@@ -2508,7 +2584,18 @@ async def _completions(
             )
 
         # Non-streaming
-        if effective_n > 1:
+        if max_tokens == 0:
+            output = await _zero_token_output(request, prompt_or_tokens)
+            resp = (
+                build_completion_response_multi(
+                    request_id, model_name, [output] * effective_n, echo=echo
+                )
+                if effective_n > 1
+                else build_completion_response(
+                    request_id, model_name, output, echo=echo
+                )
+            )
+        elif effective_n > 1:
             outputs = await _race_disconnect(
                 generate_async_fanout(
                     prompt_or_tokens,

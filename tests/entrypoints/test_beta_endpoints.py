@@ -215,7 +215,14 @@ def _closed(dialect=THINK):
     ],
 )
 def test_prefix_continues_the_rendered_turn(prompt, channel, prefix, expected):
-    assert continue_prompt(prompt, prefix, channel) == expected
+    expected_prompt, in_reasoning = expected
+    continued, reading = continue_prompt(prompt, prefix, channel)
+    assert continued == expected_prompt
+    assert reading.dialect is channel.dialect
+    assert reading.starts_open is in_reasoning
+    # Only a channel the prefix closed has begun the answer; with thinking
+    # off the continuation reads as an ordinary reply does.
+    assert reading.answer_started is (channel.starts_open and not in_reasoning)
 
 
 @pytest.mark.parametrize("dialect", DIALECTS)
@@ -223,6 +230,45 @@ def test_reasoning_prefix_needs_a_reply_that_begins_in_reasoning(dialect):
     # Thinking off, or a model that opens the channel itself (Qwen3).
     with pytest.raises(ValueError, match="thinking mode"):
         continue_prompt("<A>", AssistantPrefix("x", "r"), _closed(dialect))
+
+
+def _read(channel, text, chunk):
+    """``(reasoning, content)`` of ``text``: whole, as a JSON reply is read, or
+    arriving ``chunk`` characters at a time, as a stream is."""
+    if chunk is None:
+        return channel.split(text, stopped=True)
+    reader = channel.stream()
+    events = []
+    for i in range(0, len(text), chunk):
+        events += reader.process(text[i : i + chunk])
+    events += reader.flush(stopped=True)
+    reasoning = "".join(v for k, v in events if k == "reasoning_content")
+    return reasoning or None, "".join(v for k, v in events if k == "content")
+
+
+@pytest.mark.parametrize("chunk", [None, 1, 4])
+@pytest.mark.parametrize("reasoning", [None, "Plan."])
+@pytest.mark.parametrize("dialect", [THINK, MINIMAX, K3])
+def test_a_continued_answer_reads_as_the_models_own_would(dialect, reasoning, chunk):
+    """The prefix closed the channel, so what follows is the answer: think
+    markers in it are the model's words, as when the model closes the channel
+    itself, and the format's answer framing is still removed."""
+    prefix = AssistantPrefix("XML example: ", reasoning)
+    words = f"<a>{dialect.output_open_marker}x{dialect.think_end_marker}</a>"
+    continuation = words + "".join(dialect.answer_end_markers)
+    _, channel = continue_prompt("<A>", prefix, _opened(dialect))
+    whole = (
+        (reasoning or "")
+        + dialect.think_end_marker
+        + dialect.answer_open_marker
+        + prefix.content
+        + continuation
+    )
+    assert _read(_opened(dialect), whole, chunk) == (
+        reasoning,
+        prefix.content + words,
+    )
+    assert _read(channel, continuation, chunk) == (None, words)
 
 
 # --- fill-in-the-middle format -------------------------------------------------
@@ -413,6 +459,19 @@ def test_implicit_reasoning_model_continues_a_reasoning_prefix(engine, monkeypat
     assert (message["reasoning_content"], message["content"]) == (" more.", "answer")
 
 
+def test_think_tags_after_a_content_prefix_stay_in_the_content(engine, monkeypatch):
+    """Thinking mode: the prefix closed the channel, so tags the model then
+    writes are its answer's words."""
+    _template(monkeypatch, engine, "<A><think>")
+    monkeypatch.setattr(api_server, "model_starts_in_reasoning", True)
+    engine.reply = "<think>x</think>"
+    prefix = {"role": "assistant", "content": "XML example: ", "prefix": True}
+    message = _chat(api_server.beta_chat_completions, [USER, prefix])
+    assert engine.prompts == ["<A><think></think>XML example: "]
+    assert message["content"] == "<think>x</think>"
+    assert not message.get("reasoning_content")
+
+
 def test_streamed_prefix_reply_gets_the_same_prompt_and_channel(engine, monkeypatch):
     _template(monkeypatch, engine, "<A><think>")
     seen = {}
@@ -435,6 +494,7 @@ def test_streamed_prefix_reply_gets_the_same_prompt_and_channel(engine, monkeypa
     asyncio.run(api_server.beta_chat_completions(request, None))
     assert seen["prompt"] == "<A><think></think>```python\n"
     assert seen["reasoning"].starts_open is False
+    assert seen["reasoning"].answer_started is True
 
 
 @pytest.mark.parametrize(
@@ -550,6 +610,106 @@ def test_completion_options_outside_the_contract_are_400(engine, kwargs):
         _complete(api_server.beta_completions, **kwargs)
     assert exc.value.status_code == 400
     assert not engine.prompts
+
+
+@pytest.fixture
+def no_generation(engine, monkeypatch):
+    """What a zero-token completion uses: the prompt's tokens (one a
+    character here) and the context length."""
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        SimpleNamespace(
+            io_processor=SimpleNamespace(encode_prompt=lambda p: [0] * len(p))
+        ),
+    )
+    monkeypatch.setattr(api_server, "_get_engine_max_model_len", lambda: 64)
+    return engine
+
+
+def _beta_complete(**kwargs):
+    request = BetaCompletionRequest(model="m", **kwargs)
+    response = asyncio.run(api_server.beta_completions(request, None))
+    if not kwargs.get("stream"):
+        return json.loads(response.body)
+
+    async def frames():
+        return "".join([frame async for frame in response.body_iterator])
+
+    return [
+        json.loads(data)
+        for data in iter_sse_data(asyncio.run(frames()))
+        if data != "[DONE]"
+    ]
+
+
+@pytest.mark.parametrize("echo, text", [(True, "return 42"), (False, "")])
+def test_zero_max_tokens_generates_nothing(no_generation, echo, text):
+    body = _beta_complete(prompt="return 42", echo=echo, max_tokens=0)
+    assert not no_generation.prompts
+    assert [(c["text"], c["finish_reason"]) for c in body["choices"]] == [
+        (text, "length")
+    ]
+    assert body["usage"]["prompt_tokens"] == len("return 42")
+    assert body["usage"]["completion_tokens"] == 0
+
+
+def test_zero_max_tokens_counts_the_fill_in_the_middle_prompt(no_generation):
+    body = _beta_complete(prompt="def f(a):", suffix="  return b", max_tokens=0)
+    assert body["choices"][0]["text"] == ""
+    rendered = DEEPSEEK_FIM.render("def f(a):", "  return b")
+    assert body["usage"]["prompt_tokens"] == len(rendered)
+
+
+def test_zero_max_tokens_answers_every_choice(no_generation):
+    body = _beta_complete(prompt="p", echo=True, max_tokens=0, n=2, temperature=0.7)
+    assert [c["text"] for c in body["choices"]] == ["p", "p"]
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_zero_max_tokens_streams_the_echo_alone(no_generation, monkeypatch, n):
+    monkeypatch.setattr(
+        api_server, "api_compatibility_for", lambda _e: DEEPSEEK_API_COMPATIBILITY
+    )
+    payloads = _beta_complete(
+        prompt="return 42",
+        echo=True,
+        max_tokens=0,
+        stream=True,
+        stream_options={"include_usage": True},
+        n=n,
+        temperature=0.7,
+    )
+    assert not no_generation.prompts
+    texts = {}
+    for payload in payloads:
+        for choice in payload["choices"]:
+            texts[choice["index"]] = texts.get(choice["index"], "") + choice["text"]
+    assert texts == {i: "return 42" for i in range(n)}
+    # DeepSeek's contract: the last chunk carries the usage.
+    *before, last = payloads
+    assert all(payload["usage"] is None for payload in before)
+    assert last["choices"][0]["finish_reason"] == "length"
+    assert last["usage"]["prompt_tokens"] == len("return 42")
+    assert last["usage"]["completion_tokens"] == 0
+
+
+def test_zero_max_tokens_still_needs_the_prompt_to_fit(no_generation):
+    with pytest.raises(HTTPException) as exc:
+        _beta_complete(prompt="x" * 65, echo=True, max_tokens=0)
+    assert exc.value.status_code == 400
+
+
+def test_v1_completions_still_need_a_token(engine):
+    with pytest.raises(HTTPException) as exc:
+        _complete(api_server.completions, prompt="p", max_tokens=0)
+    assert exc.value.status_code == 400
+    for limit in ({"max_tokens": -1}, {"max_completion_tokens": -1}):
+        with pytest.raises(ValueError):
+            BetaCompletionRequest(prompt="p", **limit).get_max_tokens()
+    assert (
+        BetaCompletionRequest(prompt="p", max_completion_tokens=0).get_max_tokens() == 0
+    )
 
 
 def test_beta_logprobs_outside_deepseeks_range_is_invalid():

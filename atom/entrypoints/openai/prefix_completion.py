@@ -17,7 +17,7 @@ channel (Qwen3 writes line breaks into an empty one) sees the prefix without
 them.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .protocol import ChatMessage
 from .reasoning import ReasoningChannel
@@ -69,19 +69,20 @@ def take_assistant_prefix(
 
 def continue_prompt(
     prompt: str, prefix: AssistantPrefix, channel: ReasoningChannel
-) -> tuple[str, bool]:
+) -> tuple[str, ReasoningChannel]:
     """Append ``prefix`` to a prompt that has just opened the assistant turn.
 
     ``channel`` is the server's own reading of this reply: whether it begins
     inside the reasoning channel -- because the prompt opened it, or because
     the model starts there with no marker at all (DeepSeek-R1) -- and in
-    which dialect. Returns the prompt and whether the continuation still
-    begins inside the channel.
+    which dialect. Returns the prompt and how to read its continuation.
 
     A content prefix in a reply that begins in reasoning has the channel
     closed empty first: the reply continues that content, not reasoning
     about it. A format that frames the answer in a channel of its own
-    (Kimi-K3) has that channel opened before the content.
+    (Kimi-K3) has that channel opened before the content. The continuation
+    is then read as the answer: a think marker in it is the model's own
+    words, as it is when the model closes the channel itself.
     """
     if not channel.starts_open:
         if prefix.reasoning_content is not None:
@@ -89,13 +90,16 @@ def continue_prompt(
                 "reasoning_content in an assistant prefix requires thinking mode, "
                 "in which the reply begins in the reasoning channel"
             )
-        return prompt + prefix.content, False
+        return prompt + prefix.content, channel
     reasoning = prefix.reasoning_content or ""
     if prefix.reasoning_content is not None and not prefix.content:
-        return prompt + reasoning, True
+        return prompt + reasoning, channel
     dialect = channel.dialect or FALLBACK_DIALECT
     answer = dialect.think_end_marker + dialect.answer_open_marker
-    return prompt + reasoning + answer + prefix.content, False
+    return (
+        prompt + reasoning + answer + prefix.content,
+        replace(channel, starts_open=False, answer_started=True),
+    )
 
 
 def _prefix_flag(message: ChatMessage) -> bool:

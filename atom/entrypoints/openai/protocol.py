@@ -417,6 +417,17 @@ class BetaCompletionRequest(CompletionRequest):
     # a value is refused rather than dropped.
     logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] | None = None
 
+    def get_max_tokens(self) -> int:
+        """As for /v1, except that 0 is allowed: DeepSeek's completions take
+        ``max_tokens >= 0``, and 0 generates nothing (the ``echo`` alone).
+        """
+        limit = (
+            self.max_completion_tokens
+            if self.max_completion_tokens is not None
+            else self.max_tokens
+        )
+        return 0 if limit == 0 else super().get_max_tokens()
+
 
 # ============================================================================
 # Response Models
