@@ -36,7 +36,9 @@ def patch_vllm_mla_head_size() -> None:
     import vllm.config  # noqa: F401
     from vllm.transformers_utils import model_arch_config_convertor as convertor
 
-    base = convertor.ModelArchConfigConvertorBase
+    base = getattr(convertor, "ModelArchConfigConvertorBase", None)
+    if base is None or not hasattr(base, "get_head_size"):
+        return  # a vLLM without this hook has nothing to patch
     if getattr(base, "_atom_glm5_next_patched", False):
         return
 
@@ -79,7 +81,13 @@ def install_glm5_next_mla_head_size_patch() -> None:
             exc,
         )
 
-    from vllm.transformers_utils.configs.glm5_next import Glm5NextTextConfig
+    try:
+        from vllm.transformers_utils.configs.glm5_next import Glm5NextTextConfig
+    except ImportError:
+        # This runs from the platform hook for every model: a vLLM that does
+        # not know glm5_next cannot serve GLM-5.3-Flash, and must still load
+        # the plugin for everything else.
+        return
 
     if getattr(Glm5NextTextConfig, "_atom_patch_on_init", False):
         return

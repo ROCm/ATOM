@@ -23,7 +23,6 @@ Three things differ from the native path and account for all the extra code:
 from __future__ import annotations
 
 import logging
-import os
 
 import torch
 from aiter import dtypes
@@ -40,6 +39,7 @@ from atom.model_ops.glm5_next.indexer import (
     _kpool_request_index,
     _kpool_write_completed_pools,
 )
+from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
@@ -141,6 +141,92 @@ def _tail_cache(k_cache_prefix: str) -> torch.Tensor:
     return cached
 
 
+def _prefill_chunk_topk(
+    kv_cache: torch.Tensor,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    rows_pos: torch.Tensor,
+    req_idx: torch.Tensor,
+    pool_cu: torch.Tensor,
+    total_pools: int,
+    block_table: torch.Tensor,
+    index_kpool: int,
+    head_dim: int,
+    select_k: int,
+    stable_topk: bool,
+    out: torch.Tensor,
+) -> None:
+    """Request-local token indices each row of one prefill chunk attends.
+
+    Every row always gets its own open pool (the tail): with `total_pools == 0`
+    -- no request in the chunk has closed a pool yet, e.g. a prompt shorter
+    than `index_kpool` -- there is nothing to score, but the tail is still all
+    the row may attend. Leaving the row at -1 instead would be silently wrong:
+    the global-index conversion maps -1 to slot 0, and the plugin path always
+    runs sparse MLA.
+    """
+    device = q_fp8.device
+    n_rows = q_fp8.shape[0]
+    row_pos = rows_pos.to(torch.int64)
+    if total_pools == 0:
+        pool_topk = torch.full((n_rows, select_k), -1, dtype=torch.int32, device=device)
+    else:
+        k_fp8 = torch.empty((total_pools, head_dim), device=device, dtype=dtypes.fp8)
+        k_scale = torch.empty((total_pools, 1), device=device, dtype=torch.float32)
+        cp_gather_indexer_k_quant_cache(
+            kv_cache,
+            k_fp8,
+            k_scale.view(dtypes.fp8),
+            block_table,
+            pool_cu,
+            preshuffle=True,
+        )
+        pool_ks = pool_cu.to(torch.int64)[req_idx]
+        pool_ke = (pool_ks + (row_pos + 1) // index_kpool).to(torch.int32)
+        pool_ks = pool_ks.to(torch.int32)
+        pool_topk = torch.empty((n_rows, select_k), dtype=torch.int32, device=device)
+        # Same row batching as the dense plugin indexer, including the hard
+        # 2 GiB bound on one [rows, total_pools] fp32 logits buffer.
+        row_chunk = sparse_indexer_row_chunk(
+            n_rows, total_pools, envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+        )
+        for start in range(0, n_rows, row_chunk):
+            end = min(start + row_chunk, n_rows)
+            row_ks = pool_ks[start:end]
+            row_ke = pool_ke[start:end]
+            logits = fp8_mqa_logits(
+                Q=q_fp8[start:end],
+                KV=k_fp8,
+                kv_scales=k_scale.squeeze(-1).contiguous(),
+                weights=weights[start:end],
+                cu_starts=row_ks,
+                cu_ends=row_ke,
+            )
+            top_k_per_row_prefill(
+                logits,
+                row_ks,
+                row_ke,
+                pool_topk[start:end],
+                None,
+                end - start,
+                logits.stride(0),
+                logits.stride(1),
+                k=select_k,
+                stable=stable_topk,
+            )
+        # aiter's prefill top-k reports a pool's place in the chunk-wide
+        # gathered run; less its request's first pool it is the request's own
+        # (the same correction `model_ops/indexer/score.py` applies). The
+        # converter takes request-LOCAL token indices, so the expansion has to
+        # start from request-local pool ids.
+        torch.where(
+            pool_topk < 0, pool_topk, pool_topk - pool_ks.unsqueeze(1), out=pool_topk
+        )
+    kpool.expand_pools_and_append_tail(
+        pool_topk, (row_pos + 1).to(torch.int32), index_kpool, out=out
+    )
+
+
 def sparse_attn_indexer_kpool_plugin_mode(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -219,39 +305,6 @@ def sparse_attn_indexer_kpool_plugin_mode(
     num_decode_tokens = indexer_meta.num_decode_tokens
     has_decode = indexer_meta.num_decodes > 0
     has_prefill = indexer_meta.num_prefills > 0
-
-    kpool_check = os.getenv("ATOM_GLM5_KPOOL_CHECK") == "1" and not (
-        torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-    )
-    if kpool_check:
-        # Debug-only, and only here: every index below is consumed by a Triton
-        # kernel, where an out-of-range slot is an illegal access reported at
-        # some later launch rather than at its cause. Reading the extremes costs
-        # a device sync, which CUDA-graph capture forbids -- hence the switch.
-        lo = int(state_slots.min().item())
-        hi = int(state_slots.max().item())
-        blocks = kv_cache.shape[0]
-        bt_hi = -1
-        if has_decode and indexer_meta.decode is not None:
-            bt_hi = int(indexer_meta.decode.block_table.max().item())
-        logger.info(
-            "[glm5 kpool] tail_slots=[%d,%d] tail_cache=%d pool_rows=%d "
-            "cache_blocks=%d decode_bt_max=%d reqs=%d dec=%d pre=%d",
-            lo,
-            hi,
-            tail_cache.shape[0],
-            pool_rows,
-            blocks,
-            bt_hi,
-            num_reqs,
-            indexer_meta.num_decodes,
-            indexer_meta.num_prefills,
-        )
-        if hi >= tail_cache.shape[0]:
-            raise RuntimeError(
-                f"pooled tail buffer holds {tail_cache.shape[0]} slots but the "
-                f"KDA metadata handed out slot {hi}"
-            )
 
     if has_decode:
         decode_meta = indexer_meta.decode
@@ -343,19 +396,6 @@ def sparse_attn_indexer_kpool_plugin_mode(
             # closing pool must come from the tail buffer rather than from this
             # batch's rows.
             chunk_start = rows_pos[cu_q[:-1].to(torch.int64)].to(torch.int64)
-            if kpool_check:
-                # The cases the pooled write must stitch from the tail buffer:
-                # a request contributing fewer rows than one pool to this
-                # chunk, and one resuming mid-pool after an earlier chunk.
-                q_lens = (cu_q[1:] - cu_q[:-1]).tolist()
-                starts = chunk_start.tolist()
-                logger.info(
-                    "[glm5 kpool] prefill chunk reqs=%d short_q=%d "
-                    "mid_pool_starts=%d",
-                    len(q_lens),
-                    sum(q < index_kpool for q in q_lens),
-                    sum(st % index_kpool != 0 for st in starts),
-                )
 
             _kpool_write_completed_pools(
                 kv_cache,
@@ -396,81 +436,19 @@ def sparse_attn_indexer_kpool_plugin_mode(
                     "pooled prefill metadata is missing its pooled cumulative "
                     "lengths; the builder did not see tokens_per_state > 1"
                 )
-            if total_pools == 0:
-                continue
-
-            k_fp8 = torch.empty(
-                (total_pools, head_dim), device=device, dtype=dtypes.fp8
-            )
-            k_scale = torch.empty((total_pools, 1), device=device, dtype=torch.float32)
-            cp_gather_indexer_k_quant_cache(
+            _prefill_chunk_topk(
                 kv_cache,
-                k_fp8,
-                k_scale.view(dtypes.fp8),
-                chunk.block_table,
+                q_fp8[tok_a:tok_b],
+                weights[tok_a:tok_b],
+                rows_pos,
+                req_idx,
                 pool_cu,
-                preshuffle=True,
-            )
-
-            row_pos = rows_pos.to(torch.int64)
-            pool_ks = pool_cu.to(torch.int64)[req_idx]
-            pool_ke = (pool_ks + (row_pos + 1) // index_kpool).to(torch.int32)
-            pool_ks = pool_ks.to(torch.int32)
-            pool_topk = torch.empty(
-                (n_rows, select_k), dtype=torch.int32, device=device
-            )
-
-            budget_bytes = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
-            if budget_bytes > 0 and budget_bytes // (total_pools * 4) < n_rows:
-                budget_rows = budget_bytes // (total_pools * 4)
-                row_chunk = (
-                    (budget_rows // 128) * 128
-                    if budget_rows >= 128
-                    else 1 << (max(1, budget_rows).bit_length() - 1)
-                )
-            else:
-                row_chunk = n_rows
-
-            for start in range(0, n_rows, row_chunk):
-                end = min(start + row_chunk, n_rows)
-                row_ks = pool_ks[start:end]
-                row_ke = pool_ke[start:end]
-                logits = fp8_mqa_logits(
-                    Q=q_fp8[tok_a + start : tok_a + end],
-                    KV=k_fp8,
-                    kv_scales=k_scale.squeeze(-1).contiguous(),
-                    weights=weights[tok_a + start : tok_a + end],
-                    cu_starts=row_ks,
-                    cu_ends=row_ke,
-                )
-                top_k_per_row_prefill(
-                    logits,
-                    row_ks,
-                    row_ke,
-                    pool_topk[start:end],
-                    None,
-                    end - start,
-                    logits.stride(0),
-                    logits.stride(1),
-                    k=select_k,
-                    stable=stable_topk,
-                )
-
-            # aiter's prefill top-k reports a pool's place in the chunk-wide
-            # gathered run; less its request's first pool it is the request's
-            # own (the same correction `model_ops/indexer/score.py` applies).
-            # The converter below takes request-LOCAL token indices, so the
-            # expansion has to start from request-local pool ids.
-            torch.where(
-                pool_topk < 0,
-                pool_topk,
-                pool_topk - pool_ks.unsqueeze(1),
-                out=pool_topk,
-            )
-            kpool.expand_pools_and_append_tail(
-                pool_topk,
-                (row_pos + 1).to(torch.int32),
+                total_pools,
+                chunk.block_table,
                 index_kpool,
+                head_dim,
+                select_k,
+                stable_topk,
                 out=topk_indices[tok_a:tok_b],
             )
 

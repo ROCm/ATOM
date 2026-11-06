@@ -77,13 +77,14 @@ def _get_glm5_state_dtype(vllm_config: VllmConfig) -> tuple[torch.dtype, torch.d
 
 
 def _check_unsupported(vllm_config: VllmConfig) -> None:
-    """Re-raise the guards `Config.__post_init__` applies natively.
+    """Refuse what the native GLM-5.3-Flash guard cannot see in plugin mode.
 
-    Plugin mode builds a `PluginConfig` (atom/plugin/config.py) and never runs
-    ATOM `Config.__post_init__`, so the GLM-5.3-Flash feature guards there are
-    simply absent here -- an unsupported combination would start and produce
-    wrong output instead of refusing. Keep this list in step with
-    `atom/config.py`.
+    The vLLM plugin does build an ATOM `Config` (atom/plugin/config.py), so
+    `Config.__post_init__` and its GLM-5.3-Flash guard run -- but vLLM's PCP and
+    DCP sizes are never forwarded into it, so that guard always sees 1 and would
+    admit both. Speculative decoding, prefix caching and KV transfer are refused
+    because this plugin path does not implement them for the pooled indexer.
+    An unsupported combination would otherwise start and produce wrong output.
     """
     unsupported = []
     parallel = vllm_config.parallel_config

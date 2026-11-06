@@ -363,3 +363,39 @@ def test_unpooled_prefill_chunk_has_no_pool_metadata():
     m = _prefill_chunk(seq_lens=[3, 9], q_lens=[3, 9], tokens_per_state=1)
     assert m.pool_cu_seq_lens is None
     assert m.total_pools == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="runs the Triton kernels")
+def test_prefill_rows_shorter_than_a_pool_attend_their_own_tokens():
+    """A prefill chunk in which no request has closed a pool (prompts of 1, 2
+    and 3 tokens at index_kpool=4) has nothing to score, but every row must
+    still select its own open pool. A row left at -1 would be mapped to slot 0
+    by the global-index conversion and attend the wrong token."""
+    from atom.model_ops.glm5_next.geometry import topk_output_width
+    from atom.plugin.vllm.attention.glm5_kpool_indexer import _prefill_chunk_topk
+
+    dev = torch.device("cuda")
+    kpool, topk, head_dim, n_head = 4, 2048, 128, 2
+    rows_pos = torch.tensor([0, 0, 1, 0, 1, 2], dtype=torch.int64, device=dev)
+    req_idx = torch.tensor([0, 1, 1, 2, 2, 2], dtype=torch.int64, device=dev)
+    out = torch.full(
+        (6, topk_output_width(topk, kpool)), -7, dtype=torch.int32, device=dev
+    )
+    _prefill_chunk_topk(
+        kv_cache=torch.empty(0, 16, 144, dtype=torch.uint8, device=dev),
+        q_fp8=torch.zeros(6, n_head, head_dim, device=dev),
+        weights=torch.zeros(6, n_head, device=dev),
+        rows_pos=rows_pos,
+        req_idx=req_idx,
+        pool_cu=torch.zeros(4, dtype=torch.int32, device=dev),
+        total_pools=0,
+        block_table=torch.zeros(3, 1, dtype=torch.int32, device=dev),
+        index_kpool=kpool,
+        head_dim=head_dim,
+        select_k=topk // kpool,
+        stable_topk=True,
+        out=out,
+    )
+    for row, pos in enumerate(rows_pos.tolist()):
+        picked = sorted(t for t in out[row].tolist() if t >= 0)
+        assert picked == list(range(pos + 1)), (row, picked)

@@ -316,8 +316,8 @@ class AiterMlaSparseIndexerMetadataForVllm:
     prefill: AiterMlaSparseIndexerPrefillMetadataForVllm | None = None
 
     # Tokens per cached indexer row (the spec's `tokens_per_state`). 1
-    # everywhere but GLM-5.3-Flash's pooled indexer, where `slot_mapping`
-    # addresses POOLED rows and is -1 for every token that does not close a pool.
+    # everywhere but GLM-5.3-Flash's pooled indexer, whose op computes its own
+    # pooled write slots and does not read `slot_mapping`.
     tokens_per_state: int = 1
     # Cached rows per block of `block_table` (`block_size // tokens_per_state`).
     rows_per_block: int = 0
@@ -2986,29 +2986,6 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
                 offsets=offsets,
             )
 
-        # With a pooled index cache the per-token slot mapping vLLM hands us
-        # addresses tokens, but the cache holds one row per `tokens_per_state`
-        # tokens. Recompute it against pooled rows with vLLM's own helper --
-        # the same arithmetic as ATOM's native `pool_slot_mapping`, including
-        # the -1 for tokens whose pool has not closed, which the aiter write
-        # kernel skips.
-        if tokens_per_state > 1:
-            from vllm.v1.attention.backends.mla.compressor_utils import (
-                get_compressed_slot_mapping,
-            )
-
-            slot_mapping = get_compressed_slot_mapping(
-                common_attn_metadata.num_actual_tokens,
-                common_attn_metadata.slot_mapping,
-                common_attn_metadata.query_start_loc,
-                common_attn_metadata.seq_lens,
-                common_attn_metadata.block_table_tensor,
-                rows_per_block,
-                tokens_per_state,
-            )
-        else:
-            slot_mapping = common_attn_metadata.slot_mapping
-
         indexer_metadata = AiterMlaSparseIndexerMetadataForVllm(
             seq_lens=common_attn_metadata.seq_lens,
             num_reqs=common_attn_metadata.num_reqs,
@@ -3016,7 +2993,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             max_seq_len=common_attn_metadata.max_seq_len,
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             query_start_loc=common_attn_metadata.query_start_loc,
-            slot_mapping=slot_mapping,
+            slot_mapping=common_attn_metadata.slot_mapping,
             head_dim=128,
             tokens_per_state=tokens_per_state,
             rows_per_block=rows_per_block,
