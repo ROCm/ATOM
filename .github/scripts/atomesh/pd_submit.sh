@@ -463,6 +463,9 @@ else
   if [[ -n "${NODE_LIST}" ]]; then
     slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
     SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
+  else
+    # g24's Docker fails the Mesh build with rc=125; g15 hosts foreign containers.
+    SBATCH_CMD+=(--exclude pit2-p03-g15,pit2-p03-g24)
   fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
