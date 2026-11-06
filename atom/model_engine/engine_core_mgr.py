@@ -39,6 +39,7 @@ from atom.model_engine.engine_utility import (
 )
 from atom.model_engine.prefix_hash import take_shipped_chains
 from atom.model_engine.prefix_spread import PrefixSpreadRouter
+from atom.model_engine.store_aware import StoreAwareRouter
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
@@ -61,7 +62,13 @@ _WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
 # the Config field can never diverge.
-DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens", "prefix_spread")
+DP_LB_STRATEGIES = (
+    "round_robin",
+    "least_requests",
+    "least_tokens",
+    "prefix_spread",
+    "store_tokens",
+)
 DP_LB_DEFAULT = "least_requests"
 
 # Engine sockets for a multi-node run cannot use IPC paths, and the two ends
@@ -311,14 +318,14 @@ class CoreManager:
         # request on the rank holding its prompt's prefix unless that rank has
         # a prefill backlog and another is about to idle. Set exactly when
         # dp_load_balance is "prefix_spread".
-        self._prefix_router: PrefixSpreadRouter | None = None
-        if self._dp_lb_strategy == "prefix_spread":
+        self._prefix_router: PrefixSpreadRouter | StoreAwareRouter | None = None
+        if self._dp_lb_strategy in ("prefix_spread", "store_tokens"):
             if self._dp_session_affinity_enabled:
                 # Both place every request by their own rule; a session pin
                 # would undo every move.
                 raise ValueError(
-                    "--dp-load-balance prefix_spread and ATOM_DP_SESSION_AFFINITY=1 "
-                    "are two routing policies; set only one"
+                    f"--dp-load-balance {self._dp_lb_strategy} and "
+                    "ATOM_DP_SESSION_AFFINITY=1 are two routing policies; set only one"
                 )
             if not (
                 getattr(config, "enable_prefix_caching", False)
@@ -327,21 +334,34 @@ class CoreManager:
                 # No prompt hash chain reaches the router: every request is
                 # cold and goes to the lightest rank.
                 raise ValueError(
-                    "--dp-load-balance prefix_spread needs --enable_prefix_caching "
-                    "and ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
+                    f"--dp-load-balance {self._dp_lb_strategy} needs "
+                    "--enable_prefix_caching and ATOM_FRONTEND_PREFIX_HASH=1 "
+                    "(the frontend prompt hash chain)"
                 )
-            self._prefix_router = PrefixSpreadRouter(
-                envs.ATOM_DP_PREFIX_IDLE_TOKENS,
-                KVConnectorFactory.offload_tier(config),
-                config.max_num_seqs,
-            )
-            self._dp_route_counters.update(
-                dict.fromkeys(
-                    PrefixSpreadRouter.DECISIONS
-                    + ("prefix_moved_tokens", "prefix_moved_partial_total"),
-                    0,
+            if self._dp_lb_strategy == "store_tokens":
+                tier = KVConnectorFactory.offload_tier(config)
+                if not tier.loads:
+                    raise ValueError(
+                        "--dp-load-balance store_tokens needs an offload tier all "
+                        "DP ranks share (e.g. mooncake_store)"
+                    )
+                self._prefix_router = StoreAwareRouter(tier, self._dp_lb_req_equiv)
+                self._dp_route_counters.update(
+                    dict.fromkeys(StoreAwareRouter.DECISIONS, 0)
                 )
-            )
+            else:
+                self._prefix_router = PrefixSpreadRouter(
+                    envs.ATOM_DP_PREFIX_IDLE_TOKENS,
+                    KVConnectorFactory.offload_tier(config),
+                    config.max_num_seqs,
+                )
+                self._dp_route_counters.update(
+                    dict.fromkeys(
+                        PrefixSpreadRouter.DECISIONS
+                        + ("prefix_moved_tokens", "prefix_moved_partial_total"),
+                        0,
+                    )
+                )
         self._rank_routed_total = [0] * self.global_engine_count
         # Authoritative local load per rank. Request count is in-flight until
         # finish/abort; token count is queued/in-flight PREFILL work and is
