@@ -216,6 +216,27 @@ class SpurDispatchTest(unittest.TestCase):
             log = self.run_dir / f"rank-{rank}/host-memory-combined.log"
             self.assertIn("cache cleanup completed", log.read_text())
 
+    def test_host_cache_cleanup_runs_only_on_listed_ranks(self):
+        self.run_job(
+            ATOMESH_ENV_ATOMESH_DROP_HOST_CACHES="1",
+            ATOMESH_ENV_ATOMESH_DROP_HOST_CACHES_RANKS="0",
+        )
+        privileged = {
+            rank: [
+                call
+                for call in self.docker_calls(rank)
+                if call[0] == "run" and "--privileged" in call
+            ]
+            for rank in range(2)
+        }
+        self.assertEqual(len(privileged[0]), 1)
+        self.assertEqual(privileged[1], [])
+        services = [c for c in self.docker_calls(1) if c[0] == "run"]
+        self.assertEqual(len(services), 1)
+        self.assertIn("NODE_RANK=1", services[0])
+        log = self.run_dir / "rank-1/host-memory-combined.log"
+        self.assertIn("skipping cache cleanup", log.read_text())
+
     def test_host_cache_cleanup_failure_blocks_service(self):
         self.run_job(
             "--spur-worker",

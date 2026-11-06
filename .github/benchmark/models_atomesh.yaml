@@ -3600,7 +3600,8 @@ models:
       # D1 on the first node (the Store stays there) and D2, D3 on the second.
       # Each decode keeps A9's per-decode load, so C264 is three A9 C88s.
       # packed_nodes sets each worker's HIP_VISIBLE_DEVICES, over the role env.
-      # The issue382 metrics sampler only runs single-node.
+      # The issue382 metrics sampler only runs single-node. Only the Store's
+      # node drops host caches: the decode-only node may deny --privileged.
       - &issue382_a9_1p3d_c264
         <<: *issue382_a9_c140
         name: issue382-a9-1p3d-c264
@@ -3628,8 +3629,13 @@ models:
           common:
             <<: *issue382_a9_env_common
             ATOMESH_ISSUE382_METRICS: '0'
+            ATOMESH_DROP_HOST_CACHES_RANKS: '0'
           prefill: *issue382_a9_env_prefill
           decode: *issue382_a9_env_decode
+        runner:
+          # The A9 nodes plus g40, which also denies the privileged cache drop.
+          exclude_nodes: pit2-p03-g08,pit2-p03-g10,pit2-p03-g12,pit2-p03-g15,pit2-p03-g23,pit2-p03-g25,pit2-p03-g40
+          time_limit: 04:00:00
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c180
         concurrency:

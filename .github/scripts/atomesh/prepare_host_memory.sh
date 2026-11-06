@@ -8,6 +8,14 @@ enabled="${ATOMESH_ENV_ATOMESH_DROP_HOST_CACHES:-${ATOMESH_DROP_HOST_CACHES:-0}}
 [[ "${enabled}" == "1" ]] || exit 0
 image="$1"
 container="${2}-host-cache-drop"
+rank="${3:-}"
+# Comma-separated node ranks that drop; unset means every rank. Nodes hosting
+# no Store need no clean caches, and some deny the privileged helper.
+ranks="${ATOMESH_ENV_ATOMESH_DROP_HOST_CACHES_RANKS:-${ATOMESH_DROP_HOST_CACHES_RANKS:-}}"
+if [[ -n "${ranks}" && -n "${rank}" && ",${ranks// /}," != *",${rank},"* ]]; then
+  echo "[host-memory] rank ${rank} is not in ATOMESH_DROP_HOST_CACHES_RANKS=${ranks}; skipping cache cleanup"
+  exit 0
+fi
 cleanup_timeout="${ATOMESH_ENV_ATOMESH_HOST_CACHE_DROP_TIMEOUT:-${ATOMESH_HOST_CACHE_DROP_TIMEOUT:-180}}"
 if [[ ! "${cleanup_timeout}" =~ ^[1-9][0-9]*$ ]]; then
   echo "[host-memory][FAIL] ATOMESH_HOST_CACHE_DROP_TIMEOUT must be a positive integer" >&2

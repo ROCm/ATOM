@@ -348,7 +348,7 @@ EOF
   fi
 
   bash "${REPO_ROOT}/.github/scripts/atomesh/prepare_host_memory.sh" \
-    "${DOCKER_IMAGE}" "${container}" \
+    "${DOCKER_IMAGE}" "${container}" "${rank}" \
     2>&1 | tee "${rank_dir}/host-memory-${execution_phase}.log" || return $?
 
   docker_args=(
@@ -881,7 +881,7 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
           "'"${REPO_ROOT}"'" "'"${RUN_DIR}"'" "'"${DOCKER_IMAGE}"'" "'"${ENV_FILE}"'" "'"${SLURM_JOB_ID}"'")"
       fi
       bash "'"${REPO_ROOT}"'/.github/scripts/atomesh/prepare_host_memory.sh" \
-        "'"${DOCKER_IMAGE}"'" "${container}" \
+        "'"${DOCKER_IMAGE}"'" "${container}" "${rank}" \
         2>&1 | tee "${rank_dir}/host-memory-${execution_phase}.log"
       nested_docker_args=()
       if [[ -d /shared_nfs ]]; then
