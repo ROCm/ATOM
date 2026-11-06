@@ -14,6 +14,7 @@ from typing import Annotated, Any
 import numpy as np
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     NonNegativeInt,
@@ -433,6 +434,55 @@ class CompletionRequest(BaseModel):
         if self.max_tokens is not None:
             return validate_max_tokens(self.max_tokens)
         return DEFAULT_MAX_TOKENS
+
+
+def _one_or_many(value: Any) -> Any:
+    """A single stop string as a list of one."""
+    return [value] if isinstance(value, str) else value
+
+
+# DeepSeek's API takes one stop string or a list of them.
+OneOrManyStops = Annotated[list[str] | None, BeforeValidator(_one_or_many)]
+
+
+class BetaChatCompletionRequest(ChatCompletionRequest):
+    """``/beta/chat/completions``: Chat with DeepSeek's beta contract.
+
+    A final assistant message may carry ``prefix: true`` to be continued
+    (see ``prefix_completion``), and ``stop`` may be a single string.
+    """
+
+    stop: OneOrManyStops = None
+
+
+class BetaCompletionRequest(CompletionRequest):
+    """``/beta/completions``: completions with DeepSeek's FIM parameters.
+
+    ``/v1/completions`` does not declare these, so it ignores them, as it
+    always has.
+    """
+
+    stop: OneOrManyStops = None
+    # Text after the gap that fill-in-the-middle asks the model to fill.
+    suffix: str | None = None
+    # Only with `stream`: `include_usage` puts `usage` on every chunk.
+    stream_options: dict[str, Any] | None = None
+    # Return the prompt ahead of the completion; not with `suffix`.
+    echo: bool | None = False
+    # DeepSeek's range. Completions return no token probabilities yet, so
+    # a value is refused rather than dropped.
+    logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] | None = None
+
+    def get_max_tokens(self) -> int:
+        """As for /v1, except that 0 is allowed: DeepSeek's completions take
+        ``max_tokens >= 0``, and 0 generates nothing (the ``echo`` alone).
+        """
+        limit = (
+            self.max_completion_tokens
+            if self.max_completion_tokens is not None
+            else self.max_tokens
+        )
+        return 0 if limit == 0 else super().get_max_tokens()
 
 
 # ============================================================================

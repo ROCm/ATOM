@@ -8,6 +8,7 @@ ATOM (AiTer Optimized Model) supports three parallelism strategies for distribut
 |-------------|----------|---------|---------------|
 | Tensor Parallel (TP) | `-tp N` / `--tensor-parallel-size N` | Shard weights across GPUs | NCCL AllReduce |
 | Data Parallel (DP) | `-dp N` / `--data-parallel-size N` | Replicate model, split requests | Gloo AllReduce (CPU) |
+| Sequence Parallel (SP) | `-sp N` / `--sequence-parallel-size N` | Split each batch's tokens across GPUs (Ulysses; `-tp 1`, `-pp 1`, DP1, no EP / TBO / speculative decoding / KV transfer / RapidServe / image input, MHA with heads divisible across the ranks; validated only on MiniMax-M3 MXFP4 at SP4; KV replication, i.e. fewer KV heads than SP ranks, untested) | NCCL All-to-All, AllGather/ReduceScatter |
 | Expert Parallel (EP) | `--enable-expert-parallel` | Distribute MoE experts across GPUs | MORI All-to-All |
 | DP Attention | `--enable-dp-attention` | Flatten DP into TP for MoE layers | NCCL AllGather/ReduceScatter |
 
@@ -504,6 +505,9 @@ This means each GPU runs an independent attention computation (no TP AllReduce f
 | `atom/model_ops/linear.py` | `ColumnParallelLinear`, `RowParallelLinear`, `QKVParallelLinear`, `MergedColumnParallelLinear` |
 | `atom/model_ops/moe.py` | `FusedMoE`, `FusedMoEParallelConfig` (EP configuration and expert distribution) |
 | `atom/model_ops/fused_moe/mori_prepare_finalize.py` | `MoriPrepareAndFinalize` (MORI dispatch/combine for EP) |
+| `atom/model_engine/pp_engine_core.py` | Pipeline-parallel stage loops (head / downstream) |
+| `atom/distributed/pp_comm.py` | What crosses a PP stage boundary: `_PP_PROXY_KEYS` (`hidden_states`, `residual`, `block_residual`, ...) plus `PP_AUX_KEY` (`pp_aux`) |
+| `atom/spec_decode/pp_aux_relay.py` | `PPAuxRelay`: speculative decoding under PP. The drafter lives on the last stage; earlier stages capture the target aux hidden states they own and send them on under `pp_aux` |
 
 ---
 

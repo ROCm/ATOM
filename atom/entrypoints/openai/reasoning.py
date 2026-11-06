@@ -148,6 +148,11 @@ class ReasoningFilter:
     output then begins *inside* the channel with no opening tag, so nothing in
     the text says so and the filter must be told.
 
+    ``answer_started`` is for a prompt that has begun the answer itself (an
+    assistant prefix's content): the output is read as the text after the
+    channel's end marker is, its framing removed and any think markers in it
+    the model's own words.
+
     ``dialect`` is the one this model speaks. Go through
     :class:`ReasoningChannel` rather than passing it by hand.
 
@@ -167,6 +172,7 @@ class ReasoningFilter:
         starts_thinking: bool = False,
         dialect: ReasoningDialect | None = None,
         literal_answer: bool = False,
+        answer_started: bool = False,
     ) -> None:
         self.starts_thinking = starts_thinking
         self.dialect = dialect
@@ -185,12 +191,14 @@ class ReasoningFilter:
         self._open_markers = frozenset(
             (speaking.output_open_marker,) if speaking.output_open_marker else ()
         )
-        self.state = 1 if starts_thinking else (2 if literal_answer else 0)
+        self.state = (
+            1 if starts_thinking else (2 if literal_answer or answer_started else 0)
+        )
         # Nothing has been released yet, so an end marker arriving now sits at
         # offset 0 -- the only place it means "I did not think this turn"
         # (MiniMax-M3's trained form for a no-thinking turn). Anywhere else it
         # is the model's own words.
-        self._at_offset_zero = not starts_thinking
+        self._at_offset_zero = self.state == 0
         # The channel's text so far, kept only by a dialect whose answer can
         # close inside the channel, in case the channel turns out to have been
         # the reply. One string, dropped when the channel ends.
@@ -366,11 +374,16 @@ class ReasoningChannel:
     that turns thinking off renders a prompt that does not, and OR-ing the
     model-level fact in regardless made an ordinary answer come back as
     ``reasoning_content`` with empty ``content``. The caller resolves it.
+
+    ``answer_started``: the prompt has begun the answer itself -- an
+    assistant prefix's content (``prefix_completion``) -- so the output reads
+    as it would after the model's own end marker.
     """
 
     dialect: ReasoningDialect | None = None
     starts_open: bool = False
     literal_answer: bool = False
+    answer_started: bool = False
 
     def split(self, text: str, *, stopped: bool) -> tuple[str | None, str]:
         """A complete output as ``(reasoning, content)``: the stream's own
@@ -391,6 +404,7 @@ class ReasoningChannel:
             starts_thinking=self.starts_open,
             dialect=self.dialect,
             literal_answer=self.literal_answer,
+            answer_started=self.answer_started,
         )
 
 

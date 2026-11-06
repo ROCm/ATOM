@@ -54,6 +54,12 @@ Key entry points:
   `atom/model_engine/dynamic_chunking.py` (latency model, pure) and
   `dynamic_chunking_worker.py` (startup sweep and runtime timing in the runner),
   sized by `Scheduler._dynamic_chunk_limit`
+- Ulysses sequence parallel (`-sp`, on the PCP rank dimension):
+  `atom/distributed/ulysses_sp.py` (the SP group, the token shard / gather and
+  the QKV exchange), `group_agreement.py` (verdicts every rank of a CPU group
+  takes alike); the model runs on a rank's token range through `atom/utils/sp_wrapper.py`; the
+  attention and its head gather in `atom/model_ops/sp_attention.py`, and the MXFP4 MoE
+  through AITER MegaMoE in `atom/model_ops/fused_moe/sp_mega_moe.py`
 - Mono decode (fused per-layer decode kernels): the shared mechanisms in `atom/mono/`
   (`runtime/`: TP consensus and a runner's bind-then-agree construction
   (`consensus.bind_agreed`), peer memory and its owned buffer (`lifecycle`),
