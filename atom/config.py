@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
     checkpoint_layer_key,
@@ -2069,6 +2070,9 @@ class Config:
     dcp_config: DCPConfig = field(default_factory=DCPConfig)
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
+    # Ulysses shards tokens and exchanges them for heads around attention.
+    # Its workers form AITER's PCP process group; see `pcp_group_size`.
+    sequence_parallel_size: int = 1
     enforce_eager: bool = False
     # Number of vocabulary positions that carry a real token. A checkpoint
     # whose embedding matrix is padded up to a friendlier width -- Qwen3 rounds
@@ -2234,6 +2238,10 @@ class Config:
         return visible if 0 < visible < tp else tp
 
     @property
+    def pcp_group_size(self) -> int:
+        return pcp_group_size_of(self)
+
+    @property
     def capture_sizes(self) -> list[int]:
         """The declared CUDAGraph capture ladder, in batch sizes.
 
@@ -2315,7 +2323,111 @@ class Config:
             )
         )
 
+    def _init_sequence_parallel(self) -> None:
+        """Validate Ulysses SP, which runs over AITER's PCP process group."""
+        sp = self.sequence_parallel_size
+        if self.parallel_config.data_parallel_size != 1 or self.enable_dp_attention:
+            raise ValueError(
+                "Ulysses SP currently requires data_parallel_size=1 without "
+                "--enable-dp-attention: the DP MoE forward path does not "
+                "gather/scatter SP token shards."
+            )
+        if self.tensor_parallel_size != 1:
+            raise ValueError(
+                f"--sequence-parallel-size {sp} requires --tensor-parallel-size 1: "
+                "Ulysses SP requires unsharded attention projections."
+            )
+        if self.pipeline_parallel_size != 1:
+            raise ValueError("Ulysses SP is not validated with pipeline parallelism.")
+        if self.enable_expert_parallel:
+            raise ValueError("Ulysses SP is not validated with expert parallelism.")
+        if self.prefill_context_parallel_size != 1:
+            raise ValueError(
+                "--sequence-parallel-size and --prefill-context-parallel-size "
+                "both claim the same rank dimension; set only one."
+            )
+        if self.enable_tbo or self.enable_tbo_decode:
+            raise ValueError("Ulysses SP does not support TBO token slicing.")
+        if self.compilation_config.level == CompilationLevel.DYNAMO_AS_IS:
+            raise ValueError(
+                "Ulysses SP does not support --level 1: fullgraph cannot trace "
+                "its decode token gather."
+            )
+        # Each rank reads its token shard from the shared input buffer.
+        if self.max_num_batched_tokens % sp:
+            raise ValueError(
+                f"--sequence-parallel-size {sp} must divide "
+                f"--max-num-batched-tokens ({self.max_num_batched_tokens})."
+            )
+        # Also keeps each TR_HYBRID decode token bucket one (bs, q=1) request
+        # bucket, which the inline-recorded sp_attention_fp8 relies on.
+        if self.speculative_config is not None:
+            raise ValueError(
+                "Ulysses SP does not support speculative decoding: draft model "
+                "inputs and auxiliary hidden states are not sequence-sharded."
+            )
+        if self.kv_transfer_config:
+            raise ValueError(
+                "Ulysses SP does not support KV transfer or offload connectors: "
+                "they address KV by TP rank, while each SP rank holds 1/SP of "
+                "the KV heads."
+            )
+        if self.enable_rapidserve:
+            raise ValueError(
+                "Ulysses SP does not support --enable-rapidserve: it hands KV "
+                "over by TP rank only."
+            )
+        # Every vision tower but MiniMax-M3's is built from this config; M3
+        # builds none under SP (`image_input_refusal`) and serves text.
+        if getattr(self.hf_config, "_multimodal_config", None) is not None:
+            raise ValueError(
+                "Ulysses SP does not support multimodal checkpoints: it does "
+                "not shard the inputs_embeds a vision tower feeds the model."
+            )
+        # Local import: atom.utils pulls in atom.config at module scope.
+        from atom.utils import get_hf_text_config
+        from atom.utils.selector import Family, attn_family
+
+        hf_text = get_hf_text_config(self.hf_config)
+        if attn_family(hf_text) is not Family.MHA:
+            raise ValueError(
+                "Ulysses SP supports MHA models only; MLA and recurrent "
+                "attention do not exchange SP token shards."
+            )
+        from atom.distributed.ulysses_sp import sp_head_shards
+
+        heads = hf_text.num_attention_heads
+        if heads % sp:
+            raise ValueError(
+                f"--sequence-parallel-size {sp} does not shard the {heads} "
+                "query heads evenly."
+            )
+        sp_head_shards(getattr(hf_text, "num_key_value_heads", None) or heads, sp)
+
+    def _init_moe_backend(self) -> None:
+        self.moe_backend = self.moe_backend.strip().lower()
+        if self.moe_backend not in ("standard", "mega"):
+            raise ValueError(
+                "moe_backend must be one of {'standard', 'mega'}, "
+                f"got {self.moe_backend!r}"
+            )
+        # Under Ulysses SP, `mega` selects SP MegaMoE (sp_mega_moe.py) instead.
+        if self.moe_backend != "mega" or self.sequence_parallel_size > 1:
+            return
+        if not self.enable_expert_parallel:
+            raise ValueError(
+                "moe_backend='mega' requires expert parallelism; pass "
+                "--enable-expert-parallel, or --sequence-parallel-size for SP MegaMoE."
+            )
+        if self.moe_all2all_backend == "rccl":
+            raise ValueError(
+                "moe_backend='mega' owns its MoRI transport and cannot use the "
+                "experimental RCCL prepare/finalize backend"
+            )
+
     def __post_init__(self):
+        if self.sequence_parallel_size < 1:
+            raise ValueError("sequence_parallel_size must be at least 1")
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
@@ -2340,22 +2452,7 @@ class Config:
                 f"got {self.prefill_admit_policy!r}"
             )
 
-        self.moe_backend = self.moe_backend.strip().lower()
-        if self.moe_backend not in ("standard", "mega"):
-            raise ValueError(
-                "moe_backend must be one of {'standard', 'mega'}, "
-                f"got {self.moe_backend!r}"
-            )
-        if self.moe_backend == "mega" and not self.enable_expert_parallel:
-            raise ValueError(
-                "moe_backend='mega' requires expert parallelism; "
-                "pass --enable-expert-parallel."
-            )
-        if self.moe_backend == "mega" and self.moe_all2all_backend == "rccl":
-            raise ValueError(
-                "moe_backend='mega' owns its MoRI transport and cannot use the "
-                "experimental RCCL prepare/finalize backend"
-            )
+        self._init_moe_backend()
 
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
@@ -2498,6 +2595,19 @@ class Config:
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
         self._check_kv_cache_dtype()
+        if hasattr(self, "kv_transfer_config") and isinstance(
+            self.kv_transfer_config, str
+        ):
+            import json
+
+            try:
+                self.kv_transfer_config = json.loads(self.kv_transfer_config)
+            except json.JSONDecodeError:
+                import ast
+
+                self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        if self.sequence_parallel_size > 1:
+            self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:
@@ -2593,17 +2703,6 @@ class Config:
             else torch.bfloat16
         )
 
-        if hasattr(self, "kv_transfer_config") and isinstance(
-            self.kv_transfer_config, str
-        ):
-            import json
-
-            try:
-                self.kv_transfer_config = json.loads(self.kv_transfer_config)
-            except json.JSONDecodeError:
-                import ast
-
-                self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
         # After the parse above: the P/D clause reads `kv_role` off
         # `kv_transfer_config`, which arrives from the CLI as a string.
         self._resolve_throughput_step_interval()
@@ -2972,6 +3071,9 @@ class Config:
         # runtime — the same stale-artifact hazard documented for the vocab-embed
         # flag below.
         factors.append(self.prefill_context_parallel_size)
+        if self.sequence_parallel_size > 1:
+            # SP and PCP use the same rank dimension but different head shapes.
+            factors.append(("sp", self.sequence_parallel_size))
         # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
         # is this rank's one head under TP and all `sparse_num_index_heads` of
         # them under CP (minimax_m3/model.py, linear.py), so the traced graph and the
