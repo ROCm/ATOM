@@ -4,9 +4,10 @@
 """`tensor_model_parallel_all_reduce_add(routed, shared)` against what
 `MoE.combine_outputs` did before, `tensor_model_parallel_all_reduce(routed + shared)`:
 the same bits on every rank, at V4.1-Flash's MoE combine width (5120 bf16), for
-decode row counts the fused Gluon kernel takes and prefill ones past its cap, eager
-and replayed in a HIP graph. Needs 4 gfx1250 GPUs and aiter's fused op
-(ROCm/aiter#7488)."""
+decode row counts the fused kernel takes and prefill ones past its cap, eager and
+replayed in a HIP graph. The fused kernel is aiter's HIP Lamport one-shot all-reduce
+(ROCm/aiter#7499, 8 MiB at TP4) when aiter has it, else the Gluon all-reduce
+(ROCm/aiter#7488, 4 MiB). Needs 4 gfx1250 GPUs and one of them."""
 
 import multiprocessing as mp
 import os
@@ -21,8 +22,11 @@ pytest.importorskip(
 
 _WORLD = 4
 _DIM = 5120
-_FUSED_ROWS = (1, 8, 48, 96, 288, 409)  # 409 x 5120 bf16 is the 4 MiB Gluon cap
-_FALLBACK_ROWS = (410, 4096)
+_ROW_BYTES = _DIM * 2
+_GLUON_CAP = 4 * 1024 * 1024  # 409 rows
+# Decode row counts, the Gluon cap and one past it; the Lamport cap and one past it
+# are added at run time, and 4096 rows is past both.
+_ROWS = (1, 8, 48, 96, 288, 409, 410, 4096)
 _GRAPH_ROWS = (48, 8, 288, 1)
 _REPLAYS = 10
 
@@ -38,10 +42,41 @@ def _differ(a, b):
     return int((a.view(torch.int16) != b.view(torch.int16)).sum())
 
 
-def _checks(rank):
-    """(fused kernel calls, elements differing from the add + all-reduce, elements
-    differing across ranks, elements differing over graph replays)."""
+def _hook_fused_kernels(fused_calls):
+    """Count the calls that reach a fused all-reduce add kernel; returns the largest
+    input in bytes the fused path takes on this aiter."""
+    import inspect
+
     import aiter.ops.triton.comms.all_reduce as gluon
+    from aiter.dist.device_communicators import custom_all_reduce
+    from aiter.dist.parallel_state import get_tp_group
+
+    plain = gluon.all_reduce
+
+    def counting_gluon(*args, **kwargs):
+        fused_calls[0] += kwargs.get("x2") is not None
+        return plain(*args, **kwargs)
+
+    gluon.all_reduce = counting_gluon
+    # The Gluon kernel folds the add only where it takes the second input (#7488).
+    cap = _GLUON_CAP if "x2" in inspect.signature(plain).parameters else 0
+    lamport = getattr(custom_all_reduce.CustomAllreduce, "lamport_ar_add", None)
+    if lamport is not None:
+
+        def counting_lamport(self, *args, **kwargs):
+            fused_calls[0] += 1
+            return lamport(self, *args, **kwargs)
+
+        custom_all_reduce.CustomAllreduce.lamport_ar_add = counting_lamport
+        ca_comm = get_tp_group().device_communicator.ca_comm
+        cap = max(cap, getattr(ca_comm, "_lamport_max_bytes", 0))
+    return cap
+
+
+def _checks(rank):
+    """(fused kernel calls, row counts at or under the fused cap, elements differing
+    from the add + all-reduce, elements differing across ranks, elements differing
+    over graph replays)."""
     import torch.distributed as dist
     from aiter.dist.parallel_state import get_tp_group
 
@@ -49,16 +84,13 @@ def _checks(rank):
 
     comm._tbo_aware_tp_reduce = lambda tp_size: False  # no ATOM config here
     fused_calls = [0]
-    plain = gluon.all_reduce
-
-    def counting(*args, **kwargs):
-        fused_calls[0] += kwargs.get("x2") is not None
-        return plain(*args, **kwargs)
-
-    gluon.all_reduce = counting
+    cap_rows = _hook_fused_kernels(fused_calls) // _ROW_BYTES
+    extra = {cap_rows, cap_rows + 1} if cap_rows else set()
+    all_rows = sorted(set(_ROWS) | extra)
+    fused_rows = sum(rows <= cap_rows for rows in all_rows)
     group = get_tp_group().device_group
     differ = across = 0
-    for i, rows in enumerate(_FUSED_ROWS + _FALLBACK_ROWS):
+    for i, rows in enumerate(all_rows):
         routed, shared = _pair(rows, i, rank)
         want = comm.tensor_model_parallel_all_reduce(routed + shared)
         got = comm.tensor_model_parallel_all_reduce_add(routed, shared)
@@ -83,7 +115,7 @@ def _checks(rank):
         graph.replay()
         torch.cuda.synchronize()
         replay_differ += sum(_differ(g, w) for g, w in zip(got, want))
-    return eager_fused, differ, across, replay_differ
+    return eager_fused, fused_rows, differ, across, replay_differ
 
 
 def _rank(rank, init_method, results):
@@ -142,6 +174,9 @@ def test_all_reduce_add_matches_add_then_all_reduce():
             if p.is_alive():
                 p.kill()
         assert not hung and all(p.exitcode == 0 for p in procs)
-        # Every decode row count took the fused kernel; nothing differs anywhere.
-        want = (len(_FUSED_ROWS), 0, 0, 0)
-        assert dict(results) == {r: want for r in range(_WORLD)}
+        # Every row count under the cap took the fused kernel, none past it did,
+        # and nothing differs anywhere.
+        for r in range(_WORLD):
+            eager_fused, fused_rows, *differs = results[r]
+            assert eager_fused == fused_rows, (r, eager_fused, fused_rows)
+            assert differs == [0, 0, 0], (r, differs)
