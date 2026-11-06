@@ -217,10 +217,12 @@ class KimiRMSNormGated(nn.Module):
         quant_type: QuantType | None = None,
         quant_dtype: torch.dtype | None = None,
         weight_dtype: torch.dtype | None = None,
+        e8m0_scale: bool = False,
     ):
         super().__init__()
         self.weight = atom_parameter(torch.ones(hidden_size, dtype=weight_dtype))
         self.variance_epsilon = eps
+        self.e8m0_scale = e8m0_scale
         # When ``quant_type`` names a fusable per-token scheme, the per-head
         # sigmoid-gated norm also emits (quantized, scale) so the consuming
         # o_proj skips its standalone quant; otherwise it returns a bf16 tensor.
@@ -238,6 +240,7 @@ class KimiRMSNormGated(nn.Module):
             quant_type=self.quant_type,
             quant_dtype=self.quant_dtype,
             is_prefill=is_prefill,
+            e8m0_scale=self.e8m0_scale,
         )
 
 
@@ -1126,15 +1129,20 @@ class KimiKDAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.f_b_proj",
         )
-        # rmsnorm_gated fuses only per-token FP8; otherwise o_proj quantizes itself.
+        # rmsnorm_gated fuses per-token FP8, and E8M0 per-1x128 FP8 when a head is
+        # one 128-wide group; otherwise o_proj quantizes itself.
         o_type, o_dtype = effective_layer_quant(quant_config, f"{prefix}.o_proj")
-        o_norm_fuses_quant = o_type == QuantType.per_Token and o_dtype == dtypes.fp8
+        o_e8m0 = _is_e8m0_blockscale(quant_config, o_type) and self.head_dim == 128
+        o_norm_fuses_quant = o_dtype == dtypes.fp8 and (
+            o_type == QuantType.per_Token or o_e8m0
+        )
         self.o_norm = KimiRMSNormGated(
             self.head_dim,
             eps=config.rms_norm_eps,
             quant_type=o_type if o_norm_fuses_quant else None,
             quant_dtype=o_dtype if o_norm_fuses_quant else None,
             weight_dtype=control_dtype,
+            e8m0_scale=o_e8m0,
         )
         self.o_proj = RowParallelLinear(
             self.proj_size,
