@@ -850,10 +850,8 @@ class KimiFullAttention(nn.Module):
             mla_modules=mla_modules,
             prefix=prefix,
         )
-        # A prefill token-graph recording breaks only around this layer's
-        # KV-cache write and attention; its Q projection, kv_b_proj and FP8
-        # quantization land in the graph (`MLAAttention.forward_prefill_split`).
-        # ATOM's own token graphs only: a plugin's host records its own way.
+        # Prefill token graphs record the MLA head (`forward_prefill_split`);
+        # ATOM's own graphs only, a plugin's host records its own way.
         impl = getattr(self.attn, "impl", None)
         if not is_plugin_mode() and hasattr(impl, "split_prefill_recording"):
             impl.split_prefill_recording = True
@@ -1058,11 +1056,9 @@ def _kda_recurrence(
     layer_name: str,
 ) -> torch.Tensor:
     """A prefill's causal conv and KDA recurrence, written into ``out``
-    (``[T, heads, head_dim]``) and handed back: the TR-graph break of a split
-    KDA layer, whose launches follow each request's rows and state slots.
-    ``gate`` and ``beta`` are ``[T, ...]`` so a padded bucket's rows slice like
-    ``mixed_qkv``'s. ``out`` comes zeroed from the recorded segment, so its
-    rows past the scheduled ones stay zero and a replay copies nothing."""
+    (``[T, heads, head_dim]``): the TR-graph break of a split KDA layer, whose
+    launches follow each request's rows and state slots. ``gate`` and ``beta``
+    are ``[T, ...]`` so a padded bucket's rows slice like ``mixed_qkv``'s."""
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
@@ -1710,8 +1706,7 @@ class KimiKDAAttention(nn.Module):
         mixed_qkv, out_gate, beta, gate = self._project_in(
             hidden_states, hidden_states_scale
         )
-        # Zeroed here, in the recorded segment: the region writes the scheduled
-        # rows in place, so neither it nor the replay copies the output.
+        # Zeroed in the graph: the region writes the scheduled rows in place.
         out = mixed_qkv.new_zeros(
             (mixed_qkv.shape[0], self.num_local_heads, self.head_dim)
         )
@@ -1726,8 +1721,8 @@ class KimiKDAAttention(nn.Module):
         beta: torch.Tensor,
     ) -> None:
         """`_prefill_recurrence` for `_kda_recurrence`, on ``[T, ...]`` inputs
-        and the live step's state, written into ``out[:T]``. A step with no KDA
-        metadata (the recording's dummy prefill) leaves ``out`` as it is."""
+        and the live step's state, into ``out``; the recording's dummy prefill
+        (no KDA metadata) leaves it alone."""
         fwd_ctx = get_forward_context()
         kda_metadata = getattr(fwd_ctx.attn_metadata, "kda_metadata", None)
         if kda_metadata is None:

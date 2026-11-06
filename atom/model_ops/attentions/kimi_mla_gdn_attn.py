@@ -558,12 +558,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         may pad to a recorded token-graph bucket; the regions run its scheduled
         rows (`region_graph.padded_prefill_rows`).
 
-        Not under DP. A step some DP rank prefills pads every rank to the
-        prefill bucket (`ForwardMode._pad_to_token_graph`), so a decoding or
-        idle rank would replay the prefill recording, and these regions serve a
-        prefill alone: the KDA recurrence would run the prefill conv and chunked
-        recurrence on a decode step's state slots, and hand the bucket fewer
-        rows than it records."""
+        Not under DP: a decoding or idle rank would replay the prefill
+        recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
+        prefill alone."""
         config = getattr(self.model_runner, "config", None)
         return config is not None and config.parallel_config.data_parallel_size == 1
 

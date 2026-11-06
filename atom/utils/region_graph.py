@@ -328,15 +328,9 @@ def on_scheduled_rows(fn: Callable[..., torch.Tensor], rows: int | None, *args):
 
 def on_scheduled_rows_into(fn: Callable[..., Any], out: torch.Tensor, *args):
     """``fn(out, *args)``, which writes its rows of ``out`` in place, then
-    ``out`` itself.
-
-    On a prefill padded to a token-graph bucket (`padded_prefill_rows`),
-    ``fn`` is handed ``out`` and each tensor argument of ``out``'s height cut
-    to the scheduled rows; the rows of ``out`` past them keep what the caller
-    left there -- zeros, when the recorded segment allocates ``out`` so. Unlike
-    `on_scheduled_rows` nothing is allocated, copied or zero-filled here, and
-    a region that hands back one of its inputs is delivered as it is
-    (`_Recorder._deliver`), so a replay copies nothing after it either."""
+    ``out``. On a padded prefill (`padded_prefill_rows`) ``out`` and the
+    tensor arguments of its height are cut to the scheduled rows; unlike
+    `on_scheduled_rows` nothing is allocated, copied or zero-filled."""
     height = out.shape[0]
     rows = padded_prefill_rows(height)
     if rows is None:

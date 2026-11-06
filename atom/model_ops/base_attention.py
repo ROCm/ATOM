@@ -1019,8 +1019,7 @@ def unified_attention_with_output_base(
     use_mla: bool,
     qkv: torch.Tensor,
 ) -> torch.Tensor:
-    """The attention as one TR-graph break (`_attention_region`), or, for an
-    MLA layer whose dense prefill a token graph records up to its core, that
+    """The attention as one TR-graph break, or an MLA layer's recorded prefill
     split (`MLAAttention.records_prefill_split`)."""
     if use_mla:
         atom_config = get_current_atom_config()
