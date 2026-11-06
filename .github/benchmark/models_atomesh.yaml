@@ -338,6 +338,9 @@ models:
           decode:
             workers: 1
             tp: 8
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
