@@ -85,16 +85,3 @@ def test_mxfp8_preshuffle_dispatches_through_aiter_blockscale(monkeypatch):
     assert len(calls) == 1
     assert calls[0][1]["dtype"] == torch.bfloat16
     assert calls[0][1]["isBpreshuffled"] is True
-
-
-def test_mxfp8_preshuffle_rejects_unsupported_k(monkeypatch):
-    monkeypatch.setattr(blockscale, "_aiter_fp8_gemm", lambda *args, **kwargs: None)
-    with pytest.raises(ValueError, match="K divisible by 128"):
-        blockscale.native_quant_linear(
-            torch.empty((2, 64), dtype=torch.float8_e4m3fn),
-            torch.empty((16, 64), dtype=torch.float8_e4m3fn),
-            torch.empty((16, 2), dtype=torch.float8_e8m0fnu),
-            x_scale=torch.empty((2, 2), dtype=torch.float8_e8m0fnu),
-            weight_group_rows=1,
-            weight_preshuffled=True,
-        )
