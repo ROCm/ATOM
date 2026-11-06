@@ -861,8 +861,28 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
         layer.w13_weight = atom_parameter(self._maybe_pad_weight(layer.w13_weight.data))
         layer.w2_weight = atom_parameter(self._maybe_pad_weight(layer.w2_weight.data))
-        # reshaping weights is required for aiter moe kernel.
-        shuffle_weights(layer.w13_weight, layer.w2_weight)
+        # gfx1250's fused_moe consumes GUGU-interleaved stage-1 weights. The
+        # Quark Qwen3.8 checkpoint stores its MTP expert in BF16, so it reaches
+        # this unquantized method instead of Mxfp4MoEMethod's existing gfx1250
+        # interleave path.
+        if get_gfx() == "gfx1250" and envs.ATOM_MOE_GU_ITLV:
+            layer.w13_weight.data = moe_shuffle_weight(
+                layer.w13_weight,
+                experts_cnt=layer.w13_weight.shape[0],
+                is_guinterleave=True,
+                gate_up=True,
+            )
+            layer.w2_weight.data = moe_shuffle_weight(
+                layer.w2_weight,
+                experts_cnt=layer.w2_weight.shape[0],
+                is_guinterleave=True,
+                gate_up=False,
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+        else:
+            # Reshaping weights is required for the standard aiter MoE kernel.
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -908,6 +928,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
             expert_mask=layer.expert_mask,
             activation=activation,
             num_local_tokens=scheduled_tokens_gpu,
+            gate_mode=(
+                GateMode.INTERLEAVE.value
+                if get_gfx() == "gfx1250" and envs.ATOM_MOE_GU_ITLV
+                else GateMode.SEPARATED.value
+            ),
         )
 
 
