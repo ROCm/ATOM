@@ -328,10 +328,15 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn cancel_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        query: Option<&str>,
+    ) -> Response {
         let router = self.select_router_for_request(headers, None);
         if let Some(router) = router {
-            router.cancel_response(headers, response_id).await
+            router.cancel_response(headers, response_id, query).await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -341,10 +346,15 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn delete_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn delete_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        query: Option<&str>,
+    ) -> Response {
         let router = self.select_router_for_request(headers, None);
         if let Some(router) = router {
-            router.delete_response(headers, response_id).await
+            router.delete_response(headers, response_id, query).await
         } else {
             (
                 StatusCode::NOT_FOUND,

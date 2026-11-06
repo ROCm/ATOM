@@ -168,10 +168,11 @@ impl EndpointSpec {
         State(state): State<Arc<AppState>>,
         ResponseId(response_id): ResponseId,
         headers: HeaderMap,
+        RawQuery(query): RawQuery,
     ) -> Response {
         state
             .router
-            .cancel_response(Some(&headers), &response_id)
+            .cancel_response(Some(&headers), &response_id, query.as_deref())
             .await
     }
 
@@ -179,10 +180,11 @@ impl EndpointSpec {
         State(state): State<Arc<AppState>>,
         ResponseId(response_id): ResponseId,
         headers: HeaderMap,
+        RawQuery(query): RawQuery,
     ) -> Response {
         state
             .router
-            .delete_response(Some(&headers), &response_id)
+            .delete_response(Some(&headers), &response_id, query.as_deref())
             .await
     }
 

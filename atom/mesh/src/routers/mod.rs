@@ -179,7 +179,12 @@ pub trait RouterTrait: Send + Sync + Debug {
     }
 
     /// Cancel a background response by id
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    async fn cancel_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+        _query: Option<&str>,
+    ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Cancel response not implemented",
@@ -188,7 +193,12 @@ pub trait RouterTrait: Send + Sync + Debug {
     }
 
     /// Delete a response by id
-    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    async fn delete_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+        _query: Option<&str>,
+    ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Responses delete endpoint not implemented",

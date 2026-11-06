@@ -479,11 +479,21 @@ impl RouterTrait for AtomStandaloneRouter {
         Self::not_implemented("responses_get")
     }
 
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    async fn cancel_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+        _query: Option<&str>,
+    ) -> Response {
         Self::not_implemented("responses_cancel")
     }
 
-    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    async fn delete_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _response_id: &str,
+        _query: Option<&str>,
+    ) -> Response {
         Self::not_implemented("responses_delete")
     }
 

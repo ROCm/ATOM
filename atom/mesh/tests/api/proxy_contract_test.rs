@@ -315,10 +315,14 @@ async fn response_resources_preserve_methods_queries_credentials_and_streaming()
         ),
         (
             Method::POST,
-            "/v1/responses/resp-test/cancel",
+            "/v1/responses/resp-test/cancel?beta=1&vendor=a%2Fb&vendor=c",
             StatusCode::OK,
         ),
-        (Method::DELETE, "/v1/responses/resp-test", StatusCode::OK),
+        (
+            Method::DELETE,
+            "/v1/responses/resp-test?beta=1&vendor=a%2Fb&vendor=c",
+            StatusCode::OK,
+        ),
         (
             Method::GET,
             concat!(

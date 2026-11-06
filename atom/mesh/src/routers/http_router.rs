@@ -520,15 +520,25 @@ impl RouterTrait for Router {
             .await
     }
 
-    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn cancel_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        query: Option<&str>,
+    ) -> Response {
         let endpoint = format!("v1/responses/{}/cancel", response_id);
-        self.route_simple_request(headers, &endpoint, Method::POST, None)
+        self.route_simple_request(headers, &endpoint, Method::POST, query)
             .await
     }
 
-    async fn delete_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn delete_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        query: Option<&str>,
+    ) -> Response {
         let endpoint = format!("v1/responses/{}", response_id);
-        self.route_simple_request(headers, &endpoint, Method::DELETE, None)
+        self.route_simple_request(headers, &endpoint, Method::DELETE, query)
             .await
     }
 

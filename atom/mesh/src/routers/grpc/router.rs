@@ -265,7 +265,12 @@ impl RouterTrait for GrpcRouter {
         get_response_impl(&self.responses_context, response_id).await
     }
 
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn cancel_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        response_id: &str,
+        _query: Option<&str>,
+    ) -> Response {
         cancel_response_impl(&self.responses_context, response_id).await
     }
 
