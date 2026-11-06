@@ -82,6 +82,8 @@ class EngineCore:
     # attribute because it is per-process state and each engine is spawned into
     # its own interpreter; `_setup_engine_process` is the only writer.
     _process_name = "EngineCore"
+    # `ATOM_KV_POLL_FRESH_WAIT_MS` in seconds, set by `__init__`; 0 = off.
+    _fresh_kv_poll_s = 0.0
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
