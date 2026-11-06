@@ -1,8 +1,11 @@
 # V4.1 单机 C256：#2755 + LMCache MP / Mooncake Store
 
-这是实际实验代码分支，基于#2755提交`ab5368a71c9ea22e2454d090f8752288d8245999`，保留本会话的V4.1/MP集成改动及诊断指标。不是纯main，不携带二进制、SDK、模型或数据。
+最新的 **P/D direct Store（无 CPU L1）** 实验代码和运行说明见
+[PD_DIRECT_STORE.md](PD_DIRECT_STORE.md)。下面保留的是旧单机 L1+Store 配方，不代表本轮 P/D 参数。
 
-两组都用相同的session affinity和迁移策略。`local`只有256GiB MP L1；`store`在同一个L1后增加512GiB Mooncake Store。单机共享缓存服务允许rank之间恢复KV，但各GPU的显存KV仍独立。
+此分支已同步#2755提交`0392e24daf7586cad7740d6db33247d66ae7df2e`的源码，保留本会话的V4.1/MP集成改动及诊断指标。不是纯main，不携带二进制、SDK、模型或数据。
+
+两组都使用`--dp-load-balance prefix_spread`，关闭session affinity。`local`只有256GiB MP L1；`store`在同一个L1后增加512GiB Mooncake Store。单机共享缓存服务允许rank之间恢复KV，但各GPU的显存KV仍独立。
 
 ## 运行环境
 
@@ -59,8 +62,6 @@ curl http://127.0.0.1:22300/v1/completions \
 在具有上述AgentX版本的客户端环境执行；客户端需能访问服务、模型tokenizer和公开数据源。MODEL须与服务模型名一致，URL按环境修改。
 
 ```bash
-export AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true
-export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
 export AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=0
 export AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=300
 export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
@@ -83,7 +84,13 @@ B组使用相同命令，只更换结果目录为`/tmp/agentx-store-01`。900s�
 
 ## 策略与结果解读
 
-两组均设置：session affinity=1、prefix spread=1、policy=idle_ratio、idle_tokens=32768、owner_backlog_tokens=65536、ratio=0、similar_tokens=16384、early_load=1。这是当前32k实验配置，不是早先64k/2倍的策略。Store使用TCP、4workers、1GiBbuffer、512GiBsegment；MP chunk256、LRU、TTL900s、watermark0.98。
+两组均通过`--dp-load-balance prefix_spread`选择rank，不再启用session affinity。优先复用prompt的prefix所在rank；满足新PR的负载/空闲条件时才分流，并从offload恢复prefix，并非无条件按最空闲rank发送。
+
+保留受支持的`ATOM_DP_PREFIX_IDLE_TOKENS=32768`。删除旧版`ATOM_DP_PREFIX_SPREAD`、`ATOM_DP_PREFIX_POLICY`、`ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS`、`ATOM_DP_PREFIX_RATIO`、`ATOM_DP_PREFIX_SIMILAR_TOKENS`及`ATOM_OFFLOAD_EARLY_LOAD`；脚本也会从子进程环境中移除这些变量和`ATOM_DP_SESSION_AFFINITY`，避免继承终端的旧配置。
+
+新PR在`prefix_spread`＋直接`lmcache_mp`连接器下默认开启offload prefetch，无需旧的early-load环境变量；不要将这个默认行为直接套到P/D的`multi`组合连接器。Store使用TCP、4workers、1GiBbuffer、512GiBsegment；MP chunk256、LRU、TTL900s、watermark0.98。
+
+此前实验使用旧提交`ab5368a`及旧环境变量。更新后的源码和recipe尚未完成GPU压测，旧实验结果不能当作这一版的验证结果。
 
 本脚本通过`ATOM_KV_OFFLOAD=lmcache_mp`组合offload，**不要再额外指定一个offload `--kv-transfer-config`**。
 

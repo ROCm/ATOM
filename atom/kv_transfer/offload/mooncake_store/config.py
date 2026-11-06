@@ -193,7 +193,7 @@ def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> 
             chunk is not a whole number of KV blocks.
     """
     layout = offcfg.select_offload_layout(config)
-    if layout != "dense":
+    if layout != "dense" and not uses_replay_pages(config):
         raise ValueError(
             f"the Mooncake Store offload moves only the dense KV layout; this "
             f"model resolves to {layout!r}"
@@ -277,3 +277,10 @@ def _positive_seconds(name: str, value: Any) -> float:
     if not math.isfinite(seconds) or seconds <= 0:
         raise ValueError(f"{name} must be finite and > 0, got {value!r}")
     return seconds
+
+
+def uses_replay_pages(config: Any) -> bool:
+    """V4.1 restores PAGE bytes and rebuilds per-request state by replay."""
+    return getattr(config.hf_config, "model_type", None) in (
+        "deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"
+    )

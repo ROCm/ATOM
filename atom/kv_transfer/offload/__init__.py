@@ -60,6 +60,7 @@ KVConnectorFactory.register(
     scheduler_class="MooncakeStoreOffloadScheduler",
     requires_pd_staging=False,
     offload=True,
-    # The dense codec builds from `KVCacheTensor`s; the region map is unread.
-    reads_block_regions=False,
+    # V4.1 restores PAGE bytes through the block-region map (replay pages).
+    reads_block_regions=True,
+    copies_whole_block_regions=True,
 )

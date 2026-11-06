@@ -44,7 +44,7 @@ _CHAIN_PERSON = b"atom-kv-chain-v1"
 _MEDIA_SEED_PERSON = b"atom-kv-media-v1"
 _NAMESPACE_PREFIX = "atomkv1-"
 # Bumped when the dense codec's per-chunk byte layout changes.
-CODEC_ID = "dense-opaque-block-v1"
+CODEC_ID = "dense-or-replay-page-block-v2"
 
 
 def pp_stage_layer_spans(config: Any) -> list[tuple[int, int]]:
