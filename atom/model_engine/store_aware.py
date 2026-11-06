@@ -6,9 +6,11 @@
 With an offload tier every DP rank shares (Mooncake Store), a prefix one rank
 computed can be loaded by any rank once its prefill completed. So a request's
 prefill work does not depend on where its prefix was computed, and the router
-can place every request purely by work: the rank with the least queued prefill
+can place every request purely by work: the rank with the least prefill left
 (plus `req_equiv` per in-flight request, as `least_tokens`), charging the
-request only the tokens it will actually compute.
+request only the tokens it will actually compute. `CoreManager` passes each
+rank's own report of the prefill it has left (`PREFILL_BACKLOG`) plus the
+charges of requests sent after that report, not routing-time estimates.
 
 The prefix index is rank-agnostic: sampled prompt-block hash -> (rank, request
 that computes it). A prefix whose producer finished prefilling is in the tier:
@@ -48,6 +50,8 @@ class StoreAwareRouter:
         self.produced: dict[Any, list[int]] = {}
         self._prefilling: set = set()
         self._est_hit: dict = {}
+        # Rotating tie-break, so fully tied ranks do not all go to rank 0.
+        self._cursor = 0
 
     def reset(self) -> None:
         self.produced.clear()
@@ -94,33 +98,31 @@ class StoreAwareRouter:
         prompt = int(getattr(seq, "num_prompt_tokens", 0) or 0)
         hit, src_rank, src_seq = self._longest_hit(chain)
         n = len(rank_tokens)
-        if hit == 0:
-            rank = lightest()
-            self._est_hit[seq.id] = 0
-            self._record(chain, rank, seq.id)
-            return Route(rank, "store_cold_total")
-
-        in_tier = (
+        in_tier = hit > 0 and (
             self.tier.loads
             and src_seq not in self._prefilling
             and hit >= self.tier.min_load_tokens
         )
 
         def cost(r: int) -> int:
-            return prompt - hit if (r == src_rank or in_tier) else prompt
+            if hit and (r == src_rank or in_tier):
+                return prompt - hit
+            return prompt
 
+        cursor = self._cursor
+        self._cursor += 1
         best = min(
             range(n),
             key=lambda r: (
                 rank_tokens[r] + cost(r) + self.req_equiv * rank_reqs[r],
                 r != src_rank,
-                r,
+                (r - cursor) % n,
             ),
         )
         est = prompt - cost(best)
         self._est_hit[seq.id] = est
         self._record(chain, best, seq.id, reused=est)
-        if best == src_rank:
+        if hit and best == src_rank:
             return Route(best, "store_source_rank_total")
         return Route(best, "store_hit_total" if est else "store_cold_total")
 

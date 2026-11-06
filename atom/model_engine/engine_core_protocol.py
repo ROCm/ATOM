@@ -33,3 +33,6 @@ class EngineCoreRequestType(enum.Enum):
     UTILITY_RESPONSE = b"\x08"
     # Unsolicited metrics snapshot, pushed by EngineCore on its own clock.
     METRICS = b"\x09"
+    # (seqs ingested so far, prefill tokens still to compute), pushed by a DP
+    # engine core when either changes; read by store-aware DP routing.
+    PREFILL_BACKLOG = b"\x0a"
