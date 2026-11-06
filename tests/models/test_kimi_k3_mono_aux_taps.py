@@ -95,3 +95,35 @@ def test_a_block_write_layer_records_nothing():
     runner._fallback = lambda *a, **k: (None, torch.ones(ROWS, HIDDEN), None)
     _drive(runner, layer_id=1, mono=False, prefix=torch.zeros(ROWS, HIDDEN))
     assert torch.equal(runner.aux.buffers[0], torch.full((ROWS, HIDDEN), 7.0))
+
+
+@pytest.mark.parametrize("mono", [True, False])
+def test_the_drafters_extract_gets_the_layer_return_and_the_block_bank(mono):
+    """The tap is the drafter's own extract, the function its hook runs, on
+    ``(prefix, add, add2, blocks)`` -- the layer's return layout, with mono's
+    slot stack as the bank."""
+    runner, out = _runner([1], mono=mono)
+    blocks = torch.full((ROWS, 3, HIDDEN), 4.0)
+    seen = []
+
+    def extract(output, layer):
+        seen.append((output, layer))
+        return output[0] + output[-1][:, 0]
+
+    runner.aux = AuxTaps(runner.aux.layer_ids, runner.aux.buffers, extract)
+    plan = SimpleNamespace(mono=mono, ffn_only=False, layer_id=1)
+    runner._layer(None, plan, None, out[0], blocks, None, None, None)
+    ((output, layer),) = seen
+    assert len(output) == 4 and output[1] is out[1] and output[3] is blocks
+    assert layer is runner.inner.layers[1]
+    assert torch.equal(runner.aux.buffers[0], torch.full((ROWS, HIDDEN), 6.0))
+
+
+def test_the_drafters_extract_is_not_called_for_an_untapped_layer():
+    runner, out = _runner([1], mono=True)
+    called = []
+    runner.aux = AuxTaps(
+        runner.aux.layer_ids, runner.aux.buffers, lambda o, l: called.append(o)
+    )
+    _drive(runner, layer_id=2, mono=True, prefix=out[0])
+    assert not called

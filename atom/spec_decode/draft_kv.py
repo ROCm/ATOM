@@ -1,5 +1,8 @@
 import logging
+from dataclasses import dataclass
 from functools import partial
+
+import torch
 
 from atom.config import KVCacheTensor
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
@@ -12,7 +15,32 @@ logger = logging.getLogger("atom")
 DRAFT_KV_ROWS = "draft_kv"
 
 
-def draft_kv_builder(model_runner, draft_hf):
+@dataclass(frozen=True)
+class DraftKvPoolSpec:
+    """The pool a draft declares of its own, as the draft class's
+    `kv_pool_spec`; None there is the generic SHUFFLE pool in the target's DCP
+    group.
+
+    Declaring one is the whole fact: the draft sits outside the DCP group, so
+    every rank stores every position a target block id covers. An entry is
+    then `block_size * dcp` tokens, which only the FLASH order reads, and the
+    block is the scheduler's, the unit the target's block tables count in. The
+    proposer's addressing and the pool's geometry both key on the declaration,
+    so they cannot disagree.
+    """
+
+    def pool_kwargs(self, dcp: int) -> dict:
+        """What `make_kv_pool` takes beyond the geometry."""
+        return {"blocks_per_entry": dcp, "flash_layout": True}
+
+    def block_size(self, model_runner) -> int:
+        """The block the pool is built at. The target's builder may page at a
+        kernel page instead (MLA's ATOM_MLA_PAGE_SIZE), which a block id does
+        not count in."""
+        return model_runner.block_size
+
+
+def draft_kv_builder(model_runner, draft_hf, model):
     """The KV builder a draft needs of its own, or None if it needs none.
 
     A draft is not an attention flavor; it is a model that has one. So the
@@ -23,6 +51,9 @@ def draft_kv_builder(model_runner, draft_hf):
 
     Which is why speculative decoding imports no attention anywhere: adding a
     flavor is a flag and a `make_kv_pool` on that backend.
+
+    `model` is the built draft; its `kv_pool_spec` (None, or undeclared as on
+    Eagle3, is the generic pool) adds to the pool's kwargs.
     """
     from aiter import dtypes
 
@@ -31,16 +62,22 @@ def draft_kv_builder(model_runner, draft_hf):
     backend = get_attn_backend(attn_family(draft_hf))
     if not backend.DRAFT_OWNS_KV_POOL:
         return None
+
+    spec = getattr(model, "kv_pool_spec", None)
+    if spec is None:
+        spec_kwargs, block_size = {}, None
+    else:
+        dcp = model_runner.config.decode_context_parallel_size
+        spec_kwargs = spec.pool_kwargs(dcp)
+        block_size = spec.block_size(model_runner)
     make_pool = partial(
         backend.make_kv_pool,
         draft_hf,
         world_size=model_runner.world_size,
         kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
+        **spec_kwargs,
     )
-    # A way to build it, not the pool: how many rows it has is the walk's to
-    # say, and this runs from the proposer's `__init__` -- `build_drafter`
-    # still running, `runner.drafter` not yet set, nothing to walk.
-    return DraftKvBuilder(model_runner, make_pool)
+    return DraftKvBuilder(model_runner, make_pool, block_size=block_size)
 
 
 class DraftKvBuilder(PoolRowsMixin):
@@ -52,15 +89,24 @@ class DraftKvBuilder(PoolRowsMixin):
     target's builder. It does NOT drive prepare_decode/prepare_prefill; it
     piggybacks on the target builder's metadata flow during propose.
 
-    It knows nothing about attention: the caller that resolved the draft's
-    flavor hands over a way to build the pool. What is left is the part that is
-    genuinely about being a draft -- its blocks are the target's blocks,
-    re-paged at its own block size.
+    The caller that resolved the draft's flavor hands over a way to build the
+    pool, and the pool's own construction decides the views and the scale
+    binding. What is left is the part that is genuinely about being a draft --
+    its blocks are the target's blocks.
+
+    `block_size` is the block the pool is built at; None takes the target
+    builder's, which does not exist yet when this is constructed.
     """
 
-    def __init__(self, model_runner, make_pool):
+    def __init__(self, model_runner, make_pool, block_size: int | None = None):
         self.model_runner = model_runner
         self._make_pool = make_pool
+        self._block_size = block_size
+        # A per-tensor-scale pool's one scale, shared by every layer: a
+        # one-element fp32 tensor because both `reshape_and_cache_flash` and
+        # `unified_attention` take it as a device pointer. Built at the first
+        # bind, never in a forward.
+        self._unit_scale = None
         self._kv_pool = None
         self.num_blocks = 0  # set in allocate_kv_cache_tensors
 
@@ -68,10 +114,11 @@ class DraftKvBuilder(PoolRowsMixin):
     def kv_pool(self):
         """The pool, built at the row count the walk found.
 
-        On demand because the draft model does not exist at `__init__`; every
-        reader is a sizing or binding step, which all run after it does. The
-        count is the walk's and not `num_hidden_layers`, or the pool is sized
-        off one number and addressed by another.
+        On demand because the runner cannot reach the draft model
+        (`runner.drafter`) at `__init__`; every reader is a sizing or binding
+        step, which all run after it can. The count is the walk's and not
+        `num_hidden_layers`, or the pool is sized off one number and addressed
+        by another.
 
         Indexed and not `.get(..., 0)`: this builder exists because the flavor
         owns a pool, so no rows is a contradiction, and a pool of none prices
@@ -83,13 +130,17 @@ class DraftKvBuilder(PoolRowsMixin):
         draft's kernels take the block off the cache they were bound to, so a
         block of its own would address one page with an id that counted
         another. There is nowhere in a draft to convert between the two -- it
-        has no metadata of its own. The builder is constructed after
-        `build_drafter`, which is why this is read here and not bound earlier.
+        has no metadata of its own. The builder is constructed before the
+        target builder, which is why this is read here and not bound earlier.
         """
         if self._kv_pool is None:
+            layers = self.row_counts()[DRAFT_KV_ROWS]
+            block_size = self._block_size
+            if block_size is None:
+                block_size = self.model_runner.attn_metadata_builder.block_size
             self._kv_pool = self._make_pool(
-                layers=self.row_counts()[DRAFT_KV_ROWS],
-                target_block_size=self.model_runner.attn_metadata_builder.block_size,
+                layers=layers,
+                target_block_size=block_size,
             )
         return self._kv_pool
 
@@ -138,8 +189,10 @@ class DraftKvBuilder(PoolRowsMixin):
         self.num_blocks = blocks
         pool.allocate(blocks, runner.device, buf=buf)
         logger.info(
-            "Allocated draft KV pool: %d blocks, %d B of the paged allocation",
+            "Allocated draft KV pool: %d blocks, %d B per block entry, "
+            "%d B of the paged allocation",
             blocks,
+            pool.entry_bytes,
             pool.pool_bytes(blocks),
         )
         return {}
@@ -172,11 +225,22 @@ class DraftKvBuilder(PoolRowsMixin):
         if DRAFT_KV_ROWS not in self._module_kinds(module):
             return None
         runner = self.model_runner
+        pool = self.kv_pool
         idx = self.pool_rows[DRAFT_KV_ROWS][module]
-        k_cache, v_cache = self.kv_pool.kv_views(idx)
+        if pool.flash_layout:
+            k_cache, v_cache = pool.fa_views(idx)
+            # A FLASH pool reads one per-tensor scale; with no KV scales in
+            # the checkpoint it is 1.0.
+            if self._unit_scale is None:
+                self._unit_scale = torch.ones(
+                    1, dtype=torch.float32, device=k_cache.device
+                )
+            module.k_scale = module.v_scale = self._unit_scale
+        else:
+            k_cache, v_cache = pool.kv_views(idx)
+            if runner.config.kv_cache_dtype == "fp8":
+                module.k_scale, module.v_scale = pool.scale_views(idx)
         module.max_model_len = runner.config.max_model_len
-        if runner.config.kv_cache_dtype == "fp8":
-            module.k_scale, module.v_scale = self.kv_pool.scale_views(idx)
         module.k_cache = k_cache
         module.v_cache = v_cache
         return KVCacheTensor(

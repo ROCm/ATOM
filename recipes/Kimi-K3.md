@@ -79,8 +79,15 @@ context parallelism are all served:
 With a drafter:
 
 ```bash
-export DRAFT_MODEL_PATH=/path/to/Kimi-K3-DSpark   # a directory, not a repo id
+export DRAFT_MODEL_PATH=/path/to/Inferact/Kimi-K3-DSpark   # a directory, not a repo id
 ```
+
+`DRAFT_MODEL_PATH` here and in the PP launch below is the
+[Inferact/Kimi-K3-DSpark](https://huggingface.co/Inferact/Kimi-K3-DSpark) MLA
+draft; every number in this section was measured with it. The
+[RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark) GQA
+draft has the same repo name but is a different checkpoint; see
+[its section below](#dspark-gqa-draft-radixarkkimi-k3-dspark).
 
 Add these to the launch command:
 
@@ -203,6 +210,21 @@ lives on the last stage, and earlier stages relay the target hidden states it
 reads (`atom/spec_decode/pp_aux_relay.py`). `"context_proj"` and `"layers"` are
 the draft's own unprefixed module names; they keep the draft out of online
 quant without touching the target. This is the CI case `Kimi-K3 DSpark PP2`.
+
+### DSpark GQA draft (RadixArk/Kimi-K3-DSpark)
+
+[RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark) is a
+second DSpark draft for Kimi-K3: a 5-layer GQA draft (a SpecForge DFlash
+checkpoint) with its own KV pool, served by `atom/models/kimi_k3_dspark_gqa.py`
+(`K3DSparkGQAModel`). It runs under the same `--method dspark`; the launch
+command (TP8 + DCP8) and its memory cost are in
+[recipes/DSpark.md](DSpark.md#kimi-k3-with-the-radixark-dspark-gqa-draft-tp8--dcp8--fp8-kv-cache).
+
+- Mono decode admits it (`tests/models/test_kimi_k3_mono_config_refusal.py`);
+  the mono numbers above were measured with the Inferact draft, not this one.
+- Pipeline parallelism is refused: the draft declares its own target aux
+  capture, which a drafterless PP stage cannot rebuild, so the PP launch above
+  takes the Inferact draft only.
 
 ---
 

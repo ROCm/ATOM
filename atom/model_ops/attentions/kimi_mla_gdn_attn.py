@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
@@ -16,7 +17,7 @@ from atom.model_ops.glm5_next.geometry import (
     pooled_path_enabled,
     speculative_kpool_history_size,
 )
-from atom.utils import envs
+from atom.utils import CpuGpuBuffer, envs
 
 from .aiter_mla import (
     MLA_ROWS,
@@ -27,6 +28,7 @@ from .backends import AttentionBackend
 from .gdn_attn import LINEAR_STATE_ROWS, GDNStateMixin
 from .pool_layout.page_unit_geometry import PageUnitGeometryMixin
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
+from .token_layout.slots import slot_mapping
 from .triton_mla import TritonMLAMetadataBuilder
 
 
@@ -49,6 +51,17 @@ class KimiMLAGDNBackend(AttentionBackend):
 class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def __init__(self, model_runner):
         super().__init__(model_runner=model_runner)
+        # A draft that declares a pool of its own stores every token of the
+        # target forward at that pool's entry size, so it gets slots of its
+        # own: the target's are DCP-filtered and count `block_size` tokens.
+        drafter = getattr(model_runner, "drafter", None)
+        if getattr(getattr(drafter, "model", None), "kv_pool_spec", None) is not None:
+            model_runner.forward_vars["draft_ctx_slots"] = CpuGpuBuffer(
+                self.max_num_batched_tokens,
+                dtype=torch.int64,
+                device=self.device,
+                publication_group="draft_ctx_slots",
+            )
 
     def spec_honours_state_fork(self) -> bool:
         # K3's KDA forward reads the fork table; glm5_next's does not.
@@ -506,6 +519,12 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         attn_metadata, positions = super().prepare_prefill(
             batch, running_bs, running_tokens
         )
+        scheduled_bs = batch.total_seqs_num_prefill
+        self._publish_draft_ctx_slots(
+            batch,
+            batch.num_scheduled_tokens[:scheduled_bs],
+            batch.total_tokens_num_prefill,
+        )
         if batch.block_tables == []:
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions
@@ -527,12 +546,48 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         attn_metadata, positions = super().prepare_decode(
             batch, running_bs, running_tokens, max_seqlen_q
         )
+        self._publish_draft_ctx_slots(
+            batch,
+            np.full(batch.total_seqs_num_decode, max_seqlen_q, dtype=np.int32),
+            running_tokens,
+        )
         self._attach_gdn_decode_metadata(
             batch,
             attn_metadata,
             prepare_block_tables=False,
         )
         return attn_metadata, positions
+
+    def _publish_draft_ctx_slots(
+        self, batch: ScheduledBatch, seqlens_q: np.ndarray, rows: int
+    ) -> None:
+        """Upload the draft's own slot for each scheduled token, `-1` out to
+        `rows`, the width the target's `slot_mapping` was uploaded at.
+
+        Runs after the target's metadata, whose positions and packed block
+        table it reads. No DCP filter, as the draft stores every token, and
+        `entry_tokens` per block id.
+        """
+        var = self.model_runner.forward_vars
+        buf = var.get("draft_ctx_slots")
+        if buf is None or batch.is_dummy_run:
+            return
+        if buf._publication is not None:
+            buf._publication.acquire_write()
+        n = int(seqlens_q.sum())
+        buf.np[n:rows] = -1
+        if batch.block_tables:
+            slot_mapping(
+                var["positions"].np[:n],
+                seqlens_q,
+                var["block_tables"].np,
+                self.model_runner.draft_kv_builder.kv_pool.entry_tokens,
+                out=buf.np[:n],
+                scratch=self.token_axis_scratch,
+            )
+        else:
+            buf.np[:n] = -1
+        buf.copy_to_gpu(rows)
 
     def _capture_needs_nonempty_kv(self, max_q_len: int) -> bool:
         # Kimi's dense MLA warmup needs a page even with page_size=1.
