@@ -52,7 +52,12 @@ class V4RoutingTest(unittest.TestCase):
             cls.cells = json.loads(output.read_text())["include"]
         source = (SCRIPTS / "pd_server_atom.sh").read_text()
         functions = []
-        for name in ("has_cli_flag", "is_agentic_dpa", "start_router"):
+        for name in (
+            "has_cli_flag",
+            "is_agentic_dpa",
+            "is_agentic_multi_prefill",
+            "start_router",
+        ):
             start = source.index(f"{name}() {{")
             functions.append(source[start : source.index("\n}\n", start) + 3])
         cls.script = "\n".join(functions) + """
@@ -63,7 +68,9 @@ decode_args=(--decode http://decode:8020)
 start_router
 """
 
-    def router_args(self, cell, policy=None, kind=None):
+    def router_args(
+        self, cell, policy=None, kind=None, xP="1", prefill_extra=None, decode_extra=None
+    ):
         service = cell["service"]
         result = subprocess.run(
             ["bash", "-eu", "-c", self.script],
@@ -74,11 +81,20 @@ start_router
                 ATOMESH_MESH_BINARY="/test/atomesh",
                 ATOM_PD_RANK_MAPPING_POLICY="none",
                 BENCHMARK_KIND=kind or cell["benchmark"]["kind"],
-                PREFILL_EXTRA_SERVER_ARGS=service["prefill"]["extra_args"],
-                DECODE_EXTRA_SERVER_ARGS=service["decode"]["extra_args"],
+                PREFILL_EXTRA_SERVER_ARGS=(
+                    service["prefill"]["extra_args"]
+                    if prefill_extra is None
+                    else prefill_extra
+                ),
+                DECODE_EXTRA_SERVER_ARGS=(
+                    service["decode"]["extra_args"]
+                    if decode_extra is None
+                    else decode_extra
+                ),
                 ROUTER_PORT="8000",
                 PROMETHEUS_PORT="29100",
                 RUNTIME_LOG_DIR="/tmp",
+                xP=xP,
             ),
             check=True,
             capture_output=True,
@@ -147,6 +163,21 @@ start_router
         args = self.router_args(self.cells[0], policy="random")
         self.assertEqual(args[args.index("--policy") + 1], "dp_sticky")
         self.assertIn("--dp-aware", args)
+
+    def test_agentic_multi_prefill_pins_prefill_once(self):
+        args = self.router_args(
+            self.cells[0],
+            policy="cache_aware",
+            kind="aiperf_agentic",
+            xP="2",
+            prefill_extra="",
+            decode_extra="",
+        )
+        self.assertEqual(args.count("--prefill-policy"), 1)
+        self.assertEqual(args[args.index("--prefill-policy") + 1], "dp_sticky")
+        self.assertEqual(args[args.index("--policy") + 1], "cache_aware")
+        self.assertEqual(args[args.index("--decode-policy") + 1], "cache_aware")
+        self.assertNotIn("--dp-aware", args)
 
     def test_non_agentic_policy_is_preserved(self):
         args = self.router_args(self.cells[0], policy="random", kind="random")
