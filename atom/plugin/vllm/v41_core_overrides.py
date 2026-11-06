@@ -435,14 +435,23 @@ def _attend_block(
         hidden_scale = hidden_scale.view(hidden_scale_dtype)
     step = getattr(cache, "current_step", None) or _step
     compressed = self._fork_compress(hidden, cache, step, rope)
-    # Auxiliary readers keep BF16; QKV can reuse the preceding MHC quantization.
-    q_lora, kv_pre = self.project_qkv(
-        hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
-    )
+    # PTPC wqkv_a quantizes the BF16 residual. The MXFP8 pair from the seam
+    # is the native group-32 activation, and feeding it here would apply a
+    # block scale to a per-channel GEMM. Auxiliary readers keep BF16; the
+    # native path reuses the preceding MHC quantization.
+    if getattr(self, "ptpc", False):
+        q_lora, kv_pre = self.project_qkv(hidden, None)
+    else:
+        q_lora, kv_pre = self.project_qkv(
+            hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
+        )
     qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
     self._fork_select(hidden, qr, qr_scale, cache, step, rope, compressed=compressed)
     if queries is not None:
-        qr, qr_scale = queries.take(qr, qr_scale)
+        if qr_scale is None:
+            (qr,) = queries.take(qr)
+        else:
+            qr, qr_scale = queries.take(qr, qr_scale)
     query = self.wq_b(qr, x_scale=qr_scale).unflatten(-1, (self.heads, self.head_dim))
     # One launch for both rotations, the KV row's FP8 bytes and, where a
     # decode allows it, the window write. `window_kv` is what is left for
