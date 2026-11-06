@@ -25,6 +25,7 @@ pytest.importorskip("aiter", reason="the floor reads aiter's own split ladder")
 import torch
 from aiter.ops.triton.gluon import pa_decode_gluon
 
+from atom.distributed import ulysses_sp
 from atom.model_ops.minimax_m3 import sparse_attn
 from atom.models.minimax_m3 import model as minimax_m3_model
 
@@ -118,9 +119,7 @@ def test_flydsl_startup_config(
     monkeypatch.setattr(minimax_m3_model.envs, "ATOM_PA_FLYDSL", enabled)
     monkeypatch.setattr(minimax_m3_model, "_flydsl_arch_supported", lambda: arch)
     monkeypatch.setattr(minimax_m3_model, "_flydsl_explicit_plan_api", lambda: api)
-    monkeypatch.setattr(
-        minimax_m3_model, "get_tensor_model_parallel_world_size", lambda: 4
-    )
+    monkeypatch.setattr(ulysses_sp, "attn_head_shard_size", lambda: 4)
     monkeypatch.setattr(minimax_m3_model, "_flydsl_plan_max_batch", lambda: 81792)
     atom_config = SimpleNamespace(max_num_batched_tokens=max_tokens)
     model_config = SimpleNamespace(

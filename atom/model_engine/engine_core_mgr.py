@@ -21,6 +21,7 @@ import zmq
 import zmq.asyncio
 
 from atom.config import Config
+from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
@@ -247,9 +248,8 @@ class CoreManager:
         # Runner processes behind each engine -- EngineCore's own sizing -- so
         # an engine that never answers still fails one result per rank. Read
         # with defaults: managers are also built from bare stand-in configs.
-        self._rpc_ranks_per_engine = getattr(config, "tp_world_size", 1) * getattr(
-            config, "prefill_context_parallel_size", 1
-        )
+        tp_world_size = getattr(config, "tp_world_size", 1)
+        self._rpc_ranks_per_engine = tp_world_size * pcp_group_size_of(config)
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
