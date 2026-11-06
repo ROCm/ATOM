@@ -30,7 +30,26 @@ class _VisibleAddedTokenAdapter:
         return self.source.tokenize_bytes(value)
 
 
+def tiktoken_tokenizer(encoding, vocab_size, stop_ids):
+    """The trie of a slow tiktoken tokenizer (Kimi-K3), which has no
+    serializable fast backend for `from_tokenizer`. Its special tokens stay
+    special: a grammar names them as tokens and text rules cannot match them."""
+    return LLTokenizer.from_tiktoken(
+        encoder=encoding._mergeable_ranks,
+        special_tokens=encoding._special_tokens,
+        pattern=encoding._pat_str,
+        eos_token=list(stop_ids),
+        n_vocab=vocab_size,
+        slices=[],
+    )
+
+
 def grammar_tokenizer(tokenizer, vocab_size, stop_ids):
+    encoding = getattr(tokenizer, "model", None)
+    if getattr(tokenizer, "backend_tokenizer", None) is None and hasattr(
+        encoding, "_mergeable_ranks"
+    ):
+        return tiktoken_tokenizer(encoding, vocab_size, stop_ids)
     source = from_tokenizer(tokenizer, n_vocab=vocab_size, eos_token=stop_ids)
     # llguidance 1.9.1 classifies HF added tokens as grammar specials even
     # when HF marks them special=False. Its mask can then allow <think> as
@@ -75,6 +94,10 @@ class GrammarCompiler:
         self.tokenizer = tokenizer
 
     def compile_json_schema(self, schema, tool_format=None, reasoning_end=""):
+        if tool_format and json.loads(tool_format).get("kind") == "lark":
+            # A tool-call grammar the parser declared; no response schema.
+            grammar = LLMatcher.grammar_from_lark(json.loads(tool_format)["grammar"])
+            return self._matcher(grammar)
         value = json.loads(schema)
         check_schema_safety(value)
         value = normalize_schema(value)
@@ -119,6 +142,9 @@ class GrammarCompiler:
             lark = lark.replace("start: ", "start: reasoning response\nresponse: ", 1)
             lark += f"reasoning[suffix={q(reasoning_end)}]: /(.|\\n)*/\n"
             grammar = {"grammars": [{"lark_grammar": lark}]}
+        return self._matcher(grammar)
+
+    def _matcher(self, grammar):
         matcher = LLMatcher(self.tokenizer, grammar, log_level=0)
         if matcher.is_error():
             raise ValueError(matcher.get_error())

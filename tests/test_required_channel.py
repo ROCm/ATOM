@@ -257,6 +257,9 @@ def test_openai_chat_endpoint_hands_the_channel_to_sampling(monkeypatch, tool_ch
             "num_tokens_output": 1,
         }
 
+    # The channel holds a required call only where no tool-call grammar does:
+    # the grammar replaces it (tests/entrypoints/test_tool_call_grammar.py).
+    monkeypatch.setenv("ATOM_TOOL_CALL_GRAMMAR", "0")
     monkeypatch.setattr(api_server, "model_name", "m")
     monkeypatch.setattr(api_server, "_request_logger", None)
     monkeypatch.setattr(api_server, "default_chat_template_kwargs", {})
