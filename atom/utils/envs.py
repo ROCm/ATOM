@@ -1025,12 +1025,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_TIER_WAIT_TICKS": lambda: max(
         0, int(os.getenv("ATOM_PREFILL_TIER_WAIT_TICKS", "3"))
     ),
-    # Scheduler: ticks a vacuous delayer FIRE (no rank prefillable at the
-    # decision) may keep a prefill that became admissible after the decision
-    # out of the step, so it joins the next aligned FIRE instead of running
-    # alone. 0 disables the veto.
+    # Scheduler: consecutive vacuous delayer FIREs (no rank prefillable at the
+    # decision) on which a rank with waiting work keeps a prefill that became
+    # admissible after the decision out of the step, so it joins the next
+    # aligned FIRE instead of running alone. 0 disables the veto.
     "ATOM_PREFILL_VACUOUS_VETO_TICKS": lambda: max(
-        0, int(os.getenv("ATOM_PREFILL_VACUOUS_VETO_TICKS", "2"))
+        0, int(os.getenv("ATOM_PREFILL_VACUOUS_VETO_TICKS", "8"))
     ),
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")

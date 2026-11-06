@@ -2224,14 +2224,18 @@ class Scheduler:
         # often a tier lookup that answered in between -- would run on this
         # rank alone, while every peer's decode waits for it, and its peers'
         # prefills on later ticks interrupt those decodes again. Keep it for the
-        # next tick, where the delayer sees it and aligns it, up to
-        # ATOM_PREFILL_VACUOUS_VETO_TICKS in a row. The streak follows the
-        # reduced decision, so it is the same on every rank.
+        # next tick, where the delayer sees it and aligns it. The streak counts
+        # only ticks on which the veto really held something back (this rank
+        # has admittable prefill now), so quiet or blocked stretches do not
+        # use it up; it bounds, at ATOM_PREFILL_VACUOUS_VETO_TICKS, how long a
+        # request the prefillable check keeps missing is held before it runs.
         if (
             self.prefill_delayer is not None
             and not self.prefill_delayer.is_local
             and decision.allow
             and decision.prefillable_ranks == 0
+            and self.waiting
+            and self._can_admit_head_prefill()
         ):
             self._vacuous_streak = getattr(self, "_vacuous_streak", 0) + 1
             if self._vacuous_streak <= envs.ATOM_PREFILL_VACUOUS_VETO_TICKS:
