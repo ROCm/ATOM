@@ -61,6 +61,7 @@ from atom.observability.tracing import shutdown as shutdown_tracing
 from atom.sampling_params import RequiredChannel
 from atom.structured_output.validation import (
     configure_request,
+    configure_tool_call_grammar,
     schema_from_format,
     structured_response_channel,
     validate_chat_stream,
@@ -1983,6 +1984,21 @@ async def _configure_structured_output(
     multimodal=False,
 ):
     if schema is None:
+        if not tools or tool_call_parser_cls is None:
+            return
+        await configure_tool_call_grammar(
+            engine,
+            _get_engine_config(),
+            sampling_params,
+            channel,
+            parser_cls=tool_call_parser_cls,
+            tools=tools,
+            tool_choice=tool_choice,
+            kv_transfer=kv_transfer,
+            multimodal=multimodal,
+            relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+            synthetic=synthetic_token_text is not None,
+        )
         return
     await configure_request(
         engine,

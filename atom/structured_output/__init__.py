@@ -4,7 +4,9 @@
 """Lightweight structured-output protocol; execution dependencies load on demand."""
 
 from dataclasses import dataclass
+from functools import cache
 from importlib import import_module
+from importlib.util import find_spec
 
 
 @dataclass(frozen=True)
@@ -36,9 +38,18 @@ class StructuredRequest:
         return update
 
 
+@cache
+def available():
+    """Whether the optional `atom[structured-output]` dependencies are installed."""
+    return all(
+        find_spec(name) is not None for name in ("llguidance", "jsonschema", "re2")
+    )
+
+
 __all__ = [
     "StructuredOutput",
     "StructuredRequest",
+    "available",
     "prepare_worker_grammar",
     "structured_stop_token_ids",
     "tokenizer_fingerprint",
@@ -46,6 +57,6 @@ __all__ = [
 
 
 def __getattr__(name):
-    if name in __all__ and name != "StructuredRequest":
+    if name in __all__ and name not in ("StructuredRequest", "available"):
         return getattr(import_module(".manager", __name__), name)
     raise AttributeError(name)

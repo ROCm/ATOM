@@ -5,6 +5,7 @@
 
 import asyncio
 import json
+import logging
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,8 @@ from dataclasses import replace
 from threading import Lock
 
 from atom import structured_output
+
+logger = logging.getLogger("atom")
 
 
 def schema_from_format(fmt, *, responses=False):
@@ -172,7 +175,7 @@ async def validate_chat_stream(source, schema):
         await source.aclose()
 
 
-def validate_execution_options(
+def execution_blocker(
     config,
     params,
     *,
@@ -181,28 +184,41 @@ def validate_execution_options(
     relaxed_mtp=False,
     synthetic=False,
 ):
+    """Why this deployment or request cannot run a grammar, or None."""
     if getattr(config, "pipeline_parallel_size", 1) > 1:
-        raise ValueError("Structured output does not support pipeline parallelism")
+        return "Structured output does not support pipeline parallelism"
     if relaxed_mtp:
-        raise ValueError("Structured output cannot use relaxed MTP verification")
+        return "Structured output cannot use relaxed MTP verification"
+    kv_config = getattr(config, "kv_transfer_config", None)
+    # A local offload tier (LMCache CPU) only restores prefix KV; the request
+    # still decodes on this engine, so its grammar state is never handed off.
+    local_offload = (
+        isinstance(kv_config, dict) and kv_config.get("kv_role") == "offload"
+    )
     if (
         kv_transfer
         or multimodal
         or getattr(config, "enable_rapidserve", False)
-        or getattr(config, "kv_transfer_config", None)
+        or (kv_config and not local_offload)
     ):
-        raise ValueError("Structured output currently requires text without P/D")
+        return "Structured output currently requires text without P/D"
     spec = getattr(config, "speculative_config", None)
     if synthetic or getattr(spec, "synthetic_acceptance_rates", None):
-        raise ValueError("Structured output cannot use synthetic forced acceptance")
+        return "Structured output cannot use synthetic forced acceptance"
     if params.ignore_eos or params.stop_strings:
-        raise ValueError(
-            "Structured output does not support ignore_eos or custom stop strings"
-        )
+        return "Structured output does not support ignore_eos or custom stop strings"
     if params.logprobs and getattr(spec, "num_speculative_tokens", 0):
-        raise ValueError(
-            "Combining JSON Schema, speculative decoding and logprobs is not supported; disable speculative decoding or logprobs"
+        return (
+            "Combining JSON Schema, speculative decoding and logprobs is not "
+            "supported; disable speculative decoding or logprobs"
         )
+    return None
+
+
+def validate_execution_options(config, params, **options):
+    reason = execution_blocker(config, params, **options)
+    if reason is not None:
+        raise ValueError(reason)
 
 
 class WorkerGrammarPreflight:
@@ -306,6 +322,100 @@ class WorkerGrammarPreflight:
 
     def close(self):
         self.executor.shutdown(wait=True, cancel_futures=True)
+
+
+# Keys the grammar of a request whose only constraint is its tool calls: the
+# slot that carries a response JSON Schema carries this marker instead, and
+# no answer schema is applied (`compile_json_schema` dispatches on the format).
+TOOL_CALL_GRAMMAR_SCHEMA = '{"x-atom": "tool-call-grammar"}'
+
+
+def tool_call_grammar_format(parser_cls, tools, tool_choice, starts_in_reasoning):
+    """The tool-call grammar the parser declares for this request, or None."""
+    if parser_cls is None or not tools or tool_choice == "none":
+        return None
+    if any(tool.get("type", "function") != "function" for tool in tools):
+        return None  # only function tools have a parameter schema to hold to
+    from atom.entrypoints.openai.tool_parser.tool_parser import qualified_tool_name
+
+    functions = [tool.get("function", tool) for tool in tools]
+    required = tool_choice == "required" or isinstance(tool_choice, dict)
+    if isinstance(tool_choice, dict):
+        name = qualified_tool_name(tool_choice)
+        functions = [
+            fn
+            for tool, fn in zip(tools, functions)
+            if qualified_tool_name(tool) == name
+        ]
+        if not functions:
+            raise ValueError("The selected tool must be declared in tools")
+    grammar = parser_cls.tool_call_grammar(
+        functions, required=required, starts_in_reasoning=starts_in_reasoning
+    )
+    if grammar is None:
+        return None
+    return json.dumps({"kind": "lark", "grammar": grammar})
+
+
+async def configure_tool_call_grammar(
+    engine,
+    config,
+    sampling_params,
+    channel,
+    *,
+    parser_cls=None,
+    tools=None,
+    tool_choice=None,
+    kv_transfer=None,
+    multimodal=False,
+    relaxed_mtp=False,
+    synthetic=False,
+):
+    """Hold the tool calls of a request without a response format to the
+    declared schemas, when the parser declares a grammar for them.
+
+    Never rejects a request the server took before this existed: without the
+    optional dependency, on a deployment or request that cannot run a grammar,
+    or when the grammar does not compile, the output stays unconstrained.
+    """
+    if not tools or parser_cls is None or not structured_output.available():
+        return False
+    from atom.utils import envs
+
+    if not envs.ATOM_TOOL_CALL_GRAMMAR:
+        return False
+    starts_in_reasoning = bool(getattr(channel, "starts_open", False))
+    fmt = tool_call_grammar_format(parser_cls, tools, tool_choice, starts_in_reasoning)
+    if fmt is None:
+        return False
+    reason = execution_blocker(
+        config,
+        sampling_params,
+        kv_transfer=kv_transfer,
+        multimodal=multimodal,
+        relaxed_mtp=relaxed_mtp,
+        synthetic=synthetic,
+    )
+    if reason is not None:
+        logger.debug("Tool calls left unconstrained: %s", reason)
+        return False
+    sampling_params.json_schema = TOOL_CALL_GRAMMAR_SCHEMA
+    sampling_params.structured_tool_format = fmt
+    sampling_params.structured_reasoning_end = ""
+    # The grammar already requires the tools section for a required choice.
+    required_channel = sampling_params.required_channel
+    sampling_params.required_channel = None
+    try:
+        await asyncio.to_thread(
+            engine.prepare_structured_request, sampling_params, kv_transfer, multimodal
+        )
+    except ValueError as exc:
+        logger.warning("Tool calls left unconstrained: %s", exc)
+        sampling_params.json_schema = None
+        sampling_params.structured_tool_format = None
+        sampling_params.required_channel = required_channel
+        return False
+    return True
 
 
 async def configure_request(
