@@ -15,9 +15,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 from atom.model_ops.engram import host_memory
 from atom.model_ops.qwen4_exp.ple_host_table import HostTableHooks, PleHostTable
+from atom.rollout.memory_manager import MemoryManagerMixin
+from atom.rollout.weight_updater import WeightUpdaterMixin
 
 DIM = 160
 SHARD_ROWS = 37
@@ -69,16 +73,19 @@ def _bitwise_equal(a, b):
 
 @pytest.fixture
 def fake_pin(monkeypatch):
-    """`pin_rows` as copies into fresh host memory; `fail_at` refuses one
-    shard (by its first row), as a full page-locked pool would."""
-    state = SimpleNamespace(calls=0, fail_at=None, copy=[])
+    """`pin_rows` as copies into fresh host memory, weakly kept in `pinned`;
+    `fail_at` refuses one shard (by its first row), as a full page-locked pool
+    would."""
+    state = SimpleNamespace(calls=0, fail_at=None, copy=[], pinned=[])
 
     def pin_rows(sources, copy=False):
         state.calls += 1
         state.copy.append(copy)
         if state.fail_at is not None and state.calls == state.fail_at:
             return None
-        return tuple(s.clone() for s in sources)
+        pinned = tuple(s.clone() for s in sources)
+        state.pinned += [weakref.ref(p) for p in pinned]
+        return pinned
 
     monkeypatch.setattr(host_memory, "pin_rows", pin_rows)
     return state
@@ -197,8 +204,6 @@ class _Embedding(HostTableHooks, torch.nn.Module):
 
 
 def _runner(model, device="cpu"):
-    from atom.rollout.memory_manager import MemoryManagerMixin
-
     runner = MemoryManagerMixin()
     runner.model, runner.device, runner.label = model, torch.device(device), "ple"
     runner.enforce_eager = True
@@ -220,8 +225,10 @@ def test_releasing_the_weights_releases_the_table(fake_pin, monkeypatch, fail_at
     emb.bind()
     runner = _runner(model)
     before = emb.shard_bases.clone()
-    pinned = [weakref.ref(p) for _, p in emb.table._rows.values() if p is not None]
-    assert len(pinned) == (NUM_SHARDS if fail_at is None else 0)
+    pinned = list(fake_pin.pinned)
+    assert sum(ref() is not None for ref in pinned) == (
+        NUM_SHARDS if fail_at is None else 0
+    )
     pins = fake_pin.calls
     # The released HBM table, one block the heap could hand back as it was,
     # stays held, so the resumed one cannot come back where it was.
@@ -300,7 +307,9 @@ def test_resumed_rows_are_host_memory_whatever_the_default_device(fake_pin):
     finally:
         torch.set_default_device(None)
     assert bases.device.type == "cpu"
-    assert all(pinned.device.type == "cpu" for _, pinned in host._rows.values())
+    resumed = [ref() for ref in fake_pin.pinned[NUM_SHARDS:]]
+    assert len(resumed) == NUM_SHARDS
+    assert all(rows.device.type == "cpu" for rows in resumed)
     assert host.pinned_bytes == table.nbytes
 
 
@@ -352,8 +361,6 @@ class _Model(torch.nn.Module):
 
 
 def _updater(model, device="cpu"):
-    from atom.rollout.weight_updater import WeightUpdaterMixin
-
     class _Updater(WeightUpdaterMixin):
         label, rank, world_size = "ple", 0, 1
 
@@ -408,24 +415,28 @@ def test_an_update_waits_for_the_lookups_once_before_any_row(
     """The rows are written from the host, after one device-wide wait per
     update for the lookups of the step that ended -- not one per shard."""
     fake_pin.fail_at = fail_at
+    old, new = _table(), _table().neg()
     model = _Model()
     emb = model.ple.ngram_embedding
-    _load(_table(), emb.table)
+    _load(old, emb.table)
     emb.bind()
-    events = []
-    sync_rows = emb.table.sync_rows
+    ids = _probe_ids(TABLE_ROWS)
+
+    def rows():
+        return _follow(emb.shard_bases, ids, 0, TABLE_ROWS, old.dtype)
+
+    waits = []
     monkeypatch.setattr(
-        emb.table, "sync_rows", lambda *a: events.append("row") or sync_rows(*a)
-    )
-    monkeypatch.setattr(
-        torch.cuda, "synchronize", lambda device=None: events.append(device)
+        torch.cuda, "synchronize", lambda device=None: waits.append((device, rows()))
     )
     updater = _updater(model, device="cuda")
-    shards = _sync_tensors(_table().neg(), torch.ones(4, 4), True)[:NUM_SHARDS]
-    for _ in range(2):
-        events.clear()
+    for before, after in ((old, new), (new, old)):
+        waits.clear()
+        shards = _sync_tensors(after, torch.ones(4, 4), True)[:NUM_SHARDS]
         assert updater.update_weights(shards) == NUM_SHARDS
-        assert events == [torch.device("cuda")] + ["row"] * NUM_SHARDS
+        assert [device for device, _ in waits] == [torch.device("cuda")]
+        assert _bitwise_equal(waits[0][1], before[ids])
+        assert _bitwise_equal(rows(), after[ids])
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -544,9 +555,6 @@ def _ops():
 def _checkpoint_shards(table, directory):
     """The shards as the loader gets them: views of a safetensors mapping,
     adjacent and not page-aligned."""
-    from safetensors import safe_open
-    from safetensors.torch import save_file
-
     path = directory / "ple.safetensors"
     names = [f"shard_{i}" for i in range(-(-table.shape[0] // SHARD_ROWS))]
     save_file({n: s.contiguous() for n, s in zip(names, _shards(table))}, path)
@@ -855,28 +863,37 @@ def test_the_host_table_stays_off_where_not_validated_under_a_plugin_or_for_a_du
 
 
 @_gpu
+@pytest.mark.parametrize("tp", [1, 2])
 @pytest.mark.parametrize("uva", [True, False])
-def test_an_fp8_table_in_hbm_syncs_its_shards_and_refuses_bf16_rows(
-    ngram_layer, monkeypatch, uva
+def test_an_fp8_table_in_hbm_syncs_the_ranks_rows_and_refuses_bf16_rows(
+    ngram_layer, monkeypatch, uva, tp
 ):
-    """Shards land in the table; BF16 rows for the whole table raise rather
-    than reach the updater's FP8 requantization, which knows no PLE scale."""
+    """Shards and the whole table land in the rank's rows; BF16 rows for the
+    whole table raise rather than reach the updater's FP8 requantization,
+    which knows no PLE scale."""
+    from atom.model_ops.qwen4_exp import ple_layer
+
+    group = SimpleNamespace(world_size=tp, rank_in_group=tp - 1)
+    monkeypatch.setattr(ple_layer, "get_tp_group", lambda: group)
     monkeypatch.setattr(host_memory, "pin_rows", lambda sources, copy=None: None)
     config = SimpleNamespace(**vars(_NGRAM_CONFIG), ple_embedding_dtype="float8_e4m3fn")
     layer = ngram_layer(uva, config)
     embedding = layer.ngram_embedding
     scale = embedding.weight_scale
     scale.weight_loader(scale, torch.tensor([0.0625]))
-    _load_layer(layer, _layer_table(layer).to(torch.float8_e4m3fn))
+    old = _layer_table(layer).to(torch.float8_e4m3fn)
+    _load_layer(layer, old)
     assert embedding.weight.is_cuda
+    rows = slice(embedding.vocab_start_idx, embedding.vocab_end_idx)
     new = _layer_table(layer).neg().to(torch.float8_e4m3fn)
     updater = _updater(_ngram_model(layer), "cuda")
-    shards = _layer_sync_tensors(layer, new, True)
-    assert updater.update_weights(shards) == len(shards)
-    assert _bitwise_equal(embedding.weight.data.cpu(), new)
+    for by_shard, table in ((True, new), (False, old)):
+        tensors = _layer_sync_tensors(layer, table, by_shard)
+        assert updater.update_weights(tensors) == len(tensors)
+        assert _bitwise_equal(embedding.weight.data.cpu(), table[rows])
     with pytest.raises(ValueError, match="expected torch.float8_e4m3fn n-gram rows"):
         updater.update_weights(_layer_sync_tensors(layer, new.bfloat16(), False))
-    assert _bitwise_equal(embedding.weight.data.cpu(), new)
+    assert _bitwise_equal(embedding.weight.data.cpu(), old[rows])
 
 
 @_gpu

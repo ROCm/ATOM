@@ -1510,7 +1510,7 @@ def test_copy_copies_whatever_the_setting_and_shared_say(monkeypatch, env, share
     rows = torch.arange(1 << 18, dtype=torch.float32)
     pinned = host_memory.pin_rows([rows], shared=shared, copy=True)
     assert pinned is not None and torch.equal(pinned[0], rows)
-    assert (len(allocator.live), len(cudart.registered)) == (1, 0)
+    assert (len(allocator.live), cudart.calls) == (1, 0)
     del pinned
     gc.collect()
     assert allocator.live == {}

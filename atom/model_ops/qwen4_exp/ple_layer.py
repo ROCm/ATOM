@@ -120,14 +120,20 @@ class _ShardsIntoWeight:
         self, param_name: str, tensor: torch.Tensor, shard_id: int | None = None
     ) -> bool:
         """`WeightUpdaterMixin`: a checkpoint shard goes through the shard
-        loader, which checks it; the whole table is left to the updater unless
-        its rows cannot go into an FP8 table as they are."""
+        loader, which checks it; of the whole table, this rank's rows."""
         if param_name != "weight":
             return False
-        if shard_id is None:
-            check_fp8_rows(self.prefix, tensor, self.weight.dtype)
-            return False
-        self.weight.weight_loader(self.weight, tensor, shard_id)
+        if shard_id is not None:
+            self.weight.weight_loader(self.weight, tensor, shard_id)
+            return True
+        rows, dim = self.weight.shape
+        if tuple(tensor.shape) != (rows * self.tp_size, dim):
+            raise ValueError(
+                f"{self.prefix}: expected [{rows * self.tp_size}, {dim}] n-gram "
+                f"rows, got {tuple(tensor.shape)}"
+            )
+        check_fp8_rows(self.prefix, tensor, self.weight.dtype)
+        self.weight.data.copy_(tensor.narrow(0, self.vocab_start_idx, rows))
         return True
 
 
@@ -261,7 +267,9 @@ class _Qwen4ExpHostEmbedding(HostTableHooks, nn.Module):
             self.weight_scale.weight_loader = _Qwen4ExpFP8Embedding._scale_loader
         self.register_buffer(
             "shard_bases",
-            torch.zeros(-(-num_embeddings // shard_rows), dtype=torch.int64),
+            torch.zeros(
+                (num_embeddings + shard_rows - 1) // shard_rows, dtype=torch.int64
+            ),
             persistent=False,
         )
         self.table = PleHostTable(

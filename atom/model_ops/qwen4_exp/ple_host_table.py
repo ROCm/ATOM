@@ -57,7 +57,9 @@ class PleHostTable:
         self.device = device
         self.prefix = prefix
         # The shards holding this rank's rows.
-        self.shards = range(vocab_start // shard_rows, -(-vocab_end // shard_rows))
+        self.shards = range(
+            vocab_start // shard_rows, (vocab_end + shard_rows - 1) // shard_rows
+        )
         # Per shard: (first global row held, page-locked rows, or None once
         # they are in `weight`).
         self._rows: dict[int, tuple[int, torch.Tensor | None]] = {}
@@ -100,7 +102,7 @@ class PleHostTable:
         with self._lock:
             self._rows[shard] = (row_start, None)
 
-    def _check_resumed(self, use: str = "sync its rows") -> None:
+    def _check_resumed(self, use: str) -> None:
         # In HBM, `weight` itself is released, with the other parameters.
         if self._released or (self._in_hbm and not self.weight.numel()):
             raise ValueError(
@@ -121,7 +123,7 @@ class PleHostTable:
         lo = max(first, self.vocab_start)
         hi = min(first + rows.shape[0], self.vocab_end)
         with self._lock:
-            self._check_resumed()
+            self._check_resumed("sync its rows")
             if self._in_hbm:
                 if lo < hi:
                     self.weight.data.narrow(0, lo - self.vocab_start, hi - lo).copy_(
@@ -187,6 +189,8 @@ class PleHostTable:
     def shard_bases(self, num_shards: int) -> torch.Tensor:
         """`[num_shards]` int64 on the CPU: the address of each local shard's
         first global row (0 for other ranks'). Ask again after a resume."""
+        row_bytes = self.dim * self.dtype.itemsize
+        bases = torch.zeros(num_shards, dtype=torch.int64, device="cpu")
         with self._lock:
             self._check_resumed("take its addresses")
             missing = [shard for shard in self.shards if shard not in self._rows]
@@ -195,9 +199,6 @@ class PleHostTable:
                     f"{self.prefix}: n-gram checkpoint shards {missing[:8]} were "
                     "never loaded"
                 )
-        row_bytes = self.dim * self.dtype.itemsize
-        bases = torch.zeros(num_shards, dtype=torch.int64, device="cpu")
-        with self._lock:
             for shard in self.shards:
                 first = shard * self.shard_rows
                 if self._in_hbm:
