@@ -36,7 +36,7 @@ class _FakeTarget(nn.Module):
         self.layers = nn.ModuleList(
             nn.Identity() if lo <= i < hi else PPMissingLayer() for i in range(n_layers)
         )
-        # Like the real models: off the first stage the embedding is missing.
+        # Middle stages hold no embedding; the last may hold a drafter's copy.
         self.embed_tokens = nn.Identity() if with_embed else PPMissingLayer()
 
 

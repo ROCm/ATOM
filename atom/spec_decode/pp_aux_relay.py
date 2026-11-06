@@ -4,8 +4,9 @@
 """Relay a block drafter's target aux hidden states across PP stages.
 
 The drafter lives only on the last PP stage, so hooks on taps owned by earlier
-stages land on ``PPMissingLayer`` and never fire, leaving zero aux buffers and
-garbage drafts. Earlier stages capture their own taps and forward them in the
+stages would never fire: their layers are ``PPMissingLayer``, and the last
+stage's copy of the embedding (held for the drafter) is not run by the target
+forward. That would leave zero aux buffers and garbage drafts. Earlier stages capture their own taps and forward them in the
 intermediate-tensor payload, concatenated along the hidden axis in the
 spec's ``layer_ids`` order, which ``install_aux_taps`` requires strictly
 increasing (-1, the embedding, first). Stages own contiguous ascending layer
