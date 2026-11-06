@@ -1280,7 +1280,7 @@ class V4MonoSession:
                     from atom.mono.runtime.aux_taps import bind_aux_taps
                     from atom.spec_decode.dspark_proposer import DSparkProposer
 
-                    spec = drafter._aux_capture_spec(self.model)
+                    spec = drafter._aux_capture_spec()
                     if (
                         spec is None
                         or spec.capture != "output"
