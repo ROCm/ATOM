@@ -208,6 +208,35 @@ def test_swiglu_reduces_gate_up_partials_bitwise(rows):
     assert _bitwise(swiglu_oai_split_reducing(gate_up_ref, 1.702, 1.0, 7.0), ref)
 
 
+@pytest.mark.parametrize("rows", [1, 4, 16, 64])
+def test_swiglu_quant_reduces_gate_up_partials_bitwise(rows):
+    aiter = _aiter_or_skip()
+    from aiter import QuantType
+    from aiter.ops.quant import get_hip_quant
+
+    from atom.model_ops.swiglu_oai import (
+        swiglu_oai_split,
+        swiglu_oai_split_reducing_quant,
+    )
+
+    # The fused per-token FP8 activation of the dense MLP against the split-K
+    # reduce + activation + the quant a per-token FP8 down_proj runs.
+    xq, wq, xs, ws = _gemm_inputs(aiter, rows, n=6144)
+    gate_up_ref = aiter.gemm_a8w8_bpreshuffle(xq, wq, xs, ws)
+    q_ref, s_ref = get_hip_quant(QuantType.per_Token)(
+        swiglu_oai_split(gate_up_ref, 1.702, 1.0, 7.0), quant_dtype=aiter.dtypes.fp8
+    )
+
+    gate_up = aiter.gemm_a8w8_bpreshuffle_splitk_deferred(xq, wq, xs, ws, max_m=64)
+    assert aiter.ops.gemm_op_a8w8._SPLITK_DEFERRED.get(gate_up.data_ptr())
+    q, s = swiglu_oai_split_reducing_quant(gate_up, 1.702, 1.0, 7.0)
+    assert _bitwise(q, q_ref) and _bitwise(s, s_ref)
+    assert _bitwise(gate_up, gate_up_ref)  # written back reduced
+    # Not a deferred output: the same op quantizes the plain activation.
+    q, s = swiglu_oai_split_reducing_quant(gate_up_ref, 1.702, 1.0, 7.0)
+    assert _bitwise(q, q_ref) and _bitwise(s, s_ref)
+
+
 @pytest.mark.parametrize("split_k", [2, 4, 8])
 def test_triton_consumers_match_the_reduce_kernel_on_edge_values(split_k):
     aiter = _aiter_or_skip()
