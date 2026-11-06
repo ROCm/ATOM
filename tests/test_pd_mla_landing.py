@@ -36,8 +36,8 @@ from atom.kv_transfer.disaggregation.sharded_transfer import (
     pack_slots,
 )
 from atom.kv_transfer.disaggregation.staging_config import (
+    landing_reserve_bytes,
     mla_landing_configured,
-    mla_landing_reserve_bytes,
     mla_landing_table_segments,
 )
 from atom.kv_transfer.disaggregation.types import MLA_KV_ROLE
@@ -1603,19 +1603,19 @@ def test_landing_reserve_matches_the_pool_and_its_gates(monkeypatch, transfer):
     consumer = {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
     monkeypatch.delenv("ATOM_PD_MLA_LANDING", raising=False)
     # On by default: the whole pool and its scatter table.
-    assert mla_landing_reserve_bytes(_config(consumer)) == LANDING_RESERVE
-    assert mla_landing_reserve_bytes(_config(transfer)) == 0
-    assert mla_landing_reserve_bytes(_config(consumer, dcp=1)) == 0
-    assert mla_landing_reserve_bytes(_config(consumer, kv_lora_rank=None)) == 0
+    assert landing_reserve_bytes(_config(consumer)) == LANDING_RESERVE
+    assert landing_reserve_bytes(_config(transfer)) == 0
+    assert landing_reserve_bytes(_config(consumer, dcp=1)) == 0
+    assert landing_reserve_bytes(_config(consumer, kv_lora_rank=None)) == 0
     # A latent rank alone is not plain MLA: DeepSeek-V4 (V3 schema) and the
     # Kimi hybrid never land, so they reserve nothing.
     v4 = _config(
         consumer, model_type="deepseek_v3", architectures=["DeepseekV4ForCausalLM"]
     )
-    assert mla_landing_reserve_bytes(v4) == 0
-    assert mla_landing_reserve_bytes(_config(consumer, model_type="kimi_linear")) == 0
+    assert landing_reserve_bytes(v4) == 0
+    assert landing_reserve_bytes(_config(consumer, model_type="kimi_linear")) == 0
     monkeypatch.setenv("ATOM_PD_MLA_LANDING", "0")
-    assert mla_landing_reserve_bytes(_config(consumer)) == 0
+    assert landing_reserve_bytes(_config(consumer)) == 0
 
 
 def test_landing_is_built_only_where_it_was_reserved(monkeypatch):

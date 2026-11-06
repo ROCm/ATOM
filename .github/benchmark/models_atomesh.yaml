@@ -813,12 +813,51 @@ models:
               VLLM_PP_LAYER_PARTITION: "10,10,10,10,10,10,10,8"
             decode: *glm52_agentic_dcp8_env_decode
 
-      # Manual accuracy suite: the two deployments above, GSM8K only and without
+      # Manual accuracy suite: GSM8K only and without
       # forced acceptance, which would otherwise commit draft tokens the target
       # rejected. 20-shot prompts (~3.5k tokens) exceed the DSA top-k of 2048, so
       # the sparse indexer's selection -- and on CPP8 its top-k handoff across PP
       # stages -- decides what each token attends to.
       accuracy:
+        # Shared token-row staging/landing, with the CPP4/DCP4 compute recipe
+        # and real MTP acceptance. No CPU offload tier is needed for accuracy.
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-gsm8k-20shot-landing-c32
+          display_topology: 1P1D-CPP4-DCP4-MTP3
+          isl: [4096]
+          osl: 1024
+          concurrency: [32]
+          server:
+            common_args:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_args
+              max_model_len: 16384
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 3"
+          env:
+            common:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+              ATOM_PD_MLA_STAGING: "1"
+              ATOM_PD_MLA_LANDING: "1"
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              VLLM_PP_LAYER_PARTITION: "20,20,20,18"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+            decode: *glm52_cpp4_dcp4_decode_env
+          benchmark:
+            kind: random
+            wait_server_timeout: 5400
+            wait_router_timeout: 600
+          run_eval: true
+          eval_only: true
+          accuracy:
+            task: gsm8k
+            fewshot: 20
+            limit: null
+            eval_concurrency: [32]
+            model_type: local-completions
+            endpoint: completions
+            threshold: 0.92
+
         - &glm52_dcp8_dcp8_gsm8k
           <<: *glm52_agentic_dcp8_dcp8
           name: glm-52-mxfp4-1p1d-dcp8-dcp8-gsm8k-only-c64

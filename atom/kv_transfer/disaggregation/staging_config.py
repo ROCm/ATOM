@@ -59,19 +59,6 @@ def mla_landing_table_segments(config) -> int:
     return segment_table_capacity(LANDING_POOL_SLOTS * (pages_per_slot + 64))
 
 
-def mla_landing_reserve_bytes(config) -> int:
-    """HBM to hold back from the KV budget for this rank's MLA landing.
-
-    The pool plus the scatter's int64 ``[3, segments]`` device table, both
-    allocated in ``register_kv_caches`` after the KV cache is sized.
-    """
-
-    if not mla_landing_configured(config):
-        return 0
-    table_bytes = 3 * 8 * mla_landing_table_segments(config)
-    return LANDING_POOL_SLOTS * LANDING_SLOT_BYTES + table_bytes
-
-
 def mha_landing_model(config) -> bool:
     from atom.config import _is_minimax_m3_config
 
@@ -98,12 +85,6 @@ def mha_landing_configured(config) -> bool:
         and getattr(config, "tensor_parallel_size", 1) > 1
         and config.kv_transfer_config.get("kv_role") == "kv_consumer"
     )
-
-
-def mha_landing_reserve_bytes(config) -> int:
-    if not mha_landing_configured(config):
-        return 0
-    return LANDING_POOL_SLOTS * LANDING_SLOT_BYTES + 3 * 8 * MHA_SCATTER_SEGMENTS
 
 
 @dataclass(frozen=True)

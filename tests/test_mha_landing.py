@@ -20,7 +20,7 @@ from atom.kv_transfer.disaggregation.mooncake.landing import (
 from atom.kv_transfer.disaggregation.staging_config import (
     MHA_SCATTER_SEGMENTS,
     LandingSpec,
-    mha_landing_reserve_bytes,
+    landing_reserve_bytes,
     mha_staging_reserve_bytes,
 )
 from atom.kv_transfer.disaggregation.transfer_plan import PAGE_UNITS
@@ -339,12 +339,12 @@ def test_reserves_are_gated_and_bounded(monkeypatch, workers):
         kv_transfer_config={"kv_role": "kv_producer", "num_worker_threads": workers},
     )
     assert mha_staging_reserve_bytes(cfg) == min(workers, 32) * LANDING_SLOT_BYTES
-    assert mha_landing_reserve_bytes(cfg) == 0
+    assert landing_reserve_bytes(cfg) == 0
     cfg.tensor_parallel_size = 4
     cfg.kv_transfer_config["kv_role"] = "kv_consumer"
     assert mha_staging_reserve_bytes(cfg) == 0
     assert (
-        mha_landing_reserve_bytes(cfg)
+        landing_reserve_bytes(cfg)
         == LANDING_POOL_SLOTS * LANDING_SLOT_BYTES + 3 * 8 * MHA_SCATTER_SEGMENTS
     )
     for key, val in [
@@ -353,10 +353,10 @@ def test_reserves_are_gated_and_bounded(monkeypatch, workers):
     ]:
         old = getattr(cfg, key)
         setattr(cfg, key, val)
-        assert mha_staging_reserve_bytes(cfg) == mha_landing_reserve_bytes(cfg) == 0
+        assert mha_staging_reserve_bytes(cfg) == landing_reserve_bytes(cfg) == 0
         setattr(cfg, key, old)
     monkeypatch.setenv("ATOM_PD_MHA_LANDING", "0")
-    assert mha_staging_reserve_bytes(cfg) == mha_landing_reserve_bytes(cfg) == 0
+    assert mha_staging_reserve_bytes(cfg) == landing_reserve_bytes(cfg) == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU gather/scatter")
@@ -460,6 +460,6 @@ def test_mha_budget_is_visible_through_connector_factory(monkeypatch):
         decode_context_parallel_size=1,
         kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_consumer"},
     )
-    assert KVConnectorFactory.kv_budget_reserve_bytes(cfg) == mha_landing_reserve_bytes(
-        cfg
+    assert KVConnectorFactory.kv_budget_reserve_bytes(cfg) == (
+        LANDING_POOL_SLOTS * LANDING_SLOT_BYTES + 3 * 8 * MHA_SCATTER_SEGMENTS
     )
