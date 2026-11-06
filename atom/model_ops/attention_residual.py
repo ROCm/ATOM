@@ -34,11 +34,8 @@ def _rms_eps(norm: RMSNorm) -> float:
 def _fused_quant_dtype(norm: RMSNorm | None) -> torch.dtype | None:
     """The activation dtype ``norm`` would have quantized to, or None.
 
-    Per-token FP8 only. That is the one scheme this kernel emits: a per-token
-    scale is a single scalar per row, which the fused kernel already has in
-    registers when the row is formed. Block schemes (per_1x128 / per_1x32) need
-    a scale PER GROUP of channels plus a choice of scale layout, so they stay on
-    the standalone quant path -- unfused, exactly as before this fold existed.
+    The kernel emits per-token FP8 and per-1x128 FP8 with E8M0 scales (in the
+    layout ``norm`` would write); other schemes stay on the standalone quant.
     """
     if norm is None or not getattr(norm, "use_fused_quant", False):
         return None
@@ -48,9 +45,12 @@ def _fused_quant_dtype(norm: RMSNorm | None) -> torch.dtype | None:
         return None
     # QuantType is compared by .value throughout ATOM: the enum can be re-imported
     # under a different module identity, which breaks `is`/`==` on the members.
-    if getattr(quant_type, "value", None) != QuantType.per_Token.value:
-        return None
-    return params_dtype
+    qv = getattr(quant_type, "value", None)
+    if qv == QuantType.per_Token.value or (
+        qv == QuantType.per_1x128.value and getattr(norm, "_aiter_e8m0_scale", False)
+    ):
+        return params_dtype
+    return None
 
 
 class AttnRes(nn.Module):
@@ -188,6 +188,8 @@ class AttnRes(nn.Module):
                 self.out_eps,
                 add_hidden2,
                 self.out_quant_dtype,
+                getattr(self.out_norm, "_aiter_e8m0_scale", False),
+                getattr(self.out_norm, "_aiter_transpose_scale", False),
             )
 
         # Nothing to mix (residuals off, or no candidates yet). Apply by hand
