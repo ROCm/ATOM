@@ -875,6 +875,9 @@ class EngineArgs:
         kwargs = {
             f.name: getattr(self, f.name) for f in fields(self) if f.name != "model"
         }
+        # Let Config resolve ATOM_TORCH_PROFILER_DIR when no path was supplied.
+        if self.torch_profiler_dir is None:
+            kwargs.pop("torch_profiler_dir")
 
         # Handle special transformations
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
