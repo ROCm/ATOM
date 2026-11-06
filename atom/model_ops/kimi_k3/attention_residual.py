@@ -248,6 +248,8 @@ def _apply_attn_res_impl(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,  # [T, H], folded the same way
     quant_dtype: torch.dtype | None = None,  # folded: y = per-token quant(y)
+    e8m0_scale: bool = False,  # ... per-1x128 E8M0 quant(y) instead
+    transpose_scale: bool = False,  # E8M0 scale column-major, as aiter's
 ) -> (
     tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ):
@@ -283,8 +285,27 @@ def _apply_attn_res_impl(
     quant = quant_dtype is not None
     if quant and not out_norm:
         raise ValueError("quant_dtype requires out_norm_weight")
-    fp8_max = float(torch.finfo(quant_dtype).max) if quant else 1.0
+    e8m0 = quant and e8m0_scale
     br = block_residual.contiguous()
+    tdm = _attn_res_tdm_module()
+    use_tdm = tdm is not None and tdm.attn_res_tdm_supported(br)
+    if e8m0 and not use_tdm:  # E8M0 is fused on the gfx1250 Gluon kernel only
+        from atom.model_ops.linear import per_1x128_e8m0_quant
+
+        y, prefix_out = _apply_attn_res_impl(
+            prefix_sum,
+            block_residual,
+            score_weight,
+            eps,
+            add_hidden,
+            out_norm_weight,
+            out_eps,
+            add_hidden2,
+        )
+        return (*per_1x128_e8m0_quant(y, quant_dtype, transpose_scale), prefix_out)
+    if e8m0 and H % 128:
+        raise ValueError(f"E8M0 per-1x128 quant needs H % 128 == 0, got {H}")
+    fp8_max = float(torch.finfo(quant_dtype).max) if quant else 1.0
     ps = prefix_sum.contiguous()
     sw = score_weight.contiguous()
     y = torch.empty(
@@ -297,6 +318,18 @@ def _apply_attn_res_impl(
     y_scale = torch.empty(
         (T, 1) if quant else (1,), device=block_residual.device, dtype=torch.float32
     )
+    e8m0_args = {}
+    if e8m0:  # uint8, viewed as E8M0 below
+        G = H // 128
+        y_scale = torch.empty(
+            (G, T) if transpose_scale else (T, G), device=br.device, dtype=torch.uint8
+        )
+        e8m0_args = {
+            "E8M0_SCALE": True,
+            "FP8_MAX": fp8_max,
+            "stride_ys_t": 1 if transpose_scale else G,
+            "stride_ys_g": T if transpose_scale else 1,
+        }
     ow = out_norm_weight.contiguous() if out_norm else sw
     # hs/hs2/pref pointers are always passed (triton needs a tensor); when not
     # adding they alias ps and are never dereferenced (DO_ADD / DO_ADD2 /
@@ -309,11 +342,11 @@ def _apply_attn_res_impl(
         "DO_ADD2": do_add2,
         "WRITE_PREF": do_add,
         "OUT_NORM": out_norm,
-        "QUANT": quant,
+        "QUANT": quant and not e8m0,  # E8M0 keeps the BF16 kernel config
+        **e8m0_args,
     }
 
-    tdm = _attn_res_tdm_module()
-    if tdm is not None and tdm.attn_res_tdm_supported(br):
+    if use_tdm:
         tdm.launch_attn_res_tdm(
             br, ps, sw, y, y_scale, hs, hs2, pref, ow, eps, out_eps, fp8_max, flags
         )
@@ -322,6 +355,8 @@ def _apply_attn_res_impl(
             br, ps, sw, y, y_scale, hs, hs2, pref, ow, eps, out_eps, fp8_max, flags
         )
     prefix_out = pref if do_add else prefix_sum
+    if e8m0:
+        y_scale = y_scale.view(T, H // 128).view(torch.float8_e8m0fnu)
     if quant:
         return y, y_scale, prefix_out
     return y, prefix_out
@@ -455,6 +490,13 @@ direct_register_custom_op(
 # type is fixed at registration.
 
 
+def _quant_scale_fake(prefix_sum: torch.Tensor, e8m0_scale: bool) -> torch.Tensor:
+    T, H = prefix_sum.shape
+    if e8m0_scale:
+        return prefix_sum.new_empty((T, H // 128), dtype=torch.float8_e8m0fnu)
+    return prefix_sum.new_empty((T, 1), dtype=torch.float32)
+
+
 def _apply_attn_res_quant_op(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -463,6 +505,8 @@ def _apply_attn_res_quant_op(
     out_norm_weight: torch.Tensor,
     out_eps: float,
     quant_dtype: torch.dtype,
+    e8m0_scale: bool = False,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     y, y_scale, _ = _apply_attn_res_impl(
         prefix_sum,
@@ -472,6 +516,8 @@ def _apply_attn_res_quant_op(
         out_norm_weight=out_norm_weight,
         out_eps=out_eps,
         quant_dtype=quant_dtype,
+        e8m0_scale=e8m0_scale,
+        transpose_scale=transpose_scale,
     )
     return y, y_scale
 
@@ -484,12 +530,12 @@ def _apply_attn_res_quant_op_fake(
     out_norm_weight: torch.Tensor,
     out_eps: float,
     quant_dtype: torch.dtype,
+    e8m0_scale: bool = False,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(prefix_sum, dtype=quant_dtype),
-        torch.empty(
-            (prefix_sum.shape[0], 1), device=prefix_sum.device, dtype=torch.float32
-        ),
+        _quant_scale_fake(prefix_sum, e8m0_scale),
     )
 
 
@@ -511,6 +557,8 @@ def _apply_attn_res_add_quant_op(
     out_eps: float,
     quant_dtype: torch.dtype,
     add_hidden2: torch.Tensor | None = None,
+    e8m0_scale: bool = False,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _apply_attn_res_impl(
         prefix_sum,
@@ -522,6 +570,8 @@ def _apply_attn_res_add_quant_op(
         out_eps=out_eps,
         add_hidden2=add_hidden2,
         quant_dtype=quant_dtype,
+        e8m0_scale=e8m0_scale,
+        transpose_scale=transpose_scale,
     )
 
 
@@ -535,12 +585,12 @@ def _apply_attn_res_add_quant_op_fake(
     out_eps: float,
     quant_dtype: torch.dtype,
     add_hidden2: torch.Tensor | None = None,
+    e8m0_scale: bool = False,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(prefix_sum, dtype=quant_dtype),
-        torch.empty(
-            (prefix_sum.shape[0], 1), device=prefix_sum.device, dtype=torch.float32
-        ),
+        _quant_scale_fake(prefix_sum, e8m0_scale),
         torch.empty_like(prefix_sum),
     )
 
@@ -564,6 +614,8 @@ def apply_attn_res(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
     quant_dtype: torch.dtype | None = None,
+    e8m0_scale: bool = False,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Dispatch an opaque custom op whose CUDA implementation selects by concrete T.
 
@@ -574,7 +626,8 @@ def apply_attn_res(
     ``quant_dtype`` additionally folds the consuming GEMM's per-token quant in,
     making the first element of the returned pair a ``(quantized, scale)`` tuple
     rather than a tensor -- the same shape the fused-quant RMSNorm hands its
-    consumers, so the call sites that already unpack one need no new branch."""
+    consumers, so the call sites that already unpack one need no new branch.
+    ``e8m0_scale`` makes that quant per-1x128 with E8M0 scales instead."""
     if quant_dtype is not None:
         if add_hidden is None:
             if add_hidden2 is not None:
@@ -587,6 +640,8 @@ def apply_attn_res(
                 out_norm_weight,
                 out_eps,
                 quant_dtype,
+                e8m0_scale,
+                transpose_scale,
             )
             return (y, y_scale), prefix_sum
         y, y_scale, prefix_out = torch.ops.aiter.kimi_k3_apply_attn_res_add_quant(
@@ -599,6 +654,8 @@ def apply_attn_res(
             out_eps,
             quant_dtype,
             add_hidden2,
+            e8m0_scale,
+            transpose_scale,
         )
         return (y, y_scale), prefix_out
     if add_hidden is None:
