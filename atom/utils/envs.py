@@ -292,7 +292,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # `num_local_tokens * topk` multiply it launches in every MoE layer. Needs
     # an aiter whose fused_moe takes `num_valid_routes`; off, nothing passes it.
     # Schedule and dispatch the next step's prefill while a pure decode forward is
-    # still in flight (EngineCore._early_prefill_ok gates it), and let a pure
+    # still in flight (EngineCore._early_prefill_ok gates it: a lone engine or an
+    # independent DP rank, ATOM_DP_INDEPENDENT), and let a pure
     # prefill take the previous step's speculative status after its launch
     # instead of before it. Hides the prefill schedule() and the dispatch behind
     # the decode on the GPU.
