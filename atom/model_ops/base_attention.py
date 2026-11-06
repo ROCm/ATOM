@@ -256,6 +256,36 @@ def _flydsl_explicit_plan_api() -> bool:
     return ok
 
 
+@functools.cache
+def _flydsl_output_quant_api() -> bool:
+    """Whether gfx1250 aiter exposes paired FP8 + scale PA outputs."""
+    import inspect
+
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx1250":
+        return False
+    try:
+        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    except ImportError:
+        return False
+    params = inspect.signature(mod.pa_decode).parameters
+    return "quantized_output" in params and "output_scale" in params
+
+
+@functools.cache
+def _flydsl_output_quant_option(name: str) -> bool:
+    """Whether aiter's FlyDSL ``pa_decode`` takes the quantized-output option
+    ``name``: ``store_output`` (skip the BF16 store) or ``quantized_pad_rows``
+    (write a padded bucket's extra FP8 rows as zeros with a unit descale)."""
+    import inspect
+
+    if not _flydsl_output_quant_api():
+        return False
+    mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    return name in inspect.signature(mod.pa_decode).parameters
+
+
 def _flydsl_pa_decode_num_seqs(
     *,
     output: torch.Tensor,
@@ -500,6 +530,7 @@ def _flydsl_prepare_explicit_plan(
     existing_plan,
     plan_step_owner=None,
     plan_cache_owner=None,
+    plan_workgroup_budget=None,
 ):
     """Return the explicit plan aiter #5809 requires.
 
@@ -525,6 +556,8 @@ def _flydsl_prepare_explicit_plan(
     else:
         max_partitions = shape.get("max_partitions")
     workgroup_budget = shape.get("workgroup_budget")
+    if plan_workgroup_budget is not None:
+        workgroup_budget = int(plan_workgroup_budget)
 
     if existing_plan is not None and flydsl_plan_matches(
         existing_plan, num_seqs, num_kv_heads
@@ -642,6 +675,10 @@ def run_pa_decode(
     exp_sums: torch.Tensor | None = None,
     max_logits: torch.Tensor | None = None,
     temporary_output: torch.Tensor | None = None,
+    quantized_output: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
+    store_output: bool = True,
+    quantized_pad_rows: int = 0,
     alibi_slopes: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
@@ -651,6 +688,7 @@ def run_pa_decode(
     plan_step_owner=None,
     plan_cache_owner=None,
     plan_partition_cap: int | None = None,
+    plan_workgroup_budget: int | None = None,
 ):
     """Run the AITER paged-attention decode kernel.
 
@@ -666,7 +704,20 @@ def run_pa_decode(
     ``exp_sums`` / ``max_logits`` / ``temporary_output`` are gluon scratch.
     Omitted, ``pa_decode_gluon`` sizes and allocates its own, so a FlyDSL
     call, which uses its plan's cached scratch, allocates none.
+
+    ``quantized_output`` / ``output_scale`` are a paired FlyDSL-only output:
+    OCP FP8 in the attention layout plus contiguous FP32 ``[tokens, 1]``
+    descales. Omitting both preserves the existing return/output contract.
+    With them, ``store_output=False`` leaves ``output`` unwritten (only its
+    layout is used), and ``quantized_pad_rows`` extra rows of both, past the
+    query rows, are written as FP8 zeros with a unit descale by the same call;
+    both need an aiter that takes them (`_flydsl_output_quant_option`).
     """
+    if (quantized_output is None) != (output_scale is None):
+        raise ValueError(
+            "quantized_output and output_scale must either both be provided or both "
+            "be None"
+        )
     flydsl_seqs = flydsl_decode_seqs(
         output=output,
         q=q,
@@ -761,6 +812,7 @@ def run_pa_decode(
             num_seqs=n,
             query_length=max_seqlen_q,
             plan_partition_cap=plan_partition_cap,
+            plan_workgroup_budget=plan_workgroup_budget,
             context_bound=context_bound,
             existing_plan=work_plan,
             plan_step_owner=plan_step_owner,
@@ -778,6 +830,20 @@ def run_pa_decode(
 
         # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL
         # requires holds. Views, no copy: dim 0 is the outermost axis of each.
+        output_quant_args = (
+            {}
+            if quantized_output is None
+            else {
+                "quantized_output": quantized_output,
+                "output_scale": output_scale,
+            }
+        )
+        # Passed only when they differ from the defaults, so an aiter without
+        # these options still serves the calls that do not use them.
+        if not store_output:
+            output_quant_args["store_output"] = False
+        if quantized_pad_rows:
+            output_quant_args["quantized_pad_rows"] = quantized_pad_rows
         return _flydsl_pa_decode(
             output,
             q,
@@ -800,8 +866,13 @@ def run_pa_decode(
             sliding_window=0,
             work_plan=work_plan,
             max_context_length=context_bound,
+            **output_quant_args,
         )
 
+    if quantized_output is not None or output_scale is not None:
+        raise RuntimeError(
+            "quantized paged-attention output requires the FlyDSL sparse path"
+        )
     if not pa_decode_gluon_supports_arch():
         raise RuntimeError(
             "This GPU has no gluon paged decode: set ATOM_PA_FLYDSL=1"
@@ -1072,7 +1143,7 @@ def unified_attention_with_output_base(
         # Rows are positions' last dim (an mrope table leads with its axes).
         positions = positions[..., :rows]
 
-    def attend(q, q_scale, k, v, qkv):
+    def attend(q, q_scale, k, v, qkv, out=None):
         if use_mla:
             return self.impl.forward(
                 query=q,
@@ -1088,9 +1159,98 @@ def unified_attention_with_output_base(
             position=positions,
             q_scale=q_scale,
             qkv=qkv,
+            output=out,
         )
 
-    return on_scheduled_rows(attend, rows, q, q_scale, k, v, qkv)
+    # A token-graph replay hands MHA the rows the next segment reads as `out`.
+    return on_scheduled_rows(
+        attend, rows, q, q_scale, k, v, qkv, writes_out=not use_mla
+    )
+
+
+def unified_attention_with_output_quant_base_fake(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+    quantized_output: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> None:
+    return None
+
+
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=unified_attention_with_output_quant_base_fake,
+    mutates_args=["quantized_output", "output_scale"],
+)
+@eager_region()
+def unified_attention_with_output_quant_base(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+    quantized_output: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> None:
+    """Sparse-M3 attention writing prequantized o_proj input in place.
+
+    Keeping both results as caller-owned mutable buffers lets token-graph replay
+    retain stable addresses while the eager region itself continues to return
+    only ``None``. The generic attention custom op and all non-requesting paths
+    remain unchanged.
+    """
+    if use_mla:
+        raise ValueError("quantized attention output is only defined for sparse MHA")
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    if not getattr(self.impl, "supports_output_quant", False):
+        raise RuntimeError(f"{layer_name} does not support quantized attention output")
+
+    rows = padded_prefill_rows(q.shape[0])
+    if rows is not None:
+        positions = positions[..., :rows]
+
+    def narrow(value):
+        if (
+            rows is not None
+            and isinstance(value, torch.Tensor)
+            and value.shape[0] == q.shape[0]
+        ):
+            return value[:rows]
+        return value
+
+    # The following o_proj consumes the full token bucket, so the rows past
+    # the scheduled ones must be inert: zero FP8 values and a unit descale
+    # rather than whatever the graph pool left there (NaN included; under pure
+    # TP the MoE routes pad rows like real ones). The sparse PA writes them in
+    # the same launch when it gets the whole bucket (`quantized_pad_rows`);
+    # otherwise they are filled here.
+    pad_in_attention = rows is not None and getattr(
+        self.impl, "writes_quantized_pad_rows", False
+    )
+    whole = pad_in_attention or rows is None
+    self.impl.forward(
+        query=narrow(q),
+        key=narrow(k),
+        value=narrow(v),
+        position=positions,
+        q_scale=narrow(q_scale),
+        qkv=narrow(qkv),
+        quantized_output=quantized_output if whole else narrow(quantized_output),
+        output_scale=output_scale if whole else narrow(output_scale),
+    )
+    if rows is not None and not pad_in_attention:
+        quantized_output[rows:].zero_()
+        output_scale[rows:].fill_(1.0)
 
 
 def linear_attention_with_output_base_fake(
