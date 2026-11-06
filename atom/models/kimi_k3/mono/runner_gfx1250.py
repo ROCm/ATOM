@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Kimi-K3 mono decode on gfx1250 with rank-local kernels and RCCL.
+"""Kimi-K3 decode with a resident gfx1250 K1 and production K2.
 
-The gfx950 runner keeps TP communication inside its persistent kernels.  That
-protocol is wave64- and single-host-specific.  gfx1250 instead runs the
-architecture-local K1/K2 compute kernels around ordinary TP collectives:
-
-``K1 -> o_proj AR -> packed router/latent AG -> persistent MoE finish
-    -> routed AR -> routed-up/shared merge -> final AR``.
-
-No peer pointer, HIP IPC mapping, or in-kernel cross-rank wait is used here.
+K1 fuses the attention-residual seam, projections, convolution and recurrent
+attention into one rank-local launch.  The output projection and latent MoE
+remain on their production paths, retaining K3's tuned FP8/BF16 GEMMs, expert
+kernels, collective selection and communication/compute overlap.
 """
 
 from __future__ import annotations
@@ -21,19 +17,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.models.kimi_k3.mono.config import (
-    EXPERTS,
     GFX1250_BLOCKS,
-    HIDDEN,
-    LATENT,
-)
-from atom.models.kimi_k3.mono.external_collectives import (
-    ExternalCollectivePlan,
-    FrontPayloadLayout,
-)
-from atom.models.kimi_k3.mono.external_runner import (
-    ExternalCollectiveK2Runner,
-    MoeLocalPartials,
-    PackedShardedFrontPartials,
 )
 from atom.models.kimi_k3.mono.k1_local_runner_gfx1250 import (
     Gfx1250K1LocalRunner,
@@ -45,20 +29,9 @@ from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
 from atom.models.kimi_k3.mono.kernels.execution_plan import (
     Gfx1250KimiBuildPlan,
 )
-from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import (
-    build_packed_finish,
-)
-from atom.models.kimi_k3.mono.kernels.stages.k2_front_role_lds_gfx1250 import (
-    build_role_lds_front,
-)
-from atom.models.kimi_k3.mono.kernels.stages.k2_local_kernels_gfx1250 import (
-    build_finalize_local,
-    build_oproj_local,
-)
 from atom.models.kimi_k3.mono.kernels.token_tiling import GFX1250_MAX_TOKENS
 from atom.models.kimi_k3.mono.plan import _width, kda_metadata, width_key
 from atom.models.kimi_k3.mono.runner import K3MonoDecodeRunner, state_slots
-from atom.models.kimi_k3.mono.weights import bind_k2_expert_scales
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.compile import launcher_resources
@@ -102,43 +75,20 @@ def _lean_width(
     if not replacements:
         return None
     return Gfx1250WidthBuild(
-        {layer: replacements.get(layer, runner) for layer, runner in built.k1.items()},
-        built.k2,
+        {layer: replacements.get(layer, runner) for layer, runner in built.k1.items()}
     )
-
-
-@dataclass
-class Gfx1250K2Build:
-    """One row/block specialization and its stable graph-capture buffers."""
-
-    plan: Gfx1250KimiBuildPlan
-    runner: ExternalCollectiveK2Runner
-    oproj: object
-    front: object
-    finish: object
-    finalize: object
-    buffers: dict[str, torch.Tensor]
 
 
 @dataclass(frozen=True)
 class Gfx1250WidthBuild:
     k1: dict[int, Gfx1250K1LocalRunner]
-    k2: dict[int, Gfx1250K2Build]
 
     def kernels(self) -> list[tuple[object, KernelAbi]]:
         """All local launchers, for compile-time scratch validation."""
-        pairs: list[tuple[object, KernelAbi]] = []
-        for k1 in self.k1.values():
-            pairs.append((k1.entrypoint.launcher, k1.entrypoint.abi))
-        for k2 in self.k2.values():
-            pairs.extend(
-                (
-                    (k2.oproj.launcher, k2.oproj.abi),
-                    (k2.front.launcher, k2.front.abi),
-                    (k2.finish.launcher, k2.finish.abi),
-                    (k2.finalize.launcher, k2.finalize.abi),
-                )
-            )
+        pairs = [
+            (k1.entrypoint.launcher, k1.entrypoint.abi)
+            for k1 in self.k1.values()
+        ]
 
         unique = {}
         for launcher, abi in pairs:
@@ -147,9 +97,10 @@ class Gfx1250WidthBuild:
 
 
 class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
-    """One TP8 rank of the packed, external-collective gfx1250 path."""
+    """One TP8 rank with resident K1 and production K2."""
 
     max_rows = GFX1250_MAX_TOKENS
+    bind_k2 = False
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
@@ -187,29 +138,6 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 f"gfx1250 packed mono needs {GFX1250_BLOCKS} CUs, " f"got {self.blocks}"
             )
 
-        # AITER's gfx1250 expert payload is byte-compatible with the model
-        # binder's FP4 planes, but its n32k4 E8M0 scale layout is explicit.
-        plans = []
-        for plan in self.plans:
-            if plan.moe is None:
-                plans.append(plan)
-                continue
-            module = self.inner.layers[plan.layer_id].block_sparse_moe
-            scales = bind_k2_expert_scales(
-                module, plan.layer_id, self.dims, self.rank, GFX1250
-            ).kernel_arguments()
-            plans.append(
-                replace(
-                    plan,
-                    moe=replace(
-                        plan.moe,
-                        w13s=scales["w13s"],
-                        w2s=scales["w2s"],
-                    ),
-                )
-            )
-        self.plans = plans
-
     def _allocate(self) -> None:
         self.ones = torch.ones(self.max_rows, dtype=torch.int32, device=self.device)
 
@@ -235,14 +163,11 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
     def _build_width(self, key: int) -> Gfx1250WidthBuild:
         rows, qlen = _width(key)
         k1_cache: dict[tuple, Gfx1250K1LocalRunner] = {}
-        k2_cache: dict[tuple[int, bool, bool], Gfx1250K2Build] = {}
         k1_by_layer: dict[int, Gfx1250K1LocalRunner] = {}
-        k2_by_layer: dict[int, Gfx1250K2Build] = {}
 
         for layer in self.plans:
-            if layer.mono:
+            if layer.kda is not None:
                 weight = layer.kda
-                assert weight is not None
                 spec = K1LocalBuildSpec(
                     qlen=qlen,
                     delta=True,
@@ -264,107 +189,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     k1_cache[cache_key] = local
                 k1_by_layer[layer.layer_id] = local
 
-            if layer.moe is not None:
-                reset = layer.moe.write_idx >= 0
-                nblocks = layer.moe.blocks + reset
-                cache_key = (nblocks, reset, layer.moe.gu_interleave)
-                local = k2_cache.get(cache_key)
-                if local is None:
-                    local = self._build_k2(
-                        rows,
-                        nblocks,
-                        reset,
-                        layer.moe.gu_interleave,
-                    )
-                    k2_cache[cache_key] = local
-                k2_by_layer[layer.layer_id] = local
-
-        return Gfx1250WidthBuild(k1_by_layer, k2_by_layer)
-
-    def _build_k2(
-        self,
-        rows: int,
-        nblocks: int,
-        reset: bool,
-        gu_interleave: bool,
-    ) -> Gfx1250K2Build:
-        plan = self._plan(rows, nblocks)
-        oproj = build_oproj_local(plan)
-        front = build_role_lds_front(plan, reset=reset)
-        finish = build_packed_finish(plan, gu_interleave=gu_interleave)
-        finalize = build_finalize_local(plan)
-        buffers = self._allocate_k2_buffers(
-            plan, front.scratch_bytes, finish.scratch_bytes
-        )
-        tp_group = get_tp_group()
-
-        def all_gather(tensor: torch.Tensor) -> torch.Tensor:
-            return tp_group.all_gather(tensor, dim=0, use_custom=False)
-
-        def all_reduce(tensor: torch.Tensor) -> torch.Tensor:
-            # Match the production TP path: this selects the best available
-            # small-message backend (LL/custom AR, symmetric memory, or RCCL)
-            # and falls back safely.  Calling torch.distributed directly here
-            # forced every K2 boundary onto generic cross-node RCCL.
-            return tp_group.all_reduce(tensor, ca_fp8_quant=False)
-
-        runner = ExternalCollectiveK2Runner(
-            ExternalCollectivePlan(rows),
-            all_gather,
-            all_reduce,
-        )
-        return Gfx1250K2Build(plan, runner, oproj, front, finish, finalize, buffers)
-
-    def _allocate_k2_buffers(
-        self,
-        plan: Gfx1250KimiBuildPlan,
-        front_scratch_bytes: int,
-        finish_scratch_bytes: int,
-    ) -> dict[str, torch.Tensor]:
-        rows = plan.tokens
-        tiles = plan.token_tiling.tile_count
-        device = self.device
-
-        def empty(shape, dtype=torch.float32):
-            return torch.empty(shape, dtype=dtype, device=device)
-
-        payload = FrontPayloadLayout(rows)
-        # Every empty tensor is a kernel output. The front overwrites all local
-        # planes; the finish initializes the full flag/union metadata and only
-        # reads the route/expert/KOF prefixes it wrote for that tile. Quantized
-        # planes and final partials are fully overwritten before consumption.
-        # Scratch is different: its barrier tickets need a known initial epoch.
-        return {
-            "oproj": empty((rows, HIDDEN), torch.bfloat16),
-            "x_local": empty((rows, HIDDEN), torch.bfloat16),
-            "shared_gate_up": empty((rows, 2 * self.dims.sh_inter), torch.bfloat16),
-            "latent_logical": empty((rows, LATENT), torch.bfloat16),
-            "shared_hidden": empty((rows, self.dims.sh_inter), torch.bfloat16),
-            "route": empty((rows, 32), torch.int32),
-            "tile_route": empty((tiles, 16, 32), torch.int32),
-            "flags": empty((tiles, EXPERTS), torch.int32),
-            "experts": empty((tiles, 256), torch.int32),
-            "kof": empty((tiles, 256, 16), torch.int32),
-            "union_sizes": empty((tiles,), torch.int32),
-            "latent_fp4": empty((rows, LATENT // 8), torch.int32),
-            "latent_scales": empty((rows, LATENT // 32), torch.int32),
-            "routed_intermediate_fp4": empty(
-                (tiles, 256, self.dims.inter // 8), torch.int32
-            ),
-            "routed_intermediate_scales": empty(
-                (tiles, 256, self.dims.inter // 32), torch.int32
-            ),
-            "routed_partial": empty((rows, LATENT), torch.bfloat16),
-            "shared_partial": empty((rows, HIDDEN), torch.bfloat16),
-            "final": empty((rows, HIDDEN), torch.bfloat16),
-            "front_payload": empty(payload.local_shape, torch.uint8),
-            "front_scratch": torch.zeros(
-                front_scratch_bytes, dtype=torch.uint8, device=device
-            ),
-            "finish_scratch": torch.zeros(
-                finish_scratch_bytes, dtype=torch.uint8, device=device
-            ),
-        }
+        return Gfx1250WidthBuild(k1_by_layer)
 
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor, qlen: int
@@ -396,6 +221,37 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             )
         hidden, _ = self.inner.output_attn_res(prefix, blocks, add, add2)
         return hidden
+
+    def _layer(self, build, plan, positions, prefix, blocks, add, add2, metadata):
+        if not plan.k1_only:
+            out = self._fallback(plan, positions, prefix, blocks, add, add2)
+        else:
+            delta = add if add2 is None else (add2 if add is None else add + add2)
+            core = self._k1(build, plan, prefix, delta, blocks, metadata)
+            layer = self.inner.layers[plan.layer_id]
+            attn_out = layer.self_attn.o_proj(core)
+
+            # K1 already banked a closing block. The production MLP seam must
+            # therefore restart its prefix exactly as DecoderLayer.forward does.
+            weight = plan.kda
+            reset = weight.write_idx >= 0
+            normed, prefix = layer.mlp_attn_res(
+                None if reset else prefix,
+                blocks[:, : weight.blocks + reset],
+                attn_out,
+            )
+            add, add2 = layer._ffn(normed)
+            out = (prefix, add, add2)
+
+        rows = blocks.size(0)
+        widths = {tensor.size(0) for tensor in out if tensor is not None}
+        if widths != {rows}:
+            raise MonoUnsupported(
+                f"layer {plan.layer_id} returned rows {sorted(widths)} for "
+                f"an {rows}-row step"
+            )
+        self._write_aux(plan.layer_id, out)
+        return out
 
     def _k1(self, build, plan, prefix, delta, blocks, metadata, taps=None):
         if taps is not None:
@@ -433,104 +289,3 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             core_out=core,
         )
         return local(runtime, stream=torch.cuda.current_stream())
-
-    def _k2(self, build, plan, core, prefix, blocks) -> torch.Tensor:
-        weight = plan.moe
-        local = build.k2[plan.layer_id]
-        buffers = local.buffers
-        stream = torch.cuda.current_stream()
-
-        def oproj_local() -> torch.Tensor:
-            local.oproj.launcher(
-                core.data_ptr(),
-                weight.w_o.data_ptr(),
-                buffers["oproj"].data_ptr(),
-                stream=stream,
-            )
-            return buffers["oproj"]
-
-        def front_local(
-            oproj_reduced: torch.Tensor,
-        ) -> PackedShardedFrontPartials:
-            router = weight.w_gate.narrow(
-                0, self.rank * (EXPERTS // self.tp), EXPERTS // self.tp
-            )
-            latent = weight.w_ld.narrow(
-                0, self.rank * (LATENT // self.tp), LATENT // self.tp
-            )
-            local.front.launcher(
-                oproj_reduced.data_ptr(),
-                prefix.data_ptr(),
-                blocks.data_ptr(),
-                blocks.stride(0),
-                blocks.stride(1),
-                weight.seam.nw.data_ptr(),
-                weight.seam.qk.data_ptr(),
-                weight.seam.out_nw.data_ptr(),
-                router.data_ptr(),
-                latent.data_ptr(),
-                weight.w_sgu.data_ptr(),
-                buffers["x_local"].data_ptr(),
-                buffers["front_payload"].data_ptr(),
-                buffers["shared_gate_up"].data_ptr(),
-                buffers["front_scratch"].data_ptr(),
-                plan.layer_id,
-                weight.seam.eps,
-                weight.seam.out_eps,
-                stream=stream,
-            )
-            return PackedShardedFrontPartials(buffers["front_payload"], buffers)
-
-        def finish_local(gathered: torch.Tensor, retained: object) -> MoeLocalPartials:
-            if retained is not buffers:
-                raise ValueError("gfx1250 K2 retained buffer mismatch")
-            local.finish.launcher(
-                gathered.data_ptr(),
-                weight.bias.data_ptr(),
-                buffers["shared_gate_up"].data_ptr(),
-                weight.w_sd.data_ptr(),
-                weight.w13.data_ptr(),
-                weight.w13s.data_ptr(),
-                weight.w2.data_ptr(),
-                weight.w2s.data_ptr(),
-                buffers["latent_logical"].data_ptr(),
-                buffers["shared_hidden"].data_ptr(),
-                buffers["route"].data_ptr(),
-                buffers["tile_route"].data_ptr(),
-                buffers["flags"].data_ptr(),
-                buffers["experts"].data_ptr(),
-                buffers["kof"].data_ptr(),
-                buffers["union_sizes"].data_ptr(),
-                buffers["latent_fp4"].data_ptr(),
-                buffers["latent_scales"].data_ptr(),
-                buffers["routed_intermediate_fp4"].data_ptr(),
-                buffers["routed_intermediate_scales"].data_ptr(),
-                buffers["routed_partial"].data_ptr(),
-                buffers["shared_partial"].data_ptr(),
-                buffers["finish_scratch"].data_ptr(),
-                stream=stream,
-            )
-            return MoeLocalPartials(
-                buffers["routed_partial"],
-                buffers["shared_partial"],
-            )
-
-        def finalize_local(routed: torch.Tensor, shared: torch.Tensor) -> torch.Tensor:
-            local.finalize.launcher(
-                routed.data_ptr(),
-                shared.data_ptr(),
-                weight.ln_w.data_ptr(),
-                weight.w_up.data_ptr(),
-                buffers["final"].data_ptr(),
-                self.rank,
-                weight.ln_eps,
-                stream=stream,
-            )
-            return buffers["final"]
-
-        return local.runner.run(
-            oproj_local,
-            front_local,
-            finish_local,
-            finalize_local,
-        )

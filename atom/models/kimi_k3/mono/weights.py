@@ -503,8 +503,15 @@ class LayerPlan:
         production path (``bind_model``)."""
         return self.kda is None and self.moe is not None
 
+    @property
+    def k1_only(self) -> bool:
+        """K1 alone; projection, MoE and their collectives stay production."""
+        return self.kda is not None and self.moe is None
 
-def bind_model(model, dims: Dims, rank: int) -> list[LayerPlan]:
+
+def bind_model(
+    model, dims: Dims, rank: int, *, bind_k2: bool = True
+) -> list[LayerPlan]:
     """Every decoder layer, in order.
 
     A layer takes K1 and K2 only when it is a KDA layer with a MoE FFN and at
@@ -525,6 +532,9 @@ def bind_model(model, dims: Dims, rank: int) -> list[LayerPlan]:
         has_ffn = hasattr(layer, "block_sparse_moe") and blocks >= 1
         takes = bool(getattr(layer, "is_linear_attn", False)) and has_ffn
         if not takes and has_ffn:
+            if not bind_k2:
+                plans.append(LayerPlan(layer_id, None, None))
+                continue
             # One layer's refusal leaves that layer on the production path; it
             # must not take the KDA layers' mono down with it.
             try:
@@ -547,11 +557,11 @@ def bind_model(model, dims: Dims, rank: int) -> list[LayerPlan]:
             LayerPlan(
                 layer_id,
                 bind_kda(layer, layer_id, dims),
-                bind_moe(layer, layer_id, dims, rank),
+                bind_moe(layer, layer_id, dims, rank) if bind_k2 else None,
             )
         )
     _need(
-        any(p.mono for p in plans),
+        any(p.mono if bind_k2 else p.k1_only for p in plans),
         f"no layer takes the kernels ({len(layers)} layers, block size "
         f"{ATTN_RES_BLOCK})",
     )

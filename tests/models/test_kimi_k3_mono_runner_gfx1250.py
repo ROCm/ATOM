@@ -35,28 +35,15 @@ class _Launcher:
         self.calls.append((args, os.environ.get("COMPILE_ONLY")))
 
 
-def _entry(launcher, *names):
-    return SimpleNamespace(launcher=launcher, abi=KernelAbi(names))
-
-
 def test_width_build_enumerates_each_local_launcher_once_and_compile_only():
-    launchers = [_Launcher() for _ in range(5)]
+    launchers = [_Launcher()]
     k1 = SimpleNamespace(
         entrypoint=SimpleNamespace(
             launcher=launchers[0],
             abi=KernelAbi(("k1_arg",)),
         )
     )
-    k2 = SimpleNamespace(
-        oproj=_entry(launchers[1], "oproj"),
-        front=_entry(launchers[2], "front"),
-        finish=_entry(launchers[3], "finish"),
-        finalize=_entry(launchers[4], "finalize"),
-    )
-    build = Gfx1250WidthBuild(
-        k1={1: k1, 2: k1},
-        k2={1: k2, 2: k2},
-    )
+    build = Gfx1250WidthBuild(k1={1: k1, 2: k1})
 
     kernels = build.kernels()
     assert len(kernels) == len(launchers)
@@ -92,7 +79,7 @@ def test_width_build_replaces_only_spilled_k1_with_lean_gemv():
         spec=spec,
         plan=plan,
     )
-    built = Gfx1250WidthBuild({1: old, 2: other}, {})
+    built = Gfx1250WidthBuild({1: old, 2: other})
 
     lean = _lean_width(built, [spilled])
     assert lean is not None
@@ -120,12 +107,61 @@ def test_resident_resource_hazards_include_explicit_spills(monkeypatch):
     )
 
 
-def test_k2_uses_the_production_tp_all_reduce_dispatch():
+def test_gfx1250_keeps_k2_on_the_production_path():
     source = (
         Path(__file__).parents[2] / "atom/models/kimi_k3/mono/runner_gfx1250.py"
     ).read_text()
-    assert "tp_group.all_reduce(tensor, ca_fp8_quant=False)" in source
-    assert "torch.distributed.all_reduce(" not in source
+    assert "layer.self_attn.o_proj(core)" in source
+    assert "layer._ffn(normed)" in source
+    assert "def _k2(" not in source
+
+
+@pytest.mark.parametrize("write_idx", (-1, 1))
+def test_k1_hands_its_core_to_the_production_k2(write_idx):
+    rows, hidden = 2, 4
+    prefix = torch.zeros(rows, hidden)
+    blocks = torch.zeros(rows, 3, hidden)
+    core = torch.full((rows, hidden), 2.0)
+    calls = {}
+
+    def o_proj(value):
+        calls["core"] = value
+        return value + 1
+
+    def mlp_attn_res(value, visible, attn_out):
+        calls["seam"] = (value, visible, attn_out)
+        return attn_out + 1, attn_out + 2
+
+    def ffn(normed):
+        calls["ffn"] = normed
+        return normed + 1, normed + 2
+
+    layer = SimpleNamespace(
+        self_attn=SimpleNamespace(o_proj=o_proj),
+        mlp_attn_res=mlp_attn_res,
+        _ffn=ffn,
+    )
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.inner = SimpleNamespace(layers=[layer])
+    runner._k1 = lambda *_args, **_kwargs: core
+    runner._write_aux = lambda *_args: None
+    plan = SimpleNamespace(
+        layer_id=0,
+        k1_only=True,
+        kda=SimpleNamespace(blocks=1, write_idx=write_idx),
+    )
+
+    out = runner._layer(
+        None, plan, None, prefix, blocks, torch.ones_like(prefix), None, None
+    )
+
+    assert calls["core"] is core
+    seam_prefix, visible, attn_out = calls["seam"]
+    assert (seam_prefix is None) == (write_idx >= 0)
+    assert visible.size(1) == 1 + (write_idx >= 0)
+    torch.testing.assert_close(attn_out, core + 1)
+    torch.testing.assert_close(calls["ffn"], core + 2)
+    assert all(tensor.shape == prefix.shape for tensor in out)
 
 
 def test_runner_admits_only_supported_rows_and_query_lengths():

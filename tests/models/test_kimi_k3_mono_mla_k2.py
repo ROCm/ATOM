@@ -88,6 +88,18 @@ def test_full_attention_layers_get_k2_alone(stub_binds):
     assert (plans[0].kda, plans[0].moe) == (None, None)
 
 
+def test_k1_only_binding_never_touches_k2_weights(stub_binds, monkeypatch):
+    monkeypatch.setattr(
+        stub_binds,
+        "bind_moe",
+        lambda *_args, **_kwargs: pytest.fail("K2 must stay on the model path"),
+    )
+    plans = stub_binds.bind_model(_model(6), None, 0, bind_k2=False)
+
+    assert [p.k1_only for p in plans] == [False, True, True, False, True, True]
+    assert all(plan.moe is None for plan in plans)
+
+
 def test_a_full_attention_layer_that_closes_a_block_keeps_production_k2(
     stub_binds, caplog
 ):
