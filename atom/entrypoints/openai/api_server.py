@@ -2031,7 +2031,10 @@ async def _chat_completions(
         messages = request.get_messages()
         assistant_prefix = None
         if beta:
-            messages, assistant_prefix = take_assistant_prefix(messages)
+            messages, assistant_prefix = take_assistant_prefix(
+                messages,
+                getattr(custom_message_encoder, "join_text_blocks", None),
+            )
         logprob_codec = None
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:

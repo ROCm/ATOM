@@ -17,6 +17,7 @@ logger = logging.getLogger("atom")
 MessageEncoder = Callable[..., str]
 MessagePreparer = Callable[[list[dict], list[dict] | None], list[dict]]
 KwargsPreparer = Callable[[dict[str, Any]], dict[str, Any]]
+TextJoiner = Callable[[list], str]
 
 
 def _identity_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -67,6 +68,10 @@ class MessageEncoderAdapter:
     defaults: dict[str, Any] = field(default_factory=dict, compare=False)
     prepare_kwargs: KwargsPreparer = _identity_kwargs
     preserve_content: bool = False
+    # How the encoder joins the text blocks of a content list, which it is
+    # given with `preserve_content`; ``None`` when it never is. Text placed
+    # after the render (an assistant prefix) has to be joined the same way.
+    join_text_blocks: TextJoiner | None = None
     reasoning_rules: ReasoningRules | None = None
 
     def __call__(self, messages: list[dict], **kwargs: Any) -> str:
@@ -105,6 +110,7 @@ class _EncoderPreparation:
     kwargs: KwargsPreparer = _identity_kwargs
     supports_tools: bool = False
     preserve_content: bool = False
+    join_text_blocks: TextJoiner | None = None
     reasoning_rules: ReasoningRules | None = None
 
 
@@ -117,6 +123,7 @@ _PREPARERS = {
         kwargs=deepseek_v41_encoder.prepare_kwargs,
         supports_tools=True,
         preserve_content=True,
+        join_text_blocks=deepseek_v41_encoder.join_text_blocks,
         reasoning_rules=deepseek_v41_encoder.REASONING_RULES,
     ),
 }
@@ -173,6 +180,7 @@ def build_message_encoder_adapter(
         prepare_kwargs=preparation.kwargs,
         supports_tools=preparation.supports_tools,
         preserve_content=preparation.preserve_content,
+        join_text_blocks=preparation.join_text_blocks,
         reasoning_rules=preparation.reasoning_rules,
         source_path=source_path,
         accepts=_accepted_kwargs(accepts_from or encoder),

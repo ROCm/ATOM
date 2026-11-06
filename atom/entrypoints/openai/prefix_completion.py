@@ -17,6 +17,7 @@ channel (Qwen3 writes line breaks into an empty one) sees the prefix without
 them.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from .protocol import ChatMessage
@@ -34,11 +35,17 @@ class AssistantPrefix:
 
 def take_assistant_prefix(
     messages: list[ChatMessage],
+    join_text_blocks: Callable[[list], str] | None = None,
 ) -> tuple[list[ChatMessage], AssistantPrefix | None]:
     """Split a trailing ``prefix: true`` assistant message off ``messages``.
 
     Returns the messages to render and the prefix, or ``messages`` unchanged
     and ``None`` when no message asks for prefix completion.
+
+    The prefix's text is the message's as the renderer would have written
+    it: a content list joined by ``join_text_blocks``, the encoder's own rule
+    when it is given lists (DeepSeek-V4.1's), else by ``get_content_text``,
+    as every message is before a chat template sees it.
     """
     flagged = [i for i, m in enumerate(messages) if _prefix_flag(m)]
     if not flagged:
@@ -64,7 +71,11 @@ def take_assistant_prefix(
     reasoning = extras.get("reasoning_content")
     if reasoning is not None and not isinstance(reasoning, str):
         raise ValueError("an assistant prefix's reasoning_content must be a string")
-    return messages[:-1], AssistantPrefix(last.get_content_text(), reasoning)
+    if join_text_blocks is not None and isinstance(last.content, list):
+        text = join_text_blocks(last.content)
+    else:
+        text = last.get_content_text()
+    return messages[:-1], AssistantPrefix(text, reasoning)
 
 
 def continue_prompt(

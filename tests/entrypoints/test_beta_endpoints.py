@@ -23,6 +23,9 @@ from atom.entrypoints.openai.chat_encoders import (
     _load_encoder_from_dir,
     apply_chat_template,
 )
+from atom.entrypoints.openai.deepseek_v41_encoder import (
+    join_text_blocks as v41_join_text_blocks,
+)
 from atom.entrypoints.openai.fim import KNOWN_FIM_FORMATS, resolve_fim_format
 from atom.entrypoints.openai.prefix_completion import (
     AssistantPrefix,
@@ -73,6 +76,21 @@ def test_trailing_prefix_is_split_off():
     rest, prefix = take_assistant_prefix(messages)
     assert rest == messages[:1]
     assert prefix == AssistantPrefix("```python\n", "Plan.")
+
+
+TWO_BLOCKS = [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}]
+
+
+def test_a_prefixs_text_blocks_are_joined_as_the_renderer_joins_them():
+    """As a chat template gets them (one line apart), or as the encoder
+    that is given the list joins them: V4.1's, a blank line apart."""
+    messages = _messages(
+        USER, {"role": "assistant", "content": TWO_BLOCKS, "prefix": True}
+    )
+    _, prefix = take_assistant_prefix(messages)
+    assert prefix.content == messages[-1].get_content_text() == "first\nsecond"
+    _, prefix = take_assistant_prefix(messages, v41_join_text_blocks)
+    assert prefix.content == "first\n\nsecond"
 
 
 @pytest.mark.parametrize(
@@ -975,15 +993,20 @@ def v41_encoder():
     return _load_encoder_from_dir(str(directory))
 
 
+@pytest.mark.parametrize(
+    "content", [PREFIX["content"], TWO_BLOCKS], ids=["text", "blocks"]
+)
 @pytest.mark.parametrize("mode", ["chat", "thinking"])
 def test_v41_prefix_matches_official_unterminated_assistant_turn(
-    engine, monkeypatch, v41_encoder, mode
+    engine, monkeypatch, v41_encoder, mode, content
 ):
     """The official encoder renders an assistant turn without its EOS when
     asked (`wo_eos`); a continued prefix must be exactly that prompt."""
     monkeypatch.setattr(api_server, "custom_message_encoder", v41_encoder)
     reasoning = "Partition first." if mode == "thinking" else None
-    prefix = {**PREFIX, "reasoning_content": reasoning} if reasoning else PREFIX
+    prefix = {**PREFIX, "content": content}
+    if reasoning:
+        prefix["reasoning_content"] = reasoning
     history = [
         {"role": "system", "content": "Be brief."},
         USER,
@@ -1002,7 +1025,7 @@ def test_v41_prefix_matches_official_unterminated_assistant_turn(
             *history,
             {
                 "role": "assistant",
-                "content": PREFIX["content"],
+                "content": content,
                 "reasoning_content": reasoning,
                 "wo_eos": True,
             },
