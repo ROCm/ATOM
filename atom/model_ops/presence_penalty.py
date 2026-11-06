@@ -87,6 +87,96 @@ def _mark_tokens_kernel(
     )
 
 
+@triton.jit
+def _record_draft_kernel(
+    ids_ptr, ctx_ptr, pos_ptr, rows, CTX: tl.constexpr, BLOCK: tl.constexpr
+):
+    # Each row's new draft id into its context (slot 1 + pos), then pos + 1.
+    r = tl.arange(0, BLOCK)
+    m = r < rows
+    pos = tl.load(pos_ptr + r, mask=m, other=0)
+    tok = tl.load(ids_ptr + r, mask=m, other=-1)
+    tl.store(ctx_ptr + r * CTX + 1 + pos, tok, mask=m & (pos < CTX - 1))
+    tl.store(pos_ptr + r, pos + 1, mask=m)
+
+
+class DraftPresencePenalty:
+    """ATOM_MTP_DRAFT_PRESENCE_PENALTY: the verifier's presence penalty on the
+    draft passes' argmax.
+
+    Row `r` of a draft pass is the step's `r`-th request. Before the argmax it
+    loses the request's penalty on every token in its slot's mask (all it has
+    emitted, this step's tokens included: they are marked before the drafter
+    runs) and on the drafts already made this step, the set its verify row will
+    penalize. The buffers are fixed, since the draft passes are recorded: `begin`
+    stages a step's slots and penalties before the passes, each pass then
+    penalizes and records its ids (`apply`, `record`), so a replayed mid-step
+    reads how many drafts precede it from `pos`."""
+
+    def __init__(self, state, max_rows: int, max_drafts: int, device):
+        assert (
+            max_drafts <= state.max_extra
+        ), "the penalty kernel counts max_extra drafts"
+        self.state = state
+        self.max_rows = int(max_rows)
+        self.ctx_width = int(max_drafts) + 1
+        self.slots = torch.zeros(self.max_rows, dtype=torch.int32, device=device)
+        self.penalties = torch.zeros(self.max_rows, dtype=torch.float32, device=device)
+        self.ctx = torch.full(
+            (self.max_rows * self.ctx_width,), -1, dtype=torch.int32, device=device
+        )
+        self.pos = torch.zeros(self.max_rows, dtype=torch.int32, device=device)
+        self.row_seq = torch.arange(self.max_rows, dtype=torch.int32, device=device)
+        self.seq_start = self.row_seq * self.ctx_width
+
+    def begin(self, step: "PresencePenaltyStep | None", scheduled_bs: int):
+        """A step's requests (`step`'s slots and penalties, rows in batch order)
+        before its draft passes; no penalty without a step (prefill, none set)."""
+        self.penalties.zero_()
+        self.pos.zero_()
+        self.ctx.fill_(-1)
+        if step is None:
+            return
+        n = min(int(scheduled_bs), step.slots.numel(), self.max_rows)
+        self.slots[:n].copy_(step.slots[:n])
+        self.penalties[:n].copy_(step.penalties[:n])
+
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        """Subtract the penalties in place from a draft pass's `[rows, V]` logits."""
+        rows = logits.shape[0]
+        assert rows <= self.max_rows and logits.stride(1) == 1
+        block = 4096
+        _apply_presence_penalty_kernel[(rows, triton.cdiv(logits.shape[1], block))](
+            logits,
+            logits.stride(0),
+            self.ctx,
+            self.row_seq,
+            self.pos,
+            self.seq_start,
+            self.slots,
+            self.penalties,
+            self.state.mask,
+            self.state.mask.stride(0),
+            0,
+            logits.shape[1],
+            MAX_EXTRA=self.state.max_extra,
+            BLOCK=block,
+        )
+        return logits
+
+    def record(self, ids: torch.Tensor):
+        """A draft pass's `[rows]` ids: they count for the passes after it."""
+        rows = ids.numel()
+        _record_draft_kernel[(1,)](
+            ids.view(-1),
+            self.ctx,
+            self.pos,
+            rows,
+            CTX=self.ctx_width,
+            BLOCK=triton.next_power_of_2(max(rows, 2)),
+        )
+
+
 class PresencePenaltyStep:
     """One decode forward's rows: which request each logits row belongs to, its
     position in the request's query, and the requests' slots and penalties."""

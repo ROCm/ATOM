@@ -1403,6 +1403,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MTP_ADVANCE_TOKEN_SPLIT": lambda: _flag_env(
         "ATOM_MTP_ADVANCE_TOKEN_SPLIT", "0"
     ),
+    # The verifier's presence penalty on the draft's argmax too (TP1 LM head): a
+    # draft row loses the request's presence_penalty on every token it has emitted
+    # and on the drafts before it in this step, as its verify row will, so the
+    # draft stops proposing the tokens the penalized target turns down. Changes
+    # only the proposals: the output distribution is the verifier's either way.
+    "ATOM_MTP_DRAFT_PRESENCE_PENALTY": lambda: _flag_env(
+        "ATOM_MTP_DRAFT_PRESENCE_PENALTY", "0"
+    ),
     # With ATOM_MTP_FUSED_DRAFT_GLUE: skip the per-pass kv_indices generation
     # where no draft attention reads kv_indices (page sizes other than 256 / 1024,
     # whose persistent ASM decode is its only reader). kv_indptr is still written.

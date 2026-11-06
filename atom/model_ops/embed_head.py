@@ -423,19 +423,28 @@ class ParallelLMHead(VocabParallelEmbedding):
         assert (
             out.dtype == torch.int32 and out.device == x.device
         ), "argmax out must be an int32 tensor on the input device"
+        # ATOM_MTP_DRAFT_PRESENCE_PENALTY: a draft pass's argmax over the logits
+        # its verify row's penalty would leave, so the logits must be written.
+        draft_presence = getattr(self, "draft_presence", None)
+        if draft_presence is not None and not getattr(
+            get_forward_context().context, "is_draft", False
+        ):
+            draft_presence = None
         # Pure-DP draft: shard the vocab across the DP group instead of a
         # replicated full-vocab GEMM. Skip plugin mode -- its caller decides the
         # collective count per chunk (a mismatch would deadlock DP) -- and skip
         # the context lookup entirely when the env is off.
         if (
-            envs.ATOM_DP_DRAFT_ARGMAX
+            draft_presence is None
+            and envs.ATOM_DP_DRAFT_ARGMAX
             and not is_plugin_mode()
             and self._can_use_dp_sharded_argmax(get_forward_context().context)
         ):
             return out.copy_(self._dp_sharded_logits(x, "argmax"))
         exchange = getattr(self, "_argmax_exchange", None)
         if (
-            exchange is not None
+            draft_presence is None
+            and exchange is not None
             and out.is_contiguous()
             and self._argmax_epilogue_serves(x)
         ):
@@ -452,7 +461,8 @@ class ParallelLMHead(VocabParallelEmbedding):
             argmax_exchange_pick(keys, self.vocab_start_idx, out.view(-1), *exchange)
             return out
         if (
-            envs.ATOM_LM_HEAD_ARGMAX_EPILOGUE
+            draft_presence is None
+            and envs.ATOM_LM_HEAD_ARGMAX_EPILOGUE
             and self.tp_size > 1
             and envs.ATOM_ARGMAX_HEAD_AR_GATHER
             and out.is_contiguous()
@@ -479,6 +489,8 @@ class ParallelLMHead(VocabParallelEmbedding):
             # `tie="low"` keeps the lowest-index pick promised above; `logits`
             # stays bf16, since the reduction widens as it reads.
             rows, width = logits.shape
+            if draft_presence is not None:
+                draft_presence.apply(logits)
             if not self._argmax_row_lens or self._argmax_row_lens[-1].numel() < rows:
                 self._argmax_row_lens.append(
                     torch.full(
@@ -492,7 +504,12 @@ class ParallelLMHead(VocabParallelEmbedding):
                 tie="low",
                 output_idx=out.view(-1, 1),
             )
+            if draft_presence is not None:
+                draft_presence.record(out)
             return out
+        assert (
+            draft_presence is None
+        ), "ATOM_MTP_DRAFT_PRESENCE_PENALTY penalizes the TP1 LM head's argmax only"
         if envs.ATOM_ARGMAX_HEAD_AR_GATHER and out.is_contiguous():
             # The packs' all-gather as an exact all-reduce of their byte images
             # (lm_head_argmax.py): the plain all-reduce is the cheaper collective

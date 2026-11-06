@@ -826,6 +826,13 @@ class EagleProposer(Drafter):
 
         forward_context = get_forward_context()
         context = forward_context.context
+        # ATOM_MTP_DRAFT_PRESENCE_PENALTY: this step's requests and no drafts yet,
+        # before the (recorded) passes read them.
+        draft_presence = getattr(self, "draft_presence", None)
+        if draft_presence is not None:
+            draft_presence.begin(
+                getattr(self.runner, "_presence_step", None), context.scheduled_bs
+            )
         # A mid-step's token split (ATOM_MTP_ADVANCE_TOKEN_SPLIT) is installed by
         # the advance that precedes it; none may reach step 0 from a last step.
         if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT:
