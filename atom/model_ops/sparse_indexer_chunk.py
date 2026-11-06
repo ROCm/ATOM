@@ -259,10 +259,11 @@ class ConcatKeyWorkspace:
     of a long prefill asks for a slightly larger block than the last one: the
     caching allocator never finds one to reuse and reserves another, chunk
     after chunk, until HBM runs out. Sized from the configuration before the
-    memory profile, they are counted in it. A step whose keys outgrow a buffer
-    doubles it -- the only allocation after startup, and a rare one: one
-    request is at most the model length, a step past it is several long
-    requests scheduled together."""
+    memory profile, they are counted in it. One request's keys are at most
+    the model length, so a step whose requests together outgrow the buffers
+    is gathered and scored a group of requests at a time
+    (`ConcatKeys.groups`). A buffer still asked for more (a PCP step, whose
+    rows are not grouped) doubles, the only allocation after startup."""
 
     def __init__(
         self, capacity: int, dim: int, dtype, device, gathered_capacity: int = 0
@@ -276,6 +277,12 @@ class ConcatKeyWorkspace:
             torch.empty((rows, self.dim), dtype=self.dtype, device=self.device),
             torch.empty((rows, 1), dtype=torch.float32, device=self.device),
         )
+
+    @property
+    def capacity(self) -> int:
+        """Keys the key buffer holds: a step, or a group of its requests
+        (`ConcatKeys.groups`), of at most this many keys fits without growth."""
+        return self._keys[0].shape[0]
 
     @property
     def nbytes(self) -> int:

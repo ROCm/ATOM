@@ -16,6 +16,7 @@ from aiter import (
     get_mla_metadata_v1,
 )
 
+from atom.distributed.dcp_layout import dcp_concat_gather_plan
 from atom.distributed.dcp_utils import (
     NONPS_MAX_Q_ROWS,
     dcp_persistent_supported,
@@ -66,13 +67,17 @@ from atom.model_ops.glm5_next.geometry import (
 )
 from atom.model_ops.indexer import (
     FP8_MQA_LOGITS_TAKES_OUT,
+    ConcatGroup,
     ConcatKeys,
+    DcpConcatGather,
     Fp4LaunchStorages,
     IndexRows,
     RowSplit,
     concat_rows,
     fp4_rows,
     fp8_rows,
+    pack_concat_groups,
+    ubatch_concat_keys,
 )
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
 from atom.model_ops.sparse_indexer_chunk import (
@@ -890,7 +895,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 width = self._index_decode_width()
                 capacity = logits_rows(self.max_bs * max_seqlen_qo, width) * width
             if self._concat_prefill_scored():
-                capacity = max(capacity, self._alloc_prefill_concat_keys())
+                self._alloc_prefill_concat_keys()
+                capacity = max(capacity, self._prefill_concat_plane_capacity())
             if capacity:
                 self.index_logits_workspace = LogitsWorkspace(capacity, self.device)
                 logger.info(
@@ -1865,29 +1871,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             round-robin ``p%W`` / ``p//W``), hence
             ``src = owner(p) * sum(Lpad) + cu_pad[b] + local_index(p)``.
         """
-        from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
-
-        W = self.dcp_world_size
-        S = self.cp_kv_cache_interleave_size
-        if attn_metadata.has_cached:
-            g_cu = var["cu_seqlens_k"].np[: bs + 1].astype(np.int64)
-        else:
-            g_cu = var["cu_seqlens_q"].np[: bs + 1].astype(np.int64)
-        g_lens = g_cu[1:] - g_cu[:bs]
         del counts  # kept for signature symmetry with the caller's other helpers
-
-        lpad = ((g_lens + S * W - 1) // (S * W)) * S
-        cu_pad = np.zeros(bs + 1, dtype=np.int64)
-        np.cumsum(lpad, out=cu_pad[1:])
-        local_total = int(cu_pad[bs])
-        total_kv = int(g_cu[bs])
-
-        # Position within its sequence for every global KV token.
-        pos = np.arange(total_kv, dtype=np.int64) - np.repeat(g_cu[:bs], g_lens)
-        src = (
-            dcp_owner_rank(pos, W, S) * local_total
-            + np.repeat(cu_pad[:bs], g_lens)
-            + dcp_local_index(pos, W, S)
+        g_cu = self._committed_cu(attn_metadata, bs)
+        if self._concat_grouped(int(g_cu[bs])):
+            # Gathered a group at a time, each by its own plan (`_concat_groups`).
+            attn_metadata.dcp_indexer_local_total = None
+            attn_metadata.dcp_indexer_local_cu_seqlens = None
+            attn_metadata.dcp_indexer_gather_index = None
+            return
+        g_lens, lpad, cu_pad, local_total, src = dcp_concat_gather_plan(
+            g_cu, 0, bs, self.dcp_world_size, self.cp_kv_cache_interleave_size
         )
 
         dev = self.device
@@ -2680,23 +2673,85 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         and a pooled one's."""
         return self.is_sparse and not self._indexer_fp4 and self.index_kpool == 1
 
+    def _committed_cu(self, attn_metadata, bs: int):
+        """Host cumsum of the step's requests' committed keys (cached and
+        scheduled), int64."""
+        var = self.model_runner.forward_vars
+        committed = "cu_seqlens_k" if attn_metadata.has_cached else "cu_seqlens_q"
+        return var[committed].np[: bs + 1].astype(np.int64)
+
+    def _concat_grouped(self, total_kv: int) -> bool:
+        """Whether a prefill step of `total_kv` committed keys scores its FP8
+        concat rows a group of requests at a time: they outgrow the
+        gathered-key workspace together. Not under PCP, whose rows interleave
+        the requests; there a step past it grows the workspace instead."""
+        workspace = self.index_prefill_key_workspace
+        return (
+            workspace is not None
+            and not pcp_is_enabled()
+            and total_kv > workspace.capacity
+        )
+
+    def _concat_groups(self, attn_metadata, bs: int):
+        """The step's requests in consecutive groups whose committed keys each
+        fit the gathered-key workspace, with each group's query rows, keys
+        and, under DCP, its own gather plan; None when one group is the
+        step (`_concat_grouped`)."""
+        g_cu = self._committed_cu(attn_metadata, bs)
+        if not self._concat_grouped(int(g_cu[bs])):
+            return None
+        cu_q = self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1]
+        groups = []
+        for first, end in pack_concat_groups(
+            g_cu, self.index_prefill_key_workspace.capacity
+        ):
+            plan = None
+            if self.dcp_world_size > 1:
+                _, _, cu_pad, local_total, src = dcp_concat_gather_plan(
+                    g_cu,
+                    first,
+                    end,
+                    self.dcp_world_size,
+                    self.cp_kv_cache_interleave_size,
+                )
+                plan = DcpConcatGather(
+                    local_total,
+                    torch.from_numpy(cu_pad.astype(np.int32)).to(
+                        self.device, non_blocking=True
+                    ),
+                    torch.from_numpy(src.astype(np.int32)).to(
+                        self.device, non_blocking=True
+                    ),
+                )
+            groups.append(
+                ConcatGroup(
+                    first,
+                    end,
+                    int(cu_q[first]),
+                    int(cu_q[end]),
+                    int(g_cu[first]),
+                    int(g_cu[end] - g_cu[first]),
+                    plan,
+                )
+            )
+        return tuple(groups)
+
     def _prefill_concat_plane(self) -> LogitsWorkspace | None:
         """The plane FP8 prefill bands are scored into; None when aiter's
         scorer allocates its own."""
         return self.index_logits_workspace if FP8_MQA_LOGITS_TAKES_OUT else None
 
-    def _alloc_prefill_concat_keys(self) -> int:
-        """Allocate the FP8 prefill indexer's gathered-key workspace and return
-        the logits plane (fp32 elements) its bands need -- a rank's share of a
-        step's rows (`RowSplit`) across a request of the model length.
+    def _alloc_prefill_concat_keys(self) -> None:
+        """Allocate the FP8 prefill indexer's gathered-key workspace: one
+        request of the model length plus a chunk, and under DCP the
+        all-gathered shards of that many keys. A step whose requests together
+        hold more is scored a group of them at a time (`_concat_groups`).
 
-        Both follow the configuration, not the step: allocated per step they
-        are as long as the step's context, so every chunk of a long prefill
-        asks the caching allocator for a slightly larger block than the last,
-        which it never has, until HBM runs out. 0 when aiter's scorer cannot
-        write into a plane: its bands are then allocated per call."""
+        Sized by the configuration, not the step: allocated per step these are
+        as long as the step's context, so every chunk of a long prefill asks
+        the caching allocator for a slightly larger block than the last,
+        which it never has, until HBM runs out."""
         config = self.model_runner.config
-        hf_config = config.hf_config
         world = self.dcp_world_size
         keys = config.max_model_len + self.max_num_batched_tokens
         gathered = 0
@@ -2705,13 +2760,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             shard = -(-keys // world) + self.max_bs * self.cp_kv_cache_interleave_size
             gathered = world * shard
         self.index_prefill_key_workspace = ConcatKeyWorkspace(
-            keys, hf_config.index_head_dim, dtypes.fp8, self.device, gathered
+            keys, config.hf_config.index_head_dim, dtypes.fp8, self.device, gathered
         )
         logger.info(
             "FP8 prefill indexer key workspace: %.2f GiB (%d keys)",
             self.index_prefill_key_workspace.nbytes / (1 << 30),
             keys,
         )
+
+    def _prefill_concat_plane_capacity(self) -> int:
+        """fp32 elements the logits plane needs for FP8 prefill bands: a
+        rank's share of a step's rows (`RowSplit`) across a request of the
+        model length, within the logits budget. 0 when aiter's scorer cannot
+        write into a plane: its bands are then allocated per call."""
         if not FP8_MQA_LOGITS_TAKES_OUT:
             logger.warning(
                 "aiter fp8_mqa_logits takes no logits buffer: FP8 prefill index "
@@ -2719,8 +2780,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "context through a long prefill"
             )
             return 0
-        rows = -(-self.max_num_batched_tokens // world)
-        width = concat_plane_width(config.max_model_len)
+        rows = -(-self.max_num_batched_tokens // self.dcp_world_size)
+        width = concat_plane_width(self.model_runner.config.max_model_len)
         return logits_rows(rows, width) * width
 
     def _publishes_decode_index_rows(self) -> bool:
@@ -2846,6 +2907,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 total=total_kv,
                 row_starts=attn_metadata.cu_seqlen_ks,
                 workspace=self.index_prefill_key_workspace,
+                groups=self._concat_groups(attn_metadata, bs),
             )
             attn_metadata.index_rows = concat_rows(
                 ends, keys, split, workspace=self._prefill_concat_plane()
@@ -3742,10 +3804,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ends = rows.row_ends[ts]
         split = RowSplit.of(ends.shape[0], self.dcp_rank, self.dcp_world_size)
         if rows.concat is not None:
-            row_starts = rows.concat.row_starts[ts]
+            start, stop, _ = ts.indices(rows.row_ends.shape[0])
             return concat_rows(
                 ends,
-                rows.concat._replace(row_starts=row_starts),
+                ubatch_concat_keys(rows.concat, start, stop),
                 split,
                 workspace=rows.workspace,
             )
