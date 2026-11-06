@@ -153,6 +153,7 @@ class K3MonoDecodeRunner:
     refusal every rank agrees on before anything collective."""
 
     max_rows = MAX_ROWS
+    bind_k2 = True
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
@@ -193,7 +194,9 @@ class K3MonoDecodeRunner:
         self.dims = Dims(self.tp)
         self.debug = envs.ATOM_MONO_DEBUG
         self.inner = inner_model(model)
-        self.plans = bind_model(self.inner, self.dims, self.rank)
+        self.plans = bind_model(
+            self.inner, self.dims, self.rank, bind_k2=self.bind_k2
+        )
         self.num_blocks = num_blocks(len(self.inner.layers))
         # a DSpark drafter taps hidden states; a plain-decode deployment has none
         self.aux = (
@@ -201,7 +204,7 @@ class K3MonoDecodeRunner:
             if drafter is None
             else bind_aux_taps(drafter, self.inner.config.hidden_size)
         )
-        first = next(p for p in self.plans if p.mono)
+        first = next(p for p in self.plans if p.kda is not None)
         self.device = first.kda.w_in.device
         self.state_len = self._state_len()
         self.replay_cap = self._replay_cap()

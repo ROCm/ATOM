@@ -27,9 +27,11 @@ Three groups are the exception, and each says why:
 What is *not* copied is everything large: the expert planes (1.2 GB and 616 MB a
 layer) and their E8M0 scales are read exactly where ``FusedMoE`` left them.
 ``moe_shuffle_scale`` on gfx950 is ``aiter.ops.shuffle.shuffle_scale``, whose
-permutation is the one ``atom.mono.device.mx.scale_index`` indexes a byte of --
-the same layout the MoE kernel's scale readers were written for. That holds only
-for the non-interleaved gate/up layout, so ``is_guinterleave`` is checked.
+permutation is the one ``atom.mono.device.mx.scale_index`` indexes a byte of.
+
+The gfx1250 K2 path requires AITER's native n32k4 scales and binds both
+separated GGUU and production interleaved GUGU gate/up layouts zero-copy. The
+FP4 payload is likewise never repacked here.
 """
 
 import logging
@@ -47,12 +49,21 @@ from atom.models.kimi_k3.mono.config import (
     Dims,
     layer_block,
 )
+from atom.models.kimi_k3.mono.expert_scales import (
+    KimiExpertScaleHandles,
+    bind_expert_scale,
+)
+from atom.models.kimi_k3.mono.kernels.stages.moe_expert_layout import (
+    ExpertScaleLayout,
+    ExpertScaleSpec,
+)
 from atom.models.kimi_k3.mono.layouts import (
     SCALE_GROUP_ALIGN,
     SCALE_ROW_ALIGN,
     unshuffle_scale,
     unshuffle_weight,
 )
+from atom.mono.plan.architecture import GFX1250, Architecture
 from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
@@ -213,6 +224,7 @@ class MoeLayer:
     w13s: torch.Tensor
     w2: torch.Tensor
     w2s: torch.Tensor
+    gu_interleave: bool
     ln_eps: float
 
 
@@ -274,10 +286,10 @@ def _experts(moe, layer_id: int, dims: Dims):
     method = experts.quant_method
     name = f"layer {layer_id} experts"
     _need(experts.top_k == TOPK, f"{name}: top-{experts.top_k}")
+    gu_interleave = bool(getattr(method, "is_guinterleave", True))
     _need(
-        not getattr(method, "is_guinterleave", True),
-        f"{name}: gate/up interleaved (ATOM_MOE_GU_ITLV); the scale readers "
-        "follow shuffle_scale's plain layout",
+        not gu_interleave or getattr(method, "is_gfx1250", False),
+        f"{name}: gate/up interleaving requires the gfx1250 K2 reader",
     )
     _need(
         not getattr(method, "fp8_activations", False),
@@ -314,14 +326,82 @@ def _experts(moe, layer_id: int, dims: Dims):
         ("w13_scale", s13, EXPERTS * 2 * inter, LATENT // MX_GROUP),
         ("w2_scale", s2, EXPERTS * LATENT, inter // MX_GROUP),
     ):
-        pad_rows = -(-rows // SCALE_ROW_ALIGN) * SCALE_ROW_ALIGN
-        pad_groups = -(-groups // SCALE_GROUP_ALIGN) * SCALE_GROUP_ALIGN
+        if getattr(method, "is_gfx1250", False):
+            expected = rows * groups
+        else:
+            pad_rows = -(-rows // SCALE_ROW_ALIGN) * SCALE_ROW_ALIGN
+            pad_groups = -(-groups // SCALE_GROUP_ALIGN) * SCALE_GROUP_ALIGN
+            expected = pad_rows * pad_groups
         got = t.numel() * t.element_size()
         _need(
-            got == pad_rows * pad_groups,
-            f"{name}: {plane} is {got} B, expected {pad_rows} x {pad_groups}",
+            got == expected,
+            f"{name}: {plane} is {got} B, expected {expected}",
         )
     return w13.data, s13.data, w2.data, s2.data
+
+
+def bind_k2_expert_scales(
+    moe,
+    layer_id: int,
+    dims: Dims,
+    rank: int,
+    architecture: Architecture,
+) -> KimiExpertScaleHandles:
+    """Bind the explicit gfx1250 K2 scale arguments.
+
+    This is deliberately separate from ``_experts``: the production gfx950
+    binder continues to return AITER's existing tensors byte-for-byte.
+    The gfx1250 runner calls this function and passes the returned handles to
+    its K2 declaration.
+    """
+
+    if architecture is not GFX1250:
+        raise ValueError(
+            "bind_k2_expert_scales is the architecture-explicit gfx1250 path"
+        )
+    experts = moe.experts
+    method = experts.quant_method
+    name = f"layer {layer_id} experts"
+    _need(hasattr(method, "is_gfx1250"), f"{name}: no source scale-layout metadata")
+    _need(
+        method.is_gfx1250,
+        f"{name}: gfx1250 mono requires native n32k4 expert scales",
+    )
+    source_layout = ExpertScaleLayout.GFX1250_N32K4
+
+    w13_spec = ExpertScaleSpec(
+        "w13_scale",
+        EXPERTS,
+        2 * dims.inter,
+        LATENT,
+        rank,
+        dims.tp,
+    )
+    w2_spec = ExpertScaleSpec(
+        "w2_scale",
+        EXPERTS,
+        LATENT,
+        dims.inter,
+        rank,
+        dims.tp,
+    )
+    handles = KimiExpertScaleHandles(
+        architecture,
+        bind_expert_scale(
+            experts.w13_weight_scale,
+            spec=w13_spec,
+            source_layout=source_layout,
+            architecture=architecture,
+        ),
+        bind_expert_scale(
+            experts.w2_weight_scale,
+            spec=w2_spec,
+            source_layout=source_layout,
+            architecture=architecture,
+        ),
+    )
+    handles.validate()
+    return handles
 
 
 def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
@@ -349,6 +429,13 @@ def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
         f"{name}: gate is {gate.dtype} {tuple(gate.shape)}",
     )
     w13, s13, w2, s2 = _experts(moe, layer_id, dims)
+    gu_interleave = bool(
+        getattr(
+            getattr(getattr(moe, "experts", None), "quant_method", None),
+            "is_guinterleave",
+            False,
+        )
+    )
     # the up-projection is replicated in the model; the kernel's stage computes
     # this rank's row band of it and the ranks' bands are summed into the
     # layer's output, so only the band is bound.
@@ -391,6 +478,7 @@ def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
         w13s=s13,
         w2=w2,
         w2s=s2,
+        gu_interleave=gu_interleave,
         ln_eps=_eps(moe.routed_expert_norm, f"{name} routed_expert_norm"),
     )
 
@@ -415,8 +503,15 @@ class LayerPlan:
         production path (``bind_model``)."""
         return self.kda is None and self.moe is not None
 
+    @property
+    def k1_only(self) -> bool:
+        """K1 alone; projection, MoE and their collectives stay production."""
+        return self.kda is not None and self.moe is None
 
-def bind_model(model, dims: Dims, rank: int) -> list[LayerPlan]:
+
+def bind_model(
+    model, dims: Dims, rank: int, *, bind_k2: bool = True
+) -> list[LayerPlan]:
     """Every decoder layer, in order.
 
     A layer takes K1 and K2 only when it is a KDA layer with a MoE FFN and at
@@ -437,6 +532,9 @@ def bind_model(model, dims: Dims, rank: int) -> list[LayerPlan]:
         has_ffn = hasattr(layer, "block_sparse_moe") and blocks >= 1
         takes = bool(getattr(layer, "is_linear_attn", False)) and has_ffn
         if not takes and has_ffn:
+            if not bind_k2:
+                plans.append(LayerPlan(layer_id, None, None))
+                continue
             # One layer's refusal leaves that layer on the production path; it
             # must not take the KDA layers' mono down with it.
             try:
@@ -459,11 +557,11 @@ def bind_model(model, dims: Dims, rank: int) -> list[LayerPlan]:
             LayerPlan(
                 layer_id,
                 bind_kda(layer, layer_id, dims),
-                bind_moe(layer, layer_id, dims, rank),
+                bind_moe(layer, layer_id, dims, rank) if bind_k2 else None,
             )
         )
     _need(
-        any(p.mono for p in plans),
+        any(p.mono if bind_k2 else p.k1_only for p in plans),
         f"no layer takes the kernels ({len(layers)} layers, block size "
         f"{ATTN_RES_BLOCK})",
     )
