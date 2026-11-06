@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """StateOffloadIndex must stop advertising images the worker codec dropped."""
 
+from math import inf
 from types import SimpleNamespace
 
 import pytest
@@ -60,18 +61,10 @@ def test_state_tier_cpu_bytes_reads_gib(monkeypatch):
 
 
 #: Past every confirmation window `tier_verified_for_s` can give.
-STALE = so._TIER_VERIFIED_MAX_S + 1
+STALE = so.tier_verified_for_s(inf) + 1
 
 
-@pytest.fixture
-def offload_clock(monkeypatch):
-    """`state_offload`'s monotonic clock, advanced by hand."""
-    now = [1000.0]
-    monkeypatch.setattr("atom.model_engine.state_offload.monotonic", lambda: now[0])
-    return now
-
-
-def _index(*hashes, verified_for_s=so._TIER_VERIFIED_MIN_S, **kw):
+def _index(*hashes, verified_for_s=5.0, **kw):
     idx = StateOffloadIndex(verified_for_s=verified_for_s, **kw)
     for h in hashes:
         idx.note_stored(h)
@@ -94,7 +87,10 @@ class TestIndexTouches:
         idx = _index(7, verified_for_s=None)
         idx.want_touch(7)
         assert idx.take_touches() == []
-        assert idx._verified_at == {}, "nothing reads it"
+        offload_clock[0] += STALE
+        assert not idx.hold_admission(7)
+        # Up to the hash cap of entries nothing would read.
+        assert idx._verified_at == {}
 
     def test_a_hash_voted_every_pass_is_touched_at_an_interval(self, offload_clock):
         idx = _index(7)
@@ -278,15 +274,6 @@ class TestTouchPlumbing:
     """The scheduler's two calls a pass: `publish_touches` before the metadata
     is built, `collect_touch_verdicts` before the next admission."""
 
-    def test_voted_hashes_reach_the_connector(self, offload_clock):
-        idx = _index(7)
-        idx.want_touch(7)
-        sent = []
-        idx.publish_touches(
-            SimpleNamespace(enqueue_state_touches=lambda hs: sent.extend(hs) or True)
-        )
-        assert sent == [7] and idx.refresh_hits
-
     def test_a_connector_without_touches_turns_the_refresh_off(self, offload_clock):
         idx = _index(7)
         idx.want_touch(7)
@@ -295,14 +282,3 @@ class TestTouchPlumbing:
         assert idx.take_touches() == []
         offload_clock[0] += STALE
         assert not idx.hold_admission(7), "nothing would ever answer the hold"
-
-    def test_verdicts_are_collected(self, offload_clock):
-        idx = _index(7, 8)
-        offload_clock[0] += 1
-        idx.want_touch(7)
-        idx.want_touch(8)
-        assert sorted(idx.take_touches()) == [7, 8]
-        idx.collect_touch_verdicts(
-            SimpleNamespace(take_state_touch_verdicts=lambda: {7: False, 8: True})
-        )
-        assert not idx.could_serve(7) and idx.could_serve(8)

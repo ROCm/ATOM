@@ -127,9 +127,8 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # the no-tier store path and took the whole step's KV loads/saves down
         # with it (super().start_load_kv never ran).
         self._store_failed_no_tier: set[StateStoreOperationId] = set()
-        # Touch verdicts since the last `get_finished`: (resident, refreshed).
-        # GONE counts as refreshed: nothing was left unrefreshed.
-        self._touch_verdicts: dict[StateTouchId, tuple[bool, bool]] = {}
+        # Touch verdicts since the last `get_finished`.
+        self._touch_verdicts: dict[StateTouchId, TouchResult] = {}
         # Only the first touch whose codec call raised is logged.
         self._warned_touch_failure = False
 
@@ -311,12 +310,12 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         if not touches:
             return
         tier = self._state_tier
+        if tier is None:
+            self._touch_verdicts.update(dict.fromkeys(touches, TouchResult.GONE))
+            return
         for touch_id in touches:
-            if tier is None:
-                self._touch_verdicts[touch_id] = (False, True)
-                continue
             try:
-                result = tier.codec.touch(int(touch_id.prefix_hash))
+                result = tier.codec.touch(touch_id.prefix_hash)
             except Exception:
                 # Says nothing about the bytes: kept, not refreshed. One
                 # traceback, since a drifted LMCache raises on every touch.
@@ -330,10 +329,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                         exc_info=True,
                     )
                 result = TouchResult.PRESENT
-            self._touch_verdicts[touch_id] = (
-                bool(result),
-                result is not TouchResult.PRESENT,
-            )
+            self._touch_verdicts[touch_id] = result
 
     def _arm_joint_loads(self, metadata) -> None:
         """Hold a request owning both legs until both report.
@@ -516,14 +512,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             self._store_failed_no_tier = set()
         # Before the tier-None return too: `_touch_states` answers for a
         # missing tier, and the engine may be holding an admission for it.
-        for touch_id, (resident, refreshed) in self._touch_verdicts.items():
-            out.connector_completions.add(
-                ConnectorCompletion(STATE_TOUCH_CHANNEL, touch_id, resident)
-            )
-            out.connector_completions.add(
-                ConnectorCompletion(STATE_TOUCH_REFRESH_CHANNEL, touch_id, refreshed)
-            )
-        self._touch_verdicts = {}
+        self._emit_touch_verdicts(out)
         if self._state_tier is None:
             # `_arm_joint_loads` armed these even with no tier and
             # `_fail_state_loads` failed their state leg; drain the park here,
@@ -609,6 +598,24 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                     STATE_LOAD_DISPOSITION_CHANNEL, key, bool(state_intact)
                 )
             )
+
+    def _emit_touch_verdicts(self, out) -> None:
+        """Two completions per touch since the last call: still resident, and
+        refreshed (GONE counts as refreshed: nothing was left unrefreshed)."""
+        for touch_id, result in self._touch_verdicts.items():
+            out.connector_completions.add(
+                ConnectorCompletion(
+                    STATE_TOUCH_CHANNEL, touch_id, result is not TouchResult.GONE
+                )
+            )
+            out.connector_completions.add(
+                ConnectorCompletion(
+                    STATE_TOUCH_REFRESH_CHANNEL,
+                    touch_id,
+                    result is not TouchResult.PRESENT,
+                )
+            )
+        self._touch_verdicts = {}
 
     def _reclaim_stale_parks(self) -> None:
         """Evict joint parks whose report never came (finding #3).
@@ -948,10 +955,10 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             target.add(completion.operation_id)
             return True
         if completion.channel == STATE_TOUCH_CHANNEL:
-            h = int(completion.operation_id.prefix_hash)
-            self._state_touch_verdicts[h] = self._state_touch_verdicts.get(
-                h, True
-            ) and bool(completion.succeeded)
+            h = completion.operation_id.prefix_hash
+            self._state_touch_verdicts[h] = (
+                self._state_touch_verdicts.get(h, True) and completion.succeeded
+            )
             # Handled, but not a terminal save: `process_completions` would
             # file the touch id under `finished_saving`.
             return None

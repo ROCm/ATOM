@@ -46,6 +46,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
     StateStoreOperationId,
     StateTouchId,
+    connector_metadata_has_work,
 )
 from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
@@ -81,7 +82,10 @@ from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
     KimiK3OffloadScheduler,
     save_stall_seconds,
 )
-from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import TouchResult
+from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import (
+    StateByteCodec,
+    TouchResult,
+)
 from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import _JointPark
 from atom.kv_transfer.offload.hybrid.qwen.connector import QwenOffloadScheduler
 from atom.kv_transfer.offload.metadata import (
@@ -6356,6 +6360,12 @@ def test_a_step_whose_only_work_is_a_state_store_reaches_the_worker():
     assert connector_metadata_has_work(meta)
 
 
+def test_a_step_whose_only_work_is_a_state_touch_reaches_the_worker():
+    meta = LMCacheOffloadMetadata()
+    meta.state_touches = [StateTouchId(7, 0)]
+    assert connector_metadata_has_work(meta)
+
+
 # ── the delegating shells must expose everything their driver reads ────────
 #
 # There are two forwarding axes, not one, and every round of review has found
@@ -7264,8 +7274,6 @@ class _LocalCPU:
 
 
 def _lru_codec(storage, max_entries):
-    from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import StateByteCodec
-
     codec = StateByteCodec(
         backend=SimpleNamespace(
             page_unit_views=lambda units: [], state_entry_views=lambda slot: []
@@ -7308,11 +7316,12 @@ class TestCodecRefresh:
 
     def test_a_touch_reports_an_evicted_image_gone(self, lmcache_key):
         pool = _LocalCPU()
-        codec, _ = _lru_codec(pool, max_entries=2)
-        assert codec.put(1, [])
-        assert pool.evict_oldest() == codec.key(1)
-        assert codec.touch(1) is TouchResult.GONE
-        assert codec.key(1) not in codec._cache_keys, "no longer counts against the cap"
+        codec, _ = _lru_codec(pool, max_entries=3)
+        assert codec.put(1, []) and codec.put(2, []) and codec.put(3, [])
+        assert pool.remove(codec.key(2))
+        assert codec.touch(2) is TouchResult.GONE
+        assert codec.put(4, [])
+        assert codec.key(1) in pool.hot, "a gone image no longer counts against the cap"
 
     def test_a_resume_refreshes_the_image(self, lmcache_key):
         """`get_blocking` takes a reference and nothing else."""
@@ -7354,7 +7363,7 @@ class TestCodecRefresh:
 
         assert codec.key(2) not in pool.hot
         assert objs[1].refs == 0, "a retired image goes back to the allocator"
-        assert list(codec._cache_keys) == [codec.key(1), codec.key(3)]
+        assert codec.key(1) in pool.hot and codec.key(3) in pool.hot
 
     @pytest.mark.parametrize(
         "missing",
@@ -7436,8 +7445,21 @@ def _touch_worker(tier):
     return c
 
 
+def _reported(worker):
+    out = KVConnectorOutput()
+    worker._emit_touch_verdicts(out)
+    return out.connector_completions
+
+
+def _reports(touch_id, *, resident, refreshed):
+    return {
+        ConnectorCompletion(STATE_TOUCH_CHANNEL, touch_id, resident),
+        ConnectorCompletion(STATE_TOUCH_REFRESH_CHANNEL, touch_id, refreshed),
+    }
+
+
 class TestConnectorTouches:
-    def test_the_worker_touches_and_records_each_verdict(self):
+    def test_the_worker_touches_and_reports_each_verdict(self):
         touched = []
 
         found = {1: TouchResult.REFRESHED, 2: TouchResult.GONE, 3: TouchResult.PRESENT}
@@ -7450,18 +7472,34 @@ class TestConnectorTouches:
         ids = [StateTouchId(1, 0), StateTouchId(2, 1), StateTouchId(3, 2)]
         worker._touch_states(SimpleNamespace(state_touches=ids))
         assert touched == [1, 2, 3]
-        # (resident, refreshed): only a present-but-unrefreshed image is False
-        # on the second.
-        assert worker._touch_verdicts == {
-            ids[0]: (True, True),
-            ids[1]: (False, True),
-            ids[2]: (True, False),
-        }
+        # Only a present-but-unrefreshed image reports unrefreshed.
+        assert _reported(worker) == (
+            _reports(ids[0], resident=True, refreshed=True)
+            | _reports(ids[1], resident=False, refreshed=True)
+            | _reports(ids[2], resident=True, refreshed=False)
+        )
+        assert _reported(worker) == set(), "drained once"
+
+    def test_start_load_kv_touches(self, monkeypatch):
+        monkeypatch.setattr(DenseOffloadConnector, "start_load_kv", lambda s, m: None)
+        worker = _touch_worker(
+            SimpleNamespace(
+                codec=SimpleNamespace(touch=lambda h: TouchResult.REFRESHED)
+            )
+        )
+        meta = LMCacheOffloadMetadata()
+        meta.state_touches = [StateTouchId(7, 0)]
+        worker.start_load_kv(meta)
+        assert _reported(worker) == _reports(
+            StateTouchId(7, 0), resident=True, refreshed=True
+        )
 
     def test_with_no_tier_every_image_is_gone(self):
         worker = _touch_worker(None)
         worker._touch_states(SimpleNamespace(state_touches=[StateTouchId(1, 0)]))
-        assert worker._touch_verdicts == {StateTouchId(1, 0): (False, True)}
+        assert _reported(worker) == _reports(
+            StateTouchId(1, 0), resident=False, refreshed=True
+        )
 
     def test_a_failing_touch_is_unrefreshed_and_logged_once(self, caplog):
         """A raising touch keeps the image (resident) but is not a refresh;
@@ -7475,7 +7513,9 @@ class TestConnectorTouches:
         with caplog.at_level(logging.WARNING, logger="atom"):
             worker._touch_states(SimpleNamespace(state_touches=ids[:2]))
             worker._touch_states(SimpleNamespace(state_touches=ids[2:]))
-        assert worker._touch_verdicts == {i: (True, False) for i in ids}
+        assert _reported(worker) == set().union(
+            *(_reports(i, resident=True, refreshed=False) for i in ids)
+        )
         assert [r.exc_info is not None for r in caplog.records] == [True]
 
     def _scheduler(self, monkeypatch):
@@ -7519,17 +7559,7 @@ class TestConnectorTouches:
                 SimpleNamespace(codec=SimpleNamespace(touch=lambda h, r=result: r))
             )
             worker._touch_states(SimpleNamespace(state_touches=[touch]))
-            resident, refreshed = worker._touch_verdicts[touch]
-            outputs.append(
-                KVConnectorOutput(
-                    connector_completions={
-                        ConnectorCompletion(STATE_TOUCH_CHANNEL, touch, resident),
-                        ConnectorCompletion(
-                            STATE_TOUCH_REFRESH_CHANNEL, touch, refreshed
-                        ),
-                    }
-                )
-            )
+            outputs.append(KVConnectorOutput(connector_completions=_reported(worker)))
         merged = KVOutputAggregator(world_size=2).aggregate(outputs)
         s = self._scheduler(monkeypatch)
         monkeypatch.setattr(

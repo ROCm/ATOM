@@ -15,6 +15,7 @@ import logging
 import os
 from collections import OrderedDict
 from dataclasses import dataclass, replace
+from math import inf
 from time import monotonic
 
 from atom.utils import envs
@@ -22,9 +23,9 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 #: Seconds a confirmed image is trusted per GiB of LMCache pool: a quarter of
-#: the pool's turnover at 1 GiB/s, four times the fill rate AgentX c64 measured.
+#: the time the pool takes to turn over at 1 GiB/s of new stores.
 _TIER_VERIFIED_S_PER_GIB = 0.25
-#: Well above a touch round trip / the largest window measured (AgentX c64).
+#: Well above a touch round trip.
 _TIER_VERIFIED_MIN_S = 5.0
 _TIER_VERIFIED_MAX_S = 60.0
 
@@ -106,10 +107,10 @@ class StateOffloadIndex:
         self.stores_untrusted = 0
         # Off for indexes whose connector carries no touches (the vLLM plugin).
         self.refresh_hits = verified_for_s is not None
-        self.verified_for_s = float(verified_for_s or 0.0)
+        self.verified_for_s = verified_for_s or 0.0
         # Read once: `hold_admission` runs on the admission path. Not read
         # without the refresh, which never holds.
-        self.defer_s = float(envs.OFFLOAD_LOOKUP_DEFER_S) if self.refresh_hits else 0.0
+        self.defer_s = envs.OFFLOAD_LOOKUP_DEFER_S if self.refresh_hits else 0.0
         self._touch_wanted: set[int] = set()
         # hash -> monotonic of the last touch sent / the last evidence the
         # image was resident.
@@ -200,7 +201,7 @@ class StateOffloadIndex:
         now = monotonic()
         out = []
         for h in self._touch_wanted:
-            if now - self._touch_sent_at.get(h, -1e18) < _TIER_TOUCH_INTERVAL_S:
+            if now - self._touch_sent_at.get(h, -inf) < _TIER_TOUCH_INTERVAL_S:
                 continue
             self._touch_sent_at[h] = now
             out.append(h)
@@ -210,12 +211,11 @@ class StateOffloadIndex:
 
     def apply_touch_verdict(self, h: int, resident: bool) -> None:
         """A touch came back; gone drops `h` before a request parks on it."""
-        h = int(h)
         if h not in self.hashes:
             return
         if not resident:
             # Stale: `h` was stored (again) after this touch looked.
-            if self._verified_at.get(h, -1e18) > self._touch_sent_at.get(h, -1e18):
+            if self._verified_at.get(h, -inf) > self._touch_sent_at.get(h, -inf):
                 return
             self.touch_misses += 1
             self.forget(h)
@@ -257,10 +257,7 @@ class StateOffloadIndex:
         outside HBM) waits a pass for its touch verdict: `h` not confirmed
         within `verified_for_s`. If the verdict is gone, `h` has left the index
         and the retry plans a lower boundary instead of parking on a miss.
-
-        Bounded by `defer_s` from the first hold, not from the latest touch
-        (re-sent every `_TIER_TOUCH_INTERVAL_S`, so it would never run out);
-        after that `h` is admitted unheld until new evidence arrives.
+        At most `defer_s` from the first hold.
         """
         defer_s = self.defer_s
         # `could_serve`: a store-only role indexes stores it never loads.
@@ -576,6 +573,24 @@ def state_tier_cpu_bytes() -> int:
     return int(float(os.environ.get("OFFLOAD_STATE_CPU_SIZE", "32")) * (1 << 30))
 
 
+def _lmcache_engine_config(config):
+    """The LMCache config this engine's offload connector builds; raises when
+    LMCache or its config cannot be read."""
+    from atom.kv_transfer.offload.config import build_lmcache_config
+
+    kvcfg = getattr(config, "kv_transfer_config", None) or {}
+    # Under `multi` the lmcache.* keys (chunk_size, offload_layout) live on
+    # the offload SUB-connector, not the composite. Passing the raw
+    # composite here read a zero chunk grid. Unwrap the sub the same way
+    # `state_tier_capability` does, so the gate's chunk size and the tier
+    # the capability check builds stay consistent.
+    if isinstance(kvcfg, dict) and kvcfg.get("kv_connector") == "multi":
+        sub, _why = _offload_subconfig(kvcfg)
+        if sub is not None:
+            kvcfg = sub
+    return build_lmcache_config(kvcfg)
+
+
 def state_tier_chunk_tokens(config) -> int:
     """The LMCache chunk size in tokens for the joint KV leg, or 0.
 
@@ -594,19 +609,7 @@ def state_tier_chunk_tokens(config) -> int:
     disable the joint KV load.
     """
     try:
-        from atom.kv_transfer.offload.config import build_lmcache_config
-
-        kvcfg = getattr(config, "kv_transfer_config", None) or {}
-        # Under `multi` the lmcache.* keys (chunk_size, offload_layout) live on
-        # the offload SUB-connector, not the composite. Passing the raw
-        # composite here read a zero chunk grid. Unwrap the sub the same way
-        # `state_tier_capability` does, so the gate's chunk size and the tier
-        # the capability check builds stay consistent.
-        if isinstance(kvcfg, dict) and kvcfg.get("kv_connector") == "multi":
-            sub, _why = _offload_subconfig(kvcfg)
-            if sub is not None:
-                kvcfg = sub
-        return int(build_lmcache_config(kvcfg).chunk_size)
+        return int(_lmcache_engine_config(config).chunk_size)
     except Exception:
         # Blind on purpose: this runs at model load, the import reaches a
         # third-party package that may be absent entirely, and the only
@@ -625,15 +628,7 @@ def state_tier_verified_for_s(config) -> float:
     when it cannot be read. Like `state_tier_chunk_tokens`, call it only when
     a tier is hosted."""
     try:
-        from atom.kv_transfer.offload.config import build_lmcache_config
-
-        kvcfg = getattr(config, "kv_transfer_config", None) or {}
-        # The offload sub-connector's keys, as in `state_tier_chunk_tokens`.
-        if isinstance(kvcfg, dict) and kvcfg.get("kv_connector") == "multi":
-            sub, _why = _offload_subconfig(kvcfg)
-            if sub is not None:
-                kvcfg = sub
-        pool_gib = float(build_lmcache_config(kvcfg).max_local_cpu_size)
+        pool_gib = float(_lmcache_engine_config(config).max_local_cpu_size)
     except Exception:  # noqa: BLE001 - `state_tier_chunk_tokens` logged why
         logger.warning(
             "state offload: LMCache's CPU pool size is unknown; a confirmed "

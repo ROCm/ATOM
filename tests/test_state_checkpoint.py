@@ -18,7 +18,9 @@ from types import SimpleNamespace
 
 import pytest
 from conftest import MockConfig
+from test_state_offload_index import STALE
 
+from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.model_engine.block_manager import (
     AdmissionProbe,
     BlockManager,
@@ -34,7 +36,7 @@ from atom.model_engine.prefix_hash import full_prompt_blocks
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
-from atom.model_engine.state_offload import _TIER_VERIFIED_MAX_S, StateOffloadIndex
+from atom.model_engine.state_offload import StateOffloadIndex
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
     StateRuntime,
@@ -4566,18 +4568,6 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
 # ── state tier hit refresh: the admission hold and the voters ──────────────
 
 
-#: Past every confirmation window `tier_verified_for_s` can give.
-STALE = _TIER_VERIFIED_MAX_S + 1
-
-
-@pytest.fixture
-def offload_clock(monkeypatch):
-    """`state_offload`'s monotonic clock, advanced by hand."""
-    now = [1000.0]
-    monkeypatch.setattr("atom.model_engine.state_offload.monotonic", lambda: now[0])
-    return now
-
-
 def _paged_bm():
     bm = make_block_manager(
         ckpt_config(num_kvcache_blocks=160, pool_entries={"state": 8}),
@@ -4844,3 +4834,19 @@ def test_the_scheduler_publishes_touches_with_the_state_loads(offload_clock):
     s.block_manager = SimpleNamespace(state_offload=idx)
     s._publish_state_loads()
     assert sent == [7]
+
+
+def test_the_scheduler_applies_touch_verdicts(offload_clock):
+    idx = StateOffloadIndex(verified_for_s=5.0)
+    idx.note_stored(7)
+    offload_clock[0] += 1
+    idx.want_touch(7)
+    assert idx.take_touches() == [7]
+    s = Scheduler.__new__(Scheduler)
+    s.kv_connector = SimpleNamespace(take_state_touch_verdicts=lambda: {7: False})
+    s.block_manager = SimpleNamespace(state_offload=idx)
+    s.finished_recving_kv_req_ids = []
+    s.failed_recving_kv_req_ids = []
+    s.deferred_free_blocks = {}
+    s._update_from_kv_xfer_finished(KVConnectorOutput())
+    assert not idx.could_serve(7)

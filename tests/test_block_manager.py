@@ -1393,5 +1393,5 @@ class TestStateTierVerifyWindow:
         with caplog.at_level(logging.WARNING, logger="atom"):
             bm = _bm_with_state_tier(monkeypatch, _OFFLOAD_KVC)
         assert bm._joint_chunk_tokens == 0
-        assert bm.state_offload.verified_for_s == so._TIER_VERIFIED_MIN_S
+        assert bm.state_offload.verified_for_s == so.tier_verified_for_s(0)
         assert sum(r.exc_info is not None for r in caplog.records) == 1

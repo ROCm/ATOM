@@ -22,14 +22,14 @@ import torch
 logger = logging.getLogger("atom")
 
 
-class TouchResult(enum.IntEnum):
-    """What a touch found. Truthy when the image can still be read."""
+class TouchResult(enum.Enum):
+    """What a touch found."""
 
-    GONE = 0
+    GONE = enum.auto()
     #: Held only by another backend: present, not refreshed. `get` still reads
     #: it; LMCache's `StorageManager.get` writes it back into LocalCPU.
-    PRESENT = 1
-    REFRESHED = 2
+    PRESENT = enum.auto()
+    REFRESHED = enum.auto()
 
 
 def _local_cpu_lru(storage_manager):
@@ -188,7 +188,7 @@ class StateByteCodec:
 
     def touch(self, h: int) -> TouchResult:
         """Refresh `h`'s image in LMCache's LRU, as a KV lookup does for its
-        chunks; falsy (`GONE`) when it is gone. A state hit is answered by
+        chunks; `GONE` when it is gone. A state hit is answered by
         `StateOffloadIndex`, so otherwise LMCache never sees the image used.
         """
         if self._storage is None:
@@ -212,7 +212,7 @@ class StateByteCodec:
     def _touch_key(self, key) -> TouchResult:
         result = self._refresh(key)
         with self._cache_lock:
-            if result:
+            if result is not TouchResult.GONE:
                 if key in self._cache_keys:
                     self._cache_keys.move_to_end(key)
             else:
