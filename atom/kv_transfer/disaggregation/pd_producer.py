@@ -25,6 +25,8 @@ _MOONCAKE_CONNECTORS = frozenset({"mooncake"})
 # so a large ``num_worker_threads`` makes workers share slots.
 MLA_STAGING_SLOT_BYTES = 8 << 20
 MLA_STAGING_POOL_BYTES = 256 << 20
+# MLA shard staging (``kv_staging.MLAShardStaging``) aligns each slot to this.
+MLA_SHARD_SLOT_ALIGN = 4096
 
 
 def _canonical(connector: dict, *, path: str) -> str | None:
@@ -176,24 +178,72 @@ def mla_staging_slot_count(num_send_workers: int, slot_bytes: int) -> int:
     return min(num_send_workers, mla_staging_pool_bytes(num_send_workers) // slot_bytes)
 
 
+def _model_attention(config):
+    """``config``'s HF text config and its ``selector.Family``.
+
+    ``(None, None)`` without an HF config.
+    """
+
+    hf_config = getattr(config, "hf_config", None)
+    if hf_config is None:
+        return None, None
+    # Local import: config-time callers must not import transformers early.
+    from atom.utils import get_hf_text_config
+    from atom.utils.selector import attn_family
+
+    text_config = get_hf_text_config(hf_config)
+    return text_config, attn_family(text_config)
+
+
 def plain_mla_model(config) -> bool:
     """Whether ``config``'s model keeps plain MLA KV, all MLA staging handles.
 
     One latent row per token and no per-request state (``Family.MLA``), which
     is what the producer stages and a DCP consumer lands. DeepSeek-V4 carries
     a ``kv_lora_rank`` too (its V3 schema defaults one) but is its own family,
-    and the MLA hybrids register slot regions, which both paths skip, so
-    reserving for either would hold back HBM nothing uses.
+    so reserving for it would hold back HBM nothing uses. The MLA hybrids
+    register slot regions, which both paths skip; their MLA rows have
+    ``mla_shard_staging_reserve_bytes``.
     """
 
-    hf_config = getattr(config, "hf_config", None)
-    if hf_config is None:
-        return False
-    # Local import: config-time callers must not import transformers early.
-    from atom.utils import get_hf_text_config
-    from atom.utils.selector import Family, attn_family
+    _, family = _model_attention(config)
+    return family is not None and family.is_mla and not family.has_recurrent_state
 
-    return attn_family(get_hf_text_config(hf_config)) == Family.MLA
+
+def mla_shard_slot_bytes(chunk_pages: int, page_bytes: int) -> int:
+    """One MLA shard staging slot: ``chunk_pages`` pages, aligned."""
+
+    slot_bytes = chunk_pages * page_bytes
+    return -(-slot_bytes // MLA_SHARD_SLOT_ALIGN) * MLA_SHARD_SLOT_ALIGN
+
+
+def mla_shard_staging_reserve_bytes(config) -> int:
+    """HBM to hold back from the KV budget for Mooncake MLA shard staging.
+
+    What ``MooncakeConnector`` allocates for the per-request-state path after
+    the KV cache is sized: on an MLA hybrid without producer DCP, every
+    Mooncake producer entry gets one ``ATOM_PD_MLA_STAGING_CHUNK_PAGES``-page
+    slot per send worker. A page is ``kv_cache_block_size`` rows of
+    ``kv_lora_rank + qk_rope_head_dim`` elements; a wider row (a NoPE model's
+    padded rope) gets fewer slots rather than outgrow this.
+    """
+
+    chunk_pages = envs.ATOM_PD_MLA_STAGING_CHUNK_PAGES
+    if not chunk_pages or getattr(config, "decode_context_parallel_size", 1) > 1:
+        return 0
+    hf, family = _model_attention(config)
+    if family is None or not (family.is_mla and family.has_recurrent_state):
+        return 0
+    row_bytes = (hf.kv_lora_rank + hf.qk_rope_head_dim) * (
+        1 if config.kv_cache_dtype.startswith("fp8") else 2
+    )
+    slot_bytes = mla_shard_slot_bytes(
+        chunk_pages, config.kv_cache_block_size * row_bytes
+    )
+    return sum(
+        send_worker_count(connector) * slot_bytes
+        for connector in _producer_connectors(config, _MOONCAKE_CONNECTORS)
+    )
 
 
 def mla_staging_reserve_bytes(config) -> int:
