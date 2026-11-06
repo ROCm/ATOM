@@ -1808,7 +1808,12 @@ class KimiLinearModel(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
 
-        if get_pp_group().is_first_rank:
+        # The drafter runs on the last stage and shares this table, and not
+        # every draft checkpoint (Kimi-K3.1-DSpark) ships its own.
+        pp = get_pp_group()
+        if pp.is_first_rank or (
+            pp.is_last_rank and atom_config.speculative_config is not None
+        ):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size, config.hidden_size
             )

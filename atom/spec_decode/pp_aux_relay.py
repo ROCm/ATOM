@@ -49,15 +49,13 @@ class PPAuxRelay:
         taps = spec.layer_ids
 
         self.spec = spec
-        self.own_ids = tuple(
-            lid for lid in taps if tap_is_resident(target_model, layers, lid)
-        )
+        self.own_ids = tuple(lid for lid in taps if tap_is_resident(layers, lid))
         # Every tap below this stage's first layer was captured upstream, which
         # is exactly what the previous stage sent, even if it owned none itself.
         self.incoming_ids = tuple(
             lid
             for lid in taps
-            if not tap_is_resident(target_model, layers, lid) and lid < stage_start
+            if not tap_is_resident(layers, lid) and lid < stage_start
         )
         self.outgoing_ids = () if pp.is_last_rank else self.incoming_ids + self.own_ids
 
