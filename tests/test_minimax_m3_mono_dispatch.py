@@ -57,6 +57,54 @@ def test_supported_deployment_has_no_refusal(native):
     assert dispatch._config_refusal(_atom_config()) is None
 
 
+@pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
+def test_each_mono_arch_runs_its_own_kernels(native, monkeypatch, arch):
+    monkeypatch.setattr(deployment, "_gfx", lambda: arch)
+    assert dispatch._config_refusal(_atom_config()) is None
+
+
+def test_another_arch_is_refused(native, monkeypatch):
+    monkeypatch.setattr(deployment, "_gfx", lambda: "gfx942")
+    assert dispatch._config_refusal(_atom_config()) == "arch gfx942"
+
+
+def test_gfx1250_scratch_keeps_the_measured_cached_allocation(monkeypatch):
+    dev = torch.device("cuda", 3)
+    cached = object()
+    calls = []
+
+    def zeros(nbytes, *, dtype, device):
+        calls.append((nbytes, dtype, device))
+        return cached
+
+    monkeypatch.setattr(runner.torch, "zeros", zeros)
+    monkeypatch.setattr(
+        runner,
+        "uncached_bytes",
+        lambda *_args: pytest.fail("gfx1250 scratch must stay cached"),
+    )
+    assert runner._scratch_bytes(123, dev, gfx1250=True) is cached
+    assert calls == [(123, torch.uint8, dev)]
+
+
+def test_other_mono_arches_keep_uncached_scratch(monkeypatch):
+    dev = torch.device("cuda", 2)
+    uncached = object()
+    calls = []
+    monkeypatch.setattr(
+        runner,
+        "uncached_bytes",
+        lambda nbytes, device: calls.append((nbytes, device)) or uncached,
+    )
+    monkeypatch.setattr(
+        runner.torch,
+        "zeros",
+        lambda *_args, **_kwargs: pytest.fail("non-gfx1250 scratch must stay uncached"),
+    )
+    assert runner._scratch_bytes(456, dev, gfx1250=False) is uncached
+    assert calls == [(456, dev)]
+
+
 @pytest.mark.parametrize(
     "overrides, reason",
     [
@@ -480,7 +528,8 @@ def test_dspark_drafter_binds_before_the_lazy_runner_starts():
         mono.bind_drafter(object())
 
 
-def test_forward_taps_the_residual_entering_the_next_layer(monkeypatch):
+@pytest.mark.parametrize("gfx1250", [False, True])
+def test_forward_taps_the_residual_entering_the_next_layer(monkeypatch, gfx1250):
     monkeypatch.setattr(runner, "get_forward_context", lambda: _forward_context())
     monkeypatch.setattr(
         runner,
@@ -493,12 +542,15 @@ def test_forward_taps_the_residual_entering_the_next_layer(monkeypatch):
     stub.dense_mono = False
     stub.sparse = [SimpleNamespace(layer_id=3), SimpleNamespace(layer_id=4)]
     stub.timeline = None
+    # gfx1250's layers write h alternately into hs by layer parity
+    stub.gfx1250 = gfx1250
     stub.h = torch.empty(1, HIDDEN)
+    stub.hs = [torch.empty(1, HIDDEN), torch.empty(1, HIDDEN)]
     stub.run_dense = lambda *args: torch.zeros(1, HIDDEN)
     tapped = []
 
     def sparse(i, *args):
-        stub.h.fill_(i + 1)
+        (stub.hs[i % 2] if gfx1250 else stub.h).fill_(i + 1)
         return torch.zeros(1, HIDDEN)
 
     stub.run_sparse_layer = sparse
