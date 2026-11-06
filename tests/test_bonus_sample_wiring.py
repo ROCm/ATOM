@@ -7,13 +7,16 @@ The sampler needs AITER at import, which a CPU runner does not have, so it is
 loaded here against a fake `aiter` under a private module name and the fakes are
 removed again. aiter's `fused_mixed_sample` is faked the same way, so these
 tests need neither AITER nor Triton and run on any CPU runner. Nothing runs a
-kernel: the aiter ops and the fused draw are recording stand-ins.
+kernel: the aiter ops and the fused draw are recording stand-ins. The one
+exception binds the call to the real op's signature where aiter has the op, so
+a change in #7416's signature fails here and not only in production.
 """
 
 import importlib.util
 import pathlib
 import sys
 import types
+import warnings
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,6 +26,16 @@ SAMPLER_PATH = (
     pathlib.Path(__file__).resolve().parents[1] / "atom" / "model_ops" / "sampler.py"
 )
 FUSED_MODULE = "aiter.ops.triton.fusions.fused_mixed_sample"
+
+
+@pytest.fixture(scope="module")
+def real_fused_mixed_sample():
+    """aiter's real op, imported before `load_sampler` fakes aiter; else skip."""
+    try:
+        from aiter.ops.triton.fusions.fused_mixed_sample import fused_mixed_sample
+    except ImportError as e:  # no aiter, or one without the op (CPU runners)
+        pytest.skip(f"aiter's fused_mixed_sample is not importable: {e!r}")
+    return fused_mixed_sample
 
 
 @pytest.fixture
@@ -45,12 +58,14 @@ def load_sampler(monkeypatch):
             torch.zeros(x.shape[0], 1, dtype=torch.int32),
         )
     )
-    fused = types.ModuleType(FUSED_MODULE)
-    fused.fused_mixed_sample = MagicMock(name="fused_draw")
-    monkeypatch.setitem(sys.modules, FUSED_MODULE, fused)
+    fused_module = types.ModuleType(FUSED_MODULE)
+    fused_module.fused_mixed_sample = MagicMock(name="fused_draw")
+    monkeypatch.setitem(sys.modules, FUSED_MODULE, fused_module)
 
-    def load(fused: bool, aiter_has_op: bool = True):
+    def load(fused: bool, aiter_has_op: bool = True, op=None):
         monkeypatch.setenv("ATOM_SPEC_BONUS_FUSED", "1" if fused else "0")
+        if op is not None:
+            fused_module.fused_mixed_sample = op
         if not aiter_has_op:
             # an aiter without the op: the import raises ImportError
             monkeypatch.setitem(sys.modules, FUSED_MODULE, None)
@@ -61,7 +76,7 @@ def load_sampler(monkeypatch):
         spec.loader.exec_module(module)
         return module, stub
 
-    load.fused_draw = fused.fused_mixed_sample
+    load.fused_draw = fused_module.fused_mixed_sample
     return load
 
 
@@ -82,6 +97,37 @@ def test_flag_on_without_the_op_keeps_the_aiter_path(load_sampler):
     logits, temps = _batch()
     sampler(logits, temps, needs_independent_noise=True)
     aiter.mixed_sample_outer_exponential.assert_called_once()
+
+
+def _renamed_eps(input, exponentials, temperatures, sample_eps=1e-10, greedy_eps=0.0):
+    pass
+
+
+def _no_greedy_eps(input, exponentials, temperatures, eps=1e-10):
+    pass
+
+
+def _new_required(input, exponentials, temperatures, seed, eps=1e-10, greedy_eps=0.0):
+    pass
+
+
+@pytest.mark.parametrize("op", [_renamed_eps, _no_greedy_eps, _new_required])
+def test_flag_on_with_a_changed_signature_keeps_the_aiter_path(load_sampler, op):
+    module, aiter = load_sampler(fused=True, op=op)
+    with pytest.warns(UserWarning, match="signature"):
+        sampler = module.Sampler()
+    assert sampler._fused_temperature_sample is None
+    logits, temps = _batch()
+    sampler(logits, temps, needs_independent_noise=True)
+    aiter.mixed_sample_outer_exponential.assert_called_once()
+
+
+def test_real_fused_mixed_sample_takes_the_call(real_fused_mixed_sample, load_sampler):
+    module, _ = load_sampler(fused=True, op=real_fused_mixed_sample)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sampler = module.Sampler()
+    assert sampler._fused_temperature_sample is real_fused_mixed_sample
 
 
 def test_flag_off_keeps_the_aiter_path(load_sampler):
@@ -112,12 +158,19 @@ def test_flag_on_routes_the_per_row_noise_draw(load_sampler):
     assert kwargs == {"eps": sampler.eps, "greedy_eps": module.SAMPLER_EPS}
 
 
-def test_no_config_for_the_gpu_falls_back_on_the_same_noise(load_sampler):
+@pytest.mark.parametrize(
+    "error",
+    [
+        FileNotFoundError("no config"),  # no tuned config for this arch
+        ValueError("the last dim of input and exponentials must be contiguous"),
+    ],
+)
+def test_no_config_for_the_gpu_falls_back_on_the_same_noise(load_sampler, error):
     module, aiter = load_sampler(fused=True)
     sampler = module.Sampler()
-    load_sampler.fused_draw.side_effect = FileNotFoundError("no config")
+    load_sampler.fused_draw.side_effect = error
     logits, temps = _batch()
-    with pytest.warns(UserWarning, match="no config"):
+    with pytest.warns(UserWarning, match=type(error).__name__):
         sampler(logits, temps, needs_independent_noise=True)
 
     ((fused_args, _),) = load_sampler.fused_draw.call_args_list

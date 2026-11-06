@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import inspect
 import warnings
 
 import torch
@@ -74,19 +75,29 @@ def get_per_row_exponential(num_tokens: int, vocab_size: int, device) -> torch.T
 
 
 def _load_fused_mixed_sample():
-    """aiter's `fused_mixed_sample` (ROCm/aiter#7416), or None if this aiter has none."""
+    """aiter's `fused_mixed_sample` (ROCm/aiter#7416), or None if this aiter has
+    none, or has one that `Sampler.forward`'s call does not bind to."""
     try:
         from aiter.ops.triton.fusions.fused_mixed_sample import fused_mixed_sample
     except ImportError:
-        warnings.warn(
-            "ATOM_SPEC_BONUS_FUSED=1 needs aiter's fused_mixed_sample "
-            "(ROCm/aiter#7416), which this aiter does not have; the draw keeps "
-            "mixed_sample_outer_exponential.",
-            UserWarning,
-            stacklevel=2,
-        )
-        return None
-    return fused_mixed_sample
+        reason = "which this aiter does not have"
+    else:
+        try:
+            # The call in `Sampler.forward`: three positionals, two keywords.
+            inspect.signature(fused_mixed_sample).bind(
+                None, None, None, eps=0.0, greedy_eps=0.0
+            )
+            return fused_mixed_sample
+        except (TypeError, ValueError) as e:
+            reason = f"whose signature this ATOM does not match ({e})"
+    warnings.warn(
+        f"ATOM_SPEC_BONUS_FUSED=1 needs aiter's fused_mixed_sample "
+        f"(ROCm/aiter#7416), {reason}; the draw keeps "
+        "mixed_sample_outer_exponential.",
+        UserWarning,
+        stacklevel=2,
+    )
+    return None
 
 
 class Sampler(nn.Module):
@@ -193,13 +204,16 @@ class Sampler(nn.Module):
                         eps=self.eps,
                         greedy_eps=SAMPLER_EPS,
                     )
-                except FileNotFoundError:
-                    # aiter tunes fused_mixed_sample per arch and raises before
-                    # launching where it has no config. Keep its HIP race, on
-                    # this step's noise, for this and every later step.
+                except (FileNotFoundError, ValueError) as e:
+                    # Both raise before either kernel launches: no tuned config
+                    # for this arch, or an input precondition (2-D, f32 noise
+                    # and temperatures, contiguous last dim, shapes) that this
+                    # call no longer meets. Keep its HIP race, on this step's
+                    # noise, for this and every later step.
                     warnings.warn(
-                        "ATOM_SPEC_BONUS_FUSED: aiter's fused_mixed_sample has no "
-                        "config for this GPU; using mixed_sample_outer_exponential.",
+                        f"ATOM_SPEC_BONUS_FUSED: aiter's fused_mixed_sample "
+                        f"refused this draw ({type(e).__name__}: {e}); using "
+                        "mixed_sample_outer_exponential.",
                         UserWarning,
                         stacklevel=2,
                     )

@@ -1025,10 +1025,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # greedy rows (temperature at or below the sampler's epsilon) are
     # bit-identical, lowest id on ties. Sampling rows can differ from the aiter
     # kernel only when the two best race keys sit within a few 1e-7 relative of
-    # each other (fp32 rounding order). Rows with top-k/top-p, and batches
-    # without per-row noise, keep the aiter path. Needs an aiter that has
-    # `fused_mixed_sample`; without it, or on a GPU it has no tuned config for,
-    # the draw keeps the aiter path and warns once. Read when the `Sampler` is
+    # each other (fp32 rounding order). Rows with top-k/top-p keep the aiter
+    # path. So, by choice of scope, do batches that share one noise row
+    # (`needs_independent_noise=False`, ordinary non-speculative sampling):
+    # aiter accepts that stride-0 broadcast, but it is not measured here. Needs
+    # an aiter whose `fused_mixed_sample` takes this call; without it, on a GPU
+    # it has no tuned config for, or for an input it refuses (ValueError), the
+    # draw keeps the aiter path and warns once. Read when the `Sampler` is
     # built, so it must be set before the server starts. Off by default:
     # sampling rows are not bit-exact with the aiter kernel (above).
     "ATOM_SPEC_BONUS_FUSED": lambda: os.getenv("ATOM_SPEC_BONUS_FUSED", "0") == "1",
