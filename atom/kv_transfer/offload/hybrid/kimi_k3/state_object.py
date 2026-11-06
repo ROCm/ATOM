@@ -115,14 +115,16 @@ class StateByteCodec:
             torch.uint8,
         )
 
-    def put(self, h: int, unit_ids, on_source_released=None) -> bool:
+    def put(
+        self, h: int, unit_ids, on_source_released=None, producer_event=None
+    ) -> bool:
         # Bound state independently of KV while retaining the shared allocator.
         # Only stores serialize; a load holds its MemoryObj reference while
         # unpacking, so removing its cache entry cannot free live bytes.
         if self._storage is None:
             return False
         if self._max_entries is None:
-            return self._put(h, unit_ids, on_source_released)
+            return self._put(h, unit_ids, on_source_released, producer_event)
         key = self.key(h)
         with self._store_lock:
             with self._cache_lock:
@@ -131,14 +133,16 @@ class StateByteCodec:
                         old = next(iter(self._cache_keys))
                         self._storage.remove(old)
                         del self._cache_keys[old]
-            ok = self._put(h, unit_ids, on_source_released)
+            ok = self._put(h, unit_ids, on_source_released, producer_event)
             if ok:
                 with self._cache_lock:
                     self._cache_keys.pop(key, None)
                     self._cache_keys[key] = None
             return ok
 
-    def _put(self, h: int, unit_ids, on_source_released=None) -> bool:
+    def _put(
+        self, h: int, unit_ids, on_source_released=None, producer_event=None
+    ) -> bool:
         """Store one checkpoint image. False when nothing was stored.
 
         Reads PAGE units where `get` writes an Active Slot; safe because the
@@ -186,9 +190,15 @@ class StateByteCodec:
             segments = getattr(self._backend, "page_unit_segments", None)
             if callable(segments):
                 ptrs, sizes = segments(unit_ids)
-                self._staged.pack_segments(ptrs, sizes, obj)
+                self._staged.pack_segments(
+                    ptrs, sizes, obj, producer_event=producer_event
+                )
             else:
-                self._staged.pack(self._backend.page_unit_views(unit_ids), obj)
+                self._staged.pack(
+                    self._backend.page_unit_views(unit_ids),
+                    obj,
+                    producer_event=producer_event,
+                )
             # Source first: `pack` has synchronized the stream that reads the
             # units, so nothing on the device touches them from here.
             if on_source_released is not None:

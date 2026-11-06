@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 import time
 
+import torch
+
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     StateStoreOperationId,
@@ -123,8 +125,8 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         first lets an in-flight transfer finish against a pool that is still
         mapped; `shutdown` then joins the tier's own executors. Only after that
         does the base close its save/load pools. Guarded because the tier is
-        `None` until `register_kv_caches` builds it (and stays `None` under PP or
-        on a non-owning layout).
+        `None` until `register_kv_caches` builds it (and stays `None` on a
+        non-owning layout).
         """
         tier = getattr(self, "_state_tier", None)
         if tier is not None:
@@ -142,18 +144,10 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     def _build_state_tier(self, transfer_tensors) -> None:
         from aiter.dist.parallel_state import get_tp_group
 
-        # PP breaks the tier: the CacheEngineKey has no PP component, so two
-        # stages at the same TP rank would overwrite each other. Refused rather
-        # than half-supported. Paged KV is unaffected.
-        pp_size = int(getattr(self._config, "pipeline_parallel_size", 1) or 1)
-        if pp_size > 1:
-            logger.warning(
-                "kimi_k3 offload: the state tier is unsupported under pipeline "
-                "parallelism (pipeline_parallel_size=%d); paged KV is unaffected.",
-                pp_size,
-            )
-            return
-
+        # Under PP every stage builds its own tier over its own layers' image.
+        # The key's worker id is `pp_aware_rank_and_world`'s, so stages at one
+        # TP rank do not collide, and `PPKVAggregator` takes each store's and
+        # load's verdict across all of them.
         backend = getattr(transfer_tensors, "state_backend", None)
         if backend is None:
             logger.warning(
@@ -399,9 +393,15 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     def _start_state_stores(self, metadata) -> None:
         """Hand this step's ready checkpoints to the tier's executor.
 
-        No producer fence and no staging copy: the source is the checkpoint's
-        PAGE units, reserved out of the KV pool and pinned by the engine, so the
-        packer gathers straight from where they sit.
+        No staging copy: the source is the checkpoint's PAGE units, reserved
+        out of the KV pool and pinned by the engine, so the packer gathers
+        straight from where they sit. It does need a producer fence. The engine
+        marks a checkpoint READY once the batch whose `build()` copies the
+        Active Slot into those units has been *issued*, not run, and on a PP
+        stage that copy may sit a whole pipeline depth behind in the compute
+        stream. Metadata reaches each stage after every batch scheduled before
+        it, so one event recorded here on the compute stream orders the gather
+        after the copy.
 
         A store with no tier is reported failed rather than dropped -- the
         engine holds those units pinned against a report, and silence would
@@ -419,13 +419,32 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             for op, _units in stores:
                 self._store_failed_no_tier.add(op)
             return
+        try:
+            producer_event = torch.cuda.Event()
+            producer_event.record(torch.cuda.current_stream())
+        except Exception:
+            # Nothing has read the units yet, so failing the step's stores
+            # releases them safely; an unfenced gather could store a stale image
+            # under a valid hash.
+            logger.exception(
+                "kimi_k3 offload: state store fence creation failed; failing "
+                "%d store(s).",
+                len(stores),
+            )
+            for op, _units in stores:
+                self._store_failed_no_tier.add(op)
+            return
         for op, unit_ids in stores:
             # Isolate each submit (finding #4): route a submit failure into the
             # same no-tier failure channel (get_finished drains it) so the engine
             # releases the store's pinned PAGE units now rather than on the
             # reconciler's full timeout, without escaping past super().
             try:
-                self._state_tier.submit_store(op, tuple(int(u) for u in unit_ids))
+                self._state_tier.submit_store(
+                    op,
+                    tuple(int(u) for u in unit_ids),
+                    producer_event=producer_event,
+                )
             except Exception:
                 logger.exception(
                     "kimi_k3 offload: submit_store failed for %s; failing it.",
@@ -612,6 +631,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         self._max_pending_saves = max_pending_saves(
             getattr(config, "kv_transfer_config", None) or {},
             envs.OFFLOAD_COPY_WORKERS,
+            pp_size=int(getattr(config, "pipeline_parallel_size", 1) or 1),
         )
         self._save_inflight_since: dict[object, float] = {}
         self._save_stalled = False

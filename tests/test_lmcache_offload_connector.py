@@ -6259,7 +6259,7 @@ def test_state_budget_evicts_cold_state_without_removing_kv(lmcache_key, monkeyp
     codec._staged = SimpleNamespace(unpack=lambda obj, views: None)
     storage.objects["KV"] = object()
 
-    def put(h, units, callback):
+    def put(h, units, callback, producer_event=None):
         storage.objects[codec.key(h)] = SimpleNamespace(
             get_size=lambda: 1024, ref_count_down=lambda: None
         )
@@ -7184,7 +7184,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             self.gate = threading.Event()
             self.loaded = threading.Event()
 
-        def put(self, h, unit_ids, on_source_released=None):
+        def put(self, h, unit_ids, on_source_released=None, producer_event=None):
             self.gate.wait(timeout=5)
             if on_source_released is not None:
                 on_source_released()
@@ -7261,7 +7261,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             self.released = threading.Event()
             self.gate = threading.Event()
 
-        def put(self, h, unit_ids, on_source_released=None):
+        def put(self, h, unit_ids, on_source_released=None, producer_event=None):
             if on_source_released is not None:
                 on_source_released()  # D2H is done here, CPU put is not
             self.released.set()
@@ -7298,7 +7298,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         image out of the KV pool until the stale reclaimer noticed."""
 
         class _RefuseCodec:
-            def put(self, h, unit_ids, on_source_released=None):
+            def put(self, h, unit_ids, on_source_released=None, producer_event=None):
                 return False  # allocation refused; callback never reached
 
             def get(self, h, slot):
@@ -7320,7 +7320,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         releases them and the store is reported failed, not lost."""
 
         class _ThrowCodec:
-            def put(self, h, unit_ids, on_source_released=None):
+            def put(self, h, unit_ids, on_source_released=None, producer_event=None):
                 raise RuntimeError("pack blew up")
 
             def get(self, h, slot):
