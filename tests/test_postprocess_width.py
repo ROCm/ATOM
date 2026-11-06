@@ -343,3 +343,73 @@ def _payload_tensors(payload):
         payload[..., k + 1 : 2 * k + 1].view(torch.int32),
         payload[..., -1].view(torch.int32),
     )
+
+
+@pytest.mark.parametrize("producer", [False, True])
+@pytest.mark.parametrize("duplicates_propose", [False, True])
+def test_a_producer_skips_propose_only_when_nothing_rides_on_it(
+    producer, duplicates_propose
+):
+    """A producer's drafts are dropped. DSpark writes its context K/V apart
+    from propose, so a producer leaves propose out, PP or not, and on every DP
+    rank alike; EAGLE's first draft step writes the final chunk's K/V, so it
+    still runs."""
+    runner = object.__new__(mod.ModelRunner)
+    runner.drafter = types.SimpleNamespace(
+        draft_kv_duplicates_propose=duplicates_propose
+    )
+    runner.tokenID_processor = types.SimpleNamespace(
+        is_pd_producer=producer, is_pipeline_parallel=False
+    )
+    runner.config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(data_parallel_size=2)
+    )
+    skips = producer and not duplicates_propose
+    assert runner._producer_skips_propose() is skips
+    # No DP peer is owed the collectives of a propose nobody runs.
+    assert runner._dp_draft_lockstep_active() is not skips
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("producer", [False, True])
+def test_a_producer_skips_propose_on_either_output_path(
+    monkeypatch, deferred, producer
+):
+    """A producer outside PP defers its output, so the deferred branch must
+    skip propose too (a DSpark draft below its TP floor cannot run the block
+    pass); it still keeps the step's bookkeeping."""
+    monkeypatch.setattr(
+        mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(spec_decode_metadata=None),
+    )
+    monkeypatch.setattr(
+        mod, "get_tp_group", lambda: types.SimpleNamespace(world_size=1)
+    )
+    monkeypatch.setattr(mod, "get_pcp_world_size", lambda: 1)
+    runner = _runner({})
+    runner.drafter = types.SimpleNamespace(draft_kv_duplicates_propose=False)
+    proposed, sent = [], []
+    drafts = np.array([[5], [6]], dtype=np.int32)
+    runner.propose_draft_token_ids = lambda *a: proposed.append(a) or drafts
+    runner.tokenID_processor.__dict__.update(
+        is_deferred_out=deferred,
+        is_pd_producer=producer,
+        prev_rejected_num=np.array([1, 2], dtype=np.int32),
+        prev_bonus_num=np.array([3, 4], dtype=np.int32),
+        spec_status_queue=types.SimpleNamespace(
+            send=lambda counts, ready: sent.append(counts)
+        ),
+        input_ids=types.SimpleNamespace(gpu=torch.zeros(8, dtype=torch.int32)),
+    )
+
+    out = runner.postprocess(
+        _batch(2), torch.zeros(2, 8), torch.ones(2), None, None, False, None
+    )
+
+    assert len(proposed) == (0 if producer else 1)
+    assert out.draft_token_ids is (None if producer else drafts)
+    if deferred:
+        assert len(sent) == 1
+        assert out.num_rejected.tolist() == [1, 2]
+        assert runner.tokenID_processor.prev_token_ids.shape == (2,)

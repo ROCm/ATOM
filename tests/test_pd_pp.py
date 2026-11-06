@@ -1028,8 +1028,10 @@ def test_explicit_region_map_rejects_length_mismatch():
         conn._consumer_region_map(3, 2, explicit_indices=[0, 1])
 
 
+# Negative indices count from the consumer's end (`merge_pages`): -3 of 2 is
+# before it, and -1 is the consumer's region 1.
 @pytest.mark.parametrize(
-    "indices, refusal", [([0, 2], "exceeds"), ([-1, 0], "exceeds"), ([1, 1], "two")]
+    "indices, refusal", [([0, 2], "exceeds"), ([-3, 0], "exceeds"), ([1, -1], "two")]
 )
 def test_explicit_region_map_rejects_a_region_the_consumer_lacks_or_repeats(
     indices, refusal

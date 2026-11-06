@@ -2879,15 +2879,19 @@ class MooncakeConnector(KVConnectorBase):
                     "Explicit consumer region map length does not match local "
                     f"regions: {len(explicit_indices)} != {num_local_regions}"
                 )
-            if any(not 0 <= i < num_consumer_regions for i in explicit_indices):
+            # Negative indices count from the consumer's end (`merge_pages`).
+            resolved = [
+                i + num_consumer_regions if i < 0 else i for i in explicit_indices
+            ]
+            if any(not 0 <= i < num_consumer_regions for i in resolved):
                 raise ValueError(
                     "Explicit consumer region map exceeds consumer regions"
                 )
-            if len(set(explicit_indices)) != len(explicit_indices):
+            if len(set(resolved)) != len(resolved):
                 raise ValueError(
                     "Explicit consumer region map sends two regions to one"
                 )
-            return list(explicit_indices)
+            return resolved
         if (
             consumer_num_layers is not None
             and self.pp_size > 1

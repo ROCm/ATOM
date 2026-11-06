@@ -3,9 +3,10 @@
 
 The MHA backend's own export numbers a stage's units as an unsplit model does
 and says how each splits by KV head (MiniMax-M3: page-16 sparse layers, dense
-layers, the replicated indexer keys). The byte test drives the real descriptor
-builder against host buffers, so a wrong region or head offset shows up as a
-wrong byte.
+layers, the replicated indexer keys); the last stage appends its draft pool's
+(DSpark: page-16), which the consumer appends last too. The byte test drives
+the real descriptor builder against host buffers, so a wrong region or head
+offset shows up as a wrong byte.
 """
 
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from atom.kv_transfer.offload.mp.page_views import _build_cache_views
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
 from atom.model_ops.attentions.pool_layout.pool_rows import KvGeometry
+from atom.spec_decode.draft_kv import DRAFT_KV_ROWS, DraftKvBuilder
 
 # `exc_type`: collected after a test that stubs `sys.modules["aiter"]`, the
 # import reaches the stub and fails on a symbol rather than on the module.
@@ -91,16 +93,42 @@ def _pp(monkeypatch, builder, rank, size):
     return builder
 
 
+class _Binding:
+    """A DSpark draft layer's cache binding, which reads and writes page-16."""
+
+    shuffle_page_tokens = 16
+
+
+def _draft(heads, kv_dtype):
+    builder = object.__new__(DraftKvBuilder)
+    builder._kv_pool = MhaKvPool(
+        layers=2,
+        block_size=BLOCK,
+        num_kv_heads=heads,
+        head_dim=HEAD_DIM,
+        kv_dtype=kv_dtype,
+    )
+    builder._kv_pool.allocate(4, "cpu")
+    builder._pool_rows = {DRAFT_KV_ROWS: {_Binding(): row for row in range(2)}}
+    return builder.get_kv_transfer_tensors()
+
+
 @pytest.fixture
 def export(monkeypatch):
-    """The backend's export on stage `rank` of `partition`, or unsplit."""
+    """The runner's export on stage `rank` of `partition`, or unsplit: the
+    backend's units, then the draft's on the last stage."""
 
-    def _export(heads, rank=0, partition=None, kv_dtype=torch.float8_e4m3fn):
+    def _export(
+        heads, rank=0, partition=None, kv_dtype=torch.float8_e4m3fn, draft=False
+    ):
         sizes = partition or (LAYERS,)
         monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", ",".join(map(str, sizes)))
         start = sum(sizes[:rank])
         builder = _builder(range(start, start + sizes[rank]), heads, kv_dtype)
-        return _pp(monkeypatch, builder, rank, len(sizes)).get_kv_transfer_tensors()
+        tt = _pp(monkeypatch, builder, rank, len(sizes)).get_kv_transfer_tensors()
+        if draft and rank == len(sizes) - 1:
+            tt.merge_pages(_draft(heads, kv_dtype))
+        return tt
 
     return _export
 
@@ -140,16 +168,19 @@ def test_an_unsplit_model_keeps_the_backend_names_and_splits_by_head(export):
 
 @pytest.mark.parametrize("heads", [1, 4])
 @pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize("partition", PARTITIONS)
 def test_every_stage_maps_into_the_full_consumer_layout(
-    export, heads, kv_dtype, partition
+    export, heads, kv_dtype, draft, partition
 ):
-    consumer = [r.semantic_role for r in export(1, kv_dtype=kv_dtype).block_regions]
+    consumer = export(1, kv_dtype=kv_dtype, draft=draft).block_regions
+    consumer = [region.semantic_role for region in consumer]
     claimed = []
     for rank in range(len(partition)):
-        tt = export(heads, rank, partition, kv_dtype)
-        indices = tt.block_region_consumer_indices
-        assert len(indices) == len(tt.pages)
+        tt = export(heads, rank, partition, kv_dtype, draft)
+        assert len(tt.block_region_consumer_indices) == len(tt.pages)
+        # Negative: counted from the consumer's end (the appended draft).
+        indices = [i % len(consumer) for i in tt.block_region_consumer_indices]
         for page, index in zip(tt.pages, indices):
             assert _unit(page.region.semantic_role) == _unit(consumer[index])
         claimed.extend(indices)
@@ -249,12 +280,13 @@ def _request(theirs, bases, rank, runs=True):
 
 
 @pytest.mark.parametrize("heads", [1, 4])
+@pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize("rank, partition", [(0, (2, 2, 2, 2)), (3, (3, 2, 2, 1))])
-def test_stage_fills_each_tp4_rank_with_its_head(export, heads, rank, partition):
+def test_stage_fills_each_tp4_rank_with_its_head(export, heads, draft, rank, partition):
     """`heads` 4 is a TP1 stage, cut by head; 1 is a TP4 stage, copied whole."""
     mem, blocks, src_ids, dst_ids = _Memory(), 4, [3, 1], [0, 2]
-    theirs = _layout(export(1))  # a TP4 decode rank: every layer, one head
-    tt = export(heads, rank, partition)
+    theirs = _layout(export(1, draft=draft))  # a TP4 decode rank: one head
+    tt = export(heads, rank, partition, draft=draft)
     layout = _layout(tt)
     producer = _producer(tt, mem, blocks, heads)
     consumers = []
@@ -289,17 +321,22 @@ def test_stage_fills_each_tp4_rank_with_its_head(export, heads, rank, partition)
     assert mem.writes > 4
 
 
-@pytest.mark.parametrize("bad_layout", ["reordered", "short"])
+@pytest.mark.parametrize("bad_layout", ["reordered", "short", "missing_draft"])
 def test_incompatible_consumer_layout_is_refused(export, bad_layout):
     mem = _Memory()
-    producer = _producer(export(4, 3, (3, 2, 2, 1)), mem, 4, 4)
-    roles = [r.semantic_role for r in export(1).block_regions]
+    producer = _producer(export(4, 3, (3, 2, 2, 1), draft=True), mem, 4, 4)
+    consumer = export(1, draft=bad_layout != "missing_draft")
+    roles = [r.semantic_role for r in consumer.block_regions]
     bases = [0] * len(roles)
     if bad_layout == "reordered":
         roles.reverse()
-    else:
+    elif bad_layout == "short":
         bases, roles = bases[:-1], roles[:-1]
-    with pytest.raises((RuntimeError, ValueError), match="role mismatch|exceeds"):
+    # A missing draft: its regions, numbered from the consumer's end, land
+    # on target regions this stage already maps.
+    with pytest.raises(
+        (RuntimeError, ValueError), match="role mismatch|exceeds|two regions"
+    ):
         producer._execute_block_transfer(
             {
                 "consumer_base_addrs": bases,
