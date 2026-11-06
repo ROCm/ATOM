@@ -1483,15 +1483,16 @@ def sparse_pa_per_row(
     plan_workgroup_budget = None
     if (
         quantized_output is not None
-        and max_context_partition_num < 8
         and not quantized_direct
         and num_seqs <= _cluster_resident_rows(q.device)
     ):
-        # Decode rows past 64 get fewer than eight splits from the default
-        # plan budget (two workgroups per CU), and only the eight-CTA cluster
-        # merge carries the FP8 epilogue. A budget of eight tasks per row keeps
-        # every row one resident cluster of eight (gfx1250 keeps 15 clusters
-        # per 16 CUs), so the fused cluster8 epilogue applies.
+        # Only the eight-CTA cluster merge carries the FP8 epilogue. Past 64
+        # decode rows the default plan budget (two workgroups per CU) fits
+        # fewer than eight tasks per row (or eight splits but not the cluster
+        # budget, 65..73 rows), so those rows fell back to the split PA plus
+        # the standalone quant. Eight partitions with a budget of eight tasks
+        # per row keep every row one resident cluster of eight (gfx1250 keeps
+        # 15 clusters per 16 CUs); up to 64 rows that is the default plan.
         max_context_partition_num = 8
         plan_workgroup_budget = 8 * num_seqs
     if (
