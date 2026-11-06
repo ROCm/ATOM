@@ -1,41 +1,75 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Kimi-K3 prefill token graphs: which steps record, and the dense MLA split.
-
-A token graph records a prefill at its bucket and replays it on every step
-that pads to it. Kimi's MLA layer records its head -- Q projection, the new
-tokens' kv_b_proj, their FP8 quantization -- and breaks only around the
-KV-cache write and the attention (`MLAAttention.forward_prefill_split`).
-
-On the host, with the kernels replaced by references: when the split is
-taken, and that a padded bucket's split writes the scheduled rows as
-`forward_impl` computes them alone, the same KV cache, and zeros past them.
-"""
+"""Kimi-K3 prefill token graphs: when the dense MLA split is taken, and that a
+padded bucket's split writes the rows `forward_impl` computes, the same KV
+cache, and zeros past them. Kernels are replaced by references."""
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import sys
 from itertools import pairwise
 from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+import torch._dynamo  # before Triton may be faked below
+from aiter_stub import stubbed_aiter
 from torch import nn
 
-pytest.importorskip("triton", reason="attention_mla defines @triton.jit kernels")
-pytest.importorskip("aiter", reason="attention_mla imports the AITER runtime")
+# Without AITER (the CPU runner) attention_mla's AITER imports, and Triton where
+# it is missing, are faked; the kernels these tests reach are references here.
+_FAKE_AITER = (
+    "aiter.jit",
+    "aiter.jit.utils",
+    "aiter.jit.utils.torch_guard",
+    "aiter.mla",
+    "aiter.ops",
+    "aiter.ops.gated_rmsnorm_fp8_group_quant",
+    "aiter.ops.quant",
+    "aiter.ops.shuffle",
+    "aiter.ops.triton",
+    "aiter.ops.triton.attention",
+    "aiter.ops.triton.attention.mla",
+    "aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant",
+    "aiter.ops.triton.fused_add_rmsnorm_pad",
+    "aiter.ops.triton.fusions",
+    "aiter.ops.triton.fusions.fused_kv_cache",
+    "aiter.ops.triton.gemm",
+    "aiter.ops.triton.gemm.batched",
+    "aiter.ops.triton.gemm.batched.batched_gemm_bf16",
+    "aiter.ops.triton.gather_kv_b_proj",
+    "aiter.ops.triton.gluon",
+    "aiter.ops.triton.gluon.pa_decode_gluon",
+    "aiter.ops.triton.kv_cache",
+    "aiter.ops.triton.quant",
+    "aiter.ops.triton.quant.fused_mxfp8_quant",
+    "aiter.tuned_gemm",
+    "aiter.utility",
+    "aiter.utility.fp4_utils",
+)
 
-from atom.model_ops import attention_mla as mla
-from atom.model_ops.attentions import triton_merge_attn_states as merge
-from atom.utils import forward_context
+
+def _imports():
+    if importlib.util.find_spec("aiter") is not None:
+        return contextlib.nullcontext()
+    no_triton = importlib.util.find_spec("triton") is None
+    return stubbed_aiter(*_FAKE_AITER, *(("triton", "triton.language") * no_triton))
+
+
+with _imports():
+    from atom.model_ops import attention_mla as mla
+    from atom.model_ops import base_attention as base
+    from atom.utils import forward_context
 
 HEADS, NOPE, ROPE, V_DIM, LORA = 2, 8, 4, 8, 6
 
 
 def test_kimi_records_prefill_token_graphs_only_without_dp():
-    """Under DP every rank pads to a prefill bucket some rank chose, so a
-    decoding or idle rank would replay a recording whose regions serve a
-    prefill alone."""
-    from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
+    pytest.importorskip("einops", reason="the Kimi builder imports the GDN mixer")
+    with _imports():
+        from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
 
     def supports(runner):
         builder = SimpleNamespace(model_runner=runner)
@@ -63,8 +97,6 @@ def test_kimi_records_prefill_token_graphs_only_without_dp():
 def test_the_attention_op_takes_the_split_its_impl_asks_for(
     monkeypatch, use_mla, impl, taken
 ):
-    from atom.model_ops import base_attention as base
-
     impl.forward_prefill_split = lambda *args: ("split", args)
     layers = {"layer": SimpleNamespace(impl=impl)}
     compilation = SimpleNamespace(static_forward_context=layers)
@@ -152,11 +184,19 @@ def test_the_split_is_off_under_pcp(step, monkeypatch):
     assert not _split_impl().records_prefill_split()
 
 
+def test_the_split_is_off_under_triton_gemm(step, monkeypatch):
+    # The eager prefill then takes the fused GEMM + split + cat for kv_b_proj.
+    step.tr_graph = "record"
+    step.context = SimpleNamespace(is_prefill=True, is_dummy_run=True)
+    monkeypatch.setattr(mla, "use_triton_gemm", lambda: True)
+    assert not _split_impl().records_prefill_split()
+
+
 # ---- the split against forward_impl, with reference kernels ----------------
 
 
 def _varlen(*, q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal, **kw):
-    """Varlen attention, bottom-right causal, LSE as ``[heads, tokens]``."""
+    """Varlen attention, bottom-right causal, LSE ``[heads, tokens]``."""
     out = q.new_zeros(q.shape[0], q.shape[1], v.shape[-1])
     lse = torch.full((q.shape[1], q.shape[0]), float("-inf"))
     cu_q, cu_k = cu_seqlens_q.tolist(), cu_seqlens_k.tolist()
@@ -189,8 +229,12 @@ def _cache_write(k_nope, k_rope, kv_cache, slot_mapping, **_):
 
 @pytest.fixture
 def kernels(monkeypatch):
+    # The chunked path imports merge_attn_states from its module at call time.
+    merge = SimpleNamespace(merge_attn_states=_merge)
+    monkeypatch.setitem(
+        sys.modules, "atom.model_ops.attentions.triton_merge_attn_states", merge
+    )
     monkeypatch.setattr(mla, "flash_attn_varlen_func", _varlen)
-    monkeypatch.setattr(merge, "merge_attn_states", _merge)
     monkeypatch.setattr(mla, "concat_and_cache_mla", _cache_write)
     monkeypatch.setattr(mla, "use_triton_gemm", lambda: False)
     monkeypatch.setattr(mla, "pcp_is_enabled", lambda: False)
@@ -201,7 +245,6 @@ def _dense_impl(prefix_k, prefix_v):
     weight = torch.randn(HEADS * (NOPE + V_DIM), LORA)
 
     def gather(cache, indptr, indices, cu_seqlens_k, k_out, v_out, *a, **kw):
-        # The prefix's K/V as kv_b_proj would decompress them from the cache.
         k_out.copy_(prefix_k[: k_out.shape[0]])
         v_out.copy_(prefix_v[: v_out.shape[0]])
 
@@ -217,7 +260,6 @@ def _dense_impl(prefix_k, prefix_v):
         dtype=torch.float32,
         layer_num=0,
         qrep_enabled=False,
-        # The query arrives projected; RoPE is NoPE, as Kimi-K3's.
         q_proj=lambda x, x_scale=None: x,
         rotary_emb=lambda positions, q_pe, k_pe: None,
         kv_b_proj=lambda x: nn.functional.linear(x, weight),
@@ -254,7 +296,7 @@ def _dense_impl(prefix_k, prefix_v):
 
 
 def _metadata(path):
-    """Two prompts of 3 and 2 new tokens behind 4 and 1 cached ones."""
+    """Prompts of 3 and 2 new tokens behind 4 and 1 cached ones."""
     cu_new = torch.tensor([0, 3, 5], dtype=torch.int32)
     cu_full = torch.tensor([0, 7, 10], dtype=torch.int32)
     cu_cached = torch.tensor([0, 4, 5], dtype=torch.int32)
@@ -328,7 +370,6 @@ def test_a_padded_split_writes_the_rows_forward_impl_computes(
     k_nope = torch.randn(bucket, LORA)
     k_rope = torch.randn(bucket, 1, ROPE)
     positions = torch.arange(bucket)
-    # The prefix's K/V, and for the single pass the whole context's.
     prefix_k = torch.randn(10, HEADS, NOPE + ROPE)
     prefix_v = torch.randn(10, HEADS, V_DIM)
     metadata = _metadata(path)
@@ -341,7 +382,6 @@ def test_a_padded_split_writes_the_rows_forward_impl_computes(
 
     impl = _dense_impl(prefix_k, prefix_v)
     split_cache = _run(monkeypatch, impl, metadata, rows)
-    # The padding a replayed bucket carries: whatever the last step left.
     q[rows:], k_nope[rows:], k_rope[rows:] = 1e4, 1e4, 1e4
     split = impl.forward_prefill_split(q, None, k_nope, k_rope, positions, "layer")
 
@@ -366,3 +406,20 @@ def test_the_recordings_dummy_step_leaves_the_output_and_cache_alone(
     assert split.shape == (8, HEADS * V_DIM)
     assert torch.count_nonzero(split) == 0
     assert torch.count_nonzero(kv_cache) == 0
+
+
+def test_an_fp8_split_needs_the_steps_row_count(monkeypatch, kernels):
+    impl = _dense_impl(
+        torch.zeros(10, HEADS, NOPE + ROPE), torch.zeros(10, HEADS, V_DIM)
+    )
+    impl._flydsl_fp8_mha_ok = True
+    _run(monkeypatch, impl, _metadata("new_only"), 5)  # no scheduled_tokens_gpu
+    with pytest.raises(AssertionError, match="row count"):
+        impl.forward_prefill_split(
+            torch.randn(8, HEADS * (NOPE + ROPE)),
+            None,
+            torch.randn(8, LORA),
+            torch.randn(8, 1, ROPE),
+            torch.arange(8),
+            "layer",
+        )
