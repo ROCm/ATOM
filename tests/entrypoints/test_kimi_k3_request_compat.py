@@ -407,7 +407,8 @@ def server(monkeypatch):
         SimpleNamespace(
             config=SimpleNamespace(
                 generation_config=SimpleNamespace(), max_model_len=8192
-            )
+            ),
+            io_processor=SimpleNamespace(encode_prompt=lambda _text: [1, 2]),
         ),
     )
     monkeypatch.setattr(api_server, "generate_async", fake_generate_async)

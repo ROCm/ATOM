@@ -188,6 +188,9 @@ def test_target_prefixes_cover_every_ragged_acceptance_length(stochastic):
         assert output[i].tolist() == expected
     assert counts.tolist() == accepts
     assert rejected.tolist() == [5 - a for a in accepts]
+    # The undeferred runner's counts come from the row length.
+    emitted = (output != -1).sum(1)
+    assert torch.equal(emitted - 1, counts) and torch.equal(6 - emitted, rejected)
     # The anchor is the row the last emitted token was sampled at.
     starts = [sum(w + 1 for w in widths[:i]) for i in range(len(widths))]
     assert anchors.tolist() == [s + a for s, a in zip(starts, accepts)]

@@ -20,6 +20,7 @@ from typing import Any
 # whole thesis is that asking "how much can be released without splitting a
 # marker" in more than one place is how the answers drift apart, and it used
 # to answer it itself, twice, with a different tie-break.
+from .logprobs import LogprobText, join_text
 from .marker_scanner import MarkerScanner
 from .reasoning_dialects import DIALECTS, FALLBACK_DIALECT, ReasoningDialect
 
@@ -193,6 +194,7 @@ class ReasoningFilter:
         # close inside the channel, in case the channel turns out to have been
         # the reply. One string, dropped when the channel ends.
         self._channel_text = io.StringIO() if self._answer_end_markers else None
+        self._channel_parts = None
         # The channel's last words, whitespace and framing aside, were the
         # answer's closer.
         self._answer_closed = False
@@ -201,6 +203,11 @@ class ReasoningFilter:
             if literal_answer and not starts_thinking
             else self._scanner_for(self.state)
         )
+
+    @property
+    def held_text(self) -> str:
+        """Unresolved marker prefix that may still become visible text."""
+        return self._scanner.held if self._scanner is not None else ""
 
     def _scanner_for(self, state: int) -> MarkerScanner | None:
         """What this state has to watch for. ``None`` when that is nothing,
@@ -294,7 +301,12 @@ class ReasoningFilter:
         """
         if self._channel_text is None:
             return
-        self._channel_text.write(released)
+        if isinstance(released, LogprobText):
+            if self._channel_parts is None:
+                self._channel_parts = []
+            self._channel_parts.append(released)
+        else:
+            self._channel_text.write(released)
         if self._answer_closed and not released.isspace():
             self._answer_closed = False
 
@@ -309,9 +321,10 @@ class ReasoningFilter:
         cannot be recalled, so it goes out again as `content`.
         """
         kept, self._channel_text = self._channel_text, None  # never reopens
+        parts, self._channel_parts = self._channel_parts, None
         if not self._answer_closed or at in self._exits_to_answer or not stopped:
             return []
-        reply = kept.getvalue()
+        reply = join_text(parts) if parts is not None else kept.getvalue()
         return [
             ("content", reply[i : i + _REPLAY_PIECE])
             for i in range(0, len(reply), _REPLAY_PIECE)
@@ -366,8 +379,9 @@ class ReasoningChannel:
         ``None`` when there is none. ``stopped`` is as for
         :meth:`ReasoningFilter.flush`."""
         events = self.stream().read_whole_events(text, stopped=stopped)
-        reasoning = "".join(v for k, v in events if k == "reasoning_content")
-        content = "".join(v for k, v in events if k == "content")
+        join = join_text if isinstance(text, LogprobText) else "".join
+        reasoning = join(v for k, v in events if k == "reasoning_content")
+        content = join(v for k, v in events if k == "content")
         return reasoning or None, content
 
     def stream(self) -> ReasoningFilter:
