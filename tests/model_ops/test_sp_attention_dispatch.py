@@ -15,7 +15,6 @@ def modules():
     with atom_without_aiter() as load:
         yield SimpleNamespace(
             chip_info=load("aiter.jit.utils.chip_info"),
-            token_transport=load("atom.distributed.token_transport"),
             sp_attention=load("atom.model_ops.sp_attention"),
         )
 
@@ -48,7 +47,7 @@ def test_unsupported_runtime_keeps_existing_kernels(
 
 
 def test_head_exchange_requires_usable_collective(monkeypatch, modules, supported):
-    transport = modules.token_transport
+    transport = modules.sp_attention
     ca = SimpleNamespace(
         disabled=False,
         should_head_exchange=lambda x: True,

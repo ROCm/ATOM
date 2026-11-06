@@ -8,7 +8,6 @@ from aiter.dist.parallel_state import get_pcp_group
 from torch import nn
 
 from atom.config import get_current_atom_config
-from atom.distributed.token_transport import head_exchange_comm
 from atom.distributed.ulysses_sp import (
     check_sp_attention_layer,
     get_sp_world_size,
@@ -20,7 +19,7 @@ from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules
 from .base_attention import BaseAttention
-from .sp_attention import sp_fp8_attention_output_supported
+from .sp_attention import head_exchange_comm, sp_fp8_attention_output_supported
 
 
 class Attention(BaseAttention):

@@ -12,9 +12,12 @@ rank dimension and runs with ``-tp 1 -sp W``.
 import torch
 
 from atom.config import get_current_atom_config
-from atom.distributed.token_transport import ALLGATHER_MAX_PAYLOAD_BYTES
 
 # AITER is imported where used: `Config` imports this module on CPU.
+
+# Per-rank payloads up to this are all-gathered rather than sent all-to-all.
+# Measured on SP4 the two cross at ~3.7 MB; 2 MiB keeps a margin.
+ALLGATHER_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 
 
 def get_sp_world_size() -> int:

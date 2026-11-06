@@ -17,17 +17,18 @@ from aiter.ops.quant import dynamic_per_token_scaled_quant
 
 from atom.config import get_current_atom_config
 from atom.distributed.pcp_utils import pcp_pad_dense
-from atom.distributed.token_transport import (
-    ALLGATHER_MAX_PAYLOAD_BYTES,
-    HEAD_EXCHANGE_MIN_LOCAL_ROWS,
-    head_exchange_view,
-)
 from atom.distributed.ulysses_sp import (
+    ALLGATHER_MAX_PAYLOAD_BYTES,
     all_to_all_blocks,
     exchange_columns,
     sp_is_enabled,
 )
-from atom.utils import mark_spliting_op
+from atom.utils import envs, mark_spliting_op
+
+# Output rows per rank from which an attention output takes the prefill head
+# exchange (FP8 with a gathered amax, the four-rank exchange kernel); decode
+# stays below it on the all-gather.
+HEAD_EXCHANGE_MIN_LOCAL_ROWS = 2048
 
 
 def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
@@ -62,13 +63,38 @@ def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
     return out, padded_tokens
 
 
+def head_exchange_comm(group):
+    """The communicator of the four-rank head exchange, unless the env opts
+    out. Static: a layer decides it once, when built."""
+    if not envs.ATOM_USE_CUSTOM_ALL_GATHER:
+        return None
+    return group.device_communicator.ca_comm
+
+
+def head_exchange_view(ca, x: torch.Tensor, rows: int, dtype=None):
+    """The ``[rows, x.shape[1]]`` buffer of ``dtype`` that ``ca`` exchanges
+    from: ``x`` itself when it fits as is, else a registered staging view.
+    None when the exchange does not take it."""
+    dtype = x.dtype if dtype is None else dtype
+    if ca is None:
+        return None
+    if (rows, dtype) == (x.shape[0], x.dtype):
+        view = x
+    else:
+        view = ca.registered_input_view((rows, x.shape[1]), dtype)
+    if view is not None and ca.should_head_exchange(view):
+        return view
+    return None
+
+
 def gather_heads(x, rows, ca=None, scale=None):
     """``[S, H/W*D] -> [S/W, H*D]``: give up the sequence, regain all heads.
 
     ``x`` may hold only the leading rows of S = ``rows``; the rest are sent as
     zeros. ``ca`` is the layer's `head_exchange_comm`. With ``scale``, the
     result is per-token FP8 and its scales go to ``scale``; a long output then
-    travels as FP8, quantized with the gathered row maxima.
+    travels as FP8, quantized with the gathered row maxima. Every choice
+    depends only on shapes, so all ranks pick the same collective.
     """
     group = get_pcp_group()
     w, rank = group.world_size, group.rank_in_group
