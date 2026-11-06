@@ -36,6 +36,9 @@ jobs:
               "",
               "> Heavy jobs are skipped when the PR is not approved and no matching `ci:*` label is present.",
               `> Add labels via the sidebar or \`gh pr edit ${context.issue.number} --add-label <label>\``,
+              "",
+              "**Reviews:**",
+              "A reviewer is usually assigned within one working day after the PR is ready for review (see [Pull Request Process](https://github.com/ROCm/ATOM/blob/main/CONTRIBUTING.md#pull-request-process)). If nobody has responded for about a week, mention the area contact listed in [CONTACTS.md](https://github.com/ROCm/ATOM/blob/main/CONTACTS.md). Want to help review? See [REVIEWERS.md](https://github.com/ROCm/ATOM/blob/main/REVIEWERS.md).",
             ].join("\n");
 
             try {
