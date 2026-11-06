@@ -826,10 +826,15 @@ class EagleProposer(Drafter):
 
         forward_context = get_forward_context()
         context = forward_context.context
+        # What the runner's fused verify epilogue already wrote for this step
+        # (`verify_epilogue_targets`), if it ran.
+        handoff = self.__dict__.pop("verify_handoff", None)
         # ATOM_MTP_DRAFT_PRESENCE_PENALTY: this step's requests and no drafts yet,
         # before the (recorded) passes read them.
         draft_presence = getattr(self, "draft_presence", None)
-        if draft_presence is not None:
+        if draft_presence is not None and not (
+            handoff is not None and handoff.presence_begun
+        ):
             draft_presence.begin(
                 getattr(self.runner, "_presence_step", None), context.scheduled_bs
             )
@@ -837,6 +842,7 @@ class EagleProposer(Drafter):
         # the advance that precedes it; none may reach step 0 from a last step.
         if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT:
             forward_context.attn_metadata.__dict__.pop("gfx12_token_split_tiles", None)
+        staged0 = handoff.staged0 if handoff is not None else None
         if self._fused_glue_applies(context):
             return self._propose_fused_glue(
                 target_token_ids,
@@ -845,7 +851,9 @@ class EagleProposer(Drafter):
                 num_reject_tokens,
                 next_token_ids,
                 last_token_indices,
+                staged0=staged0,
             )
+        assert staged0 is None, "step 0 staged for a propose without the fused glue"
         attn_metadata = forward_context.attn_metadata
         scheduled_bs = context.scheduled_bs
         batch_info = self.runner.forward_vars["batch_info"].gpu
@@ -1182,6 +1190,48 @@ class EagleProposer(Drafter):
             and not envs.ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL
         )
 
+    def verify_epilogue_targets(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+    ) -> tuple[dict | None, object | None]:
+        """`Drafter.verify_epilogue_targets`: step 0's staging where
+        `_propose_fused_glue` would stage it in one launch (a uniform verify
+        replaying a step-0 recording), and the draft presence penalty."""
+        context = get_forward_context().context
+        stage = None
+        if self._fused_glue_applies(context) and not context.is_dummy_run:
+            running_bs = context.running_bs
+            scheduled_bs = context.scheduled_bs
+            q = self.mtp_k + 1
+            if (
+                self._step0_graphed(context, running_bs)
+                and target_token_ids.shape[0] == scheduled_bs * q
+            ):
+                stage = {
+                    "input_ids": target_token_ids,
+                    "positions": (
+                        target_positions[0]
+                        if target_positions.ndim == 2
+                        else target_positions
+                    ),
+                    "hidden_states": target_hidden_states,
+                    "staged": {
+                        role: self.step0.buffer(role, running_bs)
+                        for role in (
+                            "input_ids",
+                            "positions",
+                            "hidden_states",
+                            "last_token_indices",
+                        )
+                    },
+                    "scheduled_bs": scheduled_bs,
+                    "running_bs": running_bs,
+                    "query_width": q,
+                }
+        return stage, getattr(self, "draft_presence", None)
+
     def _fused_glue_deployment_applies(self) -> bool:
         """The deployment half of `_fused_glue_applies`, decided once."""
         applies = getattr(self, "_fused_glue_deployment", None)
@@ -1252,6 +1302,7 @@ class EagleProposer(Drafter):
         num_reject_tokens: torch.Tensor,
         next_token_ids: torch.Tensor,
         last_token_indices: torch.Tensor,
+        staged0: dict | None = None,
     ) -> torch.Tensor:
         """`propose` with the eager work between passes fused (`eagle_fused_glue`).
 
@@ -1262,6 +1313,8 @@ class EagleProposer(Drafter):
         staging and draft id export in one launch plus the `kv_indices`
         generation, reading each pass's outputs in place (`borrow`). The draft
         ids are written straight into the ``[scheduled_bs, mtp_k]`` result.
+        ``staged0``: step 0's buffers, already staged by the runner's verify
+        epilogue (`verify_epilogue_targets`).
         """
         from atom.spec_decode.eagle_fused_glue import (
             advance_draft_pass,
@@ -1296,8 +1349,11 @@ class EagleProposer(Drafter):
         )
         mid_label = self.step.label(scheduled_bs, running_bs)
         # A ragged verify (a sequence short of `q` rows) stages as `propose` does.
-        staged0 = None
-        if step0_graphed and num_tokens == scheduled_bs * q:
+        if staged0 is not None:
+            # The verify epilogue staged exactly what `stage_verify_step0` would.
+            assert step0_graphed and num_tokens == scheduled_bs * q
+            positions_src = staged0["positions"].view(-1)
+        elif step0_graphed and num_tokens == scheduled_bs * q:
             staged0 = stage_verify_step0(
                 target_token_ids,
                 next_token_ids,

@@ -50,7 +50,7 @@ from atom.kv_transfer.disaggregation import (
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.output_transfer import D2HQueue
+from atom.model_engine.output_transfer import D2HQueue, HostHandoffRing, HostSlot
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
@@ -365,7 +365,25 @@ class tokenIDProcessor:
         # Pop only after the wait: the pop drops the GPU sources, and the
         # allocator may reuse them once the copy has completed.
         cpu_tensor_handle.pop(0)
+        if isinstance(copy_done, HostSlot):
+            # A kernel wrote it into a hand-off slot, which goes back to its ring.
+            cpu_tensor = cpu_tensor.clone()
+            copy_done.release()
         return cpu_tensor
+
+    def claim_verify_handoff(self, bs: int, width: int) -> tuple[HostSlot, HostSlot]:
+        """ATOM_MTP_VERIFY_HOST_HANDOFF: pinned slots for one verify's output rows
+        ``[bs, width]`` and its ``[accepted, rejected]`` status ``[2, bs]``, which
+        the verify epilogue writes and flags (`output_transfer.HostHandoffRing`);
+        `prepare_sampled_ids` and `spec_status_queue.send_direct` take them."""
+        rings = self._handoff_rings
+        if rings is None:
+            cap = self._output_request_capacity
+            rings = self._handoff_rings = (
+                HostHandoffRing(8, cap * width),
+                HostHandoffRing(8, 2 * cap),
+            )
+        return rings[0].claim((bs, width)), rings[1].claim((2, bs))
 
     def recv_logprobs(self) -> list[float] | None:
         """Pop and return the earliest logprobs from the async copy queue.
@@ -413,6 +431,9 @@ class tokenIDProcessor:
 
         self.prev_batch: ScheduledBatch | None = None
         self.prev_token_ids: torch.Tensor | None = None
+        # ATOM_MTP_VERIFY_HOST_HANDOFF's token / status rings (made on first use);
+        # every slot was waited on above.
+        self._handoff_rings: tuple[HostHandoffRing, HostHandoffRing] | None = None
 
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: torch.Tensor | None = None
@@ -451,8 +472,9 @@ class tokenIDProcessor:
         self,
         batch: ScheduledBatch,
         sampled_token_ids: torch.Tensor,
-        sync_event: torch.cuda.Event,
+        sync_event: torch.cuda.Event | None,
         sampled_logprobs: torch.Tensor | None = None,
+        host_slot: HostSlot | None = None,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, float] | None]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
@@ -473,12 +495,20 @@ class tokenIDProcessor:
 
         token_ids = self.recv_async_output(self.token_ids_cpu)
         logprobs = self.recv_logprobs()
-        self.send_to_cpu_async(
-            sampled_token_ids,
-            self.token_ids_cpu,
-            sync_event,
-            gpu_logprobs=sampled_logprobs,
-        )
+        if host_slot is not None:
+            # The verify epilogue writes these rows into the slot itself.
+            assert sampled_logprobs is None
+            self.token_ids_cpu.append(
+                (host_slot.view, host_slot, (sampled_token_ids, None))
+            )
+            self.logprobs_cpu.append(None)
+        else:
+            self.send_to_cpu_async(
+                sampled_token_ids,
+                self.token_ids_cpu,
+                sync_event,
+                gpu_logprobs=sampled_logprobs,
+            )
         token_id_dict = {}
         logprobs_map = None
         self.prev_req_ids = None
@@ -3395,15 +3425,21 @@ class ModelRunner:
                 or get_pcp_world_size() > 1
             ):
                 logger.warning("presence_penalty is untested under DP or PCP")
-            head = self._greedy_lm_head()
-            vocab = max(
-                self.config.hf_config.vocab_size,
-                getattr(head, "num_embeddings", 0) if head is not None else 0,
-            )
             self._presence_state = PresencePenaltyState(
-                vocab, self.config.max_num_seqs, max_extra=8, device=self.device
+                self._presence_vocab(),
+                self.config.max_num_seqs,
+                max_extra=8,
+                device=self.device,
             )
         return self._presence_state
+
+    def _presence_vocab(self) -> int:
+        """The presence masks' width: every id the LM head can emit."""
+        head = self._greedy_lm_head()
+        return max(
+            self.config.hf_config.vocab_size,
+            getattr(head, "num_embeddings", 0) if head is not None else 0,
+        )
 
     def _install_draft_lm_head_fp8(self) -> None:
         """ATOM_MTP_DRAFT_LM_HEAD_FP8: the draft passes' logits from an FP8 copy of
@@ -3637,6 +3673,126 @@ class ModelRunner:
             tokens = broadcast_from_rank0(tokens, get_tp_group())
         return tokens[:rows], tokens[rows:]
 
+    def _warm_verify_epilogue(self) -> None:
+        """Compile the verify epilogue's variants before serving
+        (ATOM_MTP_FUSED_VERIFY_EPILOGUE)."""
+        from atom.model_ops.verify_epilogue import warm_verify_epilogue_kernels
+
+        drafter = self.drafter
+        step = getattr(drafter, "step", None)
+        mtp_k = getattr(drafter, "mtp_k", 0)
+        if step is None or mtp_k <= 0:
+            return
+        proc = self.tokenID_processor
+        width = mtp_k + 1
+        cap = proc._output_request_capacity
+        warm_verify_epilogue_kernels(
+            max_bs=self._verify_epilogue_max_bs(),
+            num_spec_steps=mtp_k,
+            vocab=self._presence_vocab(),
+            hidden_size=step.buffer("hidden_states", 0).shape[-1],
+            hidden_dtype=step.buffer("hidden_states", 0).dtype,
+            ids_dtype=proc.input_ids.gpu.dtype,
+            device=self.device,
+            draft_presence=getattr(drafter, "draft_presence", None),
+            host_capacity=(
+                (cap * width, 2 * cap) if envs.ATOM_MTP_VERIFY_HOST_HANDOFF else None
+            ),
+        )
+
+    def _verify_epilogue_max_bs(self) -> int:
+        """The largest running batch a verify can have (a padded graph size
+        too), which sizes the epilogue's one compiled variant."""
+        sizes = self.config.compilation_config.cudagraph_capture_sizes or []
+        return max([self.config.max_num_seqs, *sizes])
+
+    def _fused_verify_epilogue(
+        self,
+        batch: ScheduledBatch,
+        metadata,
+        target_logits: torch.Tensor | None,
+        target_token_ids: torch.Tensor | None,
+        bonus_token_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        tokens_tp_synced: bool,
+    ):
+        """ATOM_MTP_FUSED_VERIFY_EPILOGUE: ``(sampled tokens, verdict, next anchor
+        ids, host slots or None)`` of a verify whose target tokens are sampled
+        ids, from one kernel (`verify_epilogue`): the rejection, the presence
+        marks, the next-anchor gather and, for the drafter's `propose`
+        (`verify_epilogue_targets`), step 0's staging and the draft presence
+        reset; with ATOM_MTP_VERIFY_HOST_HANDOFF the output rows and status go
+        straight into pinned host slots. None where the eager chain stays."""
+        if (
+            target_logits is not None
+            or target_token_ids is None
+            or batch.is_dummy_run
+            or self.rejection_sampler.synthetic_acceptance_rates is not None
+            or get_pcp_world_size() > 1
+            or (get_tp_group().world_size > 1 and not tokens_tp_synced)
+        ):
+            return None
+        from atom.model_ops.verify_epilogue import VerifyHandoff, verify_epilogue
+
+        bs = batch.total_seqs_num
+        S = metadata.num_spec_steps
+        max_bs = self._verify_epilogue_max_bs()
+        if not 1 <= bs <= max_bs or metadata.cu_num_draft_tokens.numel() != bs:
+            return None
+        proc = self.tokenID_processor
+        drafter = getattr(self, "drafter", None)
+        context = get_forward_context().context
+        # The drafter runs right after, from these next ids unless the
+        # scheduler overrides some (`batch.next_token_ids`).
+        hands_off = (
+            proc.is_deferred_out
+            and drafter is not None
+            and batch.next_token_ids is None
+        )
+        stage = draft_presence = None
+        if hands_off:
+            stage, draft_presence = drafter.verify_epilogue_targets(
+                proc.input_ids.gpu[1 : batch.total_tokens_num + 1],
+                context.positions,
+                hidden_states,
+            )
+            if stage is not None and stage["running_bs"] > max_bs:
+                stage = None
+        host = None
+        if (
+            envs.ATOM_MTP_VERIFY_HOST_HANDOFF
+            and proc.is_deferred_out
+            and drafter is not None
+            and not any(batch.return_logprobs)
+        ):
+            host = proc.claim_verify_handoff(bs, S + 1)
+        step = self._presence_step
+        if step is not None:
+            step._mark_anchors()
+        num_draft = metadata.num_draft_tokens_np
+        out, verdict, nxt = verify_epilogue(
+            target_token_ids,
+            bonus_token_ids.reshape(-1),
+            metadata,
+            max_bs=max_bs,
+            presence_step=step,
+            draft_presence=draft_presence,
+            draft_presence_bs=context.scheduled_bs,
+            stage=stage,
+            host=host,
+            uniform=bool(
+                len(num_draft) == bs
+                and (num_draft == S).all()
+                and batch.total_tokens_num == bs * (S + 1)
+            ),
+        )
+        if stage is not None or draft_presence is not None:
+            drafter.verify_handoff = VerifyHandoff(
+                stage["staged"] if stage is not None else None,
+                draft_presence is not None,
+            )
+        return out, verdict, nxt, host
+
     _glue_sampler = None
 
     def _glue_step_sample(self, cands, metadata, temperatures, top_k, top_ps):
@@ -3698,10 +3854,14 @@ class ModelRunner:
         bs = batch.total_seqs_num
         # Set when the sampled tokens are already identical on every TP rank.
         tokens_tp_synced = False
-        # ATOM_GLUE_STEP_SAMPLE's kernel: the next anchors it wrote, and whether it
-        # already marked the presence mask
+        # ATOM_GLUE_STEP_SAMPLE's kernel or the fused verify epilogue
+        # (ATOM_MTP_FUSED_VERIFY_EPILOGUE): the next anchors it wrote, and whether
+        # it already marked the presence mask
         glue_next = None
         glue = None
+        # ATOM_MTP_VERIFY_HOST_HANDOFF: the pinned slots the epilogue filled with
+        # the output rows and the status, in place of their D2H copies
+        handoff_slots = None
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3800,6 +3960,19 @@ class ModelRunner:
                     all_greedy=all_greedy,
                     needs_independent_noise=needs_independent_noise or not all_greedy,
                 )
+            if glue is None and envs.ATOM_MTP_FUSED_VERIFY_EPILOGUE:
+                epilogue = self._fused_verify_epilogue(
+                    batch,
+                    spec_decode_metadata,
+                    target_logits,
+                    target_token_ids,
+                    bonus_token_ids,
+                    hidden_states,
+                    tokens_tp_synced,
+                )
+                if epilogue is not None:
+                    sampled_tokens, verdict, glue_next, handoff_slots = epilogue
+                    glue = epilogue[:3]
             if glue is None:
                 sampled_tokens, verdict = self.rejection_sampler.forward(
                     spec_decode_metadata,
@@ -3842,11 +4015,17 @@ class ModelRunner:
             if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
-        self.forward_done_event.record()
+        if handoff_slots is None:
+            # What the D2H copies wait for; the host hand-off needs no event.
+            self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
         token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
-            batch, sampled_tokens, self.forward_done_event, sampled_logprobs
+            batch,
+            sampled_tokens,
+            self.forward_done_event,
+            sampled_logprobs,
+            host_slot=handoff_slots[0] if handoff_slots is not None else None,
         )
         # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
         req_ids_out = [k for k in token_id_dict if k != -1]
@@ -3857,9 +4036,14 @@ class ModelRunner:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
                 prev_bonus_num = self.tokenID_processor.prev_bonus_num
-                self.tokenID_processor.spec_status_queue.send(
-                    spec_counts, ready=self.forward_done_event
-                )
+                if handoff_slots is not None:
+                    self.tokenID_processor.spec_status_queue.send_direct(
+                        handoff_slots[1]
+                    )
+                else:
+                    self.tokenID_processor.spec_status_queue.send(
+                        spec_counts, ready=self.forward_done_event
+                    )
                 if glue_next is not None:
                     next_token_ids = glue_next
                 else:
@@ -4694,6 +4878,8 @@ class ModelRunner:
                     ),
                     end_draft_trace if prof is not None else None,
                 )
+                if envs.ATOM_MTP_FUSED_VERIFY_EPILOGUE:
+                    self._warm_verify_epilogue()
             self._record_prefill_graphs()
         self.capture_sizes.sort()
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)

@@ -337,6 +337,18 @@ class Drafter(abc.ABC):
         them from its own buffers via ``aux_for`` — ModelRunner passes none.
         """
 
+    def verify_epilogue_targets(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+    ) -> tuple[dict | None, object | None]:
+        """What the runner's fused verify epilogue (ATOM_MTP_FUSED_VERIFY_EPILOGUE)
+        may write for this step's `propose`, which then skips it: step 0's staging
+        (`verify_epilogue.verify_epilogue`'s ``stage``) and the draft presence
+        penalty to reset. Default: neither."""
+        return None, None
+
     # ---- capability surface (typed replacements for flavor probes) ----
     @property
     def is_block_drafter(self) -> bool:
