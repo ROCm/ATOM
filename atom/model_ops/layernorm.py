@@ -29,10 +29,13 @@ from atom.config import QuantizationConfig
 from atom.model_ops.moe_tail_norm import (
     MoEGatedSum,
     MoENormed,
+    can_fuse_gather_tail,
     can_fuse_moe_tail,
     gated_sum,
+    moe_gather_tail_rmsnorm,
     moe_tail_rmsnorm,
     moe_tail_rmsnorm_rows,
+    resolve_gathered,
 )
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
@@ -818,19 +821,51 @@ def gluon_gemm_ar_init() -> None:
         _gluon_gemm_ar_state = (group, *all_reduce_init(group, 1 << 20))
 
 
+@functools.lru_cache(maxsize=1)
+def gluon_gemm_ar_gathers_residual() -> bool:
+    """Whether aiter's GEMM + all-reduce + RMSNorm takes `residual_rows`."""
+    if not _gluon_gemm_ar_in_aiter():
+        return False
+    from aiter.ops.triton.comms.fused.gemm_a16w16_all_reduce_rmsnorm import (
+        gemm_a16w16_all_reduce_rmsnorm,
+    )
+
+    params = inspect.signature(gemm_a16w16_all_reduce_rmsnorm).parameters
+    return "residual_rows" in params
+
+
 def _gluon_gemm_allreduce_gemma_rmsnorm_fake(
-    x: Tensor, w: Tensor, residual: Tensor, weight: Tensor, eps: float
+    x: Tensor,
+    w: Tensor,
+    residual: Tensor,
+    weight: Tensor,
+    eps: float,
+    residual_rows: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
-    return torch.empty_like(residual), torch.empty_like(residual)
+    shape = (x.shape[0], residual.shape[1])
+    return residual.new_empty(shape), residual.new_empty(shape)
 
 
 @torch_compile_guard(gen_fake=_gluon_gemm_allreduce_gemma_rmsnorm_fake)
 def gluon_gemm_allreduce_gemma_rmsnorm(
-    x: Tensor, w: Tensor, residual: Tensor, weight: Tensor, eps: float
+    x: Tensor,
+    w: Tensor,
+    residual: Tensor,
+    weight: Tensor,
+    eps: float,
+    residual_rows: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Returns the Gemma RMSNorm of residual + all-reduce(x @ w.T), and that sum: a
     bf16 o_proj / out_proj (w is the (hidden, K) part of this rank) and the norm after
-    it, in one aiter kernel up to 128 tokens."""
+    it, in one aiter kernel up to 128 tokens.
+
+    `residual_rows` (the MTP drafter's step-0 rows, ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ):
+    row r of x adds residual row residual_rows[r], gathered by the kernel."""
+    if residual_rows is not None and (
+        x.shape[0] > _GLUON_GEMM_AR_MAX_TOKENS or not gluon_gemm_ar_gathers_residual()
+    ):
+        residual = torch.index_select(residual, 0, residual_rows)
+        residual_rows = None
     if x.shape[0] > _GLUON_GEMM_AR_MAX_TOKENS:
         from aiter.tuned_gemm import tgemm
 
@@ -842,8 +877,125 @@ def gluon_gemm_allreduce_gemma_rmsnorm(
         gemm_a16w16_all_reduce_rmsnorm,
     )
 
+    if residual_rows is None:
+        return gemm_a16w16_all_reduce_rmsnorm(
+            x, w, residual, weight, eps, True, *_gluon_gemm_ar_state
+        )
     return gemm_a16w16_all_reduce_rmsnorm(
-        x, w, residual, weight, eps, True, *_gluon_gemm_ar_state
+        x,
+        w,
+        residual,
+        weight,
+        eps,
+        True,
+        *_gluon_gemm_ar_state,
+        residual_rows=residual_rows,
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _gluon_ar_norm_takes_gated_input() -> bool:
+    """Whether aiter's Gluon all-reduce + RMSNorm reads `x + sigmoid(gate) *
+    shared` itself (`shared` / `gate`)."""
+    try:
+        from aiter.ops.triton.comms.fused.all_reduce_rmsnorm_quant import (
+            all_reduce_rmsnorm_quant,
+        )
+    except ImportError:
+        return False
+    return "shared" in inspect.signature(all_reduce_rmsnorm_quant).parameters
+
+
+def fused_allreduce_moe_tail_supported() -> bool:
+    """Whether a TP-partial MoEGatedSum can go into the all-reduce + RMSNorm kernel
+    (ATOM_FUSED_MOE_TAIL_AR_NORM): gfx1250 at TP4 with aiter's Gluon all-reduce
+    + RMSNorm (ATOM_ENABLE_GLUON_FUSED_AR) and its gated input."""
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return (
+        envs.ATOM_ENABLE_GLUON_FUSED_AR
+        and get_gfx() == "gfx1250"
+        and get_tensor_model_parallel_world_size() == 4
+        and _gluon_ar_norm_takes_gated_input()
+    )
+
+
+def _gluon_ar_gated_state(routed: Tensor, shared: Tensor, gate: Tensor | None):
+    """The TP group and the Gluon all-reduce + RMSNorm inboxes when the kernel can
+    take these inputs, else None. The inboxes are the TP communicator's own, for
+    this same kernel: its calls keep the order of all the other fused calls."""
+    from aiter.dist.device_communicators import communicator_cuda
+    from aiter.dist.parallel_state import get_tp_group
+
+    tp = get_tp_group()
+    state = getattr(tp.device_communicator, "gluon_ar", None)
+    hidden = routed.shape[-1]
+    if (
+        state is None
+        or gate is None
+        or routed.dim() != 2
+        or routed.numel() * routed.element_size()
+        > getattr(communicator_cuda, "_GLUON_AR_MAX_BYTES", 0)
+        or hidden < 256
+        or hidden & (hidden - 1)
+        or routed.dtype != torch.bfloat16
+        or shared.dtype != torch.bfloat16
+        or gate.dtype != torch.bfloat16
+        or shared.shape != routed.shape
+        or gate.shape != (routed.shape[0], 1)
+        or not routed.is_contiguous()
+        or not shared.is_contiguous()
+    ):
+        return None
+    return tp.cpu_group, state
+
+
+def _fused_allreduce_moe_tail_fake(
+    routed: Tensor,
+    shared: Tensor,
+    gate: Tensor | None,
+    residual: Tensor,
+    weight: Tensor,
+    eps: float,
+) -> tuple[Tensor, Tensor]:
+    return torch.empty_like(residual), torch.empty_like(residual)
+
+
+@torch_compile_guard(gen_fake=_fused_allreduce_moe_tail_fake)
+def fused_allreduce_moe_tail_gemma_rmsnorm(
+    routed: Tensor,
+    shared: Tensor,
+    gate: Tensor | None,
+    residual: Tensor,
+    weight: Tensor,
+    eps: float,
+) -> tuple[Tensor, Tensor]:
+    """The Gemma RMSNorm of residual + all-reduce(routed + sigmoid(gate) *
+    shared), and that sum, for TP-partial routed / shared: the gated add in the
+    all-reduce kernel's input read (one launch), else sigmoid_mul first."""
+    found = _gluon_ar_gated_state(routed, shared, gate)
+    if found is None:
+        x = gated_sum(MoEGatedSum(routed, shared, gate))
+        return tensor_model_parallel_fused_allreduce_rmsnorm(
+            x, residual.contiguous(), weight, eps, gemma_norm=True
+        )
+    from aiter.ops.triton.comms.fused.all_reduce_rmsnorm_quant import (
+        all_reduce_rmsnorm_quant,
+    )
+
+    group, (inboxes, calls) = found
+    return all_reduce_rmsnorm_quant(
+        routed,
+        residual.contiguous(),
+        weight,
+        eps,
+        True,
+        False,
+        group,
+        inboxes,
+        calls,
+        shared=shared,
+        gate=gate,
     )
 
 
@@ -1071,6 +1223,17 @@ class GemmaRMSNorm(nn.Module):
         norm path, not the all-reduce or the FP8-quantizing one."""
         return not self.fused_allreduce and not self.use_fused_quant
 
+    @property
+    def takes_tp_partial_moe_gated_sum(self) -> bool:
+        """Whether `forward` / `forward_moe_tail` take a TP-partial `MoEGatedSum`
+        and fold its gated add into the all-reduce + RMSNorm kernel
+        (ATOM_FUSED_MOE_TAIL_AR_NORM): the bf16 all-reduce path."""
+        return (
+            self.fused_allreduce
+            and not self.use_fused_quant
+            and fused_allreduce_moe_tail_supported()
+        )
+
     def forward_moe_tail(
         self,
         moe: MoEGatedSum,
@@ -1083,7 +1246,30 @@ class GemmaRMSNorm(nn.Module):
         `write_residual=False` (a final norm, whose new residual nobody reads)
         returns the normed rows alone, and only rows `rows` when given
         (`out[i]` is row `rows[i]`); otherwise `(normed, new_residual)`.
+
+        A deferred gather (`GatheredRouted` routed, ATOM_MOE_GATHER_TAIL_NORM)
+        is reduced in the same launch where the kernel can take it, and by
+        aiter's gather-reduce first everywhere else.
         """
+        if not self.fused_allreduce and can_fuse_gather_tail(
+            moe, residual, self.weight, rows
+        ):
+            return moe_gather_tail_rmsnorm(
+                moe, residual, self.weight, self.variance_epsilon, rows, write_residual
+            )
+        moe = resolve_gathered(moe)
+        if self.fused_allreduce:
+            # TP-partial addends (ATOM_FUSED_MOE_TAIL_AR_NORM): the gated add and
+            # the all-reduce in the norm's kernel, over every row.
+            assert self.takes_tp_partial_moe_gated_sum, "cannot take a MoEGatedSum"
+            out = fused_allreduce_moe_tail_gemma_rmsnorm(
+                *moe, residual, self.weight, self.variance_epsilon
+            )
+            if write_residual:
+                assert rows is None, "a row subset has no new residual to return"
+                return out
+            out = out[0]
+            return out if rows is None else torch.index_select(out, 0, rows)
         assert self.takes_moe_gated_sum, "this norm cannot take a MoEGatedSum"
         if not can_fuse_moe_tail(moe, residual, self.weight, rows):
             out = self.forward_cuda(gated_sum(moe), residual)
@@ -1105,6 +1291,7 @@ class GemmaRMSNorm(nn.Module):
         """The MoE-tail kernel with its MXFP8 epilogue, or None where it does not apply."""
         if not isinstance(x, MoEGatedSum) or residual is None or not self.takes_moe_gated_sum:
             return None
+        x = resolve_gathered(x)
         if not can_fuse_moe_tail(x, residual, self.weight, None):
             return None
         from atom.model_ops.moe_tail_norm import moe_tail_rmsnorm_mxfp8

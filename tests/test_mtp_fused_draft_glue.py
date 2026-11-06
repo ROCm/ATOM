@@ -159,6 +159,9 @@ class _FakeDraft(nn.Module):
             meta = meta + 1
         elif fc.attn_metadata.max_seqlen_q == 1:
             meta = meta + (ctx[:n] % 13) + (self.var["cu_seqlens_q"].gpu[1 : n + 1] % 5)
+            split = getattr(fc.attn_metadata, "gfx12_token_split_tiles", None)
+            if split is not None:  # ATOM_MTP_ADVANCE_TOKEN_SPLIT
+                meta = meta + split[0] % 7
         else:
             meta = meta + (ctx[torch.arange(n, device="cuda") // Q] % 7)
         return x + meta.to(torch.bfloat16)[:, None]
@@ -173,7 +176,7 @@ class _Env:
     """A GDN builder over `forward_vars`, an `EagleProposer` with both passes
     declared and recorded, and a forward context the way `propose` finds it."""
 
-    def __init__(self, sizes):
+    def __init__(self, sizes, token_split=False):
         import atom.utils.forward_context as fctx
         from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
 
@@ -240,6 +243,13 @@ class _Env:
                 "last_token_indices": StagedInput(dtype=torch.int64),
             },
         ).bind(p.config, "cuda")
+        if token_split:
+            from atom.spec_decode.eagle_fused_glue import DraftTokenSplit
+
+            # aiter's defaults (AITER_GFX12_TOKEN_SPLIT_PROGRAMS / MIN / MAX).
+            p._token_split = DraftTokenSplit(
+                torch.zeros(1, **i32), BLOCK, 1, 2048, 32, 256
+            )
         self.p, self.builder = p, b
         with torch.cuda.stream(self.stream):
             for bs in sizes:
@@ -393,6 +403,7 @@ class _Env:
                 last_token_indices=st["anchors"],
             )
             indptr = var["kv_indptr"].gpu[: rbs + 1].clone()
+            split = getattr(self.p, "_token_split", None)
             snap = {
                 "draft_ids": out.clone(),
                 "context_lens": var["context_lens"].gpu.clone(),
@@ -415,6 +426,8 @@ class _Env:
                     ctx.is_prefill,
                 ),
             }
+            if split:
+                snap["token_split"] = split.tiles.clone()
             if not st["prefill"]:
                 snap["step0_inputs"] = [
                     self.p.step0.buffer(r, rbs).clone()
@@ -543,3 +556,81 @@ def test_warmup_compiles_every_variant_serving_launches(env):
         glue._advance_draft_pass_kernel
     )
     assert after == before
+
+
+@pytest.fixture(scope="module")
+def split_env(env):
+    """`env`'s setup, with ATOM_MTP_ADVANCE_TOKEN_SPLIT on and its buffer in place
+    before the recordings, as `warmup_draft_graphs` makes it."""
+    old = os.environ.get("ATOM_MTP_ADVANCE_TOKEN_SPLIT")
+    os.environ["ATOM_MTP_ADVANCE_TOKEN_SPLIT"] = "1"
+    try:
+        yield _Env([1, 8, 16, 128], token_split=True)
+    finally:
+        if old is None:
+            os.environ.pop("ATOM_MTP_ADVANCE_TOKEN_SPLIT", None)
+        else:
+            os.environ["ATOM_MTP_ADVANCE_TOKEN_SPLIT"] = old
+
+
+@pytest.mark.parametrize("sbs,rbs", [(1, 1), (6, 8), (16, 16), (103, 128)])
+def test_the_advance_writes_the_token_split_unified_attention_would(
+    split_env, sbs, rbs
+):
+    """ATOM_MTP_ADVANCE_TOKEN_SPLIT: each pass reads the tiles per segment (the
+    stand-in draft folds them into its output) the fused advance wrote, and they
+    are what the eager advance writes and what aiter computes from seqused_k."""
+    from aiter.ops.triton.attention.unified_attention import (
+        _gfx12_token_split_tiles_torch,
+    )
+
+    st = split_env.batch(sbs * 11 + rbs, sbs, rbs)
+    eager, fused = split_env.propose(st, False), split_env.propose(st, True)
+    _assert_same(eager, fused)
+    ref = _gfx12_token_split_tiles_torch(fused["context_lens"][:rbs], 1, BLOCK)
+    assert torch.equal(fused["token_split"], ref)
+
+
+def test_the_token_split_matches_aiter_on_any_lengths():
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    from aiter.ops.triton.attention.unified_attention import (
+        _gfx12_token_split_tiles_torch,
+    )
+
+    from atom.spec_decode.eagle_fused_glue import DraftTokenSplit
+
+    g = torch.Generator(device="cuda").manual_seed(3)
+    for rows, hi, tile, heads in [
+        (1, 10, 64, 1),
+        (16, 300000, 128, 1),
+        (160, 70000, 128, 2),
+        (64, 5, 16, 4),
+    ]:
+        lens = torch.randint(
+            0, hi, (rows,), generator=g, device="cuda", dtype=torch.int32
+        )
+        split = DraftTokenSplit(
+            torch.zeros(1, dtype=torch.int32, device="cuda"), tile, heads, 2048, 32, 256
+        )
+        split.write(lens)
+        assert torch.equal(
+            split.tiles, _gfx12_token_split_tiles_torch(lens, heads, tile)
+        )
+
+
+@pytest.mark.parametrize("sbs,rbs", [(6, 8), (103, 128)])
+def test_skipping_kv_indices_changes_nothing_else(env, sbs, rbs, monkeypatch):
+    """ATOM_MTP_SKIP_DRAFT_KV_INDICES: the fused advance leaves kv_indices
+    unwritten and everything else as the eager path does."""
+    st = env.batch(sbs * 13 + rbs, sbs, rbs)
+    eager = env.propose(st, False)
+    monkeypatch.setenv("ATOM_MTP_SKIP_DRAFT_KV_INDICES", "1")
+    env.p._gen_kv_indices = False  # draft_reads_kv_indices: page 64, unified
+    try:
+        fused = env.propose(st, True)
+    finally:
+        del env.p._gen_kv_indices
+    assert not fused["kv_indices"].any()
+    eager.pop("kv_indices"), fused.pop("kv_indices")
+    _assert_same(eager, fused)

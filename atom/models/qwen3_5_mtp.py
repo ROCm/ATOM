@@ -28,6 +28,7 @@ from atom.model_ops.utils import atom_parameter
 from atom.models.qwen3_5 import (
     Qwen3_5DecoderLayer,
     Qwen3_5RMSNorm,
+    allreduce_norm_fusion_enabled,
     get_qwen3_5_text_config,
 )
 from atom.models.qwen3_next import defer_moe_gated_sums
@@ -41,6 +42,11 @@ logger = logging.getLogger("atom")
 
 # Up to here (decode and draft steps) the replicated fc runs whole on each rank.
 _REPLICATED_FC_MAX_TOKENS = 1024
+# ATOM_MTP_FUSED_FC_NORM: the fused norm + fc kernel up to this many rows; it
+# is slower than the norm kernel + fc GEMM on wider passes.
+_FUSED_FC_NORM_MAX_ROWS = 32
+# Rows of the embedding normed per launch when the normed table is built.
+_NORMED_EMBED_CHUNK = 8192
 
 
 def _dual_norm_inputs_ok(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -91,13 +97,25 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         )
         self.dual_pre_fc_norm = envs.ATOM_MTP_DUAL_PRE_FC_NORM
         self.fused_embed_pre_fc_norm = envs.ATOM_MTP_FUSED_EMBED_PRE_FC_NORM
+        # ATOM_MTP_FUSED_FC_NORM: pre_fc_norm_embedding of the whole embedding
+        # table, built by build_normed_embedding once the table is final.
+        self.normed_embedding: torch.Tensor | None = None
 
+        # ATOM_MTP_FUSE_ALLREDUCE_NORM: the target's all-reduce fusions. o_proj,
+        # its all-reduce and post_attention_layernorm in one kernel, and the MoE
+        # output's all-reduce in the final norm. The layer's input (the fc
+        # output) is complete on every rank, so its input norm does not reduce.
+        fuse_allreduce_norm = (
+            envs.ATOM_MTP_FUSE_ALLREDUCE_NORM and allreduce_norm_fusion_enabled()
+        )
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
                 atom_config,
                 layer_type="full_attention",
                 prefix=f"{prefix}.layers.{idx}",
                 layer_num=idx,
+                fuse_allreduce_norm=fuse_allreduce_norm,
+                input_is_reduced=True,
             )
             for idx in range(
                 self.mtp_start_layer_idx,
@@ -105,7 +123,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             )
         )
 
-        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3_5RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=fuse_allreduce_norm,
+        )
         self.pre_fc_norm_hidden = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -116,11 +138,109 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         # is 1 for every Qwen3.5 checkpoint; with more, each still feeds `norm`).
         # The final norm covers only the rows the head reads (select_rows),
         # which the combine's tail does not: it stays the tail kernel's.
+        # ATOM_MTP_MONO_MOE: the drafter's MoE block and the final norm after it
+        # in the target's fused TP4 kernel (ATOM_QWEN_MONO_MOE: router, top-k,
+        # experts, shared expert, gated add, all-reduce, residual add, norm).
+        # It needs the final norm to all-reduce (ATOM_MTP_FUSE_ALLREDUCE_NORM).
+        # Before defer_moe_gated_sums, which it otherwise refuses: a step the
+        # fused kernel declines (prefill, > 128 rows) runs the deferred path.
+        # The one MTP layer is index 0 here, so it writes the kernel's parity-0
+        # output and leaves the target's last layer's (parity 1) alone.
+        if envs.ATOM_MTP_MONO_MOE and fuse_allreduce_norm:
+            from atom.model_ops.qwen_mono_moe.integration import enable_mono_moe
+
+            enable_mono_moe(self.layers, self.norm)
         for layer in self.layers:
-            defer_moe_gated_sums([layer], self.norm, combine_tail=False)
+            defer_moe_gated_sums(
+                [layer],
+                self.norm,
+                combine_tail=False,
+                tp_partial=envs.ATOM_FUSED_MOE_TAIL_AR_NORM,
+            )
+            # Step 0 keeps its rows before o_proj (ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ),
+            # and the output gate (with that selection) goes to the attention's
+            # epilogue (ATOM_MTP_ATTN_GATE_IN_REDUCE).
+            layer.select_rows_before_o_proj = envs.ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ
+            layer.self_attn.gate_in_attention = envs.ATOM_MTP_ATTN_GATE_IN_REDUCE
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def build_normed_embedding(self) -> None:
+        """pre_fc_norm_embedding of every row of the local embedding table
+        (ATOM_MTP_FUSED_FC_NORM), by the norm kernel the default path runs, so
+        a gathered row is that path's normed row bit for bit."""
+        from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+
+        weight = self._local_embedding_weight()
+        fc_weight = getattr(self.fc, "weight", None)
+        if (
+            weight is None
+            or not (self.replicated_fc or get_tp_group().world_size == 1)
+            or self.fc.quant_type.value != QuantType.No.value
+            or getattr(fc_weight, "is_shuffled", False)
+            or weight.dtype != torch.bfloat16
+        ):
+            logger.warning(
+                "ATOM_MTP_FUSED_FC_NORM: needs a local bf16 embedding table and "
+                "the replicated bf16 fc; keeping the unfused fc"
+            )
+            return
+        table = torch.empty_like(weight)
+        norm = self.pre_fc_norm_embedding
+        for start in range(0, weight.shape[0], _NORMED_EMBED_CHUNK):
+            rows = slice(start, start + _NORMED_EMBED_CHUNK)
+            fused_qk_rmsnorm_group_quant(
+                q=weight[rows],
+                q_weight=norm.weight.data,
+                q_epsilon=norm.variance_epsilon,
+                q_out_unquantized=table[rows],
+                gemma_norm=True,
+            )
+        self.normed_embedding = table
+        logger.info(
+            "Qwen3.5 MTP: normed embedding table for the fused fc (%d x %d)",
+            table.shape[0],
+            table.shape[1],
+        )
+
+    def _fused_fc_norm(
+        self, input_ids: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor | None:
+        """fc(cat(norm_e(embed[ids]), norm_h(hidden))) in one launch
+        (ATOM_MTP_FUSED_FC_NORM), or None where it does not apply."""
+        from aiter.ops.triton.gemm.fused.fused_rmsnorm_gemm_a16w16 import (
+            fused_rmsnorm_gemm_a16w16,
+            fused_rmsnorm_gemm_a16w16_supported,
+        )
+
+        rows = hidden_states.shape[0]
+        weight = self.fc.weight
+        if not (
+            0 < rows <= _FUSED_FC_NORM_MAX_ROWS
+            and input_ids.dim() == 1
+            and input_ids.shape[0] == rows
+            and input_ids.dtype == torch.int32
+            and input_ids.is_contiguous()
+            and hidden_states.dim() == 2
+            and hidden_states.dtype == weight.dtype
+            and hidden_states.stride(-1) == 1
+            and fused_rmsnorm_gemm_a16w16_supported(
+                rows, weight.shape[0], hidden_states.shape[1], 2, weight.dtype
+            )
+        ):
+            return None
+        hnorm = self.pre_fc_norm_hidden
+        return fused_rmsnorm_gemm_a16w16(
+            self.normed_embedding,
+            weight,
+            None,
+            None,
+            hidden_states,
+            hnorm.weight.data,
+            hnorm.variance_epsilon,
+            row_index=input_ids,
+        )
 
     def _fc(self, x: torch.Tensor) -> torch.Tensor:
         if not self.replicated_fc:
@@ -210,10 +330,15 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         """The final-normed hidden states, of rows `select_rows` only when
         given (`out[i]` is row `select_rows[i]`, as `index_select` picks them)."""
-        fc_input = None
-        if inputs_embeds is None and self.fused_embed_pre_fc_norm:
+        fc_input = fc_out = None
+        if inputs_embeds is None and self.normed_embedding is not None:
+            # ATOM_MTP_FUSED_FC_NORM: the norms and the fc in one launch.
+            fc_out = self._fused_fc_norm(input_ids, hidden_states)
+        if fc_out is None and inputs_embeds is None and self.fused_embed_pre_fc_norm:
             fc_input = self._embed_pre_fc_norms(input_ids, hidden_states)
-        if fc_input is not None:
+        if fc_out is not None:
+            pass
+        elif fc_input is not None:
             hidden_states = fc_input
         else:
             if inputs_embeds is None:
@@ -227,7 +352,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                 inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
                 hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-        hidden_states = self._fc(hidden_states)
+        hidden_states = fc_out if fc_out is not None else self._fc(hidden_states)
         residual = None
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
@@ -346,11 +471,16 @@ class Qwen3_5MTP(nn.Module):
         Runs after the drafter shared the target's embed, so it is whatever the
         draft really reads. The table is all-gathered from the sharded copy
         rather than re-read from the checkpoint, so the replicated rows are
-        those very bits. A no-op with the flag off.
+        those very bits. Then, with ATOM_MTP_FUSED_FC_NORM, the normed copy of
+        the final table for the fused fc. A no-op with both flags off.
         """
         tp = get_tp_group()
-        if not (envs.ATOM_QWEN35_MTP_REPLICATED_EMBED and tp.world_size > 1):
-            return
+        if envs.ATOM_QWEN35_MTP_REPLICATED_EMBED and tp.world_size > 1:
+            self._replicate_embedding(tp)
+        if envs.ATOM_MTP_FUSED_FC_NORM:
+            self.model.build_normed_embedding()
+
+    def _replicate_embedding(self, tp) -> None:
         sharded = self.model.embed_tokens
         assert isinstance(sharded, VocabParallelEmbedding), type(sharded)
         full = tp.all_gather(sharded.weight.data, dim=0)

@@ -292,7 +292,12 @@ class EagleProposer(Drafter):
         )
 
     def _stage_step0(
-        self, running_bs, scheduled_bs, input_ids, positions, hidden_states,
+        self,
+        running_bs,
+        scheduled_bs,
+        input_ids,
+        positions,
+        hidden_states,
         last_token_indices,
     ):
         """Copy the verify stream into the step-0 pass's buffers as flat rows.
@@ -576,6 +581,8 @@ class EagleProposer(Drafter):
             restore()
             return build_context(**kwargs)
 
+        if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT:
+            self._draft_token_split()  # its buffer, before any capture
         try:
             super().warmup_draft_graphs(build_pristine_context, end_trace)
         finally:
@@ -590,6 +597,11 @@ class EagleProposer(Drafter):
                 ids_dtype=self.step.buffer("input_ids", 0).dtype,
                 query_width=self.mtp_k + 1,
                 max_bs=self.config.max_num_seqs,
+                token_split=(
+                    self._draft_token_split()
+                    if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT
+                    else None
+                ),
             )
 
     def _step_warmup_inputs(self, running_bs, **staged):
@@ -786,6 +798,14 @@ class EagleProposer(Drafter):
             num_reject_tokens=num_reject_tokens,
             **mtp_decode_kwargs,
         )
+        token_split = (
+            self._draft_token_split() if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT else None
+        )
+        if token_split is not None:
+            # The value the fused advance writes, so that a recording made from
+            # here (warmup) reads the same buffer a served pass does.
+            token_split.write(attn_metadata.context_lens[:running_bs])
+            workinfos["gfx12_token_split_tiles"] = token_split.metadata()
         for k, v in workinfos.items():
             attn_metadata.__dict__[k] = v
         return workinfos
@@ -806,6 +826,10 @@ class EagleProposer(Drafter):
 
         forward_context = get_forward_context()
         context = forward_context.context
+        # A mid-step's token split (ATOM_MTP_ADVANCE_TOKEN_SPLIT) is installed by
+        # the advance that precedes it; none may reach step 0 from a last step.
+        if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT:
+            forward_context.attn_metadata.__dict__.pop("gfx12_token_split_tiles", None)
         if self._fused_glue_applies(context):
             return self._propose_fused_glue(
                 target_token_ids,
@@ -909,9 +933,11 @@ class EagleProposer(Drafter):
                     running_tokens=(
                         running_bs
                         if i
-                        else running_bs * (self.mtp_k + 1)
-                        if step0_graphed
-                        else input_ids.shape[0]
+                        else (
+                            running_bs * (self.mtp_k + 1)
+                            if step0_graphed
+                            else input_ids.shape[0]
+                        )
                     ),
                     # Only a widened pass runs a height the group agreed on.
                     running_tokens_are_unified=(
@@ -1178,6 +1204,39 @@ class EagleProposer(Drafter):
             and not _pcp_active_for_draft_model(self.model)
         )
 
+    def _draft_token_split(self):
+        """ATOM_MTP_ADVANCE_TOKEN_SPLIT's `DraftTokenSplit`, made once (outside
+        a capture: `warmup_draft_graphs` asks first), or None."""
+        split = getattr(self, "_token_split", False)
+        if split is False:
+            split = None
+            if self._fused_glue_deployment_applies():
+                from atom.spec_decode.eagle_fused_glue import draft_token_split
+
+                split = draft_token_split(
+                    self.runner.attn_metadata_builder, self.device
+                )
+                if split is not None:
+                    logger.info(
+                        "MTP draft token split: written by the advance kernel "
+                        "(tile %d, %d KV heads)",
+                        split.tile,
+                        split.heads,
+                    )
+            self._token_split = split
+        return split
+
+    def _draft_kv_indices(self) -> bool:
+        """Whether the fused advance generates kv_indices (see
+        ATOM_MTP_SKIP_DRAFT_KV_INDICES)."""
+        gen = getattr(self, "_gen_kv_indices", None)
+        if gen is None:
+            from atom.spec_decode.eagle_fused_glue import draft_reads_kv_indices
+
+            gen = draft_reads_kv_indices(self.runner.attn_metadata_builder)
+            self._gen_kv_indices = gen
+        return gen
+
     def _propose_fused_glue(
         self,
         target_token_ids: torch.Tensor,
@@ -1363,6 +1422,15 @@ class EagleProposer(Drafter):
                     num_reject_tokens=num_reject_tokens if i == 0 else None,
                     positions_src=positions_src if i == 0 else None,
                     anchors=last_token_indices if i == 0 else None,
+                    token_split=(
+                        self._draft_token_split()
+                        if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT
+                        else None
+                    ),
+                    kv_indices=(
+                        not envs.ATOM_MTP_SKIP_DRAFT_KV_INDICES
+                        or self._draft_kv_indices()
+                    ),
                 )
                 for k, v in workinfos.items():
                     attn_metadata.__dict__[k] = v
