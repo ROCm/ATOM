@@ -1,4 +1,5 @@
 import logging
+import math
 from functools import partial
 
 import numpy as np
@@ -166,7 +167,9 @@ class DraftKvBuilder(PoolRowsMixin):
     the block pass to address the pool by.
     """
 
-    def __init__(self, model_runner, make_pool, window: DraftWindowGeometry = None):
+    def __init__(
+        self, model_runner, make_pool, window: DraftWindowGeometry | None = None
+    ):
         self.model_runner = model_runner
         self._make_pool = make_pool
         self._kv_pool = None
@@ -218,7 +221,8 @@ class DraftKvBuilder(PoolRowsMixin):
         if self.window is None:
             return [page_pool(self.kv_pool.entry_bytes)]
         per_req = self.window.blocks_per_req
-        cached = round(
+        # Rounded up, so a fraction of a window per slot still keeps one.
+        cached = math.ceil(
             envs.ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE
             * self.model_runner.config.max_num_seqs
         )
@@ -227,7 +231,7 @@ class DraftKvBuilder(PoolRowsMixin):
                 DRAFT_WINDOW_CLASS,
                 self.kv_pool.entry_bytes,
                 entries_per_req=per_req,
-                extra_entries=max(0, cached) * per_req,
+                extra_entries=cached * per_req,
             )
         ]
 

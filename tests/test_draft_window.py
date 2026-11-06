@@ -428,6 +428,39 @@ def test_the_windowed_pool_is_a_state_class_sized_to_the_running_windows():
     assert builder.paged_pool_bytes(1000) == 0
 
 
+def _sized_builder(max_num_seqs):
+    runner = SimpleNamespace(
+        config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        attn_metadata_builder=SimpleNamespace(block_size=4),
+    )
+    builder = DraftKvBuilder(runner, make_pool=None, window=SMALL)
+    builder._kv_pool = SimpleNamespace(entry_bytes=1000)
+    return builder
+
+
+@pytest.mark.parametrize(
+    "ratio, max_num_seqs, windows",
+    [("1", 8, 8), ("0.25", 8, 2), ("0.3", 8, 3), ("0.5", 1, 1), ("0", 8, 0)],
+)
+def test_the_window_cache_rounds_up_to_whole_windows(
+    monkeypatch, ratio, max_num_seqs, windows
+):
+    """A fraction of a window per slot still keeps one: rounding half to even
+    would have dropped the only cached window at 0.5 x 1 slot."""
+    monkeypatch.setenv("ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE", ratio)
+    (spec,) = _sized_builder(max_num_seqs).sub_pool_specs()
+    assert spec.extra_entries == windows * SMALL.blocks_per_req
+
+
+@pytest.mark.parametrize("ratio", ["nan", "inf", "-1", "many"])
+def test_a_window_cache_that_is_not_a_finite_nonnegative_number_is_refused(
+    monkeypatch, ratio
+):
+    monkeypatch.setenv("ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE", ratio)
+    with pytest.raises(ValueError, match="ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE"):
+        _sized_builder(8).sub_pool_specs()
+
+
 @pytest.mark.parametrize(
     "overrides, why",
     [

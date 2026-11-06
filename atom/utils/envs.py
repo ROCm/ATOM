@@ -700,8 +700,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # `--max-num-seqs` slot, so a finished request's window is still there
     # when its next turn hits the prefix cache. A hit whose window is gone
     # recomputes up to one window instead.
-    "ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE": lambda: float(
-        os.getenv("ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE", "1")
+    "ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE": lambda: _finite_float_env(
+        "ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE", 1.0, allow_zero=True
     ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
