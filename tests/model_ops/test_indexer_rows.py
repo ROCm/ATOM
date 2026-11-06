@@ -97,6 +97,62 @@ def test_recorded_fp4_bands_keep_their_launch_arguments_in_place():
     assert second[1].tolist() == [0] * 4 + [1, 2, 3] + [3] * 4
 
 
+def test_concat_rows_band_within_the_plane_at_its_row_pitch():
+    """FP8 prefill rows cut to a workspace band at `concat_plane_width`, the
+    pitch aiter pads a plane to, and carry the plane to the scorer."""
+    keys = rows_module.ConcatKeys(None, None, 1000, None)
+    pitch = chunk.concat_plane_width(1000)
+    assert pitch == 1024
+    plane = LogitsWorkspace(3 * pitch, "cpu")
+    rows = rows_module.concat_rows(
+        torch.zeros(10, dtype=torch.int32), keys, workspace=plane
+    )
+    assert _covers(rows.bands, 0, 10)
+    assert max(e - b for b, e in rows.bands) == 3
+    assert rows.workspace is plane
+    # Without one, the logits budget alone bands them and nothing is carried.
+    rows = rows_module.concat_rows(torch.zeros(10, dtype=torch.int32), keys)
+    assert rows.bands == ((0, 10),) and rows.workspace is None
+
+
+def test_concat_bands_score_into_the_plane(monkeypatch):
+    """Every band's logits are a view of the workspace plane at the band's
+    rows and the step's key count, rows `concat_plane_width` apart: nothing
+    the size of the context is allocated per band."""
+    total, count, pitch = 1000, 10, chunk.concat_plane_width(1000)
+    plane = LogitsWorkspace(3 * pitch, "cpu")
+    keys = rows_module.ConcatKeys(
+        None, None, total, torch.zeros(count, dtype=torch.int32)
+    )
+    rows = rows_module.concat_rows(
+        torch.full((count,), total, dtype=torch.int32), keys, workspace=plane
+    )
+    seen = []
+
+    def fake_logits(**kwargs):
+        logits = kwargs["logits"]
+        seen.append(logits)
+        return logits
+
+    monkeypatch.setattr(score_module, "fp8_mqa_logits", fake_logits)
+    monkeypatch.setattr(score_module, "top_k_per_row_prefill", lambda *a, **k: None)
+    base = plane.logits(1, 1).data_ptr()
+    score_module._score_concat(
+        torch.zeros(count, 1, 1),
+        torch.zeros(count, 1),
+        None,
+        rows,
+        4,
+        False,
+        torch.zeros(count, 4, dtype=torch.int32),
+        (torch.zeros(total, 1), torch.zeros(total, 1)),
+        True,
+    )
+    assert [t.shape[0] for t in seen] == [e - b for b, e in rows.bands]
+    assert all(t.shape[1] == total and t.stride() == (pitch, 1) for t in seen)
+    assert all(t.data_ptr() == base for t in seen)
+
+
 @pytest.mark.parametrize("world", [2, 4, 8])
 @pytest.mark.parametrize("count", [1, 7, 12, 4097])
 def test_row_split_bands_only_this_rank_s_rows(world, count):

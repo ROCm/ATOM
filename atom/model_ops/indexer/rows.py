@@ -15,6 +15,7 @@ from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
 
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.sparse_indexer_chunk import (
+    concat_plane_width,
     decode_band_rows,
     logits_rows,
     qsplit_rows,
@@ -43,12 +44,14 @@ class IndexCache(NamedTuple):
 class ConcatKeys(NamedTuple):
     """FP8 prefill: the step's requests' committed keys gathered end to end
     (`cu_committed` [requests + 1], `total` rows) and scored densely, row r
-    over `[row_starts[r], row_starts[r] + row_ends[r])` of them."""
+    over `[row_starts[r], row_starts[r] + row_ends[r])` of them. `workspace`:
+    where they are gathered (`ConcatKeyWorkspace`); None, allocated per step."""
 
     block_tables: torch.Tensor
     cu_committed: torch.Tensor
     total: int
     row_starts: torch.Tensor
+    workspace: Any = None
 
 
 def _check_split_group(group: str) -> None:
@@ -224,18 +227,32 @@ def fp8_rows(row_ends, width, workspace, row_tables, *, next_n=1) -> IndexRows:
     )
 
 
-def concat_rows(row_ends, keys: ConcatKeys, split: RowSplit | None = None):
-    """FP8 prefill rows against their requests' gathered keys, banded by the
-    logits budget alone: a prefill's temporaries are allocated as it runs.
-    This rank's rows of them, `split` (every row by default)."""
+def concat_rows(
+    row_ends, keys: ConcatKeys, split: RowSplit | None = None, workspace=None
+):
+    """FP8 prefill rows against their requests' gathered keys. This rank's
+    rows of them, `split` (every row by default).
+
+    With `workspace` (`LogitsWorkspace`) each band is scored into the plane,
+    as many rows as it holds at `concat_plane_width(keys.total)`. Without one,
+    banded by the logits budget alone and each band's logits allocated as it
+    is scored -- a block whose size follows the step's context, which a long
+    prefill grows chunk by chunk."""
     split = split or RowSplit.of(row_ends.shape[0])
-    band = max(1, logits_rows(split.end - split.first, keys.total))
+    if workspace is None:
+        band = max(1, logits_rows(split.end - split.first, keys.total))
+        bands = _uniform_bands(split.first, split.end, band)
+    else:
+        bands = _plane_bands(
+            split.first, split.end, concat_plane_width(keys.total), workspace
+        )
     return IndexRows(
         row_ends,
         keys.total,
-        _uniform_bands(split.first, split.end, band),
+        bands,
         split,
         concat=keys,
+        workspace=workspace,
     )
 
 

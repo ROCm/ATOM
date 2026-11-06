@@ -29,9 +29,11 @@ _EXPORTS = {
     "quantize_query": ".query",
     "quantize_query_rows": ".query",
     "score_topk": ".score",
+    "FP8_MQA_LOGITS_TAKES_OUT": ".score",
 }
 
 __all__ = [
+    "FP8_MQA_LOGITS_TAKES_OUT",
     "NATURAL",
     "PRESHUFFLE",
     "ConcatKeys",
