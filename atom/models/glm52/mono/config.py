@@ -272,10 +272,6 @@ def config_refusal(atom_config) -> str | None:
             dcp == 1 or atom_config.dcp_config.interleave_size == 1,
             "DCP interleave size above 1",
         ),
-        (
-            dcp == 1 or atom_config.dcp_config.enable_query_replication,
-            "DCP without query replication",
-        ),
         (geometry is not None, "native geometry"),
         (getattr(hf, "model_type", None) == "glm_moe_dsa", "model type"),
         (not atom_config.enable_dp_attention, "DP attention"),

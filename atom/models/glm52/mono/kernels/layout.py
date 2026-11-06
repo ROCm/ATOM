@@ -447,6 +447,18 @@ def layout(
         "_dcp_part_stride": dcp_part,
         "_bytes": 2 * region + 2 * dcp_part,
     }
+    if dcp_size > 1:
+        # Under DCP each rank computes only its own heads' q and pushes them
+        # into every peer's copy of these, at the global head index.
+        offset = symmetric["_bytes"]
+        for name, size in (
+            ("q_lat", samples * heads * KV_LORA * pair_bytes),
+            ("q_pe", samples * heads * PE_DIM * pair_bytes),
+        ):
+            symmetric[name] = offset
+            symmetric[name + "_stride"] = _align(size)
+            offset += 2 * _align(size)
+        symmetric["_bytes"] = offset
     if tiled_indexer or (with_indexer and indexer_cp):
         # Two launch slots, like the attention/FFN peer buffers. Distinct radix
         # rounds must not overwrite a histogram or threshold still being read.
@@ -489,8 +501,9 @@ def stage_tasks(
 ):
     """Return ``(stage name, task count)`` pairs in execution order.
 
-    Under DCP, ``uvl`` builds each (sample, head) partial latent once and sends
-    it to the head's owner; ``uv`` then covers only the owned heads.
+    Under DCP, ``q_b`` / ``uk`` cover only this rank's heads, ``uvl`` builds
+    each (sample, head) partial latent once and sends it to the head's owner,
+    and ``uv`` covers only the owned heads.
 
     ``split_head_merge`` folds the two head groups of an (sample, key-chunk)
     cell into one task, halving ``split``. It must be given the same value the
@@ -499,11 +512,18 @@ def stage_tasks(
     """
 
     index_ranks = index_cp_world(npes, samples, index_max_seq) if indexer_cp else 1
-    tasks = [("qkv_a", N_QKV_A), ("q_norm", samples), ("cache", 1), ("q_b", heads * (NOPE_DIM + PE_DIM) // Q_B_TILE)]
+    # q_b / uk cover this rank's own heads: under DCP the other ranks send theirs
+    local_heads = heads // dcp_size
+    tasks = [
+        ("qkv_a", N_QKV_A),
+        ("q_norm", samples),
+        ("cache", 1),
+        ("q_b", local_heads * (NOPE_DIM + PE_DIM) // Q_B_TILE),
+    ]
     if with_indexer:
         shard_q = indexer_cp and not indexer_uses_tiles(index_max_seq, indexer_cp)
         tasks += [("index_q", INDEX_Q_ROWS // INDEX_TILE // (index_ranks if shard_q else 1))]
-    tasks += [("uk", heads * KV_LORA // UK_TILE)]
+    tasks += [("uk", local_heads * KV_LORA // UK_TILE)]
     if with_indexer:
         capacity = index_cp_capacity(index_max_seq, index_ranks) if indexer_cp else index_max_seq
         tasks += [("index_score", samples * ((capacity + INDEX_KEYS_PER_TASK - 1) // INDEX_KEYS_PER_TASK))]

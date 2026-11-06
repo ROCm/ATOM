@@ -166,17 +166,27 @@ def indexer_weights(layer, cfg) -> dict[str, torch.Tensor]:
     }
 
 
-def decode_heads_w_k(impl, local_heads: int, dcp_size: int):
-    """(heads this rank decodes, their W_K and its scale). Under DCP every rank
-    decodes the DCP group's heads (query replication: the widened q_proj and
-    the group's W_K) and keeps its own for W_V / o_proj."""
-    if dcp_size == 1:
-        return local_heads, impl.W_K, impl.W_K_scale
-    need(
-        bool(getattr(impl, "qrep_enabled", False)),
-        "DCP without query replication on this layer",
+def query_weights(attn, impl, cfg, dcp_size: int):
+    """q_b and W_UK of the heads this rank computes q for: its own. Under DCP
+    the kernel receives the group's other heads from its peers (the runner
+    requires the DCP group to be the TP group); query replication widens
+    q_b_proj to the whole group, so take this rank's rows of it."""
+    q_b = attn.q_b_proj
+    if dcp_size > 1 and getattr(impl, "qrep_enabled", False):
+        q_b = impl._local_q_proj()
+    w_q_b, s_q_b = linear_ptpc_fp8(
+        q_b,
+        name="q_b_proj",
+        logical_rows=cfg.local_heads * (cfg.nope_dim + cfg.pe_dim),
+        logical_cols=cfg.q_lora,
     )
-    return local_heads * dcp_size, impl.W_K_qrep, impl.W_K_qrep_scale
+    w_uk, s_uk = _batched_fp8(
+        impl.W_K,
+        impl.W_K_scale,
+        name="W_K",
+        shape=(cfg.local_heads, cfg.kv_lora, cfg.nope_dim),
+    )
+    return w_q_b, s_q_b, w_uk, s_uk
 
 
 def _batched_fp8(
@@ -297,13 +307,9 @@ def layer_weights(
     )
 
     impl = attention_impl(layer)
-    heads, w_k, w_k_scale = decode_heads_w_k(impl, cfg.local_heads, dcp_size)
-    w_uk, s_uk = _batched_fp8(
-        w_k,
-        w_k_scale,
-        name="W_K",
-        shape=(heads, cfg.kv_lora, cfg.nope_dim),
-    )
+    # the heads this rank decodes; it computes q for its own only
+    heads = cfg.local_heads * dcp_size
+    w_q_b, s_q_b, w_uk, s_uk = query_weights(attn, impl, cfg, dcp_size)
     w_uv, s_uv = _batched_fp8(
         impl.W_V,
         impl.W_V_scale,
@@ -315,12 +321,6 @@ def layer_weights(
         name="fused_qkv_a_proj",
         logical_rows=cfg.qkv_a_rows,
         logical_cols=cfg.hidden,
-    )
-    w_q_b, s_q_b = linear_ptpc_fp8(
-        attn.q_b_proj,
-        name="q_b_proj",
-        logical_rows=heads * (cfg.nope_dim + cfg.pe_dim),
-        logical_cols=cfg.q_lora,
     )
     w_o, s_o = linear_ptpc_fp8(
         attn.o_proj,

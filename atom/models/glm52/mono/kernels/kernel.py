@@ -20,11 +20,13 @@ prepared sparse indices::
       -> MoE TP peer reduce + residual -> x_out                   (sym_ffn)
 
 Under decode context parallelism (DCP == TP4, ATOM only) every rank decodes the
-group's heads over its KV shard: ``uvl`` rebuilds each head's partial latent
-once and pushes it to the head's owner rank, ``uv`` merges the ranks' partials
-(max / sum, rank order) before W_UV, and split tasks past a rank's keys only
-publish empty statistics. This, the 64-head q_pe staging and the PTPC-after-
-merge order are ATOM's divergence from upstream FlyDSL.
+group's heads over its KV shard: ``q_b`` / ``uk`` compute the rank's own heads
+and push them into every peer's symmetric q buffer, ``uvl`` rebuilds each
+head's partial latent once and pushes it to the head's owner rank, ``uv``
+merges the ranks' partials (max / sum, rank order) before W_UV, and split
+tasks past a rank's keys only publish empty statistics. This, the 64-head q_pe
+staging and the PTPC-after-merge order are ATOM's divergence from upstream
+FlyDSL.
 
 Scheduling: every stage is a list of tasks; task ``t`` of a stage runs on CTA
 ``(stage_base + t) % 256`` and every CTA walks the stages in order.  There is
@@ -345,13 +347,15 @@ def build_glm5_monokernel(
     SHARD_INDEX_Q = indexer_cp and not TILED_INDEXER and W > 1
     CP_PARTS = index_cp_partitions(index_max_seq, CP_RANKS) if TILED_INDEXER else 0
     N_SPLIT = topk // SPLIT_KEYS
-    QB_ROWS = H * (NOPE_DIM + PE_DIM)
+    # q_b / uk run this rank's L heads; under DCP every rank pushes its q into
+    # each peer's symmetric copy (``q_lat`` / ``q_pe``) at the global head
+    QB_ROWS = L * (NOPE_DIM + PE_DIM)
     N_QB = QB_ROWS // Q_B_TILE
     # The index-Q row space is fixed at 256 tiles.  TP8 produces half from
     # q_b CTAs; TP4 produces all of them, one per CTA.
     assert not with_indexer or (INDEX_Q_ROWS // INDEX_TILE == BLOCKS and N_QB in (BLOCKS // 2, BLOCKS))
     QB_PER_HEAD = (NOPE_DIM + PE_DIM) // Q_B_TILE
-    N_UK = H * KV_LORA // UK_TILE
+    N_UK = L * KV_LORA // UK_TILE
     UK_PER_HEAD = KV_LORA // UK_TILE
     N_UV = H * V_DIM // UV_TILE
     O_K = L * V_DIM
@@ -515,6 +519,7 @@ def build_glm5_monokernel(
         inter=expert_inter, split_head_merge=bool(split_head_merge) and H // WAVES > 1, dcp_size=D,
         )
     )
+    assert tasks["q_b"] == N_QB and tasks["uk"] == N_UK
     acc = 0
     uv_stages = ("uvl", "uv") if D > 1 else ("uv",)
     for name in ("qkv_a", "q_norm", "cache", "q_b", "split", "uk", *uv_stages, "o", "router", "ug", "down"):
@@ -1569,6 +1574,15 @@ def build_glm5_monokernel(
         def dcp_region():
             return fx.Int64(SY["dcp"]) + fx.Int64(peer_slot) * fx.Int64(SY["_dcp_part_stride"])
 
+        def dcp_peer(p):
+            words = fx.Vector(bo.buffer_load(r_peers, fx.Int32(p) * 2, vec_width=2, dtype=T.i32))
+            return (fx.Int64(_uniform(words[1])) << 32) | fx.Int64(fx.Uint32(_uniform(words[0])))
+
+        def dcp_push_q(name, element, vals):
+            """Element ``element`` of the group-wide q buffer ``name``, on every rank."""
+            for p in range_constexpr(D):
+                put_bf(cp_buffer(name, dcp_peer(p)), element, vals, CM_SYS)
+
         def dcp_push_latent(s, head):
             """Send this rank's partial latent of (s, head) (``xs`` bf16 pairs, then
             the split max and sum in ``misc``) to the head's owner."""
@@ -1988,7 +2002,7 @@ def build_glm5_monokernel(
                     r = (tid % (Q_B_TILE // 4)) * 4
                     put_bf(
                         mb("q_nope"),
-                        (s * H + head) * NOPE_DIM + hoff + r,
+                        (s * L + head) * NOPE_DIM + hoff + r,
                         [lds_ld(outs, s * Q_B_TILE + r + j) for j in range(4)],
                     )
             else:
@@ -2000,7 +2014,10 @@ def build_glm5_monokernel(
                     x1 = lds_ld(outs, s * Q_B_TILE + pr * 2 + 1)
                     c = ld_rope(_rsrc(rope_cos), row_position(s) * (PE_DIM // 2) + i // 2)
                     sn = ld_rope(_rsrc(rope_sin), row_position(s) * (PE_DIM // 2) + i // 2)
-                    put_bf(mb("q_pe"), (s * H + head) * PE_DIM + i, [x0 * c - x1 * sn, x0 * sn + x1 * c])
+                    if const_expr(D == 1):
+                        put_bf(mb("q_pe"), (s * H + head) * PE_DIM + i, [x0 * c - x1 * sn, x0 * sn + x1 * c])
+                    else:
+                        dcp_push_q("q_pe", (s * H + rank * L + head) * PE_DIM + i, [x0 * c - x1 * sn, x0 * sn + x1 * c])
             stamp("q_b", t, 4)
 
             if const_expr(with_indexer and not SHARD_INDEX_Q):
@@ -2116,15 +2133,15 @@ def build_glm5_monokernel(
             pre = [u_uk(c) for c in range(UK_NKC)]
             hint_wait(
                 NOPE_DIM // Q_B_TILE,
-                lambda k: (mb("q_nope"), ((S - 1) * H + head) * NOPE_DIM + k * Q_B_TILE + Q_B_TILE - 1),
+                lambda k: (mb("q_nope"), ((S - 1) * L + head) * NOPE_DIM + k * Q_B_TILE + Q_B_TILE - 1),
                 mark=("uk", t),
             )
             if const_expr(attention_ptpc):
                 uk_scales = stage_x_pairs_ptpc(
-                    "q_nope", S, NOPE_DIM, lambda k: ((k // NOPE_DIM) * H + head) * NOPE_DIM + k % NOPE_DIM, group=128
+                    "q_nope", S, NOPE_DIM, lambda k: ((k // NOPE_DIM) * L + head) * NOPE_DIM + k % NOPE_DIM, group=128
                 )
             else:
-                stage_x_pairs("q_nope", S * NOPE_DIM, lambda k: ((k // NOPE_DIM) * H + head) * NOPE_DIM + k % NOPE_DIM)
+                stage_x_pairs("q_nope", S * NOPE_DIM, lambda k: ((k // NOPE_DIM) * L + head) * NOPE_DIM + k % NOPE_DIM)
             stamp("uk", t, 2)
             gpu.barrier()
             acc = run_units(u_uk, UK_NKC, UK_NKC, pre)
@@ -2145,7 +2162,10 @@ def build_glm5_monokernel(
                     if const_expr(attention_ptpc):
                         value = bf16_round(value * ptpc_scale)
                     vals.append(value)
-                put_bf(mb("q_lat"), (s * H + head) * KV_LORA + (t % UK_PER_HEAD) * UK_TILE + r0, vals)
+                if const_expr(D == 1):
+                    put_bf(mb("q_lat"), (s * H + head) * KV_LORA + (t % UK_PER_HEAD) * UK_TILE + r0, vals)
+                else:
+                    dcp_push_q("q_lat", (s * H + rank * L + head) * KV_LORA + (t % UK_PER_HEAD) * UK_TILE + r0, vals)
             stamp("uk", t, 4)
 
         # ====================== 4b. fused sparse index score + exact top-2048
@@ -3015,13 +3035,16 @@ def build_glm5_monokernel(
                 NPE = -(-PE_WORDS // THREADS)
                 tpe = fx.min(tid, PE_WORDS - 1)
                 qh0 = hg0 * QH_STRIDE if const_expr(SPLIT_QH != H) else fx.Int32(0)
+                # under DCP every rank's heads, pushed here by their uk / q_b tasks
+                q_src = mb if D == 1 else (lambda name: cp_buffer(name, sym))
                 qv = poll(
-                    [(mb("q_lat"), ((s * H + qh0) * KV_LORA + (tid + i * THREADS) * 4) // 2, 2) for i in range(NQ)]
-                    + [(mb("q_pe"), ((s * H + qh0) * PE_DIM + tpe * 4) // 2, 2)]
+                    [(q_src("q_lat"), ((s * H + qh0) * KV_LORA + (tid + i * THREADS) * 4) // 2, 2) for i in range(NQ)]
+                    + [(q_src("q_pe"), ((s * H + qh0) * PE_DIM + tpe * 4) // 2, 2)]
                     + [
-                        (mb("q_pe"), ((s * H + qh0) * PE_DIM + fx.min(tid + i * THREADS, PE_WORDS - 1) * 4) // 2, 2)
+                        (q_src("q_pe"), ((s * H + qh0) * PE_DIM + fx.min(tid + i * THREADS, PE_WORDS - 1) * 4) // 2, 2)
                         for i in range(1, NPE)
-                    ]
+                    ],
+                    "agent" if D == 1 else "system",
                 )
                 for i in range_constexpr(NQ):
                     w4 = tid + i * THREADS

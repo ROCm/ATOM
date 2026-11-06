@@ -576,8 +576,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # name in atom.models.glm52.mono.config.indexer_cp_refusal, and a refusal
     # leaves the fused indexer running exactly as it does with CP off.
     "ATOM_GLM52_INDEXER_CP": lambda: os.getenv("ATOM_GLM52_INDEXER_CP", "0") == "1",
-    # GLM-5.2 mono under DCP == TP4 (query replication on). Off by default: at
-    # 64K it measured C1 -22% but C2 +4.4% against the production DCP4 path.
+    # GLM-5.2 mono under DCP == TP4. Off by default: at 64K it measured C1 -22%
+    # but C2 +4.4% against the production DCP4 path (with every rank computing
+    # the group's 64 heads of q).
     "ATOM_GLM52_MONO_DCP": lambda: os.getenv("ATOM_GLM52_MONO_DCP", "0") == "1",
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.

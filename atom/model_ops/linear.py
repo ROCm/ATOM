@@ -1677,9 +1677,10 @@ class LinearBase(nn.Module):
         # `self`. It does NOT isolate the bytes and is not meant to: the view
         # narrows `self.weight.data`, so an in-place write to the parent -- a
         # weight sync, or `shuffle_weights`, which no longer rebinds -- is seen
-        # through it. `_local_q_proj` is the only caller and rebuilds the view on
-        # every call anyway (its `is not` guard compares two `param.data`
-        # objects, and that attribute hands back a fresh one each access).
+        # through it. `_local_q_proj` rebuilds the view on every call anyway (its
+        # `is not` guard compares two `param.data` objects, and that attribute
+        # hands back a fresh one each access); the GLM-5.2 mono kernel binds the
+        # view it got at load, so it too sees in-place writes but not a rebind.
         view._parameters = dict(self._parameters)
         view.weight = nn.Parameter(
             self.weight.data.narrow(0, start, length), requires_grad=False

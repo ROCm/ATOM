@@ -51,12 +51,16 @@ def test_dcp_equal_to_tp4_is_served(dcp_on):
     [
         ({"dcp": 2}, "DCP 2 with TP 4"),
         ({"interleave": 2}, "interleave"),
-        ({"qrep": False}, "query replication"),
     ],
 )
 def test_any_other_dcp_deployment_is_refused_by_name(dcp_on, over, why):
     refusal = config_refusal(_dcp_config(**over))
     assert refusal is not None and why in refusal
+
+
+def test_dcp_without_query_replication_is_served(dcp_on):
+    """The kernel computes q for its own heads either way."""
+    assert config_refusal(_dcp_config(qrep=False)) is None
 
 
 def test_dcp_at_tp8_is_refused(dcp_on):
@@ -202,33 +206,82 @@ def test_dcp_summaries_tile_the_peer_buffer(samples):
     n = dcp * samples * owned * DCP_SUMMARY_PAIRS
     assert seen == set(range(n))
     assert sym["_dcp_part_stride"] == n * 8
-    assert sym["_bytes"] - sym["dcp"] == 2 * n * 8
+    # two launch slots, and the q buffers start past them
+    assert sym["q_lat"] - sym["dcp"] == 2 * n * 8
 
 
 # ------------------------------------------------------- DCP query heads
-def test_dcp_decodes_the_groups_heads_with_the_replicated_w_k():
-    """Under DCP a rank's q_b / W_K cover the group's 64 heads (W_K_qrep); a
-    16-head W_K there would be refused as a shape and quietly fall back."""
-    from atom.models.glm52.mono.weights import decode_heads_w_k
+def _query_weights(monkeypatch, dcp_size, qrep):
+    """What ``query_weights`` hands the PTPC / batched-fp8 binders."""
+    from atom.models.glm52.mono import weights
+    from atom.models.glm52.mono.kernels.geometry_config import glm5_tp_config
 
+    seen = {}
+    monkeypatch.setattr(
+        weights,
+        "linear_ptpc_fp8",
+        lambda lin, **kw: seen.setdefault("q_b", (lin, kw["logical_rows"])),
+    )
+    monkeypatch.setattr(
+        weights,
+        "_batched_fp8",
+        lambda w, s, **kw: seen.setdefault("w_k", (w, kw["shape"])),
+    )
     impl = SimpleNamespace(
-        qrep_enabled=True,
+        qrep_enabled=qrep,
+        _local_q_proj=lambda: "own rows",
         W_K="w_k",
         W_K_scale="s",
         W_K_qrep="w_qrep",
         W_K_qrep_scale="sq",
     )
-    assert decode_heads_w_k(impl, 16, 4) == (64, "w_qrep", "sq")
-    assert decode_heads_w_k(impl, 16, 1) == (16, "w_k", "s")
+    attn = SimpleNamespace(q_b_proj="q_b")
+    weights.query_weights(attn, impl, glm5_tp_config(4), dcp_size)
+    return seen
 
 
-def test_dcp_without_query_replication_binds_no_weights():
-    from atom.models.glm52.mono.weights import decode_heads_w_k
-    from atom.mono.runtime.consensus import MonoUnsupported
+@pytest.mark.parametrize(
+    "dcp_size,qrep,q_b", [(4, True, "own rows"), (4, False, "q_b"), (1, False, "q_b")]
+)
+def test_q_is_computed_from_the_ranks_own_heads(monkeypatch, dcp_size, qrep, q_b):
+    """Under DCP the kernel computes q for the rank's 16 heads and receives the
+    rest from its peers: QREP's widened q_b_proj is cut to the rank's rows, and
+    W_K is the rank's own (not the group's W_K_qrep)."""
+    seen = _query_weights(monkeypatch, dcp_size, qrep)
+    assert seen["q_b"] == (q_b, 16 * 256)
+    assert seen["w_k"] == ("w_k", (16, 512, 192))
 
-    impl = SimpleNamespace(qrep_enabled=False, W_K="w_k", W_K_scale="s")
-    with pytest.raises(MonoUnsupported, match="query replication"):
-        decode_heads_w_k(impl, 16, 4)
+
+@pytest.mark.parametrize("samples", [1, 4, 8, 12])
+def test_dcp_q_b_and_uk_run_only_the_ranks_own_heads(samples):
+    from atom.models.glm52.mono.kernels.layout import stage_tasks
+
+    dcp = dict(
+        stage_tasks(
+            samples, 64, 2048, npes=4, inter=512, split_head_merge=True, dcp_size=4
+        )
+    )
+    tp4 = dict(stage_tasks(samples, 16, 2048, npes=4, inter=512, split_head_merge=True))
+    assert dcp["q_b"] == tp4["q_b"]
+    assert dcp["uk"] == tp4["uk"]
+
+
+@pytest.mark.parametrize("samples", [1, 12])
+def test_dcp_q_buffers_hold_every_head_in_two_slots_past_the_merge(samples):
+    """Each rank's q lands in every peer's copy at the global head, so a copy
+    holds all 64 heads; two launch slots, after the DCP partials."""
+    from atom.models.glm52.mono.kernels.geometry_config import KV_LORA, PE_DIM
+    from atom.models.glm52.mono.kernels.layout import layout
+
+    _, sym = layout(samples, 64, 4, 2048, inter=512, output_heads=16, dcp_size=4)
+    assert sym["q_lat"] >= sym["dcp"] + 2 * sym["_dcp_part_stride"]
+    # a bf16 pair and its tag per two elements
+    assert sym["q_lat_stride"] >= samples * 64 * KV_LORA * 4
+    assert sym["q_pe"] >= sym["q_lat"] + 2 * sym["q_lat_stride"]
+    assert sym["q_pe_stride"] >= samples * 64 * PE_DIM * 4
+    assert sym["_bytes"] >= sym["q_pe"] + 2 * sym["q_pe_stride"]
+    _, sym1 = layout(samples, 16, 4, 2048, inter=512)
+    assert "q_lat" not in sym1 and "q_pe" not in sym1
 
 
 def test_the_runner_hands_the_kernel_the_dcp_indptr_under_dcp():
