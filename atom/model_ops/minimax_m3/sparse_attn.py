@@ -1417,7 +1417,10 @@ def sparse_pa_per_row(
     """
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
-    from atom.model_ops.base_attention import run_pa_decode
+    from atom.model_ops.base_attention import (
+        _flydsl_output_quant_option,
+        run_pa_decode,
+    )
 
     assert q.shape[-1] == 128, "Paged attention here requires head_dim == 128."
     if (quantized_output is None) != (output_scale is None):
@@ -1434,12 +1437,18 @@ def sparse_pa_per_row(
     q_view = q.view(T * num_kv_heads, g, head_size)
     out_view = output.view(T * num_kv_heads, g, head_size)
     quantized_view = None
+    quantized_pad_rows = 0
     if quantized_output is not None:
         assert num_kv_heads == 1, (
             "per-token o_proj quantization requires one KV head per rank so one "
             "PA sequence covers the token's complete attention row"
         )
-        quantized_view = quantized_output.view_as(q_view)
+        # Rows past q's are a padded token bucket's: the PA writes them inert.
+        quantized_view = quantized_output.view(-1, g, head_size)
+        quantized_pad_rows = quantized_view.shape[0] - q_view.shape[0]
+        assert quantized_pad_rows >= 0 and output_scale.shape[0] == (
+            quantized_view.shape[0]
+        ), "quantized output covers the query rows and maybe a padded bucket"
     # .view, not .reshape: the SHUFFLE slices are contiguous so this is always
     # zero-copy, and a copy would silently break the page-id encoding alignment.
     nph16, _hkv = k_cache.shape[0], k_cache.shape[1]
@@ -1500,6 +1509,10 @@ def sparse_pa_per_row(
         ps=True,
         quantized_output=quantized_view,
         output_scale=output_scale,
+        # With the FP8 output nothing reads the BF16 one.
+        store_output=quantized_output is None
+        or not _flydsl_output_quant_option("store_output"),
+        quantized_pad_rows=quantized_pad_rows,
         plan_step_owner=plan_step_owner,
         plan_cache_owner=plan_cache_owner,
         # Bounded topk window per row: keep the static split cap.

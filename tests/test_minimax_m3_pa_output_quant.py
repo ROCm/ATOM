@@ -98,6 +98,8 @@ def test_sparse_runner_forces_flydsl_and_preserves_token_scale_layout(monkeypatc
         captured.update(kwargs)
 
     monkeypatch.setattr(base_attention, "run_pa_decode", run_pa_decode)
+    # An aiter without the store_output / quantized_pad_rows options.
+    monkeypatch.setattr(base_attention, "_flydsl_output_quant_option", lambda _: False)
     monkeypatch.setattr(
         "aiter.ops.triton.gluon.pa_decode_gluon.get_recommended_splits",
         lambda *_: 4,
@@ -137,6 +139,8 @@ def test_sparse_runner_forces_flydsl_and_preserves_token_scale_layout(monkeypatc
     assert captured["output_scale"].shape == (2, 1)
     assert captured["max_seqlen_q"] == 1
     assert captured["max_context_partition_num"] == 1
+    assert captured["store_output"] is True
+    assert captured["quantized_pad_rows"] == 0
 
 
 def test_sparse_model_checks_o_proj_quant_at_forward_time():
@@ -152,3 +156,132 @@ def test_sparse_model_checks_o_proj_quant_at_forward_time():
     layer.o_proj.params_dtype = m3_model.dtypes.fp8
     MiniMaxM3SparseAttention.forward(layer, torch.arange(3), packed)
     assert len(layer.attn.quant_calls) == 1
+
+
+def _run_sparse_rows(monkeypatch, rows, bucket):
+    captured = {}
+    monkeypatch.setattr(
+        base_attention, "run_pa_decode", lambda **kwargs: captured.update(kwargs)
+    )
+    monkeypatch.setattr(base_attention, "_flydsl_output_quant_option", lambda _: True)
+    monkeypatch.setattr(
+        "aiter.ops.triton.gluon.pa_decode_gluon.get_recommended_splits",
+        lambda *_: 1,
+    )
+    q = torch.randn(rows, 16, 128, dtype=torch.bfloat16)
+    output_fp8 = torch.empty((bucket, 16, 128), dtype=torch.uint8)
+    scale = torch.empty((bucket, 1), dtype=torch.float32)
+    sparse_attn.sparse_pa_per_row(
+        q,
+        torch.empty((1, 1, 8, 16, 16), dtype=torch.uint8),
+        torch.empty((1, 1, 1, 128, 16), dtype=torch.uint8),
+        torch.zeros((rows, 8), dtype=torch.int32),
+        torch.ones(rows, dtype=torch.int32),
+        1,
+        128**-0.5,
+        torch.empty_like(q),
+        None,
+        None,
+        quantized_output=output_fp8,
+        output_scale=scale,
+    )
+    return captured, output_fp8, scale
+
+
+def test_sparse_runner_skips_bf16_store_and_hands_the_padded_bucket(monkeypatch):
+    captured, output_fp8, scale = _run_sparse_rows(monkeypatch, rows=5, bucket=8)
+
+    assert captured["q"].shape == (5, 16, 128)
+    assert captured["output"].shape == (5, 16, 128)
+    assert captured["store_output"] is False
+    assert captured["quantized_pad_rows"] == 3
+    assert captured["quantized_output"].shape == (8, 16, 128)
+    assert captured["quantized_output"].data_ptr() == output_fp8.data_ptr()
+    assert captured["output_scale"].data_ptr() == scale.data_ptr()
+
+
+def test_sparse_runner_unpadded_rows_pass_no_pad(monkeypatch):
+    captured, _, _ = _run_sparse_rows(monkeypatch, rows=6, bucket=6)
+
+    assert captured["store_output"] is False
+    assert captured["quantized_pad_rows"] == 0
+
+
+_BUCKET, _ROWS = 8, 5
+
+
+class _QuantImpl:
+    """Writes the scheduled FP8 rows (and, given the bucket, its pad rows) like
+    the sparse PA does; records what the op body handed it."""
+
+    supports_output_quant = True
+
+    def __init__(self, writes_pad):
+        self.writes_quantized_pad_rows = writes_pad
+        self.calls = []
+
+    def forward(self, query, key, value, position, q_scale, qkv, **kwargs):
+        quantized_output = kwargs["quantized_output"]
+        output_scale = kwargs["output_scale"]
+        self.calls.append(SimpleNamespace(query=query, **kwargs))
+        rows = query.shape[0]
+        quantized_output[:rows].fill_(7)
+        output_scale[:rows].fill_(0.5)
+        if quantized_output.shape[0] > rows:
+            quantized_output[rows:].zero_()
+            output_scale[rows:].fill_(1.0)
+
+
+def _quant_op(monkeypatch, writes_pad):
+    from atom.utils import forward_context
+
+    impl = _QuantImpl(writes_pad)
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={"layer": SimpleNamespace(impl=impl)}
+        )
+    )
+    monkeypatch.setattr(base_attention, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(
+        forward_context,
+        "_forward_context",
+        SimpleNamespace(
+            context=SimpleNamespace(is_prefill=True, scheduled_tokens=_ROWS)
+        ),
+    )
+    q = torch.randn(_BUCKET, 16)
+    fp8 = torch.full((_BUCKET, 16), 0x7F, dtype=torch.uint8)
+    scale = torch.full((_BUCKET, 1), float("nan"))
+    base_attention.unified_attention_with_output_quant_base.__wrapped__(
+        q, None, q, q, torch.arange(_BUCKET), "layer", False, q, fp8, scale
+    )
+    return impl, fp8, scale
+
+
+def test_padded_prefill_hands_the_pa_the_whole_bucket(monkeypatch):
+    impl, fp8, scale = _quant_op(monkeypatch, writes_pad=True)
+
+    (call,) = impl.calls
+    assert call.query.shape[0] == _ROWS
+    assert call.quantized_output.shape[0] == _BUCKET
+    assert call.quantized_output.data_ptr() == fp8.data_ptr()
+    assert call.output_scale.shape[0] == _BUCKET
+    assert torch.equal(fp8[:_ROWS], torch.full((_ROWS, 16), 7, dtype=torch.uint8))
+    assert torch.equal(
+        fp8[_ROWS:], torch.zeros((_BUCKET - _ROWS, 16), dtype=torch.uint8)
+    )
+    assert torch.equal(scale[_ROWS:], torch.ones((_BUCKET - _ROWS, 1)))
+
+
+def test_padded_prefill_fills_pad_rows_when_the_pa_cannot(monkeypatch):
+    impl, fp8, scale = _quant_op(monkeypatch, writes_pad=False)
+
+    (call,) = impl.calls
+    assert call.quantized_output.shape[0] == _ROWS
+    assert call.output_scale.shape[0] == _ROWS
+    assert torch.equal(fp8[:_ROWS], torch.full((_ROWS, 16), 7, dtype=torch.uint8))
+    assert torch.equal(
+        fp8[_ROWS:], torch.zeros((_BUCKET - _ROWS, 16), dtype=torch.uint8)
+    )
+    assert torch.equal(scale[:_ROWS], torch.full((_ROWS, 1), 0.5))
+    assert torch.equal(scale[_ROWS:], torch.ones((_BUCKET - _ROWS, 1)))

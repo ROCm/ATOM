@@ -274,6 +274,19 @@ def _flydsl_output_quant_api() -> bool:
     return "quantized_output" in params and "output_scale" in params
 
 
+@functools.cache
+def _flydsl_output_quant_option(name: str) -> bool:
+    """Whether aiter's FlyDSL ``pa_decode`` takes the quantized-output option
+    ``name``: ``store_output`` (skip the BF16 store) or ``quantized_pad_rows``
+    (write a padded bucket's extra FP8 rows as zeros with a unit descale)."""
+    import inspect
+
+    if not _flydsl_output_quant_api():
+        return False
+    mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    return name in inspect.signature(mod.pa_decode).parameters
+
+
 def _flydsl_pa_decode_num_seqs(
     *,
     output: torch.Tensor,
@@ -662,6 +675,8 @@ def run_pa_decode(
     temporary_output: torch.Tensor | None = None,
     quantized_output: torch.Tensor | None = None,
     output_scale: torch.Tensor | None = None,
+    store_output: bool = True,
+    quantized_pad_rows: int = 0,
     alibi_slopes: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
@@ -690,6 +705,10 @@ def run_pa_decode(
     ``quantized_output`` / ``output_scale`` are a paired FlyDSL-only output:
     OCP FP8 in the attention layout plus contiguous FP32 ``[tokens, 1]``
     descales. Omitting both preserves the existing return/output contract.
+    With them, ``store_output=False`` leaves ``output`` unwritten (only its
+    layout is used), and ``quantized_pad_rows`` extra rows of both, past the
+    query rows, are written as FP8 zeros with a unit descale by the same call;
+    both need an aiter that takes them (`_flydsl_output_quant_option`).
     """
     if (quantized_output is None) != (output_scale is None):
         raise ValueError(
@@ -815,6 +834,12 @@ def run_pa_decode(
                 "output_scale": output_scale,
             }
         )
+        # Passed only when they differ from the defaults, so an aiter without
+        # these options still serves the calls that do not use them.
+        if not store_output:
+            output_quant_args["store_output"] = False
+        if quantized_pad_rows:
+            output_quant_args["quantized_pad_rows"] = quantized_pad_rows
         return _flydsl_pa_decode(
             output,
             q,
@@ -1204,6 +1229,16 @@ def unified_attention_with_output_quant_base(
             return value[:rows]
         return value
 
+    # The following o_proj consumes the full token bucket, so the rows past
+    # the scheduled ones must be inert: zero FP8 values and a unit descale
+    # rather than whatever the graph pool left there (NaN included; under pure
+    # TP the MoE routes pad rows like real ones). The sparse PA writes them in
+    # the same launch when it gets the whole bucket (`quantized_pad_rows`);
+    # otherwise they are filled here.
+    pad_in_attention = rows is not None and getattr(
+        self.impl, "writes_quantized_pad_rows", False
+    )
+    whole = pad_in_attention or rows is None
     self.impl.forward(
         query=narrow(q),
         key=narrow(k),
@@ -1211,13 +1246,10 @@ def unified_attention_with_output_quant_base(
         position=positions,
         q_scale=narrow(q_scale),
         qkv=narrow(qkv),
-        quantized_output=narrow(quantized_output),
-        output_scale=narrow(output_scale),
+        quantized_output=quantized_output if whole else narrow(quantized_output),
+        output_scale=output_scale if whole else narrow(output_scale),
     )
-    if rows is not None:
-        # The following o_proj consumes the full token bucket. Zero FP8 values
-        # make padded rows inert; a unit descale avoids exposing uninitialized
-        # scale bytes to the GEMM.
+    if rows is not None and not pad_in_attention:
         quantized_output[rows:].zero_()
         output_scale[rows:].fill_(1.0)
 
