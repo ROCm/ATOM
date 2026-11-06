@@ -1377,21 +1377,34 @@ class Scheduler:
             return True
         if not self.waiting:
             return False
-        for i, seq in enumerate(self.waiting):
-            if i >= 4:
+        # Same reach as Phase 2: it walks past heads whose tier lookup is in
+        # flight (`prefix_waiters`), up to `prefix_bypass_left` of them, and
+        # admits what follows. Stopping at the first four entries instead
+        # reported "not prefillable" while Phase 2 could admit a later
+        # request, which then ran alone after a vacuous FIRE.
+        examined = 0
+        lookup_skips = min(16, self.max_num_seqs)
+        for seq in self.waiting:
+            if examined >= 4:
                 break
             if self._unschedulable_reason(seq) is not None:
+                examined += 1
                 continue
             if seq.status in (
                 SequenceStatus.ABORTED,
                 SequenceStatus.WAITING_FOR_REMOTE_KVS,
             ):
+                examined += 1
                 continue
             if self._head_waits_on_tier_lookup(seq):
                 # Phase 2 skips it until its lookup answers (`prefix_waiters`),
                 # so reporting it prefillable would make the delayer count a
                 # rank that then runs a dummy prefill.
+                lookup_skips -= 1
+                if lookup_skips < 0:
+                    break
                 continue
+            examined += 1
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
                 not self.enable_chunked_prefill
