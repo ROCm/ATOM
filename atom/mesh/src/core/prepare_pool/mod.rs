@@ -217,20 +217,7 @@ impl PrepareHandle {
         }
         let queue_deadline = enqueued + state.config.queue_timeout;
         state.open_sender(&state.sender.lock())?;
-        let execution = {
-            struct PendingSubmission(bool);
-            impl Drop for PendingSubmission {
-                fn drop(&mut self) {
-                    if self.0 {
-                        PrepareError::Cancelled.count();
-                    }
-                }
-            }
-            let mut pending = PendingSubmission(true);
-            let result = state.acquire_execution(queue_deadline, deadline).await;
-            pending.0 = false;
-            result?
-        };
+        let execution = state.acquire_execution(queue_deadline, deadline).await?;
         let control = JobControl::new(state.control.clone());
         let (job, receiver) = Job::new(
             control.clone(),
