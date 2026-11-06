@@ -241,6 +241,21 @@ def test_offload_layout_override_cannot_downgrade_kimi_k3_to_dense():
         offcfg.select_offload_layout(config)
 
 
+@pytest.mark.parametrize(
+    ("model_type", "override"), [("kimi_linear", "qwen"), ("qwen3_next", "kimi_k3")]
+)
+def test_offload_layout_override_cannot_swap_the_two_state_tiers(model_type, override):
+    # `qwen` and `kimi_k3` both own a state tier, but each for its own family's
+    # state: neither restores the other's, so the swap is refused too.
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = model_type
+    config.kv_transfer_config = {"offload_layout": override}
+
+    with pytest.raises(ValueError, match="owns no tier"):
+        offcfg.select_offload_layout(config)
+
+
 def test_offload_layout_override_still_allows_dense_hybrid_choice():
     # The downgrade guard is narrow: dense<->hybrid is a legitimate operator
     # choice (namespace separation), not a recurrent-state downgrade.

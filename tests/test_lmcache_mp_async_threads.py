@@ -308,7 +308,7 @@ def test_an_asked_round_polls_before_the_rest_of_the_queue():
         order.append("first")
 
     thread = transfer_thread._TransferThread(
-        "mp-transfer-test", poll=lambda: order.append("poll")
+        "mp-transfer-test", poll=lambda _thread: order.append("poll")
     )
     try:
         thread.submit(first)
@@ -329,7 +329,7 @@ def test_a_failed_poll_round_stops_the_polling(caplog):
     fail and log again, every `_IDLE_POLL_S`, until the engine stepped."""
     rounds = []
 
-    def poll():
+    def poll(_thread):
         rounds.append(1)
         raise RuntimeError("transfer deadline")
 
@@ -342,8 +342,10 @@ def test_a_failed_poll_round_stops_the_polling(caplog):
         time.sleep(0.02)
         assert len(rounds) == 1
         assert caplog.text.count("transfer poll failed") == 1
-        with pytest.raises(RuntimeError, match="transfer deadline"):
-            thread.raise_error()
+        # Raised on every call: nothing else would report what is left.
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="transfer deadline"):
+                thread.raise_error()
     finally:
         thread.close(5.0)
 
@@ -352,7 +354,9 @@ def test_a_handed_back_future_is_dropped_once_nothing_else_holds_it():
     """One LMCache still references stays queued: its last reference would
     otherwise be dropped by LMCache's next submission, on the transfer
     thread."""
-    thread = transfer_thread._TransferThread("mp-transfer-test", poll=lambda: None)
+    thread = transfer_thread._TransferThread(
+        "mp-transfer-test", poll=lambda _thread: None
+    )
     try:
         lmcache = [object()]
         ident = id(lmcache[0])

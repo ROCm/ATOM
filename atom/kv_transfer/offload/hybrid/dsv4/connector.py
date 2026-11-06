@@ -47,6 +47,7 @@ from atom.kv_transfer.disaggregation.types import (
     ReqId,
     SaveCompletionId,
     SaveOperationId,
+    req_id_of,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
@@ -2316,6 +2317,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             if not self._ensure_lookup_pin(seq, sid, ls):
                 self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
                 # The tier no longer holds the prefix this request recomputes.
+                # `_ensure_lookup_pin` only answers; the drop is done here.
                 self._reopen_saves(sid)
                 self._clear_pending_load(sid)
                 continue
@@ -2526,7 +2528,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
 
     @staticmethod
     def _watermark_sid(operation) -> str:
-        return str(getattr(operation, "req_id", operation))
+        return req_id_of(operation)
 
     def _forget_save_watermark(self, operation) -> int | None:
         """Drop one operation's contingency record, returning what it held."""

@@ -53,9 +53,8 @@ _FENCE_MAX_RECORDS = 31
 # Poll period while a queued submission waits for its fence to complete.
 _READY_POLL_S = 0.0005
 # With ``poll``: the round period when nothing wakes the thread, a backstop for
-# a rank that has stopped stepping. Demand-driven otherwise: a fixed short
-# cadence with loads outstanding cost more end to end than the forward-thread
-# work it moved off.
+# a rank that has stopped stepping. Rounds are otherwise asked for by the
+# forward thread, never run on a short timer.
 _IDLE_POLL_S = 0.05
 # Queued to wake a polling thread for a round; runs no call.
 _WAKE = object()
@@ -113,7 +112,9 @@ class _TransferThread:
     forward thread asks for one (`look`, `fence`).
     """
 
-    def __init__(self, name: str, poll: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self, name: str, poll: Callable[[_TransferThread], None] | None = None
+    ) -> None:
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
         self._idle = threading.Condition()
         self._outstanding = 0
@@ -125,6 +126,7 @@ class _TransferThread:
         self._rounds_done = 0
         self._round_asked = False
         self._poll_failed = False
+        self._last_round_at = time.monotonic()
         self._returned: deque[Any] = deque()
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._thread.start()
@@ -132,6 +134,11 @@ class _TransferThread:
     @property
     def polls(self) -> bool:
         return self._poll is not None
+
+    @property
+    def last_round_at(self) -> float:
+        """When the last poll round ended (`time.monotonic`)."""
+        return self._last_round_at
 
     def submit(
         self,
@@ -157,19 +164,26 @@ class _TransferThread:
         """Re-raise, on the caller's thread, the first submission that raised.
 
         Inline, that exception stopped the engine on the forward thread; it
-        still does, one step later.
+        still does, one step later. A failed poll round is raised on every
+        call: no round runs after it, so nothing else would report the
+        transfers left in flight.
         """
         with self._idle:
-            error, self._error = self._error, None
+            error = self._error
+            if not self._poll_failed:
+                self._error = None
         if error is not None:
             raise error
 
-    def _record_error(self, exc: BaseException) -> None:
+    def _record_error(self, exc: BaseException, *, poll: bool = False) -> None:
         """Keep the first failure for `raise_error`; under the lock, so the
-        forward thread's swap cannot drop one recorded meanwhile."""
+        forward thread's swap cannot drop one recorded meanwhile, nor see a
+        failed poll before it is marked as one."""
         with self._idle:
             if self._error is None:
                 self._error = exc
+            if poll:
+                self._poll_failed = True
 
     def hand_back(self, future: Any) -> None:
         """A future a poll finished, for the forward thread to drop."""
@@ -332,17 +346,16 @@ class _TransferThread:
             self._rounds_started += 1
             number = self._rounds_started
         try:
-            self._poll()
+            self._poll(self)
         except BaseException as exc:  # re-raised by raise_error
             # A transfer deadline is fail-stop, and only the forward thread can
             # stop the engine. Another round would only fail and log again.
             logger.exception("LMCache MP transfer poll failed; polling stops")
-            self._record_error(exc)
-            with self._idle:
-                self._poll_failed = True
+            self._record_error(exc, poll=True)
         finally:
             with self._idle:
                 self._rounds_done = number
+                self._last_round_at = time.monotonic()
                 self._idle.notify_all()
 
 

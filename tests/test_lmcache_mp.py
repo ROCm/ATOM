@@ -2603,6 +2603,54 @@ def test_a_submit_only_transfer_thread_keeps_no_fence_bookkeeping(
         worker.fence(["7"])
 
 
+def test_a_round_during_close_settles_without_the_worker_s_handle(
+    fake_lmcache_modules, monkeypatch
+):
+    """`close` drains the thread it is shutting down, and a round can still run
+    meanwhile: it hands a finished future back to the thread it runs on."""
+    worker = _worker(_WorkerAdapter())
+    request = _unprovable_request("save")
+    worker._submit_save(request, _step_event(worker))
+    _settle(worker)
+    worker._pending_saves["save:16:1"].future.ready = True
+    transfer = worker._transfer
+    real_close = transfer.close
+
+    def close_after_a_round(timeout=None):
+        assert transfer._wait_round(5.0)
+        real_close(timeout)
+
+    monkeypatch.setattr(transfer, "close", close_after_a_round)
+    worker.close()
+
+    assert transfer._error is None
+    assert worker._polled.finished_saving == {request.save_operation}
+    assert worker._transfer is None
+
+
+def test_a_stalled_poller_cannot_hide_a_transfer_past_its_deadline(
+    fake_lmcache_modules, monkeypatch
+):
+    """Rounds enforce deadlines but run between submissions, so a submit that
+    never returns stops them; the forward thread stops the engine instead."""
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker = _worker(_WorkerAdapter())
+    worker._transfer_deadline_s = 30.0
+    worker._submit_load(_unprovable_request("load"), _step_event(worker))
+    _settle(worker)
+    stuck = threading.Event()
+    worker._transfer.submit(stuck.wait, 5.0)  # a submit RPC that hangs
+    try:
+        now[0] = 1030.0 + mp_worker._POLL_STALL_GRACE_S / 2
+        worker._settle_transfer_thread()  # a round may still be on its way
+        now[0] = 1031.0 + mp_worker._POLL_STALL_GRACE_S
+        with pytest.raises(transfer.LMCacheTransferUnprovable, match="no poll round"):
+            worker._settle_transfer_thread()
+    finally:
+        stuck.set()
+
+
 def test_the_fence_covers_queued_transfers_and_fails_stop(fake_lmcache_modules):
     """A queued save reaches the server after the fence; it must hold it.
 

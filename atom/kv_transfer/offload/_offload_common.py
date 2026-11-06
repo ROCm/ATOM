@@ -29,6 +29,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadCompletionId,
     SaveCompletionId,
+    raw_req_id,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.utils import envs
@@ -364,9 +365,9 @@ class OffloadWorkerMixin:
             logger.exception(
                 "offload %s failed for %s",
                 getattr(fn, "__name__", kind),
-                getattr(req, "req_id", req),
+                raw_req_id(req),
             )
-            rid = getattr(req, "req_id", req)
+            rid = raw_req_id(req)
             if kind == "load":
                 self._on_load_fail(rid)
                 with self._lock:
@@ -516,12 +517,12 @@ class OffloadSchedulerMixin(ABC):
         """Apply offload-specific completions and expose plain request IDs."""
 
         loaded = {
-            value.req_id if hasattr(value, "req_id") else value
+            raw_req_id(value)
             for value in output.finished_loading
             if self.load_finished(value) is not False
         }
         failed = {
-            value.req_id if hasattr(value, "req_id") else value
+            raw_req_id(value)
             for value in output.failed_loading
             if self.load_failed(value) is not False
         }
@@ -540,10 +541,10 @@ class OffloadSchedulerMixin(ABC):
             # non-terminal milestone such as PAGE source-safety.
             if handled is True:
                 value = completion.operation_id
-                terminal_saves.add(value.req_id if hasattr(value, "req_id") else value)
+                terminal_saves.add(raw_req_id(value))
         for value in output.finished_saving:
             self.save_finished(value)
-            terminal_saves.add(value.req_id if hasattr(value, "req_id") else value)
+            terminal_saves.add(raw_req_id(value))
 
         output.finished_loading = loaded
         output.failed_loading = failed
@@ -810,9 +811,9 @@ class OffloadSchedulerMixin(ABC):
         A transfer does: it must not read an entry that nothing is holding. So
         the step that turns a load spec into a dispatched retrieve asks the tier
         for real, and the load stands only if the tier still holds at least what
-        the spec promised. If it holds less -- evicted in the steps since -- the
-        load is dropped and the request prefills, which is what would have
-        happened with no tier at all.
+        the spec promised. If it holds less -- evicted in the steps since -- this
+        answers False and the caller drops the load (reopening its saves): the
+        request prefills, which is what would have happened with no tier at all.
 
         Confirming rather than re-deriving is deliberate: by this point the spec
         may have been shaped by something this mixin does not own (the unaligned
@@ -847,9 +848,6 @@ class OffloadSchedulerMixin(ABC):
                 hit,
                 int(spec.lmcache_cached_tokens),
             )
-            # The request recomputes what the tier lost.
-            self._reopen_saves(sid)
-            self._clear_pending_load(sid)
             return False
         return True
 

@@ -825,6 +825,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if not self._ensure_lookup_pin(seq, sid, ls):
                 self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
                 # The tier no longer holds the prefix this request recomputes.
+                # `_ensure_lookup_pin` only answers; the drop is done here.
                 self._reopen_saves(sid)
                 self._clear_pending_load(sid)
                 continue

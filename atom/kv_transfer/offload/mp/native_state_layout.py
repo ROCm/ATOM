@@ -8,9 +8,8 @@ each unit. Every ordinal gets its own engine block-id list while aliasing the
 original PAGE allocation. No Active SLOT or extra state allocation is exposed.
 LMCache imports stay behind ``engine_group_infos`` so layout validation and
 copy-plan tests run without a GPU or LMCache's native extension. Every worker
-that registers this layout, and the scheduler naming its namespace, asks the
-same two questions here: whether saves carry images, and whether the server's
-chunk is the configured one.
+that registers this layout, and the scheduler naming its namespace, asks
+`stores_state_images` whether saves carry images.
 """
 
 from __future__ import annotations
