@@ -24,13 +24,44 @@ logger = logging.getLogger("atom")
 FIRE_AND_FORGET_UTILITY_CMDS = frozenset(
     {"abort_request", "get_mtp_stats", "release_structured_requests"}
 )
+RECEIVE_WEIGHTS_RDMA_CMD = "receive_weights_rdma"
 WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
-    {"update_weights", "update_weights_shm", "update_weights_ipc"}
+    {
+        "update_weights",
+        "update_weights_shm",
+        "update_weights_ipc",
+        RECEIVE_WEIGHTS_RDMA_CMD,
+    }
 )
+# As vLLM's pause_generation(mode="keep") / resume_generation.
+PAUSE_GENERATION_CMD = "pause_generation"
+RESUME_GENERATION_CMD = "resume_generation"
+
+
+def memory_tags(args) -> tuple[str, ...]:
+    """The resources a release_memory / resume_memory acts on; none named
+    means both, as the runner reads it."""
+    tags = args.get("tags") if isinstance(args, dict) else None
+    return ("weights", "kv_cache") if tags is None else tuple(tags)
+
+
+def kv_change(cmd: str, args) -> str | None:
+    """What *cmd* does to the KV pool: ``"weights"`` if it commits new weights
+    (the update's last step clears the KV cache), ``"kv"`` if it zeroes, frees
+    or reallocates the pool, ``None`` if neither."""
+    args = args if isinstance(args, dict) else {}
+    if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+        return "weights" if completes_weight_sync(cmd, args) else None
+    if cmd == "clear_kv_cache":
+        return "kv"
+    if cmd in ("release_memory", "resume_memory") and "kv_cache" in memory_tags(args):
+        return "kv"
+    return None
 
 
 def completes_weight_sync(cmd: str, args: dict) -> bool:
-    """Whether *cmd* is the update a sync ends on: direct, or a last bucket."""
+    """Whether *cmd* is the update a sync ends on: direct, a weight stream, or
+    a last bucket."""
     return cmd == "update_weights" or (
         cmd in WEIGHT_UPDATE_UTILITY_CMDS and bool(args.get("is_last", True))
     )
@@ -39,7 +70,15 @@ def completes_weight_sync(cmd: str, args: dict) -> bool:
 # For a direct weight update whose sender gives no deadline of its own;
 # broadcast_utility_command_sync always does.
 _DIRECT_UPDATE_TIMEOUT_S = 300.0
+# How long a KV change waits for transfers in flight, and a pause for the
+# pipeline to empty, before refusing.
+_KV_QUIESCE_TIMEOUT_S = 30.0
 _FAILED_SYNC_CLEANUP_TIMEOUT_S = 1.0
+_CAPABILITY_TIMEOUT_S = 30.0
+# How long the engine waits for its runners to finish a weight stream. They
+# bound it themselves, by their group's collective timeout, and a rank that
+# dies is noticed at once; this only keeps the deadline finite.
+_WEIGHT_STREAM_TIMEOUT_S = 24 * 3600.0
 
 
 def _remaining_timeout(args: dict, default: float) -> float:
@@ -94,6 +133,7 @@ class EngineUtilityHandler:
         "update_weights": "_handle_update_weights",
         "update_weights_shm": "_handle_update_weights_shm",
         "update_weights_ipc": "_handle_update_weights_ipc",
+        RECEIVE_WEIGHTS_RDMA_CMD: "_handle_receive_weights_rdma",
         DISCARD_WEIGHT_SYNC_CMD: "_handle_discard_failed_weight_sync",
         FINISH_WEIGHT_SYNC_CMD: "_handle_finish_weight_sync",
         "get_weight_sync_status": "_handle_get_weight_sync_status",
@@ -109,6 +149,8 @@ class EngineUtilityHandler:
         "abort_request": "_handle_abort_request",
         "release_structured_requests": "_handle_release_structured_requests",
         COLLECTIVE_RPC_CMD: "_handle_collective_rpc",
+        PAUSE_GENERATION_CMD: "_handle_pause_generation",
+        RESUME_GENERATION_CMD: "_handle_resume_generation",
     }
 
     def __init__(
@@ -118,7 +160,8 @@ class EngineUtilityHandler:
         self.output_queue = _ReplyQueue(output_queue)
         self.label = label
         self.scheduler = scheduler
-        self._weight_sync_fenced = False
+        # Set by process_queue to the engine whose queue it drains.
+        self.engine = None
         self._weight_sync_in_progress = False
         # Why the current sync can no longer complete. Its later updates and
         # its FINISH are refused while this is set.
@@ -128,6 +171,8 @@ class EngineUtilityHandler:
         # Request id of the complete update this engine applied, the only one
         # a FINISH may commit.
         self._awaiting_finish: str | None = None
+        # What the runners reported they cannot take, by feature, with why.
+        self._unavailable: dict[str, str] | None = None
 
     def process_queue(self, utility_queue, engine):
         """Drain *utility_queue* and execute each command.
@@ -140,29 +185,49 @@ class EngineUtilityHandler:
         Memory residency stays on ``engine._is_rl_weights_offloaded``; weight
         synchronization safety uses ``engine._weight_sync_fenced``. The busy
         loop skips model execution while either is true.
+
+        The fence goes up with a sync's first update and comes down at its
+        FINISH. After a sync failed or was abandoned the weights are not whole
+        (``engine._rl_weights_inconsistent``), and then the runners refuse to
+        complete a sync that leaves any parameter as it was, so only one that
+        rewrites them all takes the fence down.
         """
         if not engine._has_pending_utility:
             return
         engine._has_pending_utility = False
+        # The engine whose queue this is; pause/resume and KV changes act on it.
+        self.engine = engine
 
         while True:
             try:
                 cmd, args = utility_queue.get_nowait()
+                change = kv_change(cmd, args)
+                refusal = self._sync_refusal(cmd, args) or self._prepare_engine(
+                    engine, cmd, change, args
+                )
+                if refusal is not None and not self._continues_weight_sync(cmd, args):
+                    # Nothing of it has been written: the engine stays as it was.
+                    self._refuse(cmd, args, refusal)
+                    continue
                 if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
                     # Local success is not global success: another DP engine
                     # can still fail this bucket. Stay fenced until CoreManager
                     # explicitly finishes a complete sync on every engine.
-                    self._weight_sync_fenced = True
                     self._awaiting_finish = None
                     engine._weight_sync_fenced = True
                     if args.get("sync_id") != self._sync_id:
                         self._begin_weight_sync(args.get("sync_id"))
                     self._weight_sync_in_progress = True
-                reply = self._execute_utility_command(cmd, args)
+                if refusal is None:
+                    reply = self._execute_utility_command(cmd, args)
+                    if change is not None:
+                        self._forget_cached_prefixes()
+                else:
+                    # Its sync wrote earlier buckets, so it fails as a sync.
+                    reply = self._refuse(cmd, args, refusal)
                 # Track sleep/wake transitions
                 if cmd == "release_memory":
-                    tags = args.get("tags", []) if isinstance(args, dict) else []
-                    if "weights" in tags:
+                    if "weights" in memory_tags(args):
                         # Some ranks may already have released their weights
                         # before a peer reports failure. Conservatively stop
                         # serving until an all-rank resume succeeds.
@@ -175,12 +240,11 @@ class EngineUtilityHandler:
                         else:
                             logger.info(f"{self.label}: engine entered sleep mode")
                 elif cmd == "resume_memory":
-                    tags = args.get("tags", []) if isinstance(args, dict) else []
-                    if "weights" in tags and not (
+                    if "weights" in memory_tags(args) and not (
                         isinstance(reply, dict) and reply.get("error")
                     ):
                         engine._is_rl_weights_offloaded = False
-                        if self._weight_sync_fenced:
+                        if engine._weight_sync_fenced:
                             logger.warning(
                                 f"{self.label}: weights resumed, but serving "
                                 f"stays fenced until a complete sync succeeds"
@@ -201,8 +265,14 @@ class EngineUtilityHandler:
                         )
                     elif completes_weight_sync(cmd, args):
                         self._awaiting_finish = args.get("request_id")
+                elif cmd == DISCARD_WEIGHT_SYNC_CMD and not engine._weight_sync_fenced:
+                    # No update of it ran here (the fence goes up with the
+                    # first), so this engine still holds the committed weights.
+                    logger.info(
+                        f"{self.label}: discarded weight sync wrote nothing "
+                        f"here; serving is unchanged"
+                    )
                 elif cmd == DISCARD_WEIGHT_SYNC_CMD:
-                    self._weight_sync_fenced = True
                     self._weight_sync_in_progress = False
                     self._awaiting_finish = None
                     self._weight_sync_failure = self._weight_sync_failure or str(
@@ -221,7 +291,6 @@ class EngineUtilityHandler:
                             f"stays fenced: {reply['error']}"
                         )
                     else:
-                        self._weight_sync_fenced = False
                         self._weight_sync_in_progress = False
                         self._weight_sync_failure = None
                         self._awaiting_finish = None
@@ -234,6 +303,108 @@ class EngineUtilityHandler:
                         )
             except queue.Empty:
                 break
+
+    def _continues_weight_sync(self, cmd: str, args) -> bool:
+        """Whether *cmd* is a later bucket of the sync in progress."""
+        return (
+            cmd in WEIGHT_UPDATE_UTILITY_CMDS
+            and self._weight_sync_in_progress
+            and args.get("sync_id") == self._sync_id
+        )
+
+    def _sync_refusal(self, cmd: str, args) -> str | None:
+        """Why the runners cannot take the sync *cmd* would start, if they
+        cannot.
+
+        Asked before its first update, so a refusal writes nothing and fences
+        nothing. The answer is the model's, so the runners are asked once; if
+        they cannot be, they decide, refusing before they write.
+        """
+        if cmd not in WEIGHT_UPDATE_UTILITY_CMDS or self._continues_weight_sync(
+            cmd, args
+        ):
+            return None
+        if self._unavailable is None:
+            payload = RpcPayload(
+                request_id=f"get_worker_capabilities-{uuid.uuid4().hex}"
+            )
+            try:
+                replies = self.runner_mgr.utility_rpc(
+                    "get_worker_capabilities", payload, timeout=_CAPABILITY_TIMEOUT_S
+                )
+            except Exception:
+                logger.exception(f"{self.label}: could not ask the runners")
+                return None
+            if not all(reply.ok for reply in replies):
+                return None
+            self._unavailable = {}
+            for reply in replies:
+                self._unavailable.update(reply.value.get("unavailable", {}))
+        if cmd == RECEIVE_WEIGHTS_RDMA_CMD:
+            return self._unavailable.get("rdma_weight_receive")
+        return self._unavailable.get("weight_reload")
+
+    def _prepare_engine(self, engine, cmd: str, change: str | None, args) -> str | None:
+        """Ready *engine* for *cmd*; return why it cannot be, or None.
+
+        A weight sync's first update waits for what is in flight. A KV change
+        preempts what is running, so nothing decodes on a zeroed or recomputed
+        pool. A refused command preempts nothing and runs nothing.
+        """
+        starts_sync = cmd in WEIGHT_UPDATE_UTILITY_CMDS and not (
+            self._continues_weight_sync(cmd, args)
+        )
+        if change is None and not starts_sync:
+            return None
+        args = args if isinstance(args, dict) else {}
+        deadline = time.monotonic() + min(
+            _KV_QUIESCE_TIMEOUT_S, _remaining_timeout(args, _KV_QUIESCE_TIMEOUT_S)
+        )
+        try:
+            if starts_sync:
+                engine.prepare_weight_sync(deadline)
+            if change is not None:
+                engine.prepare_kv_change(weights=change == "weights", deadline=deadline)
+        except RuntimeError as exc:
+            return str(exc)
+        return None
+
+    def _refuse(self, cmd: str, args, reason: str) -> dict:
+        """Answer *cmd* with *reason* without running it.
+
+        A weight stream is still taken in, and discarded: its trainer is
+        already broadcasting it, and would wait in its first broadcast.
+        """
+        if cmd == RECEIVE_WEIGHTS_RDMA_CMD:
+            payload = RpcPayload(
+                request_id=f"{cmd}-refused-{uuid.uuid4().hex}",
+                args=(args.get("group_name"), args.get("version")),
+                kwargs={"refusal": reason},
+            )
+            try:
+                self.runner_mgr.utility_rpc(
+                    cmd, payload, timeout=_WEIGHT_STREAM_TIMEOUT_S
+                )
+            except Exception:  # the refusal is what is answered
+                logger.exception(f"{self.label}: a refused {cmd} was not drained")
+        reply = {"cmd": cmd, "error": f"refused: {reason}"}
+        logger.error(f"{self.label}: {cmd} refused: {reason}")
+        self.output_queue.request_id = (
+            args.get("request_id") if isinstance(args, dict) else None
+        )
+        try:
+            self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        finally:
+            self.output_queue.request_id = None
+        return reply
+
+    def _forget_cached_prefixes(self) -> None:
+        """Drop the prefix-cache index; live sequences keep their blocks.
+
+        A prefill-only engine has no block manager; the decode engine owns it.
+        """
+        if self.scheduler is not None and self.scheduler.block_manager is not None:
+            self.scheduler.block_manager.clear_cache()
 
     def _execute_utility_command(self, cmd: str, args: dict) -> dict | None:
         """Run *cmd*'s handler and return what it returned: the weight
@@ -379,8 +550,10 @@ class EngineUtilityHandler:
         self._sync_id = sync_id
         self._weight_sync_failure = None
         if abandoned:
-            # The previous sync stopped between buckets and was never aborted;
-            # its packed shards and IPC mapping must not carry into this one.
+            # The previous sync stopped between buckets and was never aborted:
+            # its packed shards and IPC mapping must not carry into this one,
+            # and the weights hold some of its writes and not others.
+            self.engine._rl_weights_inconsistent = True
             reply = self._discard_failed_update_on_every_rank(
                 "abandoned weight sync", _FAILED_SYNC_CLEANUP_TIMEOUT_S
             )
@@ -390,7 +563,13 @@ class EngineUtilityHandler:
                 )
 
     def _update_on_every_rank(
-        self, cmd: str, method: str, args: dict, *call_args, barrier: bool = False
+        self,
+        cmd: str,
+        method: str,
+        args: dict,
+        *call_args,
+        barrier: bool = False,
+        timeout: float | None = None,
     ) -> dict:
         """Run a direct weight update on every TP rank; the reply for all.
 
@@ -415,9 +594,14 @@ class EngineUtilityHandler:
                 f"this update cannot complete it: {self._weight_sync_failure}",
             }
         payload = RpcPayload(
-            request_id=f"{cmd}-{uuid.uuid4().hex}", args=call_args, barrier=barrier
+            request_id=f"{cmd}-{uuid.uuid4().hex}",
+            # The runners refuse to complete a partial sync where the weights
+            # are not whole; see process_queue.
+            args=(*call_args, self.engine._rl_weights_inconsistent),
+            barrier=barrier,
         )
-        timeout = _remaining_timeout(args, _DIRECT_UPDATE_TIMEOUT_S)
+        if timeout is None:
+            timeout = _remaining_timeout(args, _DIRECT_UPDATE_TIMEOUT_S)
         try:
             replies = self.runner_mgr.utility_rpc(method, payload, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 - answered, never raised at the loop
@@ -504,9 +688,10 @@ class EngineUtilityHandler:
         reply = {
             "cmd": "get_weight_sync_status",
             "result": {
-                "fenced": self._weight_sync_fenced,
+                "fenced": self.engine._weight_sync_fenced,
                 "in_progress": self._weight_sync_in_progress,
                 "failure": self._weight_sync_failure,
+                "whole": not self.engine._rl_weights_inconsistent,
             },
         }
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
@@ -569,6 +754,24 @@ class EngineUtilityHandler:
             args.get("is_last", True),
             args.get("ipc_handles"),
             barrier=True,
+        )
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
+
+    def _handle_receive_weights_rdma(self, args: dict) -> dict:
+        """Take one weight stream over the RDMA group the runners joined.
+
+        Waits for the runners' own outcome, not the caller's deadline: a
+        stream outlasting that is still received and decided by the runners,
+        and giving up on it reported a failure for a version they then wrote.
+        """
+        reply = self._update_on_every_rank(
+            RECEIVE_WEIGHTS_RDMA_CMD,
+            RECEIVE_WEIGHTS_RDMA_CMD,
+            args,
+            args.get("group_name"),
+            args.get("version"),
+            timeout=_WEIGHT_STREAM_TIMEOUT_S,
         )
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
@@ -639,6 +842,38 @@ class EngineUtilityHandler:
 
     def _handle_release_structured_requests(self, args: dict):
         self.runner_mgr.call_func("release_structured_requests", args["request_ids"])
+
+    def _handle_pause_generation(self, args: dict) -> dict:
+        """Schedule nothing until ``resume_generation``.
+
+        What is running waits. A weight update in between preempts it (see
+        ``EngineCore.prepare_kv_change``), and once resumed it recomputes its
+        context on the new weights, keeping the tokens and logprobs it has.
+        """
+        args = args if isinstance(args, dict) else {}
+        try:
+            mode = args.get("mode", "keep")
+            if mode != "keep":
+                raise ValueError(f"unsupported pause mode {mode!r}; only 'keep'")
+            self.engine.pause_generation(
+                deadline=time.monotonic()
+                + _remaining_timeout(args, _KV_QUIESCE_TIMEOUT_S)
+            )
+            reply = {"cmd": PAUSE_GENERATION_CMD}
+            logger.info(f"{self.label}: generation paused")
+        except (ValueError, RuntimeError) as exc:
+            reply = self._error_reply(PAUSE_GENERATION_CMD, exc)
+            logger.error(f"{self.label}: pause_generation failed: {reply['error']}")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
+
+    def _handle_resume_generation(self, args: dict) -> dict:
+        """Let scheduling go on after ``pause_generation``."""
+        self.engine.resume_generation()
+        reply = {"cmd": RESUME_GENERATION_CMD}
+        logger.info(f"{self.label}: generation resumed")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
 
     def _handle_abort_request(self, args: dict):
         """Cancel queued work promptly; running forwards finish via postprocess."""

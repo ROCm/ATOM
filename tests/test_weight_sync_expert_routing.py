@@ -45,6 +45,7 @@ def _updater(model):
             pass
 
     updater = _Updater()
+    updater._init_weight_updater()
     updater.model = model
     return updater
 
@@ -118,7 +119,7 @@ def test_a_named_expert_buffer_registers_every_slice(param_name):
     )
 
     assert param.eq(3.0).all(), "the write did not land"
-    pending = updater._pending_expert_relayout
+    pending = updater._expert_relayout_pending
     assert list(pending) == [(experts, param_name)]
     arrived = pending[(experts, param_name)]
     assert sorted(arrived) == list(range(EXPERTS))
@@ -141,7 +142,7 @@ def test_a_partial_named_expert_buffer_is_refused():
             torch.zeros(EXPERTS, INTERMEDIATE, HIDDEN, dtype=torch.bfloat16),
         )
 
-    assert not updater._pending_expert_relayout
+    assert not updater._expert_relayout_pending
 
 
 def test_a_named_expert_buffer_is_refused_on_a_quantized_moe():
@@ -262,7 +263,7 @@ def test_a_rebind_after_the_first_lookup_rebuilds_the_mapping():
 
 def _pending_two_buffers(updater, experts, *, second_is_half_written):
     """Buffer A complete, buffer B missing a shard so finalize raises on it."""
-    pending = updater._pending_expert_relayout
+    pending = updater._expert_relayout_pending
     pending[(experts, "w13_weight")] = {e: {"w1", "w3"} for e in range(EXPERTS)}
     pending[(experts, "w2_weight")] = {
         e: (set() if second_is_half_written else {"w2"}) for e in range(EXPERTS)
@@ -324,7 +325,7 @@ def test_a_half_delivered_expert_does_not_poison_every_later_sync(monkeypatch):
         lambda buffer, ids, **k: shuffled.append(tuple(ids)),
         raising=True,
     )
-    pending = updater._pending_expert_relayout
+    pending = updater._expert_relayout_pending
     pending[(experts, "w13_weight")] = {0: {"w1", "w3"}, 1: {"w1"}}
 
     with pytest.raises(RuntimeError, match=r"w13_weight\[1\] arrived without"):
@@ -359,7 +360,7 @@ def test_a_whole_expert_resent_later_gets_its_layout_back(monkeypatch):
         lambda buffer, ids, **k: shuffled.append(tuple(ids)),
         raising=True,
     )
-    updater._pending_expert_relayout[(experts, "w13_weight")] = {1: {"w1"}}
+    updater._expert_relayout_pending[(experts, "w13_weight")] = {1: {"w1"}}
 
     with pytest.raises(RuntimeError, match="half new and"):
         updater._finalize_expert_weight_sync()
@@ -375,7 +376,7 @@ def test_a_whole_expert_resent_later_gets_its_layout_back(monkeypatch):
     updater._finalize_expert_weight_sync()
 
     assert shuffled == [(0, 1)]
-    assert not updater._pending_expert_relayout
+    assert not updater._expert_relayout_pending
 
 
 @needs_aiter
@@ -425,7 +426,7 @@ def test_finalize_is_a_no_op_with_nothing_pending():
 
     updater._finalize_expert_weight_sync()
 
-    assert not updater._pending_expert_relayout
+    assert not updater._expert_relayout_pending
 
 
 def test_the_updater_needs_no_expert_mapping_for_this_route():

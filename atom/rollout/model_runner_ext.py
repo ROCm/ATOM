@@ -16,6 +16,7 @@ from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.rollout.capabilities import CapabilityProviderMixin
 from atom.rollout.memory_manager import MemoryManagerMixin
+from atom.rollout.rdma_weight_receiver import RDMAWeightReceiverMixin
 from atom.rollout.weight_updater import WeightUpdaterMixin
 from atom.utils.forward_context import get_forward_context
 
@@ -23,7 +24,11 @@ logger = logging.getLogger("atom")
 
 
 class RLHFModelRunner(
-    ModelRunner, WeightUpdaterMixin, MemoryManagerMixin, CapabilityProviderMixin
+    ModelRunner,
+    WeightUpdaterMixin,
+    RDMAWeightReceiverMixin,
+    MemoryManagerMixin,
+    CapabilityProviderMixin,
 ):
     """ModelRunner with RLHF extensions (weight sync + memory lifecycle + DP isolation).
 
@@ -51,6 +56,8 @@ class RLHFModelRunner(
         # padded", which is the right answer for almost every model and costs
         # one comparison per step.
         self._true_vocab_size = config.true_vocab_size
+        self._init_weight_updater()
+        self._init_rdma_receiver(config)
         super().__init__(rank, config)
         self._check_true_vocab_size(config)
 

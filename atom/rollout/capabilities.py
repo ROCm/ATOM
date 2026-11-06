@@ -44,6 +44,25 @@ class CapabilityProviderMixin:
             features.add("vocab_masking")
         if self._holds_fp8_weights():
             features.add("fp8_weight_update")
+        # Engine-side (AsyncLLMEngine.pause_generation), reported here so a
+        # caller has one place to ask what this ATOM supports.
+        features.add("pause_generation")
+        # A weight sync that rewrites this model in place (direct, SHM, IPC),
+        # and AsyncLLMEngine.receive_weights_rdma. The engine asks before a
+        # sync's first update, and refuses one these rule out with the reason.
+        unavailable = {}
+        for feature, refusal in (
+            ("weight_reload", "_reload_refusal"),
+            ("rdma_weight_receive", "_rdma_receive_refusal"),
+        ):
+            ask = getattr(self, refusal, None)
+            if not callable(ask):
+                continue
+            reason = ask()
+            if reason is None:
+                features.add(feature)
+            else:
+                unavailable[feature] = reason
         config = getattr(self, "config", None)
         parallel = getattr(config, "parallel_config", None)
         return {
@@ -52,6 +71,7 @@ class CapabilityProviderMixin:
             "dp_rank_local": int(getattr(parallel, "data_parallel_rank_local", 0) or 0),
             "methods": methods,
             "features": sorted(features),
+            "unavailable": unavailable,
         }
 
     def _holds_fp8_weights(self) -> bool:
