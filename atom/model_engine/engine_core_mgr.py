@@ -1608,9 +1608,8 @@ class CoreManager:
         """Per rank: reported prefill left + charges of seqs not yet reported.
         A rank that has not reported yet falls back to the routing charges."""
         out = []
-        use_reports = os.environ.get("ATOM_DP_STORE_BACKLOG_REPORT", "1") != "0"
         for r in range(self._routable_engine_count):
-            report = self._bl_report[r] if use_reports else None
+            report = self._bl_report[r]
             if report is None:
                 out.append(self._rank_tokens[r])
             else:
