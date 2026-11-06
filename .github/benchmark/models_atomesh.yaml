@@ -16479,6 +16479,8 @@ models:
         ATOMESH_PRE_CLEAN_GPU: "1"
         # Also this model's other cells: a job the scheduler ends early leaves its detached router on :8000.
         ATOMESH_PRE_CLEAN_CELL_PREFIX: minimax-m3.1-flash-vllm-moriio-rdma-
+        # The allocation is exclusive: stop every other running container and kill leftover GPU processes.
+        ATOMESH_PRE_CLEAN_ALL: "1"
         # rocprofiler-register deadlocks MoRIIO WRITE under load (local 1P1D C64 hangs in warmup without it).
         ROCPROFILER_REGISTER_ENABLED: "0"
         # Wait out a full send queue instead of failing the transfer (50 ms killed P at C64).

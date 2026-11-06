@@ -250,7 +250,10 @@ pre_cleanup_local() {
   elif [[ -n "${ATOMESH_ENV_ATOMESH_PRE_CLEAN_CELL_PREFIX:-}" ]]; then
     cleanup_args=(--cell-prefix "${ATOMESH_ENV_ATOMESH_PRE_CLEAN_CELL_PREFIX}")
   fi
-  timeout --kill-after=2s 120s python3 \
+  if [[ "${ATOMESH_ENV_ATOMESH_PRE_CLEAN_ALL:-0}" == "1" ]]; then
+    cleanup_args+=(--stop-all)
+  fi
+  timeout --kill-after=2s 180s python3 \
     "${REPO_ROOT}/.github/scripts/atomesh/pd_gpu_cleanup.py" \
     --job-id "${JOB_ID}" --run-token "${ATOMESH_RUN_TOKEN}" \
     --node "${SELECTED_NODES[$node_rank]}" --rank "${node_rank}" \

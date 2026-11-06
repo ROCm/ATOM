@@ -12,10 +12,12 @@ from pathlib import Path
 
 KFD = Path("/sys/class/kfd/kfd/proc")
 DRM = Path("/sys/class/drm")
+SUFFIX = r"(?:-benchmark|-eval|-router|-benchmark-router|-eval-router)?"
+KILL_IMAGE = "busybox:1.36"
 
 
 def gpu_processes():
-    # Spur isolates job PIDs; these are diagnostic IDs, never signal targets.
+    # Host PIDs: Spur isolates job PIDs, so only --stop-all signals them, from the host namespace.
     return sorted(int(entry.name) for entry in KFD.iterdir() if entry.name.isdecimal())
 
 
@@ -144,15 +146,14 @@ class Cleanup:
         return set(rows)
 
     def stop_containers(self):
-        suffix = r"(?:-benchmark|-eval|-router|-benchmark-router|-eval-router)?"
         if self.targets is None:
             cell = re.escape(self.args.cell_id)
             if self.args.cell_prefix:
                 cell = re.escape(self.args.cell_prefix) + r"[a-zA-Z0-9_.-]*"
-            patterns = [re.compile(rf"atomesh-{cell}-([0-9]+)-[0-9]+" + suffix)]
+            patterns = [re.compile(rf"atomesh-{cell}-([0-9]+)-[0-9]+" + SUFFIX)]
         else:
             patterns = [
-                re.compile(rf"atomesh-{re.escape(cell)}-({job})-[0-9]+" + suffix)
+                re.compile(rf"atomesh-{re.escape(cell)}-({job})-[0-9]+" + SUFFIX)
                 for cell, job in self.targets
             ]
         user = f"{os.getuid()}:{os.getgid()}"
@@ -208,6 +209,56 @@ class Cleanup:
             command(["docker", "rm", cid])
             self.event("removed_container", container=cid, name=name)
 
+    def stop_foreign_containers(self):
+        """Stop every other running container: the allocation is exclusive."""
+        own = re.compile(
+            rf"atomesh-{re.escape(self.args.cell_id)}-{self.args.job_id}-[0-9]+"
+            + SUFFIX
+        )
+
+        def foreign():
+            rows = command(
+                ["docker", "ps", "--no-trunc", "--format", "{{.ID}} {{.Names}}"]
+            ).splitlines()
+            running = dict(row.split(" ", 1) for row in rows if row)
+            if any(not re.fullmatch(r"[0-9a-f]{64}", cid) for cid in running):
+                raise RuntimeError("Invalid Docker container ID")
+            return {cid: n for cid, n in running.items() if not own.fullmatch(n)}
+
+        self.active_jobs()  # Validate the current allocation before any cleanup.
+        targets = foreign()
+        if not targets:
+            return
+        for cid, name in targets.items():
+            self.event("stop_foreign_container", container=cid, name=name)
+        try:
+            command(["docker", "stop", "--time", "10", *targets], timeout=60)
+        except RuntimeError as error:
+            # A container that exits on its own meanwhile fails the batch; recheck below.
+            self.event("stop_foreign_error", error=str(error))
+        if left := sorted(set(targets) & set(foreign())):
+            raise RuntimeError(f"Foreign containers still running: {left}")
+
+    def kill_gpu_processes(self, pids):
+        self.event("kill_gpu_processes", processes=pids)
+        command(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--privileged",
+                "--pid=host",
+                "--entrypoint",
+                "sh",
+                KILL_IMAGE,
+                "-c",
+                'kill -9 "$@" 2>/dev/null; exit 0',
+                "kill",
+                *map(str, pids),
+            ],
+            timeout=90,
+        )
+
     def run(self):
         args = self.args
         if socket.gethostname().split(".")[0] != args.node:
@@ -225,7 +276,10 @@ class Cleanup:
             raise RuntimeError("Invalid case identity")
         self.snapshot("before")
         self.stop_containers()
+        if args.stop_all:
+            self.stop_foreign_containers()
         deadline = time.monotonic() + 60
+        killed = False
         while True:
             current = self.snapshot("check")
             if not current["processes"] and all(
@@ -235,7 +289,10 @@ class Cleanup:
                 self.report["passed"] = True
                 self.event("complete")
                 return
-            if time.monotonic() >= deadline:
+            if args.stop_all and current["processes"] and not killed:
+                self.kill_gpu_processes(current["processes"])
+                killed = True
+            elif time.monotonic() >= deadline:
                 raise RuntimeError(
                     "GPU processes or insufficient free VRAM remain after cleanup"
                 )
@@ -259,6 +316,11 @@ def main():
         "--cell-prefix",
         default="",
         help="Also stop finished jobs' containers of sibling cells with this prefix",
+    )
+    parser.add_argument(
+        "--stop-all",
+        action="store_true",
+        help="Stop every other running container and kill leftover GPU processes",
     )
     parser.add_argument("--required-free-ratio", type=float, default=0.88)
     args = parser.parse_args()

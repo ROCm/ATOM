@@ -40,10 +40,12 @@ class CleanupTest(unittest.TestCase):
             out=root / "result.json",
             targets=self.manifest,
             cell_prefix="",
+            stop_all=False,
             required_free_ratio=0.95,
         )
         self.calls = []
         self.containers = {}
+        self.running = set()
         self.active = {"9000"}
 
     def write_targets(self):
@@ -60,12 +62,19 @@ class CleanupTest(unittest.TestCase):
         self.calls.append(args)
         if args[0] == "squeue":
             return "\n".join(sorted(self.active))
+        if args[:2] == ["docker", "ps"] and "-a" not in args:
+            return "\n".join(
+                f"{cid} {self.containers[cid][0][1:]}" for cid in sorted(self.running)
+            )
         if args[:2] == ["docker", "ps"]:
             return "\n".join(self.containers)
         if args[:2] == ["docker", "inspect"]:
             return json.dumps(self.containers[args[-1]])
         if args[:2] == ["docker", "stop"]:
+            self.running.difference_update(args[4:])
             return args[-1]
+        if args[:2] == ["docker", "run"]:
+            return ""
         if args[:2] == ["docker", "rm"]:
             del self.containers[args[-1]]
             return args[-1]
@@ -117,6 +126,64 @@ class CleanupTest(unittest.TestCase):
         self.invoke()
         self.assertEqual(set(self.containers), {active, other_task, other_user})
         self.assertNotIn(sibling, self.containers)
+
+    def test_stop_all_stops_other_running_containers_but_not_this_job(self):
+        self.args.targets, self.args.stop_all = None, True
+        squatter = self.add_container(1, "someone-else-train", "0:0")
+        other_task = self.add_container(2, "atomesh-k3-c48-vllm-8068-0")
+        ours = self.add_container(3, "atomesh-c48-vq-9000-0-router")
+        exited = self.add_container(4, "old-exited-job", "0:0")
+        self.running = {squatter, other_task, ours}
+        with (
+            patch.object(cleanup, "command", side_effect=self.command),
+            patch.object(cleanup.os, "getuid", return_value=100),
+            patch.object(cleanup.os, "getgid", return_value=200),
+        ):
+            cleanup.Cleanup(self.args).stop_foreign_containers()
+        self.assertEqual(self.running, {ours})
+        self.assertIn(exited, self.containers)
+        self.assertFalse(any(c[:2] == ["docker", "rm"] for c in self.calls))
+
+    def test_stop_all_kills_leftover_gpu_processes_in_host_pid_namespace(self):
+        self.args.targets, self.args.stop_all = None, True
+        killed = []
+        original = self.command
+
+        def command(args, timeout=10):
+            if args[:2] == ["docker", "run"]:
+                killed.extend(args)
+            return original(args, timeout)
+
+        self.command = command
+        with (
+            patch.object(cleanup, "command", side_effect=self.command),
+            patch.object(cleanup.os, "getuid", return_value=100),
+            patch.object(cleanup.os, "getgid", return_value=200),
+            patch.object(cleanup.socket, "gethostname", return_value="node-a"),
+            patch.dict(
+                cleanup.os.environ,
+                {
+                    "SLURM_JOB_ID": "9000",
+                    "SPUR_JOB_ID": "9000",
+                    "ATOMESH_EXCLUSIVE_GPU_CLEANUP": "1",
+                },
+            ),
+            patch.object(
+                cleanup,
+                "memory",
+                side_effect=lambda: [{"total": 100, "free": 5 if not killed else 99}]
+                * 8,
+            ),
+            patch.object(
+                cleanup, "gpu_processes", side_effect=lambda: [] if killed else [456, 789]
+            ),
+            patch.object(cleanup.time, "sleep"),
+        ):
+            instance = cleanup.Cleanup(self.args)
+            instance.run()
+        self.assertTrue(instance.report["passed"])
+        self.assertIn("--pid=host", killed)
+        self.assertEqual(killed[-2:], ["456", "789"])
 
     def test_rechecks_queue_after_inspection_before_stopping(self):
         self.add_container(1, "atomesh-c48-v0-8068-0")
