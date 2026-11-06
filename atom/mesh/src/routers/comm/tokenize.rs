@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
 use axum::{
+    extract::Request,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
+use serde::de::DeserializeOwned;
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -18,6 +21,10 @@ use crate::{
         AddTokenizerRequest, AddTokenizerResponse, CountResult, DetokenizeRequest,
         DetokenizeResponse, ListTokenizersResponse, RemoveTokenizerResponse, TextResult,
         TokenizeRequest, TokenizeResponse, TokenizerInfo, TokensResult,
+    },
+    routers::{
+        comm::error::IngressError,
+        ingress::{read_body, InferenceEnvelope},
     },
     tokenizer::{registry::TokenizerEntry, traits::Tokenizer, TokenizerRegistry},
 };
@@ -33,6 +40,10 @@ fn error_response(status: StatusCode, message: &str, error_type: &str) -> Respon
         })),
     )
         .into_response()
+}
+
+fn ingress_error_response(error: IngressError) -> Response {
+    error_response(error.status, &error.message, error.code)
 }
 
 fn prepare_error_response(error: PrepareError) -> Response {
@@ -53,6 +64,26 @@ async fn run_on_prepare_pool(
         Ok(ticket) => ticket.wait().await.unwrap_or_else(prepare_error_response),
         Err(error) => prepare_error_response(error),
     }
+}
+
+/// Check the headers and collect the body on Tokio, leaving JSON parsing to the
+/// preparation job so admission and its deadline bound that work too.
+async fn read_json_body(context: &AppContext, request: Request) -> Result<Bytes, IngressError> {
+    let (parts, body) = request.into_parts();
+    InferenceEnvelope::validate_headers(&parts.headers)?;
+    read_body(body, context.router_config.max_payload_size).await
+}
+
+fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, IngressError> {
+    serde_json::from_slice(body).map_err(|error| IngressError::invalid(error.to_string()))
+}
+
+fn tokenizer_entry(
+    registry: &TokenizerRegistry,
+    model: &str,
+) -> Result<TokenizerEntry, IngressError> {
+    get_tokenizer_entry(registry, model)
+        .map_err(|e| IngressError::new(StatusCode::BAD_REQUEST, "tokenizer_not_found", e))
 }
 
 fn get_tokenizer_entry(
@@ -91,21 +122,40 @@ fn get_tokenizer_entry(
     }
 }
 
-pub async fn tokenize(context: &Arc<AppContext>, request: TokenizeRequest) -> Response {
-    debug!("Tokenize request for model: {}", request.model);
-
-    let entry = match get_tokenizer_entry(&context.tokenizer_registry, &request.model) {
-        Ok(entry) => entry,
-        Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
-        }
+pub async fn tokenize(context: &Arc<AppContext>, request: Request) -> Response {
+    let body = match read_json_body(context, request).await {
+        Ok(body) => body,
+        Err(error) => return ingress_error_response(error),
     };
-
+    let registry = context.tokenizer_registry.clone();
+    let max_tokenize_bytes = context.router_config.resolved_max_tokenize_bytes();
     run_on_prepare_pool(context, move |_| {
-        let encoder = crate::routers::prepare::thread_tokenizer::encoder(&entry);
-        encode_prompts(&*encoder, &request)
+        tokenize_body(&registry, max_tokenize_bytes, &body).unwrap_or_else(ingress_error_response)
     })
     .await
+}
+
+fn tokenize_body(
+    registry: &TokenizerRegistry,
+    max_tokenize_bytes: usize,
+    body: &[u8],
+) -> Result<Response, IngressError> {
+    let request: TokenizeRequest = parse_body(body)?;
+    debug!("Tokenize request for model: {}", request.model);
+    let entry = tokenizer_entry(registry, &request.model)?;
+
+    // The whole batch encodes in one preparation job, so the limit covers its total.
+    let input_bytes = request
+        .prompt
+        .as_strings()
+        .iter()
+        .try_fold(0usize, |size, text| size.checked_add(text.len()));
+    if input_bytes.is_none_or(|size| size > max_tokenize_bytes) {
+        return Err(IngressError::tokenizer_input_too_large());
+    }
+
+    let encoder = crate::routers::prepare::thread_tokenizer::encoder(&entry);
+    Ok(encode_prompts(&*encoder, &request))
 }
 
 fn encode_prompts(tokenizer: &dyn Tokenizer, request: &TokenizeRequest) -> Response {
@@ -159,17 +209,23 @@ fn encode_prompts(tokenizer: &dyn Tokenizer, request: &TokenizeRequest) -> Respo
     .into_response()
 }
 
-pub async fn detokenize(context: &Arc<AppContext>, request: DetokenizeRequest) -> Response {
-    debug!("Detokenize request for model: {}", request.model);
-
-    let tokenizer = match get_tokenizer_entry(&context.tokenizer_registry, &request.model) {
-        Ok(entry) => entry.tokenizer,
-        Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
-        }
+pub async fn detokenize(context: &Arc<AppContext>, request: Request) -> Response {
+    let body = match read_json_body(context, request).await {
+        Ok(body) => body,
+        Err(error) => return ingress_error_response(error),
     };
+    let registry = context.tokenizer_registry.clone();
+    run_on_prepare_pool(context, move |_| {
+        detokenize_body(&registry, &body).unwrap_or_else(ingress_error_response)
+    })
+    .await
+}
 
-    run_on_prepare_pool(context, move |_| decode_sequences(&*tokenizer, &request)).await
+fn detokenize_body(registry: &TokenizerRegistry, body: &[u8]) -> Result<Response, IngressError> {
+    let request: DetokenizeRequest = parse_body(body)?;
+    debug!("Detokenize request for model: {}", request.model);
+    let entry = tokenizer_entry(registry, &request.model)?;
+    Ok(decode_sequences(&*entry.tokenizer, &request))
 }
 
 fn decode_sequences(tokenizer: &dyn Tokenizer, request: &DetokenizeRequest) -> Response {
@@ -304,6 +360,7 @@ pub async fn remove_tokenizer(context: &Arc<AppContext>, tokenizer_id: &str) -> 
         .or_else(|| context.tokenizer_registry.remove(tokenizer_id));
 
     if let Some(entry) = removed {
+        crate::routers::prepare::thread_tokenizer::release_copies(&entry.id);
         debug!("Removed tokenizer '{}' (id: {})", entry.name, entry.id);
         (
             StatusCode::OK,

@@ -130,23 +130,10 @@ impl EndpointSpec {
     async fn inference(State(state): State<Arc<AppState>>, request: Request) -> Response {
         let (parts, body) = request.into_parts();
         let path = parts.uri.path().to_owned();
-        let body =
-            match axum::body::to_bytes(body, state.context.router_config.max_payload_size).await {
-                Ok(body) => body,
-                Err(error) => {
-                    let mut source: &(dyn std::error::Error + 'static) = &error;
-                    loop {
-                        if source.is::<http_body_util::LengthLimitError>() {
-                            return IngressError::body_too_large().response(&path);
-                        }
-                        match source.source() {
-                            Some(next) => source = next,
-                            None => break,
-                        }
-                    }
-                    return IngressError::invalid("failed to read request body").response(&path);
-                }
-            };
+        let body = match read_body(body, state.context.router_config.max_payload_size).await {
+            Ok(body) => body,
+            Err(error) => return error.response(&path),
+        };
         let envelope = match InferenceEnvelope::parse_for_routing(
             parts.uri,
             parts.headers,
@@ -368,6 +355,22 @@ pub(crate) struct HttpInferenceRequest {
     pub body: Bytes,
     pub metadata: InferenceMetadata,
     pub dp_rank_body: Option<DpRankBody>,
+}
+
+/// Collect a request body on Tokio; parsing it is CPU work for the preparation pool.
+pub(crate) async fn read_body(body: axum::body::Body, limit: usize) -> Result<Bytes, IngressError> {
+    axum::body::to_bytes(body, limit).await.map_err(|error| {
+        let mut source: &(dyn std::error::Error + 'static) = &error;
+        loop {
+            if source.is::<http_body_util::LengthLimitError>() {
+                return IngressError::body_too_large();
+            }
+            match source.source() {
+                Some(next) => source = next,
+                None => return IngressError::invalid("failed to read request body"),
+            }
+        }
+    })
 }
 
 pub struct InferenceEnvelope {
@@ -757,14 +760,6 @@ impl IngressRouting {
         Ok(())
     }
 
-    fn tokenizer_input_too_large() -> IngressError {
-        IngressError::new(
-            http::StatusCode::PAYLOAD_TOO_LARGE,
-            "tokenizer_input_too_large",
-            "prompt exceeds the synchronous tokenizer byte limit",
-        )
-    }
-
     fn tokens(
         &self,
         parsed: &ParsedInference,
@@ -798,7 +793,7 @@ impl IngressRouting {
             })?;
         let limit = self.max_tokenize_bytes;
         if metadata.text.len() > limit {
-            return Err(Self::tokenizer_input_too_large());
+            return Err(IngressError::tokenizer_input_too_large());
         }
         ctx.check()?;
         let template_started = Instant::now();
@@ -813,7 +808,7 @@ impl IngressRouting {
             .record(template_started.elapsed().as_secs_f64());
         ctx.check()?;
         if prompt.len() > limit {
-            return Err(Self::tokenizer_input_too_large());
+            return Err(IngressError::tokenizer_input_too_large());
         }
         let encoder = super::prepare::thread_tokenizer::encoder(&entry);
         let encode_started = Instant::now();

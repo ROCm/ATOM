@@ -51,7 +51,7 @@ The `common/` directory provides shared test utilities used across all test modu
 | `header_forwarding_test.rs` | 6 | Header propagation tests. Verifies that custom headers are correctly forwarded from client through the router to backend workers. |
 | `payload_size_test.rs` | 5 | Request payload size limit tests. Verifies behavior with oversized payloads and boundary conditions. |
 | `pd_routing_test.rs` | 3 | Prefill/Decode disaggregation routing. Tests routing decisions that split prefill and decode phases to different workers. |
-| `ingress_tests.rs` | 14 | Shared metadata, capabilities, token routing, Responses state-domain checks, DP rank forwarding, preparation in the parse job, and Tokio responsiveness during tokenization. Library unit tests. |
+| `ingress_tests.rs` | 18 | Shared metadata, capabilities, token routing, Responses state-domain checks, DP rank forwarding, preparation in the parse job, Tokio responsiveness during tokenization, and `/v1/tokenize` / `/v1/detokenize` parsing on the pool and byte limit. Library unit tests. |
 | `http_pd_load_tests.rs` | 14 | PD worker load lifecycle across ATOM, vLLM and SGLang dispatch, including streaming, errors and cancellation. Compiled as a library unit test module. |
 | `http_proxy_body_tests.rs` | 2 | Real HTTP framing regression tests for exactly-once completion, worker outcomes, empty responses, cancellation and truncated bodies. Compiled as a library unit test module. |
 | `pd_topology_test.rs` | 18 | PD topology end-to-end tests: 1P1D, 2P2D, and Regular mode. Verifies complete request flows through the router with mock worker backends. |

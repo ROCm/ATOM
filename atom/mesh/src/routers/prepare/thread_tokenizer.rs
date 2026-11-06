@@ -28,6 +28,8 @@ use crate::{
 
 const WORKERS_PER_COPY: usize = 4;
 
+/// A group's copy as `GROUP_COPIES` holds it: the only strong reference to the
+/// loaded copy outside in-flight requests, so dropping it releases the copy.
 #[derive(Clone)]
 struct Copy {
     /// The registered instance this copy was made for; a re-registration under
@@ -50,13 +52,49 @@ impl Copy {
     }
 }
 
+/// A thread's view of its group's copy. It holds the copy weakly so idle
+/// workers cannot keep a released copy alive.
+struct ThreadCopy {
+    shared: Weak<dyn Tokenizer>,
+    local: Option<Weak<dyn Tokenizer>>,
+}
+
+impl ThreadCopy {
+    fn of(copy: &Copy) -> Self {
+        Self {
+            shared: copy.shared.clone(),
+            local: copy.local.as_ref().map(Arc::downgrade),
+        }
+    }
+
+    /// The tokenizer to encode `entry` with, or `None` when this view is not
+    /// for `entry` or its copy has been released.
+    fn encoder(&self, entry: &TokenizerEntry) -> Option<Arc<dyn Tokenizer>> {
+        if !std::ptr::addr_eq(self.shared.as_ptr(), Arc::as_ptr(&entry.tokenizer)) {
+            return None;
+        }
+        match &self.local {
+            Some(local) => local.upgrade(),
+            None => Some(entry.tokenizer.clone()),
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        self.shared.strong_count() > 0
+            && self
+                .local
+                .as_ref()
+                .is_none_or(|local| local.strong_count() > 0)
+    }
+}
+
 /// Copies keyed by (tokenizer id, worker group).
 static GROUP_COPIES: LazyLock<Mutex<HashMap<(String, usize), Copy>>> =
     LazyLock::new(Default::default);
 
 thread_local! {
     /// This thread's view of its group's copies, so encoding takes no lock.
-    static THREAD_COPIES: RefCell<HashMap<String, Copy>> = RefCell::new(HashMap::new());
+    static THREAD_COPIES: RefCell<HashMap<String, ThreadCopy>> = RefCell::new(HashMap::new());
 }
 
 /// Return the tokenizer this thread should encode `entry`'s text with.
@@ -70,18 +108,26 @@ pub(crate) fn encoder(entry: &TokenizerEntry) -> Arc<dyn Tokenizer> {
     }
 }
 
+/// Release every group's copy of a removed tokenizer. Requests still encoding
+/// with a copy keep it until they finish.
+pub(crate) fn release_copies(tokenizer_id: &str) {
+    GROUP_COPIES
+        .lock()
+        .retain(|(id, _), copy| id != tokenizer_id && copy.shared.strong_count() > 0);
+}
+
 fn group_encoder(entry: &TokenizerEntry, group: usize) -> Arc<dyn Tokenizer> {
     if !entry.tokenizer.as_any().is::<HuggingFaceTokenizer>() {
         return entry.tokenizer.clone();
     }
     THREAD_COPIES.with(|copies| {
         let mut copies = copies.borrow_mut();
-        if let Some(copy) = copies.get(&entry.id).filter(|copy| copy.made_for(entry)) {
-            return copy.encoder(entry);
+        if let Some(encoder) = copies.get(&entry.id).and_then(|copy| copy.encoder(entry)) {
+            return encoder;
         }
-        copies.retain(|_, copy| copy.shared.strong_count() > 0);
+        copies.retain(|_, copy| copy.is_live());
         let copy = group_copy(entry, group);
-        copies.insert(entry.id.clone(), copy.clone());
+        copies.insert(entry.id.clone(), ThreadCopy::of(&copy));
         copy.encoder(entry)
     })
 }
@@ -167,5 +213,30 @@ mod tests {
             ..entry
         };
         assert!(Arc::ptr_eq(&group_encoder(&missing, 0), &missing.tokenizer));
+    }
+
+    #[test]
+    fn removing_a_tokenizer_releases_copies_that_idle_workers_have_seen() {
+        let entry = TokenizerEntry {
+            id: "released-copy".into(),
+            name: "released-copy".into(),
+            source: hf_tokenizer_path().into(),
+            tokenizer: hf_tokenizer(),
+        };
+        let in_flight = group_encoder(&entry, 0);
+        let copy = Arc::downgrade(&in_flight);
+        assert!(!Arc::ptr_eq(&in_flight, &entry.tokenizer));
+
+        release_copies(&entry.id);
+        // A request still encoding keeps its copy until it finishes, but this
+        // thread's cached view of the copy does not.
+        assert!(copy.upgrade().is_some());
+        drop(in_flight);
+        assert!(copy.upgrade().is_none());
+
+        // The group loads a fresh copy if the entry is used again.
+        let reloaded = group_encoder(&entry, 0);
+        assert!(!Arc::ptr_eq(&reloaded, &entry.tokenizer));
+        assert!(GROUP_COPIES.lock().contains_key(&(entry.id.clone(), 0)));
     }
 }

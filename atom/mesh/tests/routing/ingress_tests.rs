@@ -761,8 +761,10 @@ async fn tokenize_endpoint_encodes_on_the_prepare_pool() {
         wake.notify_all();
         advanced
     });
-    let request: crate::protocols::tokenize::TokenizeRequest =
-        serde_json::from_value(json!({"model": "m", "prompt": "hello world"})).unwrap();
+    let request = json_request(
+        "/v1/tokenize",
+        json!({"model": "m", "prompt": "hello world"}),
+    );
     let task_context = context.clone();
     let task = tokio::spawn(async move {
         crate::routers::comm::tokenize::tokenize(&task_context, request).await
@@ -773,6 +775,100 @@ async fn tokenize_endpoint_encodes_on_the_prepare_pool() {
     assert!(watchdog.join().unwrap(), "tokenize encode blocked Tokio");
     let response = task.await.unwrap();
     assert_eq!(response.status(), http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn tokenize_endpoint_limits_the_total_prompt_bytes() {
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let mut config = crate::config::RouterConfig::default();
+    config.prepare_pool.max_tokenize_bytes = Some(11);
+    let context = Arc::new(
+        AppContext::from_config(config, 5, pool.handle())
+            .await
+            .unwrap(),
+    );
+    let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> =
+        Arc::new(crate::tokenizer::MockTokenizer::new());
+    context
+        .tokenizer_registry
+        .load("limited", "m", "mock", || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    for (prompt, status) in [
+        (json!("hello world"), http::StatusCode::OK),
+        (json!(["hello", "world!"]), http::StatusCode::OK),
+        (json!("hello world!"), http::StatusCode::PAYLOAD_TOO_LARGE),
+        (
+            json!(["hello", "world!!"]),
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+    ] {
+        let request = json_request("/v1/tokenize", json!({"model": "m", "prompt": prompt}));
+        let response = crate::routers::comm::tokenize::tokenize(&context, request).await;
+        assert_eq!(response.status(), status, "{prompt}");
+        if status == http::StatusCode::PAYLOAD_TOO_LARGE {
+            assert_eq!(error_type(response).await, "tokenizer_input_too_large");
+        }
+    }
+}
+
+fn json_request(path: &str, body: serde_json::Value) -> Request {
+    Request::builder()
+        .uri(path)
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn error_type(response: Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["type"].clone()
+}
+
+#[tokio::test]
+async fn token_endpoints_parse_their_bodies_on_the_prepare_pool() {
+    let mut pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let context = Arc::new(
+        AppContext::from_config(Default::default(), 5, pool.handle())
+            .await
+            .unwrap(),
+    );
+    let raw = |content_type: &str, body: &'static str| {
+        Request::builder()
+            .method("POST")
+            .header("content-type", content_type)
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    };
+    let tokenize = crate::routers::comm::tokenize::tokenize;
+    let detokenize = crate::routers::comm::tokenize::detokenize;
+
+    // Malformed and mistyped bodies are 400s in the API's error format.
+    for body in ["{", r#"{"model":"m","prompt":7}"#] {
+        let response = tokenize(&context, raw("application/json", body)).await;
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(error_type(response).await, "invalid_request");
+    }
+    let response = detokenize(&context, raw("application/json", r#"{"tokens":"x"}"#)).await;
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(error_type(response).await, "invalid_request");
+    // Header checks match the inference routes.
+    let response = tokenize(&context, raw("text/plain", "{}")).await;
+    assert_eq!(response.status(), http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(error_type(response).await, "unsupported_content_type");
+
+    // Without the pool, a body is rejected before it is parsed.
+    pool.shutdown().await;
+    for response in [
+        tokenize(&context, raw("application/json", "{")).await,
+        detokenize(&context, raw("application/json", "{")).await,
+    ] {
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_type(response).await, "prepare_pool_closed");
+    }
 }
 
 #[test]

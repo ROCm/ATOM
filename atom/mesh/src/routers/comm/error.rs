@@ -196,6 +196,13 @@ impl IngressError {
             "request body limit exceeded",
         )
     }
+    pub fn tokenizer_input_too_large() -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "tokenizer_input_too_large",
+            "prompt exceeds the synchronous tokenizer byte limit",
+        )
+    }
     pub fn response(&self, path: &str) -> Response {
         MeshLocalError::response(path, self.status, self.code, &self.message)
     }

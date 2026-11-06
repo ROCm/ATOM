@@ -37,7 +37,7 @@ use crate::{
     },
     protocols::{
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
-        tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
+        tokenize::AddTokenizerRequest,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
@@ -289,17 +289,11 @@ async fn update_worker(
 // Tokenize / Detokenize Handlers
 // ============================================================================
 
-async fn v1_tokenize(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<TokenizeRequest>,
-) -> Response {
+async fn v1_tokenize(State(state): State<Arc<AppState>>, request: Request) -> Response {
     tokenize::tokenize(&state.context, request).await
 }
 
-async fn v1_detokenize(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<DetokenizeRequest>,
-) -> Response {
+async fn v1_detokenize(State(state): State<Arc<AppState>>, request: Request) -> Response {
     tokenize::detokenize(&state.context, request).await
 }
 
