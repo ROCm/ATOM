@@ -410,6 +410,12 @@ class EngineArgs:
             "prompt-token load. 'least_tokens': route to the rank with "
             "the lowest combined in-flight token load (prompt tokens + "
             "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
+            "'store_tokens': with an offload tier every rank shares "
+            "(mooncake_store, lmcache_mp), route to the rank with the least "
+            "prefill left as the ranks report it, charging a request only what "
+            "it will compute (prompt minus the prefix any rank already put in "
+            "the tier); needs --enable_prefix_caching and "
+            "ATOM_FRONTEND_PREFIX_HASH=1, excludes ATOM_DP_SESSION_AFFINITY. "
             "Has no effect when data_parallel_size == 1.",
         )
         parser.add_argument(

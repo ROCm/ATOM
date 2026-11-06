@@ -1371,6 +1371,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
+    # Give an offload load worker's transfer streams the device's highest
+    # priority, so a load's scatter kernels dispatch ahead of queued forward
+    # kernels instead of waiting behind them on a busy GPU.
+    "OFFLOAD_LOAD_STREAM_HIGH_PRIORITY": lambda: _flag_env(
+        "OFFLOAD_LOAD_STREAM_HIGH_PRIORITY"
+    ),
     # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.
     # Unset derives the size from the KV geometry.
     "OFFLOAD_GPU_STAGING_CHUNKS": lambda: _optional_int_env(

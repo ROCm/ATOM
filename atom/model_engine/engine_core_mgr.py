@@ -40,6 +40,7 @@ from atom.model_engine.engine_utility import (
 from atom.model_engine.prefix_hash import take_shipped_chains
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.store_aware import SHARED_TIER_CONNECTORS, StoreAwareRouter
 from atom.observability import tracing
 from atom.utils import (
     envs,
@@ -60,7 +61,7 @@ _WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
 # the Config field can never diverge.
-DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens")
+DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens", "store_tokens")
 DP_LB_DEFAULT = "least_requests"
 
 # Engine sockets for a multi-node run cannot use IPC paths, and the two ends
@@ -191,6 +192,8 @@ class CoreManager:
     # _input_send_lock with their own in _init_shared_state; _bp_depth defaults
     # to 0 (backpressure disabled).
     _bp_depth = 0
+    # No `store_tokens` router unless __init__ builds one.
+    _store_router = None
     _bp_offline_batch = False
     _bp_dispatch_paused = False
     _input_send_lock = Lock()
@@ -318,6 +321,20 @@ class CoreManager:
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
         self._lb_lock = Lock()
+        # Store-aware routing (`store_tokens`, atom/model_engine/store_aware.py).
+        self._store_router: StoreAwareRouter | None = None
+        if self._dp_lb_strategy == "store_tokens":
+            self._store_router = self._build_store_router(config)
+            self._dp_route_counters.update(dict.fromkeys(StoreAwareRouter.DECISIONS, 0))
+        # Per rank: its last (seqs ingested, prefill left) report
+        # (`EngineCoreRequestType.PREFILL_BACKLOG`), and the charges of the seqs
+        # sent to it that the report does not cover yet, in send order.
+        n_ranks = self.global_engine_count
+        self._bl_report: list = [None] * n_ranks
+        self._bl_unseen: list = [deque() for _ in range(n_ranks)]
+        self._bl_unseen_tokens = [0] * n_ranks
+        self._bl_sent = [0] * n_ranks
+        self._bl_popped = [0] * n_ranks
         # --- Backpressure (lazy) DP dispatch --------------------------------
         # ATOM_DP_DISPATCH_DEPTH > 0 holds load-balanced seqs in _bp_pending and
         # releases them to the lightest rank only up to that in-flight cap. A
@@ -802,6 +819,10 @@ class CoreManager:
                                 )
                     elif request_type == EngineCoreRequestType.METRICS:
                         self.latest_metrics[dp_rank] = data
+                    elif request_type == EngineCoreRequestType.PREFILL_BACKLOG:
+                        with self._lb_lock:
+                            self._bl_report[dp_rank] = data
+                            self._bl_pop_seen_locked(dp_rank)
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self._route_utility_response(dp_rank, data)
                     elif request_type == EngineCoreRequestType.ADD:
@@ -1118,6 +1139,7 @@ class CoreManager:
             getattr(self, "_bp_depth", 0) > 0
             and getattr(self, "_bp_offline_batch", False)
             and not self._dp_session_affinity_enabled
+            and self._store_router is None
             and all(h is None for h in hints)
         ):
             self._bp_dispatch_or_refill(new_seqs=seqs, raise_on_error=True)
@@ -1157,6 +1179,9 @@ class CoreManager:
                     continue
                 self._send_request(dp_rank, _add_frame(rank_seqs))
                 dispatched[dp_rank] = True
+                if self._store_router is not None:
+                    with self._lb_lock:
+                        self._bl_note_sent_locked(dp_rank, rank_seqs)
                 batch_prefill_tokens = sum(
                     int(getattr(seq, "num_prompt_tokens", 0) or 0) for seq in rank_seqs
                 )
@@ -1180,12 +1205,17 @@ class CoreManager:
         # load-aware strategies) the resulting in-flight distribution across all
         # ranks, so a single grep shows both what changed and how balanced it is.
         if reqs_snapshot is not None:
+            backlog = ""
+            if self._store_router is not None:
+                with self._lb_lock:
+                    backlog = f" rank_backlog={self._bl_effective_tokens_locked()}"
             logger.info(
-                "%s: add %s | in-flight reqs=%s queued_prefill_tokens=%s",
+                "%s: add %s | in-flight reqs=%s queued_prefill_tokens=%s%s",
                 self.label,
                 ", ".join(added),
                 reqs_snapshot,
                 tokens_snapshot,
+                backlog,
             )
         else:
             logger.info("%s: add %s", self.label, ", ".join(added))
@@ -1439,6 +1469,68 @@ class CoreManager:
                 best_hash = tie_hash
         return best_rank
 
+    def _build_store_router(self, config) -> StoreAwareRouter:
+        """`store_tokens` needs a tier every rank shares and prompt hashes."""
+        if self._dp_session_affinity_enabled:
+            raise ValueError(
+                "--dp-load-balance store_tokens and ATOM_DP_SESSION_AFFINITY=1 "
+                "are two routing policies; set only one"
+            )
+        if not (
+            getattr(config, "enable_prefix_caching", False)
+            and envs.ATOM_FRONTEND_PREFIX_HASH
+        ):
+            raise ValueError(
+                "--dp-load-balance store_tokens needs --enable_prefix_caching "
+                "and ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
+            )
+        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+        name = KVConnectorFactory.connector_name(
+            getattr(config, "kv_transfer_config", None) or None
+        )
+        if name not in SHARED_TIER_CONNECTORS:
+            raise ValueError(
+                "--dp-load-balance store_tokens needs an offload tier every DP "
+                f"rank shares ({', '.join(sorted(SHARED_TIER_CONNECTORS))}); "
+                f"the KV connector is {name!r}"
+            )
+        return StoreAwareRouter(envs.OFFLOAD_MIN_LOAD_TOKENS, self._dp_lb_req_equiv)
+
+    def _bl_note_sent_locked(self, dp_rank: int, seqs) -> None:
+        """Seqs just sent to `dp_rank`, in send (= ingest) order."""
+        q = self._bl_unseen[dp_rank]
+        for seq in seqs:
+            entry = self._seq_load.get(seq.id)
+            charge = entry[2] if entry is not None else 0
+            q.append(charge)
+            self._bl_unseen_tokens[dp_rank] += charge
+        self._bl_sent[dp_rank] += len(seqs)
+        self._bl_pop_seen_locked(dp_rank)
+
+    def _bl_pop_seen_locked(self, dp_rank: int) -> None:
+        """Drop the sent seqs the rank's last report already counts."""
+        report = self._bl_report[dp_rank]
+        if report is None:
+            return
+        target = min(int(report[0]), self._bl_sent[dp_rank])
+        q = self._bl_unseen[dp_rank]
+        while self._bl_popped[dp_rank] < target and q:
+            self._bl_unseen_tokens[dp_rank] -= q.popleft()
+            self._bl_popped[dp_rank] += 1
+
+    def _bl_effective_tokens_locked(self) -> list[int]:
+        """Per rank: reported prefill left plus the charges of seqs sent after
+        that report. A rank that has not reported yet uses its charges."""
+        out = []
+        for r in range(self._routable_engine_count):
+            report = self._bl_report[r]
+            if report is None:
+                out.append(self._rank_tokens[r])
+            else:
+                out.append(int(report[1]) + self._bl_unseen_tokens[r])
+        return out
+
     def _record_dp_route_locked(self, decision: str, rank: int) -> int:
         """Account for one routing decision and return its target rank."""
         self._dp_route_counters[decision] += 1
@@ -1471,6 +1563,12 @@ class CoreManager:
                         self._dp_session_prompt_tokens.pop(session_id, None)
                     self._dp_session_owners[session_id] = explicit_rank
             return self._record_dp_route_locked("explicit_total", explicit_rank)
+
+        if self._store_router is not None:
+            route = self._store_router.select(
+                seq, self._bl_effective_tokens_locked(), self._rank_reqs
+            )
+            return self._record_dp_route_locked(route.decision, route.rank)
 
         session_id = getattr(seq, "dp_session_id", None)
         parent_id = getattr(seq, "dp_parent_session_id", None)
@@ -1522,7 +1620,12 @@ class CoreManager:
         prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
         tok_cost = prompt_tokens
         session_id = getattr(seq, "dp_session_id", None)
-        if self._dp_session_affinity_enabled and session_id:
+        if self._store_router is not None:
+            est_hit = self._store_router.charge(seq.id)
+            tok_cost = max(0, prompt_tokens - est_hit)
+            # The rank counts a seq it has not allocated yet at this estimate.
+            seq.dp_est_cached_tokens = int(est_hit)
+        elif self._dp_session_affinity_enabled and session_id:
             previous_prompt_tokens = self._dp_session_prompt_tokens.get(session_id)
             if previous_prompt_tokens is not None:
                 # Agentic turns normally extend their previous prompt.  Charge
@@ -1587,6 +1690,8 @@ class CoreManager:
 
     def _release_seq_load_locked(self, seq_id) -> None:
         """``_release_seq_load`` for a caller that already holds ``_lb_lock``."""
+        if self._store_router is not None:
+            self._store_router.release(seq_id)
         entry = self._seq_load.pop(seq_id, None)
         if entry is None:
             return
@@ -1600,13 +1705,17 @@ class CoreManager:
         # at admission, or already released by the first output. Avoid taking
         # the router lock for a no-op; re-read under the lock before changing
         # counters because abort/finish may release the charge concurrently.
-        entry = self._seq_load.get(seq_id)
-        if entry is None:
-            return
-        _, _, tok_cost = entry
-        if tok_cost == 0:
-            return
+        router = self._store_router
+        if router is None or not router.prefilling(seq_id):
+            entry = self._seq_load.get(seq_id)
+            if entry is None:
+                return
+            _, _, tok_cost = entry
+            if tok_cost == 0:
+                return
         with self._lb_lock:
+            if router is not None:
+                router.prefill_complete(seq_id)
             entry = self._seq_load.get(seq_id)
             if entry is None:
                 return
@@ -1654,6 +1763,14 @@ class CoreManager:
             self._dp_session_owners.clear()
             self._dp_session_prompt_tokens.clear()
             self._bp_dispatch_paused = False
+            if self._store_router is not None:
+                self._store_router.reset()
+            # Engine-side ingest counts are not reset: keep the send/pop
+            # counters running and only forget the pending charges.
+            for r in range(len(getattr(self, "_bl_unseen", ()))):
+                self._bl_popped[r] += len(self._bl_unseen[r])
+                self._bl_unseen[r].clear()
+                self._bl_unseen_tokens[r] = 0
 
     def send_utility_command(self, cmd: str, dp_rank: int | None = None):
         self._refuse_unowned_weight_sync_cmd(cmd, None)

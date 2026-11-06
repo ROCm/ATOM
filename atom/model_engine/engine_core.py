@@ -754,7 +754,35 @@ class EngineCore:
         if len(recv_reqs) > 0:
             logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)
+            self._ingested_seqs = getattr(self, "_ingested_seqs", 0) + len(recv_reqs)
         return False
+
+    def _report_prefill_backlog(self) -> None:
+        """Push (seqs ingested, prefill tokens still to compute) when it changed.
+
+        For `store_tokens` DP routing, which balances on what each rank really
+        has left to prefill. A seq that has started counts ``prompt -
+        num_cached_tokens`` (its HBM hit, tier load and computed chunks all
+        advance that); one not allocated yet counts ``prompt -
+        dp_est_cached_tokens``, the router's estimate.
+        """
+        backlog = 0
+        sched = self.scheduler
+        for queue_ in (sched.waiting, sched.running):
+            for seq in queue_:
+                if seq.num_completion_tokens > 0:
+                    continue
+                if seq.block_table:
+                    done = seq.num_cached_tokens
+                else:
+                    done = max(
+                        seq.num_cached_tokens, getattr(seq, "dp_est_cached_tokens", 0)
+                    )
+                backlog += max(0, seq.num_prompt_tokens - done)
+        report = (getattr(self, "_ingested_seqs", 0), backlog)
+        if report != getattr(self, "_last_backlog_report", None):
+            self._last_backlog_report = report
+            self.output_queue.put_nowait(("PREFILL_BACKLOG", report))
 
     def _offer_tier_lookups(self, reqs) -> None:
         """Let an offload connector start tier lookups for arrived requests.
@@ -872,6 +900,11 @@ class EngineCore:
                     socket.send(obj)
                     continue
 
+                if isinstance(item, tuple) and item[0] == "PREFILL_BACKLOG":
+                    obj = pickle.dumps((EngineCoreRequestType.PREFILL_BACKLOG, item[1]))
+                    socket.send(obj)
+                    continue
+
                 if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
                     # Send utility command response back to CoreManager
                     response_data = item[1]
@@ -910,6 +943,10 @@ class DPEngineCoreProc(EngineCore):
         self._shutting_down = False
 
         self._init_prefill_delayer(config, self.dp_group)
+        # `store_tokens` routing reads each rank's own prefill backlog.
+        self._report_backlog = (
+            getattr(config, "dp_load_balance", None) == "store_tokens"
+        )
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
@@ -952,6 +989,8 @@ class DPEngineCoreProc(EngineCore):
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
+                if self._report_backlog:
+                    self._report_prefill_backlog()
                 local_unfinished = not self.scheduler.is_finished() and not (
                     self._is_rl_weights_offloaded or self._weight_sync_fenced
                 )

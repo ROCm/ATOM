@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -56,7 +55,9 @@ def load_stream_priority() -> int:
     Save threads and everything else keep the default priority (0).
     """
     global _LOAD_PRIORITY_LOGGED
-    if os.environ.get("OFFLOAD_LOAD_STREAM_HIGH_PRIORITY", "0") not in ("1", "true"):
+    from atom.utils import envs
+
+    if not envs.OFFLOAD_LOAD_STREAM_HIGH_PRIORITY:
         return 0
     if "-load" not in threading.current_thread().name:
         return 0
