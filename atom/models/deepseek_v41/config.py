@@ -352,11 +352,11 @@ def validate_runtime_config(config):
             or len(transfers) != 2
             or not all(isinstance(leg, dict) for leg in transfers)
             or sorted(KVConnectorFactory.connector_name(leg) or "" for leg in transfers)
-            != ["lmcache_mp", "mooncake"]
+            not in (["lmcache_mp", "mooncake"], ["mooncake", "mooncake_store"])
         ):
             raise ValueError(
                 "DeepSeek-V4.1 runtime does not support KV transfer other than "
-                "lmcache_mp or mooncake; multi requires exactly one of each"
+                "lmcache_mp, mooncake_store or mooncake; multi requires mooncake plus one offload tier"
             )
 
     unsupported = []

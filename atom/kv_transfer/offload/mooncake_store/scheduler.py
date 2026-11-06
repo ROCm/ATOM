@@ -21,6 +21,7 @@ from typing import Any
 
 from atom.kv_transfer.disaggregation.types import LoadOperationId, SaveOperationId
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
 from atom.kv_transfer.offload._offload_common import (
     max_pending_saves,
     validated_kv_role,
@@ -497,9 +498,9 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         super().__init__(
             config,
             chunk_size=cfg.chunk_tokens,
-            lookup_client=_StoreLookup(
+            lookup_client=AsyncStoreLookup(_StoreLookup(
                 cfg, namespace=namespace, world=world, chunk_tokens=cfg.chunk_tokens
-            ),
+            )),
         )
         extra = kvc.get("kv_connector_extra_config", kvc) or {}
         # Unbounded unless asked for, in the connector config or through
@@ -521,6 +522,16 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             self._max_pending_saves,
             cfg.save_abandon_timeout_s,
         )
+
+    def offer_lookups(self, seqs):
+        # Called on arrival after tokenization, before admission/prefill.
+        if self._do_load:
+            for seq in seqs:
+                if self._lookup_len(seq) > 0:
+                    self._lookup_client.submit(seq, str(seq.id))
+
+    def close(self):
+        self._lookup_client.close()
 
     def _lookup_token_ids(self, seq: Any) -> Any:
         """The sequence itself: the lookup hashes its prompt once per sequence.

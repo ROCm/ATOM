@@ -61,6 +61,7 @@ from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store.config import (
     check_engine_compatibility,
     parse_mooncake_store_config,
+    uses_replay_pages,
 )
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,

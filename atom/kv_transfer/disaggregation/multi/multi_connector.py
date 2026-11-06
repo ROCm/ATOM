@@ -382,6 +382,35 @@ class MultiConnector(KVConnectorBase):
 class MultiConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side composite connector."""
 
+    def _prefetch_tier(self):
+        # Prefill producer + one offload tier only; decode's P/D receive
+        # must not compete with a speculative Store read into the same blocks.
+        if not self.is_producer:
+            return None
+        return next((c for c in self._connectors
+                     if getattr(c, "is_offload", False)), None)
+
+    @property
+    def supports_async_lookup(self):
+        return bool(getattr(self._prefetch_tier(), "supports_async_lookup", False))
+
+    @property
+    def chunk_size(self):
+        return getattr(self._prefetch_tier(), "chunk_size", 0)
+
+    def lookup_ready(self, seq):
+        c = self._prefetch_tier()
+        return c is not None and c.lookup_ready(seq)
+
+    def take_ready_lookup(self, seq):
+        c = self._prefetch_tier()
+        return c is not None and c.take_ready_lookup(seq)
+
+    def release_taken_lookup(self, seq):
+        c = self._prefetch_tier()
+        if c is not None:
+            c.release_taken_lookup(seq)
+
     def bind_block_manager(self, block_manager: Any) -> None:
         """Bind native checkpoint owners before any request can be admitted."""
         for connector in self._connectors:
