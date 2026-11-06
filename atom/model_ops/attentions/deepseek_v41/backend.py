@@ -877,6 +877,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             filled=layout.filled,
             filled_gpu=filled_gpu,
             finishing_gpu=finishing_gpu,
+            tail_rows_host=layout.rows,
         )
 
     @staticmethod

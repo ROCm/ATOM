@@ -49,7 +49,7 @@ class DecoderGraph:
         read = {s.topk_owner for s in specs} | {s.candidate_source for s in specs}
         self.records = not (read - {None} - {s.layer_id for s in specs})
 
-    def run(self, forward, plan, normed, seam):
+    def run(self, forward, plan, normed, seam, *, gather_tail=None):
         """Layer 39's output rows, one per tail request (`ReplayPlan.last`),
         from the forward's ``normed`` rows and mHC ``seam`` at layer 20.
         Recorded under the runner's request-bucket pass ("record_req"),
@@ -64,12 +64,19 @@ class DecoderGraph:
         )
 
         def tail_rows(out=None):
+            target = None if out is None else tuple(t[None] for t in out)
+            if gather_tail is not None:
+                # Owner transport fills the same recording inputs and preserves
+                # all quantization planes; the decoder graph remains native.
+                return tuple(
+                    t.squeeze(0) for t in gather_tail(*fields, *seam, out=target)
+                )
             gathered = gather_rows(
                 plan.tail_rows,
                 *fields,
                 *seam,
                 dim=1,
-                out=None if out is None else tuple(t[None] for t in out),
+                out=target,
             )
             return tuple(t.squeeze(0) for t in gathered)
 

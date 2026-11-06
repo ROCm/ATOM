@@ -632,6 +632,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # periods and the noise floor under them are in the environment doc, and
     # end-to-end throughput is too coarse to see an effect that size.
     "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
+    "ATOM_DSV41_OWNER_FP8_ATTENTION": lambda: os.getenv(
+        "ATOM_DSV41_OWNER_FP8_ATTENTION", "native"
+    ),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
@@ -664,6 +667,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ","
         )
         if s.strip()
+    ),
+    "ATOM_DSV41_ROW_SHARDED_MHC": lambda: _flag_env("ATOM_DSV41_ROW_SHARDED_MHC"),
+    "ATOM_DSV41_PREFILL_TAIL_MODE": lambda: os.environ.get(
+        "ATOM_DSV41_PREFILL_TAIL_MODE", "off"
+    ),
+    "ATOM_DSV41_PREFILL_TAIL_TRANSPORT": lambda: os.environ.get(
+        "ATOM_DSV41_PREFILL_TAIL_TRANSPORT", "packet"
     ),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --

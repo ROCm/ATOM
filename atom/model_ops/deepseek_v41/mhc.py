@@ -98,6 +98,8 @@ class SinglePassHCState:
     pending: torch.Tensor | None = None
     post_mix: torch.Tensor | None = None
     combination: torch.Tensor | None = None
+    row_sharded: bool = False
+    original_rows: int | None = None
 
     @classmethod
     def from_embeddings(cls, hidden: torch.Tensor, hc_mult: int):
@@ -121,6 +123,8 @@ class SinglePassHCState:
                 self.pending, self.residual, self.post_mix, self.combination
             ),
             self.pre_mix,
+            row_sharded=self.row_sharded,
+            original_rows=self.original_rows,
         )
 
     def fields(self):
