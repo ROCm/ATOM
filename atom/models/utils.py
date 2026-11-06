@@ -557,3 +557,30 @@ def is_neox_rope_style(
     if interleave is None:
         return default_is_neox
     return not bool(interleave)
+
+
+# Per-rank bytes, times the TP size, above which an MTP fc all-gather takes
+# RCCL instead of aiter's custom all-gather. aiter's custom path has no size
+# fallback of its own, and the draft's first step runs over a whole prefill
+# chunk (16384 tokens x 1024 bf16 = 32 MiB a rank for Qwen3.5-397B at TP4).
+# The value is aiter's `CustomAllreduce._ALL_GATHERV_BYTES_PER_RANK`, measured
+# on MI355X for its custom-vs-NCCL all-gather crossover (about 4.5 / 9 / 21 MB
+# a rank at 2 / 4 / 8 ranks); it has not been measured for this gather. Decode
+# payloads sit far below it: 64 requests x 6 rows x 2 KiB = 768 KiB at TP4.
+MTP_FC_CUSTOM_AG_BYTES_PER_RANK = 2 << 20
+
+
+def mtp_fc_gather_use_custom(x: torch.Tensor, world_size: int) -> bool:
+    """Whether the MTP fc all-gather of `x` takes aiter's custom collective.
+
+    `ATOM_USE_CUSTOM_ALL_GATHER` (the LM head's knob) and a payload bound,
+    like `indexer_cp._can_all_gather`. Both are rank-invariant: every TP rank
+    gathers the same [tokens, hidden / tp] shape, so no rank can take a
+    different collective from its peers.
+    """
+    from atom.utils import envs
+
+    if not envs.ATOM_USE_CUSTOM_ALL_GATHER:
+        return False
+    nbytes = x.numel() * x.element_size()
+    return nbytes <= MTP_FC_CUSTOM_AG_BYTES_PER_RANK * world_size
