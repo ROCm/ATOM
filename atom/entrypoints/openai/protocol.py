@@ -79,6 +79,22 @@ def resolve_prompt_token_ids(
     return ids
 
 
+# The leave reasons that mean the model ended the output itself: its EOS, one
+# of the request's stop sequences, or one of the model's stop tokens
+# (`stop_<token_id>`), and `stop`, the same fact in OpenAI's words. Every other
+# reason -- `max_tokens`, `aborted`, `unschedulable: ...` -- cut it off.
+MODEL_STOP_REASONS = ("eos", "stop", "stop_sequence")
+STOP_TOKEN_REASON_PREFIX = "stop_"
+
+
+def ended_by_stop(finish_reason: str | None) -> bool:
+    """Did the model end its output itself, rather than being cut off?"""
+    return finish_reason is not None and (
+        finish_reason in MODEL_STOP_REASONS
+        or finish_reason.startswith(STOP_TOKEN_REASON_PREFIX)
+    )
+
+
 def openai_stop_reason(finish_reason: str | None) -> str | None:
     """The engine's leave reason as OpenAI spells it.
 
@@ -94,7 +110,9 @@ def openai_stop_reason(finish_reason: str | None) -> str | None:
     """
     if finish_reason is None:
         return None
-    if finish_reason in ("stop", "length", "tool_calls"):
+    if ended_by_stop(finish_reason):
+        return "stop"
+    if finish_reason in ("length", "tool_calls"):
         return finish_reason
     if finish_reason in ("max_tokens", "max_new_tokens"):
         return "length"
@@ -253,6 +271,8 @@ class ChatCompletionRequest(BaseModel):
     ignore_eos: bool | None = False
     stream: bool | None = False
     stream_options: dict[str, Any] | None = None
+    logprobs: Annotated[bool, Field(strict=True)] | None = False
+    top_logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] | None = None
     seed: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     # Tool calling

@@ -51,6 +51,7 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import load_tokenizer
 from atom.model_engine.request import RequestOutput
+from atom.model_engine.segment_tokenizer import PrefixEncoding
 from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.multimodal.registry import get_native_multimodal_processor
@@ -85,6 +86,7 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
+from .logprobs import LogprobCollector, TokenBytes
 from .metrics_setup import create_metrics_exporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
@@ -94,6 +96,7 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    ended_by_stop,
     validate_max_tokens,
 )
 from .reasoning import (
@@ -166,6 +169,7 @@ from .streaming_dispatch import (
     StreamBatchDispatcher,
     StreamOutputCollector,
     enable_delta_reuse,
+    oldest_waiting_since,
 )
 from .tool_parser import (
     ToolCallStreamParser,
@@ -224,6 +228,14 @@ _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
 _request_logger: logging.Logger | None = None
 _stream_batch_dispatcher: StreamBatchDispatcher | None = None
+# --api-server-count > 1. In a front-end worker: the hub's admin Unix socket,
+# where everything but the inference routes is answered. In the hub: the
+# FrontendHub that feeds the workers' requests to the engine.
+_frontend_hub_uds: str | None = None
+_frontend_hub = None
+# In a front-end worker: (FrontendStatsBoard, worker index), published on the
+# metrics cadence so the hub's /metrics covers this process too.
+_frontend_stats = None
 # `SYNTHETIC_TOKEN_TEXT` while a run's own text is meaningless, None otherwise.
 # One switch for both delivery modes: they decode in different places, and a
 # response that read differently depending on `stream` is the asymmetry the
@@ -578,6 +590,8 @@ def _build_sampling_params(
     n: int = 1,
     required_channel: RequiredChannel | None = None,
     max_tokens_is_default: bool = False,
+    logprobs: bool = False,
+    top_logprobs: int = 0,
 ) -> SamplingParams:
     from .model_capabilities import deployment_metadata
 
@@ -601,6 +615,8 @@ def _build_sampling_params(
         ignore_eos=ignore_eos,
         n=n,
         required_channel=required_channel,
+        logprobs=logprobs,
+        top_logprobs=top_logprobs,
     )
 
 
@@ -774,6 +790,8 @@ def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
         "started_at": started_at,
         "num_cached_tokens": getattr(request_output, "num_cached_tokens", 0),
     }
+    if request_output.logprobs is not None:
+        chunk_data["logprobs"] = request_output.logprobs
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
     return chunk_data
@@ -853,7 +871,7 @@ async def _submit_engine_requests(seqs):
 
 
 async def generate_async(
-    prompt_or_tokens: str | list[int],
+    prompt_or_tokens: str | list[int] | PrefixEncoding,
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
@@ -876,6 +894,7 @@ async def generate_async(
     # the counters and never `token_ids`, so nothing serializes it. A
     # consumer that starts reading that key has to convert.
     all_token_ids = new_token_ids()
+    all_logprobs = [] if sampling_params.logprobs else None
     finish_reason: str | None = None
     seq = None
     kv_transfer_output_meta_info = None
@@ -894,6 +913,7 @@ async def generate_async(
             token_queue.put_nowait,
             {
                 "token_ids": request_output.output_tokens,
+                "logprobs": request_output.logprobs,
                 "finished": request_output.finished,
                 "finish_reason": request_output.finish_reason,
                 "ts": now,
@@ -930,6 +950,8 @@ async def generate_async(
                     record_nonstream_first_token()
                 last_token_at = item.get("ts", time.time())
                 all_token_ids.extend(token_ids)
+                if all_logprobs is not None:
+                    all_logprobs.extend(item.get("logprobs") or [])
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
                 _finished_ok = True
@@ -949,7 +971,7 @@ async def generate_async(
                     engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
 
-    text = delivered_text(all_token_ids)
+    text = "" if sampling_params.logprobs else delivered_text(all_token_ids)
     num_tokens_input = (
         seq.num_prompt_tokens
         if seq is not None
@@ -974,6 +996,7 @@ async def generate_async(
     response = {
         "text": text,
         "token_ids": all_token_ids,
+        "logprobs": all_logprobs,
         "finish_reason": finish_reason,
         "num_tokens_input": num_tokens_input,
         "num_tokens_output": num_tokens_output,
@@ -1122,6 +1145,7 @@ async def generate_async_fanout(
 
     started_at = time.time()
     per_tokens = [new_token_ids() for _ in range(n)]
+    per_logprobs = [[] for _ in range(n)] if sampling_params.logprobs else None
     per_first_token_at: list[float | None] = [None] * n
     per_last_token_at: list[float | None] = [None] * n
     per_finish_reason: list[str | None] = [None] * n
@@ -1136,6 +1160,7 @@ async def generate_async_fanout(
                     idx,
                     {
                         "token_ids": request_output.output_tokens,
+                        "logprobs": request_output.logprobs,
                         "finished": request_output.finished,
                         "finish_reason": request_output.finish_reason,
                         "ts": now,
@@ -1184,6 +1209,8 @@ async def generate_async_fanout(
                     record_nonstream_first_token()
                 per_last_token_at[idx] = item.get("ts", time.time())
                 per_tokens[idx].extend(tokens)
+                if per_logprobs is not None:
+                    per_logprobs[idx].extend(item.get("logprobs") or [])
             if item.get("finished", False):
                 per_finish_reason[idx] = item.get("finish_reason")
                 finished[idx] = True
@@ -1216,8 +1243,11 @@ async def generate_async_fanout(
         )
         outputs.append(
             {
-                "text": delivered_text(per_tokens[i]),
+                "text": (
+                    "" if sampling_params.logprobs else delivered_text(per_tokens[i])
+                ),
                 "token_ids": per_tokens[i],
+                "logprobs": per_logprobs[i] if per_logprobs is not None else None,
                 "finish_reason": per_finish_reason[i],
                 "num_tokens_input": num_tokens_input,
                 "num_tokens_output": num_tokens_output,
@@ -1306,6 +1336,50 @@ def _prompt_headroom(
     return headroom
 
 
+def _prepare_prompt(
+    messages,
+    template_kwargs: dict[str, Any],
+    *,
+    tools,
+    preserve_tool_call_arguments: bool,
+    max_tokens: int,
+    kv_transfer_params: dict[str, Any] | None,
+) -> tuple[PrefixEncoding | list[int], str]:
+    """Render, tokenize the engine's way and cut to the context, in one
+    executor step for ``/v1/messages`` and ``/v1/responses``.
+
+    Returns ``(engine_input, text)``: what preprocess takes in place of the
+    prompt (no second tokenize), and the text the engine runs, which seeds the
+    reasoning channel. A prompt longer than the context minus the output
+    headroom is cut from the end; a context with no room for any prompt is
+    refused (ValueError, a 400)."""
+    prompt = apply_chat_template(
+        tokenizer,
+        custom_message_encoder,
+        messages,
+        tools=tools,
+        preserve_tool_call_arguments=preserve_tool_call_arguments,
+        **template_kwargs,
+    )
+    encoded = engine.io_processor.encode_prompt(prompt)
+    max_ctx = int(_get_engine_max_model_len() or 30720)
+    cap = max_ctx - _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
+    if cap < 1:
+        raise ValueError(
+            f"max_tokens={max_tokens} leaves no room for a prompt in this "
+            f"model's {max_ctx}-token context"
+        )
+    token_ids = encoded.token_ids if isinstance(encoded, PrefixEncoding) else encoded
+    if len(token_ids) <= cap:
+        return encoded, prompt
+    logger.warning("Prompt too long (%d > %d), truncating", len(token_ids), cap)
+    token_ids = list(token_ids[:cap])
+    text = tokenizer.decode(token_ids, skip_special_tokens=False)
+    if not text:
+        raise ValueError("The prompt is empty after truncation to the context")
+    return token_ids, text
+
+
 def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
     """Return the prefill's KV location to the PD router, as chat does."""
     if "kv_transfer_output_meta_info" in final_output:
@@ -1314,7 +1388,7 @@ def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
 
 
 async def setup_streaming_request(
-    prompt_or_tokens: str | list[int],
+    prompt_or_tokens: str | list[int] | PrefixEncoding,
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
@@ -1338,7 +1412,9 @@ async def setup_streaming_request(
     # The detokenizer lives in this closure, so it is freed when the engine
     # drops the callback on the stream's last chunk -- no registry, no cleanup.
     assert _stream_batch_dispatcher is not None
-    detokenizer = _stream_batch_dispatcher.new_state()
+    detokenizer = _stream_batch_dispatcher.new_state(
+        decode=not sampling_params.logprobs
+    )
 
     def stream_callback(request_output: RequestOutput) -> None:
         _send_stream_chunk_direct(
@@ -1549,7 +1625,9 @@ async def setup_streaming_request_fanout(
 
     def make_callback(idx: int):
         # One detokenizer per sibling, held by the closure that feeds it.
-        detokenizer = _stream_batch_dispatcher.new_state()
+        detokenizer = _stream_batch_dispatcher.new_state(
+            decode=not sampling_params.logprobs
+        )
 
         def _cb(request_output: RequestOutput) -> None:
             _send_stream_chunk_tagged(
@@ -1660,7 +1738,10 @@ async def lifespan(app: FastAPI):
     logger.info("Server started successfully and ready to accept requests")
     tune_gc()
     maybe_attach_gc_debug_callback("api_server")
-    await _refresh_metrics_once()
+    # A front-end worker holds no engine metrics: the hub answers /metrics.
+    refresh_metrics = _frontend_hub_uds is None
+    if refresh_metrics:
+        await _refresh_metrics_once()
     # The engine was built in `main()`, so this is the last point before the
     # first request at which everything reachable is still startup state.
     freeze_gc_heap("api_server")
@@ -1671,7 +1752,10 @@ async def lifespan(app: FastAPI):
         for interval, step in (
             (metrics_interval, _refresh_metrics_once),
             (_GC_WATCH_INTERVAL_SECONDS, _reclaim_watch_once),
+            (metrics_interval, _publish_frontend_stats_once),
         )
+        if (refresh_metrics or step is not _refresh_metrics_once)
+        and (_frontend_stats is not None or step is not _publish_frontend_stats_once)
     ]
     try:
         yield
@@ -1689,7 +1773,12 @@ async def lifespan(app: FastAPI):
             if engine is not None:
                 engine.close()
         finally:
-            await asyncio.to_thread(shutdown_tracing)
+            try:
+                # After the engine: its output threads flush into the hub.
+                if _frontend_hub is not None:
+                    _frontend_hub.close()
+            finally:
+                await asyncio.to_thread(shutdown_tracing)
 
 
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
@@ -1698,6 +1787,73 @@ app.add_middleware(
     observe_ttft=_request_metrics.observe_time_to_first_token,
 )
 app.add_middleware(TraceMiddleware, model=lambda: model_name)
+
+# Management routes that read the engine. With --api-server-count > 1 the
+# process that owns the engine (the hub) answers them, and a front-end worker
+# relays them over the hub's Unix socket; every other route is served where it
+# arrives. Register such a route with `_engine_route`, not `@app.get`.
+_ENGINE_ROUTES: set[str] = set()
+_frontend_hub_session = None
+# Hop-by-hop or recomputed by the relay.
+_RELAY_SKIP_HEADERS = frozenset(("host", "content-length", "transfer-encoding"))
+
+
+def _engine_route(path: str, **kwargs):
+    """``app.api_route`` for a route the engine-owning process answers."""
+    _ENGINE_ROUTES.add(path)
+    kwargs.setdefault("methods", ["GET"])
+    return app.api_route(path, **kwargs)
+
+
+async def _publish_frontend_stats_once() -> None:
+    board, index = _frontend_stats
+    board.publish(index, oldest_waiting_since())
+
+
+@app.middleware("http")
+async def _forward_to_frontend_hub(request: Request, call_next):
+    """In a front-end worker, relay the engine's management routes (health,
+    metrics, profiling, cache and debug stats) to the hub."""
+    global _frontend_hub_session
+    if _frontend_hub_uds is None or request.url.path not in _ENGINE_ROUTES:
+        return await call_next(request)
+    import aiohttp
+
+    if _frontend_hub_session is None:
+        _frontend_hub_session = aiohttp.ClientSession(
+            connector=aiohttp.UnixConnector(path=_frontend_hub_uds),
+            timeout=aiohttp.ClientTimeout(total=None),
+        )
+    try:
+        return await _relay_to_hub(request)
+    except aiohttp.ClientError:
+        # Workers serve before the hub binds its socket and after it exits,
+        # and the hub can go away mid-reply.
+        return JSONResponse({"detail": "Engine hub is not serving"}, status_code=503)
+
+
+async def _relay_to_hub(request: Request) -> Response:
+    async with _frontend_hub_session.request(
+        request.method,
+        f"http://hub{request.url.path}",
+        params=list(request.query_params.multi_items()),
+        data=await request.body(),
+        headers={
+            k: v
+            for k, v in request.headers.items()
+            if k.lower() not in _RELAY_SKIP_HEADERS
+        },
+    ) as reply:
+        return Response(
+            content=await reply.read(),
+            status_code=reply.status,
+            headers={
+                k: v
+                for k, v in reply.headers.items()
+                if k.lower() not in _RELAY_SKIP_HEADERS
+                and k.lower() != "content-encoding"
+            },
+        )
 
 
 # ---- Error handlers ----
@@ -1845,7 +2001,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         request.tools = normalize_chat_tools(request.tools)
         validate_chat_request(request)
         messages = request.get_messages()
-
+        logprob_codec = None
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
             merged_kwargs.update(request.chat_template_kwargs)
@@ -1884,10 +2040,24 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            logprobs=bool(request.logprobs),
+            top_logprobs=request.top_logprobs or 0,
             required_channel=channel_for_request(
                 required_tool_channel, request.tool_choice, request_tools(request)
             ),
         )
+
+        if request.logprobs:
+            sampling_params.validate_logprob_options(
+                _get_engine_config(),
+                kv_transfer=request.kv_transfer_params,
+                multimodal=_has_multimodal_content(messages),
+                synthetic=synthetic_token_text is not None,
+            )
+            logprob_codec = getattr(app.state, "logprob_codec", None)
+            if logprob_codec is None or logprob_codec.tokenizer is not tokenizer:
+                logprob_codec = TokenBytes(tokenizer)
+                app.state.logprob_codec = logprob_codec
 
         schema = schema_from_format(request.response_format)
 
@@ -1924,7 +2094,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             prompt_or_tokens = pretokenized
             kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
         else:
-            prompt_or_tokens = apply_chat_template(
+            prompt_or_tokens = await asyncio.to_thread(
+                apply_chat_template,
                 tokenizer,
                 custom_message_encoder,
                 messages,
@@ -1959,64 +2130,44 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         # Streaming
         if request.stream:
-            stream_input = prompt_or_tokens
-            stream_multimodal_data = multimodal_data
-            if effective_n > 1:
-                seq_ids, stream_collector, num_prompt_tokens = (
-                    await setup_streaming_request_fanout(
-                        stream_input,
-                        sampling_params,
-                        request_id,
-                        multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=kv_transfer_params,
-                        **dp_routing,
-                    )
-                )
-                gen = stream_chat_response_fanout(
-                    request_id,
-                    model_name,
+            setup = (
+                setup_streaming_request_fanout
+                if effective_n > 1
+                else setup_streaming_request
+            )
+            sequences, stream_collector, num_prompt_tokens = await setup(
+                prompt_or_tokens,
+                sampling_params,
+                request_id,
+                multimodal_data=multimodal_data,
+                kv_transfer_params=kv_transfer_params,
+                **dp_routing,
+            )
+            if logprob_codec is not None:
+                stream_collector = LogprobCollector(
                     stream_collector,
-                    seq_ids,
-                    num_prompt_tokens,
-                    cleanup_stream,
-                    cleanup_request,
-                    tools=request.tools,
-                    tool_choice=request.tool_choice,
-                    reasoning=_reasoning,
-                    tool_parser_cls=tool_call_parser_cls,
-                    usage_on_finish=compatibility.chat_usage_on_finish,
-                    include_usage=bool(
-                        (request.stream_options or {}).get("include_usage")
-                    ),
+                    logprob_codec,
+                    sampling_params.top_logprobs,
+                    effective_n,
                 )
-            else:
-                seq_id, stream_collector, num_prompt_tokens = (
-                    await setup_streaming_request(
-                        stream_input,
-                        sampling_params,
-                        request_id,
-                        multimodal_data=stream_multimodal_data,
-                        kv_transfer_params=kv_transfer_params,
-                        **dp_routing,
-                    )
-                )
-                gen = stream_chat_response(
-                    request_id,
-                    model_name,
-                    stream_collector,
-                    seq_id,
-                    num_prompt_tokens,
-                    cleanup_stream,
-                    cleanup_request,
-                    tools=request.tools,
-                    tool_choice=request.tool_choice,
-                    reasoning=_reasoning,
-                    tool_parser_cls=tool_call_parser_cls,
-                    usage_on_finish=compatibility.chat_usage_on_finish,
-                    include_usage=bool(
-                        (request.stream_options or {}).get("include_usage")
-                    ),
-                )
+            stream_response = (
+                stream_chat_response_fanout if effective_n > 1 else stream_chat_response
+            )
+            gen = stream_response(
+                request_id,
+                model_name,
+                stream_collector,
+                sequences,
+                num_prompt_tokens,
+                cleanup_stream,
+                cleanup_request,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+                reasoning=_reasoning,
+                tool_parser_cls=tool_call_parser_cls,
+                usage_on_finish=compatibility.chat_usage_on_finish,
+                include_usage=bool((request.stream_options or {}).get("include_usage")),
+            )
             if schema is not None:
 
                 gen = validate_chat_stream(gen, schema)
@@ -2050,6 +2201,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=sampling_params.top_logprobs,
             )
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
@@ -2075,6 +2228,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=sampling_params.top_logprobs,
             )
         elif effective_n > 1:
             outputs = await _race_disconnect(
@@ -2099,6 +2254,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=sampling_params.top_logprobs,
             )
         else:
             final_output = await _run_nonstream_with_disconnect(
@@ -2124,6 +2281,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=sampling_params.top_logprobs,
             )
         if schema is not None:
 
@@ -2351,15 +2510,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # no such spelling, and are not answered here or on the chat path.
         if forbids_tool_calls(request.tool_choice):
             merged_kwargs["tool_choice"] = "none"
-        prompt = apply_chat_template(
-            tokenizer,
-            custom_message_encoder,
-            messages,
-            tools=anthropic_to_openai_tools(request.tools),
-            preserve_tool_call_arguments=preserve_tool_call_arguments,
-            **merged_kwargs,
-        )
-
         generation_config = engine.config.generation_config
         model_temperature = getattr(generation_config, "temperature", None)
         model_top_p = getattr(generation_config, "top_p", None)
@@ -2388,47 +2538,23 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         request_id = uuid.uuid4().hex[:24]
         set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
-        input_tokens = len(tokenizer.encode(prompt))
-
-        max_ctx = None
-        for _path in (
-            lambda: engine.config.max_model_len,
-            lambda: engine.model_config.max_model_len,
-            lambda: engine.scheduler.max_model_len,
-            lambda: engine.max_model_len,
-        ):
-            try:
-                _v = _path()
-                if _v:
-                    max_ctx = int(_v)
-                    break
-            except Exception:
-                logger.debug("max_ctx candidate rejected", exc_info=True)
-                continue
-        if not max_ctx:
-            max_ctx = 30720
-        logger.warning(f"[anthropic] resolved max_ctx={max_ctx}")
-        headroom = _prompt_headroom(
-            sampling_params.max_tokens, max_ctx, kv_transfer_params
+        engine_input, prompt = await asyncio.to_thread(
+            _prepare_prompt,
+            messages,
+            merged_kwargs,
+            tools=anthropic_to_openai_tools(request.tools),
+            preserve_tool_call_arguments=preserve_tool_call_arguments,
+            max_tokens=sampling_params.max_tokens,
+            kv_transfer_params=kv_transfer_params,
         )
-        max_input = max_ctx - headroom
-        if input_tokens > max_input:
-            logger.warning(
-                f"Prompt too long ({input_tokens} > {max_input}), truncating"
-            )
-            token_ids = tokenizer.encode(prompt)[:max_input]
-            prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
-            input_tokens = max_input
 
         if request.stream:
             # Streaming response
-            seq_id, stream_collector, _num_prompt_tokens = (
-                await setup_streaming_request(
-                    prompt,
-                    sampling_params,
-                    request_id,
-                    kv_transfer_params=kv_transfer_params,
-                )
+            seq_id, stream_collector, input_tokens = await setup_streaming_request(
+                engine_input,
+                sampling_params,
+                request_id,
+                kv_transfer_params=kv_transfer_params,
             )
 
             async def generate_anthropic_stream():
@@ -2504,7 +2630,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                         # into the tool parser.
                         segments = reasoning_filter.process(new_text)
                         if finished:
-                            segments.extend(reasoning_filter.flush())
+                            segments.extend(
+                                reasoning_filter.flush(
+                                    stopped=ended_by_stop(engine_reason)
+                                )
+                            )
 
                         for field, text in segments:
                             if not text:
@@ -2600,7 +2730,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # Non-streaming response
         final_output = await _run_nonstream_with_disconnect(
             generate_async(
-                prompt,
+                engine_input,
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
@@ -2610,16 +2740,18 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
         if final_output is None:
             raise RuntimeError("No output generated")
+        input_tokens = final_output["num_tokens_input"]
 
         raw_text = final_output["text"]
         # Separating is unconditional -- the same call the chat path makes,
         # and what keeps a chain of thought out of the tool parser. Only
         # whether the client is shown it is a question, and the same one the
         # streaming branch above asks.
-        # Both stages over one chunk, in the order the branch above streams
-        # them: reasoning filter, then the tool parser on the content segments
-        # it yields. Calling `.split()` here instead flattened the two into
-        # `(reasoning, content)` and lost the interleaving at that line.
+        # Both stages over the whole output, once, in the order the branch
+        # above streams them: reasoning filter, then the tool parser on the
+        # content segments it yields. Calling `.split()` here instead
+        # flattened the two into `(reasoning, content)` and lost the
+        # interleaving at that line.
         events = read_whole_blocks(
             reasoning_channel(
                 prompt_starts_in_reasoning(prompt),
@@ -2629,11 +2761,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             raw_text,
             anthropic_to_openai_tools(request.tools),
             suppress_calls=forbids_tool_calls(request.tool_choice),
+            stopped=ended_by_stop(final_output.get("finish_reason")),
         )
         if drop_reasoning:
             events = [e for e in events if e[0] != "reasoning"]
         _, tool_calls = flatten_tool_events(events)
-        output_tokens = len(tokenizer.encode(raw_text))
+        output_tokens = final_output["num_tokens_output"]
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         response = build_anthropic_response(
             request_id=request_id,
@@ -2783,15 +2916,6 @@ async def responses_create(raw_request: Request):
             rules=rules,
         )
 
-        prompt = apply_chat_template(
-            tokenizer,
-            custom_message_encoder,
-            messages,
-            tools=openai_tools,
-            preserve_tool_call_arguments=preserve_tool_call_arguments,
-            **merged_kwargs,
-        )
-
         generation_config = engine.config.generation_config
         model_temperature = getattr(generation_config, "temperature", None)
         model_top_p = getattr(generation_config, "top_p", None)
@@ -2828,30 +2952,15 @@ async def responses_create(raw_request: Request):
         schema = schema_from_format((text_config or {}).get("format"), responses=True)
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
         set_request_id(request_id)
-        input_tokens = len(tokenizer.encode(prompt))
-
-        max_ctx = 30720
-        for obj in (
-            getattr(engine, "config", None),
-            getattr(engine, "model_config", None),
-            getattr(engine, "scheduler", None),
-            engine,
-        ):
-            value = getattr(obj, "max_model_len", None) if obj is not None else None
-            if value:
-                max_ctx = int(value)
-                break
-        headroom = _prompt_headroom(
-            sampling_params.max_tokens, max_ctx, kv_transfer_params
+        engine_input, prompt = await asyncio.to_thread(
+            _prepare_prompt,
+            messages,
+            merged_kwargs,
+            tools=openai_tools,
+            preserve_tool_call_arguments=preserve_tool_call_arguments,
+            max_tokens=sampling_params.max_tokens,
+            kv_transfer_params=kv_transfer_params,
         )
-        max_input = max_ctx - headroom
-        if input_tokens > max_input:
-            logger.warning(
-                f"Prompt too long ({input_tokens} > {max_input}), truncating"
-            )
-            token_ids = tokenizer.encode(prompt)[:max_input]
-            prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
-            input_tokens = max_input
 
         created_at = int(time.time())
         _reasoning = reasoning_channel(
@@ -2869,13 +2978,11 @@ async def responses_create(raw_request: Request):
         _reasoning = structured_response_channel(_reasoning, schema)
 
         if request.stream:
-            seq_id, stream_collector, _num_prompt_tokens = (
-                await setup_streaming_request(
-                    prompt,
-                    sampling_params,
-                    request_id,
-                    kv_transfer_params=kv_transfer_params,
-                )
+            seq_id, stream_collector, input_tokens = await setup_streaming_request(
+                engine_input,
+                sampling_params,
+                request_id,
+                kv_transfer_params=kv_transfer_params,
             )
 
             async def generate_responses_stream():
@@ -2910,7 +3017,13 @@ async def responses_create(raw_request: Request):
 
                         segments = reasoning_filter.process(new_text)
                         if finished:
-                            segments.extend(reasoning_filter.flush())
+                            segments.extend(
+                                reasoning_filter.flush(
+                                    stopped=ended_by_stop(
+                                        chunk_data.get("finish_reason")
+                                    )
+                                )
+                            )
 
                         for field, text in segments:
                             if not text:
@@ -2984,7 +3097,7 @@ async def responses_create(raw_request: Request):
 
         final_output = await _run_nonstream_with_disconnect(
             generate_async(
-                prompt,
+                engine_input,
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
@@ -2994,6 +3107,7 @@ async def responses_create(raw_request: Request):
         )
         if final_output is None:
             raise RuntimeError("No output generated")
+        input_tokens = final_output["num_tokens_input"]
 
         raw_text = final_output["text"]
         events = read_whole_blocks(
@@ -3002,8 +3116,9 @@ async def responses_create(raw_request: Request):
             raw_text,
             openai_tools,
             suppress_calls=forbids_tool_calls(request.tool_choice),
+            stopped=ended_by_stop(final_output.get("finish_reason")),
         )
-        output_tokens = len(tokenizer.encode(raw_text))
+        output_tokens = final_output["num_tokens_output"]
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         response = build_responses_response(
             request_id=request_id,
@@ -3057,15 +3172,18 @@ async def list_models():
     ).model_dump(exclude_none=True)
 
 
-@app.get("/health")
+@_engine_route("/health")
 async def health():
     """Report readiness of all engine workers, not just the HTTP process."""
     if engine is None or not engine.core_mgr.is_healthy():
         raise HTTPException(status_code=503, detail="Engine workers unavailable")
+    dead = _frontend_hub.dead_workers() if _frontend_hub is not None else []
+    if dead:
+        raise HTTPException(status_code=503, detail=f"Front-end workers {dead} exited")
     return {"status": "ok"}
 
 
-@app.api_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)
+@_engine_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)
 async def metrics():
     """Expose cached standalone-engine metrics in Prometheus text format."""
     return Response(
@@ -3074,7 +3192,7 @@ async def metrics():
     )
 
 
-@app.get("/debug/mtp_stats")
+@_engine_route("/debug/mtp_stats")
 async def get_mtp_stats():
     """Return current speculative decoding acceptance statistics."""
     if engine is None:
@@ -3088,7 +3206,7 @@ async def get_mtp_stats():
         )
 
 
-@app.get("/debug/cache_stats")
+@_engine_route("/debug/cache_stats")
 async def get_cache_stats():
     """Return cumulative prefix-cache reuse statistics."""
     if engine is None:
@@ -3150,7 +3268,7 @@ def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
     return fallback_role, fallback_port
 
 
-@app.get("/kv_transfer_info")
+@_engine_route("/kv_transfer_info")
 async def kv_transfer_info():
     cfg = engine.config
     kv_cfg = cfg.kv_transfer_config or {}
@@ -3181,7 +3299,7 @@ async def kv_transfer_info():
     return info
 
 
-@app.get("/server_info")
+@_engine_route("/server_info")
 async def server_info():
     """Server metadata for the Atomesh router.
 
@@ -3198,7 +3316,7 @@ async def server_info():
     }
 
 
-@app.post("/start_profile")
+@_engine_route("/start_profile", methods=["POST"])
 async def start_profile():
     """Start profiling the engine."""
     try:
@@ -3209,7 +3327,7 @@ async def start_profile():
         raise HTTPException(status_code=500, detail=f"Failed to start profiling: {e!s}")
 
 
-@app.post("/stop_profile")
+@_engine_route("/stop_profile", methods=["POST"])
 async def stop_profile():
     """Stop profiling the engine."""
     try:
@@ -3231,12 +3349,7 @@ async def stop_profile():
 
 def main():
     """Main entry point for the server."""
-    global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
-    global tool_call_parser_cls, required_tool_channel
-    global preserve_tool_call_arguments
-    global model_starts_in_reasoning, reasoning_toggle
-    global reasoning_dialect, synthetic_token_text
-    global custom_message_encoder, _stream_batch_dispatcher
+    global engine
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -3296,13 +3409,71 @@ def main():
         ),
     )
     parser.add_argument(
+        "--api-server-count",
+        type=int,
+        default=1,
+        help=(
+            "Front-end processes serving the HTTP port. Each one reads, parses, "
+            "templates, tokenizes and streams its own requests; the process "
+            "that owns the engine keeps routing and answers management "
+            "endpoints. Raise it when one process's event loop cannot keep up "
+            "with the request rate (long agentic conversations at high "
+            "concurrency). 1 serves everything in one process."
+        ),
+    )
+    parser.add_argument(
         "--request-log",
         type=str,
         default=None,
         help="Path to JSONL file for logging all API requests and responses (debug)",
     )
     args = parser.parse_args()
+    if args.api_server_count < 1:
+        parser.error("--api-server-count must be at least 1")
 
+    _setup_frontend(args)
+
+    logger.info(f"Initializing engine with model {args.model}...")
+    engine_args = EngineArgs.from_cli_args(args)
+    # Remote DP nodes block inside engine startup and never run the API loop.
+    # Expose their local mmap metrics on the same configured HTTP port.
+    dp_rank = (
+        envs.ATOM_DP_RANK
+        if envs.is_set("ATOM_DP_RANK")
+        else engine_args.data_parallel_rank
+    )
+    if dp_rank > 0:
+        from atom.metrics.prometheus import start_metrics_server
+
+        server, _ = start_metrics_server(args.host, args.server_port)
+        try:
+            engine_args.create_engine(tokenizer=tokenizer)
+        finally:
+            server.shutdown()
+            server.server_close()
+        return
+    _setup_reasoning_and_tools(args)
+
+    engine = engine_args.create_engine(tokenizer=tokenizer)
+    _setup_stream_dispatch(args)
+
+    # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
+    # their chunks into a thread-local; the engine core manager's output thread
+    # calls this flush after each step's callbacks to drain the buffer into the
+    # per-request stream collectors (one call_soon_threadsafe per event loop).
+    # Registered lazily here to avoid the api_server <-> engine_core_mgr import
+    # cycle; the core manager leaves the hook as None until this resolves it.
+    engine.core_mgr._flush_stream_batch_fn = flush_stream_batch
+    if args.api_server_count > 1:
+        _start_frontend_workers(args)
+    _serve(args)
+
+
+def _setup_frontend(args) -> None:
+    """Request log, tokenizer, chat template and model name: everything a
+    front end needs before the engine exists (shared with front-end workers)."""
+    global tokenizer, model_name, default_chat_template_kwargs, _request_logger
+    global custom_message_encoder
     if args.request_log:
         _request_logger = logging.getLogger("atom.request_log")
         _request_logger.setLevel(logging.INFO)
@@ -3330,25 +3501,13 @@ def main():
     model_name = args.served_model_name if args.served_model_name else args.model
     custom_message_encoder = load_custom_message_encoder(args.model)
 
-    logger.info(f"Initializing engine with model {args.model}...")
-    engine_args = EngineArgs.from_cli_args(args)
-    # Remote DP nodes block inside engine startup and never run the API loop.
-    # Expose their local mmap metrics on the same configured HTTP port.
-    dp_rank = (
-        envs.ATOM_DP_RANK
-        if envs.is_set("ATOM_DP_RANK")
-        else engine_args.data_parallel_rank
-    )
-    if dp_rank > 0:
-        from atom.metrics.prometheus import start_metrics_server
 
-        server, _ = start_metrics_server(args.host, args.server_port)
-        try:
-            engine_args.create_engine(tokenizer=tokenizer)
-        finally:
-            server.shutdown()
-            server.server_close()
-        return
+def _setup_reasoning_and_tools(args) -> None:
+    """Reasoning dialect, reasoning switch and tool-call parser, read from the
+    chat template (shared with front-end workers)."""
+    global tool_call_parser_cls, required_tool_channel
+    global preserve_tool_call_arguments
+    global model_starts_in_reasoning, reasoning_toggle, reasoning_dialect
     _template_source = chat_template_source(tokenizer, custom_message_encoder)
     reasoning_dialect, _dialect_stated = resolve_dialect(
         _template_source,
@@ -3388,7 +3547,11 @@ def main():
     preserve_tool_call_arguments = template_keeps_tool_call_arguments(tools_probe)
     required_tool_channel = required_call_channel(tool_call_parser_cls, tokenizer)
 
-    engine = engine_args.create_engine(tokenizer=tokenizer)
+
+def _setup_stream_dispatch(args) -> None:
+    """The batched stream dispatcher and detokenizer reuse (shared with
+    front-end workers)."""
+    global synthetic_token_text, _stream_batch_dispatcher
     # Forced acceptance emits draft tokens that nothing verified, and once the
     # context is long enough those degenerate into the dialect's own channel
     # framing and nothing else -- read as structure, correctly, that leaves a
@@ -3424,14 +3587,120 @@ def main():
         envs.ATOM_DETOKENIZER_AUDIT_EVERY,
     )
 
-    # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
-    # their chunks into a thread-local; the engine core manager's output thread
-    # calls this flush after each step's callbacks to drain the buffer into the
-    # per-request stream collectors (one call_soon_threadsafe per event loop).
-    # Registered lazily here to avoid the api_server <-> engine_core_mgr import
-    # cycle; the core manager leaves the hook as None until this resolves it.
-    engine.core_mgr._flush_stream_batch_fn = flush_stream_batch
 
+def _start_frontend_workers(args) -> None:
+    """--api-server-count > 1: start the hub and spawn the front-end workers,
+    which take over the public port. This process then serves management
+    endpoints only, on the hub's Unix socket."""
+    global _frontend_hub
+    import multiprocessing
+
+    from .frontend_workers import FrontendHub
+
+    hub = FrontendHub(
+        engine.core_mgr,
+        args.api_server_count,
+        prepare_structured=engine.prepare_structured_request,
+    )
+    hub.start()
+    _frontend_hub = hub
+    _metrics_exporter.attach_frontend_board(hub.stats)
+    engine.core_mgr._flush_stream_batch_fn = _flush_local_and_hub(
+        engine.core_mgr._flush_stream_batch_fn, hub
+    )
+    ctx = multiprocessing.get_context("spawn")
+    processes = []
+    for index in range(args.api_server_count):
+        proc = ctx.Process(
+            target=_frontend_worker_main,
+            args=(args, engine.config, hub.connection_info(index), os.getpid()),
+            name=f"ATOM-APIServer-{index}",
+            daemon=True,
+        )
+        proc.start()
+        processes.append(proc)
+    try:
+        hub.wait_for_workers(processes)
+    except RuntimeError:
+        for proc in processes:
+            proc.terminate()
+        engine.close()
+        raise
+    logger.info(
+        "Started %d front-end workers on %s:%s; engine hub admin socket %s",
+        args.api_server_count,
+        args.host,
+        args.server_port,
+        hub.admin_uds,
+    )
+
+
+def _flush_local_and_hub(local_flush, hub):
+    """The engine output thread's per-step flush with a hub: this process's
+    own streams, then each worker's batch. The hub's flush runs even if the
+    local one fails, or every worker's clients would stall."""
+
+    def flush():
+        try:
+            if local_flush is not None:
+                local_flush()
+        finally:
+            hub.flush()
+
+    return flush
+
+
+def _frontend_worker_main(args, config, info, parent_pid) -> None:
+    """Entry point of one front-end worker process."""
+    global engine, _frontend_hub_uds, _frontend_stats
+    from .frontend_workers import (
+        FrontendEngine,
+        bind_shared_listener,
+        watch_parent,
+    )
+
+    watch_parent(parent_pid)
+    _frontend_hub_uds = info["admin_uds"]
+    _frontend_stats = (info["stats"], info["index"])
+    _setup_frontend(args)
+    _setup_reasoning_and_tools(args)
+    engine = FrontendEngine(config, tokenizer, info)
+    _setup_stream_dispatch(args)
+    engine.core_mgr._flush_stream_batch_fn = flush_stream_batch
+    listener = bind_shared_listener(args.host, args.server_port)
+    engine.core_mgr.announce_ready()
+    uv_config = uvicorn.Config(
+        app,
+        loop=_loop_impl(),
+        access_log=not args.disable_uvicorn_access_log,
+        timeout_keep_alive=args.timeout_keep_alive,
+    )
+    logger.info(
+        "Front-end worker %d serving %s:%s",
+        info["index"],
+        args.host,
+        args.server_port,
+    )
+    uvicorn.Server(uv_config).run(sockets=[listener])
+
+
+def _loop_impl() -> str:
+    # uvloop replaces the stdlib asyncio selector loop with a libuv-backed one,
+    # which is markedly faster at the SSE socket I/O (sock.send / selector
+    # register-unregister) that saturates the event loop under high streaming
+    # concurrency. Fall back to the default loop if uvloop is unavailable.
+    try:
+        import uvloop  # noqa: F401
+
+        return "uvloop"
+    except ImportError:
+        logger.warning(
+            "uvloop not installed; falling back to the default asyncio loop."
+        )
+        return "auto"
+
+
+def _serve(args) -> None:
     import signal
 
     def _sigint_handler(signum, frame):
@@ -3453,20 +3722,19 @@ def main():
 
     signal.signal(signal.SIGINT, _sigint_handler)
 
-    # uvloop replaces the stdlib asyncio selector loop with a libuv-backed one,
-    # which is markedly faster at the SSE socket I/O (sock.send / selector
-    # register-unregister) that saturates the event loop under high streaming
-    # concurrency. Fall back to the default loop if uvloop is unavailable.
-    try:
-        import uvloop  # noqa: F401
-
-        loop_impl = "uvloop"
-    except ImportError:
-        loop_impl = "auto"
-        logger.warning(
-            "uvloop not installed; falling back to the default asyncio loop."
+    loop_impl = _loop_impl()
+    if _frontend_hub is not None:
+        # The workers own the public port; this process answers the
+        # management endpoints they relay.
+        logger.info(f"Engine hub serving on {_frontend_hub.admin_uds}")
+        uvicorn.run(
+            app,
+            uds=_frontend_hub.admin_uds,
+            loop=loop_impl,
+            access_log=not args.disable_uvicorn_access_log,
+            timeout_keep_alive=args.timeout_keep_alive,
         )
-
+        return
     logger.info(
         f"Starting server on {args.host}:{args.server_port} (loop={loop_impl})..."
     )

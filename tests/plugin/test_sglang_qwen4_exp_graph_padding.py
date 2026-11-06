@@ -13,6 +13,7 @@ from atom.plugin.sglang.qwen4_exp_bridge import (
     _NO_WRITE,
     _eager_qsa_max_seq_len,
     _fill_block_tables_into,
+    _flydsl_prefill_layout,
     _lift_qsa_seq_lens,
     _ple_state_pool_slots,
     _query_start_loc,
@@ -1356,3 +1357,34 @@ def test_checkpoint_context_resolved_once_per_config(monkeypatch):
     other = _flash_checkpoint_config(max_position_embeddings=32768)
     assert bridge._serving_context_len(other, 2048) == 32768
     assert len(walks) > first
+
+
+def _flydsl_layout(extends, seqs, live_bs, num_tokens):
+    fb = SimpleNamespace(extend_seq_lens_cpu=extends, seq_lens_cpu=seqs)
+    tables = torch.zeros((max(live_bs, 1), 4), dtype=torch.int32)
+    return _flydsl_prefill_layout(fb, live_bs, num_tokens, tables, 64)
+
+
+def test_flydsl_prefill_layout_unprefixed_batch_has_no_context_slots():
+    assert _flydsl_layout([3, 5], [3, 5], 2, 8) == (((3, 5), (3, 5)), None)
+
+
+@pytest.mark.parametrize(
+    "extends,seqs,live_bs,num_tokens",
+    [
+        # CUDA-graph / DP padding: more packed tokens than scheduled extends.
+        ([3, 5], [3, 5], 2, 12),
+        # Partial batch: fewer host lengths than live requests.
+        ([3], [3], 2, 3),
+        # Host lengths missing.
+        (None, [3, 5], 2, 8),
+        ([3, 5], None, 2, 8),
+        # An extend longer than its sequence is not a prefill layout.
+        ([3, 5], [3, 4], 2, 8),
+    ],
+    ids=["padded-tokens", "partial-batch", "no-extends", "no-seqs", "extend-gt-seq"],
+)
+def test_flydsl_prefill_layout_falls_back_unless_tokens_are_the_extends(
+    extends, seqs, live_bs, num_tokens
+):
+    assert _flydsl_layout(extends, seqs, live_bs, num_tokens) == (None, None)

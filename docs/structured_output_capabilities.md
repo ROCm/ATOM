@@ -143,12 +143,12 @@ rejected at both API and worker admission when `ATOM_ENABLE_RELAXED_MTP=1`, sinc
 relaxed acceptance can otherwise accept a draft with zero grammar-masked target
 probability. Unconstrained requests retain their existing behavior.
 
-This change preserves the existing non-speculative engine's scalar logprob
+Structured output preserves the non-speculative engine's scalar logprob
 semantics: normalization uses the raw model distribution before grammar and
 required-channel masks. Chat token-logprob responses, top candidates, and
-DSpark speculative logprobs are a separate change, not a prerequisite for
-structured output. A constrained request asking for speculative logprobs is
-rejected before enqueue until token-level speculative logprob support is available.
+DSpark speculative logprobs are described in [Chat token logprobs](chat_logprobs.md).
+The combined Schema + speculative decoding + logprobs mode is not supported and
+is rejected before enqueue. Disable speculative decoding or logprobs when using Schema.
 The ordinary path does not copy logits for this feature.
 
 With a DSML parser, normal function tools can accompany Chat `response_format`

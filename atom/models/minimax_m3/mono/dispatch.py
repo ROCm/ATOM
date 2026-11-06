@@ -140,8 +140,8 @@ class MonoDecode:
         bt = decode.block_table
         if bt.dtype != torch.int32 or decode.seq_lens.dtype != torch.int32:
             return False
-        # a row per request (eager decode cuts the tables to the real batch while
-        # the ids stay padded) and rows bt.shape[1] apart
+        # a row per request, the batch's pad rows included (``row_live`` keeps
+        # them out), and rows bt.shape[1] apart
         if (
             bt.shape[0] < n // q
             or decode.seq_lens.shape[0] < n // q
