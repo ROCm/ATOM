@@ -362,7 +362,10 @@ class _Env:
             "max_seqlen_k": int(ctx.max()),
         }
 
-    def propose(self, st, fused, dummy=False):
+    def propose(self, st, fused, dummy=False, epilogue=False):
+        """``epilogue``: step 0 staged by the runner's fused verify epilogue
+        (`verify_epilogue`, from ``st["verify"]``'s sampled ids) and handed to
+        `propose`, which then stages nothing itself."""
         os.environ["ATOM_MTP_FUSED_DRAFT_GLUE"] = "1" if fused else "0"
         self.p._fused_glue_deployment = None
         var = self.var
@@ -394,14 +397,33 @@ class _Env:
                     rbs, rbs * Q, False, Q, mode=mode, dummy=dummy, sbs=sbs
                 )
             md.max_seqlen_k = st["max_seqlen_k"]
+            next_ids, reject, anchors = st["next_ids"], st["reject"], st["anchors"]
+            if epilogue:
+                from atom.model_ops.verify_epilogue import (
+                    VerifyHandoff,
+                    verify_epilogue,
+                )
+
+                meta, target, bonus = st["verify"]
+                meta = NS(**{**vars(meta), "input_ids": ids[:n]})
+                stage, _ = self.p.verify_epilogue_targets(
+                    ids[1 : n + 1], st["positions"], st["hidden"]
+                )
+                assert stage is not None
+                _, verdict, next_ids = verify_epilogue(
+                    target, bonus, meta, max_bs=MAX_BS, stage=stage, uniform=True
+                )
+                reject, anchors = verdict[1], verdict[2]
+                self.p.verify_handoff = VerifyHandoff(stage["staged"], False)
             out = self.p.propose(
                 target_token_ids=ids[1 : n + 1],
                 target_positions=st["positions"],
                 target_hidden_states=st["hidden"],
-                num_reject_tokens=st["reject"],
-                next_token_ids=st["next_ids"],
-                last_token_indices=st["anchors"],
+                num_reject_tokens=reject,
+                next_token_ids=next_ids,
+                last_token_indices=anchors,
             )
+            assert "verify_handoff" not in self.p.__dict__
             indptr = var["kv_indptr"].gpu[: rbs + 1].clone()
             split = getattr(self.p, "_token_split", None)
             snap = {
@@ -634,3 +656,100 @@ def test_skipping_kv_indices_changes_nothing_else(env, sbs, rbs, monkeypatch):
     assert not fused["kv_indices"].any()
     eager.pop("kv_indices"), fused.pop("kv_indices")
     _assert_same(eager, fused)
+
+
+def _sampled_verify(st, seed):
+    """Sampled target ids for `st`'s decode step, with its next ids, rejected
+    counts and anchors replaced by what the eager chain makes of them
+    (`rejection_sample` and the next-anchor gather)."""
+    from atom.model_ops.rejection_sampler import rejection_sample
+
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    sbs, n = st["sbs"], st["n"]
+    ids = st["input_ids"]
+    tli = (
+        torch.arange(sbs, device="cuda")[:, None] * Q
+        + torch.arange(MTP_K, device="cuda")
+    ).reshape(-1)
+    cu = (torch.arange(1, sbs + 1, device="cuda") * MTP_K).to(torch.int32)
+    bli = torch.arange(sbs, device="cuda") * Q + MTP_K
+    drafts = ids[tli + 1]
+    accept = torch.randint(0, MTP_K + 1, (sbs,), generator=g, device="cuda")
+    pos = torch.arange(sbs * MTP_K, device="cuda") % MTP_K
+    acc = accept.repeat_interleave(MTP_K)
+    target = torch.randint(
+        0, VOCAB, (sbs * MTP_K,), generator=g, device="cuda", dtype=torch.int32
+    )
+    target = torch.where(pos < acc, drafts, target)
+    target = torch.where(
+        (pos == acc) & (target == drafts), (drafts + 1) % VOCAB, target
+    )
+    bonus = torch.randint(
+        0, VOCAB, (sbs,), generator=g, device="cuda", dtype=torch.int32
+    )
+    meta = NS(
+        input_ids=ids[:n],
+        num_spec_steps=MTP_K,
+        cu_num_draft_tokens=cu,
+        target_logits_indices=tli,
+        bonus_logits_indices=bli,
+    )
+    out, verdict = rejection_sample(
+        ids[:n], tli, MTP_K, cu, None, None, bonus, bli, target_token_ids=target
+    )
+    nxt = torch.gather(out, 1, verdict[0].view(-1, 1)).view(sbs)
+    return {
+        **st,
+        "next_ids": nxt,
+        "reject": verdict[1],
+        "anchors": verdict[2],
+        "verify": (meta, target, bonus),
+    }
+
+
+@pytest.mark.parametrize(
+    "sbs,rbs", [(1, 1), (5, 8), (9, 16), (16, 16), (103, 128), (150, 160)]
+)
+def test_step_0_staged_by_the_verify_epilogue_drafts_the_same(env, sbs, rbs):
+    """ATOM_MTP_FUSED_VERIFY_EPILOGUE: the epilogue's rejection, next ids and
+    step-0 staging, handed to `propose`, leave what the fused glue's own
+    staging of the eager chain's verdict leaves."""
+    st = _sampled_verify(env.batch(sbs * 5 + rbs, sbs, rbs), sbs + rbs)
+    _assert_same(env.propose(st, True), env.propose(st, True, epilogue=True))
+
+
+def test_the_epilogue_stages_nothing_where_the_glue_would_not(env):
+    """A ragged verify, a prefill, or the glue off: no step-0 staging offered."""
+    st = env.batch(4243, 6, 8)
+    n = 6 * Q - 1
+    os.environ["ATOM_MTP_FUSED_DRAFT_GLUE"] = "1"
+    env.p._fused_glue_deployment = None
+    mode = NS(
+        use_cudagraph=True,
+        is_prefill=False,
+        max_seqlen_q=Q,
+        running_tokens_are_unified=True,
+        running_tokens=8 * Q,
+        token_graph=False,
+    )
+    env._context(8, 8 * Q, False, Q, mode=mode, sbs=6)
+    ids = st["input_ids"]
+    assert (
+        env.p.verify_epilogue_targets(ids[1 : n + 1], st["positions"], st["hidden"])[0]
+        is None
+    )
+    stage, _ = env.p.verify_epilogue_targets(
+        ids[1 : 6 * Q + 1], st["positions"], st["hidden"]
+    )
+    assert stage is not None and stage["running_bs"] == 8
+    env._context(8, 700, True, 4096, sbs=3)
+    assert (
+        env.p.verify_epilogue_targets(ids[1:701], st["positions"], st["hidden"])[0]
+        is None
+    )
+    os.environ["ATOM_MTP_FUSED_DRAFT_GLUE"] = "0"
+    env.p._fused_glue_deployment = None
+    env._context(8, 8 * Q, False, Q, mode=mode, sbs=6)
+    assert env.p.verify_epilogue_targets(
+        ids[1 : 6 * Q + 1], st["positions"], st["hidden"]
+    ) == (None, None)

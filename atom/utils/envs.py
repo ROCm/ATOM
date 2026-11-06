@@ -1417,6 +1417,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MTP_ADVANCE_TOKEN_SPLIT": lambda: _flag_env(
         "ATOM_MTP_ADVANCE_TOKEN_SPLIT", "0"
     ),
+    # MTP verify: the work after sampling in one kernel (verify_epilogue.py) --
+    # the rejection, the presence marks, the next-anchor gather, and, for the
+    # drafter, step 0's staging (with ATOM_MTP_FUSED_DRAFT_GLUE on a uniform
+    # graphed verify) and the draft presence reset
+    # (ATOM_MTP_DRAFT_PRESENCE_PENALTY). Replaces ~10 eager launches between the
+    # sampler and the first draft pass. Same tokens and state, bit for bit.
+    "ATOM_MTP_FUSED_VERIFY_EPILOGUE": lambda: _flag_env(
+        "ATOM_MTP_FUSED_VERIFY_EPILOGUE", "0"
+    ),
+    # With ATOM_MTP_FUSED_VERIFY_EPILOGUE: the epilogue also writes the output
+    # rows and the [accepted, rejected] status straight into pinned host slots
+    # and flags them (system-scope release); the host polls the flag instead of
+    # an event record, two side-stream D2H copies and their completion events
+    # (output_transfer.HostHandoffRing). Not on a step with logprobs.
+    "ATOM_MTP_VERIFY_HOST_HANDOFF": lambda: _flag_env(
+        "ATOM_MTP_VERIFY_HOST_HANDOFF", "0"
+    ),
     # The verifier's presence penalty on the draft's argmax too (TP1 LM head): a
     # draft row loses the request's presence_penalty on every token it has emitted
     # and on the drafts before it in this step, as its verify row will, so the
