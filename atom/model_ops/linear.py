@@ -916,13 +916,12 @@ class LinearBase(nn.Module):
                 raise ValueError(
                     "TP partitions must align with the native source blocks"
                 )
-        self.mxfp8_linear_bpreshuffle = use_mxfp8_linear_bpreshuffle(
+        if use_mxfp8_linear_bpreshuffle(
             self.input_size,
             self.output_size,
             self.params_dtype,
             self.native_a8_group_rows,
-        )
-        if self.mxfp8_linear_bpreshuffle:
+        ):
             self.needs_preshuffled_weight = True
 
         if quant_type != QuantType.No and self.source_quant_dtype is None:
