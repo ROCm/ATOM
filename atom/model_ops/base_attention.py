@@ -533,6 +533,7 @@ def _flydsl_prepare_explicit_plan(
     existing_plan,
     plan_step_owner=None,
     plan_cache_owner=None,
+    plan_workgroup_budget=None,
 ):
     """Return the explicit plan aiter #5809 requires.
 
@@ -558,6 +559,8 @@ def _flydsl_prepare_explicit_plan(
     else:
         max_partitions = shape.get("max_partitions")
     workgroup_budget = shape.get("workgroup_budget")
+    if plan_workgroup_budget is not None:
+        workgroup_budget = int(plan_workgroup_budget)
 
     if existing_plan is not None and flydsl_plan_matches(
         existing_plan, num_seqs, num_kv_heads
@@ -688,6 +691,7 @@ def run_pa_decode(
     plan_step_owner=None,
     plan_cache_owner=None,
     plan_partition_cap: int | None = None,
+    plan_workgroup_budget: int | None = None,
 ):
     """Run the AITER paged-attention decode kernel.
 
@@ -811,6 +815,7 @@ def run_pa_decode(
             num_seqs=n,
             query_length=max_seqlen_q,
             plan_partition_cap=plan_partition_cap,
+            plan_workgroup_budget=plan_workgroup_budget,
             context_bound=context_bound,
             existing_plan=work_plan,
             plan_step_owner=plan_step_owner,

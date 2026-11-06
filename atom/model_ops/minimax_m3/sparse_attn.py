@@ -1390,6 +1390,13 @@ def minimax_m3_sparse_attn_decode_asm(
     )
 
 
+@functools.cache
+def _cluster_resident_rows(device) -> int:
+    """Sequences (one KV head each) whose workgroup clusters all stay resident:
+    gfx1250 keeps 15 clusters per 16 CUs, whatever their size."""
+    return torch.cuda.get_device_properties(device).multi_processor_count * 15 // 16
+
+
 @torch.no_grad()
 def sparse_pa_per_row(
     q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
@@ -1473,6 +1480,20 @@ def sparse_pa_per_row(
     num_seqs = T * num_kv_heads
     num_kv_heads_view = 1
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
+    plan_workgroup_budget = None
+    if (
+        quantized_output is not None
+        and max_context_partition_num < 8
+        and not quantized_direct
+        and num_seqs <= _cluster_resident_rows(q.device)
+    ):
+        # Decode rows past 64 get fewer than eight splits from the default
+        # plan budget (two workgroups per CU), and only the eight-CTA cluster
+        # merge carries the FP8 epilogue. A budget of eight tasks per row keeps
+        # every row one resident cluster of eight (gfx1250 keeps 15 clusters
+        # per 16 CUs), so the fused cluster8 epilogue applies.
+        max_context_partition_num = 8
+        plan_workgroup_budget = 8 * num_seqs
     if (
         quantized_output is not None
         and max_context_partition_num != 8
@@ -1527,6 +1548,7 @@ def sparse_pa_per_row(
         plan_cache_owner=plan_cache_owner,
         # Bounded topk window per row: keep the static split cap.
         plan_partition_cap=max_context_partition_num,
+        plan_workgroup_budget=plan_workgroup_budget,
     )
 
 
