@@ -44,6 +44,12 @@ def use_pa_decode_bf16_asm() -> bool:
     )
 
 
+def _gate_kwarg(gate):
+    """unified_attention's output_gate argument (none without a gate, so an aiter
+    without the epilogue still takes the call)."""
+    return {} if gate is None else {"output_gate": gate}
+
+
 class PagedAttentionImpl(nn.Module):
     """
     Attention paged implementation
@@ -53,6 +59,13 @@ class PagedAttentionImpl(nn.Module):
     # prefill unified-attention path writes into instead of allocating its own
     # (`unified_attention_into_output`); every other path returns a fresh one.
     accepts_output = True
+    # `forward` takes ``output_gate`` (ATOM_UA_FUSED_OUTPUT_GATE): it returns
+    # attention * sigmoid(output_gate), the gate in the unified attention's
+    # epilogue on the paths that end on it, else applied after the kernel.
+    accepts_output_gate = True
+    # the gate of the forward in progress, for the unified-attention runners
+    _output_gate = None
+    _output_gate_taken = False
 
     def __init__(
         self,
@@ -215,6 +228,44 @@ class PagedAttentionImpl(nn.Module):
             )
 
     def forward_impl(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        position: torch.Tensor = None,
+        q_scale: torch.Tensor = None,
+        qkv: torch.Tensor = None,
+        output: torch.Tensor | None = None,
+        output_gate: torch.Tensor | None = None,
+    ):
+        if output_gate is None:
+            return self._forward_impl(q, k, v, position, q_scale, qkv, output)
+        # The unified-attention runners take the gate from here into their
+        # epilogue (_take_output_gate); any other kernel's output is gated
+        # after it, by the op the model would have run.
+        self._output_gate, self._output_gate_taken = output_gate, False
+        try:
+            o = self._forward_impl(q, k, v, position, q_scale, qkv, output)
+            taken = self._output_gate_taken
+        finally:
+            self._output_gate, self._output_gate_taken = None, False
+        if not taken:
+            from atom.model_ops.sigmoid_gate import output_gate_mul
+
+            o = output_gate_mul(o, output_gate, envs.ATOM_FUSED_SIGMOID_GATE)
+        return o
+
+    def _take_output_gate(self, rows: int):
+        """The gate of this forward for a unified attention over its first
+        ``rows`` query rows (None without one); the forward then leaves the
+        gating to that call's epilogue."""
+        gate = self._output_gate
+        if gate is None:
+            return None
+        self._output_gate_taken = True
+        return gate if gate.shape[0] == rows else gate[:rows]
+
+    def _forward_impl(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -875,6 +926,7 @@ class PagedAttentionImpl(nn.Module):
             sinks=self.sinks,
             shuffled_kv_cache=not self.use_flash_layout,
             equal_seqlen_q=attn_metadata.equal_seqlen_q,
+            **_gate_kwarg(self._take_output_gate(q.shape[0])),
         )
         return o
 
@@ -1367,6 +1419,7 @@ class PagedAttentionImpl(nn.Module):
             v_descale=self.kv_scale,
             sinks=self.sinks,
             shuffled_kv_cache=shuffled_kv_cache,
+            **_gate_kwarg(self._take_output_gate(q_attn.shape[0])),
         )
 
         return o
@@ -1468,6 +1521,7 @@ class PagedAttentionImpl(nn.Module):
         q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
         output: torch.Tensor = None,
+        output_gate: torch.Tensor | None = None,
         **kwargs,
     ):
         return self.forward_impl(
@@ -1478,6 +1532,7 @@ class PagedAttentionImpl(nn.Module):
             q_scale=q_scale,
             qkv=qkv,
             **({} if output is None else {"output": output}),
+            **({} if output_gate is None else {"output_gate": output_gate}),
         )
 
 

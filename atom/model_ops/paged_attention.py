@@ -117,8 +117,13 @@ class Attention(BaseAttention):
         positions: torch.Tensor = None,
         q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
+        output_gate: torch.Tensor | None = None,
         **kwargs,
     ):
+        """``output_gate`` (MHA): return ``attention * sigmoid(output_gate)``;
+        the impl applies the gate (see PagedAttentionImpl.forward_impl)."""
+        if output_gate is not None:
+            assert not self.use_mla and getattr(self.impl, "accepts_output_gate", False)
         if (
             not self.use_mla
             and getattr(self.impl, "accepts_output", False)
@@ -134,10 +139,12 @@ class Attention(BaseAttention):
                 device=query.device,
             )
             torch.ops.aiter.unified_attention_into_output(
-                query, q_scale, key, value, positions, self.layer_name, qkv, output
+                query, q_scale, key, value, positions, self.layer_name, qkv, output,
+                output_gate,
             )
             return output
         output = torch.ops.aiter.unified_attention_with_output_base(
-            query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
+            query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv,
+            output_gate,
         )
         return output
