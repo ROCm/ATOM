@@ -12,7 +12,18 @@ import pytest
 import torch
 
 from atom.config import DCPConfig
-from atom.model_ops import dcp_ops
+
+# dcp_ops imports triton, absent on the CPU-only CI runner: guard per test so
+# the config test still runs there.
+try:
+    from atom.model_ops import dcp_ops
+except ImportError as _e:
+    dcp_ops, _DCP_OPS_ERR = None, _e
+else:
+    _DCP_OPS_ERR = None
+needs_dcp_ops = pytest.mark.skipif(
+    _DCP_OPS_ERR is not None, reason=f"requires full atom import env: {_DCP_OPS_ERR}"
+)
 
 
 def test_mailbox_is_a_comm_backend():
@@ -40,6 +51,7 @@ def capturing(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
 
+@needs_dcp_ops
 def test_without_a_workspace_the_mailbox_merge_is_all_to_all(a2a_calls, capturing):
     group = _group()
     out = torch.zeros(2, 16, 128, dtype=torch.bfloat16)
@@ -48,6 +60,7 @@ def test_without_a_workspace_the_mailbox_merge_is_all_to_all(a2a_calls, capturin
     assert a2a_calls == [None]
 
 
+@needs_dcp_ops
 @pytest.mark.parametrize(
     "tokens,dtype", [(9, torch.bfloat16), (0, torch.bfloat16), (2, torch.float32)]
 )
@@ -62,6 +75,7 @@ def test_a_call_the_workspace_cannot_take_is_all_to_all(
     assert dcp_ops.dcp_lse_merge(out, lse, group, backend="mailbox") == "a2a"
 
 
+@needs_dcp_ops
 def test_an_eager_step_is_all_to_all(monkeypatch, a2a_calls):
     """Each token count is its own kernel build; outside a capture it would
     compile mid-serving."""
@@ -74,6 +88,7 @@ def test_an_eager_step_is_all_to_all(monkeypatch, a2a_calls):
     assert dcp_ops.dcp_lse_merge(out, lse, group, backend="mailbox") == "a2a"
 
 
+@needs_dcp_ops
 def test_max_tokens_is_the_widest_decode_step():
     spec = SimpleNamespace(num_speculative_tokens=3)
     cfg = SimpleNamespace(max_num_seqs=16, speculative_config=spec)
@@ -82,6 +97,7 @@ def test_max_tokens_is_the_widest_decode_step():
     assert dcp_ops.dcp_mailbox_max_tokens(cfg) == 16
 
 
+@needs_dcp_ops
 @pytest.mark.parametrize("decode,expected", [(True, "mailbox"), (False, "a2a")])
 def test_only_decode_takes_the_mailbox(monkeypatch, decode, expected):
     from atom.model_ops.attention_mla import MLAAttention
@@ -145,6 +161,7 @@ def _merge_layer(monkeypatch, seen):
     return layer
 
 
+@needs_dcp_ops
 def test_decode_hands_its_merge_to_the_mailbox(monkeypatch):
     seen = []
     layer = _merge_layer(monkeypatch, seen)
@@ -152,6 +169,7 @@ def test_decode_hands_its_merge_to_the_mailbox(monkeypatch):
     assert seen == [("mailbox", torch.float8_e4m3fn)]
 
 
+@needs_dcp_ops
 def test_prefill_keeps_all_to_all_and_its_fused_quant(monkeypatch):
     seen = []
     layer = _merge_layer(monkeypatch, seen)
@@ -159,6 +177,7 @@ def test_prefill_keeps_all_to_all_and_its_fused_quant(monkeypatch):
     assert seen == [("a2a", torch.float8_e4m3fn)]
 
 
+@needs_dcp_ops
 @pytest.mark.parametrize("prepared,backend", [(True, "mailbox"), (False, "a2a")])
 def test_a_layer_without_a_workspace_merges_with_all_to_all(
     monkeypatch, prepared, backend
@@ -254,6 +273,7 @@ def _worker(rank, world, init, results):
     dist.destroy_process_group()
 
 
+@needs_dcp_ops
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
     reason="needs two GPUs",
