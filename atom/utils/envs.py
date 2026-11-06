@@ -1294,6 +1294,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rather than copied once per rank -- and copies only if that is refused.
     # `tools/engram/bench_uva_shard.py` measures both.
     "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
+    # Optional override of the file that serializes shared in-place
+    # registration. Empty: host_memory names one from the checkpoint path.
+    "ATOM_ENGRAM_REG_LOCK": lambda: os.getenv("ATOM_ENGRAM_REG_LOCK", ""),
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.
