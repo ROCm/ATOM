@@ -3386,6 +3386,8 @@ class BlockManager:
                         f"seq={seq.id} block={block_id} indexed={indexed_block_id}"
                     )
                 block.update(h, token_ids)
+            # The producer sent the draft's window rows with the KV.
+            self.draft_window.publish(seq, i, h, token_ids)
 
         seq.num_hashed_tokens = max(seq.num_hashed_tokens, num_full * hbs)
         # The decode consumer has no local prefill postprocess to publish these
