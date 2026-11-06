@@ -21,6 +21,8 @@ class V4MonoProfile:
     ragged: bool = False
     variable_q: bool = False
     deployment_qualified: bool = True
+    native_sampling: bool = False
+    prefix_caching: bool = False
 
     def capture_request_widths(self, declared) -> tuple[int, ...]:
         """Prepare C4's exact three-request tail without changing its ladder.
@@ -52,6 +54,10 @@ ORDINARY_PROFILE = V4MonoProfile(
     auto_request_widths=(1, 2, 4),
     max_requests=16,
     continuation=True,
+    # Native owns sampling and prefix state copies; the engine invalidates
+    # Mono continuation when a state slot is restored, moved, or reused.
+    native_sampling=True,
+    prefix_caching=True,
 )
 
 MTP3_TARGET_PROFILE = V4MonoProfile(
@@ -172,7 +178,10 @@ def deployment_refusal(
         return "only pure TP8 without TBO/context parallel is supported"
     if atom_config.kv_cache_dtype != "fp8" or atom_config.index_cache_dtype != "fp4":
         return "FP8 KV / FP4 index is required"
-    if getattr(atom_config, "enable_prefix_caching", False):
+    if (
+        getattr(atom_config, "enable_prefix_caching", False)
+        and not profile.prefix_caching
+    ):
         return "prefix caching is outside the qualified V4 Mono profile"
     index_policy = (model_args.use_index_cache, model_args.index_topk_freq)
     if index_policy not in _INDEX_POLICIES[profile.name] or (
