@@ -27,19 +27,9 @@ def _dcp_config(dcp=4, tp=4, interleave=1, qrep=True):
 
 @pytest.fixture
 def dcp_on(monkeypatch):
-    monkeypatch.setenv("ATOM_GLM52_MONO_DCP", "1")
     monkeypatch.setattr(
         "atom.models.glm52.mono.config._is_gfx950", lambda: True, raising=True
     )
-
-
-def test_dcp_is_off_unless_asked_for(monkeypatch):
-    monkeypatch.delenv("ATOM_GLM52_MONO_DCP", raising=False)
-    monkeypatch.setattr(
-        "atom.models.glm52.mono.config._is_gfx950", lambda: True, raising=True
-    )
-    refusal = config_refusal(_dcp_config())
-    assert refusal is not None and "ATOM_GLM52_MONO_DCP" in refusal
 
 
 def test_dcp_equal_to_tp4_is_served(dcp_on):
