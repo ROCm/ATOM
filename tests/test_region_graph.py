@@ -498,3 +498,135 @@ def test_padded_prefill_rows_only_for_a_prefill_taller_than_its_schedule(
     assert rows(20, is_prefill=True, scheduled_tokens=20) is None
     assert rows(32, is_prefill=False, scheduled_tokens=20) is None
     assert rows(32) is None
+
+
+def _padding_on_scheduled_rows(fn, rows, *args):
+    """`on_scheduled_rows` before its result went to the next segment's rows:
+    a fresh padded tensor, which the replay then copies over that input."""
+    if rows is None:
+        return fn(*args)
+    height = next(a.shape[0] for a in args if isinstance(a, torch.Tensor))
+    result = fn(*(a[:rows] if a.shape[0] == height else a for a in args))
+    padded = result.new_empty((height, *result.shape[1:]))
+    padded[:rows].copy_(result)
+    padded[rows:].zero_()
+    return padded
+
+
+@token_graph
+class HandOffUnit(torch.nn.Module):
+    """A region over a prefill's scheduled rows whose result the next segment
+    reads unchanged (``* 1.0``), so the unit's output is the delivered bucket,
+    pad rows included. ``padding`` runs the hand-off as it was before."""
+
+    def __init__(self, padding=False, region=None, dim=64):
+        super().__init__()
+        self.a = torch.nn.Linear(dim, dim, device="cuda")
+        self.padding = padding
+        self.region = region or (lambda h, out=None: torch.cumsum(h, 0, out=out))
+        self.outs = []
+
+    @eager_region()
+    def attend(self, x: torch.Tensor):
+        rows = padded_prefill_rows(x.shape[0])
+        if self.padding:
+            return _padding_on_scheduled_rows(self.region, rows, x)
+
+        def region(h, out=None):
+            self.outs.append(out)
+            return self.region(h, out=out)
+
+        return on_scheduled_rows(region, rows, x, writes_out=True)
+
+    def forward(self, x):
+        return self.attend(torch.relu(self.a(x))) * 1.0
+
+
+def _record_buckets(context, unit, buckets):
+    for bucket in buckets:  # largest first: the first sizes the input buffer
+        context.context = SimpleNamespace(is_prefill=True, scheduled_tokens=bucket)
+        unit(torch.randn(bucket, 64, device="cuda"))  # warmup
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            context.main_stream = stream
+            context.in_hipgraph, context.tr_graph = True, "record"
+            unit(torch.randn(bucket, 64, device="cuda"))
+            context.in_hipgraph, context.tr_graph = False, None
+        torch.cuda.current_stream().wait_stream(stream)
+    context.main_stream = torch.cuda.current_stream()
+
+
+def _delivery_target(unit, bucket):
+    graph = unit.__dict__["_token_graph"]
+    segments, _, _ = graph._buckets[(None, ((bucket, 64),))]
+    (step,) = [s for s in segments._steps if isinstance(s, region_graph._EagerStep)]
+    return step._target
+
+
+def _replay(context, unit, x, scheduled):
+    context.context = SimpleNamespace(is_prefill=True, scheduled_tokens=scheduled)
+    context.tr_graph = "replay"
+    try:
+        return unit(x)
+    finally:
+        context.tr_graph = None
+
+
+@torch.inference_mode()
+def test_a_replay_delivers_the_scheduled_rows_as_the_padding_hand_off_did(context):
+    torch.manual_seed(6)
+    unit, padding = HandOffUnit(), HandOffUnit(padding=True)
+    padding.load_state_dict(unit.state_dict())
+    buckets = (64, 32)
+    _record_buckets(context, unit, buckets)
+    _record_buckets(context, padding, buckets)
+
+    for bucket, scheduled in ((64, 50), (32, 20), (64, 64), (64, 1), (32, 32)):
+        x = torch.randn(bucket, 64, device="cuda")
+        # The pool hands this memory to other activations between replays.
+        target = _delivery_target(unit, bucket)
+        target.fill_(float("nan"))
+        unit.outs.clear()
+        got = _replay(context, unit, x, scheduled).clone()
+        want = _replay(context, padding, x, scheduled).clone()
+
+        # Bit for bit what the padding hand-off delivered, NaN gone.
+        assert torch.equal(got, want)
+        assert torch.equal(got[scheduled:], torch.zeros_like(got[scheduled:]))
+        # The region wrote the recorded target's own rows: one per bucket,
+        # whatever the step schedules.
+        (out,) = unit.outs
+        assert out.data_ptr() == target.data_ptr()
+        assert out.shape[0] == scheduled
+        # The scheduled rows are the eager step's (a GEMM of other rows).
+        context.context = SimpleNamespace(is_prefill=True, scheduled_tokens=scheduled)
+        eager = unit(x[:scheduled])
+        torch.testing.assert_close(got[:scheduled], eager, rtol=1e-5, atol=1e-5)
+    for graph in (unit, padding):
+        graph.__dict__["_token_graph"].release_graphs()
+
+
+@torch.inference_mode()
+def test_a_replayed_hand_off_allocates_nothing(context):
+    """A region writing its ``out`` allocates nothing at replay; the padding
+    hand-off allocated the region's result and the padded bucket."""
+
+    def scaled(h, out=None):
+        return torch.mul(h, 2.0, out=out)
+
+    torch.manual_seed(7)
+    allocations = {}
+    for padding in (False, True):
+        unit = HandOffUnit(padding=padding, region=scaled)
+        _record_buckets(context, unit, (64,))
+        x = torch.randn(64, 64, device="cuda")
+        _replay(context, unit, x, 40)  # the first replay may warm up allocations
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        _replay(context, unit, x, 40)
+        allocations[padding] = (
+            torch.cuda.memory_stats()["allocation.all.allocated"] - before
+        )
+        unit.__dict__["_token_graph"].release_graphs()
+    assert allocations == {False: 0, True: 2}

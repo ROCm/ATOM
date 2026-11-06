@@ -246,7 +246,11 @@ class PagedAttentionImpl(nn.Module):
         qkv: torch.Tensor = None,
         quantized_output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ):
+        """Attention over ``q``'s rows. ``output``, when given, is where the
+        caller reads the result from (``[tokens, heads * head_dim]``): a
+        prefill writes it in place, any other path returns its own tensor."""
 
         fwd_ctx: ForwardContext = get_forward_context()
 
@@ -258,7 +262,7 @@ class PagedAttentionImpl(nn.Module):
                 quantized_output.zero_()
                 output_scale.fill_(1.0)
                 return quantized_output
-            o = torch.empty_like(q)
+            o = torch.empty_like(q) if output is None else output
             return o
 
         o: torch.Tensor
@@ -273,7 +277,20 @@ class PagedAttentionImpl(nn.Module):
 
         attn_impl = self.dispatch_backend(fwd_ctx, q, k, v)
         if quantized_output is None:
-            o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+            if output is not None and attn_impl == self.prefill_attention:
+                o = attn_impl(
+                    q,
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    k_scale,
+                    v_scale,
+                    fwd_ctx,
+                    output=output.view(-1, self.num_heads, self.head_dim),
+                )
+            else:
+                o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
         else:
             if output_scale is None:
                 raise ValueError("output_scale is required with quantized_output")
@@ -998,8 +1015,20 @@ class PagedAttentionImpl(nn.Module):
 
     @mark_trace(prefix="prefill_attention", torch_compile=False)
     def prefill_attention(
-        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+        self,
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        fwd_ctx: ForwardContext,
+        output: torch.Tensor | None = None,
     ):
+        """Varlen prefill attention. The BF16 path writes ``output``
+        (``[tokens, heads, head_dim]``) when given; the FP8 one returns its
+        own tensor."""
 
         # variable lenth attention use key value as input
         attn_metadata = fwd_ctx.attn_metadata
@@ -1066,6 +1095,7 @@ class PagedAttentionImpl(nn.Module):
             causal=True,
             window_size=sliding_window,
             sink_ptr=self.sinks,
+            out=output,
         )
         return o
 
@@ -1271,6 +1301,7 @@ class PagedAttentionImpl(nn.Module):
             qkv=qkv,
             quantized_output=quantized_output,
             output_scale=output_scale,
+            output=output,
         )
 
 
