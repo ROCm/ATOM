@@ -30,11 +30,13 @@ from torch.profiler import record_function
 
 from atom import structured_output
 from atom.config import Config, set_current_atom_config
+from atom.distributed.group_agreement import group_min
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     get_pcp_group,
     get_pcp_world_size,
     pcp_allgather_rerange,
+    pcp_is_enabled,
     pcp_pad_len,
     pcp_round_robin_split,
 )
@@ -45,6 +47,13 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
+from atom.distributed.ulysses_sp import (
+    check_aiter_sp_api,
+    get_sp_world_size,
+    local_num_kv_heads,
+    sp_is_enabled,
+    sp_local_len,
+)
 from atom.kv_transfer.disaggregation import (
     KVConnectorFactory,
     KVConnectorOutput,
@@ -146,6 +155,7 @@ from atom.utils.gc_utils import freeze_gc_heap
 from atom.utils.h2d import h2d_producer
 from atom.utils.region_graph import ReqGraph, TokenGraph
 from atom.utils.selector import attn_family, get_attn_backend, has_mla_indexer
+from atom.utils.sp_wrapper import SPModelWrapper
 from atom.utils.tbo import (
     UBatchSlice,
     UBatchWrapper,
@@ -174,6 +184,19 @@ def max_schedulable_decode_bs(
     `tokens_per_decode_seq`.
     """
     return min(max_num_seqs, max_num_batched_tokens // full_q_len)
+
+
+def split_rows_graph_ladder(sizes, step: int, max_bs: int) -> list[int]:
+    """Capture ladder for SP, which splits a batch's rows over ranks: one batch
+    size per local bucket.
+
+    Each rung is rounded up to a multiple of `step` batch sizes, chosen so its
+    rows split evenly: no layer pads them, and an SP token graph's bucket (its
+    local rows) keeps the largest batch it serves. Rounding past `max_bs` would
+    overrun the per-request buffers, so the top rung is clamped to it instead
+    of dropped.
+    """
+    return sorted({min(-(-bs // step) * step, max_bs) for bs in sizes}, reverse=True)
 
 
 # Re-exported under the old private name: this module is where the predicate
@@ -910,6 +933,11 @@ class ModelRunner:
         )
 
         self._build_and_load_model(model_class)
+        # After weight processing, before warmup and capture. Here rather than in
+        # the loader so a runner that builds its model differently still sets it.
+        from atom.model_ops.fused_moe.sp_mega_moe import initialize_sp_mega_moe
+
+        self.sp_mega_moe = initialize_sp_mega_moe(self.model, config)
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
@@ -986,6 +1014,8 @@ class ModelRunner:
                 dp_gather_scatter=dp_gather_scatter,
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
+        if sp_is_enabled():
+            self.model = SPModelWrapper(self.model)
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
         self.pp_aux_relay = PPAuxRelay.build(self.config, self.model)
@@ -1076,6 +1106,8 @@ class ModelRunner:
         return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
+        if sp_is_enabled():
+            check_aiter_sp_api()
         # Calculate local device rank considering DP, PP and PCP.
         # On a single node the physical GPU index equals the global distributed
         # rank in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp)
@@ -1088,7 +1120,7 @@ class ModelRunner:
             # Reject before any collective can wait for nonexistent ranks.
             reject_simulated_tp(config, "pipeline parallel")
         # tp_world_size: how many GPUs this stage actually occupies.
-        stage_span = config.tp_world_size * config.prefill_context_parallel_size
+        stage_span = config.tp_world_size * config.pcp_group_size
         engine_index = dp_rank_local * pp_size + pp_rank
         local_device_rank = engine_index * stage_span + rank
         num_gpus = torch.cuda.device_count()
@@ -1149,7 +1181,7 @@ class ModelRunner:
                 distributed_init_method=distributed_init_method,
                 backend="nccl",
                 data_parallel_size=dp_size,
-                prefill_context_model_parallel_size=config.prefill_context_parallel_size,
+                prefill_context_model_parallel_size=config.pcp_group_size,
             )
         else:
             # The group spans the devices that exist; apply_simulated_tp then
@@ -1165,7 +1197,7 @@ class ModelRunner:
                 local_rank=local_device_rank,
                 data_parallel_size=config.parallel_config.data_parallel_size,
                 data_parallel_rank=config.parallel_config.data_parallel_rank,
-                prefill_context_model_parallel_size=config.prefill_context_parallel_size,
+                prefill_context_model_parallel_size=config.pcp_group_size,
                 decode_context_parallel_size=getattr(
                     config, "decode_context_parallel_size", 1
                 ),
@@ -1215,9 +1247,12 @@ class ModelRunner:
         if builder is not None:
             builder.close()
         # MegaMoE's arenas live on the EP all2all manager's cco communicator,
-        # which destroy_dist_env() destroys. A close error propagates once the
-        # rest of the teardown has run.
+        # and SP MegaMoE's runtime on the SP group; destroy_dist_env() destroys
+        # both. A close error propagates once the rest of the teardown has run.
         try:
+            sp_mega_moe = getattr(self, "sp_mega_moe", None)
+            if sp_mega_moe is not None:
+                sp_mega_moe.close()
             if envs.ATOM_MORI_V2:
                 from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
                     close_mega_transports,
@@ -1756,13 +1791,7 @@ class ModelRunner:
 
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
-        hf_config = self.config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            assert hf_config.num_key_value_heads % self.world_size == 0
-            return hf_config.num_key_value_heads // self.world_size
-        else:
-            assert self.world_size % hf_config.num_key_value_heads == 0
-            return 1
+        return local_num_kv_heads(self.config.hf_config.num_key_value_heads)
 
     def _mrope_positions_view(self, running_tokens: int) -> torch.Tensor:
         return self.forward_vars["mrope_positions"].gpu.as_strided(
@@ -2261,16 +2290,9 @@ class ModelRunner:
 
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
-        hf_config = config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            assert hf_config.num_key_value_heads % self.world_size == 0
-            num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        else:
-            assert self.world_size % hf_config.num_key_value_heads == 0
-            num_kv_heads = 1
         # Promote to self so attention builders' build_kv_cache_tensor()
         # hooks can access it without re-deriving from hf_config.
-        self.num_kv_heads = num_kv_heads
+        self.num_kv_heads = self._get_num_kv_heads()
         self.aligned_index_dim = None  # set below for DeepSeek-V3.2
 
         # Primary KV cache allocation: one buffer, one region per builder, each
@@ -3331,6 +3353,9 @@ class ModelRunner:
                 input_ids, positions, _pcp_bal_groups, _pcp_size, forward_context
             )
 
+        if self.sp_mega_moe is not None:
+            self.sp_mega_moe.before_step(sp_local_len(forward_mode.running_tokens))
+
         if not forward_mode.use_cudagraph:
             # prefill, or a decode no request graph serves (enforce_eager / DP
             # peer prefill / bs above the largest captured graph). Either may
@@ -3692,9 +3717,9 @@ class ModelRunner:
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
 
-        # Near-tie argmaxes differ across PCP ranks (~1 bf16 ULP) and the ids
-        # feed the next forward, whose MoE all_reduce assumes identical rows.
-        if get_pcp_world_size() > 1 and _needs_id_sync(
+        # The ids feed the next forward: PCP near-tie argmaxes differ (~1 bf16
+        # ULP), and each SP rank samples with its own RNG.
+        if (pcp_is_enabled() or sp_is_enabled()) and _needs_id_sync(
             self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
         ):
             sampled_tokens = get_pcp_group().broadcast(
@@ -3892,7 +3917,7 @@ class ModelRunner:
         Call right after `run_model`."""
         if getattr(self, "drafter", None) is not None:
             ctx = get_forward_context().context
-            ctx.target_pcp_split = bool(ctx.pcp_split)
+            ctx.target_pcp_split = bool(ctx.pcp_split) and pcp_is_enabled()
 
     @_profile_runner_stage
     @torch.inference_mode()
@@ -4282,8 +4307,8 @@ class ModelRunner:
            fit in free GPU memory (adapts to GPU size / config, no hardcoded
            cap). DP amplifies the retained per-token footprint (MoE all_gather
            ~dp_size x tokens); scale the slope by dp**0.6 to match
-           _estimate_cudagraph_overhead. Free is min-reduced across DP so all
-           ranks skip the same set.
+           _estimate_cudagraph_overhead. Free is min-reduced across the DP and
+           PCP groups so all ranks skip the same set.
         """
         dp_size = self.config.parallel_config.data_parallel_size
         if dp_size > 1 and hasattr(self, "drafter"):
@@ -4306,15 +4331,9 @@ class ModelRunner:
         if dp_size > 1:
             slope *= float(dp_size) ** 0.6
         free = torch.cuda.mem_get_info()[0]
-        if dp_size > 1:
-            import torch.distributed as dist
-            from aiter.dist.parallel_state import get_dp_group
-
-            free_t = torch.tensor([free], device="cpu", dtype=torch.int64)
-            dist.all_reduce(
-                free_t, op=dist.ReduceOp.MIN, group=get_dp_group().cpu_group
-            )
-            free = int(free_t.item())
+        for group in (get_dp_group(), get_pcp_group()):
+            if group.world_size > 1:
+                free = group_min(free, group.cpu_group)
         need = slope * running_tokens * 1.25 + (4 << 30)
         if (free >> 30) < (int(need) >> 30):
             if self.rank == 0:
@@ -4376,6 +4395,10 @@ class ModelRunner:
         max_bs = max_schedulable_decode_bs(
             max_seq_bs, self.config.max_num_batched_tokens, full_q_len
         )
+        if tr_hybrid and sp_is_enabled():
+            self.capture_sizes = split_rows_graph_ladder(
+                self.capture_sizes, get_sp_world_size(), max_bs
+            )
         oversized = [s for s in self.capture_sizes if s > max_bs]
         if oversized:
             self.capture_sizes = [s for s in self.capture_sizes if s <= max_bs]
@@ -4512,7 +4535,7 @@ class ModelRunner:
                     running_tokens = bs * max_q_len
                     if tr_hybrid and (
                         running_tokens in TokenGraph.captured_sizes("decode")
-                        or self._skip_token_bucket(running_tokens)
+                        or self._skip_token_bucket(sp_local_len(running_tokens))
                     ):
                         continue
                     # Names the capture trace this iteration will export. Set

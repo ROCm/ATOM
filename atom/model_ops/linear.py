@@ -743,8 +743,14 @@ class LinearBase(nn.Module):
         prefix: str = "",
         override_tp_size: int | None = None,
         override_tp_rank: int | None = None,
+        output_row_alignment: int | None = None,
     ):
         self.prefix = prefix
+        # An unquantised weight's output rows (N) are zero-padded to a multiple
+        # of this after loading, for a shape whose N the GEMM backends have no
+        # kernel for (Qwen3-Next / Qwen3.5's 513-row router); `forward` slices
+        # the padding off. None: never padded.
+        self.output_row_alignment = output_row_alignment
         layer_quant_config = (
             quant_config.get_layer_quant_config(prefix)
             if quant_config is not None
@@ -1433,6 +1439,8 @@ class LinearBase(nn.Module):
             if need_shuffle and self.weight.dim() == 2:
                 self.is_output_padded = self._maybe_pad_a8w8_preshuffle_output()
                 shuffle_weights(self.weight)
+            elif self._maybe_pad_unquantized_output():
+                self.is_output_padded = True
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
         self.fp4_n32k4_scale = False
@@ -1453,6 +1461,33 @@ class LinearBase(nn.Module):
                 if self.params_dtype == dtypes.fp4x2 and self.weight.dim() == 2:
                     check_mxfp4_preshuffle_k(getattr(self, "prefix", ""), self.weight)
                 self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+
+    def _maybe_pad_unquantized_output(self) -> bool:
+        """Zero-pad an unquantised 2D weight's output rows to a multiple of
+        `output_row_alignment` (and the bias with it). True if it padded; a
+        weight already aligned, including one padded by an earlier call, is
+        left alone."""
+        align = self.output_row_alignment
+        if (
+            not align
+            or self.quant_type.value != QuantType.No.value
+            or self.weight.dim() != 2
+        ):
+            return False
+        output_size = self.weight.shape[0]
+        padding_size = -output_size % align
+        if padding_size == 0:
+            return False
+        self._output_size_before_padding = output_size
+        self.weight.data = torch.nn.functional.pad(
+            self.weight.data, (0, 0, 0, padding_size)
+        )
+        if self.bias is not None:
+            b = self.bias.data
+            self.bias.data = torch.cat(
+                [b, b.new_zeros((padding_size, *b.shape[1:]))], dim=0
+            )
+        return True
 
     def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
         # The other half of the shuffle decision `process_weights_after_loading`
@@ -1539,12 +1574,12 @@ class LinearBase(nn.Module):
         """
         if self.native_a8_group_rows is not None:
             return False
+        if self.is_output_padded:  # a padded N overruns `out`
+            return False
         if self.quant_type.value == QuantType.No.value:
             return True
-        return (
-            self.quant_type.value == QuantType.per_1x128.value
-            and bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)
-            and not self.is_output_padded  # a padded N overruns `out`
+        return self.quant_type.value == QuantType.per_1x128.value and bool(
+            envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
 
     @mark_trace
@@ -1814,6 +1849,7 @@ class ReplicatedLinear(LinearBase):
         quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
+        output_row_alignment: int | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -1824,6 +1860,7 @@ class ReplicatedLinear(LinearBase):
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
+            output_row_alignment=output_row_alignment,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -2808,6 +2845,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
         quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
+        output_row_alignment: int | None = None,
         **kwargs,
     ):
         self.output_sizes = output_size
@@ -2818,6 +2856,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
+            output_row_alignment=output_row_alignment,
         )
 
     def shard_view(self, index: int) -> "LinearBase":

@@ -18,8 +18,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-import torch.distributed as dist
 
+from atom.distributed.group_agreement import group_agree
 from atom.model_ops.engram.tables import HostEmbeddingTable
 from atom.utils import CpuGpuBuffer, envs
 
@@ -426,14 +426,11 @@ class EngramHost:
         # where a copy per rank would pin them once per rank.
         self._shared_tables = shards == 1 and _dp_world_size() > 1
         pinned = self._register_shard(prefetcher)
-        if shards > 1:
-            # Gloo, once, at load. MIN: one refusal is the group's answer.
-            vote = torch.tensor([bool(pinned)], dtype=torch.int32)
-            dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group.cpu_group)
-            if not int(vote):
-                if pinned:
-                    logger.info("engram: a peer has no UVA shard")
-                pinned = 0
+        # Gloo, once, at load: one refusal is the group's answer.
+        if shards > 1 and not group_agree(bool(pinned), group.cpu_group):
+            if pinned:
+                logger.info("engram: a peer has no UVA shard")
+            pinned = 0
         if not pinned:
             logger.info("engram: using the host path")
             self._release_shard()

@@ -233,8 +233,17 @@ def test_topology_comes_from_config_not_from_the_workers():
     assert caps.data_parallel_size == 2
     assert caps.pipeline_parallel_size == 3  # on Config, not parallel_config
     assert caps.prefill_context_parallel_size == 2
+    assert caps.sequence_parallel_size == 1
     assert caps.workers_per_engine == 8
     assert caps.kv_cache_dtype == "fp8"
+
+    # Ulysses SP keeps -pcp at 1 and runs over the PCP group's ranks.
+    sp = _Config()
+    sp.prefill_context_parallel_size, sp.sequence_parallel_size = 1, 4
+    caps = EngineCapabilities.from_workers(config=sp, workers=[_worker(0)])
+    assert caps.prefill_context_parallel_size == 1
+    assert caps.sequence_parallel_size == 4
+    assert caps.workers_per_engine == 16
 
 
 def test_disagreeing_protocol_versions_are_fatal():
