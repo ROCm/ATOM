@@ -468,6 +468,7 @@ class TestChunkedAdmissionTopology:
                 config=SimpleNamespace(
                     tensor_parallel_size=d_tp,
                     pipeline_parallel_size=1,
+                    decode_context_parallel_size=1,
                 )
             ),
         )

@@ -37,13 +37,23 @@ K3 = pytest.importorskip(
 
 LAYERS = 3
 SLOTS = 12
-SHAPE_K = (2, 5)
+# A conv unit is (conv_kernel - 1 + num_spec) rows of [q | k | v].
+SHAPE_K = (2, 6)
 SHAPE_V = (2, 3, 4)
 
 
 CAP = 6
 REC_K = (2, 5)
 REC_V = (2, 3)
+
+
+@pytest.fixture(autouse=True)
+def _tp_size(monkeypatch):
+    """The K3 builder reads its TP size from the TP group, which no test here
+    initializes. One rank unless a test sets another."""
+    tp = SimpleNamespace(world_size=1)
+    monkeypatch.setattr(K3, "get_tp_group", lambda: tp)
+    return tp
 
 
 def build(num_spec: int, replayssm: bool = False):
@@ -333,6 +343,25 @@ class _MLABase:
         return tensors
 
 
+class _Layer:
+    """A bound module, as far as row placement reads one: its layer number."""
+
+    def __init__(self, layer_num):
+        self.layer_num = layer_num
+
+
+# Eight layers, full attention at 3 and 7: the MLA rows are layers [3, 7] and
+# the KDA slots layers [0, 1, 2, 4, 5, 6]. The second of two PP stages holds
+# layers 4-7, so one MLA row (global MLA 1) and three KDA rows (global KDA 3-5),
+# which is what the relocation fixture's three cache layers are.
+NUM_HIDDEN_LAYERS = 8
+FULL_ATTENTION_LAYERS = [3, 7]
+SECOND_STAGE_ROWS = {
+    K3.MLA_ROWS: {_Layer(7): 0},
+    K3.LINEAR_STATE_ROWS: {_Layer(4): 0, _Layer(5): 1, _Layer(6): 2},
+}
+
+
 def kimi_builder(kv_transfer_config, pp_size=1, replayssm=False):
     """A K3 builder over the relocation fixture's caches.
 
@@ -349,16 +378,25 @@ def kimi_builder(kv_transfer_config, pp_size=1, replayssm=False):
     builder = _Builder()
     builder.model_runner = stub.model_runner
     builder.replayssm = replayssm
-    builder.mla_idx_by_layer = dict.fromkeys(range(24), 0)
-    builder.kda_idx_by_layer = dict.fromkeys(range(LAYERS), 0)
+    builder.num_spec = 0
+    builder._pool_rows = SECOND_STAGE_ROWS if pp_size > 1 else None
     builder.model_runner.config = SimpleNamespace(
         kv_transfer_config=kv_transfer_config,
         pipeline_parallel_size=pp_size,
-        hf_config=SimpleNamespace(model_type="kimi_linear"),
+        hf_config=SimpleNamespace(
+            model_type="kimi_linear",
+            num_hidden_layers=NUM_HIDDEN_LAYERS,
+            linear_conv_kernel_dim=SHAPE_K[0] + 1,
+            # q, k and v convs of 2 channels each: SHAPE_K's 6 at TP1
+            linear_num_key_heads=2,
+            linear_key_head_dim=1,
+        ),
     )
+    builder.model_runner.full_attention_layers = FULL_ATTENTION_LAYERS
     # No checkpoint spec, so the answer is the P/D join alone rather than the
     # `lmcache_mp` checkpoint contract layered on it.
     builder.model_runner.state_runtime = SimpleNamespace(checkpoint_spec=None)
+    builder.model_runner.num_spec_tokens = 0
     return builder
 
 
@@ -440,15 +478,12 @@ def test_a_pd_connector_that_cannot_move_the_state_is_refused(monkeypatch):
         builder.get_kv_transfer_tensors()
 
 
-def test_pipeline_parallelism_is_refused():
-    """`_consumer_region_map` aligns a stage's regions by shifting over
-    `num_hidden_layers`; the slot regions are indexed by KDA layer, a shorter
-    axis. The misalignment writes one layer's state onto another's rather than
-    failing, so it is refused where it is knowable.
-    """
-    builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2)
+def test_moriio_keeps_refusing_pp():
+    """Only the Mooncake path places a PP stage's rows by layer; MoRIIO reads
+    none of that placement."""
+    builder = kimi_builder({"kv_connector": "moriio"}, pp_size=2)
 
-    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+    with pytest.raises(NotImplementedError, match="over moriio does not support"):
         builder.get_kv_transfer_tensors()
 
 
@@ -475,6 +510,9 @@ def transfer_stub(slot_regions):
         # are about.
         _consumer_region_map=lambda n, *_: list(range(n)),
         _block_region_consumer_indices=None,
+        _slot_region_consumer_indices=None,
+        _slot_region_tp_segments=None,
+        _slot_region_tp_replicated=None,
         # Matches the absence of the FP4 keys in `transfer_args`; the dtype
         # cross-check now runs before Phase 2 and would reject the pair first.
         _fp4_index_layout=False,
