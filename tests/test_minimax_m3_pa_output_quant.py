@@ -287,7 +287,7 @@ def test_padded_prefill_fills_pad_rows_when_the_pa_cannot(monkeypatch):
     assert torch.equal(scale[_ROWS:], torch.ones((_BUCKET - _ROWS, 1)))
 
 
-def _decode_rows(monkeypatch, rows, **kwargs):
+def _decode_rows(monkeypatch, rows, splits=4, **kwargs):
     captured = {}
     monkeypatch.setattr(
         base_attention, "run_pa_decode", lambda **kw: captured.update(kw)
@@ -295,7 +295,7 @@ def _decode_rows(monkeypatch, rows, **kwargs):
     monkeypatch.setattr(base_attention, "_flydsl_output_quant_option", lambda _: True)
     monkeypatch.setattr(
         "aiter.ops.triton.gluon.pa_decode_gluon.get_recommended_splits",
-        lambda *_: 4,
+        lambda *_: splits,
     )
     monkeypatch.setattr(sparse_attn, "_cluster_resident_rows", lambda _: 240)
     q = torch.randn(rows, 16, 128, dtype=torch.bfloat16)
@@ -323,6 +323,13 @@ def test_fp8_decode_rows_get_one_cluster_of_eight_each(monkeypatch):
     captured = _decode_rows(monkeypatch, 128, quantized_direct=False)
     assert captured["plan_partition_cap"] == 8
     assert captured["plan_workgroup_budget"] == 8 * 128
+
+
+def test_fp8_decode_rows_with_eight_splits_get_the_cluster_budget(monkeypatch):
+    # 72 rows: eight splits, but the default budget cannot hold 72 clusters.
+    captured = _decode_rows(monkeypatch, 72, quantized_direct=False, splits=8)
+    assert captured["plan_partition_cap"] == 8
+    assert captured["plan_workgroup_budget"] == 8 * 72
 
 
 def test_fp8_decode_rows_past_resident_clusters_keep_the_split(monkeypatch):
