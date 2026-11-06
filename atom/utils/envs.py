@@ -619,6 +619,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (the same lengths) read it; the draft's later passes take theirs from
     # ATOM_MTP_ADVANCE_TOKEN_SPLIT. Off by default.
     "ATOM_UA_DECODE_TOKEN_SPLIT": lambda: _flag_env("ATOM_UA_DECODE_TOKEN_SPLIT"),
+    # With ATOM_UA_SPLIT_REDUCE: aiter's reduce_segments_split_oneshot_gluon
+    # (unified_attention(split_reduce_oneshot=True)) in its place, bitwise the same
+    # output: every load (the live segments' partials by TDM, the statistics, the
+    # output gate) in flight at once instead of a chain of dependent round trips.
+    # No-op on an aiter without it. Off by default.
+    "ATOM_UA_SPLIT_REDUCE_ONESHOT": lambda: _flag_env("ATOM_UA_SPLIT_REDUCE_ONESHOT"),
     # With ATOM_FUSED_MOE_TAIL_NORM at TP > 1 (gfx1250, TP4): a sparse MoE block
     # whose next norm all-reduces (the Qwen3.5 MTP drafter's final norm with
     # ATOM_MTP_FUSE_ALLREDUCE_NORM) leaves `routed + sigmoid(gate) * shared` to
