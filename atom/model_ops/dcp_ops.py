@@ -864,6 +864,11 @@ def mask_empty_dcp_lse(
 # steps take it: the build lands in capture, and eager steps stay on a2a.
 
 _MAILBOX_WORKSPACES: dict = {}
+# Largest merge (tokens x all heads x head dim) the mailbox takes. Its tagged
+# system-scope stores beat pack -> RCCL -> combine while the merge is latency
+# bound and lose once it is bandwidth bound: on MI355X the two cross between
+# about 2.6e5 and 3.9e5 elements (GLM-5.2 DCP4 16 x 256, Kimi-K3 DCP8 12 x 128).
+_MAILBOX_MAX_ELEMS = 1 << 18
 logger = logging.getLogger("atom")
 
 
@@ -934,6 +939,7 @@ def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_d
         ws is None
         or tokens == 0
         or tokens > ws.max_tokens
+        or tokens * heads * dim > _MAILBOX_MAX_ELEMS
         or cp_attn_out.dtype != torch.bfloat16
     ):
         return None

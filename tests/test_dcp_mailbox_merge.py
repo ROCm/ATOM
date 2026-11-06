@@ -5,6 +5,7 @@ when a merge takes it, when it falls back to all-to-all, and -- across real
 ranks, in and out of a CUDA graph -- that it merges what all-to-all merges."""
 
 import os
+import sys
 import tempfile
 from types import SimpleNamespace
 
@@ -73,6 +74,32 @@ def test_a_call_the_workspace_cannot_take_is_all_to_all(
     out = torch.zeros(tokens, 16, 128, dtype=dtype)
     lse = torch.zeros(tokens, 16)
     assert dcp_ops.dcp_lse_merge(out, lse, group, backend="mailbox") == "a2a"
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize("tokens,taken", [(16, True), (17, False)])
+def test_a_merge_past_the_size_limit_is_all_to_all(
+    monkeypatch, a2a_calls, capturing, tokens, taken
+):
+    """16 tokens x 64 heads x 256 is the largest merge the mailbox takes."""
+    group = _group()
+    key = dcp_ops._mailbox_key(group, 16, 256)
+    monkeypatch.setitem(
+        dcp_ops._MAILBOX_WORKSPACES, key, SimpleNamespace(max_tokens=64)
+    )
+    combined = []
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.flydsl.dcp_mailbox",
+        SimpleNamespace(
+            dcp_lse_combine=lambda ws, o, l, base_e: combined.append(o) or o
+        ),
+    )
+    out = torch.zeros(tokens, 64, 256, dtype=torch.bfloat16)
+    lse = torch.zeros(tokens, 64)
+    dcp_ops.dcp_lse_merge(out, lse, group, backend="mailbox")
+    assert len(combined) == int(taken)
+    assert a2a_calls == ([] if taken else [None])
 
 
 @needs_dcp_ops
