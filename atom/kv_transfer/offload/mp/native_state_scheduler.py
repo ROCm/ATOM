@@ -18,7 +18,6 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload._offload_common import (
     max_pending_saves,
-    tier_token_ids,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
@@ -148,10 +147,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 "every hit replays %d tokens below the KV it loads.",
                 self._replay_tokens,
             )
-        else:
-            # Images are saved only at a chunk boundary, so an anchor off the
-            # chunk grid never reaches LMCache.
-            block_manager.align_checkpoint_anchor(self.chunk_size)
         # sid -> (seq, KV-only reach in tokens) of the request's lookup, from
         # its answer until admission weighs it. The lookup keeps the PAGE KV
         # locked up to the reach meanwhile, so nothing releases it before then.
@@ -200,7 +195,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         # locks belong to the requested endpoint. A full-prompt query followed
         # by rounding the result would pair the earlier KV with later state.
         boundary = self._chunk_floor(max(0, int(seq.num_prompt_tokens) - 1))
-        return tier_token_ids(seq, boundary)
+        return list(seq.token_ids[:boundary])
 
     def _lookup_len(self, seq: Any) -> int:
         return self._chunk_floor(max(0, int(seq.num_prompt_tokens) - 1))
@@ -300,6 +295,25 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             if reach > int(self._hit_save_floors.get(sid, 0)):
                 self._hit_save_floors[sid] = reach
         super().update_state_after_alloc(seq)
+
+    def lookup_pending(self, seq: Any) -> bool:
+        """Also hold back a request that may restore an image while every
+        restore slot of the worker is taken; only a known miss goes ahead.
+
+        The worker restores into `max(2, max_pending_saves)` slots, and only
+        between forwards. A load dispatched past them queues there with no
+        clock of the worker running, while its deadline here counts from
+        dispatch, so a few slow forwards (a cold restart) would stop the engine.
+        """
+        if super().lookup_pending(seq):
+            return True
+        # With images every native load restores one (a KV-only load comes
+        # only with a replay, which stores no images).
+        if self._page_only or not getattr(seq, "has_per_req_cache", False):
+            return False
+        if len(self._native_loads) < max(2, self._max_pending_saves):
+            return False
+        return self._lookup_client.hit_tokens(str(seq.id)) != 0
 
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:
         parks = super().should_park_for_load_after_alloc(seq)

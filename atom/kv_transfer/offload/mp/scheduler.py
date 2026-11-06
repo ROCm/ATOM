@@ -16,7 +16,10 @@ from atom.kv_transfer.disaggregation.types import (
     LoadOperationId,
 )
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload._offload_common import validated_kv_role
+from atom.kv_transfer.offload._offload_common import (
+    tier_lookup_kwargs,
+    validated_kv_role,
+)
 from atom.kv_transfer.offload.chunked_scheduler import (
     ChunkedOffloadSchedulerBase,
 )
@@ -92,8 +95,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 _transfer_deadline_s(config) + _SCHEDULER_DEADLINE_MARGIN_S
             )
             self._transfer_seen_at: dict[Any, float] = {}
-            # Live loads, in dispatch order: the order the worker restores them.
-            self._load_order: dict[Any, None] = {}
             super().__init__(
                 config,
                 chunk_size=int(adapter.lmcache_tokens_per_chunk),
@@ -142,7 +143,11 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         for seq in seqs:
             if self._lookup_len(seq) <= 0:
                 continue
-            client.offer(str(seq.id), functools.partial(self._offered_tokens, seq))
+            client.offer(
+                str(seq.id),
+                functools.partial(self._offered_tokens, seq),
+                **tier_lookup_kwargs(seq),
+            )
 
     def _offered_tokens(self, seq: Any) -> list[int] | None:
         """The prompt to look up, or None once `seq` stopped waiting for one.
@@ -345,29 +350,10 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         for operation in [op for op in seen if op not in live]:
             del seen[operation]
         now = time.monotonic()
-        self._restart_loads_queued_behind_a_finished_one(now)
         for operation in live:
             _enforce_transfer_deadline(
                 operation, seen.setdefault(operation, now), self._scheduler_deadline_s
             )
-
-    def _restart_loads_queued_behind_a_finished_one(self, now: float) -> None:
-        """A native-state worker restores loads in dispatch order, advancing
-        them only between forwards. When a load finishes, every load dispatched
-        after it starts its bound again (`_active_load_operations` keeps
-        dispatch order, also within one step). Only earlier loads restart a
-        load, so one whose completion is lost still stops the engine one bound
-        after the last of those finishes."""
-        loads = [operation for _, operation in self._active_load_operations.values()]
-        live = set(loads)
-        behind_a_finished_one = False
-        for operation in list(self._load_order):
-            if operation not in live:
-                del self._load_order[operation]
-                behind_a_finished_one = True
-            elif behind_a_finished_one and operation in self._transfer_seen_at:
-                self._transfer_seen_at[operation] = now
-        self._load_order.update(dict.fromkeys(loads))
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         output = super().process_completions(output)

@@ -612,6 +612,27 @@ def test_page_verdict_succeeds_for_a_page_only_save():
     assert _page_verdict(connector) == {request.req_id: True}
 
 
+@pytest.mark.parametrize(
+    "cache_salt, configs", [("", None), ("11", {"lmcache.tag.cache_salt": "11"})]
+)
+def test_a_save_stores_and_probes_under_the_prompts_salt(cache_salt, configs):
+    order: list[str] = []
+    connector = _worker(order)
+    connector._engine.lookup_hit = 8
+    request = _save_request()
+    request.cache_salt = cache_salt
+
+    connector._do_save_req(request, None, None)
+
+    engine = connector._engine
+    assert [kwargs.get("request_configs") for *_, kwargs in engine.store_calls] == [
+        configs
+    ]
+    assert [kwargs.get("request_configs") for _, kwargs in engine.lookup_calls] == [
+        configs
+    ]
+
+
 def test_page_verdict_reported_when_executor_submission_is_rejected():
     """`_finish_rejected_save` is a terminal path and owes a verdict too."""
     order: list[str] = []

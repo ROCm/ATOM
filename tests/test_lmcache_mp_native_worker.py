@@ -5,9 +5,7 @@
 
 import copy
 import json
-import sys
-import types
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -48,29 +46,6 @@ from atom.model_engine.arg_utils import (
 )
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_ops.attentions.deepseek_v4_replay import state_replay_tokens
-
-
-@dataclass
-class _TransferSpec:
-    token_ids: list[int]
-    block_ids: list[list[int]]
-    start: int = 0
-    end: int = 0
-    request_configs: dict | None = None
-
-
-@pytest.fixture(autouse=True)
-def fake_lmcache_transfer_spec(monkeypatch):
-    """Keep transport-contract tests independent of optional LMCache installs."""
-    lmcache = types.ModuleType("lmcache")
-    integration = types.ModuleType("lmcache.integration")
-    atom = types.ModuleType("lmcache.integration.atom")
-    atom.AtomMPTransferSpec = _TransferSpec
-    lmcache.integration = integration
-    integration.atom = atom
-    monkeypatch.setitem(sys.modules, "lmcache", lmcache)
-    monkeypatch.setitem(sys.modules, "lmcache.integration", integration)
-    monkeypatch.setitem(sys.modules, "lmcache.integration.atom", atom)
 
 
 class Future:
@@ -282,14 +257,14 @@ def _kv_only_load(hbm=8):
 
 
 def test_kv_only_load_reads_page_alone_under_the_request_session(page_worker):
-    req = _kv_only_load()
+    req = replace(_kv_only_load(), cache_salt="11")
     page_worker._submit_load(req, object())
     # The lookup that reported the reach also locked it, under this session.
     assert page_worker.submitted_request_ids == ["atom-offload-dp0:7"]
     [spec] = page_worker.submitted
     # PAGE for [8, 16) and nothing else: the layout has no image group.
     assert spec.block_ids == [[3, 4]]
-    assert spec.request_configs is None
+    assert spec.cache_salt == "11"
 
 
 def test_page_only_save_stores_page_alone(page_worker):
@@ -299,7 +274,7 @@ def test_page_only_save_stores_page_alone(page_worker):
     page_worker._submit_save(req, object())
     [spec] = page_worker.submitted
     assert spec.block_ids == [[1, 2, 3, 4]]
-    assert spec.request_configs is None
+    assert spec.cache_salt == ""
     page_worker.future.ready = True
     terminals = [
         completion

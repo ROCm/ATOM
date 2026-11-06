@@ -1490,7 +1490,7 @@ class TestPagedCopyCheckpoint:
         bm._joint_chunk_tokens = chunk
         return bm
 
-    def _prompt_with_a_rung_at(self, bm, blocks: int, tokens=None):
+    def _prompt_with_a_rung_at(self, bm, blocks: int):
         """Run PROMPT once and leave one READY checkpoint `blocks` blocks in.
 
         Placed explicitly rather than by the ladder because the position
@@ -1498,7 +1498,7 @@ class TestPagedCopyCheckpoint:
         checkpoint filed under the LAST block is one no scan can ever look up.
         An interior rung is what a resume actually lands on.
         """
-        seq = self._admitted(bm, tokens or PROMPT)
+        seq = self._admitted(bm, PROMPT)
         # Publish the prefix, which is what makes its blocks lookup-able and so
         # what a second request's walk can match against.
         bm.hash_blocks(seq, seq.num_prompt_tokens)
@@ -1566,54 +1566,6 @@ class TestPagedCopyCheckpoint:
         assert second.offload_joint.boundary_tokens == 8 * BLOCK
         # The KV leg has real work: the walk stopped well below the boundary.
         assert hbm_hit * BLOCK < second.offload_joint.kv_tokens
-
-    def _only_the_tier_keeps(self, bm, first, h, *, evict_from=0):
-        """Evict `first`'s KV from block `evict_from` on, and rung `h` from HBM;
-        the tier keeps the rung."""
-        victim = first.block_table[evict_from]
-        bm.deallocate(first)
-        self._break_the_kv_chain_at(bm, victim)
-        bm.paged_state_checkpoints.unindex(h)
-        self._with_tier(bm, h)
-        self._reset_joint_counters(bm)
-
-    def test_a_chunk_aligned_prompt_resent_whole_reaches_its_last_rung(self):
-        """Its rungs sit at its end and one block before; a KV ceiling withheld
-        by one token and floored lands a whole chunk below the second."""
-        tokens = list(range(48))  # 12 blocks, 3 chunks
-        chunk = 4 * BLOCK
-        bm = self._joint_bm(chunk=chunk)
-        self._only_the_tier_keeps(bm, *self._prompt_with_a_rung_at(bm, 11, tokens))
-
-        withheld = stateful_seq(tokens)
-        withheld.offload_joint.kv_prefix_tokens = (len(tokens) - 1) // chunk * chunk
-        bm.can_allocate(withheld)
-        assert bm.joint_boundaries == 0
-        assert bm.joint_skips.get("no_rung_above_hbm") == 1, bm.joint_skips
-
-        whole = stateful_seq(tokens)
-        whole.offload_joint.kv_prefix_tokens = len(tokens)
-        bm.can_allocate(whole)
-        assert bm.joint_boundaries == 1, bm.joint_skips
-        assert whole.offload_joint.boundary_tokens == 11 * BLOCK
-        assert whole.offload_joint.kv_tokens == len(tokens)
-
-    def test_the_joint_probe_names_the_boundary_a_full_hit_lands_on(self):
-        """0 while HBM already resumes there, or for a withheld hit."""
-        tokens = list(range(48))
-        chunk = 4 * BLOCK
-        bm = self._joint_bm(chunk=chunk)
-        first, h = self._prompt_with_a_rung_at(bm, 11, tokens)
-        self._with_tier(bm, h)
-        assert bm.joint_boundary_tokens(stateful_seq(tokens), len(tokens)) == 0
-
-        self._only_the_tier_keeps(bm, first, h)
-        seq = stateful_seq(tokens)
-        assert bm.joint_boundary_tokens(seq, len(tokens)) == 11 * BLOCK
-        assert bm.joint_boundary_tokens(seq, 2 * chunk) == 0
-        # A probe: nothing committed, nothing counted.
-        assert seq.offload_joint.boundary_tokens == 0
-        assert bm.joint_boundaries == 0 and not bm.joint_skips
 
     def test_an_unaligned_hbm_hit_still_reaches_the_rung_above_it(self):
         """A hit that is not a multiple of the KV chunk used to refuse the
@@ -1979,7 +1931,7 @@ class TestPagedCopyCheckpoint:
         probe = AdmissionProbe()
         bm.can_allocate(seq, record=False, probe=probe)
         decision = bm._joint_kv_boundary(
-            seq, probe.num_cached_blocks, probe.block_hashes, len(PROMPT)
+            seq, probe.num_cached_blocks, probe.block_hashes
         )
         assert decision.skip_reason is None
         return seq, probe, decision
@@ -3188,83 +3140,6 @@ class TestPromptEndAnchor:
                 cuts = set(forward_on_the_ladder(bm, seq))
                 keeps = {p for p in range(1, n + 1) if bm.checkpointers_at(seq, p)}
                 assert not cuts - keeps, (n, sorted(cuts), sorted(keeps))
-
-    def test_an_aligned_anchor_is_the_hash_anchor_floored_to_the_tier_grid(self):
-        """Floored, it moves left by less than one grid and stays a position
-        the cut and the keep agree on. Swept for the same reason as above."""
-        grid = 2 * BLOCK
-        for n in range(BLOCK, 80):
-            tokens = list(range(1000 * n, 1000 * n + n))
-            plain = make_block_manager(demand_config())
-            ref = stateful_seq(tokens)
-            plain.can_allocate(ref)
-
-            bm = make_block_manager(demand_config())
-            bm.align_checkpoint_anchor(grid)
-            seq = stateful_seq(tokens)
-            bm.allocate(seq, bm.can_allocate(seq))
-            anchor = seq.checkpoint_end_pos
-            floored = ref.checkpoint_end_pos // grid * grid
-            assert anchor == (floored or ref.checkpoint_end_pos), n
-            cuts = set(forward_on_the_ladder(bm, seq))
-            keeps = {p for p in range(1, n + 1) if bm.checkpointers_at(seq, p)}
-            assert not cuts - keeps, (n, sorted(cuts), sorted(keeps))
-            if anchor:
-                assert anchor in keeps, n
-
-    def test_a_prompt_short_of_the_tier_grid_keeps_its_hash_block_anchor(self):
-        n = 40
-        tokens = list(range(1000 * n, 1000 * n + n))
-        plain = make_block_manager(demand_config())
-        ref = stateful_seq(tokens)
-        plain.can_allocate(ref)
-        assert ref.checkpoint_end_pos > 0
-
-        bm = make_block_manager(demand_config())
-        bm.align_checkpoint_anchor(
-            (ref.checkpoint_end_pos // BLOCK + 1) * BLOCK  # just past the anchor
-        )
-        seq = stateful_seq(tokens)
-        bm.allocate(seq, bm.can_allocate(seq))
-        assert seq.checkpoint_end_pos == ref.checkpoint_end_pos
-        assert bm.checkpointers_at(seq, seq.checkpoint_end_pos)
-
-    def _tier_grid_manager(self):
-        bm = make_block_manager(
-            demand_config(
-                kv_cache_block_size=64,
-                num_kvcache_blocks=400,
-                max_model_len=16384,
-                max_num_batched_tokens=16384,
-                state_checkpoint_interval_tokens=8192,
-            )
-        )
-        bm.align_checkpoint_anchor(256)
-        return bm
-
-    def test_a_hit_on_the_tier_grid_keeps_the_anchor_past_it(self):
-        """Chunk 256, block 64: floored, the anchor 8256 would sit on the 8192
-        hit, where no forward of this turn reaches it."""
-        bm = self._tier_grid_manager()
-        run_prompt_on_the_ladder(
-            bm, Sequence(list(range(8200)), 64, has_per_req_cache=True)
-        )
-        seq = Sequence(list(range(8300)), 64, has_per_req_cache=True)
-        hit = bm.can_allocate(seq)
-        assert hit * 64 == 8192
-        assert seq.checkpoint_end_pos == 8256
-        bm.allocate(seq, hit)
-        assert forward_on_the_ladder(bm, seq) == [8256]
-        assert bm.checkpointers_at(seq, 8256)
-
-    def test_a_tier_load_on_the_tier_grid_keeps_the_anchor_past_it(self):
-        """No joint re-records the anchor: the reported load point is where
-        this turn resumes."""
-        bm = self._tier_grid_manager()
-        seq = Sequence(list(range(8300)), 64, has_per_req_cache=True)
-        seq.offload_joint.kv_prefix_tokens = 8192
-        assert bm.can_allocate(seq) == 0
-        assert seq.checkpoint_end_pos == 8256
 
     def test_the_anchor_does_not_displace_the_grid_rung(self):
         """Both are cut for, because they serve different classes.

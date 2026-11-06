@@ -19,7 +19,8 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import (
     OffloadSchedulerMixin,
-    tier_token_ids,
+    tier_cache_salt,
+    tier_lookup_kwargs,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.metadata import (
@@ -173,7 +174,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
     def _lookup_token_ids(self, seq) -> list[int]:
         """The prompt extent this layout can safely ask the tier to resume."""
-        return tier_token_ids(seq, seq.num_prompt_tokens)
+        return list(seq.token_ids[: seq.num_prompt_tokens])
 
     def _lookup_len(self, seq) -> int:
         """`len(self._lookup_token_ids(seq))` without copying the prompt."""
@@ -268,7 +269,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if self._lookup_len(seq) <= 0:
                 continue
             budget -= 1
-            if submit(self._lookup_token_ids(seq), sid):
+            if submit(self._lookup_token_ids(seq), sid, **tier_lookup_kwargs(seq)):
                 self._perf_bump("lookup_prefetched")
         self._perf_bump("prefetch_us", int((time.perf_counter() - t0) * 1e6))
 
@@ -341,7 +342,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         sid = str(seq.id)
         client = self._lookup_client
         if sid not in client.pending_ids():
-            if not client.submit(self._lookup_token_ids(seq), sid):
+            if not client.submit(
+                self._lookup_token_ids(seq), sid, **tier_lookup_kwargs(seq)
+            ):
                 return False
             self._perf_bump("lookup_detached_sent")
         # Registered before `discard`, which releases an answered lookup at once.
@@ -457,7 +460,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._lookup_results[sid] = (seq, 0)
         _t0 = time.perf_counter()
         try:
-            hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
+            hit = self._lookup_client.lookup(
+                token_ids, lookup_id=sid, **tier_lookup_kwargs(seq)
+            )
             _us = int((time.perf_counter() - _t0) * 1e6)
             self._perf_bump("lookup_n")
             self._perf_bump("lookup_us", _us)
@@ -512,7 +517,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return 0, False
         num_prompt = seq.num_prompt_tokens
         frontier = int(seq.num_cached_tokens)
-        hit = self._loadable_hit(hit, num_prompt, seq)
+        hit = self._loadable_hit(hit, num_prompt)
         if self._hit_cap_hook is not None:
             # After `_loadable_hit`, so the hook caps the hit that will
             # actually be requested; before the save floor is recorded, so a
@@ -657,11 +662,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """Admit any layout-specific sources before advancing the watermark."""
         return LMCacheReqMeta(
             req_id=seq.id,
-            token_ids=tier_token_ids(seq, aligned),
+            token_ids=list(seq.token_ids[:aligned]),
             block_ids=block_ids,
             save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
             is_last_prefill=is_last_prefill,
             save_operation=operation,
+            cache_salt=tier_cache_salt(seq),
         )
 
     def _build_load_request(
@@ -678,10 +684,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """
         return LMCacheReqMeta(
             req_id=seq.id,
-            token_ids=tier_token_ids(seq, transfer_end),
+            token_ids=list(seq.token_ids[:transfer_end]),
             block_ids=list(seq.block_table),
             load_spec=load_spec,
             load_operation=load_operation,
+            cache_salt=tier_cache_salt(seq),
         )
 
     def _late_save_frontier(self, seq, saved: int, available: int) -> int:
