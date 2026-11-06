@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""Sparse attention over the FP8 pool's MXFP8 rows.
+"""Sparse attention over separate, contiguous MXFP8 KV data/scale planes.
 
-A row is `head_dim` E4M3 values then `head_dim // 32` E8M0 scales, RoPE dims
-included (`V41PoolGeometry.row_bytes`); the query is quantized the same way
-(`rope_quant_window`'s `query_fp8`). Only AITER's `mla_sparse_prefill_v41`
-reads this record: the V3 (576 dims, a scale a tensor) and V4 (FP8 NoPE + BF16
-RoPE) FP8 kernels take the same dtypes and compute garbage on it, so nothing
-here dispatches by dtype.
+CSA and SWA have independent row spaces. A prefill's SWA source contains
+the current batch's rings followed by the current chunk; decode uses the ring directly.
+Legacy packed rows remain accepted by the standalone wrappers.
 """
 
 import torch
@@ -24,6 +21,11 @@ except ImportError:
 def _split(rows, dim):
     """`[n, dim + dim // 32]` byte rows as their (values, scales) views, at the
     rows' own stride."""
+    if isinstance(rows, tuple):
+        values, scales = rows
+        if not values.is_contiguous() or not scales.is_contiguous():
+            raise ValueError("KV data and scale planes must each be contiguous")
+        return values.view(FP8_DTYPE), scales.view(torch.float8_e8m0fnu)
     return rows[:, :dim].view(FP8_DTYPE), rows[:, dim:].view(torch.float8_e8m0fnu)
 
 
@@ -45,9 +47,9 @@ def sparse_attn_v41_paged_2src(
 
     Args:
       query:   `(values [T, H, D] fp8, scales [T, H, D // 32] E8M0)`.
-      pool:    `[rows, D + D // 32]` uint8, the prefix source (the cache's pool).
-      kv:      `[rows, D + D // 32]` uint8 at `pool`'s row stride, the extend
-        source: this forward's rows (prefill) or the layer's ring (decode).
+      pool:    `(data [rows, D], scale [rows, D // 32])`, the CSA source.
+      kv:      the SWA pair: ring plus current chunk (prefill), or ring (decode).
+        Both planes are contiguous; each source has its own CSR row space.
       kv_indices_* / kv_indptr_*: int32 CSR row lists into each source.
       out:     optional `[T, H, D]` bf16 output.
     """

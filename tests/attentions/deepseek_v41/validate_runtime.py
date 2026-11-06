@@ -27,6 +27,7 @@ from atom.model_engine.sequence import (
     SequenceStatus,
 )
 from atom.sampling_params import SamplingParams
+from atom.utils.forward_context import request_bucket
 
 
 def scheduler_cases(runner, tokenizer):
@@ -210,16 +211,29 @@ def main():
             cache = builder.cache
             max_q_len = runner.drafter.mtp_k + 1 if hasattr(runner, "drafter") else 1
             scratch = -(-(cache.geometry.window_size + max_q_len) // builder.block_size)
-            before = cache.page_bytes[scratch:].clone()
+            # Index planes live outside page_regions, for every KV dtype.
+            # Compare bytes so packed/scaled index formats share this check.
+            regions = list(cache.page_regions) + [
+                (f"index_{owner}.{i}", plane.view(torch.uint8).flatten(1))
+                for owner, planes in cache.index_planes.items()
+                for i, plane in enumerate(planes)
+            ]
+            before = {name: region[scratch:].clone() for name, region in regions}
             runner.capture_cudagraph()
-            torch.testing.assert_close(
-                cache.page_bytes[scratch:], before, rtol=0, atol=0
-            )
+            for name, region in regions:
+                torch.testing.assert_close(
+                    region[scratch:],
+                    before[name],
+                    rtol=0,
+                    atol=0,
+                    msg=f"CUDA graph capture modified non-scratch pages in {name}",
+                )
             del before
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
         events = scheduler_cases(runner, tokenizer)
-        shapes = sorted(getattr(runner, "graphs", {}))
+        shapes = sorted(runner.req_graph.keys()) if args.graph else []
         if args.graph:
+            # ReqGraph keys encode (batch size, draft tokens), as capture/replay do.
             # One whole-forward graph per declared shape, and nothing per
             # layer: the target is a single replay now. A shape that failed to
             # capture would be missing here, and a decode step that reached for
@@ -229,7 +243,7 @@ def main():
                 runner.drafter.mtp_k + 1 if hasattr(runner, "drafter") else 1
             )
             assert shapes == sorted(
-                (bs, q) for q in buckets for bs in capture_sizes
+                request_bucket(bs, q) for q in buckets for bs in capture_sizes
             ), f"captured {shapes}, declared {capture_sizes} x {buckets}"
         report = {
             "graph": args.graph,

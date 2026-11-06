@@ -65,9 +65,8 @@ MAIN_FP4 = {"group_size": 16, "scale_dtype": torch.float8_e4m3fn}
 # which one meant what.
 INDEX_FP8_SCALE_FMT = "ue8m0"
 
-# The main pool's formats (`--kv_cache_dtype`). FP8 rows are `fp8_rows`': row
-# addressed like BF16, which is what `mla_sparse_prefill_v41`'s int32 row
-# indices need; FP4 rows are byte addressed through tagged addresses.
+# Both quantized formats expose separate contiguous data/scale planes.
+# CSR indices count rows within one owner's CSA or one layer's SWA source.
 KV_DTYPES = ("bf16", "fp4", "fp8")
 
 # The rows one page of the FP4 index plane holds: the row-group scorer's page-8
@@ -158,7 +157,7 @@ class V41PoolGeometry:
 
     @property
     def packed(self):
-        """FP4 main rows, byte addressed: the pool a reader decodes first."""
+        """Whether CSA values use packed E2M1 rather than FP8/BF16."""
         return self.kv_dtype == "fp4"
 
     @property
@@ -379,6 +378,21 @@ class V41PoolGeometry:
     @property
     def checkpoint_image_ranges(self):
         """`(offset, num_bytes)` of a STATE entry a checkpoint image holds."""
+        if self.window_fp8:
+            # Image order follows the source buffers, then the original cursor.
+            row = self.ring_slots * self.window_row_bytes
+            data = self.ring_slots * self.head_dim
+            window = [
+                (layer * row + offset, size)
+                for layer in range(self.layers)
+                for offset, size in ((0, data), (data, row - data))
+            ]
+            cursor = [
+                (start, field.bytes_per_entry)
+                for field, start, _ in field_extents(self.state_fields)
+                if field.name == "cursor"
+            ]
+            return window + cursor
         return checkpoint_ranges_for(self.state_fields)
 
     @property
@@ -386,6 +400,8 @@ class V41PoolGeometry:
         return sum(nbytes for _, nbytes in self.checkpoint_image_ranges)
 
     def main_offset(self, owner):
+        if self.window_fp8:
+            return 0
         return next(
             start // (1 if self.packed else self.row_bytes)
             for field, start, _ in field_extents(self.page_fields)
@@ -395,8 +411,12 @@ class V41PoolGeometry:
     def window(self, layer, pages):
         """`layer`'s ring in the pool's own units: bytes when packed, rows
         otherwise."""
-        if self.packed:
-            return self.window_bytes(layer, pages)
+        if not 0 <= layer < self.layers:
+            raise IndexError("Window layer is outside the cache")
+        if self.window_fp8:
+            return WindowParams(
+                0, self.ring_slots, self.ring_slots, self.ring_slots, self.ring_slots
+            )
         return WindowParams(
             ring_start=self._state_start(layer, pages) // self.row_bytes
             + layer * self.ring_slots,
@@ -409,15 +429,8 @@ class V41PoolGeometry:
     def window_bytes(self, layer, pages):
         """`layer`'s ring in bytes from the pool's base: where the FP8 window
         writers and readers (`packed_rows`) address an FP8 window row."""
-        if not self.window_fp8:
-            raise ValueError("A BF16 window is addressed in rows")
-        return WindowParams(
-            ring_start=self._state_start(layer, pages)
-            + layer * self.ring_slots * self.window_row_bytes,
-            slot_rows=self.state_bytes,
-            ring_slots=self.ring_slots,
-            ring_stride=1,
-            run_rows=self.window_row_bytes,
+        raise ValueError(
+            "Quantized windows use separate data/scale planes; use window()"
         )
 
     def _state_start(self, layer, pages):
@@ -429,7 +442,7 @@ class V41PoolGeometry:
 
     @property
     def layout_id(self):
-        identity = (
+        identity = ("source-buffer-v1:" if self.window_fp8 else "") + (
             # v2: the compressor's incomplete-group tail became a K_pool ring.
             # Every other term below was already the same in v1, so without the
             # bump a v1 image would read as compatible and restore into fields
