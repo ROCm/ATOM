@@ -8,6 +8,7 @@ model loader and so the real aiter. Stubbing that chain would mean stubbing
 the loader's whole quant surface, so this file skips on the non-GPU runner.
 """
 
+import contextlib
 import types
 from unittest import mock
 
@@ -35,7 +36,7 @@ class _FakeTarget(nn.Module):
         self.layers = nn.ModuleList(
             nn.Identity() if lo <= i < hi else PPMissingLayer() for i in range(n_layers)
         )
-        # Like the real models: off the first stage the embedding is missing.
+        # Middle stages hold no embedding; the last may hold a drafter's copy.
         self.embed_tokens = nn.Identity() if with_embed else PPMissingLayer()
 
 
@@ -50,13 +51,23 @@ def _forward_context():
         yield _CTX
 
 
+def _pp_group(group):
+    # The relay reads the stage; the shared residency rule reads it for `-1`.
+    stack = contextlib.ExitStack()
+    for mod in ("pp_aux_relay", "drafter"):
+        stack.enter_context(
+            mock.patch(f"atom.spec_decode.{mod}.get_pp_group", return_value=group)
+        )
+    return stack
+
+
 def _relay(layer_ids, n_layers, resident_range, *, first, last, hidden=8):
     target = _FakeTarget(n_layers, resident_range, with_embed=first)
     spec = AuxCaptureSpec(
         layer_ids=tuple(layer_ids), hidden_size=hidden, extract=lambda out, mod: out
     )
     group = types.SimpleNamespace(is_first_rank=first, is_last_rank=last)
-    with mock.patch("atom.spec_decode.pp_aux_relay.get_pp_group", return_value=group):
+    with _pp_group(group):
         relay = PPAuxRelay(spec, target)
         relay.arm(target)
     return relay, target
@@ -174,7 +185,9 @@ def test_last_stage_arms_only_its_own_taps():
     from atom.spec_decode.drafter import Drafter
 
     hidden = 8
-    target = _FakeTarget(8, (4, 8), with_embed=False)
+    # The last stage holds an embedding copy for its drafter, yet the `-1`
+    # tap still arrives through the relay.
+    target = _FakeTarget(8, (4, 8), with_embed=True)
     spec = AuxCaptureSpec(
         layer_ids=(-1, 2, 5), hidden_size=hidden, extract=lambda out, mod: out
     )
@@ -185,7 +198,9 @@ def test_last_stage_arms_only_its_own_taps():
         dtype=torch.float32,
     )
     drafter._make_aux_hook = lambda i, e: Drafter._make_aux_hook(drafter, i, e)
-    Drafter.arm_aux_capture(drafter, target)
+    group = types.SimpleNamespace(is_first_rank=False, is_last_rank=True)
+    with _pp_group(group):
+        Drafter.arm_aux_capture(drafter, target)
     assert [b.shape[0] for b in drafter._aux_buffers] == [0, 0, 4]
     assert not target.embed_tokens._forward_hooks
     assert not target.layers[2]._forward_hooks
@@ -235,7 +250,7 @@ def test_build_takes_the_drafter_class_spec_and_arms_only_under_pp(world_size):
         world_size=world_size, is_first_rank=True, is_last_rank=False
     )
     with (
-        mock.patch("atom.spec_decode.pp_aux_relay.get_pp_group", return_value=group),
+        _pp_group(group),
         mock.patch(
             "atom.spec_decode.pp_aux_relay.drafter_class", return_value=drafter_cls
         ),

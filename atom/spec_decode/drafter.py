@@ -114,16 +114,14 @@ def _resolve_embedding(target_model: nn.Module) -> nn.Module:
     return embed
 
 
-def tap_is_resident(target_model: nn.Module, layers: nn.Module, lid: int) -> bool:
-    """Whether aux tap ``lid`` runs on this PP stage: a tap owned by another
-    stage sits on a ``PPMissingLayer``. Out-of-range ids are not resident."""
+def tap_is_resident(layers: nn.Module, lid: int) -> bool:
+    """Whether aux tap ``lid`` runs on this PP stage: a layer owned by another
+    stage is a ``PPMissingLayer``. The embedding runs only on the first stage,
+    though the last may hold a copy for its drafter. Out-of-range ids are not
+    resident."""
     if lid == -1:
-        module = _resolve_embedding(target_model)
-    elif 0 <= lid < len(layers):
-        module = layers[lid]
-    else:
-        return False
-    return not isinstance(module, PPMissingLayer)
+        return get_pp_group().is_first_rank
+    return 0 <= lid < len(layers) and not isinstance(layers[lid], PPMissingLayer)
 
 
 def _identity_extract(output: Any, _module: nn.Module) -> torch.Tensor:
@@ -468,9 +466,7 @@ class Drafter(abc.ABC):
         layers = _resolve_decoder_layers(target_model)
         # A tap on an earlier PP stage reaches `take_relayed_aux` instead, so it
         # gets no rows and no hook. install_aux_taps still rejects bad ids.
-        own = tuple(
-            lid for lid in spec.layer_ids if tap_is_resident(target_model, layers, lid)
-        )
+        own = tuple(lid for lid in spec.layer_ids if tap_is_resident(layers, lid))
         self._aux_buffers = [
             torch.zeros(
                 self.max_num_tokens if lid in own else 0,
