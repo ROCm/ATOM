@@ -1,0 +1,60 @@
+{
+  "source_path": "csrc/include/custom_all_reduce.cuh",
+  "source_sha256": "adea7a7d4d8f6116274b418a6f7628740e50a4ac83e89deee8466fa984ff0948",
+  "outputs": {
+    "custom_all_reduce_ordered.cuh": {
+      "sha256": "0728731b44f64ac4e3c9e348d6c34ebcbd42150f613c703a7d61884edcafd050",
+      "edits": [
+        {
+          "start": 904,
+          "end": 904,
+          "lines": [
+            "\n",
+            "// Local diagnostic candidate: exact per-segment BF16 order, same start/end sync.\n",
+            "template<typename T>\n",
+            "__global__ void __launch_bounds__(512, 1) dsv41_rs_bf16_ordered(\n",
+            "    RankData* dp, RankSignals sg, Signal* self_sg, T* result,\n",
+            "    int rank, int range, const uint8_t* order_codes)\n",
+            "{\n",
+            "    constexpr int pack = 16 / sizeof(T);\n",
+            "    using P = typename opus::vector_t<T, pack>;\n",
+            "    const P* ptrs[4];\n",
+            "    #pragma unroll\n",
+            "    for(int r=0;r<4;r++) ptrs[r]=reinterpret_cast<const P*>(dp->ptrs[r]);\n",
+            "    start_sync<4>(sg,self_sg,rank);\n",
+            "    const int tid=blockIdx.x*blockDim.x+threadIdx.x;\n",
+            "    const int stride=gridDim.x*blockDim.x;\n",
+            "    for(int idx=tid;idx<range;idx+=stride){\n",
+            "        const uint8_t code=order_codes[(idx*pack)/128];\n",
+            "        const int load_index=rank*range+idx;\n",
+            "        P value=ptrs[code&3][load_index];\n",
+            "        #pragma unroll\n",
+            "        for(int j=1;j<4;j++) {\n",
+            "            P other=ptrs[(code>>(2*j))&3][load_index];\n",
+            "            packed_assign_add<T,pack>(value,other);\n",
+            "        }\n",
+            "        reinterpret_cast<P*>(result)[idx]=value;\n",
+            "    }\n",
+            "    end_sync<4,true>(sg,self_sg,rank);\n",
+            "}\n"
+          ]
+        },
+        {
+          "start": 4822,
+          "end": 4822,
+          "lines": [
+            "void dispatchDsv41RSOrdered(hipStream_t stream, opus::bf16_t* input,\n",
+            "                          opus::bf16_t* output, const uint8_t* order_codes)\n",
+            "{\n",
+            "    if(world_size_!=4) throw std::runtime_error(\"DSV41 ordered RS requires TP4\");\n",
+            "    RankData* ptrs=get_buffer_RD(stream,input);\n",
+            "    constexpr int range=(1536*5120)/(4*8);\n",
+            "    dsv41_rs_bf16_ordered<opus::bf16_t><<<80,512,0,stream>>>(\n",
+            "        ptrs,sg_,self_sg_,output,rank_,range,order_codes);\n",
+            "}\n"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,161 @@
+{
+  "source_path": "aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage_common.py",
+  "source_sha256": "c317226daa89dddcfe070777e78d2bb31ef0012b91e159ff72afd643ecb1697d",
+  "outputs": {
+    "minimal_common.py": {
+      "sha256": "81acd2a10c29d7b1d0791a3632d9f0e69b99909035b79679ab03a012d20cf9be",
+      "edits": [
+        {
+          "start": 42,
+          "end": 45,
+          "lines": [
+            "from aiter.ops.flydsl.kernels.layout_utils import crd2idx, idx2crd\n",
+            "from aiter.ops.flydsl.kernels.mfma_epilogues import c_shuffle_epilog, default_epilog\n",
+            "from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import (\n"
+          ]
+        },
+        {
+          "start": 55,
+          "end": 56,
+          "lines": [
+            "from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc\n"
+          ]
+        },
+        {
+          "start": 284,
+          "end": 285,
+          "lines": [
+            "    ).replace(\"-\", \"_\") + \"_asyncwait0_r1\"\n"
+          ]
+        },
+        {
+          "start": 1483,
+          "end": 1484,
+          "lines": [
+            "                    if const_expr(use_async_copy):\n"
+          ]
+        },
+        {
+          "start": 3230,
+          "end": 3231,
+          "lines": [
+            "    ).replace(\"-\", \"_\") + \"_asyncwait0_r1\"\n"
+          ]
+        },
+        {
+          "start": 3283,
+          "end": 3284,
+          "lines": [
+            "            from aiter.ops.flydsl.kernels.layout_utils import _div_pow2, _mod_pow2\n"
+          ]
+        }
+      ]
+    },
+    "wait_common.py": {
+      "sha256": "a16b439b87fa09395790dfd5784ebbe599b2e509011d4da1d4a46092676ec7bd",
+      "edits": [
+        {
+          "start": 42,
+          "end": 45,
+          "lines": [
+            "from aiter.ops.flydsl.kernels.layout_utils import crd2idx, idx2crd\n",
+            "from aiter.ops.flydsl.kernels.mfma_epilogues import c_shuffle_epilog, default_epilog\n",
+            "from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import (\n"
+          ]
+        },
+        {
+          "start": 55,
+          "end": 56,
+          "lines": [
+            "from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc\n"
+          ]
+        },
+        {
+          "start": 79,
+          "end": 79,
+          "lines": [
+            "    vmcnt = 0\n",
+            "    lgkmcnt = 0\n"
+          ]
+        },
+        {
+          "start": 284,
+          "end": 285,
+          "lines": [
+            "    ).replace(\"-\", \"_\") + \"_allwait_r1\"\n"
+          ]
+        },
+        {
+          "start": 1486,
+          "end": 1487,
+          "lines": [
+            "                        rocdl.s_waitcnt(0)\n"
+          ]
+        },
+        {
+          "start": 1735,
+          "end": 1736,
+          "lines": [
+            "                rocdl.s_waitcnt(0)\n"
+          ]
+        },
+        {
+          "start": 3230,
+          "end": 3231,
+          "lines": [
+            "    ).replace(\"-\", \"_\") + \"_allwait_r1\"\n"
+          ]
+        },
+        {
+          "start": 3283,
+          "end": 3284,
+          "lines": [
+            "            from aiter.ops.flydsl.kernels.layout_utils import _div_pow2, _mod_pow2\n"
+          ]
+        }
+      ]
+    },
+    "fresh_common.py": {
+      "sha256": "6f26c2661bfefc31ad30840d47cc6f364606835c2988cc869aa7d2a6e9205841",
+      "edits": [
+        {
+          "start": 42,
+          "end": 45,
+          "lines": [
+            "from aiter.ops.flydsl.kernels.layout_utils import crd2idx, idx2crd\n",
+            "from aiter.ops.flydsl.kernels.mfma_epilogues import c_shuffle_epilog, default_epilog\n",
+            "from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import (\n"
+          ]
+        },
+        {
+          "start": 55,
+          "end": 56,
+          "lines": [
+            "from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc\n"
+          ]
+        },
+        {
+          "start": 284,
+          "end": 285,
+          "lines": [
+            "    ).replace(\"-\", \"_\") + \"_nativefresh_r1\"\n"
+          ]
+        },
+        {
+          "start": 3230,
+          "end": 3231,
+          "lines": [
+            "    ).replace(\"-\", \"_\") + \"_nativefresh_r1\"\n"
+          ]
+        },
+        {
+          "start": 3283,
+          "end": 3284,
+          "lines": [
+            "            from aiter.ops.flydsl.kernels.layout_utils import _div_pow2, _mod_pow2\n"
+          ]
+        }
+      ]
+    }
+  }
+}
