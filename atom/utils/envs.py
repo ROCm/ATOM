@@ -483,6 +483,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_SIGMOID_GATE": lambda: (
         os.getenv("ATOM_FUSED_SIGMOID_GATE", "0") == "1"
     ),
+    # Qwen3-Next / Qwen3.5: the attention output gate `o * sigmoid(gate)` runs in
+    # the unified attention's own epilogue (the 3D reduce_segments store, the
+    # gfx1250 2D kernel's store) instead of `_gated_pointwise_kernel` after it.
+    # Bitwise the unfused gate. Paths that end on another attention kernel apply
+    # the gate after it, as before.
+    "ATOM_UA_FUSED_OUTPUT_GATE": lambda: (
+        os.getenv("ATOM_UA_FUSED_OUTPUT_GATE", "1") == "1"
+    ),
     # Qwen3-Next / Qwen3.5: the MoE block leaves `routed + sigmoid(gate) *
     # shared` to the norm that reads it (the next layer's input norm, the final
     # norm, the MTP drafter's final norm), which adds it, adds the residual and

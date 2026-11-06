@@ -916,6 +916,7 @@ def fake_(
     layer_name: str,
     use_mla: bool,
     qkv: torch.Tensor,
+    output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     output_shape = list(q.shape)
     # If we fusion rmsnorm and quant, the input dtype is fp8, but actually we use bf16 for output.
@@ -944,7 +945,11 @@ def unified_attention_with_output_base(
     layer_name: str,
     use_mla: bool,
     qkv: torch.Tensor,
+    output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """``output_gate`` (ATOM_UA_FUSED_OUTPUT_GATE, MHA only): the result is
+    ``attention * sigmoid(output_gate)``, the gate applied by the impl (in the
+    unified attention's epilogue where it can)."""
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
     if use_mla:
@@ -963,6 +968,7 @@ def unified_attention_with_output_base(
             position=positions,
             q_scale=q_scale,
             qkv=qkv,
+            **({} if output_gate is None else {"output_gate": output_gate}),
         )
         # A prefill padded to a token-graph bucket: the kernel wrote the
         # scheduled rows; the pad rows of the fresh output hold whatever the
@@ -986,6 +992,7 @@ def unified_attention_into_output_fake(
     layer_name: str,
     qkv: torch.Tensor,
     output: torch.Tensor,
+    output_gate: torch.Tensor | None = None,
 ) -> None:
     return None
 
@@ -1014,6 +1021,7 @@ def unified_attention_into_output(
     layer_name: str,
     qkv: torch.Tensor,
     output: torch.Tensor,
+    output_gate: torch.Tensor | None = None,
 ) -> None:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
@@ -1025,6 +1033,7 @@ def unified_attention_into_output(
         q_scale=q_scale,
         qkv=qkv,
         output=output,
+        **({} if output_gate is None else {"output_gate": output_gate}),
     )
     if out.data_ptr() != output.data_ptr():
         output.copy_(out.reshape(output.shape))

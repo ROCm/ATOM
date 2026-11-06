@@ -833,6 +833,17 @@ class Qwen3NextAttention(nn.Module):
             and self.attn_output_gate
             and self.o_proj.quant_type == QuantType.per_1x128
         )
+        # ATOM_UA_FUSED_OUTPUT_GATE: the attention returns o * sigmoid(gate), the
+        # gate in the unified attention's epilogue (attention_mha: the paths that
+        # end on another kernel gate after it). ATOM native attention only. Not
+        # `gate_in_attention`, the MTP drafter's epilogue request (_attend).
+        self.fused_output_gate = (
+            envs.ATOM_UA_FUSED_OUTPUT_GATE
+            and self.attn_output_gate
+            and not self.use_fused_sigmoid_mul_quant
+            and not is_plugin_mode()
+            and getattr(getattr(self.attn, "impl", None), "accepts_output_gate", False)
+        )
 
     def _attend(self, gate, select_rows, *args, **kwargs) -> tuple[torch.Tensor, bool]:
         """`self.attn(*args, **kwargs)`, handing it the output gate and the row
@@ -868,6 +879,19 @@ class Qwen3NextAttention(nn.Module):
             q, k, v = torch.split(
                 qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
+        # The MXFP8 o_proj path keeps its own gate + quant kernel.
+        mxfp8_out = (
+            self.attn_output_gate
+            and envs.ATOM_MXFP8_FUSED_ACT_QUANT
+            and not self.skip_out_proj
+            and self.o_proj.takes_mxfp8_input()
+        )
+        # The drafter's epilogue request (gate_in_attention) takes the gate when it
+        # is on, so the gate is applied once.
+        fused_output_gate = (
+            self.fused_output_gate and not mxfp8_out and not self.gate_in_attention
+        )
+        attn_gate = {"output_gate": gate} if fused_output_gate else {}
         if self.fuse_qk_norm_rope_cache:
             # Pass the packed [q, k, v] tensor (gate excluded) for smuggling
             # through vLLM's typed custom op which requires Tensor args.
@@ -880,6 +904,7 @@ class Qwen3NextAttention(nn.Module):
                 value=v,
                 positions=positions,
                 qkv=qkv,
+                **attn_gate,
             )
         else:
             # gfx1250: the norm and the MRoPE in one kernel. Else the norm, then the MRoPE.
@@ -908,13 +933,19 @@ class Qwen3NextAttention(nn.Module):
                 q, k = self.rotary_emb(positions, q, k)
             else:
                 q, k = fused_qk
-            attn_output, epilogue_done = self._attend(gate, select_rows, q, k, v)
+            attn_output, epilogue_done = self._attend(
+                gate, select_rows, q, k, v, **attn_gate
+            )
 
         if epilogue_done:
             # The attention gated (and selected) its output itself.
             return attn_output if self.skip_out_proj else self.o_proj(attn_output)
         if select_rows is not None:
-            if self.attn_output_gate and not self.use_fused_sigmoid_mul_quant:
+            if (
+                self.attn_output_gate
+                and not fused_output_gate
+                and not self.use_fused_sigmoid_mul_quant
+            ):
                 # The gate and the row gather in one launch.
                 attn_output = output_gate_rows(attn_output, gate, select_rows)
                 return attn_output if self.skip_out_proj else self.o_proj(attn_output)
@@ -929,18 +960,15 @@ class Qwen3NextAttention(nn.Module):
 
             attn_output, attn_scale = sigmoid_mul_fp8_group_quant(attn_output, gate)
             output = self.o_proj(attn_output, x_scale=attn_scale)
-        elif (
-            self.attn_output_gate
-            and envs.ATOM_MXFP8_FUSED_ACT_QUANT
-            and not self.skip_out_proj
-            and self.o_proj.takes_mxfp8_input()
-            and can_fuse_output_gate_mxfp8(attn_output, gate)
-        ):
+        elif mxfp8_out and can_fuse_output_gate_mxfp8(attn_output, gate):
             # the gate writes o_proj's MXFP8 input itself (fp8 + e8m0 scales)
             x_fp8, x_scale = output_gate_mul_mxfp8(attn_output, gate)
             output = self.o_proj(x_fp8, x_scale=x_scale)
         elif self.attn_output_gate:
-            attn_output = output_gate_mul(attn_output, gate, ATOM_FUSED_SIGMOID_GATE)
+            if not fused_output_gate:
+                attn_output = output_gate_mul(
+                    attn_output, gate, ATOM_FUSED_SIGMOID_GATE
+                )
             output = attn_output if self.skip_out_proj else self.o_proj(attn_output)
         else:
             output = attn_output if self.skip_out_proj else self.o_proj(attn_output)
