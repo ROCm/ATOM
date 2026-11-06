@@ -240,24 +240,28 @@ class Cleanup:
             raise RuntimeError(f"Foreign containers still running: {left}")
 
     def kill_gpu_processes(self, pids):
-        self.event("kill_gpu_processes", processes=pids)
-        command(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "--privileged",
-                "--pid=host",
-                "--entrypoint",
-                "sh",
-                KILL_IMAGE,
-                "-c",
-                'kill -9 "$@" 2>/dev/null; exit 0',
-                "kill",
-                *map(str, pids),
-            ],
-            timeout=90,
+        script = (
+            'for p; do ps -o pid,user,args | awk -v p="$p" \'$1 == p\'; done; '
+            'kill -9 "$@" 2>/dev/null; sleep 1; '
+            'for p; do [ -d "/proc/$p" ] && echo "alive $p"; done; exit 0'
         )
+        user = ["--user", f"{os.getuid()}:{os.getgid()}"]
+        unconfined = ["--security-opt", "apparmor=unconfined"]
+        # spur-authz rejects --privileged; try the option sets it may still allow.
+        for opts in (unconfined, [], [*user, *unconfined], user):
+            try:
+                out = command(
+                    ["docker", "run", "--rm", "--pid=host", *opts]
+                    + ["--entrypoint", "sh", KILL_IMAGE, "-c", script, "kill"]
+                    + [str(pid) for pid in pids],
+                    timeout=90,
+                )
+            except RuntimeError as error:
+                self.event("kill_denied", options=opts, error=str(error))
+                continue
+            self.event("kill_gpu_processes", options=opts, processes=pids, output=out)
+            if "alive " not in out:
+                return
 
     def run(self):
         args = self.args

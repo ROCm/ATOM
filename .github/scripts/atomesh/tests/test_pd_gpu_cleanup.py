@@ -185,6 +185,33 @@ class CleanupTest(unittest.TestCase):
         self.assertIn("--pid=host", killed)
         self.assertEqual(killed[-2:], ["456", "789"])
 
+    def test_kill_falls_back_until_an_allowed_option_set_kills_everything(self):
+        self.args.targets = None
+        replies = iter(
+            [RuntimeError("authorization denied by plugin spur-authz"), "alive 456\n", ""]
+        )
+        runs = []
+
+        def command(args, timeout=10):
+            runs.append(args)
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        with (
+            patch.object(cleanup, "command", side_effect=command),
+            patch.object(cleanup.os, "getuid", return_value=100),
+            patch.object(cleanup.os, "getgid", return_value=200),
+        ):
+            instance = cleanup.Cleanup(self.args)
+            instance.kill_gpu_processes([456])
+        self.assertEqual(len(runs), 3)
+        self.assertTrue(all("--privileged" not in run for run in runs))
+        self.assertIn("100:200", runs[2])
+        kinds = [e["kind"] for e in instance.report["events"]]
+        self.assertEqual(kinds, ["kill_denied", "kill_gpu_processes", "kill_gpu_processes"])
+
     def test_rechecks_queue_after_inspection_before_stopping(self):
         self.add_container(1, "atomesh-c48-v0-8068-0")
         original = self.command
