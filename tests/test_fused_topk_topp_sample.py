@@ -184,3 +184,31 @@ def test_decode_postprocess_matches_eager(monkeypatch):
     actual = post("1")
     for a, e in zip(actual, expected):
         torch.testing.assert_close(a, e, rtol=0, atol=0)
+
+
+def test_gluon_select_flag_routes_to_gluon(monkeypatch):
+    """ATOM_SAMPLER_GLUON_SELECT: gluon_select and a new Philox counter a call."""
+    calls = []
+    fused = _stub(monkeypatch, "aiter.ops.triton.fusions.topk_topp_sample")
+    monkeypatch.setattr(
+        fused, "topk_topp_sample", lambda *a, **kw: calls.append(kw), raising=False
+    )
+    monkeypatch.setattr(
+        fused,
+        "topk_topp_sample_gluon_select_supported",
+        lambda logits, k: True,
+        raising=False,
+    )
+    monkeypatch.setattr(torch.cuda, "initial_seed", lambda: 7)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    logits = torch.zeros(2, 248320, dtype=torch.bfloat16)
+    t = torch.ones(2)
+    monkeypatch.setenv("ATOM_SAMPLER_GLUON_SELECT", "0")
+    sampler.fused_topk_topp_sample(logits, t, 20, 0.95)
+    monkeypatch.setenv("ATOM_SAMPLER_GLUON_SELECT", "1")
+    sampler.fused_topk_topp_sample(logits, t, 20, 0.95)
+    sampler.fused_topk_topp_sample(logits, t, 20, 0.95)
+    assert "gluon_select" not in calls[0]
+    assert calls[1]["gluon_select"] and calls[2]["gluon_select"]
+    assert calls[1]["philox"][0] == 7
+    assert calls[1]["philox"][1] != calls[2]["philox"][1]
