@@ -112,6 +112,9 @@ def fused_topk_topp_applicable(
     )
 
 
+_PHILOX_CALLS = [0]
+
+
 def fused_topk_topp_sample(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -120,10 +123,32 @@ def fused_topk_topp_sample(
     **rows,
 ) -> torch.Tensor:
     """aiter ``topk_topp_sample`` with the sampler's greedy floor; ``rows``
-    are its verify_rows / bonus_rows / cu_num_draft_tokens."""
-    from aiter.ops.triton.fusions.topk_topp_sample import topk_topp_sample
+    are its verify_rows / bonus_rows / cu_num_draft_tokens.
 
-    return topk_topp_sample(logits, temperatures, top_k, top_p, eps=SAMPLER_EPS, **rows)
+    ATOM_SAMPLER_GLUON_SELECT: aiter's Gluon kernels with each row's uniform
+    made in the kernel, at a new Philox counter a call (eager calls only)."""
+    from aiter.ops.triton.fusions import topk_topp_sample as tts
+
+    if (
+        envs.ATOM_SAMPLER_GLUON_SELECT
+        and tts.topk_topp_sample_gluon_select_supported(logits, top_k)
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        _PHILOX_CALLS[0] += 1
+        seed = torch.cuda.initial_seed() & 0xFFFFFFFFFFFFFFFF
+        return tts.topk_topp_sample(
+            logits,
+            temperatures,
+            top_k,
+            top_p,
+            eps=SAMPLER_EPS,
+            gluon_select=True,
+            philox=(seed, _PHILOX_CALLS[0]),
+            **rows,
+        )
+    return tts.topk_topp_sample(
+        logits, temperatures, top_k, top_p, eps=SAMPLER_EPS, **rows
+    )
 
 
 def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:

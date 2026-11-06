@@ -1528,6 +1528,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_TOPK_TOPP_SAMPLE": lambda: (
         os.getenv("ATOM_FUSED_TOPK_TOPP_SAMPLE", "0") == "1"
     ),
+    # With ATOM_FUSED_TOPK_TOPP_SAMPLE: aiter's Gluon stats and select kernels
+    # (gfx1250, gluon_select) and the uniform made in the kernel (Philox keyed
+    # by the CUDA seed, a counter a call and the row) in place of torch.rand.
+    "ATOM_SAMPLER_GLUON_SELECT": lambda: (
+        os.getenv("ATOM_SAMPLER_GLUON_SELECT", "0") == "1"
+    ),
     # --- Atomesh ---
     # Build atomesh when installing ATOM from source.
     "ATOM_MESH_BUILD": lambda: os.getenv("ATOM_MESH_BUILD", "0") == "1",
