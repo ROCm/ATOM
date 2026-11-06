@@ -59,18 +59,20 @@ def prefill_window(history, step, ring):
 
     The producer writes current KV directly to the tail views. The persistent
     rings remain unchanged until attention completes and write_window commits.
-    Shape and tail offsets depend on the host request capacity. Token graphs
-    must call this inside the live attention region, beside the CSR build.
+    Reuse the step's reserved storage, but derive plane and tail offsets from
+    its live request count. Token graphs keep this beside the live CSR build.
     """
     dim = history[0].shape[-1]
     batches = step.cu_seqlens_q.numel() - 1
     rows = batches * ring
-    source = torch.empty(
-        (rows + step.width) * (dim + dim // 32),
-        dtype=torch.uint8,
-        device=history[0].device,
-    )
-    planes = split_source(source, dim)
+    size = (rows + step.width) * (dim + dim // 32)
+    source = getattr(step, "prefill_window_staging", None)
+    if source is None:
+        # Standalone callers have no cache/builder to reserve scratch for them.
+        source = torch.empty(size, dtype=torch.uint8, device=history[0].device)
+    elif source.numel() < size:
+        raise ValueError("Prefill window staging is smaller than the live step")
+    planes = split_source(source[:size], dim)
     if batches:
         if source.is_cuda:
             _stage_window[(triton.cdiv(ring, 16), batches)](

@@ -195,7 +195,28 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # allocations precede the memory profile: get_num_blocks accounts
         # for them in peak/current PyTorch bytes, outside the KV pool. They
         # remain resident across KV release, like the parent forward buffers.
+        # One SWA staging source per execution owner, not per attention layer.
+        # Layers consume it serially; TBO children overlap and need disjoint
+        # sources. Reserve before profiling so this scratch is in the budget.
+        self._prefill_window_staging = (
+            torch.empty(
+                (self.max_bs * self.geometry.ring_slots + self.max_num_batched_tokens)
+                * self.geometry.window_row_bytes,
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            if self.geometry.window_fp8
+            else None
+        )
         if model_runner.config.enable_tbo:
+            self._ubatch_prefill_window_staging = [
+                (
+                    torch.empty_like(self._prefill_window_staging)
+                    if self._prefill_window_staging is not None
+                    else None
+                )
+                for _ in range(self._NUM_TBO_UBATCHES)
+            ]
             model_runner.forward_vars.update(self._ubatch_step_buffers())
             self._ubatch_indptrs = [
                 {
@@ -423,6 +444,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.device,
             max_tokens=self.max_num_batched_tokens,
             workspace=self.score_workspace,
+            prefill_window_staging=self._prefill_window_staging,
         )
         self.copies = StateCopies(
             self.cache, self.model_runner.state_runtime.checkpoint_spec, self.max_bs
@@ -665,6 +687,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 self.device,
                 max_tokens=running_tokens,
                 workspace=self.score_workspace,
+                prefill_window_staging=self._prefill_window_staging,
             )
             if batch.is_dummy_run
             else self.cache
@@ -1139,6 +1162,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             )
             if metadata.cache.workspace is not None:
                 step.tile_workspace = metadata.cache.workspace.tile_slice(ts)
+            step.prefill_window_staging = self._ubatch_prefill_window_staging[
+                ubatch_idx
+            ]
             step.plans = make_compress_plans(
                 np.asarray([span.length for span in spans], dtype=np.int32),
                 np.asarray([span.end for span in spans], dtype=np.int32),

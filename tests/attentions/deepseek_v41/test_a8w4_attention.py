@@ -268,6 +268,7 @@ def test_native_token_graph_replays_different_request_counts(
             swa_replay_start=floor[:requests],
             swa_cached_until=floor[:requests],
         )
+        cache._reserve_prefill_window(step)
         step.begin_forward()
         ctx.attn_metadata = SimpleNamespace(cache=cache, step=step, queries=None)
         planes = (cache.pool,) if cache_dtype == "bf16" else cache.ring_view(0)
@@ -321,7 +322,13 @@ def test_native_token_graph_replays_different_request_counts(
 
     def track_preparation(*args, **kwargs):
         preparation_calls.append(torch.cuda.is_current_stream_capturing())
-        return prepare_window(*args, **kwargs)
+        result = prepare_window(*args, **kwargs)
+        if cache_dtype == "fp8" or (cache_dtype == "fp4" and a8w4):
+            source = result[0]
+            reserved = ctx.attn_metadata.step.prefill_window_staging
+            assert source[0].untyped_storage().data_ptr() == reserved.data_ptr()
+            assert source[1].untyped_storage().data_ptr() == reserved.data_ptr()
+        return result
 
     monkeypatch.setattr(cache, "rope_quant_window", track_preparation)
 

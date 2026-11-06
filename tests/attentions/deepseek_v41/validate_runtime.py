@@ -211,11 +211,16 @@ def main():
             cache = builder.cache
             max_q_len = runner.drafter.mtp_k + 1 if hasattr(runner, "drafter") else 1
             scratch = -(-(cache.geometry.window_size + max_q_len) // builder.block_size)
-            before = {
-                name: region[scratch:].clone() for name, region in cache.page_regions
-            }
+            # Index planes live outside page_regions, for every KV dtype.
+            # Compare bytes so packed/scaled index formats share this check.
+            regions = list(cache.page_regions) + [
+                (f"index_{owner}.{i}", plane.view(torch.uint8).flatten(1))
+                for owner, planes in cache.index_planes.items()
+                for i, plane in enumerate(planes)
+            ]
+            before = {name: region[scratch:].clone() for name, region in regions}
             runner.capture_cudagraph()
-            for name, region in cache.page_regions:
+            for name, region in regions:
                 torch.testing.assert_close(
                     region[scratch:],
                     before[name],

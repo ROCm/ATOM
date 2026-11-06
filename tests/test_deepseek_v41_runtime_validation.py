@@ -62,14 +62,20 @@ def make_runner(dtype, *, draft=0, corrupt=None, graph_keys=None):
         regions = [
             ("main_0.data", source[:cut].view(pages, data_width)),
             ("main_0.scale", source[cut:].view(pages, scale_width)),
-            ("index_0.data", torch.full((pages, 16), 17, dtype=torch.uint8)),
-            ("index_0.scale", torch.full((pages, 4), 17, dtype=torch.uint8)),
             ("page_padding", torch.full((pages, 4), 17, dtype=torch.uint8)),
         ]
         page_bytes = None
+    index_planes = {
+        owner: (
+            torch.full((pages, 2, 8), 17, dtype=torch.uint8),
+            torch.full((pages, 2, 2), 17, dtype=torch.uint8),
+        )
+        for owner in (0, 3)
+    }
     cache = SimpleNamespace(
         page_bytes=page_bytes,
         page_regions=regions,
+        index_planes=index_planes,
         geometry=SimpleNamespace(window_size=4),
     )
     scratch = -(-(4 + draft + 1) // 4)
@@ -85,7 +91,12 @@ def make_runner(dtype, *, draft=0, corrupt=None, graph_keys=None):
         runner.drafter = SimpleNamespace(mtp_k=draft)
 
     def capture():
-        for name, region in regions:
+        all_regions = regions + [
+            (f"index_{owner}.{i}", plane.flatten(1))
+            for owner, planes in index_planes.items()
+            for i, plane in enumerate(planes)
+        ]
+        for name, region in all_regions:
             region[:scratch].fill_(23)
             if name == corrupt:
                 region[scratch, 0] = 99
@@ -104,14 +115,26 @@ def test_capture_accepts_scratch_writes_and_current_request_graph_keys(dtype, dr
     for _, region in runner.attn_metadata_builder.cache.page_regions:
         assert (region[:scratch] == 23).all()
         assert (region[scratch:] == 17).all()
+    for planes in runner.attn_metadata_builder.cache.index_planes.values():
+        for plane in planes:
+            assert (plane[:scratch] == 23).all()
+            assert (plane[scratch:] == 17).all()
 
 
 @pytest.mark.parametrize("dtype", ["fp4", "fp8"])
 @pytest.mark.parametrize(
     "region",
-    ["main_0.data", "main_0.scale", "index_0.data", "index_0.scale", "page_padding"],
+    ["main_0.data", "main_0.scale", "page_padding"],
 )
 def test_capture_rejects_non_scratch_writes_in_every_quantized_region(dtype, region):
+    runner, _ = make_runner(dtype, corrupt=region)
+    with pytest.raises(AssertionError, match="non-scratch pages in " + region):
+        capture_checks(runner, [1, 2, 4])
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "fp4", "fp8"])
+@pytest.mark.parametrize("region", ["index_0.0", "index_0.1", "index_3.0", "index_3.1"])
+def test_capture_rejects_non_scratch_writes_in_separate_index_planes(dtype, region):
     runner, _ = make_runner(dtype, corrupt=region)
     with pytest.raises(AssertionError, match="non-scratch pages in " + region):
         capture_checks(runner, [1, 2, 4])

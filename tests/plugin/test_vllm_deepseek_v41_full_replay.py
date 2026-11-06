@@ -81,6 +81,15 @@ def _builder(
         else None
     )
     builder.score_workspace = None
+    builder._prefill_window_staging = (
+        torch.empty(
+            (_CAPACITY * geometry.ring_slots + max_tokens) * geometry.window_row_bytes,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        if geometry.window_fp8
+        else None
+    )
     builder.block_size, builder.device = 32, "cuda"
     builder.max_bs, builder.max_num_batched_tokens = _CAPACITY, max_tokens
     buffers = metadata_buffers(_CAPACITY, max_tokens, 1, "cuda", geometry)

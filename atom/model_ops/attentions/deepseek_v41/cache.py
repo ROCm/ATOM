@@ -151,6 +151,7 @@ class PagedAttentionCache:
         device,
         max_tokens=0,
         workspace=None,
+        prefill_window_staging=None,
     ):
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
@@ -158,6 +159,9 @@ class PagedAttentionCache:
         # The scorer's `ScoreWorkspace`, owned by the builder so the startup
         # profile's throwaway cache and the serving one share it.
         self.workspace = workspace
+        # Native serving supplies pre-profiled scratch. Other frontends reserve
+        # it at begin_step and retain it across layers and subsequent forwards.
+        self.prefill_window_staging = prefill_window_staging
         self.packed = geometry.packed
         self.window_fp8 = geometry.window_fp8
         # MXFP8 rows everywhere, read by `sparse_attn_v41_paged_2src`
@@ -358,6 +362,30 @@ class PagedAttentionCache:
                 "Commit the accepted prefix before reusing or checkpointing state"
             )
 
+    def _reserve_prefill_window(self, step):
+        """Bind parent scratch before any layer launches; TBO binds child storage.
+
+        Attention and the ring commit finish on the compute stream before the
+        next layer reuses these bytes. A larger eager step may grow the buffer;
+        native serving reserves its configured maximum before profiling.
+        """
+        if not self.window_fp8 or step.decode:
+            return
+        batches = step.cu_seqlens_q.numel() - 1
+        size = (batches * self.geometry.ring_slots + step.width) * (
+            self.geometry.window_row_bytes
+        )
+        source = self.prefill_window_staging
+        if source is None or source.numel() < size:
+            if self.pool.is_cuda and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Prefill window staging must be reserved before capture"
+                )
+            source = self.prefill_window_staging = torch.empty(
+                size, dtype=torch.uint8, device=self.pool.device
+            )
+        step.prefill_window_staging = source
+
     def begin_step(
         self,
         requests,
@@ -441,6 +469,7 @@ class PagedAttentionCache:
             np.ones(count, np.bool_) if finals is None else np.asarray(finals)
         )
         step.start_histories = start_histories
+        self._reserve_prefill_window(step)
         # Per-forward and layer-invariant, so built here rather than by the
         # first layer to want one, exactly as V4 builds its own three. Triton,
         # like every reader of them, so a CPU pool has neither.

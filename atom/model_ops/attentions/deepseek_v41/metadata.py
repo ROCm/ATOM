@@ -81,6 +81,10 @@ class BatchStep:
     window_rows: torch.Tensor | None = None
     # One layer's live Q/KV preparation, consumed after the side-stream join.
     attention_inputs: tuple | None = None
+    # Reusable raw storage for one layer's live SWA history/current-KV source.
+    # The serving cache binds the parent's; TBO gives each child its own.
+    # Keep this across begin_forward: only its live views depend on the step.
+    prefill_window_staging: torch.Tensor | None = None
     # A bounded-replay forward's `ReplayPlan` (`models.deepseek_v41.
     # bounded_replay`): the rows its decoder ran on, for what else reads the
     # decoder's rows after it (the DSpark draft's window). None where the

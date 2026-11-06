@@ -31,6 +31,117 @@ def geometry(dtype, slack=0):
 
 
 @pytest.mark.parametrize("dtype", ["fp4", "fp8"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_prefill_staging_reuses_storage_with_live_plane_offsets(
+    dtype, device, monkeypatch
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
+
+    cache = PagedAttentionCache(geometry(dtype), 7, 4, device, max_tokens=16)
+    pointer = None
+    for requests in (2, 2, 1, 2):
+        length = 16 // requests
+        step = cache.begin_step(
+            tuple(RequestSpan(b, 8, b * length, length, b) for b in range(requests)),
+            block_tables=[[b] for b in range(requests)],
+            is_prefill=True,
+        )
+        reserved = step.prefill_window_staging
+        if pointer is None:
+            pointer = reserved.data_ptr()
+        assert reserved.data_ptr() == pointer
+        step.begin_forward()
+        assert step.prefill_window_staging is reserved
+        for layer in range(3):
+            history = cache.ring_view(layer)
+            for i, plane in enumerate(history):
+                plane.fill_(layer * 10 + i + 1)
+            with monkeypatch.context() as patch:
+
+                def no_allocation(*args, **kwargs):
+                    pytest.fail("prefill_window allocated instead of reusing staging")
+
+                patch.setattr(torch, "empty", no_allocation)
+                source, tail = prefill_window(history, step, 8)
+            rows = requests * 8
+            assert source[0].data_ptr() == pointer
+            assert source[1].data_ptr() == pointer + (rows + 16) * 512
+            for i, (plane, current) in enumerate(zip(source, tail)):
+                assert plane.is_contiguous() and current.is_contiguous()
+                assert current.shape[0] == 16
+                assert current.data_ptr() == plane.data_ptr() + rows * plane.shape[1]
+                assert (plane[:rows] == layer * 10 + i + 1).all()
+                current.fill_(99)
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "fp4", "fp8"])
+def test_prefill_staging_grows_at_step_boundary_and_skips_decode(dtype):
+    from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
+
+    cache = PagedAttentionCache(geometry(dtype), 7, 4, "cpu")
+    cache.begin_step((RequestSpan(0, 8, 0, 1, 0),), block_tables=[[0]])
+    assert cache.prefill_window_staging is None
+    small = cache.begin_step(
+        (RequestSpan(0, 8, 0, 2, 0),), block_tables=[[0]], is_prefill=True
+    )
+    large = cache.begin_step(
+        (RequestSpan(0, 8, 0, 16, 0),), block_tables=[[0]], is_prefill=True
+    )
+    if dtype == "bf16":
+        assert small.prefill_window_staging is large.prefill_window_staging is None
+    else:
+        assert (
+            large.prefill_window_staging.numel() > small.prefill_window_staging.numel()
+        )
+        assert (
+            large.prefill_window_staging.data_ptr()
+            != small.prefill_window_staging.data_ptr()
+        )
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "fp4", "fp8"])
+@pytest.mark.parametrize("index_fp4", [False, True])
+def test_capture_validator_checks_real_index_allocations(dtype, index_fp4):
+    from dataclasses import replace
+
+    from tests.test_deepseek_v41_runtime_validation import capture_checks, make_runner
+
+    geo = replace(geometry(dtype), index_fp4=index_fp4, index_block_rows=8)
+    cache = PagedAttentionCache(geo, 7, 4, "cpu")
+    runner, _ = make_runner(dtype)
+    runner.attn_metadata_builder.cache = cache
+    runner.attn_metadata_builder.block_size = 32
+    for owner, planes in cache.index_planes.items():
+        for i, plane in enumerate(planes):
+
+            def corrupt(plane=plane):
+                plane[1].view(torch.uint8).fill_(99)
+
+            runner.capture_cudagraph = corrupt
+            with pytest.raises(
+                AssertionError, match=f"non-scratch pages in index_{owner}.{i}"
+            ):
+                capture_checks(runner, [1, 2, 4])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_prefill_staging_cannot_grow_under_capture(monkeypatch):
+    cache = PagedAttentionCache(geometry("fp8"), 7, 4, "cuda")
+    small = SimpleNamespace(decode=False, width=16, cu_seqlens_q=torch.tensor([0, 16]))
+    large = SimpleNamespace(decode=False, width=32, cu_seqlens_q=torch.tensor([0, 32]))
+    cache._reserve_prefill_window(small)
+    pointer = small.prefill_window_staging.data_ptr()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    cache._reserve_prefill_window(small)
+    assert small.prefill_window_staging.data_ptr() == pointer
+    with pytest.raises(RuntimeError, match="reserved before capture"):
+        cache._reserve_prefill_window(large)
+    assert cache.prefill_window_staging.data_ptr() == pointer
+
+
+@pytest.mark.parametrize("dtype", ["fp4", "fp8"])
 @pytest.mark.parametrize("slack", [0, 3])
 def test_planes_are_dense_disjoint_and_cover_exact_budget(dtype, slack):
     cache = PagedAttentionCache(geometry(dtype, slack), 7, 4, "cpu")
