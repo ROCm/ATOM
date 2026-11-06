@@ -641,9 +641,10 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             return super()._withholds_last_prompt_token(seq)
         num_prompt = int(seq.num_prompt_tokens)
         withheld = self._chunk_floor(num_prompt - 1)
-        if self._block_manager is None or withheld == self._chunk_floor(num_prompt):
-            return True
-        return self._block_manager.joint_boundary_tokens(seq, num_prompt) <= withheld
+        return (
+            withheld == self._chunk_floor(num_prompt)
+            or self._block_manager.joint_boundary_tokens(seq, num_prompt) <= withheld
+        )
 
     # -- state load queue --------------------------------------------------
     def enqueue_state_loads(self, loads) -> bool:

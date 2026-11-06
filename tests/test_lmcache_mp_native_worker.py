@@ -634,10 +634,10 @@ def test_native_restore_reports_success_and_returns_its_slot(worker, cuda):
 def test_restore_deadline_counts_from_the_restore_not_the_retrieve(
     worker, cuda, monkeypatch
 ):
-    """The host may first poll a retrieve long after submitting it (a cold
-    first forward compiles for ~30 s in between). The retrieve is terminal by
-    then and its restore only just enqueued: the deadline bounds the restore
-    from there, and still stops the engine if that copy never completes."""
+    """The host may first poll a retrieve long after submitting it. The
+    retrieve is terminal by then and its restore only just enqueued: the
+    deadline bounds the restore from there, and still stops the engine if that
+    copy never completes."""
     from atom.kv_transfer.offload.mp import transfer
 
     now = [1000.0]

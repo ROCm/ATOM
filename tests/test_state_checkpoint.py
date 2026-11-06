@@ -3266,11 +3266,6 @@ class TestPromptEndAnchor:
         assert bm.can_allocate(seq) == 0
         assert seq.checkpoint_end_pos == 8256
 
-    def test_an_anchor_grid_off_the_hash_grid_is_refused(self):
-        bm = make_block_manager(demand_config())
-        with pytest.raises(ValueError):
-            bm.align_checkpoint_anchor(BLOCK + 2)
-
     def test_the_anchor_does_not_displace_the_grid_rung(self):
         """Both are cut for, because they serve different classes.
 

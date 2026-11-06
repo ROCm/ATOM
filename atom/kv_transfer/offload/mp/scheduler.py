@@ -352,14 +352,12 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             )
 
     def _restart_loads_queued_behind_a_finished_one(self, now: float) -> None:
-        """A native-state worker restores a few loads at a time, in dispatch
-        order, and advances them only between forwards, so a burst of loads on
-        a cold server can wait out several slow forwards with nothing in
-        flight. A finished load shows that queue moving: every load dispatched
+        """A native-state worker restores loads in dispatch order, advancing
+        them only between forwards. When a load finishes, every load dispatched
         after it starts its bound again (`_active_load_operations` keeps
-        dispatch order, also within one step). Only loads dispatched before it
-        restart a load, so one whose completion is lost still stops the engine
-        one bound after the last of those finishes."""
+        dispatch order, also within one step). Only earlier loads restart a
+        load, so one whose completion is lost still stops the engine one bound
+        after the last of those finishes."""
         loads = [operation for _, operation in self._active_load_operations.values()]
         live = set(loads)
         behind_a_finished_one = False
