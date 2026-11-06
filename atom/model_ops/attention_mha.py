@@ -18,6 +18,7 @@ from atom.model_ops.attn_output_epilogue import (
     current_attention_output_epilogue,
     unified_attention_takes_output_epilogue,
     unified_attention_takes_split_reduce,
+    unified_attention_takes_split_reduce_oneshot,
 )
 from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
@@ -1020,6 +1021,12 @@ class PagedAttentionImpl(nn.Module):
         # ATOM_UA_SPLIT_REDUCE: aiter's split-KV reduce for the token split's grid.
         if envs.ATOM_UA_SPLIT_REDUCE and unified_attention_takes_split_reduce():
             split["split_reduce"] = True
+            # ATOM_UA_SPLIT_REDUCE_ONESHOT: its one-round-trip variant (bitwise).
+            if (
+                envs.ATOM_UA_SPLIT_REDUCE_ONESHOT
+                and unified_attention_takes_split_reduce_oneshot()
+            ):
+                split["split_reduce_oneshot"] = True
         unified_attention(
             q,
             k_cache,

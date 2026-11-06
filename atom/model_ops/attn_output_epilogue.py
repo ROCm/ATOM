@@ -77,3 +77,13 @@ def unified_attention_takes_split_reduce() -> bool:
     from aiter.ops.triton.unified_attention import unified_attention
 
     return "split_reduce" in inspect.signature(unified_attention).parameters
+
+
+@functools.lru_cache(maxsize=1)
+def unified_attention_takes_split_reduce_oneshot() -> bool:
+    """Whether aiter's unified_attention has `split_reduce_oneshot`."""
+    import inspect
+
+    from aiter.ops.triton.unified_attention import unified_attention
+
+    return "split_reduce_oneshot" in inspect.signature(unified_attention).parameters
