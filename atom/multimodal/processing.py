@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING, Any
 
 from atom.multimodal import MediaLoader, MultiModalDataDict, normalize_multimodal_data
 from atom.multimodal.media import load_multimodal_data
-from atom.multimodal.registry import get_multimodal_input_builder
+from atom.multimodal.registry import (
+    get_multimodal_input_builder,
+    get_multimodal_modalities,
+)
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -52,39 +55,6 @@ def expand_media_placeholders(
     return expanded, tuple(spans)
 
 
-def _bind_images_to_messages(
-    conversation: list[dict[str, Any]], images: list
-) -> list[dict[str, Any]]:
-    """Bind the nth image marker to the nth image across all chat turns."""
-    messages = []
-    image_index = 0
-    for message in conversation:
-        content = message.get("content")
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if part["type"] == "image":
-                    if image_index >= len(images):
-                        raise ValueError(
-                            "Conversation has more image markers than images"
-                        )
-                    part = {**part, "image": images[image_index]}
-                    image_index += 1
-                elif part["type"] != "text":
-                    raise ValueError(
-                        "Expected a normalized conversation with image/text parts"
-                    )
-                parts.append(dict(part))
-            content = parts
-        # Retain the native processors' handling of assistant/tool messages.
-        messages.append({**message, "content": "" if content is None else content})
-    if image_index != len(images):
-        raise ValueError(
-            f"Conversation has {image_index} image markers but {len(images)} images"
-        )
-    return messages
-
-
 def prepare_multimodal_inputs(
     atom_config: Config,
     processor: Any,
@@ -100,24 +70,28 @@ def prepare_multimodal_inputs(
     Chat callers supply a conversation with image markers, in the same order as
     multi_modal_data['image']. Qwen-style processors also accept a rendered text
     prompt, with one image placeholder per item and no chat template applied.
-    Video/audio are rejected before any media is loaded.
+    Video is accepted for architectures the registry lists with it (chat
+    conversations only); audio is rejected before any media is loaded.
     """
     media_items = normalize_multimodal_data(multi_modal_data)
     if not media_items:
         raise ValueError("Multimodal request did not contain any media")
-    unsupported = media_items.keys() - {"image"}
-    if unsupported:
-        raise ValueError(
-            f"Native multimodal inference does not support {', '.join(sorted(unsupported))} "
-            "inputs yet; supported modalities: image"
-        )
     builder = get_multimodal_input_builder(
         atom_config, is_text_prompt=isinstance(prompt, str)
     )
+    supported = get_multimodal_modalities(atom_config)
+    unsupported = media_items.keys() - supported
+    if unsupported:
+        raise ValueError(
+            f"Native multimodal inference does not support {', '.join(sorted(unsupported))} "
+            f"inputs yet; supported modalities: {', '.join(sorted(supported))}"
+        )
     media = load_multimodal_data(media_items, media_loader or MediaLoader())
-    images = media["image"]
+    images = media.get("image", [])
+    videos = media.get("video", [])
     if not isinstance(prompt, str):
-        prompt = _bind_images_to_messages(prompt, images)
+        # Videos reach the builder bound to their conversation parts.
+        prompt = _bind_media_to_messages(prompt, images, videos)
     return builder(
         atom_config,
         processor,
@@ -126,3 +100,40 @@ def prepare_multimodal_inputs(
         dict(chat_template_kwargs or {}),
         tools=tools,
     )
+
+
+def _bind_media_to_messages(
+    conversation: list[dict[str, Any]], images: list, videos: list = ()
+) -> list[dict[str, Any]]:
+    """Bind the nth image (and video) marker to the nth item, across all turns."""
+    items = {"image": list(images), "video": list(videos)}
+    used = {"image": 0, "video": 0}
+    allowed = "image/video/text" if videos else "image/text"
+    messages = []
+    for message in conversation:
+        content = message.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                kind = part["type"]
+                if kind == "image" or (kind == "video" and videos):
+                    if used[kind] >= len(items[kind]):
+                        raise ValueError(
+                            f"Conversation has more {kind} markers than {kind}s"
+                        )
+                    part = {**part, kind: items[kind][used[kind]]}
+                    used[kind] += 1
+                elif kind != "text":
+                    raise ValueError(
+                        f"Expected a normalized conversation with {allowed} parts"
+                    )
+                parts.append(dict(part))
+            content = parts
+        # Retain the native processors' handling of assistant/tool messages.
+        messages.append({**message, "content": "" if content is None else content})
+    for kind, values in items.items():
+        if used[kind] != len(values):
+            raise ValueError(
+                f"Conversation has {used[kind]} {kind} markers but {len(values)} {kind}s"
+            )
+    return messages

@@ -27,11 +27,12 @@ def multimodal_cache_seed(data):
         if hasattr(value, "detach"):
             value = value.detach().cpu().contiguous()
             digest.update(str((value.dtype, tuple(value.shape))).encode())
-            digest.update(value.view(torch.uint8).numpy().tobytes())
+            # Hash the buffer in place; a video's pixels can be gigabytes.
+            digest.update(memoryview(value.view(torch.uint8).numpy()))
         else:
             value = np.ascontiguousarray(value)
             digest.update(str((value.dtype, value.shape)).encode())
-            digest.update(value.tobytes())
+            digest.update(memoryview(value).cast("B"))
     digest.update(repr(data.get("embedding_spans", ())).encode())
     return int.from_bytes(digest.digest(), "little")
 
@@ -109,6 +110,53 @@ class VisionEmbeddingCache:
         self.leases.clear()
 
 
+def vision_pass_groups(patch_counts: list[int], max_patches: int) -> list[int]:
+    """Greedy group sizes, in grids, of at most ``max_patches`` patches each.
+
+    A grid is never split: one larger than ``max_patches`` takes a pass alone.
+    """
+    groups: list[int] = []
+    patches = 0
+    for count in patch_counts:
+        if groups and patches + count <= max_patches:
+            groups[-1] += 1
+            patches += count
+        else:
+            groups.append(1)
+            patches = count
+    return groups
+
+
+def encode_grids_in_passes(
+    encode, pixel_values, grid_thws, max_patches, device, dtype
+) -> torch.Tensor:
+    """``encode(pixel_values, grid_thws)`` over whole grids in bounded passes.
+
+    A model sets ``vision_pass_patches`` when every op of its vision encoder
+    works per grid or per token, so encoding consecutive groups of grids gives
+    the rows of one encode, in order. Each pass moves only its own pixels to
+    the device. Without it (None) the request's grids are encoded at once.
+    """
+    if max_patches is None:
+        return encode(pixel_values.to(device=device, dtype=dtype), grid_thws)
+    patch_counts = grid_thws.prod(dim=-1).tolist()
+    if sum(patch_counts) != pixel_values.shape[0]:
+        raise ValueError(
+            f"pixel_values has {pixel_values.shape[0]} patches but the grids "
+            f"describe {sum(patch_counts)}"
+        )
+    groups = vision_pass_groups(patch_counts, max_patches)
+    grid_groups = torch.split(grid_thws, groups)
+    pixel_groups = torch.split(
+        pixel_values, [int(grids.prod(dim=-1).sum()) for grids in grid_groups]
+    )
+    outputs = [
+        encode(pixels.to(device=device, dtype=dtype), grids)
+        for pixels, grids in zip(pixel_groups, grid_groups)
+    ]
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+
+
 def embed_multimodal_batch(model, cache, input_ids, batch, device, dtype):
     """Consume request leases and scatter only the current chunk's intersections."""
     hidden = model.embed_input_ids(input_ids)
@@ -123,9 +171,13 @@ def embed_multimodal_batch(model, cache, input_ids, batch, device, dtype):
             values = cache.acquire(
                 request_id,
                 data,
-                lambda payload: model.get_vision_embeddings(
-                    payload["pixel_values"].to(device=device, dtype=dtype),
+                lambda payload: encode_grids_in_passes(
+                    model.get_vision_embeddings,
+                    payload["pixel_values"],
                     payload["image_grid_thw"],
+                    getattr(model, "vision_pass_patches", None),
+                    device,
+                    dtype,
                 ),
             )
             query, source = embedding_indices(

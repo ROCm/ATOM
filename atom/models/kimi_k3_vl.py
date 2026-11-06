@@ -129,9 +129,12 @@ class KimiK3InterpPosEmb(nn.Module):
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
-                pos_emb_3d = (
-                    pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[0:t]
-                )
+                # time_weight is built with from_numpy, which ignores the default
+                # device the model is constructed under, so it stays on the CPU
+                # in fp32; follow the embedding's device and dtype.
+                pos_emb_3d = pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[
+                    0:t
+                ].to(pos_emb_2d.device, pos_emb_2d.dtype)
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
         return x + torch.cat(pos_embs)
 
