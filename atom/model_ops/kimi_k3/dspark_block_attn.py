@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Page-table read for the GQA DFlash draft block.
+"""Page-table read for the Kimi-K3 DSpark GQA draft block.
 
 The block pass writes its own T rows into the draft pool first
-(`KimiK3DFlashAttention._write_kv`), so request ``b``'s pool rows are
+(`KimiK3DSparkGQAAttention._write_kv`), so request ``b``'s pool rows are
 keys ``[0, kv_lens[b])``, ``kv_lens = context_lens = anchor + 1 + T``, and every
 block row attends all of them. Key ``t`` sits at slot
 ``block_tables[b, t // E] * E + t % E``, where ``E`` is the pool's entry span
@@ -11,7 +11,7 @@ block row attends all of them. Key ``t`` sits at slot
 read takes exactly that, so the proposer builds no ``kv_indptr``/``kv_indices``
 stream for it.
 
-`DFlashDraftUnifiedAttention` is aiter's ``unified_attention`` -- the kernel
+`DSparkGQABlockAttention` is aiter's ``unified_attention`` -- the kernel
 `PagedAttentionImpl.paged_attention_unified` already decodes through -- on the
 FOLDED query ``[bs, HKV * T * G, D]`` with ``max_seqlen_q = 1``. That kernel
 asserts ``causal``, and with one query row per sequence the causal mask admits
@@ -56,7 +56,7 @@ def gluon_takes_pool_dtype_q(
     if supported is None or params_t is None:
         logger.warning(
             "aiter unified_attention has no _gfx950_gluon_supported/_UAParams; "
-            "the DFlash draft read keeps q in bf16 over an fp8 pool"
+            "the DSpark GQA draft read keeps q in bf16 over an fp8 pool"
         )
         return False
     fields = dict.fromkeys(params_t._fields)
@@ -113,7 +113,7 @@ def unfold_block_output(
     return o
 
 
-class DFlashDraftUnifiedAttention:
+class DSparkGQABlockAttention:
     """aiter ``unified_attention`` (3D split-KV) on the folded draft block."""
 
     def __init__(self, device, max_bs: int, max_model_len: int):

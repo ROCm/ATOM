@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Kimi-K3 DFlash draft: the SpecForge/SGLang DSpark speculator.
+"""Kimi-K3 DSpark GQA draft: the SpecForge/SGLang DSpark speculator.
 
-`RadixArk/Kimi-K3-DSpark`: the same block-parallel draft, Markov head and
-confidence head as `kimi_k3_dspark.py`, on 5 Qwen3-style GQA layers instead of
-MLA. `embed_tokens` and `lm_head` are shared from the target. The fusion width
-is ``len(target_layer_ids)`` (5), not the config's ``num_target_layers`` (the
-target's depth).
+`RadixArk/Kimi-K3-DSpark` (a SpecForge DFlash checkpoint): the same
+block-parallel draft, Markov head and confidence head as `kimi_k3_dspark.py`,
+on 5 Qwen3-style GQA layers instead of MLA. `embed_tokens` and `lm_head` are
+shared from the target. The fusion width is ``len(target_layer_ids)`` (5), not
+the config's ``num_target_layers`` (the target's depth).
 
 Each layer attends non-causally over the cached context K/V followed by the
 block's own K/V, with q/k RMS-normed per head BEFORE rope. The norms run here,
@@ -43,7 +43,7 @@ from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.config import QuantizationConfig
-from atom.model_ops.attentions.dflash_draft_attn import DFlashDraftUnifiedAttention
+from atom.model_ops.kimi_k3.dspark_block_attn import DSparkGQABlockAttention
 from atom.model_ops.layernorm import DualRMSNorm, RMSNorm
 from atom.model_ops.linear import (
     QKVParallelLinear,
@@ -67,8 +67,8 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
-class KimiK3DFlashAttention(nn.Module):
-    """One DFlash GQA layer's attention, with a second entry for context rows.
+class KimiK3DSparkGQAAttention(nn.Module):
+    """One DSpark GQA draft layer's attention, with a second entry for context rows.
 
     `forward` is the block pass over the noise stream. `write_context_kv` is the
     target-derived half: it runs the same k/v projections over the projected aux
@@ -243,7 +243,7 @@ class KimiK3DFlashAttention(nn.Module):
         self._write_kv(k, v, slot_mapping, self.kv.k_cache, self.kv.v_cache)
 
 
-class KimiK3DFlashDecoderLayer(DSparkGQADecoderLayer):
+class KimiK3DSparkGQADecoderLayer(DSparkGQADecoderLayer):
     def __init__(
         self,
         config,
@@ -253,7 +253,7 @@ class KimiK3DFlashDecoderLayer(DSparkGQADecoderLayer):
         prefix: str = "",
     ):
         super().__init__()
-        self.self_attn = KimiK3DFlashAttention(
+        self.self_attn = KimiK3DSparkGQAAttention(
             config,
             layer_num,
             block_attn,
@@ -297,7 +297,7 @@ def _check_rope_covers(max_model_len: int, rope_rows: int) -> None:
     """
     if max_model_len > rope_rows:
         raise ValueError(
-            f"max_model_len {max_model_len} exceeds the DFlash draft's rope "
+            f"max_model_len {max_model_len} exceeds the DSpark GQA draft's rope "
             f"cache of {rope_rows} positions; lower --max-model-len to at "
             f"most {rope_rows}"
         )
@@ -315,16 +315,16 @@ def _draft_quant_config(config) -> QuantizationConfig:
     draft_qc = QuantizationConfig(config)
     if draft_qc.quant_method:
         raise ValueError(
-            "the Kimi-K3 DFlash draft supports BF16 weights only, got "
+            "the Kimi-K3 DSpark GQA draft supports BF16 weights only, got "
             f"quant_method={draft_qc.quant_method!r}"
         )
     return draft_qc
 
 
-class KimiK3DFlash(DSparkDraftModel):
-    """The SpecForge DFlash draft for Kimi-K3.
+class KimiK3DSparkGQA(DSparkDraftModel):
+    """The Kimi-K3 DSpark GQA draft (the RadixArk SpecForge DFlash checkpoint).
 
-    Registered as ``K3DFlashModel``, which `SpeculativeConfig.hf_config_override`
+    Registered as ``K3DSparkGQAModel``, which `SpeculativeConfig.hf_config_override`
     renames the checkpoint's generic ``DSparkDraftModel`` to.
     """
 
@@ -371,14 +371,14 @@ class KimiK3DFlash(DSparkDraftModel):
         self.hidden_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
         # One block read for every layer, built before any capture.
-        block_attn = DFlashDraftUnifiedAttention(
+        block_attn = DSparkGQABlockAttention(
             torch.get_default_device(),
             max_bs=int(atom_config.max_num_seqs),
             max_model_len=int(atom_config.max_model_len),
         )
         self.layers = nn.ModuleList(
             [
-                KimiK3DFlashDecoderLayer(
+                KimiK3DSparkGQADecoderLayer(
                     config,
                     layer_offset + i,
                     block_attn,
@@ -467,26 +467,28 @@ class KimiK3DFlash(DSparkDraftModel):
             # on the prefix, a feature the checkpoint was not trained on.
             if not 0 <= lid < len(target_layers) - 1:
                 raise ValueError(
-                    f"DFlash aggregate tap on target layer {lid}: needs a "
+                    f"DSpark GQA aggregate tap on target layer {lid}: needs a "
                     f"successor layer in a {len(target_layers)}-layer stack"
                 )
             # The checkpoint arch is generic (see `hf_config_override`), so the
             # target is checked here, where its layers are known.
             if not hasattr(target_layers[lid], "check_aggregate_source"):
                 raise ValueError(
-                    "The SpecForge DFlash draft serves a Kimi-K3 target only; "
+                    "The Kimi-K3 DSpark GQA draft serves a Kimi-K3 target only; "
                     f"target layer {lid} is {type(target_layers[lid]).__name__}"
                 )
             if target_layers[lid].layer_idx != lid:
                 raise ValueError(
-                    f"DFlash aggregate tap on target layer {lid}: the stack's "
+                    f"DSpark GQA aggregate tap on target layer {lid}: the stack's "
                     f"layer {lid} has layer_idx {target_layers[lid].layer_idx}"
                 )
             target_layers[lid].check_aggregate_source(target_layers[lid + 1])
             taps[lid] = target_layers[lid + 1]
 
         if taps:
-            logger.info("DFlash aggregate tap armed on target layers %s", sorted(taps))
+            logger.info(
+                "DSpark GQA aggregate tap armed on target layers %s", sorted(taps)
+            )
 
         def extract(output, block):
             # The base hook copies the mix in place into the same fixed capture

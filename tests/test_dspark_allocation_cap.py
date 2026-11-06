@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """`AllocationCap`, the allocation staging the paged block drafts share
-(Kimi-K3 DFlash, MiniMax-M3.1 DSpark), on CPU."""
+(Kimi-K3 DSpark GQA, MiniMax-M3.1 DSpark), on CPU."""
 
 import types
 
@@ -57,7 +57,7 @@ def test_allocation_cap_masks_writes_past_each_rows_allocation(host_staging, uni
 
 def test_allocation_cap_leaves_the_minimum_to_each_caller(host_staging):
     """MiniMax-M3.1 shape: page-128 units, rows capped into their own buffer
-    while `ctx_lens` stays as the proposer built it. Kimi-K3 DFlash shape: one
+    while `ctx_lens` stays as the proposer built it. Kimi-K3 DSpark GQA shape: one
     pool entry (block size x DCP) per block id, `ctx_lens` capped in place."""
     import torch
 

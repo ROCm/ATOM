@@ -26,7 +26,7 @@ half. The steps line up one for one and not one of them is the same computation
 
 The heads after the backbone are the same in every flavor, so they live here
 too: ``DSparkMarkovHead``, ``DSparkConfidenceHead`` and ``linear_out``.
-The standalone GQA drafts (Kimi-K3 DFlash, MiniMax-M3.1) also share one layer
+The standalone GQA drafts (Kimi-K3 DSpark GQA, MiniMax-M3.1) also share one layer
 forward, ``DSparkGQADecoderLayer``.
 """
 

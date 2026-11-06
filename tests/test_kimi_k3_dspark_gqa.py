@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Unit tests for the SpecForge DFlash draft (RadixArk/Kimi-K3-DSpark).
+"""Unit tests for the Kimi-K3 DSpark GQA draft (RadixArk/Kimi-K3-DSpark, a
+SpecForge DFlash checkpoint).
 
 The config-normalization and fold tests run on CPU; the rest need the
 aiter/triton stack and skip without it, and the kernel checks need a GPU.
@@ -90,16 +91,17 @@ def _radixark_cfg(**overrides):
 # --------------------------------------------------------------------------
 
 
-def test_dflash_config_normalize():
-    """DSparkDraftModel -> K3DFlashModel, normalized like the other standalone
+def test_gqa_draft_config_normalize():
+    """DSparkDraftModel -> K3DSparkGQAModel, normalized like the other standalone
     DSpark drafts."""
     from atom.config import SpeculativeConfig
 
     hf = _radixark_cfg()
     SpeculativeConfig.hf_config_override(hf, model_path=None)
 
-    # Renamed away from the SpecForge string, which every DFlash draft carries.
-    assert hf.architectures == ["K3DFlashModel"]
+    # Renamed away from the generic SpecForge string, which every SpecForge
+    # DFlash checkpoint carries.
+    assert hf.architectures == ["K3DSparkGQAModel"]
 
     # Lifted out of the nested dflash_config onto the canonical names.
     assert hf.dspark_target_layer_ids == [7, 23, 51, 67, 83]
@@ -116,8 +118,8 @@ def test_dflash_config_normalize():
     assert len(hf.dspark_target_layer_ids) == 5
 
 
-def test_dflash_config_normalize_is_idempotent():
-    """A second override keeps the DFlash draft and its normalized fields."""
+def test_gqa_draft_config_normalize_is_idempotent():
+    """A second override keeps the DSpark GQA draft and its normalized fields."""
     from atom.config import SpeculativeConfig
 
     hf = _radixark_cfg()
@@ -125,18 +127,18 @@ def test_dflash_config_normalize_is_idempotent():
     model_type = hf.model_type
     SpeculativeConfig.hf_config_override(hf, model_path=None)
 
-    assert hf.architectures == ["K3DFlashModel"]
+    assert hf.architectures == ["K3DSparkGQAModel"]
     assert hf.dspark_target_layer_ids == [7, 23, 51, 67, 83]
     assert hf.model_type == model_type
 
 
-def test_dflash_rope_is_the_drafts_own():
+def test_gqa_draft_rope_is_the_drafts_own():
     """The rope the draft attention builds comes from the draft's config:
     theta 10000 / YaRN x16 from 65536, neox-style -- not the target's theta
     50000 / x32. A wrong rope loads clean and only moves acceptance."""
     from atom.config import SpeculativeConfig
 
-    kwargs_fn = _draft_rope_kwargs_fn("kimi_k3_dflash.py")
+    kwargs_fn = _draft_rope_kwargs_fn("kimi_k3_dspark_gqa.py")
     hf = _radixark_cfg()
     SpeculativeConfig.hf_config_override(hf, model_path=None)
     kw = kwargs_fn(hf)
@@ -204,11 +206,11 @@ def _draft_rope_kwargs_fn(module_file):
     return _lift_fn(module_file, "_draft_rope_kwargs", ns)
 
 
-def test_dflash_refuses_a_max_model_len_past_the_rope_cache():
+def test_gqa_draft_refuses_a_max_model_len_past_the_rope_cache():
     """The context write ropes unclamped positions, all below `max_model_len`.
     A length equal to the cache rows -- the shipped pair's default -- fits;
     one more row is refused at startup."""
-    check = _lift_fn("kimi_k3_dflash.py", "_check_rope_covers", {})
+    check = _lift_fn("kimi_k3_dspark_gqa.py", "_check_rope_covers", {})
     rows = 65536 * 16
     check(rows, rows)
     check(4096, rows)
@@ -364,7 +366,7 @@ def test_default_sample_block_chains_each_token_into_the_next():
     assert ids.tolist() == [[11, 12, 13], [21, 22, 23]]
 
 
-def test_dflash_does_not_capture_the_k3_dspark_checkpoint():
+def test_gqa_draft_does_not_capture_the_k3_dspark_checkpoint():
     """The MLA K3-DSpark draft keeps its own route and gains no block size."""
     from atom.config import SpeculativeConfig
 
@@ -387,9 +389,10 @@ def test_dflash_does_not_capture_the_k3_dspark_checkpoint():
     assert getattr(hf, "dspark_block_size", None) is None
 
 
-def test_dflash_draft_without_dflash_config_is_refused():
-    """A `DSparkDraftModel` without the DFlash fields fails normalization, as
-    any standalone DSpark draft missing `target_layer_ids` does."""
+def test_gqa_draft_without_dflash_config_is_refused():
+    """A `DSparkDraftModel` without the `dflash_config` fields fails
+    normalization, as any standalone DSpark draft missing `target_layer_ids`
+    does."""
     from atom.config import SpeculativeConfig
 
     hf = _radixark_cfg(dflash_config=None)
@@ -397,7 +400,7 @@ def test_dflash_draft_without_dflash_config_is_refused():
         SpeculativeConfig.hf_config_override(hf, model_path=None)
 
 
-def test_dflash_plain_qwen3_target_is_untouched():
+def test_gqa_draft_plain_qwen3_target_is_untouched():
     """model_type qwen3 is a legitimate TARGET type and must not be routed."""
     from atom.config import SpeculativeConfig
 
@@ -418,7 +421,7 @@ def test_dflash_plain_qwen3_target_is_untouched():
 # --------------------------------------------------------------------------
 
 
-def test_dflash_resolves_to_mha_not_mla():
+def test_gqa_draft_resolves_to_mha_not_mla():
     """No kv_lora_rank -> MHA family.
 
     This is the fork that hands the draft a sibling KV pool instead of binding
@@ -462,7 +465,7 @@ def _pool(block_size, world_size, kv_dtype=None, blocks_per_entry=1):
 
 
 @pytest.mark.parametrize("tp,dcp", [(8, 1), (8, 2), (8, 8)])
-def test_dflash_pool_footprint_is_dcp_invariant(tp, dcp):
+def test_gqa_draft_pool_footprint_is_dcp_invariant(tp, dcp):
     """A wider entry over fewer blocks is the same per-rank footprint.
 
     The draft is NOT in the dcp group: its KV heads are sharded by the full TP
@@ -472,7 +475,7 @@ def test_dflash_pool_footprint_is_dcp_invariant(tp, dcp):
     `blocks_per_entry = dcp` -- `entry_bytes` grows by dcp while the number of
     entries a request needs falls by dcp.
 
-    This pins the arithmetic; `test_dflash_pool_entry_is_dcp_blocks` pins that
+    This pins the arithmetic; `test_gqa_draft_pool_entry_is_dcp_blocks` pins that
     `draft_kv_builder` builds this geometry.
     """
     _gpu_stack_import("atom.model_ops.attentions.mha_kv_pool")
@@ -522,7 +525,7 @@ def _stub_runner(tp=8, dcp=1, kv_cache_dtype="fp8"):
 
 
 def _make_kv_pool_kwargs(runner, model=None):
-    """Build a draft's pool through a stub backend, the DFlash draft's unless
+    """Build a draft's pool through a stub backend, the DSpark GQA draft's unless
     `model` names another.
 
     Returns what `make_kv_pool` was called with, and the builder under
@@ -553,7 +556,8 @@ def _make_kv_pool_kwargs(runner, model=None):
         builder = dk.draft_kv_builder(
             runner,
             _normalized_radixark(),
-            model=model or _gpu_stack_import("atom.models.kimi_k3_dflash").KimiK3DFlash,
+            model=model
+            or _gpu_stack_import("atom.models.kimi_k3_dspark_gqa").KimiK3DSparkGQA,
         )
 
     assert builder is not None
@@ -562,7 +566,7 @@ def _make_kv_pool_kwargs(runner, model=None):
     return seen
 
 
-def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
+def test_gqa_draft_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
     """The draft caches fp8 beside an fp8 target, at ONE per-tensor scale.
 
     Both ends of the pool take one scale: `aiter.reshape_and_cache_flash`
@@ -600,7 +604,7 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
 
 
 @pytest.mark.parametrize("dcp", [1, 2, 8])
-def test_dflash_pool_entry_is_dcp_blocks(dcp):
+def test_gqa_draft_pool_entry_is_dcp_blocks(dcp):
     """One target block id spans `block_size * dcp` global positions, and the
     draft, outside the dcp group, stores all of them: `dcp` blocks an entry,
     at the scheduler's block, the unit those ids count in.
@@ -631,7 +635,7 @@ def test_a_draft_without_a_pool_spec_gets_the_generic_pool(model):
     "module,cls_name,sharded",
     [
         ("atom.models.kimi_k3_dspark", "KimiK3DSpark", True),
-        ("atom.models.kimi_k3_dflash", "KimiK3DFlash", False),
+        ("atom.models.kimi_k3_dspark_gqa", "KimiK3DSparkGQA", False),
         ("atom.models.minimax_m3.dspark", "MiniMaxM3DSpark", True),
     ],
 )
@@ -656,7 +660,7 @@ def test_dcp_sharding_is_read_from_the_pool_spec(module, cls_name, sharded):
 # whose dspark tap returns the mixture. Feeding it the prefix instead measured
 # -6.43 pp acceptance on GSM8K.
 #
-# The routing is by draft CLASS, not by a flag: `KimiK3DFlash` implements
+# The routing is by draft CLASS, not by a flag: `KimiK3DSparkGQA` implements
 # `target_aux_capture_spec`, the MLA draft beside it deliberately does not. The
 # tests below pin both halves of that, because the failure mode in either
 # direction is silent -- a draft fed the wrong feature still proposes tokens,
@@ -738,21 +742,21 @@ def _k3_target_stub(hidden=16, n_layers=16, block_size=4, enabled=True):
     return types.SimpleNamespace(layers=layers)
 
 
-def _dflash_spec(target, layer_ids, hidden=16):
-    """Resolve `KimiK3DFlash`'s capture spec without building the draft.
+def _gqa_spec(target, layer_ids, hidden=16):
+    """Resolve `KimiK3DSparkGQA`'s capture spec without building the draft.
 
     Called unbound on purpose: the method reads nothing off `self` (its inputs
     are the tap ids, the target's hidden size, and the target's layers), and
     constructing the real draft would want a loaded checkpoint, a TP group and
     a GPU.
     """
-    dflash = _gpu_stack_import("atom.models.kimi_k3_dflash")
-    return dflash.KimiK3DFlash.target_aux_capture_spec(
+    mod = _gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
+    return mod.KimiK3DSparkGQA.target_aux_capture_spec(
         None, layer_ids, hidden, target.layers
     )
 
 
-def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
+def test_gqa_draft_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
     """(a) The draft resolves to its OWN extract, and that extract mixes.
 
     Both halves matter: resolving to its own spec is what makes the routing
@@ -766,7 +770,7 @@ def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
     target = _k3_target_stub(hidden=hidden, n_layers=16, block_size=block_size)
     # Tap 6, not 7: with block_size 4, layer 6 is preceded by closes at layers
     # 0 and 4 only, so the bank slice below pins the block count.
-    spec = _dflash_spec(target, (6, 11), hidden=hidden)
+    spec = _gqa_spec(target, (6, 11), hidden=hidden)
 
     assert spec.layer_ids == (6, 11)
     assert spec.hidden_size == hidden
@@ -808,13 +812,13 @@ def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
     assert out is call["result"]
 
 
-def test_dflash_aggregate_refuses_a_short_bank(monkeypatch):
+def test_gqa_draft_aggregate_refuses_a_short_bank(monkeypatch):
     """Fewer closed blocks than the tap implies is a target layout change, not
     a reason to drop silently back to the prefix feature."""
     torch = pytest.importorskip("torch")
     hidden = 16
     target = _k3_target_stub(hidden=hidden)
-    spec = _dflash_spec(target, (6, 11), hidden=hidden)
+    spec = _gqa_spec(target, (6, 11), hidden=hidden)
 
     calls = _fake_attn_res_kernel(monkeypatch, [])
     prefix = torch.randn(3, hidden)
@@ -825,7 +829,7 @@ def test_dflash_aggregate_refuses_a_short_bank(monkeypatch):
     assert calls == []
 
 
-def test_dflash_aggregate_folds_the_score_weight_when_armed():
+def test_gqa_draft_aggregate_folds_the_score_weight_when_armed():
     """The fold runs once at arm time, never inside the traced forward."""
     pytest.importorskip("torch")
     target = _k3_target_stub(hidden=16)
@@ -833,29 +837,29 @@ def test_dflash_aggregate_folds_the_score_weight_when_armed():
     folded = res.score_weight
     res.score_weight = None
     res.process_weights_after_loading = lambda: setattr(res, "score_weight", folded)
-    _dflash_spec(target, (6, 11), hidden=16)
+    _gqa_spec(target, (6, 11), hidden=16)
     assert res.score_weight is folded
 
 
-def test_dflash_refuses_a_tap_that_cannot_form_the_aggregate():
+def test_gqa_draft_refuses_a_tap_that_cannot_form_the_aggregate():
     """A tap without a mixture would feed the prefix, which this checkpoint was
     not trained on, so arming refuses it rather than fall back per tap."""
     pytest.importorskip("torch")
     with pytest.raises(ValueError, match="no enabled attn-residual"):
-        _dflash_spec(_k3_target_stub(enabled=False), (7, 11))
+        _gqa_spec(_k3_target_stub(enabled=False), (7, 11))
     with pytest.raises(ValueError, match="successor layer"):
-        _dflash_spec(_k3_target_stub(n_layers=16), (6, 15))
+        _gqa_spec(_k3_target_stub(n_layers=16), (6, 15))
     target = _k3_target_stub()
     target.layers[6].layer_idx = 5
     with pytest.raises(ValueError, match="layer_idx 5"):
-        _dflash_spec(target, (6,))
+        _gqa_spec(target, (6,))
 
 
-def test_dflash_arms_the_embedding_tap_without_a_successor():
+def test_gqa_draft_arms_the_embedding_tap_without_a_successor():
     """`-1` taps the embedding, below every mixture, and the drafter reads it
     verbatim, so arming needs no successor layer for it."""
     pytest.importorskip("torch")
-    spec = _dflash_spec(_k3_target_stub(n_layers=1), (-1,))
+    spec = _gqa_spec(_k3_target_stub(n_layers=1), (-1,))
     assert spec.layer_ids == (-1,)
 
 
@@ -975,7 +979,7 @@ def test_dspark_proposer_refuses_a_drafts_own_spec_under_pp_before_reading_layer
 # draft context slots (kimi_mla_gdn_attn builder -> dspark_proposer -> draft)
 #
 # The slot math is `token_layout/slots.py`'s, on the host, and runs on CPU.
-# The builder's publication, the proposer's hand-off and the DFlash layer are
+# The builder's publication, the proposer's hand-off and the DSpark GQA layer are
 # the REAL methods on stubs; their modules import aiter/triton, so those skip
 # on the CPU-only CI job. The base draft's fan-out runs on CPU.
 # --------------------------------------------------------------------------- #
@@ -1228,7 +1232,7 @@ def test_the_draft_layer_writes_at_the_slots_it_is_handed(module, layer):
 
 
 # --------------------------------------------------------------------------- #
-# the block read (model_ops/attentions/dflash_draft_attn.py)
+# the block read (model_ops/kimi_k3/dspark_block_attn.py)
 #
 # `unified_attention` asserts causal; the read gets a non-causal block out of it
 # by folding each request's T rows into its head axis and decoding ONE row per
@@ -1239,7 +1243,7 @@ def test_the_draft_layer_writes_at_the_slots_it_is_handed(module, layer):
 
 def _fold_mod():
     pytest.importorskip("torch")
-    return _gpu_stack_import("atom.model_ops.attentions.dflash_draft_attn")
+    return _gpu_stack_import("atom.model_ops.kimi_k3.dspark_block_attn")
 
 
 @pytest.mark.parametrize("bs,T,hkv,g", [(1, 7, 2, 4), (3, 7, 2, 4), (2, 4, 1, 8)])
@@ -1253,7 +1257,7 @@ def test_block_fold_puts_every_row_on_its_own_kv_head(bs, T, hkv, g):
     """
     import torch
 
-    dda = _fold_mod()
+    dba = _fold_mod()
     hq = hkv * g
     b = torch.arange(bs).view(bs, 1, 1).expand(bs, T, hq)
     t = torch.arange(T).view(1, T, 1).expand(bs, T, hq)
@@ -1261,7 +1265,7 @@ def test_block_fold_puts_every_row_on_its_own_kv_head(bs, T, hkv, g):
     # One scalar per (b, t, h), carried in the D axis so the fold moves it.
     tag = torch.stack([b, t, h], dim=-1).reshape(bs * T, hq, 3)
 
-    qf = dda.fold_block_queries(tag, bs, hkv)
+    qf = dba.fold_block_queries(tag, bs, hkv)
     assert qf.shape == (bs, hkv * T * g, 3)
     for req in range(bs):
         for j in range(hkv * T * g):
@@ -1275,7 +1279,7 @@ def test_block_fold_puts_every_row_on_its_own_kv_head(bs, T, hkv, g):
             assert j % g == fh % g
 
     out = torch.empty_like(tag)
-    dda.unfold_block_output(qf, out, hkv)
+    dba.unfold_block_output(qf, out, hkv)
     assert torch.equal(out, tag)
 
 
@@ -1336,7 +1340,7 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
     pytest.importorskip("aiter")
-    dda = _fold_mod()
+    dba = _fold_mod()
 
     torch.manual_seed(0)
     dev = torch.device("cuda")
@@ -1368,7 +1372,7 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
         k_pool, v_pool = k_pool.to(dtypes.fp8), v_pool.to(dtypes.fp8)
     scale = d**-0.5
 
-    read = dda.DFlashDraftUnifiedAttention(dev, max_bs=8, max_model_len=W * E)
+    read = dba.DSparkGQABlockAttention(dev, max_bs=8, max_model_len=W * E)
     one = torch.ones(1, dtype=torch.float32, device=dev)
     # Where the read casts q to an fp8 pool's dtype (gfx950), the reference
     # takes the same q. Taken BEFORE the call, which clamps q in place.
@@ -1389,10 +1393,12 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
     assert err_causal > 10 * err_bidir, (err_bidir, err_causal)
 
 
-# The two non-MLA block drafts, by their real classes: DFlash addresses a
+# The two non-MLA block drafts, by their real classes: the K3 GQA draft addresses a
 # `block_size * dcp` entry (dcp 8 here), MiniMax-M3.1 the scheduler block.
 _NON_MLA_DRAFTS = [
-    pytest.param("atom.models.kimi_k3_dflash", "KimiK3DFlash", 128 * 8, id="dflash"),
+    pytest.param(
+        "atom.models.kimi_k3_dspark_gqa", "KimiK3DSparkGQA", 128 * 8, id="k3_gqa"
+    ),
     pytest.param(
         "atom.models.minimax_m3.dspark", "MiniMaxM3DSpark", 128, id="minimax_m31"
     ),
@@ -1473,7 +1479,7 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
     "module,cls_name,is_mla",
     [
         ("atom.models.kimi_k3_dspark", "KimiK3DSpark", True),
-        ("atom.models.kimi_k3_dflash", "KimiK3DFlash", False),
+        ("atom.models.kimi_k3_dspark_gqa", "KimiK3DSparkGQA", False),
         ("atom.models.minimax_m3.dspark", "MiniMaxM3DSpark", False),
     ],
 )
@@ -1508,22 +1514,22 @@ def test_kv_indices_buffer_is_allocated_only_for_mla_block_plans(
         assert p._blk_kv_indices.numel() == 0
 
 
-def test_dflash_draft_is_refused_on_a_non_k3_target():
+def test_gqa_draft_is_refused_on_a_non_k3_target():
     """The checkpoint arch is generic, so the draft checks its target where the
     target's layers are known: a stack without the Kimi-K3 aggregate refuses."""
     target = types.SimpleNamespace(
         layers=[types.SimpleNamespace(layer_idx=i) for i in range(16)]
     )
     with pytest.raises(ValueError, match="Kimi-K3 target only"):
-        _dflash_spec(target, (6, 11))
+        _gqa_spec(target, (6, 11))
 
 
 def test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments(monkeypatch):
     """The cast follows aiter's own gate, asked about this read: q in the
     pool's dtype, the pool's head and page sizes, no softcap, all-decode."""
     torch = pytest.importorskip("torch")
-    dda = _fold_mod()
-    ua = dda.ua
+    dba = _fold_mod()
+    ua = dba.ua
     seen = []
 
     def gate(params):
@@ -1531,7 +1537,7 @@ def test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments(monkeypatch)
         return params.head_size == 64
 
     monkeypatch.setattr(ua, "_gfx950_gluon_supported", gate)
-    read = dda.DFlashDraftUnifiedAttention("cpu", max_bs=2, max_model_len=1024)
+    read = dba.DSparkGQABlockAttention("cpu", max_bs=2, max_model_len=1024)
     fp8 = torch.float8_e4m3fn
     k = torch.empty(2, 1024, 2, 64, dtype=fp8)
     assert read.casts_q(k, k) and read.casts_q(k, k)
@@ -1546,7 +1552,7 @@ def test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments(monkeypatch)
     assert not read.casts_q(k96, k96)
 
     monkeypatch.delattr(ua, "_gfx950_gluon_supported")
-    assert not dda.gluon_takes_pool_dtype_q(64, 64, 1024, fp8)
+    assert not dba.gluon_takes_pool_dtype_q(64, 64, 1024, fp8)
 
 
 def test_fp8_q_cast_saturates_instead_of_producing_nan():
@@ -1558,10 +1564,10 @@ def test_fp8_q_cast_saturates_instead_of_producing_nan():
     pytest.importorskip("aiter")
     from aiter import dtypes
 
-    dda = _fold_mod()
+    dba = _fold_mod()
     dev = torch.device("cuda")
     bs, T, hkv, g, d, E = 2, 7, 2, 4, 64, 1024
-    read = dda.DFlashDraftUnifiedAttention(dev, max_bs=4, max_model_len=E)
+    read = dba.DSparkGQABlockAttention(dev, max_bs=4, max_model_len=E)
     k_pool = torch.randn(3, E, hkv, d, device=dev).to(dtypes.fp8)
     v_pool = torch.randn_like(k_pool, dtype=torch.float32).to(dtypes.fp8)
     if not read.casts_q(k_pool, v_pool):
@@ -1578,12 +1584,12 @@ def test_fp8_q_cast_saturates_instead_of_producing_nan():
 def test_block_writes_and_reads_stay_inside_the_allocated_blocks():
     """The block runs up to T past the anchor, which can pass the request's
     allocation; that column reads as block 0, another request's entry. The real
-    `KimiK3DFlash.prepare_paged_block` drops those writes and caps the read."""
+    `KimiK3DSparkGQA.prepare_paged_block` drops those writes and caps the read."""
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU: pinned staging and a CUDA event")
-    m = _gpu_stack_import("atom.models.kimi_k3_dflash")
-    draft = m.KimiK3DFlash.__new__(m.KimiK3DFlash)
+    m = _gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
+    draft = m.KimiK3DSparkGQA.__new__(m.KimiK3DSparkGQA)
     vblock, T = 1024, 3
     # The bound FLASH page is one entry wide.
     k_cache = torch.empty(1, vblock, 1, 1, device="cuda")
@@ -1607,7 +1613,7 @@ def test_block_writes_and_reads_stay_inside_the_allocated_blocks():
 def test_the_draft_ignores_the_targets_quantization():
     """The draft atom config is a copy of the target's; its quant config, and
     the online re-quantization it carries, must not reach this BF16 draft."""
-    m = _gpu_stack_import("atom.models.kimi_k3_dflash")
+    m = _gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
     qc = m._draft_quant_config(_radixark_cfg())
     assert qc.quant_method == "" and qc.online_quant is False
     with pytest.raises(ValueError, match="BF16 weights only"):

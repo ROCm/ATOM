@@ -216,7 +216,7 @@ support_draft_model_arch_dict = {
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
     "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
     "DSparkMiniMaxDraftModel": "atom.models.minimax_m3.dspark.MiniMaxM3DSpark",
-    "K3DFlashModel": "atom.models.kimi_k3_dflash.KimiK3DFlash",
+    "K3DSparkGQAModel": "atom.models.kimi_k3_dspark_gqa.KimiK3DSparkGQA",
 }
 
 

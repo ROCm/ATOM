@@ -105,8 +105,8 @@ def test_the_pool_is_built_at_the_target_builders_block():
     assert asked == [(2, 256)]
 
 
-def test_the_dflash_pool_takes_the_schedulers_block():
-    """The DFlash pool sits beside an MLA target, whose builder pages at
+def test_the_gqa_draft_pool_takes_the_schedulers_block():
+    """The DSpark GQA draft's pool sits beside an MLA target, whose builder pages at
     ATOM_MLA_PAGE_SIZE -- 1 by default -- a kernel page, not a block id. Its
     block tables count SCHEDULER blocks, so that is the number to size at; at
     the builder's, MhaKvPool's SHUFFLE packing would not even construct.
@@ -263,8 +263,8 @@ def test_the_count_tracks_the_model_it_walked(draft_layers):
     assert asked == [(draft_layers, TARGET_BLOCK)]
 
 
-def test_dflash_layers_share_one_bound_unit_scale_tensor():
-    """The DFlash pool binds every layer the same one-element 1.0 tensor, at
+def test_gqa_draft_layers_share_one_bound_unit_scale_tensor():
+    """The DSpark GQA draft's pool binds every layer the same one-element 1.0 tensor, at
     bind time: both its write and its read take the scale as a device pointer,
     and nothing may be built for it inside a captured forward."""
     pool = MhaKvPool(

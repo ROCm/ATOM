@@ -2098,8 +2098,8 @@ def test_first_attention_layer_num_follows_the_kv_binding():
     ``KVCacheBinding`` the GQA drafts bind their pool on; the MLA draft binds
     on ``mla_attn`` and keeps its own lookup."""
     from atom.models.dspark_draft import DSparkDraftModel
-    from atom.models.kimi_k3_dflash import KimiK3DFlash
     from atom.models.kimi_k3_dspark import KimiK3DSpark
+    from atom.models.kimi_k3_dspark_gqa import KimiK3DSparkGQA
     from atom.models.minimax_m3.dspark import MiniMaxM3DSpark
     from atom.spec_decode.dspark_proposer import DSparkProposer
 
@@ -2123,7 +2123,7 @@ def test_first_attention_layer_num_follows_the_kv_binding():
         )
         is cache.k_cache
     )
-    for draft_cls in (KimiK3DFlash, MiniMaxM3DSpark):
+    for draft_cls in (KimiK3DSparkGQA, MiniMaxM3DSpark):
         assert (
             draft_cls.first_attention_layer_num
             is DSparkDraftModel.first_attention_layer_num

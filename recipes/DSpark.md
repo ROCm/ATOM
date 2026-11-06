@@ -79,7 +79,7 @@ Notes for Kimi-K3:
 - The confidence-scheduled ragged verify (`--dspark-config`) also applies here;
   omit it to run the plain batch-uniform verify.
 
-### Kimi-K3 with the RadixArk DFlash draft (TP8 + DCP8 + FP8 KV Cache)
+### Kimi-K3 with the RadixArk DSpark GQA draft (TP8 + DCP8 + FP8 KV Cache)
 
 [RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark) is a
 5-layer Qwen3-style GQA draft (SpecForge DFlash) that reads an aggregate of the

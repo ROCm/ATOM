@@ -1778,7 +1778,7 @@ class KimiDecoderLayer(nn.Module):
         the plain residual stream after this layer, which the reference forms as
         ``prefix_sum = prefix_sum + hidden_states`` before returning. It is
         what a draft trained on that stream reads (the MLA DSpark draft); a
-        draft trained on the attn-residual mixture over the bank (the DFlash
+        draft trained on the attn-residual mixture over the bank (the DSpark GQA
         draft) reads ``aggregate_hidden_state`` instead. forward()
         deliberately does not: it hands the FFN output back unapplied so the
         NEXT layer's attn_res kernel can fold it into its on-load, and an MoE
