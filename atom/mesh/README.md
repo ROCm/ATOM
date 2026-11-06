@@ -35,6 +35,16 @@ HTTP backends that support `/v1/responses`. A `mesh.apis` label restricts suppor
 APIs using comma-separated paths, such as `/v1/chat/completions,/v1/responses`;
 omitting the label preserves the default of accepting all supported API routes.
 
+A Responses request that refers to stored state (`previous_response_id`,
+`conversation`, or an `item_reference` input item) must reach the backend that
+holds that state. When all candidate workers share one backend address, it is
+routed normally. When candidates span several addresses, every candidate must
+carry the `mesh.responses_state=shared` label, which declares that those backends
+read one shared state store; otherwise Mesh returns
+`501 stateful_routing_unsupported`. Unhealthy candidates count too, so failover
+cannot move a request to a different state store. Requests without these fields
+need no label.
+
 A configured worker API key replaces client credentials and is sent as
 `authorization: Bearer <key>`; Messages requests also carry it as `x-api-key`.
 Backends without a worker key receive the client's `authorization` and
@@ -190,6 +200,10 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
 
 Prefill entries may include an optional bootstrap port (e.g. for Mooncake KV cache transfer).
 
+Messages and Responses have no PD adapter: in PD mode `/v1/messages` and
+`/v1/responses` return `501 unsupported_api_topology`. Serve them from regular
+HTTP workers.
+
 ### gRPC routing
 
 ```bash
@@ -245,6 +259,11 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `prefix_hash` | Consistent prefix hashing |
 
 In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
+
+`prefix_hash` routes on exact request tokens. Messages and Responses have no
+registered token-routing template, so under `prefix_hash` they return
+`501 token_routing_unsupported`. Use a policy that does not need tokens, such as
+`cache_aware` or `round_robin`, for models served through these APIs.
 
 ## Reliability
 
