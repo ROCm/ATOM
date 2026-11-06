@@ -118,6 +118,21 @@
           "bench_args": "--use-chat-template",
           "conc_min": 1,
           "conc_max": 256
+        },
+        {
+          "label": "No Spec",
+          "suffix": "-no-spec",
+          "bench_args": "--use-chat-template",
+          "conc_min": 16,
+          "conc_max": 256,
+          "scenarios": [
+            {
+              "isl": 8192,
+              "osl": 1024,
+              "concurrency": [16, 256],
+              "random_range_ratio": 0.8
+            }
+          ]
         }
       ]
     },
