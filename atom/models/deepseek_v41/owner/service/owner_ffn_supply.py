@@ -7,7 +7,7 @@ from aiter.tuned_gemm import flydsl_gemm, get_GEMM_A16W16_config
 
 from atom.model_ops.blockscale import quantize_fp8
 from atom.model_ops.module_dispatch_ops import _dual_stream_is_active
-from atom.models.deepseek_v41.prefill_ffn import _gather
+from atom.models.deepseek_v41.owner.prefill_ffn import _gather
 
 from .owner_ffn_dispatch import finish_output
 

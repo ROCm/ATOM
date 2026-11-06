@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from atom.models.deepseek_v41.owner_service.owner_graph import (
+from atom.models.deepseek_v41.owner.service.owner_graph import (
     GraphCoverage,
     OwnerGraphInputs,
     graph_key,

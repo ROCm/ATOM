@@ -115,7 +115,9 @@ def bind(Runner, consumer, enabled, configure):
         # Count the actual exit call; graph replay does not re-enter Python.
         combined = hasattr(consumer, "v41_ffn_combine_scatter")
         if combined:
-            from atom.model_ops.deepseek_v41.ffn_combine import supports_fused_combine
+            from atom.models.deepseek_v41.owner.ffn_combine import (
+                supports_fused_combine,
+            )
 
             original_exit = consumer.v41_ffn_combine_scatter
 

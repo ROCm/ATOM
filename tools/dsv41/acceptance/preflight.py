@@ -72,7 +72,11 @@ def main():
     assert routed.quant_dtype == dtypes.fp4x2 and shared.quant_dtype == dtypes.fp8
     schema = None
     if candidate:
-        from atom.models.deepseek_v41 import prefill_ffn
+        # Registers the owner guarded ops (`owner.runtime`).
+        from atom.models.deepseek_v41.owner import prefill_ffn
+        from atom.models.deepseek_v41.owner import (
+            runtime as _owner_runtime,  # noqa: F401
+        )
 
         assert hasattr(prefill_ffn.prequantized_owned_ffn, "__wrapped__")
         schema = str(torch.ops.aiter.v41_owned_prequantized_moe.default._schema)

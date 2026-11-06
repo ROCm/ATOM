@@ -156,8 +156,14 @@ def install_mono_decode(
     """``model`` wrapped for mono decode (and ``drafter``'s DSpark draft model
     for its backbone), or ``model`` itself when this deployment is one mono
     does not serve."""
+    if getattr(model, "use_row_sharded_mhc", False):
+        # The owner-row prefill deployment (`owner/`) replicates its attention
+        # weights once, after load and before any forward.
+        from atom.models.deepseek_v41.owner.attention import bind_model
+
+        bind_model(model)
     if os.environ.get("DSV41_OWNER_SERVING") == "1":
-        from atom.models.deepseek_v41.owner_service import install
+        from atom.models.deepseek_v41.owner.service import install
 
         install()
     why = config_refusal(atom_config)

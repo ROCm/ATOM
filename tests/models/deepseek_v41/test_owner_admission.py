@@ -7,9 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 spec = importlib.util.spec_from_file_location(
-    "owner_service_contract",
-    Path(__file__).resolve().parents[3]
-    / "atom/models/deepseek_v41/owner_service_contract.py",
+    "owner_admission",
+    Path(__file__).resolve().parents[3] / "atom/models/deepseek_v41/owner/admission.py",
 )
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)

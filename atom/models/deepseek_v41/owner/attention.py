@@ -19,8 +19,14 @@ from torch import nn
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
     sparse_attn_v41_paged_2src,
 )
-from atom.model_ops.deepseek_v41.row_sharded_mhc import gather_norm
+from atom.model_ops.deepseek_v41.paged_scoring import quantize_query_fp4
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
+from atom.models.deepseek_v41.attention import _live_step
+from atom.models.deepseek_v41.owner.row_sharded_mhc import (
+    gather_norm,
+    score_owned_rows,
+)
+from atom.utils.region_graph import eager_region, forks
 
 
 def unshuffle_fp8(weight):
@@ -73,7 +79,7 @@ def bind_linear(linear, dim):
 
 def bind_model(model):
     """Called exactly once after source weights have reached their final layouts."""
-    if not model.use_row_sharded_mhc:
+    if not getattr(model, "use_row_sharded_mhc", False):
         raise ValueError("owner attention requires the owner-state deployment")
     group = get_tp_group()
     assert group.world_size == 4
@@ -82,7 +88,7 @@ def bind_model(model):
     dist.barrier(group=group.cpu_group)
     extra_bytes = 0
     for block in model.layers:
-        if not block.row_sharded_mhc:
+        if not getattr(block, "row_sharded_mhc", False):
             continue
         attention = block.attn
         if getattr(attention, "owner_attention_bound", False):
@@ -101,6 +107,54 @@ def bind_model(model):
         f"OWNER_ATTENTION_BOUND rank={group.rank_in_group} extra_bytes={extra_bytes}",
         flush=True,
     )
+
+
+def compress_batch(attention, hidden, cache, step, rope):
+    """`Attention._compress_batch` on owner rows: the compressor projects only
+    this rank's rows, and its values/scores are gathered back to every row
+    before the native cache writer, which keeps the replicated KV layout."""
+    if (
+        not attention.spec.ratio
+        or attention.compressor is None
+        or not step.plans
+        or not step.requests
+    ):
+        return
+    values, scores = attention.compressor.project(hidden)
+    values = gather_norm(values, step.width)
+    if scores is not None:
+        scores = gather_norm(scores, step.width)
+    latent = cache.compress(
+        attention.spec.kv_owner, attention.compressor, values, scores, step, rope
+    )
+    if latent is not None:
+        attention.indexer.write_keys(latent, cache, step, rope)
+
+
+@eager_region(stream=lambda attention: attention.compress_stream, live=_live_step)
+def _compress(attention, hidden, cache, step, rope):
+    """`compress_batch` as a TR-graph break, as `Attention._compress` is."""
+    compress_batch(attention, hidden, cache, step, rope)
+
+
+def index_project(indexer, hidden, qr, qr_scale, cache, step, rope):
+    """`Indexer.project` on owner rows: RoPE positions are this rank's slice of
+    the step, zero-padded to the owner capacity."""
+    count = hidden.shape[-2]
+    start = get_tp_group().rank_in_group * count
+    valid = min(count, max(0, step.width - start))
+    positions = cache.rope_positions(step)
+    part = positions.narrow(-1, min(start, step.width), valid)
+    shape = list(positions.shape)
+    shape[-1] = count - valid
+    positions = torch.cat((part, positions.new_zeros(shape)), dim=-1)
+    query = indexer.wq_b(qr, x_scale=qr_scale).unflatten(
+        -1, (indexer.heads, indexer.head_dim)
+    )
+    weights = indexer.weights_proj(hidden)[0]
+    if cache.geometry.index_fp4:
+        return quantize_query_fp4(query[0], rope, positions), weights
+    return rope(query, positions)[0], weights
 
 
 def project_out(attention, output, rope, positions):
@@ -136,24 +190,20 @@ def forward(
     start = group.rank_in_group * capacity
     valid = min(capacity, step.width - start)
     positions = cache.rope_positions(step)[start : start + valid]
-    compressed = attention._fork_compress(hidden, cache, step, rope, row_sharded=True)
+    _compress(attention, hidden, cache, step, rope)
+    # This deployment excludes side streams, so the compressor never forks and
+    # the scorer below needs no join.
+    assert not forks(attention.compress_stream)
     q_lora, kv_pre = attention.project_qkv(
         hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
     )
     qr, qr_scale, kv_normed = attention.qk_norm(q_lora, kv_pre)
     # The indexer reads the same local qr that the attention consumes.
     if attention.indexer is not None:
-        index_query = attention.indexer.project(
-            hidden,
-            qr,
-            qr_scale,
-            cache,
-            step,
-            rope,
-            row_sharded=True,
+        index_query = index_project(
+            attention.indexer, hidden, qr, qr_scale, cache, step, rope
         )
-        assert not compressed  # this deployment excludes side streams
-        attention.indexer.score(*index_query, cache, step, row_sharded=True)
+        score_owned_rows(attention.indexer, *index_query, cache, step)
     heads = attention.heads * group.world_size
     query = attention.wq_b_owned(qr, x_scale=qr_scale).view(
         capacity, heads, attention.head_dim

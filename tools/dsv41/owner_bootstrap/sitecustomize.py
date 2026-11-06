@@ -7,8 +7,8 @@ from owner_bootstrap_scope import service_process
 
 if os.environ.get("DSV41_FP8_OWNER_ENTRY") == "1" and service_process(sys.orig_argv):
     try:
-        from atom.models.deepseek_v41.owner_service import install
-        from atom.models.deepseek_v41.owner_service.lifecycle import (
+        from atom.models.deepseek_v41.owner.service import install
+        from atom.models.deepseek_v41.owner.service.lifecycle import (
             install as install_lifecycle,
         )
 

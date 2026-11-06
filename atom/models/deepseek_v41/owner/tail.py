@@ -6,8 +6,8 @@ import triton
 import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.model_ops.deepseek_v41.owner_tail_plan import plan_tail_ownership
-from atom.model_ops.deepseek_v41.row_sharded_mhc import v41_mhc_gather_rows
+from atom.models.deepseek_v41.owner.row_sharded_mhc import v41_mhc_gather_rows
+from atom.models.deepseek_v41.owner.tail_plan import plan_tail_ownership
 from atom.utils import upload_numpy
 
 

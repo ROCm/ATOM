@@ -51,7 +51,7 @@ def install():
     assert enabled == (os.environ["DSV41_OWNER_SERVING"] == "1")
     validate = None
     if enabled:
-        from atom.models.deepseek_v41.owner_ep import validate_owner_ep4
+        from atom.models.deepseek_v41.owner.ep import validate_owner_ep4
 
         validate = validate_owner_ep4
     bind(ModelRunner, enabled, validate)

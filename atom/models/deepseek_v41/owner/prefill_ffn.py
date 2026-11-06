@@ -6,9 +6,9 @@ import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_ops.blockscale import quantize_fp8
-from atom.model_ops.deepseek_v41.ffn_combine import v41_ffn_combine_scatter
-from atom.model_ops.deepseek_v41.row_sharded_mhc import eligible
 from atom.model_ops.module_dispatch_ops import _dual_stream_is_active
+from atom.models.deepseek_v41.owner.ffn_combine import v41_ffn_combine_scatter
+from atom.models.deepseek_v41.owner.row_sharded_mhc import eligible
 
 from .prefill_router import owned_router_logits
 

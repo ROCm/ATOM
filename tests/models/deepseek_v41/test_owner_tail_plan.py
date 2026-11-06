@@ -4,7 +4,7 @@
 import numpy as np
 import pytest
 
-from atom.model_ops.deepseek_v41.owner_tail_plan import plan_tail_ownership
+from atom.models.deepseek_v41.owner.tail_plan import plan_tail_ownership
 
 
 @pytest.mark.parametrize("rows,tp", [(1, 4), (5, 4), (4097, 4), (16381, 4), (8192, 2)])

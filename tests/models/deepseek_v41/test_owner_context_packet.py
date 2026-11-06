@@ -35,7 +35,7 @@ def extracted(path, class_name, method=None):
 
 def packet_class():
     return extracted(
-        "atom/models/deepseek_v41/owner_service/owner_serving.py", "ContextPacket"
+        "atom/models/deepseek_v41/owner/service/owner_serving.py", "ContextPacket"
     )[0]
 
 

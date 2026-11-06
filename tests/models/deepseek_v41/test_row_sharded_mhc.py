@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.model_ops.deepseek_v41 import row_sharded_mhc as owner
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
+from atom.models.deepseek_v41.owner import row_sharded_mhc as owner
 
 
 @pytest.mark.parametrize("rows", [5, 8, 4097])

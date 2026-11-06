@@ -15,8 +15,8 @@ def validate_capture(capacity, graph_delta, native_delta, recorded_calls):
 def install():
     import torch
 
-    from atom.models.deepseek_v41.owner_service import owner_grouped_attention
-    from atom.models.deepseek_v41.owner_service.owner_serving import OwnerServing
+    from atom.models.deepseek_v41.owner.service import owner_grouped_attention
+    from atom.models.deepseek_v41.owner.service.owner_serving import OwnerServing
 
     bind(OwnerServing, owner_grouped_attention, torch.cuda.is_current_stream_capturing)
 

@@ -502,10 +502,12 @@ class OwnerServing:
         import torch
 
         from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
-        from atom.model_ops.deepseek_v41.row_sharded_mhc import v41_mhc_reduce_scatter
         from atom.model_ops.engram.device.staging import EngramStagedRows
         from atom.model_ops.module_dispatch_ops import _dual_stream_is_active
         from atom.models.deepseek_v41.model import Block
+        from atom.models.deepseek_v41.owner.row_sharded_mhc import (
+            v41_mhc_reduce_scatter,
+        )
 
         from .owner_cost_attention_chain import forward_owner
         from .owner_ffn_dispatch import finish_output, routed_forward

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
-SERVICE = ROOT / "atom/models/deepseek_v41/owner_service"
+SERVICE = ROOT / "atom/models/deepseek_v41/owner/service"
 spec = importlib.util.spec_from_file_location(
     "owner_lifecycle", SERVICE / "lifecycle.py"
 )

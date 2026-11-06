@@ -59,7 +59,7 @@ def validate_owner_ep4(model, config, *, loaded=False):
         raise ValueError("Incomplete owner backbone")
     placement = getattr(model, "owner_ep4_placement", None)
     if placement is not None:
-        from .owner_placement import PLAN_ID, expected_experts
+        from .placement import PLAN_ID, expected_experts
 
         if placement != PLAN_ID:
             raise ValueError("Unrecognized fixed expert placement")

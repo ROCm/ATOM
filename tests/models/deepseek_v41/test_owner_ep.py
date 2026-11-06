@@ -7,7 +7,7 @@ from pathlib import Path
 
 spec = importlib.util.spec_from_file_location(
     "owner_ep",
-    Path(__file__).resolve().parents[3] / "atom/models/deepseek_v41/owner_ep.py",
+    Path(__file__).resolve().parents[3] / "atom/models/deepseek_v41/owner/ep.py",
 )
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)

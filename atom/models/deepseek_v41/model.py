@@ -53,7 +53,6 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.layer_name = f"v41.layers.{spec.layer_id}"
-        self.row_sharded_mhc = False
         self.attn = self.attention_cls(
             config, spec, compress_stream=compress_stream, index_stream=index_stream
         )
@@ -122,21 +121,14 @@ class Block(nn.Module):
             self.hc_attn_fn_packed is not None and fuse_quant_supported()
         )
 
-    def attention_forward(self, normed, cache, step, rope, *, row_sharded=False):
+    def attention_forward(self, normed, cache, step, rope):
         """Keep BF16 for auxiliary readers and reuse the optional QKV quant."""
-        options = {"row_sharded": True} if row_sharded else {}
         if isinstance(normed, tuple):
             hidden, hidden_fp8, hidden_scale = normed
             return self.attn(
-                hidden,
-                hidden_scale,
-                cache,
-                step,
-                rope,
-                hidden_fp8=hidden_fp8,
-                **options,
+                hidden, hidden_scale, cache, step, rope, hidden_fp8=hidden_fp8
             )
-        return self.attn(normed, None, cache, step, rope, **options)
+        return self.attn(normed, None, cache, step, rope)
 
     def engram_forward(self, residual, embeddings, image_mask):
         if embeddings is None:
@@ -145,10 +137,7 @@ class Block(nn.Module):
             residual, embeddings, None if image_mask is None else ~image_mask
         )
 
-    def prepare_attention(self, state, embeddings, image_mask, *, row_sharded=False):
-        from atom.model_ops.deepseek_v41.row_sharded_mhc import localize, replicate
-
-        state = localize(state) if row_sharded else replicate(state)
+    def prepare_attention(self, state, embeddings, image_mask):
         if self.engram is not None:
             # Engram reads the residual between the post and the pre, so this
             # is the one seam that cannot fold: settling leaves nothing owed
@@ -176,23 +165,13 @@ class Block(nn.Module):
         )
         return normed, residual, pre, post, comb
 
-    def prepare_ffn(
-        self,
-        output,
-        residual,
-        pre,
-        post,
-        comb,
-        *,
-        row_sharded=False,
-        original_rows=None,
-        fuse_quant=False,
-    ):
-        # The attention post folds into this seam: one kernel pair computes the
-        # new residual, the gates and the normed FFN input.
+    def prepare_ffn(self, output, residual, pre, post, comb, *, fuse_quant=False):
+        # The attention post folds into this seam: the delayed kernel computes the
+        # new residual, the gates and the normed FFN input; with ``fuse_quant``
+        # also its FP8 rows (`pre_delayed`), for an FFN that takes them.
         hc_fn = self.hc_ffn_fn_packed
-        if fuse_quant and (hc_fn is None or row_sharded):
-            raise ValueError("FFN fused quantization requires local HIP mHC")
+        if fuse_quant and hc_fn is None:
+            raise ValueError("FFN fused quantization requires the HIP mHC seam")
         residual, normed, pre, post, comb = pre_delayed(
             residual,
             pre,
@@ -208,120 +187,33 @@ class Block(nn.Module):
             post_mix=post,
             combination=comb,
         )
-        if row_sharded:
-            from atom.model_ops.deepseek_v41.row_sharded_mhc import gather_norm
-
-            normed = gather_norm(normed, original_rows)
         return normed, residual, pre, post, comb
 
-    def finish_ffn(
-        self,
-        output,
-        residual,
-        pre,
-        post,
-        comb,
-        *,
-        row_sharded=False,
-        original_rows=None,
-    ):
+    def finish_ffn(self, output, residual, pre, post, comb):
         # Owed, not applied: the next block's pre folds this post into its own
         # projection.
-        return SinglePassHCState(
-            residual,
-            pre,
-            output,
-            post,
-            comb,
-            row_sharded=row_sharded,
-            original_rows=original_rows,
-        )
+        return SinglePassHCState(residual, pre, output, post, comb)
 
     def forward(
-        self,
-        state,
-        cache,
-        step,
-        rope,
-        embeddings=None,
-        image_mask=None,
-        queries=None,
-        *,
-        row_sharded=False,
+        self, state, cache, step, rope, embeddings=None, image_mask=None, queries=None
     ):
         """``queries``: bounded replay's `QueryRows`, the rows the rest of the
         layer runs on, those the attention outputs (the runtime's reads them
         off the forward context, `runtime.v41_attention`)."""
-        row_sharded = row_sharded and getattr(self, "row_sharded_mhc", False)
-        if row_sharded:
-            normed, residual, pre, post, comb = self.prepare_attention(
-                state, embeddings, image_mask, row_sharded=True
-            )
-        else:
-            normed, residual, pre, post, comb = self.prepare_attention(
-                state, embeddings, image_mask
-            )
-        output = (
-            self.attention_forward(normed, cache, step, rope, row_sharded=True)
-            if row_sharded
-            else self.attention_forward(normed, cache, step, rope)
+        normed, residual, pre, post, comb = self.prepare_attention(
+            state, embeddings, image_mask
         )
+        output = self.attention_forward(normed, cache, step, rope)
         if queries is not None:
-            if row_sharded:
-                raise RuntimeError("query-row cutting requires a replicated mHC state")
             residual, pre, post, comb = queries.take(residual, pre, post, comb)
-        return self.ffn_forward(
-            output,
-            residual,
-            pre,
-            post,
-            comb,
-            row_sharded=row_sharded,
-            original_rows=(
-                state.original_rows if state.row_sharded else state.residual.shape[-3]
-            ),
-        )
+        return self.ffn_forward(output, residual, pre, post, comb)
 
-    def ffn_forward(
-        self,
-        output,
-        residual,
-        pre,
-        post,
-        comb,
-        *,
-        row_sharded=False,
-        original_rows=None,
-    ):
+    def ffn_forward(self, output, residual, pre, post, comb):
         """The layer after its attention: ``output`` and the seam's state."""
-        if row_sharded:
-            normed, residual, pre, post, comb = self.prepare_ffn(
-                output,
-                residual,
-                pre,
-                post,
-                comb,
-                row_sharded=True,
-                original_rows=original_rows,
-            )
-            return self.finish_ffn(
-                self.expert_forward(normed, row_sharded=True),
-                residual,
-                pre,
-                post,
-                comb,
-                row_sharded=True,
-                original_rows=original_rows,
-            )
         normed, residual, pre, post, comb = self.prepare_ffn(
             output, residual, pre, post, comb
         )
-        return self.finish_ffn(
-            self.expert_forward(normed, row_sharded=False), residual, pre, post, comb
-        )
-
-    def expert_forward(self, normed, *, row_sharded):
-        return self.ffn(normed)
+        return self.finish_ffn(self.ffn(normed), residual, pre, post, comb)
 
 
 class DeepseekV41ForCausalLM(nn.Module):
@@ -499,9 +391,7 @@ class DeepseekV41ForCausalLM(nn.Module):
                 engram_embeddings.get(spec.layer_id),
                 image_mask=image_mask,
             )
-        from atom.model_ops.deepseek_v41.row_sharded_mhc import replicate
-
-        hidden = replicate(state).collapse()
+        hidden = state.collapse()
         self.end_forward(hidden, engram_embeddings)
         return hidden
 

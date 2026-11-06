@@ -13,7 +13,7 @@ import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-from atom.model_ops.deepseek_v41.row_sharded_mhc import (
+from atom.models.deepseek_v41.owner.row_sharded_mhc import (
     MIN_ROWS,
     _scatter_fake,
     v41_mhc_reduce_scatter,

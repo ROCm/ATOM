@@ -7130,7 +7130,7 @@ def install_owner_placement(model, config):
     """One startup mutation, before the native loader reads expert_map."""
     import torch
 
-    from .owner_ep import validate_owner_ep4
+    from .ep import validate_owner_ep4
 
     if getattr(model, "owner_ep4_placement", None) is not None:
         raise ValueError("Expert placement is already installed")

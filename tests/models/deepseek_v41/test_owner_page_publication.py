@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from atom.models.deepseek_v41.owner_service.owner_serving_plan import written_page_units
+from atom.models.deepseek_v41.owner.service.owner_serving_plan import written_page_units
 
 PLAN = (
     Path(__file__).resolve().parents[3] / "atom/model_ops/v4_kernels/compress_plan.py"

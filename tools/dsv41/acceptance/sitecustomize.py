@@ -21,7 +21,7 @@ def install():
         if not Path(atom.__file__).resolve().is_relative_to(source):
             raise RuntimeError("Wrong DSV41 subject imported")
         if owner:
-            from atom.models.deepseek_v41.owner_service import install as execution
+            from atom.models.deepseek_v41.owner.service import install as execution
         else:
             from origin_native_service_accounting import install as execution
         execution()
