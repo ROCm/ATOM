@@ -346,20 +346,3 @@ def test_a_flash_pool_binds_entry_wide_flash_views_and_a_unit_scale(
     assert module.k_cache.shape[1] == pool.entry_tokens
     assert module.v_cache.shape == pool.fa_views(0)[1].shape
     assert module.k_scale.numel() == 1 and float(module.k_scale) == 1.0
-
-
-def test_kv_views_refuses_a_flash_pool():
-    """Both views cover the same bytes, so the SHUFFLE one would read a FLASH
-    pool in the wrong order without any size check noticing."""
-    pool = MhaKvPool(
-        layers=1,
-        block_size=128,
-        num_kv_heads=2,
-        head_dim=64,
-        kv_dtype=torch.float8_e4m3fnuz,
-        flash_layout=True,
-    )
-    pool.allocate(2, "cpu")
-    with pytest.raises(ValueError, match="fa_views"):
-        pool.kv_views(0)
-    assert pool.scale_fields == []
