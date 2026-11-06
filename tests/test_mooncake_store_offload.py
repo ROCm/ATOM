@@ -729,6 +729,20 @@ def test_engine_compatibility_refuses_what_phase_one_does_not_move():
         check_engine_compatibility(odd, _config())
 
 
+@pytest.mark.parametrize(
+    "model_type", ["deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"]
+)
+def test_engine_compatibility_accepts_v41_page_replay(model_type):
+    config = _config()
+    config.hf_config.model_type = model_type
+    config.hf_config.compress_ratios = [4, 128]
+    cfg = parse_mooncake_store_config(_extra())
+    check_engine_compatibility(cfg, config)
+    config.decode_context_parallel_size = 2
+    with pytest.raises(ValueError, match="decode context parallelism"):
+        check_engine_compatibility(cfg, config)
+
+
 @pytest.mark.parametrize("role_side", ["scheduler", "worker"])
 def test_both_sides_refuse_dcp(cluster, role_side):
     config = _config(decode_context_parallel_size=2)
@@ -3131,6 +3145,63 @@ def one_rank(monkeypatch):
 
 def _registering_config():
     return _config(extra=_extra(save_pool_mib=1, load_pool_mib=1))
+
+
+@pytest.mark.parametrize("replays", [False, None])
+def test_v41_registration_requires_explicit_page_replay(cluster, one_rank, replays):
+    config = _registering_config()
+    config.hf_config.model_type = "deepseek_v41"
+    transfer = SimpleNamespace(
+        state_backend=SimpleNamespace(
+            state_transfer=lambda: SimpleNamespace(replays=replays)
+        )
+    )
+    worker = MooncakeStoreOffloadConnector(config)
+    try:
+        with pytest.raises(ValueError, match="requires the PAGE replay contract"):
+            worker.register_kv_caches(
+                _kv_caches(), transfer_tensors=transfer, num_blocks=8
+            )
+        assert not cluster.stores
+    finally:
+        worker.close()
+
+
+def test_v41_registration_uses_pages_without_request_slots(
+    cluster, one_rank, monkeypatch
+):
+    from atom.kv_transfer.offload.hybrid.dsv4 import codec as dsv4_codec
+
+    config = _registering_config()
+    config.hf_config.model_type = "deepseek_v41"
+    pages = object()
+    transfer = SimpleNamespace(
+        block_regions=pages,
+        num_blocks=8,
+        state_backend=SimpleNamespace(
+            state_transfer=lambda: SimpleNamespace(replays=True)
+        ),
+    )
+    selected = {}
+
+    def page_codec(**kwargs):
+        selected.update(kwargs)
+        # The fixture's fake transfer engine uses CPU bytes. Keep its normal
+        # codec while verifying which PAGE/SLOT contract registration selects.
+        return worker_mod.DenseKVByteCodec(_kv_caches(), num_blocks=8)
+
+    monkeypatch.setattr(dsv4_codec, "DSV4PageSlotCodec", page_codec)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    worker = MooncakeStoreOffloadConnector(config)
+    try:
+        worker.register_kv_caches({}, transfer_tensors=transfer, num_blocks=8)
+        assert selected["page_regions"] is pages
+        assert selected["slot_regions"] == ()
+        assert selected["num_slots"] == 0
+        assert selected["num_blocks"] == 8
+        assert worker._pool is not None
+    finally:
+        worker.close()
 
 
 def test_registration_builds_the_pool_and_probes_the_store(cluster, one_rank):
