@@ -1275,7 +1275,7 @@ def test_silent_producer_ranks_fail_the_receive_after_their_window():
     conn = _make_connector(
         _release_targets={"old": ("stage0", "t1", 1)},
         _send_on_socket=lambda addr, parts, repeat=1: sent.append((addr, parts[0])),
-        _mla_landing=None,
+        _landing=None,
     )
     for req_id in ("old", "new"):
         conn._pending_recv_expected[req_id] = 2
@@ -1302,7 +1302,7 @@ def test_silent_producer_ranks_fail_the_receive_after_their_window():
 def test_a_rank_that_never_acknowledged_keeps_the_receive_open():
     """It may still get the request and write, however long that takes."""
     pytest.importorskip("atom.kv_transfer.disaggregation.mooncake.mooncake_connector")
-    conn = _make_connector(_mla_landing=None)
+    conn = _make_connector(_landing=None)
     conn._pending_recv_expected["r1"] = 2
     conn._pending_recv.add("r1")
     assert not conn._record_write_done("r1", 1, 0, 0, success=False)
@@ -1317,7 +1317,7 @@ def test_a_rank_that_never_acknowledged_keeps_the_receive_open():
 @pytest.mark.parametrize("window", [None, -1, 0, float("inf"), True, "60"])
 def test_an_ack_without_a_usable_window_starts_no_deadline(window):
     pytest.importorskip("atom.kv_transfer.disaggregation.mooncake.mooncake_connector")
-    conn = _make_connector(_mla_landing=None)
+    conn = _make_connector(_landing=None)
     conn._pending_recv_expected["r1"] = 1
     conn._record_write_ack(
         {"request_id": "r1", "pp_rank": 0, "tp_rank": 0, "write_window_s": window}
@@ -1384,7 +1384,7 @@ def test_a_failed_receive_is_reported_only_after_its_hold(monkeypatch):
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
     monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
-    conn = _make_connector(_staging_slots=mc.SlotPool(), _mla_landing=None)
+    conn = _make_connector(_staging_slots=mc.SlotPool(), _landing=None)
     conn._pending_recv_expected["r1"] = 1
     conn._pending_recv.add("r1")
     conn._pending_recv_slots["r1"] = (7, 3)
@@ -1407,7 +1407,7 @@ def test_a_stalled_receive_is_logged_once(monkeypatch, caplog, acked):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
-    conn = _make_connector(_mla_landing=None)
+    conn = _make_connector(_landing=None)
     conn._pending_recv_expected["r1"] = 2
     conn._pending_recv_stall_watch["r1"] = time.monotonic()
     assert not conn._record_write_done("r1", 0, 0, 0, success=False)

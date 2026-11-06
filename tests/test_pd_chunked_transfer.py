@@ -785,12 +785,12 @@ def test_swa_only_pool_transfers_final_relocated_slot(monkeypatch, reverse_index
         },
         local_swa_block_ids=[2],
     )
-    d._mla_landing = MagicMock()
+    d._landing = MagicMock()
     d.start_load_kv(meta)
     d._send_on_socket.assert_not_called()
     post_write_requests(d, monkeypatch)
-    d._mla_landing.advertise.assert_not_called()
-    d._mla_landing.begin.assert_not_called()
+    d._landing.advertise.assert_not_called()
+    d._landing.begin.assert_not_called()
     assert meta.reqs_to_recv.keys() <= d._pending_handoffs.keys()
     _, (_, payload) = d._send_on_socket.call_args.args
     request = msgpack.loads(payload)

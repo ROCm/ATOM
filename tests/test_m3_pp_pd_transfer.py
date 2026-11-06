@@ -392,7 +392,7 @@ def _producer(tt, mem, blocks, heads):
         dcp_size=1,
         pp_size=4,
         block_size=BLOCK,
-        _mla_staging=None,
+        _kv_staging=None,
         _MAX_RDMA_ENTRIES_PER_BATCH=7,
         _rdma_write=lambda target, s, d, n, *a, **k: mem.write(s, d, n) or True,
     )
