@@ -188,3 +188,45 @@ def test_k3_fused_producers_stand_down_for_an_e8m0_consumer(
 ):
     cfg = SimpleNamespace(blockscale_e8m0_scale=switch)
     assert kimi_k3._is_e8m0_blockscale(cfg, quant_type) is expected
+
+
+def test_a_column_shard_off_the_128_grid_is_quantized_locally(monkeypatch):
+    """At TP>1 a column-parallel shard whose rows aren't a multiple of 128 (e.g.
+    Kimi-K3's KDA in_proj, [q|k|v|g|b] plus the appended f_a) can't be
+    re-sharded on block boundaries after a gather, so it is quantized locally:
+    its block scales are its own rows' blocks."""
+    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "0")
+    rank = SimpleNamespace(rank_in_group=3, world_size=8)
+    monkeypatch.setattr(linear_mod, "get_tp_group", lambda: rank)
+    monkeypatch.setattr(
+        linear_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(torch_dtype=torch.bfloat16),
+    )
+    target = LayerQuantConfig(
+        quant_type=QuantType.per_1x128, quant_dtype=dtypes.fp8, is_dynamic=True
+    )
+    quant_config = SimpleNamespace(
+        online_quant=True,
+        blockscale_e8m0_scale=False,
+        get_layer_quant_config=lambda *_a, use_online_quant=False, **_k: (
+            target if use_online_quant else LayerQuantConfig()
+        ),
+    )
+    local_rows = 200  # not a multiple of 128
+    layer = linear_mod.ColumnParallelLinear(
+        256, 8 * local_rows, quant_config=quant_config, prefix="layers.1.in_proj"
+    )
+    source = torch.randn(local_rows, 256, dtype=torch.bfloat16) * 0.02
+    layer.weight.data = source
+
+    def no_gather(_weight):
+        raise AssertionError("a column shard must not be gathered")
+
+    monkeypatch.setattr(layer, "_gather_full_weight", no_gather)
+    layer.online_quantize_weight()
+
+    want_q, want_s = quantize(source, dtypes.fp8)
+    assert tuple(layer.weight_scale.shape) == (2, 2)  # ceil(200/128) x 256/128
+    assert _same_bytes(layer.weight, want_q)
+    assert _same_bytes(layer.weight_scale, want_s)

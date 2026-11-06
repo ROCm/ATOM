@@ -230,21 +230,23 @@ def _normalize_glm5_next_config(config) -> None:
 # Kimi-K3 has to enumerate this per KDA layer, because its full-attention layers
 # also own a `g_proj` that must not be folded. GLM-5.3 needs no such care: its
 # MLA layers use `q_a_proj` / `q_b_proj` / `kv_a_proj_with_mqa` / `kv_b_proj`, and
-# none of those contain `.q_proj`, `.k_proj` or `.v_proj` as a substring (the
-# match is anchored on a leading "."). So a single layer-agnostic mapping is
+# none of those contain `.q_proj`, `.k_proj`, `.v_proj` or `.b_proj` as a
+# substring (the match is anchored on a leading ".", so `q_b_proj`, `kv_b_proj`
+# and the KDA layer's own `g_b_proj` do not match `.b_proj`). So a single layer-agnostic mapping is
 # unambiguous, and -- unlike a per-layer one -- it can live on the class, where
 # `model_runner` reads it *before* the model is constructed. Getting that
 # ordering right matters: remapping the quant config a second time from
 # `__init__` corrupts its layer pattern specs and silently marks every
 # attention projection quantized.
 #
-# Only q/k/v come from the checkpoint. Shard 3 (`g`) is filled after load by
+# Only q/k/v/b come from the checkpoint. Shard 3 (`g`) is filled after load by
 # folding the low-rank `g_b_proj @ g_a_proj`; see
 # `Glm5NextKDAAttention.process_weights_after_loading`.
 _KDA_PACKED_MODULES_MAPPING: dict[str, tuple[str, int]] = {
     ".q_proj": (".in_proj", 0),
     ".k_proj": (".in_proj", 1),
     ".v_proj": (".in_proj", 2),
+    ".b_proj": (".in_proj", 4),
 }
 
 
@@ -529,22 +531,32 @@ class Glm5NextKDAAttention(KimiKDAAttention):
     def process_weights_after_loading(self) -> None:
         if getattr(self, "_in_proj_fused", False):
             return
+        # The fold below casts the bf16 gate into in_proj's g rows. That is only
+        # right for an unquantized in_proj (an online ptpc run is still bf16
+        # here: the parent hook runs before the child quantizes); a statically
+        # quantized one would need the folded rows quantized and scaled too.
+        if self.in_proj.quant_type.value != aiter.QuantType.No.value:
+            raise NotImplementedError(
+                "GLM-5.3 folds its low-rank KDA gate into in_proj in bf16; a "
+                f"statically quantized in_proj ({self.in_proj.quant_type.name}) "
+                "is not supported."
+            )
         # `--load_dummy` never runs a weight_loader, so the shard set is empty
         # by design and this coverage check would refuse to start on all 34 KDA
         # layers. The check exists to catch a checkpoint that silently supplied
-        # only part of q/k/v; with no checkpoint there is nothing to catch. The
+        # only part of q/k/v/b; with no checkpoint there is nothing to catch. The
         # gate fold below still runs, so the layer keeps the same shape and
         # dtype it would have had.
         if not getattr(get_current_atom_config(), "load_dummy", None):
-            missing = {0, 1, 2} - self._loaded_input_shards
+            missing = {0, 1, 2, 4} - self._loaded_input_shards
             if missing:
                 raise RuntimeError(
                     "Incomplete GLM-5.3 KDA input projection: missing "
-                    f"checkpoint shards {sorted(missing)} from q/k/v"
+                    f"checkpoint shards {sorted(missing)} from q/k/v/b"
                 )
-        # in_proj is [q | k | v | g]; the checkpoint only supplied q/k/v, so
-        # write the folded gate into the g shard before the parent appends its
-        # b_proj / f_a_proj tails.
+        # in_proj is [q | k | v | g | b]; the checkpoint only supplied q/k/v/b,
+        # so write the folded gate into the g shard before the parent appends
+        # its f_a_proj tail.
         g = (self.g_b_proj.weight.data.float() @ self.g_a_proj.weight.data.float()).to(
             self.in_proj.weight.dtype
         )

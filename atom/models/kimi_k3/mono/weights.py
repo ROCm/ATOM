@@ -96,7 +96,7 @@ def _plain_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
     _need(
         w.dtype == BF16,
         f"{name} is {w.dtype}: the kernels read bf16, so this projection must "
-        "stay out of the online quant (it is unquantized in the checkpoint)",
+        "be bf16 in the checkpoint and kept out of the online quant",
     )
     _need(not getattr(w, "is_shuffled", False), f"{name} is preshuffled")
     _need(not getattr(module, "is_output_padded", False), f"{name} output padded")
