@@ -123,6 +123,8 @@ from typing import NamedTuple
 
 import torch
 
+from atom.utils import envs
+
 logger = logging.getLogger(__name__)
 
 _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0").lower() in ("1", "true")
@@ -130,7 +132,7 @@ _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0").lower() in ("1", "tru
 _STEP_EMA_WEIGHT = 0.2
 # The reduce buffer: these fixed slots, each rank's prefill cost, then the cost
 # gate's `_Gate` (`PrefillDelayer.__init__`).
-_FIXED_SLOTS = 11
+_FIXED_SLOTS = 12
 
 
 class _Gate(NamedTuple):
@@ -298,6 +300,7 @@ class PrefillDelayer:
         "_stat_hold",
         "_stat_hold_decode_interval",
         "_stat_log_every",
+        "_tier_wait_ticks",
         "admit_policy",
         "cpu_group",
         "dp_size",
@@ -309,6 +312,7 @@ class PrefillDelayer:
         "rank_prefill_costs",
         "stall_ticks",
         "target_fill",
+        "tier_wait_max_ticks",
         "token_usage_low_watermark",
         "ttft_max_ticks",
     )
@@ -471,6 +475,10 @@ class PrefillDelayer:
         # (mirrors SGL PR #19836's skip_first).
         self._first = True
         self._decode_interval_remaining = 0
+        # Ticks the current episode has held for a rank whose waiting head is
+        # blocked only on an offload-tier lookup/load (see `_decide`).
+        self._tier_wait_ticks = 0
+        self.tier_wait_max_ticks = envs.ATOM_PREFILL_TIER_WAIT_TICKS
         self._prefill_executed_since_last_decision = False
 
         # Per-exit fire counters + hold counter for periodic logging. Each exit
@@ -549,6 +557,7 @@ class PrefillDelayer:
         arrived_requests: int = 0,
         next_completion_steps: int | None = None,
         admittable_requests: int | None = None,
+        tier_pending: bool = False,
     ) -> PrefillDecision:
         """Whether this rank may admit new prefills this tick (FIRE), and how
         many ranks have prefill to admit.
@@ -596,6 +605,10 @@ class PrefillDelayer:
                 FIRE could put into this rank's decode batch now: resumable
                 partials plus waiting heads that fit the free seq slots.
                 None falls back to `waiting_requests`.
+            tier_pending: this rank has no admittable prefill only because a
+                waiting head's offload-tier lookup or load is still in flight.
+                Such a rank aligns within a few ticks, so a FIRE that would
+                leave it out holds for it, up to `tier_wait_max_ticks`.
         """
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
@@ -638,6 +651,7 @@ class PrefillDelayer:
         self._reduce_buf[8] = int(arrived_requests)
         self._reduce_buf[9] = 1 if blocked else 0
         self._reduce_buf[10] = 1 if unreachable else 0
+        self._reduce_buf[11] = 1 if (blocked and tier_pending) else 0
         if self._cost_slots:
             self._reduce_buf[_FIXED_SLOTS : self._gate_at] = 0
             self._reduce_buf[_FIXED_SLOTS + self._rank] = int(prefill_cost)
@@ -721,6 +735,7 @@ class PrefillDelayer:
             g_arrived,
             n_blocked,
             n_unreachable,
+            n_tier_pending,
         ) = reduced[:_FIXED_SLOTS]
         if self._cost_gate:
             self._time_step(step_s, prefill_ran_n > 0)
@@ -818,6 +833,19 @@ class PrefillDelayer:
                     _Gate(*reduced[self._gate_at :]), g_running_dec
                 ):
                     return self._fire("cost", g_pending)
+            return self._hold(g_pending)
+
+        # ---- tier-load alignment: a rank counted as blocked only because its
+        # head's tier lookup/load is in flight becomes prefillable within a few
+        # ticks (a load is milliseconds). Firing without it runs a one-rank
+        # prefill now and its own prefill on a later tick, so every decode in
+        # the group is interrupted twice; hold for it, briefly.
+        if (
+            n_tier_pending > 0
+            and n_prefillable < self.dp_size
+            and self._tier_wait_ticks < self.tier_wait_max_ticks
+        ):
+            self._tier_wait_ticks += 1
             return self._hold(g_pending)
 
         # ---- goal: fire once the aggregate fills a worthwhile forward ----
@@ -1022,6 +1050,7 @@ class PrefillDelayer:
         return False
 
     def _reset(self) -> None:
+        self._tier_wait_ticks = 0
         self._hold_ticks = 0
         self._stall_count = 0
         self._prev_pending = -1
