@@ -267,6 +267,13 @@ def config_refusal(atom_config) -> str | None:
         # DCP: the kernel decodes every head of the DCP group on each rank and
         # merges the latent across them (``kernels.kernel.dcp_merge_latent``)
         (dcp == 1 or (dcp == tp_size == 4), f"DCP {dcp} with TP {tp_size}"),
+        # Only the measured shape is served under DCP: MTP3, i.e. decode
+        # widths 4 / 8. No speculation (widths 1 / 2) and MTP4 / MTP5 (5, 6,
+        # 10, 12) are untested there and keep the production DCP path.
+        (
+            dcp == 1 or query_length == 4,
+            f"DCP with decode width {query_length} (untested)",
+        ),
         (
             dcp == 1 or atom_config.dcp_config.interleave_size == 1,
             "DCP interleave size above 1",

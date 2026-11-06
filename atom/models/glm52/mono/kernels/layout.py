@@ -256,6 +256,16 @@ def dcp_split_groups(samples: int, heads: int, topk: int, dcp_size: int) -> int:
     return g
 
 
+def dcp_split_task(tt, samples: int, split_blocks: int, split_groups: int):
+    """(key split, sample, first head group) of DCP split task ``tt``.
+
+    Numbered split-major, so the splits holding a rank's keys come first and
+    spread over the grid; a task runs ``split_groups`` head groups."""
+    t = tt // (samples * split_blocks)
+    blk = tt % (samples * split_blocks)
+    return t, blk // split_blocks, (blk % split_blocks) * split_groups
+
+
 def sample_wave_batches(samples: int) -> int:
     return (samples + WAVES - 1) // WAVES
 
@@ -506,7 +516,8 @@ def stage_tasks(
     and ``uv`` covers only the owned heads.
 
     ``split_head_merge`` folds the two head groups of an (sample, key-chunk)
-    cell into one task, halving ``split``. It must be given the same value the
+    cell into one task, halving ``split``; under DCP it is ignored and
+    ``dcp_split_groups`` sets the head groups a task runs. It must be given the same value the
     kernel was built with: these counts set the CTA placement rotation and the
     timeline's per-stage offsets, so a disagreement silently mis-seats both.
     """

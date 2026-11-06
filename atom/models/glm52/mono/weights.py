@@ -12,7 +12,6 @@ is silent wrong numerics on a GPU, not a compile error.
 from __future__ import annotations
 
 import torch
-from aiter import dtypes
 
 from atom.models.glm52.mono.kernels.geometry_config import (
     EPS,
@@ -90,6 +89,8 @@ def _block128_fp8(
         rows % 128 == 0 and cols % 128 == 0,
         f"{name} must align to 128x128 scale blocks, got {(rows, cols)}",
     )
+    from aiter import dtypes
+
     fp8_max = torch.finfo(dtypes.fp8).max
     blocked = matrix.to(torch.float32).view(rows // 128, 128, cols // 128, 128)
     amax = blocked.abs().amax(dim=(1, 3)).clamp_min(1e-4)

@@ -13,9 +13,9 @@ from test_mono_config import _served_tp4_fp8_config
 from atom.models.glm52.mono.config import config_refusal
 
 
-def _dcp_config(dcp=4, tp=4, interleave=1, qrep=True):
+def _dcp_config(dcp=4, tp=4, interleave=1, qrep=True, mtp=3):
     cfg = _served_tp4_fp8_config(
-        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=3)
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=mtp)
     )
     cfg.tensor_parallel_size = tp
     cfg.decode_context_parallel_size = dcp
@@ -26,13 +26,13 @@ def _dcp_config(dcp=4, tp=4, interleave=1, qrep=True):
 
 
 @pytest.fixture
-def dcp_on(monkeypatch):
+def gfx950(monkeypatch):
     monkeypatch.setattr(
         "atom.models.glm52.mono.config._is_gfx950", lambda: True, raising=True
     )
 
 
-def test_dcp_equal_to_tp4_is_served(dcp_on):
+def test_dcp_equal_to_tp4_is_served(gfx950):
     assert config_refusal(_dcp_config()) is None
 
 
@@ -41,19 +41,29 @@ def test_dcp_equal_to_tp4_is_served(dcp_on):
     [
         ({"dcp": 2}, "DCP 2 with TP 4"),
         ({"interleave": 2}, "interleave"),
+        ({"mtp": 4}, "decode width 5 (untested)"),
+        ({"mtp": 5}, "decode width 6 (untested)"),
     ],
 )
-def test_any_other_dcp_deployment_is_refused_by_name(dcp_on, over, why):
+def test_any_other_dcp_deployment_is_refused_by_name(gfx950, over, why):
     refusal = config_refusal(_dcp_config(**over))
     assert refusal is not None and why in refusal
 
 
-def test_dcp_without_query_replication_is_served(dcp_on):
+def test_dcp_without_speculation_is_refused(gfx950):
+    """Widths 1 / 2 under DCP have not run on a GPU."""
+    cfg = _dcp_config()
+    cfg.speculative_config = None
+    refusal = config_refusal(cfg)
+    assert refusal is not None and "decode width 1 (untested)" in refusal
+
+
+def test_dcp_without_query_replication_is_served(gfx950):
     """The kernel computes q for its own heads either way."""
     assert config_refusal(_dcp_config(qrep=False)) is None
 
 
-def test_dcp_at_tp8_is_refused(dcp_on):
+def test_dcp_at_tp8_is_refused(gfx950):
     """The kernel's geometry takes DCP 4 only (``glm5_attention_heads``)."""
     refusal = config_refusal(_dcp_config(dcp=8, tp=8))
     assert refusal is not None and "DCP 8 with TP 8" in refusal
@@ -277,6 +287,7 @@ def test_dcp_q_buffers_hold_every_head_in_two_slots_past_the_merge(samples):
 def test_the_runner_hands_the_kernel_the_dcp_indptr_under_dcp():
     """The global indptr under DCP would have the kernel read global slots
     from this rank's local cache: every layer's attention silently wrong."""
+    pytest.importorskip("aiter")
     from atom.models.glm52.mono.runner import Glm52MonoRunner
 
     local = torch.arange(65, dtype=torch.int32)
@@ -323,3 +334,34 @@ def test_the_split_table_without_dcp_is_unchanged():
             stage_tasks(8, 16, 2048, npes=4, inter=512, split_head_merge=merge)
         )
         assert tasks["split"] == 8 * blocks * 32
+
+
+@pytest.mark.parametrize("samples", [1, 2, 4, 5, 6, 8, 10, 12])
+def test_dcp_split_tasks_cover_every_cell_once_keys_first(samples):
+    """Each (key split, sample, head group) cell is run by exactly one task,
+    and the tasks of the splits a rank holds keys for come before the rest,
+    so ``(tt + base) mod 256`` spreads them over the grid."""
+    from atom.models.glm52.mono.kernels.layout import (
+        dcp_split_groups,
+        dcp_split_task,
+        stage_tasks,
+    )
+
+    groups = dcp_split_groups(samples, 64, 2048, 4)
+    blocks, n_split, live = 8 // groups, 64, 16
+    n = dict(
+        stage_tasks(
+            samples, 64, 2048, npes=4, inter=512, split_head_merge=True, dcp_size=4
+        )
+    )["split"]
+    cells = [dcp_split_task(tt, samples, blocks, groups) for tt in range(n)]
+    want = {
+        (t, s, b * groups)
+        for t in range(n_split)
+        for s in range(samples)
+        for b in range(blocks)
+    }
+    assert len(cells) == len(set(cells)) and set(cells) == want
+    first = samples * blocks * live
+    assert all(t < live for t, _, _ in cells[:first])
+    assert all(t >= live for t, _, _ in cells[first:])

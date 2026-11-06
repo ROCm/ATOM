@@ -497,6 +497,8 @@ class Glm52MonoRunner:
                 raise MonoUnsupported("layer backend")
             if self._dcp > 1:
                 # the kernel takes its TP rank and peer table as the DCP group's
+                # (and places a rank's q at head rank * 16 + h); with DCP == TP
+                # required by ``config_refusal`` this cannot fire today
                 from atom.distributed.dcp_utils import get_dcp_group
 
                 if get_dcp_group() is not get_tp_group():

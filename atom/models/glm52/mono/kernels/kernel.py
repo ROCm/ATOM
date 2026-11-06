@@ -112,6 +112,7 @@ from atom.models.glm52.mono.kernels.layout import (
     XQ_GROUPS,
     XQ_WAVES,
     dcp_split_groups,
+    dcp_split_task,
     dcp_summary_index,
     dn_tile,
     down_prefetch_batch,
@@ -2980,14 +2981,12 @@ def build_glm5_monokernel(
             SPLIT_QH = SPLIT_GROUPS * WAVES
             QH_STRIDE = WAVES
         SPLIT_BLOCKS = N_HEAD_GROUPS // SPLIT_GROUPS
+        assert S * SPLIT_BLOCKS * N_SPLIT == tasks["split"]
         for tt in range(start("split"), S * (N_HEAD_GROUPS // SPLIT_GROUPS) * N_SPLIT, G):
             tt = fx.Int32(tt)
             stamp("split", tt, 0)
             if const_expr(D > 1):
-                t = tt // (S * SPLIT_BLOCKS)
-                blk = tt % (S * SPLIT_BLOCKS)
-                s = blk // SPLIT_BLOCKS
-                hg0 = (blk % SPLIT_BLOCKS) * SPLIT_GROUPS
+                t, s, hg0 = dcp_split_task(tt, S, SPLIT_BLOCKS, SPLIT_GROUPS)
             else:
                 if const_expr(SPLIT_MERGE):
                     s = tt // N_SPLIT
@@ -3002,19 +3001,29 @@ def build_glm5_monokernel(
                 gather_old_kv()  # before waiting for q: these rows are from earlier launches
                 if const_expr(True):
                     N_PE_T = PE_DIM // Q_B_TILE
-                    hint_wait(
-                        N_UK + H * N_PE_T + 1,
-                        lambda k: (
-                            (k < N_UK).select(
+                    # q of all H heads: uk / q_b tasks of every rank under DCP
+                    N_QL = H * UK_PER_HEAD
+
+                    def q_hint_base(k):
+                        if const_expr(D == 1):
+                            return (k < N_QL).select(
                                 fx.Int64(SC["q_lat"]),
-                                (k < N_UK + H * N_PE_T).select(fx.Int64(SC["q_pe"]), fx.Int64(SC["penew"])),
-                            )
-                            + scratch,
-                            (k < N_UK).select(
+                                (k < N_QL + H * N_PE_T).select(fx.Int64(SC["q_pe"]), fx.Int64(SC["penew"])),
+                            ) + scratch
+                        return (k < N_QL).select(
+                            cp_buffer("q_lat", sym),
+                            (k < N_QL + H * N_PE_T).select(cp_buffer("q_pe", sym), mb("penew")),
+                        )
+
+                    hint_wait(
+                        N_QL + H * N_PE_T + 1,
+                        lambda k: (
+                            q_hint_base(k),
+                            (k < N_QL).select(
                                 (s * H + k // UK_PER_HEAD) * KV_LORA + (k % UK_PER_HEAD) * UK_TILE + UK_TILE - 1,
-                                (k < N_UK + H * N_PE_T).select(
-                                    (s * H + (k - N_UK) // N_PE_T) * PE_DIM
-                                    + ((k - N_UK) % N_PE_T) * Q_B_TILE
+                                (k < N_QL + H * N_PE_T).select(
+                                    (s * H + (k - N_QL) // N_PE_T) * PE_DIM
+                                    + ((k - N_QL) % N_PE_T) * Q_B_TILE
                                     + Q_B_TILE
                                     - 1,
                                     s * PE_DIM + PE_DIM - 1,
@@ -3246,6 +3255,7 @@ def build_glm5_monokernel(
 
         if const_expr(D > 1):
             # each (sample, head) partial latent once, to its owner only
+            assert S * H == tasks["uvl"]
             for tt in range(start("uvl"), S * H, G):
                 tt = fx.Int32(tt)
                 stamp("uvl", tt, 0)
@@ -3260,6 +3270,7 @@ def build_glm5_monokernel(
                 stamp("uvl", tt, 4)
 
         N_UV_OWN = L * V_DIM // UV_TILE
+        assert S * N_UV_OWN == tasks["uv"]
         for tt in range(start("uv"), S * N_UV_OWN, G):
             tt = fx.Int32(tt)
             stamp("uv", tt, 0)
