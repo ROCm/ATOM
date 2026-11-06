@@ -374,7 +374,8 @@ def build_page_namespace(
     # are per-process.
     speculative = getattr(config, "offload_speculative_config", None)
     if speculative is None:
-        speculative = _stable_config_value(getattr(config, "speculative_config", None))
+        speculative = getattr(config, "speculative_config", None)
+    speculative = _stable_config_value(speculative)
     document = {
         "schema": "atom-page-namespace",
         "layout_version": layout_version,

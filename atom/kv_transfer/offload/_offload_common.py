@@ -801,7 +801,7 @@ class OffloadSchedulerMixin(ABC):
         if self._tier_hit_memo:
             self._tier_hit_memo.pop(sid, None)
 
-    def _ensure_lookup_pin(self, seq, sid: str, spec) -> bool:
+    def _ensure_lookup_pin(self, seq, sid: str, spec) -> bool | None:
         """Re-take the worker-side lookup pin before a load is committed.
 
         An answer served from the remembered hit carries no pin: the metadata
@@ -812,7 +812,9 @@ class OffloadSchedulerMixin(ABC):
         the step that turns a load spec into a dispatched retrieve asks the tier
         for real, and the load stands only if the tier still holds at least what
         the spec promised. If it holds less -- evicted in the steps since -- this
-        answers False and the caller drops the load (reopening its saves): the
+        answers False, and None if the lookup did not answer (a timeout or an
+        RPC error); the caller drops the load either way, and reopens its saves
+        only on False, when the tier has lost what the request recomputes. The
         request prefills, which is what would have happened with no tier at all.
 
         Confirming rather than re-deriving is deliberate: by this point the spec
@@ -848,7 +850,7 @@ class OffloadSchedulerMixin(ABC):
                 hit,
                 int(spec.lmcache_cached_tokens),
             )
-            return False
+            return None if hit is None else False
         return True
 
     def _repeat_load_suppressed(self, seq, sid: str) -> bool:

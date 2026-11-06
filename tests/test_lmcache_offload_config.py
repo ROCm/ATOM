@@ -71,6 +71,18 @@ def test_page_namespace_hashes_a_frontends_stable_speculative_form_even_empty():
     ) == offcfg.build_page_namespace(second, _lmcache_config(), 4)
 
 
+def test_page_namespace_stabilises_a_frontends_speculative_form():
+    """The frontend's form goes through the same canonical encoding: a dtype
+    hashes as its name, and a non-finite value is refused."""
+    torch = pytest.importorskip("torch")
+    config = _config()
+    config.offload_speculative_config = {"dtype": torch.bfloat16}
+    offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    config.offload_speculative_config = {"acceptance": float("nan")}
+    with pytest.raises(ValueError, match="finite"):
+        offcfg.build_page_namespace(config, _lmcache_config(), 4)
+
+
 def test_page_namespace_supports_torch_dtype_in_speculative_config():
     torch = pytest.importorskip("torch")
     config = _config()

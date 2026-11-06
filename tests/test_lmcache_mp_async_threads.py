@@ -335,17 +335,36 @@ def test_a_failed_poll_round_stops_the_polling(caplog):
 
     thread = transfer_thread._TransferThread("mp-transfer-test", poll=poll)
     try:
-        thread.look(0)
-        time.sleep(3 * transfer_thread._IDLE_POLL_S)
-        thread.look(0)
-        assert thread.drain(5.0)
-        time.sleep(0.02)
+        assert thread.wait_round(thread.request_round(), 5.0)
+        assert not thread.wait_round(thread.request_round(), 5.0)
         assert len(rounds) == 1
         assert caplog.text.count("transfer poll failed") == 1
         # Raised on every call: nothing else would report what is left.
         for _ in range(2):
             with pytest.raises(RuntimeError, match="transfer deadline"):
                 thread.raise_error()
+    finally:
+        thread.close(5.0)
+
+
+def test_the_polling_timer_runs_only_while_transfers_are_in_flight():
+    """Idle, a rank's thread waits for a submission or a request; with a
+    transfer in flight it polls on its own, for a rank that stopped stepping."""
+    in_flight = [False]
+    rounds = []
+
+    def poll(_thread):
+        rounds.append(1)
+        return in_flight[0]
+
+    thread = transfer_thread._TransferThread("mp-transfer-test", poll=poll)
+    try:
+        assert thread.wait_round(thread.request_round(), 5.0)
+        time.sleep(4 * transfer_thread._IDLE_POLL_S)
+        assert len(rounds) == 1
+        in_flight[0] = True
+        target = thread.request_round()
+        assert thread.wait_round(target + 2, 5.0)
     finally:
         thread.close(5.0)
 

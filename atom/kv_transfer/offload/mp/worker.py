@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from collections import deque
 from collections.abc import Callable
 from typing import Any
@@ -55,7 +54,6 @@ from atom.kv_transfer.offload.mp.native_state_layout import (
 )
 from atom.kv_transfer.offload.mp.page_views import _build_cache_views
 from atom.kv_transfer.offload.mp.transfer import (
-    LMCacheTransferUnprovable,
     _chunk_ranges,
     _enforce_transfer_deadline,
     _PendingLoad,
@@ -88,10 +86,18 @@ _LAST_LOOK_WAIT_S = 0.001
 # once this many are held.
 _RETURNED_FUTURES_CAP = 8192
 _RETURNED_FUTURES_BATCH = 64
-# How long past a transfer's deadline the forward thread waits for a polling
-# round before it fail-stops the transfer itself: a round enforces deadlines,
-# but runs only between submissions.
-_POLL_STALL_GRACE_S = 1.0
+
+
+def _takes_recorded_events(adapter: Any) -> bool:
+    return bool(getattr(type(adapter), "ACCEPTS_RECORDED_PRODUCER_EVENTS", False))
+
+
+def _records_its_own_events(adapter: Any) -> bool:
+    """It would record its pooled event on the submitting thread's stream, not
+    behind the forward."""
+    return getattr(adapter, "_producer_events", None) is not None and not (
+        _takes_recorded_events(adapter)
+    )
 
 
 class LMCacheMPConnector(KVConnectorBase):
@@ -224,6 +230,7 @@ class LMCacheMPConnector(KVConnectorBase):
             for layer_indices in views.layer_groups
         ]
         try:
+            self._refuse_unfenceable_adapter(adapter)
             adapter.register_kv_caches(views.tensors, engine_group_infos=groups)
             chunk_size = offcfg._strict_integer(
                 "LMCache MP chunk size",
@@ -296,6 +303,7 @@ class LMCacheMPConnector(KVConnectorBase):
             self._config, rank, checkpoint_spec=spec, images=images
         )
         try:
+            self._refuse_unfenceable_adapter(adapter)
             require_native_state_server(adapter, self._config)
             chunk_size = int(adapter.lmcache_tokens_per_chunk)
             layout = build_native_state_mp_layout(
@@ -345,8 +353,18 @@ class LMCacheMPConnector(KVConnectorBase):
         if transfer is not None:
             # Queued submissions go out first: shutdown drains only what the
             # adapter already holds.
-            transfer.close(_TRANSFER_DRAIN_TIMEOUT_S)
+            stopped = transfer.close(_TRANSFER_DRAIN_TIMEOUT_S)
             self._transfer = None
+            if not stopped:
+                # Still inside a submit or a poll on this adapter's futures:
+                # leave it registered for the server's reaper rather than tear
+                # it down under a live thread.
+                logger.error(
+                    "LMCache MP transfer thread did not stop within %.0fs; "
+                    "skipping the adapter shutdown",
+                    _TRANSFER_DRAIN_TIMEOUT_S,
+                )
+                return
         adapter, self._adapter = self._adapter, None
         if adapter is None:
             return
@@ -427,15 +445,7 @@ class LMCacheMPConnector(KVConnectorBase):
         off_step = self._transfers_off_step
         if not off_step and not envs.OFFLOAD_MP_TRANSFER_THREAD:
             return
-        if self._adapter_records_its_own_events():
-            if off_step:
-                # Inline, transfers would be safe but nothing could fence them.
-                raise RuntimeError(
-                    f"LMCache MP adapter {type(self._adapter).__name__} records "
-                    "producer events at submission, so its transfers cannot "
-                    "leave the forward thread, and this frontend's preemption "
-                    "fence needs them to"
-                )
+        if _records_its_own_events(self._adapter):
             logger.warning(
                 "LMCache MP adapter %s records producer events at submission; "
                 "transfers stay on the forward thread",
@@ -450,22 +460,21 @@ class LMCacheMPConnector(KVConnectorBase):
             "LMCache MP transfer thread started rank=%d polls=%s", rank, off_step
         )
 
-    def _adapter_records_its_own_events(self) -> bool:
-        """It would record its pooled event on the submitting thread's stream,
-        not behind the forward."""
-        return (
-            getattr(self._adapter, "_producer_events", None) is not None
-            and not self._adapter_takes_recorded_events()
-        )
-
-    def _adapter_takes_recorded_events(self) -> bool:
-        return bool(
-            getattr(type(self._adapter), "ACCEPTS_RECORDED_PRODUCER_EVENTS", False)
-        )
+    def _refuse_unfenceable_adapter(self, adapter: Any) -> None:
+        """Before registration: a worker built to run transfers off the step
+        cannot take an adapter that records its own producer events, which
+        keeps them on the forward thread, where nothing could fence them."""
+        if self._transfers_off_step and _records_its_own_events(adapter):
+            raise RuntimeError(
+                f"LMCache MP adapter {type(adapter).__name__} records producer "
+                "events at submission, so its transfers cannot leave the "
+                "forward thread, and this frontend's preemption fence needs "
+                "them to"
+            )
 
     def _submit_kwargs(self) -> dict[str, Any]:
         """Tell an adapter that can hear it the fence is recorded and reused."""
-        if self._fences is not None and self._adapter_takes_recorded_events():
+        if self._fences is not None and _takes_recorded_events(self._adapter):
             return {"producer_event_recorded": True}
         return {}
 
@@ -527,31 +536,15 @@ class LMCacheMPConnector(KVConnectorBase):
                 transfer.take_returned(_RETURNED_FUTURES_BATCH)
         transfer.raise_error()
         if transfer.polls:
-            self._enforce_stalled_deadlines(transfer.last_round_at)
-
-    def _enforce_stalled_deadlines(self, last_round_at: float) -> None:
-        """Fail-stop a transfer whose deadline no polling round has checked.
-
-        Rounds enforce every pending transfer's deadline, but run only between
-        submissions on the same thread, so a submit that never returns stops
-        them. A transfer past its deadline with no round since is stopped here,
-        on the forward thread.
-        """
-        now = time.monotonic()
-        with self._lock:
-            pending = [*self._pending_saves.items(), *self._pending_loads.items()]
-        for operation_id, entry in pending:
-            due = entry.started_at + self._transfer_deadline_s
-            if last_round_at < due and now >= due + _POLL_STALL_GRACE_S:
-                message = (
-                    f"LMCache MP transfer {operation_id} passed its "
-                    f"{self._transfer_deadline_s:.0f}s deadline and the transfer "
-                    "thread has run no poll round since; its memory cannot be "
-                    "released without proof that the server stopped, so the "
-                    "engine is stopping."
+            # A round enforces deadlines too, but rounds run between
+            # submissions on that thread: a submit that never returns would
+            # stop them.
+            with self._lock:
+                pending = [*self._pending_saves.items(), *self._pending_loads.items()]
+            for operation_id, entry in pending:
+                _enforce_transfer_deadline(
+                    operation_id, entry.started_at, self._transfer_deadline_s
                 )
-                logger.error(message)
-                raise LMCacheTransferUnprovable(message)
 
     def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:
         if start < 0 or end < start:
@@ -908,12 +901,13 @@ class LMCacheMPConnector(KVConnectorBase):
             if retire is not None:
                 retire(pending.future)
 
-    def _poll_round(self, transfer: _TransferThread) -> None:
+    def _poll_round(self, transfer: _TransferThread) -> bool:
         """One round on the polling transfer thread ``transfer``.
 
         Polls without `_lock` and settles what finished into `_polled` for
         `get_finished`, handing each finished future back to ``transfer``
         itself: the round may still run while `close` shuts that thread down.
+        Returns whether transfers are still in flight.
         """
         with self._lock:
             saves = list(self._pending_saves.items())
@@ -925,6 +919,7 @@ class LMCacheMPConnector(KVConnectorBase):
             self._settle_terminal_locked(
                 terminal_saves, terminal_loads, self._polled, transfer.hand_back
             )
+            return self._transfers_in_flight_locked()
 
     def _transfers_in_flight_locked(self) -> bool:
         return bool(self._pending_loads or self._pending_saves or self._queued_requests)

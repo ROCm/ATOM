@@ -93,5 +93,5 @@ def settle(worker) -> None:
     if transfer is not None and transfer.polls:
         assert transfer.drain(5.0), "queued submissions did not go out"
         assert (
-            transfer._wait_round(5.0) or transfer._poll_failed
+            transfer.wait_round(transfer.request_round(), 5.0) or transfer._poll_failed
         ), "no transfer-thread round finished"

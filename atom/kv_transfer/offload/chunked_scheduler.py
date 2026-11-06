@@ -822,11 +822,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # This is the one place a retrieve is handed to the worker, so it
             # is where the load's lookup pin has to be live -- a spec derived
             # from a remembered hit has none yet.
-            if not self._ensure_lookup_pin(seq, sid, ls):
+            pinned = self._ensure_lookup_pin(seq, sid, ls)
+            if not pinned:
                 self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
-                # The tier no longer holds the prefix this request recomputes.
-                # `_ensure_lookup_pin` only answers; the drop is done here.
-                self._reopen_saves(sid)
+                if pinned is False:
+                    # The tier answered less: it no longer holds the prefix
+                    # this request recomputes. (None: the lookup did not answer,
+                    # and the tier most likely still does.)
+                    self._reopen_saves(sid)
                 self._clear_pending_load(sid)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.

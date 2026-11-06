@@ -19,16 +19,16 @@ Two things never happen on this thread:
 
 Given a ``poll`` callable (the vLLM plugin's worker), the thread also polls
 pending transfers: whenever its queue runs dry, when the forward thread asks
-(`look`, `fence`), and every `_IDLE_POLL_S` otherwise. An asked-for round runs
-after the submission in progress, whatever is still queued, so a backlog of
-submissions delays neither a finished load's report nor a fence. Submits and
-terminal polls (the IPC handle import) both cost the forward thread
-milliseconds under its own launch pressure. A failed round stops the polling;
-the forward thread raises the failure. A future a poll finished holds the
-server's imported IPC event, so it is handed back (`hand_back`) for the forward
-thread to drop once nothing else holds it (`take_returned`): LMCache keeps each
-future until its next submission, on this thread. Native ATOM polls on its
-forward thread.
+(`look`, `fence`), and every `_IDLE_POLL_S` while transfers are in flight. An
+asked-for round runs after the submission in progress, whatever is still
+queued, so a backlog of submissions delays neither a finished load's report
+nor a fence. Submits and terminal polls (the IPC handle import) both cost the
+forward thread milliseconds under its own launch pressure. A failed round stops
+the polling; the forward thread raises the failure on every step. A future a
+poll finished holds the server's imported IPC event, so it is handed back
+(`hand_back`) for the forward thread to drop once nothing else holds it
+(`take_returned`): LMCache keeps each future until its next submission, on this
+thread. Native ATOM polls on its forward thread.
 """
 
 from __future__ import annotations
@@ -52,9 +52,9 @@ logger = logging.getLogger("atom")
 _FENCE_MAX_RECORDS = 31
 # Poll period while a queued submission waits for its fence to complete.
 _READY_POLL_S = 0.0005
-# With ``poll``: the round period when nothing wakes the thread, a backstop for
-# a rank that has stopped stepping. Rounds are otherwise asked for by the
-# forward thread, never run on a short timer.
+# With ``poll`` and transfers in flight: the round period when nothing wakes the
+# thread, a backstop for a rank that has stopped stepping. Rounds are otherwise
+# asked for by the forward thread, never run on a short timer.
 _IDLE_POLL_S = 0.05
 # Queued to wake a polling thread for a round; runs no call.
 _WAKE = object()
@@ -109,11 +109,13 @@ class _TransferThread:
     """Runs queued transfer submissions in order on one thread.
 
     With ``poll``, also a round of polls whenever the queue runs dry or the
-    forward thread asks for one (`look`, `fence`).
+    forward thread asks for one (`request_round`). ``poll`` gets this thread
+    and returns whether transfers are still in flight; only then does the
+    thread poll on a timer too.
     """
 
     def __init__(
-        self, name: str, poll: Callable[[_TransferThread], None] | None = None
+        self, name: str, poll: Callable[[_TransferThread], bool] | None = None
     ) -> None:
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
         self._idle = threading.Condition()
@@ -122,11 +124,14 @@ class _TransferThread:
         self._spent_lock = threading.Lock()
         self._error: BaseException | None = None
         self._poll = poll
+        # Round numbers: the last started, the last ended, and the one the
+        # forward thread has asked for, which runs after the submission in
+        # progress.
         self._rounds_started = 0
         self._rounds_done = 0
-        self._round_asked = False
+        self._rounds_requested = 0
         self._poll_failed = False
-        self._last_round_at = time.monotonic()
+        self._in_flight = False
         self._returned: deque[Any] = deque()
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._thread.start()
@@ -134,11 +139,6 @@ class _TransferThread:
     @property
     def polls(self) -> bool:
         return self._poll is not None
-
-    @property
-    def last_round_at(self) -> float:
-        """When the last poll round ended (`time.monotonic`)."""
-        return self._last_round_at
 
     def submit(
         self,
@@ -214,16 +214,36 @@ class _TransferThread:
                     self._returned.append(future)
         return unshared
 
+    def request_round(self) -> int:
+        """Ask for a round after the submission in progress; its number."""
+        with self._idle:
+            target = self._rounds_started + 1
+            self._rounds_requested = max(self._rounds_requested, target)
+        self._queue.put(_WAKE)
+        return target
+
+    def wait_round(self, target: int, timeout: float) -> bool:
+        """Wait for round ``target`` to end. False on timeout, or when no
+        round will: the thread stopped, or its polling failed."""
+        with self._idle:
+            self._idle.wait_for(
+                lambda: self._rounds_done >= target
+                or self._poll_failed
+                or not self._thread.is_alive(),
+                timeout=timeout,
+            )
+            return self._rounds_done >= target
+
     def look(self, wait_s: float) -> None:
-        """Ask for a poll round, and wait up to ``wait_s`` for it when it is a
-        pure poll: nothing queued to submit and no round running. A round that
-        has to submit first outlasts any wait short enough for a step; what it
+        """Ask for a round, and wait up to ``wait_s`` for it when it is a pure
+        poll: nothing queued to submit and no round running. A round that has
+        to submit first outlasts any wait short enough for a step; what it
         settles is reported on a later step."""
         with self._idle:
             pure = self._outstanding == 0 and self._rounds_done == self._rounds_started
-        target = self._ask_round()
+        target = self.request_round()
         if wait_s > 0 and pure:
-            self._wait_for_round(target, wait_s)
+            self.wait_round(target, wait_s)
 
     def fence(
         self,
@@ -245,7 +265,7 @@ class _TransferThread:
             left = outstanding()
             if not left:
                 return
-            if not self._thread.is_alive() or self._poll_failed:
+            if not self._thread.is_alive():
                 raise RuntimeError(
                     f"LMCache MP fence for {what}: no transfer thread polls {left}"
                 )
@@ -255,43 +275,21 @@ class _TransferThread:
                     f"LMCache MP fence for {what} timed out after {deadline_s:.0f}s, "
                     f"the transfer deadline, with {len(left)} transfer(s) in flight"
                 )
-            self._wait_round(min(remaining, _IDLE_POLL_S))
-
-    def _ask_round(self) -> int:
-        """Ask for a round after the submission in progress; its number."""
-        with self._idle:
-            self._round_asked = True
-            target = self._rounds_started + 1
-        self._queue.put(_WAKE)
-        return target
-
-    def _wait_for_round(self, target: int, timeout: float) -> bool:
-        with self._idle:
-            return (
-                self._idle.wait_for(
-                    lambda: self._rounds_done >= target
-                    or self._poll_failed
-                    or not self._thread.is_alive(),
-                    timeout=timeout,
-                )
-                and self._rounds_done >= target
-            )
-
-    def _wait_round(self, timeout: float) -> bool:
-        """Ask for a round and wait for it: one that starts after this call."""
-        return self._wait_for_round(self._ask_round(), timeout)
+            self.wait_round(self.request_round(), min(remaining, _IDLE_POLL_S))
 
     def drain(self, timeout: float | None = None) -> bool:
         """Wait until every queued submission has run. False on timeout."""
         with self._idle:
             return self._idle.wait_for(lambda: self._outstanding == 0, timeout)
 
-    def close(self, timeout: float | None = None) -> None:
+    def close(self, timeout: float | None = None) -> bool:
+        """Submit what is queued, stop, and join; whether the thread stopped."""
         if not self._thread.is_alive():
-            return
+            return True
         self.drain(timeout)
         self._queue.put(None)
         self._thread.join(timeout)
+        return not self._thread.is_alive()
 
     @staticmethod
     def _wait_ready(ready: Callable[[], bool]) -> None:
@@ -309,8 +307,10 @@ class _TransferThread:
     def _run(self) -> None:
         while True:
             try:
+                # On a timer only while transfers are in flight: with none, a
+                # submission or a request wakes the thread.
                 item = self._queue.get(
-                    timeout=_IDLE_POLL_S if self._poll is not None else None
+                    timeout=_IDLE_POLL_S if self._in_flight else None
                 )
             except queue.Empty:
                 item = _WAKE
@@ -336,17 +336,16 @@ class _TransferThread:
             if self._poll is None or self._poll_failed:
                 continue
             with self._idle:
-                asked = self._round_asked
+                asked = self._rounds_requested > self._rounds_started
             if asked or self._queue.empty():
                 self._poll_round()
 
     def _poll_round(self) -> None:
         with self._idle:
-            self._round_asked = False
             self._rounds_started += 1
             number = self._rounds_started
         try:
-            self._poll(self)
+            self._in_flight = bool(self._poll(self))
         except BaseException as exc:  # re-raised by raise_error
             # A transfer deadline is fail-stop, and only the forward thread can
             # stop the engine. Another round would only fail and log again.
@@ -355,7 +354,6 @@ class _TransferThread:
         finally:
             with self._idle:
                 self._rounds_done = number
-                self._last_round_at = time.monotonic()
                 self._idle.notify_all()
 
 

@@ -320,24 +320,15 @@ def test_auto_rank_collapse_distinguishes_glm52_mla_from_minimax_m3_gqa():
     assert deployment._tp_replication_factor(minimax) == 1
 
 
-def _kimi_k3_config(**kwargs):
-    k3 = _config(model_type="kimi_k3", tp=8, **kwargs)
-    k3.hf_config.text_config = SimpleNamespace(
-        model_type="kimi_linear",
-        kv_lora_rank=512,
-        num_attention_heads=16,
-        num_key_value_heads=4,
-        num_hidden_layers=2,
-        hidden_size=2048,
-        head_dim=128,
-    )
-    return k3
-
-
 def test_auto_rank_collapse_keeps_kimi_k3_per_rank():
-    # K3's MLA KV is replicated, but the KDA checkpoints ride in the same PAGE
-    # units and hold TP-sharded heads, so the unit as a whole is not.
-    assert deployment._tp_replication_factor(_kimi_k3_config()) == 1
+    # MLA KV is replicated, but the KDA checkpoint images stored in the same
+    # PAGE units hold TP-sharded heads.
+    k3 = _config(model_type="kimi_k3", tp=8)
+    k3.hf_config.text_config = SimpleNamespace(
+        model_type="kimi_linear", kv_lora_rank=512
+    )
+
+    assert deployment._tp_replication_factor(k3) == 1
 
 
 def test_tp_rank_collapse_can_be_disabled_and_rejects_bad_values():
@@ -2339,7 +2330,7 @@ def _checkpointed_transfer_tensors(*, num_blocks: int = 16) -> KVTransferTensors
     return transfer
 
 
-def _register_checkpointed(monkeypatch):
+def _register_checkpointed(monkeypatch, adapter=None, *, off_step=False):
     """A base worker registered on a layout that publishes checkpoint images."""
     aiter = types.ModuleType("aiter")
     aiter.__path__ = []
@@ -2351,7 +2342,7 @@ def _register_checkpointed(monkeypatch):
     monkeypatch.setitem(sys.modules, "aiter.dist", dist)
     monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
 
-    adapter = _WorkerAdapter()
+    adapter = _WorkerAdapter() if adapter is None else adapter
     namespaces = []
 
     def connect(_config, _rank, **kwargs):
@@ -2360,7 +2351,7 @@ def _register_checkpointed(monkeypatch):
 
     monkeypatch.setattr(mp_worker, "_make_worker_adapter", connect)
     monkeypatch.setattr(mp_worker, "require_native_state_server", lambda *_a: None)
-    worker = mp_worker.LMCacheMPConnector(_config())
+    worker = mp_worker.LMCacheMPConnector(_config(), transfers_off_step=off_step)
     worker.register_kv_caches({}, _checkpointed_transfer_tensors(), 16)
     adapter.namespaces = namespaces
     return worker, adapter
@@ -2518,14 +2509,17 @@ def test_off_step_fences_come_from_the_bounded_event_pool(fake_lmcache_modules):
 
 
 def test_off_step_transfers_refuse_an_adapter_that_records_its_own_event(
-    fake_lmcache_modules,
+    fake_lmcache_modules, monkeypatch
 ):
     """Its pooled event would be recorded on the transfer thread's stream, not
-    behind the forward; inline, nothing could fence a preempted request."""
+    behind the forward; inline, nothing could fence a preempted request. Refused
+    before the server registration, which is shut down again."""
     adapter = _WorkerAdapter()
     adapter._producer_events = object()
     with pytest.raises(RuntimeError, match="records producer events at submission"):
-        _worker(adapter)
+        _register_checkpointed(monkeypatch, adapter, off_step=True)
+    assert adapter.registered is None
+    assert adapter.shutdown_called
 
 
 def test_off_step_transfers_poll_whatever_the_transfer_thread_flag_says(
@@ -2617,7 +2611,7 @@ def test_a_round_during_close_settles_without_the_worker_s_handle(
     real_close = transfer.close
 
     def close_after_a_round(timeout=None):
-        assert transfer._wait_round(5.0)
+        assert transfer.wait_round(transfer.request_round(), 5.0)
         real_close(timeout)
 
     monkeypatch.setattr(transfer, "close", close_after_a_round)
@@ -2628,11 +2622,11 @@ def test_a_round_during_close_settles_without_the_worker_s_handle(
     assert worker._transfer is None
 
 
-def test_a_stalled_poller_cannot_hide_a_transfer_past_its_deadline(
+def test_a_stuck_submit_cannot_hide_a_transfer_past_its_deadline(
     fake_lmcache_modules, monkeypatch
 ):
     """Rounds enforce deadlines but run between submissions, so a submit that
-    never returns stops them; the forward thread stops the engine instead."""
+    never returns stops them: the forward thread enforces every deadline too."""
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
     worker = _worker(_WorkerAdapter())
@@ -2642,13 +2636,29 @@ def test_a_stalled_poller_cannot_hide_a_transfer_past_its_deadline(
     stuck = threading.Event()
     worker._transfer.submit(stuck.wait, 5.0)  # a submit RPC that hangs
     try:
-        now[0] = 1030.0 + mp_worker._POLL_STALL_GRACE_S / 2
-        worker._settle_transfer_thread()  # a round may still be on its way
-        now[0] = 1031.0 + mp_worker._POLL_STALL_GRACE_S
-        with pytest.raises(transfer.LMCacheTransferUnprovable, match="no poll round"):
+        now[0] = 1029.0
+        worker._settle_transfer_thread()
+        now[0] = 1030.0
+        with pytest.raises(transfer.LMCacheTransferUnprovable, match="not terminal"):
             worker._settle_transfer_thread()
     finally:
         stuck.set()
+
+
+def test_close_leaves_the_adapter_to_a_thread_that_did_not_stop(
+    fake_lmcache_modules, monkeypatch
+):
+    """A thread still inside a submit or a poll may be using the adapter's
+    futures: it is not shut down under it."""
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    transfer_obj = worker._transfer
+    real_close = transfer_obj.close
+    monkeypatch.setattr(transfer_obj, "close", lambda timeout=None: False)
+    worker.close()
+    assert not adapter.shutdown_called
+    assert worker._transfer is None
+    real_close(5.0)
 
 
 def test_the_fence_covers_queued_transfers_and_fails_stop(fake_lmcache_modules):
