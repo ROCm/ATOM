@@ -143,7 +143,7 @@ class EngineCore:
             # the first tp_world_size shards get a process.
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
-                config.tp_world_size * config.prefill_context_parallel_size,
+                config.tp_world_size * config.pcp_group_size,
                 config.runner_qualname,
                 config,
                 on_worker_failure=self._send_engine_dead,
