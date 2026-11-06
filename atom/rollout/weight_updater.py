@@ -950,13 +950,19 @@ class WeightUpdaterMixin:
 
         from atom.model_ops.linear import weight_is_stored_preshuffled
         from atom.model_ops.utils import shuffle_weights
+        from atom.utils import envs
 
-        # The same decision the initial load makes, from the same function.
+        # The same decision the initial load makes, from the same function
+        # (incl. hybrid a8w8 shapes that must stay row-major for Triton).
+        wshape = (
+            (int(param.shape[0]), int(param.shape[1])) if param.dim() == 2 else None
+        )
         needs_shuffle = weight_is_stored_preshuffled(
             quant_type,
             getattr(module, "params_dtype", param.dtype),
             needs_preshuffled_weight=getattr(module, "needs_preshuffled_weight", False),
             native_group_rows=getattr(module, "native_a8_group_rows", None),
+            weight_shape=wshape,
         )
 
         # And the same rank check. 3D is Qwen3-Next's GDN conv1d, which the
@@ -969,6 +975,25 @@ class WeightUpdaterMixin:
             # catching half-done, five syncs out of seven.
             self._await_readers_of(param)
             shuffle_weights(param)
+
+        # gfx942 group32 BF16 cache is filled once at load; rebuild after every
+        # in-place FP8 write so sync does not leave stale pre-update bytes.
+        native_rows = getattr(module, "native_a8_group_rows", None)
+        if (
+            native_rows is not None
+            and envs.ATOM_GFX942_CACHE_BF16_WEIGHT
+            and hasattr(module, "_rebuild_group32_bf16_cache")
+        ):
+            try:
+                from aiter.jit.utils.chip_info import get_gfx
+
+                gfx942 = str(get_gfx()).startswith("gfx942")
+            except (ImportError, RuntimeError):
+                gfx942 = False
+            if gfx942:
+                module._rebuild_group32_bf16_cache()
+            elif hasattr(param, "_atom_group32_bf16_cache"):
+                delattr(param, "_atom_group32_bf16_cache")
 
     @_discard_sync_state_on_error
     def update_weights(

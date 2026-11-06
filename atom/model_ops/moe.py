@@ -1466,12 +1466,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.static_input_scales = not quant_config.is_dynamic
         self.fp8_activations = moe.mxfp4_fp8_activations
         self.is_guinterleave = envs.ATOM_MOE_GU_ITLV or self.fp8_activations
-        self.pad_align = 256
+        gfx = get_gfx()
+        # gfx942 Triton a16w4 / FlyDSL DSV41 untuned rows use inter_dim=640
+        # (pad 576→640). pad_align=256 forced 768 and wasted ~20% GEMM work.
+        self.pad_align = 128 if gfx.startswith("gfx94") else 256
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
         )
-        gfx = get_gfx()
         self.is_gfx1250 = gfx == "gfx1250"
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
         ep_moe = self.moe.use_ep
@@ -1619,6 +1621,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_pad = (
             self.intermediate_size - layer.intermediate_size_per_partition
         )
+        if not getattr(Mxfp4MoEMethod, "_logged_pad_once", False):
+            Mxfp4MoEMethod._logged_pad_once = True
+            logger.info(
+                "Mxfp4MoE pad_align=%s intermediate %s→%s (pad=%s) hidden_pad=%s "
+                "use_triton=%s act_quant=%s",
+                pad_align,
+                intermediate_size_per_partition,
+                self.intermediate_size,
+                self.intermediate_pad,
+                self.hidden_pad,
+                self.use_triton,
+                self.act_quant,
+            )
         # MXFP4 is target-only: it is never dequantized as an online source.
         # Fused gate_up_proj (column parallel)
         w13_weight = atom_parameter(

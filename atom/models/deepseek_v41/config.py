@@ -44,13 +44,25 @@ class LayerAttentionSpec:
         return None if self.produces_candidates else self.candidate_owner
 
 
+def is_fp4_ptpc(config) -> bool:
+    """Mixed FP4 routed experts + per-channel FP8 dense linears."""
+    quant = getattr(config, "quantization_config", None) or {}
+    return isinstance(quant, dict) and quant.get("quant_method") == "w8a8_fp8"
+
+
 def validate_native_quantization(config):
     """Reject a checkpoint whose quantization is not the one V4.1 reads.
 
-    There is no second format to select between, so this returns nothing: the
-    five shapes below are the only ones the kernels accept, and a checkpoint
-    that declares anything else has no reader to fall back to.
+    Two formats are readable. Native FP8 is 32x32 block scales. FP4PTPC
+    (`w8a8_fp8`) keeps routed experts on native FP4 and stores the converted
+    dense linears as per-channel FP8. Anything else has no reader.
     """
+    if config.get("quant_method") == "w8a8_fp8":
+        if config.get("activation_scheme") != "dynamic":
+            raise ValueError("DeepSeek-V4.1 FP4PTPC requires dynamic activations")
+        if config.get("expert_dtype") != "fp4":
+            raise ValueError("DeepSeek-V4.1 routed experts must use native fp4 weights")
+        return
     if config.get("quant_method") != "fp8":
         raise ValueError("DeepSeek-V4.1 requires the native FP8 checkpoint format")
     if config.get("weight_block_size") not in ([32, 32], (32, 32)):

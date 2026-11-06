@@ -24,24 +24,63 @@ import torch
 import triton
 from aiter import ActivationType
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
+
+# Mxfp4MoEMethod.use_triton auto-enables on gfx94x even when
+# ATOM_USE_TRITON_MOE is unset, so these imports must not be env-gated
+# (otherwise _swizzle_mxfp4 hits NameError on shuffle_scale_moe).
+from aiter.ops.triton.moe import moe_op_gemm_a4w4 as _moe_a4w4
+from aiter.ops.triton.moe import moe_op_gemm_a16w4 as _moe_a16w4
+from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+    moe_gemm_a4w4,
+    mxfp4_quant,
+)
+from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
+    get_kernel_config_gluon,
+    moe_gemm_a8w4,
+)
+from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
+    moe_gemm_a16w4,
+)
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 from atom.utils import envs
 
-if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
-    from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
-        moe_gemm_a4w4,
-        mxfp4_quant,
-    )
-    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
-        get_kernel_config_gluon,
-        moe_gemm_a8w4,
-    )
-    from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
-        moe_gemm_a16w4,
-    )
-    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
-    from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+
+def _gfx942_moe_bn_floor(orig_cfg):
+    """Keep decode BN from shrinking to 32 on gfx942 (underfills CUs).
+
+    Temporary ATOM patch. This replaces aiter's global ``get_kernel_config_triton``.
+    Delete it once aiter's per-arch config raises gfx942 ``block_n`` to 64
+    (128 when N is wide and the grid covers the CUs). Measured on MI308
+    decode M=1: the stock loop landed on BN=32.
+    """
+
+    def _wrapped(m, n, k, routing_data):
+        cfg = dict(orig_cfg(m, n, k, routing_data))
+        if get_arch() == "gfx942" and cfg.get("block_m") == 16:
+            bn = int(cfg.get("block_n", 64))
+            bn = max(bn, 64)
+            if n >= 1024 and bn < 128:
+                grid_m = routing_data.n_blocks(m, 16)
+                grid_n = (n + 127) // 128
+                if grid_m * grid_n >= 32:
+                    bn = 128
+            cfg["block_n"] = bn
+        return cfg
+
+    return _wrapped
+
+
+# Temporary: monkeypatch aiter's tile function. Remove with _gfx942_moe_bn_floor
+# once the same floor lives in aiter's per-arch config.
+_moe_a16w4.get_kernel_config_triton = _gfx942_moe_bn_floor(
+    _moe_a16w4.get_kernel_config_triton
+)
+_moe_a4w4.get_kernel_config_triton = _gfx942_moe_bn_floor(
+    _moe_a4w4.get_kernel_config_triton
+)
 
 from atom.model_ops.moe import MoEActivationQuant
 
@@ -96,7 +135,9 @@ def _swizzle_mxfp4(
     passed explicitly. ``act_quant`` is keyword-only and has no default on
     purpose: a default would silently pick a width for a caller that forgot.
     """
-    assert envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE
+    # Callers gate on Mxfp4MoEMethod.use_triton, which auto-enables Triton MoE
+    # on gfx94x even when ATOM_USE_TRITON_MOE is unset. Do not re-check the raw
+    # env here -- that rejected the MI308 default path after weight load.
 
     # Transposing for expected layout of aiter triton kernels
     w1_triton_layout = w1.transpose(-2, -1)

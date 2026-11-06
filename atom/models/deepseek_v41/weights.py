@@ -18,7 +18,7 @@ from safetensors import safe_open
 
 from atom.model_ops.engram.tables import HostEmbeddingTable
 
-from .config import AttentionMode, build_attention_topology
+from .config import AttentionMode, build_attention_topology, is_fp4_ptpc
 
 # safetensors dtype names a shared read-only tensor can have (`shared_tensor`).
 _SAFETENSORS_DTYPES = {
@@ -102,7 +102,17 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
             raise ValueError(f"Duplicate checkpoint parameter {name}")
         specs[name] = WeightSpec(name, tuple(shape), dtype, **kwargs)
 
-    def linear(name, n, k, *, quantized=True, fp4=False, **kwargs):
+    def linear(name, n, k, *, quantized=True, fp4=False, ptpc=False, **kwargs):
+        # FP4PTPC dense linears are per-channel FP8: F32 scale (N, 1) stored
+        # as `.weight_scale`. Block `.scale` stays for FP4 experts, wo_a, and
+        # the draft stack the converter left untouched.
+        if ptpc and quantized and not fp4:
+            add(name + ".weight", (n, k), "F8_E4M3", **kwargs)
+            scale_kwargs = dict(kwargs)
+            if scale_kwargs.get("tp_axis") != 0:
+                scale_kwargs["tp_axis"] = None
+            add(name + ".weight_scale", (n, 1), "F32", **scale_kwargs)
+            return
         block = (1, 32) if fp4 else (32, 32)
         add(
             name + ".weight",
@@ -142,12 +152,20 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
             ):
                 add(f"{prefix}.hc_{sublayer}_{suffix}", shape, "F32", scope=scope)
         attn = prefix + ".attn"
+        channel = is_fp4_ptpc(config) and not draft
         add(attn + ".attn_sink", (h,), "F32", scope=scope, tp_axis=0)
         add(attn + ".q_norm.weight", (config.q_lora_rank,), scope=scope)
         add(attn + ".kv_norm.weight", (hd,), scope=scope)
-        linear(attn + ".wq_a", config.q_lora_rank, d, scope=scope)
-        linear(attn + ".wq_b", h * hd, config.q_lora_rank, scope=scope, tp_axis=0)
-        linear(attn + ".wkv", hd, d, scope=scope)
+        linear(attn + ".wq_a", config.q_lora_rank, d, scope=scope, ptpc=channel)
+        linear(
+            attn + ".wq_b",
+            h * hd,
+            config.q_lora_rank,
+            scope=scope,
+            tp_axis=0,
+            ptpc=channel,
+        )
+        linear(attn + ".wkv", hd, d, scope=scope, ptpc=channel)
         linear(
             attn + ".wo_a",
             config.o_groups * config.o_lora_rank,
@@ -162,6 +180,7 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
             config.o_groups * config.o_lora_rank,
             scope=scope,
             tp_axis=1,
+            ptpc=channel,
         )
         if layer.mode == AttentionMode.FULL:
             linear(attn + ".compressor.wkv", hd, d, quantized=False, scope=scope)
@@ -184,6 +203,7 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
                 config.index_n_heads * config.index_head_dim,
                 config.q_lora_rank,
                 scope=scope,
+                ptpc=channel,
             )
             linear(
                 attn + ".indexer.weights_proj",
@@ -218,7 +238,14 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
             ("w3", mid, d, 0),
             ("w2", d, mid, 1),
         ):
-            linear(f"{ffn}.shared_experts.{proj}", n, k, scope=scope, tp_axis=axis)
+            linear(
+                f"{ffn}.shared_experts.{proj}",
+                n,
+                k,
+                scope=scope,
+                tp_axis=axis,
+                ptpc=channel,
+            )
         if draft:
             if layer_id == config.num_nextn_predict_layers - 1:
                 r = config.dspark_markov_rank
@@ -268,7 +295,12 @@ def checkpoint_schema(config) -> dict[str, WeightSpec]:
             scope="engram_table",
             block=(1, 32),
         )
-        linear(prefix + ".wkv", (hc + 1) * d, engram_dim)
+        linear(
+            prefix + ".wkv",
+            (hc + 1) * d,
+            engram_dim,
+            ptpc=is_fp4_ptpc(config),
+        )
         for name in ("k_weight", "q_weight"):
             add(prefix + "." + name, (hc, d))
     vision = config._multimodal_config.vision_config
@@ -342,12 +374,15 @@ def build_weight_manifest(
                 packing = 2 if spec.dtype == "I8" and axis == 1 else 1
                 if (length * packing) % spec.block[axis]:
                     raise ValueError(f"TP partition crosses source blocks: {spec.name}")
-        is_scale = spec.name.endswith(".scale")
-        target = (
-            spec.name.removesuffix(".scale") + ".weight_scale"
-            if is_scale
-            else spec.name
-        )
+        if spec.name.endswith(".weight_scale"):
+            is_scale = True
+            target = spec.name
+        elif spec.name.endswith(".scale"):
+            is_scale = True
+            target = spec.name.removesuffix(".scale") + ".weight_scale"
+        else:
+            is_scale = False
+            target = spec.name
         action = "dequant_scale" if spec.dequantize and is_scale else "load"
         result.append(
             LocalWeight(

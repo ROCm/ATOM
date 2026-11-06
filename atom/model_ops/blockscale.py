@@ -17,15 +17,26 @@ from .blockscale_kernels.blockscale_gemm import (
 )
 from .blockscale_kernels.quantization import (
     FP8_DTYPE,
+    FP8_OCP_DTYPE,
     quantize_fp4_kernel,
     quantize_fp8_kernel,
+    quantize_fp8_ocp_kernel,
 )
 
 
 def _get_aiter_fp8_gemm():
     try:
         from aiter import gemm_a8w8_blockscale
+        from aiter.jit.utils.chip_info import get_gfx
     except ImportError:
+        return None
+    # gfx942 has no aiter group32 MXFP8 path; keep the local BF16/Triton GEMM.
+    # Do not gate on ``!= gfx950``: gfx1250 stores group32 weights preshuffled
+    # and must still call into aiter, not the row-major local fallback.
+    try:
+        if str(get_gfx()).startswith("gfx942"):
+            return None
+    except RuntimeError:
         return None
     # The older same-named interface only supports FP32 128x128 scales.
     # The registered schema retains the signature hidden by torch_compile_guard.
@@ -73,6 +84,98 @@ def quantize_fp8(x: torch.Tensor, *, dequantize: bool = False):
             dequantize,
         )
     return output if dequantize else (output, scales)
+
+
+def quantize_fp8_ocp(x: torch.Tensor, *, dequantize: bool = False):
+    """Group32 E8M0 into OCP float8_e4m3fn (V4.1 checkpoint / aiter group32)."""
+    x = _check_quant_input(x, 32)
+    output = torch.empty_like(x, dtype=x.dtype if dequantize else FP8_OCP_DTYPE)
+    scales = (
+        None
+        if dequantize
+        else torch.empty(
+            (*x.shape[:-1], x.shape[-1] // 32),
+            device=x.device,
+            dtype=torch.float8_e8m0fnu,
+        )
+    )
+    if x.numel():
+        quantize_fp8_ocp_kernel[(triton.cdiv(x.numel(), 1024),)](
+            x,
+            output,
+            None if scales is None else scales.view(torch.uint8),
+            x.numel(),
+            dequantize,
+        )
+    return output if dequantize else (output, scales)
+
+
+def _activations_for_ocp_group32(x, x_scale):
+    """Native group32 GEMM wants OCP e4m3fn; gfx942 quantize_fp8 writes FNUZ."""
+    if x.dtype == torch.float8_e4m3fn:
+        return x, x_scale
+    if x.dtype == torch.float8_e4m3fnuz:
+        if x_scale is None:
+            raise ValueError("FNUZ activations need scales to re-encode as OCP e4m3fn")
+        code = x_scale.view(torch.uint8).to(torch.int32)
+        scale = (code << 23).view(torch.float32)
+        flat = x.reshape(-1, x.shape[-1]).float()
+        scale_f = scale.reshape(flat.shape[0], -1)
+        dequant = (flat.reshape(flat.shape[0], -1, 32) * scale_f[:, :, None]).reshape(
+            x.shape
+        )
+        return quantize_fp8_ocp(dequant.to(torch.bfloat16))
+    if x_scale is None and x.dtype in (torch.bfloat16, torch.float16, torch.float32):
+        return quantize_fp8_ocp(x)
+    raise ValueError(f"Unsupported activation dtype for native group32 GEMM: {x.dtype}")
+
+
+def _e8m0_codes_to_float(scale: torch.Tensor) -> torch.Tensor:
+    code = scale.view(torch.uint8).to(torch.int32)
+    return (code << 23).view(torch.float32)
+
+
+def _use_group32_bf16_fallback() -> bool:
+    """True on gfx942 only: no CDNA4 MXFP8 MFMA / aiter group32 path.
+
+    Temporary. gfx942 dequants the group32 weight to a resident BF16 copy and
+    calls hipBLAS. Delete this path once aiter ships a gfx942 group32 GEMM.
+    gfx1250 keeps aiter's preshuffled group32 GEMM; treating it like gfx942
+    would feed a row-major local kernel a shuffled weight.
+    """
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return str(get_gfx()).startswith("gfx942")
+    except (ImportError, RuntimeError):
+        return False
+
+
+def _group32_bf16_gemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    weight_group_rows: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """gfx942 group32 GEMM: in-kernel e8m0 dequant + BF16 tl.dot (K=16 MFMA).
+
+    Replaces the previous host dequant + hipBLAS path. Do not call
+    ``tl.dot_scaled`` on e4m3 here -- that lowers to the missing K=32 BF16 MFMA.
+    """
+    from .blockscale_kernels.fp8 import gemm_fp8_bf16_dequant
+
+    return gemm_fp8_bf16_dequant(
+        x,
+        weight,
+        x_scale,
+        weight_scale,
+        dtype=dtype,
+        weight_group_rows=weight_group_rows,
+        cu_num=_units(x.device.index),
+    )
 
 
 def quantize_fp4(
@@ -173,6 +276,16 @@ def native_quant_linear(
             "Expected batched activations, a matrix weight and BF16/FP32 output"
         )
     fp4 = weight.dtype == torch.float4_e2m1fn_x2
+    # Native path keeps checkpoint OCP bits even when the param was typed
+    # e4m3fnuz on gfx942 (process_weights_after_loading skips FNUZ normalize).
+    # `.view(dtype)` returns a new Tensor and drops the BF16 weight cache that
+    # process_weights hung on the parameter. Without it, every decode step
+    # dequants the FP8 weight again (several ms on the shared expert).
+    bf16_cache = getattr(weight, "_atom_group32_bf16_cache", None)
+    if weight.dtype == torch.float8_e4m3fnuz:
+        weight = weight.view(torch.float8_e4m3fn)
+        if bf16_cache is not None:
+            weight._atom_group32_bf16_cache = bf16_cache
     if weight.dtype not in (torch.float8_e4m3fn, torch.float4_e2m1fn_x2):
         raise ValueError("Weight must be E4M3 or packed E2M1")
     if weight_group_rows not in (1, 32) or (fp4 and weight_group_rows != 1):
@@ -181,7 +294,7 @@ def native_quant_linear(
     k = stored_k * (2 if fp4 else 1)
     if k <= 0 or k % 32 or x.shape[-1] != k or n <= 0:
         raise ValueError("Invalid matrix dimensions for group32 GEMM")
-    if x_scale is None:
+    if fp4 and x_scale is None:
         x, x_scale = quantize_fp8(x)
     m = x.numel() // k
     if split_k is not None and (not isinstance(split_k, int) or split_k < 1):
@@ -198,6 +311,9 @@ def native_quant_linear(
             "no split_k and BF16 output"
         )
     if not fp4 and _aiter_fp8_gemm is not None:
+        # OCP re-encode is only required by aiter's MX kernel; the gfx942 BF16
+        # fallback below can consume FNUZ activations without this round-trip.
+        x, x_scale = _activations_for_ocp_group32(x, x_scale)
         batched = x.ndim > 2
         output = _aiter_fp8_gemm(
             x.view(m, k) if batched else x,
@@ -210,6 +326,27 @@ def native_quant_linear(
         )
         return output.view(*x.shape[:-1], n) if batched else output
 
+    if not fp4 and _use_group32_bf16_fallback():
+        # A norm that other readers share leaves the scale empty and a BF16
+        # activation. The GEMM quantizes that input itself. hipBLAS on gfx942
+        # decodes FNUZ, which is what quantize_fp8 writes here.
+        if x_scale is None:
+            if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+                raise ValueError(
+                    "gfx942 group32 GEMM needs a scale or a floating activation"
+                )
+            x, x_scale = quantize_fp8(x)
+        return _group32_bf16_gemm(
+            x,
+            weight,
+            x_scale,
+            weight_scale,
+            weight_group_rows=weight_group_rows,
+            dtype=dtype,
+        )
+
+    if not fp4:
+        x, x_scale = _activations_for_ocp_group32(x, x_scale)
     if (
         x.dtype != torch.float8_e4m3fn
         or x_scale.dtype != torch.float8_e8m0fnu
@@ -309,10 +446,11 @@ def dequantize_fp8_weight(weight, scale, *, group_rows=32, dtype=torch.bfloat16)
     n, k = weight.shape
     if k % 32 or n % group_rows or scale.shape != (n // group_rows, k // 32):
         raise ValueError("FP8 source block dimensions do not match")
+    scale_f = (scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
     return (
         (
             weight.float().reshape(n // group_rows, group_rows, k // 32, 32)
-            * scale.float()[:, None, :, None]
+            * scale_f[:, None, :, None]
         )
         .reshape(n, k)
         .to(dtype)
