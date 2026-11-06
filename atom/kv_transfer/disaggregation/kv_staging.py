@@ -138,10 +138,13 @@ class MLAShardStaging:
         sources = {}
         for idx, page in enumerate(pages):
             region, view = page.region, page.view
+            # `_row_view` sizes a row in bytes, so it reads a uint8 alias of the
+            # region (`page_region`'s); any other view keeps the per-token path.
             if (
                 region.semantic_role != MLA_KV_ROLE
                 or region.reverse_indexed
                 or view is None
+                or view.dtype != torch.uint8
                 or view.device != device
                 or region.unit_bytes % block_size
             ):

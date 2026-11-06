@@ -40,7 +40,7 @@ limitations](observability/README.md).
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_PP_MAX_INFLIGHT** | int | 0 | Output batches (decode batches and final prefill chunks) the PP head keeps in flight before it waits for the oldest to return. A middle prefill chunk retires once launched and does not count. `0` uses `pipeline_parallel_size`. A larger cap keeps the head issuing while a long batch holds the stages ahead of it. |
+| **ATOM_PP_MAX_INFLIGHT** | int | 0 | Output batches (decode batches and final prefill chunks) the PP head keeps in flight before it waits for the oldest to return. A middle prefill chunk retires once launched and does not count. `0` uses `pipeline_parallel_size`. A larger cap keeps the head issuing while a long batch holds the stages ahead of it. Its cost is queueing: batches past the stage count wait on the stages, so each takes longer to return. Kimi-K3's PP8 P/D prefill at C88 sets 16, ~15% more throughput than 8, and 12 was no better than 16. Other models and PP sizes are unmeasured, so the default stays the stage count. |
 
 ## Prefill delayer (TP/DCP and DP attention)
 

@@ -3659,11 +3659,14 @@ class MooncakeConnector(KVConnectorBase):
                             f"Staged region {region_idx} packs {page_bytes}-byte "
                             f"pages, but its blocks are {bpb} bytes"
                         )
+                    dst_pages = dst_ids[start:stop]
+                    # Never merge across a destination MR chunk.
                     src, dst, sizes = coalesce_contiguous(
                         slot_addr
                         + np.arange(stop - start, dtype=np.int64) * page_bytes,
-                        dst_base + dst_ids[start:stop] * bpb,
+                        dst_base + dst_pages * bpb,
                         shard.page_tokens(start, stop) * (bpb // self.block_size),
+                        dst_pages % self._rdma_chunk_units(bpb) == 0,
                     )
                     descriptors += src.size
                     if not self._rdma_write(
