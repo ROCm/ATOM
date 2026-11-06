@@ -185,6 +185,11 @@ class DSparkDraftModel(nn.Module):
     # the proposer plans. A draft that attends its block another way (MiniMax-
     # M3.1's per-row MHA decode) builds what it reads in `prepare_paged_block`.
     block_attention_is_mla = True
+    # `(window, read_page)` when the block pass reads only a sliding window of
+    # the context, starting each row on a page of `read_page` tokens; None
+    # when it reads the whole context. What a windowed draft KV pool is sized
+    # and freed by (`atom/model_engine/draft_window.py`).
+    kv_read_window: "tuple[int, int] | None" = None
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
         """Mask padded writes for models whose draft pass mutates private KV."""
@@ -212,9 +217,13 @@ class DSparkDraftModel(nn.Module):
         ctx_lens: torch.Tensor,  # [running_bs] anchor + 1 + T
         allocated_pages,  # [>= scheduled_bs] host, pages each request holds
         scheduled_bs: int,
+        window=None,  # a windowed draft pool's (tables, first, extent)
     ) -> None:
         """The per-step metadata only a non-MLA block attention reads, built
-        outside the captured block from the proposer's paged block metadata."""
+        outside the captured block from the proposer's paged block metadata.
+
+        `window` replaces `block_tables` for a draft whose KV pool holds only
+        its window (`DraftKvBuilder.block_window`)."""
         return
 
     def write_context_kv(
