@@ -8,10 +8,6 @@ step (`attn_metadata.index_rows`); a model reads both and computes neither."""
 from typing import Any, Literal, NamedTuple
 
 import torch
-from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
-    pa_mqa_logits_mxfp4_plan,
-    pa_mqa_logits_mxfp4_plan_buffers,
-)
 
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.sparse_indexer_chunk import (
@@ -23,6 +19,7 @@ from atom.model_ops.sparse_indexer_chunk import (
 PRESHUFFLE = "preshuffle"
 # gfx1250: FP4 rows in natural order, scored by the OPUS kernels.
 NATURAL = "natural"
+MFMA = "mfma"
 
 
 class IndexCache(NamedTuple):
@@ -168,6 +165,8 @@ class Fp4LaunchStorage:
     def plan_buffers(self, band: int, max_qlen: int):
         """Band `band`'s OPUS plan, the variant a sequence of `max_qlen` rows
         launches."""
+        from aiter.ops.opus.pa_mqa_logits_mxfp4 import pa_mqa_logits_mxfp4_plan_buffers
+
         variant = "qlen1_kv64" if max_qlen == 1 else "qlen4_kv64"
         if (band, variant) not in self._plans:
             self._plans[band, variant] = pa_mqa_logits_mxfp4_plan_buffers(
@@ -286,7 +285,18 @@ def fp4_rows(
                 out=None if storage is None else storage.starts(index),
             )
         )
-        if layout == NATURAL:
+        if layout == MFMA:
+            launches.append(
+                {
+                    "block_tables": band.block_tables,
+                    "query_start_loc": band.query_start_loc,
+                    "row_ends": ends,
+                    "max_qlen": band.max_qlen,
+                }
+            )
+        elif layout == NATURAL:
+            from aiter.ops.opus.pa_mqa_logits_mxfp4 import pa_mqa_logits_mxfp4_plan
+
             plan = pa_mqa_logits_mxfp4_plan(
                 band.query_start_loc,
                 ends,

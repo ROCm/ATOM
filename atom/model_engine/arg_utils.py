@@ -159,7 +159,9 @@ class EngineArgs:
     prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
-    cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
+    cudagraph_capture_sizes: str = (
+        "[1,2,3,4,5,6,7,8,16,32,48,64,128,160,192,224,256,512]"
+    )
     level: int = 3
     cudagraph_mode: str = "FULL"
     load_dummy: str | None = None

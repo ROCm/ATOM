@@ -7,6 +7,8 @@ FP4 is a change of dtype, not a second cache: `indexer_qk_rope_quant_and_cache`
 writes packed E2M1 keys plus their e8m0 scales in place of the FP8 row, and
 `flydsl_pa_mqa_logits_fp4` scores them straight out of the paged cache.
 Every number here is one those kernels fix, so it drifts with them.
+The explicit OPUS opt-in instead uses ``dsa_fp4`` and the gfx950 MFMA layout;
+it is not a view-compatible replacement for the legacy FP4 permutation.
 """
 
 from __future__ import annotations
@@ -27,6 +29,26 @@ FP4_QUANT_BLOCK_SIZE = 32
 FP4_KV_BLOCK_SIZE = 64
 _MFMA_M = 16
 _K_TILE = 128
+
+
+def fp4_cache_layout() -> str:
+    """Opt-in while the OPUS DSA path is validated separately from legacy FP4.
+
+    This is process-static and must agree on all TP/DCP ranks and both ends
+    of any transferred cache. Never toggle it on a live cache.
+    """
+    from atom.utils import envs
+
+    return "mfma" if envs.ATOM_DSA_FP4_OPUS else "preshuffle"
+
+
+def require_opus_api() -> None:
+    from aiter.ops.opus import pa_mqa_logits_mxfp4 as opus
+
+    if not hasattr(opus, "mqa_logits_mxfp4_config"):
+        raise RuntimeError(
+            "ATOM_DSA_FP4_OPUS requires the mqa_logits_mxfp4 API from AITER PR 6952"
+        )
 
 
 def _gfx() -> str:
@@ -119,6 +141,8 @@ def fp4_q_scale_shape(tokens: int, heads: int, head_dim: int) -> tuple:
     The trailing pad is the dword a lane loads its four M-tile scale bytes with,
     so it is four even where the head count needs two.
     """
+    if fp4_cache_layout() == "mfma":
+        return (tokens, 2, 32, heads // 16)
     m_tiles = heads // _MFMA_M
     return (tokens, head_dim // _K_TILE, 4, _MFMA_M, -(-m_tiles // 4) * 4)
 
@@ -154,4 +178,8 @@ def fp4_index_block_shapes(rows: int, head_dim: int) -> tuple[tuple, tuple]:
             f"got {rows}"
         )
     k_tiles = head_dim // _K_TILE
+    if fp4_cache_layout() == "mfma":
+        if head_dim != 128:
+            raise ValueError("OPUS DSA FP4 requires head_dim=128")
+        return (4, rows, 16), (2, 32, 4)
     return (k_tiles, 4, rows, 16), (k_tiles, 4, rows)
