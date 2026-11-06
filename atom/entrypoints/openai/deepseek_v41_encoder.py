@@ -37,20 +37,6 @@ REASONING_RULES = ReasoningRules(
 )
 
 
-def join_text_blocks(blocks: list) -> str:
-    """A content list's text as the official encoder joins it
-    (``process_image_messages``): its text blocks, a blank line apart.
-
-    For text this server places after the render, an assistant prefix's;
-    every message it renders goes to the encoder with its list intact.
-    """
-    return "\n\n".join(
-        block.get("text", "")
-        for block in blocks
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
-
-
 def prepare_messages(messages: list[dict], tools: list[dict] | None) -> list[dict]:
     prepared = [dict(message) for message in messages]
     if tools:

@@ -23,9 +23,6 @@ from atom.entrypoints.openai.chat_encoders import (
     _load_encoder_from_dir,
     apply_chat_template,
 )
-from atom.entrypoints.openai.deepseek_v41_encoder import (
-    join_text_blocks as v41_join_text_blocks,
-)
 from atom.entrypoints.openai.fim import KNOWN_FIM_FORMATS, resolve_fim_format
 from atom.entrypoints.openai.prefix_completion import (
     AssistantPrefix,
@@ -81,16 +78,41 @@ def test_trailing_prefix_is_split_off():
 TWO_BLOCKS = [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}]
 
 
-def test_a_prefixs_text_blocks_are_joined_as_the_renderer_joins_them():
-    """As a chat template gets them (one line apart), or as the encoder
-    that is given the list joins them: V4.1's, a blank line apart."""
+def test_a_prefix_goes_through_the_encoders_own_message_processing():
+    """As the rendered messages do; without one, its text is joined as a
+    chat template gets it, one line apart."""
+    seen = []
+
+    def process(messages):
+        seen.extend(messages)
+        return [
+            {**m, "content": "joined", "reasoning_content": "r2"} for m in messages
+        ], []
+
     messages = _messages(
-        USER, {"role": "assistant", "content": TWO_BLOCKS, "prefix": True}
+        USER,
+        {
+            "role": "assistant",
+            "content": TWO_BLOCKS,
+            "reasoning_content": "r",
+            "prefix": True,
+        },
     )
+    encoder = SimpleNamespace(preserve_content=True, process_image_messages=process)
+    _, prefix = take_assistant_prefix(messages, encoder)
+    assert seen == [
+        {"role": "assistant", "content": TWO_BLOCKS, "reasoning_content": "r"}
+    ]
+    assert prefix == AssistantPrefix("joined", "r2")
     _, prefix = take_assistant_prefix(messages)
-    assert prefix.content == messages[-1].get_content_text() == "first\nsecond"
-    _, prefix = take_assistant_prefix(messages, v41_join_text_blocks)
-    assert prefix.content == "first\n\nsecond"
+    assert prefix == AssistantPrefix("first\nsecond", "r")
+
+
+def test_an_unset_prefix_may_be_spelled_null():
+    messages = _messages(
+        USER, {"role": "assistant", "content": "x", "prefix": None}, USER
+    )
+    assert take_assistant_prefix(messages) == (messages, None)
 
 
 @pytest.mark.parametrize(
@@ -996,14 +1018,19 @@ def v41_encoder():
 @pytest.mark.parametrize(
     "content", [PREFIX["content"], TWO_BLOCKS], ids=["text", "blocks"]
 )
-@pytest.mark.parametrize("mode", ["chat", "thinking"])
+@pytest.mark.parametrize(
+    "mode, reasoning",
+    [("chat", None), ("thinking", "Partition first."), ("thinking", None)],
+    ids=["chat", "thinking", "thinking-content-only"],
+)
 def test_v41_prefix_matches_official_unterminated_assistant_turn(
-    engine, monkeypatch, v41_encoder, mode, content
+    engine, monkeypatch, v41_encoder, mode, reasoning, content
 ):
     """The official encoder renders an assistant turn without its EOS when
-    asked (`wo_eos`); a continued prefix must be exactly that prompt."""
+    asked (`wo_eos`); a continued prefix must be exactly that prompt. A
+    content-only prefix in thinking mode is the case where this server closes
+    the reasoning channel itself."""
     monkeypatch.setattr(api_server, "custom_message_encoder", v41_encoder)
-    reasoning = "Partition first." if mode == "thinking" else None
     prefix = {**PREFIX, "content": content}
     if reasoning:
         prefix["reasoning_content"] = reasoning
@@ -1035,3 +1062,35 @@ def test_v41_prefix_matches_official_unterminated_assistant_turn(
     assert engine.prompts == [official]
     assert message["content"] == "<think>x</think>"
     assert not message.get("reasoning_content")
+
+
+IMAGE_TOKEN = "<\uff5cdeepseek_image\uff5c>"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"content": f"see {IMAGE_TOKEN}"},
+        {"content": [{"type": "text", "text": f"see {IMAGE_TOKEN}"}]},
+        {"content": "x", "reasoning_content": f"see {IMAGE_TOKEN}"},
+    ],
+    ids=["content", "text-block", "reasoning"],
+)
+def test_v41_prefix_refuses_image_placeholders_as_the_history_does(
+    engine, monkeypatch, v41_encoder, fields
+):
+    """The official encoder refuses an image placeholder written as text,
+    and a prefix goes through the same check as the messages before it."""
+    monkeypatch.setattr(api_server, "custom_message_encoder", v41_encoder)
+    assistant = {"role": "assistant", **fields}
+    for handler, messages in (
+        (
+            api_server.chat_completions,
+            [USER, assistant, {"role": "user", "content": "go on"}],
+        ),
+        (api_server.beta_chat_completions, [USER, {**assistant, "prefix": True}]),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            _chat(handler, messages, chat_template_kwargs={"thinking_mode": "thinking"})
+        assert exc.value.status_code == 400, handler.__name__
+    assert not engine.prompts
