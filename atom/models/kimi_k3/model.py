@@ -1388,11 +1388,12 @@ class KimiKDAAttention(nn.Module):
         # for exactly one forward: the prefix-cache hit that forks off a
         # checkpoint (BlockManager._attach_state_group reads `state_fork_src`
         # and writes a freshly popped group). Reading the write slot there
-        # resumes from whatever the recycled group still held. Only prefill can
-        # carry a fork -- prepare_state_indices asserts it, and min_fork_tokens
-        # keeps the chunk long enough -- so the decode branches below stay on
-        # `state_indices`. Falling back to the write slot leaves every non-fork
-        # forward bit-identical. Mirrors attention_gdn.py.
+        # resumes from whatever the recycled group still held. Under pp=1 only
+        # prefill carries a fork, since the checkpoint is taken between prompt
+        # chunks; under pp>1 it lands after the prompt, so the decode and
+        # spec-decode branches below read it too.
+        # Falling back to the write slot leaves every non-fork forward
+        # bit-identical. Mirrors attention_gdn.py.
         state_indices_in = kda_metadata.non_spec_state_indices_in_tensor
         if state_indices_in is None:
             state_indices_in = state_indices
@@ -1406,6 +1407,7 @@ class KimiKDAAttention(nn.Module):
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
             decode_state_indices = state_indices[:num_actual_tokens]
+            decode_state_indices_in = state_indices_in[:num_actual_tokens]
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -1415,6 +1417,7 @@ class KimiKDAAttention(nn.Module):
                 None,
                 self.activation,
                 conv_state_indices=decode_state_indices,
+                conv_state_indices_in=decode_state_indices_in,
                 validate_data=False,
             )
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
@@ -1452,6 +1455,7 @@ class KimiKDAAttention(nn.Module):
                     o=out,
                     use_qk_l2norm_in_kernel=True,
                     lower_bound=self._kda_gate_lower_bound,
+                    fork_slots=kda_metadata.replayssm_fork_slots,
                 )
             else:
                 fused_sigmoid_gating_delta_rule_update(
@@ -1467,6 +1471,7 @@ class KimiKDAAttention(nn.Module):
                     inplace_final_state=True,
                     cu_seqlens=query_start_loc[: kda_metadata.num_decodes + 1],
                     ssm_state_indices=decode_state_indices,
+                    ssm_state_indices_in=decode_state_indices_in,
                     use_qk_l2norm_in_kernel=True,
                     is_kda=True,
                     lower_bound=self._kda_gate_lower_bound,
@@ -1476,6 +1481,10 @@ class KimiKDAAttention(nn.Module):
             spec_state_indices = kda_metadata.spec_state_indices_tensor
             spec_query_start_loc = kda_metadata.spec_query_start_loc
             num_accepted_tokens = kda_metadata.num_accepted_tokens
+            # Under pp>1 the first verify after the prompt can fork off a
+            # checkpoint: the builder then ships the source as the read side.
+            spec_state_indices_in = kda_metadata.spec_state_indices_in_tensor
+            nsd = kda_metadata.num_spec_decodes
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -1486,9 +1495,12 @@ class KimiKDAAttention(nn.Module):
                 self.activation,
                 # First reserved slot per seq holds the resume state; the kernel
                 # walks forward via num_accepted_tokens + query_start_loc.
-                conv_state_indices=spec_state_indices[:, 0][
-                    : kda_metadata.num_spec_decodes
-                ],
+                conv_state_indices=spec_state_indices[:nsd, 0],
+                conv_state_indices_in=(
+                    None
+                    if spec_state_indices_in is None
+                    else spec_state_indices_in[:nsd, 0]
+                ),
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
                 # Verify window: sizes the conv rollback window and hence the
@@ -1506,7 +1518,6 @@ class KimiKDAAttention(nn.Module):
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
             if getattr(kda_metadata, "replayssm", False):
-                nsd = kda_metadata.num_spec_decodes
                 replayssm_sigmoid_gating_delta_rule(
                     q,
                     k,
@@ -1526,6 +1537,7 @@ class KimiKDAAttention(nn.Module):
                     o=out,
                     use_qk_l2norm_in_kernel=True,
                     lower_bound=self._kda_gate_lower_bound,
+                    fork_slots=kda_metadata.replayssm_fork_slots,
                 )
             else:
                 fused_sigmoid_gating_delta_rule_update(
@@ -1546,6 +1558,7 @@ class KimiKDAAttention(nn.Module):
                     # num_accepted_tokens the kernel reads the resume state from
                     # slot[num_accepted-1] and writes a snapshot after each token.
                     ssm_state_indices=spec_state_indices,
+                    ssm_state_indices_in=spec_state_indices_in,
                     num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
                     is_kda=True,
