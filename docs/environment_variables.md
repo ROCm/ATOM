@@ -307,6 +307,7 @@ that ever changes, so a fusion left inert by an unrecognised layout says so.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_RELAXED_MTP** | bool | 0 (false) | Accept a draft token when it lands in the target's top 10 within 0.6 of the top logit, instead of requiring the argmax. Intended for quantized MTP heads, whose drafts are right about the region and wrong about the exact winner often enough that strict acceptance throws away usable tokens. Read once at `rejection_sampler` import, so it must be set before the server starts. |
+| **ATOM_GREEDY_SHARDED_ARGMAX** | bool | 0 (false) | On a speculative verify step that is all greedy, returns no logprobs, uses the plain greedy rejection path (no relaxed MTP, no synthetic acceptance), has no required-channel or structured requests, and runs pure TP > 1 (DP 1, PCP 1), the target LM head returns token ids (each rank's shard argmax, all-gathered as `[N, 2]`) instead of all-gathering `[N, vocab]` logits. The ids are bitwise-identical to the full-vocab argmax. Any other step keeps the logits path. |
 
 ## Engram (DeepSeek-V4.1)
 

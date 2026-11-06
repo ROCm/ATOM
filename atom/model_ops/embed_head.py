@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import contextlib
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -225,6 +227,24 @@ class ReplicatedEmbedding(nn.Module):
         return replicated_embedding(x, self.weight)
 
 
+_emit_greedy_token_ids = False
+
+
+@contextlib.contextmanager
+def greedy_token_ids_head():
+    """Inside it, a TP-sharded ``ParallelLMHead.forward`` returns ``[N]`` int32
+    greedy token ids (``compute_argmax_token``) instead of ``[N, vocab]``
+    logits. The caller (the runner's greedy verify step) owns the decision;
+    it must be TP-uniform, since the head's collective changes shape."""
+    global _emit_greedy_token_ids
+    prev = _emit_greedy_token_ids
+    _emit_greedy_token_ids = True
+    try:
+        yield
+    finally:
+        _emit_greedy_token_ids = prev
+
+
 def empty_token_ids(hidden: torch.Tensor) -> torch.Tensor:
     """Storage ``compute_argmax_token`` answers into, for a caller holding none.
 
@@ -263,6 +283,8 @@ class ParallelLMHead(VocabParallelEmbedding):
                 x = x[last_indices].contiguous()
             if self._can_use_dp_sharded_head(context):
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
+        if _emit_greedy_token_ids and self.tp_size > 1:
+            return self.compute_argmax_token(x, out=empty_token_ids(x))
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
             use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER

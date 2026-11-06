@@ -979,6 +979,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # counters (modes, overridden steps, guard trips), one JSON file per
     # process, rewritten every step. Unset: off.
     "ATOM_V4_CG_INSTR_DIR": lambda: os.getenv("ATOM_V4_CG_INSTR_DIR") or None,
+    # Greedy verify without the full-vocab logits gather: on an all-greedy,
+    # logprob-free speculative decode step at TP > 1 the target LM head emits
+    # token ids (each rank's shard argmax, all-gathered as [N, 2]) instead of
+    # all-gathering [N, vocab] logits. Bitwise-identical ids. Default off.
+    "ATOM_GREEDY_SHARDED_ARGMAX": lambda: (
+        os.getenv("ATOM_GREEDY_SHARDED_ARGMAX", "0").lower() in ("1", "true")
+    ),
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),

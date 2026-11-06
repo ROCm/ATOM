@@ -89,12 +89,13 @@ from atom.model_ops.decode_input_ids import (
     NEW_SEQUENCE,
     fill_deferred_decode_ids,
 )
+from atom.model_ops.embed_head import greedy_token_ids_head
 from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
 from atom.model_ops.indexer.schedule import skips_index_topk
-from atom.model_ops.rejection_sampler import RejectionSampler
+from atom.model_ops.rejection_sampler import RELAXED_TOP_N, RejectionSampler
 from atom.model_ops.required_channel import (
     DeviceChannel,
     advance_states,
@@ -751,6 +752,10 @@ def _profile_runner_stage(method):
 
 
 class ModelRunner:
+    # `forward`'s greedy-ids step (`_can_emit_greedy_token_ids`); True only
+    # around that forward's run_model call.
+    _greedy_token_ids_step = False
+
     def __init__(self, rank: int, config: Config):
         self.config = config
         self.structured_output = None
@@ -3485,30 +3490,53 @@ class ModelRunner:
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
-            target_logits = torch.index_select(logits, 0, target_logits_indices)
-            channel = self._constrain_required_channel(
-                batch, bonus_logits, spec_decode_metadata, target_logits
-            )
-            target_token_ids = None
-            if not all_greedy:
-                target_token_ids = self.sampler.sample_verification_tokens(
-                    target_logits,
-                    spec_decode_metadata.cu_num_draft_tokens,
-                    temperatures,
-                    top_ks,
-                    top_ps,
+            channel = None
+            if logits.ndim == 1:
+                # Greedy ids from the sharded head (`_can_emit_greedy_token_ids`):
+                # the argmax the sampler and the greedy rejection path would
+                # take of the full logits, bitwise. The rejection sampler reads
+                # `target_token_ids` alone; its probs operand is shape-only.
+                # The gate excludes required-channel and structured batches,
+                # so there is no logit mask to apply.
+                greedy_ids = logits
+                bonus_token_ids = torch.index_select(
+                    greedy_ids, 0, bonus_logits_indices
                 )
-                if target_token_ids.numel() and get_tp_group().world_size > 1:
-                    target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
-            bonus_token_ids = self.sampler(
-                logits=bonus_logits,
-                temperatures=temperatures,
-                top_ks=top_ks,
-                top_ps=top_ps,
-                all_greedy=all_greedy,
-                needs_independent_noise=needs_independent_noise or not all_greedy,
-            )
+                target_token_ids = torch.index_select(
+                    greedy_ids, 0, target_logits_indices
+                )
+                target_logits = torch.empty(
+                    (target_token_ids.shape[0], 0),
+                    dtype=torch.float32,
+                    device=greedy_ids.device,
+                )
+            else:
+                bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+                target_logits = torch.index_select(logits, 0, target_logits_indices)
+                channel = self._constrain_required_channel(
+                    batch, bonus_logits, spec_decode_metadata, target_logits
+                )
+                target_token_ids = None
+                if not all_greedy:
+                    target_token_ids = self.sampler.sample_verification_tokens(
+                        target_logits,
+                        spec_decode_metadata.cu_num_draft_tokens,
+                        temperatures,
+                        top_ks,
+                        top_ps,
+                    )
+                    if target_token_ids.numel() and get_tp_group().world_size > 1:
+                        target_token_ids = get_tp_group().broadcast(
+                            target_token_ids, src=0
+                        )
+                bonus_token_ids = self.sampler(
+                    logits=bonus_logits,
+                    temperatures=temperatures,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    all_greedy=all_greedy,
+                    needs_independent_noise=needs_independent_noise or not all_greedy,
+                )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,
@@ -3730,7 +3758,21 @@ class ModelRunner:
             self.structured_output.prepare(
                 batch, get_forward_context().spec_decode_metadata
             )
-        logits, hidden_states = self.run_model(input_ids, batch)
+        self._greedy_token_ids_step = self._can_emit_greedy_token_ids(batch, all_greedy)
+        if envs.ATOM_GREEDY_SHARDED_ARGMAX and not batch.is_dummy_run:
+            self._count_greedy_token_ids_step(batch)
+        # On a greedy-ids step every target-head call (the runner's own or a
+        # run_model wrapper's) emits [N] int32 greedy ids, which postprocess's
+        # greedy-ids path consumes instead of logits.
+        head_mode = (
+            greedy_token_ids_head() if self._greedy_token_ids_step else nullcontext()
+        )
+        try:
+            with head_mode:
+                logits, hidden_states = self.run_model(input_ids, batch)
+        finally:
+            # set for this forward's run_model only; other callers never see it
+            self._greedy_token_ids_step = False
         self._settle_target_pcp_split()
         drafter = getattr(self, "drafter", None)
 
@@ -3806,6 +3848,46 @@ class ModelRunner:
         self._record_forward_vars_event()
         self._record_kv_cache_ready(batch)
         return fwd_output
+
+    def _count_greedy_token_ids_step(self, batch) -> None:
+        """Host-only hit audit for ``ATOM_GREEDY_SHARDED_ARGMAX``: rank 0 prints
+        cumulative greedy-ids steps / rows against all real forwards."""
+        counts = self.__dict__.setdefault("_greedy_ids_counts", [0, 0, 0, 0])
+        rows = int(batch.total_tokens_num)
+        counts[0] += 1
+        counts[1] += rows
+        if self._greedy_token_ids_step:
+            counts[2] += 1
+            counts[3] += rows
+        if self.rank == 0 and (
+            counts[2] == 1 and self._greedy_token_ids_step or counts[0] % 512 == 0
+        ):
+            forwards, rows_all, greedy_steps, greedy_rows = counts
+            print(
+                f"GREEDY_SHARDED_ARGMAX_HITS forwards={forwards} rows={rows_all}"
+                f" greedy_steps={greedy_steps} greedy_rows={greedy_rows}",
+                flush=True,
+            )
+
+    def _can_emit_greedy_token_ids(self, batch, all_greedy) -> bool:
+        """May this step's target head emit greedy ids instead of logits
+        (``ATOM_GREEDY_SHARDED_ARGMAX``)? Only a speculative verify whose every
+        consumer reads argmax ids alone: all greedy, no logprobs, the plain
+        greedy rejection path, pure TP > 1. Every input is TP-uniform."""
+        return bool(
+            envs.ATOM_GREEDY_SHARDED_ARGMAX
+            and all_greedy
+            and get_forward_context().spec_decode_metadata is not None
+            and not any(batch.return_logprobs)
+            and getattr(self, "rejection_sampler", None) is not None
+            and self.rejection_sampler.synthetic_acceptance_rates is None
+            and RELAXED_TOP_N <= 1
+            and get_tp_group().world_size > 1
+            and get_dp_group().world_size == 1
+            and get_pcp_world_size() == 1
+            and getattr(batch, "required_channel", None) is None
+            and not getattr(batch, "structured_requests", None)
+        )
 
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:
