@@ -441,14 +441,20 @@ class BlockGPUConnector:
 
     @staticmethod
     def _wait_for_save_source(state, producer_event) -> None:
-        """Order the actual pack stream after the KV producer stream.
+        """Order the pack after the KV producer, on the host.
 
         Must run before this call enqueues anything on ``state.pack_stream``:
         the block-ID upload and every stage-A pack are ordered behind the
-        producer only because they are enqueued after this wait. A staging
-        state without a pack stream cannot honor the dependency; the fused
-        staging pipeline rejects that device anyway, so refuse loudly instead of
-        host-synchronizing on the save thread.
+        producer only because they are enqueued after this wait.
+
+        The wait is a host wait on the save thread, never a device-side
+        ``wait_event``. On ROCm a stream wait on an unfinished event is a
+        one-work-item kernel that polls the event; when the engine's stream
+        runs a kernel that needs every CU co-resident (a persistent kernel,
+        one CTA per CU), that polling kernel can hold the slot one of its CTAs
+        needs while it waits for the signal that kernel would set, and both
+        hang. The save thread is off the scheduler's path, so blocking it
+        costs nothing the engine waits on.
         """
 
         if state.pack_stream is None:
@@ -456,7 +462,7 @@ class BlockGPUConnector:
                 "ATOM LMCache connector: producer fence requires a CUDA/HIP "
                 "pack stream"
             )
-        state.pack_stream.wait_event(producer_event)
+        producer_event.synchronize()
 
     def _ensure_staging_buffer(
         self,

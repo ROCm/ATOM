@@ -42,6 +42,9 @@ class _PipelineHarness:
         def record(self, _stream):
             pass
 
+        def synchronize(self):
+            pass
+
 
 def _cpu_connector(monkeypatch):
     monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "2")

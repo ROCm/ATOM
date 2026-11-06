@@ -156,7 +156,11 @@ def run_staged_pipeline(
     try:
         for group in groups:
             if fenced and staging_buffer.free_event_valid:
-                stage_a.stream.wait_event(staging_buffer.free_event)
+                # Host waits throughout, never a device-side `wait_event`: on
+                # ROCm that is a polling kernel which can deadlock against a
+                # co-resident persistent kernel on the compute stream (see
+                # `BlockGPUConnector._wait_for_save_source`).
+                staging_buffer.free_event.synchronize()
             with state.stream_ctx(stage_a.stream):
                 # ``ensure_buffer`` may allocate device storage. Allocate it on
                 # the first consumer stream so a caching allocator cannot
@@ -167,7 +171,7 @@ def run_staged_pipeline(
                 stage_a.run(group, device_buf)
             if fenced:
                 staging_buffer.ready_event.record(stage_a.stream)
-                stage_b.stream.wait_event(staging_buffer.ready_event)
+                staging_buffer.ready_event.synchronize()
             with state.stream_ctx(stage_b.stream):
                 stage_b.run(group, device_buf)
             if fenced:
