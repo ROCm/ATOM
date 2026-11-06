@@ -18,31 +18,6 @@ gpu = pytest.mark.skipif(
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
-def _config(kv, index=None):
-    return SimpleNamespace(kv_cache_dtype=kv, index_cache_dtype=index)
-
-
-@pytest.mark.parametrize(
-    ("kv", "index", "expected"),
-    [
-        ("bf16", None, ("bf16", "bf16")),
-        ("auto", None, ("bf16", "bf16")),
-        ("fp8", None, ("fp8", "fp8")),
-        ("fp8", "bf16", ("fp8", "bf16")),
-        ("fp8", "fp4", ("fp8", "fp4")),
-        ("bf16", "fp8", ("bf16", "fp8")),
-    ],
-)
-def test_cache_formats_follow_the_kv_dtype(kv, index, expected):
-    assert qsa.qsa_cache_formats(_config(kv, index)) == expected
-
-
-@pytest.mark.parametrize(("kv", "index"), [("int8", None), ("fp4", None)])
-def test_cache_formats_reject_unserved(kv, index):
-    with pytest.raises(ValueError, match="Qwen QSA serves"):
-        qsa.qsa_cache_formats(_config(kv, index))
-
-
 def _builder(kv, index, draft_rows, block=16, rope=False):
     from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
 

@@ -258,6 +258,12 @@ def entry_bytes_for(fields: list[EntryField]) -> int:
     return _align_up(end)
 
 
+def published_bytes_for(fields: list[EntryField]) -> int:
+    """Bytes one entry publishes as transfer regions: `entry_bytes_for`
+    without the alignment gaps between fields."""
+    return sum(field.bytes_per_entry for field in fields)
+
+
 def checkpoint_ranges_for(fields: list[EntryField]) -> list[tuple[int, int]]:
     """`(offset, num_bytes)` of an entry a checkpoint image holds.
 
@@ -582,3 +588,26 @@ class LayerMajorArena:
             typed.storage_offset()
             + self._offsets[field.name] * self.entries // itemsize,
         )
+
+    def region_layout(self) -> list[tuple[int, int]]:
+        """`(base address, bytes per entry)` of each field's layers, from the
+        declared offsets rather than `view`."""
+        base = self.buf.data_ptr()
+        regions: list[tuple[int, int]] = []
+        for field in self.fields:
+            unit = field.per_layer_numel * field.dtype.itemsize
+            start = base + self._offsets[field.name] * self.entries
+            regions.extend(
+                (start + layer * unit * self.entries, unit)
+                for layer in range(field.layers)
+            )
+        return regions
+
+    def region_tensors(self) -> list[tuple[str, torch.Tensor]]:
+        """One `(role, view(name)[layer])` per (field, layer), in field order."""
+        return [
+            (f"{field.name}.layer_{layer}", view[layer])
+            for field in self.fields
+            for view in (self.view(field.name),)
+            for layer in range(field.layers)
+        ]
