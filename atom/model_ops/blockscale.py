@@ -327,6 +327,15 @@ def native_quant_linear(
         return output.view(*x.shape[:-1], n) if batched else output
 
     if not fp4 and _use_group32_bf16_fallback():
+        # A norm that other readers share leaves the scale empty and a BF16
+        # activation. The GEMM quantizes that input itself. hipBLAS on gfx942
+        # decodes FNUZ, which is what quantize_fp8 writes here.
+        if x_scale is None:
+            if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+                raise ValueError(
+                    "gfx942 group32 GEMM needs a scale or a floating activation"
+                )
+            x, x_scale = quantize_fp8(x)
         return _group32_bf16_gemm(
             x,
             weight,
