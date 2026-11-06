@@ -3936,13 +3936,18 @@ def test_m3_store_namespace_separates_complete_pages_from_dense_codec(monkeypatc
 
 @pytest.mark.parametrize("layout", ["dense", "m3"])
 def test_store_codec_version_changes_only_its_own_namespace(monkeypatch, layout):
+    from atom.kv_transfer.offload.hybrid.m3 import codec as m3_codec
+
     config = _config()
     monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: layout)
     namespace = keys.store_namespace(config, CHUNK)
-    own, other = (
-        ("M3_CODEC_ID", "CODEC_ID") if layout == "m3" else ("CODEC_ID", "M3_CODEC_ID")
-    )
-    monkeypatch.setattr(keys, other, "other-codec-next-version")
+    if layout == "m3":
+        own = (m3_codec, "M3_CODEC_ID")
+        other = (keys, "CODEC_ID")
+    else:
+        own = (keys, "CODEC_ID")
+        other = (m3_codec, "M3_CODEC_ID")
+    monkeypatch.setattr(*other, "other-codec-next-version")
     assert keys.store_namespace(config, CHUNK) == namespace
-    monkeypatch.setattr(keys, own, "own-codec-next-version")
+    monkeypatch.setattr(*own, "own-codec-next-version")
     assert keys.store_namespace(config, CHUNK) != namespace

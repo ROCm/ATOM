@@ -19,7 +19,9 @@ Defines three backends registered by the shared KV connector factory:
   start its master and owners and set ``ATOM_KV_OFFLOAD=mooncake_store`` with
   ``ATOM_KV_OFFLOAD_EXTRA_CONFIG`` naming them (``mooncake_store.master`` and
   ``mooncake_store.metadata``, or ``mooncake_store.pools``). Moves the dense
-  KV layout and V4.1's PAGE regions (state is rebuilt by replay).
+  KV layout, MiniMax-M3/M3.1 PAGE layout, and V4.1's PAGE regions (state is
+  rebuilt by replay). Other stateful layouts and DCP greater than 1 stay
+  refused.
 """
 
 
@@ -68,9 +70,9 @@ def register_backends(factory) -> None:
         # One Mooncake Store for every DP rank.
         shared_tier=True,
         chunk_tokens="atom.kv_transfer.offload.mooncake_store.config:store_chunk_tokens",
-        # Dense layout: the codec builds from `KVCacheTensor`s and never reads the
-        # region map; V4.1's PAGE layout does (`topology_reads_block_regions`
-        # refines this by layout, as for `lmcache_offload`).
+        # The dense codec builds from `KVCacheTensor`s and ignores the region map.
+        # M3 and V4.1 PAGE layouts read it, and which one applies comes from the
+        # model, so `topology_reads_block_regions` refines this by layout.
         reads_block_regions=False,
         # Dense and PAGE codecs preserve all planes, including FP4 index scales.
         copies_whole_block_regions=True,

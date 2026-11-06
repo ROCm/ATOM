@@ -366,7 +366,8 @@ class KVConnectorFactory:
             return True
         if cls._offload.get(connector, False):
             # An offload tier reads the map only on a PAGE layout; the dense
-            # codec builds from the `KVCacheTensor`s.
+            # codec builds from the `KVCacheTensor`s. M3 and V4.1 are PAGE
+            # layouts, so `mooncake_store` reads the map for both.
             from atom.kv_transfer.offload.config import select_offload_layout
 
             return select_offload_layout(config) != "dense"

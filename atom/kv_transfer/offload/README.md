@@ -386,7 +386,7 @@ Dense layouts use `DenseKVByteCodec`. MiniMax-M3 and M3.1 use
 `DSV4PageSlotCodec` with complete PAGE regions and no SLOT state: the ordered
 target K/V, scale, index-cache and draft regions from
 `KVTransferTensors.block_regions`. A tensor view must exist for every region.
-The `m3-complete-page-v1` codec namespace keeps these objects separate from
+The `m3-page-regions` codec namespace keeps these objects separate from
 dense KV objects and from V4.1's `v41-replay-page-v1` objects. V4.1 stores PAGE
 regions only; its request state is rebuilt by replay. Other stateful layouts
 and DCP greater than 1 remain unsupported.

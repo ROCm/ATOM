@@ -48,10 +48,6 @@ _NAMESPACE_PREFIX = "atomkv1-"
 # Bumped when the dense codec's per-chunk byte layout changes.
 CODEC_ID = "dense-opaque-block-v1"
 REPLAY_PAGE_CODEC_ID = "v41-replay-page-v1"
-# M3 packs each block's regions in publication order (pool -> field -> layer,
-# then draft merge_pages). Bump when the M3 region order or set changes, even
-# if the total byte count stays the same: existing Store objects outlive servers.
-M3_CODEC_ID = "m3-complete-page-v1"
 
 
 def pp_stage_layer_spans(config: Any) -> list[tuple[int, int]]:
@@ -125,9 +121,16 @@ def kv_storage_formats(config: Any) -> dict[str, str]:
 
 
 def _codec_id(config: Any) -> str:
-    """The codec version folded into this server's Store namespace."""
+    """The codec version folded into this server's Store namespace.
+
+    M3's id lives with the codec that defines its region order. It is imported
+    only for that layout, so a dense or V4.1 server does not load the M3
+    connector.
+    """
     layout = offcfg.select_offload_layout(config)
     if layout == "m3":
+        from atom.kv_transfer.offload.hybrid.m3.codec import M3_CODEC_ID
+
         return M3_CODEC_ID
     if uses_replay_pages(config):
         return REPLAY_PAGE_CODEC_ID

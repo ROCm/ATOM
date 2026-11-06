@@ -8,6 +8,11 @@ from __future__ import annotations
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 
+# Publication order is pool -> field -> layer, then the draft's merge_pages.
+# Bump when that order or the region set changes, even if the total byte count
+# stays the same: existing Store objects outlive the servers that wrote them.
+M3_CODEC_ID = "m3-page-regions"
+
 
 def build_m3_page_codec(
     transfer_tensors: KVTransferTensors | None, num_blocks: int | None = None
@@ -15,8 +20,8 @@ def build_m3_page_codec(
     """Pack all published PAGE regions, including the NSA index and draft KV.
 
     M3's per-layer kv_caches includes target and draft K/V/scales, but only
-    block_regions includes the NSA index cache. Preserve publication order;
-    changes to that order or region set require a Store M3_CODEC_ID bump.
+    block_regions includes the NSA index cache. Preserve publication order.
+    A change to that order or region set bumps ``M3_CODEC_ID``.
     """
     pages = getattr(transfer_tensors, "block_regions", ())
     if not pages or getattr(transfer_tensors, "slot_regions", ()):
