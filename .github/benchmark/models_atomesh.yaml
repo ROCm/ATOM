@@ -238,6 +238,58 @@ models:
           run_eval: true
           eval_concurrency: [128, 512]
 
+      accuracy:
+        - &dsv4_ep_moriio
+          name: ds-v4-1p1d-dpa8-ep8-ll-moriio-gsm8k
+          topology: 1p1d_dpa8_ep8_ll_moriio
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill: &dsv4_ep_prefill
+            extra_args: "--enable-dp-attention --enable-expert-parallel"
+          decode: &dsv4_ep_decode
+            extra_args: "--enable-dp-attention --enable-expert-parallel --all2all-backend low-latency"
+            cudagraph: "[1,2,4,8,16,32,64]"
+          server:
+            common_args: &dsv4_ep_args
+              decode_max_num_seqs: 256
+          env:
+            common: &dsv4_ep_env
+              KV_CONNECTOR: moriio
+              MORI_SHMEM_HEAP_SIZE: 16G
+              HSA_NO_SCRATCH_RECLAIM: "1"
+            decode: &dsv4_ep_decode_env
+              ATOM_MORI_V1_LL: "1"
+          benchmark:
+            wait_server_timeout: 7200
+          run_eval: true
+          eval_only: true
+          accuracy:
+            threshold: 0.90
+        - <<: *dsv4_ep_moriio
+          name: ds-v4-2p2d-dpa16-ep16-ll-moriio-gsm8k
+          topology: 1p1d_dpa16_ep16_ll_moriio
+          display_topology: 2P2D-DPA16-EP16-LL-MORIIO
+          prefill:
+            <<: *dsv4_ep_prefill
+            nodes_per_worker: 2
+          decode:
+            <<: *dsv4_ep_decode
+            nodes_per_worker: 2
+          server:
+            common_args:
+              <<: *dsv4_ep_args
+              gpu_memory_utilization: 0.70
+          env:
+            common:
+              <<: *dsv4_ep_env
+              ATOM_DP_LM_HEAD_MODE: default
+            decode:
+              <<: *dsv4_ep_decode_env
+              MORI_EP_BLOCK_NUM: "64"
+              MORI_EP_RDMA_BLOCK_NUM: "32"
+
     accuracy:
       task: gsm8k
       fewshot: 3
