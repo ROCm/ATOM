@@ -287,19 +287,19 @@ def test_padded_prefill_fills_pad_rows_when_the_pa_cannot(monkeypatch):
     assert torch.equal(scale[_ROWS:], torch.ones((_BUCKET - _ROWS, 1)))
 
 
-def test_sparse_decode_keeps_a_non_cluster8_split_for_the_fp8_output(monkeypatch):
+def _decode_rows(monkeypatch, rows, **kwargs):
     captured = {}
     monkeypatch.setattr(
-        base_attention, "run_pa_decode", lambda **kwargs: captured.update(kwargs)
+        base_attention, "run_pa_decode", lambda **kw: captured.update(kw)
     )
     monkeypatch.setattr(base_attention, "_flydsl_output_quant_option", lambda _: True)
     monkeypatch.setattr(
         "aiter.ops.triton.gluon.pa_decode_gluon.get_recommended_splits",
         lambda *_: 4,
     )
-    rows = 128
+    monkeypatch.setattr(sparse_attn, "_cluster_resident_rows", lambda _: 240)
     q = torch.randn(rows, 16, 128, dtype=torch.bfloat16)
-    args = (
+    sparse_attn.sparse_pa_per_row(
         q,
         torch.empty((1, 1, 8, 16, 16), dtype=torch.uint8),
         torch.empty((1, 1, 1, 128, 16), dtype=torch.uint8),
@@ -310,15 +310,28 @@ def test_sparse_decode_keeps_a_non_cluster8_split_for_the_fp8_output(monkeypatch
         torch.empty_like(q),
         None,
         None,
+        quantized_output=torch.empty((rows, 16, 128), dtype=torch.uint8),
+        output_scale=torch.empty((rows, 1), dtype=torch.float32),
+        **kwargs,
     )
-    quant = {
-        "quantized_output": torch.empty((rows, 16, 128), dtype=torch.uint8),
-        "output_scale": torch.empty((rows, 1), dtype=torch.float32),
-    }
+    return captured
 
-    sparse_attn.sparse_pa_per_row(*args, **quant, quantized_direct=False)
-    assert captured["max_context_partition_num"] == 4
+
+def test_fp8_decode_rows_get_one_cluster_of_eight_each(monkeypatch):
+    # 128 decode rows: eight splits with a budget of eight tasks per row, so
+    # the fused cluster8 epilogue applies instead of a split it cannot quantize.
+    captured = _decode_rows(monkeypatch, 128, quantized_direct=False)
+    assert captured["plan_partition_cap"] == 8
+    assert captured["plan_workgroup_budget"] == 8 * 128
+
+
+def test_fp8_decode_rows_past_resident_clusters_keep_the_split(monkeypatch):
+    captured = _decode_rows(monkeypatch, 241, quantized_direct=False)
     assert captured["plan_partition_cap"] == 4
+    assert captured["plan_workgroup_budget"] is None
 
-    sparse_attn.sparse_pa_per_row(*args, **quant)
-    assert captured["max_context_partition_num"] == 1
+
+def test_fp8_prefill_rows_stay_direct(monkeypatch):
+    captured = _decode_rows(monkeypatch, 128)
+    assert captured["plan_partition_cap"] == 1
+    assert captured["plan_workgroup_budget"] is None
