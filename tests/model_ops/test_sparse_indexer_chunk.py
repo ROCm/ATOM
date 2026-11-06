@@ -203,6 +203,40 @@ def test_concat_plane_width_is_aiter_s_row_pitch():
     assert concat_plane_width(359_768) == 359_936
 
 
+@pytest.mark.parametrize(
+    "keys, plane, expected",
+    [(4096, None, 4096), (1000, 4096, 1000), (4096, 1023, 768), (4096, 1024, 1024)],
+)
+def test_concat_group_capacity_accounts_for_the_aligned_row(keys, plane, expected):
+    from atom.model_ops.sparse_indexer_chunk import concat_group_capacity
+
+    capacity = concat_group_capacity(keys, plane)
+    assert capacity == expected
+    if plane is not None:
+        assert concat_plane_width(capacity) <= plane
+
+
+@pytest.mark.parametrize(
+    "lengths, capacity, expected",
+    [([], 256, []), ([256], 256, [(0, 1)]), ([128, 128, 1], 256, [(0, 2), (2, 3)])],
+)
+def test_concat_groups_fit_at_the_capacity_boundary(lengths, capacity, expected):
+    from itertools import accumulate
+
+    from atom.model_ops.sparse_indexer_chunk import pack_concat_groups
+
+    assert (
+        pack_concat_groups(list(accumulate(lengths, initial=0)), capacity) == expected
+    )
+
+
+def test_concat_groups_reject_an_oversized_request():
+    from atom.model_ops.sparse_indexer_chunk import pack_concat_groups
+
+    with pytest.raises(ValueError, match="request 1 has 257 keys"):
+        pack_concat_groups([0, 100, 357], 256)
+
+
 def test_concat_key_workspace_hands_out_views_of_held_buffers():
     """The gathered keys come back as views of buffers held across steps: a
     step that fits takes no allocation, one past them doubles them once."""
