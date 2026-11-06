@@ -1,0 +1,28 @@
+{
+  "measured_run": "validation/dec_moe2_t32_svc_20261103/gsm2_cf1_HRC_r1",
+  "measured_base": {
+    "atom": "9a821a52d",
+    "aiter": "c141da6bd10300dfc22da7777c23efc6c7b88712"
+  },
+  "equivalence": "ast.dump(include_attributes=False) with docstrings whitespace-stripped; only black/noqa formatting differs",
+  "modules": {
+    "commfused_v13.py": {
+      "frozen": "commfused_v13.frozen.py",
+      "frozen_sha256": "87242280721c649419c7f6f54cc6db9c5d48950ccae2b1a55bbc51972102cf1f",
+      "normalized_ast_sha256": "b8959a011308215c62ae7a420b2993ae280fe273e91dcd1c38a410fafc12100e"
+    },
+    "rope_nw_v7.py": {
+      "frozen": "rope_nw_v7.frozen.py",
+      "frozen_sha256": "2a30692fb2b749082025b6ccecb2c4905ce23a09bc06a88f06997c39e8e0f639",
+      "normalized_ast_sha256": "37de78ac871da3e554187ccf6329904540af1d9603c4254fd982315f51b64145"
+    },
+    "decode_fp8_wait0_v5.py": {
+      "frozen": "decode_fp8_wait0_v5.frozen.py",
+      "frozen_sha256": "e16856f311d10419c2538b3dcfebf06b55b7eee42550a5895e6cfd21ff10a314",
+      "normalized_ast_sha256": "a7a4d41c27a3b39f709217390de76c3e839b010e31de81822cc6b24d06ae31e6"
+    }
+  },
+  "csv": {
+    "dsv41_fp8_tuned_fmoe.csv": "9c78fdb9ebfa849919b9c81e8ada579007f6e0d2673b7a742aec449353f41ddd"
+  }
+}
