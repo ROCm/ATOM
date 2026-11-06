@@ -1,5 +1,3 @@
-# ruff: noqa: S102
-# Keep measured import ordering/namespace; AST parity is verified by prepare.py.
 """Opt-in, host-only diagnostics. Install after the existing owner bootstrap.
 
 Snapshots are requested while the client has drained its warmup/formal requests.
@@ -65,7 +63,9 @@ def bind_replay_source(source, namespace, name, observe):
         ast.Name(id=n, ctx=ast.Load()) for n in ("self", "graph", "rows", "metadata")
     ]
     ns = dict(namespace, _p0_replayed=observe, _p2_trace_replay=tagged_replay)
-    exec(compile(ast.fix_missing_locations(tree), "<p0-owner-observer>", "exec"), ns)
+    exec(  # noqa: S102
+        compile(ast.fix_missing_locations(tree), "<p0-owner-observer>", "exec"), ns
+    )
     return ns[name]
 
 
@@ -167,7 +167,7 @@ def install():
     if root_value is None:
         return
     from atom.model_engine.model_runner import ModelRunner
-    from atom.models.deepseek_v41.owner_service.owner_serving import OwnerServing
+    from atom.models.deepseek_v41.owner.service.owner_serving import OwnerServing
     from atom.spec_decode.draft_graph import DraftGraph
 
     if getattr(OwnerServing, "_p0_counter_installed", False):

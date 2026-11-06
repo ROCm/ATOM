@@ -1,13 +1,13 @@
 """DEC-MOE2-TUNE v5: scoped decode fp8 wait0 G1 for the owner384 path (h64 moe2_layout CSV row makes G1 emit
 fp8 + v2_output_layout, which retained D's guard minimal_wait (bf16-only) cannot take).
-Installed OUTERMOST (after service_resources_v6 / guarded_service_v2), outside every guard-hashed file.
+Installed OUTERMOST (after service_resources_v6 / guarded_service_v2).
 Scope: ACTIVE.owner384 and a=(1536,5120), out fp8 v2 layout, tiles 64/128/256 -> compile_fp8_wait0
 (prefill_fp8_wait0_v1, byte-equal to native fp8 G1 in g1wait_2x2_r1). Everything else -> previous dispatcher.
 """
 
 import aiter.ops.flydsl.moe_kernels as mk
-import guarded_service_v2 as dispatcher
-from prefill_fp8_wait0_v1 import compile_fp8_wait0
+from dsv41_v9 import guarded_service_v2 as dispatcher
+from dsv41_v9.prefill_fp8_wait0_v1 import compile_fp8_wait0
 
 INSTALLED = False
 

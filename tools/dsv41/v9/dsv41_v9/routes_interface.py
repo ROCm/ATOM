@@ -1,17 +1,16 @@
-# ruff: noqa: I001, S102
-# Keep measured import ordering/namespace; AST parity is verified by prepare.py.
-"""Explicit route tensor prototype using the pinned native stage2 implementation.
+"""Native MoE that returns per-route stage-2 outputs instead of their sum.
 
-No producer/consumer pending dictionary. Opaque registration and service dispatch
-remain separate integration work; this module alone enables no model path.
+`build_shadow` re-compiles AITER's `_flydsl_v2_stage2_wrapper` without its final
+`_run_moe_reduction` and returns the `(tokens, topk, hidden)` route tensor; an
+AST round trip asserts nothing else changed. `call_native_routes` runs the
+native `_fused_moe_impl` with that stage 2 swapped in.
 """
 
 import ast
-import hashlib
-import inspect
-import torch
-import aiter.fused_moe as _import_alias  # noqa: F401
 import importlib
+import inspect
+
+import torch
 
 fm = importlib.import_module("aiter.fused_moe")
 
@@ -77,16 +76,13 @@ def build_shadow():
         original, include_attributes=False
     )
     namespace = dict(fm._flydsl_v2_stage2_wrapper.__globals__)
-    exec(compile(tree, "<dsv41_explicit_routes_shadow>", "exec"), namespace)
-    return namespace[fn.name], {
-        "original_function_sha256": hashlib.sha256(source.encode()).hexdigest(),
-        "transform": "Only drop one final _run_moe_reduction expression and replace final return out with target.view(M,topk,H). Early scatter returns untouched, runtime guards require reduce/BF16/noFP8 route.",
-        "restored_AST_equal": True,
-        "shadow_source": ast.unparse(tree),
-    }
+    exec(  # noqa: S102
+        compile(tree, "<dsv41_explicit_routes_shadow>", "exec"), namespace
+    )
+    return namespace[fn.name]
 
 
-SHADOW, SOURCE_AUDIT = build_shadow()
+SHADOW = build_shadow()
 
 
 def override_stage2(*, ordinary_stage2, stage2_args, stage2_kwargs):

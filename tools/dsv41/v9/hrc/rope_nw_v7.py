@@ -6,13 +6,18 @@ mono check) goes through the proxy. DSV41_ROPE_NW=1 -> launch with num_warps=1 (
 unchanged; microbench rope_mb/ byte-equal vs default num_warps=4 at T in {1024,1536,8192}, H in {16,64},
 ring/no-ring). Unset -> pass-through (no num_warps kwarg), observer only.
 Counts are Python-call-time keyed (grid0, grid1, num_warps, capturing): captured graphs count once per capture.
-Dumps <run>/ropenw/counts_<pid>.json on every new key and every 4096 calls."""
+Dumps $P0_COUNTER_DIR/ropenw/counts_<pid>.json on every new key and every 4096
+calls when P0_COUNTER_DIR is set."""
 
 import importlib.abc, json, os, sys, threading  # noqa: I001
 from pathlib import Path
 
 TARGET = "atom.model_ops.deepseek_v41.rope_window"
-OUT = Path(os.environ["DSV41_SERVICE_RUN"]) / "ropenw"
+OUT = (
+    Path(os.environ["P0_COUNTER_DIR"]) / "ropenw"
+    if os.environ.get("P0_COUNTER_DIR")
+    else None
+)
 NW = int(os.environ["DSV41_ROPE_NW"]) if os.environ.get("DSV41_ROPE_NW") else None
 assert NW in (None, 1), NW
 COUNTS = {}
@@ -21,7 +26,9 @@ LOCK = threading.Lock()
 
 
 def _dump():
-    OUT.mkdir(exist_ok=True)
+    if OUT is None:
+        return
+    OUT.mkdir(parents=True, exist_ok=True)
     rows = [
         {"grid0": k[0], "grid1": k[1], "num_warps": k[2], "capturing": k[3], "count": v}
         for k, v in sorted(COUNTS.items(), key=str)

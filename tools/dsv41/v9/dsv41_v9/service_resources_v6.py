@@ -1,5 +1,3 @@
-# ruff: noqa: I001
-# Keep measured import ordering/namespace; AST parity is verified by prepare.py.
 """Snapshot actual graph/IPC bindings outside formal timing; same observer in A/B."""
 
 import functools
@@ -10,16 +8,18 @@ LOCAL = threading.local()
 
 
 def install():
-    import torch  # noqa: F401
     import aiter.ops.flydsl.moe_kernels as mk
-    from formal_counters import Counters
-    import guarded_service_v2 as dispatcher
+    import torch  # noqa: F401
+
+    from . import guarded_service_v2 as dispatcher
+    from .formal_counters import Counters
 
     enabled = os.environ.get("DSV41_COMBINED_GUARDED") == "1"
     if enabled:
         assert dispatcher.install()["installed"]
-        from prefill_fp8_wait0_v1 import corrected
-        import atom.models.deepseek_v41.prefill_ffn as pf
+        import atom.models.deepseek_v41.owner.prefill_ffn as pf
+
+        from .prefill_fp8_wait0_v1 import corrected
 
         original_stage, original_prefill = (
             mk.flydsl_moe_stage1,
@@ -93,7 +93,7 @@ def install():
             data["combined_service"] = dispatcher.snapshot()
             if dispatcher.STATE["ready"]:
                 state["owner_order_codes"] = binding(dispatcher.STATE["rs"].codes)
-            import explicit_routes
+            from . import explicit_routes
 
             state["prefill_adapters"] = [
                 {

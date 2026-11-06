@@ -1,4 +1,4 @@
-#include "native_include/custom_all_reduce.cuh"
+#include "custom_all_reduce.cuh"
 #include <cstdio>
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)

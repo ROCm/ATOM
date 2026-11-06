@@ -1,5 +1,3 @@
-# ruff: noqa: I001, S102
-# Keep measured import ordering/namespace; AST parity is verified by prepare.py.
 """Diagnostic GPU ring: one scalar store per layer, one step advance.
 
 No per-step CPU readback. The formal boundary snapshot waits for completion.
@@ -149,15 +147,18 @@ def instrument(original, call, where):
     ns = dict(
         original.__globals__, _workload_observe=observe, _workload_layer=set_layer
     )
-    exec(compile(ast.fix_missing_locations(tree), "<owner-workload-ring>", "exec"), ns)
+    exec(  # noqa: S102
+        compile(ast.fix_missing_locations(tree), "<owner-workload-ring>", "exec"), ns
+    )
     return functools.wraps(original)(ns[original.__name__])
 
 
 def install():
-    from atom.models.deepseek_v41.owner_service.owner_serving import (
+    from atom.models.deepseek_v41.owner.service.owner_serving import (
         OwnerServing,
     )
-    from formal_counters import Counters
+
+    from .formal_counters import Counters
 
     if getattr(OwnerServing, "_workload_installed", False):
         return

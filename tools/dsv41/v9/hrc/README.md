@@ -6,7 +6,7 @@ is opt-in; ordinary ATOM startup is unchanged.
 
 | Part | What | Switch |
 |------|------|--------|
-| D | V9 owner service (`../`, prepared by `../prepare.py`) | V9 `environment.list` |
+| D | V9 owner stack (`../`) | `--execution v9` |
 | G10 | TP-sharded greedy argmax, no full-vocab gather (`model_runner.py`, `embed_head.py`) | `ATOM_GREEDY_SHARDED_ARGMAX=1` |
 | H | moe2 layout row in `dsv41_fp8_tuned_fmoe.csv` + scoped decode FP8 wait0 G1 (`decode_fp8_wait0_v5.py`) | CSV in `AITER_CONFIG_FMOE` in place of AITER's `dsv41_fp8_tuned_fmoe.csv`, `DSV41_DECODE_FP8_WAIT0=1` |
 | R | rope window single-wave launch (`rope_nw_v7.py`) | `DSV41_ROPE_OBS=1 DSV41_ROPE_NW=1` |
@@ -14,17 +14,16 @@ is opt-in; ordinary ATOM startup is unchanged.
 
 ## Use
 
-1. Prepare D exactly as in `../README.md` (pinned AITER, pinned model source).
-2. Use the generated `environment.list`, prepend `ATOM/tools/dsv41/v9/hrc` to
-   `PYTHONPATH` (this `sitecustomize.py` runs the V9 bootstrap first, then H, R,
-   C in the measured order), and add the switches above.
-3. `rope_nw_v7` writes counters under `$DSV41_SERVICE_RUN/ropenw`. A failed
-   install exits the server process with 80 (H), 83 (R) or 86 (C).
+`python tools/dsv41/run_dashboard.py serve --execution hrc --aiter-source <aiter> --output <run>`
+sets everything above (`owner_stacks.hrc` in `tools/dsv41/dashboard_profile.json`):
+this directory first on `PYTHONPATH` (its `sitecustomize.py` runs the V9
+bootstrap, then H, R, C in that order) and `AITER_CONFIG_FMOE` as AITER's
+default merge with this CSV in place of `dsv41_fp8_tuned_fmoe.csv`.
+`rope_nw_v7` writes counters under `$P0_COUNTER_DIR/ropenw`, C its hits under
+`$ATOM_DSV41_PREFILL_FFN_COMMFUSED_HIT_DIR`. A failed install exits the server
+process with 80 (H), 83 (R) or 86 (C).
 
-`LOCK.json` ties each module to its frozen file in the measured run: only
-black/noqa formatting differs (normalized AST equal), and the CSV is byte equal.
-
-## Evidence (measured on ATOM 9a821a52d + AITER c141da6bd, 4×MI355X TP4)
+## Historical evidence (ATOM 9a821a52d + AITER c141da6bd, 4×MI355X TP4; not re-measured on this tree)
 
 - Service, C256 random 8192/1024, 2560 requests, same-suite ABBA:
   HR ≈ 303.8 s → HRC ≈ 290.9 s, **−12.94 s (−4.26 %)**. The gain of C is
@@ -39,8 +38,5 @@ black/noqa formatting differs (normalized AST equal), and the CSV is byte equal.
 
 ## Scope
 
-This branch is rebased on ATOM main, which needs a newer AITER than the pinned
-c141da6bd, and main changed `atom/models/deepseek_v41/model.py`. `../prepare.py`
-therefore refuses this tree by design. Running D/HRC on the rebased tree is a
-dependency migration and needs its own qualification (service ABBA and GSM8K);
-the numbers above do not transfer automatically.
+The numbers above are for the tree named in their heading. Running HRC on this
+branch (newer ATOM main and AITER) needs its own service ABBA and GSM8K.

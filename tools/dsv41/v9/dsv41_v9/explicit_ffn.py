@@ -1,17 +1,24 @@
-# ruff: noqa: I001, S102
-# Keep measured import ordering/namespace; AST parity is verified by prepare.py.
-"""Native owned prefill with explicit 3D route and 2D join/RS opaque boundaries."""
+"""Native owned prefill FFN with explicit route and join/reduce-scatter ops.
 
-import ast, hashlib, importlib, inspect
+`build_owned` re-compiles `prefill_ffn.prequantized_owned_ffn` with exactly two
+calls swapped: the expert `forward_impl` becomes the route producer op and the
+final combine/scatter becomes the push-join reduce-scatter op. Everything else
+(preparation, shared expert, streams) is the native body.
+"""
+
+import ast
+import importlib
+import inspect
+
 import torch
-from explicit_routes import APPLY_AUDIT  # noqa: F401
 
-pf = importlib.import_module("atom.models.deepseek_v41.prefill_ffn")
+from . import explicit_routes  # noqa: F401  (registers the two custom ops)
+
+pf = importlib.import_module("atom.models.deepseek_v41.owner.prefill_ffn")
 
 
 def build_owned():
     source = inspect.getsource(pf.prequantized_owned_ffn)
-    original = ast.parse(source)  # noqa: F841
     tree = ast.parse(source)
     edits = []
 
@@ -40,25 +47,18 @@ def build_owned():
 
     tree = Replace().visit(tree)
     assert [e[0] for e in edits] == ["producer", "consumer"]
-    # Preserve exact native preparation/shared/stream body; only the two interface calls change.
     tree.body[0].name = "_explicit_owned_ffn"
     ast.fix_missing_locations(tree)
     namespace = dict(pf.prequantized_owned_ffn.__globals__)
-    namespace["_explicit_route"] = torch.ops.aiter.dsv41_qualify_prefill_routes
-    namespace["_explicit_join"] = torch.ops.aiter.dsv41_qualify_prefill_join_rs
-    exec(compile(tree, "<dsv41_explicit_owned_prefill>", "exec"), namespace)
-    return namespace["_explicit_owned_ffn"], {
-        "native_prefill_source_sha256": hashlib.sha256(source.encode()).hexdigest(),
-        "edits": [
-            "native forward_impl -> explicit route opaque op",
-            "native combine/scatter -> explicit route consumer opaque op",
-        ],
-        "preparation_shared_stream_body_unchanged": True,
-        "shadow_source": ast.unparse(tree),
-    }
+    namespace["_explicit_route"] = torch.ops.aiter.dsv41_prefill_routes
+    namespace["_explicit_join"] = torch.ops.aiter.dsv41_prefill_join_rs
+    exec(  # noqa: S102
+        compile(tree, "<dsv41_explicit_owned_prefill>", "exec"), namespace
+    )
+    return namespace["_explicit_owned_ffn"]
 
 
-OWNED, OWNED_AUDIT = build_owned()
+OWNED = build_owned()
 
 
 def explicit_owned_ffn(moe, local, rows):

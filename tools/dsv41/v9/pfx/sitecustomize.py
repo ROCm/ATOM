@@ -2,9 +2,8 @@
 comm-fused prefill the rebased-main ``num_local_tokens`` shim, PF-CLR v3 and
 PF-SHS v3 (``DSV41_PFX=1``).
 
-Same install order as the measured Q arm
-(validation/rebased_main_dep_migration_20261104/smoke_r1, PFX11 v3 cells). The
-HRC modules are not modified; this layer rebinds two functions after they load.
+The HRC modules are not modified; this layer rebinds two functions after they
+load. Gated by `DSV41_PRE_COMMFUSED=1`; PF-CLR/PF-SHS additionally by `DSV41_PFX=1`.
 A failed install exits the server process with 89.
 """
 
@@ -15,6 +14,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 runpy.run_path(str(HERE.parent / "hrc" / "sitecustomize.py"))
+sys.path.insert(0, str(HERE))
 from owner_bootstrap_scope import service_process
 
 HITS = {"nl_tensor_dropped": 0, "clear_routes": 0, "local_shared": 0}
@@ -41,7 +41,6 @@ def _install():
     if os.environ.get("DSV41_PFX") != "1":
         return "pfx=0"
 
-    sys.path.insert(0, str(HERE))
     from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4 import producer
     from clear_routes import compile_clear_missing_routes
     from local_shared import local_shared

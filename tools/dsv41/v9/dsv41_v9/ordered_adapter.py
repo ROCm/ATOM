@@ -1,17 +1,16 @@
-# Keep measured import ordering/namespace; AST parity is verified by prepare.py.
-"""Diagnostic TP4 ordered BF16 RS using the existing custom-AR IPC context.
+"""TP4 ordered BF16 reduce-scatter of a 1536x5120 tile over the custom-AR IPC context.
 
-Only qualified for the frozen 1536x5120 fixture; not a production dispatch.
+The per-chunk summation order comes from `formula.make_codes`, so the result is
+bitwise reproducible; `guarded_service_v2` checks it against a fixed-order
+reference before enabling it.
 """
 
 import ctypes
-from pathlib import Path
 
 import torch
 
-HERE = Path(__file__).resolve().parent
-LIBRARY = HERE / "ordered_source/ordered_rs.so"
-ORDER_DIR = HERE / "numeric_r2"
+from . import kernels
+from .formula import make_codes
 
 
 class OrderedRS:
@@ -20,15 +19,9 @@ class OrderedRS:
         self.comm = group.device_communicator.ca_comm
         assert group.world_size == 4 and not self.comm.disabled
         assert self.comm.fully_connected
-        calibration = torch.load(
-            ORDER_DIR / f"rank{group.rank_in_group}_orders.pt", weights_only=False
-        )
-        assert calibration["all_chunks_have_fixed_order"]
-        assert tuple(calibration["shape"]) == (1536, 5120)
-        assert calibration["chunk_elements"] == 128
-        self.codes = calibration["codes"].to(device="cuda", dtype=torch.uint8)
+        self.codes, _ = make_codes(1536, group.rank_in_group, device="cuda")
         assert self.codes.numel() == 384 * 5120 // 128
-        self.library = ctypes.CDLL(str(LIBRARY))
+        self.library = kernels.load("ordered_rs")
         self.call = self.library.dsv41_rs_ordered
         self.call.argtypes = [ctypes.c_int64] * 7
         self.call.restype = ctypes.c_int

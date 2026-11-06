@@ -1,11 +1,15 @@
-# ruff: noqa: I001
-# Keep measured import ordering/namespace; AST parity is verified by prepare.py.
-"""One fused node owns graph-private scratch; eager uses original registered pool."""
+"""TP4 push-join reduce-scatter of routed + shared expert outputs in one kernel.
+
+Under graph capture each call owns graph-private registered scratch; eager calls
+use the custom all-reduce's registered input pool.
+"""
 
 import ctypes
-from pathlib import Path
+
 import torch
-from formula import make_codes
+
+from . import kernels
+from .formula import make_codes
 
 
 class PushJoinRS:
@@ -22,7 +26,7 @@ class PushJoinRS:
         assert self.comm._pool["input"].max_size >= self.padded * 5120 * 2
         self.codes, _ = make_codes(self.padded, group.rank_in_group, device="cuda")
         self.graph_scratch = []
-        self.lib = ctypes.CDLL(str(Path(__file__).with_name("push_join.so")))
+        self.lib = kernels.load("push_join")
         self.lib.dsv41_push_last_error.restype = ctypes.c_char_p
         self.lib.dsv41_push_join_rs.argtypes = [ctypes.c_int64] * 10
         self.lib.dsv41_push_join_rs.restype = ctypes.c_int

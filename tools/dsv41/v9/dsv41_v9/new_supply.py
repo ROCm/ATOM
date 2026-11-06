@@ -1,5 +1,3 @@
-# ruff: noqa: I001
-# Keep measured import ordering/namespace; AST parity is verified by prepare.py.
 # SPDX-License-Identifier: MIT
 """Opt-in owner FP8 supply with the full-row native router schedule."""
 
@@ -9,9 +7,8 @@ from aiter.tuned_gemm import flydsl_gemm, get_GEMM_A16W16_config
 
 from atom.model_ops.blockscale import quantize_fp8
 from atom.model_ops.module_dispatch_ops import _dual_stream_is_active
-from atom.models.deepseek_v41.prefill_ffn import _gather
-
-from atom.models.deepseek_v41.owner_service.owner_ffn_dispatch import finish_output
+from atom.models.deepseek_v41.owner.prefill_ffn import _gather
+from atom.models.deepseek_v41.owner.service.owner_ffn_dispatch import finish_output
 
 KERNEL = (
     "flydsl_hgemm_abf16_wbf16_bf16_t32x64x64x6_ks1_w1x2x1_bias0_ktail0_gm4_pft_gfx950"

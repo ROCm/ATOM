@@ -1,9 +1,8 @@
 """HRC opt-in bootstrap: the V9 owner bootstrap (D), then H, R and C.
 
-Same install order and exit codes as the measured suite
-(validation/dec_moe2_t32_svc_20261103/gsm2_cf1_HRC_r1, bootstrap_v13 chain);
-the observer-only layers of that chain (step trace, dual-stream counter, T32
-observer, RS01) are omitted. Each module is the frozen file byte for byte.
+Each layer is gated by its own variable and exits the server process with its
+code on a failed install: decode FP8 wait0 G1 (80), RoPE num_warps (83) and the
+comm-fused prefill MoE (86).
 """
 
 import importlib.util

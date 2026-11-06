@@ -5,8 +5,10 @@ EngineArgs -> Config and V4.1 validation without constructing a model. `serve`
 performs that preflight before exec'ing the native module (preserving spawn).
 `benchmark` is the native client, against an already running server.
 `--execution fp8-owner` selects the migrated EP1/full path explicitly; the
-public deployment and request profile remain the same. It does not reproduce
-the controlled performance harness's separate warm593 and route observers.
+public deployment and request profile remain the same. `v9`, `hrc` and `pfx`
+add the owner stacks of `tools/dsv41/v9` on top of it (`owner_stacks` in the
+profile; each extends the previous one). It does not reproduce the controlled
+performance harness's separate warm593 and route observers.
 """
 
 import argparse
@@ -21,6 +23,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 PROFILE = HERE / "dashboard_profile.json"
+EXECUTIONS = ("native", "fp8-owner", "v9", "hrc", "pfx")
 # These selectors can silently carry a previous experiment into another
 # Python process. Infrastructure such as visible devices and ROCm paths stays.
 MODEL_ENV_PREFIXES = ("DSV41_", "ATOM_", "AITER_")
@@ -39,6 +42,59 @@ CACHE_ENV = {
 
 def load_profile():
     return json.loads(PROFILE.read_text())
+
+
+def owner_stacks(profile, execution):
+    """The `owner_stacks` chain for `execution`, base first."""
+    stacks, chain = profile["owner_stacks"], []
+    while execution in stacks:
+        chain.insert(0, stacks[execution])
+        execution = stacks[execution].get("extends")
+    return chain
+
+
+def execution_profile(profile, execution):
+    """The profile with the stack chain's engine overrides applied."""
+    engine = dict(profile["engine"])
+    for stack in owner_stacks(profile, execution):
+        unknown = set(stack.get("engine", ())) - set(engine)
+        if unknown:
+            raise ValueError(f"Owner stack overrides unknown engine keys {unknown}")
+        engine.update(stack.get("engine", {}))
+    return dict(profile, engine=engine)
+
+
+def stack_entry_files(profile, execution):
+    files = []
+    for stack in owner_stacks(profile, execution):
+        files.append(stack["bootstrap"] + "/sitecustomize.py")
+        if "tuned_fmoe" in stack:
+            files.append(stack["tuned_fmoe"])
+    if files:
+        files += [
+            "tools/dsv41/v9/dsv41_v9/guarded_service_v2.py",
+            "tools/dsv41/v9/dsv41_v9/kernels.py",
+        ]
+    return tuple(files)
+
+
+def tuned_fmoe(aiter_source, replacement):
+    """AITER's default tuned-fMoE merge with one model config swapped in place.
+
+    Mirrors `aiter.jit.core.get_config_file` without `AITER_CONFIG_FMOE`: the
+    base table, then every non-untuned `model_configs/*tuned_fmoe*.csv` (in
+    sorted rather than directory order), the same-named file replaced by
+    `replacement`.
+    """
+    configs = aiter_source / "aiter/configs"
+    names = {
+        path.name: path
+        for path in (configs / "model_configs").glob("*tuned_fmoe*.csv")
+        if "untuned" not in path.name
+    }
+    names[replacement.name] = replacement
+    files = (configs / "tuned_fmoe.csv", *(names[k] for k in sorted(names)))
+    return os.pathsep.join(map(str, files))
 
 
 def cli_options(options):
@@ -70,19 +126,46 @@ def clean_environment(inherited, model_source, aiter_source, cache_dir, profile)
 
 def owner_environment(args, env, profile):
     """Only the service gets these switches; configuration probes stay native."""
-    if args.execution != "fp8-owner" or args.action == "benchmark":
+    if args.execution == "native" or args.action == "benchmark":
         return env
     output = args.output / "owner"
-    return dict(
+    bootstrap = "tools/dsv41/owner_bootstrap"
+    env = dict(
         env,
         **profile["owner_execution"]["environment"],
-        PYTHONPATH=os.pathsep.join(
-            (str(args.model_source / "tools/dsv41/owner_bootstrap"), env["PYTHONPATH"])
-        ),
         DSV41_OWNER_SERVING_OUTPUT=str(output),
         DSV41_OWNER_SERVING_CONTROL=str(output / "capacity.txt"),
         DSV41_OWNER_SERVING_COMPILE_CACHE=str(args.cache_dir / "atom"),
     )
+    chain = owner_stacks(profile, args.execution)
+    if chain:
+        env.update(
+            DSV41_OWNER_GRAPH_PHASE_FILE=str(output / "phase.txt"),
+            DSV41_COMBINED_REPORT=str(args.output / "communication"),
+            P0_COUNTER_DIR=str(args.output / "counters"),
+            PROMETHEUS_MULTIPROC_DIR=str(args.output / "prometheus"),
+            DSV41_V9_KERNEL_DIR=str(args.cache_dir / "v9_kernels"),
+        )
+    sources = {"aiter": args.aiter_source, "atom": args.model_source}
+    for stack in chain:
+        # Each stack's bootstrap runs the previous one's, so only the last
+        # goes on the path. A null value removes an inherited switch.
+        bootstrap = stack["bootstrap"]
+        for key, value in stack["environment"].items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value.format(**sources)
+        if "tuned_fmoe" in stack:
+            env["AITER_CONFIG_FMOE"] = tuned_fmoe(
+                args.aiter_source, args.model_source / stack["tuned_fmoe"]
+            )
+    if env.get("ATOM_DSV41_PREFILL_FFN_COMMFUSED") == "1":
+        env["ATOM_DSV41_PREFILL_FFN_COMMFUSED_HIT_DIR"] = str(args.output / "commfused")
+    env["PYTHONPATH"] = os.pathsep.join(
+        (str(args.model_source / bootstrap), env["PYTHONPATH"])
+    )
+    return env
 
 
 def commands(args, profile):
@@ -162,19 +245,20 @@ def manifest(args, profile, env, removed):
             )
             + (
                 (
-                    "atom/models/deepseek_v41/owner_service_contract.py",
-                    "atom/models/deepseek_v41/owner_service/__init__.py",
-                    "atom/models/deepseek_v41/owner_service/owner_serving.py",
-                    "atom/models/deepseek_v41/owner_service/owner_cost_attention_chain.py",
-                    "atom/models/deepseek_v41/owner_service/owner_head_attention.py",
-                    "atom/models/deepseek_v41/owner_service/lifecycle.py",
-                    "atom/model_ops/deepseek_v41/owner_attention.py",
+                    "atom/models/deepseek_v41/owner/admission.py",
+                    "atom/models/deepseek_v41/owner/service/__init__.py",
+                    "atom/models/deepseek_v41/owner/service/owner_serving.py",
+                    "atom/models/deepseek_v41/owner/service/owner_cost_attention_chain.py",
+                    "atom/models/deepseek_v41/owner/service/owner_head_attention.py",
+                    "atom/models/deepseek_v41/owner/service/lifecycle.py",
+                    "atom/models/deepseek_v41/owner/attention.py",
                     "tools/dsv41/owner_bootstrap/sitecustomize.py",
                     "tools/dsv41/owner_bootstrap/owner_bootstrap_scope.py",
                 )
-                if args.execution == "fp8-owner"
+                if args.execution != "native"
                 else ()
-            ),
+            )
+            + stack_entry_files(profile, args.execution),
         ),
         "aiter": source_identity(args.aiter_source, ("aiter/__init__.py",)),
         "model": args.model,
@@ -254,8 +338,8 @@ def preflight(args, profile):
         raise ValueError("Resolved Config differs from the TP4/FP8/real-DSpark profile")
     if any(k.startswith("DSV41_") for k in os.environ):
         raise ValueError("Owner experiment environment leaked into the preflight")
-    if args.execution == "fp8-owner":
-        from atom.models.deepseek_v41.owner_service_contract import (
+    if args.execution != "native":
+        from atom.models.deepseek_v41.owner.admission import (
             owner_prefill_enabled,
         )
 
@@ -296,9 +380,7 @@ def parse_args(argv=None):
     parser.add_argument("--aiter-source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cache-dir", type=Path)
-    parser.add_argument(
-        "--execution", choices=("native", "fp8-owner"), default="native"
-    )
+    parser.add_argument("--execution", choices=EXECUTIONS, default="native")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=19126)
@@ -316,7 +398,7 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    profile = load_profile()
+    profile = execution_profile(load_profile(), args.execution)
     if args._preflight_worker:
         if args.action != "preflight":
             raise ValueError("Internal worker requires preflight")
@@ -367,11 +449,16 @@ def main(argv=None):
         return
     if args.action == "benchmark" and (args.output / "benchmark.json").exists():
         raise FileExistsError(args.output / "benchmark.json")
-    if args.action == "serve" and args.execution == "fp8-owner":
+    if args.action == "serve" and args.execution != "native":
         output = args.output / "owner"
         output.mkdir()
         with (output / "capacity.txt").open("x") as stream:
             stream.write(profile["owner_execution"]["capacity"] + "\n")
+        if owner_stacks(profile, args.execution):
+            # Graph capture reads the phase; the service reports go below.
+            (output / "phase.txt").write_text("warmup\n")
+            for name in ("counters", "communication", "prometheus"):
+                (args.output / name).mkdir()
     server, client = commands(args, profile)
     command = server if args.action == "serve" else client
     os.chdir(args.model_source)

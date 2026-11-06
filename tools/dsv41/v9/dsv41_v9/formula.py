@@ -1,5 +1,9 @@
-# Keep measured import ordering/namespace; AST parity is verified by prepare.py.
-"""Hypothesis frozen before held-out shapes; no per-shape calibration."""
+"""Per-rank chunk summation-order codes for the TP4 ordered BF16 reduce-scatter.
+
+Each 128-element output chunk carries the order in which the four rank
+contributions are summed; six fixed patterns per rank repeat over contiguous
+segments, so the reduction is bitwise reproducible across graph replays.
+"""
 
 import torch
 
@@ -12,7 +16,7 @@ PATTERNS = (
 
 
 def make_codes(rows, rank, device="cpu"):
-    assert 4096 <= rows <= 16384 and rows % 4 == 0 and 0 <= rank < 4
+    assert (rows == 1536 or 4096 <= rows <= 16384) and rows % 4 == 0 and 0 <= rank < 4
     chunks = rows * 10  # outputnumel /128: rows/4 *5120 /128
     segment = ((chunks + 48 * 16 - 1) // (48 * 16)) * 16
     index = torch.arange(chunks, device=device)

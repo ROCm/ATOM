@@ -1,12 +1,12 @@
-# ruff: noqa: I001
-# Keep measured import ordering/namespace; AST parity is verified by prepare.py.
-"""Default-off corrective G1 builder: tested scope starts at M4096 FP8 sorted output."""
+"""Stage-1 G1 with the minimal async-copy wait for 4096-row FP8 sorted output."""
 
 from contextlib import contextmanager
 from functools import cache
+
 import aiter.ops.flydsl.moe_kernels as mk
 from aiter.ops.flydsl.moe_common import GateMode
-from minimal_common import compile_mixed_moe_gemm1_common
+
+from .flydsl_minimal import compile_mixed_moe_gemm1_common
 
 
 @cache

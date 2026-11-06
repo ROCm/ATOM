@@ -31,9 +31,9 @@ from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_ops.blockscale import quantize_fp8
 
-import atom.models.deepseek_v41.prefill_ffn as pf
-from atom.models.deepseek_v41.prefill_ffn import _gather
-from atom.models.deepseek_v41.prefill_router import owned_router_logits
+import atom.models.deepseek_v41.owner.prefill_ffn as pf
+from atom.models.deepseek_v41.owner.prefill_ffn import _gather
+from atom.models.deepseek_v41.owner.prefill_router import owned_router_logits
 
 _ENABLED = os.environ.get("ATOM_DSV41_PREFILL_FFN_COMMFUSED", "0") == "1"
 _MIN_ROWS = int(os.environ.get("ATOM_DSV41_PREFILL_FFN_COMMFUSED_MIN_ROWS", "16384"))

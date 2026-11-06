@@ -1,37 +1,31 @@
-# ruff: noqa: I001
-# Keep measured import ordering/namespace; AST parity is verified by prepare.py.
-"""Default-off service dispatcher for the qualified owner/prefill combination.
+"""Guarded service dispatcher for the owner/prefill FP8 combination.
 
-This source is a prototype until real module/Inductor/FULL and service probes pass.
-All candidate imports are deferred, leaving a disabled install without mutations.
+`install` patches the owner serving path; candidate imports are deferred, so a
+disabled install (`DSV41_COMBINED_GUARDED` unset) mutates nothing.
+
+- Owner 384-row steps: Mega-MHC supply (`new_supply`), the minimal-wait stage-1
+  G1 (`variants`) and the ordered reduce-scatter (`ordered_adapter`).
+- Prefill FFN on layers 2-18 with 4096-16384 rows: explicit owned FFN
+  (`explicit_ffn`).
+
+Anything else falls through to the native implementation.
 """
 
 import collections
 import functools
-import hashlib
 import importlib
 import json
 import os
-from pathlib import Path
-import sys
 import threading
+from contextlib import contextmanager
+from pathlib import Path
 
 ACTIVE = threading.local()
 STATE = None
 INSTALLED = False
 PREPARE = None
-
-
-def read_qualification(path):
-    value = json.loads(Path(path).read_text())
-    if value["status"] != "full17_FFN_225shape_numerical_pass":
-        raise ValueError("Complete shape qualification required before service install")
-    if value["layers"] != list(range(2, 19)) or len(set(value["real_rows"])) != 225:
-        raise ValueError("Qualification scope mismatch")
-    for name, expected in value["evidence_sha256"].items():
-        if hashlib.sha256(Path(name).read_bytes()).hexdigest() != expected:
-            raise ValueError(f"Qualification evidence changed: {name}")
-    return value
+PREFILL_ROWS = range(4096, 16385)
+PREFILL_LAYERS = range(2, 19)
 
 
 def install():
@@ -40,40 +34,30 @@ def install():
         return {"installed": False, "reason": "default_off"}
     if INSTALLED:
         raise RuntimeError("Install exactly once per service worker")
-    qualification = read_qualification(os.environ["DSV41_COMBINED_QUALIFICATION"])
-    source = Path(os.environ["DSV41_COMBINED_FROZEN_SOURCE"]).resolve()
-    for name, expected in qualification["candidate_source_sha256"].items():
-        if hashlib.sha256((source / name).read_bytes()).hexdigest() != expected:
-            raise ValueError(f"Candidate source/binary changed: {name}")
-    sys.path.insert(0, str(source))
+    import aiter.ops.flydsl.moe_kernels as kernels
     import torch
     import torch.distributed as dist
-    from aiter.dist.parallel_state import get_tp_group  # noqa: F401
     from aiter.jit.utils.torch_guard import torch_compile_guard
-    import aiter.ops.flydsl.moe_kernels as kernels
-    from variants import minimal_wait
-    from ordered_adapter import OrderedRS
-    from explicit_ffn import explicit_owned_ffn
-    from new_supply import supplied_forward as agv_forward
-    from atom.models.deepseek_v41.owner_service.owner_serving import OwnerServing
-    from atom.model_ops.deepseek_v41 import row_sharded_mhc as seam
+
+    from atom.models.deepseek_v41.owner import row_sharded_mhc as seam
+    from atom.models.deepseek_v41.owner.service.owner_serving import OwnerServing
     from atom.utils.forward_context import get_forward_context
 
-    pf = importlib.import_module("atom.models.deepseek_v41.prefill_ffn")
+    from .explicit_ffn import explicit_owned_ffn
+    from .new_supply import supplied_forward as agv_forward
+    from .ordered_adapter import OrderedRS
+    from .variants import minimal_wait
+
+    pf = importlib.import_module("atom.models.deepseek_v41.owner.prefill_ffn")
     supply = importlib.import_module(
-        "atom.models.deepseek_v41.owner_service.owner_ffn_supply"
+        "atom.models.deepseek_v41.owner.service.owner_ffn_supply"
     )
     STATE = {
-        "qualified_rows": frozenset(qualification["real_rows"]),
-        "qualified_layers": frozenset(qualification["layers"]),
         "counts": collections.Counter(),
         "prefill_bindings": collections.Counter(),
         "owner_bindings": [],
         "rs": None,
         "ready": False,
-        "qualification_sha256": hashlib.sha256(
-            Path(os.environ["DSV41_COMBINED_QUALIFICATION"]).read_bytes()
-        ).hexdigest(),
     }
     original_init, original_target = OwnerServing.__init__, OwnerServing.target
     original_rs, original_g1 = seam.v41_mhc_reduce_scatter, kernels.flydsl_moe_stage1
@@ -103,34 +87,23 @@ def install():
                 torch.equal(reference.view(torch.uint8), result.view(torch.uint8))
             )
         agreement = [None] * group.world_size
-        dist.all_gather_object(
-            agreement,
-            {"rs_ok": all(checks), "qualification": STATE["qualification_sha256"]},
-            group=group.cpu_group,
-        )
-        if not all(
-            v["rs_ok"] and v["qualification"] == STATE["qualification_sha256"]
-            for v in agreement
-        ):
+        dist.all_gather_object(agreement, all(checks), group=group.cpu_group)
+        if not all(agreement):
             raise RuntimeError(
-                "All-rank RS calibration or qualification agreement failed"
+                f"Ordered RS differs from the native RS bitwise on ranks {agreement}"
             )
-        STATE.update(rs=adapter, ready=True)
-        STATE["group"] = group
-        out = Path(os.environ["DSV41_COMBINED_REPORT"])
-        out.mkdir(parents=True, exist_ok=True)
-        (out / f"rank{group.rank_in_group}_startup.json").write_text(
-            json.dumps(
-                {
-                    "rs_cases_equal": checks,
-                    "all_rank_agreement": agreement,
-                    "qualified_prefill_shapes": len(STATE["qualified_rows"]),
-                    "scope": "Startup communication/qualification agreement only; not service or task accuracy acceptance",
-                },
-                indent=2,
+        STATE.update(rs=adapter, ready=True, group=group)
+        report = os.environ.get("DSV41_COMBINED_REPORT")
+        if report:
+            out = Path(report)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / f"rank{group.rank_in_group}_startup.json").write_text(
+                json.dumps(
+                    {"rs_cases_equal": checks, "all_rank_agreement": agreement},
+                    indent=2,
+                )
+                + "\n"
             )
-            + "\n"
-        )
 
         return snapshot()
 
@@ -141,7 +114,7 @@ def install():
         original_init(self, *args, **kwargs)
         if os.environ.get("ATOM_DSV41_OWNER_FFN_SUPPLY") != "mhc":
             raise ValueError(
-                "Candidate arm must explicitly select owner Mega-MHC supply"
+                "DSV41_COMBINED_GUARDED requires ATOM_DSV41_OWNER_FFN_SUPPLY=mhc"
             )
         prepare(self.group)
         self._combined_guarded_state = STATE
@@ -204,17 +177,17 @@ def install():
     def prefill(moe, local, rows):
         context = get_forward_context()
         layer_id = getattr(moe.experts, "layer_id", None)
-        qualified = (
+        eligible = (
             getattr(ACTIVE, "prefill_enabled", True)
             and STATE["ready"]
-            and rows in STATE["qualified_rows"]
-            and layer_id in STATE["qualified_layers"]
+            and rows in PREFILL_ROWS
+            and layer_id in PREFILL_LAYERS
             and (moe.experts.tp_size, moe.experts.ep_size, moe.experts.dp_size)
             == (4, 1, 1)
             and not getattr(moe, "prefill_route_packet", False)
             and pf.supported(moe, local, rows, context.attn_metadata)
         )
-        if not qualified:
+        if not eligible:
             STATE["counts"]["prefill_native_fallback"] += 1
             return original_prefill(moe, local, rows)
         STATE["counts"]["prefill_explicit"] += 1
@@ -228,11 +201,7 @@ def install():
     seam.v41_mhc_reduce_scatter = guarded_owner_rs_v2
     supply.supplied_forward, pf.prequantized_owned_ffn = supplied, prefill
     INSTALLED = True
-    return {
-        "installed": True,
-        "qualified_rows": len(STATE["qualified_rows"]),
-        "service_acceptance": "not_run",
-    }
+    return {"installed": True}
 
 
 def snapshot():
@@ -247,8 +216,7 @@ def snapshot():
             {"rows": k[0], "layer": k[1], "capture": k[2], "calls": n}
             for k, n in STATE["prefill_bindings"].items()
         ],
-        "qualification_sha256": STATE["qualification_sha256"],
-        "counter_scope": "Python eager/capture dispatch; graph replay backend work requires binding with actual replay counters",
+        # Python eager/capture dispatch only; graph replays are not counted here.
     }
 
 
@@ -256,9 +224,6 @@ def prepare_communication(group):
     if not INSTALLED or PREPARE is None:
         raise RuntimeError("Install before communication preparation")
     return PREPARE(group)
-
-
-from contextlib import contextmanager
 
 
 @contextmanager

@@ -1,4 +1,3 @@
-# Keep measured import ordering/namespace; AST parity is verified by prepare.py.
 """Use production profiler for only three M384 owner replays on request."""
 
 import json
@@ -8,7 +7,7 @@ from pathlib import Path
 
 
 def install():
-    from formal_counters import Counters
+    from .formal_counters import Counters
 
     old_snapshot, old_replay = Counters.snapshot, Counters.replayed
 

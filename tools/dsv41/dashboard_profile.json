@@ -78,6 +78,47 @@
       "ATOM_USE_TRITON_MOE": "0"
     }
   },
+  "owner_stacks": {
+    "v9": {
+      "bootstrap": "tools/dsv41/v9/bootstrap",
+      "scope": "D: owner execution plus the guarded owner-384 / prefill-FFN dispatcher.",
+      "environment": {
+        "DSV41_COMBINED_GUARDED": "1",
+        "DSV41_ORDERED_RS": "0",
+        "P2_WORKLOAD_RING": "0",
+        "ATOM_DSV41_OWNER_FP8_ATTENTION": "h64",
+        "ATOM_DSV41_OWNER_FFN_SUPPLY": "mhc"
+      }
+    },
+    "hrc": {
+      "extends": "v9",
+      "bootstrap": "tools/dsv41/v9/hrc",
+      "tuned_fmoe": "tools/dsv41/v9/hrc/dsv41_fp8_tuned_fmoe.csv",
+      "scope": "D + G10 + H (decode FP8 wait0) + R (RoPE single wave) + C (comm-fused prefill MoE).",
+      "environment": {
+        "ATOM_GREEDY_SHARDED_ARGMAX": "1",
+        "DSV41_DECODE_FP8_WAIT0": "1",
+        "DSV41_ROPE_OBS": "1",
+        "DSV41_ROPE_NW": "1",
+        "DSV41_PRE_COMMFUSED": "1",
+        "ATOM_DSV41_PREFILL_FFN_COMMFUSED": "1",
+        "ATOM_DSV41_PREFILL_FFN_COMMFUSED_TUNER_DIR": "{aiter}/op_tests/tuners"
+      }
+    },
+    "pfx": {
+      "extends": "hrc",
+      "bootstrap": "tools/dsv41/v9/pfx",
+      "scope": "Q: HRC with R off, plus PF-CLR / PF-SHS on comm-fused prefill and a 32768-token prefill budget.",
+      "engine": {
+        "max_num_batched_tokens": 32768
+      },
+      "environment": {
+        "DSV41_ROPE_NW": null,
+        "DSV41_PFX": "1",
+        "ATOM_PREFILL_DECODE_INTERVAL": "1"
+      }
+    }
+  },
   "acceptance": {
     "synthetic_acceptance": false,
     "fixed_query_rows": null,

@@ -1,18 +1,25 @@
-# ruff: noqa: I001, S102
-# Keep measured import ordering/namespace; AST parity is verified by prepare.py.
-"""Explicit raw-route producer/consumer qualification; no production dispatch installed."""
+"""Route producer/consumer custom ops for the explicit owned prefill FFN.
+
+- `aiter.dsv41_prefill_routes`: the layer's native `Mxfp4MoEMethod.apply`,
+  re-compiled so its final `fused_moe` returns per-route outputs
+  (`routes_interface.call_native_routes`) instead of their sum.
+- `aiter.dsv41_prefill_join_rs`: adds the shared expert and reduce-scatters the
+  routes with `PushJoinRS`, one instance per row count.
+"""
 
 import ast
-import hashlib
 import importlib
 import inspect
 import textwrap
+
 import torch
 from aiter.dist.parallel_state import get_tp_group
-from atom.utils.forward_context import get_forward_context
+
 from atom.utils.custom_register import direct_register_custom_op
-from adapter import PushJoinRS
-from routes_interface import call_native_routes
+from atom.utils.forward_context import get_forward_context
+
+from .adapter import PushJoinRS
+from .routes_interface import call_native_routes
 
 fm = importlib.import_module("aiter.fused_moe")
 mm = importlib.import_module("atom.model_ops.moe")
@@ -86,15 +93,13 @@ def build_apply_shadow():
     native = inspect.unwrap(mm.Mxfp4MoEMethod.apply)
     namespace = dict(native.__globals__)
     namespace["_explicit_route_frontend"] = route_frontend
-    exec(compile(tree, "<dsv41_native_apply_raw_route>", "exec"), namespace)
-    return namespace["_raw_native_apply"], {
-        "native_apply_sha256": hashlib.sha256(source.encode()).hexdigest(),
-        "restored_AST_equal": True,
-        "transform": "Remove tracing decorator from shadow only; replace exactly one native fused_moe return with parity frontend/raw G2 override. Native object never changed.",
-    }
+    exec(  # noqa: S102
+        compile(tree, "<dsv41_native_apply_raw_route>", "exec"), namespace
+    )
+    return namespace["_raw_native_apply"]
 
 
-APPLY, APPLY_AUDIT = build_apply_shadow()
+APPLY = build_apply_shadow()
 
 
 def forward_routes(experts, hidden, logits, scale):
@@ -156,7 +161,7 @@ def route_consumer_fake(routes: torch.Tensor, shared: torch.Tensor) -> torch.Ten
 
 
 for name, real, fake in (
-    ("dsv41_qualify_prefill_routes", route_producer, route_producer_fake),
-    ("dsv41_qualify_prefill_join_rs", route_consumer, route_consumer_fake),
+    ("dsv41_prefill_routes", route_producer, route_producer_fake),
+    ("dsv41_prefill_join_rs", route_consumer, route_consumer_fake),
 ):
     direct_register_custom_op(name, real, [], fake_impl=fake)

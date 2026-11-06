@@ -1,63 +1,55 @@
-# Service-tested DSV4.1 V9 snapshot
+# DSV4.1 V9 owner stack (D)
 
-This opt-in source snapshot preserves the owner/prefill combination used in the
-2026-10-31 current-main C256 A/B/A/B. It is an experimental, dependency-pinned
-deployment, with task accuracy still unqualified. Ordinary ATOM startup remains
-unchanged. The model-side P1 implementation is in `owner_ffn_supply.py`.
+Opt-in service stack on top of the FP8 owner execution
+(`atom/models/deepseek_v41/owner`, `tools/dsv41/owner_bootstrap`). Ordinary
+ATOM startup is unchanged. `hrc/` and `pfx/` are the next layers; each chains
+the previous one.
 
-`LOCK.json` records the measured model/owner source, AITER revision, runtime ASTs,
-external binary/calibration hashes, qualification scope, deployment profile and
-performance result. Runtime code covers owner single AGV, ordered BF16 RS,
-limited G1 wait0, and explicit prefill route → top6/shared join → push RS.
-The bootstrap retains the original formal observer so reproduction does not
-silently change the measurement instrumentation.
+What it adds, through `dsv41_v9.guarded_service_v2` (`DSV41_COMBINED_GUARDED=1`):
 
-The FlyDSL changes are stored as line edits against a hash-locked AITER builder,
-including the native-fresh/full-wait references needed by the original runtime
-module. Materialization reconstructs the **exact measured builder bytes** without
-editing AITER or copying thousands of unchanged upstream lines into ATOM.
-The ordered HIP header is reconstructed in the same way. The two `.cu` files are
-the measured backend sources; original SPDX notices remain in upstream inputs.
+- Owner 384-row steps: Mega-MHC supply (`new_supply`), the minimal-wait
+  stage-1 G1 (`variants`, `flydsl_minimal`) and the ordered BF16
+  reduce-scatter (`ordered_adapter`, HIP `csrc/ordered_rs.cu`).
+- Prefill FFN on layers 2-18 with 4096-16384 rows: explicit route → top6 /
+  shared join → push RS (`explicit_ffn`, `explicit_routes`, HIP
+  `csrc/push_join.cu`).
+- Anything else falls through to the native implementation.
 
-On the original server, from the workspace containing `ATOM/` and `aiter/`:
+The ordered RS summation order comes from `formula.make_codes`; at startup each
+rank checks it bitwise against the native RS and refuses to serve otherwise
+(`$DSV41_COMBINED_REPORT/rank*_startup.json`). The FlyDSL change is applied as
+small checked text edits to the installed AITER builder, loaded as a sibling
+module, so AITER itself is not edited.
 
-```bash
-python3 ATOM/tools/dsv41/v9/prepare.py \
-  --reference-run validation/mainline_abab_20261031/main43_v9p2_b1_r1 \
-  --aiter aiter \
-  --output validation/v9_reproduction/new_run
-```
+## Run
 
-This performs no GPU work and refuses an existing output directory. It verifies
-the dependency, model/owner source, runtime ASTs and original calibration/binaries,
-then materializes runtime code, bootstrap, qualification, environment and client
-commands outside the checkout. Original qualification evidence remains external
-and must still be present. This is intentionally a reproduction of the measured
-server, not a claim that another machine has the same floating-point reduction
-order. `numeric_r2/rank*_orders.pt` is required runtime calibration, not weights.
-It is validated again against native RS at startup on every rank.
-
-Use the generated `environment.list` with the server/client commands in
-`manifest.json`, following independent stop/start/ready/client/drain/stop. The
-formal client uses 512 regular warmup requests plus common C8/C12 supplemental
-warmup, then 2560 formal requests at C256, random 8192/1024, range0.8, seed0.
-Register each experiment's frozen planned record before GPU execution, and its
-completed record afterward, including failures. Do not mix results from another
-warmup protocol. Raw logs and experiment tooling remain outside the repository.
-
-To rebuild the HIP backends, run inside the locked ROCm environment:
+Through the dashboard runner, which sets the owner and V9 environment, the run
+directories and the kernel cache:
 
 ```bash
-python3 ATOM/tools/dsv41/v9/build_kernels.py \
-  --aiter aiter --output validation/v9_reproduction/new_build
+python tools/dsv41/run_dashboard.py serve --execution v9 \
+  --aiter-source <aiter> --output <fresh run dir>
+python tools/dsv41/run_dashboard.py benchmark --execution v9 \
+  --aiter-source <aiter> --output <fresh run dir>/client
 ```
 
-Rebuilding checks header hashes and writes source/build/binaries into the external
-directory. New binaries require numerical/graph and service qualification;
-`prepare.py` deliberately reuses only the hash-locked measured binaries.
-Dependency migration, expanding shapes/layers, enabling FP4 activation, or
-removing instrumentation also require separate qualification. No unqualified
-projection Quant/Sum prototypes are included.
+`--execution hrc` / `pfx` select the later layers. The switches live in
+`owner_stacks` of `tools/dsv41/dashboard_profile.json`; `plan` prints the
+resolved environment without starting anything.
 
-Measured results and remaining accuracy/measurement qualifications are kept
-with the external run records referenced by `LOCK.json`.
+The HIP kernels build on first use into `$DSV41_V9_KERNEL_DIR` (default
+`~/.cache/atom/dsv41_v9_kernels`), against the AITER custom all-reduce header.
+To build them ahead of serving:
+
+```bash
+python tools/dsv41/v9/build_kernels.py --cache-dir <cache>/v9_kernels
+```
+
+A failed install exits the server process with 78. Service counters go to
+`$P0_COUNTER_DIR`, owner graph coverage next to `$DSV41_OWNER_GRAPH_PHASE_FILE`.
+
+## Status
+
+The 2026-10-31 C256 A/B/A/B was measured on an older ATOM/AITER pair with the
+earlier, separately calibrated version of this stack. That result does not
+transfer: this tree needs its own service A/B and task-accuracy run.
