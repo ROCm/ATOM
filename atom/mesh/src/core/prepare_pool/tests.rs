@@ -103,6 +103,20 @@ async fn burst_fills_execution_and_queue_capacity_without_idle_workers() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn canceled_waiter_releases_queue_slot_and_input_immediately() {
+    // Submissions are polled and dropped on this thread, so a local recorder sees them.
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics = recorder.handle();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let cancelled = || {
+        metrics
+            .render()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("mesh_prepare_errors_total{reason=\"prepare_cancelled\"} ")
+                    .map(|count| count.parse::<u64>().unwrap())
+            })
+            .unwrap_or(0)
+    };
     let mut runtime = start(config());
     let handle = runtime.handle();
     let (active, started, release) = blocked(&handle, (), handle.prepare_deadline()).await;
@@ -123,17 +137,22 @@ async fn canceled_waiter_releases_queue_slot_and_input_immediately() {
         handle.submit(handle.prepare_deadline(), |_| ()).await,
         Err(PrepareError::Full)
     ));
+    assert_eq!(cancelled(), 0);
     drop(canceled);
+    assert_eq!(cancelled(), 1);
     assert_eq!(handle.stats().queued_jobs, 1);
     assert_eq!(Arc::strong_count(&input), 1);
     assert_eq!(handle.stats().execution_reserved, 1);
     let mut replacement = Box::pin(handle.submit(handle.prepare_deadline(), |_| ()));
     assert!(poll!(&mut replacement).is_pending());
     drop(replacement);
+    assert_eq!(cancelled(), 2);
     release.send(()).unwrap();
     active.wait().await.unwrap();
     assert_eq!(waiting.await.unwrap().wait().await.unwrap(), 42);
     assert!(!called.load(Ordering::Acquire));
+    // Admitted submissions that complete are not counted as cancelled.
+    assert_eq!(cancelled(), 2);
     runtime.shutdown().await;
 }
 

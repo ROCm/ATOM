@@ -119,6 +119,19 @@ impl PrepareError {
     }
 }
 
+/// Counts `PrepareError::Cancelled` if dropped while armed.
+struct WaitCancellation {
+    armed: bool,
+}
+
+impl Drop for WaitCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            PrepareError::Cancelled.count();
+        }
+    }
+}
+
 struct SubmitState {
     // The only Sender lives here. Never drop jobs or the sender under this lock.
     sender: Mutex<Option<Sender<Job>>>,
@@ -267,6 +280,8 @@ impl SubmitState {
                     TryAcquireError::NoPermits => PrepareError::Full.count(),
                 })?;
         let _waiting = Slot::new(permit, &control.waiting_jobs);
+        // No ticket exists yet to count a submission dropped while it waits.
+        let mut cancellation = WaitCancellation { armed: true };
         let wait_deadline = queue_deadline.min(deadline);
         let permit = tokio::select! {
             biased;
@@ -280,7 +295,10 @@ impl SubmitState {
                     PrepareError::QueueTimeout.count()
                 })
             }
-        }?;
+        };
+        // Admission counts its own errors, and the ticket counts later cancellation.
+        cancellation.armed = false;
+        let permit = permit?;
         // A ready permit cannot revive work whose deadline has already elapsed.
         if Instant::now() >= deadline {
             return Err(PrepareError::Timeout.count());
