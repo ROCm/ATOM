@@ -1227,7 +1227,7 @@ def _resolve_sequential_drafter_max_spec(
 # listed; they ship inside the target checkpoint and are told by
 # `dspark_block_size`.
 _STANDALONE_DSPARK_ARCHS: frozenset[str] = frozenset(
-    {"K3DSparkModel", "DSparkMiniMaxDraftModel"}
+    {"K3DSparkModel", "DSparkMiniMaxDraftModel", "K3DFlashModel"}
 )
 # Where the standalone drafts name each field ATOM reads, in lookup order:
 # Kimi-K3's top-level names, then MiniMax-M3.1's `dspark_*` names and its DFlash
@@ -1263,40 +1263,6 @@ def _standalone_dspark_field(hf_config: PretrainedConfig, field: str):
     return None
 
 
-# What `hf_config_override` renames a SpecForge DFlash draft to.
-K3_DFLASH_ARCH = "K3DFlashModel"
-
-# Checked against the target separately: the rename sees only the draft, and
-# SpecForge stamps the same arch on every DFlash draft. Kimi-K3.1 arrives here
-# as Kimi-K3 (ARCH_ALIASES).
-_K3_DFLASH_TARGET_ARCHS: frozenset[str] = frozenset({"KimiK3ForConditionalGeneration"})
-
-
-def _check_dflash_draft_target(
-    target_hf: PretrainedConfig,
-    draft_hf: PretrainedConfig | None,
-    pipeline_parallel_size: int = 1,
-) -> None:
-    """Refuse a SpecForge DFlash draft paired with a non-Kimi-K3 target or
-    run with pipeline parallelism."""
-    draft_arch = (getattr(draft_hf, "architectures", None) or [""])[0]
-    if draft_arch != K3_DFLASH_ARCH:
-        return
-    if pipeline_parallel_size > 1:
-        raise ValueError(
-            "A SpecForge DFlash draft is not supported with "
-            "pipeline_parallel_size > 1: its aggregate tap is scored by the next "
-            "target layer, which another stage may own, and it shares the "
-            "target's embedding, a PPMissingLayer on the drafter's stage."
-        )
-    target_arch = (getattr(target_hf, "architectures", None) or [""])[0]
-    if target_arch not in _K3_DFLASH_TARGET_ARCHS:
-        raise ValueError(
-            f"This SpecForge DFlash draft is only supported on a Kimi-K3 target "
-            f"({sorted(_K3_DFLASH_TARGET_ARCHS)}); the target is {target_arch!r}."
-        )
-
-
 def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     """Map a standalone DSpark draft config onto ATOM's canonical names.
 
@@ -1309,9 +1275,6 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
       ``_STANDALONE_DSPARK_ARCHS``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``)
       and name their DSpark fields as ``_STANDALONE_DSPARK_FIELD_ALIASES``
       lists: ``target_layer_ids``, ``mask_token_id``, ``markov_rank``.
-    - SpecForge DFlash drafts nest the first two under ``dflash_config`` and
-      record the trained block width as ``block_size``, which
-      ``hf_config_override`` promotes.
     """
     target_layer_ids = _standalone_dspark_field(hf_config, "dspark_target_layer_ids")
     if not target_layer_ids:
@@ -1340,13 +1303,17 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     # rest of the stack branches on (SpeculativeConfig.use_dspark_with_draft).
     hf_config.dspark_with_draft = True
 
-    backbone = "MLA" if getattr(hf_config, "kv_lora_rank", None) else "GQA"
+    # NOTE: no `dspark_block_size` here. Unlike V4-Pro-DSpark and the SpecForge
+    # SpecForge DFlash checkpoints, this config carries no block width: the draft is
+    # width-agnostic in its weights and the block is sized by
+    # --num-speculative-tokens (7 in the checkpoint's own serving recipe).
+    # DSparkProposer._resolve_mtp_k falls back to that.
+
     logger.info(
-        f"Detected {backbone} DSpark drafter with a separate draft model "
+        "Detected DSpark drafter with a separate draft model "
         f"(markov_rank={hf_config.dspark_markov_rank}, "
         f"target_layers={hf_config.dspark_target_layer_ids}, "
-        f"mask_token_id={hf_config.dspark_noise_token_id}, "
-        f"block_size={getattr(hf_config, 'dspark_block_size', None)})"
+        f"mask_token_id={hf_config.dspark_noise_token_id})"
     )
 
 
@@ -1440,20 +1407,18 @@ class SpeculativeConfig:
     }
 
     def use_dspark(self) -> bool:
-        """DSpark semi-autoregressive block drafter (any flavor).
+        """DSpark semi-autoregressive block drafter (either flavor).
 
         DSpark is a parallel block drafter (parallel backbone + Markov
-        sequential head + confidence head), NOT serial MTP. Checkpoints that
-        reach here:
+        sequential head + confidence head), NOT serial MTP. Two checkpoint
+        flavors reach here, and both normalize to `dspark_block_size` in
+        `hf_config_override`:
 
-        - V4-Pro-DSpark / V4.1: ships INSIDE the V4 target checkpoint under the
-          same `mtp.*` namespace serial MTP uses, so only the DSpark-only
+        - V4-Pro-DSpark: ships INSIDE the V4 target checkpoint under the same
+          `mtp.*` namespace serial MTP uses, so only the DSpark-only
           `dspark_block_size` field distinguishes the two.
-        - Standalone drafts passed with --draft-model, which
-          `hf_config_override` marks `dspark_with_draft`: Kimi-K3-DSpark's MLA
-          `K3DSparkModel`, MiniMax-M3.1's `DSparkMiniMaxDraftModel`, and a
-          SpecForge DFlash draft (`DSparkDraftModel` with a `dflash_config`,
-          renamed `K3DFlashModel`).
+        - Kimi-K3-DSpark: a standalone MLA-backbone checkpoint with its own
+          `architectures: ["K3DSparkModel"]`.
 
         We intentionally never silently fall back to MTP: a wrong fallback
         loads cleanly but measures the wrong algorithm.
@@ -1470,9 +1435,10 @@ class SpeculativeConfig:
 
         ``dspark_with_draft`` is NOT a checkpoint field -- do not go looking for
         it in config.json. It is synthesized by
-        :func:`_normalize_draft_dspark_config`, which :meth:`hf_config_override`
-        runs for every architecture in ``_STANDALONE_DSPARK_ARCHS`` and for a
-        SpecForge DFlash draft, so ask this rather than set membership.
+        :func:`_normalize_draft_dspark_config`, which runs from
+        :meth:`hf_config_override` when the draft's architecture is in
+        ``_STANDALONE_DSPARK_ARCHS``, so it is set for exactly the configs that went
+        through that normalization.
         """
         cfg = self.draft_model_hf_config
         return bool(getattr(cfg, "dspark_with_draft", False))
@@ -1576,23 +1542,9 @@ class SpeculativeConfig:
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
-        # SpecForge stamps `DSparkDraftModel` on every DFlash draft, and that
-        # is also ATOM's draft base class name, so key on `dflash_config` and
-        # rename to an arch that identifies the model.
-        if arch == "DSparkDraftModel" and getattr(hf_config, "dflash_config", None):
-            hf_config.architectures = [K3_DFLASH_ARCH]
-            # Read only here: `block_size` is a generic HF key.
-            block_size = hf_config.dflash_config.get("block_size") or getattr(
-                hf_config, "block_size", None
-            )
-            if block_size:
-                hf_config.dspark_block_size = int(block_size)
-            _normalize_draft_dspark_config(hf_config)
-            return
-        # Already normalized: the `dspark_block_size` set above must not route
-        # it to the V4 DSpark draft below.
-        if arch == K3_DFLASH_ARCH:
-            return
+        if arch == "DSparkDraftModel":  # SpecForge DFlash draft for Kimi-K3
+            hf_config.architectures = ["K3DFlashModel"]
+            arch = "K3DFlashModel"
         if arch in _STANDALONE_DSPARK_ARCHS:
             _normalize_draft_dspark_config(hf_config)
             return
@@ -2681,9 +2633,6 @@ class Config:
             num_spec = self.speculative_config.num_speculative_tokens
             is_dspark = getattr(self.speculative_config, "use_dspark", lambda: False)()
             draft_cfg = self.speculative_config.draft_model_hf_config
-            _check_dflash_draft_target(
-                self.hf_config, draft_cfg, self.pipeline_parallel_size
-            )
             if not is_dspark:
                 # Sequential drafters (MTP / Eagle): one drafted token per
                 # backbone pass, and the drafter just repeats that pass, so the

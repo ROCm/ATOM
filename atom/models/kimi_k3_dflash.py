@@ -324,10 +324,8 @@ def _draft_quant_config(config) -> QuantizationConfig:
 class KimiK3DFlash(DSparkDraftModel):
     """The SpecForge DFlash draft for Kimi-K3.
 
-    Registered as ``K3DFlashModel``: the checkpoint ships
-    ``architectures: ["DSparkDraftModel"]``, which SpecForge stamps on every
-    DFlash draft and which collides with this module's own base class, so
-    `SpeculativeConfig.hf_config_override` renames it.
+    Registered as ``K3DFlashModel``, which `SpeculativeConfig.hf_config_override`
+    renames the checkpoint's generic ``DSparkDraftModel`` to.
     """
 
     block_attention_is_mla = False
@@ -471,6 +469,13 @@ class KimiK3DFlash(DSparkDraftModel):
                 raise ValueError(
                     f"DFlash aggregate tap on target layer {lid}: needs a "
                     f"successor layer in a {len(target_layers)}-layer stack"
+                )
+            # The checkpoint arch is generic (see `hf_config_override`), so the
+            # target is checked here, where its layers are known.
+            if not hasattr(target_layers[lid], "check_aggregate_source"):
+                raise ValueError(
+                    "The SpecForge DFlash draft serves a Kimi-K3 target only; "
+                    f"target layer {lid} is {type(target_layers[lid]).__name__}"
                 )
             if target_layers[lid].layer_idx != lid:
                 raise ValueError(

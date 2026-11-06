@@ -91,14 +91,14 @@ def _radixark_cfg(**overrides):
 
 
 def test_dflash_config_normalize():
-    """DSparkDraftModel + dflash_config -> K3DFlashModel with lifted fields."""
+    """DSparkDraftModel -> K3DFlashModel, normalized like the other standalone
+    DSpark drafts."""
     from atom.config import SpeculativeConfig
 
     hf = _radixark_cfg()
     SpeculativeConfig.hf_config_override(hf, model_path=None)
 
-    # Renamed away from the SpecForge string, which collides with ATOM's own
-    # draft base class and is reused across every DFlash draft.
+    # Renamed away from the SpecForge string, which every DFlash draft carries.
     assert hf.architectures == ["K3DFlashModel"]
 
     # Lifted out of the nested dflash_config onto the canonical names.
@@ -107,8 +107,8 @@ def test_dflash_config_normalize():
     assert hf.dspark_markov_rank == 256
     assert hf.dspark_with_draft is True
 
-    # The trained block width, recorded so the horizon can be warned against.
-    assert hf.dspark_block_size == 7
+    # No block width: as for the K3 MLA draft, --num-speculative-tokens sets it.
+    assert getattr(hf, "dspark_block_size", None) is None
 
     # num_target_layers is the TARGET's depth, not the aux-tap count. The fusion
     # width is len(target_layer_ids); sizing off 93 would be a 93/5 overshoot.
@@ -117,8 +117,7 @@ def test_dflash_config_normalize():
 
 
 def test_dflash_config_normalize_is_idempotent():
-    """A second override keeps the DFlash draft rather than routing it, by its
-    `dspark_block_size`, to the V4 DSpark draft."""
+    """A second override keeps the DFlash draft and its normalized fields."""
     from atom.config import SpeculativeConfig
 
     hf = _radixark_cfg()
@@ -127,8 +126,8 @@ def test_dflash_config_normalize_is_idempotent():
     SpeculativeConfig.hf_config_override(hf, model_path=None)
 
     assert hf.architectures == ["K3DFlashModel"]
-    assert hf.dspark_block_size == 7
-    assert hf.model_type == model_type != "deepseek_v4_dspark"
+    assert hf.dspark_target_layer_ids == [7, 23, 51, 67, 83]
+    assert hf.model_type == model_type
 
 
 def test_dflash_rope_is_the_drafts_own():
@@ -388,23 +387,14 @@ def test_dflash_does_not_capture_the_k3_dspark_checkpoint():
     assert getattr(hf, "dspark_block_size", None) is None
 
 
-def test_dflash_branch_needs_dflash_config():
-    """A bare DSparkDraftModel with no dflash_config is NOT claimed as DFlash.
-
-    SpecForge stamps that arch on every DFlash draft, so the arch string alone
-    is not a model identity; claiming it would silently bind the wrong class.
-    """
+def test_dflash_draft_without_dflash_config_is_refused():
+    """A `DSparkDraftModel` without the DFlash fields fails normalization, as
+    any standalone DSpark draft missing `target_layer_ids` does."""
     from atom.config import SpeculativeConfig
 
     hf = _radixark_cfg(dflash_config=None)
-    SpeculativeConfig.hf_config_override(hf, model_path=None)
-
-    # Unclaimed: the arch is left alone and no dspark_* marker is synthesized,
-    # so the drafter registry raises a KeyError on an unknown arch rather than
-    # binding this checkpoint to the Kimi-K3 draft class.
-    assert hf.architectures == ["DSparkDraftModel"]
-    assert getattr(hf, "dspark_with_draft", False) is False
-    assert getattr(hf, "dspark_target_layer_ids", None) is None
+    with pytest.raises(ValueError, match="target_layer_ids"):
+        SpeculativeConfig.hf_config_override(hf, model_path=None)
 
 
 def test_dflash_plain_qwen3_target_is_untouched():
@@ -1519,41 +1509,13 @@ def test_kv_indices_buffer_is_allocated_only_for_mla_block_plans(
 
 
 def test_dflash_draft_is_refused_on_a_non_k3_target():
-    """SpecForge stamps one arch on every DFlash draft, so the rename to
-    `K3DFlashModel` cannot tell a Kimi-K3 draft from a Qwen3/Llama one; the
-    target is checked where both configs are known."""
-    import atom.config as cfg
-
-    draft = types.SimpleNamespace(architectures=["K3DFlashModel"])
-    cfg._check_dflash_draft_target(
-        types.SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]), draft
+    """The checkpoint arch is generic, so the draft checks its target where the
+    target's layers are known: a stack without the Kimi-K3 aggregate refuses."""
+    target = types.SimpleNamespace(
+        layers=[types.SimpleNamespace(layer_idx=i) for i in range(16)]
     )
-    with pytest.raises(ValueError, match="Kimi-K3 target"):
-        cfg._check_dflash_draft_target(
-            types.SimpleNamespace(architectures=["Qwen3ForCausalLM"]), draft
-        )
-    # Any other draft is not this check's business.
-    cfg._check_dflash_draft_target(
-        types.SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
-        types.SimpleNamespace(architectures=["Eagle3LlamaModel"]),
-    )
-    cfg._check_dflash_draft_target(types.SimpleNamespace(architectures=[]), None)
-
-
-def test_dflash_draft_is_refused_under_pipeline_parallelism():
-    """Refused on every rank before weights load: the aggregate tap is scored
-    by the next target layer, which another PP stage may own."""
-    import atom.config as cfg
-
-    k3 = types.SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
-    draft = types.SimpleNamespace(architectures=["K3DFlashModel"])
-    with pytest.raises(ValueError, match="pipeline_parallel_size > 1"):
-        cfg._check_dflash_draft_target(k3, draft, 2)
-    cfg._check_dflash_draft_target(k3, draft, 1)
-    # Other drafts keep main's PP checks.
-    cfg._check_dflash_draft_target(
-        k3, types.SimpleNamespace(architectures=["K3DSparkModel"]), 2
-    )
+    with pytest.raises(ValueError, match="Kimi-K3 target only"):
+        _dflash_spec(target, (6, 11))
 
 
 def test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments(monkeypatch):

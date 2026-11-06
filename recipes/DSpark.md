@@ -83,8 +83,8 @@ Notes for Kimi-K3:
 
 [RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark) is a
 5-layer Qwen3-style GQA draft (SpecForge DFlash) that reads an aggregate of the
-target's hidden states. ATOM loads it as `K3DFlashModel` and refuses it on any
-target other than Kimi-K3.
+target's hidden states. It serves a Kimi-K3 target only. Its block width is
+`--num-speculative-tokens`, as for the Inferact draft above.
 
 ```bash
 python -m atom.entrypoints.openai_server \
