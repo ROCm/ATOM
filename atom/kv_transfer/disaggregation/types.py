@@ -221,6 +221,9 @@ class PageRegion:
 
     region: KVTransferRegion
     view: Any = None
+    # `(runs, heads)`: the unit is `runs` equal runs, each holding this rank's
+    # `heads` KV heads one after another. None: not per head (replicated).
+    head_major_runs: tuple[int, int] | None = None
 
 
 @dataclass

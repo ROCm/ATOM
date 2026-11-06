@@ -9,11 +9,12 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-from aiter.dist.parallel_state import get_tp_group
+from aiter.dist.parallel_state import get_pp_group, get_tp_group
 
 from atom.config import _is_minimax_m3_config
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
+from atom.models.utils import get_pp_indices
 from atom.utils import CpuGpuBuffer, envs, pack_rows, upload_numpy
 from atom.utils.block_convert import (
     block_table_convert_triton,
@@ -778,21 +779,84 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         if not self.kv_pools:
             return None
+        num_layers = self._pp_num_global_layers()
+        entry_tokens = self.block_size * self.block_ratio
+        # Every field of every pool, indexer cache included: a unit per (pool,
+        # field, layer), in declared order. The geometry is in the role because
+        # a hybrid declares two pools whose per-layer regions are otherwise
+        # named alike.
+        pages, consumer_indices = [], []
+        for geometry, pool in self.kv_pools.items():
+            kv_fields = [f.name for f in (*pool.cache_fields, *pool.scale_fields)]
+            modules = {
+                kind: {row: module for module, row in self.pool_rows[kind].items()}
+                for kind in (geometry, INDEX_ROWS)
+                if kind in self.pool_rows
+            }
+            for field, row, tensor in pool.field_regions():
+                per_head = field in kv_fields
+                module = modules[geometry if per_head else INDEX_ROWS][row]
+                runs = None  # the indexer keys: one per token, on every rank
+                if per_head:
+                    # Head-major per page. A layer that re-views its cache in
+                    # smaller SHUFFLE pages (M3's sparse layers: page-16) keeps
+                    # each block as that many runs of all its heads.
+                    page = getattr(
+                        getattr(module, "impl", None),
+                        "shuffle_page_tokens",
+                        pool.block_size,
+                    )
+                    runs = (entry_tokens // page, pool.num_kv_heads)
+                if num_layers is not None:
+                    # The row an unsplit model gives the unit, in its name and
+                    # as its consumer region: the layer for KV, its slot among
+                    # the sparse layers for the indexer key.
+                    if per_head:
+                        row = module.layer_num
+                        offset = kv_fields.index(field) * num_layers
+                    else:
+                        row = module.impl.sparse_layer_ordinal
+                        offset = len(kv_fields) * num_layers
+                    consumer_indices.append(offset + row)
+                pages.append(
+                    page_region(
+                        tensor,
+                        semantic_role=f"mha.{geometry}.{field}.layer_{row}",
+                        head_major_runs=runs,
+                    )
+                )
         return KVTransferTensors(
-            # Every field of every pool, indexer cache included: a unit per
-            # (pool, field, layer), in declared order. The geometry is in the
-            # role because a hybrid declares two pools whose per-layer regions
-            # are otherwise named alike.
-            pages=[
-                page_region(tensor, semantic_role=f"mha.{geometry}.{role}")
-                for geometry, pool in self.kv_pools.items()
-                for role, tensor in pool.region_tensors()
-            ],
+            pages=pages,
             # GQA/MQA KV heads are sharded or only partially replicated across
             # TP. In particular MiniMax-M3 must keep one stored shard per rank;
             # whole-object TP collapse is unsafe for this PAGE layout.
             tp_replication_factor=1,
+            block_region_consumer_indices=(
+                None if num_layers is None else consumer_indices
+            ),
         )
+
+    def _pp_num_global_layers(self) -> int | None:
+        """The model's layer count when this PP stage numbers its transfer
+        units as an unsplit model does, else None (no PP).
+
+        Only where a layer's row is the layer: every layer of the stage holds
+        one KV row of the one geometry. A hybrid's linear layers hold none, and
+        MiMo-V2 spreads its layers over two geometries, so their stages keep
+        their local rows, as before. The consumer is the same model unsplit,
+        whose target pool then holds a row per layer too: an MHA draft caches
+        into a pool of its own (`AiterBackend.DRAFT_OWNS_KV_POOL`).
+        """
+        config = self.model_runner.config
+        if config.pipeline_parallel_size == 1 or len(self.kv_pools) != 1:
+            return None
+        pp = get_pp_group()
+        text_config = getattr(config.hf_config, "text_config", config.hf_config)
+        num_layers = text_config.num_hidden_layers
+        start, end = get_pp_indices(num_layers, pp.rank_in_group, pp.world_size)
+        ((geometry, _),) = self.kv_pools.items()
+        held = sorted(module.layer_num for module in self.pool_rows[geometry])
+        return num_layers if held == list(range(start, end)) else None
 
     def refresh_flydsl_plan(self, context_lens, *, create=False):
         """Build or refresh aiter's FlyDSL work plan for this forward.

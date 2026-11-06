@@ -475,6 +475,8 @@ def transfer_stub(slot_regions):
         # are about.
         _consumer_region_map=lambda n, *_: list(range(n)),
         _block_region_consumer_indices=None,
+        # Same TP on both ends: nothing to cut by head.
+        _consumer_head_cut=lambda *_: None,
         # Matches the absence of the FP4 keys in `transfer_args`; the dtype
         # cross-check now runs before Phase 2 and would reject the pair first.
         _fp4_index_layout=False,

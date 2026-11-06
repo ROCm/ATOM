@@ -743,7 +743,11 @@ def mooncake_page_writer():
         "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py"
     )
     tree = ast.parse(path.read_text())
-    names = {"_execute_block_slot_transfer", "_consumer_region_map"}
+    names = {
+        "_execute_block_slot_transfer",
+        "_consumer_region_map",
+        "_consumer_head_cut",
+    }
     methods = [
         node
         for node in ast.walk(tree)
@@ -784,6 +788,7 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
             for r in src.block_regions
         ),
         _block_region_consumer_indices=None,
+        _block_head_major_runs=(),  # MLA: nothing per head
         _block_mr_ends=[[r.total_bytes] for r in src.block_regions],
         _swa_block_regions=src.swa_block_regions,
         _slot_regions=[],
@@ -794,7 +799,11 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
         pp_size=1,
         tp_rank=0,
     )
-    for name in ("_execute_block_slot_transfer", "_consumer_region_map"):
+    for name in (
+        "_execute_block_slot_transfer",
+        "_consumer_region_map",
+        "_consumer_head_cut",
+    ):
         setattr(conn, name, types.MethodType(writer[name], conn))
     req = {
         # FP4 consumers advertise under the FP4-only key (version fence).
