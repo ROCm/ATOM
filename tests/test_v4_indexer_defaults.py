@@ -116,10 +116,9 @@ def _make_config(
     _install_chip_info_stub(monkeypatch, probe)
     config = Config(
         model="test-model",
-        kv_cache_dtype="fp8",
         torch_profiler_dir=None,
         compilation_config=CompilationConfig(level=0, use_cudagraph=False),
-        **overrides,
+        **{"kv_cache_dtype": "fp8", **overrides},
     )
     return config, probe
 
@@ -200,3 +199,11 @@ def test_non_fp4_indexer_predicate_does_not_query_arch(monkeypatch):
 
     assert not v4_kernels.fp4_indexer_enabled("fp8")
     assert probe.calls == 0
+
+
+def test_v4_keeps_its_fp4_indexer_and_refuses_a_fp4_kv(monkeypatch):
+    config, _ = _make_config(monkeypatch, index_cache_dtype="fp4")
+    assert (config.kv_cache_dtype, config.index_cache_dtype) == ("fp8", "fp4")
+
+    with pytest.raises(ValueError, match="MiniMax-M3 and DeepSeek-V4.1 only"):
+        _make_config(monkeypatch, kv_cache_dtype="fp4")

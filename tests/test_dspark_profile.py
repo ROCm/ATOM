@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
+import torch
 
-from atom.spec_decode.calibration import validate_calibration
+from atom.spec_decode.calibration import calibration_identity, validate_calibration
 
 
 def profile():
@@ -42,3 +44,50 @@ def test_incompatible_or_invalid_profile_is_rejected(field, value):
     data[field] = value
     with pytest.raises(ValueError):
         validate_calibration(data, identity, width=5, max_batch=4)
+
+
+def identity_of(tmp_path, monkeypatch, **kw):
+    for name in ("config.json", "model.safetensors.index.json"):
+        (tmp_path / name).write_text("{}")
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "gpu")
+    config = SimpleNamespace(
+        model=str(tmp_path),
+        hf_config=SimpleNamespace(model_type="m"),
+        tensor_parallel_size=4,
+        kv_cache_dtype="fp8",
+        index_cache_dtype="fp8",
+        enforce_eager=False,
+    )
+    for key, value in kw.items():
+        setattr(config, key, value)
+    return calibration_identity(config, 0)
+
+
+def test_mxfp4_kv_does_not_share_an_fp8_identity(tmp_path, monkeypatch):
+    fp8 = identity_of(tmp_path, monkeypatch)
+    kv_mx = identity_of(tmp_path, monkeypatch, kv_cache_dtype="fp4")
+    index_mx = identity_of(tmp_path, monkeypatch, index_cache_dtype="fp4")
+    assert len({str(fp8), str(kv_mx), str(index_mx)}) == 3
+
+    data = {**profile(), "identity": fp8}
+    with pytest.raises(ValueError):
+        validate_calibration(data, kv_mx, width=5, max_batch=4)
+
+
+def test_a_draft_dtype_beside_the_targets_changes_the_identity(tmp_path, monkeypatch):
+    from atom.utils import selector
+
+    monkeypatch.setattr(selector, "attn_family", lambda hf: "x")
+    monkeypatch.setattr(
+        selector, "get_attn_backend", lambda f: SimpleNamespace(DRAFT_OWNS_KV_POOL=True)
+    )
+
+    def with_draft(dtype):
+        spec = SimpleNamespace(
+            method="dspark", kv_cache_dtype=dtype, draft_model_hf_config=object()
+        )
+        return identity_of(tmp_path, monkeypatch, speculative_config=spec)
+
+    # the target's own dtype leaves it as it was, so older profiles still match
+    assert with_draft("fp8") == identity_of(tmp_path, monkeypatch)
+    assert with_draft("bf16") != with_draft("fp8")

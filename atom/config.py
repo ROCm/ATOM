@@ -1378,6 +1378,10 @@ class SpeculativeConfig:
     # probability that the first i+1 draft tokens are all accepted), filled in by
     # __post_init__. None => real draft/target rejection sampling.
     synthetic_acceptance_rates: list[float] | None = None
+    # The draft's KV dtype (--spec-decode-kv-cache-dtype). As given: None = not
+    # asked, "bf16" / "fp8" / "fp4". `resolve_draft_kv_dtype` (from `Config`, once
+    # the target is known) replaces it with the dtype the draft will use.
+    kv_cache_dtype: str | None = None
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
@@ -1939,6 +1943,65 @@ def qrep_for_step(
     return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
 
 
+def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
+    """``--kv-cache-dtype fp4`` is MiniMax-M3's to ask for and DeepSeek-V4.1's own;
+    refused elsewhere. Asking is not being served: ``minimax_m3.config.
+    validate_runtime_config`` then takes only the all-indexed-sparse MiniMax-M3.1 and
+    refuses M3's original dense-attention checkpoints. The index ``fp4`` is left as
+    it is: its layout is per model."""
+    if kv_cache_dtype == "fp4" and not (is_m3 or is_v41):
+        raise ValueError(
+            "--kv-cache-dtype fp4 is supported by MiniMax-M3 and DeepSeek-V4.1 only"
+        )
+
+
+def kv_offload_requested(config) -> bool:
+    """Whether KV pages leave the pool: a ``--kv-transfer-config`` (a P/D connector,
+    or the offload one ``EngineArgs`` folds ``ATOM_KV_OFFLOAD`` into) or the env
+    itself, read too for a ``Config`` built without ``EngineArgs``."""
+    mode = (envs.ATOM_KV_OFFLOAD or "").strip().lower()
+    return bool(config.kv_transfer_config) or mode not in ("", "0", "off", "none")
+
+
+def resolve_draft_kv_dtype(spec, target_dtype: str, *, is_m3: bool) -> str:
+    """The KV dtype a speculative draft's pages have, from ``--spec-decode-kv-cache-dtype``
+    and the target's ``--kv-cache-dtype``.
+
+    A draft that caches into a pool of its own -- MiniMax-M3.1's standalone DSpark,
+    which `spec_decode.draft_kv.draft_kv_builder` gives one because its backend says
+    `DRAFT_OWNS_KV_POOL` -- takes its own dtype: fp8 unless the user chose bf16 or
+    fp8. FP4 has no draft layout (an exact FP4 sliding window is not built),
+    so it is refused here rather than mapped to anything else. Every other draft
+    lives in the target's pool, so it has the target's dtype and a different request
+    is an error, not a second pool.
+    """
+    asked = spec.kv_cache_dtype
+    own_pool = False
+    if is_m3 and spec.method == "dspark":
+        # The predicate `draft_kv_builder` and the offload deployment ask, so this
+        # cannot resolve a pool the builder does not give (or the reverse). It
+        # imports the attention backend, so only an M3 DSpark asks.
+        from atom.utils.selector import attn_family, get_attn_backend
+
+        own_pool = bool(
+            get_attn_backend(attn_family(spec.draft_model_hf_config)).DRAFT_OWNS_KV_POOL
+        )
+    if not own_pool:
+        if asked is not None and asked != target_dtype:
+            raise ValueError(
+                f"--spec-decode-kv-cache-dtype {asked} differs from "
+                f"--kv-cache-dtype {target_dtype}, but this draft caches in the "
+                "target's KV pool and cannot have its own dtype"
+            )
+        return target_dtype
+    if asked == "fp4":
+        raise ValueError(
+            "--spec-decode-kv-cache-dtype fp4: the draft has no FP4 KV layout "
+            "(use bf16 or fp8; fp8 when omitted)"
+        )
+    return asked or "fp8"
+
+
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
@@ -1947,6 +2010,7 @@ def indexer_cp_unsupported_reason(
     dcp_size: int,
     enable_tbo: bool,
     plugin_mode: bool = False,
+    mxfp4_caches: bool = False,
 ) -> str | None:
     """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
 
@@ -1974,6 +2038,8 @@ def indexer_cp_unsupported_reason(
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
         # flag so nothing downstream (log line, compile hash) disagrees.
         return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
+    if mxfp4_caches:
+        return "the MXFP4 caches are not wired to the CP scorer"
     if dcp_size > 1:
         return (
             "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
@@ -2790,6 +2856,15 @@ class Config:
             str(a).startswith(("DeepseekV4For", "DeepseekV4MTP", "DeepseekV4DSpark"))
             for a in arches
         )
+        # The same test the attention builder and the offload layout use, so the
+        # MXFP4 gate cannot disagree with them on an export that names itself
+        # only in `text_config` or `model_type`.
+        is_m3 = _is_minimax_m3_config(self.hf_config)
+        _check_fp4_kv(
+            self.kv_cache_dtype,
+            is_m3=is_m3,
+            is_v41=self.hf_config.model_type == "deepseek_v41_text",
+        )
         if is_deepseek_v4:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
@@ -2864,6 +2939,7 @@ class Config:
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
+                "fp4" in (self.index_cache_dtype, self.kv_cache_dtype),
             )
             if indexer_cp_off is not None:
                 logger.warning(
@@ -2905,7 +2981,34 @@ class Config:
                 # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
             else:
-                self.index_cache_dtype = self.kv_cache_dtype
+                # M3's fp4 KV keeps an FP8 index plane: its own choice, not the
+                # KV dtype's. An explicit --index-cache-dtype is never overridden.
+                self.index_cache_dtype = (
+                    "fp8"
+                    if is_m3 and self.kv_cache_dtype == "fp4"
+                    else self.kv_cache_dtype
+                )
+        if self.speculative_config is not None:
+            spec = self.speculative_config
+            spec.kv_cache_dtype = resolve_draft_kv_dtype(
+                spec, self.kv_cache_dtype, is_m3=is_m3
+            )
+            if spec.kv_cache_dtype != self.kv_cache_dtype and kv_offload_requested(
+                self
+            ):
+                # The offload namespace keys the target's KV dtype alone, so a
+                # draft page of another dtype would share a key with the target's.
+                raise ValueError(
+                    f"draft KV dtype {spec.kv_cache_dtype} differs from the "
+                    f"target's {self.kv_cache_dtype}: not supported with KV offload "
+                    "or --kv-transfer-config. An own-pool DSpark draft defaults to "
+                    "fp8; pass --spec-decode-kv-cache-dtype "
+                    f"{self.kv_cache_dtype} to match the target"
+                )
+        if is_m3:
+            from atom.models.minimax_m3.config import validate_runtime_config
+
+            validate_runtime_config(self)
 
         if self.hf_config.model_type == "deepseek_v41_text":
             # CSA2's index plane is paged by the same scorer GLM's is, so a
@@ -3077,6 +3180,7 @@ class Config:
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(self.index_cache_dtype)
+        factors.append(self.kv_cache_dtype == "fp4")
         # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
         # graphs (early + late layers) instead of one; both compile under the
         # `backbone` tag, so the flag must key the artifacts.
@@ -3143,7 +3247,13 @@ class Config:
         # steer sampling and stay out.
         spec = self.speculative_config
         factors.append(
-            None if spec is None else (spec.method, spec.num_speculative_tokens)
+            None
+            if spec is None
+            else (
+                spec.method,
+                spec.num_speculative_tokens,
+                getattr(spec, "kv_cache_dtype", None),
+            )
         )
 
         hash_str = hashlib.md5(

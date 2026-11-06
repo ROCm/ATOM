@@ -130,6 +130,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         max_seqlen_q: int,
         *,
         ubatch_split_bs: int | None = None,
+        use_cudagraph: bool = False,
     ):
         raise NotImplementedError
 
@@ -1006,6 +1007,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         max_seqlen_q: int,
         *,
         ubatch_split_bs: int | None = None,
+        use_cudagraph: bool = False,
     ):
         """Build this step's metadata at the shape `prepare_inputs` settled.
 
@@ -1030,6 +1032,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         cuts back to the scheduled batch, and that is the one place it does.
         """
         self._ubatch_split_bs = ubatch_split_bs
+        self._step_use_cudagraph = use_cudagraph
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
         if state_ops.relocations:
@@ -1055,6 +1058,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
     # The decode batch this step's TBO micro-batches are cut from (`build`).
     # None: they cut the scheduled requests, as an eager split does.
     _ubatch_split_bs: int | None = None
+
+    # Whether this step's decode forward is replayed as a request graph
+    # (`ForwardMode.use_cudagraph`), whose kernels keep the widths they were
+    # recorded at. False: the attention runs eagerly (an eager step, or a token
+    # graph, whose attention is an eager region), so the step's own widths do.
+    # Only `build` sets it; `build_for_cudagraph_capture` is a capture by definition.
+    _step_use_cudagraph: bool = False
 
     # Whether `prepare_prefill` builds a prefill padded past its scheduled rows
     # (`running_tokens`), as a token-graph bucket pads it

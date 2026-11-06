@@ -34,10 +34,18 @@ try:
     # It narrows in one pass where Triton folds tl.topk over
     # ceil(max_block / BLOCK_SIZE_K) tiles, so it pulls ahead as the row widens
     # -- 7us against 36us at a 1M context. `_aiter_selector_wins` says where.
-    from aiter.ops.flydsl.topk_per_row_small_k import (
-        topk_per_row_small_k,
-        topk_per_row_small_k_supported,
-    )
+    # A newer aiter keeps it in the `topk` package; the flat module is an older
+    # aiter's, the same functions.
+    try:
+        from aiter.ops.flydsl.topk.topk_per_row_small_k import (
+            topk_per_row_small_k,
+            topk_per_row_small_k_supported,
+        )
+    except ImportError:
+        from aiter.ops.flydsl.topk_per_row_small_k import (
+            topk_per_row_small_k,
+            topk_per_row_small_k_supported,
+        )
 except ImportError:  # pragma: no cover - aiter is optional at import time
     topk_per_row_small_k = None
     topk_per_row_small_k_supported = None
@@ -125,8 +133,8 @@ def _emit_sparse_block_table_row(
     topk,
     pid_h,
     block_size: tl.constexpr,
-    pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
-    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (>= pages_per_block)
+    pages_per_block: tl.constexpr,  # pages per sparse block (8 of 16 tokens; 1 for page-128)
+    block_page_stride: tl.constexpr,  # pages between logical blocks (>= pages_per_block)
     NUM_KV_HEADS: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
 ):
@@ -149,8 +157,10 @@ def _emit_sparse_block_table_row(
     bt_slot = tl.where(bt_is_full, bt_earlier_full, bt_n_full)  # tail -> n_full
 
     bt_logical_page = tl.load(bt_row + bt_blk, mask=bt_valid, other=0).to(tl.int32)
-    # block_page_stride (16) > pages_per_block (8): consecutive logical blocks sit
-    # 16 physical pages apart because the K and V planes overlap half a block.
+    # block_page_stride > pages_per_block only for a fused-K/V cache (the vLLM
+    # plugin's 16 > 8): consecutive logical blocks then sit 16 physical pages apart
+    # because the K and V planes overlap half a block. 8 / 8 for the page-16
+    # SHUFFLE cache, 1 / 1 for a page-128 (MXFP4) one.
     bt_base_phys = bt_logical_page * block_page_stride * NUM_KV_HEADS + pid_h
     bt_dst_base = bt_slot * pages_per_block
 
@@ -178,7 +188,10 @@ def _emit_sparse_block_table_row(
     bt_ctx = tl.where(
         bt_has_tail, bt_ctx, tl.minimum(bt_n_valid * block_size, causal_len)
     )
-    tl.store(sctx_ptr, bt_ctx)
+    # A pad row of a padded step (length 0) has no causal key: causal_len <= 0
+    # makes the count above negative, and a context below zero is outside what the
+    # decode kernels take. A live row has causal_len >= 1 and a positive count.
+    tl.store(sctx_ptr, tl.maximum(bt_ctx, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -685,7 +698,15 @@ def _require_packable(max_block: int) -> None:
         )
 
 
-def _alloc_emit(total_q, num_idx_heads, topk, block_table, emit, device):
+def _alloc_emit(
+    total_q,
+    num_idx_heads,
+    topk,
+    block_table,
+    emit,
+    device,
+    pages_per_block=PAGES_PER_SPARSE_BLOCK,
+):
     """Buffers for the fused page-16 emit, as (what to return, what to pass).
 
     One row per (query token, kv-head): the ASM/gluon path collapses kv-head
@@ -703,7 +724,7 @@ def _alloc_emit(total_q, num_idx_heads, topk, block_table, emit, device):
         return None, (dummy, dummy, 0, 0)
     rows = total_q * num_idx_heads
     sparse_bt = torch.empty(
-        (rows, topk * PAGES_PER_SPARSE_BLOCK), dtype=torch.int32, device=device
+        (rows, topk * pages_per_block), dtype=torch.int32, device=device
     )
     sparse_ctx = torch.empty((rows,), dtype=torch.int32, device=device)
     args = (sparse_bt, sparse_ctx, block_table.stride(0), sparse_bt.stride(0))
@@ -742,10 +763,12 @@ def _select_with_aiter(
     """Run the selection through aiter, or return False if it cannot serve.
 
     Declines rather than raises: k past the wave width, or a survivor buffer
-    past the LDS budget, are shapes the Triton selector still handles. `score`
-    and `topk_idx` are contiguous, so the flattening is a view.
+    past the LDS budget, are shapes the Triton selector still handles. `topk_idx` is contiguous, so its
+    flattening is a view; `score` is too unless the scorer laid it out transposed
+    (MXFP4 with several index heads), which only the stride-aware Triton selector
+    reads.
     """
-    if topk_per_row_small_k is None:
+    if topk_per_row_small_k is None or not score.is_contiguous():
         return False
     heads, total_q, max_block = score.shape
     rows = heads * total_q
@@ -787,6 +810,7 @@ def _launch_select(
     emit,
     block_page_stride,
     n_valid_column_per_row=None,
+    pages_per_block=PAGES_PER_SPARSE_BLOCK,
 ):
     """The one selection pass, launched the same way by both phases.
 
@@ -823,7 +847,7 @@ def _launch_select(
                 SPARSE_BLOCK_SIZE,
                 NUM_KV_HEADS=num_idx_heads,
                 DECODE_MAX_Q=decode_max_q,
-                pages_per_block=PAGES_PER_SPARSE_BLOCK,
+                pages_per_block=pages_per_block,
                 # Not PAGES_PER_SPARSE_BLOCK: a caller whose cache packs
                 # several planes into one block has a stride wider than the
                 # pages a block fills. Hard-coding the two to the same constant
@@ -862,7 +886,7 @@ def _launch_select(
         NUM_KV_HEADS=num_idx_heads,
         DECODE_MAX_Q=decode_max_q,
         BLOCK_SIZE_K=block_size_k,
-        pages_per_block=PAGES_PER_SPARSE_BLOCK,
+        pages_per_block=pages_per_block,
         block_page_stride=block_page_stride,
         EMIT_SPARSE_BT=emit,
         num_warps=num_warps,
@@ -910,8 +934,8 @@ def _topk_index_packed_kernel(
     DECODE_MAX_Q: tl.constexpr,  # 0 = prefill; else query rows per request
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
-    pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
-    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (>= pages_per_block)
+    pages_per_block: tl.constexpr,  # pages per sparse block (8 of 16 tokens; 1 for page-128)
+    block_page_stride: tl.constexpr,  # pages between logical blocks (>= pages_per_block)
     EMIT_SPARSE_BT: tl.constexpr,  # fuse compaction (per-kv-head row + encoded page)
 ):
     tl.static_assert(BLOCK_SIZE_K >= BLOCK_SIZE_T)
@@ -937,7 +961,8 @@ def _topk_index_packed_kernel(
     valid_blocks = (prefix_len + pid_q * sample_interval + block_size) // block_size
     local_start = tl.maximum(0, valid_blocks - local_blocks)
 
-    # valid_blocks >= 1 always, so the first tile is unconditional and the loop
+    # valid_blocks >= 1 for a live row (a pad row's is 0, and selects nothing: its
+    # `topk_idx` is all -1 below), so the first tile is unconditional and the loop
     # covers only the rows long enough to need a second one. Folding it into the
     # loop instead would cost the single-tile rows -- the common case -- one
     # extra cat and topk against an all-padding vector. (The two argument lists
@@ -1123,8 +1148,16 @@ def minimax_m3_index_topk(
     emit_sparse_block_table: bool = False,
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
+    index_mxfp4: bool = False,
+    pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
+
+    With ``index_mxfp4`` (``--index-cache-dtype fp4``) ``index_kv_cache`` is the
+    uint8 ``[num_blocks, 8704]`` MXFP4 page cache and the scores come from aiter's
+    FlyDSL scorer (index_mxfp4.py); the selection after it is this module's.
+    ``pages_per_block`` / ``block_page_stride`` describe the emitted block table:
+    8 / 8 for the page-16 SHUFFLE cache, 1 / 1 for page-128 caches (MXFP4 KV).
 
     Returns topk_idx [num_kv_heads, total_q, topk] of 0-indexed block ids
     (right-padded with -1). M3 has num_idx_heads == num_kv_heads, so the
@@ -1149,7 +1182,7 @@ def minimax_m3_index_topk(
     (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
     same bound in registers.
     """
-    total_q, num_idx_heads, head_dim = idx_q.shape
+    total_q, num_idx_heads, _ = idx_q.shape
     assert (
         num_idx_heads == num_kv_heads
     ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
@@ -1157,6 +1190,86 @@ def minimax_m3_index_topk(
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     _require_packable(max_block)
 
+    if index_mxfp4:
+        from atom.model_ops.minimax_m3.mxfp4_pages import page_views
+
+        k_data, k_scale = page_views(index_kv_cache)
+        from aiter.ops.flydsl import minimax_m3_index_score_prefill_fp4_flydsl
+
+        score = minimax_m3_index_score_prefill_fp4_flydsl(
+            idx_q,
+            k_data,
+            k_scale,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            max_query_len,
+            max_seq_len,
+            sm_scale,
+        )
+    else:
+        score = _triton_prefill_score(
+            idx_q,
+            index_kv_cache,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            max_query_len,
+            max_block,
+            sm_scale,
+        )
+
+    topk_idx = torch.empty(
+        (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device
+    )
+    emit_out, emit_args = _alloc_emit(
+        total_q,
+        num_idx_heads,
+        topk,
+        block_table,
+        emit_sparse_block_table,
+        idx_q.device,
+        pages_per_block,
+    )
+    _launch_select(
+        score,
+        topk_idx,
+        cu_seqlens_q,  # ragged: query starts, one past the end for the count
+        prefix_lens,
+        batch,
+        topk,
+        init_blocks,
+        local_blocks,
+        block_table,
+        emit_args,
+        num_idx_heads,
+        rows_per_req=max_query_len,
+        decode_max_q=0,
+        block_size_k=_prefill_topk_block_size_k(max_block),
+        num_warps=PREFILL_TOPK_NUM_WARPS,
+        emit=emit_sparse_block_table,
+        block_page_stride=block_page_stride,
+        n_valid_column_per_row=n_valid_column_per_row,
+        pages_per_block=pages_per_block,
+    )
+    return (topk_idx, *emit_out) if emit_out else topk_idx
+
+
+def _triton_prefill_score(
+    idx_q,
+    index_kv_cache,
+    block_table,
+    cu_seqlens_q,
+    seq_lens,
+    prefix_lens,
+    max_query_len,
+    max_block,
+    sm_scale,
+):
+    total_q, num_idx_heads, head_dim = idx_q.shape
+    batch = cu_seqlens_q.shape[0] - 1
     score = torch.empty(
         (num_idx_heads, total_q, max_block),
         dtype=torch.float32,
@@ -1201,101 +1314,20 @@ def minimax_m3_index_topk(
         num_warps=score_num_warps,
         num_stages=score_num_stages,
     )
-
-    topk_idx = torch.empty(
-        (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device
-    )
-    emit_out, emit_args = _alloc_emit(
-        total_q, num_idx_heads, topk, block_table, emit_sparse_block_table, idx_q.device
-    )
-    _launch_select(
-        score,
-        topk_idx,
-        cu_seqlens_q,  # ragged: query starts, one past the end for the count
-        prefix_lens,
-        batch,
-        topk,
-        init_blocks,
-        local_blocks,
-        block_table,
-        emit_args,
-        num_idx_heads,
-        rows_per_req=max_query_len,
-        decode_max_q=0,
-        block_size_k=_prefill_topk_block_size_k(max_block),
-        num_warps=PREFILL_TOPK_NUM_WARPS,
-        emit=emit_sparse_block_table,
-        block_page_stride=block_page_stride,
-        n_valid_column_per_row=n_valid_column_per_row,
-    )
-    return (topk_idx, *emit_out) if emit_out else topk_idx
+    return score
 
 
-@torch.no_grad()
-def minimax_m3_index_topk_decode(
-    idx_q: torch.Tensor,  # [total_q == batch*max_query_len, num_idx_heads, head_dim]
-    index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
-    block_table: torch.Tensor,  # [batch, max_blocks]
-    seq_lens: torch.Tensor,  # [batch] int32
-    max_seq_len: int,
-    topk: int,
-    init_blocks: int,
-    local_blocks: int,
-    num_kv_heads: int,
-    sm_scale: float,
-    emit_sparse_block_table: bool = False,
-    max_query_len: int = 1,  # query tokens per request (num_spec+1); 1 == plain decode
-    block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
-    n_valid_column_per_row: torch.Tensor | None = None,
+def _triton_decode_score(
+    idx_q,
+    index_kv_cache,
+    block_table,
+    seq_lens,
+    max_block,
+    max_query_len,
+    sm_scale,
 ):
-    """Decode index block-score + top-k, both split-K (cudagraph-safe).
-
-    Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
-    For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
-    query tokens of a request is an independent row with its own causal cutoff
-    ``causal_len = seq_len - max_query_len + tok + 1``; ``max_query_len == 1`` is
-    plain decode (one token per request).
-
-    When ``emit_sparse_block_table`` is True the selector ALSO fuses the page-16
-    SHUFFLE block-table compaction and returns ``(topk_idx, sparse_bt [total_q,
-    topk*8], sparse_ctx [total_q])`` ready for the ASM/gluon decode kernel --
-    saving a separate build launch + topk_idx HBM round-trip.
-
-    ``block_page_stride`` is the distance in physical 16-pages between two
-    consecutive logical 128-blocks in the KV cache. It defaults to
-    ``PAGES_PER_SPARSE_BLOCK``, which is correct for a cache whose blocks are
-    back to back; a caller that packs N planes into one block, so that the
-    planes overlap and a block no longer fills its own stride, passes
-    ``N * PAGES_PER_SPARSE_BLOCK``.
-    ``n_valid_column_per_row`` is the batch's
-    ``MiniMaxM3SparseMetadata.n_valid_column_per_row``, built once per forward by
-    the attention metadata and handed to every sparse layer. It makes the aiter
-    selector eligible -- the row width decides whether it is actually cheaper
-    (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
-    same bound in registers.
-    """
     total_q, num_idx_heads, head_dim = idx_q.shape
-    assert (
-        num_idx_heads == num_kv_heads
-    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
-    assert total_q % max_query_len == 0, (
-        f"total_q {total_q} not divisible by max_query_len {max_query_len}: the "
-        "decode segment must be uniform, i.e. every request contributes exactly "
-        "max_query_len rows, because the kernels below recover a request as "
-        "row // max_query_len. A ragged segment (spec decode where some request "
-        "carries no draft tokens) has to be routed to the prefill path by the "
-        "attention metadata builder."
-    )
     batch = seq_lens.shape[0]
-    max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
-    _require_packable(max_block)
-    topk_idx = torch.empty(
-        (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device
-    )
-    emit_out, emit_args = _alloc_emit(
-        total_q, num_idx_heads, topk, block_table, emit_sparse_block_table, idx_q.device
-    )
-
     score = torch.empty(
         (num_idx_heads, total_q, max_block),
         dtype=torch.float32,
@@ -1326,6 +1358,129 @@ def minimax_m3_index_topk_decode(
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         num_stages=DECODE_SCORE_NUM_STAGES,
     )
+    return score
+
+
+@torch.no_grad()
+def minimax_m3_index_topk_decode(
+    idx_q: torch.Tensor,  # [total_q == batch*max_query_len, num_idx_heads, head_dim]
+    index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
+    block_table: torch.Tensor,  # [batch, max_blocks]
+    seq_lens: torch.Tensor,  # [batch] int32
+    max_seq_len: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    num_kv_heads: int,
+    sm_scale: float,
+    emit_sparse_block_table: bool = False,
+    max_query_len: int = 1,  # query tokens per request (num_spec+1); 1 == plain decode
+    block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
+    n_valid_column_per_row: torch.Tensor | None = None,
+    index_mxfp4: bool = False,
+    pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
+    index_score=None,
+):
+    """Decode index block-score + top-k, both split-K (cudagraph-safe).
+
+    ``index_mxfp4`` and ``pages_per_block`` as in :func:`minimax_m3_index_topk`.
+    The MXFP4 scorer takes the step's ``index_score`` (``IndexScoreStep``: work map,
+    the block bound it was built against, which does not move between graph replays,
+    and the -inf filled score storage); omitted, it builds and allocates its own.
+
+    Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
+    For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
+    query tokens of a request is an independent row with its own causal cutoff
+    ``causal_len = seq_len - max_query_len + tok + 1``; ``max_query_len == 1`` is
+    plain decode (one token per request).
+
+    When ``emit_sparse_block_table`` is True the selector ALSO fuses the page-16
+    SHUFFLE block-table compaction and returns ``(topk_idx, sparse_bt [total_q,
+    topk*8], sparse_ctx [total_q])`` ready for the ASM/gluon decode kernel --
+    saving a separate build launch + topk_idx HBM round-trip.
+
+    ``block_page_stride`` is the distance in physical 16-pages between two
+    consecutive logical 128-blocks in the KV cache. It defaults to
+    ``PAGES_PER_SPARSE_BLOCK``, which is correct for a cache whose blocks are
+    back to back; a caller that packs N planes into one block, so that the
+    planes overlap and a block no longer fills its own stride, passes
+    ``N * PAGES_PER_SPARSE_BLOCK``.
+    ``n_valid_column_per_row`` is the batch's
+    ``MiniMaxM3SparseMetadata.n_valid_column_per_row``, built once per forward by
+    the attention metadata and handed to every sparse layer. It makes the aiter
+    selector eligible -- the row width decides whether it is actually cheaper
+    (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
+    same bound in registers.
+    """
+    total_q, num_idx_heads, _ = idx_q.shape
+    assert (
+        num_idx_heads == num_kv_heads
+    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
+    assert total_q % max_query_len == 0, (
+        f"total_q {total_q} not divisible by max_query_len {max_query_len}: the "
+        "decode segment must be uniform, i.e. every request contributes exactly "
+        "max_query_len rows, because the kernels below recover a request as "
+        "row // max_query_len. A ragged segment (spec decode where some request "
+        "carries no draft tokens) has to be routed to the prefill path by the "
+        "attention metadata builder."
+    )
+    batch = seq_lens.shape[0]
+    max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    _require_packable(max_block)
+    topk_idx = torch.empty(
+        (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device
+    )
+    emit_out, emit_args = _alloc_emit(
+        total_q,
+        num_idx_heads,
+        topk,
+        block_table,
+        emit_sparse_block_table,
+        idx_q.device,
+        pages_per_block,
+    )
+
+    if index_mxfp4:
+        from aiter.ops.flydsl import minimax_m3_index_score_fp4_flydsl
+
+        from atom.model_ops.minimax_m3.mxfp4_pages import page_views
+
+        step = index_score
+        score_max_block = max(max_block, step.max_block if step else 0)
+        _require_packable(score_max_block)
+        if (
+            step is not None
+            and step.out is not None
+            and step.out.shape[-1] != score_max_block
+        ):
+            raise ValueError(
+                f"index_score.out is {step.out.shape[-1]} blocks wide, the "
+                f"scorer's bound is {score_max_block}"
+            )
+        k_data, k_scale = page_views(index_kv_cache)
+        score = minimax_m3_index_score_fp4_flydsl(
+            idx_q,
+            k_data,
+            k_scale,
+            block_table,
+            seq_lens,
+            max_query_len,
+            num_idx_heads,
+            sm_scale,
+            score_max_block,
+            out=step.out if step else None,
+            work_map=step.work_map if step else None,
+        )
+    else:
+        score = _triton_decode_score(
+            idx_q,
+            index_kv_cache,
+            block_table,
+            seq_lens,
+            max_block,
+            max_query_len,
+            sm_scale,
+        )
 
     _launch_select(
         score,
@@ -1346,5 +1501,6 @@ def minimax_m3_index_topk_decode(
         emit=emit_sparse_block_table,
         block_page_stride=block_page_stride,
         n_valid_column_per_row=n_valid_column_per_row,
+        pages_per_block=pages_per_block,
     )
     return (topk_idx, *emit_out) if emit_out else topk_idx

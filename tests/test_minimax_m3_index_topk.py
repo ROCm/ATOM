@@ -545,6 +545,28 @@ class TestSelectorDispatch:
             assert m._aiter_selector_wins(width, emit=True)
 
 
+class TestSelectWithAiter:
+    """aiter flattens the score with a `view`: a layout it cannot view is declined."""
+
+    @pytest.mark.parametrize("transposed", [False, True])
+    def test_only_a_contiguous_score_is_served(self, monkeypatch, transposed):
+        calls = []
+        monkeypatch.setattr(m, "topk_per_row_small_k", lambda *a: calls.append(a))
+        monkeypatch.setattr(m, "topk_per_row_small_k_supported", lambda *a: True)
+        monkeypatch.setattr(m, "_AITER_SERVES", {})
+        heads, total_q, blocks = 2, 8, 2048
+        if transposed:
+            # what the MXFP4 scorer returns once S * H >= its TRANSPOSE_MIN_F
+            score = torch.empty(blocks, total_q, heads).permute(2, 1, 0)
+            assert score.stride() == (1, heads, total_q * heads)
+        else:
+            score = torch.empty(heads, total_q, blocks)
+        topk_idx = torch.empty(heads, total_q, TOPK, dtype=torch.int32)
+        bounds = torch.full((heads * total_q,), blocks, dtype=torch.int32)
+        served = m._select_with_aiter(score, topk_idx, bounds, TOPK, 1, 1)
+        assert served != transposed and len(calls) == int(not transposed)
+
+
 @gpu
 def test_the_two_selectors_agree_where_the_dispatch_switches():
     """Above the width threshold both paths must return the same selection.
@@ -586,6 +608,86 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
     )
     assert torch.equal(ait_ctx, tri_ctx)
     assert torch.equal(ait_bt, tri_bt)
+
+
+@gpu
+@pytest.mark.parametrize(
+    "S,heads,width",
+    [
+        (1, 1, 70),
+        (8, 2, 70),
+        (1, 2, m._AITER_MIN_WIDTH_WITH_EMIT + 252),
+        (8, 1, m._AITER_MIN_WIDTH_WITH_EMIT + 252),
+    ],
+)
+def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
+    monkeypatch, S, heads, width
+):
+    """Decode selection + emission over a step padded from 3 to 6 requests (pad rows
+    length 0, a poisoned block table), on both selectors. A pad row has no causal
+    key: it emits context 0 and page 0 and never reads its table; a live row's
+    context is the closed form of what the selection holds. The wide case is the one
+    `_aiter_selector_wins` hands to aiter's selector: it must actually serve it, and
+    agree with Triton."""
+    live_lens = [width * SPARSE_BLOCK_SIZE - 5, 300 + S, 9 * SPARSE_BLOCK_SIZE + S]
+    batch, live = 6, len(live_lens)
+    dev = "cuda"
+    seq = torch.zeros(batch, dtype=torch.int32, device=dev)
+    seq[:live] = torch.tensor(live_lens, dtype=torch.int32)
+    table = torch.full((batch, width), 0x7FFFFFFF, dtype=torch.int32, device=dev)
+    table[:live] = torch.randperm(10_000, device=dev)[: live * width].reshape(live, -1).int()  # fmt: skip
+    total_q = batch * S
+    g = torch.Generator(device=dev).manual_seed(7 * S + heads)
+    score = torch.randn(heads, total_q, width, generator=g, device=dev)
+    nvalid = m.build_n_valid_column_per_row(
+        seq, seq, batch=batch, total_q=total_q, num_idx_heads=heads, decode_max_q=S
+    )
+
+    served = []
+    real = m.topk_per_row_small_k
+    if real is not None:
+        monkeypatch.setattr(
+            m, "topk_per_row_small_k", lambda *a: (served.append(1), real(*a))[1]
+        )
+    monkeypatch.setattr(m, "_AITER_SERVES", {})
+
+    def run(bounds):
+        topk_idx = torch.empty((heads, total_q, TOPK), dtype=torch.int32, device=dev)
+        (sbt, sctx), args = m._alloc_emit(total_q, heads, TOPK, table, True, dev, 1)
+        m._launch_select(
+            score, topk_idx, seq, seq, batch, TOPK, 0, 1, table, (sbt, sctx, *args[2:]),
+            heads, rows_per_req=S, decode_max_q=S,
+            block_size_k=m.DECODE_TOPK_BLOCK_SIZE_K, num_warps=m.DECODE_TOPK_NUM_WARPS,
+            emit=True, block_page_stride=1, n_valid_column_per_row=bounds,
+            pages_per_block=1,
+        )  # fmt: skip
+        return topk_idx, sbt, sctx
+
+    tri_idx, tri_bt, tri_ctx = run(None)
+    assert not served
+    ait_idx, ait_bt, ait_ctx = run(nvalid)
+    if width >= m._AITER_MIN_WIDTH_WITH_EMIT:
+        if real is None:
+            pytest.skip("aiter's small-k selector is not installed")
+        assert served, "the wide row was not served by aiter's selector"
+    rows = heads * total_q
+    assert torch.equal(
+        torch.sort(ait_idx.reshape(rows, TOPK), dim=1).values,
+        torch.sort(tri_idx.reshape(rows, TOPK), dim=1).values,
+    )
+    for bt, ctx in ((tri_bt, tri_ctx), (ait_bt, ait_ctx)):
+        n = live * S * heads
+        # live rows (token-major, head-minor): the closed form of the context
+        for r in range(live * S):
+            b, t = divmod(r, S)
+            causal = live_lens[b] - S + t + 1
+            last = (causal - 1) // SPARSE_BLOCK_SIZE
+            want = (min(TOPK, last + 1) - 1) * SPARSE_BLOCK_SIZE + causal - last * SPARSE_BLOCK_SIZE  # fmt: skip
+            assert ctx[r * heads : (r + 1) * heads].tolist() == [want] * heads
+        # pad rows: nothing, and no poisoned page id got out
+        assert int(ctx[n:].abs().max()) == 0 and int(bt[n:].abs().max()) == 0
+        assert int(bt[:n].max()) < 10_000 * 8 * heads
+    assert torch.equal(ait_ctx, tri_ctx) and torch.equal(ait_bt, tri_bt)
 
 
 @gpu

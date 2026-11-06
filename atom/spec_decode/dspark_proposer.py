@@ -383,10 +383,15 @@ class DSparkProposer(Drafter):
         import copy
 
         from atom.config import CompilationLevel
+        from atom.spec_decode.draft_kv import draft_kv_cache_dtype
 
         draft_hf = self.speculative_config.draft_model_hf_config
         draft_atom_config = copy.copy(self.config)
         draft_atom_config.hf_config = draft_hf
+        # Before the model is built: its attention reads this at construction.
+        draft_atom_config.kv_cache_dtype = self.draft_kv_cache_dtype = (
+            draft_kv_cache_dtype(self.config, draft_hf)
+        )
         draft_atom_config.compilation_config = copy.copy(self.config.compilation_config)
         draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
         model = model_class(
@@ -470,7 +475,10 @@ class DSparkProposer(Drafter):
 
         # d_dtypes maps the "auto" cache dtype to None, and torch.empty would
         # silently read that as float32 rather than the model dtype.
-        from_config = dtypes.d_dtypes.get(self.config.kv_cache_dtype) or self.dtype
+        kv_cache_dtype = (
+            getattr(self, "draft_kv_cache_dtype", None) or self.config.kv_cache_dtype
+        )
+        from_config = dtypes.d_dtypes.get(kv_cache_dtype) or self.dtype
 
         bound = self._bound_draft_k_cache(forward_context)
         if bound is None:
@@ -489,7 +497,7 @@ class DSparkProposer(Drafter):
                 "resolved to a draft row and not to a target layer.",
                 layer_num,
                 bound.dtype,
-                self.config.kv_cache_dtype,
+                kv_cache_dtype,
                 from_config,
                 layer_num,
             )

@@ -11,9 +11,15 @@ import torch
 
 
 def calibration_identity(config, device):
+    from atom.spec_decode.draft_kv import draft_kv_cache_dtype
+
     model = Path(config.model)
     files = ("config.json", "model.safetensors.index.json")
-    return {
+    spec = getattr(config, "speculative_config", None)
+    draft_dtype = draft_kv_cache_dtype(
+        config, getattr(spec, "draft_model_hf_config", None)
+    )
+    identity = {
         "model_files": {
             name: hashlib.sha256((model / name).read_bytes()).hexdigest()
             for name in files
@@ -27,6 +33,11 @@ def calibration_identity(config, device):
         "torch_version": torch.__version__,
         "hip_version": torch.version.hip,
     }
+    # Only when it is not the target's, so profiles from before it was a choice
+    # still match.
+    if draft_dtype != config.kv_cache_dtype:
+        identity["draft_kv_cache_dtype"] = draft_dtype
+    return identity
 
 
 def validate_calibration(profile, identity, *, width, max_batch):
