@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793897758234,
+  "lastUpdate": 1793991467239,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4796,6 +4796,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8939,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/42062283041 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611051503 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1585 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "honglie",
+            "username": "yhl-amd",
+            "email": "hyi@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "6d22f7dbfda7d759135cc07e20b3bcbe16cc4515",
+          "message": "fix(moe): drop the missing-route clear from comm-fused MoE (#3075)\n\nSince routing moved before the gather, comm-fused MoE passed\n`routes_may_be_missing=True` on every call, so the runtime cleared the\nroute scratch of the whole bucket before every MoE layer of every\nprefill.\n\nThe routes that go missing here are whole rows -- DPA pad rows and rows\npast `scheduled_tokens_gpu`, every top-k slot at expert -1. The runtime\nreduces each row's slots into that row alone and those rows are dropped,\nso their unwritten scratch never reaches a real row. Stop requesting the\nclear.\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-06T15:53:24Z",
+          "url": "https://github.com/ROCm/ATOM/commit/6d22f7dbfda7d759135cc07e20b3bcbe16cc4515"
+        },
+        "date": 1793991466433,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9424,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/42250140200 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611061502 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9401 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8946,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/42250140200 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611061502 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1607 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
