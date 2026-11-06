@@ -10,10 +10,12 @@ namespace, and the adapters both connector halves open to the server.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 from dataclasses import replace
 from typing import Any
+from urllib.parse import urlsplit
 
 from atom.kv_transfer.offload import config as offcfg
 from atom.utils import envs
@@ -112,7 +114,25 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
     if pp_size != 1:
         raise NotImplementedError("lmcache_mp does not support PP yet")
     if dcp_size != 1:
-        raise NotImplementedError("lmcache_mp does not support DCP yet")
+        # Under DCP one block-table entry is a virtual block of
+        # `block_size * dcp` global tokens, and each rank's physical block holds
+        # its interleaved share of them; LMCache moves that block as one
+        # compressed block (`_page_block_tokens`). That holds only while a
+        # rank's share of a virtual block stays inside one physical block,
+        # i.e. while the interleave granularity divides the block size.
+        interleave = offcfg._strict_integer(
+            "DCP interleave size",
+            getattr(getattr(config, "dcp_config", None), "interleave_size", 1) or 1,
+            minimum=1,
+        )
+        block_size = offcfg._strict_integer(
+            "kv_cache_block_size", config.kv_cache_block_size, minimum=1
+        )
+        if block_size % interleave:
+            raise NotImplementedError(
+                "lmcache_mp under DCP needs the DCP interleave size to divide the "
+                f"block size (interleave={interleave}, block_size={block_size})"
+            )
     if pcp_size != 1:
         raise NotImplementedError("lmcache_mp does not support PCP yet")
     # Single-host DP replicas deliberately share one (model_name, worker_id,
@@ -122,16 +142,162 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
     # descriptors per (model_name, world_size) (all replicas publish the same
     # one), and _mp_session_id scopes request sessions and their locks per
     # replica.
-    if dp_size_local != dp_size:
+    #
+    # Across hosts the server cannot be shared: it moves KV through GPU IPC,
+    # which reaches only its own host's devices. A loopback server address
+    # therefore means one server per host, each serving that host's replicas,
+    # which is the multi-node layout this connector supports. A prefix is then
+    # reusable only on the host that stored it; DP session affinity routes a
+    # session's later turns back to its owner rank, and so to that host.
+    if dp_size_local != dp_size and not _server_is_host_local(config):
         raise NotImplementedError(
-            "lmcache_mp supports DP and DP-attention only within one host; "
-            "multi-node DP requires one LMCache server per host and local "
-            "server routing "
+            "lmcache_mp supports multi-node DP only with one LMCache server per "
+            "host: set lmcache.mp.host to a loopback address and start a server "
+            "on every host "
             f"(data_parallel_size={dp_size}, local={dp_size_local})"
         )
 
+    # A TP group spanning hosts: each host's ranks reach their own host's
+    # server, which can only serve them (GPU IPC), and the engine's scheduler
+    # asks every host's server (`tp_hosts.TPHostsSchedulerAdapter`).
+    if _tp_host_count(config) > 1:
+        if not _server_is_host_local(config):
+            raise NotImplementedError(
+                "lmcache_mp runs a TP group spanning hosts only with one LMCache "
+                "server per host: set lmcache.mp.host to a loopback address and "
+                "start a server on every host"
+            )
+        if _extra_config(config).get("lmcache.mp.tp_rank_collapse") is True:
+            # One writer and TP readers would need that writer's object on
+            # every host's server; each host stores only its own ranks'.
+            raise NotImplementedError(
+                "lmcache_mp does not collapse TP ranks across hosts; leave "
+                "lmcache.mp.tp_rank_collapse at 'auto' or set it to false"
+            )
+        _tp_host_server_urls(config)
+
     _transfer_mode(config)
     return tp_size, pp_size
+
+
+def _page_block_tokens(config: Any) -> int:
+    """Global tokens one block-table entry covers: the PAGE block LMCache moves.
+
+    Without DCP this is the block size. Under DCP an entry is a virtual block
+    of `block_size * dcp` tokens (`prefix_hash.hash_block_size_for`), of which
+    each rank stores its interleaved share in one physical block of
+    `block_size` slots; LMCache registers such a group as compressed
+    (`tokens_per_block` a multiple of the physical slots).
+    """
+
+    block_size = offcfg._strict_integer(
+        "kv_cache_block_size", config.kv_cache_block_size, minimum=1
+    )
+    dcp_size = offcfg._strict_integer(
+        "decode_context_parallel_size",
+        getattr(config, "decode_context_parallel_size", 1) or 1,
+        minimum=1,
+    )
+    return block_size * dcp_size
+
+
+def _tp_host_count(config: Any) -> int:
+    """Hosts one TP group spans: 1 unless `--tensor-parallel-size-local` cuts it."""
+
+    if not getattr(config, "is_multinode_tp", False):
+        return 1
+    tp_size = offcfg._strict_integer(
+        "tensor_parallel_size",
+        getattr(config, "tensor_parallel_size", 1) or 1,
+        minimum=1,
+    )
+    local = offcfg._strict_integer(
+        "tensor_parallel_size_local",
+        getattr(config, "tp_size_local", tp_size) or tp_size,
+        minimum=1,
+    )
+    if tp_size % local:
+        raise ValueError(
+            f"TP size {tp_size} is not a whole number of hosts of {local} ranks"
+        )
+    return tp_size // local
+
+
+def _tp_ranks_per_host(config: Any) -> int:
+    tp_size = offcfg._strict_integer(
+        "tensor_parallel_size",
+        getattr(config, "tensor_parallel_size", 1) or 1,
+        minimum=1,
+    )
+    return tp_size // _tp_host_count(config)
+
+
+def _tp_host_server_urls(config: Any) -> list[str]:
+    """Every host's LMCache server, as the engine's host reaches it, in host order.
+
+    Host ``h`` runs TP ranks ``[h * local, (h + 1) * local)``. Its own ranks use
+    the loopback URL; the scheduler, which runs on host 0, needs each server's
+    reachable address (host 0's may stay loopback).
+    """
+
+    hosts = _tp_host_count(config)
+    extra = _extra_config(config)
+    configured = extra.get("lmcache.mp.tp_host_server_urls")
+    if configured is None:
+        raise ValueError(
+            f"lmcache_mp: this TP group spans {hosts} hosts; set "
+            "lmcache.mp.tp_host_server_urls to every host's LMCache server URL, "
+            "in host order (the first host's may be its loopback URL)"
+        )
+    if isinstance(configured, (list, tuple)):
+        urls = [str(value).strip() for value in configured if str(value).strip()]
+    else:
+        urls = [value.strip() for value in str(configured).split(",") if value.strip()]
+    port = offcfg._strict_integer(
+        "lmcache.mp.port", extra.get("lmcache.mp.port", 5555), minimum=1
+    )
+    resolved = []
+    for url in urls:
+        url = url if "://" in url else f"tcp://{url}"
+        try:
+            has_port = urlsplit(url).port is not None
+        except ValueError as error:
+            raise ValueError(
+                f"lmcache.mp.tp_host_server_urls has an invalid URL {url!r}"
+            ) from error
+        # Every host's server listens where this host's ranks reach theirs
+        # unless a URL names another port.
+        resolved.append(url if has_port else f"{url}:{port}")
+    if len(resolved) != hosts:
+        raise ValueError(
+            f"lmcache.mp.tp_host_server_urls lists {len(resolved)} servers for a "
+            f"TP group spanning {hosts} hosts"
+        )
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(
+            "lmcache.mp.tp_host_server_urls must name a different server for "
+            f"every host, got {resolved}"
+        )
+    return resolved
+
+
+def _server_is_host_local(config: Any) -> bool:
+    """Whether every rank reaches the LMCache server at a loopback address."""
+
+    try:
+        urls = _server_urls(config)
+    except (TypeError, ValueError, NotImplementedError):
+        return False
+    for url in urls:
+        host = urlsplit(url).hostname or ""
+        if host == "localhost":
+            continue
+        try:
+            if not ipaddress.ip_address(host).is_loopback:
+                return False
+        except ValueError:
+            return False
+    return True
 
 
 def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
@@ -146,6 +312,14 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     registering any cache memory.
     """
 
+    if (getattr(config, "decode_context_parallel_size", 1) or 1) > 1:
+        # Under DCP each rank holds only its interleaved share of the latent
+        # KV, so no PAGE block is the same on two ranks.
+        return False
+    if _tp_host_count(config) > 1:
+        # One writer's object would have to reach every host's server; each
+        # host's server holds only its own ranks' (`_parallel_strategy`).
+        return False
     if _config_has_own_pool_draft(config):
         # A DSpark draft whose backend owns a KV pool appends per-rank-sharded
         # PAGE regions (`draft_kv.py` declares factor 1), so the complete PAGE
@@ -264,13 +438,26 @@ def _server_urls(config: Any) -> list[str]:
 
 
 def _model_namespace(
-    config: Any, *, checkpoint_spec: Any = None, images: bool = True
+    config: Any,
+    *,
+    checkpoint_spec: Any = None,
+    images: bool = True,
+    host: int | None = None,
 ) -> str:
     """Build a model/layout namespace shared by scheduler and workers.
 
     A native-state layout without images (`images=False`: PAGE KV alone, no
     image group) gets a namespace of its own, so a scheduler and workers that
     disagree about images find nothing rather than each other's objects.
+
+    Under DCP a rank's PAGE object holds the tokens the interleave size deals
+    it, which the PAGE namespace (block size, DCP size) does not name; an MP
+    server outlives the engines that fill it, so an engine restarted with
+    another interleave must not read the objects the previous one stored.
+
+    A TP group spanning hosts stores each host's ranks as a host-local world
+    (`_parallel_strategy`), so local rank 0 of host 0 and of host 1 are
+    different shards under the same key fields; `host` keeps them apart.
     """
 
     cfg = offcfg.build_lmcache_config(_storage_kv_transfer_config(config))
@@ -281,6 +468,11 @@ def _model_namespace(
         world_size,
     )
     namespace = f"{page_namespace}::lmcache-mp-v{_MP_LAYOUT_VERSION}"
+    if (getattr(config, "decode_context_parallel_size", 1) or 1) > 1:
+        interleave = (
+            getattr(getattr(config, "dcp_config", None), "interleave_size", 1) or 1
+        )
+        namespace += f"::dcp-interleave{int(interleave)}"
     if checkpoint_spec is not None:
         hf = getattr(config, "hf_config", None)
         hf = getattr(hf, "text_config", hf)
@@ -295,6 +487,11 @@ def _model_namespace(
         ).hexdigest()[:32]
         kind = "native-state" if images else "native-page"
         namespace += f"::{kind}-v1-{fingerprint}"
+    hosts = _tp_host_count(config)
+    if hosts > 1:
+        if host is None or not 0 <= host < hosts:
+            raise ValueError(f"TP host {host!r} is outside [0, {hosts})")
+        namespace += f"::tp-host{host}-of{hosts}"
     return namespace
 
 
@@ -307,6 +504,19 @@ def _parallel_strategy(config: Any, worker_id: int) -> Any:
             f"LMCache MP worker rank {worker_id} is outside [0, {tp_size})"
         )
     replication_factor = _tp_replication_factor(config)
+    if _tp_host_count(config) > 1:
+        # Each host's server sees only that host's ranks, so they form its
+        # world: a lookup there fans out to exactly the shards it holds.
+        if replication_factor != 1:
+            raise NotImplementedError(
+                "lmcache_mp does not collapse TP ranks across hosts"
+            )
+        local = _tp_ranks_per_host(config)
+        return AtomMPParallelConfig(
+            world_size=local * pp_size,
+            worker_id=worker_id % local,
+            tp_size=local,
+        )
     return AtomMPParallelConfig(
         world_size=tp_size * pp_size // replication_factor,
         worker_id=worker_id // replication_factor,
@@ -329,17 +539,58 @@ def _make_scheduler_adapter(
             key = super()._create_key(*args, **kwargs)
             return replace(key, num_kv_readers=num_kv_readers)
 
-    extra = _extra_config(config)
-    return _ReaderAwareSchedulerAdapter(
-        server_url=_server_urls(config)[0],
-        context=zmq.Context.instance(),
-        model_name=_model_namespace(
-            config, checkpoint_spec=checkpoint_spec, images=images
-        ),
-        block_size=int(config.kv_cache_block_size),
-        parallel_config=_parallel_strategy(config, 0),
-        mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
-    )
+    mq_timeout = float(_extra_config(config).get("lmcache.mp.mq_timeout", 300.0))
+    hosts = _tp_host_count(config)
+    if hosts == 1:
+        return _ReaderAwareSchedulerAdapter(
+            server_url=_server_urls(config)[0],
+            context=zmq.Context.instance(),
+            model_name=_model_namespace(
+                config, checkpoint_spec=checkpoint_spec, images=images
+            ),
+            block_size=_page_block_tokens(config),
+            parallel_config=_parallel_strategy(config, 0),
+            mq_timeout=mq_timeout,
+        )
+
+    from atom.kv_transfer.offload.mp.tp_hosts import TPHostsSchedulerAdapter
+
+    adapters: list[Any] = []
+    try:
+        for host, url in enumerate(_tp_host_server_urls(config)):
+            namespace = _model_namespace(
+                config, checkpoint_spec=checkpoint_spec, images=images, host=host
+            )
+            adapters.append(
+                _ReaderAwareSchedulerAdapter(
+                    server_url=url,
+                    context=zmq.Context.instance(),
+                    model_name=namespace,
+                    block_size=_page_block_tokens(config),
+                    parallel_config=_parallel_strategy(config, 0),
+                    mq_timeout=mq_timeout,
+                )
+            )
+            # The workers of that host log the namespace they register under
+            # (`_make_worker_adapter`); the two must match for any hit there.
+            logger.info(
+                "LMCache MP: TP host %d of %d is looked up at %s under %s",
+                host,
+                hosts,
+                url,
+                namespace,
+            )
+        return TPHostsSchedulerAdapter(adapters, mq_timeout=mq_timeout)
+    except Exception:
+        for adapter in adapters:
+            try:
+                adapter.shutdown()
+            except Exception:
+                logger.warning(
+                    "Failed to close a host's LMCache MP scheduler adapter",
+                    exc_info=True,
+                )
+        raise
 
 
 def _make_worker_adapter(
@@ -349,13 +600,24 @@ def _make_worker_adapter(
     from lmcache.integration.atom import AtomMPWorkerAdapter
 
     extra = _extra_config(config)
+    host = rank // _tp_ranks_per_host(config) if _tp_host_count(config) > 1 else None
+    namespace = _model_namespace(
+        config, checkpoint_spec=checkpoint_spec, images=images, host=host
+    )
+    if host is not None:
+        # Built on this host from its own environment (LMCACHE_* included);
+        # the engine's host logs the namespace it looks this host up under.
+        logger.info(
+            "LMCache MP: TP rank %d registers with TP host %d's server under %s",
+            rank,
+            host,
+            namespace,
+        )
     return AtomMPWorkerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
-        model_name=_model_namespace(
-            config, checkpoint_spec=checkpoint_spec, images=images
-        ),
-        block_size=int(config.kv_cache_block_size),
+        model_name=namespace,
+        block_size=_page_block_tokens(config),
         parallel_config=_parallel_strategy(config, rank),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
         heartbeat_interval=float(extra.get("lmcache.mp.heartbeat_interval", 10.0)),
