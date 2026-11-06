@@ -109,3 +109,33 @@ async fn late_decode_admission_limit_rejects_before_p() {
     assert_eq!(response.status(),StatusCode::TOO_MANY_REQUESTS);
     assert_eq!((p.worker.load(),d.worker.load()),(0,0));
 }
+
+#[tokio::test]
+async fn late_decode_cached_prefill_preserves_backend_rank_and_full_context_budget() {
+    let (mut p, mut d) = backend_routed_servers().await;
+    let router = late_router(&p, &d);
+    let task = start_late(router.clone(), true);
+    p.wait_entered().await;
+    assert!(p.request.lock().await.as_ref().unwrap().get("data_parallel_rank").is_none());
+    assert_eq!(router.late_decode.as_ref().unwrap().outstanding(), 0);
+    p.respond(axum::Json(json!({
+        "usage": {"prompt_tokens": 10000, "prompt_tokens_details": {"cached_tokens": 9984}},
+        "prompt_token_ids": vec![11; 10000],
+        "kv_transfer_params": {"dp_rank": 3, "prefix_cache_hit_tokens": 9984,
+            "remote_block_ids": [7, 8], "remote_swa_block_ids": [9], "remote_slot_index": 19}
+    })).into_response());
+    d.wait_entered().await;
+    let body = d.request.lock().await.clone().unwrap();
+    assert_eq!(body["data_parallel_rank"], 1);
+    assert_eq!(body["kv_transfer_params"]["remote_dp_rank"], 3);
+    assert_eq!(body["kv_transfer_params"]["remote_slot_index"], 19);
+    assert_eq!(body["kv_transfer_params"]["remote_swa_block_ids"], json!([9]));
+    // Formatted token IDs are authoritative; cached Prefill tokens never reduce D's context.
+    assert_eq!(router.late_decode.as_ref().unwrap().outstanding_tokens(), 10000 + 30);
+    let (response, _sender) = stream_response(StatusCode::OK);
+    d.respond(response);
+    drop(result(task).await);
+    wait_load(&d.worker, 0).await;
+    assert_eq!(router.late_decode.as_ref().unwrap().outstanding_tokens(), 0);
+}
+

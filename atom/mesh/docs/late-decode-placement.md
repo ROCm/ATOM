@@ -56,6 +56,23 @@ Prefill URLs and Decode URLs:
 rank-mapping and chunked-transfer configurations are rejected. Multi-sequence
 requests (`n > 1`, `best_of > 1`, batch size > 1) are rejected on this path.
 
+### Independent of Prefill cache and routing implementations
+
+This router does not depend on a Store connector or the `store_tokens` backend
+policy. P may use local prefix caching, a shared external cache, session routing
+or another backend policy. Only the ordinary ATOM handoff is required: the
+actual P rank, KV metadata and formatted prompt token IDs or usage.
+
+Keep `--dp-aware` with `--atom-pd-prefill-backend-routing` when P chooses its
+own rank: P is represented as a service, while D remains selectable per rank.
+Disabling `--dp-aware` also removes rank-level D placement. Without the
+backend-routing flag, ordinary rank-aware routing selects P's rank externally.
+
+D's reservation uses the full formatted context plus output budget. Cache hits
+reduce Prefill computation but do not reduce the context Decode attends to.
+Exact D ties rotate by stable worker/rank identity, independent of registry
+order. No P-to-D rank mapping or Decode session affinity is required.
+
 Aggregate gauges expose reservations, labeled by worker and DP rank only:
 
 - `atomesh_pd_decode_reserved_requests`
@@ -117,3 +134,4 @@ The design takes inspiration from independent P/D routing and Decode workload
 accounting; it does not claim to reproduce DeepInfer or Dynamo's production
 schedulers. Request count is primary, with context as a tie-breaker, rather than
 assuming context length alone predicts Decode compute cost.
+

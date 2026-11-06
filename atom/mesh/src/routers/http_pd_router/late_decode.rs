@@ -51,6 +51,11 @@ impl DecodeBalancer {
         self.0.lock().loads.values().map(|l| l.requests).sum()
     }
 
+    #[cfg(test)]
+    pub(super) fn outstanding_tokens(&self) -> u64 {
+        self.0.lock().loads.values().map(|l| l.tokens).sum()
+    }
+
     pub(super) fn reserve(
         self: &Arc<Self>,
         candidates: &[Arc<dyn Worker>],
@@ -62,11 +67,18 @@ impl DecodeBalancer {
         if n == 0 {
             return None;
         }
+        // Registry enumeration order is not stable. Rotate ties by worker
+        // identity so a reordered snapshot cannot repeatedly select one rank.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            (candidates[a].url(), candidates[a].dp_rank())
+                .cmp(&(candidates[b].url(), candidates[b].dp_rank()))
+        });
         let offset = state.cursor % n;
         state.cursor = state.cursor.wrapping_add(1);
         let tokens = prompt_tokens.checked_add(output_budget)?;
         let index = (0..n)
-            .map(|i| (offset + i) % n)
+            .map(|i| order[(offset + i) % n])
             .filter(|&i| candidates[i].is_available())
             .filter(|&i| {
                 let w = &candidates[i];
@@ -170,6 +182,18 @@ mod tests {
         let (first, a) = b.reserve(&ws, 100, 0).unwrap();
         drop(a);
         let (second, c) = b.reserve(&ws, 100, 0).unwrap();
+        assert_ne!(first.url(), second.url());
+        drop(c);
+    }
+
+    #[test]
+    fn exact_ties_rotate_when_registry_order_changes() {
+        let b = Arc::new(DecodeBalancer::default());
+        let ws = workers();
+        let (first, a) = b.reserve(&ws, 100, 0).unwrap();
+        drop(a);
+        let reversed: Vec<_> = ws.iter().rev().cloned().collect();
+        let (second, c) = b.reserve(&reversed, 100, 0).unwrap();
         assert_ne!(first.url(), second.url());
         drop(c);
     }
