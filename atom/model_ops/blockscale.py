@@ -43,6 +43,23 @@ def _get_aiter_fp8_gemm():
 _aiter_fp8_gemm = _get_aiter_fp8_gemm()
 
 
+@torch.compiler.assume_constant_result
+def _aiter_row_major_group32_supported() -> bool:
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() == "gfx950"
+
+
+def _use_aiter_fp8_gemm(weight_preshuffled: bool) -> bool:
+    if _aiter_fp8_gemm is None:
+        return False
+    if weight_preshuffled:
+        return True
+
+    # AITER's row-major group32 Triton path is currently gfx950-only.
+    return _aiter_row_major_group32_supported()
+
+
 def _check_quant_input(x, group):
     if x.ndim < 1 or x.shape[-1] % group:
         raise ValueError(f"Last dimension must be divisible by {group}")
@@ -197,7 +214,7 @@ def native_quant_linear(
             "A preshuffled weight needs an FP8 weight, AITER's group32 GEMM, "
             "no split_k and BF16 output"
         )
-    if not fp4 and _aiter_fp8_gemm is not None:
+    if not fp4 and _use_aiter_fp8_gemm(weight_preshuffled):
         batched = x.ndim > 2
         output = _aiter_fp8_gemm(
             x.view(m, k) if batched else x,
