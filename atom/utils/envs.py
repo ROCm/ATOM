@@ -481,7 +481,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Bitwise the unfused gate. Paths that end on another attention kernel apply
     # the gate after it, as before.
     "ATOM_UA_FUSED_OUTPUT_GATE": lambda: (
-        os.getenv("ATOM_UA_FUSED_OUTPUT_GATE", "0") == "1"
+        os.getenv("ATOM_UA_FUSED_OUTPUT_GATE", "1") == "1"
     ),
     # Qwen3-Next / Qwen3.5: the MoE block leaves `routed + sigmoid(gate) *
     # shared` to the norm that reads it (the next layer's input norm, the final
