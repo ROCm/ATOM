@@ -542,7 +542,7 @@ while true; do
     for i in "${!SBATCH_CMD[@]}"; do
       [[ "${SBATCH_CMD[i]}" == "--exclude" ]] && SBATCH_CMD[i + 1]="${AUTO_EXCLUDE}"
     done
-    echo "=== GPUs busy on ${busy_markers[*]##*/}; resubmitting (${gpu_busy_attempt}/${GPU_BUSY_RETRIES}) excluding ${AUTO_EXCLUDE} ==="
+    echo "=== GPUs or host memory busy on ${busy_markers[*]##*/}; resubmitting (${gpu_busy_attempt}/${GPU_BUSY_RETRIES}) excluding ${AUTO_EXCLUDE} ==="
     continue
   fi
   [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" && -n "${NODE_LIST}" ]] || break
