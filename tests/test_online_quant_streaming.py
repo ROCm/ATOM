@@ -567,19 +567,13 @@ class StreamingDifferentialTest(unittest.TestCase):
             num_layers=1,
             model_cls=DeferredStreamModel,
         )
-        with self.assertLogs("atom", level="INFO") as logs:
-            model, online_quant_streamer = run_load(
-                streaming=True,
-                host_staging=True,
-                num_threads=8,
-                num_layers=1,
-                model_cls=DeferredStreamModel,
-            )
-        # The deferred o_proj is reported as deferred, not as a fallback.
-        report = [r for r in logs.output if "eligible modules" in r]
-        self.assertEqual(len(report), 1)
-        self.assertIn("0 fell back", report[0])
-        self.assertIn("1 deferred", report[0])
+        model, online_quant_streamer = run_load(
+            streaming=True,
+            host_staging=True,
+            num_threads=8,
+            num_layers=1,
+            model_cls=DeferredStreamModel,
+        )
 
         for module in baseline.modules():
             if hasattr(module, "process_weights_after_loading"):

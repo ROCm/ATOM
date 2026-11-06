@@ -376,8 +376,6 @@ class DSparkProposer(Drafter):
                 logger.info("DSpark draft: torch.compile disabled by env.")
             return model
 
-        # Standalone draft: build from the DRAFT's own hf_config, as
-        # EagleProposer does for eagle3.
         return self._build_standalone_draft(model_class)
 
     @property

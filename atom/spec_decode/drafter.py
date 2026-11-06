@@ -403,7 +403,8 @@ class Drafter(abc.ABC):
 
         A standalone draft (eagle3, or DSpark with --draft-model) loads its own
         checkpoint, so its static quant scheme comes from that checkpoint; the
-        run's --online_quant_config still applies to it. Its layer names are
+        run's --online_quant_config still applies to it unless the draft class
+        sets ``draft_skips_online_quant``. Its layer names are
         remapped onto ``model_class``'s packed modules, as the target's are in
         ModelRunner. Shallow copy: the config can hold non-picklable cuda.Stream
         objects, and only the fields set here change. Compilation is off for
@@ -413,10 +414,13 @@ class Drafter(abc.ABC):
         cfg.hf_config = self.speculative_config.draft_model_hf_config
         cfg.compilation_config = copy.copy(self.config.compilation_config)
         cfg.compilation_config.level = CompilationLevel.NO_COMPILATION
+        online = (
+            None
+            if getattr(model_class, "draft_skips_online_quant", False)
+            else self.config.online_quant_config
+        )
         cfg.quant_config = QuantizationConfig(
-            cfg.hf_config,
-            self.config.online_quant_config,
-            model=self.speculative_config.model,
+            cfg.hf_config, online, model=self.speculative_config.model
         )
         cfg.quant_config.remap_layer_name(
             cfg.hf_config,

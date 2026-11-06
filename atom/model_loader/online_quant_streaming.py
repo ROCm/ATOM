@@ -475,12 +475,7 @@ class OnlineQuantStreamer:
                     stranded.append(f"{mod_name}.{p_name}")
             self._settle_weights(m)
 
-        # A deferred child is finalized by its parent's post-load hook by
-        # design, so it is neither a fallback nor counted as eligible.
-        eligible = [
-            (n, m) for n, m in self.candidates if id(m) not in self.deferred_module_ids
-        ]
-        fell_back = [n for n, m in eligible if id(m) not in self.done_module_ids]
+        fell_back = [n for n, m in self.candidates if id(m) not in self.done_module_ids]
         if not is_rank0:
             return
         if stranded:
@@ -511,12 +506,10 @@ class OnlineQuantStreamer:
         log(
             "Online-quant streaming: %d/%d eligible modules quantized during "
             "load, %d fell back to the post-load pass (no memory saving for "
-            "those), %d deferred to their parent's post-load. First %d "
-            "fallbacks: %s",
-            len(eligible) - len(fell_back),
-            len(eligible),
+            "those). First %d fallbacks: %s",
+            len(self.candidates) - len(fell_back),
+            len(self.candidates),
             len(fell_back),
-            len(self.candidates) - len(eligible),
             min(len(fell_back), 20),
             fell_back[:20],
         )
