@@ -465,14 +465,16 @@ else
     SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
   else
     # GPUs held outside Slurm; g24's Docker also fails the Mesh build with rc=125,
-    # the g25 -> g27 KV RDMA hung the prefill engine, and g07 swaps the prefill's
-    # LMCache CPU pool out rather than dropping its page cache.
-    AUTO_EXCLUDE="pit2-p03-g07,pit2-p03-g08,pit2-p03-g15,pit2-p03-g24,pit2-p03-g25,pit2-p03-g27,pit2-p03-g40"
+    # the g25 -> g27 KV RDMA hung the prefill engine, g07 swaps the prefill's
+    # LMCache CPU pool out rather than dropping its page cache, and g52 reads the
+    # model from NFS at ~100 MiB/s, past the server wait.
+    AUTO_EXCLUDE="pit2-p03-g07,pit2-p03-g08,pit2-p03-g15,pit2-p03-g24,pit2-p03-g25,pit2-p03-g27,pit2-p03-g40,pit2-p03-g52"
     SBATCH_CMD+=(--exclude "${AUTO_EXCLUDE}")
     # Other tenants' host-network containers have taken the router's 8000 while
     # the prefill loaded; move every service port off the defaults, below the
-    # ephemeral range (32768) that outgoing connections take theirs from.
-    export ATOMESH_SERVICE_PORT_OFFSET="${ATOMESH_SERVICE_PORT_OFFSET:-2000}"
+    # ephemeral range (32768) that outgoing connections take theirs from, eval's
+    # restart offset included. pd_slurm_job.sh adds it to each phase's offset.
+    export ATOMESH_SERVICE_PORT_BASE_OFFSET="${ATOMESH_SERVICE_PORT_BASE_OFFSET:-1500}"
   fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"

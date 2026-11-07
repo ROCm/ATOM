@@ -44,10 +44,11 @@ if [[ " ${EXECUTION_PHASES[*]} " == *" eval "* && ! "${ATOMESH_RESTART_PORT_OFFS
 fi
 
 execution_phase_port_offset() {
+  local base="${ATOMESH_SERVICE_PORT_BASE_OFFSET:-0}"
   if [[ "$1" == "eval" ]]; then
-    printf '%s\n' "${ATOMESH_RESTART_PORT_OFFSET}"
+    printf '%s\n' "$((base + ATOMESH_RESTART_PORT_OFFSET))"
   else
-    printf '0\n'
+    printf '%s\n' "${base}"
   fi
 }
 
