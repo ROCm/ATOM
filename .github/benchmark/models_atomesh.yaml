@@ -823,7 +823,7 @@ models:
         # and real MTP acceptance. No CPU offload tier is needed for accuracy.
         - <<: *glm52_agentic_lmcache_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-gsm8k-20shot-landing-c32
-          display_topology: 1P1D-CPP4-DCP4-MTP3
+          display_topology: 1P1D-CPP4-DCP4-NOMTP
           isl: [4096]
           osl: 1024
           concurrency: [32]
@@ -831,7 +831,7 @@ models:
             common_args:
               <<: *glm52_agentic_lmcache_cpp4_dcp4_args
               max_model_len: 16384
-              extra_args: "--level 3 --method mtp --num-speculative-tokens 3"
+              extra_args: "--level 3"
           env:
             common:
               <<: *glm52_agentic_lmcache_cpp4_dcp4_env_common
