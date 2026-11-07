@@ -489,6 +489,19 @@ else
   )
 fi
 
+# Adds comma-separated hosts to the sbatch command's --exclude list, or gives
+# it one ahead of the job script.
+sbatch_exclude_hosts() {
+  local hosts="$1" i
+  for i in "${!SBATCH_CMD[@]}"; do
+    if [[ "${SBATCH_CMD[i]}" == "--exclude" ]]; then
+      SBATCH_CMD[i + 1]+=",${hosts}"
+      return 0
+    fi
+  done
+  SBATCH_CMD=("${SBATCH_CMD[@]:0:${#SBATCH_CMD[@]}-1}" --exclude "${hosts}" "${SBATCH_CMD[-1]}")
+}
+
 submit_and_monitor_slurm_job() {
   echo "=== submitting Slurm job ==="
   # Bind completion evidence to this submission, including job-ID reuse.
@@ -530,15 +543,20 @@ submit_and_monitor_slurm_job() {
 
 # Spur ignores --exclusive and may place the job on a node whose GPUs another
 # job holds. The batch script then records the busy hosts in gpu-busy/ before
-# starting any worker; resubmit without them, or wait for the pool to drain
-# when too few candidates remain.
+# starting any worker; resubmit without them: among NODE_LIST on mi350, which
+# waits for the pool to drain when too few candidates remain, and by excluding
+# them where the scheduler picks the nodes.
 GPU_BUSY_RETRIES="${ATOMESH_GPU_BUSY_RETRIES:-6}"
 GPU_BUSY_WAIT_SECONDS="${ATOMESH_GPU_BUSY_WAIT_SECONDS:-300}"
 gpu_busy_attempt=0
 declare -A gpu_busy_nodes=()
 while true; do
   submit_and_monitor_slurm_job
-  [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" && -n "${NODE_LIST}" ]] || break
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+    [[ -n "${NODE_LIST}" ]] || break
+  else
+    [[ -z "${NODE_LIST}" ]] || break
+  fi
   busy_dir="${LOG_ROOT}/slurm_job-${JOB_ID}/gpu-busy"
   shopt -s nullglob
   busy_markers=("${busy_dir}"/*)
@@ -549,6 +567,12 @@ while true; do
     break
   fi
   gpu_busy_attempt=$((gpu_busy_attempt + 1))
+  if [[ "${SLURM_SUBMIT_RUNNER}" != "atomesh-cicd-mi350" ]]; then
+    busy_hosts="$(for marker in "${busy_markers[@]}"; do basename "${marker}"; done | paste -sd, -)"
+    echo "=== GPUs busy on ${busy_hosts}; resubmitting (${gpu_busy_attempt}/${GPU_BUSY_RETRIES}) without them ==="
+    sbatch_exclude_hosts "${busy_hosts}"
+    continue
+  fi
   for marker in "${busy_markers[@]}"; do
     gpu_busy_nodes["$(basename "${marker}")"]=1
   done
