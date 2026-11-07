@@ -8,9 +8,9 @@ from functools import wraps
 from typing import Any
 
 import torch
-from aiter.dist.parallel_state import get_tp_group
 
 from atom.config import get_current_atom_config
+from atom.model_ops.eplb_deepinfer import replicate_experts_deepinfer
 from atom.utils import envs
 
 try:
@@ -26,6 +26,13 @@ import logging
 logger = logging.getLogger("atom")
 
 BufferCopyPlan = list[tuple[int, int]]
+
+
+def get_tp_group():
+    # Policies and load-history tests can run on CPU without an AITER build.
+    from aiter.dist.parallel_state import get_tp_group as _get_tp_group
+
+    return _get_tp_group()
 
 
 @dataclass(frozen=True)
@@ -339,9 +346,32 @@ def _placement_naive(
     phy2log, phyrank, logcnt = replicate_experts(
         weight_l.view(1, num_logical), num_physical
     )
-    phy2log_l = phy2log[0].clone()
-    phyrank_l = phyrank[0].clone()
-    logcnt_l = logcnt[0].clone()
+    return _pack_replicas(weight_l, phy2log[0], phyrank[0], logcnt[0], num_gpus)
+
+
+def _placement_deepinfer(
+    weight_l: torch.Tensor,
+    num_physical: int,
+    num_gpus: int,
+    old_p2l_layer: torch.Tensor | None = None,
+    *,
+    load_history: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """DeepInfer replica selection, followed by ATOM's existing LPT packing."""
+    phy2log, phyrank, logcnt = replicate_experts_deepinfer(
+        load_history.unsqueeze(1), num_physical
+    )
+    return _pack_replicas(weight_l, phy2log[0], phyrank[0], logcnt[0], num_gpus)
+
+
+def _pack_replicas(
+    weight_l: torch.Tensor,
+    phy2log_l: torch.Tensor,
+    phyrank_l: torch.Tensor,
+    logcnt_l: torch.Tensor,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_physical = phy2log_l.numel()
     # Step-3 pack physical slots onto GPUs (equal cardinality per GPU).
     per_phy_load = weight_l.to(torch.float32)[phy2log_l] / logcnt_l[phy2log_l].to(
         torch.float32
@@ -362,7 +392,12 @@ def _placement_naive(
 #   (weight_l[num_logical], num_physical, num_gpus) -> (p2l, phyrank, logcnt).
 # Policy name comes from EPLBConfig; `biased` derives its top-K from the
 # redundant budget (num_redundant // num_gpus), no extra param.
-_PLACEMENT_POLICIES = {"naive": _placement_naive, "biased": _placement_biased}
+# `deepinfer` additionally receives per-step load_history from the dispatcher.
+_PLACEMENT_POLICIES = {
+    "naive": _placement_naive,
+    "biased": _placement_biased,
+    "deepinfer": _placement_deepinfer,
+}
 
 
 def resolve_placement_policy(name: str | None):
@@ -382,10 +417,16 @@ def _rebalance_single_layer_global(
     num_gpus: int,
     policy=None,
     old_p2l_layer: torch.Tensor | None = None,
+    load_history: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return (physical_to_logical, physical_rank, logcnt) for one layer via the
     given placement policy callable (default: naive). `old_p2l_layer` is the layer's
     current placement, passed to policies with a sticky/shortest-path fast-path."""
+    if policy is _placement_deepinfer:
+        assert load_history is not None, "deepinfer requires per-step load_history"
+        return policy(
+            weight_l, num_physical, num_gpus, old_p2l_layer, load_history=load_history
+        )
     return (policy or _placement_naive)(weight_l, num_physical, num_gpus, old_p2l_layer)
 
 
@@ -399,12 +440,16 @@ def rebalance_experts(
     enable_hierarchical: bool,
     policy=None,
     old_p2l: torch.Tensor | None = None,
+    load_history: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Module-C entrypoint. `policy` is the per-layer placement callable
     (default naive); in the hierarchical path it is applied per-node so `biased`
     replicates within-node. `old_p2l` [num_layers, num_physical] is the current
     live placement; passed per-layer to policies for a sticky/shortest-path
     fast-path (flat/non-hierarchical path only; hierarchical recomputes fresh).
+    `deepinfer` requires `load_history` [steps, layers, logical]; its sum is
+    used for the existing group assignment and LPT packing, while replica
+    selection retains the individual steps.
 
     Returns:
         physical_to_logical_map: [num_layers, num_physical] int32
@@ -417,6 +462,15 @@ def rebalance_experts(
     assert num_groups > 0 and num_nodes > 0 and num_gpus > 0
     assert num_physical % num_gpus == 0, "num_physical must be divisible by num_gpus"
     assert num_physical >= num_logical
+    if policy is _placement_deepinfer:
+        assert load_history is not None, "deepinfer requires per-step load_history"
+        assert (
+            load_history.dim() == 3
+            and load_history.shape[0] > 0
+            and load_history.shape[1:] == weight.shape
+        ), "load_history must be [steps, num_layers, num_logical] with steps > 0"
+        assert load_history.device == weight.device
+        weight = load_history.sum(dim=0)
 
     p2l = torch.empty(
         (num_layers, num_physical), dtype=torch.int32, device=weight.device
@@ -437,6 +491,7 @@ def rebalance_experts(
                 num_gpus,
                 policy=policy,
                 old_p2l_layer=old_p2l_l,
+                load_history=None if load_history is None else load_history[:, layer],
             )
             p2l[layer] = p2l_l
             phyrank[layer] = rank_l
@@ -488,7 +543,15 @@ def rebalance_experts(
             node_weight = weight[layer, node_logical_ids]
             node_p2l_local, node_rank_local, node_cnt_local = (
                 _rebalance_single_layer_global(
-                    node_weight, phy_per_node, gpus_per_node, policy=policy
+                    node_weight,
+                    phy_per_node,
+                    gpus_per_node,
+                    policy=policy,
+                    load_history=(
+                        None
+                        if load_history is None
+                        else load_history[:, layer, node_logical_ids]
+                    ),
                 )
             )
             node_global_logical = torch.tensor(
@@ -1023,8 +1086,8 @@ def _plan_single_layer_migration(
         rbase = r * num_local_physical_experts
         old_r = old_list[rbase : rbase + num_local_physical_experts]
         new_r = new_list[rbase : rbase + num_local_physical_experts]
-        old_set = set(x for x in old_r if x >= 0)
-        new_set = set(x for x in new_r if x >= 0)
+        old_set = {x for x in old_r if x >= 0}
+        new_set = {x for x in new_r if x >= 0}
         for logical in sorted(new_set):
             if logical not in old_set:
                 recv_ranks_by_logical.setdefault(logical, []).append(r)
@@ -1382,6 +1445,9 @@ class ExpertLoadMonitor:
         self._device: torch.device | None = None
         self._cur_pass_count: torch.Tensor | None = None
         self._expert_load_window: torch.Tensor | None = None
+        self._logical_load_window: torch.Tensor | None = None
+        self._logical_slot = 0
+        self._logical_filled = 0
         self._logged_first_record: bool = False
         self._logged_logical_without_metadata: bool = False
         self._load_group: Any | None = None
@@ -1443,6 +1509,58 @@ class ExpertLoadMonitor:
     def ensure_capacity_for_metadata(self, meta: ExpertLocationMetadata) -> None:
         """Compatibility wrapper for the old lazy-capacity API."""
         self.initialize_for_metadata(meta)
+
+    def initialize_logical_history(self, meta: ExpertLocationMetadata) -> None:
+        """Allocate the opt-in DeepInfer history before any forward/capture."""
+        if self._logical_load_window is None:
+            self._logical_load_window = torch.zeros(
+                (self.window_size, meta.num_layers, meta.num_logical_experts),
+                dtype=torch.int64,
+                device=meta.physical_to_logical_map.device,
+            )
+
+    def record_logical_load(
+        self, meta: ExpertLocationMetadata, include_current: bool = True
+    ) -> None:
+        """Commit one group-wide prefill step before any placement can change.
+
+        Every EP rank advances the same slot, even if its local batch is dummy,
+        decode or mixed. Folding now preserves the identity of historical
+        experts across subsequent (including chunked) weight migrations.
+        """
+        assert self._logical_load_window is not None
+        assert self._cur_pass_count is not None
+        row = self._logical_load_window[self._logical_slot]
+        if include_current:
+            row.copy_(
+                physical_load_to_logical_load(
+                    self._cur_pass_count.to(torch.int64),
+                    meta.physical_to_logical_map,
+                    meta.num_logical_experts,
+                )
+            )
+        else:
+            row.zero_()
+        self._logical_slot = (self._logical_slot + 1) % self.window_size
+        self._logical_filled = min(self._logical_filled + 1, self.window_size)
+
+    def dump_global_logical_load_history(self) -> torch.Tensor | None:
+        """Snapshot [steps, layers, logical] counts without collapsing steps."""
+        if self._logical_load_window is None or self._logical_filled == 0:
+            return None
+        # The manager advances history on an EP-uniform signal, so every rank
+        # has the same filled length and slot ordering. Unfilled rows must not
+        # enter DeepInfer's scoring, whose tie-break adds an expert-id epsilon.
+        history = self._logical_load_window[: self._logical_filled].clone()
+        group = self._load_group if self._load_group is not None else get_tp_group()
+        if int(getattr(group, "world_size", 1)) > 1:
+            device_group = getattr(group, "device_group", None)
+            if device_group is None:
+                raise RuntimeError("DeepInfer history requires an EP device_group")
+            torch.distributed.all_reduce(
+                history, op=torch.distributed.ReduceOp.SUM, group=device_group
+            )
+        return history
 
     def _validate_record_shape(
         self, *, layer_id: int, num_physical: int, device: torch.device
@@ -1853,6 +1971,8 @@ class EPLBManager:
             ep_rank,
         )
         self.monitor.initialize_for_metadata(self.live_metadata)
+        if self.placement_policy == "deepinfer":
+            self.monitor.initialize_logical_history(self.live_metadata)
         # Initialize redundant physical slots the checkpoint loader left empty.
         # At init the weights are loaded, the EP group is up, and no forward has
         # run yet -- an idle window for the one-time trivial copy.
@@ -2089,6 +2209,8 @@ class EPLBManager:
         self,
         local_has_prefill: bool,
         dp_any_has_prefill: bool | None = None,
+        *,
+        record_load: bool = True,
     ) -> None:
         # Once stopped there is nothing left to schedule, so skip the per-step
         # has-prefill reduction too. The stop latches on the same step on every
@@ -2115,6 +2237,11 @@ class EPLBManager:
         if not has_prefill:
             # Pure-decode step across the migration group: do not advance.
             return
+        if self.placement_policy == "deepinfer":
+            assert self.live_metadata is not None
+            self.monitor.record_logical_load(
+                self.live_metadata, include_current=record_load
+            )
         next(self._gen)
 
     def trigger_offline_rebalance(self, reason: str = "manual") -> None:
@@ -2199,7 +2326,12 @@ class EPLBManager:
             logger.warning("EPLB rebalance skipped: EP process group is unavailable")
             return
 
-        logical_load = self.monitor.dump_global_logical_load()
+        load_history = None
+        if self.placement_policy == "deepinfer":
+            load_history = self.monitor.dump_global_logical_load_history()
+            logical_load = None if load_history is None else load_history.sum(dim=0)
+        else:
+            logical_load = self.monitor.dump_global_logical_load()
         if logical_load is None:
             return
 
@@ -2222,6 +2354,7 @@ class EPLBManager:
             # Current live placement -> enables the biased sticky/shortest-path
             # fast-path: unchanged hot set => reuse old placement => zero migration.
             old_p2l=self.live_metadata.physical_to_logical_map,
+            load_history=load_history,
         )
         new_meta = ExpertLocationMetadata.from_rebalance_result(
             physical_to_logical_map=p2l,
@@ -2296,7 +2429,7 @@ class EPLBManager:
             non-replicated experts have a single slot and no dispatch choice.
 
         The live placement's per-GPU balancedness (the gate metric) is logged
-        by the gate (_need_rebalance) for the same window.
+        by the gate (_need_rebalance) from the existing physical-load window.
 
         Diagnostic only: never raises into the rebalance path.
         """
@@ -2487,7 +2620,11 @@ def with_eplb_forward_monitor(fn):
             # under the no-mixed-batch invariant (see on_forward_pass_end).
             local_has_prefill = getattr(batch, "total_tokens_num_prefill", 0) > 0
             dp_any_has_prefill = getattr(self, "_eplb_any_rank_has_prefill", None)
-            manager.on_forward_pass_end(local_has_prefill, dp_any_has_prefill)
+            manager.on_forward_pass_end(
+                local_has_prefill,
+                dp_any_has_prefill,
+                record_load=is_pure_prefill and not is_dummy_run,
+            )
 
     return wrapper
 
