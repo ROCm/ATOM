@@ -208,6 +208,8 @@ class ScheduledBatch:
         scheduled_spec_decode_tokens: Draft token IDs per request for
             speculative decoding (must not use a mutable default).
         state_maintenance_ops: State moves that must execute before this batch.
+        is_dp_dummy: An idle DP rank's placeholder, whose rows must not route
+            to experts. Startup profiling dummies still run the experts.
     """
 
     def __init__(
@@ -232,6 +234,7 @@ class ScheduledBatch:
         next_token_ids: list[int] | None = None,
         state_maintenance_ops: StateMaintenanceOps | None = None,
         is_deferred_out: bool = True,
+        is_dp_dummy: bool = False,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -475,6 +478,7 @@ class ScheduledBatch:
         self.finished_recving_kv_req_ids: list[int] = []
 
         self.is_dummy_run = is_dummy_run
+        self.is_dp_dummy = is_dp_dummy
         self.num_spec_step = num_spec_step
         # Set by the PP head on a batch whose completion it waits for although
         # the batch produces no output. It travels with the metadata, so the

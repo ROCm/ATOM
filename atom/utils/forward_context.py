@@ -500,7 +500,8 @@ class Context:
     is_prefill: bool = False
     is_dummy_run: bool = False
     # What this rank was handed. Duplicated from `forward_mode` because a
-    # capture context has none; `scheduled_tokens` counts this rank's real rows.
+    # capture context has none. These are execution counts before padding,
+    # including the placeholder rows of an idle DP dummy.
     scheduled_bs: int = 0
     scheduled_tokens: int = 0
     # The step's DP-unified padded shape. `running_bs` counts SEQUENCES (graph
@@ -550,10 +551,12 @@ class Context:
     # after it. Unlike `pcp_split` it survives drafting, which clears that per
     # pass; the drafter's aux gather and draft prefill split read this one.
     target_pcp_split: bool = False
-    # `scheduled_tokens` on the device (`[1]` int32), an entry of the step's
-    # `forward_vars["batch_info"]` read in place, so a replay reads its own
-    # step whatever shape it was recorded at. A draft re-points it with
-    # `scheduled_tokens` (`Drafter._publish_draft_shape`).
+    # Active local rows for expert routing (`[1]` int32 on the device).
+    # Real passes and startup warmup publish their local row count; an idle
+    # DP dummy publishes zero while CPU counts retain the placeholder shape.
+    # This is a view of the current pass's `forward_vars["batch_info"]` entry, read
+    # in place on graph replay. `Drafter._publish_draft_shape` re-points it to
+    # the draft entry when the pass changes.
     scheduled_tokens_gpu: torch.Tensor | None = None
 
     # Optional speculative-decoding inputs staged alongside the target

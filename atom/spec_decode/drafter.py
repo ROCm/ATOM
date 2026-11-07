@@ -702,11 +702,11 @@ class Drafter(abc.ABC):
         wrong height, so the draft states its shape here rather than letting
         each consumer special-case `is_draft`.
 
-        Both units: `scheduled_tokens` is how many rows carry a real request,
-        `running_tokens` how many the pass runs -- they differ exactly when the
-        batch was widened. `scheduled_tokens_gpu` is `scheduled_tokens` on the
-        device, an entry of the step's `forward_vars["batch_info"]`: what a
-        recorded pass reads.
+        `scheduled_tokens` is the pass's local execution count before padding;
+        `running_tokens` is its padded height. The device count follows
+        `Context.scheduled_tokens_gpu`'s active-row rule, using the draft's
+        entry of `forward_vars["batch_info"]` so a recorded pass reads the
+        current step.
 
         Both flags below are the caller's to answer, because this seam cannot
         see either. `running_tokens_are_unified` claims every OTHER rank runs

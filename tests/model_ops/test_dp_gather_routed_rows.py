@@ -11,6 +11,7 @@ import pytest
 import torch
 from aiter_stub import stubbed_aiter
 
+from atom.model_ops.fused_moe.shared_expert_dispatch import _remap_torch
 from atom.utils import forward_context as fc
 
 with (
@@ -156,8 +157,83 @@ def test_gathered_shared_ids_split_the_rows_between_ep_ranks(monkeypatch):
     assert runs[0] == {0, 2} and runs[1] == {1, 3}
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("num_shared", [1, 3])
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+def test_gather_does_not_restore_shared_experts_on_dummy_or_padded_rows(
+    monkeypatch, rank, num_shared, compiled
+):
+    layer = SimpleNamespace(
+        expert_layout=SimpleNamespace(mode=SharedExpertMode.LEGACY_AITER),
+        top_k=2,
+    )
+    # Rank 0's dummy followed by rank 1's two real rows and one padded row.
+    # Shared columns were prefilled before routing masked the routed columns.
+    routed = torch.tensor([[-1, -1], [0, 1], [1, 2], [-1, -1]], dtype=torch.int32)
+    ids = torch.cat((routed, torch.full((4, num_shared), 8, dtype=torch.int32)), 1)
+    template = torch.zeros_like(ids)
+    template[:, 2:] = 9  # fake shared id on this rank's unassigned rows
+    template[rank::2, 2:] = 8
+    before = template.clone()
+    monkeypatch.setattr(topK, "aiter_topK_meta_data", (torch.ones_like(ids), template))
+
+    reassign = topK.reassign_gathered_shared_ids
+    if compiled:
+        reassign = torch.compile(reassign, backend="eager", fullgraph=True)
+    reassign(layer, ids)
+
+    assert (ids[[0, 3]] == -1).all()
+    assert torch.equal(ids[:, :2], routed)
+    assert torch.equal(ids[1:3, 2:], template[1:3, 2:])
+    assert torch.equal(template, before)
+    # A subsequent real replay must still find the complete prefilled table.
+    real = torch.zeros_like(ids)
+    reassign(layer, real)
+    assert torch.equal(real[:, 2:], before[:, 2:])
+
+
+@pytest.mark.parametrize("placement", ["local-replica", "eplb"])
+@pytest.mark.parametrize("num_shared", [1, 3])
+@pytest.mark.parametrize("rows", ["mixed", "all-dummy", "empty"])
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+def test_shared_placement_preserves_padding(placement, num_shared, rows, compiled):
+    """Shared placement agrees across the two torch fallback layouts, including
+    a partially masked real row, an idle rank, and multiple shared columns."""
+    ids = torch.tensor([[0, 4], [3, -1], [-1, -1]], dtype=torch.int32)
+    weights = torch.tensor([[0.7, 0.3], [0.6, 0.0], [0.0, 0.0]])
+    if rows == "all-dummy":
+        ids.fill_(-1)
+        weights.zero_()
+    elif rows == "empty":
+        ids, weights = ids[:0], weights[:0]
+
+    def append(w, i):
+        if placement == "eplb":
+            return eplb._append_shared_torch(w, i, num_shared, 8, 0.5)
+        return _remap_torch(w, i, 8, 4, 8, num_shared, 0.5)
+
+    if compiled:
+        append = torch.compile(append, backend="eager", fullgraph=True)
+    out_w, out_ids = append(weights, ids)
+
+    assert out_ids.shape == out_w.shape == (ids.shape[0], 2 + num_shared)
+    assert torch.equal(out_w[:, :2], weights)
+    if rows == "mixed":
+        assert torch.equal(
+            out_ids[:2, 2:], torch.arange(8, 8 + num_shared).expand(2, -1)
+        )
+        assert (out_w[:2, 2:] == 0.5).all()
+        assert out_ids[1, 1] == -1  # A masked later slot does not pad a real row.
+        assert (out_ids[2] == -1).all() and (out_w[2] == 0).all()
+    else:
+        assert (out_ids == -1).all() and (out_w == 0).all()
+
+
 @pytest.mark.parametrize("use_ep", [False, True], ids=["tp", "ep"])
-def test_gathered_rows_are_placed_after_the_gather_and_uncounted(monkeypatch, use_ep):
+@pytest.mark.parametrize("dummy", [False, True], ids=["real", "dp-dummy"])
+def test_gathered_rows_are_placed_after_the_gather_and_uncounted(
+    monkeypatch, use_ep, dummy
+):
     """Placement (the EPLB remap, which shifts the shared column) follows the
     gather and the shared-id re-mark. Only the pass's whole ungathered rows
     carry its count, under both TP and EP."""
@@ -178,9 +254,9 @@ def test_gathered_rows_are_placed_after_the_gather_and_uncounted(monkeypatch, us
         prefix="t",
         use_ep=use_ep,
     )
-    count = torch.tensor([2], dtype=torch.int32)
+    count = torch.tensor([0 if dummy else 2], dtype=torch.int32)
     context = SimpleNamespace(
-        is_dummy_run=False,
+        is_dummy_run=dummy,
         pcp_split=False,
         running_tokens=3,
         scheduled_tokens_gpu=count,
