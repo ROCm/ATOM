@@ -463,6 +463,18 @@ else
   if [[ -n "${NODE_LIST}" ]]; then
     slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
     SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
+  else
+    # GPUs held outside Slurm; g24's Docker also fails the Mesh build with rc=125,
+    # the g25 -> g27 KV RDMA hung the prefill engine, g07 swaps the prefill's
+    # LMCache CPU pool out rather than dropping its page cache, and g52 reads the
+    # model from NFS at ~100 MiB/s, past the server wait.
+    AUTO_EXCLUDE="pit2-p03-g07,pit2-p03-g08,pit2-p03-g15,pit2-p03-g24,pit2-p03-g25,pit2-p03-g27,pit2-p03-g40,pit2-p03-g52"
+    SBATCH_CMD+=(--exclude "${AUTO_EXCLUDE}")
+    # Other tenants' host-network containers have taken the router's 8000 while
+    # the prefill loaded; move every service port off the defaults, below the
+    # ephemeral range (32768) that outgoing connections take theirs from, eval's
+    # restart offset included. pd_slurm_job.sh adds it to each phase's offset.
+    export ATOMESH_SERVICE_PORT_BASE_OFFSET="${ATOMESH_SERVICE_PORT_BASE_OFFSET:-1500}"
   fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
@@ -520,6 +532,25 @@ gpu_busy_attempt=0
 declare -A gpu_busy_nodes=()
 while true; do
   submit_and_monitor_slurm_job
+  if [[ -z "${NODE_LIST}" && -n "${AUTO_EXCLUDE:-}" ]]; then
+    shopt -s nullglob
+    busy_markers=("${LOG_ROOT}/slurm_job-${JOB_ID}/gpu-busy"/*)
+    shopt -u nullglob
+    [[ "${#busy_markers[@]}" -gt 0 ]] || break
+    if (( gpu_busy_attempt >= GPU_BUSY_RETRIES )); then
+      echo "ERROR: GPUs still busy after ${GPU_BUSY_RETRIES} resubmissions; giving up" >&2
+      break
+    fi
+    gpu_busy_attempt=$((gpu_busy_attempt + 1))
+    for marker in "${busy_markers[@]}"; do
+      AUTO_EXCLUDE+=",$(basename "${marker}")"
+    done
+    for i in "${!SBATCH_CMD[@]}"; do
+      [[ "${SBATCH_CMD[i]}" == "--exclude" ]] && SBATCH_CMD[i + 1]="${AUTO_EXCLUDE}"
+    done
+    echo "=== GPUs or host memory busy on ${busy_markers[*]##*/}; resubmitting (${gpu_busy_attempt}/${GPU_BUSY_RETRIES}) excluding ${AUTO_EXCLUDE} ==="
+    continue
+  fi
   [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" && -n "${NODE_LIST}" ]] || break
   busy_dir="${LOG_ROOT}/slurm_job-${JOB_ID}/gpu-busy"
   shopt -s nullglob

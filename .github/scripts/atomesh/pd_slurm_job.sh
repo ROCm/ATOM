@@ -44,10 +44,11 @@ if [[ " ${EXECUTION_PHASES[*]} " == *" eval "* && ! "${ATOMESH_RESTART_PORT_OFFS
 fi
 
 execution_phase_port_offset() {
+  local base="${ATOMESH_SERVICE_PORT_BASE_OFFSET:-0}"
   if [[ "$1" == "eval" ]]; then
-    printf '%s\n' "${ATOMESH_RESTART_PORT_OFFSET}"
+    printf '%s\n' "$((base + ATOMESH_RESTART_PORT_OFFSET))"
   else
-    printf '0\n'
+    printf '%s\n' "${base}"
   fi
 }
 
@@ -232,6 +233,29 @@ assert_gpus_idle() {
       return 1
     fi
     sleep 10
+  done
+  return 0
+}
+
+# Workers bind their CPU pools to their GPUs' NUMA nodes, where another
+# tenant's anonymous memory is never reclaimed for them: a prefill whose LMCache
+# pools stop fitting swaps instead of starting. Such a host is recorded in
+# gpu-busy/ as well, so pd_submit.sh resubmits without it.
+# ATOMESH_HOST_ANON_BUSY_GIB=0 turns the check off.
+assert_host_memory_free() {
+  local max_gib="${ATOMESH_HOST_ANON_BUSY_GIB:-256}"
+  local meminfo anon_kb
+  (( max_gib > 0 )) || return 0
+  for meminfo in /sys/devices/system/node/node*/meminfo; do
+    [[ -r "${meminfo}" ]] || continue
+    anon_kb="$(awk '$3 == "AnonPages:" {print $4}' "${meminfo}")"
+    [[ "${anon_kb}" =~ ^[0-9]+$ ]] || continue
+    if (( anon_kb > max_gib * 1048576 )); then
+      echo "ERROR: $(hostname) $(basename "$(dirname "${meminfo}")") already holds $((anon_kb / 1048576)) GiB of anonymous memory (limit ${max_gib} GiB); refusing to start." >&2
+      docker ps --format '  {{.Names}}\t{{.Status}}' 2>/dev/null | head -20 >&2 || true
+      mkdir -p "${RUN_DIR}/gpu-busy" 2>/dev/null && touch "${RUN_DIR}/gpu-busy/$(hostname)" 2>/dev/null
+      return 1
+    fi
   done
   return 0
 }
@@ -603,7 +627,7 @@ fi
 
 if [[ "${1:-}" == "--spur-preflight" ]]; then
   pre_cleanup_local
-  assert_gpus_idle
+  assert_gpus_idle && assert_host_memory_free
   exit $?
 fi
 
