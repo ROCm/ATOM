@@ -20,6 +20,7 @@ from typing import Any
 # whole thesis is that asking "how much can be released without splitting a
 # marker" in more than one place is how the answers drift apart, and it used
 # to answer it itself, twice, with a different tie-break.
+from .logprobs import LogprobText, join_text
 from .marker_scanner import MarkerScanner
 from .reasoning_dialects import DIALECTS, FALLBACK_DIALECT, ReasoningDialect
 
@@ -146,6 +147,11 @@ class ReasoningFilter:
     output then begins *inside* the channel with no opening tag, so nothing in
     the text says so and the filter must be told.
 
+    ``answer_started`` is for a prompt that has begun the answer itself (an
+    assistant prefix's content): the output is read as the text after the
+    channel's end marker is, its framing removed and any think markers in it
+    the model's own words.
+
     ``dialect`` is the one this model speaks. Go through
     :class:`ReasoningChannel` rather than passing it by hand.
 
@@ -165,6 +171,7 @@ class ReasoningFilter:
         starts_thinking: bool = False,
         dialect: ReasoningDialect | None = None,
         literal_answer: bool = False,
+        answer_started: bool = False,
     ) -> None:
         self.starts_thinking = starts_thinking
         self.dialect = dialect
@@ -183,16 +190,19 @@ class ReasoningFilter:
         self._open_markers = frozenset(
             (speaking.output_open_marker,) if speaking.output_open_marker else ()
         )
-        self.state = 1 if starts_thinking else (2 if literal_answer else 0)
+        self.state = (
+            1 if starts_thinking else (2 if literal_answer or answer_started else 0)
+        )
         # Nothing has been released yet, so an end marker arriving now sits at
         # offset 0 -- the only place it means "I did not think this turn"
         # (MiniMax-M3's trained form for a no-thinking turn). Anywhere else it
         # is the model's own words.
-        self._at_offset_zero = not starts_thinking
+        self._at_offset_zero = self.state == 0
         # The channel's text so far, kept only by a dialect whose answer can
         # close inside the channel, in case the channel turns out to have been
         # the reply. One string, dropped when the channel ends.
         self._channel_text = io.StringIO() if self._answer_end_markers else None
+        self._channel_parts = None
         # The channel's last words, whitespace and framing aside, were the
         # answer's closer.
         self._answer_closed = False
@@ -201,6 +211,11 @@ class ReasoningFilter:
             if literal_answer and not starts_thinking
             else self._scanner_for(self.state)
         )
+
+    @property
+    def held_text(self) -> str:
+        """Unresolved marker prefix that may still become visible text."""
+        return self._scanner.held if self._scanner is not None else ""
 
     def _scanner_for(self, state: int) -> MarkerScanner | None:
         """What this state has to watch for. ``None`` when that is nothing,
@@ -294,7 +309,12 @@ class ReasoningFilter:
         """
         if self._channel_text is None:
             return
-        self._channel_text.write(released)
+        if isinstance(released, LogprobText):
+            if self._channel_parts is None:
+                self._channel_parts = []
+            self._channel_parts.append(released)
+        else:
+            self._channel_text.write(released)
         if self._answer_closed and not released.isspace():
             self._answer_closed = False
 
@@ -309,9 +329,10 @@ class ReasoningFilter:
         cannot be recalled, so it goes out again as `content`.
         """
         kept, self._channel_text = self._channel_text, None  # never reopens
+        parts, self._channel_parts = self._channel_parts, None
         if not self._answer_closed or at in self._exits_to_answer or not stopped:
             return []
-        reply = kept.getvalue()
+        reply = join_text(parts) if parts is not None else kept.getvalue()
         return [
             ("content", reply[i : i + _REPLAY_PIECE])
             for i in range(0, len(reply), _REPLAY_PIECE)
@@ -352,11 +373,16 @@ class ReasoningChannel:
     that turns thinking off renders a prompt that does not, and OR-ing the
     model-level fact in regardless made an ordinary answer come back as
     ``reasoning_content`` with empty ``content``. The caller resolves it.
+
+    ``answer_started``: the prompt has begun the answer itself -- an
+    assistant prefix's content (``prefix_completion``) -- so the output reads
+    as it would after the model's own end marker.
     """
 
     dialect: ReasoningDialect | None = None
     starts_open: bool = False
     literal_answer: bool = False
+    answer_started: bool = False
 
     def split(self, text: str, *, stopped: bool) -> tuple[str | None, str]:
         """A complete output as ``(reasoning, content)``: the stream's own
@@ -366,8 +392,9 @@ class ReasoningChannel:
         ``None`` when there is none. ``stopped`` is as for
         :meth:`ReasoningFilter.flush`."""
         events = self.stream().read_whole_events(text, stopped=stopped)
-        reasoning = "".join(v for k, v in events if k == "reasoning_content")
-        content = "".join(v for k, v in events if k == "content")
+        join = join_text if isinstance(text, LogprobText) else "".join
+        reasoning = join(v for k, v in events if k == "reasoning_content")
+        content = join(v for k, v in events if k == "content")
         return reasoning or None, content
 
     def stream(self) -> ReasoningFilter:
@@ -376,6 +403,7 @@ class ReasoningChannel:
             starts_thinking=self.starts_open,
             dialect=self.dialect,
             literal_answer=self.literal_answer,
+            answer_started=self.answer_started,
         )
 
 

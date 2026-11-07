@@ -131,7 +131,7 @@ def test_qwen35_bf16_mapping_uses_fused_in_proj_layout():
         atom_config = _Obj(
             quant_config=_Obj(global_quant_config=_Obj(quant_dtype=torch.bfloat16))
         )
-        remapped = module._apply_bf16_in_proj_mapping(
+        remapped = module._apply_merged_in_proj_mapping(
             dict(module._PACKED_MODULES_MAPPING), atom_config
         )
 
@@ -183,6 +183,36 @@ def test_qwen35_prepare_adaptations_remap_quant_config(model_arch):
     assert (
         calls["weights_mapper"].orig_to_new_prefix["model.language_model."] == "model."
     )
+
+
+def test_qwen35_quant_remap_keeps_the_split_names_when_merged():
+    # A per-token FP8 checkpoint builds in_proj_qkvzba, but the quant config is
+    # remapped with the split mapping first (as ModelRunner does natively), so
+    # in_proj_qkv/z and in_proj_b/a keep their own per-layer specs for the
+    # merge decision; only the wrapper's load mapping is merged.
+    with patch.dict(sys.modules, _make_fake_modules()):
+        sys.modules.pop("atom.plugin.sglang.models.qwen3_5", None)
+        module = importlib.import_module("atom.plugin.sglang.models.qwen3_5")
+        calls = {}
+
+        def remap_layer_name(hf_config, packed_modules_mapping=None, **_kw):
+            calls["packed_modules_mapping"] = packed_modules_mapping
+
+        atom_config = _Obj(
+            hf_config=_Obj(),
+            quant_config=_Obj(
+                global_quant_config=_Obj(quant_dtype=torch.bfloat16),
+                remap_layer_name=remap_layer_name,
+            ),
+        )
+        module.remap_qwen35_quant_config_for_sglang_plugin(atom_config)
+        load_mapping = module._apply_merged_in_proj_mapping(
+            dict(module._PACKED_MODULES_MAPPING), atom_config
+        )
+
+    assert calls["packed_modules_mapping"]["in_proj_qkv"] == ("in_proj_qkvz", (0, 1, 2))
+    assert calls["packed_modules_mapping"]["in_proj_b"] == ("in_proj_ba", 0)
+    assert load_mapping["in_proj_b"] == ("in_proj_qkvzba", 4)
 
 
 class _FakeLayer:

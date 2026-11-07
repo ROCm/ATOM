@@ -326,7 +326,7 @@ class K3MonoDecodeRunner:
           which is the overhead mono exists to remove.
 
         Build time has that vote for free: ``bind_agreed`` turns this rank's
-        ``MonoUnsupported`` into a ``tp_agree(False)`` every peer follows.
+        ``MonoUnsupported`` into a ``group_agree(False)`` every peer follows.
         """
         lens = set()
         for plan in self.plans:

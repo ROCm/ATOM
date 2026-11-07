@@ -14,7 +14,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
-from atom.model_engine.segment_tokenizer import SegmentTokenizer
+from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import RequiredChannel, SamplingParams
@@ -69,6 +69,9 @@ class LLMEngine:
                     data_parallel_master_port
                 )
         self.data_parallel_size = config.parallel_config.data_parallel_size
+        # Config validated SP before the legacy DP kwargs above landed.
+        if config.sequence_parallel_size > 1 and self.data_parallel_size != 1:
+            raise ValueError("Ulysses SP currently requires data_parallel_size=1")
         # TBO's two concurrent ubatches are supported by the mori EP
         # dispatch/combine path. The EP collective fallback instead issues
         # full DP all-gather/reduce-scatter operations from both ubatch streams;
@@ -330,6 +333,7 @@ class LLMEngine:
                 parent_request_id=request_id,
             )
             reqs.extend(fanout)
+        self.core_mgr.keep_finished_outputs = True
         self.core_mgr.add_request(reqs)
 
     def step(self) -> list[Sequence]:
@@ -813,7 +817,7 @@ class InputOutputProcessor:
 
     def preprocess(
         self,
-        prompt_or_tokens: str | list[int],
+        prompt_or_tokens: str | list[int] | PrefixEncoding,
         sampling_params: SamplingParams,
         stream_callback=None,
         kv_transfer_params=None,
@@ -874,9 +878,29 @@ class InputOutputProcessor:
             )
         return self._required_channel
 
+    def encode_prompt(
+        self, prompt: str, *, multimodal: bool = False
+    ) -> PrefixEncoding | list[int]:
+        """Tokenize ``prompt`` the way ``preprocess`` does (segment cache and,
+        when enabled, the prompt's block-hash chain). ``preprocess`` takes the
+        result in place of the text without tokenizing again."""
+        segment_tokenizer = getattr(self, "segment_tokenizer", None)
+        if segment_tokenizer is None:
+            return self.tokenizer.encode(prompt)
+        if (
+            getattr(self, "_reuse_block_hashes", False)
+            and self.prefix_hash_block_size
+            and envs.ATOM_FRONTEND_PREFIX_HASH
+            and not multimodal
+        ):
+            return segment_tokenizer.encode_with_prefix(
+                prompt, self.prefix_hash_block_size
+            )
+        return segment_tokenizer.encode(prompt)
+
     def preprocess_fanout(
         self,
-        prompt_or_tokens: str | list[int],
+        prompt_or_tokens: str | list[int] | PrefixEncoding,
         sampling_params: SamplingParams,
         stream_callback=None,
         stream_callbacks: list | None = None,
@@ -903,6 +927,11 @@ class InputOutputProcessor:
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
         """
+        sampling_params.validate_logprob_options(
+            self.config,
+            kv_transfer=kv_transfer_params,
+            multimodal=multimodal_data is not None,
+        )
         if sampling_params.json_schema is not None:
             if self.structured_admission is None:
                 raise ValueError("Structured output requires engine admission")
@@ -918,25 +947,16 @@ class InputOutputProcessor:
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
 
-        prefix_encoding = None
-        segment_tokenizer = getattr(self, "segment_tokenizer", None)
-        if not isinstance(prompt_or_tokens, str):
-            tokens = prompt_or_tokens
-        elif segment_tokenizer is not None:
-            if (
-                getattr(self, "_reuse_block_hashes", False)
-                and self.prefix_hash_block_size
-                and envs.ATOM_FRONTEND_PREFIX_HASH
-                and multimodal_data is None
-            ):
-                prefix_encoding = segment_tokenizer.encode_with_prefix(
-                    prompt_or_tokens, self.prefix_hash_block_size
-                )
-                tokens = prefix_encoding.token_ids
-            else:
-                tokens = segment_tokenizer.encode(prompt_or_tokens)
+        if isinstance(prompt_or_tokens, str):
+            prompt_or_tokens = self.encode_prompt(
+                prompt_or_tokens, multimodal=multimodal_data is not None
+            )
+        if isinstance(prompt_or_tokens, PrefixEncoding):
+            prefix_encoding = prompt_or_tokens
+            tokens = prefix_encoding.token_ids
         else:
-            tokens = self.tokenizer.encode(prompt_or_tokens)
+            prefix_encoding = None
+            tokens = prompt_or_tokens
         mrope_positions = None
         mrope_position_delta = 0
         if multimodal_data is not None:

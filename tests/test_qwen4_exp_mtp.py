@@ -19,6 +19,7 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
 )
+from atom.spec_decode.draft_graph import StagedInput
 
 
 def test_qwen_mtp_does_not_import_deepseek_when_pcp_disabled(monkeypatch):
@@ -288,6 +289,37 @@ def test_decode_mrope_storage_matches_padded_graph_stride(monkeypatch, k):
         graph_positions = builder.model_runner._mrope_positions_view(4 * width)
         torch.testing.assert_close(graph_positions[:, :tokens], reference)
         assert not graph_positions[:, tokens:].count_nonzero()
+
+
+@pytest.mark.parametrize("opted_in", [True, False])
+def test_mrope_draft_graph_declares_positions_with_the_batch_at_axis_1(opted_in):
+    """Qwen3.8's MTP head declares its steps 1+ with `[3, bs]` positions; an
+    MRoPE draft model that has not opted in still declares no pass."""
+    from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
+    from atom.spec_decode.eagle_proposer import EagleProposer
+
+    proposer = SimpleNamespace(
+        runner=SimpleNamespace(use_mrope=True),
+        mtp_k=3,
+        speculative_config=SimpleNamespace(
+            draft_model_hf_config=SimpleNamespace(hidden_size=8, hc_count=2)
+        ),
+        model=object.__new__(Qwen4ExpMTP) if opted_in else SimpleNamespace(),
+        dtype=torch.bfloat16,
+        _step_forward=lambda *a, **kw: None,
+        _step_head=lambda *a, **kw: None,
+        _step_warmup_inputs=lambda *a, **kw: None,
+    )
+    graphs = EagleProposer._declare_draft_graphs(proposer)
+    if not opted_in:
+        assert graphs == () and proposer.step is None
+        return
+    (graph,) = graphs
+    assert graph.inputs["positions"] == StagedInput(
+        shape=(3,), dtype=torch.int64, batch_dim=1
+    )
+    assert graph.inputs["hidden_states"].shape == (2, 8)
+    assert proposer._reuse_step_buffers
 
 
 def test_draft_qsa_view_drops_only_graph_padding():

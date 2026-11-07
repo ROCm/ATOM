@@ -221,19 +221,25 @@ def test_native_linear_dispatch_keeps_a8_qat(linear_modules, monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("m", [1, 5, 300])
-def test_native_linear_preshuffled_matches_row_major(linear_modules, monkeypatch, m):
-    """The (16, 16)-preshuffled group32 weight gives the row-major GEMM's BF16
-    result; off gfx950 both modules stay row-major and agree trivially."""
+@pytest.mark.parametrize("block_rows", [32, 1])
+def test_native_linear_preshuffled_matches_row_major(
+    linear_modules, monkeypatch, m, block_rows
+):
+    """Preshuffled native 32x32 and 1x32 weights match row-major GEMM output."""
     linear, group = linear_modules
     group.world_size = 1
     torch.manual_seed(m)
     weight = (torch.randn(1024, 512) * 32).to(torch.float8_e4m3fn)
-    scale = torch.exp2(torch.randint(-8, -1, (32, 16)).float()).to(torch.float8_e8m0fnu)
+    scale = torch.exp2(torch.randint(-8, -1, (1024 // block_rows, 16)).float()).to(
+        torch.float8_e8m0fnu
+    )
     x = torch.randn(m, 512, dtype=torch.bfloat16, device="cuda")
     outputs = []
     for preshuffle in ("0", "1"):
         monkeypatch.setenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", preshuffle)
-        module = linear.ReplicatedLinear(512, 1024, quant_config=_config()).cuda()
+        module = linear.ReplicatedLinear(
+            512, 1024, quant_config=_config(block_rows)
+        ).cuda()
         module.weight_loader(module.weight, weight)
         module.weight_loader(module.weight_scale, scale)
         module.process_weights_after_loading()

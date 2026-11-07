@@ -1256,7 +1256,7 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
 
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
     monkeypatch.setenv("ATOM_MLA_KV_SHUFFLED", "0")
-    monkeypatch.setattr(backends, "get_tp_group", lambda: SimpleNamespace(world_size=8))
+    monkeypatch.setattr(backends, "attn_head_shard_size", lambda: 8)
     for module in (backends, aiter_mla):
         monkeypatch.setattr(module, "get_dcp_world_size", lambda: world)
         monkeypatch.setattr(module, "get_dcp_rank", lambda: 0)

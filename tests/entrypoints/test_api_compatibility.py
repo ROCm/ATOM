@@ -73,7 +73,8 @@ def server(monkeypatch):
         "engine": SimpleNamespace(
             config=SimpleNamespace(
                 generation_config=SimpleNamespace(), max_model_len=8192
-            )
+            ),
+            io_processor=SimpleNamespace(encode_prompt=lambda text: [1, 2]),
         ),
     }.items():
         monkeypatch.setattr(api_server, name, value)
@@ -106,6 +107,8 @@ def server(monkeypatch):
         return 1, Collector(), 2
 
     class Reasoning:
+        held_text = ""
+
         def stream(self):
             return self
 
@@ -813,34 +816,44 @@ def test_http_error_handler_preserves_status_headers_and_other_routes():
             ),
         )
 
-    response = asyncio.run(run("/v1/chat/completions"))
-    assert response.status_code == 429 and response.headers["Retry-After"] == "5"
-    assert json.loads(response.body)["error"]["message"] == "slow down"
+    for path in ("/v1/chat/completions", "/beta/completions"):
+        response = asyncio.run(run(path))
+        assert response.status_code == 429 and response.headers["Retry-After"] == "5"
+        assert json.loads(response.body)["error"]["message"] == "slow down"
     assert json.loads(asyncio.run(run("/server_info")).body) == {"detail": "slow down"}
 
 
 @pytest.mark.parametrize(
     "endpoint,body",
     [
-        ("chat/completions", {"messages": "invalid"}),
-        ("completions", {"prompt": {}, "max_tokens": "invalid"}),
-        ("responses", {"input": "hi", "max_output_tokens": "invalid"}),
-        ("messages", {"messages": "invalid", "max_tokens": 16}),
+        ("v1/chat/completions", {"messages": "invalid"}),
+        ("v1/completions", {"prompt": {}, "max_tokens": "invalid"}),
+        ("v1/responses", {"input": "hi", "max_output_tokens": "invalid"}),
+        ("v1/messages", {"messages": "invalid", "max_tokens": 16}),
+        ("beta/chat/completions", {"messages": "invalid"}),
+        ("beta/completions", {"prompt": {}, "suffix": 3}),
+        ("beta/completions", {"prompt": "p", "suffix": 3}),
+        # /v1 keeps main's models: a single stop string is still invalid.
+        ("v1/completions", {"prompt": "p", "stop": "x"}),
+        (
+            "v1/chat/completions",
+            {"messages": [{"role": "user", "content": "q"}], "stop": "x"},
+        ),
     ],
 )
 def test_pydantic_errors_use_endpoint_envelope_before_generation(
     server, endpoint, body
 ):
-    response = post("/v1/" + endpoint, {"model": "renamed-model", **body})
+    response = post("/" + endpoint, {"model": "renamed-model", **body})
     # Responses validates its rewritten body inside the endpoint, preserving
     # its existing 400; FastAPI's typed-body validation retains 422 elsewhere.
-    expected_status = 400 if endpoint == "responses" else 422
+    expected_status = 400 if endpoint == "v1/responses" else 422
     assert response.status_code == expected_status
     payload = response.json()
     assert "detail" not in payload
     assert payload["error"]["type"] == "invalid_request_error"
     assert payload["error"]["message"]
-    if endpoint == "messages":
+    if endpoint == "v1/messages":
         assert payload["type"] == "error"
     else:
         assert payload["error"]["code"] == expected_status
@@ -1084,6 +1097,8 @@ def test_responses_engine_failure_is_not_success(
             "text": "partial" if partial else "",
             "finish_reason": reason,
             "num_cached_tokens": 0,
+            "num_tokens_input": 2,
+            "num_tokens_output": 1 if partial else 0,
         }
 
     monkeypatch.setattr(api_server, "generate_async", generate)
