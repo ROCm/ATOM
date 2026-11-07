@@ -2721,6 +2721,13 @@ class Config:
                 self.dp_load_balance == "prefix_spread"
                 and KVConnectorFactory.offload_tier(self).async_lookup
             )
+        if self.offload_prefetch:
+            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+            if not KVConnectorFactory.offload_tier(self).async_lookup:
+                raise ValueError(
+                    "--offload-prefetch requires async tier lookup support"
+                )
         if not 0.0 < self.offload_prefetch_max_kv_usage <= 1.0:
             raise ValueError(
                 "offload_prefetch_max_kv_usage must be in (0, 1], got "
@@ -2746,6 +2753,19 @@ class Config:
             # llama.py adds a key to the live `rope_parameters` while a worker
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
+        # Reject unsupported Store layouts/replay modes before workers load weights.
+        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+        for name, leaf in KVConnectorFactory.leaf_connectors(self) or ():
+            if name == "mooncake_store":
+                from atom.kv_transfer.offload.mooncake_store.config import (
+                    check_engine_compatibility,
+                    parse_mooncake_store_config,
+                )
+
+                check_engine_compatibility(
+                    parse_mooncake_store_config(leaf.kv_transfer_config), leaf
+                )
         self._resolve_dynamic_chunking()
         self._check_pp_support()
 

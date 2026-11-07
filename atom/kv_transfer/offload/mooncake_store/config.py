@@ -19,6 +19,7 @@ from typing import Any, NamedTuple
 
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.mooncake_store.nic import parse_device_list
+from atom.utils.selector import Family, attn_family
 
 KEY_PREFIX = "mooncake_store."
 _MIB = 1 << 20
@@ -196,8 +197,14 @@ def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> 
     layout = offcfg.select_offload_layout(config)
     if layout != "dense" and not uses_replay_pages(config):
         raise ValueError(
-            f"the Mooncake Store offload moves only the dense KV layout; this "
+            f"the Mooncake Store offload requires dense KV or V4.1 bounded-replay PAGEs; this "
             f"model resolves to {layout!r}"
+        )
+    if uses_replay_pages(config) and not getattr(
+        config, "enable_encoder_swa_bounded_replay", False
+    ):
+        raise ValueError(
+            "Mooncake Store V4.1 requires enable_encoder_swa_bounded_replay"
         )
     dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
     if dcp > 1:
@@ -282,8 +289,4 @@ def _positive_seconds(name: str, value: Any) -> float:
 
 def uses_replay_pages(config: Any) -> bool:
     """V4.1 restores PAGE bytes and rebuilds per-request state by replay."""
-    return getattr(config.hf_config, "model_type", None) in (
-        "deepseek_v41",
-        "deepseek_v41_text",
-        "deepseek_v41_dspark",
-    )
+    return attn_family(config.hf_config) == Family.CSA2

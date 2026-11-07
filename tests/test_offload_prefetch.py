@@ -135,12 +135,11 @@ def _make(monkeypatch, seq_factory, n=1, blocks=100, **env):
             max_num_seqs=8,
             max_num_batched_tokens=64,
             num_kvcache_blocks=blocks,
-            offload_prefetch=True,
+            offload_prefetch=False,
         )
     )
     sched.kv_connector = _Connector()
-    # Built here: `__init__` saw MockConfig's connector, which answers no
-    # async lookup.
+    # Enable prefetch only after installing the async connector double.
     sched._prefetch = OffloadPrefetch(sched, 0.8, min_load_tokens=0)
     delayer = _Delayer()
     sched.set_prefill_delayer(delayer)
@@ -733,3 +732,14 @@ def test_a_misaligned_hit_found_after_the_answer_gives_the_answer_back(
     assert conn.released == [seq.id] and conn.taken == set()
     assert seq.status == SequenceStatus.WAITING and not sched._prefetch.holds(seq)
     assert sched._prefetch.skip_until[seq.id] == float("inf")
+
+
+def test_explicit_prefetch_rejects_connector_without_async_lookup():
+    scheduler = object.__new__(Scheduler)
+    scheduler.kv_connector = SimpleNamespace(supports_async_lookup=False)
+    with pytest.raises(ValueError, match="async tier lookup"):
+        scheduler._make_offload_prefetch(SimpleNamespace(offload_prefetch=True))
+    assert (
+        scheduler._make_offload_prefetch(SimpleNamespace(offload_prefetch=False))
+        is None
+    )

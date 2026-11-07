@@ -18,7 +18,7 @@ Registers three backends with the shared KV connector factory:
 * ``mooncake_store`` -- a Mooncake Store reached directly, no LMCache involved:
   start its master and owners and set ``ATOM_KV_OFFLOAD=mooncake_store`` with
   ``ATOM_KV_OFFLOAD_EXTRA_CONFIG`` naming them (``mooncake_store.master`` and
-  ``mooncake_store.metadata``, or ``mooncake_store.pools``). Dense layout only.
+  ``mooncake_store.metadata``, or ``mooncake_store.pools``). Supports dense KV and V4.1 bounded-replay PAGEs.
 """
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -66,6 +66,6 @@ KVConnectorFactory.register(
     offload=True,
     # One Mooncake Store for every DP rank.
     shared_tier=True,
-    # The dense codec builds from `KVCacheTensor`s; the region map is unread.
-    reads_block_regions=False,
+    # V4.1 sources its complete PAGE codec from the region map.
+    reads_block_regions=True,
 )
