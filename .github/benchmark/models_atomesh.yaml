@@ -823,6 +823,8 @@ models:
         # and real MTP acceptance. No CPU offload tier is needed for accuracy.
         - <<: *glm52_agentic_lmcache_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-gsm8k-20shot-landing-c32
+          runner:
+            time_limit: "02:00:00"
           display_topology: 1P1D-CPP4-DCP4-MTP3
           isl: [4096]
           osl: 1024
