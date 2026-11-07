@@ -1637,7 +1637,11 @@ class MooncakeConnector(KVConnectorBase):
         """Record when this prefill batch's KV writes become visible to staging."""
         if (
             not self.is_producer
-            or (self._index_staging_pool_size == 0 and self._mla_staging is None)
+            or (
+                self._index_staging_pool_size == 0
+                and self._mla_staging is None
+                and self._staging_slot_bytes == 0
+            )
             or not req_ids
         ):
             return
@@ -2541,6 +2545,7 @@ class MooncakeConnector(KVConnectorBase):
                     dst_block_ids,
                     prefill_data,
                     req_id,
+                    kv_cache_ready_event,
                     engine=engine,
                 )
             else:
@@ -3527,6 +3532,7 @@ class MooncakeConnector(KVConnectorBase):
         dst_block_ids: list[int],
         prefill_data: dict,
         req_id: str,
+        kv_cache_ready_event: torch.cuda.Event | None = None,
         *,
         engine=None,
         blocks_only: bool = False,
@@ -3759,11 +3765,21 @@ class MooncakeConnector(KVConnectorBase):
         consumer_staging_addr = request_data.get("consumer_staging_addr", 0)
         if self._gather_slot is not None and consumer_staging_addr:
             producer_pool_idx = self._staging_slots.acquire()
-            self._gather_slot(src_slot, producer_pool_idx)
+            # The forward may run on a different stream than this thread's
+            # current one, so the gather waits on this request's prefill event
+            # before reading what the prefill wrote.
+            stream = self._send_worker_stream()
+            if kv_cache_ready_event is None:
+                raise RuntimeError(
+                    "Missing prefill KV-cache ready event for staged slot transfer"
+                )
+            stream.wait_event(kv_cache_ready_event)
+            with torch.cuda.stream(stream):
+                self._gather_slot(src_slot, producer_pool_idx)
             # Synchronize on the gather kernel before NIC starts reading the
             # staging buffer. Without this, the RDMA can race the still-in-flight
             # gather kernel on TBO prefill (page fault under high concurrency).
-            torch.cuda.current_stream().synchronize()
+            stream.synchronize()
             slot_src.append(
                 self._staging_base_addr + producer_pool_idx * self._staging_slot_bytes
             )
