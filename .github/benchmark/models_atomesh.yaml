@@ -880,7 +880,10 @@ models:
               # disjoint from the stages' own NICs (their GPUs' rdma0-3) and
               # from each other. Resize by overriding
               # ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS, at most 832 GiB per
-              # owner (an ionic NIC's registration limit).
+              # owner (an ionic NIC's registration limit). pd_submit.sh asks the
+              # Spur prolog for the owners' 2 MiB HugeTLB pages (sbatch --comment
+              # hugepages_2m=node0:393216,node1:393216); the owners take them on
+              # a node that reserved them, and transparent huge pages elsewhere.
               MOONCAKE_STORE_OWNERS: "0:768:rdma4,rdma5;1:768:rdma6,rdma7"
               # The clean page cache of every model on the node goes before the
               # owners pin huge pages, not just this one's: compaction would
