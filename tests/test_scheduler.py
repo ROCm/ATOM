@@ -451,6 +451,8 @@ class TestSchedule:
             _counted_as_inflight_load=True,
         )
         sched = Scheduler.__new__(Scheduler)
+        sched._prefetch = None
+        sched._blocked_head = None
         sched._rejected = []
         sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
@@ -577,6 +579,8 @@ class TestSchedule:
                 events.append(("source_blocks_released", value.id))
 
         sched = Scheduler.__new__(Scheduler)
+        sched._prefetch = None
+        sched._blocked_head = None
         sched.waiting = deque()
         sched.running = deque()
         sched._rejected = []
@@ -718,6 +722,57 @@ class TestSchedule:
         # 200 - 128 = 72 for seq 2, floored to 64; the freed 8 stays unspent.
         assert list(batch.num_scheduled_tokens) == [128, 64]
         assert batch.total_tokens_num_prefill == 192
+
+    def test_prefill_completed_is_set_with_the_last_chunk(self, seq_factory):
+        """The DP router reads it to tell a prefix that exists (the last chunk
+        has completed its forward) from one that never
+        will."""
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=6,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(10)))
+        sched.add(seq)
+        assert seq.prefill_completed is False
+
+        batch1, _ = sched.schedule()
+        assert batch1.total_tokens_num_prefill == 6
+        assert seq.prefill_completed is False  # a middle chunk
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch1,
+        )
+        batch2, _ = sched.schedule()  # dispatch alone is not completion
+        assert seq.prefill_completed is False
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch2,
+        )
+        assert seq.prefill_completed is True
+
+        # A preempted request prefills again: the flag describes that one.
+        sched.running.remove(seq) if seq in sched.running else None
+        sched.running.append(seq)
+        assert sched.preempt(seq)
+        assert seq.prefill_completed is False
 
     def test_chunked_prefill_splits_prompt_across_steps(self, seq_factory):
         sched = Scheduler(
@@ -986,12 +1041,15 @@ class TestSchedule:
 
     def test_ready_remote_kv_waiter_is_promoted_ahead_of_fresh_head(self):
         sched = Scheduler.__new__(Scheduler)
+        sched._prefetch = None
+        sched._blocked_head = None
         fresh = SimpleNamespace(id=1, status=SequenceStatus.WAITING)
         ready = SimpleNamespace(id=2, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
         blocked = SimpleNamespace(id=3, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
         sched.waiting = deque([fresh, ready, blocked])
         sched.finished_recving_kv_req_ids = ["2"]
         sched.failed_recving_kv_req_ids = []
+        sched.kv_connector = None  # P/D: resolved at admission
 
         sched._promote_ready_remote_kv_requests()
 
@@ -1018,7 +1076,12 @@ class TestSchedule:
         sched._count_inflight_load(seq)
         sched.finished_recving_kv_req_ids.append(seq.id)
 
-        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        sched._resolve_offload_load(seq)
+        # Handed back to admission as a resume at the load's end, still
+        # counted as parked until it is admitted.
+        assert seq.status == SequenceStatus.WAITING and seq.offload_loaded
+        assert sched._is_offload_prefill_resume(seq)
+        assert seq.num_cached_tokens == 4
         assert sched._num_parked_remote_kv == 1
         sched.waiting.append(seq)
 
@@ -1115,7 +1178,10 @@ class TestSchedule:
         sched._park_for_remote_load(seq, deque())
         sched._count_inflight_load(seq)
         sched.finished_recving_kv_req_ids.append(seq.id)
-        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        sched._resolve_offload_load(seq)
+        assert seq.status == SequenceStatus.WAITING and seq.offload_loaded
+        assert sched._is_offload_prefill_resume(seq)
+        assert seq.num_cached_tokens == 6
         sched.waiting.append(seq)
 
         sched.schedule()
@@ -1130,6 +1196,8 @@ class TestSchedule:
                 return seq.id == 2
 
         sched = Scheduler.__new__(Scheduler)
+        sched._prefetch = None
+        sched._blocked_head = None
         sched.kv_connector = _Connector()
         sched.waiting = deque()
         sched._partial_prefill_count = 1
@@ -2950,6 +3018,8 @@ class TestStalledOffloadSaveReclaim:
         import atom.model_engine.scheduler as sched_mod
 
         s = object.__new__(sched_mod.Scheduler)
+        s._prefetch = None
+        s._blocked_head = None
         s.deferred_free_blocks = {seq.id: seq for seq in deferred}
         s._abandoned_saves = 0
         s._next_save_reconcile_at = 0.0
@@ -3129,6 +3199,8 @@ class TestStalledOffloadSaveReclaim:
         import atom.model_engine.scheduler as sched_mod
 
         s = object.__new__(sched_mod.Scheduler)
+        s._prefetch = None
+        s._blocked_head = None
         s.deferred_free_blocks = {
             1: SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 1e6)
         }
@@ -3168,6 +3240,8 @@ class TestStalledOffloadSaveReclaim:
         import atom.model_engine.scheduler as sched_mod
 
         s = object.__new__(sched_mod.Scheduler)
+        s._prefetch = None
+        s._blocked_head = None
         s.kv_connector = None
         assert s._save_abandon_timeout_s() == 0.0
         s.kv_connector = SimpleNamespace()  # a connector without the offload face
@@ -3187,6 +3261,8 @@ class TestStateStorePendingCap:
         import atom.model_engine.scheduler as sched_mod
 
         s = object.__new__(sched_mod.Scheduler)
+        s._prefetch = None
+        s._blocked_head = None
         s.kv_connector = connector
         return s
 
@@ -3363,3 +3439,37 @@ def test_scheduled_batch_logprob_gate(enabled):
     assert batch.any_logprobs is enabled
     assert batch.logprob_requested == ((1,) if enabled else ())
     assert batch.top_logprobs == ([0, 5] if enabled else None)
+
+
+@pytest.mark.parametrize("pp", [False, True])
+@pytest.mark.parametrize("final_chunk", [False, True])
+def test_abort_after_forward_keeps_actual_prefill_completion(
+    seq_factory, pp, final_chunk
+):
+    sched = Scheduler(
+        MockConfig(
+            enable_prefix_caching=True,
+            num_kvcache_blocks=40,
+            max_num_batched_tokens=8 if final_chunk else 4,
+        )
+    )
+    sched.advance_on_schedule = pp
+    seq = seq_factory(list(range(8)), sampling_params=SamplingParams(max_tokens=16))
+    sched.add(seq)
+    batch, _ = sched.schedule()
+    assert not seq.prefill_completed  # even PP schedule-time advancement is not proof
+    seq.status = SequenceStatus.ABORTED
+    finished = sched.postprocess(
+        list(sched.running),
+        ScheduledBatchOutput(
+            req_ids=[],
+            token_ids=[],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            is_deferred_out=True,
+        ),
+        batch=batch,
+    )
+    assert seq in finished
+    assert seq.prefill_completed == final_chunk

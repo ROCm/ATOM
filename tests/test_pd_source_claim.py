@@ -19,6 +19,8 @@ from types import SimpleNamespace
 import pytest
 from aiter_stub import stubbed_aiter
 
+from atom.model_engine.sequence import SequenceStatus as _SeqStatus
+
 with stubbed_aiter():
     # `importorskip`, not a plain import: `moriio_connector` reaches
     # `disaggregation.utils`, which imports triton, and a CPU-only runner has
@@ -160,3 +162,73 @@ def test_nothing_is_claimed_when_nothing_will_be_sent(build):
         seq.leave_reason = "stop_sequence"
         local_only.request_finished(seq)
         assert local_only.should_defer_free(seq) is False
+
+
+@pytest.mark.parametrize("build", BACKENDS)
+def test_cancel_preadmission_drops_the_queued_receive_and_rearms_it(build):
+    """Under `multi`, an offload sub can refuse an admission after the P/D
+    consumer queued its receive. The receive must not run into the freed
+    blocks, and the re-admission must report and wait for the load again."""
+    sched = build(is_producer=False)
+    sched.state_slot = -1
+    seq = _seq(do_remote_prefill=True, remote_block_ids=[1, 2, 3])
+    seq.prompt_token_ids = [0] * 48
+    seq.num_cached_tokens = 0
+    seq.has_per_req_cache = False
+    assert sched.get_num_new_matched_tokens(seq)[1]
+    sched.update_state_after_alloc(seq)
+    assert seq.id in sched._reqs_need_recv
+
+    sched.cancel_preadmission(seq)
+
+    assert seq.id not in sched._reqs_need_recv
+    assert seq.kv_transfer_params["do_remote_prefill"] is True
+    assert sched.get_num_new_matched_tokens(seq)[1]
+
+
+def test_a_producer_requeue_undoes_every_record_of_the_admission():
+    """Under `multi[mooncake kv_producer + chunked_transfer, an offload tier
+    with state]` a REQUEUE frees the blocks after the notification. Nothing
+    the notification recorded may outlive them: the same tick's metadata
+    would save from freed blocks, and the leftover claim would skip the
+    handshake. The readiness the D side reported (once) is given back."""
+    sched = _mooncake(is_producer=True)
+    sched.enable_chunked_transfer = True
+    sched._chunked_admission_timeout_s = 60.0
+    seq = _seq(do_remote_decode=True, chunked_transfer=True, transfer_id="t1")
+    seq.prompt_token_ids = [0] * 48
+    seq.num_prompt_tokens = 48
+    seq.status = _SeqStatus.WAITING
+    sched._chunked_ready.add(seq.id)
+    assert sched.admission_ready(seq)
+
+    sched.update_state_after_alloc(seq)
+    assert seq.id in sched._reqs_need_save and str(seq.id) in sched._awaiting_send
+    assert seq.id not in sched._chunked_ready
+
+    sched.cancel_preadmission(seq)
+
+    assert seq.id not in sched._reqs_need_save
+    assert str(seq.id) not in sched._awaiting_send
+    # The re-admission passes `admission_ready` without a second handshake.
+    assert sched.admission_ready(seq)
+    sched.update_state_after_alloc(seq)
+    assert seq.id in sched._reqs_need_save
+
+
+def test_a_consumer_requeue_undoes_its_chunked_receive():
+    sched = _mooncake(is_producer=False)
+    sched._chunked_receiving = {}
+    seq = _seq(do_remote_prefill=True, chunked_transfer=True, transfer_id="t2")
+    seq.prompt_token_ids = [0] * 48
+    seq.num_cached_tokens = 0
+    seq.has_per_req_cache = False
+    sched.update_state_after_alloc(seq)
+    assert sched._chunked_receiving[seq.id] is seq
+    assert seq.id in sched._reqs_need_recv
+
+    sched.cancel_preadmission(seq)
+
+    assert seq.id not in sched._chunked_receiving
+    assert seq.id not in sched._reqs_need_recv
+    assert seq.kv_transfer_params["do_remote_prefill"] is True

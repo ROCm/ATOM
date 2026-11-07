@@ -29,6 +29,7 @@ from atom.config import Config
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
+    cancel_queued_receive,
 )
 from atom.kv_transfer.disaggregation.moriio.moriio_common import (
     _MORIIO_AVAILABLE,
@@ -2019,6 +2020,18 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         )
         self._reqs_need_recv.clear()
         return meta
+
+    def cancel_preadmission(self, seq: Sequence) -> None:
+        """Undo the receive `update_state_after_alloc` queued for an admission
+        the scheduler refused before dispatch (under `multi`, an offload
+        sub's state load): its blocks are freed, so the receive must not run,
+        and the re-admission queues it again."""
+        if not cancel_queued_receive(self._reqs_need_recv, seq):
+            return
+        # The lookup tags a request once (`get_num_new_matched_tokens`): the
+        # re-admission must report and wait for its remote load again.
+        if hasattr(seq, "kv_async_tagged"):
+            del seq.kv_async_tagged
 
     def update_state_after_alloc(self, seq: Sequence) -> None:
         """Update internal state after the scheduler allocates blocks for a sequence.

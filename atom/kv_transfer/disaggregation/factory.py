@@ -14,12 +14,14 @@ from __future__ import annotations
 import importlib
 import logging
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -59,6 +61,28 @@ def pd_transfer_config(kv_transfer_config: dict | None) -> dict | None:
     return cfg if name in PD_TRANSFER_BACKENDS else None
 
 
+@dataclass(frozen=True)
+class OffloadTierProfile:
+    """What the configured offload tier offers DP routing and admission,
+    read off the registry once at startup (`KVConnectorFactory.offload_tier`).
+
+    `loads`: a rank can load a prefix another DP rank computed from the tier
+    (some configured transport, ``multi`` expanded, is an offload backend
+    whose role loads and whose tier the DP ranks share).
+
+    `async_lookup`: the configured connector itself (not ``multi``) answers
+    tier lookups asynchronously, so the offload prefetch can take an answer
+    without a round trip.
+
+    `min_load_tokens`: the shortest tier hit, beyond the HBM prefix, that the
+    connector loads rather than recomputes.
+    """
+
+    loads: bool = False
+    async_lookup: bool = False
+    min_load_tokens: int = 0
+
+
 class KVConnectorFactory:
     """Registry + factory for KV connector backends.
 
@@ -93,6 +117,12 @@ class KVConnectorFactory:
     # Whether a backend is a KV offload tier, whose scheduler half rewrites the
     # completion sets it is handed (`process_completions`). Absent means no.
     _offload: ClassVar[dict[str, bool]] = {}
+    # Whether a backend's scheduler answers tier lookups asynchronously
+    # (`KVConnectorSchedulerBase.supports_async_lookup`). Absent means no.
+    _async_lookup: ClassVar[dict[str, bool]] = {}
+    # Whether a backend's tier is one store every DP rank reads (an LMCache MP
+    # server, Mooncake Store), not one per rank. Absent means per rank.
+    _shared_tier: ClassVar[dict[str, bool]] = {}
 
     @classmethod
     def register(
@@ -108,6 +138,8 @@ class KVConnectorFactory:
         copies_whole_block_regions: bool = False,
         requires_pd_staging: bool = True,
         offload: bool = False,
+        async_lookup: bool = False,
+        shared_tier: bool = False,
     ) -> None:
         """Register a KV connector backend.
 
@@ -119,6 +151,10 @@ class KVConnectorFactory:
             scheduler_class: Class name within *scheduler_module*.
             offload: The backend is a KV offload tier; a ``multi`` runs at most
                 one (`is_offload_backend`).
+            async_lookup: The backend's scheduler can answer tier lookups
+                asynchronously (`offload_tier`).
+            shared_tier: The offload tier is shared by all DP ranks
+                (`offload_tier`).
         """
         cls._registry[name] = {
             "worker_module": worker_module,
@@ -143,6 +179,8 @@ class KVConnectorFactory:
         cls._reads_block_regions[name] = bool(reads_block_regions)
         cls._copies_whole_block_regions[name] = bool(copies_whole_block_regions)
         cls._offload[name] = bool(offload)
+        cls._async_lookup[name] = bool(async_lookup)
+        cls._shared_tier[name] = bool(shared_tier)
 
     @classmethod
     def canonical_name(cls, value: object, *, path: str = "kv_transfer_config") -> str:
@@ -169,6 +207,29 @@ class KVConnectorFactory:
         """Whether the registered backend ``name`` (canonical) is an offload tier."""
 
         return cls._offload.get(name, False)
+
+    @classmethod
+    def offload_tier(cls, config: Any) -> OffloadTierProfile:
+        """The configured offload tier's `OffloadTierProfile`, from the
+        registry and `config` alone (nothing is built)."""
+        kv_cfg = getattr(config, "kv_transfer_config", None) or {}
+        if not isinstance(kv_cfg, dict):
+            return OffloadTierProfile()
+        tier = shared = False
+        for name, sub in cls.leaf_connectors(config) or ():
+            role = (getattr(sub, "kv_transfer_config", None) or {}).get(
+                "kv_role", "offload"
+            )
+            if cls.is_offload_backend(name) and role != "kv_producer":
+                tier = True
+                shared |= cls._shared_tier.get(name, False)
+        if not tier:
+            return OffloadTierProfile()
+        return OffloadTierProfile(
+            loads=shared,
+            async_lookup=cls._async_lookup.get(cls.connector_name(kv_cfg), False),
+            min_load_tokens=int(envs.OFFLOAD_MIN_LOAD_TOKENS),
+        )
 
     @classmethod
     def connector_name(cls, kv_transfer_config: dict[str, Any] | None) -> str | None:

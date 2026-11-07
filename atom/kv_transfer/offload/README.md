@@ -105,6 +105,7 @@ Four rules carry the module:
 | `mp/connector.py` | Capability-selected public `lmcache_mp` worker/scheduler shells. |
 | `mp/deployment.py` | LMCache MP configuration, topology, model namespace and server adapters. |
 | `mp/worker.py`, `mp/scheduler.py` | Generic PAGE-only LMCache MP connector halves. |
+| `mp/token_shipping.py` | Incremental token shipping: the scheduler sends each transfer only the tokens past what the workers hold; the worker shell rebuilds the prefix. |
 | `mp/lookup.py` | Scheduler-side MP lookups and read-lock bookkeeping. |
 | `mp/transfer.py` | Transfer identity, terminal detection and the fail-stop transfer deadline. |
 | `mp/page_views.py` | Shared validation of backend-published PAGE views. |

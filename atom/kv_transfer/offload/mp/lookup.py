@@ -299,6 +299,51 @@ class _MPLookupClient:
             return True
 
     @_locked
+    def has_answer(self, lookup_id: str) -> bool:
+        """Answered and waiting to be consumed. A failed lookup is not: it
+        leaves `_async` without an answer, and consuming it would retry
+        synchronously."""
+        return lookup_id in self._async_hits
+
+    def take_answer(
+        self,
+        lookup_id: str,
+        tokens: Callable[[], list[int]],
+        before: Callable[[], None] | None = None,
+    ) -> int | None:
+        """Consume an answered async lookup as `lookup` would, without
+        waiting; None, consuming nothing, if it has not answered. The check
+        and the consumption are one step under the lock, so the driver cannot
+        expire and re-ask it in between (`_release_stale`). `before` (what the
+        caller runs ahead of a lookup) and `tokens` (a prompt copy, which takes
+        milliseconds for a long prompt) run outside the lock, as `_drive`
+        copies, and only once it has answered."""
+        with self._lock:
+            if lookup_id not in self._async_hits:
+                return None
+        if before is not None:
+            before()
+        token_ids = tokens()
+        with self._lock:
+            if lookup_id not in self._async_hits:
+                return None  # released as stale meanwhile, and asked again
+            return self._consume_answer(lookup_id, token_ids)
+
+    def _consume_answer(self, lookup_id: str, token_ids: list[int]) -> int:
+        """Take an answered async lookup for its request (lock held).
+        `token_ids` is kept as given: the caller passes its own copy."""
+        self._orphans.discard(lookup_id)
+        self._offered.pop(lookup_id, None)
+        self._async_tokens.pop(lookup_id, None)
+        self._answered_at.pop(lookup_id, None)
+        hit = self._async_hits.pop(lookup_id)
+        state = _LookupState(token_ids=token_ids)
+        state.hit = hit
+        self._lookups[lookup_id] = state
+        self._window_freed()
+        return hit
+
+    @_locked
     def pending_ids(self):
         """Lookups already submitted and not yet consumed (do not mutate)."""
         if self._driver is not None:
@@ -551,15 +596,12 @@ class _MPLookupClient:
                         return None
                 time.sleep(self._wait_interval())
         with self._lock:
+            if lookup_id in self._async_hits:
+                return self._consume_answer(lookup_id, list(token_ids))
             self._async_tokens.pop(lookup_id, None)
             self._answered_at.pop(lookup_id, None)
-            async_hit = self._async_hits.pop(lookup_id, None)
             state = _LookupState(token_ids=list(token_ids))
             self._lookups[lookup_id] = state
-            if async_hit is not None:
-                state.hit = async_hit
-                self._window_freed()
-                return async_hit
             request_id = _mp_session_id(self._config, lookup_id)
             self._adapter.maybe_submit_lookup_request(request_id, token_ids)
         deadline = time.monotonic() + self._timeout

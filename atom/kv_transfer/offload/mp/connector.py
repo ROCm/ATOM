@@ -23,6 +23,8 @@ from atom.kv_transfer.offload._offload_common import validated_kv_role
 from atom.kv_transfer.offload.mp import deployment
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
+from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
+from atom.kv_transfer.offload.page_codec import replays_state
 
 
 def _publishes_native_state(transfer_tensors: Any) -> bool:
@@ -65,21 +67,6 @@ def _copies_paged_state(transfer_tensors: Any) -> bool:
     return callable(state_transfer) and bool(state_transfer().copies)
 
 
-def _replays_state(transfer_tensors: Any) -> bool:
-    """Whether the backend rebuilds its per-request state at every hit.
-
-    A `replay` state transfer keeps no checkpoint: a prefix hit resumes with a
-    fresh state slot and the forward recomputes the hash block below it
-    (`BlockManager.replay_start`), so a PAGE-only load is resumable as is.
-    """
-
-    builder = getattr(transfer_tensors, "state_backend", None)
-    state_transfer = getattr(builder, "state_transfer", None)
-    return callable(state_transfer) and bool(
-        getattr(state_transfer(), "replays", False)
-    )
-
-
 class LMCacheMPConnector(KVConnectorBase):
     """Worker shell selecting PAGE-only or native-state transport by capability."""
 
@@ -90,6 +77,9 @@ class LMCacheMPConnector(KVConnectorBase):
         validated_kv_role(getattr(config, "kv_transfer_config", {}) or {})
         self._config = config
         self._impl: KVConnectorBase | None = None
+        # Each request's token prefix, rebuilt from incremental shipments
+        # (`token_shipping.py`).
+        self._tokens = WorkerTokens()
 
     def _require_impl(self) -> KVConnectorBase:
         if self._impl is None:
@@ -118,7 +108,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 "but publishes no paged_state_checkpoint_spec and "
                 "execute_paged_state_copies for the native-state transfer"
             )
-        elif _replays_state(transfer_tensors):
+        elif replays_state(transfer_tensors):
             # The forward rebuilds the state from the PAGE below any hit
             # (`StateTransfer.replay`), a tier load's included, so PAGE alone
             # is all a load has to bring.
@@ -145,6 +135,7 @@ class LMCacheMPConnector(KVConnectorBase):
             self._impl.close()
 
     def start_load_kv(self, metadata: Any) -> None:
+        self._tokens.resolve(metadata)
         self._require_impl().start_load_kv(metadata)
 
     def get_finished(self) -> KVConnectorOutput:
@@ -236,6 +227,22 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
     def lookup_pending(self, seq: Any) -> bool:
         pending = getattr(self._require_impl(), "lookup_pending", None)
         return bool(pending(seq)) if callable(pending) else False
+
+    @property
+    def supports_async_lookup(self) -> bool:
+        return bool(getattr(self._require_impl(), "supports_async_lookup", False))
+
+    def lookup_ready(self, seq: Any) -> bool:
+        return self._require_impl().lookup_ready(seq)
+
+    def take_ready_lookup(self, seq: Any) -> bool:
+        return self._require_impl().take_ready_lookup(seq)
+
+    def release_taken_lookup(self, seq: Any) -> None:
+        self._require_impl().release_taken_lookup(seq)
+
+    def cancel_preadmission(self, seq: Any) -> None:
+        self._require_impl().cancel_preadmission(seq)
 
     def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
         check = getattr(self._require_impl(), "can_detach_lookup", None)

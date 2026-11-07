@@ -7,7 +7,6 @@ import logging
 import sys
 import threading
 import types
-from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -3528,6 +3527,8 @@ def test_tp_cross_generation_reports_do_not_clear_or_commit_until_matched():
     boundary_hash = boundary.slot_save_spec.boundary_block_hash
     aggregator = KVOutputAggregator(world_size=2)
     host = Scheduler.__new__(Scheduler)
+    host._prefetch = None
+    host._blocked_head = None
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     host.finished_recving_kv_req_ids = []
@@ -3622,6 +3623,8 @@ def test_collapsed_sidecar_and_save_completion_clears_page_inflight():
     sched._save_inflight["723"] = {prior_operation}
     boundary_operation = sched.build_connector_meta().requests[0].save_operation
     host = Scheduler.__new__(Scheduler)
+    host._prefetch = None
+    host._blocked_head = None
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     host.finished_recving_kv_req_ids = []
@@ -3710,6 +3713,8 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+    host._prefetch = None
+    host._blocked_head = None
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(deallocate=deallocate)
@@ -3777,6 +3782,8 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+    host._prefetch = None
+    host._blocked_head = None
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(deallocate=deallocate)
@@ -3851,6 +3858,8 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+    host._prefetch = None
+    host._blocked_head = None
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(
@@ -3864,7 +3873,8 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
     host._rejected = []
 
     host._update_from_kv_xfer_finished(KVConnectorOutput(**{terminal_field: {seq.id}}))
-    assert host._resolve_waiting_remote_kv(seq, deque()) is False
+    host._resolve_offload_load(seq)
+    assert seq.status == SequenceStatus.WAITING
     assert getattr(seq, consumed_flag) is True
     assert host.finished_recving_kv_req_ids == []
     assert host.failed_recving_kv_req_ids == []
@@ -3901,6 +3911,8 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
             calls.append(req_id)
 
     host = Scheduler.__new__(Scheduler)
+    host._prefetch = None
+    host._blocked_head = None
     host.kv_connector = _Connector()
     host.failed_recving_kv_req_ids = [seq.id]
     host._num_parked_remote_kv = 0
@@ -4038,6 +4050,8 @@ def test_tp_partial_sidecar_completion_never_commits():
     save_operation = meta.requests[0].save_operation
     boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
     host = Scheduler.__new__(Scheduler)
+    host._prefetch = None
+    host._blocked_head = None
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     aggregator = KVOutputAggregator(world_size=2)
@@ -4098,6 +4112,8 @@ def test_tp_sidecar_failure_prevents_commit_after_all_workers_terminal():
     save_operation = meta.requests[0].save_operation
     boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
     host = Scheduler.__new__(Scheduler)
+    host._prefetch = None
+    host._blocked_head = None
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     aggregator = KVOutputAggregator(world_size=2)
@@ -5045,6 +5061,8 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
     pending_send = {str(seq.id)}
     freed = []
     engine_sched = Scheduler.__new__(Scheduler)
+    engine_sched._prefetch = None
+    engine_sched._blocked_head = None
     engine_sched.deferred_free_blocks = {seq.id: seq}
     engine_sched.block_manager = SimpleNamespace(deallocate=freed.append)
     engine_sched.kv_connector = SimpleNamespace(
@@ -5147,6 +5165,8 @@ def test_finished_saving_releases_deferred_free_with_string_req_id():
             return str(seq.id) in self.inflight
 
     sched = Scheduler.__new__(Scheduler)
+    sched._prefetch = None
+    sched._blocked_head = None
     sched.block_manager = _BlockManager()
     sched.kv_connector = _Connector()
     seq = SimpleNamespace(id=9)
@@ -5176,6 +5196,8 @@ def test_producer_waits_for_send_and_final_save(send_first):
             return self.pending_save or self.pending_send
 
     host = Scheduler.__new__(Scheduler)
+    host._prefetch = None
+    host._blocked_head = None
     host.kv_connector = Connector()
     freed = []
     host.block_manager = SimpleNamespace(deallocate=lambda seq: freed.append(seq.id))
@@ -5194,6 +5216,8 @@ def test_producer_waits_for_send_and_final_save(send_first):
 
 def test_finished_recv_matches_string_req_id():
     sched = Scheduler.__new__(Scheduler)
+    sched._prefetch = None
+    sched._blocked_head = None
     sched.finished_recving_kv_req_ids = ["123"]
     # kv_events disabled: skip the remote-store recording path so this test
     # only exercises string/int req_id matching in _pop_req_id.
@@ -6403,13 +6427,17 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     import inspect
     import re
 
+    import atom.model_engine.offload_prefetch as prefetch_mod
     import atom.model_engine.scheduler as sched_mod
     from atom.kv_transfer.disaggregation.multi.multi_connector import (
         MultiConnectorScheduler,
     )
     from atom.kv_transfer.offload.connector import LMCacheOffloadConnectorScheduler
 
-    src = inspect.getsource(sched_mod)
+    # The offload prefetch is the other reader: it holds the scheduler as `s`.
+    src = inspect.getsource(sched_mod) + inspect.getsource(prefetch_mod).replace(
+        "s.kv_connector", "self.kv_connector"
+    )
 
     # The Scheduler reads the shell two ways: directly (`self.kv_connector.x`)
     # and through a local alias it hoists first (`conn = self.kv_connector; ...
@@ -6471,6 +6499,9 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
         # Without this read the send's claim never clears and a producer's
         # blocks are parked forever.
         "send_finished",
+        # Read by the offload prefetch (`offload_prefetch.py`).
+        "chunk_size",
+        "take_ready_lookup",
     }
     lost = sorted(must_be_seen - probed)
     assert not lost, (
@@ -6495,6 +6526,10 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     # Retention hooks are mandatory on both shells. Offload's send_finished
     # explicitly does nothing, since it has no P/D send claim to retire.
     multi_routes_via_sub: set[str] = {"max_pending_saves"}
+    # The offload prefetch is not built under `multi`: the composite answers
+    # `supports_async_lookup` False (the base default), so nothing reads its
+    # chunk size.
+    multi_routes_via_sub |= {"chunk_size"}
     for shell in (LMCacheOffloadConnectorScheduler, MultiConnectorScheduler):
         allow = multi_routes_via_sub if shell is MultiConnectorScheduler else set()
         missing = sorted(

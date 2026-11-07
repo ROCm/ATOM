@@ -88,6 +88,24 @@ class KVConnectorBase(ABC):
         return []
 
 
+def cancel_queued_receive(reqs_need_recv: dict, seq: Any) -> bool:
+    """Drop the receive a P/D consumer queued for `seq` and re-arm it.
+
+    For `cancel_preadmission`: the admission is refused after
+    `update_state_after_alloc` queued the receive, its blocks are freed, and
+    the re-admission queues it again -- so the receive must not run into them,
+    and `do_remote_prefill` (which the alloc cleared) is set again. True if a
+    receive of this request was queued.
+    """
+    entry = reqs_need_recv.get(seq.id)
+    if entry is None or entry[0] is not seq:
+        return False
+    del reqs_need_recv[seq.id]
+    if seq.kv_transfer_params is not None:
+        seq.kv_transfer_params["do_remote_prefill"] = True
+    return True
+
+
 class KVConnectorSchedulerBase(ABC):
     """Scheduler-side KV connector interface.
 
@@ -123,6 +141,32 @@ class KVConnectorSchedulerBase(ABC):
     def admission_ready(self, seq: Any) -> bool:
         """Whether the scheduler may allocate this request and start prefill."""
         return True
+
+    # Whether `take_ready_lookup` can hand over an answered tier lookup
+    # without a round trip (the offload prefetch needs it).
+    supports_async_lookup: bool = False
+
+    def lookup_ready(self, seq: Any) -> bool:
+        """Whether `seq`'s tier lookup has answered. A peek: the answer may
+        still expire before `take_ready_lookup`. No tier, no answer."""
+        return False
+
+    def take_ready_lookup(self, seq: Any) -> bool:
+        """Take `seq`'s tier answer for its admission if it has answered,
+        atomically with respect to any lookup driver thread; never waits.
+        True if the answer is now held for the admission."""
+        return False
+
+    def release_taken_lookup(self, seq: Any) -> None:
+        """Give back an answer `take_ready_lookup` took for an admission that
+        did not happen (its read locks)."""
+
+    def cancel_preadmission(self, seq: Any) -> None:
+        """Undo what `update_state_after_alloc` recorded for `seq` when the
+        scheduler refuses the admission before any dispatch and returns the
+        request to `waiting` (`Admit.REQUEUE`). The default records nothing
+        to undo; a connector that queues work at the notification (a P/D
+        consumer's receive, an offload tier's load) overrides it."""
 
     def abort_send(self, seq: Any) -> None:
         """Retire an unsent abort; streaming senders must wait for reader drain."""

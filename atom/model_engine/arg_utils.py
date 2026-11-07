@@ -168,6 +168,7 @@ class EngineArgs:
     torch_profiler_dir: str | None = None
     enable_dp_attention: bool = False
     dp_load_balance: str = DP_LB_DEFAULT
+    offload_prefetch: bool | None = None
     enable_tbo: str | None = None
     all2all_backend: str | None = None
     moe_backend: str = "standard"
@@ -410,7 +411,22 @@ class EngineArgs:
             "prompt-token load. 'least_tokens': route to the rank with "
             "the lowest combined in-flight token load (prompt tokens + "
             "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
+            "'prefix_spread': keep a request on the rank holding its prompt's "
+            "prefix unless that rank has a prefill backlog and another is "
+            "about to idle (ATOM_DP_PREFIX_IDLE_TOKENS); the moved request "
+            "loads its prefix from the offload tier. Needs prefix caching; "
+            "excludes ATOM_DP_SESSION_AFFINITY. "
             "Has no effect when data_parallel_size == 1.",
+        )
+        parser.add_argument(
+            "--offload-prefetch",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Start a waiting request's offload-tier KV load on any "
+            "scheduler tick once its tier lookup answers, instead of when "
+            "admission reaches it; it still prefills in its turn. Default: on "
+            "with --dp-load-balance prefix_spread when the KV connector answers "
+            "tier lookups asynchronously (lmcache_mp, not under multi).",
         )
         parser.add_argument(
             "--enable-tbo",

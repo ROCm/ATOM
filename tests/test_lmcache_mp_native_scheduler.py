@@ -2,7 +2,6 @@
 
 """Native-state MP admission and PAGE-image lifetime contracts."""
 
-from collections import deque
 from types import SimpleNamespace
 from weakref import WeakKeyDictionary
 
@@ -35,6 +34,19 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Replay, Sequence, SequenceStatus, SequenceType
 from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+
+
+def _shipped_tokens(req):
+    """The token ids a worker hands the transfer for `req` (a request's first
+    shipment carries its whole prefix: `token_shipping.WorkerTokens`)."""
+    import copy
+    from types import SimpleNamespace as _NS
+
+    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
+
+    meta = _NS(requests=[copy.copy(req)])
+    WorkerTokens().resolve(meta)
+    return meta.requests[0].token_ids
 
 
 @pytest.fixture(autouse=True)
@@ -202,7 +214,7 @@ def test_save_uses_ready_native_hash_and_never_copies_active_slot(monkeypatch):
     assert request.native_state.boundary_tokens == 16
     assert request.native_state.unit_ids == image.unit_ids
     assert request.native_state.destination_slot is None
-    assert request.token_ids == list(seq.token_ids[:16])
+    assert _shipped_tokens(request) == list(seq.token_ids[:16])
     assert request.save_spec.skip_leading_tokens == 0
     assert checkpoints.take_checkpoint_ops() == ((), ())
     checkpoints.clear_index()
@@ -238,7 +250,7 @@ def test_save_frontier_selects_existing_checkpoint_below_computed_tokens(monkeyp
     checkpoint(scheduler, checkpoints, seq, 8)
     scheduler.update_state_after_alloc(seq)
     [request] = scheduler.build_connector_meta().requests
-    assert len(request.token_ids) == 8
+    assert len(_shipped_tokens(request)) == 8
     assert request.native_state.boundary_tokens == 8
     assert scheduler._save_tracker["1"][1] == 8
 
@@ -461,7 +473,7 @@ def test_load_queries_safe_chunk_boundary_before_reserving_state(monkeypatch, pr
     assert request.native_state.destination_slot == seq.state_slot
     assert request.load_spec.lmcache_cached_tokens == expected
     assert request.load_spec.transfer_end_tokens is None
-    assert request.token_ids == list(seq.token_ids[:expected])
+    assert _shipped_tokens(request) == list(seq.token_ids[:expected])
     assert (
         scheduler.load_finished(LoadOperationId(seq.id, operation.generation + 1))
         is False
@@ -485,7 +497,7 @@ def test_aligned_hbm_hit_uses_incremental_native_restore(monkeypatch):
     [request] = scheduler.build_connector_meta().requests
     assert request.load_spec.hbm_cached_tokens == 8
     assert request.load_spec.lmcache_cached_tokens == 16
-    assert request.token_ids == list(seq.token_ids[:16])
+    assert _shipped_tokens(request) == list(seq.token_ids[:16])
     assert seq.offload_load_start_tokens == 8
     assert checkpoints.store.pool.num_free == 27
 
@@ -977,7 +989,8 @@ def _woken(engine, seq):
     engine._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_loading={request.load_operation})
     )
-    assert engine._resolve_waiting_remote_kv(seq, deque()) is False
+    engine._resolve_offload_load(seq)
+    assert engine._is_offload_prefill_resume(seq)
     assert seq.status == SequenceStatus.WAITING and seq.replays_hit
     assert seq.num_cached_tokens == 32
 
@@ -1039,3 +1052,113 @@ def test_engine_unaligned_hbm_hit_replays_without_a_load(monkeypatch):
     assert not seq.replay_kv_load
     assert seq.replay == Replay(12, True, (), 12 - _REPLAY)
     assert list(batch.num_cached_tokens) == [12 - _REPLAY]
+
+
+# -- offload prefetch on the native-state engine ----------------------------
+
+
+class _EarlyDelayer:
+    """A prefill delayer that holds until `allow` is set."""
+
+    is_local = False
+    max_queue_ms = None
+    kv_high_watermark = 0.9
+
+    def __init__(self):
+        self.rank_prefill_costs = []
+        self.allow = False
+
+    def protects_decode(self, running_decode_batch):
+        return False
+
+    def should_allow_prefill(self, **_):
+        from atom.model_engine.prefill_delayer import PrefillDecision
+
+        return PrefillDecision(allow=self.allow, prefillable_ranks=1)
+
+    def notify_prefill_executed(self): ...
+
+
+def _async_adapter(chunks, base=Adapter):
+    """`base` with the async-lookup surface over a fake server answering
+    `chunks` LMCache chunks: what the lookup client needs to answer a lookup
+    without blocking the scheduler."""
+    from test_lmcache_mp_async_lookup import _Adapter as AsyncAdapter
+    from test_lmcache_mp_async_lookup import _Client
+
+    class _Both(base):
+        lmcache_tokens_per_chunk = 8
+
+        def __init__(self, *args):
+            base.__init__(self, *args)
+            fake = AsyncAdapter(_Client(chunks=chunks))
+            self._client = fake._client
+            self._parallel = fake._parallel
+            self._pending_lookups = fake._pending_lookups
+            self._lookup_results = fake._lookup_results
+            self._create_key = fake._create_key
+
+    return _Both
+
+
+def _holding_engine(monkeypatch, adapter, **overrides):
+    engine, connector, _ = engine_scheduler(
+        monkeypatch, adapter=adapter, offload_prefetch=True, **overrides
+    )
+    # A 40-block pool: the default watermark would not fit one prompt.
+    engine._prefetch.max_kv_usage = 0.95
+    delayer = _EarlyDelayer()
+    engine.set_prefill_delayer(delayer)
+    return engine, connector, delayer
+
+
+def _until_parked(engine, seq, ticks=6):
+    for _ in range(ticks):
+        batch, scheduled = engine.schedule()
+        if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+            return batch, scheduled
+    raise AssertionError(f"never parked: skipped={engine._prefetch.skip_until}")
+
+
+def test_prefetch_page_only_replay_parks_on_a_hold_tick_and_prefills_on_fire(
+    monkeypatch,
+):
+    """PAGE-only + bounded replay (DeepSeek-V4): the KV-only load is submitted on
+    a HOLD tick the lookup answered on; the replayed prefill waits for a FIRE."""
+    adapter = _async_adapter(4, _ReachAdapter)(32)
+    engine, _, delayer = _holding_engine(
+        monkeypatch, adapter, state_replay_tokens=_REPLAY
+    )
+    bm = engine.block_manager
+    first = Sequence(list(range(16)) + [900] * 4, 4, has_per_req_cache=True)
+    assert bm.allocate(first, bm.can_allocate(first))
+    bm.hash_blocks(first, first.num_tokens)
+    bm.deallocate(first)
+    seq = Sequence(list(range(40)), 4, has_per_req_cache=True)
+    engine.add(seq)
+
+    batch, scheduled = _until_parked(engine, seq)
+
+    assert scheduled == {} and not delayer.allow  # a HOLD tick
+    assert seq.replays_hit and seq.replay_kv_load
+    assert seq.num_cached_tokens == 16
+    assert list(engine.waiting) == [seq]
+    [request] = batch.connector_meta_output.requests  # shipped with this tick
+    assert request.native_state.kv_only and not request.native_state.unit_ids
+    assert request.native_state.boundary_tokens == 32
+    assert seq.id in engine._prefetch.entries
+
+    engine._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_loading={request.load_operation})
+    )
+    batch, scheduled = engine.schedule()  # loaded, still HOLD: no prefill
+    assert scheduled == {}
+    assert seq.status == SequenceStatus.WAITING and seq.offload_loaded
+
+    delayer.allow = True
+    batch, scheduled = engine.schedule()
+    assert scheduled[seq.id] is seq
+    assert seq.replay == Replay(32, True, (), 32 - _REPLAY)
+    assert list(batch.num_cached_tokens) == [32 - _REPLAY]
+    assert engine._num_parked_remote_kv == 0
+    assert seq.id not in engine._prefetch.entries

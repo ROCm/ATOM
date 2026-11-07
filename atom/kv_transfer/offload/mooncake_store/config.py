@@ -19,6 +19,7 @@ from typing import Any, NamedTuple
 
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.mooncake_store.nic import parse_device_list
+from atom.utils.selector import Family, attn_family
 
 KEY_PREFIX = "mooncake_store."
 _MIB = 1 << 20
@@ -181,22 +182,29 @@ def parse_mooncake_store_config(
 
 
 def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> None:
-    """Refuse what phase 1 does not move: non-dense layouts, DCP, odd chunks.
+    """Require dense KV or V4.1 replay PAGEs, no DCP, and whole chunks.
 
     The Store holds one object per (rank, chunk) of the dense codec's opaque
-    block bytes. A hybrid, M3 or Kimi-K3 layout needs PAGE regions or a state
-    tier this connector does not carry, and a DCP rank's pages cover a virtual
-    block that the chunk keys do not name.
+    block bytes. V4.1 supplies PAGE regions and reconstructs request state by
+    replay; the worker checks that explicit contract before registering KV.
+    Other hybrid layouts need a state tier this connector does not carry. A
+    DCP rank's pages cover a virtual block that the chunk keys do not name.
 
     Raises:
-        ValueError: The model is not on the dense layout, DCP > 1, or the
-            chunk is not a whole number of KV blocks.
+        ValueError: The model is neither dense nor V4.1, DCP > 1, or the chunk
+            is not a whole number of KV blocks.
     """
     layout = offcfg.select_offload_layout(config)
-    if layout != "dense":
+    if layout != "dense" and not uses_replay_pages(config):
         raise ValueError(
-            f"the Mooncake Store offload moves only the dense KV layout; this "
+            f"the Mooncake Store offload requires dense KV or V4.1 bounded-replay PAGEs; this "
             f"model resolves to {layout!r}"
+        )
+    if uses_replay_pages(config) and not getattr(
+        config, "enable_encoder_swa_bounded_replay", False
+    ):
+        raise ValueError(
+            "Mooncake Store V4.1 requires enable_encoder_swa_bounded_replay"
         )
     dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
     if dcp > 1:
@@ -277,3 +285,8 @@ def _positive_seconds(name: str, value: Any) -> float:
     if not math.isfinite(seconds) or seconds <= 0:
         raise ValueError(f"{name} must be finite and > 0, got {value!r}")
     return seconds
+
+
+def uses_replay_pages(config: Any) -> bool:
+    """V4.1 restores PAGE bytes and rebuilds per-request state by replay."""
+    return attn_family(config.hf_config) == Family.CSA2

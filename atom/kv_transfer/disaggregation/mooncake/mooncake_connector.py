@@ -37,6 +37,7 @@ from atom.distributed.dcp_utils import get_dcp_group
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
+    cancel_queued_receive,
 )
 from atom.kv_transfer.disaggregation.chunked_prefill import (
     ChunkedPrefill,
@@ -577,6 +578,27 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self._reqs_need_recv.clear()
         self._reqs_need_save.clear()
         return meta
+
+    def cancel_preadmission(self, seq: Sequence) -> None:
+        """Undo what `update_state_after_alloc` recorded for an admission the
+        scheduler refused before dispatch (under `multi`, an offload sub's
+        state load): its blocks are freed, so nothing may run into them, and
+        the re-admission records it all again."""
+        cancel_queued_receive(self._reqs_need_recv, seq)
+        saving = self._reqs_need_save.get(seq.id)
+        if saving is not None and saving[0] is seq:
+            del self._reqs_need_save[seq.id]
+        if not (seq.kv_transfer_params or {}).get("chunked_transfer"):
+            return
+        if self.is_producer:
+            # A fresh admission is not yet awaiting a send (that claim makes a
+            # request unpreemptable, so it is never re-allocated). The alloc
+            # spent the readiness the D side's handshake reported, once: give
+            # it back, or the re-admission waits for one that never comes.
+            self._awaiting_send.discard(str(seq.id))
+            self._chunked_ready.add(seq.id)
+        elif self._chunked_receiving.get(seq.id) is seq:
+            del self._chunked_receiving[seq.id]
 
     def update_state_after_alloc(self, seq: Sequence) -> None:
         self._chunked_waiting.pop(seq.id, None)

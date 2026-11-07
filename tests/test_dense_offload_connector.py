@@ -85,6 +85,8 @@ def _arm_load(scheduler, seq, *, hbm=0, lmcache=8):
 
 def _engine_scheduler(connector):
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler._prefetch = None
+    scheduler._blocked_head = None
     scheduler.kv_connector = connector
     scheduler.finished_recving_kv_req_ids = []
     scheduler.failed_recving_kv_req_ids = []

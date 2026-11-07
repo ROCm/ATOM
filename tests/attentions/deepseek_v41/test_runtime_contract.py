@@ -125,10 +125,11 @@ def test_unimplemented_modes_fail_before_loading(override):
         validate_runtime_config(runtime_config(**override))
 
 
-def test_lmcache_mp_and_mooncake_are_the_kv_transfers_admitted():
-    validate_runtime_config(
-        runtime_config(kv_transfer_config={"kv_connector": "lmcache_mp"})
-    )
+def test_mp_store_and_mooncake_are_the_kv_transfers_admitted():
+    for connector in ("lmcache_mp", "mooncake_store"):
+        validate_runtime_config(
+            runtime_config(kv_transfer_config={"kv_connector": connector})
+        )
     for role in ("kv_producer", "kv_consumer"):
         validate_runtime_config(
             runtime_config(
@@ -142,7 +143,8 @@ def test_lmcache_mp_and_mooncake_are_the_kv_transfers_admitted():
         )
     for connector in ("lmcache_offload", "moriio", "multi"):
         with pytest.raises(
-            ValueError, match="KV transfer other than lmcache_mp or mooncake"
+            ValueError,
+            match="KV transfer other than lmcache_mp, mooncake or mooncake_store",
         ):
             validate_runtime_config(
                 runtime_config(kv_transfer_config={"kv_connector": connector})

@@ -206,6 +206,7 @@ The strategy is selected with `--dp-load-balance` (`Config.dp_load_balance`):
 | `round_robin` | none | Load-agnostic rotation (`cursor % n`). |
 | `least_requests` **(default)** | in-flight request count, then prompt-token load | `argmin((num_in_flight_reqs, in_flight_prompt_tokens))` — request count is primary; ties broken by the lighter prompt-token load, then the rotation cursor. |
 | `least_tokens` | combined token load per rank | `argmin(sum_prompt_tokens + ATOM_DP_LB_REQ_EQUIV * num_reqs)`. |
+| `prefix_spread` | prompt-prefix location, queued prefill per rank | Keep a request on the rank holding its prefix unless that rank has over `2 x ATOM_DP_PREFIX_IDLE_TOKENS` queued prefill and another has under `ATOM_DP_PREFIX_IDLE_TOKENS`; then move it there (it loads the prefix from the offload tier). New prefixes: `least_tokens`. See below. |
 
 `least_requests` (the default) keeps the number of in-flight requests even
 across ranks — the dominant lever for DP-lockstep efficiency (equal request
@@ -219,6 +220,15 @@ additionally weights by prompt-token load across *all* ranks, mirroring producti
 decode-slot pressure. It helps most with heterogeneous prompt lengths under
 moderate load; with uniform-length requests it degenerates to `least_requests`.
 All strategies break ties with a round-robin cursor.
+
+**`prefix_spread`.** The router remembers which ranks ran each prompt prefix (the frontend prompt block-hash chain, sampled every 4096 tokens) and keeps a request on its prefix's rank, unless another rank has under `ATOM_DP_PREFIX_IDLE_TOKENS` queued prefill and a free request slot (about to idle) while the prefix's rank has over twice that. Then the request goes to an idle rank, chosen by queued prefill -- with more than two ranks, among those within `ATOM_DP_PREFIX_IDLE_TOKENS / 2` of the least queued, the one holding the most of its prefix -- and loads the prefix from the offload tier. While both ranks have queued prefill a move adds no capacity under lockstep DP, so the request stays. New prefixes go to the lightest rank (`least_tokens` score). A request whose prefix source is still prefilling stays on the prefix's rank to reuse it from HBM unless that rank is backlogged and another is idle; then it moves and is charged all of its prompt the target does not hold, since the tier cannot supply that KV yet. If the source leaves before finishing its prefill, the parts it was computing are forgotten. Another rank's part of the prefix counts as a local hit only once its source finished prefilling it. A moved request is credited its prefix only if an offload tier shared by the DP ranks (`lmcache_mp`, `mooncake_store`; not the per-rank `lmcache_offload`) can load it (at least `OFFLOAD_MIN_LOAD_TOKENS`); otherwise only its local part. Needs `--enable_prefix_caching` and `ATOM_FRONTEND_PREFIX_HASH=1`, and excludes `ATOM_DP_SESSION_AFFINITY` (startup fails otherwise); bypasses the offline backpressure dispatch. Tuning: `ATOM_DP_PREFIX_IDLE_TOKENS` (default 32768).
+
+For V4.1, use the [native Mooncake Store recipe](../recipes/DeepSeek-V4.1-Prefix-Spread-Store.md)
+to recover shared PAGEs without LMCache MP. Local HBM hits remain local. The
+worker requires the backend's explicit PAGE/replay contract; this does not
+enable other hybrid models that require an independent state tier.
+
+**Offload prefetch** (`--offload-prefetch`, `Config.offload_prefetch`; default on with `prefix_spread` when the KV connector answers tier lookups asynchronously -- capable `lmcache_mp` adapters, resolved from the constructed connector; not under `multi`). Native Store has synchronous lookup and does not support this flag; its loads start at admission. Once a waiting request's tier lookup answers, it gets its blocks and starts its tier load on any scheduler tick, wherever it waits, while the KV pool stays under `Config.offload_prefetch_max_kv_usage` (0.8), and only when the tier holds at least `OFFLOAD_MIN_LOAD_TOKENS` past the HBM hit. This is the scheduler's admission run ahead of its turn; the prefill still waits for it, and an admission the connector turns into a local prefill is given back rather than held. A finished prefetch keeps its place in `waiting`, except that it moves up when admission last stopped for want of KV blocks or parked-load slots, which the prefetches hold and release only by running. With async lookup, a moved request can load its tier KV while it queues; without it, restoration starts at admission.
 
 When `ATOM_DP_SESSION_AFFINITY=1`, session routing adds a cache-locality layer
 above the configured fallback strategy. A new correlation/session ID is placed
@@ -257,9 +267,9 @@ drained and warns if it is invoked while requests are still charged.
 - `ParallelConfig.data_parallel_rank` (int, default `0`): This rank's DP index.
 - `ParallelConfig.data_parallel_rank_local` (int, default `None`): Local DP rank on this node.
 - `Config.dp_load_balance` (str, default `"least_requests"`): DP routing strategy.
-- CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens}`
+- CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens,prefix_spread}`; `--offload-prefetch` / `--no-offload-prefetch`
 - Env: `ATOM_DP_LB_REQ_EQUIV` (int, default `512`): token-equivalent cost of one in-flight request for `least_tokens`.
-- Env: `ATOM_DP_DISPATCH_DEPTH` (int, default `0`): per-rank in-flight cap for lazy dispatch of an offline batch (`LLMEngine.generate` / `generate_multimodal`). Online API admission is unchanged. While it is positive, that offline routing balances on in-flight request count and ignores `round_robin` and `least_tokens`; init warns when `dp_load_balance` is not `least_requests`. A failed send returns the requests to the pending pool. `abort_request` removes a request that has not been sent yet.
+- Env: `ATOM_DP_DISPATCH_DEPTH` (int, default `0`): per-rank in-flight cap for lazy dispatch of an offline batch (`LLMEngine.generate` / `generate_multimodal`). Online API admission is unchanged. While it is positive, that offline routing balances on in-flight request count and ignores `round_robin` and `least_tokens`; init warns when `dp_load_balance` is not `least_requests`. Under `prefix_spread` the depth is ignored (init warns). A failed send returns the requests to the pending pool. `abort_request` removes a request that has not been sent yet.
 - Env: `ATOM_DP_SESSION_AFFINITY` (bool, default `0`): load-place each new
   session once, then keep all later turns on its cache owner without spill.
 

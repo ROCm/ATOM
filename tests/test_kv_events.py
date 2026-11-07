@@ -437,6 +437,8 @@ class TestSchedulerRemoteStore:
             record_remote_store=lambda **kw: calls.append(kw),
         )
         sched = Scheduler.__new__(Scheduler)
+        sched._prefetch = None
+        sched._blocked_head = None
         sched.block_manager = bm
         sched.kv_connector = SimpleNamespace(is_offload=False)
         sched.finished_recving_kv_req_ids = []

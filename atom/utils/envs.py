@@ -222,6 +222,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and reads as 0. Keep it >= max_num_seqs; a smaller cap truncates every
     # rank's running batch. CoreManager warns when that happens.
     "ATOM_DP_DISPATCH_DEPTH": lambda: _nonnegative_int_env("ATOM_DP_DISPATCH_DEPTH", 0),
+    # `--dp-load-balance prefix_spread`: a rank with less queued prefill than
+    # this is about to idle and may take requests from a prefix's rank with
+    # over twice this queued. Must be positive; the default is two 16k prefill
+    # chunks.
+    "ATOM_DP_PREFIX_IDLE_TOKENS": lambda: _optional_int_env(
+        "ATOM_DP_PREFIX_IDLE_TOKENS", min_value=1
+    )
+    or 32768,
     # Place a new agent session on the lightest DP rank, then keep every later
     # request on that immutable cache owner. Existing sessions never spill;
     # child correlation ids are independently load-placed rather than
