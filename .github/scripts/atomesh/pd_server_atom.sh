@@ -1548,18 +1548,40 @@ stop_mooncake_store() {
   [[ -z "${mooncake_store_failed_rc}" ]]
 }
 
+# Prints the rank-rc-* of another node whose launcher exited non-zero
+# (pd_slurm_job.sh publishes one per node as it exits): the Store owners or
+# masters that node was to bring never come.
+mooncake_store_failed_peer() {
+  local f rc
+  for f in "${RUN_DIR}"/rank-rc-*; do
+    [[ -f "${f}" && "${f}" != *.tmp && "${f##*/}" != "rank-rc-${NODE_RANK}" ]] || continue
+    rc="$(cat "${f}" 2>/dev/null)"
+    if [[ -n "${rc}" && "${rc}" != "0" ]]; then
+      echo "${f##*/}=${rc}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Fails startup (stopping what it started) unless <condition> holds within
-# <timeout> seconds; a dying Store process fails it at once.
+# <timeout> seconds; a dying Store process, or another node's launcher
+# exiting non-zero, fails it at once.
 wait_for_mooncake_store() {
   local what="$1" timeout="$2"
   shift 2
   local deadline=$(( $(date +%s) + timeout ))
-  local log
+  local log peer
   until "$@"; do
     if ! reap_dead_mooncake_store; then
       echo "[wait][FAIL] mooncake-store ${what}: a Store process exited" >&2
       stop_mooncake_store || true
       exit "${mooncake_store_failed_rc}"
+    fi
+    if peer="$(mooncake_store_failed_peer)"; then
+      echo "[wait][FAIL] mooncake-store ${what}: another node's launcher exited (${peer})" >&2
+      stop_mooncake_store || true
+      exit 1
     fi
     for log in "${mooncake_store_logs[@]}"; do
       if grep -q -E "Failed to setup client|Failed to mount|Check failed|FATAL" "${log}" 2>/dev/null; then

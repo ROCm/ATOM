@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -841,6 +842,39 @@ stop_mooncake_store
             MOONCAKE_STORE_COMPACT_TIMEOUT="10",
         )
         self.assertEqual(len(self.store_calls("mooncake_client")), 2)
+        for pid in self.stub_pids():
+            self.assertFalse(self.alive(pid), pid)
+
+    def test_the_prefill_node_stops_waiting_once_the_decode_node_failed(self):
+        # The decode node's owners failed to mount and its launcher exited 1:
+        # the prefill node fails within seconds rather than at its 60 s wait,
+        # and a node that exited 0, or its own rank's file, does not stop it.
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-0").write_text("1\n")
+        (run_dir / "rank-rc-2").write_text("0\n")
+        started = time.monotonic()
+        result = self.run_shell(
+            """
+(
+  until [[ "$(wc -l < "${STUB_DIR}/segments" 2>/dev/null)" -ge 1 ]]; do
+    sleep 0.2
+  done
+  sleep 2
+  echo 1 > "${RUN_DIR}/rank-rc-1.tmp"
+  mv "${RUN_DIR}/rank-rc-1.tmp" "${RUN_DIR}/rank-rc-1"
+) >/dev/null 2>&1 &
+start_mooncake_store
+""",
+            expect_rc=1,
+            RUN_DIR=str(run_dir),
+            MOONCAKE_STORE_OWNERS="0:8",
+            MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1",
+            MOONCAKE_STORE_WAIT_TIMEOUT="30",
+            MOONCAKE_STORE_COMPACT_TIMEOUT="30",
+        )
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIn("another node's launcher exited (rank-rc-1=1)", result.stderr)
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 
