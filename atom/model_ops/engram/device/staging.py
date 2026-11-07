@@ -182,7 +182,17 @@ class EngramStaging:
                 live=step.live,
             )
 
+    # `lookup_served(width)`, or None: True on a step whose model looks the
+    # rows up itself (DeepSeek-V4.1's hi path): `start` only advances the
+    # cursor (no snapshot, no side stream) and `join` waits on nothing.
+    lookup_served = None
+    _served = False
+
     def start(self, width):
+        self._served = self.lookup_served is not None and self.lookup_served(width)
+        if self._served:
+            self._advance_cursor(width)
+            return
         host = self.host
         self._snapshot(width)
         compute = torch.cuda.current_stream(host.device)
@@ -237,6 +247,8 @@ class EngramStaging:
             host.buffers[layer].gpu[:width].copy_(out)
 
     def join(self):
+        if self._served:
+            return
         # Close the fork even if a partial forward did not consume every layer.
         torch.cuda.current_stream(self.host.device).wait_stream(self.stream)
 

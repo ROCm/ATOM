@@ -484,7 +484,20 @@ class PagedAttentionCache:
         thinks are both decided over the whole batch at once -- the per-request
         walk this replaced was 58 us of every decode step, spent branching on
         `span.position` one Python attribute at a time.
+
+        A device-round step (`step.device_round`: DeepSeek-V4.1's hi path
+        advanced its positions on the device, `mono/round/device_round.py`) is a
+        steady decode of the requests the previous step served: no slot
+        restarts and no probe (its start is the device's), only the tentative
+        state its verdict commits.
         """
+        if getattr(step, "device_round", False):
+            if histories:
+                raise RuntimeError("A device-round step on the host Engram path")
+            self.require_committed()
+            if step.tentative:
+                self.pending = TentativeState(self, step)
+            return None
         self.require_committed()
         self._judge_previous_probe()
         count = step.scheduled_bs

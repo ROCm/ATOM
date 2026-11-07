@@ -253,6 +253,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
     step_planners = ()
     _decoder_replays = False
+    # A decode round's host extension, or None (DeepSeek-V4.1's hi path sets
+    # one: `atom/models/deepseek_v41/mono/round/`). `lean_layout(...)`
+    # before a step's layout: True lays it out lean (no compress plans, no
+    # step planners: nothing its forward runs reads them); `laid_out(...)`
+    # after it; `committed(metadata)` before the speculative commit (True: the
+    # forward committed it already).
+    decode_round = None
 
     def add_step_planner(self, planner):
         """Have `planner` lay its per-step tables out of each step's staged rows
@@ -715,6 +722,17 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         cached_until, histories) for a resumed prefill, else all None;
         ``scheduled``, each span's batch index, is read with it."""
         resumes, floors, cached_until, histories = replay_layout
+        hook = self.decode_round
+        lean = hook is not None and hook.lean_layout(
+            batch,
+            spans,
+            running_bs,
+            running_tokens,
+            max_q_len=max_q_len,
+            tentative=tentative,
+            is_prefill=is_prefill,
+            resumes=resumes,
+        )
         offset = sum(span.length for span in spans)
         groups = getattr(self.model_runner, "h2d_groups", None)
         combined = None if groups is None else groups.get("v41_metadata")
@@ -739,15 +757,19 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # A prefill passes neither and gets the tight grid.
         # `extra_write`: CSA2's K_pool is 1 or 2, narrower than a verify step,
         # so without the slack the plan drops what a rejection re-exposes.
-        plans = self._build_compress_plans(
-            np.asarray([span.length for span in spans], dtype=np.int32),
-            np.asarray([span.end for span in spans], dtype=np.int32),
-            write_from=resumes,
-            running_bs=None if max_q_len is None else running_bs,
-            max_q_len=max_q_len,
-            # Idle ranks replay the same write grid as verifying peers.
-            extra_write=self.geometry.speculative_tokens if tentative else 0,
-            defer_to=combined,
+        plans = (
+            {}  # `begin_step` keeps `{}` (None would build private ones)
+            if lean
+            else self._build_compress_plans(
+                np.asarray([span.length for span in spans], dtype=np.int32),
+                np.asarray([span.end for span in spans], dtype=np.int32),
+                write_from=resumes,
+                running_bs=None if max_q_len is None else running_bs,
+                max_q_len=max_q_len,
+                # Idle ranks replay the same write grid as verifying peers.
+                extra_write=self.geometry.speculative_tokens if tentative else 0,
+                defer_to=combined,
+            )
         )
         token_mask = self._token_mask(batch, spans, offset)
         step_group = (
@@ -772,7 +794,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             max_q_len=max_q_len,
             state_slot_out=state_slot_out,
             plans=plans,
-            planners=self.step_planners,
+            planners=() if lean else self.step_planners,
             floors=floors,
             cached_until=cached_until,
             finals=(
@@ -808,6 +830,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 else ()
             ),
         )
+        if hook is not None:
+            hook.laid_out(
+                batch, spans, rows, running_bs, running_tokens, metadata, lean
+            )
         return metadata, step.positions
 
     def _publish_decoder(self, step, rows, cache, running_bs):
@@ -1316,6 +1342,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             cache.pending.staged_on_device = True
 
     def commit_speculative_state(self, metadata, last_token_indices):
+        if self.decode_round is not None and self.decode_round.committed(metadata):
+            return
         if metadata.cache.pending is not None:
             metadata.cache.commit_tentative(metadata.step, last_token_indices)
 

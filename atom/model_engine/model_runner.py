@@ -103,7 +103,7 @@ from atom.model_ops.eplb import (
     with_eplb_forward_monitor,
 )
 from atom.model_ops.indexer.schedule import skips_index_topk
-from atom.model_ops.rejection_sampler import RejectionSampler
+from atom.model_ops.rejection_sampler import RELAXED_TOP_N, RejectionSampler
 from atom.model_ops.required_channel import (
     DeviceChannel,
     advance_states,
@@ -536,7 +536,14 @@ class tokenIDProcessor:
         filling the ids need none of it, so they go first and run while the
         GPU still works; only what follows (the attention metadata, through
         `num_rejected`) reads the status.
+
+        A model's decode round (`ModelRunner._decode_round`) sees the batch
+        first, and may hand the status over itself (`spec_status`: its own
+        wait comes later, `after_forward`).
         """
+        decode_round = self.runner._decode_round()
+        if decode_round is not None:
+            decode_round.before_input_ids(batch, max_seqlen_q)
         bs = batch.total_seqs_num
         self.batch_info.np[:] = (
             bs,
@@ -552,7 +559,10 @@ class tokenIDProcessor:
         # whose deferred tokens the NEXT output-producing step will surface.
         # Draining it here would hand that step `num_rejected=None`.
         if batch.produces_output():
-            self.prev_rejected_num, self.prev_bonus_num = self.recv_spec_status()
+            status = None if decode_round is None else decode_round.spec_status()
+            self.prev_rejected_num, self.prev_bonus_num = (
+                self.recv_spec_status() if status is None else status
+            )
         if locs is not None:
             # Map the previous step's rejected/bonus counts onto this batch's
             # order (prev_idx -> curr_idx) for the carried-over sequences.
@@ -714,15 +724,21 @@ class tokenIDProcessor:
             )
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
-        fill_deferred_decode_ids(
+        fill_args = (
             self.input_ids.gpu,
             self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
             self.decode_src.gpu[:bs],
             self.prev_token_ids,
             self.draft_token_ids if self.pre_num_decode_token_per_seq > 1 else None,
-            max_tokens_per_seq=int(lens.max()) if bs else 1,
-            width=fill_to,
         )
+        fill_kw = dict(max_tokens_per_seq=int(lens.max()) if bs else 1, width=fill_to)
+        # A model's decode round may fill them itself (fused with its own
+        # pre-forward launches); else the fill kernel.
+        decode_round = self.runner._decode_round()
+        if decode_round is None or not decode_round.fill_decode_ids(
+            *fill_args, **fill_kw
+        ):
+            fill_deferred_decode_ids(*fill_args, **fill_kw)
 
         # Slice by the width this path actually staged. Prefill returned above,
         # so the decode total is the whole batch; a worker-side speculative q
@@ -995,6 +1011,8 @@ class ModelRunner:
                 getattr(self, "drafter", None),
                 metadata_builder=self.attn_metadata_builder,
             )
+            # the model hooks are the installed model's (`_model_hook`)
+            self.__dict__.pop("_model_hooks", None)
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
@@ -1679,6 +1697,9 @@ class ModelRunner:
             self._h2d_groups.append(groups)
         self.h2d_owner = self._h2d_owners[self._fv_idx]
         self.h2d_groups = self._h2d_groups[self._fv_idx]
+        decode_round = self._decode_round()
+        if decode_round is not None:
+            decode_round.publications_ready(self)
 
     def _advance_forward_vars(self):
         """Rotate to the next in-flight slot before any buffer is written.
@@ -1738,7 +1759,11 @@ class ModelRunner:
         direct copies and grouped publishers. Late V4 TBO preparation resumes
         this epoch and records the completion again after its uploads.
         Independent subsystem uploads retain their own completion protocols.
+        A model's decode round flushes what it recorded first.
         """
+        decode_round = self._decode_round()
+        if decode_round is not None:
+            decode_round.before_staging_mark()
         self.h2d_owner.finish()
 
     def _record_forward_vars_event(self):
@@ -3118,11 +3143,29 @@ class ModelRunner:
         input_ids: torch.Tensor,
         batch: ScheduledBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        out = self._run_model(input_ids, batch)
+        # after the target's launch: a model's decode round takes the wait it
+        # owes (`tokenIDProcessor.prepare_input_ids`)
+        decode_round = self._decode_round()
+        if decode_round is not None:
+            decode_round.after_forward(self.tokenID_processor)
+        return out
+
+    def _run_model(
+        self,
+        input_ids: torch.Tensor,
+        batch: ScheduledBatch | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         forward_context = get_forward_context()
         context = forward_context.context
         bs = context.scheduled_bs
         is_prefill = context.is_prefill
         positions = context.positions
+        # Set below when the model's own verify head served this verify
+        # (`_verify_head_ids`; DeepSeek-V4.1's hi hook): `postprocess`
+        # then reads its ids instead of logits. None for every other model.
+        self.verify_token_ids = None
+        self._verify_head_sampling(batch)
 
         # Dispatch is owned by ForwardMode.decide() (called in prepare_model).
         # Every run_model caller MUST go through prepare_inputs first, so
@@ -3319,7 +3362,15 @@ class ModelRunner:
                     # PP carries the full run between stages. Only the last
                     # stage returns scheduled rows to sampling/draft consumers.
                     hidden_states = model_output[: context.scheduled_tokens]
-                    logits = self.model.compute_logits(hidden_states)
+                    if not is_prefill:
+                        self.verify_token_ids = self._verify_head_ids(
+                            batch, hidden_states
+                        )
+                    logits = (
+                        None
+                        if self.verify_token_ids is not None
+                        else self.model.compute_logits(hidden_states)
+                    )
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
             # dummy_decode[...] — see build_run_label.
@@ -3359,9 +3410,151 @@ class ModelRunner:
                 if logits is not None:
                     logits = logits[:scheduled_tokens]
                 else:
-                    logits = self.model.compute_logits(hidden_states)
+                    self.verify_token_ids = self._verify_head_ids(
+                        batch, hidden_states, graph_key
+                    )
+                    logits = (
+                        None
+                        if self.verify_token_ids is not None
+                        else self.model.compute_logits(hidden_states)
+                    )
 
         return logits, hidden_states
+
+    # ---- a model-side verify head (DeepSeek-V4.1's hi hook, `ATOM_DSV41_MONO_HI`)
+    #
+    # A model whose forward runs its own LM head on a speculative verify step
+    # hands the runner each row's pick instead of logits: `verify_head_ids`
+    # (the ids, int32 [rows]), `samples_verify` / `set_verify_sampling` (the
+    # head draws a sampled row itself), `verify_head_forced` (forced
+    # acceptance), `verify_verdict` (the verdict in one launch) and
+    # `verify_ids_bcast` ("skip": every rank holds the same ids). A model
+    # without them takes the logits path, unchanged.
+
+    def _model_hook(self, name: str):
+        """The model's attribute ``name`` (a model-side hook), or None; looked
+        up once (the model is fixed once built)."""
+        hooks = self.__dict__.setdefault("_model_hooks", {})
+        if name not in hooks:
+            hooks[name] = getattr(self.model, name, None)
+        return hooks[name]
+
+    # ---- a model's decode round (DeepSeek-V4.1's hi hook): host work of the
+    # round it takes over, called by the runner where that work sits:
+    # `before_input_ids(batch, max_seqlen_q)` / `spec_status()` (None: the
+    # queue's) in `prepare_input_ids`, `fill_decode_ids(...)` (True: filled),
+    # `before_staging_mark()`, `after_forward(token_processor)` after the
+    # target's launch, `note_verdict((tokens, verdict))` after the rejection
+    # sampler, `publications_ready(runner)` after the H2D publications are set
+    # up. A model without one (the model's `decode_round` attribute) runs none.
+
+    def _decode_round(self):
+        """The model's decode round, or None."""
+        if getattr(self, "model", None) is None:
+            return None
+        return self._model_hook("decode_round")
+
+    def _verify_head_sampling(self, batch):
+        """Before the forward, for a model head that samples: an all-sampled
+        verify step's per-row (temperature, top_p), every other step's rows
+        greedy. Sets ``_head_sampled``: the head's ids are this step's samples.
+        Only a speculative verify where every request samples (T > 0) with
+        top-p alone (no top-k), without logprobs, fan-out noise or relaxed
+        acceptance; ATOM's verify of such a step is sample-and-match (one
+        independent sample a row, then the greedy match kernel), which the
+        head's per-row draws stand in for. Under forced acceptance, a head that
+        serves it ("sample", `_head_forced_mode`) draws the rows as above, the
+        schedule deciding only acceptance."""
+        self._head_sampled = False
+        if batch is None or not self._model_hook("samples_verify"):
+            return
+        if not batch.temperatures.any():
+            # all greedy: the head's rows are greedy already unless a sampled
+            # step set them (host work on every greedy step is on the critical
+            # path: kept to this test)
+            if self.__dict__.get("_head_rows_sampling", False):
+                self._model_hook("set_verify_sampling")(None, None)
+                self._head_rows_sampling = False
+            return
+        noise = getattr(batch, "needs_independent_noise", None)
+        sampled = (
+            get_forward_context().spec_decode_metadata is not None
+            and bool((batch.temperatures > SAMPLER_EPS).all())
+            and bool((batch.top_ks == -1).all())
+            and not batch.any_logprobs
+            and not (noise is not None and bool(noise.any()))
+            and RELAXED_TOP_N <= 1
+            and getattr(self, "rejection_sampler", None) is not None
+            and (
+                self.rejection_sampler.synthetic_acceptance_rates is None
+                or self._head_forced_mode() == "sample"
+            )
+        )
+        if sampled:
+            rows = batch.num_scheduled_tokens
+            temps = np.repeat(batch.temperatures, rows)
+            top_ps = np.repeat(batch.top_ps, rows)
+            self._head_sampled = bool(
+                self._model_hook("set_verify_sampling")(temps, top_ps)
+            )
+            self._head_rows_sampling = self._head_sampled
+        elif self.__dict__.get("_head_rows_sampling", False):
+            self._model_hook("set_verify_sampling")(None, None)
+            self._head_rows_sampling = False
+
+    def _head_forced_mode(self) -> str:
+        """How the model's verify head serves forced acceptance
+        (``--spec-decode-acceptance-length``): "" (off, or no forced
+        acceptance: such a run takes the logits path) or "sample" (the head's
+        ids are what it serves anyway, per-row draws for sampled requests; the
+        schedule decides acceptance and a rejection emits the row's draw)."""
+        sampler = getattr(self, "rejection_sampler", None)
+        if sampler is None or sampler.synthetic_acceptance_rates is None:
+            return ""
+        return self._model_hook("verify_head_forced") or ""
+
+    def _verify_head_ids(self, batch, hidden_states, graph_key=None):
+        """This verify's ids from a head inside the model's forward, or None:
+        the logits path. Only when the model offers them and the step reads
+        nothing but each row's pick: a speculative verify, every request greedy
+        (or, with a head that samples, an all-sampled verify the head drew:
+        `_verify_head_sampling`), exact acceptance or forced acceptance with a
+        head that serves it (`_head_forced_mode`: the synthetic kernel reads
+        one id a row); no logprobs, structured output, required tool channel,
+        relaxed acceptance or context parallelism (each reads the logits). A
+        replayed graph's ids are the buffer its capture recorded
+        (`graph_head_ids`); an eager step asks the model."""
+        head = self._model_hook("verify_head_ids")
+        if head is None or batch is None:
+            return None
+        spec = get_forward_context().spec_decode_metadata
+        sampler = getattr(self, "rejection_sampler", None)
+        if sampler is None or sampler.synthetic_acceptance_rates is None:
+            served = (batch.temperatures == 0).all() or self._head_sampled
+        else:
+            mode = self._head_forced_mode()
+            served = mode != "" and (
+                (batch.temperatures == 0).all()
+                or (mode == "sample" and self._head_sampled)
+            )
+        if (
+            spec is None
+            or not served
+            or batch.any_logprobs
+            or getattr(batch, "structured_requests", None)
+            or getattr(batch, "required_channel", None) is not None
+            or RELAXED_TOP_N > 1
+            or sampler is None
+            or get_pcp_world_size() > 1
+        ):
+            return None
+        if graph_key is not None:
+            ids = getattr(self, "graph_head_ids", {}).get(graph_key)
+        else:
+            ids = head(hidden_states)
+        if ids is None or ids.shape[0] < hidden_states.shape[0]:
+            return None
+        return ids[: hidden_states.shape[0]]
 
     def flush_pp_send(self) -> bool:
         """Flush pending PP isend. Returns True for call_func wait_out."""
@@ -3447,6 +3640,12 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        # The ids of a verify the model's own head served (`_verify_head_ids`),
+        # in place of the logits; and each request's next id, from its verdict.
+        head_ids = getattr(self, "verify_token_ids", None)
+        if spec_decode_metadata is None:
+            head_ids = None
+        next_ids = None
         # Keep probability payloads available on every participating rank.
         need_logprobs = batch.any_logprobs
         logprob_snapshot = None
@@ -3505,6 +3704,17 @@ class ModelRunner:
             # No drafts scored -> no verdict; the drafter anchors on each
             # segment's last row.
             anchors = None
+        elif head_ids is not None:
+            # The model's own verify head picked every row (`_verify_head_ids`):
+            # its verdict -- the selects, the rejection kernel and each
+            # request's next id -- in one launch (`verify_verdict`).
+            channel = None
+            sampled_tokens, verdict, next_ids = self._model_hook("verify_verdict")(
+                spec_decode_metadata, head_ids, self.rejection_sampler
+            )
+            num_bonus_tokens, num_reject_tokens, anchors = verdict
+            next_token_locs = num_bonus_tokens
+            spec_counts = verdict[:2]
         else:
             assert logits is not None
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
@@ -3540,6 +3750,9 @@ class ModelRunner:
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
             )
+            decode_round = self._decode_round()
+            if decode_round is not None:
+                decode_round.note_verdict((sampled_tokens, verdict))
             # PCP ranks decode redundantly but not bit-identically, so their
             # accept counts can differ: take rank 0's verdict. Ids are synced
             # below, outside this branch.
@@ -3559,9 +3772,17 @@ class ModelRunner:
             )
 
         # Drafter input must agree across TP ranks. Ids only: the verdict is
-        # deterministic on TP ranks' bit-identical inputs.
-        if get_tp_group().world_size > 1 and _needs_id_sync(
-            self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
+        # deterministic on TP ranks' bit-identical inputs. A step the model's
+        # verify head served has the same ids on every rank by construction:
+        # such a model may skip the broadcast (`verify_ids_bcast`).
+        if (
+            get_tp_group().world_size > 1
+            and _needs_id_sync(
+                self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
+            )
+            and not (
+                head_ids is not None and self._model_hook("verify_ids_bcast") == "skip"
+            )
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
@@ -3611,9 +3832,13 @@ class ModelRunner:
                 self.tokenID_processor.spec_status_queue.send(
                     spec_counts, ready=self.forward_done_event
                 )
-                next_token_ids = torch.gather(
-                    sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
-                ).view(bs)
+                next_token_ids = (
+                    next_ids
+                    if next_ids is not None
+                    else torch.gather(
+                        sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
+                    ).view(bs)
+                )
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
@@ -4237,6 +4462,9 @@ class ModelRunner:
         # (`ForwardMode.decide`). Token graphs have no such recording: under
         # TR_HYBRID a split decode runs eagerly.
         self.req_graph = ReqGraph()
+        # A model-side verify head's ids buffer per request bucket, where its
+        # recorded forward ran the head (`_verify_head_ids`).
+        self.graph_head_ids: dict = {}
         self.tbo_decode_graphs = self.config.enable_tbo_decode and not tr_hybrid
         if self.config.enable_tbo_decode and tr_hybrid and self.rank == 0:
             logger.warning(
@@ -4431,6 +4659,11 @@ class ModelRunner:
                         self.req_graph.record(
                             full_forward, key=request_bucket(bs, max_q_len)
                         )
+                    # the model's own verify head, when the recorded forward
+                    # ran it: its persistent ids buffer (`_verify_head_ids`)
+                    head = self._model_hook("verify_head_ids")
+                    if head is not None:
+                        self.graph_head_ids[request_bucket(bs, max_q_len)] = head()
                     torch.cuda.synchronize()
                     # After the sync: the warmup forward's kernels must have
                     # completed before the window closes, or they spill into the
@@ -4460,6 +4693,11 @@ class ModelRunner:
                     end_draft_trace if prof is not None else None,
                 )
             self._record_prefill_graphs()
+        head_keys = sorted(
+            k for k, ids in self.graph_head_ids.items() if ids is not None
+        )
+        if head_keys:
+            logger.info("verify ids from the model's own head in graphs %s", head_keys)
         self.capture_sizes.sort()
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
 

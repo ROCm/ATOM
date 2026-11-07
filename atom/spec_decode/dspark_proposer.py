@@ -47,6 +47,12 @@ class DSparkProposer(Drafter):
     driven by a confidence schedule (variable-length, Level B) verification.
     """
 
+    # `anchors_staged(running_bs)`, or None: True when the target's forward
+    # already wrote this step's anchors into the block's fixed inputs
+    # (DeepSeek-V4.1's hi path, inside its graph), so `_stage_anchors` writes
+    # none.
+    anchors_staged = None
+
     def __init__(self, atom_config, device: torch.device, runner):
         super().__init__(atom_config, device, runner)
         # Confidence-scheduled verification (Level B, variable-length verify) is
@@ -171,6 +177,10 @@ class DSparkProposer(Drafter):
         block's fixed inputs at the padded batch, so `stage` copies nothing."""
         ids = self.block.buffer("anchor_ids", running_bs)
         anchor_positions = self.block.buffer("anchor_positions", running_bs)
+        if self.anchors_staged is not None and self.anchors_staged(running_bs):
+            return self.block.stage(
+                running_bs, {"anchor_ids": ids, "anchor_positions": anchor_positions}
+            )
         scheduled_bs = next_token_ids.shape[0]
         vocab_max = int(self.model.vocab_size) - 1
         if ids.is_cuda:
@@ -626,6 +636,14 @@ class DSparkProposer(Drafter):
         `next_token_ids` is unused: DSpark drafts from aux hidden states.
         """
         del next_token_ids
+        # A draft model that wrote this forward's rows itself (DeepSeek-V4.1's
+        # hi hook, `ATOM_DSV41_MONO_HI`) skips the taps' concat and the
+        # write. Looked up on the class: no other draft model has it.
+        if (
+            getattr(type(self.model), "context_kv_served", None) is not None
+            and self.model.context_kv_served()
+        ):
+            return
         aux_hidden_states = self.aux_for(hidden_states)
         if aux_hidden_states is None:
             return

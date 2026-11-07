@@ -229,3 +229,71 @@ def test_direct_member_preserves_an_in_flight_packed_arena():
     assert [value.cpu().tolist() for value in observed] == [
         [11 + i] * 8 for i in range(5)
     ]
+
+
+def test_packed_scatter_reads_the_host_arena():
+    # The scatter reads the pinned arena itself (`read_host_arena`, DeepSeek-V4.1's
+    # hi hook); reuse waits on the owner's event exactly as with the copy
+    # (the delay keeps every launch queued).
+    owner, a, b, _, _, group = setup("cuda", shape=(1031,))
+    assert group.use_transport("packed") == "packed"
+    owner.begin()
+    group.publish((1031, 1031))  # Compile before reading the arena.
+    owner.finish()
+    group._backend.read_host_arena()
+    observations = []
+    for step, counts in enumerate(((1031, 1031), (5, 1031), (1031, None), (1, 2))):
+        owner.begin()
+        a.cpu.fill_(step + 11)
+        b.cpu.fill_(step + 21)
+        torch.cuda._sleep(3_000_000)
+        group.publish(counts)
+        observations.append((counts, a.gpu.clone(), b.gpu.clone()))
+        owner.finish()
+    owner.completion.synchronize()
+    for step, (counts, first, second) in enumerate(observations):
+        for count, got, value in zip(counts, (first, second), (step + 11, step + 21)):
+            assert count is None or torch.all(got[:count].cpu() == value)
+
+
+class _Recorder:
+    """A `PackedCopy.defer` recorder that takes every scatter while armed."""
+
+    armed = True
+
+    def __init__(self):
+        self.taken = []
+
+    def take(self, copy, arena, largest):
+        self.taken.append((arena, largest))
+        return True
+
+
+def test_a_deferred_scatter_is_not_launched():
+    # A recorder takes the scatter (DeepSeek-V4.1's hi prologue launches it
+    # later); disarmed, the publication launches as before.
+    owner, a, b, _, _, group = setup("cuda", shape=(1031,))
+    assert group.use_transport("packed") == "packed"
+    owner.begin()
+    group.publish((1031, 1031))
+    owner.finish()
+    owner.completion.synchronize()
+    recorder = _Recorder()
+    group._backend.defer = recorder
+    owner.begin()
+    a.cpu.fill_(5)
+    b.cpu.fill_(6)
+    before = a.gpu.clone()
+    group.publish((1031, 1031))
+    owner.finish()
+    owner.completion.synchronize()
+    assert (
+        len(recorder.taken) == 1 and recorder.taken[0][1] == 1031 * a.cpu.element_size()
+    )
+    assert torch.equal(a.gpu, before)  # not scattered
+    recorder.armed = False
+    owner.begin()
+    group.publish((1031, 1031))
+    owner.finish()
+    owner.completion.synchronize()
+    assert torch.all(a.gpu.cpu() == 5) and torch.all(b.gpu.cpu() == 6)
