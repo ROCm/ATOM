@@ -4,7 +4,7 @@
 import logging
 
 import pytest
-from conftest import MockConfig
+from conftest import MockConfig, kv_blocks
 
 from atom.model_engine import block_manager as bm_module
 from atom.model_engine.block_manager import BlockManager
@@ -42,7 +42,7 @@ class TestCanAllocate:
         assert block_manager.can_allocate(seq) >= 0
 
     def test_cannot_allocate_when_full(self, seq_factory):
-        cfg = MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4)
+        cfg = MockConfig(num_kvcache_blocks=kv_blocks(1), kv_cache_block_size=4)
         bm = BlockManager(cfg)
         s1 = seq_factory([1, 2, 3, 4])
         bm.allocate(s1)
@@ -181,7 +181,7 @@ class TestDisownClaimedPrefix:
         # fewer than the 4 private copies the disown needs, so it must refuse
         # rather than silently reuse the shared blocks.
         bm, _holder, seq, shared = self._shared_prefix(
-            seq_factory, num_kvcache_blocks=6
+            seq_factory, num_kvcache_blocks=kv_blocks(6)
         )
         assert bm.kv.has_free(4) is False
 
@@ -227,9 +227,10 @@ class TestAllocateDeallocate:
     def test_deallocate_restores_capacity(self, block_manager, seq_factory):
         s1 = seq_factory([1, 2, 3, 4])
         block_manager.allocate(s1)
-        # Fill remaining capacity
+        # Fill remaining capacity (block 0 may be the null page: count, do
+        # not assume 9 of the default 10).
         others = []
-        for i in range(9):
+        for i in range(block_manager.kv.num_free):
             s = seq_factory([10 + i * 4, 11 + i * 4, 12 + i * 4, 13 + i * 4])
             block_manager.allocate(s)
             others.append(s)
@@ -494,7 +495,7 @@ class TestCanAppend:
         assert block_manager.can_append(seq)
 
     def test_cannot_append_no_free(self, seq_factory):
-        cfg = MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4)
+        cfg = MockConfig(num_kvcache_blocks=kv_blocks(1), kv_cache_block_size=4)
         bm = BlockManager(cfg)
         seq = seq_factory([1, 2, 3, 4])
         bm.allocate(seq)
@@ -536,7 +537,9 @@ class TestCanAllocateWithPrefixCaching:
         cache-hit-on-free-pool block to the free-block budget, because the
         cached block still has to be claimed off the free list."""
         cfg = MockConfig(
-            num_kvcache_blocks=4, kv_cache_block_size=4, enable_prefix_caching=True
+            num_kvcache_blocks=kv_blocks(4),
+            kv_cache_block_size=4,
+            enable_prefix_caching=True,
         )
         bm = BlockManager(cfg)
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
@@ -558,7 +561,9 @@ class TestCanAllocateWithPrefixCaching:
         """can_allocate should return False when even with cache hits
         there aren't enough free blocks."""
         cfg = MockConfig(
-            num_kvcache_blocks=2, kv_cache_block_size=4, enable_prefix_caching=True
+            num_kvcache_blocks=kv_blocks(2),
+            kv_cache_block_size=4,
+            enable_prefix_caching=True,
         )
         bm = BlockManager(cfg)
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
@@ -576,7 +581,9 @@ class TestHashTableCleanup:
         """When a cached block is reused for a different hash, the old
         content-hash entry should be cleaned up."""
         cfg = MockConfig(
-            num_kvcache_blocks=2, kv_cache_block_size=4, enable_prefix_caching=True
+            num_kvcache_blocks=kv_blocks(2),
+            kv_cache_block_size=4,
+            enable_prefix_caching=True,
         )
         bm = BlockManager(cfg)
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
@@ -623,7 +630,7 @@ class TestCanAppendMultiToken:
     def test_can_append_multi_token_crossing_boundary(self, seq_factory):
         """block_size=4, seq_len=14 (3.5 blocks=4 blocks allocated),
         appending 5 tokens crosses into block 5 — needs 1 new block."""
-        cfg = MockConfig(num_kvcache_blocks=6, kv_cache_block_size=4)
+        cfg = MockConfig(num_kvcache_blocks=kv_blocks(6), kv_cache_block_size=4)
         bm = BlockManager(cfg)
         seq = seq_factory(list(range(14)))
         bm.allocate(seq)
@@ -635,7 +642,7 @@ class TestCanAppendMultiToken:
     def test_cannot_append_multi_token_no_free(self, seq_factory):
         """block_size=4, 4 blocks total, seq fills 4 blocks (16 tokens),
         appending 5 tokens needs 2 new blocks but only 0 free."""
-        cfg = MockConfig(num_kvcache_blocks=4, kv_cache_block_size=4)
+        cfg = MockConfig(num_kvcache_blocks=kv_blocks(4), kv_cache_block_size=4)
         bm = BlockManager(cfg)
         seq = seq_factory(list(range(14)))
         bm.allocate(seq)

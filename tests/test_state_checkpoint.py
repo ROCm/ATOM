@@ -17,7 +17,7 @@ from math import inf, isinf
 from types import SimpleNamespace
 
 import pytest
-from conftest import MockConfig
+from conftest import MockConfig, kv_blocks
 
 from atom.model_engine.block_manager import AdmissionProbe, BlockManager
 from atom.model_engine.block_pool import BlockPool
@@ -3924,7 +3924,9 @@ class TestTheCacheCannotStarveLiveKv:
         cache can put the pool in.
         """
         bm = make_block_manager(
-            paged_copy_config(num_kvcache_blocks=3, state_checkpoint_interval_tokens=0),
+            paged_copy_config(
+                num_kvcache_blocks=kv_blocks(3), state_checkpoint_interval_tokens=0
+            ),
             state_runtime=PAGED_COPY_RUNTIME,
         )
         checkpoints = bm.paged_state_checkpoints
@@ -3988,7 +3990,9 @@ class TestTheCacheCannotStarveLiveKv:
         possible once the pinned image becomes spendable again.
         """
         scheduler = make_scheduler(
-            paged_copy_config(num_kvcache_blocks=3, state_checkpoint_interval_tokens=0),
+            paged_copy_config(
+                num_kvcache_blocks=kv_blocks(3), state_checkpoint_interval_tokens=0
+            ),
             state_runtime=PAGED_COPY_RUNTIME,
         )
         # The same pinned pool as the tests above, built inside a scheduler,

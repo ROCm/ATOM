@@ -558,7 +558,10 @@ def test_real_scheduler_pins_from_first_chunk_through_final_handoff(
         ]
         assert sum(sizes) == 12
         assert worker.transfer_engine.writes.empty()
-        assert bytes(destinations[worker.pp_rank][8:12]) == bytes(src[:4])
+        first = 4 * seq.block_table[0]  # block 0 is the null page when on
+        assert bytes(destinations[worker.pp_rank][8:12]) == bytes(
+            src[first : first + 4]
+        )
         sched._update_from_kv_xfer_finished(
             pp.ingest(worker.pp_rank, worker.get_finished())
         )
@@ -1371,12 +1374,12 @@ def test_opposite_admission_order_progresses_without_recompute(
     monkeypatch, seq_factory
 ):
     import msgpack
-    from conftest import MockConfig
+    from conftest import MockConfig, kv_blocks
 
     from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 
-    p = Scheduler(MockConfig(num_kvcache_blocks=3, max_num_batched_tokens=4))
-    d = Scheduler(MockConfig(num_kvcache_blocks=3, max_num_batched_tokens=4))
+    p = Scheduler(MockConfig(num_kvcache_blocks=kv_blocks(3), max_num_batched_tokens=4))
+    d = Scheduler(MockConfig(num_kvcache_blocks=kv_blocks(3), max_num_batched_tokens=4))
     p.kv_connector = scheduler_connector(monkeypatch, True)
     d.kv_connector = scheduler_connector(monkeypatch, False)
     pa, pb = [pd_sequence(seq_factory, name) for name in ("xfer-a", "xfer-b")]
@@ -1527,11 +1530,11 @@ def test_admission_requires_all_tp_dcp_and_pp_ranks(monkeypatch, seq_factory, ea
 def test_capacity_wait_does_not_expire_ready_or_queued_requests(
     monkeypatch, seq_factory
 ):
-    from conftest import MockConfig
+    from conftest import MockConfig, kv_blocks
 
     from atom.model_engine.scheduler import Scheduler
 
-    p = Scheduler(MockConfig(num_kvcache_blocks=3))
+    p = Scheduler(MockConfig(num_kvcache_blocks=kv_blocks(3)))
     p.kv_connector = scheduler_connector(monkeypatch, True)
     occupied = seq_factory(list(range(10)))
     assert p.block_manager.allocate(occupied)
@@ -1647,14 +1650,14 @@ def test_reusing_live_transfer_id_cannot_cancel_original(monkeypatch, seq_factor
 def test_d_transfer_failure_waits_for_write_hold_before_abort(
     monkeypatch, seq_factory, cancelled
 ):
-    from conftest import MockConfig
+    from conftest import MockConfig, kv_blocks
 
     from atom.model_engine.scheduler import Scheduler
 
     monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "30")
     now = [mc.time.monotonic()]
     monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
-    d = Scheduler(MockConfig(num_kvcache_blocks=3))
+    d = Scheduler(MockConfig(num_kvcache_blocks=kv_blocks(3)))
     d.kv_connector = scheduler_connector(monkeypatch, False)
     seq = pd_sequence(seq_factory, producer=False)
     d.add(seq)
@@ -1713,14 +1716,14 @@ def test_legacy_requests_bypass_admission_gate(monkeypatch, seq_factory, produce
 def test_d_reserves_full_prompt_without_max_new_tokens(
     monkeypatch, seq_factory, dcp_size
 ):
-    from conftest import MockConfig
+    from conftest import MockConfig, kv_blocks
 
     from atom.model_engine.scheduler import Scheduler
 
     blocks = (10 + 4 * dcp_size - 1) // (4 * dcp_size)
     d = Scheduler(
         MockConfig(
-            num_kvcache_blocks=blocks,
+            num_kvcache_blocks=kv_blocks(blocks),
             max_num_batched_tokens=4,
             decode_context_parallel_size=dcp_size,
         )
@@ -1979,15 +1982,17 @@ def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
     monkeypatch, seq_factory, pp_size, cancel_decode
 ):
     import msgpack
-    from conftest import MockConfig
+    from conftest import MockConfig, kv_blocks
 
     from atom.model_engine.scheduler import Scheduler
 
     monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "30")
     now = [100.0]
     monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
-    p = Scheduler(MockConfig(num_kvcache_blocks=3, pipeline_parallel_size=pp_size))
-    d = Scheduler(MockConfig(num_kvcache_blocks=3))
+    p = Scheduler(
+        MockConfig(num_kvcache_blocks=kv_blocks(3), pipeline_parallel_size=pp_size)
+    )
+    d = Scheduler(MockConfig(num_kvcache_blocks=kv_blocks(3)))
     p.kv_connector = scheduler_connector(
         monkeypatch, True, pp_size, admission_timeout_s=10
     )

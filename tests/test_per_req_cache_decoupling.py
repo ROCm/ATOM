@@ -12,7 +12,7 @@
 # -1 on failure (no free slot, or not enough KV blocks).
 
 
-from conftest import MockConfig
+from conftest import MockConfig, kv_blocks
 
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import ScheduledBatch, Scheduler
@@ -166,7 +166,9 @@ class TestBlockManagerPerReqCacheSlots:
         only pays for its OWN KV blocks (no equiv penalty), and slot capacity
         is unaffected by how many paged blocks plain seqs consume."""
         bm = BlockManager(
-            per_req_cache_config(num_kvcache_blocks=20, pool_entries={"state": 8})
+            per_req_cache_config(
+                num_kvcache_blocks=kv_blocks(20), pool_entries={"state": 8}
+            )
         )
         # A long plain sequence (16 tokens → 4 KV blocks) consumes KV only.
         long_seq = plain_seq(list(range(16)))

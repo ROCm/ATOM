@@ -31,9 +31,37 @@ from atom.kv_transfer.disaggregation.types import (
     SaveCompletionId,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.model_engine.state_runtime import pending_unit_zero
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+
+def pending_zero_fence():
+    """The event loads of this step must wait on, or None.
+
+    ATOM_ZERO_EVICTED_BLOCKS: released checkpoint units are zeroed on the
+    runner's compute stream -- right before this dispatch
+    (`EngineCore._zero_released_units_before_loads`) or by an earlier batch's
+    `build()` the GPU may not have reached yet. Loads here write from a
+    transfer thread on their own streams, so a zero still in flight could land
+    after the restored bytes and erase them. Each zero records an event when it
+    is enqueued (`UnitZeroer.launch`); this returns the last one only while
+    the GPU has not finished it. No zero pending (switch off, a layout without
+    a zero kernel, or the zero already done) means no fence and no wait.
+    """
+    return pending_unit_zero()
+
+
+def wait_load_fence(fence) -> None:
+    """Block the calling transfer thread until `pending_zero_fence`'s zero is done.
+
+    Run before the load enqueues any write.
+    """
+    if fence is not None:
+        fence.synchronize()
+
+
 _VALID_KV_ROLES = {"offload", "kv_both", "kv_producer", "kv_consumer"}
 
 

@@ -10,7 +10,7 @@ from unittest import mock
 
 import numpy as np
 import pytest
-from conftest import MockConfig
+from conftest import MockConfig, kv_blocks
 
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
@@ -860,7 +860,9 @@ class TestSchedule:
         assert seq not in sched.waiting
 
     def test_prefill_respects_block_availability(self, seq_factory):
-        sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
+        sched = Scheduler(
+            MockConfig(num_kvcache_blocks=kv_blocks(1), kv_cache_block_size=4)
+        )
         sched.add(seq_factory([1, 2, 3, 4]))  # 1 block
         sched.add(seq_factory([5, 6, 7, 8, 9]))  # 2 blocks → no room
         batch, _ = sched.schedule()
@@ -876,7 +878,9 @@ class TestSchedule:
         assert batch.total_seqs_num_decode == 1
 
     def test_decode_preemption(self, seq_factory):
-        sched = Scheduler(MockConfig(num_kvcache_blocks=2, kv_cache_block_size=4))
+        sched = Scheduler(
+            MockConfig(num_kvcache_blocks=kv_blocks(2), kv_cache_block_size=4)
+        )
         s1 = seq_factory([1, 2, 3, 4])
         s2 = seq_factory([5, 6, 7, 8])
         sched.add(s1)
@@ -892,7 +896,9 @@ class TestSchedule:
         assert SequenceStatus.WAITING in statuses
 
     def test_decode_preemption_skips_save_pinned_victim(self, seq_factory):
-        sched = Scheduler(MockConfig(num_kvcache_blocks=2, kv_cache_block_size=4))
+        sched = Scheduler(
+            MockConfig(num_kvcache_blocks=kv_blocks(2), kv_cache_block_size=4)
+        )
         current = seq_factory([1, 2, 3, 4])
         pinned_victim = seq_factory([5, 6, 7, 8])
         sched.add(current)
@@ -934,7 +940,9 @@ class TestSchedule:
     def test_decode_preemption_stalls_pinned_current_until_save_terminal(
         self, seq_factory
     ):
-        sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
+        sched = Scheduler(
+            MockConfig(num_kvcache_blocks=kv_blocks(1), kv_cache_block_size=4)
+        )
         pinned = seq_factory([1, 2, 3, 4])
         sched.add(pinned)
         sched.schedule()

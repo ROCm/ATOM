@@ -320,6 +320,30 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
             "implement state_entry_views"
         )
 
+    def zeroes_page_units(self) -> bool:
+        """Whether this builder has a PAGE unit zero: it overrides
+        `zero_page_units`. The capability the scheduler's released-unit scrub
+        keys on, so it follows the kernel rather than a layout name."""
+        return (
+            type(self).zero_page_units is not AttentionMetadataBuilder.zero_page_units
+        )
+
+    def zero_page_units(self, unit_ids: Sequence[int]) -> None:
+        """Zero every published byte of these PAGE ids, on the current stream.
+
+        The ids are raw units a released state checkpoint held
+        (`StateMaintenanceOps.zero_units`). The scheduler queues them only
+        when `zeroes_page_units()` (published as
+        `StateRuntime.zeroes_released_units`), i.e. when a builder overrides
+        this; ids reaching the default are a wiring error, not something to
+        drop silently.
+        """
+        if len(unit_ids):
+            raise NotImplementedError(
+                f"{type(self).__name__} has no PAGE unit zero, but the "
+                f"scheduler queued {len(unit_ids)} released units for it"
+            )
+
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Move live state between contiguous Active Slots."""
         raise NotImplementedError(
@@ -1032,6 +1056,11 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         self._ubatch_split_bs = ubatch_split_bs
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
+        # First: the ids were freed before this batch was built, and anything
+        # below -- a checkpoint store into a reused unit, this forward's KV
+        # writes -- may be their next writer.
+        if state_ops.zero_units:
+            self.zero_page_units(state_ops.zero_units)
         if state_ops.relocations:
             self.relocate_state_slots(state_ops.relocations)
         if state_ops.checkpoint_stores or state_ops.checkpoint_restores:

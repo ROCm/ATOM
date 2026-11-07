@@ -1207,6 +1207,9 @@ class PagedStateCheckpointCoordinator:
         )
         if units is None:
             return None
+        # The transfer writes these outside any batch: a zero still queued for
+        # a unit released earlier would land after the image (`cancel_scrub`).
+        self.store.pool.cancel_scrub(units)
         self._transfer_units[owner] = tuple(units)
         return self._transfer_units[owner]
 
