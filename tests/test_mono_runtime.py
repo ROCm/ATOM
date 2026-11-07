@@ -377,6 +377,46 @@ def test_a_lean_rebuild_that_still_spills_refuses_its_width(caplog):
     assert "pre_s56 needs 24 B of scratch" in caplog.text
 
 
+def test_a_rebuild_that_still_spills_is_rebuilt_leaner_again(caplog):
+    """``lean`` again while its rebuild spills, until one fits."""
+    spill = _CompiledLauncher(b"\x14", b"pre_s16")
+    chain = {"fat": "lean1", "lean1": "lean2", "lean2": "lean3"}
+    lean_calls = []
+
+    def lean(built, spilled):
+        lean_calls.append(built)
+        return chain.get(built)
+
+    widths = WidthBuilds(
+        lambda key: "fat",
+        lambda k: [(NO_SCRATCH, _NoArgs)]
+        + ([(spill, _NoArgs)] if k != "lean2" else []),
+        None,
+        "test",
+        lean=lean,
+    )
+    with caplog.at_level("INFO", logger="atom"):
+        assert widths.prepare(16)
+    assert lean_calls == ["fat", "lean1"] and widths[16] == "lean2"
+    assert caplog.text.count("rebuilt lean") == 2
+
+
+def test_a_lean_chain_that_runs_out_refuses_its_width(caplog):
+    spill = _CompiledLauncher(b"\x14", b"pre_s16")
+    chain = {"fat": "lean1", "lean1": "lean2"}
+    widths = WidthBuilds(
+        lambda key: "fat",
+        lambda k: [(spill, _NoArgs)],
+        None,
+        "test",
+        lean=lambda built, spilled: chain.get(built),
+    )
+    with caplog.at_level("INFO", logger="atom"):
+        assert not widths.prepare(16)
+    assert caplog.text.count("rebuilt lean") == 2
+    assert "pre_s16 needs 20 B of scratch" in caplog.text
+
+
 def test_a_spill_with_nothing_leaner_refuses_without_a_rebuild(caplog):
     """``lean`` None (a K2 or indexer spill: no K1 build to restage) refuses
     the width on the first build, not after compiling the same one again."""

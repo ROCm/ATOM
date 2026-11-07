@@ -2624,7 +2624,13 @@ class MLAAttention(nn.Module):
         attn_metadata: AttentionMetaData,
         return_lse: bool = False,
         q_prepadded: bool = False,
+        latent_out: bool = False,
     ) -> torch.Tensor:
+        """``latent_out``: return the attention's latent output
+        ``[B, H, kv_lora_rank]`` (this rank's real heads; a strided view under
+        head padding) instead of running the v-up projection -- the K3 mono
+        decode runs v-up, g_proj and the output gate in its own K2 launch
+        (``ATOM_MONO_MLA_POST``)."""
         # attn_metadata.causal is True for the target; False only for DSpark's
         # bidirectional draft block (set by the proposer). The asm kernel picks
         # a different .co by this flag, so the target must stay causal.
@@ -2863,6 +2869,9 @@ class MLAAttention(nn.Module):
             # Bound for a cross-rank combine rather than the bmm: materialise.
             return o.contiguous(), final_lse.contiguous()
 
+        if latent_out:
+            return o
+
         return self._v_up_proj_and_o_proj(o)
 
     def _pcp_write_full_kv(self, kv_cache, k_nope, k_rope, slot_mapping):
@@ -3006,18 +3015,29 @@ class MLAAttention(nn.Module):
         k_rope: torch.Tensor,
         positions: torch.Tensor = None,
         q_scale: torch.Tensor | None = None,
+        latent_out: bool = False,
     ) -> torch.Tensor:
+        # ``latent_out`` (K3 mono, ``ATOM_MONO_MLA_POST``): plain DCP-1 decode only;
+        # the latent attention output instead of v-up (``_forward_decode``)
         # kv_cache = self.kv_cache
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         context = forward_context.context
         use_prefill_mla = self.is_sparse_mla and attn_metadata.run_sparse
+        if latent_out and (
+            context.is_prefill or self.dcp_world_size > 1 or self.is_sparse_mla
+        ):
+            raise ValueError(
+                "latent_out is the plain DCP-1 non-sparse decode's latent output"
+            )
         if forward_context.context.is_dummy_run:
             output_shape = list(q.shape)
             atom_config = get_current_atom_config()
             output_shape[-1] = _mla_output_width(
                 self, atom_config.hf_config.hidden_size
             )
+            if latent_out:
+                output_shape = [q.shape[0], self.num_heads, self.kv_lora_rank]
             output_dtype = atom_config.torch_dtype
             output = torch.empty(output_shape, dtype=output_dtype, device=q.device)
             return output
@@ -3275,9 +3295,36 @@ class MLAAttention(nn.Module):
                     kv_cache,
                     attn_metadata,
                     q_prepadded=self._fused_q_head_pad,
+                    latent_out=latent_out,
                 )
 
         return output
+
+    def forward_decode_prebuilt(
+        self, q_out: torch.Tensor, latent_out: bool = False
+    ) -> torch.Tensor:
+        """K3 mono decode, ``ATOM_MONO_MLA_PREP=3``: ``forward_impl``'s plain DCP-1
+        decode branch from the ``q_out`` the preceding K2 launch wrote, together
+        with this step's KV-cache rows (the work of ``q_proj``, the absorb BMM and
+        ``fused_qk_rope_concat_and_cache_mla``)."""
+        forward_context: ForwardContext = get_forward_context()
+        if forward_context.context.is_dummy_run:
+            atom_config = get_current_atom_config()
+            width = _mla_output_width(self, atom_config.hf_config.hidden_size)
+            shape = (q_out.shape[0], width)
+            if latent_out:
+                shape = (q_out.shape[0], self.num_heads, self.kv_lora_rank)
+            return torch.empty(
+                shape, dtype=atom_config.torch_dtype, device=q_out.device
+            )
+        kv_cache = forward_context.kv_cache_data[f"layer_{self.layer_num}"].k_cache
+        return self._forward_decode(
+            q_out,
+            kv_cache,
+            forward_context.attn_metadata,
+            q_prepadded=self._fused_q_head_pad,
+            latent_out=latent_out,
+        )
 
     def forward(
         self,

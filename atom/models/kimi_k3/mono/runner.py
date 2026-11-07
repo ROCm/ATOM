@@ -34,8 +34,10 @@ returns it as the single pending and folds any two it was handed into K1's one
 """
 
 import logging
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 
 import torch
 from aiter.dist.parallel_state import (
@@ -53,6 +55,9 @@ from atom.models.kimi_k3.mono.config import (
 )
 from atom.models.kimi_k3.mono.kernels import layer as k2
 from atom.models.kimi_k3.mono.kernels.attention import kda as k1
+from atom.models.kimi_k3.mono.kernels.stages import mla_post as k2mp
+from atom.models.kimi_k3.mono.kernels.stages import mla_post_plan
+from atom.models.kimi_k3.mono.kernels.stages import mla_prep as k2pr
 from atom.models.kimi_k3.mono.kernels.stages import moe as k2b
 from atom.models.kimi_k3.mono.plan import (
     _width,
@@ -61,7 +66,7 @@ from atom.models.kimi_k3.mono.plan import (
     width_key,
     width_refusal,
 )
-from atom.models.kimi_k3.mono.weights import bind_model
+from atom.models.kimi_k3.mono.weights import bind_mla_post, bind_mla_prep, bind_model
 from atom.mono.dsa_indexer import kernel as kix
 from atom.mono.dsa_indexer.runner import IndexerRunner
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
@@ -80,6 +85,16 @@ from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+
+# the per-token FP8 activation the MLA prep stage writes
+FP8 = torch.float8_e4m3fn
+_INT_OF = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    """``t``'s elements as integers of their width: a bitwise comparison."""
+    return t.contiguous().view(_INT_OF[t.element_size()])
+
 
 # K2's mailbox tags start past every layer's K1: a step's two launches of one
 # layer must not share a tag, and the model has fewer layers than this
@@ -111,7 +126,7 @@ class WidthBuild:
         ix = [] if self.indexer is None else [(self.indexer, kix.ABI)]
         return (
             [(f, k1.ABI) for f in self.k1_launchers.values()]
-            + [(f, k2.ABI) for f in self.k2_launchers.values()]
+            + [(f, k2.abi_for(key)) for key, f in self.k2_launchers.items()]
             + ix
         )
 
@@ -124,26 +139,74 @@ def ix_peer_offset(max_rows: int) -> int:
     return -(-k2.peer_bytes(max_rows) // 256) * 256
 
 
+def _next_fold_build(key: "k2.K2Build") -> "k2.K2Build":
+    """The build a fold build that needs scratch is rebuilt as: the next of
+    ``k2.FOLD_SCHEDULERS``, then its layer's default build."""
+    order = ("", *k2.FOLD_SCHEDULERS)
+    at = order.index(key.sched)
+    if at + 1 < len(order):
+        return replace(key, sched=order[at + 1])
+    return k2.unfolded(key)
+
+
 def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
     """``built`` with each K1 build whose launcher spilled staged a column group
     a GEMV unit (``KdaPreBuild.gemv_unit``): half the weights in flight, slower
-    where ``kda.gemv_staging`` keeps two groups, so only where those do not fit.
-    None when no spilled launcher is such a K1 build (a K2 or indexer spill, or
-    a K1 at one group a unit already): there is nothing leaner to build."""
+    where ``kda.gemv_staging`` keeps two groups, so only where those do not fit;
+    and each K2 build with the MLA post / prep folds whose launcher spilled
+    rebuilt one step down ``_next_fold_build``: under another LLVM scheduler,
+    and past the last of those as its layer's default build (``k2.unfolded``),
+    where that layer runs its attention tail / seam unfolded at this width (the
+    forward follows the width's K2 keys) and the width stays mono. The fold
+    builds sit at K2's register limit, where the backend can leave an
+    unreferenced SGPR spill slot (a private segment, never accessed) that the
+    scratch guard refuses (``k2.FOLD_SCHEDULERS``). ``WidthBuilds.prepare``
+    calls this again while a rebuild still spills.
+    None when no spilled launcher is such a K1 or K2 build (a default K2 or
+    indexer spill, or a K1 at one group a unit already): there is nothing
+    leaner to build."""
     lean = {
         key: replace(key, gemv_unit=1)
         for key, launcher in built.k1_launchers.items()
         if launcher in spilled and key.gemv_unit > 1
     }
-    if not lean:
+    plain = {
+        key: _next_fold_build(key)
+        for key, launcher in built.k2_launchers.items()
+        if launcher in spilled
+        and isinstance(key, k2.K2Build)
+        and (key.mla_post or key.mla_prep)
+    }
+    if not lean and not plain:
         return None
+    for sched in (*k2.FOLD_SCHEDULERS, ""):
+        moved = {key for key, new in plain.items() if new.sched == sched}
+        if not moved:
+            continue
+        logger.info(
+            "Kimi-K3 mono: %d-row K2 of layers %s %s (their fold builds need"
+            " scratch)",
+            next(iter(moved)).tokens,
+            sorted(layer for layer, key in built.k2_keys.items() if key in moved),
+            (
+                f"rebuilt with amdgpu-sched-strategy={sched}"
+                if sched
+                else "without the MLA folds"
+            ),
+        )
     k1_keys = {layer: lean.get(key, key) for layer, key in built.k1_keys.items()}
+    k2_keys = {layer: plain.get(key, key) for layer, key in built.k2_keys.items()}
     return replace(
         built,
         k1_keys=k1_keys,
         k1_launchers={
             key: k1.build(key) if key in lean.values() else built.k1_launchers[key]
             for key in set(k1_keys.values())
+        },
+        k2_keys=k2_keys,
+        k2_launchers={
+            key: built.k2_launchers.get(key) or k2.build(key)
+            for key in set(k2_keys.values())
         },
     )
 
@@ -153,6 +216,16 @@ class K3MonoDecodeRunner:
     refusal every rank agrees on before anything collective."""
 
     max_rows = MAX_ROWS
+    # ``ATOM_MONO_MLA_POST`` (``_bind_mla_post``): none until bound
+    mla_post: Mapping = MappingProxyType({})
+    _mla_post_pending = None
+    # ``ATOM_MONO_MLA_PREP`` (``_bind_mla_prep``): MLA layer M -> its prep,
+    # K2 layer M - 1 -> M; none until bound
+    mla_prep: Mapping = MappingProxyType({})
+    mla_prep_prev: Mapping = MappingProxyType({})
+    _prep_pending: dict = MappingProxyType({})
+    _pref_hold_next = None
+    _positions = None
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
@@ -218,6 +291,9 @@ class K3MonoDecodeRunner:
         except MonoUnsupported as why:
             logger.info("mono DSA indexer off: %s", why)
             self.ix = None
+        # before ``_allocate``: an ``mla_post`` K2 key adds scratch (its pairs)
+        self._bind_mla_post()
+        self._bind_mla_prep()
         self._allocate()
 
     def _state_len(self) -> int:
@@ -408,6 +484,9 @@ class K3MonoDecodeRunner:
         return keys
 
     def _k2_keys(self, rows: int) -> dict[int, k2.K2Build]:
+        # the MLA post stage up to its width bound; wider steps run those
+        # layers' attention tail unfused (``_pre_o_core``)
+        post = self.mla_post if rows <= mla_post_plan.MAX_ROWS else {}
         return {
             p.layer_id: k2.K2Build(
                 tokens=rows,
@@ -417,6 +496,8 @@ class K3MonoDecodeRunner:
                 out_eps=p.moe.seam.out_eps,
                 ln_eps=p.moe.ln_eps,
                 diag=self.debug,
+                mla_post=p.layer_id in post,
+                **self._prep_key(p.layer_id, rows),
             )
             for p in self.plans
             if p.moe is not None
@@ -464,12 +545,27 @@ class K3MonoDecodeRunner:
         serving = (
             nullcontext() if self.ix is None else self.ix.hook.serving(build.indexer)
         )
+        self._prep_pending = {}
+        self._pref_hold_next = None
+        # ``ATOM_MONO_MLA_PREP=3``: the KV-cache write needs the positions
+        self._positions = positions
+        # the production prefix's pool block (``_seam_mirror``), released where
+        # the production prefix is: when a later layer returns a new prefix
+        hold = None
         with serving:
             for plan in self.plans:
-                prefix, add, add2 = self._layer(
+                res = self._layer(
                     build, plan, positions, prefix, blocks, add, add2, metadata
                 )
+                if self._pref_hold_next is not None or res[0] is not prefix:
+                    # a folded seam's mirror block replaces the held one, and any
+                    # other new prefix releases it, as production releases its
+                    # previous prefix there
+                    hold, self._pref_hold_next = self._pref_hold_next, None
+                prefix, add, add2 = res
+                del res
         hidden, _ = self.inner.output_attn_res(prefix, blocks, add, add2)
+        del hold
         self._raise_on_given_up_waits(rows)
         return hidden
 
@@ -507,7 +603,16 @@ class K3MonoDecodeRunner:
                     f"an {rows}-row step"
                 )
         else:
-            if plan.ffn_only:
+            post = keep = None
+            if (
+                plan.ffn_only
+                and plan.layer_id in self.mla_post
+                and build.k2_keys[plan.layer_id].mla_post
+            ):
+                core, prefix, post, keep = self._post_core(
+                    plan, positions, prefix, blocks, add, add2
+                )
+            elif plan.ffn_only:
                 core, prefix = self._pre_o_core(
                     plan, positions, prefix, blocks, add, add2
                 )
@@ -516,7 +621,14 @@ class K3MonoDecodeRunner:
                 core = self._k1(build, plan, prefix, delta, blocks, metadata)
             # K2 updates ``prefix`` in place: on a block-write layer it restarts
             # it at the all-reduced o_proj output, which K1 has already banked
-            out = (prefix, self._k2(build, plan, core, prefix, blocks), None)
+            k2_args = (build, plan, core, prefix, blocks)
+            ffn = self._k2(*k2_args) if post is None else self._k2(*k2_args, post)
+            out = (prefix, ffn, None)
+            # ``keep`` holds what the launch was handed pointers to until now
+            del keep
+            if self._mla_post_pending is not None:
+                pending, self._mla_post_pending = self._mla_post_pending, None
+                self._mla_post_compare(*pending)
         self._write_aux(plan.layer_id, out)
         return out
 
@@ -529,8 +641,14 @@ class K3MonoDecodeRunner:
         seam's ``prefix`` is a fresh tensor (the previous layer always hands an
         FFN output, so it takes the ``add`` branch), which K2 updates in place
         exactly as it does on a KDA layer."""
-        layer, normed, prefix, _, _ = self._seam(plan, prefix, blocks, add, add2)
-        core = layer.self_attn.forward_pre_o(positions, normed)
+        # the mirror lives as long as the production ``normed``
+        layer, normed, prefix, _mirror, attn = self._prepped_seam(
+            plan, prefix, blocks, add, add2
+        )
+        if attn is not None:
+            core = layer.self_attn.forward_prepped(positions, *normed, **attn)
+        else:
+            core = layer.self_attn.forward_pre_o(positions, normed)
         rows = prefix.size(0)
         if (
             core.dim() != 2
@@ -545,6 +663,485 @@ class K3MonoDecodeRunner:
                 f"{core.dtype} stride {core.stride()} for an {rows}-row step"
             )
         return core, prefix
+
+    def _bind_mla_post(self) -> None:
+        """``ATOM_MONO_MLA_POST=1``: the full-attention layers whose v-up, g_proj
+        and output gate run as the first stage of their own K2 launch
+        (``kernels.stages.mla_post``) -- 4 launches fewer a layer, no new launch
+        and no grid barrier. Off by default; then ``mla_post`` is empty and every
+        key, launch and argument is as before. A layer the stage cannot serve
+        exactly (a DSA layer's sparse MLA, a tail outside the FP8 recipe) keeps
+        its unfused tail (``_pre_o_core``), as ``bind_model`` keeps a layer it
+        refuses on the production path. The refusals are static properties of
+        the model, the same on every rank; the stage is rank-local besides, so
+        its K2 talks to its peers exactly as the unfused build does."""
+        self.mla_post: dict = {}
+        self.mla_post_check = envs.ATOM_MONO_MLA_POST_CHECK
+        self._mla_post_pending = None
+        if not envs.ATOM_MONO_MLA_POST:
+            return
+        for p in self.plans:
+            if not p.ffn_only:
+                continue
+            layer = self.inner.layers[p.layer_id]
+            try:
+                self.mla_post[p.layer_id] = bind_mla_post(layer, p.layer_id, self.dims)
+            except MonoUnsupported as why:
+                logger.info(
+                    "Kimi-K3 mono: layer %d keeps its unfused MLA tail (%s)",
+                    p.layer_id,
+                    why,
+                )
+        if self.rank == 0:
+            logger.info(
+                "Kimi-K3 mono: ATOM_MONO_MLA_POST: v-up / g_proj / gate in K2 on "
+                "%d MLA layers",
+                len(self.mla_post),
+            )
+
+    def _post_core(self, plan, positions, prefix, blocks, add, add2):
+        """``_pre_o_core`` with the attention stopped at the MLA decode's latent
+        output: K2's post stage makes ``core`` from it and g_proj's FP8 input.
+        Returns the buffer the stage writes, the seam's prefix and the stage's
+        kernel arguments, and the tensors those arguments point into: they must
+        stay allocated until the launch (a caching allocator hands a released
+        block to the next allocation, under graph capture across graphs)."""
+        post = self.mla_post[plan.layer_id]
+        # the mirror lives as long as the production ``normed``
+        layer, normed, prefix, _mirror, attn = self._prepped_seam(
+            plan, prefix, blocks, add, add2
+        )
+        if attn is not None:
+            x, xs = normed
+            olat = layer.self_attn.forward_prepped(
+                positions, x, xs, latent_out=True, **attn
+            )
+        else:
+            olat, x, xs = layer.self_attn.forward_latent(positions, normed)
+        rows = prefix.size(0)
+        heads, lora = post.w_v.shape[0], post.w_v.shape[2]
+        if (
+            olat.dim() != 3
+            or tuple(olat.shape) != (rows, heads, lora)
+            or olat.dtype != torch.bfloat16
+            or olat.stride(1) != lora
+            or olat.stride(2) != 1
+            or x.dtype != post.w_g.dtype
+            or tuple(x.shape) != (rows, post.w_g.shape[1])
+            or not x.is_contiguous()
+            or xs is None
+            or xs.dtype != torch.float32
+            or xs.numel() != rows
+            or not xs.is_contiguous()
+            or not prefix.is_contiguous()
+        ):
+            raise MonoUnsupported(
+                f"layer {plan.layer_id}: MLA post inputs latent "
+                f"{tuple(olat.shape)} {olat.dtype} {olat.stride()}, x "
+                f"{tuple(x.shape)} {x.dtype}, scale "
+                f"{None if xs is None else (tuple(xs.shape), xs.dtype)} for a "
+                f"{rows}-row step"
+            )
+        core = prefix.new_empty(rows, self.dims.proj)
+        p = torch.Tensor.data_ptr
+        args = {
+            "olat": p(olat), "olat_sr": olat.stride(0), "w_v": p(post.w_v),
+            "w_v_s": p(post.w_v_s), "xg": p(x), "xg_s": p(xs),
+            "w_g": p(post.w_g), "w_g_s": p(post.w_g_s),
+        }  # fmt: skip
+        if self.mla_post_check and not torch.cuda.is_current_stream_capturing():
+            self._mla_post_pending = (plan.layer_id, layer, olat, x, xs, core)
+        # ``_mirror``: the production ``normed``'s allocations live as long as
+        # the production ``normed`` (x, xs) does, past the K2 launch
+        return core, prefix, args, (olat, x, xs, _mirror)
+
+    def _mla_post_compare(self, layer_id, layer, olat, x, xs, core) -> None:
+        """``ATOM_MONO_MLA_POST_CHECK=1`` (eager GPU validation): the production
+        tail -- ``_v_up_proj``, g_proj, ``attn * sigmoid(gate)`` -- on the same
+        inputs, against the core the K2 post stage wrote; rank 0 logs the bf16
+        ulp statistics. Synchronizes."""
+        sa = layer.self_attn
+        av = sa.attn.impl._v_up_proj(olat).reshape(olat.size(0), -1)
+        gate = sa.g_proj(x, xs)
+        ref = av * torch.sigmoid(gate)
+        a = core.view(torch.int16).int()
+        b = ref.view(torch.int16).int()
+        a = torch.where(a < 0, -(a & 0x7FFF), a)
+        b = torch.where(b < 0, -(b & 0x7FFF), b)
+        d = (a - b).abs()
+        if self.rank == 0:
+            logger.info(
+                "MLA post check layer %d: %d / %d bf16 values differ, max %d ulp, "
+                "max |diff| %.3e (max |ref| %.3e)",
+                layer_id,
+                int((d > 0).sum()),
+                d.numel(),
+                int(d.max()),
+                float((core.float() - ref.float()).abs().max()),
+                float(ref.float().abs().max()),
+            )
+
+    def _bind_mla_prep(self) -> None:
+        """``ATOM_MONO_MLA_PREP=1``: the MLA layers M whose attention seam (and
+        input RMSNorm + per-token FP8 quant) runs as the tail stage of K2(M-1)
+        (``kernels.stages.mla_prep``, P0). Needs M-1 to run K2. Off by default;
+        then every key, launch and argument is as before. A layer it cannot
+        serve keeps its production seam (as ``bind_model`` keeps a refused
+        layer); the refusals are static, the same on every rank."""
+        self.mla_prep = {}
+        self.mla_prep_prev = {}
+        self.mla_prep_check = envs.ATOM_MONO_MLA_PREP_CHECK
+        raw = envs.ATOM_MONO_MLA_PREP.strip() or "0"
+        if raw == "0":
+            return
+        if raw not in ("1", "2", "3"):
+            raise MonoUnsupported(
+                f"ATOM_MONO_MLA_PREP={raw}: sub-modes are 1 (the seam, P0), 2 (+ the "
+                "q_a / kv_a GEMV and norms, P1 / P2) and 3 (+ q_b, the absorb, rope "
+                "and the FP8 KV-cache write, P3 .. P5)"
+            )
+        mode = int(raw)
+        # GPU bisect aid: fold only these MLA layers (comma list; default every one)
+        only = envs.ATOM_MONO_MLA_PREP_LAYERS.strip()
+        only = {int(v) for v in only.split(",") if v.strip()} if only else None
+        by_id = {p.layer_id: p for p in self.plans}
+        for p in self.plans:
+            if not p.ffn_only or (only is not None and p.layer_id not in only):
+                continue
+            prev = by_id.get(p.layer_id - 1)
+            if prev is None or prev.moe is None:
+                continue
+            try:
+                prep = bind_mla_prep(
+                    self.inner.layers[p.layer_id], p.layer_id, self.dims, mode
+                )
+                nb = prev.moe.blocks + (prev.moe.write_idx >= 0)
+                if not 1 <= prep.blocks <= nb:
+                    raise MonoUnsupported(
+                        f"layer {p.layer_id}: its seam mixes {prep.blocks} blocks, "
+                        f"K2 of layer {prev.layer_id} stages {nb}"
+                    )
+            except MonoUnsupported as why:
+                logger.info(
+                    "Kimi-K3 mono: layer %d keeps its production seam (%s)",
+                    p.layer_id,
+                    why,
+                )
+                continue
+            self.mla_prep[p.layer_id] = prep
+            self.mla_prep_prev[prev.layer_id] = p.layer_id
+        if not self.mla_prep:
+            return
+        self._alloc_prep_buffers()
+        if self.rank == 0:
+            logger.info(
+                "Kimi-K3 mono: ATOM_MONO_MLA_PREP=%d: the prep of %d MLA layers in "
+                "the preceding K2 (layers %s)",
+                mode,
+                len(self.mla_prep),
+                sorted(self.mla_prep),
+            )
+
+    def _alloc_prep_buffers(self) -> None:
+        """The prep stage's outputs, allocated once here -- outside every CUDA
+        graph's memory pool -- and used as ``[:rows]`` views by every width.
+
+        A step's pool allocations then stay exactly the flag-off ones:
+        ``_prep_args`` takes nothing from the pool, and ``_prepped_seam``
+        replays the production seam's own allocations (``_seam_mirror``).
+
+        ``pref`` alternates between two buffers by the MLA layer's ordinal:
+        K2(M-1) reads prefix(M-1) -- the previous MLA layer's ``pref``, updated
+        in place since -- while it writes ``pref`` (M). x8 / xs are dead by the
+        next MLA layer's K2(M-1)."""
+        n, dev = self.max_rows, self.device
+        hidden = self.inner.config.hidden_size
+
+        def e(*shape, dtype):
+            return torch.empty(*shape, dtype=dtype, device=dev)
+
+        self._prep_bufs = {
+            "pref": (
+                e(n, hidden, dtype=torch.bfloat16),
+                e(n, hidden, dtype=torch.bfloat16),
+            ),
+            "x8": e(n, hidden, dtype=FP8),
+            "xs": e(n, 1, dtype=torch.float32),
+        }
+        if max(w.mode for w in self.mla_prep.values()) >= 2:
+            self._prep_bufs.update(
+                qkv=e(n, k2pr.QKV_A, dtype=torch.bfloat16),
+                q8=e(n, k2pr.QL, dtype=FP8),
+                qs=e(n, 1, dtype=torch.float32),
+                kvn=e(n, k2pr.KVL, dtype=torch.bfloat16),
+            )
+        if max(w.mode for w in self.mla_prep.values()) >= 3:
+            heads = {w.q_heads for w in self.mla_prep.values()}
+            if len(heads) != 1:
+                raise MonoUnsupported(
+                    f"MLA q_out heads {sorted(heads)}: one buffer serves every layer"
+                )
+            # zeros: the padded heads past the 12 a rank owns stay 0, as the
+            # production q_out's (P4 writes the 12 every step)
+            self._prep_bufs.update(
+                qb=e(n, k2pr.QB, dtype=torch.bfloat16),
+                q_out=torch.zeros(n, heads.pop(), k2pr.ENTRY, dtype=FP8, device=dev),
+            )
+            # a dummy run writes no KV-cache row (nor does production there)
+            self._neg_slots = torch.full((n,), -1, dtype=torch.int64, device=dev)
+        self._prep_ord = {m: i for i, m in enumerate(sorted(self.mla_prep))}
+
+    def _seam_mirror(
+        self, prefix: torch.Tensor, block_residual: torch.Tensor, add=None, add2=None
+    ) -> tuple:
+        """The production attention seam's pool allocations, in its order and
+        sizes (``attention_residual._apply_attn_res_impl``: ``br``, ``y``,
+        ``y_scale``, the addends' copies, ``pref``; ``br`` and the copies
+        released when it returns), with no kernel. Returns ``(y, y_scale)`` for
+        the caller to keep alive as long as the production ``normed``; ``pref``
+        waits in ``_pref_hold_next`` for the forward loop to keep as long as the
+        production prefix. A change to that function's allocations must change
+        this one with it."""
+        dev = prefix.device
+        rows = prefix.size(0)
+        br = None
+        if not block_residual.is_contiguous():
+            br = torch.empty(
+                block_residual.shape, dtype=block_residual.dtype, device=dev
+            )
+        ps = prefix.contiguous()
+        y = torch.empty((rows, prefix.size(1)), dtype=FP8, device=dev)
+        y_scale = torch.empty((rows, 1), dtype=torch.float32, device=dev)
+        hs = add.contiguous() if add is not None else None
+        hs2 = add2.contiguous() if add2 is not None else None
+        self._pref_hold_next = torch.empty_like(ps) if add is not None else None
+        del br, hs, hs2
+        return y, y_scale
+
+    def _prep_key(self, layer_id: int, rows: int) -> dict:
+        """K2 build-key fields for layer ``layer_id`` (an M - 1) at ``rows``, or
+        none (past the stage's width the next layer keeps its own seam; so does
+        a layer whose P0 sums do not fit K2's ``red`` at this width, e.g. 16 rows
+        on 7+ blocks: ``build`` would refuse the whole width)."""
+        m = self.mla_prep_prev.get(layer_id)
+        if m is None or rows > k2pr.MAX_ROWS:
+            return {}
+        w = self.mla_prep[m]
+        if not k2pr.red_fits(rows, w.blocks + 1):
+            return {}
+        key = {
+            "mla_prep": w.mode,
+            "prep_nblocks": w.blocks,
+            "prep_eps": w.seam.eps,
+            "prep_out_eps": w.seam.out_eps,
+        }
+        if w.mode >= 2:
+            key.update(qa_eps=w.qa_eps, kva_eps=w.kva_eps)
+        if w.mode >= 3:
+            key.update(rope_neox=w.rope_neox, rope_maxpos=w.cos.numel() // 32)
+        return key
+
+    def _prep_args(self, layer_id: int, prefix: torch.Tensor) -> dict:
+        """The prep stage's arguments of K2(``layer_id``) for MLA layer
+        ``layer_id`` + 1; its outputs (``[:rows]`` of ``_alloc_prep_buffers``'
+        buffers, nothing from the graph pool) kept for ``_prepped_seam``."""
+        m = self.mla_prep_prev[layer_id]
+        w = self.mla_prep[m]
+        rows = prefix.size(0)
+        bufs = self._prep_bufs
+        if rows > bufs["x8"].size(0) or prefix.size(1) != bufs["x8"].size(1):
+            raise MonoUnsupported(
+                f"layer {m}: a {tuple(prefix.shape)} prefix, the prep buffers "
+                f"{tuple(bufs['x8'].shape)}"
+            )
+        out = {
+            "pref": bufs["pref"][self._prep_ord[m] % 2][:rows],
+            "x8": bufs["x8"][:rows],
+            "xs": bufs["xs"][:rows],
+        }
+        p = torch.Tensor.data_ptr
+        args = dict.fromkeys(k2pr.ARGS, 0)
+        args.update(
+            pref=p(out["pref"]), x8=p(out["x8"]), xs=p(out["xs"]),
+            p_nw=p(w.seam.nw), p_qk=p(w.seam.qk), p_onw=p(w.seam.out_nw),
+        )  # fmt: skip
+        out["attn"] = None
+        if w.mode >= 2:
+            qkv, q8, qs, kvn = (bufs[n][:rows] for n in ("qkv", "q8", "qs", "kvn"))
+            args.update(
+                w_qa=p(w.w_qa), w_qa_s=p(w.w_qa_s), qkv=p(qkv), q8=p(q8), qs=p(qs),
+                kvn=p(kvn), qa_nw=p(w.qa_nw), kva_nw=p(w.kva_nw),
+            )  # fmt: skip
+            # ``forward_prepped``'s inputs: ``_mla_inputs``' results
+            out["qkv"] = qkv
+            out["p2"] = {"q": q8, "q_scale": qs, "kv": kvn}
+            out["attn"] = {**out["p2"], "k_rope": qkv[:, k2pr.QL + k2pr.KVL :]}
+        if w.mode >= 3:
+            args.update(self._prep_args3(m, w, rows, out))
+        self._prep_pending[m] = out
+        return args
+
+    def _prep_args3(self, m: int, w, rows: int, out: dict) -> dict:
+        """Sub-mode 3's arguments for MLA layer ``m`` (P3 .. P5): q_b, W_K, the
+        rope tables, the layer's FP8 KV cache, the step's slots and positions;
+        ``out`` takes what ``forward_prepped`` and the check read."""
+        fc = get_forward_context()
+        meta = fc.attn_metadata
+        if meta.dtype_q != FP8:
+            raise MonoUnsupported(
+                f"layer {m}: q_out dtype {meta.dtype_q}, the stages write {FP8}"
+            )
+        kv_cache = fc.kv_cache_data[f"layer_{m}"].k_cache
+        if kv_cache.element_size() != 1 or not kv_cache.is_contiguous():
+            raise MonoUnsupported(
+                f"layer {m}: KV cache {kv_cache.dtype} stride {kv_cache.stride()}, "
+                "the stages write FP8 rows of a contiguous cache"
+            )
+        # the production kernel's view (block, offset) and one row a slot (the
+        # stages' address: slot * 576 B, whatever the block size)
+        kv3 = kv_cache.view(kv_cache.shape[0], -1, k2pr.ENTRY)
+        kvrows = kv_cache.view(-1, k2pr.ENTRY)
+        slots = meta.slot_mapping.reshape(-1)
+        if fc.context.is_dummy_run:
+            slots = self._neg_slots
+        pos = self._positions.reshape(-1)
+        if (
+            slots.dtype != torch.int64
+            or slots.numel() < rows
+            or not slots.is_contiguous()
+            or pos.dtype != torch.int64
+            or pos.numel() < rows
+            or not pos.is_contiguous()
+        ):
+            raise MonoUnsupported(
+                f"layer {m}: slot mapping {slots.dtype} {tuple(slots.shape)} / "
+                f"positions {pos.dtype} {tuple(pos.shape)} for a {rows}-row step"
+            )
+        # the tokens' own (the kernels read ``rows`` of each)
+        slots, pos = slots[:rows], pos[:rows]
+        bufs = self._prep_bufs
+        qb, q_out = bufs["qb"][:rows], bufs["q_out"][:rows]
+        out.update(
+            qb=qb, slots=slots, pos=pos, kv3=kv3, kvrows=kvrows, attn={"q_out": q_out}
+        )
+        p = torch.Tensor.data_ptr
+        return {
+            "w_qb": p(w.w_qb), "w_qb_s": p(w.w_qb_s), "w_k": p(w.w_k),
+            "w_k_s": p(w.w_k_s), "qb": p(qb), "qout": p(q_out),
+            "qout_sr": q_out.stride(0), "kvc": p(kv_cache), "kvc_sr": kvrows.stride(0),
+            "slots": p(slots), "pos": p(pos), "cosc": p(w.cos), "sinc": p(w.sin),
+            "k_sc": p(w.k_scale), "q_sc": p(w.q_scale),
+        }  # fmt: skip
+
+    @torch.no_grad()
+    def _mla_prep_compare(self, layer_id, layer, prefix, blocks, add, add2, pend):
+        """``ATOM_MONO_MLA_PREP_CHECK=1`` (eager GPU validation): the production
+        seam (and, sub-mode 2, fused_qkv_a_proj and the q_a / kv_a norm + quant)
+        on the same inputs against what K2(M-1)'s prep stages wrote; rank 0 logs
+        how many values differ. P2 is rerun on P1's own output and must show 0;
+        sub-mode 3: ``_mla_prep_compare3``. Synchronizes."""
+
+        def ndiff(a, b):
+            return int((_bits(a) != _bits(b)).sum())
+
+        (x8r, xsr), prefr = layer.self_attention_attn_res(prefix, blocks, add, add2)
+        seam = (
+            f"seam x8 {ndiff(pend['x8'], x8r)}/{x8r.numel()} "
+            f"xs {ndiff(pend['xs'], xsr)} pref {ndiff(pend['pref'], prefr)}"
+        )
+        msgs = [seam]
+        if "p2" in pend:
+            from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
+
+            sa = layer.self_attn
+            qkv = pend["qkv"]
+            ref = sa.fused_qkv_a_proj(pend["x8"], pend["xs"])
+            msgs.append(f"P1 qkv {ndiff(qkv, ref)}/{ref.numel()} (GEMM order)")
+            # P2 on P1's own output: aiter's kernel, operation for operation
+            (q8e, qse), _, kve, _ = _fuse_rmsnorm_quant(
+                qkv[:, : k2pr.QL], sa.q_a_layernorm.weight, sa.q_a_layernorm.eps,
+                qkv[:, k2pr.QL : k2pr.QL + k2pr.KVL], sa.kv_a_layernorm.weight,
+                sa.kv_a_layernorm.eps, None, dtype_quant=sa.qknorm_dtype,
+                shuffle=False, scale_shuffle_padding=False, group_size=128,
+                quant_type=sa.qknorm_quant_type_value, output_unquantized_inp1=False,
+                transpose_scale=True,
+            )  # fmt: skip
+            a = pend["p2"]
+            msgs.append(
+                f"P2 q8 {ndiff(a['q'], q8e)} qs {ndiff(a['q_scale'], qse)} "
+                f"kv {ndiff(a['kv'], kve)} (must be 0)"
+            )
+        if "qb" in pend:
+            msgs.append(self._mla_prep_compare3(sa, pend, kve, ndiff))
+        if self.rank == 0:
+            logger.info("MLA prep check layer %d: %s", layer_id, "; ".join(msgs))
+
+    def _mla_prep_compare3(self, sa, pend, kve, ndiff) -> str:
+        """Sub-mode 3's part of ``_mla_prep_compare``: q_b_proj on the stage's
+        own ``q8`` / ``q_scale`` (P3, GEMM order), then the production absorb,
+        rope and KV-cache write on the stages' own ``qb`` / ``kv`` / ``k_rope``.
+        The KV rows and q_out's rope part must match bit for bit; q_out's nope
+        part differs by the absorb's summation order. Leaves the production
+        kernel's KV bytes in place (equal when the check passes)."""
+        from atom.model_ops.attention_mla import (
+            _aiter_triton_fp8_bmm,
+            fused_qk_rope_concat_and_cache_mla,
+        )
+
+        impl = sa.attn.impl
+        p2 = pend["p2"]
+        qbr = impl.q_proj(p2["q"], p2["q_scale"])
+        p3 = f"P3 qb {ndiff(pend['qb'], qbr)}/{qbr.numel()} (GEMM order)"
+        qb = pend["qb"].view(-1, k2pr.HEADS, k2pr.QH)
+        ql = _aiter_triton_fp8_bmm(
+            qb[..., : k2pr.QK_NOPE].transpose(0, 1), impl.W_K, impl.W_K_scale,
+            group_size=128, transpose_bm=True,
+        )  # fmt: skip
+        slots, kv3, kvrows = pend["slots"], pend["kv3"], pend["kvrows"]
+        live = slots >= 0
+        ours = kvrows[slots.clamp(min=0)].clone()
+        q_out = pend["attn"]["q_out"]
+        q_ref = torch.zeros_like(q_out)
+        fused_qk_rope_concat_and_cache_mla(
+            ql, qb[..., k2pr.QK_NOPE :], kve,
+            pend["qkv"][:, k2pr.QL + k2pr.KVL :], kv3, q_ref[:, : k2pr.HEADS],
+            slots, impl._k_scale, impl._q_scale, pend["pos"],
+            impl.rotary_emb.cos_cache, impl.rotary_emb.sin_cache,
+            is_neox=impl.rotary_emb.is_neox_style, is_nope_first=True,
+            compute_all_q_rope=False,
+        )  # fmt: skip
+        theirs = kvrows[slots.clamp(min=0)]
+        q_live = q_out[live][:, : k2pr.HEADS]
+        r_live = q_ref[live][:, : k2pr.HEADS]
+        return p3 + (
+            f"; P5 KV rows {ndiff(ours[live], theirs[live])}/{ours[live].numel()} "
+            f"(must be 0), q_out rope "
+            f"{ndiff(q_live[..., k2pr.KVL :], r_live[..., k2pr.KVL :])} (must be 0), "
+            f"q_out nope {ndiff(q_live[..., : k2pr.KVL], r_live[..., : k2pr.KVL])} "
+            "(absorb order)"
+        )
+
+    def _prepped_seam(self, plan, prefix, blocks, add, add2):
+        """``_seam``, or -- when K2(M-1) already ran this layer's prep -- its
+        results: ``(layer, normed, prefix, mirror, attn)`` with ``normed`` the
+        per-token FP8 activation and its scale, ``prefix`` the stage's ``pref``,
+        ``mirror`` the production seam's pool allocations, to hold as long as
+        the production path holds its own, then (sub-mode 2) ``attn``, the
+        ``forward_prepped`` inputs; the last two None without the stage."""
+        pend = None
+        if plan.layer_id in self._prep_pending:
+            pend = self._prep_pending.pop(plan.layer_id)
+        if pend is None:
+            layer, normed, prefix, _, _ = self._seam(plan, prefix, blocks, add, add2)
+            return layer, normed, prefix, None, None
+        layer = self.inner.layers[plan.layer_id]
+        before, _ = layer_block(plan.layer_id)
+        if self.mla_prep_check and not torch.cuda.is_current_stream_capturing():
+            self._mla_prep_compare(
+                plan.layer_id, layer, prefix, blocks[:, :before], add, add2, pend
+            )
+        mirror = self._seam_mirror(prefix, blocks[:, :before], add, add2)
+        return layer, (pend["x8"], pend["xs"]), pend["pref"], mirror, pend["attn"]
 
     def _seam(self, plan, prefix, blocks, add, add2):
         """The layer's attention-side AttnRes seam, on the blocks behind it."""
@@ -675,12 +1272,14 @@ class K3MonoDecodeRunner:
             self._replay_tables[layer_id] = (table, ptrs)
         return table.data_ptr()
 
-    def _k2(self, build, plan, core, prefix, blocks) -> torch.Tensor:
+    def _k2(self, build, plan, core, prefix, blocks, post=None) -> torch.Tensor:
+        """``post`` (an ``mla_post`` build): the post stage's arguments, ``core``
+        then being the buffer the stage writes and o_proj reads."""
         w = plan.moe
         key = build.k2_keys[plan.layer_id]
         out = torch.empty_like(prefix)
         p = torch.Tensor.data_ptr
-        args = k2.ABI.pack({
+        args = k2.abi_for(key).pack({
             "core": p(core), "w_o": p(w.w_o), "prefix": p(prefix),
             "blocks": p(blocks), "blk_sm": blocks.stride(0),
             "blk_sr": blocks.stride(1), "ares_nw": p(w.seam.nw),
@@ -699,6 +1298,8 @@ class K3MonoDecodeRunner:
             # a block-write layer's MLP seam restarts its prefix
             "reset": int(plan.moe.write_idx >= 0),
             "diag": self._diag_ptr(), "tl": 0,
+            **(post or ({} if not key.mla_prep else dict.fromkeys(k2mp.ARGS, 0))),
+            **(self._prep_args(plan.layer_id, prefix) if key.mla_prep else {}),
         })  # fmt: skip
         _run_compiled(build.k2_launchers[key], *args, torch.cuda.current_stream())
         return out

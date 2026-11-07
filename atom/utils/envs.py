@@ -625,6 +625,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
+    # Kimi-K3 mono: on each full-attention (MLA) layer that runs K2, the v-up
+    # BMM, g_proj, sigmoid and mul become K2's first stage (kernels/stages/
+    # mla_post.py) instead of four kernels between the MLA decode and K2. Needs
+    # g_proj and kv_b_proj in the FP8 online quant (they are in the recipe).
+    # Not bit-identical to the four kernels (GEMM summation order). Off by default.
+    "ATOM_MONO_MLA_POST": lambda: os.getenv("ATOM_MONO_MLA_POST", "0") == "1",
+    # Debug: with ATOM_MONO_MLA_POST, run the production tail next to the K2 post
+    # stage on the same inputs and log how many bf16 values differ (rank 0).
+    # Use with --enforce-eager.
+    "ATOM_MONO_MLA_POST_CHECK": lambda: (
+        os.getenv("ATOM_MONO_MLA_POST_CHECK", "0") == "1"
+    ),
+    # Kimi-K3 mono: the NEXT MLA layer's prep glue as tail stages of the
+    # preceding layer's K2 (kernels/stages/mla_prep.py): 1 the attention seam +
+    # per-token FP8 quant (P0); 2 also the fused q_a/kv_a projection and its
+    # two RMSNorms (P1 / P2); 3 also q_b, the absorb BMM, rope and the FP8
+    # KV-cache write (P3 .. P5). Not bit-identical (row-reduction / GEMM
+    # order). 0 (default) is off.
+    "ATOM_MONO_MLA_PREP": lambda: os.getenv("ATOM_MONO_MLA_PREP", "0"),
+    # Debug: with ATOM_MONO_MLA_PREP, run the production prep next to the stages
+    # on the same inputs and log what differs (rank 0; synchronizes). Use with
+    # --enforce-eager.
+    "ATOM_MONO_MLA_PREP_CHECK": lambda: (
+        os.getenv("ATOM_MONO_MLA_PREP_CHECK", "0") == "1"
+    ),
+    # Bisect aid: fold only these MLA layers (comma list; unset: every one).
+    "ATOM_MONO_MLA_PREP_LAYERS": lambda: os.getenv("ATOM_MONO_MLA_PREP_LAYERS", ""),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.

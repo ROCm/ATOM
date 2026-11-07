@@ -32,6 +32,7 @@ the same layout the MoE kernel's scale readers were written for. That holds only
 for the non-interleaved gate/up layout, so ``is_guinterleave`` is checked.
 """
 
+import inspect
 import logging
 from dataclasses import dataclass
 
@@ -468,3 +469,300 @@ def bind_model(model, dims: Dims, rank: int) -> list[LayerPlan]:
         f"{ATTN_RES_BLOCK})",
     )
     return plans
+
+
+# ---------------------------------------------- MLA post stage (ATOM_MONO_MLA_POST)
+FP8 = torch.float8_e4m3fn
+MLA_HEADS = 12  # a TP8 rank's MLA heads (96 / 8): the stage's task placement
+MLA_LORA = 512  # kv_lora_rank
+MLA_VH = 128  # v_head_dim
+
+
+@dataclass(frozen=True)
+class MlaPost:
+    """What an MLA layer's K2 post stage reads (``kernels.stages.mla_post``):
+    the MLA module's own FP8 W_V and its per-tensor scale, and g_proj's per-token
+    FP8 plane in place."""
+
+    layer_id: int
+    w_v: torch.Tensor  # [12, 128, 512] E4M3, K (the latent) contiguous
+    w_v_s: torch.Tensor  # fp32, one element
+    w_g: torch.Tensor  # [1536, 7168] E4M3, AITER (16, 16) preshuffle
+    w_g_s: torch.Tensor  # fp32 a row
+
+
+def _fp8_dense(module, name: str, shape: tuple[int, ...]):
+    """A dense linear's production per-token FP8 plane and its row scale as the
+    GEMVs read them: E4M3 preshuffled by AITER's ``shuffle_weight`` at its
+    default (16, 16) layout, rows padded past ``shape[0]`` to the GEMM's tile,
+    an fp32 scale a padded row (``gemv.w8_dword`` indexes that layout). A
+    projection that is not that is refused."""
+    w = _param(module, name)
+    n, k = shape
+    _need(
+        w.dtype == FP8,
+        f"{name} is {w.dtype}: the stage reads a preshuffled {FP8} plane, so this "
+        "projection must stay in the online quant",
+    )
+    qt = getattr(module, "quant_type", None)
+    _need(
+        getattr(qt, "name", None) == "per_Token",
+        f"{name}: {qt}, the stage reads a per-token FP8 plane",
+    )
+    _need(
+        getattr(module, "native_a8_group_rows", None) is None,
+        f"{name}: a native-a8 grouped plane",
+    )
+    _need(getattr(w, "is_shuffled", False), f"{name}: FP8 but not preshuffled")
+    _need(
+        w.dim() == 2 and w.shape[1] == k and w.shape[0] >= n and w.shape[0] % 16 == 0,
+        f"{name} is {tuple(w.shape)}, expected {shape} padded to 16 rows",
+    )
+    # the GEMVs walk K in 128-wide chunks; the shuffle's K block is 32
+    _need(k % 128 == 0, f"{name}: K {k} not a multiple of 128")
+    _need(getattr(module, "bias", None) is None, f"{name} has a bias")
+    _need(w.is_contiguous(), f"{name} not contiguous")
+    sc = getattr(module, "weight_scale", None)
+    _need(
+        sc is not None
+        and sc.dtype == F32
+        and sc.numel() == w.shape[0]
+        and sc.is_contiguous(),
+        f"{name}: weight_scale "
+        + ("missing" if sc is None else f"{sc.dtype} {tuple(sc.shape)}")
+        + f", expected fp32 a row of {w.shape[0]}",
+    )
+    return w.data, sc.data.view(-1)
+
+
+def bind_mla_post(layer, layer_id: int, dims: Dims) -> MlaPost:
+    """``layer``'s post-stage weights, or ``MonoUnsupported`` naming why the
+    stage cannot reproduce its production tail: the plain DCP-1 FP8 decode path
+    (``MLAAttention._forward_decode`` -> ``_v_up_proj`` with the triton FP8
+    BMM), g_proj per-token FP8 fed by the input RMSNorm's fused per-token quant."""
+    name = f"layer {layer_id}"
+    sa = layer.self_attn
+    impl = getattr(getattr(sa, "attn", None), "impl", None)
+    _need(impl is not None and hasattr(impl, "W_V"), f"{name}: no MLA impl with W_V")
+    _need(
+        "latent_out" in inspect.signature(impl.forward_impl).parameters,
+        f"{name}: MLA forward_impl has no latent_out",
+    )
+    _need(hasattr(sa, "forward_latent"), f"{name}: no KimiFullAttention.forward_latent")
+    _need(getattr(impl, "dcp_world_size", 1) == 1, f"{name}: decode context parallel")
+    for flag in (
+        "use_seg_mla",
+        "kv_shuffled",
+        "is_sparse_mla",
+        "qrep_enabled",
+        "pbm_enabled",
+        "use_triton_mla",
+    ):
+        _need(not getattr(impl, flag, False), f"{name}: MLA {flag}")
+    _need(
+        impl.num_heads == MLA_HEADS and dims.proj == MLA_HEADS * MLA_VH,
+        f"{name}: {impl.num_heads} MLA heads a rank, the stage places {MLA_HEADS}",
+    )
+    _need(
+        impl.kv_lora_rank == MLA_LORA and impl.v_head_dim == MLA_VH,
+        f"{name}: kv_lora_rank {impl.kv_lora_rank} / v_head_dim {impl.v_head_dim}",
+    )
+    w_v, w_v_s = impl.W_V, impl.W_V_scale
+    _need(
+        w_v.dtype == FP8
+        and tuple(w_v.shape) == (MLA_HEADS, MLA_VH, MLA_LORA)
+        and w_v.is_contiguous(),
+        f"{name}: W_V {w_v.dtype} {tuple(w_v.shape)}, expected contiguous "
+        f"{FP8} {(MLA_HEADS, MLA_VH, MLA_LORA)} (the FP8 BMM path)",
+    )
+    _need(w_v_s.dtype == F32 and w_v_s.numel() == 1, f"{name}: W_V_scale {w_v_s.dtype}")
+    _need(
+        bool(getattr(sa, "fuse_input_norm_quant", False)),
+        f"{name}: the input RMSNorm does not emit the FP8 activation g_proj reads",
+    )
+    w_g, w_g_s = _fp8_dense(sa.g_proj, f"{name} g_proj", (dims.proj, HIDDEN))
+    _need(w_g.shape[0] == dims.proj, f"{name}: g_proj rows padded to {w_g.shape[0]}")
+    return MlaPost(layer_id, w_v, w_v_s.reshape(-1), w_g, w_g_s)
+
+
+# ---------------------------------------------- MLA prep stages (ATOM_MONO_MLA_PREP)
+MLA_QL = 1536  # q_lora_rank
+MLA_QKV_A = 1536 + 512 + 64  # fused_qkv_a_proj rows: q_c | kv_c | k_rope
+MLA_QH = 192  # qk_nope_head_dim + qk_rope_head_dim
+MLA_NOPE = 128
+
+
+@dataclass(frozen=True)
+class MlaPrep:
+    """What layer M's prep stages, run at the tail of K2(M-1), read
+    (``kernels.stages.mla_prep``): the attention seam (mode >= 1), the fused
+    q_a / kv_a projection and its two RMSNorms (mode >= 2), q_b, W_K, the rope
+    tables and the KV-cache scales (mode 3). A later mode's fields are None
+    below it."""
+
+    layer_id: int
+    mode: int
+    blocks: int
+    seam: AttnRes
+    w_qa: torch.Tensor | None = None  # [2112, 7168] E4M3, AITER (16, 16) preshuffle
+    w_qa_s: torch.Tensor | None = None  # fp32 a row
+    qa_nw: torch.Tensor | None = None
+    kva_nw: torch.Tensor | None = None
+    qa_eps: float = 1e-6
+    kva_eps: float = 1e-6
+    w_qb: torch.Tensor | None = None  # [2304, 1536] E4M3 preshuffled
+    w_qb_s: torch.Tensor | None = None
+    w_k: torch.Tensor | None = None  # [12, 512, 128] E4M3, K (q_nope) contiguous
+    w_k_s: torch.Tensor | None = None  # fp32, one element
+    cos: torch.Tensor | None = None  # bf16 [max_pos, 32] (as the rope kernel reads it)
+    sin: torch.Tensor | None = None
+    rope_neox: bool = True
+    k_scale: torch.Tensor | None = None  # fp32 [1]: the KV cache's
+    q_scale: torch.Tensor | None = None  # fp32 [1]: q_out's
+    q_heads: int = 12  # q_out's head stride (16 under the decode's head pad)
+
+
+def _mla_impl_checks(sa, name: str):
+    """The plain DCP-1 decode path the prep stages reproduce (``bind_mla_post``'s
+    checks), returning the MLA impl."""
+    impl = getattr(getattr(sa, "attn", None), "impl", None)
+    _need(impl is not None and hasattr(impl, "W_K"), f"{name}: no MLA impl with W_K")
+    _need(getattr(impl, "dcp_world_size", 1) == 1, f"{name}: decode context parallel")
+    for flag in (
+        "use_seg_mla",
+        "kv_shuffled",
+        "is_sparse_mla",
+        "qrep_enabled",
+        "pbm_enabled",
+        "use_triton_mla",
+    ):
+        _need(not getattr(impl, flag, False), f"{name}: MLA {flag}")
+    _need(
+        impl.num_heads == MLA_HEADS,
+        f"{name}: {impl.num_heads} MLA heads a rank, the stages place 12",
+    )
+    _need(
+        (impl.kv_lora_rank, impl.qk_nope_head_dim, impl.qk_rope_head_dim)
+        == (MLA_LORA, MLA_NOPE, MLA_QH - MLA_NOPE),
+        f"{name}: kv_lora_rank / nope / rope {impl.kv_lora_rank} / "
+        f"{impl.qk_nope_head_dim} / {impl.qk_rope_head_dim}",
+    )
+    return impl
+
+
+def bind_mla_prep(layer, layer_id: int, dims: Dims, mode: int) -> MlaPrep:
+    """``layer``'s (an MLA layer's) prep-stage tensors for sub-mode ``mode``, or
+    ``MonoUnsupported`` naming why the stages cannot reproduce its production
+    prep: the triton AttnRes seam with the per-token FP8 input quant fused
+    (mode 1), FP8 per-token fused_qkv_a_proj and the aiter per-token
+    rmsnorm quant (mode 2), FP8 q_b, the triton FP8 absorb BMM and the aiter
+    per-head rope / FP8 KV-cache kernel on a page-1 cache (mode 3)."""
+    name = f"layer {layer_id}"
+    _need(1 <= mode <= 3, f"ATOM_MONO_MLA_PREP={mode}: sub-modes are 1 .. 3")
+    sa = layer.self_attn
+    site = layer.self_attention_attn_res
+    blocks, write_idx = layer_block(layer_id)
+    _need(blocks >= 1 and write_idx < 0, f"{name}: a block-write or block-less seam")
+    _need(bool(getattr(site, "enabled", False)), f"{name}: attention residuals off")
+    # (imports triton: after the checks a CPU runner can make)
+    from atom.model_ops.attention_residual import _fused_quant_dtype
+
+    _need(
+        _fused_quant_dtype(site.out_norm) == FP8,
+        f"{name}: the attention seam does not fold the per-token FP8 input quant",
+    )
+    _need(
+        bool(getattr(sa, "fuse_input_norm_quant", False)),
+        f"{name}: no fused input quant",
+    )
+    seam = _seam(site, f"{name} attn seam")
+    out = {"layer_id": layer_id, "mode": mode, "blocks": blocks, "seam": seam}
+    if mode >= 2:
+        from aiter import QuantType
+
+        impl = _mla_impl_checks(sa, name)
+        _need(sa.q_lora_rank == MLA_QL, f"{name}: q_lora_rank {sa.q_lora_rank}")
+        # q_c | kv_c | k_rope only: a DSA layer's plane carries its indexer's too
+        split = tuple(getattr(sa, "projection_split_sizes", ()))
+        _need(
+            split == (MLA_QL, MLA_LORA, MLA_QH - MLA_NOPE),
+            f"{name}: fused_qkv_a_proj splits {split}",
+        )
+        w_qa, w_qa_s = _fp8_dense(
+            sa.fused_qkv_a_proj, f"{name} fused_qkv_a_proj", (MLA_QKV_A, HIDDEN)
+        )
+        _need(
+            sa.qknorm_dtype == FP8
+            and sa.qknorm_quant_type_value == QuantType.per_Token.value,
+            f"{name}: q_b's activation quant {sa.qknorm_dtype} / {sa.qknorm_quant_type_value}, "
+            "the stages emit per-token FP8",
+        )
+        out.update(
+            w_qa=w_qa,
+            w_qa_s=w_qa_s,
+            qa_nw=_vec(sa.q_a_layernorm.weight, MLA_QL, f"{name} q_a_layernorm"),
+            kva_nw=_vec(sa.kv_a_layernorm.weight, MLA_LORA, f"{name} kv_a_layernorm"),
+            qa_eps=_eps(sa.q_a_layernorm, f"{name} q_a_layernorm"),
+            kva_eps=_eps(sa.kv_a_layernorm, f"{name} kv_a_layernorm"),
+        )
+    if mode >= 3:
+        w_qb, w_qb_s = _fp8_dense(
+            impl.q_proj, f"{name} q_b_proj", (MLA_HEADS * MLA_QH, MLA_QL)
+        )
+        w_k, w_k_s = impl.W_K, impl.W_K_scale
+        _need(
+            w_k.dtype == FP8
+            and tuple(w_k.shape) == (MLA_HEADS, MLA_LORA, MLA_NOPE)
+            and w_k.is_contiguous(),
+            f"{name}: W_K {w_k.dtype} {tuple(w_k.shape)}, expected contiguous {FP8} "
+            f"{(MLA_HEADS, MLA_LORA, MLA_NOPE)} (the FP8 BMM path)",
+        )
+        _need(
+            w_k_s.dtype == F32 and w_k_s.numel() == 1,
+            f"{name}: W_K_scale {w_k_s.dtype}",
+        )
+        rot = impl.rotary_emb
+        cos, sin = rot.cos_cache, rot.sin_cache
+        # the rope kernel reads the tables as the activations' dtype at pos * 32
+        _need(
+            cos.dtype == BF16
+            and sin.dtype == BF16
+            and cos.is_contiguous()
+            and sin.is_contiguous()
+            and cos.numel() == sin.numel()
+            and cos.numel() % 32 == 0,
+            f"{name}: rope tables {cos.dtype} {tuple(cos.shape)}, expected contiguous bf16 [pos, 32]",
+        )
+        kv_dt = str(getattr(impl, "kv_cache_dtype", ""))
+        _need(
+            kv_dt.startswith("fp8"),
+            f"{name}: kv_cache_dtype {kv_dt}, the stages write FP8",
+        )
+        scales = {}
+        for sc in ("_k_scale", "_q_scale"):
+            t = getattr(impl, sc, None)
+            _need(
+                isinstance(t, torch.Tensor) and t.dtype == F32 and t.numel() == 1,
+                f"{name}: {sc} is not an fp32 scalar tensor",
+            )
+            # the rope kernel takes them as host scalars; the stages read a
+            # device copy, taken here (they are load-time constants)
+            scales[sc] = t.detach().reshape(1).to(w_k.device).clone()
+        heads = (
+            impl.padded_num_heads
+            if getattr(impl, "_fused_q_head_pad", False)
+            else MLA_HEADS
+        )
+        out.update(
+            w_qb=w_qb,
+            w_qb_s=w_qb_s,
+            w_k=w_k,
+            w_k_s=w_k_s.reshape(-1),
+            cos=cos,
+            sin=sin,
+            rope_neox=bool(rot.is_neox_style),
+            k_scale=scales["_k_scale"],
+            q_scale=scales["_q_scale"],
+            q_heads=int(heads),
+        )
+    return MlaPrep(**out)

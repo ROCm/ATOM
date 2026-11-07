@@ -430,8 +430,9 @@ def stage_slice(c, task):
 @traced
 def slice_compute(c, task, ld):
     """Columns 128 task ..: every token's sources into LDS ``vals`` (4 columns a
-    thread), the prefix (+ delta) rounded to bf16 and stored back, per-(token,
-    source) partial sum of squares and qk dot -> PART. ``ld``: ``slice_loads``."""
+    thread), the prefix (+ delta) rounded to bf16 and stored back (or to
+    ``args["prefix_out"]`` when given), per-(token, source) partial sum of
+    squares and qk dot -> PART. ``ld``: ``slice_loads``."""
     s, ns, nb, tid, lane = c["S"], c["NS"], c["NB"], c["tid"], c["lane"]
     a = c["args"]
     c0 = task * COLS
@@ -469,8 +470,12 @@ def slice_compute(c, task, ld):
                 restart = c["reset"] != 0
                 pre = [restart.select(dl[j], pre[j]) for j in range(4)]
             if live & is_pre:
+                # ``prefix_out`` (K2's MLA prep seam, ``stages.mla_prep``): the
+                # next layer's prefix into its own buffer, this one's kept
                 bo.buffer_store(
-                    bf4_words(pre), rsrc(a["prefix"]), (t * HIDDEN + col) // 2
+                    bf4_words(pre),
+                    rsrc(a.get("prefix_out", a["prefix"])),
+                    (t * HIDDEN + col) // 2,
                 )
         # the block-write layer's attention seam: the updated prefix is block
         # write_idx. The compile-time gate stays outside the traced condition:
