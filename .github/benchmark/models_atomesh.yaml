@@ -3655,6 +3655,36 @@ models:
             decode_max_num_seqs: 120
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+      # C180 with a 2.5 TiB Store: at 2 TiB the Store sits at its eviction
+      # watermark, the hit rate falls to 93% and the prefill computes twice
+      # what A9 C150 does. 640 GiB per owner keeps each NUMA node's pins
+      # plus the 128 GiB reserve within its 1511 GiB.
+      - <<: *issue382_a9_1p3d_c264
+        name: issue382-a9-1p3d-c180-store2560
+        concurrency:
+        - 180
+        decode:
+          workers: 3
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,120]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 360
+            decode_max_num_seqs: 120
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+        env:
+          common:
+            <<: *issue382_a9_env_common
+            ATOMESH_ISSUE382_METRICS: '0'
+            ATOMESH_DROP_HOST_CACHES: best_effort
+            ATOMESH_DROP_HOST_CACHES_RANKS: '0'
+          prefill:
+            <<: *issue382_a9_env_prefill
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}
+            MOONCAKE_STORE_OWNERS: 0:640:rdma4;0:640:rdma5;1:640:rdma6;1:640:rdma7
+          decode: *issue382_a9_env_decode
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c330
         concurrency:
