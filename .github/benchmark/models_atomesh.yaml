@@ -16680,6 +16680,22 @@ models:
             common:
               <<: *m31_n4fab_env
               ATOMESH_M31_D_MAX_SEQS: "12"
+        - <<: *m31_moriio_1p2d_n4fab_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n4fab-c40-dcap10
+          concurrency: [40]
+          env:
+            common:
+              <<: *m31_n4fab_env
+              ATOMESH_M31_D_MAX_SEQS: "10"
+        # 2.2 TB (~41M tokens) covers C128's live sessions (~45M at the peak, from C112's 39M).
+        - <<: *m31_moriio_1p2d_n4fab_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n4fab-c128-dcap24-cpu22
+          concurrency: [128]
+          env:
+            common:
+              <<: *m31_n4fab_env
+              ATOMESH_M31_D_MAX_SEQS: "24"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "2200000000000"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
