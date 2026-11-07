@@ -1299,6 +1299,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
+    # Mooncake Store in-place packs and unpacks on a high-priority stream.
+    "OFFLOAD_COPY_HIGH_PRIORITY": lambda: _flag_env("OFFLOAD_COPY_HIGH_PRIORITY"),
     # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.
     # Unset derives the size from the KV geometry.
     "OFFLOAD_GPU_STAGING_CHUNKS": lambda: _optional_int_env(

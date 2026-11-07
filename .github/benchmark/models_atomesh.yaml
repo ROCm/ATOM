@@ -3814,13 +3814,31 @@ models:
       # C180. The tokenizer cache now covers MiniMax-M3's NFC normalizer, so
       # a turn encodes only its new messages; 2 GiB holds every session's
       # stored prompt and segments.
-      - <<: *issue382_a9_1p2d_c200_lpt4096
+      - &issue382_a9_1p2d_c200_lpt4096_tokcache
+        <<: *issue382_a9_1p2d_c200_lpt4096
         name: issue382-a9-1p2d-c200-lpt4096-tokcache
         env:
-          common:
+          common: &issue382_a9_tokcache_env_common
             <<: *issue382_a9_1p3d_env_common
             ATOM_TOKENIZE_CACHE_MB: '2048'
           prefill: *issue382_a9_store2560_env_prefill
+          decode: *issue382_a9_env_decode
+      # A save packs after everything its stage had queued when it was
+      # dispatched, so on the middle stages, whose queue waits on the stage
+      # before, the one save thread spends 200-750 ms (p90-p99) per pack and
+      # every later save waits behind it: the finished requests' blocks stay
+      # pinned until all four stages saved them, and a burst filled the
+      # 16M-token pool and stopped the prefill for 15 s. Loads, one thread
+      # too, wait 0.4-1.8 s (p90-p99) on the same stages for their unpacks.
+      - <<: *issue382_a9_1p2d_c200_lpt4096_tokcache
+        name: issue382-a9-1p2d-c200-lpt4096-tokcache-copy2
+        env:
+          common: *issue382_a9_tokcache_env_common
+          prefill:
+            <<: *issue382_a9_store2560_env_prefill
+            OFFLOAD_COPY_WORKERS: '2'
+            OFFLOAD_LOAD_WORKERS: '2'
+            OFFLOAD_COPY_HIGH_PRIORITY: '1'
           decode: *issue382_a9_env_decode
       # Past C200 the prefill node's 2.5 TiB no longer holds the sessions: the
       # second node's memory joins the Store (1.75 TiB), and each decode keeps
