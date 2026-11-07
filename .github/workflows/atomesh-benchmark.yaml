@@ -265,6 +265,11 @@ on:
         required: false
         default: false
         type: boolean
+      shorten_pending_glm_jobs:
+        description: 'Lower only the two recorded pending PR2846 accuracy allocations to two hours; no resubmission'
+        required: false
+        default: false
+        type: boolean
 
 env:
   ATOMESH_SINGLE_NODE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_single_node || 'auto' }}
@@ -331,10 +336,14 @@ jobs:
           SOURCE_RUN_IDS: ${{ inputs.inspect_run_ids }}
           SOURCE_JOB_IDS: ${{ inputs.inspect_job_ids }}
           RETIRE_REPLACED_RUNS: ${{ inputs.retire_replaced_issue382_runs }}
+          SHORTEN_GLM_JOBS: ${{ inputs.shorten_pending_glm_jobs }}
         run: |
           args=()
           if [[ "$RETIRE_REPLACED_RUNS" == "true" ]]; then
             args+=(--retire-replaced-runs)
+          fi
+          if [[ "$SHORTEN_GLM_JOBS" == "true" ]]; then
+            args+=(--shorten-pending-glm-jobs)
           fi
           python3 "$ISSUE382_INSPECTION_DIR/inspect_runs.py" --run-ids "$SOURCE_RUN_IDS" --job-map "$SOURCE_JOB_IDS" --output "$ISSUE382_INSPECTION_DIR/snapshot" "${args[@]}"
       - uses: actions/upload-artifact@v7

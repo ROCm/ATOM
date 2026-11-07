@@ -17,6 +17,66 @@ REPLACED_JOBS = {
     "41654920836": ("11881", "issue382-a2-correctness64-accuracy"),
 }
 
+GLM_PENDING_JOBS = {
+    "42337229149": ("13343", "295e2f40933709084774fb87c25a395a5f8457ae"),
+    "42337231792": ("13342", "b46fe0923b87017fa1d4d00b7b8e07a12db1aadf"),
+}
+
+
+def shorten_pending_glm_jobs(ids):
+    """Lower only these two pending accuracy allocations from eight to two hours.
+
+    Keep their job IDs, submission times, priority, account and placement. A
+    running or mismatched allocation is never updated. This is opt-in and
+    independent of inspection and the issue382 retirement action.
+    """
+    if any(rid not in GLM_PENDING_JOBS for rid in ids):
+        raise ValueError("time-limit update is restricted to the two GLM runs")
+    results = []
+    for rid in ids:
+        job_id, head = GLM_PENDING_JOBS[rid]
+        before = command(["scontrol", "show", "job", job_id])
+        row = {"run_id": rid, "job_id": job_id, "before": before}
+        results.append(row)
+        fields = dict(re.findall(r"(?:^|\s)(\w+)=(\S+)", before.get("stdout", "")))
+        expected = (
+            "glm-5.2-mxfp4-glm-52-mxfp4-1p1d-cpp4-dcp4-gsm8k-20shot-"
+            f"landing-c32-accuracy-{rid}-1"
+        )
+        if before.get("returncode") != 0 or any(
+            fields.get(key) != value
+            for key, value in {
+                "JobId": job_id,
+                "JobName": expected,
+                "Account": "amd-atom",
+                "Partition": "amd-spur",
+            }.items()
+        ):
+            row["error"] = "job identity does not match the recorded experiment"
+            continue
+        if fields.get("JobState") != "PENDING":
+            row["skipped_state"] = fields.get("JobState")
+            continue
+        if fields.get("TimeLimit") == "02:00:00":
+            row["already_shortened"] = True
+            continue
+        workdir = fields.get("WorkDir", "")
+        if fields.get("TimeLimit") != "08:00:00" or not workdir.startswith(
+            "/share_nfs/ATOMESH_RUNNER/"
+        ):
+            row["error"] = "unexpected original limit or source directory"
+            continue
+        source = command(["git", "-C", workdir, "rev-parse", "HEAD"])
+        row["source_head"] = source
+        if source.get("returncode") != 0 or source.get("stdout", "").strip() != head:
+            row["error"] = "source head changed"
+            continue
+        row["update"] = command(
+            ["scontrol", "update", f"JobId={job_id}", "TimeLimit=02:00:00"]
+        )
+        row["after"] = command(["scontrol", "show", "job", job_id])
+    return results
+
 
 def retire_replaced_jobs(ids):
     """Cancel only the four recorded jobs with confirmed source drift.
@@ -233,6 +293,7 @@ def main():
     parser.add_argument("--job-map", type=json.loads, default={})
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--retire-replaced-runs", action="store_true")
+    parser.add_argument("--shorten-pending-glm-jobs", action="store_true")
     args = parser.parse_args()
     ids = args.run_ids.split(",")
     if not 1 <= len(ids) <= 4 or any(
@@ -344,6 +405,8 @@ def main():
         )
     if args.retire_replaced_runs:
         report["retirement"] = retire_replaced_jobs(ids)
+    if args.shorten_pending_glm_jobs:
+        report["time_limit_updates"] = shorten_pending_glm_jobs(ids)
     (args.output / "inspection.json").write_text(
         json.dumps(report, indent=2) + "\n"
     )
