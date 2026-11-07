@@ -111,6 +111,7 @@ def _prepare_model_atom_rtpllm(
         )
 
     if model_arch == "Qwen4ExpForConditionalGeneration":
+        from atom.config import QuantizationConfig
         from atom.model_loader.loader import WeightsMapper
         from atom.models.qwen4_exp import qwen4_exp_packed_modules_mapping
 
@@ -126,6 +127,33 @@ def _prepare_model_atom_rtpllm(
         hf = (
             getattr(atom_config.hf_config, "text_config", None) or atom_config.hf_config
         )
+        # Block-FP8 checkpoints may leave the PLE table in BF16 without
+        # declaring its dtype. The official Qwen3.8 FP8 checkpoint explicitly
+        # lists the table in modules_to_convert, so keep that table FP8.
+        quantization = getattr(hf, "quantization_config", None) or getattr(
+            atom_config.hf_config, "quantization_config", None
+        )
+        ple_module = "ple.ple_embedding.ngram_embedding"
+        # ``ple_layer_ids`` is 1-based.  Match only PLE layers that this
+        # checkpoint actually builds; a conversion entry for another layer
+        # must not change the dtype of the real PLE table.
+        ple_names = {ple_module}
+        for layer_id in getattr(hf, "ple_layer_ids", ()) or ():
+            layer_index = int(layer_id) - 1
+            ple_names.add(f"model.layers.{layer_index}.{ple_module}")
+            ple_names.add(f"model.language_model.layers.{layer_index}.{ple_module}")
+        ple_is_fp8 = isinstance(quantization, dict) and any(
+            QuantizationConfig._matches_exclude(name, item)
+            for item in (quantization.get("modules_to_convert") or ())
+            for name in ple_names
+        )
+        if (
+            getattr(hf, "ple_embedding_dtype", None) is None
+            and isinstance(quantization, dict)
+            and quantization.get("weight_block_size")
+            and not ple_is_fp8
+        ):
+            hf.ple_embedding_dtype = "bfloat16"
         packed = qwen4_exp_packed_modules_mapping(
             getattr(model_cls, "packed_modules_mapping", {}),
             int(hf.split_ngram_parts),

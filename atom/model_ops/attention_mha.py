@@ -9,7 +9,6 @@ from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import _flash_attn_varlen_forward
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
-from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon_supports_arch
 from aiter.ops.triton.unified_attention import unified_attention
 from torch import nn
 
@@ -20,6 +19,7 @@ from atom.model_ops.base_attention import (
     dense_decode_splits,
     flydsl_decode_seqs,
     gluon_decode_over_limit,
+    pa_decode_gluon_supports_arch,
     run_pa_decode,
     run_pa_fwd_asm,
 )

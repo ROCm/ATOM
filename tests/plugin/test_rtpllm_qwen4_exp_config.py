@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -561,11 +562,16 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from rtp_llm.model_factory_register import (
+    _hf_architecture_2_ft, register_hf_architecture,
+)
 
 from atom.plugin.prepare import _set_framework_backbone, is_rtpllm, prepare_model
 _set_framework_backbone("atom")
 assert not is_rtpllm()
+register_hf_architecture("Qwen4ExpForConditionalGeneration", "qwen4_exp")
 import atom.plugin.rtpllm.models
+assert _hf_architecture_2_ft["Qwen4ExpForConditionalGeneration"] == "qwen4_exp"
 from atom.plugin import config as plugin_config, register
 from atom.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 assert not is_rtpllm()
@@ -603,6 +609,98 @@ quant_config.remap_layer_name.assert_called_once()
         [sys.executable, "-c", script], check=False, capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("quantization", "explicit_dtype", "expected_dtype"),
+    [
+        ({"weight_block_size": [128, 128]}, None, "bfloat16"),
+        (
+            {
+                "weight_block_size": [128, 128],
+                "modules_to_convert": [
+                    "model.layers.0.ple.ple_embedding.ngram_embedding"
+                ],
+            },
+            None,
+            "bfloat16",
+        ),
+        (
+            {
+                "weight_block_size": [128, 128],
+                "modules_to_convert": [
+                    "model.layers.1.ple.ple_embedding.ngram_embedding"
+                ],
+            },
+            None,
+            None,
+        ),
+        (
+            {
+                "weight_block_size": [128, 128],
+                "modules_to_convert": [
+                    "re:^model\\.layers\\.1\\.ple\\.ple_embedding\\.ngram_embedding$"
+                ],
+            },
+            None,
+            None,
+        ),
+        (
+            {
+                "weight_block_size": [128, 128],
+                "modules_to_convert": ["re:.*ple\\.ple_embedding\\.ngram_embedding$"],
+            },
+            None,
+            None,
+        ),
+        (
+            {
+                "weight_block_size": [128, 128],
+                "modules_to_convert": [
+                    "model.layers.*.ple.ple_embedding.ngram_embedding"
+                ],
+            },
+            None,
+            None,
+        ),
+        ({"quant_method": "fp8"}, None, None),
+        ({"weight_block_size": [128, 128]}, "float8_e4m3fnuz", "float8_e4m3fnuz"),
+    ],
+)
+def test_qwen4_exp_rtp_block_fp8_ple_dtype_selection(
+    monkeypatch, quantization, explicit_dtype, expected_dtype
+):
+    from atom.plugin import prepare
+
+    hf = SimpleNamespace(
+        split_ngram_parts=1,
+        ple_layer_ids=[2],
+        quantization_config=quantization,
+        ple_embedding_dtype=explicit_dtype,
+    )
+    # Production Qwen4Exp configs expose the same object as text_config.
+    hf.text_config = hf
+    quant_config = SimpleNamespace(exclude_layers=[], remap_layer_name=Mock())
+    atom_config = SimpleNamespace(
+        hf_config=hf,
+        quant_config=quant_config,
+        multimodal_config=object(),
+    )
+    expected_model = object()
+    monkeypatch.setattr(
+        prepare, "_instantiate_prepared_model", lambda *args: expected_model
+    )
+    actual = prepare._prepare_model_atom_rtpllm(
+        SimpleNamespace(model_config=SimpleNamespace(is_mtp=False)),
+        atom_config,
+        "Qwen4ExpForConditionalGeneration",
+        SimpleNamespace(packed_modules_mapping={}),
+        Mock(),
+        Mock(),
+    )
+    assert actual is expected_model
+    assert hf.ple_embedding_dtype == expected_dtype
+    quant_config.remap_layer_name.assert_called_once()
 
 
 def test_prepared_qwen4_exp_mtp_receives_atom_config(monkeypatch):
@@ -1379,6 +1477,11 @@ def test_qwen4_exp_graph_marks_both_cache_tags(monkeypatch):
     assert inputs.attention_inputs == {"linear": linear, "full": full}
 
 
+def test_qwen4_exp_mtp_draft_graph_uses_request_lanes():
+    runtime = object.__new__(_ATOMQwen4ExpMTPRuntime)
+    assert runtime.cuda_graph_draft_prefill_uses_request_lanes() is True
+
+
 def test_qwen4_exp_graph_prewarms_qsa_caches_before_capture(monkeypatch):
     runtime = object.__new__(_ATOMQwen4ExpRuntime)
     monkeypatch.setattr(
@@ -1656,8 +1759,10 @@ def test_qwen4_exp_prefill_reads_prefix_block_when_continuing_across_boundary():
         is_cuda_graph=False,
         input_lengths=torch.tensor([1], dtype=torch.int32),
         prefix_lengths=torch.tensor([64], dtype=torch.int32),
-        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
-        kv_cache_kernel_block_id_device=torch.tensor([[10, 11]], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        kv_cache_kernel_block_id_device=torch.tensor(
+            [[10, 11]], dtype=torch.int32, device="cuda"
+        ),
     )
     metadata = RTPQwen4ExpContext._build_gdn_metadata(
         attn_inputs, seq_size_per_block=64, num_tokens=1

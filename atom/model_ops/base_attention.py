@@ -11,9 +11,7 @@ from abc import ABC, abstractmethod
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.gluon.pa_decode_gluon import (
-    pa_decode_gluon_supports_arch,
-)
+from aiter.ops.triton.gluon import pa_decode_gluon as _pa_decode_gluon_module
 from torch import nn
 
 from atom.config import get_current_atom_config
@@ -25,6 +23,12 @@ from .attention_mla import MLAModules, _mla_output_width
 from .sp_attention import gather_heads, ulysses_attention
 
 logger = logging.getLogger("atom")
+
+# Older AITER builds do not expose this optional capability probe. In that
+# case, retain the existing non-Gluon paged decode path.
+pa_decode_gluon_supports_arch = getattr(
+    _pa_decode_gluon_module, "pa_decode_gluon_supports_arch", lambda: False
+)
 
 
 def _warn_removed_flydsl_plan_env() -> None:
@@ -974,9 +978,8 @@ def cp_mha_gather_cache(
         if k_scales.numel() == 1 and v_scales.numel() == 1:
             per_token_quant = False
         else:
-            assert (
-                k_scales.numel() > 1 and v_scales.numel() > 1
-            ), "k_scales and v_scales must both be scalar or per-token"
+            scale_error = "k_scales and v_scales must both be scalar or per-token"
+            assert k_scales.numel() > 1 and v_scales.numel() > 1, scale_error
 
     head_dim = key.shape[2]
     x = 16 // key_cache.element_size()

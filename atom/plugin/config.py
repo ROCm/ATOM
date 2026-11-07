@@ -821,7 +821,15 @@ def _generate_atom_config_from_rtpllm_config(config: Any):
 
     return Config(
         model=rtpllm_model_config.ckpt_path,
-        max_num_batched_tokens=max(max_model_len, max_generate_batch_size),
+        # RTP can admit a context batch larger than one max-length request.
+        # MoE's preallocated top-k metadata must cover that same scheduler bound.
+        max_num_batched_tokens=max(
+            max_model_len,
+            max_generate_batch_size,
+            int(
+                getattr(rtpllm_model_config, "moe_prefill_max_tokens_per_rank", 0) or 0
+            ),
+        ),
         max_num_seqs=max_generate_batch_size,
         max_model_len=max_model_len,
         gpu_memory_utilization=0.9,
