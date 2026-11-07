@@ -4,14 +4,22 @@
 # fork of ATOM's atom/mono (MIT, Copyright (C) 2026, Advanced Micro
 # Devices, Inc.). This port reads those primitives from atom.mono
 # directly and takes ATOM's mailbox discipline in place of the fork's.
-"""bf16 GEMV pieces mono kernels share (K3's K1 / K2, the DSA indexer): 16
-weight rows a task against up to 16 token rows in LDS, one
+"""GEMV pieces mono kernels share (K3's K1 / K2, the DSA indexer): 16 bf16
+(or ``w8``) weight rows a task against up to 16 token rows in LDS, one
 ``mfma_f32_16x16x32_bf16`` per 32 K.
 
 K is walked in 128-wide chunks, wave w taking chunks w, w + 8, ...; a lane reads
 64 contiguous bytes of its row a chunk (4 dwordx4 at q 32 + g 8 elements: lane
 group g = lane / 16), and the token rows are read at the same K. The K order
 inside a chunk is a permutation both operands share, so the dot is unchanged.
+
+``w8``: the weight is ATOM's per-token FP8 linear as the production GEMM holds
+it -- E4M3 in AITER's (16, 16) preshuffle, ``[N/16][K/32][2][16 rows][16 B]``,
+with an fp32 scale a row. A lane's 8 elements of a q step are then 8 contiguous
+bytes (``w8_offset``), widened to the same bf16 operand exactly
+(``fp8x8_bf16_pk``): the MFMAs and the K order are the bf16 path's, and the
+row's scale multiplies the reduced sum (``row_value``), loaded before the MFMAs
+so that it lands under them (``pair_scales``).
 """
 
 import flydsl.expr as fx
@@ -19,7 +27,18 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from atom.mono.device.ops import CM_DEV, CM_NT, mfma_bf16, rsrc, traced, xshfl
+from atom.mono.device.ops import (
+    CM_DEV,
+    CM_NT,
+    bf16_round,
+    fp8x8_bf16_pk,
+    ld_f32,
+    mfma_bf16,
+    row_sum,
+    rsrc,
+    traced,
+    xshfl,
+)
 from atom.mono.plan.execution import THREADS, WAVES
 
 ROWS = 16
@@ -69,20 +88,30 @@ def chunks(k):
     return (n + WAVES - 1) // WAVES, n
 
 
-def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, paired=False):
+def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, paired=False, w8=False):
     """This wave's operands of weight rows ``row0`` .. + 16 (row-major, ``ldk``
     bf16 a row at ``w``, K columns ``k0`` .. ``k0 + k``): a list a chunk
-    (clamped into K: ``mfmas`` zeroes the extra), ``chunk_ops``' each."""
+    (clamped into K: ``mfmas`` zeroes the extra), ``chunk_operands``' each."""
     per, n = chunks(k)
     ldk = k if ldk is None else ldk
     r_w = rsrc(w)
     cm = CM_NT if nt else 0
+
+    def kcol(i):
+        return k0 + fx.min(wave + WAVES * i, n - 1) * KCH
+
     return [
-        chunk_ops(
-            r_w, row0, ldk, k0 + fx.min(wave + WAVES * i, n - 1) * KCH, lane, paired, cm
-        )
+        chunk_operands(r_w, row0, ldk, kcol(i), lane, paired, cm, w8)
         for i in range(per)
     ]
+
+
+def chunk_operands(r_w, row0, ldk, kcol, lane, paired=False, cm=CM_NT, w8=False):
+    """A chunk's MFMA A operands: ``chunk_ops``', or (``w8``) those of a
+    preshuffled E4M3 plane, ``w8_chunk_ops``'."""
+    if w8:
+        return w8_chunk_ops(r_w, row0, ldk, kcol, lane, cm)
+    return chunk_ops(r_w, row0, ldk, kcol, lane, paired, cm)
 
 
 def chunk_ops(r_w, row0, ldk, kcol, lane, paired=False, cm=CM_NT):
@@ -133,12 +162,79 @@ def _select4(cond, a, b):
     )
 
 
-def mfmas(lane, wave, xl, xrow, k, s, ops, acc=None):
+# dwords from a lane's 8 fp8 of one q step to the next's: 32 K columns, a K
+# block (``w8_offset``)
+W8_QSTEP = 128
+
+
+def w8_offset(row0, r, col, ldk):
+    """The byte of element (row0 + r, col) of an ``[N, ldk]`` E4M3 plane in
+    AITER's (16, 16) preshuffle, ``[N/16][K/32][2][16 rows][16 B]`` (``row0`` a
+    multiple of 16, r < 16). The 8 elements from a ``col`` multiple of 8 are
+    contiguous: a lane's operand of a q step."""
+    return (
+        ((row0 // ROWS * (ldk // 32) + col // 32) * 2 + col % 32 // 16) * 256
+        + r * 16
+        + col % 16
+    )
+
+
+def w8_lane_dwords(row0, lane, kcol, ldk):
+    """The dwords of a lane's four q-step operands of chunk ``kcol`` in a
+    preshuffled E4M3 plane (``w8_offset``): row row0 + lane % 16, 8 elements
+    from kcol + 32 q + 8 (lane / 16), as ``chunk_ops`` takes them."""
+    base = w8_offset(row0, lane % ROWS, kcol + 8 * (lane // ROWS), ldk) // 4
+    return [base + W8_QSTEP * q for q in range(4)]
+
+
+def w8_chunk_ops(r_w, row0, ldk, kcol, lane, cm=CM_NT):
+    """``chunk_ops`` of a preshuffled E4M3 plane: two dwords a lane a q step
+    (``w8_lane_dwords``), which ``operand`` widens. A wave's 64 lanes read a
+    step's 512 B in one piece, so there is no ``paired`` form."""
+    return [
+        fx.Vector(bo.buffer_load(r_w, at, vec_width=2, dtype=T.i32, cache_modifier=cm))
+        for at in w8_lane_dwords(row0, lane, kcol, ldk)
+    ]
+
+
+def operand(op, w8=False):
+    """A ``chunk_ops`` operand, or (``w8``) a ``w8_chunk_ops`` one widened:
+    the bf16 MFMA A operand."""
+    return fp8x8_bf16_pk([op[0], op[1]]) if w8 else op.bitcast(fx.BFloat16)
+
+
+def pair_scales(scale, row0, tid):
+    """A ``w8`` GEMV's row scales (fp32 at ``scale``) of thread tid's
+    ``row_pair``, rows row0 + 2 (tid % 8) and the next: loaded before the
+    MFMAs, so that they land under them rather than after the reduce."""
+    r = row0 + 2 * (tid % (ROWS // 2))
+    return [ld_f32(scale, r), ld_f32(scale, r + 1)]
+
+
+def row_value(red, r, t, scale=None):
+    """Row r, token t of the waves' accumulators at ``red`` (``row_sum``), times
+    ``scale`` (a ``w8`` GEMV's row scale), rounded to bf16."""
+    v = row_sum(red, r, t)
+    if scale is not None:
+        v = v * scale
+    return bf16_round(v)
+
+
+def row_pair(red, rp, t, scales=None):
+    """Rows 2 rp and 2 rp + 1, token t (``row_value``; ``scales``:
+    ``pair_scales``'): a thread's column pair."""
+    scales = [None, None] if scales is None else scales
+    return [row_value(red, 2 * rp + i, t, scales[i]) for i in range(2)]
+
+
+def mfmas(lane, wave, xl, xrow, k, s, ops, acc=None, w8=False):
     """``loads``' operands against token rows 0 .. s - 1 of the LDS rows ``xl``
     (``xrow`` bf16 a row) -> this wave's 16x16 accumulator.
 
     ``acc`` carries an earlier slab's partial in, so a K split on group
     boundaries accumulates in the same order one pass over the whole K would.
+    ``w8``: the operands are ``loads(w8=True)``'s; the sum is unscaled (the
+    caller scales the reduced row: ``row_value``).
     """
     per, n = chunks(k)
     g = lane // ROWS
@@ -160,13 +256,11 @@ def mfmas(lane, wave, xl, xrow, k, s, ops, acc=None):
                 xb = fx.Vector.from_elements(
                     [live.select(xb[d], fx.Int32(0)) for d in range(4)], fx.Int32
                 )
-            acc = mfma_bf16(
-                ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
-            )
+            acc = mfma_bf16(operand(ops[i][q], w8), xb.bitcast(fx.BFloat16), acc)
     return acc
 
 
-def mfmas_unit(lane, wave, xl, xrow, i, k, s, op, acc):
+def mfmas_unit(lane, wave, xl, xrow, i, k, s, op, acc, w8=False):
     """``mfmas``' chunk ``i`` alone: ``op`` (``loads``' entry i) against the
     LDS rows of column group i only (``KGROUP`` columns from local column 0,
     ``xrow`` bf16 a row) -> ``acc``. Groups i = 0, 1, .. in turn accumulate in
@@ -189,7 +283,7 @@ def mfmas_unit(lane, wave, xl, xrow, i, k, s, op, acc):
             xb = fx.Vector.from_elements(
                 [live.select(xb[d], fx.Int32(0)) for d in range(4)], fx.Int32
             )
-        acc = mfma_bf16(op[q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc)
+        acc = mfma_bf16(operand(op[q], w8), xb.bitcast(fx.BFloat16), acc)
     return acc
 
 

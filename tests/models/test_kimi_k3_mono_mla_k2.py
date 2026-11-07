@@ -247,7 +247,9 @@ def _plan(layer_id, *, kda, moe):
 
 def _stub_moe(blocks=1):
     seam = SimpleNamespace(eps=1e-6, out_eps=1e-6)
-    return SimpleNamespace(blocks=blocks, write_idx=-1, seam=seam, ln_eps=1e-6)
+    return SimpleNamespace(
+        blocks=blocks, write_idx=-1, seam=seam, ln_eps=1e-6, w_o_s=None
+    )
 
 
 def _stub_kda(blocks=1):
@@ -258,6 +260,7 @@ def _stub_kda(blocks=1):
         seam=seam,
         onorm_eps=1e-6,
         lower_bound=-5.0,
+        w_in_s=None,
     )
 
 
@@ -286,9 +289,13 @@ def test_forward_pre_o_is_forward_without_o_proj():
         pytest.skip(f"atom.models.kimi_k3.model needs the GPU stack: {error}")
 
     core = torch.ones(2, 4)
-    fake = SimpleNamespace(_gated_core=lambda positions, hidden: (core, None))
-    assert KimiFullAttention.forward_pre_o(fake, None, None) is core
+    fused = []
 
-    quantized = SimpleNamespace(_gated_core=lambda positions, hidden: (core, core))
-    with pytest.raises(AssertionError, match="quantized"):
-        KimiFullAttention.forward_pre_o(quantized, None, None)
+    def gated_core(positions, hidden, fuse_o_quant=True):
+        fused.append(fuse_o_quant)
+        return core, None
+
+    fake = SimpleNamespace(_gated_core=gated_core)
+    assert KimiFullAttention.forward_pre_o(fake, None, None) is core
+    # K2 takes the bf16 core, FP8 o_proj or not: never the gate's fused o_proj quant
+    assert fused == [False]
