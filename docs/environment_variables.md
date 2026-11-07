@@ -35,6 +35,7 @@ limitations](observability/README.md).
 | **ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT** | int | 360000 | DP prefill cost balancing (always on under DP attention with more than one rank; needs the prefill delayer): each lockstep prefill step aims at min(costliest, mean x (1 + slack)) of the ranks' estimated chunk costs, and a costlier rank takes fewer tokens. This is the per-token term of the chunk cost, in attended-context tokens: cost = new tokens x (weight + prior context + new / 2). |
 | **ATOM_DP_PREFILL_BALANCE_SLACK** | float | 0.1 | The target cost is at most mean x (1 + slack) over the ranks that prefill. |
 | **ATOM_DP_PREFILL_BALANCE_MIN_TOKENS** | int | 4096 | Fewest tokens a shrunk rank still prefills in a step. |
+| **ATOM_DSV41_DECODER_FINAL_REQUEST_BUCKET** | bool | false | Opt-in V4.1 bounded-replay decoder tail sizing by the DP-wide maximum finishing-prefill request count. Rounds up using `ATOM_DECODER_GRAPH_SIZES`; beyond the recorded sizes, runs eagerly at the exact count. At least one padding request keeps empty prefilling ranks in the stage collectives. Outer target/decode and DSpark request buckets, capture shapes and TBO are unchanged. Set consistently on every rank before startup. |
 
 ## Prefill delayer (TP/DCP and DP attention)
 

@@ -653,17 +653,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # DeepSeek-V4.1's decoder on a bounded-replay prefill's tail, recorded as a
     # request graph (`models/deepseek_v41/decoder_graph.py`): the comma-separated
-    # `running_bs` to record at. Any other runs the same tail eagerly; empty
-    # records none. `ForwardMode.decide` rounds a step's batch up the cudagraph
-    # capture ladder, so `running_bs` is always a capture size: the default is
-    # the usual ladder (1..8, 12, 16, ...) up to 16. Without 5, 6, 7 and 12,
-    # steps of 5-7 and 9-12 requests ran the decoder eagerly.
+    # request counts to record at. Other counts run the tail eagerly; empty
+    # records none. Final-request bucketing uses this ladder independently
+    # of the outer request bucket.
     "ATOM_DECODER_GRAPH_SIZES": lambda: tuple(
         int(s)
         for s in os.getenv("ATOM_DECODER_GRAPH_SIZES", "1,2,3,4,5,6,7,8,12,16").split(
             ","
         )
         if s.strip()
+    ),
+    # Opt-in V4.1 decoder tail bucket based on the DP-wide maximum number of
+    # requests finishing prefill. The target's outer batch and the drafter
+    # retain running_bs. Captures and TBO retain their declared shapes.
+    "ATOM_DSV41_DECODER_FINAL_REQUEST_BUCKET": lambda: (
+        os.getenv("ATOM_DSV41_DECODER_FINAL_REQUEST_BUCKET", "0").lower()
+        in {"1", "true", "yes", "on"}
     ),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --

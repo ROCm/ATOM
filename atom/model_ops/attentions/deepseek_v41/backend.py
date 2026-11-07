@@ -34,6 +34,7 @@ from atom.model_ops.v4_kernels import make_compress_plans
 from atom.models.deepseek_v41.bounded_replay import (
     ReplayPlan,
     decoder_replay_unsupported,
+    decoder_request_bucket,
     lay_out_tail,
     tail_spans,
     tail_width,
@@ -76,6 +77,37 @@ class DeepseekV41Backend(AttentionBackend):
 class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     capture_owns_cu_seqlens_q = True
     tbo_comm_stream_priority = -1
+    _decoder_running_bs = None
+
+    def build(
+        self,
+        batch,
+        running_bs,
+        running_tokens,
+        max_seqlen_q,
+        *,
+        ubatch_split_bs=None,
+        forward_mode=None,
+    ):
+        # Scoped to this build: direct synthetic capture builders must keep
+        # their declared bucket, never a previous serving step's final count.
+        self._decoder_running_bs = decoder_request_bucket(
+            running_bs,
+            forward_mode,
+            self.geometry.window_size,
+            self.max_num_batched_tokens,
+        )
+        try:
+            return super().build(
+                batch,
+                running_bs,
+                running_tokens,
+                max_seqlen_q,
+                ubatch_split_bs=ubatch_split_bs,
+                forward_mode=forward_mode,
+            )
+        finally:
+            self._decoder_running_bs = None
 
     # Reuse V4's publisher and staging contract, including fixed addresses and
     # running_bs padding. Only pool-slot -> physical-row geometry differs.
@@ -220,6 +252,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 self._step_buffer_copies(DECODER_ROWS, self._step_buffer_names())
                 | self._decoder_layout_buffers()
             )
+            if envs.ATOM_DSV41_DECODER_FINAL_REQUEST_BUCKET:
+                logger.info(
+                    "V4.1 decoder final-request bucketing enabled; ladder=%s",
+                    envs.ATOM_DECODER_GRAPH_SIZES,
+                )
         # Before the memory profile, so the budget counts it; and so before
         # the pool is sized, which its packed logits follow: the weights are
         # in, so what is left of the budget bounds the PAGEs from above.
@@ -813,13 +850,18 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     def _publish_decoder(self, step, rows, cache, running_bs):
         """The `ReplayPlan` of the rows a replaying prefill's decoder runs on:
         each finishing request's last window rows (`tail_spans`), its window
-        starting there, laid out for ``running_bs`` requests (`lay_out_tail`)
+        starting there, laid out for the decoder's agreed request bucket
+        (`lay_out_tail`), or the declared ``running_bs`` during capture,
         as a step of their own in the `DECODER_ROWS` buffers -- one set of
         addresses per request bucket, so its recording (`DecoderGraph`) reads
         what every replay publishes. No compress plan: the forward's
         compression ran over every row."""
+        if self._decoder_running_bs is not None:
+            running_bs = self._decoder_running_bs
         window = self.geometry.window_size
         picks = tail_spans(step, window)
+        if len(picks) > running_bs:
+            raise ValueError("Decoder bucket does not hold this rank's final requests")
         width = tail_width(running_bs, window, self.max_num_batched_tokens)
         layout = lay_out_tail(picks, running_bs, width)
         lengths = np.asarray([n for _, n, _ in picks], dtype=np.int32)

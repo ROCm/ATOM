@@ -17,6 +17,7 @@ from atom.utils.region_graph import eager_region, token_graph
 from .bounded_replay import (
     carry_selections,
     decoder_replay_unsupported,
+    decoder_request_bucket,
     decoder_runs,
     decoder_stages,
     late_layer_start,
@@ -363,7 +364,12 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             return self._replayed(state, running_tokens, step.decoder)
         # Every row through every layer; beside replaying DP peers, under the
         # tail's stages they run (`decoder_stages`).
-        running_bs = forward.context.running_bs
+        running_bs = decoder_request_bucket(
+            forward.context.running_bs,
+            forward.context.forward_mode,
+            self.window,
+            self.tail_capacity,
+        )
         stages = decoder_stages(
             forward,
             self.parallel_config,

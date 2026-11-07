@@ -130,6 +130,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         max_seqlen_q: int,
         *,
         ubatch_split_bs: int | None = None,
+        forward_mode: ForwardMode | None = None,
     ):
         raise NotImplementedError
 
@@ -1006,12 +1007,16 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         max_seqlen_q: int,
         *,
         ubatch_split_bs: int | None = None,
+        forward_mode: ForwardMode | None = None,
     ):
         """Build this step's metadata at the shape `prepare_inputs` settled.
 
         ``ubatch_split_bs`` is the decode batch the step's TBO micro-batches
         are cut from (`ForwardMode.ubatch_split_bs`), which a backend's
         per-ubatch metadata covers (`_ubatch_split_bs`).
+
+        ``forward_mode`` supplies the agreed DP counts to backends that select
+        a separate shape for a model stage, such as V4.1's decoder tail.
 
         The step's two units and nothing else: `running_bs` sizes everything
         per-sequence, `running_tokens` everything per-row. Both arrive as

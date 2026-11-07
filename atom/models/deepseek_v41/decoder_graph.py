@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """DeepSeek-V4.1's decoder on a replayed prefill's tail, as a request graph.
 
-`bounded_replay` lays a tail out for the step's ``running_bs`` requests, at
+`bounded_replay` lays a tail out for the decoder's request bucket, at
 addresses every step of that request bucket shares, so the decoder -- layer
 20's attention and FFN, layers 21-38, layer 39 -- records once per bucket as a
 `ReqGraph` and replays with no Python. A rank finishing no prompt replays its
@@ -98,7 +98,7 @@ class DecoderGraph:
 
     def _replays(self, forward, key) -> bool:
         """A recording serves the step: one exists for its bucket (the
-        group's `running_bs`), no token-bucket pass is recording around it,
+        group's decoder request count), no token-bucket pass is recording around it,
         and the DP group replays request graphs as one, as a decode's whole
         forward does (`ForwardMode.req_graphs`) -- an image prefill, whose rows
         the MoE router routes on their mask, being a step the group refuses a
