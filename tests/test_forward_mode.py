@@ -47,9 +47,9 @@ def _batch(*, seqs, tokens=None, prefill_tokens=0, q=1):
     )
 
 
-def _decide(batch=None, captured_tokens=None, **kw):
-    """``captured_tokens``: the decode token buckets recorded, which `decide`
-    reads off `TokenGraph`."""
+def _decide(batch=None, captured_tokens=None, captured_prefill=None, **kw):
+    """``captured_tokens`` / ``captured_prefill``: the decode / prefill token
+    buckets recorded, which `decide` reads off `TokenGraph`."""
     base = {
         "batch": batch if batch is not None else _batch(seqs=8, q=1),
         "dp_size": 1,
@@ -68,7 +68,10 @@ def _decide(batch=None, captured_tokens=None, **kw):
     merged.setdefault(
         "running_tokens_per_dp_rank", np.zeros(merged["dp_size"], dtype=np.int32)
     )
-    sizes = {"decode": tuple(captured_tokens or ())}
+    sizes = {
+        "decode": tuple(captured_tokens or ()),
+        "prefill": tuple(captured_prefill or ()),
+    }
     with mock.patch.object(
         TokenGraph,
         "captured_sizes",
@@ -580,6 +583,43 @@ def test_no_token_graph_when_a_rank_refuses_or_exceeds_the_largest_bucket():
         own, running = _bucket(sync)
         assert own == 0
         assert running == sync.scheduled_tokens_per_dp_rank.tolist()
+
+
+# --------------------------------------------------------------------------- #
+# Over-band prefill (V4.1): the decoder graph answers for itself.             #
+# --------------------------------------------------------------------------- #
+
+
+def _over_band(batch=None, **kw):
+    """A prefill the backend refuses as a whole (`step_needs_eager`)."""
+    batch = batch or _batch(seqs=2, tokens=300, prefill_tokens=300)
+    return _decide(batch, step_needs_eager=True, captured_prefill=BUCKETS, **kw)
+
+
+def test_an_over_band_prefill_runs_eagerly_without_the_decoders_answer():
+    for mode in (_over_band(), _over_band(decoder_needs_eager=True)):
+        assert not mode.token_graph and not mode.req_graphs
+        assert mode.running_tokens == 300
+
+
+def test_an_over_band_prefill_replays_only_the_decoder_graph_it_allows():
+    mode = _over_band(decoder_needs_eager=False)
+    assert mode.req_graphs and not mode.use_cudagraph
+    assert not mode.token_graph and mode.running_tokens == 300
+
+
+def test_the_decoders_answer_does_not_override_forced_eager_decode_or_dp(
+    monkeypatch,
+):
+    forced = _over_band(enforce_eager=True, decoder_needs_eager=False)
+    assert not forced.req_graphs
+    decode = _decide(
+        _batch(seqs=8, q=1), step_needs_eager=True, decoder_needs_eager=False
+    )
+    assert not decode.use_cudagraph and not decode.req_graphs
+    _fake_sync(monkeypatch, peer_tokens=300, peer_bs=2, peer_prefill=True)
+    dp = _over_band(dp_size=2, dp_group=object(), decoder_needs_eager=False)
+    assert not dp.req_graphs
 
 
 # --------------------------------------------------------------------------- #
