@@ -32,6 +32,7 @@ from atom.distributed.pcp_utils import (
     pcp_all_reduce,
     pcp_reduce_scatter,
 )
+from atom.distributed.ulysses_sp import sp_is_enabled
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.eplb import (
@@ -63,6 +64,7 @@ from atom.model_ops.fused_moe.modular_kernel import (
 )
 from atom.model_ops.fused_moe.mori_prepare_finalize import (
     MoriPrepareAndFinalize,
+    use_mori_low_latency,
 )
 from atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4 import Mxfp8SharedIntoMxfp4
 from atom.model_ops.fused_moe.routed_rows import (
@@ -320,12 +322,10 @@ class FusedMoEParallelConfig:
             get_prefill_context_model_parallel_world_size,
         )
 
-        pcp_merge = (
-            envs.ATOM_PCP_MOE_MERGE
-            and get_prefill_context_model_parallel_world_size() > 1
-        )
+        pcp_size = get_prefill_context_model_parallel_world_size()
+        # SP always folds its group, which shares the PCP rank dimension.
+        pcp_merge = pcp_size > 1 and (envs.ATOM_PCP_MOE_MERGE or sp_is_enabled())
         if pcp_merge:
-            pcp_size = get_prefill_context_model_parallel_world_size()
             pcp_rank = get_prefill_context_model_parallel_rank()
             tp_rank = pcp_rank * tp_size + tp_rank
             tp_size = pcp_size * tp_size
@@ -642,23 +642,25 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 ),
             )
 
+        # gfx1250: MegaMoE over mori's cco instead of the gfx942/950-only v1
+        # kernels. Gated by ATOM_MORI_V2, and decided before anything reads
+        # .all2all_manager, which would pin the default (v1) manager.
+        if moe.use_mori_kernels and envs.ATOM_MORI_V2:
+            from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                make_mori_v2_prepare_finalize,
+            )
+
+            return make_mori_v2_prepare_finalize(
+                moe,
+                ep_group.device_communicator.get_or_create_all2all_manager("mori_v2"),
+            )
+
         all2all_manager = ep_group.device_communicator.all2all_manager
         assert all2all_manager is not None
 
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
-            from atom.utils import envs as _atom_envs
-
-            # gfx1250: use mori dispatch_combine_v2 (cco/FlyDSL) instead of the
-            # gfx942/950-only v1 kernels. Gated by ATOM_MORI_V2.
-            if _atom_envs.ATOM_MORI_V2:
-                from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
-                    make_mori_v2_prepare_finalize,
-                )
-
-                return make_mori_v2_prepare_finalize(moe, all2all_manager)
-
             assert quant_config is not None
 
             # One branch decides the whole wire format: the dtype dispatch() will
@@ -686,7 +688,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # dtype above -- MoRI infers dispatch from the tensor, combine from this.
             mori_combine_quant_type = envs.ATOM_MORI_COMBINE_QUANT
             tbo_is_enabled = tbo_enabled()
-            low_latency = moe.moe_parallel_config.low_latency
+            low_latency = use_mori_low_latency(
+                moe.moe_parallel_config.low_latency, all2all_manager.internode
+            )
             if all2all_manager.internode and mori_combine_quant_type != "none":
                 # MoRI registers no blockwise combine kernel for these; without
                 # this it fails later, at kernel lookup.
@@ -791,9 +795,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # told the expert-GEMM recipe that only the layer + this quant method
             # know. Here is also the last point before any cudagraph capture, and
             # it allocates a cco arena and JIT-compiles its kernels.
-            bind_mega = getattr(prepare_finalize, "bind_mega_transport", None)
-            if bind_mega is not None:
-                bind_mega(layer, self)
+            if mori_v2:
+                prepare_finalize.bind_mega_transport(layer, self)
+                assert (
+                    prepare_finalize.mega is not None
+                ), "MoriV2ModularKernel has no MegaMoE to run"
 
         comm_fused = getattr(layer, "_comm_fused_moe", None)
         if comm_fused is not None:
@@ -2057,6 +2063,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
+    def activation_dtype(self, layer, tokens):
+        """The activation dtype fused_moe quantizes `tokens` rows to."""
+        from aiter.fused_moe import resolve_activation_dtype
+
+        return resolve_activation_dtype(
+            self.quant_type,
+            layer.w13_weight.dtype,
+            activation=layer.activation,
+            gate_mode=(
+                GateMode.INTERLEAVE if self.is_guinterleave else GateMode.SEPARATED
+            ),
+            M=tokens,
+            gate_up_interleave=getattr(layer.w13_weight, "gate_up_interleave", None),
+        )
+
     @mark_trace
     def select_experts(
         self, layer: torch.nn.Module, x: torch.Tensor, router_logits: torch.Tensor
@@ -2612,7 +2633,8 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
 def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
-    if get_current_atom_config().moe_backend == "mega":
+    # Under SP, `mega` runs SP MegaMoE over the native weights instead.
+    if get_current_atom_config().moe_backend == "mega" and not sp_is_enabled():
         return MegaMxfp4MoEMethod(quant_config, moe)
     return Mxfp4MoEMethod(quant_config, moe)
 
@@ -3527,6 +3549,8 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
+        # Attached by `initialize_sp_mega_moe` under -sp --moe-backend mega.
+        self.sp_mega_moe = None
         self._comm_fused_moe = None
         if enable_comm_fused:
             from atom.model_ops.fused_moe.comm_fused_moe import (
@@ -3889,7 +3913,7 @@ class FusedMoE(torch.nn.Module):
         self._validate_moe_backend()
 
     def _validate_moe_backend(self) -> None:
-        if get_current_atom_config().moe_backend != "mega":
+        if get_current_atom_config().moe_backend != "mega" or sp_is_enabled():
             return
         if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
             raise TypeError(
@@ -5349,15 +5373,19 @@ class FusedMoE(torch.nn.Module):
         """The experts on the routed rows (`x_scale`: they are in the method's
         `routed_rows_wire` already), still on logical experts: placed on the
         physical ones (`place_experts`) after every gather. `gathered`: a DP
-        gather made them the group's. Where ATOM_PCP_MOE_MERGE folds the PCP
-        group into the expert sharding, every PCP rank runs them over the same
-        rows: a split pass gathers its rows rank-major first, in that wire,
-        and reduce-scatters the partial sums back; any other real pass already
-        holds the same rows on every PCP rank and all-reduces. Only rows no
-        gather moved are counted (`pass_scheduled_tokens_gpu`)."""
+        gather made them the group's. Where ATOM_PCP_MOE_MERGE or SP folds the
+        PCP group into the expert sharding, every PCP rank runs them over the
+        same rows: a split pass (every SP pass) gathers its rows rank-major
+        first, in that wire, and reduce-scatters the partial sums back; any
+        other real pass already holds the same rows on every PCP rank and
+        all-reduces. Rows no gather moved are counted
+        (`pass_scheduled_tokens_gpu`), and so are an SP gather's: its shards
+        are contiguous, so the step's real rows lead."""
         context = get_forward_context().context
-        pcp = self.moe_parallel_config.pcp_merge and not context.is_dummy_run
-        split = pcp and context.pcp_split
+        merge = self.moe_parallel_config.pcp_merge
+        pcp = merge and not context.is_dummy_run
+        # SP marks its dummy and captured passes split too.
+        split = merge and context.pcp_split and (pcp or sp_is_enabled())
         if split:
             rows = pack_routed_rows(
                 self.quant_method.routed_rows_wire,
@@ -5394,8 +5422,14 @@ class FusedMoE(torch.nn.Module):
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             prefix=f"{self.prefix}.fused_moe",
             x_scale=x_scale,
+            # Pure-TP padded graphs require ROCm/aiter#7294: its FlyDSL,
+            # FlyDSL-v2, and native-MXFP4 stage2 paths reject the sorting
+            # sentinel at the real token count instead of scattering every
+            # padded expert slot into that row.
             scheduled_tokens_gpu=(
-                None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
+                context.scheduled_tokens_gpu
+                if split and sp_is_enabled()
+                else None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
             ),
         )
         if split:
@@ -5496,6 +5530,12 @@ class FusedMoE(torch.nn.Module):
 
     def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
+
+        # Decided here, at run time: the row count is symbolic while compiling.
+        if self.sp_mega_moe is not None and self.sp_mega_moe.runs(
+            hidden_states.shape[0]
+        ):
+            return self.sp_mega_moe.forward(self, hidden_states, router_logits)
 
         if get_dp_group().world_size > 1:
             return self.forward_impl_graph(hidden_states, router_logits)

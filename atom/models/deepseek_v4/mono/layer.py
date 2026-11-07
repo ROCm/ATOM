@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.models.deepseek_v4.mono.config import (
     MAX_LAYERS_PER_STEP,
@@ -424,5 +425,5 @@ class Dsv4MonoKernel:
             cfg.index_topk_source_layer,
         )
         for launch in self.launches:
-            launch(*args, stream=torch.cuda.current_stream())
+            _run_compiled(launch, *args, torch.cuda.current_stream())
         return x_out

@@ -241,14 +241,24 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # the embedding BF16; the shard loader rejects any dtype mismatch.
             # PLE uses a global scalar, independently of the linear block scales.
             embedding_cls = _Qwen4ExpFP8Embedding
-        self.ngram_embedding = embedding_cls(
-            self.table_rows, self.head_dim, prefix=embedding_prefix
-        )
         # The 128 checkpoint shards are slices of the PADDED table, so the
         # shard width divides it exactly.
         self.checkpoint_shard_rows = (
             self.table_rows + self.split_ngram_parts - 1
         ) // self.split_ngram_parts
+        from atom.models.qwen38.mono.ple import make_host_embedding
+
+        self.ngram_embedding = make_host_embedding(
+            self.table_rows,
+            self.head_dim,
+            self.checkpoint_shard_rows,
+            embedding_prefix,
+            fp8=embedding_cls is _Qwen4ExpFP8Embedding,
+        )
+        if self.ngram_embedding is None:
+            self.ngram_embedding = embedding_cls(
+                self.table_rows, self.head_dim, prefix=embedding_prefix
+            )
         self.ngram_embedding.weight.weight_loader = self._embedding_shard_loader
 
         self.max_total_tokens = max_total_tokens
@@ -310,6 +320,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             return
         rows = overlap_end - overlap_start
         source = loaded_weight.narrow(0, overlap_start - checkpoint_start, rows)
+        load_rows = getattr(embedding, "load_rows", None)
+        if load_rows is not None:
+            load_rows(shard_index, overlap_start, source)
+            return
         target = param.data.narrow(0, overlap_start - tp_start, rows)
         target.copy_(source)
 
@@ -352,6 +366,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
 
 class Qwen4ExpPLELayer(nn.Module):
+    # RTP may install a per-instance writer for prefix-cache side state.
+    _state_checkpoint_writer = None
+
     def __init__(
         self,
         config,
@@ -530,4 +547,13 @@ class Qwen4ExpPLELayer(nn.Module):
             metadata.has_initial_state,
             metadata.num_accepted_tokens,
         )
+        checkpoint_writer = getattr(self, "_state_checkpoint_writer", None)
+        if checkpoint_writer is not None:
+            checkpoint_writer(
+                input_ids,
+                normalized,
+                metadata,
+                history_width=self.ple_embedding.ngram_size - 1,
+                conv_state_len=self.conv_state_len,
+            )
         return gated_value.flatten(-2) + conv_output

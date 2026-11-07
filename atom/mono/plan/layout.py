@@ -17,3 +17,19 @@ def pair_layout(items, align: int = PAIR_BYTES, start: int = 0) -> dict:
         out[name] = (off, pairs * PAIR_BYTES)
         off += pairs * PAIR_BYTES
     return out
+
+
+def byte_layout(items, align: int = 16, start: int = 0) -> dict:
+    """``items`` (name, bytes) of plain words laid out in order: name -> (byte
+    offset, bytes), each region from an ``align``-byte boundary at or past
+    ``start``.
+
+    Plain words never share a buffer with tagged pairs: one launch's stale
+    plain word in a later launch's tag position can equal that launch's tag,
+    and its poll takes the pair as landed."""
+    out, off = {}, start
+    for name, nbytes in items:
+        off = (off + align - 1) // align * align
+        out[name] = (off, nbytes)
+        off += nbytes
+    return out

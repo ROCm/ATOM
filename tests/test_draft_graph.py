@@ -157,6 +157,14 @@ def test_fixed_storage_accessor_checks_role_and_capacity():
         g.buffer("row", 257)
 
 
+def test_staging_an_undeclared_role_names_it():
+    g = _graph()
+    with pytest.raises(
+        AssertionError, match=r"\['missing'\]; declared roles are \['row'\]"
+    ):
+        g.stage(1, {"missing": torch.zeros(1, dtype=torch.int32)})
+
+
 def test_staging_rejects_a_wrong_trailing_shape_before_identity_check():
     g = _graph(inputs={"row": StagedInput(shape=(4,), dtype=torch.int32)})
     wrong = g._buffers["row"][:2, :1]
@@ -171,16 +179,53 @@ def test_staging_a_wrong_dtype_fails_loudly():
 
 
 def test_staging_a_source_whose_leading_axis_is_not_the_batch_fails_loudly():
-    """Every staged source is indexed as `[rows, *StagedInput.shape]`.
+    """Every leading-batch source is indexed as `[rows, *StagedInput.shape]`.
 
     MRoPE positions are the live case: they keep the token axis LAST (`[3, N]`),
-    so a drafter must not hand them to a pass at all. Without this the mismatch
+    so a drafter must declare them `batch_dim=1`. Without this the mismatch
     surfaced as a `copy_` size error two frames down, which reads like a
     batch-size bug rather than a layout one.
     """
     g = _graph()
-    with pytest.raises(AssertionError, match="leading axis is not the batch"):
+    with pytest.raises(AssertionError, match="batch at axis 0"):
         g._stage_one("row", 8, torch.zeros(3, 8, dtype=torch.int32))
+
+
+def _mrope_graph():
+    return _graph(
+        inputs={
+            "pos": StagedInput(shape=(3,), dtype=torch.int64, batch_dim=1),
+            "row": StagedInput(dtype=torch.int32),
+        }
+    )
+
+
+def test_a_batch_dim_1_input_stages_columns_and_tail_repeats_the_last_one():
+    """MRoPE positions stage as the first `bs` columns of one `[3, max_num_seqs]`
+    buffer, beside a leading-batch input a producer filled in place
+    (`hidden_states`)."""
+    g = _mrope_graph()
+    src = torch.arange(6, dtype=torch.int64).view(3, 2) * 10
+    g.buffer("row", 2).copy_(torch.tensor([1, 2], dtype=torch.int32))
+    staged = g.stage(4, {"pos": src, "row": g.buffer("row", 2)})
+    pos = staged["pos"]
+    assert pos.shape == (3, 4)
+    assert pos.stride() == (g._buffers["pos"].shape[1], 1)
+    assert pos.tolist() == [[0, 10, 10, 10], [20, 30, 30, 30], [40, 50, 50, 50]]
+    assert staged["row"].tolist() == [1, 2, 2, 2]
+    assert pos.data_ptr() == g._buffers["pos"].data_ptr()
+
+
+def test_a_batch_dim_1_producer_view_is_the_front_of_the_staged_one():
+    """`buffer(role, scheduled_bs)` is a prefix of the `running_bs` view at the
+    same stride, so staging a fill of it pads after it and copies nothing over
+    it."""
+    g = _mrope_graph()
+    fill = g.buffer("pos", 2)
+    fill.copy_(torch.tensor([[1, 2], [3, 4], [5, 6]]))
+    pos = g.stage(4, {"pos": fill})["pos"]
+    assert pos.data_ptr() == fill.data_ptr() and pos.stride() == fill.stride()
+    assert pos.tolist() == [[1, 2, 2, 2], [3, 4, 4, 4], [5, 6, 6, 6]]
 
 
 def test_sources_that_disagree_on_the_batch_are_refused():
@@ -197,6 +242,17 @@ def test_sources_that_disagree_on_the_batch_are_refused():
             {
                 "a": torch.zeros(3, dtype=torch.int32),
                 "b": torch.zeros(5, dtype=torch.int32),
+            },
+        )
+
+
+def test_batch_dim_1_sources_must_agree_with_leading_ones():
+    with pytest.raises(AssertionError, match="batches of"):
+        _mrope_graph().stage(
+            4,
+            {
+                "pos": torch.zeros(3, 2, dtype=torch.int64),
+                "row": torch.zeros(3, dtype=torch.int32),
             },
         )
 

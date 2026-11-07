@@ -67,6 +67,54 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             self._rtp_mtp_request_capacity = max_batch
         self._atom_attn_pyobj = _Qwen4ExpAttnPyObj(self)
 
+    def copy_plugin_cache_blocks(self, mapping: torch.Tensor, tags: list[str]) -> None:
+        """Mirror RTP's tagged block relocations into QSA and PLE side pools.
+
+        RTP invokes this before eager forward *and* graph replay. A prefix hit
+        keeps the same physical block; only copy-on-write relocations appear
+        in ``mapping``. The RTP-owned KV/GDN pools are copied separately.
+        """
+        if mapping.device.type != "cpu" or mapping.ndim != 2 or mapping.shape[1] != 3:
+            raise ValueError("plugin cache copy requires a CPU int32 [N,3] mapping")
+        if mapping.dtype != torch.int32:
+            raise ValueError("plugin cache copy requires int32 block IDs")
+        if not mapping.numel():
+            return
+        side_pools: dict[str, list[torch.Tensor]] = {"full": [], "linear": []}
+        qsa_layers = [
+            module
+            for module in self._rtp_layer_maps[1].values()
+            if getattr(module, "is_qsa_attention", False)
+        ]
+        if qsa_layers:
+            self._rtp_forward_context_cls._bind_qsa_caches(
+                self, qsa_layers, int(self.kv_cache.get_seq_size_per_block("full"))
+            )
+            for module in qsa_layers:
+                side_pools["full"].extend(
+                    (module.raw_key_cache, module.compressed_key_cache)
+                )
+                if module.rope_position_cache is not None:
+                    side_pools["full"].append(module.rope_position_cache)
+        self._rtp_forward_context_cls._bind_ple_caches(
+            self, self.model, self._rtp_layer_maps[0]
+        )
+        if hasattr(self, "_rtp_ple_ngram"):
+            side_pools["linear"].extend((self._rtp_ple_ngram, self._rtp_ple_conv))
+        copies = mapping.tolist()
+        # Validate the entire mapping before touching any side pool. RTP may
+        # chain copies, so the second pass must still preserve row order.
+        for row, src, dst in copies:
+            if row < 0 or row >= len(tags):
+                raise ValueError(f"plugin cache copy has invalid tag row {row}")
+            for pool in side_pools.get(tags[row], ()):
+                if src < 0 or dst < 0 or src >= pool.shape[0] or dst >= pool.shape[0]:
+                    raise ValueError("plugin cache copy has out-of-range block ID")
+        for row, src, dst in copies:
+            for pool in side_pools.get(tags[row], ()):
+                if src != dst:
+                    pool[dst].copy_(pool[src])
+
     def prepare_fmha_impl(self, inputs, is_cuda_graph: bool = False):
         tagged = inputs.attention_inputs
         if not isinstance(tagged, dict):
@@ -646,15 +694,15 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
             raise ValueError(
                 "Qwen4Exp QSA cache requires positive, ratio-aligned block geometry"
             )
-        # RTP's prefix cache only retains its owned KV/linear-state pools. A
-        # prefix hit would skip the QSA index and PLE history writes while
-        # reusing their physical slots, so those separate pools cannot yet be
-        # restored correctly. Per-request reuse_cache is ANDed with this flag.
         if getattr(kv_cache_config, "multi_task_prompt", None) or getattr(
             kv_cache_config, "multi_task_prompt_str", None
         ):
             raise ValueError("Qwen4Exp RTP plugin does not support cached task prompts")
-        kv_cache_config.reuse_cache = False
+        # RTP's plugin block-copy callback must accompany reuse_cache so QSA/PLE
+        # side pools follow copy-on-write relocations.
+        model_config.atom_qwen4_exp_prefix_cache_enabled = bool(
+            kv_cache_config.reuse_cache
+        )
 
         # _bind_qsa_caches allocates both BF16 arrays for *every* FULL block
         # on this rank: [block, 1, dim] and [block/ratio, 1, dim].
@@ -694,6 +742,7 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
     def _create_python_model(self):
         from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
         from atom.plugin.prepare import _set_framework_backbone, prepare_model
+        from atom.plugin.rtpllm.utils.topk_compat import install_rtp_topk_compat
 
         target_device = torch.device(self.device)
         target_dtype = self.model_config.compute_dtype
@@ -703,6 +752,7 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
             torch.set_default_device(target_device)
             torch.set_default_dtype(target_dtype)
             _set_framework_backbone("rtpllm")
+            install_rtp_topk_compat()
             atom_model = prepare_model(config=self, engine="rtpllm")
             atom_model = atom_model.to(target_device)
             if getattr(self.model_config, "atom_qwen4_exp_mtp_target", False):
@@ -712,6 +762,18 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
 
                 bind_qwen4_exp_mtp_hooks(atom_model)
                 atom_model.model.return_hc_state = True
+            if getattr(self.model_config, "atom_qwen4_exp_prefix_cache_enabled", False):
+                from atom.plugin.rtpllm.utils.gdn_checkpoint import (
+                    install_rtp_gdn_checkpoint_writer,
+                    install_rtp_native_prefill_snapshot,
+                )
+                from atom.plugin.rtpllm.utils.qwen4_exp_prefix_cache import (
+                    bind_ple_checkpoint_hooks,
+                )
+
+                install_rtp_gdn_checkpoint_writer()
+                install_rtp_native_prefill_snapshot()
+                bind_ple_checkpoint_hooks(atom_model)
             load_model_in_plugin_mode(
                 model=atom_model,
                 config=atom_model.atom_config,

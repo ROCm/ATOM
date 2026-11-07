@@ -9,6 +9,7 @@ stops the engine instead of releasing memory the server may still use.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import deque
 from collections.abc import Iterable, Sequence
@@ -48,15 +49,15 @@ class _PendingSave:
     started_at: float = field(default_factory=lambda: time.monotonic())
 
 
-_DEFAULT_TRANSFER_DEADLINE_S = 1200.0
+_DEFAULT_TRANSFER_DEADLINE_S = 30.0
 # The scheduler watches the same operations from dispatch, a step or more
 # before a worker submits them. The margin lets the worker, which can name the
 # exact transfer, fail first.
-_SCHEDULER_DEADLINE_MARGIN_S = 60.0
+_SCHEDULER_DEADLINE_MARGIN_S = 10.0
 
 
 class LMCacheTransferUnprovable(RuntimeError):
-    """An MP transfer never reached a terminal state within the deadline."""
+    """An MP transfer failed or exceeded its deadline without proving DMA safety."""
 
 
 def _transfer_deadline_s(config: Any) -> float:
@@ -73,8 +74,8 @@ def _transfer_deadline_s(config: Any) -> float:
     deadline = float(
         extra.get("lmcache.mp.transfer_deadline_s", _DEFAULT_TRANSFER_DEADLINE_S)
     )
-    if not deadline > 0:
-        raise ValueError("lmcache.mp.transfer_deadline_s must be > 0")
+    if not math.isfinite(deadline) or deadline <= 0:
+        raise ValueError("lmcache.mp.transfer_deadline_s must be finite and > 0")
     return deadline
 
 
@@ -121,15 +122,14 @@ def _terminal_future_result(future: Any | None) -> tuple[bool, Any]:
         if not future.query():
             return False, None
         return True, future.result(timeout=0)
-    except Exception:
+    except Exception as exc:
         # A query/result exception is not proof that the remote GPU stream has
-        # quiesced. Keep the operation pending; the transfer deadline bounds a
-        # future that keeps raising.
-        logger.warning(
-            "LMCache MP transfer future could not prove terminal state",
-            exc_info=True,
-        )
-        return False, None
+        # quiesced. Fail the engine immediately, retaining the pending lease:
+        # a known failure must not masquerade as a slow transfer for 20 minutes.
+        raise LMCacheTransferUnprovable(
+            "LMCache MP transfer failed without proof that remote GPU work "
+            f"stopped; retaining its memory and stopping the engine: {exc}"
+        ) from exc
 
 
 def _transfer_operation_id(kind: str, completion: Any) -> str:

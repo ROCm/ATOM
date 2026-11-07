@@ -84,8 +84,51 @@ duplicate qualified names are rejected.
 
 Reasoning is delivered in reasoning_content, answer text in content, and calls
 in tool_calls. The existing tool_choice="none" suppression is preserved.
-Named/required tool choices and response_format do not add constrained
-decoding in this phase.
+With the optional structured-output backend, `response_format` constrains JSON
+during decoding and allows declared DSML tool calls as a separate alternative.
+See [structured output](structured_output_capabilities.md) for supported formats
+and deployment limits.
+
+## Beta endpoints
+
+`/beta/chat/completions` is the chat endpoint plus DeepSeek's prefix
+completion: a final assistant message with `"prefix": true` is continued
+rather than answered, and the response carries only what the model adds.
+Earlier messages render exactly as for an ordinary request and the prefix is
+appended to the opened assistant turn, so for V4.1 the prompt equals the
+official encoder's unterminated (`wo_eos`) assistant turn. When the reply
+begins in the reasoning channel -- thinking mode, or a model that starts there
+with no marker, like DeepSeek-R1 -- a `reasoning_content` alone continues the
+chain of thought; with `content` the channel is closed and the answer
+continues; `content` alone closes the channel empty. On Kimi-K3's channel
+format the response channel is opened before the content. The flag is
+rejected on any but the last message, after another assistant message, with
+`tool_calls`, with non-text content, and with image input, `prompt_token_ids`
+or `response_format`; `reasoning_content` is rejected when the reply does not
+begin in reasoning (thinking off, or a model such as Qwen3 that opens the
+channel itself).
+
+`/beta/completions` is the completions endpoint plus fill-in-the-middle: with
+`suffix`, the prompt is `BOS <｜fim▁begin｜>prompt<｜fim▁hole｜>suffix<｜fim▁end｜>`
+and the model writes the middle, ending at EOS. The format is recognised by
+those markers each encoding to a single token. V4.1 starts the middle with
+its line break rather than ending with one, so a cursor at the end of a line
+pairs with a suffix that begins with `\n`. `suffix` is rejected with token-ID
+prompts and on a model without FIM tokens; without `suffix` the endpoint is an
+ordinary completion. `echo` returns the prompt ahead of the completion and is
+rejected with `suffix`. `logprobs` (0 to 20) is rejected until completions
+return token probabilities. On a V4.1 deployment the stream ends as DeepSeek
+documents it, as Chat already does there: the last chunk, the one with
+`finish_reason`, carries the request's `usage` and no usage-only chunk
+follows; `stream_options` requires `stream`, and its `include_usage` adds
+`usage: null` to every earlier chunk. Other deployments keep the usage chunk
+`/v1` sends.
+
+On both beta endpoints `stop` takes one string or a list. The `/v1`
+endpoints are unchanged: they ignore `prefix`, `suffix`, `echo`, `logprobs`
+and completions' `stream_options`, as before. The beta endpoints are served by
+the ATOM API server itself; the mesh router does not route them yet, so a
+deployment behind it (DP or P/D through the mesh) does not offer them.
 
 ## Validation
 
