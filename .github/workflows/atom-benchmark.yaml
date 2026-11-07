@@ -16,13 +16,18 @@ on:
         description: "Pinned AITER revision matching PR2724's OPUS API"
         type: string
         default: cdd2259d79d87148e46909da5d328131d659323b
+      scope:
+        description: "Rerun accuracy alone without repeating successful benchmarks"
+        type: choice
+        default: all
+        options: [all, accuracy]
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: pr2877-flash-${{ github.ref }}
+  group: pr2877-flash-${{ github.ref }}-${{ inputs.scope }}
   cancel-in-progress: false
 
 jobs:
@@ -82,6 +87,7 @@ jobs:
   benchmark:
     name: ${{ matrix.mode }} ${{ matrix.workload.isl }}-1024 c${{ matrix.workload.conc }}
     needs: kernels
+    if: inputs.scope != 'accuracy'
     strategy:
       fail-fast: false
       matrix:
@@ -163,10 +169,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "${MODEL_HOST_ROOT:-}" ]; then model_path="/models/$MODEL_PATH"; else model_path="$MODEL_PATH"; fi
+          echo "SERVED_MODEL_PATH=$model_path" >> "$GITHUB_ENV"
           echo ".github/scripts/atom_test.sh launch $model_path $SERVER_ARGS" | docker exec -i "$CONTAINER_NAME" bash -l
       - name: Run full GSM8K 3-shot
         timeout-minutes: 35
-        run: docker exec -e ACCURACY_TIMEOUT_MINUTES=30 "$CONTAINER_NAME" bash .github/scripts/atom_test.sh accuracy "$MODEL_PATH"
+        run: docker exec -e ACCURACY_TIMEOUT_MINUTES=30 "$CONTAINER_NAME" bash .github/scripts/atom_test.sh accuracy "$SERVED_MODEL_PATH"
       - name: Check existing Flash accuracy threshold
         run: |
           docker exec -i "$CONTAINER_NAME" python3 - <<'PY'
