@@ -836,7 +836,7 @@ models:
             common:
               <<: *glm52_agentic_lmcache_cpp4_dcp4_env_common
               ATOM_PD_MLA_STAGING: "1"
-              ATOM_PD_MLA_LANDING: "1"
+              ATOM_PD_MLA_LANDING: "0"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
               VLLM_PP_LAYER_PARTITION: "20,20,20,18"
