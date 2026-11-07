@@ -205,6 +205,7 @@ def test_producer_advertises_remote_pp_size():
         output_tokens=[7],
         spec_token_ids=None,
         block_table=[1, 2, 3],
+        num_prompt_tokens=3 * 64,
         id=99,
         state_slot=7,
         state_slots=[],
