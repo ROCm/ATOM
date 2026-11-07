@@ -16629,6 +16629,42 @@ models:
             common:
               ATOMESH_M31_VLLM_SHA: 0f1fbe69071cf155e64468849186d808d0bc4141
               ATOMESH_M31_D_MAX_SEQS: "12"
+        # The image of InferenceX #4866's MI355X lane with its opt-in ROCm switches on P and D. vLLM is
+        # 4fab5a07 + PR 63483 (head 3a7ba0e13) + PR 65822 (head 2029713aa), Python only.
+        - &m31_moriio_1p2d_n4fab_case
+          <<: *m31_moriio_1p2d_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n4fab-c64-dcap16
+          image: vllm/vllm-openai-rocm:nightly-4fab5a07475822c6eaa971dceb2e2220d0446808@sha256:6f126f27a3b58959da3c16076248fc99eb31e26d0a3ae9f8563bda7317d6a7e6
+          concurrency: [64]
+          env:
+            common: &m31_n4fab_env
+              ATOMESH_M31_VLLM_SHA: af0a2ae5acb52d6e353319e696d879a162ba3759
+              ATOMESH_M31_VLLM_BASE_SHA: 4fab5a07475822c6eaa971dceb2e2220d0446808
+              ATOMESH_M31_EXTRA_ENV: VLLM_ROCM_MINIMAX_M3_MONO_DRAFTER=1 VLLM_ROCM_PARALLEL_INDEX_TOPK=1 VLLM_USE_RUST_FRONTEND=1 VLLM_ROCM_USE_SKINNY_GEMM=0
+              ATOMESH_M31_D_MAX_SEQS: "16"
+        # D with breakable CUDA graphs (FULL_AND_PIECEWISE is the default mode), so the mixed steps
+        # that admit a new request replay a graph too.
+        - <<: *m31_moriio_1p2d_n4fab_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n4fab-c64-dcap16-dbcg
+          env:
+            common:
+              <<: *m31_n4fab_env
+              ATOMESH_M31_D_EXTRA_ENV: VLLM_USE_BREAKABLE_CUDAGRAPH=1
+        - <<: *m31_moriio_1p2d_n4fab_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n4fab-c96-dcap16-cpu19
+          concurrency: [96]
+          env:
+            common:
+              <<: *m31_n4fab_env
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1900000000000"
+        - <<: *m31_moriio_1p2d_n4fab_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n4fab-c96-dcap16-cpu19-nodbo
+          concurrency: [96]
+          env:
+            common:
+              <<: *m31_n4fab_env
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1900000000000"
+              ATOMESH_M31_P_DBO: "0"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case

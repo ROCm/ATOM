@@ -24,6 +24,9 @@ M31_ENV=(
   HIP_FORCE_DEV_KERNARG=1 NCCL_DMABUF_ENABLE=0 HSA_ENABLE_IPC_MODE_LEGACY=1
   VLLM_HTTP_TIMEOUT_KEEP_ALIVE=3600
 )
+# KEY=VAL words for every server, e.g. an image's opt-in ROCm switches.
+read -r -a m31_extra_env <<< "${ATOMESH_M31_EXTRA_ENV:-}"
+M31_ENV+=("${m31_extra_env[@]}")
 M31_VLLM_ARGS=(
   vllm serve "${MODEL_PATH}"
   --served-model-name "${SERVED_MODEL_NAME}" --host 0.0.0.0 --tensor-parallel-size 4
@@ -101,17 +104,20 @@ m31_moriio() {
 
 start_vllm_server() {
   local role="$1" log_name="$2" server_port="$3" gpus idx xfer
-  local -a cache_env=() role_args=() pin=()
+  local -a cache_env=() role_env=() role_args=() pin=()
   build_server_cache_env "${role}" "${server_port}" cache_env
   if [[ "${role}" == prefill ]]; then
     gpus=0,1,2,3
     xfer="$(m31_moriio kv_producer "${server_port}" "${M31_HANDSHAKE_PORT}" "${M31_NOTIFY_PORT}")"
     xfer="{\"kv_connector\":\"MultiConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"connectors\":[${xfer},{\"kv_connector\":\"SimpleCPUOffloadConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${ATOMESH_M31_P_CPU_OFFLOAD_BYTES},\"lazy_offload\":false}}]}}"
     role_args=(--max-num-seqs $((2 * m31_conc)) --port "${server_port}" --gpu-memory-utilization 0.85
-      --max-num-batched-tokens 32768
-      --enable-dbo --dbo-prefill-token-threshold 16384 --dbo-decode-token-threshold 32768
-      --kv-transfer-config "${xfer}")
+      --max-num-batched-tokens 32768)
+    [[ "${ATOMESH_M31_P_DBO:-1}" == 1 ]] &&
+      role_args+=(--enable-dbo --dbo-prefill-token-threshold 16384 --dbo-decode-token-threshold 32768)
+    role_args+=(--kv-transfer-config "${xfer}")
   else
+    # KEY=VAL words for the decode servers only.
+    read -r -a role_env <<< "${ATOMESH_M31_D_EXTRA_ENV:-}"
     # decode_single_node: worker idx serves DECODE_PORT+idx on the GPUs pd_server_atom.sh exported, so
     # each D on the node needs its own handshake/notify bases (4 TP ranks each).
     gpus="${HIP_VISIBLE_DEVICES}" idx=$((server_port - DECODE_PORT))
@@ -132,7 +138,7 @@ start_vllm_server() {
     echo "[m31] WARNING: cannot pin ${role} to the NUMA node of GPU ${gpus%%,*}; running unpinned" >&2
     pin=()
   fi
-  local -a cmd=(env "${cache_env[@]}" "${M31_ENV[@]}" HIP_VISIBLE_DEVICES="${gpus}" "${pin[@]}"
+  local -a cmd=(env "${cache_env[@]}" "${M31_ENV[@]}" "${role_env[@]}" HIP_VISIBLE_DEVICES="${gpus}" "${pin[@]}"
     "${M31_VLLM_ARGS[@]}" "${role_args[@]}")
   echo "[${role}] rank=${NODE_RANK} host=${host_name} ip=${host_ip} port=${server_port} discovery=${NODE0_ADDR}:${VLLM_DISCOVERY_PORT} $(quote "${cmd[@]}")"
   python3 -c 'import json, sys; open(sys.argv[1], "w").write(json.dumps({"role": sys.argv[2], "argv": sys.argv[3:]}, indent=2) + "\n")' \
