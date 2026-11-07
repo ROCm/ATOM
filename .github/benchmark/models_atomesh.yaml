@@ -3638,8 +3638,8 @@ models:
           decode: *issue382_a9_env_decode
         runner:
           # The A9 nodes plus g40, which also denies the privileged cache drop,
-          # and g27, whose GPUs a leftover container (sf-regen-13458) holds.
-          exclude_nodes: pit2-p03-g08,pit2-p03-g10,pit2-p03-g12,pit2-p03-g15,pit2-p03-g23,pit2-p03-g25,pit2-p03-g27,pit2-p03-g40
+          # and g27 and g37, whose GPUs other jobs' containers held.
+          exclude_nodes: pit2-p03-g08,pit2-p03-g10,pit2-p03-g12,pit2-p03-g15,pit2-p03-g23,pit2-p03-g25,pit2-p03-g27,pit2-p03-g37,pit2-p03-g40
           time_limit: 04:00:00
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c180
