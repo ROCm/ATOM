@@ -133,9 +133,10 @@ def test_engine_holds_back_every_id_it_stops_on():
 
     (seq,) = _engine_io().preprocess_fanout([1, 2, 3], params)
 
-    assert seq.required_channel.end_ids == (7, EOS, END_OF_MSG)
-    assert seq.required_channel.after == K3_CHANNEL.after
-    assert seq.required_channel.opening == K3_CHANNEL.opening
+    channel = seq.sampling_params.required_channel
+    assert channel.end_ids == (7, EOS, END_OF_MSG)
+    assert channel.after == K3_CHANNEL.after
+    assert channel.opening == K3_CHANNEL.opening
     assert params.required_channel is K3_CHANNEL  # the caller's is untouched
 
 
@@ -144,7 +145,9 @@ def test_the_engine_builds_its_channel_once_and_shares_it():
     params = SamplingParams(required_channel=K3_CHANNEL)
     (first,) = io.preprocess_fanout([1, 2, 3], params)
     (again,) = io.preprocess_fanout([4, 5], params)
-    assert again.required_channel is first.required_channel
+    assert (
+        again.sampling_params.required_channel is first.sampling_params.required_channel
+    )
 
 
 def test_a_request_naming_another_channel_is_refused_at_admission():

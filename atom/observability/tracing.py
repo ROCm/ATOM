@@ -175,6 +175,27 @@ def _unbind(seq):
     seq.__dict__.pop("_atom_trace_timing", None)
 
 
+def wire_context(seq):
+    """`(carrier, model, request_id)` that `bind_sequences` bound to `seq`,
+    for the engine wire protocol to carry; None when `seq` is not traced."""
+    carrier = getattr(seq, "_atom_trace_carrier", None)
+    if not carrier:
+        return None
+    return (
+        carrier,
+        getattr(seq, "_atom_trace_model", "unknown"),
+        getattr(seq, "_atom_trace_request_id", None),
+    )
+
+
+def adopt_context(seq, carrier, model, request_id):
+    """Bind a context `wire_context` sent to the engine's own sequence."""
+    seq._atom_trace_carrier = dict(carrier)
+    seq._atom_trace_model = model
+    seq._atom_trace_request_id = request_id
+    seq._atom_trace_timing = None
+
+
 def set_request_id(request_id):
     if not _ENABLED:
         return

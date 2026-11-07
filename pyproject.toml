@@ -10,7 +10,7 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10"
 dynamic = ["version"]
-dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf", "uvicorn", "uvloop", "aiohttp", "datasets", "openpyxl", "tqdm", "setproctitle"]
+dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf>=3.20", "uvicorn", "uvloop", "aiohttp", "datasets", "openpyxl", "tqdm", "setproctitle"]
 
 [project.optional-dependencies]
 structured-output = ["llguidance==1.9.1", "jsonschema>=4.25,<5", "google-re2>=1.1"]
@@ -42,7 +42,13 @@ include-package-data = true
 atom = [
     "mesh/target/release/libmesh.so",
     "benchmarks/results/schemas/*.json",
+    "model_engine/protocol/*.proto",
 ]
+
+# Generated protobuf bindings (atom/model_engine/protocol/generate.py) are kept
+# as the compiler wrote them; black's half of this is in [tool.black] below.
+[tool.ruff]
+extend-exclude = ["*_pb2.py"]
 
 [project.entry-points."vllm.platform_plugins"]
 # by default the entry-points will be installed anyway
@@ -77,9 +83,13 @@ atom_sglang = "atom.plugin.sglang.register:register_plugin"
 # `force-exclude`, not `extend-exclude`: extend-exclude is ignored for paths
 # passed explicitly, which is exactly how both CI and the PostToolUse
 # `auto_lint.py` hook invoke black (`black <file>` on the file just edited).
+#
+# Generated protobuf bindings (`_pb2.py`) are excluded too, kept as the
+# compiler wrote them.
 force-exclude = '''
 /(
     atom/models/glm52/mono/kernels
   | tests/models/glm52/kernels
 )/
+| _pb2\.py$
 '''

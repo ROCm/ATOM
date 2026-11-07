@@ -26,12 +26,15 @@ from test_state_checkpoint import (
 )
 
 from atom.model_engine.block_manager import AdmissionProbe, BlockManager
-from atom.model_engine.prefix_hash import (
-    attach_shipped_chains,
-    chained_block_hashes,
-    ship_prompt_hash_chain,
-    take_shipped_chains,
+from atom.model_engine.prefix_hash import chained_block_hashes, ship_prompt_hash_chain
+from atom.model_engine.protocol import engine_v1_pb2 as pb
+from atom.model_engine.protocol.codec import (
+    _decode_chain,
+    _encode_chain,
+    decode_client_message,
+    encode_shutdown,
 )
+from atom.model_engine.protocol.wire import FrameReader, FrameWriter, decode_envelope
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 
@@ -426,10 +429,22 @@ def test_shipped_chain_equals_engine_chain(seed, dcp, length):
 
 
 def over_ipc(seqs):
-    """The ADD frame's trip: seqs pickled, their chains beside them."""
-    seqs, chains = pickle.loads(pickle.dumps((seqs, take_shipped_chains(seqs))))
-    attach_shipped_chains(seqs, chains)
-    return seqs
+    """The trip to the engine: each chain as the wire protocol's
+    `PromptHashChain`, beside a pickled seq (which drops its chain)."""
+    out = []
+    for seq in seqs:
+        writer = FrameWriter()
+        envelope = pb.Envelope()
+        spec = envelope.submit.requests.add()
+        _encode_chain(seq.prompt_hash_chain, spec.prompt_hash_chain, writer)
+        frames = writer.frames(envelope)
+        twin = pickle.loads(pickle.dumps(seq))
+        twin.prompt_hash_chain = _decode_chain(
+            decode_envelope(frames).submit.requests[0].prompt_hash_chain,
+            FrameReader(frames),
+        )
+        out.append(twin)
+    return out
 
 
 PROMPT = list(range(40)) + [900, 901, 902]
@@ -519,7 +534,7 @@ def _real(name, monkeypatch):
 
 @pytest.mark.parametrize("manager", ["CoreManager", "DisaggCoreManager"])
 def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
-    """Frontend to engine in the ADD frame, next to the seqs; the frontend
+    """Frontend to engine in the SubmitBatch, beside the seqs; the frontend
     keeps no copy, and the disaggregated prefill engine (no BlockManager)
     gets none."""
     tokens = list(range(41))
@@ -528,23 +543,33 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
         getattr(_real("atom.model_engine.engine_core_mgr", monkeypatch), manager)
     )
     mgr.label, mgr.pp_size, mgr.local_engine_count = "test", 1, 1
-    mgr._seq_id_to_callback, frames = {}, []
-    mgr._send_request = lambda rank, payload: frames.append((rank, payload))
+    mgr._seq_id_to_callback, sent = {}, []
+    mgr._send_request = lambda rank, frames: sent.append((rank, frames))
     mgr.add_request(seqs)
     assert all(s.prompt_hash_chain is None for s in seqs)
     if manager == "DisaggCoreManager":
-        (rank, frame), (prefill, prefill_frame) = frames
-        assert (rank, prefill, len(pickle.loads(prefill_frame))) == (1, 0, 2)
+        (rank, frames), (prefill, prefill_frames) = sent
+        _, specs, _ = decode_client_message(prefill_frames)
+        assert (rank, prefill) == (1, 0)
+        assert [spec.prompt_hash_chain for spec in specs] == [None] * 3
     else:
-        [(rank, frame)] = frames
+        [(rank, frames)] = sent
     core = _real("atom.model_engine.engine_core", monkeypatch)
-    feed = iter([frame, pickle.dumps((core.EngineCoreRequestType.SHUTDOWN, None))])
-    sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(feed))
+    feed = iter([frames, encode_shutdown()])
+    sock = SimpleNamespace(send=lambda _: None, recv_multipart=lambda **_: next(feed))
     monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
     poller = SimpleNamespace(register=lambda *a: None, poll=lambda: [(sock, 1)])
     monkeypatch.setattr(core.zmq, "Poller", lambda: poller)
     engine = object.__new__(core.EngineCore)
     engine.label, engine.input_queue = "test", queue.Queue()
+    engine.output_queue = queue.Queue()
+    engine._admission = SimpleNamespace(
+        block_size=BLOCK,
+        num_draft_tokens=0,
+        has_per_req_cache=False,
+        validate_request=None,
+        enable_dp_attention=False,
+    )
     engine.process_input_sockets("input", "control")
     want = reference_chain(tokens, BLOCK, -1, 10)
     got = engine.input_queue.get_nowait()

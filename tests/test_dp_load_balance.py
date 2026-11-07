@@ -9,7 +9,6 @@
 # here works on the CPU-only / mocked CI runner without any sys.modules stub;
 # conftest.py supplies the atom.* / zmq stubs the import chain needs.
 
-import pickle
 from threading import Event, Lock, Thread
 
 import pytest
@@ -18,6 +17,9 @@ from atom.model_engine.engine_core_mgr import (
     DP_LB_STRATEGIES,
     CoreManager,
 )
+from atom.model_engine.protocol.codec import decode_client_message
+from atom.model_engine.protocol.requests import IngressRequest
+from atom.sampling_params import SamplingParams
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -39,6 +41,16 @@ class _FakeSeq:
         self.dp_parent_session_id = dp_parent_session_id
         if data_parallel_rank is not None:
             self.data_parallel_rank = data_parallel_rank
+
+
+def _wire_request(seq_id, num_prompt_tokens=1, data_parallel_rank=None):
+    """A request dispatch can actually encode, unlike `_FakeSeq`."""
+    return IngressRequest(
+        id=seq_id,
+        prompt_token_ids=[1] * num_prompt_tokens,
+        sampling_params=SamplingParams(),
+        data_parallel_rank=data_parallel_rank,
+    )
 
 
 def _make_mgr(
@@ -401,13 +413,15 @@ def test_dispatch_sends_explicit_hint_to_exact_engine_rank():
     mgr._rank_reqs = [0, 0, 0, 10]
     mgr._rank_tokens = [0, 0, 0, 10_000]
 
-    seq = _FakeSeq("sticky", num_prompt_tokens=100, data_parallel_rank=3)
+    seq = _wire_request(7, num_prompt_tokens=100, data_parallel_rank=3)
     mgr._dispatch_to_dp_ranks([seq])
 
     assert [len(sock.messages) for sock in mgr.input_sockets] == [0, 0, 0, 1]
-    request_type, dispatched = pickle.loads(mgr.input_sockets[3].messages[0][1])
+    identity, *frames = mgr.input_sockets[3].messages[0]
+    assert identity == b"e3"
+    request_type, dispatched, _ = decode_client_message(frames)
     assert request_type.name == "ADD"
-    assert [item.id for item in dispatched] == [seq.id]
+    assert [item.seq_id for item in dispatched] == [seq.id]
 
 
 def test_invalid_hint_still_supported_via_add_request_validation():
@@ -475,7 +489,7 @@ def test_send_failure_rolls_back_undispatched_charge():
     # NOT successfully handed off were charged but will never emit a finished
     # output to release them. Dispatch must roll those back so routing does not
     # skew permanently; already-sent ranks keep their (legitimate) charge.
-    # dispatch pickles (EngineCoreRequestType.ADD, seqs) with the real enum.
+    # dispatch encodes the batch with the real codec before each send.
     class _FakeSocket:
         def __init__(self, fail=False):
             self.fail = fail
@@ -493,7 +507,7 @@ def test_send_failure_rolls_back_undispatched_charge():
         _FakeSocket(fail=True),
         _FakeSocket(),
     ]
-    seqs = [_FakeSeq(i, num_prompt_tokens=10) for i in range(4)]
+    seqs = [_wire_request(i, num_prompt_tokens=10) for i in range(4)]
     with pytest.raises(RuntimeError):
         mgr._dispatch_to_dp_ranks(seqs)
     # Ranks 0,1 dispatched -> stay charged; ranks 2 (failed) and 3 (never

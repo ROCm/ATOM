@@ -47,8 +47,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 import zmq
 
-from atom.model_engine.engine_core_mgr import _add_frame
-from atom.model_engine.prefix_hash import attach_shipped_chains
+from atom.model_engine.protocol.requests import IngressRequest
 from atom.model_engine.sequence import Sequence
 from atom.utils import get_open_zmq_ipc_path, make_zmq_socket
 
@@ -288,8 +287,9 @@ class FrontendHub:
             try:
                 if kind == _MSG_ADD:
                     worker_index = int(bytes(parts[1].buffer))
-                    _, seqs, *rest = pickle.loads(parts[2].buffer)
-                    attach_shipped_chains(seqs, rest[0] if rest else None)
+                    # Pickled whole, shipped prompt chain included: this
+                    # channel never leaves the frontend's own processes.
+                    seqs = pickle.loads(parts[2].buffer)
                     callback = self._callbacks[worker_index]
                     for seq in seqs:
                         seq.stream_callback = callback
@@ -406,12 +406,16 @@ class RemoteCoreManager:
         with self._send_lock:
             self._send_socket.send_multipart(parts, copy=False)
 
-    def add_request(self, seqs: list[Sequence]) -> None:
+    def add_request(self, seqs: list[IngressRequest]) -> None:
         for seq in seqs:
             if seq.stream_callback is not None:
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
-        self._send(_MSG_ADD, self._index_bytes, _add_frame(seqs))
+        self._send(
+            _MSG_ADD,
+            self._index_bytes,
+            pickle.dumps(seqs, protocol=pickle.HIGHEST_PROTOCOL),
+        )
 
     def abort_request(self, req_id) -> None:
         self._seq_id_to_callback.pop(req_id, None)

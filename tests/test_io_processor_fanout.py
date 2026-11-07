@@ -6,16 +6,24 @@
 These tests bypass ``__init__`` because the real processor needs a full
 engine config, a loaded tokenizer, and mamba-detection helpers. We only
 need to exercise ``preprocess_fanout`` / ``preprocess`` here — both of
-those touch just ``self.tokenizer.encode``, ``self.block_size``, and a
+those touch just ``self.tokenizer.encode`` and a
 handful of instance attributes, which we wire up by hand.
 """
 
 from itertools import count
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from aiter_stub import stubbed_aiter
 
+from atom.model_engine.protocol.codec import (
+    AdmissionContext,
+    build_sequence,
+    decode_client_message,
+    encode_submit,
+)
+from atom.model_engine.protocol.requests import IngressRequest
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 
@@ -33,6 +41,18 @@ def _reset_sequence_counter():
     Sequence.counter = count()
 
 
+def _engine_seqs(reqs) -> list[Sequence]:
+    """The Sequences an engine builds from `reqs` as they arrive on the wire."""
+    config = SimpleNamespace(
+        kv_cache_block_size=4,
+        speculative_config=None,
+        hf_config=SimpleNamespace(model_type="llama"),
+    )
+    _, specs, _ = decode_client_message(encode_submit(reqs))
+    context = AdmissionContext(config)
+    return [build_sequence(spec, context) for spec in specs]
+
+
 def _make_processor() -> InputOutputProcessor:
     proc = InputOutputProcessor.__new__(InputOutputProcessor)
     proc.config = MagicMock()
@@ -44,16 +64,15 @@ def _make_processor() -> InputOutputProcessor:
     proc.tokenizer = tokenizer
     proc.block_size = 4
     proc.requests = {}
-    proc.has_per_req_cache = False
     proc.num_speculative_tokens = 0
     return proc
 
 
 class TestPreprocessSingle:
-    def test_returns_single_sequence(self):
+    def test_returns_single_request(self):
         proc = _make_processor()
         seq = proc.preprocess("hello", SamplingParams(n=1))
-        assert isinstance(seq, Sequence)
+        assert isinstance(seq, IngressRequest)
         assert seq.needs_independent_noise is False
         assert seq.sibling_index == 0
         assert seq.parent_request_id is None
@@ -95,10 +114,13 @@ class TestPreprocessFanout:
 
     def test_fanout_shares_prompt_tokens(self):
         proc = _make_processor()
-        seqs = proc.preprocess_fanout("hello", SamplingParams(n=2, temperature=0.8))
+        reqs = proc.preprocess_fanout("hello", SamplingParams(n=2, temperature=0.8))
+        # One tokenization, one array, sent once.
+        assert reqs[0].prompt_token_ids is reqs[1].prompt_token_ids
+        # The engine builds each sibling's Sequence with its own copy, so a
+        # token appended to one does not leak to the other.
+        seqs = _engine_seqs(reqs)
         assert seqs[0].token_ids == seqs[1].token_ids
-        # Mutations on one sibling must not leak to the others (Sequence
-        # copies the input token list internally).
         seqs[0].append_token(999)
         assert seqs[1].token_ids != seqs[0].token_ids
 
@@ -148,7 +170,7 @@ def test_rapidserve_logprob_admission(n, rapidserve, logprobs):
     else:
         seqs = proc.preprocess_fanout("hello", params)
         assert len(seqs) == n
-        assert all(s.return_logprobs == logprobs for s in seqs)
+        assert all(s.return_logprobs == logprobs for s in _engine_seqs(seqs))
 
 
 @pytest.mark.parametrize("configured", [False, True])

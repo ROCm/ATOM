@@ -24,8 +24,9 @@ pytestmark = pytest.mark.skipif(
 
 
 class _Seq:
-    """What ``RemoteCoreManager.add_request`` / ``_add_frame`` touch on a
-    Sequence: an id, a stream callback and a shipped prompt chain."""
+    """What ``RemoteCoreManager.add_request`` touches on an IngressRequest,
+    which it pickles whole: an id, a stream callback and a shipped prompt
+    chain."""
 
     def __init__(self, seq_id):
         self.id = seq_id

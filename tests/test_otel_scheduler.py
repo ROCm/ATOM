@@ -5,7 +5,6 @@
 # ruff: noqa: F811
 
 import asyncio
-import pickle
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -13,6 +12,8 @@ from conftest import MockConfig
 from test_otel_tracing import clock, execute, spans  # noqa: F401
 
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.protocol.codec import decode_client_message
+from atom.model_engine.protocol.requests import IngressRequest
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
@@ -111,11 +112,9 @@ def test_core_manager_captures_context_after_executor_preprocess(spans):
     frames = []
 
     async def app(scope, receive, send):
-        # Match the API: Sequence construction runs in an executor, while
+        # Match the API: request construction runs in an executor, while
         # CoreManager.add_request runs back on the HTTP event-loop thread.
-        seq = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: Sequence([10, 11, 12, 13], block_size=4)
-        )
+        seq = await asyncio.get_running_loop().run_in_executor(None, _request)
         manager = SimpleNamespace(
             pp_size=1,
             _routable_engine_count=1,
@@ -129,13 +128,17 @@ def test_core_manager_captures_context_after_executor_preprocess(spans):
         CoreManager.add_request(manager, [seq])
 
     execute(app)
-    _, seqs = pickle.loads(frames[0])
+    _, specs, _ = decode_client_message(frames[0])
+    carrier, _, _ = specs[0].trace
     http = spans.get_finished_spans()[0]
-    assert (
-        seqs[0]._atom_trace_carrier["traceparent"].split("-")[2]
-        == f"{http.context.span_id:016x}"
+    assert carrier["traceparent"].split("-")[2] == f"{http.context.span_id:016x}"
+    assert carrier["tracestate"] == "othervendor=x,nsdye=1"
+
+
+def _request() -> IngressRequest:
+    return IngressRequest(
+        id=1, prompt_token_ids=[10, 11, 12, 13], sampling_params=SamplingParams()
     )
-    assert seqs[0]._atom_trace_carrier["tracestate"] == "othervendor=x,nsdye=1"
 
 
 @pytest.mark.parametrize("already_bound", [False, True])
@@ -145,7 +148,7 @@ def test_same_node_pd_marks_http_and_skips_both_engine_carriers(
     frames = []
 
     async def app(scope, receive, send):
-        seq = Sequence([10, 11, 12, 13], block_size=4)
+        seq = _request()
         if already_bound:
             tracing.bind_sequences([seq])
         manager = SimpleNamespace(
@@ -156,9 +159,13 @@ def test_same_node_pd_marks_http_and_skips_both_engine_carriers(
         DisaggCoreManager.add_request(manager, [seq])
         assert len(frames) == 2
         for frame in frames:
-            _, seqs, *_ = pickle.loads(frame)
-            for child_seq in seqs:
-                assert not hasattr(child_seq, "_atom_trace_carrier")
+            _, specs, _ = decode_client_message(frame)
+            for spec in specs:
+                assert spec.trace is None
+                # The engine's own sequence for it, untraced.
+                child_seq = Sequence(
+                    list(spec.kwargs["token_ids"]), block_size=4, id=spec.seq_id
+                )
                 tracing.enqueue(child_seq)
                 tracing.forward(child_seq, is_decode=False)
                 tracing.finish(child_seq, reason="max_tokens")
@@ -374,6 +381,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
 
     monkeypatch.setattr(engine_core, "AsyncIOProcManager", runner_manager)
     monkeypatch.setattr(engine_core, "Scheduler", lambda *a, **k: None)
+    monkeypatch.setattr(engine_core, "AdmissionContext", lambda *a, **k: None)
     monkeypatch.setattr(engine_core, "EngineUtilityHandler", lambda *a, **k: None)
     monkeypatch.setattr(tracing, "initialize", lambda: events.append("initialize"))
     monkeypatch.setattr(

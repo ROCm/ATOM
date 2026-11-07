@@ -395,8 +395,8 @@ class Sequence:
         self.block_hashes: list[int] = []
         # `prefix_hash.ShippedChain`, consumed by
         # `BlockManager._adopt_shipped_chain`; None = the engine hashes it. It
-        # rides beside the seq in the ADD frame (`take_shipped_chains`), never
-        # inside a pickled seq (`__getstate__`).
+        # reaches the engine as the request's `PromptHashChain` on the wire,
+        # never inside a pickled seq (`__getstate__`).
         self.prompt_hash_chain: tuple | None = None
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never
