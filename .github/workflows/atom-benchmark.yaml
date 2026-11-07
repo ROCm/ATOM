@@ -43,6 +43,7 @@ jobs:
           base-image: ${{ inputs.image }}
           runner: ${{ inputs.runner }}
           pull-policy: always
+          network-host: "true"
           env-vars: |
             ATOM_PR2877_TEST_GFX950=1
             AITER_LOG_LEVEL=WARNING
