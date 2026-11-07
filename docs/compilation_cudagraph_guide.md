@@ -264,7 +264,70 @@ The `VllmBackend.__call__` method orchestrates the piecewise compilation:
 
 The `CompilerManager` caches compiled graphs using a key of `(runtime_shape, graph_index, backend_name)`. The cache is stored in a Python file (`vllm_compile_cache.py`) at the local cache directory (`~/.cache/atom/torch_compile_cache/<hash>/rank_<i>/<prefix>/`).
 
-On subsequent runs with the same model and configuration, compiled graphs are loaded from the cache, bypassing Inductor compilation entirely.
+On subsequent runs with compatible model, code and configuration, reusable
+compiled graphs can be loaded from the cache. A top-level graph cache hit does
+not guarantee that every eager/custom-op Triton specialization is already
+compiled; new request shapes can still require compilation.
+
+### Lower-level compiler cache ownership
+
+When `compilation_config.use_inductor` is enabled and the ATOM backend is
+actually invoked, `make_compiler()` selects one adaptor. The two adaptors do
+not compete for the same worker's variables:
+
+| Selection | Adaptor | Enabled-cache rule |
+|---|---|---|
+| Torch before `2.8.0.dev` | `InductorAdaptor` | Preserves its historical behavior: redirects both cache variables into the ATOM rank cache, even if they were already set. |
+| Torch `2.8.0.dev` and later (including stable 2.8+) | `InductorStandaloneAdaptor` | Preserves caller-owned paths. Redirects only unset values, recognized PyTorch temporary defaults, or the current value previously assigned by this initializer. |
+| Either adaptor with `disable_cache=True` | Same adaptor | Records cache metadata, but creates no lower-level directories and changes neither variable. |
+| Execution that never invokes this backend, including level 0 | Neither initializer runs | The caller/framework's environment and defaults apply. Configure cache paths before process startup if persistence is needed. |
+
+The variables are `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR`.
+Automatically managed paths are respectively `inductor_cache/` and
+`triton_cache/` beneath
+`~/.cache/atom/torch_compile_cache/<hash>/rank_<i>/` (or the configured
+ATOM cache root). Graph prefixes such as `backbone` and `eagle_head` share
+these rank-owned lower-level directories. Different ranks retain separate
+automatically selected paths.
+
+For standalone compilation, recognized temporary defaults mean precisely
+PyTorch's `default_cache_dir()` for Inductor and that directory's `triton/`
+subtree for Triton, including its per-device children. This is not a rule to
+replace arbitrary `/tmp` paths: a deployment-selected path such as
+`/var/cache/atomesh/triton` or `.../triton-custom` remains caller-owned.
+An explicit value equal to a recognized PyTorch default is indistinguishable
+from an automatically assigned one and is redirected too.
+
+If deployment scripts set either variable before startup, standalone preserves
+that caller-owned value. When only `TORCHINDUCTOR_CACHE_DIR` is caller-owned,
+an unset, recognized temporary-default, or ATOM-managed Triton path is selected
+as `<TORCHINDUCTOR_CACHE_DIR>/triton`. Mounting the external Inductor root
+persistently therefore retains both sets of compiler artifacts. An explicit
+`TRITON_CACHE_DIR` always wins, even when it is outside that root. If only Triton
+is caller-owned, Inductor remains managed under the ATOM rank cache.
+An explicitly empty Inductor value is preserved but is not used as a parent;
+the normal ATOM Triton default applies in that case.
+
+Environment values and PyTorch's default root are snapshotted once before either
+variable is modified. These paths must be mounted persistently and writable by
+the worker. ATOM does not add rank suffixes to caller-owned or inherited external
+paths. The regular adaptor retains the historical rule in the table above.
+Changing a variable after initialization transfers ownership back to the caller
+when its value differs from the last value assigned by the initializer.
+
+Initialization happens inside `VllmBackend.__call__`, via
+`CompilerManager.initialize_cache`, before that backend's graph compile/load.
+It is not a process-entry hook. Already-created cache managers and artifacts
+from kernels compiled earlier are not migrated, cleared or invalidated.
+Level-0/eager-only deployments therefore need their own startup cache settings.
+The INFO message `Compiler cache directories: Inductor=..., Triton=...` reports
+the effective paths after initialization.
+
+Persist the resolved paths, not only the reported top-level graph cache.
+Use trusted artifacts from a compatible software/GPU stack. Cache reuse removes
+repeated compilation after restart; it does not make warm kernel execution
+faster and does not persist model KV/prefix contents.
+
 
 ## Forward context & stateless dispatch
 
