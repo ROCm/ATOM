@@ -5,12 +5,12 @@
     scores  = x . W^T                    fp32 (``GatheredDot``, dense: bf16 x and W, fp32 products and sums;
                                          ``kslices``: its K-split MFMA mode, 0 for the per-row lane loop)
     s       = sqrt(softplus(scores))     (``score_func = "sqrtsoftplus"``; softplus = x past 20, as torch;
-                                         ``"sigmoid"``: s = 1 / (1 + exp(-scores)), MiniMax-M3's and Kimi K3's)
+                                         ``"sigmoid"``: s = 1 / (1 + exp(-scores)))
     indices = top-k of s + bias          (the bias steers the choice only; ``wave_topk_won``: ties to the lowest index)
     weights = s[indices] / (sum + 1e-20) * route_scale
 
-``score_func = "softmax_topk"`` (GPT-OSS's ``GptOssTopKRouter``: the bias is part of the logit, top-k first, then
-the softmax over the winners only, both rounded to bf16 as HF's bf16 ``F.linear`` / ``softmax(dtype=bf16)``)::
+``score_func = "softmax_topk"`` (the bias is part of the logit, top-k first, then the softmax over the winners only,
+both rounded to bf16 as a bf16 ``F.linear`` / ``softmax(dtype=bf16)``)::
 
     logits  = bf16(scores + bias)
     indices = top-k of logits            (ties to the lowest index)
@@ -22,7 +22,7 @@ score task's prologue, the norm stage's bits; GatheredDot's module docstring).
 ``scores`` (the dense K-split mode): "wave0" (wave 0 computes the row's n scores, n / 64 a lane, then the top-k)
 or "waves" (wave w < n / 64 computes columns 64 w .., one a lane, s and the biased bits into LDS; wave 0 reads its
 n / 64 a lane back and runs the same top-k and puts: the same operations on the same values, so the same bits; the
-sqrt(softplus) is most of the route's compute on one wave). R8. "fused": as "waves", but
+sqrt(softplus) is most of the route's compute on one wave). "fused": as "waves", but
 wave w polls its own columns' slice partials and adds them in slice order in registers (no LDS staging of the
 partials, no column-sum pass and its barriers): a wave computes its scores as soon as its columns have landed; the
 same operations on the same values.
@@ -57,7 +57,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from ..base import Block, Channel, Fmt, Search
+from ..base import Block, Channel, Fmt
 from .gathered import DotNorm, GatheredDot
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import mailbox as mb
@@ -105,19 +105,6 @@ class _Plan:
 
 
 class MoERouter(Block):
-    # what the tuner may change (``Block.SEARCH``): the router dot's K slices (another summation order)
-    SEARCH = {
-        "kslices": Search((10, 4, 6, 8, 12, 16), "d10", "shape", "GPT-OSS: 12 (3072 / 256); V4.1: 10", routing=True),
-        # any n / 64 a lane and k <= 64; its candidate count follows the scores: judged on real routing
-        "topk": Search(
-            ("heads", "thresh"), "bitwise", "knob", "Kimi K3 (896 experts, k 16): route 5.2 -> 4.0 us", routing=True
-        ),
-        # (class A of the transfer catalog: V4.1's ROUTER_TILES / ROUTER_SCORES knobs)
-        "dot_tiles": Search((1, 2, 4), "bitwise", "shape", "R5: V4.1 4 tiles a task", routing=True),
-        "scores": Search(("wave0", "waves", "fused"), "bitwise", "structural", "R8 / R13: V4.1 "
-                         "fused", routing=True),  # fmt: skip
-    }
-
     def __init__(self, name: str, x: Channel, weight: str, bias: str, idx: Channel, weights: Channel, n: int, k: int,
                  route_scale: float = 1.0, score_func: str = "sqrtsoftplus", kslices: int = 10,
                  dot_tiles: int = 1, norm: DotNorm | None = None, scores: str = "wave0",
@@ -312,7 +299,7 @@ def _land_partials(k, p, row, per):
             )
     gpu.barrier()
     # thread c: columns c, c + 512, .. < n, each one's partials added in slice order -> LDS row ``slices`` (few live
-    # registers a thread; past 512 experts, e.g. Kimi K3's 896 unsplit, a second column a thread: before, columns
+    # registers a thread; past 512 experts (e.g. 896 unsplit) a second column a thread: before, columns
     # 512 .. n - 1 were never summed and the route read stale LDS)
     for c0 in range(0, p.n, THREADS_):
         c = k.tid if c0 == 0 else k.tid + c0  # (n <= 512: the code of before)

@@ -5,9 +5,8 @@
 An MFMA whose srcC is exactly the vDst of an earlier MFMA gets the result forwarded, and LLVM inserts no wait states
 for an exact overlap. Forwarding needs equal pass counts: ``v_mfma_f32_16x16x16_bf16`` (4 passes) reading the vDst of
 ``v_mfma_f32_16x16x32_bf16`` (8 passes) as srcC read stale elements (the first two of a lane's four) with up to 4 wait
-states between, never with 5 (GQACore's owner tile; G3). The writer may be in flight for the other
-wave of the SIMD too, so it showed only in some builds (the 27B at grid 128 / 64; at the full grid the distances were
-1 and 9-10 and the outputs right).
+states between, never with 5. The writer may be in flight for the other wave of the SIMD too, so it showed only in
+some builds (at a grid of 128 / 64; at the full grid the distances were 1 and 9-10 and the outputs right).
 
 ``srcc_hazards(text)``: every MFMA of straight-line code whose srcC exactly overlaps the vDst of the latest MFMA of a
 different opcode writing it, with fewer wait states between than ``GAPS`` (or ``UNKNOWN_GAP`` for a pair not in it).
@@ -21,7 +20,6 @@ import re
 # writer's passes - the reader's + 1)
 GAPS = {("v_mfma_f32_16x16x32_bf16", "v_mfma_f32_16x16x16_bf16"): 5}
 UNKNOWN_GAP = 18  # a pair not measured: the longest XDL op's passes + 2
-SRCC_PASS_GAP = max(GAPS.values())
 
 _INS = re.compile(r"^\s+([a-z_][a-z0-9_]*)\s*(.*?)\s*(?://\s*([0-9A-Fa-f]+):.*)?$")
 _RANGE = re.compile(r"^[va]\[(\d+):(\d+)\]$")

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """``GatheredDot``: fp32 dot products of each row with rows of a bf16 table, chosen per row by index (a gathered
-rescore: the DFlash2 head's exact scores of its MXFP4-screened candidates) or a fixed leading block of the table
+rescore: exact scores of candidates an earlier stage screened) or a fixed leading block of the table
 (a small dense projection).
 
 Per row ``r`` of the step and column ``c < C``::
@@ -37,7 +37,7 @@ row; ``width``: the norm's width (its mean), when x carries zeros past it; ``cen
 y = bf16(x rstd (1 + w)) (``NormQuant``'s default arithmetic: its bf16 copy's bits).
 
 **A narrower x** (``k`` > the x channel's width, dense mode): the table's K is ``k``, x's row ``x.width`` (a multiple
-of 32), its elements past the width read as zero (GPT-OSS: the 2944-wide residual row against the router's 3072).
+of 32), its elements past the width read as zero (e.g. a 2944-wide row against a 3072-wide table).
 """
 
 from __future__ import annotations
@@ -80,13 +80,6 @@ class DotNorm:
     eps: float
     width: int = 0  # the norm's width (its mean); 0: K
     centred: bool = False  # the zero-centred weight (``NormQuant``'s default): y = bf16(x rstd (1 + w)), (1 + w) in f32
-
-
-@dataclass(frozen=True)
-class DotNorm2(DotNorm):
-    """``DotNorm`` with two roundings, y = bf16(bf16(x rstd) w) (KimiRMSNorm's ``weight * x.to(bf16)``)."""
-
-    twice: bool = True
 
 
 @dataclass(frozen=True)

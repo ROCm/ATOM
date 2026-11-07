@@ -80,7 +80,7 @@ def check(record: Record, regions: list[Region], prev_reads: dict[str, tuple[str
 
 # ---- the memory model (``check_memory``): plain memory, bulk + flag, peer formats
 #
-# Measured on MI355X (P9 / P10): (1) within one launch a plain (cache mode 0) store is not seen by a
+# Measured on MI355X: (1) within one launch a plain (cache mode 0) store is not seen by a
 # CTA on another XCD (82-99 % stale words; XCD = CTA id mod 8), and a load issued before its producer's store lands
 # reads the old bytes: a plain hand-off needs device-scope (sc1) stores and loads, unless writer and reader share a
 # CTA or an XCD, and an ordering edge; (2) bulk + flag needs ``s_waitcnt vmcnt(0)`` after the bulk stores, before the

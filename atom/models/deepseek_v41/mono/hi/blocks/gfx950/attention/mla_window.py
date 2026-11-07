@@ -588,7 +588,7 @@ class MLAWindowAttn(Block):
         self.ring_slots, self.ring_first, self.dsplit = ring_slots, ring_first, dsplit
         # the output's inverse RoPE: o is bf16, the rotation bf16-rounded before the MXFP8 QAT (the official model's
         # order); ``unrope_f32``: the f32 rotation quantized directly (an engine's arithmetic, ATOM's). A numerics
-        # choice, not a searched lever
+        # choice, not a schedule knob
         self.unrope_f32 = unrope_f32
 
     def plan(self, sc: Scenario) -> _APlan:

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The block interface: what P2 streams build and P3 composes (frozen at the end of P1).
+"""The block interface: the pieces a layer program is composed of.
 
 A **block** is one reusable piece of a layer (a linear, a norm, an attention
 mixer). It is plain Python on the plan side and produces ``Stage``s:
@@ -46,15 +46,12 @@ chosen per edge and scenario by the recipe):
   slots). A consumer polls every flag, then loads the words (device scope): half the
   bytes, one more round trip (the producer's drain before its flag, the consumer's
   flag poll before its loads). Device helpers: ``device.gfx950.channels``.
-  Where it wins and why (mostly: the consumer's input attempt holds fewer registers,
-  so a Linear's weight prefetch gets deeper): the layer measurements
-  L19-L27.
+  Where it wins (mostly: the consumer's input attempt holds fewer registers,
+  so a Linear's weight prefetch gets deeper).
 
-Block emit code follows (free ``@traced`` functions, explicit values;
-see ``bench.toy`` for the pattern) and the knob discipline of
+Block emit code is free ``@traced`` functions on explicit values.
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -131,57 +128,13 @@ class Channel:
         )
 
 
-@dataclass(frozen=True)
-class Search:
-    """A searchable constructor parameter of a block, as the tuner reads it: ``values`` (the
-    first: the old default), ``claim`` "bitwise" (same sums, same bits) or "d10" (another summation order; or a
-    callable of the block when the class depends on its configuration, e.g. a sliding vs a full attention),
-    ``cost`` (knob, shape, placement, structural, frame), the ``evidence`` that made it searchable, and ``rows``
-    (the row counts it applies to). Values the block's constructor refuses for this instance (a task group that
-    does not divide its width) are dropped when the levers are derived."""
-
-    values: tuple
-    claim: str | Callable = "bitwise"
-    cost: str = "knob"
-    evidence: str = ""
-    rows: tuple[int, int] = (1, 1 << 20)
-    targets: tuple[str, ...] = ()  # a recipe knob's stages (``KNOB_LEVERS``; a block's parameter: the block's own)
-    routing: bool = False  # its cost follows the routing (MoE groups, router slices): judged on real routing only
-    # values whose format for the op is lossier than ATOM's default for it (merge rule 4): never searched unless the
-    # case admits the lever (``tune.levers.Lever.below_floor``)
-    below_floor: tuple = ()
-    # (block) -> whether this instance uses the parameter at all (e.g. a shared expert's task shape where the block
-    # has one): None, always. A parameter an instance ignores is no lever there (its arms would be no-ops)
-    when: Callable | None = None
-    # another SEARCH parameter of the same block this one is coupled with: also searched as a pair (both values in
-    # one arm), for parameters that only pay together (MiniMax-M3's routed ug_g 6 with the shared sh_g 2: each alone
-    # flat, the pair -0.7 µs)
-    pair: str = ""
-    # other parameters of the same block a value past ``values[0]`` needs set with it ((param, value) pairs): the arm
-    # sets them too where the instance has them otherwise (Kimi K3's MLADecode kswz: only with lean and vtr), so the
-    # lever applies to an instance without them and its arm is the combination
-    needs: tuple = ()
-    # values that deadlock from a batch size on ((value, batch) pairs): a bug to fix, never an arm there (the sweep's
-    # hang watchdog found it; e.g. MiniMax-M3's BlockIndexer select "wave" at two requests)
-    hangs: tuple = ()
-
-
 class Block:
     """Base class of blocks. Subclasses set ``name`` and implement ``stages``
     (and ``pack`` when they read weights).
 
-    A block is described by its constructor arguments alone (recorded at construction: ``rebuilt``), so a composed
-    layer can be rebuilt with other parameters without the recipe (``plan.overrides``). ``SEARCH``: the
-    parameters the tuner may change, {param: :class:`Search`}."""
+    A block is described by its constructor arguments alone."""
 
     name: str = "block"
-    SEARCH: dict[str, Search] = {}
-
-    def __new__(cls, *args, **kwargs):
-        self = super().__new__(cls)
-        self._ctor = (args, kwargs)
-        return self
-
 
     def stages(self, sc: Scenario) -> list[Stage]:
         raise NotImplementedError

@@ -2,8 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """DeepSeek-V4.1 layer recipes: the blocks of each layer kind, in dataflow order.
 
-The contract is the hw-arithmetic reference (``reference.py``, ``oracle/kernels_hw.py``): a layer's ``h_out`` within
-D10 of it, routing ids and the index sources' selections exact (the near-tie
+The contract is a hardware-arithmetic reference of the checkpoint's layer (its operations with the kernels'
+roundings): a layer's ``h_out`` within D10 of it, routing ids and the index sources' selections exact (the near-tie
 rule). Every kind is one program at TP4 (64 / 4 heads a rank; the KV path, q_a, the router and HC replicated; wo_b
 row-parallel; the routed and the shared experts sharded), a single-layer 16-row build two (``split``: the attention
 kernel, then the FFN kernel). Stages, in order (channels between them):
@@ -224,7 +224,7 @@ def residual_layout(tp: int, split: bool = False, knobs: dict | None = None, row
     (``shard_cols``)."""
     kn = knobs or schedules.current()
     v = kn["RESIDUAL"]
-    if v == "auto":  # (measured at one request of 6 / 8 / 16 rows and B = 2-4 requests of 6, K41)
+    if v == "auto":  # (measured at one request of 6 / 8 / 16 rows and B = 2-4 requests of 6)
         v = "sharded" if rows is not None and kn["R_SHARD_ROWS"] <= rows <= kn["R_SHARD_MAX_ROWS"] else "replicated"
     return "sharded" if v == "sharded" and tp > 1 and not split else "replicated"
 
@@ -233,7 +233,7 @@ def rs_pack(tp: int, knobs: dict | None = None, rows: int | None = None) -> str:
     """``RS_PACK`` resolved for a step: the reduce-scatter partials' format of every two-shot exchange (wo_b ->
     seam F, the MoE combine -> its owner stage or the next seam A): "f32" ((fp32, tag) pairs, 8 B a value), "f32p" (a
     lane's 4 values as a tagged quad of 3 + a (value, tag) pair, 6 B) or "f32q" (3 values + tags a 16 B quad across
-    lanes, 5.5 B; slower: its lane exchange), the same sums either way (P16); "auto": f32p from
+    lanes, 5.5 B; slower: its lane exchange), the same sums either way; "auto": f32p from
     ``RS_PACK_ROWS`` rows (``rows`` None: pairs) where an owner's columns are whole waves (HIDDEN / tp a multiple of
     256: measured at TP4; at 8 ranks the MoE combine's wave crosses an owner boundary, ``push_rs(two_owners=)``, where
     f32p is not measured yet: pairs). By the step's rows and tp only (a chain's launches read each other's partials:
@@ -270,7 +270,7 @@ def chain_pend(tp: int, rows: int | None, order: str | None = None, knobs: dict 
 def _moe_mode(tp: int, order: str, split: bool = False, rows: int | None = None, chain: bool = False,
               knobs: dict | None = None) -> str:  # fmt: skip
     """``MOE_SUM`` resolved for a layer's MoE partial: "push", "2shot" or "own" (only in a chain: ``chain`` = the
-    partial is pushed for the next launch's seam A); two-shot needs TP and the "fold" order. "auto" (K28): 2shot in a
+    partial is pushed for the next launch's seam A); two-shot needs TP and the "fold" order. "auto": 2shot in a
     two-kernel layer's FFN kernel; in a chain "own" from ``MOE_OWN_ROWS`` rows on, push otherwise."""
     kn = knobs or schedules.current()
     m = kn["MOE_SUM"]
@@ -321,7 +321,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     router, the shared expert and HC replicated. ``replay`` (synthetic timing): the router runs (on synthetic weights,
     into unread channels) and the MoE reads plain args ``idx`` / ``wts`` (routing replayed from real taps), each row
     published once the router has published it. ``rows``: the scenario's (the schedule's row-count entries); None:
-    the entries of an unknown row count. ``knobs``: overrides over the schedule (``schedules.knobs``).
+    the entries of an unknown row count. ``knobs``: values over the schedule's (``schedules.knobs``).
 
     **A chain of layer launches (TP, one kernel a layer):** ``push_moe``: the MoE only pushes its partials
     (``MoEExperts(dsum=False)``: its combine is the program's last stage; no ``ffn_out`` store); ``prev_moe``: seam
@@ -353,7 +353,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     ``experts`` / ``topk`` (default ``EXPERTS`` / ``TOPK``, the target's 384 / 6): the routed experts and the router's
     k, for the DSpark draft stages (128 / 3, ``dspark_n_routed_experts`` / ``dspark_num_experts_per_tok``).
 
-    **A sharded residual** (``RESIDUAL`` "sharded", TP, one kernel; H11): R is column-owned, so the R args a launch
+    **A sharded residual** (``RESIDUAL`` "sharded", TP, one kernel): R is column-owned, so the R args a launch
     reads and writes (``h_in``, ``r_a``, ``r_f``) are the rank's columns [rows, 4, hidden / tp] (``shard_cols``),
     except what leaves a chain whole: a chain's tail writes ``r_f`` whole (gathered), and ``full_r_a`` (the DSpark aux
     taps' layers) ``r_a``, and what enters it: a chain's first layer reads the whole ``h_in`` (the engine's). The Engram
@@ -381,7 +381,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     # the router normalizes its K slices (window layers: no compressed cache, no sources)
     rnorm = k.FFN_NORM == "router" or (k.FFN_NORM == "auto" and not sparse and source is None)
     shard = residual_layout(tp, split, kn, rows) == "sharded"
-    if shard:  # R column-owned (H11): the seams own their columns, LIN gathered, no owner stages
+    if shard:  # R column-owned: the seams own their columns, LIN gathered, no owner stages
         if k.SEAM_NORM or rnorm or k.WO_B_SUM != "2shot" or order != "fold" or not k.R_CHANNEL:
             raise ValueError("RESIDUAL 'sharded': not with SEAM_NORM, FFN_NORM 'router', WO_B_SUM other than '2shot', "
                              "SHARED_ORDER 'ref' or R_CHANNEL off (yet)")  # fmt: skip
@@ -394,7 +394,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     # an Engram layer's seam A after the Engram (its whole output on every rank): LIN and mixes replicated, LIN local
     eng_rep = shard and engram and k.SHARD_ENGRAM_A == "replicated"
     # seam A's fold and LIN at the end of the launch that produced the MoE output (``hcz``, LIN-only), the next
-    # launch's seam A the mixes of R as given (H11)
+    # launch's seam A the mixes of R as given
     end = shard and k.SHARD_SEAM_A == "end" and (push_moe or prev_moe)
     ga = {"gate_out_arg": "gate_a"} if split else {}
     early = bool(k.HC_EARLY)
@@ -412,7 +412,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     pad = k.HC_LDS_PAD
     if "a" in pad:
         ga = {**ga, "lds_pad": True}
-    entry = k.HC_ENTRY is True or (k.HC_ENTRY == "auto" and rows is not None and m_in not in ("", "own"))  # K10
+    entry = k.HC_ENTRY is True or (k.HC_ENTRY == "auto" and rows is not None and m_in not in ("", "own"))
     # what enters a chain from outside it (a first layer's, an unchained layer's h_in) and what leaves it (an unchained
     # layer's R_F, the aux taps' R_A) are whole; only the chain's own hand-offs are the rank's columns
     whole_in = {"res_in_full": True} if shard and not prev_moe else {}
@@ -452,8 +452,8 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     sparse = src.cache_len if src is not None else sparse
     rs = k.RING_SLOTS if ring_slots is None else ring_slots
     smerge = k.SPARSE_SMERGE in (True, 1)
-    ckv4 = k.SPARSE_CKV4 if k.SPARSE_CKV4 != "auto" else False  # (K19's FP4 copy: the cache is ATOM's pool)
-    ring8 = (6 if src is None else False) if k.SPARSE_RING8 == "auto" else k.SPARSE_RING8  # K19
+    ckv4 = k.SPARSE_CKV4 if k.SPARSE_CKV4 != "auto" else False  # (no FP4 copy: the cache is ATOM's pool)
+    ring8 = (6 if src is None else False) if k.SPARSE_RING8 == "auto" else k.SPARSE_RING8
     attn = (MLASparseAttn("attn", C.q, C.kvn, C.o, "ring", "pos", "rope", "attn.sink",
                           C.sel if src is not None and src.index else "sel", "ckv", sparse, heads=heads,
                           new=C.ckvn if src is not None and src.kv else None,
@@ -473,8 +473,8 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     comp, idx = [], []
     ctiles = k.SHARD_COMP_TILES if shard and k.SHARD_COMP_TILES else k.COMP_TILES
     if k.IDX_SCORE_F32 and src is not None and src.ratio == 2 and rows is not None and rows >= 18:
-        # K62: COMP_TILES 4 sits at 256 VGPRs on the ratio-2 KV + index sources at 18 rows (K41); the f32 scores'
-        # program spills one there (133K / 1M buckets, replicated): 2 tiles, as at 24 rows (K37)
+        # COMP_TILES 4 sits at 256 VGPRs on the ratio-2 KV + index sources at 18 rows; the f32 scores'
+        # program spills one there (133K / 1M buckets, replicated): 2 tiles, as at 24 rows
         ctiles = min(ctiles, 2)
     if src is not None and src.kv:  # beside wq_a / wkv: its dots depend only on attn_norm
         comp = [
@@ -502,7 +502,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
             if src.cand == "source"
             else {"candidates": "cand", "compact": int(k.IDX_COMPACT)} if src.cand == "reader" else {}
         )
-        f32 = bool(k.IDX_SCORE_F32)  # (K62: f32 scores; the bf16 scores' shortcuts off, schedule entries included)
+        f32 = bool(k.IDX_SCORE_F32)  # (f32 scores; the bf16 scores' shortcuts off, schedule entries included)
         idx = [Indexer("idx", C.qn, C.xab, src.ratio, src.n_max, C.sel, "pos", "rope", "index_k", src.cache_len,
                        "idx.bound", new_keys=C.ikey if src.kv else None, kfmt=k.INDEX_KFMT, wq_b_rows=k.IDX_WQB_ROWS,
                        kpack_lanes=bool(k.KPACK_LANES), subtiles=int(k.IDX_SUBTILES), short_tiles=bool(k.IDX_SHORT),
@@ -635,8 +635,8 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
 
 
 def engram_kv_spill_ok(tp: int) -> bool:
-    """``engram_kv_stages``' program: SGPR spills into VGPR lanes allowed past ``schedules.KEY_TP`` (TP8 B3S6: 1,
-    K51)."""
+    """``engram_kv_stages``' program: SGPR spills into VGPR lanes allowed past ``schedules.KEY_TP`` (TP8 B3S6:
+    1)."""
     return tp > schedules.KEY_TP
 
 
@@ -665,7 +665,7 @@ def moe_route_early(stages: list[Stage], knobs: dict | None = None) -> list[Stag
     names = [st.name for st in stages]
     dual = kn["NUMA_DUAL"]
     if dual:  # dual-copy (numa2) mailboxes: every tagged scratch region up to NUMA_DUAL KiB (window layers: 64,
-        #      their program is at the SGPR budget: 256 spilled one SGPR on layer 0 at 6 rows) (K29)
+        #      their program is at the SGPR budget: 256 spilled one SGPR on layer 0 at 6 rows)
         names = {st.name for st in stages}
         window = "attn.m" not in names and "attn.c" not in names
         numa_stages(stages + aside, (f"auto:{min(int(dual), 64) if window else int(dual)}",))
@@ -692,7 +692,7 @@ def shard_place(stages: list[Stage], aside: list[Stage], cus: int = 256) -> list
     them (the replicated layout's), then each seam's block-sum and gate stage back in program order (``_SHARD_SLOTS``)
     on the first window of CTAs that runs none of the listed stages: their tasks wait for the other ranks' block sums
     (~3 µs after the slices), so no stage on the path may queue behind them on a CTA. Seam A's gate goes right before
-    wo_a: its consumer is seam F (H11)."""
+    wo_a: its consumer is seam F."""
     nxt = 0
     for st in stages:
         if st.base is None:
@@ -718,7 +718,7 @@ def shard_place(stages: list[Stage], aside: list[Stage], cus: int = 256) -> list
 
 def wo_a_hold(stages: list[Stage], knobs: dict | None = None) -> list[Stage]:
     """``WO_A_HOLD``: wo_a's entry hold (``Stage.hold``) on window layers ("auto": 64 when the program has no sparse
-    merge and wo_a has at most 8 rows; K21)."""
+    merge and wo_a has at most 8 rows)."""
     hold = (knobs or schedules.current())["WO_A_HOLD"]
     names = {st.name for st in stages}
     for st in stages:
@@ -735,7 +735,7 @@ def wo_a_hold(stages: list[Stage], knobs: dict | None = None) -> list[Stage]:
 def idx_after_pool(stages: list[Stage], cus: int = 256, knobs: dict | None = None) -> list[Stage]:
     """``IDX_AFTER_POOL``: in a one-kernel KV + index source (stages ``comp.pool`` and ``idx.wq_b``, no ``store_ao``)
     the Indexer's first stage starts on the CTA after ``comp.pool``'s last (its tasks no longer wait behind the pool's),
-    the later stages following it as ``plan`` places them (K22)."""
+    the later stages following it as ``plan`` places them."""
     v = (knobs or schedules.current())["IDX_AFTER_POOL"]
     names = [st.name for st in stages]
     on = v in (True, 1) or (v == "auto" and "store_ao" not in names)
@@ -753,7 +753,7 @@ def smerge_place(stages: list[Stage], cus: int = 256, knobs: dict | None = None)
     """``SPARSE_SMERGE``'s placement (stages ``attn.m``, ``ringw``, ``wo_a`` in a row, as ``plan`` would place them):
     RingWrite on the merge's first CTAs (after their merge tasks: nothing in this launch waits for it) and wo_a on the
     CTAs right after the merge's, so no wo_a task waits behind a merge task to start its weight prefetch; wo_b
-    follows as ``plan`` places it (K18)."""
+    follows as ``plan`` places it."""
     kn = knobs or schedules.current()
     names = [st.name for st in stages]
     if not (kn["SPARSE_SMERGE"] in (True, 1, "auto") and kn["SMERGE_PLACE"]) or not {"attn.m", "ringw", "wo_a"} <= set(
@@ -779,9 +779,9 @@ def cand_apart(stages: list[Stage], cus: int = 256, knobs: dict | None = None) -
     then the attention path's stages (``_APART``: wq_b, the merge with its RingWrite, wo_a, wo_b, seam F's slices)
     from the CTA after the candidate chain's last (``idx.cmask``'s): none waits behind ctopk / cmask, one task a row
     each that end late at long contexts (layer 20's own attention does not read the bitmap). wo_a then shares the
-    merge's first CTAs (K18's placement given up there) (K44). 2: also the selection's TopK above level 0 (its levels,
+    merge's first CTAs (``SMERGE_PLACE``'s placement given up there). 2: also the selection's TopK above level 0 (its levels,
     the split merge) and ``sel_store`` on the first CTAs from their own that run none of the candidate chain's late
-    stages nor ``_APART``'s (K47). "auto" (a build without the kind's knobs: the live ones): the ratio-1 KV source's
+    stages nor ``_APART``'s. "auto" (a build without the kind's knobs: the live ones): the ratio-1 KV source's
     schedule at the cmask stage's rows and bucket (``schedules.LONG_ROWS``)."""
     on = (knobs or schedules.current())["IDX_CAND_APART"]
     names = [st.name for st in stages]
@@ -821,7 +821,7 @@ _GATE_AVOID = ("ffn_norm", "router.", "moe.sh_ug", "moe.route")
 def hcf_gate_place(stages: list[Stage], cus: int = 256, knobs: dict | None = None) -> list[Stage]:
     """``HCF_GATE_AT``: every stage's base as ``plan`` would place it, then seam F's gate on the CTAs from that one
     ("auto": only when its plan CTAs run one of ``_GATE_AVOID``'s stages, the first window of CTAs from hcf.slice's
-    first that runs none); nothing else moves (K11)."""
+    first that runs none); nothing else moves."""
     at = (knobs or schedules.current())["HCF_GATE_AT"]
     names = [st.name for st in stages]
     if at is None or "hcf.gate" not in names or "hcf.slice" not in names:

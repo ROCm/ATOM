@@ -5,7 +5,7 @@
 
 On a step this hook serves, every one of V4.1's 40 decoder layers runs its
 hi layer program (the ``mono/hi`` package: ``layer.window_layer_blocks``, one
-persistent launch a layer at TP; the plan: ``hi_bridge.plan_layers``), then
+persistent launch a layer at TP; the plan: ``hi_plan.plan_layers``), then
 the hi verify head.
 Prefill and every step the hook does not serve stay ATOM's (its own mono
 decode, K1 / K2).
@@ -72,7 +72,7 @@ lowest id) runs right after the last layer inside the target graph, its weights
 packed from ATOM's own ``model.norm.weight`` / ``model.head.weight``. Its ids
 land in a persistent int32 buffer (``head_out``) that ATOM's runner reads
 instead of logits on the verify steps that read nothing but each row's pick
-(``ModelRunner._verify_head_ids``). It samples (the hi runtime's
+(``round.verify_head``, the runner's model-side verify head). It samples (the hi runtime's
 ``head_blocks(sample=True)``): per row, temperature 0 takes the greedy pick,
 else one draw of softmax(bf16 logits / T) in ATOM's top-p nucleus, the rows
 with top_p >= 1 drawn in the dot epilogue (``race``); Philox counters keyed by
@@ -80,7 +80,7 @@ the seed, the launch tag, the row and the id (the same draw on every rank). The
 rows' (T, top_p) are a persistent buffer (``head.par``) the runner sets before
 each forward (``set_head_sampling``). Under forced acceptance
 (``--spec-decode-acceptance-length``) the head's ids feed the same synthetic
-acceptance schedule (``head_forced`` "sample").
+acceptance schedule (``round.verify_head``).
 
 Graph capture: weights, buffers, programs, pointer tables and the peer groups
 are bound at install, so a step only launches; the launch-tag step counter is
@@ -97,6 +97,7 @@ import triton
 import triton.language as tl
 
 from atom.models.deepseek_v41.mono import hi_bridge as ml
+from atom.models.deepseek_v41.mono import hi_plan
 from atom.models.deepseek_v41.mono import hi_weights as hw
 from atom.models.deepseek_v41.mono.hi_draft import (
     CTX_LAUNCH,
@@ -140,13 +141,6 @@ HEAD_SEED = 0  # the sampling head's Philox seed
 class HiLayers(HiDraft, HiPrograms):
     """the hi runtime's layer programs for one TP rank (``install``) and the per-step
     hand-off (module docstring)."""
-
-    # how the verify head serves forced acceptance (``ModelRunner._head_forced_mode``): "sample", its rows as it
-    # serves them without forcing (a sampled row's draw), the schedule deciding only acceptance
-    head_forced = "sample"
-    # the sampled ids' TP broadcast on a step the verify head served: "skip" (every rank holds the head's ids: its
-    # candidates are exchanged, then every rank picks alike; forced acceptance's draws are seeded from the step)
-    ids_bcast = "skip"
 
     def __init__(
         self, model, atom_config, widths: list[int], max_ctx: int, engram_mapping, draft
@@ -221,9 +215,9 @@ class HiLayers(HiDraft, HiPrograms):
         self.draft_max_pos = max_ctx - 16
         # the RoPE tables, ATOM's own in place (``RotaryEmbedding``: bf16 cos / sin [positions, 32]; ``rope_cs``):
         # the window layers' ``window_rope``, the compressing layers' ``global_rope``, the draft's its own ``rope``
-        self.rope_w = _rope_args(model.window_rope)
-        self.rope_c = _rope_args(model.global_rope)
-        self.rope_d = _rope_args(draft.rope)
+        self.rope_w = hw.rope_args(model.window_rope)
+        self.rope_c = hw.rope_args(model.global_rope)
+        self.rope_d = hw.rope_args(draft.rope)
         # ---- ATOM's storage in place (module docstring): the KV owners (layer -> ratio) and the request words
         # (``hi_bridge.REQ_WORDS``: the page geometry, bound by ``_bind_cache``; each request's batch id, slot and
         # liveness and each row's, written by the begin-step), the owners' addresses bound by ``_bind_cache``
@@ -282,8 +276,6 @@ class HiLayers(HiDraft, HiPrograms):
         self.ring_p = IMPORT_RING
         # a request slot each
         self.imp = torch.full((self.bmax * ml.IMP_WORDS,), -1, dtype=i32, device=dev)
-        # the ring import's count of inexact merge copies (its copy is compiled out here: never written)
-        self.copy_bad = z(1, dt=i32)
         peer_bytes = max(
             k.program.peer_bytes
             for k in [*self.programs.values(), *self._heads.values()]
@@ -607,6 +599,13 @@ class HiLayers(HiDraft, HiPrograms):
         ]
         self.par_events = [torch.cuda.Event() for _ in range(4)]
         self.par_next = 0
+        # ``set_head_sampling``'s persistent host buffers (filled in place each step, nothing allocated): the rows'
+        # (T, top_p), and the next blocks (their seed words kept from ``par_last``)
+        self.par_row_buf = np.zeros((self.par_rows, 2), dtype=np.float32)
+        self.par_work = self.par_last.copy()
+        self.par_work_f = self.par_work.view(np.float32)
+        # (the pinned slots' host views)
+        self.par_ring_np = [t.numpy() for t in self.par_ring]
         for (s, b), (r0, n) in launches.items():
             kern = self.head_programs[s]
             at = {
@@ -629,27 +628,26 @@ class HiLayers(HiDraft, HiPrograms):
         self._packed.append(packed)
         return sum(t.numel() * t.element_size() for t in packed.values())
 
-    def set_head_sampling(self, temps=None, top_ps=None) -> bool:
-        """This step's rows' (temperature, top_p) for the sampling head, before the forward: ``temps`` / ``top_ps``
-        per row (numpy, the step's rows in order; None: every row greedy; rows past them greedy). One H2D copy from a
-        pinned slot when they changed, on the current stream (so ahead of the forward that reads them); unchanged:
-        nothing (a few µs of host). -> False when a graph capture is recording (nothing staged).
+    def set_head_sampling(self, temps=None, top_ps=None, rows=None) -> bool:
+        """This step's rows' (temperature, top_p) for the sampling head, before the forward: request i's
+        ``temps[i]`` / ``top_ps[i]`` on its ``rows[i]`` rows (numpy, the step's requests in order; None: every row
+        greedy; rows past them greedy). Filled in place into persistent host buffers; one H2D copy from a pinned slot
+        when they changed, on the current stream (so ahead of the forward that reads them); unchanged: nothing (a few
+        µs of host). -> False when a graph capture is recording (nothing staged).
         """
-        # the step's rows' (T, top_p); past them greedy
-        rows = np.zeros((self.par_rows, 2), dtype=np.float32)
+        buf = self.par_row_buf
+        buf.fill(0.0)  # (past the step's rows: greedy)
         if temps is not None:
-            n = min(len(temps), self.par_rows)
-            rows[:n, 0], rows[:n, 1] = temps[:n], top_ps[:n]
-        par = self.par_last.copy()
-        f = par.view(np.float32)
+            r = 0
+            for t, p, n in zip(temps, top_ps, rows):
+                n = min(int(n), self.par_rows - r)
+                buf[r : r + n, 0], buf[r : r + n, 1] = t, p
+                r += n
         # each launch's block: its rows' pairs
-        for (
-            o,
-            r0,
-            n,
-        ) in self.par_blocks.values():
-            f[o : o + 2 * n] = rows[r0 : r0 + n].reshape(-1)
-        if np.array_equal(par, self.par_last):
+        f = self.par_work_f
+        for o, r0, n in self.par_blocks.values():
+            f[o : o + 2 * n] = buf[r0 : r0 + n].reshape(-1)
+        if np.array_equal(self.par_work, self.par_last):
             return True
         # (a capture's dummy step: nothing staged into the graph)
         if torch.cuda.is_current_stream_capturing():
@@ -657,10 +655,10 @@ class HiLayers(HiDraft, HiPrograms):
         i = self.par_next
         self.par_next = (i + 1) % len(self.par_ring)
         self.par_events[i].synchronize()  # the slot's previous copy is done
-        self.par_ring[i].copy_(torch.from_numpy(par))
+        self.par_ring_np[i][:] = self.par_work
         self.head_par.copy_(self.par_ring[i], non_blocking=True)
         self.par_events[i].record()
-        self.par_last = par
+        self.par_last[:] = self.par_work
         return True
 
     def head_out(self) -> torch.Tensor | None:
@@ -782,11 +780,6 @@ class HiLayers(HiDraft, HiPrograms):
         logger.info("V4.1 mono hi: %d pointers of %d layers bound to ATOM's KV pool, FP4 index planes, compress rings "
                     "and block table (in place)", len(self._late), len(self.mf))  # fmt: skip
 
-    def _ring_copy_args(self) -> tuple:
-        """The ring import's copy pointers (placeholders: the bridge's copies are compiled out, ``RING8`` 0) and its
-        ``bad`` counter."""
-        return self.pos, self.pos, self.copy_bad
-
     def begin_step(self, cache, step, rows: int, staged=None, input_ids=None) -> None:
         """One launch (``_begin_step_kernel``): the step bump (recorded by a capture), the rings, the request words,
         the embedding read in place from the ranks' shards and expanded into layer 0's input, the Engram history and
@@ -819,9 +812,9 @@ class HiLayers(HiDraft, HiPrograms):
         n = nb * len(self.mf) * rp + rows + ke["NE0"] + ke["NE1"] + ke["EHIST"]
         ml._begin_step_kernel[(n,)](
             cache.pool, step.positions, step.batch_ids, step.slots, self.rings, self.ring_layers, self.pos,
-            self.bounds, *self._geo(cache), rows, *self._ring_copy_args(), emb.shards, emb.hidden, self.h_in0,
+            self.bounds, *self._geo(cache), rows, emb.shards, emb.hidden, self.h_in0,
             self.step, self.req, *eflat, self.imp, NMF=len(self.mf), WIN=WINDOW, DIM=HEAD_DIM,
-            RB=self.RB, HIDDEN=emb.hidden, BLOCK=1024, NHC=HC, **ke, RING8=0, INCR=1, RP=rp, NB=nb, BM=self.bmax,
+            RB=self.RB, HIDDEN=emb.hidden, BLOCK=1024, NHC=HC, **ke, INCR=1, RP=rp, NB=nb, BM=self.bmax,
             RQP=triton.next_power_of_2(rows // nb),
         )  # fmt: skip
         if rows in self.band_of:
@@ -981,22 +974,6 @@ class HiLayers(HiDraft, HiPrograms):
         )  # fmt: skip
 
 
-def _rope_args(rope) -> dict:
-    """The pointer-table entries of ATOM's ``RotaryEmbedding`` ``rope``: its bf16 cos / sin caches [positions, 32]
-    (``rope`` / ``rope.sin``: the hi device code's ``rope_cs``)."""
-    cos, sin = rope.cos_cache, rope.sin_cache
-    if (
-        cos.dtype != torch.bfloat16
-        or cos.shape != sin.shape
-        or cos.shape[-1] != 32
-        or not (cos.is_contiguous() and sin.is_contiguous())
-    ):
-        raise ValueError(
-            f"V4.1 mono hi: RoPE caches {cos.dtype} {tuple(cos.shape)} / {tuple(sin.shape)}, not bf16 [n, 32]"
-        )
-    return {"rope": cos, "rope.sin": sin}
-
-
 def head_launch_ids(last: int, requests: int) -> tuple[int, ...]:
     """The verify head's launch ids at a width of ``requests`` requests, after the last layer ``last``: ``last + 1``
     for the first (one request: the chained head), then ``HEAD_MORE`` (consecutive launches on one peer group
@@ -1015,7 +992,7 @@ def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
     peer groups): every rank calls it at the same point."""
     widths = list(ROWS)
     max_ctx = MAX_CTX
-    for p in ml.plan_layers(
+    for p in hi_plan.plan_layers(
         model.topology, model.config.engram_layer_ids, engram_on=True
     ):
         logger.info(
@@ -1044,6 +1021,10 @@ def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
     # the verdict, the Engram cursor commit and the DSpark anchors inside the target graph (``post_verify``; the
     # fused one-launch verdict, ``head_verdict``, on the steps it does not take)
     hook.pv = post_verify.PostVerify(hook.widths, hook.split, hook.step.device)
+    # the runner's model-side verify head on the head's ids (``round.verify_head``)
+    from atom.models.deepseek_v41.mono.round.verify_head import HiVerifyHead
+
+    hook.verify_head = HiVerifyHead(hook)
     return hook
 
 

@@ -4,7 +4,8 @@
 
 ``block_tensors``: a target layer's or a DSpark draft stage's tensors on this TP rank, in the checkpoint's form and
 names (what the hi runtime's ``layer_impl.pack(local=True)`` reads); ``expert_packs``: its routed experts' packs;
-``ctx_tensors`` / ``engram_tensors``: the draft's context write's and an Engram layer's projection, likewise.
+``ctx_tensors`` / ``engram_tensors``: the draft's context write's and an Engram layer's projection, likewise;
+``rope_args``: ATOM's RoPE caches, read in place.
 
 ATOM holds every tensor these packers read, rank-local exactly as they slice it (TP without EP: ``wq_b`` / ``wo_a``
 rows, ``wo_b`` columns, ``attn_sink``, the shared expert's and every routed expert's width slice), and changes them
@@ -276,3 +277,19 @@ def alias_plain(block, packed: dict) -> int:
         packed[key] = view
         n += 1
     return n
+
+
+def rope_args(rope) -> dict:
+    """The pointer-table entries of ATOM's ``RotaryEmbedding`` ``rope``: its bf16 cos / sin caches [positions, 32]
+    (``rope`` / ``rope.sin``: the hi device code's ``rope_cs``)."""
+    cos, sin = rope.cos_cache, rope.sin_cache
+    if (
+        cos.dtype != torch.bfloat16
+        or cos.shape != sin.shape
+        or cos.shape[-1] != 32
+        or not (cos.is_contiguous() and sin.is_contiguous())
+    ):
+        raise ValueError(
+            f"V4.1 mono hi: RoPE caches {cos.dtype} {tuple(cos.shape)} / {tuple(sin.shape)}, not bf16 [n, 32]"
+        )
+    return {"rope": cos, "rope.sin": sin}

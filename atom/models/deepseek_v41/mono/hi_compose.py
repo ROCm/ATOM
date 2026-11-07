@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from atom.models.deepseek_v41.mono import hi_bridge as ml
+from atom.models.deepseek_v41.mono import hi_plan
 from atom.models.deepseek_v41.mono.hi_bands import plan_widths
 from atom.models.deepseek_v41.mono.hi_gate import MAX_CTX, REQ_ROWS
 
@@ -97,7 +97,7 @@ class HiPrograms:
         mf_program.share_peer_groups(True)
         # every layer on the hi path, the Engram layers included (their gate half in seam A, the token-only halves in a
         # launch before layer 0)
-        plan = ml.plan_layers(topology, cfg.engram_layer_ids, engram_on=True)
+        plan = hi_plan.plan_layers(topology, cfg.engram_layer_ids, engram_on=True)
         self.plan = {p.layer_id: p for p in plan}
         self.mf = [i for i, p in sorted(self.plan.items()) if p.hi]
         atom_layers = sorted(i for i, p in self.plan.items() if not p.hi)
@@ -130,7 +130,7 @@ class HiPrograms:
         self.aux_ids = tuple(
             int(i) for i in getattr(cfg, "dspark_target_layer_ids", ()) or ()
         )
-        self.cl = {r: ml.n_max(max_ctx, r) for r in (1, 2)}
+        self.cl = {r: hi_plan.n_max(max_ctx, r) for r in (1, 2)}
         self.eng = {f"eng{i}": i for i in self.mf if self.plan[i].engram}
         # ---- programs: one a (kind, width), shared by the layers of the kind
         # the verify head a width (before the layer programs: the last layer's chain role follows it): one request,
@@ -266,7 +266,7 @@ class HiPrograms:
         neighbour (module docstring)."""
         if not self.chain:
             return False, False
-        return ml.chain_role(self.plan, i, self.head_chained(s))
+        return hi_plan.chain_role(self.plan, i, self.head_chained(s))
 
     def pwidth(self, s: int) -> int:
         """The rows of width s's programs: s, or a band's width (its requests x ``req_rows``: every width of the band
@@ -295,7 +295,7 @@ class HiPrograms:
 
     def _program(
         self,
-        p: ml.LayerPlan,
+        p: hi_plan.LayerPlan,
         s: int,
         push: bool = False,
         prev: bool = False,
@@ -363,7 +363,7 @@ class HiPrograms:
     ):
         """The verify head's program at ``s`` rows (module docstring), ``split`` = (requests, rows a request) of its
         scenario (default one request): ``chain``, its fold sums the last layer's pushed MoE partials
-        (``ml.chain_role``); its R into ``r_h``. One program a (rows, requests, chain), shared by the widths that run
+        (``hi_plan.chain_role``); its R into ``r_h``. One program a (rows, requests, chain), shared by the widths that run
         it."""
         from .hi.v41 import head as H
         from .hi.plan.program import Scenario

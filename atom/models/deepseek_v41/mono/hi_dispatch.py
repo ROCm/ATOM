@@ -9,9 +9,9 @@ unchanged. Nothing here is imported without the flag.
 
 - ``HiDecodeModel``: the forwards the hook serves (``HiLayers.serves_step``) run every decoder layer on
   hi (``HiDecodeModel._hi_forward``); every other forward takes ATOM's path as before (a decode step ATOM's K1 / K2,
-  their runner created on the first such step only) and invalidates the hook's incremental import for its requests. Its verify head's hooks for ``ModelRunner`` (``verify_head_ids``,
-  ``verify_verdict``, ``set_verify_sampling``, ...): a served verify step's ids come from the head inside the forward
-  instead of the logits.
+  their runner created on the first such step only) and invalidates the hook's incremental import for its requests. Its
+  ``verify_head`` (``round.verify_head.HiVerifyHead``, ``ModelRunner``'s model-side verify head): a served verify
+  step's ids come from the head inside the forward instead of the logits.
 - ``HiDraftModel``: the DSpark draft's context-KV write and its block draft on the hi path on the steps the hook
   served (``context_kv_served``, ``block_backbone``), ATOM's draft otherwise.
 - the host work of the decode round at the engine's explicit hooks (``round.HiRound``: the runner's through
@@ -27,7 +27,7 @@ import torch
 from torch import nn
 
 from atom.models.deepseek_v41.mono import hi_runner
-from atom.models.deepseek_v41.mono.round import embed_full, post_verify
+from atom.models.deepseek_v41.mono.round import embed_full
 from atom.models.deepseek_v41.mono import round as hi_round
 from atom.models.deepseek_v41.mono.dispatch import (
     MonoDecodeModel,
@@ -118,42 +118,10 @@ class HiDecodeModel(MonoDecodeModel):
         """The decode round's host work at ``ModelRunner``'s hooks (``round.HiRound``)."""
         return self._hi.round
 
-    # ---- the verify head's hooks (``ModelRunner._verify_head_ids`` and the ones it calls)
-
-    # the head samples: its ids on an all-sampled verify step are draws
-    samples_verify = True
-
     @property
-    def verify_verdict(self):
-        """A head-served verify step's verdict: ``(spec, head_ids, sampler) -> (output ids, verdict, next ids)``,
-        the in-graph post-verify's results or the one-launch verdict (``post_verify.verdict``).
-        """
-        hook = self._hi
-        return lambda spec, ids, sampler: post_verify.verdict(hook, spec, ids, sampler)
-
-    @property
-    def verify_head_forced(self) -> str:
-        """How the verify head serves forced acceptance (``ModelRunner._head_forced_mode``)."""
-        return self._hi.head_forced
-
-    @property
-    def verify_ids_bcast(self) -> str:
-        """The sampled ids' TP broadcast on a step the verify head served: "skip" (``ModelRunner.postprocess``)."""
-        return self._hi.ids_bcast
-
-    def set_verify_sampling(self, temps=None, top_ps=None) -> bool:
-        """The next forward's rows' (T, top_p) for the sampling verify head (None: every row greedy)."""
-        return self._hi.set_head_sampling(temps, top_ps)
-
-    @property
-    def verify_head_ids(self):
-        """``_head_ids``: the runner takes a served verify's ids from it (``ModelRunner._verify_head_ids``)."""
-        return self._head_ids
-
-    def _head_ids(self, hidden_states: torch.Tensor | None = None):
-        """The ids of the forward that just ran on the host, from the verify head: int32 [rows] (a persistent buffer
-        a captured graph rewrites on replay), or None when the head did not run."""
-        return self._hi.head_out()
+    def verify_head(self):
+        """The model-side verify head ``ModelRunner`` takes a served verify's ids from (``round.verify_head``)."""
+        return self._hi.verify_head
 
 
 class HiDraftModel(MonoDraftModel):

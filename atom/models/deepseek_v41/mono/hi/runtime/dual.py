@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Dual-copy scratch on MI355X's home rule (``Program.dual``; H4-H6).
+"""Dual-copy scratch on MI355X's home rule (``Program.dual``).
 
-The rule (H5 on two MI355X boxes, agreement 1.0 on every page): within a 2 MiB page, memory alternates its
+The rule (on two MI355X boxes, agreement 1.0 on every page): within a 2 MiB page, memory alternates its
 home I/O die every 8 KiB (home = address bit 13 XOR a bit of the page). A dual program lays both copies of its dual
 regions out arithmetically by it (``plan.program._dual_layout``: copy 0 in the area's even runs, copy 1 in the odd
 ones, the area at the start of a 2 MiB-aligned scratch), so copy 0 is homed on one IOD and copy 1 on the other. What
@@ -16,8 +16,7 @@ timing probe, which also checks the rule:
   the run parity local to them -> each XCD's copy (``word``: bit x = the copy XCD x reads). Then a sweep of every run
   of the area with one pair of each IOD: every run must take the home the rule gives it (agreement 1.0). A run whose
   home disagrees is timed again (``RETIME`` repetitions, up to ``RETIME_ROUNDS`` rounds) before it counts: one noisy
-  round trip in a sweep of hundreds of runs gave agreement 0.9961 and word 0 on a scratch whose rule held
-  (H8).
+  round trip in a sweep of hundreds of runs gave agreement 0.9961 and word 0 on a scratch whose rule held.
 
 ``scratch_word`` (each dual scratch): the copy word of that page, its runs checked, up to ``ATTEMPTS`` calibrations; a
 failed check (also logged) gives word 0 (every CTA reads copy 0: correct, the stores still go to both, but up to a few

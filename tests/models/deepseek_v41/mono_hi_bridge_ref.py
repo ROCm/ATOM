@@ -13,14 +13,13 @@ import triton.language as tl
 @triton.jit
 def _import_rings_kernel(
     pool, positions, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
-    ring_start0, slot_rows, ring_slots, num_slots, max_pos, rows, ring_q8, ring_s8, bad,
-    WIN: tl.constexpr, DIM: tl.constexpr, RB: tl.constexpr, RING8: tl.constexpr = 0, NB: tl.constexpr = 1,
-    BM: tl.constexpr = 1,
+    ring_start0, slot_rows, ring_slots, num_slots, max_pos, rows,
+    WIN: tl.constexpr, DIM: tl.constexpr, RB: tl.constexpr, NB: tl.constexpr = 1, BM: tl.constexpr = 1,
 ):  # fmt: skip
     """Program (m, s, b): ``_ring_in`` (grid (NMF, WIN, NB); ``rows`` = NB requests' rows)."""
     _ring_in(tl.program_id(0), tl.program_id(2), tl.program_id(1), rows // NB, pool, positions, batch_ids, slots,
-             rings, layer_ids, pos_out, bounds_out, ring_start0, slot_rows, ring_slots, num_slots, max_pos, ring_q8,
-             ring_s8, bad, WIN, DIM, RB, RING8, BM)  # fmt: skip
+             rings, layer_ids, pos_out, bounds_out, ring_start0, slot_rows, ring_slots, num_slots, max_pos, WIN, DIM,
+             RB, BM)  # fmt: skip
 
 
 @triton.jit

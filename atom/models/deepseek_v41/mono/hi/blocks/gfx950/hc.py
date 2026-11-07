@@ -3,7 +3,7 @@
 """Hyper-connections: ``HCIn`` (stream norm, low-rank mix, injection weights) and ``HCWrite``,
 the combine of a ``Linear``'s output (or any block's) into every residual stream.
 
-The numerics contract is ``reference.hyperconn`` (any ``HCGeometry``: ``streams``
+The numerics contract is the checkpoint's hyper-connections (any ``HCGeometry``: ``streams``
 bf16 streams of ``hidden``, the flat row ``width = streams * hidden`` stream-major, a
 low-rank path of ``lowrank`` columns). Every rounding point below is the contract's.
 
@@ -36,7 +36,7 @@ low-rank path of ``lowrank`` columns). Every rounding point below is the contrac
   Task 0 also publishes the injection multipliers ``inj[r, s] = 2 sigmoid(bf16(bf16(d_inj) /
   streams))`` (an F32 channel [rows, streams]): what ``combine`` multiplies the block by.
 
-Sigmoid and SiLU are torch's fp32 formulas (accurate exp, IEEE division; as in ``gdn``).
+Sigmoid and SiLU are torch's fp32 formulas (accurate exp, IEEE division).
 Sums are fp32 in a fixed order (MFMA, then K units per wave, waves in order, slices in
 order); the contract's torch GEMMs sum in another order, so a bf16 rounding of ``d`` or
 ``u`` can differ in its last bit where the fp32 sum sits on a rounding boundary.
@@ -166,7 +166,7 @@ def _words(ptr, w, n):
 
 @dataclass(frozen=True)
 class HCWrite:
-    """The combine of ``reference.hyperconn`` as an output spec: the producer's row
+    """The hyper-connections' combine as an output spec: the producer's row
     ``y`` [rows, hidden] (fp32, rounded to bf16 here) goes into each of ``streams`` residual
     streams with its injection multiplier: ``out[r, s * hidden + c] = bf16(res[r, s * hidden
     + c] + bf16(y[r, c]) * inj[r, s])``.
@@ -178,7 +178,7 @@ class HCWrite:
     - the result: a plain bf16 arg ``out`` [rows, streams * hidden] and / or a BF16 channel
       ``publish`` (the next HC's and the next combine's input).
 
-    ``streams = 1`` with ``inj = 1`` is a plain residual add (the 27B's ``Residual``)."""
+    ``streams = 1`` with ``inj = 1`` is a plain residual add (``linear.Residual``'s)."""
 
     streams: int
     inj: Channel
@@ -881,7 +881,7 @@ def _direct_rstds(k, p, tws, landed=False):
             return _squares(tw[c])
 
         # lane / wave through opaque copies: masks on k.lane / k.wave would be hoisted to the
-        # kernel top and hold SGPR pairs across every stage (the moe measurements; ple B1S2 spilled)
+        # kernel top and hold SGPR pairs across every stage (spills seen in composed programs)
         lane, wave = fresh(k.lane), fresh(k.wave)
         part = torch_thread_sum(squares, 256 * len(tw), 64, lane, 0)  # the unit's vectors, in order
         live = wave < len(units)
@@ -986,7 +986,7 @@ def _normalize_lds(k, p, rows, gw, st, publish, rstds, r0=None):
 
 def _down_task(k, p, fmt, blk, s, r0=None):
     st, part = s // p.split, s % p.split
-    lane = fresh(k.lane)  # masks on it are not CSE'd with other stages' and held across them (ple B1S2 spilled)
+    lane = fresh(k.lane)  # masks on it are not CSE'd with other stages' and held across them (spills seen in a composed program)
     # 1. the weights first, then the gamma, the rows' first group and (a plain source) the waves'
     # own loads of their rows in torch's layout for the norm's sums (vmcnt is in order)
     units = _down_units(k, p, fmt, blk, s)

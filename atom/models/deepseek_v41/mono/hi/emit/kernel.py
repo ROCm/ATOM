@@ -25,10 +25,10 @@ step phase (``k.peer_phase``: the peer table's entry ``tp``, ``PeerGroup.end_ste
 The body walks the stages in order. Each stage gets a fresh ``StageCtx``: wave
 index, pointer-table loads and region addresses recomputed behind opaque moves,
 so LLVM cannot hold one stage's values in registers across later stages (the
-spills / scratch that would break residency, Flash-Next's ``_fresh``).
+spills / scratch that would break residency).
 
 Target: the program's (``Program.target``). The device helpers the emitter calls (opaque moves,
-the step load, table loads, the mailbox's ``Addr`` and debug hooks, stamps, the kernel symbol)
+the step load, table loads, the mailbox's ``Addr`` and debug hooks, the kernel symbol)
 come from the target's device package (``device.package``), the launch grid and CTA
 count from ``target.grid``.
 """
@@ -181,17 +181,6 @@ def _task_once(k, emit, first, tasks):
     set-up into ahead of its first instructions (an entry-issued stage's, ``Stage.pre``)."""
     if first < tasks:
         emit(k, fx.Int32(first))
-
-
-def _i64(lo, hi):
-    return (fx.Int64(hi) << 32) | fx.Int64(fx.Uint32(lo))
-
-
-def _entry(table, i):
-    """Pointer-table entry ``i`` (an invariant scalar load)."""
-    addr = fx.Int64(table) + fx.Int64(8 * i)
-    ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<4>"), addr.ir_value()).result
-    return fx.Int64(llvm.LoadOp(T.i64, ptr, alignment=8, invariant=True).result)
 
 
 def _stage_ctx(program: Program, base: SimpleNamespace, stage) -> SimpleNamespace:
@@ -351,10 +340,6 @@ def carried_by(program: Program, stage) -> dict:
     return out
 
 
-def reads_carried(program: Program, stage) -> bool:
-    return any(stage.name in c.readers for s in program.stages for c in s.carry)
-
-
 def _emit_stages(program: Program, base: SimpleNamespace) -> None:
     """Plain Python (not rewritten): the stage loop unrolls at trace time."""
     if program.dual_on:  # (gfx950's dual-copy mailboxes)
@@ -383,7 +368,7 @@ def _emit_stage_entry(program: Program, base: SimpleNamespace, i: int, stage) ->
     if i > 0 and stage.lds_words and _prev_lds(program, i):
         # Stages overlay one LDS arena and a CTA's waves leave a stage at different
         # times: without this a fast wave's next-stage LDS writes clobber what a slow
-        # sibling still reads (found by stream D in the composed GDN layer).
+        # sibling still reads.
         gpu.barrier()
     first = first_task(k.bid, stage.base, program.target.grid)
     dyn = program.dyn_rows

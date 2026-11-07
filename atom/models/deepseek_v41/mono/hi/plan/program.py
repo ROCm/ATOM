@@ -118,7 +118,7 @@ class LdsKeep:
     same block on the same CTA (``readers``): e.g. MoEExperts' rt slot table, read by its ug / down tasks. Unlike an
     ``LdsCarry`` the planner does not place it, so it constrains nothing in the build; ``plan`` only refuses a stage
     between the writer and the last reader, on a CTA they share, whose arena reaches ``lo`` (it would overwrite the
-    words: an inserted or re-placed stage, e.g. a tuner placement or ``Schedule.insert``). ``aware``: stages that keep
+    words: an inserted or re-placed stage). ``aware``: stages that keep
     the layout (the block's own; their ``lds_words`` may cover the range). Plan-time only: not part of the build key."""
 
     name: str

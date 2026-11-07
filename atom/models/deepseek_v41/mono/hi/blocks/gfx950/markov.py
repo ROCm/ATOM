@@ -136,7 +136,7 @@ class MarkovHead(Block):
                  rank_r: int = 256, logits: Channel | None = None, kparts: int = 0,
                  blocks: int | None = None):  # fmt: skip
         # blocks: 128-id blocks a task; None: 1 while a rank's blocks fit one a CU, else 2 (V4.1 at TP2: 505 blocks of
-        # its 64,640 ids, 253 tasks of 2; K67)
+        # its 64,640 ids, 253 tasks of 2)
         if blocks not in (None, 1, 2) or (blocks == 2 and logits is not None):
             raise ValueError(f"MarkovHead {name}: blocks None, 1 or 2 (2: the head's own dot, no logits channel)")
         self.blocks = blocks

@@ -5,6 +5,14 @@ decode's hi hook serves it (``ATOM_DSV41_MONO_HI``: ``atom/models/deepseek_v41/m
 
 The layer recipe and schedules (``v41``), the gfx950 blocks and device code (``blocks.gfx950``,
 ``device.gfx950``), the planner (``plan``), the emitter and compiler driver (``emit``) and the runtime (``runtime``:
-kernels, peer memory, dual-copy and uncached scratch). Imports within the package are relative; it imports nothing
-from ``atom``.
+kernels, peer memory, dual-copy and uncached scratch). Imports within the package are relative. Of ATOM it imports
+only the shared mono pieces of ``atom.mono``:
+
+- ``atom.mono.device.ops`` / ``atom.mono.device.mx``: the device primitives the gfx950 blocks share with ATOM's mono
+  kernels (re-exported by ``device.gfx950.ops`` / ``device.gfx950.gemv``);
+- ``atom.mono.runtime.hip_ipc``: the HIP runtime wrapper the peer groups and the scratch allocate through
+  (``runtime.peer``);
+- ``atom.mono.runtime.srcloc``: the fast source-location capture around a build's trace (``emit.compile``).
+
+``tests/test_deepseek_v41_mono_hi_package.py`` holds it to that.
 """

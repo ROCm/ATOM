@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""``NormQuant``: zero-centred RMSNorm fused with MXFP8 quantization (P2 stream B).
+"""``NormQuant``: zero-centred RMSNorm fused with MXFP8 quantization.
 
 Per row of the step::
 
     y  = bf16(x * rsqrt(mean(x ** 2) + eps) * (1 + w))     (fp32 math, w = gamma)
     q, s = MXFP8(y)                                         (group 32, E8M0 scales)
 
-exactly ``reference.norms.rms_norm`` followed by
+exactly a zero-centred RMSNorm (the formula above) followed by
 ``weights.mx.quantize_mxfp8`` (scale = ceil_pow2(amax / 448) as an E8M0
 code clipped to [1, 254], an all-zero group gets 127, elements RNE to E4M3).
 The quantization is byte-identical to ``quantize_mxfp8`` whenever the fp32 sum
@@ -161,22 +161,22 @@ class NormSpec:
     split: int = 1  # stage tasks per row (each quantizes 1 / split of it)
     sum: str = "cta"  # "cta": sum over the CTA (LDS, 2 barriers); "wave": every quantizing wave sums the row
     plain: bool = (
-        False  # plain-weight RMSNorm (Qwen3 / Llama): y = bf16(bf16(x * rstd) * w), not bf16(x * rstd * (1 + w))
+        False  # plain-weight RMSNorm, two roundings: y = bf16(bf16(x * rstd) * w), not bf16(x * rstd * (1 + w))
     )
     identity: bool = False  # no norm, y = x: a quantize-only stage (no gamma, no sum)
     # with ``plain``: one rounding, y = bf16(x * rstd * w) in fp32 (DeepSeek-V4.1's RMSNorm: the bf16 weight
-    # times the fp32 normalized x, then one cast), not Qwen3's bf16(bf16(x * rstd) * w)
+    # times the fp32 normalized x, then one cast), not bf16(bf16(x * rstd) * w)
     plain_once: bool = False
     # split > 1, the CTA sum: the sum map's threads x words a slot over the whole row (0: 512 x 4). Give the split = 1
     # spec's threads / wps (e.g. 320 x 8) for its sum order, i.e. the same rstd and so the same bits as one task a row
     sum_threads: int = 0
     sum_wps: int = 0
     # the row stride (elements) of the source rows, the MXFP8 channel and the BF16 copy, when wider than the norm
-    # (0: ``width``): a model whose width is not a multiple of 128 stores its rows padded (GPT-OSS: 2880 in 2944) and
+    # (0: ``width``): a model whose width is not a multiple of 128 stores its rows padded (e.g. 2880 in 2944) and
     # the stage writes the tail ``width .. pitch`` as zero (fp8 0, E8M0 127, bf16 0), the K tail a GEMM pads with
     pitch: int = 0
-    # the BF16 copy's row stride when it differs from ``pitch`` (0: the same), its tail zero too (GPT-OSS's router dot
-    # wants rows a multiple of 512 wide: 3072)
+    # the BF16 copy's row stride when it differs from ``pitch`` (0: the same), its tail zero too (e.g. a
+    # consumer that wants rows a multiple of 512 wide)
     copy_pitch: int = 0
 
     def __post_init__(self):
@@ -359,9 +359,6 @@ def _rows_words(spec: NormSpec, rows, got):
     return out
 
 
-SPECS_A_POLL = 2  # poll_rows_partials: 16-byte specs a poll, every rank's (registers: 8 words a rank a spec)
-
-
 # ------------------------------------------------------------------ device: math
 
 
@@ -445,7 +442,7 @@ def row_rstd(spec: NormSpec, sums, red, lane, wave):
 def quantize_slot(m: WordMap, words, g1, rstd, plain=False, identity=False):
     """One slot: ``wps`` packed bf16 x words, ``2 wps`` f32 (1 + w) (``plain``: w) -> (``wps / 2`` fp8
     words, the group's code, ``wps`` packed bf16 y words). ``plain``: the normalized x is rounded to
-    bf16 before the gamma product (Qwen3's plain RMSNorm)."""
+    bf16 before the gamma product (the two-rounding plain RMSNorm)."""
     v = []
     for w, j in zip(words, range(0, 2 * m.wps, 2)):
         lo, hi = bf2_f32(w)
@@ -600,7 +597,7 @@ class NormQuant(Block):
         if out.fmt is not Fmt.MXFP8 or out.width != spec.row_width:
             raise ValueError(f"out must be an MXFP8 channel of width {spec.row_width}")
         # bf16_col: the copy is columns bf16_col .. + width of a wider BF16 channel's rows (e.g. a concatenation of
-        # two norms' rows: the MiniMax-M3 EAGLE3 drafter's attention input); None: the copy is the whole row
+        # two norms' rows); None: the copy is the whole row
         if bf16_col is not None and (bf16_out is None or spec.row_width != spec.width or spec.copy_pitch
                                      or bf16_col % 8 or bf16_col + spec.width > bf16_out.width):  # fmt: skip
             raise ValueError(f"NormQuant {name}: bf16_col {bf16_col} places the unpadded copy inside bf16_out's rows")

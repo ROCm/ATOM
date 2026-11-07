@@ -14,13 +14,15 @@ FlyDSL's afterwards: the same frames, filenames, lines and columns, with each co
 each file's source path resolved once, and ``DEPTH`` frames a chain (only the locations change: the LLVM IR is the
 same at any depth). The 108 hi programs of a rank trace in 587 s instead of 1284 s (compile-only on a CPU). It
 replaces only the FlyDSL functions it was written against (``FINGERPRINT``: their source text); after a FlyDSL change
-it leaves FlyDSL's in place.
+it leaves FlyDSL's in place and logs one warning a process (the builds then trace at FlyDSL's own cost, about twice
+the time).
 """
 
 from __future__ import annotations
 
 import hashlib
 import inspect
+import logging
 import os
 from contextlib import contextmanager
 from functools import lru_cache
@@ -38,6 +40,7 @@ _HOLDERS = (
     ast_rewriter,
     kernel_function,
 )  # the modules that call it by a name of their own
+logger = logging.getLogger("atom")
 DEPTH = 1  # user frames a location's call-site chain keeps (FlyDSL's ``max_loc_depth``)
 
 _ORIGINAL = meta.capture_user_location
@@ -120,11 +123,24 @@ def capture_user_location() -> ir.Location:
     return ir.Location.callsite(callee, callers)
 
 
+@lru_cache(maxsize=None)
+def _warn_miss() -> None:
+    """Once a process: FlyDSL's location capture is not the one this module reproduces."""
+    logger.warning(
+        "mono srcloc: FlyDSL's capture_user_location / file_location differ from the ones the fast source locations "
+        "reproduce (fingerprint %s, expected %s): the builds' traces take FlyDSL's own location capture, about twice "
+        "the build time; the programs are the same",
+        _fingerprint(),
+        FINGERPRINT,
+    )
+
+
 @contextmanager
 def scoped():
     """Inside: FlyDSL captures locations with ``capture_user_location`` (when its functions are the ones this module
     reproduces); FlyDSL's own again afterwards."""
     if _fingerprint() != FINGERPRINT:
+        _warn_miss()
         yield
         return
     before = [mod.capture_user_location for mod in _HOLDERS]

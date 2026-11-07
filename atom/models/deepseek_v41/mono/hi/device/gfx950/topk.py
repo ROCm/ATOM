@@ -60,8 +60,8 @@ has a minimal one.
 - Sampling (top-k / top-p over a vocabulary of ~150 K): two levels, chunk tasks over
   vocabulary slices, then softmax over the final ``k`` in rank order.
 
-**aiter's rule** (V4.1, the DFlash2 drafter: ``blocks.topk.TopK``, a merge tree of
-lists ascending by index; one implementation since the top-k fold, T8):
+**aiter's rule** (V4.1: ``blocks.topk.TopK``, a merge tree of
+lists ascending by index; one implementation since the top-k fold):
 
 - keys by :func:`order_key` (``-0.0`` below ``+0.0``, NaNs by their bits): every u32 is a
   key, ``0`` (bits ``0xFFFFFFFF``) included, so :func:`select` takes ``valid`` (a key counts

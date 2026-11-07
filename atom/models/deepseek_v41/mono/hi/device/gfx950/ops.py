@@ -81,12 +81,6 @@ def rsrc(addr, nbytes=None):
     return bo.create_buffer_resource_from_addr(addr, num_records_bytes=nbytes)
 
 
-# a per-request cache [batch, rows, ...] of this many bytes or more addresses a request's slot from a 64-bit base: a
-# buffer instruction's byte offset is 32-bit, so a row index over the whole tensor wraps past it (V4.1's compressed
-# caches at the 1M bucket: 1 GiB a request, 5+ requests a step)
-CACHE_BIG = 1 << 32
-
-
 def slot_base(ptr, b, slot_bytes: int):
     """Request ``b``'s slot (``slot_bytes`` a slot) of a per-request cache at device address ``ptr``: its address."""
     return fx.Int64(ptr) + fx.Int64(b) * slot_bytes
@@ -176,8 +170,8 @@ def rsqrt_rn_pos(x):
     """:func:`rsqrt_rn` of a positive finite fp32 ``x`` (a norm's ``mean + eps``), the same value
     without LLVM's f64-sqrt range scaling and class checks: they never apply to an fp32 input
     above 0 (the scaling starts below 2^-767), but their f64 threshold is a constant LLVM hoists
-    into an SGPR pair held across a whole persistent kernel (HCIn's norm: 2 SGPR spills in a
-    composed delta_ple program, E11). The sqrt is LLVM's own sequence (``v_rsq_f64``,
+    into an SGPR pair held across a whole persistent kernel (HCIn's norm: 2 SGPR spills seen in a
+    composed program). The sqrt is LLVM's own sequence (``v_rsq_f64``,
     then Newton steps to the correctly rounded root), the division the IEEE f64 one."""
     from flydsl.expr import math as fmath
 

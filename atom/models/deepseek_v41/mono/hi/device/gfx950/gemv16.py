@@ -2,8 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """BF16-activation GEMV on gfx950: weights x bf16 activations, rows as the MFMA N, fp32 sums.
 
-The engine of linears whose contract is a BF16 GEMM (``reference.dense.bf16_linear``:
-bf16 x bf16 products, exact in fp32, accumulated in fp32). One ``v_mfma_f32_16x16x32_bf16``
+The engine of linears whose contract is a BF16 GEMM (bf16 x bf16 products, exact in fp32, accumulated in
+fp32). One ``v_mfma_f32_16x16x32_bf16``
 per 32 K; a **unit** is 16 weight rows x 128 K (four MFMAs), as in ``gemv``. Two weight formats:
 
 - ``fp4``: weights whose values are MXFP4 values (a checkpoint that rounded a BF16 linear to
@@ -32,8 +32,6 @@ from .ops import CM_NT
 
 OOB = 0x7FFFFFFF // 4  # a word offset no buffer reaches: the load returns 0 without traffic
 UNIT_K = 128
-FP4_UNIT_WORDS = 256  # 1 KiB
-BF16_UNIT_WORDS = 1024  # 4 KiB
 
 
 # ------------------------------------------------------------------ packing (host)

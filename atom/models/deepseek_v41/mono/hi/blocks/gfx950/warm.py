@@ -3,23 +3,15 @@
 """Cache warming: touch a later ``Linear``'s weight bytes early, so that
 its own (nontemporal) weight loads hit L2 / the 256 MB Infinity Cache instead of HBM.
 
-**Unused** (cleanup C9): no shipped schedule has a ``Warm`` stage or an ``Idle`` hook (every placement
-tried lost, G7); only the 27B recipe's ``knobs["warm"]`` / ``knobs["idle"]`` would add one. It stays
-importable because ``plan.layer.Schedule``, that recipe and ``blockset.OPTIONAL`` are wired to it,
-and blocks call ``idle_issue`` / ``idle_sink`` (no-ops without a hook).
+**Unused**: no served schedule sets an ``Idle`` hook (every placement tried lost). ``Linear`` calls
+``idle_issue`` / ``idle_sink`` at its wait points, no-ops without a hook.
 
-A touch is one dword load per ``line`` bytes (cache policy ``cm``: 0 = LRU in L2 and
-the Infinity Cache). It reads nothing from the mailbox and writes nothing, so it
-changes no result, only timing. Two forms:
-
-- **``Warm`` stage** (a block, inserted in program order by ``plan.layer.Schedule``):
-  its tasks touch their share of the bytes and wait for them at the task's end.
-  For CTAs whose next wait is long anyway (an idle cohort).
-- **``Idle`` hook** (``Stage.idle``, set by ``Schedule.idle``): a host stage's task
-  issues the touches where its own loads are in flight and it is about to wait
-  (blocks call ``idle_issue`` there and ``idle_sink`` at the task's end; a block
-  without the calls ignores the hook). At most ``cap`` touches per thread (one VGPR
-  each, held until the sink).
+A touch is one dword load per ``line`` bytes. It reads nothing from the mailbox and writes nothing, so it
+changes no result, only timing. The **``Idle`` hook** (``Stage.idle``): a host stage's task
+issues the touches where its own loads are in flight and it is about to wait
+(blocks call ``idle_issue`` there and ``idle_sink`` at the task's end; a block
+without the calls ignores the hook). At most ``cap`` touches per thread (one VGPR
+each, held until the sink).
 
 Which bytes (``mode``):
 
@@ -28,27 +20,22 @@ Which bytes (``mode``):
   the target's register prefetch, which the task issues itself first) to the end of
   its K slice, K step by K step (the order the task streams them);
 - ``"spread"``: fraction ``[lo, hi)`` of the target's whole weight, split evenly
-  over the Warm stage's tasks (an ``Idle`` hook: over the 256 CTAs).
+  over the 256 CTAs.
 
 Cost: loads complete in issue order per wave, so every wait of the same wave after
 the touches waits for them too.
 """
 
 from dataclasses import dataclass
-from functools import partial
 
 import flydsl.expr as fx
-from flydsl.expr.typing import T
 
-from ..base import Block
-from ...device.gfx950 import buffer_ops as bo
-from ...device.gfx950.ops import fresh, rsrc, traced
-from ...plan.program import Scenario, Stage
+from ...device.gfx950.ops import fresh, traced
+from ...plan.program import Scenario
 from ...target import MI355X
 
 THREADS = MI355X.threads
 GRID = MI355X.cus
-DEPTH = 8  # a Warm stage's touches in flight per thread before they are folded
 OOB = 0x3FFFFFFF  # a word offset past every buffer: the load returns 0 without touching memory
 
 
@@ -69,7 +56,7 @@ class _WPlan:
     w_bytes: int
     line: int
     cm: int
-    tasks: int  # warm tasks (an Idle hook: GRID)
+    tasks: int  # GRID
     cap: int  # touches per thread (an Idle hook)
 
     @property
@@ -111,33 +98,6 @@ def _plan(name, target, sc, mode, tasks, skip, lo, hi, line, cm, cap) -> _WPlan:
         tasks=tasks,
         cap=cap,
     )
-
-
-class Warm(Block):
-    """A stage touching ``target``'s weights (``target``: a ``Linear`` of the same program)."""
-
-    def __init__(
-        self,
-        name: str,
-        target,
-        mode: str = "own",
-        tasks: int | None = None,
-        base: int | None = None,
-        skip: int | None = None,
-        lo: float = 0.0,
-        hi: float = 1.0,
-        line: int = 128,
-        cm: int = 0,
-    ):
-        self.name, self.target, self.mode, self.base = name, target, mode, base
-        self.opts = dict(tasks=tasks or GRID, skip=skip, lo=lo, hi=hi, line=line, cm=cm)
-
-    def plan(self, sc: Scenario) -> _WPlan:
-        return _plan(self.name, self.target, sc, self.mode, cap=0, **self.opts)
-
-    def stages(self, sc: Scenario) -> list[Stage]:
-        w = self.plan(sc)
-        return [Stage(self.name, w.tasks, partial(_warm, w=w), args=(f"{w.target}.w",), base=self.base, key=(w,))]
 
 
 @dataclass(frozen=True)
@@ -194,10 +154,6 @@ def _target_base(k, w):
     raise ValueError(f"warm {w.name}: no stage {w.target} in the program")
 
 
-def _touch(r, off, cm):
-    return fx.Int32(bo.buffer_load(r, off, vec_width=1, dtype=T.i32, cache_modifier=cm))
-
-
 def _touch_global(ptr, word):
     """One dword at word ``word`` of ``ptr`` (out-of-range words: word 0, a harmless repeat)."""
     word = (word == fx.Int32(OOB)).select(fx.Int32(0), word)
@@ -237,32 +193,3 @@ def _spread_off(w, t, li):
     line = fx.Int32(lo) + t * w.spread_lines + li
     ok = (li < w.spread_lines) & (line < hi)
     return ok.select(line * (w.line // 4), fx.Int32(OOB))
-
-
-@traced
-def _warm_own(k, w, first):
-    r = rsrc(k.args[f"{w.target}.w"], w.w_bytes)
-    acc = fx.Int32(0)
-    for tt in range(first, w.tasks_t, GRID):
-        for j in range(0, -(-w.own_lines // (THREADS * DEPTH))):
-            li0 = j * (DEPTH * THREADS) + k.tid
-            acc = acc ^ _fold([_touch(r, _own_off(k, w, tt, li0 + d * THREADS, tt >= 0), w.cm) for d in range(DEPTH)])
-    _sink(k, w, acc)
-
-
-@traced
-def _warm_spread(k, w, t):
-    r = rsrc(k.args[f"{w.target}.w"], w.w_bytes)
-    acc = fx.Int32(0)
-    for j in range(0, -(-w.spread_lines // (THREADS * DEPTH))):
-        li0 = j * (DEPTH * THREADS) + k.tid
-        acc = acc ^ _fold([_touch(r, _spread_off(w, t, li0 + d * THREADS), w.cm) for d in range(DEPTH)])
-    _sink(k, w, acc)
-
-
-def _warm(k, t, w):
-    if w.mode == "own":
-        if w.own_lines > 0:
-            _warm_own(k, w, (k.bid - _target_base(k, w) % GRID + GRID) % GRID)
-    else:
-        _warm_spread(k, w, t)

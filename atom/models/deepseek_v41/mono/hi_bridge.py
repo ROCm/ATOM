@@ -1,21 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The V4.1 mono hi hook's plan and its cache bridge, free of ATOM / aiter
-imports (the CPU tests run the bridge kernels in the Triton interpreter:
-``tests/models/deepseek_v41/test_mono_hi_bridge.py``).
-
-**Plan** (``plan_layers``): which layers run the hi runtime's layer program, as which
-program kind, reading which owner's caches. A layer runs on the hi path when every
-owner it reads (its KV owner, its top-k owner, the candidate source) runs on
-hi too (a consumer reads its owner's selection, which only a hi owner
-writes in the same step), and,
-without ``engram_on``, when it is not an Engram
-layer. With V4.1's topology that is layers 0, 2-13 and 20-39 (33 of 40):
-layers 1 / 14 (Engram) and 15-19 (owner 14) keep ATOM's K1 / K2. With
-``engram`` all 40: an Engram layer runs the hi runtime's layer with the Engram's gate
-half in its seam A (``window_layer_blocks(engram=True)``: layer 1 a non-first
-window layer, layer 14 a ratio-2 KV + index source), its token-only half in a
-launch before layer 0 (``engram_kv_stages``), and 15-19 follow owner 14.
+"""The V4.1 mono hi hook's cache bridge, free of ATOM / aiter imports (the CPU
+tests run the bridge kernels in the Triton interpreter:
+``tests/models/deepseek_v41/test_mono_hi_bridge.py``); which layers it serves is
+``hi_plan``'s.
 
 **Cache bridge.** ATOM's pool stays the source of truth (prefill, the draft,
 any step the hook does not serve, and ATOM's own layers read it). The owners'
@@ -44,8 +32,6 @@ comb[i_in][o_out] 16, the pending MoE output [rows, 5120]); ATOM's
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import triton
 import triton.language as tl
 
@@ -55,140 +41,6 @@ WINDOW = 128
 HEAD_DIM = 512
 FP4_PAGE = 8  # ATOM's FP4 index plane: keys a unit (``FP4_INDEX_PAGE_ROWS``)
 IDX_DIM = 128
-
-
-# ---------------------------------------------------------------- the plan
-
-
-@dataclass(frozen=True)
-class LayerPlan:
-    layer_id: int
-    kind: str  # "window0" | "consumer" | "kv+index source" | "index source" | "window" (ATOM)
-    ratio: int
-    hi: bool
-    why: str = ""  # why ATOM runs it
-    kv_owner: int | None = None
-    topk_owner: int | None = None
-    cand: str = ""  # "source" (layer 20) | "reader" (an index source past it) | ""
-    engram: bool = False  # an Engram layer on the hi path (the gate half in seam A)
-
-    @property
-    def program_key(self) -> tuple:
-        eng = ("engram",) if self.engram else ()
-        if self.kind == "window0":
-            return ("window0",)
-        if self.kind == "consumer":
-            return ("consumer", self.ratio)
-        if self.kind == "window":
-            return ("window",) + eng
-        return (self.kind, self.ratio, self.cand) + eng
-
-
-def plan_layers(topology, engram_ids, engram_on: bool = False) -> list[LayerPlan]:
-    """Every layer's plan from ATOM's attention topology (``LayerAttentionSpec``s)
-    and the Engram layer ids; ``engram_on``: the Engram layers on the hi path too
-    (module docstring)."""
-    engram = set(engram_ids)
-    out: dict[int, LayerPlan] = {}
-    for spec in topology:
-        i = spec.layer_id
-        cand = ""
-        if spec.ratio == 0:
-            kind = "window0" if i == 0 else "window"
-        elif spec.topk_owner == i and spec.kv_owner == i:
-            kind = "kv+index source"
-            cand = "source" if spec.produces_candidates else ""
-        elif spec.topk_owner == i:
-            kind = "index source"
-            cand = "reader" if spec.candidate_source is not None else ""
-        else:
-            kind = "consumer"
-        why = ""
-        if i in engram and not engram_on:
-            why = "Engram (engram_on False)"
-        elif i in engram and i == 0:
-            why = "an Engram layer 0 (its gate half needs a fold before it)"
-        elif kind == "window" and i not in engram:
-            why = "a window layer past layer 0 without Engram (V4.1 has none)"
-        else:
-            for owner, what in ((spec.kv_owner, "KV"), (spec.topk_owner, "top-k"),
-                                (spec.candidate_source, "candidate")):  # fmt: skip
-                if owner is not None and owner != i and not out[owner].hi:
-                    why = f"its {what} owner {owner} runs on ATOM"
-                    break
-        eng = engram_on and i in engram
-        out[i] = LayerPlan(
-            i, kind, spec.ratio, not why, why, spec.kv_owner, spec.topk_owner, cand, eng
-        )
-    return [out[i] for i in sorted(out)]
-
-
-def chain_role(plan: dict, i: int, head: bool = False) -> tuple[bool, bool]:
-    """(push_moe, prev_moe) of hi layer i in a chained hook (``plan``:
-    layer id -> ``LayerPlan``): it pushes its MoE partials when the next launch
-    sums them (a hi layer i + 1, or, ``head``, the verify head after the
-    model's last layer), and it sums the previous launch's when layer i - 1 ran
-    on the hi path. A run's last layer before an ATOM layer is its tail (sums, no
-    push)."""
-    nxt, prv = plan.get(i + 1), plan.get(i - 1)
-    push = bool(nxt and nxt.hi) or (head and nxt is None)
-    return push, bool(i and prv and prv.hi)
-
-
-def n_max(max_ctx: int, ratio: int) -> int:
-    """The compressed positions a step can see at ``max_ctx`` (+ 16: a verify's
-    rows), a multiple of 32: the programs' cache length ."""
-    return -(-((max_ctx + 16) // ratio) // 32) * 32
-
-
-# ---------------------------------------------------------------- the merge's ring copy (compiled out here)
-#
-# the hi runtime's sparse merge can land its window V from a compact copy kept beside the bf16 ring (hi
-# ``MLASparseAttn(ring8=)``, knob SPARSE_RING8): the window ring's MXFP8 copy (``ring.q8`` / ``ring.s8``, exact for KVPrep's QAT keys). The ring import can write it
-# from the same bf16 rows it imports (bit for bit the hi runtime's host packer ``ring_mxfp8``); a group that is not exact
-# in the format adds its count to ``bad``. The served hook runs the merge without the copy (the bridge kernels'
-# ``RING8`` constexpr 0: these helpers are not compiled in); they stay so the kernels keep the reference's bodies.
-
-
-@triton.jit
-def _e4m3_byte(y):
-    """The E4M3 byte of f32 ``y``, an E4M3 value (sign kept; |y| < 2^-6: the subnormals m x 2^-9)."""
-    yb = y.to(tl.int32, bitcast=True)
-    e = ((yb >> 23) & 255) - 127
-    mag = tl.where(
-        e >= -6, ((e + 7) << 3) | ((yb >> 20) & 7), (tl.abs(y) * 512.0).to(tl.int32)
-    )
-    return mag | ((yb >> 24) & 128)
-
-
-@triton.jit
-def _e4m3_value(byte):
-    """|value| of an E4M3 byte (f32)."""
-    eb = (byte >> 3) & 15
-    m = (byte & 7).to(tl.float32)
-    p2 = ((tl.maximum(eb, 1) + 117) << 23).to(tl.float32, bitcast=True)  # 2^(eb - 10)
-    return tl.where(eb > 0, (8.0 + m) * p2, m * (1.0 / 512))
-
-
-@triton.jit
-def _mxfp8_copy(v, q8, s8, bad, DIM: tl.constexpr):
-    """A bf16 row ``v`` [DIM] -> its MXFP8 copy: E4M3 bytes ``q8`` [DIM] (dim order) and the E8M0 code of each
-    32-dim group ``s8`` [DIM / 32] (the smallest power of two >= amax / 448, clamped to [1, 254], 127 for a zero
-    group: ``weights.mx.scale_codes``); the row's inexact values into ``bad``.
-    """
-    g = tl.reshape(v.to(tl.float32), (DIM // 32, 32))
-    amax = tl.max(tl.abs(g), axis=1)
-    ab = amax.to(tl.int32, bitcast=True)
-    code = ((ab >> 23) & 255) - 8 + ((ab & 0x7FFFFF) > 0x600000).to(tl.int32)
-    code = tl.where(amax == 0.0, 127, tl.minimum(tl.maximum(code, 1), 254))
-    # / 2^(code - 127), exact
-    y = g * ((254 - code) << 23).to(tl.float32, bitcast=True)[:, None]
-    byte = _e4m3_byte(y)
-    back = _e4m3_value(byte) * (code << 23).to(tl.float32, bitcast=True)[:, None]
-    nbad = tl.sum(tl.sum((back != tl.abs(g)).to(tl.int32), axis=1), axis=0)
-    tl.store(q8 + tl.arange(0, DIM), tl.reshape(byte, (DIM,)).to(tl.uint8))
-    tl.store(s8 + tl.arange(0, DIM // 32), code.to(tl.uint8))
-    tl.atomic_add(bad, nbad, mask=nbad > 0)
 
 
 # ---------------------------------------------------------------- ring / step metadata
@@ -253,20 +105,19 @@ def _dead_words(req, pos_out, rows, NB: tl.constexpr, BM: tl.constexpr):
 @triton.jit
 def _ring_in(
     m, b, s, rq, pool, positions, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
-    ring_start0, slot_rows, ring_slots, num_slots, max_pos, ring_q8, ring_s8, bad,
-    WIN: tl.constexpr, DIM: tl.constexpr, RB: tl.constexpr, RING8: tl.constexpr, BM: tl.constexpr,
+    ring_start0, slot_rows, ring_slots, num_slots, max_pos,
+    WIN: tl.constexpr, DIM: tl.constexpr, RB: tl.constexpr, BM: tl.constexpr,
 ):  # fmt: skip
     """The hi runtime layer m's ring slot s of request b <- ATOM's ring row of the
     position q in [ctx - WIN, ctx) with q % WIN == s (zeros below position 0 or
-    on a pad request); ``RING8``: and its MXFP8 copy (uint8 views of ``ring.q8``
-    [WIN, DIM] / ``ring.s8`` [WIN, DIM / 32] a layer). (0, b, 0) also writes
+    on a pad request). (0, b, 0) also writes
     ``pos[b]`` (the request's first position) and its rows' bounds [3, RB]:
     (p + 1) // 2, (p + 1), ceil((p + 1) / 8)."""
     _, slot, live, ctx = _request(
         b, rq, positions, batch_ids, slots, num_slots, max_pos
     )
-    _ring_row(m, b, s, ctx, slot, live, pool, rings, layer_ids, ring_start0, slot_rows, ring_slots, ring_q8, ring_s8,
-              bad, WIN, DIM, RING8, BM)  # fmt: skip
+    _ring_row(m, b, s, ctx, slot, live, pool, rings, layer_ids, ring_start0, slot_rows, ring_slots, WIN, DIM,
+              BM)  # fmt: skip
     if (m == 0) & (s == 0):
         _step_bounds(ctx, pos_out + b, bounds_out + b * rq, rq, RB)
 
@@ -274,10 +125,10 @@ def _ring_in(
 @triton.jit
 def _ring_row(
     m, b, s, ctx, slot, live, pool, rings, layer_ids, ring_start0, slot_rows, ring_slots,
-    ring_q8, ring_s8, bad, WIN: tl.constexpr, DIM: tl.constexpr, RING8: tl.constexpr, BM: tl.constexpr,
+    WIN: tl.constexpr, DIM: tl.constexpr, BM: tl.constexpr,
 ):  # fmt: skip
     """``_ring_in``'s copy: hi layer m's ring slot s of request b <- ATOM's ring row of position q in
-    [ctx - WIN, ctx), q % WIN == s (zeros below 0 / on a pad request), and its MXFP8 copy (``RING8``).
+    [ctx - WIN, ctx), q % WIN == s (zeros below 0 / on a pad request).
     """
     layer = tl.load(layer_ids + m).to(tl.int64)
     slot = tl.where(live, slot, 0)
@@ -293,8 +144,6 @@ def _ring_row(
     v = tl.load(pool + row * DIM + d, mask=ok & (d < DIM), other=0.0)
     at = ((m * BM + b) * WIN + s).to(tl.int64)
     tl.store(rings + at * DIM + d, v)
-    if RING8:
-        _mxfp8_copy(v, ring_q8 + at * DIM, ring_s8 + at * (DIM // 32), bad, DIM)
 
 
 @triton.jit
@@ -576,9 +425,8 @@ def _import_state(b, rq, positions, batch_ids, slots, num_slots, max_pos, imp):
 @triton.jit
 def _ring_in_incr(
     m, b, r, rq, positions, pool, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
-    ring_start0, slot_rows, ring_slots, num_slots, max_pos, ring_q8, ring_s8, bad, imp,
-    WIN: tl.constexpr, DIM: tl.constexpr, RB: tl.constexpr, RING8: tl.constexpr, RP: tl.constexpr,
-    BM: tl.constexpr,
+    ring_start0, slot_rows, ring_slots, num_slots, max_pos, imp,
+    WIN: tl.constexpr, DIM: tl.constexpr, RB: tl.constexpr, RP: tl.constexpr, BM: tl.constexpr,
 ):  # fmt: skip
     """Program (m, b, r) of the incremental ring import: layer m's slots r, r + RP, .. of request b that the last
     served step's rows wrote (all of them unless ``incr``), each ``_ring_row``; (0, b, 0) also pos / bounds.
@@ -588,8 +436,8 @@ def _ring_in_incr(
     )
     for s in range(r, WIN, RP):
         if (~incr) | (((s - pctx % WIN + WIN) % WIN) < prow):
-            _ring_row(m, b, s, ctx, slot, live, pool, rings, layer_ids, ring_start0, slot_rows, ring_slots, ring_q8,
-                      ring_s8, bad, WIN, DIM, RING8, BM)  # fmt: skip
+            _ring_row(m, b, s, ctx, slot, live, pool, rings, layer_ids, ring_start0, slot_rows, ring_slots, WIN, DIM,
+                      BM)  # fmt: skip
     if (m == 0) & (r == 0):
         _step_bounds(ctx, pos_out + b, bounds_out + b * rq, rq, RB)
 
@@ -597,13 +445,13 @@ def _ring_in_incr(
 @triton.jit
 def _begin_step_kernel(
     pool, positions, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
-    ring_start0, slot_rows, ring_slots, num_slots, max_pos, rows, ring_q8, ring_s8, bad,
+    ring_start0, slot_rows, ring_slots, num_slots, max_pos, rows,
     hidden, hidden_stride, h_in, step, req,
     e0_src, e0_src_stride, e0_dst, e1_src, e1_src_stride, e1_dst, cursor, cursor_stride, hist, imp,
     NMF: tl.constexpr, WIN: tl.constexpr, DIM: tl.constexpr, RB: tl.constexpr,
     HIDDEN: tl.constexpr, BLOCK: tl.constexpr, NHC: tl.constexpr,
     NE0: tl.constexpr = 0, NE1: tl.constexpr = 0, KIN: tl.constexpr = 6144, EHIST: tl.constexpr = 0,
-    RING8: tl.constexpr = 0, INCR: tl.constexpr = 0, RP: tl.constexpr = 128,
+    INCR: tl.constexpr = 0, RP: tl.constexpr = 128,
     NB: tl.constexpr = 1, BM: tl.constexpr = 1, RQP: tl.constexpr = 1,
     fold_ids=None, fold_dst=None, fold_tmap=None, fold_dead=None, fold_cand=None, fold_cand_stride=0,
     fold_live=None, hist_stride=0, fold_cand_req_stride=0, EFOLD: tl.constexpr = 0, RPOW: tl.constexpr = 16,
@@ -622,8 +470,7 @@ def _begin_step_kernel(
     (``_eng_hist``, ``hist`` rows ``hist_stride`` apart; with ``EFOLD`` the same program also copies the request's ids
     from ATOM's ``fold_ids`` into the kv launch's ``ids`` (``fold_dst``) and writes its ATOM Engram cursor
     candidates, ``_eng_fold``); program 0 also bumps the launch-tag ``step`` and clears the words of the batch slots
-    and rows past the step's (``_dead_words``). ``RING8``: the import writes the merge's ring copy too
-    (``_ring_in``). Request b = rows b * rows / NB .. (``_request``); its
+    and rows past the step's (``_dead_words``). Request b = rows b * rows / NB .. (``_request``); its
     hi-side buffers are batch slot b of buffers holding ``BM``.
 
     The full import (``INCR`` = 0): a program a ring slot (RP = WIN). The incremental import (``INCR`` = 1, the hook's
@@ -640,12 +487,11 @@ def _begin_step_kernel(
         r = pid % RP
         if INCR:
             _ring_in_incr(m, b, r, rq, positions, pool, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
-                          ring_start0, slot_rows, ring_slots, num_slots, max_pos, ring_q8, ring_s8, bad, imp, WIN,
-                          DIM, RB, RING8, RP, BM)  # fmt: skip
+                          ring_start0, slot_rows, ring_slots, num_slots, max_pos, imp, WIN, DIM, RB, RP,
+                          BM)  # fmt: skip
         else:
             _ring_in(m, b, r, rq, pool, positions, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
-                     ring_start0, slot_rows, ring_slots, num_slots, max_pos, ring_q8, ring_s8, bad, WIN, DIM, RB,
-                     RING8, BM)  # fmt: skip
+                     ring_start0, slot_rows, ring_slots, num_slots, max_pos, WIN, DIM, RB, BM)  # fmt: skip
         if (m == 0) & (r == 0):
             _req_words(b, rq, positions, batch_ids, slots, num_slots, max_pos, req, RQP)
         if pid == 0:

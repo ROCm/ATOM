@@ -2,9 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """MXFP4 / MXFP8 codecs (OCP MX, group 32, E8M0 scales), in torch.
 
-The quantization rule is the one the Qwen3.8-27B mono converter uses
-(``atom/models/qwen3_8_27b/mono/codecs.py``), so references and packed weights
-agree with it bit for bit:
+The packed weights and the references quantize by one rule, so they agree bit for bit:
 
 - scale = the smallest power of two >= amax / FMAX (FMAX = 6 for E2M1, 448 for
   E4M3), as an E8M0 code clipped to [1, 254]; an all-zero group gets code 127;

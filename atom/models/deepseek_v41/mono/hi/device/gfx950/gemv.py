@@ -51,8 +51,6 @@ from .ops import CM_NT, fp8_pack4, xred
 
 FP8, FP4 = 0, 4  # the f8f6f4 MFMA's operand formats (cbsz / blgp)
 FP8_MAX = 448.0
-UNIT_BYTES = 1024  # one 16 x 128 FP4 unit
-UNIT_SCALES = 64  # its E8M0 codes, one per lane
 OOB = 0x7FFFFFFF  # an element offset no buffer reaches: the load returns 0
 
 
@@ -102,7 +100,7 @@ def pack_weight(
     elif fmt is MXFP8:
         # K within a step = 64 half + 16 j + b: [rg, r, st, half, j, b] -> [rg, st, half, j, r, b], lane l = 16 j + r:
         # 16 B a lane a half (K 16 j .. + 15, then 64 + 16 j .. + 15), each half's 64 lanes one contiguous 1 KiB
-        # (one 16 B load instruction reads 1 KiB, not 16 B every 32 B: M23)
+        # (one 16 B load instruction reads 1 KiB, not 16 B every 32 B)
         w = packed.view(torch.uint8).reshape(n // 16, 16, s, 2, 4, 16).permute(0, 2, 3, 4, 1, 5)
         w = w.contiguous().reshape(-1)
     else:

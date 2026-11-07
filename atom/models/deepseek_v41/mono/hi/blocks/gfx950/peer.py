@@ -14,11 +14,11 @@ linear: bf16 partials, an fp32 all-reduce, then bf16). Every rank adds the same 
 order, so they agree to the bit. Each task waits only for the same task's puts on the other ranks,
 which come before those ranks' polls: with every CTA resident, deadlock-free.
 
-``proto`` (per edge; times in P4-P6): ``"tagged"`` is the one-shot exchange
+``proto`` (per edge): ``"tagged"`` is the one-shot exchange
 above (every rank sends its whole partial to every rank: tp - 1 partials out), one stage. ``"spread"`` is the
 same exchange in two stages: ``<name>`` puts chunk c to rank d as its own task (tp x the tasks: a CTA's remote
-puts were the limit, not the link), ``<name>.sum`` polls and sums. ``"two_shot"`` (reduce-scatter + all-gather,
-P4): rank o owns the words ``o * Q ..`` of the partial (Q = ceil(words / tp));
+puts were the limit, not the link), ``<name>.sum`` polls and sums. ``"two_shot"`` (reduce-scatter + all-gather):
+rank o owns the words ``o * Q ..`` of the partial (Q = ceil(words / tp));
 
 1. ``<name>``: every rank puts its partial's words into their owner's peer copy (its own slot);
 2. ``<name>.own``: the owner polls the ``tp`` ranks' words, sums them in rank order (the same fp32 sum, the
@@ -27,7 +27,7 @@ P4): rank o owns the words ``o * Q ..`` of the partial (Q = ceil(words / tp));
 
 (tp - 1) / tp of a partial out per shot: 2 (tp - 1) / tp partials in all vs tp - 1, for one more peer hop.
 The owner's puts are spread one destination a task too. Words travel as tagged pairs: a dense + flag variant
-(half the bytes) paid a store drain and a flag round trip per hop (P4a). ``"auto"`` (default): ``spread`` up to
+(half the bytes) paid a store drain and a flag round trip per hop. ``"auto"`` (default): ``spread`` up to
 ``AUTO_SPREAD_WORDS`` words a step (latency-bound), ``two_shot`` above (bandwidth-bound). Every protocol gives
 the same bits.
 """
@@ -93,7 +93,7 @@ class PeerAllReduce(Block):
             raise ValueError(f"PeerAllReduce {self.name}: needs a TP scenario (tp > 1), got {sc.name}")
         words = sc.rows * self.x.words_per_row()
         proto = self.proto
-        if proto == "auto":  # P6: latency-bound below ~16K words, bandwidth-bound above
+        if proto == "auto":  # latency-bound below ~16K words, bandwidth-bound above
             proto = "spread" if words <= AUTO_SPREAD_WORDS else "two_shot"
         return _Plan(
             self.name,

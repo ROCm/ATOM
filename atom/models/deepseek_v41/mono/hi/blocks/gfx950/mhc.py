@@ -42,7 +42,7 @@ projection and no gate stage (no ``fn`` / ``scale`` / ``base`` args are read); `
 before a head: the last sub-layer's output folded in and the streams collapsed with the last FFN seam's pre (the
 reference's ``hc_pre(h, pre_mix)`` after the last layer), nothing mixed for a next sub-layer.
 
-**pend from TP partials** (``pend=PeerPartial(region, fmt)``, P4): the previous sub-layer is a row-parallel
+**pend from TP partials** (``pend=PeerPartial(region, fmt)``): the previous sub-layer is a row-parallel
 ``Linear(tp_sum="consumer")`` that only pushed its partials; the fold sums the ranks' partials of its columns
 itself (``peer.sum_partials``, rank order, fp32) and rounds to bf16 (the producer's ``BF16Out`` bits), its R
 loads already in flight. One hop and the producer's wait for the slowest rank fewer.
@@ -111,7 +111,7 @@ class PeerPartial:
     ``HCSeam(residual="sharded")``): the ranks' fp32 reduce-scatter partials of this rank's own columns (the
     ``push_rs`` layout: ``Linear(tp_sum="rs")``, ``MoEExperts(reduce="2shot")``'s combine), summed in the slice.
     ``rs_fmt`` ("rs" / "2shot"): the reduce-scatter partials' format, "f32" (value, tag) pairs or "f32q" / "f32p"
-    packed (the producer's ``tp_partial`` / ``rs_fmt``; P16), summed in rank order either way: the
+    packed (the producer's ``tp_partial`` / ``rs_fmt``), summed in rank order either way: the
     same bits."""
 
     region: str
@@ -357,7 +357,7 @@ class HCSeam(Block):
         self.direct = direct
         # the slice's R and hc_fn rows in LDS at a pitch of KT + 4 words: the mixes' MFMA operand reads (16 hc_fn rows,
         # or the step's token rows, KT = 128 words apart: one bank) were 16-way / rows-way bank conflicts; only LDS
-        # addresses change (the same bits). H8
+        # addresses change (the same bits).
         self.lds_pad = lds_pad
         # a chained seam's first poll (the previous launch's gathered sums, ``PeerPartial("ag", prev_launch=True)``) and
         # the task's R / previous-gate loads issued at the stage's entry (``Stage.pre``), before the task loop's
@@ -938,7 +938,7 @@ def _own(k, t, p):
     """Two-shot, the owner's half (``own_quads`` threads a task): elements ``4 i .. + 4`` of this rank's column quarter
     (rows x width / tp, the reduce-scatter's layout): the ranks' fp32 partials summed in rank order
     (``peer.sum_partials``: the one-shot's bits), rounded to bf16 (seam F's y), pushed to one rank a task
-    (``<pend>.ag``; the remote puts spread over pend_tp x the CTAs, P6 / -moe M26: one task pushing
+    (``<pend>.ag``; the remote puts spread over pend_tp x the CTAs: one task pushing
     to every rank in turn reached the last rank ~2 us after the first)."""
     n = p.rows * p.width // p.pend_tp
     chunks = -(-n // 4 // p.own_quads)

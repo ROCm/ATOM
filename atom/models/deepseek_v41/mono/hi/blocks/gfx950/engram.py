@@ -150,7 +150,7 @@ class _Plan:
     @property
     def per_task(self) -> int:  # look: columns a task (a wave each): the most up to WAVES that divide a rank's
         # columns (TP2: 12 columns a rank -> 6 a task, 2 tasks; 8 a task left 4 columns unlooked-up, their pairs never
-        # put: the gather waited forever, K66)
+        # put: the gather waited forever)
         return max(d for d in range(1, min(WAVES, self.cpr) + 1) if self.cpr % d == 0)
 
     @property
@@ -357,7 +357,7 @@ def _part(k, t, p: _Plan):
 
 def _kvx(k, t, p: _Plan):
     """Mode "kv", TP > 1: task t = (row, chunk, destination rank): this rank's kv words -> that rank's peer copy
-    (one destination a task: a CTA's remote puts are the limit, P5)."""
+    (one destination a task: a CTA's remote puts are the limit)."""
     words = p.n // 2
     chunks = -(-words // KVX_CHUNK)
     row, rest = t // (chunks * p.tp), t % (chunks * p.tp)

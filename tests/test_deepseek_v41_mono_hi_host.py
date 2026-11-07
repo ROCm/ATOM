@@ -2,7 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The V4.1 mono hi hook's host-side glue (``ATOM_DSV41_MONO_HI``), on stand-ins for ATOM's runner, token processor,
 sampler, metadata builder, cache and proposer: no GPU, no hi, no aiter. The device-side advance runs in the
-Triton interpreter.
+Triton interpreter; the parts that load a module with Triton kernels (the device round, the post-verify) skip without
+Triton, the rest (the lean host prep, the gate's import guard) run without it.
 
 - lean host prep (``lean_host``): the served-step predicate and the builder's hooks;
 - the device round (``device_round``): the advance kernel, its predicates and its hooks (``hi_round``) in forward
@@ -22,8 +23,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-
-pytest.importorskip("triton")
+from aiter_stub import atom_without_aiter
 
 MONO = Path(__file__).resolve().parents[1] / "atom/models/deepseek_v41/mono"
 
@@ -60,6 +60,7 @@ def lh():
 
 @pytest.fixture(scope="module")
 def dr():
+    pytest.importorskip("triton")
     return _load("device_round")
 
 
@@ -550,7 +551,9 @@ def test_first_step_after_a_prefill(dr, monkeypatch):
 
 @pytest.fixture
 def no_aiter_sampler(monkeypatch):
-    """The rejection sampler's module (it imports aiter) as the constants ``PostVerify`` reads from it."""
+    """The rejection sampler's module (it imports aiter) as the constants ``PostVerify`` reads from it (the
+    post-verify's module has Triton kernels: skipped without Triton)."""
+    pytest.importorskip("triton")
     if "aiter" not in sys.modules:
         try:
             import aiter  # noqa: F401
@@ -628,7 +631,10 @@ def test_post_verify_skips_the_commit_and_the_anchor_staging_where_it_ran(
 def test_engram_staging_skips_its_lookup_on_a_served_step():
     """ATOM's ``EngramStaging`` with the hook's ``lookup_served``: on a step the hook serves it only advances the cursor
     (no snapshot, no side stream) and its join waits on nothing."""
-    from atom.model_ops.engram.device.staging import EngramStaging
+    with (
+        atom_without_aiter() as load
+    ):  # (its hashing kernels' Triton stubbed with AITER where it is not installed)
+        EngramStaging = load("atom.model_ops.engram.device.staging").EngramStaging
 
     calls = []
     staging = object.__new__(EngramStaging)
@@ -688,14 +694,21 @@ def test_the_gate_decides_before_any_hi_import():
         "embed_full",
         "hi_weights",
         "round/__init__",
+        "verify_head",
+        "hi_plan",
+        "hi_compose",
+        "hi_bands",
     ):
         tree = ast.parse(_src(name).read_text())
         for n in tree.body:
             if isinstance(n, ast.ImportFrom):
                 assert ".mono.hi." not in (n.module or "") + ".", (name, n.module)
     before = set(sys.modules)
-    from atom.models.deepseek_v41.mono import hi_bridge, hi_gate  # noqa: F401
-    from atom.models.deepseek_v41.mono import hi_runner  # noqa: F401
+    from atom.models.deepseek_v41.mono import hi_compose, hi_gate  # noqa: F401
+    from atom.models.deepseek_v41.mono.round import verify_head  # noqa: F401
 
-    new = set(sys.modules) - before
-    assert not [m for m in new if ".mono.hi." in m + "."]
+    assert not [m for m in set(sys.modules) - before if ".mono.hi." in m + "."]
+    pytest.importorskip("triton")
+    from atom.models.deepseek_v41.mono import hi_bridge, hi_runner  # noqa: F401
+
+    assert not [m for m in set(sys.modules) - before if ".mono.hi." in m + "."]

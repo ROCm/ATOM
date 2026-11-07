@@ -27,7 +27,7 @@ class Target:
     mcpu: str = ""  # LLVM CPU (default: arch)
     xcds: int = 0  # CTA c runs on XCD c % xcds (each XCD has its own L2: plain stores are not seen across them);
     # 0: not modeled (``plan.check.check_memory``, the memory model, is calibrated on gfx950 only)
-    # NUMA (N4, H5, H6): two I/O dies; an address's home IOD flips every 8 KiB inside a 2 MiB page
+    # NUMA: two I/O dies; an address's home IOD flips every 8 KiB inside a 2 MiB page
     # (bit 13 XOR a bit of the page). Dual-copy regions (``Program.dual``, ``Region.home``) keep a copy on each, laid
     # out by that rule in one page (``plan.program.DUAL_*``); which XCDs read which copy is measured per scratch
     # (``dsv41hi.runtime.dual``).

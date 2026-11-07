@@ -32,36 +32,7 @@ class Geometry:
     def stream(self) -> int:
         return self.hc_mult * self.hidden  # 20480: the flattened residual stream
 
-    @property
-    def mix_width(self) -> int:
-        return (2 + self.hc_mult) * self.hc_mult  # 24: pre 4 | post 4 | comb 16
-
-    @property
-    def group_width(self) -> int:
-        return self.heads * self.head_dim // self.o_groups  # 4096: wo_a's K per group
-
 
 G = Geometry()
-
-_CONFIG_KEYS = {
-    "dim": "hidden",
-    "n_layers": "layers",
-    "vocab_size": "vocab",
-    "norm_eps": "eps",
-    "hc_mult": "hc_mult",
-    "n_heads": "heads",
-    "head_dim": "head_dim",
-    "rope_head_dim": "rope_dim",
-    "q_lora_rank": "q_lora",
-    "o_lora_rank": "o_lora",
-    "o_groups": "o_groups",
-    "window_size": "window",
-    "index_topk": "index_topk",
-    "n_routed_experts": "experts",
-    "n_activated_experts": "topk",
-    "moe_inter_dim": "moe_inter",
-    "route_scale": "route_scale",
-    "swiglu_limit": "swiglu_limit",
-}
 
 

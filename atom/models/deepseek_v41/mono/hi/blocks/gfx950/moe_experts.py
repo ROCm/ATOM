@@ -13,22 +13,6 @@ bits, ascending by id: the router's order), the reference (``inference/model.py`
 
 with ``shared`` a BF16 channel (the shared expert, e.g. ``Linear`` blocks) or none.
 
-Kimi K3's experts (``act="situ"``, ``betas`` (4, 25): the checkpoint's ``SituAndMul``; ``weight_at="down"``: the
-route weight on y in fp32, as the reference's fp32 weighted combine, so the MXFP8 of m is the reference's; ``"ug"``:
-on the act as ``silu``'s, the rest as above)::
-
-    m     = bf16((b tanh(g / b) sigmoid(g)) * (lb tanh(u / lb)))      (fp32 math; (b, lb) = ``betas``)
-    y_rk  = bf16(w_rk (MXFP8(m) W2_e^T))                               (TP intra: the rank's partial)
-
-GPT-OSS's experts (``act="gptoss"``, ``bias=True``, ``weight_at="down"``, ``combine="bf16"``: HF ``GptOssExperts``,
-every op of its bf16 chain rounded where HF rounds; ``alpha`` 1.702, ``limit`` 7; biases f32 args of bf16 values)::
-
-    g, u  = bf16(bf16(x W1_e^T) + b1_e), bf16(bf16(x W3_e^T) + b3_e)
-    g, u  = min(g, L), clamp(u, -L, L)
-    m     = bf16(bf16(u + 1) * bf16(g * bf16(sigmoid(bf16(alpha g)))))
-    y_rk  = bf16(bf16(bf16(MXFP8(m) W2_e^T) + b2_e) * w_rk)
-    out_r = bf16(shared_r + bf16(..bf16(y_r0 + y_r1) + ..))       (each add rounded, k ascending = id ascending)
-
 Stages:
 
 1. ``<name>.rt`` (``route="cta"``, the default; a task on every CTA): the step's ``rows * K`` picks (``route_from``:
@@ -67,10 +51,10 @@ Either way (``reduce="push"``, the default) the combine pushes the fp32 partial 
 ``shared`` channel and writes ``out``; ``reduce`` = a ``PeerAllReduce`` proto instead goes combine -> local partial
 -> ``PeerAllReduce`` -> ``finish``. Every rank's ``out`` is the same bits. ``reduce="2shot"``: each column quarter
 to its owner only (``peer.push_rs``), the partials as (fp32, tag) pairs or, ``rs_fmt`` "f32p" / "f32q", packed
-(P16: the owner's sums the same bits); its readers (``<name>.own``, a sharded seam's
+(the owner's sums the same bits); its readers (``<name>.own``, a sharded seam's
 ``PeerPartial("rs", rs_fmt=)``) take the same format.
 
-``down="cols"`` (ATOM study P2, a knob: slower so far, M16): one stage of column tasks, each 16
+``down="cols"`` (a knob: slower so far): one stage of column tasks, each 16
 output columns x every slot (+ the folded shared expert), the picks' mid rows gathered into LDS, the combine in LDS,
 the partial pushed from the epilogue.
 
@@ -88,9 +72,8 @@ from types import SimpleNamespace
 import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
 
-from ..base import Block, Channel, Fmt, Search
+from ..base import Block, Channel, Fmt
 from .peer import PeerAllReduce
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import channels as chan
@@ -125,13 +108,13 @@ SH_PREFETCH = 8  # the folded shared expert's MXFP8 units in flight a wave (32 B
 RT_ROWS = 64  # route "cta": the most step rows (an expert's row mask in two words; over 16 rows runs of 16 picks)
 A16_ROWS = 8  # A16W4 (``acts="bf16"``): the most step rows (their bf16 x rows sit in LDS whole: 8 x 12 KB at 6144)
 TASK_BYTES = (80 << 10, 40 << 10)  # a ug / down task's fixed cost (B gather, K-wave reduce, epilogue) as weight bytes
-# at a CTA's streaming rate (~3 / ~1.5 us at ~27 GB/s), for ``MoEExperts.groups`` (calibrated: M28)
-# intra TP row groups a ug / down part (``MoEExperts.groups``); down 24: MiniMax-M3 TP4 (384 groups x 16 slots = 256
-# tasks, one round of 156 KB instead of 192 of 208 KB: chained 128K B1S4 72.7 -> 71.7 us)
+# at a CTA's streaming rate (~3 / ~1.5 us at ~27 GB/s), for ``MoEExperts.groups`` (calibrated)
+# intra TP row groups a ug / down part (``MoEExperts.groups``); down 24: e.g. 384 groups x 16 slots = 256 tasks at TP4,
+# one round of 156 KB instead of 192 of 208 KB
 UG_CANDS, DOWN_CANDS = (4, 8, 12), (16, 24, 32)
 INTRA_DOWN_G = 32  # intra TP: down's row groups a task (its K is the rank's slice: 5 steps at V4.1 TP4)
 SH_G, SH_DG = 4, 8  # its row groups a gate / up and a down task (gate / up: 72 tasks at TP1, 20 at TP4)
-SH_DG_SOLO = 16  # ... a down task at TP without the down queue (``MoEExperts.cfg``, M27)
+SH_DG_SOLO = 16  # ... a down task at TP without the down queue (``MoEExperts.cfg``)
 
 
 @dataclass(frozen=True)
@@ -150,7 +133,7 @@ class _Cfg:
     out: str
     ug_g: int  # row groups a ug task (gate / up pairs: ug_g / 2)
     down_g: int
-    prefetch: int = 8  # weight units a wave keeps in flight (16 put the TP4 6-row layer at 256 VGPRs: M20)
+    prefetch: int = 8  # weight units a wave keeps in flight (16 put the TP4 6-row layer at 256 VGPRs)
     pre_b: int = 4  # of which issued before the task's picks and B rows are polled (ug)
     down_pre_b: int = 4  # the same for down
     tp: int = 1  # TP ranks; the combine's partial is all-reduced (fp32)
@@ -162,25 +145,27 @@ class _Cfg:
     sh_live: int = 0  # ... its real width (the rest zero padding, not loaded)
     sh_g: int = 8  # row groups a shared ug task
     sh_dg: int = 8  # row groups a shared down task
-    down: str = "cols"  # "cols": a down task owns 16 output columns x every slot (ATOM study P2); "slots": (slot, part)
+    down: str = "cols"  # "cols": a down task owns 16 output columns x every slot; "slots": (slot, part)
     sh_sep: bool = False  # TP push: the folded shared expert's fp32 partial travels as its own field, so the sum can
     # round it to bf16 and add it after the routed sum, as the reference (``MoE.forward``: all-reduce, then + shared)
     sh_prefetch: int = SH_PREFETCH
-    sh_fmt: str = "mxfp8"  # the folded shared expert's weights: "mxfp8" (V4.1's FP8) or "mxfp4" (MiniMax-M3's)
+    sh_fmt: str = "mxfp8"  # the folded shared expert's weights: "mxfp8" (V4.1's FP8) or "mxfp4"
     sh_ks: int = 1  # the folded shared expert's gate / up: K slices a part (tasks), summed in slice order (fp32)
-    rs: bool = False  # reduce "2shot": the combine pushes each column quarter to its owner only (peer.push_rs, P11)
+    rs: bool = False  # reduce "2shot": the combine pushes each column quarter to its owner only (peer.push_rs)
     own_quads: int = MI355X.threads  # 2shot owner stage: element quads a task (a thread each; fewer: more tasks)
     dq: bool = False  # down as a work queue (routed + folded shared items, an atomic counter; route_mode "cta")
-    route_mode: str = "cta"  # "stage": one route task publishes the slot table; "cta": each CTA builds it (P5b)
+    route_mode: str = "cta"  # "stage": one route task publishes the slot table; "cta": each CTA builds it
     sh_own: bool = False  # the folded shared expert's stages on CTAs of their own (the top ``sh_ctas``): no rt there,
-    # the routed rt / ug / down on the other ``n_r`` CTAs, a task a CTA looping over its (slot, part) items (M26)
+    # the routed rt / ug / down on the other ``n_r`` CTAs, a task a CTA looping over its (slot, part) items
     rt_picks: bool = False  # rt: only the threads with a pick poll the routing (into LDS), not every thread of the CTA
     rt_lean: bool = False  # rt (with rt_picks): the counts zeroed before the poll, both scans on one barrier pair
-    act: str = "silu"  # "silu": w silu(g) u (V4.1); "gptoss": (u + 1) g sigmoid(alpha g), HF's bf16 chain
-    alpha: float = 1.702  # act "gptoss": the sigmoid's slope
-    bias: bool = False  # the experts' biases (args <name>.ug.b f32 [E, 2, inter], <name>.down.b f32 [E, hidden])
-    wdown: bool = False  # the route weight on y after down (bf16), not on the act before it
-    cround: str = "f32"  # the combine: "f32" one rounding; "bf16" each add rounded (HF's bf16 index_add_)
+    # the activation and its options, always these values (w silu(g) u, the route weight on the act, the combine's
+    # one fp32 rounding); kept: the stage keys hash every field
+    act: str = "silu"
+    alpha: float = 1.702
+    bias: bool = False
+    wdown: bool = False
+    cround: str = "f32"
     out_arg: str = ""  # the combine (TP: dsum) also stores ``out`` to this plain bf16 arg [rows, hidden]
     rplan: object = None  # route_from: the router's route plan (``MoERouter.route_plan``): rt computes the picks
     ug_ring: int = 0  # ug: weight units a wave from an LDS ring, filled by the CTA's previous ug task (``_gemv``)
@@ -508,7 +493,7 @@ def _put_if(k, ok, a, i, v):
 
 
 def _cta_route(k, t, c: _Cfg):
-    """route="cta" (ATOM study P5b), stage ``<name>.rt``, a task on every CTA: ``_route``'s slot table into this CTA's
+    """route="cta", stage ``<name>.rt``, a task on every CTA: ``_route``'s slot table into this CTA's
     LDS (``_Cfg.rt_*``), where ug and down read it (no route stage, no per-task route polls). The same counts, scan
     and slots (ascending ids, so every CTA numbers the slots alike; a slot's pick order is this CTA's atomic order,
     which only permutes MFMA columns; over 16 rows the row order, from the experts' row masks, so an expert's runs of
@@ -763,7 +748,7 @@ def _rows_b(k, c: _Cfg, s, npick, pick_lds, with_weights, *gather):
 def _gather_n(kk: int) -> int:
     """Rows a gather batch of ``kk``-element rows: as many as one pass of the CTA's threads covers (a row's two-pair
     specs: kk / 8), at least ``GATHER_ROWS``. Each batch is a poll round trip, which under a saturated HBM costs
-    ~1.3 us: the 6-row shared down's 640-wide B took 3 batches, ~4 us (M26); x rows (5120) stay 2."""
+    ~1.3 us: the 6-row shared down's 640-wide B took 3 batches, ~4 us; x rows (5120) stay 2."""
     return max(GATHER_ROWS, min(TILE, THREADS // max(kk // 8, 1)))
 
 
@@ -866,7 +851,7 @@ def _gemv(k, c: _Cfg, e, g, kk, n_rows, part, w_arg, s_arg, pitch, spitch, stage
 
     nr = 0 if ring is None else min(ring.n, len(units))  # units from the ring
     # the task's scale codes (contiguous: g row groups x every K step, 64 B a unit) with 16 B loads, issued first and
-    # staged in LDS (Linear E5): one load per lane per unit cost 2-6 us at TP4 (M12)
+    # staged in LDS (as ``Linear``'s): one load per lane per unit cost 2-6 us at TP4
     ws_base = c.gemv_lds + 2 * TILE
     # ATOM's: the task's g row groups are g / 2 contiguous 32-row blocks of cols x 32 B (16 B chunks: g x cols)
     chunks = g * cols if cols else g * steps * 4
@@ -1032,20 +1017,6 @@ def _ug_body(k, c: _Cfg, s, part, e, npick, sh=False, kh=0, ch=None, ring=None):
     gpu.barrier()
 
 
-def _ug_bias(k, c: _Cfg, e, part, pairs, ps, items):
-    """The gate and up biases (4 f32 each) of epilogue pass ``ps``'s item: expert ``e``, features (part pairs + p)
-    16 + f4 4 .. + 3 (``bias``: arg ``<name>.ug.b`` [E, 2, inter])."""
-    i = fx.min(k.tid + ps * THREADS, fx.Int32(items - 1))
-    p, f4 = (i // 4) % pairs, i % 4
-    feat = (part * pairs + p) * 16 + f4 * 4
-    r = rsrc(k.args[f"{c.name}.ug.b"])
-    out = []
-    for h in range(2):
-        v = fx.Vector(bo.buffer_load(r, e * (2 * c.inter) + h * c.inter + feat, vec_width=4, dtype=T.f32))
-        out.append([fx.Float32(v[q]) for q in range(4)])
-    return out
-
-
 def _sh_slices(k, c: _Cfg, ok, kh, n, rg, f4, gate, up):
     """sh_ks > 1: this slice's gate / up sums (row n of the step, row groups rg / rg + 1, features f4 * 4 ..) into
     ``sh_kp``
@@ -1099,7 +1070,7 @@ def _down_live(k, c: _Cfg, s, part, count, e, npick):
 def _down_q(k, t, c: _Cfg):
     """dq: a CTA takes down items from the queue until it is empty: items 0 .. count x down_parts - 1 the routed
     slots' (slot, part), then the folded shared expert's parts. The grab order hands out work as CTAs free up, so the
-    stage's bytes spread over the CTAs whatever the routing (M24)."""
+    stage's bytes spread over the CTAs whatever the routing."""
     mb.poll([(k.mb[c.dq_ready], 0, 1)], k.tag)
     routed = uniform(fx.ptr_load(k.lds + c.rt)) * c.down_parts
     _down_loop(k, c, routed, routed + (c.sh_down_items if c.sh_inter and not c.sh_own else 0))
@@ -1178,16 +1149,6 @@ def _down_body(k, c: _Cfg, s, part, e, npick, sh=False, ch=None):
         col = kp * c.hidden + (part * g + gl) * 16 + f4 * 4
         _put_y(k, c, ok, r * (c.y_k * c.hidden) + col, y)
     gpu.barrier()
-
-
-def _down_bias(k, c: _Cfg, e, part, g, ps, items):
-    """The down bias (4 f32) of epilogue pass ``ps``'s item: expert ``e``, columns (part g + gl) 16 + f4 4 .. + 3
-    (arg ``<name>.down.b`` [E, hidden])."""
-    i = fx.min(k.tid + ps * THREADS, fx.Int32(items - 1))
-    gl, f4 = (i // 4) % g, i % 4
-    v = fx.Vector(bo.buffer_load(rsrc(k.args[f"{c.name}.down.b"]), e * c.hidden + (part * g + gl) * 16 + f4 * 4,
-                                 vec_width=4, dtype=T.f32))  # fmt: skip
-    return [fx.Float32(v[q]) for q in range(4)]
 
 
 def _put_y(k, c: _Cfg, ok, e, vals):
@@ -1270,12 +1231,7 @@ def _put_out(k, c: _Cfg, ok, e, vals):
     _put_bf16_if(k, ok, k.mb[c.out], e, [bf16_round(v) for v in vals])
 
 
-# ------------------------------------------------------------------ 3'. down owning columns (ATOM study P2)
-
-
-DCOL_AHEAD = 2  # B in LDS: slots of weights a wave keeps in flight
-DCOL_GROUPS = 1  # B in LDS: row groups (16 output columns) a column task (2: 160 tasks, spilled SGPRs at TP4)
-GATHER_BATCH = 6  # B in LDS: pair specs a gather poll (12 spilled SGPRs at TP4, 6 rows)
+# ------------------------------------------------------------------ 3'. down owning columns
 
 
 def _sh_wfmt(c: _Cfg):
@@ -1286,10 +1242,6 @@ def _sh_wfmt(c: _Cfg):
 def _sh_pre(c: _Cfg):
     """Its units in flight a wave: ``sh_prefetch`` (MXFP8 units), the routed experts' for MXFP4 (None)."""
     return None if c.sh_fmt == "mxfp4" else c.sh_prefetch
-
-
-DCOL_LDS_STEPS = 8  # B in LDS: K steps a column task unrolls (intra TP4: 5)
-DCOL_LDS_WORDS = 36 * 1024  # ... and the LDS words it may take
 
 
 def _dsum(k, t, c: _Cfg):
@@ -1311,7 +1263,7 @@ def _own(k, t, c: _Cfg):
     f32 when a shared channel is added after)."""
     n = c.rows * c.hidden // c.tp
     chunks = -(-n // 4 // c.own_quads)
-    dst, i = t // chunks, (t % chunks) * c.own_quads + k.tid  # a destination a task: the remote puts spread (P6)
+    dst, i = t // chunks, (t % chunks) * c.own_quads + k.tid  # a destination a task: the remote puts spread
     ok = i * 4 < n
     if const_expr(c.own_quads < THREADS):
         ok = ok & (k.tid < c.own_quads)
@@ -1332,41 +1284,6 @@ class MoEExperts(Block):
     ``groups``; a dict {rows: groups}: per scenario rows, rows not listed take ``groups``' rule); ``prefetch`` weight
     units a wave keeps in flight, ``pre_b`` of them issued before a task's picks and rows are polled."""
 
-    # what the tuner may change (``Block.SEARCH``; values a model's widths do not divide are dropped per instance)
-    SEARCH = {
-        "ug_g": Search((None, 4, 6, 8, 12, 16), "bitwise", "shape", "GPT-OSS G1: 8 at 1 row; V4.1 {6: 8}; M3 6 with "
-                       "sh_g 2", routing=True, pair="sh_g"),  # fmt: skip
-        "down_g": Search(
-            (None, 4, 8, 16, 24, 32, 48),
-            "bitwise",
-            "shape",
-            "GPT-OSS gap: 8 +5 % at 1 row (shape-dependent); M3 TP4 B1S4: 24 fills the grid; 48: M3 TP4 at 8 rows "
-            "(32 slots x 8 parts) fits one round of the grid, where the rule's 24 takes two (512 tasks)",
-            routing=True,
-        ),
-        "prefetch": Search((8, 4, 12, 16), "bitwise", "knob", "GPT-OSS gap: 8-12 flat at 1 row", routing=True),
-        "pre_b": Search((4, 2, 8), "bitwise", "knob", "GPT-OSS gap: flat at 1 row", routing=True),
-        "down_pre_b": Search((4, 2, 8), "bitwise", "knob", "GPT-OSS gap: flat at 1 row", routing=True),
-        "sh_ks": Search((None, 1, 2, 4), "d10", "shape", "M3 TP4 B1S4: 1 slice = 24 shared ug tasks of 393 KB",
-                        when=lambda b: b.shared_inter > 0),
-        # (class A of the transfer catalog: parameters a model hand-tuned as its own knob)
-        "sh_g": Search((SH_G, 2, 6, 8), "bitwise", "shape", "M3: sh_g 8 (hand); ug_g 6 + sh_g 2 paid only together",
-                       when=lambda b: b.shared_inter > 0),
-        "sh_dg": Search((None, 2, 4, 8, 16), "bitwise", "shape", "the shared down's row groups (SH_DG 8 when None); "
-                        "M3 B2S4: a moe.down pole CTA (median 11 / max 28-31 us) may be the shared down's",
-                        when=lambda b: b.shared_inter > 0),  # fmt: skip
-        "sh_own": Search((None, True), "bitwise", "placement", "the folded shared expert on its own top CTAs: TP4 6 "
-                         "rows -0.7 us (M26), +2.5 us at 16 rows (the down queue); M3 B2S4's down "
-                         "pole", when=lambda b: b.shared_inter > 0),  # fmt: skip
-        "rt_poll": Search(("all", "picks"), "bitwise", "knob", "M30: V4.1 picks", routing=True),
-        "rt_lean": Search((False, True), "bitwise", "knob", "V4.1 K35: the rt table on fewer barriers, on at 1 / 6-16 "
-                          "rows", routing=True),  # fmt: skip
-        "ug_ring": Search((0, 2, 4), "bitwise", "shape", "M36 / M41: ~0 at 12-18 rows at 16 copies (K46 withdrawn)",
-                          rows=(12, 1 << 20), routing=True),  # fmt: skip
-        "down_ring": Search((0, 2, 4, 8), "bitwise", "shape", "M39 / M41: -1.57 µs at 1-3 copies, +0.55 at 16: judge "
-                            "chained", routing=True),  # fmt: skip
-    }
-
     def __init__(self, name: str, x: Channel, idx: Channel, weights: Channel, out: Channel, experts: int, inter: int,
                  shared: Channel | None = None, limit: float = 0.0, ug_g: int | None = None,
                  down_g: int | None = None, prefetch: int = 8, pre_b: int = 4, down_pre_b: int = 4,
@@ -1376,11 +1293,10 @@ class MoEExperts(Block):
                  sh_fmt: str = "mxfp8",
                  down_queue: bool | None = None, sh_own: bool | None = None,
                  weight: str = "ffn.experts", rt_poll: str = "all", chain_own: bool = False,
-                 own_quads: int = THREADS, rt_lean: bool = False, act: str = "silu", alpha: float = 1.702,
-                 bias: bool = False, weight_at: str = "ug", combine: str = "f32", out_arg: str = "",
+                 own_quads: int = THREADS, rt_lean: bool = False, out_arg: str = "",
                  route_from=None, ug_ring: int = 0, rs_fmt: str = "f32", down_ring: int = 0,
                  part_fmt: str = "f32", acts: str = "mxfp8", x_lds: bool = False,
-                 betas: tuple = (4.0, 25.0), atom_scales: bool = False):  # fmt: skip
+                 atom_scales: bool = False):  # fmt: skip
         if acts not in ("mxfp8", "bf16"):
             raise ValueError(f"MoEExperts: acts 'mxfp8' or 'bf16', got {acts!r}")
         xfmt = Fmt.BF16 if acts == "bf16" else Fmt.MXFP8
@@ -1409,7 +1325,7 @@ class MoEExperts(Block):
             raise ValueError(f"MoEExperts: at most {THREADS} experts (route 'stage': a thread per expert), "
                              f"{2 * THREADS} (route 'cta': two a thread)")  # fmt: skip
         if shared_inter and (shared_inter % 128 or (shared is not None and not layout.startswith("intra"))):
-            # with a folded shared expert a ``shared`` channel is the last add (MiniMax-M3: the residual), TP intra
+            # with a folded shared expert a ``shared`` channel is the last add (e.g. the residual), TP intra
             raise ValueError("MoEExperts: a folded shared expert (shared_inter): width % 128; a shared channel beside "
                              "it with layout 'intra' only")  # fmt: skip
         if layout not in ("expert", "intra", "intra_gu"):
@@ -1427,7 +1343,7 @@ class MoEExperts(Block):
             raise ValueError("MoEExperts: 0 <= pre_b, down_pre_b <= prefetch")
         self.prefetch, self.pre_b, self.down_pre_b, self.layout = prefetch, pre_b, down_pre_b, layout
         # TP: "push" (combine pushes the partial, dsum sums it), "2shot" (the combine pushes each column quarter to its
-        # owner only, the owner sums and gathers: P11, -moe M25; the folded "fold" order) or a
+        # owner only, the owner sums and gathers; the folded "fold" order) or a
         # PeerAllReduce proto
         if reduce == "2shot" and shared_order != "fold":
             raise ValueError("MoEExperts: reduce '2shot' needs shared_order 'fold'")
@@ -1450,7 +1366,7 @@ class MoEExperts(Block):
         # TP, folded shared expert: "fold" (the speed default) adds its partial into the routed one (one field, D10);
         # "ref" (validation) all-reduces it apart (packed with the routed partial, 12 B an element), rounds it to bf16
         # and adds it after the routed sum: the reference's arithmetic, +0.6-0.9 / 1.6-2.5 / 4.5-5.9 us at 1 / 6 / 16
-        # rows (M18, M19)
+        # rows
         self.shared_order = shared_order
         # TP push: False = no dsum stage; the partial region (``<name>.part``, pushed by the combine, now the program's
         # last stage) is summed by its consumer, e.g. the next layer's seam (``HCSeam(pend=PeerPartial(...,
@@ -1473,7 +1389,7 @@ class MoEExperts(Block):
             raise ValueError(f"MoEExperts: own_quads a multiple of 64 up to {THREADS}")
         self.own_quads = own_quads
         # "stage": one route task dedupes the picks into slots and publishes the table (every ug / down task polls its
-        # slot); "cta" (ATOM study P5b): every CTA builds the table in LDS from the router's channels on its first
+        # slot); "cta": every CTA builds the table in LDS from the router's channels on its first
         # ug / down task (no route stage, no per-task route polls; down="slots" only)
         if route not in ("stage", "cta") or (route == "cta" and down != "slots"):
             raise ValueError(f"MoEExperts: route 'stage' or 'cta' (down='slots'), got {route!r}")
@@ -1493,26 +1409,10 @@ class MoEExperts(Block):
         if down_queue and (route != "cta" or down != "slots"):
             raise ValueError("MoEExperts: down_queue needs route='cta' and down='slots'")
         self.down_queue = down_queue
-        # the folded shared expert on CTAs of its own (route "cta", down "slots"; None: off, a knob: M26)
+        # the folded shared expert on CTAs of its own (route "cta", down "slots"; None: off, a knob)
         if sh_own and (route != "cta" or down != "slots" or not shared_inter):
             raise ValueError("MoEExperts: sh_own needs a folded shared expert, route='cta' and down='slots'")
         self.sh_own = sh_own
-        # GPT-OSS (module docstring): the activation, the experts' biases, the route weight after down, the combine's
-        # rounding. Defaults: V4.1's arithmetic. TP1 / the slots down only (the TP partials and the column down keep
-        # the fp32 sum)
-        if act not in ("silu", "gptoss", "situ") or weight_at not in ("ug", "down") or combine not in ("f32", "bf16"):
-            raise ValueError("MoEExperts: act silu | gptoss | situ, weight_at ug | down, combine f32 | bf16")
-        if act == "situ" and (bias or limit or combine != "f32"):
-            raise ValueError("MoEExperts: act situ has no bias, no limit, the f32 combine")
-        # (the activation alone also goes with a folded shared expert: its ug epilogue is the routed experts'; the
-        # route weight in ug and the fp32 combine as V4.1's: MiniMax-M3 at TP intra)
-        gpt = act not in ("silu", "situ") or bias or weight_at != "ug" or combine != "f32"
-        act_only = not bias and weight_at == "ug" and combine == "f32"
-        if gpt and (down != "slots" or (shared_inter and not act_only)):
-            raise ValueError("MoEExperts: act / bias / weight_at / combine options need down='slots'; with a folded "
-                             "shared expert only act")  # fmt: skip
-        self.act, self.alpha, self.bias, self.weight_at, self.combine = act, alpha, bias, weight_at, combine
-        self.betas = tuple(betas)
         self.out_arg = out_arg  # the output also stored to a plain arg (TP: by dsum, push reduce)
         # a MoERouter whose route the rt stage computes (route "cta"): a softmax_topk / sigmoid router with the dot's
         # slice partials and wave-0 scores (``route_lds``), or a ``consumer`` sigmoid / sqrtsoftplus router (any TP:
@@ -1535,7 +1435,7 @@ class MoEExperts(Block):
         if down_ring < 0:
             raise ValueError("MoEExperts: down_ring >= 0")
         self.down_ring = down_ring
-        # TP push: the partial each rank pushes, "f32" or "bf16" (ATOM's MiniMax-M3 monokernel: half the exchanged
+        # TP push: the partial each rank pushes, "f32" or "bf16" (half the exchanged
         # bytes; each rank's partial rounded to bf16 before the rank-order fp32 sum: D10). One field (no "ref" order),
         # one shot
         if part_fmt not in ("f32", "bf16") or (part_fmt == "bf16" and (reduce != "push" or shared_order != "fold")):
@@ -1545,9 +1445,9 @@ class MoEExperts(Block):
         # to exact bf16 and multiplied on the bf16 MFMA (``gemv16``): bf16 x bf16 products, fp32 sums. The step's rows
         # sit in LDS whole (at most A16_ROWS), so route "cta", down "slots", no queue / own shared CTAs / ug ring,
         # MXFP4 shared weights, no biases (the ug ring's units are raw MXFP4: any B format)
-        if acts == "bf16" and (route != "cta" or down != "slots" or down_queue or sh_own or bias
+        if acts == "bf16" and (route != "cta" or down != "slots" or down_queue or sh_own
                                or (shared_inter and sh_fmt != "mxfp4")):  # fmt: skip
-            raise ValueError("MoEExperts: acts 'bf16' needs route 'cta', down 'slots', no down queue / sh_own / bias, "
+            raise ValueError("MoEExperts: acts 'bf16' needs route 'cta', down 'slots', no down queue / sh_own, "
                              "MXFP4 shared weights")  # fmt: skip
         self.acts = acts
         # x_lds: the rt stage (route "cta") stages every row of x in its CTA's LDS once; the routed ug tasks read
@@ -1573,13 +1473,13 @@ class MoEExperts(Block):
 
     def groups(self, sc: Scenario) -> tuple[int, int]:
         """(ug_g, down_g): given, else
-        - intra TP: the candidate whose busiest CTA streams the least (M28): ``ceil(slots x parts /
+        - intra TP: the candidate whose busiest CTA streams the least: ``ceil(slots x parts /
           CTAs)`` rounds x (a part's weight bytes + a task's fixed cost in bytes, ``TASK_BYTES``), with the most
           slots a step can have (rows x K); ties go to fewer, larger tasks. A partial last round costs a whole part:
           at 6 rows TP4 ~31-35 distinct experts x 10 ug parts of 8 groups put two 330 KB parts on ~100 CTAs, 4
           groups at most 3 x 165 KB. With the down queue (16 rows) down keeps ``INTRA_DOWN_G``.
         - else (expert layout, TP1: not measured with the rule): the largest of (4, 8, 12) / (4, 8, 16) row groups a
-          task that keeps the expected live slots x parts >= 192 tasks (M3, M5)."""
+          task that keeps the expected live slots x parts >= 192 tasks."""
         n16 = self.x.width // 16
         ug_given, down_given = (v.get(sc.rows) if isinstance(v, dict) else v for v in (self.ug_g, self.down_g))
         if self.layout.startswith("intra") and sc.tp > 1:
@@ -1598,7 +1498,7 @@ class MoEExperts(Block):
             ug = best(ug_given, UG_CANDS, 2 * inter // 16, 16 * self.x.width * 17 // 32, TASK_BYTES[0],
                       self.x.width // 128)  # fmt: skip
             if down_given or n16 % INTRA_DOWN_G or self.down_queued(sc, INTRA_DOWN_G):
-                return ug, down_given or INTRA_DOWN_G  # the queue balances its items itself (M24)
+                return ug, down_given or INTRA_DOWN_G  # the queue balances its items itself
             return ug, best(None, DOWN_CANDS, n16, 16 * live * 17 // 32, TASK_BYTES[1], inter // 128)
         slots = sc.rows * self.idx.width / (sc.tp if self.layout == "expert" else 1)
 
@@ -1613,7 +1513,7 @@ class MoEExperts(Block):
     def sh_slices(self, sc: Scenario, ug_g: int, sh_inter: int) -> int:
         """The shared gate / up's K slices: given, else the most of (4, 2) whose tasks still fit beside the expected
         routed ug tasks in 3 / 4 of the CTAs (its 327 KB parts on 20 CTAs are the 1-row long pole; at 6 rows the
-        routed tasks fill the CTAs and slices would double up: M23); 1 at TP1 / for shared_order
+        routed tasks fill the CTAs and slices would double up); 1 at TP1 / for shared_order
         "ref" (the reference's order)."""
         slots = min(sc.rows * self.idx.width, self.experts) / (sc.tp if self.layout == "expert" else 1)
         routed = slots * (2 * self.inter_on(sc) // 16 // ug_g)
@@ -1623,16 +1523,14 @@ class MoEExperts(Block):
 
     def down_queued(self, sc: Scenario, down_g: int) -> bool:
         """Down as a work queue: given, else when the expected routed down items pass two rounds of CTAs (TP4 16 rows:
-        −2.5 to −3.9 µs; at 1 and 6 rows the grab's atomic round trip before each item's loads costs 0.3-1 µs,
-        M24)."""
+        −2.5 to −3.9 µs; at 1 and 6 rows the grab's atomic round trip before each item's loads costs 0.3-1 µs)."""
         slots = sc.rows * self.idx.width / (sc.tp if self.layout == "expert" else 1)
         return slots * (self.x.width // 16 // down_g) > 2 * MI355X.cus
 
     def sh_owned(self, sc: Scenario) -> bool:
         """The folded shared expert's gate / up and down on the top CTAs, which skip the route table and every routed
         task. Off unless given: the TP4 6-row block gains 0.7 us, the V4.1 layer nothing (its shared expert runs
-        ahead of the routed experts anyway), and at 16 rows its CTAs leave the down queue (+2.5 us; the moe measurements
-        M26)."""
+        ahead of the routed experts anyway), and at 16 rows its CTAs leave the down queue (+2.5 us)."""
         return bool(self.sh_own) and bool(self.shared_inter) and sc.tp > 1
 
     def cfg(self, sc: Scenario) -> _Cfg:
@@ -1670,7 +1568,7 @@ class MoEExperts(Block):
         if self.sh_dg is None and sc.tp > 1 and sh_inter and not dq and (self.x.width // 16) % SH_DG_SOLO == 0:
             # half the parts, on the top CTAs clear of the routed down tasks: with 8 the 40 parts sat on CTAs 216-255
             # and CTAs 216-229 ran a routed ug item, a shared down part and a routed down item (the layer's down
-            # tail, 2.7-4.6 us median -> last at 6 rows; 16: 1.4-1.7, M27). With the down queue the parts are queue
+            # tail, 2.7-4.6 us median -> last at 6 rows; 16: 1.4-1.7). With the down queue the parts are queue
             # items and smaller ones balance better (16 rows: +0.7-1.8 us with 16)
             sh_dg = SH_DG_SOLO
         return _Cfg(
@@ -1685,8 +1583,6 @@ class MoEExperts(Block):
             route_mode=self.route, sh_own=own, rt_picks=self.rt_poll == "picks",
             rt_lean=self.rt_lean and self.rt_poll == "picks",
             own_quads=self.own_quads,
-            act=f"situ:{self.betas[0]}:{self.betas[1]}" if self.act == "situ" else self.act, alpha=self.alpha,
-            bias=self.bias, wdown=self.weight_at == "down", cround=self.combine,
             out_arg=self.out_arg,
             rplan=(self.route_from.route_plan(sc) if self.route_from is not None
                    and (sc.tp == 1 or self.route_from.consumer) else None),  # fmt: skip
@@ -1814,13 +1710,8 @@ class MoEExperts(Block):
 
     def pack(self, layer) -> dict[str, torch.Tensor]:
         """``layer.experts``: per expert an object with ``w1`` / ``w3`` / ``w2`` (``.packed`` MXFP4 [N, K / 2] bytes,
-        ``.codes`` [N, K / 32]); ``bias``: ``layer.ug_bias`` [E, 2, inter] (gate, up) and ``layer.down_bias`` [E,
-        hidden] (bf16 values)."""
-        out = pack_experts(layer.experts, self.name)
-        if self.bias:
-            out[f"{self.name}.ug.b"] = layer.ug_bias.float().contiguous()
-            out[f"{self.name}.down.b"] = layer.down_bias.float().contiguous()
-        return out
+        ``.codes`` [N, K / 32])."""
+        return pack_experts(layer.experts, self.name)
 
 
 def _rows(t, a, b, n):

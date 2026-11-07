@@ -8,7 +8,7 @@ winners come out ascending by index (position order, as the V4.1 indexer re-sort
 when a row has fewer values.
 
 **Device.** A task's CTA runs ``device.gfx950.topk.select`` (the radix select over the 64-bit (key,
-index), one implementation with the Flash indexer's) on keys in registers, thread i holding ``per`` consecutive
+index), one implementation with the Indexer's) on keys in registers, thread i holding ``per`` consecutive
 positions from i x per: ``select`` places the kept keys by one CTA prefix sum in thread order, so its slots come
 out in position order, which is index order at every level; ``slot`` reads them (no sort). Every u32 is a key
 (``valid``: a position below the list's count), bf16 values select on their top 16 bits (``u_bits`` 16), and keys
@@ -30,7 +30,7 @@ a level of one list. A row with fewer values than the build's ``n`` runs the sam
 inputs (a level-l task beyond the row's lists ranks nothing). Lists hand over as tagged pairs
 (value bits, global index) in exchange regions ``<name>.l<level>``.
 
-**Groups** (``groups`` g, with ``split`` g: one group a TP rank, e.g. MiniMax-M3's index heads under context
+**Groups** (``groups`` g, with ``split`` g: one group a TP rank, e.g. index heads under context
 parallelism): ``x`` holds g x rows rows, row ``h rows + r`` group h's values for row r (the same bound, ``bound[r]``);
 each rank ranks every group's share of the values and sends group h's answer to rank h only; rank h's merge ranks
 its own group's answers into the output (rows rows). A request ranked whole (``scap``) ranks this rank's group only.
@@ -546,9 +546,6 @@ def _out_put(k, p, row, pos, gidx):
 
 def _merge(k, t, p):
     _merge_cta(k, t, p)
-
-
-WMERGE_AT = -(-topk.THRESH_WORDS // 4) * 4  # wmerge: the winners' pairs in LDS past the rank's words
 
 
 def _merge_cta(k, t, p):

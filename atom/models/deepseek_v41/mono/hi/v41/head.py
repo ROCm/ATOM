@@ -50,7 +50,7 @@ LAYOUT = "wave"  # the head weight: the hi runtime's copy in 1 KiB units, "wave"
 # weight units a wave keeps in flight (6 rows: 8 / 16 / 24 / 32 -> 67.9 / 66.4 / 64.1 / 62.0 us; 48 spills); 9-16 rows
 # (B = 2 requests: 12) 16 units with x landing beside them (12 rows: 65.4 us vs 66.9 with 32 / 28 / 24 units and the
 # rest of the prefetch after x lands); over 16 rows (two 16-row chunks, x in K slices) the most that build: 24 up to 20
-# rows, else 16 (K38)
+# rows, else 16
 PREFETCH = 32
 
 
@@ -77,7 +77,7 @@ def _kparts(kparts, rows: int | None) -> int:
 
 LEAD = 4  # ArgmaxHead: units before x's poll attempt
 # the rest of the prefetch after x lands: "auto" from LATE_ROWS rows (over 16 rows: x's K slices land between the
-# steps; 12 rows: 32 units beside x spill 65 VGPRs, 16 do not: K38), else a bool
+# steps; 12 rows: 32 units beside x spill 65 VGPRs, 16 do not), else a bool
 LATE, LATE_ROWS = "auto", 17
 
 
@@ -183,8 +183,8 @@ def head_program(name: str, sc, chain: bool = False, dyn: bool = False, **knobs)
     from ..plan.program import Program
 
     stages = place([st for b in head_blocks(sc.tp, chain=chain, rows=sc.rows, **knobs) for st in b.stages(sc)])
-    wide = sc.tp > KEY_TP  # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: up to 12, K51)
-    # a sharded fold (the rank columns of R): SGPR spills into VGPR lanes allowed (B = 4: 1, 5 with sampling; K41)
+    wide = sc.tp > KEY_TP  # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: up to 12)
+    # a sharded fold (the rank columns of R): SGPR spills into VGPR lanes allowed (B = 4: 1, 5 with sampling)
     spill = residual_layout(sc.tp, rows=sc.rows) == "sharded" or wide
     return Program(name, sc, stages, host_regions=chain_regions(sc), peer_first=chain_peer_first(sc.tp, rows=sc.rows),
                    sgpr_spill_ok=spill, dyn_rows=dyn)  # fmt: skip

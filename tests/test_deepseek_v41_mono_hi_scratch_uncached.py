@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The V4.1 mono hi hook allocates every program's scratch uncached (hi ``Kernel.buffers(uncached=)``, hi
-F19: the served c1 median +1.44 %, bitwise)."""
+"""The V4.1 mono hi hook allocates every program's scratch uncached (hi ``Kernel.buffers(uncached=)``: a hand-off's
+polls never hit a stale cache line)."""
 
+import ast
 import inspect
 import re
+from pathlib import Path
 
 import pytest
 
-pytest.importorskip("triton")
-hook = pytest.importorskip("atom.models.deepseek_v41.mono.hi_runner")
+MONO = Path(__file__).resolve().parents[1] / "atom/models/deepseek_v41/mono"
 
 
 def test_programs_share_one_arena(monkeypatch):
@@ -18,10 +19,9 @@ def test_programs_share_one_arena(monkeypatch):
     own private buffer, the given step counter."""
     import torch
 
-    from atom.models.deepseek_v41.mono import hi_draft
-
     pytest.importorskip("flydsl")
     pytest.importorskip("aiter")
+    from atom.models.deepseek_v41.mono import hi_draft
     from atom.models.deepseek_v41.mono.hi.plan.program import DUAL_PAGE
     from atom.models.deepseek_v41.mono.hi.runtime import dual, uncached
 
@@ -73,10 +73,13 @@ def test_every_program_buffer_goes_through_the_helper():
     buffers would otherwise fall back to cached scratch): no ``.buffers(device=`` call outside it; the layer programs,
     the heads, the Engram kv launch, the draft's CTX write and its stages each allocate through it.
     """
-    from atom.models.deepseek_v41.mono import hi_draft
-
-    src = inspect.getsource(hook) + inspect.getsource(hi_draft)
-    helper = inspect.getsource(hi_draft._buffers)
+    draft = (MONO / "hi_draft.py").read_text()
+    src = (MONO / "hi_runner.py").read_text() + draft
+    tree = ast.parse(draft)
+    (fn,) = [
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_buffers"
+    ]
+    helper = ast.get_source_segment(draft, fn)
     assert not re.findall(r"\.buffers\(device=[^)]*\)", src.replace(helper, ""))
     assert (
         len(re.findall(r"= _buffers\(\s*self\.", src)) == 5

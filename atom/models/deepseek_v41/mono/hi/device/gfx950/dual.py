@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Dual-copy regions at trace time (``Region.home`` "numa2"; H4-H6, N5).
+"""Dual-copy regions at trace time (``Region.home`` "numa2").
 
 MI355X homes every 8 KiB of a 2 MiB page on one of its two I/O dies, alternating: home = address bit 13 XOR a bit of
-the page (H5), and a poll of memory homed on the other IOD costs 1.3-1.5x a local round trip. A dual
+the page, and a poll of memory homed on the other IOD costs 1.3-1.5x a local round trip. A dual
 build keeps two copies of a region in one 2 MiB page of scratch, copy ``i`` in the 8 KiB runs of one parity: logical
 byte ``o`` of a region's copy lies at ``2 (o & ~8191) + (o & 8191)`` from the region's start, and copy 1 ``HALF``
 (8 KiB) after copy 0 (``plan.program``: regions up to 8 KiB sit inside one run, larger ones start on a run). Copy 0's

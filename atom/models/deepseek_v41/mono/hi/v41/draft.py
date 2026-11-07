@@ -262,7 +262,7 @@ def channels(tp: int, cols: str = "shard"):
 # launch, 4: 21.1; wkv in 2: 23.0 (TP4, 6 rows, CUDA-graph timing; bit-exact vs the reference in every variant)
 KNOBS = {"PROJ_KSPLIT": 3, "WKV_KSPLIT": None}
 # by rows (``context_program``): main_proj in 6 K slices over 18 rows (3 leaves no task shape at 24 rows, 4 / 5 spill
-# SGPRs; K38)
+# SGPRs)
 KNOBS_ROWS = {r: {"PROJ_KSPLIT": 6} for r in range(19, 25)}
 
 
@@ -270,7 +270,7 @@ def context_blocks(tp: int = 1, cols: str = "shard", meta: bool = False, knobs: 
     """The context write's blocks (module docstring). ``cols``: "shard" (TP: main_proj column-sharded + ``ColGather``)
     or "rep" (every rank all 5120 columns: the same bits, 4x the weight bytes); ``meta``: the slot / liveness from the
     ``cx.meta`` snapshot (a launch after the target step's) instead of the step's ``cx.bids`` / ``cx.slots``;
-    ``knobs``: overrides of ``KNOBS``."""
+    ``knobs``: values over ``KNOBS``'."""
     if cols not in ("shard", "rep"):
         raise ValueError(f"cols {cols!r}: 'shard' or 'rep'")
     kn = {**KNOBS, **(knobs or {})}
@@ -300,8 +300,8 @@ def context_blocks(tp: int = 1, cols: str = "shard", meta: bool = False, knobs: 
 
 def context_program(name: str, sc: Scenario, cols: str = "shard", meta: bool = False, knobs: dict | None = None,
                     **program):  # fmt: skip
-    """-> (blocks, ``Program``) of the context write at ``sc`` (``Scenario(1, rows, tp)``); ``knobs``: overrides of
-    ``KNOBS`` (and ``KNOBS_ROWS[sc.rows]``); ``program``: ``Program`` options. ``Scenario(B,
+    """-> (blocks, ``Program``) of the context write at ``sc`` (``Scenario(1, rows, tp)``); ``knobs``: values over
+    ``KNOBS``' (and ``KNOBS_ROWS[sc.rows]``'); ``program``: ``Program`` options. ``Scenario(B,
     rows, tp)``: B requests' rows, each at its request's position (``pos`` [B]) and ring slot."""
     blocks = context_blocks(sc.tp, cols, meta, {**KNOBS_ROWS.get(sc.rows, {}), **(knobs or {})})
     return blocks, Program(name, sc, [st for b in blocks for st in b.stages(sc)], **program)
@@ -409,7 +409,7 @@ def pack_stage(stage: int, w: dict, raw: dict, tp: int = 4, rank: int = 0, devic
 
 
 # rows -> the MarkovHead's prefetch over the verify head's rule: B = 2 / 3 / 4 requests of 5 positions build at 32 /
-# 24 / 16 units (H10)
+# 24 / 16 units
 DRAFT_PREFETCH = {10: 32, 15: 24, 20: 16}
 
 
@@ -448,7 +448,7 @@ def head_program(name: str, sc: Scenario, res_out: str | None = None, **program)
 
     blocks = head_blocks(sc.tp, sc.rows, res_out)
     stages = [st for b in blocks for st in b.stages(sc)]
-    # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: 12, K51), as the verify head's
+    # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: 12), as the verify head's
     program.setdefault("sgpr_spill_ok", sc.tp > KEY_TP)
     return blocks, Program(name, sc, stages, host_regions=H.chain_regions(sc, _draft_knobs()), peer_first=CHAIN_PEER,
                            **program)  # fmt: skip

@@ -21,7 +21,7 @@ kernel (``_post_verify_kernel``, a program a request, each request's rows at onc
   fixed inputs at the width's requests.
 
 The host then takes the kernel's results on a step the head's verdict serves (``ModelRunner.postprocess`` asks
-``verify_verdict``) whose layout is the one the kernel assumed (every request ``rq - 1`` drafts): ``verdict``
+``HiVerifyHead.verdict``) whose layout is the one the kernel assumed (every request ``rq - 1`` drafts): ``verdict``
 returns the persistent outputs without a launch, and the commit (``commit_speculative_state``) and the anchor staging
 (``_stage_anchors``) skip their launches on that step (``PostVerify.committed`` / ``anchors_staged``, at the builder's
 and the proposer's hooks). On any other step the eager path runs
@@ -232,8 +232,8 @@ class PostVerify:
 
 
 def verdict(hook, spec, head_ids, sampler):
-    """``ModelRunner.postprocess``'s ``verify_verdict``: the in-graph results on a step laid out as the kernel
-    assumed; on any other step the one-launch verdict (``head_verdict``). Reported to the device round as ATOM's
+    """``ModelRunner.postprocess``'s verdict (``HiVerifyHead.verdict``): the in-graph results on a step laid out as
+    the kernel assumed; on any other step the one-launch verdict (``head_verdict``). Reported to the device round as ATOM's
     verdict is (``HiRound.note_verdict``)."""
     pv = hook.pv
     pv.used = None

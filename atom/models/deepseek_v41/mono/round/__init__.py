@@ -25,8 +25,6 @@ import logging
 
 import torch
 
-from atom.models.deepseek_v41.mono.round import device_round, lean_host
-
 logger = logging.getLogger("atom")
 
 
@@ -120,6 +118,9 @@ class HiRound:
 def install(hook, metadata_builder, runner, drafter) -> HiRound:
     """``hook``'s decode round, set on the builder (``decode_round``) and the proposer (``anchors_staged``); the model
     (``HiDecodeModel.decode_round``) and the post-verify read it from ``hook.round``."""
+    # (imported here: the hooks above, and ``verify_head``, import without Triton)
+    from atom.models.deepseek_v41.mono.round import device_round, lean_host
+
     lean = lean_host.install(hook)
     device = device_round.install(metadata_builder, hook, runner)
     rnd = HiRound(lean=lean, device=device, pv=getattr(hook, "pv", None),

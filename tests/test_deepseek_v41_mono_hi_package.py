@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The V4.1 mono hi runtime (``atom/models/deepseek_v41/mono/hi``): of ATOM it imports only the shared mono pieces
-(``atom.mono``) and the environment (``atom.utils.envs``), the hook and its entry modules import, and no file of the
-tree carries the name of the project the runtime grew out of."""
+(``atom.mono``), the hook and its entry modules import, and no file of the tree carries the name of the project the runtime grew out of.
+"""
 
 import ast
 import importlib
@@ -71,7 +71,7 @@ def _imports(path: Path):
 
 
 # what the package may import of ATOM (the rest of its imports are relative or third-party: torch, flydsl, ...)
-ATOM_IMPORTS = ("atom.mono", "atom.utils.envs")
+ATOM_IMPORTS = ("atom.mono",)
 
 
 def test_the_package_is_self_contained():
@@ -178,3 +178,22 @@ def test_a_dual_copy_scratch_takes_its_calibrated_word(monkeypatch):
     assert int(b2.private[:4].view(torch.int32)[0]) == 0x1234
     with pytest.raises(ValueError, match="page"):
         k.buffers(device="cpu", scratch=arena[256:], word=0)
+
+
+def test_a_flydsl_change_keeps_flydsls_locations_and_warns_once(monkeypatch, caplog):
+    """``atom.mono.runtime.srcloc.scoped``: on a fingerprint miss (a FlyDSL whose location capture is not the one
+    reproduced) FlyDSL's own capture stays in place and one WARNING a process says what is skipped and its cost.
+    """
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime import srcloc
+
+    original = srcloc.meta.capture_user_location
+    monkeypatch.setattr(srcloc, "FINGERPRINT", "0" * 16)
+    srcloc._warn_miss.cache_clear()
+    with caplog.at_level("WARNING", logger="atom"):
+        for _ in range(3):
+            with srcloc.scoped():
+                assert srcloc.meta.capture_user_location is original
+    srcloc._warn_miss.cache_clear()
+    warned = [r for r in caplog.records if "srcloc" in r.getMessage()]
+    assert len(warned) == 1 and "twice the build time" in warned[0].getMessage()

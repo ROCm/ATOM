@@ -384,7 +384,7 @@ class Compressor(Block):
         self.dots = [mk("kv", self.wkv)] + ([mk("score", self.wgate)] if ratio == 2 else [])
         self.kslices, self.tiles, self.poll_batch = kslices, tiles, poll_batch
         # the cache entry's FP4 QAT (the official model's); False: the rotated bf16 latent as is (an engine's bf16
-        # cache without the QAT, ATOM's). A numerics choice, not a searched lever
+        # cache without the QAT, ATOM's). A numerics choice, not a schedule knob
         self.qat = qat
 
     def plan(self, sc: Scenario) -> _Plan:
@@ -436,16 +436,3 @@ def pack_wk(wk: torch.Tensor) -> torch.Tensor:
 # ------------------------------------------------------------------ torch reference (the official arithmetic)
 
 
-def fp4_qat32_pow2(x: torch.Tensor) -> torch.Tensor:
-    """``fp4_act_quant(x, 32, inplace=True)`` (E8M0 power-of-two scales: the indexer's keys)."""
-    g = x.float().unflatten(-1, (-1, 32))
-    scale = torch.exp2(torch.ceil(torch.log2(g.abs().amax(-1).clamp_min(6 * 2**-126) / 6)))
-    s = (g / scale.unsqueeze(-1)).clamp(-6, 6)
-    levels = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=x.device)
-    d = (s.abs().unsqueeze(-1) - levels).abs()
-    code = d.argmin(-1)
-    up = (code + 1).clamp_max(7)
-    tie = d.gather(-1, code.unsqueeze(-1)) == d.gather(-1, up.unsqueeze(-1))
-    code = torch.where(tie.squeeze(-1) & (code % 2 == 1), up, code)
-    v = levels[code] * torch.where(torch.signbit(s), -1.0, 1.0)
-    return (v * scale.unsqueeze(-1)).flatten(-2).to(x.dtype)

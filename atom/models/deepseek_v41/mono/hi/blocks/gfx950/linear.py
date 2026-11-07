@@ -3,25 +3,23 @@
 """``Linear``: y = MXFP8(x) @ W^T, fp32 accumulation, for every row of the step.
 
 The weight format is the block's ``weight_format`` (``gemv.WeightFormat``): ``"mxfp4"``
-(default, every Qwen3.8-27B projection) or ``"mxfp8"`` (E4M3 + E8M0 per row and 32 K, e.g.
+(default) or ``"mxfp8"`` (E4M3 + E8M0 per row and 32 K, e.g.
 FP8 block-scaled checkpoints through ``weights.mx.fp8_block_to_mxfp8``). A weight object
 (``pack``) has ``packed`` (MXFP4 [N, K/2] bytes or MXFP8 [N, K]), ``codes`` [N, K/32] and
 optionally ``fmt`` (its format name; absent means MXFP4). The rest of this docstring
 describes MXFP4; MXFP8 differs only in unit size (2 KiB, 8 VGPRs a lane in flight).
 
-The W4A8 GEMV of every Qwen3.8-27B projection ("skinny GEMM on
+A W4A8 GEMV ("skinny GEMM on
 MFMA"). One source serves any number of rows (1..16): the step's rows are the
 MFMA N dimension (``device.gfx950.gemv``); rows < 16 leave columns unused.
 
 **Inputs.** The activation is an MXFP8 ``Channel`` of width K (polled), or
 ``NormIn``: the task normalizes and quantizes the bf16 source rows itself (a BF16
-channel such as h1, polled, or a plain bf16 arg such as h_in) with stream B's
+channel such as h1, polled, or a plain bf16 arg such as h_in) with the
 prologue norm (``blocks.gfx950.norm``: same device functions, so the same bytes
 reach the MFMA as through a ``NormQuant`` stage with the same ``NormSpec``) and
 writes the fp8 words and scale codes into its own LDS activation layout (the norm
-strategy "recompute in the consumer prologue"). Or ``ConvIn``: the
-same for the DFlash2 drafter's conv before a projection (``conv.ConvPrep``'s
-arithmetic and mapping, so the same bytes as a ``ConvPrep`` stage). The
+strategy "recompute in the consumer prologue"). The
 weight is the given HF linears stacked along N in order (e.g. q, k, v), packed
 by ``pack`` into two pointer-table args ``<name>.w`` / ``<name>.ws`` (layout:
 ``gemv.pack_weight``, 16-row groups x 128-K units, aiter's 16x16 shuffle). For
@@ -36,10 +34,9 @@ matching gate / up columns.
 - ``Residual(out, arg= | channel=, publish=)``: out := bf16(bf16(acc) + residual),
   the residual a plain bf16 arg [rows, N] (written before the launch) or a BF16
   channel (written earlier in the launch: polled); written to the plain bf16 arg
-  ``out`` [rows, N] and, with ``publish``, to a BF16 channel too. With
-  ``conv=ConvFinish(...)`` (the DFlash2 drafter) bf16(acc) is first mixed with the
-  previous row's by a dynamic 2-tap conv (``ConvFinish``);
-- ``SwiGLU(ch)``: mid := bf16(bf16(silu(bf16(gate))) * bf16(up)), MXFP8-quantized
+  ``out`` [rows, N] and, with ``publish``, to a BF16 channel too;
+- ``SwiGLU(ch)``: mid := bf16(silu(min(g, L)) * clamp(u, -L, L)) (fp32 math, g / u the bf16 gate / up, L the
+  ``limit``), MXFP8-quantized
   (group 32, ``weights.mx.quantize_mxfp8``) into MXFP8 channel ``ch`` of
   width N / 2;
 - ``MXFP8Out(ch)``: MXFP8 of bf16(acc);
@@ -77,7 +74,7 @@ spec as above.
 ``groups`` K-wide pieces per row and output rows ``j N / groups .. (j + 1) N / groups`` (weight rows likewise)
 read piece j only; a task's row groups never straddle two groups.
 
-**Task shape** (the searchable knobs): a task owns ``group_rows``
+**Task shape** (the shape knobs): a task owns ``group_rows``
 output rows (G = group_rows / 16 row groups) over a 1 / ``k_split`` slice of K;
 the CTA's 8 waves form ``wave_rows`` x (8 / ``wave_rows``) (row groups x K
 waves; ``kwave`` "contiguous": each K wave a K range, as K slices take them). With ``k_split`` > 1 every slice
@@ -115,19 +112,18 @@ import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from ..base import Block, Channel, Fmt, Search
+from ..base import Block, Channel, Fmt
 from . import norm as nq
 from .hc import HCWrite
 from .warm import idle_issue, idle_sink
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import channels as chan
-from ...device.gfx950 import gemv, gemv16, lds_dma, peer
+from ...device.gfx950 import gemv, gemv16, peer
 from ...device.gfx950 import mailbox as mb
 from ...device.gfx950.ops import (
     bf16_round,
     fresh,
     rsrc,
-    spin_pause,
     traced,
 )
 from ...geometry import NormGeometry
@@ -148,11 +144,11 @@ TASK_BYTES = 32 << 10
 HOP_BYTES = 32 << 10
 STREAM_FIT_MARGIN = 8  # more for a streamed input (its composed layers' pressure, as FIT_MARGIN's)
 FIT_MARGIN = 8  # VGPRs a fitted stage leaves free: the composed kernel's other stages (and their
-# pointers, held in SGPRs from kernel start) cost the stage a few registers (1-5 spills seen in layer.mlp)
+# pointers, held in SGPRs from kernel start) cost the stage a few registers (1-5 spills seen in a composed MLP)
 NORM_ROWS = 4  # NormIn rows normalized per norm_quant call (their words stay live until it returns)
 # ``weight_format="bf16"`` (A16W16): plain bf16 weights in ``gemv16.pack_bf16``'s units (16 rows x 128 K, 64 B a lane),
 # a BF16 channel input landed as bf16 words, four bf16 MFMAs a unit (``gemv16``): a BF16 GEMM's exact products, fp32
-# sums (the MiniMax-M3 EAGLE3 drafter's linears, as ATOM runs them)
+# sums
 BF16W = gemv.WeightFormat("bf16", -1, 16)
 
 
@@ -165,12 +161,12 @@ def wformat(name: str) -> gemv.WeightFormat:
 # **A16W4** (MXFP4 weights and a BF16 channel input): the input lands as bf16 words (as ``weight_format="bf16"``),
 # each MXFP4 unit is decoded to its exact bf16 values (``gemv16.decode_fp4``, the lane's E8M0 code) and fed to four
 # bf16 MFMAs with the input's bf16 at the same K (``gemv16.b_operands``): bf16 activations x the weights' MXFP4 values,
-# exact products, fp32 sums (ATOM's K3 mono runs its latent projections so). The plan's ``wfmt`` is ``"mxfp4/x16"``.
+# exact products, fp32 sums. The plan's ``wfmt`` is ``"mxfp4/x16"``.
 X16 = "/x16"
 
 
 STREAM_ROWS = 32  # rows above which the derived shape streams its input (``Linear(xchunk=)``): resident slices fit
-#                  up to 32 rows (L31), at 64 none does
+#                  up to 32 rows, at 64 none does
 
 
 # ------------------------------------------------------------------ output specs
@@ -202,46 +198,19 @@ class ArgOut:
 @dataclass(frozen=True)
 class SwiGLU:
     channel: Channel  # MXFP8, width N / 2
-    # "qwen": mid = bf16(bf16(silu(bf16(gate))) * bf16(up)); "fp32" (DeepSeek-V4.1's Expert): gate and up rounded
-    # to bf16 (the projections' outputs), clamped (``limit`` > 0: up to [-limit, limit], gate to <= limit), then
-    # silu(gate) * up in fp32 and one bf16 rounding; "situ" (Kimi K3's ``SituAndMul``): gate and up rounded to bf16,
-    # ``gemv.situ_f32`` (``betas``) and one bf16 rounding
-    rounding: str = "qwen"
+    # "fp32" (DeepSeek-V4.1's Expert): gate and up rounded to bf16 (the projections' outputs), clamped (``limit`` > 0:
+    # up to [-limit, limit], gate to <= limit), then silu(gate) * up in fp32 and one bf16 rounding
+    rounding: str = "fp32"
     limit: float = 0.0
-    betas: tuple = (4.0, 25.0)
 
     def __post_init__(self):
-        if self.rounding not in ("qwen", "fp32", "situ") or (self.limit and self.rounding != "fp32"):
-            raise ValueError(f"SwiGLU: rounding 'qwen', 'fp32' or 'situ' (a limit only with 'fp32'), got {self}")
+        if self.rounding != "fp32":
+            raise ValueError(f"SwiGLU: rounding 'fp32', got {self}")
 
 
 def _swi_round(out: SwiGLU) -> str:
-    """The plan's SwiGLU rounding: "situ" carries its betas ("situ:<beta>:<linear beta>"; a field of its own would
-    change every Linear's build key)."""
-    return f"situ:{out.betas[0]}:{out.betas[1]}" if out.rounding == "situ" else out.rounding
-
-
-@dataclass(frozen=True)
-class ConvFinish:
-    """A block-local dynamic 2-tap conv of the output rows (the DFlash2 drafter's conv after a
-    projection), applied before the residual add: with ``y[r] = bf16(acc[r])``,
-
-        c[r] = bf16((b0 + d0[r]) y[r] + [r is not its request's first row] (b1 + d1[r]) y[r - 1])
-
-    (fp32 math). Per row ``r`` and 16 output features ``f .. f + 15`` one coefficient pair:
-    ``d0[r]`` = element ``d0 + f // 16`` and ``d1[r]`` = element ``d1 + f // 16`` of row ``r`` of
-    the BF16 channel ``coef`` (a kernel projection's output); the base taps are the plain bf16 [2, N]
-    arg ``base`` (row 0: b0, row 1: b1; ``Linear.pack``: ``layer.retained[weight]`` if given)."""
-
-    coef: Channel
-    d0: int
-    d1: int
-    base: str
-    weight: str | None = None
-
-    def __post_init__(self):
-        if self.coef.fmt is not Fmt.BF16 or self.coef.flagged:
-            raise ValueError("ConvFinish polls a tagged BF16 coefficient channel")
+    """The plan's SwiGLU rounding."""
+    return out.rounding
 
 
 @dataclass(frozen=True)
@@ -250,7 +219,6 @@ class Residual:
     arg: str | None = None  # residual from a plain bf16 arg [rows, N] ...
     channel: Channel | None = None  # ... or from a BF16 channel
     publish: Channel | None = None  # also publish the sum as a BF16 channel
-    conv: ConvFinish | None = None  # mix the rows of bf16(acc) first (``ConvFinish``)
     # also publish, per row and 16 output columns, the dot2 sum of squares of the sum's bf16 words in a ``NormQuant``
     # thread's order (word order from 0): an F32 channel of width N / 16, ``HCSeam(ssq_out=)``'s partials, so a
     # ``GatheredDot(norm=DotNorm(ssq=))`` normalizes its own K slice with the norm stage's bits (no whole-row poll)
@@ -301,42 +269,6 @@ class NormIn:
         return self.src.name if isinstance(self.src, Channel) else self.src
 
 
-@dataclass(frozen=True)
-class ConvIn:
-    """The input as a conv prologue (``conv.ConvPrep`` inside the task): rows of the BF16 channel ``src``
-    (width K, polled) mixed with the previous row of their request by the coefficients of the BF16 channel
-    ``coef`` (elements ``d0 + f // 16`` / ``d1 + f // 16`` of each row) and the base taps (plain bf16 [2, K]
-    arg ``base``; ``Linear.pack``: ``layer.retained[weight]``), quantized to MXFP8 into the task's LDS layout.
-    ``spec`` fixes the mapping (thread ``i`` < 320: features ``16 i ..``), as ``ConvPrep``'s (default
-    ``norm.prologue(norm)``: give the geometry ``norm`` or a ``spec``)."""
-
-    src: Channel
-    coef: Channel
-    d0: int
-    d1: int
-    base: str
-    weight: str | None = None
-    spec: nq.NormSpec | None = None
-    norm: NormGeometry | None = None
-
-    def __post_init__(self):
-        if self.spec is None:
-            if self.norm is None:
-                raise ValueError("ConvIn needs the geometry (norm=) or a spec")
-            object.__setattr__(self, "spec", nq.prologue(self.norm))
-        if self.spec.split != 1 or self.spec.qmap.chunks != 1 or self.spec.wps != 8:
-            raise ValueError(f"ConvIn needs a one-chunk, unsplit 16-feature mapping, got {self.spec}")
-        for ch in (self.src, self.coef):
-            if ch.fmt is not Fmt.BF16 or ch.flagged:
-                raise ValueError("ConvIn polls tagged BF16 channels")
-        if self.src.width != self.spec.width:
-            raise ValueError(f"ConvIn's source must have width {self.spec.width}")
-
-    @property
-    def width(self) -> int:
-        return self.spec.width
-
-
 # ------------------------------------------------------------------ the plan of one stage
 
 
@@ -379,10 +311,12 @@ class _Plan:
     tp_partial: str = ""  # row-parallel TP: the exchanged partial's format ("bf16" | "f32"), "" if none
     tp_sum: str = "producer"  # row-parallel TP: who sums the ranks' partials ("producer" | "consumer" | "rs": the
     #                           consumer, two-shot: each column quarter to its owner only, ``peer.push_rs``; its
-    #                           tp_partial "f32" pairs or "f32p" / "f32q" packed, P16)
+    #                           tp_partial "f32" pairs or "f32p" / "f32q" packed)
     groups: int = 1  # block-diagonal weight: output rows of group j read input columns j K .. (j + 1) K
     x_split: int = 1  # row-parallel TP over a whole input row: rank r reads input columns r K .. (r + 1) K
-    swi_round: str = "qwen"  # SwiGLU: the rounding ("qwen" | "fp32", see ``SwiGLU``)
+    # SwiGLU: the rounding ("fp32", see ``SwiGLU``); every other Linear keeps the default below, as the plan
+    # digests (``linear_fits``) hash every field
+    swi_round: str = "qwen"
     swi_limit: float = 0.0  # SwiGLU "fp32": the clamp (0: none)
     compute: str = "scaled"  # "scaled": the MX MFMA; "bf16": MXFP8 widened to bf16, bf16 MFMA (module docstring)
     hcw: HCWrite | None = None  # kind "hcwrite": the combine's spec
@@ -394,8 +328,8 @@ class _Plan:
     # instead of the whole slice resident; 0: resident (``Linear(xchunk=)``)
     xchunk: int = 0
     xlead: int = 1  # a streamed input: slots whose poll is in flight (registers) while a slot streams
-    # a streamed FLAG input's ring slots landed by async buffer -> LDS copies (``lds_dma``, alias-scoped) instead of
-    # loads into registers and ``ds_write``s (``Linear(xcopy=)``); False: the loads, as before
+    # always False (a streamed input's slots by loads into registers and ``ds_write``s); kept: the stage keys and the
+    # plan digests hash every field
     xcopy: bool = False
 
     @property
@@ -410,19 +344,20 @@ class _Plan:
     def xk(self):  # the input channel's width
         return self.k * self.groups * self.x_split
 
-    seg: int = 1  # rows per request (the scenario's spec): ConvFinish's first-row test
+    seg: int = 1  # rows per request (the scenario's spec)
     ssq: str = ""  # Residual(ssq=): the sum of squares channel ("" if none)
-    conv_coef: str = ""  # ConvFinish: coefficient channel ("" if none) ...
-    conv_w: int = 0  # ... its width
-    conv_d0: int = 0  # ... the elements of d0 / d1 for features 0 .. 15
+    # always at their defaults (no conv input or output); kept: the stage keys and the plan digests hash every field
+    conv_coef: str = ""
+    conv_w: int = 0
+    conv_d0: int = 0
     conv_d1: int = 0
-    conv_base: str = ""  # ... the base taps' arg
-    cin_src: str = ""  # ConvIn: the source channel ("" if none) ...
-    cin_coef: str = ""  # ... the coefficient channel and its width ...
+    conv_base: str = ""
+    cin_src: str = ""
+    cin_coef: str = ""
     cin_w: int = 0
-    cin_d0: int = 0  # ... the elements of d0 / d1 for features 0 .. 15 ...
+    cin_d0: int = 0
     cin_d1: int = 0
-    cin_base: str = ""  # ... the base taps' arg (rows per call / early rows: ``norm_rows`` / ``norm_pre``)
+    cin_base: str = ""
 
     @property
     def tp_reg(self):  # the peer region of the TP partials
@@ -706,25 +641,6 @@ def _fit(lin, sc: Scenario, p: _Plan) -> _Plan | None:
 class Linear(Block):
     """One W4A8 projection (module docstring)."""
 
-    # what the tuner may change (``Block.SEARCH``): the task shape; K slices
-    # and K waves move the summation order (D10 class), the others are claimed D10 too (a task's wave layout can) and
-    # recorded bitwise where they are. Evidence: 27B L13 / L14 / L35 / L36, the head's units / kwave rule (0.82x),
-    # V4.1 wq_b / wkv K slices; the best shape differs per matrix and scenario.
-    SEARCH = {
-        "k_split": Search((None, 1, 2, 4), "d10", "shape", "27B L13 / L14, V4.1 wkv K slices"),
-        "group_rows": Search((None, 32, 64, 128), "d10", "shape", "27B L13 / L36, Flash delta out_proj 32"),
-        "wave_rows": Search((None, 1, 2, 4), "d10", "shape", "27B L13, GQA B1S8 gate_up 2"),
-        "plan_rule": Search(("one_round", "units"), "d10", "shape", "27B 32-row layers: units rule (L35)"),
-        "kwave": Search(("interleave", "contiguous"), "d10", "shape", "the 27B head 0.82x (units / kwave)"),
-        # same sums, only the weight loads' timing; a consumer's prefetch flooding memory before its input lands
-        "pre_units": Search((None, 1, 12, 16), "bitwise", "knob", "L16: down GDN B1S16 0.986, "
-                            "GQA B1S8 12 units 0.991; gate_up capped loses", rows=(8, 1 << 20)),  # fmt: skip
-        # same sums; a streamed FLAG input's slots copied to LDS (its VGPRs to the weight prefetch where that was
-        # shallow): a no-op on a resident or tagged input
-        "xcopy": Search((False, True), "bitwise", "knob", "L20: 27B B16S8 down GDN 0.958, GQA "
-                        "0.986 (input flag); B16S8 gate_up loses", rows=(33, 1 << 20)),  # fmt: skip
-    }
-
     def __init__(
         self,
         name: str,
@@ -747,7 +663,6 @@ class Linear(Block):
         bias: tuple[str, ...] | None = None,
         xchunk: int | str | None = None,
         xlead: int | None = None,
-        xcopy: bool = False,
         x_split: int = 1,
         row_scale: bool = False,
     ):
@@ -759,7 +674,7 @@ class Linear(Block):
             raise ValueError(f"Linear {name}: tp_sum 'producer' or 'consumer' (consumer: a tp_partial; 'rs': an "
                              f"'f32' or 'f32q' one), got {tp_sum!r}")  # fmt: skip
         self.tp_sum = tp_sum
-        if tp_partial not in (None, "bf16", "f32", "f32q", "f32p"):  # f32q: fp32 packed (peer.py, P9)
+        if tp_partial not in (None, "bf16", "f32", "f32q", "f32p"):  # f32q: fp32 packed (peer.py)
             raise ValueError(f"Linear {name}: tp_partial {tp_partial!r} not in (None, 'bf16', 'f32', 'f32q', 'f32p')")
         if tp_partial and isinstance(out, SwiGLU):
             raise ValueError(f"Linear {name}: SwiGLU is column-parallel, it takes no tp_partial")
@@ -773,22 +688,17 @@ class Linear(Block):
         if x16 and (
             weight_format != "mxfp4" or x.flagged or groups != 1 or compute != "scaled" or prewiden or xchunk
             or bias is not None or isinstance(out, (HCWrite, SwiGLU))
-            or (isinstance(out, Residual) and out.conv is not None)
         ):  # fmt: skip
             raise ValueError(f"Linear {name}: a BF16 input takes MXFP4 (A16W4) or bf16 weights; A16W4: a "
-                             "tagged channel, no groups / compute / prewiden / xchunk / bias / SwiGLU / HCWrite / "
-                             "ConvFinish")  # fmt: skip
+                             "tagged channel, no groups / compute / prewiden / xchunk / bias / SwiGLU / HCWrite")  # fmt: skip
         if a16 and (
             not isinstance(x, Channel) or x.fmt is not Fmt.BF16 or x.flagged or groups != 1 or compute != "scaled"
             or prewiden or xchunk or bias is not None or isinstance(out, HCWrite)
-            or (isinstance(out, Residual) and out.conv is not None)
         ):  # fmt: skip
             raise ValueError(f"Linear {name}: bf16 weights take a tagged BF16 channel input, no groups / compute / "
-                             "prewiden / xchunk / bias / HCWrite / ConvFinish")  # fmt: skip
-        if not a16 and not x16 and not isinstance(x, (NormIn, ConvIn)) and x.fmt is not Fmt.MXFP8:
-            raise ValueError("Linear's input must be an MXFP8 channel, a NormIn or a ConvIn")
-        if tp_partial and isinstance(out, Residual) and out.conv is not None:
-            raise ValueError(f"Linear {name}: ConvFinish mixes rows of the reduced output; no tp_partial")
+                             "prewiden / xchunk / bias / HCWrite")  # fmt: skip
+        if not a16 and not x16 and not isinstance(x, NormIn) and x.fmt is not Fmt.MXFP8:
+            raise ValueError("Linear's input must be an MXFP8 channel or a NormIn")
         if isinstance(x, NormIn) and isinstance(x.src, Channel) and x.src.flagged:
             raise ValueError("NormIn polls a tagged BF16 channel (bulk + flag source not implemented)")
         if isinstance(out, Residual) and out.channel is not None and out.channel.flagged:
@@ -796,17 +706,17 @@ class Linear(Block):
         if (
             isinstance(out, Residual)
             and out.ssq is not None
-            and (out.ssq.width * 16 != n or out.conv is not None or (tp_sum or "producer") != "producer")
+            and (out.ssq.width * 16 != n or (tp_sum or "producer") != "producer")
         ):
-            raise ValueError(f"Linear {name}: Residual ssq: width N / 16, no ConvFinish, the producer's TP sum")
-        if groups > 1 and (isinstance(x, (NormIn, ConvIn)) or x.width % groups or n % (16 * groups)):
+            raise ValueError(f"Linear {name}: Residual ssq: width N / 16, the producer's TP sum")
+        if groups > 1 and (isinstance(x, NormIn) or x.width % groups or n % (16 * groups)):
             raise ValueError(f"Linear {name}: groups {groups} needs an MXFP8 channel input of width groups x K and "
                              f"N a multiple of 16 groups (N {n})")  # fmt: skip
         self.groups = groups
         if compute not in ("scaled", "bf16") or (compute == "bf16" and weight_format != "mxfp8"):
             raise ValueError(f"Linear {name}: compute 'scaled' or 'bf16' (bf16: MXFP8 weights), got {compute!r}")
         self.compute = compute
-        if prewiden and (compute != "bf16" or isinstance(x, (NormIn, ConvIn)) or x.dense):
+        if prewiden and (compute != "bf16" or isinstance(x, NormIn) or x.dense):
             raise ValueError(f"Linear {name}: prewiden needs the bf16 compute and a tagged MXFP8 channel input")
         self.prewiden = prewiden  # units a wave widens before its input lands (``_Plan.prewiden``)
         # bias: the layer's retained bf16 biases of ``linears`` (in their order), added in fp32 to acc before the
@@ -824,7 +734,7 @@ class Linear(Block):
         self.row_scale = row_scale
         # x_split: the input channel holds every rank's K columns of a row (a whole row, e.g. a replicated input); a
         # row-parallel TP Linear (tp_partial) reads its rank's K slice of it (rank r: columns r K .. (r + 1) K)
-        if x_split > 1 and (groups > 1 or not tp_partial or isinstance(x, (NormIn, ConvIn)) or x.width % x_split):
+        if x_split > 1 and (groups > 1 or not tp_partial or isinstance(x, NormIn) or x.width % x_split):
             raise ValueError(f"Linear {name}: x_split needs a row-parallel TP (tp_partial), no groups, a channel input "
                              f"of width x_split x K")  # fmt: skip
         self.x_split = x_split
@@ -858,7 +768,6 @@ class Linear(Block):
                              "compute and interleaved K waves")  # fmt: skip
         self.xchunk = xchunk
         self.xlead = xlead  # a streamed input's slots in flight (None: the deepest of 4 .. 1 that fits)
-        self.xcopy = xcopy  # a streamed FLAG input's slots by async copies to LDS (``_Plan.xcopy``)
         if group_rows is not None and (group_rows % 16 or (group_rows // 16) % align):
             raise ValueError(f"Linear {name}: group_rows {group_rows} must be a multiple of {16 * align}")
         if wave_rows is not None and WAVES % wave_rows:
@@ -940,7 +849,7 @@ class Linear(Block):
 
     def _straddles(self, sc: Scenario, g: int) -> bool:
         """``tp_sum`` "rs": a task of ``g`` row groups would hold columns of two owners (``peer.push_rs`` puts a wave's
-        lanes to one owner: the other owner's pairs never arrive, its consumer waits; K65)."""
+        lanes to one owner: the other owner's pairs never arrive, its consumer waits)."""
         if self.tp_sum != "rs" or not self.tp_partial:
             return False
         q = self.n // 16 // sc.tp  # an owner's row groups
@@ -1038,7 +947,6 @@ class Linear(Block):
         ks = self.k // 128 // kt
         c = -(-ks // wk)
         norm = self.x if isinstance(self.x, NormIn) else None
-        cin = self.x if isinstance(self.x, ConvIn) else None
         if xchunk and self.x.dense:  # the dense loads of the slots in flight (after the flags, at the task's start)
             in_regs = xlead * 4 * sum(_dense_chunks(sc.rows, xchunk * 128)) + 2
         elif xchunk:  # the attempts of the slots in flight (``xlead`` of them, live while a slot streams)
@@ -1068,7 +976,7 @@ class Linear(Block):
             prefetch=pre,
             lead=max(1, pre // LEAD_DIV),
             kind=kind,
-            x="" if norm or cin else self.x.name,
+            x="" if norm else self.x.name,
             out_ch=out_ch,
             res_arg=out.arg or "" if kind == "residual" else "",
             res_ch=out.channel.name if kind == "residual" and out.channel else "",
@@ -1079,10 +987,10 @@ class Linear(Block):
             norm_src=norm.src_name if norm else "",
             norm_ch=bool(norm and isinstance(norm.src, Channel)),
             gamma=norm.gamma if norm else "",
-            nspec=norm.spec if norm else (cin.spec if cin else None),
-            norm_rows=nrows if norm or cin else 0,
-            norm_pre=npre if norm or cin else 0,
-            x_proto="tagged" if norm or cin else self.x.proto.value,
+            nspec=norm.spec if norm else None,
+            norm_rows=nrows if norm else 0,
+            norm_pre=npre if norm else 0,
+            x_proto="tagged" if norm else self.x.proto.value,
             out_proto=self._out_channel().proto.value if self._out_channel() is not None else "tagged",
             wfmt=self.weight_format + (X16 if self.x16 else ""),
             tp=sc.tp if self.tp_partial else 1,
@@ -1096,26 +1004,13 @@ class Linear(Block):
             swi_limit=out.limit if kind == "swiglu" else 0.0,
             compute=self.compute,
             seg=sc.spec,
-            **self._conv_fields(),
-            **(
-                dict(cin_src=cin.src.name, cin_coef=cin.coef.name, cin_w=cin.coef.width, cin_d0=cin.d0,
-                     cin_d1=cin.d1, cin_base=cin.base)
-                if cin else {}
-            ),  # fmt: skip
             hcw=out if kind == "hcwrite" else None,
             prewiden=self.prewiden,
             bias=f"{self.name}.b" if self.bias else "",
             row_scale=f"{self.name}.rs" if self.row_scale else "",
             xchunk=xchunk,
             xlead=xlead if xchunk else 1,
-            xcopy=bool(self.xcopy and xchunk and not (norm or cin) and self.x.proto.value == "flag"),
         )
-
-    def _conv_fields(self) -> dict:
-        cv = self.out.conv if isinstance(self.out, Residual) else None
-        if cv is None:
-            return {}
-        return dict(conv_coef=cv.coef.name, conv_w=cv.coef.width, conv_d0=cv.d0, conv_d1=cv.d1, conv_base=cv.base)
 
     def _out_channel(self) -> Channel | None:
         return self.out.publish if isinstance(self.out, (Residual, HCWrite)) else self.out.channel
@@ -1179,11 +1074,6 @@ class Linear(Block):
             out[f"{self.name}.rs"] = self._pack_row_scale(rs)
         if isinstance(self.x, NormIn):
             out[self.x.gamma] = layer.retained[self.x.weight].contiguous()
-        cv = self.out.conv if isinstance(self.out, Residual) else None
-        if cv is not None and cv.weight:
-            out[cv.base] = layer.retained[cv.weight].contiguous()
-        if isinstance(self.x, ConvIn) and self.x.weight:
-            out[self.x.base] = layer.retained[self.x.weight].contiguous()
         if self.bias:
             b = torch.cat([layer.retained[n].reshape(-1) for n in self.bias]).float()
             if b.shape != (self.n,):
@@ -1334,11 +1224,6 @@ def _land_dense(k, p, s, xoff=0):
     _store_dense(k, items, [chan.load_words(a, w, 4) for a, w, _, _ in items])
 
 
-def _touch(byte, scope, noalias):
-    """A volatile LDS read in ``scope``: LLVM waits there for this wave's copies of the scope (and only those)."""
-    lds_dma.load(byte, T.i32, scope, noalias, volatile=True)
-
-
 def _store_dense(k, items, got):
     """``_x_dense``'s items' loaded words into LDS at their offsets."""
     for (_, _, off, code), ws in zip(items, got, strict=True):
@@ -1386,18 +1271,6 @@ def _repoll(k, bad, specs, dests):
 # ---- NormIn: the input rows normalized and quantized in the task's prologue
 
 
-@traced
-def _spin_from(v, load_all, pending):
-    """``mailbox.poll``'s retry loop, entered with an attempt's words ``v``."""
-    while pending(v):
-        spin_pause()
-        v = load_all()
-    return v
-
-
-# ---- ConvIn: the drafter's conv-prepare in the task's prologue (``conv.ConvPrep``'s arithmetic)
-
-
 def _live_item(k, ok, n):
     """``ok`` and, in a ``Program.dyn_rows`` build, item row ``n`` live: a dead row's K-slice partials are neither put
     nor polled (its output, zeros, still goes out: the region stays whole). A static
@@ -1416,14 +1289,6 @@ def _put_partial(k, p, ok, idx, vals):
 def _store_bf16(k, p, ok, e, vals):
     if ok:
         chan.put_bf16(k.mb[p.out_ch], e, vals, k.tag, p.out_proto == "flag")
-
-
-@traced
-def _store_f32(k, p, ok, e, vals):
-    """Elements e .. e + 3 (e a multiple of 4) as tagged f32 pairs, two 16-byte stores."""
-    if ok:
-        mb.put2(k.mb[p.out_ch], e, vals[0], vals[1], k.tag)
-        mb.put2(k.mb[p.out_ch], e + 2, vals[2], vals[3], k.tag)
 
 
 @traced
@@ -1520,20 +1385,8 @@ def _tp_reduce(k, p, ok, e, vals):
     return [t0, t1, t2, t3]
 
 
-def _clamped(p, gate, up):
-    """SwiGLU "fp32": gate and up at bf16 (the projections' outputs), clamped as DeepSeek-V4.1's Expert."""
-    g = [bf16_round(v) for v in gate]
-    u = [bf16_round(v) for v in up]
-    if p.swi_limit:
-        lim = fx.Float32(p.swi_limit)
-        u = [fx.max(fx.min(v, lim), -lim) for v in u]
-        g = [fx.min(v, lim) for v in g]
-    return g, u
-
-
-def _emit_out(k, p, ok, n, col, lead, vals, res_words, prev=None):
-    """The output spec of one item's totals (``vals``: one or, SwiGLU, two lists of 4; ``prev``:
-    the previous row's, for ``ConvFinish``)."""
+def _emit_out(k, p, ok, n, col, lead, vals, res_words):
+    """The output spec of one item's totals (``vals``: one or, SwiGLU, two lists of 4)."""
     if p.tp_partial:  # never SwiGLU (the constructor)
         vals = [_tp_reduce(k, p, ok, n * p.n + col, vals[0])]
         if const_expr(p.tp_sum != "producer"):  # pushed: the consumer sums and owns the output
@@ -1552,8 +1405,7 @@ def _finish(k, p, s, b, res_words):
     if p.k_split == 1:
         for ps in range(passes):
             ok, n, srcs, col, lead = _items(p, b, fx.Int32(ps * THREADS) + k.tid)
-            prev = None
-            _emit_out(k, p, ok, n, col, lead, [_sum_red(k, p, w) for w, _ in srcs], res_words[ps], prev)
+            _emit_out(k, p, ok, n, col, lead, [_sum_red(k, p, w) for w, _ in srcs], res_words[ps])
         return
     for ps in range(passes):
         ok, n, srcs, col, lead = _items(p, b, fx.Int32(ps * THREADS) + k.tid)
@@ -1576,8 +1428,7 @@ def _finish_last(k, p, b, res_words):
     for ps in range(-(-p.out_quads // THREADS)):
         ok, n, srcs, col, lead = _items(p, b, fx.Int32(ps * THREADS) + k.tid)
         live = _live_item(k, ok, n)
-        prev = None
-        _emit_out(k, p, ok, n, col, lead, [_poll_slices(k, p, live, idx) for _, idx in srcs], res_words[ps], prev)
+        _emit_out(k, p, ok, n, col, lead, [_poll_slices(k, p, live, idx) for _, idx in srcs], res_words[ps])
 
 
 def _quant_out(k, p, ok, e, vals, lead, width):
@@ -1625,18 +1476,6 @@ def _bias_prefetch(k, p, b, ps):
     rg = fx.min(b * p.g + gl, fx.Int32(p.n_rg - 1))
     v = fx.Vector(bo.buffer_load(rsrc(k.args[p.bias]), rg * 16 + f4 * 4, vec_width=4, dtype=T.f32))
     return [fx.Float32(v[q]) for q in range(4)]
-
-
-@traced
-def _res_words(k, p, e, words):
-    """The residual's two bf16-pair words of elements e .. e + 3: the plain arg's, or
-    the channel attempt's if its tags are current, else polled now."""
-    r0, r1 = (words[0], words[2]) if p.res_ch else (words[0], words[1])
-    if const_expr(p.res_ch != ""):
-        if (words[1] != k.tag) | (words[3] != k.tag):
-            got = mb.poll([(k.mb[p.res_ch], e // 2, 2)], k.tag)[0]
-            r0, r1 = got[0], got[1]
-    return r0, r1
 
 
 @traced
@@ -1832,8 +1671,8 @@ def _stream_chunks(k, p, q, issue, units, wr, wk, lane):
 
 def _fresh_lanes(k):
     """``k`` with the thread id and lane from an opaque copy of the thread id: LLVM would otherwise share the
-    task's lane arithmetic with an earlier stage's (the GDN core's at 64 rows) and hold it across that stage, 24 VGPRs
-    of spills in the composed layer."""
+    task's lane arithmetic with an earlier stage's and hold it across that stage (24 VGPRs of spills seen in a composed
+    layer at 64 rows)."""
     from types import SimpleNamespace
 
     tid = fresh(k.tid)

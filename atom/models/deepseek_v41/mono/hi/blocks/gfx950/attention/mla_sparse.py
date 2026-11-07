@@ -25,7 +25,7 @@ den_c = den_{c-1} corr_c + sum(P_c), corr_c = exp(m_{c-1} - m_c); o = bf16(num /
 Arithmetic: each chunk's scores and P V are ``MLAWindowAttn``'s MFMA chains, the recurrence the reference's
 operations in its order, so the result is ``MLAWindowAttn``'s bits extended to 10 chunks.
 
-``smerge`` (the merge takes the raw scores; A18): the chain above is three hand-offs in series after
+``smerge`` (the merge takes the raw scores): the chain above is three hand-offs in series after
 the scores (m_1 and the sibling maxima to every chunk, then 64 KB of P V partials a task to the merge), ~1.1-1.4 µs
 round trips under load each, plus the puts. With ``smerge`` the window task (or, ``wsplit``, a task per window chunk)
 and the chunk tasks stop after their scores and put them (8 KB a chunk, ``<name>.s``); a merge task per (row, tile,
@@ -33,15 +33,15 @@ and the chunk tasks stop after their scores and put them (8 KB a chunk, ``<name>
 cache by the selection, a source's new entries), then polls its heads' scores of all ten chunks, runs the softmax
 with the producers' thread mapping and operations (each chunk's max exact, its prefix max the running max), P V with
 the producers' MFMA operands, the recurrence and the output: one hand-off after the scores. The same bits.
-Optionally the merge's window V comes from an exact copy the caller keeps beside the bf16 ring (the mla measurement
-A21): ``ring8`` the ring's MXFP8 copy (``ring_mxfp8``).
+Optionally the merge's window V comes from an exact copy the caller keeps beside the bf16 ring: ``ring8`` the ring's
+MXFP8 copy (``ring_mxfp8``).
 
 Args: ``pos``, ``ring``, ``rope`` (the layer's table: a compressed layer's YaRN one), ``sink`` as ``MLAWindowAttn``;
 ``sel`` int32 [batch x spec, 512] the step rows' compressed positions (raw: no window offset; -1 pads), ``ckv`` the
 compressed cache: the owner's main rows in ATOM's pool, read in place (``device.gfx950.paged``: a selected position's
 row through the request's block table; the request words and the page geometry, ``paged.REQ``, beside it). Both are
-written by earlier launches (the KV / index source's): a consumer layer. Not yet (phase V6): a source layer's own step entries and selection from its Compressor / Indexer
-channels.
+written by earlier launches (the KV / index source's): a consumer layer. Not yet: a source layer's own step entries
+and selection from its Compressor / Indexer channels.
 """
 
 from __future__ import annotations
@@ -110,7 +110,6 @@ NCH = SEL // CH  # compressed chunks
 CPITCH = CH + 4  # LDS words a chunk score row (f32)
 CPPITCH = CH // 2 + 4  # LDS words a chunk P row (bf16 pairs)
 SLICE = 64  # dims a merge task
-NSCAL = 2 + 2 * NCH  # the merge's scalars a head: m_1, den_1, the chunks' maxima, the chunks' sum(P)
 # ``smerge`` (the merge takes the raw scores): the window's two chunks and the compressed ones, NCT in all. A merge
 # task (row, its ``mheads`` heads, 64 dims) holds V^T of its slice (a dim's 640 keys as bf16 pairs a row: the MFMA's B
 # operand is 4 consecutive words), P of its heads (16 rows: the MFMA's A), per-head maxima and sums, then t
@@ -151,15 +150,15 @@ class _SPlan:
     cratio: int = 1  # the compressed cache's ratio (its rows a page in ATOM's pool, ``paged``)
     # the chunk / merge tasks' index math as unsigned shifts and one modulo (keys, rows and slots are never negative;
     # a window key's position is at least -(WINDOW - 1)) and the merge's V^T pairs packed by v_perm_b32: fewer VALU
-    # instructions, the same addresses and bits (A23)
+    # instructions, the same addresses and bits
     lean: bool = False
     # the merge's V as loaded (``vtr``): key-major rows [640 keys][32 words] (one 16 B LDS store a lane and load, the
     # 4-word pieces of a row XOR-swizzled by key bits 1 and 3: conflict-free stores and reads), the P V's B operand by
     # gfx950's LDS transpose reads (``lds_read_tr16``: the same operand values, so the same bits) instead of V^T built
-    # by lane-pair exchanges and 4 B stores (A24)
+    # by lane-pair exchanges and 4 B stores
     vtr: bool = False
     # chunk tasks without this launch's entries (no ``new``): the gathered keys stored into LDS before the q poll (they
-    # land long before q), so only the scores follow q; the same bits (A24)
+    # land long before q), so only the scores follow q; the same bits
     kfirst: bool = False
     # the output's inverse RoPE quantized from f32 (``MLAWindowAttn(unrope_f32=)``): no bf16 rounding of the 64 dims
     unrope_f32: bool = False
@@ -577,64 +576,6 @@ def _chunk(k, t, p: _SPlan):
 # ------------------------------------------------------------------ the merge from the raw scores (smerge)
 
 
-def _merge(k, t, p: _SPlan):
-    """(row, tile, 64-dim slice s); thread -> head ``tid // 32``, dims ``64 s + 2 (tid % 32) .. + 2``."""
-    nsl = HD // SLICE
-    tt, s = t // nsl, t % nsl
-    r, ht = tt // p.tiles, tt % p.tiles
-    _, _, pos = _row_pos(k, p.pos, p.spec, r)
-    hh, j = k.tid // 32, k.tid % 32
-    d0 = s * SLICE + 2 * j
-    sink = fx.Float32(bo.buffer_load(rsrc(k.args[p.sink]), p.head(ht, hh), vec_width=1, dtype=T.f32))
-    first = fx.max(d0 - (HD - ROPE), 0) // 2  # the rotary pair (d0, d0 + 1), issued before the polls
-    cs = rope_cs(k, p.rope, pos, first)
-    _scal_land(k, p, tt, hh, j)
-    nv = mb.poll([(k.mb[f"{p.name}.num"], (tt * TILE + hh) * HD + d0, 2)]
-                 + [(k.mb[f"{p.name}.t"], ((tt * NCH + c) * TILE + hh) * HD + d0, 2) for c in range(NCH)],
-                 k.tag)  # fmt: skip
-    gpu.barrier()
-    sc = [fx.ptr_load(k.ldsf + (hh * NSCAL + i)) for i in range(NSCAL)]
-    num = [nv[0][e].bitcast(fx.Float32) for e in range(2)]
-    m, den = sc[0], sc[1]
-    for c in range_constexpr(NCH):  # the reference's recurrence, in chunk order
-        m_new = fx.max(m, sc[2 + c])
-        corr = fx.Float32(fmath.exp(m - m_new))
-        num = [num[e] * corr + nv[1 + c][e].bitcast(fx.Float32) for e in range(2)]
-        den = den * corr + sc[2 + NCH + c]
-        m = m_new
-    den = den + fx.Float32(fmath.exp(sink - m))
-    o = [bf16_round(num[e] / den) for e in range(2)]
-    is_rope = d0 >= HD - ROPE
-    a_, b_ = mw._rope_pair(o[0], o[1], fx.Float32(cs[0]), fx.Float32(cs[1]), True)
-    if not p.unrope_f32:
-        a_, b_ = bf16_round(a_), bf16_round(b_)
-    o = [is_rope.select(a_, o[0]), is_rope.select(b_, o[1])]
-    am = butterfly(fx.max(mw._ab(o[0]), mw._ab(o[1])), (1, 2, 4, 8), fx.max)  # the 32-dim group: 16 lanes
-    code = gemv.activation_code(am)
-    nb = [xshfl(o[e], 1) for e in range(2)]  # the odd lane's two values: the even lane's word
-    word = _qat_word([o[0], o[1], nb[0], nb[1]], code)[0]
-    e0 = r * p.heads * HD + p.head(ht, hh) * HD + d0
-    _out_put(k, p, j, e0, word, code)
-    gpu.barrier()  # the next task reuses the LDS
-
-
-@traced
-def _scal_land(k, p, tt, hh, j):
-    """Head hh's merge scalars into LDS [head][NSCAL]: thread j < NSCAL of the head polls scalar j."""
-    if j < NSCAL:
-        a_w, a_mx, a_ls = k.mb[f"{p.name}.w"], k.mb[f"{p.name}.mx"], k.mb[f"{p.name}.ls"]
-        jj = fx.min(j, fx.Int32(NSCAL - 1))
-        if j < 2:
-            v = mb.poll([(a_w, 2 * (tt * TILE + hh), 2)], k.tag)[0]
-            fx.ptr_store((j == 0).select(v[0], v[1]).bitcast(fx.Float32), k.ldsf + (hh * NSCAL + jj))
-        if (j >= 2) & (j < 2 + NCH):
-            v = mb.poll([(a_mx, (tt * NCH + fx.min(fx.max(j - 2, 0), NCH - 1)) * TILE + hh, 1)], k.tag)[0]
-            fx.ptr_store(v[0].bitcast(fx.Float32), k.ldsf + (hh * NSCAL + jj))
-        if j >= 2 + NCH:
-            v = mb.poll([(a_ls, (tt * NCH + fx.min(fx.max(j - 2 - NCH, 0), NCH - 1)) * TILE + hh, 1)], k.tag)[0]
-            fx.ptr_store(v[0].bitcast(fx.Float32), k.ldsf + (hh * NSCAL + jj))
-
-
 def _bfly(vs, offsets, op=None):
     """``butterfly`` of each of ``vs`` (the same operations each), level by level across them: independent chains
     interleaved instead of one after another."""
@@ -970,14 +911,6 @@ def _out_put_if(k, p, j, e0, word, code, ok):
         chan.put_mxfp8_scale(k.mb[f"{p.out}.s"], e0 // 32, code, k.tag)
 
 
-@traced
-def _out_put(k, p, j, e0, word, code):
-    if j % 2 == 0:
-        chan.put_mxfp8_word(k.mb[f"{p.out}.q"], e0 // 4, word, k.tag)
-    if j % 16 == 0:
-        chan.put_mxfp8_scale(k.mb[f"{p.out}.s"], e0 // 32, code, k.tag)
-
-
 def _from_rows(knob, sc: Scenario) -> bool:
     """A copy knob: False, True, or an int n = from n rows."""
     return bool(knob) and sc.rows >= (1 if knob is True else knob)
@@ -1024,7 +957,7 @@ class MLASparseAttn(Block):
         # the window / chunk tasks put their raw scores (8 KB a chunk) and stop; the merge tasks land their 64 dims
         # of every key's V beforehand, then run the softmax of all ten chunks (the producers' operations: the same
         # P, maxima and sums), the P V and the recurrence: one hand-off after the scores instead of the prefix max's
-        # and the 64 KB partials' (A18); the same bits. RingWrite also waits for the merge's ring
+        # and the 64 KB partials'; the same bits. RingWrite also waits for the merge's ring
         # reads (``ring_mdone``)
         if smerge and dsplit != 1:
             raise ValueError(f"MLASparseAttn {name}: smerge has no P V in the window / chunk tasks (dsplit 1)")
@@ -1033,14 +966,14 @@ class MLASparseAttn(Block):
         if wsplit and not smerge:
             raise ValueError(f"MLASparseAttn {name}: wsplit needs smerge")
         self.smerge, self.mheads, self.wsplit = smerge, mheads, wsplit
-        # ckv4 (A20, the merge's compressed V from an FP4 copy of the cache): refused, the cache is ATOM's pool
+        # ckv4 (the merge's compressed V from an FP4 copy of the cache): refused, the cache is ATOM's pool
         self.ckv4 = ckv4 if smerge else False
         if self.ckv4:
             raise ValueError(f"MLASparseAttn {name}: ckv4 (the cache's FP4 copy): the cache is ATOM's pool, in place")
         if cache_ratio < 1:
             raise ValueError(f"MLASparseAttn {name}: cache_ratio (the compressed cache's ratio: its page geometry)")
         self.cache_ratio = cache_ratio
-        # ring8 (A21): the same for the window's V from the ring's MXFP8 copy (True or from n rows).
+        # ring8: the same for the window's V from the ring's MXFP8 copy (True or from n rows).
         # The copy is the caller's (the hook's import, a step): RingWrite writes the bf16 ring only and no longer
         # waits for the merge
         self.ring8 = ring8 if smerge else False
@@ -1065,7 +998,7 @@ class MLASparseAttn(Block):
 
     def _mheads(self, sc: Scenario) -> int:
         """``mheads`` 0 ("auto"): 4 up to 6 rows (192 merge tasks), else 16 (layer 3's program, A / B at 16 rows:
-        16 −1.6 µs, 8 −0.9, 4 +5.2 against smerge off; A18)."""
+        16 −1.6 µs, 8 −0.9, 4 +5.2 against smerge off)."""
         return self.mheads or (4 if sc.rows <= 6 else 16)
 
     def plan(self, sc: Scenario) -> _SPlan:

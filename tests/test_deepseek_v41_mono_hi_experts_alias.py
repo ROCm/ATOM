@@ -5,7 +5,6 @@ runtime's unit order, ``[rg, st, j, r, b]`` with gate / up interleaved a 16-row 
 lane-level GUGU shuffle, written out here from both sides' definitions) and the plain tensors (``hi_weights.alias_plain``).
 """
 
-import pytest
 import torch
 
 E, INTER, HIDDEN = (
@@ -59,8 +58,7 @@ def test_plain_tensors_alias_only_where_the_bytes_match():
     """``hi_weights.alias_plain``: a packed plain tensor (``PLAIN``) takes the block's own where its bytes match (the compressor's
     wkv / wgate: rows of ATOM's fused ``wkv_gate``), keeps its pack where they differ or the block has none.
     """
-    pytest.importorskip("triton")
-    hook = pytest.importorskip("atom.models.deepseek_v41.mono.hi_weights")
+    from atom.models.deepseek_v41.mono import hi_weights
 
     class Block(torch.nn.Module):
         def __init__(self):
@@ -91,7 +89,7 @@ def test_plain_tensors_alias_only_where_the_bytes_match():
         "comp.wgate": wkv_gate[512:].clone(),
     }
     kept = packed["attn_norm.g"]
-    assert hook.alias_plain(b, packed) == 3
+    assert hi_weights.alias_plain(b, packed) == 3
     assert packed["router.w"].data_ptr() == b.ffn.gate.weight.data_ptr()
     assert packed["comp.wkv"].data_ptr() == wkv_gate.data_ptr()
     assert packed["comp.wgate"].data_ptr() == wkv_gate[512:].data_ptr()

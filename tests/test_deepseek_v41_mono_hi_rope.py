@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The V4.1 mono hi programs read ATOM's own RoPE caches in place (``hi_runner._rope_args``: ``RotaryEmbedding``'s bf16
+"""The V4.1 mono hi programs read ATOM's own RoPE caches in place (``hi_weights.rope_args``: ``RotaryEmbedding``'s bf16
 ``cos_cache`` / ``sin_cache`` [positions, 32], the hi device code's ``rope_cs``): the pointer-table entries are those
 caches, any other layout is refused, and the caches are the official ``precompute_freqs_cis`` tables rounded to bf16
 (the numerics the hi path now shares with ATOM's own V4.1 kernels: the window layers' table without YaRN, the
@@ -66,9 +66,9 @@ YARN = dict(
 
 @pytest.fixture(scope="module")
 def mods():
-    pytest.importorskip("triton")
+    """``hi_weights`` (pure torch) and ATOM's rotary module (AITER stubbed where it is not installed)."""
     with atom_without_aiter() as load:
-        yield load("atom.models.deepseek_v41.mono.hi_runner"), load(
+        yield load("atom.models.deepseek_v41.mono.hi_weights"), load(
             "atom.model_ops.deepseek_v41.rotary"
         )
 
@@ -94,10 +94,10 @@ def _rotary(rotary, n, kw):
 
 
 def test_the_tables_are_atoms_caches(mods):
-    """``_rope_args``: the programs' ``rope`` / ``rope.sin`` entries are the module's own caches (no copy)."""
+    """``rope_args``: the programs' ``rope`` / ``rope.sin`` entries are the module's own caches (no copy)."""
     mh, rotary = mods
     emb = _rotary(rotary, 4096, YARN)
-    args = mh._rope_args(emb)
+    args = mh.rope_args(emb)
     assert args["rope"] is emb.cos_cache and args["rope.sin"] is emb.sin_cache
 
 
@@ -114,7 +114,7 @@ def test_other_layouts_are_refused(mods):
         SimpleNamespace(cos_cache=emb.cos_cache.t(), sin_cache=emb.sin_cache.t()),
     ):
         with pytest.raises(ValueError, match="RoPE caches"):
-            mh._rope_args(bad)
+            mh.rope_args(bad)
 
 
 @pytest.mark.parametrize("kw", [WINDOW, YARN], ids=["window", "yarn"])

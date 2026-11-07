@@ -155,9 +155,9 @@ class PeerGroup:
         after every rank is done with it. Idempotent.
 
         Why not free: in a process that runs device collectives afterwards, closing a group (its peers' IPC mappings,
-        its buffer) corrupted them (V4.1 TP8, chain_tl's group closed before a test harness's NCCL all_gather: some
+        its buffer) corrupted them (V4.1 TP8, a group closed before an NCCL all_gather in the same process: some
         ranks' slices arrived wrong at most receivers, deterministically and in every later gather; no close: clean).
-        Reuse bounds the memory of evaluations that make a group per build (the tuner arms)."""
+        Reuse bounds the memory of evaluations that make a group per build."""
         if barrier:
             import torch.distributed as dist
 

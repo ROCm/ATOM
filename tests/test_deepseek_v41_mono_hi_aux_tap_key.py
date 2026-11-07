@@ -2,15 +2,16 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The DSpark aux taps under the hi runtime's sharded residual: ``HiLayers._key`` gives the tap layers, and only them, a
 program of their own (``window_layer_blocks(full_r_a=True)``: R_A whole) at the widths where the hi runtime's
-``layer.residual_layout`` says "sharded"; replicated, every key is the plain one."""
+``layer.residual_layout`` says "sharded"; replicated, every key is the plain one. The keys are pure Python
+(``hi_compose``); the hi layer needs FlyDSL (its test skips without it)."""
 
 import inspect
 import types
 
 import pytest
+from aiter_stub import atom_without_aiter
 
-pytest.importorskip("triton")
-hook = pytest.importorskip("atom.models.deepseek_v41.mono.hi_runner")
+from atom.models.deepseek_v41.mono import hi_compose
 
 AUX = (37, 38, 39)
 WIDTHS = (1, 2, 6, 8, 12, 16, 24)
@@ -26,7 +27,7 @@ def _hi_layer_module(layout):
 
 
 def _layers(L):
-    m = object.__new__(hook.HiLayers)  # (only what ``_key`` reads)
+    m = object.__new__(hi_compose.HiPrograms)  # (only what ``_key`` reads)
     m.L, m.tp, m.chain, m.aux_ids, m.band_of = L, 4, False, AUX, {}
     m.plan = {
         i: types.SimpleNamespace(program_key=("consumer", 4 if i % 2 else 128))
@@ -76,7 +77,7 @@ def test_keys_differ_only_for_the_taps(name, layout):
 
 
 def test_program_takes_the_tap():
-    assert "full_r_a" in inspect.signature(hook.HiLayers._program).parameters
+    assert "full_r_a" in inspect.signature(hi_compose.HiPrograms._program).parameters
 
 
 def test_hi_layer_takes_full_r_a():
@@ -104,6 +105,10 @@ def test_first_served_step_writes_the_taps():
     """
     import torch
 
+    with (
+        atom_without_aiter() as load
+    ):  # (Triton stubbed with AITER where it is not installed)
+        hook = load("atom.models.deepseek_v41.mono.hi_runner")
     m = object.__new__(hook.HiLayers)
     m.aux, m.D = None, types.SimpleNamespace(TAPS=len(AUX))
     m.h_in0 = torch.zeros(1, 4, 8, dtype=torch.bfloat16)

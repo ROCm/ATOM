@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""ModelRunner's model-side verify head (DeepSeek-V4.1's hi hook): which verify steps take the head's ids
-instead of logits (``_verify_head_ids``), the sampling rows it is told (``_verify_head_sampling``), and
-``postprocess`` on a head-served step (the model's verdict, no TP broadcast of the ids). A model without the hook
-takes the logits path."""
+"""ModelRunner's model-side hooks and DeepSeek-V4.1's hi verify head behind them.
+
+The runner's seam is generic (``verify_head``, ``decode_round``): a model without them takes the logits path and
+runs no decode round; with them the runner asks the head for a verify's ids, its verdict, and skips the ids' TP
+broadcast. Which steps the hi head serves is its own policy (``round.verify_head.HiVerifyHead``), tested here
+against a stub hook: pure Python, no Triton, AITER or FlyDSL."""
 
 from types import SimpleNamespace
 
@@ -12,6 +14,8 @@ import pytest
 import torch
 from aiter_stub import atom_without_aiter
 
+from atom.models.deepseek_v41.mono.round import verify_head as vh
+
 
 @pytest.fixture(scope="module")
 def runner_module():
@@ -19,32 +23,10 @@ def runner_module():
         yield load("atom.model_engine.model_runner")
 
 
-class _HeadModel:
-    """The hook's surface as ``HiDecodeModel`` offers it."""
-
-    samples_verify = True
-    verify_head_forced = "sample"
-    verify_ids_bcast = "skip"
-
-    def __init__(self, ids):
-        self.ids, self.sampling = ids, []
-
-    @property
-    def verify_head_ids(self):
-        return lambda hidden_states=None: self.ids
-
-    def set_verify_sampling(self, temps=None, top_ps=None):
-        self.sampling.append(
-            None if temps is None else (temps.tolist(), top_ps.tolist())
-        )
-        return True
-
-
-def _runner(runner_module, model, synthetic=None):
+def _runner(runner_module, model):
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.model = model
-    runner.rejection_sampler = SimpleNamespace(synthetic_acceptance_rates=synthetic)
-    runner._head_sampled = False
+    runner.rejection_sampler = SimpleNamespace(synthetic_acceptance_rates=None)
     return runner
 
 
@@ -64,82 +46,49 @@ def _batch(temps=(0.0,), **over):
     return SimpleNamespace(**b)
 
 
-@pytest.fixture
-def spec_step(monkeypatch, runner_module):
-    spec = SimpleNamespace(num_spec_steps=5)
-    monkeypatch.setattr(
-        runner_module,
-        "get_forward_context",
-        lambda: SimpleNamespace(spec_decode_metadata=spec),
-    )
-    monkeypatch.setattr(runner_module, "get_pcp_world_size", lambda: 1)
-    return spec
+# ---- the runner's generic seam
 
 
-def test_a_model_without_the_hook_takes_the_logits_path(spec_step, runner_module):
+class _StubHead:
+    """A model-side verify head as the runner sees one."""
+
+    ids_identical_on_tp_ranks = True
+
+    def __init__(self, ids=None):
+        self.ids_out, self.calls = ids, []
+
+    def before_forward(self, runner, batch):
+        self.calls.append(("before", batch))
+
+    def ids(self, runner, batch, hidden_states, graph_key=None):
+        self.calls.append(("ids", graph_key))
+        return self.ids_out
+
+    def captured(self, graph_key):
+        self.calls.append(("captured", graph_key))
+
+
+def test_a_model_without_the_hooks_takes_the_logits_path(runner_module):
     runner = _runner(runner_module, SimpleNamespace())
-    runner._verify_head_sampling(_batch())
+    assert runner._verify_head() is None and runner._decode_round() is None
     assert runner._verify_head_ids(_batch(), torch.zeros(6, 4)) is None
+    bare = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
+    assert bare._verify_head() is None and bare._decode_round() is None
 
 
-def test_greedy_verify_takes_the_head_ids(spec_step, runner_module):
-    ids = torch.arange(8, dtype=torch.int32)
-    runner = _runner(runner_module, _HeadModel(ids))
-    batch = _batch()
-    runner._verify_head_sampling(batch)
-    got = runner._verify_head_ids(batch, torch.zeros(6, 4))
-    assert torch.equal(got, ids[:6])
-    for over in (
-        dict(any_logprobs=True),
-        dict(structured_requests={0: object()}),
-        dict(required_channel=object()),
-    ):
-        assert runner._verify_head_ids(_batch(**over), torch.zeros(6, 4)) is None
+def test_the_runner_asks_the_models_head(runner_module):
+    ids = torch.arange(6, dtype=torch.int32)
+    head = _StubHead(ids)
+    runner = _runner(runner_module, SimpleNamespace(verify_head=head))
+    assert runner._verify_head() is head
+    assert runner._verify_head_ids(_batch(), torch.zeros(6, 4)) is ids
+    assert runner._verify_head_ids(_batch(), torch.zeros(6, 4), (1, 6)) is ids
+    assert head.calls == [("ids", None), ("ids", (1, 6))]
 
 
-def test_a_replay_reads_the_captured_buffer(spec_step, runner_module):
-    ids = torch.arange(12, dtype=torch.int32)
-    runner = _runner(runner_module, _HeadModel(None))
-    runner.graph_head_ids = {(1, 6): ids}
-    got = runner._verify_head_ids(_batch(), torch.zeros(6, 4), (1, 6))
-    assert torch.equal(got, ids[:6])
-    assert runner._verify_head_ids(_batch(), torch.zeros(6, 4), (2, 6)) is None
-
-
-def test_sampled_verify(spec_step, runner_module):
-    model = _HeadModel(torch.zeros(6, dtype=torch.int32))
-    runner = _runner(runner_module, model)
-    batch = _batch((0.7,), top_ps=np.full(1, 0.9, dtype=np.float32))
-    runner._verify_head_sampling(batch)
-    assert runner._head_sampled
-    (temps, top_ps), *_ = model.sampling
-    assert temps == pytest.approx([0.7] * 6) and top_ps == pytest.approx([0.9] * 6)
-    assert runner._verify_head_ids(batch, torch.zeros(6, 4)) is not None
-    # top-k: not the head's draw (ATOM's sampler), and the head's rows go back to greedy
-    topk = _batch((0.7,), top_ks=np.full(1, 20, dtype=np.int32))
-    runner._verify_head_sampling(topk)
-    assert not runner._head_sampled and model.sampling[-1] is None
-    assert runner._verify_head_ids(topk, torch.zeros(6, 4)) is None
-
-
-def test_forced_acceptance(spec_step, runner_module):
-    """Under ``--spec-decode-acceptance-length`` the head serves greedy steps and the sampled steps it drew."""
-    model = _HeadModel(torch.zeros(6, dtype=torch.int32))
-    runner = _runner(runner_module, model, synthetic=(1.0, 1.0, 0.51, 0.0, 0.0))
-    assert runner._head_forced_mode() == "sample"
-    assert runner._verify_head_ids(_batch(), torch.zeros(6, 4)) is not None
-    sampled = _batch((1.0,))
-    runner._verify_head_sampling(sampled)
-    assert runner._head_sampled
-    assert runner._verify_head_ids(sampled, torch.zeros(6, 4)) is not None
-    model.verify_head_forced = ""
-    runner = _runner(runner_module, model, synthetic=(1.0,))
-    assert runner._verify_head_ids(_batch(), torch.zeros(6, 4)) is None
-
-
-def test_postprocess_takes_the_models_verdict_and_skips_the_broadcast(
-    monkeypatch, runner_module
-):
+@pytest.mark.parametrize("identical", [True, False])
+def test_postprocess_takes_the_heads_verdict(monkeypatch, runner_module, identical):
+    """A head-served step: the head's verdict; the ids' TP broadcast only when the head's ids may differ by rank."""
     bs = 2
     spec = SimpleNamespace(
         bonus_logits_indices=torch.tensor([5, 11]),
@@ -169,18 +118,15 @@ def test_postprocess_takes_the_models_verdict_and_skips_the_broadcast(
     class Stop(Exception):
         pass
 
-    model = _HeadModel(None)
-    model.verify_verdict = lambda s, ids, sampler: calls.append(ids) or (
-        out,
-        verdict,
-        nxt,
-    )
+    head = _StubHead()
+    head.ids_identical_on_tp_ranks = identical
+    head.verdict = lambda s, ids, sampler: calls.append(ids) or (out, verdict, nxt)
 
     def propose(batch, input_ids, hidden, next_token_ids, num_reject, anchors):
         assert next_token_ids is nxt and torch.equal(anchors, verdict[2])
         raise Stop
 
-    runner = _runner(runner_module, model)
+    runner = _runner(runner_module, SimpleNamespace(verify_head=head))
     runner.verify_token_ids = torch.arange(12, dtype=torch.int32)
     runner.tokenID_processor = SimpleNamespace(
         is_deferred_out=True,
@@ -206,7 +152,8 @@ def test_postprocess_takes_the_models_verdict_and_skips_the_broadcast(
         runner_module.ModelRunner.postprocess(
             runner, batch, None, None, None, None, True, hidden_states=None
         )
-    assert len(calls) == 1 and broadcasts == []
+    assert len(calls) == 1
+    assert len(broadcasts) == (0 if identical else 1)
 
 
 def test_the_runner_calls_a_models_decode_round(runner_module, monkeypatch):
@@ -235,7 +182,236 @@ def test_the_runner_calls_a_models_decode_round(runner_module, monkeypatch):
         assert runner.run_model("ids") == ("l", "h")
         runner._mark_staging_h2d_enqueued()
         assert calls == want
+
+
+# ---- the hi verify head's policy (``HiVerifyHead``)
+
+
+class _Hook:
+    """The hi hook's surface ``HiVerifyHead`` uses."""
+
+    def __init__(self, ids=None):
+        self.ids, self.sampling = ids, []
+
+    def set_head_sampling(self, temps=None, top_ps=None, rows=None):
+        self.sampling.append(
+            None
+            if temps is None
+            else (temps.tolist(), top_ps.tolist(), [int(n) for n in rows])
+        )
+        return True
+
+    def head_out(self):
+        return self.ids
+
+
+@pytest.fixture
+def spec_step(monkeypatch):
+    """A speculative verify step (``vh._spec``), exact acceptance, no context parallelism."""
+    spec = SimpleNamespace(num_spec_steps=5)
+    monkeypatch.setattr(vh, "_spec", lambda: spec)
+    monkeypatch.setattr(vh, "_limits", lambda: (1, 1e-10))
+    monkeypatch.setattr(vh, "_pcp_world_size", lambda: 1)
+    return spec
+
+
+_RUNNER = SimpleNamespace(rejection_sampler=object())
+
+
+def test_greedy_verify_takes_the_head_ids(spec_step):
+    ids = torch.arange(8, dtype=torch.int32)
+    hook = _Hook(ids)
+    head = vh.HiVerifyHead(hook)
+    batch = _batch()
+    head.before_forward(_RUNNER, batch)
+    assert not head.sampled and hook.sampling == []  # greedy: nothing staged
+    assert torch.equal(head.ids(_RUNNER, batch, torch.zeros(6, 4)), ids[:6])
+    for over in (
+        dict(any_logprobs=True),
+        dict(structured_requests={0: object()}),
+        dict(required_channel=object()),
+    ):
+        assert head.ids(_RUNNER, _batch(**over), torch.zeros(6, 4)) is None
     assert (
-        runner_module.ModelRunner.__new__(runner_module.ModelRunner)._decode_round()
+        head.ids(SimpleNamespace(rejection_sampler=None), batch, torch.zeros(6, 4))
         is None
+    )
+    assert head.ids(_RUNNER, None, torch.zeros(6, 4)) is None
+    # fewer ids than rows: the logits path
+    assert head.ids(_RUNNER, batch, torch.zeros(9, 4)) is None
+
+
+@pytest.mark.parametrize("why", ["not_a_verify", "relaxed", "pcp"])
+def test_the_logits_path(spec_step, monkeypatch, why):
+    head = vh.HiVerifyHead(_Hook(torch.arange(8, dtype=torch.int32)))
+    if why == "not_a_verify":
+        monkeypatch.setattr(vh, "_spec", lambda: None)
+    elif why == "relaxed":
+        monkeypatch.setattr(vh, "_limits", lambda: (10, 1e-10))
+    else:
+        monkeypatch.setattr(vh, "_pcp_world_size", lambda: 2)
+    assert head.ids(_RUNNER, _batch(), torch.zeros(6, 4)) is None
+
+
+def test_a_replay_reads_the_captured_buffer(spec_step):
+    ids = torch.arange(12, dtype=torch.int32)
+    hook = _Hook(ids)
+    head = vh.HiVerifyHead(hook)
+    head.captured((1, 6))
+    hook.ids = None
+    head.captured((2, 6))  # the head did not run in that graph
+    assert torch.equal(head.ids(_RUNNER, _batch(), torch.zeros(6, 4), (1, 6)), ids[:6])
+    assert head.ids(_RUNNER, _batch(), torch.zeros(6, 4), (2, 6)) is None
+    assert head.ids(_RUNNER, _batch(), torch.zeros(6, 4), (4, 6)) is None
+
+
+def test_sampled_verify(spec_step):
+    hook = _Hook(torch.zeros(12, dtype=torch.int32))
+    head = vh.HiVerifyHead(hook)
+    batch = _batch(
+        (0.7, 0.5),
+        top_ps=np.asarray([0.9, 0.8], dtype=np.float32),
+        num_scheduled_tokens=np.asarray([6, 6], dtype=np.int32),
+    )
+    head.before_forward(_RUNNER, batch)
+    assert head.sampled and head.rows_sampling
+    (temps, top_ps, rows), *_ = hook.sampling
+    assert temps == pytest.approx([0.7, 0.5]) and top_ps == pytest.approx([0.9, 0.8])
+    assert rows == [6, 6]
+    assert head.ids(_RUNNER, batch, torch.zeros(12, 4)) is not None
+    # top-k: not the head's draw (ATOM's sampler), and the head's rows go back to greedy
+    topk = _batch((0.7,), top_ks=np.full(1, 20, dtype=np.int32))
+    head.before_forward(_RUNNER, topk)
+    assert not head.sampled and not head.rows_sampling and hook.sampling[-1] is None
+    assert head.ids(_RUNNER, topk, torch.zeros(6, 4)) is None
+    # a greedy step after it: rows greedy already, nothing staged
+    head.before_forward(_RUNNER, _batch())
+    assert len(hook.sampling) == 2
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(any_logprobs=True),
+        dict(needs_independent_noise=np.ones(1, dtype=bool)),
+        dict(temperatures=np.asarray([1e-12], dtype=np.float32)),
+    ],
+)
+def test_a_sampled_step_the_head_does_not_draw(spec_step, over):
+    hook = _Hook(torch.zeros(6, dtype=torch.int32))
+    head = vh.HiVerifyHead(hook)
+    head.before_forward(_RUNNER, _batch((0.7,), **over))
+    assert not head.sampled and hook.sampling == []
+
+
+def test_a_mixed_step_is_not_served(spec_step):
+    """Some requests greedy, some sampled: ATOM's sampler (the head draws only all-sampled steps)."""
+    head = vh.HiVerifyHead(_Hook(torch.zeros(12, dtype=torch.int32)))
+    batch = _batch((0.0, 0.7), num_scheduled_tokens=np.asarray([6, 6], dtype=np.int32))
+    head.before_forward(_RUNNER, batch)
+    assert not head.sampled
+    assert head.ids(_RUNNER, batch, torch.zeros(12, 4)) is None
+
+
+def test_forced_acceptance_serves_as_without_it(spec_step):
+    """Under ``--spec-decode-acceptance-length`` the head serves greedy steps and the sampled steps it drew (the
+    synthetic schedule decides only acceptance)."""
+    runner = SimpleNamespace(
+        rejection_sampler=SimpleNamespace(synthetic_acceptance_rates=(1.0, 0.5, 0.0))
+    )
+    head = vh.HiVerifyHead(_Hook(torch.zeros(6, dtype=torch.int32)))
+    assert head.ids(runner, _batch(), torch.zeros(6, 4)) is not None
+    sampled = _batch((1.0,))
+    head.before_forward(runner, sampled)
+    assert head.sampled
+    assert head.ids(runner, sampled, torch.zeros(6, 4)) is not None
+
+
+def test_a_capture_stages_nothing(spec_step):
+    """A graph capture's dummy step: ``set_head_sampling`` stages nothing (False), so the head's ids are not served
+    as samples."""
+    hook = _Hook(torch.zeros(6, dtype=torch.int32))
+    hook.set_head_sampling = lambda *a: False
+    head = vh.HiVerifyHead(hook)
+    sampled = _batch((1.0,))
+    head.before_forward(_RUNNER, sampled)
+    assert not head.sampled and not head.rows_sampling
+    assert head.ids(_RUNNER, sampled, torch.zeros(6, 4)) is None
+
+
+# ---- the head's sampling rows (``HiLayers.set_head_sampling``)
+
+
+class _Event:
+    def synchronize(self):
+        pass
+
+    def record(self):
+        pass
+
+
+def _sampling_hook():
+    """``HiLayers`` with only ``set_head_sampling``'s state, as ``_head_tables`` lays it out: two launches of 6 rows
+    (a 2-request split) and one of 12 (a wide head), each block its rows' (T, top_p) then the seed's two words.
+    """
+    with (
+        atom_without_aiter() as load
+    ):  # (Triton stubbed with AITER where it is not installed)
+        hr = load("atom.models.deepseek_v41.mono.hi_runner")
+    m = object.__new__(hr.HiLayers)
+    m.par_blocks, off = {}, 0
+    for key, (r0, n) in {(12, 0): (0, 6), (12, 1): (6, 6), (24, 0): (0, 12)}.items():
+        m.par_blocks[key] = (off, r0, n)
+        off += 2 * n + 2
+    m.par_last = np.zeros(off, dtype=np.int32)
+    for o, _, n in m.par_blocks.values():
+        m.par_last[o + 2 * n : o + 2 * n + 2] = (7, 9)  # (the seed words)
+    m.par_rows = 12
+    m.head_par = torch.from_numpy(m.par_last.copy())
+    m.par_ring = [torch.zeros(off, dtype=torch.int32) for _ in range(4)]
+    m.par_events = [_Event() for _ in range(4)]
+    m.par_next = 0
+    m.par_row_buf = np.zeros((m.par_rows, 2), dtype=np.float32)
+    m.par_work = m.par_last.copy()
+    m.par_work_f = m.par_work.view(np.float32)
+    m.par_ring_np = [t.numpy() for t in m.par_ring]
+    return m
+
+
+def test_set_head_sampling_fills_persistent_buffers_in_place(monkeypatch):
+    """Request i's (T, top_p) on its rows, into the same host buffers every step (nothing allocated); one staged
+    copy when they change, none when they do not; greedy (None) zeroes the rows and keeps the seed words.
+    """
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    m = _sampling_hook()
+    bufs = (m.par_row_buf, m.par_work, m.par_last, *m.par_ring_np)
+    temps = np.asarray([0.7, 0.5], dtype=np.float32)
+    top_ps = np.asarray([0.9, 1.0], dtype=np.float32)
+    assert m.set_head_sampling(temps, top_ps, np.asarray([6, 6], dtype=np.int32))
+    par = m.head_par.numpy().view(np.float32)
+    for o, r0, n in m.par_blocks.values():
+        rows = par[o : o + 2 * n].reshape(n, 2)
+        want_t = [0.7 if r < 6 else 0.5 for r in range(r0, r0 + n)]
+        want_p = [0.9 if r < 6 else 1.0 for r in range(r0, r0 + n)]
+        assert rows[:, 0].tolist() == pytest.approx(want_t)
+        assert rows[:, 1].tolist() == pytest.approx(want_p)
+        assert m.head_par[o + 2 * n : o + 2 * n + 2].tolist() == [7, 9]
+    assert m.par_next == 1
+    # unchanged: nothing staged
+    assert m.set_head_sampling(temps, top_ps, np.asarray([6, 6], dtype=np.int32))
+    assert m.par_next == 1
+    # one request of 3 rows: the rows past it greedy
+    assert m.set_head_sampling(temps[:1], top_ps[:1], np.asarray([3], dtype=np.int32))
+    o, r0, n = m.par_blocks[24, 0]
+    rows = m.head_par.numpy().view(np.float32)[o : o + 2 * n].reshape(n, 2)
+    assert rows[:, 0].tolist() == pytest.approx([0.7] * 3 + [0.0] * 9)
+    assert m.par_next == 2
+    # greedy
+    assert m.set_head_sampling(None, None, None)
+    for o, _, n in m.par_blocks.values():
+        assert not m.head_par[o : o + 2 * n].any()
+        assert m.head_par[o + 2 * n : o + 2 * n + 2].tolist() == [7, 9]
+    assert all(
+        a is b
+        for a, b in zip(bufs, (m.par_row_buf, m.par_work, m.par_last, *m.par_ring_np))
     )

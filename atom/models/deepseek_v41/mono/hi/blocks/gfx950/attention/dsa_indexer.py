@@ -87,7 +87,6 @@ from ....device.gfx950.ops import (
     rope_sin,
     CM_DEV,
     bf2_f32,
-    bf16_pair,
     bf16_round,
     block_excl_scan,
     butterfly,
@@ -175,7 +174,7 @@ class _Plan:
     bbf: bool = False  # ``Indexer(bmax_bf16=)``: the block maxima a BF16 channel (two blocks a pair; bf16-exact values)
     f32: bool = False  # ``Indexer(scores_f32=)``: q . k, relu(s) w and the head sum unrounded, an F32 scores channel
     # ``Indexer(items=)`` (with ``per``): the persistent tasks shared among the requests in proportion to their tiles
-    # (``plan.items``: request b's per[b] tasks a row group, task c taking tiles c, c + per[b], ..), instead
+    # (request b's per[b] tasks a row group, task c taking tiles c, c + per[b], ..), instead
     # of ``per`` a (request, row group) whatever its length; a ``Program.dyn_rows`` build's dead requests get none
     items: bool = False
 
@@ -560,28 +559,10 @@ def _tile_compute(k, p: _Plan, b, j0, pos, st) -> None:
             _score_out(k, p, b, j0, g, s, pos, st, tot)
 
 
-def _bf16x2(a, b):
-    """bf16(a), bf16(b) as f32 (round to nearest even, as ``bf16_round``) from one paired conversion."""
-    w = bf16_pair(a, b).bitcast(fx.Int32)
-    return (w << 16).bitcast(fx.Float32), (w & fx.Int32(-65536)).bitcast(fx.Float32)
-
-
-def _epi_lean(acc, wt) -> list:
-    """``_tile_compute``'s per-head values bf16(relu(bf16(s)) w), the roundings in pairs (one conversion for two
-    values): the same values, bit for bit (ReLU as there: a select, -0 and NaN to +0)."""
-    zero = fx.Float32(0.0)
-    out = []
-    for i in (0, 2):
-        s0, s1 = _bf16x2(acc[i], acc[i + 1])
-        s0, s1 = (s0 > zero).select(s0, zero), (s1 > zero).select(s1, zero)
-        out += list(_bf16x2(s0 * fx.Float32(wt[i]), s1 * fx.Float32(wt[i + 1])))
-    return out
-
-
 def _put_nb(k, a, word, words, ok, nbytes) -> None:
     """``words`` at word ``word`` of region ``a`` where ``ok``; elsewhere the store goes past the region's buffer range
     and is dropped: no branch (a DPP reduction feeding a store in a lane-conditional branch may be sunk into it by
-    LLVM and read stale lanes: I14 / I15)."""
+    LLVM and read stale lanes)."""
     note(a.region, a.space, "put")
     off = ok.select(word, fx.Int32(OOB_WORD))
     bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), rsrc(a.value, nbytes), off, cache_modifier=CM_DEV)
@@ -914,7 +895,7 @@ class Indexer(Block):
             raise ValueError(f"Indexer {name}: n_max a multiple of 4, <= cache_len ({n_max}, {cache_len})")
         self.name, self.ratio, self.n_max, self.pos, self.rope = name, ratio, n_max, pos, rope
         # f32 scores (module docstring): an engine's arithmetic (ATOM's), a numerics choice, not a
-        # searched lever; the bf16 scores' shortcuts (the lean epilogue's paired roundings, packed lists, bf16 maxima)
+        # schedule knob; the bf16 scores' shortcuts (the lean epilogue's paired roundings, packed lists, bf16 maxima)
         # do not apply to them
         if scores_f32 and (lean_epi or topk_packed or bmax_bf16):
             raise ValueError(f"Indexer {name}: scores_f32 with lean_epi / topk_packed / bmax_bf16 (bf16 scores only)")
@@ -933,7 +914,7 @@ class Indexer(Block):
         # tasks), the rest the persistent ones: two score stages, each with no live tasks outside its lengths
         self.pcap = pcap if persist and live else 0
         self.pnarrow = pnarrow
-        # ``rows_long``: the rows a score task for long requests (I15: 6 rows a task, the keys read
+        # ``rows_long``: the rows a score task for long requests (6 rows a task, the keys read
         # once a request, saves 1.4-4.6 us a source layer at 128K and costs ~7 us at 1K). Two tile stages (no
         # ``persist``): requests past ``rcap`` positions at ``rows_long`` rows a task, the rest at the block's; with
         # ``persist`` + ``pcap`` the persistent (long) stage takes ``rows_long`` (its cap ``pcap``). 0: the block's
@@ -949,7 +930,7 @@ class Indexer(Block):
         # a compact reader's candidate list (``_clist``) from the row's live bitmap words only (its bound: the words
         # past it are 0) and its set bits only (a loop over each word's set bits): O(the row's blocks), not O(n_max)
         self.clist_sparse = clist_sparse
-        self.cmask_lds = cmask_lds  # layer 20's bitmap words built in LDS (``_cmask_bits``), not searched a word
+        self.cmask_lds = cmask_lds  # layer 20's bitmap words built in LDS (``_cmask_bits``), not stored a word
         # positions split across ``split`` TP ranks (persistent score tasks, full-width sources): each rank scores and
         # ranks its share, the TopKs merge the ranks' answers (``TopK(split=)``: the same ids)
         self.split = split if split > 1 else 0
@@ -997,7 +978,7 @@ class Indexer(Block):
         # scores an F32 channel and TopK's f32 mode
         self.scores = Channel(f"{name}.scores", width, Fmt.F32 if scores_f32 else Fmt.BF16)
         # TopK's segment: one level up to ONE_LEVEL positions (a level's hand-off costs more than the larger sort);
-        # compact: CSEG (4 segments of the 16384 columns, then one merge: I8)
+        # compact: CSEG (4 segments of the 16384 columns, then one merge)
         seg = seg or (CSEG if self.compact else width if width <= ONE_LEVEL else SEG)
         # (split + pcap: the requests the tile stage scores are whole on every rank, their TopKs too: at most a rank's
         # columns, a multiple of the shares' unit)
@@ -1034,7 +1015,7 @@ class Indexer(Block):
         return self.q4 is None and self.kfp4 or self.qauto and sc.spec <= 8
 
     def plan(self, sc: Scenario) -> _Plan:
-        # defaults (I4, S3): 2 rows x 128 positions a task up to 8 rows a request (1 row without
+        # defaults: 2 rows x 128 positions a task up to 8 rows a request (1 row without
         # qprep), 4 x 256 above
         g = self.g or (4 if sc.spec > 8 else 1 if self.raw(sc) else 2)
         g = 1 if self.compact else g  # compact: a row a task (each row its own candidate positions)
@@ -1042,9 +1023,9 @@ class Indexer(Block):
             raise ValueError(f"Indexer {self.name}: rows a task x heads at most {THREADS} (g {g}, {HEADS} heads)")
         if self.nt:
             nt = self.nt
-        elif self.compact:  # 256 columns a task, 64 at 1 row (I9)
+        elif self.compact:  # 256 columns a task, 64 at 1 row
             nt = 4 if sc.spec > 1 else 1
-        else:  # long contexts: 256 positions a task (I9)
+        else:  # long contexts: 256 positions a task
             nt = 4 if self.n_max >= WIDE else 2 if sc.spec > 8 else 1
         q4 = "" if self.raw(sc) or self.q4 is None else self.q4.name
         return _Plan(self.name, sc.rows, sc.spec, sc.batch, self.ratio, self.n_max, self.cache_len,
@@ -1146,27 +1127,6 @@ class Indexer(Block):
         out = dict(self.wq_b.pack(SimpleNamespace(linears={self.wq_b_w: m})))
         out[self.wproj] = layer["attn.indexer.weights_proj.weight"].to(torch.bfloat16).contiguous()
         return out
-
-
-def pack_keys_fp4(keys: torch.Tensor) -> torch.Tensor:
-    """FP4-QAT'd index keys (bf16 [..., 128]) -> the FP4 cache layout int32 [..., KW] (``_fp4_pack``'s rule: scale
-    2^(floor(log2 max |group|) - 2), exact codes)."""
-    shape = keys.shape[:-1]
-    g = keys.reshape(-1, 4, 32).float()
-    am = g.abs().amax(-1)
-    eb = ((am.view(torch.int32) >> 23) & 255).long()
-    e8 = torch.where(eb == 0, torch.full_like(eb, 127), (eb - 2).clamp_min(1))
-    q = g * torch.exp2(127 - e8.double()).float().unsqueeze(-1)
-    levels = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=keys.device)
-    code = (q.abs().unsqueeze(-1) - levels).abs().argmin(-1)
-    assert torch.equal(levels[code], q.abs()), "keys not FP4-QAT'd values"
-    code = code | (torch.signbit(q).long() << 3)
-    words = (code.view(-1, 4, 4, 8) << (4 * torch.arange(8, device=keys.device))).sum(-1)  # [n, group, word]
-    out = torch.zeros(g.shape[0], KW, dtype=torch.int64, device=keys.device)
-    out[:, :16] = words.view(-1, 16)
-    out[:, 16] = (e8 << (8 * torch.arange(4, device=keys.device))).sum(-1)
-    out = torch.where(out >= 2**31, out - 2**32, out).int()
-    return out.view(*shape, KW)
 
 
 def bounds(pos: torch.Tensor, spec: int, ratio: int) -> torch.Tensor:

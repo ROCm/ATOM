@@ -148,7 +148,7 @@ def check_rings():
         geo = (w.ring_start0, w.slot_rows, w.ring_slots, w.num_slots, 1 << 20)
         before = w.pool.clone()
         ml._import_rings_kernel[(len(mf), 128)](w.pool, positions, batch, slots, rings, ids, pos, bounds, *geo, rows,
-                                                pos, pos, pos, WIN=128, DIM=w.dim, RB=8)  # fmt: skip
+                                                WIN=128, DIM=w.dim, RB=8)  # fmt: skip
         ok = int(pos) == ctx
         for m, layer in enumerate(mf):
             want = torch.zeros(128, w.dim).bfloat16()
@@ -329,7 +329,6 @@ def check_fused(engram: bool = False):
         "pre": torch.zeros(rows, 4), "post": torch.zeros(rows, 4), "comb": torch.zeros(rows, 16),
         "req": torch.randint(-9, 9, (ml.REQ_WORDS,), dtype=torch.int32),
     }  # fmt: skip
-    base["bad"] = torch.zeros(1, dtype=torch.int32)
     if (
         engram
     ):  # ATOM's staged rows (views of a wider buffer), the kv launch's row buffers, the cursor, hist
@@ -360,9 +359,6 @@ def check_fused(engram: bool = False):
         g = torch.Generator().manual_seed(ctx)
         writes = {"rings": torch.randn(base["rings"].shape, generator=g)}
 
-        def ring_copy(w):
-            return [w["pos"]] * 2 + [w["bad"]]
-
         def hi_writes(w):  # the layers' writes between the import and the export
             for k, v in writes.items():
                 w[k].copy_(v)
@@ -372,8 +368,7 @@ def check_fused(engram: bool = False):
         w["step"].add_(1)
         w["h_in"][:rows].copy_(w["hidden"].view(rows, 1, -1).expand(rows, 4, hid))
         ml._import_rings_kernel[(len(mf), win)](w["pool"], positions, batch, slot_map, w["rings"], ids, w["pos"],
-                                                w["bounds"], *geo, rows, *ring_copy(w), WIN=win, DIM=dim, RB=8,
-                                                RING8=0)  # fmt: skip
+                                                w["bounds"], *geo, rows, WIN=win, DIM=dim, RB=8)  # fmt: skip
         ml._req_words_kernel[(1,)](positions, batch, slot_map, num_slots, 1 << 20, w["req"], w["pos"], rows, NB=1, BM=1,
                                    RQP=8)  # fmt: skip
         hi_writes(w)
@@ -414,9 +409,9 @@ def check_fused(engram: bool = False):
             eflat, ek = [d, 0, d, d, 0, d, d, 0, d], dict(NE0=0, NE1=0, EHIST=0)
         grid = len(mf) * win + rows + ek["NE0"] + ek["NE1"] + ek["EHIST"]
         ml._begin_step_kernel[(grid,)](w["pool"], positions, batch, slot_map, w["rings"], ids, w["pos"], w["bounds"], *geo,
-                                       rows, *ring_copy(w), w["hidden"], w["hidden"].stride(0), w["h_in"], w["step"],
+                                       rows, w["hidden"], w["hidden"].stride(0), w["h_in"], w["step"],
                                        w["req"], *eflat, w["pos"], NMF=len(mf), WIN=win, DIM=dim, RB=8,
-                                       HIDDEN=hid, BLOCK=1024, NHC=4, **ek, RING8=0, RQP=8)  # fmt: skip
+                                       HIDDEN=hid, BLOCK=1024, NHC=4, **ek, RQP=8)  # fmt: skip
         hi_writes(w)
         taps = [w[f"{k}{t}"] for t in range(3) for k in ("r_a", "aux")]
         ml._end_step_kernel[((len(mf) + 3 + 1) * rows,)](
@@ -488,7 +483,7 @@ def check_incremental(configs=((16, 7), (128, 64), (5, 300)), control: bool = Tr
         "hidden": torch.randn(R, hid).bfloat16(), "h_in": torch.zeros(8, 4, hid).bfloat16(),
         "step": torch.tensor([5], dtype=torch.int32), "gate": torch.rand(R, 24),
         "pre": torch.zeros(R, 4), "post": torch.zeros(R, 4), "comb": torch.zeros(R, 16),
-        "bad": torch.zeros(1, dtype=torch.int32), "imp": torch.full((ml.IMP_WORDS,), -1, dtype=torch.int32),
+        "imp": torch.full((ml.IMP_WORDS,), -1, dtype=torch.int32),
         "req": torch.zeros(ml.REQ_WORDS, dtype=torch.int32),
     }  # fmt: skip
     for t in range(3):
@@ -526,10 +521,10 @@ def check_incremental(configs=((16, 7), (128, 64), (5, 300)), control: bool = Tr
             d = w["pos"]
             rpl = rp if inc else win
             ml._begin_step_kernel[(len(mf) * rpl + R,)](
-                w["pool"], positions, batch, slot_map, w["rings"], ids, w["pos"], w["bounds"], *geo, R, d, d, w["bad"],
+                w["pool"], positions, batch, slot_map, w["rings"], ids, w["pos"], w["bounds"], *geo, R,
                 w["hidden"], w["hidden"].stride(0), w["h_in"], w["step"], w["req"],
                 d, 0, d, d, 0, d, d, 0, d, w["imp"], NMF=len(mf), WIN=win, DIM=dim, RB=8, HIDDEN=hid, BLOCK=1024,
-                NHC=4, NE0=0, NE1=0, EHIST=0, RING8=0, INCR=inc, RP=rpl, RQP=8,
+                NHC=4, NE0=0, NE1=0, EHIST=0, INCR=inc, RP=rpl, RQP=8,
             )  # fmt: skip
         d_begin = differ(mono, worlds)
         for w in worlds:
@@ -663,7 +658,6 @@ class _BatchWorld:
         w["step"] = torch.tensor([5], dtype=torch.int32)
         w["gate"], w["pre"], w["post"], w["comb"] = rnd(rows, 24), torch.zeros(rows, 4), torch.zeros(rows, 4), \
             torch.zeros(rows, 16)  # fmt: skip
-        w["bad"] = torch.zeros(1, dtype=torch.int32)
         w["imp"] = torch.full((bm * 4,), -1, dtype=torch.int32)
         for t in range(3):
             w[f"r_a{t}"], w[f"aux{t}"] = (
@@ -717,7 +711,7 @@ class _BatchWorld:
         req = torch.zeros(ml.REQ_WORDS, dtype=torch.int32) if b0 or r0 else w["req"]
         ml._begin_step_kernel[(nb * len(self.mf) * rpl + rows,)](
             w["pool"], positions, batch, slot_map, w["rings"][:, b0:], torch.tensor(self.mf, dtype=torch.int32),
-            w["pos"][b0:], w["bounds"].view(-1)[r0:], *self.geo(), rows, d, d, w["bad"], w["hidden"][r0:],
+            w["pos"][b0:], w["bounds"].view(-1)[r0:], *self.geo(), rows, w["hidden"][r0:],
             w["hidden"].stride(0), w["h_in"][r0:], w["step"], req, d, 0, d, d, 0, d, d, 0, d,
             w["imp"][4 * b0 :], NMF=len(self.mf), WIN=self.win, DIM=self.dim, RB=self.RB, HIDDEN=self.hid, BLOCK=1024,
             NHC=4, NE0=0, NE1=0, EHIST=0, INCR=int(incr), RP=rpl, NB=nb, BM=self.bm,
@@ -742,7 +736,7 @@ class _BatchWorld:
         w["h_in"][:rows].copy_(w["hidden"].view(rows, 1, -1).expand(rows, 4, self.hid))
         ml._import_rings_kernel[(len(self.mf), self.win, nb)](
             w["pool"], positions, batch, slot_map, w["rings"], ids, w["pos"], w["bounds"], *self.geo(), rows,
-            w["pos"], w["pos"], w["bad"], WIN=self.win, DIM=self.dim, RB=self.RB, NB=nb, BM=self.bm)  # fmt: skip
+            WIN=self.win, DIM=self.dim, RB=self.RB, NB=nb, BM=self.bm)  # fmt: skip
         ml._req_words_kernel[(nb,)](positions, batch, slot_map, self.num_slots, 1 << 20, w["req"], w["pos"], rows,
                                     NB=nb, BM=self.bm, RQP=triton.next_power_of_2(rq))  # fmt: skip
         return rq

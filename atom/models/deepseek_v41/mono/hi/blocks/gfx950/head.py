@@ -94,7 +94,7 @@ CUs), CTA c the row groups [c G / tasks, (c + 1) G / tasks) of the rank's G, eac
 steps, the CTA's parts spread evenly over its 8 waves in (row group, part) order. A wave streams its parts (each into
 a fresh fp32 accumulator, K steps in order) and stores each part's sums into the LDS; then wave w sums row groups w,
 w + 8, .. of the CTA over their parts in part order and takes their top-1 (the same epilogue, the same keys). Where
-G / 8 row groups of a rank do not fill whole rounds of the grid (MiniMax-M3: 3126 over 256 CTAs, 1.53 tasks a CTA
+G / 8 row groups of a rank do not fill whole rounds of the grid (e.g. 3126 over 256 CTAs, 1.53 tasks a CTA
 with whole row groups a wave) a wave's work is at most ceil(ceil(G / tasks) S / 8) parts instead of two tasks. The
 logits are the same products summed in another order (S partial sums added in order): another rounding than the
 unbalanced head's (a bf16 key can differ on a near-tie)."""
@@ -109,7 +109,7 @@ import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from ..base import Block, Channel, Fmt, Search
+from ..base import Block, Channel, Fmt
 from .linear import _land_batch, _try_batch
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import gemv
@@ -290,18 +290,6 @@ class _Plan:
 class ArgmaxHead(Block):
     """Greedy LM head with a top-1 epilogue and the exact TP argmax (module docstring). ``n``: this rank's vocab
     rows (a multiple of 16)."""
-
-    # what the tuner may change (``Block.SEARCH``): the stream's depth and layout; the ids are exact either way
-    SEARCH = {
-        "prefetch": Search((16, 8, 24, 32), "bitwise", "knob", "the 27B / GPT-OSS heads: stream depth"),
-        "lead": Search((4, 2, 8), "bitwise", "knob", "the 27B / GPT-OSS heads"),
-        "layout": Search(
-            ("packed", "kmajor", "wave", "rows"),
-            "bitwise",
-            "shape",
-            "27B: the head's shape 0.82x (the tune measurements)",
-        ),
-    }
 
     def __init__(self, name: str, x: Channel, n: int, key: str = "bf16", layout: str = "packed",
                  prefetch: int = 16, vals: bool = True, out: Channel | None = None, lead: int = 4,

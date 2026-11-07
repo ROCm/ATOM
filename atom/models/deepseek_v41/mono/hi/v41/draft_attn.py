@@ -228,7 +228,7 @@ class MLABlockAttn(Block):
         self.name, self.q, self.kvn, self.out, self.heads = name, q, kvn, out, heads
         self.pos, self.rope, self.sink, self.ring, self.geo, self.slot = pos, rope, sink, ring, geo, slot
         # the output's inverse RoPE quantized from f32 (``MLAWindowAttn(unrope_f32=)``: ATOM's order, the draft's K2a
-        # irq path); False: bf16-rounded first (the official order). A numerics choice, not searched
+        # irq path); False: bf16-rounded first (the official order). A numerics choice, not a schedule knob
         self.unrope_f32 = unrope_f32
 
     def plan(self, sc: Scenario) -> _BPlan:

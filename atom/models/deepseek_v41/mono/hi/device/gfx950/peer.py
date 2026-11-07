@@ -53,7 +53,7 @@ def to_rank(k, region: str, dst) -> Addr:
 
 
 # ------------------------------------------------------------------ TP partials (the MoE's; the producer pushes, a
-# consumer sums: the peer measurements / -moe M17)
+# consumer sums)
 #
 # A partial region holds a [rows, width] row-major partial per slot. ``fmt`` "bf16": a pair = two packed bf16 values
 # (pair (row * width + col) / 2); "f32": two planes, values 0-1 then 2-3 of every 4-element item (pair
@@ -70,7 +70,7 @@ def partial_pairs(fmt: str, rows: int, width: int) -> int:
 
 def push_partial(k, region: str, fmt: str, e, vals4, dsts=None) -> None:
     """This rank's partial of elements ``e .. e + 3`` (``e`` a multiple of 4) into every rank's slot (``dsts``: only
-    these ranks, e.g. one a task: a CTA's remote puts are the limit, P5)."""
+    these ranks, e.g. one a task: a CTA's remote puts are the limit)."""
     from . import mailbox as mb
 
     half = k.peer_pairs[region] // 2  # f32: the second plane's first pair
@@ -105,10 +105,10 @@ def sum_partials(k, region: str, fmt: str, e, tp: int, tag=None) -> list:
     return acc
 
 
-# ---- two-shot TP sum (reduce-scatter, then all-gather; P11). Rank q owns columns q * width / tp ..
+# ---- two-shot TP sum (reduce-scatter, then all-gather). Rank q owns columns q * width / tp ..
 # + width / tp - 1 of every row. Shot 1 (``push_rs``): each rank pushes its fp32 partial of those columns to q only,
 # region ``rs`` (a slot a source rank, [rows, width / tp] in the "f32" two-plane layout, or packed: "f32p", a lane's
-# tagged quad of 3 values + a pair, or "f32q", 3 values + tags a 16 B quad across lanes; P16). The
+# tagged quad of 3 values + a pair, or "f32q", 3 values + tags a 16 B quad across lanes). The
 # owner sums them in rank order (``sum_partials(k, rs, fmt, el, tp)``: the one-shot sum's bits, any format) and shot 2
 # (``push_partial(k, ag, fmt, el, sums)``) puts the sums into every rank's region ``ag`` (a slot an owner; fmt "bf16"
 # when the consumer rounds the sum to bf16 anyway: half the bytes, the same bits). ``read_ag`` reads element e from its
@@ -164,7 +164,7 @@ def push_rs(k, region: str, e, vals4, width: int, fmt: str = "f32", two_owners: 
 # q * width / tp .. of a row-major [rows, width] tensor and puts them into every rank's slot q; a reader takes any
 # element from its owner's slot (from slot (parity, 0): ``from_rank(k, region, 0)``). A slot is tiled
 # [tile][row][``tile`` pairs] so a producer task's tile (``tile`` pairs of every row) is one contiguous run of puts
-# (P3: a store instruction's peer stores contiguous).
+# (a store instruction's peer stores contiguous).
 
 
 @traced
@@ -207,11 +207,11 @@ def read_ag(k, region: str, e, width: int, fmt: str = "f32", tag=None) -> list:
     return [w.bitcast(fx.Float32) for w in got[0] + got[1]]
 
 
-# ---- two-field partials, 3 values + a tag in every 16 B (M19): a thread's 4 elements of two fp32
+# ---- two-field partials, 3 values + a tag in every 16 B: a thread's 4 elements of two fp32
 # fields (a, b) are 3 dwordx4 stores [a0 a1 a2 tag] [a3 b0 b1 tag] [b2 b3 0 tag], 12 B an element instead of two tagged
-# pairs' 16 B, in 3 planes (quad v of item j at word (v * items + j) * 4: each store instruction of a wave contiguous,
-# P3). A 16 B store reaches a peer as two 8 B halves that can land apart (measured: words 0-1 stale
-# with words 2-3 current, P9), so each half carries the tag's low 16 bits (``_pack3``).
+# pairs' 16 B, in 3 planes (quad v of item j at word (v * items + j) * 4: each store instruction of a wave
+# contiguous). A 16 B store reaches a peer as two 8 B halves that can land apart (measured: words 0-1 stale
+# with words 2-3 current), so each half carries the tag's low 16 bits (``_pack3``).
 
 
 def _pack3(x, y, z, tag):
@@ -233,21 +233,21 @@ def _tags_ok(w, tag):
     return ((w[1] & 0xFFFF) == t) & ((w[2] & 0xFFFF) == t)
 
 
-# ---- "f32q": one fp32 field, 3 values + a tag a 16 B quad (5.5 B a value, f32 pairs' 8; P9)
+# ---- "f32q": one fp32 field, 3 values + a tag a 16 B quad (5.5 B a value, f32 pairs' 8)
 #
 # A producer's 4 lanes 4m .. 4m + 3 must hold one 16-element group's elements in order (lane j: 4 j .. 4 j + 3, the
 # group 16-aligned: Linear's epilogue items and the MoE combine are). Group G's 16 values:
 #   plane A, quad 4 G + j (lane j): j 0: (0 1 2), j 1: (3 4 5), j 2: (6 7 8), j 3: (12 13 14)
 #   plane B, quad G (lane 2): (9 10 11);  plane C, pair G (lane 3): 15
 # lane j > 0 takes elements 4 j - 2, 4 j - 1 from lane j - 1 (ds_bpermute; every lane of a group calls the push).
-# Each store instruction of a wave stays contiguous (P3). A reader's 4 elements are 2 loads: quad A (4 G + j) and the
+# Each store instruction of a wave stays contiguous. A reader's 4 elements are 2 loads: quad A (4 G + j) and the
 # next one (j 0, 1: A 4 G + j + 1; j 2: B G; j 3: C G).
 
 
 # ---- "f32p": a lane's own 4 fp32 values as a ``_pack3`` quad (values 0-2, a tag in each 8 B half) and a (value 3,
 # tag) pair: 6 B a value (f32 pairs' 8, f32q's 5.5), no lane exchange and no lane-dependent store (the peer measurements
 # P16). Plane A: item i's quad at word 4 i; plane C: its pair at pair 2 items + i. Each store instruction of a wave
-# stays contiguous (P3); a reader's 4 elements are one 16 B and one 8 B load.
+# stays contiguous; a reader's 4 elements are one 16 B and one 8 B load.
 
 
 def partial3_pairs(rows: int, width: int) -> int:
@@ -259,23 +259,6 @@ def _quad_word(k, region, e, v):
     """Word of quad ``v`` of the item holding element ``e`` (planes of ``items`` quads)."""
     items = k.peer_pairs[region] * 2 // 12
     return (v * items + e // 4) * 4
-
-
-def push_partial3(k, region: str, e, a4, b4, dsts=None) -> None:
-    """Elements ``e .. e + 3`` (``e`` a multiple of 4) of this rank's two fp32 fields into every rank's slot (or
-    ``dsts``')."""
-    from . import buffer_ops as bo
-    from .ops import CM_SYS, rsrc
-
-    vals = [fx.Float32(v).bitcast(fx.Int32) for v in list(a4) + list(b4)] + [fx.Int32(0)]
-    quads = [_pack3(*vals[3 * v : 3 * v + 3], k.tag) for v in range(3)]
-    dl = list(range(k.tp)) if dsts is None else list(dsts)
-    for i, dst in enumerate(dl):
-        a = to_rank(k, region, dst)
-        note(a.region, a.space, "put")
-        for v in range(3):
-            bo.buffer_store(fx.Vector.from_elements(quads[v], fx.Int32), rsrc(a.value), _quad_word(k, region, e, v),
-                            cache_modifier=CM_SYS)  # fmt: skip
 
 
 def sum_partials3(k, region: str, e, tp: int, tag=None):
