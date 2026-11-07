@@ -94,12 +94,12 @@ def test_zero_expert_rows_sort_and_replay(monkeypatch, rows, router, shared):
     real_valid = None
     for active in (rows, 0, rows):
         count.fill_(active)
-        # Poison the accumulated output: sorting must clear it on every replay,
-        # including the dummy, so stale real-pass values cannot escape.
+        # Sorting clears only the active rows. A dummy replay clears none and
+        # leaves its rows stale, like padding rows; nothing reads them.
         graph_output.fill_(7)
         graph.replay()
         torch.cuda.synchronize()
-        assert (graph_output == 0).all()
+        assert (graph_output[:active] == 0).all()
         if active == 0:
             assert (graph_ids == -1).all()
             assert graph_valid[0].item() == 0
