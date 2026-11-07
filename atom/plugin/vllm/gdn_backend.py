@@ -20,7 +20,8 @@ from vllm.v1.attention.backends.registry import (
     MambaAttentionBackendEnum,
     register_backend,
 )
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID, mamba_get_block_table_tensor
+from vllm.v1.attention.backends.gdn_attn import NULL_BLOCK_ID
+from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 
 logger = logging.getLogger("atom")
 
@@ -109,7 +110,14 @@ class AtomGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             state_indices[:real_num_decodes].copy_(
                 block_table_tensor[real_decode_mask, 0], non_blocking=True
             )
-        state_indices[real_num_decodes:].fill_(PAD_SLOT_ID)
+        # NULL_BLOCK_ID (0), not PAD_SLOT_ID (-1). These are state-cache block
+        # indices, not slot-mapping entries: the request-indexed GDN decode
+        # kernel dereferences every one of the batch_size rows, so -1 makes it
+        # address ssm_state before the buffer and the whole TP group dies with
+        # "Memory access fault ... Reason: Unknown" on any padded decode batch.
+        # vLLM's own builder fills NULL_BLOCK_ID here for exactly this reason
+        # (gdn_attn.py: non_spec_state_indices_tensor[num_decodes:]).
+        state_indices[real_num_decodes:].fill_(NULL_BLOCK_ID)
 
         compact_query_start_loc_cpu = torch.zeros(
             real_num_decodes + 1, dtype=torch.int32
