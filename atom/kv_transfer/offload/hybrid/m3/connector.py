@@ -38,8 +38,6 @@ from __future__ import annotations
 
 import logging
 
-import torch
-
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import (
@@ -50,7 +48,7 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
-from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+from atom.kv_transfer.offload.hybrid.m3.codec import build_m3_page_codec
 
 logger = logging.getLogger("atom")
 
@@ -73,45 +71,7 @@ class M3OffloadConnector(DenseOffloadConnector):
         rank, world = pp_aware_rank_and_world(self._config, tp)
         self._rank = rank
 
-        block_regions = getattr(transfer_tensors, "block_regions", None)
-        if not block_regions:
-            raise ValueError(
-                "M3 offload requires transfer_tensors.block_regions "
-                "(K/V/scale + NSA index_cache regions); got none. The M3 model "
-                "runner must emit get_kv_transfer_tensors() block_regions."
-            )
-        slot_regions = getattr(transfer_tensors, "slot_regions", ()) or ()
-        if slot_regions:
-            # M3 has no per-request state; a non-empty SLOT list means the model
-            # or config selected the wrong offload variant.
-            raise ValueError(
-                "M3 offload is PAGE-only but transfer_tensors carries "
-                f"{len(slot_regions)} SLOT region(s); expected none"
-            )
-
-        page_num_blocks = (
-            num_blocks
-            if num_blocks is not None
-            else getattr(transfer_tensors, "num_blocks", None)
-        )
-        if page_num_blocks is None:
-            raise ValueError("M3 offload PAGE regions require a num_blocks value")
-
-        # Build the codec from the ordered region list (NOT from kv_caches), so
-        # the NSA index_cache regions are included. slot_regions empty ->
-        # DSV4PageSlotCodec runs pure-PAGE (num_slots=0).
-        self._codec = DSV4PageSlotCodec(
-            page_regions=block_regions,
-            slot_regions=(),
-            num_blocks=int(page_num_blocks),
-            num_slots=0,
-            device=torch.device("cuda", torch.cuda.current_device()),
-        )
-        if not self._codec.has_fused_chunk_major_staging:
-            raise RuntimeError(
-                "M3 offload requires the Triton fused chunk-major PAGE staging "
-                "kernels (DSV4PageSlotCodec reported them unavailable)"
-            )
+        self._codec = build_m3_page_codec(transfer_tensors, num_blocks)
 
         self._engine, cfg, meta = build_offload_engine(
             self._config,
@@ -150,7 +110,7 @@ class M3OffloadConnector(DenseOffloadConnector):
             "gpu_staging_buffer_chunks=%d gpu_staging_buffer_bytes=%d "
             "release_gpu_staging=%s save=%s load=%s",
             rank,
-            len(block_regions),
+            len(self._codec.page_regions),
             self._codec.bytes_per_block,
             self.chunk_size,
             gpu_connector.gpu_staging_chunk_bytes,

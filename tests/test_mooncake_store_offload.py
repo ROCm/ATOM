@@ -3736,3 +3736,66 @@ def test_mixed_windows_report_the_same_chunks(
     for index in range(4):
         expected = _page_pattern(2 * index) + _page_pattern(2 * index + 1)
         assert objects[_key(request.chunk_hashes, index)] == expected
+
+
+@pytest.mark.parametrize("model_type", ["minimax_m3", "minimax_m3_vl"])
+def test_m3_store_codec_includes_all_page_planes(model_type, monkeypatch):
+    from atom.kv_transfer.disaggregation.page_region import page_region
+    from atom.kv_transfer.disaggregation.types import KVTransferTensors
+    from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+
+    # Exercise real PAGE geometry on CPU; GPU capability refusal is tested
+    # separately in test_m3_offload_codec.py.
+    monkeypatch.setattr(
+        DSV4PageSlotCodec, "has_fused_chunk_major_staging", property(lambda _: True)
+    )
+    config = _config()
+    config.hf_config.model_type = model_type
+    check_engine_compatibility(parse_mooncake_store_config(_extra()), config)
+    connector = object.__new__(MooncakeStoreOffloadConnector)
+    connector._config = config
+    fields = {
+        name: torch.zeros((4, width), dtype=torch.uint8)
+        for name, width in [
+            ("k", 2048),
+            ("v", 2048),
+            ("k_scale", 64),
+            ("v_scale", 64),
+            ("index", 144),
+            ("draft", 2048),
+        ]
+    }
+    transfer = KVTransferTensors(
+        pages=[page_region(t, semantic_role=f"m3.{name}") for name, t in fields.items()]
+    )
+    transfer.set_block_count(4)
+    codec = connector._make_codec({}, transfer, 4)
+    assert codec.bytes_per_block == sum(t.shape[1] for t in fields.values())
+    for bad in (None, KVTransferTensors()):
+        with pytest.raises(ValueError, match="complete PAGE"):
+            connector._make_codec({}, bad, 4)
+
+
+def test_m3_store_namespace_separates_complete_pages_from_dense_codec(monkeypatch):
+    config = _config()
+    config.hf_config.model_type = "minimax_m3_vl"
+    # Even with an identical page namespace, a legacy dense object must not
+    # be interpreted as complete M3 PAGE bytes containing the index cache.
+    monkeypatch.setattr(offcfg, "build_page_namespace", lambda *args: "same-page")
+    m3_namespace = keys.store_namespace(config, CHUNK)
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: "dense")
+    assert keys.store_namespace(config, CHUNK) != m3_namespace
+
+
+@pytest.mark.parametrize("layout", ["dense", "m3"])
+def test_store_codec_version_changes_only_its_own_namespace(monkeypatch, layout):
+    config = _config()
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: layout)
+    namespace = keys.store_namespace(config, CHUNK)
+    own, other = (
+        ("M3_CODEC_ID", "CODEC_ID") if layout == "m3" else ("CODEC_ID", "M3_CODEC_ID")
+    )
+    monkeypatch.setattr(keys, other, "other-codec-next-version")
+    assert keys.store_namespace(config, CHUNK) == namespace
+    monkeypatch.setattr(keys, own, "own-codec-next-version")
+    assert keys.store_namespace(config, CHUNK) != namespace
