@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Pack metadata into one pinned arena, upload once, scatter to stable addresses."""
 
+import ctypes
+
 import torch
 import triton
 import triton.language as tl
@@ -18,8 +20,42 @@ def scatter_packed_bytes(arena, destinations, BLOCK: tl.constexpr):
     tl.store(destination + offset, values, offset < length)
 
 
+class _Address:
+    """A raw device address as a kernel's pointer argument."""
+
+    dtype = torch.uint8
+
+    def __init__(self, address):
+        self.address = address
+
+    def data_ptr(self):
+        return self.address
+
+
+def _device_address(host):
+    """The device's address of a page-locked host tensor's first byte."""
+    hip = ctypes.CDLL("libamdhip64.so")
+    dev = ctypes.c_void_p()
+    rc = hip.hipHostGetDevicePointer(
+        ctypes.byref(dev), ctypes.c_void_p(host.data_ptr()), ctypes.c_uint(0)
+    )
+    if rc != 0 or not dev.value:
+        raise RuntimeError(f"hipHostGetDevicePointer failed ({rc})")
+    return dev.value
+
+
 class PackedCopy:
     """Persistent byte storage; the publication owner fences reuse of the arena."""
+
+    # Both None unless a model hook opts in (DeepSeek-V4.1's hi hook,
+    # `ATOM_DSV41_MONO_HI`); unset, `submit` is the copy-then-scatter below.
+    # ``read_host_arena``: the scatter reads the pinned arena itself.
+    host_arena = None
+    # A recorder that may take this publication's scatter instead of launching
+    # it (``defer.take(copy, arena, largest)`` -> True: it launches the scatter
+    # itself later, before the owner's reuse event; the V4.1 mono hi hook's
+    # ``prologue``).
+    defer = None
 
     @classmethod
     def create(cls, members, device):
@@ -74,15 +110,35 @@ class PackedCopy:
                 self.payload[offset : offset + length] = self.sources[i][:length]
                 offset += length
                 largest = max(largest, length)
-        prefix = self.prefixes.get(offset)
-        if prefix is None:
-            prefix = self.host[:offset], self.device[:offset]
-            if len(self.prefixes) == 4:
-                del self.prefixes[next(iter(self.prefixes))]
-            self.prefixes[offset] = prefix
+        grid = (len(self.members), (largest + 1023) // 1024, 1)
+        defer = self.defer
+        if (
+            defer is not None
+            and defer.armed
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            if self.host_arena is not None:
+                arena = self.host_arena.data_ptr()
+            else:
+                # The deferred scatter reads the device arena.
+                host, device = self._prefix(offset)
+                device.copy_(host, non_blocking=True)
+                arena = self.device.data_ptr()
+            if defer.take(self, arena, largest):
+                return True
+        if (
+            self.host_arena is not None
+            and self.kernel is not None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # An eager launch reads the arena written above through its
+            # device address: no H2D. The owner's reuse event, recorded after
+            # this launch, fences the arena as it fences the copy.
+            self.kernel[grid](self.host_arena, self.destinations)
+            return True
+        prefix = self._prefix(offset)
         # Header and payload share this single asynchronous H2D.
         prefix[1].copy_(prefix[0], non_blocking=True)
-        grid = (len(self.members), (largest + 1023) // 1024, 1)
         if self.kernel is None:
             self.kernel = self.launch[grid](self.device, self.destinations, BLOCK=1024)
         else:
@@ -90,3 +146,18 @@ class PackedCopy:
             # binding. Reuse its compiled kernel; counts and grid stay dynamic.
             self.kernel[grid](self.device, self.destinations)
         return True
+
+    def _prefix(self, offset):
+        prefix = self.prefixes.get(offset)
+        if prefix is None:
+            prefix = self.host[:offset], self.device[:offset]
+            if len(self.prefixes) == 4:
+                del self.prefixes[next(iter(self.prefixes))]
+            self.prefixes[offset] = prefix
+        return prefix
+
+    def read_host_arena(self):
+        """Have the scatter read the pinned arena through its device address
+        instead of after an H2D copy (one launch a publication, not two), on
+        eager launches; a launch inside a graph capture copies as before."""
+        self.host_arena = _Address(_device_address(self.host))

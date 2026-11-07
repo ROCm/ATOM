@@ -23,6 +23,7 @@ import logging
 import torch
 from torch import nn
 
+from atom.models.deepseek_v41.mono import hi_gate
 from atom.models.deepseek_v41.mono.config import (
     MAX_MOE_ROWS,
     MAX_REQUESTS,
@@ -157,9 +158,20 @@ def install_mono_decode(
     does not serve."""
     why = config_refusal(atom_config)
     if why is not None:
+        if hi_gate.mode() == "1":
+            raise RuntimeError(
+                f"ATOM_DSV41_MONO_HI=1, but V4.1 mono decode is off: {why}"
+            )
         logger.info("V4.1 mono decode off: %s", why)
         return model
     dp_ranks = dp_attention_ranks(atom_config)
+    # The decoder layers on the high-interactivity monokernels where they serve
+    # this deployment (``hi_gate``: ATOM_DSV41_MONO_HI, "auto" by default); any
+    # other takes ATOM's mono decode below, unchanged.
+    if hi_gate.decide(atom_config, drafter, metadata_builder, dp_ranks):
+        from atom.models.deepseek_v41.mono.hi_dispatch import install_hi
+
+        return install_hi(model, atom_config, drafter, metadata_builder, dp_ranks)
     if drafter is not None and hasattr(drafter.model, "block_backbone"):
         drafter.model = MonoDraftModel(drafter.model, dp_ranks)
     return MonoDecodeModel(

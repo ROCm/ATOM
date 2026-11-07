@@ -1,0 +1,250 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""A served verify step's verdict, Engram cursor commit and DSpark anchor staging inside the target graph
+(the V4.1 mono hi hook, ``ATOM_DSV41_MONO_HI``).
+
+Between the target graph and the draft graph a served step would run three eager launches: the verdict
+(``head_verdict``), Engram's cursor commit (``TentativeState.commit``: ``_commit_cursors``) and DSpark's anchor
+staging (``DSparkProposer._stage_anchors``). All three read only device state, but as eager launches between two
+graphs they cost a graph -> eager boundary (~8 us) and their eager overhead. The hook launches all three as one
+kernel (``_post_verify_kernel``, a program a request, each request's rows at once) at the end of its forward
+(``HiLayers.end_step``), so a captured graph replays it and target graph -> draft graph is one boundary:
+
+- the verdict on the head's ids (``head_verdict``'s arithmetic), the width's verify / bonus rows and draft counts
+  laid out as the served step lays them (B requests of ``rq`` rows: ``rq - 1`` drafts and a bonus row each), into
+  persistent outputs a width; under forced acceptance the uniforms are seeded from the hook's launch-tag step
+  (bumped by every forward: the same on every TP rank);
+- the commit: each live request's accepted prefix's candidate cursor (ATOM's tentative staging plane, written on
+  the device on served steps) into its slot's Engram cursor (a padding request of a bs-B graph commits nothing: its
+  slot entry is padding, which names some other slot);
+- the anchors: each request's next id (clamped to the vocab) and its anchor row's position into the DSpark block's
+  fixed inputs at the width's requests.
+
+The host then takes the kernel's results on a step the head's verdict serves (``ModelRunner.postprocess`` asks
+``verify_verdict``) whose layout is the one the kernel assumed (every request ``rq - 1`` drafts): ``verdict``
+returns the persistent outputs without a launch, and the commit (``commit_speculative_state``) and the anchor staging
+(``_stage_anchors``) skip their launches on that step (``PostVerify.committed`` / ``anchors_staged``, at the builder's
+and the proposer's hooks). On any other step the eager path runs
+(``head_verdict``'s one-launch verdict, then ATOM's commit and staging), after the graph: it rewrites the cursor and
+the anchors, so the in-graph writes it never asked for are overwritten. The outputs are a width's fixed addresses,
+read after the step by the runner's side-stream copies (the sampled ids, the verdict counts) with no reverse wait,
+as ``send_to_cpu_async_draft`` reads the draft graph's: the replay that rewrites them is the next target forward's
+end, a draft pass and a whole forward later on the default stream.
+"""
+
+from __future__ import annotations
+
+import logging
+
+import numpy as np
+import torch
+import triton
+import triton.language as tl
+
+from atom.models.deepseek_v41.mono.hi_bridge import REQ_LIVE
+
+logger = logging.getLogger("atom")
+
+
+@triton.jit(do_not_specialize=["num_spec_steps", "vocab_max", "seed_base"])
+def _post_verify_kernel(
+    out_ptr, verdict_ptr, next_ptr, cu_ptr, input_ids_ptr, target_idx_ptr, bonus_idx_ptr, head_ids_ptr, cond_rates_ptr,
+    step_ptr, used_seed_ptr, cursor_ptr, cursor_stride, staging_ptr, staging_req_stride, staging_row_stride, starts_ptr,
+    slots_ptr, anchor_ids_ptr, anchor_pos_ptr, positions_ptr, live_ptr, vocab_max, num_spec_steps, seed_base,
+    WIDTH: tl.constexpr, BLOCK: tl.constexpr, SP: tl.constexpr, SYNTHETIC: tl.constexpr, SHADOW: tl.constexpr,
+):  # fmt: skip
+    """Program b, request b: the verdict (``head_verdict``'s kernel's, its rows at once: the first rejected
+    position is a min over the rows), the commit (request b's accepted prefix's candidate cursor,
+    ``staging[b, anchor - start]``, into ``cursor[slot]`` when ``live_ptr[b]`` (the hook's request word: not a padding
+    request); ``SHADOW``: into ``cursor[b]``, the check's rows) and the
+    anchors (DSpark's ``_stage_anchors_kernel``: the next id clamped to the vocab, the anchor row's position). The
+    uniforms' seed is ``seed_base`` + the hook's launch-tag step (bumped by every forward's begin-step: the same on
+    every TP rank), recorded in ``used_seed_ptr``."""
+    b = tl.program_id(0)
+    seed = seed_base + tl.load(step_ptr).to(tl.int64)
+    if b == 0:
+        tl.store(used_seed_ptr, seed)
+    if b == 0:
+        start = 0
+    else:
+        start = tl.load(cu_ptr + b - 1)
+    n = tl.load(cu_ptr + b) - start
+    p = tl.arange(0, SP)
+    live = p < n
+    vrow = tl.load(target_idx_ptr + start + p, mask=live, other=0)
+    target = tl.load(head_ids_ptr + vrow, mask=live, other=0).to(tl.int32)
+    draft = tl.load(input_ids_ptr + vrow + 1, mask=live, other=0).to(tl.int32)
+    if SYNTHETIC:
+        u = tl.rand(seed, start + p)
+        ok = u < tl.load(cond_rates_ptr + p, mask=live, other=0.0)
+        kept = draft  # a forced accept emits the draft
+    else:
+        ok = draft == target
+        kept = target
+    # the first rejected row, n if none
+    k = tl.min(tl.where(live & (ok == 0), p, n), axis=0)
+    rejected = k < n
+    brow = tl.load(bonus_idx_ptr + b)
+    bonus = tl.load(head_ids_ptr + brow).to(tl.int32)
+    INVALID: tl.constexpr = -1
+    row = tl.where(p < n, tl.where(p < k, kept, tl.where(p == k, target, INVALID)),
+                   tl.where((p == n) & (rejected == 0), bonus, INVALID))  # fmt: skip
+    tl.store(out_ptr + b * (num_spec_steps + 1) + p, row, mask=p < num_spec_steps + 1)
+    accepted = tl.where(rejected, k, n)
+    next_id = tl.where(rejected, tl.sum(tl.where(p == k, target, 0), axis=0), bonus)
+    anchor = brow - n + accepted
+    nreq = tl.num_programs(0)
+    tl.store(verdict_ptr + b, accepted)
+    tl.store(verdict_ptr + nreq + b, num_spec_steps - accepted)
+    tl.store(verdict_ptr + 2 * nreq + b, anchor)
+    tl.store(next_ptr + b, next_id)
+    cols = tl.arange(0, BLOCK)
+    keep = cols < WIDTH
+    prefix = anchor - tl.load(starts_ptr + b)
+    crow = tl.load(
+        staging_ptr + b * staging_req_stride + prefix * staging_row_stride + cols,
+        mask=keep,
+    )
+    if SHADOW:
+        dst = b.to(tl.int64)
+    else:
+        dst = tl.load(slots_ptr + b).to(tl.int64)
+    if (
+        tl.load(live_ptr + b) != 0
+    ):  # (a padding request's slot entry names some other request's slot, or a free one)
+        tl.store(cursor_ptr + dst * cursor_stride + cols, crow, mask=keep)
+    tl.store(anchor_ids_ptr + b, tl.minimum(tl.maximum(next_id, 0), vocab_max))
+    tl.store(anchor_pos_ptr + b, tl.load(positions_ptr + anchor))
+
+
+class PostVerify:
+    """The hook's in-graph post-verify (module docstring): a width's persistent outputs and constant row layout, its
+    launch from the hook's forward, and the host's side of a step."""
+
+    def __init__(self, widths, split, device):
+        from atom.model_ops.rejection_sampler import _SYNTHETIC_RNG_BASE_SEED
+
+        self.split = split
+        self.seed_base = _SYNTHETIC_RNG_BASE_SEED
+        self.used_seed = torch.zeros(1, dtype=torch.int64, device=device)
+        self.bufs, self.launched = {}, set()
+        i32 = {"dtype": torch.int32, "device": device}
+        for rows in widths:
+            nb, rq = split[rows]
+            s = rq - 1
+            self.bufs[rows] = {
+                "out": torch.zeros(nb, rq, **i32), "verdict": torch.zeros(3, nb, **i32), "next": torch.zeros(nb, **i32),
+                "cu": torch.arange(1, nb + 1, **i32) * s,
+                "target": torch.tensor([b * rq + j for b in range(nb) for j in range(s)], dtype=torch.long,
+                                       device=device),
+                "bonus": torch.tensor([b * rq + s for b in range(nb)], dtype=torch.long, device=device),
+            }  # fmt: skip
+        self.used = None  # the width whose in-graph results this step took (``take``), for the skip wrappers
+
+    def launch(self, hook, cache, step, rows: int) -> None:
+        """At the end of a served forward (``HiLayers.end_step``; a capture records it): the kernel on this
+        width's fixed buffers. Every input is a fixed address of this width: the head's ids, the step's input ids,
+        positions, query starts and slots, ATOM's cursor and tentative staging plane, the DSpark block's anchor
+        inputs at the width's requests."""
+        from atom.model_ops.rejection_sampler import _get_synthetic_cond_rates
+
+        nb, rq = self.split[rows]
+        bufs = self.bufs[rows]
+        sampler = (
+            getattr(hook.runner, "rejection_sampler", None)
+            if hook.runner is not None
+            else None
+        )
+        drafter = hook.cx_drafter
+        if (
+            sampler is None
+            or drafter is None
+            or hook.step_ids is None
+            or not hasattr(drafter, "block")
+        ):
+            raise RuntimeError("V4.1 mono hi post-verify: needs the runner's rejection sampler, the DSpark "
+                               "proposer and the step's input ids")  # fmt: skip
+        rates = sampler.synthetic_acceptance_rates
+        cond = (
+            _get_synthetic_cond_rates(rates, self.used_seed.device)
+            if rates is not None
+            else bufs["out"]
+        )
+        staging, cursor = cache.tentative_staging.gpu, cache.cursor
+        ids, pos = drafter.block.buffer("anchor_ids", nb), drafter.block.buffer(
+            "anchor_positions", nb
+        )
+        self.launched.add(rows)
+        _post_verify_kernel[(nb,)](
+            bufs["out"], bufs["verdict"], bufs["next"], bufs["cu"], hook.step_ids, bufs["target"], bufs["bonus"],
+            hook.head_ids, cond, hook.step, self.used_seed, cursor, cursor.stride(0), staging, staging.stride(0),
+            staging.stride(1), step.cu_seqlens_q, step.slots, ids, pos, step.positions, hook.req[REQ_LIVE:],
+            int(drafter.model.vocab_size) - 1, rq - 1, self.seed_base, WIDTH=cache.cursor.shape[1],
+            BLOCK=triton.next_power_of_2(cache.cursor.shape[1]), SP=triton.next_power_of_2(rq),
+            SYNTHETIC=rates is not None, SHADOW=False, num_warps=1,
+        )  # fmt: skip
+
+    def serves(self, spec, head_ids) -> int | None:
+        """The width whose in-graph results stand for this step (the forward the hook served ran the kernel at it,
+        and the step's verify is laid out as the kernel assumed: every request ``rq - 1`` drafts), else None.
+        """
+        rows = head_ids.shape[0]
+        if rows not in self.launched:
+            return None
+        nb, rq = self.split[rows]
+        drafts = np.asarray(spec.num_draft_tokens_np)
+        if (
+            drafts.shape != (nb,)
+            or (drafts != rq - 1).any()
+            or spec.num_spec_steps != rq - 1
+        ):
+            return None
+        return rows
+
+    def take(self, rows: int, sampler):
+        """The in-graph results as this step's (output ids, verdict, next ids); the commit and the anchor staging
+        skip their launches on this step."""
+        b = self.bufs[rows]
+        self.used = rows
+        if sampler.synthetic_acceptance_rates is not None:
+            sampler._synthetic_step += 1  # as ``RejectionSampler.forward``
+        return b["out"], b["verdict"], b["next"]
+
+    def committed(self, metadata) -> bool:
+        """The builder's commit (``HiRound.committed``): a step that took the in-graph results committed in the graph
+        (``_post_verify_kernel``); here only the bookkeeping ``cache.commit_tentative`` does. -> committed.
+        """
+        cache = metadata.cache
+        pending = getattr(cache, "pending", None)
+        if self.used is None or pending is None or not pending.staged_on_device:
+            return False
+        if pending.step is not metadata.step:
+            raise RuntimeError("Tentative state was not prepared for this step")
+        cache.pending = None
+        return True
+
+    def anchors_staged(self, running_bs: int) -> bool:
+        """The DSpark proposer's anchor staging (``HiRound.anchors_staged``): the in-graph results wrote this step's
+        anchors into the block's inputs. Takes the step's results (``used``) either way.
+        """
+        used, self.used = self.used, None
+        return used is not None and self.split[used][0] == running_bs
+
+
+def verdict(hook, spec, head_ids, sampler):
+    """``ModelRunner.postprocess``'s ``verify_verdict``: the in-graph results on a step laid out as the kernel
+    assumed; on any other step the one-launch verdict (``head_verdict``). Reported to the device round as ATOM's
+    verdict is (``HiRound.note_verdict``)."""
+    pv = hook.pv
+    pv.used = None
+    rows = pv.serves(spec, head_ids)
+    if rows is not None:
+        out = pv.take(rows, sampler)
+    else:
+        from atom.models.deepseek_v41.mono.round import head_verdict
+
+        out = head_verdict.verdict(spec, head_ids, sampler)
+    rnd = getattr(hook, "round", None)
+    if rnd is not None:
+        rnd.note_verdict(out)
+    return out
