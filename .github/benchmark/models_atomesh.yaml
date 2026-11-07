@@ -3780,6 +3780,19 @@ models:
           workers: 1
           tp: 1
           extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192 --long-prefill-token-threshold 4096
+      # Diagnostic: a 6 s trace of the prefill's four stages 300 s into the
+      # profiling phase, after which aiperf stops. At C200 a request of 1-2
+      # batches spends 1.5 s between its first batch and its first token where
+      # each stage computes a batch in 67 ms.
+      - <<: *issue382_a9_1p2d_c180_lpt4096
+        name: issue382-a9-1p2d-c180-lpt4096-prof
+        env:
+          common:
+            <<: *issue382_a9_1p3d_env_common
+            ATOMESH_TORCH_PROFILE_DURATION: '6'
+            ATOMESH_TORCH_PROFILE_ROLES: prefill
+          prefill: *issue382_a9_store2560_env_prefill
+          decode: *issue382_a9_env_decode
       - <<: *issue382_a9_1p2d_c180_lpt4096
         name: issue382-a9-1p2d-c200-lpt4096
         concurrency:
