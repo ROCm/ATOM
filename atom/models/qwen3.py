@@ -24,7 +24,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Iterable, Union
+from collections.abc import Iterable
+from typing import Any, ClassVar
 
 import torch
 
@@ -293,21 +294,23 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         **model_kwargs: dict[str, Any],
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[int, torch.Tensor]]]:
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[int, torch.Tensor]]:
         capture_layer_ids = model_kwargs.pop("capture_hidden_state_layers", None)
 
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         captured: dict[int, torch.Tensor] = {}
         for i, layer in enumerate(self.layers):
+            if capture_layer_ids is not None and i in capture_layer_ids:
+                captured[i] = (
+                    hidden_states if residual is None else hidden_states + residual
+                ).detach()
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
                 **model_kwargs,
             )
-            if capture_layer_ids is not None and i in capture_layer_ids:
-                captured[i] = (hidden_states + residual).detach()
 
         hidden_states, _ = self.norm(hidden_states, residual)
         if captured:
@@ -316,7 +319,7 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict] = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
@@ -324,8 +327,16 @@ class Qwen3ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self._aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
     def __init__(self, config: Any, prefix: str = "") -> None:
         super().__init__()
+        self._aux_hidden_state_layers: tuple[int, ...] = ()
         self.atom_config = config
         self.hf_config = self.atom_config.hf_config
         self.model = Qwen3Model(
@@ -349,9 +360,17 @@ class Qwen3ForCausalLM(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **model_kwargs: dict[str, Any],
     ) -> torch.Tensor:
+        if self._aux_hidden_state_layers:
+            model_kwargs["capture_hidden_state_layers"] = set(
+                self._aux_hidden_state_layers
+            )
         hidden_states = self.model(
             input_ids=input_ids, positions=positions, **model_kwargs
         )
+        if isinstance(hidden_states, tuple) and len(hidden_states) == 2:
+            hidden, captured_dict = hidden_states
+            aux_list = [captured_dict[i] for i in sorted(captured_dict)]
+            return hidden, aux_list
         return hidden_states
 
     def compute_logits(
