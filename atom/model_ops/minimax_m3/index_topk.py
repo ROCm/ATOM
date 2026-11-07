@@ -614,6 +614,17 @@ DECODE_TOPK_BLOCK_SIZE_K = 512
 DECODE_TOPK_NUM_WARPS = 8
 
 
+def _decode_topk_block_size_k(max_block: int) -> int:
+    """Measured gfx1250 decode selector tile for the served context range."""
+    if get_gfx() != "gfx1250":
+        return DECODE_TOPK_BLOCK_SIZE_K
+    if max_block >= 1984:
+        return 2048
+    if max_block > 512:
+        return 1024
+    return DECODE_TOPK_BLOCK_SIZE_K
+
+
 @functools.cache
 def _compute_units(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
@@ -1341,7 +1352,7 @@ def minimax_m3_index_topk_decode(
         num_idx_heads,
         rows_per_req=max_query_len,
         decode_max_q=max_query_len,
-        block_size_k=DECODE_TOPK_BLOCK_SIZE_K,
+        block_size_k=_decode_topk_block_size_k(max_block),
         num_warps=DECODE_TOPK_NUM_WARPS,
         emit=emit_sparse_block_table,
         block_page_stride=block_page_stride,
