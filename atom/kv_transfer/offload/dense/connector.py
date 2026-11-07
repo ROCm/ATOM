@@ -58,6 +58,7 @@ from atom.kv_transfer.offload._offload_common import (
     validated_kv_role,
     wait_save_fence,
 )
+from atom.kv_transfer.offload.atom_lmcache_staging import set_compute_stream
 from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
@@ -117,6 +118,10 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     ) -> None:
         from aiter.dist.parallel_state import get_tp_group
 
+        # Called on the model runner's thread: its current stream is the one
+        # the forward runs on (see `atom_lmcache_staging.compute_stream`).
+        # Recorded here so a load that precedes the first save stages on it.
+        set_compute_stream(torch.cuda.current_stream())
         tp = get_tp_group()
         rank, world = pp_aware_rank_and_world(self._config, tp)
         self._rank = rank
