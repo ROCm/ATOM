@@ -3764,6 +3764,49 @@ models:
             MOONCAKE_STORE_EVICTION_HIGH_WATERMARK: '0.97'
             MOONCAKE_STORE_EVICTION_RATIO: '0.03'
           decode: *issue382_a9_env_decode
+      # Past C200 the prefill node's 2.5 TiB no longer holds the sessions: the
+      # second node's memory joins the Store (2 TiB, on the NICs the prefill
+      # stages leave free), and each decode keeps 0.94 of its VRAM for the
+      # 110-120 sessions it serves.
+      - &issue382_a9_1p2d_c220_store4608
+        <<: *issue382_a9_1p2d_c180
+        name: issue382-a9-1p2d-c220-store4608
+        concurrency:
+        - 220
+        decode:
+          workers: 2
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,152]'
+          extra_args: --gpu-memory-utilization 0.94
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 440
+            decode_max_num_seqs: 152
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+        env:
+          common: *issue382_a9_1p3d_env_common
+          prefill:
+            <<: *issue382_a9_store2560_env_prefill
+            MOONCAKE_STORE_DECODE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+          decode: *issue382_a9_env_decode
+      - <<: *issue382_a9_1p2d_c220_store4608
+        name: issue382-a9-1p2d-c240-store4608
+        concurrency:
+        - 240
+        decode:
+          workers: 2
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160]'
+          extra_args: --gpu-memory-utilization 0.94
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 480
+            decode_max_num_seqs: 160
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c330
         concurrency:
