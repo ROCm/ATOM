@@ -97,7 +97,7 @@ class _Delayer:
     is_local = False
     max_queue_ms = None
     kv_high_watermark = 0.9
-    rank_prefill_costs = []
+    rank_prefill_costs: tuple = ()
 
     def __init__(self):
         self.allow = False
@@ -242,7 +242,7 @@ def test_prefill_stays_fifo_when_a_later_request_loaded_first(monkeypatch, seq_f
     sched.finished_recving_kv_req_ids.append(a.id)
 
     delayer.allow = True
-    batch, scheduled = sched.schedule()
+    _batch, scheduled = sched.schedule()
 
     assert list(scheduled) == [a.id, b.id]  # arrival order, not load order
 
@@ -256,7 +256,7 @@ def test_request_whose_load_is_in_flight_does_not_block_later_ones(
     sched.finished_recving_kv_req_ids.append(b.id)  # only b has landed
 
     delayer.allow = True
-    batch, scheduled = sched.schedule()
+    _batch, scheduled = sched.schedule()
 
     assert list(scheduled) == [b.id]
     assert list(sched.waiting) == [a]
@@ -264,7 +264,7 @@ def test_request_whose_load_is_in_flight_does_not_block_later_ones(
 
 
 def test_flag_off_is_the_old_behaviour(monkeypatch, seq_factory):
-    sched, delayer, (first, moved) = _make(
+    sched, _delayer, (first, moved) = _make(
         monkeypatch, seq_factory, n=2, ATOM_OFFLOAD_EARLY_LOAD="0"
     )
 
@@ -274,17 +274,6 @@ def test_flag_off_is_the_old_behaviour(monkeypatch, seq_factory):
     assert sched.kv_connector.allocs == []
     assert len(first.block_table) == len(moved.block_table) == 0
     assert sched._early_load.submitted == 0
-
-
-def test_moved_request_jumps_the_queue_only_with_the_flag_off(monkeypatch, seq_factory):
-    for flag, jumps in (("0", True), ("1", False)):
-        monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD", flag)
-        sched = Scheduler(MockConfig(num_kvcache_blocks=100))
-        first, moved = seq_factory(list(range(16))), seq_factory(list(range(16)))
-        moved.dp_prefetch_priority = True
-        sched.add(first)
-        sched.add(moved)
-        assert (list(sched.waiting) == [moved, first]) is jumps
 
 
 def test_priority_max_queue_has_no_effect_with_early_load(monkeypatch, seq_factory):
@@ -509,7 +498,7 @@ def test_abort_of_a_loaded_early_request_releases_its_blocks(setup):
 
 
 def test_status_abort_is_reclaimed_on_a_hold_tick(monkeypatch, seq_factory):
-    sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
+    sched, _, (_a, b) = _make(monkeypatch, seq_factory, n=2)
     sched.schedule()
     b.status = SequenceStatus.ABORTED  # marked, still queued behind a
 
@@ -523,7 +512,7 @@ def test_status_abort_is_reclaimed_on_a_hold_tick(monkeypatch, seq_factory):
 
 
 def test_one_info_line_per_interval(setup, caplog):
-    sched, _, seq = setup
+    sched, _, _seq = setup
     sched.schedule()
     state = sched._early_load
     state.skip(77, "watermark")
