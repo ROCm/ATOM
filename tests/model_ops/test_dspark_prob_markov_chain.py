@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Preserve the native sampled-prefix chain, including graph scratch reuse."""
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +11,9 @@ pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("needs a gfx1250 GPU", allow_module_level=True)
 arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-if arch.split(":")[0] != "gfx1250":
+if arch.split(":")[0] != "gfx1250" and not (
+    arch.split(":")[0] == "gfx950" and os.getenv("ATOM_PR2877_TEST_GFX950", "0") == "1"
+):
     pytest.skip("the fused chain is enabled only on gfx1250", allow_module_level=True)
 
 from atom.model_ops import dspark_prob_sample as native

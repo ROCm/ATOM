@@ -13,6 +13,7 @@ Only the full-vocabulary path is integrated. A sharded path still needs the
 per-position inter-rank winner exchange and uses the existing implementation.
 """
 
+import os
 from functools import cache
 
 import torch
@@ -29,13 +30,18 @@ def _fits_int32_offsets(tensor):
 
 
 @cache
-def _is_gfx1250(device):
+def _supports_packed_chain(device):
     arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
-    return arch.split(":")[0] == "gfx1250"
+    arch = arch.split(":")[0]
+    # Dedicated PR2877 CI branch only: numerical tests gate this experiment
+    # before the existing gfx950 runners measure the fused implementation.
+    return arch == "gfx1250" or (
+        arch == "gfx950" and os.getenv("ATOM_PR2877_TEST_GFX950", "0") == "1"
+    )
 
 
 def can_use_prob_markov_chain(base_logits, markov_w1, markov_w2, keys):
-    """Static metadata gate for the measured gfx1250 V4.1 workload."""
+    """Static metadata gate; gfx950 is opt-in on the PR2877 CI branch."""
     if keys is None or base_logits.ndim != 3:
         return False
     b, t, v = base_logits.shape
@@ -60,7 +66,7 @@ def can_use_prob_markov_chain(base_logits, markov_w1, markov_w2, keys):
             _fits_int32_offsets(tensor)
             for tensor in (base_logits, markov_w1, markov_w2, keys)
         )
-        and _is_gfx1250(base_logits.device)
+        and _supports_packed_chain(base_logits.device)
     )
 
 

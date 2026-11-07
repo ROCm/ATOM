@@ -2,6 +2,7 @@
 """Check fused-chain dispatch and launch bounds without Triton or a GPU."""
 
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,7 +37,7 @@ class _Metadata:
 
 @pytest.fixture
 def metadata(monkeypatch):
-    monkeypatch.setattr(chain, "_is_gfx1250", lambda _: True)
+    monkeypatch.setattr(chain, "_supports_packed_chain", lambda _: True)
     return {
         "base": _Metadata((24, 5, 129280)),
         "w1": _Metadata((129280, 256)),
@@ -94,12 +95,12 @@ def test_unsupported_metadata_falls_back_before_device_probe(
     def unexpected_probe(_):
         pytest.fail("invalid metadata should not query the GPU")
 
-    monkeypatch.setattr(chain, "_is_gfx1250", unexpected_probe)
+    monkeypatch.setattr(chain, "_supports_packed_chain", unexpected_probe)
     assert not _can_use(metadata)
 
 
 def test_missing_workspace_and_other_arch_fall_back(metadata, monkeypatch):
-    monkeypatch.setattr(chain, "_is_gfx1250", lambda _: False)
+    monkeypatch.setattr(chain, "_supports_packed_chain", lambda _: False)
     assert not _can_use(metadata)
     metadata["keys"] = None
     assert not _can_use(metadata)
@@ -109,6 +110,27 @@ def test_missing_workspace_and_other_arch_fall_back(metadata, monkeypatch):
 def test_int32_element_offset_boundary(last_offset, expected):
     tensor = torch.empty_strided((2, 2), (last_offset - 1, 1), device="meta")
     assert chain._fits_int32_offsets(tensor) is expected
+
+
+@pytest.mark.parametrize(
+    "arch,opt_in,expected",
+    [
+        ("gfx1250:sramecc+", "0", True),
+        ("gfx950", "0", False),
+        ("gfx950", "1", True),
+        ("gfx942", "1", False),
+    ],
+)
+def test_gfx950_requires_explicit_ci_opt_in(monkeypatch, arch, opt_in, expected):
+    monkeypatch.setenv("ATOM_PR2877_TEST_GFX950", opt_in)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda _: SimpleNamespace(gcnArchName=arch)
+    )
+    chain._supports_packed_chain.cache_clear()
+    try:
+        assert chain._supports_packed_chain(torch.device("cuda:0")) is expected
+    finally:
+        chain._supports_packed_chain.cache_clear()
 
 
 @pytest.mark.parametrize(
