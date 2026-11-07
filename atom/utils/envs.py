@@ -1384,6 +1384,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
+    # Run offload staging (pack/unpack, H2D/D2H legs) on the forward's own
+    # stream instead of side streams, so offload kernels never run
+    # concurrently with forward kernels. Side streams can deadlock against a
+    # persistent (all-CU co-resident) kernel on ROCm; see
+    # `atom_lmcache_staging.compute_stream`. 0 restores the side streams.
+    "OFFLOAD_STAGING_ON_COMPUTE_STREAM": lambda: _flag_env(
+        "OFFLOAD_STAGING_ON_COMPUTE_STREAM", "1"
+    ),
     # Give an offload load worker's transfer streams the device's highest
     # priority, so a load's scatter kernels dispatch ahead of queued forward
     # kernels instead of waiting behind them on a busy GPU.

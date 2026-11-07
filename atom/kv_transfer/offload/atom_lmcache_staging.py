@@ -45,6 +45,37 @@ def memory_object_as_uint8(memory_obj: Any, nbytes: int) -> torch.Tensor:
 
 _LOAD_PRIORITY_LOGGED = False
 
+# The stream the forward runs on, recorded by the offload connector from the
+# model runner's thread (`set_compute_stream`). With
+# OFFLOAD_STAGING_ON_COMPUTE_STREAM (default on) transfer states created
+# afterwards run both staging legs on it.
+_COMPUTE_STREAM = None
+
+
+def set_compute_stream(stream) -> None:
+    """Record the forward's stream once; later calls are no-ops."""
+    global _COMPUTE_STREAM
+    if _COMPUTE_STREAM is None and stream is not None:
+        _COMPUTE_STREAM = stream
+
+
+def compute_stream():
+    """The stream offload staging must use, or None for its own streams.
+
+    Offload pack/unpack kernels on a stream of their own run concurrently with
+    the forward. On ROCm a kernel that needs every CU co-resident (a
+    persistent kernel, one CTA per CU) can then wait for CUs those kernels
+    hold while they wait for it, and the engine hangs with the GPU at 100%:
+    seen with Mooncake Store saves on a side stream, both GPUs of a DP pair
+    frozen for minutes, host-side event waits notwithstanding. On the
+    forward's stream the transfers run between forward kernels instead.
+    """
+    from atom.utils import envs
+
+    if not envs.OFFLOAD_STAGING_ON_COMPUTE_STREAM:
+        return None
+    return _COMPUTE_STREAM
+
 
 def load_stream_priority() -> int:
     """Stream priority for a transfer stream created on the calling thread.
@@ -100,7 +131,12 @@ class _ThreadTransferState:
         self.device = device
         self.pack_stream = None
         self.copy_stream = None
-        if use_cuda:
+        shared = compute_stream() if use_cuda else None
+        if shared is not None:
+            # One stream for both legs: `run_staged_pipeline` then skips the
+            # cross-stream handshake entirely.
+            self.pack_stream = self.copy_stream = shared
+        elif use_cuda:
             priority = load_stream_priority()
             with torch.cuda.device(device):
                 self.pack_stream = torch.cuda.Stream(priority=priority)

@@ -237,6 +237,10 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     def register_kv_caches(
         self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
     ) -> None:
+        from atom.kv_transfer.offload.atom_lmcache_staging import set_compute_stream
+
+        # The model runner's thread: its current stream is the forward's.
+        set_compute_stream(torch.cuda.current_stream())
         rank, world = pp_aware_rank_and_world(self._config, _tp_group())
         self._rank = rank
         self._world = world
@@ -878,8 +882,14 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         stream = getattr(self._in_place_tls, "stream", None)
         if stream is None:
             from atom.kv_transfer.offload.atom_lmcache_staging import (
+                compute_stream,
                 load_stream_priority,
             )
+
+            shared = compute_stream()
+            if shared is not None:
+                self._in_place_tls.stream = shared
+                return shared
 
             stream = torch.cuda.Stream(
                 device=self._codec.device, priority=load_stream_priority()
