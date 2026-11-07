@@ -696,6 +696,7 @@ class PagedAttentionImpl(nn.Module):
             v_descale=self.kv_scale,
             sinks=self.sinks,
             shuffled_kv_cache=not self.use_flash_layout,
+            equal_seqlen_q=attn_metadata.equal_seqlen_q,
         )
         return o
 
@@ -1084,6 +1085,7 @@ class PagedAttentionImpl(nn.Module):
             v_descale=self.kv_scale,
             sinks=self.sinks,
             shuffled_kv_cache=shuffled_kv_cache,
+            attn_work=attn_metadata.attn_work or None,
         )
 
         return o

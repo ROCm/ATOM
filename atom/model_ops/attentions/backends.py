@@ -912,6 +912,8 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         has_cached = bool((cached_lens > 0).any())
         max_seqlen_q = int(seqlens_q.max(initial=0))
         max_seqlen_k = int(context_lens.max(initial=0))
+        # causal query-key pairs of the step: new tokens x mean attended context
+        attn_work = int((seqlens_q * (context_lens - seqlens_q / 2)).sum())
 
         total_kv = self._publish_prefill_seq_lens(
             context_lens, scheduled_bs, running_bs
@@ -955,6 +957,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             dropout_p=0.0,
             has_cached=has_cached,
             total_kv=int(total_kv),
+            attn_work=attn_work,
             state=AttnState.PREFILL_PREFIX if has_cached else AttnState.PREFILL_NATIVE,
             **ctx,
         )
