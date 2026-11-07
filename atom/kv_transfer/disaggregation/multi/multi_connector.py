@@ -387,8 +387,9 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # must not compete with a speculative Store read into the same blocks.
         if not self.is_producer:
             return None
-        return next((c for c in self._connectors
-                     if getattr(c, "is_offload", False)), None)
+        return next(
+            (c for c in self._connectors if getattr(c, "is_offload", False)), None
+        )
 
     @property
     def supports_async_lookup(self):
@@ -424,20 +425,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             pending = getattr(connector, "lookup_pending", None)
             if callable(pending) and pending(seq):
                 return True
-        return False
-
-    @property
-    def chunk_size(self) -> int:
-        """The first sub-connector's transfer granule in tokens; 0 if none has one."""
-        for connector in self._connectors:
-            size = int(getattr(connector, "chunk_size", 0) or 0)
-            if size > 0:
-                return size
-        return 0
-
-    def lookup_ready(self, seq: Any) -> bool:
-        """Never: the early tier load (`Scheduler._early_load_tier_prefixes`)
-        is not offered under `multi`, where a P/D sub shares the admission."""
         return False
 
     def cancel_preadmission(self, seq: Any) -> None:
