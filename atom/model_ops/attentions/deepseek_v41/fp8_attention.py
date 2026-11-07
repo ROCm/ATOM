@@ -3,13 +3,14 @@
 
 A row is `head_dim` E4M3 values then `head_dim // 32` E8M0 scales, RoPE dims
 included (`V41PoolGeometry.row_bytes`); the query is quantized the same way
-(`rope_quant_window`'s `query_fp8`). Only AITER's `mla_sparse_prefill_v41`
-reads this record: the V3 (576 dims, a scale a tensor) and V4 (FP8 NoPE + BF16
+(`rope_quant_window`'s `query_fp8`). AITER's V4.1 attention and fused attention
+read this record: the V3 (576 dims, a scale a tensor) and V4 (FP8 NoPE + BF16
 RoPE) FP8 kernels take the same dtypes and compute garbage on it, so nothing
 here dispatches by dtype.
 """
 
 import torch
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src_reference
@@ -19,6 +20,15 @@ try:
     from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41
 except ImportError:
     mla_sparse_prefill_v41 = None
+
+try:
+    from aiter.ops.fused_norm_rope_attn_rope_cast import fused_norm_rope_attn_rope_cast
+except ImportError:
+    fused_norm_rope_attn_rope_cast = None
+
+
+def fused_attention_available():
+    return fused_norm_rope_attn_rope_cast is not None and get_gfx_runtime() == "gfx950"
 
 
 def _split(rows, dim):
@@ -70,6 +80,49 @@ def sparse_attn_v41_paged_2src(
         softmax_scale,
         out=out,
     )
+
+
+@mark_trace
+def fused_sparse_attn_v41_paged_2src(
+    query,
+    pool,
+    kv_indices_prefix,
+    kv_indptr_prefix,
+    kv,
+    kv_indices_extend,
+    kv_indptr_extend,
+    attn_sink,
+    softmax_scale,
+    *,
+    rope,
+    positions,
+    out=None,
+    out_scale=None,
+):
+    """Raw BF16 Q to inverse-rotated MXFP8 output."""
+    if fused_norm_rope_attn_rope_cast is None:
+        raise RuntimeError("Fused V4.1 attention needs AITER PR #6821")
+    dim = query.shape[-1]
+    output, output_scale, _ = fused_norm_rope_attn_rope_cast(
+        query,
+        *_split(pool, dim),
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        *_split(kv, dim),
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        out=out,
+        out_scale=out_scale,
+        cos=rope.cos_cache,
+        sin=rope.sin_cache,
+        positions=positions.flatten(),
+        q_is_rotated=False,
+        q_norm=False,
+        num_splits=0,
+    )
+    return output, output_scale
 
 
 def dequantize_rows(values, scales):
