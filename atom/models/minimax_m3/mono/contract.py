@@ -2,10 +2,11 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The fused layer kernel's hand-off contract, checked on a build.
 
-Tracing a build (compile-only, no launch, no GPU needed with ``ARCH`` set) records
-its mailbox accesses (``atom.mono.plan.trace``); ``check_traced`` holds them to
-``layout.mailbox_regions``. A build served from FlyDSL's disk cache is not traced,
-so the caller disables the cache (``FLYDSL_RUNTIME_ENABLE_CACHE=0``).
+Tracing a build (compile-only, no launch, no GPU needed with
+``FLYDSL_GPU_ARCH`` set) records its mailbox accesses (``atom.mono.plan.trace``);
+``check_traced`` holds them to ``layout.mailbox_regions``. A build served from
+FlyDSL's disk cache is not traced, so the caller disables the cache
+(``FLYDSL_RUNTIME_ENABLE_CACHE=0``).
 
 Usage: python -m atom.models.minimax_m3.mono.contract [S ...]
 """

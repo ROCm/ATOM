@@ -30,7 +30,7 @@ INDEX_HEADS = TP
 @pytest.fixture(scope="module")
 def traces():
     with pytest.MonkeyPatch.context() as patch:
-        patch.setenv("ARCH", "gfx950")
+        patch.setenv("FLYDSL_GPU_ARCH", "gfx950")
         patch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
         return {
             "layer": trace(contract.build_layer(TOKENS, INDEX_HEADS), K4_ABI),
