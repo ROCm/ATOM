@@ -111,6 +111,7 @@ class SpurDispatchTest(unittest.TestCase):
             if sys.argv[1] == "run" and "--privileged" in sys.argv:
                 import time
                 time.sleep(float(os.environ.get("HOST_CLEANUP_DELAY", "0")))
+                sys.stderr.write(os.environ.get("HOST_CLEANUP_STDERR", ""))
                 sys.exit(int(os.environ.get("HOST_CLEANUP_RC", "0")))
             if sys.argv[1] == "run" and "--entrypoint" in sys.argv and "test-image" in sys.argv:
                 import io
@@ -264,6 +265,34 @@ class SpurDispatchTest(unittest.TestCase):
         helper = runs[0][runs[0].index("--name") + 1]
         self.assertIn(["rm", "-f", helper], calls)
         self.assertEqual((self.run_dir / "rank-rc-0").read_text(), "9\n")
+
+    def test_a_host_denying_the_privileged_cleanup_is_recorded_as_unfit(self):
+        # Spur's authorization plugin denies --privileged on some hosts for
+        # every job: a strict drop records the host for pd_submit.sh to
+        # resubmit without, where any other failure records nothing.
+        denial = (
+            "docker: Error response from daemon: authorization denied by "
+            "plugin spur-authz: spur-authz: denied [P1]: --privileged\n"
+        )
+        for stderr, recorded in ((denial, True), ("no space left\n", False)):
+            with self.subTest(recorded=recorded):
+                shutil.rmtree(self.run_dir, ignore_errors=True)
+                self.run_job(
+                    "--spur-worker",
+                    ATOMESH_ENV_ATOMESH_DROP_HOST_CACHES="1",
+                    HOST_CLEANUP_RC="125",
+                    HOST_CLEANUP_STDERR=stderr,
+                    expected_rc=125,
+                )
+                unfit = self.run_dir / "unfit-hosts"
+                self.assertEqual(unfit.is_dir(), recorded)
+                if recorded:
+                    self.assertEqual(
+                        [p.name for p in unfit.iterdir()], [os.uname().nodename]
+                    )
+                log = (self.run_dir / "rank-0/host-memory-combined.log").read_text()
+                self.assertIn(stderr.strip(), log)
+                self.assertEqual((self.run_dir / "rank-rc-0").read_text(), "125\n")
 
     def test_host_cache_cleanup_timeout_blocks_service_and_removes_helper(self):
         self.run_job(

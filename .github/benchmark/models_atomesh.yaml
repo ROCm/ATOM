@@ -3677,10 +3677,14 @@ models:
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
         env: &issue382_a9_1p3d_store2560_env
+          # 1280 GiB of huge pages per NUMA node needs the privileged drop: g07,
+          # whose authorization plugin denies it, compacted neither node in
+          # 1800 s. A strict drop fails there at once, and the job is
+          # resubmitted without that node.
           common: &issue382_a9_1p3d_env_common
             <<: *issue382_a9_env_common
             ATOMESH_ISSUE382_METRICS: '0'
-            ATOMESH_DROP_HOST_CACHES: best_effort
+            ATOMESH_DROP_HOST_CACHES: '1'
             ATOMESH_DROP_HOST_CACHES_RANKS: '0'
           prefill: &issue382_a9_store2560_env_prefill
             <<: *issue382_a9_env_prefill

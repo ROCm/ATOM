@@ -543,9 +543,10 @@ submit_and_monitor_slurm_job() {
 
 # Spur ignores --exclusive and may place the job on a node whose GPUs another
 # job holds. The batch script then records the busy hosts in gpu-busy/ before
-# starting any worker; resubmit without them: among NODE_LIST on mi350, which
-# waits for the pool to drain when too few candidates remain, and by excluding
-# them where the scheduler picks the nodes.
+# starting any worker, as a strict host cache drop records in unfit-hosts/ a
+# host that denies its privileged helper; resubmit without them: among
+# NODE_LIST on mi350, which waits for the pool to drain when too few candidates
+# remain, and by excluding them where the scheduler picks the nodes.
 GPU_BUSY_RETRIES="${ATOMESH_GPU_BUSY_RETRIES:-6}"
 GPU_BUSY_WAIT_SECONDS="${ATOMESH_GPU_BUSY_WAIT_SECONDS:-300}"
 gpu_busy_attempt=0
@@ -557,9 +558,9 @@ while true; do
   else
     [[ -z "${NODE_LIST}" ]] || break
   fi
-  busy_dir="${LOG_ROOT}/slurm_job-${JOB_ID}/gpu-busy"
+  job_run_dir="${LOG_ROOT}/slurm_job-${JOB_ID}"
   shopt -s nullglob
-  busy_markers=("${busy_dir}"/*)
+  busy_markers=("${job_run_dir}"/gpu-busy/* "${job_run_dir}"/unfit-hosts/*)
   shopt -u nullglob
   [[ "${#busy_markers[@]}" -gt 0 ]] || break
   if (( gpu_busy_attempt >= GPU_BUSY_RETRIES )); then
