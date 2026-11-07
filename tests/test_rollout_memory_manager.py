@@ -13,7 +13,8 @@ from atom.rollout.memory_manager import MemoryManagerMixin
 
 
 class _SparseImpl(nn.Module):
-    """`SparseMHAPagedAttentionImpl`: holds `index_cache` and nothing else.
+    """`SparseMHAPagedAttentionImpl`: holds `index_cache` (and, with the FP4
+    index cache, its `index_scale` plane) and nothing else.
 
     The nesting is the whole point. MiniMax-M3's indexer slice is bound to the
     impl (`module.impl.index_cache`) while K/V go on the `Attention` around it,
@@ -24,6 +25,7 @@ class _SparseImpl(nn.Module):
     def __init__(self):
         super().__init__()
         self.index_cache = torch.empty(1)
+        self.index_scale = torch.empty(1)
 
 
 class _IndexerCache(nn.Module):
@@ -128,6 +130,8 @@ def test_release_kv_cache_drops_every_view_of_the_one_pool(monkeypatch):
     assert owner.k_scale is owner.v_scale is None
     # The impl's, which no sibling `k_cache` announces.
     assert owner.impl.index_cache is None
+    # The FP4 index cache's scale plane is a view of the same pool.
+    assert owner.impl.index_scale is None
     # And the one a level up, which only shares the name, keeps its value.
     assert outer.v_scale == 0.5
 
