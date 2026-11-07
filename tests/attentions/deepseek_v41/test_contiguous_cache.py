@@ -23,7 +23,8 @@ def geometry(dtype, slack=0):
         8,
         512,
         128,
-        kv_dtype=dtype,
+        kv_dtype="fp4" if dtype == "draft_fp4" else dtype,
+        fp4_window_layers=(2,) if dtype == "draft_fp4" else (),
         speculative_tokens=slack,
         layer_ratios=(0, 1, 2),
         index_topk=4,
@@ -141,7 +142,7 @@ def test_prefill_staging_cannot_grow_under_capture(monkeypatch):
     assert cache.prefill_window_staging.data_ptr() == pointer
 
 
-@pytest.mark.parametrize("dtype", ["fp4", "fp8"])
+@pytest.mark.parametrize("dtype", ["fp4", "fp8", "draft_fp4"])
 @pytest.mark.parametrize("slack", [0, 3])
 def test_planes_are_dense_disjoint_and_cover_exact_budget(dtype, slack):
     cache = PagedAttentionCache(geometry(dtype, slack), 7, 4, "cpu")
@@ -151,8 +152,8 @@ def test_planes_are_dense_disjoint_and_cover_exact_budget(dtype, slack):
     )
     for owner, ratio in cache.geometry.owners:
         data, scale = cache.main_view(owner)
-        assert data.shape == (7 * (32 // ratio), 256 if dtype == "fp4" else 512)
-        assert scale.shape == (data.shape[0], 32 if dtype == "fp4" else 16)
+        assert data.shape == (7 * (32 // ratio), 256 if cache.packed else 512)
+        assert scale.shape == (data.shape[0], 32 if cache.packed else 16)
         for plane in (data, scale):
             assert plane.is_contiguous()
             assert (
@@ -161,8 +162,9 @@ def test_planes_are_dense_disjoint_and_cover_exact_budget(dtype, slack):
             )
     for layer in range(3):
         data, scale = cache.ring_view(layer)
-        assert data.shape == (4 * (8 + slack), 512)
-        assert scale.shape == (data.shape[0], 16)
+        packed = dtype == "draft_fp4" and layer == 2
+        assert data.shape == (4 * (8 + slack), 256 if packed else 512)
+        assert scale.shape == (data.shape[0], 32 if packed else 16)
         assert data.is_contiguous() and scale.is_contiguous()
     assert sum(n for _, n in cache.unit_regions()) == cache.geometry.paged_bytes
     assert sum(v.shape[1] for _, v in cache.state_regions) == cache.geometry.state_bytes
@@ -267,7 +269,7 @@ def test_prefill_source_retains_history_until_ring_commit(dtype):
     assert cache.ring_view(0)[0].count_nonzero() == 0
 
 
-@pytest.mark.parametrize("dtype", ["fp4", "fp8", "bf16"])
+@pytest.mark.parametrize("dtype", ["fp4", "fp8", "bf16", "draft_fp4"])
 def test_checkpoint_and_overlapping_relocation_preserve_segments(dtype):
     cache = PagedAttentionCache(geometry(dtype, 3), 32, 4, "cpu")
     geo = cache.geometry

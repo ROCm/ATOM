@@ -3,6 +3,7 @@
 
 import logging
 from copy import copy
+from dataclasses import replace
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
@@ -10,11 +11,16 @@ from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.model_loader.weight_names import WeightsMapper
-from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
+from atom.model_ops.attentions.deepseek_v41.a8w4_attention import select_a8w4_backend
+from atom.model_ops.attentions.pool_layout.v41_pool_geometry import MAIN_FP4
+from atom.model_ops.blockscale import native_quant_linear, quantize_fp4, quantize_fp8
+from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.deepseek_v41.draft_block import DraftStep, draft_step, rotate_rows
 from atom.model_ops.deepseek_v41.dspark import (
     build_block_state,
     draft_attention,
+    draft_attention_csr,
+    draft_attention_quantized,
     draft_step_indices,
     fused_draft_kv_tail,
 )
@@ -43,7 +49,7 @@ logger = logging.getLogger("atom")
 
 
 class DraftAttention(Attention):
-    def context_keys(self, kv_normed, positions, rope, *, packed=False):
+    def context_keys(self, kv_normed, positions, rope, *, packed=False, fp4=False):
         """The context row alone, for a caller with no query to rotate with it.
 
         Takes the latent already normed, because its one caller normed it. A
@@ -51,6 +57,8 @@ class DraftAttention(Attention):
         them beside the query in a single launch instead.
         """
         keys = rotate_rows(rope, kv_normed, positions)
+        if fp4:
+            return quantize_fp4(keys, **MAIN_FP4)
         # Unlike V4's mixed NoPE/RoPE layout, V4.1 QAT covers all head lanes.
         return quantize_fp8(keys, dequantize=not packed)
 
@@ -62,14 +70,16 @@ class DraftAttention(Attention):
             view = self._wkv_shard = self.wqkv_a.shard_view(1)
         return view
 
-    def project_context(self, hidden, positions, rope, *, packed=False):
+    def project_context(self, hidden, positions, rope, *, packed=False, fp4=False):
         """Target keys alone; the query half is computed and dropped.
 
         As V4's draft does, and only on the unfused path -- when the stages
         fuse, `write_context_kv` reads `wkv_shard` and no query is projected.
         """
         _, kv_pre = self.project_qkv(hidden)
-        return self.context_keys(self.kv_norm(kv_pre), positions, rope, packed=packed)
+        return self.context_keys(
+            self.kv_norm(kv_pre), positions, rope, packed=packed, fp4=fp4
+        )
 
     def forward(self, hidden, hidden_scale, context_kv, step, rope, *, hidden_fp8=None):
         q_lora, kv_pre = self.project_qkv(
@@ -79,6 +89,66 @@ class DraftAttention(Attention):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
+        context = context_kv[self.spec.layer_id]
+        if isinstance(context, tuple):
+            fp4 = context[0].shape[-1] == self.head_dim // 2
+            if not fp4 and context[0].shape[-1] != self.head_dim:
+                raise ValueError("Quantized draft history has an invalid row width")
+            backend = (
+                select_a8w4_backend(self.heads, self.head_dim, self.softmax_scale)
+                if fp4
+                else "opus"
+            )
+            if not getattr(self, "_draft_attention_announced", False):
+                logger.info(
+                    "V4.1 draft layer %d: %s history, MXFP8 current KV, %s attention",
+                    self.spec.layer_id,
+                    "NVFP4" if fp4 else "MXFP8",
+                    (backend or "BF16 fallback") if fp4 else "opus A8W8",
+                )
+                self._draft_attention_announced = True
+            rows = kv_normed.shape[:-1].numel()
+            keys = (
+                torch.empty_like(kv_normed, dtype=FP8_DTYPE),
+                torch.empty(
+                    (*kv_normed.shape[:-1], self.head_dim // 32),
+                    dtype=torch.float8_e8m0fnu,
+                    device=query.device,
+                ),
+            )
+            query_fp8 = None
+            if backend is not None:
+                query_fp8 = (
+                    torch.empty_like(query, dtype=FP8_DTYPE),
+                    torch.empty(
+                        (*query.shape[:-1], self.head_dim // 32),
+                        dtype=torch.float8_e8m0fnu,
+                        device=query.device,
+                    ),
+                )
+            rope_quant_window(
+                query.view(rows, self.heads, self.head_dim),
+                kv_normed.view(rows, self.head_dim),
+                rope.cos_cache,
+                rope.sin_cache,
+                step.positions.flatten(),
+                rope_dim=rope.rope_dim,
+                values=keys[0].view(rows, self.head_dim),
+                scales=keys[1].view(rows, self.head_dim // 32),
+                query_fp8=query_fp8,
+            )
+            output = draft_attention_quantized(
+                query,
+                context,
+                keys,
+                self.attn_sink,
+                step,
+                self.softmax_scale,
+                fp4=fp4,
+                query_fp8=query_fp8,
+                backend=backend,
+            )
+            return self._project_out(output, rope, step.positions)
         # Both rotations and the quantized row in one launch.
         keys = torch.empty_like(kv_normed)
         rows = kv_normed.shape[:-1].numel()
@@ -93,7 +163,7 @@ class DraftAttention(Attention):
         )
         output = draft_attention(
             query,
-            context_kv[self.spec.layer_id],
+            context,
             keys,
             self.attn_sink,
             step,
@@ -162,6 +232,9 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 "V4.1 DSpark needs draft stages and a positive block width"
             )
         self.config = args
+        self.draft_kv_dtype = getattr(
+            getattr(config, "dspark", None), "draft_kv_dtype", "auto"
+        )
         self.block_size = args.dspark_block_size
         self.window_size, self.vocab_size = args.sliding_window, args.vocab_size
         draft = copy(args)
@@ -276,11 +349,16 @@ class DeepseekV41DSpark(DSparkDraftModel):
         hidden = self.project_context(aux_concat[: step.width].unsqueeze(0))
         positions = positions[: step.width][None]
         layers = self.context_layers
+        fp4 = cache.geometry.window_packed(layers[0].spec.layer_id)
         fused = self._context_kv_fusion()
         if fused is None:
             for attention in layers:
                 keys = attention.project_context(
-                    hidden, positions, self.rope, packed=cache.window_fp8
+                    hidden,
+                    positions,
+                    self.rope,
+                    packed=cache.window_fp8,
+                    **({"fp4": True} if fp4 else {}),
                 )
                 cache.write_window(attention.spec.layer_id, keys, step)
             return
@@ -292,7 +370,9 @@ class DeepseekV41DSpark(DSparkDraftModel):
             weight_group_rows=group_rows,
             weight_preshuffled=preshuffled,
         ).unflatten(-1, (len(layers), width))
-        tail = self._draft_kv_tail_fusion()
+        # The fused tail emits MXFP8. Quantize FP4 directly from rotated BF16,
+        # avoiding an extra FP8 QAT rounding before the NVFP4 conversion.
+        tail = None if fp4 else self._draft_kv_tail_fusion()
         if tail is None:
             # Concatenating the per-stage norms puts the stage axis in front,
             # which buys two things: each stage's rows become contiguous again
@@ -308,8 +388,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
                     for i, a in enumerate(layers)
                 ]
             )
-            keys = quantize_fp8(
-                self.rope(kv, positions.flatten()), dequantize=not cache.window_fp8
+            rotated = self.rope(kv, positions.flatten())
+            keys = (
+                quantize_fp4(rotated, **MAIN_FP4)
+                if fp4
+                else quantize_fp8(rotated, dequantize=not cache.window_fp8)
             )
         else:
             # Same stage-major result, one kernel: the cat is not fused but
@@ -502,11 +585,19 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # in the layer, so indexing them one at a time spent a gather and a
         # `.long()` cast apiece. The slices below are views.
         layer_ids = self._context_layer_ids(slots.device)
-        windows = cache.read_windows(layer_ids, slots)
-        context = {
-            layer.spec.layer_id: windows[i]
-            for i, layer in enumerate(self.context_layers)
-        }
+        fp4 = cache.geometry.window_packed(self.context_layers[0].spec.layer_id)
+        if fp4 or getattr(self, "draft_kv_dtype", "auto") == "fp8":
+            windows = cache.read_window_planes(layer_ids, slots, fp4=fp4)
+            context = {
+                layer.spec.layer_id: tuple(p[i] for p in windows)
+                for i, layer in enumerate(self.context_layers)
+            }
+        else:
+            windows = cache.read_windows(layer_ids, slots)
+            context = {
+                layer.spec.layer_id: windows[i]
+                for i, layer in enumerate(self.context_layers)
+            }
         # The slot -> position map and the block's index list are one closed
         # form over (positions, ring, window, width), so they come from a
         # single launch rather than the ~16 torch ops that spelled them out --
@@ -565,6 +656,14 @@ class DeepseekV41DSpark(DSparkDraftModel):
         )
         if step is None:
             step = draft_step(context_positions, anchors, width, self.window_size)
+        context = context_kv[self.mtp[0].attn.spec.layer_id]
+        if isinstance(context, tuple):
+            # The stages share visibility and source-relative row numbers,
+            # even though each stage owns different KV data. Rebuild once per
+            # invocation; a captured graph replays this with the live mask.
+            step = replace(
+                step, csr=draft_attention_csr(step.indices, context[0].shape[-2])
+            )
         for layer in self.mtp:
             state = layer(state, context_kv, step, self.rope)
         hidden = state.collapse()

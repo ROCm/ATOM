@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from atom.model_ops.attentions.deepseek_v41.planes import (
+    gather_window_planes,
     gather_windows,
     prefill_window,
     reset_windows,
@@ -61,21 +62,22 @@ class PagedAttentionCache:
         main_sizes = [
             pages * g.rows_per_page(ratio) * g.main_row_bytes for _, ratio in g.owners
         ]
-        window_size = slots * g.ring_slots * g.window_row_bytes
+        window_sizes = [
+            slots * g.ring_slots * g.window_layer_bytes(layer)
+            for layer in range(g.layers)
+        ]
         # Compressor rings and cursor retain the original entry-major layout.
         fields = g.state_fields[1:]
         state_size = g._aligned_bytes(fields)
         page_pad = g.page_bytes - sum(size // pages for size in main_sizes)
-        state_pad = (
-            g.state_bytes - g.layers * g.ring_slots * g.window_row_bytes - state_size
-        )
+        state_pad = g.state_bytes - g.all_window_bytes - state_size
         offsets, boundary = g.paged_extents(pages)
         index_bytes = boundary - pages * g.page_bytes
         auxiliary = (
             index_bytes + slots * state_size + pages * page_pad + slots * state_pad
         )
         self.allocations = self._allocate_buffers(
-            [auxiliary, *main_sizes, *([window_size] * g.layers)], device
+            [auxiliary, *main_sizes, *window_sizes], device
         )
         # Index rows, compressor state, cursor and alignment padding.
         self.backing = self.allocations[0]
@@ -112,7 +114,7 @@ class PagedAttentionCache:
         self.state_regions = [
             (f"window.{layer}.{part}", plane.view(slots, -1))
             for layer, source in enumerate(self.window_sources)
-            for part, plane in zip(("data", "scale"), split_source(source, g.head_dim))
+            for part, plane in zip(("data", "scale"), self.ring_view(layer))
         ]
         offset = state_end
         for name, count, width, regions in (
@@ -134,6 +136,11 @@ class PagedAttentionCache:
         # Layer pointers let DSpark gather several separately allocated windows
         # in one kernel, without joining or duplicating the persistent sources.
         self.window_layer_ids = torch.arange(g.layers, dtype=torch.int64, device=device)
+        self.window_formats = torch.tensor(
+            [g.window_packed(layer) for layer in range(g.layers)],
+            dtype=torch.bool,
+            device=device,
+        )
         self.window_ptrs = torch.tensor(
             [
                 [v.data_ptr() for v in self.ring_view(layer)]
@@ -600,6 +607,8 @@ class PagedAttentionCache:
                 slots,
                 self.geometry.ring_slots,
                 self.geometry.head_dim,
+                self.window_formats,
+                self.geometry.fp4_window_layers,
             )
             regions = self.state_aux_regions
         for _, region in regions:
@@ -928,6 +937,26 @@ class PagedAttentionCache:
             slots,
             self.geometry.ring_slots,
             self.geometry.head_dim,
+            self.window_formats,
+            self.geometry.fp4_window_layers,
+        )
+
+    def read_window_planes(self, layers, slots, *, fp4=False):
+        """Gather raw draft data/scales with live layer and slot IDs.
+
+        The selected stages must all use the requested NVFP4 or MXFP8 format.
+        The returned planes share one allocation, without a BF16 round trip.
+        """
+        self.require_committed()
+        if not self.window_fp8:
+            raise ValueError("Quantized drafting requires FP8 or FP4 window storage")
+        return gather_window_planes(
+            self.window_ptrs,
+            layers,
+            slots,
+            self.geometry.ring_slots,
+            self.geometry.head_dim,
+            fp4=fp4,
         )
 
     def query_fp8(self, query, *, a8w4=False):
@@ -1114,16 +1143,19 @@ class PagedAttentionCache:
 
     def ring_view(self, layer):
         if self.window_fp8:
-            return split_source(self.window_sources[layer], self.geometry.head_dim)
+            return split_source(
+                self.window_sources[layer],
+                self.geometry.head_dim,
+                self.geometry.window_packed(layer),
+            )
         return self.pool[self.geometry.window(layer, self.num_pages).ring_start :]
 
     def window_view(self, layer):
         """The layer's window data as [slots, ring, dim], for state inspection."""
         if not self.window_fp8:
             return self.state.view("window")[layer]
-        return self.ring_view(layer)[0].view(
-            self.num_slots, self.geometry.ring_slots, self.geometry.head_dim
-        )
+        data = self.ring_view(layer)[0]
+        return data.view(self.num_slots, self.geometry.ring_slots, data.shape[-1])
 
     def state_views(self, slot, *, checkpoint=False):
         self.require_committed()

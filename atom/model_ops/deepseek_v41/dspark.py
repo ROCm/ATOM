@@ -34,6 +34,166 @@ def draft_attention(query, context_kv, draft_kv, sink, step, scale):
     return sparse_attn(query, keys, sink, step.indices, scale)
 
 
+@triton.jit
+def _draft_csr(
+    indices,
+    prefix,
+    pp,
+    extend,
+    ep,
+    WIDTH: tl.constexpr,
+    RING: tl.constexpr,
+    BATCH: tl.constexpr,
+    BLOCK_BATCH: tl.constexpr,
+    ENTRIES: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    i = tl.arange(0, ENTRIES)
+    # Every query in a request has the same bidirectional mask. Count only
+    # its first row, in bounded tiles to avoid a B * ENTRIES register tensor.
+    # Each program computes its own prefix, so no cross-program barrier or
+    # separate scan launch is needed at the small batches used by drafting.
+    previous = tl.arange(0, BLOCK_BATCH)
+    pbase = tl.full((), 0, tl.int32)
+    ebase = tl.full((), 0, tl.int32)
+    for start in range(tl.cdiv(batch, BLOCK_BATCH)):
+        requests = start * BLOCK_BATCH + previous
+        earlier = tl.load(
+            indices + requests[:, None] * WIDTH * (RING + WIDTH) + i[None, :],
+            (requests[:, None] < batch) & (i[None, :] < RING + WIDTH),
+            other=-1,
+        )
+        pbase += (
+            tl.sum(tl.sum(((earlier >= 0) & (earlier < RING)).to(tl.int32), 1), 0)
+            * WIDTH
+        )
+        ebase += tl.sum(tl.sum((earlier >= RING).to(tl.int32), 1), 0) * WIDTH
+    ids = tl.load(
+        indices + batch * WIDTH * (RING + WIDTH) + i, i < RING + WIDTH, other=-1
+    )
+    history = (ids >= 0) & (ids < RING)
+    current = ids >= RING
+    pi = tl.cumsum(history.to(tl.int32)) - 1
+    ei = tl.cumsum(current.to(tl.int32)) - 1
+    pc = tl.sum(history.to(tl.int32), 0)
+    ec = tl.sum(current.to(tl.int32), 0)
+    for query in tl.static_range(WIDTH):
+        row = batch * WIDTH + query
+        pb = pbase + query * pc
+        eb = ebase + query * ec
+        tl.store(pp + row, pb)
+        tl.store(ep + row, eb)
+        tl.store(prefix + pb + pi, batch * RING + ids, history)
+        tl.store(extend + eb + ei, batch * WIDTH + ids - RING, current)
+    if batch == BATCH - 1:
+        tl.store(pp + BATCH * WIDTH, pbase + WIDTH * pc)
+        tl.store(ep + BATCH * WIDTH, ebase + WIDTH * ec)
+
+
+def draft_attention_csr(indices, ring):
+    """Two CSR sources for request-shared bidirectional draft masks, in one launch.
+
+    Capacities follow the graph's tensor shapes. Counts and slot-relative row
+    IDs are rebuilt on device, including after rejection or request reordering.
+    All queries of a request must share one mask, as produced by ``draft_step``
+    and ``draft_step_indices``. The physical ring order is preserved.
+    """
+    batch, width, entries = indices.shape
+    if entries != ring + width:
+        raise ValueError("Draft indices must cover the history ring and whole block")
+    indices = indices.contiguous()
+    rows = batch * width
+    pp, ep = [
+        torch.empty(rows + 1, device=indices.device, dtype=torch.int32)
+        for _ in range(2)
+    ]
+    prefix = torch.empty(rows * ring, device=indices.device, dtype=torch.int32)
+    extend = torch.empty(rows * width, device=indices.device, dtype=torch.int32)
+    if rows:
+        _draft_csr[(batch,)](
+            indices,
+            prefix,
+            pp,
+            extend,
+            ep,
+            width,
+            ring,
+            batch,
+            min(16, triton.next_power_of_2(batch)),
+            triton.next_power_of_2(entries),
+        )
+    else:
+        pp.zero_()
+        ep.zero_()
+    return prefix, pp, extend, ep
+
+
+def draft_attention_quantized(
+    query,
+    context_kv,
+    draft_kv,
+    sink,
+    step,
+    scale,
+    *,
+    fp4,
+    query_fp8=None,
+    backend="opus",
+):
+    """MXFP8 query/current KV over NVFP4 or MXFP8 historical windows.
+
+    Both kernels consume the same two-source CSR and output layout. Only the
+    FP4 path supports the existing BF16 adapter when ``backend`` is None.
+    """
+
+    if fp4 and backend is None:
+        from atom.model_ops.attentions.deepseek_v41.planes import decode_planes
+
+        return draft_attention(
+            query,
+            decode_planes(context_kv, fp4=True),
+            decode_planes(draft_kv, fp4=False),
+            sink,
+            step,
+            scale,
+        )
+    if query_fp8 is None:
+        raise ValueError("Quantized draft attention requires MXFP8 query planes")
+    if fp4:
+        from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
+            sparse_attn_v41_a8w4_paged_2src,
+        )
+
+        attend = sparse_attn_v41_a8w4_paged_2src
+        options = {"backend": backend}
+    else:
+        from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+            sparse_attn_v41_paged_2src,
+        )
+
+        attend = sparse_attn_v41_paged_2src
+        options = {}
+    csr = step.csr
+    if csr is None:
+        csr = draft_attention_csr(step.indices, context_kv[0].shape[-2])
+    pi, pp, ei, ep = csr
+    output = torch.empty_like(query)
+    attend(
+        tuple(p.flatten(0, 1) for p in query_fp8),
+        tuple(p.flatten(0, 1) for p in context_kv),
+        pi,
+        pp,
+        tuple(p.flatten(0, 1) for p in draft_kv),
+        ei,
+        ep,
+        sink,
+        scale,
+        out=output.flatten(0, 1),
+        **options,
+    )
+    return output
+
+
 # ---------------------------------------------------------------------------
 # The stages' rolling windows, gathered in one coalesced pass.
 #
