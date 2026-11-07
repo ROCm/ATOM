@@ -11,6 +11,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.config import get_current_atom_config
+from atom.model_ops.fused_moe.expert_layout import topk_padding_mask
 from atom.utils import envs
 
 try:
@@ -2694,7 +2695,7 @@ def eplb_append_shared_map_and_record_fused(
 def _append_shared_torch(topk_weights, topk_ids, num_shared, base, weight):
     """`_eplb_route_kernel`'s shared columns, for a build without Triton."""
     rows = topk_ids.shape[0]
-    pad = topk_ids[:, :1] < 0
+    pad = topk_padding_mask(topk_ids)
     shared_ids = torch.arange(base, base + num_shared, device=topk_ids.device)
     shared_ids = torch.where(pad, -1, shared_ids.to(topk_ids.dtype))
     shared_w = torch.where(pad, 0.0, weight).to(topk_weights.dtype)

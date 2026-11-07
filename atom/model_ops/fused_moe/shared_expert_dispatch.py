@@ -17,6 +17,8 @@ ordinary routed logical expert and placement handles it.
 
 import torch
 
+from atom.model_ops.fused_moe.expert_layout import topk_padding_mask
+
 try:
     import triton
     import triton.language as tl
@@ -49,7 +51,7 @@ def _remap_torch(
         device=topk_ids.device,
     ).expand(num_tokens, num_fused_shared_experts)
     # A pad row (routed to -1 throughout) takes no shared expert either.
-    pad = topk_ids[:, :1] < 0
+    pad = topk_padding_mask(topk_ids)
     shared_ids = torch.where(pad, -1, shared_ids)
     shared_w = torch.where(pad, 0.0, shared_weight).to(topk_weights.dtype)
     return (

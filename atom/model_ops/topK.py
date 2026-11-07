@@ -8,7 +8,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
-from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
+from atom.model_ops.fused_moe.expert_layout import SharedExpertMode, topk_padding_mask
 from atom.model_ops.triton_topk_softmax import triton_topk_softmax
 from atom.model_ops.utils import _has_module
 from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
@@ -202,9 +202,9 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
     top_k = layer.top_k
     # Routing has already marked padded and DP-dummy rows with -1. Restoring
     # a shared id on those rows would make the gathered dummy run that expert.
-    topk_ids[:, top_k:] = torch.where(
-        topk_ids[:, :1] >= 0, total_topk_ids[:rows, top_k:], -1
-    )
+    shared_ids = topk_ids[:, top_k:]
+    shared_ids.copy_(total_topk_ids[:rows, top_k:])
+    shared_ids.masked_fill_(topk_padding_mask(topk_ids), -1)
 
 
 # Rows per CU up to which `triton_topk_softmax` is faster than AITER's
