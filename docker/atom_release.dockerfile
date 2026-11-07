@@ -442,6 +442,10 @@ FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
 FROM base AS atom_image
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="HEAD"
+ARG GPU_ARCH
+
+# Gate: every serving-critical HIP payload must cover GPU_ARCH (default gfx942;gfx950).
+COPY docker/scripts/verify_rocm_image_gpu_arches.py /tmp/verify_rocm_image_gpu_arches.py
 
 # pip packages (lm-eval is lightweight, install directly)
 RUN pip install lm-eval[api]
@@ -883,5 +887,10 @@ RUN set -eux; \
     # a successfully published image carrying the stock runtime.
     hsa="$(grep -m1 '^libhsa-runtime64\.so\.' /opt/rocm/.info/atom-rocm-runtime-sonames)"; \
     nm -D "/opt/rocm/lib/$hsa" | grep -q hsa_amd_signal_create_v2
+
+RUN echo "========== [ATOM] Verify multi-arch HIP payloads ==========" && \
+    "${VENV_PYTHON:-/opt/venv/bin/python}" /tmp/verify_rocm_image_gpu_arches.py \
+      --required-arches "${GPU_ARCH:-${GPU_ARCH_LIST}}" \
+      --strict-coverage
 
 CMD ["/bin/bash"]
