@@ -625,6 +625,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
+    # DeepSeek-V4.1 FP4 main KV: quantize the compressed rows and scatter them
+    # into the pool in one kernel (`deepseek_v41/main_write.py`). 0 restores
+    # `quantize_fp4` + `_scatter_rows`; both write the same bytes.
+    "ATOM_DSV41_FUSED_MAIN_FP4": lambda: os.getenv("ATOM_DSV41_FUSED_MAIN_FP4", "1")
+    == "1",
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.

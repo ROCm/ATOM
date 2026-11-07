@@ -24,6 +24,7 @@ from atom.model_ops.deepseek_v41.index_write import (
     write_index_rows,
     write_index_rows_fp4,
 )
+from atom.model_ops.deepseek_v41.main_write import write_main_rows_fp4
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
@@ -32,7 +33,7 @@ from atom.model_ops.v4_kernels.state_writes import (
     swa_scatter_rows_reference,
     swa_write,
 )
-from atom.utils import CpuGpuBuffer, upload_numpy
+from atom.utils import CpuGpuBuffer, envs, upload_numpy
 
 from .indices import (
     build_indices,
@@ -584,6 +585,20 @@ class PagedAttentionCache:
             self, owner, compressor, values, scores, step, rope, scatter=scatter
         )
         if rotated is not None:
+            if self.packed and envs.ATOM_DSV41_FUSED_MAIN_FP4:
+                # One launch: quantize, resolve each plan row's address, store
+                # values and scales (`write_main_rows_fp4`, bit for bit the
+                # path below).
+                pages = self.pages.view(f"main_{owner}")[0]
+                half = rotated.shape[-1] // 2
+                write_main_rows_fp4(
+                    rotated[0],
+                    (pages[..., :half], pages[..., half:]),
+                    step.plans[compressor.ratio].compress_plan_gpu,
+                    step.block_tables,
+                    ratio=compressor.ratio,
+                )
+                return latent
             self._scatter_rows(
                 self.pages.view(f"main_{owner}")[0],
                 step,
