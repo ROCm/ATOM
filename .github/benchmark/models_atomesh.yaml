@@ -16614,6 +16614,21 @@ models:
               ATOMESH_M31_VLLM_SHA: 0f1fbe69071cf155e64468849186d808d0bc4141
               ATOMESH_M31_D_MAX_SEQS: "20"
               ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1900000000000"
+        - <<: *m31_moriio_1p2d_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-c128-skip-dcap16-cpu19
+          concurrency: [128]
+          env:
+            common:
+              ATOMESH_M31_VLLM_SHA: 0f1fbe69071cf155e64468849186d808d0bc4141
+              ATOMESH_M31_D_MAX_SEQS: "16"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1900000000000"
+        - <<: *m31_moriio_1p2d_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-c48-skip-dcap12
+          concurrency: [48]
+          env:
+            common:
+              ATOMESH_M31_VLLM_SHA: 0f1fbe69071cf155e64468849186d808d0bc4141
+              ATOMESH_M31_D_MAX_SEQS: "12"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
