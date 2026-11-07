@@ -16612,3 +16612,17 @@ models:
         - <<: *m31_moriio_1p1d_sn_case
           name: m31-flash-vllm-moriio-rdma-1p1d-sn-c128
           concurrency: [128]
+        # Low concurrency on 8 chips instead of 12: 1P2D C24 is 20% under SA.
+        - <<: *m31_moriio_1p1d_sn_case
+          name: m31-flash-vllm-moriio-rdma-1p1d-sn-c24-skip
+          concurrency: [24]
+          env:
+            common:
+              ATOMESH_M31_VLLM_SHA: 0f1fbe69071cf155e64468849186d808d0bc4141
+        - <<: *m31_moriio_1p1d_sn_case
+          name: m31-flash-vllm-moriio-rdma-1p1d-sn-c32-skip-dcap12
+          concurrency: [32]
+          env:
+            common:
+              ATOMESH_M31_VLLM_SHA: 0f1fbe69071cf155e64468849186d808d0bc4141
+              ATOMESH_M31_D_MAX_SEQS: "12"
