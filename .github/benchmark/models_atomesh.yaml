@@ -3769,6 +3769,32 @@ models:
             MOONCAKE_STORE_EVICTION_HIGH_WATERMARK: '0.97'
             MOONCAKE_STORE_EVICTION_RATIO: '0.03'
           decode: *issue382_a9_env_decode
+      # At C180 the p90 TTFT is mostly the prefill queue (2.1 s of 3 s), not
+      # its compute: a cold prefill of 100K+ new tokens takes every 8192-token
+      # batch for 2-3 s while the requests behind it, most of them under 2K
+      # new tokens, wait. Capping a request at 4096 per batch leaves them half.
+      - &issue382_a9_1p2d_c180_lpt4096
+        <<: *issue382_a9_1p2d_c180
+        name: issue382-a9-1p2d-c180-lpt4096
+        prefill:
+          workers: 1
+          tp: 1
+          extra_args: --pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192 --long-prefill-token-threshold 4096
+      - <<: *issue382_a9_1p2d_c180_lpt4096
+        name: issue382-a9-1p2d-c200-lpt4096
+        concurrency:
+        - 200
+        decode:
+          workers: 2
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,136]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 400
+            decode_max_num_seqs: 136
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
       # Past C200 the prefill node's 2.5 TiB no longer holds the sessions: the
       # second node's memory joins the Store (1.75 TiB), and each decode keeps
       # 0.94 of its VRAM for the 110-120 sessions it serves. Every owner sits
