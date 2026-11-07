@@ -878,6 +878,24 @@ start_mooncake_store
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 
+    def test_a_wait_for_a_server_stops_once_another_node_failed(self):
+        # A decode node waits up to WAIT_SERVER_TIMEOUT for the router of a
+        # prefill node whose Store failed to start.
+        source = SERVER_SCRIPT.read_text()
+        wait_http = "wait_http() {" + source.split("wait_http() {")[1].split("\n}\n")[0]
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-0").write_text("1\n")
+        result = self.run_shell(
+            wait_http + '\n}\nwait_http "http://127.0.0.1:9/health" router 600\n',
+            expect_rc=1,
+            RUN_DIR=str(run_dir),
+            NODE_RANK="1",
+        )
+        self.assertIn(
+            "router: another node's launcher exited (rank-rc-0=1)", result.stderr
+        )
+
     def test_a_wait_timeout_with_a_leading_zero_waits_that_many_seconds(self):
         # Bash arithmetic would read 0600 as octal, 384 s, and refuse 0900
         # with the Store already started.

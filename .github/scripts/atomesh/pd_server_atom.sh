@@ -807,9 +807,14 @@ wait_http() {
   local timeout="$3"
   local pid="${4:-}"
   local deadline=$(( $(date +%s) + timeout ))
+  local peer
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
     exit_if_mooncake_store_died
+    if peer="$(failed_peer_node)"; then
+      echo "[wait][FAIL] ${name}: another node's launcher exited (${peer})" >&2
+      exit 1
+    fi
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
       set +e
       wait "${pid}"
@@ -1549,9 +1554,9 @@ stop_mooncake_store() {
 }
 
 # Prints the rank-rc-* of another node whose launcher exited non-zero
-# (pd_slurm_job.sh publishes one per node as it exits): the Store owners or
-# masters that node was to bring never come.
-mooncake_store_failed_peer() {
+# (pd_slurm_job.sh publishes one per node as it exits): the servers, router or
+# Store owners that node was to bring never come.
+failed_peer_node() {
   local f rc
   for f in "${RUN_DIR}"/rank-rc-*; do
     [[ -f "${f}" && "${f}" != *.tmp && "${f##*/}" != "rank-rc-${NODE_RANK}" ]] || continue
@@ -1578,7 +1583,7 @@ wait_for_mooncake_store() {
       stop_mooncake_store || true
       exit "${mooncake_store_failed_rc}"
     fi
-    if peer="$(mooncake_store_failed_peer)"; then
+    if peer="$(failed_peer_node)"; then
       echo "[wait][FAIL] mooncake-store ${what}: another node's launcher exited (${peer})" >&2
       stop_mooncake_store || true
       exit 1
