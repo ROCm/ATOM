@@ -469,6 +469,10 @@ else
     # LMCache CPU pool out rather than dropping its page cache.
     AUTO_EXCLUDE="pit2-p03-g07,pit2-p03-g08,pit2-p03-g15,pit2-p03-g24,pit2-p03-g25,pit2-p03-g27,pit2-p03-g40"
     SBATCH_CMD+=(--exclude "${AUTO_EXCLUDE}")
+    # Other tenants' host-network containers have taken the router's 8000 while
+    # the prefill loaded; move every service port off the defaults, below the
+    # ephemeral range (32768) that outgoing connections take theirs from.
+    export ATOMESH_SERVICE_PORT_OFFSET="${ATOMESH_SERVICE_PORT_OFFSET:-2000}"
   fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
