@@ -455,6 +455,7 @@ class QuantizationConfig:
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
         if (
             not use_online_quant
+            and "routed_expert_" not in layer_name
             and checkpoint_layer_key(layer_name) in self._stored_unquantized
         ):
             return LayerQuantConfig(quant_dtype=self.torch_dtype)

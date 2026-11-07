@@ -1498,16 +1498,9 @@ models:
               <<: *kimi_k3_pd_dspark4_args
               max_num_seqs: 112
           env:
-            common:
-              <<: &kimi_k3_pp8_reuse_env
-                <<: *kimi_k3_pp8_ondemand_env
-                AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
-              # 10 s of decode trace, 900 s into the aiperf Profiling phase.
-              ATOMESH_TORCH_PROFILE_START: "900"
-              ATOMESH_TORCH_PROFILE_DURATION: "10"
-              ATOMESH_TORCH_PROFILE_ROLES: decode
-              ATOM_PROFILER_MORE: "0"
-              ATOM_PROFILER_TIMEOUT: "1800"
+            common: &kimi_k3_pp8_reuse_env
+              <<: *kimi_k3_pp8_ondemand_env
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
             prefill: *kimi_k3_pp8_state128_prefill_env
             decode: *kimi_k3_pd_decode_env
 

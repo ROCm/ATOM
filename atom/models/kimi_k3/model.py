@@ -408,6 +408,19 @@ class KimiSparseMoeBlock(nn.Module):
             self.shared_experts = None
 
         if self.use_latent_moe:
+
+            def _routed_source_quant_dtype(layer_prefix: str) -> torch.dtype | None:
+                if quant_config is None:
+                    return None
+                layer_quant_config = quant_config.get_layer_quant_config(layer_prefix)
+                if (
+                    layer_quant_config.quant_type == QuantType.per_1x32
+                    and layer_quant_config.quant_dtype
+                    == getattr(torch, "float4_e2m1fn_x2", None)
+                ):
+                    return torch.bfloat16
+                return None
+
             down_proj_prefix = f"{prefix}.routed_expert_down_proj"
             up_proj_prefix = f"{prefix}.routed_expert_up_proj"
             self.routed_expert_down_proj = ReplicatedLinear(
@@ -415,6 +428,7 @@ class KimiSparseMoeBlock(nn.Module):
                 self.moe_hidden_size,
                 bias=False,
                 quant_config=quant_config,
+                source_quant_dtype=_routed_source_quant_dtype(down_proj_prefix),
                 prefix=down_proj_prefix,
             )
             self.routed_expert_up_proj = ReplicatedLinear(
@@ -422,6 +436,7 @@ class KimiSparseMoeBlock(nn.Module):
                 config.hidden_size,
                 bias=False,
                 quant_config=quant_config,
+                source_quant_dtype=_routed_source_quant_dtype(up_proj_prefix),
                 prefix=up_proj_prefix,
             )
             up_proj_quant_type, up_proj_quant_dtype = _effective_layer_quant(
