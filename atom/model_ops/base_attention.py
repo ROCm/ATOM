@@ -236,7 +236,7 @@ def _flydsl_explicit_plan_api() -> bool:
             hasattr(mod, "plan_pa_decode")
             and plan is not None
             and plan.kind is inspect.Parameter.KEYWORD_ONLY
-            and plan.default is inspect.Parameter.empty
+            and plan.default in (inspect.Parameter.empty, None)
             and "max_context_length" in params
         )
     if not ok:

@@ -1273,8 +1273,8 @@ class TestExplicitPlan:
         ubatch[0] = 0
         assert self._call(ba, owner=step, cache_owner=step) is ub0
 
-    def test_old_aiter_api_takes_gluon(self, monkeypatch):
-        """An aiter without #5809's required work plan must not be routed."""
+    def test_explicit_plan_api_accepts_required_or_optional_none(self, monkeypatch):
+        """ATOM always passes a plan; aiter may also allow callers to omit it."""
         from atom.model_ops import base_attention as ba
 
         mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
@@ -1286,10 +1286,10 @@ class TestExplicitPlan:
             raise AssertionError("not called")
 
         try:
-            for old in (optional_plan, no_bound):
+            for old, expected in ((optional_plan, True), (no_bound, False)):
                 monkeypatch.setattr(mod, "pa_decode", old)
                 ba._flydsl_explicit_plan_api.cache_clear()
-                assert ba._flydsl_explicit_plan_api() is False, old.__name__
+                assert ba._flydsl_explicit_plan_api() is expected, old.__name__
         finally:
             monkeypatch.undo()
             ba._flydsl_explicit_plan_api.cache_clear()
