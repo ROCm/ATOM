@@ -18,7 +18,7 @@ docker exec \
 
     echo "=== Reinstalling amd-aiter from ROCm/aiter ref: ${AITER_GIT_REF} ==="
     python3 -m pip uninstall -y amd-aiter || true
-    python3 -m pip install --upgrade "pybind11>=3.0.1"
+    python3 -m pip install "pybind11>=3.0.1" "setuptools_scm[toml]>=6.2" vcs_versioning wheel
     python3 -m pip show pybind11
 
     rm -rf /app/aiter-test
@@ -29,8 +29,12 @@ docker exec \
     git submodule sync
     git submodule update --init --recursive
 
-    MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
+    # Keep the immutable image runtime. PEP 517 avoids the legacy
+    # setup_requires resolver that fails on incomplete package metadata.
+    AITER_USE_SYSTEM_TRITON=1 AITER_MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 \
+      python3 -m pip install --no-build-isolation --no-deps -e .
 
     echo "=== AITER version AFTER reinstall ==="
-    python3 -m pip show amd-aiter
+    git rev-parse HEAD
+    python3 -m pip show amd-aiter torch triton flydsl pybind11 setuptools setuptools_scm vcs_versioning
   '
