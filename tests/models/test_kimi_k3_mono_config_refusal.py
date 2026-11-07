@@ -165,3 +165,16 @@ def test_the_query_cap_bounds_the_speculative_width(servable, draft_tokens, refu
         method="dspark", num_speculative_tokens=draft_tokens
     )
     assert (config_refusal(atom_config) is not None) is refused
+
+
+@pytest.mark.parametrize(
+    ("ssm", "refused"), [("fp32", False), ("fp16", False), ("bf16", True)]
+)
+def test_the_recurrent_state_dtype_gate(servable, monkeypatch, ssm, refused):
+    # K1 reads the pool in place as fp32 or fp16; a bf16 one would be
+    # reinterpreted rather than converted
+    monkeypatch.setattr(k3_config.envs, "ATOM_GDN_SSM_DTYPE", ssm)
+    reason = config_refusal(_atom_config())
+    assert (reason is not None) is refused
+    if refused:
+        assert f"ATOM_GDN_SSM_DTYPE={ssm}" in reason
