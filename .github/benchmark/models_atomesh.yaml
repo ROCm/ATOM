@@ -3865,16 +3865,33 @@ models:
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
         env:
-          common:
+          common: &issue382_a9_pernic4352_env_common
             <<: *issue382_a9_1p3d_env_common
             ATOMESH_DROP_HOST_CACHES_RANKS: 0,1
-          prefill:
+          prefill: &issue382_a9_pernic4352_env_prefill
             <<: *issue382_a9_store2560_env_prefill
             MOONCAKE_STORE_POOLS: per_nic
             MOONCAKE_STORE_OWNERS: 0:640:rdma0;0:640:rdma1;1:640:rdma2;1:640:rdma3
             MOONCAKE_STORE_DECODE_OWNERS: 0:448:rdma0;0:448:rdma1;1:448:rdma2;1:448:rdma3
           decode: *issue382_a9_env_decode
-      - <<: *issue382_a9_1p2d_c220_pernic4352
+      # At C220 a turn's 3.1 s TTFT holds 0.45 s of re-encoding its history
+      # at both API servers and 0.7 s of prefill queue, where at any moment
+      # 3-11 requests (p50-p90) wait on the one load thread.
+      - &issue382_a9_1p2d_c220_pernic4352_tuned
+        <<: *issue382_a9_1p2d_c220_pernic4352
+        name: issue382-a9-1p2d-c220-pernic4352-tuned
+        env:
+          common: &issue382_a9_pernic4352_tuned_env_common
+            <<: *issue382_a9_pernic4352_env_common
+            ATOM_TOKENIZE_CACHE_MB: '2048'
+          prefill: &issue382_a9_pernic4352_tuned_env_prefill
+            <<: *issue382_a9_pernic4352_env_prefill
+            OFFLOAD_COPY_WORKERS: '2'
+            OFFLOAD_LOAD_WORKERS: '2'
+            OFFLOAD_COPY_HIGH_PRIORITY: '1'
+          decode: *issue382_a9_env_decode
+      - &issue382_a9_1p2d_c240_pernic4352
+        <<: *issue382_a9_1p2d_c220_pernic4352
         name: issue382-a9-1p2d-c240-pernic4352
         concurrency:
         - 240
@@ -3890,6 +3907,12 @@ models:
             decode_max_num_seqs: 160
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+      - <<: *issue382_a9_1p2d_c240_pernic4352
+        name: issue382-a9-1p2d-c240-pernic4352-tuned
+        env:
+          common: *issue382_a9_pernic4352_tuned_env_common
+          prefill: *issue382_a9_pernic4352_tuned_env_prefill
+          decode: *issue382_a9_env_decode
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c330
         concurrency:
