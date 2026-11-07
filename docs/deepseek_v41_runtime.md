@@ -148,11 +148,14 @@ restores STATE through the same PAGE-backed checkpoint images the local prefix
 cache uses (`get_kv_transfer_tensors` publishes each plane of a unit, in
 `StateCopies` order).
 
-That admission is native-only. On the plugin backend every KV connector is
-refused, `lmcache_mp` included: vLLM resolves the connector through its own
-registry, so what runs there is vLLM's `LMCacheMPConnector` rather than the
-ATOM transport that publishes those checkpoint images, and a hit would restore
-PAGEs whose STATE nobody wrote.
+That admission is native-only. On the plugin backend `lmcache_mp` is refused:
+vLLM resolves the connector through its own registry, so what runs there is
+vLLM's `LMCacheMPConnector` rather than the ATOM transport that publishes those
+checkpoint images, and a hit would restore PAGEs whose STATE nobody wrote. The
+plugin's one connector is `AtomLMCacheOffloadConnector`, which needs V4.1's
+state checkpoints on and stores each boundary's checkpoint in the same object
+as the PAGE KV ending there; see
+[the LMCache recipe](../recipes/atom_vllm/DeepSeek-V4.1-Flash-LMCache-Byte-Offload.md).
 DP attention supports text requests and prefill TBO.
 Compilation level 3 is admitted with FULL graphs or eager execution; the
 [AgentX recipe](../recipes/DeepSeek-V4.1-Flash-Agentic.md) records TP2/TP4
