@@ -56,7 +56,6 @@ from atom.kv_transfer.offload._block_gpu_connector import (
 from atom.kv_transfer.offload._offload_common import pp_aware_rank_and_world
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
-from atom.kv_transfer.offload.page_codec import pure_page_codec, replays_state
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
 from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store.config import (
@@ -84,6 +83,7 @@ from atom.kv_transfer.offload.mooncake_store.scheduler import (
     require_monotonic_clock_id,
 )
 from atom.kv_transfer.offload.mooncake_store.taint import TaintMarker
+from atom.kv_transfer.offload.page_codec import pure_page_codec, replays_state
 from atom.utils import envs
 
 logger = logging.getLogger("atom")

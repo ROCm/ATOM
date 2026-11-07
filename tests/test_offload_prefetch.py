@@ -743,3 +743,25 @@ def test_explicit_prefetch_rejects_connector_without_async_lookup():
         scheduler._make_offload_prefetch(SimpleNamespace(offload_prefetch=False))
         is None
     )
+
+
+@pytest.mark.parametrize("supported", [False, True])
+@pytest.mark.parametrize("policy", ["least_requests", "prefix_spread"])
+def test_automatic_prefetch_uses_actual_connector_capability(
+    monkeypatch, supported, policy
+):
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    monkeypatch.setattr(
+        KVConnectorFactory,
+        "offload_tier",
+        lambda config: SimpleNamespace(min_load_tokens=512),
+    )
+    scheduler = object.__new__(Scheduler)
+    scheduler.kv_connector = SimpleNamespace(supports_async_lookup=supported)
+    config = SimpleNamespace(
+        offload_prefetch=None, dp_load_balance=policy, offload_prefetch_max_kv_usage=0.8
+    )
+    result = scheduler._make_offload_prefetch(config)
+    assert (result is not None) == (supported and policy == "prefix_spread")
+    assert config.offload_prefetch is None

@@ -2156,7 +2156,7 @@ class Config:
     # waiting request's tier load before its turn (`--offload-prefetch`).
     # Unset (None): on with prefix-spread DP routing when the configured
     # connector answers tier lookups asynchronously
-    # (`OffloadTierProfile.async_lookup`).
+    # (the constructed connector's `supports_async_lookup`).
     offload_prefetch: bool | None = None
     # No prefetch allocation once it would take the KV pool past this
     # fraction in use.
@@ -2712,15 +2712,8 @@ class Config:
             else torch.bfloat16
         )
 
-        if self.offload_prefetch is None:
-            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-            # Measured only under prefix-spread routing, which moves requests
-            # onto ranks that must load their prefix: on there by default.
-            self.offload_prefetch = (
-                self.dp_load_balance == "prefix_spread"
-                and KVConnectorFactory.offload_tier(self).async_lookup
-            )
+        # Keep None as automatic: the constructed adapter may only support
+        # synchronous lookup despite its connector family's registry entry.
         if self.offload_prefetch:
             from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 

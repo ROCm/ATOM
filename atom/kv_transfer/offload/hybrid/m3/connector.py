@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import logging
 
-
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import (
