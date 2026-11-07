@@ -469,7 +469,7 @@ else
   # Diagnostic retry: these hosts failed GPU-idle preflight in the first A/B.
   # Keep placement automatic while avoiding the confirmed occupied nodes.
   if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd" && -z "${NODE_LIST}" ]]; then
-    SBATCH_CMD+=(--exclude pit2-p03-g27,pit2-p03-g53)
+    SBATCH_CMD+=(--exclude pit2-p03-g08,pit2-p03-g27,pit2-p03-g52,pit2-p03-g53)
   fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
@@ -525,9 +525,16 @@ GPU_BUSY_RETRIES="${ATOMESH_GPU_BUSY_RETRIES:-6}"
 GPU_BUSY_WAIT_SECONDS="${ATOMESH_GPU_BUSY_WAIT_SECONDS:-300}"
 gpu_busy_attempt=0
 declare -A gpu_busy_nodes=()
+auto_spur_retry=0
+if [[ "${USES_SPUR_CONTROLLER}" == "1" && "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd" && -z "${NODE_LIST}" ]]; then
+  auto_spur_retry=1
+  gpu_busy_nodes=(
+    [pit2-p03-g08]=1 [pit2-p03-g27]=1 [pit2-p03-g52]=1 [pit2-p03-g53]=1
+  )
+fi
 while true; do
   submit_and_monitor_slurm_job
-  [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" && -n "${NODE_LIST}" ]] || break
+  [[ ( "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" && -n "${NODE_LIST}" ) || "${auto_spur_retry}" == "1" ]] || break
   busy_dir="${LOG_ROOT}/slurm_job-${JOB_ID}/gpu-busy"
   shopt -s nullglob
   busy_markers=("${busy_dir}"/*)
@@ -541,6 +548,19 @@ while true; do
   for marker in "${busy_markers[@]}"; do
     gpu_busy_nodes["$(basename "${marker}")"]=1
   done
+  if [[ "${auto_spur_retry}" == "1" ]]; then
+    # The previous submission is terminal and has an explicit GPU-busy marker.
+    # Replace the exclusion value; never turn automatic placement into a pin.
+    retry_excludes="$(IFS=,; echo "${!gpu_busy_nodes[*]}")"
+    for index in "${!SBATCH_CMD[@]}"; do
+      if [[ "${SBATCH_CMD[index]}" == "--exclude" ]]; then
+        SBATCH_CMD[index+1]="${retry_excludes}"
+        break
+      fi
+    done
+    echo "=== GPUs busy; resubmitting (${gpu_busy_attempt}/${GPU_BUSY_RETRIES}), excluding ${retry_excludes} ==="
+    continue
+  fi
   free_nodes=()
   for node in "${NODE_ARRAY[@]}"; do
     [[ -n "${gpu_busy_nodes[${node}]:-}" ]] || free_nodes+=("${node}")
