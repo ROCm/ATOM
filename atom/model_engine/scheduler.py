@@ -1453,23 +1453,6 @@ class Scheduler:
             and self._can_detach_tier_lookup(seq, self._probe_hbm_prefix(seq))
         )
 
-    def _tier_pending_head(self) -> bool:
-        """Whether one of the first waiting heads waits only on the offload
-        tier: its lookup is in flight or its load is still running. The
-        delayer holds a FIRE briefly for such a rank (`tier_pending`)."""
-        if self.kv_connector is None:
-            return False
-        for i, seq in enumerate(self.waiting):
-            if i >= 4:
-                break
-            if seq.status == SequenceStatus.ABORTED:
-                continue
-            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                return True
-            if self._head_waits_on_tier_lookup(seq):
-                return True
-        return False
-
     def _kv_usage(self) -> float:
         """Fraction of KV-cache blocks currently in use ∈ [0, 1].
 
@@ -2229,36 +2212,12 @@ class Scheduler:
                     len(self.waiting),
                     max(0, self.max_num_seqs - len(self.running)),
                 ),
-                tier_pending=(not prefillable and self._tier_pending_head()),
             )
         else:
             decision = PrefillDecision(allow=True, prefillable_ranks=0)
             prefill_cost = 0.0
         self._arrived_requests = 0
         delayer_allows = decision.allow
-        # A vacuous FIRE (no rank prefillable at the decision) admits nothing
-        # the delayer saw. A prefill that became admissible after it -- most
-        # often a tier lookup that answered in between -- would run on this
-        # rank alone, while every peer's decode waits for it, and its peers'
-        # prefills on later ticks interrupt those decodes again. Keep it for the
-        # next tick, where the delayer sees it and aligns it. The streak counts
-        # only ticks on which the veto really held something back (this rank
-        # has admittable prefill now), so quiet or blocked stretches do not
-        # use it up; it bounds, at ATOM_PREFILL_VACUOUS_VETO_TICKS, how long a
-        # request the prefillable check keeps missing is held before it runs.
-        if (
-            self.prefill_delayer is not None
-            and not self.prefill_delayer.is_local
-            and decision.allow
-            and decision.prefillable_ranks == 0
-            and self.waiting
-            and self._can_admit_head_prefill()
-        ):
-            self._vacuous_streak = getattr(self, "_vacuous_streak", 0) + 1
-            if self._vacuous_streak <= envs.ATOM_PREFILL_VACUOUS_VETO_TICKS:
-                delayer_allows = False
-        else:
-            self._vacuous_streak = 0
 
         # Before the early return below: an idle rank keeps its peers' prefill
         # company too.
