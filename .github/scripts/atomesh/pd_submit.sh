@@ -468,7 +468,7 @@ else
     # the g25 -> g27 KV RDMA hung the prefill engine, g07 swaps the prefill's
     # LMCache CPU pool out rather than dropping its page cache, and g52 reads the
     # model from NFS at ~100 MiB/s, past the server wait.
-    AUTO_EXCLUDE="pit2-p03-g07,pit2-p03-g08,pit2-p03-g15,pit2-p03-g24,pit2-p03-g25,pit2-p03-g27,pit2-p03-g40,pit2-p03-g52"
+    AUTO_EXCLUDE="pit2-p03-g07,pit2-p03-g08,pit2-p03-g15,pit2-p03-g24,pit2-p03-g25,pit2-p03-g27,pit2-p03-g37,pit2-p03-g40,pit2-p03-g52"
     SBATCH_CMD+=(--exclude "${AUTO_EXCLUDE}")
     # Other tenants' host-network containers have taken the router's 8000 while
     # the prefill loaded; move every service port off the defaults, below the
