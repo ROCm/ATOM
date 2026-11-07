@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import logging
 
-import torch
 
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
@@ -50,7 +49,7 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
-from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+from atom.kv_transfer.offload.page_codec import pure_page_codec
 
 logger = logging.getLogger("atom")
 
@@ -100,18 +99,7 @@ class M3OffloadConnector(DenseOffloadConnector):
         # Build the codec from the ordered region list (NOT from kv_caches), so
         # the NSA index_cache regions are included. slot_regions empty ->
         # DSV4PageSlotCodec runs pure-PAGE (num_slots=0).
-        self._codec = DSV4PageSlotCodec(
-            page_regions=block_regions,
-            slot_regions=(),
-            num_blocks=int(page_num_blocks),
-            num_slots=0,
-            device=torch.device("cuda", torch.cuda.current_device()),
-        )
-        if not self._codec.has_fused_chunk_major_staging:
-            raise RuntimeError(
-                "M3 offload requires the Triton fused chunk-major PAGE staging "
-                "kernels (DSV4PageSlotCodec reported them unavailable)"
-            )
+        self._codec = pure_page_codec(block_regions, page_num_blocks)
 
         self._engine, cfg, meta = build_offload_engine(
             self._config,

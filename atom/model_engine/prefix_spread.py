@@ -71,6 +71,12 @@ class PrefixSpreadRouter:
     def reset(self) -> None:
         """Forget in-flight state. The index stays: it describes the ranks'
         prefix caches, which outlive a batch."""
+        for h, rank in self.pending:
+            holders = self.index.get(h)
+            if holders is not None:
+                holders.pop(rank, None)
+                if not holders:
+                    del self.index[h]
         self.seq_hashes.clear()
         self.pending.clear()
         self._prefilling.clear()
@@ -222,6 +228,10 @@ class PrefixSpreadRouter:
                 continue
             for rank, seq_id in reversed(holders.items()):
                 if not 0 <= rank < n or rank in hits:
+                    continue
+                # A remote restore is provisional even if its source finished.
+                # Keep local in-flight producers as owners for HBM followers.
+                if (hashes[i], rank) in self.pending and seq_id not in self._prefilling:
                     continue
                 if owner is None:
                     owner, source = rank, seq_id

@@ -5,7 +5,7 @@
 
 Everything but the transport is the dense offload's: the executors and the
 per-step producer fence (``start_load_kv``), the completion reports, the block
-GPU connector and the dense codec. What changes is where a packed chunk goes:
+GPU connector and a dense or replay PAGE codec. What changes is where a packed chunk goes:
 
 * save: KV blocks --pack, copy--> a slot of the registered transfer pool
   --``batch_put_from``--> the Store owners;
@@ -56,6 +56,7 @@ from atom.kv_transfer.offload._block_gpu_connector import (
 from atom.kv_transfer.offload._offload_common import pp_aware_rank_and_world
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+from atom.kv_transfer.offload.page_codec import pure_page_codec, replays_state
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
 from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store.config import (
@@ -243,19 +244,17 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         # Scheduler blocks, threaded from the model runner. MLA stores its KV
         # token-major, so the codec cannot infer the count from shape[0].
         if uses_replay_pages(self._config):
-            from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
-            from atom.kv_transfer.offload.mp.connector import _replays_state
-
-            if not _replays_state(transfer_tensors):
+            if not replays_state(transfer_tensors):
                 raise ValueError(
                     "Mooncake Store V4.1 requires the PAGE replay contract"
                 )
-            self._codec = DSV4PageSlotCodec(
-                page_regions=transfer_tensors.block_regions,
-                slot_regions=(),
-                num_blocks=int(num_blocks or transfer_tensors.num_blocks),
-                num_slots=0,
-                device=torch.device("cuda", torch.cuda.current_device()),
+            page_num_blocks = (
+                num_blocks
+                if num_blocks is not None
+                else getattr(transfer_tensors, "num_blocks", None)
+            )
+            self._codec = pure_page_codec(
+                getattr(transfer_tensors, "block_regions", None), page_num_blocks
             )
         else:
             self._codec = DenseKVByteCodec(

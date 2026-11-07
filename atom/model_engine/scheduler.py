@@ -1019,11 +1019,9 @@ class Scheduler:
         if not getattr(config, "offload_prefetch", False):
             return None
         if not getattr(self.kv_connector, "supports_async_lookup", False):
-            logger.info(
-                "Offload prefetch is off: the KV connector answers no async "
-                "tier lookup"
+            raise ValueError(
+                "--offload-prefetch requires a KV connector with async tier lookup"
             )
-            return None
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
         from atom.model_engine.offload_prefetch import OffloadPrefetch
 

@@ -742,6 +742,8 @@ def _dp4_idle_ratio_mgr():
     # rank0 ran the whole 100k prefix, rank2 its first 48k.
     mgr._prefix_router._record(_chain_seq(1, 100_000).prompt_hash_chain, 0, 1, 0, None)
     mgr._prefix_router._record(_chain_seq(2, 49_152).prompt_hash_chain, 2, 2, 0, None)
+    mgr._prefix_router.prefill_complete(1)
+    mgr._prefix_router.prefill_complete(2)
     mgr._rank_tokens = [200_000, 0, 4_096, 8_192]
     mgr._rank_reqs = [0, 0, 0, 0]
     return mgr
@@ -1028,3 +1030,37 @@ def test_an_explicit_rank_indexes_the_prefix_it_lands():
     again.data_parallel_rank = 1
     _route(mgr, [again])
     assert _est(mgr, again) == 98_304
+
+
+def test_reset_removes_provisional_holders_but_keeps_completed():
+    mgr = _make_spread_mgr()
+    _route(mgr, [_chain_seq(1, 65536)])
+    mgr._mark_seq_prefill_complete(1)
+    _route(mgr, [_chain_seq(2, 131072, first_block=1000)])
+    router = mgr._prefix_router
+    completed = {
+        h: dict(holders)
+        for h, holders in router.index.items()
+        if not any((h, rank) in router.pending for rank in holders)
+    }
+    assert router.pending
+    mgr.reset_dp_router()
+    assert router.index == completed
+    assert not router.pending
+    assert not router.seq_hashes
+
+
+def test_pending_remote_restore_does_not_count_as_local_hbm():
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 65536)])
+    mgr._mark_seq_prefill_complete(1)
+    mgr._rank_tokens[owner] = 200000
+    moved = _chain_seq(2, 65536)
+    (target,) = _route(mgr, [moved])
+    assert target != owner
+    hits, actual_owner, _ = mgr._prefix_router._rank_hits(moved.prompt_hash_chain, 2)
+    assert actual_owner == owner
+    assert target not in hits
+    mgr._mark_seq_prefill_complete(2)
+    hits, _, _ = mgr._prefix_router._rank_hits(moved.prompt_hash_chain, 2)
+    assert hits[target] == 65536

@@ -43,7 +43,7 @@ these options to the V4.1 model command:
 
 ```bash
 --enable-dp-attention --enable_prefix_caching \
---dp-load-balance prefix_spread --offload-prefetch
+--dp-load-balance prefix_spread
 ```
 
 The Store extra config names the shared pool. Do not also pass a second
@@ -77,3 +77,7 @@ Store improved mean TTFT by 31.8% and output throughput by 6.1% relative to MP
 in this run. Relative to main, output throughput was 3.8% lower; this is not
 evidence of a general performance advantage over HBM/session. One run per
 configuration does not establish variance or results at larger concurrency.
+
+Native Store lookup is synchronous. KV restoration starts at admission;
+this recipe does not provide scheduler prefetch ahead of admission.
+Do not pass `--offload-prefetch` with this connector.
