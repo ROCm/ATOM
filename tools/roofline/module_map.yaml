@@ -1,0 +1,59 @@
+# marker path -> roofline metadata.
+#
+# DESIGN: this file is DATA, not code. Renaming a module in ATOM should cost one
+# line here, not a code change, so anyone touching the model can keep the roofline
+# honest without knowing anything about roofline.
+#
+# You usually do NOT need to add anything. Markers that carry a shape annotation
+# -- layers.N.attn.wq_b[M=..,N=..,K=..,a=..,w=..,o=..] -- are priced by the
+# generic GEMM formula automatically. This file only holds:
+#   stages   : which bucket an operator reports under (presentation only)
+#   formulas : explicit overrides for operators that are NOT plain GEMMs
+#
+# Anything with no shape and no explicit formula lands in the gap tier: its
+# measured time is still counted (so coverage stays honest) but it gets no
+# roofline bound. That is the intended two-tier split, and the data splits itself.
+
+# Layer families moved to configs/models/<model>.yaml: which archetypes a model
+# has is model structure, and this file is shared. `stages` below stays here --
+# grouping operators for display is the same job whatever the model.
+
+# --- stage tagging -------------------------------------------------------
+# Longest matching prefix wins. Used for grouping / colouring only; a miss here
+# never changes a number, it just reports the operator under "other".
+stages:
+  attn.indexer: indexer
+  attn.compressor: attn
+  attn: attn
+  ffn.experts: moe
+  ffn.shared_experts: moe
+  ffn.gate: moe
+  ffn: moe
+  mhc: mhc
+
+# --- explicit formula overrides -----------------------------------------
+# key   = marker path with the layers.N. prefix stripped
+# value = formula id understood by formulas.py
+#
+# Empty on purpose. Every shape-carrying operator in the DSV4-Pro prefill trace
+# (2026-08-25) is a plain GEMM and needs no entry. Add one only when an operator
+# is genuinely not 2*M*N*K, and say why in a comment.
+formulas: {}
+
+# --- operators deliberately left in the gap tier -------------------------
+# Documentation only: the code does not read this list. It exists so that a
+# reader can tell "we know about this and chose not to model it" apart from
+# "nobody ever looked". Move an entry into `formulas` when you model it.
+gap_tier_known:
+  - ffn.experts.fused_moe          # routed-expert grouped GEMM, dynamic per-expert shapes
+  - ffn.combine_outputs            # weighted sum over top-k expert outputs
+  - attn.sparse_attn_prefill       # causal + top-k sparse attention
+  - attn.sparse_attn_decode
+  - attn.indexer                   # fp4 indexer, top-1024 selection
+  - mhc_fused_post_pre             # fused mHC pre/post
+  - attn.wo_a                      # fused into the attention epilogue, no standalone shape
+  - attn.q_norm
+  - attn.qk_norm_rope_maybe_quant
+  - attn.inverse_rope
+  - attn.compressor.fused_compress_attn
+  - attn.compressor.update_compressor_states
