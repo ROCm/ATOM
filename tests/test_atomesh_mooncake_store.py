@@ -98,10 +98,18 @@ P_D_PRODUCER = (
 )
 
 
+# The owner, metadata and metrics ports `run_shell` fixes (50152-50190), less
+# the 100 per pool a pool's master adds to the master port.
+FIXED_PORTS = range(49700, 50400)
+
+
 def free_port():
-    with socket.socket() as sock:
-        sock.bind((HOST, 0))
-        return sock.getsockname()[1]
+    while True:
+        with socket.socket() as sock:
+            sock.bind((HOST, 0))
+            port = sock.getsockname()[1]
+        if port not in FIXED_PORTS:
+            return port
 
 
 def prefixed_lines(stdout, prefix):
