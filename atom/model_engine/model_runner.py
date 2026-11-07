@@ -76,6 +76,10 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
+from atom.model_engine.token_constraints import (
+    TokenConstraints,
+    prepare_token_constraints,
+)
 from atom.model_engine.token_logprobs import (
     LogprobRows,
     TokenLogprob,
@@ -104,11 +108,7 @@ from atom.model_ops.eplb import (
 )
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.rejection_sampler import RejectionSampler
-from atom.model_ops.required_channel import (
-    DeviceChannel,
-    advance_states,
-    constrain_logits,
-)
+from atom.model_ops.required_channel import DeviceChannel
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.models.registry import mono_decode_installers, support_model_arch_dict
 from atom.sampling_params import RequiredChannel
@@ -408,9 +408,22 @@ class tokenIDProcessor:
         sync_event: torch.cuda.Event,
         sampled_logprobs: torch.Tensor | None = None,
         channel_states: torch.Tensor | None = None,
+        constraint_failed: torch.Tensor | None = None,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, list[TokenLogprob]] | None]:
+        output_ids = sampled_token_ids
+        if constraint_failed is not None:
+            failure = (
+                constraint_failed
+                if sampled_token_ids.ndim == 1
+                else constraint_failed[:, None]
+            )
+            output_ids = sampled_token_ids.masked_fill(failure, -2)
+            if self.is_deferred_out and sampled_token_ids.is_cuda:
+                # The caller recorded before this output-only transform. D2H
+                # must wait for its completion too, not copy uninitialized IDs.
+                sync_event.record()
         if not self.is_deferred_out:
-            token_ids = sampled_token_ids.tolist()
+            token_ids = output_ids.tolist()
             req_ids = batch.req_ids
             if token_ids and isinstance(token_ids[0], list):
                 processed = self._batch_process_token_ids(token_ids)
@@ -429,7 +442,7 @@ class tokenIDProcessor:
         token_ids = self.recv_async_output(self.token_ids_cpu)
         logprobs = self.recv_logprobs()
         self.send_to_cpu_async(
-            sampled_token_ids,
+            output_ids,
             self.token_ids_cpu,
             sync_event,
             gpu_logprobs=sampled_logprobs,
@@ -2790,7 +2803,7 @@ class ModelRunner:
                 buffer.gpu[n + m : logprob_count].view(n, width),
             )
 
-        # Read back by `postprocess` through `_constrain_required_channel`.
+        # Read back by `postprocess` through the token-constraint boundary.
         channel_count = None
         if batch.required_channel is not None:
             self.forward_vars["required_channel_states"].np[
@@ -3369,46 +3382,6 @@ class ModelRunner:
             commit_pp_send_work(self._pp_pending_send)
         return True
 
-    def _constrain_required_channel(
-        self,
-        batch: ScheduledBatch,
-        last_logits: torch.Tensor,
-        spec_decode_metadata=None,
-        target_logits: torch.Tensor | None = None,
-    ) -> tuple[DeviceChannel, torch.Tensor] | None:
-        """Mask the step's target rows of the requests that must open a
-        channel (see `atom.model_ops.required_channel`).
-
-        Returns the channel and each request's state at the start of the step,
-        which the caller advances over the step's output; None when no request
-        in the batch has one, which costs nothing.
-        """
-        channel = batch.required_channel
-        if channel is None:
-            return None
-        device_channel = self._device_channels.get(channel)
-        if device_channel is None:
-            device_channel = DeviceChannel.of(channel, self.device)
-            self._device_channels[channel] = device_channel
-        tp = self.tokenID_processor
-        bs = batch.total_seqs_num
-        # Without states from the previous forward no carried request had a
-        # channel then, so it has none now and the host's -1 is right.
-        carried = tp.carries_over and tp.prev_channel_states is not None
-        md = spec_decode_metadata
-        base = constrain_logits(
-            device_channel,
-            self.forward_vars["required_channel_states"].gpu[:bs],
-            last_logits,
-            carried_from=tp.decode_src.gpu[:bs] if carried else None,
-            carried_states=tp.prev_channel_states if carried else None,
-            target_logits=target_logits,
-            cu_num_draft_tokens=None if md is None else md.cu_num_draft_tokens,
-            input_ids=None if md is None else md.input_ids,
-            target_logits_indices=None if md is None else md.target_logits_indices,
-        )
-        return device_channel, base
-
     def release_structured_requests(self, request_ids):
         if self.structured_output is not None:
             self.structured_output.release(request_ids)
@@ -3455,21 +3428,20 @@ class ModelRunner:
             logprob_rows = batch.logprob_rows
         structured = getattr(self, "structured_output", None)
         structured_requests = getattr(batch, "structured_requests", None)
-        if structured_requests and structured is None:
-            raise ValueError("Structured output must be prepared before enqueue")
-        if structured_requests and logits.shape[-1] != structured.vocab_size:
-            raise ValueError(
-                "Target logits do not match the prepared structured vocabulary"
-            )
-        structured_prefixes = {}
-        if structured_requests:
-            if need_logprobs:
-                # Snapshot requested rows before either grammar or channel
-                # masking, including raw top candidates and token ranks.
-                logprob_snapshot = capture_token_logits(
-                    logits, batch, spec_decode_metadata, rows=logprob_rows
+        if need_logprobs and (
+            structured_requests
+            or (
+                spec_decode_metadata is None
+                and (
+                    batch.required_channel is not None
+                    or getattr(batch, "token_constraints", None)
                 )
-            structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
+            )
+        ):
+            logprob_snapshot = capture_token_logits(
+                logits, batch, spec_decode_metadata, rows=logprob_rows
+            )
+        constraints = TokenConstraints.apply(self, batch, logits, spec_decode_metadata)
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3480,15 +3452,6 @@ class ModelRunner:
             # after either and the pad rows divide `[running_bs, V]` by
             # `[scheduled_bs, 1]`.
             logits = logits[:bs]
-            if (
-                need_logprobs
-                and batch.required_channel is not None
-                and logprob_snapshot is None
-            ):
-                logprob_snapshot = capture_token_logits(
-                    logits, batch, rows=logprob_rows
-                )
-            channel = self._constrain_required_channel(batch, logits)
             sampled_tokens = self.sampler(
                 logits,
                 temperatures,
@@ -3510,11 +3473,11 @@ class ModelRunner:
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
-            target_logits = torch.index_select(logits, 0, target_logits_indices)
-            channel = self._constrain_required_channel(
-                batch, bonus_logits, spec_decode_metadata, target_logits
-            )
+            if constraints is None:
+                bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+                target_logits = torch.index_select(logits, 0, target_logits_indices)
+            else:
+                bonus_logits, target_logits = constraints.logits, constraints.target
             target_token_ids = None
             if not all_greedy:
                 target_token_ids = self.sampler.sample_verification_tokens(
@@ -3567,12 +3530,19 @@ class ModelRunner:
 
         # From the ids every rank now agrees on. Only a deferred step needs
         # it: otherwise the host has these ids before the next forward.
-        channel_states = None
-        if channel is not None and self.tokenID_processor.is_deferred_out:
-            channel_states = advance_states(*channel, sampled_tokens)
-
-        if structured_prefixes:
-            structured.commit(sampled_tokens, batch, structured_prefixes)
+        constraint_failed = (
+            constraints.failed(sampled_tokens) if constraints is not None else None
+        )
+        channel_states = (
+            constraints.commit(
+                sampled_tokens,
+                batch,
+                self.tokenID_processor.is_deferred_out,
+                constraint_failed,
+            )
+            if constraints is not None
+            else None
+        )
 
         sampled_logprobs = None
         if need_logprobs:
@@ -3598,7 +3568,24 @@ class ModelRunner:
             self.forward_done_event,
             sampled_logprobs,
             channel_states=channel_states,
+            constraint_failed=constraint_failed,
         )
+        output_errors = dict(structured.errors) if structured is not None else None
+        # Read only the output already delivered by the existing D2H pipeline.
+        # Keep safe sampled IDs for GPU carry; never feed the error sentinel back.
+        delivered = prev_batch if self.tokenID_processor.is_deferred_out else batch
+        if delivered is not None and (
+            getattr(delivered, "token_constraints", None)
+            or getattr(delivered, "structured_requests", None)
+        ):
+            for req_id, ids in tuple(token_id_dict.items()):
+                if req_id != -1 and -2 in ids:
+                    if output_errors is None:
+                        output_errors = {}
+                    output_errors[req_id] = (
+                        "Token constraints leave no valid continuation"
+                    )
+                    token_id_dict[req_id] = ()
         # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
@@ -3681,9 +3668,7 @@ class ModelRunner:
             num_bonus=prev_bonus_num,
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
-            structured_errors=(
-                dict(structured.errors) if structured is not None else None
-            ),
+            structured_errors=output_errors or None,
         )
 
     def _kv_after_forward(self) -> None:
@@ -3749,12 +3734,9 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
-        if getattr(batch, "structured_requests", None):
-            # Snapshot draft ids before target forward, so their D2H can overlap
-            # it. This runs after device-side deferred input assembly.
-            self.structured_output.prepare(
-                batch, get_forward_context().spec_decode_metadata
-            )
+        prepare_token_constraints(
+            self, batch, get_forward_context().spec_decode_metadata
+        )
         logits, hidden_states = self.run_model(input_ids, batch)
         self._settle_target_pcp_split()
         drafter = getattr(self, "drafter", None)
@@ -5196,9 +5178,17 @@ class RapidServeModelRunner(ModelRunner):
             # Masked in place with no pre-mask copy, unlike `postprocess`: this
             # path returns token ids only and computes no logprobs, so nothing
             # reads the unmasked row.
-            self._constrain_required_channel(batch, logits)
+            constraints = TokenConstraints.apply(self, batch, logits, None)
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
+            if constraints is not None and constraints.invalid is not None:
+                sampled = sampled.masked_fill(constraints.failed(sampled), -2)
             sampled_cpu = sampled.view(-1).tolist()
+            if (
+                constraints is not None
+                and constraints.invalid is not None
+                and -2 in sampled_cpu
+            ):
+                raise ValueError("Token constraints leave no valid continuation")
             self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()

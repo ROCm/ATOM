@@ -48,6 +48,7 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.triton_token_constraints import mask_token_columns
 from atom.sampling_params import UNCONSTRAINED, RequiredChannel
 
 BLOCK_V = 1024
@@ -137,6 +138,7 @@ def _constrain_row_block(
     OPEN_LEN: tl.constexpr,
     END_LEN: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    PRESERVE_MASKS: tl.constexpr,
 ):
     """Mask program `vb`'s share of one logits row for state `s`.
 
@@ -151,8 +153,8 @@ def _constrain_row_block(
         # Written, not read: only the forced column keeps a value.
         for first in range(vb * BLOCK_V, vocab_size, nprog * BLOCK_V):
             col = first + tl.arange(0, BLOCK_V)
-            tl.store(row_ptr + col, neg_inf, mask=(col < vocab_size) & (col != forced))
-        if (forced // BLOCK_V) % nprog == vb:
+            mask_token_columns(row_ptr, col, col != forced, col < vocab_size)
+        if not PRESERVE_MASKS and (forced // BLOCK_V) % nprog == vb:
             # Its own value, unless the model ruled it out too: then 0, so the
             # row keeps a finite logit and its softmax is not NaN.
             x = tl.load(row_ptr + forced)
@@ -164,7 +166,7 @@ def _constrain_row_block(
         # the whole row to know, on the step a request takes every time until
         # its channel opens.
         for e in tl.static_range(END_LEN):
-            tl.store(row_ptr + tl.load(table_ptr + forced_end + e), neg_inf)
+            mask_token_columns(row_ptr, tl.load(table_ptr + forced_end + e), True, True)
 
 
 @triton.jit(do_not_specialize=["vocab_size"])
@@ -189,6 +191,7 @@ def _constrain_logits_kernel(
     OPENS_AT: tl.constexpr,
     END_LEN: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    PRESERVE_MASKS: tl.constexpr,
 ):
     # Every one of the request's programs walks its drafts for the states;
     # each writes only its own share of the rows.
@@ -220,6 +223,7 @@ def _constrain_logits_kernel(
                 OPEN_LEN,
                 END_LEN,
                 BLOCK_V,
+                PRESERVE_MASKS,
             )
             draft = tl.load(input_ids_ptr + tl.load(target_logits_indices_ptr + r) + 1)
             s = _step(s, draft, table_ptr, AFTER_LEN, OPEN_LEN, OPENS_AT)
@@ -234,6 +238,7 @@ def _constrain_logits_kernel(
         OPEN_LEN,
         END_LEN,
         BLOCK_V,
+        PRESERVE_MASKS,
     )
 
 
@@ -273,6 +278,7 @@ def constrain_logits(
     cu_num_draft_tokens: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
     target_logits_indices: torch.Tensor | None = None,
+    preserve_masks: bool = False,
 ) -> torch.Tensor:
     """Mask the step's target rows in place; return each request's base state.
 
@@ -325,6 +331,7 @@ def constrain_logits(
         OPENS_AT=channel.opens_at,
         END_LEN=channel.end_len,
         BLOCK_V=BLOCK_V,
+        PRESERVE_MASKS=preserve_masks,
     )
     return base
 
@@ -355,13 +362,15 @@ def advance_states(
     return out
 
 
-def _constrain_row_reference(row: torch.Tensor, state: int, channel: RequiredChannel):
+def _constrain_row_reference(
+    row: torch.Tensor, state: int, channel: RequiredChannel, preserve_masks=False
+):
     if state < 0:
         return
     if len(channel.after) <= state < len(channel.after) + len(channel.opening):
         forced = channel.table[state]
         kept = row[forced].clone()
-        if kept == float("-inf"):
+        if not preserve_masks and kept == float("-inf"):
             kept.zero_()
         row.fill_(float("-inf"))
         row[forced] = kept
@@ -380,6 +389,7 @@ def constrain_logits_reference(
     cu_num_draft_tokens: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
     target_logits_indices: torch.Tensor | None = None,
+    preserve_masks: bool = False,
 ) -> torch.Tensor:
     """Pure-torch twin of `constrain_logits`, runnable on CPU.
 
@@ -397,10 +407,12 @@ def constrain_logits_reference(
         if target_logits is not None:
             start = 0 if i == 0 else int(cu_num_draft_tokens[i - 1])
             for r in range(start, int(cu_num_draft_tokens[i])):
-                _constrain_row_reference(target_logits[r], state, channel)
+                _constrain_row_reference(
+                    target_logits[r], state, channel, preserve_masks
+                )
                 draft = int(input_ids[int(target_logits_indices[r]) + 1])
                 state = channel.step(state, draft)
-        _constrain_row_reference(last_logits[i], state, channel)
+        _constrain_row_reference(last_logits[i], state, channel, preserve_masks)
     return base
 
 

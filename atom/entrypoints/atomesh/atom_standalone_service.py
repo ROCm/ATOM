@@ -1713,6 +1713,7 @@ class AtomStandaloneService:
                 self._request_field(request, "stop")
             ),
             ignore_eos=self._request_field(request, "ignore_eos", False),
+            min_tokens=self._request_field(request, "min_tokens", 0),
             top_k=self._request_field(request, "top_k", DEFAULT_TOP_K),
             top_p=self._request_field(request, "top_p", DEFAULT_TOP_P),
             n=effective_n,
