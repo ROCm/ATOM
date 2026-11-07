@@ -1047,12 +1047,23 @@ class Scheduler:
 
     def _waiting_prefills(self):
         for seq in self.waiting:
+            if seq.status == SequenceStatus.ABORTED:
+                continue
             if (
-                seq.status
-                not in (SequenceStatus.ABORTED, SequenceStatus.WAITING_FOR_REMOTE_KVS)
-                and self._unschedulable_reason(seq) is None
+                seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+                and not self._tier_load_finished(seq)
             ):
+                continue
+            if self._unschedulable_reason(seq) is None:
                 yield seq
+
+    def _tier_load_finished(self, seq: Sequence) -> bool:
+        """Whether `seq` waits on a tier load that completed (or failed) last
+        step: Phase 2 resumes its prefill this tick (`_resolve_waiting_remote_kv`)."""
+        return self._connector_flag("is_offload") and (
+            seq.id in self.finished_recving_kv_req_ids
+            or seq.id in self.failed_recving_kv_req_ids
+        )
 
     def _local_prefill_pending_work(self) -> tuple[bool, int]:
         """Count probed work; a bounded scan never invents fill for unseen work."""
@@ -1390,10 +1401,16 @@ class Scheduler:
             if self._unschedulable_reason(seq) is not None:
                 examined += 1
                 continue
-            if seq.status in (
-                SequenceStatus.ABORTED,
-                SequenceStatus.WAITING_FOR_REMOTE_KVS,
-            ):
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                if self._tier_load_finished(seq):
+                    # Its tier load completed (reported last step): Phase 2
+                    # resumes its suffix prefill on its held blocks this tick
+                    # (`_resolve_waiting_remote_kv`). Missing it here made the
+                    # delayer fire vacuously and that prefill run alone.
+                    return True
+                examined += 1
+                continue
+            if seq.status == SequenceStatus.ABORTED:
                 examined += 1
                 continue
             if self._head_waits_on_tier_lookup(seq):
