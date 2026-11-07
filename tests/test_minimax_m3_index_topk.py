@@ -66,6 +66,18 @@ def test_prefill_score_launch_config(monkeypatch, arch, dtype, want):
         m._prefill_score_launch_config.cache_clear()
 
 
+def test_gfx1250_prefill_score_uses_measured_long_query_chunk(monkeypatch):
+    monkeypatch.setattr(m, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(m, "_compute_units", lambda _index: 256)
+    dev = torch.device("cuda", 0)
+
+    assert m._score_chunk_blocks(493, 36, 1, 1, dev) == 24
+    assert m._score_chunk_blocks(823, 20, 1, 1, dev) == 24
+    # Short context and multi-request batches retain the generic grid policy.
+    assert m._score_chunk_blocks(64, 16, 1, 1, dev) == 1
+    assert m._score_chunk_blocks(493, 36, 2, 1, dev) != 24
+
+
 class TestPrefillTileWidth:
     """clamp(next_pow2(max_block), MIN, MAX), and the two ends of the clamp."""
 
