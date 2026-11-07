@@ -3675,12 +3675,12 @@ models:
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
         env: &issue382_a9_1p3d_store2560_env
-          common:
+          common: &issue382_a9_1p3d_env_common
             <<: *issue382_a9_env_common
             ATOMESH_ISSUE382_METRICS: '0'
             ATOMESH_DROP_HOST_CACHES: best_effort
             ATOMESH_DROP_HOST_CACHES_RANKS: '0'
-          prefill:
+          prefill: &issue382_a9_store2560_env_prefill
             <<: *issue382_a9_env_prefill
             MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}
             MOONCAKE_STORE_OWNERS: 0:640:rdma4;0:640:rdma5;1:640:rdma6;1:640:rdma7
@@ -3717,6 +3717,52 @@ models:
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
         env: *issue382_a9_1p3d_store2560_env
+      # One prefill with two decodes. At 1P3D C180 each decode runs 13-18
+      # requests at 25-35% of its KV and the prefill computes 60% of what it
+      # does at 2 TiB, so the third decode only adds GPUs.
+      - &issue382_a9_1p2d_c180
+        <<: *issue382_a9_1p3d_c264
+        name: issue382-a9-1p2d-c180-store2560
+        topology: 1p2d
+        display_topology: 1P2D-CPP4-TP4-MXFP4-ISSUE382-A9
+        concurrency:
+        - 180
+        decode:
+          workers: 2
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,120]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 360
+            decode_max_num_seqs: 120
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+        env: *issue382_a9_1p3d_store2560_env
+      # The masters evict 3% at 97% instead of 5% at 90%: the 2.5 TiB Store
+      # then holds 94-97% of its pool instead of 85-90%.
+      - <<: *issue382_a9_1p2d_c180
+        name: issue382-a9-1p2d-c200-store2560-evict97
+        concurrency:
+        - 200
+        decode:
+          workers: 2
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,136]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 400
+            decode_max_num_seqs: 136
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+        env:
+          common: *issue382_a9_1p3d_env_common
+          prefill:
+            <<: *issue382_a9_store2560_env_prefill
+            MOONCAKE_STORE_EVICTION_HIGH_WATERMARK: '0.97'
+            MOONCAKE_STORE_EVICTION_RATIO: '0.03'
+          decode: *issue382_a9_env_decode
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c330
         concurrency:
