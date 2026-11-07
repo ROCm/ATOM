@@ -3601,7 +3601,8 @@ models:
       # Each decode keeps A9's per-decode load, so C264 is three A9 C88s.
       # packed_nodes sets each worker's HIP_VISIBLE_DEVICES, over the role env.
       # The issue382 metrics sampler only runs single-node. Only the Store's
-      # node drops host caches: the decode-only node may deny --privileged.
+      # node drops host caches, best effort: many nodes deny --privileged, and
+      # the Store then drops the whole model root's page cache itself.
       - &issue382_a9_1p3d_c264
         <<: *issue382_a9_c140
         name: issue382-a9-1p3d-c264
@@ -3629,8 +3630,11 @@ models:
           common:
             <<: *issue382_a9_env_common
             ATOMESH_ISSUE382_METRICS: '0'
+            ATOMESH_DROP_HOST_CACHES: best_effort
             ATOMESH_DROP_HOST_CACHES_RANKS: '0'
-          prefill: *issue382_a9_env_prefill
+          prefill:
+            <<: *issue382_a9_env_prefill
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}
           decode: *issue382_a9_env_decode
         runner:
           # The A9 nodes plus g40, which also denies the privileged cache drop.

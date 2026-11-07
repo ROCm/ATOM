@@ -4,8 +4,11 @@
 set -euo pipefail
 
 # pd_submit.sh prefixes case env.common settings with ATOMESH_ENV_.
+# 1 refuses to start services when the drop fails; best_effort only warns, for
+# nodes that deny the privileged helper (the Store then reclaims the cache
+# through its own unprivileged page-cache drop and compaction).
 enabled="${ATOMESH_ENV_ATOMESH_DROP_HOST_CACHES:-${ATOMESH_DROP_HOST_CACHES:-0}}"
-[[ "${enabled}" == "1" ]] || exit 0
+[[ "${enabled}" == "1" || "${enabled}" == "best_effort" ]] || exit 0
 image="$1"
 container="${2}-host-cache-drop"
 rank="${3:-}"
@@ -53,6 +56,10 @@ if timeout --kill-after=10s "${cleanup_timeout}s" \
   echo "[host-memory] cache cleanup completed"
 else
   rc=$?
+  if [[ "${enabled}" == "best_effort" ]]; then
+    echo "[host-memory][WARN] cache cleanup failed (rc=${rc}); starting services anyway (best_effort)" >&2
+    exit 0
+  fi
   echo "[host-memory][FAIL] cache cleanup failed (rc=${rc}); refusing to start services" >&2
   exit "${rc}"
 fi
