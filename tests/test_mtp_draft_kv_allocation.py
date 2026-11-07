@@ -134,6 +134,18 @@ def test_lookahead_is_the_draft_mid_steps(k, lookahead):
     assert draft_kv_lookahead(k) == lookahead
 
 
+@pytest.mark.parametrize("k", [0, 1, 3, 5, 7])
+def test_block_drafter_lookahead_is_its_whole_block(k):
+    assert draft_kv_lookahead(k, block_drafter=True) == k
+
+
+@pytest.mark.parametrize("dspark", [False, True])
+def test_scheduler_takes_the_lookahead_from_draft_kv_lookahead(dspark):
+    sched = make_scheduler(5, 16, dspark=dspark)
+    assert sched.draft_lookahead == draft_kv_lookahead(5, block_drafter=dspark)
+    assert sched.block_manager.draft_lookahead == sched.draft_lookahead
+
+
 # ── The real scheduler path ─────────────────────────────────────────────────
 
 PATTERNS = {

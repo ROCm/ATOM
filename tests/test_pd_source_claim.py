@@ -77,10 +77,11 @@ def _moriio(is_producer=True):
     return _build(MoRIIOConnectorScheduler, is_producer)
 
 
-def _seq(seq_id=7, **params):
+def _seq(seq_id=7, num_prompt_tokens=48, **params):
     return SimpleNamespace(
         id=seq_id,
         block_table=[1, 2, 3],
+        num_prompt_tokens=num_prompt_tokens,
         kv_transfer_params=dict(params),
         output_tokens=[42],
         spec_token_ids=None,
@@ -160,3 +161,23 @@ def test_nothing_is_claimed_when_nothing_will_be_sent(build):
         seq.leave_reason = "stop_sequence"
         local_only.request_finished(seq)
         assert local_only.should_defer_free(seq) is False
+
+
+def test_mooncake_producer_sends_only_the_prompts_pages():
+    """A draft round's lookahead (`draft_kv_lookahead`) can leave a page past
+    the prompt on P: 28 prompt tokens fill two 16-token pages, and the draft
+    block writes into a third. D reserves only the prompt's two, and the
+    producer aborts a transfer whose source and destination page counts
+    differ; so neither the saved nor the advertised table carries the third.
+    It stays on the sequence (pinned until the send retires the claim)."""
+    sched = _mooncake()
+    seq = _seq(num_prompt_tokens=28, do_remote_decode=True)
+    sched.update_state_after_alloc(seq)
+
+    saved = sched.build_connector_meta().reqs_to_save[seq.id]
+    assert list(saved.local_block_ids) == [1, 2]
+
+    seq.leave_reason = "stop_sequence"
+    sched.request_finished(seq)
+    assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2]
+    assert seq.block_table == [1, 2, 3]

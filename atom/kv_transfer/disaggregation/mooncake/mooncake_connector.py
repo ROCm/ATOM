@@ -553,16 +553,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         for req_id, (req, block_ids, slot_idx) in self._reqs_need_save.items():
             assert req.kv_transfer_params is not None
             req.kv_transfer_params["local_slot_index"] = slot_idx
-            if req.kv_transfer_params.get("chunked_transfer"):
-                # MTP owns lookahead pages beyond the prompt on P. D reserves
-                # only prompt pages; keep the extra pages pinned on the sequence
-                # but leave them out of both initial and final transfer metadata.
-                page_tokens = self.block_size * self.dcp_size
-                prompt_blocks = (req.num_prompt_tokens + page_tokens - 1) // page_tokens
-                block_ids = block_ids[:prompt_blocks]
             meta.add_new_req_to_save(
                 request_id=req_id,
-                local_block_ids=block_ids,
+                local_block_ids=self._prompt_pages(req, block_ids),
                 kv_transfer_params=req.kv_transfer_params,
                 local_swa_block_ids=_swa_ring_ids(req),
             )
@@ -675,6 +668,16 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 slot_index,
             )
 
+    def _prompt_pages(self, seq: Sequence, block_ids) -> list[int]:
+        """The prompt's pages of a producer's table. A draft round's lookahead
+        (`draft_kv_lookahead`) can leave pages past the prompt on P; D reserves
+        only the prompt's, and the transfer requires as many source pages as
+        destination pages. The extra pages stay pinned on the sequence but
+        leave every transfer's metadata (initial, final, chunked or not)."""
+        page_tokens = self.block_size * self.dcp_size
+        prompt_blocks = (seq.num_prompt_tokens + page_tokens - 1) // page_tokens
+        return list(block_ids)[:prompt_blocks]
+
     def request_finished(self, seq: Sequence) -> None:
         params = getattr(seq, "kv_transfer_params", None) or {}
         if self.is_producer and params.get("chunked_transfer"):
@@ -725,7 +728,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
-            "remote_block_ids": list(seq.block_table),
+            "remote_block_ids": self._prompt_pages(seq, seq.block_table),
             # The consumer's SWA ring slot; the producer keys the SWA region
             # transfer by it. Empty for backends with no SWA state.
             "remote_swa_block_ids": _swa_ring_ids(seq),

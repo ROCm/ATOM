@@ -799,16 +799,10 @@ class Scheduler:
         # Allocated before the forward, with the step's own blocks: see
         # `draft_kv_lookahead` for the arithmetic and what an unallocated one
         # costs.
-        self.draft_lookahead = draft_kv_lookahead(self.mtp_k)
-        if has_spec and config.speculative_config.use_dspark():
-            # `draft_kv_lookahead` counts EAGLE's k - 1 mid-steps. A DSpark block
-            # writes T = mtp_k rows past its anchor, the last verified position
-            # (`len(seq) - 1`), i.e. through `len(seq) + mtp_k - 1`: one more.
-            # Under-allocated, that last row lands -- whenever it starts a new
-            # page -- on the zeroed block-table tail: slot 0 of block 0, which
-            # may be a PAGE unit of a state checkpoint (dspark_proposer.py
-            # `_block_page_idx` masks only past the table's width).
-            self.draft_lookahead = max(self.draft_lookahead, self.mtp_k)
+        self.draft_lookahead = draft_kv_lookahead(
+            self.mtp_k,
+            block_drafter=has_spec and config.speculative_config.use_dspark(),
+        )
         self.block_manager.draft_lookahead = self.draft_lookahead
         self.is_deferred_out = defers_output(config)
         if self.use_spec and pp_size > 1:
