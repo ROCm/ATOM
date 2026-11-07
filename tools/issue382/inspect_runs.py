@@ -269,6 +269,8 @@ def main():
         ).isoformat(),
         "collector_host": socket.gethostname(),
         "sbatch_help": command(["sbatch", "--help"]),
+        "scontrol_help": command(["scontrol", "--help"]),
+        "scontrol_update_help": command(["scontrol", "update", "--help"]),
         "queue": queue,
         "runs": [],
     }
