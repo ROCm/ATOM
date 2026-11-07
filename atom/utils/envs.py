@@ -1339,10 +1339,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Also load early when the load carries a state leg (state images / joint
     # boundary). Off: only plain KV and PAGE-only (replay) loads go early.
     "ATOM_OFFLOAD_EARLY_LOAD_STATE": lambda: _flag_env(
-        "ATOM_OFFLOAD_EARLY_LOAD_STATE", "0"
+        "ATOM_OFFLOAD_EARLY_LOAD_STATE", "1"
     ),
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: max(
-        0, _int_env_or_default("OFFLOAD_MIN_LOAD_TOKENS", 8192)
+        0, _int_env_or_default("OFFLOAD_MIN_LOAD_TOKENS", 512)
     ),
     "OFFLOAD_MIN_SAVE_TOKENS": lambda: max(
         0, _int_env_or_default("OFFLOAD_MIN_SAVE_TOKENS", 8192)
@@ -1403,7 +1403,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # priority, so a load's scatter kernels dispatch ahead of queued forward
     # kernels instead of waiting behind them on a busy GPU.
     "OFFLOAD_LOAD_STREAM_HIGH_PRIORITY": lambda: _flag_env(
-        "OFFLOAD_LOAD_STREAM_HIGH_PRIORITY"
+        "OFFLOAD_LOAD_STREAM_HIGH_PRIORITY", "1"
     ),
     # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.
     # Unset derives the size from the KV geometry.
