@@ -268,6 +268,17 @@ stop_mooncake_store
             with self.subTest(env=env):
                 self.run_shell("plan_mooncake_store_owners\n", expect_rc=2, **env)
 
+    def test_the_eviction_watermark_and_ratio_reach_the_masters(self):
+        self.run_shell(
+            "start_mooncake_store\nstop_mooncake_store\n",
+            MOONCAKE_STORE_OWNERS="0:64;1:96",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_EVICTION_HIGH_WATERMARK="0.97",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_EVICTION_RATIO=".03",
+        )
+        (master,) = self.store_calls("mooncake_master")
+        for flag in ("--eviction_high_watermark_ratio=0.97", "--eviction_ratio=.03"):
+            self.assertIn(f" {flag} ", f"{master} ")
+
     def test_start_waits_for_the_capacity_and_stop_ends_everything(self):
         port = self.master_port
         result = self.run_shell(
@@ -1009,6 +1020,8 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
                     ("COMPACT_TIMEOUT", "nan", "positive number"),
                     ("WAIT_TIMEOUT", "20m", "positive integer number"),
                     ("MASTER_NUMA", "-1", "integer number"),
+                    ("EVICTION_HIGH_WATERMARK", "1.2", "fraction number"),
+                    ("EVICTION_RATIO", "0", "fraction number"),
                 )
             ),
         ):
