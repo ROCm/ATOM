@@ -878,9 +878,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     def _decode_token_split_metadata(self, context_lens) -> DecodeTokenSplit | None:
         """The attention metadata's ``decode_token_split_tiles``: the buffer
         `prepare_decode` publishes, for the attention over ``context_lens``."""
-        if self._decode_token_split is None:
+        split = getattr(self, "_decode_token_split", None)
+        if split is None:
             return None
-        tile, heads = self._decode_token_split[:2]
+        tile, heads = split[:2]
         tiles = self.model_runner.forward_vars["decode_token_split_tiles"].gpu
         return DecodeTokenSplit(tiles, tile, heads, context_lens)
 
