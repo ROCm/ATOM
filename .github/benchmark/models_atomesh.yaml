@@ -3765,12 +3765,14 @@ models:
             MOONCAKE_STORE_EVICTION_RATIO: '0.03'
           decode: *issue382_a9_env_decode
       # Past C200 the prefill node's 2.5 TiB no longer holds the sessions: the
-      # second node's memory joins the Store (2 TiB, on the NICs the prefill
+      # second node's memory joins the Store (1.75 TiB, on the NICs the prefill
       # stages leave free), and each decode keeps 0.94 of its VRAM for the
-      # 110-120 sessions it serves.
-      - &issue382_a9_1p2d_c220_store4608
+      # 110-120 sessions it serves. That node then drops its caches too: one
+      # whose NUMA1 compacted to 988 of 1024 GiB in huge pages left an owner
+      # 4 KiB pages its NIC refused.
+      - &issue382_a9_1p2d_c220_store4352
         <<: *issue382_a9_1p2d_c180
-        name: issue382-a9-1p2d-c220-store4608
+        name: issue382-a9-1p2d-c220-store4352
         concurrency:
         - 220
         decode:
@@ -3786,13 +3788,15 @@ models:
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
         env:
-          common: *issue382_a9_1p3d_env_common
+          common:
+            <<: *issue382_a9_1p3d_env_common
+            ATOMESH_DROP_HOST_CACHES_RANKS: 0,1
           prefill:
             <<: *issue382_a9_store2560_env_prefill
-            MOONCAKE_STORE_DECODE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
+            MOONCAKE_STORE_DECODE_OWNERS: 0:448:rdma4;0:448:rdma5;1:448:rdma6;1:448:rdma7
           decode: *issue382_a9_env_decode
-      - <<: *issue382_a9_1p2d_c220_store4608
-        name: issue382-a9-1p2d-c240-store4608
+      - <<: *issue382_a9_1p2d_c220_store4352
+        name: issue382-a9-1p2d-c240-store4352
         concurrency:
         - 240
         decode:
