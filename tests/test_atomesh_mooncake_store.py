@@ -609,6 +609,74 @@ done
             xP="1",
             yD="1",
         )
+        # Packed nodes: the decode-only node is every node but the prefill's.
+        for placement, n_prefill, n_decode in (
+            # Every decode shares the prefill's node.
+            ("prefill_nodes=(0); decode_nodes=(0)", "1", "1"),
+            # Two decode-only nodes would each start the owners.
+            ("prefill_nodes=(0); decode_nodes=(0 1 1 2)", "1", "4"),
+            ("prefill_nodes=(0 0); decode_nodes=(1 1)", "2", "2"),
+        ):
+            with self.subTest(placement=placement):
+                result = self.run_shell(
+                    f"{placement}\ncheck_mooncake_store_settings\n",
+                    expect_rc=2,
+                    **decode_owners,
+                    ATOMESH_PD_WORKER_LAYOUT="packed_nodes",
+                    xP=n_prefill,
+                    yD=n_decode,
+                )
+                self.assertIn("needs the decode on nodes of its own", result.stderr)
+        for placement, n_decode in (
+            ("prefill_nodes=(0); decode_nodes=(0 1)", "2"),
+            ("prefill_nodes=(0); decode_nodes=(0 1 1)", "3"),
+        ):
+            with self.subTest(placement=placement):
+                self.run_shell(
+                    f"{placement}\ncheck_mooncake_store_settings\n",
+                    **decode_owners,
+                    ATOMESH_PD_WORKER_LAYOUT="packed_nodes",
+                    xP="1",
+                    yD=n_decode,
+                )
+
+    def test_packed_decode_owners_start_once_off_the_prefill_node(self):
+        port = self.master_port
+        (self.root / "segments").write_text(f"{port} {64 * GIB}\n")
+        store_env = dict(
+            NODE0_ADDR=HOST,
+            host_ip="127.0.0.2",
+            PACKED_NODES_PD="1",
+            MOONCAKE_STORE="0",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE="1",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS="0:64:rdma4",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_DECODE_OWNERS="0:32:rdma5;1:32:rdma6",
+        )
+        # The prefill's node: its decode worker leaves the Store to the prefill.
+        self.run_shell(
+            "prefill_nodes=(0)\nstart_mooncake_store_decode_owners\n",
+            NODE_RANK="0",
+            **store_env,
+        )
+        self.assertEqual(self.store_calls("mooncake_client"), [])
+        # The other node: two decode workers, one set of owners.
+        self.run_shell(
+            f"""
+setsid python3 /scripts/numa_exec.py 0 mooncake_master --rpc_port={port} \
+  >/dev/null 2>&1 &
+prefill_nodes=(0)
+start_mooncake_store_decode_owners
+start_mooncake_store_decode_owners
+stop_mooncake_store
+""",
+            NODE_RANK="1",
+            **store_env,
+        )
+        owners = self.store_calls("mooncake_client")
+        self.assertEqual(len(owners), 2)
+        for device in ("rdma5", "rdma6"):
+            (call,) = [c for c in owners if f"--device_names={device} " in f"{c} "]
+            self.assertIn(f" --master_server_address={HOST}:{port} ", f"{call} ")
 
     def test_per_nic_store_gives_each_nic_a_master_and_each_stage_its_pool(self):
         port = self.master_port
