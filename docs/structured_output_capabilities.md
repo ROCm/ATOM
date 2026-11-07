@@ -16,6 +16,7 @@ multi-backend interfaces.
 | `__init__.py` | Lightweight entry points used by the API preflight and model runner. |
 | `manager.py` | Worker admission, cached compilation, committed and speculative grammar state, and prepare/apply/commit ordering. |
 | `backend_guidance.py` | llguidance compiler and matcher adapter. |
+| `dsml_grammar.py` | DSML tool-call grammar for beta strict function tools. |
 | `schema.py` | Offline reference resolution, bounded RE2 validation, exact constraint lowering and shared expansion budgets. |
 | `validation.py` | Chat/Responses format and final answer validation, tool/reasoning adapters, and admission-time worker RPC/cache. |
 | `utils.py` | Reusable packed mask buffers, H2D kernel dispatch, and owned asynchronous token D2H snapshots. |
@@ -155,8 +156,8 @@ With a DSML parser, normal function tools can accompany Chat `response_format`
 or Responses `text.format`. The grammar admits the parser's canonical function
 envelope or a schema-conforming answer. Required/named choices select the tool
 branch; `tool_choice="none"` selects JSON text. Function-only turns have no
-response text to validate; subsequent text answers remain constrained. This is
-not beta strict-tool argument validation. Other tool parser formats, pipeline parallelism, P/D handoff,
+response text to validate; subsequent text answers remain constrained. Other
+tool parser formats, pipeline parallelism, P/D handoff,
 multimodal input, custom stop strings, and `ignore_eos` remain unsupported with
 constraints. Synthetic forced acceptance is also rejected. No image
 implementation is included.
@@ -208,6 +209,60 @@ perform host grammar work. There is no zero-overhead claim. Performance results
 must distinguish enabled-request overhead from disabled-request regression and
 compare matching generated outputs. Production and broader-topology qualification
 remain separate tasks.
+
+## Strict function tools (beta)
+
+On `/beta/chat/completions`, a function with `"strict": true` has its
+arguments constrained by its `parameters` schema, with or without
+`response_format`. `/v1/chat/completions` keeps ignoring `strict`.
+
+The schema is checked before enqueue and refused with HTTP 400 where it breaks
+DeepSeek's rules or asks for what the grammar cannot hold:
+
+- every object lists all its properties in `required` and sets
+  `additionalProperties: false`, and `patternProperties` is refused, so the
+  arguments carry exactly the declared keys;
+- every schema gives its type (or a `$ref`, `anyOf`, `oneOf`, `allOf`, `enum`
+  or `const`), and every array its `items`;
+- `minLength`, `maxLength`, `minItems` and `maxItems` are refused, and a
+  `format` must be one of DeepSeek's five: `email`, `hostname`, `ipv4`, `ipv6`,
+  `uuid`;
+- the top of `parameters` holds only its properties, definitions and
+  annotations;
+- definitions live at the top, under DeepSeek's `$def` (read as `$defs`),
+  `$defs` or `definitions`, and every `$ref` points into them. Each parameter
+  is compiled on its own, where `#` would name the parameter; `$id`, `$anchor`
+  and dynamic references are refused for the same reason. A draft-07
+  `$schema`, as OpenAI's zod helpers write, is read as 2020-12.
+
+A strict tool is checked off the event loop. The last 256 distinct tools under
+64 KiB are remembered, so an agent resending its tools is not checked again.
+
+The grammar is the DSML envelope itself (`dsml_grammar.py`): parameters appear
+once each, in declared order. A string is written raw (`string="true"`), as
+the encoder writes it: a plain string, a string `enum`/`const` (behind a
+`$ref` too), and the string side of a nullable one. Every other value,
+patterned and formatted strings included, is a `string="false"` JSON value
+under its own JSON grammar, carrying the definitions it references. The answer
+and every parameter share one expansion budget, and the grammar may not grow
+past twice the size of the tool schemas (or 1 MiB). Whitespace around the
+answer and the calls is free; inside a call it is allowed only where the
+encoder writes line breaks. Neither the free text before the calls, a raw
+value, nor a non-strict function's body may contain what the tool parser
+reads as the start of a call, the end of a value or another call, with or
+without the DSML marker, so the parser reads them back as written. A
+non-strict function's body is otherwise free. A string inside a JSON value is
+not held to this: the parser cuts the value short at such a tag, as it does
+on `/v1`. The cut value usually fails the validation below; one its schema
+still takes (a nullable string written as JSON, say) goes out cut short.
+
+Parsed arguments are validated against their schema again before success is
+reported (formats are the grammar's to enforce), and every call must name one
+of the request's functions. A streamed reply holds its frames from the first
+tool call on until then, so a call that fails is never sent: the stream ends
+with a `structured_output_error`, as a non-streamed reply fails. The reply is
+read literally, as under `response_format`. The thinking-mode refusal of
+required/named `tool_choice` still applies.
 
 ## Model discovery
 
