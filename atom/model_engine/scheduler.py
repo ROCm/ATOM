@@ -1013,12 +1013,22 @@ class Scheduler:
         )
 
     def _make_offload_prefetch(self, config):
-        """The offload prefetch, or None: off in `config`, or the connector
-        cannot hand over an answered tier lookup without a round trip
-        (`supports_async_lookup`)."""
-        if not getattr(config, "offload_prefetch", False):
+        """Resolve automatic prefetch from the constructed connector.
+
+        Explicit enablement must be supported; an automatic default may fall
+        back to synchronous admission on older adapters.
+        """
+        requested = getattr(config, "offload_prefetch", None)
+        supported = bool(getattr(self.kv_connector, "supports_async_lookup", False))
+        if requested is None:
+            if (
+                getattr(config, "dp_load_balance", None) != "prefix_spread"
+                or not supported
+            ):
+                return None
+        elif not requested:
             return None
-        if not getattr(self.kv_connector, "supports_async_lookup", False):
+        elif not supported:
             raise ValueError(
                 "--offload-prefetch requires a KV connector with async tier lookup"
             )

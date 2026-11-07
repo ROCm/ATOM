@@ -68,4 +68,6 @@ KVConnectorFactory.register(
     shared_tier=True,
     # V4.1 sources its complete PAGE codec from the region map.
     reads_block_regions=True,
+    # Dense and PAGE codecs preserve all planes, including FP4 index scales.
+    copies_whole_block_regions=True,
 )
