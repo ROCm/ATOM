@@ -3793,7 +3793,8 @@ models:
             ATOMESH_TORCH_PROFILE_ROLES: prefill
           prefill: *issue382_a9_store2560_env_prefill
           decode: *issue382_a9_env_decode
-      - <<: *issue382_a9_1p2d_c180_lpt4096
+      - &issue382_a9_1p2d_c200_lpt4096
+        <<: *issue382_a9_1p2d_c180_lpt4096
         name: issue382-a9-1p2d-c200-lpt4096
         concurrency:
         - 200
@@ -3808,6 +3809,19 @@ models:
             decode_max_num_seqs: 136
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+      # Each turn re-encoded its whole history at the API servers: 0.4 s of
+      # the prefill's TTFT (0.9 s past 200K tokens) and about two cores at
+      # C180. The tokenizer cache now covers MiniMax-M3's NFC normalizer, so
+      # a turn encodes only its new messages; 2 GiB holds every session's
+      # stored prompt and segments.
+      - <<: *issue382_a9_1p2d_c200_lpt4096
+        name: issue382-a9-1p2d-c200-lpt4096-tokcache
+        env:
+          common:
+            <<: *issue382_a9_1p3d_env_common
+            ATOM_TOKENIZE_CACHE_MB: '2048'
+          prefill: *issue382_a9_store2560_env_prefill
+          decode: *issue382_a9_env_decode
       # Past C200 the prefill node's 2.5 TiB no longer holds the sessions: the
       # second node's memory joins the Store (1.75 TiB), and each decode keeps
       # 0.94 of its VRAM for the 110-120 sessions it serves. Every owner sits
