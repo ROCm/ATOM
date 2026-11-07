@@ -10,19 +10,22 @@ and reloads all went away (rematerialized), SILowerSGPRSpills hands lanes only
 to referenced slots, so the orphan (16 B) reaches frame finalization, which adds
 an emergency scavenging slot (4 B): 20 B a lane. The post builds at 12 / 16
 rows spill one VGPR outright (8 B). The guard refuses any of them, which used
-to cost the whole width its mono path; ``runner._lean_width`` now gives those
-layers their default K2 build instead.
+to cost the whole width its mono path; ``runner._lean_width`` rebuilds those
+under another LLVM scheduler (``k2.FOLD_SCHEDULERS``: a different schedule
+changes which values the allocator spills), and gives a layer its default K2
+build only when none of those fits.
 
 Compile-only: every K2 key of a width (the model's 93 layers, folds on the 24
 MLA layers) through ``WidthBuilds`` with the runner's ``_lean_width``, as the
 server builds it. The width must be served, every served launcher free of
 scratch, the default builds untouched; it prints which layers keep their
-folds. Slow (a minute or more a width), so opt-in:
+folds, and under which scheduler. Slow (a minute or more a width), so opt-in:
 ``ATOM_MONO_FOLD_SCRATCH_WIDTHS=6,12`` (the server's 1- and 2-request widths at
 query length 6; any of 1 .. 16), with a GPU or ``ARCH=gfx950``.
 """
 
 import os
+from dataclasses import replace
 
 import pytest
 
@@ -92,16 +95,20 @@ def test_the_servers_fold_builds_pass_the_scratch_guard(rows, caplog):
     served = widths[rows]
     for key, launcher in served.k2_launchers.items():
         assert scratch_bytes(launcher) == 0, kernel_names(launcher)
-    # a layer either keeps its fold build or falls back to its default build
+    # a layer keeps its fold build (under LLVM's default scheduler or one of
+    # ``k2.FOLD_SCHEDULERS``) or falls back to its default build
     for layer, key in served.k2_keys.items():
-        assert key in (keys[layer], k2.unfolded(keys[layer])), layer
+        rescheduled = {replace(keys[layer], sched=s) for s in k2.FOLD_SCHEDULERS}
+        assert key in {keys[layer], k2.unfolded(keys[layer]), *rescheduled}, layer
     folds = sorted(
         layer for layer, key in served.k2_keys.items() if key.mla_post or key.mla_prep
     )
     wanted = sorted(
         layer for layer, key in keys.items() if key.mla_post or key.mla_prep
     )
+    scheds = {layer: key.sched for layer, key in served.k2_keys.items() if key.sched}
     print(f"\n{rows} rows: folds kept on K2 of layers {folds} (of {wanted})")
+    print(f"  rescheduled: {scheds}")
     for key in sorted(set(keys.values()), key=str):
         launcher = k2.build(key)
         compile_kernels([(launcher, k2.abi_for(key))])
