@@ -465,7 +465,15 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         pending_ids = getattr(client, "pending_ids", None)
         if not callable(is_pending) or not callable(pending_ids):
             return False
-        return sid in pending_ids() and not is_pending(sid)
+        if sid not in pending_ids():
+            return False
+        # A client that keeps an answered lookup listed as pending until it is
+        # taken (the Mooncake Store's `AsyncStoreLookup`) says so through a
+        # side-effect-free `answered`; `poll` may advance other clients.
+        answered = getattr(client, "answered", None)
+        if callable(answered):
+            return bool(answered(sid))
+        return not is_pending(sid)
 
     def cancel_preadmission(self, seq) -> None:
         """Forget an admission the scheduler takes back before any dispatch.

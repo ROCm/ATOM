@@ -52,3 +52,38 @@ def test_multi_prefetch_only_on_producer_not_decode_receiver():
     m.is_producer = False
     assert not m.supports_async_lookup
     assert not m.lookup_ready(object())
+
+
+def test_answered_is_read_only_and_marks_lookup_ready():
+    gate = Event()
+
+    class Backend:
+        def lookup(self, seq, lookup_id=None):
+            gate.wait(5)
+            return 512
+
+    from atom.kv_transfer.offload.chunked_scheduler import (
+        ChunkedOffloadSchedulerBase,
+    )
+
+    lookup = AsyncStoreLookup(Backend())
+    sched = ChunkedOffloadSchedulerBase.__new__(ChunkedOffloadSchedulerBase)
+    sched._lookup_client = lookup
+    sched._lookup_results = {}
+    seq = SimpleNamespace(id=7)
+    try:
+        assert lookup.submit(seq, "7")
+        assert not lookup.answered("7")
+        assert not sched.lookup_ready(seq)  # in flight
+        gate.set()
+        deadline = time.time() + 5
+        while not lookup.answered("7") and time.time() < deadline:
+            time.sleep(0.01)
+        # Answered but not taken: still listed as pending, and early-loadable.
+        assert lookup.is_pending("7") and lookup.answered("7")
+        assert sched.lookup_ready(seq)
+        assert lookup.answered("7")  # reading it consumed nothing
+        assert lookup.take_answer("7", None) == 512
+        assert not sched.lookup_ready(seq)
+    finally:
+        lookup.close()

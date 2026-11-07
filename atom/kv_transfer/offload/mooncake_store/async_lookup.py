@@ -64,6 +64,12 @@ class AsyncStoreLookup:
         with self.lock:
             return sid in self.pending
 
+    def answered(self, sid):
+        """Whether the lookup for `sid` has completed (read-only)."""
+        with self.lock:
+            f = self.pending.get(sid)
+            return f is not None and f.done() and not f.cancelled()
+
     def poll(self, sid):
         with self.lock:
             f = self.pending.get(sid)
