@@ -466,6 +466,11 @@ else
     slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
     SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
   fi
+  # Diagnostic retry: these hosts failed GPU-idle preflight in the first A/B.
+  # Keep placement automatic while avoiding the confirmed occupied nodes.
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd" && -z "${NODE_LIST}" ]]; then
+    SBATCH_CMD+=(--exclude pit2-p03-g27,pit2-p03-g53)
+  fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
     --error "${SLURM_ERROR}"
