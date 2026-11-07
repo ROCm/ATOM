@@ -10,7 +10,6 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from atom.models.deepseek_v4.mono.config import EPS, ROPE_DIM
 from atom.models.deepseek_v4.mono.kernels import buffer_ops as bo
 from atom.models.deepseek_v4.mono.kernels.attn_pre import kv_quant
 from atom.models.deepseek_v4.mono.kernels.common import bf16x2_has_nan, wave_any
@@ -47,6 +46,8 @@ from atom.models.deepseek_v4.mono.kernels.primitives import (
 def attention_stages(ctx):
     """4-7b. Query RMS + RoPE, gather-sparse split softmax, merge, o_a / o_b and the
     attention TP peer reduce."""
+    EPS = ctx["EPS"]
+    ROPE_DIM = ctx["ROPE_DIM"]
     CR = ctx["CR"]
     DRAFT_BLOCK = ctx["DRAFT_BLOCK"]
     G = ctx["G"]

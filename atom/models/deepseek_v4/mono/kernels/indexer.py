@@ -12,7 +12,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from atom.models.deepseek_v4.mono.config import EPS, ROPE_DIM
 from atom.models.deepseek_v4.mono.kernels import buffer_ops as bo
 from atom.models.deepseek_v4.mono.kernels.common import (
     FP4_MAX,
@@ -53,6 +52,8 @@ from atom.models.deepseek_v4.mono.kernels.primitives import (
 @traced
 def index_query_stages(ctx):
     """2c-3c. The indexer's compressor, query and head weights (CSA only)."""
+    EPS = ctx["EPS"]
+    ROPE_DIM = ctx["ROPE_DIM"]
     CR = ctx["CR"]
     C_COFF = ctx["C_COFF"]
     C_RING = ctx["C_RING"]
@@ -65,7 +66,7 @@ def index_query_stages(ctx):
     IC_S_BLK = ctx["IC_S_BLK"]
     IH = ctx["IH"]
     IHD = ctx["IHD"]
-    INTER = ctx["INTER"]
+    ctx["INTER"]
     INDEXER_HADAMARD = ctx["INDEXER_HADAMARD"]
     IW = ctx["IW"]
     K_PB = ctx["K_PB"]
@@ -124,7 +125,7 @@ def index_query_stages(ctx):
     window_pool = ctx["window_pool"]
     attention_fp8_bf16 = ctx["attention_fp8_bf16"]
     compressor_projection_bf16 = ctx["compressor_projection_bf16"]
-    shared_bf16_block128 = ctx["shared_bf16_block128"]
+    ctx["shared_bf16_block128"]
 
     def had_pair(v0, v1, ln):
         """FWHT over IHD channels (lane ln holds ln and ln + 64), scaled by IHD**-0.5;
@@ -450,31 +451,6 @@ def index_query_stages(ctx):
                         term = act.select(term, fx.Float32(0.0))
                     ssq = ssq + term
             rstd = rsq(block_sums([ssq])[0] * (1.0 / HIDDEN) + EPS)
-            # Observe the ACTUAL materialized BF16 operand once per sample.
-            # FP32 rms_norm on the host is not an exact reduction-tree oracle.
-            # This existing plain-f32 plane has no communication role.
-            if const_expr(attention_fp8_bf16):
-                observer = S * (
-                    HIDDEN + (HIDDEN + INTER if shared_bf16_block128 else 0)
-                )
-                if h0 == 0:
-                    for i in range_constexpr(len(ks)):
-                        staged = [
-                            bf16_round(xv[i][j] * gs[i][j] * rstd) for j in range(4)
-                        ]
-                        if const_expr(act is not None and i == len(ks) - 1):
-                            if act:
-                                bo.buffer_store(
-                                    fx.Vector.from_elements(staged, fx.Float32),
-                                    rsrc(mb("xqd")),
-                                    observer + sw * HIDDEN + ks[i],
-                                )
-                        else:
-                            bo.buffer_store(
-                                fx.Vector.from_elements(staged, fx.Float32),
-                                rsrc(mb("xqd")),
-                                observer + sw * HIDDEN + ks[i],
-                            )
             stamp("i_wp", tt, 2)
             parts = []
             for hh in range_constexpr(IH_TASK):
@@ -506,12 +482,6 @@ def index_query_stages(ctx):
             for hh in range_constexpr(IH_TASK):
                 if tid == 0:
                     put(mb("i_wp"), sw * IH + h0 + hh, bf16_round(tots[hh]) * sc)
-                    if const_expr(attention_fp8_bf16):
-                        bo.buffer_store(
-                            bf16_round(tots[hh]),
-                            rsrc(mb("xqd")),
-                            observer + S * HIDDEN + sw * IH + h0 + hh,
-                        )
             stamp("i_wp", tt, 4)
     return {}
 

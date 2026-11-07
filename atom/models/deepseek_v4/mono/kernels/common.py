@@ -11,7 +11,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
-from atom.models.deepseek_v4.mono.config import EPS, FP8_MAX, ROUTE_SCALE
+from atom.models.deepseek_v4.mono.config import FP8_MAX
 from atom.models.deepseek_v4.mono.kernels import buffer_ops as bo
 from atom.models.deepseek_v4.mono.kernels import helpers
 from atom.models.deepseek_v4.mono.kernels.helpers import (
@@ -30,7 +30,6 @@ from atom.models.deepseek_v4.mono.kernels.primitives import (
     lds_st,
     mxfp8_to_bf16x8,
     rcp,
-    rsrc,
     wave_max,
     wave_umax,
     write_lane_i32,
@@ -104,6 +103,8 @@ def bf16x2_has_nan(w):
 def common_defs(ctx):
     """The helpers every stage shares: mailboxes, reductions, the MFMA GEMV machinery,
     activation staging, routing and the TP peer reduce."""
+    EPS = ctx["EPS"]
+    ROUTE_SCALE = ctx["ROUTE_SCALE"]
     BOUNDED_POLL = ctx["BOUNDED_POLL"]
     G = ctx["G"]
     HIDDEN = ctx["HIDDEN"]
@@ -273,12 +274,6 @@ def common_defs(ctx):
                     d0, d1, scale = quant_mxfp8(v0, v1, 128)
                     staged = bf16_pair(d0 * scale, d1 * scale)
                     lds_st(xs, j * nq + tid + i * THREADS, staged)
-                    q0, q1 = bf2_f32(staged.bitcast(fx.Int32))
-                    bo.buffer_store(
-                        fx.Vector.from_elements([q0, q1], fx.Float32),
-                        rsrc(mb("xqd")),
-                        S * HIDDEN + samples[j] * HIDDEN + 2 * (tid + i * THREADS),
-                    )
         elif const_expr(use_fp8_block128):
             # HIDDEN // 4 slots of 4 FP8 bytes; ragged tail clamped (see _rmsnorm_tail_ks)
             nq = HIDDEN // 4

@@ -77,7 +77,7 @@ def ffn_hcc(S: int, hc_mult: int, n_experts: int = N_EXPERTS) -> bool:
     """Whether the FFN contracts its hc_mult streams in a stage of its own (hcc_f,
     publishing ``ain``) rather than in every router task. Keep this handoff for
     workloads exceeding one grid round even when a non-divisible sample count
-    prevents multi-column router grouping; inline contraction spills at q7.
+    prevents multi-column router grouping.
     """
     return hc_mult > 1 and S * (n_experts // ROUTER_TILE) > BLOCKS
 
@@ -264,20 +264,6 @@ def layout(
         ("sel", S * (1 + top_k) * pr),
         ("prob", S * (1 + top_k) * pr),
         ("mid", S * (1 + top_k) * inter * pr),
-        # Plain-f32 observer plane, excluded from tagged-pair scrub. Routed
-        # input first, then real shared UG and down ACTUALLY staged operands.
-        # Real CSA appends its normalized BF16 index-weights input/output for
-        # fixed-operand attribution; these stores are not performance-ready.
-        (
-            "xqd",
-            S
-            * (
-                hidden
-                + (hidden + inter if shared_bf16_block128 else 0)
-                + (hidden + index_heads if attention_fp8_bf16 and index_head_dim else 0)
-            )
-            * 4,
-        ),
     ]
     off, scratch = 0, {}
     for name, size in items:

@@ -26,6 +26,7 @@ from atom.models.deepseek_v4.mono.build import (
 )
 from atom.models.deepseek_v4.mono.config import (
     MAX_LAYERS_PER_STEP,
+    POLL_TIMEOUT_US,
     MoeMode,
     _variant_key,
     as_moe_mode,
@@ -316,7 +317,7 @@ class V4MonoDecodeRunner:
                     self.npes,
                     self.moe_mode,
                     self.timeline,
-                    None,
+                    POLL_TIMEOUT_US,
                     tokens_per_seq,
                     attention_mode=self.attention_mode,
                     **plan,
@@ -354,6 +355,7 @@ class V4MonoDecodeRunner:
                             rows,
                             self.npes,
                             launch_shape=plan["launch_shape"],
+                            poll_timeout_us=POLL_TIMEOUT_US,
                             **kwargs,
                         )
                     elif not isinstance(launches, tuple):
@@ -399,6 +401,7 @@ class V4MonoDecodeRunner:
                         self.npes,
                         self.group,
                         timeline=self.timeline,
+                        poll_timeout_us=POLL_TIMEOUT_US,
                         moe_mode=self.moe_mode,
                         tokens_per_seq=tokens_per_seq,
                         attention_mode=self.attention_mode,

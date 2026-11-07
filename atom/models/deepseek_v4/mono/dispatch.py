@@ -18,6 +18,7 @@ from atom.models.deepseek_v4.mono.profile import (
     deployment_refusal,
     select_profile,
 )
+from atom.mono.runtime.consensus import bind_agreed
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -99,32 +100,77 @@ def install_mono_decode(model, atom_config, drafter, *, metadata_builder=None):
     from atom.models.deepseek_v4.mono.embedding import MonoEmbedding
     from atom.models.deepseek_v4.mono.projection import MonoIndexerProjection
 
-    model.model.embed = MonoEmbedding(model.model.embed)
-    for layer in model.model.layers:
-        if layer.attn.indexer is not None:
-            layer.attn.indexer.weights_proj = MonoIndexerProjection(
-                layer.attn.indexer.weights_proj
-            )
-    if drafter is not None:
-        drafter.model.share_with_target(model, set())
-    if profile.name.startswith("dspark_"):
-        from atom.models.deepseek_v4.mono.norm import MonoRMSNorm
-        from atom.models.deepseek_v4.mono.proposer import MonoDSparkProposer
+    replacements = []
 
-        last = drafter.model.model.mtp[-1]
-        last.norm = MonoRMSNorm(last.norm)
-        block = drafter.block
-        native_callbacks = (block.forward, block.epilogue, block.warmup_inputs)
-        # The installed proposer owns the draft runner, not the target shape.
-        metadata_builder.model_runner.drafter = MonoDSparkProposer(drafter, session)
-    # Bind only after read-only wrappers and shared draft modules are final.
-    # Repack still precedes native warmup/KV sizing; binding earlier would
-    # invalidate the draft embedding owner when it is shared again above.
-    if not session.prepare_weights():
+    def prepare_wrappers():
+        # Construct and validate every wrapper before replacing any module.
+        # A quantized indexer must refuse on every rank without partial edits.
+        embedding = MonoEmbedding(model.model.embed)
+        replacements.append((model.model, "embed", model.model.embed, embedding))
+        for layer in model.model.layers:
+            if layer.attn.indexer is not None:
+                owner = layer.attn.indexer
+                replacements.append(
+                    (
+                        owner,
+                        "weights_proj",
+                        owner.weights_proj,
+                        MonoIndexerProjection(owner.weights_proj),
+                    )
+                )
+        if drafter is not None:
+            # Retain the original references for both native draft layouts.
+            if profile.name.startswith("dspark_"):
+                from atom.models.deepseek_v4.mono.norm import MonoRMSNorm
+
+                inner = drafter.model.model
+                replacements.append((inner, "embed", inner.embed, embedding))
+                last = inner.mtp[-1]
+                replacements.append((last, "norm", last.norm, MonoRMSNorm(last.norm)))
+            else:
+                for block in drafter.model.model.mtp:
+                    replacements.append((block, "embed", block.embed, embedding))
+
+    def replace_modules(index):
+        for replacement in replacements:
+            owner, name = replacement[:2]
+            setattr(owner, name, replacement[index])
+
+    def install_modules():
+        replace_modules(3)
         if profile.name.startswith("dspark_"):
-            metadata_builder.model_runner.drafter = drafter
-            block.forward, block.epilogue, block.warmup_inputs = native_callbacks
+            from atom.models.deepseek_v4.mono.proposer import MonoDSparkProposer
+
+            # The proposer rebinds native callbacks. Snapshot them before its
+            # constructor so a peer's refusal rolls back the entire draft too.
+            block = drafter.block
+            for name in ("forward", "epilogue", "warmup_inputs"):
+                original = getattr(block, name)
+                replacements.append((block, name, original, original))
+            runner = metadata_builder.model_runner
+            replacements.append((runner, "drafter", drafter, drafter))
+            runner.drafter = MonoDSparkProposer(drafter, session)
+
+    installed = prepared = False
+    try:
+        bind_agreed(prepare_wrappers, session.group)
+        installed = True
+        bind_agreed(install_modules, session.group)
+        # Binding sees the final read-only modules and the shared draft owner.
+        # Any later geometry/device refusal rolls both back before Native runs.
+        prepared = session.prepare_storage()
+        if not prepared:
+            return model
+    except Exception:
+        logger.exception("V4 Mono installation refused before publication")
         return model
+    finally:
+        if not prepared:
+            try:
+                if installed:
+                    bind_agreed(lambda: replace_modules(2), session.group)
+            finally:
+                session.close()
     metadata_builder._mono_session = session
     # Publish only after preparation succeeds. Refused deployments retain the
     # exact native builder, whose buffers were allocated once by ModelRunner.

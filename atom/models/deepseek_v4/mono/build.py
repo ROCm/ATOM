@@ -27,9 +27,10 @@ def launch_plan(rows: int, *, tokens_per_seq: int = 1, attention_mode="causal") 
         elif rows == 8 and tokens_per_seq == 1:
             samples_per_pass = 2
         plan = {
-            # S7/q7 combined attention can spill; split that complete request.
+            # S3 with bounded polling and S7/q7 combined attention can spill.
+            # Split producers/core to retain the zero-scratch resident grid.
             "launch_shape": (
-                "three" if rows == 14 or rows == tokens_per_seq == 7 else "two"
+                "three" if rows in (3, 14) or rows == tokens_per_seq == 7 else "two"
             ),
             "qkv_batch_limit": 1,
             # Ordinary S4/q1 and causal S4/S8 q4 consume a full tile in one
@@ -68,6 +69,9 @@ def kernel_kwargs(
     """Identical geometry and numerical contract for every launch phase."""
     return dict(
         scale=cfg.softmax_scale,
+        eps=cfg.eps,
+        rope_dim=cfg.rope_dim,
+        route_scale=cfg.route_scale,
         timeline=timeline,
         moe_mode=moe_mode,
         tokens_per_seq=tokens_per_seq,
