@@ -436,18 +436,23 @@ def test_a_lean_width_restages_only_the_spilled_k1_builds(monkeypatch):
 
 def test_a_lean_width_unfolds_only_the_spilled_mla_fold_k2_builds(monkeypatch):
     """``_lean_width``: a K2 build with the MLA post / prep folds whose launcher
-    needs scratch is replaced by its layer's default build (shared with the
-    layers already on it), every layer keyed on it moved; a fold build that fits
-    keeps its folds, K1 untouched."""
+    needs scratch, past the last of ``k2.FOLD_SCHEDULERS``, is replaced by its
+    layer's default build (shared with the layers already on it), every layer
+    keyed on it moved; a fold build that fits keeps its folds, K1 untouched."""
     pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL")
     pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
     from atom.models.kimi_k3.mono import runner
     from atom.models.kimi_k3.mono.kernels import layer as k2
 
     monkeypatch.setattr(k2, "build", lambda key: ("plain", key.nblocks))
+    last = k2.FOLD_SCHEDULERS[-1]
     plain8 = k2.K2Build(tokens=6, nblocks=8)
-    both = replace(plain8, mla_post=True, mla_prep=3, prep_nblocks=8, rope_maxpos=64)
-    prep2 = k2.K2Build(tokens=6, nblocks=2, mla_prep=3, prep_nblocks=2, qa_eps=1e-5)
+    both = replace(
+        plain8, mla_post=True, mla_prep=3, prep_nblocks=8, rope_maxpos=64, sched=last
+    )
+    prep2 = k2.K2Build(
+        tokens=6, nblocks=2, mla_prep=3, prep_nblocks=2, qa_eps=1e-5, sched=last
+    )
     post2 = k2.K2Build(tokens=6, nblocks=2, mla_post=True)
     built = runner.WidthBuild(
         k1_keys={1: "k1"},
@@ -463,3 +468,39 @@ def test_a_lean_width_unfolds_only_the_spilled_mla_fold_k2_builds(monkeypatch):
     assert lean.k1_keys == built.k1_keys and lean.k1_launchers == built.k1_launchers
     # a default K2 build that spills: nothing leaner
     assert runner._lean_width(built, ["p8"]) is None
+
+
+def test_a_spilled_fold_build_tries_each_scheduler_before_unfolding(monkeypatch):
+    """``_lean_width`` steps a spilled fold build down ``_next_fold_build``: the
+    default schedule, then each of ``k2.FOLD_SCHEDULERS``, then its layer's
+    default build; the fold fields stay until that last step."""
+    pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL")
+    pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
+    from atom.models.kimi_k3.mono import runner
+    from atom.models.kimi_k3.mono.kernels import layer as k2
+
+    monkeypatch.setattr(k2, "build", lambda key: ("built", key.sched))
+    fold = k2.K2Build(tokens=8, nblocks=2, mla_prep=2, prep_nblocks=2)
+    built = runner.WidthBuild(
+        k1_keys={}, k1_launchers={}, k2_keys={6: fold}, k2_launchers={fold: "s0"}
+    )
+    seen = []
+    while True:
+        (key,) = built.k2_keys.values()
+        seen.append(key.sched if key.mla_prep else "unfolded")
+        if not key.mla_prep:
+            break
+        built = runner._lean_width(built, [built.k2_launchers[key]])
+    assert seen == ["", *k2.FOLD_SCHEDULERS, "unfolded"]
+    assert built.k2_keys == {6: k2.K2Build(tokens=8, nblocks=2)}
+    # the default build that spills: nothing leaner
+    assert runner._lean_width(built, [built.k2_launchers[built.k2_keys[6]]]) is None
+
+
+def test_unfolding_drops_the_scheduler():
+    pytest.importorskip("flydsl", reason="K2 builds need FlyDSL")
+    from atom.models.kimi_k3.mono.kernels import layer as k2
+
+    fold = k2.K2Build(tokens=8, nblocks=2, mla_prep=2, prep_nblocks=2)
+    assert k2.unfolded(replace(fold, sched="iterative-ilp")) == k2.unfolded(fold)
+    assert "sched" in k2.FOLD_FIELDS

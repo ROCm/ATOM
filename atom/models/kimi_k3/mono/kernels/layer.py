@@ -122,6 +122,11 @@ class K2Build:
     # mode 3: the MLA layer's rotary module (neox style; cos / sin rows)
     rope_neox: bool = True
     rope_maxpos: int = 1
+    # a fold build's LLVM machine scheduler (``amdgpu-sched-strategy``, one of
+    # ``FOLD_SCHEDULERS``), "" for LLVM's default. Set only by the width guard's
+    # lean rebuild (``runner._lean_width``) when the default build needs
+    # scratch; in the symbol only when set
+    sched: str = ""
 
 
 ABI = KernelAbi(
@@ -184,7 +189,18 @@ FOLD_FIELDS = (
     "kva_eps",
     "rope_neox",
     "rope_maxpos",
+    "sched",
 )
+
+# The schedulers a fold build that needs scratch is rebuilt with, in order,
+# before its layer falls back to the default build. Near K2's register limit
+# the allocator can rematerialize every reload of a spilled SGPR value (a
+# kernel-argument load) and leave its spill slot unreferenced; SILowerSGPRSpills
+# frees only the slots it moved to VGPR lanes, so the orphan, and the emergency
+# slot frame finalization adds for it, become a private segment no instruction
+# touches, which the scratch guard refuses all the same. Another schedule
+# changes which values the allocator spills; the computation is the same.
+FOLD_SCHEDULERS = ("iterative-ilp", "iterative-minreg")
 
 
 def unfolded(key: K2Build) -> K2Build:
@@ -609,6 +625,14 @@ def _body(
 _BUILDS: dict = {}
 
 
+def _schedule(key: K2Build, launch) -> None:
+    """``key.sched`` as the fold build's ``amdgpu-sched-strategy``: a compile
+    hint, so FlyDSL keys its cache on it as well."""
+    if key.sched:
+        assert key.sched in FOLD_SCHEDULERS, key.sched
+        flyc.compile[{"llvm_options": {"amdgpu-sched-strategy": key.sched}}](launch)
+
+
 def build(key: K2Build):
     if key in _BUILDS:
         return _BUILDS[key]
@@ -644,6 +668,7 @@ def build(key: K2Build):
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
+    assert not key.sched or key.mla_post or key.mla_prep, "sched is a fold build's"
     if key.mla_prep:
         assert key.mla_prep in (1, 2, 3), f"MLA prep mode {key.mla_prep}"
         # P2 on P0's first 2 S CTAs
@@ -691,6 +716,8 @@ def build(key: K2Build):
     ext_sym = {"mp": 1} if key.mla_post else {}
     if key.mla_prep:
         ext_sym["pp"] = key.mla_prep
+    if key.sched:
+        ext_sym["ss"] = key.sched.removeprefix("iterative-")
     name = kernel_symbol("k3_mono_k2", **symbol_params(key), **ext_sym)
 
     bk = {
@@ -1027,6 +1054,7 @@ def _build_post(key, name, keyed, bk):
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI_POST.check(k2, launch)
+    _schedule(key, launch)
     _BUILDS[key] = launch
     return launch
 
@@ -1326,6 +1354,7 @@ def _build_prep(key, name, keyed, bk):
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI_PREP.check(k2, launch)
+    _schedule(key, launch)
     _BUILDS[key] = launch
     return launch
 

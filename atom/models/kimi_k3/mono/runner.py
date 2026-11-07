@@ -139,16 +139,29 @@ def ix_peer_offset(max_rows: int) -> int:
     return -(-k2.peer_bytes(max_rows) // 256) * 256
 
 
+def _next_fold_build(key: "k2.K2Build") -> "k2.K2Build":
+    """The build a fold build that needs scratch is rebuilt as: the next of
+    ``k2.FOLD_SCHEDULERS``, then its layer's default build."""
+    order = ("", *k2.FOLD_SCHEDULERS)
+    at = order.index(key.sched)
+    if at + 1 < len(order):
+        return replace(key, sched=order[at + 1])
+    return k2.unfolded(key)
+
+
 def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
     """``built`` with each K1 build whose launcher spilled staged a column group
     a GEMV unit (``KdaPreBuild.gemv_unit``): half the weights in flight, slower
     where ``kda.gemv_staging`` keeps two groups, so only where those do not fit;
     and each K2 build with the MLA post / prep folds whose launcher spilled
-    replaced by its layer's default build (``k2.unfolded``): those layers run
-    their attention tail / seam unfolded at this width (the forward follows the
-    width's K2 keys), the width stays mono. The fold builds sit at K2's
-    register limit, where the backend can leave an unreferenced SGPR spill slot
-    (a private segment, never accessed) that the scratch guard refuses.
+    rebuilt one step down ``_next_fold_build``: under another LLVM scheduler,
+    and past the last of those as its layer's default build (``k2.unfolded``),
+    where that layer runs its attention tail / seam unfolded at this width (the
+    forward follows the width's K2 keys) and the width stays mono. The fold
+    builds sit at K2's register limit, where the backend can leave an
+    unreferenced SGPR spill slot (a private segment, never accessed) that the
+    scratch guard refuses (``k2.FOLD_SCHEDULERS``). ``WidthBuilds.prepare``
+    calls this again while a rebuild still spills.
     None when no spilled launcher is such a K1 or K2 build (a default K2 or
     indexer spill, or a K1 at one group a unit already): there is nothing
     leaner to build."""
@@ -158,7 +171,7 @@ def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
         if launcher in spilled and key.gemv_unit > 1
     }
     plain = {
-        key: k2.unfolded(key)
+        key: _next_fold_build(key)
         for key, launcher in built.k2_launchers.items()
         if launcher in spilled
         and isinstance(key, k2.K2Build)
@@ -166,12 +179,20 @@ def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
     }
     if not lean and not plain:
         return None
-    if plain:
+    for sched in (*k2.FOLD_SCHEDULERS, ""):
+        moved = {key for key, new in plain.items() if new.sched == sched}
+        if not moved:
+            continue
         logger.info(
-            "Kimi-K3 mono: %d-row K2 of layers %s without the MLA folds (their"
-            " fold builds need scratch)",
-            next(iter(plain)).tokens,
-            sorted(layer for layer, key in built.k2_keys.items() if key in plain),
+            "Kimi-K3 mono: %d-row K2 of layers %s %s (their fold builds need"
+            " scratch)",
+            next(iter(moved)).tokens,
+            sorted(layer for layer, key in built.k2_keys.items() if key in moved),
+            (
+                f"rebuilt with amdgpu-sched-strategy={sched}"
+                if sched
+                else "without the MLA folds"
+            ),
         )
     k1_keys = {layer: lean.get(key, key) for layer, key in built.k1_keys.items()}
     k2_keys = {layer: plain.get(key, key) for layer, key in built.k2_keys.items()}
