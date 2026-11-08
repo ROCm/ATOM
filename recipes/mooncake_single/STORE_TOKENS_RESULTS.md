@@ -25,7 +25,7 @@ Branch defaults that this result depends on:
 |---|---|---|
 | `OFFLOAD_MIN_LOAD_TOKENS` | 512 | A shared tier should serve what HBM would; 8192 re-prefilled ~11% more. |
 | `OFFLOAD_LOAD_STREAM_HIGH_PRIORITY` | 1 | Load unpack 144 ms -> 3.6 ms mean on a busy GPU. |
-| `OFFLOAD_STAGING_ON_COMPUTE_STREAM` | 1 | Side-stream offload kernels froze the engine in 5 of 9 runs; 0 of 12 on the compute stream. |
+| `OFFLOAD_STAGING_ON_COMPUTE_STREAM` | 1 | Store arms on side streams froze the engine for minutes in 5 of the 9 runs in which it was tried; no freeze in the 20+ Store arms run on the compute stream since. |
 | `ATOM_OFFLOAD_EARLY_LOAD` / `_STATE` | 1 / 1 | Start the Store read when the lookup answers instead of one delayer cycle later. |
 
 ## Best measured configuration: DP2 (TP2 x DP2), concurrency 128, 900 s
@@ -60,6 +60,9 @@ Effect of the individual pieces (DP2, same batch as the row above it):
 | f09 | -0.1% | -11.6% | +15.6% | -13.6% | -35.2% | +3.8% | |
 | i09 | +0.7% | -15.8% | +32.0% | -19.5% | -57.9% | +3.0% | |
 | t29d (branch defaults) | +4.8% | +3.0% | **+80.9%** | -13.9% | -60.9% | -6.2% | main had 66 s of stalls; **open issue below** |
+
+The DP4 rows are different code versions (e29: host-side event waits only; f09: same; i09: compute stream plus the since-removed delayer waits; t29d: the current branch), so they
+show the trend, not one configuration.
 
 **Open issue:** with early tier load on, the DP4 median TTFT regressed
 (+80.9%). The step trace shows the prefill delayer holds longer on the Store arm
