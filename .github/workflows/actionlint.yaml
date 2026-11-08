@@ -24,17 +24,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Go for actionlint
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          cache: false
+
       - name: Install actionlint
         env:
-          ACTIONLINT_VERSION: "1.7.7"
+          GOPROXY: https://proxy.golang.org,direct
         run: |
-          set -euo pipefail
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30 \
-            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
-            -o actionlint.tar.gz
-          tar -xzf actionlint.tar.gz actionlint
-          rm -f actionlint.tar.gz
-          chmod +x ./actionlint
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run actionlint
-        run: ./actionlint -color -shellcheck "" -pyflakes ""
+        run: actionlint -color -shellcheck "" -pyflakes ""
