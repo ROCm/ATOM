@@ -242,13 +242,12 @@ def _check_strict_targets(name, parameters):
     from referencing.exceptions import Unresolvable
     from referencing.jsonschema import DRAFT202012
 
-    from .dsml_grammar import _refs
     from .schema import OFFLINE_REGISTRY
 
     resolver = OFFLINE_REGISTRY.resolver_with_root(
         DRAFT202012.create_resource(parameters)
     )
-    seen, pending = set(), list(_refs(parameters))
+    seen, pending = set(), list(_schema_refs(parameters))
     while pending:
         ref = pending.pop()
         if ref in seen:
@@ -259,7 +258,28 @@ def _check_strict_targets(name, parameters):
         except Unresolvable:
             raise ValueError(f"{name}: cannot resolve $ref {ref!r}") from None
         _check_strict(name, target)
-        pending += _refs(target)
+        pending += _schema_refs(target)
+
+
+def _schema_refs(schema):
+    """The ``$ref``s at ``schema``'s schema positions, the ones
+    ``check_schema_safety`` resolves: in `example` or an `x-*` annotation a
+    `$ref` key is data."""
+    from .schema import _ARRAYS, _MAPS, _SINGLES
+
+    pending = [schema]
+    while pending:
+        node = pending.pop()
+        if not isinstance(node, dict):
+            continue
+        if isinstance(node.get("$ref"), str):
+            yield node["$ref"]
+        for key in _MAPS:
+            if isinstance(node.get(key), dict):
+                pending += node[key].values()
+        pending += [node[key] for key in _SINGLES if key in node]
+        for key in _ARRAYS:
+            pending += node.get(key) or ()
 
 
 def _check_strict(name, schema, *, top=False):

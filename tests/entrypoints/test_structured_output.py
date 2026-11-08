@@ -915,3 +915,19 @@ def test_a_call_the_stream_never_finished_is_not_sent():
     assert "Checking." in raw and "logprob_error" in raw
     assert '"tool_calls"' not in raw
     assert raw.count("[DONE]") == 1
+
+
+def test_a_ref_inside_an_annotation_is_data():
+    """`example` and `x-*` annotations hold instances, where `$ref` is a key."""
+    from atom.structured_output.validation import strict_tool_schemas
+
+    data = {"$ref": "https://example.com/data"}
+    city = {
+        "type": "object",
+        "properties": {"$ref": {"type": "string"}},
+        "required": ["$ref"],
+        "additionalProperties": False,
+        "example": data,
+        "x-sample": data,
+    }
+    assert strict_tool_schemas([_function({**STRICT, "properties": {"city": city}})])
