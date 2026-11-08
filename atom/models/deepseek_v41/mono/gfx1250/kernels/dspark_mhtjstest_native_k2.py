@@ -29,6 +29,7 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_round_column
 from atom.mono.runtime.abi import KernelAbi
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_state import STATE_WORDS
 from atom.models.deepseek_v41.mono.gfx1250.kernels.bf16_k2_abi import ABI_QOFF
+from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_ug import QOFF_META
 ABI = KernelAbi((*ABI_QOFF.names, 'mhtjstest_state'))
 @lru_cache(None)
 def build_dspark_down(key: LayerPostBuild, debug=False, reduce=False, seam=False, gates=False, front=False, shared_debug=False, union=False, ug=False, ug_debug=False, down=False, down_debug=False):
@@ -202,6 +203,8 @@ def build_dspark_down(key: LayerPostBuild, debug=False, reduce=False, seam=False
                 for i,value in enumerate((w13,w13_s)):
                     fx.ptr_store(fx.Int32(value),mem.late_meta.ptr+240+2*i)
                     fx.ptr_store(fx.Int32(value>>32),mem.late_meta.ptr+241+2*i)
+                fx.ptr_store(fx.Int32(qoff),mem.late_meta.ptr+QOFF_META)
+                fx.ptr_store(fx.Int32(qoff>>32),mem.late_meta.ptr+QOFF_META+1)
             if const_expr(ug_debug):
                 for i,value in enumerate((sw2,sw2_s)):
                     fx.ptr_store(fx.Int32(value),mem.late_meta.ptr+244+2*i)
@@ -220,9 +223,8 @@ def build_dspark_down(key: LayerPostBuild, debug=False, reduce=False, seam=False
         for name in ATT_WORDS:args_a[name]=fx.Int32(0)
         for name in LATE_PTRS:args_a[name]=fx.Int64(0)
         for name in LATE_WORDS:args_a[name]=fx.Int32(0)
-        args_a['qoff']=qoff
         mb=Mailbox(layer)
-        c=dict(S=s,tid=tid,bid=bid,lane=tid%32,wave=tid//32,args=args_a,
+        c=dict(S=s,tid=tid,bid=bid,lane=tid%32,wave=tid//32,args=args_a,qoff_meta=ug,
                put=mb.put,put_words=mb.put_words,poll=mb.poll,
                tok_par=key.tok_par,index_fp4=False,rank=rank,d=dims,
                late_meta=mem.late_meta.ptr,

@@ -12,6 +12,9 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import CM_NT_G
 THREADS=256
 WAVES=8
 CM_NT=CM_NT_GFX1250
+# late_meta words 262..263: the MoE launch queue offset (qoff), for a K2 that
+# stages it (``qoff_meta``)
+QOFF_META=262
 
 def ug_context(root,key):
     c=front_context(root,key,'route')
@@ -21,9 +24,10 @@ def ug_context(root,key):
         mhtjstest_tid = fx.thread_idx.x
         c.update(tid=mhtjstest_tid, lane=mhtjstest_tid % 32, wave=mhtjstest_tid // 32)
     c['args']={name:late_pointer(root,240+2*i) for i,name in enumerate(('w13','w13_s'))}
-    if 'qoff' in root['args']:
-        # take_ug_task's queue word offset: a host-computed kernel argument
-        c['args']['qoff']=root['args']['qoff']
+    if root.get('qoff_meta',False):
+        # take_ug_task's queue word offset: host-computed, staged in late_meta
+        # (not a kernel-argument SGPR live across the whole K2)
+        c['args']['qoff']=late_pointer(root,QOFF_META)
     c['red'],c['tab']=root['front_red'],root['front_tab']
     for name,offset in stage_lds(key.tokens,c['rs'])['offsets'].items():
         c[name]=root['front_stage']+offset

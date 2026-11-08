@@ -47,7 +47,7 @@ def check_residency(kernels):
         record = resources[0]
         assert all(record[k] == 0 for k in ('scratch', 'vgpr_spill'))
         if record['sgpr_spill']:
-            assert len(abi.names) == 76
+            assert len(abi.names) == 77  # bf16 K2 ABI + qoff + mhtjstest_state
             assert record['name'].startswith((
                 'atom::gfx1250_dspark_mhtjstest_native_k2_s48_',
                 'atom::ct1_p1a_k2_fs5_s48_',
