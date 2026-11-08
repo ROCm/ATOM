@@ -67,6 +67,9 @@ class PrefixSpreadRouter:
         # nevertheless still prefilling), and the prefix each was credited.
         self._prefilling: set = set()
         self._est_hit: dict = {}
+        # Prefix credit still owned by each in-flight request. A follower
+        # taking over an aborted producer loses that credit exactly once.
+        self._credited_hit: dict = {}
 
     def reset(self) -> None:
         """Forget in-flight state. The index stays: it describes the ranks'
@@ -81,6 +84,7 @@ class PrefixSpreadRouter:
         self.pending.clear()
         self._prefilling.clear()
         self._est_hit.clear()
+        self._credited_hit.clear()
 
     # -- request lifecycle (called by CoreManager under its lock) --------------
 
@@ -88,7 +92,9 @@ class PrefixSpreadRouter:
         """Mark `seq_id` in flight; returns the prefix it was credited at
         `select`."""
         self._prefilling.add(seq_id)
-        return self._est_hit.pop(seq_id, 0)
+        hit = self._est_hit.pop(seq_id, 0)
+        self._credited_hit[seq_id] = hit
+        return hit
 
     def prefilling(self, seq_id) -> bool:
         return seq_id in self._prefilling
@@ -96,21 +102,23 @@ class PrefixSpreadRouter:
     def prefill_complete(self, seq_id) -> None:
         """`seq_id` completed its prefill: the entries it relied on are real."""
         self._prefilling.discard(seq_id)
+        self._credited_hit.pop(seq_id, None)
         entry = self.seq_hashes.pop(seq_id, None)
         if entry is None:
             return
         rank, hashes = entry
-        for h in hashes:
+        for h, _start in hashes:
             self.pending.pop((h, rank), None)
 
-    def release(self, seq_id) -> None:
-        """`seq_id` left (finished, aborted, rejected, failed send)."""
+    def release(self, seq_id) -> dict:
+        """Release a request; return extra prefill charges for its successors."""
         self._est_hit.pop(seq_id, None)
         if seq_id not in self._prefilling:
             self.prefill_complete(seq_id)
-            return
+            return {}
         self._prefilling.discard(seq_id)
-        self._left_unprefilled(seq_id)
+        self._credited_hit.pop(seq_id, None)
+        return self._left_unprefilled(seq_id)
 
     # -- placement ------------------------------------------------------------
 
@@ -269,7 +277,11 @@ class PrefixSpreadRouter:
                 index.move_to_end(h)
             reused = (i + 1) * hbs <= hit
             had = rank in holders
-            if reused:
+            if had and holders[rank] in self._prefilling:
+                # A newcomer must not erase another request computing this
+                # prefix locally. It joins that producer's ordered waiters.
+                producer = holders[rank]
+            elif reused:
                 producer = holders.pop(rank, hit_source)
             else:
                 holders.pop(rank, None)
@@ -277,11 +289,11 @@ class PrefixSpreadRouter:
             holders[rank] = producer
             key = (h, rank)
             if not had or not reused:
-                pending.setdefault(key, set()).add(seq_id)
-                relied.append(h)
+                pending.setdefault(key, {})[seq_id] = None
+                relied.append((h, (i + 1 - stride) * hbs))
             elif key in pending:
-                pending[key].add(seq_id)
-                relied.append(h)
+                pending[key][seq_id] = None
+                relied.append((h, (i + 1 - stride) * hbs))
         if relied:
             self.seq_hashes[seq_id] = (rank, relied)
         while len(index) > self.CAP:
@@ -289,28 +301,39 @@ class PrefixSpreadRouter:
             for r in holders:
                 pending.pop((old, r), None)
 
-    def _left_unprefilled(self, seq_id) -> None:
+    def _left_unprefilled(self, seq_id) -> dict:
         """`seq_id` left before its prefill completed (abort, reject, failed
-        send). Drop each provisional entry it produced -- its KV never arrived
-        -- and each no other unfinished request on that rank still relies on.
-        Who recomputes a part it was producing is the scheduler's call, not
-        the router's."""
+        send). Hand provisional entries to the oldest remaining waiter on
+        that rank. Its credited prefix above the first lost sampled block
+        becomes conservative prefill debt; CoreManager applies it under the
+        same lock as this handoff."""
+        charges: dict = {}
         entry = self.seq_hashes.pop(seq_id, None)
         if entry is None:
-            return
+            return charges
         rank, hashes = entry
-        for h in hashes:
+        for h, start in hashes:
             key = (h, rank)
             waiters = self.pending.get(key)
             if waiters is None:
                 continue
-            waiters.discard(seq_id)
+            waiters.pop(seq_id, None)
             holders = self.index.get(h)
             produced = holders is not None and holders.get(rank) == seq_id
             if waiters and not produced:
+                continue
+            if waiters and holders is not None:
+                successor = next(iter(waiters))
+                holders[rank] = successor
+                credited = self._credited_hit.get(successor, 0)
+                retained = min(credited, start)
+                if retained < credited:
+                    self._credited_hit[successor] = retained
+                    charges[successor] = charges.get(successor, 0) + credited - retained
                 continue
             del self.pending[key]
             if holders is not None and rank in holders:
                 del holders[rank]
                 if not holders:
                     del self.index[h]
+        return charges

@@ -848,26 +848,99 @@ def test_an_aborted_move_leaves_no_hit_on_its_destination():
     assert hits.get(other) == 98_304
 
 
-def test_a_producer_abort_drops_the_prefix_it_was_computing():
-    """The producer of a prefix aborts while a follower on its rank still
-    relies on it: its entries go, so no later request is credited KV nobody
-    computed. Who recomputes it is the scheduler's call; the follower keeps
-    its charge."""
+def test_a_producer_abort_hands_the_prefix_and_debt_to_its_follower():
     mgr = _make_spread_mgr()
-    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])  # producer, prefilling
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
     other = 1 - owner
     mgr._rank_tokens[other] = 40_000
-    assert _route(mgr, [_chain_seq(2, 110_000)]) == [owner]  # follower
-    charged = mgr._seq_load[2][2]
-    mgr._release_seq_load(1)  # producer aborted
-    _, src_owner, _ = mgr._prefix_router._rank_hits(
-        _chain_seq(9, 100_000).prompt_hash_chain, 2
+    follower = _chain_seq(2, 110_000)
+    assert _route(mgr, [follower]) == [owner]
+    assert _est(mgr, follower) == 98_304
+    mgr._release_seq_load(1)
+    assert mgr._seq_load[2][2] == 110_000
+    assert mgr._rank_tokens[owner] == 110_000
+    router = mgr._prefix_router
+    hits, src_owner, source = router._rank_hits(follower.prompt_hash_chain, 2)
+    assert src_owner == owner and source == 2 and hits[owner] == 106_496
+    assert router.pending
+    mgr._release_seq_load(1)  # repeated producer release cannot charge twice
+    assert mgr._rank_tokens[owner] == 110_000
+    mgr._mark_seq_prefill_complete(2)
+    assert not router.pending
+    mgr._release_seq_load(2)
+    assert mgr._rank_tokens[owner] == 0
+    assert router._rank_hits(follower.prompt_hash_chain, 2)[0][owner] == 106_496
+
+
+def test_an_aborted_move_does_not_replace_a_local_prefill_producer():
+    from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
+
+    mgr = _make_spread_mgr(tier=OffloadTierProfile())
+    router = mgr._prefix_router
+    local = _chain_seq(3, 8192)
+    owner = _chain_seq(1, 8192)
+    # C computes on rank1; completed A is the newest holder on rank0.
+    router.place(local, 1, 2)
+    mgr._charge_seq_load_locked(local, 1)
+    router.place(owner, 0, 2)
+    mgr._charge_seq_load_locked(owner, 0)
+    mgr._mark_seq_prefill_complete(1)
+    mgr._rank_tokens[0] = 100_000
+    moved = _chain_seq(2, 12288)
+    assert _route(mgr, [moved]) == [1]
+    assert all(
+        router.index[h][1] == 3
+        for h in local.prompt_hash_chain.hashes
+        if h in router.index
     )
-    assert src_owner is None
-    assert mgr._seq_load[2][2] == charged
-    third = _chain_seq(3, 100_000)
-    _route(mgr, [third])
-    assert _est(mgr, third) == 0
+    mgr._release_seq_load(2)
+    assert all(
+        router.index[h][1] == 3
+        for h in local.prompt_hash_chain.hashes
+        if h in router.index
+    )
+    mgr._mark_seq_prefill_complete(3)
+    assert router._rank_hits(local.prompt_hash_chain, 2)[0][1] == 8192
+
+
+def test_successive_producer_aborts_transfer_debt_without_leaking_it():
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._rank_tokens[1 - owner] = 40_000
+    assert _route(mgr, [_chain_seq(2, 110_000), _chain_seq(3, 120_000)]) == [
+        owner,
+        owner,
+    ]
+    mgr._release_seq_load(1, route=False)  # API abort precedes terminal output
+    mgr._release_seq_load(1)
+    assert mgr._seq_load[2][2] == 110_000
+    mgr._release_seq_load(2)
+    assert mgr._seq_load[3][2] == 120_000
+    assert mgr._rank_tokens[owner] == 120_000
+    mgr._release_seq_load(2)
+    assert mgr._rank_tokens[owner] == 120_000
+    mgr._mark_seq_prefill_complete(3)
+    mgr._release_seq_load(3)
+    assert mgr._rank_tokens[owner] == 0
+    assert not mgr._prefix_router.pending
+    assert not mgr._prefix_router._credited_hit
+    assert mgr._prefix_router.index
+
+
+def test_producer_handoff_preserves_an_earlier_completed_prefix_credit():
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 4096)])
+    mgr._mark_seq_prefill_complete(1)
+    mgr._release_seq_load(1)
+    assert _route(mgr, [_chain_seq(2, 8192), _chain_seq(3, 12288)]) == [owner, owner]
+    assert mgr._seq_load[3][2] == 4096
+    mgr._release_seq_load(2)
+    # Only the provisional 4K..8K part loses credit, not the confirmed first 4K.
+    assert mgr._seq_load[3][2] == 8192
+    assert mgr._rank_tokens[owner] == 8192
+    mgr._mark_seq_prefill_complete(3)
+    mgr._release_seq_load(3)
+    assert mgr._rank_tokens[owner] == 0
 
 
 def test_an_abort_racing_the_first_stream_keeps_the_prefix():
@@ -933,6 +1006,9 @@ def test_offload_tier_profile_reads_the_kv_transfer_config(monkeypatch):
     assert tier(mp).loads
     assert tier(mp).min_load_tokens == 4096
     assert not tier({"kv_connector": "lmcache_mp", "kv_role": "kv_producer"}).loads
+    assert not tier({"kv_connector": "lmcache_mp", "kv_role": "kv_consumer"}).loads
+    assert not tier({"kv_connector": "mooncake_store", "kv_role": "kv_consumer"}).loads
+    assert tier({"kv_connector": "lmcache_mp", "kv_role": "kv_both"}).loads
     pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
     assert not tier({"kv_connector": "multi", "connectors": [pd]}).loads
     assert tier({"kv_connector": "mooncake_store", "kv_role": "offload"}).loads

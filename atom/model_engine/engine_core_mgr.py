@@ -1667,7 +1667,12 @@ class CoreManager:
     def _release_seq_load_locked(self, seq_id, *, route: bool = True) -> None:
         """``_release_seq_load`` for a caller that already holds ``_lb_lock``."""
         if route and self._prefix_router is not None:
-            self._prefix_router.release(seq_id)
+            for successor, extra in self._prefix_router.release(seq_id).items():
+                successor_load = self._seq_load.get(successor)
+                if successor_load is not None:
+                    rank, req_cost, tok_cost = successor_load
+                    self._rank_tokens[rank] += extra
+                    self._seq_load[successor] = (rank, req_cost, tok_cost + extra)
         entry = self._seq_load.pop(seq_id, None)
         if entry is None:
             return

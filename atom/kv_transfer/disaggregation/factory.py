@@ -68,7 +68,7 @@ class OffloadTierProfile:
 
     `loads`: a rank can load a prefix another DP rank computed from the tier
     (some configured transport, ``multi`` expanded, is an offload backend
-    whose role loads and whose tier the DP ranks share).
+    whose role both saves and loads and whose tier the DP ranks share).
 
     `min_load_tokens`: the shortest tier hit, beyond the HBM prefix, that the
     connector loads rather than recomputes.
@@ -226,7 +226,7 @@ class KVConnectorFactory:
             role = (getattr(sub, "kv_transfer_config", None) or {}).get(
                 "kv_role", "offload"
             )
-            if cls.is_offload_backend(name) and role != "kv_producer":
+            if cls.is_offload_backend(name) and role in ("offload", "kv_both"):
                 tier = True
                 shared |= cls._shared_tier.get(name, False)
                 if name == "mooncake_store":
