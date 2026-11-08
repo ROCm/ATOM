@@ -16736,6 +16736,22 @@ models:
               <<: *m31_s65822_env
               ATOMESH_M31_D_MAX_SEQS: "24"
               ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "2200000000000"
+        # Higher interactivity: ITL follows each D's decode batch (~3.3 ms at 4, ~2.9 ms at 3), so a small
+        # cap bounds it; the excess waits on D with its KV already loaded.
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c48-dcap4
+          concurrency: [48]
+          env:
+            common:
+              <<: *m31_s65822_env
+              ATOMESH_M31_D_MAX_SEQS: "4"
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c40-dcap3
+          concurrency: [40]
+          env:
+            common:
+              <<: *m31_s65822_env
+              ATOMESH_M31_D_MAX_SEQS: "3"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
