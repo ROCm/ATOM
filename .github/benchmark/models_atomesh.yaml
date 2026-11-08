@@ -3913,6 +3913,92 @@ models:
           common: *issue382_a9_pernic4352_tuned_env_common
           prefill: *issue382_a9_pernic4352_tuned_env_prefill
           decode: *issue382_a9_env_decode
+      # The tuned cells with the decodes at A9's 0.9 of their VRAM. At 0.94 a
+      # decode plans 270.7 of its 288 GB and leaves 17 GB to what the engine
+      # does not count; 0.9 leaves 29 GB for 6% fewer KV blocks (109,142 vs
+      # 116,203), where at C240 the decodes peaked at 90% of the larger pool.
+      - &issue382_a9_1p2d_c220_pernic4352_tuned_mem90
+        <<: *issue382_a9_1p2d_c220_pernic4352_tuned
+        name: issue382-a9-1p2d-c220-pernic4352-tuned-mem90
+        decode:
+          workers: 2
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,152]'
+      - <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c160-pernic4352-tuned-mem90
+        concurrency:
+        - 160
+        decode:
+          workers: 2
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 320
+            decode_max_num_seqs: 112
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+      - <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c180-pernic4352-tuned-mem90
+        concurrency:
+        - 180
+        decode:
+          workers: 2
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,120]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 360
+            decode_max_num_seqs: 120
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+      - <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c200-pernic4352-tuned-mem90
+        concurrency:
+        - 200
+        decode:
+          workers: 2
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,136]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 400
+            decode_max_num_seqs: 136
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+      - <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c240-pernic4352-tuned-mem90
+        concurrency:
+        - 240
+        decode:
+          workers: 2
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 480
+            decode_max_num_seqs: 160
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+      - <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c260-pernic4352-tuned-mem90
+        concurrency:
+        - 260
+        decode:
+          workers: 2
+          tp: 4
+          cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176]'
+        server:
+          common_args:
+            max_model_len: 1048576
+            max_num_seqs: 520
+            decode_max_num_seqs: 176
+            spec_decode_acceptance_length: 4.04
+            hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c330
         concurrency:
