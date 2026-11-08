@@ -117,8 +117,16 @@ def dsml_grammar(
     value_stops = _excluding(value_patterns)
     # A free body holds its own parameter tags, but not another call: one
     # opened inside it would be parsed as a call outside this tool's grammar.
+    # Nor the call's end in the spelling the grammar does not close it with:
+    # the parser ends the call at `</invoke>` with or without the marker.
     body_stops = _excluding(
-        [_regex_literal(m) for m in spec.get("markers", ())] + invoke_opens
+        [_regex_literal(m) for m in spec.get("markers", ())]
+        + invoke_opens
+        + [
+            _regex_literal(f"</{t}>")
+            for t in _spellings(p, "invoke")
+            if t != f"{p}invoke"
+        ]
     )
     rules = [
         "ws: /[ \\t\\r\\n]+/",

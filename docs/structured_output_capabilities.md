@@ -216,6 +216,13 @@ On `/beta/chat/completions`, a function with `"strict": true` has its
 arguments constrained by its `parameters` schema, with or without
 `response_format`. `/v1/chat/completions` keeps ignoring `strict`.
 
+Strict tools are constrained decoding, so a request with them is refused with
+HTTP 400 wherever `response_format` is (see above): with a tool parser other
+than DSML, pipeline parallelism, P/D handoff, images, custom stop strings,
+`ignore_eos`, relaxed MTP, or logprobs under speculative decoding. Without
+`response_format`, the error starts with `strict function tools:`, so the
+client can tell which part of its request asked for the grammar.
+
 The schema is checked before enqueue and refused with HTTP 400 where it breaks
 DeepSeek's rules or asks for what the grammar cannot hold:
 
@@ -250,14 +257,15 @@ under its own JSON grammar, carrying the definitions it references. The answer
 and every parameter share one expansion budget, and the grammar may not grow
 past twice the size of the tool schemas (or 1 MiB). Whitespace around the
 answer and the calls is free; inside a call it is allowed only where the
-encoder writes line breaks. Neither the free text before the calls, a raw
-value, nor a non-strict function's body may contain what the tool parser
-reads as the start of a call, the end of a value or another call, with or
-without the DSML marker, so the parser reads them back as written. A
-non-strict function's body is otherwise free. A string inside a JSON value is
-not held to this: the parser cuts the value short at such a tag, as it does
-on `/v1`. The cut value usually fails the validation below; one its schema
-still takes (a nullable string written as JSON, say) goes out cut short.
+encoder writes line breaks. Neither the free text before the calls nor a raw
+value may contain what the tool parser reads as the start of a call, the end
+of a value or another call, with or without the DSML marker, so the parser
+reads them back as written. A non-strict function's body is free but for
+another call or the call's end, in either spelling. A string inside a JSON
+value is not held to this: the parser cuts the value short at such a tag, as
+it does on `/v1`. The cut value usually fails the validation below; one its
+schema still takes (a nullable string written as JSON, say) goes out cut
+short.
 
 Parsed arguments are validated against their schema again before success is
 reported (formats are the grammar's to enforce), and every call must name one

@@ -1989,22 +1989,29 @@ async def _configure_structured_output(
 ):
     if schema is None and not strict_schemas:
         return
-    await configure_request(
-        engine,
-        tokenizer,
-        _get_engine_config(),
-        sampling_params,
-        schema,
-        channel,
-        parser_cls=tool_call_parser_cls,
-        tools=tools,
-        tool_choice=tool_choice,
-        kv_transfer=kv_transfer,
-        multimodal=multimodal,
-        relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
-        synthetic=synthetic_token_text is not None,
-        strict_schemas=strict_schemas,
-    )
+    try:
+        await configure_request(
+            engine,
+            tokenizer,
+            _get_engine_config(),
+            sampling_params,
+            schema,
+            channel,
+            parser_cls=tool_call_parser_cls,
+            tools=tools,
+            tool_choice=tool_choice,
+            kv_transfer=kv_transfer,
+            multimodal=multimodal,
+            relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+            synthetic=synthetic_token_text is not None,
+            strict_schemas=strict_schemas,
+        )
+    except ValueError as exc:
+        if schema is not None:
+            raise
+        # Only strict tools asked for the grammar, and the refusals are
+        # worded for JSON Schema output: name what the client did ask for.
+        raise ValueError(f"strict function tools: {exc}") from exc
 
 
 @app.post("/v1/chat/completions")

@@ -1221,3 +1221,33 @@ def test_strict_tools_alone_reach_the_grammar_setup(monkeypatch):
         )
     # Without a schema or strict tools there is nothing to configure.
     assert seen == [{"weather": STRICT_PARAMETERS}]
+
+
+def test_a_refusal_for_strict_tools_alone_names_them(monkeypatch):
+    """The refusals are worded for JSON Schema output: a client that sent
+    only strict tools is told those asked for the grammar."""
+    from atom.sampling_params import SamplingParams
+
+    async def refuse(*_args, **_kwargs):
+        raise ValueError("Structured output with tools requires a DSML tool parser")
+
+    monkeypatch.setattr(api_server, "configure_request", refuse)
+    monkeypatch.setattr(api_server, "_get_engine_config", lambda: None)
+
+    def configure(schema):
+        asyncio.run(
+            api_server._configure_structured_output(
+                SamplingParams(),
+                schema,
+                ReasoningChannel(),
+                tools=[STRICT_TOOL],
+                tool_choice="auto",
+                strict_schemas={"weather": STRICT_PARAMETERS},
+            )
+        )
+
+    with pytest.raises(ValueError, match="^strict function tools: Structured"):
+        configure(None)
+    # With `response_format` the client asked for structured output itself.
+    with pytest.raises(ValueError, match="^Structured output"):
+        configure(json.dumps({"type": "object"}))

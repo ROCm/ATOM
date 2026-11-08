@@ -1125,3 +1125,15 @@ def test_a_const_beside_an_enum_takes_what_both_allow(controller):
     compiled = controller.compile(None, _one_param(both))
     assert accepts(controller, compiled, _call_f("true", "a"))
     assert not accepts(controller, compiled, _call_f("true", "b"))
+
+
+def test_a_free_body_cannot_hold_the_bare_call_closer(controller):
+    """The parser ends a call at `</invoke>` with or without the marker: a
+    body holding the bare one would be cut short there, its rest read as
+    text. On `/v1`, `response_format` with ordinary tools, too."""
+    leaky = FREE_CALL.replace("anything", "any</invoke>thing")
+    for answer in (None, json.dumps({"type": "object"})):
+        spec = _dsml_spec(FREE_TOOL, required=answer is None)
+        compiled = controller.compile(answer, spec)
+        assert accepts(controller, compiled, FREE_CALL)
+        assert not accepts(controller, compiled, leaky)
