@@ -20,7 +20,7 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_topk import lds_wor
 from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import publish_plain
 from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import uniform_stage_context
 from atom.models.deepseek_v41.mono.kernels.layer_post import LayerPostBuild, scratch_layout, ABI
-from atom.models.deepseek_v41.mono.kernels.attn_post import attn_post_args
+from atom.models.deepseek_v41.mono.gfx1250.kernels.bf16_k2_abi import attn_post_args
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
