@@ -28,7 +28,35 @@ Branch defaults that this result depends on:
 | `OFFLOAD_STAGING_ON_COMPUTE_STREAM` | 1 | Store arms on side streams froze the engine for minutes in 5 of the 9 runs in which it was tried; no freeze in the 20+ Store arms run on the compute stream since. |
 | `ATOM_OFFLOAD_EARLY_LOAD` / `_STATE` | 1 / 1 | Start the Store read when the lookup answers instead of one delayer cycle later. |
 
-## Best measured configuration: DP2 (TP2 x DP2), concurrency 128, 900 s
+## Final results (branch head b1ccf5b97, 1800 s, no environment variables)
+
+Same-time, same-node pairs, 1800 s profiling window each. The Store arm runs the
+branch defaults; main is session-affinity routing with HBM prefix caching only.
+
+| | 128 concurrency, DP2 (TP2) | 256 concurrency, DP4 (TP4) |
+|---|---|---|
+| Completed requests, main / Store | 8306 / 8336 | 15424 / 15499 |
+| Output throughput (tok/s), main -> Store | 3769.9 -> 3782.8 (**+0.3%**) | 6891.8 -> 6943.9 (**+0.8%**) |
+| TTFT mean (ms) | 1891 -> 1481 (**-21.7%**) | 2560 -> 2401 (**-6.2%**) |
+| TTFT p50 (ms) | 991 -> 1062 (**+7.1%**) | 1161 -> 1740 (**+49.9%**) |
+| TTFT p90 (ms) | 4366 -> 2867 (**-34.3%**) | 5570 -> 4737 (**-15.0%**) |
+| TTFT p99 (ms) | 10051 -> 7664 (**-23.7%**) | 25758 -> 10021 (**-61.1%**) |
+| ITL (ms) | 15.98 -> 16.20 (**+1.4%**) | 14.06 -> 14.33 (**+1.9%**) |
+
+No stall of 5 s or more in any arm. Store usage at the end: 190 GB of 512 GB (DP4),
+97 GB of 256 GB (DP2); no capacity pressure.
+
+Reading: throughput is unchanged and ITL moves by about 1-2% (within the
+run-to-run noise of 3% measured on repeats). The tail improves at both scales
+(p99 -24% at DP2, -61% at DP4) and the whole distribution improves at DP2. At
+DP4 the median is 50% higher and the mean only 6% lower; the 900 s DP4 runs
+below (median +32%, mean -17%) were better than this 1800 s run, cause not
+identified.
+
+The sections below are the development measurements that led to this version
+(shorter 900 s windows, intermediate code).
+
+## Development measurement: DP2 (TP2 x DP2), concurrency 128, 900 s
 
 Branch defaults, early tier load on. Three independent same-time batches:
 
@@ -75,7 +103,7 @@ main), so 38% of releases came from the stall bound (6% on main) and median TTFT
 rose by 64-82%. Counting what follows the loaded prefix (b8aae1324) halved the
 median gap (+82% -> +32%) and moved mean TTFT from +9% to -17%.
 
-**Still open:** median TTFT is 32% above main at DP4 (DP2: 5-17%). With the
+**Still open:** median TTFT is 32% (900 s) to 50% (1800 s) above main at DP4 (DP2: 5-17%). With the
 fix, 36% of releases are still stall releases. The ranks are nearly always all
 prefillable, but each holds only a little pending work (aggregate fill 0.71 against the 0.9
 target), because `store_tokens` spreads requests evenly while session affinity
