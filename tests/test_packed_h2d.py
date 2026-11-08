@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
 from atom.utils.h2d import HostArenaReader, PublicationError, PublicationOwner
 from tests.test_h2d_publication import buffer, setup
@@ -342,10 +343,18 @@ class _Kernel:
         return lambda arena, destinations: self.launches.append(arena)
 
 
-def _copy(reader, monkeypatch, *, capturing=False):
+@pytest.fixture(scope="module")
+def packed_h2d():
+    """`atom.utils.packed_h2d`, its Triton kernel on the repo's stand-ins where
+    AITER is not installed (the CPU job): the tests below drive its host
+    logic only."""
+    with atom_without_aiter() as load:
+        yield load("atom.utils.packed_h2d")
+
+
+def _copy(packed_h2d, reader, monkeypatch, *, capturing=False):
     """A `PackedCopy` of two 8-byte members on stand-ins (no GPU): the arena
     copies and the scatter launches recorded."""
-    packed_h2d = pytest.importorskip("atom.utils.packed_h2d")  # (Triton)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     members = [
         SimpleNamespace(
@@ -379,13 +388,13 @@ class _Declines(_Reader):
 @pytest.mark.parametrize("capturing", [False, True])
 @pytest.mark.parametrize("reader", [None, "declines", "reads"])
 def test_only_an_accepted_eager_launch_reads_the_host_arena(
-    monkeypatch, capturing, reader
+    monkeypatch, packed_h2d, capturing, reader
 ):
     """The copy then the scatter from the device arena, unless the reader
     accepts an eager launch: then the scatter reads the host arena (no H2D);
     a capture always copies."""
     reader = {None: None, "declines": _Declines(), "reads": _Reader()}[reader]
-    copy, launches = _copy(reader, monkeypatch, capturing=capturing)
+    copy, launches = _copy(packed_h2d, reader, monkeypatch, capturing=capturing)
     assert copy.submit([8, 8])
     (arena,) = launches
     if type(reader) is _Reader and not capturing:
@@ -396,9 +405,9 @@ def test_only_an_accepted_eager_launch_reads_the_host_arena(
         assert reader.asked == 48  # header and payload
 
 
-def test_a_taken_scatter_is_neither_copied_nor_launched(monkeypatch):
+def test_a_taken_scatter_is_neither_copied_nor_launched(monkeypatch, packed_h2d):
     reader = _Reader(takes=True)
-    copy, launches = _copy(reader, monkeypatch)
+    copy, launches = _copy(packed_h2d, reader, monkeypatch)
     assert copy.submit([8, 3])
     assert reader.taken == [(0x1000, 8)] and launches == []
     assert not copy.device.any()

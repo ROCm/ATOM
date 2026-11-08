@@ -8,6 +8,8 @@ from __future__ import annotations
 import ctypes
 import os
 
+from atom.utils.hip_runtime import hip_runtime
+
 HIP_IPC_HANDLE_BYTES = 64
 HIP_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1
 HIP_DEVICE_MALLOC_UNCACHED = 0x3
@@ -27,8 +29,12 @@ class HipRuntime:
         self._configured_library = None
 
     def library(self):
-        """Return the configured HIP ctypes library, loading it on first use."""
+        """Return the configured HIP ctypes library, loading it on first use:
+        the runtime torch loaded (``atom.utils.hip_runtime``), else the first
+        HIP runtime library found."""
 
+        if self._library is None:
+            self._library = hip_runtime()
         if self._library is None:
             sonames = (
                 "libamdhip64.so",

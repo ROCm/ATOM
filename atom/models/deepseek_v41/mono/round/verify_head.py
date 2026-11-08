@@ -135,7 +135,7 @@ class HiVerifyHead(VerifyHead):
             )
 
     def verdict(self, spec, head_ids, sampler):
-        """A head-served step's (output ids, verdict, next ids) (``post_verify.verdict``)."""
+        """A head-served step's (output ids, verdict) (``post_verify.verdict``)."""
         from atom.models.deepseek_v41.mono.round import post_verify
 
         return post_verify.verdict(self.hook, spec, head_ids, sampler)

@@ -1406,7 +1406,7 @@ def test_the_hip_runtime_is_the_one_torch_loaded(monkeypatch):
     none (copying would silently stop), and another one is a second runtime."""
     import io
 
-    from atom.model_ops.engram import host_memory as hm
+    from atom.utils import hip_runtime as hr
 
     loaded = "/venv/lib/python3/site-packages/torch/lib/libamdhip64.so.7"
     maps = (
@@ -1414,14 +1414,14 @@ def test_the_hip_runtime_is_the_one_torch_loaded(monkeypatch):
         f"7f0000002000-7f0000003000 r-xp 00000000 08:01 2 {loaded}\n"
     )
     opened = []
-    monkeypatch.setattr(hm.torch.version, "hip", "7.0", raising=False)
-    monkeypatch.setattr(hm, "open", lambda path, *a: io.StringIO(maps), raising=False)
-    monkeypatch.setattr(hm.ctypes, "CDLL", lambda path, *a, **k: opened.append(path))
-    hm._hip_runtime.cache_clear()
+    monkeypatch.setattr(hr.torch.version, "hip", "7.0", raising=False)
+    monkeypatch.setattr(hr, "open", lambda path, *a: io.StringIO(maps), raising=False)
+    monkeypatch.setattr(hr.ctypes, "CDLL", lambda path, *a, **k: opened.append(path))
+    hr.hip_runtime.cache_clear()
     try:
-        hm._hip_runtime()
+        hr.hip_runtime()
     finally:
-        hm._hip_runtime.cache_clear()
+        hr.hip_runtime.cache_clear()
     assert opened == [loaded]
 
 

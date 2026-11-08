@@ -11,7 +11,7 @@ only the shared mono pieces of ``atom.mono``:
 - ``atom.mono.device.ops`` / ``atom.mono.device.mx``: the device primitives the gfx950 blocks share with ATOM's mono
   kernels (re-exported by ``device.gfx950.ops`` / ``device.gfx950.gemv``);
 - ``atom.mono.runtime.hip_ipc``: the HIP runtime wrapper the peer groups and the scratch allocate through
-  (``runtime.peer``);
+  (``runtime.peer``, ``runtime.uncached``: its module functions, on the HIP runtime torch loaded);
 - ``atom.mono.runtime.srcloc``: the fast source-location capture around a build's trace (``emit.compile``).
 
 ``tests/test_deepseek_v41_mono_hi_package.py`` holds it to that.

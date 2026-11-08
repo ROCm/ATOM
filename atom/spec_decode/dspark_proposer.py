@@ -171,17 +171,6 @@ class DSparkProposer(Drafter):
         block's fixed inputs at the padded batch, so `stage` copies nothing."""
         ids = self.block.buffer("anchor_ids", running_bs)
         anchor_positions = self.block.buffer("anchor_positions", running_bs)
-        # A step the model's decode round served whose forward already wrote
-        # the anchors into the block's fixed inputs: none to write.
-        metadata = get_forward_context().attn_metadata
-        if (
-            metadata is not None
-            and metadata.served_by_round
-            and self.runner.decode_round.anchors_staged(running_bs)
-        ):
-            return self.block.stage(
-                running_bs, {"anchor_ids": ids, "anchor_positions": anchor_positions}
-            )
         scheduled_bs = next_token_ids.shape[0]
         vocab_max = int(self.model.vocab_size) - 1
         if ids.is_cuda:

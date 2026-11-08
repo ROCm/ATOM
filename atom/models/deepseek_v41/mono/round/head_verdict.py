@@ -2,15 +2,13 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The verdict of a step the V4.1 mono hi hook's verify head served, in one launch (``ATOM_DSV41_MONO_HI``).
 
-On such a step ``ModelRunner.postprocess`` has the head's id a row (``verify_token_ids``) and runs, between the target
-graph and the draft: two ``index_select`` (the verify rows' ids, the bonus rows' ids), under forced acceptance a
-``torch.rand`` of the step's uniforms, the rejection sampler's kernel (the output ids and the verdict), and after the
-ids are handed on a ``gather`` of each request's next id (the drafter's anchor token). Five small launches on the
-round's critical path at c1 (~29 us of kernels, ATOM's own trace). ``verdict`` does all of it in one Triton launch
-(``_head_verdict_kernel``, a program a request): it reads the head's ids through the verify / bonus row indices
-itself, compares or force-accepts row by row exactly as ATOM's greedy / synthetic kernels do, writes the same output
-ids and verdict ([3, requests]: accepted, rejected, anchor row), and each request's next id (its output at the
-accepted count: the correction token, or the bonus).
+On such a step ``ModelRunner.postprocess`` has the head's id a row (``verify_token_ids``) and would run, between the
+target graph and the draft: two ``index_select`` (the verify rows' ids, the bonus rows' ids), under forced acceptance
+a ``torch.rand`` of the step's uniforms and the rejection sampler's kernel (the output ids and the verdict).
+``verdict`` does all of it in one Triton launch (``_head_verdict_kernel``, a program a request): it reads the head's
+ids through the verify / bonus row indices itself, compares or force-accepts row by row exactly as ATOM's greedy /
+synthetic kernels do, and writes the same output ids and verdict ([3, requests]: accepted, rejected, anchor row). Each
+request's next id stays the runner's ``gather``, from the output ids after their TP broadcast.
 
 Under forced acceptance its uniforms are drawn in the kernel (``tl.rand``, seeded from the sampler's step counter as
 ATOM's generator is: the same on every TP rank, a different stream from ``torch.rand``'s, the same schedule in
@@ -30,7 +28,6 @@ import triton.language as tl
 def _head_verdict_kernel(
     out_ptr,  # int32 [requests, num_spec_steps + 1]
     verdict_ptr,  # int32 [3, requests]: accepted drafts, rejected, anchor row
-    next_ptr,  # int32 [requests]: the output at the accepted count
     cu_num_draft_ptr,  # [requests]
     input_ids_ptr,  # the step's input ids; draft r is input_ids[target_idx[r] + 1]
     target_idx_ptr,  # [verify rows]: each verify row's row of the step
@@ -44,8 +41,8 @@ def _head_verdict_kernel(
     DRAW: tl.constexpr,
 ):
     """ATOM's ``rejection_greedy_sample_kernel`` / ``rejection_synthetic_sample_kernel`` + ``_finish_request`` on the
-    head's ids read through the row indices (the two ``index_select``), the uniforms drawn here (``DRAW``), and the
-    next id (the runner's ``gather``)."""
+    head's ids read through the row indices (the two ``index_select``), the uniforms drawn here (``DRAW``).
+    """
     req = tl.program_id(0)
     if req == 0:
         start = 0
@@ -56,7 +53,6 @@ def _head_verdict_kernel(
     row_out = out_ptr + req * (num_spec_steps + 1)
     rejected = False
     last = -1
-    next_id = INVALID
     for pos in range(n):
         if rejected:
             oid = INVALID
@@ -74,12 +70,10 @@ def _head_verdict_kernel(
                     oid = draft
                 else:
                     oid = target
-                    next_id = target
                     rejected = True
             else:
                 oid = target
                 if draft != target:
-                    next_id = target
                     rejected = True
             last += 1
         tl.store(row_out + pos, oid)
@@ -89,7 +83,6 @@ def _head_verdict_kernel(
         bonus = INVALID
     else:
         bonus = tl.load(head_ids_ptr + brow).to(tl.int32)
-        next_id = bonus
         accepted += 1
     tl.store(row_out + n, bonus)
     for pos in range(n + 1, num_spec_steps + 1):
@@ -98,12 +91,11 @@ def _head_verdict_kernel(
     tl.store(verdict_ptr + req, accepted)
     tl.store(verdict_ptr + nreq + req, num_spec_steps - accepted)
     tl.store(verdict_ptr + 2 * nreq + req, brow - n + accepted)
-    tl.store(next_ptr + req, next_id)
 
 
 def _launch(spec, head_ids, sampler):
-    """The fused launch: (output ids [requests, spec + 1], verdict [3, requests], next ids [requests]); under forced
-    acceptance the uniforms are drawn in the kernel, seeded from the sampler's step."""
+    """The fused launch: (output ids [requests, spec + 1], verdict [3, requests]); under forced acceptance the
+    uniforms are drawn in the kernel, seeded from the sampler's step."""
     from atom.model_ops.rejection_sampler import (
         _SYNTHETIC_RNG_BASE_SEED,
         _get_synthetic_cond_rates,
@@ -113,20 +105,19 @@ def _launch(spec, head_ids, sampler):
     nreq, steps, dev = len(cu), spec.num_spec_steps, head_ids.device
     out = torch.empty((nreq, steps + 1), dtype=torch.int32, device=dev)
     verdict = torch.empty((3, nreq), dtype=torch.int32, device=dev)
-    nxt = torch.empty(nreq, dtype=torch.int32, device=dev)
     rates = sampler.synthetic_acceptance_rates
     synthetic = rates is not None
     cond = _get_synthetic_cond_rates(rates, dev) if synthetic else out
     _head_verdict_kernel[(nreq,)](
-        out, verdict, nxt, cu, spec.input_ids, spec.target_logits_indices, spec.bonus_logits_indices, head_ids,
+        out, verdict, cu, spec.input_ids, spec.target_logits_indices, spec.bonus_logits_indices, head_ids,
         out, cond, _SYNTHETIC_RNG_BASE_SEED + int(sampler._synthetic_step), steps,
         SYNTHETIC=synthetic, DRAW=True, num_warps=1,
     )  # fmt: skip
     if synthetic:
         sampler._synthetic_step += 1  # as ``RejectionSampler.forward``
-    return out, verdict, nxt
+    return out, verdict
 
 
 def verdict(spec, head_ids, sampler):
-    """A head-served verify step's (output ids, verdict, next ids) (module docstring)."""
+    """A head-served verify step's (output ids, verdict) (module docstring)."""
     return _launch(spec, head_ids, sampler)

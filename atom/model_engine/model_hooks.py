@@ -35,7 +35,8 @@ class VerifyHead:
 
     def verdict(self, spec, ids, sampler):
         """``postprocess`` on a step whose ids came from the head: (output
-        ids, verdict, each request's next id)."""
+        ids, verdict). The runner broadcasts the output ids over TP and takes
+        each request's next id from them, as on the logits path."""
         raise NotImplementedError
 
 
@@ -76,8 +77,20 @@ class DecodeRound:
 
     # ---- the attention metadata builder
 
-    def service(self, batch, spans, running_bs, running_tokens, *, max_q_len, decode, tentative, is_prefill,
-                resumes, image_rows) -> RoundService:  # fmt: skip
+    def service(
+        self,
+        batch,
+        spans,
+        running_bs,
+        running_tokens,
+        *,
+        max_q_len,
+        decode,
+        tentative,
+        is_prefill,
+        resumes,
+        image_rows,
+    ) -> RoundService:
         """Before a step's layout: how much of it the round takes over
         (``AttentionMetaData.served_by_round``)."""
         return RoundService.NONE
@@ -88,13 +101,6 @@ class DecodeRound:
     def committed(self, metadata) -> bool:
         """Before the speculative commit of a served step: True when the
         forward committed it already."""
-        return False
-
-    # ---- the DSpark proposer
-
-    def anchors_staged(self, running_bs: int) -> bool:
-        """Before a served step's anchor staging: True when the forward staged
-        them already."""
         return False
 
 

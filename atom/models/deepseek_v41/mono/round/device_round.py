@@ -118,6 +118,23 @@ def first_step(state, batch, max_seqlen_q, hook) -> bool:
     )
 
 
+def may_serve(batch, max_seqlen_q, hook) -> bool:
+    """Whether the hook may serve this forward, before the step's routing decision (``HiRound.service``, the builder's:
+    after the token inputs' publication): a decode of at most as many requests, of at most as many rows each, as a
+    width of the hook takes. Host-side, TP-uniform."""
+    n = batch.total_seqs_num
+    if (
+        hook is None
+        or batch.is_dummy_run
+        or getattr(batch, "total_seqs_num_prefill", 0) > 0
+        or n < 1
+    ):
+        return False
+    return any(
+        b >= n and max_seqlen_q <= rq for b, rq in getattr(hook, "split", {}).values()
+    )
+
+
 def _served_verify(batch, max_seqlen_q, hook) -> bool:
     """A decode verify the hook serves on the lean path: its full DSpark span at a served width, no image rows, no
     replayed rows."""
@@ -193,9 +210,9 @@ class DeviceRound:
             else None
         )
         state.cur_served = False
-        # a device-round step's pre-target launches recorded until its advance; a decode step's publications read
-        # their pinned arenas directly
-        self.pro.arm(state.on, decode=n >= 1 and pre == 0)
+        # a device-round step's pre-target launches recorded until its advance; a decode step the hook may serve
+        # reads its publications' pinned arenas directly
+        self.pro.arm(state.on, served=may_serve(batch, max_seqlen_q, hook))
 
     def spec_status(self):
         """``prepare_input_ids``' status: zeros on a device-round step (the step is built as if no draft had been

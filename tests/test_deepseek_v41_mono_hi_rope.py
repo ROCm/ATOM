@@ -113,7 +113,7 @@ def test_other_layouts_are_refused(mods):
         ),
         SimpleNamespace(cos_cache=emb.cos_cache.t(), sin_cache=emb.sin_cache.t()),
     ):
-        with pytest.raises(ValueError, match="RoPE caches"):
+        with pytest.raises(mh.MonoUnsupported, match="RoPE caches"):
             mh.rope_args(bad)
 
 

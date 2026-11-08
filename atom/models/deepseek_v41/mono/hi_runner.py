@@ -27,7 +27,7 @@ One served step:
    step's ring rows back into ATOM's pool), the DSpark taps of layers 37-39, the last layer's gates planar and
    ATOM's collapse into the runner's output rows; then the DSpark draft's
    context-KV write (``CTX``, launch ``CTX_LAUNCH``) and the post-verify
-   (``post_verify``: verdict, Engram cursor commit, DSpark anchors), all inside
+   (``post_verify``: verdict and Engram cursor commit), all inside
    the target graph.
 
 The block draft runs on the hi path too (``draft_run``: three chained stage
@@ -944,7 +944,7 @@ class HiLayers(HiDraft, HiPrograms):
         self._end_step(cache, step, rows)
         self._ctx_after_target(cache, step, rows)
         if self.pv is not None and step.max_q_len == self.split[rows][1]:
-            # the verdict, commit and anchors in the graph (``post_verify``)
+            # the verdict and commit in the graph (``post_verify``)
             self.pv.launch(self, cache, step, rows)
 
     def _end_step(self, cache, step, rows: int) -> None:
@@ -1023,8 +1023,8 @@ def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
         torch.set_default_device(device)
     from atom.models.deepseek_v41.mono.round import post_verify
 
-    # the verdict, the Engram cursor commit and the DSpark anchors inside the target graph (``post_verify``; the
-    # fused one-launch verdict, ``head_verdict``, on the steps it does not take)
+    # the verdict and the Engram cursor commit inside the target graph (``post_verify``; the fused one-launch
+    # verdict, ``head_verdict``, on the steps it does not take)
     hook.pv = post_verify.PostVerify(hook.widths, hook.split, hook.step.device)
     # the runner's model-side verify head on the head's ids (``round.verify_head``)
     from atom.models.deepseek_v41.mono.round.verify_head import HiVerifyHead

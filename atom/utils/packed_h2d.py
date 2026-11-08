@@ -8,6 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.hip_runtime import hip_runtime
+
 
 @triton.jit
 def scatter_packed_bytes(arena, destinations, BLOCK: tl.constexpr):
@@ -34,11 +36,8 @@ class DeviceAddress:
 @functools.cache
 def _host_get_device_pointer():
     """`hipHostGetDevicePointer` of the HIP runtime torch runs (the one that
-    page-locked the memory; `engram.host_memory._hip_runtime`), resolved
-    once."""
-    from atom.model_ops.engram.host_memory import _hip_runtime
-
-    hip = _hip_runtime()
+    page-locked the memory; `hip_runtime`), resolved once."""
+    hip = hip_runtime()
     if hip is None:
         raise RuntimeError("no HIP runtime loaded: no device address of host memory")
     fn = hip.hipHostGetDevicePointer

@@ -4,9 +4,9 @@
 
 The runner's hooks are declared (``VerifyHead``, ``DecodeRound``) and resolved once at install: a model without them
 takes the logits path and runs no decode round; with them the runner asks the head for a verify's ids and its
-verdict (the ids still broadcast over TP), and calls the decode round where its work sits. Which steps the hi head
-serves is its own policy (``round.verify_head.HiVerifyHead``), tested here against a stub hook: pure Python, no
-Triton, AITER or FlyDSL."""
+verdict (the ids broadcast over TP, the next step's ids taken from the broadcast ones), and calls the decode round
+where its work sits. Which steps the hi head serves is its own policy (``round.verify_head.HiVerifyHead``), tested
+here against a stub hook: pure Python, no Triton, AITER or FlyDSL."""
 
 import ast
 import inspect
@@ -91,7 +91,7 @@ def test_hooks_are_declared_types(runner_module):
     # every member defaults to "nothing taken over"
     assert rnd.spec_status() is None and rnd.decode_ids_filler() is None
     assert rnd.host_arena_reader("token_inputs") is None
-    assert not rnd.committed(None) and not rnd.anchors_staged(1)
+    assert not rnd.committed(None)
 
 
 def test_the_runner_asks_the_models_head(runner_module):
@@ -104,11 +104,12 @@ def test_the_runner_asks_the_models_head(runner_module):
     assert head.calls == [("ids", None), ("ids", (1, 6))]
 
 
-def test_postprocess_takes_the_heads_verdict_and_broadcasts_the_ids(
+def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
     monkeypatch, runner_module
 ):
-    """A head-served step: the head's verdict in place of the rejection sampler's; the ids are broadcast over TP as
-    on every other step."""
+    """A head-served step: the head's verdict in place of the rejection sampler's; the ids are broadcast over TP and
+    every id that feeds the next step (the next forward's ids, the drafter's anchors) is taken from the broadcast
+    ids, at the head verdict's accepted counts, as on every other step."""
     bs = 2
     spec = SimpleNamespace(
         bonus_logits_indices=torch.tensor([5, 11]),
@@ -119,30 +120,32 @@ def test_postprocess_takes_the_heads_verdict_and_broadcasts_the_ids(
         "get_forward_context",
         lambda: SimpleNamespace(spec_decode_metadata=spec),
     )
+    # rank 0's ids, as a rank that is not rank 0 receives them
+    rank0 = torch.arange(bs * 6, dtype=torch.int32).view(bs, 6) + 100
     broadcasts = []
     monkeypatch.setattr(
         runner_module,
         "get_tp_group",
         lambda: SimpleNamespace(
-            world_size=4, broadcast=lambda t, src: broadcasts.append(t) or t
+            world_size=4, broadcast=lambda t, src: broadcasts.append(t) or rank0
         ),
     )
     monkeypatch.setattr(runner_module, "get_pcp_world_size", lambda: 1)
     monkeypatch.setattr(runner_module, "pcp_is_enabled", lambda: False)
     monkeypatch.setattr(runner_module, "sp_is_enabled", lambda: False)
-    out = torch.zeros(bs, 6, dtype=torch.int32)
+    out = torch.zeros(bs, 6, dtype=torch.int32)  # this rank's own picks
     verdict = torch.tensor([[3, 5], [2, 0], [3, 11]], dtype=torch.int32)
-    nxt = torch.tensor([17, 19], dtype=torch.int32)
-    calls = []
+    calls, proposed = [], []
 
     class Stop(Exception):
         pass
 
     head = _stub_head(runner_module)
-    head.verdict = lambda s, ids, sampler: calls.append(ids) or (out, verdict, nxt)
+    head.verdict = lambda s, ids, sampler: calls.append(ids) or (out, verdict)
 
     def propose(batch, input_ids, hidden, next_token_ids, num_reject, anchors):
-        assert next_token_ids is nxt and torch.equal(anchors, verdict[2])
+        proposed.append(next_token_ids)
+        assert torch.equal(anchors, verdict[2])
         raise Stop
 
     runner = _runner(runner_module, SimpleNamespace(verify_head=head))
@@ -171,7 +174,10 @@ def test_postprocess_takes_the_heads_verdict_and_broadcasts_the_ids(
         runner_module.ModelRunner.postprocess(
             runner, batch, None, None, None, None, True, hidden_states=None
         )
-    assert len(calls) == 1 and len(broadcasts) == 1
+    assert len(calls) == 1 and len(broadcasts) == 1 and broadcasts[0] is out
+    # rank 0's ids at each request's accepted count (3 and 5), not this rank's picks
+    assert proposed[0].tolist() == [103, 111]
+    assert runner.tokenID_processor.prev_token_ids is proposed[0]
 
 
 def test_the_staging_mark_calls_the_decode_round(runner_module):

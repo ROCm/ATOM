@@ -198,8 +198,8 @@ def _install_hi(
     drafter.model = HiDraftModel(drafter.model, dp_ranks, hook)
     hook.bind_draft(drafter)
     # the round's host work (``HiDecodeModel.decode_round``): the routing decision with lean host prep on the steps it
-    # serves, the device-side round advance on top of it, the verdict / Engram commit / DSpark anchors inside the
-    # target graph, the decode publications reading their pinned arenas directly
+    # serves, the device-side round advance on top of it, the verdict / Engram commit inside the target graph, the
+    # served decode steps' publications reading their pinned arenas directly
     hi_round.install(hook, metadata_builder, runner)
     return HiDecodeModel(
         model,

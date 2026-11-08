@@ -3510,11 +3510,10 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         # The ids of a verify the model's own head served (`_verify_head_ids`),
-        # in place of the logits; and each request's next id, from its verdict.
+        # in place of the logits.
         head_ids = self.verify_token_ids
         if spec_decode_metadata is None:
             head_ids = None
-        next_ids = None
         # Keep probability payloads available on every participating rank.
         need_logprobs = batch.any_logprobs
         logprob_snapshot = None
@@ -3574,11 +3573,13 @@ class ModelRunner:
             # segment's last row.
             anchors = None
         elif head_ids is not None:
-            # The model's own verify head picked every row (`_verify_head_ids`):
-            # its verdict -- the selects, the rejection kernel and each
-            # request's next id -- in one launch (the head's `verdict`).
+            # The model's own verify head picked every row (`_verify_head_ids`;
+            # greedy, or draws seeded alike on every rank): its verdict -- the
+            # selects and the rejection kernel -- in one launch (the head's
+            # `verdict`). The next ids are gathered below from the broadcast
+            # ids, as on the logits path.
             channel = None
-            sampled_tokens, verdict, next_ids = self.verify_head.verdict(
+            sampled_tokens, verdict = self.verify_head.verdict(
                 spec_decode_metadata, head_ids, self.rejection_sampler
             )
             num_bonus_tokens, num_reject_tokens, anchors = verdict
@@ -3692,13 +3693,9 @@ class ModelRunner:
                 self.tokenID_processor.spec_status_queue.send(
                     spec_counts, ready=self.forward_done_event
                 )
-                next_token_ids = (
-                    next_ids
-                    if next_ids is not None
-                    else torch.gather(
-                        sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
-                    ).view(bs)
-                )
+                next_token_ids = torch.gather(
+                    sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
+                ).view(bs)
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,

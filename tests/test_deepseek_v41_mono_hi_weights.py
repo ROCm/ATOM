@@ -192,7 +192,7 @@ def test_expert_packs_are_the_checkpoints():
     experts.w13_weight_scale.view(torch.uint8).reshape(-1)[
         -1
     ] = 255  # (the last byte: the up half's last row: padding)
-    with pytest.raises(ValueError, match="255"):
+    with pytest.raises(hi_weights.MonoUnsupported, match="255"):
         hi_weights.expert_packs(experts, inter, TP)
 
 

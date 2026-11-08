@@ -22,9 +22,12 @@ stream, so what the draft round and the target read is unchanged. The arenas sta
 Only device-round steps arm the recorder (a served lean verify of the requests that left the verdict); a P/D
 consumer's first step, a prefill, a dummy or graph-capture forward and every other step launch as before.
 
-The same reader makes the decode publications zero-copy (``reads``): on a decode step, an eager launch of the two
-publications (``DECODE_PUBLICATIONS``) of at most ``HOST_ARENA_MAX_BYTES`` reads the pinned arena through its device
-address instead of after an H2D copy; a prefill's, a graph capture's and every other publication copy as before.
+The same reader makes the decode publications zero-copy (``reads``): on a decode step the hook serves, an eager launch
+of the two publications (``DECODE_PUBLICATIONS``) of at most ``HOST_ARENA_MAX_BYTES`` reads the pinned arena through
+its device address instead of after an H2D copy (the token inputs on the device round's test before the step's routing
+decision, ``device_round.may_serve``; the step metadata on the decision itself, ``HiRound.service``); a decode step
+ATOM's own path runs (a width the hook does not serve), a prefill's, a graph capture's and every other publication
+copy as before.
 """
 
 from __future__ import annotations
@@ -44,8 +47,8 @@ logger = logging.getLogger("atom")
 # the publications a served decode step makes (the token inputs, the V4.1 step metadata): the only ones opted into
 # host-arena reads (``PublicationGroup.read_host_arena``)
 DECODE_PUBLICATIONS = ("token_inputs", "v41_metadata")
-# a decode publication at the served widths, block tables included, stays below this; a prefill's does not, and is
-# copied
+# a decode publication at the served widths, block tables included, stays below this (a seatbelt: a step the hook
+# does not serve is copied whatever its size)
 HOST_ARENA_MAX_BYTES = 1 << 20
 
 BLOCK = (
@@ -168,27 +171,32 @@ def _prologue_kernel(
 
 class Prologue(HostArenaReader):
     """The recorder (module docstring): ``armed`` by the device round on its steps; ``take``
-    (``HostArenaReader.take``), ``fill`` and ``advance`` record; ``launch`` runs the fused kernel. ``reads``: a decode
-    step's publications read their pinned arenas in place."""
+    (``HostArenaReader.take``), ``fill`` and ``advance`` record; ``launch`` runs the fused kernel. ``reads``: a served
+    decode step's publications read their pinned arenas in place."""
 
     def __init__(self, device):
-        self.armed, self.decode = False, False
+        self.armed, self.served = False, False
         self.dummy = torch.zeros(8, dtype=torch.int64, device=device)
         self.arrivals = torch.zeros(1, dtype=torch.int32, device=device)
         self.scatters, self.fills = [], []
         # fused launches; publications past two a step (launched as before)
         self.launches = self.extra = 0
 
-    def arm(self, on: bool, decode: bool):
-        """Every step, before its publications: a device-round step (``on``) records until its advance; ``decode``:
-        the step is a decode step (its publications read their pinned arenas, ``reads``).
+    def arm(self, on: bool, served: bool):
+        """Every step, before its publications: a device-round step (``on``) records until its advance; ``served``:
+        the step is a decode step the hook may serve (its publications read their pinned arenas, ``reads``; the
+        step's routing decision settles it before the step metadata's publication, ``serve``).
         """
-        self.armed, self.decode = on, decode
+        self.armed, self.served = on, served
+
+    def serve(self, served: bool):
+        """The step's routing decision (``HiRound.service``): whether the hook serves it."""
+        self.served = served
 
     # ---- the publications (``HostArenaReader``)
     def reads(self, nbytes: int) -> bool:
-        """A decode step's publication of at most ``HOST_ARENA_MAX_BYTES`` reads its pinned arena in place."""
-        return self.decode and nbytes <= HOST_ARENA_MAX_BYTES
+        """A served decode step's publication of at most ``HOST_ARENA_MAX_BYTES`` reads its pinned arena in place."""
+        return self.served and nbytes <= HOST_ARENA_MAX_BYTES
 
     # ---- recording
     def take(self, copy, arena, largest) -> bool:

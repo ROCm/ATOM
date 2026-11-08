@@ -44,7 +44,7 @@ def _dense(
     and its E8M0 block scale (the rows' blocks)."""
     w, s = _unshuffle_linear_weight(lin.weight).detach(), lin.weight_scale.detach()
     if w.dtype != torch.float8_e4m3fn:
-        raise ValueError(f"V4.1 mono hi weights: an FP8 linear holds {w.dtype}")
+        raise MonoUnsupported(f"V4.1 mono hi weights: an FP8 linear holds {w.dtype}")
     if rows is not None:
         a, b = rows
         w, s = w[a:b], s[a // _GROUP : b // _GROUP]
@@ -216,7 +216,7 @@ def expert_packs(
     if bool((c13[:, :, live:] == 255).any()) or bool(
         (c2[:, :, live // _GROUP : pad // _GROUP] == 255).any()
     ):
-        raise ValueError(
+        raise MonoUnsupported(
             "V4.1 mono hi weights: a routed expert's padding scale code is 255 (E8M0 NaN)"
         )
     out = {
@@ -290,7 +290,7 @@ def rope_args(rope) -> dict:
         or cos.shape[-1] != 32
         or not (cos.is_contiguous() and sin.is_contiguous())
     ):
-        raise ValueError(
+        raise MonoUnsupported(
             f"V4.1 mono hi: RoPE caches {cos.dtype} {tuple(cos.shape)} / {tuple(sin.shape)}, not bf16 [n, 32]"
         )
     return {"rope": cos, "rope.sin": sin}

@@ -38,7 +38,8 @@ def test_no_file_carries_the_old_project_name():
     paths = [
         p for top in SCANNED if (ROOT / top).exists() for p in (ROOT / top).rglob("*")
     ]
-    paths += [p for p in ROOT.iterdir() if p.is_file()]
+    # (not ``.git``: in a worktree a file naming the checkout's path)
+    paths += [p for p in ROOT.iterdir() if p.is_file() and p.name != ".git"]
     for path in paths:
         rel = path.relative_to(ROOT)
         if "__pycache__" in rel.parts:

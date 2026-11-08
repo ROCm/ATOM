@@ -59,12 +59,19 @@ GEOMETRY = {
 }
 
 
+_LOGGED: set = set()  # the lines ``log_once`` logged: (level, the formatted line)
+
+
 def log_once(level: int, msg: str, *args) -> None:
-    """A line every rank would log alike (the deployment's, not a rank's), logged once: on rank 0 (on every rank
-    without ``torch.distributed``)."""
+    """A line every rank would log alike (the deployment's, not a rank's), logged once a process: the first time it
+    comes, on rank 0 (on every rank without ``torch.distributed``)."""
     import torch.distributed as dist
 
-    if not dist.is_initialized() or dist.get_rank() == 0:
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    key = (level, msg % args if args else msg)
+    if key not in _LOGGED:
+        _LOGGED.add(key)
         logger.log(level, msg, *args)
 
 

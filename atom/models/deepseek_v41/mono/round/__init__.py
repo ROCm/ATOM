@@ -12,9 +12,8 @@ One object (``HiRound``) answers every point the engine calls a decode round at:
 - ``ModelRunner``: ``before_input_ids`` / ``spec_status`` in ``prepare_input_ids`` and ``after_forward`` after the
   target's launch (the device round's verdict wait), ``note_verdict`` after the rejection sampler (and after the hook's
   own verdict, ``post_verify.verdict``), ``decode_ids_filler`` / ``before_staging_mark`` (the prologue's recorder,
-  ``prologue``), ``host_arena_reader`` (the decode publications' scatter reads their pinned arenas directly);
-- the DSpark proposer: ``anchors_staged`` before a served step's anchor staging (the in-graph staging,
-  ``post_verify``).
+  ``prologue``), ``host_arena_reader`` (a served decode step's publications' scatter reads their pinned arenas
+  directly).
 
 ``HiDecodeModel.forward``, Engram staging and the DSpark proposer read the builder's decision
 (``served_by_round``), so they agree on every step.
@@ -68,6 +67,9 @@ class HiRound(DecodeRound):
             raise RuntimeError(
                 "V4.1 mono: a device-round step whose builder did not take the lean path"
             )
+        if self.pro is not None:
+            # the step metadata's publication, next: zero-copy on a served step only
+            self.pro.serve(service is not RoundService.NONE)
         return service
 
     def laid_out(self, metadata) -> None:
@@ -112,11 +114,6 @@ class HiRound(DecodeRound):
     def note_verdict(self, out) -> None:
         if self.device is not None:
             self.device.note_verdict(out)
-
-    # ---- the DSpark proposer
-
-    def anchors_staged(self, running_bs: int) -> bool:
-        return self.pv is not None and self.pv.anchors_staged(running_bs)
 
 
 def install(hook, metadata_builder, runner) -> HiRound:

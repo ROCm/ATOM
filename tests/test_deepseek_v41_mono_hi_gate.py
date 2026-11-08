@@ -57,6 +57,12 @@ def served():
     return _atom_config()
 
 
+@pytest.fixture(autouse=True)
+def fresh_log_once(monkeypatch):
+    """Each test sees its own lines: ``log_once`` logs a line once a process."""
+    monkeypatch.setattr(hi_gate, "_LOGGED", set())
+
+
 def _config(served, **over):
     """``served`` (ATOM's ``Config`` of the served command line) with ``over`` changed (``hf``: hf_config fields)."""
     cfg = copy.copy(served)
@@ -347,11 +353,14 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
 @pytest.mark.parametrize("rank, logged", [(0, 1), (1, 0), (3, 0)])
 def test_a_deployments_line_is_logged_once(monkeypatch, caplog, rank, logged):
     """``log_once``: the lines every rank would log alike (the gate's and the fallback's "hi off", the install's) come
-    from rank 0 only."""
+    from rank 0 only, each line once a process (another argument is another line)."""
     import torch.distributed as dist
 
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
     monkeypatch.setattr(dist, "get_rank", lambda: rank)
     with caplog.at_level(logging.INFO, logger="atom"):
-        hi_gate.log_once(logging.INFO, "V4.1 mono hi off: %s", "why")
-    assert len(caplog.records) == logged
+        for why in ("why", "why", "other"):
+            hi_gate.log_once(logging.INFO, "V4.1 mono hi off: %s", why)
+    assert [r.getMessage() for r in caplog.records] == (
+        ["V4.1 mono hi off: why", "V4.1 mono hi off: other"] if logged else []
+    )

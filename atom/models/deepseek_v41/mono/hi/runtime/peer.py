@@ -31,10 +31,7 @@ import warnings
 
 import torch
 
-from atom.mono.runtime.hip_ipc import HipRuntime
-
-_HIP = HipRuntime()
-
+from atom.mono.runtime import hip_ipc
 
 _RETIRED: list = []  # closed groups kept mapped for reuse (``PeerGroup.close``)
 
@@ -81,10 +78,10 @@ class PeerGroup:
             nbytes, group
         ):  # a retired group's memory (``close``), zeroed again
             return
-        self.local = _HIP.allocate_uncached(
+        self.local = hip_ipc.allocate_uncached(
             max(nbytes, 1)
         )  # (whole 4 KiB pages, zeroed)
-        mine = _HIP.get_ipc_handle(self.local)
+        mine = hip_ipc.get_ipc_handle(self.local)
         handles = [None] * self.tp
         dist.all_gather_object(handles, mine, group=group)
         addresses, error = [], None
@@ -93,7 +90,7 @@ class PeerGroup:
                 addresses.append(self.local)
                 continue
             try:
-                base = _HIP.open_ipc_handle(h)
+                base = hip_ipc.open_ipc_handle(h)
                 self._opened.append(base)
                 addresses.append(base)
             except RuntimeError as e:  # every rank must still reach the agreement below
@@ -170,8 +167,9 @@ class PeerGroup:
         )
         self.addresses[self.tp :].zero_()  # (a fresh step phase)
         old.local, old._opened = 0, []
-        _HIP.check(
-            _HIP.library().hipMemset(self.local, 0, self.nbytes), operation="hipMemset"
+        hip_ipc.check_hip_error(
+            hip_ipc.load_runtime().hipMemset(self.local, 0, self.nbytes),
+            operation="hipMemset",
         )
         torch.cuda.synchronize()
         dist.barrier(group=group)
@@ -200,7 +198,9 @@ class PeerGroup:
             _RETIRED.remove(self)
         opened, self._opened = self._opened, []
         for base in opened:
-            _HIP.close_ipc_handle(base)
+            hip_ipc.close_ipc_handle(base)
         if self.local:
-            _HIP.check(_HIP.library().hipFree(self.local), operation="hipFree")
+            hip_ipc.check_hip_error(
+                hip_ipc.load_runtime().hipFree(self.local), operation="hipFree"
+            )
             self.local = 0

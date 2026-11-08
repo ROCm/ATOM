@@ -124,8 +124,10 @@ then runs exactly as before.
   speculative verify. `before_forward` (the step's sampling rows) and `ids`
   (the rows' ids, or None: the logits path) bracket the forward in
   `run_model`; `captured` follows a graph capture; `postprocess` takes the
-  head's `verdict` in place of the rejection sampler's. The ids are broadcast
-  over TP as on every other step.
+  head's `verdict` in place of the rejection sampler's. As on every other
+  step, the output ids are broadcast over TP and each request's next id (the
+  next forward's ids, the drafter's anchor) is gathered from the broadcast
+  ids.
 - **`DecodeRound`** — host work of the decode round the model takes over,
   called where that work sits: `before_input_ids` / `spec_status` /
   `decode_ids_filler` in `tokenIDProcessor.prepare_input_ids`,
@@ -133,7 +135,7 @@ then runs exactly as before.
   (`PublicationGroup.read_host_arena`), `before_staging_mark`,
   `after_forward` right after the target forward's launch, `note_verdict`
   after the rejection sampler; for the attention metadata builder `service`,
-  `laid_out` and `committed`, and for the DSpark proposer `anchors_staged`.
+  `laid_out` and `committed`.
 
 `DecodeRound.service` is the step's one routing decision,
 `AttentionMetaData.served_by_round` (`RoundService`): `NONE`, or `FORWARD`

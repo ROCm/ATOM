@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import torch
 
+from atom.mono.runtime import hip_ipc
+
 _FREE: list[tuple[int, int, int]] = []  # (nbytes, ptr, device) blocks no tensor views
 _STATS = {"blocks": 0, "bytes": 0, "reused": 0}
 
@@ -50,23 +52,22 @@ def _take(nbytes: int, device: int) -> tuple[int, int] | None:
 
 def zeros(nbytes: int, device="cuda") -> torch.Tensor:
     """``nbytes`` of zeroed uncached device memory as a uint8 tensor (module docstring)."""
-    from .peer import _HIP
-
     dev = torch.device(device)
     index = dev.index if dev.index is not None else torch.cuda.current_device()
     with torch.cuda.device(index):
         got = _take(nbytes, index)
         if got is None:  # (a new block: zeroed by the allocation, whole 4 KiB pages)
             size = -(-max(nbytes, 1) // 4096) * 4096
-            got = (size, _HIP.allocate_uncached(size))
+            got = (size, hip_ipc.allocate_uncached(size))
             torch.cuda.synchronize()  # (the allocation's zeroing done before any stream uses it)
             _STATS["blocks"] += 1
             _STATS["bytes"] += size
         else:
             _STATS["reused"] += 1
             torch.cuda.synchronize()  # (a reused block's last kernels are done before it is zeroed)
-            _HIP.check(
-                _HIP.library().hipMemset(got[1], 0, got[0]), operation="hipMemset"
+            hip_ipc.check_hip_error(
+                hip_ipc.load_runtime().hipMemset(got[1], 0, got[0]),
+                operation="hipMemset",
             )
             torch.cuda.synchronize()
         size, ptr = got

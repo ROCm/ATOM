@@ -1290,24 +1290,23 @@ def _verdict_launch(hv, rs, spec, head_ids, sampler, uniform=None, seed=None):
     nreq, steps, dev = len(cu), spec.num_spec_steps, head_ids.device
     out = torch.empty((nreq, steps + 1), dtype=torch.int32, device=dev)
     verdict = torch.empty((3, nreq), dtype=torch.int32, device=dev)
-    nxt = torch.empty(nreq, dtype=torch.int32, device=dev)
     rates = sampler.synthetic_acceptance_rates
     synthetic = rates is not None
     cond = rs._get_synthetic_cond_rates(rates, dev) if synthetic else out
     hv._head_verdict_kernel[(nreq,)](
-        out, verdict, nxt, cu, spec.input_ids, spec.target_logits_indices, spec.bonus_logits_indices, head_ids,
+        out, verdict, cu, spec.input_ids, spec.target_logits_indices, spec.bonus_logits_indices, head_ids,
         uniform if uniform is not None else out, cond,
         rs._SYNTHETIC_RNG_BASE_SEED + int(sampler._synthetic_step) if seed is None else seed, steps,
         SYNTHETIC=synthetic, DRAW=uniform is None, num_warps=1,
     )  # fmt: skip
     if synthetic:
         sampler._synthetic_step += 1
-    return out, verdict, nxt
+    return out, verdict
 
 
 def check_head_verdict():
     """[vf] The one-launch verdict (``head_verdict``) against ATOM's path (the two ``index_select``,
-    ``RejectionSampler.forward``, the runner's next-id gather) on scripted steps of 1-4 requests with 0-5 drafts each
+    ``RejectionSampler.forward``) on scripted steps of 1-4 requests with 0-5 drafts each
     (head ids agreeing with the drafts up to a random row): real acceptance bit for bit; forced acceptance on ATOM's own
     uniforms bit for bit, the step counter advanced alike; with the uniforms drawn in the kernel (``verdict``), the same
     on a re-run (the same seed: TP-uniform), the schedule's certain positions as ATOM's and the fractional one accepted
@@ -1344,11 +1343,9 @@ def check_head_verdict():
     def atom(meta, head, sampler):
         t = torch.index_select(head, 0, meta.target_logits_indices)
         b = torch.index_select(head, 0, meta.bonus_logits_indices)
-        out, vd = sampler.forward(meta, None, b, target_token_ids=t)
-        nxt = torch.gather(
-            out.view(len(meta.cu_num_draft_tokens), -1), 1, vd[0].view(-1, 1).long()
-        ).view(-1)
-        return out, vd, nxt
+        # the verify rows' logits: their argmax the head's ids (the sampler reads them alongside the ids)
+        logits = torch.nn.functional.one_hot(t.long(), 1000).float()
+        return sampler.forward(meta, logits, b, target_token_ids=t)
 
     def same(a, b):
         return all(
@@ -1395,7 +1392,7 @@ def check_head_verdict():
         abs(rate - 0.51) < 0.12
     )
     report(
-        "[vf] verdict in one launch: == ATOM's selects + rejection + gather (real, forced on ATOM's uniforms); "
+        "[vf] verdict in one launch: == ATOM's selects + rejection (real, forced on ATOM's uniforms); "
         "in-kernel draws TP-uniform at the schedule's rates",
         all(got.values()),
         f"({got})",
@@ -1404,29 +1401,21 @@ def check_head_verdict():
 
 def check_post_verify():
     """[pv] The in-graph post-verify kernel (``_post_verify_kernel`` through ``PostVerify.launch`` on stand-ins of the
-    hook, cache, step and DSpark proposer) against the eager path it replaces: the one-launch verdict on the same seed,
-    Engram's ``_commit_cursors`` and DSpark's ``_stage_anchors_kernel``, at 1-4 requests of 6 rows (real and forced
-    acceptance, head ids agreeing with the drafts up to a random row); the seed from the hook's step counter;
-    ``serves`` declines a ragged verify or an unlaunched width; ``take`` advances the sampler's step; the commit and
-    anchor wrappers skip a taken step's launches and run ATOM's otherwise."""
+    hook, cache and step) against the eager path it replaces: the one-launch verdict on the same seed and Engram's
+    ``_commit_cursors``, at 1-4 requests of 6 rows (real and forced acceptance, head ids agreeing with the drafts up to
+    a random row); the seed from the hook's step counter; ``serves`` declines a ragged verify or an unlaunched width;
+    ``take`` advances the sampler's step; the commit skips a taken step's launch and runs ATOM's otherwise.
+    """
     hv = importlib.import_module("atom.models.deepseek_v41.mono.round.head_verdict")
     pvm = importlib.import_module("atom.models.deepseek_v41.mono.round.post_verify")
     rs = importlib.import_module("atom.model_ops.rejection_sampler")
     spec_mod = importlib.import_module(
         "atom.model_ops.attentions.deepseek_v41.speculative"
     )
-    dsp = importlib.import_module("atom.spec_decode.dspark_proposer")
     dev = torch.get_default_device()
     g = torch.Generator(device="cpu").manual_seed(23)
     i32 = {"dtype": torch.int32, "device": dev}
     rq, nslot, W, vocab = 6, 8, 4, 1000
-
-    class Block:
-        def __init__(self):
-            self.b = {}
-
-        def buffer(self, name, n):
-            return self.b.setdefault((name, n), torch.zeros(n, **i32))
 
     def world(nb, rates):
         rows = nb * rq
@@ -1442,13 +1431,12 @@ def check_post_verify():
         )
         hook = SimpleNamespace(head_ids=head.to(**i32), step_ids=seg.to(**i32), req=req,
                                step=torch.randint(0, 1000, (1,), generator=g, device="cpu").to(**i32),
-                               runner=SimpleNamespace(rejection_sampler=rs.RejectionSampler(rates)),
-                               cx_drafter=SimpleNamespace(block=Block(), model=SimpleNamespace(vocab_size=vocab)))  # fmt: skip
+                               runner=SimpleNamespace(rejection_sampler=rs.RejectionSampler(rates)))  # fmt: skip
         cache = SimpleNamespace(cursor=torch.randint(-1, 300, (nslot, W), generator=g, device="cpu").to(dev),
                                 tentative_staging=SimpleNamespace(gpu=torch.randint(
                                     -1, 300, (nslot, rq, W), generator=g, device="cpu").to(dev)))  # fmt: skip
-        step = SimpleNamespace(positions=(torch.arange(rows) + 5000).to(**i32), slots=slots.to(**i32),
-                               cu_seqlens_q=torch.arange(0, rows + 1, rq).to(**i32), max_q_len=rq)  # fmt: skip
+        step = SimpleNamespace(slots=slots.to(**i32), cu_seqlens_q=torch.arange(0, rows + 1, rq).to(**i32),
+                               max_q_len=rq)  # fmt: skip
         meta = SimpleNamespace(input_ids=hook.step_ids, cu_num_draft_tokens=torch.arange(1, nb + 1, **i32) * (rq - 1),
                                target_logits_indices=torch.tensor([b * rq + j for b in range(nb) for j in range(rq - 1)],
                                                                   dtype=torch.long, device=dev),
@@ -1469,24 +1457,15 @@ def check_post_verify():
             pv.launch(hook, cache, step, nb * rq)
             got["seed from the step counter"] &= int(pv.used_seed) == seed0
             b = pv.bufs[nb * rq]
-            # the eager path: the one-launch verdict on the same seed, ATOM's commit, DSpark's anchor staging
+            # the eager path: the one-launch verdict on the same seed, ATOM's commit
             sampler = rs.RejectionSampler(rates)
-            out, vd, nxt = _verdict_launch(
-                hv, rs, meta, hook.head_ids, sampler, seed=seed0
-            )
+            out, vd = _verdict_launch(hv, rs, meta, hook.head_ids, sampler, seed=seed0)
             cur = cur0.clone()
             st = cache.tentative_staging.gpu
             spec_mod._commit_cursors[(nb,)](cur, st, vd[2], step.cu_seqlens_q[:nb], step.slots, cur.stride(0),
                                             st.stride(0), st.stride(1), WIDTH=W, BLOCK=4)  # fmt: skip
-            ids, pos = torch.zeros(nb, **i32), torch.zeros(nb, **i32)
-            dsp._stage_anchors_kernel[(nb,)](
-                ids, pos, nxt, step.positions, vd[2], nb, vocab - 1, num_warps=1
-            )
-            blk = hook.cx_drafter.block
             got["graph == eager"] &= (torch.equal(b["out"], out) and torch.equal(b["verdict"], vd)
-                                      and torch.equal(b["next"], nxt) and torch.equal(cache.cursor, cur)
-                                      and torch.equal(blk.buffer("anchor_ids", nb), ids)
-                                      and torch.equal(blk.buffer("anchor_positions", nb), pos))  # fmt: skip
+                                      and torch.equal(cache.cursor, cur))  # fmt: skip
     # serves / take
     hook, cache, step, meta = world(2, None)
     pv = pvm.PostVerify([12, 6], {12: (2, 6), 6: (1, 6)}, dev)
@@ -1500,42 +1479,21 @@ def check_post_verify():
     got["take: the width's outputs, the sampler's step advanced"] = (
         out[0] is pv.bufs[12]["out"] and smp._synthetic_step == 1
     )
-
-    # the wrappers: a step that took the in-graph results launches no commit (the tentative state released as
-    # ``commit_tentative`` releases it); any other step: ATOM's commit and staging
-    class Builder:
-        def commit_speculative_state(self, metadata, last):
-            return "atom"
-
-    class Proposer:
-        block = Block()
-
-        def _stage_anchors(self, running_bs, next_token_ids, positions, rows):
-            return "atom"
-
-    bld, prop = Builder(), Proposer()
-    h = SimpleNamespace(pv=pvm.PostVerify([6], {6: (1, 6)}, dev))
-    pvm.install(SimpleNamespace(), bld, prop, h)
+    # the commit: a step that took the in-graph results launches none (the tentative state released as
+    # ``commit_tentative`` releases it); any other step: ATOM's
     st = SimpleNamespace()
-    cache = SimpleNamespace(pending=SimpleNamespace(step=st, staged_on_device=True))
-    h.pv.used = 6
+    pending = SimpleNamespace(step=st, staged_on_device=True)
+    md = SimpleNamespace(cache=SimpleNamespace(pending=pending), step=st)
     got["taken step: no commit, pending released"] = (
-        bld.commit_speculative_state(SimpleNamespace(cache=cache, step=st), None)
-        is None
-        and cache.pending is None
+        pv.committed(md) and md.cache.pending is None
     )
-    cache.pending = SimpleNamespace(step=st, staged_on_device=True)
-    h.pv.used = None
+    md.cache.pending = pending
     got["other step: ATOM's commit"] = (
-        bld.commit_speculative_state(SimpleNamespace(cache=cache, step=st), None)
-        == "atom"
-    )
-    got["other step: ATOM's anchor staging"] = (
-        prop._stage_anchors(1, None, None, None) == "atom"
+        not pv.committed(md) and md.cache.pending is pending
     )
     report(
-        "[pv] post-verify in the graph: == the one-launch verdict + commit + anchor staging (1-4 requests, real / "
-        "forced); serves / take; the wrappers",
+        "[pv] post-verify in the graph: == the one-launch verdict + commit (1-4 requests, real / forced); serves / "
+        "take; the commit's skip",
         all(got.values()),
         f"({got})",
     )
@@ -1569,21 +1527,15 @@ def check_post_verify_pad(pad_slot: int):
     starts = torch.tensor(
         [0, 6, 12, 18, 18], **i32
     )  # ATOM's cu_seqlens_q: the padding request has no rows
-    out, verdict, nxt = (
-        torch.zeros(nb, rq, **i32),
-        torch.zeros(3, nb, **i32),
-        torch.zeros(nb, **i32),
-    )
+    out, verdict = torch.zeros(nb, rq, **i32), torch.zeros(3, nb, **i32)
     cu = torch.arange(1, nb + 1, **i32) * s
     target = torch.tensor([b * rq + j for b in range(nb) for j in range(s)])
     bonus = torch.tensor([b * rq + s for b in range(nb)])
-    ids, pos = torch.zeros(nb, **i32), torch.zeros(nb, **i32)
     before = cursor.clone()
     pv._post_verify_kernel[(nb,)](
-        out, verdict, nxt, cu, seg, target, bonus, head, out, torch.zeros(1, **i32), torch.zeros(1, dtype=torch.int64),
-        cursor, cursor.stride(0), staging, staging.stride(0), staging.stride(1), starts, slots, ids, pos,
-        torch.arange(rows, **i32) + 1000, live[hb.REQ_LIVE :], 899, s, 0, WIDTH=W, BLOCK=W, SP=8, SYNTHETIC=False,
-        SHADOW=False,
+        out, verdict, cu, seg, target, bonus, head, out, torch.zeros(1, **i32), torch.zeros(1, dtype=torch.int64),
+        cursor, cursor.stride(0), staging, staging.stride(0), staging.stride(1), starts, slots, live[hb.REQ_LIVE :],
+        s, 0, WIDTH=W, BLOCK=W, SP=8, SYNTHETIC=False, SHADOW=False,
     )  # fmt: skip
     want = before.clone()
     for b in range(3):

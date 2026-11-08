@@ -276,31 +276,22 @@ def test_service_is_the_steps_one_routing_decision():
     assert hook.lean_steps == 1
 
 
-def test_lean_attributes_are_set_once_in_init():
-    """The hook's lean attributes are its own: each set once in ``HiLayers.__init__``, never reassigned (a name
-    shared with another counter would turn the width set into an int)."""
-    tree = ast.parse((MONO / "hi_runner.py").read_text())
-    names = ("served_widths", "lean_host", "lean_steps", "runs_every_layer")
-    sets = {n: [] for n in names}
-    for fn in ast.walk(tree):
-        if not isinstance(fn, ast.FunctionDef):
-            continue
-        for node in ast.walk(fn):
-            if isinstance(node, ast.Assign):
-                targets = node.targets
-            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
-                targets = [node.target]
-            else:
-                continue
-            for t in targets:
-                for e in t.elts if isinstance(t, ast.Tuple) else [t]:
-                    if (
-                        isinstance(e, ast.Attribute)
-                        and isinstance(e.value, ast.Name)
-                        and e.attr in sets
-                    ):
-                        sets[e.attr].append(fn.name)
-    assert all(v == ["__init__"] for v in sets.values()), sets
+def test_lean_attributes_keep_one_meaning_each():
+    """The hook's lean attributes through the code that writes them after ``HiLayers.__init__``: ``lean_host.install``
+    turns ``lean_host`` on, ``HiRound.laid_out`` counts a lean or device-round step in ``lean_steps``; neither touches
+    the other's nor the served widths (a name shared with another counter would turn the width set into an int).
+    Pure Python (no Triton)."""
+    from atom.models.deepseek_v41.mono.round import HiRound, lean_host
+    from atom.utils.forward_context import RoundService as S
+
+    hook = _ServingHook(runs_every_layer=True, lean_host=False, served_widths={6, 12}, lean_steps=0, plan={},
+                        split={6: (1, 6), 12: (2, 6)})  # fmt: skip
+    assert lean_host.install(hook)
+    rnd = HiRound(hook)
+    for service in (S.NONE, S.FORWARD, S.LEAN, S.DEVICE, S.LEAN):
+        rnd.laid_out(SimpleNamespace(served_by_round=service))
+    assert hook.lean_host is True and hook.lean_steps == 3
+    assert hook.served_widths == {6, 12} and hook.runs_every_layer is True
 
 
 # ---------------------------------------------------------------- the device round
@@ -414,16 +405,63 @@ def test_device_round_predicate(dr):
     assert [k for k, args in cases.items() if dr.device_round_step(*args)] == []
 
 
+_ZERO_COPY_SPLIT = {6: (1, 6), 12: (2, 6), 48: (8, 6)}
+
+
+def test_the_token_inputs_read_the_host_arena_on_a_step_the_hook_may_serve(dr):
+    """``may_serve``, before the routing decision: a decode of at most as many requests, of at most as many rows
+    each, as a width of the hook takes. A decode of more requests (ATOM's own path, e.g. bs 16) copies as before.
+    """
+    hook = SimpleNamespace(split=_ZERO_COPY_SPLIT)
+
+    def batch(n=1, **over):
+        return _batch(**{"total_seqs_num": n, "req_ids": list(range(n)), **over})
+
+    assert dr.may_serve(batch(), 6, hook) and dr.may_serve(batch(8), 6, hook)
+    assert dr.may_serve(batch(3), 6, hook)  # (the bs-4 graph's requests)
+    assert dr.may_serve(batch(), 3, hook)  # (a shorter verify in the served bucket)
+    cases = {
+        "bs 9": (batch(9), 6),
+        "bs 16": (batch(16), 6),
+        "prefill": (batch(total_seqs_num_prefill=1), 6),
+        "dummy": (batch(is_dummy_run=True), 6),
+        "longer verify": (batch(), 7),
+        "empty": (batch(0), 6),
+    }
+    assert [k for k, (b, q) in cases.items() if dr.may_serve(b, q, hook)] == []
+    assert not dr.may_serve(batch(), 6, None)
+
+
+def test_the_step_metadata_reads_the_host_arena_on_a_served_step():
+    """``HiRound.service`` hands its decision to the prologue's reader before the step metadata's publication: a
+    served step reads its pinned arena, a decode at a width the hook does not serve (bs 16) copies. Pure Python.
+    """
+    from atom.models.deepseek_v41.mono.round import HiRound
+
+    hook = _ServingHook(lean_host=False, runs_every_layer=True, served_widths={6}, lean_steps=0, plan={},
+                        split=_ZERO_COPY_SPLIT)  # fmt: skip
+    pro = SimpleNamespace(served=[])
+    pro.serve = pro.served.append
+    rnd = HiRound(hook, pro=pro)
+    batch = SimpleNamespace(is_dummy_run=False, multimodal_data={})
+    for bs in (1, 16, 8):
+        spans = (SimpleNamespace(request_id=0, length=6),) * bs
+        rnd.service(batch, spans, bs, bs * 6, max_q_len=6, decode=True, tentative=True, is_prefill=False,
+                    resumes=None, image_rows=False)  # fmt: skip
+    assert pro.served == [True, False, True]
+
+
 class _Recorder:
     """``prologue.Prologue``'s stand-in: never armed past ``arm``, so the plain advance runs."""
 
     armed = False
 
     def __init__(self):
-        self.arms = []
+        self.arms, self.served = [], []
 
-    def arm(self, on, decode):
+    def arm(self, on, served):
         self.arms.append(on)
+        self.served.append(served)
 
 
 def _round_world(dr, monkeypatch):
@@ -662,7 +700,7 @@ def test_post_verify_takes_the_in_graph_results_only_where_it_ran(
     assert post_verify.verdict(hook, spec([5, 5]), ids12, sampler) is eager
     pv.launched.add(12)
     got = post_verify.verdict(hook, spec([5, 5]), ids12, sampler)
-    assert got == (pv.bufs[12]["out"], pv.bufs[12]["verdict"], pv.bufs[12]["next"])
+    assert got == (pv.bufs[12]["out"], pv.bufs[12]["verdict"])
     assert pv.used == 12 and sampler._synthetic_step == 4 and noted == [eager, got]
     # another layout: the eager verdict, and the next step's skip wrappers see none taken
     assert post_verify.verdict(hook, spec([5, 3]), ids12, sampler) is eager
@@ -670,12 +708,10 @@ def test_post_verify_takes_the_in_graph_results_only_where_it_ran(
     assert pv.used is None
 
 
-def test_post_verify_skips_the_commit_and_the_anchor_staging_where_it_ran(
-    no_aiter_sampler,
-):
-    """On a step that took the in-graph results the builder's commit and the proposer's anchor staging skip their
-    launches (``committed`` / ``anchors_staged``: the bookkeeping kept); on any other step they run as before.
-    """
+def test_post_verify_skips_the_commit_where_it_ran(no_aiter_sampler):
+    """On a step that took the in-graph results the builder's commit skips its launch (``committed``: the bookkeeping
+    kept); on any other step it runs as before. ``committed`` takes the step's results either way, so a later step
+    the head did not serve never sees them."""
     from atom.models.deepseek_v41.mono.round import post_verify
 
     pv = post_verify.PostVerify((6,), {6: (1, 6)}, torch.device("cpu"))
@@ -683,15 +719,13 @@ def test_post_verify_skips_the_commit_and_the_anchor_staging_where_it_ran(
     pending = SimpleNamespace(staged_on_device=True, step=step)
     md = SimpleNamespace(cache=SimpleNamespace(pending=pending), step=step)
     pv.used = 6
-    assert pv.committed(md) and md.cache.pending is None
-    assert (
-        not pv.anchors_staged(2) and pv.used is None
-    )  # another batch: staged by the proposer
-    pv.used = 6
-    assert pv.anchors_staged(1) and pv.used is None
+    assert pv.committed(md) and md.cache.pending is None and pv.used is None
     md.cache.pending = pending
     assert not pv.committed(md) and md.cache.pending is pending
-    assert not pv.anchors_staged(1)
+    # taken, but nothing staged on the device: ATOM's commit, and the results are gone
+    pv.used = 6
+    md.cache.pending = SimpleNamespace(staged_on_device=False, step=step)
+    assert not pv.committed(md) and pv.used is None
 
 
 # ---------------------------------------------------------------- ATOM's Engram staging on served steps
