@@ -92,16 +92,27 @@ def pack_weight(
     n, kb = packed.shape
     k = kb * 8 // fmt.lane_words
     if n % 16 or k % 128 or codes.shape != (n, k // 32):
-        raise ValueError(f"pack_weight needs N % 16 == 0, K % 128 == 0, got {tuple(packed.shape)} {tuple(codes.shape)}")
+        raise ValueError(
+            f"pack_weight needs N % 16 == 0, K % 128 == 0, got {tuple(packed.shape)} {tuple(codes.shape)}"
+        )
     s = k // 128
     if fmt is MXFP4:
         # weights: [rg, r, st, j, b] -> [rg, st, j, r, b]: lane l = 16 j + r, 16 B each
-        w = packed.reshape(n // 16, 16, s, 4, 16).permute(0, 2, 3, 1, 4).contiguous().reshape(-1)
+        w = (
+            packed.reshape(n // 16, 16, s, 4, 16)
+            .permute(0, 2, 3, 1, 4)
+            .contiguous()
+            .reshape(-1)
+        )
     elif fmt is MXFP8:
         # K within a step = 64 half + 16 j + b: [rg, r, st, half, j, b] -> [rg, st, half, j, r, b], lane l = 16 j + r:
         # 16 B a lane a half (K 16 j .. + 15, then 64 + 16 j .. + 15), each half's 64 lanes one contiguous 1 KiB
         # (one 16 B load instruction reads 1 KiB, not 16 B every 32 B)
-        w = packed.view(torch.uint8).reshape(n // 16, 16, s, 2, 4, 16).permute(0, 2, 3, 4, 1, 5)
+        w = (
+            packed.view(torch.uint8)
+            .reshape(n // 16, 16, s, 2, 4, 16)
+            .permute(0, 2, 3, 4, 1, 5)
+        )
         w = w.contiguous().reshape(-1)
     else:
         raise ValueError(f"no packer for weight format {fmt.name}")
@@ -113,15 +124,24 @@ def pack_weight(
 # ------------------------------------------------------------------ device: weights
 
 
-def load_weight(r_w, unit, lane, valid=None, fmt: WeightFormat = MXFP4, k_left=None, cm=CM_NT):
+def load_weight(
+    r_w, unit, lane, valid=None, fmt: WeightFormat = MXFP4, k_left=None, cm=CM_NT
+):
     """Issue lane ``lane``'s weights of unit ``unit`` (= rg * S + st), nontemporal:
     ``fmt.lane_words`` words (MXFP4 16 B, MXFP8 32 B as two 16 B loads). ``valid`` False:
     reads 0 without touching memory (the buffer must carry its size). ``k_left``: the K
     elements of the unit's step that are live (from its start); a lane's chunk at or past it
     is zero padding, read as 0 the same way (MXFP4: lane l holds K 32 (l // 16) .. + 31;
-    MXFP8: K 16 (l // 16) .. + 15, then + 64). ``cm``: the loads' cache-policy bits (default nontemporal)."""
-    halves = fmt.lane_words // 4  # 16 B loads a lane: half h of every lane is one contiguous 1 KiB
-    offs = [(unit * 64 + lane) * 4] if halves == 1 else [((unit * halves + h) * 64 + lane) * 4 for h in range(halves)]
+    MXFP8: K 16 (l // 16) .. + 15, then + 64). ``cm``: the loads' cache-policy bits (default nontemporal).
+    """
+    halves = (
+        fmt.lane_words // 4
+    )  # 16 B loads a lane: half h of every lane is one contiguous 1 KiB
+    offs = (
+        [(unit * 64 + lane) * 4]
+        if halves == 1
+        else [((unit * halves + h) * 64 + lane) * 4 for h in range(halves)]
+    )
     for h in range(halves):
         ok = valid
         if k_left is not None:
@@ -130,20 +150,33 @@ def load_weight(r_w, unit, lane, valid=None, fmt: WeightFormat = MXFP4, k_left=N
         if ok is not None:
             offs[h] = ok.select(offs[h], fx.Int32(OOB // 4 - (4 if halves > 1 else 0)))
     if halves == 1:
-        return fx.Vector(bo.buffer_load(r_w, offs[0], vec_width=4, dtype=T.i32, cache_modifier=cm))
-    got = [fx.Vector(bo.buffer_load(r_w, o, vec_width=4, dtype=T.i32, cache_modifier=cm)) for o in offs]
-    return fx.Vector.from_elements([got[h][e] for h in range(2) for e in range(4)], fx.Int32)
+        return fx.Vector(
+            bo.buffer_load(r_w, offs[0], vec_width=4, dtype=T.i32, cache_modifier=cm)
+        )
+    got = [
+        fx.Vector(bo.buffer_load(r_w, o, vec_width=4, dtype=T.i32, cache_modifier=cm))
+        for o in offs
+    ]
+    return fx.Vector.from_elements(
+        [got[h][e] for h in range(2) for e in range(4)], fx.Int32
+    )
 
 
 def load_scales(r_s, chunk):
     """Issue 16 B chunk ``chunk`` of the scale codes (chunk = unit * 4 + lane // 16:
     the codes of lanes 16 (chunk % 4) .. + 15 of a unit), nontemporal."""
-    return fx.Vector(bo.buffer_load(r_s, chunk * 4, vec_width=4, dtype=T.i32, cache_modifier=CM_NT))
+    return fx.Vector(
+        bo.buffer_load(r_s, chunk * 4, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+    )
 
 
 def mfma_wxa8(acc, w, ws, x, xs, fmt: WeightFormat):
     """acc (vec4 f32) += (W unit in ``fmt``, scale ws) x (activation, FP8, scale xs)."""
-    return fx.Vector(rocdl.mfma_scale_f32_16x16x128_f8f6f4(T.vec(4, T.f32), [w, x, acc, fmt.code, FP8, 0, ws, 0, xs]))
+    return fx.Vector(
+        rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+            T.vec(4, T.f32), [w, x, acc, fmt.code, FP8, 0, ws, 0, xs]
+        )
+    )
 
 
 def widen_bf16(words, codes):
@@ -158,10 +191,14 @@ def widen_bf16(words, codes):
         scale = scales[i // 4]
         for hi in (False, True):
             v = fx.Vector(
-                rocdl.cvt_scalef32_pk_bf16_fp8(T.vec(2, T.bf16), fx.Int32(w).ir_value(), scale.ir_value(), hi)
+                rocdl.cvt_scalef32_pk_bf16_fp8(
+                    T.vec(2, T.bf16), fx.Int32(w).ir_value(), scale.ir_value(), hi
+                )
             )
             vals += [v[0], v[1]]
-    return [fx.Vector.from_elements(vals[8 * i : 8 * i + 8], fx.BFloat16) for i in range(4)]
+    return [
+        fx.Vector.from_elements(vals[8 * i : 8 * i + 8], fx.BFloat16) for i in range(4)
+    ]
 
 
 def mfma_bf16_wide(acc, wv, xv):
@@ -188,7 +225,9 @@ def b_operand(x_lds, xs_lds, row, j, st, pitch, spitch):
     off = row * pitch + st * 32 + j * 4
     a0 = fx.Vector(fx.ptr_load(x_lds + off, result_type=_v4i()))
     a1 = fx.Vector(fx.ptr_load(x_lds + (off + 16), result_type=_v4i()))
-    x = fx.Vector.from_elements([a0[e] for e in range(4)] + [a1[e] for e in range(4)], fx.Int32)
+    x = fx.Vector.from_elements(
+        [a0[e] for e in range(4)] + [a1[e] for e in range(4)], fx.Int32
+    )
     xs = fx.ptr_load(xs_lds + (row * spitch + st * 4 + j))
     return x, xs
 
@@ -224,7 +263,9 @@ def quant_word(vals, code):
 def group_amax(vals, lanes):
     """max |v| over ``vals`` and over the ``lanes`` (2, 4 or 8) adjacent lanes that
     share an MX group (lane groups aligned to ``lanes``)."""
-    m = fx.max(fx.max(abs_f(vals[0]), abs_f(vals[1])), fx.max(abs_f(vals[2]), abs_f(vals[3])))
+    m = fx.max(
+        fx.max(abs_f(vals[0]), abs_f(vals[1])), fx.max(abs_f(vals[2]), abs_f(vals[3]))
+    )
     off = 1
     while off < lanes:
         m = xred(m, off, fx.max)

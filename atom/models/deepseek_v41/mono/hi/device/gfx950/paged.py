@@ -33,8 +33,17 @@ from ...plan import trace
 PAGE = 128  # ATOM's V4.1 page in positions (``hi_gate.BLOCK_SIZE``)
 ROW_BYTES = 1024  # a main row: bf16 [512]
 REQ = ("req", "ptab")  # the args every in-place block takes
-MAX_REQ, MAX_ROWS = 8, 64  # the request words' requests and rows (a step's, a band's dead ones included)
-GEO, BID, SLOT, LIVE, ROW_LIVE = 0, 4, 4 + MAX_REQ, 4 + 2 * MAX_REQ, 4 + 3 * MAX_REQ  # word offsets in ``req``
+MAX_REQ, MAX_ROWS = (
+    8,
+    64,
+)  # the request words' requests and rows (a step's, a band's dead ones included)
+GEO, BID, SLOT, LIVE, ROW_LIVE = (
+    0,
+    4,
+    4 + MAX_REQ,
+    4 + 2 * MAX_REQ,
+    4 + 3 * MAX_REQ,
+)  # word offsets in ``req``
 REQ_WORDS = ROW_LIVE + MAX_ROWS
 
 
@@ -104,7 +113,9 @@ def global_store(addr, value, nbytes: int = 4):
     address."""
     trace.mem("store", addr, 0, nbytes, value)  # the memory-model record (no IR)
     dual.global_access(addr)
-    ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(fx.Int64(addr))).result
+    ptr = llvm.IntToPtrOp(
+        ir.Type.parse("!llvm.ptr<1>"), as_ir_value(fx.Int64(addr))
+    ).result
     v = as_ir_value(value)
     if nbytes == 1:
         v = arith.TruncIOp(ir.IntegerType.get_signless(8), v).result

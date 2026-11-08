@@ -73,13 +73,16 @@ WAVES, THREADS = MI355X.waves, MI355X.threads
 @dataclass(frozen=True)
 class DotNorm:
     """The dense mode's norm prologue (module docstring): ``ssq`` the tagged F32 channel of x's per-16-element partial
-    sums of squares (width K / 16), ``gamma`` the bf16 [K] weight arg, ``eps`` the norm's."""
+    sums of squares (width K / 16), ``gamma`` the bf16 [K] weight arg, ``eps`` the norm's.
+    """
 
     ssq: str  # "": computed in the task from x (module docstring)
     gamma: str
     eps: float
     width: int = 0  # the norm's width (its mean); 0: K
-    centred: bool = False  # the zero-centred weight (``NormQuant``'s default): y = bf16(x rstd (1 + w)), (1 + w) in f32
+    centred: bool = (
+        False  # the zero-centred weight (``NormQuant``'s default): y = bf16(x rstd (1 + w)), (1 + w) in f32
+    )
 
 
 @dataclass(frozen=True)
@@ -107,7 +110,9 @@ def _land_x(k, c: _Cfg, r):
         dests.append(w)
     got = mb.poll(specs, k.tag)
     for g, d in zip(got, dests, strict=True):
-        fx.ptr_store(fx.Vector.from_elements(g, fx.Int32).bitcast(fx.Float32), k.ldsf + d)
+        fx.ptr_store(
+            fx.Vector.from_elements(g, fx.Int32).bitcast(fx.Float32), k.ldsf + d
+        )
 
 
 def _emit(k, t, c: _Cfg):
@@ -116,7 +121,9 @@ def _emit(k, t, c: _Cfg):
     gpu.barrier()
     for h in range(2):
         col = chunk * COLS + k.wave * 2 + h
-        if c.idx:  # one column per wave at a time: the index is wave-uniform (the table's buffer base is scalar)
+        if (
+            c.idx
+        ):  # one column per wave at a time: the index is wave-uniform (the table's buffer base is scalar)
             row = uniform(mb.poll([(k.mb[c.idx], r * c.c + col, 1)], k.tag)[0][0])
         else:
             row = col
@@ -127,7 +134,9 @@ def _emit(k, t, c: _Cfg):
         for j in range(0, c.per_lane, 4):
             w0 = k.lane * c.per_lane + j
             tv = fx.Vector(bo.buffer_load(r_t, w0, vec_width=4, dtype=T.i32))
-            xv = fx.Vector(fx.ptr_load(k.ldsf + w0, result_type=fx.Vector.make_type(4, fx.Float32))).bitcast(fx.Int32)
+            xv = fx.Vector(
+                fx.ptr_load(k.ldsf + w0, result_type=fx.Vector.make_type(4, fx.Float32))
+            ).bitcast(fx.Int32)
             for e in range(4):
                 tl, th = bf2_f32(tv[e])
                 xl, xh = bf2_f32(xv[e])
@@ -158,32 +167,50 @@ class _DCfg:  # the dense K-split mode
         1  # 16-column tiles a task (T): its 8 waves split T tiles x 8 / T K parts; x is polled C / 16 / T times
     )
     norm: DotNorm | None = None  # the norm prologue (x raw, normalized in the task)
-    xw: int = 0  # x's row width when narrower than K (its elements past it read as zero); 0: K
-
+    xw: int = (
+        0  # x's row width when narrower than K (its elements past it read as zero); 0: K
+    )
 
     @property
     def ks(self) -> int:  # K per slice
         return self.k // self.s
 
     @property
-    def pitch(self) -> int:  # LDS words per x row (+4: the 16 rows of an operand load on distinct banks)
+    def pitch(
+        self,
+    ) -> (
+        int
+    ):  # LDS words per x row (+4: the 16 rows of an operand load on distinct banks)
         return self.ks // 2 + 4
 
     @property
-    def nwaves(self) -> int:  # norm: the waves of the norm's map (K / 16 partials, 64 a wave)
+    def nwaves(
+        self,
+    ) -> int:  # norm: the waves of the norm's map (K / 16 partials, 64 a wave)
         return self.k // 16 // 64
 
     @property
-    def red(self) -> int:  # norm: LDS word of the waves' sums [row][WAVES], after the x slice
+    def red(
+        self,
+    ) -> int:  # norm: LDS word of the waves' sums [row][WAVES], after the x slice
         return self.rows * self.pitch
 
     @property
-    def rc(self) -> int:  # 16-row chunks (the MFMA's N): an MFMA a chunk on each table operand
+    def rc(
+        self,
+    ) -> int:  # 16-row chunks (the MFMA's N): an MFMA a chunk on each table operand
         return -(-self.rows // 16)
 
     @property
-    def lds_words(self) -> int:  # the x slice (norm: then the waves' sums), then (overlaid) the waves' tiles
-        return max(self.rows * self.pitch + (self.rows * WAVES if self.norm else 0), WAVES * 64 * 4 * self.rc)
+    def lds_words(
+        self,
+    ) -> (
+        int
+    ):  # the x slice (norm: then the waves' sums), then (overlaid) the waves' tiles
+        return max(
+            self.rows * self.pitch + (self.rows * WAVES if self.norm else 0),
+            WAVES * 64 * 4 * self.rc,
+        )
 
 
 def _emit_dense(k, t, c: _DCfg):
@@ -198,10 +225,15 @@ def _emit_dense(k, t, c: _DCfg):
     # starts long before its input lands)
     n = k.lane % 16  # A: the tile's column n; B: x row n (clamped)
     r_t = rsrc(k.args[c.table])
-    kbs = [kpart * (c.ks // wp) + j * 32 + (k.lane // 16) * 8 for j in range(c.ks // (wp * 32))]  # K in slice
+    kbs = [
+        kpart * (c.ks // wp) + j * 32 + (k.lane // 16) * 8
+        for j in range(c.ks // (wp * 32))
+    ]  # K in slice
     avs = [fx.Vector(bo.buffer_load(r_t, (tile * 16 + n) * kw + (s * c.ks + kb) // 2, vec_width=4, dtype=T.i32))
            for kb in kbs]  # fmt: skip
-    rocdl.sched_barrier(0)  # keep them here: LLVM would sink each load to its MFMA, past the poll
+    rocdl.sched_barrier(
+        0
+    )  # keep them here: LLVM would sink each load to its MFMA, past the poll
     per = -(-(c.rows * words) // (2 * THREADS))
     specs, dests, rws, gws = [], [], [], []
     for i in range(per):
@@ -211,28 +243,53 @@ def _emit_dense(k, t, c: _DCfg):
         dests.append(r * c.pitch + w)
         rws.append(r)
         if c.norm is not None:  # the gamma words of these two x words (before the poll)
-            gws.append(fx.Vector(bo.buffer_load(rsrc(k.args[c.norm.gamma]), s * words + w, vec_width=2, dtype=T.i32)))
+            gws.append(
+                fx.Vector(
+                    bo.buffer_load(
+                        rsrc(k.args[c.norm.gamma]),
+                        s * words + w,
+                        vec_width=2,
+                        dtype=T.i32,
+                    )
+                )
+            )
     if c.norm is None:
         got = mb.poll(specs, k.tag)
-    elif c.norm.ssq:  # the norm's partials in the same poll: wave w < nwaves, lane l: partial 64 w + l of every row
+    elif (
+        c.norm.ssq
+    ):  # the norm's partials in the same poll: wave w < nwaves, lane l: partial 64 w + l of every row
         nq = c.k // 16
         ip = fx.min(k.wave * 64 + k.lane, fx.Int32(nq - 1))
-        got = mb.poll(specs + [(k.mb[c.norm.ssq], r * nq + ip, 1) for r in range(c.rows)], k.tag)
+        got = mb.poll(
+            specs + [(k.mb[c.norm.ssq], r * nq + ip, 1) for r in range(c.rows)], k.tag
+        )
         got, sq = got[: len(specs)], got[len(specs) :]
         _norm_red(k, c, [g[0].bitcast(fx.Float32) for g in sq])
         gpu.barrier()
         got = [_norm_words(k, c, rws[i], g, gws[i]) for i, g in enumerate(got)]
     for gg, d in zip(got, dests, strict=True):
-        fx.ptr_store(fx.Vector.from_elements(gg, fx.Int32).bitcast(fx.Float32), k.ldsf + d)
+        fx.ptr_store(
+            fx.Vector.from_elements(gg, fx.Int32).bitcast(fx.Float32), k.ldsf + d
+        )
     gpu.barrier()
-    rows = [fx.min(n if ch == 0 else n + 16 * ch, fx.Int32(c.rows - 1)) for ch in range(c.rc)]
+    rows = [
+        fx.min(n if ch == 0 else n + 16 * ch, fx.Int32(c.rows - 1))
+        for ch in range(c.rc)
+    ]
     accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(c.rc)]
     for kb, a in zip(kbs, avs, strict=True):
         for ch, row in enumerate(rows):
-            b = fx.ptr_load(k.ldsf + (row * c.pitch + kb // 2), result_type=fx.Vector.make_type(4, fx.Float32))
-            accs[ch] = mfma_bf16(a.bitcast(fx.BFloat16), b.bitcast(fx.BFloat16), accs[ch])
+            b = fx.ptr_load(
+                k.ldsf + (row * c.pitch + kb // 2),
+                result_type=fx.Vector.make_type(4, fx.Float32),
+            )
+            accs[ch] = mfma_bf16(
+                a.bitcast(fx.BFloat16), b.bitcast(fx.BFloat16), accs[ch]
+            )
     gpu.barrier()  # every wave's x reads are done: the LDS takes the tiles
-    for ch, acc in enumerate(accs):  # chunk ch's tiles after chunk ch - 1's (8 waves x 64 lanes x 4 a chunk)
+    for ch, acc in enumerate(
+        accs
+    ):  # chunk ch's tiles after chunk ch - 1's (8 waves x 64 lanes x 4 a chunk)
         fx.ptr_store(acc, k.ldsf + ((k.wave * 64 + k.lane) * 4 + ch * WAVES * 256))
     gpu.barrier()
     # output o < 256 T: tile o // 256 of the group, lane l = (o % 256) // 4, element i: column 4 (l // 16) + i,
@@ -245,10 +302,21 @@ def _emit_dense(k, t, c: _DCfg):
             lane, i = rem // 4, rem % 4
             v = fx.Float32(0.0)
             for kp in range(wp):
-                v = v + fx.Float32(fx.ptr_load(k.ldsf + (((kp * c.tiles + ti) * 64 + lane) * 4 + i + ch * WAVES * 256)))
+                v = v + fx.Float32(
+                    fx.ptr_load(
+                        k.ldsf
+                        + (((kp * c.tiles + ti) * 64 + lane) * 4 + i + ch * WAVES * 256)
+                    )
+                )
             col = (g * c.tiles + ti) * 16 + (lane // 16) * 4 + i
             row = lane % 16 if ch == 0 else lane % 16 + 16 * ch
-            _put_part(k, c, row * (c.s * c.c) + s * c.c + col, v, (o < 256 * c.tiles) & (row < c.rows))
+            _put_part(
+                k,
+                c,
+                row * (c.s * c.c) + s * c.c + col,
+                v,
+                (o < 256 * c.tiles) & (row < c.rows),
+            )
     gpu.barrier()  # the next task reuses the LDS
 
 
@@ -265,7 +333,8 @@ def _norm_red(k, c: _DCfg, sq):
 
 def _norm_words(k, c: _DCfg, r, words, gwords):
     """Two x words of row ``r`` normalized: rstd from the waves' sums in wave order (``norm.row_rstd``), then y =
-    bf16((x rstd) w) per element (``norm.quantize_slot``, plain_once) -> two bf16-pair words."""
+    bf16((x rstd) w) per element (``norm.quantize_slot``, plain_once) -> two bf16-pair words.
+    """
     tot = fx.ptr_load(k.ldsf + (c.red + r * WAVES))
     for w in range(1, c.nwaves):
         tot = tot + fx.ptr_load(k.ldsf + (c.red + r * WAVES + w))
@@ -287,7 +356,9 @@ def _put_part(k, c: _DCfg, i, v, ok):
 def _sum_slices(k, t, c: _DCfg):
     """Row t: each column's S partials added in slice order -> out (a thread a column)."""
     col = fx.min(k.tid, fx.Int32(c.c - 1))
-    got = mb.poll([(k.mb[c.part], t * (c.s * c.c) + s * c.c + col, 1) for s in range(c.s)], k.tag)
+    got = mb.poll(
+        [(k.mb[c.part], t * (c.s * c.c) + s * c.c + col, 1) for s in range(c.s)], k.tag
+    )
     v = fx.Float32(0.0)
     for g in got:
         v = v + g[0].bitcast(fx.Float32)
@@ -309,31 +380,61 @@ class GatheredDot(Block):
                  norm: DotNorm | None = None, k: int | None = None):  # fmt: skip
         xw = 0
         self.xw = xw
-        if kslices and (idx is not None or x.width % (kslices * WAVES * 32) or (sum_stage and out.width > THREADS)):
+        if kslices and (
+            idx is not None
+            or x.width % (kslices * WAVES * 32)
+            or (sum_stage and out.width > THREADS)
+        ):
             raise ValueError(f"GatheredDot {name}: kslices (dense mode) needs no idx, K a multiple of "
                              f"{WAVES * 32} x kslices and (its sum stage) C <= {THREADS}")  # fmt: skip
         if tiles not in (1, 2, 4, 8) or (
-            kslices and ((out.width // 16) % tiles or (x.width // kslices) % (WAVES // tiles * 32))
+            kslices
+            and (
+                (out.width // 16) % tiles
+                or (x.width // kslices) % (WAVES // tiles * 32)
+            )
         ):
             raise ValueError(
                 f"GatheredDot {name}: tiles 1 / 2 / 4 / 8 dividing C / 16, K / S a multiple of 256 / tiles"
             )
-        if norm is not None and (not kslices or x.width % (16 * 64) or x.width // 16 // 64 > WAVES):
+        if norm is not None and (
+            not kslices or x.width % (16 * 64) or x.width // 16 // 64 > WAVES
+        ):
             raise ValueError(f"GatheredDot {name}: the norm prologue is the dense mode's, K a multiple of 1024 up to "
                              f"{WAVES * 1024}")  # fmt: skip
-        self.kslices, self.sum_stage, self.tiles, self.norm = kslices, sum_stage, tiles, norm
+        self.kslices, self.sum_stage, self.tiles, self.norm = (
+            kslices,
+            sum_stage,
+            tiles,
+            norm,
+        )
         # the dense mode's slice partials: [rows][S x C], slice s at s x C (``sum_stage=False``: the consumer adds
         # them in slice order, e.g. MoERouter's route, saving a stage and a round trip)
-        self.part = Channel(f"{name}.part", kslices * out.width, Fmt.F32) if kslices else None
+        self.part = (
+            Channel(f"{name}.part", kslices * out.width, Fmt.F32) if kslices else None
+        )
         if x.fmt is not Fmt.BF16 or x.flagged or x.width % 512:
             raise ValueError(f"GatheredDot reads a tagged BF16 channel, width a multiple of 512 ({x.name}: "
                              f"{x.fmt.value}, width {x.width}; a padded copy: NormSpec.copy_pitch, "
                              "BLOCK_CATALOG 'K')")  # fmt: skip
         if out.fmt is not Fmt.F32 or out.flagged or out.width % COLS:
-            raise ValueError(f"out must be a tagged F32 channel, width a multiple of {COLS}")
-        if idx is not None and (idx.fmt is not Fmt.F32 or idx.flagged or idx.width != out.width):
-            raise ValueError("idx must be a tagged F32 channel (int32 bits) as wide as out")
-        self.name, self.x, self.table, self.out, self.idx, self.weight = name, x, table, out, idx, weight
+            raise ValueError(
+                f"out must be a tagged F32 channel, width a multiple of {COLS}"
+            )
+        if idx is not None and (
+            idx.fmt is not Fmt.F32 or idx.flagged or idx.width != out.width
+        ):
+            raise ValueError(
+                "idx must be a tagged F32 channel (int32 bits) as wide as out"
+            )
+        self.name, self.x, self.table, self.out, self.idx, self.weight = (
+            name,
+            x,
+            table,
+            out,
+            idx,
+            weight,
+        )
 
     def stages(self, sc: Scenario) -> list[Stage]:
         if self.kslices:
@@ -363,8 +464,7 @@ class GatheredDot(Block):
             partial(_emit_dense, c=c),
             lds_words=c.lds_words,
             writes=part.regions(sc.rows, (self.name,)),
-            args=(self.table,)
-            + ((self.norm.gamma,) if self.norm is not None else ()),
+            args=(self.table,) + ((self.norm.gamma,) if self.norm is not None else ()),
             key=("gathered_dense", c),
         )
         if not self.sum_stage:
@@ -373,4 +473,8 @@ class GatheredDot(Block):
                            key=("gathered_sum", c))]  # fmt: skip
 
     def pack(self, layer) -> dict[str, torch.Tensor]:
-        return {self.table: layer.retained[self.weight].contiguous()} if self.weight else {}
+        return (
+            {self.table: layer.retained[self.weight].contiguous()}
+            if self.weight
+            else {}
+        )

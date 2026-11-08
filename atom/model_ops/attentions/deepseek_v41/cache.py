@@ -33,6 +33,7 @@ from atom.model_ops.v4_kernels.state_writes import (
     swa_write,
 )
 from atom.utils import CpuGpuBuffer, upload_numpy
+from atom.utils.forward_context import RoundService
 
 from .indices import (
     build_indices,
@@ -291,10 +292,17 @@ class PagedAttentionCache:
         cached_until=None,
         finals=None,
         start_histories=None,
+        served_by_round=RoundService.NONE,
     ):
         """`floors`, `cached_until`, `finals`, `start_histories`: per request,
         on the host, `BatchStep`'s `request_*` and `start_histories`; None for
-        a forward recomputing nothing, ending every prompt."""
+        a forward recomputing nothing, ending every prompt.
+
+        `served_by_round` (`AttentionMetaData.served_by_round`): a lean step
+        (`RoundService.LEAN` and above) runs no layer that reads a compress
+        plan or a step planner's tables -- the model's decode round runs them
+        all -- so it gets neither."""
+        lean = served_by_round >= RoundService.LEAN
         self.require_committed()
         requests = tuple(requests)
         if tentative and (
@@ -340,11 +348,14 @@ class PagedAttentionCache:
             publication_group=publication_group,
             query_prefix_ready=query_prefix_ready,
             query_prefix_republish_reason=query_prefix_republish_reason,
-            planners=planners,
+            planners=() if lean else planners,
         )
-        step.plans = (
-            self._private_plans(requests, tentative) if plans is None else plans
-        )
+        if lean:
+            step.plans = {}
+        else:
+            step.plans = (
+                self._private_plans(requests, tentative) if plans is None else plans
+            )
         count = len(requests)
         zeros = np.zeros(count, np.int32)
         step.request_floors = zeros if floors is None else floors
@@ -468,6 +479,19 @@ class PagedAttentionCache:
             self._probe[: starts.size].numpy(), starts, requests, fresh
         )
 
+    def prepare_device_round_state(self, step, *, histories=True):
+        """`prepare_state` for a device-round step (`RoundService.DEVICE`: the
+        model's decode round advanced its positions on the device from the
+        previous verdict): a steady decode of the requests the previous step
+        served, so no slot restarts and no probe (its start is the device's),
+        only the tentative state its verdict commits."""
+        if histories:
+            raise RuntimeError("A device-round step on the host Engram path")
+        self.require_committed()
+        if step.tentative:
+            self.pending = TentativeState(self, step)
+        return None
+
     def prepare_state(self, step, *, histories=True):
         """Read restored cursors; reset recycled slots before any layer writes.
 
@@ -484,20 +508,7 @@ class PagedAttentionCache:
         thinks are both decided over the whole batch at once -- the per-request
         walk this replaced was 58 us of every decode step, spent branching on
         `span.position` one Python attribute at a time.
-
-        A device-round step (`step.device_round`: DeepSeek-V4.1's hi path
-        advanced its positions on the device, `mono/round/device_round.py`) is a
-        steady decode of the requests the previous step served: no slot
-        restarts and no probe (its start is the device's), only the tentative
-        state its verdict commits.
         """
-        if getattr(step, "device_round", False):
-            if histories:
-                raise RuntimeError("A device-round step on the host Engram path")
-            self.require_committed()
-            if step.tentative:
-                self.pending = TentativeState(self, step)
-            return None
         self.require_committed()
         self._judge_previous_probe()
         count = step.scheduled_bs

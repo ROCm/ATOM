@@ -10,5 +10,9 @@ def merge_knobs(base: dict, over: dict) -> dict:
     (None included) replaces it."""
     out = copy.deepcopy(base)
     for k, v in over.items():
-        out[k] = merge_knobs(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else copy.deepcopy(v)
+        out[k] = (
+            merge_knobs(out[k], v)
+            if isinstance(v, dict) and isinstance(out.get(k), dict)
+            else copy.deepcopy(v)
+        )
     return out

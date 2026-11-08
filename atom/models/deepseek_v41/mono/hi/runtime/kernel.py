@@ -31,7 +31,8 @@ def bind_group(bufs: "Buffers", peers, name: str, layer: int) -> None:
     counter is the first bound ``Buffers``' own tensor. A ``Buffers`` whose tensor must change is bound outside a graph
     capture, before any capture of its launches (the graph holds the old tensor): ``TagError`` otherwise. Its first
     launch, layer id ``layer``, starts a new step when the group launched that id since its last bump (an evaluation
-    building a fresh ``Buffers`` an arm on one group: its step 0 would repeat the previous arm's tags)."""
+    building a fresh ``Buffers`` an arm on one group: its step 0 would repeat the previous arm's tags).
+    """
     if bufs.group is peers:
         return
     if bufs.group is not None:
@@ -39,17 +40,23 @@ def bind_group(bufs: "Buffers", peers, name: str, layer: int) -> None:
     if peers.step is None:
         peers.step = bufs.step
     elif bufs.step is not peers.step:
-        if bufs.captured or (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+        if bufs.captured or (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        ):
             raise TagError(
                 f"{name}: a Buffers with its own step counter joins a peer group inside or after a graph capture: "
                 "launch it on the group once eagerly first (or build it on the group's step)"
             )
-        if bufs.step.numel() > peers.step.numel():  # (a dyn_rows build reads the live words after the counter)
+        if (
+            bufs.step.numel() > peers.step.numel()
+        ):  # (a dyn_rows build reads the live words after the counter)
             raise TagError(
                 f"{name}: a Program.dyn_rows Buffers joins a peer group whose step counter has no live words (its "
                 "first bound Buffers is a static program's): bind a dyn_rows Buffers to the group first"
             )
-        bufs.step = peers.step  # (dyn_rows: the group's live words too, Buffers.set_live on any of its Buffers)
+        bufs.step = (
+            peers.step
+        )  # (dyn_rows: the group's live words too, Buffers.set_live on any of its Buffers)
         if layer in peers.ids:
             bufs.step[:1].add_(1)  # (the counter only: not the live words after it)
             peers.ids.clear()
@@ -84,7 +91,8 @@ class Buffers:
     ``Buffers`` on a group binds it (``group``): the group's step counter (``PeerGroup.step``, the first bound
     ``Buffers``' own) becomes its ``step``. Every bump adds 1, whichever of the group's ``Buffers`` it is called on:
     a driver that bumps several of them between two steps adds several, and the tags stay distinct. (No host-side
-    "one add a step": a graph replay calls no Python, so such a flag would go stale and drop the replays' bumps.)"""
+    "one add a step": a graph replay calls no Python, so such a flag would go stale and drop the replays' bumps.)
+    """
 
     scratch: torch.Tensor
     step: torch.Tensor
@@ -92,8 +100,12 @@ class Buffers:
     # has neither (``buffers`` sets it)
     private: torch.Tensor | None = None
     launched: set = field(default_factory=set)
-    group: object = None  # the PeerGroup this Buffers' launches run on (bound at its first launch on one)
-    captured: bool = False  # launched inside a graph capture (its step tensor is in the graph)
+    group: object = (
+        None  # the PeerGroup this Buffers' launches run on (bound at its first launch on one)
+    )
+    captured: bool = (
+        False  # launched inside a graph capture (its step tensor is in the graph)
+    )
 
     def bump(self) -> None:
         """A new step: every layer id is fresh again (one device add, capturable)."""
@@ -109,15 +121,22 @@ class Buffers:
         if self.group is not None:
             self.group.ids.clear()
 
-    def set_live(self, rows: int, spec: int | None = None, batch: int | None = None) -> None:
+    def set_live(
+        self, rows: int, spec: int | None = None, batch: int | None = None
+    ) -> None:
         """``Program.dyn_rows``: the live rows of the next launches (the words after the step counter: rows, and for a
         batch x spec program its live spec and batch, ``rows = batch x spec``, the rows packed at the live spec's
         stride; device fills, capturable). Every rank of a TP group sets the same values. On a peer group the step
         tensor is the group's (``bind_group``): the live words are then every bound ``Buffers``' (one live shape a
-        step), and a ``Buffers`` set before its first launch on the group takes the group's at that launch."""
+        step), and a ``Buffers`` set before its first launch on the group takes the group's at that launch.
+        """
         if self.step.numel() < 4:
-            raise ValueError("set_live: these buffers have no live words (a program without dyn_rows)")
-        if (spec is None) != (batch is None) or (spec is not None and spec * batch != rows):
+            raise ValueError(
+                "set_live: these buffers have no live words (a program without dyn_rows)"
+            )
+        if (spec is None) != (batch is None) or (
+            spec is not None and spec * batch != rows
+        ):
             raise ValueError(f"set_live: rows {rows} != batch {batch} x spec {spec}")
         self.step[1].fill_(rows)
         if spec is not None:
@@ -160,7 +179,9 @@ class MonoKernel:
         return super().__new__(cls)
 
     def __init__(self, program: Program):
-        if self.__dict__.pop("_memo_hit", False):  # a copy of a build in the active compile memo
+        if self.__dict__.pop(
+            "_memo_hit", False
+        ):  # a copy of a build in the active compile memo
             return
         self.program = plan(program)
         t = program.target
@@ -171,9 +192,16 @@ class MonoKernel:
         from ..emit.compile import _code_object
 
         # the built code's MFMA srcC hazards (``device.gfx950.hazards``)
-        bad = srcc_hazards(_disassemble(_code_object(next(iter(self.launcher._mem_cache.values()))._ir_text), t.mcpu))
+        bad = srcc_hazards(
+            _disassemble(
+                _code_object(next(iter(self.launcher._mem_cache.values()))._ir_text),
+                t.mcpu,
+            )
+        )
         if bad:
-            raise ResourceError(f"{program.name}: {len(bad)} code hazard(s), e.g. {bad[0]}")
+            raise ResourceError(
+                f"{program.name}: {len(bad)} code hazard(s), e.g. {bad[0]}"
+            )
         if _MEMO:
             _MEMO[-1][self.program.key()] = self
 
@@ -185,7 +213,11 @@ class MonoKernel:
             t.lds_bytes,
             sgpr_spill_ok=p.sgpr_spill_ok,
             grid=t.grid,
-            cus=device_cus() if self.resources["max_blocks_per_cu"] is not None else None,
+            cus=(
+                device_cus()
+                if self.resources["max_blocks_per_cu"] is not None
+                else None
+            ),
         )
 
     def buffers(self, device="cuda", scratch: torch.Tensor | None = None, uncached: bool = False,
@@ -198,10 +230,18 @@ class MonoKernel:
         (``runtime.uncached``)."""
         p = self.program
         if scratch is not None:
-            if scratch.dtype != torch.uint8 or scratch.numel() < p.scratch_bytes or not scratch.is_contiguous():
-                raise ValueError(f"{p.name}: scratch needs {p.scratch_bytes} contiguous uint8 bytes")
+            if (
+                scratch.dtype != torch.uint8
+                or scratch.numel() < p.scratch_bytes
+                or not scratch.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{p.name}: scratch needs {p.scratch_bytes} contiguous uint8 bytes"
+                )
             if p.dual_on and scratch.data_ptr() % DUAL_PAGE:
-                raise ValueError(f"{p.name}: a dual-copy program's scratch starts a {DUAL_PAGE} B page")
+                raise ValueError(
+                    f"{p.name}: a dual-copy program's scratch starts a {DUAL_PAGE} B page"
+                )
         elif p.dual_on:  # the run area at the start of a 2 MiB page
             raw = _zeros(p.scratch_bytes + DUAL_PAGE, device, uncached)
             shift = -raw.data_ptr() % DUAL_PAGE
@@ -209,28 +249,45 @@ class MonoKernel:
         else:
             alloc = max(p.scratch_bytes, 256)
             scratch = _zeros(alloc, device, uncached)
-        private = _zeros(max(p.private_bytes, 256), device, uncached) if p.private or p.dual_on else None
+        private = (
+            _zeros(max(p.private_bytes, 256), device, uncached)
+            if p.private or p.dual_on
+            else None
+        )
         if p.dual_on:  # the copy word of each XCD: word 0 of the private buffer
             if word is None:
                 from .dual import scratch_word
 
                 word = scratch_word(scratch, p.dual_bytes, p.name)
-            word = word - (1 << 32) if word >= 1 << 31 else word  # (as int32 bits: page 3's XCD 7 is bit 31)
+            word = (
+                word - (1 << 32) if word >= 1 << 31 else word
+            )  # (as int32 bits: page 3's XCD 7 is bit 31)
             private[:4].view(torch.int32)[0] = word
         # the step counter: one int32
-        if p.dyn_rows:  # the step word, then live rows, spec, batch: all of them until set_live
+        if (
+            p.dyn_rows
+        ):  # the step word, then live rows, spec, batch: all of them until set_live
             step = torch.zeros(4, dtype=torch.int32, device=device)
-            step[1:] = torch.tensor([p.scenario.rows, p.scenario.spec, p.scenario.batch], dtype=torch.int32)
+            step[1:] = torch.tensor(
+                [p.scenario.rows, p.scenario.spec, p.scenario.batch], dtype=torch.int32
+            )
             return Buffers(scratch=scratch, step=step, private=private)
-        return Buffers(scratch=scratch, step=torch.zeros(1, dtype=torch.int32, device=device), private=private)
+        return Buffers(
+            scratch=scratch,
+            step=torch.zeros(1, dtype=torch.int32, device=device),
+            private=private,
+        )
 
     def table(self, pointers: dict, device="cuda", peers=None) -> torch.Tensor:
         """The pointer table: ``pointers[name]`` (a tensor or an int address) per
         ``program.args`` entry, int64, on ``device``. Keep it alive while launching.
-        A program with peer regions takes its TP group's ``peers`` (``runtime.peer.PeerGroup``)."""
+        A program with peer regions takes its TP group's ``peers`` (``runtime.peer.PeerGroup``).
+        """
         if self.program.peer:
             if peers is None or peers.tp != self.program.scenario.tp:
-                raise ValueError(f"{self.program.name} needs a PeerGroup of {self.program.scenario.tp} ranks")
+                raise ValueError(
+                    f"{self.program.name} needs a PeerGroup of {self.program.scenario.tp} ranks"
+                )
             if peers.nbytes < self.program.peer_bytes:
                 raise ValueError(
                     f"{self.program.name} needs {self.program.peer_bytes} B of peer memory, "
@@ -239,14 +296,19 @@ class MonoKernel:
             pointers = {**pointers, PEERS_ARG: peers.addresses, RANK_ARG: peers.rank}
             if self.program.fast_entry:
                 pointers[OWN_ARG] = peers.local
-            if self.program.peer_shared:  # its parity-1 slots mirrored from the group's top (``Program.peer_shared``)
+            if (
+                self.program.peer_shared
+            ):  # its parity-1 slots mirrored from the group's top (``Program.peer_shared``)
                 pointers[PEER_TOP_ARG] = peers.nbytes
-            peers.bind(self.program)  # (the group's layouts: a warning for unshared programs of different layouts)
+            peers.bind(
+                self.program
+            )  # (the group's layouts: a warning for unshared programs of different layouts)
         missing = set(self.program.args) - set(pointers)
         if missing:
             raise KeyError(f"pointer table needs {sorted(missing)}")
         addr = [
-            p.data_ptr() if isinstance(p, torch.Tensor) else int(p) for p in (pointers[n] for n in self.program.args)
+            p.data_ptr() if isinstance(p, torch.Tensor) else int(p)
+            for p in (pointers[n] for n in self.program.args)
         ]
         table = torch.tensor(addr + [0], dtype=torch.int64, device=device)
         # the table holds raw addresses: keep the tensors alive as long as the table,
@@ -255,17 +317,23 @@ class MonoKernel:
         table._hi_peers = peers if self.program.peer else None
         return table
 
-    def launch(self, table: torch.Tensor, bufs: Buffers, layer: int = 0, stream=None) -> None:
+    def launch(
+        self, table: torch.Tensor, bufs: Buffers, layer: int = 0, stream=None
+    ) -> None:
         """One launch. Each launch needs a fresh tag: a new ``layer`` (0 ..
         ``LAYER_SLOTS - 1``) within a step, or ``bufs.bump()`` between steps;
         raises ``TagError`` on a layer id already launched since the last bump."""
         if not 0 <= layer < LAYER_SLOTS:
-            raise TagError(f"layer id {layer} outside 0..{LAYER_SLOTS - 1} (it would alias another step's tag)")
+            raise TagError(
+                f"layer id {layer} outside 0..{LAYER_SLOTS - 1} (it would alias another step's tag)"
+            )
         peers = getattr(table, "_hi_peers", None)
         if peers is not None:
             bind_group(bufs, peers, self.program.name, layer)
         if layer in bufs.launched:
-            raise TagError(f"{self.program.name}: layer id {layer} launched twice in one step (bump the step)")
+            raise TagError(
+                f"{self.program.name}: layer id {layer} launched twice in one step (bump the step)"
+            )
         bufs.launched.add(layer)
         if peers is not None:
             peers.launched(layer, self.program.name)

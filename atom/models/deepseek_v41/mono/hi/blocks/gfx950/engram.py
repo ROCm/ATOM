@@ -108,7 +108,9 @@ SLICES = 4  # the gate's dim slices (TP4's column split; TP1 runs the same slice
 SL = HIDDEN // SLICES  # 1280
 SL_T = SL // 4  # 320 threads a slice in ``part`` (4 dims each)
 PXV = HIDDEN // 2  # value pairs a row of ``<name>.px``
-PX = PXV + SLICES * 2 * HC  # + (dot, ksq) of the 4 copies per slice: pair PXV + 8 s + c (dot), + 4 + c (ksq)
+PX = (
+    PXV + SLICES * 2 * HC
+)  # + (dot, ksq) of the 4 copies per slice: pair PXV + 8 s + c (dot), + 4 + c (ksq)
 QW, SW = KIN // 4, KIN // 32  # MXFP8 words / scale codes a row
 CODE_W = HEAD_DIM // 4  # 64 code words a table row: a wave
 # ``<name>.hash`` (int64): multipliers [NGRAM], primes [NCOLS], offsets [NCOLS + 1] (the last: the table's rows), pad
@@ -135,10 +137,18 @@ class _Plan:
     tmap: str
     n: int  # wkv columns on this rank
     x: str  # the streams channel
-    kv_arg: str = ""  # mode "kv": the full kv stored there; "gate": read from there (an earlier launch's)
-    look_dst: bool = False  # TP > 1: a look task puts to one rank (tasks x tp; a CTA's remote puts are the limit)
-    store_chunks: int = 1  # mode "kv", TP > 1: store tasks a row (each a 1 / n of the row's words from the 4 ranks)
-    staged: str = ""  # mode "kv": the rows already looked up (plain bf16 [rows, 6144]: ATOM's staged rows), no table
+    kv_arg: str = (
+        ""  # mode "kv": the full kv stored there; "gate": read from there (an earlier launch's)
+    )
+    look_dst: bool = (
+        False  # TP > 1: a look task puts to one rank (tasks x tp; a CTA's remote puts are the limit)
+    )
+    store_chunks: int = (
+        1  # mode "kv", TP > 1: store tasks a row (each a 1 / n of the row's words from the 4 ranks)
+    )
+    staged: str = (
+        ""  # mode "kv": the rows already looked up (plain bf16 [rows, 6144]: ATOM's staged rows), no table
+    )
     xg: int = (
         0  # mode "gate": x is a sharded residual's gathered R (``HCSeam(res_gather=)``) over these ranks; 0: a channel
     )
@@ -148,7 +158,11 @@ class _Plan:
         return NCOLS // self.tp
 
     @property
-    def per_task(self) -> int:  # look: columns a task (a wave each): the most up to WAVES that divide a rank's
+    def per_task(
+        self,
+    ) -> (
+        int
+    ):  # look: columns a task (a wave each): the most up to WAVES that divide a rank's
         # columns (TP2: 12 columns a rank -> 6 a task, 2 tasks; 8 a task left 4 columns unlooked-up, their pairs never
         # put: the gather waited forever)
         return max(d for d in range(1, min(WAVES, self.cpr) + 1) if self.cpr % d == 0)
@@ -183,7 +197,8 @@ def _store_i32(ptr, i, v, ok):
 
 def _compressed(k, p: _Plan, row, b, j, pos0, back):
     """The compressed id at position ``pos0 + j - back`` (python ``back``) and whether the n-gram is cut there
-    (before position 0 or a dead token): a step row's own token through ``tmap``, an older one from ``hist``."""
+    (before position 0 or a dead token): a step row's own token through ``tmap``, an older one from ``hist``.
+    """
     q = pos0 + j - back
     in_step = back <= j
     tok = ld_i32(k.args[p.ids], fx.max(row - back, fx.Int32(0)))
@@ -195,7 +210,8 @@ def _compressed(k, p: _Plan, row, b, j, pos0, back):
 
 def _look(k, t, p: _Plan):
     """Task t: row t // chunks, hash columns ``per_task`` from (chunk); wave w = one column (one table row).
-    ``look_dst``: task t = (that task, destination rank t % tp): the same rows, put to that rank only."""
+    ``look_dst``: task t = (that task, destination rank t % tp): the same rows, put to that rank only.
+    """
     dst_t = None
     if p.look_dst and p.tp > 1:
         t, dst_t = t // p.tp, t % p.tp
@@ -234,7 +250,10 @@ def _look(k, t, p: _Plan):
     sw = fx.Int32(global_load(sa))
     s = (sw >> ((g % 4) * 8)) & 255
     scale = (s == 0).select(fx.Int32(0x00400000), s << 23).bitcast(fx.Float32)
-    vals = [fx.Float32(rocdl.cvt_f32_fp8(T.f32, word.ir_value(), e)) * scale for e in range(4)]
+    vals = [
+        fx.Float32(rocdl.cvt_f32_fp8(T.f32, word.ir_value(), e)) * scale
+        for e in range(4)
+    ]
     # act_quant (E8M0 per 32 = 8 lanes): amax, the power-of-two scale, the codes (exact shifts of the stored ones)
     amax = fx.max(fx.max(fx.max(vals[0], -vals[0]), fx.max(vals[1], -vals[1])),
                   fx.max(fx.max(vals[2], -vals[2]), fx.max(vals[3], -vals[3])))  # fmt: skip
@@ -265,7 +284,9 @@ def _gath(k, t, p: _Plan):
         specs.append((from_rank(k, _a(p, "pq"), src), t * QW + wc, 1))
         dst.append((k.mb[_a(p, "e.q")], t * QW + wc, w < QW))
     gc = fx.min(k.tid, fx.Int32(SW - 1))
-    sspec = [(from_rank(k, _a(p, "ps"), (gc // (HEAD_DIM // 32)) // p.cpr), t * SW + gc, 1)]
+    sspec = [
+        (from_rank(k, _a(p, "ps"), (gc // (HEAD_DIM // 32)) // p.cpr), t * SW + gc, 1)
+    ]
     got = mb.poll(specs + sspec, k.tag)
     for (a, i, ok), v in zip(dst, got[: len(dst)], strict=True):
         _put_word(a, i, v[0], k.tag, ok)
@@ -275,7 +296,9 @@ def _gath(k, t, p: _Plan):
 # ------------------------------------------------------------------ device: part, gate
 
 
-KVX_CHUNK = 4 * THREADS  # mode "kv", TP > 1: kv words a ``kvx`` task pushes (to one rank)
+KVX_CHUNK = (
+    4 * THREADS
+)  # mode "kv", TP > 1: kv words a ``kvx`` task pushes (to one rank)
 
 
 def _slice(k, p: _Plan, t):
@@ -303,7 +326,11 @@ def _put_w2(a, i, w0, w1, tag, ok):
 
 def _px_dsts(k, p: _Plan):
     """Where ``part`` puts: the scratch region (TP1) or every rank's peer copy (its own slot)."""
-    return [k.mb[_a(p, "px")]] if p.tp == 1 else [to_rank(k, _a(p, "px"), dst) for dst in range(p.tp)]
+    return (
+        [k.mb[_a(p, "px")]]
+        if p.tp == 1
+        else [to_rank(k, _a(p, "px"), dst) for dst in range(p.tp)]
+    )
 
 
 def _part(k, t, p: _Plan):
@@ -313,10 +340,17 @@ def _part(k, t, p: _Plan):
     act = k.tid < SL_T
     d = 4 * i
     x = k.mb[p.x]
-    kvw = [(row * p.n + _kv_col(p, c, ls, d)) // 2 for c in range(HC + 1)]  # word index of each vector's 4 dims
+    kvw = [
+        (row * p.n + _kv_col(p, c, ls, d)) // 2 for c in range(HC + 1)
+    ]  # word index of each vector's 4 dims
     gw = rsrc(k.args[_a(p, "gw")])
-    w4s = [fx.Vector(bo.buffer_load(gw, c * HIDDEN + s * SL + d, vec_width=4, dtype=T.f32)) for c in range(HC)]
-    hsp = [(x, (row * HC * HIDDEN + c * HIDDEN + s * SL + d) // 2, 2) for c in range(HC)]
+    w4s = [
+        fx.Vector(bo.buffer_load(gw, c * HIDDEN + s * SL + d, vec_width=4, dtype=T.f32))
+        for c in range(HC)
+    ]
+    hsp = [
+        (x, (row * HC * HIDDEN + c * HIDDEN + s * SL + d) // 2, 2) for c in range(HC)
+    ]
     kv = k.mb[_a(p, "kv")]
     specs = []
     for c in range(HC):
@@ -351,7 +385,9 @@ def _part(k, t, p: _Plan):
     # q = 2 c (dot) / 2 c + 1 (ksq) -> pair PXV + 8 s + c / + 4 + c
     c, kind = q // 2, q % 2
     for a in dsts:
-        _put_f(a, row * PX + PXV + 2 * HC * s + kind * HC + c, tot, k.tag, k.tid < 2 * HC)
+        _put_f(
+            a, row * PX + PXV + 2 * HC * s + kind * HC + c, tot, k.tag, k.tid < 2 * HC
+        )
     gpu.barrier()  # the next task reuses the LDS
 
 
@@ -376,7 +412,8 @@ def _kvx(k, t, p: _Plan):
 
 def kv_share_word(w, tp: int):
     """Word ``w`` of a rank's kv share (``rank_columns``' order, 2 bf16 a word) -> (its vector, its word in the
-    rank's part of the vector): a vector's words a rank 5120 / tp / 2 (TP4: 640). Python ints or traced ones."""
+    rank's part of the vector): a vector's words a rank 5120 / tp / 2 (TP4: 640). Python ints or traced ones.
+    """
     vw = HIDDEN // tp // 2
     return w // vw, w % vw
 
@@ -393,11 +430,16 @@ def _store_full(k, t, p: _Plan):
     for r in range(-(-cw // THREADS)):
         w = w0 + k.tid + r * THREADS
         wc = fx.min(w, fx.Int32(words - 1))
-        got = mb.poll([(from_rank(k, _a(p, "kvp"), s), row * words + wc, 1) for s in range(p.tp)], k.tag)
+        got = mb.poll(
+            [(from_rank(k, _a(p, "kvp"), s), row * words + wc, 1) for s in range(p.tp)],
+            k.tag,
+        )
         vec, d2 = kv_share_word(wc, p.tp)
         ok = (w < words) & (w < w0 + cw) if p.store_chunks > 1 else w < words
         for s in range(p.tp):
-            nat = row * (NOUT // 2) + vec * (HIDDEN // 2) + s * (HIDDEN // p.tp // 2) + d2
+            nat = (
+                row * (NOUT // 2) + vec * (HIDDEN // 2) + s * (HIDDEN // p.tp // 2) + d2
+            )
             _store_i32(k.args[p.kv_arg], nat, got[s][0], ok)
 
 
@@ -425,7 +467,10 @@ def _gate(k, t, p: _Plan):
     sspec = []
     for s in range(SLICES):
         a = _px_addr(k, p, s)
-        sspec += [(a, row * PX + PXV + 2 * HC * s + c, 1), (a, row * PX + PXV + 2 * HC * s + HC + c, 1)]
+        sspec += [
+            (a, row * PX + PXV + 2 * HC * s + c, 1),
+            (a, row * PX + PXV + 2 * HC * s + HC + c, 1),
+        ]
     hw = mb.poll(hspec, k.tag)
     vw = mb.poll(vspec + sspec, k.tag)
     h = [v for w in hw for v in bf2_f32(w[0])]
@@ -444,7 +489,9 @@ def _gate(k, t, p: _Plan):
     dot, ksq = sv[0], sv[1]
     for s in range(1, SLICES):
         dot, ksq = dot + sv[2 * s], ksq + sv[2 * s + 1]
-    _finish(k, p, row, c, pairs, h, [bf2_f32(vw[m][0]) for m in range(PER_T)], dot, ksq, hsq)
+    _finish(
+        k, p, row, c, pairs, h, [bf2_f32(vw[m][0]) for m in range(PER_T)], dot, ksq, hsq
+    )
     gpu.barrier()  # the next task reuses the LDS
 
 
@@ -464,11 +511,23 @@ def _gate_fused(k, t, p: _Plan):
     # loads: the slices' keys / weights (part's mapping), the value (gate's mapping), then the polls of h (both)
     keys = [fx.Vector(bo.buffer_load(kva, (row * NOUT + c * HIDDEN + s * SL + d) // 2, vec_width=2, dtype=T.i32))
             for s in range(SLICES)]  # fmt: skip
-    w4s = [fx.Vector(bo.buffer_load(gw, c * HIDDEN + s * SL + d, vec_width=4, dtype=T.f32)) for s in range(SLICES)]
+    w4s = [
+        fx.Vector(bo.buffer_load(gw, c * HIDDEN + s * SL + d, vec_width=4, dtype=T.f32))
+        for s in range(SLICES)
+    ]
     vals = [fx.Int32(bo.buffer_load(kva, (row * NOUT + HC * HIDDEN) // 2 + pi, vec_width=1, dtype=T.i32))
             for pi in pairs]  # fmt: skip
-    hs = mb.poll([(x, _xw(k, p, (row * HC * HIDDEN + c * HIDDEN + s * SL + d) // 2), 2) for s in range(SLICES)], k.tag)
-    hw = mb.poll([(x, _xw(k, p, (row * HC * HIDDEN + c * HIDDEN) // 2 + pi), 1) for pi in pairs], k.tag)
+    hs = mb.poll(
+        [
+            (x, _xw(k, p, (row * HC * HIDDEN + c * HIDDEN + s * SL + d) // 2), 2)
+            for s in range(SLICES)
+        ],
+        k.tag,
+    )
+    hw = mb.poll(
+        [(x, _xw(k, p, (row * HC * HIDDEN + c * HIDDEN) // 2 + pi), 1) for pi in pairs],
+        k.tag,
+    )
     zero = fx.Float32(0.0)
     sums = []
     for s in range(SLICES):
@@ -517,7 +576,9 @@ def _xw(k, p: _Plan, w):
 def _finish(k, p: _Plan, row, c, pairs, h, vals, dot, ksq, hsq):
     """The gate from the summed partials, ``out = bf16(h + gate value)`` for the thread's pairs."""
     eps = fx.Float32(p.eps)
-    rstd = hw_rsq(hsq / fx.Float32(float(HIDDEN)) + eps) * hw_rsq(ksq / fx.Float32(float(HIDDEN)) + eps)
+    rstd = hw_rsq(hsq / fx.Float32(float(HIDDEN)) + eps) * hw_rsq(
+        ksq / fx.Float32(float(HIDDEN)) + eps
+    )
     dot = dot * rstd * fx.Float32(HIDDEN**-0.5)
     mag = fx.Float32(fmath.sqrt(fx.max(fx.max(dot, -dot), fx.Float32(1e-6))))
     sign = dot.bitcast(fx.Int32) & fx.Int32(-0x80000000)
@@ -545,32 +606,64 @@ class Engram(Block):
                  wkv_knobs: dict | None = None, mode: str = "full", kv_arg: str = "", look_dst: bool = False,
                  store_chunks: int = 1, staged: str = "", x_gathered: bool = False):  # fmt: skip
         if x.fmt is not Fmt.BF16 or x.flagged or x.width != HC * HIDDEN:
-            raise ValueError(f"Engram {name}: x is a tagged BF16 channel of width {HC * HIDDEN}")
-        if out is not None and (out.fmt is not Fmt.BF16 or out.flagged or out.width != HC * HIDDEN):
-            raise ValueError(f"Engram {name}: out is a tagged BF16 channel of width {HC * HIDDEN}")
+            raise ValueError(
+                f"Engram {name}: x is a tagged BF16 channel of width {HC * HIDDEN}"
+            )
+        if out is not None and (
+            out.fmt is not Fmt.BF16 or out.flagged or out.width != HC * HIDDEN
+        ):
+            raise ValueError(
+                f"Engram {name}: out is a tagged BF16 channel of width {HC * HIDDEN}"
+            )
         if mode not in ("full", "kv", "gate") or (mode != "full" and not kv_arg):
-            raise ValueError(f"Engram {name}: mode full / kv / gate (kv, gate: with kv_arg), got {mode!r}")
+            raise ValueError(
+                f"Engram {name}: mode full / kv / gate (kv, gate: with kv_arg), got {mode!r}"
+            )
         if staged and mode != "kv":
             raise ValueError(f"Engram {name}: staged rows feed the kv half (mode 'kv')")
         if out is None and not out_arg and mode != "kv":
             raise ValueError(f"Engram {name}: give an output channel or arg")
-        self.mode, self.kv_arg, self.look_dst, self.store_chunks = mode, kv_arg, look_dst, store_chunks
+        self.mode, self.kv_arg, self.look_dst, self.store_chunks = (
+            mode,
+            kv_arg,
+            look_dst,
+            store_chunks,
+        )
         self.staged = staged
         # TP, a sharded residual: x is the gathered R a sharded seam put (``HCSeam(res_gather=)``, mode "gate")
         if x_gathered and mode != "gate":
-            raise ValueError(f"Engram {name}: x_gathered reads a sharded seam's gathered R in mode 'gate'")
+            raise ValueError(
+                f"Engram {name}: x_gathered reads a sharded seam's gathered R in mode 'gate'"
+            )
         self.x_gathered = x_gathered
         self.name, self.x, self.out, self.out_arg = name, x, out, out_arg
-        self.ids, self.pos, self.hist, self.tmap, self.hist_len, self.eps = ids, pos, hist, tmap, hist_len, eps
+        self.ids, self.pos, self.hist, self.tmap, self.hist_len, self.eps = (
+            ids,
+            pos,
+            hist,
+            tmap,
+            hist_len,
+            eps,
+        )
         self.e = Channel(f"{name}.e", KIN, Fmt.MXFP8)
-        self.wkv_knobs = dict(wkv_knobs or {})  # Linear knobs (k_split, group_rows, wave_rows) for wkv
+        self.wkv_knobs = dict(
+            wkv_knobs or {}
+        )  # Linear knobs (k_split, group_rows, wave_rows) for wkv
 
     def channels(self, tp: int, rows: int = 1) -> tuple[Channel, Linear]:
         """wkv's output channel and its ``Linear``. Default knobs: the plan's, except TP1 above 8 rows (the 25600
         columns' derived shape does not fit there: K in 2 slices, 248 tasks)."""
         kv = Channel(f"{self.name}.kv", NOUT // tp, Fmt.BF16)
         knobs = self.wkv_knobs or ({"k_split": 2} if tp == 1 and rows > 8 else {})
-        return kv, Linear(f"{self.name}.wkv", ("wkv",), self.e, NOUT // tp, BF16Out(kv), weight_format="mxfp8", **knobs)
+        return kv, Linear(
+            f"{self.name}.wkv",
+            ("wkv",),
+            self.e,
+            NOUT // tp,
+            BF16Out(kv),
+            weight_format="mxfp8",
+            **knobs,
+        )
 
     def plan(self, sc: Scenario) -> _Plan:
         if NCOLS % sc.tp or HIDDEN % sc.tp or (self.mode == "full" and SLICES % sc.tp):
@@ -609,13 +702,22 @@ class Engram(Block):
             st.append(Stage(n("store"), sc.rows * p.store_chunks, partial(_store_full, p=sp), args=(self.kv_arg,),
                             key=key + ("store",)))  # fmt: skip
             return st
-        if self.mode == "gate":  # the full kv is local (mode "kv" all-gathered it): one stage, no hand-off
+        if (
+            self.mode == "gate"
+        ):  # the full kv is local (mode "kv" all-gathered it): one stage, no hand-off
             p = replace(p, tp=1, n=NOUT)
-            out_w = self.out.regions(sc.rows, (n("gate"),)) if self.out is not None else ()
+            out_w = (
+                self.out.regions(sc.rows, (n("gate"),)) if self.out is not None else ()
+            )
             args = (n("gw"), p.kv_arg) + ((p.out_arg,) if p.out_arg else ())
             return [Stage(n("gate"), sc.rows * HC, partial(_gate_fused, p=p), lds_words=WAVES * (2 * SLICES + 1),
                           writes=tuple(out_w), args=args, key=("engram",) + (p,) + ("fused",))]  # fmt: skip
-        px = Region(n("px"), sc.rows * PX, (n("part"),), space=Space.PEER if p.tp > 1 else Space.SCRATCH)
+        px = Region(
+            n("px"),
+            sc.rows * PX,
+            (n("part"),),
+            space=Space.PEER if p.tp > 1 else Space.SCRATCH,
+        )
         st.append(Stage(n("part"), sc.rows * p.slices, partial(_part, p=p), lds_words=WAVES * 2 * HC, writes=(px,),
                         args=(n("gw"),), key=key))  # fmt: skip
         out_w = self.out.regions(sc.rows, (n("gate"),)) if self.out is not None else ()
@@ -623,17 +725,27 @@ class Engram(Block):
                         writes=tuple(out_w), args=(p.out_arg,) if p.out_arg else (), key=key))  # fmt: skip
         return st
 
-    def pack(self, weights: dict, tp: int = 1, rank: int = 0, device="cuda") -> dict[str, torch.Tensor]:
+    def pack(
+        self, weights: dict, tp: int = 1, rank: int = 0, device="cuda"
+    ) -> dict[str, torch.Tensor]:
         """``weights``: ``wkv`` (float8_e4m3fn [25600, 6144]), ``wkv_s`` (E8M0 / uint8 [800, 192]), ``q_weight`` /
-        ``k_weight`` [4, 5120]; plus ``hash`` (``pack_hash``). Returns this rank's args (not the table: ``shard``)."""
+        ``k_weight`` [4, 5120]; plus ``hash`` (``pack_hash``). Returns this rank's args (not the table: ``shard``).
+        """
         out = {}
         if self.mode != "gate":
             wkv = weights["wkv"].view(torch.float8_e4m3fn)
             m = fp8_block_to_mxfp8(wkv, weights["wkv_s"].view(torch.uint8))
             cols = rank_columns(tp, rank)
-            m.packed, m.codes = m.packed[cols].contiguous().to(device), m.codes[cols].contiguous().to(device)
+            m.packed, m.codes = m.packed[cols].contiguous().to(device), m.codes[
+                cols
+            ].contiguous().to(device)
             _, lin = self.channels(tp)
-            out.update({k: v.to(device) for k, v in lin.pack(SimpleNamespace(linears={"wkv": m})).items()})
+            out.update(
+                {
+                    k: v.to(device)
+                    for k, v in lin.pack(SimpleNamespace(linears={"wkv": m})).items()
+                }
+            )
             out[f"{self.name}.hash"] = weights["hash"].to(device)
         if self.mode != "kv":
             gw = weights["q_weight"].float() * weights["k_weight"].float()
@@ -649,12 +761,15 @@ def rank_columns(tp: int, rank: int) -> torch.Tensor:
     value) the dims ``5120 / tp`` rank .. (at TP 1 / 2 / 4 the rank's gate slices; any tp dividing the width: the
     split modes, whose gate keeps its 4 slices on the gathered kv)."""
     lo, hi = rank * HIDDEN // tp, (rank + 1) * HIDDEN // tp
-    return torch.cat([torch.arange(v * HIDDEN + lo, v * HIDDEN + hi) for v in range(HC + 1)])
+    return torch.cat(
+        [torch.arange(v * HIDDEN + lo, v * HIDDEN + hi) for v in range(HC + 1)]
+    )
 
 
 def pack_hash(multipliers, primes, offsets, num_rows: int, pad: int) -> torch.Tensor:
     """``<name>.hash`` (int64 [H_WORDS]) of one layer from ``NgramHashState``'s buffers: multipliers [4], primes
-    [3, 8] (column order: n-gram major), offsets [24], the table's rows, the compressed pad id."""
+    [3, 8] (column order: n-gram major), offsets [24], the table's rows, the compressed pad id.
+    """
     out = torch.zeros(H_WORDS, dtype=torch.int64)
     out[H_MULT : H_MULT + NGRAM] = torch.as_tensor(multipliers).flatten()
     out[H_PRIME : H_PRIME + NCOLS] = torch.as_tensor(primes).flatten()

@@ -1,22 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Which V4.1 forwards the hi hook serves (``ATOM_DSV41_MONO_HI=1``), and its installation.
+"""Which V4.1 forwards the hi hook serves (``ATOM_DSV41_MONO_HI``), and its installation.
 
 ``install_hi`` is ``dispatch.install_mono_decode``'s hi branch: it builds the hook (``hi_runner``) and
 returns the model wrapped as ``HiDecodeModel`` (and the DSpark draft model as ``HiDraftModel``), the
-classes of ``dispatch`` with the hook's routing on top; or None, and the deployment takes ATOM's mono decode
-unchanged. Nothing here is imported without the flag.
+classes of ``dispatch`` with the hook's routing on top; a loaded model it does not serve raises
+``MonoUnsupported``, and under "auto" the deployment takes ATOM's mono decode unchanged. Nothing here is imported
+unless ``hi_gate.decide`` says yes.
 
-- ``HiDecodeModel``: the forwards the hook serves (``HiLayers.serves_step``) run every decoder layer on
-  hi (``HiDecodeModel._hi_forward``); every other forward takes ATOM's path as before (a decode step ATOM's K1 / K2,
-  their runner created on the first such step only) and invalidates the hook's incremental import for its requests. Its
-  ``verify_head`` (``round.verify_head.HiVerifyHead``, ``ModelRunner``'s model-side verify head): a served verify
-  step's ids come from the head inside the forward instead of the logits.
-- ``HiDraftModel``: the DSpark draft's context-KV write and its block draft on the hi path on the steps the hook
-  served (``context_kv_served``, ``block_backbone``), ATOM's draft otherwise.
-- the host work of the decode round at the engine's explicit hooks (``round.HiRound``: the runner's through
-  ``HiDecodeModel.decode_round``, the V4.1 builder's, the DSpark proposer's), the token embedding's shards read in
-  place across the ranks (``embed_full``) and ATOM's Engram staging skipped on served steps (``HiLayers.use_host_tables``).
+- ``HiDecodeModel``: the forwards the builder's routing decision gives the hook (``AttentionMetaData.served_by_round``,
+  ``round.HiRound.service``) run every decoder layer on hi (``HiDecodeModel._hi_forward``); every other forward takes
+  ATOM's path as before (a decode step ATOM's K1 / K2, their runner created on the first such step only) and
+  invalidates the hook's incremental import for its requests. Its ``verify_head`` (``round.verify_head.HiVerifyHead``):
+  a served verify step's ids come from the head inside the forward instead of the logits; its ``decode_round``
+  (``round.HiRound``): the host work of the decode round (``model_engine.model_hooks``).
+- ``HiDraftModel``: the DSpark draft's block draft on the hi path (``block_backbone``); its context-KV write on a
+  served step is the target forward's (the proposer skips ATOM's on such a step).
+- the token embedding's shards read in place across the ranks (``embed_full``) and ATOM's Engram staging skipped on
+  served steps (``HiLayers.use_host_tables``).
 """
 
 from __future__ import annotations
@@ -61,18 +62,22 @@ class HiDecodeModel(MonoDecodeModel):
         hook = self._hi
         hook.head_rows = 0  # set again by a step whose verify head ran
         fwd = get_forward_context()
-        step = getattr(fwd.attn_metadata, "step", None)
-        if supported and hook.serves_step(rows, step):
+        metadata = fwd.attn_metadata
+        if metadata is not None and metadata.served_by_round:
+            # the builder laid the step out for the hi path (Engram staging and the DSpark proposer follow the same
+            # decision): its forward must be one the hi layers run
+            if not supported:
+                raise RuntimeError(
+                    "V4.1 mono hi: a step routed to the hi path whose forward is not a mono decode step "
+                    f"({rows} rows, inputs_embeds {inputs_embeds is not None}, ubatches "
+                    f"{fwd.ubatch_slices is not None})"
+                )
             return self._hi_forward(input_ids, positions)
         # it writes its own requests' caches: their request slots import in full next
+        step = getattr(metadata, "step", None)
         ctx = fwd.context
         dummy = ctx is None or bool(getattr(ctx, "is_dummy_run", False))
         hook.invalidate(step, dummy=dummy)
-        if hook.lean_host and getattr(step, "lean_host", False):
-            raise RuntimeError(
-                "V4.1 mono: a lean-host step is not served by the hi hook: "
-                "its metadata has no plans / indptrs"
-            )
         if supported and self._mono.ready(rows):
             return self._mono.runner.forward(input_ids, positions)
         if inputs_embeds is None:
@@ -125,25 +130,13 @@ class HiDecodeModel(MonoDecodeModel):
 
 
 class HiDraftModel(MonoDraftModel):
-    """``MonoDraftModel`` with the hi hook's draft (module docstring): on a forward the hook served,
-    ``write_context_kv`` is a no-op (the hook's ``CTX`` launch wrote the rows inside the target graph,
-    ``context_kv_served``), and the block draft of up to ``HiLayers.dr_bmax`` requests runs on the hi path.
+    """``MonoDraftModel`` with the hi hook's block draft (module docstring): up to ``HiLayers.dr_bmax`` requests run on
+    the hi path. (The context-KV write of a served step is the hook's ``CTX`` launch, inside the target graph.)
     """
 
     def __init__(self, draft: nn.Module, dp_ranks: int, hook) -> None:
         super().__init__(draft, dp_ranks)
         self.hi = hook
-
-    def context_kv_served(self) -> bool:
-        """Whether the forward that just ran wrote the draft's context rows on the hi path (``compute_draft_kv`` then
-        skips the taps' concat and the write)."""
-        step = getattr(get_forward_context().attn_metadata, "step", None)
-        return self.hi.ctx_served(step)
-
-    def write_context_kv(self, aux_concat, positions):
-        if self.context_kv_served():
-            return None
-        return self.model.write_context_kv(aux_concat, positions)
 
     def block_backbone(self, input_ids, positions, num_draft):
         hook = self.hi
@@ -172,10 +165,22 @@ class HiDraftModel(MonoDraftModel):
 
 def install_hi(
     model: nn.Module, atom_config, drafter, metadata_builder, dp_ranks: int
-) -> nn.Module | None:
+) -> nn.Module:
     """``model`` wrapped for the hi hook (and ``drafter``'s draft model for its draft), on a deployment the hi path
-    serves (``hi_gate.decide``). Collective (the hook's peer groups): every rank calls it at the same point.
-    """
+    serves (``hi_gate.decide``). Collective (the hook's peer groups): every rank calls it at the same point. A loaded
+    model the hi path does not serve raises ``MonoUnsupported`` (``dispatch.install_mono_decode`` falls back under
+    "auto"), the draft model left as it was."""
+    draft = drafter.model
+    try:
+        return _install_hi(model, atom_config, drafter, metadata_builder, dp_ranks)
+    except MonoUnsupported:
+        drafter.model = draft
+        raise
+
+
+def _install_hi(
+    model, atom_config, drafter, metadata_builder, dp_ranks: int
+) -> nn.Module:
     engram = metadata_builder.engram
     # the hi runtime's layers for every layer: weights (packed from the target's and the draft's loaded tensors), kernels
     # and peer groups bound here, before the KV cache is sized (the Engram table lookup's hash constants from ATOM's own
@@ -192,10 +197,10 @@ def install_hi(
     # the draft's context write and block draft on the hi path
     drafter.model = HiDraftModel(drafter.model, dp_ranks, hook)
     hook.bind_draft(drafter)
-    # the round's host work at the engine's decode-round hooks: lean host prep on the steps it serves, the device-side
-    # round advance on top of it, the verdict / Engram commit /
-    # DSpark anchors inside the target graph, the packed publications reading their pinned arenas directly
-    hi_round.install(hook, metadata_builder, runner, drafter)
+    # the round's host work (``HiDecodeModel.decode_round``): the routing decision with lean host prep on the steps it
+    # serves, the device-side round advance on top of it, the verdict / Engram commit / DSpark anchors inside the
+    # target graph, the decode publications reading their pinned arenas directly
+    hi_round.install(hook, metadata_builder, runner)
     return HiDecodeModel(
         model,
         drafter,

@@ -2,18 +2,20 @@
 """Real DMA/scatter correctness, asynchronous source reuse."""
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from atom.utils.h2d import PublicationError, PublicationOwner
+from atom.utils.h2d import HostArenaReader, PublicationError, PublicationOwner
 from tests.test_h2d_publication import buffer, setup
 
-pytestmark = pytest.mark.skipif(
+gpu = pytest.mark.skipif(
     os.environ.get("RUN_H2D_GPU_TESTS") != "1", reason="set RUN_H2D_GPU_TESTS=1"
 )
 
 
+@gpu
 def test_mixed_bytes_padding_dynamic_counts_and_graph_replay():
     owner = PublicationOwner("cuda", torch.cuda.Event())
     layouts = [
@@ -75,6 +77,7 @@ def test_mixed_bytes_padding_dynamic_counts_and_graph_replay():
     assert len(group._backend.prefixes) <= 4
 
 
+@gpu
 def test_packed_arena_reuse_and_atomic_validation():
     owner, a, b, _, _, group = setup("cuda", shape=(1031,))
     assert group.use_transport("packed") == "packed"
@@ -102,6 +105,7 @@ def test_packed_arena_reuse_and_atomic_validation():
         assert torch.all(second.cpu() == step + 21)
 
 
+@gpu
 def test_packed_failure_after_dma_poison_retains_arena(monkeypatch):
     owner, a, b, _, _, group = setup("cuda")
     assert group.use_transport("packed") == "packed"
@@ -125,6 +129,7 @@ def test_packed_failure_after_dma_poison_retains_arena(monkeypatch):
         owner.begin()
 
 
+@gpu
 def test_packed_initializes_with_cuda_as_default_device():
     with torch.device("cuda"):
         owner, a, b, _, _, group = setup("cuda")
@@ -139,6 +144,7 @@ def test_packed_initializes_with_cuda_as_default_device():
         assert torch.all(a.gpu.cpu() == 51) and torch.all(b.gpu.cpu() == 61)
 
 
+@gpu
 @pytest.mark.parametrize("strided", [False, True])
 def test_owner_packs_consumer_boundaries_and_keeps_supported_fallback(strided):
     owner, a, b, x, y, producer = setup("cuda")
@@ -172,6 +178,7 @@ def test_owner_packs_consumer_boundaries_and_keeps_supported_fallback(strided):
     assert torch.all(a.gpu.cpu() == 44) and torch.all(b.gpu.cpu() == 55)
 
 
+@gpu
 def test_disjoint_single_member_publications_do_not_borrow_packed_header(monkeypatch):
     owner, a, b, _, _, group = setup("cuda", shape=(8,))
     assert group.use_transport("packed") == "packed"
@@ -198,6 +205,7 @@ def test_disjoint_single_member_publications_do_not_borrow_packed_header(monkeyp
     assert second.cpu().tolist() == [23] * 8
 
 
+@gpu
 def test_direct_member_preserves_an_in_flight_packed_arena():
     owner = PublicationOwner("cuda", torch.cuda.Event())
     buffers = [buffer(8, device="cuda") for _ in range(5)]
@@ -231,16 +239,34 @@ def test_direct_member_preserves_an_in_flight_packed_arena():
     ]
 
 
+class _Reader(HostArenaReader):
+    """Reads every publication's host arena; with `takes`, records every
+    scatter instead of launching it."""
+
+    def __init__(self, takes=False):
+        self.takes, self.taken = takes, []
+
+    def reads(self, nbytes):
+        return True
+
+    def take(self, copy, arena, largest):
+        if not self.takes:
+            return False
+        self.taken.append((arena, largest))
+        return True
+
+
+@gpu
 def test_packed_scatter_reads_the_host_arena():
-    # The scatter reads the pinned arena itself (`read_host_arena`, DeepSeek-V4.1's
-    # hi hook); reuse waits on the owner's event exactly as with the copy
-    # (the delay keeps every launch queued).
+    # The scatter reads the pinned arena itself (`read_host_arena`); reuse
+    # waits on the owner's event exactly as with the copy (the delay keeps
+    # every launch queued).
     owner, a, b, _, _, group = setup("cuda", shape=(1031,))
     assert group.use_transport("packed") == "packed"
+    assert group.read_host_arena(_Reader())
     owner.begin()
     group.publish((1031, 1031))  # Compile before reading the arena.
     owner.finish()
-    group._backend.read_host_arena()
     observations = []
     for step, counts in enumerate(((1031, 1031), (5, 1031), (1031, None), (1, 2))):
         owner.begin()
@@ -256,30 +282,19 @@ def test_packed_scatter_reads_the_host_arena():
             assert count is None or torch.all(got[:count].cpu() == value)
 
 
-class _Recorder:
-    """A `PackedCopy.defer` recorder that takes every scatter while armed."""
-
-    armed = True
-
-    def __init__(self):
-        self.taken = []
-
-    def take(self, copy, arena, largest):
-        self.taken.append((arena, largest))
-        return True
-
-
+@gpu
 def test_a_deferred_scatter_is_not_launched():
-    # A recorder takes the scatter (DeepSeek-V4.1's hi prologue launches it
-    # later); disarmed, the publication launches as before.
+    # A reader takes the scatter (DeepSeek-V4.1's hi prologue launches it
+    # later); declining, the publication launches as before.
     owner, a, b, _, _, group = setup("cuda", shape=(1031,))
     assert group.use_transport("packed") == "packed"
+    reader = _Reader(takes=True)
+    assert group.read_host_arena(reader)
     owner.begin()
     group.publish((1031, 1031))
     owner.finish()
     owner.completion.synchronize()
-    recorder = _Recorder()
-    group._backend.defer = recorder
+    taken = len(reader.taken)
     owner.begin()
     a.cpu.fill_(5)
     b.cpu.fill_(6)
@@ -287,13 +302,103 @@ def test_a_deferred_scatter_is_not_launched():
     group.publish((1031, 1031))
     owner.finish()
     owner.completion.synchronize()
-    assert (
-        len(recorder.taken) == 1 and recorder.taken[0][1] == 1031 * a.cpu.element_size()
+    assert len(reader.taken) == taken + 1
+    assert reader.taken[-1] == (
+        group._backend.host_arena.data_ptr(),
+        1031 * a.cpu.element_size(),
     )
     assert torch.equal(a.gpu, before)  # not scattered
-    recorder.armed = False
+    reader.takes = False
     owner.begin()
     group.publish((1031, 1031))
     owner.finish()
     owner.completion.synchronize()
     assert torch.all(a.gpu.cpu() == 5) and torch.all(b.gpu.cpu() == 6)
+
+
+def test_a_direct_group_does_not_read_a_host_arena():
+    owner, _, _, _, _, group = setup("cpu")
+    assert group.transport == "direct"
+    assert group.read_host_arena(_Reader()) is False
+
+
+def test_host_arena_reads_opt_in_at_initialization_only():
+    owner, _, _, _, _, group = setup("cpu")
+    owner.begin()
+    with pytest.raises(PublicationError):
+        group.read_host_arena(_Reader())
+
+
+def test_the_default_reader_reads_and_takes_nothing():
+    reader = HostArenaReader()
+    assert not reader.reads(16) and not reader.take(None, 0, 0)
+
+
+class _Kernel:
+    def __init__(self, launches):
+        self.launches = launches
+
+    def __getitem__(self, grid):
+        return lambda arena, destinations: self.launches.append(arena)
+
+
+def _copy(reader, monkeypatch, *, capturing=False):
+    """A `PackedCopy` of two 8-byte members on stand-ins (no GPU): the arena
+    copies and the scatter launches recorded."""
+    packed_h2d = pytest.importorskip("atom.utils.packed_h2d")  # (Triton)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    members = [
+        SimpleNamespace(
+            bytes_per_count=1, source=torch.arange(8, dtype=torch.uint8) + 10 * i
+        )
+        for i in range(2)
+    ]
+    copy = object.__new__(packed_h2d.PackedCopy)
+    copy.members = members
+    copy.header_bytes = 32
+    copy.host = torch.zeros(48, dtype=torch.uint8)
+    copy.device = torch.zeros(48, dtype=torch.uint8)
+    copy.header = copy.host[:32].view(torch.int64).numpy()
+    copy.payload = memoryview(copy.host.numpy())
+    copy.sources = tuple(memoryview(m.source.numpy()) for m in members)
+    copy.destinations = torch.zeros(2, dtype=torch.int64)
+    copy.prefixes = {}
+    launches = []
+    copy.kernel = _Kernel(launches)
+    copy.reader = reader
+    copy.host_arena = None if reader is None else packed_h2d.DeviceAddress(0x1000)
+    return copy, launches
+
+
+class _Declines(_Reader):
+    def reads(self, nbytes):
+        self.asked = nbytes
+        return False
+
+
+@pytest.mark.parametrize("capturing", [False, True])
+@pytest.mark.parametrize("reader", [None, "declines", "reads"])
+def test_only_an_accepted_eager_launch_reads_the_host_arena(
+    monkeypatch, capturing, reader
+):
+    """The copy then the scatter from the device arena, unless the reader
+    accepts an eager launch: then the scatter reads the host arena (no H2D);
+    a capture always copies."""
+    reader = {None: None, "declines": _Declines(), "reads": _Reader()}[reader]
+    copy, launches = _copy(reader, monkeypatch, capturing=capturing)
+    assert copy.submit([8, 8])
+    (arena,) = launches
+    if type(reader) is _Reader and not capturing:
+        assert arena.data_ptr() == 0x1000 and not copy.device.any()  # no H2D
+    else:
+        assert arena is copy.device and torch.equal(copy.device, copy.host)
+    if isinstance(reader, _Declines) and not capturing:
+        assert reader.asked == 48  # header and payload
+
+
+def test_a_taken_scatter_is_neither_copied_nor_launched(monkeypatch):
+    reader = _Reader(takes=True)
+    copy, launches = _copy(reader, monkeypatch)
+    assert copy.submit([8, 3])
+    assert reader.taken == [(0x1000, 8)] and launches == []
+    assert not copy.device.any()

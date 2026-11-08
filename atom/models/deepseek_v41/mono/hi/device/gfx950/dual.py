@@ -32,7 +32,9 @@ from contextlib import contextmanager
 HALF = 8192  # bytes from a region's copy 0 to its copy 1 (one run of the home rule)
 RUN_MASK = 0x3FFFE000  # the run bits of a byte offset that ``place`` spreads (offsets >= 1 GiB stay out of range)
 
-_state: dict | None = None  # while a dual program's stages are traced: roots, resources, memo
+_state: dict | None = (
+    None  # while a dual program's stages are traced: roots, resources, memo
+)
 
 
 @contextmanager
@@ -40,7 +42,9 @@ def emitting(on: bool):
     """The stages traced inside belong to a dual build (``on``) or not."""
     global _state
     before = _state
-    _state = {"roots": {}, "rsrc": {}, "memo": {}, "local": {}, "names": {}} if on else None
+    _state = (
+        {"roots": {}, "rsrc": {}, "memo": {}, "local": {}, "names": {}} if on else None
+    )
     try:
         yield
     finally:
@@ -143,9 +147,12 @@ def bound(addr, nbytes):
     r, (rv, spread, _) = hit
     import flydsl.expr as fx
 
-
     if not spread:
-        return nbytes + HALF if isinstance(nbytes, int) else fx.Int64(nbytes) + fx.Int64(HALF)
+        return (
+            nbytes + HALF
+            if isinstance(nbytes, int)
+            else fx.Int64(nbytes) + fx.Int64(HALF)
+        )
     # a resource from inside the region: its bytes lie up to twice their logical distance from the copy's start on
     return (fx.Int64(nbytes) + (fx.Int64(addr) - fx.Int64(rv))) * 2 + fx.Int64(2 * HALF)
 
@@ -165,7 +172,8 @@ def over(rsrc) -> bool:
 
 def place(rsrc, offset):
     """The byte offset (i32 ir.Value) of an access through ``rsrc`` at byte ``offset``: unchanged unless the resource
-    is over a spread dual region, where logical byte o (from the region copy's start) lies at o + (o & ~8191)."""
+    is over a spread dual region, where logical byte o (from the region copy's start) lies at o + (o & ~8191).
+    """
     hit = _hit(rsrc)
     if hit is None or not hit[2][1]:
         return offset
@@ -175,7 +183,9 @@ def place(rsrc, offset):
 
     addr, r, (rv, _, _) = hit
     rel = fx.Int32(offset)
-    if _ir(addr) != r:  # a resource over an address inside the region: its distance from the copy's start
+    if (
+        _ir(addr) != r
+    ):  # a resource over an address inside the region: its distance from the copy's start
         rel = rel + fx.Int32(fx.Int64(addr) - fx.Int64(rv))
     return (fx.Int32(offset) + (rel & RUN_MASK)).ir_value()
 
@@ -199,4 +209,6 @@ def other(rsrc):
 def global_access(addr) -> None:
     """Plain global loads / stores do not go through ``place`` / ``other``: refuse them on a dual region."""
     if _state is not None and _of_addr(addr) is not None:
-        raise ValueError("a global load / store of a dual region: use buffer_load / buffer_store")
+        raise ValueError(
+            "a global load / store of a dual region: use buffer_load / buffer_store"
+        )

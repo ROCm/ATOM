@@ -123,7 +123,9 @@ class _Plan:
     poll: int  # the pool's pair specs a poll batch (0: one batch a (channel, row))
     index_out: str  # the index keys' channel ("" without the index-key path)
     flag: bool  # some row overwrites the slot the step's first row reads: the .rd hand-off
-    qat: bool = True  # the cache entry's FP4 QAT (False: the rotated bf16 latent, unquantized)
+    qat: bool = (
+        True  # the cache entry's FP4 QAT (False: the rotated bf16 latent, unquantized)
+    )
 
     @property
     def rd(self) -> str:
@@ -135,9 +137,18 @@ class _Plan:
 
 def _slices(k, groups, c, s, batch):
     """Channel c of each (part channel, row) in ``groups``: the dot's ``s`` slice partials, added in slice order
-    (``GatheredDot``'s ``.sum``). ``batch``: pair specs per poll batch (0: one batch a group)."""
-    specs = [(k.mb[part], r * (s * HD) + i * HD + c, 1) for part, r in groups for i in range(s)]
-    got = [g for q in range(len(groups)) for g in mb.poll(specs[q * s : (q + 1) * s], k.tag)]
+    (``GatheredDot``'s ``.sum``). ``batch``: pair specs per poll batch (0: one batch a group).
+    """
+    specs = [
+        (k.mb[part], r * (s * HD) + i * HD + c, 1)
+        for part, r in groups
+        for i in range(s)
+    ]
+    got = [
+        g
+        for q in range(len(groups))
+        for g in mb.poll(specs[q * s : (q + 1) * s], k.tag)
+    ]
     out = []
     for q in range(len(groups)):
         v = fx.Float32(0.0)
@@ -160,7 +171,8 @@ def _e2m1(a):
 
 def _rope_lanes(v, c, first, cs):
     """RoPE of the bf16 value ``v`` held one a lane, adjacent lanes a pair, on lanes ``c >= first`` (cos, sin
-    ``cs`` of the lane's pair): the rotated value, bf16-rounded (lanes below ``first`` keep ``v``)."""
+    ``cs`` of the lane's pair): the rotated value, bf16-rounded (lanes below ``first`` keep ``v``).
+    """
     other = xshfl(v, 1)
     odd = (c & 1) == 1
     re, im = odd.select(other, v), odd.select(v, other)
@@ -201,14 +213,26 @@ def _index_key(k, t, p: _Plan, c, b, pos, loads, lat, emits):
     Lane c: wk row c // 4, K quarter c % 4 (``_index_loads``), summed with dot2 into 4 accumulators (the order of
     the reference's BF16 ``F.linear`` is not known; the bf16 key absorbs it)."""
     wk, cs_k, gamma = loads
-    lw, kb = HD, HD + HD // 2  # LDS (words): the latent as packed bf16 at lw, the 128 keys (f32) at kb
+    lw, kb = (
+        HD,
+        HD + HD // 2,
+    )  # LDS (words): the latent as packed bf16 at lw, the 128 keys (f32) at kb
     ci = fx.min(c, fx.Int32(IHD - 1))
-    _lds_put(k.lds + (lw + c // 2), bf16_pair(lat, xshfl(lat, 1)).bitcast(fx.Int32), (c & 1) == 0)
+    _lds_put(
+        k.lds + (lw + c // 2),
+        bf16_pair(lat, xshfl(lat, 1)).bitcast(fx.Int32),
+        (c & 1) == 0,
+    )
     gpu.barrier()
     o, kq = c // 4, c % 4
     acc = [fx.Float32(0.0)] * 4
     for i in range(16):
-        xv = fx.Vector(fx.ptr_load(k.lds + (lw + kq * 64 + 4 * i), result_type=fx.Vector.make_type(4, fx.Int32)))
+        xv = fx.Vector(
+            fx.ptr_load(
+                k.lds + (lw + kq * 64 + 4 * i),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+        )
         for e in range(4):
             acc[e] = dot2_bf16(wk[i][e], xv[e], acc[e])
     tot = butterfly((acc[0] + acc[1]) + (acc[2] + acc[3]), (1, 2))
@@ -219,7 +243,10 @@ def _index_key(k, t, p: _Plan, c, b, pos, loads, lat, emits):
     lane = c % NORM_LANES
     ss = fx.Float32(0.0)
     for w in range(4):
-        vals = [fx.Float32(fx.ptr_load(k.ldsf + (kb + 8 * (lane % 16) + 2 * w + e))) for e in range(2)]
+        vals = [
+            fx.Float32(fx.ptr_load(k.ldsf + (kb + 8 * (lane % 16) + 2 * w + e)))
+            for e in range(2)
+        ]
         word = bf16_pair(vals[0], vals[1]).bitcast(fx.Int32)
         word = (lane < 16).select(word, fx.Int32(0))
         ss = dot2_bf16(word, word, ss)
@@ -278,7 +305,9 @@ def _pool(k, t, p: _Plan):
     c = k.tid
     b, j = t // p.spec, t % p.spec
     pos = uniform(ld_i32(k.args[p.pos], b)) + j
-    live = paged.row_live(k, t)  # (a padded or dead request's row writes none of ATOM's storage)
+    live = paged.row_live(
+        k, t
+    )  # (a padded or dead request's row writes none of ATOM's storage)
     # plain loads first (independent of the dots): gamma, the RoPE pair, the state partner
     gw = ld_i32(k.args[p.aux], c // 2)
     g_lo, g_hi = bf2_f32(gw)
@@ -293,8 +322,12 @@ def _pool(k, t, p: _Plan):
     else:
         pslot = (pos + (p.slots - 1)) % p.slots
         si = _state_at(k, p, b, pslot) + c
-        st_kv = fx.Float32(bo.buffer_load(rsrc(k.args[p.kv_state]), si, vec_width=1, dtype=T.f32))
-        st_sc = fx.Float32(bo.buffer_load(rsrc(k.args[p.score_state]), si, vec_width=1, dtype=T.f32))
+        st_kv = fx.Float32(
+            bo.buffer_load(rsrc(k.args[p.kv_state]), si, vec_width=1, dtype=T.f32)
+        )
+        st_sc = fx.Float32(
+            bo.buffer_load(rsrc(k.args[p.score_state]), si, vec_width=1, dtype=T.f32)
+        )
         emits = (pos & 1) == 1
         # the partner (position P - 1): the step's previous row (its partials polled again), or the state (the
         # step's first row)
@@ -326,10 +359,14 @@ def _pool(k, t, p: _Plan):
     lane = c % NORM_LANES
     ss = fx.Float32(0.0)
     for w in range(4):
-        vals = [fx.Float32(fx.ptr_load(k.ldsf + (8 * lane + 2 * w + e))) for e in range(2)]
+        vals = [
+            fx.Float32(fx.ptr_load(k.ldsf + (8 * lane + 2 * w + e))) for e in range(2)
+        ]
         word = bf16_pair(vals[0], vals[1]).bitcast(fx.Int32)
         ss = dot2_bf16(word, word, ss)
-    tot = wave_sum(ss)  # every wave computes it (wave 0's is the one), no second barrier
+    tot = wave_sum(
+        ss
+    )  # every wave computes it (wave 0's is the one), no second barrier
     rstd = hw_rsq(tot * (1.0 / HD) + fx.Float32(p.eps))
     lat = bf16_round(y * rstd * gamma)
     # RoPE on the last 64 channels (adjacent pairs), at the group's first position
@@ -345,7 +382,11 @@ def _pool(k, t, p: _Plan):
     # the entry into ATOM's pool, in place: the owner's main row of entry pos // ratio (``paged``)
     addr = paged.row_addr(k, p.cache, b, pos // p.ratio, p.ratio) + fx.Int64(c * 2)
     ok = even & live
-    _store_entry(addr, bf16_pair(entry, nxt).bitcast(fx.Int32), ok if emits is None else ok & emits)
+    _store_entry(
+        addr,
+        bf16_pair(entry, nxt).bitcast(fx.Int32),
+        ok if emits is None else ok & emits,
+    )
     if p.index_out:
         _index_key(k, t, p, c, b, pos, iload, lat, emits)
     gpu.barrier()  # the next task reuses the LDS
@@ -363,25 +404,52 @@ class Compressor(Block):
                  slots: int = 0, index_out: Channel | None = None, kslices: int = 4,
                  tiles: int = 1, poll_batch: int = 0, eps: float = 1e-20, qat: bool = True):  # fmt: skip
         if ratio not in (1, 2):
-            raise ValueError(f"Compressor {name}: ratio 1 or 2 (DeepSeek-V4.1's), got {ratio}")
+            raise ValueError(
+                f"Compressor {name}: ratio 1 or 2 (DeepSeek-V4.1's), got {ratio}"
+            )
         if x.fmt is not Fmt.BF16 or x.flagged or x.width != HIDDEN:
-            raise ValueError(f"Compressor {name}: x is a tagged BF16 channel of width {HIDDEN}")
+            raise ValueError(
+                f"Compressor {name}: x is a tagged BF16 channel of width {HIDDEN}"
+            )
         for ch in (out, latent):
-            if ch is not None and (ch.fmt is not Fmt.BF16 or ch.flagged or ch.width != HD):
-                raise ValueError(f"Compressor {name}: out / latent are tagged BF16 channels of width {HD}")
-        if index_out is not None and (index_out.fmt is not Fmt.BF16 or index_out.flagged or index_out.width != IHD):
-            raise ValueError(f"Compressor {name}: index_out is a tagged BF16 channel of width {IHD}")
+            if ch is not None and (
+                ch.fmt is not Fmt.BF16 or ch.flagged or ch.width != HD
+            ):
+                raise ValueError(
+                    f"Compressor {name}: out / latent are tagged BF16 channels of width {HD}"
+                )
+        if index_out is not None and (
+            index_out.fmt is not Fmt.BF16 or index_out.flagged or index_out.width != IHD
+        ):
+            raise ValueError(
+                f"Compressor {name}: index_out is a tagged BF16 channel of width {IHD}"
+            )
         slots = slots or ratio
         if ratio == 2 and (not kv_state or not score_state or slots < 2):
-            raise ValueError(f"Compressor {name}: ratio 2 needs kv_state / score_state and 2 slots at least")
-        self.name, self.x, self.ratio, self.out, self.latent = name, x, ratio, out, latent
+            raise ValueError(
+                f"Compressor {name}: ratio 2 needs kv_state / score_state and 2 slots at least"
+            )
+        self.name, self.x, self.ratio, self.out, self.latent = (
+            name,
+            x,
+            ratio,
+            out,
+            latent,
+        )
         self.pos, self.rope, self.cache, self.cache_len = pos, rope, cache, cache_len
-        self.kv_state, self.score_state, self.slots, self.eps = kv_state, score_state, slots, eps
+        self.kv_state, self.score_state, self.slots, self.eps = (
+            kv_state,
+            score_state,
+            slots,
+            eps,
+        )
         self.wkv, self.wgate, self.aux = f"{name}.wkv", f"{name}.wgate", f"{name}.aux"
         self.index_out = index_out
         mk = lambda n, w: GatheredDot(f"{name}.{n}", x, w, Channel(f"{name}.{n}", HD, Fmt.F32),  # noqa: E731
                                       kslices=kslices, sum_stage=False, tiles=tiles)  # fmt: skip
-        self.dots = [mk("kv", self.wkv)] + ([mk("score", self.wgate)] if ratio == 2 else [])
+        self.dots = [mk("kv", self.wkv)] + (
+            [mk("score", self.wgate)] if ratio == 2 else []
+        )
         self.kslices, self.tiles, self.poll_batch = kslices, tiles, poll_batch
         # the cache entry's FP4 QAT (the official model's); False: the rotated bf16 latent as is (an engine's bf16
         # cache without the QAT, ATOM's). A numerics choice, not a schedule knob
@@ -389,7 +457,9 @@ class Compressor(Block):
 
     def plan(self, sc: Scenario) -> _Plan:
         spec = sc.spec
-        flag = self.ratio == 2 and any((j + 1) % self.slots == 0 for j in range(max(1, spec - self.slots), spec))
+        flag = self.ratio == 2 and any(
+            (j + 1) % self.slots == 0 for j in range(max(1, spec - self.slots), spec)
+        )
         return _Plan(self.name, sc.rows, spec, sc.batch, self.ratio, self.slots, self.kslices,
                      self.dots[0].part.name, self.dots[1].part.name if self.ratio == 2 else "", self.pos, self.rope,
                      self.aux, self.cache, self.cache_len, self.kv_state, self.score_state, self.out.name,
@@ -415,14 +485,18 @@ class Compressor(Block):
 
     def pack(self, layer) -> dict[str, torch.Tensor]:
         """``layer``: a dict of the layer's tensors as the checkpoint names them
-        (``attn.compressor.{wkv,wgate,norm}.weight``), any device; returns bf16 tensors on that device."""
+        (``attn.compressor.{wkv,wgate,norm}.weight``), any device; returns bf16 tensors on that device.
+        """
         bf = lambda n: layer[n].to(torch.bfloat16).contiguous()  # noqa: E731
         out = {self.wkv: bf("attn.compressor.wkv.weight")}
         if self.ratio == 2:
             out[self.wgate] = bf("attn.compressor.wgate.weight")
         aux = [bf("attn.compressor.norm.weight").flatten()]
         if self.index_out is not None:
-            aux += [pack_wk(bf("attn.indexer.wk.weight")).flatten(), bf("attn.indexer.k_norm.weight").flatten()]
+            aux += [
+                pack_wk(bf("attn.indexer.wk.weight")).flatten(),
+                bf("attn.indexer.k_norm.weight").flatten(),
+            ]
         out[self.aux] = torch.cat(aux)
         return out
 
@@ -430,9 +504,9 @@ class Compressor(Block):
 def pack_wk(wk: torch.Tensor) -> torch.Tensor:
     """wk [128, 512] -> [16 steps, 512 lanes, 8] (lane c: row c // 4, K (c % 4) x 128 + 8 i .. + 8 at step i): every
     load instruction of the pool's GEMV reads 8 KB contiguous across the CTA."""
-    return wk.view(IHD, 4, 16, 8).permute(2, 0, 1, 3).reshape(16, THREADS, 8).contiguous()
+    return (
+        wk.view(IHD, 4, 16, 8).permute(2, 0, 1, 3).reshape(16, THREADS, 8).contiguous()
+    )
 
 
 # ------------------------------------------------------------------ torch reference (the official arithmetic)
-
-

@@ -57,9 +57,13 @@ PREFETCH = 32
 def _prefetch(prefetch, rows: int | None, race: bool | str = False) -> int:
     if rows is None or rows <= 8:
         return PREFETCH
-    if rows > 30:  # the batch band's 36-48 rows (with KPARTS_ROWS' 10 slices): 16 units spill 3-5 VGPRs, 8 build
+    if (
+        rows > 30
+    ):  # the batch band's 36-48 rows (with KPARTS_ROWS' 10 slices): 16 units spill 3-5 VGPRs, 8 build
         return 8
-    if race and rows > 16:  # the race build: 24 units at 17-20 rows spill (18 rows: 4 VGPRs), 16 build
+    if (
+        race and rows > 16
+    ):  # the race build: 24 units at 17-20 rows spill (18 rows: 4 VGPRs), 16 build
         return 16
     return 16 if rows <= 16 else 24 if rows <= 20 else 16
 
@@ -72,7 +76,9 @@ KPARTS_ROWS: dict[int, int] = {25: 4, 31: 10}
 
 
 def _kparts(kparts, rows: int | None) -> int:
-    return max((v for r, v in KPARTS_ROWS.items() if rows is not None and rows >= r), default=0)
+    return max(
+        (v for r, v in KPARTS_ROWS.items() if rows is not None and rows >= r), default=0
+    )
 
 
 LEAD = 4  # ArgmaxHead: units before x's poll attempt
@@ -83,7 +89,9 @@ LATE, LATE_ROWS = "auto", 17
 
 def _late(late, rows: int | None) -> bool:
     late = LATE if late is None else late
-    return bool(rows is not None and rows >= LATE_ROWS) if late == "auto" else bool(late)
+    return (
+        bool(rows is not None and rows >= LATE_ROWS) if late == "auto" else bool(late)
+    )
 
 
 def head_blocks(tp: int = 1, chain: bool = False, key: str | None = None, layout: str | None = None,
@@ -101,13 +109,23 @@ def head_blocks(tp: int = 1, chain: bool = False, key: str | None = None, layout
     follows (``layer.residual_layout`` / ``chain_pend``; default the live ones), e.g. the draft's replicated chain.
     ``sample``: the head's sampling mode (``ArgmaxHead``); ``race``: with it, rows with T > 0 and top_p >= 1 drawn in
     the dot's epilogue (the hook's served head; "check": every row's logits kept)."""
-    lin, xq, xb = Channel("lin_h", HIDDEN, Fmt.BF16), Channel("xh", HIDDEN, Fmt.MXFP8), Channel("xhb", HIDDEN, Fmt.BF16)
+    lin, xq, xb = (
+        Channel("lin_h", HIDDEN, Fmt.BF16),
+        Channel("xh", HIDDEN, Fmt.MXFP8),
+        Channel("xhb", HIDDEN, Fmt.BF16),
+    )
     src = src or ("chain" if chain else "plain")
     if src == "chain" and tp < 2:
-        raise ValueError("chain: a TP chain (the previous launch's pushed MoE partials)")
-    spec = NormSpec(width=HIDDEN, eps=EPS, threads=320, wps=8, plain=True, plain_once=True)
+        raise ValueError(
+            "chain: a TP chain (the previous launch's pushed MoE partials)"
+        )
+    spec = NormSpec(
+        width=HIDDEN, eps=EPS, threads=320, wps=8, plain=True, plain_once=True
+    )
     if res_out is not None and src == "fused":
-        raise ValueError("res_out: the plain / chain sources (a fused head's R is the layer's own r_f)")
+        raise ValueError(
+            "res_out: the plain / chain sources (a fused head's R is the layer's own r_f)"
+        )
     from .layer import residual_layout
 
     # a sharded residual (``layer.RESIDUAL``): a chained / fused head's fold runs on the rank's columns (R_F's, the
@@ -117,14 +135,26 @@ def head_blocks(tp: int = 1, chain: bool = False, key: str | None = None, layout
     from .layer import chain_pend
 
     pend = chain_pend(tp, rows, knobs=knobs) if src == "chain" else "ffn_out"
-    out = {"res_gather": "hzg", "res_full": res_out} if shard and res_out else {"res_out": res_out}
-    seam = HCSeam("hz", "r_f", lin, "gate_f", "", "", "", pend=pend, mixes=False, **out, **rsd)
+    out = (
+        {"res_gather": "hzg", "res_full": res_out}
+        if shard and res_out
+        else {"res_out": res_out}
+    )
+    seam = HCSeam(
+        "hz", "r_f", lin, "gate_f", "", "", "", pend=pend, mixes=False, **out, **rsd
+    )
     from ..blocks.gfx950.mhc import GATHER_TILE
 
     return [
         seam,
         NormQuant(
-            "norm", lin, xq, "norm.g", bf16_out=xb, spec=spec, **({"src_gathered": GATHER_TILE} if shard else {})
+            "norm",
+            lin,
+            xq,
+            "norm.g",
+            bf16_out=xb,
+            spec=spec,
+            **({"src_gathered": GATHER_TILE} if shard else {}),
         ),
         ArgmaxHead(
             "head",
@@ -182,15 +212,25 @@ def head_program(name: str, sc, chain: bool = False, dyn: bool = False, **knobs)
     from .schedules import KEY_TP
     from ..plan.program import Program
 
-    stages = place([st for b in head_blocks(sc.tp, chain=chain, rows=sc.rows, **knobs) for st in b.stages(sc)])
-    wide = sc.tp > KEY_TP  # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: up to 12)
+    stages = place(
+        [
+            st
+            for b in head_blocks(sc.tp, chain=chain, rows=sc.rows, **knobs)
+            for st in b.stages(sc)
+        ]
+    )
+    wide = (
+        sc.tp > KEY_TP
+    )  # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: up to 12)
     # a sharded fold (the rank columns of R): SGPR spills into VGPR lanes allowed (B = 4: 1, 5 with sampling)
     spill = residual_layout(sc.tp, rows=sc.rows) == "sharded" or wide
     return Program(name, sc, stages, host_regions=chain_regions(sc), peer_first=chain_peer_first(sc.tp, rows=sc.rows),
                    sgpr_spill_ok=spill, dyn_rows=dyn)  # fmt: skip
 
 
-def pack(norm_w: torch.Tensor, head_w: torch.Tensor, layout: str | None = None, device="cuda") -> dict:
+def pack(
+    norm_w: torch.Tensor, head_w: torch.Tensor, layout: str | None = None, device="cuda"
+) -> dict:
     """The weight args of ``head_blocks``: ``norm.g`` and ``head.w`` (this rank's rows, ``layout``)."""
     return {"norm.g": norm_w.bfloat16().contiguous().to(device),
             "head.w": pack_head(head_w.bfloat16().to(device), layout or LAYOUT)}  # fmt: skip

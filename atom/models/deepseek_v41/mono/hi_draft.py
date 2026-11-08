@@ -15,6 +15,7 @@ import torch
 import triton
 
 from atom.models.deepseek_v41.mono import hi_bridge as ml
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.models.deepseek_v41.mono import hi_weights as hw
 from atom.models.deepseek_v41.mono.hi_compose import _DraftLaunch
 
@@ -115,7 +116,7 @@ class HiDraft:
         draft = drafter.model
         layers = tuple(draft.context_layers)
         if len(layers) != self.D.STAGES:
-            raise ValueError(
+            raise MonoUnsupported(
                 f"V4.1 mono hi draft: {len(layers)} draft stages, the hi runtime's CTX has {self.D.STAGES}"
             )
         self.cx_layers = [int(a.spec.layer_id) for a in layers]
@@ -123,7 +124,7 @@ class HiDraft:
             float(draft.mtp[0].main_norm.eps)
         }
         if eps != {float(self.D.EPS)}:
-            raise ValueError(
+            raise MonoUnsupported(
                 f"V4.1 mono hi draft: the draft's norm eps {eps} != the hi runtime's {self.D.EPS}"
             )
 
@@ -231,25 +232,19 @@ class HiDraft:
 
     def _ctx_after_target(self, cache, step, rows: int) -> None:
         """A served step's end (``end_step``): ``CTX`` inside the target graph, after the end-step launch (the taps
-        are written there), before the verdict; the shape recorded as served (``ctx_served``).
+        are written there), before the verdict. Every served step writes the draft's context rows here: the DSpark
+        proposer skips ATOM's write on it (``AttentionMetaData.served_by_round``).
         """
-        if rows not in self.ctx_programs or getattr(step, "replay", None) is not None:
-            return
-        self.ctx_keys[(rows, int(step.max_q_len))] = True
+        if rows not in self.ctx_programs or step.replay is not None:
+            raise RuntimeError(
+                f"V4.1 mono hi draft: a served step of {rows} rows without the draft's context write"
+            )
         table = self._ctx_table(rows, cache, step)
         if table is None:
             raise RuntimeError(
                 "V4.1 mono hi draft: a served step without the draft's taps bound"
             )
         self._ctx_launch(rows, table)
-
-    def ctx_served(self, step) -> bool:
-        """Host-side, TP-uniform: whether ``CTX`` writes this forward's rows (so ATOM's ``write_context_kv`` must
-        not): a shape a served forward recorded (eager, or the capture a replay replays), no bounded replay.
-        """
-        if step is None or getattr(step, "replay", None) is not None:
-            return False
-        return self.ctx_keys.get((int(step.width), int(step.max_q_len)), False)
 
     # ------------------------------------------------------------ the block draft
 

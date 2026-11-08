@@ -43,7 +43,11 @@ def _pick_retired(retired: list, nbytes: int, group) -> int | None:
     """The index of the smallest retired group on TP group ``group`` (the same object) of at least ``nbytes``, the
     earliest of equals; None when none fits. Every rank retires in program order, so every rank picks alike
     (``PeerGroup._reuse`` checks)."""
-    fits = [(g.nbytes, i) for i, g in enumerate(retired) if g.group is group and g.nbytes >= nbytes and g.local]
+    fits = [
+        (g.nbytes, i)
+        for i, g in enumerate(retired)
+        if g.group is group and g.nbytes >= nbytes and g.local
+    ]
     return min(fits)[1] if fits else None
 
 
@@ -59,17 +63,27 @@ class PeerGroup:
         self.nbytes = nbytes
         self.last_parity: int | None = None
         self.step = None  # the group's step counter (``runtime.kernel.Buffers``: one counter a group)
-        self.ids: set[int] = set()  # layer ids launched on the group since a bound Buffers' last bump
+        self.ids: set[int] = (
+            set()
+        )  # layer ids launched on the group since a bound Buffers' last bump
         self._opened: list[int] = []
         self.local = 0
         self._retired = False
-        self.layouts: dict[tuple, str] = {}  # the peer layouts bound to the group (``bind``) -> a program's name
+        self.layouts: dict[tuple, str] = (
+            {}
+        )  # the peer layouts bound to the group (``bind``) -> a program's name
         self._warned = False
         self.since_step = 0  # launches since the last ``end_step``
-        self._phase = 0  # the step phase as the host last set it (the launch order check's)
-        if self._reuse(nbytes, group):  # a retired group's memory (``close``), zeroed again
+        self._phase = (
+            0  # the step phase as the host last set it (the launch order check's)
+        )
+        if self._reuse(
+            nbytes, group
+        ):  # a retired group's memory (``close``), zeroed again
             return
-        self.local = _HIP.allocate_uncached(max(nbytes, 1))  # (whole 4 KiB pages, zeroed)
+        self.local = _HIP.allocate_uncached(
+            max(nbytes, 1)
+        )  # (whole 4 KiB pages, zeroed)
         mine = _HIP.get_ipc_handle(self.local)
         handles = [None] * self.tp
         dist.all_gather_object(handles, mine, group=group)
@@ -89,7 +103,9 @@ class PeerGroup:
         dist.all_gather_object(errors, error, group=group)
         if any(errors):
             self.close(barrier=False, now=True)
-            raise RuntimeError("peer memory exchange failed: " + "; ".join(e for e in errors if e))
+            raise RuntimeError(
+                "peer memory exchange failed: " + "; ".join(e for e in errors if e)
+            )
         # every rank's buffer, then the step phase (``end_step``; shared programs read its low word)
         self.addresses = torch.tensor(addresses + [0], dtype=torch.int64, device="cuda")
 
@@ -99,7 +115,10 @@ class PeerGroup:
         peer still polls); a group holding unshared programs of two layouts warns once (``plan.peer_alias`` names
         the overlapping slots of a launch order)."""
         pairs = {r.name: r.pairs for r in program.regions}
-        layout = (bool(program.peer_shared), tuple(sorted((n, o, pairs[n]) for n, o in program.peer.items())))
+        layout = (
+            bool(program.peer_shared),
+            tuple(sorted((n, o, pairs[n]) for n, o in program.peer.items())),
+        )
         self.layouts.setdefault(layout, program.name)
         unshared = [name for (shared, _), name in self.layouts.items() if not shared]
         if len(self.layouts) > 1 and unshared and not self._warned:
@@ -137,14 +156,23 @@ class PeerGroup:
 
         pick = _pick_retired(_RETIRED, nbytes, group)
         every = [None] * self.tp
-        dist.all_gather_object(every, None if pick is None else (pick, _RETIRED[pick].nbytes), group=group)
+        dist.all_gather_object(
+            every, None if pick is None else (pick, _RETIRED[pick].nbytes), group=group
+        )
         if pick is None or any(e != every[0] for e in every):
             return False
         old = _RETIRED.pop(pick)
-        self.nbytes, self.local, self._opened, self.addresses = old.nbytes, old.local, old._opened, old.addresses
+        self.nbytes, self.local, self._opened, self.addresses = (
+            old.nbytes,
+            old.local,
+            old._opened,
+            old.addresses,
+        )
         self.addresses[self.tp :].zero_()  # (a fresh step phase)
         old.local, old._opened = 0, []
-        _HIP.check(_HIP.library().hipMemset(self.local, 0, self.nbytes), operation="hipMemset")
+        _HIP.check(
+            _HIP.library().hipMemset(self.local, 0, self.nbytes), operation="hipMemset"
+        )
         torch.cuda.synchronize()
         dist.barrier(group=group)
         return True

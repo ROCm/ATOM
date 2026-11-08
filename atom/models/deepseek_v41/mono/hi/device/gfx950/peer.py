@@ -26,11 +26,15 @@ def _slot_bytes(k, region: str, src, tag=None) -> object:
     whose tag is ``tag`` (a ``prev_reads`` region: the previous launch's)."""
     pairs = k.peer_pairs[region]
     parity = fx.Int32(k.tag if tag is None else tag) & 1
-    if k.program.peer_shared:  # parity 1: the region's tp slots at top - offset - tp slots (``plan.peer_slot``)
+    if (
+        k.program.peer_shared
+    ):  # parity 1: the region's tp slots at top - offset - tp slots (``plan.peer_slot``)
         # (the group's step phase on top of the tag: a step of an odd number of launches flips it, so the next
         # step's first launch has the other parity than this one's last: ``PeerGroup.end_step``)
         parity = (fx.Int32(k.tag if tag is None else tag) + k.peer_phase) & 1
-        mirror = k.peer_top - fx.Int64(2 * k.program.peer[region] + k.tp * pairs * PAIR_BYTES)
+        mirror = k.peer_top - fx.Int64(
+            2 * k.program.peer[region] + k.tp * pairs * PAIR_BYTES
+        )
         return fx.Int64(parity) * mirror + fx.Int64(src * pairs) * PAIR_BYTES
     return fx.Int64((parity * k.tp + src) * pairs) * PAIR_BYTES
 
@@ -62,7 +66,9 @@ def to_rank(k, region: str, dst) -> Addr:
 
 def partial_pairs(fmt: str, rows: int, width: int) -> int:
     """Pairs a slot of a [rows, width] partial takes."""
-    if fmt == "f32p":  # 3 pairs a 4-element item (a _pack3 quad + a (value, tag) pair), a whole 16 B a slot
+    if (
+        fmt == "f32p"
+    ):  # 3 pairs a 4-element item (a _pack3 quad + a (value, tag) pair), a whole 16 B a slot
         items = rows * width // 4
         return 3 * items + (items & 1)
     return rows * width // (2 if fmt == "bf16" else 1)
@@ -96,9 +102,14 @@ def sum_partials(k, region: str, fmt: str, e, tp: int, tag=None) -> list:
     half = k.peer_pairs[region] // 2
     specs = []
     for src in range(tp):
-        specs += [(from_rank(k, region, src, tag), e // 2, 2), (from_rank(k, region, src, tag), half + e // 2, 2)]
+        specs += [
+            (from_rank(k, region, src, tag), e // 2, 2),
+            (from_rank(k, region, src, tag), half + e // 2, 2),
+        ]
     got = mb.poll(specs, tag)
-    parts = [[w.bitcast(fx.Float32) for w in got[2 * s] + got[2 * s + 1]] for s in range(tp)]
+    parts = [
+        [w.bitcast(fx.Float32) for w in got[2 * s] + got[2 * s + 1]] for s in range(tp)
+    ]
     acc = parts[0]
     for s in range(1, tp):
         acc = [acc[q] + parts[s][q] for q in range(4)]
@@ -117,10 +128,13 @@ def sum_partials(k, region: str, fmt: str, e, tp: int, tag=None) -> list:
 
 def shot2_pairs(rows: int, width: int, tp: int, fmt: str = "f32") -> int:
     """Pairs a slot of a two-shot region (``rs``: "f32" or "f32q"; ``ag``: "f32" or "bf16") takes. "f32q" (the
-    rs partials packed, ``push_rs(fmt="f32q")``): an owner's columns a whole number of 16-element groups."""
+    rs partials packed, ``push_rs(fmt="f32q")``): an owner's columns a whole number of 16-element groups.
+    """
     if fmt == "f32p":
         if (width // tp) % 4 or width % tp:
-            raise ValueError(f"rs 'f32p': width / tp a multiple of 4 (4-element items an owner), got {width} / {tp}")
+            raise ValueError(
+                f"rs 'f32p': width / tp a multiple of 4 (4-element items an owner), got {width} / {tp}"
+            )
         return partial_pairs("f32p", rows, width // tp)
     return rows * width // tp // (2 if fmt == "bf16" else 1)
 
@@ -132,7 +146,9 @@ def owned(e, width: int, tp: int):
     return col // q, (e // width) * q + col % q
 
 
-def push_rs(k, region: str, e, vals4, width: int, fmt: str = "f32", two_owners: bool = False) -> None:
+def push_rs(
+    k, region: str, e, vals4, width: int, fmt: str = "f32", two_owners: bool = False
+) -> None:
     """Shot 1: this rank's partial of elements ``e .. e + 3`` (one owner's columns) to their owner only. The owner must
     be the same for a wave's lanes (its slot address is wave-uniform): a wave's elements within one owner's columns.
     ``two_owners``: a wave's elements may cross one owner boundary (an owner's ``width / tp`` columns at least a
@@ -195,15 +211,22 @@ def read_ag(k, region: str, e, width: int, fmt: str = "f32", tag=None) -> list:
     from . import mailbox as mb
     from .ops import bf2_f32
 
-    if mb._live is not None:  # dyn_rows: a dead row reads the last live row's sums (its owner put no others)
+    if (
+        mb._live is not None
+    ):  # dyn_rows: a dead row reads the last live row's sums (its owner put no others)
         e = fx.min(fx.Int32(e), mb._live * width - 4)
     owner, el = owned(e, width, k.tp)
     pairs = k.peer_pairs[region]
-    a = from_rank(k, region, 0, tag)  # slot (parity, 0); the owner's slot follows at owner x pairs
+    a = from_rank(
+        k, region, 0, tag
+    )  # slot (parity, 0); the owner's slot follows at owner x pairs
     if fmt == "bf16":
         got = mb.poll([(a, owner * pairs + el // 2, 2)], tag)[0]
         return list(bf2_f32(got[0])) + list(bf2_f32(got[1]))
-    got = mb.poll([(a, owner * pairs + el // 2, 2), (a, owner * pairs + pairs // 2 + el // 2, 2)], tag)
+    got = mb.poll(
+        [(a, owner * pairs + el // 2, 2), (a, owner * pairs + pairs // 2 + el // 2, 2)],
+        tag,
+    )
     return [w.bitcast(fx.Float32) for w in got[0] + got[1]]
 
 
@@ -216,7 +239,8 @@ def read_ag(k, region: str, e, width: int, fmt: str = "f32", tag=None) -> list:
 
 def _pack3(x, y, z, tag):
     """Three 32-bit words + a tag as 4 words in two self-tagged 8 B halves: [x, y.lo16 << 16 | t] [y.hi16 << 16 | t, z]
-    (t = the tag's low 16 bits: stale data is at most two launches old, so 16 bits never alias)."""
+    (t = the tag's low 16 bits: stale data is at most two launches old, so 16 bits never alias).
+    """
     t = fx.Int32(tag) & 0xFFFF
     y = fx.Int32(y)
     return [fx.Int32(x), (y << 16) | t, (y & fx.Int32(-65536)) | t, fx.Int32(z)]
@@ -264,7 +288,8 @@ def _quad_word(k, region, e, v):
 def sum_partials3(k, region: str, e, tp: int, tag=None):
     """The ``tp`` ranks' elements ``e .. e + 3`` of both fields, re-loaded together until every quad's tag is
     current, each field summed in rank order (fp32). -> (a4, b4). ``tag``: the producing launch's (default this
-    launch's; a ``Stage.prev_reads`` region: the previous launch's, its parity slot and its tag)."""
+    launch's; a ``Stage.prev_reads`` region: the previous launch's, its parity slot and its tag).
+    """
     tag = k.tag if tag is None else tag
     from . import buffer_ops as bo
     from . import mailbox as mb
@@ -288,14 +313,19 @@ def sum_partials3(k, region: str, e, tp: int, tag=None):
     def pending(v):
         bad = None
         for q in range(3 * tp):
-            b = _tags_ok([v[4 * q + i] for i in range(4)], tag) == False  # noqa: E712 (an fx boolean)
+            # (`== False`: an fx boolean, which `not` would test as a Python object)
+            b = _tags_ok([v[4 * q + i] for i in range(4)], tag) == False  # noqa: E712
             bad = b if bad is None else bad | b
         return bad
 
     v = mb._spin(load_all, pending)
     a4, b4 = None, None
     for s in range(tp):
-        w = [x for q in range(3) for x in _unpack3([v[12 * s + 4 * q + i] for i in range(4)])]  # the 9 values
+        w = [
+            x
+            for q in range(3)
+            for x in _unpack3([v[12 * s + 4 * q + i] for i in range(4)])
+        ]  # the 9 values
         av = [w[i].bitcast(fx.Float32) for i in range(4)]
         bv = [w[4 + i].bitcast(fx.Float32) for i in range(4)]
         a4 = av if a4 is None else [a4[q] + av[q] for q in range(4)]
@@ -344,15 +374,30 @@ def _sum_p(k, region, e, tp, tag):
     def load_all():
         words = []
         for b in bases:
-            q = fx.Vector(bo.buffer_load(rsrc(b), i * 4, vec_width=4, dtype=T.i32, cache_modifier=CM_SYS))
-            c = fx.Vector(bo.buffer_load(rsrc(b), (2 * items + i) * 2, vec_width=2, dtype=T.i32, cache_modifier=CM_SYS))
+            q = fx.Vector(
+                bo.buffer_load(
+                    rsrc(b), i * 4, vec_width=4, dtype=T.i32, cache_modifier=CM_SYS
+                )
+            )
+            c = fx.Vector(
+                bo.buffer_load(
+                    rsrc(b),
+                    (2 * items + i) * 2,
+                    vec_width=2,
+                    dtype=T.i32,
+                    cache_modifier=CM_SYS,
+                )
+            )
             words += [q[j] for j in range(4)] + [c[0], c[1]]
         return fx.Vector.from_elements(words, fx.Int32)
 
     def pending(v):
         bad = None
         for s_ in range(tp):
-            stale = _tags_ok([v[6 * s_ + j] for j in range(4)], tag) == False  # noqa: E712 (an fx boolean)
+            # (`== False`: an fx boolean, which `not` would test as a Python object)
+            stale = (
+                _tags_ok([v[6 * s_ + j] for j in range(4)], tag) == False  # noqa: E712
+            )
             b = stale | (v[6 * s_ + 5] != fx.Int32(tag))
             bad = b if bad is None else bad | b
         return bad

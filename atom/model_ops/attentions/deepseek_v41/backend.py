@@ -40,7 +40,12 @@ from atom.models.deepseek_v41.bounded_replay import (
 )
 from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
 from atom.utils import CpuGpuBuffer, envs
-from atom.utils.forward_context import AttentionMetaData, AttnState, Context
+from atom.utils.forward_context import (
+    AttentionMetaData,
+    AttnState,
+    Context,
+    RoundService,
+)
 
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
@@ -253,13 +258,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
     step_planners = ()
     _decoder_replays = False
-    # A decode round's host extension, or None (DeepSeek-V4.1's hi path sets
-    # one: `atom/models/deepseek_v41/mono/round/`). `lean_layout(...)`
-    # before a step's layout: True lays it out lean (no compress plans, no
-    # step planners: nothing its forward runs reads them); `laid_out(...)`
-    # after it; `committed(metadata)` before the speculative commit (True: the
-    # forward committed it already).
-    decode_round = None
 
     def add_step_planner(self, planner):
         """Have `planner` lay its per-step tables out of each step's staged rows
@@ -722,18 +720,30 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         cached_until, histories) for a resumed prefill, else all None;
         ``scheduled``, each span's batch index, is read with it."""
         resumes, floors, cached_until, histories = replay_layout
-        hook = self.decode_round
-        lean = hook is not None and hook.lean_layout(
-            batch,
-            spans,
-            running_bs,
-            running_tokens,
-            max_q_len=max_q_len,
-            tentative=tentative,
-            is_prefill=is_prefill,
-            resumes=resumes,
-        )
         offset = sum(span.length for span in spans)
+        token_mask = self._token_mask(batch, spans, offset)
+        verifying = tentative and not batch.is_dummy_run and bool(spans)
+        # The step's one routing decision (`AttentionMetaData.served_by_round`):
+        # how much of it the model's decode round takes over. None for a runner
+        # without one (a plugin's).
+        decode_round = getattr(self.model_runner, "decode_round", None)
+        service = (
+            RoundService.NONE
+            if decode_round is None
+            else decode_round.service(
+                batch,
+                spans,
+                running_bs,
+                running_tokens,
+                max_q_len=max_q_len,
+                decode=verifying
+                or (not is_prefill and all(span.length == 1 for span in spans)),
+                tentative=tentative,
+                is_prefill=is_prefill,
+                resumes=resumes,
+                image_rows=not token_mask.all(),
+            )
+        )
         groups = getattr(self.model_runner, "h2d_groups", None)
         combined = None if groups is None else groups.get("v41_metadata")
         if combined is not None and combined.transport != "packed":
@@ -749,7 +759,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             running_bs,
             publication_group=combined,
         )
-        verifying = tentative and not batch.is_dummy_run and bool(spans)
         # One plan per ratio for the whole batch, into the fixed-address
         # buffers. `running_bs` / `max_q_len` cut both plans to a capacity that
         # depends on neither the batch nor its content -- the shape a capture
@@ -757,9 +766,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # A prefill passes neither and gets the tight grid.
         # `extra_write`: CSA2's K_pool is 1 or 2, narrower than a verify step,
         # so without the slack the plan drops what a rejection re-exposes.
+        # A lean step (`RoundService.LEAN`) has none: nothing it runs reads them.
         plans = (
-            {}  # `begin_step` keeps `{}` (None would build private ones)
-            if lean
+            None
+            if service >= RoundService.LEAN
             else self._build_compress_plans(
                 np.asarray([span.length for span in spans], dtype=np.int32),
                 np.asarray([span.end for span in spans], dtype=np.int32),
@@ -771,7 +781,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 defer_to=combined,
             )
         )
-        token_mask = self._token_mask(batch, spans, offset)
         step_group = (
             combined
             if combined is not None
@@ -794,7 +803,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             max_q_len=max_q_len,
             state_slot_out=state_slot_out,
             plans=plans,
-            planners=() if lean else self.step_planners,
+            planners=self.step_planners,
+            served_by_round=service,
             floors=floors,
             cached_until=cached_until,
             finals=(
@@ -829,11 +839,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 if spans
                 else ()
             ),
+            served_by_round=service,
         )
-        if hook is not None:
-            hook.laid_out(
-                batch, spans, rows, running_bs, running_tokens, metadata, lean
-            )
+        if decode_round is not None:
+            decode_round.laid_out(metadata)
         return metadata, step.positions
 
     def _publish_decoder(self, step, rows, cache, running_bs):
@@ -916,6 +925,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         scheduler_rows,
         image_mask=None,
         engram_embeddings=None,
+        served_by_round=RoundService.NONE,
     ):
         metadata = AttentionMetaData(
             cu_seqlens_q=step.cu_seqlens_q,
@@ -924,6 +934,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             state=AttnState.DECODE if step.decode else AttnState.PREFILL_PREFIX,
         )
         metadata.cache, metadata.step = cache, step
+        metadata.served_by_round = served_by_round
         metadata.block_table_rows = rows
         metadata.scheduler_rows = scheduler_rows
         # A bounded replay's `QueryRows`, while a layer runs on some rows only
@@ -1244,7 +1255,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             history_index=step.slots[: step.scheduled_bs],
         )
 
-    def _engram_step(self, step, cache, input_ids):
+    def _engram_step(self, step, cache, input_ids, served_by_round):
         """This forward's Engram inputs at fixed addresses, for the forward to
         run on (overlap only; a synthetic batch's live count is 0)."""
         if self.engram is None or self.engram.host.overlap is None:
@@ -1260,6 +1271,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             cursor=cache.cursor,
             history_index=step.slots,
             candidates=cache.tentative_staging.gpu if step.tentative else None,
+            served_by_round=bool(served_by_round),
         )
 
     def _write_engram_cursor(self, step, cache, batch):
@@ -1289,18 +1301,22 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         tokens = input_ids[: step.scheduled]
         # Before `prepare_state`: a device path defers its history readback.
         # A synthetic batch's slots are someone else's: it never moves them.
-        staged = self._engram_step(step, cache, input_ids)
+        staged = self._engram_step(step, cache, input_ids, metadata.served_by_round)
         batch = (
             None
             if staged is not None
             else self._engram_batch(step, cache, metadata, tokens)
         )
         on_device = not metadata.dummy and (staged is not None or batch is not None)
-        histories = (
-            np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
-            if metadata.dummy
-            else cache.prepare_state(step, histories=not on_device)
-        )
+        if metadata.dummy:
+            histories = np.full(
+                (step.scheduled_bs, self.geometry.history_size), -1, np.int64
+            )
+        elif metadata.served_by_round is RoundService.DEVICE:
+            # its start is the device's: no probe (`prepare_device_round_state`)
+            histories = cache.prepare_device_round_state(step, histories=not on_device)
+        else:
+            histories = cache.prepare_state(step, histories=not on_device)
         if self.engram is not None:
             prepared = self.engram.prepare(
                 step.requests,
@@ -1342,7 +1358,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             cache.pending.staged_on_device = True
 
     def commit_speculative_state(self, metadata, last_token_indices):
-        if self.decode_round is not None and self.decode_round.committed(metadata):
+        # A served step whose forward committed it already (the model's decode
+        # round's word on its own step).
+        if metadata.served_by_round and self.model_runner.decode_round.committed(
+            metadata
+        ):
             return
         if metadata.cache.pending is not None:
             metadata.cache.commit_tentative(metadata.step, last_token_indices)

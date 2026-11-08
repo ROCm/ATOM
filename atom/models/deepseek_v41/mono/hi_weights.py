@@ -28,6 +28,7 @@ import logging
 
 import torch
 
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.weights.layer import _unshuffle_linear_weight
 
 logger = logging.getLogger("atom")
@@ -151,7 +152,7 @@ def _expert_layout(experts, inter: int, tp: int) -> tuple:
             getattr(w13, "is_shuffled", False) and getattr(w2, "is_shuffled", False)
         )
     ):
-        raise ValueError(
+        raise MonoUnsupported(
             f"V4.1 mono hi weights: the routed experts are not in the gfx950 FlyDSL layout "
             f"(w13 {tuple(w13.shape)}, w2 {tuple(w2.shape)}, shuffled {getattr(w13, 'is_shuffled', False)})"
         )
@@ -164,7 +165,7 @@ def _expert_layout(experts, inter: int, tp: int) -> tuple:
     g2 = s2.numel() // (e * hidden)  # down's K groups, padded to a multiple of 8
     if (w2.shape[2] * 2 != pad or hidden != kb * 2 or live > pad or s13.numel() != e * n2 * groups
             or s2.numel() != e * hidden * g2 or g2 % 8 or g2 < pad // _GROUP or groups % 8):  # fmt: skip
-        raise ValueError(
+        raise MonoUnsupported(
             f"V4.1 mono hi weights: routed experts w13 {tuple(w13.shape)} / {tuple(s13.shape)}, w2 {tuple(w2.shape)} / "
             f"{tuple(s2.shape)} are not inter {inter} / tp {tp}"
         )

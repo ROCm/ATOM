@@ -67,17 +67,24 @@ def pack(
         "se_w1": mx("ffn.shared_experts.w1"), "se_w3": mx("ffn.shared_experts.w3"),
         "se_w2": mx("ffn.shared_experts.w2"),
     }  # fmt: skip
-    lay = SimpleNamespace(linears=mats, retained={"q_norm": w["attn.q_norm.weight"].bfloat16().contiguous().to(device)})
+    lay = SimpleNamespace(
+        linears=mats,
+        retained={"q_norm": w["attn.q_norm.weight"].bfloat16().contiguous().to(device)},
+    )
     args = {}
     for blk in window_layer_blocks(first=True, split=False, tp=tp, source=source):
         if isinstance(blk, Linear):
             args.update(blk.pack(lay))
-        if isinstance(blk, (Compressor, Indexer)):  # the source layer's own (replicated at TP)
+        if isinstance(
+            blk, (Compressor, Indexer)
+        ):  # the source layer's own (replicated at TP)
             args.update({k: v.to(device) for k, v in blk.pack(w).items()})
     per_rank = experts_n // tp
     intra = tp > 1 and kn["MOE_LAYOUT"] == "intra"
     fold = kn["SHARED"] == "fold" or (kn["SHARED"] == "auto" and tp > 1)
-    if local:  # (ATOM's experts: every expert's slice of the rank; its shared expert: the rank's slice)
+    if (
+        local
+    ):  # (ATOM's experts: every expert's slice of the rank; its shared expert: the rank's slice)
         if moe is None or (tp > 1 and not (intra and fold)):
             raise ValueError("rank-local tensors pack with the routed experts' packs, at MOE_LAYOUT 'intra' with the "
                              "shared expert folded")  # fmt: skip
@@ -89,11 +96,20 @@ def pack(
                                for n in ("w1", "w2", "w3")})
             for e in (range(experts_n) if intra else range(rank * per_rank, (rank + 1) * per_rank))
         ]  # fmt: skip
-        packed = pack_experts(experts, "moe", tp, rank, "intra") if intra else pack_experts(experts, "moe")
+        packed = (
+            pack_experts(experts, "moe", tp, rank, "intra")
+            if intra
+            else pack_experts(experts, "moe")
+        )
         args.update({k: v.to(device) for k, v in packed.items()})
     if fold:  # rank's slice of the full shared expert
         sh = SimpleNamespace(w1=mats["se_w1"], w3=mats["se_w3"], w2=mats["se_w2"])
-        args.update({k: v.to(device) for k, v in pack_shared(sh, "moe", tp, rank, local=local).items()})
+        args.update(
+            {
+                k: v.to(device)
+                for k, v in pack_shared(sh, "moe", tp, rank, local=local).items()
+            }
+        )
     f32 = lambda t: t.float().contiguous().to(device)  # noqa: E731
     bf = lambda t: t.bfloat16().contiguous().to(device)  # noqa: E731
     args.update({
@@ -104,6 +120,12 @@ def pack(
         "attn.sink": f32(part(w["attn.attn_sink"], 0, HEADS)), "router.w": bf(w["ffn.gate.weight"]),
         "router.bias": f32(w["ffn.gate.bias"]),
     })  # fmt: skip
-    if engram:  # the Engram gate half's weight (``Engram.pack``'s): q_weight k_weight, f32 [4, 5120]
-        args["eng.gw"] = (w["engram.q_weight"].float() * w["engram.k_weight"].float()).contiguous().to(device)
+    if (
+        engram
+    ):  # the Engram gate half's weight (``Engram.pack``'s): q_weight k_weight, f32 [4, 5120]
+        args["eng.gw"] = (
+            (w["engram.q_weight"].float() * w["engram.k_weight"].float())
+            .contiguous()
+            .to(device)
+        )
     return args

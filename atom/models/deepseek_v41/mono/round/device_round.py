@@ -13,8 +13,8 @@ block table (the scheduler allocates the whole draft span ahead), Engram's curso
 On a device-round step the next step's positions are advanced on the device instead: ``positions[i] = start + 1 + accepted + i``
 (``_advance_kernel``), where ``start`` is the previous served step's first position (the hook's ``pos``, written by its
 begin-step bridge) and ``accepted`` is the previous verdict's accepted-draft count (row 0 of the rejection sampler's verdict, a
-device tensor). The host builds the step's metadata without waiting, as if no draft had been rejected (a start no lower than
-the true one, inside the block table's span), publishes it, and the advance kernel overwrites the positions on the same
+device tensor). The host builds the step's metadata without waiting, as if no draft had been rejected (the status it
+hands ``prepare_input_ids`` is zeros: a start no lower than the true one, inside the block table's span), publishes it, and the advance kernel overwrites the positions on the same
 stream before any reader runs (Engram staging and the target graph come after it). The host collects the verdict after the
 target graph is launched, where the scheduler's output needs it. The stale-state probe (``cache.prepare_state``), which
 compares the restored cursor with the host's start, is skipped on these steps.
@@ -41,8 +41,9 @@ the host's (nothing to advance).
 ``prologue``: a device-round step's packed publications and ids fill are recorded and launched with its advance as
 one kernel.
 
-Called at the runner's and the builder's decode-round hooks (``round.HiRound``); the cache skips its probe on a
-step marked ``device_round``. Nothing changes with the hook off, or on any other step.
+Called at the runner's and the builder's decode-round hooks (``round.HiRound``); such a step's routing decision is
+``RoundService.DEVICE`` (``AttentionMetaData.served_by_round``), on which the builder takes the cache's device-round
+state (no probe). Nothing changes with the hook off, or on any other step.
 """
 
 from __future__ import annotations
@@ -53,6 +54,8 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+
+from atom.utils.forward_context import RoundService
 
 logger = logging.getLogger("atom")
 
@@ -189,17 +192,21 @@ class DeviceRound:
             else None
         )
         state.cur_served = False
-        # a device-round step's pre-target launches recorded until its advance
-        self.pro.arm(state.on)
+        # a device-round step's pre-target launches recorded until its advance; a decode step's publications read
+        # their pinned arenas directly
+        self.pro.arm(state.on, decode=n >= 1 and pre == 0)
 
     def spec_status(self):
-        """``prepare_input_ids``' status: none to wait for on a device-round step (``(None, None)``), the prefill's
-        zeros on a first step (each wait owed: ``after_forward``), else None (the queue's).
+        """``prepare_input_ids``' status: zeros on a device-round step (the step is built as if no draft had been
+        rejected: module docstring) and the prefill's zeros on a first step (each wait owed: ``after_forward``), else
+        None (the queue's).
         """
         state = self.state
         if state.on:
             state.owed = True  # taken after the target launch (``after_forward``), in the same queue order
-            return None, None
+            # one a request of the served step that left the verdict (this step's requests, in the same order)
+            zeros = np.zeros(len(state.cur_req), dtype=np.int32)
+            return zeros, zeros.copy()
         if state.first:
             state.owed = (
                 True  # the same, for the prefill's status: known (module docstring)
@@ -209,20 +216,21 @@ class DeviceRound:
             return zeros, zeros.copy()
         return None
 
-    def laid_out(self, running_bs, running_tokens, metadata) -> None:
-        """After the builder's layout (the lean host prep's mark first): a device-round step's positions advanced on
-        the device (with the prologue's recorded launches as one kernel) and the step marked (``step.device_round``:
-        the cache's probe skips it)."""
+    def laid_out(self, metadata) -> None:
+        """After the builder's layout: a device-round step's (``RoundService.DEVICE``) positions advanced on the
+        device (with the prologue's recorded launches as one kernel)."""
         state, hook, step = self.state, self.hook, metadata.step
-        lean = getattr(step, "lean_host", False)
+        running_bs, running_tokens = int(step.slots.shape[0]), step.width
         state.cur_served = (
-            lean and state.cur_req is not None and running_bs == len(state.cur_req)
+            metadata.served_by_round >= RoundService.LEAN
+            and state.cur_req is not None
+            and running_bs == len(state.cur_req)
         )
-        if not state.on:
+        if metadata.served_by_round is not RoundService.DEVICE:
             return
-        if not lean or state.advance_from is None:
+        if state.advance_from is None:
             raise RuntimeError(
-                "V4.1 mono: a device-round step whose builder did not take the lean path"
+                "V4.1 mono: a device-round step without the verdict it advances from"
             )
         # after the step's publication on this stream: every reader of the positions runs after this
         args = (
@@ -236,7 +244,6 @@ class DeviceRound:
             self.pro.advance(*args)
         else:
             advance(*args)
-        step.device_round = True
         state.steps += 1
 
     def note_verdict(self, out) -> None:

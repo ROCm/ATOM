@@ -45,6 +45,12 @@ Key entry points:
 - Server: `atom/entrypoints/openai_server.py`
 - Engine: `atom/model_engine/llm_engine.py` → `engine_core.py` → `scheduler.py` → `model_runner.py`
 - Models: `atom/models/` — registered in `atom/models/registry.py:support_model_arch_dict`
+- Model hooks: `atom/model_engine/model_hooks.py` — `VerifyHead` / `DecodeRound`, the
+  parts of a step a model may take over, resolved once at install into
+  `ModelRunner.verify_head` / `ModelRunner.decode_round` (None for other models);
+  `DecodeRound.service` is the step's one routing decision
+  (`AttentionMetaData.served_by_round`, `RoundService`) that the builder, its
+  cache, Engram staging, the DSpark proposer and the model's forward all read
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
 - Structured output: `atom/structured_output/` — request validation, schema compilation, grammar state and asynchronous token/mask transfers
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
@@ -114,7 +120,12 @@ Key entry points:
   hand-offs without a GPU with `FLYDSL_RUNTIME_ENABLE_CACHE=0 ARCH=gfx950
   python -m atom.models.<model>.mono.contract`; GLM-5.2's `contract.py` is the
   per-step input check only, and Kimi-K3 ships neither it nor a `check.py`
-  yet)
+  yet). DeepSeek-V4.1 also has the high-interactivity monokernels
+  (`ATOM_DSV41_MONO_HI`, on by default where `deepseek_v41/mono/hi_gate.py`
+  says they serve: MI355X, TP4, DSpark): one persistent FlyDSL launch a layer
+  (the runtime in `deepseek_v41/mono/hi/`), the host hook in `hi_runner.py` /
+  `hi_compose.py` / `hi_dispatch.py`, and the model hooks above in `round/`
+  (`HiRound`, `verify_head.HiVerifyHead`)
 - Diffusion: `atom/diffusion/` — framework at the top level (`pipeline.py`,
   `attention.py`, `ulysses.py`), engine in `engine/`, server in `entrypoints/`,
   and one package per model in `models/<family>/`. Extras: `pip install -e ".[diffusion]"`

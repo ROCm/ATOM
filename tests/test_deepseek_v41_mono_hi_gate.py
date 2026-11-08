@@ -250,3 +250,95 @@ def test_an_unknown_mode_is_an_error(mi355x, served, monkeypatch):
     monkeypatch.setenv("ATOM_DSV41_MONO_HI", "yes")
     with pytest.raises(ValueError, match="auto, 1, 0"):
         hi_gate.decide(served, _drafter(), _builder(), 0)
+
+
+@pytest.mark.parametrize(
+    "over, why",
+    [
+        (dict(enable_tbo=True), "two-batch overlap"),
+        (dict(enable_tbo_decode=True), "two-batch overlap"),
+        (dict(hf=dict(vocab_size=102400)), "geometry"),
+        (dict(hf=dict(rms_norm_eps=1e-6)), "geometry"),
+        (dict(hf=dict(sliding_window=256)), "geometry"),
+        (dict(hf=dict(dspark_target_layer_ids=[36, 37, 38, 39])), "geometry"),
+        (dict(hf=dict(engram_max_ngram_size=3)), "geometry"),
+    ],
+)
+def test_the_loaded_models_assumptions_are_the_gates(mi355x, served, over, why):
+    """What the hi programs assume of the model and the engine, answered before anything is built: the verify head's
+    vocabulary, the norms' eps, the window, the draft's taps, the Engram's n-grams; no two-batch overlap.
+    """
+    assert why in hi_gate.refusal(_config(served, **over), _drafter(), _builder(), 0)
+
+
+def test_triton_moe_keeps_atoms_path(mi355x, served, monkeypatch):
+    """``ATOM_USE_TRITON_MOE=1`` (recipes/DeepSeek-V4.md) lays the routed experts out for Triton, not the gfx950 FlyDSL
+    layout the hi path reads: "auto" stays on ATOM's path, "1" refuses."""
+    monkeypatch.setenv("ATOM_USE_TRITON_MOE", "1")
+    assert "ATOM_USE_TRITON_MOE" in hi_gate.refusal(served, _drafter(), _builder(), 0)
+    assert not hi_gate.decide(served, _drafter(), _builder(), 0)
+    monkeypatch.setenv("ATOM_DSV41_MONO_HI", "1")
+    with pytest.raises(RuntimeError, match="ATOM_USE_TRITON_MOE"):
+        hi_gate.decide(served, _drafter(), _builder(), 0)
+
+
+@pytest.fixture
+def dispatch_module(monkeypatch):
+    """``mono.dispatch`` with ATOM's own mono runners (FlyDSL kernels) stood in for: loaded fresh, dropped after."""
+    import importlib
+    import types
+
+    from aiter_stub import _drop
+
+    name = "atom.models.deepseek_v41.mono.dispatch"
+    saved = sys.modules.get(name)
+    for mod, cls in (
+        ("runner", "V41MonoDecodeRunner"),
+        ("draft_runner", "DraftMonoRunner"),
+    ):
+        stub = types.ModuleType(f"atom.models.deepseek_v41.mono.{mod}")
+        setattr(stub, cls, object)
+        monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    _drop(name)
+    try:
+        yield importlib.import_module(name)
+    finally:
+        _drop(name)
+        if saved is not None:
+            sys.modules[name] = saved
+
+
+@pytest.mark.parametrize("mode", ["auto", "1"])
+def test_a_model_the_hi_path_does_not_serve_falls_back(
+    mi355x, served, monkeypatch, caplog, dispatch_module, mode
+):
+    """A mismatch only the loaded model shows (``MonoUnsupported`` from ``install_hi``, e.g. the routed experts outside
+    the gfx950 FlyDSL layout): under "auto" ``install_mono_decode`` logs one line and keeps ATOM's mono decode; under
+    "1" it raises."""
+    import types
+
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    dispatch = dispatch_module
+
+    def install_hi(*a, **k):
+        raise MonoUnsupported("routed experts not in the gfx950 FlyDSL layout")
+
+    stub = types.ModuleType("atom.models.deepseek_v41.mono.hi_dispatch")
+    stub.install_hi = install_hi
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    monkeypatch.setenv("ATOM_DSV41_MONO_HI", mode)
+    monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
+    monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
+    monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    if mode == "1":
+        with pytest.raises(MonoUnsupported, match="FlyDSL layout"):
+            dispatch.install_mono_decode("model", served, None, metadata_builder=None)
+        return
+    with caplog.at_level(logging.INFO, logger="atom"):
+        got = dispatch.install_mono_decode("model", served, None, metadata_builder=None)
+    assert got == "atom mono"
+    assert [r.getMessage() for r in caplog.records] == [
+        "V4.1 mono hi off: routed experts not in the gfx950 FlyDSL layout"
+    ]

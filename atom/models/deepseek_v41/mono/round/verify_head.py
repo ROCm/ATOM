@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The hi path's verify head as ``ModelRunner``'s model-side verify head (``HiDecodeModel.verify_head``).
+"""The hi path's verify head: the model's ``verify_head`` (``model_engine.model_hooks.VerifyHead``).
 
 The hi programs run the LM head inside the target's forward (``hi_runner``: greedy, or one draw a sampled row) and
 write each row's pick into a persistent buffer. ``HiVerifyHead`` is the runner's seam onto it:
@@ -16,14 +16,14 @@ write each row's pick into a persistent buffer. ``HiVerifyHead`` is the runner's
   tool channel, relaxed acceptance or context parallelism (each reads the logits). A replayed graph's ids are the
   buffer its capture recorded (``captured``); an eager step's the head's last.
 - ``verdict``: the verdict of a head-served step (``post_verify.verdict``: the in-graph results, or one launch).
-- ``ids_identical_on_tp_ranks``: every rank holds the same ids (the head's candidates are exchanged, then every rank
-  picks alike), so the runner skips their broadcast.
 """
 
 from __future__ import annotations
 
 import functools
 import logging
+
+from atom.model_engine.model_hooks import VerifyHead
 
 logger = logging.getLogger("atom")
 
@@ -51,10 +51,8 @@ def _pcp_world_size() -> int:
     return get_pcp_world_size()
 
 
-class HiVerifyHead:
-    """The hook's verify head behind ``ModelRunner``'s seam (module docstring)."""
-
-    ids_identical_on_tp_ranks = True
+class HiVerifyHead(VerifyHead):
+    """The hook's verify head (module docstring)."""
 
     def __init__(self, hook) -> None:
         self.hook = hook

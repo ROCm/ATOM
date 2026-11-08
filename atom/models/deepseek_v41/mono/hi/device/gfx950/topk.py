@@ -107,7 +107,9 @@ WAVE = MI355X.wave
 INT_MIN = -(2**31)
 BINS = 256
 COPIES = 8  # pass 0's histogram copies (lane l counts into copy l % COPIES)
-H0_STRIDE = BINS + 4  # copies 4 words apart in bank: distinct banks for the 16-byte scans
+H0_STRIDE = (
+    BINS + 4
+)  # copies 4 words apart in bank: distinct banks for the 16-byte scans
 
 
 def _digits(index_bits: int) -> int:
@@ -144,7 +146,11 @@ class Lds:
         return self.cnt + 2 * WAVES
 
     @property
-    def xchg(self) -> int:  # rank's cross-wave exchanges (two buffers of THREADS keys), over the histograms
+    def xchg(
+        self,
+    ) -> (
+        int
+    ):  # rank's cross-wave exchanges (two buffers of THREADS keys), over the histograms
         return 0
 
     @property
@@ -156,7 +162,13 @@ class Lds:
         return self.junk + WAVE
 
 
-def lds_words(k: int, index_bits: int = 16, u_bits: int = 32, ranked: bool = True, in_order: bool = False) -> int:
+def lds_words(
+    k: int,
+    index_bits: int = 16,
+    u_bits: int = 32,
+    ranked: bool = True,
+    in_order: bool = False,
+) -> int:
     """LDS words :func:`select` and :func:`rank` use for ``k`` (k <= THREADS; any k >= 1 when
     ``ranked`` is False: :func:`select` and :func:`slot` only) over indices below
     ``2^index_bits`` (1 .. 32) and keys of ``u_bits`` (8, 16, 24 or 32) top bits; ``in_order``:
@@ -248,7 +260,9 @@ def _clear(lds, tid, lay):
             fx.ptr_store(fx.Int32(0), lds + (tid + i * THREADS))
 
 
-def _count(lds, hoff, us, vs, lane, prefix, mask, which, shift, copies, junk, valid_v=False):
+def _count(
+    lds, hoff, us, vs, lane, prefix, mask, which, shift, copies, junk, valid_v=False
+):
     """Count the keys (u != 0; ``valid_v``: v != 0) matching ``prefix`` under ``mask`` (two
     words) by their digit at ``shift`` of word ``which`` into the histogram at word ``hoff``
     (``copies`` > 1: lane l's copy), then the barrier. Branch-free: a key that does not count
@@ -277,7 +291,8 @@ def _digit(h, lane, copies, remain):
     """From histogram ``h`` (the sum of its ``copies``): the digit holding the
     ``remain``-th largest counted key, as one uniform word ``hit << 25 | whole << 24 |
     digit << 16 | remain'`` (``remain'`` the count still to take within the digit,
-    ``whole`` 1 if that is all of its keys; 0: fewer than ``remain`` keys were counted)."""
+    ``whole`` 1 if that is all of its keys; 0: fewer than ``remain`` keys were counted).
+    """
     v = _lds4(h, 252 - 4 * lane)
     for c in range(1, copies):
         w = _lds4(h + c * H0_STRIDE, 252 - 4 * lane)
@@ -289,7 +304,9 @@ def _digit(h, lane, copies, remain):
     for j in range(4):
         here = (above < remain) & (above + cnt[j] >= remain)
         whole = (above + cnt[j] == remain).select(fx.Int32(1 << 24), fx.Int32(0))
-        word = fx.Int32(1 << 25) | whole | ((255 - 4 * lane - j) << 16) | (remain - above)
+        word = (
+            fx.Int32(1 << 25) | whole | ((255 - 4 * lane - j) << 16) | (remain - above)
+        )
         pick = here.select(word, pick)
         above = above + cnt[j]
     return uniform(wave_max(pick))  # one lane at most holds the digit
@@ -298,7 +315,10 @@ def _digit(h, lane, copies, remain):
 def _passes(index_bits: int, u_bits: int = 32, v: bool = True):
     """The radix passes: (word, shift, (mask of u, mask of v) of the bits above the digit)."""
     out, mask = [], [0, 0]
-    for which, top, low in ((0, 32, 32 - u_bits), (1, 8 * _digits(index_bits) if v else 0, 0)):
+    for which, top, low in (
+        (0, 32, 32 - u_bits),
+        (1, 8 * _digits(index_bits) if v else 0, 0),
+    ):
         for shift in range(top - 8, low - 1, -8):
             out.append((which, shift, tuple(mask)))
             mask[which] |= 0xFF << shift
@@ -320,7 +340,20 @@ def _threshold(lds, us, vs, lane, k, lay, valid_v=False):
         h = lds + hoff
         copies = COPIES if p == 0 else 1
         if live != 0:
-            _count(lds, hoff, us, vs, lane, [p0, p1], mask, which, shift, copies, lay.junk, valid_v)
+            _count(
+                lds,
+                hoff,
+                us,
+                vs,
+                lane,
+                [p0, p1],
+                mask,
+                which,
+                shift,
+                copies,
+                lay.junk,
+                valid_v,
+            )
             got = _digit(h, lane, copies, remain)
             if const_expr(which == 0):
                 p0 = p0 | (((got >> 16) & 255) << shift)
@@ -333,10 +366,25 @@ def _threshold(lds, us, vs, lane, k, lay, valid_v=False):
 
 def _vs(idxs, index_bits, valid):
     vmask = _i32(_vmask(index_bits))
-    return [ok.select(vmask - fx.Int32(i), fx.Int32(0)) for ok, i in zip(valid, idxs, strict=True)]
+    return [
+        ok.select(vmask - fx.Int32(i), fx.Int32(0))
+        for ok, i in zip(valid, idxs, strict=True)
+    ]
 
 
-def select(lds, tid, lane, wave, us, idxs, k, index_bits=16, u_bits=32, valid=None, in_order=False):
+def select(
+    lds,
+    tid,
+    lane,
+    wave,
+    us,
+    idxs,
+    k,
+    index_bits=16,
+    u_bits=32,
+    valid=None,
+    in_order=False,
+):
     """The best ``min(k, valid)`` of the CTA's keys (``us`` / ``idxs``: this thread's; indices
     below ``2^index_bits``) to LDS slots ``0 .. n_out`` (unordered) as 64-bit sort keys.
     Returns ``n_out`` (uniform). Every thread of the CTA calls it; ``lds`` is the caller's
@@ -350,9 +398,13 @@ def select(lds, tid, lane, wave, us, idxs, k, index_bits=16, u_bits=32, valid=No
     keys equal to the k-th best's are told apart by the CTA prefix sum that places the slots
     (no passes over the index), and the slots come out in index order."""
     if in_order:
-        assert valid is not None and len(us) * THREADS < 1 << 16, "in_order: valid, fewer than 2^16 keys"
+        assert (
+            valid is not None and len(us) * THREADS < 1 << 16
+        ), "in_order: valid, fewer than 2^16 keys"
         lay = Lds(k, index_bits, u_bits, True)
-        return _select_in_order(lds, tid, lane, wave, us, _vs(idxs, index_bits, valid), k, lay)
+        return _select_in_order(
+            lds, tid, lane, wave, us, _vs(idxs, index_bits, valid), k, lay
+        )
     return _select(lds, tid, lane, wave, us, idxs, k, index_bits, u_bits, valid)
 
 
@@ -369,15 +421,21 @@ def _select(lds, tid, lane, wave, us, idxs, k, index_bits, u_bits, valid):
     tu, tv, _ = _threshold(lds, us, vs, lane, k, lay, valid_v)
     kept = fx.Int32(0)
     for e in range_constexpr(len(us)):
-        kept = kept + _kept(us[e], vs[e], tu, tv, valid_v).select(fx.Int32(1), fx.Int32(0))
+        kept = kept + _kept(us[e], vs[e], tu, tv, valid_v).select(
+            fx.Int32(1), fx.Int32(0)
+        )
     slot, total = cta_prefix(kept, lane, wave, lds + lay.cnt)
     for e in range_constexpr(len(us)):
-        u = fresh(us[e])  # recompute the masks here rather than hold the counting loop's
+        u = fresh(
+            us[e]
+        )  # recompute the masks here rather than hold the counting loop's
         v = _fresh_v(vs[e], valid_v)
         keep = _kept(u, v, tu, tv, valid_v)
         if keep:
             at = lds + (lay.slots + 2 * slot)
-            fx.ptr_store(fx.Vector.from_elements([v, u ^ fx.Int32(INT_MIN)], fx.Int32), at)
+            fx.ptr_store(
+                fx.Vector.from_elements([v, u ^ fx.Int32(INT_MIN)], fx.Int32), at
+            )
         slot = slot + keep.select(fx.Int32(1), fx.Int32(0))
     gpu.barrier()
     return total
@@ -406,13 +464,17 @@ def _select_in_order(lds, tid, lane, wave, us, vs, k, lay):
     before, total = cta_prefix(cnt, lane, wave, lds + lay.cnt)
     ab, tb = before & 0xFFFF, (before >> 16) & 0xFFFF
     for e in range_constexpr(len(us)):
-        u, v = fresh(us[e]), fresh(vs[e])  # the masks again here rather than held across the prefix sum
+        u, v = fresh(us[e]), fresh(
+            vs[e]
+        )  # the masks again here rather than held across the prefix sum
         ok = v != 0
         gt = ok & _above(u, tu)
         tie = ok & (u == tu)
         if gt | (tie & (tb < need)):
             at = lds + (lay.slots + 2 * (ab + fx.min(tb, need)))
-            fx.ptr_store(fx.Vector.from_elements([v, u ^ fx.Int32(INT_MIN)], fx.Int32), at)
+            fx.ptr_store(
+                fx.Vector.from_elements([v, u ^ fx.Int32(INT_MIN)], fx.Int32), at
+            )
         ab = ab + gt.select(fx.Int32(1), fx.Int32(0))
         tb = tb + tie.select(fx.Int32(1), fx.Int32(0))
     gpu.barrier()
@@ -427,7 +489,10 @@ def _fresh_v(v, valid_v):
 def _kept(u, v, tu, tv, valid_v=False):
     """``(u, v) >= (tu, tv)`` as unsigned words, and a key at all."""
     ok = (v if valid_v else u) != 0
-    return ok & (_above(u, tu) | ((u == tu) & ((v ^ fx.Int32(INT_MIN)) >= (tv ^ fx.Int32(INT_MIN)))))
+    return ok & (
+        _above(u, tu)
+        | ((u == tu) & ((v ^ fx.Int32(INT_MIN)) >= (tv ^ fx.Int32(INT_MIN))))
+    )
 
 
 def _key(words):
@@ -442,10 +507,17 @@ def _split(key):
 def slot(lds, tid, n_out, k, index_bits=16, u_bits=32, in_order=False):
     """Slot ``tid`` (any of ``0 .. k - 1``) unsorted: (u, index), (0, -1) past ``n_out``."""
     lay = Lds(k, index_bits, u_bits, in_order)
-    v = fx.Vector(fx.ptr_load(lds + (lay.slots + 2 * fx.min(tid, k - 1)), result_type=fx.Vector.make_type(2, fx.Int32)))
+    v = fx.Vector(
+        fx.ptr_load(
+            lds + (lay.slots + 2 * fx.min(tid, k - 1)),
+            result_type=fx.Vector.make_type(2, fx.Int32),
+        )
+    )
     have = tid < n_out
     idx = _i32(_vmask(index_bits)) - v[0]
-    return have.select(v[1] ^ fx.Int32(INT_MIN), fx.Int32(0)), have.select(idx, fx.Int32(-1))
+    return have.select(v[1] ^ fx.Int32(INT_MIN), fx.Int32(0)), have.select(
+        idx, fx.Int32(-1)
+    )
 
 
 # ------------------------------------------------------------------ rank
@@ -466,7 +538,8 @@ def _xchg_wave(key, lane, stride):
 
 def wave_sort(key, lane):
     """The wave's 64-bit keys (one a lane) sorted descending, as signed Int64: lane ``l``
-    ends with the ``l``-th largest. A bitonic network in registers (21 steps, no LDS)."""
+    ends with the ``l``-th largest. A bitonic network in registers (21 steps, no LDS).
+    """
     size = 2
     while size <= WAVE:
         stride = size // 2
@@ -496,7 +569,11 @@ def _greater(lds, base, key):
     pos = fx.Int32(0)
     for step in (32, 16, 8, 4, 2, 1, 1):  # binary lifting to 63, then the 64th
         at = pos + step - 1
-        v = fx.Vector(fx.ptr_load(lds + (base + 2 * at), result_type=fx.Vector.make_type(2, fx.Int32)))
+        v = fx.Vector(
+            fx.ptr_load(
+                lds + (base + 2 * at), result_type=fx.Vector.make_type(2, fx.Int32)
+            )
+        )
         pos = pos + (_key([v[0], v[1]]) > key).select(fx.Int32(step), fx.Int32(0))
     return pos
 
@@ -515,7 +592,12 @@ def rank(lds, tid, lane, wave, n_out, k, index_bits=16, u_bits=32):
     lay = Lds(k, index_bits, u_bits)
     tid, lane, wave = fresh(tid), fresh(lane), fresh_s(wave)
     have = tid < n_out
-    v = fx.Vector(fx.ptr_load(lds + (lay.slots + 2 * fx.min(tid, k - 1)), result_type=fx.Vector.make_type(2, fx.Int32)))
+    v = fx.Vector(
+        fx.ptr_load(
+            lds + (lay.slots + 2 * fx.min(tid, k - 1)),
+            result_type=fx.Vector.make_type(2, fx.Int32),
+        )
+    )
     key = _key([have.select(v[0], fx.Int32(0)), have.select(v[1], fx.Int32(INT_MIN))])
     waves = -(-k // WAVE)
     if waves < WAVES:  # the waves holding slots sort them (the others hold no key)
@@ -525,10 +607,15 @@ def rank(lds, tid, lane, wave, n_out, k, index_bits=16, u_bits=32):
     r = lane
     if waves > 1:
         w = _split(key)
-        fx.ptr_store(fx.Vector.from_elements(w, fx.Int32), lds + (lay.xchg + 2 * (wave * WAVE + lane)))
+        fx.ptr_store(
+            fx.Vector.from_elements(w, fx.Int32),
+            lds + (lay.xchg + 2 * (wave * WAVE + lane)),
+        )
         gpu.barrier()
         for o in range(waves):
-            r = r + (wave != o).select(_greater(lds, lay.xchg + 2 * WAVE * o, key), fx.Int32(0))
+            r = r + (wave != o).select(
+                _greater(lds, lay.xchg + 2 * WAVE * o, key), fx.Int32(0)
+            )
         gpu.barrier()
     w = _split(key)
     real = w[1] != fx.Int32(INT_MIN)  # u != 0
@@ -562,11 +649,15 @@ def wave_topk_won(n, k, vals, lane):
         for d in range_constexpr(per):
             i = lane * per + d
             av = (i < n) & (((won >> d) & 1) == 0)
-            better = av & ((bav == 0) | (sk[d] > bk))  # strict: the lowest index among equal keys
+            better = av & (
+                (bav == 0) | (sk[d] > bk)
+            )  # strict: the lowest index among equal keys
             bk = better.select(sk[d], bk)
             bi = better.select(i, bi)
             bav = better.select(1, bav)
-        kmax = butterfly((bav != 0).select(bk, Int32(INT_MIN)), (32, 16, 8, 4, 2, 1), fx.max)
+        kmax = butterfly(
+            (bav != 0).select(bk, Int32(INT_MIN)), (32, 16, 8, 4, 2, 1), fx.max
+        )
         # the lowest index holding kmax: lanes hold ascending index ranges and each lane's bi is its lowest, so the
         # first lane in the ballot has it (one ballot + readlane, not a second 6-step butterfly)
         m = ballot((bav != 0) & (bk == kmax))
@@ -581,7 +672,8 @@ def wave_topk_won_full(k, vals, lane):
     """``wave_topk_won`` when all 64 x len(vals) values are valid and ``k`` <= len(vals): the same winners.
     Each lane sorts its keys once (descending; equal keys keep index order: an odd-even transposition sort that
     swaps strictly out-of-order neighbours only), so a round reads the lanes' heads instead of rescanning their
-    values, and the winning lane pops its head (only the entries a later round can still reach)."""
+    values, and the winning lane pops its head (only the entries a later round can still reach).
+    """
     per = len(vals)
     assert k <= per, (k, per)
     hk = [order_key(v) ^ INT_MIN for v in vals]  # u32 order keys as signed order
@@ -597,7 +689,9 @@ def wave_topk_won_full(k, vals, lane):
         # lanes hold ascending index ranges and a lane's head is its lowest index holding its key: the first lane
         # in the ballot holds the round's winner
         m = ballot(hk[0] == kmax)
-        first = fx.min(fx.Int32(popcount((m & (fx.Int64(0) - m)) - fx.Int64(1))), Int32(63))
+        first = fx.min(
+            fx.Int32(popcount((m & (fx.Int64(0) - m)) - fx.Int64(1))), Int32(63)
+        )
         mine = lane == first
         won = mine.select(won | (Int32(1) << (hd[0] & 31)), won)
         for j in range_constexpr(k - 1 - it):
@@ -606,7 +700,9 @@ def wave_topk_won_full(k, vals, lane):
     return won
 
 
-THRESH_WORDS = 4 * WAVE + 4  # wave_topk_won_thresh's LDS: maxima, candidate pairs, won words, a junk pair (x4)
+THRESH_WORDS = (
+    4 * WAVE + 4
+)  # wave_topk_won_thresh's LDS: maxima, candidate pairs, won words, a junk pair (x4)
 
 
 def wave_topk_won_thresh(k, vals, lane, lds, at):
@@ -627,10 +723,15 @@ def wave_topk_won_thresh(k, vals, lane, lds, at):
     mx, cand, wonw, junk = at, at + WAVE, at + 3 * WAVE, at + 4 * WAVE
     fx.ptr_store(m, lds + (mx + lane))
     # empty slots: the lowest pair (never above a candidate)
-    fx.ptr_store(fx.Vector.from_elements([Int32(0), Int32(INT_MIN)], fx.Int32), lds + (cand + 2 * lane))
+    fx.ptr_store(
+        fx.Vector.from_elements([Int32(0), Int32(INT_MIN)], fx.Int32),
+        lds + (cand + 2 * lane),
+    )
     reach = Int32(0)
     for j in range_constexpr(0, WAVE, 4):
-        mj = fx.Vector(fx.ptr_load(lds + (mx + j), result_type=fx.Vector.make_type(4, fx.Int32)))
+        mj = fx.Vector(
+            fx.ptr_load(lds + (mx + j), result_type=fx.Vector.make_type(4, fx.Int32))
+        )
         for e in range_constexpr(4):
             reach = reach + (Int32(mj[e]) >= m).select(Int32(1), Int32(0))
     t = wave_max((reach >= k).select(m, Int32(INT_MIN)))
@@ -670,23 +771,43 @@ def _won_thresh_if(k, vals, lane, lds, cand, wonw, tot, ge, slot):
         won_rank(k, lane, lds, cand, wonw, tot, ge, slot)
     else:
         per = len(vals)
-        won = wave_topk_won_full(k, vals, lane) if k <= per else wave_topk_won(Int32(per * WAVE), k, vals, lane)
+        won = (
+            wave_topk_won_full(k, vals, lane)
+            if k <= per
+            else wave_topk_won(Int32(per * WAVE), k, vals, lane)
+        )
         fx.ptr_store(won, lds + (wonw + lane))
 
 
 def won_rank(k, lane, lds, cand, wonw, tot, ge, slot):
     """The ``tot`` (<= 64) candidates at LDS ``cand`` (one a lane: the 64-bit (key, 2^16 - 1 - index) pairs; empty
     slots the lowest pair): each one's rank, the count of candidates above it, the winners those of rank < k. Lane
-    ``l``'s won bits (bit d: its value d, a candidate ``ge[d]`` at ``slot[d]``) -> LDS ``wonw + l``."""
-    mine = _pair64(fx.Vector(fx.ptr_load(lds + (cand + 2 * lane), result_type=fx.Vector.make_type(2, fx.Int32))))
+    ``l``'s won bits (bit d: its value d, a candidate ``ge[d]`` at ``slot[d]``) -> LDS ``wonw + l``.
+    """
+    mine = _pair64(
+        fx.Vector(
+            fx.ptr_load(
+                lds + (cand + 2 * lane), result_type=fx.Vector.make_type(2, fx.Int32)
+            )
+        )
+    )
     above = Int32(0)
     for j in range_constexpr(0, WAVE, 2):
-        w = fx.Vector(fx.ptr_load(lds + (cand + 2 * j), result_type=fx.Vector.make_type(4, fx.Int32)))
+        w = fx.Vector(
+            fx.ptr_load(
+                lds + (cand + 2 * j), result_type=fx.Vector.make_type(4, fx.Int32)
+            )
+        )
         for e in range_constexpr(2):
-            above = above + (_pair64([w[2 * e], w[2 * e + 1]]) > mine).select(Int32(1), Int32(0))
+            above = above + (_pair64([w[2 * e], w[2 * e + 1]]) > mine).select(
+                Int32(1), Int32(0)
+            )
     wins = ballot((lane < tot) & (above < k))
     won = Int32(0)
     for d in range_constexpr(len(ge)):
-        hit = ge[d] & (((wins >> fx.Int64(fx.min(slot[d], Int32(WAVE - 1)))) & fx.Int64(1)) != fx.Int64(0))
+        hit = ge[d] & (
+            ((wins >> fx.Int64(fx.min(slot[d], Int32(WAVE - 1)))) & fx.Int64(1))
+            != fx.Int64(0)
+        )
         won = won | hit.select(Int32(1 << d), Int32(0))
     fx.ptr_store(won, lds + (wonw + lane))

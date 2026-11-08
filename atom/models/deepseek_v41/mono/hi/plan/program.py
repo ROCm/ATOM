@@ -56,15 +56,22 @@ from .trace import Space
 from ..target import MI355X, Target
 
 PAIR_BYTES = 8  # a (value, tag) pair
-HOST = "host"  # writer name of regions the host publishes before a launch (tests, shells)
+HOST = (
+    "host"  # writer name of regions the host publishes before a launch (tests, shells)
+)
 REGION_ALIGN = 256
 LAYER_SLOTS = 128  # launch tag = step * LAYER_SLOTS + layer + 1: layers 0..127 a step
 PEER_SLOTS = 2  # copies of a peer region by launch-tag parity (module docstring)
-PEERS_ARG, RANK_ARG = "_peers", "_rank"  # the ABI entries of a program with peer regions
+PEERS_ARG, RANK_ARG = (
+    "_peers",
+    "_rank",
+)  # the ABI entries of a program with peer regions
 OWN_ARG = "_own"  # ... and with ``Program.fast_entry``: this rank's peer buffer
 PEER_TOP_ARG = "_peer_top"  # ... and with ``Program.peer_shared``: the group's peer buffer bytes, as a value
 _SHARE_PEER_GROUPS = False  # ``share_peer_groups``: ``Program.peer_shared``'s default for programs planned from now
-DUAL_PAGE = 2 << 20  # dual-copy regions: the home rule's page (a region's runs lie in one page)
+DUAL_PAGE = (
+    2 << 20
+)  # dual-copy regions: the home rule's page (a region's runs lie in one page)
 DUAL_PAGES = 4  # dual-copy regions: pages of run area at most (the scratch header word: 8 bits, one an XCD, a page)
 DUAL_RUN = 8192  # dual-copy regions: a run of one home (copy 0 in the even runs of the area, copy 1 in the odd)
 DUAL_HEADER = 256  # dual-copy regions: bytes after the run area (kept free)
@@ -77,7 +84,8 @@ PRIVATE_HEADER = 256
 def share_peer_groups(on: bool = True) -> None:
     """Programs planned from now on that leave ``Program.peer_shared`` unset share their peer groups with programs of
     other peer layouts (module docstring): what an engine hook calls once, before it builds its programs, when it
-    launches several programs on one ``PeerGroup`` (a chain of layer kinds, a head, a drafter's stages)."""
+    launches several programs on one ``PeerGroup`` (a chain of layer kinds, a head, a drafter's stages).
+    """
     global _SHARE_PEER_GROUPS
     _SHARE_PEER_GROUPS = bool(on)
 
@@ -119,7 +127,8 @@ class LdsKeep:
     ``LdsCarry`` the planner does not place it, so it constrains nothing in the build; ``plan`` only refuses a stage
     between the writer and the last reader, on a CTA they share, whose arena reaches ``lo`` (it would overwrite the
     words: an inserted or re-placed stage). ``aware``: stages that keep
-    the layout (the block's own; their ``lds_words`` may cover the range). Plan-time only: not part of the build key."""
+    the layout (the block's own; their ``lds_words`` may cover the range). Plan-time only: not part of the build key.
+    """
 
     name: str
     lo: int
@@ -162,7 +171,9 @@ class Region:
     # drain then waits for the far copy). It must fit the run area (``PlanError``). ``numa_stages`` selects regions
     # this way.
     home: str = ""
-    single: bool = False  # updated with atomics: one copy in a ``Program.dual`` build (never a dual region)
+    single: bool = (
+        False  # updated with atomics: one copy in a ``Program.dual`` build (never a dual region)
+    )
     # row-major over the scenario's rows (``Channel.regions``): pair p is row p // (pairs // rows). Read only by a
     # ``Program.dyn_rows`` build (its dead rows' polls / puts are masked); 0: not row-major. Not part of the key.
     rows: int = 0
@@ -286,14 +297,26 @@ class Program:
     scratch_bytes: int = 0
     lds_words: int = 0
     args: tuple[str, ...] = ()  # pointer-table ABI, in order
-    peer: dict[str, int] = field(default_factory=dict)  # peer region -> byte offset in the peer buffer
+    peer: dict[str, int] = field(
+        default_factory=dict
+    )  # peer region -> byte offset in the peer buffer
     peer_bytes: int = 0  # the peer buffer a rank needs (0: no peer regions)
     lds_layout: LdsLayout | None = None  # the arena and the emitter's reserved words
-    dual_bytes: int = 0  # dual regions: the run area at the start of scratch (both copies), then DUAL_HEADER bytes
-    dual_spread: tuple[str, ...] = ()  # the dual regions larger than a run (their accesses are placed)
-    dual_regions: tuple[str, ...] = ()  # the regions laid out with two copies (a selected one may not fit)
-    private: dict[str, int] = field(default_factory=dict)  # Region.single scratch regions -> byte offset in priv
-    private_bytes: int = 0  # the private buffer a launch needs (PRIVATE_HEADER at least)
+    dual_bytes: int = (
+        0  # dual regions: the run area at the start of scratch (both copies), then DUAL_HEADER bytes
+    )
+    dual_spread: tuple[
+        str, ...
+    ] = ()  # the dual regions larger than a run (their accesses are placed)
+    dual_regions: tuple[
+        str, ...
+    ] = ()  # the regions laid out with two copies (a selected one may not fit)
+    private: dict[str, int] = field(
+        default_factory=dict
+    )  # Region.single scratch regions -> byte offset in priv
+    private_bytes: int = (
+        0  # the private buffer a launch needs (PRIVATE_HEADER at least)
+    )
 
     @property
     def dual_on(self) -> bool:
@@ -328,7 +351,9 @@ class Program:
             out.append("fast_entry")
         if self.dyn_rows:  # keyed only when on
             out.append("dyn_rows")
-        if self.dual_on:  # keyed only when on (the layout itself is in the offsets below)
+        if (
+            self.dual_on
+        ):  # keyed only when on (the layout itself is in the offsets below)
             out.append(f"dual@{self.dual_bytes}:" + ",".join(self.dual_spread))
         if self.target.grid != self.target.cus:  # keyed only when not one CTA per CU
             out.append(f"grid:{self.target.grid}")
@@ -336,16 +361,29 @@ class Program:
         out += list(self.args)
         out += [f"host:{r.name}:{r.pairs}" for r in self.host_regions]
         for s in self.stages:
-            out += [s.name, s.tasks, s.base, s.lds_words, repr(stable(s.key)), getattr(s.emit, "__qualname__", "")]
+            out += [
+                s.name,
+                s.tasks,
+                s.base,
+                s.lds_words,
+                repr(stable(s.key)),
+                getattr(s.emit, "__qualname__", ""),
+            ]
             if s.idle is not None:
                 out.append(f"idle:{stable(s.idle)!r}")
             if s.hold:  # keyed only when used: other programs keep their key
-                out.append(f"hold:{s.hold}" + (f":{s.hold_where}" if s.hold_where else ""))
+                out.append(
+                    f"hold:{s.hold}" + (f":{s.hold_where}" if s.hold_where else "")
+                )
             if s.pre is not None:  # keyed only when used
-                out.append(f"pre:{getattr(getattr(s.pre, 'func', s.pre), '__qualname__', '')}")
+                out.append(
+                    f"pre:{getattr(getattr(s.pre, 'func', s.pre), '__qualname__', '')}"
+                )
             if s.prev_reads:  # keyed only when used: other programs keep their key
                 out.append(f"prev:{','.join(s.prev_reads)}")
-            if s.carry:  # keyed only when used (":early:None": the text of the keys before, kept)
+            if (
+                s.carry
+            ):  # keyed only when used (":early:None": the text of the keys before, kept)
                 out.append(f"carry:{stable(s.carry)!r}:early:None")
             out += [
                 f"{r.name}:{r.pairs}:{r.space.value}:{r.exchange}:{','.join(r.writers)}"
@@ -354,7 +392,9 @@ class Program:
             ]
         out += [f"{k}@{v}" for k, v in sorted(self.scratch.items())]
         if self.peer:  # keyed only with peer regions: TP1 programs keep their key
-            out += [f"peer:{k}@{v}" for k, v in sorted(self.peer.items())] + [f"peer_bytes:{self.peer_bytes}"]
+            out += [f"peer:{k}@{v}" for k, v in sorted(self.peer.items())] + [
+                f"peer_bytes:{self.peer_bytes}"
+            ]
             if self.peer_shared:  # keyed only when on
                 out.append("peer_shared")
         if self.lds_layout is not None and self.lds_layout.carried:
@@ -372,7 +412,9 @@ class Program:
         ]
         for s in self.stages:
             writes = ", ".join(f"{r.name}[{r.pairs}]" for r in s.writes)
-            lines.append(f"  {s.name:<16} tasks {s.tasks:>4} base {s.base:>3} lds {s.lds_words * 4:>6} B  -> {writes}")
+            lines.append(
+                f"  {s.name:<16} tasks {s.tasks:>4} base {s.base:>3} lds {s.lds_words * 4:>6} B  -> {writes}"
+            )
         if self.dual_on:
             lines.append(f"  dual: {len(self.dual_regions)} regions, run area {self.dual_bytes} B, spread "
                          f"{', '.join(self.dual_spread) or '-'}")  # fmt: skip
@@ -386,7 +428,9 @@ class PlanError(ValueError):
 
 def _numa_auto(r: Region, regions: set[str], max_bytes: int) -> bool:
     stem = r.name.rsplit(".", 1)[0] if r.name.endswith((".q", ".s")) else r.name
-    dense = f"{stem}.f" in regions and not r.name.endswith(".f")  # a FLAG channel's payload (untagged)
+    dense = f"{stem}.f" in regions and not r.name.endswith(
+        ".f"
+    )  # a FLAG channel's payload (untagged)
     return r.pairs * PAIR_BYTES <= max_bytes and not dense and "ctr" not in r.name
 
 
@@ -394,14 +438,17 @@ def _dual_size(r: Region) -> int:
     return -(-r.pairs * PAIR_BYTES // REGION_ALIGN) * REGION_ALIGN
 
 
-def _dual_pack(regions: list[Region], pages: int = DUAL_PAGES) -> tuple[dict[str, int], list[Region], tuple, int]:
+def _dual_pack(
+    regions: list[Region], pages: int = DUAL_PAGES
+) -> tuple[dict[str, int], list[Region], tuple, int]:
     """The run area's layout of ``regions`` (in this order of preference) -> (copy 0 offsets, the regions that do not
     fit, the spread ones, the area's bytes).
 
     The area is a sequence of 16 KiB slots [copy 0 run | copy 1 run]: a region up to a run long sits in one run
     (first fit, 256 B aligned), a longer one takes whole consecutive slots (logical byte o at 2 (o & ~8191) + o %
     8192, ``device.gfx950.dual``). Copy 1 is DUAL_RUN bytes after copy 0. A region's slots lie in one
-    DUAL_PAGE (the page whose runs alternate homes); the area takes up to ``pages`` pages."""
+    DUAL_PAGE (the page whose runs alternate homes); the area takes up to ``pages`` pages.
+    """
     slot, fill = 2 * DUAL_RUN, []  # fill[i]: bytes used of slot i's run
     per = DUAL_PAGE // slot  # slots a page
     offs, out, spread = {}, [], []
@@ -410,13 +457,19 @@ def _dual_pack(regions: list[Region], pages: int = DUAL_PAGES) -> tuple[dict[str
         if size > DUAL_RUN:
             n = -(-size // DUAL_RUN)
             at = len(fill)
-            if at % per + n > per:  # not across a page boundary: the next page (the skipped slots stay free)
+            if (
+                at % per + n > per
+            ):  # not across a page boundary: the next page (the skipped slots stay free)
                 at = -(-at // per) * per
             if n > per or at + n > pages * per:
                 out.append(r)
                 continue
             offs[r.name] = at * slot
-            fill += [0] * (at - len(fill)) + [DUAL_RUN] * (n - 1) + [size - (n - 1) * DUAL_RUN]
+            fill += (
+                [0] * (at - len(fill))
+                + [DUAL_RUN] * (n - 1)
+                + [size - (n - 1) * DUAL_RUN]
+            )
             spread.append(r.name)
             continue
         i = next((i for i, f in enumerate(fill) if f + size <= DUAL_RUN), None)
@@ -437,12 +490,15 @@ def _dual_order(regions: list[Region]) -> list[Region]:
     return sorted(regions, key=lambda r: (not r.home, -r.pairs))
 
 
-def numa_stages(stages: list[Stage], names: tuple[str, ...], extra: tuple[Region, ...] = ()) -> list[Stage]:
+def numa_stages(
+    stages: list[Stage], names: tuple[str, ...], extra: tuple[Region, ...] = ()
+) -> list[Stage]:
     """``stages`` (in place) with the named regions, and with ``auto[:KiB]`` every small tagged scratch region
     put as "numa2" (dual copies, ``Region.home``). For a composition that turns dual copies on for its
     programs; ``extra``: other regions of the program (host regions), to tell a FLAG payload by its sibling flag
     region. The automatic candidates are taken smallest first while their bytes fit one 2 MiB page (one copy each)
-    and every chosen region still fits the run area (named ones always; ``plan`` raises if they do not fit)."""
+    and every chosen region still fits the run area (named ones always; ``plan`` raises if they do not fit).
+    """
     regions = {r.name for r in extra} | {r.name for s in stages for r in s.writes}
     auto = next((n for n in names if n.split(":")[0] == "auto"), None)
     max_bytes = (int(auto.split(":")[1]) if auto and ":" in auto else 64) << 10
@@ -451,10 +507,19 @@ def numa_stages(stages: list[Stage], names: tuple[str, ...], extra: tuple[Region
         return any(r.name == n or r.name.startswith(n + ".") for n in names)
 
     def pick(r):
-        return r.space is Space.SCRATCH and not r.home and (named(r) or (auto and _numa_auto(r, regions, max_bytes)))
+        return (
+            r.space is Space.SCRATCH
+            and not r.home
+            and (named(r) or (auto and _numa_auto(r, regions, max_bytes)))
+        )
 
-    cands = sorted({r.name: r for s in stages for r in s.writes if pick(r)}.values(), key=lambda r: r.pairs)
-    old = [r for s in stages for r in s.writes if r.home]  # already dual: they keep their place in the area
+    cands = sorted(
+        {r.name: r for s in stages for r in s.writes if pick(r)}.values(),
+        key=lambda r: r.pairs,
+    )
+    old = [
+        r for s in stages for r in s.writes if r.home
+    ]  # already dual: they keep their place in the area
     chosen = [r for r in cands if named(r)]
     budget = DUAL_PAGE - DUAL_HEADER - sum(_dual_size(r) for r in chosen)
     for r in cands:
@@ -466,7 +531,9 @@ def numa_stages(stages: list[Stage], names: tuple[str, ...], extra: tuple[Region
             budget -= _dual_size(r)
     keep = {r.name for r in chosen}
     for s in stages:
-        s.writes = tuple(replace(r, home="numa2") if r.name in keep else r for r in s.writes)
+        s.writes = tuple(
+            replace(r, home="numa2") if r.name in keep else r for r in s.writes
+        )
     return stages
 
 
@@ -476,10 +543,14 @@ def _dual_layout(program: Program, regions: list[Region]) -> list[Region]:
     a region that asks for copies (``Region.home``) must fit."""
     dual = [r for r in regions if program.is_dual(r)]
     pages = DUAL_PAGES
-    offs, out, program.dual_spread, program.dual_bytes = _dual_pack(_dual_order(dual), pages)
+    offs, out, program.dual_spread, program.dual_bytes = _dual_pack(
+        _dual_order(dual), pages
+    )
     bad = [r.name for r in out if r.home]
     if bad:
-        raise PlanError(f"{program.name}: dual-copy regions {bad} do not fit the run area ({DUAL_PAGES} pages)")
+        raise PlanError(
+            f"{program.name}: dual-copy regions {bad} do not fit the run area ({DUAL_PAGES} pages)"
+        )
     program.scratch.update(offs)
     program.dual_regions = tuple(r.name for r in dual if r.name in offs)
     return [r for r in regions if r.name not in offs]
@@ -494,17 +565,32 @@ def plan(program: Program) -> Program:
     off = 0
     regions = program.regions
     if len({r.name for r in regions}) != len(regions):
-        raise PlanError("a region is declared by two stages; declare it once with several writers")
+        raise PlanError(
+            "a region is declared by two stages; declare it once with several writers"
+        )
     tp = program.scenario.tp
     peer_off = 0
     if program.peer_shared is None:
         program.peer_shared = _SHARE_PEER_GROUPS
-    copies = 1 if program.peer_shared else PEER_SLOTS  # (shared: the parity-1 copies mirrored from the top)
+    copies = (
+        1 if program.peer_shared else PEER_SLOTS
+    )  # (shared: the parity-1 copies mirrored from the top)
     first = {n: i for i, n in enumerate(program.peer_first)}
-    regions = sorted(regions, key=lambda r: (0, first[r.name]) if r.space is Space.PEER and r.name in first else (1, 0))
+    regions = sorted(
+        regions,
+        key=lambda r: (
+            (0, first[r.name]) if r.space is Space.PEER and r.name in first else (1, 0)
+        ),
+    )
     for r in regions:
-        if r.home and (r.home != "numa2" or r.space is not Space.SCRATCH or r in program.host_regions):
-            raise PlanError(f"region {r.name}: home {r.home!r} (only 'numa2', scratch regions a stage writes)")
+        if r.home and (
+            r.home != "numa2"
+            or r.space is not Space.SCRATCH
+            or r in program.host_regions
+        ):
+            raise PlanError(
+                f"region {r.name}: home {r.home!r} (only 'numa2', scratch regions a stage writes)"
+            )
     program.dual_bytes, program.dual_spread, program.dual_regions = 0, (), ()
     # the atomics' regions in the private buffer (the scratch may be shared with other programs: module docstring)
     priv_off, program.private = PRIVATE_HEADER, {}
@@ -530,7 +616,11 @@ def plan(program: Program) -> Program:
         program.scratch[r.name] = off
         off += r.pairs * PAIR_BYTES
     program.scratch_bytes = -(-off // REGION_ALIGN) * REGION_ALIGN
-    program.peer_bytes = -(-peer_off // REGION_ALIGN) * REGION_ALIGN * (PEER_SLOTS if program.peer_shared else 1)
+    program.peer_bytes = (
+        -(-peer_off // REGION_ALIGN)
+        * REGION_ALIGN
+        * (PEER_SLOTS if program.peer_shared else 1)
+    )
     if not program.peer:  # (no peer regions: nothing to share)
         program.peer_shared = False
     program.lds_words = max([s.lds_words for s in program.stages] + [0])
@@ -538,7 +628,9 @@ def plan(program: Program) -> Program:
     words = -(-max(program.lds_words, top, 4) // 4) * 4  # 16 B aligned
     program.lds_layout = LdsLayout(program.lds_words, words, carried)
     if program.lds_layout.words * 4 > t.lds_bytes:
-        raise PlanError(f"LDS {program.lds_layout.words * 4} B (stages {program.lds_words * 4} B) > {t.lds_bytes} B")
+        raise PlanError(
+            f"LDS {program.lds_layout.words * 4} B (stages {program.lds_words * 4} B) > {t.lds_bytes} B"
+        )
     nxt = 0
     for s in program.stages:
         if s.tasks < 1:
@@ -565,13 +657,17 @@ def carry_interval(stages: list[Stage], i: int, c: LdsCarry) -> tuple[int, int]:
     index = {s.name: j for j, s in enumerate(stages)}
     missing = [r for r in c.readers if r not in index]
     if missing:
-        raise PlanError(f"carried LDS {c.name} of {stages[i].name}: no reader stage {missing}")
+        raise PlanError(
+            f"carried LDS {c.name} of {stages[i].name}: no reader stage {missing}"
+        )
     if not c.readers:
         raise PlanError(f"carried LDS {c.name} of {stages[i].name} has no readers")
     last = max(index[r] for r in c.readers)
     for r in c.readers:
         if index[r] <= i:
-            raise PlanError(f"carried LDS {c.name}: reader {r} does not run after its writer {stages[i].name}")
+            raise PlanError(
+                f"carried LDS {c.name}: reader {r} does not run after its writer {stages[i].name}"
+            )
     return i, last
 
 
@@ -585,7 +681,8 @@ def carry_spans(program: Program, i: int, c: LdsCarry) -> dict[int, set[int]]:
 def _place_carried(program: Program) -> tuple[tuple, int]:
     """Word offsets of every carried region: past the arena of each stage of its spans
     (``carry_spans``) and past the placed regions whose spans meet it in a variant they both live in
-    (16 B aligned). Returns ((name, offset, words), ...) and the first word past them all (0: none)."""
+    (16 B aligned). Returns ((name, offset, words), ...) and the first word past them all (0: none).
+    """
     stages = program.stages
     placed, top, names = [], 0, set()
     for i, s in enumerate(stages):
@@ -623,7 +720,11 @@ def _check_kept(program: Program) -> None:
             shared = ctas(s) & set().union(*(ctas(stages[j]) for j in readers))
             for j in range(i + 1, max(readers)):
                 o = stages[j]
-                if o.name in keep.aware or o.lds_words <= keep.lo or not (ctas(o) & shared):
+                if (
+                    o.name in keep.aware
+                    or o.lds_words <= keep.lo
+                    or not (ctas(o) & shared)
+                ):
                     continue
                 raise PlanError(
                     f"stage {o.name} ({o.lds_words} LDS words) runs between {s.name} and its reader(s) "

@@ -39,13 +39,23 @@ BLOCK_SIZE = 128
 MAX_CTX = 1 << 20
 CUS = 256  # MI355X's CUs (one CTA a CU: a compute partition has fewer)
 ARCH = "gfx950"
-# DeepSeek-V4.1-Flash: the geometry the hi programs are composed for
+# DeepSeek-V4.1-Flash: the geometry the hi programs are composed for (``hi.v41.config.Geometry``, the verify head's
+# vocabulary, the draft's taps and stages, the Engram's n-grams and heads)
 GEOMETRY = {
     "hidden_size": 5120,
     "num_hidden_layers": 40,
     "num_attention_heads": 64,
     "n_routed_experts": 384,
     "hc_mult": 4,
+    "vocab_size": 129280,
+    "rms_norm_eps": 1e-20,
+    "sliding_window": 128,
+    "num_nextn_predict_layers": 3,
+    "dspark_target_layer_ids": [37, 38, 39],
+    "engram_layer_ids": [1, 14],
+    "engram_max_ngram_size": 4,
+    "engram_n_heads": 8,
+    "engram_head_dim": 256,
 }
 
 
@@ -89,7 +99,7 @@ def refusal(atom_config, drafter, metadata_builder, dp_ranks: int) -> str:
     if block != BLOCK_SIZE:
         return f"KV cache pages of {block} tokens (the hi path serves ATOM's V4.1 page, {BLOCK_SIZE})"
     hf = getattr(cfg, "hf_config", None)
-    geometry = {k: getattr(hf, k, None) for k in GEOMETRY}
+    geometry = {k: _plain(getattr(hf, k, None)) for k in GEOMETRY}
     if geometry != GEOMETRY:
         return f"model geometry {geometry} (the hi path serves DeepSeek-V4.1-Flash's)"
     spec = getattr(cfg, "speculative_config", None)
@@ -109,6 +119,10 @@ def refusal(atom_config, drafter, metadata_builder, dp_ranks: int) -> str:
         return f"--max-model-len {max_len} > the hi programs' context bucket {MAX_CTX}"
     if getattr(cfg, "kv_transfer_config", None):
         return "KV transfer configured (P/D or an offload tier)"
+    if getattr(cfg, "enable_tbo", False) or getattr(cfg, "enable_tbo_decode", False):
+        return "two-batch overlap (the hi layers run a step whole)"
+    if envs.ATOM_USE_TRITON_MOE:
+        return "ATOM_USE_TRITON_MOE=1 (the hi path reads the routed experts in the gfx950 FlyDSL layout)"
     if envs.ATOM_H2D_BACKEND != "packed":
         return f"ATOM_H2D_BACKEND={envs.ATOM_H2D_BACKEND} (the hi path reads the packed publications)"
     if metadata_builder is None:
@@ -122,6 +136,11 @@ def refusal(atom_config, drafter, metadata_builder, dp_ranks: int) -> str:
     if importlib.util.find_spec("flydsl") is None:
         return "FlyDSL is not installed"
     return ""
+
+
+def _plain(value):
+    """A configuration value as ``GEOMETRY`` spells it (a tuple of ids as a list)."""
+    return list(value) if isinstance(value, tuple) else value
 
 
 def decide(atom_config, drafter, metadata_builder, dp_ranks: int) -> bool:

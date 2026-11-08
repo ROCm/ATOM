@@ -35,18 +35,25 @@ def _is_default(value, f) -> bool:
 
 def stable(x):
     """``x`` as a key value: a dataclass -> (class name, ((field, value) for every field off its default)); tuples,
-    lists, dicts and sets element-wise; an enum by its class and member name; anything else as is."""
+    lists, dicts and sets element-wise; an enum by its class and member name; anything else as is.
+    """
     if is_dataclass(x) and not isinstance(x, type):
         return (
             type(x).__qualname__,
-            tuple((f.name, stable(getattr(x, f.name))) for f in fields(x) if not _is_default(getattr(x, f.name), f)),
+            tuple(
+                (f.name, stable(getattr(x, f.name)))
+                for f in fields(x)
+                if not _is_default(getattr(x, f.name), f)
+            ),
         )
     if isinstance(x, Enum):
         return f"{type(x).__qualname__}.{x.name}"
     if isinstance(x, (tuple, list)):
         return tuple(stable(v) for v in x)
     if isinstance(x, dict):
-        return tuple(sorted(((k, stable(v)) for k, v in x.items()), key=lambda kv: repr(kv[0])))
+        return tuple(
+            sorted(((k, stable(v)) for k, v in x.items()), key=lambda kv: repr(kv[0]))
+        )
     if isinstance(x, (set, frozenset)):
         return tuple(sorted((stable(v) for v in x), key=repr))
     return x

@@ -69,10 +69,14 @@ SPITCH = WINDOW + 4  # LDS words a score row (f32, both chunks)
 PPITCH = WINDOW // 2 + 4  # LDS words a P row (bf16 pairs, both chunks)
 NEG_INIT = -1.0e30  # the reference's initial running max
 TINY_BITS = 37 << 23  # |x| below 2^-90 (fp32 bits): _finish divides exactly
-HUGE_BITS = 187 << 23  # a denominator from 2^60 (fp32 bits, positive): _finish divides exactly
+HUGE_BITS = (
+    187 << 23
+)  # a denominator from 2^60 (fp32 bits, positive): _finish divides exactly
 OGP = 33  # LDS words a 32-dim group of o (+1: the output threads' 32-word strides on distinct banks)
 OPITCH = (HD // 32) * OGP  # LDS words an o row
-assert TILE * (HD // 32) * 2 == THREADS  # the out phase: two threads a (head, 32-dim group)
+assert (
+    TILE * (HD // 32) * 2 == THREADS
+)  # the out phase: two threads a (head, 32-dim group)
 
 
 def _ab(x):
@@ -99,7 +103,10 @@ def _qat_word(vals, code):
     """Four values of one MX group -> (the E4M3 word, the four dequantized values: the QAT's)."""
     word = gemv.quant_word(vals, code)
     scale = (code << 23).bitcast(fx.Float32)
-    back = [fx.Float32(rocdl.cvt_f32_fp8(T.f32, fx.Int32(word).ir_value(), i)) * scale for i in range(4)]
+    back = [
+        fx.Float32(rocdl.cvt_f32_fp8(T.f32, fx.Int32(word).ir_value(), i)) * scale
+        for i in range(4)
+    ]
     return word, back
 
 
@@ -114,7 +121,13 @@ def _rope_given(vals, cs):
     """RoPE of ``vals`` (adjacent pairs) with their pairs' (cos, sin) ``cs`` already loaded ."""
     out = []
     for i in range(len(vals) // 2):
-        a, b = _rope_pair(vals[2 * i], vals[2 * i + 1], fx.Float32(cs[i][0]), fx.Float32(cs[i][1]), False)
+        a, b = _rope_pair(
+            vals[2 * i],
+            vals[2 * i + 1],
+            fx.Float32(cs[i][0]),
+            fx.Float32(cs[i][1]),
+            False,
+        )
         out += [bf16_round(a), bf16_round(b)]
     return out
 
@@ -172,7 +185,9 @@ class KVPrep(Block):
     def __init__(self, name: str, kv: Channel, kvn: Channel, pos: str, rope: str):
         for ch in (kv, kvn):
             if ch.fmt is not Fmt.BF16 or ch.width != HD or ch.flagged:
-                raise ValueError(f"KVPrep {name}: kv / kvn are tagged BF16 channels of width {HD}")
+                raise ValueError(
+                    f"KVPrep {name}: kv / kvn are tagged BF16 channels of width {HD}"
+                )
         self.name, self.kv, self.kvn, self.pos, self.rope = name, kv, kvn, pos, rope
 
     def stages(self, sc: Scenario) -> list[Stage]:
@@ -206,18 +221,26 @@ class _APlan:
     out: str  # MXFP8 channel (64 x 512)
     done: str  # region: a pair a task, put once the task has read the ring
     heads: int = HEADS  # this rank's query heads
-    ring_slots: int = WINDOW  # the ring's slots (WINDOW + drafts: a rejected draft row overwrites no live key)
-    ring_first: bool = False  # the ring rows into LDS before the q poll (they need no input: a task that starts before
+    ring_slots: int = (
+        WINDOW  # the ring's slots (WINDOW + drafts: a rejected draft row overwrites no live key)
+    )
+    ring_first: bool = (
+        False  # the ring rows into LDS before the q poll (they need no input: a task that starts before
+    )
     #                           its q lands has them in by then; module docstring of ``MLAWindowAttn``)
-    dsplit: int = 1  # tasks a (row, tile): each the scores and softmax of all 512 dims, then the P V, finish and
+    dsplit: int = (
+        1  # tasks a (row, tile): each the scores and softmax of all 512 dims, then the P V, finish and
+    )
     #                  output of its 512 / dsplit dims (the same bits: those are per output element)
-    unrope_f32: bool = False  # the output's inverse RoPE quantized from f32 (no bf16 rounding of the 64 rotary dims)
-
+    unrope_f32: bool = (
+        False  # the output's inverse RoPE quantized from f32 (no bf16 rounding of the 64 rotary dims)
+    )
 
     @property
     def tiles(self):
         """16-head tiles a row. A ragged last tile (heads not a multiple of 16, e.g. 8 at TP8) runs its dead heads on
-        the last live head's q and sink and writes them there again: the same values, the same bits."""
+        the last live head's q and sink and writes them there again: the same values, the same bits.
+        """
         return -(-self.heads // TILE)
 
     @property
@@ -233,12 +256,15 @@ class _APlan:
         return fx.min(h, fx.Int32(self.heads - 1)) if self.ragged else h
 
     @property
-    def a_k(self):  # both chunks' keys [WINDOW][PITCH], after the q tile [TILE][PITCH] at 0
+    def a_k(
+        self,
+    ):  # both chunks' keys [WINDOW][PITCH], after the q tile [TILE][PITCH] at 0
         return TILE * PITCH
 
-
     @property
-    def a_s(self):  # S [TILE][SPITCH] f32, over the q tile (stored once every wave has read q)
+    def a_s(
+        self,
+    ):  # S [TILE][SPITCH] f32, over the q tile (stored once every wave has read q)
         return 0
 
     @property
@@ -250,7 +276,9 @@ class _APlan:
         return self.a_p + TILE * PPITCH
 
     @property
-    def a_rope(self):  # (cos, sin) of the row's 32 rotary pairs (the output's inverse RoPE), loaded at task start
+    def a_rope(
+        self,
+    ):  # (cos, sin) of the row's 32 rotary pairs (the output's inverse RoPE), loaded at task start
         return self.a_ml + 4 * TILE
 
     @property
@@ -268,14 +296,19 @@ class _APlan:
 def _q_tile(k, p: _APlan, r, ht, pos):
     """q of the tile's 16 heads into LDS [head][PITCH], RoPE'd. Load j of a thread: words ``1024 j + 2 tid ..
     + 2`` of the tile (4 dims; consecutive lanes, consecutive 16 B: a lane's 64 B of one head an instruction made 4x
-    the L2 requests); the RoPE table's (cos, sin) of those dims issued before the poll."""
+    the L2 requests); the RoPE table's (cos, sin) of those dims issued before the poll.
+    """
     e0w = (r * p.heads * HD + ht * TILE * HD) // 2
     ws = [j * (THREADS * 2) + k.tid * 2 for j in range(TILE * HD // 2 // (THREADS * 2))]
     css = []
     for w in ws:
-        first = fx.max((w % (HD // 2)) - (HD - ROPE) // 2, 0)  # the rotary pair of the word's first two dims
+        first = fx.max(
+            (w % (HD // 2)) - (HD - ROPE) // 2, 0
+        )  # the rotary pair of the word's first two dims
         css.append([rope_cs(k, p.rope, pos, first + i) for i in range(2)])
-    if not p.ragged:  # the tile's words (in this order: the 16-head programs' code as before)
+    if (
+        not p.ragged
+    ):  # the tile's words (in this order: the 16-head programs' code as before)
         got = mb.poll([(k.mb[p.q], e0w + w, 2) for w in ws], k.tag)
     for j, w in enumerate(ws):
         hh, dw = w // (HD // 2), w % (HD // 2)
@@ -283,10 +316,21 @@ def _q_tile(k, p: _APlan, r, ht, pos):
         is_rope = dw * 2 >= HD - ROPE
         out = []
         for i in range(2):
-            a, b = _rope_pair(vals[2 * i], vals[2 * i + 1], fx.Float32(css[j][i][0]), fx.Float32(css[j][i][1]), False)
-            out += [is_rope.select(bf16_round(a), vals[2 * i]), is_rope.select(bf16_round(b), vals[2 * i + 1])]
+            a, b = _rope_pair(
+                vals[2 * i],
+                vals[2 * i + 1],
+                fx.Float32(css[j][i][0]),
+                fx.Float32(css[j][i][1]),
+                False,
+            )
+            out += [
+                is_rope.select(bf16_round(a), vals[2 * i]),
+                is_rope.select(bf16_round(b), vals[2 * i + 1]),
+            ]
         for i in range(2):
-            fx.ptr_store(bf16_pair(out[2 * i], out[2 * i + 1]), k.ldsf + (hh * PITCH + dw + i))
+            fx.ptr_store(
+                bf16_pair(out[2 * i], out[2 * i + 1]), k.ldsf + (hh * PITCH + dw + i)
+            )
 
 
 def _ring_issue(k, p: _APlan, b, pos):
@@ -319,23 +363,32 @@ def _key_land(k, p: _APlan, pos, vs, base):
 @traced
 def _own_keys(k, p: _APlan, b, base, pos):
     """The step's own key rows (positions base .. pos, from ``kvn``) over their ring slots in LDS. Load j of a
-    thread: words ``1024 j + 2 tid .. + 2`` of the request's rows (consecutive lanes, consecutive 16 B)."""
+    thread: words ``1024 j + 2 tid .. + 2`` of the request's rows (consecutive lanes, consecutive 16 B).
+    """
     for j in range_constexpr(-(-p.spec * (HD // 2) // (THREADS * 2))):
         w = j * (THREADS * 2) + k.tid * 2
         row, dw = w // (HD // 2), w % (HD // 2)
         if base + row <= pos:
-            got = mb.poll([(k.mb[p.kvn], (b * p.spec + row) * (HD // 2) + dw, 2)], k.tag)[0]
+            got = mb.poll(
+                [(k.mb[p.kvn], (b * p.spec + row) * (HD // 2) + dw, 2)], k.tag
+            )[0]
             g = base + row - (pos - (WINDOW - 1))  # the key's index in the window
-            fx.ptr_store(fx.Vector.from_elements(got, fx.Int32).bitcast(fx.Float32), k.ldsf + (p.a_k + g * PITCH + dw))
+            fx.ptr_store(
+                fx.Vector.from_elements(got, fx.Int32).bitcast(fx.Float32),
+                k.ldsf + (p.a_k + g * PITCH + dw),
+            )
 
 
 def _lds_bf8(k, word):
-    return fx.ptr_load(k.ldsf + word, result_type=fx.Vector.make_type(4, fx.Float32)).bitcast(fx.BFloat16)
+    return fx.ptr_load(
+        k.ldsf + word, result_type=fx.Vector.make_type(4, fx.Float32)
+    ).bitcast(fx.BFloat16)
 
 
 def _scores_all(k, p: _APlan):
     """S[head][key] (unscaled f32) of all 128 keys: wave w takes keys 16 w .. + 16 (each key's MFMA chain as in
-    one chunk). S overlays the q tile, so it is stored after every wave's last q read."""
+    one chunk). S overlays the q tile, so it is stored after every wave's last q read.
+    """
     lm, ld = k.lane % 16, k.lane // 16
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for kst in range_constexpr(HD // 32):
@@ -365,7 +418,9 @@ def _softmax_all(k, p: _APlan, pos):
         corr = fx.Float32(fmath.exp(m_prev - m_new))
         pv = [fx.Float32(fmath.exp(v - m_new)) for v in sv]
         lsum = butterfly(pv[0] + pv[1], (1, 2, 4, 8, 16))
-        fx.ptr_store(bf16_pair(pv[0], pv[1]), k.ldsf + (p.a_p + hh * PPITCH + (c * CH + kk) // 2))
+        fx.ptr_store(
+            bf16_pair(pv[0], pv[1]), k.ldsf + (p.a_p + hh * PPITCH + (c * CH + kk) // 2)
+        )
         den = den * corr + lsum
         corrs.append(corr)
         m_prev = m_new
@@ -388,30 +443,48 @@ def _pv_all(k, p: _APlan, d0=0):
     word: two dims of a key) feed both (16 dims a wave: one block, the wave's parity only). -> [(dim, the 4 values of
     heads 4 (lane // 16) .. + 4)]."""
     lm, ld = k.lane % 16, k.lane // 16
-    corr = [[fx.ptr_load(k.ldsf + (p.a_ml + (2 + c) * TILE + ld * 4 + e)) for e in range(4)] for c in range(2)]
+    corr = [
+        [fx.ptr_load(k.ldsf + (p.a_ml + (2 + c) * TILE + ld * 4 + e)) for e in range(4)]
+        for c in range(2)
+    ]
     dpw = HD // p.dsplit // WAVES  # dims a wave: 64, 32 or 16
     if dpw >= 32:
         blocks, pars = [k.wave * dpw + b * 32 + d0 for b in range(dpw // 32)], [0, 1]
     out = []
     for base in blocks:
         dword = base // 2 + lm
-        ts = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(WINDOW // CH)] for _ in pars]  # [parity][chunk]
+        ts = [
+            [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(WINDOW // CH)]
+            for _ in pars
+        ]  # [parity][chunk]
         for c in range(WINDOW // CH):
             for kc in range(CH // 32):
                 kst = c * (CH // 32) + kc
                 a = _lds_bf8(k, p.a_p + lm * PPITCH + kst * 16 + ld * 4)
                 ws = [
-                    fx.ptr_load(k.ldsf + (p.a_k + (kst * 32 + ld * 8 + i) * PITCH + dword)).bitcast(fx.Int32)
+                    fx.ptr_load(
+                        k.ldsf + (p.a_k + (kst * 32 + ld * 8 + i) * PITCH + dword)
+                    ).bitcast(fx.Int32)
                     for i in range(8)
                 ]
-                halves = ([w & fx.Int32(0xFFFF) for w in ws], [fx.Int32(fx.Uint32(w) >> 16) for w in ws])
+                halves = (
+                    [w & fx.Int32(0xFFFF) for w in ws],
+                    [fx.Int32(fx.Uint32(w) >> 16) for w in ws],
+                )
                 for j, par in enumerate(pars):
                     hv = halves[par]
                     bw = [hv[2 * i] | (hv[2 * i + 1] << fx.Int32(16)) for i in range(4)]
-                    ts[j][c] = mfma_bf16(a, fx.Vector.from_elements(bw, fx.Int32).bitcast(fx.BFloat16), ts[j][c])
+                    ts[j][c] = mfma_bf16(
+                        a,
+                        fx.Vector.from_elements(bw, fx.Int32).bitcast(fx.BFloat16),
+                        ts[j][c],
+                    )
         for j, par in enumerate(pars):
             t0, t1 = ts[j]
-            vals = [(fx.Float32(0.0) * corr[0][e] + t0[e]) * corr[1][e] + t1[e] for e in range(4)]
+            vals = [
+                (fx.Float32(0.0) * corr[0][e] + t0[e]) * corr[1][e] + t1[e]
+                for e in range(4)
+            ]
             out.append((base + 2 * lm + (k.wave % 2 if par is None else par), vals))
     return out
 
@@ -460,8 +533,19 @@ def _finish(k, p: _APlan, acc, sinks):
         big = d if big is None else fx.max(big, d)
     fast = (small >= fx.Int32(TINY_BITS)) & (big < fx.Int32(HUGE_BITS))
     words = [[p.o_word(ld * 4 + e, dim) for e in range(4)] for dim, _ in acc]
-    _finish_store(k, fast, [[div_rn(v[e], dens[e], rs[e]) for e in range(4)] for _, v in acc], words)
-    _finish_exact(k, (small < fx.Int32(TINY_BITS)) | (big >= fx.Int32(HUGE_BITS)), acc, dens, words)
+    _finish_store(
+        k,
+        fast,
+        [[div_rn(v[e], dens[e], rs[e]) for e in range(4)] for _, v in acc],
+        words,
+    )
+    _finish_exact(
+        k,
+        (small < fx.Int32(TINY_BITS)) | (big >= fx.Int32(HUGE_BITS)),
+        acc,
+        dens,
+        words,
+    )
 
 
 @traced
@@ -495,14 +579,17 @@ def _unrope_lds(k, p: _APlan, first, vals):
 def _out_groups(k, p: _APlan, r, ht, pos, g0=0):
     """Per (head, 32-dim group of the task's 16 / dsplit from ``g0``) 2 dsplit threads, 16 / dsplit dims each (part
     ``tid % (2 dsplit)``): the inverse RoPE on the last 64 dims, the group's code from the parts' |max| (the lanes'
-    max: exact), then the QAT: E4M3 words and (part 0) the E8M0 code into the MXFP8 channel."""
+    max: exact), then the QAT: E4M3 words and (part 0) the E8M0 code into the MXFP8 channel.
+    """
     tpg = 2 * p.dsplit  # threads a group
     dpt = 32 // tpg  # dims a thread
     per_head = (HD // 32 // p.dsplit) * tpg
     hh, g, part = k.tid // per_head, (k.tid % per_head) // tpg, k.tid % tpg
     if const_expr(p.dsplit > 1):
         g = g + g0
-    o0 = p.a_o + hh * OPITCH + g * OGP + part * dpt  # outside the dynamic if (no method calls on local objects there)
+    o0 = (
+        p.a_o + hh * OPITCH + g * OGP + part * dpt
+    )  # outside the dynamic if (no method calls on local objects there)
     vals = [fx.ptr_load(k.ldsf + (o0 + i)) for i in range(dpt)]
     rot = vals
     if g >= (HD - ROPE) // 32:
@@ -511,7 +598,9 @@ def _out_groups(k, p: _APlan, r, ht, pos, g0=0):
     for v in rot[1:]:
         am = fx.max(am, _ab(v))
     # every lane: a group's threads are adjacent lanes (the butterfly stays within them)
-    code = gemv.activation_code(butterfly(am, tuple(1 << i for i in range(tpg.bit_length() - 1)), fx.max))
+    code = gemv.activation_code(
+        butterfly(am, tuple(1 << i for i in range(tpg.bit_length() - 1)), fx.max)
+    )
     e0 = r * p.heads * HD + p.head(ht, hh) * HD + g * 32
     for w in range_constexpr(dpt // 4):
         chan.put_mxfp8_word(k.mb[f"{p.out}.q"], e0 // 4 + part * (dpt // 4) + w,
@@ -533,14 +622,17 @@ def _done(k, p: _APlan, t):
 
 def _ring_then_q(k, p: _APlan, r, ht, b, base, pos):
     """``ring_first``: the ring rows landed in LDS, then the q tile polled (vector memory returns in order, so a q
-    poll issued with the ring in flight would wait behind it: the ring goes first, whole, while q is not there yet)."""
+    poll issued with the ring in flight would wait behind it: the ring goes first, whole, while q is not there yet).
+    """
     _key_land(k, p, pos, _ring_issue(k, p, b, pos), base)
     rocdl.sched_barrier(0)  # keep the q poll after the ring's landing
     _q_tile(k, p, r, ht, pos)
 
 
 def _attn(k, t, p: _APlan):
-    rt, j = (t // p.dsplit, t % p.dsplit) if p.dsplit > 1 else (t, 0)  # (row, tile), the task's dim part
+    rt, j = (
+        (t // p.dsplit, t % p.dsplit) if p.dsplit > 1 else (t, 0)
+    )  # (row, tile), the task's dim part
     r, ht = rt // p.tiles, rt % p.tiles
     b, base, pos = _row_pos(k, p.pos, p.spec, r)
     sinks = _sink_issue(k, p, ht)
@@ -576,15 +668,23 @@ class MLAWindowAttn(Block):
         if dsplit not in (1, 2, 4):
             raise ValueError(f"MLAWindowAttn {name}: dsplit 1, 2 or 4")
         if q.fmt is not Fmt.BF16 or q.width != heads * HD or q.flagged:
-            raise ValueError(f"MLAWindowAttn {name}: q is a tagged BF16 channel of width {heads * HD}")
+            raise ValueError(
+                f"MLAWindowAttn {name}: q is a tagged BF16 channel of width {heads * HD}"
+            )
         if kvn.fmt is not Fmt.BF16 or kvn.width != HD or kvn.flagged:
-            raise ValueError(f"MLAWindowAttn {name}: kvn is a tagged BF16 channel of width {HD}")
+            raise ValueError(
+                f"MLAWindowAttn {name}: kvn is a tagged BF16 channel of width {HD}"
+            )
         if out.fmt is not Fmt.MXFP8 or out.width != heads * HD or out.flagged:
-            raise ValueError(f"MLAWindowAttn {name}: out is a tagged MXFP8 channel of width {heads * HD}")
+            raise ValueError(
+                f"MLAWindowAttn {name}: out is a tagged MXFP8 channel of width {heads * HD}"
+            )
         self.name, self.q, self.kvn, self.out, self.heads = name, q, kvn, out, heads
         self.ring, self.pos, self.rope, self.sink = ring, pos, rope, sink
         if ring_slots < WINDOW:
-            raise ValueError(f"MLAWindowAttn {name}: ring_slots {ring_slots} < the window {WINDOW}")
+            raise ValueError(
+                f"MLAWindowAttn {name}: ring_slots {ring_slots} < the window {WINDOW}"
+            )
         self.ring_slots, self.ring_first, self.dsplit = ring_slots, ring_first, dsplit
         # the output's inverse RoPE: o is bf16, the rotation bf16-rounded before the MXFP8 QAT (the official model's
         # order); ``unrope_f32``: the f32 rotation quantized directly (an engine's arithmetic, ATOM's). A numerics
@@ -600,7 +700,9 @@ class MLAWindowAttn(Block):
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.plan(sc)
         tasks = sc.rows * p.tiles * self.dsplit
-        writes = tuple(self.out.regions(sc.rows, (self.name,))) + (Region(p.done, tasks, (self.name,)),)
+        writes = tuple(self.out.regions(sc.rows, (self.name,))) + (
+            Region(p.done, tasks, (self.name,)),
+        )
         args = (self.pos, self.ring, self.rope, rope_sin(self.rope), self.sink)
         return [Stage(self.name, tasks, partial(_attn, p=p), lds_words=p.lds_words, writes=writes, args=args,
                       key=(p,))]  # fmt: skip
@@ -621,7 +723,9 @@ class _RPlan:
     heads: int = HEADS  # MLAWindowAttn's (its tasks a row: ceil(heads / 16) x dsplit)
     ring_slots: int = WINDOW  # MLAWindowAttn's
     dsplit: int = 1  # MLAWindowAttn's
-    mdone: str = ""  # another stage's ring-read flags (``MLASparseAttn(smerge=True)``'s merge), ``mper`` a row
+    mdone: str = (
+        ""  # another stage's ring-read flags (``MLASparseAttn(smerge=True)``'s merge), ``mper`` a row
+    )
     mper: int = 0
 
 
@@ -629,7 +733,9 @@ class _RPlan:
 def _ring_write(k, r, p: _RPlan):
     """Row r: once every attention task of its request has read the ring, its key into slot position % ring_slots."""
     b, _, pos = _row_pos(k, p.pos, p.spec, r)
-    tiles = -(-p.heads // TILE) * p.dsplit  # (a ragged last tile counts: ``_APlan.tiles``)
+    tiles = (
+        -(-p.heads // TILE) * p.dsplit
+    )  # (a ragged last tile counts: ``_APlan.tiles``)
     if k.tid < p.spec * tiles:
         mb.poll([(k.mb[p.done], b * p.spec * tiles + k.tid, 1)], k.tag)
     if const_expr(p.mper > 0):
@@ -638,7 +744,11 @@ def _ring_write(k, r, p: _RPlan):
     gpu.barrier()
     if k.tid < HD // 2:
         w = mb.poll([(k.mb[p.kvn], (r * HD) // 2 + k.tid, 1)], k.tag)[0][0]
-        bo.buffer_store(w, rsrc(k.args[p.ring]), ((b * p.ring_slots + pos % p.ring_slots) * HD) // 2 + k.tid)
+        bo.buffer_store(
+            w,
+            rsrc(k.args[p.ring]),
+            ((b * p.ring_slots + pos % p.ring_slots) * HD) // 2 + k.tid,
+        )
 
 
 class RingWrite(Block):

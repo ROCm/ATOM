@@ -2,6 +2,7 @@
 """Pack metadata into one pinned arena, upload once, scatter to stable addresses."""
 
 import ctypes
+import functools
 
 import torch
 import triton
@@ -20,42 +21,44 @@ def scatter_packed_bytes(arena, destinations, BLOCK: tl.constexpr):
     tl.store(destination + offset, values, offset < length)
 
 
-class _Address:
+class DeviceAddress:
     """A raw device address as a kernel's pointer argument."""
 
-    dtype = torch.uint8
-
-    def __init__(self, address):
-        self.address = address
+    def __init__(self, address, dtype=torch.uint8):
+        self.address, self.dtype = address, dtype
 
     def data_ptr(self):
         return self.address
 
 
-def _device_address(host):
-    """The device's address of a page-locked host tensor's first byte."""
-    hip = ctypes.CDLL("libamdhip64.so")
+@functools.cache
+def _host_get_device_pointer():
+    """`hipHostGetDevicePointer` of the HIP runtime torch runs (the one that
+    page-locked the memory; `engram.host_memory._hip_runtime`), resolved
+    once."""
+    from atom.model_ops.engram.host_memory import _hip_runtime
+
+    hip = _hip_runtime()
+    if hip is None:
+        raise RuntimeError("no HIP runtime loaded: no device address of host memory")
+    fn = hip.hipHostGetDevicePointer
+    fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+    return fn
+
+
+def device_address(host_ptr: int, base: int | None = None) -> int:
+    """The device's address of `host_ptr`, a byte of the page-locked host
+    range starting at `base` (default: `host_ptr` itself)."""
+    base = host_ptr if base is None else base
     dev = ctypes.c_void_p()
-    rc = hip.hipHostGetDevicePointer(
-        ctypes.byref(dev), ctypes.c_void_p(host.data_ptr()), ctypes.c_uint(0)
-    )
+    rc = _host_get_device_pointer()(ctypes.byref(dev), base, 0)
     if rc != 0 or not dev.value:
-        raise RuntimeError(f"hipHostGetDevicePointer failed ({rc})")
-    return dev.value
+        raise RuntimeError(f"hipHostGetDevicePointer({base:#x}) failed ({rc})")
+    return dev.value + (host_ptr - base)
 
 
 class PackedCopy:
     """Persistent byte storage; the publication owner fences reuse of the arena."""
-
-    # Both None unless a model hook opts in (DeepSeek-V4.1's hi hook,
-    # `ATOM_DSV41_MONO_HI`); unset, `submit` is the copy-then-scatter below.
-    # ``read_host_arena``: the scatter reads the pinned arena itself.
-    host_arena = None
-    # A recorder that may take this publication's scatter instead of launching
-    # it (``defer.take(copy, arena, largest)`` -> True: it launches the scatter
-    # itself later, before the owner's reuse event; the V4.1 mono hi hook's
-    # ``prologue``).
-    defer = None
 
     @classmethod
     def create(cls, members, device):
@@ -90,6 +93,10 @@ class PackedCopy:
         result.prefixes = {}
         result.launch = scatter_packed_bytes
         result.kernel = None
+        # A model's opt-in (`read_host_arena`), else None: every launch is the
+        # copy-then-scatter below.
+        result.reader = None
+        result.host_arena = None
         return result, None
 
     def submit(self, counts):
@@ -111,31 +118,21 @@ class PackedCopy:
                 offset += length
                 largest = max(largest, length)
         grid = (len(self.members), (largest + 1023) // 1024, 1)
-        defer = self.defer
+        reader = self.reader
         if (
-            defer is not None
-            and defer.armed
+            reader is not None
             and not torch.cuda.is_current_stream_capturing()
+            and reader.reads(offset)
         ):
-            if self.host_arena is not None:
-                arena = self.host_arena.data_ptr()
-            else:
-                # The deferred scatter reads the device arena.
-                host, device = self._prefix(offset)
-                device.copy_(host, non_blocking=True)
-                arena = self.device.data_ptr()
-            if defer.take(self, arena, largest):
+            # The scatter reads the arena written above through its device
+            # address: no H2D. The owner's reuse event, recorded after the
+            # launch (the reader's, when it takes it), fences the arena as it
+            # fences the copy.
+            if reader.take(self, self.host_arena.data_ptr(), largest):
                 return True
-        if (
-            self.host_arena is not None
-            and self.kernel is not None
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            # An eager launch reads the arena written above through its
-            # device address: no H2D. The owner's reuse event, recorded after
-            # this launch, fences the arena as it fences the copy.
-            self.kernel[grid](self.host_arena, self.destinations)
-            return True
+            if self.kernel is not None:
+                self.kernel[grid](self.host_arena, self.destinations)
+                return True
         prefix = self._prefix(offset)
         # Header and payload share this single asynchronous H2D.
         prefix[1].copy_(prefix[0], non_blocking=True)
@@ -156,8 +153,9 @@ class PackedCopy:
             self.prefixes[offset] = prefix
         return prefix
 
-    def read_host_arena(self):
-        """Have the scatter read the pinned arena through its device address
-        instead of after an H2D copy (one launch a publication, not two), on
-        eager launches; a launch inside a graph capture copies as before."""
-        self.host_arena = _Address(_device_address(self.host))
+    def read_host_arena(self, reader):
+        """`PublicationGroup.read_host_arena`: the eager launches `reader`
+        accepts read the pinned arena through its device address (one launch
+        a publication, not two) or are recorded by it."""
+        self.host_arena = DeviceAddress(device_address(self.host.data_ptr()))
+        self.reader = reader

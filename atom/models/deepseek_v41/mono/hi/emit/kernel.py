@@ -48,7 +48,14 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from ..device.gfx950 import mailbox
-from ..device.gfx950.ops import fresh_s, fresh_s64, kernel_symbol, ld_i32, load_ptr64, uniform
+from ..device.gfx950.ops import (
+    fresh_s,
+    fresh_s64,
+    kernel_symbol,
+    ld_i32,
+    load_ptr64,
+    uniform,
+)
 from ..plan import trace
 from ..plan.program import (
     DUAL_PAGE,
@@ -65,7 +72,9 @@ from ..plan.trace import Space, enter_stage
 _PKG = Path(__file__).resolve().parents[1]
 
 
-_SOURCE_DIGEST: dict = {}  # the source files' (path, mtime, size) -> their digest (the last one)
+_SOURCE_DIGEST: dict = (
+    {}
+)  # the source files' (path, mtime, size) -> their digest (the last one)
 
 
 def _source_files() -> list[tuple[tuple[str, ...], str]]:
@@ -74,7 +83,9 @@ def _source_files() -> list[tuple[tuple[str, ...], str]]:
     for root, _, names in os.walk(_PKG):
         rel = os.path.relpath(root, _PKG)
         parts = () if rel == os.curdir else tuple(rel.split(os.sep))
-        out += [(parts + (n,), os.path.join(root, n)) for n in names if n.endswith(".py")]
+        out += [
+            (parts + (n,), os.path.join(root, n)) for n in names if n.endswith(".py")
+        ]
     return sorted(out)
 
 
@@ -82,9 +93,12 @@ def source_digest() -> str:
     """Hash of every hi source file: part of each build key, because FlyDSL
     does not key helper sources reached only through dynamic control flow. Hashed again only when a
     file's mtime or size moved (a walk and a stat a file: ~2 ms, where the pathlib walk and the reads took
-    ~32 ms a call, 14 of a snapshot's 17 s of composing; the same digest: ``tests/cpu/test_source_digest.py``)."""
+    ~32 ms a call, 14 of a snapshot's 17 s of composing; the same digest: ``tests/cpu/test_source_digest.py``).
+    """
     files = _source_files()
-    sig = tuple((p, st.st_mtime_ns, st.st_size) for p, f in files for st in (os.stat(f),))
+    sig = tuple(
+        (p, st.st_mtime_ns, st.st_size) for p, f in files for st in (os.stat(f),)
+    )
     digest = _SOURCE_DIGEST.get(sig)
     if digest is None:
         h = hashlib.sha256()
@@ -99,7 +113,9 @@ def source_digest() -> str:
 
 def _table_entry(table, i):
     """Entry ``i`` of the pointer table as a scalar load (constant address space, invariant)."""
-    ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<4>"), (fx.Int64(table) + fx.Int64(8 * i)).ir_value()).result
+    ptr = llvm.IntToPtrOp(
+        ir.Type.parse("!llvm.ptr<4>"), (fx.Int64(table) + fx.Int64(8 * i)).ir_value()
+    ).result
     return fx.Int64(llvm.LoadOp(T.i64, ptr, alignment=8, invariant=True).result)
 
 
@@ -112,22 +128,29 @@ def load_table(table, names) -> dict:
     for i, name in enumerate(names):
         addr = fx.Int64(table) + fx.Int64(8 * i)
         ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<4>"), addr.ir_value()).result
-        out[name] = fx.Int64(llvm.LoadOp(T.i64, ptr, alignment=8, invariant=True).result)
+        out[name] = fx.Int64(
+            llvm.LoadOp(T.i64, ptr, alignment=8, invariant=True).result
+        )
     return out
 
 
 def _load_step(step):
     """The step counter as a scalar load (constant address space: the scalar cache starts every launch cold, and the
     counter only changes between launches)."""
-    ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<4>"), fx.Int64(step).ir_value()).result
+    ptr = llvm.IntToPtrOp(
+        ir.Type.parse("!llvm.ptr<4>"), fx.Int64(step).ir_value()
+    ).result
     return fx.Int32(llvm.LoadOp(T.i32, ptr, alignment=4, invariant=True).result)
 
 
 def _load_live(step, word: int = 1):
     """``Program.dyn_rows``: the launch's live rows (``word`` 1, the int32 after the step counter), spec (2) or batch
     (3): a scalar load, as the step's (it changes only between launches). Re-read at each stage entry rather than held
-    across the kernel (a stage that uses none of them loads none: the loads are dead code then)."""
-    ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<4>"), (fx.Int64(step) + fx.Int64(4 * word)).ir_value()).result
+    across the kernel (a stage that uses none of them loads none: the loads are dead code then).
+    """
+    ptr = llvm.IntToPtrOp(
+        ir.Type.parse("!llvm.ptr<4>"), (fx.Int64(step) + fx.Int64(4 * word)).ir_value()
+    ).result
     return fx.Int32(llvm.LoadOp(T.i32, ptr, alignment=4, invariant=True).result)
 
 
@@ -146,7 +169,9 @@ def _hold(first, tasks, units):
         for _ in range_constexpr(units // 127):
             llvm.InlineAsmOp(None, [], "s_sleep 127", "", has_side_effects=True)
         if const_expr(units % 127):
-            llvm.InlineAsmOp(None, [], f"s_sleep {units % 127}", "", has_side_effects=True)
+            llvm.InlineAsmOp(
+                None, [], f"s_sleep {units % 127}", "", has_side_effects=True
+            )
 
 
 @traced
@@ -171,14 +196,20 @@ def _fill_dead(k, put_fill, first, tasks: int, per: int, unit: int, rows: int, r
                 row = u * unit + r
                 for j in range_constexpr(-(-share // k.threads)):
                     q = part * share + j * k.threads + k.tid
-                    if (row >= k.n) & (row < rows) & (q < rp) & (q < (part + 1) * share):
+                    if (
+                        (row >= k.n)
+                        & (row < rows)
+                        & (q < rp)
+                        & (q < (part + 1) * share)
+                    ):
                         put_fill(a, row * rp + q, k.tag)
 
 
 @traced
 def _task_once(k, emit, first, tasks):
     """A stage of at most one task a CTA without the loop: no preheader for LLVM to hoist the task's whole address
-    set-up into ahead of its first instructions (an entry-issued stage's, ``Stage.pre``)."""
+    set-up into ahead of its first instructions (an entry-issued stage's, ``Stage.pre``).
+    """
     if first < tasks:
         emit(k, fx.Int32(first))
 
@@ -187,14 +218,23 @@ def _stage_ctx(program: Program, base: SimpleNamespace, stage) -> SimpleNamespac
     """The context a stage's tasks see (attribute reads only)."""
     t = program.target
     tag, bid, scratch = base.tag, base.bid, fresh_s64(base.scratch)
-    wave = args = None  # (the opaque copies in their order of before, after the mailboxes: same code)
+    wave = args = (
+        None  # (the opaque copies in their order of before, after the mailboxes: same code)
+    )
     rows_of = _region_rows(program) if program.dyn_rows else {}
     pairs_of = {r.name: r.pairs for r in program.regions} if rows_of else {}
     row_kw = lambda name: (  # noqa: E731  (``Program.dyn_rows``: the row-major regions, gfx950's mailbox)
-        {"row_pairs": pairs_of[name] // rows_of[name], "nbytes": pairs_of[name] * 8} if name in rows_of else {}
+        {"row_pairs": pairs_of[name] // rows_of[name], "nbytes": pairs_of[name] * 8}
+        if name in rows_of
+        else {}
     )
     mbs = {
-        r.name: mailbox.Addr(r.name, r.space, scratch + fx.Int64(program.scratch[r.name]), **row_kw(r.name))
+        r.name: mailbox.Addr(
+            r.name,
+            r.space,
+            scratch + fx.Int64(program.scratch[r.name]),
+            **row_kw(r.name),
+        )
         for r in program.regions
         if r.space is not Space.PEER and r.name not in program.private
     }
@@ -202,7 +242,9 @@ def _stage_ctx(program: Program, base: SimpleNamespace, stage) -> SimpleNamespac
         priv = fresh_s64(base.priv)
         mbs.update({name: mailbox.Addr(name, Space.SCRATCH, priv + fx.Int64(off), **row_kw(name))
                     for name, off in program.private.items()})  # fmt: skip
-    if program.dual_on:  # by the regions' resources: loads read this CTA's copy (``base.dual``)
+    if (
+        program.dual_on
+    ):  # by the regions' resources: loads read this CTA's copy (``base.dual``)
         from ..device.gfx950 import dual
 
         bits = fresh_s(base.dual)
@@ -212,7 +254,11 @@ def _stage_ctx(program: Program, base: SimpleNamespace, stage) -> SimpleNamespac
             for pg in range(program.dual_pages):
                 dual.local(((bits >> (8 * pg)) & 1) * dual.HALF, pg)
         for name in program.dual_regions:
-            dual.root(mbs[name].value, name in program.dual_spread, program.scratch[name] // DUAL_PAGE)
+            dual.root(
+                mbs[name].value,
+                name in program.dual_spread,
+                program.scratch[name] // DUAL_PAGE,
+            )
     peers = rank = None
     if program.peer:
         peers, rank = fresh_s64(base.peers), fresh_s(base.rank)
@@ -220,8 +266,15 @@ def _stage_ctx(program: Program, base: SimpleNamespace, stage) -> SimpleNamespac
         # SGPR pair held across the kernel, as the vector load of ``peers[rank]`` a stage was not)
         own = (_table_entry(fresh_s64(base.table), program.args.index(OWN_ARG)) if program.fast_entry
                else load_ptr64(peers, rank))  # fmt: skip
-        mbs.update({name: mailbox.Addr(name, Space.PEER, own + fx.Int64(off)) for name, off in program.peer.items()})
-    if wave is None:  # our fork's order: lane, then the wave's and the args' opaque copies
+        mbs.update(
+            {
+                name: mailbox.Addr(name, Space.PEER, own + fx.Int64(off))
+                for name, off in program.peer.items()
+            }
+        )
+    if (
+        wave is None
+    ):  # our fork's order: lane, then the wave's and the args' opaque copies
         lane = base.tid % t.wave
         wave = fresh_s(base.wave)
         args = {name: fresh_s64(base.args[name]) for name in stage.args}
@@ -231,10 +284,22 @@ def _stage_ctx(program: Program, base: SimpleNamespace, stage) -> SimpleNamespac
         scenario=program.scenario,
         rows=program.scenario.rows,
         # the live rows (``Program.dyn_rows``): a uniform Int32 read at the stage's entry, else the Python int ``rows``
-        n=_load_live(fresh_s64(base.step)) if program.dyn_rows else program.scenario.rows,
+        n=(
+            _load_live(fresh_s64(base.step))
+            if program.dyn_rows
+            else program.scenario.rows
+        ),
         # ... and the live spec and batch (``n = b x s``, rows packed at stride ``s``); Python ints without dyn_rows
-        s=_load_live(fresh_s64(base.step), 2) if program.dyn_rows else program.scenario.spec,
-        b=_load_live(fresh_s64(base.step), 3) if program.dyn_rows else program.scenario.batch,
+        s=(
+            _load_live(fresh_s64(base.step), 2)
+            if program.dyn_rows
+            else program.scenario.spec
+        ),
+        b=(
+            _load_live(fresh_s64(base.step), 3)
+            if program.dyn_rows
+            else program.scenario.batch
+        ),
         grid=t.grid,
         threads=t.threads,
         tid=tid,
@@ -242,7 +307,8 @@ def _stage_ctx(program: Program, base: SimpleNamespace, stage) -> SimpleNamespac
         wave=wave,
         bid=bid,
         tag=tag,
-        base=stage.base % t.grid,  # the stage's first CTA (Python int): task t runs on (base + t) % grid
+        base=stage.base
+        % t.grid,  # the stage's first CTA (Python int): task t runs on (base + t) % grid
         target=t,  # the program's target (Python): a stage plans with it, not module constants
         idle=stage.idle,
         # the kernel-start pointer loads themselves (no per-stage copy): for hooks that read
@@ -255,18 +321,35 @@ def _stage_ctx(program: Program, base: SimpleNamespace, stage) -> SimpleNamespac
         args=args,
         mb=mbs,
         # carried LDS (``LdsCarry``) this stage writes or reads: name -> its LDS words (Int32 ptr)
-        carry={name: base.lds + off for name, off in carried_by(program, stage).items()},
+        carry={
+            name: base.lds + off for name, off in carried_by(program, stage).items()
+        },
         tp=program.scenario.tp,
         rank=rank,
         peers=peers,
-        own=own if peers is not None else None,  # this rank's peer buffer (the entry marks' dependency)
+        own=(
+            own if peers is not None else None
+        ),  # this rank's peer buffer (the entry marks' dependency)
         # ``Program.peer_shared``: the group's peer buffer bytes (its parity-1 slots mirrored from there)
-        peer_top=fresh_s64(base.args[PEER_TOP_ARG]) if peers is not None and program.peer_shared else None,
+        peer_top=(
+            fresh_s64(base.args[PEER_TOP_ARG])
+            if peers is not None and program.peer_shared
+            else None
+        ),
         # ... and its step phase (``PeerGroup.end_step``: the peer table's entry ``tp``), added to the tag's parity
-        peer_phase=fresh_s(base.peer_phase) if peers is not None and program.peer_shared else None,
+        peer_phase=(
+            fresh_s(base.peer_phase)
+            if peers is not None and program.peer_shared
+            else None
+        ),
         peer_pairs={r.name: r.pairs for r in program.regions if r.space is Space.PEER},
     )
-    for name, v in k.args.items():  # the memory-model record (no IR): accesses through these are the arg's
+    for (
+        name,
+        v,
+    ) in (
+        k.args.items()
+    ):  # the memory-model record (no IR): accesses through these are the arg's
         trace.root(v, trace.ARG, name)
     trace.root(scratch, trace.INTERNAL, "scratch")
     if peers is not None:
@@ -276,7 +359,8 @@ def _stage_ctx(program: Program, base: SimpleNamespace, stage) -> SimpleNamespac
 
 def _row_major(program: Program) -> dict[str, int]:
     """``Program.dyn_rows``: the row-major scratch regions and their rows: a channel's (``Region.rows``), and a region a
-    ``Stage.row_tasks`` stage writes one pair a task of (a FLAG channel's flags: a dead row's task puts none)."""
+    ``Stage.row_tasks`` stage writes one pair a task of (a FLAG channel's flags: a dead row's task puts none).
+    """
     out = {r.name: r.rows for r in program.regions if r.rows}
     for s in program.stages:
         if s.row_tasks:
@@ -289,20 +373,26 @@ def _row_major(program: Program) -> dict[str, int]:
 
 def _bounded(stage) -> bool:
     """A dyn_rows stage that runs only its live rows' tasks (``row_tasks`` / ``req_tasks`` / ``live_shape``; not a
-    ``live_tasks`` bound read from the launch's context, whose tasks serve every row)."""
+    ``live_tasks`` bound read from the launch's context, whose tasks serve every row).
+    """
     return bool(stage.row_tasks or stage.req_tasks or stage.live_shape)
 
 
 def _filled(program: Program) -> dict[str, int]:
     """The row-major regions a dyn_rows build makes whole by filling their dead rows (``_fill_dead``): no writer skips
     dead rows inside (``Stage.partial_rows``), and one at least runs only its live tasks (its dead tasks fill instead).
-"""
+    """
     rm = _row_major(program)
     by = {s.name: s for s in program.stages}
     out = {}
     for r in program.regions:
         ws = [by[w] for w in r.writers if w in by]
-        if r.name in rm and ws and not any(s.partial_rows for s in ws) and any(_bounded(s) for s in ws):
+        if (
+            r.name in rm
+            and ws
+            and not any(s.partial_rows for s in ws)
+            and any(_bounded(s) for s in ws)
+        ):
             out[r.name] = rm[r.name]
     return out
 
@@ -316,7 +406,9 @@ def _region_rows(program: Program) -> dict[str, int]:
     out = {}
     for r in program.regions:
         ws = [by[w] for w in r.writers if w in by]
-        if any(s.partial_rows for s in ws) or (r.name not in filled and any(_bounded(s) for s in ws)):
+        if any(s.partial_rows for s in ws) or (
+            r.name not in filled and any(_bounded(s) for s in ws)
+        ):
             out[r.name] = r
     rm = _row_major(program)
     return {n: rows for n, rows in rm.items() if n in out}
@@ -376,17 +468,25 @@ def _emit_stage_entry(program: Program, base: SimpleNamespace, i: int, stage) ->
         _emit_stage_body(program, base, i, stage, k, first, dyn)
 
 
-def _emit_stage_body(program: Program, base: SimpleNamespace, i: int, stage, k, first, dyn) -> None:
-    if stage.pre is not None:  # the stage's entry issue (``Stage.pre``), before the task loop's set-up
+def _emit_stage_body(
+    program: Program, base: SimpleNamespace, i: int, stage, k, first, dyn
+) -> None:
+    if (
+        stage.pre is not None
+    ):  # the stage's entry issue (``Stage.pre``), before the task loop's set-up
         k.pre = stage.pre(k, first)
     if stage.hold:
         _hold(first, stage.tasks, stage.hold)
     shape = dyn  # the live shape's task bounds
     live = stage.live_tasks is not None and (shape or not stage.live_shape)
-    tasks = stage.live_tasks(k) if live else stage.tasks  # ``Stage.live_tasks``: a prefix
+    tasks = (
+        stage.live_tasks(k) if live else stage.tasks
+    )  # ``Stage.live_tasks``: a prefix
     if shape and stage.row_tasks:  # the live rows' tasks
         if stage.tasks != program.scenario.rows * stage.row_tasks:
-            raise PlanError(f"{stage.name}: {stage.tasks} tasks, not rows x row_tasks {stage.row_tasks}")
+            raise PlanError(
+                f"{stage.name}: {stage.tasks} tasks, not rows x row_tasks {stage.row_tasks}"
+            )
         live_rows = k.n * stage.row_tasks
         tasks = live_rows if not live else fx.min(tasks, live_rows)
     k.live = tasks  # (``emit`` maps a task from the live count without recomputing it)
@@ -396,10 +496,25 @@ def _emit_stage_body(program: Program, base: SimpleNamespace, i: int, stage, k, 
         _task_loop(k, stage.emit, first, tasks, k.grid)
     if shape and (stage.row_tasks or stage.req_tasks):
         fill = _filled(program)  # the stage's tasks fill their units' dead rows
-        regs = [(r.name, r.pairs // fill[r.name]) for r in stage.writes if r.name in fill]
+        regs = [
+            (r.name, r.pairs // fill[r.name]) for r in stage.writes if r.name in fill
+        ]
         if regs:
-            per, unit = (stage.row_tasks, 1) if stage.row_tasks else (stage.req_tasks, program.scenario.spec)
-            _fill_dead(k, mailbox.put_fill, first, stage.tasks, per, unit, program.scenario.rows, regs)
+            per, unit = (
+                (stage.row_tasks, 1)
+                if stage.row_tasks
+                else (stage.req_tasks, program.scenario.spec)
+            )
+            _fill_dead(
+                k,
+                mailbox.put_fill,
+                first,
+                stage.tasks,
+                per,
+                unit,
+                program.scenario.rows,
+                regs,
+            )
 
 
 def build(program: Program):
@@ -407,7 +522,9 @@ def build(program: Program):
     ``launch(step, layer, table, scratch, priv, stream=...)``."""
     t = program.target
     keyed = program.key() + (("sources", source_digest()),)
-    lds_words = program.lds_layout.words  # the planner's: the arena, then the carried regions
+    lds_words = (
+        program.lds_layout.words
+    )  # the planner's: the arena, then the carried regions
 
     @fx.struct
     class Smem:
@@ -420,10 +537,17 @@ def build(program: Program):
     def mono(step: Int64, layer: Int32, table: Int64, scratch: Int64, priv: Int64):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        for name, v in (("step", step), ("table", table), ("scratch", scratch), ("priv", priv)):
+        for name, v in (
+            ("step", step),
+            ("table", table),
+            ("scratch", scratch),
+            ("priv", priv),
+        ):
             trace.root(v, trace.INTERNAL, name)  # the memory-model record (no IR)
         lds = fx.SharedAllocator().allocate(Smem).peek().w.ptr
-        if const_expr(program.peer and program.fast_entry):  # a scalar load with the table's (no vector round trip)
+        if const_expr(
+            program.peer and program.fast_entry
+        ):  # a scalar load with the table's (no vector round trip)
             tag = _load_step(step) * LAYER_SLOTS + layer + 1
         else:
             tag = uniform(ld_i32(step, 0)) * LAYER_SLOTS + layer + 1
@@ -440,28 +564,57 @@ def build(program: Program):
             scratch=scratch,
             priv=priv,
         )
-        if const_expr(program.dual_on):  # the copy bits of this CTA's XCD, bit 8 p for page p (word 0 of priv)
-            hdr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<4>"), fx.Int64(priv).ir_value())
-            w = fx.Int32(llvm.LoadOp(T.i32, hdr.result, alignment=4, invariant=True).result)
+        if const_expr(
+            program.dual_on
+        ):  # the copy bits of this CTA's XCD, bit 8 p for page p (word 0 of priv)
+            hdr = llvm.IntToPtrOp(
+                ir.Type.parse("!llvm.ptr<4>"), fx.Int64(priv).ir_value()
+            )
+            w = fx.Int32(
+                llvm.LoadOp(T.i32, hdr.result, alignment=4, invariant=True).result
+            )
             # the hardware's XCD: CTA id mod 8 is one only up to the launch's first XCD
-            xcc = llvm.InlineAsmOp(T.i32, [], "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID)", "=s", has_side_effects=False)
-            base.dual = (w >> (fx.Int32(xcc.result) & 7)) & sum(1 << (8 * pg) for pg in range(program.dual_pages))
-        if const_expr(program.peer and program.fast_entry):  # scalar loads with the other entries (one round trip)
+            xcc = llvm.InlineAsmOp(
+                T.i32,
+                [],
+                "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID)",
+                "=s",
+                has_side_effects=False,
+            )
+            base.dual = (w >> (fx.Int32(xcc.result) & 7)) & sum(
+                1 << (8 * pg) for pg in range(program.dual_pages)
+            )
+        if const_expr(
+            program.peer and program.fast_entry
+        ):  # scalar loads with the other entries (one round trip)
             base.peers = base.args[PEERS_ARG]
-            base.rank = fx.Int32(base.args[RANK_ARG])  # a value, not an address: its low word
+            base.rank = fx.Int32(
+                base.args[RANK_ARG]
+            )  # a value, not an address: its low word
         elif const_expr(program.peer):
             # the rank is a value in the table, not an address: its low word
             base.peers = load_ptr64(table, program.args.index(PEERS_ARG))
             base.rank = uniform(ld_i32(table, 2 * program.args.index(RANK_ARG)))
         _roots(base)
         base.peer_phase = None
-        if const_expr(program.peer and program.peer_shared):  # the group's step phase (peer table entry tp, low word)
+        if const_expr(
+            program.peer and program.peer_shared
+        ):  # the group's step phase (peer table entry tp, low word)
             base.peer_phase = uniform(ld_i32(base.peers, 2 * program.scenario.tp))
         _emit_stages(program, base)
 
     @flyc.jit
-    def launch(step: Int64, layer: Int32, table: Int64, scratch: Int64, priv: Int64, stream: fx.Stream = fx.Stream(None)):
+    def launch(
+        step: Int64,
+        layer: Int32,
+        table: Int64,
+        scratch: Int64,
+        priv: Int64,
+        stream: fx.Stream = fx.Stream(None),
+    ):
         _ = keyed
-        mono(step, layer, table, scratch, priv).launch(grid=(t.grid,), block=(t.threads,), stream=stream)
+        mono(step, layer, table, scratch, priv).launch(
+            grid=(t.grid,), block=(t.threads,), stream=stream
+        )
 
     return launch

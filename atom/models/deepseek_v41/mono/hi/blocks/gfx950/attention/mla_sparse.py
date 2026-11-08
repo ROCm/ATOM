@@ -135,19 +135,41 @@ class _SPlan:
     cache_len: int
     out: str
     heads: int = HEADS
-    sel_ch: bool = False  # sel is a tagged F32 channel (int32 bits) of this launch (an index source's Indexer)
-    new: str = ""  # a KV source: this launch's entries from this tagged BF16 channel (the Compressor's, row-indexed)
-    ratio: int = 1  # ... entries from base // ratio (row j emits (base + j) // ratio at (base + j + 1) % ratio == 0)
+    sel_ch: bool = (
+        False  # sel is a tagged F32 channel (int32 bits) of this launch (an index source's Indexer)
+    )
+    new: str = (
+        ""  # a KV source: this launch's entries from this tagged BF16 channel (the Compressor's, row-indexed)
+    )
+    ratio: int = (
+        1  # ... entries from base // ratio (row j emits (base + j) // ratio at (base + j + 1) % ratio == 0)
+    )
     ring_slots: int = WINDOW  # the window ring's slots (MLAWindowAttn's ``ring_slots``)
-    ring_first: bool = False  # the window task lands the ring before its q poll (MLAWindowAttn's ``ring_first``)
-    new_early: bool = False  # a KV source: every entry the step emits polled into LDS at chunk task start
-    dsplit: int = 1  # window / chunk tasks a (row, tile[, chunk]) by P V dims (MLAWindowAttn's ``dsplit``)
-    smerge: bool = False  # the window / chunk tasks put their raw scores; the merge runs the softmax and the P V
+    ring_first: bool = (
+        False  # the window task lands the ring before its q poll (MLAWindowAttn's ``ring_first``)
+    )
+    new_early: bool = (
+        False  # a KV source: every entry the step emits polled into LDS at chunk task start
+    )
+    dsplit: int = (
+        1  # window / chunk tasks a (row, tile[, chunk]) by P V dims (MLAWindowAttn's ``dsplit``)
+    )
+    smerge: bool = (
+        False  # the window / chunk tasks put their raw scores; the merge runs the softmax and the P V
+    )
     mheads: int = TILE  # smerge: heads a merge task (1, 2, 4, 8 or 16 of a tile)
-    wsplit: bool = False  # smerge: the window's two chunks as two tasks (64 keys each, as a compressed chunk's)
-    ckv4: bool = False  # smerge: the merge's compressed V from the cache's FP4 copy (``<ckv>.q4`` / ``.s4``: exact)
-    ring8: bool = False  # smerge: the merge's window V from the ring's MXFP8 copy (``<ring>.q8`` / ``.s8``: exact)
-    cratio: int = 1  # the compressed cache's ratio (its rows a page in ATOM's pool, ``paged``)
+    wsplit: bool = (
+        False  # smerge: the window's two chunks as two tasks (64 keys each, as a compressed chunk's)
+    )
+    ckv4: bool = (
+        False  # smerge: the merge's compressed V from the cache's FP4 copy (``<ckv>.q4`` / ``.s4``: exact)
+    )
+    ring8: bool = (
+        False  # smerge: the merge's window V from the ring's MXFP8 copy (``<ring>.q8`` / ``.s8``: exact)
+    )
+    cratio: int = (
+        1  # the compressed cache's ratio (its rows a page in ATOM's pool, ``paged``)
+    )
     # the chunk / merge tasks' index math as unsigned shifts and one modulo (keys, rows and slots are never negative;
     # a window key's position is at least -(WINDOW - 1)) and the merge's V^T pairs packed by v_perm_b32: fewer VALU
     # instructions, the same addresses and bits
@@ -164,7 +186,9 @@ class _SPlan:
     unrope_f32: bool = False
 
     @property
-    def tiles(self):  # 16-head tiles a row, a ragged last one included (``MLAWindowAttn``'s ``_APlan.tiles``)
+    def tiles(
+        self,
+    ):  # 16-head tiles a row, a ragged last one included (``MLAWindowAttn``'s ``_APlan.tiles``)
         return -(-self.heads // TILE)
 
     def head(self, ht, *hh):
@@ -175,7 +199,9 @@ class _SPlan:
             h = h + x
         return fx.min(h, fx.Int32(self.heads - 1)) if self.heads % TILE else h
 
-    def win(self) -> _APlan:  # the window part's plan (MLAWindowAttn's LDS layout and names)
+    def win(
+        self,
+    ) -> _APlan:  # the window part's plan (MLAWindowAttn's LDS layout and names)
         return _APlan(self.name, self.rows, self.spec, self.q, self.kvn, self.ring, self.pos, self.rope, self.sink,
                       self.out, f"{self.name}.done", self.heads, ring_slots=self.ring_slots,
                       ring_first=self.ring_first, dsplit=self.dsplit, unrope_f32=self.unrope_f32)  # fmt: skip
@@ -202,7 +228,9 @@ class _SPlan:
         return self.c_v + CH
 
     @property
-    def c_n(self):  # new_early: the step's emitted entries, row j's (if it emits) at j x HD / 2 (bf16 pairs)
+    def c_n(
+        self,
+    ):  # new_early: the step's emitted entries, row j's (if it emits) at j x HD / 2 (bf16 pairs)
         return -(-(self.c_i + CH) // 4) * 4
 
     @property
@@ -212,8 +240,14 @@ class _SPlan:
     # smerge merge task LDS (words): V^T [SLICE][VTP] at 0 (then t [NCT][mheads][OP] over it), P [TILE][PP], the
     # selection [SEL] (int32), a KV source's emitted entries' slices [spec][SLICE / 2], maxima and sums [mheads][NCT]
     @property
-    def mgroups(self):  # head groups a tile (a single tile of fewer than 16 heads, e.g. 8 at TP8: its live ones)
-        return -(-min(self.heads, TILE) // self.mheads) if self.tiles == 1 else TILE // self.mheads
+    def mgroups(
+        self,
+    ):  # head groups a tile (a single tile of fewer than 16 heads, e.g. 8 at TP8: its live ones)
+        return (
+            -(-min(self.heads, TILE) // self.mheads)
+            if self.tiles == 1
+            else TILE // self.mheads
+        )
 
     @property
     def m_vt(self):
@@ -253,7 +287,9 @@ def _win(k, t, p: _SPlan):
         _wchunk(k, t, p)
         return
     ap = p.win()
-    rt, j = (t // p.dsplit, t % p.dsplit) if p.dsplit > 1 else (t, 0)  # (row, tile), the task's dim part
+    rt, j = (
+        (t // p.dsplit, t % p.dsplit) if p.dsplit > 1 else (t, 0)
+    )  # (row, tile), the task's dim part
     r, ht = rt // p.tiles, rt % p.tiles
     b, base, pos = _row_pos(k, p.pos, p.spec, r)  # 6: P V, 7: num out
     if ap.ring_first:
@@ -273,14 +309,18 @@ def _win(k, t, p: _SPlan):
         return
     _softmax_all(k, ap, pos)
     gpu.barrier()
-    if p.dsplit > 1:  # m_1 (and den_1) out before the P V: the chunk tasks' prefix max waits on it; part 0's
+    if (
+        p.dsplit > 1
+    ):  # m_1 (and den_1) out before the P V: the chunk tasks' prefix max waits on it; part 0's
         _win_scalars_if(k, ap, p, rt, j == 0)
     else:
         _win_scalars(k, ap, p, rt)
     acc = _pv_all(k, ap, j * (HD // p.dsplit) if p.dsplit > 1 else 0)
     ld = k.lane // 16
     a = k.mb[f"{p.name}.num"]
-    for i in range_constexpr(0, len(acc), 2):  # (dim 2 m, dim 2 m + 1) of the lane's 4 heads
+    for i in range_constexpr(
+        0, len(acc), 2
+    ):  # (dim 2 m, dim 2 m + 1) of the lane's 4 heads
         (dim, v0), (_, v1) = acc[i], acc[i + 1]
         for e in range_constexpr(4):
             mb.put2(a, (rt * TILE + ld * 4 + e) * HD + dim, v0[e], v1[e], k.tag)
@@ -301,7 +341,8 @@ def _win_s(k, ap, p, rt):
 
 def _wchunk(k, t, p: _SPlan):
     """smerge + wsplit: (row, tile, window chunk c): its 64 ring rows (the step's own over theirs), the q tile, the
-    scores (``_chunk_scores``: the window task's MFMA chain per key) and their put as chunk c of ``<name>.s``."""
+    scores (``_chunk_scores``: the window task's MFMA chain per key) and their put as chunk c of ``<name>.s``.
+    """
     ap = p.win()
     rt, c = t // 2, t % 2
     r, ht = rt // p.tiles, rt % p.tiles
@@ -351,8 +392,13 @@ def _wown_keys(k, p: _SPlan, b, base, pos, c):
         row, dw = w // (HD // 2), w % (HD // 2)
         g = base + row - (pos - (WINDOW - 1)) - c * CH  # the key's index in the chunk
         if (base + row <= pos) & (g >= 0) & (g < CH):
-            got = mb.poll([(k.mb[p.kvn], (b * p.spec + row) * (HD // 2) + dw, 2)], k.tag)[0]
-            fx.ptr_store(fx.Vector.from_elements(got, fx.Int32).bitcast(fx.Float32), k.ldsf + (p.c_k + g * PITCH + dw))
+            got = mb.poll(
+                [(k.mb[p.kvn], (b * p.spec + row) * (HD // 2) + dw, 2)], k.tag
+            )[0]
+            fx.ptr_store(
+                fx.Vector.from_elements(got, fx.Int32).bitcast(fx.Float32),
+                k.ldsf + (p.c_k + g * PITCH + dw),
+            )
 
 
 # ------------------------------------------------------------------ a compressed chunk
@@ -382,7 +428,8 @@ def _sel_land(k, p: _SPlan, r, c):
 
 def _ckv_addr(k, p: _SPlan, b, idx, uni: bool = True):
     """The 64-bit address of request b's compressed entry ``idx`` (clamped into [0, cache_len): a pad's read lands on
-    a valid row) in ATOM's pool, through its block table (``paged.row_addr``; ``uni``: a wave-uniform entry)."""
+    a valid row) in ATOM's pool, through its block table (``paged.row_addr``; ``uni``: a wave-uniform entry).
+    """
     e = fx.min(fx.max(idx, 0), fx.Int32(p.cache_len - 1))
     return paged.row_addr(k, p.ckv, b, e, p.cratio, uni)
 
@@ -402,7 +449,13 @@ def _gather_issue(k, p: _SPlan, b, r, c):
         oks.append(idx >= 0)
         idxs.append(idx)
         # (the row's page from the block table: a scalar load, then the 1 KiB row from its own base)
-        vs.append(fx.Vector(bo.buffer_load(rsrc(_ckv_addr(k, p, b, idx)), k.lane * 4, vec_width=4, dtype=T.i32)))
+        vs.append(
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(_ckv_addr(k, p, b, idx)), k.lane * 4, vec_width=4, dtype=T.i32
+                )
+            )
+        )
     return oks, idxs, vs
 
 
@@ -410,7 +463,9 @@ def _gather_land(k, p: _SPlan, oks, idxs, vs, b, base):
     for i in range(CH // WAVES):
         key = k.wave * (CH // WAVES) + i
         words = [oks[i].select(vs[i][e], fx.Int32(0)) for e in range(4)]
-        if p.new and p.new_early:  # an entry this launch emits: from the LDS copy of the Compressor's channel
+        if (
+            p.new and p.new_early
+        ):  # an entry this launch emits: from the LDS copy of the Compressor's channel
             words = _new_entry_lds(k, p, base, idxs[i], words)
         fx.ptr_store(fx.Vector.from_elements(words, fx.Int32).bitcast(fx.Float32),
                      k.ldsf + (p.c_k + key * PITCH + k.lane * 4))  # fmt: skip
@@ -431,7 +486,8 @@ def _new_entry_lds(k, p, base, idx, words):
 @traced
 def _new_land(k, p: _SPlan, b, base):
     """new_early: the step's emitted entries (request b's rows j with (base + j + 1) % ratio == 0) from the
-    Compressor's channel into LDS (thread: row tid / 32, 8 words); they land long before the selection does."""
+    Compressor's channel into LDS (thread: row tid / 32, 8 words); they land long before the selection does.
+    """
     j = fx.min(k.tid // 32, fx.Int32(p.spec - 1))
     w = (k.tid % 32) * 8
     if (k.tid // 32 < p.spec) & ((base + j + 1) % p.ratio == 0):
@@ -446,7 +502,9 @@ def _new_land(k, p: _SPlan, b, base):
 @traced
 def _valid_put(k, p, key, ok):
     if k.lane == 0:
-        fx.ptr_store(ok.select(fx.Float32(1.0), fx.Float32(0.0)), k.ldsf + (p.c_v + key))
+        fx.ptr_store(
+            ok.select(fx.Float32(1.0), fx.Float32(0.0)), k.ldsf + (p.c_v + key)
+        )
 
 
 @traced
@@ -461,7 +519,9 @@ def _chunk_scores(k, p: _SPlan):
             bq = _lds_bf8(k, lm * PITCH + kst * 16 + ld * 4)
             acc = mfma_bf16(a, bq, acc)
         for e in range_constexpr(4):
-            fx.ptr_store(acc[e], k.ldsf + (p.c_s + lm * CPITCH + k.wave * 16 + ld * 4 + e))
+            fx.ptr_store(
+                acc[e], k.ldsf + (p.c_s + lm * CPITCH + k.wave * 16 + ld * 4 + e)
+            )
 
 
 def _chunk_softmax(k, p: _SPlan, t, c, lead=True):
@@ -472,18 +532,26 @@ def _chunk_softmax(k, p: _SPlan, t, c, lead=True):
     sv = []
     for i in range_constexpr(2):
         raw = fx.ptr_load(k.ldsf + (p.c_s + hh * CPITCH + kk + i)) * scale
-        sv.append((fx.ptr_load(k.ldsf + (p.c_v + kk + i)) != fx.Float32(0.0)).select(raw, fx.Float32(-math.inf)))
+        sv.append(
+            (fx.ptr_load(k.ldsf + (p.c_v + kk + i)) != fx.Float32(0.0)).select(
+                raw, fx.Float32(-math.inf)
+            )
+        )
     mx = butterfly(fx.max(sv[0], sv[1]), (1, 2, 4, 8, 16), fx.max)
     tt = t // NCH  # the (row, tile)
     _lead_put(k, k.mb[f"{p.name}.mx"], (tt * NCH + c) * TILE + hh, mx, lead)
     # the prefix max: m_1 (the window's) and the earlier chunks' maxima (max in any order: exact). Every chunk's max
     # is polled in one batch (each task puts its own before it waits: no cycle), the later ones dropped
     specs = [(k.mb[f"{p.name}.w"], 2 * (tt * TILE + hh), 1)]
-    specs += [(k.mb[f"{p.name}.mx"], (tt * NCH + jc) * TILE + hh, 1) for jc in range(NCH)]
+    specs += [
+        (k.mb[f"{p.name}.mx"], (tt * NCH + jc) * TILE + hh, 1) for jc in range(NCH)
+    ]
     got = mb.poll(specs, k.tag)
     m_prev = got[0][0].bitcast(fx.Float32)
     for jc in range_constexpr(NCH):
-        m_prev = (fx.Int32(jc) < c).select(fx.max(m_prev, got[1 + jc][0].bitcast(fx.Float32)), m_prev)
+        m_prev = (fx.Int32(jc) < c).select(
+            fx.max(m_prev, got[1 + jc][0].bitcast(fx.Float32)), m_prev
+        )
     m_new = fx.max(m_prev, mx)
     pv = [fx.Float32(fmath.exp(v - m_new)) for v in sv]
     lsum = butterfly(pv[0] + pv[1], (1, 2, 4, 8, 16))
@@ -514,7 +582,8 @@ def _lead_put1(k, a, i, v):
 @traced
 def _chunk_pv(k, p: _SPlan, t, j=0):
     """P_c V_c: wave w holds dims 64 w .. + 64 of the 16 heads (``_pv_all``'s operands and order for one chunk; with
-    ``dsplit`` 2, part j's 256: 32 a wave), put as (dim 2 m, dim 2 m + 1) pairs of each of the lane's 4 heads."""
+    ``dsplit`` 2, part j's 256: 32 a wave), put as (dim 2 m, dim 2 m + 1) pairs of each of the lane's 4 heads.
+    """
     lm, ld = k.lane % 16, k.lane // 16
     a_t = k.mb[f"{p.name}.t"]
     dpw = 64 // p.dsplit
@@ -526,11 +595,18 @@ def _chunk_pv(k, p: _SPlan, t, j=0):
             a = _lds_bf8(k, p.c_p + lm * CPPITCH + kst * 16 + ld * 4)
             ws = [fx.ptr_load(k.ldsf + (p.c_k + (kst * 32 + ld * 8 + i) * PITCH + dword)).bitcast(fx.Int32)
                   for i in range(8)]  # fmt: skip
-            halves = ([w & fx.Int32(0xFFFF) for w in ws], [fx.Int32(fx.Uint32(w) >> 16) for w in ws])
+            halves = (
+                [w & fx.Int32(0xFFFF) for w in ws],
+                [fx.Int32(fx.Uint32(w) >> 16) for w in ws],
+            )
             for par in range_constexpr(2):
                 hv = halves[par]
                 bw = [hv[2 * i] | (hv[2 * i + 1] << fx.Int32(16)) for i in range(4)]
-                ts[par] = mfma_bf16(a, fx.Vector.from_elements(bw, fx.Int32).bitcast(fx.BFloat16), ts[par])
+                ts[par] = mfma_bf16(
+                    a,
+                    fx.Vector.from_elements(bw, fx.Int32).bitcast(fx.BFloat16),
+                    ts[par],
+                )
         dim = d_blk + 2 * lm
         for e in range_constexpr(4):
             mb.put2(a_t, (t * TILE + ld * 4 + e) * HD + dim, ts[0][e], ts[1][e], k.tag)
@@ -548,7 +624,9 @@ def _chunk(k, t, p: _SPlan):
         _sel_land(k, p, r, c)
     if p.sel_ch or (p.new_early and p.new):
         gpu.barrier()
-    oks, idxs, vs = _gather_issue(k, p, b, r, c)  # a consumer: plain, from earlier launches, before the q poll
+    oks, idxs, vs = _gather_issue(
+        k, p, b, r, c
+    )  # a consumer: plain, from earlier launches, before the q poll
     if p.kfirst and not p.new:  # the keys into LDS while q comes
         _gather_land(k, p, oks, idxs, vs, b, base)
     _q_tile(k, p.win(), r, ht, pos)
@@ -557,14 +635,18 @@ def _chunk(k, t, p: _SPlan):
     gpu.barrier()
     _chunk_scores(k, p)
     gpu.barrier()
-    if p.smerge:  # the raw scores out (``<name>.s``, chunk 2 + c); the merge does the rest
+    if (
+        p.smerge
+    ):  # the raw scores out (``<name>.s``, chunk 2 + c); the merge does the rest
         hh, kk = k.tid // 32, (k.tid % 32) * 2
         at = p.c_s + hh * CPITCH + kk
         mb.put2(k.mb[f"{p.name}.s"], ((tt * NCT + 2 + c) * TILE + hh) * CH + kk, fx.ptr_load(k.ldsf + at),
                 fx.ptr_load(k.ldsf + (at + 1)), k.tag)  # fmt: skip
         gpu.barrier()  # the next task reuses the LDS
         return
-    _chunk_softmax(k, p, t, c, True if p.dsplit == 1 else j == 0)  # part 0 puts the chunk's max and sum
+    _chunk_softmax(
+        k, p, t, c, True if p.dsplit == 1 else j == 0
+    )  # part 0 puts the chunk's max and sum
     gpu.barrier()
     _chunk_pv(k, p, t, j)
     gpu.barrier()  # the next task reuses the LDS
@@ -609,7 +691,9 @@ def _msel_land(k, p: _SPlan, r):
     if const_expr(p.sel_ch):
         w = mb.poll([(k.mb[p.sel], r * SEL + k.tid, 1)], k.tag)[0][0]
     else:
-        w = bo.buffer_load(rsrc(k.args[p.sel]), r * SEL + k.tid, vec_width=1, dtype=T.i32)
+        w = bo.buffer_load(
+            rsrc(k.args[p.sel]), r * SEL + k.tid, vec_width=1, dtype=T.i32
+        )
     fx.ptr_store(fx.Int32(w), k.lds + (p.m_i + k.tid))
 
 
@@ -620,7 +704,10 @@ def _mnew_land(k, p: _SPlan, b, base, s):
     j = fx.min(k.tid // 16, fx.Int32(p.spec - 1))
     w = (k.tid % 16) * 2
     if (k.tid // 16 < p.spec) & ((base + j + 1) % p.ratio == 0):
-        got = mb.poll([(k.mb[p.new], (b * p.spec + j) * (HD // 2) + s * (SLICE // 2) + w, 2)], k.tag)[0]
+        got = mb.poll(
+            [(k.mb[p.new], (b * p.spec + j) * (HD // 2) + s * (SLICE // 2) + w, 2)],
+            k.tag,
+        )[0]
         at = p.m_n + j * (SLICE // 2) + w
         fx.ptr_store(fx.Int32(got[0]), k.lds + at)
         fx.ptr_store(fx.Int32(got[1]), k.lds + (at + 1))
@@ -646,7 +733,8 @@ def _vk_word(p: _SPlan, key, word):
 def _vt_store(k, p: _SPlan, key0, words, par, piece):
     """A lane pair (lane ^ 1: keys key0, key0 + 1 by ``par``) of 4 words each (dims 8 piece .. + 8 of a key):
     halves exchanged so that each lane holds 4 words (one dim, the key pair: the even key in the low half), dims
-    8 piece + 4 par .. + 4, stored into V^T. ``vtr``: each lane's 4 words as they are into its key's row."""
+    8 piece + 4 par .. + 4, stored into V^T. ``vtr``: each lane's 4 words as they are into its key's row.
+    """
     if p.vtr:
         fx.ptr_store(fx.Vector.from_elements([fx.Int32(w) for w in words], fx.Int32),
                      k.lds + _vk_word(p, key0 + par, piece * 4))  # fmt: skip
@@ -656,7 +744,9 @@ def _vt_store(k, p: _SPlan, key0, words, par, piece):
     got = [fx.Int32(xshfl(v, 1)) for v in sent]
     own = [even.select(words[0], words[2]), even.select(words[1], words[3])]
     out = []
-    if p.lean:  # the same words: (key0's half, key0 + 1's half) by byte selects of (own, got)
+    if (
+        p.lean
+    ):  # the same words: (key0's half, key0 + 1's half) by byte selects of (own, got)
         lo = even.select(fx.Int32(0x01000504), fx.Int32(0x05040100))
         hi = even.select(fx.Int32(0x03020706), fx.Int32(0x07060302))
         for o, g in zip(own, got, strict=True):
@@ -664,7 +754,9 @@ def _vt_store(k, p: _SPlan, key0, words, par, piece):
         half = fx.Int32(fx.Uint32(key0) >> 1)
     d0 = piece * 8 + par * 4
     for m in range(4):
-        fx.ptr_store(out[m].bitcast(fx.Float32), k.ldsf + (p.m_vt + (d0 + m) * VTP + half))
+        fx.ptr_store(
+            out[m].bitcast(fx.Float32), k.ldsf + (p.m_vt + (d0 + m) * VTP + half)
+        )
 
 
 def _mown_spec(k, p: _SPlan, b, base, pos, s):
@@ -680,7 +772,15 @@ def _mown_try(spec):
     """One attempt of the own rows' poll, issued at task start, not waited for (``linear._try_batch``)."""
     a, i, n = spec
     note(a.region, a.space, "poll")
-    v = fx.Vector(bo.buffer_load(rsrc(a.value), fx.Int32(i) * 2, vec_width=2 * n, dtype=T.i32, cache_modifier=CM_DEV))
+    v = fx.Vector(
+        bo.buffer_load(
+            rsrc(a.value),
+            fx.Int32(i) * 2,
+            vec_width=2 * n,
+            dtype=T.i32,
+            cache_modifier=CM_DEV,
+        )
+    )
     return [v[e] for e in range(2 * n)]
 
 
@@ -697,7 +797,9 @@ def _mown_land(k, p: _SPlan, base, pos, spec, ok, words, ldsb):
         w = (k.tid % 16) * 2
         g = base + j - (pos - (WINDOW - 1))  # the key's index in the window
         if const_expr(p.vtr):  # the two words into the key's row
-            fx.ptr_store(fx.Vector.from_elements([w0, w1], fx.Int32), k.lds + _vk_word(p, g, w))
+            fx.ptr_store(
+                fx.Vector.from_elements([w0, w1], fx.Int32), k.lds + _vk_word(p, g, w)
+            )
         for i, wd in enumerate((w0, w1) if not p.vtr else ()):
             v = fx.Vector.from_elements([wd], fx.Int32).bitcast(fx.BFloat16)
             for e in range_constexpr(2):
@@ -732,7 +834,10 @@ def _ms_specs(k, p: _SPlan, tt, hg):
     ccs = [g + G * i for i in range(-(-NCT // G))]
     oks = [cc < NCT for cc in ccs]
     ccs = [fx.min(cc, fx.Int32(NCT - 1)) for cc in ccs]
-    specs = [(k.mb[f"{p.name}.s"], ((tt * NCT + cc) * TILE + hh) * CH + 2 * j, 2) for cc in ccs]
+    specs = [
+        (k.mb[f"{p.name}.s"], ((tt * NCT + cc) * TILE + hh) * CH + 2 * j, 2)
+        for cc in ccs
+    ]
     return specs, ccs, oks, h, j
 
 
@@ -753,7 +858,9 @@ def _msoftmax(k, p: _SPlan, tt, hg, pos):
             raw = got[i][e].bitcast(fx.Float32) * scale
             ci = fx.min(fx.max(cc - 2, 0), fx.Int32(NCH - 1))
             win = (cc < 2) & (pos - (WINDOW - 1) + cc * CH + kk + e >= 0)
-            cmp = (cc >= 2) & (fx.Int32(fx.ptr_load(k.lds + (p.m_i + ci * CH + kk + e))) >= 0)
+            cmp = (cc >= 2) & (
+                fx.Int32(fx.ptr_load(k.lds + (p.m_i + ci * CH + kk + e))) >= 0
+            )
             sv.append((win | cmp).select(raw, fx.Float32(-math.inf)))
         svs.append(sv)
     mxs = _bfly([fx.max(sv[0], sv[1]) for sv in svs], (1, 2, 4, 8, 16), fx.max)
@@ -764,10 +871,18 @@ def _msoftmax(k, p: _SPlan, tt, hg, pos):
     for c in range(NCT):
         m_prev = fx.max(m_prev, fx.ptr_load(k.ldsf + (p.m_x + h * NCT + c)))
         ms.append(m_prev)
-    pvs = [[fx.Float32(fmath.exp(v - _pick(ms, cc))) for v in sv] for sv, cc in zip(svs, ccs, strict=True)]
+    pvs = [
+        [fx.Float32(fmath.exp(v - _pick(ms, cc))) for v in sv]
+        for sv, cc in zip(svs, ccs, strict=True)
+    ]
     lss = _bfly([pv[0] + pv[1] for pv in pvs], (1, 2, 4, 8, 16))
     for i, cc in enumerate(ccs):
-        _lds_put_if(k, oks[i], p.m_p + h * PP + cc * (CH // 2) + j, bf16_pair(pvs[i][0], pvs[i][1]))
+        _lds_put_if(
+            k,
+            oks[i],
+            p.m_p + h * PP + cc * (CH // 2) + j,
+            bf16_pair(pvs[i][0], pvs[i][1]),
+        )
         _lds_put_if(k, oks[i] & (j == 0), p.m_l + h * NCT + cc, lss[i])
 
 
@@ -776,7 +891,9 @@ def _mt_store(k, p, cc, acc, dim, ld):
     """t[cc][head][dim] of the lane's heads ld * 4 + e below ``mheads``."""
     for e in range_constexpr(4):
         if ld * 4 + e < p.mheads:
-            fx.ptr_store(acc[e], k.ldsf + (p.m_vt + (cc * p.mheads + ld * 4 + e) * OP + dim))
+            fx.ptr_store(
+                acc[e], k.ldsf + (p.m_vt + (cc * p.mheads + ld * 4 + e) * OP + dim)
+            )
 
 
 def _mpv(k, p: _SPlan):
@@ -786,20 +903,29 @@ def _mpv(k, p: _SPlan):
     lm, ld = k.lane % 16, k.lane // 16
     cb, half = k.wave % 4, k.wave // 4
     dim = cb * 16 + lm
-    if p.vtr:  # the lane's row of each transpose read: key 8 ld + lm // 4 (+ 4, 32 kst, 64 cc), dims 16 cb + 4 (lm % 4)
-        vk = fx.recast_iter(fx.BFloat16, k.lds) + _vk_word(p, ld * 8 + (lm >> 2), cb * 8 + (lm & 3) * 2) * 2
+    if (
+        p.vtr
+    ):  # the lane's row of each transpose read: key 8 ld + lm // 4 (+ 4, 32 kst, 64 cc), dims 16 cb + 4 (lm % 4)
+        vk = (
+            fx.recast_iter(fx.BFloat16, k.lds)
+            + _vk_word(p, ld * 8 + (lm >> 2), cb * 8 + (lm & 3) * 2) * 2
+        )
     ts = []
     for i in range(NCT // 2):
         cc = half * (NCT // 2) + i
         acc = fx.Vector.filled(4, 0.0, fx.Float32)
         for kst in range(CH // 32):
             a = _lds_bf8(k, p.m_p + lm * PP + cc * (CH // 2) + kst * 16 + ld * 4)
-            if p.vtr:  # keys 8 ld .. + 4 and + 4 .. + 8 of the 32 (the swizzle depends on key bits 1 and 3 only)
+            if (
+                p.vtr
+            ):  # keys 8 ld .. + 4 and + 4 .. + 8 of the 32 (the swizzle depends on key bits 1 and 3 only)
                 off = (cc * CH + kst * 32) * SLICE
                 w = lds_read_tr16(vk + off) + lds_read_tr16(vk + (off + 4 * SLICE))
                 bq = fx.Vector.from_elements(w, fx.Int32).bitcast(fx.BFloat16)
             else:
-                bq = _lds_bf8(k, p.m_vt + dim * VTP + cc * (CH // 2) + kst * 16 + ld * 4)
+                bq = _lds_bf8(
+                    k, p.m_vt + dim * VTP + cc * (CH // 2) + kst * 16 + ld * 4
+                )
             acc = mfma_bf16(a, bq, acc)
         ts.append((cc, acc))
     gpu.barrier()  # every wave's V^T reads are done: t overlays it
@@ -814,7 +940,10 @@ def _smerge(k, t, p: _SPlan):
     and the output."""
     nsl = HD // SLICE
     tt, rem = t // (p.mgroups * nsl), t % (p.mgroups * nsl)
-    hg, s = rem // nsl, rem % nsl  # head-group siblings 8 tasks apart: the same XCD (their V^T reads alike)
+    hg, s = (
+        rem // nsl,
+        rem % nsl,
+    )  # head-group siblings 8 tasks apart: the same XCD (their V^T reads alike)
     r, ht = tt // p.tiles, tt % p.tiles
     b, base, pos = _row_pos(k, p.pos, p.spec, r)
     # V loads: key kq of each 64 (lane pairs: consecutive keys), words 4 piece .. + 4 of the slice
@@ -822,7 +951,9 @@ def _smerge(k, t, p: _SPlan):
     kq = k.wave * 8 + (k.lane // 16) * 2 + par
     r_ring = rsrc(k.args[p.ring])
     wv = []
-    for i in range(0 if p.ring8 else WINDOW // CH):  # the window's ring rows (before the step's first position)
+    for i in range(
+        0 if p.ring8 else WINDOW // CH
+    ):  # the window's ring rows (before the step's first position)
         kp = pos - (WINDOW - 1) + i * CH + kq
         slot = _ring_slot(p, kp)
         wv.append(fx.Vector(bo.buffer_load(r_ring, _row_words(p, b * p.ring_slots + slot) + s * (SLICE // 2)
@@ -844,14 +975,23 @@ def _smerge(k, t, p: _SPlan):
     for i in range(0 if p.ring8 else WINDOW // CH):
         kp = pos - (WINDOW - 1) + i * CH + kq
         ok = (kp >= 0) & (kp < base)
-        _vt_store(k, p, i * CH + kq - par, [ok.select(wv[i][e], fx.Int32(0)) for e in range(4)], par, piece)
+        _vt_store(
+            k,
+            p,
+            i * CH + kq - par,
+            [ok.select(wv[i][e], fx.Int32(0)) for e in range(4)],
+            par,
+            piece,
+        )
     for c in range(0 if p.ckv4 else NCH):
         words = [oks[c].select(cv[c][e], fx.Int32(0)) for e in range(4)]
         if p.new:
             words = _mnew_entry(k, p, base, idxs[c], piece, words)
         _vt_store(k, p, (2 + c) * CH + kq - par, words, par, piece)
     gpu.barrier()  # every ring row (zeros at the step's own slots) is in before the own rows overwrite them
-    _mown_land(k, p, base, pos, own_spec, own_ok, own, fx.recast_iter(fx.BFloat16, k.lds))
+    _mown_land(
+        k, p, base, pos, own_spec, own_ok, own, fx.recast_iter(fx.BFloat16, k.lds)
+    )
     if not p.ring8:  # (the copy is the import's: RingWrite writes only the bf16 ring)
         _mdone(k, p, t)  # the ring is read (RingWrite)
     _msoftmax(k, p, tt, hg, pos)
@@ -860,10 +1000,15 @@ def _smerge(k, t, p: _SPlan):
 
 def _smerge_tail(k, p: _SPlan, t, tt, hg, s, r, ht, pos):
     """After the softmax: P V, the recurrence, the output."""
-    hh, j = fx.min(k.tid // 32, fx.Int32(p.mheads - 1)), k.tid % 32  # the output's head (tid < mheads x 32) and dims
+    hh, j = (
+        fx.min(k.tid // 32, fx.Int32(p.mheads - 1)),
+        k.tid % 32,
+    )  # the output's head (tid < mheads x 32) and dims
     head = p.head(ht, hg * p.mheads, hh)
     d0 = s * SLICE + 2 * j
-    sink = fx.Float32(bo.buffer_load(rsrc(k.args[p.sink]), head, vec_width=1, dtype=T.f32))
+    sink = fx.Float32(
+        bo.buffer_load(rsrc(k.args[p.sink]), head, vec_width=1, dtype=T.f32)
+    )
     first = fx.max(d0 - (HD - ROPE), 0) // 2  # the rotary pair (d0, d0 + 1)
     cs = rope_cs(k, p.rope, pos, first)
     gpu.barrier()
@@ -881,7 +1026,9 @@ def _smerge_tail(k, p: _SPlan, t, tt, hg, s, r, ht, pos):
         den = den * corr + ls[c]
         corrs.append(corr)
         m_prev = m_new
-    num = [(fx.Float32(0.0) * corrs[0] + tv[0][e]) * corrs[1] + tv[1][e] for e in range(2)]
+    num = [
+        (fx.Float32(0.0) * corrs[0] + tv[0][e]) * corrs[1] + tv[1][e] for e in range(2)
+    ]
     m = m_prev
     for c in range(NCH):  # the reference's recurrence in chunk order
         m_new = fx.max(m, mx[2 + c])
@@ -894,9 +1041,13 @@ def _smerge_tail(k, p: _SPlan, t, tt, hg, s, r, ht, pos):
     is_rope = d0 >= HD - ROPE
     a_, b_ = mw._rope_pair(o[0], o[1], fx.Float32(cs[0]), fx.Float32(cs[1]), True)
     o = [is_rope.select(a_, o[0]), is_rope.select(b_, o[1])]
-    am = butterfly(fx.max(mw._ab(o[0]), mw._ab(o[1])), (1, 2, 4, 8), fx.max)  # the 32-dim group: 16 lanes
+    am = butterfly(
+        fx.max(mw._ab(o[0]), mw._ab(o[1])), (1, 2, 4, 8), fx.max
+    )  # the 32-dim group: 16 lanes
     code = gemv.activation_code(am)
-    nb = [xshfl(o[e], 1) for e in range(2)]  # the odd lane's two values: the even lane's word
+    nb = [
+        xshfl(o[e], 1) for e in range(2)
+    ]  # the odd lane's two values: the even lane's word
     word = _qat_word([o[0], o[1], nb[0], nb[1]], code)[0]
     e0 = r * p.heads * HD + head * HD + d0
     _out_put_if(k, p, j, e0, word, code, k.tid < p.mheads * 32)
@@ -918,7 +1069,8 @@ def _from_rows(knob, sc: Scenario) -> bool:
 
 class MLASparseAttn(Block):
     """A compressed consumer layer's attention (module docstring); ``heads``: this rank's: 16-head tiles, the last one
-    ragged when heads is not a multiple of 16 (8 at TP8: its dead heads compute and write the last live head's)."""
+    ragged when heads is not a multiple of 16 (8 at TP8: its dead heads compute and write the last live head's).
+    """
 
     def __init__(self, name: str, q: Channel, kvn: Channel, out: Channel, ring: str, pos: str, rope: str, sink: str,
                  sel: str | Channel, ckv: str, cache_len: int, heads: int = HEADS, new: Channel | None = None,
@@ -930,20 +1082,42 @@ class MLASparseAttn(Block):
         if heads < 1:
             raise ValueError(f"MLASparseAttn {name}: heads {heads}")
         if q.fmt is not Fmt.BF16 or q.width != heads * HD or q.flagged:
-            raise ValueError(f"MLASparseAttn {name}: q is a tagged BF16 channel of width {heads * HD}")
+            raise ValueError(
+                f"MLASparseAttn {name}: q is a tagged BF16 channel of width {heads * HD}"
+            )
         if kvn.fmt is not Fmt.BF16 or kvn.width != HD or kvn.flagged:
-            raise ValueError(f"MLASparseAttn {name}: kvn is a tagged BF16 channel of width {HD}")
+            raise ValueError(
+                f"MLASparseAttn {name}: kvn is a tagged BF16 channel of width {HD}"
+            )
         if out.fmt is not Fmt.MXFP8 or out.width != heads * HD or out.flagged:
-            raise ValueError(f"MLASparseAttn {name}: out is a tagged MXFP8 channel of width {heads * HD}")
+            raise ValueError(
+                f"MLASparseAttn {name}: out is a tagged MXFP8 channel of width {heads * HD}"
+            )
         self.name, self.q, self.kvn, self.out, self.heads = name, q, kvn, out, heads
         self.ring, self.pos, self.rope, self.sink = ring, pos, rope, sink
-        if isinstance(sel, Channel) and (sel.fmt is not Fmt.F32 or sel.width != SEL or sel.flagged):
-            raise ValueError(f"MLASparseAttn {name}: a channel selection is a tagged F32 channel of width {SEL}")
-        if new is not None and (new.fmt is not Fmt.BF16 or new.width != HD or new.flagged):
-            raise ValueError(f"MLASparseAttn {name}: new entries are a tagged BF16 channel of width {HD}")
-        self.sel, self.ckv, self.cache_len, self.new, self.ratio = sel, ckv, cache_len, new, ratio
+        if isinstance(sel, Channel) and (
+            sel.fmt is not Fmt.F32 or sel.width != SEL or sel.flagged
+        ):
+            raise ValueError(
+                f"MLASparseAttn {name}: a channel selection is a tagged F32 channel of width {SEL}"
+            )
+        if new is not None and (
+            new.fmt is not Fmt.BF16 or new.width != HD or new.flagged
+        ):
+            raise ValueError(
+                f"MLASparseAttn {name}: new entries are a tagged BF16 channel of width {HD}"
+            )
+        self.sel, self.ckv, self.cache_len, self.new, self.ratio = (
+            sel,
+            ckv,
+            cache_len,
+            new,
+            ratio,
+        )
         if ring_slots < WINDOW:
-            raise ValueError(f"MLASparseAttn {name}: ring_slots {ring_slots} < the window {WINDOW}")
+            raise ValueError(
+                f"MLASparseAttn {name}: ring_slots {ring_slots} < the window {WINDOW}"
+            )
         self.ring_slots, self.ring_first = ring_slots, ring_first
         # a KV source: the step's emitted entries polled into LDS at chunk task start instead of after the gather (one
         # round trip fewer on the chain after the selection; the same words)
@@ -960,8 +1134,17 @@ class MLASparseAttn(Block):
         # and the 64 KB partials'; the same bits. RingWrite also waits for the merge's ring
         # reads (``ring_mdone``)
         if smerge and dsplit != 1:
-            raise ValueError(f"MLASparseAttn {name}: smerge has no P V in the window / chunk tasks (dsplit 1)")
-        if mheads not in (0, 1, 2, 4, 8, 16):  # 1 / 2: fewer heads' softmax a task, more tasks (few rows)
+            raise ValueError(
+                f"MLASparseAttn {name}: smerge has no P V in the window / chunk tasks (dsplit 1)"
+            )
+        if mheads not in (
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+        ):  # 1 / 2: fewer heads' softmax a task, more tasks (few rows)
             raise ValueError(f"MLASparseAttn {name}: mheads 1, 2, 4, 8, 16 or 0 (auto)")
         if wsplit and not smerge:
             raise ValueError(f"MLASparseAttn {name}: wsplit needs smerge")
@@ -969,9 +1152,13 @@ class MLASparseAttn(Block):
         # ckv4 (the merge's compressed V from an FP4 copy of the cache): refused, the cache is ATOM's pool
         self.ckv4 = ckv4 if smerge else False
         if self.ckv4:
-            raise ValueError(f"MLASparseAttn {name}: ckv4 (the cache's FP4 copy): the cache is ATOM's pool, in place")
+            raise ValueError(
+                f"MLASparseAttn {name}: ckv4 (the cache's FP4 copy): the cache is ATOM's pool, in place"
+            )
         if cache_ratio < 1:
-            raise ValueError(f"MLASparseAttn {name}: cache_ratio (the compressed cache's ratio: its page geometry)")
+            raise ValueError(
+                f"MLASparseAttn {name}: cache_ratio (the compressed cache's ratio: its page geometry)"
+            )
         self.cache_ratio = cache_ratio
         # ring8: the same for the window's V from the ring's MXFP8 copy (True or from n rows).
         # The copy is the caller's (the hook's import, a step): RingWrite writes the bf16 ring only and no longer
@@ -1017,17 +1204,31 @@ class MLASparseAttn(Block):
         rt = sc.rows * p.tiles  # (row, tile) pairs
         n = self.name
         if p.smerge and p.spec * 16 > THREADS:
-            raise ValueError(f"MLASparseAttn {n}: smerge lands the own keys a thread per 2 words (spec <= 32)")
+            raise ValueError(
+                f"MLASparseAttn {n}: smerge lands the own keys a thread per 2 words (spec <= 32)"
+            )
         if p.smerge:
             # one scores region for both producers: the merge's poll indexes it by chunk
             w_writes = (Region(f"{n}.done", rt * self.ring_parts, (n,)),
                         Region(f"{n}.s", rt * NCT * TILE * CH, (n, f"{n}.c")))  # fmt: skip
             c_writes = ()
             m_writes = tuple(self.out.regions(sc.rows, (f"{n}.m",))) + (
-                () if p.ring8 else (Region(f"{n}.mdone", rt * p.mgroups * (HD // SLICE), (f"{n}.m",)),)
+                ()
+                if p.ring8
+                else (
+                    Region(f"{n}.mdone", rt * p.mgroups * (HD // SLICE), (f"{n}.m",)),
+                )
             )
             m_args = (
-                (self.pos, self.rope, rope_sin(self.rope), self.sink, self.ring, self.ckv, *paged.REQ)
+                (
+                    self.pos,
+                    self.rope,
+                    rope_sin(self.rope),
+                    self.sink,
+                    self.ring,
+                    self.ckv,
+                    *paged.REQ,
+                )
                 + (() if p.sel_ch else (self.sel,))
                 + ((f"{self.ckv}.q4", f"{self.ckv}.s4") if p.ckv4 else ())
                 + ((f"{self.ring}.q8", f"{self.ring}.s8") if p.ring8 else ())

@@ -70,14 +70,25 @@ def _toolchain() -> tuple:
     try:
         dist = md.distribution("flydsl")
         record = dist.read_text("RECORD")
-        out.append(("flydsl", dist.version, hashlib.sha256(record.encode()).hexdigest()[:16] if record else None))
+        out.append(
+            (
+                "flydsl",
+                dist.version,
+                hashlib.sha256(record.encode()).hexdigest()[:16] if record else None,
+            )
+        )
         if not record:
             libs = []
             for f in dist.files or ():
                 path = f.locate()
                 if ".so" in f.name and path.exists():
                     libs.append((str(f), path.stat().st_size, path.stat().st_mtime_ns))
-            out.append(("flydsl-libs", hashlib.sha256(repr(sorted(libs)).encode()).hexdigest()[:16]))
+            out.append(
+                (
+                    "flydsl-libs",
+                    hashlib.sha256(repr(sorted(libs)).encode()).hexdigest()[:16],
+                )
+            )
     except md.PackageNotFoundError:
         out.append(("flydsl", None))
     rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
@@ -107,7 +118,9 @@ def toolchain_identity() -> tuple:
 
 
 def _keyed_env(name: str) -> bool:
-    return (name.startswith("FLYDSL_") or name == "ARCH") and not _ENV_IGNORED.search(name)
+    return (name.startswith("FLYDSL_") or name == "ARCH") and not _ENV_IGNORED.search(
+        name
+    )
 
 
 @contextmanager
@@ -141,11 +154,20 @@ def serving():
 def compile_traced(launcher, program: Program):
     """Compile ``launcher`` (no launch) and hold its recorded hand-offs to the program's regions and its memory
     operations to the memory model (``plan.check.check_memory``; raises ContractError): the body traced, FlyDSL's
-    disk cache off. Inside ``serving()``: the disk cache on (a cached build loads untraced), no checks."""
+    disk cache off. Inside ``serving()``: the disk cache on (a cached build loads untraced), no checks.
+    """
     arch = program.target.mcpu
     serve = _SERVING.get()
     cache = os.environ.get("FLYDSL_RUNTIME_ENABLE_CACHE", "1") if serve else "0"
-    with recording() as rec, _env(COMPILE_ONLY=1, FLYDSL_RUNTIME_ENABLE_CACHE=cache, ARCH=arch, FLYDSL_GPU_ARCH=arch):
+    with (
+        recording() as rec,
+        _env(
+            COMPILE_ONLY=1,
+            FLYDSL_RUNTIME_ENABLE_CACHE=cache,
+            ARCH=arch,
+            FLYDSL_GPU_ARCH=arch,
+        ),
+    ):
         with srcloc.scoped():  # (the source locations at a fraction of FlyDSL's cost)
             launcher(0, 0, 0, 0, 0)
     if serve:
@@ -157,7 +179,8 @@ def compile_traced(launcher, program: Program):
 
 def check_record(rec, program: Program):
     """``compile_traced``'s checks of a traced record against ``program``: its hand-offs to the regions,
-    its memory operations to the memory model (sets ``rec.waived``). Raises ContractError."""
+    its memory operations to the memory model (sets ``rec.waived``). Raises ContractError.
+    """
     prev = {st.name: st.prev_reads for st in program.stages if st.prev_reads}
     check(rec, program.regions, prev)
     rec.waived = check_memory(rec, program, program.plain_waive)
@@ -171,7 +194,10 @@ def resources(launcher, arch: str | None = None) -> list[dict]:
     out = []
     for artifact in launcher._mem_cache.values():
         elf = _code_object(artifact._ir_text)
-        r = {k: _note_uint(elf, key, optional=k in _OPTIONAL) for k, key in _RESOURCE_KEYS.items()}
+        r = {
+            k: _note_uint(elf, key, optional=k in _OPTIONAL)
+            for k, key in _RESOURCE_KEYS.items()
+        }
         r["max_blocks_per_cu"] = _admission(artifact, arch)
         r["code_bytes"] = code_bytes(elf)
         if r["scratch"]:  # (``gate``: a private segment the code never reaches)
@@ -183,7 +209,9 @@ def resources(launcher, arch: str | None = None) -> list[dict]:
 
 
 _PRIVATE_OPS = re.compile(r"^\s*(scratch_|flat_)", re.M)
-_PRIVATE_REGS = re.compile(r"\b(flat_scratch(_lo|_hi)?|src_private_(base|limit)|src_flat_scratch_base_(lo|hi))\b")
+_PRIVATE_REGS = re.compile(
+    r"\b(flat_scratch(_lo|_hi)?|src_private_(base|limit)|src_flat_scratch_base_(lo|hi))\b"
+)
 _PRIVATE_BUFFER = re.compile(r"\.amdhsa_user_sgpr_private_segment_buffer\s+1\b")
 
 
@@ -200,7 +228,8 @@ def private_access_count(text: str, descriptor: str = "") -> int:
 
 def scratch_ops(elf: bytes, arch: str | None) -> int | None:
     """``private_access_count`` of a code object (its code and kernel descriptor, disassembled with ROCm's
-    llvm-objdump for ``arch``); None when it cannot be disassembled (the gate then treats the scratch as reached)."""
+    llvm-objdump for ``arch``); None when it cannot be disassembled (the gate then treats the scratch as reached).
+    """
     import tempfile
 
     from .isa import _objdump
@@ -212,8 +241,14 @@ def scratch_ops(elf: bytes, arch: str | None) -> int | None:
             f.write(elf)
             f.flush()
             run = [_objdump(), f"--mcpu={arch}", "--no-show-raw-insn"]
-            text = subprocess.run(run + ["-d", f.name], capture_output=True, text=True, check=True).stdout
-            kd = subprocess.run(run + ["-D", "--section=.rodata", f.name], capture_output=True, text=True).stdout
+            text = subprocess.run(
+                run + ["-d", f.name], capture_output=True, text=True, check=True
+            ).stdout
+            kd = subprocess.run(
+                run + ["-D", "--section=.rodata", f.name],
+                capture_output=True,
+                text=True,
+            ).stdout
     except (OSError, subprocess.CalledProcessError):
         return None
     return private_access_count(text, kd)
@@ -238,7 +273,11 @@ def device_cus() -> int | None:
     try:
         import torch
 
-        return torch.cuda.get_device_properties(0).multi_processor_count if torch.cuda.is_available() else None
+        return (
+            torch.cuda.get_device_properties(0).multi_processor_count
+            if torch.cuda.is_available()
+            else None
+        )
     except Exception:  # noqa: BLE001
         return None
 
@@ -259,14 +298,21 @@ def code_bytes(elf: bytes) -> int:
     return total
 
 
-def gate(res: dict, lds_limit: int, sgpr_spill_ok: bool = False, grid: int | None = None, cus: int | None = None):
+def gate(
+    res: dict,
+    lds_limit: int,
+    sgpr_spill_ok: bool = False,
+    grid: int | None = None,
+    cus: int | None = None,
+):
     """Raise ResourceError unless ``res`` can run as a resident grid. Scratch is refused unless the code provably never
     reaches it (``res["scratch_ops"] == 0``: no scratch / flat instruction, no private-aperture register;
     ``resources``). ``sgpr_spill_ok`` (``Program.sgpr_spill_ok``): SGPR spills into VGPR lanes pass (any spill
     to memory still shows as scratch); otherwise the build stays spill-free. ``grid`` / ``cus`` (the target's grid,
     the device's CUs): HIP's admission (``max_blocks_per_cu``, when known) must cover the grid.
     HIP's per-CU bound is necessary, not proof of placement (the reference's
-    ``occupancy.py``); the toy and layer runs on the device are the rest of the evidence."""
+    ``occupancy.py``); the toy and layer runs on the device are the rest of the evidence.
+    """
     problems = []
     # a private segment the code never reaches passes: FlyDSL 0.4.0 reserves 36 B in V4.1's 1M-context KV-source
     # layers (an SGPR-spill save slot) with no instruction that can touch it (``scratch_ops`` 0; None or missing:

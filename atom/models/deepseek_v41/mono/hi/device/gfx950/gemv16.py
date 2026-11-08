@@ -30,7 +30,9 @@ from flydsl.expr.typing import T
 from . import buffer_ops as bo
 from .ops import CM_NT
 
-OOB = 0x7FFFFFFF // 4  # a word offset no buffer reaches: the load returns 0 without traffic
+OOB = (
+    0x7FFFFFFF // 4
+)  # a word offset no buffer reaches: the load returns 0 without traffic
 UNIT_K = 128
 
 
@@ -43,22 +45,34 @@ def pack_bf16(w: torch.Tensor) -> torch.Tensor:
     16) ..``) at ``32 l`` of it."""
     n, k = w.shape
     if n % 16 or k % UNIT_K:
-        raise ValueError(f"pack_bf16 needs N % 16 == 0 and K % 128 == 0, got {tuple(w.shape)}")
+        raise ValueError(
+            f"pack_bf16 needs N % 16 == 0 and K % 128 == 0, got {tuple(w.shape)}"
+        )
     s = k // UNIT_K
     # [rg, r, st, j, e] -> [rg, st, j, r, e]: lane l = 16 j + r
-    return w.reshape(n // 16, 16, s, 4, 32).permute(0, 2, 3, 1, 4).contiguous().reshape(-1)
+    return (
+        w.reshape(n // 16, 16, s, 4, 32).permute(0, 2, 3, 1, 4).contiguous().reshape(-1)
+    )
 
 
 def pack_bf16_mmajor(w: torch.Tensor) -> torch.Tensor:
     """``pack_bf16``'s units with each unit's four MFMA slices contiguous: unit (rg, st) at element ``(rg * S + st) *
     2048``, then slice ``m`` (K ``32 j + 8 m ..`` of every lane) at ``512 m``, lane ``l``'s 8 values at ``8 l`` of it:
-    one 16 B load instruction of a wave reads 1 KiB contiguous (``load_bf16_mmajor``), as MXFP8's halves do."""
+    one 16 B load instruction of a wave reads 1 KiB contiguous (``load_bf16_mmajor``), as MXFP8's halves do.
+    """
     n, k = w.shape
     if n % 16 or k % UNIT_K:
-        raise ValueError(f"pack_bf16_mmajor needs N % 16 == 0 and K % 128 == 0, got {tuple(w.shape)}")
+        raise ValueError(
+            f"pack_bf16_mmajor needs N % 16 == 0 and K % 128 == 0, got {tuple(w.shape)}"
+        )
     s = k // UNIT_K
     # [rg, r, st, j, m, e] -> [rg, st, m, j, r, e]: lane l = 16 j + r
-    return w.reshape(n // 16, 16, s, 4, 4, 8).permute(0, 2, 4, 3, 1, 5).contiguous().reshape(-1)
+    return (
+        w.reshape(n // 16, 16, s, 4, 4, 8)
+        .permute(0, 2, 4, 3, 1, 5)
+        .contiguous()
+        .reshape(-1)
+    )
 
 
 # ------------------------------------------------------------------ device: weights
@@ -70,7 +84,9 @@ def load_fp4(r_w, unit, lane, valid=None):
     off = (unit * 64 + lane) * 4
     if valid is not None:
         off = valid.select(off, fx.Int32(OOB))
-    return fx.Vector(bo.buffer_load(r_w, off, vec_width=4, dtype=T.i32, cache_modifier=CM_NT))
+    return fx.Vector(
+        bo.buffer_load(r_w, off, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+    )
 
 
 def load_scale(r_s, unit, lane, valid=None):
@@ -78,7 +94,9 @@ def load_scale(r_s, unit, lane, valid=None):
     off = unit * 16 + lane // 4
     if valid is not None:
         off = valid.select(off, fx.Int32(OOB))
-    v = fx.Int32(bo.buffer_load(r_s, off, vec_width=1, dtype=T.i32, cache_modifier=CM_NT))
+    v = fx.Int32(
+        bo.buffer_load(r_s, off, vec_width=1, dtype=T.i32, cache_modifier=CM_NT)
+    )
     return (v >> ((lane % 4) * 8)) & 255
 
 
@@ -89,19 +107,28 @@ def load_bf16(r_w, unit, lane, valid=None):
         off = (unit * 256 + lane * 4 + m) * 4
         if valid is not None:
             off = valid.select(off, fx.Int32(OOB))
-        out.append(fx.Vector(bo.buffer_load(r_w, off, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)))
+        out.append(
+            fx.Vector(
+                bo.buffer_load(r_w, off, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+            )
+        )
     return out
 
 
 def load_bf16_mmajor(r_w, unit, lane, valid=None):
     """``load_bf16``'s 64 B of a ``pack_bf16_mmajor`` unit: slice ``m``'s 16 B at word ``unit * 1024 + 256 m + 4 lane``
-    (each load instruction a contiguous 1 KiB), the same four Vectors (``bf16_operands``)."""
+    (each load instruction a contiguous 1 KiB), the same four Vectors (``bf16_operands``).
+    """
     out = []
     for m in range(4):
         off = (unit * 256 + m * 64 + lane) * 4
         if valid is not None:
             off = valid.select(off, fx.Int32(OOB))
-        out.append(fx.Vector(bo.buffer_load(r_w, off, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)))
+        out.append(
+            fx.Vector(
+                bo.buffer_load(r_w, off, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+            )
+        )
     return out
 
 
@@ -118,7 +145,9 @@ def decode_fp4(w, code):
     for m in range(4):
         words = []
         for b in range(4):
-            pair = rocdl.cvt_scalef32_pk_bf16_fp4(T.vec(2, T.bf16), fx.Int32(w[m]), scale, b)
+            pair = rocdl.cvt_scalef32_pk_bf16_fp4(
+                T.vec(2, T.bf16), fx.Int32(w[m]), scale, b
+            )
             words.append(fx.Vector(pair).bitcast(fx.Int32)[0])
         out.append(_bf16x8(words))
     return out
@@ -150,6 +179,10 @@ def b_operands(lds, row, j, unit, pitch):
     base = row * pitch + unit * 64 + j * 16
     out = []
     for m in range(4):
-        v = fx.Vector(fx.ptr_load(lds + (base + 4 * m), result_type=fx.Vector.make_type(4, fx.Int32)))
+        v = fx.Vector(
+            fx.ptr_load(
+                lds + (base + 4 * m), result_type=fx.Vector.make_type(4, fx.Int32)
+            )
+        )
         out.append(_bf16x8([v[e] for e in range(4)]))
     return out

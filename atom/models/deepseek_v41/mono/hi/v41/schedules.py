@@ -194,13 +194,20 @@ AUTO: dict = {
 # ------------------------------------------------------------------------------------------------------------- kinds
 
 WINDOW, ENGRAM = "window", "window+engram"
-KV2, KV2E, KV1, IDX1 = "ratio2_kv_source", "ratio2_kv_source+engram", "ratio1_kv_source", "ratio1_index_source"
+KV2, KV2E, KV1, IDX1 = (
+    "ratio2_kv_source",
+    "ratio2_kv_source+engram",
+    "ratio1_kv_source",
+    "ratio1_index_source",
+)
 C2, C1, CONSUMER = "ratio2_consumer", "ratio1_consumer", "consumer"
 KINDS = (WINDOW, ENGRAM, KV2, KV2E, KV1, IDX1, C2, C1, CONSUMER)
 SPLIT = "/split"  # suffix: the kind built as two kernels
 MAX_ROWS = 24  # the widest step: B = 4 requests of 6 rows (``Scenario(B, 6, tp)``: a schedule entry keys on its rows)
 ROWS = (None, *range(1, MAX_ROWS + 1))  # None: a build that does not know its row count
-MANY = range(6, MAX_ROWS + 1)  # 6 rows and up: the entries measured at 6-16 rows carry on to the batched widths
+MANY = range(
+    6, MAX_ROWS + 1
+)  # 6 rows and up: the entries measured at 6-16 rows carry on to the batched widths
 BATCHED = (12, 18, 24)  # B = 2, 3, 4 requests of 6 rows
 
 SOURCES = (KV2, KV2E, KV1, IDX1)
@@ -218,12 +225,22 @@ TWO = split(KINDS)  # two kernels a layer
 BOTH = ONE + TWO
 
 
-def kind_of(sparse: int = 0, source=None, engram: bool = False, sparse_ratio: int = 0, split_: bool = False) -> str:
+def kind_of(
+    sparse: int = 0,
+    source=None,
+    engram: bool = False,
+    sparse_ratio: int = 0,
+    split_: bool = False,
+) -> str:
     """The schedule kind of ``recipe.window_layer_blocks``' flags (``source``: a ``recipe.Source``)."""
     if source is not None:
         if source.kv and not source.index:
-            raise ValueError("V4.1's KV sources are index sources too (Source(kv=True, index=True))")
-        kind = f"ratio{source.ratio}_{'kv' if source.kv else 'index'}_source" + ("+engram" if engram else "")
+            raise ValueError(
+                "V4.1's KV sources are index sources too (Source(kv=True, index=True))"
+            )
+        kind = f"ratio{source.ratio}_{'kv' if source.kv else 'index'}_source" + (
+            "+engram" if engram else ""
+        )
     elif sparse:
         kind = f"ratio{sparse_ratio}_consumer" if sparse_ratio else CONSUMER
     else:
@@ -352,7 +369,11 @@ _put_mi355x(WINDOW, 5, FFN_NORM="router")
 # the sparse merge at 8 heads a task (96 -> 192 tasks) at the batched widths where the block's 16 above 6 rows
 # lost: chained, 2-3 distinct requests of 6 rows, -2.5 / -1.4 µs (layer 3, 12 / 18 rows), -1.8 / -1.8 (layer 21), the
 # readers -1.4 at 12; 24 rows +2.1 (two rounds of tasks), the sources 2 / 20 +0.4 / +1.1: the block's there
-for _k, _rows in ((C2, (12, 18)), (C1, (12,)), (IDX1, (12,))):  # (C1 at 18: the head-fused program spills)
+for _k, _rows in (
+    (C2, (12, 18)),
+    (C1, (12,)),
+    (IDX1, (12,)),
+):  # (C1 at 18: the head-fused program spills)
     for _r in _rows:
         _put_mi355x(_k, _r, SPARSE_MHEADS=8)
 # ... and the ratio-1 consumers at 18 rows with a sharded residual (replicated, their head-fused program spills):
@@ -390,7 +411,9 @@ PRECISION_KNOBS = ("COMPRESS_QAT", "IDX_SCORE_F32", "ATTN_OUT_F32_ROPE")
 def _entry(table: dict, kind: str, rows: int | None) -> dict:
     if (kind, rows) in table or not kind.split(SPLIT)[0].endswith("+engram"):
         return table.get((kind, rows), {})
-    base = kind.replace("+engram", "")  # an Engram layer of another kind: its kind's schedule
+    base = kind.replace(
+        "+engram", ""
+    )  # an Engram layer of another kind: its kind's schedule
     return table.get((base, rows), {})
 
 
@@ -399,7 +422,9 @@ def current() -> dict:
     return dict(DEFAULT)
 
 
-def knobs(kind: str, rows: int | None, over: dict | None = None, tokens: int = 0) -> dict:
+def knobs(
+    kind: str, rows: int | None, over: dict | None = None, tokens: int = 0
+) -> dict:
     """Every knob of a ``kind`` layer at ``rows`` (a copy): ``DEFAULT``, the schedule's entry for (kind, rows) and,
     an index source whose context bucket ``tokens`` (its Indexer's n_max x ratio) reaches ``IDX_LONG``, its kind's
     ``LONG``; then ``over``; a knob still "auto" takes ``AUTO``'s value (the recipe resolves the rest: module
@@ -416,7 +441,9 @@ def knobs(kind: str, rows: int | None, over: dict | None = None, tokens: int = 0
     for n, v in given.items():
         if n not in DEFAULT:
             raise KeyError(f"no V4.1 knob {n}")
-        if not (isinstance(v, str) and v == "auto" and n in entry):  # "auto": the schedule's value
+        if not (
+            isinstance(v, str) and v == "auto" and n in entry
+        ):  # "auto": the schedule's value
             out[n] = copy.deepcopy(v)
     for n, v in AUTO.items():
         if isinstance(out[n], str) and out[n] == "auto":
@@ -429,7 +456,9 @@ def _check_entries() -> None:
     for key, entry in SCHEDULES.items():
         bad = [n for n in (*CHAIN_KNOBS, *PRECISION_KNOBS) if n in entry]
         if bad:
-            raise ValueError(f"V4.1 schedule entry {key}: {bad} are a step's or a process's, not a kind's")
+            raise ValueError(
+                f"V4.1 schedule entry {key}: {bad} are a step's or a process's, not a kind's"
+            )
 
 
 _check_entries()

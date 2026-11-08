@@ -24,7 +24,11 @@ class ContractError(Exception):
     """A traced kernel breaks its hand-off contract (it could deadlock or read garbage)."""
 
 
-def check(record: Record, regions: list[Region], prev_reads: dict[str, tuple[str, ...]] | None = None) -> None:
+def check(
+    record: Record,
+    regions: list[Region],
+    prev_reads: dict[str, tuple[str, ...]] | None = None,
+) -> None:
     by_name = {r.name: r for r in regions}
     first = {}
     for i, stage in enumerate(record.stages):
@@ -35,7 +39,9 @@ def check(record: Record, regions: list[Region], prev_reads: dict[str, tuple[str
         for name in names:
             r = by_name.get(name)
             if r is None:
-                problems.append(f"{stage} reads undeclared region {name} from the previous launch")
+                problems.append(
+                    f"{stage} reads undeclared region {name} from the previous launch"
+                )
             elif not r.writers or stage in r.writers:
                 problems.append(f"{stage} reads {name} from the previous launch: it needs writers ({r.writers}), "
                                 f"and not the reader")  # fmt: skip
@@ -46,17 +52,23 @@ def check(record: Record, regions: list[Region], prev_reads: dict[str, tuple[str
             continue
         used.add(a.region)
         if a.space is not r.space:
-            problems.append(f"{a.kind} of {a.region} in {a.stage} as {a.space.value}, declared {r.space.value}")
+            problems.append(
+                f"{a.kind} of {a.region} in {a.stage} as {a.space.value}, declared {r.space.value}"
+            )
         if a.kind == "poll" and a.region in prev_reads.get(a.stage, ()):
             continue  # the previous launch's (checked above)
         if a.kind == "put":
             put_seen.add((a.stage, a.region))
             if a.stage not in r.writers:
-                problems.append(f"{a.region} put by {a.stage}, its writers are {r.writers}")
+                problems.append(
+                    f"{a.region} put by {a.stage}, its writers are {r.writers}"
+                )
             continue
         if a.stage in r.writers:
             if not r.exchange:
-                problems.append(f"{a.region} polled by its own writer {a.stage} (not an exchange)")
+                problems.append(
+                    f"{a.region} polled by its own writer {a.stage} (not an exchange)"
+                )
             elif (a.stage, a.region) not in put_seen:
                 polled_before_put.add((a.stage, a.region))
             continue
@@ -64,9 +76,13 @@ def check(record: Record, regions: list[Region], prev_reads: dict[str, tuple[str
             if w == HOST:
                 continue  # published by the host before the launch (block tests, shells)
             if w not in first:
-                problems.append(f"{a.region} polled by {a.stage}, its writer {w} never runs")
+                problems.append(
+                    f"{a.region} polled by {a.stage}, its writer {w} never runs"
+                )
             elif first[w] > first[a.stage]:
-                problems.append(f"{a.region} polled by {a.stage}, which runs before its writer {w}")
+                problems.append(
+                    f"{a.region} polled by {a.stage}, which runs before its writer {w}"
+                )
     for stage, region in sorted(polled_before_put):
         problems.append(f"exchange {region} polled in {stage} before any put of it")
     for name in sorted(set(by_name) - used):
@@ -98,7 +114,8 @@ def _names(m) -> list[str]:
 def _plain_names(m, dense) -> list[str]:
     """The plain targets a load / store goes through: an arg's names, a dense region's; a *mixed* load (an address
     derived from roots of different kinds: a select between an arg and a region, or an arg indexed by a value loaded
-    from scratch) as a load of every arg among its candidates (the conservative reading: it may address the arg)."""
+    from scratch) as a load of every arg among its candidates (the conservative reading: it may address the arg).
+    """
     names = _names(m)
     if m.kind == ARG:
         return names
@@ -155,7 +172,11 @@ def check_memory(record: Record, program, waive: tuple[str, ...] = ()) -> list[s
     # dense (untagged) scratch regions: payloads of bulk + flag hand-offs
     dense = set()
     for m in record.mem:
-        if m.op == "store" and m.kind == "region" and (m.tagged is None or not any(m.tagged)):
+        if (
+            m.op == "store"
+            and m.kind == "region"
+            and (m.tagged is None or not any(m.tagged))
+        ):
             dense.update(_names(m))
 
     # plain targets: stores / loads per stage
@@ -164,7 +185,9 @@ def check_memory(record: Record, program, waive: tuple[str, ...] = ()) -> list[s
         if m.op not in ("load", "store") or m.stage not in stages:
             continue
         for n in _plain_names(m, dense):
-            (stores if m.op == "store" else loads).setdefault(n, {}).setdefault(m.stage, []).append(m)
+            (stores if m.op == "store" else loads).setdefault(n, {}).setdefault(
+                m.stage, []
+            ).append(m)
 
     # ordering edges: V -> S when S polls (this launch) a tagged region V puts
     succ = {s: set() for s in stages}
@@ -201,7 +224,10 @@ def check_memory(record: Record, program, waive: tuple[str, ...] = ()) -> list[s
     def same_xcd(a, b):
         return a.tasks == b.tasks and (a.base - b.base) % xcds == 0
 
-    waits = {s: [m.seq for m in record.mem if m.stage == s and m.op == "wait" and m.cm == 0] for s in stages}
+    waits = {
+        s: [m.seq for m in record.mem if m.stage == s and m.op == "wait" and m.cm == 0]
+        for s in stages
+    }
 
     for s in program.stages:
         for x in s.later_args:
@@ -219,28 +245,46 @@ def check_memory(record: Record, program, waive: tuple[str, ...] = ()) -> list[s
                     # regions R polls before its first load of X, put by W or a stage W reaches
                     lo = min(m.seq for m in rld)
                     via = {s for s in reach[w] if s == r or r in reach[s]}
-                    guards = {f for seq, f in polls[r] if seq < lo and any(v == w or v in reach[w] for v in writers(f))}
+                    guards = {
+                        f
+                        for seq, f in polls[r]
+                        if seq < lo and any(v == w or v in reach[w] for v in writers(f))
+                    }
                     if not guards:
                         out.append(f"plain {x}: written by {w} and read by {r} in the same launch with no ordering "
                                    f"(no tagged region {w} puts is polled by {r} before its load): {r} on another "
                                    f"CTA can read the previous launch's bytes{_via(x, rld)}")  # fmt: skip
                         continue
                     # W's puts that start an edge to R, after its stores of X, each drained
-                    path = {f for _, f in puts[w] if any(f in {g for _, g in polls[v]} for v in via)}
+                    path = {
+                        f
+                        for _, f in puts[w]
+                        if any(f in {g for _, g in polls[v]} for v in via)
+                    }
                     last = max(m.seq for m in wst)
                     if not any(seq > last for seq, f in puts[w] if f in path):
                         out.append(f"plain {x}: {w} stores it after its last put of {sorted(path)}, which {r} "
                                    f"waits on: the flag can be seen before the data")  # fmt: skip
                     for seq, f in puts[w]:
                         before = [m.seq for m in wst if m.seq < seq]
-                        if f in path and before and not any(max(before) < q < seq for q in waits[w]):
+                        if (
+                            f in path
+                            and before
+                            and not any(max(before) < q < seq for q in waits[w])
+                        ):
                             out.append(
                                 f"plain {x}: {w} puts {f} (which orders {r}'s read) without an s_waitcnt "
                                 f"vmcnt(0) after its stores of {x}: the flag can overtake the data"
                             )
                             break
                     if not same_xcd(stages[w], stages[r]):
-                        bad = sorted({f"{m.op} cm {m.cm} in {m.stage}" for m in wst + rld if not m.cm & SC1})
+                        bad = sorted(
+                            {
+                                f"{m.op} cm {m.cm} in {m.stage}"
+                                for m in wst + rld
+                                if not m.cm & SC1
+                            }
+                        )
                         if bad:
                             out.append(f"plain {x}: written by {w} (base {stages[w].base}, {stages[w].tasks} tasks) "
                                        f"and read by {r} (base {stages[r].base}, {stages[r].tasks} tasks) in the same "
@@ -256,9 +300,15 @@ def check_memory(record: Record, program, waive: tuple[str, ...] = ()) -> list[s
         if m.kind != "peer" or m.op == "wait":
             continue
         if m.cm & SYS != SYS:
-            problems.append(f"peer {m.target}: {m.op} in {m.stage} with cache bits {m.cm}, not system scope")
+            problems.append(
+                f"peer {m.target}: {m.op} in {m.stage} with cache bits {m.cm}, not system scope"
+            )
         if m.op == "store" and (m.tagged is None or not all(m.tagged)):
-            what = "its words are not visible to the check" if m.tagged is None else f"halves tagged {m.tagged}"
+            what = (
+                "its words are not visible to the check"
+                if m.tagged is None
+                else f"halves tagged {m.tagged}"
+            )
             problems.append(f"peer {m.target}: a {m.nbytes} B store in {m.stage} without the tag in every 8 B half "
                             f"({what}): a peer store can land as two 8 B halves at different times")  # fmt: skip
     if problems:

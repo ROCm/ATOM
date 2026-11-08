@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The final ISA of a built kernel (a ``MonoKernel``): its code object, disassembly and a normalized hash
-(``isa_hash``: the instructions without addresses or label names), and the ``.text`` range."""
+(``isa_hash``: the instructions without addresses or label names), and the ``.text`` range.
+"""
 
 import hashlib
 import os
@@ -17,14 +18,18 @@ def _objdump() -> str:
     else the one on ``PATH``."""
     import shutil
 
-    for root in dict.fromkeys(r for r in (os.environ.get("ROCM_PATH"), "/opt/rocm") if r):
+    for root in dict.fromkeys(
+        r for r in (os.environ.get("ROCM_PATH"), "/opt/rocm") if r
+    ):
         for sub in (("lib", "llvm", "bin"), ("llvm", "bin")):
             path = os.path.join(root, *sub, "llvm-objdump")
             if os.path.exists(path):
                 return path
     found = shutil.which("llvm-objdump")
     if found is None:
-        raise FileNotFoundError("llvm-objdump: not under $ROCM_PATH or /opt/rocm ({lib/,}llvm/bin) nor on PATH")
+        raise FileNotFoundError(
+            "llvm-objdump: not under $ROCM_PATH or /opt/rocm ({lib/,}llvm/bin) nor on PATH"
+        )
     return found
 
 
@@ -49,8 +54,15 @@ _COMMENT = re.compile(r"\s*//.*$")
 
 def normalize(text: str) -> str:
     """Instruction text without addresses or label names: stable across relinks."""
-    lines = [_COMMENT.sub("", _LABEL.sub("<L>", _ADDR.sub("", ln))).strip() for ln in text.splitlines()]
-    return "\n".join(ln for ln in lines if ln and not ln.startswith(("Disassembly", "/")) and not ln.endswith(":"))
+    lines = [
+        _COMMENT.sub("", _LABEL.sub("<L>", _ADDR.sub("", ln))).strip()
+        for ln in text.splitlines()
+    ]
+    return "\n".join(
+        ln
+        for ln in lines
+        if ln and not ln.startswith(("Disassembly", "/")) and not ln.endswith(":")
+    )
 
 
 def isa_hash(kern) -> str:

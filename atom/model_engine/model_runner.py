@@ -59,6 +59,7 @@ from atom.kv_transfer.disaggregation import (
     kv_config_has_producer,
 )
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
+from atom.model_engine import model_hooks
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.output_transfer import D2HQueue
@@ -537,11 +538,11 @@ class tokenIDProcessor:
         GPU still works; only what follows (the attention metadata, through
         `num_rejected`) reads the status.
 
-        A model's decode round (`ModelRunner._decode_round`) sees the batch
+        A model's decode round (`ModelRunner.decode_round`) sees the batch
         first, and may hand the status over itself (`spec_status`: its own
         wait comes later, `after_forward`).
         """
-        decode_round = self.runner._decode_round()
+        decode_round = self.runner.decode_round
         if decode_round is not None:
             decode_round.before_input_ids(batch, max_seqlen_q)
         bs = batch.total_seqs_num
@@ -724,21 +725,19 @@ class tokenIDProcessor:
             )
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
-        fill_args = (
+        # A model's decode round may fill them itself (fused with its own
+        # pre-forward launches); else the fill kernel.
+        decode_round = self.runner.decode_round
+        fill = None if decode_round is None else decode_round.decode_ids_filler()
+        (fill_deferred_decode_ids if fill is None else fill)(
             self.input_ids.gpu,
             self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
             self.decode_src.gpu[:bs],
             self.prev_token_ids,
             self.draft_token_ids if self.pre_num_decode_token_per_seq > 1 else None,
+            max_tokens_per_seq=int(lens.max()) if bs else 1,
+            width=fill_to,
         )
-        fill_kw = dict(max_tokens_per_seq=int(lens.max()) if bs else 1, width=fill_to)
-        # A model's decode round may fill them itself (fused with its own
-        # pre-forward launches); else the fill kernel.
-        decode_round = self.runner._decode_round()
-        if decode_round is None or not decode_round.fill_decode_ids(
-            *fill_args, **fill_kw
-        ):
-            fill_deferred_decode_ids(*fill_args, **fill_kw)
 
         # Slice by the width this path actually staged. Prefill returned above,
         # so the decode total is the whole batch; a worker-side speculative q
@@ -790,8 +789,16 @@ def _profile_runner_stage(method):
 
 
 class ModelRunner:
+    # The installed model's hooks (`model_hooks.resolve`, at install), None for
+    # a model without them; and the ids its verify head gave this step's verify
+    # (`run_model`), read by `postprocess` in place of the logits.
+    verify_head: model_hooks.VerifyHead | None = None
+    decode_round: model_hooks.DecodeRound | None = None
+    verify_token_ids: torch.Tensor | None = None
+
     def __init__(self, rank: int, config: Config):
         self.config = config
+        self.verify_token_ids = None
         self.structured_output = None
         self.structured_compile_executor = None
         self.structured_compilations = OrderedDict()
@@ -1011,8 +1018,7 @@ class ModelRunner:
                 getattr(self, "drafter", None),
                 metadata_builder=self.attn_metadata_builder,
             )
-            # the model hooks are the installed model's (`_model_hook`)
-            self.__dict__.pop("_model_hooks", None)
+        self.verify_head, self.decode_round = model_hooks.resolve(self.model)
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
@@ -1697,9 +1703,14 @@ class ModelRunner:
             self._h2d_groups.append(groups)
         self.h2d_owner = self._h2d_owners[self._fv_idx]
         self.h2d_groups = self._h2d_groups[self._fv_idx]
-        decode_round = self._decode_round()
-        if decode_round is not None:
-            decode_round.publications_ready(self)
+        # The packed publications a model's decode round reads from the host
+        # arena (`PublicationGroup.read_host_arena`), each opted in by name.
+        if self.decode_round is not None:
+            for groups in self._h2d_groups:
+                for name, group in groups.items():
+                    reader = self.decode_round.host_arena_reader(name)
+                    if reader is not None:
+                        group.read_host_arena(reader)
 
     def _advance_forward_vars(self):
         """Rotate to the next in-flight slot before any buffer is written.
@@ -1761,9 +1772,8 @@ class ModelRunner:
         Independent subsystem uploads retain their own completion protocols.
         A model's decode round flushes what it recorded first.
         """
-        decode_round = self._decode_round()
-        if decode_round is not None:
-            decode_round.before_staging_mark()
+        if self.decode_round is not None:
+            self.decode_round.before_staging_mark()
         self.h2d_owner.finish()
 
     def _record_forward_vars_event(self):
@@ -3143,31 +3153,17 @@ class ModelRunner:
         input_ids: torch.Tensor,
         batch: ScheduledBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        out = self._run_model(input_ids, batch)
-        # after the target's launch: a model's decode round takes the wait it
-        # owes (`tokenIDProcessor.prepare_input_ids`)
-        decode_round = self._decode_round()
-        if decode_round is not None:
-            decode_round.after_forward(self.tokenID_processor)
-        return out
-
-    def _run_model(
-        self,
-        input_ids: torch.Tensor,
-        batch: ScheduledBatch | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
         forward_context = get_forward_context()
         context = forward_context.context
         bs = context.scheduled_bs
         is_prefill = context.is_prefill
         positions = context.positions
-        # Set below when the model's own verify head served this verify
+        # Set below when the model's verify head served this verify
         # (`_verify_head_ids`): `postprocess` then reads its ids instead of
-        # logits. None for every other model.
+        # logits.
         self.verify_token_ids = None
-        head = self._verify_head()
-        if head is not None:
-            head.before_forward(self, batch)
+        if self.verify_head is not None:
+            self.verify_head.before_forward(self, batch)
 
         # Dispatch is owned by ForwardMode.decide() (called in prepare_model).
         # Every run_model caller MUST go through prepare_inputs first, so
@@ -3423,50 +3419,10 @@ class ModelRunner:
 
         return logits, hidden_states
 
-    # ---- model-side hooks
-    #
-    # A model may take over parts of a step through attributes the runner
-    # looks up once (`_model_hook`); a model without them runs as before.
-    #
-    # `verify_head`: a head inside the model's forward that picks each row of
-    # a speculative verify. The runner calls `before_forward(runner, batch)`
-    # before the forward, `ids(runner, batch, hidden_states, graph_key)` after
-    # it (the rows' ids, int32 [rows], or None: the logits path; `graph_key`:
-    # the replayed graph's request bucket), `captured(graph_key)` after a graph
-    # capture, `verdict(spec, ids, sampler)` -> (output ids, verdict, next ids)
-    # in `postprocess`; `ids_identical_on_tp_ranks` skips the ids' broadcast.
-    #
-    # `decode_round`: host work of the decode round the model takes over,
-    # called where that work sits: `before_input_ids(batch, max_seqlen_q)` /
-    # `spec_status()` (None: the queue's) in `prepare_input_ids`,
-    # `fill_decode_ids(...)` (True: filled), `before_staging_mark()`,
-    # `after_forward(token_processor)` after the target's launch,
-    # `note_verdict((tokens, verdict))` after the rejection sampler,
-    # `publications_ready(runner)` once the H2D publications are set up.
-
-    def _model_hook(self, name: str):
-        """The model's attribute ``name`` (a model-side hook), or None; looked
-        up once (the model is fixed once built)."""
-        hooks = self.__dict__.setdefault("_model_hooks", {})
-        if name not in hooks:
-            hooks[name] = getattr(self.model, name, None)
-        return hooks[name]
-
-    def _decode_round(self):
-        """The model's decode round, or None."""
-        if getattr(self, "model", None) is None:
-            return None
-        return self._model_hook("decode_round")
-
-    def _verify_head(self):
-        """The model's verify head, or None."""
-        if getattr(self, "model", None) is None:
-            return None
-        return self._model_hook("verify_head")
-
     def _verify_head_ids(self, batch, hidden_states, graph_key=None):
-        """This verify's ids from the model's verify head, or None."""
-        head = self._verify_head()
+        """This verify's ids from the model's verify head
+        (`model_hooks.VerifyHead`), or None."""
+        head = self.verify_head
         return None if head is None else head.ids(self, batch, hidden_states, graph_key)
 
     def flush_pp_send(self) -> bool:
@@ -3555,7 +3511,7 @@ class ModelRunner:
         bs = batch.total_seqs_num
         # The ids of a verify the model's own head served (`_verify_head_ids`),
         # in place of the logits; and each request's next id, from its verdict.
-        head_ids = getattr(self, "verify_token_ids", None)
+        head_ids = self.verify_token_ids
         if spec_decode_metadata is None:
             head_ids = None
         next_ids = None
@@ -3622,7 +3578,7 @@ class ModelRunner:
             # its verdict -- the selects, the rejection kernel and each
             # request's next id -- in one launch (the head's `verdict`).
             channel = None
-            sampled_tokens, verdict, next_ids = self._verify_head().verdict(
+            sampled_tokens, verdict, next_ids = self.verify_head.verdict(
                 spec_decode_metadata, head_ids, self.rejection_sampler
             )
             num_bonus_tokens, num_reject_tokens, anchors = verdict
@@ -3663,9 +3619,8 @@ class ModelRunner:
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
             )
-            decode_round = self._decode_round()
-            if decode_round is not None:
-                decode_round.note_verdict((sampled_tokens, verdict))
+            if self.decode_round is not None:
+                self.decode_round.note_verdict((sampled_tokens, verdict))
             # PCP ranks decode redundantly but not bit-identically, so their
             # accept counts can differ: take rank 0's verdict. Ids are synced
             # below, outside this branch.
@@ -3685,17 +3640,9 @@ class ModelRunner:
             )
 
         # Drafter input must agree across TP ranks. Ids only: the verdict is
-        # deterministic on TP ranks' bit-identical inputs. A step the model's
-        # verify head served may have the same ids on every rank by
-        # construction: then no broadcast (`ids_identical_on_tp_ranks`).
-        if (
-            get_tp_group().world_size > 1
-            and _needs_id_sync(
-                self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
-            )
-            and not (
-                head_ids is not None and self._verify_head().ids_identical_on_tp_ranks
-            )
+        # deterministic on TP ranks' bit-identical inputs.
+        if get_tp_group().world_size > 1 and _needs_id_sync(
+            self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
@@ -3894,6 +3841,10 @@ class ModelRunner:
                 batch, get_forward_context().spec_decode_metadata
             )
         logits, hidden_states = self.run_model(input_ids, batch)
+        # After the target's launch: a model's decode round takes the wait it
+        # deferred (`tokenIDProcessor.prepare_input_ids`).
+        if self.decode_round is not None:
+            self.decode_round.after_forward(self.tokenID_processor)
         self._settle_target_pcp_split()
         drafter = getattr(self, "drafter", None)
 
@@ -4570,9 +4521,8 @@ class ModelRunner:
                             full_forward, key=request_bucket(bs, max_q_len)
                         )
                     # the model's verify head: what the recorded forward wrote
-                    head = self._verify_head()
-                    if head is not None:
-                        head.captured(request_bucket(bs, max_q_len))
+                    if self.verify_head is not None:
+                        self.verify_head.captured(request_bucket(bs, max_q_len))
                     torch.cuda.synchronize()
                     # After the sync: the warmup forward's kernels must have
                     # completed before the window closes, or they spill into the
@@ -4976,6 +4926,8 @@ class RapidServeModelRunner(ModelRunner):
             ) = self.prepare_model(batch)
             self._mark_staging_h2d_enqueued()
             logits, hidden_states = self.run_model(input_ids, batch)
+            if self.decode_round is not None:
+                self.decode_round.after_forward(self.tokenID_processor)
             self._settle_target_pcp_split()
         self._model_fwd_event.record(stream)
         torch.cuda.current_stream().wait_event(self._model_fwd_event)

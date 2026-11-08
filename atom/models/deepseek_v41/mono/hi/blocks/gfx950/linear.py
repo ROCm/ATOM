@@ -142,8 +142,12 @@ P_MIN = 8  # prefetched units per wave below which the derived shape splits K in
 # that time (~1.3 µs at ~25 GB/s a CU when every CU streams)
 TASK_BYTES = 32 << 10
 HOP_BYTES = 32 << 10
-STREAM_FIT_MARGIN = 8  # more for a streamed input (its composed layers' pressure, as FIT_MARGIN's)
-FIT_MARGIN = 8  # VGPRs a fitted stage leaves free: the composed kernel's other stages (and their
+STREAM_FIT_MARGIN = (
+    8  # more for a streamed input (its composed layers' pressure, as FIT_MARGIN's)
+)
+FIT_MARGIN = (
+    8  # VGPRs a fitted stage leaves free: the composed kernel's other stages (and their
+)
 # pointers, held in SGPRs from kernel start) cost the stage a few registers (1-5 spills seen in a composed MLP)
 NORM_ROWS = 4  # NormIn rows normalized per norm_quant call (their words stay live until it returns)
 # ``weight_format="bf16"`` (A16W16): plain bf16 weights in ``gemv16.pack_bf16``'s units (16 rows x 128 K, 64 B a lane),
@@ -254,11 +258,17 @@ class NormIn:
                 raise ValueError("NormIn needs the norm geometry (norm=) or a spec")
             object.__setattr__(self, "spec", nq.prologue(self.norm))
         if self.spec.split != 1 or not self.spec.shared or self.spec.qmap.chunks != 1:
-            raise ValueError(f"NormIn needs a one-chunk, shared-sum, unsplit NormSpec, got {self.spec}")
+            raise ValueError(
+                f"NormIn needs a one-chunk, shared-sum, unsplit NormSpec, got {self.spec}"
+            )
         if self.spec.pitch and isinstance(self.src, Channel):
             raise ValueError("NormIn with a pitch reads a plain bf16 arg")
-        if isinstance(self.src, Channel) and (self.src.fmt is not Fmt.BF16 or self.src.width != self.spec.width):
-            raise ValueError(f"NormIn reads a plain bf16 arg or a BF16 channel of width {self.spec.width}")
+        if isinstance(self.src, Channel) and (
+            self.src.fmt is not Fmt.BF16 or self.src.width != self.spec.width
+        ):
+            raise ValueError(
+                f"NormIn reads a plain bf16 arg or a BF16 channel of width {self.spec.width}"
+            )
 
     @property
     def width(self) -> int:
@@ -299,45 +309,75 @@ class _Plan:
     gamma: str = ""  # NormIn: gamma arg
     nspec: nq.NormSpec | None = None  # NormIn: the norm's device mapping
     norm_rows: int = 0  # NormIn: rows per norm_quant call
-    norm_pre: int = 0  # NormIn: rows whose loads go out with the weight prefetch (the rest when reached)
-    x_proto: str = "tagged"  # the input channel's ``Proto`` ("flag": flags, then dense words)
-    out_proto: str = "tagged"  # the output channel's ``Proto`` (flag: one flag per row block)
+    norm_pre: int = (
+        0  # NormIn: rows whose loads go out with the weight prefetch (the rest when reached)
+    )
+    x_proto: str = (
+        "tagged"  # the input channel's ``Proto`` ("flag": flags, then dense words)
+    )
+    out_proto: str = (
+        "tagged"  # the output channel's ``Proto`` (flag: one flag per row block)
+    )
     wfmt: str = "mxfp4"  # the weight format (``gemv.FORMATS``)
     tp: int = 1  # TP ranks (row-parallel with ``tp_partial``)
-    kwave: str = "interleave"  # the K waves' K steps: "interleave" (wave w: w, w + wk, ...) | "contiguous" (a range)
+    kwave: str = (
+        "interleave"  # the K waves' K steps: "interleave" (wave w: w, w + wk, ...) | "contiguous" (a range)
+    )
     # weight units a wave issues before its input has landed (the rest of the prefetch right after): fewer keep the
     # stage's prefetch from flooding memory while its producer finishes; 0: the whole prefetch, as before
     pre_units: int = 0
-    tp_partial: str = ""  # row-parallel TP: the exchanged partial's format ("bf16" | "f32"), "" if none
-    tp_sum: str = "producer"  # row-parallel TP: who sums the ranks' partials ("producer" | "consumer" | "rs": the
+    tp_partial: str = (
+        ""  # row-parallel TP: the exchanged partial's format ("bf16" | "f32"), "" if none
+    )
+    tp_sum: str = (
+        "producer"  # row-parallel TP: who sums the ranks' partials ("producer" | "consumer" | "rs": the
+    )
     #                           consumer, two-shot: each column quarter to its owner only, ``peer.push_rs``; its
     #                           tp_partial "f32" pairs or "f32p" / "f32q" packed)
-    groups: int = 1  # block-diagonal weight: output rows of group j read input columns j K .. (j + 1) K
-    x_split: int = 1  # row-parallel TP over a whole input row: rank r reads input columns r K .. (r + 1) K
+    groups: int = (
+        1  # block-diagonal weight: output rows of group j read input columns j K .. (j + 1) K
+    )
+    x_split: int = (
+        1  # row-parallel TP over a whole input row: rank r reads input columns r K .. (r + 1) K
+    )
     # SwiGLU: the rounding ("fp32", see ``SwiGLU``); every other Linear keeps the default below, as the plan
     # digests (``linear_fits``) hash every field
     swi_round: str = "qwen"
     swi_limit: float = 0.0  # SwiGLU "fp32": the clamp (0: none)
-    compute: str = "scaled"  # "scaled": the MX MFMA; "bf16": MXFP8 widened to bf16, bf16 MFMA (module docstring)
+    compute: str = (
+        "scaled"  # "scaled": the MX MFMA; "bf16": MXFP8 widened to bf16, bf16 MFMA (module docstring)
+    )
     hcw: HCWrite | None = None  # kind "hcwrite": the combine's spec
-    prewiden: int = 0  # bf16 compute: prefetched units a wave widens to bf16 before its input's tags are checked
-    bias: str = ""  # the f32 bias arg [N] added to acc before the output's rounding ("": none)
+    prewiden: int = (
+        0  # bf16 compute: prefetched units a wave widens to bf16 before its input's tags are checked
+    )
+    bias: str = (
+        ""  # the f32 bias arg [N] added to acc before the output's rounding ("": none)
+    )
     # the f32 per-output-row weight scale arg [N] (packed row order) multiplying acc first ("": none; ``row_scale``)
     row_scale: str = ""
     # the input streamed through two LDS slots of ``xchunk`` K steps each, polled during the task (``_stream_ring``),
     # instead of the whole slice resident; 0: resident (``Linear(xchunk=)``)
     xchunk: int = 0
-    xlead: int = 1  # a streamed input: slots whose poll is in flight (registers) while a slot streams
+    xlead: int = (
+        1  # a streamed input: slots whose poll is in flight (registers) while a slot streams
+    )
     # always False (a streamed input's slots by loads into registers and ``ds_write``s); kept: the stage keys and the
     # plan digests hash every field
     xcopy: bool = False
 
     @property
-    def a16(self) -> bool:  # ``weight_format="bf16"``: bf16 weights and input (module constants, ``BF16W``)
+    def a16(
+        self,
+    ) -> (
+        bool
+    ):  # ``weight_format="bf16"``: bf16 weights and input (module constants, ``BF16W``)
         return self.wfmt == "bf16"
 
     @property
-    def x16(self) -> bool:  # A16W4 (``X16``): MXFP4 weights decoded to bf16, a bf16 input
+    def x16(
+        self,
+    ) -> bool:  # A16W4 (``X16``): MXFP4 weights decoded to bf16, a bf16 input
         return self.wfmt.endswith(X16)
 
     @property
@@ -384,7 +424,9 @@ class _Plan:
         return -(-self.ks // self.wk)
 
     @property
-    def rchunks(self):  # 16-row chunks of the step's rows (the MFMA's N): one per 16 rows, each weight unit read once
+    def rchunks(
+        self,
+    ):  # 16-row chunks of the step's rows (the MFMA's N): one per 16 rows, each weight unit read once
         return -(-self.rows // 16)
 
     @property
@@ -404,11 +446,15 @@ class _Plan:
         return self.ks * 128
 
     @property
-    def xkse(self):  # K elements of the input an LDS buffer holds: the slice, or one ring slot (``xchunk``)
+    def xkse(
+        self,
+    ):  # K elements of the input an LDS buffer holds: the slice, or one ring slot (``xchunk``)
         return self.xchunk * 128 if self.xchunk else self.kse
 
     @property
-    def pitch(self):  # LDS words per activation row (+4: bank spread; a bf16 input: two values a word)
+    def pitch(
+        self,
+    ):  # LDS words per activation row (+4: bank spread; a bf16 input: two values a word)
         return self.xkse // 2 + 4 if self.a16 or self.x16 else self.xkse // 4 + 4
 
     @property
@@ -416,7 +462,9 @@ class _Plan:
         return self.xkse // 32 + 1
 
     @property
-    def xs_base(self):  # the codes, after the words (in a ring slot: from the slot's start)
+    def xs_base(
+        self,
+    ):  # the codes, after the words (in a ring slot: from the slot's start)
         return self.rows * self.pitch
 
     @property
@@ -424,15 +472,21 @@ class _Plan:
         return self.rows * (self.pitch + self.spitch)
 
     @property
-    def ws_base(self):  # LDS words: the task's weight scale codes, [row group][K step][64 lanes] bytes
+    def ws_base(
+        self,
+    ):  # LDS words: the task's weight scale codes, [row group][K step][64 lanes] bytes
         return self.xslot * (self.xbufs if self.xchunk else 1)
 
     @property
-    def xbufs(self):  # a streamed input's LDS slots: two; with ``xcopy`` one per slot in flight and the streaming one
+    def xbufs(
+        self,
+    ):  # a streamed input's LDS slots: two; with ``xcopy`` one per slot in flight and the streaming one
         return self.xlead + 1 if self.xcopy else 2
 
     @property
-    def ws_chunks(self):  # 16 B chunks of the task's weight scale codes (bf16 weights, row-scaled FP8: none)
+    def ws_chunks(
+        self,
+    ):  # 16 B chunks of the task's weight scale codes (bf16 weights, row-scaled FP8: none)
         return 0 if self.a16 or self.row_scale else self.g * self.ks * 4
 
     @property
@@ -443,10 +497,11 @@ class _Plan:
     def norm_red(self):  # LDS word: NormIn's per-row wave partials (norm_rows x 8 f32)
         return -(-(self.flag_word + 1) // 4) * 4
 
-
     @property
     def lds_words(self):
-        end = self.norm_red + (self.nspec.lds_words(self.norm_rows) if self.norm_src else 0)
+        end = self.norm_red + (
+            self.nspec.lds_words(self.norm_rows) if self.norm_src else 0
+        )
         return -(-end // 4) * 4  # 16 B multiple
 
     @property
@@ -460,7 +515,9 @@ class _Plan:
 
     @property
     def s_bytes(self):
-        return 16 if self.a16 else self.n * self.k // 32  # (bf16 weights: a placeholder scales arg)
+        return (
+            16 if self.a16 else self.n * self.k // 32
+        )  # (bf16 weights: a placeholder scales arg)
 
 
 def default_groups(n_rg: int, k_split: int, align: int) -> int:
@@ -481,7 +538,13 @@ def _wave_rows(g: int) -> list[int]:
 
 
 def _prefetch(
-    gw: int, units: int, poll_regs: int, scale_regs: int, unit_regs: int = 4, rc: int = 1, b_rc: int | None = None
+    gw: int,
+    units: int,
+    poll_regs: int,
+    scale_regs: int,
+    unit_regs: int = 4,
+    rc: int = 1,
+    b_rc: int | None = None,
 ) -> int:
     """Units a wave keeps in flight: as many as the VGPR budget holds.
     A unit in flight costs ``unit_regs`` VGPRs (MXFP4: 16 B of weights, MXFP8: 32 B); reserved: the
@@ -489,8 +552,16 @@ def _prefetch(
     scales: 1 per row group), the input poll's batch (``poll_regs``) and the
     task's scale chunks (``scale_regs``), both live while the prefetched units
     are, and 48 for addresses and the epilogue. ``rc``: 16-row chunks (accumulators and B operands per chunk);
-    ``b_rc``: the chunks whose B operands are live at once (default ``rc``; a streamed input: 1)."""
-    free = VGPR_BUDGET - 4 * gw * rc - 2 * (9 * (rc if b_rc is None else b_rc) + gw) - poll_regs - scale_regs - 48
+    ``b_rc``: the chunks whose B operands are live at once (default ``rc``; a streamed input: 1).
+    """
+    free = (
+        VGPR_BUDGET
+        - 4 * gw * rc
+        - 2 * (9 * (rc if b_rc is None else b_rc) + gw)
+        - poll_regs
+        - scale_regs
+        - 48
+    )
     return max(1, min(units, free // unit_regs))
 
 
@@ -515,10 +586,12 @@ _FITTED: dict = {}
 
 def fit_cache() -> Path:
     """The on-disk cache of the fits derived by probes (only where the frozen table does not apply): ``dsv41_hi_fits``
-    in FlyDSL's runtime cache directory (``FLYDSL_RUNTIME_CACHE_DIR``, FlyDSL's default otherwise)."""
+    in FlyDSL's runtime cache directory (``FLYDSL_RUNTIME_CACHE_DIR``, FlyDSL's default otherwise).
+    """
     from flydsl.utils import env as flydsl_env
 
     return Path(flydsl_env.runtime.cache_dir) / "dsv41_hi_fits"
+
 
 # the frozen fits (``linear_fits.FITS``: the served compositions' depths, derived by ``_fit``'s probes with the FlyDSL
 # ``linear_fits.FLYDSL``) used in place of the probes with that FlyDSL; ``FROZEN`` False: every fit derived (the
@@ -570,11 +643,14 @@ def _fit_store(key: str, pre) -> None:
 def fit_key(*parts) -> str:
     """A fit's cache key: ``parts`` (the plan and what else the fit depends on), the hi source and the toolchain
     and environment (``emit.compile.toolchain_identity``): a fit cached by another FlyDSL / LLVM / target / knob set
-    (another container on a shared ``fit_cache()``) is another key, never a different prefetch under this one."""
+    (another container on a shared ``fit_cache()``) is another key, never a different prefetch under this one.
+    """
     from ...emit.compile import toolchain_identity
     from ...emit.kernel import source_digest
 
-    return hashlib.sha256(repr((parts, source_digest(), toolchain_identity())).encode()).hexdigest()[:24]
+    return hashlib.sha256(
+        repr((parts, source_digest(), toolchain_identity())).encode()
+    ).hexdigest()[:24]
 
 
 def _fit(lin, sc: Scenario, p: _Plan) -> _Plan | None:
@@ -583,7 +659,8 @@ def _fit(lin, sc: Scenario, p: _Plan) -> _Plan | None:
     producers of its input channels (``source_stages``, as in the block evals) and
     the depth lowered until the resource gate passes with ``FIT_MARGIN`` VGPRs to
     spare (or the depth is 1). The frozen table's depth where it has the plan (``_frozen``); else cached per plan,
-    source digest and toolchain (``fit_key``), in process and on disk (``fit_cache()``)."""
+    source digest and toolchain (``fit_key``), in process and on disk (``fit_cache()``).
+    """
     from dataclasses import replace
 
     from ...emit.compile import ResourceError
@@ -599,10 +676,14 @@ def _fit(lin, sc: Scenario, p: _Plan) -> _Plan | None:
         stages = source_stages(lin.x, sc.rows)
         q, _FITTED[key] = p, None
         margin = FIT_MARGIN + (STREAM_FIT_MARGIN if p.xchunk else 0)
-        if p.xchunk:  # streamed: the pressure at depth 1, then the depth it leaves room for, up to every unit of the
+        if (
+            p.xchunk
+        ):  # streamed: the pressure at depth 1, then the depth it leaves room for, up to every unit of the
             #           task (the register model is not the cap: it overcounts the ring's poll, 122 VGPRs at its 10)
 
-            def vgprs(pre):  # None: the probe does not build (resources, or its compile / link fails: skipped)
+            def vgprs(
+                pre,
+            ):  # None: the probe does not build (resources, or its compile / link fails: skipped)
                 from flydsl.compiler.diagnostics import DSLCompileError
 
                 q = replace(p, prefetch=pre, lead=max(1, pre // LEAD_DIV))
@@ -614,8 +695,13 @@ def _fit(lin, sc: Scenario, p: _Plan) -> _Plan | None:
                     return None
 
             if (v1 := vgprs(1)) is not None:
-                pre = min(p.c * p.gw, max(1, 1 + (VGPR_BUDGET - margin - v1) // p.fmt.lane_words))
-                while pre > 1 and ((v := vgprs(pre)) is None or v > VGPR_BUDGET - margin):
+                pre = min(
+                    p.c * p.gw,
+                    max(1, 1 + (VGPR_BUDGET - margin - v1) // p.fmt.lane_words),
+                )
+                while pre > 1 and (
+                    (v := vgprs(pre)) is None or v > VGPR_BUDGET - margin
+                ):
                     pre -= 1
                 _FITTED[key] = pre
         while not p.xchunk:
@@ -632,7 +718,9 @@ def _fit(lin, sc: Scenario, p: _Plan) -> _Plan | None:
         _fit_store(key, _FITTED[key])
         DERIVED[plan_digest(p)] = _FITTED[key]
     pre = _FITTED[key]
-    return None if pre is None else replace(p, prefetch=pre, lead=max(1, pre // LEAD_DIV))
+    return (
+        None if pre is None else replace(p, prefetch=pre, lead=max(1, pre // LEAD_DIV))
+    )
 
 
 # ------------------------------------------------------------------ the block
@@ -674,13 +762,25 @@ class Linear(Block):
             raise ValueError(f"Linear {name}: tp_sum 'producer' or 'consumer' (consumer: a tp_partial; 'rs': an "
                              f"'f32' or 'f32q' one), got {tp_sum!r}")  # fmt: skip
         self.tp_sum = tp_sum
-        if tp_partial not in (None, "bf16", "f32", "f32q", "f32p"):  # f32q: fp32 packed (peer.py)
-            raise ValueError(f"Linear {name}: tp_partial {tp_partial!r} not in (None, 'bf16', 'f32', 'f32q', 'f32p')")
+        if tp_partial not in (
+            None,
+            "bf16",
+            "f32",
+            "f32q",
+            "f32p",
+        ):  # f32q: fp32 packed (peer.py)
+            raise ValueError(
+                f"Linear {name}: tp_partial {tp_partial!r} not in (None, 'bf16', 'f32', 'f32q', 'f32p')"
+            )
         if tp_partial and isinstance(out, SwiGLU):
-            raise ValueError(f"Linear {name}: SwiGLU is column-parallel, it takes no tp_partial")
+            raise ValueError(
+                f"Linear {name}: SwiGLU is column-parallel, it takes no tp_partial"
+            )
         self.tp_partial = tp_partial or ""
         if weight_format not in gemv.FORMATS and weight_format != "bf16":
-            raise ValueError(f"Linear {name}: weight format {weight_format!r} not in {sorted(gemv.FORMATS)} or 'bf16'")
+            raise ValueError(
+                f"Linear {name}: weight format {weight_format!r} not in {sorted(gemv.FORMATS)} or 'bf16'"
+            )
         self.weight_format = weight_format
         a16 = weight_format == "bf16"
         # A16W4 (``X16``): MXFP4 weights, a BF16 channel input
@@ -700,29 +800,55 @@ class Linear(Block):
         if not a16 and not x16 and not isinstance(x, NormIn) and x.fmt is not Fmt.MXFP8:
             raise ValueError("Linear's input must be an MXFP8 channel or a NormIn")
         if isinstance(x, NormIn) and isinstance(x.src, Channel) and x.src.flagged:
-            raise ValueError("NormIn polls a tagged BF16 channel (bulk + flag source not implemented)")
-        if isinstance(out, Residual) and out.channel is not None and out.channel.flagged:
-            raise ValueError("Residual polls a tagged BF16 channel (bulk + flag residual not implemented)")
+            raise ValueError(
+                "NormIn polls a tagged BF16 channel (bulk + flag source not implemented)"
+            )
+        if (
+            isinstance(out, Residual)
+            and out.channel is not None
+            and out.channel.flagged
+        ):
+            raise ValueError(
+                "Residual polls a tagged BF16 channel (bulk + flag residual not implemented)"
+            )
         if (
             isinstance(out, Residual)
             and out.ssq is not None
             and (out.ssq.width * 16 != n or (tp_sum or "producer") != "producer")
         ):
-            raise ValueError(f"Linear {name}: Residual ssq: width N / 16, the producer's TP sum")
-        if groups > 1 and (isinstance(x, NormIn) or x.width % groups or n % (16 * groups)):
+            raise ValueError(
+                f"Linear {name}: Residual ssq: width N / 16, the producer's TP sum"
+            )
+        if groups > 1 and (
+            isinstance(x, NormIn) or x.width % groups or n % (16 * groups)
+        ):
             raise ValueError(f"Linear {name}: groups {groups} needs an MXFP8 channel input of width groups x K and "
                              f"N a multiple of 16 groups (N {n})")  # fmt: skip
         self.groups = groups
-        if compute not in ("scaled", "bf16") or (compute == "bf16" and weight_format != "mxfp8"):
-            raise ValueError(f"Linear {name}: compute 'scaled' or 'bf16' (bf16: MXFP8 weights), got {compute!r}")
+        if compute not in ("scaled", "bf16") or (
+            compute == "bf16" and weight_format != "mxfp8"
+        ):
+            raise ValueError(
+                f"Linear {name}: compute 'scaled' or 'bf16' (bf16: MXFP8 weights), got {compute!r}"
+            )
         self.compute = compute
         if prewiden and (compute != "bf16" or isinstance(x, NormIn) or x.dense):
-            raise ValueError(f"Linear {name}: prewiden needs the bf16 compute and a tagged MXFP8 channel input")
-        self.prewiden = prewiden  # units a wave widens before its input lands (``_Plan.prewiden``)
+            raise ValueError(
+                f"Linear {name}: prewiden needs the bf16 compute and a tagged MXFP8 channel input"
+            )
+        self.prewiden = (
+            prewiden  # units a wave widens before its input lands (``_Plan.prewiden``)
+        )
         # bias: the layer's retained bf16 biases of ``linears`` (in their order), added in fp32 to acc before the
         # output's rounding (HF's ``nn.Linear(bias=True)``: bf16(x W^T + b)); not with SwiGLU / HCWrite / TP
-        if bias is not None and (isinstance(out, (SwiGLU, HCWrite)) or tp_partial or len(bias) != len(linears)):
-            raise ValueError(f"Linear {name}: a bias per linear, not with SwiGLU, HCWrite or tp_partial")
+        if bias is not None and (
+            isinstance(out, (SwiGLU, HCWrite))
+            or tp_partial
+            or len(bias) != len(linears)
+        ):
+            raise ValueError(
+                f"Linear {name}: a bias per linear, not with SwiGLU, HCWrite or tp_partial"
+            )
         self.bias = tuple(bias) if bias is not None else None
         # row_scale: FP8 weights with one fp32 scale an output row (FP8 per-channel checkpoints, e.g. Quark's
         # "fp8_e4m3 per_channel"): the E4M3 bytes packed as MXFP8 with every block code 127 (scale 1, exact) and acc x
@@ -730,11 +856,15 @@ class Linear(Block):
         # linear's record carries ``row_scale`` (fp32 [N_i]). Not with a TP partial: the row-parallel sum's consumer
         # would never scale it
         if row_scale and (weight_format != "mxfp8" or tp_partial):
-            raise ValueError(f"Linear {name}: row_scale takes MXFP8 weights (E4M3 rows, codes 127), no tp_partial")
+            raise ValueError(
+                f"Linear {name}: row_scale takes MXFP8 weights (E4M3 rows, codes 127), no tp_partial"
+            )
         self.row_scale = row_scale
         # x_split: the input channel holds every rank's K columns of a row (a whole row, e.g. a replicated input); a
         # row-parallel TP Linear (tp_partial) reads its rank's K slice of it (rank r: columns r K .. (r + 1) K)
-        if x_split > 1 and (groups > 1 or not tp_partial or isinstance(x, NormIn) or x.width % x_split):
+        if x_split > 1 and (
+            groups > 1 or not tp_partial or isinstance(x, NormIn) or x.width % x_split
+        ):
             raise ValueError(f"Linear {name}: x_split needs a row-parallel TP (tp_partial), no groups, a channel input "
                              f"of width x_split x K")  # fmt: skip
         self.x_split = x_split
@@ -746,34 +876,52 @@ class Linear(Block):
                              "block; pad other widths with zero tails (NormSpec.pitch, BLOCK_CATALOG 'K')")  # fmt: skip
         align = {SwiGLU: 4, MXFP8Out: 2}.get(type(out), 1)
         if isinstance(out, F32Out) and (
-            out.channel.fmt is not Fmt.F32 or out.channel.width != n or out.channel.flagged
+            out.channel.fmt is not Fmt.F32
+            or out.channel.width != n
+            or out.channel.flagged
         ):
             raise ValueError(f"F32Out needs a tagged F32 channel of width N ({n})")
         self.align = align
         self.group_rows, self.wave_rows, self.k_split = group_rows, wave_rows, k_split
         if kwave not in ("interleave", "contiguous"):
-            raise ValueError(f"Linear {name}: kwave {kwave!r} not in ('interleave', 'contiguous')")
+            raise ValueError(
+                f"Linear {name}: kwave {kwave!r} not in ('interleave', 'contiguous')"
+            )
         self.kwave = kwave
         self.pre_units = pre_units  # weight units a wave issues before its input lands (``_Plan.pre_units``)
         if plan_rule not in ("one_round", "units"):
-            raise ValueError(f"Linear {name}: plan_rule {plan_rule!r} not in ('one_round', 'units')")
+            raise ValueError(
+                f"Linear {name}: plan_rule {plan_rule!r} not in ('one_round', 'units')"
+            )
         self.plan_rule = plan_rule
         # the input streamed through a 2-slot LDS ring of ``xchunk`` K steps (``_stream_ring``): None derives it
         # above ``STREAM_ROWS`` rows (no resident shape fits there); 0: never; n: always, n K steps a slot; "auto":
         # always, a slot of one K step a K wave
-        if xchunk not in (None, 0, "auto") and not (isinstance(xchunk, int) and xchunk > 0):
-            raise ValueError(f"Linear {name}: xchunk None, 0, 'auto' or K steps > 0, got {xchunk!r}")
-        if xchunk and (not isinstance(x, Channel) or compute != "scaled" or kwave != "interleave"):
+        if xchunk not in (None, 0, "auto") and not (
+            isinstance(xchunk, int) and xchunk > 0
+        ):
+            raise ValueError(
+                f"Linear {name}: xchunk None, 0, 'auto' or K steps > 0, got {xchunk!r}"
+            )
+        if xchunk and (
+            not isinstance(x, Channel) or compute != "scaled" or kwave != "interleave"
+        ):
             raise ValueError(f"Linear {name}: a streamed input (xchunk) needs an MXFP8 channel input, the scaled MX "
                              "compute and interleaved K waves")  # fmt: skip
         self.xchunk = xchunk
         self.xlead = xlead  # a streamed input's slots in flight (None: the deepest of 4 .. 1 that fits)
         if group_rows is not None and (group_rows % 16 or (group_rows // 16) % align):
-            raise ValueError(f"Linear {name}: group_rows {group_rows} must be a multiple of {16 * align}")
+            raise ValueError(
+                f"Linear {name}: group_rows {group_rows} must be a multiple of {16 * align}"
+            )
         if wave_rows is not None and WAVES % wave_rows:
-            raise ValueError(f"Linear {name}: wave_rows {wave_rows} must divide {WAVES}")
+            raise ValueError(
+                f"Linear {name}: wave_rows {wave_rows} must divide {WAVES}"
+            )
         if k_split is not None and (self.k // 128) % k_split:
-            raise ValueError(f"Linear {name}: k_split {k_split} does not divide {self.k // 128} K steps")
+            raise ValueError(
+                f"Linear {name}: k_split {k_split} does not divide {self.k // 128} K steps"
+            )
 
     # ---- plan side
 
@@ -794,21 +942,39 @@ class Linear(Block):
         task whose scale block does not fit beside the prefetch then takes fewer rows over the whole K in two rounds
         instead of half the K in one (the linear measurements H-LM)."""
         if self.tp_partial and sc.tp < 2:
-            raise PlanError(f"Linear {self.name}: tp_partial needs a TP scenario (tp > 1), got {sc.name}")
+            raise PlanError(
+                f"Linear {self.name}: tp_partial needs a TP scenario (tp > 1), got {sc.name}"
+            )
         if self.x_split > 1 and sc.tp != self.x_split:
-            raise PlanError(f"Linear {self.name}: x_split {self.x_split} needs TP {self.x_split}, got {sc.name}")
+            raise PlanError(
+                f"Linear {self.name}: x_split {self.x_split} needs TP {self.x_split}, got {sc.name}"
+            )
         if self.x16 and sc.rows > 16:
-            raise PlanError(f"Linear {self.name}: a bf16 input up to 16 rows (one MFMA chunk), got {sc.rows}")
+            raise PlanError(
+                f"Linear {self.name}: a bf16 input up to 16 rows (one MFMA chunk), got {sc.rows}"
+            )
         steps = self.k // 128
-        splits = [self.k_split] if self.k_split else [d for d in range(1, steps + 1) if steps % d == 0]
-        if self.xchunk or (self.xchunk is None and sc.rows > STREAM_ROWS and self._streamable()):
+        splits = (
+            [self.k_split]
+            if self.k_split
+            else [d for d in range(1, steps + 1) if steps % d == 0]
+        )
+        if self.xchunk or (
+            self.xchunk is None and sc.rows > STREAM_ROWS and self._streamable()
+        ):
             return self._plan_streamed(sc, steps, splits)
         try:
             return self._plan_resident(sc, steps, splits)
-        except PlanError:  # 17-32 rows with no resident shape (e.g. 24): streamed, where none built before
+        except (
+            PlanError
+        ):  # 17-32 rows with no resident shape (e.g. 24): streamed, where none built before
             if self.xchunk is None and sc.rows > 16 and self._streamable():
                 return self._plan_streamed(sc, steps, splits)
-            if self.weight_format == "bf16" and sc.rows > 16 and self.plan_rule != "units":
+            if (
+                self.weight_format == "bf16"
+                and sc.rows > 16
+                and self.plan_rule != "units"
+            ):
                 # bf16 weights past 16 rows (not streamable: the whole slice's bf16 words are polled): the "units"
                 # shapes, where none built before (the one-round group counts starve the prefetch from 32 rows)
                 for kt, g in self._unit_candidates(sc, steps, splits):
@@ -824,36 +990,53 @@ class Linear(Block):
 
     def _plan_streamed(self, sc: Scenario, steps: int, splits: list[int]) -> _Plan:
         """The input through the LDS ring: shapes by the busiest CTA's bytes (``_unit_candidates``: a K split's fp32
-        partials count, they grow with the rows), each with the first wave split and slot size that fits."""
+        partials count, they grow with the rows), each with the first wave split and slot size that fits.
+        """
         for kt, g in self._unit_candidates(sc, steps, splits):
             fitted = self._first_fit(sc, g, kt, strict=False, stream=True)
             if fitted is not None:
                 return fitted
-        if self.group_rows and sc.rows > STREAM_ROWS:  # a given task shape with none past STREAM_ROWS: the plan's
-            for kt, g in self._unit_candidates(sc, steps, splits, given=False):  # (the batch bands: a wq_b's 32 / 48 at 48)
+        if (
+            self.group_rows and sc.rows > STREAM_ROWS
+        ):  # a given task shape with none past STREAM_ROWS: the plan's
+            for kt, g in self._unit_candidates(
+                sc, steps, splits, given=False
+            ):  # (the batch bands: a wq_b's 32 / 48 at 48)
                 fitted = self._first_fit(sc, g, kt, strict=False, stream=True)
                 if fitted is not None:
                     return fitted
-        raise PlanError(f"Linear {self.name}: no streamed task shape fits at {sc.rows} rows (LDS / registers)")
+        raise PlanError(
+            f"Linear {self.name}: no streamed task shape fits at {sc.rows} rows (LDS / registers)"
+        )
 
     def _plan_resident(self, sc: Scenario, steps: int, splits: list[int]) -> _Plan:
         for kt in splits:
-            g = self.group_rows // 16 if self.group_rows else default_groups(self.n // 16, kt, self.align)
+            g = (
+                self.group_rows // 16
+                if self.group_rows
+                else default_groups(self.n // 16, kt, self.align)
+            )
             g = self._in_group(g)
             if not self.group_rows:
                 g = self._owner_groups(sc, g)
             fitted = self._first_fit(sc, g, kt, strict=True)
             if fitted is not None:
                 return fitted
-        raise PlanError(f"Linear {self.name}: no task shape fits at {sc.rows} rows (LDS / registers)")
+        raise PlanError(
+            f"Linear {self.name}: no task shape fits at {sc.rows} rows (LDS / registers)"
+        )
 
     def _straddles(self, sc: Scenario, g: int) -> bool:
         """``tp_sum`` "rs": a task of ``g`` row groups would hold columns of two owners (``peer.push_rs`` puts a wave's
-        lanes to one owner: the other owner's pairs never arrive, its consumer waits)."""
+        lanes to one owner: the other owner's pairs never arrive, its consumer waits).
+        """
         if self.tp_sum != "rs" or not self.tp_partial:
             return False
         q = self.n // 16 // sc.tp  # an owner's row groups
-        return any((b * g) // q != (min((b + 1) * g, self.n // 16) - 1) // q for b in range(-(-(self.n // 16) // g)))
+        return any(
+            (b * g) // q != (min((b + 1) * g, self.n // 16) - 1) // q
+            for b in range(-(-(self.n // 16) // g))
+        )
 
     def _refuse_straddle(self, sc: Scenario, g: int) -> None:
         if self._straddles(sc, g):
@@ -869,11 +1052,15 @@ class Linear(Block):
 
     def _in_group(self, g: int) -> int:
         per_group = self.n // self.groups // 16
-        while self.groups > 1 and per_group % g and g > self.align:  # a task's row groups in one group
+        while (
+            self.groups > 1 and per_group % g and g > self.align
+        ):  # a task's row groups in one group
             g -= self.align
         return g
 
-    def _first_fit(self, sc: Scenario, g: int, kt: int, strict: bool, stream: bool = False) -> _Plan | None:
+    def _first_fit(
+        self, sc: Scenario, g: int, kt: int, strict: bool, stream: bool = False
+    ) -> _Plan | None:
         """The first wave split / norm choice of ``g`` row groups x ``kt`` K slices that fits (LDS, registers,
         compiled spill-free), or None. ``strict``: a given ``wave_rows`` that does not divide ``g`` is an error.
         ``stream``: the input through the LDS ring, the largest slot (``xchunk``: 4, 2 or 1 K steps a K wave, or the
@@ -882,20 +1069,35 @@ class Linear(Block):
         ks = self.k // 128 // kt
         for wr in [self.wave_rows] if self.wave_rows else _wave_rows(g):
             wk = WAVES // wr
-            if stream:  # slots of one K step a K wave, the deepest lead that fits first; or the given slot / lead
-                xcs = [self.xchunk] if isinstance(self.xchunk, int) and self.xchunk else [wk]
+            if (
+                stream
+            ):  # slots of one K step a K wave, the deepest lead that fits first; or the given slot / lead
+                xcs = (
+                    [self.xchunk]
+                    if isinstance(self.xchunk, int) and self.xchunk
+                    else [wk]
+                )
                 leads = [self.xlead] if self.xlead else [4, 3, 2, 1]
-                choices = [(0, 0, xc, ld) for xc in xcs for ld in leads if xc % wk == 0 and ks % xc == 0 and xc < ks]
+                choices = [
+                    (0, 0, xc, ld)
+                    for xc in xcs
+                    for ld in leads
+                    if xc % wk == 0 and ks % xc == 0 and xc < ks
+                ]
             else:
                 choices = [(0, 0, 0, 1)]
             for nrows, npre, xc, ld in choices:
                 p = self._plan(sc, g, wr, kt, nrows, npre, xc, ld)
-                if p.lds_words * 4 > MI355X.lds_bytes - 1024:  # (1 KiB kept free past the arena)
+                if (
+                    p.lds_words * 4 > MI355X.lds_bytes - 1024
+                ):  # (1 KiB kept free past the arena)
                     continue
                 if not self.k_split and not xc and p.prefetch < min(P_MIN, p.c * p.gw):
                     continue  # the input attempt would starve the prefetch: split K instead (streamed: compiled)
                 fitted = _fit(self, sc, p)
-                if fitted is None or (not self.k_split and fitted.prefetch < min(P_MIN, p.c * p.gw)):
+                if fitted is None or (
+                    not self.k_split and fitted.prefetch < min(P_MIN, p.c * p.gw)
+                ):
                     continue
                 return fitted
         return None
@@ -937,7 +1139,15 @@ class Linear(Block):
         return sorted(out, key=cost)
 
     def _plan(
-        self, sc: Scenario, g: int, wr: int, kt: int, nrows: int = 0, npre: int = 0, xchunk: int = 0, xlead: int = 1
+        self,
+        sc: Scenario,
+        g: int,
+        wr: int,
+        kt: int,
+        nrows: int = 0,
+        npre: int = 0,
+        xchunk: int = 0,
+        xlead: int = 1,
     ) -> _Plan:
         out = self.out
         kind = {BF16Out: "bf16", F32Out: "f32", MXFP8Out: "mxfp8", SwiGLU: "swiglu", Residual: "residual",
@@ -947,11 +1157,17 @@ class Linear(Block):
         ks = self.k // 128 // kt
         c = -(-ks // wk)
         norm = self.x if isinstance(self.x, NormIn) else None
-        if xchunk and self.x.dense:  # the dense loads of the slots in flight (after the flags, at the task's start)
+        if (
+            xchunk and self.x.dense
+        ):  # the dense loads of the slots in flight (after the flags, at the task's start)
             in_regs = xlead * 4 * sum(_dense_chunks(sc.rows, xchunk * 128)) + 2
-        elif xchunk:  # the attempts of the slots in flight (``xlead`` of them, live while a slot streams)
+        elif (
+            xchunk
+        ):  # the attempts of the slots in flight (``xlead`` of them, live while a slot streams)
             in_regs = xlead * _poll_regs(sc.rows, xchunk * 128)
-        elif norm is None and self.x.dense:  # the dense loads (after the prefetch) and the flag attempt
+        elif (
+            norm is None and self.x.dense
+        ):  # the dense loads (after the prefetch) and the flag attempt
             in_regs = 4 * sum(_dense_chunks(sc.rows, ks * 128)) + 2
         elif norm is None:
             in_regs = _poll_regs(sc.rows, ks * 128)
@@ -959,7 +1175,11 @@ class Linear(Block):
             g // wr,
             c * (g // wr),
             in_regs,
-            0 if self.weight_format == "bf16" or self.row_scale else 4 * -(-g * ks * 4 // THREADS),
+            (
+                0
+                if self.weight_format == "bf16" or self.row_scale
+                else 4 * -(-g * ks * 4 // THREADS)
+            ),
             wformat(self.weight_format).lane_words,
             -(-sc.rows // 16),
             1 if xchunk else None,
@@ -981,7 +1201,9 @@ class Linear(Block):
             res_arg=out.arg or "" if kind == "residual" else "",
             res_ch=out.channel.name if kind == "residual" and out.channel else "",
             ssq=out.ssq.name if kind == "residual" and out.ssq is not None else "",
-            out_arg=out.out if kind == "residual" else (out.arg if kind == "argout" else ""),
+            out_arg=(
+                out.out if kind == "residual" else (out.arg if kind == "argout" else "")
+            ),
             part=f"{self.name}.part" if kt > 1 else "",
             ctr=f"{self.name}.ctr" if kt > 1 else "",
             norm_src=norm.src_name if norm else "",
@@ -991,7 +1213,11 @@ class Linear(Block):
             norm_rows=nrows if norm else 0,
             norm_pre=npre if norm else 0,
             x_proto="tagged" if norm else self.x.proto.value,
-            out_proto=self._out_channel().proto.value if self._out_channel() is not None else "tagged",
+            out_proto=(
+                self._out_channel().proto.value
+                if self._out_channel() is not None
+                else "tagged"
+            ),
             wfmt=self.weight_format + (X16 if self.x16 else ""),
             tp=sc.tp if self.tp_partial else 1,
             kwave=self.kwave,
@@ -1013,23 +1239,41 @@ class Linear(Block):
         )
 
     def _out_channel(self) -> Channel | None:
-        return self.out.publish if isinstance(self.out, (Residual, HCWrite)) else self.out.channel
+        return (
+            self.out.publish
+            if isinstance(self.out, (Residual, HCWrite))
+            else self.out.channel
+        )
 
     def stages(self, sc: Scenario) -> list[Stage]:
         return self._stages(self.plan(sc))
 
     def _stages(self, p: _Plan) -> list[Stage]:
         writes = []
-        ch = self._out_channel() if p.tp_sum == "producer" else None  # consumer: the partials region only
+        ch = (
+            self._out_channel() if p.tp_sum == "producer" else None
+        )  # consumer: the partials region only
         if ch is not None:  # FLAG: one flag per row block (its last K slice puts it)
             writes += list(ch.regions(p.rows, (self.name,), flags=p.blocks))
         if p.part:
-            writes.append(Region(p.part, p.k_split * p.rows * p.n, (self.name,), exchange=True))
-            writes.append(Region(p.ctr, p.blocks, (self.name,), exchange=True, single=True))  # atomics: one copy
+            writes.append(
+                Region(p.part, p.k_split * p.rows * p.n, (self.name,), exchange=True)
+            )
+            writes.append(
+                Region(p.ctr, p.blocks, (self.name,), exchange=True, single=True)
+            )  # atomics: one copy
         if p.tp_partial:
             pairs = (peer.shot2_pairs(p.rows, p.n, p.tp, p.tp_partial) if p.tp_sum == "rs"
                      else peer.partial_pairs(p.tp_partial, p.rows, p.n))  # fmt: skip
-            writes.append(Region(p.tp_reg, pairs, (self.name,), space=Space.PEER, exchange=p.tp_sum == "producer"))
+            writes.append(
+                Region(
+                    p.tp_reg,
+                    pairs,
+                    (self.name,),
+                    space=Space.PEER,
+                    exchange=p.tp_sum == "producer",
+                )
+            )
         args = list(self.weight_args)
         return [
             Stage(
@@ -1051,14 +1295,23 @@ class Linear(Block):
         mats = [layer.linears[n] for n in self.linears]
         for n, m in zip(self.linears, mats, strict=True):
             if getattr(m, "fmt", "mxfp4") != fmt.name:
-                raise ValueError(f"Linear {self.name}: {n} is {getattr(m, 'fmt', 'mxfp4')}, the block is {fmt.name}")
-        data = [m.packed.view(torch.uint8) for m in mats]  # bytes: FP8 tensors stack and pack as uint8
+                raise ValueError(
+                    f"Linear {self.name}: {n} is {getattr(m, 'fmt', 'mxfp4')}, the block is {fmt.name}"
+                )
+        data = [
+            m.packed.view(torch.uint8) for m in mats
+        ]  # bytes: FP8 tensors stack and pack as uint8
         if isinstance(self.out, SwiGLU):
             gate, up = data
             g_codes, u_codes = (m.codes for m in mats)
             n2 = gate.shape[0]
-            packed = torch.stack((gate.reshape(n2 // 16, 16, -1), up.reshape(n2 // 16, 16, -1)), 1)
-            codes = torch.stack((g_codes.reshape(n2 // 16, 16, -1), u_codes.reshape(n2 // 16, 16, -1)), 1)
+            packed = torch.stack(
+                (gate.reshape(n2 // 16, 16, -1), up.reshape(n2 // 16, 16, -1)), 1
+            )
+            codes = torch.stack(
+                (g_codes.reshape(n2 // 16, 16, -1), u_codes.reshape(n2 // 16, 16, -1)),
+                1,
+            )
             packed, codes = packed.reshape(2 * n2, -1), codes.reshape(2 * n2, -1)
         else:
             packed = torch.cat(data)
@@ -1077,7 +1330,9 @@ class Linear(Block):
         if self.bias:
             b = torch.cat([layer.retained[n].reshape(-1) for n in self.bias]).float()
             if b.shape != (self.n,):
-                raise ValueError(f"Linear {self.name}: bias {tuple(b.shape)} != ({self.n},)")
+                raise ValueError(
+                    f"Linear {self.name}: bias {tuple(b.shape)} != ({self.n},)"
+                )
             out[f"{self.name}.b"] = b.contiguous()
         return out
 
@@ -1091,28 +1346,39 @@ class Linear(Block):
         rs = [r.reshape(-1).float() for r in rs]
         if isinstance(self.out, SwiGLU):
             n2 = rs[0].shape[0]
-            v = torch.stack((rs[0].reshape(n2 // 16, 16), rs[1].reshape(n2 // 16, 16)), 1).reshape(-1)
+            v = torch.stack(
+                (rs[0].reshape(n2 // 16, 16), rs[1].reshape(n2 // 16, 16)), 1
+            ).reshape(-1)
         else:
             v = torch.cat(rs)
         if v.shape != (self.n,):
-            raise ValueError(f"Linear {self.name}: row scales {tuple(v.shape)} != ({self.n},)")
+            raise ValueError(
+                f"Linear {self.name}: row scales {tuple(v.shape)} != ({self.n},)"
+            )
         return v.contiguous()
 
     def _pack_bf16(self, layer) -> dict[str, torch.Tensor]:
         """bf16 weights: ``layer.linears[name]`` bf16 [N_i, K] tensors stacked along N (SwiGLU: gate / up interleaved
-        per 16-row group, as the MX path) into ``gemv16.pack_bf16_mmajor``'s units; ``.ws`` a placeholder."""
+        per 16-row group, as the MX path) into ``gemv16.pack_bf16_mmajor``'s units; ``.ws`` a placeholder.
+        """
         mats = [layer.linears[n] for n in self.linears]
         for n, m in zip(self.linears, mats, strict=True):
             if not isinstance(m, torch.Tensor) or m.dtype != torch.bfloat16:
-                raise ValueError(f"Linear {self.name}: {n} is not a bf16 tensor (weight_format 'bf16')")
+                raise ValueError(
+                    f"Linear {self.name}: {n} is not a bf16 tensor (weight_format 'bf16')"
+                )
         if isinstance(self.out, SwiGLU):
             gate, up = mats
             n2 = gate.shape[0]
-            w = torch.stack((gate.reshape(n2 // 16, 16, -1), up.reshape(n2 // 16, 16, -1)), 1).reshape(2 * n2, -1)
+            w = torch.stack(
+                (gate.reshape(n2 // 16, 16, -1), up.reshape(n2 // 16, 16, -1)), 1
+            ).reshape(2 * n2, -1)
         else:
             w = torch.cat(mats)
         if w.shape != (self.n, self.k):
-            raise ValueError(f"Linear {self.name}: stacked weight {tuple(w.shape)} != ({self.n}, {self.k})")
+            raise ValueError(
+                f"Linear {self.name}: stacked weight {tuple(w.shape)} != ({self.n}, {self.k})"
+            )
         w_arg, s_arg = self.weight_args
         return {w_arg: gemv16.pack_bf16_mmajor(w.contiguous()),
                 s_arg: torch.zeros(16, dtype=torch.uint8, device=w.device)}  # fmt: skip
@@ -1163,7 +1429,8 @@ def _unit_scale(k, p, gt, st):
 
 def _unit_codes_bf16(k, p, gt, st):
     """The weight scale codes of the lane's two 16-value halves (``gemv.widen_bf16``): lane group j holds 32-blocks
-    j // 2 and 2 + j // 2 of its row; the LDS bytes are [block][row] per K step (``_unit_scale``: byte = lane)."""
+    j // 2 and 2 + j // 2 of its row; the LDS bytes are [block][row] per K step (``_unit_scale``: byte = lane).
+    """
     off = (p.ws_base * 4 + (gt * p.ks + st) * 64) + (k.lane >> 5) * 16 + k.lane % 16
     b = fx.recast_iter(fx.Uint8, k.lds)
     return fx.Int32(fx.ptr_load(b + off)), fx.Int32(fx.ptr_load(b + (off + 32)))
@@ -1179,7 +1446,9 @@ def _x_batches(k, p, s, rmap=None, xoff=0):
     specs_row = words_row // 2  # 2-pair specs
     nq, ns = p.rows * specs_row, p.rows * (p.kse // 32)
     aq, as_ = k.mb[f"{p.x}.q"], k.mb[f"{p.x}.s"]
-    items = [("q", c) for c in range(-(-nq // THREADS))] + [("s", c) for c in range(-(-ns // THREADS))]
+    items = [("q", c) for c in range(-(-nq // THREADS))] + [
+        ("s", c) for c in range(-(-ns // THREADS))
+    ]
     out = []
     for b0 in range(0, len(items), mb.POLL_MAX):
         specs, dests = [], []
@@ -1187,12 +1456,20 @@ def _x_batches(k, p, s, rmap=None, xoff=0):
             if kind == "q":
                 idx = fx.min(fx.Int32(c * THREADS) + k.tid, fx.Int32(nq - 1))
                 r, w2 = idx // specs_row, idx % specs_row
-                specs.append((aq, rmap(r) * (p.xk // 4) + xoff // 4 + s * words_row + w2 * 2, 2))
+                specs.append(
+                    (aq, rmap(r) * (p.xk // 4) + xoff // 4 + s * words_row + w2 * 2, 2)
+                )
                 dests.append(r * p.pitch + w2 * 2)
             else:
                 idx = fx.min(fx.Int32(c * THREADS) + k.tid, fx.Int32(ns - 1))
                 r, gi = idx // (p.kse // 32), idx % (p.kse // 32)
-                specs.append((as_, rmap(r) * (p.xk // 32) + xoff // 32 + s * (p.kse // 32) + gi, 1))
+                specs.append(
+                    (
+                        as_,
+                        rmap(r) * (p.xk // 32) + xoff // 32 + s * (p.kse // 32) + gi,
+                        1,
+                    )
+                )
                 dests.append(p.xs_base + r * p.spitch + gi)
         out.append((specs, dests))
     return out
@@ -1208,12 +1485,24 @@ def _x_dense(k, p, s, xoff=0):
     for c in range(-(-nq // THREADS)):
         idx = fx.min(fx.Int32(c * THREADS) + k.tid, fx.Int32(nq - 1))
         r, w4 = idx // (words_row // 4), idx % (words_row // 4)
-        out.append((aq, r * (p.xk // 4) + xoff // 4 + s * words_row + w4 * 4, r * p.pitch + w4 * 4, False))
+        out.append(
+            (
+                aq,
+                r * (p.xk // 4) + xoff // 4 + s * words_row + w4 * 4,
+                r * p.pitch + w4 * 4,
+                False,
+            )
+        )
     for c in range(-(-ns // THREADS)):
         idx = fx.min(fx.Int32(c * THREADS) + k.tid, fx.Int32(ns - 1))
         r, c4 = idx // (codes_row // 4), idx % (codes_row // 4)
         out.append(
-            (as_, r * (p.xk // 32) + xoff // 32 + s * codes_row + c4 * 4, p.xs_base + r * p.spitch + c4 * 4, True)
+            (
+                as_,
+                r * (p.xk // 32) + xoff // 32 + s * codes_row + c4 * 4,
+                p.xs_base + r * p.spitch + c4 * 4,
+                True,
+            )
         )
     return out
 
@@ -1296,9 +1585,13 @@ def _store_mxfp8(k, p, ok, e, word, lead, code, width):
     """FP8 word of elements e .. e + 3 (row-major, row width ``width``); ``lead``
     lanes also store their group's scale code."""
     if ok:
-        chan.put_mxfp8_word(k.mb[f"{p.out_ch}.q"], e // 4, word, k.tag, p.out_proto == "flag")
+        chan.put_mxfp8_word(
+            k.mb[f"{p.out_ch}.q"], e // 4, word, k.tag, p.out_proto == "flag"
+        )
         if lead:
-            chan.put_mxfp8_scale(k.mb[f"{p.out_ch}.s"], e // 32, code, k.tag, p.out_proto == "flag")
+            chan.put_mxfp8_scale(
+                k.mb[f"{p.out_ch}.s"], e // 32, code, k.tag, p.out_proto == "flag"
+            )
 
 
 def _sum_red(k, p, base):
@@ -1306,7 +1599,12 @@ def _sum_red(k, p, base):
     stride = p.g * p.rows * 16
     tot = None
     for w in range_constexpr(p.wk):
-        v = fx.Vector(fx.ptr_load(k.ldsf + (base + w * stride), result_type=fx.Vector.make_type(4, fx.Float32)))
+        v = fx.Vector(
+            fx.ptr_load(
+                k.ldsf + (base + w * stride),
+                result_type=fx.Vector.make_type(4, fx.Float32),
+            )
+        )
         vals = [v[q] for q in range(4)]
         tot = vals if tot is None else [tot[q] + vals[q] for q in range(4)]
     return tot
@@ -1320,9 +1618,15 @@ def _poll_slices(k, p, ok, idx):
     if ok:
         specs = []
         for s in range_constexpr(p.k_split):
-            specs += [(k.mb[p.part], s * (p.rows * p.n) + idx, 2), (k.mb[p.part], s * (p.rows * p.n) + idx + 2, 2)]
+            specs += [
+                (k.mb[p.part], s * (p.rows * p.n) + idx, 2),
+                (k.mb[p.part], s * (p.rows * p.n) + idx + 2, 2),
+            ]
         got = mb.poll(specs, k.tag)
-        parts = [[w.bitcast(fx.Float32) for w in got[2 * s] + got[2 * s + 1]] for s in range(p.k_split)]
+        parts = [
+            [w.bitcast(fx.Float32) for w in got[2 * s] + got[2 * s + 1]]
+            for s in range(p.k_split)
+        ]
         acc = parts[0]
         for s in range_constexpr(1, p.k_split):
             acc = [acc[q] + parts[s][q] for q in range(4)]
@@ -1345,11 +1649,15 @@ def _arrive(k, p, b):
         addr = k.mb[p.ctr].value + fx.Int64(b * 8)
         if const_expr(p.k_split & (p.k_split - 1) == 0):
             # a power of two: a 32-bit counter (2**32 is a multiple of k_split, so it may wrap)
-            ptr = fx.inttoptr(fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4), addr)
+            ptr = fx.inttoptr(
+                fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4), addr
+            )
             old = fx.atomic_add(ptr, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Agent)
             last = (fx.Int32(old) & (p.k_split - 1)) == p.k_split - 1
         else:
-            ptr = fx.inttoptr(fx.PointerType.get(fx.Int64.ir_type, fx.AddressSpace.Global, 8), addr)
+            ptr = fx.inttoptr(
+                fx.PointerType.get(fx.Int64.ir_type, fx.AddressSpace.Global, 8), addr
+            )
             old = fx.atomic_add(ptr, fx.Int64(1), syncscope=fx.rocdl.SyncScope.Agent)
             last = fx.Int32(old % p.k_split) == p.k_split - 1
         fx.ptr_store(last.select(fx.Int32(1), fx.Int32(0)), k.lds + p.flag_word)
@@ -1377,10 +1685,13 @@ def _items(p, b, e_idx):
 def _tp_reduce(k, p, ok, e, vals):
     """Row-parallel TP (module docstring): this rank's partial of elements e .. e + 3 to every
     rank, then (``tp_sum`` "producer") the ``tp`` ranks' partials summed in rank order (fp32);
-    ``ok`` False: zeros. "consumer": the push only (the consumer sums: ``peer.sum_partials``)."""
+    ``ok`` False: zeros. "consumer": the push only (the consumer sums: ``peer.sum_partials``).
+    """
     t0, t1, t2, t3 = fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0)
     if ok:
-        if const_expr(p.tp_sum == "rs"):  # two-shot: to the columns' owner only (a task's columns: one owner)
+        if const_expr(
+            p.tp_sum == "rs"
+        ):  # two-shot: to the columns' owner only (a task's columns: one owner)
             peer.push_rs(k, p.tp_reg, e, vals, p.n, p.tp_partial)
     return [t0, t1, t2, t3]
 
@@ -1389,7 +1700,9 @@ def _emit_out(k, p, ok, n, col, lead, vals, res_words):
     """The output spec of one item's totals (``vals``: one or, SwiGLU, two lists of 4)."""
     if p.tp_partial:  # never SwiGLU (the constructor)
         vals = [_tp_reduce(k, p, ok, n * p.n + col, vals[0])]
-        if const_expr(p.tp_sum != "producer"):  # pushed: the consumer sums and owns the output
+        if const_expr(
+            p.tp_sum != "producer"
+        ):  # pushed: the consumer sums and owns the output
             return
     if p.kind == "bf16":
         _store_bf16(k, p, ok, n * p.n + col, vals[0])
@@ -1405,12 +1718,23 @@ def _finish(k, p, s, b, res_words):
     if p.k_split == 1:
         for ps in range(passes):
             ok, n, srcs, col, lead = _items(p, b, fx.Int32(ps * THREADS) + k.tid)
-            _emit_out(k, p, ok, n, col, lead, [_sum_red(k, p, w) for w, _ in srcs], res_words[ps])
+            _emit_out(
+                k,
+                p,
+                ok,
+                n,
+                col,
+                lead,
+                [_sum_red(k, p, w) for w, _ in srcs],
+                res_words[ps],
+            )
         return
     for ps in range(passes):
         ok, n, srcs, col, lead = _items(p, b, fx.Int32(ps * THREADS) + k.tid)
         for w, idx in srcs:
-            _put_partial(k, p, _live_item(k, ok, n), s * (p.rows * p.n) + idx, _sum_red(k, p, w))
+            _put_partial(
+                k, p, _live_item(k, ok, n), s * (p.rows * p.n) + idx, _sum_red(k, p, w)
+            )
     # no wait for the partial stores before arriving: the last arrival's polls check
     # tags, so a partial still in flight is waited for there (-0.5 us at down B1S8)
     _arrive(k, p, b)
@@ -1428,7 +1752,16 @@ def _finish_last(k, p, b, res_words):
     for ps in range(-(-p.out_quads // THREADS)):
         ok, n, srcs, col, lead = _items(p, b, fx.Int32(ps * THREADS) + k.tid)
         live = _live_item(k, ok, n)
-        _emit_out(k, p, ok, n, col, lead, [_poll_slices(k, p, live, idx) for _, idx in srcs], res_words[ps])
+        _emit_out(
+            k,
+            p,
+            ok,
+            n,
+            col,
+            lead,
+            [_poll_slices(k, p, live, idx) for _, idx in srcs],
+            res_words[ps],
+        )
 
 
 def _quant_out(k, p, ok, e, vals, lead, width):
@@ -1461,7 +1794,11 @@ def _res_issue(k, p, b):
         if p.res_ch:
             out.append(_try_batch([(k.mb[p.res_ch], idx // 2, 2)])[0])
         else:
-            v = fx.Vector(bo.buffer_load(rsrc(k.args[p.res_arg]), idx // 2, vec_width=2, dtype=T.i32))
+            v = fx.Vector(
+                bo.buffer_load(
+                    rsrc(k.args[p.res_arg]), idx // 2, vec_width=2, dtype=T.i32
+                )
+            )
             out.append([v[0], v[1]])
         out[-1] += _bias_prefetch(k, p, b, ps)
     return out
@@ -1474,7 +1811,9 @@ def _bias_prefetch(k, p, b, ps):
     e = fx.min(fx.Int32(ps * THREADS) + k.tid, fx.Int32(p.out_quads - 1))
     gl, f4 = (e // 4) % p.g, e % 4
     rg = fx.min(b * p.g + gl, fx.Int32(p.n_rg - 1))
-    v = fx.Vector(bo.buffer_load(rsrc(k.args[p.bias]), rg * 16 + f4 * 4, vec_width=4, dtype=T.f32))
+    v = fx.Vector(
+        bo.buffer_load(rsrc(k.args[p.bias]), rg * 16 + f4 * 4, vec_width=4, dtype=T.f32)
+    )
     return [fx.Float32(v[q]) for q in range(4)]
 
 
@@ -1514,7 +1853,11 @@ def _linear(k, t, p):
     # (and, if the input is there, the MFMAs start) while most weights stream.
     n_pre = min(p.prefetch, units)
     lead = min(p.lead, n_pre)
-    n_first = max(lead, min(p.pre_units, n_pre)) if p.pre_units and not (p.norm_src or p.cin_src) else n_pre
+    n_first = (
+        max(lead, min(p.pre_units, n_pre))
+        if p.pre_units and not (p.norm_src or p.cin_src)
+        else n_pre
+    )
     scales = _scale_issue(k, p, r_s, b, s)
     rocdl.sched_barrier(0)
     q = [issue(u) for u in range(lead)]
@@ -1534,13 +1877,23 @@ def _linear(k, t, p):
         else:
             _land_dense(k, p, s, xoff)
     else:  # a streamed input: its first ring slot only (``_stream_ring`` polls the others)
-        batches = _x_batches(k, *_xslot(p, s, 0), xoff=xoff) if p.xchunk else _x_batches(k, p, s, xoff=xoff)
-        rocdl.sched_barrier(0)  # keep the issue order: LLVM would sink the attempt below the weights
+        batches = (
+            _x_batches(k, *_xslot(p, s, 0), xoff=xoff)
+            if p.xchunk
+            else _x_batches(k, p, s, xoff=xoff)
+        )
+        rocdl.sched_barrier(
+            0
+        )  # keep the issue order: LLVM would sink the attempt below the weights
         tries = [_try_batch(specs) for specs, _ in batches]
         rocdl.sched_barrier(0)
         q += [issue(u) for u in range(lead, n_first)]
-        idle = idle_issue(k)  # the stage's idle work (Stage.idle), behind the prefetch and the attempt
-        if p.prewiden:  # the scale codes to LDS and the first units widened while the input is out
+        idle = idle_issue(
+            k
+        )  # the stage's idle work (Stage.idle), behind the prefetch and the attempt
+        if (
+            p.prewiden
+        ):  # the scale codes to LDS and the first units widened while the input is out
             wide = _prewiden(k, p, q, scales, wr, wk, min(p.prewiden, n_first))
         for (specs, dests), words in zip(batches[:-1], tries[:-1], strict=True):
             _land_batch(k, p, specs, dests, words)
@@ -1562,9 +1915,18 @@ def _linear(k, t, p):
         if p.ks % p.wk != 0:
             st = fx.min(st, fx.Int32(p.ks - 1))
         x, xs = gemv.b_operand(k.lds, k.lds + p.xs_base, row, j, st, p.pitch, p.spitch)
-        if p.compute == "bf16":  # widened once a K step, shared by the wave's row groups
-            x = gemv.widen_bf16([x[e] for e in range(8)], gemv.b_codes_bf16(k.lds + p.xs_base, row, j, st, p.spitch))
-            return x, xs, [_unit_codes_bf16(k, p, wr * p.gw + gl, st) for gl in range(p.gw)]
+        if (
+            p.compute == "bf16"
+        ):  # widened once a K step, shared by the wave's row groups
+            x = gemv.widen_bf16(
+                [x[e] for e in range(8)],
+                gemv.b_codes_bf16(k.lds + p.xs_base, row, j, st, p.spitch),
+            )
+            return (
+                x,
+                xs,
+                [_unit_codes_bf16(k, p, wr * p.gw + gl, st) for gl in range(p.gw)],
+            )
         return x, xs, [_unit_scale(k, p, wr * p.gw + gl, st) for gl in range(p.gw)]
 
     if p.xchunk:  # the input through the LDS ring, polled while the weights stream
@@ -1573,7 +1935,9 @@ def _linear(k, t, p):
         idle_sink(k, idle)
         gpu.barrier()
         return
-    if p.rchunks > 1:  # more than 16 rows: one MFMA per 16-row chunk on each weight unit (loaded once)
+    if (
+        p.rchunks > 1
+    ):  # more than 16 rows: one MFMA per 16-row chunk on each weight unit (loaded once)
         _stream_chunks(k, p, q, issue, units, wr, wk, lane)
         _finish(k, p, s, b, res_words)
         idle_sink(k, idle)
@@ -1590,7 +1954,11 @@ def _linear(k, t, p):
             if u + p.prefetch < units:
                 q.append(issue(u + p.prefetch))
             if p.compute == "bf16":
-                wv = wide[u] if u < len(wide) else gemv.widen_bf16([q[u][e] for e in range(8)], ws[gl])
+                wv = (
+                    wide[u]
+                    if u < len(wide)
+                    else gemv.widen_bf16([q[u][e] for e in range(8)], ws[gl])
+                )
                 acc[gl] = gemv.mfma_bf16_wide(acc[gl], wv, x)
             else:
                 acc[gl] = gemv.mfma_wxa8(acc[gl], q[u], ws[gl], x, xs, p.fmt)
@@ -1609,7 +1977,8 @@ def _linear(k, t, p):
 def _prewiden(k, p, q, scales, wr, wk, n):
     """bf16 compute: the task's weight scale codes into LDS (their loads were issued first), then this wave's first
     ``n`` units widened to bf16 (``gemv.widen_bf16``, the same operands the stream would build) while the input's
-    attempt is still out: the widening leaves the path from the input's landing to the MFMAs."""
+    attempt is still out: the widening leaves the path from the input's landing to the MFMAs.
+    """
     for v, off in scales:
         fx.ptr_store(v, k.lds + off)
     gpu.barrier()
@@ -1617,7 +1986,11 @@ def _prewiden(k, p, q, scales, wr, wk, n):
     for u in range(n):
         i, gl = u // p.gw, u % p.gw
         st = _kstep(p, wk, i)
-        out.append(gemv.widen_bf16([q[u][e] for e in range(8)], _unit_codes_bf16(k, p, wr * p.gw + gl, st)))
+        out.append(
+            gemv.widen_bf16(
+                [q[u][e] for e in range(8)], _unit_codes_bf16(k, p, wr * p.gw + gl, st)
+            )
+        )
     return out
 
 
@@ -1630,21 +2003,31 @@ def _stream_chunks(k, p, q, issue, units, wr, wk, lane):
     sums are those of the one-chunk stream (the MFMA's rows are independent), so its bits are the same at any row
     count."""
     j = lane // 16
-    rows = [fx.min(lane % 16 + 16 * ch, fx.Int32(p.rows - 1)) for ch in range(p.rchunks)]
+    rows = [
+        fx.min(lane % 16 + 16 * ch, fx.Int32(p.rows - 1)) for ch in range(p.rchunks)
+    ]
     wide = p.compute == "bf16"
 
     def operands(i):
         st = _kstep(p, wk, i)
         if p.ks % p.wk != 0:
             st = fx.min(st, fx.Int32(p.ks - 1))
-        xs = [gemv.b_operand(k.lds, k.lds + p.xs_base, r, j, st, p.pitch, p.spitch) for r in rows]
+        xs = [
+            gemv.b_operand(k.lds, k.lds + p.xs_base, r, j, st, p.pitch, p.spitch)
+            for r in rows
+        ]
         if wide:
             xs = [(gemv.widen_bf16([x[e] for e in range(8)], gemv.b_codes_bf16(k.lds + p.xs_base, r, j, st, p.spitch)),
                    xsc) for r, (x, xsc) in zip(rows, xs, strict=True)]  # fmt: skip
-            return xs, [_unit_codes_bf16(k, p, wr * p.gw + gl, st) for gl in range(p.gw)]
+            return xs, [
+                _unit_codes_bf16(k, p, wr * p.gw + gl, st) for gl in range(p.gw)
+            ]
         return xs, [_unit_scale(k, p, wr * p.gw + gl, st) for gl in range(p.gw)]
 
-    acc = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(p.gw)] for _ in range(p.rchunks)]
+    acc = [
+        [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(p.gw)]
+        for _ in range(p.rchunks)
+    ]
     cur = operands(0)
     for i in range(p.c):
         nxt = operands(i + 1) if i + 1 < p.c else None
@@ -1660,7 +2043,9 @@ def _stream_chunks(k, p, q, issue, units, wr, wk, lane):
                 if wide:
                     acc[ch][gl] = gemv.mfma_bf16_wide(acc[ch][gl], w, x)
                 else:
-                    acc[ch][gl] = gemv.mfma_wxa8(acc[ch][gl], q[u], ws[gl], x, xsc, p.fmt)
+                    acc[ch][gl] = gemv.mfma_wxa8(
+                        acc[ch][gl], q[u], ws[gl], x, xsc, p.fmt
+                    )
         rocdl.sched_barrier(0)
         cur = nxt
     gpu.barrier()
@@ -1681,7 +2066,8 @@ def _fresh_lanes(k):
 
 def _xslot(p, s, ci):
     """(the plan seen as K slices of one ring slot each, slot ``ci`` of K slice ``s`` as such a slice): what
-    ``_x_batches`` polls into LDS from word 0 (the ring slot's own offset is added by the caller)."""
+    ``_x_batches`` polls into LDS from word 0 (the ring slot's own offset is added by the caller).
+    """
     from dataclasses import replace
 
     per = p.ks // p.xchunk
@@ -1700,7 +2086,9 @@ def _stream_ring(k, p, q, issue, units, wr, wk, lane, s, xoff):
     partials through LDS are the resident stream's: the same bits as the same shape with the slice resident. The
     lane's operand rows come from ``_fresh_lanes``'s thread id."""
     j = lane // 16
-    rows = [fx.min(lane % 16 + 16 * ch, fx.Int32(p.rows - 1)) for ch in range(p.rchunks)]
+    rows = [
+        fx.min(lane % 16 + 16 * ch, fx.Int32(p.rows - 1)) for ch in range(p.rchunks)
+    ]
     nslots = p.ks // p.xchunk
     ipc = p.xchunk // p.wk  # iterations a slot
     nbuf = p.xbufs
@@ -1709,31 +2097,49 @@ def _stream_ring(k, p, q, issue, units, wr, wk, lane, s, xoff):
         sl = (i // ipc) % nbuf
         st = wk + p.wk * (i % ipc)
         base = k.lds + sl * p.xslot
-        return gemv.b_operand(base, base + p.xs_base, rows[ch], j, st, p.pitch, p.spitch)
+        return gemv.b_operand(
+            base, base + p.xs_base, rows[ch], j, st, p.pitch, p.spitch
+        )
 
     def scale(gt, st):
         return _unit_scale(k, p, gt, st)
 
-    def attempt(si):  # slot si's poll attempt (dense: its loads, the flags seen), issued now (LDS slot: si % nbuf)
+    def attempt(
+        si,
+    ):  # slot si's poll attempt (dense: its loads, the flags seen), issued now (LDS slot: si % nbuf)
         view, sv = _xslot(p, s, si)
         off = (si % nbuf) * p.xslot
         rocdl.sched_barrier(0)
         if p.x_proto == "flag":
-            items = [(a, w, d + off, code) for a, w, d, code in _x_dense(k, view, sv, xoff)]
+            items = [
+                (a, w, d + off, code) for a, w, d, code in _x_dense(k, view, sv, xoff)
+            ]
             got = [chan.load_words(a, w, 4) for a, w, _, _ in items]
             rocdl.sched_barrier(0)
             return "dense", items, got
-        nxt = [(specs, [d + off for d in dests]) for specs, dests in _x_batches(k, view, sv, xoff=xoff)]
+        nxt = [
+            (specs, [d + off for d in dests])
+            for specs, dests in _x_batches(k, view, sv, xoff=xoff)
+        ]
         tries = [_try_batch(specs) for specs, _ in nxt]
         rocdl.sched_barrier(0)
         return "tagged", nxt, tries
 
-    pending = [attempt(si) for si in range(1, min(p.xlead, nslots))]  # slots 1 .. xlead - 1, behind the prefetch
-    acc = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(p.gw)] for _ in range(p.rchunks)]
+    pending = [
+        attempt(si) for si in range(1, min(p.xlead, nslots))
+    ]  # slots 1 .. xlead - 1, behind the prefetch
+    acc = [
+        [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(p.gw)]
+        for _ in range(p.rchunks)
+    ]
     for ci in range(nslots):
-        if ci + p.xlead < nslots:  # slot ci + xlead's attempt, behind the weights already in flight
+        if (
+            ci + p.xlead < nslots
+        ):  # slot ci + xlead's attempt, behind the weights already in flight
             pending.append(attempt(ci + p.xlead))
-        seq = [(i, ch) for i in range(ci * ipc, (ci + 1) * ipc) for ch in range(p.rchunks)]
+        seq = [
+            (i, ch) for i in range(ci * ipc, (ci + 1) * ipc) for ch in range(p.rchunks)
+        ]
         cur = operand(*seq[0])
         for n, (i, ch) in enumerate(seq):
             nb = operand(*seq[n + 1]) if n + 1 < len(seq) else None
@@ -1746,7 +2152,9 @@ def _stream_ring(k, p, q, issue, units, wr, wk, lane, s, xoff):
                         q.append(issue(u + p.prefetch))
             x, xsc = cur
             for gl in range(p.gw):
-                acc[ch][gl] = gemv.mfma_wxa8(acc[ch][gl], q[i * p.gw + gl], ws[gl], x, xsc, p.fmt)
+                acc[ch][gl] = gemv.mfma_wxa8(
+                    acc[ch][gl], q[i * p.gw + gl], ws[gl], x, xsc, p.fmt
+                )
             rocdl.sched_barrier(0)
             cur = nb
         if ci + 1 < nslots:
@@ -1787,7 +2195,13 @@ def _source_loads(k, t, ch, fmt, items, per_thread):
     got = []
     for c in range(per_thread):
         it = fx.min((t * per_thread + c) * THREADS + k.tid, fx.Int32(items - 1))
-        got.append(fx.Vector(bo.buffer_load(rsrc(k.args[f"{ch}{fmt}"]), it * 2, vec_width=2, dtype=T.i32)))
+        got.append(
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(k.args[f"{ch}{fmt}"]), it * 2, vec_width=2, dtype=T.i32
+                )
+            )
+        )
     return got
 
 
@@ -1820,7 +2234,11 @@ def source_stages(ch: Channel, rows: int, per_thread: int = 2) -> list[Stage]:
         tasks = _source_tasks(items, per_thread)
         writes = [Region(f"{ch.name}{fmt}", words if not ch.dense else items, (name,))]
         if ch.flagged and slot0 == 0:
-            writes.append(Region(ch.flag_region, ntasks, tuple(f"src:{ch.name}{f}" for f, _ in parts)))
+            writes.append(
+                Region(
+                    ch.flag_region, ntasks, tuple(f"src:{ch.name}{f}" for f, _ in parts)
+                )
+            )
         out.append(
             Stage(
                 name,

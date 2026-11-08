@@ -26,7 +26,9 @@ _FP4_BOUNDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 
 def _groups(x: torch.Tensor) -> torch.Tensor:
     if not x.is_floating_point() or x.shape[-1] % GROUP:
-        raise ValueError(f"MX quantization needs a float tensor with K % {GROUP} == 0, got {x.dtype} {tuple(x.shape)}")
+        raise ValueError(
+            f"MX quantization needs a float tensor with K % {GROUP} == 0, got {x.dtype} {tuple(x.shape)}"
+        )
     x = x.float()
     if not bool(torch.isfinite(x).all()):
         raise ValueError("MX quantization rejects NaN / inf")
@@ -67,7 +69,9 @@ def dequantize_mxfp4(packed: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
     """Inverse of :func:`quantize_mxfp4`, fp32 [..., K]."""
     k = packed.shape[-1] * 2
     e2m1 = torch.stack((packed & 15, packed >> 4), -1).reshape(*packed.shape[:-1], k)
-    table = torch.tensor(_FP4_VALUES + tuple(-v for v in _FP4_VALUES), device=packed.device)
+    table = torch.tensor(
+        _FP4_VALUES + tuple(-v for v in _FP4_VALUES), device=packed.device
+    )
     values = table[e2m1.long()].reshape(*packed.shape[:-1], -1, GROUP)
     return (values * code_values(codes).unsqueeze(-1)).reshape(*packed.shape[:-1], k)
 
@@ -101,9 +105,13 @@ class MXFP8Weight:
 
     def __init__(self, packed: torch.Tensor, codes: torch.Tensor):
         if packed.dtype != torch.float8_e4m3fn or codes.dtype != torch.uint8:
-            raise ValueError(f"MXFP8Weight needs float8_e4m3fn values and uint8 codes, got {packed.dtype} {codes.dtype}")
+            raise ValueError(
+                f"MXFP8Weight needs float8_e4m3fn values and uint8 codes, got {packed.dtype} {codes.dtype}"
+            )
         if codes.shape != (packed.shape[0], packed.shape[1] // GROUP):
-            raise ValueError(f"MXFP8Weight codes {tuple(codes.shape)} do not match values {tuple(packed.shape)}")
+            raise ValueError(
+                f"MXFP8Weight codes {tuple(codes.shape)} do not match values {tuple(packed.shape)}"
+            )
         self.packed, self.codes = packed, codes
 
     @classmethod
@@ -126,13 +134,19 @@ def fp8_block_to_mxfp8(weight: torch.Tensor, scale: torch.Tensor) -> MXFP8Weight
     e.g. DeepSeek's 32 x 32 or 128 x 128 blocks) as MXFP8, exactly: the values are unchanged and
     each row's group-32 code is its block's scale (bk a multiple of 32)."""
     if weight.dtype != torch.float8_e4m3fn:
-        raise ValueError(f"fp8_block_to_mxfp8 needs float8_e4m3fn weights, got {weight.dtype}")
+        raise ValueError(
+            f"fp8_block_to_mxfp8 needs float8_e4m3fn weights, got {weight.dtype}"
+        )
     n, k = weight.shape
     codes = scale.view(torch.uint8) if scale.dtype == torch.float8_e8m0fnu else scale
     if codes.dtype != torch.uint8:
         raise ValueError(f"fp8_block_to_mxfp8 needs E8M0 scales, got {scale.dtype}")
     bn, bk = -(-n // codes.shape[0]), -(-k // codes.shape[1])
     if k % GROUP or bk % GROUP:
-        raise ValueError(f"fp8_block_to_mxfp8: K {k} and the K block {bk} must be multiples of {GROUP}")
+        raise ValueError(
+            f"fp8_block_to_mxfp8: K {k} and the K block {bk} must be multiples of {GROUP}"
+        )
     per_row = codes.repeat_interleave(bn, 0)[:n]
-    return MXFP8Weight(weight, per_row.repeat_interleave(bk // GROUP, 1)[:, : k // GROUP].contiguous())
+    return MXFP8Weight(
+        weight, per_row.repeat_interleave(bk // GROUP, 1)[:, : k // GROUP].contiguous()
+    )

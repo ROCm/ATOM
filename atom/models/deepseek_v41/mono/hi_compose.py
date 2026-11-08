@@ -14,6 +14,7 @@ import logging
 from dataclasses import dataclass
 
 from atom.models.deepseek_v41.mono import hi_plan
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.models.deepseek_v41.mono.hi_bands import plan_widths
 from atom.models.deepseek_v41.mono.hi_gate import MAX_CTX, REQ_ROWS
 
@@ -102,7 +103,7 @@ class HiPrograms:
         self.mf = [i for i, p in sorted(self.plan.items()) if p.hi]
         atom_layers = sorted(i for i, p in self.plan.items() if not p.hi)
         if atom_layers:
-            raise ValueError(
+            raise MonoUnsupported(
                 f"V4.1 mono hi: layers {atom_layers} cannot run on the hi path (the hook runs every layer)"
             )
         # a width's requests and rows a request: one request up to 16 rows, or B requests of ``REQ_ROWS`` each, B <=

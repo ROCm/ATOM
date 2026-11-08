@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""ModelRunner's model-side hooks and DeepSeek-V4.1's hi verify head behind them.
+"""ModelRunner's model hooks (``model_engine.model_hooks``) and DeepSeek-V4.1's hi verify head behind them.
 
-The runner's seam is generic (``verify_head``, ``decode_round``): a model without them takes the logits path and
-runs no decode round; with them the runner asks the head for a verify's ids, its verdict, and skips the ids' TP
-broadcast. Which steps the hi head serves is its own policy (``round.verify_head.HiVerifyHead``), tested here
-against a stub hook: pure Python, no Triton, AITER or FlyDSL."""
+The runner's hooks are declared (``VerifyHead``, ``DecodeRound``) and resolved once at install: a model without them
+takes the logits path and runs no decode round; with them the runner asks the head for a verify's ids and its
+verdict (the ids still broadcast over TP), and calls the decode round where its work sits. Which steps the hi head
+serves is its own policy (``round.verify_head.HiVerifyHead``), tested here against a stub hook: pure Python, no
+Triton, AITER or FlyDSL."""
 
+import ast
+import inspect
+import textwrap
 from types import SimpleNamespace
 
 import numpy as np
@@ -24,8 +28,11 @@ def runner_module():
 
 
 def _runner(runner_module, model):
+    """A runner with ``model`` installed: its hooks resolved as ``ModelRunner.__init__`` resolves them."""
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.model = model
+    runner.verify_head, runner.decode_round = runner_module.model_hooks.resolve(model)
+    runner.verify_token_ids = None
     runner.rejection_sampler = SimpleNamespace(synthetic_acceptance_rates=None)
     return runner
 
@@ -46,49 +53,62 @@ def _batch(temps=(0.0,), **over):
     return SimpleNamespace(**b)
 
 
-# ---- the runner's generic seam
+# ---- the runner's declared hooks
 
 
-class _StubHead:
-    """A model-side verify head as the runner sees one."""
+def _stub_head(runner_module, ids=None):
+    class StubHead(runner_module.model_hooks.VerifyHead):
+        """A verify head as the runner sees one."""
 
-    ids_identical_on_tp_ranks = True
+        def __init__(self):
+            self.ids_out, self.calls = ids, []
 
-    def __init__(self, ids=None):
-        self.ids_out, self.calls = ids, []
+        def before_forward(self, runner, batch):
+            self.calls.append(("before", batch))
 
-    def before_forward(self, runner, batch):
-        self.calls.append(("before", batch))
+        def ids(self, runner, batch, hidden_states, graph_key=None):
+            self.calls.append(("ids", graph_key))
+            return self.ids_out
 
-    def ids(self, runner, batch, hidden_states, graph_key=None):
-        self.calls.append(("ids", graph_key))
-        return self.ids_out
-
-    def captured(self, graph_key):
-        self.calls.append(("captured", graph_key))
+    return StubHead()
 
 
 def test_a_model_without_the_hooks_takes_the_logits_path(runner_module):
     runner = _runner(runner_module, SimpleNamespace())
-    assert runner._verify_head() is None and runner._decode_round() is None
+    assert runner.verify_head is None and runner.decode_round is None
     assert runner._verify_head_ids(_batch(), torch.zeros(6, 4)) is None
-    bare = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
-    assert bare._verify_head() is None and bare._decode_round() is None
+
+
+def test_hooks_are_declared_types(runner_module):
+    """``resolve``: a model attribute of that name that is not the declared hook type is an error, not a hook."""
+    with pytest.raises(TypeError, match="verify_head"):
+        runner_module.model_hooks.resolve(SimpleNamespace(verify_head=object()))
+    rnd = runner_module.model_hooks.DecodeRound()
+    assert runner_module.model_hooks.resolve(SimpleNamespace(decode_round=rnd)) == (
+        None,
+        rnd,
+    )
+    # every member defaults to "nothing taken over"
+    assert rnd.spec_status() is None and rnd.decode_ids_filler() is None
+    assert rnd.host_arena_reader("token_inputs") is None
+    assert not rnd.committed(None) and not rnd.anchors_staged(1)
 
 
 def test_the_runner_asks_the_models_head(runner_module):
     ids = torch.arange(6, dtype=torch.int32)
-    head = _StubHead(ids)
+    head = _stub_head(runner_module, ids)
     runner = _runner(runner_module, SimpleNamespace(verify_head=head))
-    assert runner._verify_head() is head
+    assert runner.verify_head is head
     assert runner._verify_head_ids(_batch(), torch.zeros(6, 4)) is ids
     assert runner._verify_head_ids(_batch(), torch.zeros(6, 4), (1, 6)) is ids
     assert head.calls == [("ids", None), ("ids", (1, 6))]
 
 
-@pytest.mark.parametrize("identical", [True, False])
-def test_postprocess_takes_the_heads_verdict(monkeypatch, runner_module, identical):
-    """A head-served step: the head's verdict; the ids' TP broadcast only when the head's ids may differ by rank."""
+def test_postprocess_takes_the_heads_verdict_and_broadcasts_the_ids(
+    monkeypatch, runner_module
+):
+    """A head-served step: the head's verdict in place of the rejection sampler's; the ids are broadcast over TP as
+    on every other step."""
     bs = 2
     spec = SimpleNamespace(
         bonus_logits_indices=torch.tensor([5, 11]),
@@ -118,8 +138,7 @@ def test_postprocess_takes_the_heads_verdict(monkeypatch, runner_module, identic
     class Stop(Exception):
         pass
 
-    head = _StubHead()
-    head.ids_identical_on_tp_ranks = identical
+    head = _stub_head(runner_module)
     head.verdict = lambda s, ids, sampler: calls.append(ids) or (out, verdict, nxt)
 
     def propose(batch, input_ids, hidden, next_token_ids, num_reject, anchors):
@@ -152,36 +171,50 @@ def test_postprocess_takes_the_heads_verdict(monkeypatch, runner_module, identic
         runner_module.ModelRunner.postprocess(
             runner, batch, None, None, None, None, True, hidden_states=None
         )
-    assert len(calls) == 1
-    assert len(broadcasts) == (0 if identical else 1)
+    assert len(calls) == 1 and len(broadcasts) == 1
 
 
-def test_the_runner_calls_a_models_decode_round(runner_module, monkeypatch):
-    """The model's ``decode_round`` (the hi hook's ``HiRound``) after the target's launch (``run_model``) and before
-    the staging mark; a model without one runs none of it."""
+def test_the_staging_mark_calls_the_decode_round(runner_module):
     calls = []
 
-    class Round:
-        def after_forward(self, processor):
-            calls.append(("after", processor))
-
+    class Round(runner_module.model_hooks.DecodeRound):
         def before_staging_mark(self):
             calls.append("mark")
 
-    monkeypatch.setattr(
-        runner_module.ModelRunner, "_run_model", lambda self, ids, b=None: ("l", "h")
-    )
     for model, want in (
-        (SimpleNamespace(decode_round=Round()), [("after", "tp"), "mark", "finish"]),
+        (SimpleNamespace(decode_round=Round()), ["mark", "finish"]),
         (SimpleNamespace(), ["finish"]),
     ):
         calls.clear()
         runner = _runner(runner_module, model)
-        runner.tokenID_processor = "tp"
         runner.h2d_owner = SimpleNamespace(finish=lambda: calls.append("finish"))
-        assert runner.run_model("ids") == ("l", "h")
         runner._mark_staging_h2d_enqueued()
         assert calls == want
+
+
+@pytest.mark.parametrize("cls", ["ModelRunner", "RapidServeModelRunner"])
+def test_after_forward_follows_every_target_launch(runner_module, cls):
+    """Each ``forward`` that runs a decode step calls the decode round's ``after_forward`` right after
+    ``run_model`` (the target's launch), at that one call site."""
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(getattr(runner_module, cls).forward))
+    )
+    stmts = [
+        b
+        for node in ast.walk(tree)
+        for field in ("body", "orelse")
+        for b in [getattr(node, field, None)]
+        if isinstance(b, list)
+    ]
+    found = 0
+    for body in stmts:
+        for i, s in enumerate(body):
+            if not isinstance(s, (ast.Assign, ast.Expr)):
+                continue
+            if "self.run_model(" in ast.unparse(s):
+                assert "self.decode_round.after_forward" in ast.unparse(body[i + 1])
+                found += 1
+    assert found == 1
 
 
 # ---- the hi verify head's policy (``HiVerifyHead``)

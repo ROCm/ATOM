@@ -59,10 +59,18 @@ class Addr:
     # ``Program.dyn_rows``: a row-major region's pairs a row (``Region.rows``): its pair p is row p // row_pairs, and
     # polls / puts of rows >= the live rows (``live_rows``) are masked. 0: not row-major, or a static program.
     row_pairs: int = 0
-    nbytes: int = 0  # (dyn_rows, row-major) the region's bytes: a masked put's resource is bounded by them
+    nbytes: int = (
+        0  # (dyn_rows, row-major) the region's bytes: a masked put's resource is bounded by them
+    )
 
-    def __post_init__(self):  # the memory-model record: accesses through this address are the region's
-        trace.root(self.value, trace.PEER if self.space is Space.PEER else trace.REGION, self.region)
+    def __post_init__(
+        self,
+    ):  # the memory-model record: accesses through this address are the region's
+        trace.root(
+            self.value,
+            trace.PEER if self.space is Space.PEER else trace.REGION,
+            self.region,
+        )
 
 
 # ---- symbolic rows (Program.dyn_rows): the stage's live rows while it is traced
@@ -84,7 +92,8 @@ def live_rows(n):
 
 def row_live(a: Addr, pair):
     """Whether pair ``pair`` of ``a`` (counted from ``a``'s shifted base) lies in a live row: True (a Python bool)
-    unless a dyn_rows stage is traced and ``a`` is row-major. (A compare with the live pairs' bound: no division.)"""
+    unless a dyn_rows stage is traced and ``a`` is row-major. (A compare with the live pairs' bound: no division.)
+    """
     if _live is None or not a.row_pairs:
         return True
     d = a.delta // 8 if isinstance(a.delta, int) else fx.Int32(a.delta) // 8
@@ -104,7 +113,8 @@ def clamp_live(a: Addr, pair, width: int = 1):
 
 def _clamped(a: Addr, pair, width):
     """(Addr, pair, width) of a poll spec with its pair clamped onto the live rows (``clamp_live``), addressed from
-    the region's start: an Addr shifted into a dead row would otherwise need a negative index."""
+    the region's start: an Addr shifted into a dead row would otherwise need a negative index.
+    """
     if isinstance(a.delta, int) and a.delta == 0:
         return a, clamp_live(a, pair, width), width
     d = a.delta // 8 if isinstance(a.delta, int) else fx.Int32(a.delta) // 8
@@ -126,7 +136,16 @@ def _noted(a: Addr, kind: str):
 
 def _store(a: Addr, words, i):
     """Store the int32 ``words`` at word ``i`` of ``a`` (scope from its space); a put."""
-    store(a, fx.Vector.from_elements(words, fx.Int32) if len(words) > 1 else fx.Int32(words[0]), i, _SCOPE_CM[a.space])
+    store(
+        a,
+        (
+            fx.Vector.from_elements(words, fx.Int32)
+            if len(words) > 1
+            else fx.Int32(words[0])
+        ),
+        i,
+        _SCOPE_CM[a.space],
+    )
 
 
 def store(a: Addr, data, i, cm=CM_DEV, scale=None):
@@ -155,7 +174,11 @@ def load_pairs(a: Addr, i, n, cm=CM_DEV):
 def _put(a: Addr, words, i, scale):
     """A put's words at word ``i * scale`` (``scale`` None: ``i``). In a dyn_rows stage a dead row's put is skipped
     (``row_live``)."""
-    ok = row_live(a, i if scale == 2 else fx.Int32(i) * (scale or 1) // 2) if _live is not None else True
+    ok = (
+        row_live(a, i if scale == 2 else fx.Int32(i) * (scale or 1) // 2)
+        if _live is not None
+        else True
+    )
     if ok is not True:
         _put_masked(a, words, i if scale is None else fx.Int32(i) * scale, ok)
         return
@@ -167,16 +190,24 @@ def _put_masked(a: Addr, words, w, ok):
     reduction must not feed a store inside a lane-conditional branch (CLAUDE.md, the Indexer finding). The store goes
     through a resource bounded by the region (``Addr.nbytes``: the regions' own resources are unbounded, so an
     out-of-range offset there would land 2 GiB on)."""
-    data = fx.Vector.from_elements([fx.Int32(x) for x in words], fx.Int32) if len(words) > 1 else fx.Int32(words[0])
+    data = (
+        fx.Vector.from_elements([fx.Int32(x) for x in words], fx.Int32)
+        if len(words) > 1
+        else fx.Int32(words[0])
+    )
     note(a.region, a.space, "put")
     cm = _SCOPE_CM[a.space]
     start = fx.Int64(a.value) - fx.Int64(a.delta)
     d = a.delta // 4 if isinstance(a.delta, int) else fx.Int32(a.delta) // 4
-    bo.buffer_store(data, rsrc(start, a.nbytes), fx.Int32(w) + d, mask=ok, cache_modifier=cm)
+    bo.buffer_store(
+        data, rsrc(start, a.nbytes), fx.Int32(w) + d, mask=ok, cache_modifier=cm
+    )
 
 
 def _put_now(a: Addr, words, i, scale):
-    store(a, fx.Vector.from_elements(words, fx.Int32), i, _SCOPE_CM[a.space], scale=scale)
+    store(
+        a, fx.Vector.from_elements(words, fx.Int32), i, _SCOPE_CM[a.space], scale=scale
+    )
 
 
 def put(a: Addr, i, v, tag):
@@ -194,7 +225,10 @@ def put2(a: Addr, i, v0, v1, tag):
     """Pairs ``i``, ``i + 1`` (i even) in one 16-byte store."""
     words = []
     for v in (v0, v1):
-        words += [v.bitcast(fx.Int32) if isinstance(v, fx.Float32) else fx.Int32(v), tag]
+        words += [
+            v.bitcast(fx.Int32) if isinstance(v, fx.Float32) else fx.Int32(v),
+            tag,
+        ]
     _put(a, words, i, 2)
 
 
@@ -233,12 +267,18 @@ def poll(specs, tag, batch=POLL_MAX, live=None):
 
     ``live`` (``Program.dyn_rows``): per spec, whether it is awaited (a Python bool or a uniform traced Bool); a dead
     spec's pair is loaded with the rest but its tag is not checked (a dead row's pair is never put, so it holds an
-    earlier launch's tag): its words are garbage. None: every spec (the code of before)."""
-    if live is None and _live is not None:  # dyn_rows: dead rows' pairs polled as the last live pair (clamp_live)
+    earlier launch's tag): its words are garbage. None: every spec (the code of before).
+    """
+    if (
+        live is None and _live is not None
+    ):  # dyn_rows: dead rows' pairs polled as the last live pair (clamp_live)
         # (a 2-pair load moves by 2: the live pairs' bound is even when a row's pairs are)
         fits = [not a.row_pairs or n == 1 or a.row_pairs % 2 == 0 for a, _, n in specs]
         live = [True if f else row_live(a, i) for f, (a, i, n) in zip(fits, specs)]
-        specs = [_clamped(a, i, n) if f and a.row_pairs else (a, i, n) for f, (a, i, n) in zip(fits, specs)]
+        specs = [
+            _clamped(a, i, n) if f and a.row_pairs else (a, i, n)
+            for f, (a, i, n) in zip(fits, specs)
+        ]
     if const_expr(len(specs) > batch):
         lo = None if live is None else live[:batch]
         hi = None if live is None else live[batch:]
@@ -265,7 +305,6 @@ def poll(specs, tag, batch=POLL_MAX, live=None):
             for e in range_constexpr(3, nw, 2):
                 bad = bad | (v[e] != tag)
             return bad
-
 
     v = _spin(load_all, pending)
     outs, e = [], 0

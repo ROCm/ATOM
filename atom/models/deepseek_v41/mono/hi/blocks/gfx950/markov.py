@@ -71,11 +71,19 @@ INT_MAX = 2**31 - 1
 class _MPlan(ah._Plan):
     rank_r: int = 256  # the Markov tables' rank r
     batch: int = 1  # requests: blocks of ``rows / batch`` positions, side by side
-    blocks: int = 1  # 128-id blocks a task (``MarkovHead(blocks=)``: a rank's vocab past one block a CU)
+    blocks: int = (
+        1  # 128-id blocks a task (``MarkovHead(blocks=)``: a rank's vocab past one block a CU)
+    )
 
     @property
-    def single(self) -> bool:  # the one-request path (x whole in the LDS); else the B-request path, which also takes
-        return self.batch == 1 and self.kparts == 1 and self.blocks == 1  # one request whose x lands in K slices
+    def single(
+        self,
+    ) -> (
+        bool
+    ):  # the one-request path (x whole in the LDS); else the B-request path, which also takes
+        return (
+            self.batch == 1 and self.kparts == 1 and self.blocks == 1
+        )  # one request whose x lands in K slices
         # (or a task of several blocks: their W2 rows over x)
 
     @property
@@ -83,7 +91,11 @@ class _MPlan(ah._Plan):
         return VT * self.blocks
 
     @property
-    def mtasks(self) -> int:  # the stage's tasks (a CTA each); ``tasks``: 128-id blocks, the weight's packing
+    def mtasks(
+        self,
+    ) -> (
+        int
+    ):  # the stage's tasks (a CTA each); ``tasks``: 128-id blocks, the weight's packing
         return -(-self.tasks // self.blocks)
 
     @property
@@ -95,26 +107,42 @@ class _MPlan(ah._Plan):
         return self.rw + 4
 
     @property
-    def a_base(self) -> int:  # base logits [rows][VT] f32, after x (B requests: after x or the W2 rows over it)
+    def a_base(
+        self,
+    ) -> (
+        int
+    ):  # base logits [rows][VT] f32, after x (B requests: after x or the W2 rows over it)
         if self.single:
             return self.rows * self.pitch
         return max(self.rows * self.pitch, self.vt * self.w2pitch)
 
     @property
-    def a_w2(self) -> int:  # the task's W2 rows [VT][w2pitch] (B requests: over x, loaded once the dot is done)
+    def a_w2(
+        self,
+    ) -> (
+        int
+    ):  # the task's W2 rows [VT][w2pitch] (B requests: over x, loaded once the dot is done)
         return self.a_base + self.rows * VT if self.single else 0
 
     @property
     def a_w1(self) -> int:  # W1[x_{j-1}] [rw] (B requests: one a request)
-        return self.a_w2 + VT * self.w2pitch if self.single else self.a_base + self.rows * self.vt
+        return (
+            self.a_w2 + VT * self.w2pitch
+            if self.single
+            else self.a_base + self.rows * self.vt
+        )
 
     @property
-    def a_red(self) -> int:  # the waves' (key, id) [request][WAVES][2], then x_j a request
+    def a_red(
+        self,
+    ) -> int:  # the waves' (key, id) [request][WAVES][2], then x_j a request
         return self.a_w1 + self.rw * self.batch
 
     @property
     def lds_words(self) -> int:
-        return self.a_red + (2 * WAVES + 4 if self.single else (2 * WAVES + 1) * self.batch + 4)
+        return self.a_red + (
+            2 * WAVES + 4 if self.single else (2 * WAVES + 1) * self.batch + 4
+        )
 
     @property
     def pos(self) -> int:  # positions a request
@@ -125,7 +153,9 @@ class _MPlan(ah._Plan):
         return f"{self.name}.top"
 
     @property
-    def mtop_pairs(self) -> int:  # a source rank's slot: (key, id) pairs [position][task]
+    def mtop_pairs(
+        self,
+    ) -> int:  # a source rank's slot: (key, id) pairs [position][task]
         return self.rows * self.mtasks * 2
 
 
@@ -138,20 +168,39 @@ class MarkovHead(Block):
         # blocks: 128-id blocks a task; None: 1 while a rank's blocks fit one a CU, else 2 (V4.1 at TP2: 505 blocks of
         # its 64,640 ids, 253 tasks of 2)
         if blocks not in (None, 1, 2) or (blocks == 2 and logits is not None):
-            raise ValueError(f"MarkovHead {name}: blocks None, 1 or 2 (2: the head's own dot, no logits channel)")
+            raise ValueError(
+                f"MarkovHead {name}: blocks None, 1 or 2 (2: the head's own dot, no logits channel)"
+            )
         self.blocks = blocks
         # logits: the base logits from that BF16 channel [rows, n] (an LM head stage before this one, e.g. on every
         # CU), not this block's dot (no weight, x unread); the rest unchanged
-        if logits is not None and (logits.fmt is not Fmt.BF16 or logits.flagged or logits.width != n):
-            raise ValueError(f"MarkovHead {name}: logits a tagged BF16 channel of width n")
+        if logits is not None and (
+            logits.fmt is not Fmt.BF16 or logits.flagged or logits.width != n
+        ):
+            raise ValueError(
+                f"MarkovHead {name}: logits a tagged BF16 channel of width n"
+            )
         self.logits = logits
         if logits is not None:
-            x = Channel(x.name, 2 * ah.KSTEP, Fmt.BF16)  # (x unread: the plan's LDS without it)
+            x = Channel(
+                x.name, 2 * ah.KSTEP, Fmt.BF16
+            )  # (x unread: the plan's LDS without it)
         if x.fmt is not Fmt.BF16 or x.flagged or x.width % (2 * ah.KSTEP):
-            raise ValueError(f"MarkovHead {name}: x is a tagged BF16 channel, width a multiple of {2 * ah.KSTEP}")
+            raise ValueError(
+                f"MarkovHead {name}: x is a tagged BF16 channel, width a multiple of {2 * ah.KSTEP}"
+            )
         if n % ah.RG or layout not in ah.LAYOUTS or rank_r % 8:
-            raise ValueError(f"MarkovHead {name}: n a multiple of {ah.RG}, layout in {ah.LAYOUTS}, r of 8")
-        self.name, self.x, self.n, self.layout, self.prefetch, self.lead = name, x, n, layout, prefetch, lead
+            raise ValueError(
+                f"MarkovHead {name}: n a multiple of {ah.RG}, layout in {ah.LAYOUTS}, r of 8"
+            )
+        self.name, self.x, self.n, self.layout, self.prefetch, self.lead = (
+            name,
+            x,
+            n,
+            layout,
+            prefetch,
+            lead,
+        )
         self.rank_r = rank_r
         # x's K slices at least this many (B requests; 0: the fewest that fit the LDS), as ``ArgmaxHead(kparts=)``: the
         # same products and K order
@@ -159,27 +208,40 @@ class MarkovHead(Block):
             raise ValueError(f"MarkovHead {name}: kparts >= 0")
         self.kparts = kparts
 
-
     def plan(self, sc: Scenario) -> _MPlan:
         p = _MPlan(self.name, sc.rows, self.x.width, self.n, sc.tp, self.x.name, "bf16", self.layout, self.prefetch,
                    False, "", self.lead, False, rank_r=self.rank_r, batch=sc.batch)  # fmt: skip
-        if sc.batch > 1 or p.lds_words * 4 > MI355X.lds_bytes:  # x in K slices where it does not fit whole
+        if (
+            sc.batch > 1 or p.lds_words * 4 > MI355X.lds_bytes
+        ):  # x in K slices where it does not fit whole
             if self.kparts > 1:
                 if p.steps % self.kparts:
-                    raise ValueError(f"MarkovHead {self.name}: kparts {self.kparts} does not divide {p.steps} K steps")
+                    raise ValueError(
+                        f"MarkovHead {self.name}: kparts {self.kparts} does not divide {p.steps} K steps"
+                    )
                 p = replace(p, kparts=self.kparts)
             # (two blocks: slices of a fifth of K or less, so x's landing batches fit beside the blocks' streams:
             # V4.1 TP2 at 15 / 20 rows spilled 37 / 4 VGPRs at 2 slices, none at 5)
-            for kp in (q for q in (range(5, 11) if p.blocks > 1 else range(2, 9)) if p.steps % q == 0 and q > p.kparts):
+            for kp in (
+                q
+                for q in (range(5, 11) if p.blocks > 1 else range(2, 9))
+                if p.steps % q == 0 and q > p.kparts
+            ):
                 if p.lds_words * 4 <= MI355X.lds_bytes:
                     break
                 p = replace(p, kparts=kp)
         if p.lds_words * 4 > MI355X.lds_bytes:
-            raise ValueError(f"MarkovHead {self.name}: {sc.rows} rows do not fit the LDS")
+            raise ValueError(
+                f"MarkovHead {self.name}: {sc.rows} rows do not fit the LDS"
+            )
         if p.mtasks > MI355X.cus:
-            raise ValueError(f"MarkovHead {self.name}: {p.mtasks} tasks, more than one a CTA")
+            raise ValueError(
+                f"MarkovHead {self.name}: {p.mtasks} tasks, more than one a CTA"
+            )
         if p.single and sc.rows > 16:
-            raise ValueError(f"MarkovHead {self.name}: at most 16 positions (the MFMA's N)")
+            raise ValueError(
+                f"MarkovHead {self.name}: at most 16 positions (the MFMA's N)"
+            )
         return p
 
     def stages(self, sc: Scenario) -> list[Stage]:
@@ -187,7 +249,10 @@ class MarkovHead(Block):
         space = Space.PEER if p.tp > 1 else Space.SCRATCH
         top = Region(p.mtop, p.mtop_pairs, (self.name,), space=space, exchange=True)
         lg = self.logits.name if self.logits is not None else ""
-        args = tuple(f"{self.name}.{a}" for a in (("w",) if not lg else ()) + ("w1", "w2", "anchor", "ids"))
+        args = tuple(
+            f"{self.name}.{a}"
+            for a in (("w",) if not lg else ()) + ("w1", "w2", "anchor", "ids")
+        )
         key = (p, "markov") + ((("logits", lg),) if lg else ())
         return [Stage(self.name, p.mtasks, partial(_mk, p=p, lg=lg), lds_words=p.lds_words, writes=(top,), args=args,
                       key=key)]  # fmt: skip
@@ -200,7 +265,9 @@ def _mk(k, t, p: _MPlan, lg: str = ""):
     lane, wave = k.lane, k.wave
     r_w = rsrc(k.args[f"{p.name}.w"], p.w_bytes)
 
-    tb = t * p.blocks if p.blocks > 1 else t  # the task's first 128-id block in the weight's packing
+    tb = (
+        t * p.blocks if p.blocks > 1 else t
+    )  # the task's first 128-id block in the weight's packing
     rg = tb * WAVES + wave
     issue = partial(ah._issue, p, r_w, tb, wave, rg, lane, rg < p.n_rg)
     n_pre = min(p.prefetch, p.steps)
@@ -239,7 +306,9 @@ def _mk(k, t, p: _MPlan, lg: str = ""):
         _stream_b(k, p, lane, issue, q)
         _w2_tile(k, p, t, first)
         gpu.barrier()
-        _anchors(k, p)  # x_{-1} of every request into LDS (where each position leaves its x_j)
+        _anchors(
+            k, p
+        )  # x_{-1} of every request into LDS (where each position leaves its x_j)
         gpu.barrier()
         _position_loop(k, p, t, first)
 
@@ -254,7 +323,9 @@ def _stream(k, p: _MPlan, lane, issue, q):
         rocdl.sched_barrier(0)
         if i + n_pre < p.steps:
             q.append(issue(i + n_pre))
-        b = fx.ptr_load(xrow + i * (ah.KSTEP // 2), result_type=fx.Vector.make_type(4, fx.Float32))
+        b = fx.ptr_load(
+            xrow + i * (ah.KSTEP // 2), result_type=fx.Vector.make_type(4, fx.Float32)
+        )
         acc = mfma_bf16(q[i].bitcast(fx.BFloat16), b.bitcast(fx.BFloat16), acc)
     rocdl.sched_barrier(0)
     _base_put(k, p, lane, [bf16_round(acc[e]) for e in range(4)])
@@ -277,7 +348,9 @@ def _stream_b(k, p: _MPlan, lane, issue, q, blk: int = 0):
     accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(p.rc)]
     for i in range(p.steps):
         rocdl.sched_barrier(0)
-        if i and i % p.psteps == 0:  # the next K slice of x, once every wave is past the last one
+        if (
+            i and i % p.psteps == 0
+        ):  # the next K slice of x, once every wave is past the last one
             gpu.barrier()
             ah._land_x(k, p, i // p.psteps)
             gpu.barrier()
@@ -285,9 +358,12 @@ def _stream_b(k, p: _MPlan, lane, issue, q, blk: int = 0):
             q.append(issue(i + n_pre))
         for ch in range(p.rc):
             b = fx.ptr_load(
-                xrows[ch] + (i % p.psteps) * (ah.KSTEP // 2), result_type=fx.Vector.make_type(4, fx.Float32)
+                xrows[ch] + (i % p.psteps) * (ah.KSTEP // 2),
+                result_type=fx.Vector.make_type(4, fx.Float32),
             )
-            accs[ch] = mfma_bf16(q[i].bitcast(fx.BFloat16), b.bitcast(fx.BFloat16), accs[ch])
+            accs[ch] = mfma_bf16(
+                q[i].bitcast(fx.BFloat16), b.bitcast(fx.BFloat16), accs[ch]
+            )
     rocdl.sched_barrier(0)
     gpu.barrier()  # (x's LDS is not the base logits', but the last slice's readers finish before any reuse)
     for ch, acc in enumerate(accs):
@@ -299,7 +375,9 @@ def _base_put_ch(k, p: _MPlan, lane, ch, vals, blk: int = 0):
     row = lane % 16 + ah.RG * ch
     if row < p.rows:
         at = p.a_base + row * p.vt + k.wave * ah.RG + (lane // 16) * 4
-        at = at + blk * VT if not isinstance(blk, int) or blk else at  # (blk: a runtime value past block 0)
+        at = (
+            at + blk * VT if not isinstance(blk, int) or blk else at
+        )  # (blk: a runtime value past block 0)
         for e in range_constexpr(4):
             fx.ptr_store(vals[e], k.ldsf + (at + e))
 
@@ -314,8 +392,12 @@ def _w2_tile(k, p: _MPlan, t, first):
         i = fx.min(fx.Int32(c * THREADS) + k.tid, fx.Int32(total - 1))
         v, w4 = i // per, i % per
         gid = first + fx.min(t * p.vt + v, fx.Int32(p.n - 1))
-        got = fx.Vector(bo.buffer_load(r_w2, gid * p.rw + w4 * 4, vec_width=4, dtype=T.i32))
-        fx.ptr_store(got.bitcast(fx.Float32), k.ldsf + (p.a_w2 + v * p.w2pitch + w4 * 4))
+        got = fx.Vector(
+            bo.buffer_load(r_w2, gid * p.rw + w4 * 4, vec_width=4, dtype=T.i32)
+        )
+        fx.ptr_store(
+            got.bitcast(fx.Float32), k.ldsf + (p.a_w2 + v * p.w2pitch + w4 * 4)
+        )
 
 
 def _position(k, p: _MPlan, t, j, xp, first):
@@ -367,7 +449,10 @@ def _position(k, p: _MPlan, t, j, xp, first):
 @traced
 def _anchors(k, p: _MPlan):
     if k.tid < p.batch:
-        fx.ptr_store(ld_i32(k.args[f"{p.name}.anchor"], k.tid), k.lds + (p.a_red + 2 * WAVES * p.batch + k.tid))
+        fx.ptr_store(
+            ld_i32(k.args[f"{p.name}.anchor"], k.tid),
+            k.lds + (p.a_red + 2 * WAVES * p.batch + k.tid),
+        )
 
 
 @traced
@@ -379,8 +464,12 @@ def _position_loop(k, p: _MPlan, t, first):
 
 def _positions(k, p: _MPlan, t, j, first):
     """B requests: position ``j`` of every request given its x_{j-1} (in LDS: the anchor, then the last position's
-    pick) -> their x_j into LDS (module docstring, "B requests": one push and one poll round trip for all of them)."""
-    xps = [uniform(fx.Int32(fx.ptr_load(k.lds + (p.a_red + 2 * WAVES * p.batch + b)))) for b in range(p.batch)]
+    pick) -> their x_j into LDS (module docstring, "B requests": one push and one poll round trip for all of them).
+    """
+    xps = [
+        uniform(fx.Int32(fx.ptr_load(k.lds + (p.a_red + 2 * WAVES * p.batch + b))))
+        for b in range(p.batch)
+    ]
     gpu.barrier()  # every thread has read x_{j-1} before this position's pick overwrites it
     for b in range(p.batch):
         _w1_row(k, p, xps[b], b)
@@ -403,7 +492,9 @@ def _positions(k, p: _MPlan, t, j, first):
         for c in range(per):
             e = fx.min(fx.Int32(c * THREADS) + k.tid, fx.Int32(ents - 1))
             src, tt = e // p.mtasks, e % p.mtasks
-            specs.append((a, src * p.mtop_pairs + ((b * p.pos + j) * p.mtasks + tt) * 2, 2))
+            specs.append(
+                (a, src * p.mtop_pairs + ((b * p.pos + j) * p.mtasks + tt) * 2, 2)
+            )
     got = mb.poll(specs, k.tag)
     best = []
     for b in range(p.batch):
@@ -499,11 +590,20 @@ def _pick_b(k, p: _MPlan, t, j, best):
 def _w1_row(k, p: _MPlan, xp, b=0):
     """``W1[xp]`` into LDS (request ``b``'s row of ``a_w1``)."""
     if k.tid < p.rw // 4:
-        got = fx.Vector(bo.buffer_load(rsrc(k.args[f"{p.name}.w1"]), xp * p.rw + k.tid * 4, vec_width=4, dtype=T.i32))
+        got = fx.Vector(
+            bo.buffer_load(
+                rsrc(k.args[f"{p.name}.w1"]),
+                xp * p.rw + k.tid * 4,
+                vec_width=4,
+                dtype=T.i32,
+            )
+        )
         if const_expr(b == 0):
             fx.ptr_store(got.bitcast(fx.Float32), k.ldsf + (p.a_w1 + k.tid * 4))
         else:
-            fx.ptr_store(got.bitcast(fx.Float32), k.ldsf + (p.a_w1 + b * p.rw + k.tid * 4))
+            fx.ptr_store(
+                got.bitcast(fx.Float32), k.ldsf + (p.a_w1 + b * p.rw + k.tid * 4)
+            )
 
 
 @traced

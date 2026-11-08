@@ -8,8 +8,8 @@ sampling rows, ``cu_seqlens_q``, the staged ids, the deferred requests' source r
 (each carried request's anchor and drafts from the previous step's sampled and draft ids, the graph's padded tail
 zeroed), the V4.1 step metadata's packed publication (positions, plans, state slots, block tables) and the device
 round's ``_advance_kernel`` (each request's positions from its previous start and the verdict). The three before the
-last are recorded instead of launched (``PackedCopy.defer``, the runner's decode-round hook in place of
-``fill_deferred_decode_ids``) and the advance launches ``_prologue_kernel``: both arenas' scatter programs (each
+last are recorded instead of launched (``HostArenaReader.take``: the two publications opt in through
+``PublicationGroup.read_host_arena``; the runner's decode-round hook in place of ``fill_deferred_decode_ids``) and the advance launches ``_prologue_kernel``: both arenas' scatter programs (each
 ``scatter_packed_bytes``' (member, 1 KiB block)), every program then arriving on a counter (acquire-release at device
 scope: its stores before, across the XCDs' L2s); the last to arrive writes the fill, then the advance (the fill after
 the token inputs land, the advance after the positions do, as the four ran). Every write is the one the four made,
@@ -21,6 +21,10 @@ stream, so what the draft round and the target read is unchanged. The arenas sta
 (``_mark_staging_h2d_enqueued``) is recorded after the fused launch, which also flushes anything still recorded there.
 Only device-round steps arm the recorder (a served lean verify of the requests that left the verdict); a P/D
 consumer's first step, a prefill, a dummy or graph-capture forward and every other step launch as before.
+
+The same reader makes the decode publications zero-copy (``reads``): on a decode step, an eager launch of the two
+publications (``DECODE_PUBLICATIONS``) of at most ``HOST_ARENA_MAX_BYTES`` reads the pinned arena through its device
+address instead of after an H2D copy; a prefill's, a graph capture's and every other publication copy as before.
 """
 
 from __future__ import annotations
@@ -31,7 +35,17 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.h2d import HostArenaReader
+from atom.utils.packed_h2d import DeviceAddress
+
 logger = logging.getLogger("atom")
+
+# the publications a served decode step makes (the token inputs, the V4.1 step metadata): the only ones opted into
+# host-arena reads (``PublicationGroup.read_host_arena``)
+DECODE_PUBLICATIONS = ("token_inputs", "v41_metadata")
+# a decode publication at the served widths, block tables included, stays below this; a prefill's does not, and is
+# copied
+HOST_ARENA_MAX_BYTES = 1 << 20
 
 BLOCK = (
     1024  # bytes a scatter program (``scatter_packed_bytes``'), ids a pass of the tail
@@ -151,38 +165,36 @@ def _prologue_kernel(
                 )
 
 
-class _Address:
-    """A raw device address as a kernel's pointer argument (``packed_h2d._Address``'s)."""
-
-    def __init__(self, address, dtype=torch.uint8):
-        self.address, self.dtype = address, dtype
-
-    def data_ptr(self):
-        return self.address
-
-
-class Prologue:
-    """The recorder (module docstring): ``armed`` by the device round on its steps; ``take`` (``PackedCopy.defer``),
-    ``fill`` and ``advance`` record; ``launch`` runs the fused kernel."""
+class Prologue(HostArenaReader):
+    """The recorder (module docstring): ``armed`` by the device round on its steps; ``take``
+    (``HostArenaReader.take``), ``fill`` and ``advance`` record; ``launch`` runs the fused kernel. ``reads``: a decode
+    step's publications read their pinned arenas in place."""
 
     def __init__(self, device):
-        self.armed, self.attached, self.runner = False, 0, None
+        self.armed, self.decode = False, False
         self.dummy = torch.zeros(8, dtype=torch.int64, device=device)
         self.arrivals = torch.zeros(1, dtype=torch.int32, device=device)
         self.scatters, self.fills = [], []
         # fused launches; publications past two a step (launched as before)
         self.launches = self.extra = 0
 
-    def arm(self, on: bool):
-        """A device-round step (``on``) records until its advance; the first one attaches to the publications."""
-        if on and not self.attached:
-            self.attached = _attach(self, self.runner)
-        self.armed = on
+    def arm(self, on: bool, decode: bool):
+        """Every step, before its publications: a device-round step (``on``) records until its advance; ``decode``:
+        the step is a decode step (its publications read their pinned arenas, ``reads``).
+        """
+        self.armed, self.decode = on, decode
+
+    # ---- the publications (``HostArenaReader``)
+    def reads(self, nbytes: int) -> bool:
+        """A decode step's publication of at most ``HOST_ARENA_MAX_BYTES`` reads its pinned arena in place."""
+        return self.decode and nbytes <= HOST_ARENA_MAX_BYTES
 
     # ---- recording
     def take(self, copy, arena, largest) -> bool:
-        """``PackedCopy.submit``'s deferral: record this publication's scatter, at most two a step (a third launches
-        as before)."""
+        """The publication's deferral: record its scatter (from the host arena at ``arena``), at most two a step
+        while armed (a third launches as before)."""
+        if not self.armed:
+            return False
         if len(self.scatters) == 2:
             self.extra += 1
             return False
@@ -244,11 +256,11 @@ class Prologue:
         else:
             av, rows = (d, d, d, 0, 0, 0), 1
         _prologue_kernel[(grid,)](
-            _Address(sc[0][0]),
+            DeviceAddress(sc[0][0]),
             sc[0][1],
             sc[0][2],
             sc[0][3],
-            _Address(sc[1][0]),
+            DeviceAddress(sc[1][0]),
             sc[1][1],
             sc[1][2],
             sc[1][3],
@@ -267,34 +279,9 @@ class Prologue:
         self.armed = False
 
 
-def _attach(pro, runner) -> int:
-    """The recorder on every packed publication of the runner's groups (built after the mono installers: attached at
-    the first armed step). -> publications attached."""
-    n = 0
-    for groups in getattr(runner, "_h2d_groups", []):
-        for group in groups.values():
-            backend = getattr(group, "_backend", None)
-            if backend is None:
-                continue
-            n += 1
-            backend.defer = pro
-    if not n:
-        raise RuntimeError(
-            "V4.1 mono hi prologue: the runner has no packed publication "
-            "(ATOM_H2D_BACKEND=packed)"
-        )
-    logger.info(
-        "V4.1 mono hi prologue: %d packed publications recorded on device-round steps",
-        n,
-    )
-    return n
-
-
 def install(runner) -> Prologue:
-    """The recorder (attached to the runner's packed publications at its first armed step: ``Prologue.arm``); the
-    runner's ids fill and its reuse-event mark reach it through ``HiRound`` (``fill_decode_ids``,
-    ``before_staging_mark``)."""
+    """The recorder (the runner opts its ``DECODE_PUBLICATIONS`` into it: ``PublicationGroup.read_host_arena``); the
+    runner's ids fill and its reuse-event mark reach it through ``HiRound``."""
     pro = Prologue(runner.device)
-    pro.runner = runner
     logger.info("V4.1 mono hi: device-round steps' pre-target launches as one kernel")
     return pro

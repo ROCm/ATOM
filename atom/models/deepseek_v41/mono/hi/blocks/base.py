@@ -96,9 +96,13 @@ class Channel:
     def flag_region(self) -> str:
         return f"{self.name}.f"
 
-
     def pairs_per_row(self) -> int:
-        per = {Fmt.BF16: self.width // 2, Fmt.F32: self.width, Fmt.I32: self.width, Fmt.MXFP8: self.width // 4}
+        per = {
+            Fmt.BF16: self.width // 2,
+            Fmt.F32: self.width,
+            Fmt.I32: self.width,
+            Fmt.MXFP8: self.width // 4,
+        }
         return per[self.fmt]
 
     def words_per_row(self) -> int:
@@ -106,15 +110,24 @@ class Channel:
         return self.pairs_per_row()
 
     def region_names(self) -> tuple[str, ...]:
-        names = (f"{self.name}.q", f"{self.name}.s") if self.fmt is Fmt.MXFP8 else (self.name,)
+        names = (
+            (f"{self.name}.q", f"{self.name}.s")
+            if self.fmt is Fmt.MXFP8
+            else (self.name,)
+        )
         return names + ((self.flag_region,) if self.flagged else ())
 
-    def regions(self, rows: int, writers: tuple[str, ...], flags: int = 1) -> tuple[Region, ...]:
+    def regions(
+        self, rows: int, writers: tuple[str, ...], flags: int = 1
+    ) -> tuple[Region, ...]:
         """The scratch regions holding this channel for ``rows`` rows, put by ``writers``;
         ``flags``: the producer's flag slots (``FLAG`` only: one per producer task)."""
         if self.fmt is Fmt.MXFP8:
             assert self.width % 32 == 0, self
-            words = ((f"{self.name}.q", rows * self.width // 4), (f"{self.name}.s", rows * self.width // 32))
+            words = (
+                (f"{self.name}.q", rows * self.width // 4),
+                (f"{self.name}.s", rows * self.width // 32),
+            )
         else:
             words = ((self.name, rows * self.pairs_per_row()),)
         h = self.home
@@ -142,4 +155,3 @@ class Block:
     def pack(self, layer) -> dict[str, torch.Tensor]:
         """Device tensors this block's args need, from a ``QuantizedLayer``."""
         return {}
-

@@ -24,9 +24,8 @@ forward at (``HiLayers.served_widths``: recorded by the served forward itself, s
 only when its capture took the hook's path, and a replay runs what the capture recorded), or of B requests at a batch
 width (``HiLayers.split``: B requests verifying the query bucket's rows each, every one of them that many), no
 image rows, no recomputed rows. The decision is on the host and TP-uniform (it reads the scheduler's batch, the same on every
-rank). An eager forward that would not serve a lean step raises (``hi_dispatch``). The builder asks before each step's
-layout (its ``decode_round``: ``round.HiRound.lean_layout``). Nothing changes when the hook is off, or on any other
-step.
+rank), part of the step's one routing decision (``round.HiRound.service``: ``RoundService.LEAN``), which the builder
+takes before each step's layout. Nothing changes when the hook is off, or on any other step.
 """
 
 from __future__ import annotations
@@ -90,36 +89,14 @@ def check_batch_layout(hook, spans, running_tokens, max_q_len) -> None:
                            "rows a request")  # fmt: skip
 
 
-class LeanHost:
-    """The lean host prep at V4.1's metadata builder (``HiRound``: its ``lean_layout`` / ``laid_out`` hooks)."""
-
-    def __init__(self, hook) -> None:
-        self.hook = hook
-
-    def lean_layout(self, batch, spans, running_bs, running_tokens, *, max_q_len, tentative, is_prefill,
-                    resumes) -> bool:  # fmt: skip
-        """Before the step's layout: whether it is lean (``lean_step``); a ragged decode at a batch width raises."""
-        if not is_prefill:
-            check_batch_layout(self.hook, spans, running_tokens, max_q_len)
-        return lean_step(self.hook, batch, spans, running_bs, running_tokens, max_q_len, tentative, is_prefill,
-                         resumes)  # fmt: skip
-
-    def laid_out(self, metadata, lean: bool) -> None:
-        """After it: a lean step marked (``step.lean_host``: the runner's and the device round's test)."""
-        if lean:
-            metadata.step.lean_host = True
-            self.hook.lean_steps += 1
-
-
-def install(hook) -> LeanHost | None:
-    """The lean host prep for ``hook`` (``HiRound``'s), or None (a layer runs on ATOM: every step lays out in full)."""
-    if hook is None:
-        return None
+def install(hook) -> bool:
+    """The lean host prep for ``hook`` (``HiRound.service``'s ``LEAN`` steps); False when a layer runs on ATOM (every
+    step lays out in full)."""
     if not hook.runs_every_layer:
         logger.warning("V4.1 mono hi: no lean host prep: layers %s run on ATOM",
                        sorted(i for i, p in hook.plan.items() if not p.hi))  # fmt: skip
-        return None
+        return False
     hook.lean_host = True
     logger.info("V4.1 mono hi: lean host prep on served steps: no compress plans, step planners, ATOM mailbox "
                 "step_begin or K1 / K2 step metadata")  # fmt: skip
-    return LeanHost(hook)
+    return True

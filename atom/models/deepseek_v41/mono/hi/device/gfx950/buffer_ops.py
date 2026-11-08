@@ -37,7 +37,6 @@ from flydsl.expr.meta import dsl_loc_tracing
 from . import dual
 from ...plan import trace
 
-
 __all__ = [
     "BufferResourceDescriptor",
     "buffer_load",
@@ -85,7 +84,9 @@ def _as_num_records(num_records_bytes) -> fx.Int64 | None:
 def _byte_buffer_ptr(global_ptr, num_records_bytes, base_byte_offset=None):
     """Wrap a global pointer in a byte-addressed buffer-resource pointer."""
     ptr = fx.recast_iter(fx.Int8, global_ptr)
-    return fx.rocdl.make_buffer_ptr(ptr, num_records_bytes=_as_num_records(num_records_bytes))
+    return fx.rocdl.make_buffer_ptr(
+        ptr, num_records_bytes=_as_num_records(num_records_bytes)
+    )
 
 
 @dsl_loc_tracing
@@ -143,7 +144,9 @@ def get_element_ptr(
 
     base_ptr = _unwrap_value(base_ptr)
     if not isinstance(static_byte_offset, int):
-        raise TypeError(f"static_byte_offset must be int, got {type(static_byte_offset).__name__}")
+        raise TypeError(
+            f"static_byte_offset must be int, got {type(static_byte_offset).__name__}"
+        )
     if elem_type is None:
         elem_type = T.i8()
     elif callable(elem_type):
@@ -160,7 +163,10 @@ def get_element_ptr(
         if isinstance(offset_val.type, ir.IndexType):
             offset_val = fx.Int64(offset_val).ir_value()
         elif not isinstance(offset_val.type, ir.IntegerType):
-            raise TypeError("byte_offset must be int, index, or integer-typed MLIR value; " f"got {offset_val.type}")
+            raise TypeError(
+                "byte_offset must be int, index, or integer-typed MLIR value; "
+                f"got {offset_val.type}"
+            )
 
         if static_byte_offset != 0:
             dtype = fx.Numeric.from_ir_type(offset_val.type)
@@ -242,11 +248,15 @@ def create_buffer_resource_from_addr(
     """
     from . import dual  # hi: a dual build refuses resources over a dual region (no IR)
 
-    ptr_ty = fx.PointerType.get(T.i8(), address_space=fx.AddressSpace.Global, alignment=16)
+    ptr_ty = fx.PointerType.get(
+        T.i8(), address_space=fx.AddressSpace.Global, alignment=16
+    )
     base_ptr = fx.inttoptr(ptr_ty, fx.Int64(_unwrap_value(addr_i64)))
     if not dual.active():
         return _byte_buffer_ptr(base_ptr, num_records_bytes)
-    out = _byte_buffer_ptr(base_ptr, dual.bound(addr_i64, num_records_bytes))  # dual builds: room for both copies
+    out = _byte_buffer_ptr(
+        base_ptr, dual.bound(addr_i64, num_records_bytes)
+    )  # dual builds: room for both copies
     dual.note(out, addr_i64)  # dual-copy regions (device.gfx950.dual; no IR)
     return out
 
@@ -280,12 +290,16 @@ def create_buffer_resource(
         >>> data = buffer_load(rsrc, offset)
     """
     if stride != 0:
-        raise ValueError(f"create_buffer_resource: only stride=0 (contiguous) is supported, got {stride}")
+        raise ValueError(
+            f"create_buffer_resource: only stride=0 (contiguous) is supported, got {stride}"
+        )
 
     if num_records_bytes is None and not max_size:
         num_records_bytes = _num_records_from_memref_type(memref_val)
 
-    return _byte_buffer_ptr(fx.get_iter(memref_val), num_records_bytes, base_byte_offset)
+    return _byte_buffer_ptr(
+        fx.get_iter(memref_val), num_records_bytes, base_byte_offset
+    )
 
 
 @dsl_loc_tracing
@@ -328,19 +342,28 @@ def buffer_load(
 
     # Convert the API's element offset to the buffer instruction's byte offset.
     element_bytes = dtype.width // 8
-    trace.mem("load", rsrc, cache_modifier, vec_width * element_bytes)  # the memory-model record (no IR)
+    trace.mem(
+        "load", rsrc, cache_modifier, vec_width * element_bytes
+    )  # the memory-model record (no IR)
     offset = (fx.Int32(offset) * fx.Int32(element_bytes)).ir_value()
-    if dual.active() and dual.over(rsrc):  # a dual region: its run layout, this CTA's copy (gfx950.dual)
+    if dual.active() and dual.over(
+        rsrc
+    ):  # a dual region: its run layout, this CTA's copy (gfx950.dual)
         offset = dual.load_offset(rsrc, _add_soffset_bytes(offset, soffset_bytes))
         soffset_bytes = None
 
     # Apply mask by setting invalid offsets to max
 
-
     offset = _add_soffset_bytes(offset, soffset_bytes)
-    src = fx.make_view(rsrc + fx.Int32(offset), fx.make_layout(vec_width * element_bytes, 1))
-    atom = fx.make_copy_atom(fx.rocdl.BufferCopy(vec_width * dtype.width, cache_modifier), fx.Int8)
-    reg = fx.make_rmem_tensor(fx.make_layout(vec_width, 1), fx.Numeric.from_ir_type(dtype))
+    src = fx.make_view(
+        rsrc + fx.Int32(offset), fx.make_layout(vec_width * element_bytes, 1)
+    )
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(vec_width * dtype.width, cache_modifier), fx.Int8
+    )
+    reg = fx.make_rmem_tensor(
+        fx.make_layout(vec_width, 1), fx.Numeric.from_ir_type(dtype)
+    )
     fx.copy(atom, src, reg)
     loaded = fx.memref_load_vec(reg)
     result = _unwrap_value(loaded[0] if vec_width == 1 else loaded)
@@ -388,27 +411,43 @@ def buffer_store(
         element_type = data_type
         vec_width = 1
     element_bytes = element_type.width // 8
-    trace.mem("store", rsrc, cache_modifier, vec_width * element_bytes, data)  # the memory-model record (no IR)
+    trace.mem(
+        "store", rsrc, cache_modifier, vec_width * element_bytes, data
+    )  # the memory-model record (no IR)
 
     # Convert element offsets unless the caller already supplied bytes.
     if not offset_is_bytes:
         offset = (fx.Int32(offset) * fx.Int32(element_bytes)).ir_value()
     up = None
-    if dual.active() and dual.over(rsrc):  # a dual region: its run layout, copy 0 and copy 1 (gfx950.dual)
+    if dual.active() and dual.over(
+        rsrc
+    ):  # a dual region: its run layout, copy 0 and copy 1 (gfx950.dual)
         offset = dual.place(rsrc, _add_soffset_bytes(offset, soffset_bytes))
         soffset_bytes = None
         up = dual.other(rsrc)
 
     # Apply mask by setting invalid offsets to max
     if mask is not None:
-        offset = fx.Boolean(mask).select(fx.Int32(offset), fx.Int32(0x7FFFFFFF)).ir_value()
+        offset = (
+            fx.Boolean(mask).select(fx.Int32(offset), fx.Int32(0x7FFFFFFF)).ir_value()
+        )
 
     offset = _add_soffset_bytes(offset, soffset_bytes)
-    dst = fx.make_view(rsrc + fx.Int32(offset), fx.make_layout(vec_width * element_bytes, 1))
-    atom = fx.make_copy_atom(fx.rocdl.BufferCopy(vec_width * element_type.width, cache_modifier), fx.Int8)
-    reg = fx.make_rmem_tensor(fx.make_layout(vec_width, 1), fx.Numeric.from_ir_type(element_type))
+    dst = fx.make_view(
+        rsrc + fx.Int32(offset), fx.make_layout(vec_width * element_bytes, 1)
+    )
+    atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy(vec_width * element_type.width, cache_modifier), fx.Int8
+    )
+    reg = fx.make_rmem_tensor(
+        fx.make_layout(vec_width, 1), fx.Numeric.from_ir_type(element_type)
+    )
     fx.memref_store_vec(data, reg)
     fx.copy(atom, reg, dst)
-    if up is not None:  # the same data and cache bits into the other copy (masked-off offsets stay out of range)
-        dst = fx.make_view(rsrc + (fx.Int32(offset) + up), fx.make_layout(vec_width * element_bytes, 1))
+    if (
+        up is not None
+    ):  # the same data and cache bits into the other copy (masked-off offsets stay out of range)
+        dst = fx.make_view(
+            rsrc + (fx.Int32(offset) + up), fx.make_layout(vec_width * element_bytes, 1)
+        )
         fx.copy(atom, reg, dst)

@@ -112,6 +112,45 @@ ATOM uses a module-level global `ForwardContext` to pass metadata through CUDA g
 
 This pattern enables stateless dispatch: attention backends and model operators call `get_forward_context()` to access metadata without requiring it as a function parameter, which is critical for CUDA graph compatibility.
 
+## Model hooks (`verify_head`, `decode_round`)
+
+A model may take over part of a step by exposing two hook objects, declared in
+`atom/model_engine/model_hooks.py`. `ModelRunner` resolves them once, when the
+model is installed (`model_hooks.resolve`), into its `verify_head` and
+`decode_round` attributes; both are None for every model without them, which
+then runs exactly as before.
+
+- **`VerifyHead`** — a head inside the model's forward that picks each row of a
+  speculative verify. `before_forward` (the step's sampling rows) and `ids`
+  (the rows' ids, or None: the logits path) bracket the forward in
+  `run_model`; `captured` follows a graph capture; `postprocess` takes the
+  head's `verdict` in place of the rejection sampler's. The ids are broadcast
+  over TP as on every other step.
+- **`DecodeRound`** — host work of the decode round the model takes over,
+  called where that work sits: `before_input_ids` / `spec_status` /
+  `decode_ids_filler` in `tokenIDProcessor.prepare_input_ids`,
+  `host_arena_reader` once per packed publication
+  (`PublicationGroup.read_host_arena`), `before_staging_mark`,
+  `after_forward` right after the target forward's launch, `note_verdict`
+  after the rejection sampler; for the attention metadata builder `service`,
+  `laid_out` and `committed`, and for the DSpark proposer `anchors_staged`.
+
+`DecodeRound.service` is the step's one routing decision,
+`AttentionMetaData.served_by_round` (`RoundService`): `NONE`, or `FORWARD`
+(the model's own forward runs every layer, looks its Engram rows up itself and
+writes the DSpark draft's context KV), `LEAN` (laid out without the compress
+plans and step planners nothing it runs reads) and `DEVICE` (positions
+advanced on the device from the previous verdict). The builder decides it once
+before the step's layout; the builder, its cache, Engram staging
+(`EngramStep.served_by_round`), the DSpark proposer and the model's forward all
+read it, so they agree on every step.
+
+DeepSeek-V4.1's high-interactivity monokernels (`atom/models/deepseek_v41/mono/hi_*.py`,
+`round/`, the FlyDSL runtime in `hi/`; `ATOM_DSV41_MONO_HI`, on by default where
+`hi_gate` says they serve) are the one model with these hooks: `hi_dispatch`
+wraps the model (`HiDecodeModel`), `round.HiRound` is its `decode_round` and
+`round.verify_head.HiVerifyHead` its `verify_head`.
+
 ## Multi-process architecture
 
 ATOM uses a multi-process design with ZMQ sockets for inter-process communication:
@@ -316,6 +355,7 @@ Each attention backend provides its own `prepare_mtp_decode()` implementation:
 | `atom/model_engine/engine_core.py` | `EngineCore` main execution loop, `DPEngineCoreProc` data-parallel variant, `EngineCoreRequestType` message protocol |
 | `atom/model_engine/engine_core_mgr.py` | `CoreManager` ZMQ orchestration, process launching, load-balanced DP dispatch |
 | `atom/model_engine/model_runner.py` | `ModelRunner` per-GPU execution (model loading, CUDA graph capture, forward pass), `tokenIDProcessor` deferred output handling |
+| `atom/model_engine/model_hooks.py` | `VerifyHead` and `DecodeRound`, the hooks a model may give `ModelRunner`, and `resolve` |
 | `atom/model_engine/scheduler.py` | `Scheduler` prefill-first scheduling, `ScheduledBatch` batch descriptor, `ScheduledBatchOutput` forward results |
 | `atom/model_engine/engine_stats.py` | `EngineStats` — MTP acceptance, prefix-cache hits, and the periodic engine-status line, each on its own cadence |
 | `atom/model_engine/sequence.py` | `Sequence` request state, `SequenceStatus` and `SequenceType` enums |

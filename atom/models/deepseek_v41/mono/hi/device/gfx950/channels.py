@@ -36,7 +36,11 @@ def store_words(a, w, words):
     """Dense words ``w .. w + len(words)`` (1, 2 or 4; ``w`` aligned to the count) at
     device scope; recorded as a put of ``a``'s region."""
     note(a.region, a.space, "put")
-    data = fx.Vector.from_elements([fx.Int32(x) for x in words], fx.Int32) if len(words) > 1 else fx.Int32(words[0])
+    data = (
+        fx.Vector.from_elements([fx.Int32(x) for x in words], fx.Int32)
+        if len(words) > 1
+        else fx.Int32(words[0])
+    )
     mb.store(a, data, w, CM_DEV)
 
 
@@ -73,7 +77,8 @@ def flag_count(k, region) -> int:
 
 def flag_try(k, region, threads=None):
     """One poll attempt of this thread's share of every flag of ``region`` (issued now, not
-    waited for): (specs, raw words). Thread ``i`` polls flags ``i, i + T, ...`` (clamped)."""
+    waited for): (specs, raw words). Thread ``i`` polls flags ``i, i + T, ...`` (clamped).
+    """
     n = flag_count(k, region)
     threads = threads or k.threads
     a = k.mb[region]
@@ -152,5 +157,3 @@ def put_words(a, i, words, tag, dense=False):
         store_words(a, i, list(words))
     else:
         mb.put_words(a, i, list(words), tag)
-
-

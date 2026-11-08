@@ -45,15 +45,23 @@ logger = logging.getLogger("atom")
 
 ITERS = 24  # round trips a run
 SPIN_MAX = 1 << 18  # a poll gives up (a role no CTA took: the check then fails)
-GAP = 0.08  # a pair's parity gap (fraction of its round trip) that counts as "on one IOD"
+GAP = (
+    0.08  # a pair's parity gap (fraction of its round trip) that counts as "on one IOD"
+)
 RETIME = 8  # repetitions a run whose measured home disagrees with the rule is timed again with
-RETIME_ROUNDS = 2  # rounds of that (a run still disagreeing after them counts against the rule)
+RETIME_ROUNDS = (
+    2  # rounds of that (a run still disagreeing after them counts against the rule)
+)
 ATTEMPTS = 3  # calibrations of a scratch's page 0 before it settles on copy 0 (``scratch_word``)
-REPORT: dict = {}  # (address, runs) -> the last calibration's facts (word, gaps, agreement)
+REPORT: dict = (
+    {}
+)  # (address, runs) -> the last calibration's facts (word, gaps, agreement)
 
 
 def _xcc():
-    v = llvm.InlineAsmOp(T.i32, [], "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID)", "=s", has_side_effects=True)
+    v = llvm.InlineAsmOp(
+        T.i32, [], "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID)", "=s", has_side_effects=True
+    )
     return fx.Int32(v.result) & 7
 
 
@@ -83,11 +91,19 @@ def _pp(k, t):
                 if isp:
                     bo.buffer_store(fx.Vector.from_elements([tg, tg, tg, tg], fx.Int32), buf, w + me,
                                     cache_modifier=CM_DEV)  # fmt: skip
-                v = fx.Vector(bo.buffer_load(buf, w + yo, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))
+                v = fx.Vector(
+                    bo.buffer_load(
+                        buf, w + yo, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV
+                    )
+                )
                 s = fx.Int32(0)
                 while ((v[1] != tg) | (v[3] != tg)) & (s < SPIN_MAX):
                     spin_pause()
-                    v = fx.Vector(bo.buffer_load(buf, w + yo, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))
+                    v = fx.Vector(
+                        bo.buffer_load(
+                            buf, w + yo, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV
+                        )
+                    )
                     s = s + 1
                 if isc:
                     bo.buffer_store(fx.Vector.from_elements([tg, tg, tg, tg], fx.Int32), buf, w + me,
@@ -100,7 +116,14 @@ def _pp(k, t):
 
 
 def _program() -> Program:
-    st = Stage("pp", 256, partial(_pp), args=("cfg", "buf", "out", "runs"), base=0, key=("dual_pp", ITERS))
+    st = Stage(
+        "pp",
+        256,
+        partial(_pp),
+        args=("cfg", "buf", "out", "runs"),
+        base=0,
+        key=("dual_pp", ITERS),
+    )
     return Program("dual_pp", Scenario(1, 1), [st], plain_waive=("buf", "out", "runs"))
 
 
@@ -120,7 +143,11 @@ def pp_runs(buf: torch.Tensor, runs: list[int], xp: int, xc: int) -> torch.Tenso
     rw = torch.tensor([r // 4 for r in runs], dtype=torch.int32, device=dev)
     out = torch.zeros(len(runs), dtype=torch.int32, device=dev)
     bufs.bump()
-    kern.launch(kern.table({"cfg": cfg, "buf": buf, "out": out, "runs": rw}, device=dev), bufs, layer=0)
+    kern.launch(
+        kern.table({"cfg": cfg, "buf": buf, "out": out, "runs": rw}, device=dev),
+        bufs,
+        layer=0,
+    )
     torch.cuda.synchronize(dev)
     return out.float().cpu() * 0.01 / ITERS
 
@@ -134,11 +161,16 @@ def _homes(page: torch.Tensor, nruns: int, pairs, want: torch.Tensor, reps: int 
 
     def time(idx, n):
         runs = [i * DUAL_RUN for i in idx]
-        t = [torch.stack([pp_runs(page, runs, *ab) for _ in range(n)]).min(0).values for ab in pairs]
+        t = [
+            torch.stack([pp_runs(page, runs, *ab) for _ in range(n)]).min(0).values
+            for ab in pairs
+        ]
         return (t[0] < t[1]).int(), (t[0] - t[1]).abs()
 
     near0, diff = time(range(nruns), reps)
-    if either and float((near0 == want).float().mean()) < 0.5:  # the page's other parity
+    if (
+        either and float((near0 == want).float().mean()) < 0.5
+    ):  # the page's other parity
         want = 1 - want
     retimed = []
     for _ in range(RETIME_ROUNDS):
@@ -148,31 +180,52 @@ def _homes(page: torch.Tensor, nruns: int, pairs, want: torch.Tensor, reps: int 
         retimed += bad
         again, _ = time(bad, RETIME)
         near0[bad] = again
-    return near0, {"margin": round(float(diff.median()), 3), "retimed": sorted(set(retimed))}
+    return near0, {
+        "margin": round(float(diff.median()), 3),
+        "retimed": sorted(set(retimed)),
+    }
 
 
 def calibrate(page: torch.Tensor, nruns: int, reps: int = 3) -> tuple[int, float, dict]:
     """``page``: a zeroed int32 tensor at a 2 MiB boundary, at least ``nruns`` runs. -> (word, agreement, facts):
     bit x of ``word`` = the copy (run parity) local to XCD x; agreement = the share of the runs whose measured home
-    is the rule's (1.0 when the rule holds; a disagreeing run is timed again first, ``_homes``)."""
+    is the rule's (1.0 when the rule holds; a disagreeing run is timed again first, ``_homes``).
+    """
     even, odd = 0, DUAL_RUN
     gap = torch.zeros(8, 8)
     for xp in range(8):
         for xc in range(8):
-            t = torch.stack([pp_runs(page, [even, odd], xp, xc) for _ in range(reps)]).min(0).values
-            gap[xp, xc] = float((t[1] - t[0]) / t.min())  # > 0: the even run (copy 0) is local to the pair
+            t = (
+                torch.stack([pp_runs(page, [even, odd], xp, xc) for _ in range(reps)])
+                .min(0)
+                .values
+            )
+            gap[xp, xc] = float(
+                (t[1] - t[0]) / t.min()
+            )  # > 0: the even run (copy 0) is local to the pair
     strong = gap.abs() > GAP
-    vote = (gap * strong).sum(1) + (gap * strong).sum(0)  # each XCD's pairs on its own IOD
-    word = sum(int(vote[x] < 0) << x for x in range(8))  # bit x: copy 1 (odd runs) is XCD x's
+    vote = (gap * strong).sum(1) + (gap * strong).sum(
+        0
+    )  # each XCD's pairs on its own IOD
+    word = sum(
+        int(vote[x] < 0) << x for x in range(8)
+    )  # bit x: copy 1 (odd runs) is XCD x's
     facts = {"gap": [[round(float(v), 3) for v in r] for r in gap], "word": word}
     groups = [[x for x in range(8) if (word >> x) & 1 == c] for c in (0, 1)]
     if any(len(g) != 4 for g in groups):
         facts["error"] = f"XCD groups {groups} (expected 4 + 4)"
         return word, 0.0, facts
     # one pair of each IOD (its strongest), every run of the area: the measured home must be the rule's
-    pairs = [max(((a, b) for a in g for b in g if a != b), key=lambda ab: abs(float(gap[ab]))) for g in groups]
+    pairs = [
+        max(
+            ((a, b) for a in g for b in g if a != b), key=lambda ab: abs(float(gap[ab]))
+        )
+        for g in groups
+    ]
     want = 1 - torch.arange(nruns) % 2  # group 0 reads copy 0 = the even runs
-    near0, f = _homes(page, nruns, pairs, want)  # 1: the run is local to group 0 (copy 0's XCDs) rather than group 1
+    near0, f = _homes(
+        page, nruns, pairs, want
+    )  # 1: the run is local to group 0 (copy 0's XCDs) rather than group 1
     agree = float((near0 == want).float().mean())
     facts.update(pairs=pairs, agree=agree, **f)
     return word, agree, facts
@@ -180,7 +233,8 @@ def calibrate(page: torch.Tensor, nruns: int, reps: int = 3) -> tuple[int, float
 
 def page_parity(page: torch.Tensor, nruns: int, pairs) -> tuple[int | None, dict]:
     """A further page of the run area: with page 0's IOD pairs, its first ``nruns`` runs -> (0: its even runs are
-    local to the same XCDs as page 0's, 1: to the others, None: the rule does not hold there; facts)."""
+    local to the same XCDs as page 0's, 1: to the others, None: the rule does not hold there; facts).
+    """
     even = 1 - torch.arange(nruns) % 2
     near0, facts = _homes(page, nruns, pairs, even, either=True)
     same = float((near0 == even).float().mean())
@@ -207,7 +261,9 @@ def scratch_word(scratch: torch.Tensor, area: int, name: str = "") -> int:
     gives that page 0 (every CTA reads its copy 0); a failed page 0 gives 0. The word is logged with
     ``name`` (the program's)."""
     if scratch.data_ptr() % DUAL_PAGE:
-        raise ValueError(f"dual scratch 0x{scratch.data_ptr():x} is not {DUAL_PAGE} B aligned")
+        raise ValueError(
+            f"dual scratch 0x{scratch.data_ptr():x} is not {DUAL_PAGE} B aligned"
+        )
     pages = -(-area // DUAL_PAGE)
     first = min(max(area, 2 * DUAL_RUN), DUAL_PAGE)
     page = scratch[:first].view(torch.int32)
@@ -237,6 +293,9 @@ def scratch_word(scratch: torch.Tensor, area: int, name: str = "") -> int:
 
 def _log(name: str, word: int, facts: dict) -> None:
     """One log line a dual scratch: its program, word, agreement, calibrations and the runs timed again."""
-    retimed = sum(len(f.get("retimed", ())) for f in [facts, *(v for k, v in facts.items() if k.startswith("page"))])
+    retimed = sum(
+        len(f.get("retimed", ()))
+        for f in [facts, *(v for k, v in facts.items() if k.startswith("page"))]
+    )
     logger.info("dsv41hi.runtime.dual: %s: word 0x%x, agreement %.4f, %d calibration(s), %d run(s) timed again",
                 name or "scratch", word, facts.get("agree", 0.0), facts.get("attempts", 1), retimed)  # fmt: skip

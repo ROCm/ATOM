@@ -163,13 +163,27 @@ class _Plan:
     out: str  # "" without an output channel
     lead: int = 4  # weight units a wave issues before x's poll attempt
     late: bool = False  # the rest of the prefetch after x lands (else before)
-    sample: bool = False  # per-row temperature / top-p sampling (``sample``: the module docstring's "Sampling")
-    wfmt: str = "bf16"  # the weight's format ("mxfp4": MXFP8 x, the module docstring's "MXFP4 weights")
-    kparts: int = 1  # x lands in this many K slices, one at a time (``ArgmaxHead.plan``: the fewest that fit the LDS)
-    race: bool = False  # ``sample``: rows with T > 0 and top_p >= 1 drawn in the dot's epilogue (module docstring)
-    race_lg: bool = False  # ``race="check"``: their ``<name>.lg`` pairs written too (a check's reference)
-    race_only: bool = False  # ``race="only"``: every T > 0 row races, no scans (module docstring)
-    balance: int = 0  # K parts a row group (``balance``: balanced tasks, module docstring); 0: a task 8 row groups
+    sample: bool = (
+        False  # per-row temperature / top-p sampling (``sample``: the module docstring's "Sampling")
+    )
+    wfmt: str = (
+        "bf16"  # the weight's format ("mxfp4": MXFP8 x, the module docstring's "MXFP4 weights")
+    )
+    kparts: int = (
+        1  # x lands in this many K slices, one at a time (``ArgmaxHead.plan``: the fewest that fit the LDS)
+    )
+    race: bool = (
+        False  # ``sample``: rows with T > 0 and top_p >= 1 drawn in the dot's epilogue (module docstring)
+    )
+    race_lg: bool = (
+        False  # ``race="check"``: their ``<name>.lg`` pairs written too (a check's reference)
+    )
+    race_only: bool = (
+        False  # ``race="only"``: every T > 0 row races, no scans (module docstring)
+    )
+    balance: int = (
+        0  # K parts a row group (``balance``: balanced tasks, module docstring); 0: a task 8 row groups
+    )
 
     probe = False  # ``linear._land_batch``'s probe build: off
 
@@ -185,13 +199,14 @@ class _Plan:
     def tasks(self) -> int:
         return min(MI355X.cus, self.n_rg) if self.balance else -(-self.n_rg // WAVES)
 
-
     @property
     def bal_g(self) -> int:  # ``balance``: the most row groups a CTA
         return -(-self.n_rg // self.tasks)
 
     @property
-    def bal_base(self) -> int:  # ``balance``: LDS word of the parts' sums (a part 64 lanes x 4 floats)
+    def bal_base(
+        self,
+    ) -> int:  # ``balance``: LDS word of the parts' sums (a part 64 lanes x 4 floats)
         return self.rpar + (2 * self.rows + 2 if self.race else 0)
 
     @property
@@ -199,13 +214,18 @@ class _Plan:
         return self.k // (MX_KSTEP if self.mx else KSTEP)
 
     @property
-    def pitch(self) -> int:  # LDS words a row of x (its K slice: ``kparts``; +4: the 16 rows of an operand load on
+    def pitch(
+        self,
+    ) -> (
+        int
+    ):  # LDS words a row of x (its K slice: ``kparts``; +4: the 16 rows of an operand load on
         # distinct banks)
         return self.k // 4 + 4 if self.mx else self.k // self.kparts // 2 + 4
 
-
     @property
-    def spitch(self) -> int:  # MXFP8 x: LDS words a row of its scale codes (odd: bank spread)
+    def spitch(
+        self,
+    ) -> int:  # MXFP8 x: LDS words a row of its scale codes (odd: bank spread)
         return self.k // 32 + 1
 
     @property
@@ -213,9 +233,10 @@ class _Plan:
         return self.rows * self.pitch
 
     @property
-    def kse(self) -> int:  # ``linear._x_batches``' slice width and channel width: all of K
+    def kse(
+        self,
+    ) -> int:  # ``linear._x_batches``' slice width and channel width: all of K
         return self.k
-
 
     @property
     def xk(self) -> int:
@@ -231,10 +252,16 @@ class _Plan:
 
     @property
     def red(self) -> int:  # LDS word of the waves' (key, id) per row, after x
-        return self.xs_base + self.rows * self.spitch if self.mx else self.rows * self.pitch
+        return (
+            self.xs_base + self.rows * self.spitch
+            if self.mx
+            else self.rows * self.pitch
+        )
 
     @property
-    def rpar(self) -> int:  # ``race``: LDS word of ``<name>.par``'s copy, after the waves' (key, id)
+    def rpar(
+        self,
+    ) -> int:  # ``race``: LDS word of ``<name>.par``'s copy, after the waves' (key, id)
         return self.red + WAVES * self.rows * 2
 
     @property
@@ -242,7 +269,11 @@ class _Plan:
         return self.bal_base + (self.bal_g * self.balance * 256 if self.balance else 0)
 
     @property
-    def cshift(self) -> int:  # the row's shift in the Philox counter's first word (module docstring: ids / 2 below it)
+    def cshift(
+        self,
+    ) -> (
+        int
+    ):  # the row's shift in the Philox counter's first word (module docstring: ids / 2 below it)
         return 16 if self.n * self.tp <= 2**17 else 17
 
     @property
@@ -258,11 +289,17 @@ class _Plan:
         return self.n // 2
 
     @property
-    def quads(self) -> int:  # 16-byte poll specs a row of ``<name>.lg`` (two pairs: four logits)
+    def quads(
+        self,
+    ) -> int:  # 16-byte poll specs a row of ``<name>.lg`` (two pairs: four logits)
         return self.n // 4
 
     @property
-    def scan_slices(self) -> int:  # the sampling scans' slices of at most SCAN_SPECS specs a thread (1 to 32768 ids)
+    def scan_slices(
+        self,
+    ) -> (
+        int
+    ):  # the sampling scans' slices of at most SCAN_SPECS specs a thread (1 to 32768 ids)
         return -(-(-(-self.quads // THREADS)) // SCAN_SPECS)
 
     @property
@@ -298,11 +335,19 @@ class ArgmaxHead(Block):
         if weight_format not in WFMTS:
             raise ValueError(f"ArgmaxHead {name}: weight_format in {WFMTS}")
         mx = weight_format == "mxfp4"
-        if mx and (x.fmt is not Fmt.MXFP8 or x.flagged or x.width % MX_KSTEP or layout != "packed" or sample):
+        if mx and (
+            x.fmt is not Fmt.MXFP8
+            or x.flagged
+            or x.width % MX_KSTEP
+            or layout != "packed"
+            or sample
+        ):
             raise ValueError(f"ArgmaxHead {name}: mxfp4 reads a tagged MXFP8 channel of width a multiple of "
                              f"{MX_KSTEP}, layout 'packed', no sampling")  # fmt: skip
         if not mx and (x.fmt is not Fmt.BF16 or x.flagged or x.width % (2 * KSTEP)):
-            raise ValueError(f"ArgmaxHead {name}: x is a tagged BF16 channel, width a multiple of {2 * KSTEP}")
+            raise ValueError(
+                f"ArgmaxHead {name}: x is a tagged BF16 channel, width a multiple of {2 * KSTEP}"
+            )
         if n % RG or n >= 2**31 // 8:
             raise ValueError(f"ArgmaxHead {name}: n a multiple of {RG}")
         if key not in KEYS or layout not in LAYOUTS:
@@ -310,49 +355,88 @@ class ArgmaxHead(Block):
         kstep = MX_KSTEP if mx else KSTEP
         if not 0 <= lead <= prefetch <= x.width // kstep:
             raise ValueError(f"ArgmaxHead {name}: 0 <= lead <= prefetch <= K / {kstep}")
-        if out is not None and (out.fmt is not Fmt.F32 or out.width != 1 or out.flagged):
-            raise ValueError(f"ArgmaxHead {name}: out is a tagged F32 channel of width 1 (the id's bits)")
+        if out is not None and (
+            out.fmt is not Fmt.F32 or out.width != 1 or out.flagged
+        ):
+            raise ValueError(
+                f"ArgmaxHead {name}: out is a tagged F32 channel of width 1 (the id's bits)"
+            )
         if sample and (key != "bf16" or out is not None or n % 4):
-            raise ValueError(f"ArgmaxHead {name}: sample needs key 'bf16', no out channel, n a multiple of 4")
+            raise ValueError(
+                f"ArgmaxHead {name}: sample needs key 'bf16', no out channel, n a multiple of 4"
+            )
         if race not in (False, True, "check", "only") or (race and not sample):
-            raise ValueError(f"ArgmaxHead {name}: race (True / 'check' / 'only') is a sampling mode (sample=True)")
+            raise ValueError(
+                f"ArgmaxHead {name}: race (True / 'check' / 'only') is a sampling mode (sample=True)"
+            )
         self.name, self.x, self.n, self.key, self.layout = name, x, n, key, layout
-        self.prefetch, self.vals, self.out, self.lead, self.late = prefetch, vals, out, lead, late
-        if balance and (mx or layout != "wave" or (sample and race != "only") or x.width // KSTEP % balance):
+        self.prefetch, self.vals, self.out, self.lead, self.late = (
+            prefetch,
+            vals,
+            out,
+            lead,
+            late,
+        )
+        if balance and (
+            mx
+            or layout != "wave"
+            or (sample and race != "only")
+            or x.width // KSTEP % balance
+        ):
             raise ValueError(f"ArgmaxHead {name}: balance (K parts) with bf16 weights in layout 'wave', K / 32 a "
                              f"multiple of it, greedy or race 'only'")  # fmt: skip
-        self.sample, self.weight_format, self.race, self.balance = sample, weight_format, race, balance
+        self.sample, self.weight_format, self.race, self.balance = (
+            sample,
+            weight_format,
+            race,
+            balance,
+        )
         # x's K slices at least this many (bf16 weights; 0: the fewest that fit the LDS): smaller slices land with
         # fewer loads in flight beside the prefetch (the same products and K order: the same bits)
         if kparts < 0 or (kparts and mx):
             raise ValueError(f"ArgmaxHead {name}: kparts >= 0, bf16 weights only")
         self.kparts = kparts
 
-
     def plan(self, sc: Scenario) -> _Plan:
         p = _Plan(self.name, sc.rows, self.x.width, self.n, sc.tp, self.x.name, self.key, self.layout,
                   self.prefetch, self.vals, self.out.name if self.out is not None else "", self.lead,
                   self.late, self.sample, self.weight_format, race=bool(self.race),
                   race_lg=self.race == "check", race_only=self.race == "only", balance=self.balance)  # fmt: skip
-        if not p.mx:  # x in K slices where it does not fit whole (the bf16 weights' path), ``kparts`` at least
+        if (
+            not p.mx
+        ):  # x in K slices where it does not fit whole (the bf16 weights' path), ``kparts`` at least
             if self.kparts > 1:
                 if p.steps % self.kparts:
-                    raise ValueError(f"ArgmaxHead {self.name}: kparts {self.kparts} does not divide {p.steps} K steps")
+                    raise ValueError(
+                        f"ArgmaxHead {self.name}: kparts {self.kparts} does not divide {p.steps} K steps"
+                    )
                 p = replace(p, kparts=self.kparts)
             for kp in (q for q in range(2, 9) if p.steps % q == 0 and q > p.kparts):
                 if p.lds_words * 4 <= MI355X.lds_bytes:
                     break
                 p = replace(p, kparts=kp)
         if p.balance and (p.kparts > 1 or p.rc > 1):
-            raise ValueError(f"ArgmaxHead {self.name}: balance: x of {sc.rows} rows whole in the LDS, at most 16 rows")
+            raise ValueError(
+                f"ArgmaxHead {self.name}: balance: x of {sc.rows} rows whole in the LDS, at most 16 rows"
+            )
         if p.race_only and p.n * p.tp > 2**18:
-            raise ValueError(f"ArgmaxHead {self.name}: race 'only': a vocab below 2^18 ids (the sampler's counter)")
-        if p.sample and not p.race_only and (p.n * p.tp > 2**17 or p.scan_slices > SCAN_SLICES):
+            raise ValueError(
+                f"ArgmaxHead {self.name}: race 'only': a vocab below 2^18 ids (the sampler's counter)"
+            )
+        if (
+            p.sample
+            and not p.race_only
+            and (p.n * p.tp > 2**17 or p.scan_slices > SCAN_SLICES)
+        ):
             raise ValueError(f"ArgmaxHead {self.name}: sample: a vocab below 2^17 ids (the sampler's counter), at most "
                              f"{4 * SCAN_SLICES * SCAN_SPECS * THREADS} a rank (the scans' slices)")  # fmt: skip
         if p.lds_words * 4 > MI355X.lds_bytes:
-            raise ValueError(f"ArgmaxHead {self.name}: x of {sc.rows} rows does not fit the LDS")
-        if p.race and 2 * sc.rows + 2 > THREADS:  # ``_race_par``: a word of ``<name>.par`` a thread
+            raise ValueError(
+                f"ArgmaxHead {self.name}: x of {sc.rows} rows does not fit the LDS"
+            )
+        if (
+            p.race and 2 * sc.rows + 2 > THREADS
+        ):  # ``_race_par``: a word of ``<name>.par`` a thread
             raise ValueError(f"ArgmaxHead {self.name}: race reads its 2 rows + 2 parameter words one a thread, at most "
                              f"{THREADS}")  # fmt: skip
         return p
@@ -363,16 +447,22 @@ class ArgmaxHead(Block):
         top = Region(p.top, p.top_pairs, (self.name,), space=space)
         pname = f"{self.name}.pick"
         outs = (f"{self.name}.ids",) + ((f"{self.name}.vals",) if p.vals else ())
-        writes = tuple(self.out.regions(p.rows, (pname,))) if self.out is not None else ()
+        writes = (
+            tuple(self.out.regions(p.rows, (pname,))) if self.out is not None else ()
+        )
         dot_writes, pick_lds = (top,), WAVES * 2
         if p.sample:
-            dot_writes += (Region(p.lg, p.rows * p.n2, (self.name,), space=Space.SCRATCH),)
+            dot_writes += (
+                Region(p.lg, p.rows * p.n2, (self.name,), space=Space.SCRATCH),
+            )
             writes += (Region(p.h1, p.rows * H1_ROW, (pname,), space=space, exchange=True),
                        Region(p.h2, p.rows * H2_ROW, (pname,), space=space, exchange=True))  # fmt: skip
             outs += (f"{self.name}.par",)
             pick_lds = S_WORDS
         w_args = (f"{self.name}.w",) + ((f"{self.name}.ws",) if p.mx else ())
-        w_args += (f"{self.name}.par",) if p.race else ()  # (race: the dot reads the rows' T / top_p and the seed)
+        w_args += (
+            (f"{self.name}.par",) if p.race else ()
+        )  # (race: the dot reads the rows' T / top_p and the seed)
         return [
             Stage(self.name, p.tasks, partial(_dot, p=p), lds_words=p.lds_words, writes=dot_writes,
                   args=w_args, key=(p, "dot")),
@@ -382,7 +472,8 @@ class ArgmaxHead(Block):
 
     def pack_weight(self, w) -> dict[str, torch.Tensor]:
         """Arg ``<name>.w`` from this rank's bf16 [n, K] rows (``pack``); MXFP4: ``<name>.w`` / ``<name>.ws`` from an
-        MXFP4 weight (``packed`` [n, K / 2], ``codes`` [n, K / 32], K the channel's width: ``pack_mx``)."""
+        MXFP4 weight (``packed`` [n, K / 2], ``codes`` [n, K / 32], K the channel's width: ``pack_mx``).
+        """
         if self.weight_format == "mxfp4":
             wb, sb = pack_mx(w.packed, w.codes)
             return {f"{self.name}.w": wb, f"{self.name}.ws": sb}
@@ -404,21 +495,32 @@ def pack(w: torch.Tensor, layout: str = "packed") -> torch.Tensor:
     # [task, row group, row, K step, lane group, 8] -> [task, K step, row group, lane group, row, 8] ("kmajor": K step
     # outermost: at each K step the whole grid reads one contiguous range)
     u = w.view(tasks, WAVES, RG, k // KSTEP, 4, 8)
-    order = {"kmajor": (3, 0, 1, 4, 2, 5), "wave": (0, 1, 3, 4, 2, 5)}.get(layout, (0, 3, 1, 4, 2, 5))
+    order = {"kmajor": (3, 0, 1, 4, 2, 5), "wave": (0, 1, 3, 4, 2, 5)}.get(
+        layout, (0, 3, 1, 4, 2, 5)
+    )
     u = u.permute(*order)
     return u.contiguous().view(-1, k)
 
 
-def pack_mx(packed: torch.Tensor, codes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def pack_mx(
+    packed: torch.Tensor, codes: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     """An MXFP4 head [n, K] (``packed`` uint8 [n, K / 2], ``codes`` [n, K / 32]) as ``gemv.pack_weight``'s units and
     codes, rows padded to whole tasks (zero weights, code 127: never read past n)."""
     n = packed.shape[0]
     per = WAVES * RG
     pad = -(-n // per) * per - n
     if pad:
-        packed = torch.cat([packed.view(torch.uint8), packed.new_zeros(pad, packed.shape[1]).view(torch.uint8)])
+        packed = torch.cat(
+            [
+                packed.view(torch.uint8),
+                packed.new_zeros(pad, packed.shape[1]).view(torch.uint8),
+            ]
+        )
         codes = torch.cat([codes, codes.new_full((pad, codes.shape[1]), 127)])
-    return gemv.pack_weight(packed.view(torch.uint8), codes.view(torch.uint8), gemv.MXFP4)
+    return gemv.pack_weight(
+        packed.view(torch.uint8), codes.view(torch.uint8), gemv.MXFP4
+    )
 
 
 # ------------------------------------------------------------------ device
@@ -448,24 +550,36 @@ def _issue(p, r_w, t, wave, rg, lane, valid, i):
     if p.layout == "wave":
         off = ((t * WAVES + wave) * p.steps + i) * UNIT_WORDS + lane * 4
     off = valid.select(off, fx.Int32(OOB // 4))
-    return fx.Vector(bo.buffer_load(r_w, off, vec_width=4, dtype=T.i32, cache_modifier=CM_NT))
+    return fx.Vector(
+        bo.buffer_load(r_w, off, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+    )
 
 
 def _x_batches(k, p, tid, threads, part: int = 0):
     """x [rows, K] polled into LDS (row r at word r * pitch) by ``threads`` threads (``tid`` this one's index among
-    them): [(specs, LDS word offsets)] of at most POLL_MAX 2-pair specs a thread. ``kparts`` > 1: K slice ``part``."""
+    them): [(specs, LDS word offsets)] of at most POLL_MAX 2-pair specs a thread. ``kparts`` > 1: K slice ``part``.
+    """
     words_row = p.k // 2 // p.kparts
     specs_row = words_row // 2
     total = p.rows * specs_row
     a = k.mb[p.x]
     items = []
     for c in range(-(-total // threads)):
-        idx = fx.min(fx.max(fx.Int32(c * threads) + tid, fx.Int32(0)), fx.Int32(total - 1))
+        idx = fx.min(
+            fx.max(fx.Int32(c * threads) + tid, fx.Int32(0)), fx.Int32(total - 1)
+        )
         r, w2 = idx // specs_row, idx % specs_row
-        src = r * (p.k // 2) + part * words_row + w2 * 2 if p.kparts > 1 else r * words_row + w2 * 2
+        src = (
+            r * (p.k // 2) + part * words_row + w2 * 2
+            if p.kparts > 1
+            else r * words_row + w2 * 2
+        )
         items.append(((a, src, 2), r * p.pitch + w2 * 2))
     return [
-        ([s for s, _ in items[b : b + mb.POLL_MAX]], [d for _, d in items[b : b + mb.POLL_MAX]])
+        (
+            [s for s, _ in items[b : b + mb.POLL_MAX]],
+            [d for _, d in items[b : b + mb.POLL_MAX]],
+        )
         for b in range(0, len(items), mb.POLL_MAX)
     ]
 
@@ -478,7 +592,9 @@ def _dot(k, t, p):
     issue = partial(_issue, p, r_w, t, wave, rg, lane, valid)
     n_pre = min(p.prefetch, p.steps)
     lead = min(p.lead, n_pre)
-    if const_expr(p.race):  # issued ahead of the weights, into the LDS after the lead units (vmcnt is in order: the
+    if const_expr(
+        p.race
+    ):  # issued ahead of the weights, into the LDS after the lead units (vmcnt is in order: the
         # store waits for it alone), so its register is free before x's batches and the prefetch (12 rows: held
         # across x's landing it spilled one VGPR)
         par = _race_par(k, p)
@@ -491,7 +607,9 @@ def _dot(k, t, p):
         rocdl.sched_barrier(0)
         _race_put(k, p, par)
     batches = _x_batches(k, p, k.tid, THREADS)
-    rocdl.sched_barrier(0)  # keep the issue order: LLVM would sink the attempt below the weights
+    rocdl.sched_barrier(
+        0
+    )  # keep the issue order: LLVM would sink the attempt below the weights
     tries = [_try_batch(specs) for specs, _ in batches]
     rocdl.sched_barrier(0)
     if not p.late:
@@ -522,7 +640,9 @@ def _stream(k, p, t, rg, lane, valid, issue, q):
             rocdl.sched_barrier(0)
             if i + n_pre < p.steps:
                 q.append(issue(i + n_pre))
-            b = fx.ptr_load(xrow + i * (KSTEP // 2), result_type=fx.Vector.make_type(4, fx.Float32))
+            b = fx.ptr_load(
+                xrow + i * (KSTEP // 2), result_type=fx.Vector.make_type(4, fx.Float32)
+            )
             acc = mfma_bf16(q[i].bitcast(fx.BFloat16), b.bitcast(fx.BFloat16), acc)
         accs = [acc]
     else:
@@ -531,7 +651,9 @@ def _stream(k, p, t, rg, lane, valid, issue, q):
         accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(p.rc)]
         for i in range(p.steps):
             rocdl.sched_barrier(0)
-            if i and i % p.psteps == 0:  # the next K slice of x, once every wave is past the last one
+            if (
+                i and i % p.psteps == 0
+            ):  # the next K slice of x, once every wave is past the last one
                 gpu.barrier()
                 _land_x(k, p, i // p.psteps)
                 gpu.barrier()
@@ -539,10 +661,17 @@ def _stream(k, p, t, rg, lane, valid, issue, q):
                 q.append(issue(i + n_pre))
             j = i % p.psteps
             for ch in range(p.rc):
-                b = fx.ptr_load(xrows[ch] + j * (KSTEP // 2), result_type=fx.Vector.make_type(4, fx.Float32))
-                accs[ch] = mfma_bf16(q[i].bitcast(fx.BFloat16), b.bitcast(fx.BFloat16), accs[ch])
+                b = fx.ptr_load(
+                    xrows[ch] + j * (KSTEP // 2),
+                    result_type=fx.Vector.make_type(4, fx.Float32),
+                )
+                accs[ch] = mfma_bf16(
+                    q[i].bitcast(fx.BFloat16), b.bitcast(fx.BFloat16), accs[ch]
+                )
     rocdl.sched_barrier(0)
-    if const_expr(p.race):  # (after the barrier: the Philox and log math never above the MFMA loop's peak; the lane
+    if const_expr(
+        p.race
+    ):  # (after the barrier: the Philox and log math never above the MFMA loop's peak; the lane
         # an opaque copy, so none of the row math is hoisted out of the task loop and held across it: 18 rows spilled)
         seed0 = fx.Int32(fx.ptr_load(k.lds + (p.rpar + 2 * p.rows)))
         seed1 = fx.Int32(fx.ptr_load(k.lds + (p.rpar + 2 * p.rows + 1)))
@@ -554,13 +683,22 @@ def _stream(k, p, t, rg, lane, valid, issue, q):
             rrow = rlane % 16 + RG * ch
             rr = fx.min(rrow, fx.Int32(p.rows - 1))
             t = fx.Int32(fx.ptr_load(k.lds + (p.rpar + rr * 2))).bitcast(fx.Float32)
-            races = _races(t, fx.Int32(fx.ptr_load(k.lds + (p.rpar + rr * 2 + 1))).bitcast(fx.Float32))
+            races = _races(
+                t,
+                fx.Int32(fx.ptr_load(k.lds + (p.rpar + rr * 2 + 1))).bitcast(
+                    fx.Float32
+                ),
+            )
             race = (races, fx.Float32(1.0) / t * fx.Float32(LOG2E), rrow, seed0, seed1)
-        if const_expr(p.sample and not p.race_only):  # the logits as bf16 pairs into the rank's scratch (the scans)
+        if const_expr(
+            p.sample and not p.race_only
+        ):  # the logits as bf16 pairs into the rank's scratch (the scans)
             w01, w23 = bf16_pair(acc[0], acc[1]), bf16_pair(acc[2], acc[3])
             at = row * p.n2 + rg * (RG // 2) + (lane // 16) * 2
             ok = valid & (row < p.rows)
-            if const_expr(p.race and not p.race_lg):  # a race row's pick never scans them
+            if const_expr(
+                p.race and not p.race_lg
+            ):  # a race row's pick never scans them
                 ok = ok & (races.select(fx.Int32(1), fx.Int32(0)) == 0)
             _lg_put(k, p, ok, at, w01, w23)
         _top1(k, p, rg, lane, valid, acc, ch, race)
@@ -598,7 +736,9 @@ def _wave_put(k, p, kk, ii, ch=0):
     else:
         if (k.lane < RG) & (k.lane + RG * ch < p.rows):
             fx.ptr_store(kk, k.lds + (p.red + (k.wave * p.rows + k.lane + RG * ch) * 2))
-            fx.ptr_store(ii, k.lds + (p.red + (k.wave * p.rows + k.lane + RG * ch) * 2 + 1))
+            fx.ptr_store(
+                ii, k.lds + (p.red + (k.wave * p.rows + k.lane + RG * ch) * 2 + 1)
+            )
 
 
 @traced
@@ -622,14 +762,20 @@ def _task_put(k, p, t, first):
 
 def _pick(k, r, p):
     """Row r: the best of the ``tp x tasks`` entries -> the outputs."""
-    if const_expr(p.sample):  # the row's temperature, loaded first: its latency under the poll, not after it
+    if const_expr(
+        p.sample
+    ):  # the row's temperature, loaded first: its latency under the poll, not after it
         t = uniform(ld_i32(k.args[f"{p.name}.par"], 2 * r)).bitcast(fx.Float32)
         race = None
         if const_expr(p.race):
-            top_p = uniform(ld_i32(k.args[f"{p.name}.par"], 2 * r + 1)).bitcast(fx.Float32)
+            top_p = uniform(ld_i32(k.args[f"{p.name}.par"], 2 * r + 1)).bitcast(
+                fx.Float32
+            )
             race = _races(t, top_p).select(fx.Int32(1), fx.Int32(0))
     ents = p.tp * p.tasks
-    a = from_rank(k, p.top, 0) if p.tp > 1 else k.mb[p.top]  # slot (parity, 0); slot src at src x pairs
+    a = (
+        from_rank(k, p.top, 0) if p.tp > 1 else k.mb[p.top]
+    )  # slot (parity, 0); slot src at src x pairs
     specs = []
     for c in range(-(-ents // THREADS)):
         e = fx.min(fx.Int32(c * THREADS) + k.tid, fx.Int32(ents - 1))
@@ -663,13 +809,19 @@ SCAN_SPECS = 16  # at most this many a thread (unrolled): 4 x 16 x 512 = 32768 i
 SCAN_SLICES = 2
 COPIES = 16  # level 1 counts into copies (lane l: copy l % COPIES): its bins are sign and exponent, few take most
 S_H1C = S_GA + 4  # the copies, 256 u64 each
-S_JUNK = S_H1C + COPIES * 2 * 256  # a word a lane: the zero masses' atomics (no conflicts)
+S_JUNK = (
+    S_H1C + COPIES * 2 * 256
+)  # a word a lane: the zero masses' atomics (no conflicts)
 S_WORDS = S_JUNK + 2 * 64
 S_T = S_H1C  # the gathers of the ranks' records (``_gather``): the copies' words, free by then
 H1_ROW = 2 * 256  # values a row of ``<name>.h1``: 256 x (mass lo, hi)
-H2_ROW = 4 * 256 + 4  # values a row of ``<name>.h2``: 256 x (mass lo, hi, best lo, hi), the above-best, a pad pair
+H2_ROW = (
+    4 * 256 + 4
+)  # values a row of ``<name>.h2``: 256 x (mass lo, hi, best lo, hi), the above-best, a pad pair
 FIX_LOG2 = 36.0
-FIX = 2.0**FIX_LOG2  # mass fixed point: a row's 129280 masses (each <= 1) sum below 2^53, so f64 sums of them are exact
+FIX = (
+    2.0**FIX_LOG2
+)  # mass fixed point: a row's 129280 masses (each <= 1) sum below 2^53, so f64 sums of them are exact
 LOG2E = 1.4426950408889634
 I64_MIN_HI = INT_MIN  # an empty best: (lo 0, hi INT_MIN)
 PHILOX_M, PHILOX_W = 0xD256D193, 0x9E3779B9 - 2**32
@@ -682,7 +834,9 @@ def _lg_put(k, p, ok, at, w01, w23):
 
 
 def _i64(lo, hi):
-    return fx.Vector.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32).bitcast(fx.Int64)[0]
+    return fx.Vector.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32).bitcast(
+        fx.Int64
+    )[0]
 
 
 def _words(v):
@@ -700,13 +854,23 @@ def _f64_words(x):
 
 
 def _f64_of(lo, hi):
-    return fx.Vector.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32).bitcast(fx.Float64)[0]
+    return fx.Vector.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32).bitcast(
+        fx.Float64
+    )[0]
 
 
 def _wave_prefix_f64(x):
     """Inclusive prefix sum of f64 ``x`` over the wave's lanes (lane 0 first), ``topk.wave_prefix``'s DPP steps on
-    both words (shifted-in zeros are +0.0). Exact when every partial sum is an integer below 2^53 (the masses)."""
-    for ctrl, rmask in ((0x111, 0xF), (0x112, 0xF), (0x114, 0xF), (0x118, 0xF), (0x142, 0xA), (0x143, 0xC)):
+    both words (shifted-in zeros are +0.0). Exact when every partial sum is an integer below 2^53 (the masses).
+    """
+    for ctrl, rmask in (
+        (0x111, 0xF),
+        (0x112, 0xF),
+        (0x114, 0xF),
+        (0x118, 0xF),
+        (0x142, 0xA),
+        (0x143, 0xC),
+    ):
         lo, hi = _f64_words(x)
         slo = fx.Int32(update_dpp_i32(fx.Int32(0), lo, ctrl, rmask, 0xF, False))
         shi = fx.Int32(update_dpp_i32(fx.Int32(0), hi, ctrl, rmask, 0xF, False))
@@ -741,7 +905,8 @@ def fma_f32(a, b, c):
 
 def _mass(b, m, c):
     """The fixed-point mass of bf16 logit ``b``: exp2((b - M) log2e / T) 2^36 (an f32: 24 significant bits, as an
-    fp32 probability), to the nearest integer, as Int64 (f32 only: high word v / 2^32, low word the exact rest)."""
+    fp32 probability), to the nearest integer, as Int64 (f32 only: high word v / 2^32, low word the exact rest).
+    """
     return _mass_v(b, m, c)[0]
 
 
@@ -749,7 +914,9 @@ def _mass_v(b, m, c):
     """(``_mass``, the f32 v it rounds)."""
     v = hw_exp2(fx.Float32(fma_f32((b - m), c, fx.Float32(FIX_LOG2))))
     hi = (v * fx.Float32(2.0**-32)).to(fx.Int32)  # < 2^4
-    rest = v - hi.to(fx.Float32) * fx.Float32(2.0**32) + fx.Float32(0.5)  # exact, in [0, 2^32)
+    rest = (
+        v - hi.to(fx.Float32) * fx.Float32(2.0**32) + fx.Float32(0.5)
+    )  # exact, in [0, 2^32)
     return _i64(rest.to(fx.Uint32), hi), v
 
 
@@ -768,9 +935,14 @@ def _race_key(v, word, gid):
     race, score = v / E with v its mass (``_mass_v``) and E = -log2 U, U = (word >> 8 + 1/2) 2^-24 in (0, 1) (an
     exponential variable, scaled): argmax v / E draws id i with probability v_i / sum v, as the Gumbel-max
     argmax (b / T - ln(-ln U)) does, with one log instead of two."""
-    u = ((word >> 8) & 0xFFFFFF).to(fx.Float32) * fx.Float32(2.0**-24) + fx.Float32(2.0**-25)
+    u = ((word >> 8) & 0xFFFFFF).to(fx.Float32) * fx.Float32(2.0**-24) + fx.Float32(
+        2.0**-25
+    )
     score = v * hw_rcp(-hw_log2(u))
-    return _i64(fx.Int32(0x7FFFFFFF) - gid, order_key(score.bitcast(fx.Int32)) ^ fx.Int32(INT_MIN))
+    return _i64(
+        fx.Int32(0x7FFFFFFF) - gid,
+        order_key(score.bitcast(fx.Int32)) ^ fx.Int32(INT_MIN),
+    )
 
 
 def _races(t, top_p):
@@ -794,10 +966,13 @@ def _exp_var(word):
     """E = -log2 U (an exponential variable, in log2 units), U = (k + 1/2) 2^-24 for the word's top 24 bits k: in
     (0, 1) exactly. An f32 U would round in the upper half (the top cell to 1.0: E 0), so the upper half works from
     x = 1 - U = (2^24 - 1 - k + 1/2) 2^-24 (exact, below 1/2): -log2(1 - x) by its series below 2^-5 (to x^5: within
-    2^-25 relative), else the log of 1 - x rounded (within 2^-25 absolute: 2^-20 of x, relative)."""
+    2^-25 relative), else the log of 1 - x rounded (within 2^-25 absolute: 2^-20 of x, relative).
+    """
     kk = (word >> 8) & 0xFFFFFF
     up = kk >= fx.Int32(1 << 23)
-    x = (up.select(fx.Int32(0xFFFFFF) - kk, kk).to(fx.Float32) + fx.Float32(0.5)) * fx.Float32(2.0**-24)
+    x = (
+        up.select(fx.Int32(0xFFFFFF) - kk, kk).to(fx.Float32) + fx.Float32(0.5)
+    ) * fx.Float32(2.0**-24)
     lg = -hw_log2(up.select(fx.Float32(1.0) - x, x))
     ser = fma_f32(x, fma_f32(x, fma_f32(x, fma_f32(x, fx.Float32(0.2), fx.Float32(0.25)), fx.Float32(1 / 3)),
                              fx.Float32(0.5)), fx.Float32(1.0))  # fmt: skip
@@ -808,14 +983,18 @@ def _race_keys(k, p, acc, base, races, c, row, seed0, seed1):
     """The lane's 4 keys of row ``row`` (ids ``base`` + e of this rank): racing (``races``), the order key of the race
     score b log2(e) / T - log2(E), b the bf16 logit, ``c`` = log2(e) / T, E = ``_exp_var`` of the id's Philox word (the
     pick's counter mapping: ``_cand``); else the greedy key."""
-    gid = base + (k.rank * p.n if p.tp > 1 else fx.Int32(0))  # the global id of e = 0 (even: n is a multiple of 4)
+    gid = base + (
+        k.rank * p.n if p.tp > 1 else fx.Int32(0)
+    )  # the global id of e = 0 (even: n is a multiple of 4)
     us = []
     for h in range_constexpr(2):
         u0, u1 = _philox(((gid >> 1) + h) | (row << p.cshift), k.tag ^ seed1, seed0)
         us += [u0, u1]
     keys = []
     for e in range_constexpr(4):
-        bits = fma_f32(bf16_round(acc[e]), c, -hw_log2(_exp_var(us[e]))).bitcast(fx.Int32)
+        bits = fma_f32(bf16_round(acc[e]), c, -hw_log2(_exp_var(us[e]))).bitcast(
+            fx.Int32
+        )
         bits = (bits == fx.Int32(INT_MIN)).select(fx.Int32(0), bits)  # -0 as +0
         keys.append(races.select(order_key(bits), _key(p, acc[e])))
     return keys
@@ -831,7 +1010,12 @@ def _pick_out_s(k, p, r, kk, ii, t, race=None):
         kb = fx.Int32(fx.ptr_load(k.lds + 0))
         ib = fx.Int32(fx.ptr_load(k.lds + 1))
         for w in range_constexpr(1, WAVES):
-            kb, ib = _take(kb, ib, fx.Int32(fx.ptr_load(k.lds + w * 2)), fx.Int32(fx.ptr_load(k.lds + (w * 2 + 1))))
+            kb, ib = _take(
+                kb,
+                ib,
+                fx.Int32(fx.ptr_load(k.lds + w * 2)),
+                fx.Int32(fx.ptr_load(k.lds + (w * 2 + 1))),
+            )
         fx.ptr_store(kb, k.lds + S_BC)
         fx.ptr_store(ib, k.lds + (S_BC + 1))
         if t <= fx.Float32(0.0):
@@ -839,10 +1023,14 @@ def _pick_out_s(k, p, r, kk, ii, t, race=None):
             if const_expr(p.vals):
                 bo.buffer_store(key_bits(kb), rsrc(k.args[f"{p.name}.vals"]), r)
         if const_expr(race is not None):
-            if race != 0:  # the dot's race winner; vals -inf: every id kept (the scans' value at top_p 1)
+            if (
+                race != 0
+            ):  # the dot's race winner; vals -inf: every id kept (the scans' value at top_p 1)
                 bo.buffer_store(ib, rsrc(k.args[f"{p.name}.ids"]), r)
                 if const_expr(p.vals):
-                    bo.buffer_store(fx.Int32(-8388608), rsrc(k.args[f"{p.name}.vals"]), r)
+                    bo.buffer_store(
+                        fx.Int32(-8388608), rsrc(k.args[f"{p.name}.vals"]), r
+                    )
     gpu.barrier()
 
 
@@ -855,12 +1043,15 @@ def _sample_if(k, p, r, t, race=None):
 def _lg_specs(k, p, r, s: int = 0):
     """This thread's 16-byte specs of row r of ``<name>.lg`` (quad q = tid + THREADS c, clamped) and their
     validity (Python True where every thread's quad is in range). ``s``: the scan's slice (``p.scan_slices`` > 1:
-    columns c of slice s only, from an opaque copy of tid, so a slice's addresses are not hoisted and held)."""
+    columns c of slice s only, from an opaque copy of tid, so a slice's addresses are not hoisted and held).
+    """
     a = k.mb[p.lg]
     specs, oks = [], []
     cols = -(-p.quads // THREADS)
     tid = k.tid if p.scan_slices == 1 else fresh(k.tid)
-    for c in range(s * SCAN_SPECS, min(cols, (s + 1) * SCAN_SPECS) if p.scan_slices > 1 else cols):
+    for c in range(
+        s * SCAN_SPECS, min(cols, (s + 1) * SCAN_SPECS) if p.scan_slices > 1 else cols
+    ):
         q = fx.Int32(c * THREADS) + tid
         specs.append((a, r * p.n2 + fx.min(q, fx.Int32(p.quads - 1)) * 2, 2))
         oks.append(True if (c + 1) * THREADS <= p.quads else q < p.quads)
@@ -871,12 +1062,16 @@ def _sample_row(k, p, r, t):
     lds64 = fx.recast_iter(fx.Int64, k.lds)
     tid, lane = k.tid, k.lane
     c = fx.Float32(1.0) / t * fx.Float32(LOG2E)
-    m = key_bits(fx.Int32(fx.ptr_load(k.lds + S_BC))).bitcast(fx.Float32)  # the row's max bf16 logit (all ranks)
+    m = key_bits(fx.Int32(fx.ptr_load(k.lds + S_BC))).bitcast(
+        fx.Float32
+    )  # the row's max bf16 logit (all ranks)
     first = k.rank * p.n if p.tp > 1 else fx.Int32(0)
     # 0. clear: the masses to 0, the bests to empty, the level-1 copies to 0
     for i in range_constexpr(-(-(2 * 256 + 1) // THREADS)):  # H2 (0), G and GA (empty)
         e = fx.min(fx.Int32(i * THREADS) + tid, fx.Int32(2 * 256))
-        fx.ptr_store((e < 256).select(fx.Int64(0), _i64(0, I64_MIN_HI)), lds64 + (S_H2 // 2 + e))
+        fx.ptr_store(
+            (e < 256).select(fx.Int64(0), _i64(0, I64_MIN_HI)), lds64 + (S_H2 // 2 + e)
+        )
     for i in range_constexpr(COPIES * 256 // THREADS):
         fx.ptr_store(fx.Int64(0), lds64 + (S_H1C // 2 + i * THREADS + tid))
     gpu.barrier()
@@ -885,7 +1080,9 @@ def _sample_row(k, p, r, t):
     copy = S_H1C // 2 + (lane % COPIES) * 256
     for s in range_constexpr(p.scan_slices):
         for ci in range_constexpr(len(specs)):
-            if const_expr(ci % SCAN_BATCH == 0):  # a batch polled, then used (its words only live)
+            if const_expr(
+                ci % SCAN_BATCH == 0
+            ):  # a batch polled, then used (its words only live)
                 got = mb.poll(specs[ci : ci + SCAN_BATCH], k.tag)
             for wi in range_constexpr(2):
                 for h in range_constexpr(2):
@@ -899,10 +1096,14 @@ def _sample_row(k, p, r, t):
     gpu.barrier()
     _sum_copies(k)
     _put_h1(k, p, r)
-    _level1(k, p, r, uniform(ld_i32(k.args[f"{p.name}.par"], 2 * r + 1)).bitcast(fx.Float32))
+    _level1(
+        k, p, r, uniform(ld_i32(k.args[f"{p.name}.par"], 2 * r + 1)).bitcast(fx.Float32)
+    )
     gpu.barrier()
     b1 = fx.Int32(fx.ptr_load(k.lds + (S_BC + 2)))
-    seed0 = uniform(ld_i32(k.args[f"{p.name}.par"], 2 * p.rows))  # (loaded here: not held across level 1)
+    seed0 = uniform(
+        ld_i32(k.args[f"{p.name}.par"], 2 * p.rows)
+    )  # (loaded here: not held across level 1)
     seed1 = uniform(ld_i32(k.args[f"{p.name}.par"], 2 * p.rows + 1))
     # 2. level 2: the rank's masses and bests of bin B1's keys, its best above B1
     best = _i64(0, I64_MIN_HI)
@@ -921,7 +1122,9 @@ def _sample_row(k, p, r, t):
                     b1x = ok.select(b1, fx.Int32(1 << 20))
                 else:
                     b1x = b1
-                best = _cand(k, b0, key0, b1v, key1, b1x, m, c, r, gid0, seed0, seed1, best)
+                best = _cand(
+                    k, b0, key0, b1v, key1, b1x, m, c, r, gid0, seed0, seed1, best
+                )
     fx.atomic_max(lds64 + S_GA // 2, best, syncscope="workgroup")
     gpu.barrier()
     _put_h2(k, p, r)
@@ -936,7 +1139,9 @@ def _cand(k, b0, key0, b1v, key1, b1, m, c, r, gid0, seed0, seed1, best):
     (gid0 / 2 | row << 16, tag ^ seed1), key seed0."""
     if ((key0 >> 8) >= b1) | ((key1 >> 8) >= b1):
         lds64 = fx.recast_iter(fx.Int64, k.lds)
-        gid0 = fresh(gid0)  # its math here, not hoisted for every pair of the scan and held across it
+        gid0 = fresh(
+            gid0
+        )  # its math here, not hoisted for every pair of the scan and held across it
         junk = fx.Int32(S_JUNK // 2) + (fresh(k.tid) & 63)
         u0, u1 = _philox((gid0 >> 1) | (r << 16), k.tag ^ seed1, seed0)
         for h, (b, key, u) in enumerate(((b0, key0, u0), (b1v, key1, u1))):
@@ -948,7 +1153,9 @@ def _cand(k, b0, key0, b1v, key1, b1, m, c, r, gid0, seed0, seed1, best):
             at = inb.select(fx.Int32(S_H2 // 2) + (key & 255), junk)
             fx.atomic_add(lds64 + at, inb.select(q, fx.Int64(0)), syncscope="workgroup")
             at = inb.select(fx.Int32(S_G // 2) + (key & 255), junk)
-            fx.atomic_max(lds64 + at, inb.select(g, _i64(0, I64_MIN_HI)), syncscope="workgroup")
+            fx.atomic_max(
+                lds64 + at, inb.select(g, _i64(0, I64_MIN_HI)), syncscope="workgroup"
+            )
     return best
 
 
@@ -967,7 +1174,9 @@ def _sum_copies(k):
 def _put_h1(k, p, r):
     """Threads 0 .. 255: bin ``tid``'s mass into every rank's ``<name>.h1`` (row r)."""
     if fresh(k.tid) < 256:  # (an opaque copy: the mask not hoisted to the stage start)
-        lo, hi = _words(fx.ptr_load(fx.recast_iter(fx.Int64, k.lds) + (S_H1 // 2 + k.tid)))
+        lo, hi = _words(
+            fx.ptr_load(fx.recast_iter(fx.Int64, k.lds) + (S_H1 // 2 + k.tid))
+        )
         at = r * H1_ROW + k.tid * 2
         if const_expr(p.tp > 1):
             for dst in range_constexpr(p.tp):
@@ -991,12 +1200,19 @@ def _level1(k, p, r, top_p):
         cnt = []
         for j in range_constexpr(4):  # bin 255 - 4 l - j
             b = fx.Int32(255 - j) - lane * 4
-            cnt.append(_f64(fx.ptr_load(lds64 + (S_T // 2 + b)) + fx.ptr_load(lds64 + (S_T // 2 + 256 + b))))
+            cnt.append(
+                _f64(
+                    fx.ptr_load(lds64 + (S_T // 2 + b))
+                    + fx.ptr_load(lds64 + (S_T // 2 + 256 + b))
+                )
+            )
         tot = (cnt[0] + cnt[1]) + (cnt[2] + cnt[3])
         incl = _wave_prefix_f64(tot)
         z = _readlane_f64(incl, 63)
         pz = top_p.to(fx.Float64) * z
-        pz = (top_p >= fx.Float32(1.0)).select(fx.Float64(float("inf")), pz)  # top_p 1: no filter (ATOM's too)
+        pz = (top_p >= fx.Float32(1.0)).select(
+            fx.Float64(float("inf")), pz
+        )  # top_p 1: no filter (ATOM's too)
         above = incl - tot
         hit_w, s_hit = fx.Int32(-1), fx.Float64(0.0)
         for j in range_constexpr(4):
@@ -1010,7 +1226,10 @@ def _level1(k, p, r, top_p):
         if lane == 0:
             slo, shi = _f64_words(s_b1)
             plo, phi = _f64_words(pz)
-            fx.ptr_store(fx.Vector.from_elements([b1, b1, slo, shi, plo, phi], fx.Int32), k.lds + (S_BC + 2))
+            fx.ptr_store(
+                fx.Vector.from_elements([b1, b1, slo, shi, plo, phi], fx.Int32),
+                k.lds + (S_BC + 2),
+            )
 
 
 @traced
@@ -1090,8 +1309,18 @@ def _level2(k, p, r):
         cnt, bst = [], []
         for j in range_constexpr(4):  # key 255 - 4 l - j
             f = fx.Int32(255 - j) - lane * 4
-            cnt.append(_f64(fx.ptr_load(lds64 + (S_T // 2 + f)) + fx.ptr_load(lds64 + (S_T // 2 + 256 + f))))
-            bst.append(fx.max(fx.ptr_load(lds64 + (S_T // 2 + 512 + f)), fx.ptr_load(lds64 + (S_T // 2 + 768 + f))))
+            cnt.append(
+                _f64(
+                    fx.ptr_load(lds64 + (S_T // 2 + f))
+                    + fx.ptr_load(lds64 + (S_T // 2 + 256 + f))
+                )
+            )
+            bst.append(
+                fx.max(
+                    fx.ptr_load(lds64 + (S_T // 2 + 512 + f)),
+                    fx.ptr_load(lds64 + (S_T // 2 + 768 + f)),
+                )
+            )
         tot = (cnt[0] + cnt[1]) + (cnt[2] + cnt[3])
         above = s_b1 + (_wave_prefix_f64(tot) - tot)
         b1 = fx.Int32(fx.ptr_load(k.lds + (S_BC + 2)))
@@ -1099,14 +1328,18 @@ def _level2(k, p, r):
         for j in range_constexpr(4):
             keep = above < pz
             win = fx.max(win, keep.select(bst[j], _i64(0, I64_MIN_HI)))
-            tau = keep.select(fx.min(tau, (b1 << 8) + (fx.Int32(255 - j) - lane * 4)), tau)
+            tau = keep.select(
+                fx.min(tau, (b1 << 8) + (fx.Int32(255 - j) - lane * 4)), tau
+            )
             above = above + cnt[j]
         win = _wave_max_i64(win)
         tau = -_wave_max_i32(-tau)
         lo, hi = _words(win)
         if lane == 0:
             bo.buffer_store(fx.Int32(0x7FFFFFFF) - lo, rsrc(k.args[f"{p.name}.ids"]), r)
-            if const_expr(p.vals):  # the nucleus: every bf16 logit >= this (-inf: every token)
+            if const_expr(
+                p.vals
+            ):  # the nucleus: every bf16 logit >= this (-inf: every token)
                 lowest = key_bits(tau << 16) & fx.Int32(-65536)
                 lowest = (b1 < 0).select(fx.Int32(-8388608), lowest)
                 bo.buffer_store(lowest, rsrc(k.args[f"{p.name}.vals"]), r)

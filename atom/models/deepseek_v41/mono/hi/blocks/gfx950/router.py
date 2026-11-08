@@ -96,12 +96,24 @@ class _Plan:
     score_func: str
     part: str  # "": scores from the ``scores`` channel; else GatheredDot's slice partials (``slices`` of them)
     slices: int
-    scores_by: str = "wave0"  # the dense mode's s and biased scores: "wave0", "waves" or "fused" (module docstring)
-    thresh: bool = False  # topk "thresh": ``wave_topk_won_thresh`` (the module docstring)
-    landed: bool = False  # tp_cols gather, topk "thresh": s and the biased bits computed at landing, read from LDS
-    consumer: bool = False  # the route in the consumer's rt, a wave a row (``route_lds_rows``)
-    hoist: bool = False  # tp_cols gather: the peer bases before the remote puts (``_tp_sum_put``)
-    split_land: bool = False  # tp_cols gather: the landing by the waves that did not put (``_tp_gather``)
+    scores_by: str = (
+        "wave0"  # the dense mode's s and biased scores: "wave0", "waves" or "fused" (module docstring)
+    )
+    thresh: bool = (
+        False  # topk "thresh": ``wave_topk_won_thresh`` (the module docstring)
+    )
+    landed: bool = (
+        False  # tp_cols gather, topk "thresh": s and the biased bits computed at landing, read from LDS
+    )
+    consumer: bool = (
+        False  # the route in the consumer's rt, a wave a row (``route_lds_rows``)
+    )
+    hoist: bool = (
+        False  # tp_cols gather: the peer bases before the remote puts (``_tp_sum_put``)
+    )
+    split_land: bool = (
+        False  # tp_cols gather: the landing by the waves that did not put (``_tp_gather``)
+    )
 
 
 class MoERouter(Block):
@@ -115,13 +127,21 @@ class MoERouter(Block):
             raise NotImplementedError(f"MoERouter {name}: score_func {score_func!r} (sqrtsoftplus, sigmoid, "
                                       "softmax_topk)")  # fmt: skip
         if score_func == "softmax_topk" and scores != "wave0":
-            raise ValueError(f"MoERouter {name}: softmax_topk computes its scores on wave 0 (scores='wave0')")
+            raise ValueError(
+                f"MoERouter {name}: softmax_topk computes its scores on wave 0 (scores='wave0')"
+            )
         if n % 64 or n > 1024 or k > WAVE_MAX_K:
-            raise ValueError(f"MoERouter {name}: n a multiple of 64 up to 1024, k <= {WAVE_MAX_K} (n {n}, k {k})")
+            raise ValueError(
+                f"MoERouter {name}: n a multiple of 64 up to 1024, k <= {WAVE_MAX_K} (n {n}, k {k})"
+            )
         for ch in (idx, weights):
             if ch.fmt is not Fmt.F32 or ch.width != k or ch.flagged:
-                raise ValueError(f"MoERouter {name}: idx / weights are tagged F32 channels of width {k}")
-        if scores not in ("wave0", "waves", "fused") or (scores != "wave0" and (not kslices or n // 64 > WAVES)):
+                raise ValueError(
+                    f"MoERouter {name}: idx / weights are tagged F32 channels of width {k}"
+                )
+        if scores not in ("wave0", "waves", "fused") or (
+            scores != "wave0" and (not kslices or n // 64 > WAVES)
+        ):
             raise ValueError(f"MoERouter {name}: scores 'wave0', 'waves' or 'fused' (kslices, n / 64 <= {WAVES}): "
                              f"{scores!r}")  # fmt: skip
         self.name, self.n, self.k, self.scores_by = name, n, k, scores
@@ -133,23 +153,36 @@ class MoERouter(Block):
         # go out one destination after another; the route stage then only gathers (``_tp_push``)
         self.tp_push = tp_push
         # the top-k (module docstring): "heads" (sorted heads / scanning rounds) or "thresh" (a bound + a rank count)
-        if topk not in ("heads", "thresh") or (topk == "thresh" and (score_func == "softmax_topk" or tp_local)):
-            raise ValueError(f"MoERouter {name}: topk 'heads' or 'thresh' (not softmax_topk / tp_local): {topk!r}")
+        if topk not in ("heads", "thresh") or (
+            topk == "thresh" and (score_func == "softmax_topk" or tp_local)
+        ):
+            raise ValueError(
+                f"MoERouter {name}: topk 'heads' or 'thresh' (not softmax_topk / tp_local): {topk!r}"
+            )
         self.topk = topk
         # the route computed by its consumer (``MoEExperts(route_from=)``, ``route_lds_rows``): the dot's stages only
         # (every rank all n experts at TP; no route stage, idx / weights unwritten)
         self.consumer = consumer
         self.tp_hoist = tp_hoist  # tp_cols gather: the peer bases loaded before the remote puts (``_tp_sum_put``)
-        self.tp_split_land = tp_split_land  # tp_cols gather: the landing by the waves that did not put
+        self.tp_split_land = (
+            tp_split_land  # tp_cols gather: the landing by the waves that did not put
+        )
         if consumer and (tp_cols or not kslices or score_func == "softmax_topk"):
             raise ValueError(f"MoERouter {name}: consumer is a plain dot's (kslices, no tp_cols) sigmoid / "
                              "sqrtsoftplus route")  # fmt: skip
         if tp_local and (not tp_cols or score_func != "sigmoid" or WAVE_MAX_K < k):
             raise ValueError(f"MoERouter {name}: tp_local is a sigmoid tp_cols route")
         if tp_cols and (scores != "wave0" or k_dot is not None):
-            raise ValueError(f"MoERouter {name}: tp_cols computes the scores on wave 0 from a plain dot")
+            raise ValueError(
+                f"MoERouter {name}: tp_cols computes the scores on wave 0 from a plain dot"
+            )
         self.norm = norm
-        self.x, self.weight, self.kslices, self.dot_tiles = x, weight, kslices, dot_tiles
+        self.x, self.weight, self.kslices, self.dot_tiles = (
+            x,
+            weight,
+            kslices,
+            dot_tiles,
+        )
         # k_dot: the weight's K when x is narrower (``GatheredDot(k=)``: x's elements past its width read as zero)
         self.dot = None if tp_cols else GatheredDot(f"{name}.dot", x, weight, self.scores, kslices=kslices,
                                                     sum_stage=False, tiles=dot_tiles, norm=norm, k=k_dot)  # fmt: skip
@@ -164,20 +197,24 @@ class MoERouter(Block):
                      self.scores_by,
                      self.topk == "thresh", consumer=self.consumer)  # fmt: skip
 
-
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.route_plan(sc)
         part = p.part
         if p.scores_by != "wave0" and not part:
-            raise ValueError(f"MoERouter {self.name}: scores {p.scores_by!r} needs the dot's slice partials (kslices)")
+            raise ValueError(
+                f"MoERouter {self.name}: scores {p.scores_by!r} needs the dot's slice partials (kslices)"
+            )
         rname = f"{self.name}.route"
-        writes = tuple(self.idx.regions(sc.rows, (rname,))) + tuple(self.weights.regions(sc.rows, (rname,)))
-        tasks, lds = (sc.rows, _slots_at(p) + 2 * self.k) if part else (-(-sc.rows // WAVES), 0)
+        writes = tuple(self.idx.regions(sc.rows, (rname,))) + tuple(
+            self.weights.regions(sc.rows, (rname,))
+        )
+        tasks, lds = (
+            (sc.rows, _slots_at(p) + 2 * self.k) if part else (-(-sc.rows // WAVES), 0)
+        )
         args = (self.bias,)
         route = Stage(rname, tasks, partial(_route, p=p), lds_words=lds, writes=writes, args=args,
                       key=(p,), row_tasks=1 if part else 0)  # fmt: skip
         return self.dot.stages(sc) + [route]
-
 
     def pack_tp_table(self, table, rank: int, tp: int):
         """tp_cols: rank ``rank``'s rows of the [n, K] table (its experts)."""
@@ -214,7 +251,8 @@ def _score(p, x):
 
 def _per(p) -> int:
     """Scores a lane holds in the route: n / 64; a sigmoid route with k > n / 64 pads to k a lane (the indices past
-    n never win), so the sorted-heads top-k (``wave_topk_won_full``, k <= a lane's count) serves it."""
+    n never win), so the sorted-heads top-k (``wave_topk_won_full``, k <= a lane's count) serves it.
+    """
     per = p.n // 64
     return max(per, p.k) if p.score_func == "sigmoid" and not p.part else per
 
@@ -222,11 +260,18 @@ def _per(p) -> int:
 def _route(k, t, p):
     """Row t x WAVES + wave (a row past the step re-reads the last row, puts nothing). With the dot's slice
     partials (``p.part``): row t, its partials polled by all 8 waves (slices w, w + 8, ..) into LDS, then every
-    wave adds them in slice order (``GatheredDot``'s ``.sum`` order: the same bits) and wave 0 puts."""
+    wave adds them in slice order (``GatheredDot``'s ``.sum`` order: the same bits) and wave 0 puts.
+    """
     per = _per(p)
-    if const_expr(p.scores_by != "wave0"):  # this lane's column's bias (wave w < n / 64: column 64 w + lane)
-        bias = fx.Float32(bo.buffer_load(rsrc(k.args[p.bias]), _col(k, p), vec_width=1, dtype=T.f32))
-    if const_expr(p.scores_by == "fused"):  # each wave its columns' partials, sum and scores; wave 0 the rest
+    if const_expr(
+        p.scores_by != "wave0"
+    ):  # this lane's column's bias (wave w < n / 64: column 64 w + lane)
+        bias = fx.Float32(
+            bo.buffer_load(rsrc(k.args[p.bias]), _col(k, p), vec_width=1, dtype=T.f32)
+        )
+    if const_expr(
+        p.scores_by == "fused"
+    ):  # each wave its columns' partials, sum and scores; wave 0 the rest
         _fused_scores(k, p, t, bias)
         gpu.barrier()
         _route_tail(k, p, t, k.wave == 0, None, None, per)
@@ -240,7 +285,11 @@ def _route(k, t, p):
         row = t * WAVES + k.wave
         rowc = fx.min(row, p.rows - 1)
         live = row < p.rows
-        cl = [fx.min(k.lane * per + d, fx.Int32(p.n - 1)) for d in range(per)] if per * 64 > p.n else None
+        cl = (
+            [fx.min(k.lane * per + d, fx.Int32(p.n - 1)) for d in range(per)]
+            if per * 64 > p.n
+            else None
+        )
         got = mb.poll([(k.mb[p.scores], rowc * p.n + (cl[d] if cl else k.lane * per + d), 1) for d in range(per)],
                       k.tag)  # fmt: skip
         vals = [g[0].bitcast(fx.Float32) for g in got]
@@ -257,17 +306,22 @@ def _route(k, t, p):
 @traced
 def _route_tail(k, p, rowc, live, vals, bias, per):
     """The scores, the top-k and the puts, by the waves whose results are used: with the slice partials (a task a
-    row) wave 0 only (the other waves only competed for its SIMDs); else a row a wave."""
+    row) wave 0 only (the other waves only competed for its SIMDs); else a row a wave.
+    """
     if const_expr(p.part != ""):
         if k.wave == 0:
             _route_rows(k, p, rowc, live, vals, bias, per)
 
 
 def _route_rows(k, p, rowc, live, vals, bias, per):
-    if const_expr(p.scores_by != "wave0"):  # the lane's per columns' s and biased bits, from ``_waves_scores``
+    if const_expr(
+        p.scores_by != "wave0"
+    ):  # the lane's per columns' s and biased bits, from ``_waves_scores``
         at = (p.slices + 1) * p.n + k.lane * per
         s = [fx.Float32(fx.ptr_load(k.ldsf + (at + d))) for d in range(per)]
-        biased = [fresh(fx.Int32(fx.ptr_load(k.lds + (at + p.n + d)))) for d in range(per)]
+        biased = [
+            fresh(fx.Int32(fx.ptr_load(k.lds + (at + p.n + d)))) for d in range(per)
+        ]
     # every lane holds n / 64 valid scores: the sorted-heads top-k when k <= n / 64 (the same winners)
     if const_expr(p.k <= per):
         won = wave_topk_won_full(p.k, biased, k.lane)
@@ -280,7 +334,9 @@ def _route_rows(k, p, rowc, live, vals, bias, per):
     tot = wave_sum(part)
     cnt = popcount(won)
     pos = wave_incl_scan(cnt, k.lane) - cnt
-    if const_expr(p.part != ""):  # a task a row (LDS): the winners to their slots, then lane j puts slot j
+    if const_expr(
+        p.part != ""
+    ):  # a task a row (LDS): the winners to their slots, then lane j puts slot j
         _route_slots(k, p, won, s, pos)
         _route_put_lanes(k, p, rowc, live, tot)
 
@@ -290,12 +346,15 @@ def _land_partials(k, p, row, per):
     order into LDS row ``slices``; returns this lane's ``per`` scores."""
     n2 = 2 if per % 2 == 0 else 1
     for j in range(-(-p.slices // WAVES)):
-        sl = fx.min(k.wave + j * WAVES, fx.Int32(p.slices - 1))  # a wave past the last slice re-lands it
+        sl = fx.min(
+            k.wave + j * WAVES, fx.Int32(p.slices - 1)
+        )  # a wave past the last slice re-lands it
         base = row * (p.slices * p.n) + sl * p.n + k.lane * per
         got = mb.poll([(k.mb[p.part], base + d, n2) for d in range(0, per, n2)], k.tag)
         for d, g in zip(range(0, per, n2), got, strict=True):
             fx.ptr_store(
-                fx.Vector.from_elements(g, fx.Int32).bitcast(fx.Float32), k.ldsf + (sl * p.n + k.lane * per + d)
+                fx.Vector.from_elements(g, fx.Int32).bitcast(fx.Float32),
+                k.ldsf + (sl * p.n + k.lane * per + d),
             )
     gpu.barrier()
     # thread c: columns c, c + 512, .. < n, each one's partials added in slice order -> LDS row ``slices`` (few live
@@ -309,7 +368,10 @@ def _land_partials(k, p, row, per):
             v = v + fx.Float32(fx.ptr_load(k.ldsf + (sl * p.n + col)))
         _store_if(k.ldsf + (p.slices * p.n + col), v, c < p.n)
     gpu.barrier()
-    return [fx.Float32(fx.ptr_load(k.ldsf + (p.slices * p.n + k.lane * per + d))) for d in range(per)]
+    return [
+        fx.Float32(fx.ptr_load(k.ldsf + (p.slices * p.n + k.lane * per + d)))
+        for d in range(per)
+    ]
 
 
 @traced
@@ -342,8 +404,14 @@ def _route_put_lanes(k, p, row, live, tot):
     if live & (k.lane < p.k):
         at = _slots_at(p)
         e = fx.min(k.lane, fx.Int32(p.k - 1))
-        w = fx.Float32(fx.ptr_load(k.ldsf + (at + p.k + e))) / (tot + fx.Float32(1e-20)) * fx.Float32(p.route_scale)
-        mb.put(k.mb[p.idx], row * p.k + e, fx.Int32(fx.ptr_load(k.lds + (at + e))), k.tag)
+        w = (
+            fx.Float32(fx.ptr_load(k.ldsf + (at + p.k + e)))
+            / (tot + fx.Float32(1e-20))
+            * fx.Float32(p.route_scale)
+        )
+        mb.put(
+            k.mb[p.idx], row * p.k + e, fx.Int32(fx.ptr_load(k.lds + (at + e))), k.tag
+        )
         mb.put(k.mb[p.weights], row * p.k + e, w, k.tag)
 
 
@@ -359,13 +427,21 @@ def _fused_scores(k, p, row, bias):
     ``_waves_scores`` does."""
     if k.wave < p.n // 64:
         col = _col(k, p)
-        got = mb.poll([(k.mb[p.part], row * (p.slices * p.n) + sl * p.n + col, 1) for sl in range(p.slices)], k.tag)
+        got = mb.poll(
+            [
+                (k.mb[p.part], row * (p.slices * p.n) + sl * p.n + col, 1)
+                for sl in range(p.slices)
+            ],
+            k.tag,
+        )
         v = fx.Float32(0.0)
         for g in got:
             v = v + g[0].bitcast(fx.Float32)
         s = _score(p, v)
         fx.ptr_store(s, k.ldsf + ((p.slices + 1) * p.n + col))
-        fx.ptr_store(fresh((s + bias).bitcast(fx.Int32)), k.lds + ((p.slices + 2) * p.n + col))
+        fx.ptr_store(
+            fresh((s + bias).bitcast(fx.Int32)), k.lds + ((p.slices + 2) * p.n + col)
+        )
 
 
 @traced

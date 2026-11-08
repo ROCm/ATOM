@@ -32,6 +32,7 @@ from atom.models.deepseek_v41.mono.config import (
 )
 from atom.models.deepseek_v41.mono.draft_runner import DraftMonoRunner
 from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.deployment import dp_attention_ranks
 from atom.mono.runtime.route import LazyRunner
 from atom.utils.forward_context import get_forward_context
@@ -168,10 +169,17 @@ def install_mono_decode(
     # The decoder layers on the high-interactivity monokernels where they serve
     # this deployment (``hi_gate``: ATOM_DSV41_MONO_HI, "auto" by default); any
     # other takes ATOM's mono decode below, unchanged.
+    # A mismatch only the loaded model shows (``MonoUnsupported``) falls back
+    # as the gate's refusals do.
     if hi_gate.decide(atom_config, drafter, metadata_builder, dp_ranks):
         from atom.models.deepseek_v41.mono.hi_dispatch import install_hi
 
-        return install_hi(model, atom_config, drafter, metadata_builder, dp_ranks)
+        try:
+            return install_hi(model, atom_config, drafter, metadata_builder, dp_ranks)
+        except MonoUnsupported as why:
+            if hi_gate.mode() == "1":
+                raise
+            logger.info("V4.1 mono hi off: %s", why)
     if drafter is not None and hasattr(drafter.model, "block_backbone"):
         drafter.model = MonoDraftModel(drafter.model, dp_ranks)
     return MonoDecodeModel(

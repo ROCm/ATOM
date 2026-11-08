@@ -76,8 +76,22 @@ from . import schedules
 from .config import G
 from ..plan.program import Scenario, Stage, numa_stages
 
-HIDDEN, QR, KVD, HEADS, HD, OGROUPS, ORANK = G.hidden, G.q_lora, G.head_dim, G.heads, G.head_dim, G.o_groups, G.o_lora
-EXPERTS, TOPK, INTER, LIMIT, ROUTE_SCALE = G.experts, G.topk, G.moe_inter, G.swiglu_limit, G.route_scale
+HIDDEN, QR, KVD, HEADS, HD, OGROUPS, ORANK = (
+    G.hidden,
+    G.q_lora,
+    G.head_dim,
+    G.heads,
+    G.head_dim,
+    G.o_groups,
+    G.o_lora,
+)
+EXPERTS, TOPK, INTER, LIMIT, ROUTE_SCALE = (
+    G.experts,
+    G.topk,
+    G.moe_inter,
+    G.swiglu_limit,
+    G.route_scale,
+)
 EPS = G.eps
 
 
@@ -89,9 +103,12 @@ def _ch(name, width, fmt):
     return Channel(name, width, fmt)
 
 
-def channels(tp: int = 1, xa_proto: str | None = None, topk: int | None = None) -> SimpleNamespace:
+def channels(
+    tp: int = 1, xa_proto: str | None = None, topk: int | None = None
+) -> SimpleNamespace:
     """The layer's channels for a TP-``tp`` rank (q / o / oa carry this rank's heads and wo_a groups); ``topk``: the
-    routing channels' width (default ``TOPK``: the target's; the DSpark draft stages route top-3)."""
+    routing channels' width (default ``TOPK``: the target's; the DSpark draft stages route top-3).
+    """
     heads, groups = HEADS // tp, OGROUPS // tp
     topk = TOPK if topk is None else topk
     xa_proto = xa_proto or schedules.current()["XA_PROTO"]
@@ -120,15 +137,20 @@ C = channels(1, schedules.DEFAULT["XA_PROTO"])
 class Source:
     """A compressed layer's own sources: ``kv`` (a KV source: the Compressor, this step's entries into the cache
     and, ``index`` too, its index keys), ``index`` (an index source: the Indexer, this layer's top-512 selection,
-    stored for the consumers), ``cand`` ("source": layer 20's candidate bitmap; "reader": layers 24 .. 36 read it)."""
+    stored for the consumers), ``cand`` ("source": layer 20's candidate bitmap; "reader": layers 24 .. 36 read it).
+    """
 
     ratio: int
     cache_len: int  # the compressed cache's entries (>= n_max)
     kv: bool = False
     index: bool = False
-    n_max: int = 0  # the Indexer's positions (a context bucket: max context / ratio, a multiple of 32)
+    n_max: int = (
+        0  # the Indexer's positions (a context bucket: max context / ratio, a multiple of 32)
+    )
     cand: str = ""
-    state_slots: int = 0  # ratio 2: the Compressor's state slots (0: ratio, the reference's; >= spec + 1:
+    state_slots: int = (
+        0  # ratio 2: the Compressor's state slots (0: ratio, the reference's; >= spec + 1:
+    )
     #                       rejection-safe, a rejected draft row overwrites no slot an accepted row still needs)
 
 
@@ -138,24 +160,32 @@ def _tokens(source: Source | None) -> int:
 
 
 def _nspec(width, threads, wps):
-    return norm.NormSpec(width=width, eps=EPS, threads=threads, wps=wps, plain=True, plain_once=True)
+    return norm.NormSpec(
+        width=width, eps=EPS, threads=threads, wps=wps, plain=True, plain_once=True
+    )
 
 
 def _norm_splits(k) -> dict[str, int]:
     """``NORM_SPLIT`` resolved: {norm stage: tasks a row} ("auto": ffn_norm in ``FFN_NORM_SPLIT`` tasks)."""
     if k.NORM_SPLIT == "auto":
         return {"ffn_norm": k.FFN_NORM_SPLIT}
-    return dict((e.split(":")[0], int(e.split(":")[1])) for e in k.NORM_SPLIT.split(";") if e)
+    return dict(
+        (e.split(":")[0], int(e.split(":")[1])) for e in k.NORM_SPLIT.split(";") if e
+    )
 
 
 def _nq(name, src, out, gamma, width, threads, wps, bf16_out=None, splits=None, nsplit=0, gathered=False,
         prev=False):  # fmt: skip
     spec = _nspec(width, threads, wps)
     s = nsplit or (splits or {}).get(name, 1)
-    if s > 1:  # each of a row's s tasks quantizes width / s (4 words a thread), its sum in the one-task order
+    if (
+        s > 1
+    ):  # each of a row's s tasks quantizes width / s (4 words a thread), its sum in the one-task order
         spec = norm.NormSpec(width=width, eps=EPS, threads=width // 2 // s // 4, wps=4, plain=True, plain_once=True,
                              split=s, sum_threads=threads, sum_wps=wps)  # fmt: skip
-    extra = {"src_gathered": GATHER_TILE, "src_prev": prev} if gathered else {}  # a sharded seam's LIN (``HCSeam``)
+    extra = (
+        {"src_gathered": GATHER_TILE, "src_prev": prev} if gathered else {}
+    )  # a sharded seam's LIN (``HCSeam``)
     return norm.NormQuant(name, src, out, gamma, bf16_out=bf16_out, spec=spec, **extra)
 
 
@@ -183,11 +213,14 @@ class Store(Block):
 @traced
 def _replay_row(k, t, gate, chans):
     """Row t of the replayed routing (plain args ``<ch>`` [rows, TOPK], f32 / int32 bits) into channels ``chans``,
-    published once the router has published row t (its last ``gate`` value): the router stays on the MoE's chain."""
+    published once the router has published row t (its last ``gate`` value): the router stays on the MoE's chain.
+    """
     mb.poll([(k.mb[gate], t * TOPK + TOPK - 1, 1)], k.tag)
     it = t * (TOPK // 2) + fx.min(k.tid, fx.Int32(TOPK // 2 - 1))
     for ch in chans:
-        w = fx.Vector(bo.buffer_load(rsrc(k.args[ch]), it * 2, vec_width=2, dtype=T.i32))
+        w = fx.Vector(
+            bo.buffer_load(rsrc(k.args[ch]), it * 2, vec_width=2, dtype=T.i32)
+        )
         if k.tid < TOPK // 2:
             chan.put_words(k.mb[ch], it * 2, [w[0], w[1]], k.tag)
 
@@ -201,31 +234,52 @@ class Replay(Block):
 
     def stages(self, sc: Scenario) -> list[Stage]:
         names = tuple(ch.name for ch in self.chans)
-        writes = tuple(r for ch in self.chans for r in ch.regions(sc.rows, (self.name,)))
+        writes = tuple(
+            r for ch in self.chans for r in ch.regions(sc.rows, (self.name,))
+        )
         return [Stage(self.name, sc.rows, partial(_replay_row, gate=self.after.name, chans=names), writes=writes,
                       args=names, key=("replay", self.after.name, names))]  # fmt: skip
 
 
-CHAIN_PEER = ("moe.part", "moe.part.dag", "lin_n")  # a chain's cross-launch peer regions (the MoE partial; with
+CHAIN_PEER = (
+    "moe.part",
+    "moe.part.dag",
+    "lin_n",
+)  # a chain's cross-launch peer regions (the MoE partial; with
 #                                                    MOE_SUM "own" the owners' gathered sums; a sharded residual's next
 #                                                    LIN, SHARD_SEAM_A "end"), pinned first in every program
 
 
-def chain_peer_first(tp: int, knobs: dict | None = None, rows: int | None = None) -> tuple[str, ...]:
+def chain_peer_first(
+    tp: int, knobs: dict | None = None, rows: int | None = None
+) -> tuple[str, ...]:
     """A chain's programs' ``Program.peer_first``: ``CHAIN_PEER``; with a sharded residual only the MoE partial (the
-    chain's one cross-launch region: no launch gathers owner sums for the next, and the tail's own lie last)."""
-    return ("moe.part", "lin_n") if residual_layout(tp, knobs=knobs, rows=rows) == "sharded" else CHAIN_PEER
+    chain's one cross-launch region: no launch gathers owner sums for the next, and the tail's own lie last).
+    """
+    return (
+        ("moe.part", "lin_n")
+        if residual_layout(tp, knobs=knobs, rows=rows) == "sharded"
+        else CHAIN_PEER
+    )
 
 
-def residual_layout(tp: int, split: bool = False, knobs: dict | None = None, rows: int | None = None) -> str:
+def residual_layout(
+    tp: int, split: bool = False, knobs: dict | None = None, rows: int | None = None
+) -> str:
     """``RESIDUAL`` resolved for a layer: "sharded" (TP, one kernel: R column-owned, ``HCSeam(residual="sharded")``)
     or "replicated"; "auto": sharded from ``R_SHARD_ROWS`` to ``R_SHARD_MAX_ROWS`` rows (``rows`` None:
     replicated). A sharded layer's R args (``h_in``, ``r_a``, ``r_f``) hold the rank's columns: [rows, 4, hidden / tp]
     (``shard_cols``)."""
     kn = knobs or schedules.current()
     v = kn["RESIDUAL"]
-    if v == "auto":  # (measured at one request of 6 / 8 / 16 rows and B = 2-4 requests of 6)
-        v = "sharded" if rows is not None and kn["R_SHARD_ROWS"] <= rows <= kn["R_SHARD_MAX_ROWS"] else "replicated"
+    if (
+        v == "auto"
+    ):  # (measured at one request of 6 / 8 / 16 rows and B = 2-4 requests of 6)
+        v = (
+            "sharded"
+            if rows is not None and kn["R_SHARD_ROWS"] <= rows <= kn["R_SHARD_MAX_ROWS"]
+            else "replicated"
+        )
     return "sharded" if v == "sharded" and tp > 1 and not split else "replicated"
 
 
@@ -243,8 +297,14 @@ def rs_pack(tp: int, knobs: dict | None = None, rows: int | None = None) -> str:
     if v not in ("pair", "f32q", "f32p", "auto"):
         raise ValueError(f"RS_PACK 'pair', 'f32q', 'f32p' or 'auto', got {v!r}")
     if v == "auto":
-        whole = tp > 1 and (HIDDEN // tp) % (4 * 64) == 0  # (an MoE combine wave's 256 columns: one owner)
-        v = "f32p" if whole and rows is not None and rows >= kn["RS_PACK_ROWS"] else "pair"
+        whole = (
+            tp > 1 and (HIDDEN // tp) % (4 * 64) == 0
+        )  # (an MoE combine wave's 256 columns: one owner)
+        v = (
+            "f32p"
+            if whole and rows is not None and rows >= kn["RS_PACK_ROWS"]
+            else "pair"
+        )
     return v if v in ("f32q", "f32p") and tp > 1 else "f32"
 
 
@@ -252,30 +312,46 @@ def _order(k) -> str:
     return "fold" if k["SHARED_ORDER"] == "auto" else k["SHARED_ORDER"]
 
 
-def chain_pend(tp: int, rows: int | None, order: str | None = None, knobs: dict | None = None):
+def chain_pend(
+    tp: int, rows: int | None, order: str | None = None, knobs: dict | None = None
+):
     """The ``HCSeam`` pend of a program that reads the previous launch's chained MoE partials (a layer's seam A with
     ``prev_moe``, or a reader after the chain such as the verify head): the owners' gathered bf16 sums
-    (``moe.part.dag``) when that launch ran "own", else the pushed partials (``moe.part``)."""
+    (``moe.part.dag``) when that launch ran "own", else the pushed partials (``moe.part``).
+    """
     kn = knobs or schedules.current()
     order = order or _order(kn)
     rq = rs_pack(tp, kn, rows)
-    if residual_layout(tp, knobs=kn, rows=rows) == "sharded":  # the reduce-scatter partials of the rank's columns
+    if (
+        residual_layout(tp, knobs=kn, rows=rows) == "sharded"
+    ):  # the reduce-scatter partials of the rank's columns
         return PeerPartial("moe.part", "rs", prev_launch=True, rs_fmt=rq)
     m = _moe_mode(tp, order, rows=rows, chain=True, knobs=kn)
     if m == "own":
         return PeerPartial("moe.part.dag", "ag", prev_launch=True)
-    return PeerPartial("moe.part", "ref3" if order == "ref" else "f32", prev_launch=True)
+    return PeerPartial(
+        "moe.part", "ref3" if order == "ref" else "f32", prev_launch=True
+    )
 
 
 def _moe_mode(tp: int, order: str, split: bool = False, rows: int | None = None, chain: bool = False,
               knobs: dict | None = None) -> str:  # fmt: skip
     """``MOE_SUM`` resolved for a layer's MoE partial: "push", "2shot" or "own" (only in a chain: ``chain`` = the
     partial is pushed for the next launch's seam A); two-shot needs TP and the "fold" order. "auto": 2shot in a
-    two-kernel layer's FFN kernel; in a chain "own" from ``MOE_OWN_ROWS`` rows on, push otherwise."""
+    two-kernel layer's FFN kernel; in a chain "own" from ``MOE_OWN_ROWS`` rows on, push otherwise.
+    """
     kn = knobs or schedules.current()
     m = kn["MOE_SUM"]
     if m == "auto":
-        m = "2shot" if split else "own" if chain and rows is not None and rows >= kn["MOE_OWN_ROWS"] else "push"
+        m = (
+            "2shot"
+            if split
+            else (
+                "own"
+                if chain and rows is not None and rows >= kn["MOE_OWN_ROWS"]
+                else "push"
+            )
+        )
     return "2shot" if m == "own" and not chain else m
 
 
@@ -290,7 +366,9 @@ def sgpr_spill_ok(sparse: int, source: Source | None, rows: int | None = None, e
     kind's ``SHARD_SPILL_OK`` says so (measured: the window kinds sit at the SGPR budget). ``tp`` / ``split``: the
     program's, for ``RESIDUAL`` "auto" (``residual_layout``; tp None: a TP build)."""
     if tp is _NO_TP:
-        raise TypeError("sgpr_spill_ok: pass the program's tp (``RESIDUAL`` \"auto\" depends on it)")
+        raise TypeError(
+            'sgpr_spill_ok: pass the program\'s tp (``RESIDUAL`` "auto" depends on it)'
+        )
     kind = schedules.kind_of(sparse, source, engram, sparse_ratio)
     kn = schedules.knobs(kind, rows)
     ok = kn["SPILL_OK"]
@@ -299,7 +377,11 @@ def sgpr_spill_ok(sparse: int, source: Source | None, rows: int | None = None, e
     if kn["RESIDUAL"] == "auto":  # (residual_layout's rule; tp unknown: a TP build)
         shard = residual_layout(2 if tp is None else tp, split, kn, rows) == "sharded"
     shard = shard and bool(kn["SHARD_SPILL_OK"])
-    return source is not None or (bool(sparse) and schedules.current()["RING_FIRST"] in (True, "auto")) or shard
+    return (
+        source is not None
+        or (bool(sparse) and schedules.current()["RING_FIRST"] in (True, "auto"))
+        or shard
+    )
 
 
 def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: bool = False, push_moe: bool = False,
@@ -369,28 +451,50 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     k = SimpleNamespace(**kn)
     fold_shared = _fold_shared(tp, k.SHARED)
     if head is not None and (split or push_moe):
-        raise ValueError("head: the chain's last layer in one kernel (its MoE summed in this launch)")
+        raise ValueError(
+            "head: the chain's last layer in one kernel (its MoE summed in this launch)"
+        )
     if (push_moe or prev_moe) and (tp < 2 or split or not fold_shared):
-        raise ValueError("push_moe / prev_moe: TP, one kernel, the folded shared expert")
+        raise ValueError(
+            "push_moe / prev_moe: TP, one kernel, the folded shared expert"
+        )
     if prev_moe and first:
-        raise ValueError("prev_moe: the step's first layer has no previous launch (plain input)")
+        raise ValueError(
+            "prev_moe: the step's first layer has no previous launch (plain input)"
+        )
     order = _order(kn)
     C = channels(tp, k.XA_PROTO, topk)
     heads, groups = HEADS // tp, OGROUPS // tp
-    wo_b_consumer = tp > 1 and not split and k.WO_B_SUM in ("consumer", "2shot")  # seam F sums wo_b's partials
+    wo_b_consumer = (
+        tp > 1 and not split and k.WO_B_SUM in ("consumer", "2shot")
+    )  # seam F sums wo_b's partials
     # the router normalizes its K slices (window layers: no compressed cache, no sources)
-    rnorm = k.FFN_NORM == "router" or (k.FFN_NORM == "auto" and not sparse and source is None)
+    rnorm = k.FFN_NORM == "router" or (
+        k.FFN_NORM == "auto" and not sparse and source is None
+    )
     shard = residual_layout(tp, split, kn, rows) == "sharded"
-    if shard:  # R column-owned: the seams own their columns, LIN gathered, no owner stages
-        if k.SEAM_NORM or rnorm or k.WO_B_SUM != "2shot" or order != "fold" or not k.R_CHANNEL:
+    if (
+        shard
+    ):  # R column-owned: the seams own their columns, LIN gathered, no owner stages
+        if (
+            k.SEAM_NORM
+            or rnorm
+            or k.WO_B_SUM != "2shot"
+            or order != "fold"
+            or not k.R_CHANNEL
+        ):
             raise ValueError("RESIDUAL 'sharded': not with SEAM_NORM, FFN_NORM 'router', WO_B_SUM other than '2shot', "
                              "SHARED_ORDER 'ref' or R_CHANNEL off (yet)")  # fmt: skip
         C.ra = _ch("ra", 4 * HIDDEN // tp, Fmt.BF16)  # R_A of the rank's columns
         C.rf = _ch("rf", 4 * HIDDEN // tp, Fmt.BF16)  # R_F of the rank's columns
         C.lin_n = _ch("lin_n", HIDDEN, Fmt.BF16)  # the next layer's LIN ("end")
     rsd = {"residual": "sharded"} if shard else {}
-    rq = rs_pack(tp, kn, rows)  # the two-shot exchanges' partials ("f32" pairs or "f32q")
-    rs_f = wo_b_consumer and k.WO_B_SUM == "2shot"  # seam F sums wo_b's reduce-scatter partials (in ``rq``)
+    rq = rs_pack(
+        tp, kn, rows
+    )  # the two-shot exchanges' partials ("f32" pairs or "f32q")
+    rs_f = (
+        wo_b_consumer and k.WO_B_SUM == "2shot"
+    )  # seam F sums wo_b's reduce-scatter partials (in ``rq``)
     # an Engram layer's seam A after the Engram (its whole output on every rank): LIN and mixes replicated, LIN local
     eng_rep = shard and engram and k.SHARD_ENGRAM_A == "replicated"
     # seam A's fold and LIN at the end of the launch that produced the MoE output (``hcz``, LIN-only), the next
@@ -399,30 +503,49 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     ga = {"gate_out_arg": "gate_a"} if split else {}
     early = bool(k.HC_EARLY)
     own_q = k.OWN_QUADS
-    m_in = _moe_mode(tp, order, rows=rows, chain=True, knobs=kn) if prev_moe else ""  # the previous launch's exchange
+    m_in = (
+        _moe_mode(tp, order, rows=rows, chain=True, knobs=kn) if prev_moe else ""
+    )  # the previous launch's exchange
     m_out = _moe_mode(tp, order, split, rows, chain=push_moe, knobs=kn)  # this layer's
-    if shard:  # the MoE's reduce-scatter partials are the next seam A's (pushed only) or its own owner's (dsum)
+    if (
+        shard
+    ):  # the MoE's reduce-scatter partials are the next seam A's (pushed only) or its own owner's (dsum)
         m_in, m_out = ("rs" if prev_moe and not end else ""), "2shot"
-    if m_in == "own" and m_out == "push":  # a chain's tail after "own": its MoE two-shot (owner stage + dsum), so the
+    if (
+        m_in == "own" and m_out == "push"
+    ):  # a chain's tail after "own": its MoE two-shot (owner stage + dsum), so the
         m_out = "2shot"  # program declares moe.part.dag (its seam A reads the previous launch's) and the pinned
         #                  regions keep the chain's layout (moe.part in the rs layout)
     pend_a = chain_pend(tp, rows, order, kn) if prev_moe else "pend"
-    if k.HC_DIRECT:  # seam A's fold + LIN a thread a (row, 2 columns), LIN put straight from registers
+    if (
+        k.HC_DIRECT
+    ):  # seam A's fold + LIN a thread a (row, 2 columns), LIN put straight from registers
         ga = {**ga, "direct": True}
     pad = k.HC_LDS_PAD
     if "a" in pad:
         ga = {**ga, "lds_pad": True}
-    entry = k.HC_ENTRY is True or (k.HC_ENTRY == "auto" and rows is not None and m_in not in ("", "own"))
+    entry = k.HC_ENTRY is True or (
+        k.HC_ENTRY == "auto" and rows is not None and m_in not in ("", "own")
+    )
     # what enters a chain from outside it (a first layer's, an unchained layer's h_in) and what leaves it (an unchained
     # layer's R_F, the aux taps' R_A) are whole; only the chain's own hand-offs are the rank's columns
     whole_in = {"res_in_full": True} if shard and not prev_moe else {}
-    full_r_a = full_r_a or bool(k.FULL_R_A)  # (``FULL_R_A``: every layer, the aux taps' form; measurement)
-    late = {"res_gather_late": True} if k.R_GATHER == "late" else {}  # (the R gathers off the slices)
-    if shard and full_r_a:  # R_A whole too (gathered): the plain r_a, seam F reads the rank's columns' channel
+    full_r_a = full_r_a or bool(
+        k.FULL_R_A
+    )  # (``FULL_R_A``: every layer, the aux taps' form; measurement)
+    late = (
+        {"res_gather_late": True} if k.R_GATHER == "late" else {}
+    )  # (the R gathers off the slices)
+    if (
+        shard and full_r_a
+    ):  # R_A whole too (gathered): the plain r_a, seam F reads the rank's columns' channel
         rsd_a = {**rsd, "res_gather": "rag", "res_full": "r_a", **late}
         res_a = {"res_out": None, "res_ch": C.ra}
     else:
-        rsd_a, res_a = rsd, {"res_out": "r_a", "res_ch": C.ra if k.R_CHANNEL and not split else None}
+        rsd_a, res_a = rsd, {
+            "res_out": "r_a",
+            "res_ch": C.ra if k.R_CHANNEL and not split else None,
+        }
     seam_a = (HCSeam("hca", "h_in", C.lin_a, "gin", "hca.fn", "hca.scale", "hca.base", gate_out=C.gate_a,
                      early=early, **ga, **rsd, **whole_in)  # (the engine's h_in)
               if first else
@@ -431,11 +554,19 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
               if end else
               HCSeam("hca", "h_in", C.lin_a, "gin", "hca.fn", "hca.scale", "hca.base", pend=pend_a, **res_a,
                      gate_out=C.gate_a, early=early, entry=entry, **ga, **rsd_a, **whole_in))  # fmt: skip
-    if engram:  # seam A around the Engram (docstring): R -> ra, the gate half -> re, the mixes / LIN on re
+    if (
+        engram
+    ):  # seam A around the Engram (docstring): R -> ra, the gate half -> re, the mixes / LIN on re
         from ..blocks.gfx950.engram import Engram
 
-        rag = _ch("rag", 4 * HIDDEN, Fmt.BF16)  # sharded: R gathered for the Engram (its gate needs every column)
-        r0 = {"res_gather": rag.name, "hidden": HIDDEN, **rsd} if shard else {"res_ch": C.ra}
+        rag = _ch(
+            "rag", 4 * HIDDEN, Fmt.BF16
+        )  # sharded: R gathered for the Engram (its gate needs every column)
+        r0 = (
+            {"res_gather": rag.name, "hidden": HIDDEN, **rsd}
+            if shard
+            else {"res_ch": C.ra}
+        )
         seam_a = [
             HCSeam("hca0", "h_in", None, "gin", "hca.fn", "hca.scale", "hca.base", r_only=True, **r0, **whole_in,
                    **({} if first else {"pend": pend_a, "res_out": "r_a"})),
@@ -452,8 +583,12 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     sparse = src.cache_len if src is not None else sparse
     rs = k.RING_SLOTS if ring_slots is None else ring_slots
     smerge = k.SPARSE_SMERGE in (True, 1)
-    ckv4 = k.SPARSE_CKV4 if k.SPARSE_CKV4 != "auto" else False  # (no FP4 copy: the cache is ATOM's pool)
-    ring8 = (6 if src is None else False) if k.SPARSE_RING8 == "auto" else k.SPARSE_RING8
+    ckv4 = (
+        k.SPARSE_CKV4 if k.SPARSE_CKV4 != "auto" else False
+    )  # (no FP4 copy: the cache is ATOM's pool)
+    ring8 = (
+        (6 if src is None else False) if k.SPARSE_RING8 == "auto" else k.SPARSE_RING8
+    )
     attn = (MLASparseAttn("attn", C.q, C.kvn, C.o, "ring", "pos", "rope", "attn.sink",
                           C.sel if src is not None and src.index else "sel", "ckv", sparse, heads=heads,
                           new=C.ckvn if src is not None and src.kv else None,
@@ -472,11 +607,19 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
                           unrope_f32=bool(k.ATTN_OUT_F32_ROPE)))  # fmt: skip
     comp, idx = [], []
     ctiles = k.SHARD_COMP_TILES if shard and k.SHARD_COMP_TILES else k.COMP_TILES
-    if k.IDX_SCORE_F32 and src is not None and src.ratio == 2 and rows is not None and rows >= 18:
+    if (
+        k.IDX_SCORE_F32
+        and src is not None
+        and src.ratio == 2
+        and rows is not None
+        and rows >= 18
+    ):
         # COMP_TILES 4 sits at 256 VGPRs on the ratio-2 KV + index sources at 18 rows; the f32 scores'
         # program spills one there (133K / 1M buckets, replicated): 2 tiles, as at 24 rows
         ctiles = min(ctiles, 2)
-    if src is not None and src.kv:  # beside wq_a / wkv: its dots depend only on attn_norm
+    if (
+        src is not None and src.kv
+    ):  # beside wq_a / wkv: its dots depend only on attn_norm
         comp = [
             Compressor(
                 "comp",
@@ -500,9 +643,15 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
         cand = (
             {"cand_out": "cand", "cand_bound": "cand.bound"}
             if src.cand == "source"
-            else {"candidates": "cand", "compact": int(k.IDX_COMPACT)} if src.cand == "reader" else {}
+            else (
+                {"candidates": "cand", "compact": int(k.IDX_COMPACT)}
+                if src.cand == "reader"
+                else {}
+            )
         )
-        f32 = bool(k.IDX_SCORE_F32)  # (f32 scores; the bf16 scores' shortcuts off, schedule entries included)
+        f32 = bool(
+            k.IDX_SCORE_F32
+        )  # (f32 scores; the bf16 scores' shortcuts off, schedule entries included)
         idx = [Indexer("idx", C.qn, C.xab, src.ratio, src.n_max, C.sel, "pos", "rope", "index_k", src.cache_len,
                        "idx.bound", new_keys=C.ikey if src.kv else None, kfmt=k.INDEX_KFMT, wq_b_rows=k.IDX_WQB_ROWS,
                        kpack_lanes=bool(k.KPACK_LANES), subtiles=int(k.IDX_SUBTILES), short_tiles=bool(k.IDX_SHORT),
@@ -517,7 +666,9 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
                        items=bool(k.IDX_ITEMS), **cand),
                Store("sel_store", C.sel, "sel_out")]  # fmt: skip
     comp_first = k.COMP_FIRST is True
-    q_stage = k.Q_NORM == "stage" or (src is not None and src.index)  # the Indexer reads q_norm's MXFP8 output
+    q_stage = k.Q_NORM == "stage" or (
+        src is not None and src.index
+    )  # the Indexer reads q_norm's MXFP8 output
     splits = _norm_splits(k)
     attention = [
         *seam_a,
@@ -535,7 +686,9 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
                     8,
                     bf16_out=C.xab if src is not None else None,
                     splits=splits,
-                    nsplit=int(k.SRC_NORM_SPLIT) if src is not None and not split else 0,
+                    nsplit=(
+                        int(k.SRC_NORM_SPLIT) if src is not None and not split else 0
+                    ),
                     gathered=shard and not eng_rep,
                     prev=end and prev_moe,
                 ),
@@ -543,15 +696,41 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
         ),
         *(comp if comp_first else ()),
         Linear("wq_a", ("wq_a",), C.xa, QR, BF16Out(C.qr), weight_format="mxfp8"),
-        Linear("wkv", ("wkv",), C.xa, KVD, BF16Out(C.kv), weight_format="mxfp8", k_split=k.WKV_KSPLIT),
+        Linear(
+            "wkv",
+            ("wkv",),
+            C.xa,
+            KVD,
+            BF16Out(C.kv),
+            weight_format="mxfp8",
+            k_split=k.WKV_KSPLIT,
+        ),
         *(() if comp_first else comp),
-        *((_nq("q_norm", C.qr, C.qn, "q_norm.g", QR, 160, 4, splits=splits),) if q_stage else ()),
-        _nq("kv_norm", C.kv, C.kvq, "kv_norm.g", KVD, 64, 4, bf16_out=C.kvb, splits=splits),
+        *(
+            (_nq("q_norm", C.qr, C.qn, "q_norm.g", QR, 160, 4, splits=splits),)
+            if q_stage
+            else ()
+        ),
+        _nq(
+            "kv_norm",
+            C.kv,
+            C.kvq,
+            "kv_norm.g",
+            KVD,
+            64,
+            4,
+            bf16_out=C.kvb,
+            splits=splits,
+        ),
         *idx,
         Linear(
             "wq_b",
             ("wq_b",),
-            C.qn if k.Q_NORM == "stage" else NormIn(C.qr, "q_norm.g", "q_norm", _nspec(QR, 160, 4)),
+            (
+                C.qn
+                if k.Q_NORM == "stage"
+                else NormIn(C.qr, "q_norm.g", "q_norm", _nspec(QR, 160, 4))
+            ),
             heads * HD,
             BF16Out(C.q),
             weight_format="mxfp8",
@@ -580,8 +759,16 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
             HIDDEN,
             BF16Out(C.ao),
             weight_format="mxfp8",
-            tp_partial=(rq if rs_f and k.WO_B_PARTIAL == "f32" else k.WO_B_PARTIAL) if tp > 1 else None,
-            tp_sum=("rs" if k.WO_B_SUM == "2shot" else "consumer") if wo_b_consumer else "producer",
+            tp_partial=(
+                (rq if rs_f and k.WO_B_PARTIAL == "f32" else k.WO_B_PARTIAL)
+                if tp > 1
+                else None
+            ),
+            tp_sum=(
+                ("rs" if k.WO_B_SUM == "2shot" else "consumer")
+                if wo_b_consumer
+                else "producer"
+            ),
         ),
     ]
     pend_f = (PeerPartial("wo_b.tp", "rs" if shard else "2shot", rs_fmt=rq) if rs_f
@@ -655,30 +842,62 @@ def moe_route_early(stages: list[Stage], knobs: dict | None = None) -> list[Stag
     on the routing; placed after the shared expert's stages, its one CTA first runs a shared-expert task. Also every
     placement pass every V4.1 program takes (``idx_after_pool``, ``smerge_place``, ``cand_apart``, ``hcf_gate_place``,
     ``wo_a_hold``)
-    and the dual-copy mailboxes (``NUMA_DUAL``). ``knobs``: the build's (default: the live knobs)."""
+    and the dual-copy mailboxes (``NUMA_DUAL``). ``knobs``: the build's (default: the live knobs).
+    """
     kn = knobs or schedules.current()
-    sharded = any(st.name.endswith(".blk") for st in stages)  # a sharded residual's seams: block sums, gates aside
+    sharded = any(
+        st.name.endswith(".blk") for st in stages
+    )  # a sharded residual's seams: block sums, gates aside
     aside = [st for st in stages if sharded and st.name in SHARD_ASIDE]
     stages = [st for st in stages if st not in aside]
     stages = smerge_place(idx_after_pool(stages, knobs=kn), knobs=kn)
     stages = wo_a_hold(hcf_gate_place(cand_apart(stages, knobs=kn), knobs=kn), kn)
     names = [st.name for st in stages]
     dual = kn["NUMA_DUAL"]
-    if dual:  # dual-copy (numa2) mailboxes: every tagged scratch region up to NUMA_DUAL KiB (window layers: 64,
+    if (
+        dual
+    ):  # dual-copy (numa2) mailboxes: every tagged scratch region up to NUMA_DUAL KiB (window layers: 64,
         #      their program is at the SGPR budget: 256 spilled one SGPR on layer 0 at 6 rows)
         names = {st.name for st in stages}
         window = "attn.m" not in names and "attn.c" not in names
-        numa_stages(stages + aside, (f"auto:{min(int(dual), 64) if window else int(dual)}",))
+        numa_stages(
+            stages + aside, (f"auto:{min(int(dual), 64) if window else int(dual)}",)
+        )
     return shard_place(stages, aside) if aside else stages
 
 
-SHARD_ASIDE = ("hca.blk", "hca.gate", "hca.rpush", "hca.rfull", "hcf.blk", "hcf.gate", "hcf.rpush", "hcf.rfull")
+SHARD_ASIDE = (
+    "hca.blk",
+    "hca.gate",
+    "hca.rpush",
+    "hca.rfull",
+    "hcf.blk",
+    "hcf.gate",
+    "hcf.rpush",
+    "hcf.rfull",
+)
 # shard_place: (stage, the stage it goes before (program order), the stages it must not share a CTA with)
-_EARLY_ATTN = ("attn_norm", "wq_a", "wkv", "q_norm", "kv_norm", "kvprep", "attn", "attn.c", "comp.", "idx.", "eng.")
+_EARLY_ATTN = (
+    "attn_norm",
+    "wq_a",
+    "wkv",
+    "q_norm",
+    "kv_norm",
+    "kvprep",
+    "attn",
+    "attn.c",
+    "comp.",
+    "idx.",
+    "eng.",
+)
 _SHARD_SLOTS = (
     ("hca.blk", "wq_a", _EARLY_ATTN),
     ("hca.gate", "wo_a", ("wo_a", "wo_b")),
-    ("hca.rpush", "moe.rt", ("ffn_norm", "router.", "moe.sh_ug", "moe.route")),  # (the links idle there)
+    (
+        "hca.rpush",
+        "moe.rt",
+        ("ffn_norm", "router.", "moe.sh_ug", "moe.route"),
+    ),  # (the links idle there)
     ("hca.rfull", "moe.rt", ("ffn_norm", "router.", "moe.sh_ug", "moe.route")),
     ("hcf.blk", "ffn_norm", ("ffn_norm", "router.", "moe.sh_ug", "moe.route")),
     ("hcf.gate", "ffn_norm", ("ffn_norm", "router.", "moe.sh_ug", "moe.route")),
@@ -706,10 +925,15 @@ def shard_place(stages: list[Stage], aside: list[Stage], cus: int = 256) -> list
             continue
         busy = set(taken)
         for o in stages:
-            if any(o.name == n or (n.endswith(".") and o.name.startswith(n)) for n in avoid):
+            if any(
+                o.name == n or (n.endswith(".") and o.name.startswith(n)) for n in avoid
+            ):
                 busy |= {(o.base + t) % cus for t in range(min(o.tasks, cus))}
         # the first window of CTAs none of the listed stages runs on, else the one with the fewest
-        st.base = min(range(cus), key=lambda c: (len(busy & {(c + t) % cus for t in range(st.tasks)}), c))
+        st.base = min(
+            range(cus),
+            key=lambda c: (len(busy & {(c + t) % cus for t in range(st.tasks)}), c),
+        )
         taken |= {(st.base + t) % cus for t in range(st.tasks)}
         at = next((i for i, o in enumerate(stages) if o.name == before), None)
         stages.insert(at, st)
@@ -724,7 +948,11 @@ def wo_a_hold(stages: list[Stage], knobs: dict | None = None) -> list[Stage]:
     for st in stages:
         if st.name != "wo_a":
             continue
-        rows = st.emit.keywords["p"].rows if hasattr(st.emit, "keywords") and "p" in st.emit.keywords else 0
+        rows = (
+            st.emit.keywords["p"].rows
+            if hasattr(st.emit, "keywords") and "p" in st.emit.keywords
+            else 0
+        )
         window = "attn.m" not in names and "attn.c" not in names
         units = (64 if window and 0 < rows <= 8 else 0) if hold == "auto" else int(hold)
         if units:
@@ -732,7 +960,9 @@ def wo_a_hold(stages: list[Stage], knobs: dict | None = None) -> list[Stage]:
     return stages
 
 
-def idx_after_pool(stages: list[Stage], cus: int = 256, knobs: dict | None = None) -> list[Stage]:
+def idx_after_pool(
+    stages: list[Stage], cus: int = 256, knobs: dict | None = None
+) -> list[Stage]:
     """``IDX_AFTER_POOL``: in a one-kernel KV + index source (stages ``comp.pool`` and ``idx.wq_b``, no ``store_ao``)
     the Indexer's first stage starts on the CTA after ``comp.pool``'s last (its tasks no longer wait behind the pool's),
     the later stages following it as ``plan`` places them."""
@@ -749,16 +979,20 @@ def idx_after_pool(stages: list[Stage], cus: int = 256, knobs: dict | None = Non
     return stages
 
 
-def smerge_place(stages: list[Stage], cus: int = 256, knobs: dict | None = None) -> list[Stage]:
+def smerge_place(
+    stages: list[Stage], cus: int = 256, knobs: dict | None = None
+) -> list[Stage]:
     """``SPARSE_SMERGE``'s placement (stages ``attn.m``, ``ringw``, ``wo_a`` in a row, as ``plan`` would place them):
     RingWrite on the merge's first CTAs (after their merge tasks: nothing in this launch waits for it) and wo_a on the
     CTAs right after the merge's, so no wo_a task waits behind a merge task to start its weight prefetch; wo_b
     follows as ``plan`` places it."""
     kn = knobs or schedules.current()
     names = [st.name for st in stages]
-    if not (kn["SPARSE_SMERGE"] in (True, 1, "auto") and kn["SMERGE_PLACE"]) or not {"attn.m", "ringw", "wo_a"} <= set(
-        names
-    ):
+    if not (kn["SPARSE_SMERGE"] in (True, 1, "auto") and kn["SMERGE_PLACE"]) or not {
+        "attn.m",
+        "ringw",
+        "wo_a",
+    } <= set(names):
         return stages
     i, j, w = names.index("attn.m"), names.index("ringw"), names.index("wo_a")
     nxt = 0
@@ -774,7 +1008,9 @@ def smerge_place(stages: list[Stage], cus: int = 256, knobs: dict | None = None)
 _APART = ("wq_b", "attn.m", "ringw", "wo_a", "wo_b", "hcf.slice")
 
 
-def cand_apart(stages: list[Stage], cus: int = 256, knobs: dict | None = None) -> list[Stage]:
+def cand_apart(
+    stages: list[Stage], cus: int = 256, knobs: dict | None = None
+) -> list[Stage]:
     """``IDX_CAND_APART``: in the candidate source (stage ``idx.cmask``), every stage's base as ``plan`` would place it,
     then the attention path's stages (``_APART``: wq_b, the merge with its RingWrite, wo_a, wo_b, seam F's slices)
     from the CTA after the candidate chain's last (``idx.cmask``'s): none waits behind ctopk / cmask, one task a row
@@ -790,7 +1026,9 @@ def cand_apart(stages: list[Stage], cus: int = 256, knobs: dict | None = None) -
     cm = stages[names.index("idx.cmask")]
     if isinstance(on, str) and on == "auto":
         p = cm.emit.keywords["p"]
-        on = schedules.knobs(schedules.KV1, p.rows, tokens=p.n_max * p.ratio)["IDX_CAND_APART"]
+        on = schedules.knobs(schedules.KV1, p.rows, tokens=p.n_max * p.ratio)[
+            "IDX_CAND_APART"
+        ]
     if on not in (True, 1, 2):
         return stages
     nxt = 0
@@ -802,11 +1040,21 @@ def cand_apart(stages: list[Stage], cus: int = 256, knobs: dict | None = None) -
         if st.name in _APART:
             st.base = (cm.base + cm.tasks) % cus
     if on == 2:
-        late = [st for st in stages if st.name.startswith("idx.ctopk.") and st.name != "idx.ctopk.l0" or st is cm]
+        late = [
+            st
+            for st in stages
+            if st.name.startswith("idx.ctopk.")
+            and st.name != "idx.ctopk.l0"
+            or st is cm
+        ]
         busy = {(st.base + t) % cus for st in late + [st for st in stages if st.name in _APART]
                 for t in range(min(st.tasks, cus))}  # fmt: skip
         for st in stages:
-            if not (st.name.startswith("idx.topk.") and st.name != "idx.topk.l0" or st.name == "sel_store"):
+            if not (
+                st.name.startswith("idx.topk.")
+                and st.name != "idx.topk.l0"
+                or st.name == "sel_store"
+            ):
                 continue
             for c in range(st.base, st.base + cus):
                 if not busy & {(c + t) % cus for t in range(st.tasks)}:
@@ -818,7 +1066,9 @@ def cand_apart(stages: list[Stage], cus: int = 256, knobs: dict | None = None) -
 _GATE_AVOID = ("ffn_norm", "router.", "moe.sh_ug", "moe.route")
 
 
-def hcf_gate_place(stages: list[Stage], cus: int = 256, knobs: dict | None = None) -> list[Stage]:
+def hcf_gate_place(
+    stages: list[Stage], cus: int = 256, knobs: dict | None = None
+) -> list[Stage]:
     """``HCF_GATE_AT``: every stage's base as ``plan`` would place it, then seam F's gate on the CTAs from that one
     ("auto": only when its plan CTAs run one of ``_GATE_AVOID``'s stages, the first window of CTAs from hcf.slice's
     first that runs none); nothing else moves."""
@@ -848,7 +1098,10 @@ def hcf_gate_place(stages: list[Stage], cus: int = 256, knobs: dict | None = Non
     return stages
 
 
-ENGRAM_KV = {"eng1": 1, "eng14": 14}  # the token-only halves' block names -> their layers (``engram_kv_blocks``)
+ENGRAM_KV = {
+    "eng1": 1,
+    "eng14": 14,
+}  # the token-only halves' block names -> their layers (``engram_kv_blocks``)
 
 
 def engram_kv_blocks(names: dict[str, int] | None = None, hist_len: int = 0,
@@ -859,7 +1112,8 @@ def engram_kv_blocks(names: dict[str, int] | None = None, hist_len: int = 0,
     Args: ``ids`` int32 [rows] (the step's tokens), ``pos``, ``hist`` int32 [batch, ``hist_len``] (compressed ids by
     position; this launch writes its rows'), ``tmap``, per block ``n.hash`` / ``n.tq`` / ``n.ts`` and wkv
     (``engram_io.pack_kv``); ``wkv_knobs``: wkv's ``Linear`` knobs (default the plan's); ``knobs``: the build's
-    (``ENGRAM_LOOK_DST``, ``ENGRAM_STORE_CHUNKS``, ``ENGRAM_STAGED``; default the live knobs)."""
+    (``ENGRAM_LOOK_DST``, ``ENGRAM_STORE_CHUNKS``, ``ENGRAM_STAGED``; default the live knobs).
+    """
     from ..blocks.gfx950.engram import Engram
 
     kn = knobs or schedules.current()
@@ -871,5 +1125,6 @@ def engram_kv_blocks(names: dict[str, int] | None = None, hist_len: int = 0,
 
 def cache_len(ctx: int, ratio: int) -> int:
     """The compressed positions a step can see at context ``ctx`` (+ 16: a verify's rows), a multiple of 32: a
-    compressed layer's cache length and the Indexer's ``n_max`` (as the engine hook sizes them)."""
+    compressed layer's cache length and the Indexer's ``n_max`` (as the engine hook sizes them).
+    """
     return -(-((ctx + 16) // ratio) // 32) * 32

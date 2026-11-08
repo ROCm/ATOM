@@ -28,7 +28,12 @@ class _Block:
 
     def __init__(self, ptr: int, nbytes: int, device: int):
         self.ptr, self.nbytes, self.device = ptr, nbytes, device
-        self.__cuda_array_interface__ = {"shape": (nbytes,), "typestr": "|u1", "data": (ptr, False), "version": 2}
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (ptr, False),
+            "version": 2,
+        }
 
     def __del__(self):
         _FREE.append((self.nbytes, self.ptr, self.device))
@@ -60,7 +65,9 @@ def zeros(nbytes: int, device="cuda") -> torch.Tensor:
         else:
             _STATS["reused"] += 1
             torch.cuda.synchronize()  # (a reused block's last kernels are done before it is zeroed)
-            _HIP.check(_HIP.library().hipMemset(got[1], 0, got[0]), operation="hipMemset")
+            _HIP.check(
+                _HIP.library().hipMemset(got[1], 0, got[0]), operation="hipMemset"
+            )
             torch.cuda.synchronize()
         size, ptr = got
         t = torch.as_tensor(_Block(ptr, size, index), device=f"cuda:{index}")

@@ -38,7 +38,16 @@ from ..blocks.base import Block, Channel, Fmt
 from ..blocks.gfx950.attention import mla_window as mw
 from ..device.gfx950 import buffer_ops as bo
 from ..device.gfx950 import mailbox as mb
-from ..device.gfx950.ops import bf2_f32, bf16_round, ld_i32, rope_sin, rsrc, traced, uniform, xshfl
+from ..device.gfx950.ops import (
+    bf2_f32,
+    bf16_round,
+    ld_i32,
+    rope_sin,
+    rsrc,
+    traced,
+    uniform,
+    xshfl,
+)
 from ..plan.program import Scenario, Stage
 
 THREADS, WAVES = mw.THREADS, mw.WAVES
@@ -61,7 +70,9 @@ class _BPlan(mw._APlan):
         return self.a_b + self.spec * PITCH
 
     @property
-    def a_p2(self):  # the block probabilities [TILE][BKEYS] (f32 of the bf16-rounded values)
+    def a_p2(
+        self,
+    ):  # the block probabilities [TILE][BKEYS] (f32 of the bf16-rounded values)
         return self.a_s2 + TILE * BKEYS
 
     @property
@@ -85,7 +96,13 @@ def _ring_issue(k, p: _BPlan, slot, pos_w):
         kp = pos_w - (WINDOW - 1) + k.wave * (WINDOW // WAVES) + i
         q = ((kp % ring_slots) + ring_slots) % ring_slots
         row = slot * slot_rows + (q // stride) * run + q % stride
-        out.append(fx.Vector(bo.buffer_load(r_ring, row * (HD // 2) + k.lane * 4, vec_width=4, dtype=T.i32)))
+        out.append(
+            fx.Vector(
+                bo.buffer_load(
+                    r_ring, row * (HD // 2) + k.lane * 4, vec_width=4, dtype=T.i32
+                )
+            )
+        )
     return out
 
 
@@ -96,9 +113,12 @@ def _block_keys(k, p: _BPlan, b):
         w = j * (THREADS * 2) + k.tid * 2
         row, dw = w // (HD // 2), w % (HD // 2)
         if row < p.spec:
-            got = mb.poll([(k.mb[p.kvn], (b * p.spec + row) * (HD // 2) + dw, 2)], k.tag)[0]
+            got = mb.poll(
+                [(k.mb[p.kvn], (b * p.spec + row) * (HD // 2) + dw, 2)], k.tag
+            )[0]
             fx.ptr_store(
-                fx.Vector.from_elements(got, fx.Int32).bitcast(fx.Float32), k.ldsf + (p.a_b + row * PITCH + dw)
+                fx.Vector.from_elements(got, fx.Int32).bitcast(fx.Float32),
+                k.ldsf + (p.a_b + row * PITCH + dw),
             )
 
 
@@ -133,13 +153,17 @@ def _s2_store(k, p: _BPlan, pair, part, hh, key, acc):
 def _softmax_block(k, p: _BPlan):
     """Thread h < 16: the block chunk's step of the online softmax after the window's two (``mla_window._ml_store``'s
     max / denominator): the chunk's max, the correction, the probabilities (bf16 into ``a_p2``), the denominator; the
-    final max and denominator back where ``_finish`` reads them, the correction into ``a_c2``."""
+    final max and denominator back where ``_finish`` reads them, the correction into ``a_c2``.
+    """
     if k.tid < TILE:
         hh = k.tid
         scale = fx.Float32(1.0 / math.sqrt(HD))
         m_prev = fx.ptr_load(k.ldsf + (p.a_ml + hh))
         den = fx.ptr_load(k.ldsf + (p.a_ml + TILE + hh))
-        s = [fx.ptr_load(k.ldsf + (p.a_s2 + hh * BKEYS + j)) * scale for j in range(p.spec)]
+        s = [
+            fx.ptr_load(k.ldsf + (p.a_s2 + hh * BKEYS + j)) * scale
+            for j in range(p.spec)
+        ]
         mx = s[0]
         for v in s[1:]:
             mx = fx.max(mx, v)
@@ -162,15 +186,25 @@ def _pv_block(k, p: _BPlan, acc):
     ld = k.lane // 16
     heads = [ld * 4 + e for e in range(4)]
     corr = [fx.ptr_load(k.ldsf + (p.a_c2 + h)) for h in heads]
-    probs = [[fx.ptr_load(k.ldsf + (p.a_p2 + h * BKEYS + j)) for j in range(p.spec)] for h in heads]
+    probs = [
+        [fx.ptr_load(k.ldsf + (p.a_p2 + h * BKEYS + j)) for j in range(p.spec)]
+        for h in heads
+    ]
     out = []
     for dim, vals in acc:
-        vw = [fx.ptr_load(k.ldsf + (p.a_b + j * PITCH + dim // 2)).bitcast(fx.Int32) for j in range(p.spec)]
+        vw = [
+            fx.ptr_load(k.ldsf + (p.a_b + j * PITCH + dim // 2)).bitcast(fx.Int32)
+            for j in range(p.spec)
+        ]
         lo = (dim % 2) == 0
         vv = []
         for w in vw:
             a, b = bf2_f32(w)
-            vv.append(lo.select(a, b) if not isinstance(dim, int) else (a if dim % 2 == 0 else b))
+            vv.append(
+                lo.select(a, b)
+                if not isinstance(dim, int)
+                else (a if dim % 2 == 0 else b)
+            )
         new = []
         for e in range(4):
             t = vals[e] * corr[e]
@@ -220,20 +254,35 @@ class MLABlockAttn(Block):
         if heads < 1:
             raise ValueError(f"MLABlockAttn {name}: heads {heads}")
         if q.fmt is not Fmt.BF16 or q.width != heads * HD or q.flagged:
-            raise ValueError(f"MLABlockAttn {name}: q is a tagged BF16 channel of width {heads * HD}")
+            raise ValueError(
+                f"MLABlockAttn {name}: q is a tagged BF16 channel of width {heads * HD}"
+            )
         if kvn.fmt is not Fmt.BF16 or kvn.width != HD or kvn.flagged:
-            raise ValueError(f"MLABlockAttn {name}: kvn is a tagged BF16 channel of width {HD}")
+            raise ValueError(
+                f"MLABlockAttn {name}: kvn is a tagged BF16 channel of width {HD}"
+            )
         if out.fmt is not Fmt.MXFP8 or out.width != heads * HD or out.flagged:
-            raise ValueError(f"MLABlockAttn {name}: out is a tagged MXFP8 channel of width {heads * HD}")
+            raise ValueError(
+                f"MLABlockAttn {name}: out is a tagged MXFP8 channel of width {heads * HD}"
+            )
         self.name, self.q, self.kvn, self.out, self.heads = name, q, kvn, out, heads
-        self.pos, self.rope, self.sink, self.ring, self.geo, self.slot = pos, rope, sink, ring, geo, slot
+        self.pos, self.rope, self.sink, self.ring, self.geo, self.slot = (
+            pos,
+            rope,
+            sink,
+            ring,
+            geo,
+            slot,
+        )
         # the output's inverse RoPE quantized from f32 (``MLAWindowAttn(unrope_f32=)``: ATOM's order, the draft's K2a
         # irq path); False: bf16-rounded first (the official order). A numerics choice, not a schedule knob
         self.unrope_f32 = unrope_f32
 
     def plan(self, sc: Scenario) -> _BPlan:
         if not 1 <= sc.spec <= BKEYS:
-            raise ValueError(f"MLABlockAttn {self.name}: a block of 1 .. {BKEYS} rows, got {sc.spec}")
+            raise ValueError(
+                f"MLABlockAttn {self.name}: a block of 1 .. {BKEYS} rows, got {sc.spec}"
+            )
         return _BPlan(self.name, sc.rows, sc.spec, self.q.name, self.kvn.name, self.ring, self.pos, self.rope,
                       self.sink, self.out.name, f"{self.name}.done", self.heads, WINDOW, False, 1,
                       unrope_f32=self.unrope_f32, ring_arg=self.ring, geo=self.geo, slot=self.slot)  # fmt: skip
@@ -242,6 +291,14 @@ class MLABlockAttn(Block):
         p = self.plan(sc)
         tasks = sc.rows * p.tiles
         writes = tuple(self.out.regions(sc.rows, (self.name,)))
-        args = (self.pos, self.ring, self.rope, rope_sin(self.rope), self.sink, self.geo, self.slot)
+        args = (
+            self.pos,
+            self.ring,
+            self.rope,
+            rope_sin(self.rope),
+            self.sink,
+            self.geo,
+            self.slot,
+        )
         return [Stage(self.name, tasks, partial(_attn, p=p), lds_words=p.lds_words, writes=writes, args=args,
                       key=(p,))]  # fmt: skip

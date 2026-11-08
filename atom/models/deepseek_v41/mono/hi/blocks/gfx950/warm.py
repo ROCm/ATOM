@@ -69,7 +69,10 @@ class _WPlan:
 
     @property
     def spread_lines(self) -> int:  # lines per task
-        lo, hi = int(self.lo * self.w_bytes) // self.line, int(self.hi * self.w_bytes) // self.line
+        lo, hi = (
+            int(self.lo * self.w_bytes) // self.line,
+            int(self.hi * self.w_bytes) // self.line,
+        )
         return -(-(hi - lo) // self.tasks)
 
 
@@ -107,7 +110,18 @@ class Idle:
     w: _WPlan
 
     @classmethod
-    def of(cls, target, sc: Scenario, mode="own", skip=None, lo=0.0, hi=1.0, line=128, cm=0, cap=4) -> "Idle":
+    def of(
+        cls,
+        target,
+        sc: Scenario,
+        mode="own",
+        skip=None,
+        lo=0.0,
+        hi=1.0,
+        line=128,
+        cm=0,
+        cap=4,
+    ) -> "Idle":
         name = f"idle.{target.name}"
         return cls(_plan(name, target, sc, mode, GRID, skip, lo, hi, line, cm, cap))
 
@@ -127,9 +141,14 @@ def idle_issue(k):
         return None
     w = hook.w
     if w.mode == "own":
-        tt = (fresh(k.bid) - _target_base(k, w) % GRID + GRID) % GRID  # VGPR math: SGPRs are scarce in hosts
+        tt = (
+            fresh(k.bid) - _target_base(k, w) % GRID + GRID
+        ) % GRID  # VGPR math: SGPRs are scarce in hosts
         n = min(w.cap, -(-w.own_lines // THREADS))
-        offs = [_own_off(k, w, tt, fx.Int32(j * THREADS) + k.tid, tt < w.tasks_t) for j in range(n)]
+        offs = [
+            _own_off(k, w, tt, fx.Int32(j * THREADS) + k.tid, tt < w.tasks_t)
+            for j in range(n)
+        ]
     else:
         n = min(w.cap, -(-w.spread_lines // THREADS))
         offs = [_spread_off(w, k.bid, fx.Int32(j * THREADS) + k.tid) for j in range(n)]
@@ -158,7 +177,13 @@ def _touch_global(ptr, word):
     """One dword at word ``word`` of ``ptr`` (out-of-range words: word 0, a harmless repeat)."""
     word = (word == fx.Int32(OOB)).select(fx.Int32(0), word)
     addr = ptr + (fx.Int64(word) << 2)
-    return fx.Int32(fx.ptr_load(fx.inttoptr(fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4), addr)))
+    return fx.Int32(
+        fx.ptr_load(
+            fx.inttoptr(
+                fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4), addr
+            )
+        )
+    )
 
 
 def _fold(vals):
@@ -172,7 +197,12 @@ def _fold(vals):
 def _sink(k, w, acc):
     if (acc == fx.Int32(0x5EED)) & (k.tag == 0):  # tags are >= 1
         ptr = getattr(k, "kargs", k.args)[f"{w.target}.w"]
-        fx.generic_store(fx.inttoptr(fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4), ptr), acc)
+        fx.generic_store(
+            fx.inttoptr(
+                fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4), ptr
+            ),
+            acc,
+        )
 
 
 def _own_off(k, w, tt, li, valid):

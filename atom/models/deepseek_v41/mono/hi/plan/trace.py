@@ -36,7 +36,9 @@ class Access:
     region: str
     space: Space
     kind: str  # "put" | "poll"
-    seq: int = -1  # position in the record's trace order (``Mem.seq``'s sequence); -1: not ordered (hand-made)
+    seq: int = (
+        -1
+    )  # position in the record's trace order (``Mem.seq``'s sequence); -1: not ordered (hand-made)
 
 
 # root kinds: where an address comes from
@@ -50,9 +52,13 @@ class Mem:
     stage: str
     seq: int
     op: str  # "load" | "store" | "wait"
-    kind: str = ""  # the target's root kind: ARG / REGION / PEER / INTERNAL, "unknown" (no root reached), "" (a wait)
+    kind: str = (
+        ""  # the target's root kind: ARG / REGION / PEER / INTERNAL, "unknown" (no root reached), "" (a wait)
+    )
     target: str = ""  # arg or region name ("" for a wait / unknown)
-    cm: int = 0  # cache-policy bits (``ops.CM_*``); a wait: its vmcnt (-1: not a vmcnt wait)
+    cm: int = (
+        0  # cache-policy bits (``ops.CM_*``); a wait: its vmcnt (-1: not a vmcnt wait)
+    )
     nbytes: int = 0
     # a store: per 8 B half of the data (a 4 B store: its word), a word derived from the tag; None: words not seen
     tagged: tuple | None = None
@@ -70,7 +76,9 @@ class Record:
     roots: dict = field(default_factory=dict)  # ir.Value -> (kind, name)
     memo: dict = field(default_factory=dict)  # ir.Value -> frozenset of roots reached
     quiet: int = 0  # > 0: memory operations not recorded (debug-build bookkeeping)
-    waived: list = field(default_factory=list)  # the memory-model problems the program waived (``check_memory``)
+    waived: list = field(
+        default_factory=list
+    )  # the memory-model problems the program waived (``check_memory``)
 
     def next_seq(self) -> int:
         self.n += 1
@@ -112,7 +120,9 @@ def enter_stage(name: str) -> None:
 
 def note(region: str, space: Space, kind: str) -> None:
     if _record is not None:
-        _record.accesses.append(Access(_stage(), region, space, kind, _record.next_seq()))
+        _record.accesses.append(
+            Access(_stage(), region, space, kind, _record.next_seq())
+        )
 
 
 @contextmanager
@@ -168,7 +178,8 @@ def _plain(v):
 
 def _preds(v):
     """The values ``v`` is computed from: an op result's operands (for an op with regions also its terminators'
-    operands at the result's position); a region argument's init operand (``scf.for`` / ``scf.while``)."""
+    operands at the result's position); a region argument's init operand (``scf.for`` / ``scf.while``).
+    """
     from flydsl._mlir import ir
 
     owner = v.owner
@@ -179,7 +190,11 @@ def _preds(v):
         op = _op(parent)
         i = ir.BlockArgument(v).arg_number
         if op.name == "scf.for":
-            return [_plain(op.operands[3 + i - 1])] if i >= 1 and 3 + i - 1 < len(op.operands) else []
+            return (
+                [_plain(op.operands[3 + i - 1])]
+                if i >= 1 and 3 + i - 1 < len(op.operands)
+                else []
+            )
         if op.name == "scf.while":
             return [_plain(op.operands[i])] if i < len(op.operands) else []
         return []
@@ -238,7 +253,11 @@ def _target(addr):
     if len(rs) > 1:  # e.g. a select between two buffers: name them all
         rs = sorted(rs, key=lambda r: (r[1], r[0]))
         kinds = {k for k, _ in rs}
-        return (kinds.pop() if len(kinds) == 1 else "mixed"), "|".join(n for _, n in rs), tuple(k for k, _ in rs)
+        return (
+            (kinds.pop() if len(kinds) == 1 else "mixed"),
+            "|".join(n for _, n in rs),
+            tuple(k for k, _ in rs),
+        )
     return rs[0][0], rs[0][1], ()
 
 
@@ -290,11 +309,30 @@ def mem(op: str, addr, cm: int = 0, nbytes: int = 0, data=None) -> None:
         return
     kind, target, kinds = _target(addr)
     tagged = _tagged(data, nbytes) if op == "store" and kind in (REGION, PEER) else None
-    _record.mem.append(Mem(_stage(), _record.next_seq(), op, kind, target, int(cm), nbytes, tagged, kinds))
+    _record.mem.append(
+        Mem(
+            _stage(),
+            _record.next_seq(),
+            op,
+            kind,
+            target,
+            int(cm),
+            nbytes,
+            tagged,
+            kinds,
+        )
+    )
 
 
 def wait(vmcnt: int) -> None:
     """An ``s_waitcnt`` (``vmcnt`` -1: not a vector-memory wait)."""
     if _record is None or _record.quiet:
         return
-    _record.mem.append(Mem(_stage(), _record.next_seq(), "wait", cm=vmcnt if isinstance(vmcnt, int) else -1))
+    _record.mem.append(
+        Mem(
+            _stage(),
+            _record.next_seq(),
+            "wait",
+            cm=vmcnt if isinstance(vmcnt, int) else -1,
+        )
+    )

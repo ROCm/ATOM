@@ -25,7 +25,9 @@ class Target:
     lds_bytes: int  # one CTA owns the CU's LDS
     grid: int = 0  # resident CTAs of a launch (0: one per CU)
     mcpu: str = ""  # LLVM CPU (default: arch)
-    xcds: int = 0  # CTA c runs on XCD c % xcds (each XCD has its own L2: plain stores are not seen across them);
+    xcds: int = (
+        0  # CTA c runs on XCD c % xcds (each XCD has its own L2: plain stores are not seen across them);
+    )
     # 0: not modeled (``plan.check.check_memory``, the memory model, is calibrated on gfx950 only)
     # NUMA: two I/O dies; an address's home IOD flips every 8 KiB inside a 2 MiB page
     # (bit 13 XOR a bit of the page). Dual-copy regions (``Program.dual``, ``Region.home``) keep a copy on each, laid
@@ -38,7 +40,9 @@ class Target:
         if not self.mcpu:
             object.__setattr__(self, "mcpu", self.arch)
         if not 1 <= self.grid <= self.cus:
-            raise ValueError(f"{self.arch}: grid {self.grid} outside 1..{self.cus} (one resident CTA per CU)")
+            raise ValueError(
+                f"{self.arch}: grid {self.grid} outside 1..{self.cus} (one resident CTA per CU)"
+            )
 
     @property
     def waves(self) -> int:

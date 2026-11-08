@@ -38,5 +38,3 @@ def update_dpp_i32(
         [],
         **kw,
     )
-
-

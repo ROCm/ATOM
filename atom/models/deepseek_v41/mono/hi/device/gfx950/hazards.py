@@ -55,10 +55,14 @@ def srcc_hazards(text: str) -> list[str]:
             else:
                 if pm.startswith("v_mfma"):
                     d = _regs(re.split(r",\s*", pa)[0])
-                    if d and d[0] == c[0] and d[1] <= c[2] and c[1] <= d[2]:  # the latest MFMA writing any of it
+                    if (
+                        d and d[0] == c[0] and d[1] <= c[2] and c[1] <= d[2]
+                    ):  # the latest MFMA writing any of it
                         need = GAPS.get((pm, mn), UNKNOWN_GAP)
                         if d == c and pm != mn and ws < need:
-                            out.append(f"{addr}: {mn} srcC {ws} wait states after {pm} (needs {need})")
+                            out.append(
+                                f"{addr}: {mn} srcC {ws} wait states after {pm} (needs {need})"
+                            )
                         break
                 ws += 1
             j -= 1

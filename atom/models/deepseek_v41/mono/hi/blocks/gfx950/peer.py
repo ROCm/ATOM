@@ -48,7 +48,9 @@ from ...plan.trace import Space
 from ...target import MI355X
 
 THREADS = MI355X.threads
-AUTO_SPREAD_WORDS = 16384  # proto "auto": "spread" up to this many words a step, "two_shot" above
+AUTO_SPREAD_WORDS = (
+    16384  # proto "auto": "spread" up to this many words a step, "two_shot" above
+)
 
 
 @dataclass(frozen=True)
@@ -62,7 +64,9 @@ class _Plan:
     out: str  # output channel ("" if none)
     out_arg: str  # output arg ("" if none)
     proto: str = "tagged"
-    chunk: int = THREADS  # spread / two_shot: words a task (threads past it idle): more, smaller tasks
+    chunk: int = (
+        THREADS  # spread / two_shot: words a task (threads past it idle): more, smaller tasks
+    )
 
     @property
     def q(self) -> int:  # two_shot: words an owner reduces
@@ -77,20 +81,37 @@ class PeerAllReduce(Block):
     def __init__(self, name: str, x: Channel, out: Channel | None = None, out_arg: str | None = None,
                  proto: str = "auto", chunk: int = THREADS):  # fmt: skip
         if x.fmt not in (Fmt.BF16, Fmt.F32) or x.flagged:
-            raise ValueError(f"PeerAllReduce {name}: input must be a tagged BF16 or F32 channel")
-        if out is not None and (out.fmt is not x.fmt or out.width != x.width or out.flagged):
-            raise ValueError(f"PeerAllReduce {name}: output channel must match the input's format and width")
+            raise ValueError(
+                f"PeerAllReduce {name}: input must be a tagged BF16 or F32 channel"
+            )
+        if out is not None and (
+            out.fmt is not x.fmt or out.width != x.width or out.flagged
+        ):
+            raise ValueError(
+                f"PeerAllReduce {name}: output channel must match the input's format and width"
+            )
         if out is None and not out_arg:
             raise ValueError(f"PeerAllReduce {name}: give an output channel or arg")
         if proto not in ("auto", "tagged", "spread", "two_shot"):
-            raise ValueError(f"PeerAllReduce {name}: proto auto / tagged / spread / two_shot, got {proto!r}")
+            raise ValueError(
+                f"PeerAllReduce {name}: proto auto / tagged / spread / two_shot, got {proto!r}"
+            )
         if not 0 < chunk <= THREADS:
             raise ValueError(f"PeerAllReduce {name}: chunk in 1 .. {THREADS}")
-        self.name, self.x, self.out, self.out_arg, self.proto, self.chunk = name, x, out, out_arg or "", proto, chunk
+        self.name, self.x, self.out, self.out_arg, self.proto, self.chunk = (
+            name,
+            x,
+            out,
+            out_arg or "",
+            proto,
+            chunk,
+        )
 
     def plan(self, sc: Scenario) -> _Plan:
         if sc.tp < 2:
-            raise ValueError(f"PeerAllReduce {self.name}: needs a TP scenario (tp > 1), got {sc.name}")
+            raise ValueError(
+                f"PeerAllReduce {self.name}: needs a TP scenario (tp > 1), got {sc.name}"
+            )
         words = sc.rows * self.x.words_per_row()
         proto = self.proto
         if proto == "auto":  # latency-bound below ~16K words, bandwidth-bound above
@@ -114,16 +135,31 @@ class PeerAllReduce(Block):
             return self._two_shot(sc, p)
         if p.proto == "spread":
             return self._spread(sc, p)
-        writes = [Region(p.peer, p.words, (self.name,), space=Space.PEER, exchange=True)]
+        writes = [
+            Region(p.peer, p.words, (self.name,), space=Space.PEER, exchange=True)
+        ]
         if self.out is not None:
             writes += list(self.out.regions(sc.rows, (self.name,)))
         args = (p.out_arg,) if p.out_arg else ()
         tasks = -(-p.words // THREADS)
-        return [Stage(self.name, tasks, partial(_reduce, p=p), writes=tuple(writes), args=args, key=(p,))]
+        return [
+            Stage(
+                self.name,
+                tasks,
+                partial(_reduce, p=p),
+                writes=tuple(writes),
+                args=args,
+                key=(p,),
+            )
+        ]
 
     def _spread(self, sc: Scenario, p: _Plan) -> list[Stage]:
         chunks = -(-p.words // p.chunk)
-        writes = tuple(self.out.regions(sc.rows, (f"{self.name}.sum",))) if self.out is not None else ()
+        writes = (
+            tuple(self.out.regions(sc.rows, (f"{self.name}.sum",)))
+            if self.out is not None
+            else ()
+        )
         args = (p.out_arg,) if p.out_arg else ()
         return [
             Stage(self.name, p.tp * chunks, partial(_spread_put, p=p),
@@ -135,12 +171,27 @@ class PeerAllReduce(Block):
         own, out = f"{self.name}.own", f"{self.name}.out"
         scatter = (Region(f"{p.peer}.rs", p.q, (self.name,), space=Space.PEER),)
         gather = (Region(f"{p.peer}.ag", p.q, (own,), space=Space.PEER),)
-        writes = tuple(self.out.regions(sc.rows, (out,))) if self.out is not None else ()
+        writes = (
+            tuple(self.out.regions(sc.rows, (out,))) if self.out is not None else ()
+        )
         args = (p.out_arg,) if p.out_arg else ()
         return [
-            Stage(self.name, p.tp * p.tpo, partial(_scatter, p=p), writes=scatter, key=(p,)),
+            Stage(
+                self.name,
+                p.tp * p.tpo,
+                partial(_scatter, p=p),
+                writes=scatter,
+                key=(p,),
+            ),
             Stage(own, p.tp * p.tpo, partial(_own, p=p), writes=gather, key=(p,)),
-            Stage(out, p.tp * p.tpo, partial(_gather, p=p), writes=writes, args=args, key=(p,)),
+            Stage(
+                out,
+                p.tp * p.tpo,
+                partial(_gather, p=p),
+                writes=writes,
+                args=args,
+                key=(p,),
+            ),
         ]
 
 
@@ -162,7 +213,9 @@ def _sum_word(p, words):
 def _reduce(k, t, p):
     w = t * THREADS + k.tid
     valid = w < p.words
-    wc = fx.min(w, fx.Int32(p.words - 1))  # an idle thread polls a real word, puts nothing
+    wc = fx.min(
+        w, fx.Int32(p.words - 1)
+    )  # an idle thread polls a real word, puts nothing
     mine = mb.poll([(k.mb[p.x], wc, 1)], k.tag)[0][0]
     if valid:
         for dst in range_constexpr(p.tp):
@@ -230,7 +283,9 @@ def _own(k, t, p):
     w = k.rank * p.q + i
     valid = (i < p.q) & (w < p.words) & (k.tid < p.chunk)
     ic = fx.min(i, fx.Int32(p.q - 1))
-    got = mb.poll([(from_rank(k, f"{p.peer}.rs", src), ic, 1) for src in range(p.tp)], k.tag)
+    got = mb.poll(
+        [(from_rank(k, f"{p.peer}.rs", src), ic, 1) for src in range(p.tp)], k.tag
+    )
     y = _sum_word(p, [g[0] for g in got])
     if valid:
         mb.put(to_rank(k, f"{p.peer}.ag", dst), i, y, k.tag)
@@ -242,7 +297,9 @@ def _gather(k, t, p):
     i = i0 + k.tid
     w = o * p.q + i
     valid = (i < p.q) & (w < p.words) & (k.tid < p.chunk)
-    y = mb.poll([(from_rank(k, f"{p.peer}.ag", o), fx.min(i, fx.Int32(p.q - 1)), 1)], k.tag)[0][0]
+    y = mb.poll(
+        [(from_rank(k, f"{p.peer}.ag", o), fx.min(i, fx.Int32(p.q - 1)), 1)], k.tag
+    )[0][0]
     if valid:
         if p.out:
             mb.put(k.mb[p.out], w, y, k.tag)

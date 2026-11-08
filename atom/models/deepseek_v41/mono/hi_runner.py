@@ -97,6 +97,7 @@ import triton
 import triton.language as tl
 
 from atom.models.deepseek_v41.mono import hi_bridge as ml
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.models.deepseek_v41.mono import hi_plan
 from atom.models.deepseek_v41.mono import hi_weights as hw
 from atom.models.deepseek_v41.mono.hi_draft import (
@@ -124,6 +125,7 @@ from atom.models.deepseek_v41.mono.hi_gate import (  # noqa: F401 (REQ_ROWS re-e
     MAX_CTX,
     REQ_ROWS,
 )
+from atom.utils.packed_h2d import DeviceAddress, device_address
 
 logger = logging.getLogger("atom")
 
@@ -159,11 +161,11 @@ class HiLayers(HiDraft, HiPrograms):
         self.rank = get_tensor_model_parallel_rank()
         cfg = model.config
         if cfg.hc_mult != HC or cfg.hidden_size != L.HIDDEN:
-            raise ValueError(
+            raise MonoUnsupported(
                 f"hc_mult {cfg.hc_mult} / hidden {cfg.hidden_size} is not the hi runtime's V4.1"
             )
         if int(atom_config.max_model_len) > max_ctx:
-            raise ValueError(
+            raise MonoUnsupported(
                 f"max_model_len {atom_config.max_model_len} > the hi programs' context bucket {max_ctx} (set "
                 "--max-model-len)"
             )
@@ -178,7 +180,7 @@ class HiLayers(HiDraft, HiPrograms):
         self.lean_host, self.served_widths, self.lean_steps = False, set(), 0
         self.head_rows = 0
         if float(getattr(model.norm, "eps", L.EPS)) != float(L.EPS):
-            raise ValueError(
+            raise MonoUnsupported(
                 f"V4.1 mono hi verify head: final norm eps {model.norm.eps} != the hi runtime's {L.EPS}"
             )
         dev = self.dev = torch.device("cuda", torch.cuda.current_device())
@@ -343,8 +345,6 @@ class HiLayers(HiDraft, HiPrograms):
             nbytes += self._engram_tables(model, dev)
         nbytes += self._head_tables(model, dev)
         # ---- the DSpark draft on the hi path: its context-KV write and the block draft (module docstring)
-        # (width, query bucket) -> True: forwards of that shape launch CTX
-        self.ctx_keys: dict = {}
         self.cx_tables = {}
         self.cx_layers, self.cx_drafter = None, None
         nbytes += self._ctx_build(draft, dev)
@@ -469,8 +469,9 @@ class HiLayers(HiDraft, HiPrograms):
         ``EngramHost``, page-locked at load, a page-locked copy or the mapping registered in place: the same rows
         the hi runtime's ``shard_rows`` names, checked), its pointer tables rebuilt; and ``staging`` (ATOM's
         ``EngramStaging``) skips the step's lookup, all-gather, copies and compressed-id snapshot on the steps the hook
-        serves (nothing reads its staged rows; the begin-step writes the cursor candidates the verdict commits:
-        ``_fold_args``), keeping the cursor advance."""
+        serves (``EngramStep.served_by_round``, the builder's routing decision: nothing reads its staged rows; the
+        begin-step writes the cursor candidates the verdict commits: ``_fold_args``), keeping the cursor advance.
+        """
         from .hi.blocks.gfx950.engram import shard_rows
         from .hi.v41 import engram_io
 
@@ -504,8 +505,8 @@ class HiLayers(HiDraft, HiPrograms):
             )
             logger.info("Engram layer %d: ATOM's host shard rows [%d, %d), page-locked at %#x / %#x", i, lo, hi,
                         wbase, sbase)  # fmt: skip
-            self._eng_args[f"{n}.tq"] = _device_address(tq.data_ptr(), wbase)
-            self._eng_args[f"{n}.ts"] = _device_address(ts.data_ptr(), sbase)
+            self._eng_args[f"{n}.tq"] = device_address(tq.data_ptr(), wbase)
+            self._eng_args[f"{n}.ts"] = device_address(ts.data_ptr(), sbase)
             # kept alive with the hook
             self._eng_host = getattr(self, "_eng_host", []) + [
                 tq,
@@ -519,23 +520,6 @@ class HiLayers(HiDraft, HiPrograms):
             self.tables[ENGKV, s] = self.eng_programs[s].table(
                 self._eng_args, device=dev, peers=self.eng_peers
             )
-        hook = self
-
-        def served(width) -> bool:
-            # the runner's own predicate for the hook's path (``serves_step``): it holds on a graph capture's dummy
-            # step of a served width too, so the capture records the lean staging its replays run
-            from atom.utils.forward_context import get_forward_context
-
-            step = getattr(get_forward_context().attn_metadata, "step", None)
-            rows = int(getattr(step, "width", width) or width)
-            return (
-                step is not None
-                and hook.runs_every_layer
-                and hook.serves_step(rows, step)
-            )
-
-        # ATOM's staging skips its lookup on those steps (its ``lookup_served`` hook), keeping the cursor advance
-        staging.lookup_served = served
         logger.info("V4.1 mono hi: Engram lookup from ATOM's host shards at widths %s; ATOM's staging skipped on "
                     "served steps", self.widths)  # fmt: skip
 
@@ -549,10 +533,10 @@ class HiLayers(HiDraft, HiPrograms):
             tuple(head_w.shape) != (n, self.h_in0.shape[-1])
             or head_w.dtype != torch.bfloat16
         ):
-            raise ValueError(f"V4.1 mono hi verify head: head.weight {tuple(head_w.shape)} {head_w.dtype}, want bf16 "
+            raise MonoUnsupported(f"V4.1 mono hi verify head: head.weight {tuple(head_w.shape)} {head_w.dtype}, want bf16 "
                              f"[{n}, {self.h_in0.shape[-1]}] (this rank's vocab rows)")  # fmt: skip
         if not torch.equal(norm_w.float(), norm_w.bfloat16().float()):
-            raise ValueError(
+            raise MonoUnsupported(
                 "V4.1 mono hi verify head: the final norm weight is not bf16-exact"
             )
         R, H = self.h_in0.shape[0], self.h_in0.shape[-1]
@@ -669,14 +653,13 @@ class HiLayers(HiDraft, HiPrograms):
 
     # ------------------------------------------------------------ routing
 
-    def serves_step(self, rows: int, step) -> bool:
-        """Host-side, TP-uniform: whether this step runs the hi layers: a decode at a width of the hook whose
-        query bucket is the width's rows a request (one request: the whole step, a bs-1 graph; B requests: B x
-        rq rows, a bs-B graph whose requests each verify rq rows)."""
+    def serves_width(self, rows: int, max_q_len) -> bool:
+        """Host-side, TP-uniform: whether a decode of ``rows`` rows at query bucket ``max_q_len`` is a shape the hi
+        layers run: a width of the hook whose query bucket is the width's rows a request (one request: the whole step,
+        a bs-1 graph; B requests: B x rq rows, a bs-B graph whose requests each verify rq rows). Part of the step's
+        routing decision (``round.HiRound.service``)."""
         split = self.split.get(rows)
-        if split is None:
-            return False
-        return int(getattr(step, "max_q_len", 0) or 0) == split[1] and step.decode
+        return split is not None and int(max_q_len or 0) == split[1]
 
     def invalidate(self, step=None, dummy: bool = False) -> None:
         """A forward this hook does not serve (a prefill, another width, ATOM's own path) writes the caches of its
@@ -1061,38 +1044,13 @@ def _read_rows_kernel(src, rows, out, WIDTH: tl.constexpr):
     tl.store(out + i * WIDTH + c, tl.load(src + r * WIDTH + c))
 
 
-class _Address:
-    """A raw device address as a Triton pointer argument (``data_ptr`` / ``dtype``)."""
-
-    def __init__(self, addr: int, dtype=torch.uint8):
-        self.addr, self.dtype = addr, dtype
-
-    def data_ptr(self) -> int:
-        return self.addr
-
-
 def _read_rows(addr: int, width: int, idx) -> torch.Tensor:
     """uint8 [len(idx), width] read on the device from the uint8 [*, width] table at device address ``addr``."""
     rows = torch.tensor(idx, dtype=torch.int64, device="cuda")
     out = torch.empty(len(idx), width, dtype=torch.uint8, device="cuda")
-    _read_rows_kernel[(len(idx),)](_Address(addr), rows, out, WIDTH=width)
+    _read_rows_kernel[(len(idx),)](DeviceAddress(addr), rows, out, WIDTH=width)
     torch.cuda.synchronize()
     return out
-
-
-def _device_address(host_ptr: int, base: int) -> int:
-    """The device address of ``host_ptr``, a byte in the page-locked host range at ``base``
-    (``hipHostGetDevicePointer`` of the range, plus the offset)."""
-    import ctypes
-
-    hip = ctypes.CDLL("libamdhip64.so")
-    dev = ctypes.c_void_p()
-    rc = hip.hipHostGetDevicePointer(
-        ctypes.byref(dev), ctypes.c_void_p(base), ctypes.c_uint(0)
-    )
-    if rc != 0 or not dev.value:
-        raise RuntimeError(f"hipHostGetDevicePointer({base:#x}) failed ({rc})")
-    return dev.value + (host_ptr - base)
 
 
 def engram_consts(mapping) -> dict:

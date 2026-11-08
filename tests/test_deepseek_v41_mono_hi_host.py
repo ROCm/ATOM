@@ -3,12 +3,14 @@
 """The V4.1 mono hi hook's host-side glue (``ATOM_DSV41_MONO_HI``), on stand-ins for ATOM's runner, token processor,
 sampler, metadata builder, cache and proposer: no GPU, no hi, no aiter. The device-side advance runs in the
 Triton interpreter; the parts that load a module with Triton kernels (the device round, the post-verify) skip without
-Triton, the rest (the lean host prep, the gate's import guard) run without it.
+Triton, the rest (the routing decision, the lean host prep, the gate's import guard) run without it.
 
-- lean host prep (``lean_host``): the served-step predicate and the builder's hooks;
+- the step's routing decision (``HiRound.service``: ``AttentionMetaData.served_by_round``) and the lean host prep's
+  predicate (``lean_host``);
 - the device round (``device_round``): the advance kernel, its predicates and its hooks (``hi_round``) in forward
   order, the first step after a prefill;
-- the post-verify's routing (``post_verify``) and ATOM's Engram staging on served steps (its ``lookup_served``);
+- the post-verify's routing (``post_verify``) and ATOM's Engram staging on served steps
+  (``EngramStep.served_by_round``);
 - the install's refusals (``hi_dispatch``) and the flag's guard: no ``hi`` import without it.
 """
 
@@ -24,6 +26,8 @@ import numpy as np
 import pytest
 import torch
 from aiter_stub import atom_without_aiter
+
+from atom.utils.forward_context import RoundService
 
 MONO = Path(__file__).resolve().parents[1] / "atom/models/deepseek_v41/mono"
 
@@ -196,29 +200,80 @@ def test_lean_predicate_at_batch_widths_and_the_ragged_guard(lh):
     assert wrong == []
 
 
-def test_lean_host_marks_a_served_step_and_refuses_without_every_layer(lh):
-    """``LeanHost`` at the builder's decode-round hooks: a served step lays out lean (the builder then skips the
-    compress plans and the step planners) and is marked after its layout; any other step is neither; no lean host
-    prep when a layer runs on ATOM."""
-    _, hook, base = _lean_world()
-    off = SimpleNamespace(**{**vars(hook), "runs_every_layer": False})
-    assert lh.install(off) is None and not off.lean_host
-    lean = lh.install(hook)
-    assert hook.lean_host
+class _ServingHook(SimpleNamespace):
+    """The hook's surface ``HiRound.service`` reads (``HiLayers.serves_width``: a width of ``split`` at its bucket)."""
 
-    def layout(**over):
+    def serves_width(self, rows, max_q_len):
+        split = self.split.get(rows)
+        return split is not None and int(max_q_len or 0) == split[1]
+
+
+def test_service_is_the_steps_one_routing_decision():
+    """``HiRound.service``: the step's routing decision (``AttentionMetaData.served_by_round``), which the builder,
+    its cache, Engram staging, the DSpark proposer and the hook's forward all read. A decode at a served width and
+    bucket is served (``FORWARD``), lean when the lean predicate holds (``LEAN``), ``DEVICE`` on a device-round step;
+    a prefill, an image row or another shape is not. Pure Python (no Triton)."""
+    from atom.models.deepseek_v41.mono.round import HiRound, lean_host
+    from atom.utils.forward_context import RoundService as S
+
+    span = SimpleNamespace(request_id=7, length=6)
+    hook = _ServingHook(runs_every_layer=True, lean_host=False, served_widths={6}, lean_steps=0, plan={},
+                        split={6: (1, 6), 12: (2, 6)})  # fmt: skip
+    assert lean_host.install(hook) and hook.lean_host
+    rnd = HiRound(hook)
+    batch = SimpleNamespace(is_dummy_run=False, multimodal_data={})
+    base = dict(batch=batch, spans=(span,), running_bs=1, running_tokens=6, max_q_len=6, decode=True,
+                tentative=True, is_prefill=False, resumes=None, image_rows=False)  # fmt: skip
+
+    def service(**over):
         a = {**base, **over}
-        return lean.lean_layout(a["batch"], a["spans"], a["running_bs"], a["running_tokens"], max_q_len=a["max_q_len"],
-                                tentative=a["tentative"], is_prefill=a["is_prefill"], resumes=a["resumes"])  # fmt: skip
+        return rnd.service(
+            a.pop("batch"),
+            a.pop("spans"),
+            a.pop("running_bs"),
+            a.pop("running_tokens"),
+            **a,
+        )
 
-    md = SimpleNamespace(step=SimpleNamespace())
-    assert layout()
-    lean.laid_out(md, True)
-    assert md.step.lean_host and hook.lean_steps == 1
-    md2 = SimpleNamespace(step=SimpleNamespace())
-    assert not layout(max_q_len=3, running_tokens=3) and not layout(is_prefill=True)
-    lean.laid_out(md2, False)
-    assert not hasattr(md2.step, "lean_host") and hook.lean_steps == 1
+    assert service() is S.LEAN
+    cases = {
+        # the DSpark draft's context write: a prefill of the served shape (6 new tokens) is ATOM's
+        "6-token prefill": (
+            dict(is_prefill=True, tentative=False, decode=False),
+            S.NONE,
+        ),
+        # Engram staging and the forward: an image row keeps both on ATOM's path
+        "image rows": (dict(image_rows=True), S.NONE),
+        "not a decode": (dict(decode=False), S.NONE),
+        "other bucket": (dict(max_q_len=3), S.NONE),
+        "other width": (dict(running_tokens=8, max_q_len=8), S.NONE),
+        # a capture's dummy step, and a width no served forward recorded yet: served, laid out in full
+        "dummy (capture)": (
+            dict(batch=SimpleNamespace(is_dummy_run=True, multimodal_data={})),
+            S.FORWARD,
+        ),
+        "width not recorded": (
+            dict(running_tokens=12, running_bs=2, spans=(span, span)),
+            S.FORWARD,
+        ),
+    }
+    assert {k: service(**over) for k, (over, _) in cases.items()} == {
+        k: want for k, (_, want) in cases.items()
+    }
+    off = _ServingHook(**{**vars(hook), "runs_every_layer": False, "lean_host": False})
+    assert not lean_host.install(off) and HiRound(off).service(
+        batch, (span,), 1, 6, max_q_len=6, decode=True, tentative=True, is_prefill=False, resumes=None,
+        image_rows=False) is S.FORWARD  # fmt: skip
+    # a device-round step: DEVICE; one whose builder would not lay it out lean raises
+    rnd.device = SimpleNamespace(
+        state=SimpleNamespace(on=True), laid_out=lambda md: None
+    )
+    assert service() is S.DEVICE
+    with pytest.raises(RuntimeError, match="device-round"):
+        service(max_q_len=3)
+    md = SimpleNamespace(served_by_round=S.DEVICE)
+    rnd.laid_out(md)
+    assert hook.lean_steps == 1
 
 
 def test_lean_attributes_are_set_once_in_init():
@@ -367,7 +422,7 @@ class _Recorder:
     def __init__(self):
         self.arms = []
 
-    def arm(self, on):
+    def arm(self, on, decode):
         self.arms.append(on)
 
 
@@ -379,15 +434,17 @@ def _round_world(dr, monkeypatch):
     from atom.models.deepseek_v41.mono.round import HiRound
 
     log, queue, served_now, sampler_verdict = [], [], [True], [None]
-    hook = SimpleNamespace(
+    hook = _ServingHook(
         lean_host=True,
         runs_every_layer=True,
         served_widths={6, 12},
         split={6: (1, 6), 12: (2, 6)},
         bmax=2,
         pos=torch.tensor([100], dtype=torch.int32),
+        lean_steps=0,
     )
-    rnd = HiRound(device=dr.DeviceRound(hook, _Recorder()))
+
+    rnd = HiRound(hook, device=dr.DeviceRound(hook, _Recorder()))
 
     class TP:  # ``tokenIDProcessor.prepare_input_ids``
         prev_rejected_num = prev_bonus_num = None
@@ -413,30 +470,39 @@ def _round_world(dr, monkeypatch):
             log.append("verdict")
             return "tokens", sampler_verdict[0]
 
-    class Cache:  # ``PagedAttentionCache.prepare_state``: a device-round step takes no probe
+    class Cache:  # ``PagedAttentionCache``: a device-round step takes no probe
         cursor = pending = None
 
         def prepare_state(self, step, *, histories=True):
-            if not getattr(step, "device_round", False):
-                log.append("probe")
+            log.append("probe")
+
+        def prepare_device_round_state(self, step, *, histories=True):
+            pass
 
     cache = Cache()
 
-    class Builder:  # ``_prepare_step``: the lean mark stands in for ``LeanHost``'s
+    class Builder:  # ``_prepare_step``: the routing decision, the layout, then ``laid_out``
         engram = None
 
         def _prepare_step(
             self, b, spans, rows, cache_, running_bs, running_tokens, **kw
         ):
+            span = SimpleNamespace(request_id=b.req_ids[0], length=6)
+            service = (
+                rnd.service(b, (span,), running_bs, running_tokens, max_q_len=6, decode=True, tentative=True,
+                            is_prefill=False, resumes=None, image_rows=False)  # fmt: skip
+                if served_now[0]
+                else RoundService.NONE
+            )
             step = SimpleNamespace(
                 positions=torch.zeros(6, dtype=torch.int64),
                 tentative=True,
-                lean_host=served_now[0],
                 slots=torch.zeros(1, dtype=torch.int32),
+                width=6,
             )
             log.append(("build", running_bs, running_tokens))
-            md = SimpleNamespace(step=step, cache=cache_)
-            rnd.laid_out(b, spans, rows, running_bs, running_tokens, md, served_now[0])
+            md = SimpleNamespace(step=step, cache=cache_, served_by_round=service)
+            rnd.laid_out(md)
             return md, step.positions
 
     class Runner:
@@ -455,44 +521,47 @@ def _round_world(dr, monkeypatch):
         served_now[0] = served and not b.total_seqs_num_prefill
         runner.tokenID_processor.prepare_input_ids(b, 6)
         md, _ = builder._prepare_step(b, (), [], cache, 1, 6)
-        cache.prepare_state(md.step, histories=False)
+        if md.served_by_round is RoundService.DEVICE:
+            cache.prepare_device_round_state(md.step, histories=False)
+        else:
+            cache.prepare_state(md.step, histories=False)
         runner.run_model("ids", b)
         sampler_verdict[0] = torch.tensor(
             [[accepted], [5 - accepted], [accepted]], dtype=torch.int32
         )
         rnd.note_verdict(runner.rejection_sampler.forward())
-        return list(log), md.step
+        return list(log), md
 
     return forward, queue, runner, hook
 
 
 def test_device_round_wrappers_in_forward_order(dr, monkeypatch):
-    """A device-round step skips the verdict wait, advances, skips the probe and takes the owed wait after the
-    launch, in queue order; a stale verdict never carries across a forward that left none; every other step runs as
-    without the hooks."""
+    """A device-round step skips the verdict wait (its host status zeros: built as if no draft had been rejected),
+    advances, skips the probe and takes the owed wait after the launch, in queue order; a stale verdict never carries
+    across a forward that left none; every other step runs as without the hooks."""
     forward, queue, runner, hook = _round_world(dr, monkeypatch)
     queue[:] = [("r0", "b0"), ("r1", "b1"), ("r2", "b2"), ("r3", "b3"), ("r4", "b4")]
     # the first decode: no verdict yet -> host path
     l1, s1 = forward(_batch())
     assert l1 == ["recv", ("ids", "r0"), ("build", 1, 6), "probe", "replay", "verdict"]
-    assert not hasattr(s1, "device_round")
+    assert s1.served_by_round is not RoundService.DEVICE
     hook.pos.fill_(100)
     # after a served verdict (accepted 3 in forward 1)
     l2, s2 = forward(_batch(), accepted=3)
-    assert l2 == [("ids", None), ("build", 1, 6), "replay", "recv", "verdict"]
-    assert getattr(s2, "device_round", False)
-    assert s2.positions.tolist() == [104 + i for i in range(6)]
+    assert l2 == [("ids", "zeros1"), ("build", 1, 6), "replay", "recv", "verdict"]
+    assert s2.served_by_round is RoundService.DEVICE
+    assert s2.step.positions.tolist() == [104 + i for i in range(6)]
     assert runner.tokenID_processor.prev_rejected_num == "r1"
     # another request: host path, and the verdict of 7 is gone
     l3, s3 = forward(_batch(req=8))
     assert l3[:2] == ["recv", ("ids", "r2")] and "probe" in l3
-    assert not hasattr(s3, "device_round")
+    assert s3.served_by_round is not RoundService.DEVICE
     # 7 again, but forward 3 was request 8's: host path; not served -> no verdict kept
     l4, _ = forward(_batch(), served=False)
     # after an unserved forward of 7: host path
     l5, s5 = forward(_batch())
     assert l4[:2] == ["recv", ("ids", "r3")] and l5[:2] == ["recv", ("ids", "r4")]
-    assert not hasattr(s5, "device_round") and not queue
+    assert s5.served_by_round is not RoundService.DEVICE and not queue
 
 
 def test_first_step_after_a_prefill(dr, monkeypatch):
@@ -516,11 +585,11 @@ def test_first_step_after_a_prefill(dr, monkeypatch):
         "recv",
         "verdict",
     ]
-    assert not hasattr(s1, "device_round")
+    assert s1.served_by_round is not RoundService.DEVICE
     assert runner.tokenID_processor.prev_rejected_num is z
     l2, s2 = forward(_batch())  # then a device-round step, as before
-    assert l2 == [("ids", None), ("build", 1, 6), "replay", "recv", "verdict"]
-    assert getattr(s2, "device_round", False) and not queue
+    assert l2 == [("ids", "zeros1"), ("build", 1, 6), "replay", "recv", "verdict"]
+    assert s2.served_by_round is RoundService.DEVICE and not queue
 
     # a batch: request 8 prefilled alone, then a decode of 7 and 8 at the batch width
     forward, queue, runner, _ = _round_world(dr, monkeypatch)
@@ -528,7 +597,7 @@ def test_first_step_after_a_prefill(dr, monkeypatch):
     forward(_batch(req=8, total_seqs_num_prefill=1))
     lm, sm = forward(_batch(total_seqs_num=2, req_ids=[7, 8]))
     assert lm[0] == ("ids", "zeros1") and lm[-2:] == ["recv", "verdict"]
-    assert not hasattr(sm, "device_round") and not queue
+    assert sm.served_by_round is not RoundService.DEVICE and not queue
 
     for steps in (
         [_batch(total_seqs_num_prefill=1), _batch(total_seqs_num_prefill=1, out=False)],
@@ -629,21 +698,37 @@ def test_post_verify_skips_the_commit_and_the_anchor_staging_where_it_ran(
 
 
 def test_engram_staging_skips_its_lookup_on_a_served_step():
-    """ATOM's ``EngramStaging`` with the hook's ``lookup_served``: on a step the hook serves it only advances the cursor
-    (no snapshot, no side stream) and its join waits on nothing."""
+    """ATOM's ``EngramStaging`` on a step its builder routed to the hook (``EngramStep.served_by_round``, from
+    ``AttentionMetaData.served_by_round``): it only advances the cursor (no snapshot, no side stream) and its join waits
+    on nothing; on any other step (an image row's, at a served width) the full lookup, as the forward's ATOM path
+    reads it."""
     with (
         atom_without_aiter() as load
     ):  # (its hashing kernels' Triton stubbed with AITER where it is not installed)
         EngramStaging = load("atom.model_ops.engram.device.staging").EngramStaging
 
     calls = []
+
+    class Lookup(Exception):
+        """The full lookup started (its side stream needs a GPU: stopped here)."""
+
+    def snapshot(w):
+        calls.append(("snapshot", w))
+        raise Lookup
+
     staging = object.__new__(EngramStaging)
-    staging._snapshot = lambda w: calls.append(("snapshot", w))
+    staging.host = SimpleNamespace()
+    staging._snapshot = snapshot
     staging._advance_cursor = lambda w: calls.append(("cursor", w))
-    staging.lookup_served = lambda w: w in {6}
+    staging.step = SimpleNamespace(served_by_round=True)
     staging.start(6)
     staging.join()
     assert calls == [("cursor", 6)]
+    calls.clear()
+    staging.step = SimpleNamespace(served_by_round=False)
+    with pytest.raises(Lookup):
+        staging.start(6)
+    assert calls == [("snapshot", 6)] and not staging._served
 
 
 # ---------------------------------------------------------------- install and the flag's guard
