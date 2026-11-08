@@ -1520,12 +1520,17 @@ class Scheduler:
         early-exits the scan: one batch's worth is all the coalescer compares
         against, so there's no point summing a deep queue.
 
-        Skips unschedulable, ABORTED, WAITING_FOR_REMOTE_KVS, and
+        Skips unschedulable, ABORTED, in-flight WAITING_FOR_REMOTE_KVS, and
         oversized-when-chunking-off sequences —
         so the "queued work" signal counts only tokens this rank could actually
         prefill this step. Counting remote-KV / unschedulable tokens here would
         inflate the cross-rank aggregate and reach the fill target before a real
-        batch has accumulated. The `num_cached_tokens` discount is best-effort:
+        batch has accumulated. A request whose tier load has finished is
+        prefill work the admission pass resumes this tick
+        (`_tier_load_finished`): it counts what follows its loaded prefix,
+        like any waiting prefill; left out, the group's fill stays under target
+        and the delayer waits out its stall bound instead. The
+        `num_cached_tokens` discount is best-effort:
         an un-admitted seq has not been probed against the prefix cache yet, so
         this is an upper bound on new tokens for cache-hit prompts.
         """
@@ -1534,12 +1539,14 @@ class Scheduler:
         for seq in self.waiting:
             if self._unschedulable_reason(seq) is not None:
                 continue
-            if seq.status in (
-                SequenceStatus.ABORTED,
-                SequenceStatus.WAITING_FOR_REMOTE_KVS,
-            ):
+            if seq.status == SequenceStatus.ABORTED:
                 continue
-            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+            cached = seq.num_cached_tokens
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                if not self._tier_load_finished(seq):
+                    continue
+                cached = max(cached, int(getattr(seq, "offload_loaded_tokens", 0) or 0))
+            num_new_tokens = seq.num_tokens - cached
             if (
                 not self.enable_chunked_prefill
                 and num_new_tokens > self.max_num_batched_tokens
