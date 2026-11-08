@@ -118,3 +118,34 @@ def test_report_ahead_of_note_sent_does_not_double_count():
     mgr._bl_report[1] = (1, 5_000)  # the rank ingested "a" before we noted it
     mgr._bl_note_sent_locked(1, [SimpleNamespace(id="a")])
     assert mgr._bl_effective_tokens_locked()[1] == 5_000
+
+
+def _delayer_for(monkeypatch, lb, env=None):
+    from atom.model_engine.engine_core import EngineCore
+
+    monkeypatch.delenv("ATOM_PREFILL_DELAYER_STALL_TICKS", raising=False)
+    if env is not None:
+        monkeypatch.setenv("ATOM_PREFILL_DELAYER_STALL_TICKS", str(env))
+    captured = {}
+    engine = EngineCore.__new__(EngineCore)
+    engine.scheduler = SimpleNamespace(
+        cost_balance=False, set_prefill_delayer=lambda d: captured.setdefault("d", d)
+    )
+    config = SimpleNamespace(
+        enable_rapidserve=False,
+        dp_load_balance=lb,
+        max_num_batched_tokens=16384,
+        prefill_admit_policy="interval",
+        parallel_config=SimpleNamespace(data_parallel_size=2),
+    )
+    engine._init_prefill_delayer(config, cpu_group=object())
+    return captured["d"]
+
+
+def test_store_tokens_shortens_the_delayer_stall_bound(monkeypatch):
+    assert _delayer_for(monkeypatch, "least_requests").stall_ticks == 10
+    assert _delayer_for(monkeypatch, "store_tokens").stall_ticks == 4
+
+
+def test_explicit_stall_ticks_env_wins_under_store_tokens(monkeypatch):
+    assert _delayer_for(monkeypatch, "store_tokens", env=7).stall_ticks == 7

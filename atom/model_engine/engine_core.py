@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 import pickle
 import queue
 import threading
@@ -60,6 +61,11 @@ KV_IDLE_DRAIN_INTERVAL_S = 0.001
 # mid-transfer leaves a completion that never arrives; exiting late beats
 # never exiting.
 KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
+
+
+# PrefillDelayer stall bound under `--dp-load-balance store_tokens` (see
+# `_init_prefill_delayer`); the general default is 10.
+STORE_TOKENS_STALL_TICKS = 4
 
 
 class EngineCore:
@@ -250,6 +256,19 @@ class EngineCore:
             return
         from atom.model_engine.prefill_delayer import PrefillDelayer
 
+        stall_ticks = envs.ATOM_PREFILL_DELAYER_STALL_TICKS
+        if (
+            getattr(config, "dp_load_balance", None) == "store_tokens"
+            and "ATOM_PREFILL_DELAYER_STALL_TICKS" not in os.environ
+        ):
+            # `store_tokens` spreads requests evenly, so the ranks are nearly
+            # always all prefillable but each holds only a little work: the
+            # group rarely reaches the fill target and the delayer releases on
+            # its stall bound instead (36-38% of releases at DP4, against ~6%
+            # under session affinity). A shorter bound stops waiting for
+            # arrivals that do not come; unset env only, an explicit value wins.
+            stall_ticks = STORE_TOKENS_STALL_TICKS
+
         self.scheduler.set_prefill_delayer(
             PrefillDelayer(
                 dp_size=config.parallel_config.data_parallel_size,
@@ -258,7 +277,7 @@ class EngineCore:
                 target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
                 ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
                 partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
-                stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
+                stall_ticks=stall_ticks,
                 kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
                 token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
                 max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,

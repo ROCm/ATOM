@@ -239,6 +239,12 @@ where it lands and the router balances purely by work:
   allocated counts the router's estimate. The CoreManager adds the charges of
   requests sent after the rank's last report.
 
+Because `store_tokens` spreads requests evenly, every rank is nearly always
+prefillable but holds only a little pending work, so the prefill delayer rarely
+reaches its fill target and would release on its stall bound. Under
+`store_tokens` the stall bound defaults to 4 ticks (`ATOM_PREFILL_DELAYER_STALL_TICKS`
+unset; the general default is 10; an explicit value wins).
+
 It needs `--enable_prefix_caching` and `ATOM_FRONTEND_PREFIX_HASH=1`, and is
 mutually exclusive with `ATOM_DP_SESSION_AFFINITY=1`. Pair it with a low
 `OFFLOAD_MIN_LOAD_TOKENS`/`OFFLOAD_MIN_SAVE_TOKENS` (e.g. 256-1024, so the tier
