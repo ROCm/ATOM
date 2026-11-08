@@ -21,6 +21,9 @@ def ug_context(root,key):
         mhtjstest_tid = fx.thread_idx.x
         c.update(tid=mhtjstest_tid, lane=mhtjstest_tid % 32, wave=mhtjstest_tid // 32)
     c['args']={name:late_pointer(root,240+2*i) for i,name in enumerate(('w13','w13_s'))}
+    if 'qoff' in root['args']:
+        # take_ug_task's queue word offset: a host-computed kernel argument
+        c['args']['qoff']=root['args']['qoff']
     c['red'],c['tab']=root['front_red'],root['front_tab']
     for name,offset in stage_lds(key.tokens,c['rs'])['offsets'].items():
         c[name]=root['front_stage']+offset

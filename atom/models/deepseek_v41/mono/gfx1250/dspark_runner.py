@@ -58,6 +58,8 @@ from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.models.deepseek_v41.mono.gfx1250.dspark_weights import bind_model
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_k1 import build_dspark_k1
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_index_down import build_dspark_down
+from atom.models.deepseek_v41.mono.gfx1250.kernels.bf16_k2_abi import ABI as BF16_K2_ABI
+from atom.mono.device import queue
 from atom.models.deepseek_v41.mono.gfx1250.dspark_runtime import with_default_stream
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
@@ -411,7 +413,7 @@ class V41MonoDecodeRunner:
     def _rows_build(self, s: int) -> RowsBuild:
         """The s-row step's kernels."""
         keys = self._layer_keys(s)
-        post_abi = k2.ABI
+        post_abi = BF16_K2_ABI
         if self.row_tile_mhc:
             if s == 48:
                 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_wide_accum_k1 import build_dspark_k1 as build_k1
@@ -715,6 +717,8 @@ class V41MonoDecodeRunner:
             "layer": POST_TAG0 + layer_id, "moe_layer": MOE_TAG0 + layer_id,
             "tl": self._timeline_ptr("k2", layer_id),
         }  # fmt: skip
+        if "qoff" in self.build.layer_post_abi.names:
+            values["qoff"] = queue.tag_offset(MOE_TAG0 + layer_id)
         if "mhtjstest_state" in self.build.layer_post_abi.names:
             values["mhtjstest_state"] = self.mhtjstest_state.data_ptr()
             values["w13_s"] = weights["mhtjstest_native_w13_s"].data_ptr()
