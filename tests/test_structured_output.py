@@ -1093,3 +1093,27 @@ def test_annotations_leave_a_string_raw(controller, annotation):
     ):
         compiled = controller.compile(None, _one_param(schema))
         assert accepts(controller, compiled, _call_f("true", "x"))
+
+
+def test_a_reference_into_part_of_a_definition_takes_only_that_part(controller):
+    """`#/$defs/Scalar/anyOf/1` is Scalar's integer side, not all of Scalar."""
+    scalar = {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+    compiled = controller.compile(
+        None,
+        _one_param({"$ref": "#/$defs/Scalar/anyOf/1"}, **{"$defs": {"Scalar": scalar}}),
+    )
+    assert accepts(controller, compiled, _call_f("false", "7"))
+    assert not accepts(controller, compiled, _call_f("true", "oops"))
+
+
+def test_a_const_beside_an_enum_takes_what_both_allow(controller):
+    neither = {"type": "string", "enum": ["good"], "const": "bad"}
+    compiled = controller.compile(
+        None, _one_param({"anyOf": [neither, {"type": "null"}]})
+    )
+    assert accepts(controller, compiled, _call_f("false", "null"))
+    assert not accepts(controller, compiled, _call_f("true", "bad"))
+    both = {"type": "string", "enum": ["a", "b"], "const": "a"}
+    compiled = controller.compile(None, _one_param(both))
+    assert accepts(controller, compiled, _call_f("true", "a"))
+    assert not accepts(controller, compiled, _call_f("true", "b"))

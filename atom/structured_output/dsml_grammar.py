@@ -291,7 +291,9 @@ def _resolve(schema: Any, defs: dict) -> Any:
         extra = set(schema) - _ANNOTATIONS
         if extra == {"$ref"} and isinstance(schema["$ref"], str):
             target = _def_target(schema["$ref"])
-            if target is None or target[1] not in defs.get(target[0], {}):
+            # A path into a definition names only part of it.
+            whole = schema["$ref"].count("/") == 2
+            if not whole or target is None or target[1] not in defs.get(target[0], {}):
                 break
             schema = defs[target[0]][target[1]]
         elif extra == {"allOf"} and isinstance(schema["allOf"], list):
@@ -384,7 +386,11 @@ def _string_values(schema: Any) -> list[str] | None:
         return None
     if set(schema) - _RAW_STRING_KEYS - {"enum", "const"}:
         return None
-    values = [schema["const"]] if "const" in schema else schema.get("enum")
+    values = schema.get("enum")
+    if "const" in schema:  # within the enum, if both are given
+        values = (
+            [schema["const"]] if values is None or schema["const"] in values else []
+        )
     if not values or not all(isinstance(v, str) for v in values):
         return None
     return list(dict.fromkeys(values))

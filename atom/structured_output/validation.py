@@ -223,6 +223,12 @@ def _checked_strict_parameters(name, text):
         responses=True,
     )
     _check_strict(name, parameters, top=True)
+    # The DSML tags quote these names unescaped: the parser reads a name up
+    # to its first quote.
+    if any('"' in n for n in (name, *parameters.get("properties", {}))):
+        raise ValueError(
+            f"{name}: a strict tool's name and parameter names cannot contain '\"'"
+        )
     return json.dumps(parameters)
 
 
@@ -372,12 +378,20 @@ def validate_tool_calls(strict_schemas, tool_calls, finish_reason, declared=()):
         if name not in strict_schemas:
             continue
         try:
-            arguments = json.loads(call["function"]["arguments"])
+            # The parser reads an overflowing number as inf and writes it back
+            # as `Infinity`, which a client's JSON parser refuses.
+            arguments = json.loads(
+                call["function"]["arguments"], parse_constant=_not_json
+            )
             schema_validator(strict_schemas[name]).validate(arguments)
         except Exception as exc:
             raise RuntimeError(
                 f"Tool call {name} did not satisfy its strict parameters schema"
             ) from exc
+
+
+def _not_json(constant):
+    raise ValueError(f"{constant} is not JSON")
 
 
 async def validate_chat_stream(source, schema, strict_schemas=None, declared=()):

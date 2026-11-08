@@ -830,3 +830,32 @@ def test_a_streamed_call_to_an_undeclared_function_never_reaches_the_client():
     raw = asyncio.run(run())
     assert "structured_output_error" in raw
     assert '"tool_calls"' not in raw
+
+
+def test_strict_arguments_must_be_standard_json():
+    """The parser reads 1e999 as inf and writes it back as `Infinity`."""
+    from atom.structured_output.validation import validate_tool_calls
+
+    number = {**STRICT, "properties": {"v": {"type": "number"}}, "required": ["v"]}
+    validate_tool_calls({"weather": number}, [_call('{"v": 1.5}')], "tool_calls")
+    with pytest.raises(RuntimeError, match="strict parameters"):
+        validate_tool_calls(
+            {"weather": number}, [_call('{"v": Infinity}')], "tool_calls"
+        )
+
+
+@pytest.mark.parametrize("where", ["tool", "parameter"])
+def test_strict_names_cannot_hold_a_quote(where):
+    """The DSML tags quote names unescaped; the parser would cut one short."""
+    from atom.structured_output.validation import strict_tool_schemas
+
+    if where == "tool":
+        tool = _function()
+        tool["function"]["name"] = 'we"ather'
+    else:
+        quoted = {"type": "string"}
+        tool = _function(
+            {**STRICT, "properties": {'a">b': quoted}, "required": ['a">b']}
+        )
+    with pytest.raises(ValueError, match="cannot contain"):
+        strict_tool_schemas([tool])

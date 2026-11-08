@@ -228,7 +228,8 @@ DeepSeek's rules or asks for what the grammar cannot hold:
   `format` must be one of DeepSeek's five: `email`, `hostname`, `ipv4`, `ipv6`,
   `uuid`;
 - the top of `parameters` holds only its properties, definitions and
-  annotations;
+  annotations, and neither the tool's name nor a parameter's contains `"`,
+  which the DSML tags carry unescaped;
 - definitions live at the top, under DeepSeek's `$def` (read as `$defs`),
   `$defs` or `definitions`, and every `$ref` points into them. Each parameter
   is compiled on its own, where `#` would name the parameter; `$id`, `$anchor`
@@ -258,7 +259,8 @@ still takes (a nullable string written as JSON, say) goes out cut short.
 
 Parsed arguments are validated against their schema again before success is
 reported (formats are the grammar's to enforce), and every call must name one
-of the request's functions. A streamed reply holds its frames from the first
+of the request's functions. They must be standard JSON too: the parser reads
+a number past a double's range as infinity, which no JSON can carry. A streamed reply holds its frames from the first
 tool call on until then, so a call that fails is never sent: the stream ends
 with a `structured_output_error`, as a non-streamed reply fails. The reply is
 read literally, as under `response_format`. The thinking-mode refusal of
