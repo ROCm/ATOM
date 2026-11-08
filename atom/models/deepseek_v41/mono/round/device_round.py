@@ -56,6 +56,7 @@ import triton
 import triton.language as tl
 
 from atom.utils.forward_context import RoundService
+from atom.models.deepseek_v41.mono.hi_gate import log_once
 
 logger = logging.getLogger("atom")
 
@@ -274,17 +275,24 @@ def install(metadata_builder, hook, runner) -> DeviceRound | None:
     if hook is None:
         return None
     if not hook.lean_host:
-        logger.warning("V4.1 mono hi: the device round needs the lean host prep: off")
+        log_once(
+            logging.WARNING,
+            "V4.1 mono hi: the device round needs the lean host prep: off",
+        )
         return None
     engram = getattr(metadata_builder, "engram", None)
     if engram is not None and engram.host.overlap is None:
-        logger.warning(
-            "V4.1 mono hi: the device round needs the on-device Engram path: off"
+        log_once(
+            logging.WARNING,
+            "V4.1 mono hi: the device round needs the on-device Engram path: off",
         )
         return None
     from atom.models.deepseek_v41.mono.round import prologue
 
     pro = prologue.install(runner)
-    logger.info("V4.1 mono hi: device round advance on served steps; the first step after a prefill without its "
-                "wait")  # fmt: skip
+    log_once(
+        logging.INFO,
+        "V4.1 mono hi: device round advance on served steps; the first step after a prefill without its "
+        "wait",
+    )
     return DeviceRound(hook, pro)

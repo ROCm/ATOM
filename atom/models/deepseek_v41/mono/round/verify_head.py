@@ -24,6 +24,7 @@ import functools
 import logging
 
 from atom.model_engine.model_hooks import VerifyHead
+from atom.models.deepseek_v41.mono.hi_gate import log_once
 
 logger = logging.getLogger("atom")
 
@@ -127,7 +128,8 @@ class HiVerifyHead(VerifyHead):
         ids = self.hook.head_out()
         self.graph_ids[graph_key] = ids
         if ids is not None:
-            logger.info(
+            log_once(
+                logging.INFO,
                 "V4.1 mono hi: verify ids from the head in the graph of bucket %s",
                 graph_key,
             )

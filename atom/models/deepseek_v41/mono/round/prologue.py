@@ -37,6 +37,7 @@ import triton.language as tl
 
 from atom.utils.h2d import HostArenaReader
 from atom.utils.packed_h2d import DeviceAddress
+from atom.models.deepseek_v41.mono.hi_gate import log_once
 
 logger = logging.getLogger("atom")
 
@@ -283,5 +284,8 @@ def install(runner) -> Prologue:
     """The recorder (the runner opts its ``DECODE_PUBLICATIONS`` into it: ``PublicationGroup.read_host_arena``); the
     runner's ids fill and its reuse-event mark reach it through ``HiRound``."""
     pro = Prologue(runner.device)
-    logger.info("V4.1 mono hi: device-round steps' pre-target launches as one kernel")
+    log_once(
+        logging.INFO,
+        "V4.1 mono hi: device-round steps' pre-target launches as one kernel",
+    )
     return pro

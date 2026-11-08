@@ -126,6 +126,7 @@ from atom.models.deepseek_v41.mono.hi_gate import (  # noqa: F401 (REQ_ROWS re-e
     REQ_ROWS,
 )
 from atom.utils.packed_h2d import DeviceAddress, device_address
+from atom.models.deepseek_v41.mono.hi_gate import log_once
 
 logger = logging.getLogger("atom")
 
@@ -357,8 +358,13 @@ class HiLayers(HiDraft, HiPrograms):
             len(self.mf), self.tp, self.rank, self.split, max_ctx, len(self.programs), nbytes / 2**30, peer_bytes,
             CTX_LAUNCH, DRAFT_LAUNCH, {s: L.residual_layout(self.tp, rows=s) for s in self.widths}, time.time() - t0,
         )  # fmt: skip
-        logger.info("V4.1 mono hi: weights packed from ATOM's tensors; the routed experts' and %d plain tensors of the "
-                    "%d layers read in place", self.plain_aliased, len(self.mf))  # fmt: skip
+        log_once(
+            logging.INFO,
+            "V4.1 mono hi: weights packed from ATOM's tensors; the routed experts' and %d plain tensors of the "
+            "%d layers read in place",
+            self.plain_aliased,
+            len(self.mf),
+        )
         torch.cuda.empty_cache()
 
     # ------------------------------------------------------------ build
@@ -414,8 +420,12 @@ class HiLayers(HiDraft, HiPrograms):
                 "V4.1 mono hi: the Engram table lookup needs ATOM's Engram runtime (its hash mapping)"
             )
         consts = engram_consts(self._eng_mapping)
-        logger.info("V4.1 mono hi: Engram hash constants from ATOM's mapping (layers %s, %d token ids)",
-                    sorted(self.eng.values()), consts["token_map"].numel())  # fmt: skip
+        log_once(
+            logging.INFO,
+            "V4.1 mono hi: Engram hash constants from ATOM's mapping (layers %s, %d token ids)",
+            sorted(self.eng.values()),
+            consts["token_map"].numel(),
+        )
         return consts
 
     def _engram_tables(self, model, dev) -> int:
@@ -520,8 +530,12 @@ class HiLayers(HiDraft, HiPrograms):
             self.tables[ENGKV, s] = self.eng_programs[s].table(
                 self._eng_args, device=dev, peers=self.eng_peers
             )
-        logger.info("V4.1 mono hi: Engram lookup from ATOM's host shards at widths %s; ATOM's staging skipped on "
-                    "served steps", self.widths)  # fmt: skip
+        log_once(
+            logging.INFO,
+            "V4.1 mono hi: Engram lookup from ATOM's host shards at widths %s; ATOM's staging skipped on "
+            "served steps",
+            self.widths,
+        )
 
     def _head_tables(self, model, dev) -> int:
         """The verify head's pointer tables (one a width): ``norm.g`` / ``head.w`` packed from ATOM's own final
@@ -760,8 +774,13 @@ class HiLayers(HiDraft, HiPrograms):
         for table, idx, name, own in self._late:
             table[idx].fill_(bt.data_ptr() if own is None else addr[own][name])
         self._bound = key
-        logger.info("V4.1 mono hi: %d pointers of %d layers bound to ATOM's KV pool, FP4 index planes, compress rings "
-                    "and block table (in place)", len(self._late), len(self.mf))  # fmt: skip
+        log_once(
+            logging.INFO,
+            "V4.1 mono hi: %d pointers of %d layers bound to ATOM's KV pool, FP4 index planes, compress rings "
+            "and block table (in place)",
+            len(self._late),
+            len(self.mf),
+        )
 
     def begin_step(self, cache, step, rows: int, staged=None, input_ids=None) -> None:
         """One launch (``_begin_step_kernel``): the step bump (recorded by a capture), the rings, the request words,
@@ -978,12 +997,15 @@ def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
     for p in hi_plan.plan_layers(
         model.topology, model.config.engram_layer_ids, engram_on=True
     ):
-        logger.info(
+        log_once(
+            logging.INFO,
             "V4.1 mono hi plan: layer %2d %-30s %s",
             p.layer_id,
-            f"{p.kind} r{p.ratio}" + (f" cand {p.cand}" if p.cand else "") + (" +engram" if p.engram else ""),
+            f"{p.kind} r{p.ratio}"
+            + (f" cand {p.cand}" if p.cand else "")
+            + (" +engram" if p.engram else ""),
             "hi" if p.hi else f"ATOM: {p.why}",
-        )  # fmt: skip
+        )
     # the installers run while ModelRunner still has the model's default dtype
     # (bf16) and device set: the hi runtime's packing and tables assume torch's defaults
     from .hi.emit.compile import serving

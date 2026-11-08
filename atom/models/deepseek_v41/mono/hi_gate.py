@@ -59,6 +59,15 @@ GEOMETRY = {
 }
 
 
+def log_once(level: int, msg: str, *args) -> None:
+    """A line every rank would log alike (the deployment's, not a rank's), logged once: on rank 0 (on every rank
+    without ``torch.distributed``)."""
+    import torch.distributed as dist
+
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        logger.log(level, msg, *args)
+
+
 def mode() -> str:
     m = str(envs.ATOM_DSV41_MONO_HI).strip().lower()
     if m not in MODES:
@@ -148,7 +157,7 @@ def decide(atom_config, drafter, metadata_builder, dp_ranks: int) -> bool:
     under "1" when they cannot serve it."""
     m = mode()
     if m == "0":
-        logger.info("V4.1 mono hi off: ATOM_DSV41_MONO_HI=0")
+        log_once(logging.INFO, "V4.1 mono hi off: ATOM_DSV41_MONO_HI=0")
         return False
     why = refusal(atom_config, drafter, metadata_builder, dp_ranks)
     if not why:
@@ -157,5 +166,5 @@ def decide(atom_config, drafter, metadata_builder, dp_ranks: int) -> bool:
         raise RuntimeError(
             f"ATOM_DSV41_MONO_HI=1, but the hi path does not serve this deployment: {why}"
         )
-    logger.info("V4.1 mono hi off: %s; ATOM's mono path", why)
+    log_once(logging.INFO, "V4.1 mono hi off: %s; ATOM's mono path", why)
     return False

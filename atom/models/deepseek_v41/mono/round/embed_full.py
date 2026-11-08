@@ -23,6 +23,7 @@ import triton
 import triton.language as tl
 
 from atom.models.deepseek_v41.mono.hi_bridge import _shard_row
+from atom.models.deepseek_v41.mono.hi_gate import log_once
 
 logger = logging.getLogger("atom")
 
@@ -114,6 +115,10 @@ def install(model, group) -> SimpleNamespace:
         raise RuntimeError(
             "V4.1 mono hi embedding: the in-place shard read differs from ATOM's lookup"
         )
-    logger.info("V4.1 mono hi: the token embedding read in place from %d ranks' shards, checked on %d ids", tp,
-                ids.numel())  # fmt: skip
+    log_once(
+        logging.INFO,
+        "V4.1 mono hi: the token embedding read in place from %d ranks' shards, checked on %d ids",
+        tp,
+        ids.numel(),
+    )
     return out

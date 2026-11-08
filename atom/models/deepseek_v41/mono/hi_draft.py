@@ -18,6 +18,7 @@ from atom.models.deepseek_v41.mono import hi_bridge as ml
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.models.deepseek_v41.mono import hi_weights as hw
 from atom.models.deepseek_v41.mono.hi_compose import _DraftLaunch
+from atom.models.deepseek_v41.mono.hi_gate import log_once
 
 logger = logging.getLogger("atom")
 
@@ -50,8 +51,13 @@ class _Arena:
         self.word = (
             scratch_word(self.scratch, dual.dual_bytes, name) if dual.dual_on else None
         )
-        logger.info("V4.1 mono hi: the %s programs' scratch arena: %d programs, %.1f MiB", name, len(progs),
-                    raw.numel() / 2**20)  # fmt: skip
+        log_once(
+            logging.INFO,
+            "V4.1 mono hi: the %s programs' scratch arena: %d programs, %.1f MiB",
+            name,
+            len(progs),
+            raw.numel() / 2**20,
+        )
 
 
 def _buffers(kerns: dict, arena: _Arena, dev, step) -> dict:
@@ -287,8 +293,11 @@ class HiDraft:
         # request b's draft ids at row b
         self.mk_ids = z(self.dr_bmax, W, dt=torch.int32)
         self.dr_requests = 1
-        logger.info("V4.1 mono hi: block draft plans by requests: %s",
-                    {n: p.describe() for n, p in self.dr_plans.items()})  # fmt: skip
+        log_once(
+            logging.INFO,
+            "V4.1 mono hi: block draft plans by requests: %s",
+            {n: p.describe() for n, p in self.dr_plans.items()},
+        )
         self.dr_w, nbytes, plain = [], 0, 0
         inter = model.config.moe_intermediate_size
         for s in range(3):
@@ -306,8 +315,12 @@ class HiDraft:
                 for t in packed.values()
                 if not getattr(t, "_atom_alias", False)
             )
-        logger.info("V4.1 mono hi: the draft stages' weights packed from ATOM's draft tensors; their routed experts' "
-                    "and %d plain tensors read in place", plain)  # fmt: skip
+        log_once(
+            logging.INFO,
+            "V4.1 mono hi: the draft stages' weights packed from ATOM's draft tensors; their routed experts' "
+            "and %d plain tensors read in place",
+            plain,
+        )
         norm = draft.mtp[2].norm.weight.detach()
         head_w = getattr(self, "head_w_packed", None)
         if head_w is None:

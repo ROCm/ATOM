@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import logging
 
+from atom.models.deepseek_v41.mono.hi_gate import log_once
+
 logger = logging.getLogger("atom")
 
 
@@ -93,10 +95,16 @@ def install(hook) -> bool:
     """The lean host prep for ``hook`` (``HiRound.service``'s ``LEAN`` steps); False when a layer runs on ATOM (every
     step lays out in full)."""
     if not hook.runs_every_layer:
-        logger.warning("V4.1 mono hi: no lean host prep: layers %s run on ATOM",
-                       sorted(i for i, p in hook.plan.items() if not p.hi))  # fmt: skip
+        log_once(
+            logging.WARNING,
+            "V4.1 mono hi: no lean host prep: layers %s run on ATOM",
+            sorted(i for i, p in hook.plan.items() if not p.hi),
+        )
         return False
     hook.lean_host = True
-    logger.info("V4.1 mono hi: lean host prep on served steps: no compress plans, step planners, ATOM mailbox "
-                "step_begin or K1 / K2 step metadata")  # fmt: skip
+    log_once(
+        logging.INFO,
+        "V4.1 mono hi: lean host prep on served steps: no compress plans, step planners, ATOM mailbox "
+        "step_begin or K1 / K2 step metadata",
+    )
     return True

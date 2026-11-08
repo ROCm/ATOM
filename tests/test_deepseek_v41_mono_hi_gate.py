@@ -342,3 +342,16 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
     assert [r.getMessage() for r in caplog.records] == [
         "V4.1 mono hi off: routed experts not in the gfx950 FlyDSL layout"
     ]
+
+
+@pytest.mark.parametrize("rank, logged", [(0, 1), (1, 0), (3, 0)])
+def test_a_deployments_line_is_logged_once(monkeypatch, caplog, rank, logged):
+    """``log_once``: the lines every rank would log alike (the gate's and the fallback's "hi off", the install's) come
+    from rank 0 only."""
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: rank)
+    with caplog.at_level(logging.INFO, logger="atom"):
+        hi_gate.log_once(logging.INFO, "V4.1 mono hi off: %s", "why")
+    assert len(caplog.records) == logged

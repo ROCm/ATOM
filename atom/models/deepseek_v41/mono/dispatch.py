@@ -179,7 +179,7 @@ def install_mono_decode(
         except MonoUnsupported as why:
             if hi_gate.mode() == "1":
                 raise
-            logger.info("V4.1 mono hi off: %s", why)
+            hi_gate.log_once(logging.INFO, "V4.1 mono hi off: %s", why)
     if drafter is not None and hasattr(drafter.model, "block_backbone"):
         drafter.model = MonoDraftModel(drafter.model, dp_ranks)
     return MonoDecodeModel(
