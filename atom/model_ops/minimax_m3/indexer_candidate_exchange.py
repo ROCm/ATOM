@@ -38,11 +38,71 @@ def _force(score, block, valid, local_start, INIT_BLOCKS: tl.constexpr):
     return tl.where(valid & (block >= local_start), 1e29, score)
 
 
+@triton.jit
+def _tile_winners(
+    s_row,
+    scratch,
+    start,
+    LOCAL_BLOCKS,
+    GLOBAL_BLOCKS,
+    causal_blocks,
+    local_start,
+    RANK: tl.constexpr,
+    WORLD: tl.constexpr,
+    INIT_BLOCKS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    GROUPS: tl.constexpr,
+    CANDIDATES: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    FILTER: tl.constexpr,
+):
+    """One tile's top-k keys, sorting only the keys that can place.
+
+    The BLOCK_SIZE_T-th largest group maximum bounds the tile's own
+    BLOCK_SIZE_T-th largest key from below -- that many groups each hold a key
+    at least that large -- so every winner clears it, and usually only a few
+    dozen keys do. Those are compacted into this row's scratch and sorted
+    there; a tile where more clear it sorts whole. Keys are unique (the block
+    id rides in them), so both ways select the same keys in the same order.
+    """
+    off = start + tl.arange(0, WIDTH)
+    local_valid = off < LOCAL_BLOCKS
+    block = off * WORLD + RANK
+    valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
+    score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
+    score = _force(score, block, valid, local_start, INIT_BLOCKS)
+    key = _pack_score_key(score, block + 1, valid)
+    if FILTER:
+        group_max = tl.max(
+            tl.reshape(key, (GROUPS, WIDTH // GROUPS), can_reorder=True), axis=1
+        )
+        # Masked lanes carry key 0; the floor keeps them out of the scratch
+        # when fewer than BLOCK_SIZE_T groups hold a real key.
+        bound = tl.maximum(tl.min(tl.topk(group_max, BLOCK_SIZE_T)), 1)
+        keep = key >= bound
+        count = tl.sum(keep.to(tl.int32))
+        if count <= CANDIDATES:
+            # A long row's previous tile may still be reading this scratch row.
+            tl.debug_barrier()
+            tl.store(scratch + tl.cumsum(keep.to(tl.int32), 0) - 1, key, mask=keep)
+            tl.debug_barrier()
+            off_c = tl.arange(0, CANDIDATES)
+            winners = tl.topk(
+                tl.load(scratch + off_c, mask=off_c < count, other=0), BLOCK_SIZE_T
+            )
+        else:
+            winners = tl.topk(key, BLOCK_SIZE_T)
+    else:
+        winners = tl.topk(key, BLOCK_SIZE_T)
+    return winners
+
+
 # Retain bounded alignment specialization for the score row stride.
 @triton.jit(do_not_specialize=["GLOBAL_BLOCKS"])
 def _local_topk(
     Scores,
     Keys,
+    Scratch,
     Lengths,
     QUERY_LEN: tl.constexpr,
     LOCAL_BLOCKS,
@@ -52,8 +112,15 @@ def _local_topk(
     TOPK: tl.constexpr,
     INIT_BLOCKS: tl.constexpr,
     LOCAL_KEEP: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
+    NARROW: tl.constexpr,
+    MID: tl.constexpr,
+    WIDE: tl.constexpr,
+    NARROW_GROUPS: tl.constexpr,
+    MID_GROUPS: tl.constexpr,
+    WIDE_GROUPS: tl.constexpr,
+    CANDIDATES: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    FILTER_NARROW: tl.constexpr,
 ):
     """Pack this shard's [heads, tokens, local] scores down to its own top-k keys.
 
@@ -65,6 +132,11 @@ def _local_topk(
     arrives to be pinned. Pinning here costs nothing, because the candidate it
     evicts could not have placed globally anyway -- that block lost to k-1 other
     candidates on this rank plus the forced one, and the global top-k is k wide.
+
+    Each row reads its shard in ONE tile of the narrowest width that covers it.
+    The step waits on its longest row, and a long row walking its shard tile by
+    tile set the whole kernel's time. Only a shard wider than WIDE (past a 1M
+    bound at four ranks) still walks.
     """
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -76,28 +148,37 @@ def _local_topk(
     causal_blocks = (length - QUERY_LEN + token + 128) // 128
     local_start = tl.maximum(0, causal_blocks - LOCAL_KEEP)
     # This row's own shard length: past it every block is masked, so a short
-    # row stops there instead of walking the step's widest shard.
+    # row stops there instead of reading the step's widest shard.
     row_local = tl.minimum(
         (tl.maximum(causal_blocks - RANK, 0) + WORLD - 1) // WORLD, LOCAL_BLOCKS
     )
     s_row = Scores + (head * tokens + row) * LOCAL_BLOCKS
-
-    off = tl.arange(0, BLOCK_SIZE_K)
-    local_valid = off < LOCAL_BLOCKS
-    block = off * WORLD + RANK
-    valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
-    score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
-    score = _force(score, block, valid, local_start, INIT_BLOCKS)
-    winners = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
-    for start in tl.range(BLOCK_SIZE_K, row_local, BLOCK_SIZE_K):
-        off = start + tl.arange(0, BLOCK_SIZE_K)
-        local_valid = off < LOCAL_BLOCKS
-        block = off * WORLD + RANK
-        valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
-        score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
-        score = _force(score, block, valid, local_start, INIT_BLOCKS)
-        tile = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
-        winners = tl.topk(tl.cat(winners, tile, can_reorder=True), BLOCK_SIZE_T)
+    scratch = Scratch + (head * tokens + row) * CANDIDATES
+    if row_local <= NARROW:
+        winners = _tile_winners(
+            s_row, scratch, 0, LOCAL_BLOCKS, GLOBAL_BLOCKS, causal_blocks,
+            local_start, RANK, WORLD, INIT_BLOCKS, NARROW, NARROW_GROUPS,
+            CANDIDATES, BLOCK_SIZE_T, FILTER_NARROW,
+        )  # fmt: skip
+    elif row_local <= MID:
+        winners = _tile_winners(
+            s_row, scratch, 0, LOCAL_BLOCKS, GLOBAL_BLOCKS, causal_blocks,
+            local_start, RANK, WORLD, INIT_BLOCKS, MID, MID_GROUPS,
+            CANDIDATES, BLOCK_SIZE_T, True,
+        )  # fmt: skip
+    else:
+        winners = _tile_winners(
+            s_row, scratch, 0, LOCAL_BLOCKS, GLOBAL_BLOCKS, causal_blocks,
+            local_start, RANK, WORLD, INIT_BLOCKS, WIDE, WIDE_GROUPS,
+            CANDIDATES, BLOCK_SIZE_T, True,
+        )  # fmt: skip
+        for start in tl.range(WIDE, row_local, WIDE):
+            tile = _tile_winners(
+                s_row, scratch, start, LOCAL_BLOCKS, GLOBAL_BLOCKS, causal_blocks,
+                local_start, RANK, WORLD, INIT_BLOCKS, WIDE, WIDE_GROUPS,
+                CANDIDATES, BLOCK_SIZE_T, True,
+            )  # fmt: skip
+            winners = tl.topk(tl.cat(winners, tile, can_reorder=True), BLOCK_SIZE_T)
     off_t = tl.arange(0, BLOCK_SIZE_T)
     tl.store(
         Keys + (head * tokens + row) * TOPK + off_t,
@@ -190,9 +271,14 @@ def _merge_topk(
         )
 
 
-# Swept 256/512/1024/2048 at batch 30-40, 1M bound (2048-wide shards): 512 is
-# 15-35% faster than one tile spanning the shard.
-_LOCAL_TOPK_TILE = 512
+# Per layer in a graph on AgentX contexts (S=8, 1M bound, 2048-wide shards):
+# 6.0-10.0 us at batch 24-60 against 8.8-15.8 us for 512-wide tiles walked in
+# turn, 5.6-6.2 against 7.2-9.5 at batch 8-16 with a long row. A grid under
+# about three programs a CU is latency-bound: four warps and an unfiltered
+# narrow tile win there (3.3-3.4 against 4.1 us at batch 4-8, short rows),
+# two warps and the filter above it.
+_LOCAL_TOPK_WIDTHS = (512, 1024, 2048)
+_LOCAL_TOPK_FULL_GRID = 768
 
 
 def local_candidate_keys(
@@ -230,26 +316,26 @@ def local_candidate_keys(
         raise ValueError("scores must be contiguous and lengths int32")
     keys = torch.empty((heads, tokens, topk), dtype=torch.int64, device=scores.device)
     if tokens:
-        # The tile must be at least as wide as the top-k it selects: the
-        # kernel's FIRST `tl.topk(x[BLOCK_SIZE_K], BLOCK_SIZE_T)` runs before
-        # any `tl.cat`, so BLOCK_SIZE_K < BLOCK_SIZE_T cannot compile. A small
-        # shard reaches that -- e.g. 8 local blocks with topk 32 gives a 16-wide
-        # tile and a 32-wide selection. M3 ships sparse_topk_blocks=16, which
-        # the max(16, ...) floor already covers, so this is unreachable on the
-        # shipped config and costs it exactly nothing; it is here so the
-        # function is correct for the topk its own guard admits (<= 512), rather
-        # than only for the one value production happens to pass.
-        # Streaming tiles, each row stopping at its own shard length: a step's
-        # shards are as wide as its longest request (2048 at a 1M bound) while a
-        # typical row holds a few hundred blocks.
-        width = max(
-            16,
-            triton.next_power_of_2(min(local, _LOCAL_TOPK_TILE)),
-            triton.next_power_of_2(topk),
+        block_t = triton.next_power_of_2(topk)
+        # Every tile must be at least as wide as the top-k it selects:
+        # `tl.topk(x[WIDTH], BLOCK_SIZE_T)` cannot compile for WIDTH <
+        # BLOCK_SIZE_T. A small shard reaches that -- e.g. 8 local blocks with
+        # topk 32. M3 ships sparse_topk_blocks=16, which the 16 floor already
+        # covers; the block_t term keeps the function correct for the topk its
+        # own guard admits (<= 512).
+        full = max(16, block_t, triton.next_power_of_2(local))
+        narrow, mid, wide = (
+            min(full, max(16, block_t, width)) for width in _LOCAL_TOPK_WIDTHS
         )
+        candidates = max(64, 2 * block_t)
+        scratch = torch.empty(
+            heads * tokens * candidates, dtype=torch.int64, device=scores.device
+        )
+        full_grid = heads * tokens >= _LOCAL_TOPK_FULL_GRID
         _local_topk[(tokens, heads)](
             scores,
             keys,
+            scratch,
             seq_lens,
             QUERY_LEN=max_query_len,
             LOCAL_BLOCKS=local,
@@ -259,9 +345,17 @@ def local_candidate_keys(
             TOPK=topk,
             INIT_BLOCKS=init_blocks,
             LOCAL_KEEP=local_blocks,
-            BLOCK_SIZE_K=width,
-            BLOCK_SIZE_T=triton.next_power_of_2(topk),
-            num_warps=DECODE_TOPK_NUM_WARPS,
+            NARROW=narrow,
+            MID=mid,
+            WIDE=wide,
+            # At least BLOCK_SIZE_T groups, or the bound is not a bound.
+            NARROW_GROUPS=max(block_t, min(32, narrow)),
+            MID_GROUPS=max(block_t, min(32, mid)),
+            WIDE_GROUPS=max(block_t, min(64, wide)),
+            CANDIDATES=candidates,
+            BLOCK_SIZE_T=block_t,
+            FILTER_NARROW=full_grid,
+            num_warps=2 if full_grid else 4,
         )
     return keys
 
