@@ -172,8 +172,10 @@ class AddedTokenSplitter:
         if not _deterministic(description.get("model")):
             return False
         # A normalizer runs per segment too, and a normalized added token is
-        # matched after it runs; only the identity is accepted.
-        if not _normalizer_is_identity(description):
+        # matched after it runs; with one, only the identity is accepted.
+        # Without, the backend normalizes each piece between extracted tokens
+        # on its own as well (MiniMax-M3's NFC).
+        if self._normalized and not _normalizer_is_identity(description):
             return False
         if _offset_sensitive(description.get("pre_tokenizer")):
             return False
@@ -218,7 +220,13 @@ class AddedTokenSplitter:
         added = list(self.added)
         picks = {added[0], added[-1], min(added, key=len), max(added, key=len)}
         for tok in picks:
-            for probe in (f"a{tok}a b", f"{tok} x\n{tok}", f" y {tok}\t1 2"):
+            for probe in (
+                f"a{tok}a b",
+                f"{tok} x\n{tok}",
+                f" y {tok}\t1 2",
+                # A normalizer could compose across a cut.
+                f"e\u0301{tok}\u0301e",
+            ):
                 if self.encode_pieces(probe) != self.tokenizer.encode(probe):
                     return False
         return True

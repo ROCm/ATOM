@@ -171,7 +171,7 @@ def test_eviction_by_another_request_mid_encode_is_harmless(tok, monkeypatch):
     assert seg._encode_cached(longer) == tok.encode(longer)
 
 
-def _normalized_tokenizer(normalizer):
+def _normalized_tokenizer(normalizer, normalized_accent=True):
     rng = random.Random(7)
     backend = Tokenizer(models.BPE(unk_token="[UNK]"))
     if normalizer is not None:
@@ -181,9 +181,36 @@ def _normalized_tokenizer(normalizer):
         [_text(rng, 40) for _ in range(50)],
         trainers.BpeTrainer(vocab_size=280, special_tokens=["[UNK]"]),
     )
-    backend.add_special_tokens([AddedToken("<|User|>", special=True)])
-    backend.add_tokens([AddedToken("\u0301", normalized=True)])
+    backend.add_special_tokens(
+        [
+            AddedToken("<|User|>", special=True),
+            AddedToken("<|Assistant|>", special=True),
+        ]
+    )
+    if normalized_accent:
+        backend.add_tokens([AddedToken("\u0301", normalized=True)])
     return transformers.PreTrainedTokenizerFast(tokenizer_object=backend)
+
+
+def test_a_normalizer_is_exact_without_normalized_added_tokens():
+    """The backend normalizes the text between extracted tokens piece by
+    piece as well, so NFC (MiniMax-M3's) keeps the segments exact, accents
+    on either side of a cut included."""
+    from tokenizers import normalizers
+
+    seg = SegmentTokenizer.maybe_create(
+        _normalized_tokenizer(normalizers.NFC(), normalized_accent=False), 10**6
+    )
+    assert seg is not None
+    tok = seg._tokenizer
+    seg._verified = seg_mod._VERIFY_FIRST
+    rng = random.Random(9)
+    prompt = "caf\u0301e"
+    for _ in range(6):
+        prompt += "<|User|>\u0301" + _text(rng, 8) + " e\u0301"
+        prompt += "<|Assistant|>" + _text(rng, 4) + "a\u0301"
+        assert seg._encode_cached(prompt) == tok.encode(prompt)
+    assert seg._stats[0] > seg._stats[1]
 
 
 def test_normalized_added_tokens_need_an_identity_normalizer():
