@@ -95,12 +95,9 @@ async fn aggregate(
             })
             .unwrap_or(false);
 
-    let tool_choice_enabled = !matches!(
-        &chat_request.tool_choice,
-        Some(ToolChoice::Value(ToolChoiceValue::None))
-    );
-    let tool_available = tool_choice_enabled
-        && chat_request.tools.is_some()
+    // Read with `tool_choice: "none"` too, so the markup leaves the content;
+    // `process_choice` then drops the calls.
+    let tool_available = chat_request.tools.is_some()
         && ctx
             .tool_parser_factory
             .as_ref()
@@ -251,12 +248,12 @@ async fn process_choice(
     }
 
     let mut tool_calls: Option<Vec<ToolCall>> = None;
-    let tool_choice_enabled = !matches!(
+    let tool_choice_none = matches!(
         &chat_request.tool_choice,
         Some(ToolChoice::Value(ToolChoiceValue::None))
     );
 
-    if tool_choice_enabled && chat_request.tools.is_some() {
+    if chat_request.tools.is_some() {
         let used_json_schema = match &chat_request.tool_choice {
             Some(ToolChoice::Function { .. }) => true,
             Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
@@ -264,7 +261,7 @@ async fn process_choice(
             _ => false,
         };
 
-        if used_json_schema {
+        if used_json_schema && !tool_choice_none {
             (tool_calls, processed_text) = parse_json_schema_response(
                 &processed_text,
                 &chat_request.tool_choice,
@@ -281,12 +278,18 @@ async fn process_choice(
                     history_tool_calls_count,
                 )
                 .await;
+                if tool_choice_none {
+                    // Read, not dispatched: `tool_choice: "none"` forbids calls.
+                    tool_calls = None;
+                }
             }
         }
     }
 
+    // `length` outranks `tool_calls`: a call cut off mid-arguments must not
+    // read as one to run (`openai_stop_reason_with_calls`).
     let finish_reason_str = finish_reason_to_str(finish_reason);
-    let final_finish_reason = if tool_calls.is_some() {
+    let final_finish_reason = if tool_calls.is_some() && finish_reason_str != "length" {
         "tool_calls"
     } else {
         finish_reason_str

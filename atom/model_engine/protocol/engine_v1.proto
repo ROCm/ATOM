@@ -84,8 +84,13 @@
 //     only carried along for the record.
 //   * disaggregated prefill/decode on one GPU: the client sends each request
 //     to both Cores, the prefill one with `max_tokens` = 1.
-//   * aborting: `Abort` names seq_ids; aborting a finished or unknown id is a
-//     no-op.
+//   * aborting: `Abort` names seq_ids; aborting a finished id is a no-op. An
+//     Abort the Core handles before the Submit it follows (the two ride
+//     different sockets) is held for a while and applied on admission.
+//   * structured output: a request whose `SamplingParams.json_schema` is set
+//     must have had its grammar prepared on every rank first (the
+//     `prepare_structured_output` utility); a client that cannot prepare it
+//     must not send one.
 //
 // What the Core derives when the client leaves it out:
 //   * block size, draft token count and per-request cache: always, from the
@@ -233,7 +238,10 @@ message RequiredChannel {
   repeated int32 end_ids = 4;
 }
 
-// Mirrors atom.SamplingParams field for field. An absent optional is None.
+// Mirrors atom.SamplingParams field for field. An absent optional is None,
+// except `temperature`, `top_k` and `top_p`, which take SamplingParams'
+// defaults. `max_tokens` is the request's own and is not shared with the
+// request's other parameters on the Core.
 message SamplingParams {
   optional double temperature = 1;
   optional int64 top_k = 2;
@@ -352,6 +360,8 @@ message Completion {
   BufferRef logprobs = 3;              // float64, one per completion token
   bool return_logprobs = 4;
   uint32 num_prompt_tokens = 5;
+  // Prompt tokens whose KV the Core holds: the whole prompt once prefill is
+  // done. Not the prefix-cache hit -- that is StreamBatch.num_cached_tokens.
   uint32 num_cached_tokens = 6;
   double arrive_time = 7;
   double first_token_time = 8;
@@ -374,11 +384,11 @@ message Completions {
 // one call where a message per sequence costs one per field.
 message StreamBatch {
   repeated uint64 seq_ids = 1;
-  repeated int64 request_ids = 2;
+  reserved 2;  // request_ids: always the seq_id
   repeated uint32 token_counts = 3;  // how many of `tokens` each entry owns
   repeated int32 tokens = 4;         // every entry's output tokens, in order
   repeated bool finished = 5;
-  repeated int64 num_cached_tokens = 6;
+  repeated int64 num_cached_tokens = 6;  // prefix-cache hit, as of this step
   map<uint32, string> finish_reasons = 7;            // by entry; absent: None
   map<uint32, Value> kv_transfer_params_outputs = 8;  // by entry; absent: None
   // Token logprobs, as columns too. An entry listed in `logprob_entries` has

@@ -122,14 +122,12 @@ impl From<SeqFailure> for EngineError {
 }
 
 /// The Core's `leave_reason` (`eos`, `stop_sequence`, `stop_<id>`,
-/// `max_tokens`, `aborted`, `unschedulable: ...`) as a finish reason.
+/// `max_tokens`, `aborted`, `unschedulable: ...`) as `openai_stop_reason`
+/// reports it: running out of tokens is `length`, every other end `stop`.
 fn finish_reason(leave_reason: &str) -> FinishReason {
     match leave_reason {
         "max_tokens" | "max_new_tokens" => FinishReason::Length,
-        "aborted" => FinishReason::Abort,
-        "" | "eos" | "stop_sequence" => FinishReason::Stop,
-        r if r.starts_with("stop_") => FinishReason::Stop,
-        other => FinishReason::Other(other.to_string()),
+        _ => FinishReason::Stop,
     }
 }
 
@@ -142,9 +140,12 @@ mod tests {
         assert!(matches!(finish_reason("max_tokens"), FinishReason::Length));
         assert!(matches!(finish_reason("stop_151645"), FinishReason::Stop));
         assert!(matches!(finish_reason("eos"), FinishReason::Stop));
-        assert!(matches!(
-            finish_reason("unschedulable: too long"),
-            FinishReason::Other(_)
-        ));
+        // Never a raw Core string in `finish_reason`.
+        for reason in ["aborted", "unschedulable: too long", "rejected: no"] {
+            assert!(
+                matches!(finish_reason(reason), FinishReason::Stop),
+                "{reason}"
+            );
+        }
     }
 }

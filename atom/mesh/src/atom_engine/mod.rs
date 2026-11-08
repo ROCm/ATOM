@@ -14,6 +14,7 @@ mod tests;
 pub mod wire;
 
 pub use client::{EngineClient, Finished, SeqEvent, SeqFailure, SeqHandle, Submission};
+pub use link::Interrupted;
 pub use spec::{EngineSpec, ModelSpec, ReasoningToggle};
 
 /// A connected engine and the model it serves.
@@ -24,10 +25,10 @@ pub struct AtomEngine {
 
 impl AtomEngine {
     /// Parse `spec_json` and connect to every Core in it. Blocks until all
-    /// are ready.
-    pub fn start(spec_json: &str) -> Result<Self, String> {
+    /// are ready, or `interrupted` says to give up.
+    pub fn start(spec_json: &str, interrupted: Interrupted<'_>) -> Result<Self, String> {
         let spec = EngineSpec::from_json(spec_json)?;
-        let client = EngineClient::connect(&spec)?;
+        let client = EngineClient::connect(&spec, interrupted)?;
         Ok(Self {
             model: spec.model,
             client,

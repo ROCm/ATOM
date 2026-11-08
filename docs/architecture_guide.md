@@ -63,11 +63,11 @@ A request flows through the system in ten steps:
 
 1. **`LLMEngine.add_request()` / `generate()`** — you submit a list of prompts (strings or pre-tokenized token IDs) together with `SamplingParams`.
 
-2. **`InputOutputProcessor.preprocess()`** — each prompt is tokenized via the HuggingFace tokenizer. A `Sequence` object is created to track the request's state, timing, and block allocation. `arrive_time` is recorded.
+2. **`InputOutputProcessor.preprocess()`** — each prompt is tokenized via the HuggingFace tokenizer into an `IngressRequest` (the prompt, its `SamplingParams` and routing facts). `arrive_time` is recorded.
 
-3. **`CoreManager.add_request()`** — the list of `Sequence` objects is serialized with `pickle` and sent over a ZMQ `ROUTER` socket. When multiple DP ranks are active, requests are routed by a configurable load-balancing strategy (`least_requests` by default; `round_robin` and `least_tokens` also available).
+3. **`CoreManager.add_request()`** — the requests are encoded as one engine_v1 `SubmitBatch` (`atom/model_engine/protocol/`: a protobuf envelope plus raw data frames for the prompt tokens; the normative spec is the header of `engine_v1.proto`) and sent over a ZMQ `ROUTER` socket. When multiple DP ranks are active, requests are routed by a configurable load-balancing strategy (`least_requests` by default; `round_robin` and `least_tokens` also available).
 
-4. **`EngineCore.process_input_sockets()`** — an I/O thread on the `EngineCore` process receives the serialized data on a ZMQ `DEALER` socket, deserializes it, and places the sequences into the `input_queue`.
+4. **`EngineCore.process_input_sockets()`** — an I/O thread on the `EngineCore` process receives the message on a ZMQ `DEALER` socket, decodes it, builds each request's `Sequence` (`codec.build_sequence`, which fills in what the Core derives from its own config) and places the sequences into the `input_queue`. A request it cannot admit is answered with a `Rejected` message.
 
 5. **`EngineCore.busy_loop()`** — the main execution loop pulls from `input_queue` via `pull_and_process_input_queue()`, feeds new sequences into the scheduler, and repeatedly calls `_process_engine_step()` until all work is done.
 
@@ -80,7 +80,7 @@ A request flows through the system in ten steps:
 
 8. **`Scheduler.postprocess()`** — appends sampled tokens to each `Sequence`, records `first_token_time`, checks stop conditions (EOS, stop token IDs, stop token sequences, `max_tokens`), and moves finished sequences out of the running queue. The `BlockManager` deallocates blocks for finished sequences.
 
-9. **Output via ZMQ** — finished sequences are placed on the `output_queue`. A dedicated output thread serializes them and sends them over a ZMQ `PUSH` socket back to the `CoreManager`, which receives them on a `PULL` socket and places them in `outputs_queue`.
+9. **Output via ZMQ** — each step's streamed tokens and the finished sequences are placed on the `output_queue`. A dedicated output thread encodes them as engine_v1 `StreamBatch` and `Completions` messages and sends them over a ZMQ `PUSH` socket back to the `CoreManager`, which receives them on a `PULL` socket, decodes the finished ones into `CompletionResult`s and places them in `outputs_queue`.
 
 10. **`InputOutputProcessor.postprocess()`** — detokenizes completed sequences, computes TTFT (Time To First Token) and TPOT (Time Per Output Token), and returns structured output dictionaries.
 
@@ -130,7 +130,7 @@ ATOM uses a multi-process design with ZMQ sockets for inter-process communicatio
                     │  └────────────────────────────┘  │
                     └──────────────────────────────────┘
                           │                    ▲
-                 pickle   │                    │  pickle
+               engine_v1  │                    │  engine_v1
                           ▼                    │
            ┌──────────────────────────────────────┐
            │         EngineCore (Process)          │
@@ -154,9 +154,9 @@ ATOM uses a multi-process design with ZMQ sockets for inter-process communicatio
 
 | Socket | Type | Direction | Purpose |
 |---|---|---|---|
-| Input | `ROUTER` (CoreManager) / `DEALER` (EngineCore) | CoreManager → EngineCore | Send requests and control commands |
-| Control | `ROUTER` (CoreManager) / `DEALER` (EngineCore) | CoreManager → EngineCore | Serialized utility and collective-RPC commands |
-| Output | `PUSH` (EngineCore) / `PULL` (CoreManager) | EngineCore → CoreManager | Return finished sequences and stream outputs |
+| Input | `ROUTER` (CoreManager) / `DEALER` (EngineCore) | CoreManager → EngineCore | `SubmitBatch` (requests) |
+| Control | `ROUTER` (CoreManager) / `DEALER` (EngineCore) | CoreManager → EngineCore | `Abort`, `Shutdown`, typed admin commands, and utility / collective-RPC commands (pickled inside a `Utility` frame) |
+| Output | `PUSH` (EngineCore) / `PULL` (CoreManager) | EngineCore → CoreManager | `Ready`, `StreamBatch`, `Completions`, `Rejected`, metrics, replies, `Stopped` |
 | Worker RPC output | one `PUSH` / `PULL` pair per TP rank | ModelRunner → AsyncIOProcManager | One correlated collective-RPC reply per worker |
 
 **Process hierarchy:**

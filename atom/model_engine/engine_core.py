@@ -918,9 +918,11 @@ class EngineCore:
                         continue
                     try:
                         frames = encode(payload)
-                    except Exception:
+                    except Exception as exc:
                         logger.exception(f"{self.label}: cannot encode {kind} output")
-                        continue
+                        frames = _undeliverable_output(kind, payload, exc)
+                        if frames is None:
+                            continue
                     socket.send_multipart(frames, copy=False)
                     if kind == "READY":
                         logger.debug(f"{self.label}: sent READY signal")
@@ -962,6 +964,26 @@ class EngineCore:
 
 
 # The tagged items EngineCore threads put on `output_queue`, and their encoders.
+def _undeliverable_output(kind, payload, exc):
+    """What to send instead of a tagged output that would not encode, so the
+    client that waits on it fails rather than waits forever; None to drop it.
+
+    READY: `Stopped`, which a client still starting up reports as a failed
+    start. UTILITY_RESPONSE: an error reply to the same request id.
+    """
+    if kind == "READY":
+        return encode_stopped()
+    if kind == "UTILITY_RESPONSE" and isinstance(payload, dict):
+        return encode_utility_reply(
+            {
+                "cmd": payload.get("cmd"),
+                "request_id": payload.get("request_id"),
+                "error": f"reply not encodable: {type(exc).__name__}: {exc}",
+            }
+        )
+    return None
+
+
 _TAGGED_OUTPUT_ENCODERS = {
     "STREAM": encode_stream,
     "READY": encode_ready,

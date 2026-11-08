@@ -17,11 +17,9 @@ from __future__ import annotations
 
 import ast
 import pathlib
-from typing import ClassVar
 
 import pytest
 
-from atom.entrypoints.atomesh import server as atomesh_server
 from atom.entrypoints.openai.tool_parser import registry
 from atom.entrypoints.openai.tool_parser.registry import (
     PARSERS_BY_NAME,
@@ -217,22 +215,3 @@ class TestGlmDoesNotClaimEveryTemplate:
 
     def test_a_real_glm_template_still_resolves(self):
         assert resolve_from_prompt(self.GLM) is PARSERS_BY_NAME["glm"]
-
-
-class TestStandaloneLeavesTheFlagToTheRouter:
-    """The Rust router renders every standalone response, so
-    `--tool-call-parser` is its flag alone and reaches it as given -- in its
-    own vocabulary or in ATOM's, which the router also registers."""
-
-    BASE: ClassVar[list] = ["--model", "/x", "--port", "9000"]
-
-    @pytest.mark.parametrize("name", ["json", "hermes", *sorted(PARSERS_BY_NAME)])
-    def test_any_name_reaches_the_router(self, name):
-        args = atomesh_server.parse_standalone_args(
-            [*self.BASE, "--tool-call-parser", name]
-        )
-        assert args.mesh_args == ["--tool-call-parser", name, "--port", "9000"]
-
-    def test_unset_forwards_nothing(self):
-        args = atomesh_server.parse_standalone_args(self.BASE)
-        assert args.mesh_args == ["--port", "9000"]

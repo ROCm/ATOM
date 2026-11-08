@@ -423,6 +423,7 @@ def test_submission_owns_matchers_and_releases_all_replicas(failure):
     from atom.model_engine.engine_core_mgr import CoreManager
 
     mgr = CoreManager.__new__(CoreManager)
+    mgr._structured_ids = set()
     replicas = [{}, {}]
     events = []
     seq = NS(id=77, json_schema="{}", leave_reason="stop")
@@ -540,6 +541,7 @@ def test_cleanup_send_failure_does_not_stop_terminal_deliveries(with_callback):
     mgr = CoreManager.__new__(CoreManager)
     mgr.label = "test"
     first, second = Mock(), Mock()
+    mgr._structured_ids = {77, 78}
     mgr._seq_id_to_callback = {78: second}
     if with_callback:
         mgr._seq_id_to_callback[77] = first
@@ -556,8 +558,9 @@ def test_cleanup_send_failure_does_not_stop_terminal_deliveries(with_callback):
     assert first.call_count == int(with_callback)
     second.assert_called_once()
     assert second.call_args.args[0].finished
-    mgr._release_structured_requests([NS(id=77, json_schema="{}")])
+    mgr._release_structured_requests([77])
     assert not mgr._seq_id_to_callback
+    assert not mgr._structured_ids
 
 
 def test_bind_groups_matching_grammars_without_merging_request_states():
@@ -601,15 +604,24 @@ def test_cancellation_cleanup_follows_terminal_sequence(schema, pending):
     mgr = CoreManager.__new__(CoreManager)
     mgr.label = "test"
     seq = NS(id=19, json_schema=schema, leave_reason="aborted")
+    mgr._structured_ids = {19} if schema is not None else set()
     callback = Mock()
     mgr._seq_id_to_callback = {19: callback}
     mgr._release_seq_load = Mock()
     mgr._bp_take_pending = Mock(return_value=seq if pending else None)
     mgr.broadcast_utility_command = Mock()
+    mgr.control_sockets = [object(), object()]
+    mgr._send_control = Mock()
     mgr.abort_request(19)
     if not pending:
-        mgr.broadcast_utility_command.assert_called_once_with(
-            "abort_request", req_id=19
+        # A typed Abort to every rank (only the one holding it acts).
+        from atom.model_engine.protocol.codec import encode_abort
+
+        sent = [c.args for c in mgr._send_control.call_args_list]
+        assert [rank for rank, _ in sent] == [0, 1]
+        assert all(
+            [bytes(f) for f in frames] == [bytes(f) for f in encode_abort([19])]
+            for _, frames in sent
         )
         callback.assert_not_called()
         mgr._deliver_terminal_output(seq)
@@ -629,6 +641,7 @@ def test_cleanup_failure_preserves_original_admission_error():
 
     mgr = CoreManager.__new__(CoreManager)
     mgr.label = "test"
+    mgr._structured_ids = set()
     mgr.structured_request_prepare = Mock(side_effect=ValueError("compile failed"))
     mgr.broadcast_utility_command = Mock(side_effect=RuntimeError("socket closed"))
     mgr._add_prepared_requests = Mock()
@@ -705,3 +718,27 @@ def test_failed_identity_initialization_can_retry(monkeypatch):
         rpc.assert_called_once()
     finally:
         preflight.close()
+
+
+def test_a_finished_result_releases_its_structured_state_on_every_rank():
+    """The finished item is a `CompletionResult`, which carries no schema: the
+    release must come from what the manager submitted, or every DP rank that
+    did not run the request keeps its grammar state."""
+    from atom.model_engine.engine_core_mgr import CoreManager
+    from atom.model_engine.protocol.requests import CompletionResult
+
+    mgr = CoreManager.__new__(CoreManager)
+    mgr.label = "test"
+    mgr._structured_ids = set()
+    mgr._seq_id_to_callback = {}
+    mgr.structured_request_prepare = Mock()
+    mgr._add_prepared_requests = Mock()
+    mgr.broadcast_utility_command = Mock()
+    mgr.add_request([NS(id=5, json_schema="{}"), NS(id=6, json_schema=None)])
+    assert mgr._structured_ids == {5}
+    for seq_id in (5, 6):
+        mgr._deliver_terminal_output(CompletionResult(id=seq_id, leave_reason="stop"))
+    mgr.broadcast_utility_command.assert_called_once_with(
+        "release_structured_requests", request_ids=[5]
+    )
+    assert not mgr._structured_ids

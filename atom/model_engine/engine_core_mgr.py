@@ -324,6 +324,10 @@ class CoreManager:
         # seq_id -> (dp_rank, req_cost, tok_cost) so release subtracts exactly
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
+        # Ids of submitted structured-output requests. Their grammar state was
+        # prepared on every DP rank, so each must be released everywhere when
+        # the request ends; the finished item (`CompletionResult`) does not say.
+        self._structured_ids: set[int] = set()
         self._lb_lock = Lock()
         # --- Backpressure (lazy) DP dispatch --------------------------------
         # ATOM_DP_DISPATCH_DEPTH > 0 holds load-balanced seqs in _bp_pending and
@@ -578,6 +582,15 @@ class CoreManager:
                     self.async_output_queue = None
                     self._output_handler_task = None
                     self._asyncio_mode = False
+                    # No socket of this manager's is ever opened.
+                    self.ctx.destroy(linger=0)
+                    if self._bp_depth > 0:
+                        logger.warning(
+                            "%s: ATOM_DP_DISPATCH_DEPTH=%d has no effect with an "
+                            "external engine client, which places requests itself",
+                            self.label,
+                            self._bp_depth,
+                        )
                     return
 
                 if not self.is_coordinator:
@@ -1040,23 +1053,29 @@ class CoreManager:
             seq for seq in seqs if getattr(seq, "json_schema", None) is not None
         ]
         if structured:
+            ids = [seq.id for seq in structured]
             try:
                 if self.structured_request_prepare is None:
                     raise ValueError("Structured output requires engine admission")
                 self.structured_request_prepare(structured)
+                # Before the send: the output thread may finish them first.
+                self._structured_ids.update(ids)
                 self._add_prepared_requests(seqs)
             except BaseException:
-                self._release_structured_requests(structured)
+                self._release_structured_requests(ids)
                 raise
         else:
             self._add_prepared_requests(seqs)
 
-    def _release_structured_requests(self, seqs):
-        # The submitted/finished sequences own the cleanup information. There
-        # is no cross-thread registry: workers tolerate repeated releases.
-        ids = [seq.id for seq in seqs if getattr(seq, "json_schema", None) is not None]
-        if not ids:
-            return
+    def _release_finished_structured(self, seq_id: int) -> None:
+        if seq_id in self._structured_ids:
+            self._structured_ids.discard(seq_id)
+            self._release_structured_requests([seq_id])
+
+    def _release_structured_requests(self, ids: list[int]):
+        # Workers tolerate repeated releases.
+        for seq_id in ids:
+            self._structured_ids.discard(seq_id)
         try:
             # Never wait for an RPC reply on the output receiver thread.
             self.broadcast_utility_command(
@@ -1583,7 +1602,7 @@ class CoreManager:
         and normal completions have had theirs popped by the STREAM that
         delivered them, so both answer False and keep their existing path.
         """
-        self._release_structured_requests([seq])
+        self._release_finished_structured(seq.id)
         callback = self._seq_id_to_callback.pop(seq.id, None)
         if callback is None:
             return False

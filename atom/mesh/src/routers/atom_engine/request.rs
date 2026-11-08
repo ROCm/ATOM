@@ -1,8 +1,8 @@
 //! A prepared payload → the Cores' `Submission`. Refuses up front what the
-//! Python API server refuses (`max_tokens` over the deployment's cap, an
-//! over-long context, a prompt the KV pool cannot hold, logprobs under
-//! speculative decoding) and what this server does not serve yet (top and
-//! streamed logprobs, streaming n > 1).
+//! Python API server refuses (sampling values `SamplingParams` rejects,
+//! `max_tokens` over the deployment's cap, an over-long context, a prompt the
+//! KV pool cannot hold, logprobs under forced acceptance) and what this
+//! server does not serve yet (top and streamed logprobs, streaming n > 1).
 
 use axum::response::Response;
 use http::HeaderMap;
@@ -21,16 +21,28 @@ use crate::{
 /// Headers naming the session a request belongs to, in priority order.
 const SESSION_HEADERS: [&str; 3] = ["x-dynamo-session-id", "x-session-id", "x-correlation-id"];
 
+/// What a request asks of admission beyond its prepared payload.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct Admission {
+    /// It must call a tool, and is held to the model's required channel if
+    /// its tool-call format has one.
+    pub required_tool_call: bool,
+    /// Its `data_parallel_rank`.
+    pub rank: Option<usize>,
+    /// Its `logprobs` field is one the API ignores (`/v1/completions`, as
+    /// the Python server does): the Core is not asked for them.
+    pub ignore_logprobs: bool,
+}
+
 impl AtomEngineRouter {
-    /// `required_tool_call`: the request must call a tool, and is held to the
-    /// model's required channel if its tool-call format has one.
     pub(super) fn submit(
         &self,
         payload: &GenerationPayload,
         ctx: &ResponseContext,
-        required_tool_call: bool,
+        admission: Admission,
     ) -> Result<TokenHandle, Response> {
         let model = &self.engine.model;
+        check_sampling(payload).map_err(bad_request)?;
         let max_tokens = max_tokens(
             model,
             payload.sampling.max_new_tokens,
@@ -50,10 +62,10 @@ impl AtomEngineRouter {
                 "streaming with n > 1 is not supported yet".into(),
             ));
         }
-        let logprobs = payload.logprob.return_logprob;
-        if logprobs && model.speculative {
+        let logprobs = payload.logprob.return_logprob && !admission.ignore_logprobs;
+        if logprobs && model.synthetic_acceptance {
             return Err(bad_request(
-                "Token logprobs are not supported with speculative decoding".into(),
+                "logprobs is unavailable with synthetic forced acceptance".into(),
             ));
         }
         if logprobs && payload.logprob.top_logprobs_num > 0 {
@@ -87,31 +99,17 @@ impl AtomEngineRouter {
             });
         }
 
-        let sampling = pb::SamplingParams {
-            temperature: Some(temperature),
-            top_k: Some(payload.sampling.top_k as i64),
-            top_p: Some(payload.sampling.top_p as f64),
-            max_tokens: Some(max_tokens as i64),
-            ignore_eos: payload.sampling.ignore_eos,
-            stop_strings: (!stop_strings.is_empty()).then_some(pb::StopStrings {
-                value: Some(pb::stop_strings::Value::Many(pb::StringList {
-                    items: stop_strings,
-                })),
-            }),
-            n,
-            logprobs: logprobs.then_some(pb::sampling_params::Logprobs::LogprobsFlag(true)),
-            top_logprobs: 0,
-            required_channel: model
-                .required_channel
-                .as_ref()
-                .filter(|_| required_tool_call)
-                .map(Into::into),
-            json_schema: None,
-            structured_tool_format: None,
-            structured_reasoning_end: String::new(),
-            // `max_tokens` above is already final: nothing in the Core may shrink it.
-            max_tokens_is_default: false,
-        };
+        let sampling = sampling_params(
+            model,
+            payload,
+            Settled {
+                max_tokens,
+                n,
+                logprobs,
+                stop_strings,
+                required_tool_call: admission.required_tool_call,
+            },
+        );
         let seqs = self
             .engine
             .client
@@ -122,6 +120,7 @@ impl AtomEngineRouter {
                 stop_token_sequences,
                 n,
                 session: session_id(ctx.headers.as_ref()),
+                rank: admission.rank,
                 stream: payload.stream,
             })
             .map_err(|failure| EngineError::from(failure).into_response())?;
@@ -197,11 +196,72 @@ fn max_tokens(
     }
 }
 
+/// What `submit` settled for a request before it builds its parameters.
+struct Settled {
+    max_tokens: u64,
+    n: u32,
+    logprobs: bool,
+    stop_strings: Vec<String>,
+    required_tool_call: bool,
+}
+
+/// The request's SamplingParams on the wire.
+fn sampling_params(
+    model: &ModelSpec,
+    payload: &GenerationPayload,
+    settled: Settled,
+) -> pb::SamplingParams {
+    let stop_strings = settled.stop_strings;
+    pb::SamplingParams {
+        temperature: Some(payload.sampling.temperature as f64),
+        top_k: Some(payload.sampling.top_k as i64),
+        top_p: Some(payload.sampling.top_p as f64),
+        max_tokens: Some(settled.max_tokens as i64),
+        ignore_eos: payload.sampling.ignore_eos,
+        stop_strings: (!stop_strings.is_empty()).then_some(pb::StopStrings {
+            value: Some(pb::stop_strings::Value::Many(pb::StringList {
+                items: stop_strings,
+            })),
+        }),
+        n: settled.n,
+        logprobs: settled
+            .logprobs
+            .then_some(pb::sampling_params::Logprobs::LogprobsFlag(true)),
+        top_logprobs: 0,
+        required_channel: model
+            .required_channel
+            .as_ref()
+            .filter(|_| settled.required_tool_call)
+            .map(Into::into),
+        json_schema: None,
+        structured_tool_format: None,
+        structured_reasoning_end: String::new(),
+        // `max_tokens` is already final: nothing in the Core may shrink it.
+        max_tokens_is_default: false,
+    }
+}
+
+/// What `SamplingParams.__post_init__` refuses, refused before any response
+/// starts (in the Core it would arrive as an error after the stream began).
+fn check_sampling(payload: &GenerationPayload) -> Result<(), String> {
+    let s = &payload.sampling;
+    if !(s.top_p > 0.0 && s.top_p <= 1.0) {
+        return Err("top_p must be in range (0.0, 1.0]".into());
+    }
+    if s.top_k != -1 && s.top_k != 0 && s.top_k < 1 {
+        return Err("top_k must be -1 or 0 (disabled) or >= 1".into());
+    }
+    // `n` < 1 is not refused: `_coerce_n` makes it 1, as `submit` does.
+    Ok(())
+}
+
+/// The first session header present and not empty, as the Python server's
+/// `or` chain picks it.
 fn session_id(headers: Option<&HeaderMap>) -> Option<&str> {
     let headers = headers?;
     SESSION_HEADERS
         .iter()
-        .find_map(|name| headers.get(*name)?.to_str().ok())
+        .find_map(|name| headers.get(*name)?.to_str().ok().filter(|v| !v.is_empty()))
 }
 
 fn bad_request(message: String) -> Response {
@@ -228,6 +288,80 @@ mod tests {
             "max_output_tokens": cap,
         }))
         .unwrap()
+    }
+
+    fn payload(top_p: f32, top_k: i32) -> GenerationPayload {
+        use crate::routers::prepare::generation_payload::{
+            LogprobConfig, SamplingParams, StopConfig,
+        };
+        GenerationPayload {
+            request_id: "r".into(),
+            text: String::new(),
+            token_ids: vec![1],
+            sampling: SamplingParams {
+                temperature: 0.5,
+                top_p,
+                top_k,
+                min_p: 0.0,
+                frequency_penalty: 0.0,
+                presence_penalty: 0.0,
+                repetition_penalty: 1.0,
+                max_new_tokens: None,
+                min_new_tokens: 0,
+                n: 1,
+                ignore_eos: false,
+            },
+            stop: StopConfig {
+                stop: None,
+                stop_token_ids: None,
+                skip_special_tokens: true,
+                no_stop_trim: false,
+            },
+            logprob: LogprobConfig {
+                return_logprob: false,
+                top_logprobs_num: 0,
+                logprob_start_len: -1,
+                token_ids_logprob: vec![],
+                input_logprobs: false,
+            },
+            tool_constraints: None,
+            pd_metadata: None,
+            stream: false,
+            return_hidden_states: false,
+            log_metrics: false,
+        }
+    }
+
+    #[test]
+    fn only_a_required_tool_call_is_held_to_the_channel() {
+        let mut m = model(4096, None);
+        m.required_channel = Some(crate::atom_engine::spec::RequiredChannel {
+            after: vec![1],
+            opening: vec![2],
+            opens_at: 1,
+            end_ids: vec![3],
+        });
+        let settle = |required_tool_call| Settled {
+            max_tokens: 16,
+            n: 1,
+            logprobs: false,
+            stop_strings: vec![],
+            required_tool_call,
+        };
+        let held = sampling_params(&m, &payload(1.0, -1), settle(true));
+        assert_eq!(held.required_channel.unwrap().opening, [2]);
+        assert!(sampling_params(&m, &payload(1.0, -1), settle(false))
+            .required_channel
+            .is_none());
+    }
+
+    #[test]
+    fn sampling_values_the_core_would_refuse_are_refused_up_front() {
+        assert!(check_sampling(&payload(1.0, -1)).is_ok());
+        assert!(check_sampling(&payload(1.0, 0)).is_ok());
+        assert!(check_sampling(&payload(0.0, -1)).is_err());
+        assert!(check_sampling(&payload(1.5, -1)).is_err());
+        assert!(check_sampling(&payload(1.0, -2)).is_err());
     }
 
     #[test]
@@ -258,5 +392,8 @@ mod tests {
         assert_eq!(session_id(Some(&headers)), Some("s"));
         headers.insert("x-dynamo-session-id", "d".parse().unwrap());
         assert_eq!(session_id(Some(&headers)), Some("d"));
+        // An empty one is skipped, as the Python server's `or` chain skips it.
+        headers.insert("x-dynamo-session-id", "".parse().unwrap());
+        assert_eq!(session_id(Some(&headers)), Some("s"));
     }
 }

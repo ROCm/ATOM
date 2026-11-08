@@ -9,7 +9,12 @@ mod chat;
 mod request;
 mod token_source;
 
-use std::sync::Arc;
+use request::Admission;
+
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -96,15 +101,20 @@ impl AtomEngineRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
-        thinking: Option<&Value>,
+        extras: &RawExtras,
     ) -> Result<Response, Response> {
-        let admission = self.chat_request(body, thinking)?;
-        let request = Arc::new(admission.request);
+        let chat = self.chat_request(body, extras.thinking.as_ref())?;
+        let admission = Admission {
+            required_tool_call: chat.required_tool_call,
+            rank: extras.rank()?,
+            ignore_logprobs: false,
+        };
+        let request = Arc::new(chat.request);
         let (headers, model_id, app) = (headers.cloned(), self.model_id(), self.ctx.clone());
         let (payload, ctx) = self
             .on_prepare_worker(move || prepare::prepare_chat(request, headers, model_id, &app))
             .await?;
-        let stream = self.submit(&payload, &ctx, admission.required_tool_call)?;
+        let stream = self.submit(&payload, &ctx, admission)?;
         Ok(if payload.stream {
             render::chat_streaming::process(stream, ctx, BACKEND_LABEL)
         } else {
@@ -118,8 +128,12 @@ impl AtomEngineRouter {
         body: &GenerateRequest,
     ) -> Result<Response, Response> {
         self.check_model(body.model.as_deref())?;
-        let (payload, ctx) = self.prepare_generate(headers, body.clone()).await?;
-        let stream = self.submit(&payload, &ctx, false)?;
+        let admission = Admission {
+            rank: dp_rank(body.data_parallel_rank.map(i64::from))?,
+            ..Default::default()
+        };
+        let (payload, ctx) = self.prepare_generate(headers, body.clone(), false).await?;
+        let stream = self.submit(&payload, &ctx, admission)?;
         Ok(if payload.stream {
             render::generate_streaming::process(stream, ctx, BACKEND_LABEL)
         } else {
@@ -127,17 +141,29 @@ impl AtomEngineRouter {
         })
     }
 
+    /// `/v1/completions`, as the Python server serves it: the prompt gets the
+    /// tokenizer's special tokens (BOS), and `logprobs` is ignored.
     async fn completion(
         &self,
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
+        extras: &RawExtras,
     ) -> Result<Response, Response> {
-        let generate = completion_to_generate(body)
-            .map_err(|msg| error::bad_request("completion_unsupported_field", msg))?;
+        let mut generate = completion_to_generate(body).map_err(|msg| {
+            // The adapter is the gRPC router's too, and says so.
+            let msg = msg.replace("gRPC /v1/completions path", "ATOM standalone server");
+            error::bad_request("completion_unsupported_field", msg)
+        })?;
         self.check_model(generate.model.as_deref())?;
-        let (payload, ctx) = self.prepare_generate(headers, generate).await?;
-        let stream = self.submit(&payload, &ctx, false)?;
-        let render = CompletionRender::new(body, self.engine.model.served_name.clone());
+        let render = CompletionRender::new(self.engine.model.served_name.clone());
+        generate.rid = Some(render.id().to_string());
+        let admission = Admission {
+            rank: extras.rank()?,
+            ignore_logprobs: true,
+            ..Default::default()
+        };
+        let (payload, ctx) = self.prepare_generate(headers, generate, true).await?;
+        let stream = self.submit(&payload, &ctx, admission)?;
         Ok(if payload.stream {
             render.stream(stream, ctx)
         } else {
@@ -149,10 +175,12 @@ impl AtomEngineRouter {
         &self,
         headers: Option<&HeaderMap>,
         request: GenerateRequest,
+        add_special_tokens: bool,
     ) -> Result<(GenerationPayload, ResponseContext), Response> {
         let (headers, model_id, app) = (headers.cloned(), self.model_id(), self.ctx.clone());
         self.on_prepare_worker(move || {
-            prepare::prepare_generate(Arc::new(request), headers, model_id, &app)
+            let request = Arc::new(request);
+            prepare::prepare_generate_with(request, headers, model_id, &app, add_special_tokens)
         })
         .await
     }
@@ -176,11 +204,17 @@ impl AtomEngineRouter {
         ticket.wait().await.map_err(refused)?
     }
 
+    /// `validate_model`: the served name, a trailing `/` aside on either side.
     fn check_model(&self, requested: Option<&str>) -> Result<(), Response> {
         let served = &self.engine.model.served_name;
         match requested {
             None => Ok(()),
-            Some(name) if name == UNKNOWN_MODEL_ID || name == served => Ok(()),
+            Some(name)
+                if name == UNKNOWN_MODEL_ID
+                    || name.trim_end_matches('/') == served.trim_end_matches('/') =>
+            {
+                Ok(())
+            }
             Some(name) => Err(error::bad_request(
                 "model_not_found",
                 format!("requested model `{name}` does not match loaded model `{served}`"),
@@ -188,33 +222,26 @@ impl AtomEngineRouter {
         }
     }
 
-    /// A chat body's `thinking`, which the typed request has no field for.
-    /// The body is read again only when it names one.
-    fn thinking(body: &[u8]) -> Result<Option<Value>, Response> {
-        #[derive(serde::Deserialize)]
-        struct Thinking {
-            #[serde(default)]
-            thinking: Option<Value>,
-        }
-        if memchr::memmem::find(body, b"\"thinking\"").is_none() {
-            return Ok(None);
-        }
-        serde_json::from_slice::<Thinking>(body)
-            .map(|t| t.thinking)
-            .map_err(|e| error::bad_request("invalid_request", e.to_string()))
-    }
-
     fn model_id(&self) -> Option<String> {
         Some(self.engine.model.served_name.clone())
     }
 
+    /// api_server's `ModelCard`: the deployment's metadata under its name.
     fn model_card(&self) -> Value {
-        json!({
+        let created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let mut card = json!({
             "id": self.engine.model.served_name,
             "object": "model",
+            "created": created,
             "owned_by": "atom",
-            "max_model_len": self.engine.model.max_model_len,
-        })
+        });
+        if let Value::Object(card) = &mut card {
+            card.extend(self.engine.model.model_card.clone());
+        }
+        card
     }
 }
 
@@ -239,28 +266,32 @@ impl RouterTrait for AtomEngineRouter {
         request: InferenceEnvelope,
         _app: &Arc<AppContext>,
     ) -> Response {
-        let thinking = match &request.parsed {
-            ParsedInference::Chat(_) => Self::thinking(&request.body),
-            _ => Ok(None),
+        let extras = match &request.parsed {
+            ParsedInference::Chat(_) | ParsedInference::Completion(_) => {
+                RawExtras::read(&request.body)
+            }
+            _ => Ok(RawExtras::default()),
         };
         let (uri, headers, parsed, _) = request.into_native_parts();
         let headers = Some(&headers);
-        let routed = match parsed {
-            ParsedInference::Chat(body) => match thinking {
-                Ok(thinking) => self.chat(headers, &body, thinking.as_ref()).await,
-                Err(e) => Err(e),
-            },
-            ParsedInference::Completion(body) => self.completion(headers, &body).await,
-            ParsedInference::Generate(body) => self.generate(headers, &body).await,
-            ParsedInference::Messages(_) | ParsedInference::Responses(_) => Err(IngressError::new(
-                StatusCode::NOT_IMPLEMENTED,
-                "unsupported_api",
-                format!(
-                    "{} is not supported by the ATOM standalone server yet",
-                    uri.path()
-                ),
-            )
-            .response(uri.path())),
+        let routed = match (parsed, extras) {
+            (_, Err(e)) => Err(e),
+            (ParsedInference::Chat(body), Ok(extras)) => self.chat(headers, &body, &extras).await,
+            (ParsedInference::Completion(body), Ok(extras)) => {
+                self.completion(headers, &body, &extras).await
+            }
+            (ParsedInference::Generate(body), _) => self.generate(headers, &body).await,
+            (ParsedInference::Messages(_) | ParsedInference::Responses(_), _) => {
+                Err(IngressError::new(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "unsupported_api",
+                    format!(
+                        "{} is not supported by the ATOM standalone server yet",
+                        uri.path()
+                    ),
+                )
+                .response(uri.path()))
+            }
         };
         routed.unwrap_or_else(|e| e)
     }
@@ -311,7 +342,9 @@ impl RouterTrait for AtomEngineRouter {
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        self.chat(headers, body, None).await.unwrap_or_else(|e| e)
+        self.chat(headers, body, &RawExtras::default())
+            .await
+            .unwrap_or_else(|e| e)
     }
 
     async fn route_completion(
@@ -320,7 +353,9 @@ impl RouterTrait for AtomEngineRouter {
         body: &CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        self.completion(headers, body).await.unwrap_or_else(|e| e)
+        self.completion(headers, body, &RawExtras::default())
+            .await
+            .unwrap_or_else(|e| e)
     }
 
     fn router_type(&self) -> &'static str {
@@ -329,5 +364,70 @@ impl RouterTrait for AtomEngineRouter {
 
     fn is_pd_mode(&self) -> bool {
         false
+    }
+}
+
+/// Request fields the typed chat / completion requests have no field for,
+/// read from the body only when it names one of them.
+#[derive(Debug, Default, serde::Deserialize)]
+struct RawExtras {
+    #[serde(default)]
+    thinking: Option<Value>,
+    #[serde(default)]
+    data_parallel_rank: Option<Value>,
+}
+
+impl RawExtras {
+    fn read(body: &[u8]) -> Result<Self, Response> {
+        let names = |key: &[u8]| memchr::memmem::find(body, key).is_some();
+        if !names(b"\"thinking\"") && !names(b"\"data_parallel_rank\"") {
+            return Ok(Self::default());
+        }
+        serde_json::from_slice(body)
+            .map_err(|e| error::bad_request("invalid_request", e.to_string()))
+    }
+
+    fn rank(&self) -> Result<Option<usize>, Response> {
+        match &self.data_parallel_rank {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(n)) if n.is_i64() => dp_rank(n.as_i64()),
+            Some(_) => Err(error::bad_request(
+                "invalid_request",
+                "data_parallel_rank must be an integer",
+            )),
+        }
+    }
+}
+
+/// A request's `data_parallel_rank`, refused when negative; the client
+/// checks it against the engine count.
+fn dp_rank(rank: Option<i64>) -> Result<Option<usize>, Response> {
+    match rank {
+        None => Ok(None),
+        Some(r) if r >= 0 => Ok(Some(r as usize)),
+        Some(r) => Err(error::bad_request(
+            "invalid_request",
+            format!("data_parallel_rank must be >= 0, got {r}"),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_extras_are_read_only_when_named_and_ranks_are_checked() {
+        let none = RawExtras::read(br#"{"model": "m", "prompt": "data"}"#).unwrap();
+        assert!(none.thinking.is_none() && none.data_parallel_rank.is_none());
+        let extras =
+            RawExtras::read(br#"{"data_parallel_rank": 2, "thinking": {"type": "enabled"}}"#)
+                .unwrap();
+        assert_eq!(extras.rank().unwrap(), Some(2));
+        assert!(extras.thinking.is_some());
+        let negative = RawExtras::read(br#"{"data_parallel_rank": -1}"#).unwrap();
+        assert!(negative.rank().is_err());
+        let text = RawExtras::read(br#"{"data_parallel_rank": "1"}"#).unwrap();
+        assert!(text.rank().is_err());
     }
 }

@@ -13,6 +13,10 @@ use super::{
 
 /// How often a blocked wait rechecks that the Core process still exists.
 const LIVENESS_POLL: Duration = Duration::from_secs(1);
+
+/// Asked between polls while startup waits on a Core: true gives up (the
+/// launcher was interrupted).
+pub type Interrupted<'a> = &'a dyn Fn() -> bool;
 /// `make_zmq_socket`'s buffer size on a large host.
 const SOCKET_BUFFER_BYTES: i32 = 512 * 1024 * 1024;
 
@@ -34,11 +38,16 @@ impl CoreLink {
     pub fn connect(
         ctx: &zmq::Context,
         spec: CoreSpec,
+        interrupted: Interrupted<'_>,
     ) -> Result<(Self, zmq::Socket, Option<u64>), String> {
         let output = bind(ctx, zmq::PULL, &spec.output)?;
-        let input = Peer::accept(bind(ctx, zmq::ROUTER, &spec.input)?, spec.pid)?;
-        let control = Peer::accept(bind(ctx, zmq::ROUTER, &spec.control)?, spec.pid)?;
-        wait_readable(&output, spec.pid)?;
+        let input = Peer::accept(bind(ctx, zmq::ROUTER, &spec.input)?, spec.pid, interrupted)?;
+        let control = Peer::accept(
+            bind(ctx, zmq::ROUTER, &spec.control)?,
+            spec.pid,
+            interrupted,
+        )?;
+        wait_readable(&output, spec.pid, interrupted)?;
         let ready = match Inbound::decode(recv_frames(&output).map_err(zmq_err)?)?.body {
             pb::envelope::Body::Ready(ready) => ready,
             pb::envelope::Body::Stopped(_) => return Err("stopped before it was ready".into()),
@@ -66,8 +75,8 @@ impl CoreLink {
 
 impl Peer {
     /// The Core's first frame on a ROUTER carries its routing identity.
-    fn accept(socket: zmq::Socket, pid: u32) -> Result<Self, String> {
-        wait_readable(&socket, pid)?;
+    fn accept(socket: zmq::Socket, pid: u32, interrupted: Interrupted<'_>) -> Result<Self, String> {
+        wait_readable(&socket, pid, interrupted)?;
         let identity = recv_frames(&socket)
             .map_err(zmq_err)?
             .swap_remove(0)
@@ -101,8 +110,13 @@ pub(super) fn process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Block until `socket` has a message, failing if Core `pid` dies first.
-fn wait_readable(socket: &zmq::Socket, pid: u32) -> Result<(), String> {
+/// Block until `socket` has a message, failing if Core `pid` dies first or
+/// the wait is interrupted.
+fn wait_readable(
+    socket: &zmq::Socket,
+    pid: u32,
+    interrupted: Interrupted<'_>,
+) -> Result<(), String> {
     loop {
         if socket
             .poll(zmq::POLLIN, LIVENESS_POLL.as_millis() as i64)
@@ -113,6 +127,9 @@ fn wait_readable(socket: &zmq::Socket, pid: u32) -> Result<(), String> {
         }
         if !process_alive(pid) {
             return Err(format!("EngineCore process {pid} exited"));
+        }
+        if interrupted() {
+            return Err("interrupted while waiting for the EngineCores".into());
         }
     }
 }

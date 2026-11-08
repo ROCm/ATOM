@@ -13,14 +13,17 @@ import importlib.util
 import json
 import logging
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from atom.entrypoints.atomesh.engine_spec import (
+    apply_chat_template,
     build_engine_spec,
     check_standalone_model,
     default_reasoning_parser,
+    tool_call_format,
 )
 from atom.utils.gc_utils import (
     freeze_gc_heap,
@@ -170,8 +173,9 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
     )
 
     python_raw_args, mesh_network_args = split_standalone_mesh_args(raw_args)
-    # What Python does not know -- --tool-call-parser, --reasoning-parser and
-    # the rest of the router's flags -- is the mesh router's.
+    # What Python does not know -- --reasoning-parser and the rest of the
+    # router's flags -- is the mesh router's. `--tool-call-parser` and
+    # `--chat-template` are taken back out in `launch_atom_standalone`.
     engine_args, mesh_args = parser.parse_known_args(python_raw_args)
     return StandaloneArgs(
         engine_args=engine_args,
@@ -180,18 +184,61 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
     )
 
 
+def take_flag(args: list[str], flag: str) -> tuple[list[str], str | None]:
+    """`args` without `flag` (as `flag value` or `flag=value`), and its value."""
+    rest, value, it = [], None, iter(args)
+    for arg in it:
+        if arg == flag:
+            value = next(it, None)
+        elif arg.startswith(flag + "="):
+            value = arg[len(flag) + 1 :]
+        else:
+            rest.append(arg)
+    return rest, value
+
+
 def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
     standalone_args = parse_standalone_args(raw_args)
     engine_args = standalone_args.engine_args
-    check_standalone_model(engine_args.model)
+    check_standalone_model(engine_args)
     tokenizer = load_tokenizer(engine_args)
-    mesh_args = standalone_args.mesh_args
-    if not any(arg.startswith("--reasoning-parser") for arg in mesh_args):
-        mesh_args = [
-            *mesh_args,
-            "--reasoning-parser",
-            default_reasoning_parser(tokenizer),
-        ]
+    # The template, reasoning parser and tool-call format are decided here,
+    # against ATOM's own resolvers, and handed to the router decided.
+    mesh_args, template_override = take_flag(
+        standalone_args.mesh_args, "--chat-template"
+    )
+    mesh_args, requested_tool_parser = take_flag(mesh_args, "--tool-call-parser")
+    with tempfile.TemporaryDirectory(prefix="atomesh-") as workdir:
+        chat_template = apply_chat_template(tokenizer, template_override, workdir)
+        if not any(arg.startswith("--reasoning-parser") for arg in mesh_args):
+            mesh_args += ["--reasoning-parser", default_reasoning_parser(tokenizer)]
+        tool_format = tool_call_format(
+            requested_tool_parser,
+            tokenizer,
+            engine_args.model,
+            set(atomesh_runner.tool_parser_names()),
+        )
+        if tool_format.mesh_name is not None:
+            mesh_args += ["--tool-call-parser", tool_format.mesh_name]
+        serve_standalone(
+            atomesh_runner,
+            standalone_args,
+            tokenizer,
+            mesh_args,
+            tool_format.parser,
+            chat_template,
+        )
+
+
+def serve_standalone(
+    atomesh_runner: Any,
+    standalone_args: StandaloneArgs,
+    tokenizer: Any,
+    mesh_args: list[str],
+    tool_parser: Any,
+    chat_template: str | None,
+) -> None:
+    engine_args = standalone_args.engine_args
     parsed_args = atomesh_runner.parse_from(mesh_args)
     cli_args = parsed_args["cli_args"]
     initialize_engine(engine_args)
@@ -199,8 +246,10 @@ def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
         engine_spec = build_engine_spec(
             engine,
             tokenizer,
-            engine_args.model,
+            engine_args.served_model_name or engine_args.model,
             standalone_args.default_chat_template_kwargs,
+            tool_parser,
+            chat_template,
         )
         # This process keeps the engine and reaps its Cores while Rust serves.
         tune_gc()

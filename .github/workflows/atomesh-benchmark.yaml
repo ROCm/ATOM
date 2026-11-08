@@ -157,7 +157,7 @@ on:
         default: ''
         type: string
       worker_entrypoint:
-        description: 'Prefill/decode worker entrypoint: python = api_server, mesh = Rust runtime in Mesh (USE_ATOMESH_ENTRYPOINTS=1, built from this ref)'
+        description: 'Worker entrypoint: python = api_server, mesh = Rust runtime in Mesh (USE_ATOMESH_ENTRYPOINTS=1, built from this ref; aggregated topologies with atom_source=mounted only, no P/D yet)'
         required: false
         default: python
         type: choice

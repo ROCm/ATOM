@@ -45,11 +45,28 @@ impl Balancer {
         }
     }
 
-    /// Place sequence `seq` and charge its rank; `None` when no rank is alive.
-    pub fn admit(&mut self, seq: u64, prompt_tokens: u64, session: Option<&str>) -> Option<usize> {
+    /// Place sequence `seq` and charge its rank; `None` when no rank it may
+    /// go to is alive. An `explicit` rank (the request's `data_parallel_rank`,
+    /// already range-checked) is authoritative and becomes the session's owner.
+    pub fn admit(
+        &mut self,
+        seq: u64,
+        prompt_tokens: u64,
+        session: Option<&str>,
+        explicit: Option<usize>,
+    ) -> Option<usize> {
         let session = session.filter(|_| self.spec.session_affinity);
-        let rank = match session {
-            Some(id) => match self.session_owner.get(id) {
+        let rank = match (explicit, session) {
+            (Some(rank), _) if !self.alive[rank] => return None,
+            (Some(rank), Some(id)) => {
+                // The new rank cannot be assumed to hold the old prefix.
+                if self.session_owner.insert(id.to_string(), rank) != Some(rank) {
+                    self.session_prompt.remove(id);
+                }
+                rank
+            }
+            (Some(rank), None) => rank,
+            (None, Some(id)) => match self.session_owner.get(id) {
                 Some(&owner) if self.alive[owner] => owner,
                 _ => {
                     let owner = self.place_session(id)?;
@@ -58,7 +75,7 @@ impl Balancer {
                     owner
                 }
             },
-            None => self.place()?,
+            (None, None) => self.place()?,
         };
         let mut tokens = prompt_tokens;
         if let Some(id) = session {
@@ -140,6 +157,20 @@ fn session_hash(session: &str, rank: usize) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_explicit_rank_is_authoritative_and_owns_the_session() {
+        let mut b = balancer(BalanceStrategy::LeastRequests, 4, true);
+        let owner = b.admit(0, 100, Some("s"), None).unwrap();
+        let other = (owner + 1) % 4;
+        assert_eq!(b.admit(1, 120, Some("s"), Some(other)), Some(other));
+        // Moved: the whole prompt is new prefill debt there.
+        assert_eq!(b.charges[&1].tokens, 120);
+        assert_eq!(b.admit(2, 130, Some("s"), None), Some(other));
+        assert_eq!(b.charges[&2].tokens, 10);
+        b.mark_dead(other);
+        assert_eq!(b.admit(3, 1, None, Some(other)), None);
+    }
+
     fn balancer(strategy: BalanceStrategy, ranks: usize, affinity: bool) -> Balancer {
         Balancer::new(
             BalanceSpec {
@@ -154,11 +185,11 @@ mod tests {
     #[test]
     fn least_requests_spreads_and_releases() {
         let mut b = balancer(BalanceStrategy::LeastRequests, 2, false);
-        let first = b.admit(0, 10, None).unwrap();
-        let second = b.admit(1, 10, None).unwrap();
+        let first = b.admit(0, 10, None, None).unwrap();
+        let second = b.admit(1, 10, None, None).unwrap();
         assert_ne!(first, second);
         b.release(0);
-        assert_eq!(b.admit(2, 10, None), Some(first));
+        assert_eq!(b.admit(2, 10, None, None), Some(first));
         b.release(0);
         assert_eq!(b.reqs, vec![1, 1]);
     }
@@ -166,7 +197,7 @@ mod tests {
     #[test]
     fn prefill_done_releases_tokens_only() {
         let mut b = balancer(BalanceStrategy::LeastTokens, 1, false);
-        b.admit(7, 50, None);
+        b.admit(7, 50, None, None);
         b.prefill_done(7);
         assert_eq!((b.reqs[0], b.tokens[0]), (1, 0));
         b.release(7);
@@ -176,11 +207,11 @@ mod tests {
     #[test]
     fn session_sticks_and_is_charged_its_growth() {
         let mut b = balancer(BalanceStrategy::LeastRequests, 4, true);
-        let owner = b.admit(0, 100, Some("s")).unwrap();
+        let owner = b.admit(0, 100, Some("s"), None).unwrap();
         for seq in 1..4 {
-            b.admit(seq, 0, None);
+            b.admit(seq, 0, None, None);
         }
-        assert_eq!(b.admit(9, 130, Some("s")), Some(owner));
+        assert_eq!(b.admit(9, 130, Some("s"), None), Some(owner));
         assert_eq!(b.charges[&9].tokens, 30);
     }
 
@@ -189,7 +220,7 @@ mod tests {
         // Ranks hashlib.blake2b(session + rank_le32, digest_size=8) picks.
         for (session, rank) in [("s", 3), ("abc", 3), ("session-42", 1)] {
             let mut b = balancer(BalanceStrategy::LeastTokens, 4, true);
-            assert_eq!(b.admit(0, 10, Some(session)), Some(rank), "{session}");
+            assert_eq!(b.admit(0, 10, Some(session), None), Some(rank), "{session}");
         }
     }
 
@@ -197,9 +228,9 @@ mod tests {
     fn dead_ranks_are_skipped() {
         let mut b = balancer(BalanceStrategy::RoundRobin, 2, true);
         b.mark_dead(0);
-        assert!((0..4).all(|seq| b.admit(seq, 1, None) == Some(1)));
-        assert_eq!(b.admit(9, 1, Some("s")), Some(1));
+        assert!((0..4).all(|seq| b.admit(seq, 1, None, None) == Some(1)));
+        assert_eq!(b.admit(9, 1, Some("s"), None), Some(1));
         b.mark_dead(1);
-        assert_eq!(b.admit(10, 1, None), None);
+        assert_eq!(b.admit(10, 1, None, None), None);
     }
 }

@@ -17,6 +17,7 @@ than silently converted.
 """
 
 import array
+import math
 import pickle
 import sys
 
@@ -255,6 +256,15 @@ def _encode_torch(value, msg, writer: FrameWriter) -> bool:
     return True
 
 
+def _check_nbytes(view, shape, itemsize) -> None:
+    """A tensor's buffer holds exactly its elements."""
+    expected = math.prod(shape) * itemsize
+    if view.nbytes != expected:
+        raise ProtocolError(
+            f"tensor of shape {shape} needs {expected} bytes, got {view.nbytes}"
+        )
+
+
 def _decode_tensor(msg, reader: FrameReader):
     view = reader.view(msg.data)
     shape = tuple(msg.shape)
@@ -265,9 +275,11 @@ def _decode_tensor(msg, reader: FrameReader):
         dtype = from_wire.get(msg.dtype)
         if dtype is None:
             raise ProtocolError(f"unknown torch dtype {msg.dtype}")
+        _check_nbytes(view, shape, dtype.itemsize)
         if view.nbytes:
             tensor = torch.frombuffer(view, dtype=dtype).reshape(shape)
         else:
+            # Zero elements: `frombuffer` refuses an empty buffer.
             tensor = torch.empty(shape, dtype=dtype)
         if msg.device:
             tensor = tensor.to(msg.device)
@@ -277,6 +289,7 @@ def _decode_tensor(msg, reader: FrameReader):
     dtype = _NUMPY_FROM_WIRE.get(msg.dtype)
     if dtype is None:
         raise ProtocolError(f"unknown numpy dtype {msg.dtype}")
+    _check_nbytes(view, shape, np.dtype(dtype).itemsize)
     out = np.frombuffer(view, dtype=dtype).reshape(shape)
     if msg.kind == pb.NUMPY_SCALAR:
         return out[()]

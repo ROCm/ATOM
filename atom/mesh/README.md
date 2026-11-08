@@ -2,7 +2,7 @@
 
 High-performance model routing gateway for **PD (Prefill–Decode) disaggregated** LLM serving. It routes inference across heterogeneous worker fleets with cache-aware load balancing, a gRPC pipeline that keeps tokenization in Rust, and built-in reliability primitives.
 
-Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns the ATOM engine, tokenizer, and OpenAI-compatible serving semantics, while Atomesh provides the HTTP server, request routing, lifecycle management, observability, and PyO3 bridge. This allows the same Atomesh serving layer to support both distributed worker routing and a single-process ATOM deployment path.
+Atomesh can also run in an **ATOM standalone** mode. In this mode Python parses the arguments, decides what needs ATOM's own machinery (chat template, reasoning dialect and switch, tool-call format) and spawns and reaps the EngineCores; the Rust runtime (`src/atom_engine`, `src/routers/atom_engine`) is the EngineCores' only client, speaking the engine_v1 protocol (`atom/model_engine/protocol/engine_v1.proto`) to them over ZMQ, and does all request handling: templating, tokenization, DP placement, detokenization, parsers and HTTP.
 
 ## Features
 
@@ -135,9 +135,8 @@ image must provide `protoc` when enabling it.
 
 ### ATOM standalone
 
-ATOM standalone mode starts the ATOM engine and tokenizer in Python, while Rust
-Mesh provides the HTTP server, lifecycle handling, observability, and PyO3
-request bridge. Enable the Atomesh entrypoint through
+ATOM standalone mode starts the EngineCores from Python and serves them from
+Rust, which is their only client. Enable it through
 `USE_ATOMESH_ENTRYPOINTS=1`:
 
 ```bash
@@ -150,6 +149,30 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server \
 Do not pass `mesh-only` for standalone mode. The `mesh-only` subcommand is only
 used when the Python entrypoint should run Atomesh as a router for external
 workers.
+
+`--tool-call-parser` takes ATOM's format names (`qwen`, `glm`, `kimi`,
+`kimi_k3`, `minimax`, `dsml`, `dsml_v41`) or any of the router's own; unset, the
+format is read off the chat template as the Python server reads it.
+`--chat-template` and `--served-model-name` behave as in the Python server.
+
+#### Limitations
+
+What the standalone server does not serve yet is refused, never silently
+served differently:
+
+- At startup: models with a custom message encoder, reasoning dialects other
+  than `<think>...</think>` (unless `--reasoning-parser` is given), P/D
+  (prefill/decode) workers, pipeline parallelism, multi-node data parallelism
+  and RapidServe.
+- Per request: `response_format` json_object / json_schema, `top_logprobs`,
+  streamed logprobs, chat logprobs, streaming with `n > 1`, multimodal input,
+  `/v1/messages` and `/v1/responses` (501).
+- Not exposed yet: ATOM's `/metrics`, `/server_info` tp/dp, `/kv_transfer_info`,
+  profiling and debug routes.
+
+Losing an EngineCore shuts the whole server down (in-flight requests on it end
+with 503) so that an orchestrator restarts it; use the Python api_server
+(`USE_ATOMESH_ENTRYPOINTS=0`) for any of the above.
 
 
 ### Regular HTTP routing

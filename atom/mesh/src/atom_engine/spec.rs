@@ -25,6 +25,9 @@ pub struct ModelSpec {
     pub chat_template: Option<String>,
     #[serde(default)]
     pub default_chat_template_kwargs: Map<String, Value>,
+    /// `/v1/models`' deployment fields (`deployment_metadata`).
+    #[serde(default)]
+    pub model_card: Map<String, Value>,
     #[serde(default)]
     pub max_model_len: Option<u64>,
     pub default_max_tokens: u32,
@@ -32,9 +35,10 @@ pub struct ModelSpec {
     /// explicit request over it is refused, the default is cut to it.
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
-    /// Speculative decoding is on; the Core cannot return logprobs then.
+    /// Speculative decoding forces acceptance at fixed rates, so it has no real
+    /// token logprobs (`SamplingParams.validate_logprob_options`).
     #[serde(default)]
-    pub speculative: bool,
+    pub synthetic_acceptance: bool,
     /// What a `tool_choice="required"` request is held to, already ending
     /// on the engine's end ids; none where the tool-call format has none.
     #[serde(default)]

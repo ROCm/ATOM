@@ -259,3 +259,36 @@ class WorkflowInputTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MeshWorkerTopologyTest(TempDirTest):
+    """A mesh worker is refused up front where the Rust runtime cannot serve:
+    P/D topologies (not yet supported) and the image's own ATOM."""
+
+    def check(self, topology_aggregated, source):
+        text = (SCRIPTS / "pd_server_atom.sh").read_text()
+        start = text.index("# Refused before any weights load")
+        end = text.index("\nfi\n", start) + 4
+        script = (
+            f"ATOMESH_WORKER_ENTRYPOINT=mesh AGGREGATED={topology_aggregated} "
+            f"TOPOLOGY=t ATOMESH_ATOM_SOURCE={source}\n" + text[start:end]
+        )
+        return subprocess.run(
+            ["bash", "-eu", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    def test_aggregated_and_mounted_is_served(self):
+        self.assertEqual(self.check(1, "mounted").returncode, 0)
+
+    def test_pd_and_image_are_refused(self):
+        for aggregated, source, reason in (
+            (0, "mounted", "no P/D"),
+            (1, "image", "mounted"),
+        ):
+            result = self.check(aggregated, source)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(reason, result.stderr)

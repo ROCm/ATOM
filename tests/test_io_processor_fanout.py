@@ -183,3 +183,14 @@ def test_pd_logprobs_rejected_before_tokenization(configured):
         proc.preprocess_fanout("hello", SamplingParams(logprobs=True), **kwargs)
     proc.tokenizer.encode.assert_not_called()
     assert not proc.requests
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_speculative_logprobs_are_admitted(n):
+    """#2856: target-token logprobs are served under MTP / DSpark, so a
+    speculative engine admits a logprobs request like any other."""
+    proc = _make_processor()
+    proc.num_speculative_tokens = 3
+    seqs = proc.preprocess_fanout("hello", SamplingParams(n=n, logprobs=True))
+    assert len(seqs) == n
+    assert all(s.return_logprobs for s in _engine_seqs(seqs))

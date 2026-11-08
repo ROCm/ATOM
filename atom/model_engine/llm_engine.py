@@ -14,6 +14,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
+from atom.model_engine.protocol.codec import REJECTED_REASON
 from atom.model_engine.protocol.requests import (
     CompletionResult,
     IngressRequest,
@@ -791,32 +792,6 @@ class InputOutputProcessor:
                 block_size, config.decode_context_parallel_size
             )
 
-    @staticmethod
-    def _per_req_cache_model_types() -> frozenset[str]:
-        """Single source of truth for which model_types use per-req cache.
-
-        `has_per_req_cache` flags model architectures that need a per-request
-        stateful buffer outside the paged KV pool; BlockManager reserves a
-        per-req cache slot for their sequences. Read by the engine's sequence
-        construction (`protocol.codec.AdmissionContext`) AND by ModelRunner's
-        startup sanity check, which asserts that any model whose attention
-        builder declares a per-request state sub-pool has its model_type
-        registered here. Adding a new stateful-attention model means adding
-        its model_type to this set.
-        """
-        return frozenset(
-            {
-                "qwen3_next",
-                "qwen3_5_text",
-                "qwen3_5_moe_text",
-                "kimi_linear",
-                "glm5_next_text",
-                "deepseek_v4",
-                "deepseek_v41_text",
-                "qwen4_exp_text",
-            }
-        )
-
     def preprocess(
         self,
         prompt_or_tokens: str | list[int] | PrefixEncoding,
@@ -949,12 +924,6 @@ class InputOutputProcessor:
                 enable_dp_attention=self.config.enable_dp_attention,
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
-        # Refused here, where `Sequence` used to refuse it: the engine builds
-        # the sequence now, and the caller should still hear it synchronously.
-        if self.num_speculative_tokens and sampling_params.logprobs:
-            raise ValueError(
-                "Token logprobs are not supported with speculative decoding"
-            )
 
         if isinstance(prompt_or_tokens, str):
             prompt_or_tokens = self.encode_prompt(
@@ -1080,7 +1049,12 @@ class InputOutputProcessor:
         2) Detokenize"""
         outputs = {}
         for req in reqs:
-            self.requests.pop(req.id)
+            ingress = self.requests.pop(req.id)
+            if req.leave_reason.startswith(REJECTED_REASON):
+                # Rejected at admission: the Core never built the sequence,
+                # so the result carries no arrival or prompt of its own.
+                req.arrive_time = ingress.arrive_time
+                req.num_prompt_tokens = ingress.num_prompt_tokens
             external_request_id = self._internal_to_external.pop(req.id, None)
             if external_request_id is not None:
                 self._external_to_internal.pop(external_request_id, None)

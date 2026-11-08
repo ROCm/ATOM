@@ -70,6 +70,7 @@ from atom.model_engine.scheduler import (
     defers_output,
 )
 from atom.model_engine.sequence import (
+    PER_REQ_CACHE_MODEL_TYPES,
     Sequence,
     SequenceStatus,
     SequenceType,
@@ -961,14 +962,12 @@ class ModelRunner:
         # tensor[-1] on first decode. Catch the misconfiguration up front
         # rather than producing wrong outputs at inference time.
         if self._state_pool_names():
-            from atom.model_engine.llm_engine import InputOutputProcessor as _IOProc
-
             mt = self.config.hf_config.model_type
-            known = _IOProc._per_req_cache_model_types()
+            known = PER_REQ_CACHE_MODEL_TYPES
             assert mt in known, (
                 f"Attention builder {type(self.attn_metadata_builder).__name__} "
                 f"declares a per-request state pool but model_type={mt!r} is not in "
-                f"InputOutputProcessor.per_req_cache_model_types ({sorted(known)}). "
+                f"sequence.PER_REQ_CACHE_MODEL_TYPES ({sorted(known)}). "
                 "Add it to the set or sequences will not be assigned slots "
                 "(silent corruption)."
             )

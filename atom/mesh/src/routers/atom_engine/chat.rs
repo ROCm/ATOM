@@ -43,8 +43,26 @@ impl AtomEngineRouter {
         thinking: Option<&Value>,
     ) -> Result<ChatAdmission, Response> {
         self.check_model(Some(&body.model))?;
+        if body.logprobs {
+            // api_server splits them between reasoning and the answer and
+            // leaves out special tokens; until this one does, it refuses them.
+            return Err(error::bad_request(
+                "not_supported",
+                "chat logprobs is not supported by the ATOM standalone server yet",
+            ));
+        }
         let mut request = body.clone();
         for message in &mut request.messages {
+            if let ChatMessage::Assistant {
+                tool_calls: Some(calls),
+                ..
+            } = message
+            {
+                calls
+                    .iter_mut()
+                    .filter_map(|call| call.function.arguments.as_mut())
+                    .for_each(normalize_tool_call_arguments);
+            }
             let content = match message {
                 ChatMessage::System { content, .. }
                 | ChatMessage::User { content, .. }
@@ -194,6 +212,48 @@ fn apply_reasoning_controls(
     }
 }
 
+/// A history tool call's `arguments` as the Python server reads them
+/// (`_normalize_tool_call_arguments`): JSON as is; else with invalid escapes
+/// (`\\d` a model wrote) doubled; else wrapped as `{"_raw": ...}` -- never a
+/// refusal of the whole request.
+fn normalize_tool_call_arguments(arguments: &mut String) {
+    if serde_json::from_str::<Value>(arguments).is_ok() {
+        return;
+    }
+    let fixed = fix_invalid_json_escapes(arguments);
+    *arguments = if serde_json::from_str::<Value>(&fixed).is_ok() {
+        fixed
+    } else {
+        serde_json::json!({ "_raw": arguments.as_str() }).to_string()
+    };
+}
+
+/// `_fix_invalid_json_escapes`: a backslash not starting a JSON escape is
+/// doubled.
+fn fix_invalid_json_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            None => out.push_str("\\\\"),
+            Some('\\') => out.push_str("\\\\"),
+            Some(next) if "\"/bfnrtu".contains(next) => {
+                out.push('\\');
+                out.push(next);
+            }
+            Some(next) => {
+                out.push_str("\\\\");
+                out.push(next);
+            }
+        }
+    }
+    out
+}
+
 /// `[{type: text}, ...]` → the texts joined by newlines, as the Python server
 /// renders them (templates such as Qwen3's drop content that is not a
 /// string); media is refused.
@@ -230,6 +290,24 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn history_tool_call_arguments_are_repaired_not_refused() {
+        let mut ok = r#"{"a": 1}"#.to_string();
+        normalize_tool_call_arguments(&mut ok);
+        assert_eq!(ok, r#"{"a": 1}"#);
+        // A regex the model wrote with an unescaped backslash.
+        let mut escape = r#"{"pattern": "\d+"}"#.to_string();
+        normalize_tool_call_arguments(&mut escape);
+        let parsed: Value = serde_json::from_str(&escape).unwrap();
+        assert_eq!(parsed["pattern"], "\\d+");
+        let mut broken = "{not json".to_string();
+        normalize_tool_call_arguments(&mut broken);
+        assert_eq!(
+            serde_json::from_str::<Value>(&broken).unwrap(),
+            json!({"_raw": "{not json"})
+        );
+    }
 
     #[test]
     fn text_parts_join_into_one_string_and_media_is_refused() {

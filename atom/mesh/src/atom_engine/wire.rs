@@ -61,7 +61,9 @@ impl Inbound {
             .filter(|_| r.frame >= 1)
             .ok_or_else(|| format!("buffer refers to missing frame {}", r.frame))?;
         let start = r.offset as usize;
-        let end = start + r.nbytes as usize;
+        let end = start
+            .checked_add(r.nbytes as usize)
+            .ok_or("buffer bounds overflow")?;
         frame
             .get(start..end)
             .ok_or_else(|| format!("buffer [{start}, {end}) overruns frame {}", r.frame))

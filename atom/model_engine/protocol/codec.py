@@ -14,6 +14,7 @@ ends reads as it did when the payloads were pickled.
 """
 
 import array
+import logging
 import pickle
 from dataclasses import fields
 from functools import cache, lru_cache
@@ -36,8 +37,11 @@ from atom.model_engine.protocol.wire import (
     encode_value,
 )
 from atom.model_engine.request import RequestOutput
+from atom.model_engine.sequence import PER_REQ_CACHE_MODEL_TYPES, Sequence
 from atom.observability import tracing
 from atom.sampling_params import RequiredChannel, SamplingParams
+
+logger = logging.getLogger("atom")
 
 # Every SamplingParams field the wire carries. A field added to the dataclass
 # without a wire field would silently fall back to its default in the Core, so
@@ -62,6 +66,23 @@ if {f.name for f in fields(SamplingParams)} != set(SAMPLING_FIELDS):
     raise ImportError(
         "SamplingParams and the engine wire protocol disagree on fields; "
         "update engine_v1.proto and codec._encode/_decode_sampling"
+    )
+
+# RequestOutput's fields in constructor order, as `_decode_stream` builds one
+# positionally. A field added or reordered there must be carried here first.
+STREAM_FIELDS = (
+    "request_id",
+    "output_tokens",
+    "finished",
+    "finish_reason",
+    "kv_transfer_params_output",
+    "num_cached_tokens",
+    "logprobs",
+)
+if tuple(f.name for f in fields(RequestOutput)) != STREAM_FIELDS:
+    raise ImportError(
+        "RequestOutput and the engine wire protocol disagree on fields; "
+        "update engine_v1.proto (StreamBatch) and codec.encode/_decode_stream"
     )
 
 # A rejected admission's leave_reason starts with this.
@@ -127,6 +148,13 @@ def _encode_sampling(params: SamplingParams, msg, max_tokens) -> None:
     msg.max_tokens_is_default = params.max_tokens_is_default
 
 
+_SAMPLING_DEFAULTS = SamplingParams()
+
+
+def _optional_or_default(msg, name):
+    return getattr(msg if msg.HasField(name) else _SAMPLING_DEFAULTS, name)
+
+
 def _decode_sampling(msg) -> SamplingParams:
     stops = msg.stop_strings.WhichOneof("value")
     if stops == "single":
@@ -145,10 +173,12 @@ def _decode_sampling(msg) -> SamplingParams:
             opens_at=wire.opens_at,
             end_ids=tuple(wire.end_ids),
         )
+    # An absent temperature / top_k / top_p is the default, not None (which
+    # would reach the sampler as NaN); see SamplingParams in engine_v1.proto.
     return SamplingParams(
-        temperature=_optional(msg, "temperature"),
-        top_k=_optional(msg, "top_k"),
-        top_p=_optional(msg, "top_p"),
+        temperature=_optional_or_default(msg, "temperature"),
+        top_k=_optional_or_default(msg, "top_k"),
+        top_p=_optional_or_default(msg, "top_p"),
         max_tokens=_optional(msg, "max_tokens"),
         ignore_eos=msg.ignore_eos,
         stop_strings=stop_strings,
@@ -170,16 +200,22 @@ def _sampling_from_bytes(data: bytes) -> SamplingParams:
     return _decode_sampling(msg)
 
 
-def _decode_sampling_cached(msg) -> SamplingParams:
-    """`_decode_sampling`, shared by every request whose params encode alike.
+def _decode_sampling_cached(msg) -> tuple[SamplingParams, int | None]:
+    """`_decode_sampling`, shared by every request whose params encode alike,
+    and the request's own `max_tokens`.
 
     A Core reads a request's SamplingParams only while it builds the
     `Sequence`, which copies the fields out, so one decoded object can serve
     them all -- as n > 1 siblings always shared theirs. Requests in one
     deployment repeat a handful of parameter sets, and decoding one costs as
-    much as the rest of the request's spec.
+    much as the rest of the request's spec. `max_tokens` stays out of the
+    key: it varies per request (clamped defaults, benchmarks) and would make
+    every lookup miss. `build_sequence` sets it on the sequence.
     """
-    return _sampling_from_bytes(msg.SerializeToString(deterministic=True))
+    max_tokens = _optional(msg, "max_tokens")
+    msg.ClearField("max_tokens")
+    params = _sampling_from_bytes(msg.SerializeToString(deterministic=True))
+    return params, max_tokens
 
 
 def _encode_chain(chain: ShippedChain, msg, writer: FrameWriter) -> None:
@@ -369,10 +405,11 @@ def _decode_stream(msg, reader: FrameReader) -> list[tuple[int, RequestOutput]]:
     logprobs = _decode_logprobs(msg, reader)
     out = []
     start = 0
-    for i, (seq_id, request_id, count, finished, cached) in enumerate(
+    # A streamed output's request id is its sequence id (the Scheduler sets
+    # `request_id=seq.id`), so the wire carries it once.
+    for i, (seq_id, count, finished, cached) in enumerate(
         zip(
             list(msg.seq_ids),
-            list(msg.request_ids),
             counts,
             list(msg.finished),
             list(msg.num_cached_tokens),
@@ -385,7 +422,7 @@ def _decode_stream(msg, reader: FrameReader) -> list[tuple[int, RequestOutput]]:
                 seq_id,
                 # Positional, in field order: this runs per sequence per step.
                 RequestOutput(
-                    request_id,
+                    seq_id,
                     tokens[start:end],
                     finished,
                     reasons.get(i),
@@ -457,6 +494,7 @@ class AdmissionSpec:
         "arrive_time",
         "cache_seed",
         "kwargs",
+        "max_tokens",
         "prompt_hash_chain",
         "seq_id",
         "trace",
@@ -470,20 +508,24 @@ class AdmissionSpec:
         kwargs,
         prompt_hash_chain=None,
         trace=None,
+        max_tokens=None,
     ):
         self.seq_id = seq_id
         self.arrive_time = arrive_time
         self.cache_seed = cache_seed
         self.kwargs = kwargs
+        # The request's own cap; the shared SamplingParams in `kwargs` has none.
+        self.max_tokens = max_tokens
         self.prompt_hash_chain = prompt_hash_chain
         # `(carrier, model, request_id)`, as `tracing.wire_context` gave it.
         self.trace = trace
 
 
 def _decode_spec(msg, reader: FrameReader) -> AdmissionSpec:
+    sampling_params, max_tokens = _decode_sampling_cached(msg.sampling)
     kwargs = {
         "token_ids": reader.int32_array(msg.prompt_token_ids),
-        "sampling_params": _decode_sampling_cached(msg.sampling),
+        "sampling_params": sampling_params,
         "stop_token_sequences": [list(s.ids) for s in msg.stop_token_sequences],
         "kv_transfer_params": decode_optional_value(msg, "kv_transfer_params", reader),
         "needs_independent_noise": msg.needs_independent_noise,
@@ -515,6 +557,7 @@ def _decode_spec(msg, reader: FrameReader) -> AdmissionSpec:
             else None
         ),
         trace=trace,
+        max_tokens=max_tokens,
     )
 
 
@@ -562,14 +605,10 @@ class AdmissionContext:
     Holds what the Core derives from its own config -- the client used to
     derive the same from its copy of it -- and fills in what a client may
     leave out (the REQUESTS section of engine_v1.proto). Built once per Core,
-    at startup: the per-request-cache list lives with the frontend's
-    `InputOutputProcessor`, whose import costs a second that no request
-    should wait on.
+    at startup.
     """
 
     def __init__(self, config):
-        from atom.model_engine.llm_engine import InputOutputProcessor
-
         speculative = getattr(config, "speculative_config", None)
         self.config = config
         self.block_size = config.kv_cache_block_size
@@ -577,8 +616,7 @@ class AdmissionContext:
             speculative.num_speculative_tokens if speculative is not None else 0
         )
         self.has_per_req_cache = (
-            config.hf_config.model_type
-            in InputOutputProcessor._per_req_cache_model_types()
+            config.hf_config.model_type in PER_REQ_CACHE_MODEL_TYPES
         )
         self.validate_request = getattr(config.hf_config, "validate_request", None)
         self.enable_dp_attention = bool(getattr(config, "enable_dp_attention", False))
@@ -590,8 +628,6 @@ def build_sequence(spec: AdmissionSpec, context: AdmissionContext):
     Raises what the frontend would have raised building it, plus what the
     model's own request validation refuses.
     """
-    from atom.model_engine.sequence import Sequence
-
     kwargs = dict(spec.kwargs)
     multimodal_data = kwargs["multimodal_data"]
     if context.validate_request is not None:
@@ -633,6 +669,7 @@ def build_sequence(spec: AdmissionSpec, context: AdmissionContext):
             del multimodal_data["cache_seed"]
     # `Sequence` reads a falsy id as "draw one"; 0 is a real client id.
     seq.id = spec.seq_id
+    seq.max_tokens = spec.max_tokens
     seq.arrive_time = spec.arrive_time
     # The BlockManager checks a shipped chain before it trusts it.
     seq.prompt_hash_chain = spec.prompt_hash_chain
@@ -687,7 +724,6 @@ def encode_stream(outputs) -> list:
     msg.SetInParent()
     results = [output for _, output in outputs]
     msg.seq_ids.extend([seq_id for seq_id, _ in outputs])
-    msg.request_ids.extend([output.request_id for output in results])
     msg.token_counts.extend([len(output.output_tokens) for output in results])
     msg.tokens.extend(chain.from_iterable(output.output_tokens for output in results))
     msg.finished.extend([output.finished for output in results])
@@ -696,11 +732,20 @@ def encode_stream(outputs) -> list:
         if output.finish_reason is not None:
             msg.finish_reasons[i] = output.finish_reason
         if output.kv_transfer_params_output is not None:
-            encode_value(
-                output.kv_transfer_params_output,
-                msg.kv_transfer_params_outputs[i],
-                writer,
-            )
+            try:
+                encode_value(
+                    output.kv_transfer_params_output,
+                    msg.kv_transfer_params_outputs[i],
+                    writer,
+                )
+            except Exception:  # one entry must not drop the whole step
+                # Every other sequence keeps this step's tokens; this one
+                # still ends on its Completion, which carries the params too.
+                del msg.kv_transfer_params_outputs[i]
+                logger.exception(
+                    "dropping seq %s's unencodable kv_transfer_params_output",
+                    outputs[i][0],
+                )
     _encode_logprobs(results, msg, writer)
     return writer.frames(envelope)
 

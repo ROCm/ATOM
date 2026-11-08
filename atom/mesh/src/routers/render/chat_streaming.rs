@@ -111,6 +111,8 @@ async fn run_chat_stream(
         _ => false,
     };
     let is_specific_function = matches!(tool_choice, Some(ToolChoice::Function { .. }));
+    let tool_choice_enabled =
+        !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
 
     let tool_parser_available = tools.is_some()
         && ctx
@@ -196,12 +198,9 @@ async fn run_chat_stream(
                     false
                 };
 
-                let tool_choice_enabled =
-                    !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
                 if !in_reasoning
-                    && tool_choice_enabled
                     && tools.is_some()
-                    && (tool_parser_available || used_json_schema)
+                    && (tool_parser_available || (used_json_schema && tool_choice_enabled))
                 {
                     let tool_chunks = if is_specific_function {
                         process_specific_function_stream(
@@ -228,6 +227,7 @@ async fn run_chat_stream(
                             system_fingerprint.as_deref(),
                             history_tool_calls_count,
                             used_json_schema,
+                            !tool_choice_enabled,
                         )
                         .await
                     };
@@ -286,7 +286,7 @@ async fn run_chat_stream(
         }
     }
 
-    if let Some(parser) = &tool_parser {
+    if let Some(parser) = tool_parser.as_ref().filter(|_| tool_choice_enabled) {
         let guard = parser.lock().await;
         if let Some(unstreamed) = guard.get_unstreamed_tool_args() {
             for item in unstreamed {
@@ -508,6 +508,9 @@ async fn process_tool_calls_stream(
     system_fingerprint: Option<&str>,
     history_tool_calls_count: usize,
     use_json_parser: bool,
+    // `tool_choice: "none"`: the format is read, so its markup leaves the
+    // content, but no call is sent.
+    suppress_calls: bool,
 ) -> Vec<ChatCompletionStreamResponse> {
     let mut chunks = Vec::new();
     if tool_parser.is_none() {
@@ -542,7 +545,7 @@ async fn process_tool_calls_stream(
                         .build(),
                 );
             }
-            for item in calls {
+            for item in calls.into_iter().filter(|_| !suppress_calls) {
                 *has_tool_call = true;
                 let id = item.name.as_ref().map(|n| {
                     generate_tool_call_id(model, n, item.tool_index, history_tool_calls_count)

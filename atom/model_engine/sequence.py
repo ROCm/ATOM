@@ -12,6 +12,25 @@ import numpy as np
 
 from atom.sampling_params import UNCONSTRAINED, SamplingParams
 
+# The model_types whose sequences need a per-request stateful buffer outside
+# the paged KV pool (`Sequence.has_per_req_cache`): BlockManager reserves them
+# a per-req cache slot. Read by the Core's sequence construction
+# (`protocol.codec.AdmissionContext`) and by ModelRunner's startup check that
+# a builder declaring a per-request state sub-pool is listed here. A new
+# stateful-attention model adds its model_type.
+PER_REQ_CACHE_MODEL_TYPES = frozenset(
+    {
+        "qwen3_next",
+        "qwen3_5_text",
+        "qwen3_5_moe_text",
+        "kimi_linear",
+        "glm5_next_text",
+        "deepseek_v4",
+        "deepseek_v41_text",
+        "qwen4_exp_text",
+    }
+)
+
 
 def new_token_ids(token_ids=()) -> array.array:
     """A sequence's token ids.
@@ -395,8 +414,8 @@ class Sequence:
         self.block_hashes: list[int] = []
         # `prefix_hash.ShippedChain`, consumed by
         # `BlockManager._adopt_shipped_chain`; None = the engine hashes it. It
-        # reaches the engine as the request's `PromptHashChain` on the wire,
-        # never inside a pickled seq (`__getstate__`).
+        # reaches the engine as the request's `PromptHashChain` on the wire
+        # and is left out wherever a seq is pickled (`__getstate__`).
         self.prompt_hash_chain: tuple | None = None
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never
@@ -628,7 +647,8 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        # The shipped prompt chain rides beside the seq (`prompt_hash_chain`).
+        # Wherever a seq is still pickled (runner and PP / disagg channels),
+        # its shipped prompt chain stays behind: only the BlockManager reads it.
         state = self.__dict__.copy()
         state["prompt_hash_chain"] = None
         return state

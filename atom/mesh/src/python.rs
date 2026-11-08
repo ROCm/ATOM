@@ -67,8 +67,10 @@ pub fn launch_mesh(
 ) -> PyResult<()> {
     let mut server_config = server_config.inner.take().unwrap();
     py.detach(move || {
+        // A signal to the launcher (Ctrl-C) ends the wait for the Cores.
+        let interrupted = || Python::attach(|py| py.check_signals().is_err());
         let engine = engine_spec
-            .map(|spec| AtomEngine::start(&spec).map(Arc::new))
+            .map(|spec| AtomEngine::start(&spec, &interrupted).map(Arc::new))
             .transpose()
             .map_err(|e| PyRuntimeError::new_err(format!("ATOM engine failed to start: {e}")))?;
         server_config.router_config.atom_standalone = engine.is_some();
@@ -254,6 +256,12 @@ pub fn cliargs_backend_name(backend: String) -> PyResult<String> {
     Ok(backend.to_string())
 }
 
+/// Every tool-call parser name `--tool-call-parser` accepts.
+#[pyfunction]
+pub fn tool_parser_names() -> Vec<String> {
+    crate::tool_parser::ParserFactory::new().list_parsers()
+}
+
 #[pyfunction]
 pub fn version_string() -> String {
     version::get_version_string()
@@ -270,6 +278,7 @@ pub fn atomesh_runner(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(launch_mesh, m)?)?;
     m.add_function(wrap_pyfunction!(parse_from, m)?)?;
     m.add_function(wrap_pyfunction!(cliargs_backend_name, m)?)?;
+    m.add_function(wrap_pyfunction!(tool_parser_names, m)?)?;
     m.add_function(wrap_pyfunction!(version_string, m)?)?;
     m.add_function(wrap_pyfunction!(version_verbose_string, m)?)?;
     Ok(())

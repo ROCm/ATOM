@@ -11,6 +11,7 @@
 //! restarted as a whole; nothing here recovers a Core).
 
 use std::{
+    panic::AssertUnwindSafe,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -27,7 +28,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     balance::Balancer,
-    link::{process_alive, recv_frames, CoreLink},
+    link::{process_alive, recv_frames, CoreLink, Interrupted},
     spec::EngineSpec,
     wire::{self, pb, Inbound},
 };
@@ -75,6 +76,8 @@ pub struct Submission<'a> {
     pub stop_token_sequences: Vec<pb::TokenIds>,
     pub n: u32,
     pub session: Option<&'a str>,
+    /// The request's `data_parallel_rank`: every sibling goes there.
+    pub rank: Option<usize>,
     pub stream: bool,
 }
 
@@ -109,19 +112,23 @@ struct Slot {
     /// on its last stream entry, which the Core sends a little earlier.
     needs_completion: bool,
     prompt_tokens: u32,
+    /// The prefix-cache hit, as the latest stream entry reports it. A
+    /// `Completion`'s own `num_cached_tokens` is the KV computed, not the hit.
+    cached_tokens: u32,
     tokens: Vec<u32>,
     events: mpsc::UnboundedSender<SeqEvent>,
 }
 
 impl EngineClient {
-    /// Bind every Core's sockets and wait until all of them are ready. Blocks.
-    pub fn connect(spec: &EngineSpec) -> Result<Self, String> {
+    /// Bind every Core's sockets and wait until all of them are ready. Blocks,
+    /// asking `interrupted` between polls.
+    pub fn connect(spec: &EngineSpec, interrupted: Interrupted<'_>) -> Result<Self, String> {
         let ctx = zmq::Context::new();
         let mut links = Vec::with_capacity(spec.engines.len());
         let mut outputs = Vec::with_capacity(spec.engines.len());
         let mut max_pool_tokens: Option<u64> = None;
         for core in &spec.engines {
-            let (link, output, pool) = CoreLink::connect(&ctx, core.clone())
+            let (link, output, pool) = CoreLink::connect(&ctx, core.clone(), interrupted)
                 .map_err(|e| format!("EngineCore DP rank {}: {e}", core.dp_rank))?;
             // A prompt is only safe if it fits wherever it is placed.
             max_pool_tokens = match (max_pool_tokens, pool) {
@@ -149,7 +156,13 @@ impl EngineClient {
                 let shared = shared.clone();
                 std::thread::Builder::new()
                     .name(format!("atom-core-out-{rank}"))
-                    .spawn(move || shared.read_outputs(rank, output))
+                    .spawn(move || {
+                        // A reader that panics would strand its sequences.
+                        let read = AssertUnwindSafe(|| shared.read_outputs(rank, output));
+                        if std::panic::catch_unwind(read).is_err() {
+                            shared.core_lost(rank, "output reader panicked");
+                        }
+                    })
                     .expect("spawn EngineCore output reader")
             })
             .collect();
@@ -200,47 +213,56 @@ impl EngineClient {
                 "the server is shutting down: {reason}"
             )));
         }
+        let cores = shared.links.len();
+        if let Some(rank) = sub.rank.filter(|&r| r >= cores) {
+            return Err(SeqFailure::Invalid(format!(
+                "data_parallel_rank must be in [0, {cores}), got {rank}"
+            )));
+        }
         let n = sub.n.max(1);
         let first = shared.next_seq_id.fetch_add(n as u64, Ordering::Relaxed);
         let seq_ids: Vec<u64> = (first..first + n as u64).collect();
 
+        // Placed and registered under one lock, which `core_lost` also takes:
+        // it either marks the rank dead before placement or finds the slots.
+        // Registered before sending, so no output can arrive for an unknown id.
         let mut ranks = Vec::with_capacity(seq_ids.len());
+        let mut handles = Vec::with_capacity(seq_ids.len());
         {
             let mut balancer = shared.balancer.lock();
             for &seq_id in &seq_ids {
-                match balancer.admit(seq_id, sub.prompt.len() as u64, sub.session) {
-                    Some(rank) => ranks.push(rank),
-                    None => {
-                        seq_ids.iter().for_each(|&s| balancer.release(s));
-                        return Err(SeqFailure::Unavailable("no EngineCore is alive".into()));
+                let Some(rank) =
+                    balancer.admit(seq_id, sub.prompt.len() as u64, sub.session, sub.rank)
+                else {
+                    for &s in &seq_ids {
+                        balancer.release(s);
+                        shared.seqs.remove(&s);
                     }
-                }
-            }
-        }
-
-        // Registered before sending, so no output can arrive for an unknown id.
-        let handles: Vec<SeqHandle> = seq_ids
-            .iter()
-            .zip(&ranks)
-            .map(|(&seq_id, &rank)| {
+                    handles
+                        .iter_mut()
+                        .for_each(|h: &mut SeqHandle| h.ended = true);
+                    return Err(SeqFailure::Unavailable("no EngineCore is alive".into()));
+                };
                 let (tx, rx) = mpsc::unbounded_channel();
                 let slot = Slot {
                     rank,
                     stream: sub.stream,
                     needs_completion: sub.sampling.logprobs.is_some(),
                     prompt_tokens: sub.prompt.len() as u32,
+                    cached_tokens: 0,
                     tokens: Vec::new(),
                     events: tx,
                 };
                 shared.seqs.insert(seq_id, slot);
-                SeqHandle {
+                ranks.push(rank);
+                handles.push(SeqHandle {
                     seq_id,
                     events: rx,
                     shared: shared.clone(),
                     ended: false,
-                }
-            })
-            .collect();
+                });
+            }
+        }
 
         let prompt = wire::token_frame(sub.prompt);
         let arrive_time = SystemTime::now()
@@ -272,9 +294,16 @@ impl EngineClient {
         Ok(handles)
     }
 
-    /// Ask every live Core to stop, wait for them to say so, then stop reading.
-    pub fn shutdown(&self, timeout: Duration) {
+    /// From here on a Core that stops or exits is expected to: the server is
+    /// going down (a signal reaches the Cores' process group too).
+    pub fn begin_shutdown(&self) {
         self.shared.shutting_down.store(true, Ordering::Release);
+    }
+
+    /// Ask every live Core to stop, wait for them to say so, then stop reading.
+    /// Whatever is still in flight then ends as failed.
+    pub fn shutdown(&self, timeout: Duration) {
+        self.begin_shutdown();
         let shutdown = wire::encode(pb::envelope::Body::Shutdown(pb::Shutdown {}), vec![]);
         for link in &self.shared.links {
             if let Err(e) = link.send_control(shutdown.clone()) {
@@ -289,6 +318,13 @@ impl EngineClient {
         self.shared.stopping.store(true, Ordering::Release);
         readers.drain(..).for_each(|r| {
             let _ = r.join();
+        });
+        let mut balancer = self.shared.balancer.lock();
+        self.shared.seqs.retain(|&seq_id, slot| {
+            balancer.release(seq_id);
+            let failure = SeqFailure::Unavailable("the server is shutting down".into());
+            let _ = slot.events.send(SeqEvent::Failed(failure));
+            false
         });
     }
 }
@@ -402,18 +438,35 @@ impl Shared {
         match &message.body {
             Body::Stream(batch) => self.on_stream(batch),
             Body::Completions(done) => {
+                // Item by item: one that does not decode fails alone.
                 for item in &done.items {
-                    let finished = Finished {
-                        token_ids: message.tokens(item.completion_token_ids.as_ref())?,
-                        logprobs: match item.return_logprobs {
-                            true => Some(message.floats(item.logprobs.as_ref())?),
-                            false => None,
-                        },
-                        prompt_tokens: item.num_prompt_tokens,
-                        cached_tokens: item.num_cached_tokens,
-                        leave_reason: item.leave_reason.clone(),
-                    };
-                    self.end(item.seq_id, |_| SeqEvent::Finished(finished));
+                    let decoded =
+                        message
+                            .tokens(item.completion_token_ids.as_ref())
+                            .and_then(|token_ids| {
+                                let logprobs = match item.return_logprobs {
+                                    true => Some(message.floats(item.logprobs.as_ref())?),
+                                    false => None,
+                                };
+                                Ok((token_ids, logprobs))
+                            });
+                    self.end(item.seq_id, |slot| match decoded {
+                        Ok((token_ids, logprobs)) => SeqEvent::Finished(Finished {
+                            token_ids,
+                            logprobs,
+                            prompt_tokens: item.num_prompt_tokens,
+                            cached_tokens: slot.cached_tokens,
+                            leave_reason: item.leave_reason.clone(),
+                        }),
+                        Err(e) => {
+                            error!(
+                                dp_rank = rank,
+                                seq_id = item.seq_id,
+                                "undecodable completion: {e}"
+                            );
+                            SeqEvent::Failed(SeqFailure::Internal(e))
+                        }
+                    });
                 }
                 Ok(())
             }
@@ -446,49 +499,49 @@ impl Shared {
     /// waits for its `Completion`; that `Completion`, when it comes, finds
     /// nothing left to end.
     fn on_stream(&self, batch: &pb::StreamBatch) -> Result<(), String> {
-        let mut offset = 0usize;
-        let mut ended = Vec::new();
+        let total: u64 = batch.token_counts.iter().map(|&c| c as u64).sum();
+        if total != batch.tokens.len() as u64 || batch.token_counts.len() != batch.seq_ids.len() {
+            return Err("stream columns disagree in length".into());
+        }
+        let finished = |i: usize| batch.finished.get(i).copied().unwrap_or(false);
         {
+            // Load only: the slots are not touched under this lock.
             let mut balancer = self.balancer.lock();
-            for (i, (&seq_id, &count)) in batch.seq_ids.iter().zip(&batch.token_counts).enumerate()
-            {
-                let end = offset + count as usize;
-                let tokens = batch
-                    .tokens
-                    .get(offset..end)
-                    .ok_or("stream token_counts overrun tokens")?;
-                offset = end;
+            for (i, &seq_id) in batch.seq_ids.iter().enumerate() {
                 balancer.prefill_done(seq_id);
-                let finished = batch.finished.get(i).copied().unwrap_or(false);
-                if finished {
+                if finished(i) {
                     balancer.release(seq_id);
                 }
-                let Some(mut slot) = self.seqs.get_mut(&seq_id) else {
-                    continue;
-                };
-                let tokens: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
-                slot.tokens.extend_from_slice(&tokens);
-                if slot.stream {
-                    let _ = slot.events.send(SeqEvent::Tokens(tokens));
-                }
-                if finished && !slot.needs_completion {
-                    ended.push((seq_id, i as u32));
-                }
+            }
+        }
+        let mut offset = 0usize;
+        let mut ended = Vec::new();
+        for (i, (&seq_id, &count)) in batch.seq_ids.iter().zip(&batch.token_counts).enumerate() {
+            let tokens = &batch.tokens[offset..offset + count as usize];
+            offset += count as usize;
+            let Some(mut slot) = self.seqs.get_mut(&seq_id) else {
+                continue;
+            };
+            if let Some(&cached) = batch.num_cached_tokens.get(i) {
+                slot.cached_tokens = cached as u32;
+            }
+            let tokens: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+            slot.tokens.extend_from_slice(&tokens);
+            if slot.stream {
+                let _ = slot.events.send(SeqEvent::Tokens(tokens));
+            }
+            if finished(i) && !slot.needs_completion {
+                ended.push((seq_id, i as u32));
             }
         }
         for (seq_id, i) in ended {
             let leave_reason = batch.finish_reasons.get(&i).cloned().unwrap_or_default();
-            let cached_tokens = batch
-                .num_cached_tokens
-                .get(i as usize)
-                .copied()
-                .unwrap_or(0);
             self.end(seq_id, |slot| {
                 SeqEvent::Finished(Finished {
                     token_ids: std::mem::take(&mut slot.tokens),
                     logprobs: None,
                     prompt_tokens: slot.prompt_tokens,
-                    cached_tokens: cached_tokens as u32,
+                    cached_tokens: slot.cached_tokens,
                     leave_reason,
                 })
             });

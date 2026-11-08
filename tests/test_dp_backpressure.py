@@ -57,6 +57,7 @@ def make_mgr(n_ranks=4, depth=3, fail_ranks=None):
     mgr._bp_offline_batch = True
     mgr._bp_dispatch_paused = False
     mgr._seq_id_to_callback = {}
+    mgr._structured_ids = set()
     mgr._flush_stream_batch_fn = None
     mgr.fail_ranks = set(fail_ranks or ())
     # capture what got sent to each rank

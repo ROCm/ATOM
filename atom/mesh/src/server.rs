@@ -742,8 +742,13 @@ async fn serve_with_prepare_pool(
     let engine = config.atom_engine.clone();
     signal_tasks.spawn(async move {
         tokio::select! {
-            _ = shutdown_signal() => {}
-            reason = engine_lost(engine) => {
+            _ = shutdown_signal() => {
+                // The signal reaches the Cores too: their exit is expected now.
+                if let Some(engine) = &engine {
+                    engine.client.begin_shutdown();
+                }
+            }
+            reason = engine_lost(engine.clone()) => {
                 error!("{reason}; starting graceful shutdown");
             }
         }

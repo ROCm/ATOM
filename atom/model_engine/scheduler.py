@@ -658,6 +658,10 @@ class ScheduledBatchOutput:
         return self._req_id_to_idx.get(req_id)
 
 
+# How long an abort for a not-yet-admitted id waits for its sequence.
+UNMATCHED_ABORT_TTL_S = 30.0
+
+
 class Scheduler:
     """Manages the lifecycle of inference requests through prefill and decode.
 
@@ -968,6 +972,11 @@ class Scheduler:
         self.prefill_delayer: PrefillDelayer | None = None
         # requests added since the previous schedule, the delayer's to weigh
         self._arrived_requests = 0
+        # Aborts for ids not admitted yet -> when they arrived. A client's
+        # Abort can be handled before the Submit it follows (utilities run
+        # before inputs each tick, and the two ride different sockets), so it
+        # is held for `UNMATCHED_ABORT_TTL_S` and applied on admission.
+        self._unmatched_aborts: dict[int, float] = {}
         self._local_prefill_coalescing = False
         self._inflight_prefix_wait: dict[int, int] = {}
         # This tick is the DP group's prefill step and this rank has none of its
@@ -1614,6 +1623,10 @@ class Scheduler:
             self._register_connector_admission(seq)
         self.waiting.extend(seqs)
         self._arrived_requests += len(seqs)
+        if self._unmatched_aborts:
+            for seq in seqs:
+                if self._unmatched_aborts.pop(seq.id, None) is not None:
+                    self.abort_request(seq.id)
 
     def _register_connector_admission(self, seq: Sequence) -> None:
         # Register every logical P request, including those behind a capacity
@@ -3126,7 +3139,19 @@ class Scheduler:
             if seq.id == req_id:
                 seq.status = SequenceStatus.ABORTED
                 return True
+        self._remember_unmatched_abort(req_id)
         return False
+
+    def _remember_unmatched_abort(self, req_id) -> None:
+        """Hold an abort `extend` may still need; one for a sequence that has
+        already finished expires unused."""
+        now = time.monotonic()
+        aborts = self._unmatched_aborts
+        if aborts:
+            expired = [i for i, t in aborts.items() if now - t > UNMATCHED_ABORT_TTL_S]
+            for i in expired:
+                del aborts[i]
+        aborts[req_id] = now
 
     def _abort_failed_remote_receive(self, req_id) -> None:
         """End a request whose P/D KV receive failed, as aborted.

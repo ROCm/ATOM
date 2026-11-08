@@ -47,6 +47,23 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     if state.context.prepare_pool.is_failed() {
         return prepare_pool_unavailable();
     }
+    // ATOM standalone has no workers to count: it is ready while it holds
+    // every EngineCore, and it exits once it loses one.
+    if let Some(engine) = &state.context.atom_engine {
+        let cores = engine.client.core_count();
+        return match engine.client.lost() {
+            None => (
+                StatusCode::OK,
+                Json(json!({"status": "ready", "engine_cores": cores})),
+            )
+                .into_response(),
+            Some(reason) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"status": "not ready", "reason": reason})),
+            )
+                .into_response(),
+        };
+    }
     let workers = state.context.worker_registry.get_all();
     let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
 

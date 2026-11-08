@@ -9,6 +9,7 @@ from dataclasses import dataclass, fields
 from atom import LLMEngine
 from atom.config import (
     CompilationConfig,
+    Config,
     CUDAGraphMode,
     DCPConfig,
     DSparkConfig,
@@ -974,7 +975,11 @@ class EngineArgs:
     def create_engine(self, tokenizer=None, **config_overrides) -> LLMEngine:
         """Create and return an LLMEngine instance with the configured parameters.
 
-        `config_overrides` are Config fields the CLI does not expose.
+        `config_overrides` are Config fields the CLI does not expose. LLMEngine
+        drops keys that are not Config fields, so a misspelt one is refused here.
         """
+        unknown = set(config_overrides) - {f.name for f in fields(Config)}
+        if unknown:
+            raise ValueError(f"not Config fields: {sorted(unknown)}")
         kwargs = {**self._get_engine_kwargs(), **config_overrides}
         return LLMEngine(self.model, tokenizer=tokenizer, **kwargs)

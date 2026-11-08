@@ -149,6 +149,18 @@ case "${ATOMESH_WORKER_ENTRYPOINT}" in
     exit 2
     ;;
 esac
+# Refused before any weights load: the Rust runtime does not serve P/D
+# (prefill/decode) workers yet, and needs this checkout's EngineCore protocol.
+if [[ "${ATOMESH_WORKER_ENTRYPOINT}" == "mesh" ]]; then
+  if [[ "${AGGREGATED}" != "1" ]]; then
+    echo "ERROR: ATOMESH_WORKER_ENTRYPOINT=mesh serves aggregated topologies only (no P/D yet); TOPOLOGY=${TOPOLOGY}" >&2
+    exit 2
+  fi
+  if [[ "${ATOMESH_ATOM_SOURCE}" != "mounted" ]]; then
+    echo "ERROR: ATOMESH_WORKER_ENTRYPOINT=mesh needs ATOMESH_ATOM_SOURCE=mounted (the image's ATOM predates the Rust runtime)" >&2
+    exit 2
+  fi
+fi
 if [[ ! "${ATOMESH_SERVICE_PORT_OFFSET}" =~ ^[0-9]+$ ]]; then
   echo "ERROR: ATOMESH_SERVICE_PORT_OFFSET must be a non-negative integer" >&2
   exit 2
@@ -2163,7 +2175,9 @@ start_aggregated() {
   fi
   local -a server_profiler_args=()
   build_torch_profiler_args "${log_name}" server_profiler_args
-  echo "[server] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
+  local -a server_entry_env=() server_entry_args=()
+  build_worker_entrypoint "${server_port}" server_entry_env server_entry_args || return 1
+  echo "[server] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none} entrypoint=${ATOMESH_WORKER_ENTRYPOINT}"
   local -a server_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
@@ -2174,10 +2188,11 @@ start_aggregated() {
     "${server_kv_transfer_args[@]}"
     "${decode_cudagraph_args[@]}"
     "${server_profiler_args[@]}"
+    "${server_entry_args[@]}"
     ${DECODE_SERVER_ARGS}
   )
-  dump_launch_info "SERVER" "${server_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${server_cache_env[@]}" "${server_dp_env[@]}" "${server_cmd[@]}"
+  dump_launch_info "SERVER" "${server_entry_env[@]}" "${server_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${server_cache_env[@]}" "${server_dp_env[@]}" "${server_entry_env[@]}" "${server_cmd[@]}"
 }
 
 start_router() {

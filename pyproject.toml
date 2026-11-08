@@ -49,6 +49,8 @@ atom = [
 # as the compiler wrote them; black's half of this is in [tool.black] below.
 [tool.ruff]
 extend-exclude = ["*_pb2.py"]
+# Also for paths passed explicitly (`ruff check <file>`), as black does below.
+force-exclude = true
 
 [project.entry-points."vllm.platform_plugins"]
 # by default the entry-points will be installed anyway

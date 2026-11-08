@@ -24,7 +24,9 @@ pub(crate) fn create_stop_decoder(
         StopSequenceDecoderBuilder::new(tokenizer.clone()).skip_special_tokens(skip_special_tokens);
 
     // no_stop_trim=true keeps the stop tokens/sequences in the decoded output.
-    for seq in stop_sequences {
+    // An empty stop string stops nothing (it would match before the first
+    // token here while the engine generates on).
+    for seq in stop_sequences.into_iter().filter(|s| !s.is_empty()) {
         builder = if no_stop_trim {
             builder.visible_stop_sequence(seq)
         } else {

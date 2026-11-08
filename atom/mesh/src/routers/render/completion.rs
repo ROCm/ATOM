@@ -25,8 +25,7 @@ use crate::{
     protocols::{
         common::Usage,
         completion::{
-            CompletionChoice, CompletionRequest, CompletionResponse, CompletionStreamChoice,
-            CompletionStreamResponse,
+            CompletionChoice, CompletionResponse, CompletionStreamChoice, CompletionStreamResponse,
         },
     },
     routers::{
@@ -45,11 +44,15 @@ pub struct CompletionRender {
     id: String,
     model: String,
     created: u64,
-    include_usage: bool,
 }
 
 impl CompletionRender {
-    pub fn new(request: &CompletionRequest, model: String) -> Self {
+    /// The response id; also the request id the Core sees.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn new(model: String) -> Self {
         Self {
             id: format!("cmpl-{}", Uuid::new_v4().simple()),
             model,
@@ -57,11 +60,6 @@ impl CompletionRender {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            include_usage: request
-                .stream_options
-                .as_ref()
-                .and_then(|o| o.include_usage)
-                .unwrap_or(false),
         }
     }
 
@@ -105,7 +103,9 @@ impl CompletionRender {
                 }
             }
             handle.mark_completed();
-            if let (true, Some(usage)) = (self.include_usage, usage) {
+            // A usage-only chunk before `[DONE]`, whatever `stream_options`
+            // says, as the Python server's /v1/completions sends one.
+            if let Some(usage) = usage {
                 let chunk = json!({
                     "id": self.id, "object": "text_completion", "created": self.created,
                     "model": self.model, "choices": [], "usage": openai_usage(&usage),

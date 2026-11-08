@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - 'atom/mesh/**'
+      # The Rust runtime's protocol and its cross-language fixtures.
+      - 'atom/model_engine/protocol/**'
+      - 'tests/fixtures/engine_v1/**'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
@@ -15,6 +18,9 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'atom/mesh/**'
+      # The Rust runtime's protocol and its cross-language fixtures.
+      - 'atom/model_engine/protocol/**'
+      - 'tests/fixtures/engine_v1/**'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark.sh'
       - '.github/scripts/atomesh/atomesh_mocker_benchmark_summary.py'
       - '.github/workflows/atomesh-mocker-benchmark.yaml'
@@ -83,6 +89,23 @@ jobs:
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
             --release --lib routers::http_pd_router
+
+      - name: Test the ATOM engine runtime
+        run: |
+          set -euo pipefail
+          # The EngineCore client (fake Cores over real ipc sockets, the
+          # engine_v1 fixtures Python writes), its frontend and the render and
+          # prepare layers it shares with the gRPC router.
+          cargo test \
+            --manifest-path atom/mesh/Cargo.toml \
+            --target-dir atom/mesh/mocker/target/mesh \
+            --release --lib -- \
+            atom_engine routers::atom_engine routers::render routers::prepare
+          # The vendored llm-tokenizer patch (not a workspace member).
+          cargo test \
+            --manifest-path atom/mesh/vendor/llm-tokenizer/Cargo.toml \
+            --target-dir atom/mesh/mocker/target/llm-tokenizer \
+            --release --lib
 
       - name: Run Atomesh test harness
         run: |
