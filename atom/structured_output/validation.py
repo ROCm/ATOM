@@ -223,11 +223,13 @@ def _checked_strict_parameters(name, text):
         responses=True,
     )
     _check_strict(name, parameters, top=True)
-    # The DSML tags quote these names unescaped: the parser reads a name up
-    # to its first quote.
-    if any('"' in n for n in (name, *parameters.get("properties", {}))):
+    # The DSML tags carry these names unescaped: the parser reads a name up
+    # to its first quote, and every tag it reads -- a call's end, another
+    # call -- opens with `<`.
+    if any(c in n for n in (name, *parameters.get("properties", {})) for c in '"<'):
         raise ValueError(
-            f"{name}: a strict tool's name and parameter names cannot contain '\"'"
+            f"{name}: a strict tool's name and parameter names cannot contain "
+            "'\"' or '<'"
         )
     return json.dumps(parameters)
 

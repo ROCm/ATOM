@@ -1095,13 +1095,21 @@ def test_annotations_leave_a_string_raw(controller, annotation):
         assert accepts(controller, compiled, _call_f("true", "x"))
 
 
-def test_a_reference_into_part_of_a_definition_takes_only_that_part(controller):
-    """`#/$defs/Scalar/anyOf/1` is Scalar's integer side, not all of Scalar."""
+@pytest.mark.parametrize(
+    "ref", ["#/$defs/Scalar/anyOf/1", "#/$defs/Scalar%2FanyOf%2F1"]
+)
+@pytest.mark.parametrize("decoy", [False, True])
+def test_a_reference_into_part_of_a_definition_takes_only_that_part(
+    controller, ref, decoy
+):
+    """`#/$defs/Scalar/anyOf/1` is Scalar's integer side, not all of Scalar,
+    however its slashes are spelled; a definition named `Scalar/anyOf/1` is
+    another one."""
     scalar = {"anyOf": [{"type": "string"}, {"type": "integer"}]}
-    compiled = controller.compile(
-        None,
-        _one_param({"$ref": "#/$defs/Scalar/anyOf/1"}, **{"$defs": {"Scalar": scalar}}),
-    )
+    defs = {"Scalar": scalar}
+    if decoy:
+        defs["Scalar/anyOf/1"] = {"type": "string"}
+    compiled = controller.compile(None, _one_param({"$ref": ref}, **{"$defs": defs}))
     assert accepts(controller, compiled, _call_f("false", "7"))
     assert not accepts(controller, compiled, _call_f("true", "oops"))
 

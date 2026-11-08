@@ -228,8 +228,9 @@ DeepSeek's rules or asks for what the grammar cannot hold:
   `format` must be one of DeepSeek's five: `email`, `hostname`, `ipv4`, `ipv6`,
   `uuid`;
 - the top of `parameters` holds only its properties, definitions and
-  annotations, and neither the tool's name nor a parameter's contains `"`,
-  which the DSML tags carry unescaped;
+  annotations, and neither the tool's name nor a parameter's contains `"` or
+  `<`: the DSML tags carry them unescaped, so the parser would read a name up
+  to its quote, or a tag inside it;
 - definitions live at the top, under DeepSeek's `$def` (read as `$defs`),
   `$defs` or `definitions`, and every `$ref` points into them. Each parameter
   is compiled on its own, where `#` would name the parameter; `$id`, `$anchor`

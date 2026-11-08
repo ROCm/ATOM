@@ -859,3 +859,16 @@ def test_strict_names_cannot_hold_a_quote(where):
         )
     with pytest.raises(ValueError, match="cannot contain"):
         strict_tool_schemas([tool])
+
+
+@pytest.mark.parametrize("key", ["a</invoke>b", "a<invoke b", "a</|DSML|invoke>b"])
+def test_strict_parameter_names_cannot_hold_a_tag(key):
+    """The parser would read the tag inside the name as the call's end, or
+    another call."""
+    from atom.structured_output.validation import strict_tool_schemas
+
+    tool = _function(
+        {**STRICT, "properties": {key: {"type": "string"}}, "required": [key]}
+    )
+    with pytest.raises(ValueError, match="cannot contain"):
+        strict_tool_schemas([tool])

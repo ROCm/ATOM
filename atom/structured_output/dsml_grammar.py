@@ -290,12 +290,11 @@ def _resolve(schema: Any, defs: dict) -> Any:
             break
         extra = set(schema) - _ANNOTATIONS
         if extra == {"$ref"} and isinstance(schema["$ref"], str):
-            target = _def_target(schema["$ref"])
+            path = _def_path(schema["$ref"])
             # A path into a definition names only part of it.
-            whole = schema["$ref"].count("/") == 2
-            if not whole or target is None or target[1] not in defs.get(target[0], {}):
+            if path is None or len(path) != 2 or path[1] not in defs.get(path[0], {}):
                 break
-            schema = defs[target[0]][target[1]]
+            schema = defs[path[0]][path[1]]
         elif extra == {"allOf"} and isinstance(schema["allOf"], list):
             if len(schema["allOf"]) != 1:
                 break
@@ -345,10 +344,10 @@ def _referenced_defs(schema: Any, defs: dict) -> dict:
     pending = [schema]
     while pending:
         for ref in _refs(pending.pop()):
-            target = _def_target(ref)
-            if target is None:
+            path = _def_path(ref)
+            if path is None:
                 continue
-            container, def_name = target
+            container, def_name = path[:2]
             found = defs.get(container, {})
             if def_name in found and def_name not in needed.get(container, {}):
                 needed.setdefault(container, {})[def_name] = found[def_name]
@@ -372,12 +371,19 @@ def _refs(node: Any):
                 yield from _refs(value)
 
 
-def _def_target(ref: str) -> tuple[str, str] | None:
-    """``(container, name)`` for a reference into the root's definitions."""
-    parts = ref.split("/")
-    if len(parts) < 3 or parts[0] != "#" or parts[1] not in _DEF_CONTAINERS:
+def _def_path(ref: str) -> list[str] | None:
+    """``[container, name, ...]``: the JSON Pointer of a reference into the
+    root's definitions, percent-decoded before it is split, as a URI fragment
+    is (`Scalar%2FanyOf` is a path into `Scalar`)."""
+    if not ref.startswith("#/"):
         return None
-    return parts[1], unquote(parts[2]).replace("~1", "/").replace("~0", "~")
+    path = [
+        part.replace("~1", "/").replace("~0", "~")
+        for part in unquote(ref[2:]).split("/")
+    ]
+    if len(path) < 2 or path[0] not in _DEF_CONTAINERS:
+        return None
+    return path
 
 
 def _string_values(schema: Any) -> list[str] | None:
