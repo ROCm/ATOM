@@ -3161,6 +3161,20 @@ class Config:
         # faults on the first decode past the old width.
         factors.append(self.max_model_len)
         factors.append(self.max_num_seqs)
+        # Buffers allocated once at max_num_batched_tokens rows reach the graph
+        # as fixed-shape inputs, and the compiled artifact checks them with
+        # assert_size_stride. A restart that only changes
+        # --max-num-batched-tokens would otherwise load the old artifact and
+        # fail that check on the first forward.
+        #
+        # attn_prefill_chunk_size and kv_cache_block_size stay out on purpose:
+        # they size attention-metadata workspaces and KV pages that are only
+        # read inside the attention ops the graph is split on, never traced.
+        factors.append(self.max_num_batched_tokens)
+        # The KV cache dtype is read as a Python constant by traced model code
+        # (DeepSeek-V4's `kv_fp8` branches, the DSpark drafter's fp8 plan), so a
+        # bf16 <-> fp8 restart traces a different graph.
+        factors.append(self.kv_cache_dtype)
         # The drafter graph bakes its draft width in as a constant (DSpark traces
         # `[bs, num_draft]`), so a run that only changes --num-speculative-tokens
         # would otherwise load the other width's artifact: draft 6 over a draft 3
