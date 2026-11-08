@@ -59,17 +59,28 @@ Effect of the individual pieces (DP2, same batch as the row above it):
 | e29 (before early load) | -0.9% | -21.2% | +12.0% | -27.2% | -50.3% | +6.8% | |
 | f09 | -0.1% | -11.6% | +15.6% | -13.6% | -35.2% | +3.8% | |
 | i09 | +0.7% | -15.8% | +32.0% | -19.5% | -57.9% | +3.0% | |
-| t29d (branch defaults) | +4.8% | +3.0% | **+80.9%** | -13.9% | -60.9% | -6.2% | main had 66 s of stalls; **open issue below** |
+| t29d (branch defaults, before the pending-token fix) | +4.8% | +3.0% | +80.9% | -13.9% | -60.9% | -6.2% | main had 66 s of stalls |
+| w09d (same code, same-time main) | +2.0% | +9.3% | +81.9% | -5.6% | -47.7% | -3.0% | confirms t29d |
+| **y09d (current branch, 900 s)** | **+5.6%** | **-16.8%** | **+32.3%** | **-22.1%** | **-52.0%** | -0.5% | pending-token fix; same-time main |
 
 The DP4 rows are different code versions (e29: host-side event waits only; f09: same; i09: compute stream plus the since-removed delayer waits; t29d: the current branch), so they
 show the trend, not one configuration.
 
-**Open issue:** with early tier load on, the DP4 median TTFT regressed
-(+80.9%). The step trace shows the prefill delayer holds longer on the Store arm
-(mean hold 25 steps against 17.6, 58% of steps held against 41%) and each
-released prefill is heavier (236 ms against 165 ms). Cause not yet identified;
-an early-load on/off DP4 pair is being measured. Until then treat the DP2
-numbers above as the validated result and the DP4 median as unresolved.
+**What the DP4 median regression was.** With early tier load on, a request
+whose Store load had finished stayed in `WAITING_FOR_REMOTE_KVS` until the next
+prefill release, and the prefill delayer's fill signal
+(`Scheduler._waiting_new_token_count`) counted it as zero tokens. The group's
+fill stayed under the target (fill < 0.9 on 97% of hold steps, against 28% on
+main), so 38% of releases came from the stall bound (6% on main) and median TTFT
+rose by 64-82%. Counting what follows the loaded prefix (b8aae1324) halved the
+median gap (+82% -> +32%) and moved mean TTFT from +9% to -17%.
+
+**Still open:** median TTFT is 32% above main at DP4 (DP2: 5-17%). With the
+fix, 36% of releases are still stall releases. The ranks are nearly always all
+prefillable, but each holds only a little pending work (aggregate fill 0.71 against the 0.9
+target), because `store_tokens` spreads requests evenly while session affinity
+makes a few large chunks. Under test: `ATOM_PREFILL_DELAYER_TARGET_FILL` and
+`ATOM_PREFILL_DELAYER_STALL_TICKS`.
 
 ## Reproducing
 
