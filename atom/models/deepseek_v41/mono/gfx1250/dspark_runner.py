@@ -674,6 +674,9 @@ class V41MonoDecodeRunner:
             "wqb_s": p(weights["attn.wq_b.weight_scale"]),
             "cos": p(rope.cos_cache), "sin": p(rope.sin_cache),
             "pos": p(self._rope_positions(cache, step)), "ring": p(cache.pool),
+            # bf16 KV ring has no E8M0 scale plane (kernels assert not kv_fp8);
+            # the shared attn_pre ABI requires the slot, pass a null pointer.
+            "ring_scale": 0,
             "ring_rows": p(self.ring_rel),
             "ring_off": cache.geometry.window(layer_id, cache.num_pages).ring_start,
             "res_out": p(res_out), "post_out": p(post), "comb_out": p(comb),

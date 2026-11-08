@@ -606,7 +606,7 @@ def build_dspark_k1(key: AttnPreBuild):
         res_in: Int64, pend: Int64, post_in: Int64, comb_in: Int64, pre_in: Int64,
         hc_fn: Int64, hc_scale: Int64, hc_base: Int64, attn_w: Int64, wqkv: Int64,
         wqkv_s: Int64, qn_w: Int64, kvn_w: Int64, wqb: Int64, wqb_s: Int64,
-        cos: Int64, sin: Int64, pos: Int64, ring: Int64, ring_rows: Int64, ring_off: Int32,
+        cos: Int64, sin: Int64, pos: Int64, ring: Int64, ring_scale: Int64, ring_rows: Int64, ring_off: Int32,
         res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64,
         q_out: Int64, normed: Int64, qr_out: Int64, qrs_out: Int64, aux: Int64,
         iq_w: Int64, iq_ws: Int64, iw_w: Int64, iq_out: Int64, iqs_out: Int64,
@@ -817,7 +817,7 @@ def build_dspark_k1(key: AttnPreBuild):
         res_in: Int64, pend: Int64, post_in: Int64, comb_in: Int64, pre_in: Int64,
         hc_fn: Int64, hc_scale: Int64, hc_base: Int64, attn_w: Int64, wqkv: Int64,
         wqkv_s: Int64, qn_w: Int64, kvn_w: Int64, wqb: Int64, wqb_s: Int64,
-        cos: Int64, sin: Int64, pos: Int64, ring: Int64, ring_rows: Int64, ring_off: Int32,
+        cos: Int64, sin: Int64, pos: Int64, ring: Int64, ring_scale: Int64, ring_rows: Int64, ring_off: Int32,
         res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64,
         q_out: Int64, normed: Int64, qr_out: Int64, qrs_out: Int64, aux: Int64,
         iq_w: Int64, iq_ws: Int64, iw_w: Int64, iq_out: Int64, iqs_out: Int64,
@@ -827,7 +827,7 @@ def build_dspark_k1(key: AttnPreBuild):
         _ = keyed
         attn_pre(
             res_in, pend, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, attn_w,
-            wqkv, wqkv_s, qn_w, kvn_w, wqb, wqb_s, cos, sin, pos, ring, ring_rows, ring_off,
+            wqkv, wqkv_s, qn_w, kvn_w, wqb, wqb_s, cos, sin, pos, ring, ring_scale, ring_rows, ring_off,
             res_out, post_out, comb_out, pre_out, q_out, normed, qr_out, qrs_out, aux,
             iq_w, iq_ws, iw_w, iq_out, iqs_out, iw_out, scratch, sym, peers, rank,
             layer, tl,
