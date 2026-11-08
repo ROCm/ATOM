@@ -95,7 +95,9 @@ def store_chunk_tokens(kv_transfer_config: Mapping[str, Any] | None) -> int:
     kvc = kv_transfer_config or {}
     extra = kvc.get("kv_connector_extra_config", kvc) or {}
     if not isinstance(extra, Mapping):
-        raise ValueError("kv_connector_extra_config must be a JSON object")
+        raise ValueError(  # noqa: TRY004  # configuration errors use ValueError
+            "kv_connector_extra_config must be a JSON object"
+        )
     return offcfg._strict_integer(
         "mooncake_store.chunk_tokens",
         extra.get("mooncake_store.chunk_tokens", 256),
