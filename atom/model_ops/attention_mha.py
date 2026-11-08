@@ -1788,7 +1788,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         return output
 
     def _cp_index_topk_decode(
-        self, index_q, block_table, seq_lens, max_seq_len, max_query_len
+        self,
+        index_q,
+        block_table,
+        seq_lens,
+        max_seq_len,
+        max_query_len,
+        sparse_metadata=None,
     ):
         """Decode top-k with the context sharded across the indexer-CP group.
 
@@ -1805,22 +1811,52 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             local_candidate_keys,
             merge_candidate_keys,
         )
-        from atom.model_ops.minimax_m3.indexer_context_parallel import (
-            indexer_context_scores,
-        )
 
         global_blocks = block_table.shape[1]
-        scores = indexer_context_scores(
-            index_q,
-            self.index_cache,
-            block_table,
-            seq_lens,
-            max_seq_len,
-            self.indexer_cp_rank,
-            self.indexer_cp_world,
-            max_query_len,
-            self.scale,
-        )
+        if self.index_mxfp4:
+            from atom.model_ops.minimax_m3.index_mxfp4 import decode_score_mxfp4
+
+            local_bound = -(-(-(-max_seq_len // 128)) // self.indexer_cp_world)
+            work_map = getattr(sparse_metadata, "index_score_work_map", None)
+            score_out = getattr(sparse_metadata, "index_score_out", None)
+            if work_map is not None:
+                # The map's bound, not this step's: it is what the grid was
+                # built against and stays put across graph replays.
+                local_bound = max(local_bound, sparse_metadata.index_score_max_block)
+            if score_out is not None and score_out.shape[-1] != local_bound:
+                score_out = None
+            scores = decode_score_mxfp4(
+                index_q,
+                self.index_cache,
+                block_table,
+                seq_lens,
+                local_bound,
+                max_query_len,
+                index_q.shape[1],
+                self.scale,
+                work_map,
+                score_out,
+                cp_world=self.indexer_cp_world,
+                cp_rank=self.indexer_cp_rank,
+            )
+            if not scores.is_contiguous():
+                scores = scores.contiguous()
+        else:
+            from atom.model_ops.minimax_m3.indexer_context_parallel import (
+                indexer_context_scores,
+            )
+
+            scores = indexer_context_scores(
+                index_q,
+                self.index_cache,
+                block_table,
+                seq_lens,
+                max_seq_len,
+                self.indexer_cp_rank,
+                self.indexer_cp_world,
+                max_query_len,
+                self.scale,
+            )
         # Forced blocks are pinned in BOTH passes on purpose: one that lost its
         # owner shard's top-k would never arrive at the merge to be pinned.
         keys = local_candidate_keys(
@@ -1834,6 +1870,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.init_blocks,
             self.local_blocks,
         )
+        page_kw = (
+            {"pages_per_block": 1, "block_page_stride": 1} if self.kv_mxfp4 else {}
+        )
         return merge_candidate_keys(
             exchange_candidates(keys),
             block_table,
@@ -1842,6 +1881,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self.init_blocks,
             self.local_blocks,
             max_query_len,
+            **page_kw,
         )
 
     @mark_trace(prefix="sparse_attention_decode", torch_compile=False)
@@ -1919,6 +1959,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     decode_md.seq_lens,
                     sparse_metadata.max_seq_len,
                     max_query_len,
+                    sparse_metadata,
                 )
             else:
                 topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk_decode(

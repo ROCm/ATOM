@@ -311,10 +311,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 **i32_kwargs,
             )
         self._index_score_max_block = 0
+        self._index_score_heads = num_head_k
+        self._index_score_cp = (1, 0)
         if (
             self._has_sparse_attention
             and getattr(self.model_runner.config, "index_cache_dtype", None) == "mxfp4"
         ):
+            from atom.distributed.indexer_cp import (
+                get_indexer_cp_rank,
+                get_indexer_cp_world_size,
+                indexer_cp_enabled,
+            )
             from atom.model_ops.minimax_m3.index_mxfp4 import (
                 index_score_buffer,
                 index_work_map_capacity,
@@ -326,11 +333,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             self._index_score_max_block = cdiv(
                 self.model_runner.config.max_model_len, 128
             )
+            if indexer_cp_enabled():
+                # Every index head over this rank's 1/P of the blocks: the map,
+                # the scores and their bound are all the shard's.
+                world = get_indexer_cp_world_size()
+                self._index_score_cp = (world, get_indexer_cp_rank())
+                self._index_score_heads = num_head_k * world
+                self._index_score_max_block = cdiv(self._index_score_max_block, world)
             # Any step width up to the verify's: a plain decode step (S=1) builds
             # its map into the same buffer.
             rows = max(
                 index_work_map_capacity(
-                    self.max_bs, self._index_score_max_block, q_len, num_head_k
+                    self.max_bs,
+                    self._index_score_max_block,
+                    q_len,
+                    self._index_score_heads,
+                    *self._index_score_cp,
                 )
                 for q_len in range(1, max_qlen + 1)
             )
@@ -343,7 +361,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             self.model_runner.forward_vars["sparse_attention_index_score_buf"] = (
                 index_score_buffer(
                     self.max_bs * max_qlen,
-                    num_head_k,
+                    self._index_score_heads,
                     self._index_score_max_block,
                     self.device,
                 )
@@ -952,6 +970,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             "index_score_buf": self.model_runner.forward_vars[
                 "sparse_attention_index_score_buf"
             ],
+            "index_score_heads": self._index_score_heads,
+            "index_score_cp": self._index_score_cp,
         }
 
     def _get_sparse_attention_block_tables(

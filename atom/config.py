@@ -2669,10 +2669,15 @@ class Config:
                 indexer_cp_off = (
                     "--index-cache-dtype fp4 is not supported by the CP scorer"
                 )
-            if indexer_cp_off is None and (
-                self.index_cache_dtype == "mxfp4" or envs.ATOM_M3_SPARSE_KV_MXFP4
+            if (
+                indexer_cp_off is None
+                and envs.ATOM_M3_SPARSE_KV_MXFP4
+                and self.index_cache_dtype != "mxfp4"
             ):
-                indexer_cp_off = "the MXFP4 caches are not wired to the CP scorer"
+                indexer_cp_off = (
+                    "the MXFP4 KV is wired to the CP merge only with the MXFP4 "
+                    "index cache"
+                )
             if indexer_cp_off is not None:
                 logger.warning(
                     "dcp_config.indexer_dcp_only disabled: %s.", indexer_cp_off

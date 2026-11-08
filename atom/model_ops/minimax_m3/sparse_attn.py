@@ -145,16 +145,24 @@ def make_sparse_decode_metadata(
     index_score_work_map_out: torch.Tensor | None = None,
     index_score_max_block: int = 0,
     index_score_buf: torch.Tensor | None = None,
+    index_score_heads: int | None = None,
+    index_score_cp: tuple[int, int] = (1, 0),
 ) -> MiniMaxM3SparseMetadata:
     """``index_score_work_map_out`` is the persistent buffer of an MXFP4 index
     cache (the builder allocates it only then): given, the decode scorer's work
     map is built into it here, once, with ``index_score_max_block`` as its bound.
     ``index_score_buf`` is the scorer's persistent score storage: its view for this
-    step's rows is refilled with -inf here, once."""
+    step's rows is refilled with -inf here, once.
+
+    Under indexer CP the scorer runs ``index_score_heads`` (every index head)
+    over the shard ``index_score_cp = (world, rank)``, and
+    ``index_score_max_block`` is the shard's local bound."""
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )
     batch = seq_lens.shape[0]
+    score_heads = index_score_heads or num_idx_heads
+    cp_world, cp_rank = index_score_cp
     work_map = None
     if index_score_work_map_out is not None:
         from atom.model_ops.minimax_m3.index_mxfp4 import build_index_work_map
@@ -163,8 +171,10 @@ def make_sparse_decode_metadata(
             seq_lens,
             max_block=index_score_max_block,
             max_query_len=max_query_len,
-            num_idx_heads=num_idx_heads,
+            num_idx_heads=score_heads,
             out=index_score_work_map_out,
+            cp_world=cp_world,
+            cp_rank=cp_rank,
         )
     score_out = None
     if work_map is not None and index_score_buf is not None:
@@ -173,9 +183,10 @@ def make_sparse_decode_metadata(
         score_out = fresh_index_score(
             index_score_buf,
             batch * max_query_len,
-            num_idx_heads,
+            score_heads,
             index_score_max_block,
             max_query_len,
+            page_contiguous=cp_world > 1,
         )
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,

@@ -34,25 +34,51 @@ def _flydsl(name):
         ) from e
 
 
-def index_work_map_capacity(max_batch, max_block, max_query_len, num_idx_heads):
+def _cp_kwargs(cp_world, cp_rank):
+    # Only a sharded launch names the shard: the unsharded one keeps the exact
+    # call (and JIT cache key) it had before CP existed.
+    return {"cp_world": cp_world, "cp_rank": cp_rank} if cp_world > 1 else {}
+
+
+def index_work_map_capacity(
+    max_batch, max_block, max_query_len, num_idx_heads, cp_world=1, cp_rank=0
+):
     """Rows of a persistent work-map buffer serving every batch up to
-    ``max_batch`` (the exact grid is not monotonic in the batch)."""
+    ``max_batch`` (the exact grid is not monotonic in the batch). Under indexer
+    CP ``max_block`` is this rank's LOCAL bound, ``ceil(blocks / cp_world)``."""
     if max_batch <= 0:
         return 0
     return _flydsl("minimax_m3_index_score_work_map_capacity")(
-        max_batch, max_block, max_query_len, num_idx_heads
+        max_batch,
+        max_block,
+        max_query_len,
+        num_idx_heads,
+        **_cp_kwargs(cp_world, cp_rank),
     )
 
 
 def build_index_work_map(
-    seq_lens, *, max_block, max_query_len, num_idx_heads, out=None
+    seq_lens,
+    *,
+    max_block,
+    max_query_len,
+    num_idx_heads,
+    out=None,
+    cp_world=1,
+    cp_rank=0,
 ):
     """``[grid, 2]`` int32 dispatch order of the decode scorer; None on an empty
-    batch. ``out`` is the persistent buffer to fill (sliced to the grid)."""
+    batch. ``out`` is the persistent buffer to fill (sliced to the grid). The CP
+    shard must be the one the scorer is then launched with."""
     if seq_lens.shape[0] <= 0:
         return None
     return _flydsl("minimax_m3_index_score_work_map")(
-        seq_lens, max_block, max_query_len, num_idx_heads, out=out
+        seq_lens,
+        max_block,
+        max_query_len,
+        num_idx_heads,
+        out=out,
+        **_cp_kwargs(cp_world, cp_rank),
     )
 
 
@@ -64,19 +90,22 @@ def index_score_buffer(max_rows, num_idx_heads, max_block, device):
     )
 
 
-def fresh_index_score(buf, rows, num_idx_heads, max_block, max_query_len):
+def fresh_index_score(
+    buf, rows, num_idx_heads, max_block, max_query_len, page_contiguous=False
+):
     """``[H, rows, max_block]`` view of ``buf``, refilled with the scorer's -inf
     sentinel, for ``decode_score_mxfp4(out=...)``; call it once a step, outside the
     graph. A page a row never reaches is never stored, so without the refill it
     would keep an earlier step's score. None when the scorer lays its own scores out
     transposed (S * H >= its TRANSPOSE_MIN_F, not TP4's S=8, H=1): the caller then
-    lets the scorer allocate."""
+    lets the scorer allocate -- unless ``page_contiguous``, for a consumer that
+    reads a row's pages as one run (the indexer-CP shard top-k)."""
     from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
         NEG_INF,
         TRANSPOSE_MIN_F,
     )
 
-    if max_query_len * num_idx_heads >= TRANSPOSE_MIN_F:
+    if max_query_len * num_idx_heads >= TRANSPOSE_MIN_F and not page_contiguous:
         return None
     n = num_idx_heads * rows * max_block
     if n > buf.numel():
@@ -95,12 +124,19 @@ def decode_score_mxfp4(
     sm_scale,
     work_map=None,
     out=None,
+    cp_world=1,
+    cp_rank=0,
 ):
     """``[H, batch * S, max_block]`` fp32 block scores of a uniform decode (S query
     rows a request, causal per row). ``work_map`` is the step's; omitted, the
     scorer builds its own (~120 us -- fine in a test, ruinous per layer). ``out`` is
     the step's ``fresh_index_score``; omitted, the scorer allocates and fills its
-    own with -inf (a launch a layer)."""
+    own with -inf (a launch a layer).
+
+    Under indexer CP this rank scores the blocks ``b % cp_world == cp_rank`` only:
+    ``max_block`` is the local bound and local block ``p`` is global block
+    ``p * cp_world + cp_rank``, which still addresses ``block_table`` and the
+    causal cutoff."""
     k_data, k_scale = page_views(index_cache)
     return _flydsl("minimax_m3_index_score_fp4_flydsl")(
         idx_q,
@@ -114,6 +150,7 @@ def decode_score_mxfp4(
         max_block,
         out=out,
         work_map=work_map,
+        **_cp_kwargs(cp_world, cp_rank),
     )
 
 
