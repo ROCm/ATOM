@@ -2617,6 +2617,15 @@ models:
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
             decode: *m31_flash_pp4_direct_decode_env
+        - <<: *m31_stack_landing
+          name: m31-stack-mxfp4-pp4-tp4-landing-icp-gsm8k20
+          env:
+            common:
+              ATOM_PD_MHA_LANDING: "1"
+            prefill: *m31_flash_pp4_direct_prefill_env
+            decode:
+              <<: *m31_flash_pp4_direct_decode_env
+              ATOM_M3_INDEXER_CP: "1"
 
   # Issue #382: experiment-only cells. A1/A2 measured the inference code of
   # 1fb68bb34; A3 adds the free-KV watermark of ROCm/ATOM#2941 e90db5ac2.
@@ -3924,7 +3933,8 @@ models:
           workers: 2
           tp: 4
           cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,152]'
-      - <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
+      - &issue382_a9_1p2d_c160_pernic4352_tuned_mem90
+        <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
         name: issue382-a9-1p2d-c160-pernic4352-tuned-mem90
         concurrency:
         - 160
@@ -3939,7 +3949,8 @@ models:
             decode_max_num_seqs: 112
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
-      - <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
+      - &issue382_a9_1p2d_c180_pernic4352_tuned_mem90
+        <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
         name: issue382-a9-1p2d-c180-pernic4352-tuned-mem90
         concurrency:
         - 180
@@ -3954,7 +3965,8 @@ models:
             decode_max_num_seqs: 120
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
-      - <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
+      - &issue382_a9_1p2d_c200_pernic4352_tuned_mem90
+        <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
         name: issue382-a9-1p2d-c200-pernic4352-tuned-mem90
         concurrency:
         - 200
@@ -3969,7 +3981,8 @@ models:
             decode_max_num_seqs: 136
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
-      - <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
+      - &issue382_a9_1p2d_c240_pernic4352_tuned_mem90
+        <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
         name: issue382-a9-1p2d-c240-pernic4352-tuned-mem90
         concurrency:
         - 240
@@ -3984,7 +3997,8 @@ models:
             decode_max_num_seqs: 160
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
-      - <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
+      - &issue382_a9_1p2d_c260_pernic4352_tuned_mem90
+        <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
         name: issue382-a9-1p2d-c260-pernic4352-tuned-mem90
         concurrency:
         - 260
@@ -3999,6 +4013,33 @@ models:
             decode_max_num_seqs: 176
             spec_decode_acceptance_length: 4.04
             hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
+      # The mem90 cells with the decodes' indexer context parallelism: every TP
+      # rank scores all 4 index heads over a quarter of the blocks and the ranks
+      # merge their top-16 candidates per head. A decode step at ~30 running
+      # and ~190K context spends ~5.8 ms selecting blocks; CP cuts it to ~3.6.
+      - <<: *issue382_a9_1p2d_c220_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c220-pernic4352-tuned-mem90-icp
+        env: &issue382_a9_pernic4352_tuned_icp_env
+          common: *issue382_a9_pernic4352_tuned_env_common
+          prefill: *issue382_a9_pernic4352_tuned_env_prefill
+          decode:
+            <<: *issue382_a9_env_decode
+            ATOM_M3_INDEXER_CP: '1'
+      - <<: *issue382_a9_1p2d_c160_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c160-pernic4352-tuned-mem90-icp
+        env: *issue382_a9_pernic4352_tuned_icp_env
+      - <<: *issue382_a9_1p2d_c180_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c180-pernic4352-tuned-mem90-icp
+        env: *issue382_a9_pernic4352_tuned_icp_env
+      - <<: *issue382_a9_1p2d_c200_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c200-pernic4352-tuned-mem90-icp
+        env: *issue382_a9_pernic4352_tuned_icp_env
+      - <<: *issue382_a9_1p2d_c240_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c240-pernic4352-tuned-mem90-icp
+        env: *issue382_a9_pernic4352_tuned_icp_env
+      - <<: *issue382_a9_1p2d_c260_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c260-pernic4352-tuned-mem90-icp
+        env: *issue382_a9_pernic4352_tuned_icp_env
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c330
         concurrency:
