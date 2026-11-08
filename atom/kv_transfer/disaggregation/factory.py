@@ -70,16 +70,11 @@ class OffloadTierProfile:
     (some configured transport, ``multi`` expanded, is an offload backend
     whose role loads and whose tier the DP ranks share).
 
-    `async_lookup`: the configured connector itself (not ``multi``) answers
-    tier lookups asynchronously, so the offload prefetch can take an answer
-    without a round trip.
-
     `min_load_tokens`: the shortest tier hit, beyond the HBM prefix, that the
     connector loads rather than recomputes.
     """
 
     loads: bool = False
-    async_lookup: bool = False
     min_load_tokens: int = 0
 
 
@@ -117,9 +112,6 @@ class KVConnectorFactory:
     # Whether a backend is a KV offload tier, whose scheduler half rewrites the
     # completion sets it is handed (`process_completions`). Absent means no.
     _offload: ClassVar[dict[str, bool]] = {}
-    # Whether a backend's scheduler answers tier lookups asynchronously
-    # (`KVConnectorSchedulerBase.supports_async_lookup`). Absent means no.
-    _async_lookup: ClassVar[dict[str, bool]] = {}
     # Whether a backend's tier is one store every DP rank reads (an LMCache MP
     # server, Mooncake Store), not one per rank. Absent means per rank.
     _shared_tier: ClassVar[dict[str, bool]] = {}
@@ -138,7 +130,6 @@ class KVConnectorFactory:
         copies_whole_block_regions: bool = False,
         requires_pd_staging: bool = True,
         offload: bool = False,
-        async_lookup: bool = False,
         shared_tier: bool = False,
     ) -> None:
         """Register a KV connector backend.
@@ -151,8 +142,6 @@ class KVConnectorFactory:
             scheduler_class: Class name within *scheduler_module*.
             offload: The backend is a KV offload tier; a ``multi`` runs at most
                 one (`is_offload_backend`).
-            async_lookup: The backend's scheduler can answer tier lookups
-                asynchronously (`offload_tier`).
             shared_tier: The offload tier is shared by all DP ranks
                 (`offload_tier`).
         """
@@ -179,7 +168,6 @@ class KVConnectorFactory:
         cls._reads_block_regions[name] = bool(reads_block_regions)
         cls._copies_whole_block_regions[name] = bool(copies_whole_block_regions)
         cls._offload[name] = bool(offload)
-        cls._async_lookup[name] = bool(async_lookup)
         cls._shared_tier[name] = bool(shared_tier)
 
     @classmethod
@@ -227,7 +215,6 @@ class KVConnectorFactory:
             return OffloadTierProfile()
         return OffloadTierProfile(
             loads=shared,
-            async_lookup=cls._async_lookup.get(cls.connector_name(kv_cfg), False),
             min_load_tokens=int(envs.OFFLOAD_MIN_LOAD_TOKENS),
         )
 

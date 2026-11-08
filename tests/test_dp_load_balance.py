@@ -558,7 +558,7 @@ def _make_spread_mgr(n_ranks=2, tier=None):
     from atom.model_engine.prefix_spread import PrefixSpreadRouter
 
     if tier is None:
-        tier = OffloadTierProfile(loads=True, async_lookup=True, min_load_tokens=8192)
+        tier = OffloadTierProfile(loads=True, min_load_tokens=8192)
     mgr = _make_mgr(n_ranks, strategy="prefix_spread")
     mgr._prefix_router = PrefixSpreadRouter(32768, tier, max_seqs=256)
     mgr._dp_route_counters.update(
@@ -930,7 +930,7 @@ def test_offload_tier_profile_reads_the_kv_transfer_config(monkeypatch):
 
     assert not tier({}).loads
     mp = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
-    assert tier(mp).loads and tier(mp).async_lookup
+    assert tier(mp).loads
     assert tier(mp).min_load_tokens == 4096
     assert not tier({"kv_connector": "lmcache_mp", "kv_role": "kv_producer"}).loads
     pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
@@ -938,11 +938,11 @@ def test_offload_tier_profile_reads_the_kv_transfer_config(monkeypatch):
     assert tier({"kv_connector": "mooncake_store", "kv_role": "offload"}).loads
     # Per-rank tiers (local CPU / disk): another rank's prefix is not loadable.
     dense = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
-    assert not tier(dense).loads and not tier(dense).async_lookup
+    assert not tier(dense).loads
     assert tier(dense).min_load_tokens == 4096
-    # `multi` answers no async lookup, whatever it wraps.
+    # Shared-tier recovery also works under `multi`.
     both = tier({"kv_connector": "multi", "connectors": [pd, mp]})
-    assert both.loads and not both.async_lookup
+    assert both.loads
 
 
 def test_reset_keeps_the_prefix_index_across_batches():

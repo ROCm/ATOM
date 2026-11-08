@@ -548,13 +548,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             self._load_winner.pop(sid, None)
         return result
 
-    def cancel_preadmission(self, seq: Any) -> None:
-        """Forward to every sub: each was notified of the admission
-        (`update_state_after_alloc` fans out), so each undoes its own record."""
-        self._load_winner.pop(getattr(seq, "id", None), None)
-        for c in self._connectors:
-            c.cancel_preadmission(seq)
-
     def cancel_pending_load(self, seq: Any) -> None:
         """Forward a load cancellation to every sub that arms loads.
 

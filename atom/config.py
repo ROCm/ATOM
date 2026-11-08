@@ -2152,15 +2152,6 @@ class Config:
     # default must stay in sync with engine_core_mgr.DP_LB_DEFAULT (config.py
     # cannot import it without a cycle: engine_core_mgr imports Config).
     dp_load_balance: str = "least_requests"
-    # Offload prefetch (`atom/model_engine/offload_prefetch.py`): start a
-    # waiting request's tier load before its turn (`--offload-prefetch`).
-    # Unset (None): on with prefix-spread DP routing when the configured
-    # connector answers tier lookups asynchronously
-    # (the constructed connector's `supports_async_lookup`).
-    offload_prefetch: bool | None = None
-    # No prefetch allocation once it would take the KV pool past this
-    # fraction in use.
-    offload_prefetch_max_kv_usage: float = 0.8
     # MoE expert-parallel layout policy. When True, MoE EP computes ranks in the
     # flattened DP x TP device space (and shared-expert fusion is disabled,
     # because the fused shared expert assumes the per-DP MoE layout). The vLLM
@@ -2712,20 +2703,6 @@ class Config:
             else torch.bfloat16
         )
 
-        # Keep None as automatic: the constructed adapter may only support
-        # synchronous lookup despite its connector family's registry entry.
-        if self.offload_prefetch:
-            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-            if not KVConnectorFactory.offload_tier(self).async_lookup:
-                raise ValueError(
-                    "--offload-prefetch requires async tier lookup support"
-                )
-        if not 0.0 < self.offload_prefetch_max_kv_usage <= 1.0:
-            raise ValueError(
-                "offload_prefetch_max_kv_usage must be in (0, 1], got "
-                f"{self.offload_prefetch_max_kv_usage}"
-            )
         # After the parse above: the P/D clause reads `kv_role` off
         # `kv_transfer_config`, which arrives from the CLI as a string.
         self._resolve_throughput_step_interval()

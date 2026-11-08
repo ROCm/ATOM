@@ -219,20 +219,18 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
     # a replay's to use. The lookup keeps the PAGE KV locked up to it, and
     # `BlockManager._replay_hit` weighs it at admission.
 
-    def _before_tier_lookup(self, sid: str) -> None:
+    def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
         if not self._page_only:
-            return
+            return super()._fresh_tier_lookup(seq, sid)
         # A lookup this request still holds (one whose reach was never weighed,
         # say) goes back first: asking again replaces the server's record of
         # what the earlier one locked.
         self._kv_reach.pop(sid, None)
         if self._lookup_client.hit_tokens(sid) is not None:
             self._lookup_client.clear_lookup_status(sid)
-
-    def _hold_tier_hit(self, seq: Any, sid: str, hit, token_ids) -> int | None:
-        reach = super()._hold_tier_hit(seq, sid, hit, token_ids)
-        if not self._page_only or reach is None:
-            return reach
+        reach = super()._fresh_tier_lookup(seq, sid)
+        if reach is None:
+            return None
         self._kv_reach[sid] = (seq, int(reach))
         # Kept on the request past admission, for a later admission that
         # reuses this answer instead of asking again (the save floor).
@@ -241,23 +239,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         self._lookup_results[sid] = (seq, 0)
         self._remember_tier_hit(seq, sid, 0)
         return 0
-
-    def take_ready_lookup(self, seq: Any) -> bool:
-        # The admission's own gates (`get_num_new_matched_tokens`): no answer
-        # is taken for a request it would not ask for.
-        if not getattr(seq, "has_per_req_cache", False):
-            return False
-        if self._native_load_operations.get(str(seq.id)) is not None:
-            return False
-        return super().take_ready_lookup(seq)
-
-    def release_taken_lookup(self, seq: Any) -> None:
-        # Its reach holds the lookup (`_release_lookup` keeps it for
-        # `update_state_after_alloc`): with no admission, it goes too.
-        entry = self._kv_reach.get(str(seq.id))
-        if entry is not None and entry[0] is seq:
-            del self._kv_reach[str(seq.id)]
-        super().release_taken_lookup(seq)
 
     def _kv_only_reach(self, seq: Any) -> int:
         """This request's KV-only reach in tokens, or 0 if unknown."""
@@ -697,15 +678,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             return  # A request cancellation does not cancel an MP DMA.
         self._forget_kv_reach(seq)
         super().cancel_pending_load(seq)
-
-    def cancel_preadmission(self, seq: Any) -> None:
-        # A park this pass recorded must not reach dispatch: `build_connector_
-        # meta` would report the request's load as dropped and wake it as a
-        # failed load although it is back in `waiting`, unadmitted.
-        parked = self._parked_loads.get(str(seq.id))
-        if parked is seq:
-            del self._parked_loads[str(seq.id)]
-        super().cancel_preadmission(seq)
 
     def _forget_kv_reach(self, seq: Any) -> None:
         """Stop holding `seq`'s lookup for its reach; the base releases it."""

@@ -609,8 +609,6 @@ def test_a_finished_load_is_sized_as_a_resume_without_rewalking_its_hit():
     seq.offload_load_start_tokens = None
     engine.waiting.append(seq)
     engine.kv_connector = SimpleNamespace(is_offload=True)
-    engine._prefetch = None
-    engine._blocked_head = None
     engine.finished_recving_kv_req_ids = [seq.id]
 
     walks = []

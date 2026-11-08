@@ -78,6 +78,4 @@ in this run. Relative to main, output throughput was 3.8% lower; this is not
 evidence of a general performance advantage over HBM/session. One run per
 configuration does not establish variance or results at larger concurrency.
 
-Native Store lookup is synchronous. KV restoration starts at admission;
-this recipe does not provide scheduler prefetch ahead of admission.
-Do not pass `--offload-prefetch` with this connector.
+Native Store lookup is synchronous. KV restoration starts at admission.

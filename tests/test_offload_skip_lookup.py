@@ -159,8 +159,6 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
-    s._prefetch = None
-    s._blocked_head = None
     s.kv_connector = conn
     s._local_prefill_coalescing = False
     s._connector_flag = lambda name: getattr(conn, name, False)
@@ -500,8 +498,6 @@ def test_a_declined_detach_turns_the_request_back_to_the_ordinary_path(monkeypat
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
-    s._prefetch = None
-    s._blocked_head = None
     s.kv_connector = conn = _Conn()
     s._connector_flag = lambda name: getattr(conn, name, False)
     s.block_manager = SimpleNamespace(state_offload=None)
@@ -527,8 +523,6 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
         return 2
 
     s = Scheduler.__new__(Scheduler)
-    s._prefetch = None
-    s._blocked_head = None
     s.kv_connector = _Conn()
     s._local_prefill_coalescing = False
     s.block_manager = SimpleNamespace(hash_block_size=4, can_allocate=can_allocate)
@@ -546,30 +540,3 @@ def test_the_detach_is_on_by_default_and_0_turns_it_off(monkeypatch):
     assert envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT is True
     monkeypatch.setenv("OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", "0")
     assert envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT is False
-
-
-def test_cancelling_an_admission_forgets_its_save_floor(monkeypatch):
-    """The admission set a save floor from the tier hit it saw. A re-admission
-    may find less in the tier; a floor left above that is a hole -- chunks
-    recomputed but never saved, which truncates every later match."""
-    sched, _client, _adapter = _scheduler(monkeypatch, lookup_done=True)
-    seq = _seq()
-    sched._hit_save_floors["7"] = 64
-    sched.update_state_after_alloc(seq)
-    assert sched._save_tracker["7"][1] == 64
-
-    sched.cancel_preadmission(seq)
-
-    assert "7" not in sched._save_tracker
-    sched._hit_save_floors["7"] = 16
-    sched.update_state_after_alloc(seq)
-    assert sched._save_tracker["7"][1] == 16
-
-
-def test_a_take_that_finds_no_answer_leaves_nothing_behind(monkeypatch):
-    """Nothing taken means nothing to unpin at dispatch (it would keep the
-    engine stepping for a lookup the request never held)."""
-    sched, _client, _adapter = _scheduler(monkeypatch, lookup_done=False)
-    seq = _seq()
-    assert not sched.take_ready_lookup(seq)
-    assert sched._lookup_in_step == [] and "7" not in sched._lookup_results

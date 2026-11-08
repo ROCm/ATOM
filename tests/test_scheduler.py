@@ -451,8 +451,6 @@ class TestSchedule:
             _counted_as_inflight_load=True,
         )
         sched = Scheduler.__new__(Scheduler)
-        sched._prefetch = None
-        sched._blocked_head = None
         sched._rejected = []
         sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
@@ -579,8 +577,6 @@ class TestSchedule:
                 events.append(("source_blocks_released", value.id))
 
         sched = Scheduler.__new__(Scheduler)
-        sched._prefetch = None
-        sched._blocked_head = None
         sched.waiting = deque()
         sched.running = deque()
         sched._rejected = []
@@ -1041,8 +1037,6 @@ class TestSchedule:
 
     def test_ready_remote_kv_waiter_is_promoted_ahead_of_fresh_head(self):
         sched = Scheduler.__new__(Scheduler)
-        sched._prefetch = None
-        sched._blocked_head = None
         fresh = SimpleNamespace(id=1, status=SequenceStatus.WAITING)
         ready = SimpleNamespace(id=2, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
         blocked = SimpleNamespace(id=3, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
@@ -1196,8 +1190,6 @@ class TestSchedule:
                 return seq.id == 2
 
         sched = Scheduler.__new__(Scheduler)
-        sched._prefetch = None
-        sched._blocked_head = None
         sched.kv_connector = _Connector()
         sched.waiting = deque()
         sched._partial_prefill_count = 1
@@ -3018,8 +3010,6 @@ class TestStalledOffloadSaveReclaim:
         import atom.model_engine.scheduler as sched_mod
 
         s = object.__new__(sched_mod.Scheduler)
-        s._prefetch = None
-        s._blocked_head = None
         s.deferred_free_blocks = {seq.id: seq for seq in deferred}
         s._abandoned_saves = 0
         s._next_save_reconcile_at = 0.0
@@ -3199,8 +3189,6 @@ class TestStalledOffloadSaveReclaim:
         import atom.model_engine.scheduler as sched_mod
 
         s = object.__new__(sched_mod.Scheduler)
-        s._prefetch = None
-        s._blocked_head = None
         s.deferred_free_blocks = {
             1: SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 1e6)
         }
@@ -3240,8 +3228,6 @@ class TestStalledOffloadSaveReclaim:
         import atom.model_engine.scheduler as sched_mod
 
         s = object.__new__(sched_mod.Scheduler)
-        s._prefetch = None
-        s._blocked_head = None
         s.kv_connector = None
         assert s._save_abandon_timeout_s() == 0.0
         s.kv_connector = SimpleNamespace()  # a connector without the offload face
@@ -3261,8 +3247,6 @@ class TestStateStorePendingCap:
         import atom.model_engine.scheduler as sched_mod
 
         s = object.__new__(sched_mod.Scheduler)
-        s._prefetch = None
-        s._blocked_head = None
         s.kv_connector = connector
         return s
 

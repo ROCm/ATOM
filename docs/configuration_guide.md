@@ -67,8 +67,6 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `capture_sizes` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; derived from `compilation_config` during init |
 | `enable_dp_attention` | `bool` | `False` | Enable data-parallel attention |
 | `dp_load_balance` | `str` | `"least_requests"` | DP request-routing strategy: `"round_robin"` (legacy), `"least_requests"` (default; fewest in-flight requests, ties broken by lighter in-flight prompt-token load), or `"least_tokens"` (lowest `sum_prompt_tokens + ATOM_DP_LB_REQ_EQUIV * num_reqs`), or `"prefix_spread"` (keep a request on the rank holding its prompt's prefix unless that rank has a prefill backlog and another is about to idle; needs prefix caching and `ATOM_FRONTEND_PREFIX_HASH=1`). Only effective when >1 DP rank. See distributed guide §2 |
-| `offload_prefetch` | `Optional[bool]` | `None` | Start a waiting request's offload-tier KV load on any scheduler tick once its tier lookup answers, instead of when admission reaches it (`--offload-prefetch`). `None` resolves in the scheduler to on with `dp_load_balance="prefix_spread"` when the constructed KV connector answers tier lookups asynchronously (capable `lmcache_mp` adapters; not under `multi`) |
-| `offload_prefetch_max_kv_usage` | `float` | `0.8` | No offload prefetch once it would take the KV pool past this fraction in use |
 | `torch_dtype` | `torch.dtype` | *(computed)* | Inferred from `hf_config.torch_dtype`; falls back to `torch.bfloat16` |
 | `speculative_config` | `Optional[SpeculativeConfig]` | `None` | Speculative decoding configuration (see Section 5) |
 | `bos_token_id` | `int` | `-1` | Beginning-of-sequence token ID (`-1` = use model default) |
