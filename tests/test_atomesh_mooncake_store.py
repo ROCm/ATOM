@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -97,10 +98,18 @@ P_D_PRODUCER = (
 )
 
 
+# The owner, metadata and metrics ports `run_shell` fixes (50152-50190), less
+# the 100 per pool a pool's master adds to the master port.
+FIXED_PORTS = range(49700, 50400)
+
+
 def free_port():
-    with socket.socket() as sock:
-        sock.bind((HOST, 0))
-        return sock.getsockname()[1]
+    while True:
+        with socket.socket() as sock:
+            sock.bind((HOST, 0))
+            port = sock.getsockname()[1]
+        if port not in FIXED_PORTS:
+            return port
 
 
 def prefixed_lines(stdout, prefix):
@@ -267,6 +276,17 @@ stop_mooncake_store
         ):
             with self.subTest(env=env):
                 self.run_shell("plan_mooncake_store_owners\n", expect_rc=2, **env)
+
+    def test_the_eviction_watermark_and_ratio_reach_the_masters(self):
+        self.run_shell(
+            "start_mooncake_store\nstop_mooncake_store\n",
+            MOONCAKE_STORE_OWNERS="0:64;1:96",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_EVICTION_HIGH_WATERMARK="0.97",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_EVICTION_RATIO=".03",
+        )
+        (master,) = self.store_calls("mooncake_master")
+        for flag in ("--eviction_high_watermark_ratio=0.97", "--eviction_ratio=.03"):
+            self.assertIn(f" {flag} ", f"{master} ")
 
     def test_start_waits_for_the_capacity_and_stop_ends_everything(self):
         port = self.master_port
@@ -598,6 +618,74 @@ done
             xP="1",
             yD="1",
         )
+        # Packed nodes: the decode-only node is every node but the prefill's.
+        for placement, n_prefill, n_decode in (
+            # Every decode shares the prefill's node.
+            ("prefill_nodes=(0); decode_nodes=(0)", "1", "1"),
+            # Two decode-only nodes would each start the owners.
+            ("prefill_nodes=(0); decode_nodes=(0 1 1 2)", "1", "4"),
+            ("prefill_nodes=(0 0); decode_nodes=(1 1)", "2", "2"),
+        ):
+            with self.subTest(placement=placement):
+                result = self.run_shell(
+                    f"{placement}\ncheck_mooncake_store_settings\n",
+                    expect_rc=2,
+                    **decode_owners,
+                    ATOMESH_PD_WORKER_LAYOUT="packed_nodes",
+                    xP=n_prefill,
+                    yD=n_decode,
+                )
+                self.assertIn("needs the decode on nodes of its own", result.stderr)
+        for placement, n_decode in (
+            ("prefill_nodes=(0); decode_nodes=(0 1)", "2"),
+            ("prefill_nodes=(0); decode_nodes=(0 1 1)", "3"),
+        ):
+            with self.subTest(placement=placement):
+                self.run_shell(
+                    f"{placement}\ncheck_mooncake_store_settings\n",
+                    **decode_owners,
+                    ATOMESH_PD_WORKER_LAYOUT="packed_nodes",
+                    xP="1",
+                    yD=n_decode,
+                )
+
+    def test_packed_decode_owners_start_once_off_the_prefill_node(self):
+        port = self.master_port
+        (self.root / "segments").write_text(f"{port} {64 * GIB}\n")
+        store_env = {
+            "NODE0_ADDR": HOST,
+            "host_ip": "127.0.0.2",
+            "PACKED_NODES_PD": "1",
+            "MOONCAKE_STORE": "0",
+            "ATOMESH_PREFILL_ENV_MOONCAKE_STORE": "1",
+            "ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS": "0:64:rdma4",
+            "ATOMESH_PREFILL_ENV_MOONCAKE_STORE_DECODE_OWNERS": "0:32:rdma5;1:32:rdma6",
+        }
+        # The prefill's node: its decode worker leaves the Store to the prefill.
+        self.run_shell(
+            "prefill_nodes=(0)\nstart_mooncake_store_decode_owners\n",
+            NODE_RANK="0",
+            **store_env,
+        )
+        self.assertEqual(self.store_calls("mooncake_client"), [])
+        # The other node: two decode workers, one set of owners.
+        self.run_shell(
+            f"""
+setsid python3 /scripts/numa_exec.py 0 mooncake_master --rpc_port={port} \
+  >/dev/null 2>&1 &
+prefill_nodes=(0)
+start_mooncake_store_decode_owners
+start_mooncake_store_decode_owners
+stop_mooncake_store
+""",
+            NODE_RANK="1",
+            **store_env,
+        )
+        owners = self.store_calls("mooncake_client")
+        self.assertEqual(len(owners), 2)
+        for device in ("rdma5", "rdma6"):
+            (call,) = [c for c in owners if f"--device_names={device} " in f"{c} "]
+            self.assertIn(f" --master_server_address={HOST}:{port} ", f"{call} ")
 
     def test_per_nic_store_gives_each_nic_a_master_and_each_stage_its_pool(self):
         port = self.master_port
@@ -764,6 +852,57 @@ stop_mooncake_store
         self.assertEqual(len(self.store_calls("mooncake_client")), 2)
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
+
+    def test_the_prefill_node_stops_waiting_once_the_decode_node_failed(self):
+        # The decode node's owners failed to mount and its launcher exited 1:
+        # the prefill node fails within seconds rather than at its 60 s wait,
+        # and a node that exited 0, or its own rank's file, does not stop it.
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-0").write_text("1\n")
+        (run_dir / "rank-rc-2").write_text("0\n")
+        started = time.monotonic()
+        result = self.run_shell(
+            """
+(
+  until [[ "$(wc -l < "${STUB_DIR}/segments" 2>/dev/null)" -ge 1 ]]; do
+    sleep 0.2
+  done
+  sleep 2
+  echo 1 > "${RUN_DIR}/rank-rc-1.tmp"
+  mv "${RUN_DIR}/rank-rc-1.tmp" "${RUN_DIR}/rank-rc-1"
+) >/dev/null 2>&1 &
+start_mooncake_store
+""",
+            expect_rc=1,
+            RUN_DIR=str(run_dir),
+            MOONCAKE_STORE_OWNERS="0:8",
+            MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1",
+            MOONCAKE_STORE_WAIT_TIMEOUT="30",
+            MOONCAKE_STORE_COMPACT_TIMEOUT="30",
+        )
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIn("another node's launcher exited (rank-rc-1=1)", result.stderr)
+        for pid in self.stub_pids():
+            self.assertFalse(self.alive(pid), pid)
+
+    def test_a_wait_for_a_server_stops_once_another_node_failed(self):
+        # A decode node waits up to WAIT_SERVER_TIMEOUT for the router of a
+        # prefill node whose Store failed to start.
+        source = SERVER_SCRIPT.read_text()
+        wait_http = "wait_http() {" + source.split("wait_http() {")[1].split("\n}\n")[0]
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-0").write_text("1\n")
+        result = self.run_shell(
+            wait_http + '\n}\nwait_http "http://127.0.0.1:9/health" router 600\n',
+            expect_rc=1,
+            RUN_DIR=str(run_dir),
+            NODE_RANK="1",
+        )
+        self.assertIn(
+            "router: another node's launcher exited (rank-rc-0=1)", result.stderr
+        )
 
     def test_a_wait_timeout_with_a_leading_zero_waits_that_many_seconds(self):
         # Bash arithmetic would read 0600 as octal, 384 s, and refuse 0900
@@ -1009,6 +1148,8 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
                     ("COMPACT_TIMEOUT", "nan", "positive number"),
                     ("WAIT_TIMEOUT", "20m", "positive integer number"),
                     ("MASTER_NUMA", "-1", "integer number"),
+                    ("EVICTION_HIGH_WATERMARK", "1.2", "fraction number"),
+                    ("EVICTION_RATIO", "0", "fraction number"),
                 )
             ),
         ):
