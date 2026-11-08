@@ -4025,6 +4025,13 @@ models:
           decode:
             <<: *issue382_a9_env_decode
             ATOM_M3_INDEXER_CP: '1'
+            # CP widens the fused QKV GEMM by the other ranks' index-Q heads
+            # (N 2560 -> 2944), a shape the image's aiter tables lack: its
+            # fallback kernel takes 33 us a layer against 11.7 us at N=2560.
+            # Setting the variable replaces aiter's merge of configs/ and
+            # model_configs/, so it lists the image's tables, then ours.
+            AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE: >-
+              /app/aiter-test/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv:/app/aiter-test/aiter/configs/model_configs/a8w8_bpreshuffle_tuned_gemm_glm47.csv:/app/aiter-test/aiter/configs/model_configs/a8w8_bpreshuffle_tuned_gemm_glm5.2.csv:/app/aiter-test/aiter/configs/model_configs/a8w8_bpreshuffle_tuned_gemm_glm5_3_flash.csv:/app/aiter-test/aiter/configs/model_configs/a8w8_bpreshuffle_tuned_gemm_kimik3.csv:/app/aiter-test/aiter/configs/model_configs/a8w8_bpreshuffle_tuned_gemm_kimik3tp8.csv:/app/aiter-test/aiter/configs/model_configs/a8w8_bpreshuffle_tuned_gemm_minimax_m3.csv:/app/aiter-test/aiter/configs/model_configs/a8w8_bpreshuffle_tuned_gemm_qwen3_5_397b_a17b_mxfp4_attnfp8.csv:/app/aiter-test/aiter/configs/model_configs/dsv3_a8w8_bpreshuffle_tuned_gemm.csv:/app/aiter-test/aiter/configs/model_configs/glm5_a8w8_bpreshuffle_tuned_gemm.csv:/app/aiter-test/aiter/configs/model_configs/qwen38_flash_next_a8w8_bpreshuffle_tuned_gemm.csv:/workspace/ATOM/.github/benchmark/aiter_configs/a8w8_bpreshuffle_tuned_gemm_minimax_m3_icp.csv
       - <<: *issue382_a9_1p2d_c160_pernic4352_tuned_mem90
         name: issue382-a9-1p2d-c160-pernic4352-tuned-mem90-icp
         env: *issue382_a9_pernic4352_tuned_icp_env

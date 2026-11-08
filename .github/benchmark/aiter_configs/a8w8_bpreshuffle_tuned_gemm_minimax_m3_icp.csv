@@ -1,0 +1,14 @@
+gfx,cu_num,M,N,K,q_dtype_w,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+gfx950,256,1,2944,6144,torch.float8_e4m3fn,flydsl,2330,2,6.91,flydsl_bpreshuflle_16x32x1024_F8_F8_B16_0x1x0x2_default_ks2,5.24,2619.39,0.0
+gfx950,256,2,2944,6144,torch.float8_e4m3fn,flydsl,2314,2,6.90,flydsl_bpreshuflle_16x32x1024_F8_F8_B16_0x0x0x2_default_ks2,10.49,2624.93,0.0
+gfx950,256,4,2944,6144,torch.float8_e4m3fn,flydsl,2314,2,7.26,flydsl_bpreshuflle_16x32x1024_F8_F8_B16_0x0x0x2_default_ks2,19.93,2498.08,0.0
+gfx950,256,8,2944,6144,torch.float8_e4m3fn,flydsl,2374,3,7.95,flydsl_bpreshuflle_16x32x1024_F8_F8_B16_0x0x0x1_default_ks3,36.40,2287.32,0.0
+gfx950,256,16,2944,6144,torch.float8_e4m3fn,flydsl,2374,3,8.33,flydsl_bpreshuflle_16x32x1024_F8_F8_B16_0x0x0x1_default_ks3,69.49,2194.53,0.0
+gfx950,256,32,2944,6144,torch.float8_e4m3fn,flydsl,2374,0,8.44,flydsl_bpreshuflle_16x32x1024_F8_F8_B16_0x0x0x1_default,137.16,2188.74,0.0
+gfx950,256,64,2944,6144,torch.float8_e4m3fn,flydsl,914,3,11.18,flydsl_bpreshuflle_32x64x512_F8_F8_B16_1x3x4x2_default_ks3,207.09,1686.76,0.0
+gfx950,256,96,2944,6144,torch.float8_e4m3fn,flydsl,2395,0,11.65,flydsl_bpreshuflle_32x32x1024_F8_F8_B16_0x1x4x1_default,298.10,1651.76,0.0
+gfx950,256,128,2944,6144,torch.float8_e4m3fn,flydsl,686,0,12.51,flydsl_bpreshuflle_32x64x512_F8_F8_B16_1x2x4x2_default,370.14,1568.99,0.0
+gfx950,256,256,2944,6144,torch.float8_e4m3fn,flydsl,686,0,16.01,flydsl_bpreshuflle_32x64x512_F8_F8_B16_1x2x4x2_default,578.45,1322.18,0.0
+gfx950,256,512,2944,6144,torch.float8_e4m3fn,flydsl,208,0,20.94,flydsl_bpreshuflle_64x64x256_F8_F8_B16_1x0x4x2_default,884.53,1157.99,0.0
+gfx950,256,1024,2944,6144,torch.float8_e4m3fn,flydsl,460,0,28.44,flydsl_bpreshuflle_64x192x256_F8_F8_B16_1x1x4x2_default,1302.53,1069.22,0.0
+gfx950,256,2048,2944,6144,torch.float8_e4m3fn,flydsl,421,0,45.76,flydsl_bpreshuflle_128x192x128_F8_F8_B16_1x1x0x2_default,1619.06,933.77,0.0
