@@ -945,6 +945,54 @@ def test_offload_tier_profile_reads_the_kv_transfer_config(monkeypatch):
     assert both.loads
 
 
+@pytest.mark.parametrize(
+    "local,hit,min_load,credit",
+    [
+        (4096, 8192, 512, 0),
+        (4096, 16384, 512, 8192),
+        (0, 12288, 512, 8192),
+        (8192, 16384, 8192, 8192),
+        (4096, 16384, 8193, 0),
+    ],
+)
+def test_store_tier_credit_counts_only_aligned_loads(local, hit, min_load, credit):
+    from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
+
+    tier = OffloadTierProfile(True, min_load, load_chunk_tokens=8192)
+    assert tier.loadable_tokens(local, hit) == credit
+
+
+def test_partial_store_hit_does_not_hide_recomputed_prefill(monkeypatch):
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "512")
+    kvc = {
+        "kv_connector": "mooncake_store",
+        "kv_role": "offload",
+        "kv_connector_extra_config": {"mooncake_store.chunk_tokens": 8192},
+    }
+    tier = KVConnectorFactory.offload_tier(SimpleNamespace(kv_transfer_config=kvc))
+    assert tier.load_chunk_tokens == 8192
+    mgr = _make_spread_mgr(n_ranks=3, tier=tier)
+    router = mgr._prefix_router
+    owner = _chain_seq(1, 8192)
+    router.place(owner, 0, 3)
+    router.charge(owner.id)
+    router.prefill_complete(owner.id)
+    partial = _chain_seq(2, 4096)
+    router.place(partial, 1, 3)
+    router.charge(partial.id)
+    router.prefill_complete(partial.id)
+    mgr._rank_tokens = [100_000, 0, 0]
+    moved = _chain_seq(3, 12288)
+    assert _route(mgr, [moved]) == [1]
+    assert _est(mgr, moved) == 4096
+    assert mgr._seq_load[moved.id][2] == 8192
+    assert _count(mgr, "prefix_moved_tokens") == 0
+
+
 def test_reset_keeps_the_prefix_index_across_batches():
     """`reset_dp_router` runs before every offline batch; the ranks' prefix
     caches outlive it, so the second batch still finds the shared prefix."""

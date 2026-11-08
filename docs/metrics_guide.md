@@ -217,8 +217,8 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 | `atom:dp_affinity_parent_ignored` | Counter | New child sessions placed independently instead of inheriting a parent owner. |
 | `atom:dp_route_explicit` / `atom:dp_route_load_balanced` | Counter | Requests routed by explicit rank / by the load balancer. |
 | `atom:dp_prefix_owner` | Counter | `prefix_spread`: requests kept on the rank holding their prefix. |
-| `atom:dp_prefix_moved` | Counter | `prefix_spread`: requests moved to an idle rank, which loads their prefix from the offload tier. |
-| `atom:dp_prefix_moved_tokens` | Counter, tokens | `prefix_spread`: prefix tokens the moved requests were credited (loaded from the tier on the new rank). |
+| `atom:dp_prefix_moved` | Counter | `prefix_spread`: requests moved to an idle rank; admission determines whether tier KV is available. |
+| `atom:dp_prefix_moved_tokens` | Counter, tokens | `prefix_spread`: estimated tier tokens credited at placement, excluding an unaligned Store head/tail and loads below the minimum. This is not a count of completed restores. |
 | `atom:dp_prefix_moved_partial` | Counter | `prefix_spread`: moves onto a rank already holding part of the prefix. |
 | `atom:dp_prefix_cold` | Counter | `prefix_spread`: requests with no known prefix, placed by `least_tokens`. |
 | `atom:dp_requests_routed` | Counter, requests | Cumulative requests per rank. Label: `rank`. |

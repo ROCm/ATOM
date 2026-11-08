@@ -76,6 +76,23 @@ class OffloadTierProfile:
 
     loads: bool = False
     min_load_tokens: int = 0
+    # Store's configured transfer granularity. MP negotiates its geometry
+    # with the external adapter; the static profile does not override it.
+    load_chunk_tokens: int = 1
+
+    def loadable_tokens(self, local: int, hit: int) -> int:
+        """Credit only complete transferable chunks beyond the local prefix.
+
+        An unaligned head is recomputed before handoff and is not a cache hit.
+        The minimum load applies to the aligned remainder, not the raw gap.
+        """
+        if not self.loads:
+            return 0
+        chunk = self.load_chunk_tokens
+        start = -(-local // chunk) * chunk
+        end = hit // chunk * chunk
+        count = max(0, end - start)
+        return count if count >= self.min_load_tokens else 0
 
 
 class KVConnectorFactory:
@@ -204,6 +221,7 @@ class KVConnectorFactory:
         if not isinstance(kv_cfg, dict):
             return OffloadTierProfile()
         tier = shared = False
+        chunk_tokens = 1
         for name, sub in cls.leaf_connectors(config) or ():
             role = (getattr(sub, "kv_transfer_config", None) or {}).get(
                 "kv_role", "offload"
@@ -211,11 +229,18 @@ class KVConnectorFactory:
             if cls.is_offload_backend(name) and role != "kv_producer":
                 tier = True
                 shared |= cls._shared_tier.get(name, False)
+                if name == "mooncake_store":
+                    from atom.kv_transfer.offload.mooncake_store.config import (
+                        store_chunk_tokens,
+                    )
+
+                    chunk_tokens = store_chunk_tokens(sub.kv_transfer_config)
         if not tier:
             return OffloadTierProfile()
         return OffloadTierProfile(
             loads=shared,
             min_load_tokens=int(envs.OFFLOAD_MIN_LOAD_TOKENS),
+            load_chunk_tokens=chunk_tokens,
         )
 
     @classmethod

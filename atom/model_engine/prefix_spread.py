@@ -151,12 +151,12 @@ class PrefixSpreadRouter:
         local = hits.get(rank, 0)
         # The tier holds the prefix only once its source finished prefilling,
         # and the connector loads only a rest of at least its load threshold.
-        loadable = (
-            self.tier.loads
-            and source not in self._prefilling
-            and hit - local >= self.tier.min_load_tokens
+        loaded = (
+            self.tier.loadable_tokens(local, hit)
+            if source not in self._prefilling
+            else 0
         )
-        est_hit = hit if rank == owner or loadable else local
+        est_hit = hit if rank == owner else local + loaded
         self._est_hit[seq.id] = est_hit
         self._record(chain, rank, seq.id, est_hit, source)
         if rank == owner:

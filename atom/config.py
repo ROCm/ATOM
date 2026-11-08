@@ -2723,19 +2723,6 @@ class Config:
             # llama.py adds a key to the live `rope_parameters` while a worker
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
-        # Reject unsupported Store layouts/replay modes before workers load weights.
-        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-        for name, leaf in KVConnectorFactory.leaf_connectors(self) or ():
-            if name == "mooncake_store":
-                from atom.kv_transfer.offload.mooncake_store.config import (
-                    check_engine_compatibility,
-                    parse_mooncake_store_config,
-                )
-
-                check_engine_compatibility(
-                    parse_mooncake_store_config(leaf.kv_transfer_config), leaf
-                )
         self._resolve_dynamic_chunking()
         self._check_pp_support()
 
@@ -2948,6 +2935,20 @@ class Config:
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+        # Reject unsupported Store layouts/replay modes before workers load weights.
+        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+        for name, leaf in KVConnectorFactory.leaf_connectors(self) or ():
+            if name == "mooncake_store":
+                from atom.kv_transfer.offload.mooncake_store.config import (
+                    check_engine_compatibility,
+                    parse_mooncake_store_config,
+                )
+
+                check_engine_compatibility(
+                    parse_mooncake_store_config(leaf.kv_transfer_config), leaf
+                )
 
     def _check_pp_support(self) -> None:
         """Refuse what PP does not wire yet: TBO, P/D consumers, and speculation

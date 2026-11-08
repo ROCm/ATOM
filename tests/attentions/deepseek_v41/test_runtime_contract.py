@@ -603,6 +603,35 @@ def test_tbo_admission_is_stable_across_dp_normalization(tp, dp):
         cfg.tensor_parallel_size = 1
 
 
+@pytest.mark.parametrize("requested_block", [16, 128, 256])
+def test_store_geometry_uses_v41_effective_block_size(monkeypatch, requested_block):
+    from atom import config as config_module
+    from atom.config import CompilationConfig, Config
+
+    fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures"
+    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *a, **k: None)
+    cfg = Config(
+        model=str(fixture),
+        tensor_parallel_size=1,
+        compilation_config=CompilationConfig(level=0),
+        enforce_eager=True,
+        kv_cache_dtype="bf16",
+        index_cache_dtype="fp8",
+        kv_cache_block_size=requested_block,
+        kv_transfer_config={
+            "kv_connector": "mooncake_store",
+            "kv_role": "offload",
+            "kv_connector_extra_config": {
+                "mooncake_store.master": "127.0.0.1:50051",
+                "mooncake_store.metadata": "http://127.0.0.1:8080/metadata",
+                "mooncake_store.local_hostname": "127.0.0.1",
+                "mooncake_store.chunk_tokens": 128,
+            },
+        },
+    )
+    assert cfg.kv_cache_block_size == 128
+
+
 @pytest.mark.parametrize("explicit_parallel", [False, True])
 def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
     import atom.config as config_module

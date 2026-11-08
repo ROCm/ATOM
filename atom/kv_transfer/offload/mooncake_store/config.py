@@ -90,6 +90,19 @@ class MooncakeStoreOffloadConfig:
 _FIELDS = tuple(field.name for field in fields(MooncakeStoreOffloadConfig))
 
 
+def store_chunk_tokens(kv_transfer_config: Mapping[str, Any] | None) -> int:
+    """The transfer granularity shared by routing and the Store connector."""
+    kvc = kv_transfer_config or {}
+    extra = kvc.get("kv_connector_extra_config", kvc) or {}
+    if not isinstance(extra, Mapping):
+        raise ValueError("kv_connector_extra_config must be a JSON object")
+    return offcfg._strict_integer(
+        "mooncake_store.chunk_tokens",
+        extra.get("mooncake_store.chunk_tokens", 256),
+        minimum=1,
+    )
+
+
 def parse_mooncake_store_config(
     kv_transfer_config: Mapping[str, Any] | None,
 ) -> MooncakeStoreOffloadConfig:
@@ -165,9 +178,7 @@ def parse_mooncake_store_config(
         ),
         protocol=protocol,
         local_hostname=_text("mooncake_store.local_hostname", local_hostname),
-        chunk_tokens=offcfg._strict_integer(
-            "mooncake_store.chunk_tokens", values.get("chunk_tokens", 256), minimum=1
-        ),
+        chunk_tokens=store_chunk_tokens(kvc),
         load_pool_mib=offcfg._strict_integer(
             "mooncake_store.load_pool_mib", values.get("load_pool_mib", 1024), minimum=1
         ),
