@@ -22,6 +22,10 @@ on:
         description: 'Hardware label written into dashboard entries'
         type: string
         required: true
+      worker_entrypoint:
+        description: 'Prefill/decode worker entrypoint: python (api_server) or mesh (Rust runtime in Mesh)'
+        type: string
+        default: python
 
 # The caller's workflow-level env does not reach a called workflow.
 env:
@@ -209,8 +213,9 @@ jobs:
           # existing release profile for both benchmark and eval services.
           # Mounted Python also needs the matching router protocol; accuracy
           # cases must not silently use the image's older Mesh binary.
-          ATOMESH_BUILD_MESH: ${{ (inputs.atom_source == 'mounted' || matrix.benchmark.kind == 'aiperf_agentic') && 'true' || 'false' }}
+          ATOMESH_BUILD_MESH: ${{ (inputs.atom_source == 'mounted' || matrix.benchmark.kind == 'aiperf_agentic' || inputs.worker_entrypoint == 'mesh') && 'true' || 'false' }}
           ATOMESH_MESH_BUILD_PROFILE: release
+          ATOMESH_WORKER_ENTRYPOINT: ${{ inputs.worker_entrypoint }}
           ATOMESH_ATOM_SOURCE: ${{ inputs.atom_source }}
           CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}
           RESULT_DIR: atomesh-results

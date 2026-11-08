@@ -156,6 +156,14 @@ on:
         required: false
         default: ''
         type: string
+      worker_entrypoint:
+        description: 'Prefill/decode worker entrypoint: python = api_server, mesh = Rust runtime in Mesh (USE_ATOMESH_ENTRYPOINTS=1, built from this ref)'
+        required: false
+        default: python
+        type: choice
+        options:
+          - python
+          - mesh
       atomesh_image:
         description: 'Override ATOM docker image'
         required: false
@@ -1567,6 +1575,7 @@ jobs:
       atom_source: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_source || 'mounted' }}
       model_root: ${{ needs.load-config.outputs.model_root }}
       dashboard_hardware: ${{ needs.load-config.outputs.dashboard_hardware }}
+      worker_entrypoint: ${{ github.event_name == 'workflow_dispatch' && inputs.worker_entrypoint || 'python' }}
 
   summarize-results:
     name: Summarize ATOMesh benchmark results

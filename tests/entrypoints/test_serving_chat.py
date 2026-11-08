@@ -11,7 +11,6 @@ import pathlib
 
 import pytest
 
-from atom.entrypoints.atomesh import atom_standalone_service
 from atom.entrypoints.openai import api_server, serving_chat
 from atom.entrypoints.openai.protocol import (
     openai_stop_reason,
@@ -662,7 +661,6 @@ class TestForbiddingToolCallsDoesNotDeleteTheAnswer:
         roots = [
             pathlib.Path(serving_chat.__file__),
             pathlib.Path(api_server.__file__),
-            pathlib.Path(atom_standalone_service.__file__),
         ]
         built = unguarded = 0
         for path in roots:
@@ -726,10 +724,7 @@ class TestTheStreamReportsWhyItStopped:
     def test_no_streaming_path_hardcodes_stop(self):
         """Counted rather than listed: the gap was a site nobody listed."""
         hardcoded = 0
-        for path in (
-            pathlib.Path(serving_chat.__file__),
-            pathlib.Path(atom_standalone_service.__file__),
-        ):
+        for path in (pathlib.Path(serving_chat.__file__),):
             for node in ast.walk(ast.parse(path.read_text())):
                 if not isinstance(node, ast.IfExp):
                     continue

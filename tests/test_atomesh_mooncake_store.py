@@ -377,6 +377,8 @@ start_logged_process() {
 }
 build_server_cache_env() { local -n out="$3"; out=("HOME=/cache/$1"); }
 build_torch_profiler_args() { local -n out="$2"; out=(); }
+build_worker_entrypoint() { local -n env_out="$2" args_out="$3"; env_out=(); args_out=(); }
+ATOMESH_WORKER_ENTRYPOINT=python
 ATOM_SOURCE_ENV=()
 server_common=(--model /models/m)
 prefill_parallel=(-tp 4)

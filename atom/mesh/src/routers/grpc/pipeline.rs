@@ -123,7 +123,7 @@ impl Pipeline {
         let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = match self.engine.dispatch(&placement, &mut payload).await {
             Ok(s) => s,
-            Err(e) => return self.record_chat_err(&model, start, engine_err_to_response(e)),
+            Err(e) => return self.record_chat_err(&model, start, e.into_response()),
         };
 
         let is_stream = resp_ctx.original.is_streaming();
@@ -178,13 +178,7 @@ impl Pipeline {
         let guards = make_load_guards(&placement, resp_ctx.headers.as_ref());
         let stream = match self.engine.dispatch(&placement, &mut payload).await {
             Ok(s) => s,
-            Err(e) => {
-                return self.record_generate_err(
-                    &model_for_metric,
-                    start,
-                    engine_err_to_response(e),
-                )
-            }
+            Err(e) => return self.record_generate_err(&model_for_metric, start, e.into_response()),
         };
 
         let is_stream = resp_ctx.original.is_streaming();
@@ -227,7 +221,7 @@ impl Pipeline {
             .engine
             .dispatch(&placement, &mut payload)
             .await
-            .map_err(engine_err_to_response)?;
+            .map_err(EngineError::into_response)?;
 
         render::chat_aggregator::process_typed(stream, resp_ctx).await
     }
@@ -303,30 +297,4 @@ fn placement_err_to_response_log(err: PlacementError, model_id: Option<&str>) ->
         "Placement planner returned error"
     );
     placement_err_to_response(err, model_id)
-}
-
-fn engine_err_to_response(err: EngineError) -> Response {
-    match err {
-        EngineError::Transport(s) => {
-            error::service_unavailable("engine_transport_error", format!("transport error: {}", s))
-        }
-        EngineError::Prefill(m) => {
-            error::internal_error("engine_prefill_error", format!("prefill error: {}", m))
-        }
-        EngineError::DecodeError(m) => {
-            error::internal_error("engine_decode_error", format!("decode error: {}", m))
-        }
-        EngineError::PrefillEarlyClose => error::internal_error(
-            "engine_prefill_early_close",
-            "prefill stream closed without Complete",
-        ),
-        EngineError::DecodeIncomplete => error::internal_error(
-            "engine_decode_incomplete",
-            "decode stream closed without Complete",
-        ),
-        EngineError::ConnectionAcquireFailed(r) => {
-            error::service_unavailable("engine_connection_failed", r)
-        }
-        EngineError::RequestBuildFailed(r) => error::bad_request("engine_request_build_failed", r),
-    }
 }

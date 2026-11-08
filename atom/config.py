@@ -2133,6 +2133,9 @@ class Config:
     # Queue finished sequences on outputs_queue; only its readers turn it on
     # (LLMEngine.add_request for step / generate, and asyncio_mode).
     keep_finished_outputs: bool = False
+    # Another process (the atomesh Rust runtime) is the EngineCores' client:
+    # CoreManager spawns them and reaps them, but never connects.
+    external_engine_client: bool = False
     mark_trace: bool = False
     load_dummy: str | None = None
     enable_expert_parallel: bool = False

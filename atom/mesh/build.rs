@@ -11,6 +11,12 @@ macro_rules! set_env {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The EngineCore wire protocol, compiled from the one spec the Python side
+    // uses too; protox needs no protoc binary.
+    const ENGINE_PROTO_DIR: &str = "../model_engine/protocol";
+    let engine_proto = protox::compile(["engine_v1.proto"], [ENGINE_PROTO_DIR])?;
+    prost_build::Config::new().compile_fds(engine_proto)?;
+    println!("cargo:rerun-if-changed={ENGINE_PROTO_DIR}/engine_v1.proto");
     #[cfg(feature = "ext-proc")]
     {
         tonic_prost_build::configure()

@@ -14,11 +14,18 @@ esac
 source_commit="${ATOMESH_MESH_SOURCE_COMMIT:-$(git -C "${source_dir}" rev-parse HEAD)}"
 
 # The checkout is mounted read-only. Cargo may need to create a lockfile.
+# build.rs reads the engine wire protocol from ../model_engine/protocol, so the
+# spec goes to the same place relative to the copy.
 python3 - "${source_dir}" "${build_dir}/source" <<'PY'
+import pathlib
 import shutil
 import sys
 
-shutil.copytree(sys.argv[1], sys.argv[2], ignore=shutil.ignore_patterns("target", ".git"))
+source, copy = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+shutil.copytree(source, copy, ignore=shutil.ignore_patterns("target", ".git"))
+proto = pathlib.Path("model_engine/protocol/engine_v1.proto")
+(copy.parent / proto).parent.mkdir(parents=True)
+shutil.copy2(source.parent / proto, copy.parent / proto)
 PY
 
 target_dir="${ATOMESH_MESH_TARGET_DIR:-${TMPDIR:-/tmp}/atomesh-mesh-cache-$(id -u)}"
@@ -51,13 +58,20 @@ lock_args=()
 if [[ -f "${build_dir}/source/Cargo.lock" ]]; then
   lock_args+=(--locked)
 fi
+# Mesh-entrypoint workers import the library as the atomesh_runner PyO3 module.
+build_module=false
+targets=(--bin atomesh)
+if [[ "${ATOMESH_WORKER_ENTRYPOINT:-python}" == "mesh" ]]; then
+  build_module=true
+  targets+=(--lib)
+fi
 run_cargo_build() {
-  cargo build --profile "${profile}" --bin atomesh \
+  cargo build --profile "${profile}" "${targets[@]}" \
     "${lock_args[@]}" \
     --manifest-path "${build_dir}/source/Cargo.toml" \
     --target-dir "${target_dir}" > "${log_dir}/mesh-build.log" 2>&1
 }
-echo "[build] Mesh commit=${source_commit} profile=${profile}" >&2
+echo "[build] Mesh commit=${source_commit} profile=${profile} targets=${targets[*]}" >&2
 if ! run_cargo_build; then
   # Shared host mesh caches go stale in two ways:
   # 1) Cargo leaves .cargo-ok after a cut-short crate extract, so registry/src
@@ -77,6 +91,10 @@ if ! run_cargo_build; then
 fi
 cp "${build_dir}/source/Cargo.lock" "${log_dir}/mesh-Cargo.lock"
 cp "${target_dir}/${profile}/atomesh" "${log_dir}/atomesh"
+if [[ "${build_module}" == "true" ]]; then
+  mkdir -p "${log_dir}/python"
+  cp "${target_dir}/${profile}/libmesh.so" "${log_dir}/python/atomesh_runner.so"
+fi
 python3 - "${log_dir}" "${source_commit}" "${profile}" <<'PY'
 import hashlib
 import json
@@ -94,6 +112,9 @@ metadata = {
     "binary_sha256": hashlib.sha256((output / "atomesh").read_bytes()).hexdigest(),
     "lockfile_sha256": hashlib.sha256((output / "mesh-Cargo.lock").read_bytes()).hexdigest(),
 }
+module = output / "python" / "atomesh_runner.so"
+if module.is_file():
+    metadata["python_module_sha256"] = hashlib.sha256(module.read_bytes()).hexdigest()
 (output / "mesh-build.json").write_text(json.dumps(metadata, indent=2) + "\n")
 PY
 printf '%s\n' "${log_dir}/atomesh"

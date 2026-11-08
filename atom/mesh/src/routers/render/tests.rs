@@ -117,6 +117,20 @@ mod b_chat_aggregator {
     }
 
     #[tokio::test]
+    async fn test_aggregator_reports_cached_prompt_tokens() {
+        let mut done = complete(vec![1]);
+        if let TokenChunk::Complete { meta, .. } = &mut done {
+            meta.cached_tokens = 2;
+        }
+        let resp =
+            chat_aggregator::process(synthetic_single_stream(vec![Ok(done)]), chat_ctx()).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+        assert_eq!(json["usage"]["prompt_tokens"], 3);
+    }
+
+    #[tokio::test]
     async fn test_aggregator_finish_reason_maps_into_body() {
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
             token_ids: vec![1],
@@ -1166,6 +1180,7 @@ mod c2_chat_streaming_branches {
         let s = body_of(resp).await;
         assert!(s.contains("usage"));
         assert!(s.contains("\"total_tokens\":8") || s.contains("total_tokens"));
+        assert!(s.contains("\"prompt_tokens_details\":{\"cached_tokens\":0}"));
     }
 
     #[tokio::test]
@@ -3652,5 +3667,55 @@ mod e2_generate_streaming_branches {
         })]);
         let resp = generate_streaming::process(stream, generate_ctx(), "pd");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod prompt_opened_reasoning {
+    use super::test_support::chat_ctx;
+    use crate::{
+        reasoning_parser::ParserFactory,
+        routers::prepare::{chat_template::ProcessedMessages, response_context::REASONING_OPEN},
+    };
+
+    fn prompted(text: &str) -> bool {
+        let mut ctx = chat_ctx();
+        ctx.processed_messages = Some(ProcessedMessages {
+            text: text.into(),
+            stop_sequences: None,
+        });
+        ctx.starts_in_reasoning()
+    }
+
+    #[test]
+    fn only_a_prompt_ending_in_an_open_block_starts_in_reasoning() {
+        assert!(prompted("<|assistant|><think>\n"));
+        assert!(!prompted("<|assistant|><think></think>"));
+        assert!(!prompted("<|assistant|>"));
+        assert!(!chat_ctx().starts_in_reasoning());
+    }
+
+    /// The output of such a prompt: reasoning, then `</think>`, then the answer.
+    #[test]
+    fn a_primed_parser_splits_an_output_with_no_open_tag() {
+        let factory = ParserFactory::new();
+        let mut parser = factory.create("qwen3").unwrap();
+        let primed = format!("{REASONING_OPEN}17 * 3 = 51</think>51");
+        let whole = parser.detect_and_parse_reasoning(&primed).unwrap();
+        assert_eq!(
+            (whole.reasoning_text.as_str(), whole.normal_text.as_str()),
+            ("17 * 3 = 51", "51")
+        );
+
+        let mut parser = factory.create("qwen3").unwrap();
+        let _ = parser.parse_reasoning_streaming_incremental(REASONING_OPEN);
+        let (mut reasoning, mut normal) = (String::new(), String::new());
+        // `</think>` is one special token, so a delta carries it whole.
+        for delta in ["17 * 3", " = 51", "</think>5", "1"] {
+            let r = parser.parse_reasoning_streaming_incremental(delta).unwrap();
+            reasoning.push_str(&r.reasoning_text);
+            normal.push_str(&r.normal_text);
+        }
+        assert_eq!((reasoning.as_str(), normal.as_str()), ("17 * 3 = 51", "51"));
     }
 }

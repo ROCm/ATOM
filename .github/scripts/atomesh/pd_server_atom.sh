@@ -132,10 +132,20 @@ ATOMESH_MOONCAKE_METRICS_PORT="${ATOMESH_MOONCAKE_METRICS_PORT:-26090}"
 ATOMESH_MOONCAKE_OWNER_PORT="${ATOMESH_MOONCAKE_OWNER_PORT:-26052}"
 ATOMESH_EXECUTION_PHASE="${ATOMESH_EXECUTION_PHASE:-combined}"
 ATOMESH_SERVICE_PORT_OFFSET="${ATOMESH_SERVICE_PORT_OFFSET:-0}"
+# Workers serve through the Python api_server (python) or the Rust runtime
+# embedded in Mesh (mesh, USE_ATOMESH_ENTRYPOINTS=1). The router is Mesh either way.
+ATOMESH_WORKER_ENTRYPOINT="${ATOMESH_WORKER_ENTRYPOINT:-python}"
 case "${ATOMESH_EXECUTION_PHASE}" in
   combined|benchmark|eval) ;;
   *)
     echo "ERROR: unsupported ATOMESH_EXECUTION_PHASE=${ATOMESH_EXECUTION_PHASE}" >&2
+    exit 2
+    ;;
+esac
+case "${ATOMESH_WORKER_ENTRYPOINT}" in
+  python|mesh) ;;
+  *)
+    echo "ERROR: unsupported ATOMESH_WORKER_ENTRYPOINT=${ATOMESH_WORKER_ENTRYPOINT}" >&2
     exit 2
     ;;
 esac
@@ -823,6 +833,47 @@ build_server_cache_env() {
 if [[ -n "${AITER_JIT_DIR:-}" ]] && mkdir -p "${AITER_JIT_DIR}" 2>/dev/null; then
   seed_aiter_jit_dir "container" "${AITER_JIT_DIR}"
 fi
+
+# The atomesh_runner PyO3 module setup_mesh.sh built next to the router binary.
+# Ranks other than 0 find it in the job's shared run directory once rank 0 has
+# built it.
+mesh_python_module_dir() {
+  local binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
+  local -a candidates=("$(dirname -- "${binary}")/python" "${RUN_DIR}/mesh-build/python")
+  local deadline=$((SECONDS + ${ATOMESH_MESH_MODULE_WAIT_SECONDS:-1800}))
+  local dir
+  while true; do
+    for dir in "${candidates[@]}"; do
+      if [[ -f "${dir}/atomesh_runner.so" ]]; then
+        printf '%s\n' "${dir}"
+        return 0
+      fi
+    done
+    (( SECONDS < deadline )) || break
+    sleep 10
+  done
+  echo "ERROR: ATOMESH_WORKER_ENTRYPOINT=mesh needs atomesh_runner.so from setup_mesh.sh; looked in ${candidates[*]}" >&2
+  return 1
+}
+
+# Env and extra args that select a worker's entrypoint. A mesh worker also
+# starts Mesh's own Prometheus listener, moved off its shared default port to
+# server_port + 1000 so workers on one node do not collide.
+build_worker_entrypoint() {
+  local server_port="$1"
+  local -n env_out="$2"
+  local -n args_out="$3"
+  env_out=()
+  args_out=()
+  [[ "${ATOMESH_WORKER_ENTRYPOINT}" == "mesh" ]] || return 0
+  local module_dir
+  module_dir="$(mesh_python_module_dir)" || return 1
+  env_out=(
+    "USE_ATOMESH_ENTRYPOINTS=1"
+    "PYTHONPATH=${module_dir}${PYTHONPATH:+:${PYTHONPATH}}"
+  )
+  args_out=(--prometheus-port "$((server_port + 1000))")
+}
 
 server_common=(
   --model "${MODEL_PATH}"
@@ -1976,6 +2027,8 @@ start_prefill() {
   fi
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
+  local -a prefill_entry_env=() prefill_entry_args=()
+  build_worker_entrypoint "${server_port}" prefill_entry_env prefill_entry_args || return 1
   local -a prefill_dp_env=()
   if [[ "${USE_EXPLICIT_DP_PORTS}" == "1" ]]; then
     prefill_dp_env=(
@@ -1987,7 +2040,7 @@ start_prefill() {
   prefill_kv_transfer_config="$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
   local -a prefill_profiler_args=()
   build_torch_profiler_args "${log_name}" prefill_profiler_args
-  echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${prefill_cudagraph_args[*]:-none}"
+  echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${prefill_cudagraph_args[*]:-none} entrypoint=${ATOMESH_WORKER_ENTRYPOINT}"
   local -a prefill_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
@@ -1997,10 +2050,11 @@ start_prefill() {
     --kv-transfer-config "${prefill_kv_transfer_config}"
     "${prefill_cudagraph_args[@]}"
     "${prefill_profiler_args[@]}"
+    "${prefill_entry_args[@]}"
     ${PREFILL_SERVER_ARGS}
   )
-  dump_launch_info "PREFILL" "${prefill_offload_env[@]}" "${prefill_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_offload_env[@]}" "${prefill_cmd[@]}"
+  dump_launch_info "PREFILL" "${prefill_offload_env[@]}" "${prefill_entry_env[@]}" "${prefill_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_offload_env[@]}" "${prefill_entry_env[@]}" "${prefill_cmd[@]}"
 }
 
 start_decode() {
@@ -2039,6 +2093,8 @@ start_decode() {
   if mooncake_store_requested; then
     decode_mooncake_env=("MC_NUM_QP_PER_EP=1")
   fi
+  local -a decode_entry_env=() decode_entry_args=()
+  build_worker_entrypoint "${server_port}" decode_entry_env decode_entry_args || return 1
   local -a decode_dp_env=()
   if [[ "${USE_EXPLICIT_DP_PORTS}" == "1" ]]; then
     decode_dp_env=(
@@ -2050,7 +2106,7 @@ start_decode() {
   decode_kv_transfer_config="$(kv_transfer_config kv_consumer "${DECODE_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
   local -a decode_profiler_args=()
   build_torch_profiler_args "${log_name}" decode_profiler_args
-  echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
+  echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none} entrypoint=${ATOMESH_WORKER_ENTRYPOINT}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
@@ -2061,10 +2117,11 @@ start_decode() {
     --kv-transfer-config "${decode_kv_transfer_config}"
     "${decode_cudagraph_args[@]}"
     "${decode_profiler_args[@]}"
+    "${decode_entry_args[@]}"
     ${DECODE_SERVER_ARGS}
   )
-  dump_launch_info "DECODE" "${decode_mooncake_env[@]}" "${decode_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_mooncake_env[@]}" "${decode_cmd[@]}"
+  dump_launch_info "DECODE" "${decode_mooncake_env[@]}" "${decode_entry_env[@]}" "${decode_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_mooncake_env[@]}" "${decode_entry_env[@]}" "${decode_cmd[@]}"
 }
 
 # The aggregated server reads the `decode` service block and `env.decode`: it is
