@@ -223,6 +223,7 @@ def _checked_strict_parameters(name, text):
         responses=True,
     )
     _check_strict(name, parameters, top=True)
+    _check_strict_targets(name, parameters)
     # The DSML tags carry these names unescaped: the parser reads a name up
     # to its first quote, and every tag it reads -- a call's end, another
     # call -- opens with `<`.
@@ -232,6 +233,33 @@ def _checked_strict_parameters(name, text):
             "'\"' or '<'"
         )
     return json.dumps(parameters)
+
+
+def _check_strict_targets(name, parameters):
+    """Hold what each ``$ref`` names to the strict rules too: it may sit
+    where the walk over schema positions does not look, such as a
+    definition's ``default``."""
+    from referencing.exceptions import Unresolvable
+    from referencing.jsonschema import DRAFT202012
+
+    from .dsml_grammar import _refs
+    from .schema import OFFLINE_REGISTRY
+
+    resolver = OFFLINE_REGISTRY.resolver_with_root(
+        DRAFT202012.create_resource(parameters)
+    )
+    seen, pending = set(), list(_refs(parameters))
+    while pending:
+        ref = pending.pop()
+        if ref in seen:
+            continue
+        seen.add(ref)
+        try:
+            target = resolver.lookup(ref).contents
+        except Unresolvable:
+            raise ValueError(f"{name}: cannot resolve $ref {ref!r}") from None
+        _check_strict(name, target)
+        pending += _refs(target)
 
 
 def _check_strict(name, schema, *, top=False):
@@ -402,14 +430,17 @@ async def validate_chat_stream(source, schema, strict_schemas=None, declared=())
     A strict function's arguments are checked once its call is complete, so
     with strict tools the frames from the first tool call on wait for the
     end of the stream: a call that fails its schema never reaches the
-    client, which gets the error a non-streamed reply gets instead.
+    client, which gets the error a non-streamed reply gets instead. Nor does
+    a call whose choice never finished, so was never checked: the stream
+    ended in an error first, and that error is what goes out.
     """
     from atom.entrypoints.openai.sse import data_frame, iter_sse_data
 
     texts, calls = {}, {}
-    held = None
+    held, finished = None, set()
     try:
         async for frame in source:
+            carries = set()  # the choices whose calls this frame carries
             for data in iter_sse_data(frame):
                 if data == "[DONE]":
                     continue
@@ -421,6 +452,7 @@ async def validate_chat_stream(source, schema, strict_schemas=None, declared=())
                     for call in delta.get("tool_calls") or ():
                         if strict_schemas and held is None:
                             held = []
+                        carries.add(index)
                         fn = call.get("function") or {}
                         acc = calls.setdefault(index, {}).setdefault(
                             call.get("index", 0),
@@ -441,12 +473,14 @@ async def validate_chat_stream(source, schema, strict_schemas=None, declared=())
                             choice["finish_reason"],
                             declared,
                         )
+                        finished.add(index)
             if held is None:
                 yield frame
             else:
-                held.append(frame)
-        for frame in held or ():
-            yield frame
+                held.append((frame, carries))
+        for frame, carries in held or ():
+            if carries <= finished:
+                yield frame
     except RuntimeError as exc:
         yield data_frame(
             {"error": {"type": "structured_output_error", "message": str(exc)}}

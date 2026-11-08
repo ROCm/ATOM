@@ -872,3 +872,46 @@ def test_strict_parameter_names_cannot_hold_a_tag(key):
     )
     with pytest.raises(ValueError, match="cannot contain"):
         strict_tool_schemas([tool])
+
+
+def test_a_reference_target_is_held_to_the_strict_rules():
+    """A $ref into a definition's `default` names an untyped `{}`."""
+    from atom.structured_output.validation import strict_tool_schemas
+
+    holder = {"type": "string", "default": {}}
+    loose = {
+        **STRICT,
+        "properties": {"city": {"$ref": "#/$defs/Holder/default"}},
+        "$defs": {"Holder": holder},
+    }
+    with pytest.raises(ValueError, match="give its type"):
+        strict_tool_schemas([_function(loose)])
+    scalar = {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+    part = {
+        **STRICT,
+        "properties": {"city": {"$ref": "#/$defs/Scalar/anyOf/1"}},
+        "$defs": {"Scalar": scalar},
+    }
+    assert strict_tool_schemas([_function(part)])
+
+
+def test_a_call_the_stream_never_finished_is_not_sent():
+    """The engine failed mid-call (a logprob error, say): the call was never
+    checked, so only the text before it and the error go out."""
+    frames = _tool_call_frames('{"city": Infinity}')[:3] + [
+        data_frame({"error": {"type": "logprob_error", "message": "failed"}}),
+        "data: [DONE]\n\n",
+    ]
+
+    async def source():
+        for frame in frames:
+            yield frame
+
+    async def run():
+        stream = validate_chat_stream(source(), None, {"weather": STRICT})
+        return "".join([frame async for frame in stream])
+
+    raw = asyncio.run(run())
+    assert "Checking." in raw and "logprob_error" in raw
+    assert '"tool_calls"' not in raw
+    assert raw.count("[DONE]") == 1

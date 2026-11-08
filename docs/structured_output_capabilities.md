@@ -232,7 +232,8 @@ DeepSeek's rules or asks for what the grammar cannot hold:
   `<`: the DSML tags carry them unescaped, so the parser would read a name up
   to its quote, or a tag inside it;
 - definitions live at the top, under DeepSeek's `$def` (read as `$defs`),
-  `$defs` or `definitions`, and every `$ref` points into them. Each parameter
+  `$defs` or `definitions`, and every `$ref` points into them, at a schema
+  held to these same rules (not into a `default`, say). Each parameter
   is compiled on its own, where `#` would name the parameter; `$id`, `$anchor`
   and dynamic references are refused for the same reason. A draft-07
   `$schema`, as OpenAI's zod helpers write, is read as 2020-12.
@@ -261,10 +262,13 @@ still takes (a nullable string written as JSON, say) goes out cut short.
 Parsed arguments are validated against their schema again before success is
 reported (formats are the grammar's to enforce), and every call must name one
 of the request's functions. They must be standard JSON too: the parser reads
-a number past a double's range as infinity, which no JSON can carry. A streamed reply holds its frames from the first
-tool call on until then, so a call that fails is never sent: the stream ends
-with a `structured_output_error`, as a non-streamed reply fails. The reply is
-read literally, as under `response_format`. The thinking-mode refusal of
+a number past a double's range as infinity, which no JSON can carry. A
+streamed reply holds its frames from the first tool call on until then, so a
+call that fails is never sent: the stream ends with a
+`structured_output_error`, as a non-streamed reply fails. Nor is a call whose
+choice never finished, so was never checked: the stream ended in an error
+first, and only that error goes out. The reply is read literally, as under
+`response_format`. The thinking-mode refusal of
 required/named `tool_choice` still applies.
 
 ## Model discovery
