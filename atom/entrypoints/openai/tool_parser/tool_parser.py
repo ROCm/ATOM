@@ -374,8 +374,9 @@ class ToolCallParser(ABC):
 
         ``functions`` are the function objects the request lets the model
         call; ``required`` means it must call one; ``starts_in_reasoning``
-        says whether the prompt opened the reasoning channel. Applied to every
-        request that declares tools (`structured_output.validation.
+        says whether the prompt opened the reasoning channel. Applied to a chat
+        request that declares tools and no response format when
+        ATOM_TOOL_CALL_GRAMMAR=1 (`structured_output.validation.
         configure_tool_call_grammar`). None for every format but Kimi-K3.
         """
         return None

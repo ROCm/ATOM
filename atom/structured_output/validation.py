@@ -50,6 +50,19 @@ def schema_from_format(fmt, *, responses=False):
     return json.dumps(schema, ensure_ascii=False)
 
 
+def selected_tools(tools, tool_choice):
+    """The tools a request lets the model call, and whether it must call one."""
+    from atom.entrypoints.openai.tool_parser.tool_parser import qualified_tool_name
+
+    if not isinstance(tool_choice, dict):
+        return list(tools), tool_choice == "required"
+    name = qualified_tool_name(tool_choice)
+    chosen = [tool for tool in tools if qualified_tool_name(tool) == name]
+    if not chosen:
+        raise ValueError("The selected tool must be declared in tools")
+    return chosen, True
+
+
 def structured_tool_format(parser_cls, tools, tool_choice):
     """Describe the native tool alternative without accepting client grammars."""
     if not tools or tool_choice == "none":
@@ -59,18 +72,12 @@ def structured_tool_format(parser_cls, tools, tool_choice):
 
     if parser_cls is None or not issubclass(parser_cls, DsmlParser):
         raise ValueError("Structured output with tools requires a DSML tool parser")
-    names = [qualified_tool_name(tool) for tool in tools]
-    required = tool_choice == "required" or isinstance(tool_choice, dict)
-    if isinstance(tool_choice, dict):
-        name = qualified_tool_name(tool_choice)
-        if name not in names:
-            raise ValueError("The selected tool must be declared in tools")
-        names = [name]
+    chosen, required = selected_tools(tools, tool_choice)
     return json.dumps(
         {
             "prefix": parser_cls.DSML_PREFIX,
             "section": parser_cls.SECTION,
-            "names": names,
+            "names": [qualified_tool_name(tool) for tool in chosen],
             "required": required,
         }
     )
@@ -175,7 +182,7 @@ async def validate_chat_stream(source, schema):
         await source.aclose()
 
 
-def execution_blocker(
+def validate_execution_options(
     config,
     params,
     *,
@@ -184,41 +191,32 @@ def execution_blocker(
     relaxed_mtp=False,
     synthetic=False,
 ):
-    """Why this deployment or request cannot run a grammar, or None."""
+    from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
+
     if getattr(config, "pipeline_parallel_size", 1) > 1:
-        return "Structured output does not support pipeline parallelism"
+        raise ValueError("Structured output does not support pipeline parallelism")
     if relaxed_mtp:
-        return "Structured output cannot use relaxed MTP verification"
-    kv_config = getattr(config, "kv_transfer_config", None)
-    # A local offload tier (LMCache CPU) only restores prefix KV; the request
-    # still decodes on this engine, so its grammar state is never handed off.
-    local_offload = (
-        isinstance(kv_config, dict) and kv_config.get("kv_role") == "offload"
-    )
+        raise ValueError("Structured output cannot use relaxed MTP verification")
+    # A KV offload tier (LMCache CPU) is not P/D: the request still decodes on
+    # this engine, so its grammar state is never handed to another one.
     if (
         kv_transfer
         or multimodal
         or getattr(config, "enable_rapidserve", False)
-        or (kv_config and not local_offload)
+        or disaggregated_kv_role(config) is not None
     ):
-        return "Structured output currently requires text without P/D"
+        raise ValueError("Structured output currently requires text without P/D")
     spec = getattr(config, "speculative_config", None)
     if synthetic or getattr(spec, "synthetic_acceptance_rates", None):
-        return "Structured output cannot use synthetic forced acceptance"
+        raise ValueError("Structured output cannot use synthetic forced acceptance")
     if params.ignore_eos or params.stop_strings:
-        return "Structured output does not support ignore_eos or custom stop strings"
-    if params.logprobs and getattr(spec, "num_speculative_tokens", 0):
-        return (
-            "Combining JSON Schema, speculative decoding and logprobs is not "
-            "supported; disable speculative decoding or logprobs"
+        raise ValueError(
+            "Structured output does not support ignore_eos or custom stop strings"
         )
-    return None
-
-
-def validate_execution_options(config, params, **options):
-    reason = execution_blocker(config, params, **options)
-    if reason is not None:
-        raise ValueError(reason)
+    if params.logprobs and getattr(spec, "num_speculative_tokens", 0):
+        raise ValueError(
+            "Combining JSON Schema, speculative decoding and logprobs is not supported; disable speculative decoding or logprobs"
+        )
 
 
 class WorkerGrammarPreflight:
@@ -336,25 +334,26 @@ def tool_call_grammar_format(parser_cls, tools, tool_choice, starts_in_reasoning
         return None
     if any(tool.get("type", "function") != "function" for tool in tools):
         return None  # only function tools have a parameter schema to hold to
-    from atom.entrypoints.openai.tool_parser.tool_parser import qualified_tool_name
+    from .schema import check_schema_safety
 
-    functions = [tool.get("function", tool) for tool in tools]
-    required = tool_choice == "required" or isinstance(tool_choice, dict)
-    if isinstance(tool_choice, dict):
-        name = qualified_tool_name(tool_choice)
-        functions = [
-            fn
-            for tool, fn in zip(tools, functions)
-            if qualified_tool_name(tool) == name
-        ]
-        if not functions:
-            raise ValueError("The selected tool must be declared in tools")
+    chosen, required = selected_tools(tools, tool_choice)
+    functions = [tool.get("function", tool) for tool in chosen]
+    for function in functions:
+        # The same checks a response schema passes (#2862): a schema llguidance
+        # would accept but cannot match within its budget fails the request at
+        # decode time, after the client has been told it succeeded.
+        check_schema_safety(function.get("parameters") or {})
     grammar = parser_cls.tool_call_grammar(
         functions, required=required, starts_in_reasoning=starts_in_reasoning
     )
     if grammar is None:
         return None
     return json.dumps({"kind": "lark", "grammar": grammar})
+
+
+# Tool-call grammars that failed to compile, so a repeated tool list does not
+# rerun the all-rank preparation RPC to fail again.
+_uncompilable_tool_grammars: OrderedDict = OrderedDict()
 
 
 async def configure_tool_call_grammar(
@@ -374,9 +373,11 @@ async def configure_tool_call_grammar(
     """Hold the tool calls of a request without a response format to the
     declared schemas, when the parser declares a grammar for them.
 
-    Never rejects a request the server took before this existed: without the
-    optional dependency, on a deployment or request that cannot run a grammar,
-    or when the grammar does not compile, the output stays unconstrained.
+    Admission never fails because of it: without the optional dependency, on
+    a deployment or request that cannot run a grammar, with a schema that does
+    not pass the safety checks, or when preparation fails or times out, the
+    output stays unconstrained. A grammar error during decoding fails the
+    request like any structured-output error.
     """
     if not tools or parser_cls is None or not structured_output.available():
         return False
@@ -384,33 +385,39 @@ async def configure_tool_call_grammar(
 
     if not envs.ATOM_TOOL_CALL_GRAMMAR:
         return False
-    starts_in_reasoning = bool(getattr(channel, "starts_open", False))
-    fmt = tool_call_grammar_format(parser_cls, tools, tool_choice, starts_in_reasoning)
-    if fmt is None:
-        return False
-    reason = execution_blocker(
-        config,
-        sampling_params,
-        kv_transfer=kv_transfer,
-        multimodal=multimodal,
-        relaxed_mtp=relaxed_mtp,
-        synthetic=synthetic,
-    )
-    if reason is not None:
-        logger.debug("Tool calls left unconstrained: %s", reason)
-        return False
-    sampling_params.json_schema = TOOL_CALL_GRAMMAR_SCHEMA
-    sampling_params.structured_tool_format = fmt
-    sampling_params.structured_reasoning_end = ""
-    # The grammar already requires the tools section for a required choice.
     required_channel = sampling_params.required_channel
-    sampling_params.required_channel = None
+    fmt = None
     try:
+        fmt = tool_call_grammar_format(
+            parser_cls, tools, tool_choice, bool(getattr(channel, "starts_open", False))
+        )
+        if fmt is None or fmt in _uncompilable_tool_grammars:
+            return False
+        validate_execution_options(
+            config,
+            sampling_params,
+            kv_transfer=kv_transfer,
+            multimodal=multimodal,
+            relaxed_mtp=relaxed_mtp,
+            synthetic=synthetic,
+        )
+        sampling_params.json_schema = TOOL_CALL_GRAMMAR_SCHEMA
+        sampling_params.structured_tool_format = fmt
+        sampling_params.structured_reasoning_end = ""
+        # The grammar already requires the tools section for a required choice.
+        sampling_params.required_channel = None
         await asyncio.to_thread(
             engine.prepare_structured_request, sampling_params, kv_transfer, multimodal
         )
-    except ValueError as exc:
-        logger.warning("Tool calls left unconstrained: %s", exc)
+    # ValueError: an unsafe schema or a worker refusing the grammar;
+    # TimeoutError: preparation past its deadline; RuntimeError: a worker RPC.
+    except (ValueError, TimeoutError, RuntimeError) as exc:
+        if sampling_params.json_schema == TOOL_CALL_GRAMMAR_SCHEMA:
+            logger.warning("Tool calls left unconstrained: %s", exc)
+            if isinstance(exc, ValueError):
+                _uncompilable_tool_grammars[fmt] = None
+                if len(_uncompilable_tool_grammars) > 128:
+                    _uncompilable_tool_grammars.popitem(last=False)
         sampling_params.json_schema = None
         sampling_params.structured_tool_format = None
         sampling_params.required_channel = required_channel

@@ -312,7 +312,7 @@ that ever changes, so a fusion left inert by an unrecognised layout says so.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_TOOL_CALL_GRAMMAR** | bool | 1 (true) | On a request that declares tools and sets no `response_format`, hold each tool call to its tool's schema when the tool parser declares a grammar for its format (Kimi-K3: a call cannot close before its required arguments). Needs the `atom[structured-output]` extra; without it, or where structured output cannot run (P/D, relaxed MTP, custom stop strings, speculative logprobs), the output stays unconstrained. `0` turns it off. |
+| **ATOM_TOOL_CALL_GRAMMAR** | bool | 0 (false) | `1`: on a chat request that declares tools and sets no `response_format`, hold each tool call to its tool's schema when the tool parser declares a grammar for its format (Kimi-K3: a call cannot close before its required arguments). Needs the `atom[structured-output]` extra. Where it cannot apply -- extra not installed, P/D, relaxed MTP, custom stop strings, speculative logprobs, a schema that fails the structured-output safety checks, or a grammar that fails to prepare -- the output stays unconstrained. Off by default: every constrained request computes a CPU token mask per decode position. |
 
 ## Engram (DeepSeek-V4.1)
 

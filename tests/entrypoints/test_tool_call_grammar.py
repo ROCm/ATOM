@@ -154,6 +154,96 @@ def test_non_string_argument_follows_its_schema():
     assert feed(m, head + arg("seconds", "3", kind="number") + "<|close|>call<|sep|>")
 
 
+HEAD = THOUGHT + '<|open|>tools<|sep|><|open|>call tool="t" index="1"<|sep|>'
+END_CALL = "<|close|>call<|sep|>"
+
+
+def tool(parameters):
+    return {"type": "function", "function": {"name": "t", "parameters": parameters}}
+
+
+def test_required_key_outside_properties_stays_required():
+    m = matcher([tool({"type": "object", "required": ["path"]})])
+    assert feed(m, HEAD)
+    assert not allowed(m, CLOSE)
+    assert feed(m, arg("path", "a") + END_CALL)
+
+
+def test_undeclared_key_rule_cannot_reuse_a_declared_key():
+    # SLEEP leaves additionalProperties open; `seconds` must still be a number.
+    m = matcher([SLEEP])
+    head = THOUGHT + '<|open|>tools<|sep|><|open|>call tool="sleep" index="1"<|sep|>'
+    assert not feed(m, head + arg("seconds", "soon"))
+    m = matcher([SLEEP])
+    assert feed(m, head + arg("seconds", "3", kind="number") + arg("note", "x"))
+
+
+def test_string_enum_is_held_to_its_literals():
+    m = matcher(
+        [
+            tool(
+                {
+                    "type": "object",
+                    "properties": {"mode": {"enum": ["r", "w"], "type": "string"}},
+                }
+            )
+        ]
+    )
+    assert not feed(m, HEAD + arg("mode", "x"))
+    m = matcher(
+        [
+            tool(
+                {
+                    "type": "object",
+                    "properties": {"mode": {"enum": ["r", "w"], "type": "string"}},
+                }
+            )
+        ]
+    )
+    assert feed(m, HEAD + arg("mode", "w") + END_CALL)
+
+
+@pytest.mark.parametrize("bare", [False, True])
+def test_refs_resolve_against_the_parameters_definitions(bare):
+    edit = {
+        "type": "object",
+        "properties": {"line": {"type": "integer"}},
+        "required": ["line"],
+    }
+    ref = {"$ref": "#/$defs/Edit"}
+    prop = ref if bare else {"type": "array", "items": ref}
+    params = {"type": "object", "properties": {"edits": prop}, "$defs": {"Edit": edit}}
+    kind, good, bad = (
+        ("object", '{"line": 1}', '{"line": "x"}')
+        if bare
+        else ("array", '[{"line": 1}]', '[{"line": "x"}]')
+    )
+    m = matcher([tool(params)])
+    assert feed(m, HEAD + arg("edits", good, kind=kind) + END_CALL)
+    m = matcher([tool(params)])
+    assert not feed(m, HEAD + arg("edits", bad, kind=kind))
+
+
+def test_json_block_argument_form_is_refused():
+    # KimiK3Parser reads argument tags only; a JSON block would reach the client as {}.
+    m = matcher([WRITE])
+    assert not feed(m, THOUGHT + CALL_HEAD + '<|open|>json type="object"<|sep|>')
+
+
+def test_unsafe_schema_raises_before_any_grammar():
+    unsafe = {
+        "type": "object",
+        "properties": {
+            "p": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "(a{1,1000}){1,1000}"},
+            }
+        },
+    }
+    with pytest.raises(ValueError):
+        validation.tool_call_grammar_format(KimiK3Parser, [tool(unsafe)], "auto", True)
+
+
 def test_named_choice_allows_only_that_tool_and_requires_a_call():
     choice = {"type": "function", "function": {"name": "sleep"}}
     m = matcher([WRITE, SLEEP], choice)
@@ -190,6 +280,12 @@ def test_tiktoken_fingerprint_tracks_the_mapping_and_stops():
     assert base != manager.tokenizer_fingerprint(other, [EOS])
 
 
+@pytest.fixture
+def grammar_on(monkeypatch):
+    monkeypatch.setenv("ATOM_TOOL_CALL_GRAMMAR", "1")
+    validation._uncompilable_tool_grammars.clear()
+
+
 def _params():
     return NS(
         json_schema=None,
@@ -202,55 +298,90 @@ def _params():
     )
 
 
-def _configure(params, engine, **kwargs):
+OFFLOAD = NS(
+    kv_transfer_config={"kv_connector": "lmcache_offload", "kv_role": "kv_both"}
+)
+
+
+def _configure(params, engine, config=OFFLOAD, tools=(WRITE,), **kwargs):
     return asyncio.run(
         validation.configure_tool_call_grammar(
             engine,
-            NS(kv_transfer_config={"kv_role": "offload"}),
+            config,
             params,
             ReasoningChannel(starts_open=True),
             parser_cls=KimiK3Parser,
-            tools=[WRITE],
+            tools=list(tools),
             tool_choice="auto",
             **kwargs,
         )
     )
 
 
-def test_configure_keys_the_request_and_admits_local_kv_offload():
+def _recorder(calls):
+    return NS(prepare_structured_request=lambda *args: calls.append(args))
+
+
+def test_configure_keys_the_request_and_admits_kv_offload(grammar_on):
     calls = []
-    engine = NS(prepare_structured_request=lambda *args: calls.append(args))
     params = _params()
-    assert _configure(params, engine)
+    assert _configure(params, _recorder(calls))
     assert params.json_schema == validation.TOOL_CALL_GRAMMAR_SCHEMA
     assert json.loads(params.structured_tool_format)["kind"] == "lark"
     assert params.required_channel is None and len(calls) == 1
 
 
-@pytest.mark.parametrize("case", ["multimodal", "stop", "disabled", "missing"])
-def test_requests_that_cannot_run_a_grammar_stay_unconstrained(case, monkeypatch):
+def test_off_by_default():
     calls = []
-    engine = NS(prepare_structured_request=lambda *args: calls.append(args))
+    params = _params()
+    assert not _configure(params, _recorder(calls))
+    assert params.json_schema is None and not calls
+
+
+def test_offload_admits_response_format_and_p_d_still_refuses():
+    params = _params()
+    validation.validate_execution_options(OFFLOAD, params)
+    p_d = NS(kv_transfer_config={"kv_connector": "moriio", "kv_role": "kv_producer"})
+    with pytest.raises(ValueError, match="P/D"):
+        validation.validate_execution_options(p_d, params)
+
+
+@pytest.mark.parametrize("case", ["multimodal", "stop", "p_d", "missing", "unsafe"])
+def test_requests_that_cannot_run_a_grammar_stay_unconstrained(
+    case, grammar_on, monkeypatch
+):
+    calls = []
     params = _params()
     kwargs = {}
     if case == "multimodal":
         kwargs["multimodal"] = True
     elif case == "stop":
         params.stop_strings = ["END"]
-    elif case == "disabled":
-        monkeypatch.setenv("ATOM_TOOL_CALL_GRAMMAR", "0")
-    else:
+    elif case == "p_d":
+        kwargs["config"] = NS(kv_transfer_config={"kv_connector": "moriio"})
+    elif case == "missing":
         monkeypatch.setattr(validation.structured_output, "available", lambda: False)
-    assert not _configure(params, engine, **kwargs)
+    else:
+        bad = {"type": "string", "pattern": "(a{1,1000}){1,1000}"}
+        kwargs["tools"] = [tool({"type": "object", "properties": {"p": bad}})]
+    assert not _configure(params, _recorder(calls), **kwargs)
     assert params.json_schema is None and params.required_channel == "held"
     assert not calls
 
 
-def test_grammar_compile_failure_falls_back_to_unconstrained():
-    def refuse(*args):
-        raise ValueError("unsupported schema keyword")
+@pytest.mark.parametrize("error", [ValueError, TimeoutError])
+def test_preparation_failure_falls_back_and_only_compile_errors_are_remembered(
+    error, grammar_on
+):
+    calls = []
 
-    params = _params()
-    assert not _configure(params, NS(prepare_structured_request=refuse))
-    assert params.json_schema is None and params.structured_tool_format is None
-    assert params.required_channel == "held"
+    def refuse(*args):
+        calls.append(args)
+        raise error("worker said no")
+
+    for _ in range(2):
+        params = _params()
+        assert not _configure(params, NS(prepare_structured_request=refuse))
+        assert params.json_schema is None and params.structured_tool_format is None
+        assert params.required_channel == "held"
+    assert len(calls) == (1 if error is ValueError else 2)

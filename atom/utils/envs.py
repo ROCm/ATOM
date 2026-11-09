@@ -1051,7 +1051,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Hold tool calls to the declared schemas when the tool parser declares a
     # grammar for them (Kimi-K3) and the structured-output extra is installed.
     "ATOM_TOOL_CALL_GRAMMAR": lambda: (
-        os.getenv("ATOM_TOOL_CALL_GRAMMAR", "1").lower() == "1"
+        os.getenv("ATOM_TOOL_CALL_GRAMMAR", "0").lower() == "1"
     ),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
