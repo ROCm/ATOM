@@ -1086,6 +1086,9 @@ class ParallelConfig:
 
     data_parallel_base_port: int = 0
     """Model-runner rendezvous port. Zero requests an OS-assigned port locally."""
+    server_instance_id: str = ""
+    """Tells this server apart from others on the host. Set by ``CoreManager``
+    before it spawns the engines; empty outside it."""
     _managed_distributed_store: bool = field(default=False, init=False, repr=False)
     """CoreManager owns the store; every model runner connects as a client."""
 

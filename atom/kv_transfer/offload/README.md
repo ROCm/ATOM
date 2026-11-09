@@ -1183,16 +1183,15 @@ Under `--kv_cache_dtype fp8`, each KV block carries its own `k_scale` / `v_scale
 (`dense/kv_byte_codec.py`). The scales travel with the quantized data, so a
 reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 
-### Multimodal prompts: seeded keys
+### Multimodal prompts: salted keys
 
-Image placeholder ids are the same for every picture, so the lookup, save and
-load requests `ChunkedOffloadSchedulerBase` builds (in-process
-`lmcache_offload` and `lmcache_mp`, including the native-state lookup) and the
-DSV4 PAGE+SLOT scheduler key their ids through `tier_token_ids(seq, end)`
-(`_offload_common.py`): the first 4 ids of a prompt with a `cache_seed` become
-digests of `(cache_seed, position, id)` with bit 31 set, off every vocabulary
-id. Text prompts key unchanged. DSV4's SLOT boundary hashes start from the same
-`cache_seed`, as `BlockManager`'s chain does.
+Image placeholder ids are the same for every picture, so a prompt with a
+`cache_seed` keys its tier objects by it as well (`tier_cache_salt`,
+`_offload_common.py`): `lmcache_mp` as `IPCCacheServerKey.cache_salt`, the
+in-process engine as the `lmcache.tag.cache_salt` key tag. Lookups, saves and
+loads of the chunked schedulers and of DSV4 PAGE+SLOT carry it. Text prompts
+key unchanged. DSV4's SLOT boundary hashes start from the same `cache_seed`, as
+`BlockManager`'s chain does; Mooncake seeds its chain (`chain_seed`).
 
 ### Invariants enforced in code
 
@@ -1426,7 +1425,7 @@ env var. This per-thread isolation is exactly why load and save never contend.
   TP>1. `build_lmcache_metadata()` fills `kv_shape` from `hf_config` and pins a
   shared `engine_id` so the scheduler's lookup client and the workers' lookup
   servers derive the **same** ZMQ socket path, one per server
-  (`data_parallel_base_port`) and DP rank.
+  (`server_instance_id`) and DP rank.
 - **`metadata.py`** — `ATOMRawBytesLMCacheMetadata` overrides LMCache's allocation
   to hand out opaque `uint8` MemoryObjs (`get_shapes` returns
   `nblocks × bytes_per_block`) and asserts

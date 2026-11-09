@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from atom.kv_transfer.offload import config as offcfg
@@ -322,15 +322,37 @@ def _make_scheduler_adapter(
 
     num_kv_readers = _tp_replication_factor(config)
 
-    class _ReaderAwareSchedulerAdapter(AtomMPSchedulerAdapter):
-        """Reserve one LMCache read lock for every collapsed TP consumer."""
+    class _SaltedSchedulerAdapter(AtomMPSchedulerAdapter):
+        """Salt a session's keys with its prompt's media, and reserve one
+        LMCache read lock for every collapsed TP consumer."""
 
-        def _create_key(self, *args: Any, **kwargs: Any) -> Any:
-            key = super()._create_key(*args, **kwargs)
-            return replace(key, num_kv_readers=num_kv_readers)
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            # session -> `tier_cache_salt`, for salted prompts only.
+            self.cache_salts: dict[str, str] = {}
+
+        def _create_key(
+            self,
+            token_ids: list[int],
+            start: int,
+            end: int,
+            request_id: str,
+            worker_id: int | None,
+        ) -> Any:
+            key = super()._create_key(token_ids, start, end, request_id, worker_id)
+            key = replace(key, num_kv_readers=num_kv_readers)
+            salt = self.cache_salts.get(request_id)
+            return replace(key, cache_salt=salt) if salt else key
+
+        def salt_session(self, request_id: str, salt: str) -> None:
+            self.cache_salts[request_id] = salt
+
+        def end_session(self, request_id: str) -> None:
+            self.cache_salts.pop(request_id, None)
+            super().end_session(request_id)
 
     extra = _extra_config(config)
-    return _ReaderAwareSchedulerAdapter(
+    return _SaltedSchedulerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
         model_name=_model_namespace(
@@ -348,8 +370,15 @@ def _make_worker_adapter(
     import zmq
     from lmcache.integration.atom import AtomMPWorkerAdapter
 
+    class _SaltedWorkerAdapter(AtomMPWorkerAdapter):
+        """Salt a transfer's keys with its prompt's media (`TransferSpec`)."""
+
+        def _create_key(self, request_id: str, spec: Any) -> Any:
+            key = super()._create_key(request_id, spec)
+            return replace(key, cache_salt=spec.cache_salt)
+
     extra = _extra_config(config)
-    return AtomMPWorkerAdapter(
+    return _SaltedWorkerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
         model_name=_model_namespace(
@@ -361,3 +390,15 @@ def _make_worker_adapter(
         heartbeat_interval=float(extra.get("lmcache.mp.heartbeat_interval", 10.0)),
         transfer_mode=_transfer_mode(config),
     )
+
+
+@dataclass
+class TransferSpec:
+    """What LMCache's ATOM adapter reads off an `AtomMPTransferSpec`, plus the
+    prompt's media (`LMCacheReqMeta.cache_salt`) for the key."""
+
+    token_ids: list[int]
+    block_ids: list[list[int]]
+    start: int
+    end: int
+    cache_salt: str = ""

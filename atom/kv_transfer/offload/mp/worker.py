@@ -33,6 +33,7 @@ from atom.kv_transfer.offload.chunked_scheduler import (
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
 from atom.kv_transfer.offload.mp.deployment import (
+    TransferSpec,
     _make_worker_adapter,
     _mp_session_id,
     _published_tp_replication_factor,
@@ -372,8 +373,6 @@ class LMCacheMPConnector(KVConnectorBase):
         return block_ids
 
     def _submit_load(self, req: LMCacheReqMeta, event: Any) -> None:
-        from lmcache.integration.atom import AtomMPTransferSpec
-
         assert req.load_spec is not None
         completion = req.load_operation or req.req_id
         request_id = _mp_session_id(self._config, req.req_id)
@@ -401,11 +400,12 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"({self.chunk_size})"
                 )
             block_ids = self._block_slice(req, start, end)
-            op = AtomMPTransferSpec(
+            op = TransferSpec(
                 token_ids=list(req.token_ids),
                 block_ids=[block_ids],
                 start=start,
                 end=end,
+                cache_salt=req.cache_salt,
             )
         except Exception:
             # Nothing was sent: the failure is provable and terminal.
@@ -445,8 +445,6 @@ class LMCacheMPConnector(KVConnectorBase):
             )
 
     def _submit_save(self, req: LMCacheReqMeta, event: Any) -> None:
-        from lmcache.integration.atom import AtomMPTransferSpec
-
         assert req.save_spec is not None
         completion = req.save_operation or req.req_id
         request_id = _mp_session_id(self._config, req.req_id)
@@ -489,11 +487,12 @@ class LMCacheMPConnector(KVConnectorBase):
             return
         try:
             block_ids = self._block_slice(req, start, end)
-            op = AtomMPTransferSpec(
+            op = TransferSpec(
                 token_ids=list(req.token_ids),
                 block_ids=[block_ids],
                 start=start,
                 end=end,
+                cache_salt=req.cache_salt,
             )
         except Exception:
             # Nothing was sent: report a terminal failure so the save settles.

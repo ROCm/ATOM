@@ -20,6 +20,7 @@ from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import max_pending_saves
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, NativeStateTransfer
 from atom.kv_transfer.offload.mp.deployment import (
+    TransferSpec,
     _make_worker_adapter,
     _mp_session_id,
     _published_tp_replication_factor,
@@ -65,6 +66,12 @@ def stores_state_images(replay_tokens: int) -> bool:
     return not replay_tokens
 
 
+def restore_slot_count(max_pending_saves: int) -> int:
+    """Restore descriptor slots a native-state worker holds. The scheduler
+    dispatches no more image loads than this (`lookup_pending`)."""
+    return max(2, max_pending_saves)
+
+
 def require_native_state_server(adapter: Any, config: Any) -> None:
     """Validate native transfer geometry shared with the LMCache server."""
     configured_chunk = int(
@@ -86,6 +93,9 @@ class _NativePending:
     descriptor_slot: int | None = None
     immediate_success: bool = False
     started_at: float = field(default_factory=lambda: time.monotonic())
+    # The restore's own clock, from `_begin_restore`: the host enqueues it only
+    # between forwards, however long after the retrieve finished.
+    restore_started_at: float = 0.0
 
 
 class NativeStateLMCacheMPConnector(LMCacheMPConnector):
@@ -169,7 +179,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         self._native_copy = native_copy
         self._restore_stream = torch.cuda.Stream(device=torch.cuda.current_device())
         self._restore_descriptor_slots = list(
-            range(1, max(2, self._max_pending_saves) + 1)
+            range(1, restore_slot_count(self._max_pending_saves) + 1)
         )
         # Pinned staging allocation synchronizes the device. Reserve every
         # restore slot now, at registration, rather than on the connector
@@ -233,8 +243,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         return [pages] + [[-1] * (count - 1) + [unit] for unit in unit_ids]
 
     def _submit_native(self, req: LMCacheReqMeta, event: Any, *, loading: bool) -> None:
-        from lmcache.integration.atom import AtomMPTransferSpec
-
         completion = req.load_operation if loading else req.save_operation
         if completion is None:
             raise ValueError(
@@ -277,11 +285,12 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             )
             try:
                 groups = self._native_block_ids(req, start, end, loading=loading)
-                spec = AtomMPTransferSpec(
+                spec = TransferSpec(
                     token_ids=list(req.token_ids),
                     block_ids=groups,
                     start=start,
                     end=end,
+                    cache_salt=req.cache_salt,
                 )
             except Exception:
                 logger.exception(
@@ -359,9 +368,8 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 logger.exception("LMCache MP native restore failed")
             finally:
                 event.record(self._restore_stream)
-        # The retrieve is terminal, so the deadline now bounds only this copy,
-        # not whatever the host ran before polling it.
-        pending.started_at = time.monotonic()
+        # Bounds the copy and the compute queued ahead of it (`wait_stream`).
+        pending.restore_started_at = time.monotonic()
         return True
 
     def _emit_page_source_safe(
@@ -503,7 +511,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             return False
         if not restored:
             _enforce_transfer_deadline(
-                operation_id, pending.started_at, self._transfer_deadline_s
+                operation_id, pending.restore_started_at, self._transfer_deadline_s
             )
         return restored
 
