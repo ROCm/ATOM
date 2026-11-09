@@ -273,3 +273,88 @@ def test_dispatch_selects_gfx1250_runner(monkeypatch):
 
     wrapped = MonoDecodeModel(object())
     assert wrapped._mono._create() is sentinel
+
+
+def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch):
+    rows, layer_id = 2, 3
+    tensor = lambda *shape, dtype=torch.float32: torch.zeros(shape, dtype=dtype)  # noqa: E731
+    weight = SimpleNamespace(
+        write_idx=-1,
+        blocks=2,
+        w_gate=tensor(4, 4),
+        w_ld=tensor(4, 4),
+        w_sgu=tensor(4, 4),
+        bias=tensor(4),
+        w_sd=tensor(4, 4),
+        w13=tensor(8, dtype=torch.uint8),
+        w13s=tensor(4, dtype=torch.uint8),
+        w2=tensor(8, dtype=torch.uint8),
+        w2s=tensor(4, dtype=torch.uint8),
+        ln_w=tensor(4),
+        w_up=tensor(4, 4),
+        ln_eps=1e-6,
+    )
+    names = (
+        "router_logits", "latent_fp4", "latent_scales", "shared_gate_up",
+        "shared_hidden", "route", "tile_route", "flags", "experts", "kof",
+        "union_sizes", "intermediate_fp4", "intermediate_scales", "routed",
+        "shared", "finish_scratch", "final",
+    )
+    buffers = {name: tensor(rows, 4, dtype=torch.uint8) for name in names}
+    calls = {}
+
+    def recorder(name):
+        return SimpleNamespace(
+            launcher=lambda *args, **_kwargs: calls.setdefault(name, args)
+        )
+
+    local = SimpleNamespace(
+        front=recorder("front"),
+        finish=recorder("finish"),
+        finalize=recorder("finalize"),
+        buffers=buffers,
+        grouped_experts=True,
+    )
+    x = tensor(rows, 4)
+    experts = SimpleNamespace(w13_weight_scale=tensor(2), w2_weight_scale=tensor(2))
+    layer = SimpleNamespace(
+        mlp_attn_res=lambda _prefix, _blocks, _attn: (x, tensor(rows, 4)),
+        block_sparse_moe=SimpleNamespace(
+            experts=experts, routed_expert_norm=lambda value: value
+        ),
+    )
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.rank = 0
+    runner.routed = {layer_id: weight}
+    runner.inner = SimpleNamespace(layers={layer_id: layer})
+    group = SimpleNamespace(
+        all_reduce=lambda value, ca_fp8_quant=False: value,
+        all_gather=lambda *_args, **_kwargs: pytest.fail("no all-gather"),
+    )
+    monkeypatch.setattr(runner_module, "get_tp_group", lambda: group)
+    monkeypatch.setattr(runner_module.torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(
+        runner_module,
+        "fused_moe",
+        lambda *args, **kwargs: calls.setdefault("moe", (args, kwargs)),
+    )
+    build = SimpleNamespace(k2={layer_id: local})
+    plan = SimpleNamespace(layer_id=layer_id)
+
+    runner._routed_k2(build, plan, tensor(rows, 4), tensor(rows, 4), tensor(rows, 3, 4))
+
+    assert calls["front"][:5] == (
+        x.data_ptr(),
+        weight.w_gate.data_ptr(),
+        weight.w_ld.data_ptr(),
+        weight.w_sgu.data_ptr(),
+        buffers["router_logits"].data_ptr(),
+    )
+    assert calls["finish"][0] == buffers["router_logits"].data_ptr()
+    args, kwargs = calls["moe"]
+    assert args[0].data_ptr() == buffers["latent_fp4"].data_ptr()
+    assert args[3] is buffers["tile_route"] and args[4] is buffers["route"]
+    assert kwargs["a1_scale"] is buffers["latent_scales"]
+    assert kwargs["w1_scale"] is experts.w13_weight_scale
+    assert kwargs["output"] is buffers["routed"]
+    assert calls["finalize"][0] == buffers["routed"].data_ptr()

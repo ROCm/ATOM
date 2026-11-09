@@ -190,11 +190,17 @@ def build_packed_finish(
     gu_interleave: bool = False,
     include_shared: bool = True,
     include_routed: bool = True,
+    replicated_front: bool = False,
     local_union: bool | None = None,
 ) -> K2FinishKernel:
     """Without ``include_routed`` the routed experts are left to AITER's grouped
     MoE: ``route`` and ``tile_route`` then receive contiguous [rows, 16] expert
-    ids and weights, and ``latent_scales`` one E8M0 byte per 32-column group."""
+    ids and weights, and ``latent_scales`` one E8M0 byte per 32-column group.
+    After a ``replicated_front`` there is no gathered payload: ``front_gathered``
+    is the rank's [rows, EXPERTS] f32 router logits and the latent planes are
+    already in place."""
+    if replicated_front and include_routed:
+        raise ValueError("a replicated front feeds only the grouped-MoE finish")
     if plan.architecture is not GFX1250:
         raise ValueError("persistent K2 finish requires gfx1250")
     if plan.threads != THREADS or plan.waves != WAVES:
@@ -269,6 +275,7 @@ def build_packed_finish(
         f"k3_k2_gfx1250_persistent_finish_s{rows}_b{plan.blocks}"
         f"_gu{int(gu_interleave)}_sh{int(include_shared)}"
         f"_pq_u{int(local_union)}_r{int(include_routed)}"
+        f"{'_rf' if replicated_front else ''}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -310,7 +317,7 @@ def build_packed_finish(
 
         stride = plan.blocks * THREADS
         # Rank-major compressed payload -> logical token-major FP4/scales.
-        total_words = rows * (LATENT // 8)
+        total_words = 0 if replicated_front else rows * (LATENT // 8)
         work = bid * THREADS + tid
         while work < total_words:
             token = work // (LATENT // 8)
@@ -332,7 +339,7 @@ def build_packed_finish(
             )
             bo.buffer_store(value, rsrc(latent_fp4), work)
             work = work + stride
-        total_scales = rows * (LATENT // 32)
+        total_scales = 0 if replicated_front else rows * (LATENT // 32)
         work = bid * THREADS + tid
         while work < total_scales:
             token = work // (LATENT // 32)
@@ -382,6 +389,7 @@ def build_packed_finish(
                 "put": _direct_put,
                 "peer": {"rlog_own": front_gathered},
                 "args": {"bias": router_bias},
+                "contiguous_logits": replicated_front,
                 **route_outputs,
             }
             # One CTA owns one token.  The old candidate serialized all rows

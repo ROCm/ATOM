@@ -94,6 +94,7 @@ def stage_route(c, token, front_payload_words=0):
     """Wave32 router/top-16 with the production key, tie, and sum order."""
 
     lane, wave, red = c["lane"], c["wave"], c["red"]
+    contiguous = "contiguous_logits" in c and c["contiguous_logits"]
     if wave == 0:
         per_lane = EXPERTS // GFX1250.wave_size
         scores = []
@@ -110,6 +111,8 @@ def stage_route(c, token, front_payload_words=0):
                     + token * (EXPERTS // 8)
                     + expert % (EXPERTS // 8)
                 )
+            if const_expr(contiguous):
+                location = token * EXPERTS + expert
             got = c["poll"](
                 [
                     (
