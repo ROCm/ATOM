@@ -58,6 +58,7 @@ from atom.kv_transfer.disaggregation import (
     KVConnectorOutput,
     kv_config_has_producer,
 )
+from atom.kv_transfer.offload.atom_lmcache_staging import set_compute_stream
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
@@ -5179,6 +5180,8 @@ class RapidServeModelRunner(ModelRunner):
             stream = self._prefill_streams[batch.cu_stream_fraction]
         else:
             stream = torch.cuda.current_stream()
+        # Offload staging runs on the stream the forward does.
+        set_compute_stream(stream)
         with torch.cuda.stream(stream):
             self._advance_forward_vars()
             self._gate_staging_reuse()

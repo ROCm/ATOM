@@ -379,6 +379,11 @@ def build_page_namespace(
             getattr(config, "speculative_config", None)
         ),
     }
+    # Snapshot at startup, before scheduler/worker config copies diverge.
+    # Needed even for PAGE-only offload, which has no checkpoint layout_id.
+    index_layout = getattr(config, "index_cache_layout", None)
+    if index_layout is not None:
+        document["index_cache_layout"] = index_layout
     canonical = json.dumps(
         document,
         sort_keys=True,
@@ -414,16 +419,7 @@ def build_lmcache_config(
         ValueError: If the local-disk path, capacity, or CPU staging capacity
             is incomplete, or asynchronous loading is requested.
     """
-    try:
-        from lmcache.inprocess.v1.config import LMCacheEngineConfig
-    except ModuleNotFoundError as exc:
-        if exc.name not in (
-            "lmcache.inprocess",
-            "lmcache.inprocess.v1",
-            "lmcache.inprocess.v1.config",
-        ):
-            raise
-        from lmcache.v1.config import LMCacheEngineConfig
+    from lmcache.v1.config import LMCacheEngineConfig
 
     cfg = LMCacheEngineConfig.from_env()
     # Every shard needs the lookup's pins and LRU touches. Rank-0-only lookup
@@ -667,17 +663,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     codec), but we fill them faithfully from hf_config so logging/keys are sane.
     """
     from aiter import dtypes
-
-    try:
-        from lmcache.inprocess.v1.metadata import LMCacheMetadata
-    except ModuleNotFoundError as exc:
-        if exc.name not in (
-            "lmcache.inprocess",
-            "lmcache.inprocess.v1",
-            "lmcache.inprocess.v1.metadata",
-        ):
-            raise
-        from lmcache.v1.metadata import LMCacheMetadata
+    from lmcache.v1.metadata import LMCacheMetadata
 
     from atom.models.utils import get_pp_indices
 

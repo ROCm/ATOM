@@ -70,6 +70,11 @@ def _make_mgr(
     mgr._rank_tokens = [0] * n_ranks
     mgr._seq_load = {}
     mgr._lb_lock = Lock()
+    mgr._backlog_unseen = [[] for _ in range(n_ranks)]
+    mgr._backlog_unseen_tokens = [0] * n_ranks
+    mgr._backlog_unsent = {}
+    mgr._backlog_unsent_tokens = [0] * n_ranks
+    mgr._backlog_popped = [0] * n_ranks
     return mgr
 
 
@@ -520,7 +525,7 @@ def test_dp_lb_strategies_constant():
         "round_robin",
         "least_requests",
         "least_tokens",
-        "store_tokens",
+        "share_cache",
     )
     assert "least_request" not in DP_LB_STRATEGIES  # guards against typos
 

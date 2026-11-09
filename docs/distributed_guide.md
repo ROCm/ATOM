@@ -206,7 +206,7 @@ The strategy is selected with `--dp-load-balance` (`Config.dp_load_balance`):
 | `round_robin` | none | Load-agnostic rotation (`cursor % n`). |
 | `least_requests` **(default)** | in-flight request count, then prompt-token load | `argmin((num_in_flight_reqs, in_flight_prompt_tokens))` — request count is primary; ties broken by the lighter prompt-token load, then the rotation cursor. |
 | `least_tokens` | combined token load per rank | `argmin(sum_prompt_tokens + ATOM_DP_LB_REQ_EQUIV * num_reqs)`. |
-| `store_tokens` | prefill each rank reports it has left, plus this request's own work | `argmin(rank_backlog + (prompt - shared_prefix_hit) + ATOM_DP_LB_REQ_EQUIV * num_reqs)`. Needs an offload tier every rank shares (`mooncake_store`, `lmcache_mp`). |
+| `share_cache` | prefill each rank reports it has left, plus this request's own work | `argmin(rank_backlog + (prompt - shared_prefix_hit) + ATOM_DP_LB_REQ_EQUIV * num_reqs)`. Needs an offload tier every rank shares (`mooncake_store`, `lmcache_mp`). |
 
 `least_requests` (the default) keeps the number of in-flight requests even
 across ranks — the dominant lever for DP-lockstep efficiency (equal request
@@ -221,7 +221,7 @@ decode-slot pressure. It helps most with heterogeneous prompt lengths under
 moderate load; with uniform-length requests it degenerates to `least_requests`.
 All strategies break ties with a round-robin cursor.
 
-`store_tokens` is for deployments whose offload tier is shared by every DP
+`share_cache` is for deployments whose offload tier is shared by every DP
 rank (one Mooncake Store, one LMCache MP server). Any rank can then load a
 prefix another rank computed, so a request's prefill work does not depend on
 where it lands and the router balances purely by work:
@@ -242,7 +242,7 @@ where it lands and the router balances purely by work:
 It needs `--enable_prefix_caching` and `ATOM_FRONTEND_PREFIX_HASH=1`, and is
 mutually exclusive with `ATOM_DP_SESSION_AFFINITY=1`. Pair it with a low
 `OFFLOAD_MIN_LOAD_TOKENS`/`OFFLOAD_MIN_SAVE_TOKENS` (e.g. 256-1024, so the tier
-holds what HBM holds) and `OFFLOAD_LOAD_STREAM_HIGH_PRIORITY=1`.
+holds what HBM holds).
 
 When `ATOM_DP_SESSION_AFFINITY=1`, session routing adds a cache-locality layer
 above the configured fallback strategy. A new correlation/session ID is placed
@@ -281,7 +281,7 @@ drained and warns if it is invoked while requests are still charged.
 - `ParallelConfig.data_parallel_rank` (int, default `0`): This rank's DP index.
 - `ParallelConfig.data_parallel_rank_local` (int, default `None`): Local DP rank on this node.
 - `Config.dp_load_balance` (str, default `"least_requests"`): DP routing strategy.
-- CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens,store_tokens}`
+- CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens,share_cache}`
 - Env: `ATOM_DP_LB_REQ_EQUIV` (int, default `512`): token-equivalent cost of one in-flight request for `least_tokens`.
 - Env: `ATOM_DP_DISPATCH_DEPTH` (int, default `0`): per-rank in-flight cap for lazy dispatch of an offline batch (`LLMEngine.generate` / `generate_multimodal`). Online API admission is unchanged. While it is positive, that offline routing balances on in-flight request count and ignores `round_robin` and `least_tokens`; init warns when `dp_load_balance` is not `least_requests`. A failed send returns the requests to the pending pool. `abort_request` removes a request that has not been sent yet.
 - Env: `ATOM_DP_SESSION_AFFINITY` (bool, default `0`): load-place each new

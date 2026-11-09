@@ -1598,7 +1598,15 @@ class BlockManager:
             return False
         if lowered and self._gated_hit(seq, lowered, chain) != lowered:
             return False
-        demand = probe.num_new_blocks + (hit_blocks - lowered)
+        # `probe.num_new_blocks` already counts a cached-free block of the hit
+        # as one to allocate: claiming it or taking a fresh one costs the same
+        # unit. Only a dropped block some request still holds is a new unit.
+        in_use = 0
+        for i in range(lowered, hit_blocks):
+            block_id = self.kv.lookup(chain[i])
+            if block_id != -1 and self.kv.is_used(block_id):
+                in_use += 1
+        demand = probe.num_new_blocks + in_use
         protected = chain[lowered - 1] if lowered else None
         if not self._has_page_units(demand, protected):
             return False

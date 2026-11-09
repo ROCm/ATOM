@@ -59,6 +59,7 @@ from atom.kv_transfer.offload._offload_common import (
     tokens_to_tensor,
     validated_kv_role,
 )
+from atom.kv_transfer.offload.atom_lmcache_staging import load_stream_priority
 from atom.kv_transfer.offload.hybrid.dsv4.codec import (
     HEADER_BYTES,
     DSV4CheckpointCodec,
@@ -1247,10 +1248,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         slot_codec, _, _ = self._require_slot_components()
         if slot_codec.device.type != "cuda":
             return None
-        from atom.kv_transfer.offload.atom_lmcache_staging import (
-            load_stream_priority,
-        )
-
         return torch.cuda.Stream(
             device=slot_codec.device, priority=load_stream_priority()
         )

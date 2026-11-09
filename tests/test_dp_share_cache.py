@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Unit tests for `--dp-load-balance store_tokens` (atom/model_engine/store_aware.py)
+# Unit tests for `--dp-load-balance share_cache` (atom/model_engine/store_aware.py)
 # and its CoreManager bookkeeping (rank-reported prefill backlog).
 
+import os
 from collections import deque
 from threading import Lock
 from types import SimpleNamespace
@@ -34,7 +35,7 @@ PREFIX = list(range(40_000))
 
 
 def test_strategy_is_registered():
-    assert "store_tokens" in DP_LB_STRATEGIES
+    assert "share_cache" in DP_LB_STRATEGIES
 
 
 def test_cold_prompt_goes_to_least_backlog():
@@ -89,32 +90,79 @@ def _bare_mgr(n=2):
     mgr._rank_tokens = [0] * n
     mgr._seq_load = {}
     mgr._lb_lock = Lock()
-    mgr._bl_report = [None] * n
-    mgr._bl_unseen = [deque() for _ in range(n)]
-    mgr._bl_unseen_tokens = [0] * n
-    mgr._bl_sent = [0] * n
-    mgr._bl_popped = [0] * n
+    mgr._backlog_report = [None] * n
+    mgr._backlog_unseen = [deque() for _ in range(n)]
+    mgr._backlog_unseen_tokens = [0] * n
+    mgr._backlog_sent = [0] * n
+    mgr._backlog_popped = [0] * n
+    mgr._backlog_unsent = {}
+    mgr._backlog_unsent_tokens = [0] * n
     return mgr
 
 
 def test_backlog_is_report_plus_unreported_charges():
     mgr = _bare_mgr()
     mgr._rank_tokens = [7, 9]
-    assert mgr._bl_effective_tokens_locked() == [7, 9]  # no report yet
+    assert mgr._backlog_effective_tokens_locked() == [7, 9]  # no report yet
     mgr._seq_load = {"a": (0, 1, 1_000), "b": (0, 1, 2_000), "c": (0, 1, 4_000)}
-    mgr._bl_note_sent_locked(0, [SimpleNamespace(id="a"), SimpleNamespace(id="b")])
-    mgr._bl_report[0] = (1, 300)  # rank 0 ingested "a" and has 300 left
-    mgr._bl_pop_seen_locked(0)
-    assert mgr._bl_effective_tokens_locked()[0] == 300 + 2_000
-    mgr._bl_note_sent_locked(0, [SimpleNamespace(id="c")])
-    mgr._bl_report[0] = (3, 50)
-    mgr._bl_pop_seen_locked(0)
-    assert mgr._bl_effective_tokens_locked()[0] == 50
+    mgr._backlog_note_sent_locked(0, [SimpleNamespace(id="a"), SimpleNamespace(id="b")])
+    mgr._backlog_report[0] = (1, 300)  # rank 0 ingested "a" and has 300 left
+    mgr._backlog_pop_seen_locked(0)
+    assert mgr._backlog_effective_tokens_locked()[0] == 300 + 2_000
+    mgr._backlog_note_sent_locked(0, [SimpleNamespace(id="c")])
+    mgr._backlog_report[0] = (3, 50)
+    mgr._backlog_pop_seen_locked(0)
+    assert mgr._backlog_effective_tokens_locked()[0] == 50
 
 
 def test_report_ahead_of_note_sent_does_not_double_count():
     mgr = _bare_mgr()
     mgr._seq_load = {"a": (1, 1, 5_000)}
-    mgr._bl_report[1] = (1, 5_000)  # the rank ingested "a" before we noted it
-    mgr._bl_note_sent_locked(1, [SimpleNamespace(id="a")])
-    assert mgr._bl_effective_tokens_locked()[1] == 5_000
+    mgr._backlog_report[1] = (1, 5_000)  # the rank ingested "a" before we noted it
+    mgr._backlog_note_sent_locked(1, [SimpleNamespace(id="a")])
+    assert mgr._backlog_effective_tokens_locked()[1] == 5_000
+
+
+def test_a_charged_seq_not_sent_yet_counts_for_the_next_one_of_its_batch():
+    mgr = _bare_mgr()
+    mgr._seq_load = {"a": (0, 1, 30_000), "b": (0, 1, 30_000)}
+    mgr._backlog_report = [(0, 0), (0, 0)]
+    first, second = SimpleNamespace(id="a"), SimpleNamespace(id="b")
+    mgr._backlog_note_charged_locked(first, 0)
+    assert mgr._backlog_effective_tokens_locked() == [30_000, 0]  # rank 1 is lighter
+    mgr._backlog_note_charged_locked(second, 1)
+    # Sending moves the charges to the unreported ones, none counted twice.
+    mgr._backlog_note_sent_locked(0, [first])
+    mgr._backlog_note_sent_locked(1, [second])
+    assert mgr._backlog_effective_tokens_locked() == [30_000, 30_000]
+    assert mgr._backlog_unsent == {} and mgr._backlog_unsent_tokens == [0, 0]
+
+
+def test_a_released_unsent_seq_gives_its_charge_back():
+    mgr = _bare_mgr()
+    mgr._seq_load = {"a": (0, 1, 30_000)}
+    mgr._backlog_report = [(0, 0), (0, 0)]
+    mgr._backlog_note_charged_locked(SimpleNamespace(id="a"), 0)
+    assert mgr._backlog_drop_unsent_locked("a") == 30_000
+    assert mgr._backlog_drop_unsent_locked("a") == 0  # idempotent
+    assert mgr._backlog_effective_tokens_locked() == [0, 0]
+
+
+def test_a_mooncake_store_tier_defaults_min_load_to_512(monkeypatch):
+    import json
+
+    from atom.model_engine.arg_utils import default_store_min_load_tokens
+
+    store = {"kv_connector": "mooncake_store", "kv_role": "offload"}
+    pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    for config in (store, {"kv_connector": "multi", "connectors": [pd, store]}):
+        monkeypatch.delenv("OFFLOAD_MIN_LOAD_TOKENS", raising=False)
+        default_store_min_load_tokens(json.dumps(config))
+        assert os.environ["OFFLOAD_MIN_LOAD_TOKENS"] == "512"
+    # Another tier keeps the global default, and a value the user set is kept.
+    monkeypatch.delenv("OFFLOAD_MIN_LOAD_TOKENS", raising=False)
+    default_store_min_load_tokens(json.dumps({"kv_connector": "lmcache_mp"}))
+    assert "OFFLOAD_MIN_LOAD_TOKENS" not in os.environ
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "2048")
+    default_store_min_load_tokens(json.dumps(store))
+    assert os.environ["OFFLOAD_MIN_LOAD_TOKENS"] == "2048"

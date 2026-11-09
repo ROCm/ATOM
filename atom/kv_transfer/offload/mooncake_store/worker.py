@@ -54,6 +54,11 @@ from atom.kv_transfer.offload._block_gpu_connector import (
     BlockGPUConnector,
 )
 from atom.kv_transfer.offload._offload_common import pp_aware_rank_and_world
+from atom.kv_transfer.offload.atom_lmcache_staging import (
+    compute_stream,
+    load_stream_priority,
+    set_compute_stream,
+)
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
@@ -237,8 +242,6 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     def register_kv_caches(
         self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
     ) -> None:
-        from atom.kv_transfer.offload.atom_lmcache_staging import set_compute_stream
-
         # The model runner's thread: its current stream is the forward's.
         if torch.cuda.is_available():
             set_compute_stream(torch.cuda.current_stream())
@@ -886,18 +889,13 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     # -- in-place copies ---------------------------------------------------
     def _in_place_stream(self) -> torch.cuda.Stream:
         """This copy thread's stream for in-place packs and unpacks."""
+        # The forward's stream when it is known, looked up each time: the
+        # runner may move to another.
+        shared = compute_stream()
+        if shared is not None:
+            return shared
         stream = getattr(self._in_place_tls, "stream", None)
         if stream is None:
-            from atom.kv_transfer.offload.atom_lmcache_staging import (
-                compute_stream,
-                load_stream_priority,
-            )
-
-            shared = compute_stream()
-            if shared is not None:
-                self._in_place_tls.stream = shared
-                return shared
-
             stream = torch.cuda.Stream(
                 device=self._codec.device, priority=load_stream_priority()
             )

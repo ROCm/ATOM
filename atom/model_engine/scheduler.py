@@ -971,6 +971,8 @@ class Scheduler:
         self._arrived_requests = 0
         self._local_prefill_coalescing = False
         self._inflight_prefix_wait: dict[int, int] = {}
+        # Tier loads started early, and the skip reasons of those not started.
+        self._early_load = EarlyLoadState()
         # This tick is the DP group's prefill step and this rank has none of its
         # own: EngineCore runs a dummy prefill instead of a decode.
         self.dummy_prefill = False
@@ -1057,6 +1059,26 @@ class Scheduler:
                 continue
             if self._unschedulable_reason(seq) is None:
                 yield seq
+
+    def _tier_loaded_tokens(self, seq: Sequence) -> int:
+        """Tokens of `seq` its tier load covers: the planned load boundary, or 0
+        once the load failed (the request then falls back to what HBM held)."""
+        if self._has_req_id(self.failed_recving_kv_req_ids, seq.id):
+            return 0
+        return int(getattr(seq, "offload_loaded_tokens", 0) or 0)
+
+    def pending_prefill_tokens(self, seq: Sequence, *, estimate: bool = False) -> int:
+        """Prefill tokens `seq` still has to compute on this rank (no side
+        effects): what follows its HBM hit and, for a request whose tier load is
+        in flight or done, what follows the loaded prefix. With `estimate`, a
+        request not allocated yet also counts the router's estimate of its
+        cached prefix (`dp_est_cached_tokens`)."""
+        cached = seq.num_cached_tokens
+        if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+            cached = max(cached, self._tier_loaded_tokens(seq))
+        elif estimate and not seq.block_table:
+            cached = max(cached, getattr(seq, "dp_est_cached_tokens", 0))
+        return max(0, seq.num_tokens - cached)
 
     def _still_loading(self, seq: Sequence) -> bool:
         """A remote/tier KV load still in flight: nothing to prefill yet."""
@@ -1402,7 +1424,7 @@ class Scheduler:
         # reported "not prefillable" while Phase 2 could admit a later
         # request, which then ran alone after a vacuous FIRE.
         examined = 0
-        lookup_skips = min(16, self.max_num_seqs)
+        lookup_skips = self._prefix_bypass_limit()
         for seq in self.waiting:
             if examined >= 4:
                 break
@@ -1446,6 +1468,11 @@ class Scheduler:
             # walk is memoised across ticks.
             return self.block_manager.can_allocate_memoized(seq) >= 0
         return False
+
+    def _prefix_bypass_limit(self) -> int:
+        """How many heads whose tier lookup is in flight Phase 2 walks past; the
+        prefillable-work probe must reach as far as Phase 2 does."""
+        return min(16, self.max_num_seqs)
 
     def _head_waits_on_tier_lookup(self, seq: Sequence) -> bool:
         """Whether Phase 2 would skip `seq` for its in-flight tier lookup
@@ -1541,12 +1568,12 @@ class Scheduler:
                 continue
             if seq.status == SequenceStatus.ABORTED:
                 continue
-            cached = seq.num_cached_tokens
-            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                if not self._tier_load_finished(seq):
-                    continue
-                cached = max(cached, int(getattr(seq, "offload_loaded_tokens", 0) or 0))
-            num_new_tokens = seq.num_tokens - cached
+            if (
+                seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+                and not self._tier_load_finished(seq)
+            ):
+                continue
+            num_new_tokens = self.pending_prefill_tokens(seq)
             if (
                 not self.enable_chunked_prefill
                 and num_new_tokens > self.max_num_batched_tokens
@@ -1647,6 +1674,18 @@ class Scheduler:
             self.kv_event_publisher.shutdown()
         except Exception:
             logger.exception("KV event publisher shutdown failed")
+
+    def close_kv_connector(self) -> None:
+        """Close the scheduler-side KV connector, if it holds threads or
+        sockets (the Mooncake Store's lookup executor). Called by EngineCore on
+        engine shutdown: a non-daemon thread left running keeps the process
+        alive at exit."""
+        close = getattr(self.kv_connector, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.exception("KV connector close failed")
 
     def is_finished(self):
         # `_rejected` must be considered too: if a batch of seqs is all
@@ -2289,7 +2328,7 @@ class Scheduler:
 
         # ---- Phase 2: new requests from waiting ----
         prefix_waiters: deque[Sequence] = deque()
-        prefix_bypass_left = min(16, self.max_num_seqs)
+        prefix_bypass_left = self._prefix_bypass_limit()
         # Early-loading requests held in `prefix_waiters` (they keep their place
         # but bound nothing: they are not waiting on a lookup).
         early_waiting = 0
@@ -4065,15 +4104,6 @@ class Scheduler:
     # Ticks before a request skipped for KV pressure is looked at again.
     _EARLY_LOAD_RETRY_TICKS = 8
 
-    @property
-    def _early_load(self) -> EarlyLoadState:
-        """Early-load bookkeeping. Created on first use, so schedulers built
-        without `__init__` (test doubles) work."""
-        state = self.__dict__.get("_early_load_state")
-        if state is None:
-            state = self.__dict__["_early_load_state"] = EarlyLoadState()
-        return state
-
     def _early_load_sweep(self, state: EarlyLoadState) -> None:
         """Drop early-load entries whose request is gone from `waiting`, and
         reclaim an aborted one at once: Phase 2 only pops it on a FIRE tick, and
@@ -4166,11 +4196,7 @@ class Scheduler:
         bm = getattr(self, "block_manager", None)
         total_blocks = int(bm.kv.num_blocks) if bm is not None else 0
         state.maybe_log(total_blocks)
-        if (
-            not envs.ATOM_OFFLOAD_EARLY_LOAD
-            or self.kv_connector is None
-            or not self._connector_flag("is_offload")
-        ):
+        if self.kv_connector is None or not self._connector_flag("is_offload"):
             return 0
         state.tick += 1
         if state.entries:
@@ -4182,7 +4208,6 @@ class Scheduler:
 
         watermark = envs.ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK
         max_frac = envs.ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC
-        allow_state = envs.ATOM_OFFLOAD_EARLY_LOAD_STATE
         chunk = int(getattr(self.kv_connector, "chunk_size", 0) or 0)
         hbs = bm.hash_block_size
         parked = 0
@@ -4218,10 +4243,6 @@ class Scheduler:
                 state.skip(seq.id, "unaligned_hbm")
                 state.settled.add(seq.id)
                 continue
-            if not allow_state and seq.has_per_req_cache and not seq.replays_hit:
-                state.skip(seq.id, "state_leg")
-                state.settled.add(seq.id)
-                continue
             # KV pressure. Counted only for a request that would load: one that
             # would not never reached here.
             need = bm.num_pool_blocks(len(seq))
@@ -4234,7 +4255,7 @@ class Scheduler:
                     state.skip(seq.id, "max_frac")
                     state.retry_at[seq.id] = state.tick + self._EARLY_LOAD_RETRY_TICKS
                     continue
-            if self._early_load_admit(seq, hbm_probe, needs_remote_load, allow_state):
+            if self._early_load_admit(seq, hbm_probe, needs_remote_load):
                 parked += 1
             else:
                 break  # the pool refused the allocation
@@ -4247,7 +4268,6 @@ class Scheduler:
         seq: Sequence,
         hbm_probe: AdmissionProbe,
         needs_remote_load: bool,
-        allow_state: bool,
     ) -> bool:
         """Phase 2's admission up to the park, for a request not at its turn.
 
@@ -4255,6 +4275,11 @@ class Scheduler:
         changed); True otherwise, whether the request parked or was taken back.
         The steps and their order are Phase 2's; what differs is that a result
         that would prefill locally (a refused load) is undone instead.
+
+        TODO: this repeats Phase 2's admission sequence (record, allocate,
+        draft lookahead, prefix-hit bookkeeping, connector notification, remote
+        load confirmation, park). Factor that sequence into one helper both
+        Phase 2 and this call, so the two cannot drift apart.
         """
         state = self._early_load
         prev_hit = seq.prefix_cache_hit_tokens
@@ -4293,9 +4318,6 @@ class Scheduler:
             self._early_load_take_back(seq, prev_hit)
             return True
         # else: a state-only load, which parks like a KV load (as in Phase 2).
-        if not allow_state and (oj.load_hash != -1 or oj.boundary_tokens):
-            self._early_load_take_back(seq, prev_hit)
-            return True
         # Stays where it is in `waiting`.
         self._park_for_remote_load(seq, deque())
         self._inflight_prefix_wait.pop(seq.id, None)
@@ -5340,34 +5362,39 @@ class Scheduler:
         ):
             return
 
+        # An early-loaded request keeps its place in line while the head can
+        # still allocate: it was not parked by the head of the queue, and moving
+        # it up would let it prefill ahead of earlier arrivals. When the head
+        # cannot allocate, it is promoted like any finished waiter: it owns
+        # blocks, and Phase 2 stops at a head that does not fit, so nothing else
+        # would ever free them.
+        early = self._early_load.entries
+
+        def finished(seq: Sequence) -> bool:
+            return seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS and (
+                self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
+                or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
+            )
+
+        queue = list(self.waiting)
+        head_blocked = False
+        if any(finished(seq) and seq.id in early for seq in queue):
+            head = next((seq for seq in queue if not finished(seq)), None)
+            head_blocked = (
+                head is not None
+                and head.status == SequenceStatus.WAITING
+                and self.block_manager.can_allocate_memoized(head) < 0
+            )
         ready: deque[Sequence] = deque()
         blocked: deque[Sequence] = deque()
-        # An early-loaded request keeps its place in line: it was not parked by
-        # the head of the queue, and moving it up would let it prefill ahead of
-        # earlier arrivals. (The deadlock this function guards against -- a
-        # fresh head that cannot allocate while a finished waiter behind it
-        # holds the blocks -- needs the waiters to hold most of the pool; the
-        # early ones are capped at ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC of it.)
-        early = self._early_load.entries
-        while self.waiting:
-            seq = self.waiting.popleft()
-            if (
-                seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-                and seq.id not in early
-                and (
-                    self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
-                    or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
-                )
-            ):
+        for seq in queue:
+            if finished(seq) and (seq.id not in early or head_blocked):
                 ready.append(seq)
             else:
                 blocked.append(seq)
-
-        if ready:
-            self.waiting.extend(ready)
-            self.waiting.extend(blocked)
-        else:
-            self.waiting.extend(blocked)
+        self.waiting.clear()
+        self.waiting.extend(ready)
+        self.waiting.extend(blocked)
 
     def _park_ready_offload_partial_prefills(self) -> None:
         if (

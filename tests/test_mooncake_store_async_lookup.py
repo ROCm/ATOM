@@ -58,18 +58,16 @@ def test_v41_page_path_does_not_admit_other_hybrid_models():
 def test_multi_prefetch_only_on_producer_not_decode_receiver():
     tier = SimpleNamespace(
         is_offload=True,
-        supports_async_lookup=True,
         chunk_size=256,
         lookup_ready=lambda s: True,
-        take_ready_lookup=lambda s: True,
     )
     m = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
     m._connectors = [SimpleNamespace(is_offload=False), tier]
     m.is_producer = True
-    assert m.supports_async_lookup and m.chunk_size == 256
-    assert m.lookup_ready(object()) and m.take_ready_lookup(object())
+    assert m.chunk_size == 256
+    assert m.lookup_ready(object())
     m.is_producer = False
-    assert not m.supports_async_lookup
+    assert m.chunk_size == 0
     assert not m.lookup_ready(object())
 
 

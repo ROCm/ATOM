@@ -1321,13 +1321,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Minimum external-tier hit worth loading, in tokens. And the shortest
     # prefix native lmcache_mp stores: an absolute boundary, for normal and
     # late saves alike (other connectors ignore it).
-    # Early tier load: a waiting request whose async lookup answered and that
-    # must load its prefix from the external tier gets its blocks and its load
-    # on any tick (prefill-delayer HOLD or FIRE), wherever it sits in `waiting`.
-    # Its prefill still waits for its turn and a FIRE. 1 (default): on, and a
-    # moved request is no longer queued first. 0: the old path (queue first,
-    # allocate and load only in the admission pass).
-    "ATOM_OFFLOAD_EARLY_LOAD": lambda: _flag_env("ATOM_OFFLOAD_EARLY_LOAD", "1"),
+    # Early tier load (a waiting request whose async lookup answered gets its
+    # blocks and its load on any scheduler tick): the KV-pressure bounds.
     # No early allocation once the KV pool would be fuller than this fraction.
     "ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK": lambda: _finite_float_env(
         "ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK", 0.7, allow_zero=True
@@ -1336,13 +1331,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
         "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
     ),
-    # Also load early when the load carries a state leg (state images / joint
-    # boundary). Off: only plain KV and PAGE-only (replay) loads go early.
-    "ATOM_OFFLOAD_EARLY_LOAD_STATE": lambda: _flag_env(
-        "ATOM_OFFLOAD_EARLY_LOAD_STATE", "1"
-    ),
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: max(
-        0, _int_env_or_default("OFFLOAD_MIN_LOAD_TOKENS", 512)
+        0, _int_env_or_default("OFFLOAD_MIN_LOAD_TOKENS", 8192)
     ),
     "OFFLOAD_MIN_SAVE_TOKENS": lambda: max(
         0, _int_env_or_default("OFFLOAD_MIN_SAVE_TOKENS", 8192)
@@ -1391,20 +1381,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
-    # Run offload staging (pack/unpack, H2D/D2H legs) on the forward's own
-    # stream instead of side streams, so offload kernels never run
-    # concurrently with forward kernels. Side streams can deadlock against a
-    # persistent (all-CU co-resident) kernel on ROCm; see
-    # `atom_lmcache_staging.compute_stream`. 0 restores the side streams.
-    "OFFLOAD_STAGING_ON_COMPUTE_STREAM": lambda: _flag_env(
-        "OFFLOAD_STAGING_ON_COMPUTE_STREAM", "1"
-    ),
-    # Give an offload load worker's transfer streams the device's highest
-    # priority, so a load's scatter kernels dispatch ahead of queued forward
-    # kernels instead of waiting behind them on a busy GPU.
-    "OFFLOAD_LOAD_STREAM_HIGH_PRIORITY": lambda: _flag_env(
-        "OFFLOAD_LOAD_STREAM_HIGH_PRIORITY", "1"
-    ),
     # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.
     # Unset derives the size from the KV geometry.
     "OFFLOAD_GPU_STAGING_CHUNKS": lambda: _optional_int_env(

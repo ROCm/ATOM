@@ -71,6 +71,8 @@ class _Engine:
     - `OFFLOAD`  RL rollout parked the weights; both loops skip the pass.
     """
 
+    _report_backlog = False
+
     def __init__(self, schedule, interval_steps=INTERVAL_STEPS):
         self._schedule = list(schedule)
         self._pass = -1
@@ -88,6 +90,7 @@ class _Engine:
             prefill_delayer=None,
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda: None,
+            close_kv_connector=lambda: None,
         )
         self.utility_queue = None
         self.utility_handler = SimpleNamespace(

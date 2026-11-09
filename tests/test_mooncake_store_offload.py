@@ -2944,7 +2944,9 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
             process_queue=lambda *_: None, push_metrics=lambda **_: None
         ),
         scheduler=SimpleNamespace(
-            publish_kv_events=lambda: None, shutdown_kv_events=lambda: None
+            publish_kv_events=lambda: None,
+            shutdown_kv_events=lambda: None,
+            close_kv_connector=lambda: None,
         ),
         runner_mgr=runner(stage_rpcs),
         pp_transport=SimpleNamespace(

@@ -242,6 +242,13 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         else:
             self._impl.cancel_pending_load(seq)
 
+    def close(self) -> None:
+        """Close the impl's lookup threads at scheduler teardown (the Mooncake
+        Store's); an impl without any has nothing to close."""
+        callback = getattr(self._impl, "close", None)
+        if callable(callback):
+            callback()
+
     def can_detach_lookup(self, seq, num_hbm_tokens: int) -> bool:
         callback = getattr(self._impl, "can_detach_lookup", None)
         return bool(callback(seq, num_hbm_tokens)) if callable(callback) else False

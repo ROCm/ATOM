@@ -1041,7 +1041,7 @@ def test_engine_unaligned_hbm_hit_replays_without_a_load(monkeypatch):
     assert list(batch.num_cached_tokens) == [12 - _REPLAY]
 
 
-# -- early tier load (ATOM_OFFLOAD_EARLY_LOAD) on the native-state engine ------
+# -- early tier load on the native-state engine ------
 
 
 class _EarlyDelayer:
@@ -1089,7 +1089,6 @@ def _async_adapter(chunks, base=Adapter):
 
 
 def _holding_engine(monkeypatch, adapter, **overrides):
-    monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD", "1")
     # A 40-block pool: the default 15% cap would not fit one prompt.
     monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", "0.9")
     monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK", "0.95")
@@ -1172,26 +1171,17 @@ def test_early_load_waits_for_an_answered_lookup(monkeypatch):
     _until_parked(engine, seq)
 
 
-def test_early_load_state_image_load_follows_the_state_flag(monkeypatch):
-    """Without a replay the load carries a state image. Off by default for it
-    (ATOM_OFFLOAD_EARLY_LOAD_STATE=0): the request waits for its admission
-    pass. On: it is parked early exactly as the admission pass would."""
-    for flag, early in (("0", False), ("1", True)):
-        monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD_STATE", flag)
-        adapter = _async_adapter(2)()
-        engine, _, delayer = _holding_engine(monkeypatch, adapter)
-        seq = Sequence(list(range(24)), 4, has_per_req_cache=True)
-        engine.add(seq)
-        for _ in range(4):
-            engine.schedule()
-        assert (seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS) is early
-        if early:
-            assert seq.state_slot >= 0 and len(seq.block_table) == 6
-        else:
-            assert not seq.block_table
-            delayer.allow = True  # a FIRE then parks it the old way
-            engine.schedule()
-            assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+def test_early_load_state_image_load_parks_early(monkeypatch):
+    """Without a replay the load carries a state image; it is parked early
+    exactly as the admission pass would park it."""
+    adapter = _async_adapter(2)()
+    engine, _, _ = _holding_engine(monkeypatch, adapter)
+    seq = Sequence(list(range(24)), 4, has_per_req_cache=True)
+    engine.add(seq)
+    for _ in range(4):
+        engine.schedule()
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert seq.state_slot >= 0 and len(seq.block_table) == 6
 
 
 def test_early_load_abort_gives_the_native_load_back(monkeypatch):

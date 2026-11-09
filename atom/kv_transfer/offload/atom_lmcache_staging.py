@@ -45,17 +45,17 @@ def memory_object_as_uint8(memory_obj: Any, nbytes: int) -> torch.Tensor:
 
 _LOAD_PRIORITY_LOGGED = False
 
-# The stream the forward runs on, recorded by the offload connector from the
-# model runner's thread (`set_compute_stream`). With
-# OFFLOAD_STAGING_ON_COMPUTE_STREAM (default on) transfer states created
-# afterwards run both staging legs on it.
+# The stream the forward runs on, recorded from the model runner's thread
+# (`set_compute_stream`) at registration, by the offload connector at each step
+# and by a runner that picks a stream per forward (the disaggregated prefill
+# pool). A transfer state that follows it runs both staging legs on it.
 _COMPUTE_STREAM = None
 
 
 def set_compute_stream(stream) -> None:
-    """Record the forward's stream once; later calls are no-ops."""
+    """Record the stream the forward runs on; the latest one wins."""
     global _COMPUTE_STREAM
-    if _COMPUTE_STREAM is None and stream is not None:
+    if stream is not None:
         _COMPUTE_STREAM = stream
 
 
@@ -70,26 +70,17 @@ def compute_stream():
     frozen for minutes, host-side event waits notwithstanding. On the
     forward's stream the transfers run between forward kernels instead.
     """
-    from atom.utils import envs
-
-    if not envs.OFFLOAD_STAGING_ON_COMPUTE_STREAM:
-        return None
     return _COMPUTE_STREAM
 
 
 def load_stream_priority() -> int:
     """Stream priority for a transfer stream created on the calling thread.
 
-    With OFFLOAD_LOAD_STREAM_HIGH_PRIORITY=1, streams created on a load worker
-    (thread name ``*-load_*``) get the device's highest priority, so a load's
+    Streams created on a load worker (thread name ``*-load_*``) get the device's highest priority, so a load's
     copy and scatter kernels are dispatched ahead of queued forward kernels.
     Save threads and everything else keep the default priority (0).
     """
     global _LOAD_PRIORITY_LOGGED
-    from atom.utils import envs
-
-    if not envs.OFFLOAD_LOAD_STREAM_HIGH_PRIORITY:
-        return 0
     if "-load" not in threading.current_thread().name:
         return 0
     _, greatest = torch.cuda.Stream.priority_range()
@@ -129,19 +120,26 @@ class _ThreadTransferState:
         use_cuda: bool,
     ) -> None:
         self.device = device
-        self.pack_stream = None
-        self.copy_stream = None
-        shared = compute_stream() if use_cuda else None
-        if shared is not None:
-            # One stream for both legs: `run_staged_pipeline` then skips the
-            # cross-stream handshake entirely.
-            self.pack_stream = self.copy_stream = shared
-        elif use_cuda:
+        self._pack_stream = None
+        self._copy_stream = None
+        # With the forward's stream known, both legs run on it, and follow it
+        # if the runner moves to another: `run_staged_pipeline` then skips the
+        # cross-stream handshake entirely.
+        self._follows_compute_stream = use_cuda and compute_stream() is not None
+        if use_cuda and not self._follows_compute_stream:
             priority = load_stream_priority()
             with torch.cuda.device(device):
-                self.pack_stream = torch.cuda.Stream(priority=priority)
-                self.copy_stream = torch.cuda.Stream(priority=priority)
+                self._pack_stream = torch.cuda.Stream(priority=priority)
+                self._copy_stream = torch.cuda.Stream(priority=priority)
         self.staging_buffer = _StagingBuffer(use_cuda)
+
+    @property
+    def pack_stream(self):
+        return compute_stream() if self._follows_compute_stream else self._pack_stream
+
+    @property
+    def copy_stream(self):
+        return compute_stream() if self._follows_compute_stream else self._copy_stream
 
     def stream_ctx(self, stream):
         if stream is None:

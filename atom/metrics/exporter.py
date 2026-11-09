@@ -156,20 +156,12 @@ class _AtomMetricsCollector:
 
         dp_router = snapshot.get("dp_router", {})
         for key, documentation in (
-            ("prefix_owner_total", "Requests retained on their known prefix owner."),
+            ("store_hit_total", "Requests placed on a prefix the shared tier holds."),
             (
-                "prefix_moved_total",
-                "Requests placed away from their known prefix owner.",
+                "store_source_rank_total",
+                "Requests placed on the rank still prefilling their prefix.",
             ),
-            ("prefix_cold_total", "Requests placed without a known prefix owner."),
-            (
-                "prefix_source_busy_total",
-                "Requests whose prefix source is still active.",
-            ),
-            (
-                "prefix_moved_tokens",
-                "Estimated prefix tokens on requests moved from their owner.",
-            ),
+            ("store_cold_total", "Requests placed without a known prefix."),
         ):
             name = "atom:dp_" + key.removesuffix("_total")
             metric = CounterMetricFamily(name, documentation)
