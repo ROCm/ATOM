@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The indexer's per-step arithmetic, defined once: the selection tree (lists a level, a list's inputs, task counts),
 the REINDEX layer's compacted context and key rows, and the scorer's task split.
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The routed MoE's per-step work split, defined once: which CTA / wave runs which UG unit, and where the shared
 expert's units go. Called by the kernel on traced Int32 / trace-time Python ints and by the CPU test on Python ints
 (the same code). Only non-negative operands reach ``//``."""

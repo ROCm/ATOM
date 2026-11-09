@@ -1,3 +1,4 @@
-# fmt: off
-"""The single-launch step's FlyDSL sources (flat modules: the runner puts this directory on sys.path).
-Copied by investigation/flydsl-atom-integration-20261107/sync_kernels.py -- do not edit here."""
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""The gfx1250 single-launch decode step's FlyDSL kernel: step.build (the step), its stage modules, and the shared
+layouts / plans (layout, index_plan, moe_plan). Flat modules: the runner puts this directory on sys.path."""

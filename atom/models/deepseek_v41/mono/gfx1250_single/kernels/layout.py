@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The step kernel's device-wide counters and its fixed LDS regions (byte offsets).
 
 Counters live in the ``cnt`` buffer (zeroed every step by the host): one block of LAYER_BYTES per layer (target layers,
