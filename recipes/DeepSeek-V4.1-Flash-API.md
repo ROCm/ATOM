@@ -8,8 +8,8 @@ Run inside an ATOM development container with ROCm, PyTorch and the matching AIT
 
 ```bash
 cd /path/to/ATOM
-git fetch origin lirzhang/v41-api-recipe-20261109
-git checkout -b v41-api-recipe origin/lirzhang/v41-api-recipe-20261109
+git switch main
+git pull --ff-only origin main
 python3 -m pip install -e '.[structured-output]'
 
 export MODEL_PATH=/models/deepseek-ai/DeepSeek-V4.1-Flash
@@ -30,7 +30,7 @@ python3 -m atom.entrypoints.openai_server \
   --max-num-batched-tokens 4096 --attn-prefill-chunk-size 4096 \
   --enable_prefix_caching --block-size 16 \
   --state-checkpoint-interval-tokens 8192 \
-  --level 0 --enforce-eager \
+  --level 0 \
   --tool-call-parser dsml_v41
 ```
 
@@ -51,10 +51,14 @@ From another host, replace `127.0.0.1` with the reachable server address. The la
 
 ## 2. Request examples
 
-The standalone request files are in [examples/deepseek-v41-api](examples/deepseek-v41-api). After starting the server, open a second shell and run:
+The standalone request files are in [examples/deepseek-v41-api](examples/deepseek-v41-api) on the documentation branch. Run the server from latest `main`; extract the examples into a separate client directory without switching the serving checkout:
 
 ```bash
-cd /path/to/ATOM/recipes/examples/deepseek-v41-api
+cd /path/to/ATOM
+git fetch origin lirzhang/v41-api-recipe-20261109
+mkdir -p /tmp/v41-api-examples
+git archive origin/lirzhang/v41-api-recipe-20261109 recipes/examples/deepseek-v41-api | tar -x -C /tmp/v41-api-examples
+cd /tmp/v41-api-examples/recipes/examples/deepseek-v41-api
 export BASE_URL=http://127.0.0.1:8000
 ```
 
@@ -618,12 +622,12 @@ curl -sS "$BASE_URL/v1/responses" \
 
 This declaration is accepted for Flash compatibility, but no search backend runs and no fresh web facts/citations are guaranteed. To implement real search, supply a normal client-executed function tool and return its results.
 
-## 3. Optional DSpark and graphs
+## 3. Optional DSpark
 
 After the basic service works, stop that instance and restart with:
 
 - DSpark: add `--method dspark --num-speculative-tokens 5`.
-- Graph execution: remove `--enforce-eager` and use the model recipe's supported graph settings. Keep `--level 0` for this starting recipe.
+The basic launch uses the default CUDA-graph configuration at `--level 0`. `--enforce-eager` is only an optional debugging flag to disable graphs when isolating a problem; it is not part of the normal launch.
 
 Keep forced/synthetic acceptance disabled. Ordinary Chat logprobs work with DSpark. JSON Schema and beta strict tools work with DSpark separately from logprobs; **Schema/strict tools + speculative decoding + logprobs is rejected**. Use the basic non-speculative launch if that combination is needed.
 
@@ -633,16 +637,16 @@ Access `/beta/*` directly on this Python API server. The beta route implementati
 
 ### Serving configuration
 
-Use the basic launch in section 1 with the full multimodal checkpoint. Keep `ATOM_MONO_ENABLE=0`, `--level 0` and `--enforce-eager` as a starting point. **Do not add `--method dspark` or `--enable-dp-attention` for images.** If you switched the service to DSpark for section 3, stop that instance and restart the basic service before sending images. The model rejects unsupported image deployments instead of answering from text alone.
+Use the basic launch in section 1 with the full multimodal checkpoint. Keep `ATOM_MONO_ENABLE=0` and `--level 0`; use the default graph configuration. **Do not add `--method dspark` or `--enable-dp-attention` for images.** If you switched the service to DSpark for section 3, stop that instance and restart the basic service before sending images. The model rejects unsupported image deployments instead of answering from text alone.
 
-The same native instance can handle ordinary text requests and images. Begin with one image request at a time; tune prefill chunks/concurrency only after checking visual answers on your workload. Eager mode is a starting configuration, not a guarantee of visual correctness.
+The same native instance can handle ordinary text requests and images. Begin with one image request at a time; tune prefill chunks/concurrency only after checking visual answers on your workload. Neither eager nor graph execution guarantees visual correctness.
 
 ### Ready-to-run local image examples
 
 The example directory includes `sample-red.png`, a generated red square, and request files for all three APIs. The client sends image bytes; it does not ask the server to read your local path.
 
 ```bash
-cd /path/to/ATOM/recipes/examples/deepseek-v41-api
+cd /tmp/v41-api-examples/recipes/examples/deepseek-v41-api
 export BASE_URL=http://127.0.0.1:8000
 
 curl -sS "$BASE_URL/v1/chat/completions" \
