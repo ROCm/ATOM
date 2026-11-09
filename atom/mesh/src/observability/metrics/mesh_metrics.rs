@@ -28,7 +28,7 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
     let socket_addr = SocketAddr::new(ip_addr, config.port);
 
-    PrometheusBuilder::new()
+    let mut builder = PrometheusBuilder::new()
         .with_http_listener(socket_addr)
         .upkeep_timeout(Duration::from_secs(5 * 60))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
@@ -37,7 +37,13 @@ pub fn start_prometheus(config: PrometheusConfig) {
             Matcher::Full(schema::names::ROUTER_TTFT_SECONDS.to_string()),
             &duration_bucket,
         )
-        .expect("failed to set TTFT buckets")
+        .expect("failed to set TTFT buckets");
+    for (name, buckets) in schema::ROUTE_HISTOGRAM_BUCKETS {
+        builder = builder
+            .set_buckets_for_metric(Matcher::Full((*name).to_string()), buckets)
+            .expect("failed to set routing buckets");
+    }
+    builder
         .install()
         .expect("failed to install Prometheus metrics exporter");
 }

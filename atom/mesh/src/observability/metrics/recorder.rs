@@ -446,6 +446,105 @@ impl MeshMetrics {
         .increment(1);
     }
 
+    /// Record the branch a routing policy took for one selection.
+    pub fn record_route_branch(pool: &'static str, policy: &'static str, branch: &'static str) {
+        counter!(
+            names::ROUTE_BRANCH_TOTAL,
+            "pool" => pool,
+            "policy" => policy,
+            "branch" => branch
+        )
+        .increment(1);
+    }
+
+    /// Record the prefix match ratio a policy found for its best candidate.
+    pub fn record_route_prefix_match_ratio(pool: &'static str, policy: &'static str, ratio: f64) {
+        histogram!(
+            names::ROUTE_PREFIX_MATCH_RATIO,
+            "pool" => pool,
+            "policy" => policy
+        )
+        .record(ratio);
+    }
+
+    /// Record the cost of the selected candidate, in the policy's own unit.
+    pub fn record_route_cost(pool: &'static str, policy: &'static str, cost: f64) {
+        histogram!(names::ROUTE_COST, "pool" => pool, "policy" => policy).record(cost);
+    }
+
+    /// Record a session affinity lookup: hit, new, rebind or expired.
+    pub fn record_session_affinity(pool: &'static str, result: &'static str) {
+        counter!(
+            names::SESSION_AFFINITY_TOTAL,
+            "pool" => pool,
+            "result" => result
+        )
+        .increment(1);
+    }
+
+    /// Record the estimated KV overlap of the selected candidate on one medium.
+    pub fn record_prefill_overlap_blocks(
+        pool: &'static str,
+        policy: &'static str,
+        medium: &'static str,
+        blocks: u64,
+    ) {
+        histogram!(
+            names::PREFILL_OVERLAP_BLOCKS,
+            "pool" => pool,
+            "policy" => policy,
+            "medium" => medium
+        )
+        .record(blocks as f64);
+    }
+
+    /// Record the worker and DP rank a request was finally dispatched to.
+    pub fn record_selected_dp_rank(pool: &'static str, base_url: &str, dp_rank: Option<usize>) {
+        let dp_rank: metrics::SharedString = match dp_rank {
+            Some(rank) => intern_string(&rank.to_string()).into(),
+            None => metrics_labels::DP_RANK_NONE.into(),
+        };
+        counter!(
+            names::SELECTED_DP_RANK_TOTAL,
+            "pool" => pool,
+            "worker" => intern_string(base_url),
+            "dp_rank" => dp_rank
+        )
+        .increment(1);
+    }
+
+    /// Record the prompt and engine-reported cached tokens of a routed request.
+    pub fn record_route_cache_tokens(pool: &'static str, prompt: u64, cached: u64) {
+        for (kind, count) in [
+            (metrics_labels::CACHE_PROMPT, prompt),
+            (metrics_labels::CACHE_CACHED, cached),
+        ] {
+            counter!(names::ROUTE_CACHE_TOKENS_TOTAL, "pool" => pool, "kind" => kind)
+                .increment(count);
+        }
+    }
+
+    /// Reconcile the router's cached-token estimate with the engine's report.
+    pub fn record_route_cache_estimate(
+        pool: &'static str,
+        prompt: u64,
+        estimated: u64,
+        actual: u64,
+    ) {
+        for (kind, count) in [
+            (metrics_labels::CACHE_PROMPT, prompt),
+            (metrics_labels::CACHE_ESTIMATED, estimated),
+            (metrics_labels::CACHE_ACTUAL, actual),
+        ] {
+            counter!(names::ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL, "pool" => pool, "kind" => kind)
+                .increment(count);
+        }
+        if prompt > 0 {
+            histogram!(names::ROUTE_CACHE_ESTIMATE_ERROR_RATIO, "pool" => pool)
+                .record((estimated as f64 - actual as f64) / prompt as f64);
+        }
+    }
+
     /// Set running requests per worker.
     pub fn set_worker_requests_active(worker: &str, count: usize) {
         let worker_interned = intern_string(worker);
@@ -667,5 +766,36 @@ impl MeshMetrics {
         // workers with -1 until metrics-rs supports deleting label sets.
         gauge!(names::WORKER_CB_STATE, "worker" => Arc::clone(&worker)).set(-1.0);
         gauge!(names::WORKER_HEALTH, "worker" => worker).set(-1.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    use super::*;
+
+    #[test]
+    fn dispatch_rank_and_cache_estimate_labels() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+
+        MeshMetrics::record_selected_dp_rank("prefill", "http://p:8000", Some(3));
+        MeshMetrics::record_selected_dp_rank("decode", "http://d:8000", None);
+        MeshMetrics::record_route_cache_estimate("prefill", 100, 80, 60);
+        MeshMetrics::record_route_cache_estimate("prefill", 0, 0, 0);
+
+        let rendered = handle.render();
+        for line in [
+            r#"mesh_selected_dp_rank_total{pool="prefill",worker="http://p:8000",dp_rank="3"} 1"#,
+            r#"mesh_selected_dp_rank_total{pool="decode",worker="http://d:8000",dp_rank="none"} 1"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="estimated"} 80"#,
+            r#"mesh_route_cache_estimate_tokens_total{pool="prefill",kind="actual"} 60"#,
+            r#"mesh_route_cache_estimate_error_ratio_sum{pool="prefill"} 0.2"#,
+            r#"mesh_route_cache_estimate_error_ratio_count{pool="prefill"} 1"#,
+        ] {
+            assert!(rendered.contains(line), "missing {line} in\n{rendered}");
+        }
     }
 }

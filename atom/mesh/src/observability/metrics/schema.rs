@@ -197,6 +197,21 @@ pub mod labels {
     pub const WORKER_HTTP: &str = "http";
     pub const WORKER_GRPC: &str = "grpc";
 
+    // Routing decisions
+    pub const DP_RANK_NONE: &str = "none";
+    pub const AFFINITY_HIT: &str = "hit";
+    pub const AFFINITY_NEW: &str = "new";
+    pub const AFFINITY_REBIND: &str = "rebind";
+    pub const AFFINITY_EXPIRED: &str = "expired";
+    pub const MEDIUM_GPU: &str = "gpu";
+    pub const MEDIUM_CPU: &str = "cpu";
+    pub const MEDIUM_DISK: &str = "disk";
+    pub const MEDIUM_REMOTE: &str = "remote";
+    pub const CACHE_PROMPT: &str = "prompt";
+    pub const CACHE_CACHED: &str = "cached";
+    pub const CACHE_ESTIMATED: &str = "estimated";
+    pub const CACHE_ACTUAL: &str = "actual";
+
     // Token types
     pub const TOKEN_INPUT: &str = "input";
     pub const TOKEN_OUTPUT: &str = "output";
@@ -252,6 +267,16 @@ pub mod names {
     pub const MANUAL_POLICY_BRANCH_TOTAL: &str = "mesh_manual_policy_branch_total";
     pub const PREFIX_HASH_POLICY_BRANCH_TOTAL: &str = "mesh_prefix_hash_policy_branch_total";
     pub const WORKER_ROUTING_KEYS_ACTIVE: &str = "mesh_worker_routing_keys_active";
+
+    pub const ROUTE_BRANCH_TOTAL: &str = "mesh_route_branch_total";
+    pub const ROUTE_PREFIX_MATCH_RATIO: &str = "mesh_route_prefix_match_ratio";
+    pub const ROUTE_COST: &str = "mesh_route_cost";
+    pub const SESSION_AFFINITY_TOTAL: &str = "mesh_session_affinity_total";
+    pub const PREFILL_OVERLAP_BLOCKS: &str = "mesh_prefill_overlap_blocks";
+    pub const SELECTED_DP_RANK_TOTAL: &str = "mesh_selected_dp_rank_total";
+    pub const ROUTE_CACHE_TOKENS_TOTAL: &str = "mesh_route_cache_tokens_total";
+    pub const ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL: &str = "mesh_route_cache_estimate_tokens_total";
+    pub const ROUTE_CACHE_ESTIMATE_ERROR_RATIO: &str = "mesh_route_cache_estimate_error_ratio";
 
     pub const WORKER_CB_STATE: &str = "mesh_worker_cb_state";
     pub const WORKER_CB_TRANSITIONS_TOTAL: &str = "mesh_worker_cb_transitions_total";
@@ -453,6 +478,60 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         status: MetricStatus::Active,
     },
     MetricSpec {
+        name: names::ROUTE_BRANCH_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Routing decisions by pool, policy, branch; branches are declared by each policy",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::ROUTE_PREFIX_MATCH_RATIO,
+        kind: MetricKind::Histogram,
+        help: "Prefix match ratio of the best candidate at selection by pool, policy",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::ROUTE_COST,
+        kind: MetricKind::Histogram,
+        help: "Cost of the selected candidate in the policy's own unit by pool, policy",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::SESSION_AFFINITY_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Session affinity lookups by pool, result (hit/new/rebind/expired)",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::PREFILL_OVERLAP_BLOCKS,
+        kind: MetricKind::Histogram,
+        help: "Estimated KV overlap blocks of the selected candidate by pool, policy, medium",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::SELECTED_DP_RANK_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Dispatched requests after rank mapping by pool, worker (base URL), dp_rank",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::ROUTE_CACHE_TOKENS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Tokens of routed requests whose response reported cached tokens by pool, kind (prompt/cached)",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Tokens of routed requests with a router cache estimate by pool, kind (prompt/estimated/actual)",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
+        name: names::ROUTE_CACHE_ESTIMATE_ERROR_RATIO,
+        kind: MetricKind::Histogram,
+        help: "Per-request (estimated - actual) cached tokens over prompt tokens by pool",
+        status: MetricStatus::Planned,
+    },
+    MetricSpec {
         name: names::WORKER_CB_STATE,
         kind: MetricKind::Gauge,
         help: "Circuit breaker state per worker (0=closed, 1=open, 2=half_open)",
@@ -550,6 +629,34 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     },
 ];
 
+/// Buckets for routing histograms whose values are not durations.
+pub(crate) const ROUTE_HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
+    (
+        names::ROUTE_PREFIX_MATCH_RATIO,
+        &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0],
+    ),
+    (
+        names::ROUTE_COST,
+        &[
+            0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 4096.0,
+            16384.0, 65536.0, 262144.0, 1048576.0,
+        ],
+    ),
+    (
+        names::PREFILL_OVERLAP_BLOCKS,
+        &[
+            0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
+            8192.0, 16384.0,
+        ],
+    ),
+    (
+        names::ROUTE_CACHE_ESTIMATE_ERROR_RATIO,
+        &[
+            -1.0, -0.5, -0.25, -0.1, -0.05, -0.01, 0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0,
+        ],
+    ),
+];
+
 /// Register HELP/TYPE metadata for every metric with a complete schema entry.
 ///
 /// Planned metrics remain in the inventory so recorder APIs and future wiring
@@ -600,6 +707,22 @@ mod tests {
             "metrics still missing describe entries: {:?}",
             missing_describe
         );
+    }
+
+    #[test]
+    fn route_histogram_buckets_belong_to_sorted_histograms() {
+        for (name, buckets) in ROUTE_HISTOGRAM_BUCKETS {
+            assert!(
+                METRIC_INVENTORY
+                    .iter()
+                    .any(|metric| metric.name == *name && metric.kind == MetricKind::Histogram),
+                "{name} is not an inventoried histogram"
+            );
+            assert!(
+                buckets.windows(2).all(|pair| pair[0] < pair[1]),
+                "{name} buckets are not strictly increasing"
+            );
+        }
     }
 
     #[test]
