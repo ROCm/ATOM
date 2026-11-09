@@ -28,7 +28,47 @@ Branch defaults that this result depends on:
 | `OFFLOAD_STAGING_ON_COMPUTE_STREAM` | 1 | Store arms on side streams froze the engine for minutes in 5 of the 9 runs in which it was tried; no freeze in the 20+ Store arms run on the compute stream since. |
 | `ATOM_OFFLOAD_EARLY_LOAD` / `_STATE` | 1 / 1 | Start the Store read when the lookup answers instead of one delayer cycle later. |
 
-## Final results (branch head b1ccf5b97, 1800 s, no environment variables)
+## Latest: unaligned HBM hit floored to the Store chunk (head 0b0aef722)
+
+Store loads start on a 256-token chunk boundary. A request whose HBM prefix hit
+ends inside a chunk used to skip the early tier load and take the unaligned
+handoff (recompute to the next boundary, load, prefill the rest: two delayer
+releases). About 38% of Store-examined requests were in that case. Now the hit is
+lowered to the chunk floor and the few tokens in between are recomputed
+(`BlockManager.lower_hit_to_chunk`; only for connectors that declare
+`lowers_hbm_hit_to_chunk`, i.e. Mooncake Store), when the Store holds at least
+`OFFLOAD_MIN_LOAD_TOKENS` more than the lowered hit, there is no joint boundary,
+per-request cache classes can be rebuilt by state replay, the SWA gate keeps the
+lowered hit, and the pool has page units for the blocks given back.
+
+Same-time DP2 (TP2) pair, concurrency 128, 1800 s, `OFFLOAD_PROFILE` off, no
+environment variables:
+
+| | main | Store | change |
+|---|---|---|---|
+| Completed requests | 8326 | 8420 | +1.1% |
+| Output throughput (tok/s) | 3785.7 | 3846.2 | **+1.6%** |
+| TTFT mean (ms) | 1961 | 1441 | **-26.5%** |
+| TTFT p50 (ms) | 988 | 1008 | **+2.0%** |
+| TTFT p90 (ms) | 4415 | 2899 | **-34.3%** |
+| TTFT p99 (ms) | 12123 | 6963 | **-42.6%** |
+| ITL (ms) | 15.66 | 15.64 | **-0.1%** |
+
+The DP2 median TTFT gap went from +7% to +8% (previous head) to +2%.
+
+Correctness checks (DP2, real decoding, no forced acceptance length):
+
+* gsm8k 3-shot: main 0.9272, Store 0.9287 (stderr 0.007).
+* Retrieval after eviction (48 prompts of 2-7k tokens, chat endpoint, greedy;
+  round 1 cold, then 6M tokens of other prompts to evict HBM, then round 2 served
+  through Store loads): main 39 / 37 correct, Store 37 / 36 correct (round 1 / round 2).
+  Greedy text is not bit-identical between rounds on either arm (10/48 identical),
+  so the comparison is on answer correctness. The test does not count how often
+  the floor fired.
+* `tests/test_lower_hit_to_chunk.py`: 11 unit tests (lowering, state replay,
+  joint boundary, cache classes, pool exhaustion, early-load integration).
+
+## Final results before the floor change (branch head b1ccf5b97, 1800 s, no environment variables)
 
 Same-time, same-node pairs, 1800 s profiling window each. The Store arm runs the
 branch defaults; main is session-affinity routing with HBM prefix caching only.
@@ -65,7 +105,7 @@ identified).
 
 Benchmark settings: `OFFLOAD_PROFILE` stays at its default (off). A same-time
 test showed it does not change ITL (+2.4% on, +2.3% off), but it adds timing and
-logging to every transfer and the 1800 s rows above were measured with it on.
+logging to every transfer, so benchmark with it off (the latest DP2 run and the DP4 run of the floor change were).
 Step traces show Store decode steps about 1-2 ms slower than main (median
 25-26 ms against 23-24 ms), about 0.4 ms of which is scheduler CPU in the engine
 core.
@@ -130,5 +170,5 @@ makes a few large chunks. Under test: `ATOM_PREFILL_DELAYER_TARGET_FILL` and
 ## Reproducing
 
 Benchmark arms used `ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0`, Mooncake Store
-128 GB (DP2) or 512 GB (DP4) over RDMA, `OFFLOAD_PROFILE=1`. Store usage after
+256 GB (DP2) or 512 GB (DP4) over RDMA, `OFFLOAD_PROFILE` off. Store usage after
 1800 s at DP4/c256 was 190 GB of 512 GB with no eviction.
