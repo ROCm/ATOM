@@ -403,6 +403,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         pump = getattr(client, "pump", None)
         if callable(pump):
             pump()
+        # Before the sessions: an answered lookup releases its locks here first.
         self.reconcile_detached_lookups()
         pending = self._pending_session_ends()
         in_flight = getattr(client, "is_pending", None)

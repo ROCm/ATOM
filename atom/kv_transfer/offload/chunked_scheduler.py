@@ -828,8 +828,23 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return None
         return target, block_ids, keep
 
+    def _reconcile_lookups_each_step(self) -> None:
+        """Release the answers of detached lookups and correct their save floors.
+
+        Every tier that detaches lookups (`detach_lookup`) needs this each step,
+        not only LMCache MP: without it a detached request stays in
+        `_detached_lookups` and its answer in the client's discarded hits,
+        unbounded, and its save floor stays at the HBM prefix even where the
+        tier no longer holds it.
+        """
+        pump = getattr(self._lookup_client, "pump", None)
+        if callable(pump):
+            pump()
+        self.reconcile_detached_lookups()
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         _perf_t0 = time.perf_counter()
+        self._reconcile_lookups_each_step()
         meta = LMCacheOffloadMetadata()
 
         # Loads

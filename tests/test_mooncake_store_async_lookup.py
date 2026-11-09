@@ -104,3 +104,76 @@ def test_answered_is_read_only_and_marks_lookup_ready():
         assert not sched.lookup_ready(seq)
     finally:
         lookup.close()
+
+
+def test_a_detached_lookup_is_reconciled_and_dropped_each_step():
+    """The Store detaches lookups too; its detached requests must not pile up."""
+    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+
+    sched = ChunkedOffloadSchedulerBase.__new__(ChunkedOffloadSchedulerBase)
+    seq = SimpleNamespace(id=1)
+    lowered = []
+    sched._lookup_client = SimpleNamespace(
+        pump=lambda: None,
+        pop_discarded_hits=lambda: {"1": 512},
+        pending_ids=lambda: set(),
+    )
+    sched._detached_lookups["1"] = seq
+    sched._chunk_floor = lambda tokens: tokens // 256 * 256
+    sched._lower_save_floor = lambda sid, s, tokens: lowered.append(tokens) or True
+    sched._perf_bump = lambda name: None
+    sched._reconcile_lookups_each_step()
+    assert lowered == [512]
+    assert sched._detached_lookups == {}  # answered: forgotten, nothing piles up
+
+
+def test_renew_does_not_queue_behind_lookups_and_is_bounded(monkeypatch):
+    import threading
+
+    from atom.kv_transfer.offload.mooncake_store import async_lookup
+    from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
+
+    release = threading.Event()
+
+    class Backend:
+        def lookup(self, seq, lookup_id=None):
+            release.wait(5)
+            return 1
+
+        def renew(self, seq, start, end):
+            return 7
+
+    monkeypatch.setattr(async_lookup, "RENEW_TIMEOUT_S", 0.2)
+    lookup = AsyncStoreLookup(Backend())
+    try:
+        for i in range(3):  # one query is being served, two are queued behind it
+            lookup.submit(SimpleNamespace(id=i), str(i))
+        started = time.monotonic()
+        assert lookup.renew(SimpleNamespace(id=9), 0, 256) == 0  # bounded wait
+        assert time.monotonic() - started < 2.0
+        release.set()
+        time.sleep(0.3)
+        assert lookup.renew(SimpleNamespace(id=9), 0, 256) == 7  # nothing in its way
+    finally:
+        release.set()
+        lookup.close()
+
+
+def test_close_does_not_wait_for_a_hung_query():
+    import threading
+
+    from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
+
+    release = threading.Event()
+
+    class Backend:
+        def lookup(self, seq, lookup_id=None):
+            release.wait(10)
+
+    lookup = AsyncStoreLookup(Backend())
+    lookup.submit(SimpleNamespace(id=1), "1")
+    time.sleep(0.1)
+    started = time.monotonic()
+    lookup.close()
+    release.set()
+    assert time.monotonic() - started < 2.0

@@ -5906,6 +5906,7 @@ def test_bounded_saves_are_shared_round_robin_not_head_first():
     s.block_size = 256
     s._do_save = True
     s._do_load = False
+    s._lookup_client = None
     s._reqs_need_recv = {}
     s._lookup_in_step = []
     s._save_tracker = {}

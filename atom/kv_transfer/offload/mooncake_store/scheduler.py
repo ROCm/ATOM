@@ -44,6 +44,7 @@ from atom.kv_transfer.offload.mooncake_store.keys import (
     rank_key_prefix,
     store_namespace,
 )
+from atom.model_engine.sequence import SequenceStatus
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -67,6 +68,8 @@ _LOOKUP_STATS_INTERVAL_S = 60.0
 # dispatched. Only the lookup's read lease (10 s by default) keeps the chunks
 # from eviction, and a request can wait far longer than that for KV blocks.
 _LOOKUP_REUSE_S = 1.0
+# Store lookups an arrival batch may queue at once (`offer_lookups`).
+_MAX_OFFERS_PER_BATCH = 64
 # After a failed save the base retries, no save is emitted for this long,
 # doubled for each further such failure in a row up to `_SAVE_RETRY_MAX_S`. A
 # stored save ends the pause and starts the doubling over, whenever it reports.
@@ -532,10 +535,20 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
 
     def offer_lookups(self, seqs):
         # Called on arrival after tokenization, before admission/prefill.
-        if self._do_load:
-            for seq in seqs:
-                if self._lookup_len(seq) > 0:
-                    self._lookup_client.submit(seq, str(seq.id))
+        if not self._do_load:
+            return
+        offered = 0
+        for seq in seqs:
+            # Not a request that left WAITING meanwhile, and a bounded number per
+            # arrival batch: the rest reach their lookup through the scheduler's
+            # own prefetch (`prefetch_lookups`), as the queue drains.
+            if seq.status != SequenceStatus.WAITING:
+                continue
+            if offered >= _MAX_OFFERS_PER_BATCH:
+                break
+            if self._lookup_len(seq) > 0:
+                self._lookup_client.submit(seq, str(seq.id))
+                offered += 1
 
     def close(self):
         self._lookup_client.close()
