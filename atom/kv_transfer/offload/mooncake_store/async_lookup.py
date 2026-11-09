@@ -3,13 +3,15 @@
 
 Only completed Store answers are cached, scoped to one request lifecycle.
 The worker rechecks/renews before loading; a stale answer never authorizes
-reuse of missing bytes. One executor serializes the synchronous Store client.
+reuse of missing bytes. One lookup executor serializes the arrival-time queries;
+a lease renewal has an executor of its own and waits only for the query being
+served (`backend_lock`), never for the queue behind it.
 """
 
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
-from threading import RLock
+from threading import Lock, RLock
 
 logger = logging.getLogger("atom")
 
@@ -17,6 +19,8 @@ logger = logging.getLogger("atom")
 # arrival-time lookups. The renewal is advisory (see `renew`); a Store RPC that
 # is slow must not stall the scheduler and, through the DP lockstep, its peers.
 RENEW_TIMEOUT_S = 1.0
+# The compatibility `lookup()` fallback also runs on the scheduler thread.
+FALLBACK_LOOKUP_TIMEOUT_S = 2.0
 
 
 class AsyncStoreLookup:
@@ -30,6 +34,13 @@ class AsyncStoreLookup:
         self.executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="store-query"
         )
+        # Renewals ride their own worker so a burst of arrival-time queries
+        # cannot queue one behind it; the lock keeps the synchronous Store
+        # client (and the pool state around it) to one call at a time.
+        self.renew_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="store-renew"
+        )
+        self.backend_lock = Lock()
         self.pending = {}
         self.discarded = set()
         self.discarded_hits = {}
@@ -47,7 +58,10 @@ class AsyncStoreLookup:
 
     def _query(self, request, sid):
         seq = request()
-        return None if seq is None else self.backend.lookup(seq, lookup_id=sid)
+        if seq is None:
+            return None
+        with self.backend_lock:
+            return self.backend.lookup(seq, lookup_id=sid)
 
     def submit(self, seq, sid):
         return self.offer(sid, lambda: seq)
@@ -118,7 +132,7 @@ class AsyncStoreLookup:
         if f is None:
             return None
         try:
-            result = f.result(timeout=30)
+            result = f.result(timeout=FALLBACK_LOOKUP_TIMEOUT_S)
         except Exception:  # noqa: BLE001
             result = None
         with self.lock:
@@ -146,16 +160,20 @@ class AsyncStoreLookup:
             hits, self.discarded_hits = self.discarded_hits, {}
             return hits
 
+    def _renew(self, seq, start, end):
+        with self.backend_lock:
+            return self.backend.renew(seq, start, end)
+
     def renew(self, seq, start, end):
         """Renew the read leases of tokens ``[start, end)``; 0 if it is not done in time.
 
-        Runs on the lookup executor, which serializes the synchronous Store
-        client, but the scheduler thread waits at most `RENEW_TIMEOUT_S` for it.
+        Runs on the renewal executor, behind at most the query being served, and
+        the scheduler thread waits at most `RENEW_TIMEOUT_S` for it.
         The load goes ahead whatever the answer (its all-or-nothing get fails on
         a chunk the Store lost and the request is prefilled), so a renewal that
         is late costs a lease, never correctness.
         """
-        future = self.executor.submit(self.backend.renew, seq, start, end)
+        future = self.renew_executor.submit(self._renew, seq, start, end)
         try:
             return future.result(timeout=RENEW_TIMEOUT_S)
         except FutureTimeout:
@@ -174,4 +192,6 @@ class AsyncStoreLookup:
             for f in self.pending.values():
                 f.cancel()
             self.pending.clear()
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        # Not waited for: a hung Store RPC must not hold engine exit.
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.renew_executor.shutdown(wait=False, cancel_futures=True)
