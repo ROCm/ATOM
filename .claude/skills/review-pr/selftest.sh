@@ -395,6 +395,29 @@ t "a normal-sized diff is within one pass"   "$(_cov 6 50)"    "OK"
 t "too many files is flagged as a sample"    "$(_cov 40 10)"   "BEYOND"
 t "too many added lines is flagged too"      "$(_cov 5 1000)"  "BEYOND"
 
+# Measuring the diff is not enough: the card has to SAY it. ATOM#3034's card carried the
+# coverage line and ATOM#2762's did not -- same worker, same instruction -- and the one
+# that dropped it was the 47-file diff where "a sample, not a sweep" mattered most. So the
+# card gate enforces it against what Step 1 measured, including the softening case: a card
+# that reports a BEYOND ONE PASS diff as an ordinary one is worse than omitting the line.
+_cov_gate() {  # <rules.txt coverage line> <card coverage line or -> problem kind or ok
+  python3 -c '
+import sys, tempfile, pathlib
+sys.path.insert(0, sys.argv[1]); import triage
+d = tempfile.mkdtemp()
+pathlib.Path(d, "rules.txt").write_text("  files=9\n" + sys.argv[2] + "\n")
+card = "## T\n\nReview: OK\n" + ("" if sys.argv[3] == "-" else sys.argv[3] + "\n")
+p = triage._check_coverage_line(card, d)
+print(p[0][0] if p else "ok")' "$S" "$1" "$2"
+}
+_BIG="  coverage: BEYOND ONE PASS -- 47 files (no ATOM PR merged in the last 40 exceeded 19)"
+_SMALL="  coverage: 5 files / 49 added lines -- within one review pass"
+t "a card that drops the coverage line is refused" "$(_cov_gate "$_BIG" -)" "MISSING-COVERAGE"
+t "a card that softens BEYOND ONE PASS is refused" \
+  "$(_cov_gate "$_BIG" 'Coverage: 47 files / 16647 added lines')" "SOFTENED-COVERAGE"
+t "a card carrying the measured coverage passes" \
+  "$(_cov_gate "$_SMALL" 'Coverage: 5 files / 49 added lines -- within one review pass')" "ok"
+
 # The pollution case needs REAL skill prose, not a one-line stand-in: a synthetic hunk
 # trips no family and the test passes with the filter removed -- it did, until this was
 # measured. testdata/skill_prose.diff is three files cut from ATOM#2762's own diff, and

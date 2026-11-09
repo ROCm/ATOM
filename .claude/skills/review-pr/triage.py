@@ -2856,6 +2856,49 @@ VALIDATION_REASON = re.compile(r"(?:--|—|:)\s*\S")
 VALIDATION_REPORT_NAME = "validation_report.json"
 
 
+def _check_coverage_line(card_text, work_dir=None):
+    """The card must carry the coverage verdict Step 1 computed, verbatim.
+
+    SKILL.md asks for it, and asking was not enough: ATOM#3034's card carried it and
+    ATOM#2762's did not -- the same worker, the same instruction, and the card that
+    dropped it was the 47-file one where "this is a sample, not a sweep" mattered most.
+    An instruction a model follows most of the time is not a gate, and a reader cannot
+    tell a card that omitted the line from one whose diff was small enough not to need it.
+
+    Compared against rules.txt rather than re-derived here: Step 1 owns the measurement,
+    this only enforces that it reached the reader.
+    """
+    want = ""
+    if work_dir:
+        try:
+            for ln in (pathlib.Path(work_dir) / "rules.txt").read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                if ln.strip().startswith("coverage:"):
+                    want = ln.strip()
+                    break
+        except OSError:
+            return []
+    if not want:
+        return []
+    for line in (card_text or "").splitlines():
+        st = line.strip()
+        if st.lower().startswith("coverage:"):
+            body = st.split(":", 1)[1].strip()
+            if not body:
+                return [("EMPTY-COVERAGE", st[:70],
+                         "no verdict after the colon -- copy rules.txt's coverage line")]
+            if "BEYOND ONE PASS" in want and "BEYOND ONE PASS" not in st:
+                return [("SOFTENED-COVERAGE", st[:70],
+                         "Step 1 measured this diff as BEYOND ONE PASS and the card does "
+                         "not say so -- the findings below read as complete when they are "
+                         "a sample")]
+            return []
+    return [("MISSING-COVERAGE", want[:70],
+             "Step 1 measured the diff's reviewability and the card drops it; copy the "
+             "`coverage:` line from rules.txt above the findings")]
+
+
 def _check_validation_line(card_text, work_dir=None):
     """Returns a list of (kind, text, why) problems, same shape as audit_card's."""
     for line in (card_text or "").splitlines():
@@ -3090,6 +3133,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                           "late_findings.txt; it is not written back into an artifact that "
                           "had already gone green")))
     problems.extend(_check_validation_line(card_text, work_dir))
+    problems.extend(_check_coverage_line(card_text, work_dir))
     return findings, problems
 
 
