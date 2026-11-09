@@ -22,6 +22,7 @@ from flydsl.expr import gpu, range_constexpr
 from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
 from atom.models.deepseek_v41.mono.gfx1250.kernels import index_plan as IP
+from atom.models.deepseek_v41.mono.gfx1250.kernels import topk as TK
 from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import CTAS, T
 
 F32, I32, I64 = fx.Float32, fx.Int32, fx.Int64
@@ -52,7 +53,6 @@ O_PF = O_SRB + 3 * 64 * 4        # a batch's key rows [RB][SUB][256] int64
 def stage_score_any(c, isrx):
     """(see the module doc) isrx traced: FULL (context = the bound) and REINDEX (context = rx_context, the columns
     lifted through icand) with one code instance."""
-    from atom.models.deepseek_v41.mono.gfx1250.kernels import topk as TK
     t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
     TR = c["TR"]
     SUB_ = IP.score_sub(TR, CTAS)

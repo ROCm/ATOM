@@ -5,12 +5,16 @@ preparation the launch's graph captures (``_host_inputs`` / ``_device_inputs``),
 parameters (``_sampling``). ``SingleStepRunner`` inherits them."""
 
 import logging
+import time
 
 import numpy as np
 import torch
 
 from atom.models.deepseek_v41.mono.gfx1250 import buffers
 from atom.models.deepseek_v41.mono.gfx1250.config import ROWS_PER_REQ
+from atom.models.deepseek_v41.mono.gfx1250.tables import BCOLS, ILW
+from atom.models.deepseek_v41.mono.gfx1250.tables import T as T_MAX
+from atom.models.deepseek_v41.mono.step_meta import write_step_meta
 from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
@@ -25,9 +29,6 @@ class StepInputs:
         exception after the Engram rows are staged left the worker without a fallback: a 4.4k-token prompt with 4096
         outputs past the index bound). Identical on every rank (the batch and its spans are).
         """
-        from atom.models.deepseek_v41.mono.gfx1250.tables import BCOLS, ILW
-        from atom.models.deepseek_v41.mono.gfx1250.tables import T as T_MAX
-
         why = None
         if (
             batch is not None
@@ -67,9 +68,6 @@ class StepInputs:
         """The step's host-side checks and the rare host-to-device refills (geometry), before the device preparation;
         returns (the Engram layers' embedding rows, the key of every address / shape ``_device_inputs`` captures).
         """
-        from atom.models.deepseek_v41.mono.gfx1250.tables import BCOLS, ILW
-        from atom.models.deepseek_v41.mono.gfx1250.tables import T as T_MAX
-
         md = forward_context.attn_metadata
         cache, step = md.cache, md.step
         rows = input_ids.numel()
@@ -177,10 +175,6 @@ class StepInputs:
     def _device_inputs(self, input_ids, forward_context, engs):
         """Every device operation of the step's preparation: from fixed addresses only (captured in the width's
         graph, ``launch``), sizes fixed by the key of ``_host_inputs``."""
-        from atom.models.deepseek_v41.mono.gfx1250.tables import BCOLS
-        from atom.models.deepseek_v41.mono.gfx1250.tables import T as T_MAX
-        from atom.models.deepseek_v41.mono.step_meta import write_step_meta
-
         md = forward_context.attn_metadata
         cache, step = md.cache, md.step
         rows = input_ids.numel()
@@ -250,8 +244,6 @@ class StepInputs:
         """ATOM_MONO_TIMELINE: a host time mark inside the step's preparation (``debug.StepTimer``)."""
         r = getattr(self, "_t_rec", None)
         if r is not None:
-            import time
-
             r.setdefault("hm", []).append((name, time.perf_counter()))
 
     def _sampling(self, batch, req) -> None:

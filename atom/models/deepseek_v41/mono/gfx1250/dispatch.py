@@ -12,6 +12,7 @@ import logging
 
 from torch import nn
 
+from atom.models.deepseek_v41.mono.gfx1250 import refusal
 from atom.models.deepseek_v41.mono.gfx1250.config import MAX_ROWS, ROWS_PER_REQ
 from atom.models.deepseek_v41.mono.gfx1250.debug import CheckModel
 from atom.mono.runtime.route import LazyRunner
@@ -35,6 +36,7 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
         self._drafter = drafter
 
         def create():
+            # (imported on first use: the runner needs aiter and FlyDSL, the routing above must import without them)
             from atom.models.deepseek_v41.mono.gfx1250.runner import (
                 SingleStepRunner,
             )
@@ -142,8 +144,6 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
 
 
 def install_single_step(model: nn.Module, atom_config, drafter) -> nn.Module:
-    from atom.models.deepseek_v41.mono.gfx1250 import refusal
-
     why = refusal(atom_config)
     if why is not None:
         logger.info("V4.1 single-launch step off: %s", why)

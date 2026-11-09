@@ -30,6 +30,7 @@ from __future__ import annotations
 
 
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr, rocdl
 
@@ -118,7 +119,6 @@ def popc(m):
 
 
 def latomic_add(off, val):
-    from flydsl._mlir.dialects import llvm
     return I32(llvm.AtomicRMWOp(llvm.AtomicBinOp.add, hx.lptr(off), hx._v(I32(val)), llvm.AtomicOrdering.monotonic,
                                 syncscope="workgroup", alignment=4).result)
 

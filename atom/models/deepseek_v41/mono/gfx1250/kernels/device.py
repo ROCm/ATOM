@@ -10,10 +10,13 @@ All functions are traced inside a @flyc.kernel body.
 """
 from __future__ import annotations
 
+import re as _re
+
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
-from flydsl.expr import rocdl
+from flydsl._mlir.dialects import arith, llvm
+from flydsl.compiler.ast_rewriter import ASTRewriter as _ASTR
+from flydsl.expr import gpu, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 # ---------------------------------------------------------------- types
@@ -80,7 +83,6 @@ def gload(addr, kind=fx.Int32, n=1, nt=False, scope=None, align=None):
     return _wrap(llvm.LoadOp(ty, gptr(addr), **kw).result, kind, n)
 
 
-import re as _re
 _EB = {"i8": 1, "i16": 2, "i32": 4, "i64": 8, "f16": 2, "bf16": 2, "f32": 4, "f64": 8}
 
 
@@ -242,8 +244,7 @@ def sload64(addr):
 
 def llvm_wait_loads():
     """s_wait_loadcnt 0 (diagnostic)."""
-    from flydsl._mlir.dialects import llvm as _ll
-    _ll.inline_asm(None, [], "s_wait_loadcnt 0x0", "", has_side_effects=True)
+    llvm.inline_asm(None, [], "s_wait_loadcnt 0x0", "", has_side_effects=True)
 
 
 def cvt_pk_fp8_w(old, a, b, hi):
@@ -291,10 +292,8 @@ def fp8x2_to_f32(word, hi):
 
 def unlikely(b):
     """llvm.expect(b, false): block placement moves the guarded code out of the hot path (I-cache)."""
-    from flydsl._mlir import ir as _ir
-    i1 = _ir.IntegerType.get_signless(1)
-    from flydsl._mlir.dialects import arith as _arith
-    f = _arith.ConstantOp(i1, _ir.IntegerAttr.get(i1, 0)).result
+    i1 = ir.IntegerType.get_signless(1)
+    f = arith.ConstantOp(i1, ir.IntegerAttr.get(i1, 0)).result
     return fx.Boolean(llvm.call_intrinsic(i1, "llvm.expect.i1", [_v(b), f], [], []))
 
 
@@ -303,7 +302,6 @@ def unlikely(b):
 # 'cyc' scratch) counts them: int32 [0] += 1, int32 [1] = the last site id. The runner reads it after a step.
 TOFLAG = [None]
 POLL_TICKS = 200000000   # a bounded poll gives up after this many clock ticks (~2 s) and records a timeout
-from flydsl.compiler.ast_rewriter import ASTRewriter as _ASTR
 
 
 @_ASTR.transform
@@ -329,7 +327,6 @@ def wait_count(addr, n, site):
 def handoff(cnt, t, hdev, n=256, site=None):
     """Device-wide handoff of n CTAs on counter cnt (thread t). hdev: the stages' exchange stores are device-scope ->
     every wave waits its stores, no fences; else release / acquire fences around the count."""
-    from flydsl.expr import gpu
     if fx.const_expr(hdev):
         wait_storecnt0()
         gpu.barrier()

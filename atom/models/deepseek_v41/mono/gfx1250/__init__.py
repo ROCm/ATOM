@@ -8,6 +8,8 @@ written for (``config.config_refusal``)."""
 
 import torch
 
+from atom.models.deepseek_v41.mono.gfx1250.config import config_refusal
+from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.utils import envs
 
 
@@ -25,7 +27,4 @@ def enabled() -> bool:
 
 def refusal(atom_config) -> str | None:
     """Why this deployment cannot run the single-launch step, or None."""
-    from atom.models.deepseek_v41.mono.gfx1250.config import config_refusal
-    from atom.models.deepseek_v41.mono.kernels.dims import Dims
-
     return config_refusal(atom_config, Dims)

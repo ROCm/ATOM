@@ -10,6 +10,7 @@ import logging
 import numpy as np
 import torch
 
+from atom.model_ops.linear import weight_is_stored_preshuffled
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dims import MOE_IPAD
 from atom.mono.runtime.consensus import MonoUnsupported
 
@@ -68,8 +69,6 @@ def checkpoint_weight(linear):
     """A loaded FP8 linear's weight as checkpoint row-major bytes ``[N, K]`` (uint8), undoing the in-place shuffle
     ``LinearBase.process_weights_after_loading`` applies when the preshuffled group32 GEMM reads it (decided the way
     the loader decided it)."""
-    from atom.model_ops.linear import weight_is_stored_preshuffled
-
     w = linear.weight
     rows = getattr(linear, "native_a8_group_rows", None)
     shuffled = rows is not None and weight_is_stored_preshuffled(

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int64
@@ -188,9 +189,8 @@ def atab(fp, name, off=None):
 def iprefetch(kb):
     """Instruction prefetch of the next `kb` KB of code (s_prefetch_inst_pc_rel, 4 KB a request), issued before a
     handoff so the stage after it starts warm (the layer loop is larger than the instruction cache)."""
-    from flydsl._mlir.dialects import llvm as _ll
     for off in range(0, kb * 1024, 4096):
-        _ll.inline_asm(None, [], f"s_prefetch_inst_pc_rel {off}, null, 31", "", has_side_effects=True)
+        llvm.inline_asm(None, [], f"s_prefetch_inst_pc_rel {off}, null, 31", "", has_side_effects=True)
 
 
 def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sources=""):

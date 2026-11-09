@@ -19,6 +19,7 @@ import importlib
 import logging
 import time
 
+import flydsl.compiler as flyc
 import torch
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -26,6 +27,7 @@ from aiter.dist.parallel_state import (
     get_tp_group,
 )
 
+from atom.model_ops.engram.device.staging import EngramStagedRows
 from atom.models.deepseek_v41.mono.gfx1250 import buffers
 from atom.models.deepseek_v41.mono.gfx1250.config import (
     NDR,
@@ -35,7 +37,9 @@ from atom.models.deepseek_v41.mono.gfx1250.config import (
 )
 from atom.models.deepseek_v41.mono.gfx1250.debug import RunnerDebug, timeline
 from atom.models.deepseek_v41.mono.gfx1250.inputs import StepInputs
+from atom.models.deepseek_v41.mono.gfx1250.tables import StepTables
 from atom.mono.plan.build_key import source_digest
+from atom.mono.runtime.compile import compile_only
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
 from atom.utils.forward_context import get_forward_context
@@ -132,8 +136,6 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             RECV_BYTES / 2**20,
             self.rank,
         )
-        from atom.models.deepseek_v41.mono.gfx1250.tables import StepTables
-
         self.tables = StepTables(
             self.K,
             model,
@@ -197,8 +199,6 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             # compile (JIT or disk cache) before the first launch of this width, then wait for every rank: the step
             # kernel's cross-rank polls give up after 2 s, and ranks compiling a width seconds apart made that first
             # launch time out and compute on stale / zero peer data (KV / index / compressor state stays wrong after)
-            from atom.mono.runtime.compile import compile_only
-
             with compile_only():
                 for ln in launch:
                     ln(*self._launch_args(), stream=torch.cuda.current_stream())
@@ -212,7 +212,6 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         check (~0.15 ms of host time a launch)."""
         fast = self._fast.get(rows)
         if fast is None:
-            import flydsl.compiler as flyc
 
             def first(i):
                 def call(*a):
@@ -320,8 +319,6 @@ class SingleStepRunner(StepInputs, RunnerDebug):
 
     def run_step(self, input_ids, running_bs: int, forward_context, batch) -> None:
         """The served step: one launch (target layers, head, sampling, verify, draft layers, Markov drafts)."""
-        from atom.model_ops.engram.device.staging import EngramStagedRows
-
         if input_ids.numel() != running_bs * ROWS_PER_REQ:
             raise MonoUnsupported(
                 f"single-launch step: {input_ids.numel()} rows for {running_bs} requests"
