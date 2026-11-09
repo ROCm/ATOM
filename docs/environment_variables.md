@@ -320,6 +320,12 @@ that ever changes, so a fusion left inert by an unrecognised layout says so.
 |----------|------|---------|-------------|
 | **ATOM_TOOL_CALL_GRAMMAR** | bool | 0 (false) | `1`: on a chat request that declares tools and sets no `response_format`, hold each tool call to its tool's schema when the tool parser declares a grammar for its format (Kimi-K3: a call cannot close before its required arguments). Needs the `atom[structured-output]` extra. Where it cannot apply -- extra not installed, P/D, relaxed MTP, custom stop strings, speculative logprobs, a schema that fails the structured-output safety checks, or a grammar that fails to prepare -- the output stays unconstrained. Off by default: every constrained request computes a CPU token mask per decode position. |
 
+## API image input
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_IMAGE_URL_ALLOW_PRIVATE** | bool | 0 (false) | Let image URLs in Chat requests reach any address, through the system proxy if one is set. By default a URL, and every redirect, must resolve to public addresses and is fetched without a proxy, so a client cannot make the server read its own network. Set it where clients are trusted with the internal network: an intranet image store, or egress only through a proxy. See [API image input](api_image_input.md). |
+
 ## Engram (DeepSeek-V4.1)
 
 The n-gram tables are per-layer and large enough that where they live, and
