@@ -21,6 +21,7 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
 from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import tdm_lds_words
+from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device.ops import bf16_round, bf_hi, bf_lo, rsrc
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
@@ -61,8 +62,11 @@ def build_replicated_finalize(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFinaliz
 
     name = f"k3_k2_gfx1250_replicated_finalize_s{rows}"
 
+    sources = SOURCES
+
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(routed_normed: Int64, shared: Int64, up_weight: Int64, output: Int64):
+        _ = sources
         tid = fx.thread_idx.x
         row0 = fx.block_idx.x * (2 * ROWS)
         lane = tid % GFX1250.wave_size
@@ -124,6 +128,7 @@ def build_replicated_finalize(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFinaliz
         output: Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
+        _ = sources
         kernel(routed_normed, shared, up_weight, output).launch(
             grid=(PAIRS,), block=(THREADS,), stream=stream
         )

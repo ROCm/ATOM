@@ -29,6 +29,7 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import (
 from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250, moe_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import LDS_PAD
 from atom.models.kimi_k3.mono.kernels.token_tiling import WMMA_TOKEN_ROWS
+from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device.ops import (
     CM_DEV,
     butterfly,
@@ -489,6 +490,8 @@ def build_role_lds_front(
         f"_r{int(reset)}"
     )
 
+    sources = SOURCES
+
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(
         oproj_reduced: Int64,
@@ -511,6 +514,7 @@ def build_role_lds_front(
         attention_epsilon: Float32,
         output_epsilon: Float32,
     ):
+        _ = sources
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid % GFX1250.wave_size
@@ -850,6 +854,7 @@ def build_role_lds_front(
         output_epsilon: Float32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
+        _ = sources
         kernel(
             oproj_reduced,
             prefix,

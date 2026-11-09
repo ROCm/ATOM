@@ -32,6 +32,7 @@ from atom.models.kimi_k3.mono.kernels.stages import (
 )
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import LDS_PAD
 from atom.models.kimi_k3.mono.kernels.token_tiling import WMMA_TOKEN_ROWS
+from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device.ops import bf_hi, bf_lo, rsrc, traced
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
@@ -278,6 +279,8 @@ def build_packed_finish(
         f"{'_rf' if replicated_front else ''}"
     )
 
+    sources = SOURCES
+
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(
         front_gathered: Int64,
@@ -303,6 +306,7 @@ def build_packed_finish(
         shared_partial: Int64,
         scratch: Int64,
     ):
+        _ = sources
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid % GFX1250.wave_size
@@ -821,6 +825,7 @@ def build_packed_finish(
         scratch: Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
+        _ = sources
         kernel(
             front_gathered,
             router_bias,

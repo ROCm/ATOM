@@ -27,6 +27,7 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import (
 from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import LDS_PAD
 from atom.models.kimi_k3.mono.kernels.token_tiling import WMMA_TOKEN_ROWS
+from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device.ops import (
     bf16_round,
     bf_hi,
@@ -213,8 +214,11 @@ def build_oproj_local(
                     )
         rocdl.s_wait_storecnt(0)
 
+    sources = SOURCES
+
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(activation: Int64, weight: Int64, output: Int64):
+        _ = sources
         tid = fx.thread_idx.x
         block = fx.block_idx.x
         task = block % OUTPUT_TASKS
@@ -239,6 +243,7 @@ def build_oproj_local(
         output: Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
+        _ = sources
         kernel(activation, weight, output).launch(
             grid=(OUTPUT_TASKS * tile_count,),
             block=(THREADS,),
@@ -484,6 +489,8 @@ def build_finalize_local(
                     _store_pair(output, location, low, high)
         rocdl.s_wait_storecnt(0)
 
+    sources = SOURCES
+
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(
         routed_reduced: Int64,
@@ -494,6 +501,7 @@ def build_finalize_local(
         rank: Int32,
         epsilon: Float32,
     ):
+        _ = sources
         tid = fx.thread_idx.x
         block = fx.block_idx.x
         task = block % OUTPUT_TASKS
@@ -574,6 +582,7 @@ def build_finalize_local(
         epsilon: Float32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
+        _ = sources
         kernel(
             routed_reduced,
             shared_partial,

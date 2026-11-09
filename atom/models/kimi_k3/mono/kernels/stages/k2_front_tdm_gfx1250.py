@@ -22,6 +22,7 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
 from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250, moe_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import tdm_lds_words
+from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device.ops import butterfly, rsrc
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
@@ -82,6 +83,8 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
 
     name = f"k3_k2_gfx1250_replicated_front_s{rows}"
 
+    sources = SOURCES
+
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(
         x: Int64,
@@ -93,6 +96,7 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
         latent_scales: Int64,
         shared_gate_up: Int64,
     ):
+        _ = sources
         tid = fx.thread_idx.x
         pair = fx.block_idx.x
         lane = tid % GFX1250.wave_size
@@ -214,6 +218,7 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
         shared_gate_up: Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
+        _ = sources
         kernel(
             x,
             router_weight,
