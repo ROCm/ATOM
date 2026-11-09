@@ -224,6 +224,49 @@ def test_refs_resolve_against_the_parameters_definitions(bare):
     assert not feed(m, HEAD + arg("edits", bad, kind=kind))
 
 
+NODE = {  # `#` is the parameters, not the argument the value compiles alone
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "node": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"name": {"type": "string"}, "next": {"$ref": "#"}},
+        }
+    },
+}
+PAIR = {  # a ref into the parameters' own structure, as in KVV TestReferences
+    "type": "object",
+    "properties": {
+        "node": {
+            "type": "object",
+            "properties": {
+                "a": {"type": "string"},
+                "b": {"$ref": "#/properties/node/properties/a"},
+            },
+        }
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "params, good, bad",
+    [
+        (
+            NODE,
+            '{"name": "a", "next": {"node": {"name": "b"}}}',
+            '{"next": {"name": "b"}}',
+        ),
+        (PAIR, '{"a": "x", "b": "y"}', '{"a": "x", "b": 1}'),
+    ],
+)
+def test_refs_into_the_parameters_resolve_against_the_parameters(params, good, bad):
+    m = matcher([tool(params)])
+    assert feed(m, HEAD + arg("node", good, kind="object") + END_CALL)
+    m = matcher([tool(params)])
+    assert not feed(m, HEAD + arg("node", bad, kind="object"))
+
+
 def test_json_block_argument_form_is_refused():
     # KimiK3Parser reads argument tags only; a JSON block would reach the client as {}.
     m = matcher([WRITE])

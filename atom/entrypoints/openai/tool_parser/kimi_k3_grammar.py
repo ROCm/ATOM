@@ -64,24 +64,84 @@ def _xtml_type(schema) -> str | None:
     return kind if kind in XTML_TYPES else None
 
 
-def _resolve(schema, defs: dict):
-    """Follow a local ``$ref`` (``#/$defs/X`` or ``#/definitions/X``)."""
-    for _ in range(len(defs) + 1):
-        ref = schema.get("$ref") if isinstance(schema, dict) else None
-        if not isinstance(ref, str):
-            return schema
-        _, _, name = ref.rpartition("/")
-        if not ref.startswith(("#/$defs/", "#/definitions/")) or name not in defs:
+def _pointer(ref, root: dict):
+    """The target of a local ``$ref`` (``#`` or ``#/a/b``) in ``root``, or None."""
+    if ref == "#":
+        return root
+    if not isinstance(ref, str) or not ref.startswith("#/"):
+        return None
+    node = root
+    for part in ref[2:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _resolve(schema, root: dict):
+    """Follow local ``$ref``s against the parameters schema ``root``."""
+    seen = set()
+    while isinstance(schema, dict) and isinstance(schema.get("$ref"), str):
+        ref = schema["$ref"]
+        if ref in seen or not isinstance(_pointer(ref, root), dict):
             return {}
-        schema = defs[name]
-    return {}
+        seen.add(ref)
+        schema = _pointer(ref, root)
+    return schema
 
 
-def _value(schema, defs: dict, carried: dict) -> str:
-    """The rule for ``type="T"<|sep|>VALUE`` of one argument. ``carried`` is
-    the parameters' own ``$defs`` / ``definitions``, so a ``$ref`` inside a
-    typed value still resolves where it is compiled on its own."""
-    target = _resolve(schema, defs)
+def _localize(schema: dict, root: dict) -> dict:
+    """Make ``schema``'s refs into the parameters' own structure resolve where
+    it is compiled on its own, where ``#`` would name the value instead.
+
+    Each such target is copied under ``$defs`` (its refs rewritten the same
+    way) and the ref pointed at the copy; refs into ``$defs`` /
+    ``definitions`` already resolve, as those are carried. Unresolvable refs
+    are left for the compiler to report. As SGLang's ``_localize_root_refs``.
+    """
+    names: dict = {}
+    pending = []
+    taken = set(schema.get("$defs") or ())
+
+    def rewrite(node):
+        if isinstance(node, list):
+            return [rewrite(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        out = {key: rewrite(value) for key, value in node.items()}
+        ref = node.get("$ref")
+        if (
+            isinstance(ref, str)
+            and not ref.startswith(("#/$defs/", "#/definitions/"))
+            and _pointer(ref, root) is not None
+        ):
+            if ref not in names:
+                i = len(names)
+                while f"root_ref_{i}" in taken:
+                    i += 1
+                names[ref] = f"root_ref_{i}"
+                taken.add(names[ref])
+                pending.append(ref)
+            out["$ref"] = f"#/$defs/{names[ref]}"
+        return out
+
+    out = rewrite(schema)
+    hoisted = {}
+    while pending:
+        ref = pending.pop()
+        hoisted[names[ref]] = rewrite(_pointer(ref, root))
+    if hoisted:
+        out["$defs"] = {**(out.get("$defs") or {}), **hoisted}
+    return out
+
+
+def _value(schema, root: dict, carried: dict) -> str:
+    """The rule for ``type="T"<|sep|>VALUE`` of one argument. ``root`` is the
+    parameters schema and ``carried`` its own ``$defs`` / ``definitions``, so
+    a ``$ref`` inside a typed value still resolves where it is compiled on
+    its own."""
+    target = _resolve(schema, root)
     kind = _xtml_type(target)
     if kind == "string":
         allowed = target.get("enum", [target["const"]] if "const" in target else None)
@@ -91,7 +151,7 @@ def _value(schema, defs: dict, carried: dict) -> str:
             return f"{_lit('string' + Q)} <|sep|> ({literals}){optional}"
         return f"{_lit('string' + Q)} <|sep|> TEXT?"
     if kind is not None:
-        json_schema = {**target, **carried}
+        json_schema = _localize({**target, **carried}, root)
         return f"{_lit(kind + Q)} <|sep|> %json {json.dumps(json_schema)}"
     types = " | ".join(_lit(t) for t in XTML_TYPES)
     return f"({types}) {_lit(Q)} <|sep|> TEXT?"
@@ -128,7 +188,6 @@ def _call_rules(index: int, function: dict) -> tuple[str, list[str]]:
     params = function.get("parameters") or {}
     props = params.get("properties") or {}
     carried = {k: params[k] for k in ("$defs", "definitions") if k in params}
-    defs = {**(params.get("definitions") or {}), **(params.get("$defs") or {})}
     extra = params.get("additionalProperties", True)
     required = list(
         dict.fromkeys(k for k in params.get("required") or () if isinstance(k, str))
@@ -143,12 +202,12 @@ def _call_rules(index: int, function: dict) -> tuple[str, list[str]]:
         schema = props.get(key, extra if isinstance(extra, dict) else {})
         head = f'argument key="{_attr(key)}" type="'
         rules.append(
-            f"{names[key]}: <|open|> {_lit(head)} {_value(schema, defs, carried)} "
+            f"{names[key]}: <|open|> {_lit(head)} {_value(schema, params, carried)} "
             f"{_close('argument')}"
         )
     optional = [names[k] for k in props if k not in required]
     if extra is not False:  # undeclared keys, never a declared one
-        undeclared = _value(extra if isinstance(extra, dict) else {}, defs, carried)
+        undeclared = _value(extra if isinstance(extra, dict) else {}, params, carried)
         rules.append(
             f"{rule}_arg_extra: <|open|> {_lit('argument key=' + Q)} "
             f"/{_key_except([_attr(k) for k in names])}/ {_lit(Q + ' type=' + Q)} "
