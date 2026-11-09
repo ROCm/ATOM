@@ -16,6 +16,7 @@ import time
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     StateStoreOperationId,
+    raw_req_id,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import (
@@ -868,9 +869,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             # engine's set membership test lines up.
             if completion.succeeded:
                 op = completion.operation_id
-                self._state_load_survived.add(
-                    op.req_id if hasattr(op, "req_id") else op
-                )
+                self._state_load_survived.add(raw_req_id(op))
             return True
         # Channels this connector does not own. `DenseOffloadConnector` and the
         # rest of the MRO define no `connector_completion`, so `super().` would

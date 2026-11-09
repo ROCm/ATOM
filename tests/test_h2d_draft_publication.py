@@ -16,13 +16,20 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+class _NoBackendMembers:
+    """The attention backend the GDN state mixes into, publishing nothing of
+    its own."""
+
+    def h2d_group_members(self):
+        return {}
+
+
 def make_runner(
     monkeypatch, *, pp_size=1, num_spec=3, replay=False, base=None, max_bs=4
 ):
     from atom.model_engine.model_runner import ModelRunner
     from atom.model_ops.attentions.gdn_attn import GDNStateMixin
 
-    monkeypatch.setenv("ATOM_H2D_BACKEND", "direct")
     monkeypatch.setenv("ATOM_ENABLE_REPLAYSSM", str(int(replay)))
     runner = ModelRunner.__new__(ModelRunner)
     runner.device = torch.device("cuda", 0)
@@ -32,6 +39,7 @@ def make_runner(
     runner.enforce_eager = True
     runner.tokenID_processor = SimpleNamespace(num_bonus=None)
     runner.drafter = SimpleNamespace(mtp_k=num_spec, runner=runner)
+    runner.num_spec_tokens = num_spec
     runner.forward_vars = {
         name: CpuGpuBuffer(32, dtype=torch.int32, device=runner.device)
         for name in ("input_ids", "decode_src", "batch_info")
@@ -42,7 +50,13 @@ def make_runner(
     runner.replayssm_write_pos = torch.full(
         (64,), -1, dtype=torch.int32, device=runner.device
     )
-    cls = base or GDNStateMixin
+    if base is None:
+        cls = type("GDNStateBuilder", (GDNStateMixin, _NoBackendMembers), {})
+    else:
+        # Only the GDN state is allocated here, none of the base's metadata.
+        cls = base
+        backend = cls.__mro__[cls.__mro__.index(GDNStateMixin) + 1]
+        monkeypatch.setattr(backend, "h2d_group_members", lambda self: {})
     builder = cls.__new__(cls)
     builder.model_runner = runner
     builder.device = runner.device
@@ -86,14 +100,24 @@ def batch_and_metadata(builder, step, count, *, prefill=False):
 def test_gdn_decode_indices_select_slot_and_preserve_padding(
     monkeypatch, pp_size, num_spec, replay
 ):
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+
     runner, builder = make_runner(
-        monkeypatch, pp_size=pp_size, num_spec=num_spec, replay=replay
+        monkeypatch,
+        pp_size=pp_size,
+        num_spec=num_spec,
+        replay=replay,
+        base=GDNAttentionMetadataBuilder,
     )
     saved = []
     for step, count in enumerate((3, 1, 4, 0, 2, 3)):
         runner._advance_forward_vars()
         runner._gate_staging_reuse()
         batch, md = batch_and_metadata(builder, step, count)
+        # The attention decode publishes the slots with its own metadata.
+        group = builder.model_runner.h2d_groups["decode_metadata"]
+        builder._stage_decode_state_indices(batch, 4, group)
+        group.publish()
         builder._attach_gdn_decode_metadata(batch, md, prepare_block_tables=False)
         attrs = (
             [("spec_state_indices_tensor", "spec_state_indices")]
@@ -180,6 +204,9 @@ def test_gdn_ragged_decode_reuses_buffers_and_restores_graph_padding(
         bonuses = [i % 4 for i in range(count)]
         runner.tokenID_processor.num_bonus = bonuses if num_spec else None
         torch.cuda._sleep(5_000_000)
+        group = runner.h2d_groups["decode_metadata"]
+        builder._stage_decode_state_indices(batch, 4, group)
+        group.publish()
         builder._attach_gdn_decode_metadata(batch, md, prepare_block_tables=False)
         if num_spec:
             assert md.gdn_metadata.spec_token_indx.numel() == total
@@ -240,10 +267,23 @@ def test_gdn_fork_indices_delayed_reuse_and_draft_graph(monkeypatch, pp_size):
 
 @pytest.mark.parametrize("replay", [False, True])
 def test_gdn_prefill_fork_metadata_uses_current_slot(monkeypatch, replay):
-    runner, builder = make_runner(monkeypatch, pp_size=2, replay=replay)
+    from atom.model_ops.attentions.backends import CommonAttentionBuilder
+    from atom.model_ops.attentions.gdn_attn import GDNStateMixin
+
+    # As a GDN hybrid composes it: the mixin on the attention builder.
+    class Builder(GDNStateMixin, CommonAttentionBuilder):
+        pass
+
+    Builder.__abstractmethods__ = frozenset()
+    runner, builder = make_runner(monkeypatch, pp_size=2, replay=replay, base=Builder)
     runner._advance_forward_vars()
     runner._gate_staging_reuse()
     batch, md = batch_and_metadata(builder, 2, 3, prefill=True)
+    # The slots go up with the prefill's attention metadata, as
+    # `prepare_prefill` publishes it.
+    group = builder.model_runner.h2d_groups["prefill_metadata"]
+    builder._stage_prefill_state_indices(batch, group)
+    group.publish()
     actual = builder.prepare_gdn_metadata(
         batch, md, is_prefill=True, prepare_block_tables=False
     )

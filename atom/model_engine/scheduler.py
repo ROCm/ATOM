@@ -66,7 +66,7 @@ from atom.model_engine.state_runtime import (
 )
 from atom.observability import tracing
 from atom.sampling_params import RequiredChannel
-from atom.structured_output import StructuredRequest
+from atom.structured_output import StructuredRequest, is_structured
 from atom.utils import envs, get_hf_text_config
 from atom.utils.selector import attn_family
 
@@ -254,7 +254,7 @@ class ScheduledBatch:
             )
         self.structured_requests = {}
         for i, seq in enumerate(seqs.values()):
-            if seq.json_schema is None:
+            if not is_structured(seq):
                 continue
             self.structured_requests[i] = StructuredRequest.capture(seq)
         # `context_lens` is set further down, once `num_cached_tokens` is known:
@@ -399,8 +399,13 @@ class ScheduledBatch:
         # its length, and at decode a window is a single token. `extend`
         # between two `array("i")` is a memcpy. 4x at bs=256.
         staged = new_token_ids()
+        # Whether any request prefills. A batch with none (an idle DP rank's
+        # dummy) has no phase of its own: `ForwardMode.decide` gives it the
+        # group's.
+        self.has_prefill = False
         for i, (seq, num) in enumerate(zip(seqs.values(), num_scheduled_tokens)):
             if seq.type == SequenceType.PREFILL:
+                self.has_prefill = True
                 offset = self.num_cached_tokens[i]
             elif is_deferred_out or num_spec_step == 0:
                 offset = seq.num_tokens - num_rejected[i] - num
@@ -688,8 +693,8 @@ class Scheduler:
     ):
         # The runners recorded prefill token graphs
         # (`ModelRunner.prefill_token_graphs`), not merely configured them: a
-        # backend without `supports_token_graph` records none, and its idle DP
-        # rank has no bucket to dummy-prefill on.
+        # backend without `supports_token_graph` records none, and its decoding
+        # rank has no bucket to yield its decode to.
         self.prefill_token_graphs = prefill_token_graphs
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
@@ -802,7 +807,10 @@ class Scheduler:
         # Allocated before the forward, with the step's own blocks: see
         # `draft_kv_lookahead` for the arithmetic and what an unallocated one
         # costs.
-        self.draft_lookahead = draft_kv_lookahead(self.mtp_k)
+        self.draft_lookahead = draft_kv_lookahead(
+            self.mtp_k,
+            block_drafter=(has_spec and config.speculative_config.use_dspark()),
+        )
         self.block_manager.draft_lookahead = self.draft_lookahead
         self.is_deferred_out = defers_output(config)
         if self.use_spec and pp_size > 1:
@@ -973,9 +981,6 @@ class Scheduler:
         self._arrived_requests = 0
         self._local_prefill_coalescing = False
         self._inflight_prefix_wait: dict[int, int] = {}
-        # This tick is the DP group's prefill step and this rank has none of its
-        # own: EngineCore runs a dummy prefill instead of a decode.
-        self.dummy_prefill = False
 
     def _group_prefill_tick(self, decision: PrefillDecision) -> bool:
         """Whether some DP rank prefills this tick, from the delayer's reduce.
@@ -996,8 +1001,16 @@ class Scheduler:
 
     def _wait_for_inflight_prefix(self, seq: Sequence, cached_tokens: int) -> bool:
         """Bounded wait for a hybrid producer's planned prompt-end checkpoint."""
+        if not self._waits_for_inflight_prefix(seq, cached_tokens):
+            return False
+        self._inflight_prefix_wait.setdefault(
+            seq.id, self._schedule_tick + self.prefill_delayer.ttft_max_ticks
+        )
+        return True
+
+    def _waits_for_inflight_prefix(self, seq: Sequence, cached_tokens: int) -> bool:
+        """Whether `_wait_for_inflight_prefix` would wait; starts no deadline."""
         bm = self.block_manager
-        delayer = self.prefill_delayer
         if (
             not bm.enable_prefix_caching
             or not bm.state.enabled
@@ -1042,9 +1055,6 @@ class Scheduler:
                 np.frombuffer(seq.token_ids, dtype=np.int32, count=anchor),
                 np.frombuffer(producer.token_ids, dtype=np.int32, count=anchor),
             ):
-                self._inflight_prefix_wait.setdefault(
-                    seq.id, self._schedule_tick + delayer.ttft_max_ticks
-                )
                 return True
         return False
 
@@ -1095,7 +1105,7 @@ class Scheduler:
         prefillable = pending > 0
         if pending >= budget or len(self.running) >= self.max_num_seqs:
             return prefillable, min(pending, budget)
-        probed_tokens = 0
+        # A chunk counts the rows its forward computes, not the reused prefix.
         slots = self.max_num_seqs - len(self.running)
         for seq in self._waiting_prefills():
             offload_resume = self._is_offload_prefill_resume(seq)
@@ -1106,11 +1116,8 @@ class Scheduler:
                     seq, resume, hit=self.block_manager.tier_resume_replays(seq)
                 )
             else:
-                if probed_tokens >= budget:
-                    break
                 # The exact probe's answer; the walk is memoised across ticks.
                 cached_blocks = self.block_manager.can_allocate_memoized(seq)
-                probed_tokens += seq.num_tokens
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at the first allocation refusal.
                 if slots <= self._num_parked_remote_kv:
@@ -1120,6 +1127,10 @@ class Scheduler:
                     prefillable = True
                     break
                 resume = cached_blocks * self.block_manager.hash_block_size
+                if self._waits_for_inflight_prefix(
+                    seq, max(resume, seq.offload_joint.kv_prefix_tokens)
+                ):
+                    break  # Admission defers it; the seqs behind it go uncounted.
                 cached = self.block_manager.replay_start(seq, resume, hit=True)
             remaining = (
                 seq.num_tokens - cached
@@ -2183,7 +2194,7 @@ class Scheduler:
 
         # Before the early return below: an idle rank keeps its peers' prefill
         # company too.
-        self.dummy_prefill = self._group_prefill_tick(decision)
+        group_prefill_tick = self._group_prefill_tick(decision)
 
         if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
@@ -2835,9 +2846,9 @@ class Scheduler:
 
             return (prefill_batch, scheduled_seqs)
 
-        if self.dummy_prefill:
+        if group_prefill_tick:
             # The group's prefill step, with no prefill of this rank's own: it
-            # keeps its peers company on a dummy prefill rather than decode, so
+            # keeps its peers company on an idle step rather than decode, so
             # every rank's forward replays its token graph (`ForwardMode.decide`).
             return None
 
