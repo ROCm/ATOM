@@ -4047,6 +4047,14 @@ models:
       - <<: *issue382_a9_1p2d_c260_pernic4352_tuned_mem90
         name: issue382-a9-1p2d-c260-pernic4352-tuned-mem90-icp
         env: *issue382_a9_pernic4352_tuned_icp_env
+      # Indexer CP with the decodes back at 0.94: without CP, C240 at 0.94
+      # beat 0.9 (105.0K vs 102.9K tok/s/GPU), its decodes' KV at the cap.
+      - <<: *issue382_a9_1p2d_c220_pernic4352_tuned
+        name: issue382-a9-1p2d-c220-pernic4352-tuned-icp
+        env: *issue382_a9_pernic4352_tuned_icp_env
+      - <<: *issue382_a9_1p2d_c240_pernic4352
+        name: issue382-a9-1p2d-c240-pernic4352-tuned-icp
+        env: *issue382_a9_pernic4352_tuned_icp_env
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c330
         concurrency:
