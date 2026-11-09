@@ -6,7 +6,6 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
@@ -513,67 +512,53 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
         return None
 
-    def prepare_prefill(
-        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
-    ):
-        attn_metadata, positions = super().prepare_prefill(
-            batch, running_bs, running_tokens
-        )
+    def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
+        # The draft's slots go up with either phase's attention metadata
+        # (`stage_prefill` / `stage_decode`).
+        members = super().h2d_group_members()
+        if "draft_ctx_slots" in self.model_runner.forward_vars:
+            for phase in ("prefill_metadata", "decode_metadata"):
+                members[phase] = members.get(phase, ()) + ("draft_ctx_slots",)
+        return members
+
+    def stage_prefill(self, batch, running_bs, running_tokens, group):
+        built = super().stage_prefill(batch, running_bs, running_tokens, group)
         scheduled_bs = batch.total_seqs_num_prefill
-        self._publish_draft_ctx_slots(
+        self._stage_draft_ctx_slots(
             batch,
             batch.num_scheduled_tokens[:scheduled_bs],
             batch.total_tokens_num_prefill,
+            group,
         )
-        if batch.block_tables == []:
-            attn_metadata.gdn_metadata = None
-            return attn_metadata, positions
-        attn_metadata.gdn_metadata = self.prepare_gdn_metadata(
-            batch,
-            attn_metadata,
-            is_prefill=True,
-            prepare_block_tables=False,
-        )
-        return attn_metadata, positions
+        return built
 
-    def prepare_decode(
-        self,
-        batch: ScheduledBatch,
-        running_bs: int,
-        running_tokens: int,
-        max_seqlen_q: int,
-    ):
-        attn_metadata, positions = super().prepare_decode(
-            batch, running_bs, running_tokens, max_seqlen_q
+    def stage_decode(self, batch, running_bs, running_tokens, max_seqlen_q, group):
+        built = super().stage_decode(
+            batch, running_bs, running_tokens, max_seqlen_q, group
         )
-        self._publish_draft_ctx_slots(
+        self._stage_draft_ctx_slots(
             batch,
             np.full(batch.total_seqs_num_decode, max_seqlen_q, dtype=np.int32),
             running_tokens,
+            group,
         )
-        self._attach_gdn_decode_metadata(
-            batch,
-            attn_metadata,
-            prepare_block_tables=False,
-        )
-        return attn_metadata, positions
+        return built
 
-    def _publish_draft_ctx_slots(
-        self, batch: ScheduledBatch, seqlens_q: np.ndarray, rows: int
+    def _stage_draft_ctx_slots(
+        self, batch, seqlens_q: np.ndarray, rows: int, group
     ) -> None:
-        """Upload the draft's own slot for each scheduled token, `-1` out to
-        `rows`, the width the target's `slot_mapping` was uploaded at.
+        """The draft's own slot for each scheduled token, `-1` out to `rows`,
+        the width the target's `slot_mapping` goes up at, counted into
+        ``group``.
 
-        Runs after the target's metadata, whose positions and packed block
-        table it reads. No DCP filter, as the draft stores every token, and
-        `entry_tokens` per block id.
+        Runs after the target's staging, whose host positions and packed
+        block table it reads. No DCP filter, as the draft stores every token,
+        and `entry_tokens` per block id.
         """
         var = self.model_runner.forward_vars
         buf = var.get("draft_ctx_slots")
         if buf is None or batch.is_dummy_run:
             return
-        if buf._publication is not None:
-            buf._publication.acquire_write()
         n = int(seqlens_q.sum())
         buf.np[n:rows] = -1
         if batch.block_tables:
@@ -587,15 +572,12 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             )
         else:
             buf.np[:n] = -1
-        buf.copy_to_gpu(rows)
+        group.set_count(buf, rows)
 
-    def _capture_needs_nonempty_kv(self, max_q_len: int) -> bool:
-        # Kimi's dense MLA warmup needs a page even with page_size=1.
-        # The parent owns the single upload, including DCP + MTP capture.
-        return True
-
-    def build_for_cudagraph_capture(self, bs: int):
-        attn_metadata, context = super().build_for_cudagraph_capture(bs)
+    def build_for_cudagraph_capture(self, bs: int, *, decode_ubatch_slices=None):
+        attn_metadata, context = super().build_for_cudagraph_capture(
+            bs, decode_ubatch_slices=decode_ubatch_slices
+        )
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
         return attn_metadata, context
 

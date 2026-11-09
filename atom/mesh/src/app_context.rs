@@ -11,7 +11,10 @@ use reqwest::Client;
 
 use crate::{
     config::RouterConfig,
-    core::{steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
+    core::{
+        prepare_pool::PrepareHandle, steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry,
+        WorkerService,
+    },
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -35,6 +38,7 @@ impl std::error::Error for AppContextBuildError {}
 
 #[derive(Clone)]
 pub struct AppContext {
+    pub prepare_pool: PrepareHandle,
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
@@ -67,6 +71,7 @@ impl std::fmt::Debug for AppContext {
 }
 
 pub struct AppContextBuilder {
+    prepare_pool: Option<PrepareHandle>,
     client: Option<Client>,
     router_config: Option<RouterConfig>,
     rate_limiter: Option<Arc<TokenBucket>>,
@@ -90,14 +95,15 @@ impl AppContext {
         AppContextBuilder::new()
     }
 
-    /// Create AppContext from config with all components initialized
-    /// This is the main entry point that replaces ~194 lines of initialization in server.rs
+    /// Build a context with the caller-owned preparation pool.
     pub async fn from_config(
         router_config: RouterConfig,
         request_timeout_secs: u64,
+        prepare_pool: PrepareHandle,
     ) -> Result<Self, String> {
         AppContextBuilder::from_config(router_config, request_timeout_secs)
             .await?
+            .prepare_pool(prepare_pool)
             .build()
             .map_err(|e| e.to_string())
     }
@@ -106,6 +112,7 @@ impl AppContext {
 impl AppContextBuilder {
     pub fn new() -> Self {
         Self {
+            prepare_pool: None,
             client: None,
             router_config: None,
             rate_limiter: None,
@@ -127,6 +134,12 @@ impl AppContextBuilder {
 
     pub fn client(mut self, client: Client) -> Self {
         self.client = Some(client);
+        self
+    }
+
+    /// The caller owns the runtime and must keep it alive.
+    pub fn prepare_pool(mut self, prepare_pool: PrepareHandle) -> Self {
+        self.prepare_pool = Some(prepare_pool);
         self
     }
 
@@ -240,6 +253,9 @@ impl AppContextBuilder {
             self.rate_limiter.clone(),
         ));
         Ok(AppContext {
+            prepare_pool: self
+                .prepare_pool
+                .ok_or(AppContextBuildError("prepare_pool"))?,
             admission,
             client: self.client.ok_or(AppContextBuildError("client"))?,
             router_config,
@@ -276,8 +292,7 @@ impl AppContextBuilder {
         })
     }
 
-    /// Initialize AppContext from config - creates ALL components
-    /// This replaces ~194 lines of initialization logic from server.rs
+    /// Initialize components from config.
     pub async fn from_config(
         router_config: RouterConfig,
         request_timeout_secs: u64,

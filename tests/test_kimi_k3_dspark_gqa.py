@@ -727,7 +727,7 @@ def test_draft_slots_store_every_token_at_entry_granularity(dcp):
 
 
 def _builder_stub(entry_tokens, tables, positions, rows=64):
-    """What `_publish_draft_ctx_slots` reads off the builder and its runner."""
+    """What `_stage_draft_ctx_slots` reads off the builder and its runner."""
     import numpy as np
     import torch
 
@@ -757,34 +757,52 @@ def _builder_stub(entry_tokens, tables, positions, rows=64):
     )
 
 
-def _publish(stub, seqlens, rows, tables, dummy=False):
-    """Drive the real `_publish_draft_ctx_slots`; return the device buffer."""
+class _Group:
+    """The phase's H2D group: records each member's count."""
+
+    def __init__(self):
+        self.counts = {}
+
+    def set_count(self, buffer, count):
+        self.counts[id(buffer)] = count
+
+
+def _stage(stub, seqlens, rows, tables, dummy=False):
+    """Drive the real `_stage_draft_ctx_slots`; return the host slots and the
+    count it recorded into the group (None if it recorded none)."""
     import numpy as np
 
     kimi = _gpu_stack_import("atom.model_ops.attentions.kimi_mla_gdn_attn")
     buf = stub.model_runner.forward_vars.get("draft_ctx_slots")
     batch = types.SimpleNamespace(is_dummy_run=dummy, block_tables=tables)
-    kimi._KimiMLAGDNCommon._publish_draft_ctx_slots(
-        stub, batch, np.asarray(seqlens, dtype=np.int32), rows
+    group = _Group()
+    kimi._KimiMLAGDNCommon._stage_draft_ctx_slots(
+        stub, batch, np.asarray(seqlens, dtype=np.int32), rows, group
     )
-    return None if buf is None else buf.gpu
+    if buf is None:
+        assert not group.counts
+        return None, None
+    return buf.np, group.counts.get(id(buf))
 
 
 @pytest.mark.parametrize("dcp", [1, 8])
-def test_the_builder_uploads_the_draft_slots(dcp):
-    """The target's builder uploads, at entry granularity and with no DCP
-    filter, the host slot of every scheduled token."""
+def test_the_builder_stages_the_draft_slots(dcp):
+    """The target's builder stages, at entry granularity and with no DCP
+    filter, the host slot of every scheduled token, and counts them into the
+    phase's group."""
     vblock = 128 * dcp
     positions = [vblock - 2, vblock - 1, vblock, 5, 6]
     stub = _builder_stub(vblock, _TABLES, positions)
-    got = _publish(stub, _SEQLENS, len(positions), _TABLES)
+    got, count = _stage(stub, _SEQLENS, len(positions), _TABLES)
+    assert count == 5
     assert got[:5].tolist() == _host_slots(_TABLES, _SEQLENS, positions, vblock)
 
 
 def test_the_builder_drops_the_padded_decode_rows():
     """Graph-padded rows past the scheduled tokens get `-1`, written nowhere."""
     stub = _builder_stub(1024, _TABLES, [3, 4, 7, 8])
-    got = _publish(stub, [2, 2], 6, _TABLES)
+    got, count = _stage(stub, [2, 2], 6, _TABLES)
+    assert count == 6
     assert got[:6].tolist() == [
         7 * 1024 + 3,
         7 * 1024 + 4,
@@ -796,12 +814,14 @@ def test_the_builder_drops_the_padded_decode_rows():
 
 
 def test_the_builder_skips_dummy_runs_and_drafts_without_a_pool():
-    """A dummy run uploads nothing; a target with no pooled draft has no
-    buffer to fill and is a no-op."""
+    """A dummy run stages and counts nothing; a target with no pooled draft
+    has no buffer to fill and is a no-op."""
     stub = _builder_stub(1024, _TABLES, [0, 1])
-    assert _publish(stub, [2], 2, _TABLES, dummy=True)[:2].tolist() == [0, 0]
+    got, count = _stage(stub, [2], 2, _TABLES, dummy=True)
+    assert count is None
+    assert got[:2].tolist() == [7, 7]
     del stub.model_runner.forward_vars["draft_ctx_slots"]
-    assert _publish(stub, [2], 2, _TABLES) is None
+    assert _stage(stub, [2], 2, _TABLES) == (None, None)
 
 
 # --------------------------------------------------------------------------- #
