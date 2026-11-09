@@ -156,3 +156,66 @@ def test_mono_dispatch_routes_to_the_single_launch_when_enabled(monkeypatch):
     cfg = atom_config()
     assert mono_dispatch.install_mono_decode("m", cfg, "d") == "single"
     assert seen["args"] == ("m", cfg, "d")
+
+
+class _Runner:
+    def __init__(self, ok=True):
+        self.ok = ok
+
+    def precheck(self, batch, forward_context):
+        return self.ok
+
+
+def _batch(**kw):
+    return NS(
+        **{
+            "structured_requests": None,
+            "any_logprobs": False,
+            "required_channel": None,
+            **kw,
+        }
+    )
+
+
+@pytest.fixture
+def verify_step(monkeypatch):
+    fc = NS(spec_decode_metadata=object())
+    monkeypatch.setattr(dispatch, "get_forward_context", lambda: fc)
+    return fc
+
+
+def test_a_decode_verify_step_is_served(model, verify_step):
+    model._single.runner = _Runner()
+    assert model.single_step_runner(_batch(), 48) is model._single.runner
+
+
+@pytest.mark.parametrize(
+    "batch",
+    [
+        _batch(structured_requests=[1]),
+        _batch(any_logprobs=True),
+        _batch(required_channel=0),
+    ],
+)
+def test_steps_needing_logits_take_the_production_path(model, verify_step, batch):
+    model._single.runner = _Runner()
+    assert model.single_step_runner(batch, 48) is None
+
+
+def test_a_step_without_drafts_takes_the_production_path(model, verify_step):
+    verify_step.spec_decode_metadata = None
+    model._single.runner = _Runner()
+    assert model.single_step_runner(_batch(), 48) is None
+
+
+def test_a_request_shape_the_kernel_refuses_takes_the_production_path(
+    model, verify_step
+):
+    model._single.runner = _Runner(ok=False)
+    assert model.single_step_runner(_batch(), 48) is None
+
+
+def test_shadow_mode_never_serves(model, verify_step, monkeypatch):
+    monkeypatch.setenv("ATOM_MONO_SINGLE_SHADOW", "1")
+    model._single.runner = _Runner()
+    assert model.single_step_runner(_batch(), 48) is None

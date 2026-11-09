@@ -20,6 +20,7 @@ from atom.models.deepseek_v41.mono.gfx1250_single.config import (
 from atom.models.deepseek_v41.mono.gfx1250_single.debug import ShadowModel
 from atom.mono.runtime.route import LazyRunner
 from atom.utils import envs
+from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
@@ -48,6 +49,27 @@ class SingleStepModel(ShadowModel, nn.Module):
             and rows % ROWS_PER_REQ == 0
             and self._single.ready(rows)
         )
+
+    def single_step_runner(self, batch, rows: int):
+        """``ModelRunner``: the runner when this decode step runs as the single launch, else None (the production
+        path). Only a DSpark verify with nothing the kernel does not produce: no structured output, no logprobs, no
+        required channel (it returns ids and the verdict, not logits), and request shapes the kernel takes
+        (``precheck``)."""
+        if (
+            envs.ATOM_MONO_SINGLE_SHADOW
+        ):  # the production path serves, the launch only compares
+            return None
+        if batch is not None and (
+            getattr(batch, "structured_requests", None)
+            or batch.any_logprobs
+            or getattr(batch, "required_channel", None) is not None
+        ):
+            return None
+        fc = get_forward_context()
+        if fc.spec_decode_metadata is None or not self.step_ready(rows):
+            return None
+        runner = self._single.runner
+        return runner if runner.precheck(batch, fc) else None
 
     def set_step_batch(self, batch) -> None:
         """``ModelRunner.run_model``: this step's batch (the per-request sampling parameters the launch reads)."""

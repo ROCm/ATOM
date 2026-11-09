@@ -3872,30 +3872,13 @@ class ModelRunner:
         return fwd_output
 
     def _single_step(self, batch, running_tokens):
-        """The gfx1250 single-launch step's runner, when it serves this decode
-        step (``deepseek_v41/mono/gfx1250_single``), else None. Only a DSpark
-        verify with nothing the kernel does not produce: no structured output,
-        no logprobs, no required channel (it returns ids and the verdict, not
-        logits)."""
-        ready = getattr(self.model, "step_ready", None)
-        if (
-            envs.ATOM_MONO_SINGLE_SHADOW
-        ):  # bring-up: the production path serves, the launch only compares
+        """The gfx1250 single-launch step's runner when it serves this decode
+        step (``deepseek_v41/mono/gfx1250_single``: the model decides), else
+        None."""
+        serves = getattr(self.model, "single_step_runner", None)
+        if serves is None or not hasattr(self, "drafter"):
             return None
-        if ready is None or not hasattr(self, "drafter"):
-            return None
-        if batch is not None and (
-            getattr(batch, "structured_requests", None)
-            or batch.any_logprobs
-            or getattr(batch, "required_channel", None) is not None
-        ):
-            return None
-        if get_forward_context().spec_decode_metadata is None:
-            return None
-        runner = self.model.single_runner if ready(running_tokens) else None
-        if runner is not None and not runner.precheck(batch, get_forward_context()):
-            return None  # a request shape the kernel refuses: this step on the production path
-        return runner
+        return serves(batch, running_tokens)
 
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:
