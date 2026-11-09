@@ -5,6 +5,7 @@ shares (one TP group on one node, decode steps in the model's own graph), which
 a model's own list extends."""
 
 from atom.config import CompilationLevel
+from atom.model_engine.capabilities import pcp_group_size_of
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.plan.shard import shard_refusal
 from atom.plugin.prepare import is_sglang, is_vllm
@@ -139,7 +140,7 @@ def common_refusals(
             not refuse_decode_cp or atom_config.decode_context_parallel_size == 1,
             "decode CP",
         ),
-        (atom_config.prefill_context_parallel_size == 1, "prefill CP"),
+        (pcp_group_size_of(atom_config) == 1, "prefill CP or Ulysses SP"),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
         (

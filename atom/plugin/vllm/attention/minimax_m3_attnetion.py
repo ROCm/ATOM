@@ -213,7 +213,6 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         index_q_norm: nn.Module | None = None,
         index_k_norm: nn.Module | None = None,
         index_rotary_emb: nn.Module | None = None,
-        index_q_size: int = 0,
         index_head_dim: int = 0,
         topk: int = 0,
         init_blocks: int = 0,
@@ -275,9 +274,9 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         self.k_norm = k_norm
         self.index_q_norm = index_q_norm
         self.index_k_norm = index_k_norm
-        self.index_q_size = index_q_size
         self.index_head_dim = index_head_dim
         self.num_idx_heads = num_kv_heads
+        self.index_q_size = num_kv_heads * index_head_dim
         self.topk = topk
         self.init_blocks = init_blocks
         self.local_blocks = local_blocks
@@ -288,7 +287,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             raise ValueError("MiniMax-M3 sparse attention requires head_dim == 128.")
         if index_q_norm is None or index_k_norm is None:
             raise ValueError("MiniMax-M3 sparse attention requires index norms.")
-        if index_head_dim <= 0 or index_q_size <= 0 or topk <= 0:
+        if index_head_dim <= 0 or topk <= 0:
             raise ValueError(
                 "MiniMax-M3 sparse attention requires index dimensions/topk."
             )

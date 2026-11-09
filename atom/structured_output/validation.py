@@ -201,7 +201,7 @@ def validate_execution_options(
         )
     if params.logprobs and getattr(spec, "num_speculative_tokens", 0):
         raise ValueError(
-            "Structured output with speculative logprobs requires token-level logprob support"
+            "Combining JSON Schema, speculative decoding and logprobs is not supported; disable speculative decoding or logprobs"
         )
 
 

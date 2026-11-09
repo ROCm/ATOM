@@ -538,10 +538,14 @@ class Context:
     # whole-forward buffer from inside the model must add it, or the ubatches
     # land on each other's rows. Read per-thread (the context is thread-local).
     ubatch_token_offset: int = 0
-    # This pass's rows are this rank's round-robin 1/pcp shard of the tokens.
-    # Set where the split is made; FusedMoE reads it to gather its routed rows
-    # across the PCP group (`ATOM_PCP_MOE_MERGE`).
+    # This pass's rows are this rank's 1/pcp shard of the tokens: round-robin
+    # under PCP, a contiguous range under SP. Set where the split is made;
+    # FusedMoE reads it to gather its routed rows across the PCP group
+    # (`ATOM_PCP_MOE_MERGE`, or SP).
     pcp_split: bool = False
+    # The step's rows, set where the forward runs a shard of them (SP): the
+    # token-graph bucket a recording is listed under (`TokenGraph.captured_sizes`).
+    step_rows: int = 0
     # Whether this step's TARGET forward row-split, fixed by ModelRunner right
     # after it. Unlike `pcp_split` it survives drafting, which clears that per
     # pass; the drafter's aux gather and draft prefill split read this one.
