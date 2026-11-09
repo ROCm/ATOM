@@ -21,7 +21,6 @@ from typing import Any
 
 from atom.kv_transfer.disaggregation.types import LoadOperationId, SaveOperationId
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
 from atom.kv_transfer.offload._offload_common import (
     max_pending_saves,
     validated_kv_role,
@@ -29,6 +28,7 @@ from atom.kv_transfer.offload._offload_common import (
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, LoadSpec, SaveSpec
 from atom.kv_transfer.offload.mooncake_store import client as store_client
+from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
 from atom.kv_transfer.offload.mooncake_store.config import (
     MooncakeStoreOffloadConfig,
     StorePool,
@@ -476,6 +476,11 @@ class _StoreLookup:
 class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
     """Chunked offload scheduling with the Mooncake Store as the tier."""
 
+    # The Store reads whole chunks into fresh blocks, so an HBM hit that ends
+    # inside a chunk can be lowered to the chunk floor (see
+    # `BlockManager.lower_hit_to_chunk`).
+    lowers_hbm_hit_to_chunk = True
+
     # Workers publish one source-safe group per chunk once its GPU pack is
     # done (the block GPU connector), separately from the store terminal.
     _supports_early_block_release = True
@@ -498,9 +503,11 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         super().__init__(
             config,
             chunk_size=cfg.chunk_tokens,
-            lookup_client=AsyncStoreLookup(_StoreLookup(
-                cfg, namespace=namespace, world=world, chunk_tokens=cfg.chunk_tokens
-            )),
+            lookup_client=AsyncStoreLookup(
+                _StoreLookup(
+                    cfg, namespace=namespace, world=world, chunk_tokens=cfg.chunk_tokens
+                )
+            ),
         )
         extra = kvc.get("kv_connector_extra_config", kvc) or {}
         # Unbounded unless asked for, in the connector config or through

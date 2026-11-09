@@ -403,6 +403,15 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         c = self._prefetch_tier()
         return c is not None and c.lookup_ready(seq)
 
+    @property
+    def lowers_hbm_hit_to_chunk(self):
+        return bool(getattr(self._prefetch_tier(), "lowers_hbm_hit_to_chunk", False))
+
+    def held_tier_hit(self, seq):
+        c = self._prefetch_tier()
+        callback = getattr(c, "held_tier_hit", None)
+        return int(callback(seq)) if callable(callback) else 0
+
     def take_ready_lookup(self, seq):
         c = self._prefetch_tier()
         return c is not None and c.take_ready_lookup(seq)
