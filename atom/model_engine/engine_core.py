@@ -32,6 +32,7 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.observability import tracing
+from atom.structured_output import is_structured
 from atom.utils import (
     engine_process_name,
     envs,
@@ -484,9 +485,7 @@ class EngineCore:
                 logger.exception("KV event publish in engine-step finally failed")
 
     def _release_request_resources(self, sequences):
-        structured_ids = [
-            seq.id for seq in sequences if getattr(seq, "json_schema", None) is not None
-        ]
+        structured_ids = [seq.id for seq in sequences if is_structured(seq)]
         if structured_ids:
             self.runner_mgr.call_func("release_structured_requests", structured_ids)
         request_ids = [
@@ -905,8 +904,6 @@ class DPEngineCoreProc(EngineCore):
         self.dp_rank = config.parallel_config.data_parallel_rank
         # self.dp_group = config.parallel_config.stateless_init_dp_group()
         super().__init__(config, input_address, output_address)
-        # Initialize to True so first iteration reaches all_reduce
-        self.engines_running = True
         self._shutting_down = False
 
         self._init_prefill_delayer(config, self.dp_group)
@@ -976,11 +973,7 @@ class DPEngineCoreProc(EngineCore):
                     time.sleep(0.01)
                     continue
 
-                if not global_has_unfinished and not self.engines_running:
-                    self.engines_running = False
-                    # Pass one never lands here -- `engines_running` starts
-                    # True so the first all_reduce runs -- so window one also
-                    # carries that rendezvous. The first line is warmup.
+                if not global_has_unfinished:
                     # Global, not local: a locally idle rank reaching the pair
                     # below is running a dummy for its peers, which is work.
                     self.scheduler.engine_stats.note_idle(now)
@@ -1000,8 +993,6 @@ class DPEngineCoreProc(EngineCore):
                 # After the pair, so the idle rank's dummy counts too: that is
                 # what keeps every rank's step number equal. See `bump_step`.
                 self.scheduler.engine_stats.bump_step()
-
-                self.engines_running = global_has_unfinished
         finally:
             try:
                 # Isolate the final publish so a publisher hiccup cannot skip
@@ -1016,11 +1007,9 @@ class DPEngineCoreProc(EngineCore):
                 tracing.shutdown()
 
     def _execute_dummy_batch(self):
-        prefill = self.scheduler.dummy_prefill
-        fwd_out = self.runner_mgr.call_func("dummy_execution", prefill, wait_out=True)
-        if prefill and self.scheduler.running:
-            # This rank decoded last step and gave this tick to its peers'
-            # prefill: the tokens that step sampled come back with this
+        fwd_out = self.runner_mgr.call_func("dummy_execution", wait_out=True)
+        if self.scheduler.running:
+            # The tokens this rank's last real step sampled come back with this
             # forward (deferred output), and land like any step's.
             self._postprocess((), fwd_out, None)
 

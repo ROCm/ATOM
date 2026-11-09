@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 from aiter_stub import atom_without_aiter
@@ -68,15 +69,18 @@ def test_runner_model_height_and_sampling_rows(
     ids[:scheduled] = torch.arange(1, scheduled + 1)
     pos = torch.full((32,), -99, dtype=torch.int64)
     pos[:scheduled] = torch.arange(11, scheduled + 11)
+    # The builder publishes the padding positions (`_pad_tokens`).
+    pos[scheduled:running] = 0
     runner.forward_vars = {
         "input_ids": SimpleNamespace(gpu=ids),
         "positions": SimpleNamespace(gpu=pos),
         "mrope_positions": SimpleNamespace(gpu=torch.full((96,), -99)),
     }
     if mrope:
-        # The mRoPE builder packs three planes at the running-token stride.
+        # The mRoPE builder packs three planes at the running-token stride,
+        # padding included.
         positions = runner._mrope_positions_view(running)
-        positions[:, :scheduled] = pos[:scheduled]
+        positions[:] = pos[:running]
     else:
         positions = pos[:scheduled]
     mode = modules.forward_context.ForwardMode(
@@ -96,6 +100,7 @@ def test_runner_model_height_and_sampling_rows(
             scheduled_bs=seqs,
             is_prefill=prefill,
             tbo_on=False,
+            running_tokens_per_dp_rank=np.zeros(1, dtype=np.int32),
         ),
         token_graph=token_graph,
     )
@@ -156,7 +161,9 @@ def test_runner_model_height_and_sampling_rows(
                 # The LM head picks each prompt's last row from the local shard.
                 torch.testing.assert_close(hidden, local_rows())
                 hidden = global_ids()[:scheduled, None].float()
-            assert hidden.shape[0] == scheduled
+            else:
+                # The LM head runs the running rows; `postprocess` cuts them.
+                assert hidden.shape[0] == expected_rows
             return hidden + 1
 
     if sp_rank is not None:
@@ -180,8 +187,10 @@ def test_runner_model_height_and_sampling_rows(
     if sp_prefill:
         torch.testing.assert_close(hidden, local_rows())
     else:
-        assert hidden.shape == (scheduled, 1)
-    torch.testing.assert_close(logits[:, 0], torch.arange(2, scheduled + 2).float())
+        assert hidden.shape == (expected_rows, 1)
+    torch.testing.assert_close(
+        logits[:scheduled, 0], torch.arange(2, scheduled + 2).float()
+    )
     assert torch.all(ids[running:] == -99)
     for name, (original, values) in original_metadata.items():
         assert getattr(metadata, name) is original
