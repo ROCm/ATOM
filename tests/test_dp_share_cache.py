@@ -208,10 +208,8 @@ def test_the_newcomer_carries_the_entry_if_the_owner_leaves_unprefilled():
     assert probe.rank == second.rank  # B holds the prefix now
 
 
-def _engine_with(waiting, running=()):
+def _scheduler_with(waiting, running=()):
     from collections import deque
-
-    from atom.model_engine.engine_core import EngineCore
 
     class Sched:
         def __init__(self):
@@ -221,16 +219,11 @@ def _engine_with(waiting, running=()):
         def pending_prefill_tokens(self, seq, *, estimate=False):
             return seq.tokens
 
-    engine = EngineCore.__new__(EngineCore)
-    engine.scheduler = Sched()
-    engine._ingested_seqs = 0
-    engine._last_backlog_report = None
-    sent = []
-    engine.output_queue = SimpleNamespace(put_nowait=sent.append)
-    return engine, sent
+    return Sched()
 
 
-def test_the_backlog_report_skips_aborted_requests_and_bounds_its_scan(monkeypatch):
+def test_the_backlog_report_skips_aborted_requests_and_bounds_its_scan():
+    from atom.model_engine.prefill_backlog import prefill_backlog
     from atom.model_engine.sequence import SequenceStatus
 
     live = SimpleNamespace(
@@ -239,16 +232,16 @@ def test_the_backlog_report_skips_aborted_requests_and_bounds_its_scan(monkeypat
     dead = SimpleNamespace(
         status=SequenceStatus.ABORTED, tokens=10_000, num_completion_tokens=0
     )
-    engine, sent = _engine_with([live, dead, live])
-    engine._report_prefill_backlog()
-    assert sent[-1] == ("PREFILL_BACKLOG", (0, 200))  # the aborted one is no work
-
-    from atom.model_engine.engine_core import EngineCore
-
-    monkeypatch.setattr(EngineCore, "_BACKLOG_SCAN", 10)
-    engine, sent = _engine_with([live] * 100)
-    engine._report_prefill_backlog()
-    assert sent[-1] == ("PREFILL_BACKLOG", (0, 10_000))  # 10 scanned, 90 extrapolated
+    assert prefill_backlog(_scheduler_with([live, dead, live])) == 200  # no abort
+    # 10 scanned, 90 extrapolated.
+    assert prefill_backlog(_scheduler_with([live] * 100), scan=10) == 10_000
+    decoding = SimpleNamespace(
+        status=SequenceStatus.RUNNING, tokens=500, num_completion_tokens=3
+    )
+    prefilling = SimpleNamespace(
+        status=SequenceStatus.RUNNING, tokens=40, num_completion_tokens=0
+    )
+    assert prefill_backlog(_scheduler_with([], [decoding, prefilling])) == 40
 
 
 def test_a_promoted_backup_that_also_aborts_takes_the_entry_with_it():

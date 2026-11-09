@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import itertools
 import logging
 import pickle
 import queue
@@ -23,6 +22,7 @@ from atom.model_engine.dynamic_chunking import (
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
+from atom.model_engine.prefill_backlog import prefill_backlog
 from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
@@ -72,8 +72,6 @@ class EngineCore:
     # Whether the engine reports its prefill backlog to the CoreManager
     # (`share_cache` routing); the data-parallel engine turns it on.
     _report_backlog = False
-    # Waiting requests `_report_prefill_backlog` walks each step.
-    _BACKLOG_SCAN = 1024
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
@@ -775,24 +773,7 @@ class EngineCore:
         that has produced tokens is decoding and counts nothing; a preempted one
         waits to prefill again and counts what it must recompute.
         """
-        backlog = 0
-        sched = self.scheduler
-        # Bounded per step: the router needs the backlog to a few percent, not
-        # exactly, so a deep queue is sampled and the rest extrapolated. An
-        # aborted request is no work.
-        scanned = counted = 0
-        for seq in itertools.islice(sched.waiting, self._BACKLOG_SCAN):
-            scanned += 1
-            if seq.status != SequenceStatus.ABORTED:
-                counted += sched.pending_prefill_tokens(seq, estimate=True)
-        backlog += counted
-        if scanned == self._BACKLOG_SCAN and len(sched.waiting) > scanned:
-            backlog += counted * (len(sched.waiting) - scanned) // scanned
-        backlog += sum(
-            sched.pending_prefill_tokens(seq, estimate=True)
-            for seq in sched.running
-            if seq.num_completion_tokens == 0
-        )
+        backlog = prefill_backlog(self.scheduler)
         report = (self._ingested_seqs, backlog)
         if report != self._last_backlog_report:
             self._last_backlog_report = report
