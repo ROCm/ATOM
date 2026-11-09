@@ -147,4 +147,4 @@ class AsyncStoreLookup:
             for f in self.pending.values():
                 f.cancel()
             self.pending.clear()
-        self.executor.shutdown(wait=True
+        self.executor.shutdown(wait=True, cancel_futures=True)
