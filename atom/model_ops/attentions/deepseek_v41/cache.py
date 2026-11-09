@@ -30,6 +30,7 @@ from atom.model_ops.deepseek_v41.index_write import (
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
+from atom.model_ops.v4_kernels.compress_tail import compress_tail
 from atom.model_ops.v4_kernels.state_writes import (
     swa_scatter_rows,
     swa_scatter_rows_reference,
@@ -594,10 +595,47 @@ class PagedAttentionCache:
             if self.window_fp8
             else (self.pages.view(f"main_{owner}")[0], step.block_tables)
         )
+        # A quantized pool's ring update, quant and both planes' scatter are
+        # one launch: they write disjoint memory, and a launch apiece is what a
+        # decode replay spends its time on here.
+        fused_tail = self.window_fp8 and self.backing.is_cuda
         latent, rotated = compress_batch(
-            self, owner, compressor, values, scores, step, rope, scatter=scatter
+            self,
+            owner,
+            compressor,
+            values,
+            scores,
+            step,
+            rope,
+            scatter=scatter,
+            update_state=not fused_tail,
         )
-        if rotated is not None:
+        if fused_tail:
+            kv_state, score_state = self.compress_state(owner)
+            plan = step.plans[compressor.ratio]
+            compress_tail(
+                tuple(
+                    plane.view(
+                        self.num_pages,
+                        self.geometry.rows_per_page(compressor.ratio),
+                        -1,
+                    )
+                    for plane in self.main_view(owner)
+                ),
+                step.block_tables,
+                plan.compress_plan_gpu,
+                None if rotated is None else rotated[0],
+                compressor.ratio,
+                fp4=self.packed,
+                kv=values[0],
+                score=(values if scores is None else scores)[0],
+                ape=compressor.ape,
+                kv_state=kv_state,
+                score_state=score_state,
+                write_plan=plan.write_plan_gpu,
+                state_slot_mapping=step.slots,
+            )
+        elif rotated is not None:
             self._scatter_rows(
                 self.pages.view(f"main_{owner}")[0],
                 step,
