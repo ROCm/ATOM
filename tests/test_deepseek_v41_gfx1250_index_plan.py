@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """The gfx1250 step kernel's indexer plan (kernels/index_plan.py) on Python ints: the selection tree covers every input
-once, the task counts match the tree, the REINDEX key rows stay inside the token's bound, the scorer covers its context."""
+once, the task counts match the tree, the REINDEX key rows stay inside the token's bound, the scorer covers its context.
+"""
+
 import random
 import sys
 from pathlib import Path
@@ -8,7 +10,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
-from _gfx1250_plan_backend import Z, load  # noqa: E402
+from _gfx1250_plan_backend import Z, load
 
 IP = load("index_plan")
 KINDS = {"sel": (IP.KSEL, IP.SEG // IP.KSEL), "blk": (IP.KBLK, IP.SEG // IP.KBLK)}
@@ -38,19 +40,25 @@ def test_tree_inputs(kind):
             assert nl == int(IP.lists(Z(n), lev, fan))
             for j in {0, max(nl - 1, 0)}:
                 if j < nl:
-                    assert int(IP.list_inputs_rt(Z(n), Z(lev), Z(j), Z(k), Z(fan))) == outputs(n, lev, j, k, fan), (n, lev, j)
+                    assert int(
+                        IP.list_inputs_rt(Z(n), Z(lev), Z(j), Z(k), Z(fan))
+                    ) == outputs(n, lev, j, k, fan), (n, lev, j)
 
 
 @pytest.mark.parametrize("kind", KINDS)
 def test_task_counts(kind):
-    k, fan = KINDS[kind]
+    _, fan = KINDS[kind]
     for n in bounds():
-        counts = [int(IP.list_count_rt(Z(n), Z(lev), Z(fan))) for lev in range(IP.NLMAX + 1)]
+        counts = [
+            int(IP.list_count_rt(Z(n), Z(lev), Z(fan))) for lev in range(IP.NLMAX + 1)
+        ]
         assert counts[0] == max(int(IP.lists(Z(n), 0, fan)), 1)
         for lev in range(1, IP.NLMAX + 1):
             below = int(IP.lists(Z(n), lev - 1, fan))
             assert counts[lev] == (int(IP.lists(Z(n), lev, fan)) if below > 1 else 0)
-        if n <= (1 << 20) // (8 if kind == "blk" else 1):   # NLMAX levels reach one list (blk: blocks of a 1M bound)
+        if n <= (1 << 20) // (
+            8 if kind == "blk" else 1
+        ):  # NLMAX levels reach one list (blk: blocks of a 1M bound)
             assert int(IP.lists(Z(n), IP.NLMAX, fan)) <= 1
 
 
@@ -62,7 +70,8 @@ def rx(bd, cand):
 
 def test_reindex_key_rows_past_16384():
     """A REINDEX token keeps <= 2048 candidate blocks (<= 16384 compacted columns) but their real rows run to its bound:
-    the key row is clamped to the bound, not to the compacted count (the bug fixed 2026-11-09)."""
+    the key row is clamped to the bound, not to the compacted count (the bug fixed 2026-11-09).
+    """
     rng = random.Random(1)
     for bd in [100, 16383, 16384, 16385, 18053, 26624, 65536]:
         nblk = -(-bd // 8)
@@ -75,7 +84,7 @@ def test_reindex_key_rows_past_16384():
             assert row == min(krow, bd - 1) and row < bd
             if krow < bd:
                 assert row == krow
-        if bd > 16384:   # the old clamp (to cx - 1) would move some real rows
+        if bd > 16384:  # the old clamp (to cx - 1) would move some real rows
             assert any(cand[c // 8] * 8 + c % 8 > cx - 1 for c in range(cx))
 
 
@@ -83,9 +92,11 @@ def test_reindex_context():
     """The compacted columns: every kept block's 8 rows but the last block's rows past the bound."""
     for bd in [0, 1, 8, 9, 100, 16384, 20000]:
         nblk = -(-bd // 8)
-        cand = list(range(nblk))[-IP.NCAND:]
+        cand = list(range(nblk))[-IP.NCAND :]
         kept, cx = rx(bd, cand)
-        exp = 0 if not kept else (kept - 1) * 8 + min(max(bd - cand[kept - 1] * 8, 0), 8)
+        exp = (
+            0 if not kept else (kept - 1) * 8 + min(max(bd - cand[kept - 1] * 8, 0), 8)
+        )
         assert cx == exp
 
 

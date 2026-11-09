@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: MIT
 """A plain-integer stand-in for FlyDSL's traced Int32 (``fx.max`` / ``fx.min`` / ``I32`` / ``cmp.select``), so the CPU
-tests run the gfx1250 step kernel's plan functions (kernels/index_plan.py, kernels/moe_plan.py) on Python ints."""
+tests run the gfx1250 step kernel's plan functions (kernels/index_plan.py, kernels/moe_plan.py) on Python ints.
+"""
+
 import importlib
 import importlib.util
 import sys
 import types
 from pathlib import Path
 
-KERNELS = Path(__file__).resolve().parents[1] / "atom/models/deepseek_v41/mono/gfx1250_single/kernels"
+KERNELS = (
+    Path(__file__).resolve().parents[1]
+    / "atom/models/deepseek_v41/mono/gfx1250_single/kernels"
+)
 
 
 class B:
@@ -47,7 +52,10 @@ class Z(int):
     __rmul__ = _w(int.__rmul__)
 
     def __floordiv__(a, b):
-        assert int(a) >= 0 and int(b) > 0, (a, b)   # the device truncates: only non-negative operands are allowed
+        assert int(a) >= 0 and int(b) > 0, (
+            a,
+            b,
+        )  # the device truncates: only non-negative operands are allowed
         return Z(int(a) // int(b))
 
     def __mod__(a, b):
@@ -62,7 +70,11 @@ class Z(int):
     __hash__ = int.__hash__
 
 
-FX = types.SimpleNamespace(max=lambda a, b: Z(max(int(a), int(b))), min=lambda a, b: Z(min(int(a), int(b))), Int32=Z)
+FX = types.SimpleNamespace(
+    max=lambda a, b: Z(max(int(a), int(b))),
+    min=lambda a, b: Z(min(int(a), int(b))),
+    Int32=Z,
+)
 
 
 def load(name):
@@ -75,7 +87,9 @@ def load(name):
             fl.expr = types.ModuleType("flydsl.expr")
             fl.expr.Int32 = Z
             sys.modules["flydsl"], sys.modules["flydsl.expr"] = fl, fl.expr
-    spec = importlib.util.spec_from_file_location(f"gfx1250_{name}", KERNELS / f"{name}.py")
+    spec = importlib.util.spec_from_file_location(
+        f"gfx1250_{name}", KERNELS / f"{name}.py"
+    )
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     if hasattr(m, "fx"):

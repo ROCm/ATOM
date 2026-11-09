@@ -195,12 +195,18 @@ def iprefetch(kb):
         _ll.inline_asm(None, [], f"s_prefetch_inst_pc_rel {off}, null, 31", "", has_side_effects=True)
 
 
-def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
+def build(TR, rank, NL=40, ndr=3, trd=None, part="all", sources="", moe_ids="ids"):
     """The step kernel for TR target rows (TR // 6 requests) and trd draft rows (5 a request); NL target layers (NL < 40
     and ndr 0: a bring-up / shadow build of the first layers only). part: "all" (one launch), or the step as two launches
     on one stream: "target" (entry, target layers, head, sampling, verification) then "draft" (draft context, metadata,
-    draft layers, draft head, Markov) -- the host reads the verdict after the first while the second runs."""
-    assert part in ("all", "target", "draft")
+    draft layers, draft head, Markov) -- the host reads the verdict after the first while the second runs.
+    sources: the kernel sources' digest (the runner's atom.mono.plan.build_key.source_digest of this directory); moe_ids:
+    the routed MoE's pick ids, FPTRS name ("ids": the router's; a fixture's fixed routes: "mroute"). Every parameter is in
+    `keyed`, which the kernel and the launcher reference: all of them reach FlyDSL's JIT cache key (an edit to a helper
+    the cache walk does not reach still rebuilds)."""
+    assert part in ("all", "target", "draft") and moe_ids in ("ids", "mroute")
+    keyed = (("TR", TR), ("rank", rank), ("NL", NL), ("ndr", ndr), ("trd", trd), ("part", part), ("sources", sources),
+             ("moe_ids", moe_ids))
     L = smem_layout(TR)
     TPG = TR * 10 // 3
     stx = hx.stx_dev
@@ -437,7 +443,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                         tq2 = hx.opaque_v(fx.thread_idx.x)
                         cm = LazyC({'shplane': (lambda Ly=Ly: ltab(fp, Ly, 'shplane')())},   # (re-read at its uses: not live across the layer)
                                    t=tq2, b=b, w=tq2 // 32, l=tq2 % 32, sm=sm + FRONT_LDS_OFF, NP=TRx * RTOPK, topk=RTOPK, nexp_max=96,
-                                   plane=ltab(fp, Ly, "mplane")(), x8=mfx8, xs=mfxs, ids=fptr(fp, ('mroute' if (not DRS and os.environ.get('MROUTE_FIXED') == '1') else 'ids')), wts=mwts, out=mout,
+                                   plane=ltab(fp, Ly, "mplane")(), x8=mfx8, xs=mfxs, ids=fptr(fp, 'ids' if DRS else moe_ids), wts=mwts, out=mout,
                                    mid8=mid8, midc=midc, shcnt=lc + i64(LY.SHARED_DOWN))
                         MS.moe(cm, lc + i64(LY.MOE_UG))
                         gpu.barrier()
@@ -470,12 +476,14 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
             ST.draft(tp, t, b, sm, st, cnt + i64((NL + NDR) * LCB), recv, rank, head_d=4)
         tp_epoch_end(fp, tep)
         hx.TOFLAG[0] = None   # (the counter pointer belongs to this kernel's trace only)
+        _ = keyed
 
     @flyc.jit
     def launch(recv0: Int64, recv1: Int64, recv2: Int64, recv3: Int64, cnt: Int64, st: Int64, scale: fx.Float32, fp: Int64,
                tp: Int64, stream: fx.Stream = fx.Stream(None)):
         """recv0..3: the 4 ranks' receive buffers; cnt: the step's zeroed handoff counters; st: stamps; scale: the
         attention softmax scale; fp: the pointer table (FPTRS, ATAB, layer rows); tp: the step tail's table."""
+        _ = keyed
         body(recv0, recv1, recv2, recv3, cnt, st, scale, fp, tp).launch(
             grid=(CTAS,), block=(THREADS,), smem=max(L["LDS"], ST.HEAD_LDS if ndr else 0, FRONT_LDS_OFF + max(FS.FRONT_LDS, MS.MOE_LDS), RKOFF + FS.RK_BYTES), cluster=(CL, 1, 1), stream=stream)
 

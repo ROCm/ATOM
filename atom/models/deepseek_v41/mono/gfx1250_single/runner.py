@@ -38,6 +38,7 @@ from atom.models.deepseek_v41.mono.gfx1250_single.config import (
 from atom.models.deepseek_v41.mono.gfx1250_single.debug import RunnerDebug, StepTimer
 from atom.models.deepseek_v41.mono.gfx1250_single.inputs import StepInputs
 from atom.models.deepseek_v41.mono.gfx1250_single.weights import planes
+from atom.mono.plan.build_key import source_digest
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
 from atom.utils import envs
@@ -64,6 +65,10 @@ KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
 RECV_BYTES = 2 * (
     (16 * 40960 * 16 + 4 * 4 * 48 * 256 * 16 + (2 << 20) - 1) // (2 << 20) * (2 << 20)
 )
+
+
+# the kernel sources' digest: part of every build's FlyDSL JIT key (an edit to any kernel module rebuilds)
+SOURCES = source_digest("models/deepseek_v41/mono/gfx1250_single/kernels")
 
 
 def import_kernels() -> dict:
@@ -220,7 +225,8 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             kw = {"NL": nl, "ndr": NDR if nl == NL else 0, "trd": rows // 6 * 5}
             # two launches: target .. verification, then the draft (the host reads the verdict between)
             launch = tuple(
-                M.build(rows, self.rank, part=pt, **kw)[0] for pt in ("target", "draft")
+                M.build(rows, self.rank, part=pt, sources=SOURCES, **kw)[0]
+                for pt in ("target", "draft")
             )
             # compile (JIT or disk cache) before the first launch of this width, then wait for every rank: the step
             # kernel's cross-rank polls give up after 2 s, and ranks compiling a width seconds apart made that first
