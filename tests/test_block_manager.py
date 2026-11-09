@@ -1064,6 +1064,35 @@ def test_the_index_cap_counts_images_not_slots(monkeypatch):
     assert bm.state_offload._hash_cap == 1024 - 32
 
 
+def test_pp_stages_split_the_state_budget_by_image(monkeypatch):
+    """Two stages pool 2 GiB over a 3 MiB joint image, so each keeps 682. An
+    even split kept 512 on the 2 MiB stage and 1024 on the 1 MiB one, half of
+    them images the other stage had already evicted."""
+    from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+    from atom.model_engine.state_offload import state_tier_cpu_entries
+    from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+
+    monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "1")
+    spec = PagedStateCheckpointSpec(
+        1 << 19, 3 << 19, "cap-test", image_bytes=1 << 20
+    ).for_pipeline("pp2-joint:cap-test", 4, 3 << 20)
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config=_OFFLOAD_KVC,
+        pool_entries={"state": 4},
+        pool_entries_per_req={"state": 1},
+    )
+    cfg.pipeline_parallel_size = 2
+    assert state_tier_cpu_entries(spec, cfg) == 682
+    bm = BlockManager(
+        cfg,
+        state_runtime=StateRuntime(
+            transfer=StateTransfer.copy(spec.layout_id), checkpoint_spec=spec
+        ),
+    )
+    assert bm.state_offload._hash_cap == 682 - 682 // 32
+
+
 def test_a_multi_listing_two_offload_connectors_is_refused(monkeypatch):
     """The tier's bytes ride one connector's worker half and its completions
     ride that connector's `get_finished`, so two providers would each hold half
