@@ -799,7 +799,10 @@ class Scheduler:
         # Allocated before the forward, with the step's own blocks: see
         # `draft_kv_lookahead` for the arithmetic and what an unallocated one
         # costs.
-        self.draft_lookahead = draft_kv_lookahead(self.mtp_k)
+        self.draft_lookahead = draft_kv_lookahead(
+            self.mtp_k,
+            block_drafter=(has_spec and config.speculative_config.use_dspark()),
+        )
         self.block_manager.draft_lookahead = self.draft_lookahead
         self.is_deferred_out = defers_output(config)
         if self.use_spec and pp_size > 1:
