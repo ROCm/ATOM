@@ -36,6 +36,9 @@ def test_packed_collective_plan(rows):
         item.kind is CollectiveKind.ALL_REDUCE
         for item in (boundaries[0], boundaries[2], boundaries[3])
     )
+    assert payload.latent_bytes == rows * payload.latent_columns // 2
+    assert payload.latent_scale_bytes == rows * payload.latent_columns // 32
+    assert payload.local_bytes % 16 == 0
 
 
 def test_packed_runner_orders_local_regions_and_collectives():

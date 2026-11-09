@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float32, Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import HIDDEN
@@ -26,11 +26,12 @@ from atom.models.kimi_k3.mono.kernels.attention import (
 from atom.models.kimi_k3.mono.kernels.execution_plan import (
     Gfx1250KimiBuildPlan,
 )
-from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250
+from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250, moe_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import LDS_PAD
 from atom.models.kimi_k3.mono.kernels.token_tiling import WMMA_TOKEN_ROWS
 from atom.mono.device.ops import (
     CM_DEV,
+    butterfly,
     hw_exp2,
     hw_rsq,
     rsrc,
@@ -47,14 +48,14 @@ LOG2E = 1.0 / math.log(2.0)
 THREADS = 256
 WAVES = 8
 FRONT_REQUIRED_LDS_BYTES = 237_824
-PROJECTION_TASKS = 7 + 28 + 96
 ROUTER_ROWS = 896 // 8
 LATENT_ROWS = 3584 // 8
 SHARED_ROWS = 2 * 768
 ROUTER_TASKS = ROUTER_ROWS // 16
 LATENT_TASKS = LATENT_ROWS // 16
 ACTIVATION_SLAB_BUDGET = 120 * 1024
-ACCUMULATOR_BYTES = WAVES * GFX1250.wave_size * gemv_gfx1250.ACCUMULATOR_ELEMENTS * 4
+ACCUMULATOR_WORDS = WAVES * GFX1250.wave_size * gemv_gfx1250.ACCUMULATOR_ELEMENTS
+ACCUMULATOR_BYTES = ACCUMULATOR_WORDS * 4
 ROLE_LDS_FRONT_ABI = KernelAbi(
     (
         "oproj_reduced",
@@ -70,6 +71,7 @@ ROLE_LDS_FRONT_ABI = KernelAbi(
         "shared_weight",
         "x_local",
         "front_payload",
+        "latent_local",
         "shared_gate_up",
         "scratch",
         "layer",
@@ -81,6 +83,33 @@ ROLE_LDS_FRONT_ABI = KernelAbi(
 
 def _align(value: int, alignment: int = 16) -> int:
     return (value + alignment - 1) // alignment * alignment
+
+
+@traced
+def _opening_generation(sync, ticket, blocks):
+    """Reusable resident-grid rendezvous; tagged pairs need no bulk reset."""
+
+    tid = fx.thread_idx.x
+    generation = fx.Int32(0)
+    if tid == 0:
+        previous = protocol_device.epoch_load_system_acquire(sync + fx.Int64(4))
+        arrival = protocol_device.epoch_arrive_system_atomic(sync, fx.Int32(1))
+        if arrival == fx.Int32(blocks - 1):
+            protocol_device.epoch_store_system_release(sync, fx.Int32(0))
+            generation = previous + fx.Int32(1)
+            protocol_device.epoch_store_system_release(sync + fx.Int64(4), generation)
+        else:
+            generation = protocol_device.epoch_load_system_acquire(sync + fx.Int64(4))
+            while generation == previous:
+                rocdl.s_sleep(1)
+                generation = protocol_device.epoch_load_system_acquire(
+                    sync + fx.Int64(4)
+                )
+        fx.ptr_store(generation, ticket)
+    gpu.barrier()
+    generation = fx.ptr_load(ticket)
+    gpu.barrier()
+    return generation
 
 
 @traced
@@ -135,7 +164,7 @@ def _projection_task(
     lane,
     wave,
     task,
-    tile_start,
+    tile_starts,
     tile_rows,
     rows,
     output_rows,
@@ -143,7 +172,10 @@ def _projection_task(
     slabs,
     row_stride,
 ):
-    accumulator = fx.Vector.filled(gemv_gfx1250.ACCUMULATOR_ELEMENTS, 0.0, fx.Float32)
+    accumulators = [
+        fx.Vector.filled(gemv_gfx1250.ACCUMULATOR_ELEMENTS, 0.0, fx.Float32)
+        for _ in tile_starts
+    ]
     for slab_index in range_constexpr(len(slabs)):
         slab_start, slab_width = slabs[slab_index]
         operands = gemv_gfx1250.loads(
@@ -158,53 +190,65 @@ def _projection_task(
         )
         if slab_index:
             gpu.barrier()
-        _stage_activation_slab(
-            activation,
-            activation_lds,
-            tid,
-            tile_start,
-            rows,
-            slab_start,
-            slab_width,
-            row_stride,
-        )
-        accumulator = gemv_gfx1250.mfmas(
-            lane,
-            wave,
-            WAVES,
-            activation_lds,
-            row_stride,
-            slab_width,
-            tile_rows,
-            operands,
-            accumulator,
-        )
-    gemv_gfx1250.store_accumulator(accumulator, accumulator_lds, wave, lane)
-    gpu.barrier()
-    total = WMMA_TOKEN_ROWS * 8
-    for iteration in range_constexpr((total + THREADS - 1) // THREADS):
-        work = tid + THREADS * iteration
-        if work < total:
-            local_token = work // 8
-            pair = work % 8
-            token = tile_start + local_token
-            low = gemv_gfx1250.row_sum(accumulator_lds, 2 * pair, local_token, WAVES)
-            high = gemv_gfx1250.row_sum(
-                accumulator_lds, 2 * pair + 1, local_token, WAVES
+        for tile in range_constexpr(len(tile_starts)):
+            if tile:
+                gpu.barrier()
+            _stage_activation_slab(
+                activation,
+                activation_lds,
+                tid,
+                tile_starts[tile],
+                rows,
+                slab_start,
+                slab_width,
+                row_stride,
             )
-            row = task * 16 + 2 * pair
-            at = token * output_rows + row
-            if local_token < tile_rows:
-                if output_f32:
-                    bo.buffer_store(low, rsrc(output), at)
-                    bo.buffer_store(high, rsrc(output), at + 1)
-                else:
-                    packed = (
-                        fx.Vector.from_elements([low, high], fx.Float32)
-                        .to(fx.BFloat16)
-                        .bitcast(fx.Int32)[0]
-                    )
-                    bo.buffer_store(packed, rsrc(output), at // 2)
+            accumulators[tile] = gemv_gfx1250.mfmas(
+                lane,
+                wave,
+                WAVES,
+                activation_lds,
+                row_stride,
+                slab_width,
+                tile_rows[tile],
+                operands,
+                accumulators[tile],
+            )
+
+    for tile in range_constexpr(len(tile_starts)):
+        if tile:
+            gpu.barrier()
+        gemv_gfx1250.store_accumulator(accumulators[tile], accumulator_lds, wave, lane)
+        gpu.barrier()
+        total = WMMA_TOKEN_ROWS * 8
+        for iteration in range_constexpr((total + THREADS - 1) // THREADS):
+            work = tid + THREADS * iteration
+            if work < total:
+                local_token = work // 8
+                pair = work % 8
+                token = tile_starts[tile] + local_token
+                low = gemv_gfx1250.row_sum(
+                    accumulator_lds, 2 * pair, local_token, WAVES
+                )
+                high = gemv_gfx1250.row_sum(
+                    accumulator_lds,
+                    2 * pair + 1,
+                    local_token,
+                    WAVES,
+                )
+                row = task * 16 + 2 * pair
+                at = token * output_rows + row
+                if local_token < tile_rows[tile]:
+                    if output_f32:
+                        bo.buffer_store(low, rsrc(output), at)
+                        bo.buffer_store(high, rsrc(output), at + 1)
+                    else:
+                        packed = (
+                            fx.Vector.from_elements([low, high], fx.Float32)
+                            .to(fx.BFloat16)
+                            .bitcast(fx.Int32)[0]
+                        )
+                        bo.buffer_store(packed, rsrc(output), at // 2)
     protocol_device.wait_vector_stores()
 
 
@@ -215,6 +259,7 @@ def _projection_direct_task(
     latent_weight,
     shared_weight,
     front_payload,
+    latent_local,
     shared_gate_up,
     activation_lds,
     accumulator_lds,
@@ -222,10 +267,9 @@ def _projection_direct_task(
     lane,
     wave,
     task_id,
-    tile_start,
+    tile_starts,
     tile_rows,
     rows,
-    latent_offset,
     slabs,
     row_stride,
 ):
@@ -240,7 +284,7 @@ def _projection_direct_task(
             lane,
             wave,
             task_id,
-            tile_start,
+            tile_starts,
             tile_rows,
             rows,
             ROUTER_ROWS,
@@ -252,14 +296,14 @@ def _projection_direct_task(
         _projection_task(
             x_local,
             latent_weight,
-            front_payload + fx.Int64(latent_offset),
+            latent_local,
             activation_lds,
             accumulator_lds,
             tid,
             lane,
             wave,
             task_id - ROUTER_TASKS,
-            tile_start,
+            tile_starts,
             tile_rows,
             rows,
             LATENT_ROWS,
@@ -278,7 +322,7 @@ def _projection_direct_task(
             lane,
             wave,
             task_id - ROUTER_TASKS - LATENT_TASKS,
-            tile_start,
+            tile_starts,
             tile_rows,
             rows,
             SHARED_ROWS,
@@ -286,6 +330,55 @@ def _projection_direct_task(
             slabs,
             row_stride,
         )
+
+
+@traced
+def _quantize_latent_group(
+    latent,
+    payload,
+    tid,
+    tile_start,
+    tile_rows,
+    group,
+    latent_offset,
+    scale_offset,
+):
+    local_token = fx.min(tid // 4, tile_rows - 1)
+    packed_word = tid % 4
+    token = tile_start + local_token
+    base = (token * LATENT_ROWS + group * 32) // 2
+    words = [
+        fx.Int32(
+            bo.buffer_load(
+                rsrc(latent),
+                base + packed_word * 4 + index,
+                vec_width=1,
+                dtype=T.i32,
+            )
+        )
+        for index in range_constexpr(4)
+    ]
+    maximum_bits = fx.Int32(0)
+    for word in words:
+        maximum_bits = fx.max(maximum_bits, word & 0x7FFF)
+        maximum_bits = fx.max(maximum_bits, (word >> 16) & 0x7FFF)
+    maximum = (maximum_bits << 16).bitcast(fx.Float32)
+    maximum = butterfly(maximum, (2, 1), fx.max, architecture=GFX1250)
+    code = moe_gfx1250._e8m0_roundup(maximum)
+    reciprocal_scale = ((fx.Int32(254) - code) << 23).bitcast(fx.Float32)
+    if tid < tile_rows * 4:
+        bo.buffer_store(
+            moe_gfx1250._pack_bf16_words(words, reciprocal_scale),
+            rsrc(payload + fx.Int64(latent_offset)),
+            token * (LATENT_ROWS // 8) + group * 4 + packed_word,
+        )
+        if packed_word == 0:
+            bo.buffer_store(
+                fx.Int8(code),
+                rsrc(payload + fx.Int64(scale_offset)),
+                token * (LATENT_ROWS // 32) + group,
+            )
+    protocol_device.wait_vector_stores()
 
 
 @dataclass(frozen=True)
@@ -303,6 +396,7 @@ class K2FrontKernel:
 def build_role_lds_front(
     plan: Gfx1250KimiBuildPlan,
     *,
+    include_attention: bool = True,
     include_projection: bool = True,
     reset: bool = False,
 ) -> K2FrontKernel:
@@ -312,14 +406,20 @@ def build_role_lds_front(
         raise ValueError("role-LDS K2 front requires 256 threads/eight waves")
     if plan.nblocks is None or plan.nblocks <= 0:
         raise ValueError("role-LDS K2 front requires explicit nblocks")
-    attention_tasks = ATTENTION_CTAS * plan.token_tiling.tile_count
-    gate_cta = attention_tasks
-    norm_cta = attention_tasks + 1
-    if plan.blocks <= norm_cta:
+    attention_tasks = (
+        ATTENTION_CTAS * plan.token_tiling.tile_count if include_attention else 0
+    )
+    gate_cta = attention_tasks if include_attention else -1
+    norm_cta = attention_tasks + 1 if include_attention else -1
+    projection0 = 0
+    if include_attention and plan.blocks <= norm_cta:
         raise ValueError("role-LDS K2 front lacks gate/norm control CTAs")
 
     rows = plan.tokens
     payload = FrontPayloadLayout(rows)
+    tile_starts = tuple(tile.row_start for tile in plan.token_tiling.tiles)
+    tile_rows = tuple(tile.rows for tile in plan.token_tiling.tiles)
+    projection_tasks = ROUTER_TASKS + LATENT_TASKS + SHARED_ROWS // 16
     sources = plan.nblocks + 1
     if sources > GFX1250.wave_size:
         raise ValueError("role-LDS AttnRes sources exceed one wave32")
@@ -344,21 +444,15 @@ def build_role_lds_front(
     mean_square_pairs = ATTENTION_CTAS * rows
     rstd_pairs = rows
     ready_pairs = attention_tasks
+    latent_ready_pairs = plan.token_tiling.tile_count * LATENT_TASKS
     part_offset = 0
     weight_offset = part_offset + partial_pairs * 8
     mean_square_offset = weight_offset + weight_pairs * 8
     rstd_offset = mean_square_offset + mean_square_pairs * 8
     ready_offset = rstd_offset + rstd_pairs * 8
-    sync_offset = _align(ready_offset + ready_pairs * 8)
+    latent_ready_offset = ready_offset + ready_pairs * 8
+    sync_offset = _align(latent_ready_offset + latent_ready_pairs * 8)
     scratch_bytes = sync_offset + 8
-    reset_pairs = (
-        (part_offset, partial_pairs),
-        (weight_offset, weight_pairs),
-        (mean_square_offset, mean_square_pairs),
-        (rstd_offset, rstd_pairs),
-        (ready_offset, ready_pairs),
-    )
-    total_pairs = sum(count for _, count in reset_pairs)
 
     @fx.struct
     class AttentionRole:
@@ -369,7 +463,7 @@ def build_role_lds_front(
         activation: fx.Array[fx.Int32, WMMA_TOKEN_ROWS * row_stride // 2, 16]
         accumulator: fx.Array[
             fx.Float32,
-            WAVES * GFX1250.wave_size * gemv_gfx1250.ACCUMULATOR_ELEMENTS,
+            ACCUMULATOR_WORDS,
             16,
         ]
 
@@ -390,6 +484,7 @@ def build_role_lds_front(
     name = (
         f"k3_k2_gfx1250_role_lds_front_s{rows}"
         f"_nb{plan.nblocks}_b{plan.blocks}"
+        f"_a{int(include_attention)}"
         f"_p{int(include_projection)}"
         f"_r{int(reset)}"
     )
@@ -409,6 +504,7 @@ def build_role_lds_front(
         shared_weight: Int64,
         x_local: Int64,
         front_payload: Int64,
+        latent_local: Int64,
         shared_gate_up: Int64,
         scratch: Int64,
         layer: Int32,
@@ -432,44 +528,18 @@ def build_role_lds_front(
             )
         gpu.barrier()
 
-        total_threads = plan.blocks * THREADS
-        pair_base = bid * THREADS + tid
-        for iteration in range_constexpr(
-            (total_pairs + total_threads - 1) // total_threads
-        ):
-            flat = pair_base + iteration * total_threads
-            if flat < total_pairs:
-                protocol_device.mailbox_reset_device(scratch, flat)
-        protocol_device.wait_vector_stores()
-        gpu.barrier()
-        protocol_device.epoch_fence_system_release()
-        if tid == 0:
-            ticket = protocol_device.epoch_arrive_system_atomic(
-                scratch + fx.Int64(sync_offset), fx.Int32(1)
-            )
-            fx.ptr_store(ticket, shared.ticket.ptr)
-        gpu.barrier()
-        generation = fx.ptr_load(shared.ticket.ptr)
-        target = (generation // fx.Int32(plan.blocks) + fx.Int32(1)) * fx.Int32(
-            plan.blocks
+        _ = layer
+        tag = _opening_generation(
+            scratch + fx.Int64(sync_offset),
+            shared.ticket.ptr,
+            plan.blocks,
         )
-        if tid == 0:
-            arrived = protocol_device.epoch_load_system_acquire(
-                scratch + fx.Int64(sync_offset)
-            )
-            while arrived < target:
-                arrived = protocol_device.epoch_load_system_acquire(
-                    scratch + fx.Int64(sync_offset)
-                )
-        protocol_device.epoch_fence_system_acquire()
-        gpu.barrier()
-
-        tag = layer + fx.Int32(1)
         part = scratch + fx.Int64(part_offset)
         weights = scratch + fx.Int64(weight_offset)
         mean_squares = scratch + fx.Int64(mean_square_offset)
         rstd = scratch + fx.Int64(rstd_offset)
         ready = scratch + fx.Int64(ready_offset)
+        latent_ready = scratch + fx.Int64(latent_ready_offset)
 
         if bid < attention_tasks:
             token_tile = bid // ATTENTION_CTAS
@@ -690,35 +760,72 @@ def build_role_lds_front(
                 inverse_norm = hw_rsq(total * fx.Float32(1.0 / HIDDEN) + output_epsilon)
                 protocol_device.mailbox_store_device(rstd, tid, inverse_norm, tag)
 
-        if include_projection:  # noqa: SIM102 - compile-time outer gate
-            if bid < PROJECTION_TASKS:
-                if tid < attention_tasks:
-                    protocol_device.mailbox_poll_device(ready, tid, tag)
-                gpu.barrier()
-                protocol_device.epoch_fence_system_acquire()
-                for tile in range_constexpr(plan.token_tiling.tile_count):
-                    tile_start = tile * WMMA_TOKEN_ROWS
-                    tile_rows = min(WMMA_TOKEN_ROWS, rows - tile_start)
-                    _projection_direct_task(
-                        x_local,
-                        router_weight,
-                        latent_weight,
-                        shared_weight,
-                        front_payload,
-                        shared_gate_up,
-                        projection.activation.ptr,
-                        projection.accumulator.ptr,
-                        tid,
-                        lane,
-                        wave,
-                        bid,
-                        tile_start,
-                        tile_rows,
-                        rows,
-                        payload.latent_offset,
-                        slabs,
-                        row_stride,
-                    )
+        if include_projection:
+            projection_task = (bid - projection0 + plan.blocks) % plan.blocks
+            if projection_task < projection_tasks:
+                if include_attention:
+                    if tid < attention_tasks:
+                        protocol_device.mailbox_poll_device(ready, tid, tag)
+                    gpu.barrier()
+                    protocol_device.epoch_fence_system_acquire()
+                _projection_direct_task(
+                    x_local,
+                    router_weight,
+                    latent_weight,
+                    shared_weight,
+                    front_payload,
+                    latent_local,
+                    shared_gate_up,
+                    projection.activation.ptr,
+                    projection.accumulator.ptr,
+                    tid,
+                    lane,
+                    wave,
+                    projection_task,
+                    tile_starts,
+                    tile_rows,
+                    rows,
+                    slabs,
+                    row_stride,
+                )
+                local_task = projection_task - ROUTER_TASKS
+                if (local_task >= 0) & (local_task < LATENT_TASKS):
+                    protocol_device.wait_vector_stores()
+                    gpu.barrier()
+                    if tid == 0:
+                        for tile in range_constexpr(len(tile_starts)):
+                            protocol_device.mailbox_store_device(
+                                latent_ready,
+                                tile * LATENT_TASKS + local_task,
+                                fx.Int32(1),
+                                tag,
+                            )
+                    gpu.barrier()
+                    if local_task % 2 == 0:
+                        for tile in range_constexpr(len(tile_starts)):
+                            if tid == 0:
+                                protocol_device.mailbox_poll_device(
+                                    latent_ready,
+                                    tile * LATENT_TASKS + local_task,
+                                    tag,
+                                )
+                                protocol_device.mailbox_poll_device(
+                                    latent_ready,
+                                    tile * LATENT_TASKS + local_task + 1,
+                                    tag,
+                                )
+                            gpu.barrier()
+                            protocol_device.epoch_fence_system_acquire()
+                            _quantize_latent_group(
+                                latent_local,
+                                front_payload,
+                                tid,
+                                tile_starts[tile],
+                                tile_rows[tile],
+                                local_task // 2,
+                                payload.latent_offset,
+                                payload.latent_scale_offset,
+                            )
 
     @flyc.jit
     def launch(
@@ -735,6 +842,7 @@ def build_role_lds_front(
         shared_weight: Int64,
         x_local: Int64,
         front_payload: Int64,
+        latent_local: Int64,
         shared_gate_up: Int64,
         scratch: Int64,
         layer: Int32,
@@ -756,6 +864,7 @@ def build_role_lds_front(
             shared_weight,
             x_local,
             front_payload,
+            latent_local,
             shared_gate_up,
             scratch,
             layer,

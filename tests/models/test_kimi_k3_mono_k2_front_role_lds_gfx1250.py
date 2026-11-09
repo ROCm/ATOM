@@ -28,7 +28,7 @@ def test_role_lds_front_abi_has_no_full_attnres_workspace():
     assert "attnres_mean_squares" not in names
     assert "front_payload" in names
     assert "router_local" not in names
-    assert "latent_local" not in names
+    assert "latent_local" in names
     assert names[3:5] == ("blk_sm", "blk_sr")
     assert candidate.grid == (256,)
     assert candidate.block == (256,)
@@ -47,6 +47,8 @@ def test_role_lds_front_scales_to_s48_without_more_launches():
 def test_role_lds_front_specializes_block_write_prefix_reset():
     normal = build_role_lds_front(_plan(16))
     reset = build_role_lds_front(_plan(16), reset=True)
-    assert normal.name.endswith("_p1_r0")
-    assert reset.name.endswith("_p1_r1")
+    projection = build_role_lds_front(_plan(16), include_attention=False)
+    assert normal.name.endswith("_a1_p1_r0")
+    assert reset.name.endswith("_a1_p1_r1")
+    assert projection.name.endswith("_a0_p1_r0")
     assert normal.abi == reset.abi

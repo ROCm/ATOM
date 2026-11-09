@@ -228,6 +228,35 @@ class MoeLayer:
     ln_eps: float
 
 
+@dataclass(frozen=True)
+class RoutedMoeLayer:
+    """K2 tensors needed by the routed path; shared experts stay quantized."""
+
+    layer_id: int
+    blocks: int
+    write_idx: int
+    seam: AttnRes
+    w_gate: torch.Tensor
+    bias: torch.Tensor
+    w_ld: torch.Tensor
+    ln_w: torch.Tensor
+    w_up: torch.Tensor
+    w13: torch.Tensor
+    w13s: torch.Tensor
+    w2: torch.Tensor
+    w2s: torch.Tensor
+    gu_interleave: bool
+    ln_eps: float
+
+
+@dataclass(frozen=True)
+class ExternalMoeLayer(RoutedMoeLayer):
+    """gfx1250 K2 around external collectives; o_proj remains a model op."""
+
+    w_sgu: torch.Tensor
+    w_sd: torch.Tensor
+
+
 def _seam(site, name: str) -> AttnRes:
     """An ``AttnRes`` module's three tensors. The kernels multiply the norm and
     the projection per element in fp32 rather than reading the module's folded
@@ -404,6 +433,108 @@ def bind_k2_expert_scales(
     return handles
 
 
+def bind_routed_moe(
+    layer,
+    layer_id: int,
+    dims: Dims,
+    rank: int,
+    architecture: Architecture | None = None,
+) -> RoutedMoeLayer:
+    """Bind the routed K2 path without touching quantized shared projections."""
+
+    name = f"layer {layer_id}"
+    moe = getattr(layer, "block_sparse_moe", None)
+    _need(moe is not None, f"{name}: not a MoE layer")
+    _need(moe.use_latent_moe, f"{name}: not a latent MoE")
+    _need(moe.routed_expert_norm is not None, f"{name}: no routed norm")
+    gate = _param(moe.gate, f"{name} gate")
+    _need(
+        gate.dtype == BF16 and tuple(gate.shape) == (EXPERTS, HIDDEN),
+        f"{name}: gate is {gate.dtype} {tuple(gate.shape)}",
+    )
+    w13, s13, w2, s2 = _experts(moe, layer_id, dims)
+    if architecture is GFX1250:
+        scales = bind_k2_expert_scales(
+            moe, layer_id, dims, rank, architecture
+        ).kernel_arguments()
+        s13, s2 = scales["w13s"], scales["w2s"]
+    gu_interleave = bool(
+        getattr(
+            getattr(getattr(moe, "experts", None), "quant_method", None),
+            "is_guinterleave",
+            False,
+        )
+    )
+    w_up = _mxfp4_to_bf16(
+        moe.routed_expert_up_proj,
+        f"{name} routed_expert_up_proj",
+        (HIDDEN, LATENT),
+    )
+    return RoutedMoeLayer(
+        layer_id=layer_id,
+        blocks=layer_block(layer_id)[0],
+        write_idx=layer_block(layer_id)[1],
+        seam=_seam(layer.mlp_attn_res, f"{name} mlp seam"),
+        w_gate=gate.data,
+        bias=_as_f32(
+            moe.gate.e_score_correction_bias,
+            EXPERTS,
+            f"{name} gate bias",
+        ),
+        w_ld=_mxfp4_to_bf16(
+            moe.routed_expert_down_proj,
+            f"{name} routed_expert_down_proj",
+            (LATENT, HIDDEN),
+        ),
+        ln_w=_vec(
+            moe.routed_expert_norm.weight,
+            LATENT,
+            f"{name} routed_expert_norm",
+        ),
+        w_up=w_up.narrow(0, rank * dims.up_n, dims.up_n).clone(),
+        w13=w13,
+        w13s=s13,
+        w2=w2,
+        w2s=s2,
+        gu_interleave=gu_interleave,
+        ln_eps=_eps(moe.routed_expert_norm, f"{name} routed_expert_norm"),
+    )
+
+
+def bind_external_moe(
+    layer,
+    layer_id: int,
+    dims: Dims,
+    rank: int,
+    architecture: Architecture,
+) -> ExternalMoeLayer:
+    """Bind native K2 local stages while leaving o_proj on its quantized path."""
+
+    routed = bind_routed_moe(
+        layer,
+        layer_id,
+        dims,
+        rank,
+        architecture,
+    )
+    name = f"layer {layer_id}"
+    shared = layer.block_sparse_moe.shared_experts
+    _need(shared is not None, f"{name}: no shared experts")
+    return ExternalMoeLayer(
+        **routed.__dict__,
+        w_sgu=_plain_bf16(
+            shared.gate_up_proj,
+            f"{name} shared gate_up_proj",
+            (2 * dims.sh_inter, HIDDEN),
+        ),
+        w_sd=_plain_bf16(
+            shared.down_proj,
+            f"{name} shared down_proj",
+            (HIDDEN, dims.sh_inter),
+        ),
+    )
+
+
 def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
     """One layer's K2 tensors: o_proj and the latent MoE."""
     name = f"layer {layer_id}"
@@ -412,58 +543,18 @@ def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
     _need(moe.use_latent_moe, f"{name}: not a latent MoE")
     _need(moe.shared_experts is not None, f"{name}: no shared experts")
     _need(moe.routed_expert_norm is not None, f"{name}: no routed norm")
-    # No dual-stream refusal. `_use_dual_stream` is a static config flag that
-    # only selects a branch inside `KimiSparseMoeBlock.forward`, and a mono
-    # layer never calls that module at all -- K2 computes the latent MoE from
-    # the tensors bound here. The alt stream cannot contend with the kernel
-    # either: `dual_stream_moe_forward` joins before it returns
-    # (`current_stream.wait_stream(alt_stream)`, deepseek_v2.py), so a
-    # production layer's shared-expert work is complete before the next layer
-    # launches anything. Refusing on it disarmed mono in the DEFAULT
-    # environment -- K3 has shared experts and an alt stream, and
-    # ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD defaults to 1024 -- which cost three
-    # GSM8K runs that scored the production path while reporting "mono".
-    gate = _param(moe.gate, f"{name} gate")
-    _need(
-        gate.dtype == BF16 and tuple(gate.shape) == (EXPERTS, HIDDEN),
-        f"{name}: gate is {gate.dtype} {tuple(gate.shape)}",
-    )
-    w13, s13, w2, s2 = _experts(moe, layer_id, dims)
-    gu_interleave = bool(
-        getattr(
-            getattr(getattr(moe, "experts", None), "quant_method", None),
-            "is_guinterleave",
-            False,
-        )
-    )
-    # the up-projection is replicated in the model; the kernel's stage computes
-    # this rank's row band of it and the ranks' bands are summed into the
-    # layer's output, so only the band is bound.
-    #
-    # `.clone()`, not `.contiguous()`: a row `narrow` of a row-major tensor is
-    # already contiguous, so `contiguous()` hands back the SAME view and the
-    # whole dequantized 7168x3584 plane stays referenced by it -- 49 MiB held
-    # per layer per rank to keep the 6.1 MiB band, which is memory the lazy
-    # bind does not have and so turns mono off. `_mxfp4_to_bf16` returns a
-    # fresh contiguous tensor, so cloning the band copies once and frees it.
-    w_up = _mxfp4_to_bf16(
-        moe.routed_expert_up_proj, f"{name} routed_expert_up_proj", (HIDDEN, LATENT)
-    )
+    routed = bind_routed_moe(layer, layer_id, dims, rank)
     return MoeLayer(
-        layer_id=layer_id,
-        blocks=layer_block(layer_id)[0],
-        write_idx=layer_block(layer_id)[1],
-        seam=_seam(layer.mlp_attn_res, f"{name} mlp seam"),
+        layer_id=routed.layer_id,
+        blocks=routed.blocks,
+        write_idx=routed.write_idx,
+        seam=routed.seam,
         w_o=_plain_bf16(layer.self_attn.o_proj, f"{name} o_proj", (HIDDEN, dims.proj)),
-        w_gate=gate.data,
-        bias=_as_f32(moe.gate.e_score_correction_bias, EXPERTS, f"{name} gate bias"),
-        w_ld=_mxfp4_to_bf16(
-            moe.routed_expert_down_proj,
-            f"{name} routed_expert_down_proj",
-            (LATENT, HIDDEN),
-        ),
-        ln_w=_vec(moe.routed_expert_norm.weight, LATENT, f"{name} routed_expert_norm"),
-        w_up=w_up.narrow(0, rank * dims.up_n, dims.up_n).clone(),
+        w_gate=routed.w_gate,
+        bias=routed.bias,
+        w_ld=routed.w_ld,
+        ln_w=routed.ln_w,
+        w_up=routed.w_up,
         w_sgu=_plain_bf16(
             moe.shared_experts.gate_up_proj,
             f"{name} shared gate_up_proj",
@@ -474,12 +565,12 @@ def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
             f"{name} shared down_proj",
             (HIDDEN, dims.sh_inter),
         ),
-        w13=w13,
-        w13s=s13,
-        w2=w2,
-        w2s=s2,
-        gu_interleave=gu_interleave,
-        ln_eps=_eps(moe.routed_expert_norm, f"{name} routed_expert_norm"),
+        w13=routed.w13,
+        w13s=routed.w13s,
+        w2=routed.w2,
+        w2s=routed.w2s,
+        gu_interleave=routed.gu_interleave,
+        ln_eps=routed.ln_eps,
     )
 
 

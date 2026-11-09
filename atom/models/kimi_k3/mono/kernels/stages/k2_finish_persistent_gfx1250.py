@@ -17,6 +17,7 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int64, T
 
 from atom.models.kimi_k3.mono.config import EXPERTS, HIDDEN, LATENT, SUPPORTED_TP
+from atom.models.kimi_k3.mono.external_collectives import FrontPayloadLayout
 from atom.models.kimi_k3.mono.kernels.attention import (
     kda_gfx1250 as protocol_device,
 )
@@ -45,7 +46,6 @@ ROUTED_INTERMEDIATE = 384
 ROUTED_DOWN_TASKS = LATENT // 32
 SHARED_DOWN_TASKS = HIDDEN // 16
 GATE_UP_GROUPS = 12
-FRONT_STRIDE_DWORDS = EXPERTS // TP + LATENT // TP // 2
 
 FINISH_PACKED_FRONT_ABI = KernelAbi(
     (
@@ -57,7 +57,6 @@ FINISH_PACKED_FRONT_ABI = KernelAbi(
         "w13s",
         "w2",
         "w2s",
-        "latent_logical",
         "shared_hidden",
         "route",
         "tile_route",
@@ -101,52 +100,6 @@ def _direct_put(pointer, index, value):
 
 
 @traced
-def _quantize_latent(latent, latent_fp4, latent_scales, rows, global_tid, threads):
-    blocks = rows * (LATENT // 32)
-    for round_index in range_constexpr((blocks + threads - 1) // threads):
-        item = global_tid + threads * round_index
-        block = fx.min(item, blocks - 1)
-        token = block // (LATENT // 32)
-        group = block % (LATENT // 32)
-        base = (token * LATENT + group * 32) // 2
-        words = [
-            fx.Int32(
-                bo.buffer_load(
-                    rsrc(latent),
-                    base + index,
-                    vec_width=1,
-                    dtype=T.i32,
-                )
-            )
-            for index in range(16)
-        ]
-        maximum_bits = fx.Int32(0)
-        for word in words:
-            maximum_bits = fx.max(maximum_bits, word & 0x7FFF)
-            maximum_bits = fx.max(maximum_bits, (word >> 16) & 0x7FFF)
-        maximum = (maximum_bits << 16).bitcast(fx.Float32)
-        code = moe_gfx1250._e8m0_roundup(maximum)
-        reciprocal_scale = ((fx.Int32(254) - code) << 23).bitcast(fx.Float32)
-        if item < blocks:
-            for packed_word in range_constexpr(4):
-                value = moe_gfx1250._pack_bf16_words(
-                    words[4 * packed_word : 4 * packed_word + 4],
-                    reciprocal_scale,
-                )
-                bo.buffer_store(
-                    value,
-                    rsrc(latent_fp4),
-                    token * (LATENT // 8) + group * 4 + packed_word,
-                )
-            bo.buffer_store(
-                code,
-                rsrc(latent_scales),
-                token * (LATENT // 32) + group,
-            )
-    gpu.barrier()
-
-
-@traced
 def _grid_barrier(scratch, ticket, blocks):
     """All-resident monotonic grid barrier using the validated K1 primitive."""
 
@@ -169,6 +122,7 @@ def build_packed_finish(
     plan: Gfx1250KimiBuildPlan,
     *,
     gu_interleave: bool = False,
+    include_shared: bool = True,
 ) -> K2FinishKernel:
     if plan.architecture is not GFX1250:
         raise ValueError("persistent K2 finish requires gfx1250")
@@ -176,6 +130,7 @@ def build_packed_finish(
         raise ValueError("persistent K2 finish requires 256 threads/eight waves")
     rows = plan.tokens
     tiles = plan.token_tiling.tile_count
+    payload = FrontPayloadLayout(rows)
 
     @fx.struct
     class RouteRole:
@@ -231,7 +186,7 @@ def build_packed_finish(
 
     name = (
         f"k3_k2_gfx1250_persistent_finish_s{rows}_b{plan.blocks}"
-        f"_gu{int(gu_interleave)}"
+        f"_gu{int(gu_interleave)}_sh{int(include_shared)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -244,7 +199,6 @@ def build_packed_finish(
         w13s: Int64,
         w2: Int64,
         w2s: Int64,
-        latent_logical: Int64,
         shared_hidden: Int64,
         route: Int64,
         tile_route: Int64,
@@ -272,31 +226,52 @@ def build_packed_finish(
         down = role.down.peek()
         ticket = down.route.ptr
 
-        # Rank-major [TP,S,LOCAL_LATENT] -> logical [S,LATENT].
-        total_pairs = rows * (LATENT // 2)
-        work = bid * THREADS + tid
         stride = plan.blocks * THREADS
-        while work < total_pairs:
-            token = work // (LATENT // 2)
-            column_pair = work % (LATENT // 2)
-            rank = column_pair // (LOCAL_LATENT // 2)
-            local_pair = column_pair % (LOCAL_LATENT // 2)
-            payload_words = rows * FRONT_STRIDE_DWORDS
+        # Rank-major compressed payload -> logical token-major FP4/scales.
+        total_words = rows * (LATENT // 8)
+        work = bid * THREADS + tid
+        while work < total_words:
+            token = work // (LATENT // 8)
+            column_word = work % (LATENT // 8)
+            rank = column_word // (LOCAL_LATENT // 8)
+            local_word = column_word % (LOCAL_LATENT // 8)
             source = (
-                rank * payload_words
-                + rows * (EXPERTS // TP)
-                + token * (LOCAL_LATENT // 2)
-                + local_pair
+                rank * payload.local_bytes
+                + payload.latent_offset
+                + (token * (LOCAL_LATENT // 8) + local_word) * 4
             )
             value = fx.Int32(
                 bo.buffer_load(
-                    rsrc(front_gathered),
-                    source,
+                    rsrc(front_gathered + fx.Int64(source)),
+                    0,
                     vec_width=1,
                     dtype=T.i32,
                 )
             )
-            bo.buffer_store(value, rsrc(latent_logical), work)
+            bo.buffer_store(value, rsrc(latent_fp4), work)
+            work = work + stride
+        total_scales = rows * (LATENT // 32)
+        work = bid * THREADS + tid
+        while work < total_scales:
+            token = work // (LATENT // 32)
+            group = work % (LATENT // 32)
+            rank = group // (LOCAL_LATENT // 32)
+            local_group = group % (LOCAL_LATENT // 32)
+            source = (
+                rank * payload.local_bytes
+                + payload.latent_scale_offset
+                + token * (LOCAL_LATENT // 32)
+                + local_group
+            )
+            code = fx.Int32(
+                bo.buffer_load(
+                    rsrc(front_gathered + fx.Int64(source)),
+                    0,
+                    vec_width=1,
+                    dtype=T.i8,
+                )
+            ) & fx.Int32(0xFF)
+            bo.buffer_store(code, rsrc(latent_scales), work)
             work = work + stride
         rocdl.s_wait_storecnt(0)
         _grid_barrier(scratch, ticket, plan.blocks)
@@ -321,49 +296,50 @@ def build_packed_finish(
             moe_gfx1250.stage_route(
                 context,
                 bid,
-                rows * FRONT_STRIDE_DWORDS,
+                payload.local_bytes // 4,
             )
 
-        pairs = rows * SHARED_INTERMEDIATE // 2
-        pair = bid * THREADS + tid
-        while pair < pairs:
-            token = pair // (SHARED_INTERMEDIATE // 2)
-            column_pair = pair % (SHARED_INTERMEDIATE // 2)
-            gate_at = (token * (2 * SHARED_INTERMEDIATE) + 2 * column_pair) // 2
-            up_at = (
-                token * (2 * SHARED_INTERMEDIATE)
-                + SHARED_INTERMEDIATE
-                + 2 * column_pair
-            ) // 2
-            gate = fx.Int32(
-                bo.buffer_load(
-                    rsrc(shared_gate_up),
-                    gate_at,
-                    vec_width=1,
-                    dtype=T.i32,
+        if include_shared:
+            pairs = rows * SHARED_INTERMEDIATE // 2
+            pair = bid * THREADS + tid
+            while pair < pairs:
+                token = pair // (SHARED_INTERMEDIATE // 2)
+                column_pair = pair % (SHARED_INTERMEDIATE // 2)
+                gate_at = (token * (2 * SHARED_INTERMEDIATE) + 2 * column_pair) // 2
+                up_at = (
+                    token * (2 * SHARED_INTERMEDIATE)
+                    + SHARED_INTERMEDIATE
+                    + 2 * column_pair
+                ) // 2
+                gate = fx.Int32(
+                    bo.buffer_load(
+                        rsrc(shared_gate_up),
+                        gate_at,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
                 )
-            )
-            up = fx.Int32(
-                bo.buffer_load(
-                    rsrc(shared_gate_up),
-                    up_at,
-                    vec_width=1,
-                    dtype=T.i32,
+                up = fx.Int32(
+                    bo.buffer_load(
+                        rsrc(shared_gate_up),
+                        up_at,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
                 )
-            )
-            low = moe_expert_gfx1250._situ(bf_lo(gate), bf_lo(up))
-            high = moe_expert_gfx1250._situ(bf_hi(gate), bf_hi(up))
-            packed = (
-                fx.Vector.from_elements([low, high], fx.Float32)
-                .to(fx.BFloat16)
-                .bitcast(fx.Int32)[0]
-            )
-            bo.buffer_store(
-                packed,
-                rsrc(shared_hidden),
-                token * (SHARED_INTERMEDIATE // 2) + column_pair,
-            )
-            pair = pair + stride
+                low = moe_expert_gfx1250._situ(bf_lo(gate), bf_lo(up))
+                high = moe_expert_gfx1250._situ(bf_hi(gate), bf_hi(up))
+                packed = (
+                    fx.Vector.from_elements([low, high], fx.Float32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32)[0]
+                )
+                bo.buffer_store(
+                    packed,
+                    rsrc(shared_hidden),
+                    token * (SHARED_INTERMEDIATE // 2) + column_pair,
+                )
+                pair = pair + stride
         rocdl.s_wait_storecnt(0)
         _grid_barrier(scratch, ticket, plan.blocks)
 
@@ -380,17 +356,12 @@ def build_packed_finish(
                     "poll": _direct_poll,
                     "scan": prep.scan.ptr,
                     "route": route + tile_start * 32 * 4,
-                    "peer": {
-                        "lat_own": latent_logical + tile_start * LATENT * 2,
-                    },
                     "rt": {
                         "route": prep.route.ptr,
                         "flag": prep.flag.ptr,
                         "expert": prep.expert.ptr,
                         "kof": prep.kof.ptr,
                     },
-                    "latq": prep.latent_fp4.ptr,
-                    "latsc": prep.latent_scales.ptr,
                 }
                 union_size = moe_gfx1250.load_route(context, THREADS, WAVES)
                 if tid == 0:
@@ -427,17 +398,6 @@ def build_packed_finish(
                             rsrc(kof),
                             tile * 256 * 16 + index,
                         )
-        # Quantization groups are independent.  Flatten them over the whole
-        # resident grid instead of serializing quantization in tile-control
-        # CTAs; this also makes every CTA participate uniformly.
-        _quantize_latent(
-            latent_logical,
-            latent_fp4,
-            latent_scales,
-            rows,
-            bid * THREADS + tid,
-            plan.blocks * THREADS,
-        )
         rocdl.s_wait_storecnt(0)
         _grid_barrier(scratch, ticket, plan.blocks)
 
@@ -446,31 +406,32 @@ def build_packed_finish(
         for tile in range_constexpr(tiles):
             tile_start = tile * WMMA_TOKEN_ROWS
             tile_rows = min(WMMA_TOKEN_ROWS, rows - tile_start)
-            task = bid
-            while task < SHARED_DOWN_TASKS:
-                operands = gemv_gfx1250.loads(
-                    lane,
-                    wave,
-                    WAVES,
-                    shared_down_weight,
-                    task * 16,
-                    SHARED_INTERMEDIATE,
-                )
-                context = {
-                    "S": tile_rows,
-                    "tid": tid,
-                    "threads": THREADS,
-                    "lane": lane,
-                    "wave": wave,
-                    "tail": {
-                        "h": shared_hidden + tile_start * SHARED_INTERMEDIATE * 2,
-                        "gemv_rows": shared_down.rows.ptr,
-                        "gemv_accumulator": shared_down.accumulator.ptr,
-                    },
-                    "shared_partial": (shared_partial + tile_start * HIDDEN * 2),
-                }
-                moe_tail_gfx1250.stage_sdown(context, task, operands, WAVES)
-                task = task + plan.blocks
+            if include_shared:
+                task = bid
+                while task < SHARED_DOWN_TASKS:
+                    operands = gemv_gfx1250.loads(
+                        lane,
+                        wave,
+                        WAVES,
+                        shared_down_weight,
+                        task * 16,
+                        SHARED_INTERMEDIATE,
+                    )
+                    context = {
+                        "S": tile_rows,
+                        "tid": tid,
+                        "threads": THREADS,
+                        "lane": lane,
+                        "wave": wave,
+                        "tail": {
+                            "h": (shared_hidden + tile_start * SHARED_INTERMEDIATE * 2),
+                            "gemv_rows": shared_down.rows.ptr,
+                            "gemv_accumulator": shared_down.accumulator.ptr,
+                        },
+                        "shared_partial": (shared_partial + tile_start * HIDDEN * 2),
+                    }
+                    moe_tail_gfx1250.stage_sdown(context, task, operands, WAVES)
+                    task = task + plan.blocks
 
             union_size = fx.Int32(
                 bo.buffer_load(
@@ -690,7 +651,6 @@ def build_packed_finish(
         w13s: Int64,
         w2: Int64,
         w2s: Int64,
-        latent_logical: Int64,
         shared_hidden: Int64,
         route: Int64,
         tile_route: Int64,
@@ -716,7 +676,6 @@ def build_packed_finish(
             w13s,
             w2,
             w2s,
-            latent_logical,
             shared_hidden,
             route,
             tile_route,

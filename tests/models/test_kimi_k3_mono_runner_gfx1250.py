@@ -37,14 +37,22 @@ class _Launcher:
 
 
 def test_width_build_enumerates_each_local_launcher_once_and_compile_only():
-    launchers = [_Launcher()]
+    launchers = [_Launcher() for _ in range(4)]
     k1 = SimpleNamespace(
         entrypoint=SimpleNamespace(
             launcher=launchers[0],
             abi=KernelAbi(("k1_arg",)),
         )
     )
-    build = Gfx1250WidthBuild(k1={1: k1, 2: k1})
+    k2 = SimpleNamespace(
+        front=SimpleNamespace(launcher=launchers[1], abi=KernelAbi(("front",))),
+        finish=SimpleNamespace(launcher=launchers[2], abi=KernelAbi(("finish",))),
+        finalize=SimpleNamespace(launcher=launchers[3], abi=KernelAbi(("finalize",))),
+    )
+    build = Gfx1250WidthBuild(
+        k1={1: k1, 2: k1},
+        k2={1: k2, 2: k2},
+    )
 
     kernels = build.kernels()
     assert len(kernels) == len(launchers)
@@ -80,11 +88,12 @@ def test_width_build_replaces_only_spilled_k1_with_lean_gemv():
         spec=spec,
         plan=plan,
     )
-    built = Gfx1250WidthBuild({1: old, 2: other})
+    built = Gfx1250WidthBuild({1: old, 2: other}, {})
 
     lean = _lean_width(built, [spilled])
     assert lean is not None
     assert lean.k1 == {1: rebuilt, 2: other}
+    assert lean.k2 == {}
     assert len(observed) == 1 and observed[0].gemv_unit == 1
     assert _lean_width(built, [object()]) is None
 
@@ -108,13 +117,14 @@ def test_resident_resource_hazards_include_explicit_spills(monkeypatch):
     )
 
 
-def test_gfx1250_keeps_k2_on_the_production_path():
+def test_gfx1250_uses_native_routed_k2_with_production_seam():
     source = (
         Path(__file__).parents[2] / "atom/models/kimi_k3/mono/runner_gfx1250.py"
     ).read_text()
     assert "layer.self_attn.o_proj(core)" in source
-    assert "layer._ffn(normed)" in source
-    assert "def _k2(" not in source
+    assert "build_role_lds_front(" in source
+    assert "include_attention=False" in source
+    assert "def _routed_k2(" in source
 
 
 def test_only_ptpc_o_proj_enables_fused_k1_quant():
@@ -162,11 +172,16 @@ def test_k1_hands_its_core_to_the_production_k2(write_idx):
     )
     runner = object.__new__(K3Gfx1250MonoDecodeRunner)
     runner.inner = SimpleNamespace(layers=[layer])
+    runner.routed = {0: object()}
     runner._k1 = lambda *_args, **_kwargs: core
+    runner._routed_k2 = lambda _build, _plan, attn, value, _blocks: (
+        calls.update(routed=(attn, value)) or value + 1,
+        attn + 2,
+    )
     runner._write_aux = lambda *_args: None
     plan = SimpleNamespace(
         layer_id=0,
-        k1_only=True,
+        mono=True,
         kda=SimpleNamespace(blocks=1, write_idx=write_idx),
     )
 
@@ -175,12 +190,10 @@ def test_k1_hands_its_core_to_the_production_k2(write_idx):
     )
 
     assert calls["core"] is core
-    seam_prefix, visible, attn_out = calls["seam"]
-    assert (seam_prefix is None) == (write_idx >= 0)
-    assert visible.size(1) == 1 + (write_idx >= 0)
+    attn_out, routed_prefix = calls["routed"]
     torch.testing.assert_close(attn_out, core + 1)
-    torch.testing.assert_close(calls["ffn"], core + 2)
-    assert all(tensor.shape == prefix.shape for tensor in out)
+    assert routed_prefix is prefix
+    assert all(tensor is None or tensor.shape == prefix.shape for tensor in out)
 
 
 def test_runner_admits_only_supported_rows_and_query_lengths():

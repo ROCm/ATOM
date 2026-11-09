@@ -174,8 +174,9 @@ class FrontPayloadLayout:
     """Peer-major heterogeneous router/latent all-gather payload.
 
     Each TP rank contributes one contiguous byte row:
-    ``router[S,112] f32 || latent[S,448] bf16``. The gathered tensor is
-    ``[TP, local_bytes] u8`` in TP-rank order. Router values are never cast.
+    ``router[S,112] f32 || latent[S,448] fp4 || scale[S,14] e8m0``. The
+    gathered tensor is ``[TP, local_bytes] u8`` in TP-rank order. Router values
+    are never cast; latent values are quantized once by their producing rank.
     """
 
     rows: int
@@ -201,15 +202,24 @@ class FrontPayloadLayout:
 
     @property
     def latent_bytes(self) -> int:
-        return self.rows * self.latent_columns * 2
+        return self.rows * self.latent_columns // 2
+
+    @property
+    def latent_scale_bytes(self) -> int:
+        return self.rows * self.latent_columns // 32
 
     @property
     def latent_offset(self) -> int:
         return self.router_bytes
 
     @property
+    def latent_scale_offset(self) -> int:
+        return self.latent_offset + self.latent_bytes
+
+    @property
     def local_bytes(self) -> int:
-        return self.router_bytes + self.latent_bytes
+        raw = self.latent_scale_offset + self.latent_scale_bytes
+        return (raw + 15) // 16 * 16
 
     @property
     def local_shape(self) -> tuple[int, int]:
