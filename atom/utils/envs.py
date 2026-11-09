@@ -132,9 +132,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
     in {"1", "true"},
     "ATOM_TRACE_VERSION": lambda: os.getenv("ATOM_TRACE_VERSION", "unknown"),
-    # Forward metadata transport: direct or packed. Both keep source checks.
-    # Single-member groups and strided bindings retain direct copies.
-    "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
     # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
@@ -1248,12 +1245,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # claims. "0" walks block by block with a token compare per block.
     "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",
     # --- TBO prefill ubatch splitting ---
-    # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
-    # cutting through a request if needed for perfectly balanced 50/50 ubatches.
-    # Default on; set "0" to fall back to the request-boundary balanced split.
-    "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
-        os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
-    ),
     # Minimum prefill tokens (per rank) required to TBO-split.
     "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")

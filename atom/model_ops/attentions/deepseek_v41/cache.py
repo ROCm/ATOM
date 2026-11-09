@@ -6,15 +6,12 @@ import torch
 
 from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     gather_prefix_rows,
-    pack_rows,
     write_packed_window,
 )
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
     INDEX_FP8_SCALE_FMT,
-    MAIN_FP4,
 )
-from atom.model_ops.blockscale import quantize_fp4, quantize_fp8
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
 from atom.model_ops.deepseek_v41.compressor import compress_batch
@@ -31,8 +28,6 @@ from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
 from atom.model_ops.v4_kernels.state_writes import (
-    swa_scatter_rows,
-    swa_scatter_rows_reference,
     swa_write,
 )
 from atom.utils import CpuGpuBuffer, upload_numpy
@@ -299,7 +294,6 @@ class PagedAttentionCache:
         plans=None,
         publication_group=None,
         query_prefix_ready=False,
-        query_prefix_republish_reason=None,
         planners=(),
         floors=None,
         cached_until=None,
@@ -353,7 +347,6 @@ class PagedAttentionCache:
             ratios=tuple(ratio for ratio, _ in self.geometry.compress_ratios),
             publication_group=publication_group,
             query_prefix_ready=query_prefix_ready,
-            query_prefix_republish_reason=query_prefix_republish_reason,
             planners=planners,
         )
         step.plans = (
@@ -379,7 +372,7 @@ class PagedAttentionCache:
         self.current_step = step
         if not step.positions.is_cuda:
             return step
-        self._reserve_indptrs(step.width)
+        self._reserve_indptrs(step.running_tokens)
         # Before the indptrs, which count each row's window from its floor.
         self.publish_replay_layout(step, count if running_bs is None else running_bs)
         return step
@@ -586,29 +579,20 @@ class PagedAttentionCache:
         self.pending = None
 
     def compress(self, owner, compressor, values, scores, step, rope):
-        # A quantized pool interleaves values with their scales, which the
-        # kernel's BF16 scatter cannot write; take the rotated echo and
-        # quantize it here.
-        scatter = (
-            None
-            if self.window_fp8
-            else (self.pages.view(f"main_{owner}")[0], step.block_tables)
-        )
-        latent, rotated = compress_batch(
-            self, owner, compressor, values, scores, step, rope, scatter=scatter
-        )
-        if rotated is not None:
-            self._scatter_rows(
-                self.pages.view(f"main_{owner}")[0],
-                step,
-                (
-                    quantize_fp4(rotated, **MAIN_FP4)
-                    if self.packed
-                    else quantize_fp8(rotated)
-                ),
-                compressor.ratio,
-            )
-        return latent
+        """The boundaries' rotated latents into this owner's main rows, in the
+        pool's own row format; returns the latent the index key projects from."""
+        return compress_batch(
+            self, owner, compressor, values, scores, step, rope,
+            pages=self.pages.view(f"main_{owner}")[0],
+            quant_mode=self.main_quant_mode,
+        )  # fmt: skip
+
+    @property
+    def main_quant_mode(self):
+        """How `fused_compress_attn` stores a main row in this pool."""
+        if self.packed:
+            return "packed_fp4"
+        return "packed_fp8" if self.kv_fp8 else "none"
 
     def write_index(self, owner, step, index, ratio):
         """One pass quantizes, preshuffles and scatters.
@@ -700,27 +684,6 @@ class PagedAttentionCache:
                 rows_per_block=self.geometry.index_block_rows,
             )
         return bound
-
-    def _scatter_rows(self, pages, step, value, ratio):
-        """Scatter plan rows with V4's dtype-agnostic, sentinel-aware writer.
-
-        PAGE fields have gaps between pages. Give the existing row scatter a
-        zero-copy view whose row stride is one element, so destination indices
-        are element offsets into this field's span. This retains the real page
-        stride without flattening/copying the field or compacting live rows on
-        the host during CUDA graph capture.
-        """
-        per_page = pages.shape[1]
-        plan = step.plans[ratio].compress_plan_gpu
-        batch = plan[:, 1].long()
-        rows = plan[:, 2].long() // ratio
-        page = step.block_tables[batch.clamp_min(0), (rows // per_page).clamp_min(0)]
-        offsets = page.long() * pages.stride(0) + (rows % per_page) * pages.stride(1)
-        last = (pages.shape[0] - 1) * pages.stride(0) + (per_page - 1) * pages.stride(1)
-        pool = pages.as_strided((last + 1, pages.shape[-1]), (1, 1))
-        rows_in = pack_rows(*value) if isinstance(value, tuple) else value
-        scatter = swa_scatter_rows if pages.is_cuda else swa_scatter_rows_reference
-        scatter(rows_in[0], offsets, batch, pool)
 
     def compress_state(self, owner):
         """This owner's `(kv_state, score_state)`, each `[slots, ring, dim]`.
@@ -817,15 +780,15 @@ class PagedAttentionCache:
         """
         dim, window_fp8 = self.geometry.head_dim, self.window_fp8
 
-        if not step.width:
+        if not step.running_tokens:
             return (None, None) if step.decode else (torch.empty_like(kv), None)
         seam = (
             (
-                kv.new_empty(step.width, 0, dim)
+                kv.new_empty(step.running_tokens, 0, dim)
                 if query is None
-                else query.view(step.width, -1, dim)
+                else query.view(step.running_tokens, -1, dim)
             ),
-            kv.view(step.width, dim),
+            kv.view(step.running_tokens, dim),
             rope.cos_cache,
             rope.sin_cache,
             step.positions,
@@ -846,7 +809,7 @@ class PagedAttentionCache:
             # Values then scales a row, the pool's own row: the attention's
             # extend source has to share the prefix's strides.
             rows = torch.empty(
-                (step.width, self.geometry.row_bytes),
+                (step.running_tokens, self.geometry.row_bytes),
                 device=kv.device,
                 dtype=torch.uint8,
             )
@@ -891,9 +854,9 @@ class PagedAttentionCache:
 
     def write_window(self, layer, kv, step):
         # `None` is `rope_quant_window` reporting that it already stored the
-        # row, not an empty batch: those two differ in whether `step.width` is
+        # row, not an empty batch: those two differ in whether `step.running_tokens` is
         # zero, and only this one can reach here after a real forward.
-        if kv is not None and step.width:
+        if kv is not None and step.running_tokens:
             window = self.geometry.window(layer, self.num_pages)
             # rows below where a request's ring already holds them stay
             cached = step.swa_cached_until if step.request_cached_until.any() else None
