@@ -125,6 +125,119 @@ def _ema(avg: float, sample: float) -> float:
     return sample if avg <= 0 else avg + _STEP_EMA_WEIGHT * (sample - avg)
 
 
+# --------------------------------------------------------------------------
+# ATOM_PREFILL_ADMIT=adaptive  (default off; "" keeps the legacy behavior)
+#
+# Replaces the fixed post-prefill decode interval (ATOM_PREFILL_DECODE_INTERVAL)
+# and the fill/stall coalescer with a rent-or-buy (EOQ) rule derived from
+# measured step costs:
+#
+#   decode tick   T_d(b) = T0 + c*b      (b = decode seqs per rank)
+#   prefill step  P(n)   = A  + k*n      (n = largest per-rank prefill tokens)
+#
+# A held request costs alpha*T0/T_d decode tokens per tick (the marginal
+# throughput of one more seq in the batch); a prefill forward's fixed part A
+# costs A*alpha*B/T_d tokens (all B decode seqs stall; the per-token part k*n is
+# work that must be done whatever the batching). Firing once the accumulated
+# holding cost reaches the fixed cost -- sum over held ticks of W_t*T0 >= A*B --
+# is the EOQ optimum for a steadily growing queue and 2-competitive otherwise.
+# alpha (accepted tokens per seq per step) and T_d cancel. No interval to tune:
+# a faster prefill (smaller A) or a costlier decode seq (smaller T0 share) fires
+# sooner, and vice versa.
+#
+# Lockstep: every rank fits T0 and A locally from its own step clock; the fits
+# and the per-tick waiting counts ride the existing SUM all_reduce, and every
+# rank decides from the identical reduced means.
+# --------------------------------------------------------------------------
+_ADMIT_POLICIES = ("", "adaptive")
+# decode / prefill fit half-lives in samples, and identifiability guards
+_DEC_HALF_LIFE = 2000.0
+_PF_HALF_LIFE = 200.0
+_DEC_MIN_N = 64
+_PF_MIN_N = 8
+_DEC_MIN_CV = 0.02
+_PF_MIN_CV = 0.05
+# prior while the decode fit is not identifiable (batch ~constant): T0 share
+_DEC_T0_PRIOR = 0.75
+# prior fixed prefill cost while the prefill fit is not identifiable: share of
+# a mean prefill step
+_PF_A_PRIOR = 0.25
+# fixed slots: W_eff, T0 (us), A (us), fitted ranks; then dp_size one-hot slots
+# of each rank's prefill tokens executed on the previous tick
+_ADAPT_FIXED = 4
+# v2 (ATOM_PREFILL_ADMIT_VERSION=2, the default): v1 extrapolated T0 as the
+# intercept of T_d(b) over a narrow batch range (b ~ 300-400 total), which
+# drifted toward 0 under load (13 ms -> 2-5 ms) and stretched the cycle to
+# 30-41 ticks (-4.6% thr, TTFT 2.7x vs interval 24). v2 makes every estimate
+# robust and bounds the cycle:
+#   T0 = T0_FRAC * EMA mean decode step                (no extrapolation)
+#   A  = prefill-fit intercept clamped to [A_MIN, A_MAX] * mean prefill step
+#   FIRE when regret >= A*B and hold_ticks >= MIN_TICKS, or when
+#   hold_ticks >= MAX_TICKS = MAX_HOLD_MS / mean decode step  (TTFT budget;
+#   600 ms ~ 24 ticks at ~25 ms/tick), clamped to [MIN_TICKS, _V2_TICKS_CAP].
+_V2_DEFAULTS = {
+    "T0_FRAC": 0.75,
+    "A_MIN_FRAC": 0.3,
+    "A_MAX_FRAC": 1.5,
+    "MAX_HOLD_MS": 600.0,
+    "MIN_TICKS": 4.0,
+}
+_V2_TICKS_CAP = 200
+# cap before the decode mean is known (cold start)
+_V2_COLD_MAX_TICKS = 24
+
+
+def _admit_env(name: str, default: float) -> float:
+    raw = os.environ.get(f"ATOM_PREFILL_ADMIT_{name}", "").strip()
+    return float(raw) if raw else float(default)
+
+
+def admit_policy_from_env() -> str:
+    policy = os.environ.get("ATOM_PREFILL_ADMIT", "").strip().lower()
+    if policy in ("0", "off", "none", "interval"):
+        policy = ""
+    if policy in ("1", "eoq"):
+        policy = "adaptive"
+    if policy not in _ADMIT_POLICIES:
+        raise ValueError(f"unknown ATOM_PREFILL_ADMIT={policy!r}")
+    return policy
+
+
+class _EwFit:
+    """Exponentially weighted least squares fit of y = a + b*x."""
+
+    __slots__ = ("decay", "n", "sw", "sx", "sxx", "sxy", "sy")
+
+    def __init__(self, half_life: float):
+        self.decay = 0.5 ** (1.0 / half_life)
+        self.n = 0
+        self.sw = self.sx = self.sy = self.sxx = self.sxy = 0.0
+
+    def add(self, x: float, y: float) -> None:
+        d = self.decay
+        self.n += 1
+        self.sw = self.sw * d + 1.0
+        self.sx = self.sx * d + x
+        self.sy = self.sy * d + y
+        self.sxx = self.sxx * d + x * x
+        self.sxy = self.sxy * d + x * y
+
+    def mean_y(self) -> float:
+        return self.sy / self.sw if self.sw > 0 else 0.0
+
+    def fit(self, min_n: int, min_cv: float):
+        """(intercept, slope, mean_x, mean_y), or None if not identifiable."""
+        if self.n < min_n or self.sw <= 0:
+            return None
+        mx = self.sx / self.sw
+        my = self.sy / self.sw
+        vxx = self.sxx / self.sw - mx * mx
+        if mx <= 0 or vxx <= (min_cv * mx) ** 2:
+            return None
+        slope = (self.sxy / self.sw - mx * my) / vxx
+        return my - slope * mx, slope, mx, my
+
+
 class PrefillDecision(NamedTuple):
     """One lockstep decision, alike on every rank: whether prefill may be
     admitted this tick, and how many ranks of the group have prefill to admit."""
@@ -135,6 +248,20 @@ class PrefillDecision(NamedTuple):
 
 class PrefillDelayer:
     __slots__ = (
+        "_adapt_at",
+        "_adapt_dec_fit",
+        "_adapt_last_tokens",
+        "_adapt_pf_fit",
+        "_adapt_prev_dec_per_rank",
+        "_adapt_regret",
+        "_adapt_thr_last",
+        "_stat_adapt_cycles",
+        "_stat_adapt_hold_ticks",
+        "_stat_fire_adaptive",
+        "_stat_fire_adaptcap",
+        "_v2",
+        "admit_policy",
+        "admit_version",
         "_arrival_gap_s",
         "_clock",
         "_cost_gate",
@@ -199,6 +326,9 @@ class PrefillDelayer:
         exchange_prefill_costs: bool = False,
         cost_gate: bool = False,
         clock=time.perf_counter,
+        admit_policy: str = "",
+        admit_version: int | None = None,
+        admit_params: dict | None = None,
     ):
         if dp_size > 1 and cpu_group is None:
             raise ValueError("Cross-DP prefill coalescing requires a CPU group")
@@ -247,6 +377,28 @@ class PrefillDelayer:
                 "prefill_decode_interval must be non-negative; "
                 f"got {prefill_decode_interval}"
             )
+        if admit_policy not in _ADMIT_POLICIES:
+            raise ValueError(f"unknown admit_policy={admit_policy!r}")
+        self.admit_policy = admit_policy
+        if admit_version is None:
+            admit_version = int(_admit_env("VERSION", 2))
+        if admit_version not in (1, 2):
+            raise ValueError(f"unknown ATOM_PREFILL_ADMIT_VERSION={admit_version}")
+        self.admit_version = admit_version
+        v2 = {k: _admit_env(k, d) for k, d in _V2_DEFAULTS.items()}
+        v2.update(admit_params or {})
+        if not (0 < v2["T0_FRAC"] <= 1):
+            raise ValueError(f"ATOM_PREFILL_ADMIT_T0_FRAC={v2['T0_FRAC']} not in (0, 1]")
+        if not (0 < v2["A_MIN_FRAC"] <= v2["A_MAX_FRAC"]):
+            raise ValueError("need 0 < ATOM_PREFILL_ADMIT_A_MIN_FRAC <= A_MAX_FRAC")
+        v2["MIN_TICKS"] = max(0, int(v2["MIN_TICKS"]))
+        self._v2 = v2
+        if admit_policy == "adaptive" and prefill_decode_interval:
+            logger.info(
+                "ATOM_PREFILL_ADMIT=adaptive: ignoring "
+                f"prefill_decode_interval={prefill_decode_interval}"
+            )
+            prefill_decode_interval = 0
         self.prefill_decode_interval = prefill_decode_interval
 
         # `_FIXED_SLOTS`-slot SUM-reduce buffer (gloo-safe). Encoding:
@@ -275,11 +427,27 @@ class PrefillDelayer:
             cpu_group.rank() if self._cost_slots and cpu_group is not None else 0
         )
         self._gate_at = _FIXED_SLOTS + self._cost_slots
+        self._adapt_at = self._gate_at + (
+            len(_Gate._fields) if self._cost_gate else 0
+        )
+        if admit_policy == "adaptive" and cpu_group is not None:
+            self._rank = cpu_group.rank()
         self._reduce_buf = torch.zeros(
-            self._gate_at + (len(_Gate._fields) if self._cost_gate else 0),
+            self._adapt_at + (_ADAPT_FIXED + dp_size if admit_policy else 0),
             dtype=torch.int64,
             device="cpu",
         )
+        # adaptive admission state (see the module-level comment)
+        self._adapt_dec_fit = _EwFit(_DEC_HALF_LIFE)
+        self._adapt_pf_fit = _EwFit(_PF_HALF_LIFE)
+        self._adapt_last_tokens = 0
+        self._adapt_prev_dec_per_rank = 0.0
+        self._adapt_regret = 0.0
+        self._adapt_thr_last = (0.0, 0.0, 0.0)
+        self._stat_adapt_cycles = 0
+        self._stat_adapt_hold_ticks = 0
+        self._stat_fire_adaptive = 0
+        self._stat_fire_adaptcap = 0
         self.rank_prefill_costs: list[float] = []
         # the alignment gate's waiting cost this hold episode (µs x requests)
         self._hold_cost_us = 0.0
@@ -338,7 +506,13 @@ class PrefillDelayer:
             f"token_usage_low_watermark={token_usage_low_watermark} "
             f"max_queue_ms={max_queue_ms} "
             f"prefill_decode_interval={prefill_decode_interval} "
-            f"cost_gate={self._cost_gate}"
+            f"cost_gate={self._cost_gate} "
+            f"admit_policy={admit_policy!r}"
+            + (
+                f" admit_version={admit_version} admit_v2={self._v2}"
+                if admit_policy
+                else ""
+            )
         )
 
     @staticmethod
@@ -381,6 +555,7 @@ class PrefillDelayer:
         prefill_cost: float = 0.0,
         waiting_requests: int = 0,
         arrived_requests: int = 0,
+        admittable_requests: int | None = None,
     ) -> PrefillDecision:
         """Whether this rank may admit new prefills this tick (FIRE), and how
         many ranks have prefill to admit.
@@ -419,6 +594,10 @@ class PrefillDelayer:
                 (fresh prefills and resumable partials); read by the cost gate.
             arrived_requests: requests added to this rank since the previous
                 call; the cost gate's arrival rate.
+            admittable_requests: (ATOM_PREFILL_ADMIT=adaptive) requests a
+                FIRE could put into this rank's decode batch now: resumable
+                partials plus waiting heads that fit the free seq slots.
+                None falls back to `waiting_requests`.
         """
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
@@ -462,6 +641,26 @@ class PrefillDelayer:
             )
             for offset, value in enumerate(gate):
                 self._reduce_buf[self._gate_at + offset] = value
+        if self.admit_policy:
+            if not self._cost_gate:
+                now_a = self._clock()
+                if self._last_call_s is not None:
+                    step_s = now_a - self._last_call_s
+                self._last_call_s = now_a
+            w_eff = (
+                waiting_requests if admittable_requests is None else admittable_requests
+            )
+            t0_us, a_us = self._adapt_local_fits()
+            at = self._adapt_at
+            buf = self._reduce_buf
+            buf[at] = int(w_eff) if prefillable else 0
+            fitted = t0_us > 0 and a_us > 0
+            buf[at + 1] = int(t0_us) if fitted else 0
+            buf[at + 2] = int(a_us) if fitted else 0
+            buf[at + 3] = 1 if fitted else 0
+            buf[at + _ADAPT_FIXED : at + _ADAPT_FIXED + self.dp_size] = 0
+            buf[at + _ADAPT_FIXED + self._rank] = int(self._adapt_last_tokens)
+            self._adapt_last_tokens = 0
         if self.cpu_group is not None:
             try:
                 torch.distributed.all_reduce(
@@ -503,6 +702,8 @@ class PrefillDelayer:
         if self._cost_gate:
             self._time_step(step_s, prefill_ran_n > 0)
             self._prev_running_dec = g_running_dec
+        if self.admit_policy:
+            self._adapt_observe(reduced, step_s, prefill_ran_n > 0, g_running_dec)
         # This local execution report has now participated in the global
         # decision. A later successful prefill forward sets it again.
         self._prefill_executed_since_last_decision = False
@@ -555,6 +756,8 @@ class PrefillDelayer:
             return self._fire("queue_ms", g_pending)
         if self._hold_ticks >= self.ttft_max_ticks:
             return self._fire("ttft", g_pending)
+        if self.admit_policy:
+            return self._adapt_decide(reduced, g_running_dec, g_pending)
         if any_partial and self._hold_ticks >= self.partial_max_ticks:
             return self._fire("partial", g_pending)
 
@@ -663,7 +866,114 @@ class PrefillDelayer:
         self._maybe_log()
         return True
 
-    def notify_prefill_executed(self) -> None:
+    # ---------------- ATOM_PREFILL_ADMIT=adaptive ----------------
+    def _adapt_local_fits(self) -> tuple[float, float]:
+        """This rank's (T0, A) in us; 0 = not estimated yet."""
+        if self.admit_version >= 2:
+            return self._adapt_local_fits_v2()
+        dec = self._adapt_dec_fit
+        pf = self._adapt_pf_fit
+        t0 = 0.0
+        if dec.n >= _DEC_MIN_N:
+            f = dec.fit(_DEC_MIN_N, _DEC_MIN_CV)
+            my = dec.mean_y()
+            if f is None:
+                t0 = _DEC_T0_PRIOR * my
+            else:
+                # a negative slope (noise) clamps to "all fixed"
+                t0 = min(max(f[0], 0.1 * my), my)
+        a = 0.0
+        if pf.n >= _PF_MIN_N:
+            f = pf.fit(_PF_MIN_N, _PF_MIN_CV)
+            my = pf.mean_y()
+            if f is None or f[1] <= 0:
+                a = _PF_A_PRIOR * my
+            else:
+                a = min(max(f[0], 0.02 * my), my)
+        return t0, a
+
+    def _adapt_local_fits_v2(self) -> tuple[float, float]:
+        """v2: T0 = T0_FRAC * mean decode step (no intercept extrapolation);
+        A = prefill-fit intercept (prior share if not identifiable) clamped to
+        [A_MIN_FRAC, A_MAX_FRAC] * mean prefill step."""
+        v2 = self._v2
+        dec = self._adapt_dec_fit
+        pf = self._adapt_pf_fit
+        t0 = v2["T0_FRAC"] * dec.mean_y() if dec.n >= _DEC_MIN_N else 0.0
+        a = 0.0
+        if pf.n >= _PF_MIN_N:
+            my = pf.mean_y()
+            f = pf.fit(_PF_MIN_N, _PF_MIN_CV)
+            a = _PF_A_PRIOR * my if f is None or f[1] <= 0 else f[0]
+            a = min(max(a, v2["A_MIN_FRAC"] * my), v2["A_MAX_FRAC"] * my)
+        return t0, a
+
+    def _adapt_max_ticks(self, t0: float, fitted: bool) -> int:
+        """v2 hold cap from the TTFT budget, identical on every rank (t0 is
+        the reduced mean)."""
+        lo = self._v2["MIN_TICKS"]
+        if not fitted or t0 <= 0:
+            return max(lo, _V2_COLD_MAX_TICKS)
+        mean_dec_us = t0 / self._v2["T0_FRAC"]
+        n = int(round(self._v2["MAX_HOLD_MS"] * 1000.0 / mean_dec_us))
+        return min(max(n, lo, 1), _V2_TICKS_CAP)
+
+    def _adapt_observe(
+        self, reduced: list[int], step_s: float, prefill_ran: bool, g_running_dec: int
+    ) -> None:
+        """Fold the step that ran since the previous decision into the fits:
+        a prefill step against the largest per-rank prefill token count, a
+        decode step against the decode seqs per rank it ran with."""
+        at = self._adapt_at
+        if step_s > 0:
+            if prefill_ran:
+                toks = max(
+                    reduced[at + _ADAPT_FIXED : at + _ADAPT_FIXED + self.dp_size]
+                )
+                if toks > 0:
+                    self._adapt_pf_fit.add(float(toks), step_s * 1e6)
+            elif self._adapt_prev_dec_per_rank > 0:
+                self._adapt_dec_fit.add(self._adapt_prev_dec_per_rank, step_s * 1e6)
+        self._adapt_prev_dec_per_rank = g_running_dec / max(self.dp_size, 1)
+
+    def _adapt_decide(
+        self, reduced: list[int], g_running_dec: int, g_pending: int
+    ) -> bool:
+        """Rent-or-buy: FIRE once sum_t W_t*T0 >= A*B (all reduced values)."""
+        at = self._adapt_at
+        w_eff, t0_sum, a_sum, fitted = reduced[at : at + _ADAPT_FIXED]
+        if w_eff <= 0:
+            # nothing a FIRE could admit (slots full / KV-blocked): holding is free
+            return self._adapt_hold(g_pending)
+        if fitted > 0:
+            t0 = t0_sum / fitted
+            a = a_sum / fitted
+        else:
+            # cold start: ratio A/T0 = 1 until the fits exist
+            t0, a = 1.0, 1.0
+        self._adapt_regret += w_eff * t0
+        thr = a * g_running_dec
+        self._adapt_thr_last = (t0, a, thr)
+        if self.admit_version >= 2:
+            # this tick would be the (hold_ticks+1)-th since the last FIRE
+            ticks = self._hold_ticks + 1
+            if ticks >= self._adapt_max_ticks(t0, fitted > 0):
+                self._stat_adapt_cycles += 1
+                return self._fire("adaptcap", g_pending)
+            if ticks >= self._v2["MIN_TICKS"] and self._adapt_regret >= thr:
+                self._stat_adapt_cycles += 1
+                return self._fire("adaptive", g_pending)
+            return self._adapt_hold(g_pending)
+        if self._adapt_regret >= thr:
+            self._stat_adapt_cycles += 1
+            return self._fire("adaptive", g_pending)
+        return self._adapt_hold(g_pending)
+
+    def _adapt_hold(self, g_pending: int) -> bool:
+        self._stat_adapt_hold_ticks += 1
+        return self._hold(g_pending)
+
+    def notify_prefill_executed(self, tokens: int = 0) -> None:
         """Report a completed local prefill forward.
 
         The next lockstep decision folds this flag into the existing SUM
@@ -671,6 +981,7 @@ class PrefillDelayer:
         a second collective to the scheduler hot path.
         """
         self._prefill_executed_since_last_decision = True
+        self._adapt_last_tokens += int(tokens)
 
     def notify_idle(self) -> None:
         """Report a tick the DP group spent with no work, which schedules
@@ -694,6 +1005,7 @@ class PrefillDelayer:
         self._stall_count = 0
         self._prev_pending = -1
         self._hold_cost_us = 0.0
+        self._adapt_regret = 0.0
 
     def _maybe_log(self) -> None:
         # Cheap guard first — skip the counter sum entirely when logging is
@@ -710,6 +1022,8 @@ class PrefillDelayer:
             + self._stat_fire_nodecode
             + self._stat_fire_queue_ms
             + self._stat_fire_vacuous
+            + self._stat_fire_adaptive
+            + self._stat_fire_adaptcap
             + self._stat_hold
         )
         if total == 0:
@@ -730,3 +1044,15 @@ class PrefillDelayer:
                 f"hold={self._stat_hold} "
                 f"(hold_rate={self._stat_hold / total:.2%})"
             )
+            if self.admit_policy:
+                t0, a, thr = self._adapt_thr_last
+                cyc = self._stat_adapt_cycles
+                logger.info(
+                    f"[PrefillDelayer adaptive v{self.admit_version}] "
+                    f"fire_adaptive={self._stat_fire_adaptive} "
+                    f"fire_cap={self._stat_fire_adaptcap} "
+                    f"max_ticks={self._adapt_max_ticks(t0, t0 > 1.0)} "
+                    f"T0_us={t0:.0f} A_us={a:.0f} thr={thr:.0f} "
+                    f"dec_fit_n={self._adapt_dec_fit.n} pf_fit_n={self._adapt_pf_fit.n} "
+                    f"hold_ticks/cycle={self._stat_adapt_hold_ticks / max(cyc, 1):.1f}"
+                )

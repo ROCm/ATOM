@@ -545,6 +545,10 @@ def _read_only(lo: int, hi: int) -> bool:
     return False
 
 
+# hyi 1101: register in-place ranges as BOs of at most this many bytes (0 = one BO per gap).
+_REG_CHUNK = (int(os.environ.get("ATOM_ENGRAM_REG_CHUNK_MB", "0") or 0) << 20) // _PAGE * _PAGE
+
+
 class _PageRuns:
     """This process's in-place page-locked runs, reference-counted.
 
@@ -574,12 +578,21 @@ class _PageRuns:
             for base in [*overlapping, None]:
                 gap_end = hi if base is None else base
                 if cursor < gap_end:
-                    if int(rt.cudaHostRegister(cursor, gap_end - cursor, flags)):
-                        _clear_hip_error()
-                        self.release(rt, held)
-                        return None
-                    self._runs[cursor] = [gap_end, 1]
-                    held.append(cursor)
+                    # hyi 1101: optional chunking (ATOM_ENGRAM_REG_CHUNK_MB), see _REG_CHUNK.
+                    step = _REG_CHUNK if _REG_CHUNK > 0 else gap_end - cursor
+                    c = cursor
+                    while c < gap_end:
+                        e = min(gap_end, c + step)
+                        if int(rt.cudaHostRegister(c, e - c, flags)):
+                            _clear_hip_error()
+                            self.release(rt, held)
+                            return None
+                        self._runs[c] = [e, 1]
+                        held.append(c)
+                        c = e
+                    if gap_end - cursor >= (1 << 30):
+                        logger.info("engram: registered %.2f GiB in-place as %d userptr BO(s)",
+                                    (gap_end - cursor) / 2**30, -(-(gap_end - cursor) // step))
                 if base is None:
                     break
                 self._runs[base][1] += 1
@@ -649,6 +662,13 @@ def _register(sources, leases):
         flags = _HOST_REGISTER_READ_ONLY if _read_only(lo, hi) else 0
         if flags:
             _populate(lo, hi)
+        if os.environ.get("ATOM_ENGRAM_MLOCK", "0") == "1":  # hyi 1101
+            _libc = ctypes.CDLL(None, use_errno=True)
+            _libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            if _libc.mlock(lo, hi - lo) != 0:
+                logger.warning("engram: mlock of %d bytes failed: errno %d", hi - lo, ctypes.get_errno())
+            elif hi - lo >= (1 << 30):
+                logger.info("engram: mlocked %.2f GiB", (hi - lo) / 2**30)
         runs = _PAGE_RUNS.acquire(rt, lo, hi, flags)
         if runs is None:
             logger.info("engram: page-lock registration of %d bytes refused", hi - lo)

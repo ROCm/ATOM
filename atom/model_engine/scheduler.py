@@ -2053,6 +2053,17 @@ class Scheduler:
                 prefill_cost=prefill_cost,
                 waiting_requests=len(self.waiting) + self._partial_prefill_count,
                 arrived_requests=self._arrived_requests,
+                # ATOM_PREFILL_ADMIT=adaptive: what a FIRE could add to the
+                # decode batch -- partials plus waiting heads up to free slots
+                admittable_requests=(
+                    self._partial_prefill_count
+                    + min(
+                        len(self.waiting),
+                        max(0, self.max_num_seqs - len(self.running)),
+                    )
+                    if self.prefill_delayer.admit_policy
+                    else None
+                ),
             )
         else:
             decision = PrefillDecision(allow=True, prefillable_ranks=0)
