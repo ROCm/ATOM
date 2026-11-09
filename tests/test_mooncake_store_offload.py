@@ -51,6 +51,7 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
+from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -720,7 +721,7 @@ def test_engine_compatibility_refuses_what_phase_one_does_not_move():
     check_engine_compatibility(cfg, _config())
     state_owning = _config()
     state_owning.hf_config.model_type = "kimi_linear"
-    with pytest.raises(ValueError, match="dense KV layout and V4.1's replay PAGEs"):
+    with pytest.raises(ValueError, match="M3 PAGE layout, and V4.1's replay PAGEs"):
         check_engine_compatibility(cfg, state_owning)
     with pytest.raises(ValueError, match="decode context parallelism"):
         check_engine_compatibility(cfg, _config(decode_context_parallel_size=4))
@@ -3193,7 +3194,7 @@ def test_v41_registration_uses_pages_without_request_slots(
         selected.update(kwargs)
         # The fixture's fake transfer engine uses CPU bytes. Keep its normal
         # codec while verifying which PAGE/SLOT contract registration selects.
-        codec = worker_mod.DenseKVByteCodec(_kv_caches(), num_blocks=8)
+        codec = DenseKVByteCodec(_kv_caches(), num_blocks=8)
         monkeypatch.setattr(
             type(codec), "has_fused_chunk_major_staging", property(lambda self: True)
         )
@@ -3890,6 +3891,7 @@ def test_m3_store_codec_includes_all_page_planes(model_type, monkeypatch):
     from atom.kv_transfer.disaggregation.page_region import page_region
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
     from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+    from atom.kv_transfer.offload.mooncake_store.layouts import build_mooncake_codec
 
     # Exercise real PAGE geometry on CPU; GPU capability refusal is tested
     # separately in test_m3_offload_codec.py.
@@ -3899,8 +3901,6 @@ def test_m3_store_codec_includes_all_page_planes(model_type, monkeypatch):
     config = _config()
     config.hf_config.model_type = model_type
     check_engine_compatibility(parse_mooncake_store_config(_extra()), config)
-    connector = object.__new__(MooncakeStoreOffloadConnector)
-    connector._config = config
     fields = {
         name: torch.zeros((4, width), dtype=torch.uint8)
         for name, width in [
@@ -3916,11 +3916,13 @@ def test_m3_store_codec_includes_all_page_planes(model_type, monkeypatch):
         pages=[page_region(t, semantic_role=f"m3.{name}") for name, t in fields.items()]
     )
     transfer.set_block_count(4)
-    codec = connector._make_codec({}, transfer, 4)
+    codec = build_mooncake_codec(
+        config, {}, transfer, 4, permit_per_request_state=False
+    )
     assert codec.bytes_per_block == sum(t.shape[1] for t in fields.values())
     for bad in (None, KVTransferTensors()):
         with pytest.raises(ValueError, match="complete PAGE"):
-            connector._make_codec({}, bad, 4)
+            build_mooncake_codec(config, {}, bad, 4, permit_per_request_state=False)
 
 
 def test_m3_store_namespace_separates_complete_pages_from_dense_codec(monkeypatch):
@@ -3937,15 +3939,16 @@ def test_m3_store_namespace_separates_complete_pages_from_dense_codec(monkeypatc
 @pytest.mark.parametrize("layout", ["dense", "m3"])
 def test_store_codec_version_changes_only_its_own_namespace(monkeypatch, layout):
     from atom.kv_transfer.offload.hybrid.m3 import codec as m3_codec
+    from atom.kv_transfer.offload.mooncake_store import layouts
 
     config = _config()
     monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: layout)
     namespace = keys.store_namespace(config, CHUNK)
     if layout == "m3":
         own = (m3_codec, "M3_CODEC_ID")
-        other = (keys, "CODEC_ID")
+        other = (layouts, "DENSE_CODEC_ID")
     else:
-        own = (keys, "CODEC_ID")
+        own = (layouts, "DENSE_CODEC_ID")
         other = (m3_codec, "M3_CODEC_ID")
     monkeypatch.setattr(*other, "other-codec-next-version")
     assert keys.store_namespace(config, CHUNK) == namespace

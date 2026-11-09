@@ -14,7 +14,7 @@ from atom.kv_transfer.disaggregation.types import KVTransferTensors, PageRegion
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.kv_transfer.offload.hybrid.m3 import connector as m3_connector
 from atom.kv_transfer.offload.hybrid.m3.codec import build_m3_page_codec
-from atom.kv_transfer.offload.mooncake_store.worker import MooncakeStoreOffloadConnector
+from atom.kv_transfer.offload.mooncake_store.layouts import build_mooncake_codec
 
 
 @pytest.fixture
@@ -80,14 +80,15 @@ def test_page_codec_rejects_missing_or_unset_block_count(transfer, num_blocks):
 
 @pytest.mark.parametrize("backend", ["lmcache", "mooncake_store"])
 def test_connectors_reject_unavailable_page_staging(transfer, monkeypatch, backend):
-    # CPU PAGEs make the real codec report no Triton staging. Both workers
-    # must refuse before constructing any offload engine, pool or Store client.
+    # CPU PAGEs make the real codec report no Triton staging. Mooncake refuses
+    # inside the codec ``register_kv_caches`` builds; LMCache refuses inside
+    # ``register_kv_caches``, before either constructs an engine, pool, or client.
     config = SimpleNamespace(hf_config=SimpleNamespace(model_type="minimax_m3"))
     if backend == "mooncake_store":
-        connector = object.__new__(MooncakeStoreOffloadConnector)
-        connector._config = config
         with pytest.raises(RuntimeError, match="Triton.*PAGE staging"):
-            connector._make_codec({}, transfer, 4)
+            build_mooncake_codec(
+                config, {}, transfer, 4, permit_per_request_state=False
+            )
     else:
         monkeypatch.setitem(
             sys.modules,

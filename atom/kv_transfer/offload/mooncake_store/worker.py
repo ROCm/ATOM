@@ -55,15 +55,12 @@ from atom.kv_transfer.offload._block_gpu_connector import (
     BlockGPUConnector,
 )
 from atom.kv_transfer.offload._offload_common import pp_aware_rank_and_world
-from atom.kv_transfer.offload.capabilities import replays_state
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
-from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
 from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store.config import (
     check_engine_compatibility,
     parse_mooncake_store_config,
-    uses_replay_pages,
 )
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,
@@ -73,6 +70,7 @@ from atom.kv_transfer.offload.mooncake_store.keys import (
     probe_key,
     store_namespace,
 )
+from atom.kv_transfer.offload.mooncake_store.layouts import build_mooncake_codec
 from atom.kv_transfer.offload.mooncake_store.nic import requester_rdma_device
 from atom.kv_transfer.offload.mooncake_store.pool import (
     Slot,
@@ -85,7 +83,6 @@ from atom.kv_transfer.offload.mooncake_store.scheduler import (
     require_monotonic_clock_id,
 )
 from atom.kv_transfer.offload.mooncake_store.taint import TaintMarker
-from atom.kv_transfer.offload.page_codec import pure_page_codec
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -237,30 +234,6 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 "the Store client stays open"
             )
 
-    def _make_codec(self, kv_caches, transfer_tensors, num_blocks):
-        """Include M3's NSA index cache, which is absent from kv_caches.
-
-        Target and draft K/V/scales are in kv_caches; the complete PAGE region
-        list also carries the NSA index cache needed to restore an M3 prefix.
-        """
-        from atom.kv_transfer.offload import config as offcfg
-
-        if offcfg.select_offload_layout(self._config) == "m3":
-            from atom.kv_transfer.offload.hybrid.m3.codec import build_m3_page_codec
-
-            return build_m3_page_codec(transfer_tensors, num_blocks)
-        if uses_replay_pages(self._config):
-            if not replays_state(transfer_tensors):
-                raise ValueError(
-                    "Mooncake Store V4.1 requires the PAGE replay contract"
-                )
-            return pure_page_codec(transfer_tensors, num_blocks)
-        return DenseKVByteCodec(
-            kv_caches,
-            num_blocks=num_blocks,
-            permit_per_request_state=self._permit_per_request_state,
-        )
-
     # -- lifecycle --------------------------------------------------------
     def register_kv_caches(
         self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
@@ -270,7 +243,15 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         self._world = world
         # Scheduler blocks, threaded from the model runner. MLA stores its KV
         # token-major, so the codec cannot infer the count from shape[0].
-        self._codec = self._make_codec(kv_caches, transfer_tensors, num_blocks)
+        # The dense codec reads kv_caches. M3 and V4.1 read the PAGE region map.
+        # V4.1 also requires the replay contract; its state is not stored.
+        self._codec = build_mooncake_codec(
+            self._config,
+            kv_caches,
+            transfer_tensors,
+            num_blocks,
+            permit_per_request_state=self._permit_per_request_state,
+        )
         cfg = self._store_cfg
         namespace = store_namespace(self._config, self.chunk_size)
         device = self._codec.device
