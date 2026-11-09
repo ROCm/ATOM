@@ -225,17 +225,12 @@ def test_kpool_is_refused_when_the_pool_does_not_divide_the_block(monkeypatch):
         mod._check_unsupported(_vllm_config(_config(index_kpool=4), block_size=1022))
 
 
-def test_prefix_caching_is_refused_on_the_pooled_path(monkeypatch):
-    """Measured wrong under vLLM's align-mode KDA state migration with the
-    pooled indexer's KV layout; the dense path is not refused."""
+def test_prefix_caching_is_accepted_on_the_pooled_path(monkeypatch):
+    """Not refused: the tail ring is per request and never prefix-cached, and
+    vLLM's align mode carries the KDA state across cached blocks."""
     from atom.plugin.vllm.models import glm5_next as mod
 
     monkeypatch.setattr(mod, "pooled_path_enabled", lambda _k: True)
-    with pytest.raises(ValueError, match="prefix caching"):
-        mod._check_unsupported(
-            _vllm_config(_config(index_kpool=4), prefix_caching=True)
-        )
-    monkeypatch.setattr(mod, "pooled_path_enabled", lambda _k: False)
     mod._check_unsupported(_vllm_config(_config(index_kpool=4), prefix_caching=True))
 
 

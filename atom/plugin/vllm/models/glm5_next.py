@@ -113,21 +113,6 @@ def _check_unsupported(vllm_config: VllmConfig) -> None:
             f"{', '.join(unsupported)}"
         )
 
-    # Prefix caching switches the KDA state to `mamba_cache_mode="align"`, where
-    # a request's state moves to a new block at every block boundary. With the
-    # pooled indexer on, every request whose state moves (a prefill resumed at
-    # a block boundary, which align mode forces for any prompt past one block,
-    # or a decode crossing one) comes out wrong, before any cache hit: GSM8K
-    # 16-shot drops from 0.967 to 0.44. The dense indexer under the same mode is
-    # unaffected, and so is a request whose state never moves; what differs is
-    # vLLM's GLM-5.3-Flash KV layout, which only the pooled indexer selects.
-    if getattr(vllm_config.cache_config, "enable_prefix_caching", False) and (
-        pooled_path_enabled(_pool_size(vllm_config))
-    ):
-        raise ValueError(
-            "GLM-5.3-Flash's pooled indexer on the vllm-atom backend does not "
-            "support prefix caching yet; pass --no-enable-prefix-caching."
-        )
     # KV offloading/transfer assumes one cached row per token, which the pooled
     # index cache (tokens_per_state == index_kpool) is not.
     if getattr(vllm_config, "kv_transfer_config", None) is not None:

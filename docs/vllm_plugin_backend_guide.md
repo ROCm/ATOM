@@ -198,9 +198,11 @@ prefix-caching, and text-only requirements.
 
 GLM-5.3-Flash reuses Kimi-K3's KDA state contract and runs its DSA indexer in
 pooled (kpool) form: the index cache declares `tokens_per_state = index_kpool`,
-and each request's open pool is kept in a side buffer keyed on its KDA state
-slot. The plugin path serves the text backbone; PCP, DCP, speculative decoding,
-prefix caching and KV transfer are refused at startup. The PR CI cell runs it at
+and each request's open pool is kept in a vLLM-managed ring block
+(`KpoolTailSpec`) that is never prefix-cached. The plugin path serves the text
+backbone with prefix caching and the checkpoint's MTP layer
+(`--speculative-config '{"method": "mtp", ...}'`); PCP, DCP, other speculative
+methods and KV transfer are refused at startup. The PR CI cell runs it at
 TP4 with fp8 KV.
 
 DeepSeek-V4.1 pages out of a proxy KV cache: ATOM declares one fake attention
