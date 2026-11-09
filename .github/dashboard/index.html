@@ -862,7 +862,8 @@ function atomeshBaseModelName(model) {
   return String(model || 'unknown').replace(/-Eagle3$/i, '');
 }
 
-const AGENTIC_TRACE_FILTER = 'agentic-trace';
+// ISL/OSL value that older links used for agentic traces; such links now open AgentX.
+const LEGACY_AGENTIC_ISL_FILTER = 'agentic-trace';
 
 function isAgenticTraceRow(row) {
   const benchmarkKind = String(row?.benchmarkKind || row?.benchmark_kind || '').toLowerCase();
@@ -877,12 +878,8 @@ function isAgenticTraceRow(row) {
   return /\bagent(?:ic|x)\b/i.test(markers);
 }
 
-function atomeshIslOslFilterValue(row) {
-  return isAgenticTraceRow(row) ? AGENTIC_TRACE_FILTER : row.islOsl;
-}
-
 function atomeshMatchesIslOslFilter(row) {
-  return state.filters.islOsl.includes(atomeshIslOslFilterValue(row));
+  return !isAgenticTraceRow(row) && state.filters.islOsl.includes(row.islOsl);
 }
 
 function atomeshPointScore(row) {
@@ -948,6 +945,8 @@ function mergeAtomeshTopologyRows(rows) {
 
 const atomeshRawRows = atomeshBenchmarkRows.length ? atomeshBenchmarkRows : parseAtomeshSummaryRows(ATOMESH_DATA.summaryMarkdown);
 const atomeshSummaryRows = mergeAtomeshTopologyRows(atomeshRawRows);
+// Non-AgentX views show fixed ISL/OSL runs only; agentic traces belong to AgentX.
+const fixedSeqAtomeshRows = atomeshSummaryRows.filter(row => !isAgenticTraceRow(row));
 
 // Normalize legacy model names using HF-path->display mapping from models_map.js
 const _displayMap = window.MODELS_DISPLAY_MAP || {};
@@ -1265,15 +1264,13 @@ function buildAccuracyPreviewRows(preview) {
 
 // Extract unique filter values from ALL runs (not just latest) so historical models are always visible
 const _lc = (a, b) => { const la = a.toLowerCase(), lb = b.toLowerCase(); return la < lb ? -1 : la > lb ? 1 : 0; };
-const allBackends = [...new Set([...Object.keys(historyMap).map(k => k.split('|')[0]), ...atomeshSummaryRows.map(row => row.backend)])].sort(_lc);
-const allModels = [...new Set([...Object.keys(historyMap).map(k => k.split('|')[1]), ...atomeshSummaryRows.map(row => row.model)])].sort(_lc);
-const standardIslOsl = [...new Set([
+const allBackends = [...new Set([...Object.keys(historyMap).map(k => k.split('|')[0]), ...fixedSeqAtomeshRows.map(row => row.backend)])].sort(_lc);
+const allModels = [...new Set([...Object.keys(historyMap).map(k => k.split('|')[1]), ...fixedSeqAtomeshRows.map(row => row.model)])].sort(_lc);
+const allIslOsl = [...new Set([
   ...Object.keys(historyMap).map(k => k.split('|')[2]),
-  ...atomeshSummaryRows.filter(row => !isAgenticTraceRow(row)).map(row => row.islOsl),
+  ...fixedSeqAtomeshRows.map(row => row.islOsl),
 ])].filter(Boolean).sort();
-// Agentic traces live in the AgentX view, so the ISL/OSL filter offers only fixed sequences.
-const allIslOsl = [...standardIslOsl];
-const allConc = [...new Set([...Object.keys(historyMap).map(k => +k.split('|')[3]), ...atomeshSummaryRows.map(row => row.concurrency)].filter(Number.isFinite))].sort((a, b) => a - b);
+const allConc = [...new Set([...Object.keys(historyMap).map(k => +k.split('|')[3]), ...fixedSeqAtomeshRows.map(row => row.concurrency)].filter(Number.isFinite))].sort((a, b) => a - b);
 const allHardware = [...new Set([...Object.values(latestConfigs).map(cfg => cfg.hardware || 'unknown'), ...atomeshSummaryRows.map(row => row.hardware || 'unknown')])].sort(_lc);
 const defaultHardware = allHardware.includes('mi355x') ? 'mi355x' : (allHardware[0] || 'unknown');
 const allTrendModelKeys = [...new Set(Object.values(latestConfigs).map(cfg => `${cfg.backend}|${cfg.model}`))].sort(_lc);
@@ -1313,10 +1310,12 @@ const ATOMESH_INTERACTIVITY_METRICS = [
   },
 ];
 
-function atomeshInteractivityMetric() {
-  return ATOMESH_INTERACTIVITY_METRICS.find(m => m.key === state.atomeshIntvtyMetric)
-    || ATOMESH_INTERACTIVITY_METRICS[0];
-}
+// Fixed-sequence ATOMesh rows record interactivity as 1000 / median TPOT, no P90 variants.
+const FIXED_SEQ_INTERACTIVITY = {
+  label: 'Interactivity',
+  formula: '1000 / median TPOT',
+  value: row => row.interactivity,
+};
 
 function agentxInteractivityMetric() {
   return ATOMESH_INTERACTIVITY_METRICS.find(m => m.key === state.agentxIntvtyMetric)
@@ -1342,7 +1341,7 @@ const allAgentxConc = [...new Set(agentxAllRows.map(row => row.concurrency))].so
 const allAgentxHardware = [...new Set(agentxAllRows.map(row => row.hardware || 'unknown'))].sort(_lc);
 
 const state = {
-  dashboardMode: 'AgentX',
+  dashboardMode: 'Aggregated',
   filters: {
     backends: [...allBackends], models: [...allModels], islOsl: [...allIslOsl], conc: [...allConc], hardware: [defaultHardware],
     axModels: [...allAgentxModels], axFrameworks: [...allAgentxFrameworks], axConc: [...allAgentxConc],
@@ -1351,7 +1350,6 @@ const state = {
   perfMetric: 'Total Tput',
   trendModelKey: allTrendModelKeys[0] || '',
   atomeshTrendModel: '',
-  atomeshIntvtyMetric: ATOMESH_INTERACTIVITY_METRICS[0].key,
   agentxIntvtyMetric: ATOMESH_INTERACTIVITY_METRICS[0].key,
   lastNonAgentxMode: 'Aggregated',
   agentxShowAll: false,
@@ -1384,7 +1382,7 @@ function agentxRows({ plottableOnly = true } = {}) {
 }
 
 function filteredAtomeshRows() {
-  return atomeshSummaryRows.filter(row => (
+  return fixedSeqAtomeshRows.filter(row => (
     state.filters.backends.includes(row.backend)
     && state.filters.models.includes(row.model)
     && atomeshMatchesIslOslFilter(row)
@@ -1398,7 +1396,6 @@ function filteredAtomeshRows() {
    ================================================================ */
 // ISL/OSL compact format: "1024/1024" → "1k/1k", "8192/1024" → "8k/1k"
 function fmtIslOsl(s) { return s.replace(/\d+/g, n => +n >= 1024 ? parseFloat((+n / 1024).toPrecision(3)) + 'k' : n); }
-function fmtIslOslFilterOption(s) { return s === AGENTIC_TRACE_FILTER ? 'Agentic Trace' : fmtIslOsl(s); }
 function fmtHardware(s) { return s === 'unknown' ? 'Unknown' : String(s).toUpperCase(); }
 function selectedHardware() {
   const hw = state.filters.hardware[0];
@@ -1690,7 +1687,7 @@ document.getElementById('dl-btn').onclick = () => {
 const filterDefs = [
   { id: 'backends', label: 'Backend', options: allBackends },
   { id: 'models', label: 'Model', options: allModels },
-  { id: 'islOsl', label: 'ISL/OSL', options: allIslOsl, format: fmtIslOslFilterOption },
+  { id: 'islOsl', label: 'ISL/OSL', options: allIslOsl, format: fmtIslOsl },
   { id: 'conc', label: 'Concurrency', options: allConc.map(String) },
   { id: 'hardware', label: 'Hardware', options: allHardware, format: fmtHardware },
 ];
@@ -3408,7 +3405,7 @@ document.addEventListener('keydown', (e) => {
 let hashUpdateFromCode = false;
 function syncToHash() {
   const parts = [];
-  if (state.dashboardMode !== 'AgentX') parts.push('mode=' + state.dashboardMode);
+  if (state.dashboardMode !== 'Aggregated') parts.push('mode=' + state.dashboardMode);
   if (state.filters.backends.length !== allBackends.length) parts.push('backend=' + state.filters.backends.join(','));
   if (state.filters.models.length !== allModels.length) parts.push('model=' + state.filters.models.join(','));
   if (state.filters.islOsl.length !== allIslOsl.length) parts.push('isl=' + state.filters.islOsl.join(','));
@@ -3420,14 +3417,13 @@ function syncToHash() {
   if (state.agentxIntvtyMetric !== ATOMESH_INTERACTIVITY_METRICS[0].key) parts.push('axintvty=' + state.agentxIntvtyMetric);
   parts.push('hardware=' + selectedHardware());
   if (state.activeTab !== 'performance') parts.push('tab=' + state.activeTab);
-  if (state.atomeshIntvtyMetric !== ATOMESH_INTERACTIVITY_METRICS[0].key) parts.push('intvty=' + state.atomeshIntvtyMetric);
   hashUpdateFromCode = true;
   window.location.hash = parts.join('&');
 }
 
 function readFromHash() {
   const hash = window.location.hash.slice(1);
-  state.dashboardMode = 'AgentX';
+  state.dashboardMode = 'Aggregated';
   if (!hash) return;
   let openAgentx = false;
   for (const part of hash.split('&')) {
@@ -3441,7 +3437,7 @@ function readFromHash() {
     if (k === 'model') state.filters.models = v.split(',').filter(m => allModels.includes(m));
     if (k === 'isl') {
       // Agentic traces moved to AgentX, so an old agentic-trace link opens AgentX.
-      if (v.split(',').includes(AGENTIC_TRACE_FILTER)) { openAgentx = true; continue; }
+      if (v.split(',').includes(LEGACY_AGENTIC_ISL_FILTER)) { openAgentx = true; continue; }
       state.filters.islOsl = v.split(',').filter(i => allIslOsl.includes(i));
     }
     if (k === 'conc') state.filters.conc = v.split(',').map(Number).filter(c => allConc.includes(c));
@@ -3454,7 +3450,6 @@ function readFromHash() {
     if (k === 'axall') state.agentxShowAll = v === '1';
     if (k === 'axintvty' && ATOMESH_INTERACTIVITY_METRICS.some(m => m.key === v)) state.agentxIntvtyMetric = v;
     if (k === 'axconc') state.filters.axConc = v.split(',').map(Number).filter(c => allAgentxConc.includes(c));
-    if (k === 'intvty' && ATOMESH_INTERACTIVITY_METRICS.some(m => m.key === v)) state.atomeshIntvtyMetric = v;
     if (k === 'tab') {
       state.activeTab = v;
       document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === v));
@@ -3868,7 +3863,7 @@ function atomeshParseSummaryMarkdown(markdown) {
 }
 
 function atomeshRows() {
-  if (!_atomeshRowsCache) _atomeshRowsCache = atomeshSummaryRows;
+  if (!_atomeshRowsCache) _atomeshRowsCache = fixedSeqAtomeshRows;
   return _atomeshRowsCache;
 }
 
@@ -3963,8 +3958,7 @@ function renderAtomeshKPICards() {
   const rows = filteredAtomeshRows();
   const completed = atomeshCompletedCases();
   const best = completed.reduce((max, c) => !max || c.totalTputPerGpu > max.totalTputPerGpu ? c : max, null);
-  // Tracks the selected x-axis, so this card always describes the chart below it.
-  const intvtyMetric = atomeshInteractivityMetric();
+  const intvtyMetric = FIXED_SEQ_INTERACTIVITY;
   const plottable = atomeshPlottableCases(intvtyMetric);
   const bestInteractivity = plottable.reduce((max, c) => !max || intvtyMetric.value(c) > intvtyMetric.value(max) ? c : max, null);
   const acc = rows.find(c => Number.isFinite(atomeshAccuracyValue(c)));
@@ -4013,15 +4007,10 @@ function renderAtomeshPerformanceTab() {
   const container = document.getElementById('tab-performance');
   destroyChartsIn(container);
   const rows = filteredAtomeshRows().sort((a, b) => _lc(a.model, b.model) || _lc(a.topology, b.topology) || (a.concurrency || 0) - (b.concurrency || 0));
-  const metric = atomeshInteractivityMetric();
-  const completedAll = atomeshCompletedCases();
+  const metric = FIXED_SEQ_INTERACTIVITY;
   const completed = atomeshPlottableCases(metric).sort((a, b) => a.concurrency - b.concurrency);
   if (!completed.length) {
-    // Separate the two reasons: no rows at all is a filter problem, whereas rows
-    // without the selected metric means this axis has no data yet for them.
-    container.innerHTML = completedAll.length
-      ? `<div class="chart-empty">${escHTML(metric.label)} is not recorded for any of the ${completedAll.length} selected row(s). ${escHTML(metric.emptyHint)}</div>`
-      : '<div class="chart-empty">No completed ATOMesh performance row matches the current filters.</div>';
+    container.innerHTML = '<div class="chart-empty">No completed ATOMesh performance row matches the current filters.</div>';
     return;
   }
   const chartGroups = {};
@@ -4033,10 +4022,7 @@ function renderAtomeshPerformanceTab() {
   const chartSpecs = Object.entries(chartGroups).sort(([a], [b]) => _lc(a, b)).map(([model, modelRows], chartIdx) => {
     const seriesGroups = {};
     for (const row of modelRows) {
-      const agenticTopology = isAgenticTraceRow(row)
-        ? row.sourceTopology || row.topology || 'agentic'
-        : '';
-      const key = `${row.model}|${row.islOsl}|${agenticTopology}`;
+      const key = `${row.model}|${row.islOsl}`;
       if (!seriesGroups[key]) seriesGroups[key] = [];
       seriesGroups[key].push(row);
     }
@@ -4045,9 +4031,7 @@ function renderAtomeshPerformanceTab() {
       const first = groupRows[0];
       const color = getModelColor(ATOMESH_DATA.backend, first.model);
       return {
-        label: isAgenticTraceRow(first)
-          ? `${first.model} Agentic Trace · ${first.sourceTopology || first.topology}`
-          : `${first.model} ${first.islOsl}`,
+        label: `${first.model} ${first.islOsl}`,
         data: groupRows.map(c => ({ x: metric.value(c), y: c.totalTputPerGpu, row: c })),
         borderColor: color.border,
         backgroundColor: color.border,
@@ -4056,73 +4040,21 @@ function renderAtomeshPerformanceTab() {
         pointHoverRadius: 6,
         pointBorderWidth: 0,
         pointHoverBorderWidth: 0,
-        // Agentic topologies are connected by a separate Pareto frontier dataset below.
-        showLine: !isAgenticTraceRow(first) && groupRows.length > 1,
+        showLine: groupRows.length > 1,
       };
     });
-    // Every agentic PD topology is a valid operating point for the same model +
-    // ISL/OSL, so the curve across them is their Pareto frontier, not a per-topology
-    // polyline. Appended last so existing datasetIndex values — and with them the
-    // legendFocus highlight — stay stable.
-    const agenticGroups = {};
-    for (const row of modelRows) {
-      if (!isAgenticTraceRow(row)) continue;
-      // modelRows is every filtered row, not just the plotted ones, so drop
-      // anything the current axis cannot place before considering the frontier.
-      if (!Number.isFinite(metric.value(row)) || !Number.isFinite(row.totalTputPerGpu)) continue;
-      // A point whose number came from the wrong definition still renders and
-      // stays clickable, but cannot join a frontier that would then be defined by
-      // whichever points were measured the wrong way. For the E2E axis those are
-      // the pre-#1925 points carrying 1000/median_tpot, which ignores prefill and
-      // so reads far too optimistic — for the c48 traces by more than 50x. Their
-      // per-request records expired with the artifacts and can never be recomputed.
-      if (!metric.frontierEligible(row)) continue;
-      const key = `${row.model}|${row.islOsl}`;
-      if (!agenticGroups[key]) agenticGroups[key] = [];
-      agenticGroups[key].push(row);
-    }
-    for (const groupRows of Object.values(agenticGroups)) {
-      const frontier = atomeshParetoFrontier(
-        groupRows.map(c => ({ x: metric.value(c), y: c.totalTputPerGpu, row: c }))
-      );
-      if (frontier.length < 2) continue; // a single point is not a line
-      const first = groupRows[0];
-      const color = getModelColor(ATOMESH_DATA.backend, first.model);
-      datasets.push({
-        label: `${first.model} Agentic Pareto ${fmtIslOsl(first.islOsl)}`,
-        data: frontier,
-        borderColor: color.border,
-        backgroundColor: color.border,
-        // Same hue as its model — the frontier is a derived curve, not a series of
-        // its own — so the dash is what separates it from the solid series lines.
-        borderWidth: 2.5,
-        borderDash: [6, 4],
-        pointRadius: 0,
-        pointHoverRadius: 0,
-        pointHitRadius: 0,               // the topology datasets own hover/click for these rows
-        showLine: true,
-        fill: false,
-        order: -1,                       // draw under the point series
-        datalabels: { display: false },  // 'cN' labels already come from the topology datasets
-        _isFrontier: true,
-      });
-    }
     return {
       id: `atomesh-tradeoff-${chartIdx}`,
       model,
       rows: modelRows,
       datasets,
-      seriesCount: datasets.filter(d => !d._isFrontier).length,
+      seriesCount: datasets.length,
     };
   });
 
   let html = `<div class="section-container"><div class="section-header">
-    <span class="section-title">ATOMesh Token Throughput per GPU vs. ${escHTML(metric.label)}</span>
+    <span class="section-title">ATOMesh Token Throughput per GPU vs. ${escHTML(metric.label)} (${escHTML(metric.formula)})</span>
     <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">${completed.length}/${atomeshRows().length} selected rows · source: benchmark-action data.js</span>
-  </div>
-  <div class="model-selector" style="margin-bottom:var(--gap-md);justify-content:flex-start">
-    <span class="sel-label">X axis:</span>
-    ${ATOMESH_INTERACTIVITY_METRICS.map(m => `<button class="sel-btn ${m.key === metric.key ? 'active' : ''}" data-atomesh-intvty-metric="${escHTML(m.key)}" title="${escHTML(m.formula)}">${escHTML(m.label)}</button>`).join('')}
   </div>
   <div class="chart-grid">${chartSpecs.map(spec => `
     <div class="chart-card ${chartSpecs.length === 1 ? 'hero' : 'half'}">
@@ -4133,7 +4065,7 @@ function renderAtomeshPerformanceTab() {
   html += `<div class="section-container"><div class="section-header"><span class="section-title">Detail Table</span></div>
   <div class="table-watermark"><div class="table-watermark-scroll"><table class="perf-table"><thead><tr>
     <th>Backend</th><th>Model</th><th>Topology</th><th>ISL/OSL</th><th class="num">Conc</th>
-    <th class="num">P90 E2E Normalized Interactivity</th><th class="num">P90 Interactivity</th><th class="num">Total tok/s</th><th class="num">Input tok/s</th><th class="num">Output tok/s</th>
+    <th class="num">Interactivity</th><th class="num">Total tok/s</th><th class="num">Input tok/s</th><th class="num">Output tok/s</th>
     <th class="num">Total tok/s/GPU</th><th class="num">Input tok/s/GPU</th><th class="num">Output tok/s/GPU</th>
     <th class="num">TTFT ms</th><th class="num">TPOT ms</th><th class="num">E2E ms</th><th class="num">Accuracy</th><th>Run</th>
   </tr></thead><tbody>`;
@@ -4145,7 +4077,6 @@ function renderAtomeshPerformanceTab() {
       <td>${escHTML(c.islOsl)}</td>
       <td class="num">${c.concurrency}</td>
       <td class="num">${c.interactivity != null ? fmtNum(c.interactivity, 2) : '—'}</td>
-      <td class="num">${Number.isFinite(c.interactivityP90Itl) ? fmtNum(c.interactivityP90Itl, 2) : '—'}</td>
       <td class="num">${c.totalTput != null ? fmtNum(c.totalTput, 2) : '—'}</td>
       <td class="num">${c.inputTput != null ? fmtNum(c.inputTput, 2) : '—'}</td>
       <td class="num">${c.outputTput != null ? fmtNum(c.outputTput, 2) : '—'}</td>
@@ -4161,14 +4092,6 @@ function renderAtomeshPerformanceTab() {
   });
   html += '</tbody></table></div></div></div>';
   container.innerHTML = html;
-  container.querySelectorAll('[data-atomesh-intvty-metric]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      state.atomeshIntvtyMetric = btn.dataset.atomeshIntvtyMetric;
-      renderAtomeshKPICards();
-      renderAtomeshPerformanceTab();
-      syncToHash();
-    });
-  });
   container.querySelectorAll('tr[data-atomesh-row]').forEach(rowEl => {
     rowEl.addEventListener('click', (e) => {
       if (e.target.closest('a') || e.target.closest('button')) return;
