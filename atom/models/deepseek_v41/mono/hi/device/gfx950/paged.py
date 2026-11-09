@@ -9,7 +9,10 @@ A KV owner (a compressing layer) keeps its compressed entries in ATOM's pool, a 
   page_rows + e % rpp`` (bf16 [512], 1 KiB) from the owner's base (the pool + its main offset rows);
 - its index key: unit ``u = (page * rpp + e % rpp) // 8``, lane ``t`` the remainder; the 16 B of 32-element group
   ``c`` at ``u * 512 + (t % 4) * 128 + c * 32 + (t // 4) * 16`` of the values plane, its E8M0 byte at ``u * 32 + c *
-  8 + t`` of the scales plane.
+  8 + t`` of the scales plane (ATOM's FP4 ``preshuffle`` layout). In ATOM's ``mfma`` layout (gfx950's OPUS scorer,
+  ``ATOM_V4_UNIFIED_MQA=opus``) unit ``u`` is rows ``r = (u % 8) * 8 + t`` of the 64-row group ``G = u // 8``: the
+  16 B at ``G * 4096 + c * 1024 + r * 16``, the E8M0 byte at ``G * 256 + (c % 2) * 128 + (r % 32) * 4 + (c // 2) * 2
+  + r // 32`` (``mfma``: the functions below).
 
 Two pointer-table args (``REQ``): the step's block table (``ptab``, ATOM's) and the request words (``req``, int32
 ``REQ_WORDS``): the page geometry at ``GEO`` (table stride, page rows, the compress ring's slot stride, 0), then from
@@ -82,15 +85,33 @@ def key_unit(k, b, e, ratio: int, uni: bool = True):
     return unit, e % 8
 
 
-def key_value_addr(k, vals_arg: str, unit, t, group):
-    """The 16 B of 32-element group ``group`` of the key at (``unit``, ``t``) in the values plane."""
+def key_value_addr(k, vals_arg: str, unit, t, group, mfma: bool = False):
+    """The 16 B of 32-element group ``group`` of the key at (``unit``, ``t``) in the values plane (``mfma``: the
+    ``mfma`` layout's)."""
+    if mfma:
+        row = (unit % 8) * 8 + fx.Int64(t)
+        off = (unit // 8) * 4096 + fx.Int64(group * 1024) + row * 16
+        return fx.Int64(k.args[vals_arg]) + off
     off = unit * 512 + fx.Int64((t % 4) * 128 + group * 32 + (t // 4) * 16)
     return fx.Int64(k.args[vals_arg]) + off
 
 
-def key_scale_addr(k, scales_arg: str, unit, t, group):
-    """The E8M0 byte of group ``group`` of the key at (``unit``, ``t``) in the scales plane."""
+def key_scale_addr(k, scales_arg: str, unit, t, group, mfma: bool = False):
+    """The E8M0 byte of group ``group`` of the key at (``unit``, ``t``) in the scales plane (``mfma``: the
+    ``mfma`` layout's)."""
+    if mfma:
+        word, byte = mfma_scale_word(k, scales_arg, unit, t, group)
+        return word + fx.Int64(byte)
     return fx.Int64(k.args[scales_arg]) + unit * 32 + fx.Int64(group * 8 + t)
+
+
+def mfma_scale_word(k, scales_arg: str, unit, t, group):
+    """In the ``mfma`` layout: (the 4-byte aligned address of the word holding the E8M0 byte of group ``group`` of
+    the key at (``unit``, ``t``), that byte's index in it)."""
+    row = (unit % 8) * 8 + fx.Int64(t)
+    word = (unit // 8) * 256 + fx.Int64((group % 2) * 128) + (row % 32) * 4
+    byte = fx.Int32((group // 2) * 2) + fx.Int32(row // 32)
+    return fx.Int64(k.args[scales_arg]) + word, byte
 
 
 def row_live(k, row):

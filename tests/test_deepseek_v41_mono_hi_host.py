@@ -536,7 +536,7 @@ def _round_world(dr, monkeypatch):
                 positions=torch.zeros(6, dtype=torch.int64),
                 tentative=True,
                 slots=torch.zeros(1, dtype=torch.int32),
-                width=6,
+                running_tokens=6,
             )
             log.append(("build", running_bs, running_tokens))
             md = SimpleNamespace(step=step, cache=cache_, served_by_round=service)

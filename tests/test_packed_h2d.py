@@ -9,7 +9,7 @@ import torch
 from aiter_stub import atom_without_aiter
 
 from atom.utils.h2d import HostArenaReader, PublicationError, PublicationOwner
-from tests.test_h2d_publication import buffer, setup
+from tests.test_h2d_publication import _publish, buffer, setup
 
 gpu = pytest.mark.skipif(
     os.environ.get("RUN_H2D_GPU_TESTS") != "1", reason="set RUN_H2D_GPU_TESTS=1"
@@ -33,14 +33,14 @@ def test_mixed_bytes_padding_dynamic_counts_and_graph_replay():
         for i, (b, layout) in enumerate(zip(buffers, layouts))
     ]
     group = owner.group("mixed", members)
-    assert group.use_transport("packed") == "packed"
+    assert group.use_packed() == "packed"
     pointers = [b.gpu.data_ptr() for b in buffers]
     expected = [
         torch.full((b.cpu.numel() * b.cpu.element_size(),), 199, dtype=torch.uint8)
         for b in buffers
     ]
     owner.begin()
-    group.publish([b.capacity for b in members])  # Compile before delayed work.
+    _publish(group, [b.capacity for b in members])  # Compile before delayed work.
     owner.finish()
     for b in buffers:
         b.gpu.view(torch.uint8).fill_(199)
@@ -63,7 +63,7 @@ def test_mixed_bytes_padding_dynamic_counts_and_graph_replay():
         for i, b in enumerate(buffers):
             b.cpu.view(torch.uint8).fill_(71 + step + i)
         torch.cuda._sleep(2_000_000)
-        group.publish(counts)
+        _publish(group, counts)
         owner.finish()
         graph.replay()
         # begin() in the next step must wait before the same arena is packed.
@@ -81,9 +81,9 @@ def test_mixed_bytes_padding_dynamic_counts_and_graph_replay():
 @gpu
 def test_packed_arena_reuse_and_atomic_validation():
     owner, a, b, _, _, group = setup("cuda", shape=(1031,))
-    assert group.use_transport("packed") == "packed"
+    assert group.use_packed() == "packed"
     owner.begin()
-    group.publish((1031, 1031))
+    _publish(group, (1031, 1031))
     owner.finish()
     observations = []
     for step in range(6):
@@ -92,13 +92,13 @@ def test_packed_arena_reuse_and_atomic_validation():
         b.cpu.fill_(step + 21)
         header = group._backend.header.copy()
         with pytest.raises(ValueError):
-            group.publish((17, 1032))
+            _publish(group, (17, 1032))
         assert (header == group._backend.header).all()
         torch.cuda._sleep(3_000_000)
-        group.publish((1031, 1031))
+        _publish(group, (1031, 1031))
         observations.append((a.gpu.clone(), b.gpu.clone()))
         with pytest.raises(PublicationError, match="republish_reason"):
-            group.publish((1, None))
+            _publish(group, (1, None))
         owner.finish()
     owner.completion.synchronize()
     for step, (first, second) in enumerate(observations):
@@ -109,7 +109,7 @@ def test_packed_arena_reuse_and_atomic_validation():
 @gpu
 def test_packed_failure_after_dma_poison_retains_arena(monkeypatch):
     owner, a, b, _, _, group = setup("cuda")
-    assert group.use_transport("packed") == "packed"
+    assert group.use_packed() == "packed"
     owner.begin()
     a.cpu.fill_(17)
     b.cpu.fill_(23)
@@ -123,7 +123,7 @@ def test_packed_failure_after_dma_poison_retains_arena(monkeypatch):
 
     monkeypatch.setattr(group._backend, "launch", FailingLaunch())
     with pytest.raises(RuntimeError, match="scatter enqueue"):
-        group.publish((16, 16))
+        _publish(group, (16, 16))
     assert group._backend.host.is_pinned()
     owner.drain()
     with pytest.raises(PublicationError, match="failed"):
@@ -134,12 +134,12 @@ def test_packed_failure_after_dma_poison_retains_arena(monkeypatch):
 def test_packed_initializes_with_cuda_as_default_device():
     with torch.device("cuda"):
         owner, a, b, _, _, group = setup("cuda")
-        assert group.use_transport("packed") == "packed"
+        assert group.use_packed() == "packed"
         assert group._backend.host.device.type == "cpu"
         owner.begin()
         a.cpu.fill_(51)
         b.cpu.fill_(61)
-        group.publish((16, 16))
+        _publish(group, (16, 16))
         owner.finish()
         owner.completion.synchronize()
         assert torch.all(a.gpu.cpu() == 51) and torch.all(b.gpu.cpu() == 61)
@@ -163,16 +163,16 @@ def test_owner_packs_consumer_boundaries_and_keeps_supported_fallback(strided):
     a.cpu.fill_(11)
     b.cpu.fill_(22)
     c.cpu.fill_(33)
-    consumer.publish((16, 16, c.cpu.shape[0]))
+    _publish(consumer, (16, 16, c.cpu.shape[0]))
     result = (a.gpu.clone(), b.gpu.clone(), c.gpu.clone())
     with pytest.raises(PublicationError, match="republish_reason"):
-        producer.publish((16, 16))
+        _publish(producer, (16, 16))
     owner.finish()
     # The producer remains usable independently in the next epoch.
     owner.begin()
     a.cpu.fill_(44)
     b.cpu.fill_(55)
-    producer.publish((16, 16))
+    _publish(producer, (16, 16))
     owner.finish()
     owner.completion.synchronize()
     assert all(torch.all(t.cpu() == v) for t, v in zip(result, (11, 22, 33)))
@@ -180,9 +180,29 @@ def test_owner_packs_consumer_boundaries_and_keeps_supported_fallback(strided):
 
 
 @gpu
+def test_a_boundary_another_covers_still_packs():
+    """Two phases may publish the same members: the narrower boundary still
+    gets its own arena, while a producer group they cover stays direct."""
+    owner, a, b, x, y, producer = setup("cuda")
+    z = owner.bind(buffer(16, device="cuda"), "c")
+    wide = owner.group("prefill_metadata", (x, y, z))
+    narrow = owner.group("decode_metadata", (x, y))
+    owner.use_packed_transport({"prefill_metadata", "decode_metadata"})
+    assert wide.transport == narrow.transport == "packed"
+    assert producer.transport == "direct"
+    owner.begin()
+    a.cpu.fill_(7)
+    b.cpu.fill_(8)
+    _publish(narrow, (16, 16))
+    owner.finish()
+    owner.completion.synchronize()
+    assert torch.all(a.gpu.cpu() == 7) and torch.all(b.gpu.cpu() == 8)
+
+
+@gpu
 def test_disjoint_single_member_publications_do_not_borrow_packed_header(monkeypatch):
     owner, a, b, _, _, group = setup("cuda", shape=(8,))
-    assert group.use_transport("packed") == "packed"
+    assert group.use_packed() == "packed"
 
     def unexpected_wait():
         pytest.fail("a fresh member must not wait for another member's direct DMA")
@@ -192,13 +212,13 @@ def test_disjoint_single_member_publications_do_not_borrow_packed_header(monkeyp
     try:
         a.cpu.fill_(17)
         torch.cuda._sleep(3_000_000)
-        group.publish((8, None))
+        _publish(group, (8, None))
         first = a.gpu.clone()
         b.cpu.fill_(23)
-        group.publish((None, 8))
+        _publish(group, (None, 8))
         second = b.gpu.clone()
         with pytest.raises(PublicationError, match="republish_reason"):
-            group.publish((8, None))
+            _publish(group, (8, None))
     finally:
         owner.finish()
         owner.completion.synchronize()
@@ -212,25 +232,25 @@ def test_direct_member_preserves_an_in_flight_packed_arena():
     buffers = [buffer(8, device="cuda") for _ in range(5)]
     members = [owner.bind(buf, str(i)) for i, buf in enumerate(buffers)]
     group = owner.group("sparse", members)
-    assert group.use_transport("packed") == "packed"
+    assert group.use_packed() == "packed"
     owner.begin()
-    group.publish((8, 8, None, None, None))  # Compile before delaying the queue.
+    _publish(group, (8, 8, None, None, None))  # Compile before delaying the queue.
     owner.finish()
     owner.begin()
     try:
         for i, buf in enumerate(buffers):
             buf.cpu.fill_(11 + i)
         torch.cuda._sleep(3_000_000)
-        group.publish((8, 8, None, None, None))
+        _publish(group, (8, 8, None, None, None))
         observed = [buf.gpu.clone() for buf in buffers[:2]]
         # Direct DMA can publish a fresh member while the arena is borrowed.
-        group.publish((None, None, 8, None, None))
+        _publish(group, (None, None, 8, None, None))
         observed.append(buffers[2].gpu.clone())
         # That direct copy must not release the preceding packed source.
         with pytest.raises(PublicationError, match="transport counts are in flight"):
-            group.publish((None, None, None, 8, 8))
+            _publish(group, (None, None, None, 8, 8))
         members[0].acquire_write(republish_reason="finish the earlier packed read")
-        group.publish((None, None, None, 8, 8))
+        _publish(group, (None, None, None, 8, 8))
         observed.extend(buf.gpu.clone() for buf in buffers[3:])
     finally:
         owner.finish()
@@ -263,10 +283,10 @@ def test_packed_scatter_reads_the_host_arena():
     # waits on the owner's event exactly as with the copy (the delay keeps
     # every launch queued).
     owner, a, b, _, _, group = setup("cuda", shape=(1031,))
-    assert group.use_transport("packed") == "packed"
+    assert group.use_packed() == "packed"
     assert group.read_host_arena(_Reader())
     owner.begin()
-    group.publish((1031, 1031))  # Compile before reading the arena.
+    _publish(group, (1031, 1031))  # Compile before reading the arena.
     owner.finish()
     observations = []
     for step, counts in enumerate(((1031, 1031), (5, 1031), (1031, None), (1, 2))):
@@ -274,7 +294,7 @@ def test_packed_scatter_reads_the_host_arena():
         a.cpu.fill_(step + 11)
         b.cpu.fill_(step + 21)
         torch.cuda._sleep(3_000_000)
-        group.publish(counts)
+        _publish(group, counts)
         observations.append((counts, a.gpu.clone(), b.gpu.clone()))
         owner.finish()
     owner.completion.synchronize()
@@ -288,11 +308,11 @@ def test_a_deferred_scatter_is_not_launched():
     # A reader takes the scatter (DeepSeek-V4.1's hi prologue launches it
     # later); declining, the publication launches as before.
     owner, a, b, _, _, group = setup("cuda", shape=(1031,))
-    assert group.use_transport("packed") == "packed"
+    assert group.use_packed() == "packed"
     reader = _Reader(takes=True)
     assert group.read_host_arena(reader)
     owner.begin()
-    group.publish((1031, 1031))
+    _publish(group, (1031, 1031))
     owner.finish()
     owner.completion.synchronize()
     taken = len(reader.taken)
@@ -300,7 +320,7 @@ def test_a_deferred_scatter_is_not_launched():
     a.cpu.fill_(5)
     b.cpu.fill_(6)
     before = a.gpu.clone()
-    group.publish((1031, 1031))
+    _publish(group, (1031, 1031))
     owner.finish()
     owner.completion.synchronize()
     assert len(reader.taken) == taken + 1
@@ -311,7 +331,7 @@ def test_a_deferred_scatter_is_not_launched():
     assert torch.equal(a.gpu, before)  # not scattered
     reader.takes = False
     owner.begin()
-    group.publish((1031, 1031))
+    _publish(group, (1031, 1031))
     owner.finish()
     owner.completion.synchronize()
     assert torch.all(a.gpu.cpu() == 5) and torch.all(b.gpu.cpu() == 6)

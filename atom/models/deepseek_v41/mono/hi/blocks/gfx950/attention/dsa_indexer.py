@@ -210,6 +210,9 @@ class _Plan:
     # (request b's per[b] tasks a row group, task c taking tiles c, c + per[b], ..), instead
     # of ``per`` a (request, row group) whatever its length; a ``Program.dyn_rows`` build's dead requests get none
     items: bool = False
+    # ``Indexer(kmfma=)``: ATOM's FP4 plane in its ``mfma`` layout (gfx950's OPUS scorer; ``paged``), not
+    # ``preshuffle``: the keys' and scales' addresses only
+    kmfma: bool = False
 
     @property
     def width(self) -> int:  # the scores channel's columns
@@ -424,14 +427,16 @@ def _key_store(k, p, b, e, g, words, e8, rl):
     """
     if rl:
         unit, kt = paged.key_unit(k, b, e, p.ratio)
-        addr = paged.key_value_addr(k, p.keys, unit, kt, g)
+        addr = paged.key_value_addr(k, p.keys, unit, kt, g, mfma=p.kmfma)
         if const_expr(isinstance(words, tuple)):
             paged.global_store(addr + fx.Int64(4 * words[0]), words[1])
         if const_expr(isinstance(words, list)):
             paged.global_store(addr, fx.Vector.from_elements(words, fx.Int32), 16)
         if const_expr(e8 is not None):
             paged.global_store(
-                paged.key_scale_addr(k, key_scales(p.keys), unit, kt, g), e8, 1
+                paged.key_scale_addr(k, key_scales(p.keys), unit, kt, g, mfma=p.kmfma),
+                e8,
+                1,
             )
 
 
@@ -612,10 +617,20 @@ def _tile_loads(k, p: _Plan, b, j0, t0, pos, coff=None) -> SimpleNamespace:
         # holding its E8M0 byte
         unit, t = paged.key_unit(k, b, pc, p.ratio, uni=False)
         keys.append(
-            fx.Vector(global_load(paged.key_value_addr(k, p.keys, unit, t, kg), 4))
+            fx.Vector(
+                global_load(
+                    paged.key_value_addr(k, p.keys, unit, t, kg, mfma=p.kmfma), 4
+                )
+            )
         )
-        sw = global_load(paged.key_scale_addr(k, key_scales(p.keys), unit, t & 4, kg))
-        kscale.append((fx.Int32(sw) >> (8 * (t % 4))) & 255)
+        if p.kmfma:  # the word holding its byte (``paged.mfma_scale_word``)
+            sa, byte = paged.mfma_scale_word(k, key_scales(p.keys), unit, t, kg)
+            kscale.append((fx.Int32(global_load(sa)) >> (8 * byte)) & 255)
+        else:
+            sw = global_load(
+                paged.key_scale_addr(k, key_scales(p.keys), unit, t & 4, kg)
+            )
+            kscale.append((fx.Int32(sw) >> (8 * (t % 4))) & 255)
     cws = {}
     return SimpleNamespace(
         keys=keys,
@@ -1078,7 +1093,7 @@ class Indexer(Block):
                  pcap: int = 0, lean_epi: bool = False, pnarrow: bool = False,
                  clist_sparse: bool = False, topk_packed: bool = False, cmask_lds: bool = False,
                  bmax_bf16: bool = False, topk_xhoist: bool = False, scores_f32: bool = False,
-                 rows_long: int = 0, rcap: int = 0, items: bool = False):  # fmt: skip
+                 rows_long: int = 0, rcap: int = 0, items: bool = False, kmfma: bool = False):  # fmt: skip
         if ratio not in (1, 2):
             raise ValueError(f"Indexer {name}: ratio 1 or 2, got {ratio}")
         if qn.fmt is not Fmt.MXFP8 or qn.width != QR:
@@ -1143,6 +1158,8 @@ class Indexer(Block):
         # the persistent score tasks shared among the requests by their tiles (``_Plan.items``; with ``persist`` only:
         # a tile a task has no per-request share to deal)
         self.items = items
+        # ATOM's FP4 plane in its ``mfma`` layout (``_Plan.kmfma``)
+        self.kmfma = kmfma
         # the score epilogue with fewer VALU ops: the same roundings, ReLU values and sum order
         self.lean_epi = lean_epi
         # a compact reader's candidate list (``_clist``) from the row's live bitmap words only (its bound: the words
@@ -1297,7 +1314,7 @@ class Indexer(Block):
                      pu=self.punroll if self.persist else 1,
                      csparse=self.clist_sparse and self.compact,
                      bbf=self.bmax is not None and self.bmax.fmt is Fmt.BF16, f32=self.scores_f32,
-                     items=self.items and bool(self.persist) and not self.compact)  # fmt: skip
+                     items=self.items and bool(self.persist) and not self.compact, kmfma=self.kmfma)  # fmt: skip
 
     def _per(self, sc: Scenario, tiles: int, g: int) -> int:
         """Persistent score tasks a (request, row group): ``persist`` (-1: the grid's share), at most the tiles."""

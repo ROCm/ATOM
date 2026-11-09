@@ -100,7 +100,6 @@ def mi355x(monkeypatch):
         lambda name: object() if name == "flydsl" else None,
     )
     monkeypatch.delenv("ATOM_DSV41_MONO_HI", raising=False)
-    monkeypatch.delenv("ATOM_H2D_BACKEND", raising=False)
 
 
 def test_the_default_is_auto(mi355x):
@@ -153,6 +152,11 @@ UNSUPPORTED = {
     "DP attention": ({}, dict(dp_ranks=2), "DP attention"),
     "fp8 KV": (dict(kv_cache_dtype="fp8"), {}, "kv_cache_dtype fp8"),
     "fp8 index cache": (dict(index_cache_dtype="fp8"), {}, "index-cache-dtype fp8"),
+    "gfx1250's FP4 index layout": (
+        dict(index_cache_layout="natural"),
+        {},
+        "FP4 index cache layout natural",
+    ),
     "another KV page": (
         dict(kv_cache_block_size=256),
         {},
@@ -232,9 +236,12 @@ def test_auto_without_flydsl(mi355x, served, monkeypatch):
     assert "FlyDSL" in hi_gate.refusal(served, _drafter(), _builder(), 0)
 
 
-def test_auto_without_the_packed_h2d(mi355x, served, monkeypatch):
-    monkeypatch.setenv("ATOM_H2D_BACKEND", "copy")
-    assert "ATOM_H2D_BACKEND" in hi_gate.refusal(served, _drafter(), _builder(), 0)
+@pytest.mark.parametrize("layout", hi_gate.INDEX_LAYOUTS)
+def test_both_gfx950_fp4_index_layouts_are_served(mi355x, served, layout):
+    """ATOM's FP4 index plane in either gfx950 layout (``ATOM_V4_UNIFIED_MQA``: opus -> mfma, flydsl ->
+    preshuffle): the hi programs address both."""
+    cfg = _config(served, index_cache_layout=layout)
+    assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == ""
 
 
 def test_off(mi355x, served, monkeypatch, caplog):

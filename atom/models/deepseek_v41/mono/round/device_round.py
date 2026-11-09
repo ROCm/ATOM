@@ -238,7 +238,7 @@ class DeviceRound:
         """After the builder's layout: a device-round step's (``RoundService.DEVICE``) positions advanced on the
         device (with the prologue's recorded launches as one kernel)."""
         state, hook, step = self.state, self.hook, metadata.step
-        running_bs, running_tokens = int(step.slots.shape[0]), step.width
+        running_bs, running_tokens = int(step.slots.shape[0]), step.running_tokens
         state.cur_served = (
             metadata.served_by_round >= RoundService.LEAN
             and state.cur_req is not None

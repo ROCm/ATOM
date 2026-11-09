@@ -164,9 +164,8 @@ class HiLayers(HiDraft, HiPrograms):
         # (what this rank loaded is checked, agreed over the ranks, before: ``check``)
         # the programs (``hi_compose``: the plan, the widths, every program built)
         self._cpu_group = get_tp_group().cpu_group
-        HiPrograms.__init__(
-            self, cfg, model.topology, widths, max_ctx, self.tp, self._cpu_group
-        )
+        HiPrograms.__init__(self, cfg, model.topology, widths, max_ctx, self.tp, self._cpu_group,
+                            index_layout=atom_config.index_cache_layout)  # fmt: skip
         # lean host prep (``lean_host``) with every layer on the hi path; ``served_widths``: the widths a forward took this
         # hook's path at (a capture's included), the builder's lean-step test
         self.runs_every_layer = True
@@ -689,6 +688,10 @@ class HiLayers(HiDraft, HiPrograms):
                     f"owner {o}: {g.rows_per_page(ratio)} rows a page at ratio {ratio}"
                 )
             units = cache.index_units[o]
+            if units.layout != self.index_layout:
+                raise RuntimeError(
+                    f"owner {o}: FP4 index plane in the {units.layout} layout, the programs' {self.index_layout}"
+                )
             # the FP4 plane's units as ``paged`` addresses them (8 keys a unit: 512 value bytes, 32 scale bytes)
             if (units.values.stride(0), units.scales.stride(0)) != (
                 ml.FP4_PAGE * ml.IDX_DIM // 2,

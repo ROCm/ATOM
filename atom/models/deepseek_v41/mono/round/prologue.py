@@ -46,7 +46,7 @@ logger = logging.getLogger("atom")
 
 # the publications a served decode step makes (the token inputs, the V4.1 step metadata): the only ones opted into
 # host-arena reads (``PublicationGroup.read_host_arena``)
-DECODE_PUBLICATIONS = ("token_inputs", "v41_metadata")
+DECODE_PUBLICATIONS = ("token_inputs", "step_metadata")
 # a decode publication at the served widths, block tables included, stays below this (a seatbelt: a step the hook
 # does not serve is copied whatever its size)
 HOST_ARENA_MAX_BYTES = 1 << 20

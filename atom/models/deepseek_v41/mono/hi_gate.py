@@ -3,10 +3,10 @@
 """Whether DeepSeek-V4.1's high-interactivity (hi) monokernels serve this deployment (``ATOM_DSV41_MONO_HI``).
 
 - "auto" (the default): on for exactly the deployment they are built for, gfx950 (MI355X, every CU) at TP4 without
-  DP attention, a bf16 KV cache with the FP4 index cache, ATOM's 128-token V4.1 pages, the DSpark draft with its 5
-  drafts, ATOM's Engram runtime on its UVA lookup with overlap staging, the packed H2D publications, no KV transfer, a
-  context up to ``MAX_CTX`` (the programs' context bucket), DeepSeek-V4.1-Flash's geometry and FlyDSL installed. Any other
-  deployment keeps ATOM's own mono decode, unchanged, with one info line saying why.
+  DP attention, a bf16 KV cache with the FP4 index cache (either gfx950 layout, ``INDEX_LAYOUTS``), ATOM's 128-token
+  V4.1 pages, the DSpark draft with its 5 drafts, ATOM's Engram runtime on its UVA lookup with overlap staging, no KV
+  transfer, a context up to ``MAX_CTX`` (the programs' context bucket), DeepSeek-V4.1-Flash's geometry and FlyDSL
+  installed. Any other deployment keeps ATOM's own mono decode, unchanged, with one info line saying why.
 - "1": the same, but a deployment they do not serve is an error (raised, naming why).
 - "0": never.
 
@@ -38,6 +38,9 @@ BLOCK_SIZE = 128
 # is refused
 MAX_CTX = 1 << 20
 CUS = 256  # MI355X's CUs (one CTA a CU: a compute partition has fewer)
+# ATOM's FP4 index plane layouts the hi programs read and write in place (``Config.index_cache_layout`` on gfx950:
+# "mfma" with ``ATOM_V4_UNIFIED_MQA=opus``, the default, "preshuffle" with ``flydsl``; ``hi.device.gfx950.paged``)
+INDEX_LAYOUTS = ("preshuffle", "mfma")
 ARCH = "gfx950"
 # DeepSeek-V4.1-Flash: the geometry the hi programs are composed for (``hi.v41.config.Geometry``, the verify head's
 # vocabulary, the draft's taps and stages, the Engram's n-grams and heads)
@@ -111,6 +114,9 @@ def refusal(atom_config, drafter, metadata_builder, dp_ranks: int) -> str:
     index = getattr(cfg, "index_cache_dtype", None)
     if index != "fp4":
         return f"--index-cache-dtype {index} (the hi path serves fp4)"
+    layout = getattr(cfg, "index_cache_layout", None)
+    if layout not in INDEX_LAYOUTS:
+        return f"FP4 index cache layout {layout} (the hi path addresses {', '.join(INDEX_LAYOUTS)})"
     block = getattr(cfg, "kv_cache_block_size", None)
     if block != BLOCK_SIZE:
         return f"KV cache pages of {block} tokens (the hi path serves ATOM's V4.1 page, {BLOCK_SIZE})"
@@ -139,8 +145,6 @@ def refusal(atom_config, drafter, metadata_builder, dp_ranks: int) -> str:
         return "two-batch overlap (the hi layers run a step whole)"
     if envs.ATOM_USE_TRITON_MOE:
         return "ATOM_USE_TRITON_MOE=1 (the hi path reads the routed experts in the gfx950 FlyDSL layout)"
-    if envs.ATOM_H2D_BACKEND != "packed":
-        return f"ATOM_H2D_BACKEND={envs.ATOM_H2D_BACKEND} (the hi path reads the packed publications)"
     if metadata_builder is None:
         return "no metadata builder"
     engram = getattr(metadata_builder, "engram", None)

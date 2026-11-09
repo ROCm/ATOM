@@ -662,7 +662,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
                        topk_packed=bool(k.IDX_TOPK_PACKED) and not f32, cmask_lds=bool(k.IDX_CMASK_LDS),
                        bmax_bf16=bool(k.IDX_BMAX_BF16) and not f32, topk_xhoist=bool(k.IDX_XHOIST),
                        scores_f32=f32, rows_long=int(k.IDX_ROWS_LONG), rcap=int(k.IDX_RCAP) // src.ratio,
-                       items=bool(k.IDX_ITEMS), **cand),
+                       items=bool(k.IDX_ITEMS), kmfma=k.INDEX_KLAYOUT == "mfma", **cand),
                Store("sel_store", C.sel, "sel_out")]  # fmt: skip
     comp_first = k.COMP_FIRST is True
     q_stage = k.Q_NORM == "stage" or (

@@ -166,13 +166,21 @@ def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
     batch = SimpleNamespace(
         total_seqs_num=bs,
         total_tokens_num=12,
+        num_spec_step=5,
         any_logprobs=False,
         structured_requests={},
         required_channel=None,
     )
     with pytest.raises(Stop):
         runner_module.ModelRunner.postprocess(
-            runner, batch, None, None, None, None, True, hidden_states=None
+            runner,
+            batch,
+            None,
+            None,
+            None,
+            None,
+            True,
+            hidden_states=torch.zeros(12, 4),
         )
     assert len(calls) == 1 and len(broadcasts) == 1 and broadcasts[0] is out
     # rank 0's ids at each request's accepted count (3 and 5), not this rank's picks

@@ -33,6 +33,9 @@ DEFAULT: dict = {
     "WQB_ROWS": "auto",  # wq_b's output rows a task: None (the plan's), an int, "auto"
     "WKV_KSPLIT": "auto",  # wkv's K slices: None (the plan's), an int, "auto"
     "INDEX_KFMT": "fp4",  # the Indexer's key cache: "fp4" (its kpack stage fills it) or "bf16"
+    # the FP4 index plane's layout in ATOM's storage (``config.index_cache_layout``): "preshuffle" or "mfma"
+    # (``device.gfx950.paged``); the deployment's, never a (kind, rows) entry
+    "INDEX_KLAYOUT": "preshuffle",
     "XA_PROTO": "flag",  # attn_norm -> wq_a / wkv: "tagged" pairs or "flag" (dense words + a flag a norm task)
     "Q_NORM": "stage",  # q_norm: "stage" or "wq_b" (wq_b's NormIn prologue normalizes the qr rows)
     # the seams (HCSeam)

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from atom.models.deepseek_v41.mono import hi_plan
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.models.deepseek_v41.mono.hi_bands import plan_widths
-from atom.models.deepseek_v41.mono.hi_gate import MAX_CTX, REQ_ROWS
+from atom.models.deepseek_v41.mono.hi_gate import INDEX_LAYOUTS, MAX_CTX, REQ_ROWS
 
 logger = logging.getLogger("atom")
 
@@ -80,7 +80,8 @@ class HiPrograms:
     """The hi programs of one TP rank (module docstring): built from the model's config and attention topology,
     the served widths, the context bucket and the TP size."""
 
-    def __init__(self, cfg, topology, widths, max_ctx: int, tp: int, group=None):
+    def __init__(self, cfg, topology, widths, max_ctx: int, tp: int, group=None,
+                 index_layout: str = "preshuffle"):  # fmt: skip
         from .hi.v41 import draft as D
         from .hi.v41 import layer as L
         from .hi.plan import program as mf_program
@@ -88,6 +89,13 @@ class HiPrograms:
         from .hi.runtime.kernel import MonoKernel
 
         self.L, self.tp = L, tp
+        # ATOM's FP4 index plane's layout (``config.index_cache_layout``), which the index sources' programs address
+        # in place (``hi.device.gfx950.paged``)
+        if index_layout not in INDEX_LAYOUTS:
+            raise MonoUnsupported(
+                f"V4.1 mono hi: FP4 index layout {index_layout!r}, the programs address {', '.join(INDEX_LAYOUTS)}"
+            )
+        self.index_layout = index_layout
         # the TP group's CPU group: every build fallback below is taken by every rank or none (``_agree``); None: one
         # process (the CPU checks)
         self.group = group
@@ -345,6 +353,8 @@ class HiPrograms:
             )
         else:
             # ratio 2: Source(state_slots=) -> rejection-safe Compressor state (module docstring)
+            if self.index_layout != "preshuffle":
+                ch["knobs"] = {"INDEX_KLAYOUT": self.index_layout}
             blocks = L.window_layer_blocks(first=False, tp=self.tp, source=self.sources[p.layer_id],
                                            engram=p.engram, **ch)  # fmt: skip
         stages = L.moe_route_early([st for b in blocks for st in b.stages(sc)])
@@ -355,6 +365,7 @@ class HiPrograms:
             + ("_tap" if full_r_a else "")
         )
         tag += "_band" if dyn else ""
+        tag += "_mfma" if "knobs" in ch else ""
         dk = {"dyn_rows": True} if dyn else {}
         return MonoKernel(Program(f"atom_v41_{tag}_r{s}", sc, stages, sgpr_spill_ok=spill,
                                   peer_first=self._chain_peer() if self.chain else (), **dk))  # fmt: skip
@@ -509,6 +520,7 @@ class HiPrograms:
         return _DraftPlan(n, stages + heads)
 
 
-def served(cfg, topology, tp: int) -> HiPrograms:
-    """The programs the hook serves with: its widths (``ROWS``) and context bucket (``hi_gate.MAX_CTX``)."""
-    return HiPrograms(cfg, topology, list(ROWS), MAX_CTX, tp)
+def served(cfg, topology, tp: int, index_layout: str = "preshuffle") -> HiPrograms:
+    """The programs the hook serves with: its widths (``ROWS``) and context bucket (``hi_gate.MAX_CTX``), on ATOM's
+    FP4 index plane in ``index_layout``."""
+    return HiPrograms(cfg, topology, list(ROWS), MAX_CTX, tp, index_layout=index_layout)
