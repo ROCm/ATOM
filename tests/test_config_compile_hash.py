@@ -26,7 +26,6 @@ def _hash(**overrides):
         "max_num_batched_tokens": 16384,
         "attn_prefill_chunk_size": 16384,
         "kv_cache_block_size": 16,
-        "kv_cache_dtype": "fp8",
         "gpu_memory_utilization": 0.9,
         "speculative_config": None,
     }
