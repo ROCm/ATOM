@@ -107,6 +107,25 @@ assert.deepEqual(explorerFrontiers(points).flat().map(p=>p.x), [100,10,1]);
 """
         )
 
+    def test_throughput_per_gpu_drives_frontier_without_double_normalization(self):
+        self.run_js(
+            "const assert = require('node:assert/strict');\n"
+            + javascript_function("explorerThroughputValue")
+            + javascript_function("atomeshParetoFrontier")
+            + """
+assert.equal(explorerThroughputValue({totalTputPerGpu:100.125,totalTput:800,totalGpu:8}),100.125);
+assert.equal(explorerThroughputValue({totalTput:800,totalGpu:8}),100);
+for (const count of [null,undefined,0,-1,1.5,NaN,Infinity]) {
+  assert.equal(explorerThroughputValue({totalTput:800,totalGpu:count}),null);
+}
+assert.equal(explorerThroughputValue({totalTputPerGpu:0,totalTput:800,totalGpu:8}),null);
+assert.equal(explorerThroughputValue({totalTput:Infinity,totalGpu:8}),null);
+const rows = [{x:80,totalTput:1600,totalGpu:32},{x:90,totalTput:1200,totalGpu:8}];
+assert.equal(atomeshParetoFrontier(rows.map(row=>({x:row.x,y:row.totalTput}))).length,2);
+assert.deepEqual(atomeshParetoFrontier(rows.map(row=>({x:row.x,y:explorerThroughputValue(row)}))),[{x:90,y:150}]);
+"""
+        )
+
     def test_ci_points_preserve_recipes_and_use_latest_publication(self):
         functions = [
             "parseAtomeshNumber",
@@ -120,6 +139,7 @@ assert.deepEqual(explorerFrontiers(points).flat().map(p=>p.x), [100,10,1]);
             "explorerWorkloadKey",
             "explorerDeployment",
             "buildExplorerBenchmarkRows",
+            "explorerThroughputValue",
             "atomeshParetoFrontier",
         ]
         self.run_js(
@@ -129,11 +149,11 @@ assert.deepEqual(explorerFrontiers(points).flat().map(p=>p.x), [100,10,1]);
             + """
 const base = {source: 'ATOMesh', model: 'GLM-5.2', hardware: 'mi355x',
   precision: 'fp4', benchmark_kind: 'aiperf_agentic', public_dataset: 'agentic-trace',
-  concurrency: 56, interactivity_method: 'p90_e2e_normalized', interactivity: 30};
+  concurrency: 56, total_gpu: 8, interactivity_method: 'p90_e2e_normalized', interactivity: 30};
 const bench = point => ({extra: 'Run: https://github.com/ROCm/ATOM/actions/runs/1 | perf_point=' + encodeURIComponent(JSON.stringify({...base, ...point}))});
 const older = {date: 100, benches: [bench({config_label: 'recipe-a', total_tput: 900, interactivity_p90_itl: 100})]};
 const newer = {date: 200, benches: [
-  bench({config_label: 'recipe-a', total_tput: 200, interactivity_p90_itl: 60}),
+  bench({config_label: 'recipe-a', total_tput: 200, tput_per_gpu: 25, interactivity_p90_itl: 60}),
   bench({config_label: 'recipe-b', total_tput: 100, interactivity_p90_itl: 90}),
   bench({config_label: 'recipe-b', total_tput: 100, interactivity_p90_itl: 90}),
   bench({config_label: 'recipe-a', precision: 'fp8', total_tput: 150, interactivity_p90_itl: 70}),
@@ -147,10 +167,11 @@ assert.equal(JSON.stringify(data), before);
 assert.equal(rows.length, 4);
 const cohort = rows.filter(row => row.precision === 'fp4' && row.publicDataset === 'agentic-trace');
 assert.deepEqual(cohort.map(row => row.totalTput), [200, 100]);
+assert.deepEqual(cohort.map(explorerThroughputValue), [25, 12.5]);
 assert(cohort.every(row => row.date === 200 && row.sourceLabel === 'ATOM CI'));
 assert(cohort.every(row => row.runUrl === 'https://github.com/ROCm/ATOM/actions/runs/1'));
 // Same concurrency: the slower-throughput recipe is still a valid frontier point.
-assert.equal(atomeshParetoFrontier(cohort.map(row => ({x: row.interactivityP90Itl, y: row.totalTput}))).length, 2);
+assert.equal(atomeshParetoFrontier(cohort.map(row => ({x: row.interactivityP90Itl, y: explorerThroughputValue(row)}))).length, 2);
 """
         )
 

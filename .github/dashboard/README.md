@@ -1,8 +1,10 @@
 # Agentic performance page
 
-Open **Agentic performance** from the benchmark dashboard, or visit
+Choose **Scenario: Agentic** in the benchmark dashboard filter bar, or visit
 `benchmark-dashboard/agentic.html`. This standalone page reads the existing
-`data.js` published by ATOM CI. It selects Agentic / AgentX performance records
+`data.js` published by ATOM CI. It keeps the existing dashboard header,
+colors, fonts, control styling and shared light/dark theme. Scenario navigation
+preserves the selected hardware and restores the original filters on return. It selects Agentic / AgentX performance records
 from the encoded `perf_point` payloads without modifying the dataset.
 
 Select a model, hardware and workload/precision. The chart defaults to the
@@ -12,7 +14,12 @@ Pareto frontier and switches between two horizontal axes:
 | --- | --- | --- |
 | P90 Interactivity | `interactivity_p90_itl` | `1 / p90(ITL)` |
 | P90 Normalized Interactivity | `interactivity` with the P90 E2E normalized method | `1 / p90(ITL + TTFT / output_tokens)` |
-| Total throughput | `total_tput` | Total input + output tok/s across all participating GPUs |
+| Total throughput per GPU | `tput_per_gpu` | Total input + output tok/s divided by all participating GPUs |
+
+The vertical axis, Pareto frontier, peak selection and exports use tok/s/GPU.
+The page prefers the published `tput_per_gpu` value. When it is unavailable,
+it divides `total_tput` by a known positive `total_gpu` count; otherwise the
+point has no vertical-axis value. PD counts both prefill and decode GPUs.
 
 Latencies in the formulas are in seconds. Missing P90 values remain unavailable;
 median TPOT is never substituted. The page retains the latest publication per
@@ -22,11 +29,13 @@ Distinct recipes remain available until the two-dimensional Pareto calculation.
 **ATOMesh** means PD disaggregation and uses circular markers; **ATOM** means
 single-node aggregated serving and uses square markers. Serving mode and node
 placement are separate: PD can also run on one physical node. Their frontiers
-are computed independently, as are different model variants. Topology and the
+are computed independently, as are different model variants. Every plotted point
+is labeled `c<concurrency>`; the tooltip, inspector, table and CSV also include
+concurrency. Topology and the
 original Actions run link are available in point details and the measurement
 table. The page supports dark/light themes, shareable filters and CSV/PNG exports.
 
-The original dashboard's JavaScript, data parsing, aggregation and publication
+The original dashboard's data parsing, filtering, aggregation and publication
 behavior are unchanged. Existing deployment jobs additionally copy the new
 HTML page alongside `index.html`.
 
@@ -70,9 +79,11 @@ the following measured fields:
 | --- | --- |
 | P90 Interactivity | `request_metrics.latency.intvty.p90` |
 | P90 Normalized Interactivity | `request_metrics.latency.e2e_norm_intvty.p90` |
-| Total throughput | `request_metrics.throughput.total.tokens_per_second` |
+| Total throughput per GPU | `request_metrics.throughput.per_gpu.total_tput_tps` |
 
-Total throughput is not the `per_gpu` value. Missing P90 measurements remain
+The chart uses the measured `per_gpu` value when present; otherwise it divides
+`request_metrics.throughput.total.tokens_per_second` by `num_gpus`. The imported
+raw totals stay unchanged. Missing P90 measurements remain
 unavailable; rounded latency or mean values are never substituted. Imported
 results stay in the temporary preview directory and are not published to the
 hosted dashboard.
