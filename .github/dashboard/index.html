@@ -381,6 +381,8 @@
     .ex-detail dt { color: var(--text-tertiary); }
     .ex-detail dd { color: var(--text-primary); font-variant-numeric: tabular-nums; }
     .ex-source { font-size: 11px; color: var(--text-secondary); }
+    .ex-active-run { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 7px; font-size: 11px; color: var(--text-tertiary); }
+    .ex-run-link { color: var(--explorer-accent); font-size: 11px; white-space: nowrap; }
     .ex-table-panel { margin-top: 14px; border: 1px solid var(--border-light); border-radius: 7px; background: var(--bg-secondary); }
     .ex-table-panel summary { padding: 15px 20px; font-size: 12px; color: var(--text-secondary); cursor: pointer; }
     .ex-table-scroll { overflow-x: auto; }
@@ -4105,6 +4107,14 @@ function explorerTopology(row) {
   return row.sourceTopology || row.topology || 'Unknown topology';
 }
 
+function explorerRunLink(row) {
+  const href = safeHref(row?.runUrl);
+  if (!href) return '<span class="ex-source">CI run unavailable</span>';
+  const runId = href.match(/\/actions\/runs\/(\d+)/)?.[1];
+  const label = runId ? `CI run #${runId} ↗` : 'Open CI run ↗';
+  return `<a class="ex-run-link" href="${escHTML(href).replace(/"/g, '&quot;')}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+}
+
 function explorerCompact(value, digits = 1) {
   if (!Number.isFinite(value)) return '—';
   return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: digits }).format(value);
@@ -4182,14 +4192,14 @@ function renderAtomeshPerformanceTab() {
         </div>
       </div>
       <div class="ex-toolbar">
-        <div class="ex-legend" aria-label="Series visibility">${seriesKeys.map((key, idx) => `<button data-ex-series="${idx}" aria-pressed="${!state.explorerHidden.has(key)}"><span class="ex-dot" style="--series-color:${colors.get(key)}"></span>${escHTML(seriesLabel(key))}</button>`).join('')}<span class="ex-legend-note"><span class="ex-line"></span>Pareto frontier</span></div>
+        <div class="ex-legend" aria-label="Series visibility">${seriesKeys.map((key, idx) => `<button data-ex-series="${idx}" aria-pressed="${!state.explorerHidden.has(key)}"><span class="ex-dot" style="--series-color:${colors.get(key)}"></span>${escHTML(seriesLabel(key))}</button>`).join('')}<span class="ex-legend-note"><span class="ex-line"></span>Pareto frontier</span><span class="ex-active-run" id="ex-active-run" aria-label="Selected CI run" aria-live="polite"></span></div>
         <div class="ex-actions"><label class="ex-check"><input type="checkbox" id="ex-frontier" ${state.explorerFrontierOnly ? 'checked' : ''}> Pareto only</label><button class="ex-button" id="ex-csv">↓ CSV</button><button class="ex-button" id="ex-png" ${visible.length ? '' : 'disabled'}>↓ PNG</button></div>
       </div>
       <div class="ex-plot-main">
         ${visible.length ? '<div class="ex-chart"><canvas id="ex-chart" role="img" aria-label="Scatter plot of total throughput versus P90 interactivity. All values are available in the measurement table below."></canvas></div>'
           : `<div class="ex-empty">No points available for ${metricLabel}.<br>${missing ? `${missing} configurations lack this P90 metric or total throughput.` : 'Choose a different model, workload, or filter; enable a series in the legend.'}</div>`}
       </div>
-      <div class="ex-caption"><span>${metric.key === 'p90_itl' ? '1 / p90(ITL)' : '1 / p90(ITL + TTFT / output tokens)'} · latency in seconds · click a point for details</span><span>Higher throughput ↑ &nbsp; Faster responses →</span></div>
+      <div class="ex-caption"><span>${metric.key === 'p90_itl' ? '1 / p90(ITL)' : '1 / p90(ITL + TTFT / output tokens)'} · latency in seconds · click a point for its CI run and details</span><span>Higher throughput ↑ &nbsp; Faster responses →</span></div>
       <div class="ex-stats">
         <div class="ex-stat"><div class="ex-stat-label">Peak total throughput</div><div class="ex-stat-value">${explorerCompact(peak?.y, 2)} <small>tok/s</small></div><div class="ex-stat-note">${peak ? `Concurrency ${peak.row.concurrency} · ${peak.row.totalGpu ?? '—'} GPUs` : 'No measured points'}</div></div>
         <div class="ex-stat"><div class="ex-stat-label">Fastest ${metricLabel}</div><div class="ex-stat-value">${fastest ? fmtNum(fastest.x, 1) : '—'} <small>tok/s/user</small></div><div class="ex-stat-note">${fastest ? `Concurrency ${fastest.row.concurrency} · ${fastest.row.totalGpu ?? '—'} GPUs` : 'No P90 measurements'}</div></div>
@@ -4199,14 +4209,25 @@ function renderAtomeshPerformanceTab() {
       <aside class="ex-detail" id="ex-detail" aria-label="Selected configuration" aria-live="polite" hidden></aside>
     </section>
     <details class="ex-table-panel"><summary>All measurements <span style="color:var(--text-tertiary)">· ${rows.length} configurations${missing ? ` · ${missing} missing the selected metric` : ''}</span></summary>
-      <div class="ex-table-scroll"><table class="ex-table"><thead><tr><th>Configuration</th><th class="num">GPUs</th><th class="num">Concurrency</th><th class="num">P90 interactivity</th><th class="num">P90 normalized</th><th class="num">Total tok/s</th><th>Source</th></tr></thead>
-      <tbody>${rows.map((row, idx) => `<tr><td><button class="ex-button" data-ex-row="${idx}">${escHTML(explorerTopology(row))}</button></td><td class="num">${row.totalGpu ?? '—'}</td><td class="num">${row.concurrency ?? '—'}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(row.totalTput, v => fmtNum(v, 2))}</td><td>${atomeshRunCell(row)}</td></tr>`).join('')}</tbody></table></div>
+      <div class="ex-table-scroll"><table class="ex-table"><thead><tr><th>Configuration</th><th class="num">GPUs</th><th class="num">Concurrency</th><th class="num">P90 interactivity</th><th class="num">P90 normalized</th><th class="num">Total tok/s</th><th>CI run</th></tr></thead>
+      <tbody>${rows.map((row, idx) => `<tr><td><button class="ex-button" data-ex-row="${idx}">${escHTML(explorerTopology(row))}</button></td><td class="num">${row.totalGpu ?? '—'}</td><td class="num">${row.concurrency ?? '—'}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(row.totalTput, v => fmtNum(v, 2))}</td><td>${explorerRunLink(row)}</td></tr>`).join('')}</tbody></table></div>
     </details>
     <div class="ex-footer"><span>${sourceUrl ? `<a href="${escHTML(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escHTML(state.explorerSource)} ↗</a>` : escHTML(state.explorerSource)}${localRows.some(row => rows.includes(row)) ? ' · Local preview' : ''}${rows[0]?.sourceStatus ? ' · ' + escHTML(rows[0].sourceStatus) : ''}${missing ? ` · ${missing} configurations omitted from the chart: P90 metric or throughput unavailable.` : ''}</span><span>Total throughput = input + output tokens / second, across the full configuration.</span></div>`;
+
+  function updateRunLink(row, isPeak = false) {
+    const target = document.getElementById('ex-active-run');
+    target.innerHTML = row
+      ? `<span>${isPeak ? 'Peak · ' : ''}c${row.concurrency ?? '—'}</span>${explorerRunLink(row)}`
+      : '';
+  }
+  const initialPoint = visible.reduce((best, point) => !best || point.y > best.y
+    || (point.y === best.y && point.x > best.x) ? point : best, null);
+  updateRunLink(initialPoint?.row, true);
 
   function showDetail(row) {
     const detail = document.getElementById('ex-detail');
     if (!row) return;
+    updateRunLink(row);
     detail.hidden = false;
     detail.innerHTML = `<div class="ex-detail-title"><div class="ex-eyebrow">SELECTED CONFIGURATION</div><h4>Concurrency ${row.concurrency}</h4></div>
       <dl><div><dt>Total throughput</dt><dd>${fmtNum(row.totalTput, 2)} tok/s</dd></div>
@@ -4214,9 +4235,10 @@ function renderAtomeshPerformanceTab() {
       <div><dt>P90 normalized</dt><dd>${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</dd></div>
       <div><dt>Topology / GPUs</dt><dd>${escHTML(explorerTopology(row))} / ${row.totalGpu ?? '—'}</dd></div>
       <div><dt>Pareto optimal</dt><dd>${points.some(point => point.row === row) ? (frontierRows.has(row) ? 'Yes' : 'No') : '—'}</dd></div></dl>
-      ${safeHref(row.runUrl) ? `<a class="ex-source" href="${escHTML(row.runUrl)}" target="_blank" rel="noopener noreferrer">View run ↗</a>` : ''}
+      ${explorerRunLink(row)}
       <button class="ex-button" id="ex-close-detail" aria-label="Close configuration details">×</button>`;
     document.getElementById('ex-close-detail').addEventListener('click', () => { detail.hidden = true; });
+    detail.scrollIntoView({ block: 'nearest' });
   }
   function refresh() { renderAtomeshPerformanceTab(); syncToHash(); }
   for (const [id, key] of [['ex-model', 'explorerModel'], ['ex-source', 'explorerSource'], ['ex-workload', 'explorerWorkload']]) {
@@ -4280,6 +4302,7 @@ function renderAtomeshPerformanceTab() {
             callbacks: {
               title: items => items.length ? `Concurrency ${items[0].raw.row.concurrency}` : '',
               label: item => [`Total throughput: ${fmtNum(item.raw.y, 2)} tok/s`, `${metricLabel}: ${fmtNum(item.raw.x, 2)} tok/s/user`, `GPUs: ${item.raw.row.totalGpu ?? '—'}`],
+              afterBody: () => 'Click to view the CI run and configuration',
             } },
         },
         scales: {
