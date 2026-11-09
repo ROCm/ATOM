@@ -295,7 +295,7 @@ class _MPLookupClient:
         salt = (request_configs or {}).get(CACHE_SALT_TAG)
         if salt:
             session = _mp_session_id(self._config, lookup_id)
-            self._adapter.cache_salts[session] = salt
+            self._adapter.salt_session(session, salt)
 
     def supports_async(self) -> bool:
         """Whether `submit` can send a lookup without waiting for it."""

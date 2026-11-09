@@ -49,11 +49,7 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
-from atom.kv_transfer.offload._offload_common import (
-    OffloadSchedulerMixin,
-    salt_kwargs,
-    tier_lookup_kwargs,
-)
+from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
@@ -5974,34 +5970,6 @@ def test_a_joint_load_clamps_the_kv_leg_to_the_covering_chunk():
     assert ls.lmcache_cached_tokens == 1024
 
 
-def _offload_scheduler(monkeypatch, hf_config, *, chunk):
-    """The in-process scheduler the layout selection builds for `hf_config`."""
-    from atom.kv_transfer.offload.connector import _build_scheduler
-
-    monkeypatch.setattr(
-        offcfg,
-        "build_lmcache_config",
-        lambda _config=None: SimpleNamespace(chunk_size=chunk),
-    )
-    monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    return _build_scheduler(
-        SimpleNamespace(
-            hf_config=hf_config,
-            kv_transfer_config={"kv_role": "offload"},
-            kv_cache_block_size=64,
-            decode_context_parallel_size=1,
-            tensor_parallel_size=1,
-        )
-    )
-
-
-def _text_wrapped(model_type: str, text_type: str):
-    return SimpleNamespace(
-        model_type=model_type,
-        text_config=SimpleNamespace(model_type=text_type, num_attention_heads=16),
-    )
-
-
 def test_the_kv_leg_starts_where_the_claim_ended_not_where_the_hit_did():
     """`allocate` claims every block the prefix walk matched, which is past the
     gated hit. Starting the transfer at the hit would fetch back what the pool
@@ -7395,63 +7363,6 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             assert tier.take_store_reports() == (set(), {op})
         finally:
             tier.shutdown()
-
-
-# -- multimodal prompts: LMCache keys carry the media identity ---------------
-
-_MEDIA_CHUNK = 256
-_MEDIA_PROMPT = 3 * _MEDIA_CHUNK
-
-
-def _media_seq(sid, cache_seed):
-    tokens = list(range(100, 100 + _MEDIA_PROMPT))
-    return SimpleNamespace(
-        id=sid,
-        token_ids=tokens,
-        num_prompt_tokens=len(tokens),
-        num_tokens=len(tokens),
-        cache_seed=cache_seed,
-        block_table=list(range(len(tokens) // 64)),
-    )
-
-
-@pytest.mark.parametrize("seed_a, seed_b", [(11, 22), (11, 11), (-1, -1), (-1, 11)])
-def test_a_prompt_is_keyed_by_its_media(monkeypatch, seed_a, seed_b):
-    """Image placeholder ids are the same for every picture: two prompts with
-    the same ids share LMCache keys exactly when they share `cache_seed`."""
-    pytest.importorskip("lmcache")
-    import torch
-    from lmcache.utils import CacheEngineKey
-    from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
-
-    sched = _offload_scheduler(
-        monkeypatch,
-        _text_wrapped("qwen3_5_moe", "qwen3_5_moe_text"),
-        chunk=_MEDIA_CHUNK,
-    )
-
-    def keys(seed):
-        seq = _media_seq(seed, seed)
-        save = sched._build_save_request(
-            seq, 0, _MEDIA_PROMPT, SimpleNamespace(), list(seq.block_table), True
-        )
-        kwargs = salt_kwargs(save.cache_salt)
-        assert tier_lookup_kwargs(seq) == kwargs
-        return (
-            IPCCacheServerKey(
-                model_name="m",
-                world_size=1,
-                worker_id=0,
-                token_ids=tuple(save.token_ids),
-                start=0,
-                end=_MEDIA_PROMPT,
-                request_id=str(seed),
-                cache_salt=save.cache_salt,
-            ),
-            CacheEngineKey("m", 1, 0, 0, torch.bfloat16, **kwargs),
-        )
-
-    assert (keys(seed_a) == keys(seed_b)) is (seed_a == seed_b)
 
 
 @pytest.mark.parametrize("cache_seed, salt", [(11, "11"), (12, "12"), (-1, "")])

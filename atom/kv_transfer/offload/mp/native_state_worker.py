@@ -66,6 +66,12 @@ def stores_state_images(replay_tokens: int) -> bool:
     return not replay_tokens
 
 
+def restore_slot_count(max_pending_saves: int) -> int:
+    """Restore descriptor slots a native-state worker holds. The scheduler
+    dispatches no more image loads than this (`lookup_pending`)."""
+    return max(2, max_pending_saves)
+
+
 def require_native_state_server(adapter: Any, config: Any) -> None:
     """Validate native transfer geometry shared with the LMCache server."""
     configured_chunk = int(
@@ -173,7 +179,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         self._native_copy = native_copy
         self._restore_stream = torch.cuda.Stream(device=torch.cuda.current_device())
         self._restore_descriptor_slots = list(
-            range(1, max(2, self._max_pending_saves) + 1)
+            range(1, restore_slot_count(self._max_pending_saves) + 1)
         )
         # Pinned staging allocation synchronizes the device. Reserve every
         # restore slot now, at registration, rather than on the connector

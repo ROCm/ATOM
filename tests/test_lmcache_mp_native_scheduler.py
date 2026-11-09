@@ -764,10 +764,24 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
     assert len(adapter.queries) == 1
 
 
+class _MissFromAdapter(Adapter):
+    """A server holding every prompt below token id `miss_from`, none above."""
+
+    def __init__(self, miss_from):
+        super().__init__()
+        self.miss_from = miss_from
+
+    def check_lookup_result(self, request_id):
+        tokens = self.queries[-1][1]
+        return 0 if tokens[0] >= self.miss_from else len(tokens)
+
+
 def test_engine_holds_back_a_restore_while_every_restore_slot_is_taken(monkeypatch):
     """A load dispatched past the worker's two restore slots would wait there
     with no worker clock running, while its deadline counts from dispatch."""
-    engine, connector, _adapter = engine_scheduler(monkeypatch)
+    engine, connector, _adapter = engine_scheduler(
+        monkeypatch, adapter=_MissFromAdapter(400)
+    )
     seqs = [
         Sequence(list(range(100 * i, 100 * i + 24)), 4, has_per_req_cache=True)
         for i in range(3)
@@ -792,7 +806,7 @@ def test_engine_holds_back_a_restore_while_every_restore_slot_is_taken(monkeypat
     impl = connector._require_impl()
     fourth = Sequence(list(range(400, 424)), 4, has_per_req_cache=True)
     assert connector.lookup_pending(fourth) is True
-    monkeypatch.setattr(impl._lookup_client, "hit_tokens", lambda _sid: 0)
+    assert impl._lookup_client.lookup(fourth.token_ids, str(fourth.id)) == 0
     assert connector.lookup_pending(fourth) is False
 
 

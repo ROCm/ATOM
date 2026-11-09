@@ -344,6 +344,9 @@ def _make_scheduler_adapter(
             salt = self.cache_salts.get(request_id)
             return replace(key, cache_salt=salt) if salt else key
 
+        def salt_session(self, request_id: str, salt: str) -> None:
+            self.cache_salts[request_id] = salt
+
         def end_session(self, request_id: str) -> None:
             self.cache_salts.pop(request_id, None)
             super().end_session(request_id)

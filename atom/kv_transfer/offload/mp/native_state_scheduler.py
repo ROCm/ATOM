@@ -25,6 +25,7 @@ from atom.kv_transfer.offload.mp.deployment import _validate_mp_config
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
     require_native_state_server,
+    restore_slot_count,
     stores_state_images,
 )
 from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
@@ -300,18 +301,18 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         """Also hold back a request that may restore an image while every
         restore slot of the worker is taken; only a known miss goes ahead.
 
-        The worker restores into `max(2, max_pending_saves)` slots, and only
-        between forwards. A load dispatched past them queues there with no
-        clock of the worker running, while its deadline here counts from
-        dispatch, so a few slow forwards (a cold restart) would stop the engine.
+        The worker restores into `restore_slot_count` slots, and only between
+        forwards. A load dispatched past them queues there with no clock of the
+        worker running, while its deadline here counts from dispatch, so a few
+        slow forwards (a cold restart) would stop the engine.
         """
         if super().lookup_pending(seq):
             return True
         # With images every native load restores one (a KV-only load comes
         # only with a replay, which stores no images).
-        if self._page_only or not getattr(seq, "has_per_req_cache", False):
+        if self._page_only or not seq.has_per_req_cache:
             return False
-        if len(self._native_loads) < max(2, self._max_pending_saves):
+        if len(self._native_loads) < restore_slot_count(self._max_pending_saves):
             return False
         return self._lookup_client.hit_tokens(str(seq.id)) != 0
 
