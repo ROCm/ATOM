@@ -711,17 +711,20 @@ def sparse_attn_v4_paged_2src(
         except RuntimeError:
             pass
     if get_gfx() == "gfx1250":
-        # gfx12 Triton fallback; allocates its own output (no `out=` kwarg).
-        return pa_prefill_sparse(
-            q,
-            unified_kv,
-            kv_indices_prefix,
-            kv_indptr_prefix,
-            kv,
-            kv_indices_extend,
-            kv_indptr_extend,
-            attn_sink,
-            softmax_scale,
+        return call_with_output(
+            pa_prefill_sparse,
+            (
+                q,
+                unified_kv,
+                kv_indices_prefix,
+                kv_indptr_prefix,
+                kv,
+                kv_indices_extend,
+                kv_indptr_extend,
+                attn_sink,
+                softmax_scale,
+            ),
+            out,
         )
     return _sparse_attn_v4_paged_2src_triton(
         q,

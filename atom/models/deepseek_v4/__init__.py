@@ -2532,9 +2532,9 @@ class DeepseekV4Attention(nn.Module):
 
         ``out``, when given, is the ``[num_tokens, n_local_heads, head_dim]``
         buffer the attention lands in -- a mixed batch's segment of the whole
-        batch's output (`_attn_mixed`). The prefill kernels write into it; a
-        path without an output argument (decode, the Triton fallbacks) copies
-        its result in.
+        batch's output (`_attn_mixed`). Backends with output-buffer support
+        write directly into it; legacy API and reference fallbacks copy
+        their result in.
 
         Every launch here is sized by the token count -- `csa_translate_pack`'s grid
         is `(T, ...)`, the paged kernels take `N = qo_indptr.numel()-1`, the FP8
