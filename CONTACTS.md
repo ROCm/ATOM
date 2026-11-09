@@ -22,13 +22,15 @@ This page tells contributors who to contact for a pull request to ATOM. Each are
 | Area | Paths | Contact | Backup(s) |
 |---|---|---|---|
 | Engine core (scheduler, model runner, KV block management) | `atom/model_engine/` | Honglie Yi ([@yhl-amd](https://github.com/yhl-amd)) | Yiting Wang ([@yitingw1](https://github.com/yitingw1)) |
+| API server / entrypoints | `atom/entrypoints/`, `atom/structured_output/` | Honglie Yi ([@yhl-amd](https://github.com/yhl-amd)) | Haonan Wang ([@HaonanWang98](https://github.com/HaonanWang98)) |
 | Context parallelism (DCP / PCP) | `atom/distributed/dcp*`, `atom/distributed/pcp*`, `atom/model_ops/dcp*` | Yiting Wang ([@yitingw1](https://github.com/yitingw1)) | Lirong Zhang ([@ZhangLirong-amd](https://github.com/ZhangLirong-amd)) |
 | Speculative decoding / MTP | `atom/spec_decode/`, `atom/models/*_mtp.py` | Lirong Zhang ([@ZhangLirong-amd](https://github.com/ZhangLirong-amd)) | Honglie Yi ([@yhl-amd](https://github.com/yhl-amd)) |
-| Attention backends | `atom/model_ops/attention*`, `atom/model_ops/*mla*` | Jiayun Yu ([@jiayyu](https://github.com/jiayyu)) | Haonan Wang ([@HaonanWang98](https://github.com/HaonanWang98)) |
-| MoE / expert parallelism (incl. WideEP) | `atom/model_ops/moe*`, `atom/model_ops/fused_moe*` | Jiaoliang Yu ([@JiaoliangYu](https://github.com/JiaoliangYu)) | Lirong Zhang ([@ZhangLirong-amd](https://github.com/ZhangLirong-amd)) |
+| Attention backends (incl. linear attention and indexer) | `atom/model_ops/attention*`, `atom/model_ops/*mla*`, `atom/model_ops/fla_ops/`, `atom/model_ops/indexer/` | Jiayun Yu ([@jiayyu](https://github.com/jiayyu)) | Haonan Wang ([@HaonanWang98](https://github.com/HaonanWang98)) |
+| MoE / expert parallelism (incl. WideEP and TBO) | `atom/model_ops/moe*`, `atom/model_ops/fused_moe*`, `atom/utils/tbo/` | Jiaoliang Yu ([@JiaoliangYu](https://github.com/JiaoliangYu)) | Lirong Zhang ([@ZhangLirong-amd](https://github.com/ZhangLirong-amd)) |
 | PD disaggregation / KV transfer / offload / mesh | `atom/kv_transfer/`, `atom/mesh/` | Lingpeng Jin ([@valarLip](https://github.com/valarLip)) | Honglie Yi ([@yhl-amd](https://github.com/yhl-amd)), Yajie Zhang ([@Jasen2201](https://github.com/Jasen2201)) |
 | Model enablement | `atom/models/`, `atom/model_loader/`, `atom/model_config/`, `atom/multimodal/` | Jiayun Yu ([@jiayyu](https://github.com/jiayyu)) | Haonan Wang ([@HaonanWang98](https://github.com/HaonanWang98)) |
-| API server / entrypoints | `atom/entrypoints/`, `atom/structured_output/` | Honglie Yi ([@yhl-amd](https://github.com/yhl-amd)) | Lingpeng Jin ([@valarLip](https://github.com/valarLip)) |
+| Model-specific ops | `atom/model_ops/deepseek_v41/`, `atom/model_ops/v4_kernels/`, `atom/model_ops/kimi_k3/`, `atom/model_ops/minimax_m3/`, `atom/model_ops/glm5_next/`, `atom/model_ops/qwen4_exp/`, `atom/model_ops/engram/` | Lingpeng Jin ([@valarLip](https://github.com/valarLip)) | Lirong Zhang ([@ZhangLirong-amd](https://github.com/ZhangLirong-amd)) |
+| Monokernel | `atom/mono/` | Lingpeng Jin ([@valarLip](https://github.com/valarLip)) | Honglie Yi ([@yhl-amd](https://github.com/yhl-amd)) |
 | vLLM / SGLang plugins | `atom/plugin/` | Hattie Wu ([@wuhuikx](https://github.com/wuhuikx)) | Lingpeng Jin ([@valarLip](https://github.com/valarLip)) |
 | CI, Docker and recipes | `.github/`, `docker/`, `recipes/` | Xin Huang ([@gyohuangxin](https://github.com/gyohuangxin)) | Zufa Yu ([@zufayu](https://github.com/zufayu)) |
 | Overall coordination, and anything not listed above | — | Lingpeng Jin ([@valarLip](https://github.com/valarLip)) | Zufa Yu ([@zufayu](https://github.com/zufayu)) |
