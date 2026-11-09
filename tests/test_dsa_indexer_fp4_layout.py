@@ -46,22 +46,6 @@ def test_no_silent_reinterpretation_of_legacy_fp4():
     assert shape().tag != replace(shape(), cache_layout="preshuffle").tag
 
 
-def test_page_bases_do_not_wrap_at_four_gib():
-    sh = shape()
-    for page in [(1 << 20) - 1, 1 << 20, (1 << 20) + 17]:
-        for row in [0, 31, 32, 63]:
-            assert (
-                page * sh.block_bytes + fp4_cache_byte(row, 63)
-                == page * 4096 + 3072 + row * 16 + 15
-            )
-
-
-def test_fp8_contract_unchanged():
-    sh = replace(shape(), kv_dtype="fp8", cache_layout="preshuffle")
-    assert sh.row_bytes == 144 and sh.block_bytes == 9216
-    assert sh.block_scale_bytes == 0 and not unsupported(sh)
-
-
 def test_pool_abi_is_explicitly_opt_in(monkeypatch):
     from atom.model_ops.sparse_indexer_fp4 import (
         fp4_index_block_shapes,

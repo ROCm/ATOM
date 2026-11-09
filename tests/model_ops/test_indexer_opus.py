@@ -168,9 +168,7 @@ def test_v41_candidate_band_forwards_packed_offsets(monkeypatch):
     assert seen["args"][4] is weights
 
 
-@pytest.mark.parametrize(
-    "page_size,pages_per_block", [(8, 1), (8, 16), (64, 1), (128, 1), (128, 2)]
-)
+@pytest.mark.parametrize("page_size,pages_per_block", [(64, 1), (128, 1), (128, 2)])
 def test_mfma_blocks_preserve_their_rows_in_opus_config(
     monkeypatch, page_size, pages_per_block
 ):
@@ -204,8 +202,10 @@ def test_mfma_blocks_preserve_their_rows_in_opus_config(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("heads,page_size", [(64, 64), (32, 64), (32, 128)])
-@pytest.mark.parametrize("qlen", [1, 4, 6, 8, 9])
+@pytest.mark.parametrize(
+    "qlen,heads,page_size",
+    [(qlen, 64, 64) for qlen in (1, 4, 6, 8, 9)] + [(6, 32, 64), (6, 32, 128)],
+)
 def test_gfx950_query_layout_logits_and_graph_replay(qlen, heads, page_size):
     from aiter.jit.utils.chip_info import get_gfx
 

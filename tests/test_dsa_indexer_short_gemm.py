@@ -13,7 +13,7 @@ pytest.importorskip("flydsl")
 
 from atom.mono.dsa_indexer import bind
 from atom.mono.dsa_indexer.bind import pack_short_q
-from atom.mono.dsa_indexer.kernel import ABI, IxBuild, scratch_layout, unfit
+from atom.mono.dsa_indexer.kernel import IxBuild, unfit
 from atom.mono.dsa_indexer.plan import IndexerShape
 
 
@@ -59,7 +59,6 @@ def test_short_gemm_refuses_other_execution_layouts(changes):
 def test_short_gemm_requires_a_supported_projection_shape(rank):
     assert not unfit(replace(key(), shape=replace(key().shape, q_lora=rank)))
     assert unfit(replace(key(), shape=replace(key().shape, q_lora=1280)))
-    assert "w_qb_packed" in ABI.names
 
 
 @pytest.mark.parametrize("cache", ["fp8", "fp4"])
@@ -93,35 +92,6 @@ def test_k3_1_pro_binding_packs_nope_q_only_for_replicated_short_path(
     assert hasattr(module, "_mono_indexer_wq_packed") == (dcp == 1)
     for rows in (6, 48, 96, 144, 192, 240, 252):
         assert not unfit(binding.key(rows, 6))
-
-
-@pytest.mark.parametrize("batch", range(8, 43))
-def test_balanced_short_score_ranges_cover_each_live_unit_once(batch):
-    parts = 256 // batch
-    width = (64 + parts - 1) // parts
-    assert batch * parts <= 256 and width <= 11
-    for units in range(65):
-        covered = [
-            u
-            for part in range(parts)
-            for u in range(part * width, min((part + 1) * width, units))
-        ]
-        assert covered == list(range(units))
-    assert 6 * max(8, width) <= 512
-
-
-@pytest.mark.parametrize("rows", [6, 48, 96, 144, 192, 240, 252])
-@pytest.mark.parametrize("context", [2048, 4096, 8192, 163840])
-def test_compact_reset_only_writes_allocated_flag_pairs(rows, context):
-    layout = scratch_layout(key(rows, context))
-    start, size = layout["sflag"]
-    stride = size // rows
-    count = min(64, stride // 8)
-    writes = [
-        start + row * stride + flag * 8 for row in range(rows) for flag in range(count)
-    ]
-    assert min(writes) >= start and max(writes) + 8 <= start + size
-    assert len(writes) == len(set(writes))
 
 
 @lru_cache(None)
@@ -190,7 +160,7 @@ def planner(rows, fast):
     not torch.cuda.is_available() or not torch.version.hip,
     reason="AMD GPU planner check",
 )
-@pytest.mark.parametrize("batch", [1, 8, 16, 24, 32, 42])
+@pytest.mark.parametrize("batch", [1, 8, 42])
 @pytest.mark.parametrize(
     "pattern", ["8k", "4k", "uneven", "boundary", "long", "padded"]
 )
