@@ -59,14 +59,18 @@ from atom.observability.tracing import TraceMiddleware, set_request_id
 from atom.observability.tracing import initialize as initialize_tracing
 from atom.observability.tracing import shutdown as shutdown_tracing
 from atom.sampling_params import RequiredChannel
+from atom.structured_output import is_structured
 from atom.structured_output.validation import (
     configure_request,
     configure_tool_call_grammar,
+    declared_tool_names,
     schema_from_format,
+    strict_tool_schemas,
     structured_response_channel,
     validate_chat_stream,
     validate_output,
     validate_responses_output,
+    validate_tool_calls,
 )
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
@@ -859,7 +863,7 @@ def _send_stream_chunk_tagged(
 
 
 async def _submit_engine_requests(seqs):
-    if not any(getattr(seq, "json_schema", None) is not None for seq in seqs):
+    if not any(is_structured(seq) for seq in seqs):
         engine.core_mgr.add_request(seqs)
         return
     # Admission RPCs must not block the API event loop. If the client cancels,
@@ -1980,26 +1984,35 @@ async def _configure_structured_output(
     *,
     tools=None,
     tool_choice=None,
+    strict_schemas=None,
     kv_transfer=None,
     multimodal=False,
 ):
-    if schema is None:
+    if schema is None and not strict_schemas:
         return
-    await configure_request(
-        engine,
-        tokenizer,
-        _get_engine_config(),
-        sampling_params,
-        schema,
-        channel,
-        parser_cls=tool_call_parser_cls,
-        tools=tools,
-        tool_choice=tool_choice,
-        kv_transfer=kv_transfer,
-        multimodal=multimodal,
-        relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
-        synthetic=synthetic_token_text is not None,
-    )
+    try:
+        await configure_request(
+            engine,
+            tokenizer,
+            _get_engine_config(),
+            sampling_params,
+            schema,
+            channel,
+            parser_cls=tool_call_parser_cls,
+            tools=tools,
+            tool_choice=tool_choice,
+            kv_transfer=kv_transfer,
+            multimodal=multimodal,
+            relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+            synthetic=synthetic_token_text is not None,
+            strict_schemas=strict_schemas,
+        )
+    except ValueError as exc:
+        if schema is not None:
+            raise
+        # Only strict tools asked for the grammar, and the refusals are
+        # worded for JSON Schema output: name what the client did ask for.
+        raise ValueError(f"strict function tools: {exc}") from exc
 
 
 @app.post("/v1/chat/completions")
@@ -2094,11 +2107,23 @@ async def _chat_completions(
                 app.state.logprob_codec = logprob_codec
 
         schema = schema_from_format(request.response_format)
-        if assistant_prefix is not None and schema is not None:
+        # Strict function tools are a beta feature; /v1 keeps ignoring `strict`.
+        strict_schemas = {}
+        if beta and request.tool_choice != "none":
+            tools = request.tools or ()
+            if any(tool["function"].get("strict") is True for tool in tools):
+                # Off the event loop: a new tool's meta-schema check takes
+                # milliseconds.
+                strict_schemas = await asyncio.to_thread(strict_tool_schemas, tools)
+            else:
+                # Nothing to check but how `strict` is spelled.
+                strict_schemas = strict_tool_schemas(tools)
+        if assistant_prefix is not None and (schema is not None or strict_schemas):
             # The grammar constrains the reply from its first token, and a
             # prefix has already written part of it.
             raise ValueError(
-                "an assistant prefix cannot be combined with structured output"
+                "an assistant prefix cannot be combined with structured output "
+                "or strict tools"
             )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -2174,10 +2199,11 @@ async def _chat_completions(
             _reasoning,
             tools=request.tools,
             tool_choice=request.tool_choice,
+            strict_schemas=strict_schemas,
             kv_transfer=request.kv_transfer_params,
             multimodal=_has_multimodal_content(messages),
         )
-        if schema is None and tool_call_parser_cls is not None:
+        if schema is None and not strict_schemas and tool_call_parser_cls is not None:
             await configure_tool_call_grammar(
                 engine,
                 _get_engine_config(),
@@ -2192,7 +2218,9 @@ async def _chat_completions(
                 synthetic=synthetic_token_text is not None,
             )
 
-        _reasoning = structured_response_channel(_reasoning, schema)
+        _reasoning = structured_response_channel(
+            _reasoning, schema, bool(strict_schemas)
+        )
 
         # Streaming
         if request.stream:
@@ -2234,10 +2262,12 @@ async def _chat_completions(
                 usage_on_finish=compatibility.usage_on_finish,
                 include_usage=bool((request.stream_options or {}).get("include_usage")),
             )
-            if sampling_params.json_schema is not None:
+            if sampling_params.json_schema is not None or strict_schemas:
                 # Also a tool-call grammar: its decode error ends the stream
                 # with an error event, not a truncated success.
-                gen = validate_chat_stream(gen, schema)
+                gen = validate_chat_stream(
+                    gen, schema, strict_schemas, declared_tool_names(request.tools)
+                )
             return StreamingResponse(
                 _client_stream(gen, request_id),
                 media_type="text/event-stream",
@@ -2351,7 +2381,7 @@ async def _chat_completions(
                 logprob_codec=logprob_codec,
                 top_logprobs=sampling_params.top_logprobs,
             )
-        if schema is not None:
+        if schema is not None or strict_schemas:
 
             for choice in resp.choices:
                 validate_output(
@@ -2359,6 +2389,12 @@ async def _chat_completions(
                     choice["message"].get("content") or "",
                     choice.get("finish_reason"),
                     tool_calls=bool(choice["message"].get("tool_calls")),
+                )
+                validate_tool_calls(
+                    strict_schemas,
+                    choice["message"].get("tool_calls"),
+                    choice.get("finish_reason"),
+                    declared_tool_names(request.tools),
                 )
         _log_request_model("response", request_id, resp)
         # Bypass FastAPI's recursive conversion of the token ID list.
