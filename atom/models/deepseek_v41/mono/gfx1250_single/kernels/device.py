@@ -301,12 +301,46 @@ def unlikely(b):
 # kernel goes on with whatever it read; a timeout therefore means wrong results. TOFLAG[0] (set by the step kernel to its
 # 'cyc' scratch) counts them: int32 [0] += 1, int32 [1] = the last site id. The runner reads it after a step.
 TOFLAG = [None]
+POLL_TICKS = 200000000   # a bounded poll gives up after this many clock ticks (~2 s) and records a timeout
 from flydsl.compiler.ast_rewriter import ASTRewriter as _ASTR
 
 
 @_ASTR.transform
 def note_timeout(t0, site):
     if fx.const_expr(TOFLAG[0] is not None):
-        if clock() - t0 >= fx.Int64(200000000):
+        if clock() - t0 >= fx.Int64(POLL_TICKS):
             atomic_add(TOFLAG[0], 1)
             gstore(TOFLAG[0] + fx.Int64(4), fx.Int32(site))
+
+
+
+@_ASTR.transform
+def wait_count(addr, n, site):
+    """Spin until the agent-scope int32 counter at addr reaches n (bounded: POLL_TICKS, a timeout counted at site).
+    addr: an address, or a function giving it (evaluated in the loop, as the polls were written before this helper)."""
+    t0 = clock()
+    while (gload(addr() if callable(addr) else addr, fx.Int32, scope="agent") < n) & (clock() - t0 < fx.Int64(POLL_TICKS)):
+        s_sleep(1)
+    note_timeout(t0, site)
+
+
+@_ASTR.transform
+def handoff(cnt, t, hdev, n=256, site=None):
+    """Device-wide handoff of n CTAs on counter cnt (thread t). hdev: the stages' exchange stores are device-scope ->
+    every wave waits its stores, no fences; else release / acquire fences around the count."""
+    from flydsl.expr import gpu
+    if fx.const_expr(hdev):
+        wait_storecnt0()
+        gpu.barrier()
+        if t == 0:
+            atomic_add(cnt, 1)
+            wait_count(cnt, n, 4 if site is None else site)
+        gpu.barrier()
+    else:
+        gpu.barrier()
+        if t == 0:
+            fence_release("agent")
+            atomic_add(cnt, 1)
+            wait_count(cnt, n, 5 if site is None else site)
+            fence_acquire("agent")
+        gpu.barrier()

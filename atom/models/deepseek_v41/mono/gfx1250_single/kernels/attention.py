@@ -162,30 +162,7 @@ def cluster_sync():
     hx.fence_acquire("cluster")
 
 
-@ASTRewriter.transform
-def handoff(cnt, t, hdev):
-    """Device-wide handoff. hdev: exchange stores are device-scope -> every wave waits its stores, no fences."""
-    if fx.const_expr(hdev):
-        hx.wait_storecnt0()
-        gpu.barrier()
-        if t == 0:
-            hx.atomic_add(cnt, 1)
-            t0 = hx.clock()
-            while (hx.gload(cnt, I32, scope="agent") < CTAS) & (hx.clock() - t0 < fx.Int64(200000000)):
-                hx.s_sleep(1)
-            hx.note_timeout(t0, 4)
-        gpu.barrier()
-    else:
-        gpu.barrier()
-        if t == 0:
-            hx.fence_release("agent")
-            hx.atomic_add(cnt, 1)
-            t0 = hx.clock()
-            while (hx.gload(cnt, I32, scope="agent") < CTAS) & (hx.clock() - t0 < fx.Int64(200000000)):
-                hx.s_sleep(1)
-            hx.note_timeout(t0, 5)
-            hx.fence_acquire("agent")
-        gpu.barrier()
+handoff = hx.handoff   # (device.handoff: every stage module imports it from here)
 
 
 def pf_rows(base, stride, rows, nbytes, t):
@@ -699,7 +676,7 @@ def tp_allreduce(c, region, tag):
         gps = [c["recv"][rank] + (i64((region * 4) * TP_TG) + i64(o * TP_TG) + i64(b * TPG + t)) * 16 for o in range(4) if o != rank]
         t0 = hx.clock()
         while ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag)
-               | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)) & (hx.clock() - t0 < fx.Int64(200000000)):
+               | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
             hx.s_sleep(0)
         hx.note_timeout(t0, 6)
         gots = [hx.gload(gp, I32, 4, nt=True) for gp in gps]

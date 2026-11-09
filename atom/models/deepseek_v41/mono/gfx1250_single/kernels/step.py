@@ -125,6 +125,23 @@ def cwith(c, **kw):
     return c.with_(**kw) if isinstance(c, LazyC) else dict(c, **kw)
 
 
+def entry_front(fp, sm, b, row):
+    """A segment entry's attention front (front CTAs): the block state (dR / dy / dpre / dpost / dcomb) through the
+    attention front of layer-table row `row` (its a* weights) -> axn / x8 / xs / the gates; R kept in LDS (first)."""
+    nof = fx.Int32(0) != fx.Int32(0)
+    tq = hx.opaque_v(fx.thread_idx.x)
+    cu = dict(t=tq, b=b, w=tq // 32, l=tq % 32, sm=sm + FRONT_LDS_OFF, rms_eps=1e-20, hc_eps=1e-6, norm_eps=1e-20,
+              R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"), comb=fptr(fp, "dcomb"),
+              fnh=ltab(fp, row, "afnh")(), fnl=ltab(fp, row, "afnl")(), hsc=ltab(fp, row, "ahsc")(),
+              hbs=ltab(fp, row, "ahbs")(), nw=ltab(fp, row, "anw")(), gate=ltab(fp, row, "gate")(),
+              gbias=ltab(fp, row, "gbias")(), Rout=fptr(fp, "aRout"), xn=fptr(fp, "axn"), x8=fptr(fp, "x8"),
+              xs=fptr(fp, "xs"), part=fptr(fp, "part"), plog=fptr(fp, "plog"), cand=fptr(fp, "cand"),
+              cands=fptr(fp, "cands"), npre=fptr(fp, "anpre"), npost=fptr(fp, "anpost"), ncomb=fptr(fp, "ancomb"),
+              ids=fptr(fp, "ids"), wts=fptr(fp, "wts"), isffn=nof, xs32=fx.Int32(1) != fx.Int32(0), merge=nof,
+              rk=sm + RKOFF, first=fx.Int32(1) != fx.Int32(0), last=nof)
+    FS.front_any(cu, lambda k: None)
+
+
 @ASTRewriter.transform
 def gpub(base, b, t):
     """A TP CTA's y (device-scope stores) is out: count it in its column group b // 16 (16 CTAs a group)."""
@@ -138,10 +155,7 @@ def gpub(base, b, t):
 def gwait(base, b, t):
     """A front CTA (g, p = b % 16): wait for the 16 TP CTAs of its column group."""
     if t == 0:
-        t0 = hx.clock()
-        while (hx.gload(base + i64(b % 16) * 4, fx.Int32, scope="agent") < 16) & (hx.clock() - t0 < fx.Int64(200000000)):
-            hx.s_sleep(1)
-        hx.note_timeout(t0, 7)
+        hx.wait_count(lambda: base + i64(b % 16) * 4, 16, 7)
     gpu.barrier()
 
 
@@ -216,19 +230,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                                           comb=fptr(fp, "dcomb")), TR, 1)
                 handoff(TCNT + i64(LY.TARGET_STATE), t, False)
                 if b < FS.FRONT_CTAS:
-                    nof = fx.Int32(0) != fx.Int32(0)
-                    tq = hx.opaque_v(fx.thread_idx.x)
-                    EL = TENTRY_ROW
-                    cu = dict(t=tq, b=b, w=tq // 32, l=tq % 32, sm=sm + FRONT_LDS_OFF, rms_eps=1e-20, hc_eps=1e-6, norm_eps=1e-20,
-                              R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"), comb=fptr(fp, "dcomb"),
-                              fnh=ltab(fp, EL, "afnh")(), fnl=ltab(fp, EL, "afnl")(), hsc=ltab(fp, EL, "ahsc")(),
-                              hbs=ltab(fp, EL, "ahbs")(), nw=ltab(fp, EL, "anw")(), gate=ltab(fp, EL, "gate")(),
-                              gbias=ltab(fp, EL, "gbias")(), Rout=fptr(fp, "aRout"), xn=fptr(fp, "axn"), x8=fptr(fp, "x8"),
-                              xs=fptr(fp, "xs"), part=fptr(fp, "part"), plog=fptr(fp, "plog"), cand=fptr(fp, "cand"),
-                              cands=fptr(fp, "cands"), npre=fptr(fp, "anpre"), npost=fptr(fp, "anpost"), ncomb=fptr(fp, "ancomb"),
-                              ids=fptr(fp, "ids"), wts=fptr(fp, "wts"), isffn=nof, xs32=fx.Int32(1) != fx.Int32(0), merge=nof,
-                              rk=sm + RKOFF, first=fx.Int32(1) != fx.Int32(0), last=nof)
-                    FS.front_any(cu, lambda k: None)
+                    entry_front(fp, sm, b, TENTRY_ROW)
                 handoff(TCNT + i64(LY.TARGET_FRONT), t, False)
             TRx = TRD if DRS else TR
             Lx = LD if DRS else L
@@ -257,18 +259,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                 if b < FS.FRONT_CTAS:
                     _rt = (FS.NE, FS.TOPK)
                     FS.set_router(DRAFT_NE, DRAFT_TOPK)
-                    nof = fx.Int32(0) != fx.Int32(0)
-                    tq = hx.opaque_v(fx.thread_idx.x)
-                    cu = dict(t=tq, b=b, w=tq // 32, l=tq % 32, sm=sm + FRONT_LDS_OFF, rms_eps=1e-20, hc_eps=1e-6, norm_eps=1e-20,
-                              R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"), comb=fptr(fp, "dcomb"),
-                              fnh=ltab(fp, NL + NDR, "afnh")(), fnl=ltab(fp, NL + NDR, "afnl")(), hsc=ltab(fp, NL + NDR, "ahsc")(),
-                              hbs=ltab(fp, NL + NDR, "ahbs")(), nw=ltab(fp, NL + NDR, "anw")(), gate=ltab(fp, NL + NDR, "gate")(),
-                              gbias=ltab(fp, NL + NDR, "gbias")(), Rout=fptr(fp, "aRout"), xn=fptr(fp, "axn"), x8=fptr(fp, "x8"),
-                              xs=fptr(fp, "xs"), part=fptr(fp, "part"), plog=fptr(fp, "plog"), cand=fptr(fp, "cand"),
-                              cands=fptr(fp, "cands"), npre=fptr(fp, "anpre"), npost=fptr(fp, "anpost"), ncomb=fptr(fp, "ancomb"),
-                              ids=fptr(fp, "ids"), wts=fptr(fp, "wts"), isffn=nof, xs32=fx.Int32(1) != fx.Int32(0), merge=nof,
-                              rk=sm + RKOFF, first=fx.Int32(1) != fx.Int32(0), last=nof)
-                    FS.front_any(cu, lambda k: None)
+                    entry_front(fp, sm, b, NL + NDR)
                     FS.set_router(*_rt)
                 handoff(TCNT + i64(LY.DRAFT_FRONT), t, False)
                 _shape = (FS.NE, FS.TOPK, MS.TOPK)
@@ -436,10 +427,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                         if (hf == 0) & (b >= FS.FRONT_CTAS) & (b < FS.FRONT_CTAS + ((TRx + MS.MAXTOK - 1) // MS.MAXTOK) * MS.NUG * MS.SHE_CTAS):
                             tq3 = hx.opaque_v(fx.thread_idx.x)
                             if tq3 == 0:
-                                t0 = hx.clock()
-                                while (hx.gload(lc + i64(LY.X8_PUB), fx.Int32, scope="agent") < FS.FRONT_CTAS) & (hx.clock() - t0 < fx.Int64(200000000)):
-                                    hx.s_sleep(1)
-                                hx.note_timeout(t0, 6)
+                                hx.wait_count(lambda: lc + i64(LY.X8_PUB), FS.FRONT_CTAS, 6)
                             gpu.barrier()
                             ce = dict(t=tq3, b=b, w=tq3 // 32, l=tq3 % 32, sm=sm + FRONT_LDS_OFF, NP=TRx * MS.TOPK,
                                       x8=fptr(fp, "fx8"), xs=fptr(fp, "fxs"), shplane=ltab(fp, Ly, "shplane")(),

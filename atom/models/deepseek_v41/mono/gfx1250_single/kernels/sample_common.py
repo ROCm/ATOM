@@ -92,18 +92,9 @@ def latomic_max64(off, val):
                      syncscope="workgroup", alignment=8)
 
 
-@ASTRewriter.transform
 def handoff(cnt, t, nct, site=2):
-    gpu.barrier()
-    if t == 0:
-        hx.fence_release("agent")
-        hx.atomic_add(cnt, 1)
-        t0 = hx.clock()
-        while (hx.gload(cnt, I32, scope="agent") < nct) & (hx.clock() - t0 < fx.Int64(200000000)):
-            hx.s_sleep(1)
-        hx.note_timeout(t0, site)
-        hx.fence_acquire("agent")
-    gpu.barrier()
+    """A fenced device handoff of nct CTAs (device.handoff)."""
+    hx.handoff(cnt, t, False, nct, site)
 
 
 @ASTRewriter.transform
@@ -159,7 +150,7 @@ def zload(base, c0, CH, V, t, k, invT):
 @ASTRewriter.transform
 def poll_unit(addr, tag, site=3):
     t0 = hx.clock()
-    while (hx.gload(addr + i64(12), I32, nt=True) != tag) & (hx.clock() - t0 < fx.Int64(200000000)):
+    while (hx.gload(addr + i64(12), I32, nt=True) != tag) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
         hx.s_sleep(0)
     hx.note_timeout(t0, site)
     return hx.gload(addr, I32, 4, nt=True)

@@ -464,10 +464,7 @@ def moe_ug(c):
             gpu.barrier()
             if t == 0:
                 hx.atomic_add(c["shcnt"], 1)
-                t0 = hx.clock()
-                while (hx.gload(c["shcnt"], I32, scope="agent") < NDC) & (hx.clock() - t0 < fx.Int64(200000000)):
-                    hx.s_sleep(1)
-                hx.note_timeout(t0, 7)
+                hx.wait_count(c["shcnt"], NDC, 7)
             gpu.barrier()
             cd = {k: c[k] for k in c if k != "shcnt"}   # a plain dict (LazyC entries evaluated here)
             cd.update(dn8_bi=b - CR, dn8_nct=NDC)
