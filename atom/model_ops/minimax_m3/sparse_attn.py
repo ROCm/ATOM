@@ -99,11 +99,11 @@ class MiniMaxM3SparseMetadata:
     indexer. `index_topk` consumes it and never derives its own.
     """
     index_score: IndexScoreStep | None = None
-    """The MXFP4 decode index scorer's step state (index_mxfp4): its work map, the
+    """The MXFP4 decode index scorer's step state (index_mxfp4): its work map and the
     block bound it was built against (`ceil(max_model_len / 128)`, which must not move
-    between graph replays) and the score storage view, all built once a step. None
-    on prefill, on an empty batch and wherever the index cache is not MXFP4; the
-    scorer then builds its own, correctly but per layer.
+    between graph replays), built once a step. None on prefill, on an empty batch and
+    wherever the index cache is not MXFP4; the scorer then builds its own map, correctly
+    but per layer.
     """
 
 
@@ -165,14 +165,14 @@ def make_sparse_decode_metadata(
     index_score_eager: bool = False,
 ) -> MiniMaxM3SparseMetadata:
     """``index_score_buffers`` is the persistent storage of an MXFP4 index cache's
-    scorer (the builder allocates it only then): given, the step's work map and score
-    view are built into it here, once. ``index_score_eager``: the step is not
-    replayed from a graph, so they are built at the batch's own block count (see
+    scorer's work map (the builder allocates it only then): given, the step's map is
+    built into it here, once. ``index_score_eager``: the step is not replayed from a
+    graph, so it is built at the batch's own block count (see
     `IndexScoreBuffers.begin_step`).
     ``seq_lens`` and ``block_table`` must be the requests whose rows the scorer,
     selector and attention run (`decode_rows_batch`; pad requests of a padded step:
-    length 0): the map's encoding and grid, the score view's strides and the head
-    offsets of ``n_valid_column_per_row`` all follow that batch."""
+    length 0): the map's encoding and grid and the head offsets of ``n_valid_column_per_row`` all follow that batch.
+    """
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )

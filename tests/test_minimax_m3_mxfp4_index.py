@@ -112,7 +112,7 @@ def test_decode_selection_and_block_table(batch, S, ppb, fp8_q):
         q, cache, table, seq, int(seq.max()), TOPK, 0, 1, HEADS, SM_SCALE,
         emit_sparse_block_table=True, max_query_len=S, block_page_stride=ppb,
         index_mxfp4=True, pages_per_block=ppb,
-        index_score=IndexScoreStep(wmap, max_block, None),
+        index_score=IndexScoreStep(wmap, max_block),
     )  # fmt: skip
     _, picks, ctx = reference(cache, table, seq, q, S)
     assert sbt.shape == (batch * S, TOPK * ppb) and sctx.shape == (batch * S,)
@@ -160,77 +160,6 @@ def test_prefill_selection_matches_the_decode_definition():
             assert all(row[b].item() <= cut + tol for b in set(range(last)) - got)
         else:
             assert got == picks[r]
-
-
-def _score_steps(batch, S, seed):
-    """Three decode steps over one cache: long lengths; the same requests permuted
-    onto other rows and shortened (so a row's pages shrink); a smaller batch."""
-    cache, table, seq, q = make_case(batch, S, seed=seed)
-    g = torch.Generator(device="cuda").manual_seed(seed + 1)
-    perm = torch.randperm(batch, device="cuda", generator=g)
-    short = (seq[perm] // 3).clamp(min=S + 1).to(torch.int32)
-    qs = q.view(batch, S, HEADS, DIM)[perm].reshape(batch * S, HEADS, DIM)
-    n = max(2, batch - 2)
-    seq3 = torch.randint(S + 1, int(seq.max()), (n,), device="cuda", generator=g)
-    return cache, [
-        (table, seq, q),
-        (table[perm], short, qs),
-        (table[:n], seq3.to(torch.int32), q[: n * S]),
-    ]
-
-
-def test_a_persistent_score_buffer_changes_nothing():
-    """The scorer leaves a page no row reaches unstored, so the buffer holds -inf there
-    only if refilled: one refill a step must give the very scores (and selection)
-    a fresh -inf buffer per call does, across permuted, shorter and smaller steps."""
-    from aiter.ops.flydsl import minimax_m3_index_score_fp4_flydsl
-
-    from atom.model_ops.minimax_m3.index_mxfp4 import (
-        IndexScoreStep,
-        fresh_index_score,
-    )
-    from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
-
-    batch, S = 6, 8
-    cache, steps = _score_steps(batch, S, seed=21)
-    max_block = steps[0][0].shape[1]
-    wbuf = work_map_buf(max_block, S)
-    sbuf = torch.empty(HEADS * 32 * S * max_block, dtype=torch.float32, device="cuda")
-    k_data, k_scale = page_views(cache)
-
-    def run(table, seq, q, out):
-        wmap = work_map(seq, max_block, S, wbuf)
-        score = minimax_m3_index_score_fp4_flydsl(
-            q, k_data, k_scale, table, seq, S, HEADS, SM_SCALE, max_block,
-            out=out, work_map=wmap,
-        )  # fmt: skip
-        sel = minimax_m3_index_topk_decode(
-            q, cache, table, seq, max_block * 128, TOPK, 0, 1, HEADS, SM_SCALE,
-            emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
-            index_mxfp4=True, pages_per_block=1,
-            index_score=IndexScoreStep(wmap, max_block, out),
-        )  # fmt: skip
-        return score.clone(), sel
-
-    for i, (table, seq, q) in enumerate(steps):
-        rows = table.shape[0] * S
-        if (
-            i == 1
-        ):  # control: without the refill, the shorter step reads step 0's scores
-            stale = run(
-                table,
-                seq,
-                q,
-                sbuf[: HEADS * rows * max_block].view(HEADS, rows, max_block),
-            )[0]
-            fresh = run(table, seq, q, None)[0]
-            assert not torch.equal(stale, fresh), "the control must see stale scores"  # fmt: skip
-        out = fresh_index_score(sbuf, rows, HEADS, max_block, S)
-        got_score, got_sel = run(table, seq, q, out)
-        want_score, want_sel = run(table, seq, q, None)
-        assert torch.equal(got_score, want_score), f"step {i} scores"
-        for g, w in zip(got_sel, want_sel):
-            assert torch.equal(g, w), f"step {i} selection"
 
 
 def _pad(table, seq, q, S, running, fill):

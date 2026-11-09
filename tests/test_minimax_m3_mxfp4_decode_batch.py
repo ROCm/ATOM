@@ -5,7 +5,7 @@ MXFP4 index cache, and that scorer's per-ubatch buffers (CPU).
 The MXFP4 scorer takes its batch off the rows of ``idx_q``, so the lengths and
 block-table rows it is handed must be that many, on a padded step (a graph bucket,
 or an eager step padded for DP) and a ragged one alike; and under decode TBO each
-ubatch needs a map and a score storage of its own. The row rule
+ubatch needs a work map of its own. The row rule
 (`decode_rows_batch`) is pure and runs everywhere. The
 builder tests drive `AiterAttentionMetadataBuilder` with its collaborators stubbed
 and need ``aiter`` importable (CI's no-aiter job skips them); the scorer itself is
@@ -49,52 +49,12 @@ def builder(mod, mxfp4=True, tbo_decode=True, forward_vars=None):
     return b
 
 
-def _check_score_view(heads, S, transpose_min_f, neg_inf):
-    from atom.model_ops.minimax_m3.index_mxfp4 import fresh_index_score
-
-    batch, max_block, fill = 3, 6, 4
-    rows = batch * S
-    buf = torch.empty(heads * 8 * 8 * max_block, dtype=torch.float32).fill_(7.0)
-    out = fresh_index_score(buf, rows, heads, max_block, S, fill_blocks=fill)
-    assert out.shape == (heads, rows, max_block)
-    assert out.data_ptr() == buf.data_ptr()  # the persistent storage, no copy
-    if S * heads >= transpose_min_f:  # feature-contiguous, as the scorer allocates
-        assert out.stride() == (1, heads, rows * heads)
-    else:
-        assert out.stride() == (rows * max_block, max_block, 1)
-    assert (out[..., :fill] == neg_inf).all() and (out[..., fill:] == 7.0).all()
-    return out
-
-
 def _stand_in_scorer_module(monkeypatch):
-    """A stand-in for aiter's scorer constants (threshold 16): local logic only."""
+    """A stand-in for aiter's flydsl package: local logic only."""
     parents = ("aiter", "aiter.ops", "aiter.ops.flydsl", "aiter.ops.flydsl.kernels")
     name = "aiter.ops.flydsl.kernels.minimax_m3_index_score"
     for mod_name in (*parents, name):
         monkeypatch.setitem(sys.modules, mod_name, types.ModuleType(mod_name))
-    sys.modules[name].NEG_INF = float("-inf")
-    sys.modules[name].TRANSPOSE_MIN_F = 16
-
-
-@pytest.mark.parametrize("S,heads", [(1, 1), (8, 4)])  # S * heads each side of 16
-def test_the_score_view_follows_its_step_width_layout_at_a_stand_in_threshold(
-    monkeypatch, S, heads
-):
-    """Local logic only (the threshold is a stand-in); the next-but-one test holds
-    it to aiter's own."""
-    _stand_in_scorer_module(monkeypatch)
-    _check_score_view(heads, S, 16, float("-inf"))
-
-
-def test_a_fill_of_zero_blocks_fills_nothing_and_none_fills_every_column(monkeypatch):
-    from atom.model_ops.minimax_m3.index_mxfp4 import fresh_index_score
-
-    _stand_in_scorer_module(monkeypatch)
-    buf = torch.full((2 * 4 * 6,), 7.0)
-    out = fresh_index_score(buf, 4, 2, 6, 1, fill_blocks=0)
-    assert (out == 7.0).all()
-    out = fresh_index_score(buf, 4, 2, 6, 1)
-    assert (out == float("-inf")).all()
 
 
 def test_an_eager_step_scores_at_its_own_block_count_a_graph_step_at_the_models(
@@ -117,29 +77,6 @@ def test_an_eager_step_scores_at_its_own_block_count_a_graph_step_at_the_models(
     huge = buffers.begin_step(seq, 2, 10**9, eager=True)  # never past the model's
     assert [graph.max_block, eager.max_block, huge.max_block] == [64, 8, 64]
     assert built == [64, 8, 64]
-    for step in (graph, eager, huge):  # the view is as wide as the map's bound
-        assert step.out.shape == (1, 6, step.max_block)
-    # one persistent storage under every view
-    assert graph.out.data_ptr() == eager.out.data_ptr() == buffers.scores.data_ptr()
-
-
-@pytest.mark.parametrize("S", [1, 3, 4, 8])
-@pytest.mark.parametrize("heads", [1, 2, 4])
-def test_the_score_view_has_the_strides_aiters_own_allocation_has(heads, S):
-    """Same check against the installed aiter: its threshold, and the shape and
-    strides of the score it would allocate. Skipped, never stubbed, when aiter is
-    absent, too old for the scorer, or cannot probe a GPU."""
-    try:
-        from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
-            NEG_INF,
-            TRANSPOSE_MIN_F,
-            alloc_score,
-        )
-    except (ImportError, RuntimeError) as e:
-        pytest.skip(f"aiter's scorer is not importable here: {e!r}"[:200])
-    out = _check_score_view(heads, S, TRANSPOSE_MIN_F, NEG_INF)
-    own = alloc_score(3, S, heads, 6, "cpu")
-    assert (out.shape, out.stride()) == (own.shape, own.stride())
 
 
 # (scheduled_bs, running_bs, running_tokens, q) -> the requests whose rows run
@@ -229,19 +166,12 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     if not (mxfp4 and tbo_decode):
         assert not [n for n in names if n in var] and not capacity_args
         return
-    main = var["sparse_attention_index_score"]
     for i in (0, 1):
         ub = var[names[i]]
         assert ub.work_map.shape == (100, 2) and ub.work_map.dtype == torch.int32
-        assert ub.scores.dtype == torch.float32
-        assert ub.scores.numel() == HEADS * rows[i] * BOUND  # q == 1, not max_qlen
         assert (ub.max_block, ub.num_idx_heads) == (BOUND, HEADS)
     assert capacity_args == [(rows[0], BOUND, 1, HEADS), (rows[1], BOUND, 1, HEADS)]
-    # the score storage is the main buffer's, the two ubatches' views not overlapping
-    base = main.scores.data_ptr()
-    step = main.scores.element_size()
-    assert var[names[0]].scores.data_ptr() == base
-    assert var[names[1]].scores.data_ptr() == base + rows[0] * HEADS * BOUND * step
+    # each ubatch has its own map
     assert var[names[1]].work_map.data_ptr() != var[names[0]].work_map.data_ptr()
     # the other per-ubatch buffers stay at max_bs
     assert var["ub0_context_lens"].gpu.numel() == max_bs

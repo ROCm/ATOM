@@ -291,12 +291,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             from atom.model_ops.minimax_m3.index_mxfp4 import IndexScoreBuffers
             from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
-            # The MXFP4 decode scorer's persistent dispatch map and scores
-            # (index_mxfp4): the map's row count is the grid, so the bound is the
-            # model length, and the buffer is CAPACITY -- the exact grid is not
-            # monotonic in the batch. Allocated before the KV budget is sized, so
-            # the cache shrinks by it. Sized at the widest step; a plain decode step
-            # (S=1) builds into the same buffers.
+            # The MXFP4 decode scorer's persistent dispatch map (index_mxfp4): its row
+            # count is the grid, so the bound is the model length, and the buffer is
+            # CAPACITY -- the exact grid is not monotonic in the batch. Sized at the
+            # widest step; a plain decode step (S=1) builds into the same buffer. The
+            # scores are allocated per call, like the Triton scorers'.
             self._index_score_max_block = cdiv(
                 self.model_runner.config.max_model_len, SPARSE_BLOCK_SIZE
             )
@@ -436,32 +435,25 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     self._index_score_max_block
                     and self.model_runner.config.enable_tbo_decode
                 ):
-                    # The MXFP4 scorer's map and scores, per ubatch for the same
-                    # reason; only a decode TBO runs them (`enable_tbo` alone is
+                    # The MXFP4 scorer's work map, per ubatch for the same
+                    # reason; only a decode TBO runs it (`enable_tbo` alone is
                     # the prefill split). A ubatch is one token a request (the
                     # sparse TBO decode raises above that), so q == 1 here
                     # whatever `max_seqlen_qo` is. A ubatch is at most the larger
                     # half of a split batch of up to `max_bs` requests.
                     from atom.model_ops.minimax_m3.index_mxfp4 import IndexScoreBuffers
 
-                    # Their score storage is the main buffers' (a step runs either
-                    # the ubatches or the whole batch, and the two ubatches' rows
-                    # together fit the main buffer); the map is each ubatch's own,
-                    # its capacity not being additive.
-                    main = var["sparse_attention_index_score"]
+                    # Each ubatch's own map: its capacity is not additive.
                     ranges = decode_ubatch_request_ranges(
                         self.max_bs, self._NUM_TBO_UBATCHES
                     )
                     rows = [hi - lo for lo, hi in ranges]
-                    unit = self._num_idx_heads * self._index_score_max_block
-                    start = sum(rows[:ub_idx]) * unit
                     var[f"{p}sparse_attention_index_score"] = IndexScoreBuffers.alloc(
                         rows[ub_idx],
                         1,
                         self._num_idx_heads,
                         self._index_score_max_block,
                         self.device,
-                        scores=main.scores[start : start + rows[ub_idx] * unit],
                     )
 
             # PA work buffers per ubatch (GPU only)

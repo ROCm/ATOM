@@ -1384,9 +1384,9 @@ def minimax_m3_index_topk_decode(
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
     ``index_mxfp4`` and ``pages_per_block`` as in :func:`minimax_m3_index_topk`.
-    The MXFP4 scorer takes the step's ``index_score`` (``IndexScoreStep``: work map,
-    the block bound it was built against, which does not move between graph replays,
-    and the -inf filled score storage); omitted, it builds and allocates its own.
+    The MXFP4 scorer takes the step's ``index_score`` (``IndexScoreStep``: work map
+    and the block bound it was built against, which does not move between graph
+    replays); omitted, it builds its own map. The scorer allocates the scores per call.
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
@@ -1448,15 +1448,6 @@ def minimax_m3_index_topk_decode(
         step = index_score
         score_max_block = max(max_block, step.max_block if step else 0)
         _require_packable(score_max_block)
-        if (
-            step is not None
-            and step.out is not None
-            and step.out.shape[-1] != score_max_block
-        ):
-            raise ValueError(
-                f"index_score.out is {step.out.shape[-1]} blocks wide, the "
-                f"scorer's bound is {score_max_block}"
-            )
         k_data, k_scale = page_views(index_kv_cache)
         score = minimax_m3_index_score_fp4_flydsl(
             idx_q,
@@ -1468,7 +1459,6 @@ def minimax_m3_index_topk_decode(
             num_idx_heads,
             sm_scale,
             score_max_block,
-            out=step.out if step else None,
             work_map=step.work_map if step else None,
         )
     else:
