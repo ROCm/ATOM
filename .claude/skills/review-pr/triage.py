@@ -1203,19 +1203,28 @@ def hardcoded_launch_knob(files):
 # -driven tests is not the thing a reviewer loses track of, and counting them would flag
 # the PRs that are best covered.
 #
-# The threshold is this repo's p90, not its maximum and not a borrowed rule of thumb.
-# Anchoring on "bigger than anything ever merged" (3500 lines) produced a line that fires
-# on 0 of those 40 PRs -- a warning that never warns. The usual 1000-line advice sits past
-# p95 here and fires on 2%. p90 fires on ~7%: the top of normal practice, and the point
-# past which one pass is plausibly sampling rather than sweeping.
+# The bar is 500 non-test added lines, or 11 files. Three numbers were in play and the
+# spread is worth recording, because the next person to touch this will want to know
+# whether it was measured or guessed:
 #
-# Why sampling is the right word: finding counts flatten. ATOM#2727 (6 files, 385 lines)
-# produced 5 findings and ATOM#2762 (47 files, 16,647 lines) also produced 5, across seven
-# consecutive reviews that never converged. Five does not mean "the problems" at any size
-# past the small end -- it means five of them -- and the card gives a reader no way to tell
-# those apart unless it says so.
+#   200   the effective-review ceiling in the human code-review literature (SmartBear's
+#         2500-review study, Google's eng-practices guidance). Fires on 40% here.
+#   400   where that literature puts the drop in defect-detection rate -- and, separately,
+#         where this bot's own output saturates: 385 lines already yields 5 findings, the
+#         same count 16,647 lines yields. Fires on 20%.
+#   519   this repo's p90 of non-test added lines. Fires on 7%.
+#
+# 500 was chosen between them: close to p90, so it stays the top of normal practice rather
+# than a routine annotation, while sitting near the point where the evidence says one pass
+# stops sweeping. It is a judgement between 400 and 519, not a measurement -- the
+# measurements are the three numbers above, and 400 is the one the evidence argues for if
+# the 20% firing rate turns out to be worth paying.
+#
+# Earlier this was 3500 lines / 20 files, anchored on "larger than anything ever merged".
+# That fires on 0 of 40 PRs: a warning that never warns, which is the failure this whole
+# line exists to prevent one level up.
 TEST_PATH = re.compile(r"(^|/)(tests?|op_tests)/|(^|/)test_|_test\.(py|cpp|cu)$")
-BIG_FILES, BIG_ADDED = 11, 519
+BIG_FILES, BIG_ADDED = 11, 500
 
 
 def coverage_line(files):
