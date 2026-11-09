@@ -31,7 +31,7 @@ BUILDS = {
     ),
     "k2a": (
         k2a.build_attn_post, k2a.ABI, k2a.AttnPostBuild(tokens=12),
-        {"tokens": 24, "index_bound_max": 65536, "index_fp4": True, "tp": 2,
+        {"tokens": 24, "index_bound_max": 65536, "index_fp4": True, "index_mfma": True, "tp": 2,
          "timeline": True, "diag_off": DIAG, "tok_par": True, "kv_fp8": True},
     ),
     "k2b": (
@@ -41,7 +41,7 @@ BUILDS = {
     ),
     "k2": (
         k2.build_layer_post, k2.ABI, k2.LayerPostBuild(tokens=12, tp=1),
-        {"tokens": 24, "index_bound_max": 65536, "index_fp4": True, "experts": 128,
+        {"tokens": 24, "index_bound_max": 65536, "index_fp4": True, "index_mfma": True, "experts": 128,
          "topk": 3, "tp": 2, "timeline": True, "diag_off": DIAG, "ug_groups": 1,
          "tok_par": True, "ep": 2, "moe_tp": 2, "kv_fp8": True},
     ),

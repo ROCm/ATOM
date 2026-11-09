@@ -163,6 +163,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             # short refuses when asked, so there is nothing to pre-empt here.
             index_block_rows=self.config.candidate_block_size,
             index_fp4=model_runner.config.index_cache_dtype == "fp4",
+            index_layout=model_runner.config.index_cache_layout,
         )
         model_runner.forward_vars.update(
             self._compress_plan_buffers(
@@ -492,6 +493,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 "DeepSeek-V4.1 publishes transfer regions after allocation"
             )
         names = [name for name, _ in self.cache.geometry.index_planes]
+        if self.cache.geometry.index_fp4:
+            # Equal byte widths do not imply equal physical layout. Mooncake
+            # checks these roles before writing any PAGE.
+            names = [f"{name}_fp4_{self.cache.geometry.index_layout}" for name in names]
         planes = [(f"dsv41.{name}", view) for name, view in self.cache.page_regions] + [
             (f"dsv41.{name}_plane.{owner}", plane)
             for owner, owned in self.cache.index_planes.items()

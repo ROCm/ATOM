@@ -108,7 +108,9 @@ def test_capture_validator_checks_real_index_allocations(dtype, index_fp4):
 
     from tests.test_deepseek_v41_runtime_validation import capture_checks, make_runner
 
-    geo = replace(geometry(dtype), index_fp4=index_fp4, index_block_rows=8)
+    geo = replace(
+        geometry(dtype), index_fp4=index_fp4, index_layout=None, index_block_rows=8
+    )
     cache = PagedAttentionCache(geo, 7, 4, "cpu")
     runner, _ = make_runner(dtype)
     runner.attn_metadata_builder.cache = cache

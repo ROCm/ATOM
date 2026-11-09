@@ -853,3 +853,45 @@ def test_candidate_blocks_are_bound_once_a_forward(small_config, monkeypatch):
     step.candidates[source] = kept
     assert cache.candidate_blocks(step, source, ratio) is not first
     assert len(builds) == 2
+
+
+@pytest.mark.parametrize("layout", ["mfma", "preshuffle", "natural"])
+def test_fp4_cache_layout_selection_and_page_geometry(monkeypatch, layout):
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    # Allocation follows the declared geometry, not a later environment read.
+    monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", "flydsl")
+    geo = V41PoolGeometry(
+        2,
+        ((0, 2), (1, 1)),
+        128,
+        128,
+        512,
+        128,
+        index_block_rows=8,
+        index_fp4=True,
+        index_layout=layout,
+    )
+    cache = PagedAttentionCache(geo, 3, 1, "cpu")
+    assert {units.layout for units in cache.index_units.values()} == {layout}
+    assert cache.index_units[0].values.shape == (24, 8, 64)
+    assert cache.index_units[1].values.shape == (48, 8, 64)
+    # A group may not cross PAGE boundaries: a PAGE must remain relocatable.
+    if layout == "mfma":
+        # OPUS now addresses gfx950 KV through 64-bit pointers. Check the
+        # allocator's large-plane geometry without allocating the actual pool.
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                PagedAttentionCache,
+                "_allocate_backing",
+                lambda self, size, device: torch.empty(
+                    size, dtype=torch.uint8, device="meta"
+                ),
+            )
+            large = PagedAttentionCache(geo, (1 << 19) + 1, 1, "cpu")
+            assert large.index_units[1].values.numel() > (1 << 32)
+            assert large.index_units[1].layout == "mfma"
+        with pytest.raises(ValueError, match="complete 64-row groups"):
+            PagedAttentionCache(replace(geo, block_size=64), 3, 1, "cpu")
+    else:
+        PagedAttentionCache(replace(geo, block_size=64), 3, 1, "cpu")

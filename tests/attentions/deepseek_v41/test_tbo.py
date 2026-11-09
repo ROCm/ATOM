@@ -237,7 +237,13 @@ def test_prefill_children_publish_independent_packed_score_plans(device):
 
     builder, parent = make_parent(device)
     workspace = ScoreWorkspace(
-        replace(builder.geometry, index_fp4=True, index_dim=128, index_block_rows=8),
+        replace(
+            builder.geometry,
+            index_fp4=True,
+            index_dim=128,
+            index_block_rows=8,
+            index_layout="preshuffle",
+        ),
         32,
         4,
         device,
@@ -1163,6 +1169,7 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch, kv
             speculative_config=None,
             kv_cache_dtype=kv_dtype,
             index_cache_dtype="fp4",
+            index_cache_layout="preshuffle",
             enable_tbo=True,
             load_dummy=True,
             gpu_memory_utilization=0.75,

@@ -150,6 +150,8 @@ class AttnPostBuild:
     # the index plane is FP4: its scorer is ``index_score_fp4`` (``iqs``,
     # ``pscale`` and the FULL layers' task plan ``iplan``)
     index_fp4: bool = False
+    # FP4 keys in OPUS 64-row groups; the query remains Mono's own layout.
+    index_mfma: bool = False
     # the TP size: every width a rank holds (``Dims``)
     tp: int = 4
     timeline: bool = field(default=False, metadata={"sym": "tl"})
@@ -593,7 +595,8 @@ def attn_post_context(key, s, lds, mb, bases, layout, scratch, args, rank, sym):
         "poll": mb.poll, "peer_addr": lambda p: bases[p], "rank": rank, "sym": sym,
         "peer": peer_offsets(s, Dims(key.tp)),
         "fold": True, "index": False, "aux": False, "ffn": True,
-        "index_fp4": key.index_fp4, "tok_par": key.tok_par, "kv_fp8": key.kv_fp8,
+        "index_fp4": key.index_fp4, "index_mfma": key.index_mfma,
+        "tok_par": key.tok_par, "kv_fp8": key.kv_fp8,
         "args": args, "d": Dims(key.tp),
     }  # fmt: skip
     for region, (off, _) in layout.items():
@@ -779,6 +782,7 @@ def build_attn_post(key: AttnPostBuild):
         tl=int(timeline),
         ix=int(bound_max > 0),
         i4=int(key.index_fp4),
+        im=int(key.index_mfma),
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
