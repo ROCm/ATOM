@@ -148,9 +148,11 @@ def stage_route(c, token, front_payload_words=0):
                 )
             return butterfly(count, (16, 8, 4, 2, 1), architecture=GFX1250)
 
+        # A dynamic loop: unrolled, the 32 steps are ~23 KB of straight-line
+        # code that runs from a cold instruction cache after other kernels.
         threshold = fx.Uint32(0)
-        for bit in range_constexpr(31, -1, -1):
-            candidate = threshold | fx.Uint32(1 << bit)
+        for step in range(32):
+            candidate = threshold | (fx.Uint32(1 << 31) >> fx.Uint32(step))
             threshold = (count_at_least(candidate) >= width).select(candidate, threshold)
 
         greater = fx.Int32(0)
