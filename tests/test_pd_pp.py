@@ -270,6 +270,7 @@ def _mooncake_consumer_scheduler(mc, block_size=64, dcp_size=1):
     sched.transfer_id_to_request_id = {}
     sched._reqs_need_recv = {}
     sched._reqs_need_save = {}
+    sched._producer_admission_undo = {}
     sched._pending_chunked_admissions = {}
     sched._chunked_waiting = {}
     sched._chunked_ready = set()
