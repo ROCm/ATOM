@@ -140,13 +140,18 @@ def test_lmcache_mp_and_mooncake_are_the_kv_transfers_admitted():
         validate_runtime_config(
             runtime_config(kv_transfer_config={"kv_connector": "mooncake"})
         )
-    for connector in ("lmcache_offload", "moriio", "multi"):
+    for connector in ("lmcache_offload", "moriio"):
         with pytest.raises(
             ValueError, match="KV transfer other than lmcache_mp or mooncake"
         ):
             validate_runtime_config(
                 runtime_config(kv_transfer_config={"kv_connector": connector})
             )
+    # `multi` is admitted only as mooncake plus one offload tier.
+    with pytest.raises(ValueError, match="multi requires mooncake plus one offload"):
+        validate_runtime_config(
+            runtime_config(kv_transfer_config={"kv_connector": "multi"})
+        )
     with pytest.raises(ValueError, match="RapidServe"):
         validate_runtime_config(
             runtime_config(

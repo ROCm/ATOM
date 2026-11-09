@@ -240,7 +240,8 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         from atom.kv_transfer.offload.atom_lmcache_staging import set_compute_stream
 
         # The model runner's thread: its current stream is the forward's.
-        set_compute_stream(torch.cuda.current_stream())
+        if torch.cuda.is_available():
+            set_compute_stream(torch.cuda.current_stream())
         rank, world = pp_aware_rank_and_world(self._config, _tp_group())
         self._rank = rank
         self._world = world
