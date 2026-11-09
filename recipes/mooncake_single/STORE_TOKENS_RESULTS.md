@@ -172,3 +172,25 @@ makes a few large chunks. Under test: `ATOM_PREFILL_DELAYER_TARGET_FILL` and
 Benchmark arms used `ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0`, Mooncake Store
 256 GB (DP2) or 512 GB (DP4) over RDMA, `OFFLOAD_PROFILE` off. Store usage after
 1800 s at DP4/c256 was 190 GB of 512 GB with no eviction.
+
+## Historical P/D A/B (2026-11-05; prototype, not current PR HEAD)
+
+DeepSeek-V4.1-Flash-1017, P4 on g09 + D4 on g25 (8 inference GPUs total), DPA enabled, AgentX C256, 1800 s measurement per arm, seed 42. These are sequential runs on the same nodes, not simultaneous measurements. Main used session-affinity routing; the Store prototype used shared Mooncake Store without session affinity. Both completed normally, with empty AIPerf error summaries and no watchdog failure.
+
+| Metric | Main | Store prototype | Store relative to main |
+|---|---:|---:|---:|
+| Output throughput (tok/s) | 7236.06 | 7405.42 | +2.3% |
+| Output throughput (tok/s/inference GPU) | 904.51 | 925.68 | +2.3% |
+| TTFT mean (ms) | 1871.84 | 1548.88 | -17.3% |
+| TTFT P50 (ms) | 1188.03 | 1281.22 | +7.8% |
+| TTFT P90 (ms) | 2881.16 | 2497.81 | -13.3% |
+| TTFT P99 (ms) | 14490.79 | 6065.86 | -58.1% |
+| ITL mean (ms) | 15.57 | 14.95 | -4.0% |
+| ITL P90 (ms) | 20.02 | 19.02 | -5.0% |
+| Successful requests | 15992.00 | 16333.00 | +2.1% |
+
+Lower TTFT/ITL is better. Per-GPU output throughput divides the exported aggregate by the 8 inference GPUs; it does not charge the separate Store CPU resource. Throughput is the AIPerf exported value, including its accounting/drain behavior.
+
+Scope: this pair predates `store_tokens`, current early-load/chunk-floor scheduling, and the composite preadmission cancellation fix. The prototype used `least_requests`, the old `--offload-prefetch` path, 8192-token load/save thresholds, and profiling enabled. Main source was `df61c5d4c522778ec93b9c77242d892941b90751`. This supports feasibility of the earlier P/D shared-Store path, not a performance claim for current #3097. Median TTFT regressed despite better mean/tail latency; one sequential pair does not establish statistical significance. The existing single-node results above remain separate.
+
+Run IDs: `c256-main-sticky-p4d4-g09g25-1800s-20261105` and `c256-store-cpugpu-diag-p4d4-g09g25-1800s-20261105`. Preserved evidence: `outputs/mooncake-direct-probe/pd1800-final-latest.json` in the benchmark workspace (both full AIPerf profiles and completion records).
