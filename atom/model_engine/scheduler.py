@@ -1720,12 +1720,12 @@ class Scheduler:
         sockets (the Mooncake Store's lookup executor). Called by EngineCore on
         engine shutdown: a non-daemon thread left running keeps the process
         alive at exit."""
-        close = getattr(self.kv_connector, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                logger.exception("KV connector close failed")
+        if self.kv_connector is None:
+            return
+        try:
+            self.kv_connector.close()
+        except Exception:
+            logger.exception("KV connector close failed")
 
     def is_finished(self):
         # `_rejected` must be considered too: if a batch of seqs is all
@@ -3426,14 +3426,14 @@ class Scheduler:
         load starts there (`BlockManager.lower_hit_to_chunk`). Only for a tier
         that declares it (`lowers_hbm_hit_to_chunk`), once its answer is held."""
         conn = self.kv_connector
-        if conn is None or not getattr(conn, "lowers_hbm_hit_to_chunk", False):
-            return False
-        chunk = int(getattr(conn, "chunk_size", 0) or 0)
-        held = getattr(conn, "held_tier_hit", None)
-        if not chunk or not callable(held):
+        if conn is None or not conn.lowers_hbm_hit_to_chunk or not conn.chunk_size:
             return False
         return self.block_manager.lower_hit_to_chunk(
-            seq, probe, chunk, int(held(seq)), min_load_tokens(self.config)
+            seq,
+            probe,
+            int(conn.chunk_size),
+            int(conn.held_tier_hit(seq)),
+            min_load_tokens(self.config),
         )
 
     def _probe_hbm_prefix(self, seq: Sequence) -> AdmissionProbe:
@@ -4194,12 +4194,7 @@ class Scheduler:
         # Never block the scheduler thread -- and every DP rank with it -- on a
         # synchronous lookup: only an answered async lookup qualifies. (With a
         # lookup driver thread the answer shows up between ticks.)
-        lookup_ready = getattr(self.kv_connector, "lookup_ready", None)
-        if not callable(lookup_ready):
-            state.skip(seq.id, "connector_has_no_lookup_ready")
-            state.settled.add(seq.id)
-            return False
-        if self._offload_lookup_pending(seq) or not lookup_ready(seq):
+        if self._offload_lookup_pending(seq) or not self.kv_connector.lookup_ready(seq):
             state.skip(seq.id, "lookup_not_ready")
             return False
         return True
@@ -4236,7 +4231,11 @@ class Scheduler:
         bm = getattr(self, "block_manager", None)
         total_blocks = int(bm.kv.num_blocks) if bm is not None else 0
         state.maybe_log(total_blocks)
-        if self.kv_connector is None or not self._connector_flag("is_offload"):
+        if (
+            self.kv_connector is None
+            or not self._connector_flag("is_offload")
+            or not self._connector_flag("supports_early_load")
+        ):
             return 0
         state.tick += 1
         if state.entries:
@@ -4248,7 +4247,7 @@ class Scheduler:
 
         watermark = envs.ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK
         max_frac = envs.ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC
-        chunk = int(getattr(self.kv_connector, "chunk_size", 0) or 0)
+        chunk = int(self.kv_connector.chunk_size or 0)
         hbs = bm.hash_block_size
         parked = 0
         for seq in list(itertools.islice(self.waiting, 0, self._EARLY_LOAD_SCAN)):
@@ -4373,11 +4372,7 @@ class Scheduler:
         """Undo `allocate` and the connector notification of an early admission
         that turned out not to park; the request is back in `waiting` exactly as
         unadmitted, and is not tried again."""
-        cancel = getattr(self.kv_connector, "cancel_preadmission", None)
-        if callable(cancel):
-            cancel(seq)
-        else:
-            self.kv_connector.cancel_pending_load(seq)
+        self.kv_connector.cancel_preadmission(seq)
         if cancel_state and seq.offload_joint.load_hash != -1:
             self.block_manager.cancel_state_load(seq)
         self.block_manager.deallocate(seq)

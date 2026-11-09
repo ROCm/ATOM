@@ -3759,3 +3759,14 @@ def test_mixed_windows_report_the_same_chunks(
     for index in range(4):
         expected = _page_pattern(2 * index) + _page_pattern(2 * index + 1)
         assert objects[_key(request.chunk_hashes, index)] == expected
+
+
+def test_the_dense_codec_id_is_unchanged_and_v41_has_its_own():
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.offload.mooncake_store import keys
+
+    dense = SimpleNamespace(hf_config=SimpleNamespace(model_type="llama"))
+    v41 = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"))
+    assert keys.codec_id(dense) == "dense-opaque-block-v1"  # stored entries stay valid
+    assert keys.codec_id(v41) == "replay-page-block-v1"

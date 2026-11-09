@@ -221,33 +221,29 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     @property
     def chunk_size(self) -> int:
         """The tier's transfer granule in tokens; 0 when the impl has none."""
-        return int(getattr(self._impl, "chunk_size", 0) or 0)
+        return int(self._impl.chunk_size or 0)
+
+    @property
+    def supports_early_load(self) -> bool:
+        return self._impl.supports_early_load
 
     def lookup_ready(self, seq) -> bool:
-        callback = getattr(self._impl, "lookup_ready", None)
-        return bool(callback(seq)) if callable(callback) else False
+        return self._impl.lookup_ready(seq)
 
     @property
     def lowers_hbm_hit_to_chunk(self) -> bool:
-        return bool(getattr(self._impl, "lowers_hbm_hit_to_chunk", False))
+        return self._impl.lowers_hbm_hit_to_chunk
 
     def held_tier_hit(self, seq) -> int:
-        callback = getattr(self._impl, "held_tier_hit", None)
-        return int(callback(seq)) if callable(callback) else 0
+        return int(self._impl.held_tier_hit(seq))
 
     def cancel_preadmission(self, seq) -> None:
-        callback = getattr(self._impl, "cancel_preadmission", None)
-        if callable(callback):
-            callback(seq)
-        else:
-            self._impl.cancel_pending_load(seq)
+        self._impl.cancel_preadmission(seq)
 
     def close(self) -> None:
         """Close the impl's lookup threads at scheduler teardown (the Mooncake
-        Store's); an impl without any has nothing to close."""
-        callback = getattr(self._impl, "close", None)
-        if callable(callback):
-            callback()
+        Store's)."""
+        self._impl.close()
 
     def can_detach_lookup(self, seq, num_hbm_tokens: int) -> bool:
         callback = getattr(self._impl, "can_detach_lookup", None)

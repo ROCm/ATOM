@@ -46,6 +46,7 @@ def _build(cls, is_producer, **extra):
     sched._pending_chunked_admissions = {}
     sched._chunked_waiting = {}
     sched._chunked_ready = set()
+    sched._producer_admission_undo = {}
     for name in ("_reqs_need_save", "_reqs_need_recv", "request_id_to_transfer_id"):
         setattr(sched, name, {})
     sched.transfer_id_to_request_id = {}

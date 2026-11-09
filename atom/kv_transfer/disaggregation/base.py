@@ -97,6 +97,31 @@ class KVConnectorSchedulerBase(ABC):
 
     is_producer: bool
 
+    # Offload-tier hooks the scheduler reads from any connector; one without a
+    # tier keeps these defaults.
+    chunk_size: int = 0
+    lowers_hbm_hit_to_chunk: bool = False
+    supports_early_load: bool = False
+
+    def lookup_ready(self, seq: Any) -> bool:
+        """Whether `seq`'s tier answer can be consumed without a round trip."""
+        return False
+
+    def held_tier_hit(self, seq: Any) -> int:
+        """The tier hit armed for `seq`'s coming load, 0 when none."""
+        return 0
+
+    def cancel_pending_load(self, seq: Any) -> None:
+        """Forget the load armed for `seq`."""
+
+    def cancel_preadmission(self, seq: Any) -> None:
+        """Take back an admission the scheduler withdraws before any dispatch;
+        by default that is cancelling the pending load."""
+        self.cancel_pending_load(seq)
+
+    def close(self) -> None:
+        """Release threads or sockets the connector holds at engine shutdown."""
+
     @abstractmethod
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         """Check if *seq* needs remote KV prefill.

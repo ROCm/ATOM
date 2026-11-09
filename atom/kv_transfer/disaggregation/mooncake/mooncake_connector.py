@@ -484,6 +484,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # for legacy relay. Chunked mode claims at allocation because the peer
         # can read after the first forward; it must not be preempted meanwhile.
         self._awaiting_send: set[str] = set()
+        # Producer state each undispatched allocation replaced, by request id:
+        # what `cancel_preadmission` restores.
+        self._producer_admission_undo: dict[ReqId, tuple] = {}
 
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -578,12 +581,12 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self._reqs_need_save.clear()
         # Those allocations are now dispatched. Cancellation must drain the
         # worker's source claim, never apply preadmission rollback to them.
-        getattr(self, "_producer_admission_undo", {}).clear()
+        self._producer_admission_undo.clear()
         return meta
 
     def cancel_preadmission(self, seq: Sequence) -> None:
         """Undo only producer state installed by an undispatched allocation."""
-        undo = getattr(self, "_producer_admission_undo", {}).pop(seq.id, None)
+        undo = self._producer_admission_undo.pop(seq.id, None)
         if undo is None or undo[0] is not seq:
             return
         _, previous_save, already_claimed, previous_waiting, was_ready = undo
@@ -600,8 +603,6 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
     def update_state_after_alloc(self, seq: Sequence) -> None:
         if self.is_producer:
-            if not hasattr(self, "_producer_admission_undo"):
-                self._producer_admission_undo = {}
             self._producer_admission_undo.setdefault(
                 seq.id,
                 (

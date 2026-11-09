@@ -454,6 +454,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     # unaligned HBM hit (`BlockManager.lower_hit_to_chunk`) instead of handing
     # off through a prefill to the next chunk boundary.
     lowers_hbm_hit_to_chunk = False
+    # It answers `lookup_ready`, so the scheduler may start its loads early.
+    supports_early_load = True
 
     def held_tier_hit(self, seq) -> int:
         """The tier hit armed for `seq`'s coming load, 0 when none.
