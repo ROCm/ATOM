@@ -23,6 +23,10 @@ rules is HTTP 400 before generation.
 - **Size.** An image is at most 32 MiB, base64 or fetched, and a request's
   images at most 64 MiB together. A side is at most 8192 px, or 4096 px from
   15 images a request on, and a request carries at most 600 images.
+  Beyond DeepSeek's limits, a request's images hold at most 256 megapixels
+  together once decoded, as their headers say before any is decoded: images
+  that compress well would otherwise fit the byte limits and decode to tens
+  of GiB.
 - **`detail`.** `low` downscales the image to fit 512x512; `high`, `original`
   and `auto` keep it as it is.
 - **Roles.** Images belong to `user` messages; in any other message they are

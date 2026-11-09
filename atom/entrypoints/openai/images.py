@@ -18,7 +18,7 @@ import threading
 import time
 import urllib.request
 from base64 import b64decode
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from atom.utils import envs
@@ -26,6 +26,9 @@ from atom.utils import envs
 MAX_URL_CHARS = 8192
 MAX_IMAGE_BYTES = 32 << 20
 MAX_REQUEST_IMAGE_BYTES = 64 << 20
+# This server's own bound, beyond DeepSeek's: images that compress well fit
+# the byte limits and still decode to tens of GiB.
+MAX_REQUEST_PIXELS = 256 * 10**6
 MAX_IMAGES = 600
 MAX_SIDE = 8192
 # From this many images a request on, a side may be only half as long.
@@ -78,7 +81,18 @@ def load_chat_images(messages: list[dict]) -> list[dict]:
         for part in message["content"]
     )
     side = MAX_SIDE if count < MANY_IMAGES else MAX_SIDE_MANY
-    total = 0
+    total = pixels = 0
+
+    def admit(image: Any) -> None:
+        # Every decoded image lives until the processor runs: what they take
+        # together is bounded from the headers, before any is decoded.
+        nonlocal pixels
+        pixels += image.size[0] * image.size[1]
+        if pixels > MAX_REQUEST_PIXELS:
+            raise ValueError(
+                f"a request's images are limited to "
+                f"{MAX_REQUEST_PIXELS // 10**6} megapixels together"
+            )
 
     def load(source: Mapping) -> Any:
         nonlocal total
@@ -91,7 +105,7 @@ def load_chat_images(messages: list[dict]) -> list[dict]:
                 f"a request's images are limited to "
                 f"{MAX_REQUEST_IMAGE_BYTES >> 20} MiB together"
             )
-        return _decode(data, source.get("detail"), side)
+        return _decode(data, source.get("detail"), side, admit)
 
     loaded = []
     for message in messages:
@@ -236,7 +250,7 @@ def _shut(sock: socket.socket) -> None:
         pass  # closed already
 
 
-def _decode(data: bytes, detail: str | None, side: int) -> Any:
+def _decode(data: bytes, detail: str | None, side: int, admit: Callable) -> Any:
     """The image in its own mode, as the media loader returns one: color
     conversion is the processor's, which may use the alpha channel."""
     from PIL import Image
@@ -260,6 +274,7 @@ def _decode(data: bytes, detail: str | None, side: int) -> Any:
             f"images are limited to {side} px a side{many}, "
             f"got {image.size[0]}x{image.size[1]}"
         )
+    admit(image)
     try:
         # Decode now, so bad data fails here rather than in the processor. An
         # animation stays on its first frame, the one a processor reads.

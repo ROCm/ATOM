@@ -197,8 +197,8 @@ def test_bad_image_data_is_the_clients_error():
         _load(_image(_data_url(broken)))
 
 
-def test_a_huge_image_is_refused_from_its_header():
-    """A 20000x20000 PNG header, no pixels: Pillow refuses it on opening."""
+def _png_header(width, height):
+    """A PNG that says it is `width` x `height` and holds no pixels."""
 
     def chunk(kind, body):
         return (
@@ -208,10 +208,25 @@ def test_a_huge_image_is_refused_from_its_header():
             + struct.pack(">I", zlib.crc32(kind + body))
         )
 
-    header = struct.pack(">IIBBBBB", 20000, 20000, 8, 2, 0, 0, 0)
-    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IEND", b"")
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IEND", b"")
+
+
+def test_a_huge_image_is_refused_from_its_header():
+    """Pillow refuses a 20000x20000 header on opening."""
     with pytest.raises(ValueError, match="8192 px a side"):
-        _load(_image(_data_url(png)))
+        _load(_image(_data_url(_png_header(20000, 20000))))
+
+
+def test_a_requests_decoded_pixels_are_limited_before_decoding():
+    """Images that compress well fit the byte limits and decode to tens of
+    GiB: the headers are added up first. A header with no pixels behind it
+    is refused for its size, not found invalid by decoding."""
+    assert images.MAX_REQUEST_PIXELS == 256 * 10**6
+    big = _image(_data_url(_encoded(size=(4096, 4096), mode="1")))  # 16.8 MP
+    _load(*[big] * 15)
+    with pytest.raises(ValueError, match="megapixels together"):
+        _load(*[big] * 15, _image(_data_url(_png_header(4096, 4096))))
 
 
 def test_an_image_is_at_most_32_mib_however_sent(monkeypatch):
