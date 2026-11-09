@@ -19,6 +19,7 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload._offload_common import max_pending_saves
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, NativeStateTransfer
 from atom.kv_transfer.offload.mp.deployment import _mp_session_id
+from atom.kv_transfer.offload.mp.token_shipping import token_list
 from atom.kv_transfer.offload.mp.transfer import (
     _chunk_ranges,
     _enforce_transfer_deadline,
@@ -136,7 +137,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             try:
                 groups = self._native_block_ids(req, start, end, loading=loading)
                 spec = AtomMPTransferSpec(
-                    token_ids=req.token_ids,
+                    token_ids=token_list(req.token_ids),
                     block_ids=groups,
                     start=start,
                     end=end,

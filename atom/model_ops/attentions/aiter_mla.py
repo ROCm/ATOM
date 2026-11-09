@@ -1584,7 +1584,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # -- the whole vocabulary it and its DCP shard plan have for the
             # indexer -- and the FP4 cache is two planes neither parses.
             # A transport registered with `copies_whole_block_regions`
-            # (`lmcache_mp`, `mooncake_store`) is the exception, admitted above: it copies whole
+            # (`lmcache_mp`) is the exception, admitted above: it copies whole
             # blocks of every published region, so the FP4 data and its e8m0
             # scale plane travel as two regions per layer (see below).
             #
@@ -1605,11 +1605,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 raise NotImplementedError(
                     "KV transfer that addresses the cache through the PAGE "
                     "region map is unsupported with the FP4 sparse indexer "
-                    "unless lmcache_mp or mooncake_store is the only transport reading the map: "
+                    "unless lmcache_mp is the only transport reading the map: "
                     "the P/D backends and the hybrid/m3/kimi_k3 offload layouts "
                     "parse one index region per layer and cannot place its "
                     "separate e8m0 scale plane. Pass --index_cache_dtype fp8 to "
-                    "use one; lmcache_mp, mooncake_store and dense CPU/NVMe offload "
+                    "use one; lmcache_mp and dense CPU/NVMe offload "
                     "(lmcache_offload) carry both planes and need no change."
                 )
             return None

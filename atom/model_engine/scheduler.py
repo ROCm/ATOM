@@ -2079,7 +2079,7 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
-        self._promote_ready_remote_kv_requests()
+        self._resolve_finished_receives()
         self._park_ready_offload_partial_prefills()
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
@@ -2270,15 +2270,7 @@ class Scheduler:
                 seq.multimodal_data = None
                 tracing.finish(seq, reason=seq.leave_reason)
                 self._rejected.append(seq)
-                # Never ran to `postprocess`: tell the connector the request
-                # is over, so what it kept for it (an offload session, its
-                # token copies) is released like any other finished request.
-                if self.kv_connector is not None:
-                    if self._connector_flag("is_offload"):
-                        self.kv_connector.cancel_pending_load(seq)
-                    finished = getattr(self.kv_connector, "request_finished", None)
-                    if callable(finished):
-                        finished(seq)
+                self._release_unrun_offload(seq)
                 continue
 
             if len(self.running) >= self.max_num_seqs:
@@ -3011,8 +3003,12 @@ class Scheduler:
         self, seq: Sequence, skipped_waiting_requests: deque[Sequence]
     ) -> bool | None:
         """Resolve a P/D consumer's ``WAITING_FOR_REMOTE_KVS`` request before
-        admission. An offload tier's loads are resolved once, at the top of the
-        tick (`_resolve_offload_load`), so one still waiting here is in flight.
+        admission.
+
+        With an offload tier every receive is resolved once, at the top of the
+        tick (`_resolve_finished_receives`): one still waiting here is in
+        flight and is requeued, never taken down the P/D first-decode path
+        (which would skip its suffix prefill).
 
         Returns:
           - ``None`` when the request is still blocked and has been requeued.
@@ -3021,6 +3017,9 @@ class Scheduler:
         """
         if seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
             return False
+        if self._connector_flag("is_offload"):
+            skipped_waiting_requests.append(seq)
+            return None
 
         if self._consume_failed_remote_kv(seq):
             return False
@@ -3187,11 +3186,30 @@ class Scheduler:
         # This failure is the terminal report the abort waits for.
         self._finish_aborted_load_cleanup(seq.id)
 
+    def _release_unrun_offload(self, seq: Sequence) -> None:
+        """Release what an offload tier kept for a request rejected as
+        unschedulable before it ran (a lookup, an MP session, its worker token
+        copy).
+
+        Only the offload tier is told: a P/D connector would treat the request
+        as a finished prefill (a Mooncake chunked producer reads its first
+        output token, which does not exist) and publish a handoff. Without an
+        offload tier nothing is called, as before.
+        """
+        if self.kv_connector is None or not self._connector_flag("is_offload"):
+            return
+        self.kv_connector.cancel_pending_load(seq)
+        finish_offload = getattr(self.kv_connector, "offload_request_finished", None)
+        if callable(finish_offload):
+            finish_offload(seq)  # a `multi`: its offload sub alone
+        else:
+            self.kv_connector.request_finished(seq)
+
     def _cleanup_aborted_load(self, seq: Sequence) -> None:
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
-        # The one path that never went through `postprocess`, so it finishes
+        # An aborted request never went through `postprocess`, so it finishes
         # the request here rather than before the park.
         callback = getattr(self.kv_connector, "request_finished", None)
         if callable(callback):
@@ -4994,7 +5012,7 @@ class Scheduler:
             seq.status = SequenceStatus.WAITING
             self._mark_offload_load_ready(seq)
 
-    def _promote_ready_remote_kv_requests(self) -> None:
+    def _resolve_finished_receives(self) -> None:
         """Resolve admitted loads before sizing prefill; prioritize their resumes.
 
         These requests were admitted at the queue head and already own blocks.

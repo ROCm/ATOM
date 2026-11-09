@@ -235,18 +235,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return self._token_shipper.ship(seq, end)
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
-        shipper = self._token_shipper
-        shipper.begin()
-        try:
-            metadata = self._build_connector_meta()
-        except BaseException:
-            shipper.rollback()  # the metadata is lost, and so is what it shipped
-            raise
-        metadata.token_drops = shipper.take_drops()
-        shipper.commit()
-        return metadata
-
-    def _build_connector_meta(self) -> LMCacheOffloadMetadata:
         try:
             metadata = super().build_connector_meta()
         finally:
@@ -275,6 +263,8 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         if stats:
             for key, value in stats.items():
                 self._perf_counters_set(f"lookup_driver_{key}", value)
+        # Last: `_end_finished_sessions` above queues this step's drops.
+        metadata.token_drops = self._token_shipper.take_drops()
         return metadata
 
     def _perf_counters_set(self, key: str, value: int) -> None:

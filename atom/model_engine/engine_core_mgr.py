@@ -280,8 +280,9 @@ class CoreManager:
         # A subclass may fan out through its own add_request() and never charge
         # load at all, but the inherited output thread still calls
         # _release_seq_load() on every finished sequence, so these MUST exist.
-        # Strategy: "round_robin" | "least_requests" | "least_tokens" (validated
-        # at the CLI by argparse choices=DP_LB_STRATEGIES).
+        # Strategy: "round_robin" | "least_requests" | "least_tokens" |
+        # "prefix_spread" (validated at the CLI by argparse
+        # choices=DP_LB_STRATEGIES).
         self._dp_lb_strategy = config.dp_load_balance
         # Token-equivalent weight of one in-flight request for "least_tokens".
         # Read once here: this is a construction-time config value (CoreManager
@@ -339,7 +340,7 @@ class CoreManager:
             )
             self._dp_route_counters.update(
                 dict.fromkeys(
-                    PrefixSpreadRouter.DECISIONS + ("prefix_moved_tokens",), 0
+                    PrefixSpreadRouter.DECISIONS + (PrefixSpreadRouter.MOVED_TOKENS,), 0
                 )
             )
         self._rank_routed_total = [0] * self.global_engine_count

@@ -1156,7 +1156,7 @@ def test_reset_removes_provisional_holders_but_keeps_completed():
     assert not router.seq_hashes
 
 
-def test_pending_remote_restore_does_not_count_as_local_hbm():
+def test_a_pending_restore_makes_its_target_the_provisional_owner():
     mgr = _make_spread_mgr()
     (owner,) = _route(mgr, [_chain_seq(1, 65536)])
     mgr._mark_seq_prefill_complete(1)

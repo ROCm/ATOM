@@ -1059,3 +1059,25 @@ def test_waits_for_transfer_report_needs_every_deferring_sub():
     assert not multi(sub(True, True), sub(True)).waits_for_transfer_report(seq)
     assert not multi(sub(True, True), sub(True, False)).waits_for_transfer_report(seq)
     assert not multi(sub(False, True)).waits_for_transfer_report(seq)
+
+
+def test_offload_request_finished_reaches_only_the_offload_sub():
+    """For a request rejected before it ran, the P/D sub must not be told it
+    finished: a Mooncake chunked producer would read its first output token."""
+    calls = []
+
+    class _PD:
+        is_producer = True
+
+        def request_finished(self, seq):
+            raise IndexError("no output token")
+
+    class _Offload:
+        is_offload = True
+
+        def request_finished(self, seq):
+            calls.append(seq.id)
+
+    sched = _sched([_PD(), _Offload()])
+    sched.offload_request_finished(SimpleNamespace(id=5))
+    assert calls == [5]

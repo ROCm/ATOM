@@ -3,7 +3,7 @@
 import copy
 from types import SimpleNamespace
 
-from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
+from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens, token_list
 
 
 def shipped_tokens(req):
@@ -11,4 +11,4 @@ def shipped_tokens(req):
     request's first shipment carries its whole prefix (`WorkerTokens`)."""
     meta = SimpleNamespace(requests=[copy.copy(req)])
     WorkerTokens().resolve(meta)
-    return list(meta.requests[0].token_ids)
+    return token_list(meta.requests[0].token_ids)

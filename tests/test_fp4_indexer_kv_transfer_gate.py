@@ -318,7 +318,7 @@ def test_fp4_gate_reads_the_shared_connector_predicate():
             assert AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder) is None
 
 
-@pytest.mark.parametrize("connector", ["lmcache_mp", "mooncake_store"])
+@pytest.mark.parametrize("connector", ["lmcache_mp"])
 def test_fp4_indexer_serves_whole_block_offload_and_multi(connector):
     assert _passes_the_gate(_fp4_builder({"kv_connector": connector}))
     assert _passes_the_gate(

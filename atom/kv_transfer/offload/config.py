@@ -16,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from dataclasses import asdict, is_dataclass
 from math import isfinite
 from numbers import Integral
@@ -644,11 +643,16 @@ def scale_cpu_size_for_pp(cfg, config) -> None:
 
 def lmcache_chunk_tokens(kv_transfer_config: dict[str, Any] | None) -> int:
     """The LMCache chunk the connector is configured for, in tokens: the
-    ``lmcache.chunk_size`` extra, else ``LMCACHE_CHUNK_SIZE``, else LMCache's
-    default 256. Needs no LMCache import, so DP routing can read it at startup."""
+    ``lmcache.chunk_size`` extra, else ``LMCACHE_CHUNK_SIZE`` (`envs`), else
+    LMCache's default 256. Needs no LMCache import, so DP routing can read it
+    at startup."""
     kvc = kv_transfer_config or {}
     extra = kvc.get("kv_connector_extra_config", kvc) or {}
-    value = extra.get("lmcache.chunk_size", os.environ.get("LMCACHE_CHUNK_SIZE", "256"))
+    # Imported here: this module is on the early config path (see
+    # `_layout_from_model`), and `atom.utils` pulls in transformers.
+    from atom.utils import envs
+
+    value = extra.get("lmcache.chunk_size", envs.LMCACHE_CHUNK_SIZE)
     if isinstance(value, str) and value.strip().isdigit():
         value = int(value)
     return _strict_integer("lmcache.chunk_size", value, minimum=1)

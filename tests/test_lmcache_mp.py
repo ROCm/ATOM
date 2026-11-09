@@ -48,7 +48,7 @@ from atom.kv_transfer.offload.mp import (
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
-from atom.kv_transfer.offload.mp.token_shipping import TokenShipper
+from atom.kv_transfer.offload.mp.token_shipping import TokenShipper, token_list
 from tests.lmcache_mp_support import close_workers, cpu_step_events  # noqa: F401
 from tests.lmcache_mp_support import settle as _settle
 from tests.lmcache_mp_support import start_transfers as _start_transfers
@@ -1082,8 +1082,6 @@ def fake_lmcache_modules(monkeypatch):
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
-    # The fake server below runs on 8-token chunks; the configured one must match.
-    monkeypatch.setenv("LMCACHE_CHUNK_SIZE", "8")
 
 
 class _WorkerAdapter:
@@ -2351,7 +2349,7 @@ def _send(worker, *reqs):
     meta.requests = list(reqs)
     sent = pickle.loads(pickle.dumps(meta))
     _start(worker, sent)
-    worker._received.extend(r.token_ids for r in sent.requests)
+    worker._received.extend(token_list(r.token_ids) for r in sent.requests)
 
 
 def test_incremental_tokens_round_trip_through_the_worker_shell():
@@ -2451,29 +2449,6 @@ def test_the_session_end_drops_the_workers_copy(monkeypatch):
     assert sched._token_shipper._drops == [7]
 
 
-def test_a_failed_build_does_not_count_as_shipped():
-    """A metadata build that raises after shipping loses its metadata: the
-    workers never got the tokens, so the request's next transfer must ship them
-    again instead of starting from a base the workers do not hold."""
-    import array
-
-    sched, shell, received = _shipping_pair()
-    seq = SimpleNamespace(id=7, token_ids=array.array("i", range(100)))
-    shipper = sched._token_shipper
-    first = shipper.ship(seq, 40)
-    _send(shell, SimpleNamespace(req_id=7, token_ids=first))
-
-    shipper.begin()
-    lost = shipper.ship(seq, 80)  # shipped into a build that then fails
-    assert lost.base == 40
-    shipper.rollback()
-
-    retry = shipper.ship(seq, 80)
-    assert retry.base == 40 and len(retry.tokens) == 40
-    _send(shell, SimpleNamespace(req_id=7, token_ids=retry))
-    assert list(received[-1]) == list(range(80))
-
-
 def test_drops_reach_the_workers_without_a_transfer():
     """A finished request's copy goes with the next metadata even when no
     transfer is left to carry it."""
@@ -2496,15 +2471,29 @@ def test_drops_reach_the_workers_without_a_transfer():
 
 
 def test_a_chunk_configured_differently_from_the_mp_server_stops_startup(monkeypatch):
-    """DP routing predicts loads from the configured chunk, so a worker whose
-    server runs on another one refuses to start."""
+    """Only `prefix_spread` reads the configured chunk (to predict loads), so
+    only it is refused when the server runs on another one; any other strategy
+    keeps running on the server's chunk, as before."""
     monkeypatch.setenv("LMCACHE_CHUNK_SIZE", "256")
-    adapter = SimpleNamespace(lmcache_tokens_per_chunk=512)
-    with pytest.raises(ValueError, match="must match the server"):
-        deployment.require_chunk_matches_server(adapter, _config())
+    server_512 = SimpleNamespace(lmcache_tokens_per_chunk=512)
+    config = _config()
+    config.dp_load_balance = "least_requests"
+    deployment.require_chunk_matches_server(server_512, config)
+    config.dp_load_balance = "prefix_spread"
+    with pytest.raises(ValueError, match="configured chunk to match the server"):
+        deployment.require_chunk_matches_server(server_512, config)
     deployment.require_chunk_matches_server(
-        SimpleNamespace(lmcache_tokens_per_chunk=256), _config()
+        SimpleNamespace(lmcache_tokens_per_chunk=256), config
     )
+    monkeypatch.delenv("LMCACHE_CHUNK_SIZE")
+    config.kv_transfer_config = {
+        **config.kv_transfer_config,
+        "kv_connector_extra_config": {
+            **config.kv_transfer_config.get("kv_connector_extra_config", {}),
+            "lmcache.chunk_size": 512,
+        },
+    }
+    deployment.require_chunk_matches_server(server_512, config)
 
 
 def _checkpointed_transfer_tensors(*, num_blocks: int = 16) -> KVTransferTensors:
@@ -2968,3 +2957,22 @@ def test_the_vllm_plugin_path_resolves_shipped_tokens():
     save = sched._build_save_request(seq, 0, 256, None, [0], False)
     _send(worker, save)
     assert received == [list(range(256))]
+
+
+def test_resolve_does_not_copy_the_prefix():
+    """`resolve` only extends the worker copy; the list is built where a
+    transfer is submitted, and the prefix it names survives later shipments."""
+    import array
+
+    from atom.kv_transfer.offload.mp.token_shipping import TokenPrefix
+
+    sched, worker, _ = _shipping_pair()
+    seq = SimpleNamespace(id=7, token_ids=array.array("i", range(600)))
+    first = SimpleNamespace(req_id=7, token_ids=sched._token_shipper.ship(seq, 256))
+    meta = SimpleNamespace(requests=[first])
+    worker._tokens.resolve(meta)
+    assert isinstance(first.token_ids, TokenPrefix) and len(first.token_ids) == 256
+    later = SimpleNamespace(req_id=7, token_ids=sched._token_shipper.ship(seq, 600))
+    worker._tokens.resolve(SimpleNamespace(requests=[later]))
+    assert token_list(first.token_ids) == list(range(256))
+    assert token_list(later.token_ids) == list(range(600))

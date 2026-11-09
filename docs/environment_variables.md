@@ -457,6 +457,7 @@ derive a bound.
 | **OFFLOAD_PUBLICATION_TIMEOUT_S** | float | 5.0 | DSV4 in-process wait for a saved SLOT sidecar to become visible (finite, ≥ 0). |
 | **OFFLOAD_PUBLICATION_POLL_INTERVAL_S** | float | 0.01 | Poll period of that wait (finite, > 0). |
 | **LMCACHE_MP_TRANSFER_MODE** | str | auto | `lmcache_mp` transfer mode: `auto` or `lmcache_driven` (`engine_driven` is rejected). Overridden by `lmcache.mp.mp_transfer_mode`. |
+| **LMCACHE_CHUNK_SIZE** | int | 256 | LMCache's chunk size in tokens (an `lmcache.chunk_size` extra takes precedence). With `--dp-load-balance prefix_spread` and `lmcache_mp`, it must equal the MP server's `--chunk-size`; startup refuses a mismatch. |
 | **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's source-pin timeout. ATOM reads it only to derive the engine's save-abandon window (`pin + 30s`), so the two stay ordered: a lost store report is reclaimed only after LMCache would already have force-unpinned its source. Non-positive disables ATOM's reclamation. ATOM sets no default of its own and, when unset, assumes LMCache's. |
 
 ## KV cache events

@@ -2086,3 +2086,57 @@ def test_admission_deadline_stops_at_source_allocation(monkeypatch, seq_factory)
     assert list(seq.block_table) == blocks
     assert not seq.kv_transfer_params.get("prefill_aborted")
     assert str(seq.id) in p.kv_connector._awaiting_send
+
+
+def test_unschedulable_reject_on_a_pd_offload_node_tells_only_the_offload_tier(
+    monkeypatch, seq_factory
+):
+    """A prompt rejected as unschedulable on a P/D prefill node with an offload
+    tier (`multi`) never ran, so it has no output token. Telling the chunked
+    Mooncake producer it finished makes it read `output_tokens[0]` and stops
+    the engine; only the offload tier is released."""
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorScheduler,
+    )
+    from atom.model_engine.scheduler import Scheduler
+
+    producer = scheduler_connector(monkeypatch, True)
+    finished = []
+    offload = SimpleNamespace(
+        is_offload=True,
+        cancel_pending_load=lambda seq: None,
+        request_finished=lambda seq: finished.append(seq.id),
+    )
+    multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+    multi._connectors = [producer, offload]
+    multi.is_producer = True
+    multi.is_offload = True
+    multi._load_winner = {}
+
+    seq = seq_factory(
+        list(range(10)),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_decode": True,
+            "transfer_id": "unschedulable",
+        },
+    )
+    seq.leave_reason = "unschedulable: prompt exceeds max_model_len"
+    # The defect this guards against: the producer cannot finish it.
+    with pytest.raises(IndexError):
+        multi.request_finished(seq)
+
+    seq2 = seq_factory(
+        list(range(10)),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_decode": True,
+            "transfer_id": "unschedulable-2",
+        },
+    )
+    seq2.leave_reason = "unschedulable: prompt exceeds max_model_len"
+    sched = Scheduler.__new__(Scheduler)
+    sched.kv_connector = multi
+    sched._release_unrun_offload(seq2)
+    assert finished == [seq2.id]
+    assert not producer.should_defer_free(seq2)

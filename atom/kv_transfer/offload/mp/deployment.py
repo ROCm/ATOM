@@ -46,16 +46,24 @@ def _storage_kv_transfer_config(config: Any) -> dict[str, Any]:
 
 
 def require_chunk_matches_server(adapter: Any, config: Any) -> None:
-    """The chunk routing assumes (`offcfg.lmcache_chunk_tokens`) must be the one
-    the MP server runs on. DP routing predicts what loads from the configured
-    chunk before any server is asked; a different server chunk skews its
-    estimates, so a mismatch stops startup instead."""
+    """Under `prefix_spread`, the chunk the router predicts loads with
+    (`offcfg.lmcache_chunk_tokens`) must be the one the MP server runs on.
+
+    The router reads the configured chunk before any server is asked; a
+    different server chunk would skew its load estimates. Nothing else reads
+    the configured value -- the connector itself runs on the server's chunk --
+    so other strategies are not checked. Called by both worker registrations
+    (PAGE-only and native-state).
+    """
+    if getattr(config, "dp_load_balance", None) != "prefix_spread":
+        return
     configured = offcfg.lmcache_chunk_tokens(_storage_kv_transfer_config(config))
     server = int(adapter.lmcache_tokens_per_chunk)
     if configured != server:
         raise ValueError(
-            "LMCache MP chunk size must match the server: configured "
-            f"{configured} (lmcache.chunk_size or LMCACHE_CHUNK_SIZE), server {server}"
+            "--dp-load-balance prefix_spread with LMCache MP needs the "
+            f"configured chunk to match the server: configured {configured} "
+            f"(lmcache.chunk_size or LMCACHE_CHUNK_SIZE), server {server}"
         )
 
 

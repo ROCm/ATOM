@@ -3,8 +3,9 @@
 Use a shared Mooncake Store to recover a published prefix after `prefix_spread`
 routes a request to another DP rank. This path does not run LMCache MP. HBM
 prefix caching remains enabled: local hits stay local, and Store restores only
-the missing PAGEs. V4.1 reconstructs its per-request STATE by replay; a backend
-without that explicit replay contract is rejected at KV registration.
+the missing PAGEs. V4.1 reconstructs its per-request STATE by replay, which
+needs encoder SWA bounded replay (the default); startup refuses the Store
+without it.
 
 ## Store and model setup
 
@@ -31,10 +32,8 @@ export ATOM_KV_OFFLOAD_EXTRA_CONFIG='{
 }'
 export ATOM_FRONTEND_PREFIX_HASH=1
 export OFFLOAD_MIN_LOAD_TOKENS=512
-export OFFLOAD_MIN_SAVE_TOKENS=512
 export OFFLOAD_MAX_PENDING_SAVES=8
-# One RDMA queue pair per endpoint: the Store client's transfers share the
-# NIC with the model's own traffic, and more pairs only add contention.
+# Required in every Mooncake process (see the offload README).
 export MC_NUM_QP_PER_EP=1
 unset ATOM_DP_SESSION_AFFINITY
 ```

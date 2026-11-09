@@ -197,32 +197,24 @@ def parse_mooncake_store_config(
 
 
 def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> None:
-    """Require dense KV or V4.1 replay PAGEs, no DCP, and whole chunks.
+    """Require dense KV or V4.1's PAGEs, no DCP, and whole chunks.
 
     The Store holds one object per (rank, chunk) of the dense codec's opaque
-    block bytes. V4.1 supplies PAGE regions and reconstructs request state by
-    replay; the worker checks that explicit contract before registering KV.
-    Other hybrid layouts need a state tier this connector does not carry. A
-    DCP rank's pages cover a virtual block that the chunk keys do not name.
+    block bytes, or of V4.1's PAGE regions, whose request state is rebuilt by
+    replay. That V4.1 on the Store needs bounded replay is the model's own
+    runtime gate (`deepseek_v41.config.validate_runtime_config`). Other hybrid
+    layouts need a state tier this connector does not carry. A DCP rank's
+    pages cover a virtual block that the chunk keys do not name.
 
     Raises:
-        ValueError: The model is neither dense nor V4.1 with bounded replay,
-            DCP > 1, or the chunk is not a whole number of KV blocks.
+        ValueError: The model is neither dense nor V4.1, DCP > 1, or the chunk
+            is not a whole number of KV blocks.
     """
     layout = offcfg.select_offload_layout(config)
     if layout not in ("dense", _REPLAY_PAGE_LAYOUT):
         raise ValueError(
             "the Mooncake Store offload moves the dense KV layout and V4.1's "
             f"replay PAGEs; this model resolves to {layout!r}"
-        )
-    if layout == _REPLAY_PAGE_LAYOUT and not getattr(
-        config, "enable_encoder_swa_bounded_replay", False
-    ):
-        # V4.1 without bounded replay copies its state instead of replaying
-        # it: the Store's PAGE-only load would be unsound.
-        raise ValueError(
-            "the Mooncake Store offload moves V4.1's PAGEs only with "
-            "enable_encoder_swa_bounded_replay"
         )
     dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
     if dcp > 1:

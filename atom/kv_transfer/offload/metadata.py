@@ -154,7 +154,7 @@ class LMCacheReqMeta:
     # LMCache's ChunkedTokenDatabase). For load: prompt[:lmcache_cached_tokens];
     # for save: computed token ids. LMCache MP ships `ShippedTokens` (the part the
     # workers do not hold yet); its worker shell resolves it to the token ids
-    # (a list) before anything reads this.
+    # (`TokenPrefix`) before anything reads this.
     token_ids: list[int] | ShippedTokens
     # The sequence's GPU block table (logical block ids). A chunk spanning token
     # range [start, end) maps to blocks block_ids[start // bs : ceil(end / bs)].

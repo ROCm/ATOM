@@ -3844,18 +3844,14 @@ def test_pure_page_codec_rejects_missing_fused_staging(monkeypatch):
         page_codec.pure_page_codec([object()], 8)
 
 
-def test_plain_v4_and_v41_without_replay_are_refused_before_weights_load():
-    """Plain DeepSeek-V4 is the "hybrid" layout and V4.1 without bounded replay
-    copies its state: both are refused at construction, not at registration."""
+def test_plain_v4_is_refused_before_weights_load():
+    """Plain DeepSeek-V4 resolves to the "hybrid" layout, which the Store does
+    not move: refused at construction, not at registration. (V4.1 without
+    bounded replay is the model's own runtime gate.)"""
     plain_v4 = _config()
     plain_v4.hf_config.compress_ratios = [4, 128]
     with pytest.raises(ValueError, match="resolves to 'hybrid'"):
         check_engine_compatibility(parse_mooncake_store_config(_extra()), plain_v4)
-    v41 = _config()
-    v41.hf_config.model_type = "deepseek_v41"
-    v41.enable_encoder_swa_bounded_replay = False
-    with pytest.raises(ValueError, match="enable_encoder_swa_bounded_replay"):
-        check_engine_compatibility(parse_mooncake_store_config(_extra()), v41)
 
 
 @pytest.mark.parametrize(

@@ -13,13 +13,12 @@ Here the scheduler (`TokenShipper`) sends only the tokens past what the
 workers already hold, as an `array('i')` slice (it pickles as raw bytes), in a
 `ShippedTokens` that rides in `LMCacheReqMeta.token_ids`. Each worker shell
 (`WorkerTokens`) appends it to its own `array('i')` copy of the request's
-prefix (4 bytes a token) and hands the transfer the list it covers.
+prefix (4 bytes a token); a transfer builds the list of the part it covers
+only when it is submitted (`token_list`).
 
-The scheduler only counts a shipment as delivered once the metadata carrying it
-was built (`begin` / `commit` / `rollback`): a build that raises after shipping
-would otherwise leave the workers a prefix behind and fail the request's next
-transfer. A finished request's copy is dropped through the metadata's
-`token_drops`, which makes the step work even when no transfer is left.
+A finished request's copy is dropped through the metadata's `token_drops`,
+which counts as pending work (`has_drops`), so the drop is delivered even when
+no transfer is left.
 """
 
 from __future__ import annotations
@@ -50,21 +49,6 @@ class TokenShipper:
         # to tell a reused id from it.
         self._shipped: dict[Any, tuple[Any, int]] = {}
         self._drops: list = []
-        self._snapshot: tuple[dict, list] | None = None
-
-    def begin(self) -> None:
-        """Start a metadata build: what `ship` and `drop` do is provisional."""
-        self._snapshot = (dict(self._shipped), list(self._drops))
-
-    def commit(self) -> None:
-        """The metadata was built: its shipments are delivered."""
-        self._snapshot = None
-
-    def rollback(self) -> None:
-        """The build failed and its metadata is lost: forget what it shipped."""
-        if self._snapshot is not None:
-            self._shipped, self._drops = self._snapshot
-            self._snapshot = None
 
     def has_drops(self) -> bool:
         """Whether a finished request's worker copy still waits for a metadata
@@ -106,7 +90,7 @@ class WorkerTokens:
 
     def resolve(self, metadata: Any) -> None:
         """Drop finished requests' copies, and replace each request's
-        `ShippedTokens` with its token prefix (a fresh list)."""
+        `ShippedTokens` with its token prefix (`TokenPrefix`, not a copy)."""
         held = self._held
         for req_id in getattr(metadata, "token_drops", ()) or ():
             held.pop(req_id, None)
@@ -133,10 +117,39 @@ class WorkerTokens:
                     f"LMCache MP token copy for {req.req_id!r} holds "
                     f"{len(tokens)} tokens, the transfer needs {shipped.end}"
                 )
-            # A fresh list (what `AtomMPTransferSpec.token_ids` is), boxed once
-            # here in C and private to this transfer: the thread that reads it
-            # runs after later shipments have extended the held array.
-            req.token_ids = tokens[: shipped.end].tolist()
+            # No copy here: a transfer that is submitted (not every rank
+            # writes) builds its list when it builds its spec (`token_list`).
+            req.token_ids = TokenPrefix(tokens, shipped.end)
 
 
-__all__ = ["ShippedTokens", "TokenShipper", "WorkerTokens"]
+class TokenPrefix:
+    """The first `end` tokens of a request's worker copy, not copied.
+
+    The held array only grows past `end` (a reused request id gets a new
+    array), so reading its first `end` tokens later -- on the transfer thread,
+    after newer shipments extended it -- sees the same tokens.
+    """
+
+    __slots__ = ("_end", "_tokens")
+
+    def __init__(self, tokens: array, end: int) -> None:
+        self._tokens = tokens
+        self._end = int(end)
+
+    def __len__(self) -> int:
+        return self._end
+
+    def tolist(self) -> list[int]:
+        return self._tokens[: self._end].tolist()
+
+
+def token_list(token_ids: Any) -> list[int]:
+    """The list `AtomMPTransferSpec` takes: built once, where a transfer is
+    actually submitted."""
+    if isinstance(token_ids, list):
+        return token_ids
+    tolist = getattr(token_ids, "tolist", None)
+    return tolist() if callable(tolist) else list(token_ids)
+
+
+__all__ = ["ShippedTokens", "TokenPrefix", "TokenShipper", "WorkerTokens", "token_list"]

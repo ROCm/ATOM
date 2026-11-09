@@ -54,7 +54,7 @@ from atom.kv_transfer.offload.mp.native_state_layout import (
     stores_state_images,
 )
 from atom.kv_transfer.offload.mp.page_views import _build_cache_views
-from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
+from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens, token_list
 from atom.kv_transfer.offload.mp.transfer import (
     _chunk_ranges,
     _enforce_transfer_deadline,
@@ -313,6 +313,7 @@ class LMCacheMPConnector(KVConnectorBase):
         try:
             self._refuse_unfenceable_adapter(adapter)
             require_native_state_server(adapter, self._config)
+            deployment.require_chunk_matches_server(adapter, self._config)
             chunk_size = int(adapter.lmcache_tokens_per_chunk)
             layout = build_native_state_mp_layout(
                 transfer_tensors,
@@ -654,7 +655,7 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"({self.chunk_size})"
                 )
             op = AtomMPTransferSpec(
-                token_ids=req.token_ids,
+                token_ids=token_list(req.token_ids),
                 block_ids=self._transfer_block_ids(req, start, end, loading=True),
                 start=start,
                 end=end,
@@ -741,7 +742,7 @@ class LMCacheMPConnector(KVConnectorBase):
             return
         try:
             op = AtomMPTransferSpec(
-                token_ids=req.token_ids,
+                token_ids=token_list(req.token_ids),
                 block_ids=self._transfer_block_ids(req, start, end, loading=False),
                 start=start,
                 end=end,

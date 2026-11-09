@@ -1046,7 +1046,7 @@ class TestSchedule:
         sched.failed_recving_kv_req_ids = []
         sched.kv_connector = None  # P/D: resolved at admission
 
-        sched._promote_ready_remote_kv_requests()
+        sched._resolve_finished_receives()
 
         assert [seq.id for seq in sched.waiting] == [2, 1, 3]
 
@@ -1295,6 +1295,52 @@ class TestWaitingNewTokenCount:
         oversized = seq_factory(list(range(200)))  # > max_model_len=64
         sched.waiting = deque([normal, oversized])
         assert sched._waiting_new_token_count() == 8
+
+    def test_an_unschedulable_reject_releases_only_the_offload_tier(self, seq_factory):
+        """A prompt over max_model_len is rejected before it runs. A `multi`
+        P/D + offload connector releases its offload sub only: the P/D sub
+        would treat the request as a finished prefill and fail on its missing
+        first token. Without an offload tier nothing is called (as before)."""
+        events = []
+
+        class _Multi:
+            is_offload = True
+
+            def cancel_pending_load(self, seq):
+                events.append(("cancel", seq.id))
+
+            def offload_request_finished(self, seq):
+                events.append(("offload_finished", seq.id))
+
+            def request_finished(self, seq):
+                raise IndexError("a P/D producer reads output_tokens[0]")
+
+        sched = self._sched()
+        oversized = seq_factory(list(range(200)))  # > max_model_len=64
+        sched.kv_connector = _Multi()
+        sched._release_unrun_offload(oversized)
+        assert events == [
+            ("cancel", oversized.id),
+            ("offload_finished", oversized.id),
+        ]
+
+        sched.kv_connector = SimpleNamespace(
+            is_offload=False,
+            request_finished=lambda seq: pytest.fail("P/D only: not called"),
+        )
+        sched._release_unrun_offload(oversized)
+
+    def test_the_unschedulable_branch_releases_the_offload_tier(
+        self, seq_factory, monkeypatch
+    ):
+        sched = self._sched()
+        released = []
+        monkeypatch.setattr(sched, "_release_unrun_offload", released.append)
+        oversized = seq_factory(list(range(200)))
+        sched.add(oversized)
+        sched.schedule()
+        assert released == [oversized]
+        assert oversized.leave_reason.startswith("unschedulable")
 
     def test_saturates_at_cap(self, seq_factory):
         sched = Scheduler(
