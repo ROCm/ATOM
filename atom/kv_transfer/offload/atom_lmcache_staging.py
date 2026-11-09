@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import logging
-import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -43,57 +41,6 @@ def memory_object_as_uint8(memory_obj: Any, nbytes: int) -> torch.Tensor:
     return flat[: int(nbytes)]
 
 
-_LOAD_PRIORITY_LOGGED = False
-
-# The stream the forward runs on, recorded from the model runner's thread
-# (`set_compute_stream`) at registration, by the offload connector at each step
-# and by a runner that picks a stream per forward (the disaggregated prefill
-# pool). A transfer state that follows it runs both staging legs on it.
-_COMPUTE_STREAM = None
-
-
-def set_compute_stream(stream) -> None:
-    """Record the stream the forward runs on; the latest one wins."""
-    global _COMPUTE_STREAM
-    if stream is not None:
-        _COMPUTE_STREAM = stream
-
-
-def compute_stream():
-    """The stream offload staging must use, or None for its own streams.
-
-    Offload pack/unpack kernels on a stream of their own run concurrently with
-    the forward. On ROCm a kernel that needs every CU co-resident (a
-    persistent kernel, one CTA per CU) can then wait for CUs those kernels
-    hold while they wait for it, and the engine hangs with the GPU at 100%:
-    seen with Mooncake Store saves on a side stream, both GPUs of a DP pair
-    frozen for minutes, host-side event waits notwithstanding. On the
-    forward's stream the transfers run between forward kernels instead.
-    """
-    return _COMPUTE_STREAM
-
-
-def load_stream_priority() -> int:
-    """Stream priority for a transfer stream created on the calling thread.
-
-    Streams created on a load worker (thread name ``*-load_*``) get the device's highest priority, so a load's
-    copy and scatter kernels are dispatched ahead of queued forward kernels.
-    Save threads and everything else keep the default priority (0).
-    """
-    global _LOAD_PRIORITY_LOGGED
-    if "-load" not in threading.current_thread().name:
-        return 0
-    _, greatest = torch.cuda.Stream.priority_range()
-    if not _LOAD_PRIORITY_LOGGED:
-        _LOAD_PRIORITY_LOGGED = True
-        logging.getLogger(__name__).info(
-            "Offload load streams use priority %d (thread %s)",
-            greatest,
-            threading.current_thread().name,
-        )
-    return int(greatest)
-
-
 class _NullCtx:
     def __enter__(self):
         return None
@@ -118,21 +65,28 @@ class _ThreadTransferState:
         self,
         device: torch.device,
         use_cuda: bool,
+        compute_stream_provider: Callable[[], Any] | None = None,
     ) -> None:
         self.device = device
         self._pack_stream = None
         self._copy_stream = None
-        # With the forward's stream known, both legs run on it, and follow it
-        # if the runner moves to another, between transfers (`begin_transfer`):
-        # `run_staged_pipeline` then skips the cross-stream handshake entirely.
-        self._pinned_stream = compute_stream() if use_cuda else None
-        self._follows_compute_stream = self._pinned_stream is not None
-        if use_cuda and not self._follows_compute_stream:
-            priority = load_stream_priority()
+        # A connector that stages on the forward's stream (`compute_stream_provider`:
+        # the Mooncake Store) runs both legs on it, so offload kernels never run
+        # concurrently with forward kernels; `run_staged_pipeline` then skips the
+        # cross-stream handshake entirely. Anyone else gets side streams.
+        self._provider = compute_stream_provider
+        self._pinned_stream = (
+            compute_stream_provider() if use_cuda and compute_stream_provider else None
+        )
+        if use_cuda and self._pinned_stream is None:
             with torch.cuda.device(device):
-                self._pack_stream = torch.cuda.Stream(priority=priority)
-                self._copy_stream = torch.cuda.Stream(priority=priority)
+                self._pack_stream = torch.cuda.Stream()
+                self._copy_stream = torch.cuda.Stream()
         self.staging_buffer = _StagingBuffer(use_cuda)
+
+    @property
+    def follows_compute_stream(self) -> bool:
+        return self._pinned_stream is not None
 
     def begin_transfer(self) -> None:
         """Pin the stream this transfer stages on. A runner that picks a stream
@@ -140,20 +94,16 @@ class _ThreadTransferState:
         runs; the block-ID upload, both stages, the callbacks and the final fence
         must all use one stream, so the switch happens only here, between
         completed transfers."""
-        if self._follows_compute_stream:
-            self._pinned_stream = compute_stream() or self._pinned_stream
+        if self._pinned_stream is not None:
+            self._pinned_stream = self._provider() or self._pinned_stream
 
     @property
     def pack_stream(self):
-        return (
-            self._pinned_stream if self._follows_compute_stream else self._pack_stream
-        )
+        return self._pack_stream if self._pinned_stream is None else self._pinned_stream
 
     @property
     def copy_stream(self):
-        return (
-            self._pinned_stream if self._follows_compute_stream else self._copy_stream
-        )
+        return self._copy_stream if self._pinned_stream is None else self._pinned_stream
 
     def stream_ctx(self, stream):
         if stream is None:
@@ -204,11 +154,7 @@ def run_staged_pipeline(
     try:
         for group in groups:
             if fenced and staging_buffer.free_event_valid:
-                # Host waits throughout, never a device-side `wait_event`: on
-                # ROCm that is a polling kernel which can deadlock against a
-                # co-resident persistent kernel on the compute stream (see
-                # `BlockGPUConnector._wait_for_save_source`).
-                staging_buffer.free_event.synchronize()
+                stage_a.stream.wait_event(staging_buffer.free_event)
             with state.stream_ctx(stage_a.stream):
                 # ``ensure_buffer`` may allocate device storage. Allocate it on
                 # the first consumer stream so a caching allocator cannot
@@ -219,7 +165,7 @@ def run_staged_pipeline(
                 stage_a.run(group, device_buf)
             if fenced:
                 staging_buffer.ready_event.record(stage_a.stream)
-                staging_buffer.ready_event.synchronize()
+                stage_b.stream.wait_event(staging_buffer.ready_event)
             with state.stream_ctx(stage_b.stream):
                 stage_b.run(group, device_buf)
             if fenced:

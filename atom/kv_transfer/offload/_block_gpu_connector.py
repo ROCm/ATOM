@@ -202,8 +202,12 @@ class BlockGPUConnector:
         virtual_block_size: int | None = None,
         source_safe_callback: Callable[[SaveSourceGroupId], None] | None = None,
         max_staging_bytes: int | None = None,
+        compute_stream_provider: Callable[[], Any] | None = None,
     ) -> None:
         self.codec = codec
+        # Set by a connector that stages on the forward's stream (the Mooncake
+        # Store); every other user keeps side streams.
+        self._compute_stream_provider = compute_stream_provider
         self.physical_block_size = int(block_size)
         if self.physical_block_size <= 0:
             raise ValueError("ATOM LMCache connector: block_size must be > 0")
@@ -435,26 +439,24 @@ class BlockGPUConnector:
             state = _ThreadTransferState(
                 self.device,
                 self._use_cuda(),
+                self._compute_stream_provider,
             )
             states[key] = state
         return state
 
     @staticmethod
     def _wait_for_save_source(state, producer_event) -> None:
-        """Order the pack after the KV producer, on the host.
+        """Order the actual pack stream after the KV producer stream.
 
         Must run before this call enqueues anything on ``state.pack_stream``:
         the block-ID upload and every stage-A pack are ordered behind the
-        producer only because they are enqueued after this wait.
+        producer only because they are enqueued after this wait. A staging
+        state without a pack stream cannot honor the dependency; the fused
+        staging pipeline rejects that device anyway, so refuse loudly instead of
+        host-synchronizing on the save thread.
 
-        The wait is a host wait on the save thread, never a device-side
-        ``wait_event``. On ROCm a stream wait on an unfinished event is a
-        one-work-item kernel that polls the event; when the engine's stream
-        runs a kernel that needs every CU co-resident (a persistent kernel,
-        one CTA per CU), that polling kernel can hold the slot one of its CTAs
-        needs while it waits for the signal that kernel would set, and both
-        hang. The save thread is off the scheduler's path, so blocking it
-        costs nothing the engine waits on.
+        A state that stages on the forward's stream needs no wait: the producer
+        recorded its event on that stream, whose order already holds.
         """
 
         if state.pack_stream is None:
@@ -462,7 +464,9 @@ class BlockGPUConnector:
                 "ATOM LMCache connector: producer fence requires a CUDA/HIP "
                 "pack stream"
             )
-        producer_event.synchronize()
+        if state.follows_compute_stream:
+            return
+        state.pack_stream.wait_event(producer_event)
 
     def _ensure_staging_buffer(
         self,

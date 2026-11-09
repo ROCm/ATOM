@@ -29,6 +29,10 @@ class KVConnectorBase(ABC):
 
     is_producer: bool
 
+    def set_forward_stream(self, stream: Any) -> None:
+        """The stream the model runner is about to run a forward on. Only a
+        connector that stages transfers on it (the Mooncake Store) keeps it."""
+
     @classmethod
     def kv_budget_reserve_bytes(cls, config: Any) -> int:
         """GPU bytes this backend allocates once the KV cache is sized.

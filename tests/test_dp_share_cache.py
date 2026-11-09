@@ -248,4 +248,4 @@ def test_the_backlog_report_skips_aborted_requests_and_bounds_its_scan(monkeypat
     monkeypatch.setattr(EngineCore, "_BACKLOG_SCAN", 10)
     engine, sent = _engine_with([live] * 100)
     engine._report_prefill_backlog()
-    assert sent[-1] == ("PREFILL_BACKLOG", (0, 10_000))  # 
+    assert sent[-1] == ("PREFILL_BACKLOG", (0, 10_000))  # 10 scanned, 90 extrapolated
