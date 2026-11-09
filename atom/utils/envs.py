@@ -723,8 +723,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # regression is suspected -- the fastest way to rule this kernel in or out,
     # since the two paths are not bit-identical by construction. Read once when
     # the Markov head is built, so it must be set before the server starts.
-    # Once ATOM_SPEC_LOSSLESS_SAMPLING arms, Kimi-K3 drafts every row through
-    # the sampled block whatever this says.
+    # Once ATOM_SPEC_LOSSLESS_SAMPLING arms, Kimi-K3 honours this only on steps
+    # that replay the greedy block (no row draws q).
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
