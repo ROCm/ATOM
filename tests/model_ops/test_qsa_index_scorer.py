@@ -87,6 +87,7 @@ def make_fake_api(
         row_starts=None,
         allow_flydsl=False,
         compressed_k_scale=None,
+        stacked_decode=False,
         *,
         logits=None,
         visible_groups=None,
@@ -100,6 +101,7 @@ def make_fake_api(
                 "row_starts": row_starts,
                 "allow_flydsl": allow_flydsl,
                 "compressed_k_scale": compressed_k_scale,
+                "stacked_decode": stacked_decode,
             }
         )
         if op_raises is not None:
@@ -127,8 +129,9 @@ def make_fake_api(
             {
                 "enabled": True,
                 "profile": P,
-                "kernel_sha": "c01cf365",
-                "api_version": "1",
+                "kernel_sha256": "6b537f3b",
+                "api_version": 1,
+                "origin": "atom:Config.qsa_index_scorer.profile",
             }
             if status is None
             else status
@@ -405,7 +408,7 @@ def test_configure_once_per_process_with_profile_and_source(fake_api, caplog):
         if r.getMessage().startswith("QSA index scorer [dp0_tp0]")
     ]
     assert len(lines) == 1
-    assert f"enabled profile={P}" in lines[0] and "kernel_sha=c01cf365" in lines[0]
+    assert f"enabled profile={P}" in lines[0] and "kernel_sha256=6b537f3b" in lines[0]
 
 
 def test_status_reporting_fused_off_still_uses_the_op(fake_api, caplog):
@@ -507,6 +510,9 @@ def test_select_scores_through_the_neutral_op_with_all_12_args(
         assert c["max_columns"] == 64 and c["allow_flydsl"] is True
         assert c["compressed_k_scale"] is kw["compressed_k_scale"]
         assert c["row_starts"] is not None and c["row_starts"].dtype == torch.int32
+        # ATOM passes the contract's 12 leading params only (aiter's 13th,
+        # stacked_decode, stays at its default).
+        assert c["stacked_decode"] is False
 
 
 def test_op_errors_propagate_without_an_atom_fallback(
