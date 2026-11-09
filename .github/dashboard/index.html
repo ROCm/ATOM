@@ -301,6 +301,118 @@
     .heatmap-table th { text-align: center; padding: 6px 10px; border-bottom: 2px solid var(--border); color: var(--text-tertiary); font-weight: 500; font-size: 11px; background: var(--bg-secondary); }
     .heatmap-table td { text-align: center; padding: 6px 10px; border: 1px solid var(--border-light); font-family: "SF Mono", monospace; font-size: 11px; color: var(--text-primary); }
     .heatmap-table td.row-label { text-align: left; font-family: inherit; color: var(--text-secondary); white-space: nowrap; }
+
+    /* Single-model performance explorer. Scoped to the disaggregated chart view. */
+    body.explorer { --explorer-accent: #da84c7; --explorer-soft: #29202d; background: #111117; }
+    [data-theme="light"] body.explorer { --explorer-accent: #a83b91; --explorer-soft: #f6eaf4; background: #f7f7fb; }
+    .explorer header { border-bottom: 1px solid var(--border-light); max-width: none; padding: 18px max(28px, calc((100vw - 1400px) / 2)); }
+    .explorer h1 { font-size: 16px; letter-spacing: -.3px; }
+    .explorer .header-logo { height: 30px; }
+    .explorer .header-left { gap: 18px; }
+    .explorer .header-left > div { padding-right: 40px; }
+    .explorer .theme-toggle { right: 0; }
+    .explorer .meta { font-size: 10px; }
+    .explorer .container { max-width: 1456px; padding: 16px 28px 40px; }
+    .explorer #kpi-row, .explorer .filter-group:has([data-filter="models"]), .explorer .filter-summary { display: none; }
+    .explorer .dashboard-mode-group { position: static; }
+    .explorer .filter-btn { padding: 8px 11px; }
+    .explorer .tabs { margin-bottom: 30px; gap: 12px; }
+    .explorer .tab { padding: 9px 4px 14px; margin-right: 18px; font-weight: 500; }
+    .explorer .tab.active { border-color: var(--explorer-accent); color: var(--explorer-accent); }
+    .ex-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 26px; }
+    .ex-eyebrow { font-size: 10px; font-weight: 700; letter-spacing: 1.9px; color: var(--explorer-accent); margin-bottom: 9px; }
+    .ex-heading h2 { font-size: 30px; letter-spacing: -1px; font-weight: 650; color: var(--text-primary); }
+    .ex-subtitle { color: var(--text-tertiary); font-size: 13px; margin-top: 8px; line-height: 1.7; }
+    .ex-badge { display: inline-flex; align-items: center; gap: 7px; padding: 7px 10px; border-radius: 6px; background: var(--explorer-soft); color: var(--explorer-accent); font-size: 11px; font-weight: 600; }
+    .ex-badge::before { content: ''; width: 5px; height: 5px; background: currentColor; border-radius: 50%; }
+    .ex-controls { display: grid; grid-template-columns: 1.25fr 1.15fr 1fr; gap: 18px; padding: 20px 22px; border: 1px solid var(--border-light); background: var(--bg-secondary); border-radius: 12px; }
+    .ex-field { min-width: 0; }
+    .ex-field label { display: block; font-size: 10px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; color: var(--text-tertiary); margin-bottom: 9px; }
+    .ex-field select { width: 100%; border: 1px solid var(--border); border-radius: 7px; color: var(--text-primary); background: var(--bg-secondary); padding: 10px 32px 10px 12px; font: inherit; font-size: 13px; cursor: pointer; text-overflow: ellipsis; }
+    .ex-stats { display: grid; grid-template-columns: repeat(4, 1fr); padding: 25px 4px 27px; }
+    .ex-stat { padding: 0 24px; border-right: 1px solid var(--border-light); }
+    .ex-stat:first-child { padding-left: 0; }
+    .ex-stat:last-child { border: none; }
+    .ex-stat-label { font-size: 11px; color: var(--text-tertiary); margin-bottom: 7px; }
+    .ex-stat-value { font-size: 27px; font-weight: 650; letter-spacing: -1px; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+    .ex-stat-value small { font-size: 11px; color: var(--text-tertiary); font-weight: 400; letter-spacing: 0; }
+    .ex-stat-note { font-size: 11px; margin-top: 5px; color: var(--text-tertiary); }
+    .ex-panel { background: var(--bg-secondary); border: 1px solid var(--border-light); border-radius: 12px; overflow: hidden; }
+    .ex-panel-head { padding: 22px 24px 18px; display: flex; align-items: center; justify-content: space-between; gap: 15px; }
+    .ex-panel-head h3 { font-size: 16px; letter-spacing: -.3px; font-weight: 600; color: var(--text-primary); }
+    .ex-panel-head p { font-size: 11px; color: var(--text-tertiary); margin-top: 6px; }
+    .ex-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .ex-button { padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-secondary); color: var(--text-secondary); font: inherit; font-size: 11px; cursor: pointer; }
+    .ex-button:hover { color: var(--explorer-accent); border-color: var(--explorer-accent); }
+    .ex-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 14px; padding: 0 24px 20px; flex-wrap: wrap; }
+    .ex-segments { display: inline-flex; background: var(--bg-primary); border: 1px solid var(--border-light); padding: 4px; border-radius: 8px; gap: 3px; }
+    .ex-segments button { padding: 8px 14px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: var(--text-tertiary); font: inherit; font-size: 11px; cursor: pointer; }
+    .ex-segments button[aria-pressed="true"] { border-color: var(--border-light); background: var(--bg-secondary); color: var(--explorer-accent); box-shadow: 0 1px 3px #0000000a; font-weight: 600; }
+    .ex-check { display: inline-flex; align-items: center; gap: 7px; font-size: 11px; color: var(--text-secondary); cursor: pointer; }
+    .ex-check input { accent-color: var(--explorer-accent); }
+    .ex-plot-layout { display: grid; grid-template-columns: minmax(0, 1fr) 235px; border-top: 1px solid var(--border-light); }
+    .ex-plot-main { min-width: 0; padding: 18px 18px 0; }
+    .ex-chart { height: 390px; position: relative; }
+    .ex-chart canvas { max-width: 100%; }
+    .ex-legend { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 20px; min-height: 48px; padding: 10px 30px 14px; }
+    .ex-legend button { display: flex; align-items: center; gap: 7px; border: none; background: none; font: inherit; font-size: 11px; color: var(--text-secondary); cursor: pointer; }
+    .ex-legend button[aria-pressed="false"] { opacity: .4; text-decoration: line-through; }
+    .ex-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--series-color); }
+    .ex-legend-note { color: var(--text-tertiary); font-size: 10px; margin-left: auto; }
+    .ex-detail { padding: 22px 20px; border-left: 1px solid var(--border-light); }
+    .ex-detail .ex-eyebrow { letter-spacing: 1px; font-size: 9px; }
+    .ex-detail h4 { color: var(--text-primary); font-size: 19px; font-weight: 600; margin: 12px 0 6px; }
+    .ex-detail dl { margin: 22px 0; }
+    .ex-detail dl div { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; padding: 10px 0; border-bottom: 1px solid var(--border-light); font-size: 11px; }
+    .ex-detail dt { color: var(--text-tertiary); }
+    .ex-detail dd { color: var(--text-primary); text-align: right; font-variant-numeric: tabular-nums; }
+    .ex-detail .ex-source { font-size: 11px; color: var(--explorer-accent); }
+    .ex-caption { padding: 13px 24px; border-top: 1px solid var(--border-light); font-size: 10px; color: var(--text-tertiary); line-height: 1.8; display: flex; justify-content: space-between; gap: 16px; }
+    .ex-table-panel { margin-top: 20px; border: 1px solid var(--border-light); border-radius: 10px; background: var(--bg-secondary); }
+    .ex-table-panel summary { cursor: pointer; padding: 18px 22px; font-size: 12px; color: var(--text-primary); }
+    .ex-table-scroll { overflow-x: auto; }
+    .ex-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 11px; white-space: nowrap; }
+    .ex-table th { font-weight: 500; color: var(--text-tertiary); background: var(--bg-primary); }
+    .ex-table td, .ex-table th { padding: 12px 20px; border-top: 1px solid var(--border-light); }
+    .ex-table td { font-variant-numeric: tabular-nums; }
+    .ex-table tbody tr:hover { background: var(--explorer-soft); }
+    .ex-table .num { text-align: right; }
+    .ex-footer { display: flex; justify-content: space-between; gap: 20px; color: var(--text-tertiary); font-size: 10px; line-height: 1.8; margin-top: 19px; }
+    .ex-empty { display: grid; align-content: center; height: 390px; padding: 30px; color: var(--text-tertiary); text-align: center; line-height: 1.8; font-size: 13px; }
+    .explorer :is(button, select, input, summary, a):focus-visible { outline: 2px solid var(--explorer-accent); outline-offset: 3px; }
+    @media (max-width: 1000px) {
+      .ex-plot-layout { grid-template-columns: minmax(0, 1fr); }
+      .ex-detail { border-left: none; border-top: 1px solid var(--border-light); }
+      .ex-detail dl { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0 20px; margin: 12px 0; }
+      .ex-heading h2 { font-size: 25px; }
+      .explorer .filter-bar { margin-top: 12px; }
+    }
+    @media (max-width: 640px) {
+      .explorer .container { padding: 12px; }
+      .explorer header { padding: 12px; position: static; }
+      .explorer .header-logo { height: 24px; }
+      .explorer h1 { font-size: 14px; }
+      .explorer .header-spacer { display: none; }
+      .explorer .tabs { margin-bottom: 20px; }
+      .ex-heading { align-items: flex-start; }
+      .ex-heading h2 { font-size: 23px; }
+      .ex-heading > .ex-badge { display: none; }
+      .ex-controls { grid-template-columns: 1fr; padding: 16px; gap: 13px; }
+      .ex-stats { grid-template-columns: 1fr 1fr; gap: 22px 0; }
+      .ex-stat { padding: 0 12px; }
+      .ex-stat:nth-child(3) { padding-left: 0; }
+      .ex-stat:nth-child(2) { border: none; }
+      .ex-stat-value { font-size: 23px; }
+      .ex-panel-head { align-items: flex-start; padding: 18px 14px; }
+      .ex-toolbar { padding: 0 14px 16px; }
+      .ex-segments button { padding: 9px 8px; font-size: 10px; }
+      .ex-plot-main { padding: 14px 6px 0; }
+      .ex-chart, .ex-empty { height: 310px; }
+      .ex-legend { padding: 12px; }
+      .ex-detail dl { grid-template-columns: 1fr 1fr; }
+      .ex-caption, .ex-footer { flex-direction: column; gap: 5px; }
+    }
+
   </style>
 </head>
 <body>
@@ -703,6 +815,9 @@ function atomeshPointRow(point, meta, idx) {
     backend: ATOMESH_DATA.backend,
     hardware: atomeshHardwareKey(point.hardware || meta.hardware || ATOMESH_DATA.hardware),
     model: point.model || 'unknown',
+    sourceLabel: point.source_label || 'ATOM CI',
+    sourceUrl: point.source_url || '',
+    sourceStatus: point.source_status || '',
     topology: meta.display_topology || point.config_label || 'unknown',
     islOsl: Number.isFinite(isl) && Number.isFinite(osl) ? `${isl}/${osl}` : '--',
     isl,
@@ -947,7 +1062,12 @@ function mergeAtomeshTopologyRows(rows) {
 }
 
 const atomeshRawRows = atomeshBenchmarkRows.length ? atomeshBenchmarkRows : parseAtomeshSummaryRows(ATOMESH_DATA.summaryMarkdown);
-const atomeshSummaryRows = mergeAtomeshTopologyRows(atomeshRawRows);
+// Local previews can supply additional perf points without changing published CI data.
+const localBenchmark = window.ATOM_LOCAL_BENCHMARK || {};
+const localRows = (localBenchmark.points || []).map((point, idx) => atomeshPointRow({
+  ...point, source_label: point.source_label || 'Local measurements',
+}, {}, `local-${idx}`));
+const atomeshSummaryRows = [...mergeAtomeshTopologyRows(atomeshRawRows), ...localRows];
 
 // Normalize legacy model names using HF-path->display mapping from models_map.js
 const _displayMap = window.MODELS_DISPLAY_MAP || {};
@@ -1324,7 +1444,12 @@ const state = {
   perfMetric: 'Total Tput',
   trendModelKey: allTrendModelKeys[0] || '',
   atomeshTrendModel: '',
-  atomeshIntvtyMetric: ATOMESH_INTERACTIVITY_METRICS[0].key,
+  atomeshIntvtyMetric: 'p90_itl',
+  explorerModel: localRows[0]?.model || '',
+  explorerSource: localRows[0]?.sourceLabel || '',
+  explorerWorkload: '',
+  explorerHidden: new Set(),
+  explorerFrontierOnly: false,
   dataView: 'table',
   dataSort: { column: 'date', direction: 'desc' },
 };
@@ -1743,6 +1868,8 @@ function renderFilters() {
     state.filters.islOsl = [...allIslOsl];
     state.filters.conc = [...allConc];
     state.filters.hardware = [defaultHardware];
+    state.explorerHidden.clear();
+    state.explorerFrontierOnly = false;
     renderFilters();
     updateHeaderGpuMeta();
     renderActiveTab();
@@ -1843,7 +1970,7 @@ function updateDashboardTabs() {
     tab.style.display = allowedTabs.includes(tabName) ? '' : 'none';
     if (tabName === 'performance' && tab.firstChild) {
       tab.firstChild.nodeValue = state.dashboardMode === 'Disaggregated'
-        ? 'Token Throughput per GPU vs. Interactivity'
+        ? 'Performance explorer'
         : 'Performance';
     }
   });
@@ -2049,6 +2176,7 @@ document.getElementById('tabs-nav').addEventListener('click', (e) => {
 });
 
 function renderActiveTab() {
+  document.body.classList.toggle('explorer', state.dashboardMode === 'Disaggregated' && state.activeTab === 'performance');
   updateDashboardTabs();
   if (state.dashboardMode === 'Disaggregated') {
     if (state.activeTab === 'accuracy') renderAtomeshAccuracyTab();
@@ -3321,17 +3449,34 @@ function syncToHash() {
   if (state.filters.conc.length !== allConc.length) parts.push('conc=' + state.filters.conc.join(','));
   parts.push('hardware=' + selectedHardware());
   if (state.activeTab !== 'performance') parts.push('tab=' + state.activeTab);
-  if (state.atomeshIntvtyMetric !== ATOMESH_INTERACTIVITY_METRICS[0].key) parts.push('intvty=' + state.atomeshIntvtyMetric);
+  parts.push('intvty=' + state.atomeshIntvtyMetric);
+  for (const key of ['explorerModel', 'explorerSource', 'explorerWorkload']) {
+    if (state[key]) parts.push(key + '=' + encodeURIComponent(state[key]));
+  }
+  if (state.explorerFrontierOnly) parts.push('frontier=1');
+  if (state.explorerHidden.size) parts.push('hiddenSeries=' + encodeURIComponent(JSON.stringify([...state.explorerHidden])));
   hashUpdateFromCode = true;
   window.location.hash = parts.join('&');
 }
 
 function readFromHash() {
+  state.explorerModel = localRows[0] ? explorerModelName(localRows[0].model) : '';
+  state.explorerSource = localRows[0]?.sourceLabel || '';
+  state.explorerWorkload = '';
+  state.explorerFrontierOnly = false;
+  state.explorerHidden = new Set();
   const hash = window.location.hash.slice(1);
   if (!hash) return;
-  for (const part of hash.split('&')) {
-    const [k, v] = part.split('=');
+  for (const [k, v] of new URLSearchParams(hash)) {
     if (!v) continue;
+    if (['explorerModel', 'explorerSource', 'explorerWorkload'].includes(k)) state[k] = v;
+    if (k === 'frontier') state.explorerFrontierOnly = v === '1';
+    if (k === 'hiddenSeries') {
+      try {
+        const hidden = JSON.parse(v);
+        if (Array.isArray(hidden)) state.explorerHidden = new Set(hidden.filter(item => typeof item === 'string'));
+      } catch (_) { /* Ignore malformed optional display state. */ }
+    }
     if (k === 'mode' && DASHBOARD_MODES.includes(v)) state.dashboardMode = v;
     if (k === 'backend') state.filters.backends = v.split(',').filter(b => allBackends.includes(b));
     if (k === 'model') state.filters.models = v.split(',').filter(m => allModels.includes(m));
@@ -3892,213 +4037,242 @@ function renderAtomeshKPICards() {
   }
 }
 
+// P90 axes only accept measurements with a known definition. In particular,
+// legacy 1000 / median(TPOT) values must never appear on the normalized P90 axis.
+function explorerMetricValue(row, metric) {
+  const value = metric.value(row);
+  return metric.frontierEligible(row) && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function explorerWorkloadKey(row) {
+  return JSON.stringify([isAgenticTraceRow(row) ? 'Agentic' : row.islOsl,
+    row.publicDataset || row.scenario || '', row.precision || 'Unspecified precision']);
+}
+
+function explorerWorkloadLabel(key) {
+  const [kind, dataset, precision] = JSON.parse(key);
+  return `${kind === 'Agentic' ? 'Agentic coding' : fmtIslOsl(kind)} · ${precision.toUpperCase()}${dataset ? ' · ' + dataset.split('/').pop() : ''}`;
+}
+
+function explorerModelName(model) {
+  return atomeshBaseModelName(model).replace(/-(?:MXFP4|FP4|FP8|BF16)(?:-MTP\d*)?$/i, '');
+}
+
+function explorerTopology(row) {
+  if (row.prefillWorkers && row.decodeWorkers) return `${row.prefillWorkers}P${row.decodeWorkers}D`;
+  return row.sourceTopology || row.topology || 'Unknown topology';
+}
+
+function explorerCompact(value, digits = 1) {
+  if (!Number.isFinite(value)) return '—';
+  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: digits }).format(value);
+}
+
 function renderAtomeshPerformanceTab() {
   const container = document.getElementById('tab-performance');
   destroyChartsIn(container);
-  const rows = filteredAtomeshRows().sort((a, b) => _lc(a.model, b.model) || _lc(a.topology, b.topology) || (a.concurrency || 0) - (b.concurrency || 0));
   const metric = atomeshInteractivityMetric();
-  const completedAll = atomeshCompletedCases();
-  const completed = atomeshPlottableCases(metric).sort((a, b) => a.concurrency - b.concurrency);
-  if (!completed.length) {
-    // Separate the two reasons: no rows at all is a filter problem, whereas rows
-    // without the selected metric means this axis has no data yet for them.
-    container.innerHTML = completedAll.length
-      ? `<div class="chart-empty">${escHTML(metric.label)} is not recorded for any of the ${completedAll.length} selected row(s). ${escHTML(metric.emptyHint)}</div>`
-      : '<div class="chart-empty">No completed ATOMesh performance row matches the current filters.</div>';
-    return;
+  const metricLabel = metric.key === 'p90_itl' ? 'P90 Interactivity' : 'P90 Normalized Interactivity';
+  // The model dropdown owns model selection; the other global filters still apply.
+  const available = atomeshSummaryRows.filter(row => state.filters.hardware.includes(row.hardware || 'unknown')
+    && state.filters.backends.includes(row.backend) && atomeshMatchesIslOslFilter(row)
+    && state.filters.conc.includes(row.concurrency));
+  const models = [...new Set(available.map(row => explorerModelName(row.model)))].sort(_lc);
+  if (!models.includes(state.explorerModel)) {
+    const legacySelection = state.filters.models.length === 1 ? explorerModelName(state.filters.models[0]) : '';
+    state.explorerModel = models.find(model => model === legacySelection)
+      || models.find(model => available.some(row => explorerModelName(row.model) === model
+        && explorerMetricValue(row, metric) !== null && row.totalTput > 0)) || models[0] || '';
   }
-  const chartGroups = {};
-  for (const c of completed) {
-    const chartKey = atomeshBaseModelName(c.model);
-    if (!chartGroups[chartKey]) chartGroups[chartKey] = [];
-    chartGroups[chartKey].push(c);
+  const modelRows = available.filter(row => explorerModelName(row.model) === state.explorerModel);
+  const sourceName = row => row.sourceLabel || 'ATOM CI';
+  const sources = [...new Set(modelRows.map(sourceName))].sort(_lc);
+  if (!sources.includes(state.explorerSource)) state.explorerSource = sources[0] || '';
+  const sourceRows = modelRows.filter(row => sourceName(row) === state.explorerSource);
+  const workloads = [...new Set(sourceRows.map(explorerWorkloadKey))].sort(_lc);
+  if (!workloads.includes(state.explorerWorkload)) {
+    state.explorerWorkload = workloads.find(key => sourceRows.some(row => explorerWorkloadKey(row) === key
+      && explorerMetricValue(row, metric) !== null && row.totalTput > 0)) || workloads[0] || '';
   }
-  const chartSpecs = Object.entries(chartGroups).sort(([a], [b]) => _lc(a, b)).map(([model, modelRows], chartIdx) => {
-    const seriesGroups = {};
-    for (const row of modelRows) {
-      const agenticTopology = isAgenticTraceRow(row)
-        ? row.sourceTopology || row.topology || 'agentic'
-        : '';
-      const key = `${row.model}|${row.islOsl}|${agenticTopology}`;
-      if (!seriesGroups[key]) seriesGroups[key] = [];
-      seriesGroups[key].push(row);
-    }
-    const datasets = Object.values(seriesGroups).map(groupRows => {
-      groupRows.sort((a, b) => a.concurrency - b.concurrency);
-      const first = groupRows[0];
-      const color = getModelColor(ATOMESH_DATA.backend, first.model);
-      return {
-        label: isAgenticTraceRow(first)
-          ? `${first.model} Agentic Trace · ${first.sourceTopology || first.topology}`
-          : `${first.model} ${first.islOsl}`,
-        data: groupRows.map(c => ({ x: metric.value(c), y: c.totalTputPerGpu, row: c })),
-        borderColor: color.border,
-        backgroundColor: color.border,
-        borderWidth: 2,
-        pointRadius: 4,
-        pointHoverRadius: 6,
-        pointBorderWidth: 0,
-        pointHoverBorderWidth: 0,
-        // Agentic topologies are connected by a separate Pareto frontier dataset below.
-        showLine: !isAgenticTraceRow(first) && groupRows.length > 1,
-      };
+  const rows = sourceRows.filter(row => explorerWorkloadKey(row) === state.explorerWorkload)
+    .sort((a, b) => _lc(explorerTopology(a), explorerTopology(b)) || a.concurrency - b.concurrency);
+  const seriesKey = row => `${row.model} · ${explorerTopology(row)}`;
+  const seriesKeys = [...new Set(rows.map(seriesKey))];
+  const light = document.documentElement.getAttribute('data-theme') === 'light';
+  const palette = light ? ['#b14b9d', '#5277cf', '#218d89', '#bf8535', '#865bc4'] : ['#e090ce', '#88aaff', '#67cfbd', '#e7b96e', '#bc9bed'];
+  const colors = new Map(seriesKeys.map((key, i) => [key, palette[i % palette.length]]));
+  const points = rows.filter(row => explorerMetricValue(row, metric) !== null
+    && Number.isFinite(row.totalTput) && row.totalTput > 0
+    && !state.explorerHidden.has(seriesKey(row)))
+    .map(row => ({ x: explorerMetricValue(row, metric), y: row.totalTput, row }));
+  // Do not join different model variants (e.g. Eagle3) into one frontier.
+  const cohorts = new Map();
+  for (const point of points) {
+    const key = point.row.model;
+    if (!cohorts.has(key)) cohorts.set(key, []);
+    cohorts.get(key).push(point);
+  }
+  const frontiers = [...cohorts.values()].map(atomeshParetoFrontier);
+  const frontierRows = new Set(frontiers.flat().map(point => point.row));
+  const visible = points.filter(point => !state.explorerFrontierOnly || frontierRows.has(point.row));
+  const peak = points.reduce((a, b) => !a || b.y > a.y ? b : a, null);
+  const fastest = points.reduce((a, b) => !a || b.x > a.x ? b : a, null);
+  const gpuCounts = points.map(p => p.row.totalGpu).filter(Number.isFinite);
+  const gpuRange = gpuCounts.length ? `${Math.min(...gpuCounts)}${Math.min(...gpuCounts) === Math.max(...gpuCounts) ? '' : '–' + Math.max(...gpuCounts)}` : '—';
+  const missing = rows.filter(row => explorerMetricValue(row, metric) === null || !Number.isFinite(row.totalTput) || row.totalTput <= 0).length;
+  const sourceUrl = safeHref(rows[0]?.sourceUrl || rows[0]?.runUrl);
+  const optionHTML = (options, selected, label = x => x) => options.map(option => `<option value="${escHTML(option).replace(/"/g, '&quot;')}" ${option === selected ? 'selected' : ''}>${escHTML(label(option))}</option>`).join('');
+  container.innerHTML = `
+    <div class="ex-heading">
+      <div><div class="ex-eyebrow">ATOM / PERFORMANCE EXPLORER</div>
+        <h2>${escHTML(state.explorerModel || 'Explore inference performance')}</h2>
+        <p class="ex-subtitle">Throughput and responsiveness, at every operating point.</p></div>
+      <span class="ex-badge">${escHTML(fmtHardware(selectedHardware()))} · Disaggregated serving</span>
+    </div>
+    <div class="ex-controls">
+      <div class="ex-field"><label for="ex-model">Model</label><select id="ex-model">${optionHTML(models, state.explorerModel)}</select></div>
+      <div class="ex-field"><label for="ex-source">Data source</label><select id="ex-source">${optionHTML(sources, state.explorerSource)}</select></div>
+      <div class="ex-field"><label for="ex-workload">Workload / precision</label><select id="ex-workload">${optionHTML(workloads, state.explorerWorkload, explorerWorkloadLabel)}</select></div>
+    </div>
+    <div class="ex-stats">
+      <div class="ex-stat"><div class="ex-stat-label">Peak total throughput</div><div class="ex-stat-value">${explorerCompact(peak?.y, 2)} <small>tok/s</small></div><div class="ex-stat-note">${peak ? `${escHTML(explorerTopology(peak.row))} · concurrency ${peak.row.concurrency}` : 'No measured points'}</div></div>
+      <div class="ex-stat"><div class="ex-stat-label">Fastest ${metricLabel}</div><div class="ex-stat-value">${fastest ? fmtNum(fastest.x, 1) : '—'} <small>tok/s/user</small></div><div class="ex-stat-note">${fastest ? `${escHTML(explorerTopology(fastest.row))} · concurrency ${fastest.row.concurrency}` : 'No P90 measurements'}</div></div>
+      <div class="ex-stat"><div class="ex-stat-label">Measured configurations</div><div class="ex-stat-value">${points.length} <small>points</small></div><div class="ex-stat-note">${frontierRows.size} Pareto optimal · ${new Set(points.map(p => explorerTopology(p.row))).size} topologies</div></div>
+      <div class="ex-stat"><div class="ex-stat-label">GPUs per configuration</div><div class="ex-stat-value">${gpuRange} <small>${escHTML(fmtHardware(selectedHardware()))}</small></div><div class="ex-stat-note">Prefill + decode, all participating GPUs</div></div>
+    </div>
+    <section class="ex-panel" aria-label="Throughput and interactivity chart">
+      <div class="ex-panel-head"><div><h3>Total throughput vs. interactivity</h3><p>Find the operating point that fits your latency budget.</p></div>
+        <div class="ex-actions"><button class="ex-button" id="ex-csv">↓ CSV</button><button class="ex-button" id="ex-png" ${visible.length ? '' : 'disabled'}>↓ PNG</button></div></div>
+      <div class="ex-toolbar"><div class="ex-segments" role="group" aria-label="X axis">
+        <button data-ex-metric="p90_itl" aria-pressed="${metric.key === 'p90_itl'}">P90 Interactivity</button>
+        <button data-ex-metric="e2e_normalized" aria-pressed="${metric.key === 'e2e_normalized'}">P90 Normalized Interactivity</button>
+      </div><label class="ex-check"><input type="checkbox" id="ex-frontier" ${state.explorerFrontierOnly ? 'checked' : ''}> Pareto points only</label></div>
+      <div class="ex-plot-layout"><div class="ex-plot-main">
+        ${visible.length ? '<div class="ex-chart"><canvas id="ex-chart" role="img" aria-label="Scatter plot of total throughput versus P90 interactivity. All values are available in the measurement table below."></canvas></div>'
+          : `<div class="ex-empty">No points available for ${metricLabel}.<br>${missing ? `${missing} configurations lack this P90 metric or total throughput.` : 'Choose a different model, workload, or filter; enable a topology in the legend.'}</div>`}
+        <div class="ex-legend" aria-label="Topology visibility">${seriesKeys.map((key, idx) => `<button data-ex-series="${idx}" aria-pressed="${!state.explorerHidden.has(key)}"><span class="ex-dot" style="--series-color:${colors.get(key)}"></span>${escHTML(seriesKeys.length > new Set(rows.map(explorerTopology)).size ? key : explorerTopology(rows.find(r => seriesKey(r) === key)))}</button>`).join('')}<span class="ex-legend-note">Dashed line · Pareto frontier</span></div>
+      </div><aside class="ex-detail" id="ex-detail" aria-label="Selected configuration" aria-live="polite"></aside></div>
+      <div class="ex-caption"><span>${metric.key === 'p90_itl' ? 'P90 Interactivity = 1 / p90(ITL)' : 'P90 Normalized Interactivity = 1 / p90(ITL + TTFT / output tokens)'} · latency in seconds</span><span>Higher is better on both axes ↗</span></div>
+    </section>
+    <details class="ex-table-panel"><summary>All measurements <span style="color:var(--text-tertiary)">· ${rows.length} configurations${missing ? ` · ${missing} missing the selected metric` : ''}</span></summary>
+      <div class="ex-table-scroll"><table class="ex-table"><thead><tr><th>Configuration</th><th class="num">GPUs</th><th class="num">Concurrency</th><th class="num">P90 interactivity</th><th class="num">P90 normalized</th><th class="num">Total tok/s</th><th>Source</th></tr></thead>
+      <tbody>${rows.map((row, idx) => `<tr><td><button class="ex-button" data-ex-row="${idx}">${escHTML(explorerTopology(row))}</button></td><td class="num">${row.totalGpu ?? '—'}</td><td class="num">${row.concurrency ?? '—'}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(row.totalTput, v => fmtNum(v, 2))}</td><td>${atomeshRunCell(row)}</td></tr>`).join('')}</tbody></table></div>
+    </details>
+    <div class="ex-footer"><span>${sourceUrl ? `<a href="${escHTML(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escHTML(state.explorerSource)} ↗</a>` : escHTML(state.explorerSource)}${localRows.some(row => rows.includes(row)) ? ' · Local preview' : ''}${rows[0]?.sourceStatus ? ' · ' + escHTML(rows[0].sourceStatus) : ''}${missing ? ` · ${missing} configurations omitted from the chart: P90 metric or throughput unavailable.` : ''}</span><span>Total throughput = input + output tokens / second, across the full configuration.</span></div>`;
+
+  function showDetail(row, label = 'SELECTED CONFIGURATION') {
+    const detail = document.getElementById('ex-detail');
+    if (!row) { detail.innerHTML = '<p class="ex-subtitle">Select a measured point to inspect its configuration.</p>'; return; }
+    detail.innerHTML = `<div class="ex-eyebrow">${label}</div><h4>${escHTML(explorerTopology(row))}</h4>
+      <div class="ex-subtitle">Concurrency ${row.concurrency} · ${row.totalGpu ?? '—'} GPUs</div>
+      <dl><div><dt>Total throughput</dt><dd>${explorerCompact(row.totalTput, 2)} tok/s</dd></div>
+      <div><dt>P90 interactivity</dt><dd>${atomeshDetailValue(row.interactivityP90Itl, v => fmtNum(v, 2))}</dd></div>
+      <div><dt>P90 normalized</dt><dd>${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</dd></div>
+      <div><dt>Precision</dt><dd>${escHTML((row.precision || '—').toUpperCase())}</dd></div>
+      <div><dt>Pareto optimal</dt><dd>${points.some(point => point.row === row) ? (frontierRows.has(row) ? 'Yes' : 'No') : '—'}</dd></div></dl>
+      ${safeHref(row.runUrl) ? `<a class="ex-source" href="${escHTML(row.runUrl)}" target="_blank" rel="noopener noreferrer">View benchmark run ↗</a>` : ''}
+      <p class="ex-subtitle" style="font-size:10px;margin-top:20px">Click a point to inspect it.<br>Interactivity is in tok/s/user.</p>`;
+  }
+  showDetail(peak?.row, 'PEAK THROUGHPUT');
+  function refresh() { renderAtomeshPerformanceTab(); syncToHash(); }
+  for (const [id, key] of [['ex-model', 'explorerModel'], ['ex-source', 'explorerSource'], ['ex-workload', 'explorerWorkload']]) {
+    document.getElementById(id).addEventListener('change', event => {
+      state[key] = event.target.value;
+      state.explorerHidden.clear();
+      refresh();
     });
-    // Every agentic PD topology is a valid operating point for the same model +
-    // ISL/OSL, so the curve across them is their Pareto frontier, not a per-topology
-    // polyline. Appended last so existing datasetIndex values — and with them the
-    // legendFocus highlight — stay stable.
-    const agenticGroups = {};
-    for (const row of modelRows) {
-      if (!isAgenticTraceRow(row)) continue;
-      // modelRows is every filtered row, not just the plotted ones, so drop
-      // anything the current axis cannot place before considering the frontier.
-      if (!Number.isFinite(metric.value(row)) || !Number.isFinite(row.totalTputPerGpu)) continue;
-      // A point whose number came from the wrong definition still renders and
-      // stays clickable, but cannot join a frontier that would then be defined by
-      // whichever points were measured the wrong way. For the E2E axis those are
-      // the pre-#1925 points carrying 1000/median_tpot, which ignores prefill and
-      // so reads far too optimistic — for the c48 traces by more than 50x. Their
-      // per-request records expired with the artifacts and can never be recomputed.
-      if (!metric.frontierEligible(row)) continue;
-      const key = `${row.model}|${row.islOsl}`;
-      if (!agenticGroups[key]) agenticGroups[key] = [];
-      agenticGroups[key].push(row);
-    }
-    for (const groupRows of Object.values(agenticGroups)) {
-      const frontier = atomeshParetoFrontier(
-        groupRows.map(c => ({ x: metric.value(c), y: c.totalTputPerGpu, row: c }))
-      );
-      if (frontier.length < 2) continue; // a single point is not a line
-      const first = groupRows[0];
-      const color = getModelColor(ATOMESH_DATA.backend, first.model);
-      datasets.push({
-        label: `${first.model} Agentic Pareto ${fmtIslOsl(first.islOsl)}`,
-        data: frontier,
-        borderColor: color.border,
-        backgroundColor: color.border,
-        // Same hue as its model — the frontier is a derived curve, not a series of
-        // its own — so the dash is what separates it from the solid series lines.
-        borderWidth: 2.5,
-        borderDash: [6, 4],
-        pointRadius: 0,
-        pointHoverRadius: 0,
-        pointHitRadius: 0,               // the topology datasets own hover/click for these rows
-        showLine: true,
-        fill: false,
-        order: -1,                       // draw under the point series
-        datalabels: { display: false },  // 'cN' labels already come from the topology datasets
-        _isFrontier: true,
-      });
-    }
-    return {
-      id: `atomesh-tradeoff-${chartIdx}`,
-      model,
-      rows: modelRows,
-      datasets,
-      seriesCount: datasets.filter(d => !d._isFrontier).length,
-    };
+  }
+  container.querySelectorAll('[data-ex-metric]').forEach(button => button.addEventListener('click', () => {
+    state.atomeshIntvtyMetric = button.dataset.exMetric; refresh();
+  }));
+  container.querySelectorAll('[data-ex-series]').forEach(button => button.addEventListener('click', () => {
+    const key = seriesKeys[Number(button.dataset.exSeries)];
+    if (state.explorerHidden.has(key)) state.explorerHidden.delete(key); else state.explorerHidden.add(key);
+    refresh();
+  }));
+  container.querySelectorAll('[data-ex-row]').forEach(button => button.addEventListener('click', () => {
+    showDetail(rows[Number(button.dataset.exRow)]);
+  }));
+  document.getElementById('ex-frontier').addEventListener('change', event => { state.explorerFrontierOnly = event.target.checked; refresh(); });
+
+  const download = (blob, filename) => {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a'); link.href = url; link.download = filename; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  document.getElementById('ex-csv').addEventListener('click', () => {
+    const escape = value => '"' + String(value ?? '').replace(/^[=+@-]/, "'$&").replace(/"/g, '""') + '"';
+    const records = [['model', 'source', 'workload', 'precision', 'topology', 'gpus', 'concurrency', 'p90_interactivity_tok_s_user', 'p90_normalized_interactivity_tok_s_user', 'total_throughput_tok_s', 'run_url'],
+      ...rows.map(row => [row.model, sourceName(row), row.publicDataset || row.scenario || row.islOsl, row.precision, explorerTopology(row), row.totalGpu, row.concurrency,
+        explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), row.totalTput, row.runUrl])];
+    download(new Blob([records.map(record => record.map(escape).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' }), 'atom-benchmark-measurements.csv');
   });
 
-  let html = `<div class="section-container"><div class="section-header">
-    <span class="section-title">ATOMesh Token Throughput per GPU vs. ${escHTML(metric.label)}</span>
-    <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">${completed.length}/${atomeshRows().length} selected rows · source: benchmark-action data.js</span>
-  </div>
-  <div class="model-selector" style="margin-bottom:var(--gap-md);justify-content:flex-start">
-    <span class="sel-label">X axis:</span>
-    ${ATOMESH_INTERACTIVITY_METRICS.map(m => `<button class="sel-btn ${m.key === metric.key ? 'active' : ''}" data-atomesh-intvty-metric="${escHTML(m.key)}" title="${escHTML(m.formula)}">${escHTML(m.label)}</button>`).join('')}
-  </div>
-  <div class="chart-grid">${chartSpecs.map(spec => `
-    <div class="chart-card ${chartSpecs.length === 1 ? 'hero' : 'half'}">
-      <h3>${escHTML(spec.model)} · ${spec.seriesCount} selected series</h3>
-      <div class="chart-wrap"><canvas id="${spec.id}"></canvas></div>
-    </div>`).join('')}</div></div>`;
-
-  html += `<div class="section-container"><div class="section-header"><span class="section-title">Detail Table</span></div>
-  <div class="table-watermark"><div class="table-watermark-scroll"><table class="perf-table"><thead><tr>
-    <th>Backend</th><th>Model</th><th>Topology</th><th>ISL/OSL</th><th class="num">Conc</th>
-    <th class="num">P90 E2E Normalized Interactivity</th><th class="num">P90 Interactivity</th><th class="num">Total tok/s</th><th class="num">Input tok/s</th><th class="num">Output tok/s</th>
-    <th class="num">Total tok/s/GPU</th><th class="num">Input tok/s/GPU</th><th class="num">Output tok/s/GPU</th>
-    <th class="num">TTFT ms</th><th class="num">TPOT ms</th><th class="num">E2E ms</th><th class="num">Accuracy</th><th>Run</th>
-  </tr></thead><tbody>`;
-  rows.forEach((c, idx) => {
-    html += `<tr data-atomesh-row="${idx}" style="cursor:pointer">
-      <td style="white-space:nowrap;font-weight:600">${escHTML(ATOMESH_DATA.backend)}</td>
-      <td class="model-name" style="color:${getModelColor(ATOMESH_DATA.backend, c.model).text}">${escHTML(c.model)}</td>
-      <td>${escHTML(c.sourceTopology || c.topology)}</td>
-      <td>${escHTML(c.islOsl)}</td>
-      <td class="num">${c.concurrency}</td>
-      <td class="num">${c.interactivity != null ? fmtNum(c.interactivity, 2) : '—'}</td>
-      <td class="num">${Number.isFinite(c.interactivityP90Itl) ? fmtNum(c.interactivityP90Itl, 2) : '—'}</td>
-      <td class="num">${c.totalTput != null ? fmtNum(c.totalTput, 2) : '—'}</td>
-      <td class="num">${c.inputTput != null ? fmtNum(c.inputTput, 2) : '—'}</td>
-      <td class="num">${c.outputTput != null ? fmtNum(c.outputTput, 2) : '—'}</td>
-      <td class="num">${c.totalTputPerGpu != null ? fmtNum(c.totalTputPerGpu, 2) : '—'}</td>
-      <td class="num">${c.inputTputPerGpu != null ? fmtNum(c.inputTputPerGpu, 2) : '—'}</td>
-      <td class="num">${c.outputTputPerGpu != null ? fmtNum(c.outputTputPerGpu, 2) : '—'}</td>
-      <td class="num">${c.ttftMs != null ? fmtNum(c.ttftMs, 2) : '—'}</td>
-      <td class="num">${c.tpotMs != null ? fmtNum(c.tpotMs, 2) : '—'}</td>
-      <td class="num">${c.e2eMs != null ? fmtNum(c.e2eMs, 2) : '—'}</td>
-      <td class="num">${Number.isFinite(atomeshAccuracyValue(c)) ? `${escHTML(atomeshAccuracyTaskLabel(c.accuracyTask))} ${escHTML(atomeshAccuracyRaw(c))}` : '—'}</td>
-      <td>${atomeshRunCell(c)}</td>
-    </tr>`;
-  });
-  html += '</tbody></table></div></div></div>';
-  container.innerHTML = html;
-  container.querySelectorAll('[data-atomesh-intvty-metric]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      state.atomeshIntvtyMetric = btn.dataset.atomeshIntvtyMetric;
-      renderAtomeshKPICards();
-      renderAtomeshPerformanceTab();
-      syncToHash();
-    });
-  });
-  container.querySelectorAll('tr[data-atomesh-row]').forEach(rowEl => {
-    rowEl.addEventListener('click', (e) => {
-      if (e.target.closest('a') || e.target.closest('button')) return;
-      const row = rows[Number(rowEl.dataset.atomeshRow)];
-      if (row) showAtomeshPopover(row);
-    });
-  });
-
-  for (const spec of chartSpecs) {
-    new Chart(document.getElementById(spec.id), {
-      type: 'scatter',
-      data: { datasets: spec.datasets },
+  if (visible.length) {
+    const datasets = seriesKeys.filter(key => !state.explorerHidden.has(key)).map(key => ({
+      label: key, data: visible.filter(point => seriesKey(point.row) === key),
+      borderColor: colors.get(key), backgroundColor: colors.get(key),
+      pointRadius: 5, pointHoverRadius: 8, pointHitRadius: 10,
+      pointBorderWidth: 2, pointBorderColor: light ? '#ffffff' : '#191921', showLine: false,
+    }));
+    for (const frontier of frontiers) {
+      datasets.push({ label: 'Pareto frontier', data: frontier, showLine: true, fill: false,
+        borderColor: light ? '#9a829b' : '#ac97ad', borderWidth: 1.5, borderDash: [5, 5],
+        pointRadius: 0, pointHoverRadius: 0, pointHitRadius: 0, order: 1, _isFrontier: true });
+    }
+    const chart = new Chart(document.getElementById('ex-chart'), {
+      type: 'scatter', data: { datasets },
       options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        layout: { padding: { top: 8, right: 16 } },
+        responsive: true, maintainAspectRatio: false, animation: false,
+        layout: { padding: { top: 18, right: 24 } },
+        interaction: { mode: 'nearest', intersect: true },
         plugins: {
-          legend: { labels: { color: C_LEGEND, font: { size: 10 }, boxWidth: 10 } },
-          tooltip: { ...chartTooltipOpts(), callbacks: {
-            title: items => {
-              const c = items[0].raw.row;
-              return `${c.model} ${c.islOsl} · c=${c.concurrency} · Topology: ${c.sourceTopology || c.topology || '—'}`;
-            },
-            label: item => [
-              ` ${metric.label}: ${fmtNum(item.parsed.x, 2)} tok/s/user`,
-              ` Total tok/s/GPU: ${fmtNum(item.parsed.y, 2)}`,
-              ` ${atomeshAccuracyTaskLabel(item.raw.row.accuracyTask)}: ${atomeshAccuracyRaw(item.raw.row)}`,
-            ],
-            afterBody: () => '\nClick for details',
-          }},
-          datalabels: { display: true, color: C_LEGEND, align: 'top', formatter: value => 'c' + value.row.concurrency },
+          legend: { display: false },
+          datalabels: { display: context => !context.dataset._isFrontier && visible.length <= 18 ? 'auto' : false,
+            color: C_TICK, align: 'top', offset: 6, font: { size: 10 }, formatter: point => 'c' + point.row.concurrency },
+          tooltip: { ...chartTooltipOpts(), padding: 14, displayColors: false,
+            filter: item => !item.dataset._isFrontier,
+            callbacks: {
+              title: items => items.length ? `${explorerTopology(items[0].raw.row)} · concurrency ${items[0].raw.row.concurrency}` : '',
+              label: item => [`Total throughput: ${fmtNum(item.raw.y, 2)} tok/s`, `${metricLabel}: ${fmtNum(item.raw.x, 2)} tok/s/user`, `GPUs: ${item.raw.row.totalGpu ?? '—'}`],
+            } },
         },
         scales: {
-          x: { grid: chartGridOpts(), title: { display: true, text: `${metric.label} (tok/s/user)`, color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
-          y: { grid: chartGridOpts(), title: { display: true, text: 'Token Throughput per GPU (tok/s/gpu)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
+          x: { min: 0, grace: '12%', grid: { display: false }, border: { display: false },
+            title: { display: true, text: `${metricLabel} (tok/s/user)`, color: C_TICK, font: { size: 11 }, padding: 16 },
+            ticks: { color: C_TICK, maxTicksLimit: 8, font: { size: 10 } } },
+          y: { min: 0, grace: '15%', border: { display: false }, grid: { color: light ? '#edf0f4' : '#2a2a34', drawTicks: false },
+            title: { display: true, text: 'Total throughput (tok/s)', color: C_TICK, font: { size: 11 }, padding: 12 },
+            ticks: { color: C_TICK, maxTicksLimit: 6, padding: 12, font: { size: 10 }, callback: value => explorerCompact(value) } },
         },
-        onClick: (_e, elems) => {
-          if (!elems.length) return;
-          const item = elems[0];
-          const row = spec.datasets[item.datasetIndex]?.data?.[item.index]?.row;
-          if (row) showAtomeshPopover(row);
+        onClick: (_event, elements) => {
+          const hit = elements.find(item => !datasets[item.datasetIndex]._isFrontier);
+          if (hit) showDetail(datasets[hit.datasetIndex].data[hit.index].row);
         },
       },
     });
+    document.getElementById('ex-png').addEventListener('click', () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = chart.canvas.width; canvas.height = chart.canvas.height + 150;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = light ? '#ffffff' : '#141519'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = light ? '#1a1c24' : '#eef0f6'; ctx.font = 'bold 20px sans-serif';
+      ctx.fillText(`ATOM · ${state.explorerModel}`, 24, 30);
+      ctx.font = '12px sans-serif'; ctx.fillText(`${state.explorerSource} · Total throughput vs. ${metricLabel}`, 24, 53);
+      ctx.drawImage(chart.canvas, 0, 75);
+      let legendX = 24;
+      const legendY = chart.canvas.height + 105;
+      for (const key of seriesKeys.filter(key => !state.explorerHidden.has(key))) {
+        ctx.fillStyle = colors.get(key); ctx.fillRect(legendX, legendY - 8, 8, 8);
+        ctx.fillText(key, legendX + 15, legendY);
+        legendX += ctx.measureText(key).width + 42;
+      }
+      ctx.fillStyle = light ? '#5c6070' : '#bfc1d0';
+      ctx.fillText(`Dashed: Pareto frontier · ${rows[0]?.sourceUrl || rows[0]?.runUrl || ''}`, 24, legendY + 24);
+      canvas.toBlob(blob => { if (blob) download(blob, 'atom-throughput-interactivity.png'); });
+    });
   }
   syncHeaderH();
-  bindFixedThead(container);
 }
 
 function renderAtomeshTrendsTab() {
