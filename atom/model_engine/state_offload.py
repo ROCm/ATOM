@@ -396,12 +396,28 @@ def state_tier_capability(config) -> StateTierCapability:
 
 def state_tier_cpu_bytes() -> int:
     """CPU bytes the state tier may keep per worker (`OFFLOAD_STATE_CPU_SIZE`,
-    GiB, default 32), carved from the paged-KV LMCache pool it shares.
-
-    One reader for both halves: the worker's `StateByteCodec` evicts against
-    it and the engine's `StateOffloadIndex` mirrors the resulting entry bound.
+    GiB, default 32), carved from the paged-KV LMCache pool it shares. Under
+    PP the stages pool theirs; `state_tier_cpu_entries` splits the total.
     """
     return int(float(os.environ.get("OFFLOAD_STATE_CPU_SIZE", "32")) * (1 << 30))
+
+
+def state_tier_cpu_entries(spec, config) -> int:
+    """Checkpoint images each worker's state tier keeps.
+
+    One reader for both halves: the worker's `StateByteCodec` evicts against
+    it and the engine's `StateOffloadIndex` mirrors it.
+
+    Under PP the stages' budgets are pooled and split by image bytes, as
+    `scale_cpu_size_for_pp` splits the KV pool by layers, so every stage keeps
+    the same count. Split evenly, a stage with a smaller image would keep
+    images whose other parts the largest-image stage had already evicted, and
+    a load needs every stage's part. The total across stages is unchanged.
+    """
+    if not spec.pipeline_op_bytes:
+        return state_tier_cpu_bytes() // spec.image_bytes
+    stages = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    return state_tier_cpu_bytes() * stages // spec.pipeline_op_bytes
 
 
 def state_tier_chunk_tokens(config) -> int:
