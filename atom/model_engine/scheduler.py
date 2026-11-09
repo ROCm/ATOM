@@ -35,6 +35,7 @@ import numpy as np
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.metrics.scheduler import SchedulerMetrics
+from atom.model_engine import pd_timeline
 from atom.model_engine.block_manager import BlockManager, draft_kv_lookahead
 from atom.model_engine.dynamic_chunking import (
     CALIBRATION_SWEEP_RATIO,
@@ -2660,6 +2661,9 @@ class Scheduler:
                 f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "
                 f"req_ids: {tuple(scheduled_seqs.keys())}"
             )
+            for seq in scheduled_seqs.values():
+                pd_timeline.mark(seq, "sched0")
+                pd_timeline.mark(seq, "sched1", last=True)
             self.prev_prompt = True
             # lip: TODO for prefill/decode mixed batch
 
@@ -3225,6 +3229,7 @@ class Scheduler:
 
     def _schedule_first_decode_after_remote_kv(self, seq: Sequence) -> None:
         """P/D path: a remote prefill completed, so schedule first decode."""
+        pd_timeline.mark(seq, "unpark")
         # num_cached_tokens still describes this consumer's pre-existing prefix.
         # Received suffix blocks and the producer's inherited API hit are not
         # local hits. Record before appending the producer's first output token.
@@ -4435,6 +4440,11 @@ class Scheduler:
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
                 tracing.first_token(seq)
+                pd_timeline.mark(seq, "tok")
+                if self.kv_connector is not None and not self._connector_flag(
+                    "is_producer"
+                ):
+                    pd_timeline.emit(seq, "D")
 
             # Counted here, not from `len(token_ids)` above: `new_tokens` is
             # what reaches RequestOutput, and it differs from the forward's
@@ -4920,6 +4930,8 @@ class Scheduler:
                 # Already reclaimed by `_reconcile_stalled_deferred_saves` after
                 # a stall; a late completion report has nothing left to free.
                 continue
+            pd_timeline.mark(seq, "sent")
+            pd_timeline.emit(seq, "P")
             self._maybe_release_deferred(seq)
 
         for req_id in finished_saving:

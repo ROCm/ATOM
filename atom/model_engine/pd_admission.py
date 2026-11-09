@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from atom.model_engine import pd_timeline
+
 logger = logging.getLogger("atom")
 
 
@@ -159,6 +161,7 @@ class PdAdmissionController:
                 0.0 if deferred_at is None else time.perf_counter() - deferred_at
             )
         seq._pd_deferred_at = None
+        pd_timeline.mark(seq, "admit")
         blocks = frozenset(block_ids)
         if (
             self.max_bytes is not None
@@ -176,6 +179,7 @@ class PdAdmissionController:
         entry = self.pending.get(str(req_id))
         if entry is not None and entry.ready_at is None:
             entry.ready_at = time.perf_counter()
+            pd_timeline.mark(entry.sequence, "recv")
             self._publish()
 
     def cancel(self, seq):
@@ -195,6 +199,7 @@ class PdAdmissionController:
                 self.metrics.pd_admission_ready_wait.observe(
                     time.perf_counter() - entry.ready_at
                 )
+            pd_timeline.mark(seq, "fwd")
             self.release(seq)
 
     def release(self, seq):

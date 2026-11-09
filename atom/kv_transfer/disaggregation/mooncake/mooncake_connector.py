@@ -98,6 +98,7 @@ from atom.kv_transfer.disaggregation.types import (
     ReqId,
     TransferId,
 )
+from atom.model_engine import pd_timeline
 from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.models.utils import get_pp_indices
 from atom.utils import envs, get_open_port, make_zmq_path, zmq_socket_ctx
@@ -892,6 +893,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                     seq, _ = pending
                     if completion.succeeded:
                         self._chunked_ready.add(seq.id)
+                        pd_timeline.mark(seq, "ready")
                     else:
                         # Retired IDs cannot authorize a new source allocation.
                         seq.status = SequenceStatus.ABORTED

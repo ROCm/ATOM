@@ -4082,6 +4082,16 @@ models:
             OFFLOAD_STAGING_ON_COMPUTE_STREAM: '1'
             ATOM_PP_MAX_IN_FLIGHT: '8'
             ATOM_PP_SEND_DEPTH: '2'
+      # The C240 indexer-CP cell with a `[PD-TL]` line per request and role. At
+      # steady state a request waits ~1.4 s for P's first schedule and ~1.6 s
+      # from P's last schedule to its first token, whatever its size.
+      - <<: *issue382_a9_1p2d_c240_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c240-pernic4352-tuned-mem90-icp-tl
+        env:
+          <<: *issue382_a9_pernic4352_tuned_icp_env
+          common:
+            <<: *issue382_a9_pernic4352_tuned_env_common
+            ATOM_PD_TIMELINE: '1'
       # Twice the decodes' pending-receive credits. Sessions resuming after the
       # trace's 300 s idle-gap cap find their prefix gone from D (D's hit falls
       # 88% -> 28% in 4 minutes) and each needs its whole prompt's KV: 0.15 of

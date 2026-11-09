@@ -149,6 +149,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
     # MiniMax PP/TP1 -> TP landing, independent of incremental chunk transfer.
     "ATOM_PD_MHA_LANDING": lambda: _flag_env("ATOM_PD_MHA_LANDING", "0"),
+    # P/D: log one `[PD-TL]` line per request and role with wall-clock marks
+    # (arrival, D admission, schedules, receive, first token, send done).
+    "ATOM_PD_TIMELINE": lambda: _flag_env("ATOM_PD_TIMELINE", "0"),
     # Mooncake and MoRIIO P/D: how long a failed transfer may still land. A
     # decode holds a failed receive's KV pages this long before reporting the
     # failure; a Mooncake prefill keeps a landing slot whose write failed out
