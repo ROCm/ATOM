@@ -1519,6 +1519,58 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
         return attn
 
+    @property
+    def supports_token_graph(self) -> bool:
+        """MiniMax-M3 sizes every launch outside its attention regions by the
+        token count alone, so its prefill may pad to a recorded token-graph
+        bucket; the regions run its scheduled rows
+        (`region_graph.padded_prefill_rows`). Only a MiniMax-M3 config with
+        its sparse attention sets `_has_sparse_attention`, so the other models
+        this builder serves keep eager prefills.
+
+        Not under DP: a decoding or idle rank would replay the prefill
+        recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
+        prefill alone. Nor under Ulysses SP, whose attention records inline
+        into the decode token graphs on the premise that no prefill one is
+        recorded (`sp_attention`)."""
+        config = self.model_runner.config
+        return (
+            self._has_sparse_attention
+            and config.parallel_config.data_parallel_size == 1
+            and config.sequence_parallel_size == 1
+        )
+
+    def step_needs_eager(self, batch: ScheduledBatch) -> bool:
+        if (
+            self.supports_token_graph
+            and batch.total_tokens_num_prefill > 0
+            and batch.multimodal_data
+        ):
+            return True
+        return super().step_needs_eager(batch)
+
+    def build_for_token_graph_capture(self, tokens: int):
+        """A request-less prefill of ``tokens`` rows for recording that
+        token-graph bucket. A dummy step: attention hands back its output
+        shape and writes no KV or index cache -- a replay runs it on the live
+        step."""
+        if not 0 < tokens <= self.model_runner.config.max_num_batched_tokens:
+            raise ValueError(
+                f"token-graph bucket {tokens} exceeds max_num_batched_tokens"
+            )
+        positions = self.model_runner.forward_vars["positions"].gpu[:tokens]
+        positions.zero_()
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=True,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
+        )
+        return AttentionMetaData(max_seqlen_q=tokens, max_seqlen_k=tokens), context
+
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
         max_seqlen_k = self.model_runner.config.max_model_len
