@@ -673,10 +673,19 @@ def tool_call_grammar_format(parser_cls, tools, tool_choice, starts_in_reasoning
         return None
     if any(tool.get("type", "function") != "function" for tool in tools):
         return None  # only function tools have a parameter schema to hold to
+    from atom.entrypoints.openai.tool_parser.tool_parser import qualified_tool_name
+
     from .schema import check_schema_safety
 
     chosen, required = selected_tools(tools, tool_choice)
     functions = [tool.get("function", tool) for tool in chosen]
+    if any(
+        qualified_tool_name(tool) != function.get("name")
+        for tool, function in zip(chosen, functions)
+    ):
+        # The prompt shows a function's own name, not its namespace, so a call
+        # cannot carry the qualified identity the request selects tools by.
+        return None
     for function in functions:
         # The same checks a response schema passes (#2862): a schema llguidance
         # would accept but cannot match within its budget fails the request at
@@ -725,6 +734,7 @@ async def configure_tool_call_grammar(
     if not envs.ATOM_TOOL_CALL_GRAMMAR:
         return False
     required_channel = sampling_params.required_channel
+    reasoning_end = sampling_params.structured_reasoning_end
     fmt = None
     try:
         fmt = tool_call_grammar_format(
@@ -759,6 +769,7 @@ async def configure_tool_call_grammar(
                     _uncompilable_tool_grammars.popitem(last=False)
         sampling_params.json_schema = None
         sampling_params.structured_tool_format = None
+        sampling_params.structured_reasoning_end = reasoning_end
         sampling_params.required_channel = required_channel
         return False
     return True

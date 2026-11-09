@@ -7,13 +7,15 @@ A K3 message is ``think? response? tools? <|close|>message<|sep|>`` in XTML
 (`encoding_k3.py` in the checkpoint). Reasoning and response text stay free;
 inside the tools section every call must name a declared tool and carry each
 of its required arguments, so ``<|close|>call`` cannot be sampled before them.
-Typed values are held to their schema, string ``enum`` / ``const`` values to
-their literals, and declared keys to their own rules; other keys are refused
-when the schema closes ``additionalProperties``.
+Typed values are held to their schema (each type of a union, or each type an
+``enum`` / ``const`` implies, as its own alternative), string ``enum`` /
+``const`` values to their literals, and declared keys to their own rules;
+other keys are refused when the schema closes ``additionalProperties``.
 
-The grammar may admit a value the schema forbids -- a value of a union type,
-or a string past ``enum`` / ``const`` (``pattern``, ``maxLength``) is free --
-but it never refuses an argument the schema allows, with one exception: past
+The grammar may admit a value the schema forbids -- a value whose schema
+states no type, ``enum`` or ``const`` (a bare ``anyOf``), or a string past
+``enum`` / ``const`` (``pattern``, ``maxLength``) is free -- but it never
+refuses an argument the schema allows, with one exception: past
 ``MAX_PERMUTED_REQUIRED`` required arguments they must come in declaration
 order, because enumerating every order grows factorially.
 
@@ -23,8 +25,8 @@ Kimi Vendor Verifier ToolCall bench, prompts whose history repeats
 K3 even with ``tool_choice="auto"`` (`kimik3_structural_tag.py`).
 
 The control tokens ``<|open|>``, ``<|close|>`` and ``<|sep|>`` are written as
-special tokens, so free text can never contain them and the structure cannot
-be bypassed through a text rule.
+special tokens, and free text may not spell them from ordinary tokens either,
+so the structure cannot be bypassed through a text rule.
 """
 
 import itertools
@@ -33,6 +35,15 @@ import re
 
 # The XTML `type` attribute values (`_xtml_type` in encoding_k3.py).
 XTML_TYPES = ("string", "number", "boolean", "null", "array", "object")
+# The JSON Schema types; an integer is written as an XTML number.
+KINDS = ("string", "integer", "number", "boolean", "null", "array", "object")
+# The XTML delimiters. Free text may not spell them from ordinary tokens
+# either, as the text-based parser would read them as structure.
+DELIMITERS = ("<|open|>", "<|close|>", "<|sep|>")
+# What may stand beside a `$ref` that is the whole parameters schema.
+ROOT_REF_KEYS = frozenset(
+    ("$ref", "$defs", "definitions", "$schema", "$id", "type", "title", "description")
+)
 # Required arguments may come in any order. Up to this many, every order is
 # enumerated; beyond it they are taken in declaration order.
 MAX_PERMUTED_REQUIRED = 4
@@ -54,14 +65,6 @@ def _close(tag: str) -> str:
 def _attr(value) -> str:
     # `_escape_attr_value` in encoding_k3.py.
     return str(value).replace("&", "&amp;").replace('"', "&quot;")
-
-
-def _xtml_type(schema) -> str | None:
-    """The single XTML type a parameter schema implies, or None (any type)."""
-    kind = schema.get("type") if isinstance(schema, dict) else None
-    if kind == "integer":
-        return "number"
-    return kind if kind in XTML_TYPES else None
 
 
 def _pointer(ref, root: dict):
@@ -136,25 +139,70 @@ def _localize(schema: dict, root: dict) -> dict:
     return out
 
 
+def _is_kind(value, kind: str) -> bool:
+    """Whether a literal is an instance of the JSON Schema type ``kind``."""
+    if isinstance(value, bool) or value is None:
+        return kind == ("boolean" if isinstance(value, bool) else "null")
+    if isinstance(value, (int, float)):
+        return kind == "number" or (kind == "integer" and float(value).is_integer())
+    return kind == {str: "string", list: "array", dict: "object"}.get(type(value))
+
+
+def _kinds(schema: dict) -> list[str] | None:
+    """The JSON Schema types a value may take, or None when not stated."""
+    kind = schema.get("type")
+    if isinstance(kind, str):
+        return [kind]
+    if isinstance(kind, list):
+        return [k for k in kind if isinstance(k, str)]
+    literals = [schema["const"]] if "const" in schema else schema.get("enum")
+    if isinstance(literals, list):
+        # A number literal covers the integers.
+        kinds = [k for k in KINDS if any(_is_kind(v, k) for v in literals)]
+        return [k for k in kinds if k != "integer"]
+    return None
+
+
+def _variant(target: dict, kind: str, root: dict, carried: dict) -> str | None:
+    """``type="T"<|sep|>VALUE`` for the values of type ``kind``, or None if
+    the schema admits none of them."""
+    xtml = "number" if kind == "integer" else kind
+    if xtml not in XTML_TYPES:
+        return None
+    literals = [target["const"]] if "const" in target else target.get("enum")
+    if isinstance(literals, list):
+        literals = [v for v in literals if _is_kind(v, kind)]
+        if not literals:
+            return None
+    head = f"{_lit(xtml + Q)} <|sep|>"
+    if kind == "string":  # written raw, not as JSON
+        if literals is None:
+            return f"{head} TEXT?"
+        words = [_lit(v) for v in literals if v]
+        if not words:  # only the empty string
+            return head
+        return f"{head} ({' | '.join(words)}){'?' if '' in literals else ''}"
+    json_schema = {**target, "type": kind, **carried}
+    if literals is not None:
+        json_schema.pop("const", None)
+        json_schema["enum"] = literals
+    return f"{head} %json {json.dumps(_localize(json_schema, root))}"
+
+
 def _value(schema, root: dict, carried: dict) -> str:
-    """The rule for ``type="T"<|sep|>VALUE`` of one argument. ``root`` is the
-    parameters schema and ``carried`` its own ``$defs`` / ``definitions``, so
-    a ``$ref`` inside a typed value still resolves where it is compiled on
-    its own."""
+    """The rule for ``type="T"<|sep|>VALUE`` of one argument: one alternative
+    per type the schema allows. ``root`` is the parameters schema and
+    ``carried`` its own ``$defs`` / ``definitions``, so a ``$ref`` inside a
+    typed value still resolves where it is compiled on its own."""
     target = _resolve(schema, root)
-    kind = _xtml_type(target)
-    if kind == "string":
-        allowed = target.get("enum", [target["const"]] if "const" in target else None)
-        if allowed and all(isinstance(v, str) for v in allowed):
-            literals = " | ".join(_lit(v) for v in allowed if v)
-            optional = "?" if "" in allowed else ""
-            return f"{_lit('string' + Q)} <|sep|> ({literals}){optional}"
-        return f"{_lit('string' + Q)} <|sep|> TEXT?"
-    if kind is not None:
-        json_schema = _localize({**target, **carried}, root)
-        return f"{_lit(kind + Q)} <|sep|> %json {json.dumps(json_schema)}"
-    types = " | ".join(_lit(t) for t in XTML_TYPES)
-    return f"({types}) {_lit(Q)} <|sep|> TEXT?"
+    kinds = _kinds(target) if isinstance(target, dict) else None
+    if kinds is None:
+        types = " | ".join(_lit(t) for t in XTML_TYPES)
+        return f"({types}) {_lit(Q)} <|sep|> TEXT?"
+    variants = [v for k in kinds if (v := _variant(target, k, root, carried))]
+    if not variants:
+        raise ValueError("A tool argument schema admits no value")
+    return variants[0] if len(variants) == 1 else f"({' | '.join(variants)})"
 
 
 def _key_except(words: list[str]) -> str:
@@ -185,9 +233,12 @@ def _key_except(words: list[str]) -> str:
 
 
 def _call_rules(index: int, function: dict) -> tuple[str, list[str]]:
-    params = function.get("parameters") or {}
+    root = function.get("parameters") or {}
+    params = _resolve(root, root)  # parameters may be a `$ref` themselves
+    if params is not root and set(root) - ROOT_REF_KEYS:
+        raise ValueError("Tool parameters combine a $ref with other keywords")
     props = params.get("properties") or {}
-    carried = {k: params[k] for k in ("$defs", "definitions") if k in params}
+    carried = {k: root[k] for k in ("$defs", "definitions") if k in root}
     extra = params.get("additionalProperties", True)
     required = list(
         dict.fromkeys(k for k in params.get("required") or () if isinstance(k, str))
@@ -202,12 +253,12 @@ def _call_rules(index: int, function: dict) -> tuple[str, list[str]]:
         schema = props.get(key, extra if isinstance(extra, dict) else {})
         head = f'argument key="{_attr(key)}" type="'
         rules.append(
-            f"{names[key]}: <|open|> {_lit(head)} {_value(schema, params, carried)} "
+            f"{names[key]}: <|open|> {_lit(head)} {_value(schema, root, carried)} "
             f"{_close('argument')}"
         )
     optional = [names[k] for k in props if k not in required]
     if extra is not False:  # undeclared keys, never a declared one
-        undeclared = _value(extra if isinstance(extra, dict) else {}, params, carried)
+        undeclared = _value(extra if isinstance(extra, dict) else {}, root, carried)
         rules.append(
             f"{rule}_arg_extra: <|open|> {_lit('argument key=' + Q)} "
             f"/{_key_except([_attr(k) for k in names])}/ {_lit(Q + ' type=' + Q)} "
@@ -268,6 +319,8 @@ def build_tool_call_grammar(
     head += [
         f"tools: {_open('tools')} ({' | '.join(calls)})+ {_close('tools')}",
         f"end: {_close('message')}",
-        r"TEXT: /(.|\n)+/",
+        "TEXT: /(.|\\n)+/ & ~/(.|\\n)*("
+        + "|".join(re.escape(d) for d in DELIMITERS)
+        + ")(.|\\n)*/",
     ]
     return "\n".join(["%llguidance {}", *head, *rules]) + "\n"

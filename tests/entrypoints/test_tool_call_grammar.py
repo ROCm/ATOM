@@ -267,6 +267,55 @@ def test_refs_into_the_parameters_resolve_against_the_parameters(params, good, b
     assert not feed(m, HEAD + arg("node", bad, kind="object"))
 
 
+@pytest.mark.parametrize(
+    "schema, good, bad",
+    [
+        (
+            {"type": ["integer", "null"]},
+            [("3", "number"), ("null", "null")],
+            [("soon", "number"), ("3", "string")],
+        ),
+        ({"enum": [1, 2]}, [("1", "number")], [("3", "number"), ("1", "string")]),
+        ({"type": "string", "enum": [""]}, [("", "string")], [("x", "string")]),
+    ],
+)
+def test_union_and_literal_values_are_held_to_their_schema(schema, good, bad):
+    params = {"type": "object", "properties": {"v": schema}, "required": ["v"]}
+    for value, kind in good:
+        assert feed(matcher([tool(params)]), HEAD + arg("v", value, kind) + END_CALL)
+    for value, kind in bad:
+        assert not feed(matcher([tool(params)]), HEAD + arg("v", value, kind))
+
+
+@pytest.mark.parametrize("referenced", [False, True])
+def test_parameters_given_as_a_ref_are_held_like_inline_ones(referenced):
+    args = {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+    params = {"$ref": "#/$defs/Args", "$defs": {"Args": args}} if referenced else args
+    m = matcher([tool(params)])
+    assert feed(m, HEAD) and not allowed(m, CLOSE)
+    assert not feed(matcher([tool(params)]), HEAD + arg("other", "x"))
+    assert feed(matcher([tool(params)]), HEAD + arg("path", "a.py") + END_CALL)
+
+
+def test_parameters_ref_beside_other_keywords_raises():
+    params = {"$ref": "#/$defs/A", "$defs": {"A": {}}, "required": ["path"]}
+    with pytest.raises(ValueError, match=r"\$ref"):
+        matcher([tool(params)])
+
+
+def test_free_text_cannot_spell_a_delimiter_from_ordinary_tokens():
+    # Byte IDs only: the text-based parser would read the spelling as structure.
+    m = matcher([WRITE])
+    assert not all(m.accept_token(b) for b in b"x<|open|>tools<|sep|>")
+    m = matcher([WRITE])
+    assert all(m.accept_token(b) for b in b"a <|op x | sep")
+
+
 def test_json_block_argument_form_is_refused():
     # KimiK3Parser reads argument tags only; a JSON block would reach the client as {}.
     m = matcher([WRITE])
@@ -309,6 +358,8 @@ def test_generation_that_starts_in_the_response_channel():
         (KimiK3Parser, [{"type": "custom", "name": "x"}], "auto"),
         (ToolCallParser, [WRITE], "auto"),
         (None, [WRITE], "auto"),
+        # The prompt shows `write`; the request selects it as `files::write`.
+        (KimiK3Parser, [{**WRITE, "namespace": "files"}], "auto"),
     ],
 )
 def test_no_grammar_when_no_function_call_can_be_held(parser, tools, choice):
@@ -424,7 +475,32 @@ def test_preparation_failure_falls_back_and_only_compile_errors_are_remembered(
 
     for _ in range(2):
         params = _params()
+        params.structured_reasoning_end = "kept"
         assert not _configure(params, NS(prepare_structured_request=refuse))
         assert params.json_schema is None and params.structured_tool_format is None
         assert params.required_channel == "held"
+        assert params.structured_reasoning_end == "kept"
     assert len(calls) == (1 if error is ValueError else 2)
+
+
+def test_stream_without_a_response_schema_turns_a_decode_error_into_an_error_event():
+    # A tool-call grammar sets no response schema; the stream wrapper still
+    # reports its decode error instead of ending as a truncated success.
+    frames = [
+        f"data: {json.dumps({'choices': [choice]})}\n\n"
+        for choice in (
+            {"index": 0, "delta": {"content": "a"}},
+            {"index": 0, "delta": {}, "finish_reason": "structured_output_error"},
+        )
+    ]
+
+    async def source():
+        for frame in frames:
+            yield frame
+
+    async def collect():
+        return [f async for f in validation.validate_chat_stream(source(), None)]
+
+    out = asyncio.run(collect())
+    assert out[0] == frames[0]
+    assert "structured_output_error" in out[-2] and out[-1] == "data: [DONE]\n\n"
