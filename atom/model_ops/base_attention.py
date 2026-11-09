@@ -214,40 +214,6 @@ def _flydsl_arch_supported() -> bool:
     return get_gfx_runtime() in _FLYDSL_PA_ARCHS
 
 
-@functools.lru_cache(maxsize=1)
-def _flydsl_explicit_plan_api() -> bool:
-    """Whether aiter has #5809's FlyDSL decode API (explicit work plans).
-
-    An older aiter would raise on the first call; probing once lets the gate
-    decline the call before entering aiter. Checks only markers of that API
-    (`max_context_length`, and the `plan_pa_decode` ATOM calls), not how
-    `work_plan` is declared: aiter may omit it for K/V ATOM does not send.
-    """
-    import inspect
-
-    try:
-        # By module path: aiter.ops.flydsl lazily exports a `pa_decode`
-        # function, which `from aiter.ops.flydsl import pa_decode` can return.
-        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    except ImportError:
-        ok = False
-    else:
-        params = inspect.signature(mod.pa_decode).parameters
-        ok = hasattr(mod, "plan_pa_decode") and "max_context_length" in params
-    if not ok:
-        fallback = (
-            "using gluon"
-            if pa_decode_gluon_supports_arch()
-            else "this GPU has no gluon fallback"
-        )
-        logger.warning(
-            "FlyDSL paged decode is enabled but this aiter predates the #5809 "
-            "decode API; %s.",
-            fallback,
-        )
-    return ok
-
-
 def _flydsl_pa_decode_num_seqs(
     *,
     output: torch.Tensor,
@@ -306,8 +272,6 @@ def _flydsl_pa_decode_num_seqs(
     if k_cache.shape[-2] not in _FLYDSL_PA_BLOCK_SIZES:
         return None
     if not _flydsl_arch_supported():
-        return None
-    if not _flydsl_explicit_plan_api():
         return None
     if context_partition_size != _FLYDSL_PA_TILE:
         return None

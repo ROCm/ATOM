@@ -1273,36 +1273,6 @@ class TestExplicitPlan:
         ubatch[0] = 0
         assert self._call(ba, owner=step, cache_owner=step) is ub0
 
-    @staticmethod
-    def _before_5809(output, query, max_context_partition_num, work_plan=None):
-        raise AssertionError("not called")
-
-    @staticmethod
-    def _no_bound(output, *a, work_plan, sinks=None):
-        raise AssertionError("not called")
-
-    @staticmethod
-    def _optional_plan(output, *a, work_plan=None, max_context_length=None):
-        raise AssertionError("not called")
-
-    @pytest.mark.parametrize(
-        "signature,routed",
-        [("_before_5809", False), ("_no_bound", False), ("_optional_plan", True)],
-    )
-    def test_flydsl_api_probe(self, monkeypatch, signature, routed):
-        """Only an aiter with #5809's explicit-plan API is routed to FlyDSL."""
-        from atom.model_ops import base_attention as ba
-
-        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
-        try:
-            monkeypatch.setattr(mod, "pa_decode", getattr(self, signature))
-            ba._flydsl_explicit_plan_api.cache_clear()
-            assert ba._flydsl_explicit_plan_api() is routed
-        finally:
-            monkeypatch.undo()
-            ba._flydsl_explicit_plan_api.cache_clear()
-        assert ba._flydsl_explicit_plan_api() is True
-
     def test_dense_site_leaves_the_bound_to_the_block_table(self):
         """max_seqlen_k differs between graph and eager and picks the kernel."""
         for kw in self._call_kwargs("model_ops/attention_mha.py", "run_pa_decode"):
@@ -1895,19 +1865,6 @@ class TestNoGluonFlyDSLRouting:
                 max_logits=None,
                 temporary_output=None,
             )
-
-    def test_api_probe_reads_the_submodule_not_the_package_export(self, monkeypatch):
-        """aiter.ops.flydsl lazily exports a `pa_decode` function of that name."""
-        from atom.model_ops import base_attention as ba
-
-        pkg = importlib.import_module("aiter.ops.flydsl")
-        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
-        monkeypatch.setattr(pkg, "pa_decode", mod.pa_decode, raising=False)
-        ba._flydsl_explicit_plan_api.cache_clear()
-        try:
-            assert ba._flydsl_explicit_plan_api() is True
-        finally:
-            ba._flydsl_explicit_plan_api.cache_clear()
 
     def test_dense_decode_without_gluon_takes_the_unified_arm(self, monkeypatch):
         self._no_gluon(monkeypatch)
