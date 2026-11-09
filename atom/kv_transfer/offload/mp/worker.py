@@ -54,6 +54,7 @@ from atom.kv_transfer.offload.mp.native_state_layout import (
     stores_state_images,
 )
 from atom.kv_transfer.offload.mp.page_views import _build_cache_views
+from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
 from atom.kv_transfer.offload.mp.transfer import (
     _chunk_ranges,
     _enforce_transfer_deadline,
@@ -113,6 +114,11 @@ class LMCacheMPConnector(KVConnectorBase):
     def __init__(self, config: Any, *, transfers_off_step: bool = False) -> None:
         _validate_mp_config(config)
         self._config = config
+        # Each request's token prefix, rebuilt from incremental shipments
+        # (`token_shipping.py`). Here, in the worker every frontend reaches (the
+        # shell, the native-state worker, the vLLM plugin's adapter), not in a
+        # shell only some of them go through.
+        self._tokens = WorkerTokens()
         # Submit and poll on the transfer thread, whatever
         # OFFLOAD_MP_TRANSFER_THREAD says: for a frontend whose forward thread
         # cannot afford either (the vLLM plugin).
@@ -379,6 +385,7 @@ class LMCacheMPConnector(KVConnectorBase):
     def start_load_kv(self, metadata: Any) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
+        self._tokens.resolve(metadata)
         if self._adapter is None or self.chunk_size is None:
             raise RuntimeError("lmcache_mp KV caches are not registered")
 

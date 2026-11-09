@@ -275,10 +275,9 @@ class PrefixSpreadRouter:
         """Record that `rank` holds this prompt's sampled prefix.
 
         Each entry names the request whose prefill puts that part on the rank:
-        `seq_id` for the part it computes; for the part it reuses (the first
-        `hit` tokens) the request that computed it -- the rank's existing
-        holder, else `hit_source`. So a follower that only reuses a prefix
-        never becomes its busy source. Every entry this request adds or
+        `seq_id` for the part it computes or loads from the tier; for the part
+        it reuses in HBM (the first `hit` tokens) the rank's existing holder.
+        So a follower that only reuses a prefix never becomes its busy source. Every entry this request adds or
         rewrites stays provisional until a request relying on it completes its
         prefill (`prefill_complete`); if all of them leave first, it is
         removed (`_left_unprefilled`).

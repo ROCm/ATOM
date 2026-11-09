@@ -23,7 +23,6 @@ from atom.kv_transfer.offload._offload_common import validated_kv_role
 from atom.kv_transfer.offload.mp import deployment
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
-from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
 from atom.kv_transfer.offload.page_codec import replays_state
 
 
@@ -77,9 +76,6 @@ class LMCacheMPConnector(KVConnectorBase):
         validated_kv_role(getattr(config, "kv_transfer_config", {}) or {})
         self._config = config
         self._impl: KVConnectorBase | None = None
-        # Each request's token prefix, rebuilt from incremental shipments
-        # (`token_shipping.py`).
-        self._tokens = WorkerTokens()
 
     def _require_impl(self) -> KVConnectorBase:
         if self._impl is None:
@@ -135,7 +131,6 @@ class LMCacheMPConnector(KVConnectorBase):
             self._impl.close()
 
     def start_load_kv(self, metadata: Any) -> None:
-        self._tokens.resolve(metadata)
         self._require_impl().start_load_kv(metadata)
 
     def get_finished(self) -> KVConnectorOutput:

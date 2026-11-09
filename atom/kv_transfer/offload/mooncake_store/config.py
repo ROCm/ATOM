@@ -21,8 +21,9 @@ from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.mooncake_store.nic import parse_device_list
 
 KEY_PREFIX = "mooncake_store."
-# `select_offload_layout`'s name for the V4.x PAGE-region layout.
-_REPLAY_PAGE_LAYOUT = "hybrid"
+# `select_offload_layout`'s name for DeepSeek-V4.1's PAGE+STATE pool. Plain
+# DeepSeek-V4 resolves to "hybrid" and is refused with every other layout.
+_REPLAY_PAGE_LAYOUT = "dsv41"
 _MIB = 1 << 20
 _PROTOCOLS = ("rdma", "tcp")
 
@@ -217,13 +218,11 @@ def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> 
     if layout == _REPLAY_PAGE_LAYOUT and not getattr(
         config, "enable_encoder_swa_bounded_replay", False
     ):
-        # Plain DeepSeek-V4 is also "hybrid", and copies state instead of
-        # replaying it: its PAGE-only load would be unsound. Refuse here, at
-        # construction, not after the weights are loaded.
+        # V4.1 without bounded replay copies its state instead of replaying
+        # it: the Store's PAGE-only load would be unsound.
         raise ValueError(
-            "the Mooncake Store offload moves a hybrid model's PAGEs only where "
-            "a hit's state is rebuilt by replay (V4.1 with "
-            "enable_encoder_swa_bounded_replay)"
+            "the Mooncake Store offload moves V4.1's PAGEs only with "
+            "enable_encoder_swa_bounded_replay"
         )
     dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
     if dcp > 1:

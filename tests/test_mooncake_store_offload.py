@@ -732,7 +732,7 @@ def test_engine_compatibility_refuses_what_phase_one_does_not_move():
 def test_engine_compatibility_accepts_v41_page_replay():
     config = _config()
     config.enable_encoder_swa_bounded_replay = True
-    config.hf_config.compress_ratios = [4, 128]
+    config.hf_config.model_type = "deepseek_v41"
     cfg = parse_mooncake_store_config(_extra())
     check_engine_compatibility(cfg, config)
     config.decode_context_parallel_size = 2
@@ -3147,7 +3147,7 @@ def _registering_config():
 @pytest.mark.parametrize("replays", [False, None])
 def test_v41_registration_requires_explicit_page_replay(cluster, one_rank, replays):
     config = _registering_config()
-    config.hf_config.compress_ratios = [4, 128]
+    config.hf_config.model_type = "deepseek_v41"
     config.enable_encoder_swa_bounded_replay = True
     transfer = SimpleNamespace(
         state_backend=SimpleNamespace(
@@ -3171,7 +3171,7 @@ def test_v41_registration_uses_pages_without_request_slots(
     from atom.kv_transfer.offload import page_codec as dsv4_codec
 
     config = _registering_config()
-    config.hf_config.compress_ratios = [4, 128]
+    config.hf_config.model_type = "deepseek_v41"
     config.enable_encoder_swa_bounded_replay = True
     pages = object()
     transfer = SimpleNamespace(
@@ -3817,7 +3817,7 @@ def test_v41_architecture_alias_and_codec_identity():
 
     config = _config()
     dense = keys.store_namespace(config, CHUNK)
-    config.hf_config.compress_ratios = [4, 128]
+    config.hf_config.model_type = "deepseek_v41"
     config.enable_encoder_swa_bounded_replay = True
     assert uses_replay_pages(config)
     assert keys.store_namespace(config, CHUNK) != dense
@@ -3844,14 +3844,32 @@ def test_pure_page_codec_rejects_missing_fused_staging(monkeypatch):
         page_codec.pure_page_codec([object()], 8)
 
 
-def test_plain_v4_is_refused_before_weights_load():
-    """DeepSeek-V4 is also the "hybrid" layout, but copies state instead of
-    replaying it: the PAGE-only Store load is refused at construction."""
+def test_plain_v4_and_v41_without_replay_are_refused_before_weights_load():
+    """Plain DeepSeek-V4 is the "hybrid" layout and V4.1 without bounded replay
+    copies its state: both are refused at construction, not at registration."""
+    plain_v4 = _config()
+    plain_v4.hf_config.compress_ratios = [4, 128]
+    with pytest.raises(ValueError, match="resolves to 'hybrid'"):
+        check_engine_compatibility(parse_mooncake_store_config(_extra()), plain_v4)
+    v41 = _config()
+    v41.hf_config.model_type = "deepseek_v41"
+    v41.enable_encoder_swa_bounded_replay = False
+    with pytest.raises(ValueError, match="enable_encoder_swa_bounded_replay"):
+        check_engine_compatibility(parse_mooncake_store_config(_extra()), v41)
+
+
+@pytest.mark.parametrize(
+    "model_type", ["deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"]
+)
+def test_every_v41_spelling_is_admitted_with_bounded_replay(model_type):
+    from atom.kv_transfer.offload.mooncake_store.config import uses_replay_pages
+
     config = _config()
+    config.hf_config.model_type = model_type
     config.hf_config.compress_ratios = [4, 128]
-    config.enable_encoder_swa_bounded_replay = False
-    with pytest.raises(ValueError, match="rebuilt by replay"):
-        check_engine_compatibility(parse_mooncake_store_config(_extra()), config)
+    config.enable_encoder_swa_bounded_replay = True
+    check_engine_compatibility(parse_mooncake_store_config(_extra()), config)
+    assert uses_replay_pages(config)
 
 
 def test_store_reads_the_region_map_only_on_a_page_layout():
@@ -3861,5 +3879,5 @@ def test_store_reads_the_region_map_only_on_a_page_layout():
     dense = _config(kv_transfer_config=store)
     assert not KVConnectorFactory.topology_reads_block_regions(dense)
     v41 = _config(kv_transfer_config=store)
-    v41.hf_config.compress_ratios = [4, 128]
+    v41.hf_config.model_type = "deepseek_v41"
     assert KVConnectorFactory.topology_reads_block_regions(v41)

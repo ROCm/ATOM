@@ -2315,31 +2315,43 @@ def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
 
 
 def _shipping_pair():
-    from atom.kv_transfer.offload.mp.connector import LMCacheMPConnector
+    """A scheduler, and the concrete MP worker every frontend reaches (the
+    shell, the native-state worker and the vLLM plugin's adapter all call its
+    `start_load_kv`). The worker has no adapter, so `start_load_kv` resolves the
+    shipped tokens and then stops at "not registered"; `_send` collects what it
+    resolved."""
     from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
-
-    sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
-
-    sched._token_shipper = TokenShipper()
     from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
 
-    shell = LMCacheMPConnector.__new__(LMCacheMPConnector)
-    shell._tokens = WorkerTokens()
+    sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
+    sched._token_shipper = TokenShipper()
+    worker = mp_worker.LMCacheMPConnector.__new__(mp_worker.LMCacheMPConnector)
+    worker._tokens = WorkerTokens()
+    worker._adapter = None
+    worker.chunk_size = None
     received = []
-    shell._impl = SimpleNamespace(
-        start_load_kv=lambda meta: received.extend(r.token_ids for r in meta.requests)
-    )
-    return sched, shell, received
+    worker._received = received
+    return sched, worker, received
 
 
-def _send(shell, *reqs):
+def _start(worker, meta):
+    try:
+        worker.start_load_kv(meta)
+    except RuntimeError as exc:
+        if "not registered" not in str(exc):
+            raise
+
+
+def _send(worker, *reqs):
     import pickle
 
     from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
 
     meta = LMCacheOffloadMetadata()
     meta.requests = list(reqs)
-    shell.start_load_kv(pickle.loads(pickle.dumps(meta)))
+    sent = pickle.loads(pickle.dumps(meta))
+    _start(worker, sent)
+    worker._received.extend(r.token_ids for r in sent.requests)
 
 
 def test_incremental_tokens_round_trip_through_the_worker_shell():
@@ -2479,7 +2491,7 @@ def test_drops_reach_the_workers_without_a_transfer():
     meta = LMCacheOffloadMetadata()
     meta.token_drops = sched._token_shipper.take_drops()
     assert meta.has_work()
-    shell.start_load_kv(meta)
+    _start(shell, meta)
     assert 7 not in shell._tokens._held
 
 
@@ -2921,3 +2933,38 @@ def test_get_finished_wakes_the_transfer_thread_while_transfers_are_pending(
     )
     worker.get_finished()
     assert looks == [mp_worker._LAST_LOOK_WAIT_S]
+
+
+def test_queued_token_drops_keep_the_connector_stepping(monkeypatch):
+    """The last request retiring queues the drop of its worker token copy; with
+    nothing else running, only `has_pending_work` makes the engine dispatch the
+    metadata that carries it."""
+    import array
+
+    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+
+    sched, _worker, _ = _shipping_pair()
+    monkeypatch.setattr(
+        ChunkedOffloadSchedulerBase, "has_pending_work", lambda s: False
+    )
+    sched._lookup_client = SimpleNamespace()
+    monkeypatch.setattr(sched, "_pending_session_ends", dict)
+    assert not sched.has_pending_work()
+    seq = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
+    sched._token_shipper.ship(seq, 32)
+    sched._token_shipper.drop(7, seq)
+    assert sched.has_pending_work()
+    sched._token_shipper.take_drops()
+    assert not sched.has_pending_work()
+
+
+def test_the_vllm_plugin_path_resolves_shipped_tokens():
+    """The plugin builds the concrete worker without the shell; the worker's own
+    `start_load_kv` must resolve what the scheduler shipped."""
+    import array
+
+    sched, worker, received = _shipping_pair()
+    seq = SimpleNamespace(id=9, token_ids=array.array("i", range(300)))
+    save = sched._build_save_request(seq, 0, 256, None, [0], False)
+    _send(worker, save)
+    assert received == [list(range(256))]

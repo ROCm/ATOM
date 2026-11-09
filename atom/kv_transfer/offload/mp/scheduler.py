@@ -387,7 +387,8 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         self._end_finished_sessions()
 
     def has_pending_work(self) -> bool:
-        """Also report pending session ends and unreleased discarded lookups.
+        """Also report pending session ends, queued token drops and unreleased
+        discarded lookups.
 
         A detached lookup can outlive its request. If no other request is
         running, nothing else steps the connector, so without this the lookup
@@ -399,6 +400,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return (
             super().has_pending_work()
             or bool(self._pending_session_ends())
+            or self._token_shipper.has_drops()
             or bool(callable(orphans) and orphans())
         )
 

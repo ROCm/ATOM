@@ -66,6 +66,11 @@ class TokenShipper:
             self._shipped, self._drops = self._snapshot
             self._snapshot = None
 
+    def has_drops(self) -> bool:
+        """Whether a finished request's worker copy still waits for a metadata
+        to carry its drop."""
+        return bool(self._drops)
+
     def take_drops(self) -> tuple:
         """Request ids whose worker copy goes with the metadata being built."""
         drops, self._drops = tuple(self._drops), []
