@@ -2606,17 +2606,17 @@ class BlockManager:
         # lookup, so an off-grid demand is never reached and the fork recomputes
         # from its HBM hit (`no_rung_above_hbm`). An unaligned HBM hit is not
         # the problem; the joint load reloads its partial chunk. Flooring costs
-        # each fork under one chunk while the prefix is still in HBM. A floored
-        # demand at or below the hit is no rung anybody gains from.
+        # each fork under one chunk while the prefix is still in HBM. A floor
+        # at or below the hit would be no rung at all, so the demand then stays
+        # where it was and serves HBM alone.
         chunk = self._joint_chunk_tokens
         if (
             demand
             and chunk > self.hash_block_size
             and chunk % self.hash_block_size == 0
+            and demand - demand % chunk > hit * self.hash_block_size
         ):
             demand -= demand % chunk
-            if demand <= hit * self.hash_block_size:
-                demand = 0
         # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
         # replay bounds what the missing checkpoint costs. A demand would cut
         # every replay admission's forward at the hit and write a checkpoint
@@ -2752,9 +2752,15 @@ class BlockManager:
         # anchor that chunk runs past this prompt, so no store ever holds it.
         # A hash block finer than the chunk (PP: 128 against 1024) otherwise
         # loses 7 anchors in 8 once the prompt leaves HBM; flooring costs under
-        # one chunk of reuse while it is still there.
+        # one chunk of reuse while it is still there. An anchor below one chunk
+        # stays put: the joint load has no whole chunk to restore it from, so
+        # flooring it to 0 would only take away its HBM reuse.
         chunk = self._joint_chunk_tokens
-        if chunk > self.hash_block_size and chunk % self.hash_block_size == 0:
+        if (
+            chunk > self.hash_block_size
+            and chunk % self.hash_block_size == 0
+            and end >= chunk
+        ):
             end -= end % chunk
         if end > 0:
             seq.checkpoint_end_pos = end
