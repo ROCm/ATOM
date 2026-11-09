@@ -227,7 +227,7 @@ prefix another rank computed, so a request's prefill work does not depend on
 where it lands and the router balances purely by work:
 
 - **Request cost**: a rank-agnostic index of sampled prompt-block hashes
-  (`atom/model_engine/store_aware.py`) gives the longest prefix any rank has
+  (`atom/model_engine/share_cache.py`) gives the longest prefix any rank has
   already computed. Once that request's prefill completed the prefix is in the
   tier, and every rank is charged only `prompt - hit`; while it is still
   prefilling, only its own rank is. A hit below `OFFLOAD_MIN_LOAD_TOKENS` is

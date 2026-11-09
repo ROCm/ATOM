@@ -1323,9 +1323,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
     # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
     "OFFLOAD_MAX_PENDING_SAVES": lambda: _optional_int_env("OFFLOAD_MAX_PENDING_SAVES"),
-    # Minimum external-tier hit worth loading, in tokens. And the shortest
-    # prefix native lmcache_mp stores: an absolute boundary, for normal and
-    # late saves alike (other connectors ignore it).
     # Early tier load (a waiting request whose async lookup answered gets its
     # blocks and its load on any scheduler tick): the KV-pressure bounds.
     # No early allocation once the KV pool would be fuller than this fraction.
@@ -1336,11 +1333,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
         "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
     ),
-    # None when unset: each tier then uses its own default
-    # (`offload.config.resolve_min_load_tokens`).
+    # Minimum external-tier hit worth loading, in tokens. None when unset: each
+    # tier then uses its own default (`offload.config.resolve_min_load_tokens`).
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: _non_negative_or_none(
         _optional_int_env("OFFLOAD_MIN_LOAD_TOKENS")
     ),
+    # The shortest prefix native lmcache_mp stores: an absolute boundary, for
+    # normal and late saves alike (other connectors ignore it).
     "OFFLOAD_MIN_SAVE_TOKENS": lambda: max(
         0, _int_env_or_default("OFFLOAD_MIN_SAVE_TOKENS", 8192)
     ),

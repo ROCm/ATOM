@@ -42,7 +42,7 @@ from atom.model_engine.engine_utility import (
 from atom.model_engine.prefix_hash import take_shipped_chains
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.store_aware import SHARED_TIER_CONNECTORS, StoreAwareRouter
+from atom.model_engine.share_cache import SHARED_TIER_CONNECTORS, ShareCacheRouter
 from atom.observability import tracing
 from atom.utils import (
     envs,
@@ -324,11 +324,11 @@ class CoreManager:
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
         self._lb_lock = Lock()
-        # Store-aware routing (`share_cache`, atom/model_engine/store_aware.py).
-        self._store_router: StoreAwareRouter | None = None
+        # Shared-cache routing (`share_cache`, atom/model_engine/share_cache.py).
+        self._store_router: ShareCacheRouter | None = None
         if self._dp_lb_strategy == "share_cache":
             self._store_router = self._build_store_router(config)
-            self._dp_route_counters.update(dict.fromkeys(StoreAwareRouter.DECISIONS, 0))
+            self._dp_route_counters.update(dict.fromkeys(ShareCacheRouter.DECISIONS, 0))
         # Per rank: its last (seqs ingested, prefill left) report
         # (`EngineCoreRequestType.PREFILL_BACKLOG`), and the charges of the seqs
         # sent to it that the report does not cover yet, in send order.
@@ -1485,7 +1485,7 @@ class CoreManager:
                 best_hash = tie_hash
         return best_rank
 
-    def _build_store_router(self, config) -> StoreAwareRouter:
+    def _build_store_router(self, config) -> ShareCacheRouter:
         """`share_cache` needs a tier every rank shares and prompt hashes."""
         if self._dp_session_affinity_enabled:
             raise ValueError(
@@ -1510,7 +1510,7 @@ class CoreManager:
                 f"rank shares ({', '.join(sorted(SHARED_TIER_CONNECTORS))}); "
                 f"the KV connectors are {names!r}"
             )
-        return StoreAwareRouter(min_load_tokens(config), self._dp_lb_req_equiv)
+        return ShareCacheRouter(min_load_tokens(config), self._dp_lb_req_equiv)
 
     def _backlog_note_charged_locked(self, seq, dp_rank: int) -> None:
         """`seq` was just charged to `dp_rank` and is not sent yet."""
