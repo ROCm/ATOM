@@ -20,6 +20,7 @@ def _hash(**overrides):
         "enable_dp_attention": False,
         "index_cache_dtype": None,
         "kv_cache_dtype": "fp8",
+        "index_cache_layout": None,
         "hf_config": SimpleNamespace(),
         "max_model_len": 4096,
         "max_num_seqs": 256,
