@@ -1405,15 +1405,15 @@ def test_staged_pipeline_skips_the_handshake_on_a_shared_stream(shared_stream):
     else:
         assert calls == [
             ("record", "ready"),
-            ("host_wait", "ready"),
+            ("wait", "ready"),
             ("record", "free"),
-            ("host_wait", "free"),
+            ("wait", "free"),
             ("record", "ready"),
-            ("host_wait", "ready"),
+            ("wait", "ready"),
             ("record", "free"),
-            ("host_wait", "free"),
+            ("wait", "free"),
             ("record", "ready"),
-            ("host_wait", "ready"),
+            ("wait", "ready"),
             ("record", "free"),
         ]
         assert state.staging_buffer.free_event_valid is True

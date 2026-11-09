@@ -54,11 +54,6 @@ from atom.kv_transfer.offload._block_gpu_connector import (
     BlockGPUConnector,
 )
 from atom.kv_transfer.offload._offload_common import pp_aware_rank_and_world
-from atom.kv_transfer.offload.atom_lmcache_staging import (
-    compute_stream,
-    load_stream_priority,
-    set_compute_stream,
-)
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
@@ -244,7 +239,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     ) -> None:
         # The model runner's thread: its current stream is the forward's.
         if torch.cuda.is_available():
-            set_compute_stream(torch.cuda.current_stream())
+            self.set_forward_stream(torch.cuda.current_stream())
         rank, world = pp_aware_rank_and_world(self._config, _tp_group())
         self._rank = rank
         self._world = world
@@ -286,6 +281,10 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             virtual_block_size=self.virtual_block_size,
             source_safe_callback=self._source_group_safe,
             max_staging_bytes=_staging_buffer_bound(),
+            # The Store stages on the forward's stream: its saves on a side
+            # stream froze the engine (persistent forward kernels against
+            # concurrent offload kernels on ROCm).
+            compute_stream_provider=lambda: self._forward_stream,
         )
         client = pool = None
         try:
@@ -898,9 +897,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             return shared
         stream = getattr(self._in_place_tls, "stream", None)
         if stream is None:
-            stream = torch.cuda.Stream(
-                device=self._codec.device, priority=load_stream_priority()
-            )
+            stream = torch.cuda.Stream(device=self._codec.device)
             self._in_place_tls.stream = stream
         return stream
 
@@ -908,7 +905,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         """Pin the stream this thread's coming load or save stages on: the
         forward's, as it is now. A runner that picks a stream per forward may
         move on during the transfer; the switch happens between transfers."""
-        self._in_place_tls.pinned = compute_stream()
+        self._in_place_tls.pinned = self._forward_stream
 
     def _copy_in_place(
         self,
@@ -928,10 +925,11 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         codec = self._codec
         chunk = self.chunk_size
         stream = self._in_place_stream()
-        if producer_event is not None:
-            # A host wait, never a device-side one: see
-            # `BlockGPUConnector._wait_for_save_source`.
-            producer_event.synchronize()
+        if producer_event is not None and stream is not getattr(
+            self._in_place_tls, "pinned", None
+        ):
+            # On the forward's stream the producer's order already holds.
+            stream.wait_event(producer_event)
         # Only the window's part of the block table, with token offsets from
         # its first chunk: converting the whole table would cost every window
         # time in proportion to the prompt's length.

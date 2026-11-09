@@ -556,19 +556,18 @@ def test_dense_save_fence_failure_does_not_drop_the_step_load(monkeypatch):
         worker.close()
 
 
-def test_block_gpu_connector_host_waits_producer_before_pack_stream_work():
-    # A device-side wait on an unfinished event is a polling kernel on ROCm,
-    # which can deadlock against a persistent kernel on the compute stream:
-    # the producer fence must be a host wait, ahead of any pack-stream work.
+def test_block_gpu_connector_waits_on_actual_pack_stream_without_host_sync():
     trace = []
     stats = {}
     producer_event = SimpleNamespace(
-        synchronize=lambda: trace.append(("host_wait", "producer"))
+        synchronize=lambda: pytest.fail("producer event must not host-synchronize")
     )
     pack_stream = SimpleNamespace(
-        wait_event=lambda event: pytest.fail("no device-side wait on the producer")
+        wait_event=lambda event: trace.append(("wait", event))
     )
-    state = SimpleNamespace(pack_stream=pack_stream, copy_stream=object())
+    state = SimpleNamespace(
+        pack_stream=pack_stream, copy_stream=object(), follows_compute_stream=False
+    )
     connector = BlockGPUConnector.__new__(BlockGPUConnector)
     connector._capture_transfer_stats = lambda: nullcontext(stats)
     connector._prepare_transfer = lambda *_args, **_kwargs: (state, [object()])
@@ -593,7 +592,7 @@ def test_block_gpu_connector_host_waits_producer_before_pack_stream_work():
     )
 
     assert trace == [
-        ("host_wait", "producer"),
+        ("wait", producer_event),
         ("block_ids", None),
         ("pipeline", None),
     ]

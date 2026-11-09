@@ -172,18 +172,46 @@ def test_share_cache_accepts_a_pd_multi_connector_with_a_shared_tier():
         CoreManager._build_store_router(mgr, cfg)
 
 
-def test_a_transfer_keeps_the_stream_it_began_on(monkeypatch):
+def test_a_store_transfer_keeps_the_stream_it_began_on():
     """A runner that moves to another stream mid-transfer must not move the
     transfer: the switch happens at `begin_transfer`."""
     from atom.kv_transfer.offload import atom_lmcache_staging as staging
 
-    monkeypatch.setattr(staging, "_COMPUTE_STREAM", "A")
+    current = ["A"]
     state = staging._ThreadTransferState.__new__(staging._ThreadTransferState)
+    state._provider = lambda: current[0]
     state._pinned_stream = "A"
-    state._follows_compute_stream = True
     state._pack_stream = state._copy_stream = None
+    assert state.follows_compute_stream
     assert state.pack_stream == state.copy_stream == "A"
-    staging.set_compute_stream("B")  # a CU-masked prefill picked another stream
+    current[0] = "B"  # a CU-masked prefill picked another stream
     assert state.pack_stream == state.copy_stream == "A"  # mid-transfer: unchanged
     state.begin_transfer()
     assert state.pack_stream == state.copy_stream == "B"
+
+
+def test_every_other_connector_keeps_its_own_side_streams():
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    state = staging._ThreadTransferState.__new__(staging._ThreadTransferState)
+    state._provider = None
+    state._pinned_stream = None
+    state._pack_stream, state._copy_stream = "pack", "copy"
+    assert not state.follows_compute_stream
+    state.begin_transfer()  # nothing to follow
+    assert (state.pack_stream, state.copy_stream) == ("pack", "copy")
+
+
+def test_a_pack_on_a_side_stream_still_waits_on_the_producer_device_side():
+    from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
+
+    waited = []
+    side = SimpleNamespace(
+        follows_compute_stream=False,
+        pack_stream=SimpleNamespace(wait_event=waited.append),
+    )
+    BlockGPUConnector._wait_for_save_source(side, "event")
+    assert waited == ["event"]
+    forward = SimpleNamespace(follows_compute_stream=True, pack_stream=object())
+    BlockGPUConnector._wait_for_save_source(forward, "event")  # stream order holds
+    assert waited == ["event"]
