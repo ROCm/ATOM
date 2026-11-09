@@ -18,18 +18,19 @@ import pytest
 import torch
 from torch import nn
 
-try:  # the deployment / routing tests import the model package, which needs aiter
+from atom.models.deepseek_v41.mono import gfx1250
+from atom.models.deepseek_v41.mono.gfx1250 import config, dispatch
+from atom.models.deepseek_v41.mono.kernels.dims import Dims
+from atom.mono.runtime import deployment
+
+try:  # the gfx950 mono dispatch (its draft runner) needs aiter
     from atom.models.deepseek_v41.mono import dispatch as mono_dispatch
-    from atom.models.deepseek_v41.mono import gfx1250
-    from atom.models.deepseek_v41.mono.gfx1250 import config, dispatch
-    from atom.models.deepseek_v41.mono.kernels.dims import Dims
-    from atom.mono.runtime import deployment
-
-    HAVE_AITER = True
 except ImportError:
-    HAVE_AITER = False
+    mono_dispatch = None
 
-needs_aiter = pytest.mark.skipif(not HAVE_AITER, reason="the model package needs aiter")
+needs_aiter = pytest.mark.skipif(
+    mono_dispatch is None, reason="atom.models.deepseek_v41.mono.dispatch needs aiter"
+)
 
 
 def atom_config(**overrides):
@@ -55,8 +56,6 @@ def atom_config(**overrides):
 
 @pytest.fixture(autouse=True)
 def cpu(monkeypatch):
-    if not HAVE_AITER:
-        return
     monkeypatch.setattr(deployment, "_gfx", lambda: "gfx1250")
     monkeypatch.setattr(deployment, "is_vllm", lambda: False)
     monkeypatch.setattr(deployment, "is_sglang", lambda: False)
@@ -66,12 +65,10 @@ def cpu(monkeypatch):
     monkeypatch.setenv("ATOM_MONO_CHECK", "0")
 
 
-@needs_aiter
 def test_the_supported_deployment_is_not_refused():
     assert config.config_refusal(atom_config(), Dims) is None
 
 
-@needs_aiter
 @pytest.mark.parametrize(
     "change, why",
     [
@@ -103,7 +100,6 @@ def test_other_deployments_are_refused(change, why):
     assert why in config.config_refusal(atom_config(**change), Dims)
 
 
-@needs_aiter
 def test_the_arch_refusal_of_the_gfx950_kernels_does_not_apply():
     # the shared refusals reject every arch but gfx950; the single launch is gfx1250 code
     assert config.config_refusal(atom_config(), Dims) is None
@@ -135,47 +131,37 @@ def model(monkeypatch):
     return dispatch.SingleStepModel(Inner(), drafter=None, atom_config=atom_config())
 
 
-@needs_aiter
 @pytest.mark.parametrize(
     "rows",
-    (
-        range(config.ROWS_PER_REQ, config.MAX_ROWS + 1, config.ROWS_PER_REQ)
-        if HAVE_AITER
-        else []
-    ),
+    range(config.ROWS_PER_REQ, config.MAX_ROWS + 1, config.ROWS_PER_REQ),
 )
 def test_every_whole_request_width_up_to_eight_requests_is_served(model, rows):
     assert model.step_ready(rows)
     assert model._single.asked == [rows]
 
 
-@needs_aiter
 @pytest.mark.parametrize("rows", [0, 1, 5, 7, 13, 47, 54, 96])
 def test_other_widths_take_the_production_path(model, rows):
     assert not model.step_ready(rows)
     assert model._single.asked == []
 
 
-@needs_aiter
 def test_the_forward_is_the_production_one(model):
     ids = torch.arange(6)
     assert model(ids, ids)[0] == "inner"
     assert model.compute_logits(3) == 3
 
 
-@needs_aiter
 def test_the_wrapper_forwards_the_model_attributes(model):
     model.model.extra = 7
     assert model.extra == 7
 
 
-@needs_aiter
 def test_off_when_mono_is_switched_off(monkeypatch):
     monkeypatch.setenv("ATOM_MONO_ENABLE", "0")
     assert not gfx1250.enabled()
 
 
-@needs_aiter
 def test_a_refused_deployment_keeps_the_model(monkeypatch):
     inner = nn.Linear(1, 1)
     out = dispatch.install_single_step(
@@ -225,13 +211,11 @@ def verify_step(monkeypatch):
     return fc
 
 
-@needs_aiter
 def test_a_decode_verify_step_is_served(model, verify_step):
     model._single.runner = _Runner()
     assert model.single_step_runner(_batch(), 48) is model._single.runner
 
 
-@needs_aiter
 @pytest.mark.parametrize(
     "batch",
     [
@@ -245,14 +229,12 @@ def test_steps_needing_logits_take_the_production_path(model, verify_step, batch
     assert model.single_step_runner(batch, 48) is None
 
 
-@needs_aiter
 def test_a_step_without_drafts_takes_the_production_path(model, verify_step):
     verify_step.spec_decode_metadata = None
     model._single.runner = _Runner()
     assert model.single_step_runner(_batch(), 48) is None
 
 
-@needs_aiter
 def test_a_request_shape_the_kernel_refuses_takes_the_production_path(
     model, verify_step
 ):
@@ -260,7 +242,6 @@ def test_a_request_shape_the_kernel_refuses_takes_the_production_path(
     assert model.single_step_runner(_batch(), 48) is None
 
 
-@needs_aiter
 def test_check_mode_never_serves(model, verify_step, monkeypatch):
     monkeypatch.setenv("ATOM_MONO_CHECK", "1")
     model._single.runner = _Runner()
@@ -294,14 +275,14 @@ class _Drafter:
 
 
 @pytest.fixture
-def served(verify_step):
+def served(verify_step, monkeypatch):
+    monkeypatch.setattr(dispatch, "LazyRunner", _Lazy)
     drafter = _Drafter()
     m = dispatch.SingleStepModel(nn.Identity(), drafter, atom_config())
     m._single.runner = _ServingRunner()
     return m, drafter
 
 
-@needs_aiter
 def test_a_served_step_drafts_from_the_kernel(served):
     m, drafter = served
     runner = m._single.runner
@@ -313,7 +294,6 @@ def test_a_served_step_drafts_from_the_kernel(served):
     assert runner.forgot == 0
 
 
-@needs_aiter
 def test_a_step_with_fewer_rows_than_6_a_request_is_not_served(served):
     m, _ = served
     # 8 requests in 42 rows (a ragged or confidence-scheduled verify): the launch reads 6 rows a request
@@ -321,7 +301,6 @@ def test_a_step_with_fewer_rows_than_6_a_request_is_not_served(served):
     assert m._single.runner.steps == 0
 
 
-@needs_aiter
 def test_a_production_step_drafts_from_the_drafter(served):
     m, drafter = served
     runner = m._single.runner

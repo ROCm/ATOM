@@ -52,7 +52,6 @@ FPTRS_ROLE = {
     "ids": SCRATCH,
     "wts": SCRATCH,
     "mplane": WEIGHT,  # routed experts, plane layout (planes.PLANES), every MoE layer
-    "mroute": SCRATCH,  # (bring-up: the host routes; the product reads the front's ids, MOE_REAL_IDS)
     "mout": SCRATCH,
     "mid8": SCRATCH,
     "midc": SCRATCH,
@@ -264,7 +263,6 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "ncomb": T * 64,
         "ids": T * FS.TOPK * 4,
         "wts": T * FS.TOPK * 4,
-        "mroute": 48 * 6 * 4,
         "mout": (48 * 6 + 48 + 1) * H * 4,
         "mid8": MS.NE * MS.MAXTOK * MS.MROW,
         "midc": MS.NE * MS.MAXTOK * MS.CROW,
