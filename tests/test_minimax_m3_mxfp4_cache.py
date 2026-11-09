@@ -9,7 +9,7 @@ handed, and the combinations that must fail at startup and not in a forward.
 `--kv-cache-dtype fp4` takes an all-indexed-sparse model (MiniMax-M3.1) and refuses,
 with no FP8 fallback, what it has no MXFP4 path for: dense attention layers, KV
 offload, an fp16 model, an FP4 draft. A DSpark draft with a pool of its own keeps
-the target's dtype unless asked (fp8 under an fp4 target, which has no draft layout);
+the target's dtype unless asked (bf16 under an fp4 target, which has no draft layout);
 the index dtype stays its own choice.
 """
 
@@ -200,6 +200,13 @@ def test_an_all_sparse_m3_passes_the_kv_gate(monkeypatch, text_config):
     check(monkeypatch, text_config=text_config)
 
 
+def test_an_fp4_kv_without_the_fp4_index_flag_is_refused_not_defaulted(monkeypatch):
+    """fp4 only when asked for: the index is bf16 unless given, so the fp4 KV beside
+    it is refused at startup rather than the index being picked for the user."""
+    with pytest.raises(ValueError, match="needs --index-cache-dtype fp4, got bf16"):
+        _m3(monkeypatch, kv_cache_dtype="fp4", hf=sparse_hf())
+
+
 def test_an_fp4_kv_with_another_index_cache_is_refused(monkeypatch):
     with pytest.raises(ValueError, match="needs --index-cache-dtype fp4, got fp8"):
         check(monkeypatch, index_cache_dtype="fp8")
@@ -271,8 +278,6 @@ def test_v41_still_takes_a_fp4_kv():  # the refusal elsewhere: test_v4_indexer_d
 @pytest.mark.parametrize(
     ("kv", "index", "want"),
     [
-        # KV fp4: the index follows it (the MXFP4 attention needs the MXFP4 scorer).
-        ("fp4", None, ("fp4", "fp4")),
         # index-only: KV stays as asked.
         ("bf16", "fp4", ("bf16", "fp4")),
         ("fp4", "fp4", ("fp4", "fp4")),
@@ -330,7 +335,7 @@ def draft(method="dspark", **hf):
     [(None, None), ("fp8", "fp8"), ("bf16", "bf16")],  # None: the target's, fp8 for fp4
 )
 def test_an_own_pool_draft_keeps_the_targets_dtype_unless_asked(target, asked, want):
-    default = "fp8" if target == "fp4" else target  # fp4 has no draft layout
+    default = "bf16" if target == "fp4" else target  # fp4 has no draft layout
     assert resolve_draft_kv_dtype(draft(asked=asked), target, own_pool=True) == (
         want or default
     )
@@ -382,12 +387,14 @@ def test_fp4_target_with_a_dspark_draft_resolves_and_hashes_the_draft_dtype(
         config = _m3(
             monkeypatch,
             kv_cache_dtype="fp4",
+            index_cache_dtype="fp4",
             hf=sparse_hf(),
             speculative_config=_dspark_spec(kv_cache_dtype=asked),
         )
         assert config.kv_cache_dtype == "fp4"
-        assert config.speculative_config.kv_cache_dtype == (asked or "fp8")
-        hashes[asked or "fp8"] = config.compute_hash()
+        # unspecified is bf16: fp4 only when asked for, fp8 only when asked for
+        assert config.speculative_config.kv_cache_dtype == (asked or "bf16")
+        hashes[asked or "bf16"] = config.compute_hash()
     # the draft dtype keys the compile cache
     assert hashes["fp8"] != hashes["bf16"]
 
@@ -436,13 +443,14 @@ def test_a_draft_dtype_beside_the_targets_cannot_share_the_offload_namespace(
 def test_an_fp4_target_beside_offload_is_refused_for_that_not_for_its_draft(
     monkeypatch,
 ):
-    """The draft (fp8 under an fp4 target) can never match it, so the draft-dtype
+    """The draft (bf16 under an fp4 target) can never match it, so the draft-dtype
     refusal would send the user to `--spec-decode-kv-cache-dtype fp4`, which is
     refused in turn: the real reason, the fp4 KV beside offload, comes first."""
     with pytest.raises(ValueError, match="KV offload") as err:
         _m3(
             monkeypatch,
             kv_cache_dtype="fp4",
+            index_cache_dtype="fp4",
             hf=sparse_hf(),
             kv_transfer_config=OFFLOAD,
             speculative_config=_dspark_spec(),

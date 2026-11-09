@@ -93,23 +93,23 @@ def test_topology_gate_reasons_are_human_readable():
     )
 
 
-@pytest.mark.parametrize("index_dtype", ["fp4", None])  # None: the index stays fp8
-def test_mxfp4_caches_fall_back_from_the_cp_scorer(monkeypatch, caplog, index_dtype):
-    """Any MXFP4 cache (KV alone, or KV and index) clears the CP flag, and does so
-    after `--kv-cache-dtype fp4` is normalised, not before."""
+@pytest.mark.parametrize("kv_dtype", ["fp4", "bf16"])  # the MXFP4 index, with / without
+def test_mxfp4_caches_fall_back_from_the_cp_scorer(monkeypatch, caplog, kv_dtype):
+    """Any MXFP4 cache (the index alone, or with the KV) clears the CP flag, and does
+    so after `--kv-cache-dtype fp4` is normalised, not before."""
     from tests.test_minimax_m3_mxfp4_cache import _m3, sparse_hf
 
     with caplog.at_level("WARNING", logger="atom"):
         config = _m3(
             monkeypatch,
-            kv_cache_dtype="fp4",
-            index_cache_dtype=index_dtype,
+            kv_cache_dtype=kv_dtype,
+            index_cache_dtype="fp4",
             tensor_parallel_size=4,
             hf={**sparse_hf(), "num_key_value_heads": 4},
             dcp_config=DCPConfig(indexer_dcp_only=True),
         )
 
-    assert config.kv_cache_dtype == "fp4"
+    assert config.kv_cache_dtype == kv_dtype
     assert config.dcp_config.indexer_dcp_only is False
     assert "MXFP4 caches are not wired to the CP scorer" in caplog.text
 

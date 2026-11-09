@@ -337,7 +337,7 @@ class EngineArgs:
             default=None,
             help="Index cache type. Native single-node DeepSeek-V4 defaults to "
             "'fp4' except on gfx942, which defaults to 'fp8'; other models "
-            "default to --kv_cache_dtype ('fp8' for MiniMax-M3's fp4 KV). 'fp4' "
+            "default to --kv_cache_dtype (MiniMax-M3's fp4 KV needs 'fp4' here). 'fp4' "
             "is MXFP4 (e2m1 + e8m0 per 32, gfx950, --block-size 128) on "
             "MiniMax-M3; other models use their own FP4 layout.",
         )

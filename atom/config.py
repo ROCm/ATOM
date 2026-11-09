@@ -1971,7 +1971,7 @@ def resolve_draft_kv_dtype(spec, target_dtype: str, *, own_pool: bool) -> str:
     `DRAFT_OWNS_KV_POOL` (``own_pool``, decided once by the caller) -- may take its
     own dtype, bf16 or fp8. Asked nothing it keeps the target's, as every draft did
     before it could ask, except under an FP4 target: FP4 has no draft layout (an exact
-    FP4 sliding window is not built), so that draft is fp8, and asking for FP4 is
+    FP4 sliding window is not built), so that draft is bf16, and asking for FP4 is
     refused here rather than mapped to anything else. Every other draft lives in the
     target's pool, so it has the target's dtype and a different request is an error,
     not a second pool.
@@ -1988,9 +1988,9 @@ def resolve_draft_kv_dtype(spec, target_dtype: str, *, own_pool: bool) -> str:
     if asked == "fp4":
         raise ValueError(
             "--spec-decode-kv-cache-dtype fp4: the draft has no FP4 KV layout "
-            "(use bf16 or fp8; the target's, or fp8 under an fp4 target, when omitted)"
+            "(use bf16 or fp8; the target's, or bf16 under an fp4 target, when omitted)"
         )
-    return asked or ("fp8" if target_dtype == "fp4" else target_dtype)
+    return asked or ("bf16" if target_dtype == "fp4" else target_dtype)
 
 
 def indexer_cp_unsupported_reason(
@@ -2975,10 +2975,15 @@ class Config:
                 # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
             else:
-                # M3's fp4 KV takes the fp4 index with it (the MXFP4 attention reads
-                # the selector's rows, which only that scorer sizes to match);
-                # `validate_runtime_config` refuses an explicit other index.
-                self.index_cache_dtype = self.kv_cache_dtype
+                # fp4 only when asked for: M3's fp4 KV needs the fp4 index (the MXFP4
+                # attention reads the selector's rows, which only that scorer sizes
+                # to match), so it is not defaulted, and `validate_runtime_config`
+                # refuses the bf16 left here.
+                self.index_cache_dtype = (
+                    "bf16"
+                    if is_m3 and self.kv_cache_dtype == "fp4"
+                    else self.kv_cache_dtype
+                )
         if self.speculative_config is not None:
             from atom.kv_transfer.offload.mp.deployment import (
                 _config_has_own_pool_draft,
