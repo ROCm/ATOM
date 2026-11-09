@@ -201,7 +201,7 @@ pooled (kpool) form: the index cache declares `tokens_per_state = index_kpool`,
 and each request's open pool is kept in a side buffer keyed on its KDA state
 slot. The plugin path serves the text backbone; PCP, DCP, speculative decoding,
 prefix caching and KV transfer are refused at startup. The PR CI cell runs it at
-TP4 with `--kv-cache-dtype bfloat16`.
+TP4 with fp8 KV.
 
 DeepSeek-V4.1 pages out of a proxy KV cache: ATOM declares one fake attention
 layer whose block is exactly one 256-token CSA2 PAGE, lets vLLM size and

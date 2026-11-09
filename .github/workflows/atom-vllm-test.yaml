@@ -194,18 +194,16 @@ jobs:
           - display_name: "GLM-5.3-Flash kpool TP4"
             model_name: "GLM-5.3-Flash-kpool"
             model_path: "zai-org/GLM-5.3-Flash"
-            # Chat 16-shot: every prompt runs 2763-3591 tokens, past
-            # index_topk=2048, so the pooled (kpool) indexer decides what the
-            # model attends to. At 3-shot it would select every token and the
-            # cell would only show the pooled writes did no harm.
-            # `--kv-cache-dtype bfloat16` overrides the harness's fp8: bf16 is
-            # the configuration validated here and in the native cell.
+            # Chat 16-shot: prompts run 1939-3591 tokens (mean 2728), all but
+            # one past index_topk=2048, so the pooled (kpool) indexer decides
+            # what the model attends to. At 3-shot it would select every token
+            # and the cell would only show the pooled writes did no harm.
             client_command: "lm_eval --model local-chat-completions --apply_chat_template --fewshot_as_multiturn --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=32,max_retries=3,tokenized_requests=False,max_gen_toks=512 --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --batch_size 65 --output_path ${OUTPUT_PATH}"
-            extra_args: "--kv-cache-dtype bfloat16 --tensor-parallel-size 4 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.85"
+            extra_args: "--tensor-parallel-size 4 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.85"
             lm_eval_num_fewshot: 16
-            # Measured 0.9697 / 0.9666 flexible-extract over two runs of this
-            # exact serve command (native ATOM: 0.9666); 0.94 matches the
-            # native GLM-5.3-Flash-kpool-16shot gate.
+            # Measured 0.9727 / 0.9682 flexible-extract over two runs of this
+            # exact serve command (native ATOM, bf16 KV: 0.9666); 0.94 matches
+            # the native GLM-5.3-Flash-kpool-16shot gate.
             accuracy_test_threshold: 0.94
             runner: linux-atom-pitt-mi350x-8
           - display_name: "Qwen3.5-397B-A17B-MXFP4 TP4"
