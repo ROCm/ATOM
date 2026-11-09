@@ -309,8 +309,8 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # target just ran and what these buffers therefore hold. A padding row
         # belongs to a zero-length request in `cu_seqlens_q`, so it is
         # projected and then written nowhere.
-        ctx = aux_concat[: step.width].unsqueeze(0)
-        positions = positions[: step.width][None]
+        ctx = aux_concat[: step.running_tokens].unsqueeze(0)
+        positions = positions[: step.running_tokens][None]
         layers = self.context_layers
         fused = self._context_kv_fusion()
         if fused is None:
