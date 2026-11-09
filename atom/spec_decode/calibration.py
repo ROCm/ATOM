@@ -11,14 +11,9 @@ import torch
 
 
 def calibration_identity(config, device):
-    from atom.spec_decode.draft_kv import draft_kv_cache_dtype
-
     model = Path(config.model)
     files = ("config.json", "model.safetensors.index.json")
-    spec = getattr(config, "speculative_config", None)
-    draft_dtype = draft_kv_cache_dtype(
-        config, getattr(spec, "draft_model_hf_config", None)
-    )
+    draft_dtype = config.speculative_config.kv_cache_dtype
     identity = {
         "model_files": {
             name: hashlib.sha256((model / name).read_bytes()).hexdigest()

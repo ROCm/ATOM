@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""Which requests the MXFP4 decode index scorer and selector run (the other index
-caches keep the padded batch), and the MXFP4 scorer's per-ubatch buffers (CPU).
+"""Which requests the sparse decode (scorer, selector, attention) runs -- one rule
+for every index cache -- and the MXFP4 scorer's per-ubatch buffers (CPU).
 
-The scorer takes its batch off the rows of ``idx_q``, so a padded decode step
-(a graph bucket, or an eager step padded for DP) must hand it that many lengths
-and block-table rows; and under decode TBO each ubatch needs a map and a score
-storage of its own. The row rule (`index_batch`) is pure and runs everywhere. The
+The MXFP4 scorer takes its batch off the rows of ``idx_q``, so the lengths and
+block-table rows it is handed must be that many, on a padded step (a graph bucket,
+or an eager step padded for DP) and a ragged one alike; and under decode TBO each
+ubatch needs a map and a score storage of its own. The row rule
+(`decode_rows_batch`) is pure and runs everywhere. The
 builder tests drive `AiterAttentionMetadataBuilder` with its collaborators stubbed
 and need ``aiter`` importable (CI's no-aiter job skips them); the scorer itself is
 in test_minimax_m3_mxfp4_index.py.
@@ -130,7 +131,7 @@ def test_the_score_view_has_the_strides_aiters_own_allocation_has(heads, S):
     assert (out.shape, out.stride()) == (own.shape, own.stride())
 
 
-# (scheduled_bs, running_bs, running_tokens, q) -> the scorer's batch
+# (scheduled_bs, running_bs, running_tokens, q) -> the requests whose rows run
 @pytest.mark.parametrize(
     "scheduled,running,tokens,q,want",
     [
@@ -139,12 +140,17 @@ def test_the_score_view_has_the_strides_aiters_own_allocation_has(heads, S):
         (3, 3, 3, 1, 3),  # nothing padded
         (0, 8, 8, 1, 8),  # an idle DP rank still runs the group's rows
         (3, 8, 24, 8, 3),  # DP step a prefilling peer made ragged: no pad rows
+        (2, 4, 2048, 1, 4),  # a decoding DP rank in a prefill bucket
+        (2, 4, 2048, 3, 4),  # ... whose bucket is no multiple of the query width
+        (3, 4, 64, 8, 4),  # a DSpark decode bucket wider than running_bs * q
     ],
 )
-def test_the_scorer_runs_the_rows_idx_q_has(scheduled, running, tokens, q, want):
-    from atom.model_ops.minimax_m3.index_mxfp4 import index_batch
+def test_the_sparse_decode_runs_the_rows_the_metadata_covers(
+    scheduled, running, tokens, q, want
+):
+    from atom.utils.forward_context import decode_rows_batch
 
-    assert index_batch(scheduled, running, tokens, q) == want
+    assert decode_rows_batch(scheduled, running, tokens, q) == want
 
 
 @pytest.mark.parametrize(
@@ -152,16 +158,15 @@ def test_the_scorer_runs_the_rows_idx_q_has(scheduled, running, tokens, q, want)
     [
         (3, 8, 13, 8),  # not a whole number of requests
         (3, 8, 16, 8),  # fewer requests than were scheduled
-        (3, 4, 64, 8),  # more than the step's padded batch
     ],
 )
 def test_rows_that_are_not_a_batch_are_refused_not_clamped(
     scheduled, running, tokens, q
 ):
-    from atom.model_ops.minimax_m3.index_mxfp4 import index_batch
+    from atom.utils.forward_context import decode_rows_batch
 
-    with pytest.raises(ValueError, match="index decode"):
-        index_batch(scheduled, running, tokens, q)
+    with pytest.raises(ValueError, match="decode rows"):
+        decode_rows_batch(scheduled, running, tokens, q)
 
 
 class _Buf:
@@ -265,3 +270,96 @@ def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
     assert seen[0]["index_score_buffers"] is not seen[1]["index_score_buffers"]
     # another index cache allocated none: nothing to pass
     assert builder(mod)._index_score_kwargs("ub0_") == {}
+
+
+@pytest.mark.parametrize("kv", ["fp4", "fp8"])
+@pytest.mark.parametrize("index", ["fp4", "fp8"])
+@pytest.mark.parametrize("q_rows", [6, 12])  # exactly the metadata's rows / a DP pad
+def test_the_sparse_decode_runs_only_the_rows_the_metadata_covers(
+    monkeypatch, kv, index, q_rows
+):
+    """Whatever the KV and index caches, the scorer, the selector and the attention
+    get the same ``seq_lens.shape[0] * q`` rows; pad rows past them are never read
+    (the selector never wrote them) and the output is zero there. The skip-index
+    layer after it keys its cached selection on the unsliced shape."""
+    pytest.importorskip("aiter")
+    from atom.model_ops import attention_mha
+    from atom.model_ops.minimax_m3 import index_topk, sparse_attn, sparse_attn_mxfp4
+
+    batch, mq, heads, hq = 3, 2, 1, 4
+    rows = batch * mq
+    seen = {}
+
+    def topk(idx_q, cache, block_table, seq_lens, *a, **kw):
+        seen["scorer"] = (idx_q.shape[0], seq_lens.shape[0], block_table.shape[0])
+        n = idx_q.shape[0] * heads
+        return (
+            torch.zeros(heads, idx_q.shape[0], 2, dtype=torch.int32),
+            torch.zeros(n, 2, dtype=torch.int32),
+            torch.zeros(n, dtype=torch.int32),
+        )
+
+    def attend_fp4(q, k_cache, v_cache, sparse_bt, sparse_ctx, *a, **kw):
+        seen["attend"] = (q.shape[0], sparse_bt.shape[0] // heads, sparse_ctx.numel())
+        return torch.ones(q.shape[0], hq, 8)
+
+    def attend_fp8(
+        q, k_cache, v_cache, topk_idx, bt, seq_lens, hkv, scale, output, **kw
+    ):
+        seen["attend"] = (
+            q.shape[0],
+            kw["sparse_bt"].shape[0] // heads,
+            output.shape[0],
+        )
+        output.fill_(1)
+
+    monkeypatch.setattr(index_topk, "minimax_m3_index_topk_decode", topk)
+    monkeypatch.setattr(sparse_attn_mxfp4, "sparse_pa_mxfp4", attend_fp4)
+    monkeypatch.setattr(sparse_attn, "minimax_m3_sparse_attn_decode_asm", attend_fp8)
+
+    def impl(skip):
+        i = object.__new__(attention_mha.SparseMHAPagedAttentionImpl)
+        torch.nn.Module.__init__(i)
+        i.kv_cache_dtype, i.index_cache_dtype = kv, index
+        i.skip_index_topk, i.index_topk_cache_state = skip, {}
+        i.indexer_cp_group = None
+        i.topk, i.init_blocks, i.local_blocks, i.num_kv_heads, i.scale = 2, 1, 0, 1, 1.0
+        i.index_cache, i.layer_num, i.sparse_layer_ordinal = None, 0, 0
+        return i
+
+    md = types.SimpleNamespace(
+        decode=types.SimpleNamespace(
+            seq_lens=torch.zeros(batch, dtype=torch.int32),
+            block_table=torch.zeros(batch, 4, dtype=torch.int32),
+            max_query_len=mq,
+        ),
+        max_seq_len=100,
+        n_valid_column_per_row=None,
+        index_score=None,
+    )
+    ctx = types.SimpleNamespace(
+        attn_metadata=types.SimpleNamespace(sparse_attention_metadata=md)
+    )
+    q = torch.zeros(q_rows, hq, 8)
+    v = torch.zeros(q_rows, hq, 8)
+    first = impl(False)
+    first._index_q = torch.zeros(q_rows, heads, 8)
+    first._index_q_cache_key_info = None
+    out = first._sparse_decode(q, None, v, None, None, None, None, ctx)
+    assert out.shape == q.shape
+    assert seen["scorer"] == (rows, batch, batch)
+    assert seen["attend"][0] == rows and seen["attend"][1] == rows
+    assert (out[:rows] == 1).all() and (out[rows:] == 0).all()
+
+    # a skip-index layer holds no index_q, only the unsliced shape's key
+    seen.clear()
+    skip = impl(True)
+    skip._index_q = None
+    skip._index_q_cache_key_info = (
+        (q_rows, heads, 8),
+        torch.float32,
+        torch.device("cpu"),
+    )
+    out = skip._sparse_decode(q, None, v, None, None, None, None, ctx)
+    assert "scorer" not in seen and seen["attend"][0] == rows
+    assert (out[rows:] == 0).all()

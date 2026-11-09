@@ -15,18 +15,18 @@ def _mxfp4_kv_refusal(config) -> str | None:
     """
     import torch
 
-    from atom.config import kv_offload_requested
+    from atom.config import kv_pages_leave_pool
 
     if config.torch_dtype != torch.bfloat16:
         # aiter's MXFP4 pa_decode only writes bf16; the attention output takes the
         # model dtype, so an fp16 checkpoint would fail in its first forward.
         return f"it needs a bfloat16 model, got {config.torch_dtype}"
-    if kv_offload_requested(config):
+    if kv_pages_leave_pool(config):
         # Offloaded pages (ATOM_KV_OFFLOAD, a P/D connector) are moved by a layout
         # that was never told this byte format, and its namespace keys no FP4.
         return "it does not run with KV offload or --kv-transfer-config"
     spec = config.speculative_config
-    if spec is not None and getattr(spec, "kv_cache_dtype", None) == "fp4":
+    if spec is not None and spec.kv_cache_dtype == "fp4":
         # `resolve_draft_kv_dtype` leaves "fp4" only on a draft in the target's
         # pool (EAGLE3, MTP): one with no MXFP4 attention impl to write its rows.
         # A DSpark draft with its own pool is fp8 / bf16 and passes.

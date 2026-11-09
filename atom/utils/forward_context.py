@@ -807,6 +807,36 @@ class DPStage:
         )
 
 
+def decode_rows_batch(scheduled_bs, running_bs, running_tokens, max_query_len):
+    """Requests whose rows a decode step's sparse attention runs -- its index scorer
+    and selector, and the attention itself, whatever the index cache.
+
+    The activations have ``running_tokens`` rows and the per-request arrays
+    ``running_bs``; they differ on a DP step (`ForwardMode`). A rank
+    decoding beside a prefilling peer either runs a prefill-bucket's worth of
+    rows (more than ``running_bs * q``: pad rows past the last request), or just
+    its own tokens (fewer: the group's padded batch is wider than this rank's
+    rows). The batch is the smaller of the two, so the metadata and the rows
+    sliced out of ``q`` / ``idx_q`` are the same ``batch * q`` rows, and no
+    request of the metadata has a row that is not there (or the reverse)."""
+    held, rem = divmod(running_tokens, max_query_len)
+    if held >= running_bs:  # padded: whatever is past the last request is pad
+        batch = running_bs
+    elif rem:
+        raise ValueError(
+            f"decode rows: {running_tokens} rows is not a whole number of "
+            f"{max_query_len}-token requests"
+        )
+    else:
+        batch = held
+    if batch < scheduled_bs:
+        raise ValueError(
+            f"decode rows: {running_tokens} rows of {max_query_len} query tokens "
+            f"hold fewer than the {scheduled_bs} scheduled requests"
+        )
+    return batch
+
+
 def request_bucket(running_bs: int, max_seqlen_q: int) -> tuple[int, int]:
     """A request bucket (`ReqGraph`): the requests a step runs, and the draft
     tokens each verifies -- its query rows less the one it decodes."""

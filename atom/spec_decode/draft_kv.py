@@ -12,25 +12,6 @@ logger = logging.getLogger("atom")
 DRAFT_KV_ROWS = "draft_kv"
 
 
-def draft_kv_cache_dtype(config, draft_hf) -> str:
-    """The KV dtype the draft's own pool is written in.
-
-    A draft that owns a pool is independent of the target's dtype (a target's
-    fp4 has no draft kernel): `SpeculativeConfig.kv_cache_dtype`, fp8 when
-    unset. A draft sharing the target's pool, or any non-DSpark drafter, has no
-    say and keeps the target's. Used before the draft model is built, so the
-    model and the pool read the one answer.
-    """
-    spec = getattr(config, "speculative_config", None)
-    if getattr(spec, "method", None) != "dspark" or draft_hf is None:
-        return config.kv_cache_dtype
-    from atom.utils.selector import attn_family, get_attn_backend
-
-    if not get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL:
-        return config.kv_cache_dtype
-    return getattr(spec, "kv_cache_dtype", None) or "fp8"
-
-
 def draft_kv_builder(model_runner, draft_hf):
     """The KV builder a draft needs of its own, or None if it needs none.
 
@@ -50,17 +31,17 @@ def draft_kv_builder(model_runner, draft_hf):
     backend = get_attn_backend(attn_family(draft_hf))
     if not backend.DRAFT_OWNS_KV_POOL:
         return None
-    kv_cache_dtype = draft_kv_cache_dtype(model_runner.config, draft_hf)
     make_pool = partial(
         backend.make_kv_pool,
         draft_hf,
         world_size=model_runner.world_size,
-        kv_dtype=dtypes.d_dtypes[kv_cache_dtype],
+        # settled once, by `Config`
+        kv_dtype=dtypes.d_dtypes[model_runner.config.speculative_config.kv_cache_dtype],
     )
     # A way to build it, not the pool: how many rows it has is the walk's to
     # say, and this runs from the proposer's `__init__` -- `build_drafter`
     # still running, `runner.drafter` not yet set, nothing to walk.
-    return DraftKvBuilder(model_runner, make_pool, kv_cache_dtype)
+    return DraftKvBuilder(model_runner, make_pool)
 
 
 class DraftKvBuilder(PoolRowsMixin):
@@ -78,11 +59,8 @@ class DraftKvBuilder(PoolRowsMixin):
     re-paged at its own block size.
     """
 
-    def __init__(self, model_runner, make_pool, kv_cache_dtype=None):
+    def __init__(self, model_runner, make_pool):
         self.model_runner = model_runner
-        # The draft's own dtype, which decides whether it has scale planes to
-        # bind; None means the target's.
-        self._kv_cache_dtype = kv_cache_dtype
         self._make_pool = make_pool
         self._kv_pool = None
         self.num_blocks = 0  # set in allocate_kv_cache_tensors
@@ -198,7 +176,7 @@ class DraftKvBuilder(PoolRowsMixin):
         idx = self.pool_rows[DRAFT_KV_ROWS][module]
         k_cache, v_cache = self.kv_pool.kv_views(idx)
         module.max_model_len = runner.config.max_model_len
-        if (self._kv_cache_dtype or runner.config.kv_cache_dtype) == "fp8":
+        if self.kv_pool.scale_fields:  # the layout's, as the target binder asks
             module.k_scale, module.v_scale = self.kv_pool.scale_views(idx)
         module.k_cache = k_cache
         module.v_cache = v_cache

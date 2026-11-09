@@ -291,7 +291,7 @@ method with `num_speculative_tokens=1` is supported.
 | `model` | `Optional[str]` | `None` | Draft model name or path (typically the same as the target model for MTP) |
 | `num_speculative_tokens` | `Optional[int]` | `None` | Number of speculative tokens per iteration; **must be `1`** |
 | `draft_model_hf_config` | `Optional[PretrainedConfig]` | `None` | HuggingFace config for the draft model; auto-loaded from `model` when `None` |
-| `kv_cache_dtype` | `Optional[str]` | `None` | KV dtype of the draft's pages (`"bf16"`, `"fp8"`, `"fp4"`), set by `--spec-decode-kv-cache-dtype`. `Config` replaces it at startup with the dtype the draft will use. A draft with a KV pool of its own (MiniMax-M3.1's standalone DSpark) takes `"bf16"` or `"fp8"`, and `"fp8"` when omitted, whatever the target's dtype; `"fp4"` is refused there, since no FP4 draft layout exists. A draft in the target's pool (MTP, EAGLE3) always has the target's dtype, and a different request is an error. **Default change:** an own-pool DSpark draft now defaults to `"fp8"` even under a `bf16` target, where it used to follow the target, so an existing bf16-target DSpark deployment that uses KV offload or `--kv-transfer-config` fails at startup until it passes `--spec-decode-kv-cache-dtype bf16` (the error says so); without those it runs an fp8 draft pool. A draft dtype that differs from the target's is refused with KV offload or `--kv-transfer-config`, whose namespace keys the target's dtype only. With an M3 `kv_cache_dtype="fp4"` target, a draft left with `"fp4"` (MTP, EAGLE3) is refused. |
+| `kv_cache_dtype` | `Optional[str]` | `None` | KV dtype of the draft's pages (`"bf16"`, `"fp8"`, `"fp4"`), set by `--spec-decode-kv-cache-dtype`. `Config` replaces it at startup with the dtype the draft will use. A draft with a KV pool of its own (MiniMax-M3.1's standalone DSpark) takes `"bf16"` or `"fp8"`; omitted, it has the target's dtype, as a draft did before it could be asked, except under an `fp4` target, whose draft is `"fp8"` (no FP4 draft layout exists, so `"fp4"` is refused there). A draft in the target's pool (MTP, EAGLE3) always has the target's dtype, and a different request is an error. A draft dtype that differs from the target's is refused with KV offload or `--kv-transfer-config`, whose namespace keys the target's dtype only. With an M3 `kv_cache_dtype="fp4"` target, a draft left with `"fp4"` (MTP, EAGLE3) is refused. |
 
 ### Table-driven MTP config
 
@@ -383,7 +383,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--enable-expert-parallel` | | flag | `False` | Enable Expert Parallelism (EP MoE) |
 | `--torch-profiler-dir` | | `str` | `None` | Directory for torch profiler traces |
 | `--enable-dp-attention` | | flag | `False` | Enable DP attention |
-| `--method` | | `str` | `None` | Speculative method; choices: `mtp` |
+| `--method` | | `str` | `None` | Speculative method; choices: `mtp`, `eagle3`, `dspark` |
 | `--num-speculative-tokens` | | `int` | `1` | Number of speculative tokens per iteration |
 | `--spec-decode-kv-cache-dtype` | | `str` | `None` | The draft's KV dtype, `SpeculativeConfig.kv_cache_dtype` (native ATOM has no `--spec-decode-config` JSON; this flag is its setting); choices: `bf16`, `fp8`, `fp4`. Needs `--method`. See the `SpeculativeConfig` table for what each value means per draft |
 | `--max-num-batched-tokens` | | `int` | `16384` | Maximum number of tokens to batch in the async engine |

@@ -1370,21 +1370,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.context_lens
         )
         if self._has_sparse_attention:
-            from atom.model_ops.minimax_m3.index_mxfp4 import index_batch
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_sparse_decode_metadata,
             )
+            from atom.utils.forward_context import decode_rows_batch
 
             # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
             # the DECODE sparse path; the decode kernels handle q>1 per-token
             # causal internally via max_query_len.
-            # The MXFP4 scorer's selector bounds are laid out head-major over the
-            # rows the captured scorer runs; the other index caches keep the
-            # padded batch.
-            index_bs = (
-                index_batch(scheduled_bs, running_bs, running_tokens, max_seqlen_q)
-                if self._index_score_kwargs()
-                else running_bs
+            # The rows the sparse decode runs, for every index cache: a DP step
+            # can hand the layers more rows (a prefill bucket's pad) or fewer
+            # than `running_bs * q`; `_sparse_decode` slices q to these.
+            index_bs = decode_rows_batch(
+                scheduled_bs, running_bs, running_tokens, max_seqlen_q
             )
             sparse_block_tables = self._get_sparse_attention_block_tables(
                 attn_metadata.block_tables[:index_bs],

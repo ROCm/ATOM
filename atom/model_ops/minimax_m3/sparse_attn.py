@@ -169,10 +169,10 @@ def make_sparse_decode_metadata(
     view are built into it here, once. ``index_score_eager``: the step is not
     replayed from a graph, so they are built at the batch's own block count (see
     `IndexScoreBuffers.begin_step`).
-    ``seq_lens`` and ``block_table`` must hold every row the scorer and selector run
-    (pad rows of a padded step: length 0): the map's encoding and grid, the score
-    view's strides and the head offsets of ``n_valid_column_per_row`` all follow that
-    batch."""
+    ``seq_lens`` and ``block_table`` must be the requests whose rows the scorer,
+    selector and attention run (`decode_rows_batch`; pad requests of a padded step:
+    length 0): the map's encoding and grid, the score view's strides and the head
+    offsets of ``n_valid_column_per_row`` all follow that batch."""
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )

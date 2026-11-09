@@ -57,6 +57,8 @@ def identity_of(tmp_path, monkeypatch, **kw):
         kv_cache_dtype="fp8",
         index_cache_dtype="fp8",
         enforce_eager=False,
+        # as `Config` resolves it: the target's, unless the draft owns a pool
+        speculative_config=SimpleNamespace(kv_cache_dtype="fp8"),
     )
     for key, value in kw.items():
         setattr(config, key, value)
@@ -75,19 +77,11 @@ def test_mxfp4_kv_does_not_share_an_fp8_identity(tmp_path, monkeypatch):
 
 
 def test_a_draft_dtype_beside_the_targets_changes_the_identity(tmp_path, monkeypatch):
-    from atom.utils import selector
-
-    monkeypatch.setattr(selector, "attn_family", lambda hf: "x")
-    monkeypatch.setattr(
-        selector, "get_attn_backend", lambda f: SimpleNamespace(DRAFT_OWNS_KV_POOL=True)
-    )
-
     def with_draft(dtype):
-        spec = SimpleNamespace(
-            method="dspark", kv_cache_dtype=dtype, draft_model_hf_config=object()
-        )
+        spec = SimpleNamespace(kv_cache_dtype=dtype)
         return identity_of(tmp_path, monkeypatch, speculative_config=spec)
 
     # the target's own dtype leaves it as it was, so older profiles still match
     assert with_draft("fp8") == identity_of(tmp_path, monkeypatch)
+    assert "draft_kv_cache_dtype" not in with_draft("fp8")
     assert with_draft("bf16") != with_draft("fp8")

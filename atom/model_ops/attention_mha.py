@@ -1818,10 +1818,17 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             max_query_len,
             sparse_metadata.max_seq_len,
         )
+        # The rows the metadata was built for (`sparse_decode_batch`). On a DP step
+        # q has more (a prefill bucket's pad) or, ragged, fewer rows; the selector
+        # writes, and so attention may read, only these -- the rest of the output
+        # is zero. After the cache key: skip-index layers hold only the full shape.
+        rows = decode_md.seq_lens.shape[0] * max_query_len
+        assert rows <= q.shape[0], (rows, q.shape)
         cached_topk = self._load_cached_topk(sparse_metadata, topk_key)
         if cached_topk is None:
             if index_q is None:
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
+            index_q = index_q[:rows]
             if self.indexer_cp_group is not None:
                 topk_idx, sparse_bt, sparse_ctx = self._cp_index_topk_decode(
                     index_q,
@@ -1856,7 +1863,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
 
             output = sparse_pa_mxfp4(
-                q,
+                q[:rows],
                 k_cache,
                 v_cache,
                 sparse_bt,
@@ -1867,10 +1874,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 planned=True,
                 plan_step_owner=sparse_metadata if self.local_blocks >= 1 else None,
             )
+            if rows < q.shape[0]:
+                output = nn.functional.pad(output, (0, 0, 0, 0, 0, q.shape[0] - rows))
         else:
             output = torch.empty_like(q)
+            if rows < q.shape[0]:
+                output[rows:].zero_()
             minimax_m3_sparse_attn_decode_asm(
-                q,
+                q[:rows],
                 k_cache,
                 v_cache,
                 topk_idx,
@@ -1878,7 +1889,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 decode_md.seq_lens,
                 self.num_kv_heads,
                 self.scale,
-                output,
+                output[:rows],
                 k_scale=k_scale,
                 v_scale=v_scale,
                 sparse_bt=sparse_bt,

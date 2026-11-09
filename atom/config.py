@@ -1954,37 +1954,28 @@ def _check_fp4_kv(kv_cache_dtype: str, *, is_m3: bool, is_v41: bool) -> None:
         )
 
 
-def kv_offload_requested(config) -> bool:
-    """Whether KV pages leave the pool: a ``--kv-transfer-config`` (a P/D connector,
-    or the offload one ``EngineArgs`` folds ``ATOM_KV_OFFLOAD`` into) or the env
-    itself, read too for a ``Config`` built without ``EngineArgs``."""
-    mode = (envs.ATOM_KV_OFFLOAD or "").strip().lower()
-    return bool(config.kv_transfer_config) or mode not in ("", "0", "off", "none")
+def kv_pages_leave_pool(config) -> bool:
+    """Whether KV pages are moved out of the pool: any ``--kv-transfer-config``
+    connector, a P/D one or the offload one ``EngineArgs`` folds ``ATOM_KV_OFFLOAD``
+    into (nothing else reads that env)."""
+    return bool(config.kv_transfer_config)
 
 
-def resolve_draft_kv_dtype(spec, target_dtype: str, *, is_m3: bool) -> str:
+def resolve_draft_kv_dtype(spec, target_dtype: str, *, own_pool: bool) -> str:
     """The KV dtype a speculative draft's pages have, from ``--spec-decode-kv-cache-dtype``
     and the target's ``--kv-cache-dtype``.
 
     A draft that caches into a pool of its own -- MiniMax-M3.1's standalone DSpark,
     which `spec_decode.draft_kv.draft_kv_builder` gives one because its backend says
-    `DRAFT_OWNS_KV_POOL` -- takes its own dtype: fp8 unless the user chose bf16 or
-    fp8. FP4 has no draft layout (an exact FP4 sliding window is not built),
-    so it is refused here rather than mapped to anything else. Every other draft
-    lives in the target's pool, so it has the target's dtype and a different request
-    is an error, not a second pool.
+    `DRAFT_OWNS_KV_POOL` (``own_pool``, decided once by the caller) -- may take its
+    own dtype, bf16 or fp8. Asked nothing it keeps the target's, as every draft did
+    before it could ask, except under an FP4 target: FP4 has no draft layout (an exact
+    FP4 sliding window is not built), so that draft is fp8, and asking for FP4 is
+    refused here rather than mapped to anything else. Every other draft lives in the
+    target's pool, so it has the target's dtype and a different request is an error,
+    not a second pool.
     """
     asked = spec.kv_cache_dtype
-    own_pool = False
-    if is_m3 and spec.method == "dspark":
-        # The predicate `draft_kv_builder` and the offload deployment ask, so this
-        # cannot resolve a pool the builder does not give (or the reverse). It
-        # imports the attention backend, so only an M3 DSpark asks.
-        from atom.utils.selector import attn_family, get_attn_backend
-
-        own_pool = bool(
-            get_attn_backend(attn_family(spec.draft_model_hf_config)).DRAFT_OWNS_KV_POOL
-        )
     if not own_pool:
         if asked is not None and asked != target_dtype:
             raise ValueError(
@@ -1996,9 +1987,9 @@ def resolve_draft_kv_dtype(spec, target_dtype: str, *, is_m3: bool) -> str:
     if asked == "fp4":
         raise ValueError(
             "--spec-decode-kv-cache-dtype fp4: the draft has no FP4 KV layout "
-            "(use bf16 or fp8; fp8 when omitted)"
+            "(use bf16 or fp8; the target's, or fp8 under an fp4 target, when omitted)"
         )
-    return asked or "fp8"
+    return asked or ("fp8" if target_dtype == "fp4" else target_dtype)
 
 
 def indexer_cp_unsupported_reason(
@@ -2886,26 +2877,43 @@ class Config:
                     else self.kv_cache_dtype
                 )
         if self.speculative_config is not None:
-            spec = self.speculative_config
-            spec.kv_cache_dtype = resolve_draft_kv_dtype(
-                spec, self.kv_cache_dtype, is_m3=is_m3
+            from atom.kv_transfer.offload.mp.deployment import (
+                _config_has_own_pool_draft,
             )
-            if spec.kv_cache_dtype != self.kv_cache_dtype and kv_offload_requested(
-                self
-            ):
-                # The offload namespace keys the target's KV dtype alone, so a
-                # draft page of another dtype would share a key with the target's.
-                raise ValueError(
-                    f"draft KV dtype {spec.kv_cache_dtype} differs from the "
-                    f"target's {self.kv_cache_dtype}: not supported with KV offload "
-                    "or --kv-transfer-config. An own-pool DSpark draft defaults to "
-                    "fp8; pass --spec-decode-kv-cache-dtype "
-                    f"{self.kv_cache_dtype} to match the target"
-                )
+
+            spec = self.speculative_config
+            # The one place the draft's pool and dtype are settled: everything
+            # downstream (the draft builder, the proposer, the calibration identity)
+            # reads `spec.kv_cache_dtype`.
+            spec.kv_cache_dtype = resolve_draft_kv_dtype(
+                spec, self.kv_cache_dtype, own_pool=_config_has_own_pool_draft(self)
+            )
         if is_m3:
             from atom.models.minimax_m3.config import validate_runtime_config
 
             validate_runtime_config(self)
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.kv_cache_dtype != self.kv_cache_dtype
+            and kv_pages_leave_pool(self)
+        ):
+            # The offload namespace keys the target's KV dtype alone, so a
+            # draft page of another dtype would share a key with the target's.
+            # After the model's own refusal above: an fp4 target is refused there
+            # for the offload itself, and no draft dtype can match it.
+            raise ValueError(
+                f"draft KV dtype {self.speculative_config.kv_cache_dtype} differs "
+                f"from the target's {self.kv_cache_dtype}: not supported with KV "
+                "offload or --kv-transfer-config. Pass "
+                f"--spec-decode-kv-cache-dtype {self.kv_cache_dtype} to match the "
+                "target"
+                + (
+                    ""
+                    if self.kv_cache_dtype != "fp4"
+                    else " (an fp4 target has no draft layout: use a bf16 or fp8 "
+                    "target)"
+                )
+            )
 
         if self.hf_config.model_type == "deepseek_v41_text":
             # CSA2's index plane is paged by the same scorer GLM's is, so a
@@ -3023,7 +3031,7 @@ class Config:
         # This reads the field AFTER __post_init__, which is the only correct
         # value: it already folds in the ATOM_M3_INDEXER_CP override AND every
         # indexer_cp_unsupported_reason fallback (plugin mode, TP != kv heads,
-        # block != 128, DCP, TBO). Two topologies that both fall back therefore
+        # block != 128, DCP, TBO, an MXFP4 KV or index cache). Two topologies that both fall back therefore
         # share one artifact, as they should.
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
