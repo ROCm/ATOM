@@ -4022,7 +4022,7 @@ models:
         env: &issue382_a9_pernic4352_tuned_icp_env
           common: *issue382_a9_pernic4352_tuned_env_common
           prefill: *issue382_a9_pernic4352_tuned_env_prefill
-          decode:
+          decode: &issue382_a9_pernic4352_tuned_icp_env_decode
             <<: *issue382_a9_env_decode
             ATOM_M3_INDEXER_CP: '1'
             # CP widens the fused QKV GEMM by the other ranks' index-Q heads
@@ -4082,6 +4082,18 @@ models:
             OFFLOAD_STAGING_ON_COMPUTE_STREAM: '1'
             ATOM_PP_MAX_IN_FLIGHT: '8'
             ATOM_PP_SEND_DEPTH: '2'
+      # Twice the decodes' pending-receive credits. Sessions resuming after the
+      # trace's 300 s idle-gap cap find their prefix gone from D (D's hit falls
+      # 88% -> 28% in 4 minutes) and each needs its whole prompt's KV: 0.15 of
+      # the pool then admits ~15-25 receives per D while D's KV sits at 0.4-0.55
+      # and P computes at ~55% of its peak. That burst's TTFT p90 is 31 s.
+      - <<: *issue382_a9_1p2d_c240_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c240-pernic4352-tuned-mem90-icp-w30
+        env:
+          <<: *issue382_a9_pernic4352_tuned_icp_env
+          decode:
+            <<: *issue382_a9_pernic4352_tuned_icp_env_decode
+            DECODE_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8,"pd_admission":{"enabled":true,"max_pending_kv_fraction":0.3,"min_free_kv_fraction":0.1}}'
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c330
         concurrency:
