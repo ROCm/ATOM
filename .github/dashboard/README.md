@@ -23,7 +23,8 @@ publication per recipe, model, hardware, serving mode, workload, precision and c
 Distinct configurations survive until the two-dimensional Pareto calculation;
 lower throughput alone does not eliminate a point with higher interactivity.
 Frontiers stay within each source, hardware, model variant, serving mode,
-workload and precision. Aggregated uses blue square markers; PD uses pink
+workload and precision. **ATOM** denotes the single-node aggregated engine and
+uses blue square markers; **ATOMesh** denotes PD disaggregation and uses pink
 circles. Serving mode is independent of physical node count: PD can run on
 one node. Topology and node placement are shown in point details.
 

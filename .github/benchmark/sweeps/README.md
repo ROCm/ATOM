@@ -4,7 +4,8 @@ Add or modify **one** `NAME.yaml` file in this directory in a PR to `main`.
 When the PR is ready for review, `ATOM PR Benchmark Sweep` runs its selected
 recipes at the PR's exact head commit. Updates to the PR replace its pending
 sweep. Each configuration describes one model, hardware, workload and serving
-mode; submit separate configuration PRs for Aggregated and PD curves.
+mode; submit separate configuration PRs for ATOM (single-node aggregated) and
+ATOMesh (PD disaggregated) curves.
 Alternatively, use **Actions → ATOM PR Benchmark Sweep → Run workflow** and
 enter the configuration's path. A manual run uses the selected branch's exact
 commit and produces the same curve format without requiring a PR. The workflow
@@ -61,7 +62,7 @@ python tools/preview_benchmark_dashboard.py --sweep path/to/agg_bmk.json
 
 ATOM's sweep artifact already contains each point's run URL, so `--run-url`
 is unnecessary. The dashboard labels the source with its PR/run, distinguishes
-Aggregated and PD series, and computes their Pareto frontiers independently.
+ATOM and ATOMesh series, and computes their Pareto frontiers independently.
 Use **Source → Compare sources** to overlay imported results and published CI
 results for the same model, hardware, workload and precision.
 

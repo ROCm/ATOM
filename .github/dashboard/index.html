@@ -4149,7 +4149,7 @@ function explorerDeployment(row) {
 }
 
 function explorerDeploymentLabel(row) {
-  return { pd: 'PD', aggregated: 'Aggregated', unknown: 'Mode unknown' }[explorerDeployment(row)];
+  return { pd: 'ATOMesh', aggregated: 'ATOM', unknown: 'Engine unknown' }[explorerDeployment(row)];
 }
 
 function explorerSeriesKey(row) {
@@ -4224,7 +4224,7 @@ function renderAtomeshPerformanceTab() {
     const row = seriesRows.get(key);
     const origin = sourceName(row).match(/PR #\d+/)?.[0] || sourceName(row).match(/#\d+/)?.[0] || sourceName(row);
     const variant = /eagle3/i.test(row.model) ? ' · Eagle3' : '';
-    return `${fmtHardware(row.hardware)} · ATOM ${explorerDeploymentLabel(row)}${variant}${compareSources ? ' · ' + origin : ''}`;
+    return `${fmtHardware(row.hardware)} · ${explorerDeploymentLabel(row)}${variant}${compareSources ? ' · ' + origin : ''}`;
   };
   const light = document.documentElement.getAttribute('data-theme') === 'light';
   const palette = light ? { pd: ['#d4385a', '#a34591'], aggregated: ['#326acc', '#16856b'], unknown: ['#69717e'] }
@@ -4255,7 +4255,7 @@ function renderAtomeshPerformanceTab() {
     if (!row) return '<p class="ex-count">Select a configuration to inspect its measurements.</p>';
     return `<dl class="ex-metric-hero"><dt>Total throughput</dt><dd>${explorerCompact(row.totalTput, 2)} <small>tok/s</small></dd></dl>
       <dl class="ex-metric-list">
-        <div><dt>Serving mode</dt><dd>${explorerDeploymentLabel(row)}</dd></div>
+        <div><dt>Engine</dt><dd>${explorerDeploymentLabel(row)}</dd></div>
         ${row.runAttempt ? `<div><dt>Point attempt</dt><dd>${row.runAttempt}${row.sweepRunAttempt > row.runAttempt ? ' · retained' : ''}</dd></div>` : ''}
         ${row.prNumber && safeHref(row.prUrl) ? `<div><dt>PR / commit</dt><dd><a href="${escHTML(row.prUrl).replace(/"/g, '&quot;')}" target="_blank" rel="noopener noreferrer">#${row.prNumber}</a>${row.headSha ? ' · ' + escHTML(row.headSha.slice(0, 7)) : ''}</dd></div>` : ''}
         <div><dt>P90 interactivity</dt><dd>${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), v => fmtNum(v, 2))}</dd></div>
@@ -4456,7 +4456,7 @@ function renderAtomeshPerformanceTab() {
             padding: 14, displayColors: false,
             filter: item => !item.dataset._isFrontier,
             callbacks: {
-              title: items => items.length ? `ATOM ${explorerDeploymentLabel(items[0].raw.row)} · c${items[0].raw.row.concurrency}` : '',
+              title: items => items.length ? `${explorerDeploymentLabel(items[0].raw.row)} · c${items[0].raw.row.concurrency}` : '',
               label: item => [`Total throughput: ${fmtNum(item.raw.y, 2)} tok/s`, `${metricLabel}: ${fmtNum(item.raw.x, 2)} tok/s/user`, `${explorerTopology(item.raw.row)} · ${item.raw.row.totalGpu ?? '—'} GPUs`],
               footer: items => items.some(item => safeHref(item.raw.row.runUrl)) ? 'Click to inspect · CI run available in details' : 'Click to inspect configuration',
             } },
