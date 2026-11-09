@@ -1,0 +1,31 @@
+{
+  "model": "DeepSeek-V4.1-Flash",
+  "input": "Return city Paris and temperature_c 20.",
+  "reasoning": {
+    "effort": "none"
+  },
+  "max_output_tokens": 256,
+  "text": {
+    "format": {
+      "type": "json_schema",
+      "name": "weather",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          },
+          "temperature_c": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "city",
+          "temperature_c"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}

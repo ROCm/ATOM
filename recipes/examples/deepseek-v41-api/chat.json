@@ -1,0 +1,14 @@
+{
+  "model": "DeepSeek-V4.1-Flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is 2 + 2? Answer briefly."
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 256,
+  "thinking": {
+    "type": "disabled"
+  }
+}

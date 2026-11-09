@@ -1,0 +1,14 @@
+{
+  "model": "DeepSeek-V4.1-Flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Explain why the sum of two odd integers is even."
+    }
+  ],
+  "thinking": {
+    "type": "enabled"
+  },
+  "reasoning_effort": "high",
+  "max_tokens": 2048
+}

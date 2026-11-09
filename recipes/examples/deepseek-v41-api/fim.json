@@ -1,0 +1,7 @@
+{
+  "model": "DeepSeek-V4.1-Flash",
+  "prompt": "def add(a, b):\n",
+  "suffix": "\n\nprint(add(2, 3))",
+  "temperature": 0,
+  "max_tokens": 128
+}

@@ -1,0 +1,19 @@
+{
+  "model": "DeepSeek-V4.1-Flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "List three primary colors."
+    },
+    {
+      "role": "assistant",
+      "content": "The three primary colors are",
+      "prefix": true
+    }
+  ],
+  "thinking": {
+    "type": "disabled"
+  },
+  "temperature": 0,
+  "max_tokens": 128
+}

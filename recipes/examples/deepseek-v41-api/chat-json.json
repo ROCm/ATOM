@@ -1,0 +1,17 @@
+{
+  "model": "DeepSeek-V4.1-Flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Return a JSON object with city Paris and temperature_c 20."
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 256,
+  "thinking": {
+    "type": "disabled"
+  },
+  "response_format": {
+    "type": "json_object"
+  }
+}

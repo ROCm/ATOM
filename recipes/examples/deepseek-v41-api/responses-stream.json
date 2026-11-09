@@ -1,0 +1,9 @@
+{
+  "model": "DeepSeek-V4.1-Flash",
+  "input": "What is 2 + 2? Answer briefly.",
+  "reasoning": {
+    "effort": "none"
+  },
+  "max_output_tokens": 256,
+  "stream": true
+}
