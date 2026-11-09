@@ -68,7 +68,7 @@ from atom.model_engine.state_runtime import (
 )
 from atom.observability import tracing
 from atom.sampling_params import RequiredChannel
-from atom.structured_output import StructuredRequest
+from atom.structured_output import StructuredRequest, is_structured
 from atom.utils import envs, get_hf_text_config
 from atom.utils.selector import attn_family
 
@@ -256,7 +256,7 @@ class ScheduledBatch:
             )
         self.structured_requests = {}
         for i, seq in enumerate(seqs.values()):
-            if seq.json_schema is None:
+            if not is_structured(seq):
                 continue
             self.structured_requests[i] = StructuredRequest.capture(seq)
         # `context_lens` is set further down, once `num_cached_tokens` is known:
@@ -801,7 +801,10 @@ class Scheduler:
         # Allocated before the forward, with the step's own blocks: see
         # `draft_kv_lookahead` for the arithmetic and what an unallocated one
         # costs.
-        self.draft_lookahead = draft_kv_lookahead(self.mtp_k)
+        self.draft_lookahead = draft_kv_lookahead(
+            self.mtp_k,
+            block_drafter=(has_spec and config.speculative_config.use_dspark()),
+        )
         self.block_manager.draft_lookahead = self.draft_lookahead
         self.is_deferred_out = defers_output(config)
         if self.use_spec and pp_size > 1:

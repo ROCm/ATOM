@@ -21,11 +21,13 @@ from atom.kv_transfer.offload._offload_common import (
     validated_kv_role,
 )
 from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
-from atom.kv_transfer.offload.mp.deployment import _validate_mp_config
+from atom.kv_transfer.offload.mp.deployment import (
+    _validate_mp_config,
+    require_native_state_server,
+)
+from atom.kv_transfer.offload.mp.native_state_layout import stores_state_images
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
-    require_native_state_server,
-    stores_state_images,
 )
 from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
 from atom.model_engine.page_unit_checkpoint import SuspendedCheckpointRestore
@@ -307,7 +309,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             self._block_manager.fall_back_to_hbm_replay(seq)
         return parks
 
-    def _ensure_lookup_pin(self, seq: Any, sid: str, spec) -> bool:
+    def _ensure_lookup_pin(self, seq: Any, sid: str, spec) -> bool | None:
         operation = self._native_load_operations.get(sid)
         lease = self._native_loads.get(operation)
         if lease is None or lease.seq is not seq or not lease.transfer.kv_only:
@@ -321,7 +323,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         # what the base does for a load admitted on a remembered hit -- would
         # weigh a hit of 0 (no image), and drop the load.
         reach = self._lookup_client.hit_tokens(sid)
-        return reach is not None and int(reach) >= int(spec.lmcache_cached_tokens)
+        if reach is None:
+            return None
+        return int(reach) >= int(spec.lmcache_cached_tokens)
 
     def _save_frontier(self, seq: Any) -> int:
         if not getattr(seq, "has_per_req_cache", False):

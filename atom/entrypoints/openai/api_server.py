@@ -59,13 +59,18 @@ from atom.observability.tracing import TraceMiddleware, set_request_id
 from atom.observability.tracing import initialize as initialize_tracing
 from atom.observability.tracing import shutdown as shutdown_tracing
 from atom.sampling_params import RequiredChannel
+from atom.structured_output import is_structured
 from atom.structured_output.validation import (
     configure_request,
+    configure_tool_call_grammar,
+    declared_tool_names,
     schema_from_format,
+    strict_tool_schemas,
     structured_response_channel,
     validate_chat_stream,
     validate_output,
     validate_responses_output,
+    validate_tool_calls,
 )
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
@@ -86,12 +91,17 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
+from .fim import FimFormat, resolve_fim_format
+from .images import check_chat_images, load_chat_images
 from .logprobs import LogprobCollector, TokenBytes
 from .metrics_setup import create_metrics_exporter
+from .prefix_completion import continue_prompt, take_assistant_prefix
 from .protocol import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
+    BetaChatCompletionRequest,
+    BetaCompletionRequest,
     ChatCompletionRequest,
     CompletionRequest,
     ModelCard,
@@ -118,6 +128,7 @@ from .request_timing import (
     get_stream_timing,
     has_generated_output,
     record_nonstream_first_token,
+    skip_first_token,
 )
 from .serving_anthropic import (
     AnthropicBlocks,
@@ -143,6 +154,7 @@ from .serving_chat import (
     stream_chat_response_fanout,
     validate_chat_request,
     validate_history_tool_calls,
+    validate_stream_options,
     validate_tool_list,
 )
 from .serving_completion import (
@@ -223,6 +235,9 @@ processor: Any | None = None
 model_name: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
 custom_message_encoder: Any | None = None
+# The model's fill-in-the-middle markers, found in its vocabulary at startup;
+# None when it has none and /beta/completions cannot honour a `suffix`.
+fim_format: FimFormat | None = None
 _seq_id_to_request_id: dict[int, str] = {}
 _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
@@ -755,16 +770,20 @@ def _prepare_multimodal_inputs(
     chat_template_kwargs: dict[str, Any],
     tools: Any = None,
 ) -> tuple[list[int], dict[str, Any]]:
+    # The images arrive decoded: the processor's media loader reads any
+    # source it is given, server paths included.
     conversation, media = parse_chat_messages(
-        [
-            {
-                **message.to_template_dict(
-                    preserve_tool_call_arguments=preserve_tool_call_arguments
-                ),
-                "content": message.content,
-            }
-            for message in messages
-        ]
+        load_chat_images(
+            [
+                {
+                    **message.to_template_dict(
+                        preserve_tool_call_arguments=preserve_tool_call_arguments
+                    ),
+                    "content": message.content,
+                }
+                for message in messages
+            ]
+        )
     )
     return prepare_multimodal_inputs(
         _get_engine_config(),
@@ -849,7 +868,7 @@ def _send_stream_chunk_tagged(
 
 
 async def _submit_engine_requests(seqs):
-    if not any(getattr(seq, "json_schema", None) is not None for seq in seqs):
+    if not any(is_structured(seq) for seq in seqs):
         engine.core_mgr.add_request(seqs)
         return
     # Admission RPCs must not block the API event loop. If the client cancels,
@@ -1380,6 +1399,64 @@ def _prepare_prompt(
     return token_ids, text
 
 
+async def _prepare_engine_input(
+    messages,
+    template_kwargs: dict[str, Any],
+    *,
+    tools,
+    max_tokens: int,
+    kv_transfer_params: dict[str, Any] | None,
+) -> tuple[PrefixEncoding | list[int], dict[str, Any] | None, bool]:
+    """``(engine_input, multimodal_data, starts_in_reasoning)`` for
+    ``/v1/messages`` and ``/v1/responses``.
+
+    A request with images is prepared as on the chat path, and is not cut to
+    the context: a cut could end inside an image. One without goes through
+    ``_prepare_prompt`` as before."""
+    if _has_multimodal_content(messages):
+        if kv_transfer_params is not None:
+            # A prefill leg cannot hand an image request off, so neither leg
+            # can finish it: refused here, not as a router error or a stall.
+            raise ValueError("image input cannot be combined with kv_transfer_params")
+        _get_multimodal_processor()  # on the loop, as the chat path does
+        token_ids, multimodal_data = await asyncio.to_thread(
+            _prepare_multimodal_inputs, messages, template_kwargs, tools
+        )
+        starts = prompt_tokens_start_in_reasoning(token_ids, tokenizer.decode)
+        return token_ids, multimodal_data, starts
+    engine_input, prompt = await asyncio.to_thread(
+        _prepare_prompt,
+        messages,
+        template_kwargs,
+        tools=tools,
+        preserve_tool_call_arguments=preserve_tool_call_arguments,
+        max_tokens=max_tokens,
+        kv_transfer_params=kv_transfer_params,
+    )
+    return engine_input, None, prompt_starts_in_reasoning(prompt)
+
+
+def _generate_nonstream(
+    engine_input,
+    multimodal_data: dict[str, Any] | None,
+    sampling_params: SamplingParams,
+    request_id: str,
+    kv_transfer_params: dict[str, Any] | None,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """The engine call for what ``_prepare_engine_input`` returned."""
+    if multimodal_data is None:
+        return generate_async(
+            engine_input,
+            sampling_params,
+            request_id,
+            kv_transfer_params=kv_transfer_params,
+        )
+    # No PD handoff: `_prepare_engine_input` refused one with images.
+    return generate_async_multimodal(
+        engine_input, multimodal_data, sampling_params, request_id
+    )
+
+
 def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
     """Return the prefill's KV location to the PD router, as chat does."""
     if "kv_transfer_output_meta_info" in final_output:
@@ -1858,18 +1935,24 @@ async def _relay_to_hub(request: Request) -> Response:
 
 # ---- Error handlers ----
 
+# Generation routes whose errors use the OpenAI envelope.
+_OPENAI_ERROR_ROUTES = frozenset(
+    {
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/responses",
+        "/beta/chat/completions",
+        "/beta/completions",
+    }
+)
+
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_error_handler(
     request: Request, exc: RequestValidationError
 ):
     path = request.url.path
-    if path not in {
-        "/v1/chat/completions",
-        "/v1/completions",
-        "/v1/responses",
-        "/v1/messages",
-    }:
+    if path not in _OPENAI_ERROR_ROUTES and path != "/v1/messages":
         return await request_validation_exception_handler(request, exc)
     # Do not serialize exc.body, input values or arbitrary Pydantic ctx objects.
     message = "; ".join(
@@ -1889,11 +1972,7 @@ async def request_validation_error_handler(
 async def openai_http_error_handler(request: Request, exc: HTTPException):
     # HTTPException bypasses the ValueError/Exception handlers. Keep its status
     # and headers, but use the same OpenAI error envelope on generation routes.
-    if request.url.path not in {
-        "/v1/chat/completions",
-        "/v1/completions",
-        "/v1/responses",
-    }:
+    if request.url.path not in _OPENAI_ERROR_ROUTES:
         return await http_exception_handler(request, exc)
     return JSONResponse(
         status_code=exc.status_code,
@@ -1968,39 +2047,72 @@ async def _configure_structured_output(
     *,
     tools=None,
     tool_choice=None,
+    strict_schemas=None,
     kv_transfer=None,
     multimodal=False,
 ):
-    if schema is None:
+    if schema is None and not strict_schemas:
         return
-    await configure_request(
-        engine,
-        tokenizer,
-        _get_engine_config(),
-        sampling_params,
-        schema,
-        channel,
-        parser_cls=tool_call_parser_cls,
-        tools=tools,
-        tool_choice=tool_choice,
-        kv_transfer=kv_transfer,
-        multimodal=multimodal,
-        relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
-        synthetic=synthetic_token_text is not None,
-    )
+    try:
+        await configure_request(
+            engine,
+            tokenizer,
+            _get_engine_config(),
+            sampling_params,
+            schema,
+            channel,
+            parser_cls=tool_call_parser_cls,
+            tools=tools,
+            tool_choice=tool_choice,
+            kv_transfer=kv_transfer,
+            multimodal=multimodal,
+            relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+            synthetic=synthetic_token_text is not None,
+            strict_schemas=strict_schemas,
+        )
+    except ValueError as exc:
+        if schema is not None:
+            raise
+        # Only strict tools asked for the grammar, and the refusals are
+        # worded for JSON Schema output: name what the client did ask for.
+        raise ValueError(f"strict function tools: {exc}") from exc
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
+    return await _chat_completions(request, raw_request)
 
+
+@app.post("/beta/chat/completions")
+async def beta_chat_completions(
+    request: BetaChatCompletionRequest, raw_request: Request
+):
+    """Chat completions plus DeepSeek's beta assistant-prefix completion."""
+    return await _chat_completions(request, raw_request)
+
+
+async def _chat_completions(
+    request: ChatCompletionRequest | BetaChatCompletionRequest, raw_request: Request
+):
+    # The beta contract comes with the beta request model; /v1 ignores a
+    # `prefix` flag, as it always has.
+    beta = isinstance(request, BetaChatCompletionRequest)
+    route = "beta_chat_completions" if beta else "chat_completions"
     validate_model(request.model)
     _validate_chunked_receive(request.kv_transfer_params)
 
     try:
         request.tools = normalize_chat_tools(request.tools)
         validate_chat_request(request)
-        messages = request.get_messages()
+        # Before any work: an image's source, form and place are the client's
+        # to get right, and nothing is fetched until they are.
+        messages = check_chat_images(request.get_messages())
+        assistant_prefix = None
+        if beta:
+            messages, assistant_prefix = take_assistant_prefix(
+                messages, custom_message_encoder
+            )
         logprob_codec = None
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
@@ -2060,6 +2172,24 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 app.state.logprob_codec = logprob_codec
 
         schema = schema_from_format(request.response_format)
+        # Strict function tools are a beta feature; /v1 keeps ignoring `strict`.
+        strict_schemas = {}
+        if beta and request.tool_choice != "none":
+            tools = request.tools or ()
+            if any(tool["function"].get("strict") is True for tool in tools):
+                # Off the event loop: a new tool's meta-schema check takes
+                # milliseconds.
+                strict_schemas = await asyncio.to_thread(strict_tool_schemas, tools)
+            else:
+                # Nothing to check but how `strict` is spelled.
+                strict_schemas = strict_tool_schemas(tools)
+        if assistant_prefix is not None and (schema is not None or strict_schemas):
+            # The grammar constrains the reply from its first token, and a
+            # prefix has already written part of it.
+            raise ValueError(
+                "an assistant prefix cannot be combined with structured output "
+                "or strict tools"
+            )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         set_request_id(request_id)
@@ -2075,6 +2205,14 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         is_multimodal = _has_multimodal_content(messages)
         multimodal_data = None
         kv_transfer_params = request.kv_transfer_params
+        if assistant_prefix is not None and (
+            is_multimodal or request.get_prompt_token_ids() is not None
+        ):
+            # Only rendered text can be continued.
+            raise ValueError(
+                "an assistant prefix cannot be combined with image input or "
+                "prompt_token_ids"
+            )
         if is_multimodal:
             # Media loading (blocking network I/O, up to a 30s urlopen) plus
             # processor preprocessing are heavy and would stall the event loop;
@@ -2115,6 +2253,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             ),
             template_kwargs=merged_kwargs,
         )
+        if assistant_prefix is not None:
+            prompt_or_tokens, _reasoning = continue_prompt(
+                prompt_or_tokens, assistant_prefix, _reasoning
+            )
 
         await _configure_structured_output(
             sampling_params,
@@ -2122,11 +2264,28 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             _reasoning,
             tools=request.tools,
             tool_choice=request.tool_choice,
+            strict_schemas=strict_schemas,
             kv_transfer=request.kv_transfer_params,
             multimodal=_has_multimodal_content(messages),
         )
+        if schema is None and not strict_schemas and tool_call_parser_cls is not None:
+            await configure_tool_call_grammar(
+                engine,
+                _get_engine_config(),
+                sampling_params,
+                _reasoning,
+                parser_cls=tool_call_parser_cls,
+                tools=request_tools(request),
+                tool_choice=request.tool_choice,
+                kv_transfer=request.kv_transfer_params,
+                multimodal=_has_multimodal_content(messages),
+                relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+                synthetic=synthetic_token_text is not None,
+            )
 
-        _reasoning = structured_response_channel(_reasoning, schema)
+        _reasoning = structured_response_channel(
+            _reasoning, schema, bool(strict_schemas)
+        )
 
         # Streaming
         if request.stream:
@@ -2165,12 +2324,15 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
-                usage_on_finish=compatibility.chat_usage_on_finish,
+                usage_on_finish=compatibility.usage_on_finish,
                 include_usage=bool((request.stream_options or {}).get("include_usage")),
             )
-            if schema is not None:
-
-                gen = validate_chat_stream(gen, schema)
+            if sampling_params.json_schema is not None or strict_schemas:
+                # Also a tool-call grammar: its decode error ends the stream
+                # with an error event, not a truncated success.
+                gen = validate_chat_stream(
+                    gen, schema, strict_schemas, declared_tool_names(request.tools)
+                )
             return StreamingResponse(
                 _client_stream(gen, request_id),
                 media_type="text/event-stream",
@@ -2284,7 +2446,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 logprob_codec=logprob_codec,
                 top_logprobs=sampling_params.top_logprobs,
             )
-        if schema is not None:
+        if schema is not None or strict_schemas:
 
             for choice in resp.choices:
                 validate_output(
@@ -2292,6 +2454,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     choice["message"].get("content") or "",
                     choice.get("finish_reason"),
                     tool_calls=bool(choice["message"].get("tool_calls")),
+                )
+                validate_tool_calls(
+                    strict_schemas,
+                    choice["message"].get("tool_calls"),
+                    choice.get("finish_reason"),
+                    declared_tool_names(request.tools),
                 )
         _log_request_model("response", request_id, resp)
         # Bypass FastAPI's recursive conversion of the token ID list.
@@ -2301,26 +2469,145 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except ValueError as e:
-        logger.error(f"Validation error in chat_completions: {e}")
+        logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.exception("Error in chat_completions")
+        logger.exception("Error in %s", route)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest, raw_request: Request):
     """Handle text completion requests (OpenAI-compatible)."""
+    return await _completions(request, raw_request)
 
+
+@app.post("/beta/completions")
+async def beta_completions(request: BetaCompletionRequest, raw_request: Request):
+    """Text completions plus DeepSeek's beta fill-in-the-middle (``suffix``)."""
+    return await _completions(request, raw_request)
+
+
+def _check_beta_completion(request: BetaCompletionRequest) -> None:
+    """Refuse DeepSeek's completion parameters this server cannot honour."""
+    validate_stream_options(request.stream, request.stream_options)
+    if request.logprobs is not None:
+        raise ValueError(
+            "logprobs is not supported on /beta/completions yet; omit it or send null"
+        )
+    if request.echo and request.suffix is not None:
+        raise ValueError("echo cannot be combined with suffix")
+
+
+def _fill_in_the_middle_prompt(request: BetaCompletionRequest) -> str:
+    """Render a ``suffix`` request's prompt in the model's FIM format."""
+    if fim_format is None:
+        raise ValueError("this model has no fill-in-the-middle format")
+    if request.get_prompt_token_ids() is not None or isinstance(request.prompt, list):
+        raise ValueError("fill-in-the-middle needs 'prompt' as text, not token IDs")
+    if request.prompt is None:
+        raise ValueError("fill-in-the-middle needs a 'prompt' as well as the 'suffix'")
+    return fim_format.render(request.prompt, request.suffix)
+
+
+async def _echo_text(request: CompletionRequest) -> str:
+    """The prompt as `echo` returns it, ahead of the completion."""
+    prompt = request.get_prompt_or_tokens()
+    if isinstance(prompt, str):
+        return prompt
+    # A token prompt can be long: decode it off the event loop.
+    return await asyncio.to_thread(tokenizer.decode, prompt)
+
+
+async def _zero_token_output(
+    request: BetaCompletionRequest, prompt_or_tokens: str | list[int]
+) -> dict[str, Any]:
+    """The output ``max_tokens: 0`` asks for, made without the engine.
+
+    DeepSeek's completions take ``max_tokens >= 0``, and 0 generates nothing:
+    the reply is its ``echo`` alone, ended by its length cap. The prompt is
+    tokenized as the engine would (``encode_prompt``) for its usage and the
+    context check, and the output goes to the builders a generated one does,
+    so the response has the same shape. No first token comes, so none is
+    timed: an echoed prompt is not one.
+    """
+    skip_first_token()
+    if isinstance(prompt_or_tokens, str):
+        encoded = await asyncio.to_thread(
+            engine.io_processor.encode_prompt, prompt_or_tokens
+        )
+        prompt_ids = list(
+            encoded.token_ids if isinstance(encoded, PrefixEncoding) else encoded
+        )
+    else:
+        prompt_ids = list(prompt_or_tokens)
+    _validate_context_length(len(prompt_ids), 0, _get_engine_max_model_len())
+    output: dict[str, Any] = {
+        "text": "",
+        "finish_reason": "max_tokens",
+        "num_tokens_input": len(prompt_ids),
+        "num_tokens_output": 0,
+    }
+    if request.return_token_ids:
+        output["prompt_token_ids"] = prompt_ids
+    return output
+
+
+def _nothing_to_clean_up(*_args, **_kwargs) -> None:
+    """The cleanup of a stream the engine never ran."""
+
+
+def _zero_token_stream(
+    request_id: str, output: dict[str, Any], n: int, **options
+) -> AsyncGenerator[str, None]:
+    """``output`` streamed for each of ``n`` choices, as the engine's last
+    chunk would be."""
+    collector = StreamOutputCollector(request_id)
+    ended = {
+        "token_ids": [],
+        "text": output["text"],
+        "finished": True,
+        "finish_reason": output["finish_reason"],
+    }
+    stream_args = (
+        output["num_tokens_input"],
+        _nothing_to_clean_up,
+        _nothing_to_clean_up,
+    )
+    if n == 1:
+        collector.put_nowait(ended)
+        return stream_completion_response(
+            request_id, model_name, collector, 0, *stream_args, **options
+        )
+    for index in range(n):
+        collector.put_nowait((index, dict(ended)))
+    return stream_completion_response_fanout(
+        request_id, model_name, collector, list(range(n)), *stream_args, **options
+    )
+
+
+async def _completions(
+    request: CompletionRequest | BetaCompletionRequest, raw_request: Request
+):
+    # DeepSeek's completion parameters come with the beta request model;
+    # /v1/completions does not declare them, so it ignores them, as it
+    # always has.
+    beta = isinstance(request, BetaCompletionRequest)
+    route = "beta_completions" if beta else "completions"
     validate_model(request.model)
     _validate_chunked_receive(request.kv_transfer_params)
 
     try:
         effective_n = _coerce_n(request.n, request.temperature)
         _validate_return_token_ids(request.return_token_ids, request.stream)
+        if beta:
+            _check_beta_completion(request)
+        max_tokens = request.get_max_tokens()
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
-            max_tokens=request.get_max_tokens(),
+            # 0 (only /beta takes it) is answered without the engine, below;
+            # the other parameters are checked all the same.
+            max_tokens=max(max_tokens, 1),
             max_tokens_is_default=not any(
                 name in request.model_fields_set and getattr(request, name) is not None
                 for name in ("max_tokens", "max_completion_tokens")
@@ -2331,8 +2618,20 @@ async def completions(request: CompletionRequest, raw_request: Request):
             top_p=request.top_p,
             n=effective_n,
         )
+        echo, include_usage, usage_on_finish = "", False, False
+        if beta:
+            include_usage = bool((request.stream_options or {}).get("include_usage"))
+            # The deployment's streamed-usage shape, as Chat has it.
+            usage_on_finish = api_compatibility_for(
+                custom_message_encoder
+            ).usage_on_finish
+            if request.echo:
+                echo = await _echo_text(request)
         # Prefer pre-tokenized IDs; otherwise pass text to preprocessing.
-        prompt_or_tokens = request.get_prompt_or_tokens()
+        if beta and request.suffix is not None:
+            prompt_or_tokens = _fill_in_the_middle_prompt(request)
+        else:
+            prompt_or_tokens = request.get_prompt_or_tokens()
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
@@ -2348,7 +2647,16 @@ async def completions(request: CompletionRequest, raw_request: Request):
 
         # Streaming
         if request.stream:
-            if effective_n > 1:
+            if max_tokens == 0:
+                gen = _zero_token_stream(
+                    request_id,
+                    await _zero_token_output(request, prompt_or_tokens),
+                    effective_n,
+                    echo=echo,
+                    include_usage=include_usage,
+                    usage_on_finish=usage_on_finish,
+                )
+            elif effective_n > 1:
                 seq_ids, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request_fanout(
                         prompt_or_tokens,
@@ -2366,6 +2674,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     num_prompt_tokens,
                     cleanup_stream,
                     cleanup_request,
+                    echo=echo,
+                    include_usage=include_usage,
+                    usage_on_finish=usage_on_finish,
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
@@ -2385,6 +2696,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     num_prompt_tokens,
                     cleanup_stream,
                     cleanup_request,
+                    echo=echo,
+                    include_usage=include_usage,
+                    usage_on_finish=usage_on_finish,
                 )
             return StreamingResponse(
                 _client_stream(gen, request_id),
@@ -2392,7 +2706,18 @@ async def completions(request: CompletionRequest, raw_request: Request):
             )
 
         # Non-streaming
-        if effective_n > 1:
+        if max_tokens == 0:
+            output = await _zero_token_output(request, prompt_or_tokens)
+            resp = (
+                build_completion_response_multi(
+                    request_id, model_name, [output] * effective_n, echo=echo
+                )
+                if effective_n > 1
+                else build_completion_response(
+                    request_id, model_name, output, echo=echo
+                )
+            )
+        elif effective_n > 1:
             outputs = await _race_disconnect(
                 generate_async_fanout(
                     prompt_or_tokens,
@@ -2407,7 +2732,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
             )
             if not outputs:
                 raise RuntimeError("No output generated")
-            resp = build_completion_response_multi(request_id, model_name, outputs)
+            resp = build_completion_response_multi(
+                request_id, model_name, outputs, echo=echo
+            )
         else:
             final_output = await _run_nonstream_with_disconnect(
                 generate_async(
@@ -2425,7 +2752,9 @@ async def completions(request: CompletionRequest, raw_request: Request):
             if final_output is None:
                 raise RuntimeError("No output generated")
 
-            resp = build_completion_response(request_id, model_name, final_output)
+            resp = build_completion_response(
+                request_id, model_name, final_output, echo=echo
+            )
         _log_request_model("response", request_id, resp)
         return JSONResponse(content=resp.model_dump(mode="json"))
 
@@ -2433,10 +2762,10 @@ async def completions(request: CompletionRequest, raw_request: Request):
         # Client hung up; seq already aborted + popped. Nothing to return.
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})
     except ValueError as e:
-        logger.error(f"Validation error in completions: {e}")
+        logger.error(f"Validation error in {route}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.exception("Error in completions")
+        logger.exception("Error in %s", route)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -2478,7 +2807,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # Apply chat template
         from .protocol import ChatMessage
 
-        messages = [ChatMessage(**m) for m in openai_messages]
+        messages = check_chat_images(
+            [ChatMessage(**m) for m in openai_messages], tool_results=True
+        )
 
         merged_kwargs = dict(default_chat_template_kwargs)
         # The request's `thinking` was dropped on the floor here, so the model
@@ -2538,14 +2869,14 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         request_id = uuid.uuid4().hex[:24]
         set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
-        engine_input, prompt = await asyncio.to_thread(
-            _prepare_prompt,
-            messages,
-            merged_kwargs,
-            tools=anthropic_to_openai_tools(request.tools),
-            preserve_tool_call_arguments=preserve_tool_call_arguments,
-            max_tokens=sampling_params.max_tokens,
-            kv_transfer_params=kv_transfer_params,
+        engine_input, multimodal_data, starts_in_reasoning = (
+            await _prepare_engine_input(
+                messages,
+                merged_kwargs,
+                tools=anthropic_to_openai_tools(request.tools),
+                max_tokens=sampling_params.max_tokens,
+                kv_transfer_params=kv_transfer_params,
+            )
         )
 
         if request.stream:
@@ -2555,6 +2886,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
+                multimodal_data=multimodal_data,
             )
 
             async def generate_anthropic_stream():
@@ -2573,7 +2905,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 # it is the model's, resolved at startup -- the filter used to
                 # carry none and closed on any registered dialect's marker.
                 reasoning_filter = reasoning_channel(
-                    prompt_starts_in_reasoning(prompt),
+                    starts_in_reasoning,
                     template_kwargs=merged_kwargs,
                 ).stream()
                 tool_parser = ToolCallStreamParser(
@@ -2729,11 +3061,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         # Non-streaming response
         final_output = await _run_nonstream_with_disconnect(
-            generate_async(
+            _generate_nonstream(
                 engine_input,
+                multimodal_data,
                 sampling_params,
                 request_id,
-                kv_transfer_params=kv_transfer_params,
+                kv_transfer_params,
             ),
             raw_request,
             request_id,
@@ -2754,7 +3087,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # interleaving at that line.
         events = read_whole_blocks(
             reasoning_channel(
-                prompt_starts_in_reasoning(prompt),
+                starts_in_reasoning,
                 template_kwargs=merged_kwargs,
             ),
             tool_call_parser_cls,
@@ -2896,7 +3229,9 @@ async def responses_create(raw_request: Request):
         validate_history_tool_calls(openai_messages)
         from .protocol import ChatMessage
 
-        messages = [ChatMessage(**m) for m in openai_messages]
+        messages = check_chat_images(
+            [ChatMessage(**m) for m in openai_messages], tool_results=True
+        )
 
         merged_kwargs = dict(default_chat_template_kwargs)
         if isinstance(request.tool_choice, str):
@@ -2952,19 +3287,19 @@ async def responses_create(raw_request: Request):
         schema = schema_from_format((text_config or {}).get("format"), responses=True)
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
         set_request_id(request_id)
-        engine_input, prompt = await asyncio.to_thread(
-            _prepare_prompt,
-            messages,
-            merged_kwargs,
-            tools=openai_tools,
-            preserve_tool_call_arguments=preserve_tool_call_arguments,
-            max_tokens=sampling_params.max_tokens,
-            kv_transfer_params=kv_transfer_params,
+        engine_input, multimodal_data, starts_in_reasoning = (
+            await _prepare_engine_input(
+                messages,
+                merged_kwargs,
+                tools=openai_tools,
+                max_tokens=sampling_params.max_tokens,
+                kv_transfer_params=kv_transfer_params,
+            )
         )
 
         created_at = int(time.time())
         _reasoning = reasoning_channel(
-            prompt_starts_in_reasoning(prompt), template_kwargs=merged_kwargs
+            starts_in_reasoning, template_kwargs=merged_kwargs
         )
         await _configure_structured_output(
             sampling_params,
@@ -2973,6 +3308,7 @@ async def responses_create(raw_request: Request):
             tools=openai_tools,
             tool_choice=request.tool_choice,
             kv_transfer=kv_transfer_params,
+            multimodal=multimodal_data is not None,
         )
 
         _reasoning = structured_response_channel(_reasoning, schema)
@@ -2983,6 +3319,7 @@ async def responses_create(raw_request: Request):
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
+                multimodal_data=multimodal_data,
             )
 
             async def generate_responses_stream():
@@ -3096,11 +3433,12 @@ async def responses_create(raw_request: Request):
             )
 
         final_output = await _run_nonstream_with_disconnect(
-            generate_async(
+            _generate_nonstream(
                 engine_input,
+                multimodal_data,
                 sampling_params,
                 request_id,
-                kv_transfer_params=kv_transfer_params,
+                kv_transfer_params,
             ),
             raw_request,
             request_id,
@@ -3473,7 +3811,7 @@ def _setup_frontend(args) -> None:
     """Request log, tokenizer, chat template and model name: everything a
     front end needs before the engine exists (shared with front-end workers)."""
     global tokenizer, model_name, default_chat_template_kwargs, _request_logger
-    global custom_message_encoder
+    global custom_message_encoder, fim_format
     if args.request_log:
         _request_logger = logging.getLogger("atom.request_log")
         _request_logger.setLevel(logging.INFO)
@@ -3489,6 +3827,7 @@ def _setup_frontend(args) -> None:
 
     logger.info(f"Loading tokenizer from {args.model}...")
     tokenizer = load_tokenizer(args.model, args.trust_remote_code)
+    fim_format = resolve_fim_format(tokenizer)
     if args.chat_template:
         if os.path.isfile(args.chat_template):
             with open(args.chat_template, "r", encoding="utf-8") as f:

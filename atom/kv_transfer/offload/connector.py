@@ -37,8 +37,24 @@ def select_variant(config) -> str:
     return select_offload_layout(config)
 
 
-def _build_worker(config):
+def _in_process_variant(config) -> str:
+    """The family this in-process shell serves; ``dsv41`` it never does.
+
+    DeepSeek-V4.1's checkpoints restore only through the MP server's PAGE
+    units, and the dense codec would restore KV over a window ring it does
+    not carry.
+    """
     variant = select_variant(config)
+    if variant == "dsv41":
+        raise ValueError(
+            "DeepSeek-V4.1 offload runs only on the LMCache MP server: use the "
+            "lmcache_mp connector"
+        )
+    return variant
+
+
+def _build_worker(config):
+    variant = _in_process_variant(config)
     logger.info("lmcache_offload: worker family=%s", variant)
     if variant == "hybrid":
         from atom.kv_transfer.offload.hybrid.dsv4.connector import (
@@ -74,7 +90,7 @@ def _build_worker(config):
 
 
 def _build_scheduler(config):
-    variant = select_variant(config)
+    variant = _in_process_variant(config)
     logger.info("lmcache_offload: scheduler family=%s", variant)
     if variant == "hybrid":
         from atom.kv_transfer.offload.hybrid.dsv4.connector import (
