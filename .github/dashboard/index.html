@@ -67,7 +67,6 @@
     .filter-group { position: relative; }
     .filter-btn { background: var(--bg-secondary); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 12px; white-space: nowrap; }
     .filter-btn[data-filter="dashboard-mode"] { width: 116px; text-align: left; }
-    .dashboard-mode-group { position: absolute; right: calc(100% + var(--gap-sm)); top: 0; }
     .filter-btn:hover, .filter-btn.open { background: var(--bg-tertiary); color: var(--text-primary); }
     .filter-btn .count { background: var(--ui); color: #fff; border-radius: 10px; padding: 1px 6px; margin-left: 4px; font-size: 10px; }
     .filter-dropdown { display: none; position: absolute; top: 100%; left: 0; margin-top: 4px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 0; min-width: 200px; max-height: 300px; overflow-y: auto; z-index: 100; box-shadow: 0 8px 24px rgba(0,0,0,0.4); right: auto; }
@@ -515,6 +514,7 @@ const rawData = window.BENCHMARK_DATA || {
   entries: {},
 };
 const DASHBOARD_MODES = ['AgentX', 'Aggregated', 'Disaggregated'];
+const NON_AGENTX_MODES = ['Aggregated', 'Disaggregated'];
 const ATOMESH_DATA = {
   updatedAt: Date.UTC(2026, 6, 3, 7, 9, 0),
   backend: 'ATOMesh',
@@ -1271,7 +1271,8 @@ const standardIslOsl = [...new Set([
   ...Object.keys(historyMap).map(k => k.split('|')[2]),
   ...atomeshSummaryRows.filter(row => !isAgenticTraceRow(row)).map(row => row.islOsl),
 ])].filter(Boolean).sort();
-const allIslOsl = [AGENTIC_TRACE_FILTER, ...standardIslOsl];
+// Agentic traces live in the AgentX view, so the ISL/OSL filter offers only fixed sequences.
+const allIslOsl = [...standardIslOsl];
 const allConc = [...new Set([...Object.keys(historyMap).map(k => +k.split('|')[3]), ...atomeshSummaryRows.map(row => row.concurrency)].filter(Number.isFinite))].sort((a, b) => a - b);
 const allHardware = [...new Set([...Object.values(latestConfigs).map(cfg => cfg.hardware || 'unknown'), ...atomeshSummaryRows.map(row => row.hardware || 'unknown')])].sort(_lc);
 const defaultHardware = allHardware.includes('mi355x') ? 'mi355x' : (allHardware[0] || 'unknown');
@@ -1317,6 +1318,11 @@ function atomeshInteractivityMetric() {
     || ATOMESH_INTERACTIVITY_METRICS[0];
 }
 
+function agentxInteractivityMetric() {
+  return ATOMESH_INTERACTIVITY_METRICS.find(m => m.key === state.agentxIntvtyMetric)
+    || ATOMESH_INTERACTIVITY_METRICS[0];
+}
+
 const AGENTX_FRAMEWORKS = [
   { key: 'atom', label: 'ATOM single node', marker: 'triangle', color: { dark: '#4f8ff7', light: '#2563eb' } },
   { key: 'atomesh', label: 'ATOMesh P/D disaggregated', marker: 'circle', color: { dark: '#d9730d', light: '#d9730d' } },
@@ -1346,6 +1352,9 @@ const state = {
   trendModelKey: allTrendModelKeys[0] || '',
   atomeshTrendModel: '',
   atomeshIntvtyMetric: ATOMESH_INTERACTIVITY_METRICS[0].key,
+  agentxIntvtyMetric: ATOMESH_INTERACTIVITY_METRICS[0].key,
+  lastNonAgentxMode: 'Aggregated',
+  agentxShowAll: false,
   dataView: 'table',
   dataSort: { column: 'date', direction: 'desc' },
 };
@@ -1366,7 +1375,7 @@ function filteredConfigs() {
 // Filtered rows; without plottableOnly they include rows the selected x-axis cannot place.
 function agentxRows({ plottableOnly = true } = {}) {
   const f = state.filters;
-  const metric = atomeshInteractivityMetric();
+  const metric = agentxInteractivityMetric();
   return agentxAllRows.filter(row => (!plottableOnly || (Number.isFinite(metric.value(row)) && metric.frontierEligible(row)))
     && f.hardware.includes(row.hardware || 'unknown')
     && f.axModels.includes(row.model)
@@ -1706,18 +1715,28 @@ function getFilterState(id) {
 }
 
 function appendDashboardModeSelector(bar) {
+  const isAgentx = state.dashboardMode === 'AgentX';
   const group = document.createElement('div');
   group.className = 'filter-group dashboard-mode-group';
-  group.innerHTML = `<button class="filter-btn" data-filter="dashboard-mode">${state.dashboardMode} ▾</button>
+  group.innerHTML = `<button class="filter-btn" data-filter="dashboard-mode">${isAgentx ? 'AgentX' : 'Non-AgentX'} ▾</button>
     <div class="filter-dropdown" id="fd-dashboard-mode">
-      ${DASHBOARD_MODES.map(mode => `<label><input type="radio" name="dashboard-mode" value="${mode}" ${state.dashboardMode === mode ? 'checked' : ''}> ${mode}</label>`).join('')}
+      ${['AgentX', 'Non-AgentX'].map(mode => `<label><input type="radio" name="dashboard-mode" value="${mode}" ${(mode === 'AgentX') === isAgentx ? 'checked' : ''}> ${mode}</label>`).join('')}
     </div>`;
   bar.appendChild(group);
+  if (isAgentx) return;
+  const serving = document.createElement('div');
+  serving.className = 'filter-group';
+  serving.innerHTML = `<button class="filter-btn" data-filter="serving-mode">${state.dashboardMode} ▾</button>
+    <div class="filter-dropdown" id="fd-serving-mode">
+      ${NON_AGENTX_MODES.map(mode => `<label><input type="radio" name="serving-mode" value="${mode}" ${state.dashboardMode === mode ? 'checked' : ''}> ${mode}</label>`).join('')}
+    </div>`;
+  bar.appendChild(serving);
 }
 
 function setDashboardMode(mode) {
   if (!DASHBOARD_MODES.includes(mode) || state.dashboardMode === mode) return;
   state.dashboardMode = mode;
+  if (NON_AGENTX_MODES.includes(mode)) state.lastNonAgentxMode = mode;
   if (!dashboardTabs().includes(state.activeTab)) state.activeTab = 'performance';
   if (mode === 'AgentX' && !allAgentxHardware.includes(selectedHardware())) {
     state.filters.hardware = [allAgentxHardware.includes(defaultHardware) ? defaultHardware : allAgentxHardware[0]];
@@ -1842,6 +1861,10 @@ function bindFilterDropdownEvents(bar) {
     dd.addEventListener('change', (e) => {
       const filterId = dd.id.replace('fd-', '');
       if (filterId === 'dashboard-mode') {
+        if (e.target.type === 'radio') setDashboardMode(e.target.value === 'AgentX' ? 'AgentX' : state.lastNonAgentxMode);
+        return;
+      }
+      if (filterId === 'serving-mode') {
         if (e.target.type === 'radio') setDashboardMode(e.target.value);
         return;
       }
@@ -3393,6 +3416,8 @@ function syncToHash() {
   if (state.filters.axModels.length !== allAgentxModels.length) parts.push('axmodel=' + state.filters.axModels.join(','));
   if (state.filters.axFrameworks.length !== allAgentxFrameworks.length) parts.push('axfw=' + state.filters.axFrameworks.join(','));
   if (state.filters.axConc.length !== allAgentxConc.length) parts.push('axconc=' + state.filters.axConc.join(','));
+  if (state.agentxShowAll) parts.push('axall=1');
+  if (state.agentxIntvtyMetric !== ATOMESH_INTERACTIVITY_METRICS[0].key) parts.push('axintvty=' + state.agentxIntvtyMetric);
   parts.push('hardware=' + selectedHardware());
   if (state.activeTab !== 'performance') parts.push('tab=' + state.activeTab);
   if (state.atomeshIntvtyMetric !== ATOMESH_INTERACTIVITY_METRICS[0].key) parts.push('intvty=' + state.atomeshIntvtyMetric);
@@ -3404,13 +3429,21 @@ function readFromHash() {
   const hash = window.location.hash.slice(1);
   state.dashboardMode = 'AgentX';
   if (!hash) return;
+  let openAgentx = false;
   for (const part of hash.split('&')) {
     const [k, v] = part.split('=');
     if (!v) continue;
-    if (k === 'mode' && DASHBOARD_MODES.includes(v)) state.dashboardMode = v;
+    if (k === 'mode' && DASHBOARD_MODES.includes(v)) {
+      state.dashboardMode = v;
+      if (NON_AGENTX_MODES.includes(v)) state.lastNonAgentxMode = v;
+    }
     if (k === 'backend') state.filters.backends = v.split(',').filter(b => allBackends.includes(b));
     if (k === 'model') state.filters.models = v.split(',').filter(m => allModels.includes(m));
-    if (k === 'isl') state.filters.islOsl = v.split(',').filter(i => allIslOsl.includes(i));
+    if (k === 'isl') {
+      // Agentic traces moved to AgentX, so an old agentic-trace link opens AgentX.
+      if (v.split(',').includes(AGENTIC_TRACE_FILTER)) { openAgentx = true; continue; }
+      state.filters.islOsl = v.split(',').filter(i => allIslOsl.includes(i));
+    }
     if (k === 'conc') state.filters.conc = v.split(',').map(Number).filter(c => allConc.includes(c));
     if (k === 'hardware') {
       const hw = v.split(',')[0];
@@ -3418,6 +3451,8 @@ function readFromHash() {
     }
     if (k === 'axmodel') state.filters.axModels = v.split(',').filter(m => allAgentxModels.includes(m));
     if (k === 'axfw') state.filters.axFrameworks = v.split(',').filter(f => allAgentxFrameworks.includes(f));
+    if (k === 'axall') state.agentxShowAll = v === '1';
+    if (k === 'axintvty' && ATOMESH_INTERACTIVITY_METRICS.some(m => m.key === v)) state.agentxIntvtyMetric = v;
     if (k === 'axconc') state.filters.axConc = v.split(',').map(Number).filter(c => allAgentxConc.includes(c));
     if (k === 'intvty' && ATOMESH_INTERACTIVITY_METRICS.some(m => m.key === v)) state.atomeshIntvtyMetric = v;
     if (k === 'tab') {
@@ -3425,6 +3460,10 @@ function readFromHash() {
       document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === v));
       document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === 'tab-' + v));
     }
+  }
+  if (openAgentx) {
+    state.dashboardMode = 'AgentX';
+    syncToHash();
   }
 }
 
@@ -4509,6 +4548,21 @@ function renderAgentxKPICards() {
     </div>`;
 }
 
+function agentxPoints(rows, metric) {
+  return rows.filter(row => metric.frontierEligible(row) && metric.value(row) > 0)
+    .map(row => ({ x: metric.value(row), y: row.totalTputPerGpu, row }));
+}
+
+// InferenceX's rule: optimal = non-dominated on the selected axis, and on the P90
+// Interactivity axis also on the P90 E2E Normalized Interactivity frontier.
+function agentxFrontier(seriesRows, metric) {
+  const front = atomeshParetoFrontier(agentxPoints(seriesRows, metric));
+  const canonical = ATOMESH_INTERACTIVITY_METRICS[0];
+  if (metric.key === canonical.key) return front;
+  const optimal = new Set(atomeshParetoFrontier(agentxPoints(seriesRows, canonical)).map(p => p.row));
+  return front.filter(p => optimal.has(p.row));
+}
+
 function agentxChartSpecs(rows, metric) {
   const byModel = {};
   for (const row of rows) (byModel[row.model] = byModel[row.model] || []).push(row);
@@ -4516,10 +4570,10 @@ function agentxChartSpecs(rows, metric) {
     const datasets = [];
     const onFrontier = new Set();
     for (const fw of AGENTX_FRAMEWORKS) {
-      const points = modelRows.filter(row => agentxFramework(row) === fw)
-        .map(row => ({ x: metric.value(row), y: row.totalTputPerGpu, row }));
+      const seriesRows = modelRows.filter(row => agentxFramework(row) === fw);
+      const points = agentxPoints(seriesRows, metric);
       if (!points.length) continue;
-      const frontier = atomeshParetoFrontier(points);
+      const frontier = agentxFrontier(seriesRows, metric);
       frontier.forEach(p => onFrontier.add(p.row));
       datasets.push({
         label: fw.label,
@@ -4533,10 +4587,10 @@ function agentxChartSpecs(rows, metric) {
         showLine: frontier.length > 1,
         _framework: fw,
       });
-      const others = points.filter(p => !frontier.includes(p));
-      if (others.length) {
+      const others = points.filter(p => !onFrontier.has(p.row));
+      if (state.agentxShowAll && others.length) {
         datasets.push({
-          label: `${fw.label} (off frontier)`,
+          label: `${fw.label} (non-optimal)`,
           data: others,
           borderColor: agentxColor(fw, 0.35),
           backgroundColor: agentxColor(fw, 0.35),
@@ -4560,9 +4614,16 @@ function agentxIntvtyText(row, m) {
 }
 
 function bindAgentxAxisButtons(container) {
-  container.querySelectorAll('[data-atomesh-intvty-metric]').forEach(btn => {
+  container.querySelectorAll('[data-agentx-show-all]').forEach(btn => {
     btn.addEventListener('click', () => {
-      state.atomeshIntvtyMetric = btn.dataset.atomeshIntvtyMetric;
+      state.agentxShowAll = !state.agentxShowAll;
+      renderAgentxTab();
+      syncToHash();
+    });
+  });
+  container.querySelectorAll('[data-agentx-intvty-metric]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.agentxIntvtyMetric = btn.dataset.agentxIntvtyMetric;
       const summary = document.querySelector('#filter-bar .filter-summary');
       if (summary) summary.textContent = filterSummaryText();
       renderAgentxKPICards();
@@ -4575,10 +4636,11 @@ function bindAgentxAxisButtons(container) {
 function renderAgentxTab() {
   const container = document.getElementById('tab-performance');
   destroyChartsIn(container);
-  const metric = atomeshInteractivityMetric();
+  const metric = agentxInteractivityMetric();
   const axisSelector = `<div class="model-selector" style="margin-bottom:var(--gap-md);justify-content:flex-start">
     <span class="sel-label">X axis:</span>
-    ${ATOMESH_INTERACTIVITY_METRICS.map(m => `<button class="sel-btn ${m.key === metric.key ? 'active' : ''}" data-atomesh-intvty-metric="${escHTML(m.key)}" title="${escHTML(m.formula)}">${escHTML(m.label)}</button>`).join('')}
+    ${ATOMESH_INTERACTIVITY_METRICS.map(m => `<button class="sel-btn ${m.key === metric.key ? 'active' : ''}" data-agentx-intvty-metric="${escHTML(m.key)}" title="${escHTML(m.formula)}">${escHTML(m.label)}</button>`).join('')}
+    <button class="sel-btn ${state.agentxShowAll ? 'active' : ''}" data-agentx-show-all title="Also draw configs that are not on the Pareto frontier">Show non-optimal points</button>
   </div>`;
   const rows = agentxRows();
   const filteredRows = agentxRows({ plottableOnly: false });
@@ -4590,7 +4652,8 @@ function renderAgentxTab() {
     bindAgentxAxisButtons(container);
     return;
   }
-  const specs = agentxChartSpecs(rows, metric);
+  // All filtered rows go in: on the P90 Interactivity axis the E2E frontier needs every point.
+  const specs = agentxChartSpecs(filteredRows, metric).filter(spec => spec.datasets.length);
   const onFrontier = new Set(specs.flatMap(spec => [...spec.onFrontier]));
   const tableRows = filteredRows.slice().sort((a, b) => _lc(a.model, b.model)
     || _lc(agentxFramework(a).key, agentxFramework(b).key)
@@ -4598,7 +4661,7 @@ function renderAgentxTab() {
 
   let html = `<div class="section-container"><div class="section-header">
     <span class="section-title">AgentX · Token Throughput per Chip vs. ${escHTML(metric.label)}</span>
-    <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">Lines are each framework's Pareto frontier; faded points are dominated configs. ${escHTML(metric.label)} = ${escHTML(metric.formula)}.</span>
+    <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">Lines join each framework's optimal configs (Pareto frontier, InferenceX rule). ${escHTML(metric.label)} = ${escHTML(metric.formula)}.</span>
   </div>
   ${axisSelector}
   <div class="chart-grid">${specs.map(spec => `
@@ -4675,7 +4738,7 @@ function renderAgentxTab() {
         },
         scales: {
           x: { grid: chartGridOpts(), beginAtZero: true, title: { display: true, text: `${metric.label} (tok/s/user)`, color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
-          y: { grid: chartGridOpts(), beginAtZero: true, title: { display: true, text: 'Token Throughput per Chip (tok/s)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
+          y: { grid: chartGridOpts(), beginAtZero: true, title: { display: true, text: 'Token Throughput per Chip (tok/s)', color: C_TICK }, ticks: { color: C_TICK, callback: v => (v === 0 ? '0' : `${+(v / 1000).toFixed(1)}k`) }, grace: '10%' },
         },
         onClick: (_e, elems) => {
           if (!elems.length) return;
