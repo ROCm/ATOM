@@ -137,6 +137,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
+    # Non-PP engines: while any request waits on a connector load (a P/D
+    # receive, an offload or LMCache state load), block up to this many ms at
+    # each completion poll -- after a forward, or on an idle tick -- for a
+    # fresh one, so a load that landed during the forward is scheduled the next
+    # step rather than the one after. Each such step can take up to this much
+    # longer. 0 = off (the poll stays one step behind).
+    "ATOM_KV_POLL_FRESH_WAIT_MS": lambda: _nonnegative_int_env(
+        "ATOM_KV_POLL_FRESH_WAIT_MS", 0
+    ),
     # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
     # DCP decode rank owns into a GPU staging slot and send whole destination
     # pages instead of one RDMA descriptor per token. 0 = per-token path.
