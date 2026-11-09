@@ -4,8 +4,8 @@
 expert's units go. Called by the kernel on traced Int32 / trace-time Python ints and by the CPU test on Python ints
 (the same code). Only non-negative operands reach ``//``."""
 
-WIDE_NCH = 3        # >= 3 shared token chunks (> 32 rows): the wide schedule
-SH_EARLY = True     # wide: the shared expert's UG runs in the FFN front's idle CTAs (moe.ug_shared_early)
+WIDE_NCH = 3  # >= 3 shared token chunks (> 32 rows): the wide schedule
+SH_EARLY = True  # wide: the shared expert's UG runs in the FFN front's idle CTAs (moe.ug_shared_early)
 
 
 def sh_early(nch):

@@ -34,10 +34,11 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
 import device as hx
+import dims as D
 from attention import HID, T, e8m0_of, expf, inv_pow2, rsq
 
 F32, I32, I64, BF16 = fx.Float32, fx.Int32, fx.Int64, fx.BFloat16
-LAT = 512                  # the compressed latent (head dim)
+LAT = D.KV_DIM                  # the compressed latent (head dim)
 KEYS = 128                 # the index key
 RING = 7                   # compress_ring_slots
 CROW0 = 192    # first CTA of stage_crow (8 rows a CTA)
@@ -175,7 +176,7 @@ def stage_crow(c, r1):
         tot = hx.lload(red, F32)
         for ww in range_constexpr(1, 4):
             tot = tot + hx.lload(red + ww * 4, F32)
-        rr = rsq(tot * F32(1.0 / LAT) + F32(1e-20))
+        rr = rsq(tot * F32(1.0 / LAT) + F32(D.RMS_EPS))
         nrm = [(comp[e] * rr) * nw[e].to(F32) for e in range(4)]
         isr = d0 >= LAT - 64
         rot = []
@@ -209,7 +210,7 @@ def stage_crow(c, r1):
             sk = F32(0.0)
             for jj in range_constexpr(4):
                 sk = sk + key[jj] * key[jj]
-            rk = rsq(_lane_sum(sk) * F32(1.0 / KEYS) + F32(1e-20))
+            rk = rsq(_lane_sum(sk) * F32(1.0 / KEYS) + F32(D.RMS_EPS))
             kw = hx.gload(c["cknw"] + i64(l * 4) * 2, BF16, 4)
             kn = [((key[jj] * rk) * kw[jj].to(F32)).to(BF16).to(F32) for jj in range(4)]
             ratio2 = r1.select(I32(1), I32(2))

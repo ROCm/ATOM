@@ -24,16 +24,17 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
 import device as hx
+import dims as D
 
-T, HID, QL, KVD = 48, 5120, 1280, 512
+T, HID, QL, KVD = D.T_MAX, D.HID, D.Q_RANK, D.KV_DIM
 SS_LAYER_F32 = 2 * T   # per-layer ss region (f32 words): the q / kv sums of squares [2][T]
 NQKV = QL + KVD
-H, HD = 16, 512
+H, HD = D.HEADS, D.KV_DIM
 NQ = H * HD
 G, OR = 2, 1024
 NWOA, KWOA = G * OR, 8 * HD
-THREADS, CTAS = 256, 256
-REQ, ROWS, KEYS, CL, POOL, KP = 8, 6, 640, 16, 2048, 64
+THREADS, CTAS = D.THREADS, D.CTAS
+REQ, ROWS, KEYS, CL, POOL, KP = D.MAX_REQ, D.ROWS_PER_REQ, 640, D.CL, 2048, 64
 KC = KEYS // CL
 # the product's KV geometry (attention.py _keys / _key_row): a row's keys = its selected rows, then its window ring rows;
 # per-token kv_len mask, absolute pool rows, the ring-row KV write
@@ -46,7 +47,7 @@ HP = HD + 8
 F32, I32, BF16 = fx.Float32, fx.Int32, fx.BFloat16
 
 
-NORM_EPS = 1e-20   # q_norm / kv_norm eps (config.rms_norm_eps)
+NORM_EPS = D.RMS_EPS   # q_norm / kv_norm eps (config.rms_norm_eps)
 
 
 def rope_cs(c, r, fi):
@@ -692,7 +693,7 @@ def tp_allreduce(c, region, tag):
             wi = t * 3 + q
             col = (b // 4) * 80 + (b % 4) * 20 + 2 * (wi % 10)
             if fx.const_expr(NWD % 3 == 0 or q == 0):
-                hx.stx_dev(c["ytgt"] + (i64(wi // 10) * 5120 + i64(col)) * 2, wq)
+                hx.stx_dev(c["ytgt"] + (i64(wi // 10) * HID + i64(col)) * 2, wq)
             else:
                 if wi < NWD:   # the last thread's padding words: no row
-                    hx.stx_dev(c["ytgt"] + (i64(wi // 10) * 5120 + i64(col)) * 2, wq)
+                    hx.stx_dev(c["ytgt"] + (i64(wi // 10) * HID + i64(col)) * 2, wq)

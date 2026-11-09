@@ -27,13 +27,14 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
 import device as hx
+import dims as D
 from attention import e8m0_of, inv_pow2, ld_op, q8words, rsq
 
 F32, I32, BF16 = fx.Float32, fx.Int32, fx.BFloat16
-H, NTAP, KVD, ROPE0, NDL = 5120, 3, 512, 448, 3
+H, NTAP, KVD, ROPE0, NDL = D.HID, 3, D.KV_DIM, 448, D.DRAFT_LAYERS
 KA = NTAP * H                       # 15360
-WAVES, CTAS = 8, 256
-EPS = 1e-20   # config rms_norm_eps
+WAVES, CTAS = D.WAVES, D.CTAS
+EPS = D.RMS_EPS   # config rms_norm_eps
 
 
 def i64(x):

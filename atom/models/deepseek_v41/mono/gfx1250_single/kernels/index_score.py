@@ -23,11 +23,12 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
 import device as hx
+import dims as D
 import index_plan as IP
 from attention import CTAS, T
 
 F32, I32, I64 = fx.Float32, fx.Int32, fx.Int64
-HEADS, DIM = 32, 128
+HEADS, DIM = D.INDEX_HEADS, D.INDEX_DIM
 CHUNK, TOPK, SUB = IP.CHUNK, IP.TOPK, IP.SUB   # (a wave: SUB 16-column key tiles a task, their loads in flight together)
 TCOLS = SUB * CHUNK
 ONE4 = 0x7F7F7F7F                 # four E8M0 codes of 1.0

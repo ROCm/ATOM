@@ -24,13 +24,14 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import range_constexpr
 
 import device as hx
+import dims as D
 from flydsl.expr import gpu
 from attention import CTAS, T, e8m0_of, inv_pow2, ld_op, q8words
 
 F32, I32, BF16 = fx.Float32, fx.Int32, fx.BFloat16
 EK = 6144            # engram embedding width
 EG = EK // 32        # its 32-groups
-HC, HD5 = 4, 5120    # branches, hidden
+HC, HD5 = D.HC, D.HID    # branches, hidden
 EN = (HC + 1) * HD5  # 25600 kv columns
 NT = EN // 16        # N tiles
 

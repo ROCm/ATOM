@@ -34,9 +34,10 @@ from flydsl.expr.typing import Int64
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
 import device as hx
+import dims as D
 from device import _v, gptr, lptr
 
-ROWS, CPR, NB = 48, 5, 256
+ROWS, CPR, NB = D.T_MAX, 5, 256
 R = 16.0
 F32, I32, I64 = fx.Float32, fx.Int32, fx.Int64
 LN2 = 0.6931471805599453

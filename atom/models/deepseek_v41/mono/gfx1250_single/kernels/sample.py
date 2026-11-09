@@ -39,11 +39,12 @@ from flydsl.expr.typing import Int64
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
 import device as hx
+import dims as D
 import sample_common as S4
 from sample_common import (ROWS, CPR, NB, R, F32, I32, LN2, c32, i64, expf, log2f, lshr, I64MIN, hash32, skey,
                           latomic_max64, handoff, suffix_scan, crossing, UNITS, HB, roff, zload, poll_unit, xchg_hist)
 
-NREQ, ND = 8, 5
+NREQ, ND = D.MAX_REQ, D.DSPARK_W
 SPW = 8                      # sp words a row
 SEED_RES = 0x2545F491
 U_IDX = 0x40000000

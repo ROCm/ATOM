@@ -35,6 +35,7 @@ from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int64
 
 import device as hx
+import dims as D
 import layout as LY
 import front as FS
 import moe as MS
@@ -49,8 +50,8 @@ import engram as ES
 from attention import (CL, CTAS, KWOA, NWOA, QL, THREADS, handoff, i64, pf_rows, smem_layout, stage_A,
                          stage_C, stage_D, stage_E, stage_F_cluster, stage_kv, tp_allreduce)
 
-DRAFT_NE, DRAFT_TOPK = 128, 3
-DSPARK_W = 5          # the DSpark block width: a build's draft requests = its draft rows // 5
+DRAFT_NE, DRAFT_TOPK = D.DRAFT_EXPERTS, D.DRAFT_TOPK
+DSPARK_W = D.DSPARK_W          # the DSpark block width: a build's draft requests = its draft rows // 5
 TENTRY_ROW = LY.TARGET_ENTRY_ROW       # the layer-table row of the target entry's attention front (tables.StepTables: after 40 + 3 layers and the draft entry)
 
 FRONT_LDS_OFF = LY.FRONT_LDS                # keep the TP payload ([TR][20] f32 at LDS 0) intact
@@ -133,7 +134,7 @@ def entry_front(fp, sm, b, row, ne, topk):
     attention front of layer-table row `row` (its a* weights) -> axn / x8 / xs / the gates; R kept in LDS (first)."""
     nof = fx.Int32(0) != fx.Int32(0)
     tq = hx.opaque_v(fx.thread_idx.x)
-    cu = dict(t=tq, b=b, w=tq // 32, l=tq % 32, sm=sm + FRONT_LDS_OFF, rms_eps=1e-20, hc_eps=1e-6, norm_eps=1e-20,
+    cu = dict(t=tq, b=b, w=tq // 32, l=tq % 32, sm=sm + FRONT_LDS_OFF, rms_eps=D.RMS_EPS, hc_eps=1e-6, norm_eps=D.RMS_EPS,
               R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"), comb=fptr(fp, "dcomb"),
               fnh=ltab(fp, row, "afnh")(), fnl=ltab(fp, row, "afnl")(), hsc=ltab(fp, row, "ahsc")(),
               hbs=ltab(fp, row, "ahbs")(), nw=ltab(fp, row, "anw")(), gate=ltab(fp, row, "gate")(),
@@ -195,7 +196,7 @@ def iprefetch(kb):
         _ll.inline_asm(None, [], f"s_prefetch_inst_pc_rel {off}, null, 31", "", has_side_effects=True)
 
 
-def build(TR, rank, NL=40, ndr=3, trd=None, part="all", sources="", moe_ids="ids"):
+def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sources="", moe_ids="ids"):
     """The step kernel for TR target rows (TR // 6 requests) and trd draft rows (5 a request); NL target layers (NL < 40
     and ndr 0: a bring-up / shadow build of the first layers only). part: "all" (one launch), or the step as two launches
     on one stream: "target" (entry, target layers, head, sampling, verification) then "draft" (draft context, metadata,
@@ -394,7 +395,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all", sources="", moe_ids="ids
                             ix = isf.select(fx.Int32(FPTRS.index(n0) * 8), fx.Int32(FPTRS.index(n1) * 8))
                             return hx.sload64(fp + i64(ix))
                         tq = hx.opaque_v(fx.thread_idx.x)
-                        cu = dict(t=tq, b=b, w=tq // 32, l=tq % 32, sm=sm + FRONT_LDS_OFF, rms_eps=1e-20, hc_eps=1e-6, norm_eps=1e-20,
+                        cu = dict(t=tq, b=b, w=tq // 32, l=tq % 32, sm=sm + FRONT_LDS_OFF, rms_eps=D.RMS_EPS, hc_eps=1e-6, norm_eps=D.RMS_EPS,
                                   R=fsel("R", "Rout"), y=fsel("y1", "y2"), pre=fsel("pre", "npre"), post=fsel("post", "npost"),
                                   comb=fsel("comb", "ncomb"), fnh=fsel("fnh", "afnh"), fnl=fsel("fnl", "afnl"),
                                   hsc=fsel("hsc", "ahsc"), hbs=fsel("hbs", "ahbs"), nw=fsel("nw", "anw"),

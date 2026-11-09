@@ -30,14 +30,15 @@ from flydsl.expr.typing import Int64
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
 import device as hx
+import dims as D
 from device import _v, gptr
 from sample_common import I64MIN, c32, handoff, latomic_max64, skey, poll_unit, hash32, lshr, LN2, log2f
 
 SEED_D = 0x68E31DA4
 SPW = 8
 
-NREQ, TB, RK = 8, 5, 256          # requests, block positions, Markov rank
-VR = 32320                        # vocab rows a rank
+NREQ, TB, RK = D.MAX_REQ, D.DSPARK_W, 256          # requests, block positions, Markov rank
+VR = D.VR                        # vocab rows a rank
 NT = VR // 16
 ES = RK * 2 + 16                  # LDS row stride of the staged W1 rows (bytes)
 LX = 16 * ES                      # LDS: x_{k-1} ids [8] i32

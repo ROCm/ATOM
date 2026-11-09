@@ -6,17 +6,18 @@ the REINDEX layer's compacted context and key rows, and the scorer's task split.
 The kernel calls these on traced Int32 (``fx`` / ``I32`` below are FlyDSL's); the CPU test rebinds ``fx`` / ``I32`` to a
 plain-integer backend and runs the same code on Python ints, so it checks what the kernel computes. Only non-negative
 operands reach ``//`` (Python's floor and the device's truncation agree there)."""
+
 import flydsl.expr as fx
 
 I32 = fx.Int32
 
-SEG = 8192               # values a level-0 list's input (one CTA's LDS keys)
-KSEL, KBLK = 512, 2048   # the selection's k, the candidate blocks' k (layer 20)
-NCAND = KBLK             # REINDEX candidate blocks a row
-NLMAX = 3                # the deepest tree (IDX_LEVELS <= 3: n <= 1M)
-CHUNK = 128              # scorer columns a chunk
-SUB = 4                  # chunks a scorer task at most
-TOPK = 512               # rows a selection keeps (rows with a context <= TOPK are not scored)
+SEG = 8192  # values a level-0 list's input (one CTA's LDS keys)
+KSEL, KBLK = 512, 2048  # the selection's k, the candidate blocks' k (layer 20)
+NCAND = KBLK  # REINDEX candidate blocks a row
+NLMAX = 3  # the deepest tree (IDX_LEVELS <= 3: n <= 1M)
+CHUNK = 128  # scorer columns a chunk
+SUB = 4  # chunks a scorer task at most
+TOPK = 512  # rows a selection keeps (rows with a context <= TOPK are not scored)
 
 
 def cdiv(a, b):
@@ -56,8 +57,12 @@ def list_inputs_rt(n, lev, j, k, fan):
 
 def list_count_rt(n, lev, fan):
     """Tasks (lists) of a token at level lev: level 0 at least one; a higher level only while the one below has > 1."""
-    return (lev == 0).select(fx.max(lists(n, 0, fan), I32(1)),
-                             (lists_rt(n, fx.max(lev - 1, I32(0)), fan) > 1).select(lists_rt(n, lev, fan), I32(0)))
+    return (lev == 0).select(
+        fx.max(lists(n, 0, fan), I32(1)),
+        (lists_rt(n, fx.max(lev - 1, I32(0)), fan) > 1).select(
+            lists_rt(n, lev, fan), I32(0)
+        ),
+    )
 
 
 def rx_kept(bd):
@@ -80,7 +85,8 @@ def key_row(krow, bd):
 
 def score_sub(TR, ctas):
     """Chunks a scorer task (Python int): ~16 a row at a ~2k context; more a task only when TR x 16 exceeds one round of
-    CTAs (c8: 3 rounds -> 1); c1 / c2 keep one (a longer task only adds latency there)."""
+    CTAs (c8: 3 rounds -> 1); c1 / c2 keep one (a longer task only adds latency there).
+    """
     return next((s_ for s_ in range(1, SUB + 1) if TR * -(-16 // s_) <= ctas), SUB)
 
 

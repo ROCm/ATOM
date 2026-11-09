@@ -21,9 +21,10 @@ from flydsl.expr import gpu, range_constexpr
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
 import device as hx
+import dims as D
 # the LM-head weights (331 MB a rank) are streamed non-temporal: default caching evicted the layer loop's hot scratch
 
-T, HID, VR = 48, 5120, 32320
+T, HID, VR = D.T_MAX, D.HID, D.VR
 NT = VR // 16                 # 2020 vocab tiles
 F32, I32, BF16 = fx.Float32, fx.Int32, fx.BFloat16
 
@@ -109,5 +110,3 @@ def head_once_r(x, wb, out, t, l, w, sm, b, D, TW, NPH):
                     sacc = sacc + hx.lload(gbase + (((kq * TW + q) * 3 + n) * 32 + l) * 32, F32, 8)
                 for e in range_constexpr(8):
                     hx.gstore(out + (i64(n * 16 + l % 16) * VR + i64(tile * 16 + (l // 16) * 8 + e)) * 4, sacc[e])
-
-

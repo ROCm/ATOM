@@ -35,11 +35,12 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr, rocdl
 
 import device as hx
+import dims as D
 import moe_plan as MP
 import stamps
 from attention import q8words, bf, e8m0_of, handoff, inv_pow2
 
-H, I, TOPK, NE, CTAS = 5120, 576, 6, 384, 256
+H, I, TOPK, NE, CTAS = D.HID, D.MOE_I, D.TOPK, D.EXPERTS, D.CTAS
 UNIT, UGU, NUG, DNU, NDN = 1152, 160, 18, 5, 320
 EXPU = NUG * UGU + NDN * DNU               # 4480 units an expert
 MAXTOK, MROW, CROW, KMID = 16, 640, 32, 640

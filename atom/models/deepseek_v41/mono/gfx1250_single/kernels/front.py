@@ -34,10 +34,11 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
 import device as hx
+import dims as D
 from attention import q8words, bf, cluster_sync, e8m0_of, inv_pow2, pack4, rsq, to_e4m3
 from moe import sched_barrier
 
-T, H, NG, TG, CL, NE, TOPK = 48, 5120, 6, 8, 16, 384, 6
+T, H, NG, TG, CL, NE, TOPK = D.T_MAX, D.HID, 6, 8, D.CL, D.EXPERTS, D.TOPK
 
 
 def router(c):
@@ -147,7 +148,7 @@ def _engram_gate(c, rq, tok, g, p, w, l, c0, cs, seg2):
     live = tok < c["TR"]
     gate = []
     for j in range_constexpr(4):
-        rstd = rsq(tot[3 * j] * F32(1.0 / H) + F32(1e-20)) * rsq(tot[3 * j + 1] * F32(1.0 / H) + F32(1e-20))
+        rstd = rsq(tot[3 * j] * F32(1.0 / H) + F32(D.RMS_EPS)) * rsq(tot[3 * j + 1] * F32(1.0 / H) + F32(D.RMS_EPS))
         dot = tot[3 * j + 2] * rstd * F32(1.0 / (H ** 0.5))
         mag = fsqrt(fx.max(abs(dot), F32(1e-6)))
         sg = (dot < F32(0.0)).select(-mag, mag)
@@ -328,7 +329,7 @@ def front_C(c):
 def _grow(w, m, l, NE):
     """gate row of wave w's tile m, lane l (clamped to the NE rows: the draft router has 128)."""
     r = (w * 3 + m) * 16 + l % 16
-    return fx.min(r, I32(NE - 1)) if NE < 384 else r
+    return fx.min(r, I32(NE - 1)) if NE < D.EXPERTS else r
 
 
 @ASTRewriter.transform
@@ -346,7 +347,7 @@ def front_D(c):
         for k in range_constexpr(10):
             xb = hx.lload(sm + O_XN + ((l % 16) * CP + k * 32 + (l // 16) * 16) * 2, BF16, 16, align=16)
             acc = hx.wmma_bf16(gw[m][k], xb, acc)
-        if fx.const_expr(NE < 384):   # draft router (NE experts): tiles past NE computed on clamped rows, not stored
+        if fx.const_expr(NE < D.EXPERTS):   # draft router (NE experts): tiles past NE computed on clamped rows, not stored
             if (l % 16 < TG) & ((w * 3 + m) * 16 < NE):
                 hx.gstore(c["plog"] + i64(((g * CL + p) * TG + l % 16) * NE + (w * 3 + m) * 16 + (l // 16) * 8) * 4, acc)
         else:

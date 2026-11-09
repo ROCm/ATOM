@@ -28,10 +28,11 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
 import device as hx
+import dims as D
 from attention import CTAS, QL, HID, T, NORM_EPS, ld_op, mx_loop, rope_cs, rsq
 
 F32, I32, BF16 = fx.Float32, fx.Int32, fx.BFloat16
-HEADS, DIM = 32, 128
+HEADS, DIM = D.INDEX_HEADS, D.INDEX_DIM
 IQ_ROWS = HEADS * DIM            # 4096
 IW_SLICES = 32                   # K slices of weights_proj (5120 / 32 = 160 = 5 bf16 WMMA steps)
 IW_K = HID // IW_SLICES

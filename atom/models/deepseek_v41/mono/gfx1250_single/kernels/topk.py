@@ -17,12 +17,13 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
 import device as hx
+import dims as D
 import stamps
 import index_plan as IP
 from attention import T
 
 I32, F32 = fx.Int32, fx.Float32
-THREADS, WAVES = 256, 8
+THREADS, WAVES = D.THREADS, D.WAVES
 PER_THREAD = 32
 LDS_KEYS = THREADS * PER_THREAD          # 8192
 INT_MIN = -(2 ** 31)
