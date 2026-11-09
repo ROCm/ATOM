@@ -155,17 +155,14 @@ def test_published_decoder_tail_reuses_reserved_staging(
 
     if device == "cuda":
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            with monkeypatch.context() as patch:
-                patch.setattr(
-                    torch,
-                    "empty",
-                    lambda *a, **k: pytest.fail("capture allocated staging"),
-                )
-                for layer in range(3):
-                    source, _ = prefill_window(
-                        cache.ring_view(layer), tail, geo.ring_slots
-                    )
+        with torch.cuda.graph(graph), monkeypatch.context() as patch:
+            patch.setattr(
+                torch,
+                "empty",
+                lambda *a, **k: pytest.fail("capture allocated staging"),
+            )
+            for layer in range(3):
+                source, _ = prefill_window(cache.ring_view(layer), tail, geo.ring_slots)
         for value in (41, 73):
             for plane in cache.ring_view(2):
                 plane.fill_(value)
