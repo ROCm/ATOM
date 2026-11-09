@@ -33,6 +33,7 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "DeepseekV32MTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepSeekV4MTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "Glm5NextMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLMVllm",
     "Qwen3NextMTP": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration",

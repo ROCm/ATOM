@@ -225,15 +225,25 @@ def test_kpool_is_refused_when_the_pool_does_not_divide_the_block(monkeypatch):
         mod._check_unsupported(_vllm_config(_config(index_kpool=4), block_size=1022))
 
 
-def test_prefix_caching_and_kv_transfer_are_refused():
-    """Both move a request off the KDA state slot the pooled tail buffer is
-    keyed on, and neither migration knows the buffer exists."""
+def test_prefix_caching_is_refused_on_the_pooled_path(monkeypatch):
+    """Measured wrong under vLLM's align-mode KDA state migration with the
+    pooled indexer's KV layout; the dense path is not refused."""
     from atom.plugin.vllm.models import glm5_next as mod
 
+    monkeypatch.setattr(mod, "pooled_path_enabled", lambda _k: True)
     with pytest.raises(ValueError, match="prefix caching"):
         mod._check_unsupported(
-            _vllm_config(_config(index_kpool=1), prefix_caching=True)
+            _vllm_config(_config(index_kpool=4), prefix_caching=True)
         )
+    monkeypatch.setattr(mod, "pooled_path_enabled", lambda _k: False)
+    mod._check_unsupported(_vllm_config(_config(index_kpool=4), prefix_caching=True))
+
+
+def test_kv_transfer_is_refused():
+    """KV offloading/transfer assumes one cached row per token, which the
+    pooled index cache is not."""
+    from atom.plugin.vllm.models import glm5_next as mod
+
     with pytest.raises(ValueError, match="KV transfer"):
         mod._check_unsupported(
             _vllm_config(_config(index_kpool=1), kv_transfer=SimpleNamespace())
@@ -440,3 +450,108 @@ def test_prefill_rows_shorter_than_a_pool_attend_their_own_tokens():
     for row, pos in enumerate(rows_pos.tolist()):
         picked = sorted(t for t in out[row].tolist() if t >= 0)
         assert picked == list(range(pos + 1)), (row, picked)
+
+
+def _mtp(n=3, method="mtp"):
+    return SimpleNamespace(method=method, num_speculative_tokens=n)
+
+
+def test_mtp_is_allowed_and_other_speculation_is_refused(monkeypatch):
+    from atom.plugin.vllm.models import glm5_next as mod
+
+    monkeypatch.setattr(mod, "pooled_path_enabled", lambda _k: True)
+    mod._check_unsupported(_vllm_config(_config(), spec=_mtp()))
+    with pytest.raises(ValueError, match="'eagle3'"):
+        mod._check_unsupported(_vllm_config(_config(), spec=_mtp(method="eagle3")))
+
+
+def test_state_shape_widens_the_conv_window_for_draft_tokens():
+    """The model-level shape must match each KDA layer's own, which keeps the
+    conv inputs of the tokens a verification may roll back."""
+    from atom.plugin.vllm.models.glm5_next import _get_glm5_state_shape
+
+    conv0, state0 = _get_glm5_state_shape(_vllm_config(_config()))
+    conv3, state3 = _get_glm5_state_shape(_vllm_config(_config(), spec=_mtp(3)))
+    assert conv3 == (conv0[0] + 3, conv0[1])
+    assert state3 == state0
+
+
+def test_mtp_draft_is_registered_with_the_deepseek_mtp_contract():
+    from atom.plugin.vllm import model_wrapper as mw
+    from atom.plugin.vllm import register
+
+    assert mw._ATOM_MODEL_CLASSES["Glm5NextMTPModel"].endswith(
+        "glm5_next:Glm5NextMTPVllm"
+    )
+    for arches in (
+        mw._DEEPSEEK_MTP_ARCHES,
+        mw._MTP_MASK_INPUT_ARCH,
+        mw._MTP_DRAFT_MODEL_ARCHES,
+    ):
+        assert "Glm5NextMTPModel" in arches
+    assert "Glm5NextMTPModel" in register._VLLM_MODEL_REGISTRY_OVERRIDES
+
+
+def test_mtp_draft_builds_with_the_plugin_indexer_only(monkeypatch):
+    from atom.models import glm5_next as native
+    from atom.plugin.vllm.models import glm5_next as mod
+
+    seen = {}
+
+    def record_indexer_cls(self, *args, **kwargs):
+        seen["indexer_cls"] = native.Glm5NextIndexer
+
+    monkeypatch.setattr(mod.Glm5NextMTP, "__init__", record_indexer_cls)
+    original = native.Glm5NextIndexer
+    mod.Glm5NextMTPVllm(None)
+    assert seen["indexer_cls"] is mod.Glm5NextIndexerVllm
+    assert native.Glm5NextIndexer is original
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="runs the Triton kernels")
+def test_a_verification_matches_the_same_rows_decoded_one_at_a_time():
+    """The plugin decodes one row per request with the stash kernel and
+    verifies drafts with native's verification kernels, on the same ring. A
+    four-row verification must leave the pooled keys and the ring exactly as
+    four single-row decodes would. Request 0 closes pool 1 (positions 4-7) from
+    one ring row and three fresh rows; request 1 closes pool 2 (8-11) from two
+    of each."""
+    from atom.model_ops.glm5_next import kpool
+    from atom.model_ops.glm5_next.speculative import (
+        build_speculative_pool_candidates,
+        update_speculative_kpool_history,
+    )
+    from atom.plugin.vllm.attention.glm5_kpool_indexer import tail_ring_rows
+
+    dev, head_dim, pool, num_spec = "cuda", 128, 4, 3
+    ring = tail_ring_rows(pool, num_spec)
+    width = num_spec + 1
+    gen = torch.Generator(device=dev).manual_seed(0)
+
+    def rand(*shape, dtype=torch.bfloat16):
+        return torch.randn(*shape, device=dev, generator=gen).to(dtype)
+
+    verified = rand(2, 2, ring, head_dim)
+    stepped = verified.clone()
+    keys, gates = rand(2 * width, head_dim), rand(2 * width, head_dim)
+    ape = rand(pool, head_dim, dtype=torch.float32)
+    positions = torch.tensor([5, 6, 7, 8, 10, 11, 12, 13], device=dev)
+    cu_q = torch.tensor([0, width, 2 * width], device=dev, dtype=torch.int32)
+    slots = torch.tensor([0, 1], device=dev)
+
+    pooled, _ = build_speculative_pool_candidates(
+        verified, keys, gates, positions, cu_q, slots, ape, pool
+    )
+    update_speculative_kpool_history(
+        verified, keys, gates, positions, cu_q, slots, slots
+    )
+    for step in range(width):
+        rows = torch.tensor([step, width + step], device=dev)
+        one_row = kpool.kpool_decode_stash_and_pool(
+            stepped, keys[rows], gates[rows], positions[rows], slots, ape, pool
+        )
+        closes = positions[rows] % pool == pool - 1
+        torch.testing.assert_close(
+            pooled[rows][closes].float(), one_row[closes].float(), atol=2e-2, rtol=2e-2
+        )
+    assert torch.equal(verified, stepped)

@@ -40,6 +40,7 @@ from atom.models.glm5_next import (
     Glm5NextKDAAttention,
     _normalize_glm5_next_config,
 )
+from atom.models.glm5_next_mtp import Glm5NextMTP
 from atom.models.kimi_k3 import _text_config
 from atom.plugin.vllm.model_wrapper import ATOMMoEForCausalLM
 from atom.plugin.vllm.models.kimi_k3 import KimiKDAAttentionVllm
@@ -56,8 +57,13 @@ def _get_glm5_state_shape(
     vllm_config: VllmConfig,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     config = _glm5_text_config(vllm_config)
-    # GLM-5.3-Flash rejects speculative decoding (see _check_unsupported), so
-    # there is no draft-token dimension to size for.
+    # Must agree with the layers' own `get_state_shape`, which sizes the conv
+    # window for the draft tokens a verification carries.
+    num_spec = (
+        vllm_config.speculative_config.num_speculative_tokens
+        if vllm_config.speculative_config
+        else 0
+    )
     return MambaStateShapeCalculator.kda_state_shape(
         tp_world_size=vllm_config.parallel_config.tensor_parallel_size,
         num_heads=config.linear_num_value_heads,
@@ -65,7 +71,7 @@ def _get_glm5_state_shape(
         num_k_heads=config.linear_num_key_heads,
         head_k_dim=config.linear_key_head_dim,
         conv_kernel_size=config.linear_conv_kernel_dim,
-        num_spec=0,
+        num_spec=num_spec,
     )
 
 
@@ -76,15 +82,20 @@ def _get_glm5_state_dtype(vllm_config: VllmConfig) -> tuple[torch.dtype, torch.d
     )
 
 
+def _pool_size(vllm_config: VllmConfig) -> int:
+    return int(getattr(_glm5_text_config(vllm_config), "index_kpool", 1) or 1)
+
+
 def _check_unsupported(vllm_config: VllmConfig) -> None:
     """Refuse what the native GLM-5.3-Flash guard cannot see in plugin mode.
 
     The vLLM plugin does build an ATOM `Config` (atom/plugin/config.py), so
     `Config.__post_init__` and its GLM-5.3-Flash guard run -- but vLLM's PCP and
     DCP sizes are never forwarded into it, so that guard always sees 1 and would
-    admit both. Speculative decoding, prefix caching and KV transfer are refused
-    because this plugin path does not implement them for the pooled indexer.
-    An unsupported combination would otherwise start and produce wrong output.
+    admit both. KV transfer is refused because this plugin path does not
+    implement it for the pooled indexer, and speculative decoding other than
+    the checkpoint's own MTP layer is untested. An unsupported combination
+    would otherwise start and produce wrong output.
     """
     unsupported = []
     parallel = vllm_config.parallel_config
@@ -92,24 +103,30 @@ def _check_unsupported(vllm_config: VllmConfig) -> None:
         unsupported.append("PCP")
     if getattr(parallel, "decode_context_parallel_size", 1) > 1:
         unsupported.append("DCP")
-    if vllm_config.speculative_config is not None:
-        unsupported.append("speculative decoding")
+    speculative = vllm_config.speculative_config
+    method = getattr(speculative, "method", None)
+    if speculative is not None and method != "mtp":
+        unsupported.append(f"speculative decoding method {method!r}")
     if unsupported:
         raise ValueError(
             "GLM-5.3-Flash on the vllm-atom backend does not yet support "
             f"{', '.join(unsupported)}"
         )
 
-    # Prefix caching moves the KDA state off `mamba_cache_mode == "none"`, where
-    # each live request owns one state slot for its lifetime. Every pooled-index
-    # structure here is keyed on that slot, and vLLM's cross-block state
-    # migration knows nothing about them, so the state would be carried forward
-    # and the pooled rows silently left behind.
-    cache_config = vllm_config.cache_config
-    if getattr(cache_config, "enable_prefix_caching", False):
+    # Prefix caching switches the KDA state to `mamba_cache_mode="align"`, where
+    # a request's state moves to a new block at every block boundary. With the
+    # pooled indexer on, every request whose state moves (a prefill resumed at
+    # a block boundary, which align mode forces for any prompt past one block,
+    # or a decode crossing one) comes out wrong, before any cache hit: GSM8K
+    # 16-shot drops from 0.967 to 0.44. The dense indexer under the same mode is
+    # unaffected, and so is a request whose state never moves; what differs is
+    # vLLM's GLM-5.3-Flash KV layout, which only the pooled indexer selects.
+    if getattr(vllm_config.cache_config, "enable_prefix_caching", False) and (
+        pooled_path_enabled(_pool_size(vllm_config))
+    ):
         raise ValueError(
-            "GLM-5.3-Flash on the vllm-atom backend does not support prefix "
-            "caching; pass --no-enable-prefix-caching."
+            "GLM-5.3-Flash's pooled indexer on the vllm-atom backend does not "
+            "support prefix caching yet; pass --no-enable-prefix-caching."
         )
     # KV offloading/transfer assumes one cached row per token, which the pooled
     # index cache (tokens_per_state == index_kpool) is not.
@@ -125,8 +142,7 @@ def _check_unsupported(vllm_config: VllmConfig) -> None:
     # chunked-prefill boundaries pool-aligned); it always does for a
     # power-of-two pool and a block size that is a multiple of 128, but say so
     # rather than mis-address the cache if that ever stops holding.
-    config = _glm5_text_config(vllm_config)
-    index_kpool = int(getattr(config, "index_kpool", 1) or 1)
+    index_kpool = _pool_size(vllm_config)
     if pooled_path_enabled(index_kpool):
         block_size = vllm_config.cache_config.block_size
         if block_size % index_kpool != 0:
@@ -135,7 +151,7 @@ def _check_unsupported(vllm_config: VllmConfig) -> None:
                 f"({index_kpool}) to divide the KV block size ({block_size}). "
                 "Pass an explicit --block-size that it divides, or set "
                 "ATOM_GLM5_KPOOL=0 to run the dense path at or below "
-                f"index_topk ({getattr(config, 'index_topk', 2048)})."
+                f"index_topk ({getattr(_glm5_text_config(vllm_config), 'index_topk', 2048)})."
             )
 
 
@@ -321,3 +337,26 @@ class Glm5NextForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid):
         cls,
     ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.kda_state_copy_func()
+
+
+class Glm5NextMTPVllm(Glm5NextMTP):
+    """GLM-5.3-Flash's MTP draft (checkpoint layer 45) with the plugin indexer.
+
+    The draft layer is MLA plus a pooled indexer plus MoE, with no KDA. Its
+    indexer gets its own pooled cache and its own tail ring, so it needs nothing
+    from the target's state. Native `Glm5NextMLAAttention` resolves the indexer
+    class as a module global, swapped only for the duration of construction as
+    in `Glm5NextForConditionalGeneration_`.
+
+    vLLM passes the draft the target's positions (the hidden state's), which
+    is what native ATOM's MTP indexer computes as `positions - 1` from its own
+    convention, so the plugin indexer takes them unshifted.
+    """
+
+    def __init__(self, *args, **kwargs):
+        original_indexer_cls = glm5_next_base.Glm5NextIndexer
+        glm5_next_base.Glm5NextIndexer = Glm5NextIndexerVllm
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            glm5_next_base.Glm5NextIndexer = original_indexer_cls

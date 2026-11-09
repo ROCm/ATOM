@@ -45,6 +45,10 @@ from atom.model_ops.glm5_next.indexer import (
     _kpool_request_index,
     _kpool_write_completed_pools,
 )
+from atom.model_ops.glm5_next.speculative import (
+    build_speculative_pool_candidates,
+    update_speculative_kpool_history,
+)
 from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
@@ -346,46 +350,75 @@ def sparse_attn_indexer_kpool_plugin_mode(
     if has_decode:
         decode_meta = indexer_meta.decode
         bs = indexer_meta.num_decodes
-        if num_decode_tokens != bs:
-            raise NotImplementedError(
-                "GLM-5.3-Flash kpool does not support speculative decode; "
-                f"got {num_decode_tokens} decode tokens for {bs} requests"
-            )
+        # Under speculative decoding a request verifies its accepted token and
+        # its drafts in one step, and the builder hands the indexer one decode
+        # row per token, each with its own seq_len and its request's block
+        # table. Rows, not requests, are what is scored below.
+        rows = num_decode_tokens
         dec_slots = state_slots[:bs]
-        pos = positions[:bs].to(torch.int64)
-        pooled = kpool.kpool_decode_stash_and_pool(
-            tail_cache,
-            k[:bs],
-            gate_score[:bs],
-            positions[:bs],
-            dec_slots,
-            compress_ape,
-            index_kpool,
-        )
+        pos = positions[:rows].to(torch.int64)
+        if rows == bs:
+            pooled = kpool.kpool_decode_stash_and_pool(
+                tail_cache,
+                k[:bs],
+                gate_score[:bs],
+                positions[:bs],
+                dec_slots,
+                compress_ape,
+                index_kpool,
+            )
+            row_slots = dec_slots
+        else:
+            # Native ATOM's verification kernels: form the pool ending at each
+            # row from this step's rows and the ring, then write the rows into
+            # the ring. Rows of a rejected draft are overwritten by the next
+            # verification before anything reads them, which the ring's depth
+            # (`tail_ring_rows`) guarantees.
+            cu_q = indexer_meta.query_start_loc[: bs + 1]
+            pooled, row_req = build_speculative_pool_candidates(
+                tail_cache,
+                k[:rows],
+                gate_score[:rows],
+                positions[:rows],
+                cu_q,
+                dec_slots,
+                compress_ape,
+                index_kpool,
+            )
+            update_speculative_kpool_history(
+                tail_cache,
+                k[:rows],
+                gate_score[:rows],
+                positions[:rows],
+                cu_q,
+                dec_slots,
+                dec_slots,
+            )
+            row_slots = dec_slots[row_req]
         # The write is gated by the slot: -1 for a pool that has not closed,
         # which the aiter kernel skips. Same rule as the builder's compressed
         # slot mapping, computed here because only this call knows the pooled
         # rows it just produced.
-        closes = ((pos % index_kpool) == (index_kpool - 1)) & (dec_slots >= 0)
+        closes = ((pos % index_kpool) == (index_kpool - 1)) & (row_slots >= 0)
         pool_ids = torch.where(closes, pos // index_kpool, torch.full_like(pos, -1))
         slots = kpool.pool_slot_mapping(
             decode_meta.block_table,
             pool_ids,
-            torch.arange(bs, device=device, dtype=torch.int64),
+            torch.arange(rows, device=device, dtype=torch.int64),
             pool_rows,
         )
         indexer_k_quant_and_cache(
             pooled, kv_cache, slots, head_dim, scale_fmt, preshuffle=True
         )
 
-        seq_lens = decode_meta.seq_lens[:bs]
+        seq_lens = decode_meta.seq_lens[:rows]
         pool_ctx = (seq_lens.to(torch.int32) // index_kpool).contiguous()
         pool_max_len = -(-max_model_len // index_kpool)
-        logits = torch.empty((bs, pool_max_len), dtype=torch.float32, device=device)
+        logits = torch.empty((rows, pool_max_len), dtype=torch.float32, device=device)
         deepgemm_fp8_paged_mqa_logits(
-            q_fp8[:bs].view(bs, 1, q_fp8.shape[1], head_dim),
+            q_fp8[:rows].view(rows, 1, q_fp8.shape[1], head_dim),
             kv_cache.unsqueeze(-2),
-            weights[:bs],
+            weights[:rows],
             logits,
             pool_ctx,
             decode_meta.block_table,
@@ -393,20 +426,20 @@ def sparse_attn_indexer_kpool_plugin_mode(
             KVBlockSize=pool_rows,
             Preshuffle=True,
         )
-        pool_topk = torch.empty((bs, select_k), dtype=torch.int32, device=device)
+        pool_topk = torch.empty((rows, select_k), dtype=torch.int32, device=device)
         top_k_per_row_decode(
             logits,
             1,
             pool_ctx,
             pool_topk,
-            bs,
+            rows,
             logits.stride(0),
             logits.stride(1),
             k=select_k,
             stable=stable_topk,
         )
         kpool.expand_pools_and_append_tail(
-            pool_topk, seq_lens.to(torch.int32), index_kpool, out=topk_indices[:bs]
+            pool_topk, seq_lens.to(torch.int32), index_kpool, out=topk_indices[:rows]
         )
 
     if has_prefill:
