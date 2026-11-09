@@ -149,6 +149,7 @@ def test_renew_does_not_queue_behind_lookups_and_is_bounded(monkeypatch):
     try:
         for i in range(3):  # one query is being served, two are queued behind it
             lookup.submit(SimpleNamespace(id=i), str(i))
+        time.sleep(0.2)  # the worker is inside the first query, holding the client
         started = time.monotonic()
         assert lookup.renew(SimpleNamespace(id=9), 0, 256) == 0  # bounded wait
         assert time.monotonic() - started < 2.0
@@ -178,3 +179,39 @@ def test_close_does_not_wait_for_a_hung_query():
     lookup.close()
     release.set()
     assert time.monotonic() - started < 2.0
+
+
+def test_a_hung_store_call_does_not_keep_the_process_alive():
+    """The workers are daemon threads: a process that closed its lookup while an
+    RPC hangs still exits."""
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        import threading, time
+        from types import SimpleNamespace
+        from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
+
+        class Backend:
+            def lookup(self, seq, lookup_id=None):
+                threading.Event().wait()  # never returns
+            def renew(self, seq, start, end):
+                threading.Event().wait()
+
+        lookup = AsyncStoreLookup(Backend())
+        lookup.submit(SimpleNamespace(id=1), "1")
+        time.sleep(0.2)
+        lookup.close()
+        print("closed", flush=True)
+        """)
+    started = time.monotonic()
+    done = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert "closed" in done.stdout, done.stderr
+    assert time.monotonic() - started < 20

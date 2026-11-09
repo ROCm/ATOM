@@ -117,6 +117,12 @@ class ShareCacheRouter:
                 backup = self.backups.pop(h, None)
                 if backup is not None:
                     self.index[h] = backup
+                    # The promoted request now produces this prefix: if it too
+                    # leaves unprefilled, its release must drop the entry.
+                    self.produced.setdefault(backup[1], []).append(h)
+                    carried = self._backing.get(backup[1])
+                    if carried is not None and h in carried:
+                        carried.remove(h)
                 else:
                     del self.index[h]
         for h in self._backing.pop(seq_id, ()):

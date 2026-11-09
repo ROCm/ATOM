@@ -249,3 +249,19 @@ def test_the_backlog_report_skips_aborted_requests_and_bounds_its_scan(monkeypat
     engine, sent = _engine_with([live] * 100)
     engine._report_prefill_backlog()
     assert sent[-1] == ("PREFILL_BACKLOG", (0, 10_000))  # 10 scanned, 90 extrapolated
+
+
+def test_a_promoted_backup_that_also_aborts_takes_the_entry_with_it():
+    """A owns a cold prefix and B is its backup. A aborts, B is promoted; B then
+    aborts before completing: nothing may keep crediting a prefix neither
+    computed."""
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
+    backlog, reqs = [0, 0], [0, 0]
+    first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
+    backlog[first.rank] = 10_000_000
+    _route(router, _seq("B", PREFIX), backlog, reqs)
+    router.release("A")
+    router.release("B")
+    assert not router.index and not router.backups
+    router.select(_seq("C", PREFIX + [9] * 2_000), [0, 0], [0, 0])
+    assert router.charge("C") == 0  # the prefix is cold again

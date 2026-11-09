@@ -9,7 +9,10 @@ served (`backend_lock`), never for the queue behind it.
 """
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import queue
+import threading
+import time
+from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from threading import Lock, RLock
 
@@ -23,20 +26,67 @@ RENEW_TIMEOUT_S = 1.0
 FALLBACK_LOOKUP_TIMEOUT_S = 2.0
 
 
+class _DaemonExecutor:
+    """One worker thread that cannot hold the interpreter's exit.
+
+    A `ThreadPoolExecutor` worker is joined at interpreter shutdown, and
+    cancelling a running future does not interrupt its Store RPC, so a hung call
+    would keep the engine process alive after `close()`. A daemon thread does
+    not.
+    """
+
+    def __init__(self, name: str) -> None:
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._closed = False
+        threading.Thread(target=self._run, name=name, daemon=True).start()
+
+    def submit(self, fn, *args) -> Future:
+        future: Future = Future()
+        if self._closed:
+            future.cancel()
+            return future
+        self._queue.put((future, fn, args))
+        # Hand the GIL over so the worker starts the call now, as starting a
+        # thread would have: a Store query is mostly waiting on the network.
+        time.sleep(0)
+        return future
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            future, fn, args = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(fn(*args))
+            except BaseException as exc:  # noqa: BLE001  # handed to the waiter
+                future.set_exception(exc)
+
+    def shutdown(self) -> None:
+        """Cancel what has not started; the worker may still be inside a call."""
+        self._closed = True
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is not None:
+                item[0].cancel()
+        self._queue.put(None)
+
+
 class AsyncStoreLookup:
     def __init__(self, backend, capacity=4096):
         self.backend = backend
         self.capacity = capacity
         self.lock = RLock()
-        self.executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="store-query"
-        )
+        self.executor = _DaemonExecutor("store-query")
         # Renewals ride their own worker so a burst of arrival-time queries
         # cannot queue one behind it; the lock keeps the synchronous Store
         # client (and the pool state around it) to one call at a time.
-        self.renew_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="store-renew"
-        )
+        self.renew_executor = _DaemonExecutor("store-renew")
         self.backend_lock = Lock()
         self.pending = {}
         self.discarded = set()
@@ -175,6 +225,6 @@ class AsyncStoreLookup:
             for f in self.pending.values():
                 f.cancel()
             self.pending.clear()
-        # Not waited for: a hung Store RPC must not hold engine exit.
-        self.executor.shutdown(wait=False, cancel_futures=True)
-        self.renew_executor.shutdown(wait=False, cancel_futures=True)
+        # Daemon workers: a hung Store RPC does not hold engine exit.
+        self.executor.shutdown()
+        self.renew_executor.shutdown()
