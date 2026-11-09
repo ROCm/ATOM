@@ -239,4 +239,5 @@ def run_staged_pipeline(
             staging_buffer.free_event_valid = False
         raise
     finally:
-        if used_buffer and buffer_safe_to_release and release_buffer is not N
+        if used_buffer and buffer_safe_to_release and release_buffer is not None:
+            release_buffer(staging_buffer)
