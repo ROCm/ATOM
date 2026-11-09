@@ -3888,6 +3888,7 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
     seq = SimpleNamespace(
         id=730,
         status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
+        block_table=[1],
         num_cached_tokens=4,
         offload_joint=OffloadJointRecord(),
     )

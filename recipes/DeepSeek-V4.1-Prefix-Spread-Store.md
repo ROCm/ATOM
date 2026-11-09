@@ -33,7 +33,8 @@ export ATOM_FRONTEND_PREFIX_HASH=1
 export OFFLOAD_MIN_LOAD_TOKENS=512
 export OFFLOAD_MIN_SAVE_TOKENS=512
 export OFFLOAD_MAX_PENDING_SAVES=8
-export OFFLOAD_PROFILE=1
+# One RDMA queue pair per endpoint: the Store client's transfers share the
+# NIC with the model's own traffic, and more pairs only add contention.
 export MC_NUM_QP_PER_EP=1
 unset ATOM_DP_SESSION_AFFINITY
 ```
@@ -58,7 +59,5 @@ Before interpreting throughput, verify positive `loaded_tokens`, zero
 Finding a Store key is not proof that its KV was loaded. Keep request seeds,
 GPU assignment, prefill budget, HBM memory fraction and warmup identical across
 comparisons.
-
-Measured results for this recipe are in the PR description, not in the repo.
 
 Native Store lookup is synchronous. KV restoration starts at admission.

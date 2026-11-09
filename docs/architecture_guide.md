@@ -65,7 +65,7 @@ A request flows through the system in ten steps:
 
 2. **`InputOutputProcessor.preprocess()`** — each prompt is tokenized via the HuggingFace tokenizer. A `Sequence` object is created to track the request's state, timing, and block allocation. `arrive_time` is recorded.
 
-3. **`CoreManager.add_request()`** — the list of `Sequence` objects is serialized with `pickle` and sent over a ZMQ `ROUTER` socket. When multiple DP ranks are active, requests are routed by a configurable load-balancing strategy (`least_requests` by default; `round_robin` and `least_tokens` also available).
+3. **`CoreManager.add_request()`** — the list of `Sequence` objects is serialized with `pickle` and sent over a ZMQ `ROUTER` socket. When multiple DP ranks are active, requests are routed by a configurable load-balancing strategy (`least_requests` by default; `round_robin`, `least_tokens` and `prefix_spread` also available).
 
 4. **`EngineCore.process_input_sockets()`** — an I/O thread on the `EngineCore` process receives the serialized data on a ZMQ `DEALER` socket, deserializes it, and places the sequences into the `input_queue`.
 

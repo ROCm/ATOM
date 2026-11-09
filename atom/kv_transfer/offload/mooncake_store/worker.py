@@ -161,7 +161,8 @@ def _head_first_windows(start: int, end: int, size: int) -> list[range]:
 
 
 class MooncakeStoreOffloadConnector(DenseOffloadConnector):
-    """Dense offload worker whose tier is a Mooncake Store, reached directly."""
+    """Offload worker (dense KV, or V4.1 PAGEs) whose tier is a Mooncake Store,
+    reached directly."""
 
     def __init__(self, config: Any) -> None:
         super().__init__(config)

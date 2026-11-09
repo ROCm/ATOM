@@ -278,7 +278,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             try:
                 groups = self._native_block_ids(req, start, end, loading=loading)
                 spec = AtomMPTransferSpec(
-                    token_ids=list(req.token_ids),
+                    token_ids=req.token_ids,
                     block_ids=groups,
                     start=start,
                     end=end,

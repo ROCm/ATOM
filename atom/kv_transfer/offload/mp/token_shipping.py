@@ -13,7 +13,7 @@ Here the scheduler (`TokenShipper`) sends only the tokens past what the
 workers already hold, as an `array('i')` slice (it pickles as raw bytes), in a
 `ShippedTokens` that rides in `LMCacheReqMeta.token_ids`. Each worker shell
 (`WorkerTokens`) appends it to its own `array('i')` copy of the request's
-prefix (4 bytes a token) and hands the transfer a copy of the part it covers.
+prefix (4 bytes a token) and hands the transfer the list it covers.
 
 The scheduler only counts a shipment as delivered once the metadata carrying it
 was built (`begin` / `commit` / `rollback`): a build that raises after shipping
@@ -101,7 +101,7 @@ class WorkerTokens:
 
     def resolve(self, metadata: Any) -> None:
         """Drop finished requests' copies, and replace each request's
-        `ShippedTokens` with its token prefix (an `array('i')`)."""
+        `ShippedTokens` with its token prefix (a fresh list)."""
         held = self._held
         for req_id in getattr(metadata, "token_drops", ()) or ():
             held.pop(req_id, None)
@@ -128,9 +128,10 @@ class WorkerTokens:
                     f"LMCache MP token copy for {req.req_id!r} holds "
                     f"{len(tokens)} tokens, the transfer needs {shipped.end}"
                 )
-            # A copy, not the held array: the transfer thread reads it after
-            # later shipments have extended the held one.
-            req.token_ids = tokens[: shipped.end]
+            # A fresh list (what `AtomMPTransferSpec.token_ids` is), boxed once
+            # here in C and private to this transfer: the thread that reads it
+            # runs after later shipments have extended the held array.
+            req.token_ids = tokens[: shipped.end].tolist()
 
 
 __all__ = ["ShippedTokens", "TokenShipper", "WorkerTokens"]

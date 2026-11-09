@@ -345,7 +345,8 @@ class CoreManager:
         self._rank_routed_total = [0] * self.global_engine_count
         # Authoritative local load per rank. Request count is in-flight until
         # finish/abort; token count is queued/in-flight PREFILL work and is
-        # released as soon as the first model output proves prefill completed.
+        # released as soon as the first model output proves prefill completed
+        # (under prefix_spread, by the finished sequence if no token came).
         # Guarded by _lb_lock because dispatch runs on the request thread while
         # completion/release runs on the per-rank output threads.
         self._rank_reqs = [0] * self.global_engine_count
@@ -1495,7 +1496,8 @@ class CoreManager:
     def _select_dp_rank_for_seq_locked(
         self, seq: Sequence, explicit_rank: int | None
     ) -> int:
-        """Route one sequence using explicit hint, strict owner, then load.
+        """Route one sequence using explicit hint, then `prefix_spread` when it
+        is the strategy, else strict session owner, then load.
 
         This intentionally matches SGLang Model Gateway's agentic routing
         semantics: a stable correlation/session id selects one DP rank, and
@@ -1525,10 +1527,10 @@ class CoreManager:
                 )
             return self._record_dp_route_locked("explicit_total", explicit_rank)
 
-        session_id = getattr(seq, "dp_session_id", None)
-        parent_id = getattr(seq, "dp_parent_session_id", None)
         if self._prefix_router is not None:
             return self._select_prefix_spread_locked(seq)
+        session_id = getattr(seq, "dp_session_id", None)
+        parent_id = getattr(seq, "dp_parent_session_id", None)
         if not self._dp_session_affinity_enabled or not session_id:
             rank = self._select_dp_rank_locked()
             return self._record_dp_route_locked("load_balanced_total", rank)
@@ -1565,7 +1567,9 @@ class CoreManager:
             self._select_dp_rank_locked,
         )
         if route.decision == "prefix_moved_total":
-            self._dp_route_counters["prefix_moved_tokens"] += route.moved_tokens
+            self._dp_route_counters[
+                PrefixSpreadRouter.MOVED_TOKENS
+            ] += route.moved_tokens
         return self._record_dp_route_locked(route.decision, route.rank)
 
     def get_dp_router_statistics(self) -> dict:
@@ -1652,12 +1656,12 @@ class CoreManager:
         Idempotent: a seq is only charged once and released once, so a repeated
         call (e.g. finish followed by abort) is a no-op.
 
-        `route=False` (an abort, on the API thread) leaves the prefix router
-        alone. Its state moves only on the output threads, in order with the
-        STREAM that completes the prefill: an abort racing that STREAM would
-        otherwise see the request still prefilling and drop prefix entries its
-        prefill did produce. The terminal output the abort leads to releases
-        it there.
+        `route=False` (an abort on the API thread, and the finished-STREAM path
+        on the output thread) leaves the prefix router alone: it is released by
+        the finished sequence (`_release_terminal_seq`), which knows whether its
+        prefill completed. A release racing the STREAM that completes the
+        prefill would otherwise see the request still prefilling and drop
+        prefix entries its prefill did produce.
         """
         with self._lb_lock:
             self._release_seq_load_locked(seq_id, route=route)

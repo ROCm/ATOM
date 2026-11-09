@@ -1021,6 +1021,8 @@ def fake_lmcache_modules(monkeypatch):
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
+    # The fake server below runs on 8-token chunks; the configured one must match.
+    monkeypatch.setenv("LMCACHE_CHUNK_SIZE", "8")
 
 
 class _WorkerAdapter:
@@ -2103,8 +2105,8 @@ def test_incremental_tokens_round_trip_through_the_worker_shell():
         _send(shell, save)
     assert sizes == [256, 256, 0, 232]
     assert [len(t) for t in received] == [256, 512, 768, 512, 1000]
-    assert all(list(t) == list(range(len(t))) for t in received)
-    assert all(type(t) is array.array for t in received)
+    assert all(t == list(range(len(t))) for t in received)
+    assert all(type(t) is list for t in received)
     # Raw bytes on the wire, not a pickled list of ints.
     assert len(pickle.dumps(save.token_ids)) < 232 * 4 + 200
 
@@ -2218,3 +2220,15 @@ def test_drops_reach_the_workers_without_a_transfer():
     assert meta.has_work()
     shell.start_load_kv(meta)
     assert 7 not in shell._tokens._held
+
+
+def test_a_chunk_configured_differently_from_the_mp_server_stops_startup(monkeypatch):
+    """DP routing predicts loads from the configured chunk, so a worker whose
+    server runs on another one refuses to start."""
+    monkeypatch.setenv("LMCACHE_CHUNK_SIZE", "256")
+    adapter = SimpleNamespace(lmcache_tokens_per_chunk=512)
+    with pytest.raises(ValueError, match="must match the server"):
+        deployment.require_chunk_matches_server(adapter, _config())
+    deployment.require_chunk_matches_server(
+        SimpleNamespace(lmcache_tokens_per_chunk=256), _config()
+    )

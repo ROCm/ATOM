@@ -19,6 +19,8 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
+from atom.model_engine.prefix_spread import PrefixSpreadRouter
+
 Snapshot = dict[str, Any]
 SnapshotState = tuple[Snapshot, int, float]
 
@@ -203,18 +205,21 @@ class _AtomMetricsCollector:
             metric.add_metric([], float(value))
             yield metric
 
-        if "prefix_owner_total" in dp_router:
+        decisions = PrefixSpreadRouter.DECISIONS
+        if all(key in dp_router for key in decisions):
             # Present only under `--dp-load-balance prefix_spread`.
             routed = CounterMetricFamily(
                 "atom:dp_prefix_route",
-                "Prefix-spread placements by decision: owner (kept on the rank "
-                "holding the prefix), moved (to an idle rank that loads it from "
-                "the tier) or cold (no known prefix).",
+                "Prefix-spread placement decisions (not completed loads): owner "
+                "(kept on the rank holding the prefix), moved (placed on another "
+                "rank; where the tier holds the prefix and admission finds KV "
+                "for it, that rank restores it there) or cold (no known prefix).",
                 labels=["decision"],
             )
-            for decision in ("owner", "moved", "cold"):
+            for key in decisions:
                 routed.add_metric(
-                    [decision], float(dp_router.get(f"prefix_{decision}_total", 0))
+                    [key.removeprefix("prefix_").removesuffix("_total")],
+                    float(dp_router[key]),
                 )
             yield routed
             moved_tokens = CounterMetricFamily(
@@ -222,7 +227,9 @@ class _AtomMetricsCollector:
                 "Prefix tokens credited to moved prefix-spread requests at "
                 "placement (an estimate, not completed restores).",
             )
-            moved_tokens.add_metric([], float(dp_router.get("prefix_moved_tokens", 0)))
+            moved_tokens.add_metric(
+                [], float(dp_router.get(PrefixSpreadRouter.MOVED_TOKENS, 0))
+            )
             yield moved_tokens
 
         metric = CounterMetricFamily(

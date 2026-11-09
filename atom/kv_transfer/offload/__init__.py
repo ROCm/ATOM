@@ -67,8 +67,10 @@ KVConnectorFactory.register(
     # One Mooncake Store for every DP rank.
     shared_tier=True,
     chunk_tokens="atom.kv_transfer.offload.mooncake_store.config:store_chunk_tokens",
-    # V4.1 sources its complete PAGE codec from the region map.
-    reads_block_regions=True,
+    # Dense layout: the codec builds from `KVCacheTensor`s and never reads the
+    # region map; V4.1's PAGE layout does (`topology_reads_block_regions`
+    # refines this by layout, as for `lmcache_offload`).
+    reads_block_regions=False,
     # Dense and PAGE codecs preserve all planes, including FP4 index scales.
     copies_whole_block_regions=True,
 )

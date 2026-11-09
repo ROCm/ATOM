@@ -380,7 +380,9 @@ class KVConnectorFactory:
     def _leaf_reads_block_regions(cls, connector: str, config: Any) -> bool:
         if cls._reads_block_regions.get(connector, True):
             return True
-        if connector == "lmcache_offload":
+        if cls._offload.get(connector, False):
+            # An offload tier reads the map only on a PAGE layout; the dense
+            # codec builds from the `KVCacheTensor`s.
             from atom.kv_transfer.offload.config import select_offload_layout
 
             return select_offload_layout(config) != "dense"

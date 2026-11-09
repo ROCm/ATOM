@@ -37,8 +37,10 @@ class PrefixSpreadRouter:
     STRIDE_TOKENS = 4096
     CAP = 1 << 17
 
-    # Route counters `select` returns, for `CoreManager`'s route statistics.
+    # Route counters `select` returns, for `CoreManager`'s route statistics and
+    # the metrics exporter.
     DECISIONS = ("prefix_owner_total", "prefix_moved_total", "prefix_cold_total")
+    MOVED_TOKENS = "prefix_moved_tokens"
 
     def __init__(
         self, idle_tokens: int, tier: OffloadTierProfile, max_seqs: int
@@ -147,10 +149,10 @@ class PrefixSpreadRouter:
           this is what lets the request reuse it from HBM.
         """
         chain = getattr(seq, "prompt_hash_chain", None)
-        hits, owner, source = self._rank_hits(chain, len(rank_tokens))
+        hits, owner, _source = self._rank_hits(chain, len(rank_tokens))
         if owner is None:
             rank = lightest()
-            self._record(chain, rank, seq.id, 0, None)
+            self._record(chain, rank, seq.id, 0)
             return Route(rank, "prefix_cold_total")
 
         # An owner is a rank holding a sampled part, so `hit` > 0.
@@ -162,16 +164,19 @@ class PrefixSpreadRouter:
                 rank = target
 
         local = hits.get(rank, 0)
-        # The tier holds the prefix only once its source finished prefilling,
-        # and the connector loads only a rest of at least its load threshold.
-        loaded = (
-            self.tier.loadable_tokens(local, hit, seq.num_prompt_tokens)
-            if self._tier_holds(chain, hit)
-            else 0
-        )
-        est_hit = hit if rank == owner else local + loaded
+        if rank == owner:
+            est_hit = hit
+        else:
+            # The tier serves the prefix once some request finished prefilling
+            # it, and the connector loads only what clears its load threshold.
+            loaded = (
+                self.tier.loadable_tokens(local, hit, seq.num_prompt_tokens)
+                if self._tier_holds(chain, hit)
+                else 0
+            )
+            est_hit = local + loaded
         self._est_hit[seq.id] = est_hit
-        self._record(chain, rank, seq.id, est_hit, source)
+        self._record(chain, rank, seq.id, est_hit)
         if rank == owner:
             return Route(rank, "prefix_owner_total")
         return Route(rank, "prefix_moved_total", max(0, est_hit - local))
@@ -183,10 +188,10 @@ class PrefixSpreadRouter:
         chain = getattr(seq, "prompt_hash_chain", None)
         if chain is None or not 0 <= rank < n_ranks:
             return
-        hits, _owner, source = self._rank_hits(chain, n_ranks)
+        hits, _owner, _source = self._rank_hits(chain, n_ranks)
         local = hits.get(rank, 0)
         self._est_hit[seq.id] = local
-        self._record(chain, rank, seq.id, local, source)
+        self._record(chain, rank, seq.id, local)
 
     def _idle_target(
         self,
@@ -266,7 +271,7 @@ class PrefixSpreadRouter:
                 break
         return hits, owner, source
 
-    def _record(self, chain, rank: int, seq_id, hit: int, hit_source) -> None:
+    def _record(self, chain, rank: int, seq_id, hit: int) -> None:
         """Record that `rank` holds this prompt's sampled prefix.
 
         Each entry names the request whose prefill puts that part on the rank:
@@ -308,7 +313,12 @@ class PrefixSpreadRouter:
                 # prefix locally. It joins that producer's ordered waiters.
                 producer = holders[rank]
             elif reused:
-                producer = holders.pop(rank, hit_source)
+                # A rank that holds the part keeps its holder. One that does
+                # not is loading it from the tier for this request, which then
+                # produces it there: naming the source on another rank would
+                # leave this rank's entry to a request that never computes on
+                # it.
+                producer = holders.pop(rank, seq_id)
             else:
                 holders.pop(rank, None)
                 producer = seq_id

@@ -45,6 +45,20 @@ def _storage_kv_transfer_config(config: Any) -> dict[str, Any]:
     return kvc
 
 
+def require_chunk_matches_server(adapter: Any, config: Any) -> None:
+    """The chunk routing assumes (`offcfg.lmcache_chunk_tokens`) must be the one
+    the MP server runs on. DP routing predicts what loads from the configured
+    chunk before any server is asked; a different server chunk skews its
+    estimates, so a mismatch stops startup instead."""
+    configured = offcfg.lmcache_chunk_tokens(_storage_kv_transfer_config(config))
+    server = int(adapter.lmcache_tokens_per_chunk)
+    if configured != server:
+        raise ValueError(
+            "LMCache MP chunk size must match the server: configured "
+            f"{configured} (lmcache.chunk_size or LMCACHE_CHUNK_SIZE), server {server}"
+        )
+
+
 def _mp_session_id(config: Any, request_id: Any) -> str:
     """Scope one LMCache MP request session to its global DP replica."""
 

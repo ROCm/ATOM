@@ -32,6 +32,7 @@ from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_STORE_CHANNEL,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
+from atom.kv_transfer.offload.mp import deployment
 from atom.kv_transfer.offload.mp.deployment import (
     _make_worker_adapter,
     _mp_session_id,
@@ -175,6 +176,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 adapter.lmcache_tokens_per_chunk,
                 minimum=1,
             )
+            deployment.require_chunk_matches_server(adapter, self._config)
             if chunk_size % self.block_size:
                 raise ValueError(
                     f"LMCache MP chunk size {chunk_size} must be divisible by "
@@ -402,7 +404,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 )
             block_ids = self._block_slice(req, start, end)
             op = AtomMPTransferSpec(
-                token_ids=list(req.token_ids),
+                token_ids=req.token_ids,
                 block_ids=[block_ids],
                 start=start,
                 end=end,
@@ -490,7 +492,7 @@ class LMCacheMPConnector(KVConnectorBase):
         try:
             block_ids = self._block_slice(req, start, end)
             op = AtomMPTransferSpec(
-                token_ids=list(req.token_ids),
+                token_ids=req.token_ids,
                 block_ids=[block_ids],
                 start=start,
                 end=end,

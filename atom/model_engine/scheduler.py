@@ -2267,6 +2267,15 @@ class Scheduler:
                 seq.multimodal_data = None
                 tracing.finish(seq, reason=seq.leave_reason)
                 self._rejected.append(seq)
+                # Never ran to `postprocess`: tell the connector the request
+                # is over, so what it kept for it (an offload session, its
+                # token copies) is released like any other finished request.
+                if self.kv_connector is not None:
+                    if self._connector_flag("is_offload"):
+                        self.kv_connector.cancel_pending_load(seq)
+                    finished = getattr(self.kv_connector, "request_finished", None)
+                    if callable(finished):
+                        finished(seq)
                 continue
 
             if len(self.running) >= self.max_num_seqs:
@@ -3019,6 +3028,8 @@ class Scheduler:
 
         seq.status = SequenceStatus.WAITING
         self._uncount_inflight_load(seq)
+        # Its prompt was prefilled on the producer.
+        seq.prefill_completed = True
         return True
 
     def _consume_failed_remote_kv(self, seq: Sequence) -> bool:
@@ -3067,6 +3078,11 @@ class Scheduler:
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_start_tokens = None
         seq.offload_load_failed = True
+        if self._connector_flag("is_offload") and not seq.block_table:
+            # A failed disown dropped the whole table: no resume runs for it
+            # (an offload request with blocks is counted until it does), so
+            # its parked count is released here.
+            self._uncount_inflight_load(seq)
         return True
 
     def _note_connector_scheduled_tokens(
@@ -3085,8 +3101,9 @@ class Scheduler:
 
     @staticmethod
     def _note_prefill_complete(seq: Sequence) -> None:
-        """The request's prompt prefill completed: the one place that says so
-        (the tracing span and the DP router's `Sequence.prefill_completed`)."""
+        """A prefill this scheduler ran completed (the tracing span and the DP
+        router's `Sequence.prefill_completed`). A P/D consumer's prompt was
+        prefilled elsewhere and is marked where its receive resolves."""
         seq.prefill_completed = True
         tracing.prefill_complete(seq)
 
@@ -4393,6 +4410,9 @@ class Scheduler:
                     if need_placeholder:
                         _num_new -= num_placeholder
                     self.block_manager.hash_blocks(seq, max(0, _num_new))
+                    # No batch, so no final-chunk fact: the first sampled
+                    # output is the only proof the prompt prefill completed.
+                    self._note_prefill_complete(seq)
                 seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
@@ -4647,9 +4667,6 @@ class Scheduler:
                 # Publish transfer metadata before constructing the terminal
                 # output. Aborts without sampled output use the same helper.
                 self._mark_finished(seq, leave_reason, num_tokens)
-
-            # Decode output also proves prompt availability on a P/D consumer.
-            seq.prefill_completed = True
 
             # Prepare stream output
             # A terminal event is required even when truncation leaves no
@@ -4968,17 +4985,9 @@ class Scheduler:
 
     def _resolve_offload_load(self, seq: Sequence) -> None:
         """Resolve an admitted tier load before the delayer sizes prefill work."""
-        if seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
-            # Aborted (or otherwise moved on) while the load ran: its
-            # abort path reclaims it; a failed load must not revive it.
-            return
         if self._consume_failed_remote_kv(seq):
-            if not seq.block_table:
-                self._uncount_inflight_load(seq)
             return
-        if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS and (
-            self._update_waiting_for_remote_kv(seq)
-        ):
+        if self._update_waiting_for_remote_kv(seq):
             seq.status = SequenceStatus.WAITING
             self._mark_offload_load_ready(seq)
 
@@ -4986,8 +4995,11 @@ class Scheduler:
         """Resolve admitted loads before sizing prefill; prioritize their resumes.
 
         These requests were admitted at the queue head and already own blocks.
-        A fresh head cannot block their progress and reclamation. P/D receives
-        retain their admission-time resolution and first-decode behavior.
+        A fresh head cannot block their progress and reclamation. With an
+        offload tier configured (`is_offload`, which a `multi` P/D + offload
+        connector also reports), every finished receive is resolved here as a
+        tier load; a P/D-only consumer resolves at admission and goes to its
+        first decode.
         """
         if not self.waiting or not (
             self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids

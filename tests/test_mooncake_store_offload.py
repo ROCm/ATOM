@@ -3842,3 +3842,24 @@ def test_pure_page_codec_rejects_missing_fused_staging(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="fused chunk-major PAGE"):
         page_codec.pure_page_codec([object()], 8)
+
+
+def test_plain_v4_is_refused_before_weights_load():
+    """DeepSeek-V4 is also the "hybrid" layout, but copies state instead of
+    replaying it: the PAGE-only Store load is refused at construction."""
+    config = _config()
+    config.hf_config.compress_ratios = [4, 128]
+    config.enable_encoder_swa_bounded_replay = False
+    with pytest.raises(ValueError, match="rebuilt by replay"):
+        check_engine_compatibility(parse_mooncake_store_config(_extra()), config)
+
+
+def test_store_reads_the_region_map_only_on_a_page_layout():
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    store = {"kv_connector": "mooncake_store", "kv_role": "offload"}
+    dense = _config(kv_transfer_config=store)
+    assert not KVConnectorFactory.topology_reads_block_regions(dense)
+    v41 = _config(kv_transfer_config=store)
+    v41.hf_config.compress_ratios = [4, 128]
+    assert KVConnectorFactory.topology_reads_block_regions(v41)

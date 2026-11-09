@@ -739,8 +739,8 @@ def test_prefix_spread_moves_only_to_an_idle_rank():
 def _dp4_idle_ratio_mgr():
     mgr = _make_spread_mgr(n_ranks=4)
     # rank0 ran the whole 100k prefix, rank2 its first 48k.
-    mgr._prefix_router._record(_chain_seq(1, 100_000).prompt_hash_chain, 0, 1, 0, None)
-    mgr._prefix_router._record(_chain_seq(2, 49_152).prompt_hash_chain, 2, 2, 0, None)
+    mgr._prefix_router._record(_chain_seq(1, 100_000).prompt_hash_chain, 0, 1, 0)
+    mgr._prefix_router._record(_chain_seq(2, 49_152).prompt_hash_chain, 2, 2, 0)
     mgr._prefix_router.prefill_complete(1)
     mgr._prefix_router.prefill_complete(2)
     mgr._rank_tokens = [200_000, 0, 4_096, 8_192]
@@ -1167,9 +1167,11 @@ def test_pending_remote_restore_does_not_count_as_local_hbm():
     (target,) = _route(mgr, [moved])
     assert target != owner
     probe = _chain_seq(9, 65536).prompt_hash_chain
-    hits, actual_owner, _ = mgr._prefix_router._rank_hits(probe, 2)
-    assert actual_owner == owner
-    assert target not in hits
+    # While the move's load is in flight its target is the prefix's newest
+    # (provisional) holder: followers reuse it there instead of loading again.
+    hits, actual_owner, source = mgr._prefix_router._rank_hits(probe, 2)
+    assert (actual_owner, source) == (target, 2)
+    assert hits[owner] == 65536
     mgr._mark_seq_prefill_complete(2)
     hits, _, _ = mgr._prefix_router._rank_hits(probe, 2)
     assert hits[target] == 65536
@@ -1259,3 +1261,44 @@ def test_lmcache_mp_declares_its_chunk_through_the_registry(monkeypatch):
         kv_transfer_config={"kv_connector": "lmcache_mp", "kv_role": "offload"}
     )
     assert KVConnectorFactory.offload_tier(cfg).load_chunk_tokens == 1024
+
+
+def test_a_full_length_hit_is_not_credited_when_nothing_would_load():
+    """An 8192-token prompt fully hit in an 8192-token-chunk Store: the
+    connector steps back a token, floors to a chunk and loads nothing, so the
+    moved request is charged its whole prompt."""
+    from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
+
+    tier = OffloadTierProfile(True, 512, load_chunk_tokens=8192)
+    assert tier.loadable_tokens(0, 8192, 8192) == 0
+    mgr = _make_spread_mgr(n_ranks=2, tier=tier)
+    owner = _chain_seq(1, 8192)
+    mgr._prefix_router.place(owner, 0, 2)
+    mgr._charge_seq_load_locked(owner, 0)
+    mgr._mark_seq_prefill_complete(1)
+    mgr._rank_tokens = [100_000, 0]
+    moved = _chain_seq(2, 8192)
+    assert _route(mgr, [moved]) == [1]
+    assert _est(mgr, moved) == 0
+
+
+def test_a_moved_request_loading_from_the_tier_is_its_own_holder_on_the_target():
+    """M is moved to T and credited a prefix from the tier while another
+    request P still prefills it elsewhere (an older finished copy made the tier
+    ready). T's entry must name M, not P: when M aborts, followers that joined
+    on T are handed the entry and the debt instead of keeping credit for a
+    prefix no request is loading."""
+    mgr = _make_spread_mgr(n_ranks=3)
+    router = mgr._prefix_router
+    s = _chain_seq(1, 16384)
+    router.place(s, 0, 3)
+    mgr._charge_seq_load_locked(s, 0)
+    mgr._mark_seq_prefill_complete(1)  # a finished copy: the tier holds it
+    p = _chain_seq(2, 16384)
+    router.place(p, 1, 3)
+    mgr._charge_seq_load_locked(p, 1)  # P prefills on rank1, the newest holder
+    mgr._rank_tokens = [40_000, 200_000, 0]  # only rank2 is idle
+    m = _chain_seq(3, 20480)
+    assert _route(mgr, [m]) == [2]
+    names = [holders[2] for holders in router.index.values() if 2 in holders]
+    assert names and all(name == 3 for name in names)

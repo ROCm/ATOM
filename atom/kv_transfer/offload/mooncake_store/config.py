@@ -205,14 +205,25 @@ def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> 
     DCP rank's pages cover a virtual block that the chunk keys do not name.
 
     Raises:
-        ValueError: The model is neither dense nor V4.1, DCP > 1, or the chunk
-            is not a whole number of KV blocks.
+        ValueError: The model is neither dense nor V4.1 with bounded replay,
+            DCP > 1, or the chunk is not a whole number of KV blocks.
     """
     layout = offcfg.select_offload_layout(config)
     if layout not in ("dense", _REPLAY_PAGE_LAYOUT):
         raise ValueError(
             "the Mooncake Store offload moves the dense KV layout and V4.1's "
             f"replay PAGEs; this model resolves to {layout!r}"
+        )
+    if layout == _REPLAY_PAGE_LAYOUT and not getattr(
+        config, "enable_encoder_swa_bounded_replay", False
+    ):
+        # Plain DeepSeek-V4 is also "hybrid", and copies state instead of
+        # replaying it: its PAGE-only load would be unsound. Refuse here, at
+        # construction, not after the weights are loaded.
+        raise ValueError(
+            "the Mooncake Store offload moves a hybrid model's PAGEs only where "
+            "a hit's state is rebuilt by replay (V4.1 with "
+            "enable_encoder_swa_bounded_replay)"
         )
     dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
     if dcp > 1:
