@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from collections import deque
 from collections.abc import Callable
 from typing import Any
@@ -524,8 +523,7 @@ class LMCacheMPConnector(KVConnectorBase):
 
         Drops the events finished submissions referenced (an interprocess
         event must not be destroyed on that thread) and the futures its polls
-        finished, and surfaces a submission that raised. With a polling
-        thread, also fail-stops a transfer past its deadline.
+        finished, and surfaces a submission that raised.
         """
         transfer = self._transfer
         if transfer is None:
@@ -537,31 +535,6 @@ class LMCacheMPConnector(KVConnectorBase):
             elif transfer.returned > _RETURNED_FUTURES_CAP:
                 transfer.take_returned(_RETURNED_FUTURES_BATCH)
         transfer.raise_error()
-        if transfer.polls:
-            transfer.between_rounds(self._enforce_overdue_deadlines)
-
-    def _enforce_overdue_deadlines(self) -> None:
-        """Fail-stop, from the forward thread, a transfer past its deadline.
-
-        Rounds enforce deadlines too, but run between submissions on the
-        transfer thread, so a slow or hung submit holds them back. Only a
-        transfer already past its deadline is polled here, as a round polls
-        it: a finished one is left for the next round to settle. The others
-        are not polled at all; a terminal poll imports the peer's IPC event,
-        which stays off this thread.
-        """
-        now = time.monotonic()
-        with self._lock:
-            overdue = [
-                (operation_id, entry)
-                for operation_id, entry in (
-                    *self._pending_saves.items(),
-                    *self._pending_loads.items(),
-                )
-                if now - entry.started_at >= self._transfer_deadline_s
-            ]
-        for operation_id, entry in overdue:
-            self._poll_entry(operation_id, entry)
 
     def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:
         if start < 0 or end < start:

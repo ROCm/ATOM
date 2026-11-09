@@ -132,8 +132,6 @@ class _TransferThread:
         self._rounds_requested = 0
         self._poll_failed = False
         self._in_flight = False
-        # Held while a round polls; see `between_rounds`.
-        self._polling = threading.Lock()
         self._returned: deque[Any] = deque()
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._thread.start()
@@ -235,22 +233,6 @@ class _TransferThread:
                 timeout=timeout,
             )
             return self._rounds_done >= target
-
-    def between_rounds(self, fn: Callable[[], None]) -> None:
-        """Run ``fn`` on the caller's thread unless a round is polling; no
-        round starts until it returns.
-
-        For a caller that polls a transfer itself: the first query of a
-        finished future imports the peer's IPC event, and two threads must not
-        import it at once. Skipped while a round runs, which polls the same
-        transfers.
-        """
-        if not self._polling.acquire(blocking=False):
-            return
-        try:
-            fn()
-        finally:
-            self._polling.release()
 
     def look(self, wait_s: float) -> None:
         """Ask for a round, and wait up to ``wait_s`` for it when it is a pure
@@ -363,8 +345,7 @@ class _TransferThread:
             self._rounds_started += 1
             number = self._rounds_started
         try:
-            with self._polling:
-                self._in_flight = bool(self._poll(self))
+            self._in_flight = bool(self._poll(self))
         except BaseException as exc:  # re-raised by raise_error
             # A transfer deadline is fail-stop, and only the forward thread can
             # stop the engine. Another round would only fail and log again.
