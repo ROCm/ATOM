@@ -216,10 +216,13 @@ def _flydsl_arch_supported() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def _flydsl_explicit_plan_api() -> bool:
-    """Whether aiter has #5809's FlyDSL decode API (a required work plan).
+    """Whether aiter has #5809's FlyDSL decode API (explicit work plans).
 
     An older aiter would raise on the first call; probing once lets the gate
-    decline the call before entering aiter.
+    decline the call before entering aiter. Before #5809 `work_plan` was
+    positional and optional and `pa_decode` took no `max_context_length`;
+    aiter #7056 made the keyword `work_plan` optional again for MXFP4 K/V
+    only, so whether it has a default does not tell the two apart.
     """
     import inspect
 
@@ -236,7 +239,6 @@ def _flydsl_explicit_plan_api() -> bool:
             hasattr(mod, "plan_pa_decode")
             and plan is not None
             and plan.kind is inspect.Parameter.KEYWORD_ONLY
-            and plan.default is inspect.Parameter.empty
             and "max_context_length" in params
         )
     if not ok:
