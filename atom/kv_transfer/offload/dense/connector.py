@@ -118,7 +118,8 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         # Called on the model runner's thread: its current stream is the one
         # the forward runs on (see `atom_lmcache_staging.compute_stream`).
         # Recorded here so a load that precedes the first save stages on it.
-        set_compute_stream(torch.cuda.current_stream())
+        if torch.cuda.is_available():
+            set_compute_stream(torch.cuda.current_stream())
         tp = get_tp_group()
         rank, world = pp_aware_rank_and_world(self._config, tp)
         self._rank = rank
