@@ -48,7 +48,9 @@ def test_million_token_profile_does_not_materialize_history(monkeypatch):
 
     monkeypatch.setattr(mixed_profile, "Sequence", bounded_sequence)
     runner = SimpleNamespace(
-        config=SimpleNamespace(max_model_len=1048576, max_num_seqs=1024),
+        config=SimpleNamespace(
+            max_model_len=1048576, max_num_seqs=1024, speculative_config=None
+        ),
         block_size=256,
         drafter=SimpleNamespace(mtp_k=7),
         pool_plan=SimpleNamespace(entries_per_req={STATE_SLOT_CLASS: 2}),
@@ -56,24 +58,36 @@ def test_million_token_profile_does_not_materialize_history(monkeypatch):
     batch, _ = _batch(runner, 8192, 1023, 8, long_context=True)
     assert batch.total_seqs_num == 1024
     assert batch.total_tokens_num == 8192 + 1023 * 8
-    assert batch.context_lens.tolist() == [1048570] * 1024
+    assert batch.context_lens.tolist() == [1048570] * 2 + [8192] * 1022
     assert not batch.scheduled_tokens.any()
     assert all(isinstance(seq.token_ids, mixed_profile._ProfileTokens) for seq in rows)
-    assert all(len(seq.token_ids) == seq.num_tokens == 1048570 for seq in rows)
+    assert all(
+        len(seq.token_ids) == seq.num_tokens == context
+        for seq, context in zip(rows, batch.context_lens)
+    )
     assert all(seq.token_ids[-1] == 0 for seq in rows)
     assert list(rows[-1].token_ids[-8:]) == [0] * 8
 
 
 @pytest.mark.parametrize("width", [1, 8])
 @pytest.mark.parametrize("long_context", [False, True])
-def test_profile_addresses_include_full_draft_lookahead(width, long_context):
+@pytest.mark.parametrize("block_drafter", [False, True])
+@pytest.mark.parametrize("max_len", [256, 257])
+def test_profile_addresses_include_full_draft_lookahead(
+    width, long_context, block_drafter, max_len
+):
+    lookahead = 7 if block_drafter else 6
     runner = SimpleNamespace(
-        config=SimpleNamespace(max_model_len=257, max_num_seqs=8),
+        config=SimpleNamespace(
+            max_model_len=max_len,
+            max_num_seqs=8,
+            speculative_config=SimpleNamespace(use_dspark=lambda: block_drafter),
+        ),
         block_size=64,
         drafter=SimpleNamespace(mtp_k=7),
         pool_plan=SimpleNamespace(entries_per_req={STATE_SLOT_CLASS: 2}),
     )
-    for prefill, decodes, q in mixed_profile_shapes(400, 8, width, 251):
+    for prefill, decodes, q in mixed_profile_shapes(400, 8, width, max_len - lookahead):
         batch, pages = _batch(runner, prefill, decodes, q, long_context=long_context)
         assert batch.num_spec_step == 7
         assert batch.total_tokens_num <= 400
@@ -81,14 +95,47 @@ def test_profile_addresses_include_full_draft_lookahead(width, long_context):
         # The allocated table has room for the draft's lookahead and fits the
         # configured max-context metadata even when verification uses q=1.
         private_pages = []
-        for table in batch.block_tables:
-            assert len(table) <= math.ceil(257 / runner.block_size)
+        for context, table in zip(batch.context_lens, batch.block_tables):
+            assert len(table) <= math.ceil(max_len / runner.block_size)
+            assert len(table) * runner.block_size >= context + lookahead
             private_pages.extend(p for p in table if p)
         assert len(set(private_pages)) == len(private_pages)
         assert pages == max(private_pages) + 1
         assert all(
             len(draft) == 7 for draft in batch.scheduled_spec_decode_tokens[-decodes:]
         )
+
+
+@pytest.mark.parametrize("max_seqs", [512, 1024])
+@pytest.mark.parametrize("budget", [2048, 16384])
+@pytest.mark.parametrize("width", [1, 8])
+def test_long_context_work_is_bounded_without_reducing_query_shapes(
+    max_seqs, budget, width
+):
+    max_len = 1048576 - 7
+    runner = SimpleNamespace(
+        config=SimpleNamespace(
+            max_model_len=1048576,
+            max_num_seqs=max_seqs,
+            speculative_config=SimpleNamespace(use_dspark=lambda: True),
+        ),
+        block_size=256,
+        drafter=SimpleNamespace(mtp_k=7),
+        pool_plan=SimpleNamespace(entries_per_req={STATE_SLOT_CLASS: 2}),
+    )
+    for prefill, decodes, q in reversed(
+        mixed_profile_shapes(budget, max_seqs, width, max_len)
+    ):
+        short, _ = _batch(runner, prefill, decodes, q, long_context=False)
+        long, _ = _batch(runner, prefill, decodes, q, long_context=True)
+        # The full token and sequence envelopes still reach the model/drafter.
+        assert long.total_tokens_num == short.total_tokens_num == prefill + decodes * q
+        assert long.total_seqs_num == short.total_seqs_num == 1 + decodes
+        assert long.num_spec_step == short.num_spec_step == 7
+        # At c=1024 this is about 10M logical positions, rather than 1B.
+        assert sum(long.context_lens) <= 2 * max_len + (max_seqs - 2) * 8192
+        assert long.context_lens[:2].tolist() == [max_len, max_len]
+        assert all(context == 8192 for context in long.context_lens[2:])
 
 
 @pytest.mark.parametrize("tbo_flags", [(False, False), (True, False), (True, True)])
@@ -103,6 +150,7 @@ def test_profile_budgets_unsplit_fallback_and_restores_config(
         enable_tbo_decode=tbo_flags[1],
         max_num_seqs=4,
         max_model_len=128,
+        speculative_config=None,
     )
     memory = {"allocated": 80, "reserved": 80, "peak": 85, "reserved_peak": 85}
     observed = []
@@ -137,7 +185,11 @@ def test_profile_budgets_unsplit_fallback_and_restores_config(
         tokenID_processor=SimpleNamespace(clean=lambda: None),
         forward=forward,
     )
-    monkeypatch.setattr(mixed_profile, "_batch", lambda *args, **kwargs: (object(), 1))
+    monkeypatch.setattr(
+        mixed_profile,
+        "_batch",
+        lambda *args, **kwargs: (SimpleNamespace(context_lens=[64, 64]), 1),
+    )
     cuda = mixed_profile.torch.cuda
     monkeypatch.setattr(cuda, "synchronize", lambda: None)
     monkeypatch.setattr(cuda, "reset_peak_memory_stats", lambda: None)

@@ -888,7 +888,12 @@ Dummy warmup does not exercise V4 attention because KV has not been bound.
 Mixed startup therefore binds a temporary KV pool and runs real forwards
 before the serving pool is sized. It samples prefill-heavy, balanced, and
 decode-heavy shapes within the configured token and sequence limits, at
-short and maximum valid contexts. DSpark covers both full-width verification
+short contexts, then with one prefill request and one decode request at the
+maximum valid context. The remaining histories stay short, bounding logical
+KV work instead of multiplying the context limit by maximum concurrency.
+Both sweeps retain the full scheduled token and sequence shapes; the persistent
+decode logits workspace is already included in the memory baseline.
+DSpark covers both full-width verification
 and q=1, retaining the full draft width in both cases. With TBO enabled, it
 profiles both the configured path and unsplit forwards: a decode-only DP
 rank can veto splitting for the whole group, increasing the per-forward

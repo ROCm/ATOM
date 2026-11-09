@@ -10,6 +10,7 @@ from array import array
 import numpy as np
 import torch
 
+from atom.model_engine.block_manager import draft_kv_lookahead
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import Sequence, SequenceType
@@ -53,6 +54,14 @@ def mixed_profile_shapes(
     ]
 
 
+def _profile_lookahead(runner):
+    spec = runner.config.speculative_config
+    return draft_kv_lookahead(
+        getattr(getattr(runner, "drafter", None), "mtp_k", 0),
+        block_drafter=spec is not None and spec.use_dspark(),
+    )
+
+
 def _batch(runner, prefill_tokens, decode_seqs, width, *, long_context):
     """Valid addresses, with shared read-only zero pages for old KV history.
 
@@ -62,7 +71,7 @@ def _batch(runner, prefill_tokens, decode_seqs, width, *, long_context):
     config = runner.config
     block = runner.block_size
     full_q = getattr(getattr(runner, "drafter", None), "mtp_k", 0) + 1
-    lookahead = max(0, full_q - 2)
+    lookahead = _profile_lookahead(runner)
     max_len = config.max_model_len - lookahead
     prefill_lens = []
     while prefill_tokens:
@@ -77,9 +86,12 @@ def _batch(runner, prefill_tokens, decode_seqs, width, *, long_context):
     slots_per_req = runner.pool_plan.entries_per_req[STATE_SLOT_CLASS]
     for row, n in enumerate(lengths):
         prefill = row < len(prefill_lens)
-        # The short sweep varies allocation shapes; the long sweep exercises
-        # max-context indexer chunks and sparse attention metadata.
-        context = max_len if long_context else min(max_len, max(n, 8192))
+        # One row in each segment reaches the context limit. Keep the other
+        # histories short: replaying max_seqs * max_model_len keys is needless
+        # work for a profile. Query/sequence counts stay at their full shapes;
+        # the decode logits plane is already persistent and in the baseline.
+        long_row = long_context and row in (0, len(prefill_lens))
+        context = max_len if long_row else min(max_len, max(n, 8192))
         seq = Sequence([0], block_size=block, has_per_req_cache=True)
         seq.token_ids = _ProfileTokens(context)
         seq.num_tokens = seq.num_prompt_tokens = seq.num_finalized_tokens = context
@@ -132,7 +144,7 @@ def profile_mixed_memory(runner) -> tuple[int, int]:
             runner.warmup_max_tokens(),
             runner.config.max_num_seqs,
             q,
-            runner.config.max_model_len - max(0, width - 2),
+            runner.config.max_model_len - _profile_lookahead(runner),
         )
     ]
     if not shapes:
@@ -189,13 +201,16 @@ def profile_mixed_memory(runner) -> tuple[int, int]:
                         )
                         logger.info(
                             "mixed memory profile: prefill=%d decode=%dx%d "
-                            "long_context=%s allow_tbo=%s "
+                            "long_context=%s allow_tbo=%s max_context=%d "
+                            "total_context=%d "
                             "workspace_peak=%.2f GiB reserved_workspace=%.2f GiB",
                             prefill,
                             n_decode,
                             q,
                             long_context,
                             config.enable_tbo,
+                            max(batch.context_lens),
+                            sum(batch.context_lens),
                             (allocated - fixed) / (1 << 30),
                             (reserved - fixed) / (1 << 30),
                         )
