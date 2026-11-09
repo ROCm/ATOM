@@ -57,5 +57,8 @@ def uncached_bytes(nbytes: int, device: torch.device) -> torch.Tensor:
 
 def fine_grained_bytes(nbytes: int, device: torch.device) -> torch.Tensor:
     """A uint8 view of ``nbytes`` of zeroed fine-grained memory, never freed. A peer buffer whose few-word pushes a
-    poller waits on (gfx1250 single-launch step): uncached peer stores there took ~80-100 us to become visible."""
-    return torch.as_tensor(DeviceBytes(allocate_fine_grained(nbytes), nbytes), device=device)
+    poller waits on (gfx1250 single-launch step): uncached peer stores there took ~80-100 us to become visible.
+    """
+    return torch.as_tensor(
+        DeviceBytes(allocate_fine_grained(nbytes), nbytes), device=device
+    )

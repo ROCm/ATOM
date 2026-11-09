@@ -162,7 +162,9 @@ class HipRuntime:
         error = self.library().hipIpcCloseMemHandle(ctypes.c_void_p(int(mapped_base)))
         self.check(error, operation="hipIpcCloseMemHandle")
 
-    def allocate_uncached(self, size: int, flags: int = HIP_DEVICE_MALLOC_UNCACHED) -> int:
+    def allocate_uncached(
+        self, size: int, flags: int = HIP_DEVICE_MALLOC_UNCACHED
+    ) -> int:
         """Allocate and zero uncached device memory, returning its raw pointer.
 
         The size is rounded up to whole 4 KiB pages: ``hipIpcGetMemHandle``
@@ -254,8 +256,8 @@ __all__ = [
     "HIP_IPC_HANDLE_BYTES",
     "HIP_IPC_MEM_LAZY_ENABLE_PEER_ACCESS",
     "HipRuntime",
-    "allocate_uncached",
     "allocate_fine_grained",
+    "allocate_uncached",
     "check_hip_error",
     "close_ipc_handle",
     "get_allocation_base",

@@ -89,7 +89,8 @@ def ffn_front(block) -> dict[str, torch.Tensor]:
 
 def attention_front(next_block=None, final_norm=None) -> dict[str, torch.Tensor]:
     """The a* of the layer before ``next_block``; with ``final_norm`` (the segment's last layer): the final collapse, of
-    which the kernel reads only the norm weight -- the mHC parts are given as zeros of the right size."""
+    which the kernel reads only the norm weight -- the mHC parts are given as zeros of the right size.
+    """
     if next_block is not None:
         afnh, afnl = hi_lo(next_block.hc_attn_fn)
         return {
@@ -112,4 +113,8 @@ def attention_front(next_block=None, final_norm=None) -> dict[str, torch.Tensor]
 
 def layer_row(block, next_block=None, final_norm=None) -> dict[str, torch.Tensor]:
     """A layer-table row's weight tensors (the planes, rope tables, KV / indexer / compressor pointers are bound apart)."""
-    return {**attention(block), **ffn_front(block), **attention_front(next_block, final_norm)}
+    return {
+        **attention(block),
+        **ffn_front(block),
+        **attention_front(next_block, final_norm),
+    }

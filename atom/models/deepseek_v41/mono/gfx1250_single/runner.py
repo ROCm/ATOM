@@ -48,7 +48,12 @@ logger = logging.getLogger("atom")
 
 def _base_model(model):
     for m in model.modules():
-        if hasattr(m, "embed") and hasattr(m, "head") and hasattr(m, "norm") and hasattr(m, "layers"):
+        if (
+            hasattr(m, "embed")
+            and hasattr(m, "head")
+            and hasattr(m, "norm")
+            and hasattr(m, "layers")
+        ):
             return m
     raise MonoUnsupported("no V4.1 base model")
 
@@ -104,7 +109,9 @@ class SingleStepRunner(RunnerDebug):
         # the kernel's ring slots (window + block width) and pool row width (bf16 elements) are compile-time constants
         AS = self.K["attention"]
         if int(window.ring_slots) != AS.KG_RING:
-            raise MonoUnsupported(f"window ring {window.ring_slots} slots (the step kernel's: {AS.KG_RING})")
+            raise MonoUnsupported(
+                f"window ring {window.ring_slots} slots (the step kernel's: {AS.KG_RING})"
+            )
         miss = buffers.check_catalog(self.K)
         if miss:
             raise MonoUnsupported(f"pointer catalog out of date: {miss[:4]}")
@@ -115,7 +122,11 @@ class SingleStepRunner(RunnerDebug):
         # fine-grained, not uncached: the step's few-word peer pushes (Markov, sampling) waited ~80-100 us each for an
         # uncached store to become visible (CT12 11-08: the fixture's fine-grained receive buffers did not)
         self.peer = SymmetricPeerBuffer(
-            RECV_BYTES, rank=self.rank, npes=TP, group=get_tp_group().cpu_group, fine_grained=True
+            RECV_BYTES,
+            rank=self.rank,
+            npes=TP,
+            group=get_tp_group().cpu_group,
+            fine_grained=True,
         )
         self.recv = [int(a) for a in self.peer.addresses.tolist()]
         # the routed experts a layer, as the loader packed them (``planes.capture``): target "layers.{i}.ffn", the
@@ -138,12 +149,20 @@ class SingleStepRunner(RunnerDebug):
             len(self.planes),
             self.rank,
         )
-        if envs.ATOM_MONO_SINGLE_CHECK_ROWS is not None:  # (debug) a layer's table row against the checkpoint
+        if (
+            envs.ATOM_MONO_SINGLE_CHECK_ROWS is not None
+        ):  # (debug) a layer's table row against the checkpoint
             self._check_rows(model, envs.ATOM_MONO_SINGLE_CHECK_ROWS)
         from atom.models.deepseek_v41.mono.gfx1250_single.tables import StepTables
 
         self.tables = StepTables(
-            self.K, model, drafter, self.scratch, self.recv, self.rank, get_tp_group().device_group
+            self.K,
+            model,
+            drafter,
+            self.scratch,
+            self.recv,
+            self.rank,
+            get_tp_group().device_group,
         )
         logger.info(
             "V4.1 single-launch step tables: fp %d, tp %d, ctx %d pointers, %d layer rows (rank %d)",
@@ -167,7 +186,11 @@ class SingleStepRunner(RunnerDebug):
         self.verify_ready = torch.cuda.Event()
         self.verify_ready.single_launch = True
         self._verify_stream = torch.cuda.Stream()
-        self._timer = StepTimer(self.rank, envs.ATOM_MONO_SINGLE_TIMING_EVERY) if envs.ATOM_MONO_SINGLE_TIMING else None
+        self._timer = (
+            StepTimer(self.rank, envs.ATOM_MONO_SINGLE_TIMING_EVERY)
+            if envs.ATOM_MONO_SINGLE_TIMING
+            else None
+        )
         self._eng_rows = None
         # (debug) ATOM_MONO_SINGLE_SHADOW: the production forward serves and the launch runs beside it (``debug``)
         self.shadow = envs.ATOM_MONO_SINGLE_SHADOW
@@ -175,14 +198,20 @@ class SingleStepRunner(RunnerDebug):
         # with layer shadow_layers' attn_norm, compared to the production state there)
         self.shadow_layers = envs.ATOM_MONO_SINGLE_SHADOW_NL
         if not self.shadow and self.shadow_layers != NL:
-            raise MonoUnsupported("single-launch step: serving runs all the layers (ATOM_MONO_SINGLE_SHADOW_NL unset)")
+            raise MonoUnsupported(
+                "single-launch step: serving runs all the layers (ATOM_MONO_SINGLE_SHADOW_NL unset)"
+            )
         # every width built now (each a compile or a disk-cache load, then a TP barrier: ``prepare``), not on its first
         # step: a width first met mid-serve stalled every request for its JIT (~18 s cold)
         t0 = time.perf_counter()
         for rows in range(ROWS_PER_REQ, buffers.T_MAX + 1, ROWS_PER_REQ):
             self.prepare(rows)
-        logger.info("V4.1 single-launch step: %d widths built in %.1f s (rank %d)", len(self.builds),
-                    time.perf_counter() - t0, self.rank)
+        logger.info(
+            "V4.1 single-launch step: %d widths built in %.1f s (rank %d)",
+            len(self.builds),
+            time.perf_counter() - t0,
+            self.rank,
+        )
 
     def prepare(self, rows: int) -> bool:
         if rows % 6 or not 0 < rows <= buffers.T_MAX:
@@ -190,9 +219,11 @@ class SingleStepRunner(RunnerDebug):
         if rows not in self.builds:
             M = self.K["step"]
             nl = self.shadow_layers
-            kw = dict(NL=nl, ndr=NDR if nl == NL else 0, trd=rows // 6 * 5)
+            kw = {"NL": nl, "ndr": NDR if nl == NL else 0, "trd": rows // 6 * 5}
             # two launches: target .. verification, then the draft (the host reads the verdict between)
-            launch = tuple(M.build(rows, self.rank, part=pt, **kw)[0] for pt in ("target", "draft"))
+            launch = tuple(
+                M.build(rows, self.rank, part=pt, **kw)[0] for pt in ("target", "draft")
+            )
             # compile (JIT or disk cache) before the first launch of this width, then wait for every rank: the step
             # kernel's cross-rank polls give up after 2 s, and ranks compiling a width seconds apart made that first
             # launch time out and compute on stale / zero peer data (KV / index / compressor state stays wrong after)
@@ -217,8 +248,11 @@ class SingleStepRunner(RunnerDebug):
                 def call(*a):
                     fn = flyc.compile(self.builds[rows][i], *a)
                     if fn is None:
-                        raise MonoUnsupported(f"single-launch step: no compiled launcher for {rows} rows")
+                        raise MonoUnsupported(
+                            f"single-launch step: no compiled launcher for {rows} rows"
+                        )
                     self._fast[rows][i] = fn
+
                 return call
 
             fast = self._fast[rows] = [first(i) for i in range(len(self.builds[rows]))]
@@ -226,18 +260,29 @@ class SingleStepRunner(RunnerDebug):
 
     def _launch_args(self) -> tuple:
         T_ = self.tables
-        return (*self.recv, self.scratch["cnt"].data_ptr(), self.scratch["st"].data_ptr(),
-                float(self.base.layers[0].attn.softmax_scale), T_.fptab.data_ptr(), T_.tp.data_ptr())
+        return (
+            *self.recv,
+            self.scratch["cnt"].data_ptr(),
+            self.scratch["st"].data_ptr(),
+            float(self.base.layers[0].attn.softmax_scale),
+            T_.fptab.data_ptr(),
+            T_.tp.data_ptr(),
+        )
 
     def _check_timeouts(self) -> None:
         """The kernel's poll-timeout counter (hx.note_timeout: scratch cyc int32 [0] count, [1] last site), read a
-        launch late without a sync; any timeout means that step computed on stale peer data."""
+        launch late without a sync; any timeout means that step computed on stale peer data.
+        """
         prev = getattr(self, "_to_pend", None)
         if prev is not None and prev[1].query():
             n, site = prev[0].tolist()
             if n != getattr(self, "_to_seen", 0):
-                logger.error("V4.1 single-launch step: %d cross-rank poll timeouts so far (rank %d, last site %d)",
-                             n, self.rank, site)
+                logger.error(
+                    "V4.1 single-launch step: %d cross-rank poll timeouts so far (rank %d, last site %d)",
+                    n,
+                    self.rank,
+                    site,
+                )
                 self._to_seen = n
             prev = None
         if prev is None:
@@ -258,12 +303,16 @@ class SingleStepRunner(RunnerDebug):
         """Can the kernel serve this step's request shapes (no device work, nothing staged)? The same limits
         ``_sampling`` / ``_host_inputs`` refuse with MonoUnsupported, checked before the step commits to the kernel (an
         exception after the Engram rows are staged left the worker without a fallback: CT11 11-08, a 4.4k-token prompt
-        with 4096 outputs past the index bound). Identical on every rank (the batch and its spans are)."""
+        with 4096 outputs past the index bound). Identical on every rank (the batch and its spans are).
+        """
         from atom.models.deepseek_v41.mono.gfx1250_single.tables import BCOLS, ILW
         from atom.models.deepseek_v41.mono.gfx1250_single.tables import T as T_MAX
 
         why = None
-        if batch is not None and (np.asarray(batch.top_ks[: batch.total_seqs_num]) != -1).any():
+        if (
+            batch is not None
+            and (np.asarray(batch.top_ks[: batch.total_seqs_num]) != -1).any()
+        ):
             why = "top_k"
         md = getattr(forward_context, "attn_metadata", None)
         if why is None and self.tables.idx and md is not None:
@@ -282,15 +331,22 @@ class SingleStepRunner(RunnerDebug):
         if why is None:
             self._precheck_why = None
         else:
-            if why.split()[0] != getattr(self, "_precheck_why", None):   # once a kind (the bound values change a step)
+            if why.split()[0] != getattr(
+                self, "_precheck_why", None
+            ):  # once a kind (the bound values change a step)
                 self._precheck_why = why.split()[0]
-                logger.warning("V4.1 single-launch step: not served (%s), the production path runs (rank %d)", why, self.rank)
+                logger.warning(
+                    "V4.1 single-launch step: not served (%s), the production path runs (rank %d)",
+                    why,
+                    self.rank,
+                )
             return False
         return True
 
     def _host_inputs(self, input_ids, forward_context):
         """The step's host-side checks and the rare host-to-device refills (geometry), before the device preparation;
-        returns (the Engram layers' embedding rows, the key of every address / shape ``_device_inputs`` captures)."""
+        returns (the Engram layers' embedding rows, the key of every address / shape ``_device_inputs`` captures).
+        """
         from atom.models.deepseek_v41.mono.gfx1250_single.tables import BCOLS, ILW
         from atom.models.deepseek_v41.mono.gfx1250_single.tables import T as T_MAX
 
@@ -305,15 +361,27 @@ class SingleStepRunner(RunnerDebug):
         wk = (id(geom), cache.num_pages, cache.num_slots)
         if wk != getattr(self, "_wkey", None):
             window = geom.window(0, cache.num_pages)
-            self._wkey, self._gk = wk, (geom.window_size, window.slot_rows, window.ring_slots, cache.num_slots)
+            self._wkey, self._gk = wk, (
+                geom.window_size,
+                window.slot_rows,
+                window.ring_slots,
+                cache.num_slots,
+            )
         gk = self._gk
         self._hm("hi_geom")
-        if gk != getattr(self, "_dgeom_key", None):   # (static for a cache: an H2D copy only when it changes)
+        if gk != getattr(
+            self, "_dgeom_key", None
+        ):  # (static for a cache: an H2D copy only when it changes)
             self._dgeom_key = gk
             S["dgeom"][:4].copy_(torch.tensor(gk, dtype=torch.int32))
         rope = self.drafter.model.rope
-        if getattr(self, "_ctx_rope", None) is None:   # f32 copies of the draft's RoPE rows, once: a gather a step
-            self._ctx_rope = (rope.cos_cache.view(-1, 32).float(), rope.sin_cache.view(-1, 32).float())
+        if (
+            getattr(self, "_ctx_rope", None) is None
+        ):  # f32 copies of the draft's RoPE rows, once: a gather a step
+            self._ctx_rope = (
+                rope.cos_cache.view(-1, 32).float(),
+                rope.sin_cache.view(-1, 32).float(),
+            )
         key = [rows, input_ids.data_ptr(), gk, geom.block_size, self.tables._geom_key]
         if self.tables.idx:
             # the step's furthest position, from the host spans (no device read): a row at position p sees (p + 1) // r
@@ -324,13 +392,27 @@ class SingleStepRunner(RunnerDebug):
                     raise MonoUnsupported(f"index bound {end // r} > {ILW}")
             bt = step.block_tables
             if -(-end // geom.block_size) > BCOLS or bt.shape[0] > 8:
-                raise MonoUnsupported(f"block table: {bt.shape[0]} requests x {-(-end // geom.block_size)} columns > 8 x {BCOLS}")
-            key += [t.data_ptr() for t in (step.positions, step.slots, step.batch_ids, step.visible[1], step.visible[2])]
+                raise MonoUnsupported(
+                    f"block table: {bt.shape[0]} requests x {-(-end // geom.block_size)} columns > 8 x {BCOLS}"
+                )
+            key += [
+                t.data_ptr()
+                for t in (
+                    step.positions,
+                    step.slots,
+                    step.batch_ids,
+                    step.visible[1],
+                    step.visible[2],
+                )
+            ]
             key += [bt.data_ptr(), tuple(bt.shape), bt.stride(0)]
             if self.tables.comp:
                 for r in (1, 2):
                     plan = step.plans[r]
-                    for src, nl in ((plan.compress_plan_gpu, plan.num_compress), (plan.write_plan_gpu, plan.num_write)):
+                    for src, nl in (
+                        (plan.compress_plan_gpu, plan.num_compress),
+                        (plan.write_plan_gpu, plan.num_write),
+                    ):
                         if nl > T_MAX:
                             raise MonoUnsupported(f"plan {r}: {nl} rows > {T_MAX}")
                         key += [src.data_ptr(), tuple(src.shape)]
@@ -339,17 +421,36 @@ class SingleStepRunner(RunnerDebug):
         emb = getattr(md, "engram_embeddings", None)
         engs = {}
         for k, w in self.tables.engram.items():
-            e = (dict.get(emb, k) if self._eng_rows is not None else emb.get(k)) if emb is not None else None
+            e = (
+                (dict.get(emb, k) if self._eng_rows is not None else emb.get(k))
+                if emb is not None
+                else None
+            )
             if e is None or e.shape[-2] < rows or e.shape[-1] != w["engemb"].shape[1]:
-                raise MonoUnsupported(f"engram layer {k}: embedding rows {None if e is None else tuple(e.shape)}")
+                raise MonoUnsupported(
+                    f"engram layer {k}: embedding rows {None if e is None else tuple(e.shape)}"
+                )
             engs[k] = e
             key += [e.data_ptr(), tuple(e.shape)]
         er = self._eng_rows
-        if er is not None:   # the staged Engram inputs the graph captures (fixed addresses: EngramStep)
+        if (
+            er is not None
+        ):  # the staged Engram inputs the graph captures (fixed addresses: EngramStep)
             st = er.staging.step
-            key += [er.width, id(er.staging)] + [None if t_ is None else t_.data_ptr() for t_ in (
-                st.input_ids, st.live, st.dead, st.batch_ids, st.cu_seqlens, st.positions, st.cursor, st.history_index,
-                st.candidates)]
+            key += [er.width, id(er.staging)] + [
+                None if t_ is None else t_.data_ptr()
+                for t_ in (
+                    st.input_ids,
+                    st.live,
+                    st.dead,
+                    st.batch_ids,
+                    st.cu_seqlens,
+                    st.positions,
+                    st.cursor,
+                    st.history_index,
+                    st.candidates,
+                )
+            ]
         self._hm("host_inputs")
         return engs, tuple(key)
 
@@ -368,7 +469,15 @@ class SingleStepRunner(RunnerDebug):
         geom = cache.geometry
         window = geom.window(0, cache.num_pages)
         S["sparam"].copy_(self._sp_pin, non_blocking=True)
-        write_step_meta(step, geom, window, S["kvw"][:rows], S["kmeta"][: rows * 4].view(rows, 4), {}, (0, rows))
+        write_step_meta(
+            step,
+            geom,
+            window,
+            S["kvw"][:rows],
+            S["kmeta"][: rows * 4].view(rows, 4),
+            {},
+            (0, rows),
+        )
         S["rpos"][:rows].copy_(step.positions[:rows])
         S["tids"][:rows].copy_(input_ids.view(-1))
         S["dids"][: req * 5].copy_(input_ids.view(req, 6)[:, 1:].reshape(-1))
@@ -376,8 +485,12 @@ class SingleStepRunner(RunnerDebug):
         S["dgeom"][8 : 8 + req].copy_(step.slots[:req])
         S["ctx_kvw"][:rows].copy_(S["kvw"][:rows])
         pos = step.positions[:rows]
-        torch.index_select(self._ctx_rope[0], 0, pos, out=S["ctx_rcos"][: rows * 32].view(rows, 32))
-        torch.index_select(self._ctx_rope[1], 0, pos, out=S["ctx_rsin"][: rows * 32].view(rows, 32))
+        torch.index_select(
+            self._ctx_rope[0], 0, pos, out=S["ctx_rcos"][: rows * 32].view(rows, 32)
+        )
+        torch.index_select(
+            self._ctx_rope[1], 0, pos, out=S["ctx_rsin"][: rows * 32].view(rows, 32)
+        )
         if self.tables.idx:
             S["ibat"][:rows].copy_(step.batch_ids[:rows])
             for r in (1, 2):
@@ -387,11 +500,16 @@ class SingleStepRunner(RunnerDebug):
             n = bt.shape[0]
             cc = min(bt.shape[1], BCOLS)
             S["btab"][: n * BCOLS].view(n, BCOLS)[:, :cc].copy_(bt[:, :cc])
-            if self.tables.comp:   # the compress / ring-write plans, -1 padded (pos < 0: skipped); the plan's rows past
+            if (
+                self.tables.comp
+            ):  # the compress / ring-write plans, -1 padded (pos < 0: skipped); the plan's rows past
                 # its live count are sentinels (its fixed-capacity layout) or absent (a tight one)
                 for r in (1, 2):
                     plan = step.plans[r]
-                    for name, src in (("cplan", plan.compress_plan_gpu), ("wplan", plan.write_plan_gpu)):
+                    for name, src in (
+                        ("cplan", plan.compress_plan_gpu),
+                        ("wplan", plan.write_plan_gpu),
+                    ):
                         dst = S[f"{name}{r}"]
                         dst.fill_(-1)
                         m = min(src.shape[0], T_MAX)
@@ -425,7 +543,9 @@ class SingleStepRunner(RunnerDebug):
         (``hasq``, its row there ``qsrc``), else the one-hot rule. Noise seeds mix a step counter and the batch row.
         Top-k is not in the kernel: refused."""
         if batch is None:
-            raise MonoUnsupported("single-launch step: no batch for the sampling parameters")
+            raise MonoUnsupported(
+                "single-launch step: no batch for the sampling parameters"
+            )
         temps = np.asarray(batch.temperatures[:req], dtype=np.float32)
         top_ps = np.asarray(batch.top_ps[:req], dtype=np.float32)
         top_ks = np.asarray(batch.top_ks[:req])
@@ -444,19 +564,40 @@ class SingleStepRunner(RunnerDebug):
             sp = np.zeros((buffers.T_MAX, 8), dtype=np.float32)
             sp[:, 0], sp[:, 1], sp[:, 4] = 1.0, 1.0, 1.0
             sp.view(np.int32)[:, 3] = 1  # rows past the batch: greedy
-            inv_t = np.where(greedy, 1.0, 1.0 / np.maximum(temps, 1e-6)).astype(np.float32)
-            for c, v in ((0, inv_t), (1, np.where(greedy, 1.0, top_ps)), (4, inv_t / DRAFT_TSCALE)):
-                sp[:n, c] = np.repeat(v, ROWS_PER_REQ)  # a request's 6 verify rows share its sampling
+            inv_t = np.where(greedy, 1.0, 1.0 / np.maximum(temps, 1e-6)).astype(
+                np.float32
+            )
+            for c, v in (
+                (0, inv_t),
+                (1, np.where(greedy, 1.0, top_ps)),
+                (4, inv_t / DRAFT_TSCALE),
+            ):
+                sp[:n, c] = np.repeat(
+                    v, ROWS_PER_REQ
+                )  # a request's 6 verify rows share its sampling
             sp.view(np.int32)[:n, 3] = np.repeat(greedy.astype(np.int32), ROWS_PER_REQ)
             rr = np.repeat(np.arange(req, dtype=np.int64), ROWS_PER_REQ)
-            sc = self._sp_static = (skey, sp, rr * 0x85EBCA77, rr * 0x27D4EB2F + 0x165667B1)
+            sc = self._sp_static = (
+                skey,
+                sp,
+                rr * 0x85EBCA77,
+                rr * 0x27D4EB2F + 0x165667B1,
+            )
         sp = sc[1]
         ints = sp.view(np.int32)
         prev = getattr(self, "_qrow", {})
-        ints[:n, 5] = np.repeat(np.array([r in prev for r in rids], dtype=np.int32), ROWS_PER_REQ)
-        ints[:n, 6] = np.repeat(np.array([prev.get(r, 0) for r in rids], dtype=np.int32), ROWS_PER_REQ)
-        ints[:n, 2] = ((self._step_no * 0x9E3779B1 + sc[2]) & 0x7FFFFFFF).astype(np.int32)
-        ints[:n, 7] = ((self._step_no * 0xC2B2AE35 + sc[3]) & 0x7FFFFFFF).astype(np.int32)
+        ints[:n, 5] = np.repeat(
+            np.array([r in prev for r in rids], dtype=np.int32), ROWS_PER_REQ
+        )
+        ints[:n, 6] = np.repeat(
+            np.array([prev.get(r, 0) for r in rids], dtype=np.int32), ROWS_PER_REQ
+        )
+        ints[:n, 2] = ((self._step_no * 0x9E3779B1 + sc[2]) & 0x7FFFFFFF).astype(
+            np.int32
+        )
+        ints[:n, 7] = ((self._step_no * 0xC2B2AE35 + sc[3]) & 0x7FFFFFFF).astype(
+            np.int32
+        )
         # staged in a fixed pinned buffer; ``_device_inputs`` copies it (non-blocking: a pageable copy waited for the
         # stream to drain -- the previous step's draft launch -- stalling this step's host preparation). Rewritten a
         # step later only after that step's first launch, which follows the copy, has completed (``verify_ready``).
@@ -477,7 +618,9 @@ class SingleStepRunner(RunnerDebug):
         ids = getattr(self, "_layer_ids_c", None)
         if ids is None:
             ids = [blk.attn.spec.layer_id for blk in self.tables.target_blocks]
-            ids = self._layer_ids_c = ids + [blk.attn.spec.layer_id for blk in self.tables.draft_blocks]
+            ids = self._layer_ids_c = ids + [
+                blk.attn.spec.layer_id for blk in self.tables.draft_blocks
+            ]
         return ids
 
     def launch(self, input_ids, forward_context, batch=None) -> None:
@@ -494,7 +637,7 @@ class SingleStepRunner(RunnerDebug):
 
         er = self._eng_rows
 
-        def first():   # the step's device preparation (the Engram stage first) and its first launch
+        def first():  # the step's device preparation (the Engram stage first) and its first launch
             if er is not None:
                 er.stage()
                 # join Engram's side stream BEFORE the launch: the step kernel occupies every WGP and spins on its peers,
@@ -514,12 +657,16 @@ class SingleStepRunner(RunnerDebug):
             with torch.cuda.graph(gr, capture_error_mode="thread_local"):
                 first()
             self._graphs[rows] = (key, gr)
-            logger.info("V4.1 single-launch step: captured the preparation graph of %d rows (rank %d)", rows, self.rank)
+            logger.info(
+                "V4.1 single-launch step: captured the preparation graph of %d rows (rank %d)",
+                rows,
+                self.rank,
+            )
             gr.replay()
         else:
             self._seen[rows] = key
             first()
-        self._ev_verify.record()   # the verdict is ready here; the draft launch follows on the same stream
+        self._ev_verify.record()  # the verdict is ready here; the draft launch follows on the same stream
         launches[1](*args)
         self._check_timeouts()
         self._qrow = self._qrow_next
@@ -529,16 +676,22 @@ class SingleStepRunner(RunnerDebug):
         from atom.model_ops.engram.device.staging import EngramStagedRows
 
         if input_ids.numel() != running_bs * ROWS_PER_REQ:
-            raise MonoUnsupported(f"single-launch step: {input_ids.numel()} rows for {running_bs} requests")
+            raise MonoUnsupported(
+                f"single-launch step: {input_ids.numel()} rows for {running_bs} requests"
+            )
         # what the production forward opens and closes around its layers (runtime.v41_begin_forward / end_forward): the
         # Engram stage -- its history snapshot, each verify prefix's cursor candidate (the TentativeState staging that
         # commit_tentative picks from by the verdict's anchors) and the embedding rows' lookup on its side stream
         _w0 = time.perf_counter() if self._timer is not None else None
         md = forward_context.attn_metadata
-        if envs.ATOM_MONO_SINGLE_PROWDUMP:   # (debug) this step's positions for ``dump_step``
+        if (
+            envs.ATOM_MONO_SINGLE_PROWDUMP
+        ):  # (debug) this step's positions for ``dump_step``
             self._dbg_pos = md.step.positions[: input_ids.numel()].clone()
         rows = md.engram_embeddings
-        staged = isinstance(rows, EngramStagedRows) and not getattr(md, "staged_outside_forward", False)
+        staged = isinstance(rows, EngramStagedRows) and not getattr(
+            md, "staged_outside_forward", False
+        )
         # the Engram stage (its lookups, the side-stream gather and the join) runs inside the launch's preparation graph
         # (``launch``): issued op by op here it was ~0.26 ms of host time between the verdict and the next launch
         self._eng_rows = rows if staged else None
@@ -546,7 +699,10 @@ class SingleStepRunner(RunnerDebug):
         self._t_rec = {} if self._timer is not None else None
         if self._t_rec is not None:
             self._timer.mark("a", self._t_rec)
-            self._t_rec["pre"] = (self._t_rec["w_a"] - _w0, _w1 - _w0)   # (run_step entry -> a, of which the Engram stage)
+            self._t_rec["pre"] = (
+                self._t_rec["w_a"] - _w0,
+                _w1 - _w0,
+            )  # (run_step entry -> a, of which the Engram stage)
         self.launch(input_ids, forward_context, batch)
         if self._t_rec is not None:
             self._timer.copy_st(self._t_rec, self.scratch["st"])
@@ -557,12 +713,23 @@ class SingleStepRunner(RunnerDebug):
         """``(output_token_ids [bs, 6] int32, -1 past the emitted tokens; verdict [3, bs] int32: accepted drafts,
         rejected drafts, anchor row)`` -- the kernel's verify (tail), copied out of the scratch the next launch
         rewrites: on a side stream right after the first launch, so the host's wait for them (the step's output D2H,
-        ``verify_ready``) overlaps the draft launch; the caller's stream waits for the copies."""
+        ``verify_ready``) overlaps the draft launch; the caller's stream waits for the copies.
+        """
         cur = torch.cuda.current_stream()
         with torch.cuda.stream(self._verify_stream):
             self._verify_stream.wait_event(self._ev_verify)
-            out = self.scratch["outtok"].view(torch.int32)[: 8 * ROWS_PER_REQ].view(8, ROWS_PER_REQ)[:bs].clone()
-            verdict = self.scratch["verdict"].view(torch.int32)[:24].view(3, 8)[:, :bs].clone()
+            out = (
+                self.scratch["outtok"]
+                .view(torch.int32)[: 8 * ROWS_PER_REQ]
+                .view(8, ROWS_PER_REQ)[:bs]
+                .clone()
+            )
+            verdict = (
+                self.scratch["verdict"]
+                .view(torch.int32)[:24]
+                .view(3, 8)[:, :bs]
+                .clone()
+            )
             self.verify_ready.record()
         out.record_stream(cur)
         verdict.record_stream(cur)
@@ -572,4 +739,9 @@ class SingleStepRunner(RunnerDebug):
 
     def draft_ids(self, bs: int):
         """The next step's drafts [bs, 5] (the kernel's Markov block sampling, mids), as ``Drafter.propose`` returns."""
-        return self.scratch["mids"].view(torch.int32)[: 8 * 5].view(8, 5)[:bs].to(torch.int64)
+        return (
+            self.scratch["mids"]
+            .view(torch.int32)[: 8 * 5]
+            .view(8, 5)[:bs]
+            .to(torch.int64)
+        )

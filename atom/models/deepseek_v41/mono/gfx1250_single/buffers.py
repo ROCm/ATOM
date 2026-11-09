@@ -282,7 +282,10 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "iq_out": T * 4096,
         "iqs_out": T * 32 * 4,
         "iw_out": T * 32 * 4,
-        "cpart": 8 * T * 1024 * 4,  # the compressor's wkv_gate K-split partials (compressor.stage_cgemm)
+        "cpart": 8
+        * T
+        * 1024
+        * 4,  # the compressor's wkv_gate K-split partials (compressor.stage_cgemm)
         # the selection tree (M.IDX_LEVELS levels): a level's lists of (value, index) pairs a row, a level-0 list per
         # 8192 index rows of the bound (ILW), k a list -- 2048 for layer 20's candidate blocks (topk "blk": also
         # its dummy-row store, row T, lands there), 512 otherwise

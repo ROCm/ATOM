@@ -3878,7 +3878,9 @@ class ModelRunner:
         no logprobs, no required channel (it returns ids and the verdict, not
         logits)."""
         ready = getattr(self.model, "step_ready", None)
-        if envs.ATOM_MONO_SINGLE_SHADOW:  # bring-up: the production path serves, the launch only compares
+        if (
+            envs.ATOM_MONO_SINGLE_SHADOW
+        ):  # bring-up: the production path serves, the launch only compares
             return None
         if ready is None or not hasattr(self, "drafter"):
             return None

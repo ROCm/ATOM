@@ -600,23 +600,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # production forward (reads the rows it wrote); SHADOW_NOENGRAM: the production
     # forward without Engram.
     "ATOM_MONO_SINGLE_SHADOW": lambda: os.getenv("ATOM_MONO_SINGLE_SHADOW", "0") == "1",
-    "ATOM_MONO_SINGLE_SHADOW_NL": lambda: int(os.getenv("ATOM_MONO_SINGLE_SHADOW_NL", "40")),
-    "ATOM_MONO_SINGLE_SHADOW_AFTER": lambda: os.getenv("ATOM_MONO_SINGLE_SHADOW_AFTER", "0") == "1",
-    "ATOM_MONO_SINGLE_SHADOW_NOENGRAM": lambda: os.getenv("ATOM_MONO_SINGLE_SHADOW_NOENGRAM", "0") == "1",
+    "ATOM_MONO_SINGLE_SHADOW_NL": lambda: int(
+        os.getenv("ATOM_MONO_SINGLE_SHADOW_NL", "40")
+    ),
+    "ATOM_MONO_SINGLE_SHADOW_AFTER": lambda: os.getenv(
+        "ATOM_MONO_SINGLE_SHADOW_AFTER", "0"
+    )
+    == "1",
+    "ATOM_MONO_SINGLE_SHADOW_NOENGRAM": lambda: os.getenv(
+        "ATOM_MONO_SINGLE_SHADOW_NOENGRAM", "0"
+    )
+    == "1",
     # TIMING: where a served step's time goes (host preparation, GPU gaps, the
     # kernel and its stamped spans), logged every TIMING_EVERY steps.
     "ATOM_MONO_SINGLE_TIMING": lambda: os.getenv("ATOM_MONO_SINGLE_TIMING", "0") == "1",
-    "ATOM_MONO_SINGLE_TIMING_EVERY": lambda: int(os.getenv("ATOM_MONO_SINGLE_TIMING_EVERY", "64")),
+    "ATOM_MONO_SINGLE_TIMING_EVERY": lambda: int(
+        os.getenv("ATOM_MONO_SINGLE_TIMING_EVERY", "64")
+    ),
     # CHECK_ROWS=<layer>: that layer's kernel table row against the checkpoint, once.
     "ATOM_MONO_SINGLE_CHECK_ROWS": lambda: (
-        int(os.environ["ATOM_MONO_SINGLE_CHECK_ROWS"]) if os.getenv("ATOM_MONO_SINGLE_CHECK_ROWS") else None
+        int(os.environ["ATOM_MONO_SINGLE_CHECK_ROWS"])
+        if os.getenv("ATOM_MONO_SINGLE_CHECK_ROWS")
+        else None
     ),
     # PROWDUMP=<dir>: per served step (the first PROWDUMP_N), the verification's
     # inputs / outputs and the non-finite head-input rows, one .npz a rank (the draft
     # logits too for the first PROWDUMP_QLOG).
     "ATOM_MONO_SINGLE_PROWDUMP": lambda: os.getenv("ATOM_MONO_SINGLE_PROWDUMP"),
-    "ATOM_MONO_SINGLE_PROWDUMP_N": lambda: int(os.getenv("ATOM_MONO_SINGLE_PROWDUMP_N", "80")),
-    "ATOM_MONO_SINGLE_PROWDUMP_QLOG": lambda: int(os.getenv("ATOM_MONO_SINGLE_PROWDUMP_QLOG", "12")),
+    "ATOM_MONO_SINGLE_PROWDUMP_N": lambda: int(
+        os.getenv("ATOM_MONO_SINGLE_PROWDUMP_N", "80")
+    ),
+    "ATOM_MONO_SINGLE_PROWDUMP_QLOG": lambda: int(
+        os.getenv("ATOM_MONO_SINGLE_PROWDUMP_QLOG", "12")
+    ),
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
     # with with_indexer=True), which does index Q/K/W projection, paged FP8

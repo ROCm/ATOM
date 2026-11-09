@@ -3,17 +3,18 @@
 """The one deployment the single-launch step is written for, and why a deployment cannot run it.
 
 TP4, DSpark with a block of 5 (a verify of 6 rows a request), BF16 KV cache, FP8 index cache, up to 8 requests (48
-target rows, 40 draft rows), the 40 target layers and 3 draft stages of DeepSeek-V4.1-Flash."""
+target rows, 40 draft rows), the 40 target layers and 3 draft stages of DeepSeek-V4.1-Flash.
+"""
 
 from atom.mono.runtime.deployment import common_refusals, first_refusal
 
 TP = 4
 SUPPORTED_TP = (TP,)
 SPEC_TOKENS = 5
-ROWS_PER_REQ = SPEC_TOKENS + 1   # a request's verify rows: the anchor and its 5 drafts
+ROWS_PER_REQ = SPEC_TOKENS + 1  # a request's verify rows: the anchor and its 5 drafts
 MAX_REQUESTS = 8
 MAX_ROWS = MAX_REQUESTS * ROWS_PER_REQ
-NL, NDR = 40, 3   # target layers, draft stages
+NL, NDR = 40, 3  # target layers, draft stages
 
 
 def config_refusal(atom_config, dims) -> str | None:
