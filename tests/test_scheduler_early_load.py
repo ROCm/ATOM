@@ -519,3 +519,109 @@ def test_lookup_ready_in_lookup_thread_mode(fake_lmcache_modules):  # noqa: F811
         assert not sched.lookup_ready(seq)  # consumed
     finally:
         client.close()
+
+
+# -- a withdrawn admission gives the save frontier back ---------------------------
+
+
+def _chunked_with_tracker():
+    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+
+    conn = ChunkedOffloadSchedulerBase.__new__(ChunkedOffloadSchedulerBase)
+    conn._do_load = conn._do_save = True
+    conn._save_tracker = {}
+    conn._admission_undo = None
+    conn._load_specs = {}
+    conn._reqs_need_recv = {}
+    conn._hit_save_floors = {"7": 48}
+    conn._begin_load_lifecycle = lambda seq: None
+    conn._forget_tier_hit = lambda sid: None
+    conn._lmcache_hit_save_floor = lambda ls: 0
+    conn.cancel_pending_load = lambda seq: None
+    conn._lookup_results = {}
+    return conn
+
+
+def test_take_back_removes_the_tracker_entry_the_admission_created():
+    conn = _chunked_with_tracker()
+    seq = SimpleNamespace(id=7, num_cached_tokens=0)
+    conn.update_state_after_alloc(seq)
+    assert conn._save_tracker["7"][1] == 48
+    conn.cancel_preadmission(seq)
+    assert "7" not in conn._save_tracker
+
+
+def test_take_back_keeps_an_older_save_generations_frontier():
+    conn = _chunked_with_tracker()
+    seq = SimpleNamespace(id=7, num_cached_tokens=0)
+    conn._save_tracker["7"] = [seq, 16]  # a save already dispatched up to 16
+    conn.update_state_after_alloc(seq)
+    assert conn._save_tracker["7"][1] == 48
+    conn.cancel_preadmission(seq)
+    assert conn._save_tracker["7"][1] == 16
+
+
+# -- the delayer's and the router's view of a tier waiter --------------------------
+
+
+def _sched(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
+    sched = Scheduler(
+        MockConfig(max_num_seqs=8, max_num_batched_tokens=64, num_kvcache_blocks=100)
+    )
+    sched.kv_connector = _Connector()
+    return sched
+
+
+def test_a_completion_reported_as_a_string_id_is_recognised(monkeypatch, seq_factory):
+    sched = _sched(monkeypatch)
+    seq = seq_factory(list(range(16)))
+    seq.id = 123
+    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert not sched._tier_load_finished(seq)
+    sched.finished_recving_kv_req_ids = ["123"]
+    assert sched._tier_load_finished(seq)
+
+
+def test_pending_tokens_follow_the_replay_adjusted_resume_point(
+    monkeypatch, seq_factory
+):
+    sched = _sched(monkeypatch)
+    sched.block_manager.state = SimpleNamespace(transfer=SimpleNamespace(replays=True))
+    seq = seq_factory(list(range(40)))
+    seq.has_per_req_cache = True
+    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    seq.num_cached_tokens = 8
+    seq.offload_loaded_tokens = 32
+    hbs = sched.block_manager.hash_block_size
+    # The prefill starts one hash block below the loaded boundary.
+    assert sched.pending_prefill_tokens(seq) == 40 - (32 - hbs)
+    # A failed load falls back to the HBM hit.
+    sched.failed_recving_kv_req_ids = [seq.id]
+    assert sched.pending_prefill_tokens(seq) == 40 - 8
+
+
+def test_a_completed_tier_waiter_is_not_probed_for_a_new_allocation(
+    monkeypatch, seq_factory
+):
+    sched = _sched(monkeypatch)
+    seq = seq_factory(list(range(32)))
+    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    seq.num_cached_tokens = 4
+    seq.offload_loaded_tokens = 16
+    sched.waiting.append(seq)
+    sched.finished_recving_kv_req_ids = [seq.id]
+    sched.block_manager.can_allocate_memoized = lambda s: pytest.fail("probed")
+    prefillable, pending = sched._probe_local_prefill_work()
+    assert prefillable and pending == 32 - 16
+
+
+def test_early_loads_in_flight_do_not_use_up_the_probe_budget(monkeypatch, seq_factory):
+    sched = _sched(monkeypatch)
+    loading = [seq_factory(list(range(16))) for _ in range(4)]
+    for seq in loading:
+        seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched._early_load.entries[seq.id] = (seq, 0.0)
+        sched.waiting.append(seq)
+    sched.waiting.append(seq_factory(list(range(16))))  # a fifth, ready to admit
+    assert sched._can_admit_head_prefill()

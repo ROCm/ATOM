@@ -149,20 +149,18 @@ def test_a_released_unsent_seq_gives_its_charge_back():
 
 
 def test_a_mooncake_store_tier_defaults_min_load_to_512(monkeypatch):
-    import json
-
-    from atom.model_engine.arg_utils import default_store_min_load_tokens
+    from atom.kv_transfer.offload.config import default_store_min_load_tokens
 
     store = {"kv_connector": "mooncake_store", "kv_role": "offload"}
     pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
     for config in (store, {"kv_connector": "multi", "connectors": [pd, store]}):
         monkeypatch.delenv("OFFLOAD_MIN_LOAD_TOKENS", raising=False)
-        default_store_min_load_tokens(json.dumps(config))
+        default_store_min_load_tokens(config)
         assert os.environ["OFFLOAD_MIN_LOAD_TOKENS"] == "512"
     # Another tier keeps the global default, and a value the user set is kept.
     monkeypatch.delenv("OFFLOAD_MIN_LOAD_TOKENS", raising=False)
-    default_store_min_load_tokens(json.dumps({"kv_connector": "lmcache_mp"}))
+    default_store_min_load_tokens({"kv_connector": "lmcache_mp"})
     assert "OFFLOAD_MIN_LOAD_TOKENS" not in os.environ
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "2048")
-    default_store_min_load_tokens(json.dumps(store))
+    default_store_min_load_tokens(store)
     assert os.environ["OFFLOAD_MIN_LOAD_TOKENS"] == "2048"

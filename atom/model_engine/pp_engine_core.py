@@ -109,6 +109,7 @@ class PPEngineCoreProc(EngineCore):
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
+            self.scheduler.close_kv_connector()
 
     def pause_generation(self, deadline: float) -> None:
         """On the head, schedule nothing more and retire what is in flight.
