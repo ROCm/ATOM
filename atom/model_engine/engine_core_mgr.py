@@ -22,6 +22,7 @@ import zmq.asyncio
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.offload.config import min_load_tokens
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
@@ -198,6 +199,7 @@ class CoreManager:
     _bp_offline_batch = False
     _bp_dispatch_paused = False
     _input_send_lock = Lock()
+    _dispatch_send_lock = Lock()
 
     def _init_shared_state(
         self,
@@ -386,6 +388,7 @@ class CoreManager:
         # input_sockets send is serialized through this lock (see _send_request).
         # Uncontended in the legacy path, so it costs nothing when disabled.
         self._input_send_lock = Lock()
+        self._dispatch_send_lock = Lock()
         # Control traffic (utility commands, abort, shutdown) travels on its own
         # sockets so that input_sockets keeps a single writer -- see
         # _send_request. These have several writer threads and so do need
@@ -1186,11 +1189,15 @@ class CoreManager:
             for dp_rank, rank_seqs in enumerate(dp_seqs):
                 if not rank_seqs:
                     continue
-                self._send_request(dp_rank, _add_frame(rank_seqs))
-                dispatched[dp_rank] = True
-                if self._store_router is not None:
-                    with self._lb_lock:
-                        self._backlog_note_sent_locked(dp_rank, rank_seqs)
+                # Serialize tracked sends and their ingest-order accounting.
+                # _send_request takes its own socket lock; neither lock is
+                # acquired while holding _lb_lock in the selection phase.
+                with self._dispatch_send_lock:
+                    self._send_request(dp_rank, _add_frame(rank_seqs))
+                    dispatched[dp_rank] = True
+                    if self._store_router is not None:
+                        with self._lb_lock:
+                            self._backlog_note_sent_locked(dp_rank, rank_seqs)
                 batch_prefill_tokens = sum(
                     int(getattr(seq, "num_prompt_tokens", 0) or 0) for seq in rank_seqs
                 )
@@ -1503,7 +1510,7 @@ class CoreManager:
                 f"rank shares ({', '.join(sorted(SHARED_TIER_CONNECTORS))}); "
                 f"the KV connectors are {names!r}"
             )
-        return StoreAwareRouter(envs.OFFLOAD_MIN_LOAD_TOKENS, self._dp_lb_req_equiv)
+        return StoreAwareRouter(min_load_tokens(config), self._dp_lb_req_equiv)
 
     def _backlog_note_charged_locked(self, seq, dp_rank: int) -> None:
         """`seq` was just charged to `dp_rank` and is not sent yet."""

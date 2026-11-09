@@ -552,3 +552,60 @@ def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
     assert progressed_while_router_locked
     assert sum(mgr._rank_reqs) == 1
     assert sum(mgr._rank_tokens) == 0
+
+
+def test_concurrent_store_dispatch_accounts_in_socket_send_order():
+    import pickle
+    import time
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from types import SimpleNamespace
+
+    mgr = _make_mgr(1)
+    mgr._store_router = SimpleNamespace(charge=lambda _sid: 0)
+    mgr._backlog_report = [None]
+    mgr._backlog_sent = [0]
+    mgr._backlog_unseen = [deque()]
+    first_sent, second_started = Event(), Event()
+    order = []
+
+    def send(_rank, payload):
+        _, seqs = pickle.loads(payload)
+        sid = seqs[0].id
+        order.append(("send", sid))
+        if sid == "first":
+            first_sent.set()
+            assert second_started.wait(2)
+            # Give the concurrent caller a chance to send while the first
+            # caller has not returned to its bookkeeping yet.
+            time.sleep(0.02)
+
+    original = mgr._backlog_note_sent_locked
+
+    def account(rank, seqs):
+        order.append(("account", seqs[0].id))
+        original(rank, seqs)
+
+    mgr._send_request = send
+    mgr._backlog_note_sent_locked = account
+
+    def second():
+        assert first_sent.wait(2)
+        second_started.set()
+        mgr._dispatch_to_dp_ranks([_FakeSeq("second", 20, data_parallel_rank=0)])
+
+    with ThreadPoolExecutor(2) as pool:
+        a = pool.submit(
+            mgr._dispatch_to_dp_ranks, [_FakeSeq("first", 10, data_parallel_rank=0)]
+        )
+        b = pool.submit(second)
+        a.result(timeout=5)
+        b.result(timeout=5)
+    assert order == [
+        ("send", "first"),
+        ("account", "first"),
+        ("send", "second"),
+        ("account", "second"),
+    ]
+    assert list(mgr._backlog_unseen[0]) == [10, 20]

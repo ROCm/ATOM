@@ -2161,6 +2161,7 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: SpeculativeConfig | None = None
     kv_transfer_config: dict = field(default_factory=dict)
+    offload_min_load_tokens: int | None = field(default=None, init=False)
     kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
     # DSpark runtime knobs. Built once in the parent from --dspark-config (see
     # EngineArgs) and pickled into every worker. Read sites use `config.dspark.*`
@@ -2713,7 +2714,6 @@ class Config:
             # different namespace and every scheduler lookup misses. Snapshot it
             # here, before the config is shipped to either process.
             from atom.kv_transfer.offload.config import (
-                default_store_min_load_tokens,
                 snapshot_kv_encoding,
                 snapshot_page_hf_geometry,
             )
@@ -2723,8 +2723,7 @@ class Config:
             # llama.py adds a key to the live `rope_parameters` while a worker
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
-            # Before the engine and worker processes are spawned.
-            default_store_min_load_tokens(self.kv_transfer_config)
+        self._resolve_offload_min_load_tokens()
         self._resolve_dynamic_chunking()
         self._check_pp_support()
 
@@ -2983,6 +2982,12 @@ class Config:
                 "The DSpark confidence scheduler (confidence_schedule) is not "
                 "supported with pipeline_parallel_size > 1."
             )
+
+    def _resolve_offload_min_load_tokens(self) -> None:
+        from atom.kv_transfer.offload.config import resolve_min_load_tokens
+
+        # Resolve once before spawning workers, identically for CLI and API.
+        self.offload_min_load_tokens = resolve_min_load_tokens(self.kv_transfer_config)
 
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.

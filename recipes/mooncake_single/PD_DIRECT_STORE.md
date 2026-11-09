@@ -58,7 +58,7 @@ python recipes/mooncake_single/run_pd_direct.py --role decode \
 
 Both use TP4+DPA, no EP/MoRI, DSpark5, BF16 KV/FP8 index, GPU utilization
 0.65, max 64 sequences per rank, and `--dp-load-balance least_requests`.
-P has max batched tokens 16384 and explicit `--offload-prefetch`; D has 1024.
+P has max batched tokens 16384; D has 1024. Store early loading is scheduled automatically; the removed `--offload-prefetch` option is not used.
 There is no session affinity. Do not substitute `prefix_spread` when reproducing
 this particular run.
 

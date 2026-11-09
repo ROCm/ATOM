@@ -762,31 +762,30 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     )
 
 
-# `OFFLOAD_MIN_LOAD_TOKENS` default for a Mooncake Store tier. The Store is
-# shared by every DP rank and is measured against HBM-only prefix caching, so it
-# should serve what HBM would; the other offload tiers keep the global default
-# (`envs.OFFLOAD_MIN_LOAD_TOKENS`) they were tuned with.
-MOONCAKE_STORE_MIN_LOAD_TOKENS = "512"
+def resolve_min_load_tokens(kv_transfer_config: dict | None) -> int:
+    """Resolve a tier's default without changing another engine's environment."""
+    from atom.utils import envs
 
-
-def default_store_min_load_tokens(kv_transfer_config: dict) -> None:
-    """Default `OFFLOAD_MIN_LOAD_TOKENS` for a Mooncake Store deployment.
-
-    Called when `Config` is built, before the engine and worker processes are
-    spawned, so every reader (scheduler, workers, router) inherits one value
-    whether the engine is started from the CLI or the Python API. A value the
-    user set is kept.
-    """
-    if "OFFLOAD_MIN_LOAD_TOKENS" in os.environ or not kv_transfer_config:
-        return
+    if "OFFLOAD_MIN_LOAD_TOKENS" in os.environ:
+        return envs.OFFLOAD_MIN_LOAD_TOKENS
+    config = kv_transfer_config or {}
     subs = (
-        kv_transfer_config.get("connectors", [])
-        if str(kv_transfer_config.get("kv_connector", "")).strip().casefold() == "multi"
-        else [kv_transfer_config]
+        config.get("connectors", [])
+        if str(config.get("kv_connector", "")).strip().casefold() == "multi"
+        else [config]
     )
     if any(
         isinstance(sub, dict)
         and str(sub.get("kv_connector", "")).strip().casefold() == "mooncake_store"
         for sub in subs
     ):
-        os.environ["OFFLOAD_MIN_LOAD_TOKENS"] = MOONCAKE_STORE_MIN_LOAD_TOKENS
+        return 512
+    return 8192
+
+
+def min_load_tokens(config) -> int:
+    """Use the shared Config snapshot; support lightweight connector configs."""
+    value = getattr(config, "offload_min_load_tokens", None)
+    if value is not None:
+        return int(value)
+    return resolve_min_load_tokens(getattr(config, "kv_transfer_config", None))

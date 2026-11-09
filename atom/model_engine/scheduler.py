@@ -34,6 +34,7 @@ import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
+from atom.kv_transfer.offload.config import min_load_tokens
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import (
     AdmissionProbe,
@@ -3432,7 +3433,7 @@ class Scheduler:
         if not chunk or not callable(held):
             return False
         return self.block_manager.lower_hit_to_chunk(
-            seq, probe, chunk, int(held(seq)), envs.OFFLOAD_MIN_LOAD_TOKENS
+            seq, probe, chunk, int(held(seq)), min_load_tokens(self.config)
         )
 
     def _probe_hbm_prefix(self, seq: Sequence) -> AdmissionProbe:
@@ -4176,7 +4177,7 @@ class Scheduler:
             state.skip(seq.id, "multimodal")
             state.settled.add(seq.id)
             return False
-        if seq.num_tokens < envs.OFFLOAD_MIN_LOAD_TOKENS:
+        if seq.num_tokens < min_load_tokens(self.config):
             # No tier hit can be worth loading (`_load_ruled_out`).
             state.skip(seq.id, "below_min_load")
             state.settled.add(seq.id)
@@ -4432,6 +4433,9 @@ class Scheduler:
         if not self._is_preemptable(seq):
             return False
         self.total_preemptions += 1
+        # Routing credit describes the old allocation, which is surrendered.
+        # A new admission must recheck HBM and tier availability.
+        seq.dp_est_cached_tokens = 0
         seq.status = SequenceStatus.WAITING
         # Strip the placeholder tokens postprocess appended, so the recompute
         # restarts from real context only.

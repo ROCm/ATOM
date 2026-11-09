@@ -576,9 +576,42 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             )
         self._reqs_need_recv.clear()
         self._reqs_need_save.clear()
+        # Those allocations are now dispatched. Cancellation must drain the
+        # worker's source claim, never apply preadmission rollback to them.
+        getattr(self, "_producer_admission_undo", {}).clear()
         return meta
 
+    def cancel_preadmission(self, seq: Sequence) -> None:
+        """Undo only producer state installed by an undispatched allocation."""
+        undo = getattr(self, "_producer_admission_undo", {}).pop(seq.id, None)
+        if undo is None or undo[0] is not seq:
+            return
+        _, previous_save, already_claimed, previous_waiting, was_ready = undo
+        if previous_save is None:
+            self._reqs_need_save.pop(seq.id, None)
+        else:
+            self._reqs_need_save[seq.id] = previous_save
+        if not already_claimed:
+            self._awaiting_send.discard(str(seq.id))
+        if previous_waiting is not None:
+            self._chunked_waiting[seq.id] = previous_waiting
+        if was_ready:
+            self._chunked_ready.add(seq.id)
+
     def update_state_after_alloc(self, seq: Sequence) -> None:
+        if self.is_producer:
+            if not hasattr(self, "_producer_admission_undo"):
+                self._producer_admission_undo = {}
+            self._producer_admission_undo.setdefault(
+                seq.id,
+                (
+                    seq,
+                    self._reqs_need_save.get(seq.id),
+                    str(seq.id) in self._awaiting_send,
+                    self._chunked_waiting.get(seq.id),
+                    seq.id in self._chunked_ready,
+                ),
+            )
         self._chunked_waiting.pop(seq.id, None)
         self._chunked_ready.discard(seq.id)
         params = seq.kv_transfer_params or {}

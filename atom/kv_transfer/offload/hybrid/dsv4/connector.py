@@ -60,6 +60,7 @@ from atom.kv_transfer.offload._offload_common import (
     validated_kv_role,
 )
 from atom.kv_transfer.offload.atom_lmcache_staging import load_stream_priority
+from atom.kv_transfer.offload.config import min_load_tokens
 from atom.kv_transfer.offload.hybrid.dsv4.codec import (
     HEADER_BYTES,
     DSV4CheckpointCodec,
@@ -1909,7 +1910,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
         # by the OFFLOAD_UNALIGNED_HANDOFF env var; now unconditional.)
-        self._min_load_tokens = envs.OFFLOAD_MIN_LOAD_TOKENS
+        self._min_load_tokens = min_load_tokens(config)
 
         world = offcfg.lmcache_replica_world_size(config)
         meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
