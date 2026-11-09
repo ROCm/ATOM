@@ -41,5 +41,8 @@ def config_refusal(atom_config, dims) -> str | None:
             spec is None or spec.num_speculative_tokens == SPEC_TOKENS,
             "DSpark block size",
         ),
+        # a request's verify is all 6 rows: the confidence schedule and ragged verify give it fewer
+        (not atom_config.dspark.confidence_schedule, "DSpark confidence schedule"),
+        (not atom_config.dspark.ragged, "DSpark ragged verify"),
     ]
     return first_refusal(checks)

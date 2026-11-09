@@ -81,7 +81,11 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
         """``ModelRunner.run_model``, each decode step: run it as the single launch and return the runner (its
         ``verify_outputs`` / ``output_stream`` for postprocess), or None for the production path.
         """
-        runner = self.single_step_runner(batch, rows)
+        runner = (
+            self.single_step_runner(batch, rows)
+            if rows == running_bs * ROWS_PER_REQ
+            else None
+        )
         if runner is not None:
             runner.run_step(input_ids, running_bs, get_forward_context(), batch)
         self._served = runner

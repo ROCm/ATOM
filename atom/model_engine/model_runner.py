@@ -3127,6 +3127,7 @@ class ModelRunner:
         input_ids: torch.Tensor,
         batch: ScheduledBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._served = None  # set below when the model serves the whole step
         forward_context = get_forward_context()
         context = forward_context.context
         bs = context.scheduled_bs
@@ -3776,7 +3777,6 @@ class ModelRunner:
         # race the dummy's still-pending H2D copies.
         self._advance_forward_vars()
         self._gate_staging_reuse()
-        self._served = None
         (
             input_ids,
             temperatures,

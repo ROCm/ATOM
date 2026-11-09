@@ -47,6 +47,7 @@ def atom_config(**overrides):
         "kv_cache_dtype": "bf16",
         "index_cache_dtype": "fp8",
         "speculative_config": NS(method="dspark", num_speculative_tokens=5),
+        "dspark": NS(confidence_schedule=False, ragged=False),
     }
     fields.update(overrides)
     return NS(**fields)
@@ -88,6 +89,14 @@ def test_the_supported_deployment_is_not_refused():
         ({"speculative_config": None}, "speculative method None"),
         ({"enable_expert_parallel": True}, "expert parallel"),
         ({"pipeline_parallel_size": 2}, "PP > 1"),
+        (
+            {"dspark": NS(confidence_schedule=True, ragged=True)},
+            "DSpark confidence schedule",
+        ),
+        (
+            {"dspark": NS(confidence_schedule=False, ragged=True)},
+            "DSpark ragged verify",
+        ),
     ],
 )
 def test_other_deployments_are_refused(change, why):
@@ -302,6 +311,14 @@ def test_a_served_step_drafts_from_the_kernel(served):
     assert drafter.kv == 0
     assert drafter.propose(next_token_ids=torch.zeros(8)) == ("kernel", 8)
     assert runner.forgot == 0
+
+
+@needs_aiter
+def test_a_step_with_fewer_rows_than_6_a_request_is_not_served(served):
+    m, _ = served
+    # 8 requests in 42 rows (a ragged or confidence-scheduled verify): the launch reads 6 rows a request
+    assert m.step_override(torch.zeros(42), 8, 42, _batch()) is None
+    assert m._single.runner.steps == 0
 
 
 @needs_aiter

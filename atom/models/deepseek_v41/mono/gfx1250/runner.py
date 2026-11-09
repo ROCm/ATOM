@@ -186,6 +186,10 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         self.output_stream = self._verify_stream = torch.cuda.Stream()
         self._timer = timeline(self.rank)  # ATOM_MONO_TIMELINE (``debug``)
         self._eng_rows = None
+        # the poll-timeout counter's copy, read a launch late (``_check_timeouts``)
+        self._to_buf = torch.empty(2, dtype=torch.int32, pin_memory=True)
+        self._to_event = torch.cuda.Event()
+        self._to_pending, self._to_seen = False, 0
         # every width built now (each a compile or a disk-cache load, then a TP barrier: ``prepare``), not on its first
         # step: a width first met mid-serve stalled every request for its JIT (~18 s cold)
         t0 = time.perf_counter()
@@ -258,10 +262,9 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         """The kernel's poll-timeout counter (hx.note_timeout: scratch cyc int32 [0] count, [1] last site), read a
         launch late without a sync; any timeout means that step computed on stale peer data.
         """
-        prev = getattr(self, "_to_pend", None)
-        if prev is not None and prev[1].query():
-            n, site = prev[0].tolist()
-            if n != getattr(self, "_to_seen", 0):
+        if self._to_pending and self._to_event.query():
+            n, site = self._to_buf.tolist()
+            if n != self._to_seen:
                 logger.error(
                     "V4.1 single-launch step: %d cross-rank poll timeouts so far (rank %d, last site %d)",
                     n,
@@ -269,15 +272,13 @@ class SingleStepRunner(StepInputs, RunnerDebug):
                     site,
                 )
                 self._to_seen = n
-            prev = None
-        if prev is None:
-            buf = getattr(self, "_to_buf", None)
-            if buf is None:
-                buf = self._to_buf = torch.empty(2, dtype=torch.int32, pin_memory=True)
-            buf.copy_(self.scratch["cyc"].view(torch.int32)[:2], non_blocking=True)
-            ev = torch.cuda.Event()
-            ev.record()
-            self._to_pend = (buf, ev)
+            self._to_pending = False
+        if not self._to_pending:
+            self._to_buf.copy_(
+                self.scratch["cyc"].view(torch.int32)[:2], non_blocking=True
+            )
+            self._to_event.record()
+            self._to_pending = True
 
     def _layer_ids(self):
         ids = getattr(self, "_layer_ids_c", None)

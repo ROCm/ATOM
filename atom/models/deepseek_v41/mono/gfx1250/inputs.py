@@ -5,7 +5,6 @@ preparation the launch's graph captures (``_host_inputs`` / ``_device_inputs``),
 parameters (``_sampling``). ``SingleStepRunner`` inherits them."""
 
 import logging
-import os
 
 import numpy as np
 import torch
@@ -15,9 +14,6 @@ from atom.models.deepseek_v41.mono.gfx1250.config import ROWS_PER_REQ
 from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
-
-# the recipe's draft temperature scale (dspark_prob_sample.DRAFT_TSCALE): q = softmax(z * invT / TSCALE)
-DRAFT_TSCALE = float(os.environ.get("ATOM_DSPARK_PROB_DRAFT_TSCALE", "1.0"))
 
 
 class StepInputs:
@@ -261,8 +257,7 @@ class StepInputs:
     def _sampling(self, batch, req) -> None:
         """Each target row's sampling from its request (``ScheduledBatch`` temperatures / top_ps / top_ks), as the
         recipe's prob drafting + block verification (``dspark_prob_sample``, PROB_DRAFT / BLOCK_VERIFY): greedy
-        (temperature 0) -> argmax drafts and the argmax match; else the drafts are sampled from q (1 / temperature
-        times ``ATOM_DSPARK_PROB_DRAFT_TSCALE``) and verified against p (the top-p set of logits / temperature) by the
+        (temperature 0) -> argmax drafts and the argmax match; else the drafts are sampled from q (logits / temperature) and verified against p (the top-p set of logits / temperature) by the
         probability ratio. q is the kernel's own (``qlog``) when the request's drafts came from the last kernel launch
         (``hasq``, its row there ``qsrc``), else the one-hot rule. Noise seeds mix a step counter and the batch row.
         Top-k is not in the kernel: refused."""
@@ -294,7 +289,7 @@ class StepInputs:
             for c, v in (
                 (0, inv_t),
                 (1, np.where(greedy, 1.0, top_ps)),
-                (4, inv_t / DRAFT_TSCALE),
+                (4, inv_t),  # the drafts' inverse temperature: the request's
             ):
                 sp[:n, c] = np.repeat(
                     v, ROWS_PER_REQ
