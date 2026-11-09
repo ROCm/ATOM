@@ -19,6 +19,7 @@ def _hash(**overrides):
         "dcp_config": None,
         "enable_dp_attention": False,
         "index_cache_dtype": None,
+        "index_cache_layout": None,
         "hf_config": SimpleNamespace(),
         "max_model_len": 4096,
         "max_num_seqs": 256,

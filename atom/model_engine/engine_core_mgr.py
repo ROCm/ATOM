@@ -43,6 +43,7 @@ from atom.model_engine.prefix_spread import PrefixSpreadRouter
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
+from atom.structured_output import is_structured
 from atom.utils import (
     envs,
     get_open_zmq_inproc_path,
@@ -1047,9 +1048,7 @@ class CoreManager:
             )
 
     def add_request(self, seqs: list[Sequence]):
-        structured = [
-            seq for seq in seqs if getattr(seq, "json_schema", None) is not None
-        ]
+        structured = [seq for seq in seqs if is_structured(seq)]
         if structured:
             try:
                 if self.structured_request_prepare is None:
@@ -1065,7 +1064,7 @@ class CoreManager:
     def _release_structured_requests(self, seqs):
         # The submitted/finished sequences own the cleanup information. There
         # is no cross-thread registry: workers tolerate repeated releases.
-        ids = [seq.id for seq in seqs if getattr(seq, "json_schema", None) is not None]
+        ids = [seq.id for seq in seqs if is_structured(seq)]
         if not ids:
             return
         try:
