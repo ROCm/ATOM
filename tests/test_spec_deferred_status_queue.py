@@ -17,7 +17,7 @@ from atom.model_engine.model_runner import (
     _kv_config_has_producer,
     tokenIDProcessor,
 )
-from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.scheduler import ScheduledBatch, defers_output
 from atom.spec_decode.status import SpecStatusQueue
 from atom.utils.selector import Family
 
@@ -163,6 +163,26 @@ def _processor_for(*, kv_config: dict, family: Family) -> tokenIDProcessor:
         mock.patch("atom.model_engine.model_runner.torch.zeros"),
     ):
         return tokenIDProcessor(runner, max_num_batched_tokens=8)
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_the_scheduler_resolves_the_runners_deferral(pp_size):
+    """The scheduler has no runner: it reads the family off the config, and
+    must land where the runner does for a recurrent-state producer."""
+    config = SimpleNamespace(
+        pipeline_parallel_size=pp_size,
+        kv_transfer_config={"kv_role": "kv_producer"},
+        hf_config=object(),
+    )
+    with (
+        mock.patch("atom.model_engine.scheduler.get_hf_text_config"),
+        mock.patch(
+            "atom.model_engine.scheduler.attn_family", return_value=Family.KIMI_MLA
+        ),
+    ):
+        assert defers_output(config) is False
+    config.kv_transfer_config = {}
+    assert defers_output(config) is (pp_size == 1)
 
 
 def test_a_consumer_keeps_deferred_output():

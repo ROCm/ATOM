@@ -33,7 +33,9 @@ class MonoTargetModel(nn.Module):
     def forward(
         self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None
     ):
-        meta = self.runner.step_meta(input_ids, intermediate_tensors, inputs_embeds)
+        meta = self.runner.step_meta(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
         if meta is None:
             return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
         hidden = self.runner.forward(input_ids, meta)

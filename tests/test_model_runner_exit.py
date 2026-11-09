@@ -29,13 +29,15 @@ def test_a_failed_megamoe_close_still_releases_everything(monkeypatch):
     runner = SimpleNamespace(
         still_running=True,
         vision_embeddings=SimpleNamespace(clear=lambda: None),
+        structured_compile_executor=None,
         req_graph=object(),
         kv_cache=object(),
         model=object(),
+        sp_mega_moe=SimpleNamespace(close=lambda: calls.append("sp_close")),
     )
 
     with pytest.raises(RuntimeError, match="close failed"):
         mr.ModelRunner.exit(runner)
-    assert calls == ["close_mega_transports", "destroy", "empty"]
+    assert calls == ["sp_close", "close_mega_transports", "destroy", "empty"]
     assert runner.req_graph is None
     assert not hasattr(runner, "kv_cache") and not hasattr(runner, "model")

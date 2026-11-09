@@ -17,7 +17,6 @@ from atom.model_ops.attentions.deepseek_v4_attn import (
     DeepseekV4AttentionMetadataBuilder,
 )
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, state_pool
-from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
 from atom.model_ops.engram.device.hashing import (
     EngramBatch,
@@ -38,7 +37,7 @@ from atom.models.deepseek_v41.bounded_replay import (
     tail_spans,
     tail_width,
 )
-from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
+from atom.models.deepseek_v41.pool_geometry import build_v41_pool_geometry
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
@@ -128,9 +127,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         for name in ("positions", "batch_id_per_q_token"):
             model_runner.forward_vars[name].publication_group = "v41_step"
         self.config = model_runner.config.hf_config
-        topology = build_attention_topology(self.config)[
-            : self.config.num_hidden_layers
-        ]
         speculative = model_runner.config.speculative_config
         num_drafts = 0 if speculative is None else speculative.num_speculative_tokens
         # Whether a serving prefill gets a decoder tail (`_publish_decoder`):
@@ -140,29 +136,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             getattr(model_runner.config, "enable_decoder_swa_bounded_replay", False)
             and decoder_replay_unsupported(self.config) is None
         )
-        self.geometry = V41PoolGeometry(
-            len(topology) + (self.config.num_nextn_predict_layers if num_drafts else 0),
-            tuple(
-                (spec.layer_id, spec.ratio)
-                for spec in topology
-                if spec.mode == AttentionMode.FULL
-            ),
+        self.geometry = build_v41_pool_geometry(
+            self.config,
             self.block_size,
-            self.config.sliding_window,
-            self.config.head_dim,
-            self.config.index_head_dim,
-            self.config.engram_max_ngram_size - 1,
             kv_dtype=model_runner.config.kv_cache_dtype,
             speculative_tokens=num_drafts,
-            # Only the ratios the built layers run: a configuration with no
-            # window-only layer gets no buffer for one.
-            layer_ratios=tuple(sorted({spec.ratio for spec in topology})),
-            index_topk=self.config.index_topk,
-            # Paged at the length candidates are picked in, which is what lets
-            # a candidate list be a block table. A GPU that cannot page that
-            # short refuses when asked, so there is nothing to pre-empt here.
-            index_block_rows=self.config.candidate_block_size,
             index_fp4=model_runner.config.index_cache_dtype == "fp4",
+            index_layout=model_runner.config.index_cache_layout,
         )
         model_runner.forward_vars.update(
             self._compress_plan_buffers(
@@ -470,6 +450,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 "DeepSeek-V4.1 publishes transfer regions after allocation"
             )
         names = [name for name, _ in self.cache.geometry.index_planes]
+        if self.cache.geometry.index_fp4:
+            # Equal byte widths do not imply equal physical layout. Mooncake
+            # checks these roles before writing any PAGE.
+            names = [f"{name}_fp4_{self.cache.geometry.index_layout}" for name in names]
         planes = [("dsv41.page", self.cache.page_bytes)] + [
             (f"dsv41.{name}_plane.{owner}", plane)
             for owner, owned in self.cache.index_planes.items()
@@ -1180,10 +1164,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         if self.geometry.speculative_tokens and not batch.is_dummy_run:
             # The scheduler reserves a full draft span, including placeholders
             # from the previous step. Ragged verification takes its head.
-            starts = np.asarray(batch.context_lens) - (batch.num_spec_step + 1)
-            rejected = self.model_runner.tokenID_processor.num_rejected
-            if rejected is not None:
-                starts = starts - rejected
+            starts = self.model_runner.tokenID_processor.verify_ctx_lens(
+                np.asarray(batch.context_lens) - (batch.num_spec_step + 1)
+            )
         return self._prepare(
             batch,
             running_bs,

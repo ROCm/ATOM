@@ -63,3 +63,25 @@ def test_aiter_execution_errors_are_not_hidden(monkeypatch, error_type):
             x_scale=torch.empty((3, 2), dtype=torch.float8_e8m0fnu),
         )
     assert raised.value is error
+
+
+def test_mxfp8_preshuffle_dispatches_through_aiter_blockscale(monkeypatch):
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return torch.empty((2, 16), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(blockscale, "_aiter_fp8_gemm", run)
+    blockscale.native_quant_linear(
+        torch.empty((2, 128), dtype=torch.float8_e4m3fn),
+        torch.empty((16, 128), dtype=torch.float8_e4m3fn),
+        torch.empty((16, 4), dtype=torch.float8_e8m0fnu),
+        x_scale=torch.empty((2, 4), dtype=torch.float8_e8m0fnu),
+        weight_group_rows=1,
+        weight_preshuffled=True,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1]["dtype"] == torch.bfloat16
+    assert calls[0][1]["isBpreshuffled"] is True

@@ -21,6 +21,7 @@ import zmq
 import zmq.asyncio
 
 from atom.config import Config
+from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
@@ -40,6 +41,7 @@ from atom.model_engine.prefix_hash import take_shipped_chains
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
+from atom.structured_output import is_structured
 from atom.utils import (
     envs,
     get_open_zmq_inproc_path,
@@ -247,9 +249,8 @@ class CoreManager:
         # Runner processes behind each engine -- EngineCore's own sizing -- so
         # an engine that never answers still fails one result per rank. Read
         # with defaults: managers are also built from bare stand-in configs.
-        self._rpc_ranks_per_engine = getattr(config, "tp_world_size", 1) * getattr(
-            config, "prefill_context_parallel_size", 1
-        )
+        tp_world_size = getattr(config, "tp_world_size", 1)
+        self._rpc_ranks_per_engine = tp_world_size * pcp_group_size_of(config)
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
@@ -1006,9 +1007,7 @@ class CoreManager:
             )
 
     def add_request(self, seqs: list[Sequence]):
-        structured = [
-            seq for seq in seqs if getattr(seq, "json_schema", None) is not None
-        ]
+        structured = [seq for seq in seqs if is_structured(seq)]
         if structured:
             try:
                 if self.structured_request_prepare is None:
@@ -1024,7 +1023,7 @@ class CoreManager:
     def _release_structured_requests(self, seqs):
         # The submitted/finished sequences own the cleanup information. There
         # is no cross-thread registry: workers tolerate repeated releases.
-        ids = [seq.id for seq in seqs if getattr(seq, "json_schema", None) is not None]
+        ids = [seq.id for seq in seqs if is_structured(seq)]
         if not ids:
             return
         try:
