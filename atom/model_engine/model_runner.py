@@ -3362,9 +3362,7 @@ class ModelRunner:
                 if self._step_override is not None:
                     # The model ran the whole step (target, sampling, verify,
                     # drafts): no logits; postprocess reads its outputs.
-                    self._served = self._step_override(
-                        input_ids, running_bs, running_tokens, batch
-                    )
+                    self._served = self._step_override(input_ids, running_bs, batch)
                     if self._served is not None:
                         return None, None
 

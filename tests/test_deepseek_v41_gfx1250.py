@@ -289,7 +289,7 @@ def served(verify_step, monkeypatch):
 def test_a_served_step_drafts_from_the_kernel(served):
     m, drafter = served
     runner = m._single.runner
-    assert m.step_override(torch.zeros(48), 8, 48, _batch()) is runner
+    assert m.step_override(torch.zeros(48), 8, _batch()) is runner
     assert runner.steps == 1
     drafter.compute_draft_kv()
     assert drafter.kv == 0
@@ -300,15 +300,15 @@ def test_a_served_step_drafts_from_the_kernel(served):
 def test_a_step_with_fewer_rows_than_6_a_request_is_not_served(served):
     m, _ = served
     # 8 requests in 42 rows (a ragged or confidence-scheduled verify): the launch reads 6 rows a request
-    assert m.step_override(torch.zeros(42), 8, 42, _batch()) is None
+    assert m.step_override(torch.zeros(42), 8, _batch()) is None
     assert m._single.runner.steps == 0
 
 
 def test_a_padded_step_is_not_served(served):
     m, _ = served
-    # 7 requests (42 input rows) in a 48-row padded step: the launch reads 6 rows a request of input_ids
-    assert m.step_override(torch.zeros(48), 7, 48, _batch(total_seqs_num=7)) is None
-    assert m.step_override(torch.zeros(42), 8, 48, _batch()) is None
+    # input_ids not 6 rows a request (a padded or ragged step): the launch would misread them
+    assert m.step_override(torch.zeros(48), 7, _batch(total_seqs_num=7)) is None
+    assert m.step_override(torch.zeros(42), 8, _batch()) is None
     assert m._single.runner.steps == 0
 
 
@@ -316,7 +316,7 @@ def test_a_production_step_drafts_from_the_drafter(served):
     m, drafter = served
     runner = m._single.runner
     batch = _batch(any_logprobs=True, total_seqs_num=1, req_ids=["a", "b"])
-    assert m.step_override(torch.zeros(6), 1, 6, batch) is None
+    assert m.step_override(torch.zeros(6), 1, batch) is None
     assert runner.steps == 0
     drafter.compute_draft_kv()
     assert drafter.kv == 1
@@ -329,7 +329,7 @@ def test_a_production_step_drafts_from_the_drafter(served):
 def test_a_prefill_keeps_the_running_requests_kernel_q(served):
     m, drafter = served
     runner = m._single.runner
-    m.step_override(torch.zeros(48), 8, 48, _batch())  # a served decode step
+    m.step_override(torch.zeros(48), 8, _batch())  # a served decode step
     m(
         torch.zeros(3, dtype=torch.long), torch.zeros(3, dtype=torch.long)
     )  # then a prefill (production forward)

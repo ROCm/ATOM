@@ -11,5 +11,5 @@ class StepOverrideModel:
     verdict [3, bs])``, and ``output_stream``, the stream those outputs are ready on (the output copy waits for it, not
     for whatever the model queued after them)."""
 
-    def step_override(self, input_ids, running_bs: int, rows: int, batch):
+    def step_override(self, input_ids, running_bs: int, batch):
         raise NotImplementedError
