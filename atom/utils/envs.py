@@ -1053,6 +1053,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
     ),
+    # --- API image input ---
+    # Let image URLs in API requests reach any address, through the system
+    # proxy if one is set. By default they must resolve to public addresses.
+    "ATOM_IMAGE_URL_ALLOW_PRIVATE": lambda: (
+        os.getenv("ATOM_IMAGE_URL_ALLOW_PRIVATE", "0").lower() == "1"
+    ),
     # --- Atomesh ---
     # Build atomesh when installing ATOM from source.
     "ATOM_MESH_BUILD": lambda: os.getenv("ATOM_MESH_BUILD", "0") == "1",
