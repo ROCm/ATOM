@@ -27,7 +27,7 @@ logger = logging.getLogger("atom")
 _DEFAULT_BACKEND = "moriio"
 
 # Backends with a remote peer. The rest of the registry is local storage.
-PD_TRANSFER_BACKENDS = frozenset({"moriio", "mooncake"})
+PD_TRANSFER_BACKENDS = frozenset({"moriio", "mooncake", "tilert"})
 
 
 def resolve_pd_backend(kv_transfer_config: dict | None) -> str | None:
@@ -380,6 +380,16 @@ KVConnectorFactory.register(
     worker_class="MooncakeConnector",
     scheduler_module="atom.kv_transfer.disaggregation.mooncake.mooncake_connector",
     scheduler_class="MooncakeConnectorScheduler",
+)
+
+# External TileRT decoder: the producer owns its wire staging allocation.
+KVConnectorFactory.register(
+    "tilert",
+    worker_module="atom.kv_transfer.disaggregation.tilert.connector",
+    worker_class="TileRTConnector",
+    scheduler_module="atom.kv_transfer.disaggregation.tilert.connector",
+    scheduler_class="TileRTConnectorScheduler",
+    requires_pd_staging=False,
 )
 
 # Composite backend: fans out to several sub-connectors listed under

@@ -533,6 +533,12 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 None if spec is None else self.execute_paged_state_copies
             ),
             paged_state_region_count=len(pages),
+            external_cache=(
+                self.cache
+                if KVConnectorFactory.connector_name(runner.config.kv_transfer_config)
+                == "tilert"
+                else None
+            ),
         )
 
     def warmup_per_req_cache(self):

@@ -304,6 +304,9 @@ class KVTransferTensors:
     # those are ordinary PAGE KV, never part of the state image. None means
     # every region. Appended for positional compatibility.
     paged_state_region_count: int | None = None
+    # Worker-local cache object for an external decoder's format conversion.
+    # This descriptor is constructed after allocation; it is never RPC metadata.
+    external_cache: Any = None
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is

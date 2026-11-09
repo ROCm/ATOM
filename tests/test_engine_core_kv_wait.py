@@ -193,3 +193,20 @@ def test_forward_batch_keeps_forward_and_postprocess_without_sleep(engine_step):
     engine._poll_kv_transfer_progress.assert_called_once_with()
     engine._postprocess.assert_called_once()
     sleep.assert_not_called()
+
+
+def test_external_producer_dispatches_final_handoff_while_idle(engine_step):
+    module, engine, _, _ = engine_step
+    meta = SimpleNamespace(requests=[object()])
+    connector = SimpleNamespace(
+        is_producer=True,
+        dispatch_on_idle=True,
+        build_connector_meta=Mock(return_value=meta),
+    )
+    engine.scheduler.kv_connector = connector
+
+    module.EngineCore._dispatch_idle_offload_work(engine)
+
+    engine.runner_mgr.call_func.assert_called_once_with(
+        "process_kvconnector_output", meta
+    )
