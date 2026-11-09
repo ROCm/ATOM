@@ -246,6 +246,60 @@ class PagedAttentionImpl(nn.Module):
 
         return o
 
+    def forward_after_prologue(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx, index_q=None
+    ):
+        """`forward_impl` past `rope_cache`, for q/k/v that a fused GEMM
+        prologue already normed, roped and wrote to the KV cache."""
+        q = q.view(-1, self.num_heads, self.head_dim)
+        if k is not None:
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+        if v is not None:
+            v = v.view(-1, self.num_kv_heads, self.head_dim)
+        attn_impl = self.dispatch_backend(fwd_ctx, q, k, v)
+        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+        return o.view(-1, self.num_heads * self.head_dim)
+
+    def gemm_fusion_prologue_supported(self) -> bool:
+        """Whether `rope_cache` takes the Gemma norm + RoPE + SHUFFLE cache
+        branch that a fused GEMM prologue reproduces."""
+        from atom.model_ops.layernorm import GemmaRMSNorm
+
+        return (
+            self.rotary_emb is not None
+            and isinstance(self.q_norm, GemmaRMSNorm)
+            and self.k_norm is not None
+        )
+
+    def gemm_fusion_prologue_state(self, fwd_ctx: ForwardContext) -> dict:
+        """The caches and slot mapping that `rope_cache` would write, for a
+        fused prologue that replaces it."""
+        layer = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        k_cache, v_cache = layer.k_cache, layer.v_cache
+        self.use_triton_attn = self._native_use_triton_attn()
+        self._cache_format = "SHUFFLE"
+        v_cache_shuffle = v_cache
+        if k_cache.dim() == 5 and v_cache.dim() == 4:
+            x = 16 // k_cache.element_size()
+            n, nh, hd, bs = v_cache.shape
+            v_cache_shuffle = v_cache.view(n, nh, bs // x, hd, x)
+        return {
+            "k_cache": k_cache,
+            "v_cache": v_cache,
+            "v_cache_shuffle": v_cache_shuffle,
+            "k_scale": layer.k_scale,
+            "v_scale": layer.v_scale,
+            "slot_mapping": fwd_ctx.attn_metadata.slot_mapping,
+        }
+
+    def _native_use_triton_attn(self) -> bool:
+        # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
+        return (
+            envs.ATOM_FORCE_ATTN_TRITON
+            or self.sliding_window != -1
+            or self.head_dim != 128
+        )
+
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
         attn_metadata = fwd_ctx.attn_metadata
@@ -256,12 +310,7 @@ class PagedAttentionImpl(nn.Module):
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
-        # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
-        use_triton_attn = (
-            envs.ATOM_FORCE_ATTN_TRITON
-            or self.sliding_window != -1
-            or self.head_dim != 128
-        )
+        use_triton_attn = self._native_use_triton_attn()
         self.use_triton_attn = use_triton_attn
 
         if (
@@ -1335,6 +1384,48 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # Rotated indexer query produced by rope_cache, consumed (and cleared) by
         # dispatch_backend within the same single-threaded layer forward.
         self._index_q: torch.Tensor | None = None
+
+    def forward_after_prologue(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx, index_q=None
+    ):
+        if self.skip_index_topk or index_q is None:
+            self._index_q = None
+            self._index_q_cache_key_info = (
+                (q.shape[0], self.num_idx_heads, self.index_head_dim),
+                q.dtype,
+                q.device,
+            )
+        else:
+            self._index_q = index_q.view(-1, self.num_idx_heads, self.index_head_dim)
+            self._index_q_cache_key_info = (
+                tuple(self._index_q.shape),
+                self._index_q.dtype,
+                self._index_q.device,
+            )
+        return super().forward_after_prologue(
+            q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx
+        )
+
+    def gemm_fusion_prologue_supported(self) -> bool:
+        return True
+
+    def gemm_fusion_prologue_state(self, fwd_ctx: ForwardContext) -> dict:
+        """The page-16 views `rope_cache` writes; see there."""
+        from atom.model_ops.minimax_m3.sparse_attn import to_page16_shuffle
+
+        layer = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        k_cache, v_cache, k_scale, v_scale = to_page16_shuffle(
+            layer.k_cache, layer.v_cache, layer.k_scale, layer.v_scale
+        )
+        self.use_triton_attn = False
+        self._cache_format = "SHUFFLE"
+        return {
+            "k_cache": k_cache,
+            "v_cache": v_cache,
+            "k_scale": k_scale,
+            "v_scale": v_scale,
+            "slot_mapping": self._sparse_metadata(fwd_ctx).slot_mapping,
+        }
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):

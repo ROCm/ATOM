@@ -134,3 +134,34 @@ def test_sp_does_not_share_compiled_artifacts():
     native = Config.compute_hash(config)
     config.sequence_parallel_size = 4
     assert Config.compute_hash(config) == Config.compute_hash(config) != native
+
+
+@pytest.mark.parametrize(
+    "overrides,reason",
+    [
+        ({"gemm_fusion_profile": " "}, "must name"),
+        ({"pipeline_parallel_size": 2}, "pipeline parallelism"),
+        ({"sequence_parallel_size": 1}, "sequence-parallel-size > 1"),
+        ({}, "aiter.gemm_fusion"),
+    ],
+)
+def test_gemm_fusion_refusals(monkeypatch, overrides, reason):
+    import importlib.util
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    config = atom_config_double(
+        **{"gemm_fusion_profile": "p", "sequence_parallel_size": 4, **overrides}
+    )
+    with pytest.raises(ValueError, match=reason):
+        Config._init_gemm_fusion(config)
+
+
+def test_gemm_fusion_off_by_default_and_keyed_into_the_compile_hash():
+    from atom.model_ops.gemm_fusion import initialize_gemm_fusion
+
+    config = atom_config_double(sequence_parallel_size=4)
+    assert config.gemm_fusion_profile is None
+    assert initialize_gemm_fusion(None, config) is None
+    native = Config.compute_hash(config)
+    config.gemm_fusion_profile = "minimax_m3_sp4_gfx950_v1"
+    assert Config.compute_hash(config) != native

@@ -33,11 +33,18 @@ def test_a_failed_megamoe_close_still_releases_everything(monkeypatch):
         req_graph=object(),
         kv_cache=object(),
         model=object(),
+        gemm_fusion=SimpleNamespace(close=lambda: calls.append("gf_close")),
         sp_mega_moe=SimpleNamespace(close=lambda: calls.append("sp_close")),
     )
 
     with pytest.raises(RuntimeError, match="close failed"):
         mr.ModelRunner.exit(runner)
-    assert calls == ["sp_close", "close_mega_transports", "destroy", "empty"]
+    assert calls == [
+        "gf_close",
+        "sp_close",
+        "close_mega_transports",
+        "destroy",
+        "empty",
+    ]
     assert runner.req_graph is None
     assert not hasattr(runner, "kv_cache") and not hasattr(runner, "model")

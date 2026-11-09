@@ -18,6 +18,16 @@ def group_max(value: int, group) -> int:
     return int(flag.item())
 
 
+def group_max_each(values, group) -> list[int]:
+    """Elementwise `group_max` of a list, in one all-reduce."""
+    values = [int(v) for v in values]
+    if group is None or not values:
+        return values
+    flags = torch.tensor(values, dtype=torch.int64, device="cpu")
+    dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=group)
+    return flags.tolist()
+
+
 def group_min(value: int, group) -> int:
     """The smallest ``value`` any rank of ``group`` passed."""
     return -group_max(-value, group)
