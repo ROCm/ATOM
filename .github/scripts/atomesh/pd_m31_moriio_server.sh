@@ -104,7 +104,7 @@ m31_moriio() {
 
 start_vllm_server() {
   local role="$1" log_name="$2" server_port="$3" gpus idx xfer
-  local -a cache_env=() role_env=() role_args=() pin=()
+  local -a cache_env=() role_env=() role_args=() pin=() p_extra_args=()
   build_server_cache_env "${role}" "${server_port}" cache_env
   if [[ "${role}" == prefill ]]; then
     gpus=0,1,2,3
@@ -114,7 +114,8 @@ start_vllm_server() {
       --max-num-batched-tokens 32768)
     [[ "${ATOMESH_M31_P_DBO:-1}" == 1 ]] &&
       role_args+=(--enable-dbo --dbo-prefill-token-threshold 16384 --dbo-decode-token-threshold 32768)
-    role_args+=(--kv-transfer-config "${xfer}")
+    read -r -a p_extra_args <<< "${ATOMESH_M31_P_EXTRA_ARGS:-}"
+    role_args+=("${p_extra_args[@]}" --kv-transfer-config "${xfer}")
   else
     # KEY=VAL words for the decode servers only.
     read -r -a role_env <<< "${ATOMESH_M31_D_EXTRA_ENV:-}"

@@ -16773,6 +16773,24 @@ models:
             common:
               <<: *m31_s65822_env
               ATOMESH_M31_D_MAX_SEQS: "6"
+        # TTFT: a request that reaches P while another prefills waits behind that prefill's 32K-token
+        # steps (S40 TTFT p90 0.29 s when P is idle, 0.8-3.7 s with 1-4 ahead). Cap each prefill at
+        # 4096 tokens per step while others are queued; a lone prefill keeps the whole budget.
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c48-dcap12-lpt4k
+          concurrency: [48]
+          env:
+            common:
+              <<: *m31_s65822_env
+              ATOMESH_M31_D_MAX_SEQS: "12"
+              ATOMESH_M31_P_EXTRA_ARGS: --long-prefill-token-threshold 4096
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c64-dcap16-lpt4k
+          concurrency: [64]
+          env:
+            common:
+              <<: *m31_s65822_env
+              ATOMESH_M31_P_EXTRA_ARGS: --long-prefill-token-threshold 4096
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
