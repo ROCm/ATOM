@@ -214,6 +214,8 @@ def test_pd_checks_physical_layout_before_writing(
         _fp4_index_layout=False,
         pp_size=1,
         _consumer_region_map=lambda n, m, *args: list(range(n)),
+        # Same TP on both ends: nothing to cut by head.
+        _consumer_head_cut=lambda *_: None,
         _rdma_write=writes,
     )
     request = {

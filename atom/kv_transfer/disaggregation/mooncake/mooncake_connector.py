@@ -2949,10 +2949,13 @@ class MooncakeConnector(KVConnectorBase):
                 f"{len(per_head)} per-head region(s) starting {per_head[:2]}"
             )
         consumer_runs = request_data.get("consumer_head_major_runs")
-        # An older consumer does not describe its runs; the role and byte
-        # checks in the region loop then say what differs.
+        # Only the consumer's runs make the copy safe; its roles and byte
+        # widths are optional and would not catch a whole-unit overrun.
         if consumer_runs is None:
-            return None
+            raise RuntimeError(
+                f"Consumer TP {consumer_tp} needs KV heads cut from this TP1 "
+                "producer but describes no head runs (an older consumer?)"
+            )
         return (consumer_runs, int(request_data["consumer_tp_rank"]), consumer_tp)
 
     def _execute_block_transfer(

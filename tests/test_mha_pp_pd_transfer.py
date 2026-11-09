@@ -316,26 +316,24 @@ def test_incompatible_consumer_layout_is_refused(export, bad_layout):
 
 @pytest.mark.parametrize(
     "heads, refusal",
-    [(4, "role mismatch|byte-size mismatch"), (2, "needs a TP1 producer")],
+    [(4, "describes no head runs"), (2, "needs a TP1 producer")],
 )
+@pytest.mark.parametrize("layout_checks", [True, False])
 def test_an_older_consumer_is_refused_before_anything_is_written(
-    export, heads, refusal
+    export, heads, refusal, layout_checks
 ):
-    """A consumer that does not describe its head runs gets no cut, so a TP1
-    stage's layout checks name the region that differs. A producer that may
+    """A consumer at another TP that does not describe its head runs is
+    refused, with or without its roles and byte widths. A producer that may
     not cut is refused whatever the consumer sends: rank `c` would pull
     another rank's heads from producer rank `c % P`."""
     mem = _Memory()
     producer = _producer(export(heads, 3, (3, 2, 2, 1)), mem, 4, heads)
     theirs = _layout(export(1))
+    request = _request(theirs, [mem.add(4 * b, False) for _, _, b in theirs], 0, False)
+    if not layout_checks:
+        del request["consumer_region_roles"], request["consumer_block_bpb"]
     with pytest.raises(RuntimeError, match=refusal):
-        producer._execute_block_transfer(
-            _request(theirs, [mem.add(4 * b, False) for _, _, b in theirs], 0, False),
-            "consumer",
-            [0],
-            [0],
-            "old-consumer",
-        )
+        producer._execute_block_transfer(request, "consumer", [0], [0], "old")
     assert mem.writes == 0
 
 

@@ -841,8 +841,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         Only where a layer's row is the layer: every layer of the stage holds
         one KV row of the one geometry. A hybrid's linear layers hold none, and
-        MiMo-V2 spreads its layers over two geometries, so their stages keep
-        their local rows, as before. The consumer is the same model unsplit,
+        a MiMo-V2 stage holding both its geometries keeps its local rows (one
+        holding just one of them passes here and is refused by the role check,
+        as on main). The consumer is the same model unsplit,
         whose target pool then holds a row per layer too: an MHA draft caches
         into a pool of its own (`AiterBackend.DRAFT_OWNS_KV_POOL`).
         """
