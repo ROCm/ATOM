@@ -24,30 +24,27 @@ rows are named in layout.py; the indexer's and the MoE's per-step arithmetic is 
 """
 from __future__ import annotations
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int64
 
-import device as hx
-import dims as D
-import layout as LY
-import front as FS
-import moe as MS
-import tail as ST
-import attention as AS
-import index_query as IS
-import compressor as CS
-import draft_ctx as CX
-import index_score as SC
-import topk as TK
-import engram as ES
-from attention import (CL, CTAS, KWOA, NWOA, QL, THREADS, handoff, i64, pf_rows, smem_layout, stage_A,
+from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels import layout as LY
+from atom.models.deepseek_v41.mono.gfx1250.kernels import front as FS
+from atom.models.deepseek_v41.mono.gfx1250.kernels import moe as MS
+from atom.models.deepseek_v41.mono.gfx1250.kernels import tail as ST
+from atom.models.deepseek_v41.mono.gfx1250.kernels import attention as AS
+from atom.models.deepseek_v41.mono.gfx1250.kernels import index_query as IS
+from atom.models.deepseek_v41.mono.gfx1250.kernels import compressor as CS
+from atom.models.deepseek_v41.mono.gfx1250.kernels import draft_ctx as CX
+from atom.models.deepseek_v41.mono.gfx1250.kernels import index_score as SC
+from atom.models.deepseek_v41.mono.gfx1250.kernels import topk as TK
+from atom.models.deepseek_v41.mono.gfx1250.kernels import engram as ES
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import (CL, CTAS, KWOA, NWOA, QL, THREADS, handoff, i64, pf_rows, smem_layout, stage_A,
                          stage_C, stage_D, stage_E, stage_F_cluster, stage_kv, tp_allreduce)
 
 DRAFT_NE, DRAFT_TOPK = D.DRAFT_EXPERTS, D.DRAFT_TOPK

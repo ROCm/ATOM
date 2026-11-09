@@ -17,8 +17,6 @@ and the step metadata (``buffers``: WEIGHT / STEP) are not bound yet, so constru
 
 import importlib
 import logging
-import os
-import sys
 import time
 
 import torch
@@ -57,7 +55,7 @@ def _base_model(model):
     raise MonoUnsupported("no V4.1 base model")
 
 
-KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
+KERNELS = __package__ + ".kernels"
 # the receive regions: 4 TP regions x 4 sources x 40960 16-byte words, the sampling and Markov exchange after them
 # (tail SOFF / SOFF2), 2 MB-rounded, doubled for the step epoch
 RECV_BYTES = 2 * (
@@ -71,8 +69,6 @@ SOURCES = source_digest("models/deepseek_v41/mono/gfx1250/kernels")
 
 def import_kernels() -> dict:
     """The kernel modules (this package's kernels/: the whole step is step)."""
-    if KERNELS not in sys.path:
-        sys.path.insert(0, KERNELS)
     names = (
         "device",
         "attention",
@@ -86,7 +82,7 @@ def import_kernels() -> dict:
         "tail",
         "step",
     )
-    return {n: importlib.import_module(n) for n in names}
+    return {n: importlib.import_module(f"{KERNELS}.{n}") for n in names}
 
 
 class SingleStepRunner(StepInputs, RunnerDebug):

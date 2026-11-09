@@ -19,21 +19,18 @@ outtok [8][6], verdict [3][8], anc [8]; dh [48][5120] bf16 draft hidden (rows re
 mw1 [129280][256], mw2 shard [32320][256] bf16; mids [8][5], memb [8][5][256]; mbest [40] i64 (= INT64_MIN each step)."""
 from __future__ import annotations
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
-import device as hx
-import layout as LY
-import head as HF
-import sample_common as SF
-import sample as SPF
-import markov as MPF
-import draft_ctx as CX
-from attention import handoff
+from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import layout as LY
+from atom.models.deepseek_v41.mono.gfx1250.kernels import head as HF
+from atom.models.deepseek_v41.mono.gfx1250.kernels import sample_common as SF
+from atom.models.deepseek_v41.mono.gfx1250.kernels import sample as SPF
+from atom.models.deepseek_v41.mono.gfx1250.kernels import markov as MPF
+from atom.models.deepseek_v41.mono.gfx1250.kernels import draft_ctx as CX
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import handoff
 
 TPTRS = ['xh', 'hw', 'logits', 's0', 's1', 's2', 's3', 'sids', 'dids', 'outtok', 'verdict', 'anc', 'dh', 'dlog', 'mw1',
          'mw2', 'mids', 'memb', 'mbest', 'sparam', 'qlog', 'prow', 'qids']

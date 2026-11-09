@@ -18,17 +18,14 @@ Each stage is a grid-wide phase (a handoff between them in the step kernel).
 The GEMV operand layouts are stage_C's (plain row-major FP8, 32x32 block scales, the checkpoint's own)."""
 from __future__ import annotations
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
-import device as hx
-import dims as D
-from attention import e8m0_of, inv_pow2, ld_op, q8words, rsq
+from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import e8m0_of, inv_pow2, ld_op, q8words, rsq
 
 F32, I32, BF16 = fx.Float32, fx.Int32, fx.BFloat16
 H, NTAP, KVD, ROPE0, NDL = D.HID, 3, D.KV_DIM, 448, D.DRAFT_LAYERS

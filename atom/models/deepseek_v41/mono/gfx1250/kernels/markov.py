@@ -18,10 +18,7 @@ request -> device handoff -> CTA 0 pushes the 8 rank maxima to the peers (tagged
 in rank order -> x_k stays in LDS for the next round; CTA 0 writes ids and the W1[x_k] rows (confidence-head input)."""
 from __future__ import annotations
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
@@ -29,10 +26,10 @@ from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int64
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
-import device as hx
-import dims as D
-from device import _v, gptr
-from sample_common import I64MIN, c32, handoff, latomic_max64, skey, poll_unit, hash32, lshr, LN2, log2f
+from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels.device import _v, gptr
+from atom.models.deepseek_v41.mono.gfx1250.kernels.sample_common import I64MIN, c32, handoff, latomic_max64, skey, poll_unit, hash32, lshr, LN2, log2f
 
 SEED_D = 0x68E31DA4
 SPW = 8

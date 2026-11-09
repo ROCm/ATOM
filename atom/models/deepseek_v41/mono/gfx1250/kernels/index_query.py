@@ -19,17 +19,14 @@ The reduction orders are this kernel's own
 """
 from __future__ import annotations
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
-import device as hx
-import dims as D
-from attention import CTAS, QL, HID, T, NORM_EPS, ld_op, mx_loop, rope_cs, rsq
+from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import CTAS, QL, HID, T, NORM_EPS, ld_op, mx_loop, rope_cs, rsq
 
 F32, I32, BF16 = fx.Float32, fx.Int32, fx.BFloat16
 HEADS, DIM = D.INDEX_HEADS, D.INDEX_DIM

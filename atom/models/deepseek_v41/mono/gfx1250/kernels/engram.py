@@ -15,18 +15,15 @@ Row k - 1 of the layer table carries lflags bit 7 ("the next layer has Engram") 
 The gate itself (R' += gate . value) is the attention front's (front._engram_gate)."""
 from __future__ import annotations
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import range_constexpr
 
-import device as hx
-import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
 from flydsl.expr import gpu
-from attention import CTAS, T, e8m0_of, inv_pow2, ld_op, q8words
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import CTAS, T, e8m0_of, inv_pow2, ld_op, q8words
 
 F32, I32, BF16 = fx.Float32, fx.Int32, fx.BFloat16
 EK = 6144            # engram embedding width

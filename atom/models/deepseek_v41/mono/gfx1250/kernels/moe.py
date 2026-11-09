@@ -28,19 +28,16 @@ used = rows x 6), nexp_max. Exchange stores are device-scope (hx.stx_dev, the fe
 """
 from __future__ import annotations
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr, rocdl
 
-import device as hx
-import dims as D
-import moe_plan as MP
-import stamps
-from attention import q8words, bf, e8m0_of, handoff, inv_pow2
+from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels import moe_plan as MP
+from atom.models.deepseek_v41.mono.gfx1250.kernels import stamps
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import q8words, bf, e8m0_of, handoff, inv_pow2
 
 H, I, TOPK, NE, CTAS = D.HID, D.MOE_I, D.TOPK, D.EXPERTS, D.CTAS
 UGU, NUG, DNU, NDN = 160, 18, 5, 320

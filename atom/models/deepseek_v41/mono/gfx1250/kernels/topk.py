@@ -8,19 +8,16 @@ u32 order key of the bits, ties to the lowest index, winners ascending by index,
 layer 20's top-2048 blocks -> icand)."""
 from __future__ import annotations
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
-import device as hx
-import dims as D
-import stamps
-import index_plan as IP
-from attention import T
+from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels import stamps
+from atom.models.deepseek_v41.mono.gfx1250.kernels import index_plan as IP
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import T
 
 I32, F32 = fx.Int32, fx.Float32
 THREADS, WAVES = D.THREADS, D.WAVES

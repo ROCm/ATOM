@@ -25,17 +25,14 @@ cstate (state bytes a slot), btab bstride (block tables, int32, row stride), slo
 """
 from __future__ import annotations
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
-import device as hx
-import dims as D
-from attention import HID, T, e8m0_of, expf, inv_pow2, rsq
+from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import HID, T, e8m0_of, expf, inv_pow2, rsq
 
 F32, I32, I64, BF16 = fx.Float32, fx.Int32, fx.Int64, fx.BFloat16
 LAT = D.KV_DIM                  # the compressed latent (head dim)

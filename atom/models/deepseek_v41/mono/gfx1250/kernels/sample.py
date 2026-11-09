@@ -28,20 +28,17 @@ Noise: hash32 counters (as sample_common): u_k = hash32(r, 0x40000000, seed_acc)
 0x2545F491)). The reference draws the same in distribution (Philox there); a host model reproduces them with these hashes."""
 from __future__ import annotations
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int64
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
-import device as hx
-import dims as D
-import sample_common as S4
-from sample_common import (ROWS, CPR, NB, R, F32, I32, LN2, c32, i64, expf, log2f, lshr, I64MIN, hash32, skey,
+from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels import sample_common as S4
+from atom.models.deepseek_v41.mono.gfx1250.kernels.sample_common import (ROWS, CPR, NB, R, F32, I32, LN2, c32, i64, expf, log2f, lshr, I64MIN, hash32, skey,
                           latomic_max64, handoff, suffix_scan, crossing, UNITS, HB, roff, zload, poll_unit, xchg_hist)
 
 NREQ, ND = D.MAX_REQ, D.DSPARK_W

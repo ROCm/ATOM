@@ -25,18 +25,15 @@ rk (the residual streams' LDS region, kept between the fronts); optional eng eng
 """
 from __future__ import annotations
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
-import device as hx
-import dims as D
-from attention import q8words, bf, cluster_sync, e8m0_of, inv_pow2, pack4, rsq, to_e4m3
-from moe import sched_barrier
+from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import q8words, bf, cluster_sync, e8m0_of, inv_pow2, pack4, rsq, to_e4m3
+from atom.models.deepseek_v41.mono.gfx1250.kernels.moe import sched_barrier
 
 T, H, NG, TG, CL, NE, TOPK = D.T_MAX, D.HID, 6, 8, D.CL, D.EXPERTS, D.TOPK
 

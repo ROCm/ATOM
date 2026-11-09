@@ -12,16 +12,13 @@ NPH phases (double-buffered async copies; a phase holds every K part's next CK c
 reduced through LDS at the end."""
 from __future__ import annotations
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
-import device as hx
-import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
 # the LM-head weights (331 MB a rank) are streamed non-temporal: default caching evicted the layer loop's hot scratch
 
 T, HID, VR = D.T_MAX, D.HID, D.VR

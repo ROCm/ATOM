@@ -22,10 +22,7 @@ Tokens below M - R (e^-R relative probability) are only kept when the whole rang
 The final sub-bin (width R / 65536 in z) is kept whole: a deviation of < R/65536 in the top-p cut, within tolerance."""
 from __future__ import annotations
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
@@ -33,9 +30,9 @@ from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int64
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
-import device as hx
-import dims as D
-from device import _v, gptr, lptr
+from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
+from atom.models.deepseek_v41.mono.gfx1250.kernels.device import _v, gptr, lptr
 
 ROWS, CPR, NB = D.T_MAX, 5, 256
 R = 16.0
