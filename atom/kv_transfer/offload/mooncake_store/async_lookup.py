@@ -24,9 +24,6 @@ FALLBACK_LOOKUP_TIMEOUT_S = 2.0
 
 
 class AsyncStoreLookup:
-    token_database = None
-    driving = True
-
     def __init__(self, backend, capacity=4096):
         self.backend = backend
         self.capacity = capacity
@@ -49,22 +46,16 @@ class AsyncStoreLookup:
     def supports_async(self):
         return True
 
-    def offer(self, sid, request):
-        with self.lock:
-            if self.closed or sid in self.pending or len(self.pending) >= self.capacity:
-                return False
-            self.pending[sid] = self.executor.submit(self._query, request, sid)
-            return True
-
-    def _query(self, request, sid):
-        seq = request()
-        if seq is None:
-            return None
+    def _query(self, seq, sid):
         with self.backend_lock:
             return self.backend.lookup(seq, lookup_id=sid)
 
     def submit(self, seq, sid):
-        return self.offer(sid, lambda: seq)
+        with self.lock:
+            if self.closed or sid in self.pending or len(self.pending) >= self.capacity:
+                return False
+            self.pending[sid] = self.executor.submit(self._query, seq, sid)
+            return True
 
     def pump(self):
         with self.lock:
@@ -110,14 +101,6 @@ class AsyncStoreLookup:
                 return f.result() is not None
             except Exception:  # noqa: BLE001
                 return False
-
-    def take_answer(self, sid, tokens, before=None):
-        with self.lock:
-            if not self.has_answer(sid):
-                return None
-            if before is not None:
-                before()
-            return self.pending.pop(sid).result()
 
     def __getattr__(self, name):
         return getattr(self.backend, name)

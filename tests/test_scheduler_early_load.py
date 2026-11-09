@@ -39,6 +39,13 @@ class _Connector(OffloadSchedulerMixin):
     is_producer = False
     is_offload = True
     chunk_size = 4
+    supports_early_load = True
+    lowers_hbm_hit_to_chunk = False
+
+    def held_tier_hit(self, seq):
+        return 0
+
+    def close(self): ...
 
     def __init__(self):
         self.ready = True

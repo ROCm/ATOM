@@ -51,6 +51,7 @@ class FakeSchedSub:
             self.is_offload = True
         self.alloc_calls = []
         self.finished_calls = []
+        self.cancelled = []
         self.meta = ConnectorMetadata()
         self._offload = offload_methods
         # No longer offload-specific: a P/D producer claims its source too, so
@@ -120,6 +121,14 @@ class FakeSchedSub:
         # Idempotent, like the real connector's `_load_lifecycles` guard.
         self.cancelled.append(seq)
         self.pending_load = False
+
+    def cancel_preadmission(self, seq):
+        # The base default: the pending load's cancellation, for a sub that has one.
+        if self._offload:
+            self.cancel_pending_load(seq)
+
+    def close(self):
+        pass
 
     def process_completions(self, output):
         # Mirrors OffloadSchedulerMixin: apply the completions, then hand the

@@ -393,20 +393,26 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
 
     @property
     def chunk_size(self):
-        return getattr(self._prefetch_tier(), "chunk_size", 0)
+        tier = self._prefetch_tier()
+        return 0 if tier is None else tier.chunk_size
+
+    @property
+    def supports_early_load(self):
+        tier = self._prefetch_tier()
+        return tier is not None and tier.supports_early_load
 
     def lookup_ready(self, seq):
-        c = self._prefetch_tier()
-        return c is not None and c.lookup_ready(seq)
+        tier = self._prefetch_tier()
+        return tier is not None and tier.lookup_ready(seq)
 
     @property
     def lowers_hbm_hit_to_chunk(self):
-        return bool(getattr(self._prefetch_tier(), "lowers_hbm_hit_to_chunk", False))
+        tier = self._prefetch_tier()
+        return tier is not None and tier.lowers_hbm_hit_to_chunk
 
     def held_tier_hit(self, seq):
-        c = self._prefetch_tier()
-        callback = getattr(c, "held_tier_hit", None)
-        return int(callback(seq)) if callable(callback) else 0
+        tier = self._prefetch_tier()
+        return 0 if tier is None else int(tier.held_tier_hit(seq))
 
     def bind_block_manager(self, block_manager: Any) -> None:
         """Bind native checkpoint owners before any request can be admitted."""
@@ -426,19 +432,13 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
     def close(self) -> None:
         """Close every sub-connector that holds threads (the offload tier's)."""
         for connector in self._connectors:
-            close = getattr(connector, "close", None)
-            if callable(close):
-                close()
+            connector.close()
 
     def cancel_preadmission(self, seq: Any) -> None:
         """Take back an early admission, including each tier's held state."""
         self._load_winner.pop(getattr(seq, "id", None), None)
         for connector in self._connectors:
-            cancel = getattr(connector, "cancel_preadmission", None)
-            if not callable(cancel):
-                cancel = getattr(connector, "cancel_pending_load", None)
-            if callable(cancel):
-                cancel(seq)
+            connector.cancel_preadmission(seq)
 
     def _sub_methods(self, name: str) -> list:
         """Bound `name` of every sub-connector that implements it."""

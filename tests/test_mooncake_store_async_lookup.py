@@ -10,7 +10,7 @@ from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLooku
 from atom.kv_transfer.offload.mooncake_store.config import uses_replay_pages
 
 
-def test_async_query_is_bounded_cancellable_and_consumed_once():
+def test_async_query_is_bounded_and_cancellable():
     gate = Event()
 
     class Backend:
@@ -22,7 +22,7 @@ def test_async_query_is_bounded_cancellable_and_consumed_once():
     try:
         assert client.submit(object(), "a")
         assert not client.submit(object(), "a")
-        assert client.take_answer("a", lambda: None) is None
+        assert not client.has_answer("a")  # still in flight
         assert client.submit(object(), "b")
         assert not client.submit(object(), "c")
         client.clear_lookup_status("b")
@@ -31,8 +31,9 @@ def test_async_query_is_bounded_cancellable_and_consumed_once():
             if client.has_answer("a"):
                 break
             time.sleep(0.005)
-        assert client.take_answer("a", lambda: None) == 8192
-        assert client.take_answer("a", lambda: None) is None
+        assert client.has_answer("a")
+        client.clear_lookup_status("a")
+        assert not client.has_answer("a")
         assert not client.pending_ids()
     finally:
         gate.set()
@@ -100,7 +101,7 @@ def test_answered_is_read_only_and_marks_lookup_ready():
         assert lookup.is_pending("7") and lookup.answered("7")
         assert sched.lookup_ready(seq)
         assert lookup.answered("7")  # reading it consumed nothing
-        assert lookup.take_answer("7", None) == 512
+        lookup.clear_lookup_status("7")
         assert not sched.lookup_ready(seq)
     finally:
         lookup.close()

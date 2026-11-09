@@ -46,7 +46,6 @@ class EarlyLoadState:
         self.submitted_total = 0
         self.takebacks = 0
         self.aborted = 0
-        self.prefilled = 0
         self.wait_sum_s = 0.0
         self.wait_n = 0
         self.tick = 0
@@ -71,7 +70,6 @@ class EarlyLoadState:
         if entry is not None:
             self.wait_sum_s += time.monotonic() - entry[1]
             self.wait_n += 1
-            self.prefilled += 1
 
     def note_gone(self, seq_id: Any, *, aborted: bool = False) -> None:
         if self.entries.pop(seq_id, None) is not None and aborted:
@@ -124,4 +122,3 @@ class EarlyLoadState:
         self.aborted = 0
         self.wait_sum_s = 0.0
         self.wait_n = 0
-        self.prefilled = 0
