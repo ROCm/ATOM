@@ -496,10 +496,16 @@ def _unique(schema, budget):
     return {"anyOf": [{"type": [t for t in _TYPES if t != "array"]}, array_schema]}
 
 
-def normalize_schema(schema):
+def expansion_budget():
+    """A fresh budget, for a request that normalizes several schemas."""
+    return _ExpansionBudget()
+
+
+def normalize_schema(schema, budget=None):
     # One budget for the entire request, including sibling schemas and fallback
-    # paths. Recursive normalization must never allocate a fresh budget.
-    return _normalize_schema(schema, _ExpansionBudget())
+    # paths. Recursive normalization must never allocate a fresh budget, and a
+    # request with several schemas (strict tool parameters) passes its own.
+    return _normalize_schema(schema, _ExpansionBudget() if budget is None else budget)
 
 
 def _normalize_schema(schema, budget):
@@ -566,4 +572,56 @@ def _normalize_schema(schema, budget):
     for key in ["allOf", "anyOf", "oneOf", "prefixItems"]:
         if key in result:
             result[key] = [_normalize_schema(v, budget) for v in result[key]]
+    return result
+
+
+# Schema-position maps: their keys are names, never keywords.
+_NAME_MAPS = (
+    "properties",
+    "patternProperties",
+    "$defs",
+    "$def",
+    "definitions",
+    "dependentSchemas",
+)
+# Literal values: a "$ref" key inside one is data, not a reference.
+_LITERALS = ("const", "enum", "default", "examples")
+
+
+def canonical_defs(schema):
+    """``schema`` with DeepSeek's ``$def`` definitions moved into ``$defs``.
+
+    DeepSeek's strict mode spells the definitions container ``$def``. The
+    safety check, normalization and the grammar backend all walk ``$defs``,
+    so what sat under ``$def`` went unchecked and unnormalized; references
+    into it are rewritten to match. A name defined under both is refused.
+    """
+    if not isinstance(schema, dict) or "$def" not in schema:
+        return schema
+    defs, existing = schema["$def"], schema.get("$defs", {})
+    if not isinstance(defs, dict) or not isinstance(existing, dict):
+        raise ValueError("$def and $defs must be objects")  # noqa: TRY004
+    clash = sorted(set(defs) & set(existing))
+    if clash:
+        raise ValueError(f"{clash[0]!r} is defined in both $def and $defs")
+    result = _rewrite_def_refs(schema)
+    result["$defs"] = {**result.get("$defs", {}), **result.pop("$def")}
+    return result
+
+
+def _rewrite_def_refs(node):
+    if isinstance(node, list):
+        return [_rewrite_def_refs(child) for child in node]
+    if not isinstance(node, dict):
+        return node
+    result = {}
+    for key, value in node.items():
+        if key in _LITERALS:
+            result[key] = value
+        elif key == "$ref" and isinstance(value, str) and value.startswith("#/$def/"):
+            result[key] = "#/$defs/" + value[len("#/$def/") :]
+        elif key in _NAME_MAPS and isinstance(value, dict):
+            result[key] = {name: _rewrite_def_refs(v) for name, v in value.items()}
+        else:
+            result[key] = _rewrite_def_refs(value)
     return result
