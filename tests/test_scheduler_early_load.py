@@ -578,9 +578,9 @@ def test_a_completion_reported_as_a_string_id_is_recognised(monkeypatch, seq_fac
     seq = seq_factory(list(range(16)))
     seq.id = 123
     seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
-    assert not sched._tier_load_finished(seq)
+    assert not sched._tier_load_succeeded(seq)
     sched.finished_recving_kv_req_ids = ["123"]
-    assert sched._tier_load_finished(seq)
+    assert sched._tier_load_succeeded(seq)
 
 
 def test_pending_tokens_follow_the_replay_adjusted_resume_point(
@@ -625,3 +625,59 @@ def test_early_loads_in_flight_do_not_use_up_the_probe_budget(monkeypatch, seq_f
         sched.waiting.append(seq)
     sched.waiting.append(seq_factory(list(range(16))))  # a fifth, ready to admit
     assert sched._can_admit_head_prefill()
+
+
+# -- slots, age and failed loads (review of #3097) -------------------------------------
+
+
+def _parked(sched, seq_factory, n, *, early=True):
+    seqs = []
+    for _ in range(n):
+        seq = seq_factory(list(range(16)))
+        seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        if early:
+            sched._early_load.entries[seq.id] = (seq, 0.0)
+        seqs.append(seq)
+    return seqs
+
+
+def test_finished_early_loads_are_promoted_when_the_head_has_no_slot(
+    monkeypatch, seq_factory
+):
+    """Every parked slot taken by early loads that finished: the head cannot park,
+    Phase 2 stops there, and only promoting them frees a slot."""
+    sched = _sched(monkeypatch)
+    head = seq_factory(list(range(16)))
+    parked = _parked(sched, seq_factory, sched.max_num_seqs)
+    sched.waiting.extend([head, *parked])
+    sched._num_parked_remote_kv = sched.max_num_seqs
+    sched.finished_recving_kv_req_ids = [seq.id for seq in parked]
+    sched._promote_ready_remote_kv_requests()
+    assert list(sched.waiting)[: len(parked)] == parked
+    assert sched.waiting[-1] is head
+
+
+def test_early_load_leaves_the_last_slot_to_the_head(monkeypatch, seq_factory):
+    sched = _sched(monkeypatch)
+    sched._num_parked_remote_kv = sched.max_num_seqs - 1
+    seq = seq_factory(list(range(16)))
+    sched.add(seq)
+    assert sched._early_load_tier_prefixes() == 0
+    assert sched._early_load.skips["seq_slots"] == 1
+
+
+def test_a_finished_tier_load_has_an_age_and_a_failed_one_is_not_admittable(
+    monkeypatch, seq_factory
+):
+    sched = _sched(monkeypatch)
+    ok, failed = _parked(sched, seq_factory, 2)
+    ok.arrive_time = failed.arrive_time = 1.0
+    sched.waiting.extend([ok, failed])
+    assert sched._oldest_waiting_prefill_age_ms() == 0.0  # both still loading
+    sched.finished_recving_kv_req_ids = [ok.id, failed.id]
+    sched.failed_recving_kv_req_ids = [failed.id]
+    assert list(sched._waiting_prefills()) == [ok]
+    assert sched._oldest_waiting_prefill_age_ms() > 0.0
+    sched.finished_recving_kv_req_ids = [failed.id]
+    assert list(sched._waiting_prefills()) == []
+    assert sched._oldest_waiting_prefill_age_ms() == 0.0
