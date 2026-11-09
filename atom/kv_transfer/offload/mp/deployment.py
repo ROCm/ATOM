@@ -402,3 +402,15 @@ class TransferSpec:
     start: int
     end: int
     cache_salt: str = ""
+
+
+def require_native_state_server(adapter: Any, config: Any) -> None:
+    """Validate native transfer geometry shared with the LMCache server."""
+    configured_chunk = int(
+        offcfg.build_lmcache_config(_storage_kv_transfer_config(config)).chunk_size
+    )
+    if configured_chunk != int(adapter.lmcache_tokens_per_chunk):
+        raise ValueError(
+            "Native-state LMCache configured chunk size must match the MP server: "
+            f"configured={configured_chunk}, server={adapter.lmcache_tokens_per_chunk}"
+        )

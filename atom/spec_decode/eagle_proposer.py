@@ -126,9 +126,15 @@ class EagleProposer(Drafter):
         pad and nothing a graph could pin. Declaring anyway used to warm and
         capture a ONE-dimensional-positions shape that serving never runs --
         graphs nobody replays, paid for at every startup.
+        A draft model that sets ``draft_graph_supports_mrope`` is the exception:
+        ``StagedInput.batch_dim`` stages them with the batch at axis 1. Other
+        MRoPE drafts have not been validated with draft graphs and stay eager.
         """
         self.step = None
-        if self.runner.use_mrope or self.mtp_k < 2:
+        mrope = self.runner.use_mrope
+        if (
+            mrope and not getattr(self.model, "draft_graph_supports_mrope", False)
+        ) or self.mtp_k < 2:
             # mtp_k == 1 has no step 1+, so warming one would capture a graph
             # `propose` can never reach.
             self._reuse_step_buffers = False
@@ -148,7 +154,11 @@ class EagleProposer(Drafter):
             # `input_ids` from that buffer to this one, and `stage` asserts the
             # two agree.
             "input_ids": StagedInput(dtype=torch.int32),
-            "positions": StagedInput(dtype=torch.int64),
+            "positions": (
+                StagedInput(shape=(3,), dtype=torch.int64, batch_dim=1)
+                if mrope
+                else StagedInput(dtype=torch.int64)
+            ),
             "hidden_states": StagedInput(
                 shape=hidden_shape,
                 dtype=self.dtype,
@@ -768,7 +778,7 @@ class EagleProposer(Drafter):
                 ):
                     # (`_step_forward`) Step 0 of a decode runs every row but
                     # hands back only each sequence's last one; a step 1+ that
-                    # no declared pass covers (MRoPE) runs here, eagerly.
+                    # no declared pass covers runs here, eagerly.
                     ret_hidden_states, head_input = self.model.forward_with_head(
                         d_input_ids,
                         d_positions,
@@ -848,10 +858,6 @@ class EagleProposer(Drafter):
                         # from it, so it has to be `running_bs` long before THAT --
                         # padding it with the other rows, just before the
                         # forward, is a step too late.
-                        #
-                        # No MRoPE case to guard: a model whose positions keep
-                        # the token axis last declares no pass, so `self.step` is
-                        # None and these stay the target's own 2-D positions.
                         if self.step is not None:
                             positions = self.step.stage(
                                 running_bs, {"positions": positions}

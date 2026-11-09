@@ -19,6 +19,7 @@ from transformers import PretrainedConfig
 
 from atom.config import Config, QuantizationConfig
 from atom.distributed.indexer_cp import indexer_cp_enabled
+from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.base_attention import (
@@ -55,6 +56,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.quant_spec import effective_layer_quant
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
@@ -102,8 +104,7 @@ def _validate_sparse_flydsl_config(
             "MiniMax-M3 sparse paged attention requires aiter's FlyDSL "
             "explicit-plan API (#5809) because there is no gluon fallback"
         )
-    tp_size = get_tensor_model_parallel_world_size()
-    local_kv_heads = max(1, int(config.num_key_value_heads) // tp_size)
+    local_kv_heads = local_num_kv_heads(int(config.num_key_value_heads))
     max_tokens = int(atom_config.max_num_batched_tokens)
     max_rows = max_tokens * local_kv_heads
     plan_limit = _flydsl_plan_max_batch()
@@ -443,6 +444,8 @@ class MiniMaxM3Attention(nn.Module):
             q_norm=self.q_norm,
             k_norm=self.k_norm,
             prefix=f"{prefix}.attn",
+            per_token_fp8_out=effective_layer_quant(quant_config, f"{prefix}.o_proj")
+            == (QuantType.per_Token, dtypes.fp8),
         )
 
     def forward(
@@ -454,6 +457,8 @@ class MiniMaxM3Attention(nn.Module):
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v, positions=positions, qkv=qkv)
+        if isinstance(attn_output, tuple):
+            return self.o_proj(*attn_output)
         return self.o_proj(attn_output)
 
 
@@ -585,7 +590,6 @@ class MiniMaxM3SparseAttention(nn.Module):
             index_q_norm=self.index_q_norm,
             index_k_norm=self.index_k_norm,
             index_rotary_emb=self.index_rotary_emb,
-            index_q_size=self.index_q_size,
             index_head_dim=self.idx_head_dim,
             topk=self.topk_blocks,
             init_blocks=self.init_blocks,
@@ -593,6 +597,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             skip_index_topk=self.skip_index_topk,
             sparse_layer_ordinal=self.sparse_layer_ordinal,
             index_cache_dtype=index_cache_config,
+            per_token_fp8_out=effective_layer_quant(quant_config, f"{prefix}.o_proj")
+            == (QuantType.per_Token, dtypes.fp8),
         )
 
     def forward(
@@ -615,6 +621,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             dim=-1,
         )
         attn_output = self.attn(q, k, v, positions, qkv=qkv)
+        if isinstance(attn_output, tuple):
+            return self.o_proj(*attn_output)
         return self.o_proj(attn_output)
 
 

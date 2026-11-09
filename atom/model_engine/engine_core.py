@@ -32,6 +32,7 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.observability import tracing
+from atom.structured_output import is_structured
 from atom.utils import (
     engine_process_name,
     envs,
@@ -130,7 +131,7 @@ class EngineCore:
             # the first tp_world_size shards get a process.
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
-                config.tp_world_size * config.prefill_context_parallel_size,
+                config.tp_world_size * config.pcp_group_size,
                 config.runner_qualname,
                 config,
                 on_worker_failure=self._send_engine_dead,
@@ -484,9 +485,7 @@ class EngineCore:
                 logger.exception("KV event publish in engine-step finally failed")
 
     def _release_request_resources(self, sequences):
-        structured_ids = [
-            seq.id for seq in sequences if getattr(seq, "json_schema", None) is not None
-        ]
+        structured_ids = [seq.id for seq in sequences if is_structured(seq)]
         if structured_ids:
             self.runner_mgr.call_func("release_structured_requests", structured_ids)
         request_ids = [

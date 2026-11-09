@@ -250,11 +250,17 @@ def test_proxy_factory_stages_unbound_profiling_full_only(
     config = SimpleNamespace(
         compilation_config=SimpleNamespace(static_forward_context={"proxy": proxy})
     )
+    checkpoints = Mock()
+    order = []
+    keeps = Mock(side_effect=lambda *_: order.append("keeps"))
+    stage.side_effect = lambda *_, **__: order.append("stage") or prepared
     scope = {
         "ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME": "proxy",
-        "snapshot_v41_batch": lambda _: snapshot,
+        "snapshot_v41_batch": lambda _, page_group=None: snapshot,
         "bind_deepseek_v41_proxy_cache": lambda *_: bound,
+        "_v41_store_last_steps_decode_keeps": keeps,
         "_v41_stage_outside_forward": stage,
+        "_v41_state_checkpoints_around_forward": checkpoints,
     }
     exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module(body=[method], type_ignores=[]), str(BRIDGE), "exec"), scope
@@ -277,3 +283,16 @@ def test_proxy_factory_stages_unbound_profiling_full_only(
             profiling=staged_on == "scratch",
         )
         assert common.atom_v41_prepared is prepared
+    # The checkpoint step runs on a real step whose pool is bound, and never
+    # under capture: it is the one piece of per-step work a captured graph
+    # must not replay. An unbound step returns before staging, so there is no
+    # step to checkpoint either.
+    if staged_on is not None and not capturing:
+        checkpoints.assert_called_once_with(config, common, prepared)
+        # The keeps the last step committed to are stored before this step's
+        # staging can move the state they are read from.
+        keeps.assert_called_once_with(config, snapshot)
+        assert order == ["keeps", "stage"]
+    else:
+        checkpoints.assert_not_called()
+        keeps.assert_not_called()

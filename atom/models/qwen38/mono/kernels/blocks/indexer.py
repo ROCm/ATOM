@@ -175,6 +175,8 @@ class _Cfg:
     seq_lens: str = "seq_lens"
     weights: str = "idx_w"
     rope: str = "rope"
+    # int32 [batch]: the request's RoPE position minus its cache row (ATOM's MRoPE offset, 0 for text)
+    rope_off: str = "rope_off"
 
     @property
     def rows(self) -> int:
@@ -413,9 +415,9 @@ def _score(dots, head_dim):
     return tot / fx.Float32(math.sqrt(head_dim)) + fx.Float32(0.0)
 
 
-def _q_head(k, c: _Cfg, row, pos, head, slot):
-    """(One wave) index query ``head`` of ``row`` normed and rotated at ``pos`` into LDS vector
-    ``slot`` (f32, bf16 values; lane ``l`` dims ``2 l, 2 l + 1``)."""
+def _q_head(k, c: _Cfg, row, rp, head, slot):
+    """(One wave) index query ``head`` of ``row`` normed and rotated at RoPE table row ``rp`` into LDS
+    vector ``slot`` (f32, bf16 values; lane ``l`` dims ``2 l, 2 l + 1``)."""
     lane = k.lane
     e0 = row * c.src_width + c.col + head * DIM + 2 * lane
     x = chan.poll_bf16([(k.mb[c.src], e0, 2)], k.tag)[0]
@@ -423,9 +425,7 @@ def _q_head(k, c: _Cfg, row, pos, head, slot):
     ss = _head_ss2(x, lane)
     y = _norm(x, w, ss, c.eps)
     half_words = c.rope_words // 2  # words of the cos half
-    rw = fx.Int64(rope_pos(pos, c.width * c.blk)) * c.rope_words + fx.Int64(
-        lane % half_words
-    )
+    rw = fx.Int64(rp) * c.rope_words + fx.Int64(lane % half_words)
     cs = _unpack([fx.Int32(_ld_rope(k, c, rw))])
     sn = _unpack([fx.Int32(_ld_rope(k, c, rw + half_words))])
     # lane l holds dims 2l, 2l+1: the partner of dim d < rot / 2 is d + rot / 2 (lane l + rot / 4)
@@ -435,12 +435,17 @@ def _q_head(k, c: _Cfg, row, pos, head, slot):
 
 
 @traced
-def _q_prologue(k, c: _Cfg, row, pos):
-    """Waves < heads: index query head ``wave`` normed and rotated at ``pos`` into LDS (f32,
-    bf16 values); then a barrier."""
+def _q_prologue(k, c: _Cfg, row, rp):
+    """Waves < heads: index query head ``wave`` normed and rotated at RoPE table row ``rp`` into
+    LDS (f32, bf16 values); then a barrier."""
     if k.wave < c.heads:
-        _q_head(k, c, row, pos, k.wave, k.wave)
+        _q_head(k, c, row, rp, k.wave, k.wave)
     gpu.barrier()
+
+
+def _rope_row(k, c: _Cfg, req, pos):
+    """The RoPE table row of request ``req``'s cache row ``pos``: ATOM's position (``rope_off``)."""
+    return rope_pos(pos + uniform(ld_i32(k.args[c.rope_off], req)), c.width * c.blk)
 
 
 def _ld_rope(k, c: _Cfg, word):
@@ -484,7 +489,7 @@ def _put_score(k, c: _Cfg, pair, score, ok):
 @traced
 def _scored_new(k, c: _Cfg, row, req, l0, pos, nc, cb):
     b, key = _new_key(k, c, req, l0, nc, cb)
-    _q_prologue(k, c, row, pos)
+    _q_prologue(k, c, row, _rope_row(k, c, req, pos))
     _new_out(k, c, row, req, pos, _q_lanes(k, c), b, key, cb)
 
 
@@ -530,9 +535,9 @@ def _block_key(k, c: _Cfg, req, l0, block, j):
     # lane j holds dims 8 j ..: rotated for j < rot / 8, partner lane j ^ (rot / 16)
     half = c.rot // 2
     lanes = half // 8
-    rw = fx.Int64(
-        rope_pos(block * c.compress, c.width * c.blk)
-    ) * c.rope_words + fx.Int64(4 * (j % lanes))
+    rw = fx.Int64(_rope_row(k, c, req, block * c.compress)) * c.rope_words + fx.Int64(
+        4 * (j % lanes)
+    )
     cs = _unpack([fx.Int32(_ld_rope(k, c, rw + e)) for e in range(4)])
     sn = _unpack(
         [fx.Int32(_ld_rope(k, c, rw + c.rope_words // 2 + e)) for e in range(4)]
@@ -654,7 +659,7 @@ def _q_tile_issue(k, c: _Cfg, req, tile, l0):
     w = [ld_i32(k.args[c.weights], 2 * t + e) for e in range(2)]
     # rotated dims below rot: 4 t .. lies in frequencies (4 t) % half ..
     half = c.rot // 2
-    rw = fx.Int64(rope_pos(l0 + srow, c.width * c.blk)) * c.rope_words + fx.Int64(
+    rw = fx.Int64(_rope_row(k, c, req, l0 + srow)) * c.rope_words + fx.Int64(
         (4 * t) % half // 2
     )
     cs = [fx.Int32(_ld_rope(k, c, rw + e)) for e in range(2)]
@@ -1019,6 +1024,7 @@ class Indexer(Block):
         seq_lens: str = "seq_lens",
         weights: str | None = None,
         rope: str = "rope",
+        rope_off: str = "rope_off",
         q_norm: str = "self_attn.indexer.q_layernorm",
         k_norm: str = "self_attn.indexer.k_layernorm",
         kv_block: int = 0,
@@ -1047,6 +1053,7 @@ class Indexer(Block):
             "seq_lens": seq_lens,
             "weights": weights or f"{prefix}_w",
             "rope": rope,
+            "rope_off": rope_off,
         }
 
     def cfg(self, sc: Scenario) -> _Cfg:
@@ -1092,7 +1099,15 @@ class Indexer(Block):
                 lds_words=c.vec_slots * DIM,
                 # _put_score's own resource
                 writes=(Region(c.isc, c.rows * c.max_blocks, (score,), single=True),),
-                args=(c.seq_lens, c.block_table, c.raw, c.cmp, c.weights, c.rope),
+                args=(
+                    c.seq_lens,
+                    c.block_table,
+                    c.raw,
+                    c.cmp,
+                    c.weights,
+                    c.rope,
+                    c.rope_off,
+                ),
                 key=(c,),
             )
         ]
