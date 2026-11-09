@@ -515,19 +515,6 @@ class EngineCore:
             # final/aborted requests when there will be no subsequent batch.
             self.runner_mgr.call_func("release_multimodal_requests", request_ids)
 
-    def _put_early_outputs(self):
-        # A step whose `schedule()` can admit a remote prefill's KV must call
-        # this: the scheduler has already cleared each such seq's
-        # `_injected_t0`, so postprocess will not send T0 again. That is the
-        # base step, which the DP loop shares, and the PP loop. RapidServe's
-        # steps have nothing to drain: `DecodeScheduler._schedule` never takes
-        # that path and `PrefillScheduler` has none. Ahead of the forward, and
-        # on the queue every later output of the same seqs takes, so the
-        # client sees T0 first.
-        early = getattr(self.scheduler, "take_early_outputs", None)
-        if early is not None and (early_outputs := early()):
-            self.output_queue.put_nowait(("STREAM", early_outputs))
-
     def _process_engine_step_inner(self):
         result = self.scheduler.schedule()
 
@@ -539,8 +526,6 @@ class EngineCore:
         if rejected:
             self._release_request_resources(rejected)
             self.output_queue.put_nowait(rejected)
-
-        self._put_early_outputs()
 
         if result is None:
             self._advance_idle_kv_transfer()
