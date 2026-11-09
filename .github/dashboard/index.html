@@ -1085,6 +1085,7 @@ const localRows = (localBenchmark.points || []).map((point, idx) => atomeshPoint
   ...point, source_label: point.source_label || 'Local measurements',
 }, {}, `local-${idx}`));
 const atomeshSummaryRows = [...mergeAtomeshTopologyRows(atomeshRawRows), ...localRows];
+const explorerBenchmarkRows = buildExplorerBenchmarkRows(rawData);
 
 // Normalize legacy model names using HF-path->display mapping from models_map.js
 const _displayMap = window.MODELS_DISPLAY_MAP || {};
@@ -1463,10 +1464,10 @@ const state = {
   atomeshTrendModel: '',
   atomeshIntvtyMetric: 'p90_itl',
   explorerModel: localRows[0]?.model || '',
-  explorerSource: localRows[0]?.sourceLabel || '',
+  explorerSource: 'ATOM CI',
   explorerWorkload: '',
   explorerHidden: new Set(),
-  explorerFrontierOnly: false,
+  explorerFrontierOnly: true,
   dataView: 'table',
   dataSort: { column: 'date', direction: 'desc' },
 };
@@ -1886,7 +1887,7 @@ function renderFilters() {
     state.filters.conc = [...allConc];
     state.filters.hardware = [defaultHardware];
     state.explorerHidden.clear();
-    state.explorerFrontierOnly = false;
+    state.explorerFrontierOnly = true;
     renderFilters();
     updateHeaderGpuMeta();
     renderActiveTab();
@@ -3470,7 +3471,7 @@ function syncToHash() {
   for (const key of ['explorerModel', 'explorerSource', 'explorerWorkload']) {
     if (state[key]) parts.push(key + '=' + encodeURIComponent(state[key]));
   }
-  if (state.explorerFrontierOnly) parts.push('frontier=1');
+  if (!state.explorerFrontierOnly) parts.push('frontier=0');
   if (state.explorerHidden.size) parts.push('hiddenSeries=' + encodeURIComponent(JSON.stringify([...state.explorerHidden])));
   hashUpdateFromCode = true;
   window.location.hash = parts.join('&');
@@ -3478,16 +3479,16 @@ function syncToHash() {
 
 function readFromHash() {
   state.explorerModel = localRows[0] ? explorerModelName(localRows[0].model) : '';
-  state.explorerSource = localRows[0]?.sourceLabel || '';
+  state.explorerSource = 'ATOM CI';
   state.explorerWorkload = '';
-  state.explorerFrontierOnly = false;
+  state.explorerFrontierOnly = true;
   state.explorerHidden = new Set();
   const hash = window.location.hash.slice(1);
   if (!hash) return;
   for (const [k, v] of new URLSearchParams(hash)) {
     if (!v) continue;
     if (['explorerModel', 'explorerSource', 'explorerWorkload'].includes(k)) state[k] = v;
-    if (k === 'frontier') state.explorerFrontierOnly = v === '1';
+    if (k === 'frontier' && ['0', '1'].includes(v)) state.explorerFrontierOnly = v === '1';
     if (k === 'hiddenSeries') {
       try {
         const hidden = JSON.parse(v);
@@ -4054,6 +4055,30 @@ function renderAtomeshKPICards() {
   }
 }
 
+function buildExplorerBenchmarkRows(data) {
+  // Read the exact perf_point payload produced by process_result.py and stored
+  // by github-action-benchmark. Keep the latest publication of each recipe /
+  // concurrency; do not choose winners by throughput before calculating Pareto.
+  const runs = Object.values(data?.entries || {}).flat().sort((a, b) => (b.date || 0) - (a.date || 0));
+  const latest = new Map();
+  let index = 0;
+  for (const run of runs) {
+    for (const bench of run.benches || []) {
+      const parsed = parseAtomeshPerfPointExtra(bench.extra);
+      if (parsed?.point?.source !== 'ATOMesh') continue;
+      const row = atomeshPointRow(parsed.point, parsed.meta, index++);
+      const model = atomeshMergedModelName(row);
+      const key = JSON.stringify([row.sourceLabel, row.hardware, model,
+        row.configLabel || row.topology, explorerWorkloadKey(row), row.concurrency]);
+      if (latest.has(key)) continue;
+      latest.set(key, { ...row, model,
+        sourceModel: row.model, sourceTopology: row.topology,
+        commit: run.commit, date: run.date || row.date || 0 });
+    }
+  }
+  return [...latest.values()];
+}
+
 // P90 axes only accept measurements with a known definition. In particular,
 // legacy 1000 / median(TPOT) values must never appear on the normalized P90 axis.
 function explorerMetricValue(row, metric) {
@@ -4091,7 +4116,7 @@ function renderAtomeshPerformanceTab() {
   const metric = atomeshInteractivityMetric();
   const metricLabel = metric.key === 'p90_itl' ? 'P90 Interactivity' : 'P90 Normalized Interactivity';
   // The model dropdown owns model selection; the other global filters still apply.
-  const available = atomeshSummaryRows.filter(row => state.filters.hardware.includes(row.hardware || 'unknown')
+  const available = [...explorerBenchmarkRows, ...localRows].filter(row => state.filters.hardware.includes(row.hardware || 'unknown')
     && state.filters.backends.includes(row.backend) && atomeshMatchesIslOslFilter(row)
     && state.filters.conc.includes(row.concurrency));
   const models = [...new Set(available.map(row => explorerModelName(row.model)))].sort(_lc);
@@ -4138,7 +4163,9 @@ function renderAtomeshPerformanceTab() {
   const gpuCounts = points.map(p => p.row.totalGpu).filter(Number.isFinite);
   const gpuRange = gpuCounts.length ? `${Math.min(...gpuCounts)}${Math.min(...gpuCounts) === Math.max(...gpuCounts) ? '' : '–' + Math.max(...gpuCounts)}` : '—';
   const missing = rows.filter(row => explorerMetricValue(row, metric) === null || !Number.isFinite(row.totalTput) || row.totalTput <= 0).length;
-  const sourceUrl = safeHref(rows[0]?.sourceUrl || rows[0]?.runUrl);
+  const sourceUrl = state.explorerSource === 'ATOM CI'
+    ? 'https://github.com/ROCm/ATOM/actions/workflows/atomesh-benchmark.yaml'
+    : safeHref(rows[0]?.sourceUrl || rows[0]?.runUrl);
   const optionHTML = (options, selected, label = x => x) => options.map(option => `<option value="${escHTML(option).replace(/"/g, '&quot;')}" ${option === selected ? 'selected' : ''}>${escHTML(label(option))}</option>`).join('');
   container.innerHTML = `
     <div class="ex-controls">
@@ -4166,7 +4193,7 @@ function renderAtomeshPerformanceTab() {
       <div class="ex-stats">
         <div class="ex-stat"><div class="ex-stat-label">Peak total throughput</div><div class="ex-stat-value">${explorerCompact(peak?.y, 2)} <small>tok/s</small></div><div class="ex-stat-note">${peak ? `Concurrency ${peak.row.concurrency} · ${peak.row.totalGpu ?? '—'} GPUs` : 'No measured points'}</div></div>
         <div class="ex-stat"><div class="ex-stat-label">Fastest ${metricLabel}</div><div class="ex-stat-value">${fastest ? fmtNum(fastest.x, 1) : '—'} <small>tok/s/user</small></div><div class="ex-stat-note">${fastest ? `Concurrency ${fastest.row.concurrency} · ${fastest.row.totalGpu ?? '—'} GPUs` : 'No P90 measurements'}</div></div>
-        <div class="ex-stat"><div class="ex-stat-label">Measured configurations</div><div class="ex-stat-value">${points.length} <small>points</small></div><div class="ex-stat-note">${frontierRows.size} on the Pareto frontier</div></div>
+        <div class="ex-stat"><div class="ex-stat-label">${state.explorerFrontierOnly ? 'Pareto-optimal configurations' : 'Visible configurations'}</div><div class="ex-stat-value">${visible.length} <small>points</small></div><div class="ex-stat-note">${points.length} measured · ${frontierRows.size} Pareto optimal</div></div>
         <div class="ex-stat"><div class="ex-stat-label">GPUs per configuration</div><div class="ex-stat-value">${gpuRange} <small>${escHTML(fmtHardware(selectedHardware()))}</small></div><div class="ex-stat-note">Prefill + decode GPUs</div></div>
       </div>
       <aside class="ex-detail" id="ex-detail" aria-label="Selected configuration" aria-live="polite" hidden></aside>

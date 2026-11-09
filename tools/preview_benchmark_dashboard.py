@@ -3,8 +3,7 @@
 """Preview the dashboard locally with published data and optional extra perf points.
 
 Example:
-    python tools/preview_benchmark_dashboard.py \
-        --points .github/dashboard/demo/inferencex-pr-4045.json
+    python tools/preview_benchmark_dashboard.py --refresh
 
 Only reads public dashboard assets. Extra points stay in the preview directory;
 this script does not publish data or require GitHub credentials.
@@ -59,14 +58,23 @@ def prepare(output, points_files, refresh=False):
     html = (ROOT / ".github/dashboard/index.html").read_text(encoding="utf-8")
     for name, url in ASSETS.items():
         html = html.replace(url, name)
-    # Escaping '<' keeps JSON text from terminating its script element.
-    extra = json.dumps({"points": points}, ensure_ascii=True).replace("<", "\\u003c")
-    script = "<script>window.ATOM_LOCAL_BENCHMARK = " + extra + ";</script>\n"
-    html = html.replace(
-        '<script src="data.js"></script>', script + '<script src="data.js"></script>'
-    )
+    if points:
+        # Escaping '<' keeps JSON text from terminating its script element.
+        extra = json.dumps({"points": points}, ensure_ascii=True).replace(
+            "<", "\\u003c"
+        )
+        script = "<script>window.ATOM_LOCAL_BENCHMARK = " + extra + ";</script>\n"
+        html = html.replace(
+            '<script src="data.js"></script>',
+            script + '<script src="data.js"></script>',
+        )
     (output / "index.html").write_text(html, encoding="utf-8")
-    params = {"mode": "Disaggregated", "hardware": "mi355x", "intvty": "p90_itl"}
+    params = {
+        "mode": "Disaggregated",
+        "hardware": "mi355x",
+        "intvty": "p90_itl",
+        "explorerSource": "ATOM CI",
+    }
     if points:
         params.update(
             explorerModel=points[0]["model"],

@@ -26,7 +26,7 @@ def javascript_function(name):
 class ExplorerMetricsTests(unittest.TestCase):
     def run_js(self, script):
         result = subprocess.run(
-            [NODE, "-e", script], capture_output=True, text=True, check=False
+            [NODE], input=script, capture_output=True, text=True, check=False
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -77,6 +77,48 @@ const before = JSON.stringify(points);
 assert.deepEqual(atomeshParetoFrontier(points), [{x: 1, y: 7}, {x: 3, y: 4}, {x: 5, y: 2}]);
 assert.equal(JSON.stringify(points), before);
 assert.deepEqual(atomeshParetoFrontier([]), []);
+"""
+        )
+
+    def test_ci_points_preserve_recipes_and_use_latest_publication(self):
+        functions = [
+            "parseAtomeshNumber",
+            "atomeshInteractivityMethod",
+            "atomeshHardwareKey",
+            "parseAtomeshPerfPointExtra",
+            "atomeshPointNumber",
+            "atomeshPointRow",
+            "atomeshMergedModelName",
+            "isAgenticTraceRow",
+            "explorerWorkloadKey",
+            "buildExplorerBenchmarkRows",
+            "atomeshParetoFrontier",
+        ]
+        self.run_js(
+            "const assert = require('node:assert/strict');\n"
+            "const ATOMESH_DATA = {backend: 'ATOMesh', hardware: 'MI355X'};\n"
+            + "\n".join(javascript_function(name) for name in functions)
+            + """
+const base = {source: 'ATOMesh', model: 'GLM-5.2', hardware: 'mi355x',
+  precision: 'fp4', benchmark_kind: 'aiperf_agentic', public_dataset: 'agentic-trace',
+  concurrency: 56, interactivity_method: 'p90_e2e_normalized', interactivity: 30};
+const bench = point => ({extra: 'Run: https://github.com/ROCm/ATOM/actions/runs/1 | perf_point=' + encodeURIComponent(JSON.stringify({...base, ...point}))});
+const older = {date: 100, benches: [bench({config_label: 'recipe-a', total_tput: 900, interactivity_p90_itl: 100})]};
+const newer = {date: 200, benches: [
+  bench({config_label: 'recipe-a', total_tput: 200, interactivity_p90_itl: 60}),
+  bench({config_label: 'recipe-b', total_tput: 100, interactivity_p90_itl: 90}),
+  bench({config_label: 'recipe-b', total_tput: 100, interactivity_p90_itl: 90}),
+  bench({config_label: 'recipe-a', precision: 'fp8', total_tput: 150, interactivity_p90_itl: 70}),
+  bench({config_label: 'recipe-a', public_dataset: 'other-trace', total_tput: 180, interactivity_p90_itl: 75}),
+]};
+const rows = buildExplorerBenchmarkRows({entries: {CI: [older, newer]}});
+assert.equal(rows.length, 4);
+const cohort = rows.filter(row => row.precision === 'fp4' && row.publicDataset === 'agentic-trace');
+assert.deepEqual(cohort.map(row => row.totalTput), [200, 100]);
+assert(cohort.every(row => row.date === 200 && row.sourceLabel === 'ATOM CI'));
+assert(cohort.every(row => row.runUrl === 'https://github.com/ROCm/ATOM/actions/runs/1'));
+// Same concurrency: the slower-throughput recipe is still a valid frontier point.
+assert.equal(atomeshParetoFrontier(cohort.map(row => ({x: row.interactivityP90Itl, y: row.totalTput}))).length, 2);
 """
         )
 
@@ -139,6 +181,22 @@ class ExplorerPreviewTests(unittest.TestCase):
             self.assertIn(r"model \u003c/script>", generated)
             self.assertEqual((output / "data.js").read_text(), "// cached public asset")
             self.assertNotIn('src="https://cdnjs.cloudflare.com', generated)
+
+    def test_default_preview_uses_ci_without_sample_injection(self):
+        spec = importlib.util.spec_from_file_location(
+            "preview", ROOT / "tools/preview_benchmark_dashboard.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for name in module.ASSETS:
+                (output / name).write_text("// cached public asset", encoding="utf-8")
+            fragment = module.prepare(output, [])
+            generated = (output / "index.html").read_text(encoding="utf-8")
+            self.assertIn("explorerSource=ATOM+CI", fragment)
+            self.assertIn('<script src="data.js"></script>', generated)
+            self.assertNotIn("window.ATOM_LOCAL_BENCHMARK =", generated)
 
 
 if __name__ == "__main__":
