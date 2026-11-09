@@ -143,6 +143,7 @@ def _build_v41_pool_geometry(
     kv_dtype: str,
     speculative_tokens: int = 0,
     index_fp4: bool = False,
+    index_layout: str | None = None,
 ):
     """The CSA2 pool geometry, derived here rather than asked of core.
 
@@ -185,6 +186,7 @@ def _build_v41_pool_geometry(
         # candidate list be a block table.
         index_block_rows=hf_config.candidate_block_size,
         index_fp4=index_fp4,
+        index_layout=index_layout,
     )
 
 
