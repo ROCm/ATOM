@@ -1,17 +1,26 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::OnceLock,
     time::Duration,
 };
 
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
 use super::{
     config::{default_duration_buckets, PrometheusConfig},
     schema,
 };
 
+static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+
 pub(crate) fn init_metrics() {
     schema::describe_all_metrics();
+}
+
+/// The installed registry, rendered by the router port's `/metrics` while the
+/// Prometheus port keeps serving the same data.
+pub(crate) fn prometheus_handle() -> Option<&'static PrometheusHandle> {
+    PROMETHEUS_HANDLE.get()
 }
 
 pub fn start_prometheus(config: PrometheusConfig) {
@@ -43,9 +52,13 @@ pub fn start_prometheus(config: PrometheusConfig) {
             .set_buckets_for_metric(Matcher::Full((*name).to_string()), buckets)
             .expect("failed to set routing buckets");
     }
-    builder
-        .install()
-        .expect("failed to install Prometheus metrics exporter");
+    // build() spawns the upkeep task, so this must run inside the Tokio runtime.
+    let (recorder, exporter) = builder
+        .build()
+        .expect("failed to build Prometheus metrics exporter");
+    let _ = PROMETHEUS_HANDLE.set(recorder.handle());
+    tokio::spawn(exporter);
+    metrics::set_global_recorder(recorder).expect("failed to install Prometheus metrics recorder");
 }
 
 #[cfg(test)]
