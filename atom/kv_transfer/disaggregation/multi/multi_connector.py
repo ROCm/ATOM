@@ -437,7 +437,14 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return False
 
     def cancel_preadmission(self, seq: Any) -> None:
-        self.cancel_pending_load(seq)
+        """Take back an early admission, including each tier's held state."""
+        self._load_winner.pop(getattr(seq, "id", None), None)
+        for connector in self._connectors:
+            cancel = getattr(connector, "cancel_preadmission", None)
+            if not callable(cancel):
+                cancel = getattr(connector, "cancel_pending_load", None)
+            if callable(cancel):
+                cancel(seq)
 
     def _sub_methods(self, name: str) -> list:
         """Bound `name` of every sub-connector that implements it."""
