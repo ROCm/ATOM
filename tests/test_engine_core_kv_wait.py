@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import queue
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -16,8 +18,8 @@ def engine_step(monkeypatch):
     monkeypatch.setitem(sys.modules, "atom.model_engine.async_proc", async_proc)
     from atom.model_engine import engine_core
 
-    sleep = Mock()
-    monkeypatch.setattr(engine_core.time, "sleep", sleep)
+    event = Mock()
+    sleep = event.wait
     monkeypatch.setattr(engine_core.tracing, "record_forward", Mock())
     batch = SimpleNamespace(
         req_ids=[], connector_meta_output=None, total_seqs_num_prefill=0
@@ -33,9 +35,15 @@ def engine_step(monkeypatch):
         scheduler=scheduler,
         kv_transfer_enabled=True,
         runner_mgr=SimpleNamespace(call_func=Mock(return_value="forward-result")),
-        _poll_kv_transfer_progress=Mock(),
+        _poll_kv_transfer_progress=Mock(return_value=False),
+        _kv_progress_event=event,
+        input_queue=queue.Queue(),
+        utility_queue=queue.Queue(),
         _postprocess=Mock(),
         label="test",
+    )
+    engine._wait_for_kv_progress = lambda: engine_core.EngineCore._wait_for_kv_progress(
+        engine
     )
     return engine_core, engine, batch, sleep
 
@@ -93,6 +101,85 @@ def test_non_kv_empty_batch_does_not_sleep(engine_step):
     assert module.EngineCore._process_engine_step_inner(engine) is False
 
     sleep.assert_not_called()
+
+
+def test_reported_completion_does_not_wait(engine_step):
+    module, engine, _, wait = engine_step
+    engine._poll_kv_transfer_progress.return_value = True
+
+    assert module.EngineCore._process_engine_step_inner(engine) is False
+
+    wait.assert_not_called()
+
+
+@pytest.mark.parametrize("queue_name", ["input_queue", "utility_queue"])
+def test_already_queued_work_does_not_wait(engine_step, queue_name):
+    module, engine, _, wait = engine_step
+    getattr(engine, queue_name).put_nowait(object())
+
+    module.EngineCore._process_engine_step_inner(engine)
+
+    wait.assert_not_called()
+
+
+def test_arrival_during_poll_is_latched_until_wait(engine_step):
+    module, engine, _, _ = engine_step
+    event = threading.Event()
+    engine._kv_progress_event = event
+
+    def poll():
+        event.set()
+        return False
+
+    engine._poll_kv_transfer_progress.side_effect = poll
+    assert module.EngineCore._process_engine_step_inner(engine) is False
+    assert event.is_set()
+
+
+def test_arrival_between_queue_check_and_wait_is_not_lost(engine_step):
+    module, engine, _, _ = engine_step
+    event = threading.Event()
+    engine._kv_progress_event = event
+
+    class ArrivalQueue:
+        def empty(self):
+            event.set()
+            return True
+
+    engine.utility_queue = ArrivalQueue()
+    module.EngineCore._wait_for_kv_progress(engine)
+    assert event.is_set()
+
+
+def test_wait_releases_thread_and_wakes_on_progress(engine_step):
+    module, engine, _, _ = engine_step
+    event = threading.Event()
+    waiting = threading.Event()
+    done = threading.Event()
+
+    class ObservedEvent:
+        def wait(self, timeout):
+            assert timeout == module.KV_IDLE_DRAIN_INTERVAL_S
+            waiting.set()
+            # A longer test-only timeout avoids depending on OS scheduling
+            # within the production 1 ms interval.
+            assert event.wait(5)
+
+    engine._kv_progress_event = ObservedEvent()
+
+    def run():
+        module.EngineCore._wait_for_kv_progress(engine)
+        done.set()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert waiting.wait(5)
+        event.set()
+        assert done.wait(5)
+    finally:
+        event.set()
+        thread.join(5)
     engine.runner_mgr.call_func.assert_not_called()
 
 
