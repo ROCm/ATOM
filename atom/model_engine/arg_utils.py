@@ -863,11 +863,12 @@ class EngineArgs:
             type=str,
             default="",
             help=(
-                "Route the Qwen QSA index scorer to aiter's fused kernel "
-                "(aiter.ops.qsa_index_scorer) under this profile name or JSON "
-                "path, e.g. qsa_page4_gfx1250_v1. Calls the profile does not "
-                "cover run ATOM's native scorer with a logged reason. Default "
-                "empty = OFF (nothing imported, stock behaviour); when absent, "
+                "Score the Qwen QSA indexer with aiter's op "
+                "aiter.ops.qsa.qsa_paged_mqa_logits, configured with this "
+                "profile name or JSON path (e.g. qsa_page4_gfx1250_v1): aiter "
+                "runs its fused kernel on the call classes the profile covers "
+                "and its native paths on the rest. Default empty = OFF "
+                "(nothing imported, ATOM's own scorer); when absent, "
                 "$ATOM_QSA_INDEX_SCORER_PROFILE is used. See "
                 "docs/qsa_index_scorer.md."
             ),
@@ -877,11 +878,14 @@ class EngineArgs:
             type=str,
             default="",
             help=(
-                "Write every QSA index scorer call class (shapes, dtypes, "
-                "strides, buckets, cache layouts, rank, decision) to this JSON "
-                "path ({rank}/{pid} placeholders allowed) for the coverage "
-                "matrix and aiter gen_profile --plan-file. Works with or "
-                "without --qsa-index-scorer-profile."
+                "Debug/coverage: write every QSA index scorer call class "
+                "(shapes, dtypes, strides, buckets, cache layouts, rank, and "
+                "aiter.ops.qsa.explain()'s path) to this JSON path "
+                "({rank}/{pid} placeholders allowed) for the coverage matrix "
+                "and aiter gen_profile --plan-file, and log per-path call "
+                "counts at exit. Off by default (no wrapper installed). "
+                "Without --qsa-index-scorer-profile it observes ATOM's own "
+                "scorer."
             ),
         )
 

@@ -1,143 +1,145 @@
-# QSA index scorer: opt-in aiter in-tree op (Qwen3.8-Flash-Next)
+# QSA index scorer: aiter's neutral op `aiter.ops.qsa.qsa_paged_mqa_logits` (Qwen3.8-Flash-Next)
 
-The Qwen QSA indexer scores compressed key groups with ATOM's
+The Qwen QSA indexer scores compressed key groups with ATOM's own
 `qsa_paged_mqa_logits` (`atom/model_ops/qwen4_exp/ops/qsa.py`, unchanged: the
-frozen golden scorer, sha256 `c2e46e50…` LF / `aaa78f43…` CRLF). With
-`--qsa-index-scorer-profile` the same calls go to aiter's **in-tree** op
-`aiter.ops.qsa_index_scorer` (ROCm/aiter#7377, FlyDSL gfx1250, cross-repo
-contract API 1.x). This is a call-site integration of a new coarse aiter op; it
-does not use `aiter.plugin` (the out-of-tree provider interface) and has nothing
-to do with `atom/plugin/` (ATOM's vLLM/SGLang/rtp-llm frontend adapter).
+frozen golden reference, sha256 `c2e46e50…` LF / `aaa78f43…` CRLF). With
+`--qsa-index-scorer-profile` the same calls go to aiter's in-tree **neutral op**
+`aiter.ops.qsa.qsa_paged_mqa_logits` (op contract `qsa_paged_mqa_logits` v1;
+its 12 leading parameters are ATOM's scorer's). aiter owns the dispatch: its
+fused FlyDSL gfx1250 kernel where the configured profile covers the call
+class, aiter's native paths (Triton / FlyDSL page-16 prefill / torch)
+otherwise; the op never raises for a valid call. ATOM therefore keeps **no
+route, no capability pinning and no fallback** of its own. This uses neither
+`aiter.plugin` (the out-of-tree provider interface) nor `atom/plugin/`
+(ATOM's vLLM/SGLang/rtp-llm frontend adapter).
 
 ## Switch
 
 | CLI | Config | Env (operator override) | Default |
 |---|---|---|---|
 | `--qsa-index-scorer-profile NAME\|PATH.json` | `Config.qsa_index_scorer.profile` | `ATOM_QSA_INDEX_SCORER_PROFILE` (read once by `EngineArgs`, only when the flag is absent) | `""` (OFF) |
-| `--qsa-index-scorer-capture PATH` | `Config.qsa_index_scorer.capture` | — | `""` |
+| `--qsa-index-scorer-capture PATH` | `Config.qsa_index_scorer.capture` | — | `""` (no observer) |
 
-* **OFF** (default): `Qwen4ExpAttention.qsa_scorer is None`; neither
-  `atom.model_ops.qwen4_exp.qsa_index_scorer` nor `aiter.ops.qsa_index_scorer`
-  is imported (also not by `ModelRunner`); `_select_tokens` calls the stock
+* **OFF** (default): `Qwen4ExpAttention.qsa_select is None`; neither
+  `atom.model_ops.qwen4_exp.qsa_index_scorer` nor `aiter.ops.qsa`'s lifecycle
+  API is touched (also not by `ModelRunner`); `_select_tokens` calls the stock
   `qsa_select_paged_tokens`; `Config.compute_hash()` is unchanged
   (`QSAIndexScorerConfig.hash_factors()` is empty while OFF).
-* **ON**: `compute_hash()` includes `("qsa_index_scorer", profile)`. The profile
-  is passed as `profile=` to every aiter call; ATOM never sets aiter's
-  `AITER_QSA_INDEX_SCORER_*` variables. Do not set `QSA_*` kernel env vars (any
-  non-profiled value makes every call `kernel_env_mismatch` → stock).
-* **Capture** works with or without a profile (without one every call runs the
-  stock scorer with reason `atom_capture_only`).
+* **ON**: `compute_hash()` includes `("qsa_index_scorer", profile)`. The
+  profile reaches aiter only through `aiter.ops.qsa.configure(profile=...,
+  source="atom:Config.qsa_index_scorer.profile")`; ATOM never sets aiter's
+  env. aiter's own operator controls stay aiter's: `AITER_QSA_PROFILE`
+  (override) and `AITER_QSA_FUSED=0` (kill switch: native only).
+* **Fail-open**: an aiter without `aiter.ops.qsa.configure` (an image that
+  predates the neutral op), an `aiter.ops.qsa` that does not import, or a
+  `configure` that raises → one WARNING `QSA index scorer [rank]: DISABLED
+  (ATOM scorer) … reason=…`, and every QSA layer keeps ATOM's own scorer.
+  This is decided once, before the first scorer call; nothing is retried or
+  re-routed after the op has been called.
 
 ## Lifecycle (per worker process)
 
 ```
 ModelRunner.__init__
   _setup_device_and_distributed()
-  check_aiter_fused_ops(config)            atom/aiter_fused_ops.py (ON only)
-    -> capability.init_qsa_index_scorer    once per process: import aiter op, API_VERSION 1.x,
-                                           scorer signature, load_profile(profile); one startup line
+  configure_aiter_fused_ops(config)       atom/aiter_fused_ops.py (ON only)
+    -> qsa_index_scorer.configure         aiter.ops.qsa.configure(profile, source); one startup
+                                          line from aiter.ops.qsa.status()
   _build_and_load_model()
-    Qwen4ExpAttention.__init__ -> build_route(cfg, site)   binds the cached capability
-  _maybe_warmup()                          (attention short-circuited: no scorer call)
+    Qwen4ExpAttention.__init__ -> index_scorer(config)    aiter.ops.qsa.qsa_paged_mqa_logits
+                                                          (or None: ATOM's scorer)
+  _maybe_warmup()                         (attention short-circuited: no scorer call)
 EngineCore: get_num_blocks -> allocate_kv_cache
-  Qwen4ExpMetadataBuilder.build_kv_cache_tensor -> Qwen4ExpAttention.bind_caches
-    route.prepare(compressed_key_cache, scale)   aiter layout_eligibility (once per cache)
-                                                 + aiter prewarm, once per (dtype, page) per process
+  bind_caches (every layer) ... KV-size check
+  _prewarm_aiter_fused_ops                aiter.ops.qsa.prewarm(page_sizes, cache_dtypes,
+                                          pos_dtypes=(int64,), compressed_k_cache, scale),
+                                          once per distinct bound index-cache layout
 capture_cudagraph
-  per-bucket eager warm-up forward: first real scorer call of each class -> aiter decide (cached)
-  record: launch(cached_decision, ...) captured; replays run no Python
+  per-bucket eager warm-up forward: first call of each class -> aiter decides (cached in aiter)
+  record: the decided kernel is captured; replays run no Python
 ```
 
+`ModelRunner` also prewarms on the disaggregated-decode bind path
+(`RapidServeModelRunner._bind_kv_cache_to_modules`). Plugin hosts
+(SGLang / rtp-llm) do not carry the switch; were it set there,
+`index_scorer()` configures lazily at layer construction (still before the
+first call) and variants build on first use (no prewarm hook).
+
 Startup line (logger `atom`), e.g.
-`QSA index scorer [dp0_tp0]: enabled profile=qsa_page4_gfx1250_v1 aiter_api=1.1
-kernel_sha=58051973… fused_call=launch prewarm=cache-scoped uncovered=stock
-kv_block=32 index_page=8`; on any capability failure:
-`DISABLED (stock scorer) … reason=<reason>` (WARNING) and every QSA layer keeps
-the stock scorer. The check never raises.
+`QSA index scorer [dp0_tp0]: enabled profile=qsa_page4_gfx1250_v1
+source=atom:Config.qsa_index_scorer.profile op=aiter.ops.qsa.qsa_paged_mqa_logits
+status: <aiter.ops.qsa.status() as key=value>`; prewarm:
+`QSA index scorer [dp0_tp0]: prewarm page=4 cache=bf16 pos=int64 -> N variant(s) in S s: …`.
 
 ## Call path
 
 ```
 Qwen4ExpAttention._select_tokens
-  route.select_paged_tokens(...)  == qsa_select_paged_tokens_routed(..., scorer=route)
+  self.qsa_select(...) == qsa_select_paged_tokens_with_scorer(..., scorer=aiter.ops.qsa.qsa_paged_mqa_logits)
     (stock loop: max_seq_len pow2 max_columns bucket, row chunks under the
      128 MiB logits workspace, per-chunk row_starts, top-k, expand)
-    route(q[rows], cache, table, t2r[rows], pos[rows], ctx, 4,
+    aiter.ops.qsa.qsa_paged_mqa_logits(q[rows], cache, table, t2r[rows], pos[rows], ctx, 4,
           max_columns=..., row_starts=..., allow_flydsl=is_prefill, compressed_k_scale=...)
-      entry = cache[class key] or aiter.decide(...)                (once per class)
-      fused        -> aiter.launch(decision, <12 args>)            (API 1.1; 1.0: public op)
-      aiter-native -> aiter.launch(decision, ...)  (aiter Decision.path == "native")
-      stock        -> ATOM qsa_paged_mqa_logits(<same 12 args>)
+      -> aiter: fused | native-triton | native-torch   (aiter's per-class decision cache)
 ```
 
-* **Paths.** `fused` = aiter's FlyDSL kernel. `aiter-native` = aiter's op
-  serving an uncovered class on aiter's own native path — only with an aiter
-  whose `Decision` carries `path` (detected at the capability check); ATOM then
-  adds no fallback. `stock` = ATOM's scorer: with aiter ≤ API 1.1 (no native
-  path in aiter) this is the **interim** behaviour for uncovered classes, and it
-  is always the path of a site whose capability or cache layout failed.
-* `qsa_select_paged_tokens_routed` (`qsa_index_scorer/select.py`) is the stock
-  loop with the scorer injected; a CPU test AST-compares it to `qsa.py`.
-* **Decision caching.** The class key holds everything aiter's `decide` reads
-  (shapes/dtypes/strides/devices, q 16-byte alignment, cache identity and scale
-  plane, ratio, divisor, `max_columns`, `row_starts` layout). `decide` never
-  reads tensor values, so the cached answer is exact; under CUDA graphs it is
-  made in the eager warm-up of each bucket, outside the recording.
-* **Rank uniformity.** Decisions are pure functions of config, shapes, static
-  layouts, device arch/CU and kernel env; every TP rank builds identical cache
-  layouts, so ranks decide identically without a collective.
-* **Failure boundary.** aiter's O(1) launch guard refusing a decided class
-  (`QSAIndexScorerUnsupported`, raised before any launch) re-pins that class to
-  the stock scorer; any other exception propagates (no retry after a launch).
-* **Observability.** One log line per (site, reason); `route.counts[(path,
-  reason)]`, `route.summary()`, and `process_summary()` (all routes of the
-  process), logged once at exit as `QSA index scorer decisions: fused=…,
-  aiter-native=…, stock=…`. Counts are Python calls: a CUDA-graph-captured call
-  counts once (at capture), eager calls every time. Nothing is registered while
-  OFF.
+* `qsa_select_paged_tokens_with_scorer` (`qsa_index_scorer/select.py`) is the
+  stock loop with the scorer injected; a CPU test AST-compares it to `qsa.py`
+  (kept as a drift-tested copy so `qsa.py`, the golden reference, stays
+  byte-identical).
+* The scorer is the op object itself: no ATOM wrapper, no per-call Python of
+  ATOM's on the default ON path. Anything the op raises propagates.
+* Traced regions: `Qwen4ExpForConditionalGeneration` is not
+  `@support_torch_compile`-decorated; the choice of scorer is made at layer
+  `__init__`, never per forward.
+
+## Observability (opt-in)
+
+`--qsa-index-scorer-capture /out/cap_{rank}.json` wraps the scorer in
+`ClassObserver`: the first call of each call class runs
+`aiter.ops.qsa.explain(*12 args)` (host-side; under CUDA graphs that first
+call is the eager per-bucket warm-up, outside the recording), every call is
+counted per `path:reason`, the class goes to the capture JSON (schema
+`atom.qsa_index_scorer.capture/2`), and the process logs
+`QSA index scorer decisions: fused=… native-torch=… native-triton=…` at exit.
+Without a profile the observer wraps ATOM's own scorer (path `atom`). Counts
+are Python calls: a captured call counts once (at capture). Off by default:
+no wrapper, zero cost. Merge per-rank files into aiter's plan file and a
+coverage matrix:
+`python -m atom.model_ops.qwen4_exp.qsa_index_scorer.capture merge '/out/cap_*.json' --plan plan.json --matrix matrix.json`.
 
 ## Supported matrix
 
-| Dimension | aiter op path | otherwise |
+aiter decides coverage; ATOM gates nothing beyond "profile set and
+`aiter.ops.qsa.configure` present".
+
+| Dimension | fused (aiter profile) | otherwise |
 |---|---|---|
 | model | Qwen3.8-Flash-Next (`Qwen4ExpAttention`, target layers and MTP draft layer) | — |
-| KV block size / index page | 16 / 4, 32 / 8, 64 / 16 (page sizes the kernel reports) | `cache_shape_unsupported` → stock |
-| index cache | bf16, fp8 (E4M3 + fp32 row scale) | fp4 → `cache_format_unsupported` → stock |
+| KV block size / index page | 16 / 4, 32 / 8, 64 / 16 | aiter native |
+| index cache | bf16, fp8 (E4M3 + fp32 row scale) | aiter native (torch for fp8 / fp4 + scale) |
 | query positions | int64 (ATOM's `logical_positions`) | — |
-| rows | decode, draft (tps 1), MTP verify (`num_speculative_tokens + 1` rows/request: 4 at MTP 3 = aiter's decode regime, 3 at MTP 2 = aiter's `rows == 3×requests` bucket, on by default), prefill chunks | per profile rule; uncovered → stock (interim) |
-| graph mode | eager and CUDA graph (decided at capture) | — |
-| arch | gfx1250 (profile) | `arch_unsupported` → stock |
-| frontends | native ATOM server / offline | plugin hosts (SGLang / RTP-LLM): switch not carried, stock |
+| rows | decode, draft, MTP verify, prefill chunks per profile rule | aiter native |
+| graph mode | eager and CUDA graph (decided at the capture warm-up) | — |
+| arch | gfx1250 (profile) | aiter native |
+| frontends | native ATOM server / offline | plugin hosts: switch not carried, ATOM's scorer |
 
 ## Workspace
 
-aiter keeps no persistent device workspace on the default route (the verify
-bucket launches native 3-row groups on the caller's tensors); `prewarm`
-launches on a private zero problem and frees it. Outputs (`logits`, `visible`)
-are allocated per call exactly like the stock scorer. Nothing is charged via
-`_kv_budget_extra_reserve`. The pad-4 staging bucket (a fallback only when the
-kernel lacks native 3-row groups) allocates small staging planes at `decide`,
-i.e. in the per-bucket warm-up before recording.
-
-## Golden adapter and capture
-
-* `python -m atom.model_ops.qwen4_exp.qsa_index_scorer.golden_adapter` (GPU):
-  replays the Phase-1 golden cases through the route (site / engine /
-  engine_pad / fallbacks), comparator `qsa_golden.compare_logits(rtol=1e-4,
-  atol=1e-4)` over `valid_page & c < visible`.
-* Capture: `--qsa-index-scorer-capture /out/cap_{rank}.json` writes every call
-  class with its decisions keyed `path:reason`; merge into aiter's plan file and
-  a coverage matrix:
-  `python -m atom.model_ops.qwen4_exp.qsa_index_scorer.capture merge '/out/cap_*.json' --plan plan.json --matrix matrix.json`.
-  Plan rows cover index pages 4/8/16 (`page_size` carried when ≠ 4).
+ATOM allocates nothing for the op: outputs (`logits`, `visible`) are
+allocated per call exactly like the stock scorer, and `prewarm` runs on a
+private problem after the KV-size check and frees it. Nothing is charged via
+`_kv_budget_extra_reserve`. Any persistent workspace of aiter's would have to
+be reported by aiter (none on the R2 kernel).
 
 ## Known limitations
 
-* Pre-existing ATOM issue: the stock scorer's fp8 MFMA route (more than 256
-  rows) aborts on gfx1250 (LLVM PHINode assertion); fused-covered fp8 prefill
-  chunks avoid it, uncovered ones (stock path) still reach it.
-* Until aiter ships `Decision.path`, uncovered classes run ATOM's stock scorer
-  (interim; counted as `stock:<reason>`).
-* `--enforce-eager` re-runs the route's Python on every call (cached decision +
-  `launch`, ~4–5 µs host per call measured on CPU with stub aiter); graph replay
-  runs none.
+* ATOM's stock scorer's fp8 MFMA route (more than 256 rows) aborts on gfx1250
+  (LLVM PHINode assertion) and the stock FlyDSL page-16 prefill aborts on
+  gfx1250 (`permlane32.swap`); with the switch ON, uncovered classes run
+  aiter's native paths instead, whose gfx1250 behaviour for these classes is
+  aiter's to state.
+* `--enforce-eager`: aiter's per-class decision runs on every call (O(1)
+  after the first); graph replay runs no Python.
+* Golden correctness of the op is aiter's (`op_tests` of the op); ATOM's
+  CPU tests cover enablement, ordering and the call site only.

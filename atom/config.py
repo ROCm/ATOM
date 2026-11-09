@@ -1789,23 +1789,27 @@ _QSA_INDEX_SCORER_PROFILE_NAME = re.compile(r"[A-Za-z0-9_.\-]+")
 
 @dataclass
 class QSAIndexScorerConfig:
-    """Opt-in routing of the Qwen QSA index scorer to aiter's fused kernel.
+    """Opt-in scoring of the Qwen QSA indexer by aiter's neutral op.
 
     OFF by default. With ``profile`` empty nothing is imported, the indexer
     calls ATOM's own ``qsa_paged_mqa_logits`` through the stock
     ``qsa_select_paged_tokens``, and the config hash is unchanged.
 
     Fields:
-      - profile: aiter ``qsa_index_scorer`` profile name (e.g.
-        ``qsa_page4_gfx1250_v1``) or a path to a profile JSON. Passed as
-        ``profile=`` to every aiter call -- ATOM never relies on aiter's
-        ``AITER_QSA_INDEX_SCORER_PROFILE`` env var. Calls the profile does not
-        cover run ATOM's native scorer, with a logged reason.
-      - capture: path of a JSON file that receives every scorer call class
-        (shapes, dtypes, strides, buckets, cache layouts, rank, decision) for
-        the coverage matrix and aiter's ``gen_profile --plan-file``. May hold
-        ``{rank}`` / ``{pid}``; without them ``.rank<r>.pid<p>`` is appended.
-        Works with ``profile`` empty too (every call then runs native).
+      - profile: aiter QSA profile name (e.g. ``qsa_page4_gfx1250_v1``) or a
+        path to a profile JSON. Each worker process hands it to aiter once,
+        ``aiter.ops.qsa.configure(profile=..., source="atom:...")``, before
+        the model is built; the indexer then scores through
+        ``aiter.ops.qsa.qsa_paged_mqa_logits``, which runs its fused kernel
+        on the call classes the profile covers and aiter's native paths on
+        the rest (ATOM adds no fallback). An aiter without
+        ``aiter.ops.qsa.configure`` keeps ATOM's own scorer (logged once).
+      - capture: debug/coverage only. Path of a JSON file that receives every
+        scorer call class (shapes, dtypes, strides, buckets, cache layouts,
+        rank, and ``aiter.ops.qsa.explain()``'s path) for the coverage matrix
+        and aiter's ``gen_profile --plan-file``. May hold ``{rank}`` /
+        ``{pid}``; without them ``.rank<r>.pid<p>`` is appended. With
+        ``profile`` empty it observes ATOM's own scorer. Never keys the hash.
     """
 
     profile: str = ""
@@ -1830,7 +1834,7 @@ class QSAIndexScorerConfig:
 
     @property
     def active(self) -> bool:
-        """A call-site route is installed (fused scorer and/or capture)."""
+        """The indexer looks at the switch at all (profile and/or capture)."""
         return bool(self.profile or self.capture)
 
     def hash_factors(self) -> list:
@@ -2238,7 +2242,7 @@ class Config:
     # EngineArgs) and pickled into every worker. Read sites use `config.dspark.*`
     # (no os.environ lookups). Defaults to all-off.
     dspark: DSparkConfig = field(default_factory=DSparkConfig)
-    # Opt-in aiter fused QSA index scorer (--qsa-index-scorer-profile /
+    # Opt-in QSA indexer scoring by aiter.ops.qsa (--qsa-index-scorer-profile /
     # --qsa-index-scorer-capture). Default OFF: nothing imported, stock path.
     qsa_index_scorer: QSAIndexScorerConfig = field(default_factory=QSAIndexScorerConfig)
 
@@ -3260,7 +3264,7 @@ class Config:
         # (DeepSeek-V4's `kv_fp8` branches, the DSpark drafter's fp8 plan), so a
         # bf16 <-> fp8 restart traces a different graph.
         factors.append(self.kv_cache_dtype)
-        # The fused QSA index scorer swaps the scorer kernel. Keyed only while
+        # aiter's QSA scorer profile swaps the scorer kernel. Keyed only while
         # ON, so every hash computed with the feature off is unchanged.
         qsa_index_scorer = getattr(self, "qsa_index_scorer", None)
         if qsa_index_scorer is not None:

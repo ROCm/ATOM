@@ -1435,6 +1435,11 @@ def __getattr__(name: str):
 # MASTER_ADDR, MASTER_PORT        — PyTorch distributed; set in model_runner.py
 # AITER_LOG_LEVEL                 — AITER library log verbosity
 # AITER_QUICK_REDUCE_QUANTIZATION — AITER; set conditionally in model_runner.py
+# AITER_QSA_PROFILE, AITER_QSA_FUSED — aiter.ops.qsa operator override / kill
+#                                   switch (AITER_QSA_FUSED=0: native only); read
+#                                   by aiter itself, never set by ATOM (ATOM
+#                                   passes --qsa-index-scorer-profile through
+#                                   aiter.ops.qsa.configure)
 # TORCHINDUCTOR_CACHE_DIR         — PyTorch Inductor; set in compiler_inferface.py
 # TRITON_CACHE_DIR                — Triton compiler; set in compiler_inferface.py
 # HF_TOKEN                        — HuggingFace Hub auth token

@@ -7,12 +7,12 @@ qsa_select_paged_tokens`` statement for statement, with the one call to
 ``qsa_paged_mqa_logits`` replaced by ``scorer``: same max_columns bucketing
 (power-of-two ``reachable`` groups), same row chunking under
 ``logits_workspace_bytes``, same per-chunk ``row_starts`` staging, same top-k
-and expansion. ``qsa.py`` itself stays byte-identical (frozen sha256
-aaa78f43...), and ``tests/model_ops/test_qsa_index_scorer_route.py``
-AST-compares the two bodies, so an upstream change to the loop fails CPU CI
-until this copy is re-synced.
+and expansion. ``qsa.py`` itself stays byte-identical (frozen golden
+reference, sha256 aaa78f43... CRLF / c2e46e50... LF), and
+``tests/model_ops/test_qsa_index_scorer.py`` AST-compares the two bodies, so
+an upstream change to the loop fails CPU CI until this copy is re-synced.
 
-Imported only when the route is active (it pulls in qsa.py: Triton + aiter).
+Imported only when the switch is on (it pulls in qsa.py: Triton + aiter).
 """
 
 import torch
@@ -24,7 +24,7 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
 )
 
 
-def qsa_select_paged_tokens_routed(
+def qsa_select_paged_tokens_with_scorer(
     q: torch.Tensor,
     compressed_k_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -43,8 +43,10 @@ def qsa_select_paged_tokens_routed(
 ) -> torch.Tensor:
     """Stock ``qsa_select_paged_tokens`` scoring through ``scorer``.
 
-    ``scorer`` takes ``qsa_paged_mqa_logits``'s arguments and returns its
-    ``(logits, visible_groups)`` -- a ``QSAScorerRoute`` in production.
+    ``scorer`` takes ``qsa_paged_mqa_logits``'s 12 arguments and returns its
+    ``(logits, visible_groups)`` -- aiter's neutral op
+    ``aiter.ops.qsa.qsa_paged_mqa_logits`` in production. Whatever it raises
+    propagates: there is no second (ATOM) scorer behind it.
     """
     if compress_ratio <= 0 or token_topk <= 0 or token_topk % compress_ratio:
         raise ValueError("token_topk must be positive and divisible by compress_ratio")

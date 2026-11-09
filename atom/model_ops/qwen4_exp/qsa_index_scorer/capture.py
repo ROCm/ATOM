@@ -3,16 +3,16 @@
 """Capture hook: every QSA index scorer call class, to JSON.
 
 Enabled by ``--qsa-index-scorer-capture PATH`` (``QSAIndexScorerConfig.capture``).
-Each route calls :meth:`ScorerCapture.record` once per scorer call; calls are
-folded into *classes* (everything that can change a decision or a kernel
-route: shapes, dtypes, strides, base alignments, bucket ``max_columns`` /
-columns, ``row_starts`` staging, ``allow_flydsl``, cache layout and format)
-with a count, the sites (layers) that issued them, the rank and the decision
-(path + reason). The file is rewritten whenever a new class appears and at
-exit, so a killed server still leaves everything seen up to its last new
-class.
+The opt-in :class:`~.enablement.ClassObserver` folds scorer calls into
+*classes* (everything that can change a decision or a kernel route: shapes,
+dtypes, strides, base alignments, bucket ``max_columns`` / columns,
+``row_starts`` staging, ``allow_flydsl``, cache layout and format) with a
+count, the rank and aiter's decision for the class (``aiter.ops.qsa.explain``:
+``fused`` / ``native-triton`` / ``native-torch``; ``atom`` when ATOM's own
+scorer runs). The file is rewritten whenever a new class appears and at exit,
+so a killed server still leaves everything seen up to its last new class.
 
-Output (``schema`` ``atom.qsa_index_scorer.capture/1``)::
+Output (``schema`` ``atom.qsa_index_scorer.capture/2``)::
 
     {"schema", "profile", "rank", "pid", "classes": [...],
      "plan": [{"cache_dtype", "rows", "requests", "columns", "table_width",
@@ -24,7 +24,7 @@ form. Merge per-rank files and build the coverage matrix with::
     python -m atom.model_ops.qwen4_exp.qsa_index_scorer.capture merge \
         cap.rank*.json --plan plan.json --matrix matrix.json
 
-Pure Python + torch (no Triton / aiter).
+Pure Python (no Triton / aiter).
 """
 
 from __future__ import annotations
@@ -38,9 +38,9 @@ import os
 import sys
 import threading
 
-from .route import cache_dtype_name, regime_of
+from .enablement import cache_dtype_name
 
-SCHEMA = "atom.qsa_index_scorer.capture/1"
+SCHEMA = "atom.qsa_index_scorer.capture/2"
 logger = logging.getLogger("atom")
 #: Index page sizes aiter's kernel serves: KV block 16 / 32 / 64 at ratio 4.
 PAGES = (4, 8, 16)
@@ -65,6 +65,20 @@ GOLDEN_CLASSES = {
     "prefill_chunk512_fp8": ("fp8", 512, 2, 65536, 16384),
     "I14_decode_c32768_bf16": ("bf16", 64, 16, 32768, 16384),
 }
+
+
+def regime_of(rows: int, requests: int) -> str | None:
+    """aiter's row regimes (same thresholds), for capture records."""
+    rows, requests = int(rows), int(requests)
+    if rows < 1 or requests < 1:
+        return None
+    if rows <= requests:
+        return "draft"
+    if rows >= 32 and rows >= 32 * requests:
+        return "prefill"
+    if rows % 4 == 0:
+        return "decode"
+    return None
 
 
 def _rank() -> int:
@@ -197,27 +211,27 @@ class ScorerCapture:
         root, ext = os.path.splitext(path)
         return f"{root}.rank{self.rank}.pid{self.pid}{ext or '.json'}"
 
-    def record(
-        self, site: str, args: tuple, reason: str, path: str, profile: str
-    ) -> None:
+    def class_entry(self, args: tuple, profile: str) -> dict:
+        """The (shared) entry of the class of one call's 12 bound arguments."""
         sig = describe_call(args)
         key = json.dumps(sig, sort_keys=True)
         with self._lock:
             self.profile = profile
             ent = self.classes.get(key)
-            new = ent is None
-            if new:
+            if ent is None:
                 ent = self.classes[key] = {
                     "signature": sig,
                     "count": 0,
-                    "sites": [],
                     "decisions": {},
                 }
+        return ent
+
+    def count(self, ent: dict, decision: str) -> None:
+        """One call of ``ent``'s class served as ``decision`` (``path:reason``)."""
+        with self._lock:
+            new = ent["count"] == 0
             ent["count"] += 1
-            if site not in ent["sites"]:
-                ent["sites"].append(site)
-            dk = f"{path}:{reason}"
-            ent["decisions"][dk] = ent["decisions"].get(dk, 0) + 1
+            ent["decisions"][decision] = ent["decisions"].get(decision, 0) + 1
         if new:
             self.flush()
 
@@ -279,13 +293,11 @@ def merge(files: list[str]) -> dict:
                 {
                     "signature": c["signature"],
                     "count": 0,
-                    "sites": [],
                     "decisions": {},
                     "ranks": [],
                 },
             )
             ent["count"] += c["count"]
-            ent["sites"] = sorted(set(ent["sites"]) | set(c["sites"]))
             if data.get("rank") not in ent["ranks"]:
                 ent["ranks"].append(data.get("rank"))
             for k, v in c["decisions"].items():
@@ -315,7 +327,7 @@ def merge(files: list[str]) -> dict:
                 "count": c["count"],
                 "ranks": sorted(r for r in c["ranks"] if r is not None),
                 "decisions": c["decisions"],
-                # One class, one decision -- across sites AND ranks.
+                # One class, one decision -- across ranks.
                 "decision_uniform": len(c["decisions"]) == 1,
                 "status": (
                     "covered"

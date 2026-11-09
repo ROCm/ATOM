@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""CPU tests: QSA index scorer config + CLI switch (default OFF, hash-neutral)."""
+"""CPU tests: QSA index scorer config + CLI + env switch (default OFF, hash-neutral)."""
 
 from __future__ import annotations
 
@@ -72,9 +72,13 @@ def _hash(**overrides):
         "dcp_config": None,
         "enable_dp_attention": False,
         "index_cache_dtype": None,
+        "index_cache_layout": None,
+        "sequence_parallel_size": 1,
         "hf_config": SimpleNamespace(),
         "max_model_len": 4096,
         "max_num_seqs": 256,
+        "max_num_batched_tokens": 16384,
+        "kv_cache_dtype": "bf16",
         "speculative_config": None,
     }
     fields.update(overrides)
@@ -133,16 +137,3 @@ def test_env_override_only_when_flag_absent(monkeypatch):
     flag = parser.parse_args(["--qsa-index-scorer-profile", "other_profile"])
     kw = EngineArgs.from_cli_args(flag)._get_engine_kwargs()
     assert kw["qsa_index_scorer"].profile == "other_profile"  # the flag wins
-
-
-@pytest.mark.parametrize("block,page", [(16, 4), (32, 8), (64, 16)])
-def test_block_size_maps_to_index_page(block, page):
-    """KV block 16 / 32 / 64 with Qwen3.8's compress ratio 4 -> index page
-    4 / 8 / 16: the page sizes aiter's profile serves (and prewarm builds)."""
-    from atom.model_ops.qwen4_exp.qsa_index_scorer.capability import index_page_size
-
-    cfg = SimpleNamespace(
-        kv_cache_block_size=block,
-        hf_config=SimpleNamespace(indexer_compress_ratio=4),
-    )
-    assert index_page_size(cfg) == page

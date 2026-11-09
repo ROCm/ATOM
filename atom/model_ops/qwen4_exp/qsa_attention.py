@@ -330,16 +330,25 @@ class Qwen4ExpAttention(nn.Module):
             self.kv_format = self.index_format = "bf16"
             self.qsa_row_space = "qsa_draft"
         self.profile_block_size = getattr(atom_config, "kv_cache_block_size", 64)
-        # Opt-in aiter fused index scorer (`--qsa-index-scorer-profile`). OFF:
-        # None, nothing imported, `_select_tokens` keeps the stock call.
-        self.qsa_scorer = None
+        # Opt-in aiter scorer (`--qsa-index-scorer-profile`): the selection
+        # loop scores through aiter's neutral op `aiter.ops.qsa.
+        # qsa_paged_mqa_logits`, which dispatches (fused / native) itself.
+        # OFF, or an aiter without the op: None, `_select_tokens` keeps the
+        # stock call (ATOM's own scorer) and nothing of the op is imported.
+        self.qsa_select = None
         scorer_cfg = getattr(atom_config, "qsa_index_scorer", None)
         if scorer_cfg is not None and scorer_cfg.active:
-            from atom.model_ops.qwen4_exp.qsa_index_scorer import build_route
+            from atom.model_ops.qwen4_exp.qsa_index_scorer import index_scorer
 
-            self.qsa_scorer = build_route(
-                scorer_cfg, site=prefix or f"layer{layer_num}"
-            )
+            scorer = index_scorer(atom_config)
+            if scorer is not None:
+                from atom.model_ops.qwen4_exp.qsa_index_scorer.select import (
+                    qsa_select_paged_tokens_with_scorer,
+                )
+
+                self.qsa_select = functools.partial(
+                    qsa_select_paged_tokens_with_scorer, scorer=scorer
+                )
 
     def bind_caches(
         self,
@@ -361,9 +370,14 @@ class Qwen4ExpAttention(nn.Module):
         self.k_scale_cache = k_scale_cache
         self.v_scale_cache = v_scale_cache
         self.compressed_key_scale = compressed_key_scale
-        if self.qsa_scorer is not None:
-            # Prepare-time (rank-uniform) layout check of the index cache.
-            self.qsa_scorer.prepare(compressed_key_cache, compressed_key_scale)
+
+    def qsa_index_scorer_caches(self):
+        """``(compressed_key_cache, compressed_key_scale)`` this layer hands
+        aiter's scorer op -- what ``ModelRunner`` prewarms after binding --
+        or None (stock scorer, or no cache bound)."""
+        if self.qsa_select is None or self.compressed_key_cache is None:
+            return None
+        return self.compressed_key_cache, self.compressed_key_scale
 
     def _store_kv(self, key, value, slots) -> None:
         if self.k_scale_cache is None:
@@ -442,11 +456,7 @@ class Qwen4ExpAttention(nn.Module):
                 normalized,
             )
 
-        select = (
-            qsa_select_paged_tokens
-            if self.qsa_scorer is None
-            else self.qsa_scorer.select_paged_tokens
-        )
+        select = qsa_select_paged_tokens if self.qsa_select is None else self.qsa_select
         return select(
             index_q,
             self.compressed_key_cache,
