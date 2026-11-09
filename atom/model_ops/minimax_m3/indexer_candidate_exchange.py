@@ -25,6 +25,9 @@ from atom.model_ops.minimax_m3.index_topk import (
     _require_packable,
 )
 
+# Live blocks one _local_topk tile selects from; longer rows stream more tiles.
+LOCAL_TOPK_TILE = 512
+
 
 @triton.jit
 def _force(score, block, valid, local_start, INIT_BLOCKS: tl.constexpr):
@@ -75,17 +78,25 @@ def _local_topk(
     causal_blocks = (length - QUERY_LEN + token + 128) // 128
     local_start = tl.maximum(0, causal_blocks - LOCAL_KEEP)
     s_row = Scores + (head * tokens + row) * LOCAL_BLOCKS
+    # Lanes past this rank's blocks the token may attend key to zero, so tiles
+    # stop there rather than at the launch width.
+    live_end = tl.minimum(
+        LOCAL_BLOCKS,
+        tl.maximum(
+            0, (tl.minimum(GLOBAL_BLOCKS, causal_blocks) - RANK + WORLD - 1) // WORLD
+        ),
+    )
 
     off = tl.arange(0, BLOCK_SIZE_K)
-    local_valid = off < LOCAL_BLOCKS
+    local_valid = off < live_end
     block = off * WORLD + RANK
     valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
     score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
     score = _force(score, block, valid, local_start, INIT_BLOCKS)
     winners = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
-    for start in tl.range(BLOCK_SIZE_K, LOCAL_BLOCKS, BLOCK_SIZE_K):
+    for start in tl.range(BLOCK_SIZE_K, live_end, BLOCK_SIZE_K):
         off = start + tl.arange(0, BLOCK_SIZE_K)
-        local_valid = off < LOCAL_BLOCKS
+        local_valid = off < live_end
         block = off * WORLD + RANK
         valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
         score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
@@ -228,11 +239,11 @@ def local_candidate_keys(
         # shipped config and costs it exactly nothing; it is here so the
         # function is correct for the topk its own guard admits (<= 512), rather
         # than only for the one value production happens to pass.
-        width = max(16, triton.next_power_of_2(local), triton.next_power_of_2(topk))
-        # Select medium rows in one tile; smaller streaming tiles avoid
-        # excessive padding work when a longer row crosses a tile boundary.
-        if width > 2048:
-            width = 1024
+        width = max(
+            16,
+            triton.next_power_of_2(topk),
+            min(triton.next_power_of_2(local), LOCAL_TOPK_TILE),
+        )
         _local_topk[(tokens, heads)](
             scores,
             keys,
