@@ -2462,6 +2462,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 num_local_tokens=scheduled_tokens_gpu,
                 **moe_extra_args,
             )
+        # A caller that left its shared expert's output on the layer
+        # (`PendingSharedAdd`) has the modular kernel's combine add it.
+        pending_shared = getattr(layer, "_pending_shared_add", None)
+        if pending_shared is not None:
+            moe_extra_args = {**moe_extra_args, "shared_add": pending_shared}
         return self.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,

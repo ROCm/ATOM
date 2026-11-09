@@ -3076,6 +3076,8 @@ class MoE(nn.Module):
         """
         routed_stream = torch.cuda.current_stream(x.device)
         self.alt_stream.wait_stream(routed_stream)
+        if self._shared_into_combine(x.shape[0]):
+            return self._dual_stream_shared_in_combine(x, routed_stream)
         shared_produced = False
         shared_waited = False
 
@@ -3116,6 +3118,66 @@ class MoE(nn.Module):
             return routed
         with torch.cuda.stream(self.alt_stream):
             shared = self.shared_experts.forward(x)
+        routed_stream.wait_stream(self.alt_stream)
+        return self.combine_outputs(
+            routed, shared, prefix=f"{self.prefix}.combine_outputs"
+        )
+
+    def _shared_into_combine(self, rows: int) -> bool:
+        """Whether the routed experts' combine can add the shared output itself:
+        MegaMoE behind the mori v2 modular kernel, on a step the comm-fused
+        backend (which joins the shared output its own way) does not take."""
+        experts = getattr(self, "experts", None)
+        backend = getattr(experts, "_comm_fused_moe", None)
+        if backend is not None and backend.supports(rows):
+            return False
+        fused_experts = getattr(
+            getattr(experts, "quant_method", None), "fused_experts", None
+        )
+        if fused_experts is None:
+            return False
+        from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+            MoriV2ModularKernel,
+        )
+
+        return isinstance(fused_experts, MoriV2ModularKernel)
+
+    def _dual_stream_shared_in_combine(
+        self, x: torch.Tensor, routed_stream: torch.cuda.Stream
+    ) -> torch.Tensor:
+        """The shared expert on `alt_stream`, added by the routed combine.
+
+        The router GEMM is issued on the routed stream before the shared
+        expert, so that under graph replay the routed chain keeps the launch
+        stream and the shared expert stays on a side stream. The combine waits
+        for the shared output, rather than the routed output waiting for it and
+        then a separate add; when the combine cannot take it the add happens
+        here as before.
+        """
+        from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+            PendingSharedAdd,
+        )
+
+        router_logits = self.gate(x)
+        with torch.cuda.stream(self.alt_stream):
+            shared = self.shared_experts.forward(x)
+            ready = torch.cuda.Event()
+            ready.record(self.alt_stream)
+        shared.record_stream(routed_stream)
+        pending = PendingSharedAdd(shared, ready)
+        self.experts._pending_shared_add = pending
+        try:
+            routed, is_complete = self.experts.forward_maybe_comm_fused(
+                x, router_logits, None
+            )
+        finally:
+            self.experts._pending_shared_add = None
+        if is_complete:
+            raise RuntimeError("a comm-fused step reached the shared-in-combine path")
+        if pending.consumed:
+            return self.combine_outputs(
+                routed, None, prefix=f"{self.prefix}.combine_outputs"
+            )
         routed_stream.wait_stream(self.alt_stream)
         return self.combine_outputs(
             routed, shared, prefix=f"{self.prefix}.combine_outputs"
