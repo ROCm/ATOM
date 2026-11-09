@@ -8,8 +8,10 @@ builder against host buffers, so a wrong region or head offset shows up as a
 wrong byte.
 """
 
+from dataclasses import asdict
 from types import SimpleNamespace
 
+import msgpack
 import numpy as np
 import pytest
 import torch
@@ -52,19 +54,19 @@ class _Layer:
             self.impl = object.__new__(PagedAttentionImpl)
 
 
-def _builder(layers, heads, kv_dtype=torch.float8_e4m3fn):
+def _builder(layers, heads, kv_dtype=torch.float8_e4m3fn, head_dim=HEAD_DIM):
     modules = [_Layer(n) for n in layers]
     indexed = [m for m in modules if m.layer_num in SPARSE]
     pool = MhaKvPool(
         layers=len(modules),
         block_size=BLOCK,
         num_kv_heads=heads,
-        head_dim=HEAD_DIM,
+        head_dim=head_dim,
         kv_dtype=kv_dtype,
         extra_fields=[EntryField("index", len(indexed), (BLOCK * 128,), torch.uint8)],
     )
     pool.allocate(4, "cpu")
-    geometry = KvGeometry(heads, HEAD_DIM)
+    geometry = KvGeometry(heads, head_dim)
     builder = object.__new__(aiter_attention.AiterAttentionMetadataBuilder)
     builder.kv_pools = {geometry: pool}
     builder._pool_rows = {
@@ -95,24 +97,21 @@ def _pp(monkeypatch, builder, rank, size):
 def export(monkeypatch):
     """The backend's export on stage `rank` of `partition`, or unsplit."""
 
-    def _export(heads, rank=0, partition=None, kv_dtype=torch.float8_e4m3fn):
+    def _export(
+        heads, rank=0, partition=None, kv_dtype=torch.float8_e4m3fn, head_dim=HEAD_DIM
+    ):
         sizes = partition or (LAYERS,)
         monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", ",".join(map(str, sizes)))
         start = sum(sizes[:rank])
-        builder = _builder(range(start, start + sizes[rank]), heads, kv_dtype)
+        builder = _builder(range(start, start + sizes[rank]), heads, kv_dtype, head_dim)
         return _pp(monkeypatch, builder, rank, len(sizes)).get_kv_transfer_tensors()
 
     return _export
 
 
-def _unit(role):
-    """A region's name without the per-rank head count a head cut changes."""
-    return "mha." + role.split(".", 2)[2] if role.startswith("mha.") else role
-
-
 def _layout(tt):
     return [
-        (p.region.semantic_role, p.head_major_runs, p.region.unit_bytes)
+        (p.region.semantic_role, p.head_major_runs, p.region.unit_bytes, p.unit_spec)
         for p in tt.pages
     ]
 
@@ -144,14 +143,14 @@ def test_an_unsplit_model_keeps_the_backend_names_and_splits_by_head(export):
 def test_every_stage_maps_into_the_full_consumer_layout(
     export, heads, kv_dtype, partition
 ):
-    consumer = [r.semantic_role for r in export(1, kv_dtype=kv_dtype).block_regions]
+    consumer = [p.unit_spec for p in export(1, kv_dtype=kv_dtype).pages]
     claimed = []
     for rank in range(len(partition)):
         tt = export(heads, rank, partition, kv_dtype)
         indices = tt.block_region_consumer_indices
         assert len(indices) == len(tt.pages)
         for page, index in zip(tt.pages, indices):
-            assert _unit(page.region.semantic_role) == _unit(consumer[index])
+            assert page.unit_spec == consumer[index]
         claimed.extend(indices)
     assert sorted(claimed) == list(range(len(consumer)))
 
@@ -219,10 +218,11 @@ def _producer(tt, mem, blocks, heads):
     layout = _layout(tt)
     producer = object.__new__(mc.MooncakeConnector)
     producer.__dict__.update(
-        kv_caches_base_addr=[mem.add(blocks * b, True) for _, _, b in layout],
-        _per_block_bytes_list=[b for _, _, b in layout],
-        _block_region_roles=[r for r, _, _ in layout],
-        _block_head_major_runs=[runs for _, runs, _ in layout],
+        kv_caches_base_addr=[mem.add(blocks * b, True) for _, _, b, _ in layout],
+        _per_block_bytes_list=[b for _, _, b, _ in layout],
+        _block_region_roles=[r for r, _, _, _ in layout],
+        _block_head_major_runs=[runs for _, runs, _, _ in layout],
+        _block_unit_specs=[spec for _, _, _, spec in layout],
         _block_region_consumer_indices=tt.block_region_consumer_indices,
         tp_size=4 // heads,
         dcp_size=1,
@@ -238,29 +238,37 @@ def _producer(tt, mem, blocks, heads):
 def _request(theirs, bases, rank, runs=True):
     request = {
         "consumer_base_addrs": bases,
-        "consumer_region_roles": [r for r, _, _ in theirs],
-        "consumer_block_bpb": [b for _, _, b in theirs],
+        "consumer_region_roles": [r for r, _, _, _ in theirs],
+        "consumer_block_bpb": [b for _, _, b, _ in theirs],
+        "consumer_unit_specs": [asdict(spec) for _, _, _, spec in theirs],
         "consumer_tp_size": 4,
         "consumer_tp_rank": rank,
     }
     if runs:
-        request["consumer_head_major_runs"] = [r for _, r, _ in theirs]
-    return request
+        request["consumer_head_major_runs"] = [r for _, r, _, _ in theirs]
+    # The producer receives dictionaries and lists, not our local dataclasses.
+    return msgpack.loads(msgpack.dumps(request))
 
 
 @pytest.mark.parametrize("heads", [1, 4])
 @pytest.mark.parametrize("rank, partition", [(0, (2, 2, 2, 2)), (3, (3, 2, 2, 1))])
-def test_stage_fills_each_tp4_rank_with_its_head(export, heads, rank, partition):
+@pytest.mark.parametrize("rename", [False, True])
+def test_stage_fills_each_tp4_rank_with_its_head(
+    export, heads, rank, partition, rename, monkeypatch
+):
     """`heads` 4 is a TP1 stage, cut by head; 1 is a TP4 stage, copied whole."""
     mem, blocks, src_ids, dst_ids = _Memory(), 4, [3, 1], [0, 2]
     theirs = _layout(export(1))  # a TP4 decode rank: every layer, one head
+    if rename:
+        # A backend's display format can change without changing its bytes.
+        monkeypatch.setattr(KvGeometry, "__str__", lambda self: "display-geometry")
     tt = export(heads, rank, partition)
     layout = _layout(tt)
     producer = _producer(tt, mem, blocks, heads)
     consumers = []
     for consumer_rank in range(4):
-        bases = [mem.add(blocks * b, False) for _, _, b in theirs]
-        consumers.append({_unit(r): (a, b) for (r, _, b), a in zip(theirs, bases)})
+        bases = [mem.add(blocks * b, False) for _, _, b, _ in theirs]
+        consumers.append({spec: (a, b) for (_, _, b, spec), a in zip(theirs, bases)})
         assert producer._execute_block_transfer(
             _request(theirs, bases, consumer_rank),
             "consumer",
@@ -268,10 +276,10 @@ def test_stage_fills_each_tp4_rank_with_its_head(export, heads, rank, partition)
             dst_ids,
             f"req-{consumer_rank}",
         )
-    for (role, runs, bpb), base in zip(layout, producer.kv_caches_base_addr):
+    for (role, runs, bpb, spec), base in zip(layout, producer.kv_caches_base_addr):
         src = mem.at(base, blocks * bpb).reshape(blocks, -1)
         for consumer_rank, regions in enumerate(consumers):
-            dst_base, dst_bpb = regions[_unit(role)]
+            dst_base, dst_bpb = regions[spec]
             dst = mem.at(dst_base, blocks * dst_bpb).reshape(blocks, -1)
             for s, d in zip(src_ids, dst_ids):
                 want = (
@@ -281,7 +289,7 @@ def test_stage_fills_each_tp4_rank_with_its_head(export, heads, rank, partition)
                 )
                 assert np.array_equal(dst[d], want.ravel()), (role, consumer_rank)
             assert not dst[[1, 3]].any()
-    held = {_unit(role) for role, _, _ in layout}
+    held = {spec for _, _, _, spec in layout}
     for regions in consumers:
         for role, (base, bpb) in regions.items():
             if role not in held:
@@ -329,7 +337,10 @@ def test_an_older_consumer_is_refused_before_anything_is_written(
     mem = _Memory()
     producer = _producer(export(heads, 3, (3, 2, 2, 1)), mem, 4, heads)
     theirs = _layout(export(1))
-    request = _request(theirs, [mem.add(4 * b, False) for _, _, b in theirs], 0, False)
+    request = _request(
+        theirs, [mem.add(4 * b, False) for _, _, b, _ in theirs], 0, False
+    )
+    del request["consumer_unit_specs"]
     if not layout_checks:
         del request["consumer_region_roles"], request["consumer_block_bpb"]
     with pytest.raises(RuntimeError, match=refusal):
@@ -337,15 +348,103 @@ def test_an_older_consumer_is_refused_before_anything_is_written(
     assert mem.writes == 0
 
 
-def test_a_head_cut_matches_names_up_to_the_head_count_only():
-    same = mc._same_unit_role
-    assert same("mha.h4d128.k.layer_3", "mha.h1d128.k.layer_3", True)
-    assert not same("mha.h4d128.k.layer_3", "mha.h1d128.k.layer_3", False)
-    assert not same("mha.h4d128.k.layer_3", "mha.h1d128.v.layer_3", True)
-    assert not same("mha.h4d128.k.layer_3", "mha.h1d128.k.layer_4", True)
-    # As wide per head as an fp8 d128, but another head.
-    assert not same("mha.h4d64.k.layer_3", "mha.h1d128.k.layer_3", True)
-    assert not same("draft.k.layer_0", "draft.v.layer_0", True)
+@pytest.mark.parametrize("heads", [1, 4])
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("namespace", "draft"),
+        ("field", "v"),
+        ("row", 100),
+        ("head_dim", 64),
+        ("dtype", "torch.float16"),
+        ("layout", "token_head"),
+    ],
+)
+def test_incompatible_last_unit_is_refused_before_any_write(
+    export, heads, field, value
+):
+    mem = _Memory()
+    tt = export(heads, 3, (3, 2, 2, 1))
+    producer = _producer(tt, mem, 4, heads)
+    theirs = _layout(export(1))
+    request = _request(theirs, [mem.add(4 * b, False) for _, _, b, _ in theirs], 0)
+    # Keep the names and byte lengths untouched. Even the last region must be
+    # checked before the earlier regions can flush a batch of RDMA writes.
+    index = tt.block_region_consumer_indices[-1]
+    request["consumer_unit_specs"][index][field] = value
+    with pytest.raises(RuntimeError, match="unit spec mismatch"):
+        producer._execute_block_transfer(request, "consumer", [0], [0], "bad-spec")
+    assert mem.writes == 0
+
+
+@pytest.mark.parametrize(
+    "producer_dim, consumer_dtype",
+    [(64, torch.float8_e4m3fn), (128, torch.float16)],
+)
+def test_equal_byte_width_does_not_hide_an_incompatible_format(
+    export, producer_dim, consumer_dtype
+):
+    mem = _Memory()
+    tt = export(4, 0, (2, 2, 2, 2), torch.bfloat16, producer_dim)
+    producer = _producer(tt, mem, 4, 4)
+    theirs = _layout(export(1, kv_dtype=consumer_dtype))
+    assert tt.pages[0].region.unit_bytes // 4 == theirs[0][2]
+    request = _request(theirs, [mem.add(4 * b, False) for _, _, b, _ in theirs], 0)
+    with pytest.raises(RuntimeError, match="unit spec mismatch"):
+        producer._execute_block_transfer(request, "consumer", [0], [0], "equal-bytes")
+    assert mem.writes == 0
+
+
+@pytest.mark.parametrize(
+    "missing", ["consumer_unit_specs", "consumer_block_bpb", "one_unit_spec"]
+)
+def test_head_cut_requires_structured_metadata(export, missing):
+    mem = _Memory()
+    tt = export(4, 0, (2, 2, 2, 2))
+    producer = _producer(tt, mem, 4, 4)
+    theirs = _layout(export(1))
+    request = _request(theirs, [mem.add(4 * b, False) for _, _, b, _ in theirs], 0)
+    if missing == "one_unit_spec":
+        request["consumer_unit_specs"][tt.block_region_consumer_indices[-1]] = None
+    else:
+        del request[missing]
+    with pytest.raises(RuntimeError, match="requires.*unit specs"):
+        producer._execute_block_transfer(request, "consumer", [0], [0], "missing-spec")
+    assert mem.writes == 0
+
+
+@pytest.mark.parametrize("heads", [1, 4])
+def test_head_layout_mismatch_is_refused_before_any_write(export, heads):
+    mem = _Memory()
+    tt = export(heads, 0, (2, 2, 2, 2))
+    producer = _producer(tt, mem, 4, heads)
+    theirs = _layout(export(1))
+    request = _request(theirs, [mem.add(4 * b, False) for _, _, b, _ in theirs], 0)
+    index = next(
+        index
+        for page, index in reversed(
+            list(zip(tt.pages, tt.block_region_consumer_indices))
+        )
+        if page.head_major_runs is not None
+    )
+    request["consumer_head_major_runs"][index] = [2, 1]
+    with pytest.raises((RuntimeError, ValueError)):
+        producer._execute_block_transfer(request, "consumer", [0], [0], "bad-runs")
+    assert mem.writes == 0
+
+
+def test_same_tp_keeps_legacy_name_and_width_checks(export):
+    mem = _Memory()
+    producer = _producer(export(1, 0, (2, 2, 2, 2)), mem, 4, 1)
+    theirs = _layout(export(1))
+    request = _request(theirs, [mem.add(4 * b, False) for _, _, b, _ in theirs], 0)
+    del request["consumer_unit_specs"], request["consumer_head_major_runs"]
+    assert producer._execute_block_transfer(request, "consumer", [0], [0], "legacy")
+    mem.writes = 0
+    request["consumer_region_roles"][0] = "wrong-region"
+    with pytest.raises(RuntimeError, match="role mismatch"):
+        producer._execute_block_transfer(request, "consumer", [0], [0], "legacy-bad")
+    assert mem.writes == 0
 
 
 @pytest.mark.parametrize("heads, refusal", [(4, "state slots"), (2, "TP1 producer")])
@@ -357,7 +456,7 @@ def test_a_producer_with_state_slots_refuses_another_consumer_tp(
     mem = _Memory()
     producer = _producer(export(heads, 3, (3, 2, 2, 1)), mem, 4, heads)
     theirs = _layout(export(1))
-    request = _request(theirs, [mem.add(4 * b, False) for _, _, b in theirs], 0)
+    request = _request(theirs, [mem.add(4 * b, False) for _, _, b, _ in theirs], 0)
     with pytest.raises((NotImplementedError, RuntimeError), match=refusal):
         producer._execute_block_slot_transfer(
             request, "consumer", [0], [0], {"slot_index": 0}, "slot-consumer"

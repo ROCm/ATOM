@@ -219,6 +219,23 @@ class KVTransferRegion:
 
 
 @dataclass(frozen=True)
+class PageUnitSpec:
+    """A PAGE unit's identity and byte interpretation, independent of TP.
+
+    Backends supply these fields directly, before formatting display names.
+    The per-rank head count lives in ``PageRegion.head_major_runs``; all fields
+    here must agree even when a transfer cuts heads.
+    """
+
+    namespace: str
+    field: str
+    row: int
+    head_dim: int
+    dtype: str
+    layout: str
+
+
+@dataclass(frozen=True)
 class PageRegion:
     """One PAGE region and the tensor that aliases exactly its bytes.
 
@@ -235,6 +252,7 @@ class PageRegion:
     # `(runs, heads)`: the unit is `runs` equal runs, each holding this rank's
     # `heads` KV heads one after another. None: not per head (replicated).
     head_major_runs: tuple[int, int] | None = None
+    unit_spec: PageUnitSpec | None = None
 
 
 @dataclass

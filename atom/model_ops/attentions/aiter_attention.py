@@ -774,7 +774,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
     def get_kv_transfer_tensors(self):
         from atom.kv_transfer.disaggregation.page_region import page_region
-        from atom.kv_transfer.disaggregation.types import KVTransferTensors
+        from atom.kv_transfer.disaggregation.types import (
+            KVTransferTensors,
+            PageUnitSpec,
+        )
 
         if not self.kv_pools:
             return None
@@ -786,6 +789,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # named alike.
         pages, consumer_indices = [], []
         for geometry, pool in self.kv_pools.items():
+            cache_fields = {f.name for f in pool.cache_fields}
             kv_fields = [f.name for f in (*pool.cache_fields, *pool.scale_fields)]
             modules = {
                 kind: {row: module for module, row in self.pool_rows[kind].items()}
@@ -817,11 +821,25 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                         row = module.impl.sparse_layer_ordinal
                         offset = len(kv_fields) * num_layers
                     consumer_indices.append(offset + row)
+                if field in cache_fields:
+                    dtype, layout = pool.kv_dtype, "mha_shuffle"
+                elif per_head:
+                    dtype, layout = torch.float32, "head_token"
+                else:
+                    dtype, layout = tensor.dtype, "bytes"
                 pages.append(
                     page_region(
                         tensor,
                         semantic_role=f"mha.{geometry}.{field}.layer_{row}",
                         head_major_runs=runs,
+                        unit_spec=PageUnitSpec(
+                            namespace="mha",
+                            field=field,
+                            row=row,
+                            head_dim=pool.head_dim,
+                            dtype=str(dtype),
+                            layout=layout,
+                        ),
                     )
                 )
         return KVTransferTensors(

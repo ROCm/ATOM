@@ -99,8 +99,7 @@ def mha_export_method():
         for node in builder.body
         if isinstance(node, ast.FunctionDef) and node.name == "get_kv_transfer_tensors"
     )
-    # The exporter's one module global: the indexer keys' row space.
-    namespace = {"INDEX_ROWS": "index"}
+    namespace = {"INDEX_ROWS": "index", "torch": torch}
     exec(  # noqa: S102 -- execute the local exporter under the CPU fixture
         compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
         namespace,

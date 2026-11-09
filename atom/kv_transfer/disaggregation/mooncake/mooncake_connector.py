@@ -88,6 +88,7 @@ from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
     KVTransferRegion,
+    PageUnitSpec,
     ReqId,
     TransferId,
 )
@@ -855,27 +856,6 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 # ===================================================================
 
 
-def _same_unit_role(producer_role, consumer_role, cutting_heads: bool) -> bool:
-    """Do two regions hold the same unit?
-
-    The MHA backend names a unit by its per-rank geometry
-    (``mha.h{heads}d{dim}.{field}.layer_{row}``), and a head cut changes
-    exactly the head count; the head dim and the rest of the name must still
-    agree. Bytes alone cannot tell: a bf16 d64 head is as wide as an fp8 d128.
-    """
-    if producer_role == consumer_role:
-        return True
-    if not cutting_heads or producer_role is None or consumer_role is None:
-        return False
-    produced, consumed = producer_role.split(".", 2), consumer_role.split(".", 2)
-    return (
-        len(produced) == len(consumed) == 3
-        and produced[0] == consumed[0] == "mha"
-        and produced[1].partition("d")[2] == consumed[1].partition("d")[2]
-        and produced[2] == consumed[2]
-    )
-
-
 class MooncakeConnector(KVConnectorBase):
     """Worker-side KV cache connector using Mooncake push-mode RDMA.
 
@@ -892,6 +872,7 @@ class MooncakeConnector(KVConnectorBase):
     _rail_pool: RailEnginePool | None = None
     # Set by `register_kv_caches`; until then no units are cut by head.
     _block_head_major_runs: tuple = ()
+    _block_unit_specs: tuple[PageUnitSpec | None, ...] = ()
 
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
@@ -1352,6 +1333,7 @@ class MooncakeConnector(KVConnectorBase):
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
         self._block_region_roles = [r.semantic_role for r in tt.block_regions]
         self._block_head_major_runs = tuple(page.head_major_runs for page in tt.pages)
+        self._block_unit_specs = tuple(page.unit_spec for page in tt.pages)
         self._fp4_index_layout = any(
             role is not None and role.startswith(INDEX_CACHE_FP4_PREFIX)
             for role in self._block_region_roles
@@ -1867,6 +1849,14 @@ class MooncakeConnector(KVConnectorBase):
                 "consumer_block_bpb": [bpb for _, bpb in self._block_regions],
                 # For a producer at another TP size to cut its units by head.
                 "consumer_head_major_runs": self._block_head_major_runs,
+                "consumer_unit_specs": (
+                    [
+                        asdict(spec) if spec is not None else None
+                        for spec in self._block_unit_specs
+                    ]
+                    if self._block_unit_specs
+                    else None
+                ),
                 "dst_block_ids": dst_block_ids,
                 # Source block_ids so downstream stages (no scheduler, no
                 # _completed_prefills) can transfer without a local lookup.
@@ -2956,6 +2946,14 @@ class MooncakeConnector(KVConnectorBase):
                 f"Consumer TP {consumer_tp} needs KV heads cut from this TP1 "
                 "producer but describes no head runs (an older consumer?)"
             )
+        if (
+            request_data.get("consumer_unit_specs") is None
+            or request_data.get("consumer_block_bpb") is None
+        ):
+            raise RuntimeError(
+                "Cutting KV heads requires consumer unit specs and byte widths "
+                "(an older consumer?)"
+            )
         return (consumer_runs, int(request_data["consumer_tp_rank"]), consumer_tp)
 
     def _execute_block_transfer(
@@ -3083,13 +3081,94 @@ class MooncakeConnector(KVConnectorBase):
 
         staged_regions: list[tuple[int, int, int]] = []
         staged_mla_regions: list[tuple[int, int, int]] = []
-        # The plan comes from this stage's region order but the bytes land at
-        # cmap[region_idx], and equal region counts do not make the two orders
-        # match. Validate both semantic role and physical width so incompatible
-        # producer/consumer layouts fail instead of silently corrupting KV.
+        # Validate every mapped unit before queuing any writes. The backend's
+        # structured spec identifies the data and its format; head runs describe
+        # how it shards. Names remain an exact-match fallback for older peers.
         consumer_roles = request_data.get("consumer_region_roles")
         consumer_bpb = request_data.get("consumer_block_bpb")
         head_cut = self._consumer_head_cut(request_data, dcp_size)
+        consumer_runs = (
+            request_data.get("consumer_head_major_runs")
+            if head_cut is not None or any(self._block_unit_specs)
+            else None
+        )
+        consumer_specs = request_data.get("consumer_unit_specs")
+        if consumer_specs is not None:
+            consumer_specs = msgspec.convert(
+                consumer_specs, type=tuple[PageUnitSpec | None, ...]
+            )
+        for name, values in (
+            ("roles", consumer_roles),
+            ("byte widths", consumer_bpb),
+            ("unit specs", consumer_specs),
+            ("head runs", consumer_runs),
+        ):
+            if values is not None and len(values) != len(consumer_base_addrs):
+                raise RuntimeError(f"Consumer {name} count does not match its regions")
+        cuts_by_region = []
+        for region_idx in range(num_regions):
+            consumer_idx = cmap[region_idx]
+            bpb = self._per_block_bytes_list[region_idx]
+            role = self._block_region_roles[region_idx]
+            spec = (
+                self._block_unit_specs[region_idx] if self._block_unit_specs else None
+            )
+            peer_spec = (
+                consumer_specs[consumer_idx] if consumer_specs is not None else None
+            )
+            if spec is not None and peer_spec is not None:
+                if spec != peer_spec:
+                    raise RuntimeError(
+                        f"Region unit spec mismatch for req {req_id}: local region "
+                        f"{region_idx} is {spec!r}, but consumer region "
+                        f"{consumer_idx} is {peer_spec!r}"
+                    )
+                if head_cut is None and consumer_runs is not None:
+                    peer_runs = consumer_runs[consumer_idx]
+                    peer_runs = None if peer_runs is None else tuple(peer_runs)
+                    if self._block_head_major_runs[region_idx] != peer_runs:
+                        raise RuntimeError(
+                            f"Region head layout mismatch for req {req_id}: "
+                            f"local region {region_idx}, consumer region {consumer_idx}"
+                        )
+            elif head_cut is not None and (
+                spec is not None
+                or peer_spec is not None
+                or self._block_head_major_runs[region_idx] is not None
+            ):
+                raise RuntimeError(
+                    f"Cutting KV heads requires unit specs on both peers: "
+                    f"local region {region_idx}, consumer region {consumer_idx}"
+                )
+            elif consumer_roles is not None and role != consumer_roles[consumer_idx]:
+                raise RuntimeError(
+                    f"Region role mismatch for req {req_id}: local region "
+                    f"{region_idx} is {role!r}, but consumer region "
+                    f"{consumer_idx} is {consumer_roles[consumer_idx]!r}"
+                )
+            if head_cut is not None:
+                all_runs, rank, tp = head_cut
+                dst_runs = all_runs[consumer_idx]
+                cuts_by_region.append(
+                    np.array(
+                        consumer_head_slices(
+                            bpb,
+                            consumer_bpb[consumer_idx],
+                            self._block_head_major_runs[region_idx],
+                            dst_runs and tuple(dst_runs),
+                            rank,
+                            tp,
+                        ),
+                        dtype=np.int64,
+                    )
+                )
+            elif consumer_bpb is not None and consumer_bpb[consumer_idx] != bpb:
+                raise RuntimeError(
+                    f"Region byte-size mismatch for req {req_id}: producer "
+                    f"region {region_idx} has {bpb}, consumer region "
+                    f"{consumer_idx} has {consumer_bpb[consumer_idx]}"
+                )
+
         source_blocks = np.asarray(src_block_ids, dtype=np.int64)
         destination_blocks = np.asarray(dst_block_ids, dtype=np.int64)
         for region_idx in range(num_regions):
@@ -3097,33 +3176,10 @@ class MooncakeConnector(KVConnectorBase):
             dst_base = consumer_base_addrs[cmap[region_idx]]
             bpb = self._per_block_bytes_list[region_idx]
             role = self._block_region_roles[region_idx]
-            if consumer_roles is not None and not _same_unit_role(
-                role, consumer_roles[cmap[region_idx]], head_cut is not None
-            ):
-                raise RuntimeError(
-                    f"Region role mismatch for req {req_id}: local region "
-                    f"{region_idx} is {role!r}, but consumer region "
-                    f"{cmap[region_idx]} is {consumer_roles[cmap[region_idx]]!r}"
-                )
             if head_cut is not None:
-                # The consumer rank holds its share of the heads: write it that
-                # share of every head-major run of each unit.
-                all_runs, rank, tp = head_cut
-                dst_runs, dst_bpb = (
-                    all_runs[cmap[region_idx]],
-                    consumer_bpb[cmap[region_idx]],
-                )
-                cuts = np.array(
-                    consumer_head_slices(
-                        bpb,
-                        dst_bpb,
-                        self._block_head_major_runs[region_idx],
-                        dst_runs and tuple(dst_runs),
-                        rank,
-                        tp,
-                    ),
-                    dtype=np.int64,
-                )
+                # Write this consumer's heads of every head-major run.
+                cuts = cuts_by_region[region_idx]
+                dst_bpb = consumer_bpb[cmap[region_idx]]
                 src = source_blocks[:, None] * bpb + cuts[:, 0]
                 dst = destination_blocks[:, None] * dst_bpb + cuts[:, 1]
                 if not queue_descriptors(
@@ -3134,12 +3190,6 @@ class MooncakeConnector(KVConnectorBase):
                     logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                     return False
                 continue
-            if consumer_bpb is not None and consumer_bpb[cmap[region_idx]] != bpb:
-                raise RuntimeError(
-                    f"Region byte-size mismatch for req {req_id}: producer "
-                    f"region {region_idx} has {bpb}, consumer region "
-                    f"{cmap[region_idx]} has {consumer_bpb[cmap[region_idx]]}"
-                )
             if stages_sharded_index and role == INDEX_CACHE_ROLE:
                 staged_regions.append((region_idx, dst_base, bpb))
                 continue
