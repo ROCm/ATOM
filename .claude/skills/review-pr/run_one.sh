@@ -317,16 +317,19 @@ else
     # card admits it -- so the downgrade reaches the reader instead of hiding in the log.
     say "refuter hit the ${ATOM_AGENT_TIMEOUT}s timeout -- publishing the card unrefuted"
     printf 'NONE AVAILABLE -- the refuter did not finish within %ss on this box\n' "${ATOM_AGENT_TIMEOUT}" > "$W/independent.txt"
-    # Anchor on `Review:`, which is the shape SKILL.md's card format actually specifies --
-    # `Review (advisory):` is a Validation-line shape and never appears here, so this edit
-    # silently did nothing on every card ever produced.
-    sed -i '0,/^Review:/s//Review (not independently refuted):/' "$W/card.md"
-    # Still unconditional, because the line is model-generated and may be bolded or indented.
-    # But APPEND, never insert at line 1: _publish.severity() reads the FIRST line starting
-    # with "Review", so a line prepended above the real verdict makes a 🔴 BLOCK card report
-    # as 'ok' -- the high-severity path silently skipped on exactly the runs that degraded.
+    # Do NOT rewrite the verdict line. An earlier version anchored on `Review (advisory):`
+    # -- a Validation-line shape that never appears here -- so it silently did nothing on
+    # every card. Correcting the anchor to `Review:` then broke the opposite way: the
+    # substitution consumed the `Review:` prefix, and `_publish` pulls the verdict with
+    # `_line_starting(card, "Review:")`, so the posted review carried no verdict at all.
+    # The admission only has to BE on the card for the independent gate; it does not have
+    # to live inside the verdict line, and putting it there costs the verdict both ways.
+    #
+    # Appended, never prepended: severity() returns on the FIRST line starting with
+    # "Review", so a notice above the verdict makes a 🔴 BLOCK card report as 'ok'.
     grep -q 'not independently refuted' "$W/card.md" \
-      || printf '\nReview (not independently refuted): the refuter did not finish\n' >> "$W/card.md"
+      || printf '\nReview (not independently refuted): the refuter did not finish within %ss\n' \
+           "${ATOM_AGENT_TIMEOUT}" >> "$W/card.md"
   elif [ "$rc" -ne 0 ]; then
     agent_fail refuter "$rc" 3
   fi

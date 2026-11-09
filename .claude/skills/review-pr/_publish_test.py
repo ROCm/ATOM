@@ -336,6 +336,25 @@ def test_a_crashed_checker_is_not_a_clean_verdict(report, monkeypatch):
     assert _publish.review_payload("9999")["comments"] == []
 
 
+def test_a_degraded_card_still_carries_its_verdict_line():
+    """The downgrade must not consume the `Review:` prefix.
+
+    `_publish` pulls the verdict with `_line_starting(card, "Review:")`. An earlier
+    downgrade rewrote that prefix into `Review (not independently refuted):`, so the
+    posted review carried no verdict line at all — severity() still worked (it matches
+    "Review" without the colon), so nothing internal noticed; only the reader lost
+    something. Found by @valar-cop in review.
+    """
+    card = "## T\n\nReview: 🔴 BLOCK\n\n🔴 bad\n"
+    degraded = (
+        card + "\nReview (not independently refuted): the refuter did not finish\n"
+    )
+    assert _publish._line_starting(degraded, "Review:") == "Review: 🔴 BLOCK"
+    assert (
+        "not independently refuted" in degraded
+    )  # the gate's admission is still there
+
+
 def test_a_degraded_card_keeps_its_red_severity():
     """The refuter-timeout notice must not become the line severity() reads.
 

@@ -147,7 +147,11 @@ echo "[refuter call site]"
 # Drive the call site itself, errexit on, exactly as run_one.sh has it.
 refuter_site() {  # <rc run_agent returns> [card's first line] -> what the call site actually did
   local W; W=$(mktemp -d)
-  printf '%s\n\342\232\240 a finding\n' "${2:-Review (advisory): NEEDS WORK}" > "$W/card.md"
+  # `Review:` is the shape SKILL.md's card format specifies and the one real cards carry.
+  # These fixtures used `Review (advisory):`, a Validation-line shape, so the downgrade path
+  # was exercised against a card that cannot occur -- which is why a sed anchored on the
+  # wrong prefix passed here while doing nothing in production.
+  printf '%s\n\342\232\240 a finding\n' "${2:-Review: \342\232\240 NEEDS WORK}" > "$W/card.md"
   { echo 'set -euo pipefail'
     echo 'say() { :; }'
     echo 'bash() { :; }'                       # stub out render.sh
@@ -166,7 +170,7 @@ t "a refuter timeout reaches the downgrade" "$(refuter_site 124)" "downgraded"
 # worker bolds or indents that line the sed matches nothing, exits 0, and the independent gate
 # then discards a card that was known-good -- the one case the downgrade exists to rescue.
 t "a card the sed cannot match is still downgraded" \
-  "$(refuter_site 124 '**Review (advisory):** NEEDS WORK')" "downgraded"
+  "$(refuter_site 124 '**Review:** \342\232\240 NEEDS WORK')" "downgraded"
 t "a refuter fault reaches the triage" "$(refuter_site 1)" "agent_fail refuter 1"
 
 echo "[refuter-timeout downgrade]"
@@ -174,8 +178,8 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 printf 'NONE AVAILABLE -- the refuter did not finish within 2400s on this box\n' > "$tmp/independent.txt"
 
 # The downgrade applies exactly the sed run_one.sh uses.
-printf 'Review (advisory): \342\232\240 NEEDS WORK\n\342\232\240 a reported finding\n' > "$tmp/card.md"
-sed -i '0,/^Review (advisory):/s//Review (advisory, not independently refuted):/' "$tmp/card.md"
+printf 'Review: \342\232\240 NEEDS WORK\n\342\232\240 a reported finding\n' > "$tmp/card.md"
+printf '\nReview (not independently refuted): the refuter did not finish within 2400s\n' >> "$tmp/card.md"
 rc=0; python3 "$S/triage.py" independent "$tmp/independent.txt" "$tmp/card.md" >/dev/null 2>&1 || rc=$?
 t "downgraded card passes the independent gate" "$rc" "0"
 
