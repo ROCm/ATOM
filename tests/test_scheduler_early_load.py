@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Scheduler._early_load_tier_prefixes (ATOM_OFFLOAD_EARLY_LOAD).
+"""Scheduler._early_load_tier_prefixes.
 
 A waiting request whose tier lookup answered gets its blocks and its load on any
 tick -- delayer HOLD or FIRE, wherever it waits -- while its prefill still waits
@@ -263,21 +263,7 @@ def test_request_whose_load_is_in_flight_does_not_block_later_ones(
     assert a.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
 
 
-def test_flag_off_is_the_old_behaviour(monkeypatch, seq_factory):
-    sched, _delayer, (first, moved) = _make(
-        monkeypatch, seq_factory, n=2, ATOM_OFFLOAD_EARLY_LOAD="0"
-    )
-
-    sched.schedule()
-
-    assert first.status == moved.status == SequenceStatus.WAITING
-    assert sched.kv_connector.allocs == []
-    assert len(first.block_table) == len(moved.block_table) == 0
-    assert sched._early_load.submitted == 0
-
-
 def test_priority_max_queue_has_no_effect_with_early_load(monkeypatch, seq_factory):
-    monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD", "1")
     monkeypatch.setenv("ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE", "0")
     sched = Scheduler(MockConfig(num_kvcache_blocks=100))
     first, moved = seq_factory(list(range(16))), seq_factory(list(range(16)))
@@ -414,50 +400,6 @@ def test_no_early_allocation_without_a_free_parking_slot(monkeypatch, seq_factor
 
     assert seq.status == SequenceStatus.WAITING
     assert sched._early_load.skips["seq_slots"] == 1
-
-
-# -- state legs -----------------------------------------------------------------
-
-
-def test_a_state_leg_is_left_to_the_admission_pass_when_not_allowed(
-    monkeypatch, seq_factory
-):
-    sched, _, (seq,) = _make(
-        monkeypatch, seq_factory, ATOM_OFFLOAD_EARLY_LOAD_STATE="0"
-    )
-    seq.has_per_req_cache = True  # state-image mode: not a replay
-
-    class _Probe:
-        num_cached_blocks = 0
-
-    sched._probe_hbm_prefix = lambda s: _Probe()
-
-    sched.schedule()
-
-    assert seq.status == SequenceStatus.WAITING
-    assert sched._early_load.skips["state_leg"] == 1, dict(sched._early_load.skips)
-
-
-def test_a_joint_boundary_after_alloc_is_taken_back_when_state_is_not_allowed(
-    monkeypatch, seq_factory
-):
-    sched, _, (seq,) = _make(
-        monkeypatch, seq_factory, ATOM_OFFLOAD_EARLY_LOAD_STATE="0"
-    )
-    notify = sched.kv_connector.update_state_after_alloc
-
-    def with_joint(s):
-        notify(s)
-        s.offload_joint.boundary_tokens = 8
-
-    sched.kv_connector.update_state_after_alloc = with_joint
-    free = _free(sched)
-
-    sched.schedule()
-
-    assert seq.status == SequenceStatus.WAITING
-    assert len(seq.block_table) == 0 and _free(sched) == free
-    assert sched._early_load.takebacks == 1
 
 
 # -- cancellation ---------------------------------------------------------------

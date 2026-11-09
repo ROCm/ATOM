@@ -4,8 +4,7 @@ This is the source version used by the 2026-11-05 P4+D4, C256, 900-second
 AgentX experiment. It builds on PR #2755 source at
 `0392e24daf7586cad7740d6db33247d66ae7df2e`, plus this branch's integration
 changes. It does not include subsequent #2755 scheduler changes or the proposed
-unpack optimization. The older `run_single.py` recipe remains an LMCache MP
-L1+Store experiment; it is not this direct path.
+unpack optimization.
 
 P queries shared prefix keys asynchronously after request admission to the
 scheduler's waiting set. Store reads target registered GPU slots, then the codec
@@ -74,10 +73,31 @@ atomesh launch --host "$P_IP" --port 18000 --pd-disaggregation --dp-aware \
   --disable-circuit-breaker --request-timeout-secs 1800 --prometheus-port 29100
 ```
 
-Use the C256/900s AgentX command in [README.md](README.md#c256-agentx), changing
-the URL to `http://$P_IP:18000` and using a new artifact directory. The tested
-client image is pinned there. Check actual generation and a cross-rank prefix
-restore before benchmarking; health alone does not prove KV correctness.
+Run the AgentX trace against the router (`http://$P_IP:18000`) from a client that
+can reach the service, the model tokenizer and the public dataset, with a new
+artifact directory:
+
+```bash
+export AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=0
+export AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=300
+export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
+
+aiperf profile --scenario inferencex-agentx-mvp \
+  --url "http://$P_IP:18000" --endpoint /v1/chat/completions \
+  --endpoint-type chat --streaming \
+  --model "$MODEL" --tokenizer "$MODEL" --tokenizer-trust-remote-code \
+  --concurrency 256 --benchmark-duration 900 --stats-interval 30 --random-seed 42 \
+  --failed-request-threshold 0.10 \
+  --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
+  --warmup-requests-per-lane 10 --trace-idle-gap-cap-seconds 300 \
+  --agentic-warmup-grace-period 1800 --use-server-token-count \
+  --no-gpu-telemetry --num-dataset-entries 393 --slice-duration 1.0 \
+  --public-dataset semianalysis_cc_traces_weka_062126 \
+  --output-artifact-dir /tmp/agentx-pd-01 --no-server-metrics
+```
+
+Check actual generation and a cross-rank prefix restore before benchmarking;
+health alone does not prove KV correctness.
 
 ## Observed result and limits
 

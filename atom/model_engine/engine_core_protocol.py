@@ -34,5 +34,5 @@ class EngineCoreRequestType(enum.Enum):
     # Unsolicited metrics snapshot, pushed by EngineCore on its own clock.
     METRICS = b"\x09"
     # (seqs ingested so far, prefill tokens still to compute), pushed by a DP
-    # engine core when either changes; read by `store_tokens` DP routing.
+    # engine core when either changes; read by `share_cache` DP routing.
     PREFILL_BACKLOG = b"\x0a"

@@ -31,13 +31,30 @@ def _probe(hit_blocks, new=6):
     return AdmissionProbe(hit_blocks, list(range(100, 100 + hit_blocks + 2)), new)
 
 
+def _held_by_a_request(bm, *hashes):
+    """Make these hashes cached in blocks some request still holds (shared-live)."""
+    live = {h: 900 + i for i, h in enumerate(hashes)}
+    bm.kv.lookup = lambda h: live.get(h, -1)
+    bm.kv.is_used = lambda block_id: block_id in live.values()
+
+
 def test_lowers_an_unaligned_hit_to_the_chunk_floor(seq_factory):
     bm = _manager()
     seq = seq_factory(list(range(64)))
     probe = _probe(5)  # 20 tokens: 4 into the second 16-token chunk
     assert bm.lower_hit_to_chunk(seq, probe, CHUNK, tier_hit=48, min_load=8)
     assert probe.num_cached_blocks == 4  # 16 tokens
-    assert probe.num_new_blocks == 7  # one more fresh block for the dropped one
+    # The dropped block is cached-free (or gone): `num_new_blocks` already counts
+    # it as one to allocate, so lowering adds no demand.
+    assert probe.num_new_blocks == 6
+
+
+def test_a_dropped_block_a_request_still_holds_is_one_more_unit(seq_factory):
+    bm = _manager()
+    _held_by_a_request(bm, 104)  # the block at index 4, past the floor
+    probe = _probe(5)
+    assert bm.lower_hit_to_chunk(seq_factory(list(range(64))), probe, CHUNK, 48, 8)
+    assert probe.num_new_blocks == 7
 
 
 @pytest.mark.parametrize(
@@ -87,6 +104,7 @@ def test_refuses_when_a_cache_class_rejects_the_lowered_boundary(seq_factory):
 
 def test_refuses_when_the_pool_cannot_give_the_extra_block(seq_factory):
     bm = _manager(blocks=4)
+    _held_by_a_request(bm, 104)
     seq = seq_factory(list(range(64)))
     probe = _probe(5, new=4)  # the pool has 4 free: one more does not fit
     assert not bm.lower_hit_to_chunk(seq, probe, CHUNK, 48, 8)
@@ -135,7 +153,7 @@ def test_a_tier_that_does_not_declare_it_keeps_the_hand_off(monkeypatch, seq_fac
     assert sched._early_load.skips["unaligned_hbm"] == 1
 
 
-def test_store_tokens_accepts_a_pd_multi_connector_with_a_shared_tier():
+def test_share_cache_accepts_a_pd_multi_connector_with_a_shared_tier():
     from types import SimpleNamespace
 
     from atom.model_engine.engine_core_mgr import CoreManager

@@ -1,4 +1,4 @@
-# Shared Mooncake Store with `store_tokens` routing: measured results
+# Shared Mooncake Store with `share_cache` routing: measured results
 
 Single node, DeepSeek-V4.1-Flash (MTP, forced acceptance length 3.51), AgentX
 trace replay through aiperf, gfx950. Every comparison below ran **at the same
@@ -11,22 +11,21 @@ arm; TTFT/ITL lower is better, throughput higher is better.
 
 | | main | Store arm |
 |---|---|---|
-| Routing | `ATOM_DP_SESSION_AFFINITY=1`, `least_tokens` | `--dp-load-balance store_tokens` |
+| Routing | `ATOM_DP_SESSION_AFFINITY=1`, `least_tokens` | `--dp-load-balance share_cache` |
 | KV tier | HBM prefix cache | HBM + one Mooncake Store shared by all DP ranks |
 | Offload settings | - | branch defaults (see below), no environment variables |
 
-Launch: `--kv-transfer-config` with `mooncake_store` (see `README.md`) plus
-`--dp-load-balance store_tokens`. `ATOM_FRONTEND_PREFIX_HASH` already defaults
+Launch: `--kv-transfer-config` with `mooncake_store` (see `PD_DIRECT_STORE.md` for the P/D form) plus
+`--dp-load-balance share_cache`. `ATOM_FRONTEND_PREFIX_HASH` already defaults
 to 1.
 
 Branch defaults that this result depends on:
 
 | Setting | Default | Why |
 |---|---|---|
-| `OFFLOAD_MIN_LOAD_TOKENS` | 512 | A shared tier should serve what HBM would; 8192 re-prefilled ~11% more. |
-| `OFFLOAD_LOAD_STREAM_HIGH_PRIORITY` | 1 | Load unpack 144 ms -> 3.6 ms mean on a busy GPU. |
-| `OFFLOAD_STAGING_ON_COMPUTE_STREAM` | 1 | Store arms on side streams froze the engine for minutes in 5 of the 9 runs in which it was tried; no freeze in the 20+ Store arms run on the compute stream since. |
-| `ATOM_OFFLOAD_EARLY_LOAD` / `_STATE` | 1 / 1 | Start the Store read when the lookup answers instead of one delayer cycle later. |
+| `OFFLOAD_MIN_LOAD_TOKENS` | 512 (when the tier is a Mooncake Store; 8192 otherwise) | A shared tier should serve what HBM would; 8192 re-prefilled ~11% more. |
+| Offload staging on the forward's stream | always | Store arms on side streams froze the engine for minutes in 5 of the 9 runs in which it was tried; no freeze in the 20+ Store arms run on the compute stream since. |
+| Early tier load | always | Start the Store read when the lookup answers instead of one delayer cycle later. |
 
 ## Latest: unaligned HBM hit floored to the Store chunk (head 0b0aef722)
 
@@ -133,7 +132,7 @@ Effect of the individual pieces (DP2, same batch as the row above it):
 
 | Change | Throughput | TTFT mean | TTFT p50 | Note |
 |---|---|---|---|---|
-| least_requests routing -> `store_tokens` | -3.7% -> -0.3% | +15.7% -> -27.4% | +23.3% -> +1.4% | Balance prefill by work, not request count. |
+| least_requests routing -> `share_cache` | -3.7% -> -0.3% | +15.7% -> -27.4% | +23.3% -> +1.4% | Balance prefill by work, not request count. |
 | prefill-delayer visibility fix | - | - | - | One-rank prefills 23% -> 5-7%; prefill steps 7.2% -> 5.5% (main 5.5%). |
 | early tier load off -> on | +4.8% -> +2.2% | -24.6% -> -24.5% | **+22.5% -> +5.1%** | Removes one delayer cycle from a Store request. |
 
@@ -163,7 +162,7 @@ median gap (+82% -> +32%) and moved mean TTFT from +9% to -17%.
 **Still open:** median TTFT is 32% (900 s) to 50% (1800 s) above main at DP4 (DP2: 5-17%). With the
 fix, 36% of releases are still stall releases. The ranks are nearly always all
 prefillable, but each holds only a little pending work (aggregate fill 0.71 against the 0.9
-target), because `store_tokens` spreads requests evenly while session affinity
+target), because `share_cache` spreads requests evenly while session affinity
 makes a few large chunks. Under test: `ATOM_PREFILL_DELAYER_TARGET_FILL` and
 `ATOM_PREFILL_DELAYER_STALL_TICKS`.
 
@@ -191,6 +190,6 @@ DeepSeek-V4.1-Flash-1017, P4 on g09 + D4 on g25 (8 inference GPUs total), DPA en
 
 Lower TTFT/ITL is better. Per-GPU output throughput divides the exported aggregate by the 8 inference GPUs; it does not charge the separate Store CPU resource. Throughput is the AIPerf exported value, including its accounting/drain behavior.
 
-Scope: this pair predates `store_tokens`, current early-load/chunk-floor scheduling, and the composite preadmission cancellation fix. The prototype used `least_requests`, the old `--offload-prefetch` path, 8192-token load/save thresholds, and profiling enabled. Main source was `df61c5d4c522778ec93b9c77242d892941b90751`. This supports feasibility of the earlier P/D shared-Store path, not a performance claim for current #3097. Median TTFT regressed despite better mean/tail latency; one sequential pair does not establish statistical significance. The existing single-node results above remain separate.
+Scope: this pair predates `share_cache`, current early-load/chunk-floor scheduling, and the composite preadmission cancellation fix. The prototype used `least_requests`, the old `--offload-prefetch` path, 8192-token load/save thresholds, and profiling enabled. Main source was `df61c5d4c522778ec93b9c77242d892941b90751`. This supports feasibility of the earlier P/D shared-Store path, not a performance claim for current #3097. Median TTFT regressed despite better mean/tail latency; one sequential pair does not establish statistical significance. The existing single-node results above remain separate.
 
 Run IDs: `c256-main-sticky-p4d4-g09g25-1800s-20261105` and `c256-store-cpugpu-diag-p4d4-g09g25-1800s-20261105`. Preserved evidence: `outputs/mooncake-direct-probe/pd1800-final-latest.json` in the benchmark workspace (both full AIPerf profiles and completion records).

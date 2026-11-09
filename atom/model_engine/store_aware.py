@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Store-aware DP routing (`--dp-load-balance store_tokens`).
+"""Store-aware DP routing (`--dp-load-balance share_cache`).
 
 With an offload tier every DP rank shares (Mooncake Store, one LMCache MP
 server), a prefix one rank computed can be loaded by any rank once its prefill

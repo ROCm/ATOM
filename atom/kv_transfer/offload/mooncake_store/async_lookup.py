@@ -6,8 +6,17 @@ The worker rechecks/renews before loading; a stale answer never authorizes
 reuse of missing bytes. One executor serializes the synchronous Store client.
 """
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from threading import RLock
+
+logger = logging.getLogger("atom")
+
+# How long the scheduler thread waits for a lease renewal queued behind
+# arrival-time lookups. The renewal is advisory (see `renew`); a Store RPC that
+# is slow must not stall the scheduler and, through the DP lockstep, its peers.
+RENEW_TIMEOUT_S = 1.0
 
 
 class AsyncStoreLookup:
@@ -138,8 +147,26 @@ class AsyncStoreLookup:
             return hits
 
     def renew(self, seq, start, end):
-        # Serialize with lookups; renew is required only at load dispatch.
-        return self.executor.submit(self.backend.renew, seq, start, end).result()
+        """Renew the read leases of tokens ``[start, end)``; 0 if it is not done in time.
+
+        Runs on the lookup executor, which serializes the synchronous Store
+        client, but the scheduler thread waits at most `RENEW_TIMEOUT_S` for it.
+        The load goes ahead whatever the answer (its all-or-nothing get fails on
+        a chunk the Store lost and the request is prefilled), so a renewal that
+        is late costs a lease, never correctness.
+        """
+        future = self.executor.submit(self.backend.renew, seq, start, end)
+        try:
+            return future.result(timeout=RENEW_TIMEOUT_S)
+        except FutureTimeout:
+            future.cancel()
+            logger.warning(
+                "Mooncake Store lease renewal for seq=%s did not finish in %.1fs; "
+                "the load is dispatched without it",
+                getattr(seq, "id", None),
+                RENEW_TIMEOUT_S,
+            )
+            return 0
 
     def close(self):
         with self.lock:

@@ -392,10 +392,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         )
 
     @property
-    def supports_async_lookup(self):
-        return bool(getattr(self._prefetch_tier(), "supports_async_lookup", False))
-
-    @property
     def chunk_size(self):
         return getattr(self._prefetch_tier(), "chunk_size", 0)
 
@@ -412,15 +408,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(c, "held_tier_hit", None)
         return int(callback(seq)) if callable(callback) else 0
 
-    def take_ready_lookup(self, seq):
-        c = self._prefetch_tier()
-        return c is not None and c.take_ready_lookup(seq)
-
-    def release_taken_lookup(self, seq):
-        c = self._prefetch_tier()
-        if c is not None:
-            c.release_taken_lookup(seq)
-
     def bind_block_manager(self, block_manager: Any) -> None:
         """Bind native checkpoint owners before any request can be admitted."""
         for connector in self._connectors:
@@ -435,6 +422,13 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if callable(pending) and pending(seq):
                 return True
         return False
+
+    def close(self) -> None:
+        """Close every sub-connector that holds threads (the offload tier's)."""
+        for connector in self._connectors:
+            close = getattr(connector, "close", None)
+            if callable(close):
+                close()
 
     def cancel_preadmission(self, seq: Any) -> None:
         """Take back an early admission, including each tier's held state."""
