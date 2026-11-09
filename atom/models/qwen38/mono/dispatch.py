@@ -36,7 +36,9 @@ class MonoTargetModel(nn.Module):
         meta = self.runner.step_meta(input_ids, intermediate_tensors, inputs_embeds)
         if meta is None:
             return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
-        return self.runner.forward(input_ids, meta)
+        hidden = self.runner.forward(input_ids, meta)
+        self.runner.store_rope_positions(positions, input_ids.numel())
+        return hidden
 
     def compute_logits(self, hidden_states: torch.Tensor):
         return self.model.compute_logits(hidden_states)

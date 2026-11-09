@@ -18,6 +18,7 @@ import logging
 
 import torch
 
+from atom.model_ops.qwen4_exp.qsa_attention import store_rope_positions
 from atom.models.qwen38.mono.config import BATCHES, SPEC
 from atom.models.qwen38.mono.kernels.blocks.moe import MoEArgs
 from atom.models.qwen38.mono.kernels.layer import LayerKernel
@@ -416,3 +417,7 @@ class TargetRunner:
             )
             hidden = out
         return hidden.clone().view(-1, inner.hc_count, inner.config.hidden_size)
+
+    def store_rope_positions(self, positions, rows: int) -> None:
+        slots = get_forward_context().attn_metadata.qsa_metadata.slot_mapping
+        store_rope_positions(self._qsa_layers.values(), positions, slots, rows)

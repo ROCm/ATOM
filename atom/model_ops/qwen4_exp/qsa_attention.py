@@ -133,6 +133,23 @@ def canonical_rope_positions(positions: torch.Tensor) -> torch.Tensor:
     return positions.transpose(0, 1).unsqueeze(1).to(torch.int64)
 
 
+def store_rope_positions(modules, positions, slots, rows: int) -> None:
+    """Write `positions[..., :rows]` into the position cache of each module in
+    `modules` that has one, at `slots` (-1 skipped).
+
+    Pooling reads a group's first-token position back from this cache, so every
+    step that writes raw index keys writes their positions too: ATOM's own
+    selection below, and the steps the Qwen mono programs serve.
+    """
+    caches = [m.rope_position_cache for m in modules]
+    caches = [c for c in caches if c is not None]
+    if not caches:
+        return
+    values = canonical_rope_positions(positions[..., :rows])
+    for cache in caches:
+        qsa_store_rows(cache, slots, values)
+
+
 class Qwen4ExpIndexer(nn.Module):
     """Replicated index Q/K projection plus the QSA selection contract."""
 
@@ -402,12 +419,9 @@ class Qwen4ExpAttention(nn.Module):
         """Update both index caches, then return the per-token selection."""
         index_q, raw_key = self.indexer.project_qk(hidden_states, positions)
         qsa_store_rows(self.raw_key_cache, qsa.slot_mapping, raw_key)
-        if self.rope_position_cache is not None:
-            qsa_store_rows(
-                self.rope_position_cache,
-                qsa.slot_mapping,
-                canonical_rope_positions(positions[..., : hidden_states.shape[0]]),
-            )
+        store_rope_positions(
+            (self,), positions, qsa.slot_mapping, hidden_states.shape[0]
+        )
 
         pooled, first_positions = qsa_compress_groups(
             self.raw_key_cache,
