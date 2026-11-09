@@ -15,10 +15,20 @@ use std::{
 use async_trait::async_trait;
 use dashmap::DashMap;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
-use crate::{core::Worker, routers::comm::header_utils::extract_sticky_routing_key};
+use super::{
+    decision::{self, RouteDecision, NO_HEALTHY_WORKERS},
+    get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo,
+};
+use crate::{
+    core::Worker,
+    observability::metrics::metrics_labels::{
+        AFFINITY_EXPIRED, AFFINITY_HIT, AFFINITY_NEW, AFFINITY_REBIND,
+    },
+    routers::comm::header_utils::extract_sticky_routing_key,
+};
 
 const SESSION_REASSIGNMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120 * 60);
+const NO_SESSION: &str = "no_session";
 
 #[derive(Debug)]
 struct StickyAssignment {
@@ -107,14 +117,16 @@ impl DpStickyPolicy {
             })
     }
 
+    /// Returns the selection with the session outcome: hit, new, rebind,
+    /// expired, or no_session for requests without a session ID.
     fn select_worker_impl(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
+    ) -> (Option<usize>, &'static str) {
         let session_id = extract_sticky_routing_key(info.headers);
         let Some(session_id) = session_id else {
-            return Self::select_low_load_worker(workers);
+            return (Self::select_low_load_worker(workers), NO_SESSION);
         };
         let now = Instant::now();
 
@@ -125,7 +137,7 @@ impl DpStickyPolicy {
                 if let Some(index) = Self::healthy_worker_for_identity(workers, &assignment.worker)
                 {
                     assignment.last_access = now;
-                    return Some(index);
+                    return (Some(index), AFFINITY_HIT);
                 }
             }
         }
@@ -136,19 +148,27 @@ impl DpStickyPolicy {
             .assign_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(mut assignment) = self.assignments.get_mut(session_id) {
-            let is_expired = now.saturating_duration_since(assignment.last_access)
-                > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
-            if !is_expired {
-                if let Some(index) = Self::healthy_worker_for_identity(workers, &assignment.worker)
+        let outcome = match self.assignments.get_mut(session_id) {
+            None => AFFINITY_NEW,
+            Some(mut assignment) => {
+                let is_expired = now.saturating_duration_since(assignment.last_access)
+                    > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
+                if is_expired {
+                    AFFINITY_EXPIRED
+                } else if let Some(index) =
+                    Self::healthy_worker_for_identity(workers, &assignment.worker)
                 {
                     assignment.last_access = now;
-                    return Some(index);
+                    return (Some(index), AFFINITY_HIT);
+                } else {
+                    AFFINITY_REBIND
                 }
             }
-        }
+        };
 
-        let selected_index = self.select_new_session_worker(workers, now)?;
+        let Some(selected_index) = self.select_new_session_worker(workers, now) else {
+            return (None, outcome);
+        };
         self.assignments.insert(
             session_id.to_string(),
             StickyAssignment {
@@ -156,7 +176,7 @@ impl DpStickyPolicy {
                 last_access: now,
             },
         );
-        Some(selected_index)
+        (Some(selected_index), outcome)
     }
 }
 
@@ -173,11 +193,35 @@ impl LoadBalancingPolicy for DpStickyPolicy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
-        self.select_worker_impl(workers, info)
+        let (selected, outcome) = self.select_worker_impl(workers, info);
+        let decision = match selected {
+            None => RouteDecision::branch(NO_HEALTHY_WORKERS),
+            Some(index) if outcome == NO_SESSION => RouteDecision {
+                cost: Some(workers[index].load() as f64),
+                ..RouteDecision::branch(NO_SESSION)
+            },
+            Some(_) => RouteDecision {
+                affinity: Some(outcome),
+                ..RouteDecision::branch(outcome)
+            },
+        };
+        decision::report(self, workers, selected, decision);
+        selected
     }
 
     fn name(&self) -> &'static str {
         "dp_sticky"
+    }
+
+    fn decision_branches(&self) -> &'static [&'static str] {
+        &[
+            AFFINITY_HIT,
+            AFFINITY_NEW,
+            AFFINITY_REBIND,
+            AFFINITY_EXPIRED,
+            NO_SESSION,
+            NO_HEALTHY_WORKERS,
+        ]
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -310,6 +354,45 @@ mod tests {
             Instant::now() - SESSION_REASSIGNMENT_IDLE_TIMEOUT - Duration::from_secs(1);
 
         assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn session_outcomes_are_counted_by_result() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let policy = DpStickyPolicy::new();
+        let workers = workers();
+        let headers = headers("session-1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let first = policy.select_worker(&workers, &info).await.unwrap();
+        policy.select_worker(&workers, &info).await.unwrap();
+        workers[first].set_healthy(false);
+        policy.select_worker(&workers, &info).await.unwrap();
+        policy.assignments.get_mut("session-1").unwrap().last_access =
+            Instant::now() - SESSION_REASSIGNMENT_IDLE_TIMEOUT - Duration::from_secs(1);
+        policy.select_worker(&workers, &info).await.unwrap();
+        policy
+            .select_worker(&workers, &SelectWorkerInfo::default())
+            .await
+            .unwrap();
+
+        let rendered = handle.render();
+        for result in ["new", "hit", "rebind", "expired"] {
+            let line =
+                format!(r#"mesh_session_affinity_total{{pool="regular",result="{result}"}} 1"#);
+            assert!(rendered.contains(&line), "missing {line} in\n{rendered}");
+        }
+        assert!(
+            rendered.contains(
+                r#"mesh_route_branch_total{pool="regular",policy="dp_sticky",branch="no_session"} 1"#
+            ),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

@@ -68,7 +68,10 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{
-    get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
+    decision::{self, RouteDecision, NO_HEALTHY_WORKERS},
+    get_healthy_worker_indices, normalize_model_key,
+    tree::Tree,
+    utils::PeriodicTask,
     CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::core::{Worker, WorkerType};
@@ -311,6 +314,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
+            decision::report(
+                self,
+                workers,
+                None,
+                RouteDecision::branch(NO_HEALTHY_WORKERS),
+            );
             return None;
         }
 
@@ -332,7 +341,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
         if is_imbalanced {
-            return self.select_worker_min_load(
+            let selected = self.select_worker_min_load(
                 workers,
                 &request_text,
                 &healthy_indices,
@@ -340,6 +349,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 max_load,
                 min_load,
             );
+            let decision = RouteDecision {
+                cost: selected.map(|idx| workers[idx].load() as f64),
+                ..RouteDecision::branch("imbalanced")
+            };
+            decision::report(self, workers, selected, decision);
+            return selected;
         }
 
         // Use cache-aware routing when balanced
@@ -358,24 +373,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             } else {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
+            let affinity = match_rate > self.config.cache_threshold;
+            let tenant_url: &str = &result.tenant;
+            let decision = RouteDecision {
+                match_ratio: Some(match_rate as f64),
+                ..RouteDecision::branch(if affinity { "affinity" } else { "relocate" })
+            };
 
-            // The low-match branch places by load instead of affinity, so the
-            // match-rate distribution is what tells you whether cache_threshold
-            // suits the traffic. Kept at debug: this is one line per request.
-            debug!(
-                "cache_aware route: match_rate={:.3} threshold={:.3} path={}",
-                match_rate,
-                self.config.cache_threshold,
-                if match_rate > self.config.cache_threshold {
-                    "affinity"
-                } else {
-                    "relocate"
-                }
-            );
             // Select worker without String allocation
-            let selected_idx = if match_rate > self.config.cache_threshold {
+            let selected_idx = if affinity {
                 // Cache hit path: find worker by URL (compare &str directly, no allocation)
-                let tenant_url: &str = &result.tenant;
                 workers
                     .iter()
                     .position(|w| w.url() == tenant_url)
@@ -406,18 +413,28 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Increment processed counter
                 workers[idx].increment_processed();
 
+                let decision = RouteDecision {
+                    cost: (!affinity).then(|| workers[idx].load() as f64),
+                    ..decision
+                };
+                decision::report(self, workers, Some(idx), decision);
                 return Some(idx);
             }
 
             // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-            if match_rate > self.config.cache_threshold {
-                let tenant_url: &str = &result.tenant;
+            if affinity {
                 tree.remove_tenant(tenant_url);
                 debug!("Removed stale worker {} from cache tree", tenant_url);
             }
 
             // Fallback to first healthy worker
-            healthy_indices.first().copied()
+            let fallback = healthy_indices.first().copied();
+            let decision = RouteDecision {
+                branch: "stale_tenant",
+                ..decision
+            };
+            decision::report(self, workers, fallback, decision);
+            fallback
         } else {
             // No tree for this key: cache affinity is dead and every request is
             // placed at random, which is indistinguishable from "cache_aware is
@@ -438,7 +455,9 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             // Return a random healthy worker
             let mut rng = rand::rng();
             let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+            let selected = Some(healthy_indices[random_idx]);
+            decision::report(self, workers, selected, RouteDecision::branch("no_tree"));
+            selected
         }
     }
 
@@ -456,6 +475,17 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn name(&self) -> &'static str {
         "cache_aware"
+    }
+
+    fn decision_branches(&self) -> &'static [&'static str] {
+        &[
+            "affinity",
+            "relocate",
+            "imbalanced",
+            "stale_tenant",
+            "no_tree",
+            NO_HEALTHY_WORKERS,
+        ]
     }
 
     fn needs_request_text(&self) -> bool {
@@ -637,6 +667,56 @@ mod tests {
         for _ in 0..5 {
             let idx = policy.select_worker(&workers, &info).await.unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
+        }
+    }
+
+    #[tokio::test]
+    async fn branches_match_ratio_and_cost_are_recorded() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 5,
+            balance_rel_threshold: 2.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10000,
+        });
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Regular)
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+        let info = SelectWorkerInfo {
+            request_text: Some("hello world"),
+            ..Default::default()
+        };
+
+        let first = policy.select_worker(&workers, &info).await.unwrap();
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(first));
+        for _ in 0..20 {
+            workers[first].increment_load();
+        }
+        assert_ne!(policy.select_worker(&workers, &info).await, Some(first));
+
+        let rendered = handle.render();
+        for branch in ["relocate", "affinity", "imbalanced"] {
+            let line = format!(
+                r#"mesh_route_branch_total{{pool="regular",policy="cache_aware",branch="{branch}"}} 1"#
+            );
+            assert!(rendered.contains(&line), "missing {line} in\n{rendered}");
+        }
+        for line in [
+            r#"mesh_route_prefix_match_ratio_count{pool="regular",policy="cache_aware"} 2"#,
+            r#"mesh_route_cost_count{pool="regular",policy="cache_aware"} 2"#,
+        ] {
+            assert!(rendered.contains(line), "missing {line} in\n{rendered}");
         }
     }
 

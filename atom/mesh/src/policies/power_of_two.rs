@@ -9,7 +9,10 @@ use async_trait::async_trait;
 use rand::Rng;
 use tracing::debug;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{
+    decision::{self, RouteDecision, NO_HEALTHY_WORKERS},
+    get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo,
+};
 use crate::core::Worker;
 
 /// Power-of-two choices policy
@@ -40,11 +43,24 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
+            decision::report(
+                self,
+                workers,
+                None,
+                RouteDecision::branch(NO_HEALTHY_WORKERS),
+            );
             return None;
         }
 
         if healthy_indices.len() == 1 {
-            return Some(healthy_indices[0]);
+            let selected = Some(healthy_indices[0]);
+            decision::report(
+                self,
+                workers,
+                selected,
+                RouteDecision::branch("single_worker"),
+            );
+            return selected;
         }
 
         // Select two random workers - use offset to guarantee different selection in O(1)
@@ -72,15 +88,19 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
 
         // If either worker is missing token data (e.g. monitor failure),
         // we must degrade BOTH to request counts to ensure fairness.
-        let (load1, load2) = match (load1_tokens, load2_tokens) {
+        let (load1, load2, branch) = match (load1_tokens, load2_tokens) {
             (Some(t1), Some(t2)) => {
                 // Both have token data. Compare Tokens.
-                (t1, t2)
+                (t1, t2, "token_load")
             }
             _ => {
                 // If One or both are missing token data.
                 // Fallback to local request counts for BOTH.
-                (worker1.load() as isize, worker2.load() as isize)
+                (
+                    worker1.load() as isize,
+                    worker2.load() as isize,
+                    "request_load",
+                )
             }
         };
 
@@ -102,12 +122,27 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
 
         // Increment processed counter
         workers[selected_idx].increment_processed();
+        decision::report(
+            self,
+            workers,
+            Some(selected_idx),
+            RouteDecision::branch(branch),
+        );
 
         Some(selected_idx)
     }
 
     fn name(&self) -> &'static str {
         "power_of_two"
+    }
+
+    fn decision_branches(&self) -> &'static [&'static str] {
+        &[
+            "single_worker",
+            "token_load",
+            "request_load",
+            NO_HEALTHY_WORKERS,
+        ]
     }
 
     fn update_loads(&self, loads: &HashMap<String, isize>) {

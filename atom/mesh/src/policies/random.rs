@@ -5,7 +5,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rand::Rng;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{
+    decision::{self, RouteDecision, NO_HEALTHY_WORKERS},
+    get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo,
+};
 use crate::core::Worker;
 
 /// Random selection policy
@@ -30,17 +33,34 @@ impl LoadBalancingPolicy for RandomPolicy {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
+            decision::report(
+                self,
+                workers,
+                None,
+                RouteDecision::branch(NO_HEALTHY_WORKERS),
+            );
             return None;
         }
 
         let mut rng = rand::rng();
         let random_idx = rng.random_range(0..healthy_indices.len());
+        let selected = healthy_indices[random_idx];
+        decision::report(
+            self,
+            workers,
+            Some(selected),
+            RouteDecision::branch("random"),
+        );
 
-        Some(healthy_indices[random_idx])
+        Some(selected)
     }
 
     fn name(&self) -> &'static str {
         "random"
+    }
+
+    fn decision_branches(&self) -> &'static [&'static str] {
+        &["random", NO_HEALTHY_WORKERS]
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

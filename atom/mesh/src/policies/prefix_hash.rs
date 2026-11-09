@@ -31,7 +31,10 @@
 
 use std::sync::Arc;
 
-use super::{LoadBalancingPolicy, SelectWorkerInfo};
+use super::{
+    decision::{self, RouteDecision},
+    LoadBalancingPolicy, SelectWorkerInfo,
+};
 use crate::{core::Worker, observability::metrics::MeshMetrics};
 
 /// Configuration for the PrefixHash load balancing policy
@@ -233,11 +236,37 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
     ) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info);
         MeshMetrics::record_worker_prefix_hash_policy_branch(branch.as_str());
+        let cost = match branch {
+            Branch::LoadBalanceWalk | Branch::FallbackLeastLoad => {
+                result.map(|idx| workers[idx].load() as f64)
+            }
+            _ => None,
+        };
+        decision::report(
+            self,
+            workers,
+            result,
+            RouteDecision {
+                cost,
+                ..RouteDecision::branch(branch.as_str())
+            },
+        );
         result
     }
 
     fn name(&self) -> &'static str {
         "prefix_hash"
+    }
+
+    fn decision_branches(&self) -> &'static [&'static str] {
+        const BRANCHES: &[&str] = &[
+            Branch::NoHealthyWorkers.as_str(),
+            Branch::NoTokens.as_str(),
+            Branch::RingHit.as_str(),
+            Branch::LoadBalanceWalk.as_str(),
+            Branch::FallbackLeastLoad.as_str(),
+        ];
+        BRANCHES
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

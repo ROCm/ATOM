@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use crate::core::{HashRing, Worker};
 
 mod cache_aware;
+pub(crate) mod decision;
 mod dp_sticky;
 mod factory;
 mod power_of_two;
@@ -59,6 +60,12 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
+
+    /// Branches this policy passes to `decision::report`, declared up front so
+    /// `mesh_route_branch_total` stays bounded.
+    fn decision_branches(&self) -> &'static [&'static str] {
+        &[]
+    }
 
     /// Check if this policy needs request text for routing decisions
     fn needs_request_text(&self) -> bool {
