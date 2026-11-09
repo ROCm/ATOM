@@ -457,6 +457,25 @@ _budget_pair() {  # <agent> <budget> -> rc of run_one's precondition
     timeout 20 bash "$S/run_one.sh" 0 x/y >/dev/null 2>&1; echo $? )
 }
 t "a per-agent timeout that starves the refuter is refused" "$(_budget_pair 5400 7200)" "2"
+
+# A cross-family refuter must be reachable by doing what the comment says. The hook has
+# existed since the port and nothing had ever run through it: the refuter fell back to the
+# worker's own binary on every recorded run (41+ findings judged, zero killed), and a
+# same-family refutation produces artifacts identical to a cross-family one, so no reader
+# could tell. The wrapper exists because the value must be ONE executable -- run_one
+# appends its own flags -- which a bare `claude-glm --backend kimi` silently is not.
+t "the cross-family refuter entrypoint is executable" \
+  "$([ -x "$S/refuter-kimi" ] && echo yes || echo no)" "yes"
+t "SAME_FAMILY flips when a different refuter is configured" \
+  "$(ATOM_REVIEW_AGENT=a ATOM_REVIEW_REFUTER_AGENT=b bash -c '
+      AGENT="${ATOM_REVIEW_AGENT:-claude-glm}"
+      REFUTER_BIN="${ATOM_REVIEW_REFUTER_AGENT:-$AGENT}"
+      [ "$REFUTER_BIN" = "$AGENT" ] && echo 1 || echo 0')" "0"
+t "SAME_FAMILY is set when the refuter is left unconfigured" \
+  "$(ATOM_REVIEW_AGENT=a bash -c '
+      AGENT="${ATOM_REVIEW_AGENT:-claude-glm}"
+      REFUTER_BIN="${ATOM_REVIEW_REFUTER_AGENT:-$AGENT}"
+      [ "$REFUTER_BIN" = "$AGENT" ] && echo 1 || echo 0')" "1"
 echo "[publish]"
 # The publish path's guards are pytest cases (_publish_test.py): the --post closure, the
 # anchoring rule (span anchors and the permalinks for what cannot be anchored included), and

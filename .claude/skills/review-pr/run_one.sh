@@ -96,7 +96,11 @@ fi
 # on-box endpoint (ANTHROPIC_BASE_URL=http://localhost:<port>), so no tunnel/wrapper is needed.
 AGENT="${ATOM_REVIEW_AGENT:-claude-glm}"
 WORKER_CMD=("$AGENT" -p --dangerously-skip-permissions)
-# Cross-family (restores the refuter's value): set ATOM_REVIEW_REFUTER_AGENT to an Opus entrypoint.
+# Cross-family (restores the refuter's value): point ATOM_REVIEW_REFUTER_AGENT at an
+# entrypoint of a DIFFERENT model family. It must be a single executable: this line
+# appends `-p --dangerously-skip-permissions` after it, so a value carrying its own
+# flags (`claude-glm --backend kimi`) is not runnable here. `refuter-kimi` in this
+# directory is that wrapper for the Kimi backend; an Opus entrypoint works directly.
 REFUTER_CMD=("${ATOM_REVIEW_REFUTER_AGENT:-$AGENT}" -p --dangerously-skip-permissions)
 
 # Whether the refuter is a different model family from the worker, decided here in the
