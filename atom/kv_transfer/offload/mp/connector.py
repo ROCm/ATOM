@@ -258,6 +258,22 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
     def cancel_preadmission(self, seq: Any) -> None:
         self._require_impl().cancel_preadmission(seq)
 
+    # The base class defines these as defaults, which would shadow `__getattr__`
+    # and leave the impl's own unreached: forward each explicitly.
+    def cancel_pending_load(self, seq: Any) -> None:
+        self._require_impl().cancel_pending_load(seq)
+
+    def held_tier_hit(self, seq: Any) -> int:
+        return int(self._require_impl().held_tier_hit(seq))
+
+    @property
+    def lowers_hbm_hit_to_chunk(self) -> bool:
+        return self._require_impl().lowers_hbm_hit_to_chunk
+
+    def close(self) -> None:
+        if self._impl is not None:
+            self._impl.close()
+
     def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
         check = getattr(self._require_impl(), "can_detach_lookup", None)
         return bool(check(seq, num_hbm_tokens)) if callable(check) else False
