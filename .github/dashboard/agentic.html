@@ -3,47 +3,69 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ATOM · Agentic performance</title>
+  <title>ATOM Benchmark Dashboard · Agentic</title>
+  <link rel="icon" type="image/png" href="atom_logo_mini.png">
+  <script>if(localStorage.getItem('atom-dash-theme')==='light')document.documentElement.setAttribute('data-theme','light');</script>
   <style>
+    :root {
+      /* Background — pure dark, high contrast */
+      --bg-primary: #0b0c10; --bg-secondary: #141519; --bg-tertiary: #1c1d24;
+      --border: #303140; --border-light: #262733;
+      /* Text — brighter for readability */
+      --text-primary: #eef0f6; --text-secondary: #bfc1d0; --text-tertiary: #7e8094;
+      /* Brand — ATOM logo magenta, accent only (header line, logo) */
+      --brand: #d86ecc; --brand-dim: rgba(216,110,204,0.12);
+      /* UI accent — slightly brighter slate blue */
+      --ui: #8899b8; --ui-bright: #a4b3ce; --ui-dim: rgba(136,153,184,0.12);
+      /* Semantic — slightly more vivid */
+      --accent-green: #6dbf80; --accent-red: #f25c4e;
+      --accent-orange: #eda06a; --accent-purple: #c49af5; --accent-yellow: #ddb040;
+      /* Spacing */
+      --gap-sm: 8px; --gap-md: 16px; --gap-lg: 24px; --radius: 8px;
+    }
+    [data-theme="light"] {
+      --bg-primary: #f5f6fa; --bg-secondary: #ffffff; --bg-tertiary: #ebedf3;
+      --border: #d0d3dc; --border-light: #e2e4eb;
+      --text-primary: #1a1c24; --text-secondary: #4a4d5e; --text-tertiary: #7e8094;
+      --brand: #c054b4; --brand-dim: rgba(192,84,180,0.10);
+      --ui: #5a6d8a; --ui-bright: #3d5278; --ui-dim: rgba(90,109,138,0.10);
+      --accent-green: #2e8b47; --accent-red: #d63a2f;
+      --accent-orange: #c47a30; --accent-purple: #8b5ec0; --accent-yellow: #b08a20;
+      --table-stripe: rgba(0,0,0,0.03);
+    }
+    .header-left > div { position: relative; padding-right: 36px; }
+    h1 { line-height: 24px; }
+    .theme-toggle { position: absolute; right: 0; top: 5px; display: block; width: 28px; height: 14px; background: var(--border); border: none; border-radius: 7px; cursor: pointer; transition: background 0.2s; }
+    .theme-toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 10px; height: 10px; background: var(--text-primary); border-radius: 50%; transition: transform 0.2s; }
+    [data-theme="light"] .theme-toggle { background: var(--border); }
+    [data-theme="light"] .theme-toggle::after { transform: translateX(14px); }
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    a { color: inherit; text-decoration: none; }
+    html, body { overflow-x: hidden; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg-primary); color: var(--text-secondary); }
+    .container { max-width: 1440px; margin: 0 auto; padding: var(--gap-lg); }
+    a { color: var(--ui-bright); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    header, .header-left, .header-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-    header { justify-content: space-between; }
-    .container { margin: 24px auto; }
-    .header-actions select { color: inherit; background: var(--bg-secondary); border: 1px solid var(--border); padding: 7px; border-radius: 6px; }
-    .header-actions label { font-size: 12px; }
-    .header-subtitle { color: var(--text-tertiary); margin-top: 4px; font-size: 12px; }
-    /* Performance explorer: neutral surfaces, a large plot and an inspection rail. */
-    body.explorer {
-      --bg-primary: #111214; --bg-secondary: #18191b; --bg-tertiary: #222326;
-      --border: #424448; --border-light: #2e3034;
-      --text-primary: #f2f2f3; --text-secondary: #c7c8cc; --text-tertiary: #94969e;
-      --explorer-accent: #ff6685; --explorer-soft: #322027;
-      background: var(--bg-primary); color: var(--text-secondary); color-scheme: dark;
-    }
-    [data-theme="light"] body.explorer {
-      --bg-primary: #f0f1f3; --bg-secondary: #ffffff; --bg-tertiary: #f5f6f7;
-      --border: #bfc3ca; --border-light: #dce0e5;
-      --text-primary: #202226; --text-secondary: #4d5159; --text-tertiary: #696f79;
-      --explorer-accent: #d4385a; --explorer-soft: #fff0f3; color-scheme: light;
-    }
-    .explorer header { position: static; max-width: none; min-height: 60px; padding: 12px 32px; background: var(--bg-primary); border-bottom: 1px solid var(--border-light); }
-    .explorer .header-left { gap: 18px; }
-    .explorer .header-logo { height: 24px; }
-    .explorer h1 { font-size: 14px; font-weight: 500; color: var(--text-secondary); }
-    .explorer .header-left > div { padding-right: 42px; }
-    .explorer .container { max-width: 1680px; padding: 0 32px 28px; }
-    .ex-config { padding: 12px 18px 16px; margin-bottom: 18px; border: 1px solid var(--border-light); border-radius: 10px; background: var(--bg-secondary); }
-    .ex-config-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; font-size: 12px; color: var(--text-secondary); }
-    .ex-config-head span { color: var(--text-tertiary); font-size: 11px; }
-    .ex-controls { display: grid; grid-template-columns: 1fr .7fr 1.5fr; gap: 16px; }
-    .ex-field { min-width: 0; }
-    .ex-field label { display: block; color: var(--text-secondary); font-size: 12px; margin-bottom: 7px; }
-    .ex-field select { min-width: 0; width: 100%; height: 37px; padding: 0 10px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 6px; color: var(--text-primary); font: inherit; font-size: 13px; cursor: pointer; text-overflow: ellipsis; }
-    .ex-field option { background: var(--bg-secondary); color: var(--text-primary); }
-    .ex-panel { border: 1px solid var(--border-light); border-radius: 12px; background: var(--bg-secondary); overflow: hidden; }
+    code { font-family: "SF Mono", "Fira Code", Consolas, monospace; font-size: 12px; background: var(--bg-tertiary); padding: 2px 6px; border-radius: 4px; }
+
+    /* ============================================================
+       HEADER & FILTER BAR
+       ============================================================ */
+    header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: var(--gap-md); padding: var(--gap-md) var(--gap-lg); border-bottom: 2px solid var(--brand); position: fixed; top: 0; left: 0; right: 0; z-index: 50; background: var(--bg-primary); max-width: 1440px; margin: 0 auto; }
+    .header-spacer { margin-bottom: var(--gap-lg); }
+    .fixed-thead { position: fixed; z-index: 40; background: var(--bg-secondary); display: none; overflow: hidden; }
+    .header-left { display: flex; align-items: center; gap: 12px; }
+    .header-logo { height: 36px; opacity: 0.9; display: block; }
+    h1 { font-size: 20px; color: var(--text-primary); font-weight: 600; }
+    h1 .h1-sep { color: var(--text-tertiary); font-weight: 300; margin: 0 2px; }
+    h1 .h1-sub { color: var(--text-secondary); font-weight: 400; }
+    .meta { font-size: 12px; color: var(--text-tertiary); margin-top: 2px; }
+
+    .filter-bar { display: flex; gap: var(--gap-sm); flex-wrap: wrap; align-items: center; position: relative; }
+    .filter-select { background: var(--bg-secondary); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; cursor: pointer; font-size: 12px; max-width: 220px; text-overflow: ellipsis; }
+    .filter-reset { background: none; color: var(--text-tertiary); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+    #agentic-controls { display: contents; }
+    .ex-config-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin-bottom: 16px; font-size: 12px; color: var(--text-tertiary); }
+    .ex-panel { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-secondary); overflow: hidden; }
     .ex-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 24px 14px; }
     .ex-model-title { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
     .ex-model-title h2 { font-size: 19px; letter-spacing: -.3px; font-weight: 650; color: var(--text-primary); }
@@ -75,7 +97,7 @@
     .ex-check { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; margin-top: 14px; padding-top: 15px; border-top: 1px solid var(--border-light); color: var(--text-secondary); cursor: pointer; }
     .ex-check input { appearance: none; width: 29px; height: 17px; flex-shrink: 0; border-radius: 20px; background: var(--border); border: 1px solid var(--border); cursor: pointer; position: relative; }
     .ex-check input::after { content: ''; position: absolute; width: 11px; height: 11px; border-radius: 50%; background: var(--text-secondary); top: 2px; left: 2px; transition: transform .15s; }
-    .ex-check input:checked { background: var(--explorer-accent); border-color: var(--explorer-accent); }
+    .ex-check input:checked { background: var(--ui-bright); border-color: var(--ui-bright); }
     .ex-check input:checked::after { transform: translateX(12px); background: #fff; }
     .ex-count { color: var(--text-tertiary); font-size: 11px; line-height: 1.6; margin-top: 8px; }
     .ex-inspector { border-top: 1px solid var(--border-light); margin-top: 17px; padding-top: 17px; }
@@ -83,7 +105,7 @@
     .ex-selection-head button { font-size: 11px; padding: 2px 5px; border: 0; }
     .ex-active-run { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; font-size: 11px; color: var(--text-tertiary); margin-bottom: 17px; }
     .ex-active-run > span { width: 100%; }
-    .ex-run-link { color: var(--explorer-accent); font-size: 12px; white-space: nowrap; }
+    .ex-run-link { color: var(--ui-bright); font-size: 12px; white-space: nowrap; }
     .ex-detail[hidden], .ex-overview[hidden], .ex-selection-head button[hidden] { display: none; }
     .ex-detail h4, .ex-eyebrow { font-size: 11px; color: var(--text-tertiary); font-weight: 400; margin-bottom: 10px; }
     .ex-metric-hero { margin-bottom: 18px; }
@@ -110,11 +132,8 @@
     .ex-footer { display: flex; justify-content: space-between; gap: 20px; margin-top: 14px; font-size: 11px; line-height: 1.8; color: var(--text-tertiary); }
     .ex-footer a { color: var(--text-secondary); }
     .ex-empty { display: grid; align-content: center; height: 420px; text-align: center; padding: 30px; color: var(--text-tertiary); font-size: 13px; line-height: 1.8; }
-    .explorer :is(button, select, input, summary, a):focus-visible { outline: 2px solid var(--explorer-accent); outline-offset: 3px; }
+    .explorer :is(button, select, input, summary, a):focus-visible { outline: 2px solid var(--ui-bright); outline-offset: 3px; }
     @media (max-width: 1100px) {
-      .explorer header { gap: 12px; padding: 12px 22px; }
-      .explorer .container { padding-inline: 22px; }
-      .ex-controls { grid-template-columns: 1fr .7fr 1.3fr; gap: 12px; }
       .ex-chart-layout { grid-template-columns: minmax(0, 1fr) 224px; gap: 10px; padding-right: 16px; padding-left: 8px; }
       .ex-sidebar { padding: 14px; }
       .ex-caption { padding-left: 16px; }
@@ -127,13 +146,6 @@
       .ex-direction { display: none; }
     }
     @media (max-width: 550px) {
-      .explorer header { padding: 12px; }
-      .explorer .container { padding: 0 12px 20px; }
-      .explorer .header-logo { height: 21px; }
-      .explorer h1 { font-size: 12px; }
-      .ex-config { padding: 12px; margin-bottom: 14px; }
-      .ex-controls { grid-template-columns: 1fr 1fr; gap: 12px; }
-      .ex-field:last-child { grid-column: 1 / -1; }
       .ex-model-title h2 { font-size: 17px; }
       .ex-panel-head { padding: 16px 14px; gap: 12px; align-items: flex-start; }
       .ex-panel-head p { font-size: 12px; }
@@ -157,21 +169,41 @@
       .ex-panel-foot { padding: 12px 16px; }
       .ex-footer { flex-direction: column; gap: 4px; }
     }
+    @media (max-width: 768px) {
+      header { padding: var(--gap-sm) var(--gap-md); }
+      h1 { font-size: 16px; }
+      .filter-bar { width: 100%; }
+      .filter-select { max-width: 100%; min-width: 0; }
+    }
+    @media (max-width: 480px) {
+      .container { padding: var(--gap-sm); }
+      header { padding: var(--gap-sm); }
+      .filter-bar { gap: 4px; }
+      .filter-select, .filter-reset { padding: 5px 8px; font-size: 11px; }
+    }
   </style>
 </head>
 <body class="explorer">
 <header>
-  <div class="header-left"><img class="header-logo" src="atom_logo.png" alt="ATOM">
-    <div><h1>Agentic performance</h1><p class="header-subtitle">Throughput and response speed</p></div>
+  <div class="header-left">
+    <a href="https://github.com/rocm/atom" target="_blank" rel="noopener noreferrer"><img class="header-logo" src="atom_logo.png" alt="ATOM"></a>
+    <div>
+      <h1>Benchmark Dashboard</h1>
+      <div class="meta"><span id="last-update"></span> · <a href="https://github.com/ROCm/ATOM" target="_blank" rel="noopener noreferrer">ROCm/ATOM</a><span id="header-gpu-meta"></span></div>
+      <button class="theme-toggle" id="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle light/dark mode"></button>
+    </div>
   </div>
-  <div class="header-actions">
-    <label>Hardware <select id="hardware" aria-label="Hardware"></select></label>
-    <button class="ex-button" id="theme-toggle" aria-label="Toggle light/dark mode">Light mode</button>
-    <button class="ex-button" id="reset">Reset</button>
-    <button class="ex-button" id="copy-link">Copy link</button>
-    <a class="ex-button" href="index.html">Benchmark dashboard ↗</a>
+  <div class="filter-bar" id="filter-bar">
+    <select class="filter-select" id="dashboard-scenario" aria-label="Scenario">
+      <option value="benchmarks">Scenario: Benchmarks</option><option value="agentic" selected>Scenario: Agentic</option>
+    </select>
+    <div id="agentic-controls"></div>
+    <select class="filter-select" id="hardware" aria-label="Hardware"></select>
+    <button class="filter-reset" id="reset">Reset</button>
+    <button class="filter-reset" id="copy-link">Copy Link</button>
   </div>
 </header>
+<div class="header-spacer" id="header-spacer"></div>
 <main class="container"><div id="tab-performance"></div></main>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha384-bs/nf9FbdNouRbMiFcrcZfLXYPKiPaGVGplVbv7dLGECccEXDW+S3zjqSKR5ZEaD" crossorigin="anonymous"></script>
 <script src="data.js"></script>
@@ -300,6 +332,7 @@ function atomeshPointRow(point, meta, idx) {
     id: `benchmark-point-${idx}`, model: point.model || 'unknown',
     hardware: atomeshHardwareKey(point.hardware || meta.hardware),
     sourceLabel: 'ATOM CI',
+    rocmVersion: point.rocm || meta.rocm_version || '',
     disaggregated: point.disaggregated ?? point.disagg ?? null,
     isMultinode: typeof point.is_multinode === 'boolean' ? point.is_multinode : null,
     nodeCount: atomeshPointNumber(point, 'num_nodes'),
@@ -312,6 +345,7 @@ function atomeshPointRow(point, meta, idx) {
     interactivityMethod: atomeshInteractivityMethod(point.interactivity_method),
     interactivityP90Itl: atomeshPointNumber(point, 'interactivity_p90_itl'),
     totalTput: atomeshPointNumber(point, 'total_tput'),
+    totalTputPerGpu: atomeshPointNumber(point, 'tput_per_gpu'),
     totalGpu: atomeshPointNumber(point, 'total_gpu'),
     prefillWorkers: atomeshPointNumber(point, 'prefill_workers'),
     decodeWorkers: atomeshPointNumber(point, 'decode_workers'),
@@ -348,6 +382,13 @@ function buildExplorerBenchmarkRows(data) {
 function explorerMetricValue(row, metric) {
   const value = metric.value(row);
   return metric.frontierEligible(row) && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function explorerThroughputValue(row) {
+  // Prefer the published per-GPU metric; derive it only with a known GPU count.
+  const value = row.totalTputPerGpu ?? (Number.isInteger(row.totalGpu) && row.totalGpu > 0
+    ? row.totalTput / row.totalGpu : null);
+  return Number.isFinite(value) && value > 0 ? value : null;
 }
 
 function explorerWorkloadKey(row) {
@@ -422,7 +463,7 @@ function renderAtomeshPerformanceTab() {
   if (state.explorerModel) state.explorerModel = explorerModelName(state.explorerModel);
   if (!models.includes(state.explorerModel)) {
     state.explorerModel = models.find(model => available.some(row => explorerModelName(row.model) === model
-        && explorerMetricValue(row, metric) !== null && row.totalTput > 0)) || models[0] || '';
+        && explorerMetricValue(row, metric) !== null && explorerThroughputValue(row) > 0)) || models[0] || '';
   }
   const modelRows = available.filter(row => explorerModelName(row.model) === state.explorerModel);
   const sourceName = row => row.sourceLabel || 'ATOM CI';
@@ -433,7 +474,7 @@ function renderAtomeshPerformanceTab() {
   const workloads = [...new Set(sourceRows.map(explorerWorkloadKey))].sort(_lc);
   if (!workloads.includes(state.explorerWorkload)) {
     state.explorerWorkload = workloads.find(key => sourceRows.some(row => explorerWorkloadKey(row) === key
-      && explorerMetricValue(row, metric) !== null && row.totalTput > 0)) || workloads[0] || '';
+      && explorerMetricValue(row, metric) !== null && explorerThroughputValue(row) > 0)) || workloads[0] || '';
   }
   const rows = sourceRows.filter(row => explorerWorkloadKey(row) === state.explorerWorkload)
     .sort((a, b) => _lc(explorerTopology(a), explorerTopology(b)) || a.concurrency - b.concurrency);
@@ -455,13 +496,13 @@ function renderAtomeshPerformanceTab() {
     return [key, palette[mode][index % palette[mode].length]];
   }));
   const points = rows.filter(row => explorerMetricValue(row, metric) !== null
-    && Number.isFinite(row.totalTput) && row.totalTput > 0
+    && Number.isFinite(explorerThroughputValue(row)) && explorerThroughputValue(row) > 0
     && !state.explorerHidden.has(seriesKey(row)))
-    .map(row => ({ x: explorerMetricValue(row, metric), y: row.totalTput, row }));
+    .map(row => ({ x: explorerMetricValue(row, metric), y: explorerThroughputValue(row), row }));
   const frontiers = explorerFrontiers(points);
   const frontierRows = new Set(frontiers.flat().map(point => point.row));
   const visible = points.filter(point => !state.explorerFrontierOnly || frontierRows.has(point.row));
-  const missing = rows.filter(row => explorerMetricValue(row, metric) === null || !Number.isFinite(row.totalTput) || row.totalTput <= 0).length;
+  const missing = rows.filter(row => explorerMetricValue(row, metric) === null || !Number.isFinite(explorerThroughputValue(row)) || explorerThroughputValue(row) <= 0).length;
   const sourceUrl = 'https://github.com/ROCm/ATOM/actions/workflows/atomesh-benchmark.yaml';
   const optionHTML = (options, selected, label = x => x) => options.map(option => `<option value="${escHTML(option).replace(/"/g, '&quot;')}" ${option === selected ? 'selected' : ''}>${escHTML(label(option))}</option>`).join('');
   const initialPoint = visible.reduce((best, point) => !best || point.y > best.y
@@ -470,7 +511,7 @@ function renderAtomeshPerformanceTab() {
   let explorerChart = null;
   function inspectionMetrics(row) {
     if (!row) return '<p class="ex-count">Select a configuration to inspect its measurements.</p>';
-    return `<dl class="ex-metric-hero"><dt>Total throughput</dt><dd>${explorerCompact(row.totalTput, 2)} <small>tok/s</small></dd></dl>
+    return `<dl class="ex-metric-hero"><dt>Total throughput per GPU</dt><dd>${explorerCompact(explorerThroughputValue(row), 2)} <small>tok/s/GPU</small></dd></dl>
       <dl class="ex-metric-list">
         <div><dt>Engine</dt><dd>${explorerDeploymentLabel(row)}</dd></div>
         <div><dt>P90 interactivity</dt><dd>${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), v => fmtNum(v, 2))}</dd></div>
@@ -481,18 +522,16 @@ function renderAtomeshPerformanceTab() {
         <div><dt>Pareto optimal</dt><dd>${points.some(point => point.row === row) ? (frontierRows.has(row) ? 'Yes' : 'No') : '—'}</dd></div>
       </dl><p class="ex-count" style="margin-top:14px">Interactivity in tok/s/user</p>`;
   }
+  document.getElementById('agentic-controls').innerHTML = `
+    <select class="filter-select" id="ex-model" aria-label="Model">${optionHTML(models, state.explorerModel)}</select>
+    <select class="filter-select" id="ex-source" aria-label="Source">${optionHTML(sources, state.explorerSource)}</select>
+    <select class="filter-select" id="ex-workload" aria-label="Workload / precision">${optionHTML(workloads, state.explorerWorkload, explorerWorkloadLabel)}</select>`;
+  updateHeader();
   container.innerHTML = `
-    <section class="ex-config" aria-label="Benchmark configuration">
-      <div class="ex-config-head">Benchmark configuration <span>Latest published CI result per recipe</span></div>
-      <div class="ex-controls">
-        <div class="ex-field"><label for="ex-model">Model</label><select id="ex-model">${optionHTML(models, state.explorerModel)}</select></div>
-        <div class="ex-field"><label for="ex-source">Source</label><select id="ex-source">${optionHTML(sources, state.explorerSource)}</select></div>
-        <div class="ex-field"><label for="ex-workload">Workload / precision</label><select id="ex-workload">${optionHTML(workloads, state.explorerWorkload, explorerWorkloadLabel)}</select></div>
-      </div>
-    </section>
+    <div class="ex-config-head">Agentic performance <span>Latest published CI result per recipe</span></div>
     <section class="ex-panel" aria-label="Throughput and interactivity chart">
       <div class="ex-panel-head">
-        <div><div class="ex-model-title"><h2>${escHTML(state.explorerModel || 'Inference performance')}</h2><span class="ex-chip">${escHTML((rows[0]?.precision || 'Precision unavailable').toUpperCase())}</span></div><p>Total throughput vs. ${metricLabel}</p></div>
+        <div><div class="ex-model-title"><h2>${escHTML(state.explorerModel || 'Inference performance')}</h2><span class="ex-chip">${escHTML((rows[0]?.precision || 'Precision unavailable').toUpperCase())}</span></div><p>Total throughput per GPU vs. ${metricLabel}</p></div>
         <div class="ex-actions">
           <button class="ex-button" id="ex-csv" title="Download measurements as CSV"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 9v12"/></svg>CSV</button>
           <button class="ex-button" id="ex-png" title="Download chart as PNG" ${visible.length ? '' : 'disabled'}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5"/></svg>PNG</button>
@@ -507,9 +546,9 @@ function renderAtomeshPerformanceTab() {
       </div>
       <div class="ex-chart-layout">
         <div class="ex-plot-main">
-          ${visible.length ? '<div class="ex-chart"><canvas id="ex-chart" role="img" aria-label="Scatter plot of total throughput versus P90 interactivity. All values are available in the measurement table below."></canvas></div>'
-            : `<div class="ex-empty">No points available for ${metricLabel}.<br>${missing ? `${missing} configurations lack this P90 metric or total throughput.` : 'Choose a different model, workload, or filter; enable a series in the legend.'}</div>`}
-          <div class="ex-caption"><span>Click a point to inspect its measurements and CI run.</span></div>
+          ${visible.length ? '<div class="ex-chart"><canvas id="ex-chart" role="img" aria-label="Scatter plot of total throughput per GPU versus P90 interactivity. Each point is labeled with its concurrency. All values are available in the measurement table below."></canvas></div>'
+            : `<div class="ex-empty">No points available for ${metricLabel}.<br>${missing ? `${missing} configurations lack this P90 metric or total throughput per GPU.` : 'Choose a different model, workload, or filter; enable a series in the legend.'}</div>`}
+          <div class="ex-caption"><span>c = concurrency · Click a point for measurements and CI run.</span></div>
         </div>
         <aside class="ex-sidebar" aria-label="Chart controls and configuration details">
           <div>
@@ -519,7 +558,7 @@ function renderAtomeshPerformanceTab() {
             <p class="ex-count">${visible.length} shown · ${points.length} measured configurations</p>
           </div>
           <div class="ex-inspector">
-            <div class="ex-selection-head"><span id="ex-selection-label">Peak throughput</span><button class="ex-button" id="ex-close-detail" aria-label="Close configuration details" hidden>Reset</button></div>
+            <div class="ex-selection-head"><span id="ex-selection-label">Peak throughput / GPU</span><button class="ex-button" id="ex-close-detail" aria-label="Close configuration details" hidden>Reset</button></div>
             <div class="ex-active-run" id="ex-active-run" aria-label="Selected CI run" aria-live="polite"></div>
             <div class="ex-overview" id="ex-overview">${inspectionMetrics(initialPoint?.row)}</div>
             <aside class="ex-detail" id="ex-detail" aria-label="Selected configuration" aria-live="polite" hidden></aside>
@@ -529,10 +568,10 @@ function renderAtomeshPerformanceTab() {
       <div class="ex-panel-foot"><span>${frontierRows.size} Pareto-optimal configurations · ${escHTML(fmtHardware(selectedHardware()))}</span><span>${metric.key === 'p90_itl' ? '1 / p90(ITL)' : '1 / p90(ITL + TTFT / output tokens)'} · latency in seconds</span></div>
     </section>
     <details class="ex-table-panel"><summary>All measurements <span style="color:var(--text-tertiary)">· ${rows.length} configurations${missing ? ` · ${missing} missing the selected metric` : ''}</span></summary>
-      <div class="ex-table-scroll"><table class="ex-table"><thead><tr><th>Configuration</th><th class="num">GPUs</th><th class="num">Concurrency</th><th class="num">P90 interactivity</th><th class="num">P90 normalized</th><th class="num">Total tok/s</th><th>CI run</th></tr></thead>
-      <tbody>${rows.map((row, idx) => `<tr><td><button class="ex-button" data-ex-row="${idx}">${escHTML(explorerTopology(row))}</button></td><td class="num">${row.totalGpu ?? '—'}</td><td class="num">${row.concurrency ?? '—'}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(row.totalTput, v => fmtNum(v, 2))}</td><td>${explorerRunLink(row)}</td></tr>`).join('')}</tbody></table></div>
+      <div class="ex-table-scroll"><table class="ex-table"><thead><tr><th>Configuration</th><th class="num">GPUs</th><th class="num">Concurrency</th><th class="num">P90 interactivity</th><th class="num">P90 normalized</th><th class="num">Total tok/s/GPU</th><th>CI run</th></tr></thead>
+      <tbody>${rows.map((row, idx) => `<tr><td><button class="ex-button" data-ex-row="${idx}">${escHTML(explorerTopology(row))}</button></td><td class="num">${row.totalGpu ?? '—'}</td><td class="num">${row.concurrency ?? '—'}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(explorerThroughputValue(row), v => fmtNum(v, 2))}</td><td>${explorerRunLink(row)}</td></tr>`).join('')}</tbody></table></div>
     </details>
-    <div class="ex-footer"><span>${sourceUrl ? `<a href="${escHTML(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escHTML(sourceLabel)} ↗</a>` : escHTML(sourceLabel)}${missing ? ` · ${missing} configurations omitted from the chart: P90 metric or throughput unavailable.` : ''}</span><span>Total throughput = input + output tokens / second, across the full configuration.</span></div>`;
+    <div class="ex-footer"><span>${sourceUrl ? `<a href="${escHTML(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escHTML(sourceLabel)} ↗</a>` : escHTML(sourceLabel)}${missing ? ` · ${missing} configurations omitted from the chart: P90 metric or throughput unavailable.` : ''}</span><span>Per-GPU throughput = (input + output tokens / second) / all participating GPUs.</span></div>`;
 
   function updateRunLink(row, isPeak = false) {
     document.getElementById('ex-active-run').innerHTML = row
@@ -544,7 +583,7 @@ function renderAtomeshPerformanceTab() {
     document.getElementById('ex-detail').hidden = true;
     document.getElementById('ex-overview').hidden = false;
     document.getElementById('ex-close-detail').hidden = true;
-    document.getElementById('ex-selection-label').textContent = 'Peak throughput';
+    document.getElementById('ex-selection-label').textContent = 'Peak throughput / GPU';
     selectedRow = initialPoint?.row;
     updateRunLink(selectedRow, true);
     explorerChart?.draw();
@@ -590,9 +629,9 @@ function renderAtomeshPerformanceTab() {
   };
   document.getElementById('ex-csv').addEventListener('click', () => {
     const escape = value => '"' + String(value ?? '').replace(/^[=+@-]/, "'$&").replace(/"/g, '""') + '"';
-    const records = [['model', 'source', 'workload', 'precision', 'serving_mode', 'topology', 'gpus', 'concurrency', 'p90_interactivity_tok_s_user', 'p90_normalized_interactivity_tok_s_user', 'total_throughput_tok_s', 'run_url'],
+    const records = [['model', 'source', 'workload', 'precision', 'serving_mode', 'topology', 'gpus', 'concurrency', 'p90_interactivity_tok_s_user', 'p90_normalized_interactivity_tok_s_user', 'total_throughput_per_gpu_tok_s', 'run_url'],
       ...rows.map(row => [row.model, sourceName(row), row.publicDataset || row.scenario || row.islOsl, row.precision, explorerDeployment(row), explorerTopology(row), row.totalGpu, row.concurrency,
-        explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), row.totalTput, row.runUrl])];
+        explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), explorerThroughputValue(row), row.runUrl])];
     download(new Blob([records.map(record => record.map(escape).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' }), 'atom-benchmark-measurements.csv');
   });
 
@@ -623,6 +662,8 @@ function renderAtomeshPerformanceTab() {
       afterDatasetsDraw(chart) {
         const { ctx, chartArea: area } = chart;
         const labels = [];
+        const dots = datasets.flatMap((dataset, index) => dataset._isFrontier ? [] : chart.getDatasetMeta(index).data);
+        const occupied = dots.map(dot => ({left:dot.x - 7, right:dot.x + 7, top:dot.y - 7, bottom:dot.y + 7}));
         ctx.save();
         datasets.forEach((dataset, index) => {
           if (dataset._isFrontier || !dataset.data.length) return;
@@ -633,23 +674,34 @@ function renderAtomeshPerformanceTab() {
             ctx.strokeStyle = light ? '#42464e' : '#edeef0'; ctx.lineWidth = 1.2; ctx.setLineDash([2, 3]);
             ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
           }
-          // Attach one series label to an interior frontier point, clear of nearby dots.
-          const candidates = elements.filter((_element, i) => frontierRows.has(dataset.data[i].row));
-          const anchor = candidates.reduce((best, element) => !best || Math.abs(element.x - (area.left + area.width * .5)) < Math.abs(best.x - (area.left + area.width * .5)) ? element : best, null);
-          if (!anchor) return;
-          const label = seriesLabel(dataset.label);
-          ctx.font = '600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-          const width = Math.min(ctx.measureText(label).width + 18, area.width - 8), height = 24;
-          const left = Math.min(Math.max(anchor.x + 13, area.left + 4), area.right - width - 4);
-          let top = Math.max(area.top + 4, anchor.y - 38);
-          while (labels.some(box => left < box.right && left + width > box.left && top < box.bottom && top + height > box.top)) top += height + 5;
-          top = Math.min(top, area.bottom - height - 4);
-          labels.push({ left, right: left + width, top, bottom: top + height });
-          ctx.strokeStyle = dataset.borderColor; ctx.lineWidth = 1;
-          ctx.beginPath(); ctx.moveTo(anchor.x, anchor.y - 5); ctx.lineTo(left + 8, top + height); ctx.stroke();
-          ctx.fillStyle = dataset.borderColor; ctx.beginPath(); ctx.roundRect(left, top, width, height, 4); ctx.fill();
-          ctx.fillStyle = light ? '#ffffff' : '#251219'; ctx.textBaseline = 'middle';
-          ctx.fillText(label, left + 9, top + height / 2, width - 18);
+          // Label every measured dot, once; frontier line points are duplicates.
+          // Try nearby positions first, keeping labels inside the plot and clear of dots.
+          ctx.font = '500 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+          ctx.textBaseline = 'middle';
+          elements.forEach((anchor, i) => {
+            const label = `c${dataset.data[i].row.concurrency ?? '—'}`;
+            const width = ctx.measureText(label).width + 8, height = 17;
+            let best = null;
+            for (const distance of [16, 32, 48, 64, 80]) {
+              for (const [dx, dy] of [[0,-1],[1,-1],[1,0],[-1,-1],[-1,0],[0,1],[1,1],[-1,1]]) {
+                const left = Math.max(area.left + 2, Math.min(anchor.x + dx * distance - width / 2, area.right - width - 2));
+                const top = Math.max(area.top + 2, Math.min(anchor.y + dy * distance - height / 2, area.bottom - height - 2));
+                const box = {left, right:left + width, top, bottom:top + height};
+                const overlap = [...occupied, ...labels].reduce((sum, b) => sum + Math.max(0, Math.min(box.right, b.right) - Math.max(box.left, b.left)) * Math.max(0, Math.min(box.bottom, b.bottom) - Math.max(box.top, b.top)), 0);
+                const score = overlap * 1000 + Math.hypot(left + width / 2 - anchor.x, top + height / 2 - anchor.y);
+                if (!best || score < best.score) best = {...box, score};
+              }
+            }
+            labels.push(best);
+            const x = best.left + width / 2, y = best.top + height / 2;
+            if (Math.hypot(x - anchor.x, y - anchor.y) > 24) {
+              ctx.strokeStyle = dataset.borderColor; ctx.globalAlpha = .5; ctx.lineWidth = 1;
+              ctx.beginPath(); ctx.moveTo(anchor.x, anchor.y); ctx.lineTo(x, y); ctx.stroke(); ctx.globalAlpha = 1;
+            }
+            ctx.lineWidth = 4; ctx.strokeStyle = getComputedStyle(chart.canvas).getPropertyValue('--bg-secondary');
+            ctx.strokeText(label, best.left + 4, y);
+            ctx.fillStyle = dataset.borderColor; ctx.fillText(label, best.left + 4, y);
+          });
         });
         ctx.restore();
       },
@@ -671,8 +723,8 @@ function renderAtomeshPerformanceTab() {
             padding: 14, displayColors: false,
             filter: item => !item.dataset._isFrontier,
             callbacks: {
-              title: items => items.length ? `${explorerDeploymentLabel(items[0].raw.row)} · c${items[0].raw.row.concurrency}` : '',
-              label: item => [`Total throughput: ${fmtNum(item.raw.y, 2)} tok/s`, `${metricLabel}: ${fmtNum(item.raw.x, 2)} tok/s/user`, `${explorerTopology(item.raw.row)} · ${item.raw.row.totalGpu ?? '—'} GPUs`],
+              title: items => items.length ? `${explorerDeploymentLabel(items[0].raw.row)} · Concurrency ${items[0].raw.row.concurrency ?? '—'}` : '',
+              label: item => [`Total throughput per GPU: ${fmtNum(item.raw.y, 2)} tok/s/GPU`, `${metricLabel}: ${fmtNum(item.raw.x, 2)} tok/s/user`, `${explorerTopology(item.raw.row)} · ${item.raw.row.totalGpu ?? '—'} GPUs`],
               footer: items => items.some(item => safeHref(item.raw.row.runUrl)) ? 'Click to inspect · CI run available in details' : 'Click to inspect configuration',
             } },
         },
@@ -681,7 +733,7 @@ function renderAtomeshPerformanceTab() {
             title: { display: true, text: `${metricLabel} (tok/s/user)`, color: light ? '#4d5159' : '#d2d3d7', font: { size: 12, weight: '500' }, padding: 15 },
             ticks: { color: light ? '#696f79' : '#b1b3ba', maxTicksLimit: 9, padding: 8, font: { size: 12 } } },
           y: { min: 0, grace: '8%', border: { color: light ? '#989da7' : '#64676e' }, grid: { color: light ? '#dfe3e9' : '#303236', drawTicks: false },
-            title: { display: true, text: 'Total throughput (tok/s)', color: light ? '#4d5159' : '#d2d3d7', font: { size: 12, weight: '500' }, padding: 12 },
+            title: { display: true, text: 'Total throughput per GPU (tok/s/GPU)', color: light ? '#4d5159' : '#d2d3d7', font: { size: 12, weight: '500' }, padding: 12 },
             ticks: { color: light ? '#696f79' : '#b1b3ba', maxTicksLimit: 9, padding: 8, font: { size: 12 }, callback: value => explorerCompact(value) } },
         },
         onHover: (_event, elements, hoveredChart) => { hoveredChart.canvas.style.cursor = elements.some(item => !datasets[item.datasetIndex]._isFrontier) ? 'pointer' : 'default'; },
@@ -708,7 +760,7 @@ function renderAtomeshPerformanceTab() {
       ctx.fillStyle = light ? '#ffffff' : '#18191b'; ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.fillStyle = light ? '#1a1c24' : '#eef0f6'; ctx.font = 'bold 20px sans-serif';
       ctx.fillText(`ATOM · ${state.explorerModel}`, 24, 30);
-      ctx.font = '12px sans-serif'; ctx.fillText(`${sourceLabel} · Total throughput vs. ${metricLabel}`, 24, 53, canvas.width - 48);
+      ctx.font = '12px sans-serif'; ctx.fillText(`${sourceLabel} · Total throughput per GPU vs. ${metricLabel}`, 24, 53, canvas.width - 48);
       ctx.drawImage(chart.canvas, 0, 75);
       for (const { key, x, y } of legend) {
         ctx.fillStyle = colors.get(key);
@@ -717,7 +769,7 @@ function renderAtomeshPerformanceTab() {
         ctx.fillText(seriesLabel(key), x + 15, y, canvas.width - x - 39);
       }
       ctx.fillStyle = light ? '#5c6070' : '#bfc1d0';
-      ctx.fillText(`Line: Pareto frontier · ${sourceUrl || ''}`, 24, legendY + 24, canvas.width - 48);
+      ctx.fillText(`c = concurrency · Line: Pareto frontier · ${sourceUrl || ''}`, 24, legendY + 24, canvas.width - 48);
       canvas.toBlob(blob => { if (blob) download(blob, 'atom-throughput-interactivity.png'); });
     });
   }
@@ -730,16 +782,18 @@ function escHTML(value) { const node = document.createElement('span'); node.text
 function safeHref(url) { return typeof url === 'string' && /^https:\/\//.test(url) ? url : null; }
 const explorerBenchmarkRows = buildExplorerBenchmarkRows(window.BENCHMARK_DATA);
 const hardwareOptions = [...new Set(explorerBenchmarkRows.map(row => row.hardware))].sort(_lc);
-const state = {hardware: hardwareOptions.includes('mi355x') ? 'mi355x' : hardwareOptions[0], explorerModel:'', explorerSource:'ATOM CI', explorerWorkload:'', atomeshIntvtyMetric:'p90_itl', explorerFrontierOnly:true, explorerHidden:new Set()};
+const state = {hardware: hardwareOptions.includes('mi355x') ? 'mi355x' : hardwareOptions[0], explorerModel:'', explorerSource:'ATOM CI', explorerWorkload:'', atomeshIntvtyMetric:'p90_itl', explorerFrontierOnly:true, explorerHidden:new Set(), returnHash:'#mode=Disaggregated'};
 function selectedHardware() { return state.hardware; }
 function syncToHash() {
   const params = new URLSearchParams({hardware:state.hardware || '', explorerModel:state.explorerModel, explorerSource:state.explorerSource, explorerWorkload:state.explorerWorkload, intvty:state.atomeshIntvtyMetric});
   if (!state.explorerFrontierOnly) params.set('frontier','0');
+  params.set('returnHash', state.returnHash);
   const next = '#'+params;
   if (location.hash !== next) history.pushState(null,'',next);
 }
 function readHash() {
   const params = new URLSearchParams(location.hash.slice(1));
+  if (params.get('returnHash')?.startsWith('#')) state.returnHash = params.get('returnHash');
   if (hardwareOptions.includes(params.get('hardware'))) state.hardware = params.get('hardware');
   for (const key of ['explorerModel','explorerSource','explorerWorkload']) state[key] = params.get(key) || (key === 'explorerSource' ? 'ATOM CI' : '');
   state.atomeshIntvtyMetric = params.get('intvty') === 'e2e_normalized' ? 'e2e_normalized' : 'p90_itl';
@@ -747,6 +801,22 @@ function readHash() {
   state.explorerHidden.clear();
   document.getElementById('hardware').value = state.hardware;
 }
+function updateHeader() {
+  const updated = window.BENCHMARK_DATA?.lastUpdate;
+  const hours = Math.max(0, Math.floor((Date.now() - updated) / 3600000));
+  document.getElementById('last-update').textContent = Number.isFinite(hours) ? `Updated ${hours < 1 ? 'just now' : hours < 24 ? hours + 'h ago' : Math.floor(hours / 24) + 'd ago'}` : 'Published CI results';
+  const versions = [...new Set(explorerBenchmarkRows.filter(row => row.hardware === selectedHardware() && explorerModelName(row.model) === state.explorerModel).map(row => row.rocmVersion).filter(Boolean))];
+  const rocm = versions.length === 1 ? versions[0] : '';
+  document.getElementById('header-gpu-meta').textContent = ` · ${fmtHardware(selectedHardware())}${rocm ? ' · ROCm ' + rocm : ''}`;
+  document.getElementById('header-spacer').style.height = document.querySelector('header').offsetHeight + 'px';
+}
+document.getElementById('dashboard-scenario').onchange = event => {
+  if (event.target.value !== 'benchmarks') return;
+  const params = new URLSearchParams(state.returnHash.slice(1));
+  params.set('hardware', selectedHardware());
+  location.href = 'index.html#' + params;
+};
+new ResizeObserver(updateHeader).observe(document.querySelector('header'));
 const hardwareSelect = document.getElementById('hardware');
 for (const hardware of hardwareOptions) hardwareSelect.add(new Option(fmtHardware(hardware),hardware));
 hardwareSelect.onchange = () => { state.hardware = hardwareSelect.value; state.explorerHidden.clear(); renderAtomeshPerformanceTab(); syncToHash(); };
@@ -754,10 +824,10 @@ document.getElementById('reset').onclick = () => { history.pushState(null,'',loc
 document.getElementById('copy-link').onclick = async () => { syncToHash(); try { await navigator.clipboard.writeText(location.href); } catch (_) { document.getElementById('copy-link').textContent = 'Copy the address bar URL'; } };
 function applyTheme(light) {
   document.documentElement.dataset.theme = light ? 'light' : 'dark';
-  document.getElementById('theme-toggle').textContent = light ? 'Dark mode' : 'Light mode';
+  document.getElementById('theme-toggle').setAttribute('aria-pressed', String(light));
 }
-applyTheme(localStorage.getItem('atom-agentic-theme') === 'light');
-document.getElementById('theme-toggle').onclick = () => { const light = document.documentElement.dataset.theme !== 'light'; localStorage.setItem('atom-agentic-theme',light ? 'light' : 'dark'); applyTheme(light); renderAtomeshPerformanceTab(); };
+applyTheme(localStorage.getItem('atom-dash-theme') === 'light');
+document.getElementById('theme-toggle').onclick = () => { const light = document.documentElement.dataset.theme !== 'light'; localStorage.setItem('atom-dash-theme',light ? 'light' : 'dark'); applyTheme(light); renderAtomeshPerformanceTab(); };
 window.addEventListener('hashchange', () => { readHash(); renderAtomeshPerformanceTab(); });
 readHash();
 renderAtomeshPerformanceTab();
