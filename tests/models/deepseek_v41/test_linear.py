@@ -119,18 +119,28 @@ def test_parallel_source_slices_and_scale_alignment(linear_modules, kind):
         module.weight_loader(module.weight, weight)
         module.weight_loader(module.weight_scale, scales)
         module.process_weights_after_loading()
+        shard = weight.chunk(4, axis)[rank].contiguous()
+        scale_shard = scales.chunk(4, axis)[rank]
+        if linear.native_group32_runs_bf16():
+            # gfx94x has no group32 FP8 GEMM: the shard is dequantized once at
+            # load (each value times its 32x32 block's power of two) and the
+            # scales are folded in.
+            block_scale = scale_shard.float().repeat_interleave(32, 0)
+            expected = shard.float() * block_scale.repeat_interleave(32, 1)
+            assert module.weight.dtype == torch.bfloat16
+            assert torch.equal(module.weight.float(), expected.bfloat16().float())
+            assert module.weight_scale is None
+            continue
         # The shard's bytes, (16, 16)-shuffled where the preshuffled group32
         # GEMM reads it (gfx950); the compact scales stay as loaded.
         preshuffled = linear.weight_is_stored_preshuffled(
             module.quant_type, module.params_dtype, native_group_rows=32
         )
-        shard = weight.chunk(4, axis)[rank].contiguous()
         if preshuffled:
             shard = shuffle_weight(shard, layout=(16, 16))
         assert torch.equal(module.weight.view(torch.uint8), shard.view(torch.uint8))
         assert torch.equal(
-            module.weight_scale.view(torch.uint8),
-            scales.chunk(4, axis)[rank].view(torch.uint8),
+            module.weight_scale.view(torch.uint8), scale_shard.view(torch.uint8)
         )
         assert getattr(module.weight, "is_shuffled", False) == preshuffled
 

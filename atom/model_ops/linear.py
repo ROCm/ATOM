@@ -160,6 +160,41 @@ def check_mxfp4_preshuffle_k(prefix: str, weight: torch.Tensor) -> None:
         )
 
 
+def native_group32_runs_bf16() -> bool:
+    """Whether native E4M3/E8M0 group32 linears run as BF16 on this GPU.
+
+    gfx94x has no microscaling MFMA, and AITER's group32 FP8 GEMM asserts
+    gfx950. There the 32x32 / 1x32 FP8 weights are dequantized once at load
+    and the GEMM runs in BF16 (hipBLASLt via tgemm).
+    """
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx().startswith("gfx94")
+
+
+def _e8m0_to_float(code: torch.Tensor) -> torch.Tensor:
+    return torch.exp2(code.view(torch.uint8).float() - 127.0)
+
+
+def dequantize_native_group32_weight(
+    weight: torch.Tensor, weight_scale: torch.Tensor, group_rows: int
+) -> torch.Tensor:
+    """FP8 [N, K] with E8M0 [ceil(N/group_rows), K/32] scales -> BF16 [N, K]."""
+    n, k = weight.shape
+    scale = _e8m0_to_float(weight_scale)
+    scale = scale.repeat_interleave(group_rows, 0)[:n].repeat_interleave(32, 1)[:, :k]
+    return (weight.float() * scale).to(torch.bfloat16)
+
+
+def dequantize_group32_activation(
+    x: torch.Tensor, x_scale: torch.Tensor
+) -> torch.Tensor:
+    """FP8 activations with row-major 1x32 E8M0 scales -> BF16, same shape."""
+    from atom.model_ops.blockscale import dequantize_fp8
+
+    return dequantize_fp8(x, x_scale)
+
+
 def _is_mxfp4(quant_type, quant_dtype) -> bool:
     # By value: plugin-mode QuantType members do not compare equal under `==`.
     return (
@@ -1341,6 +1376,22 @@ class LinearBase(nn.Module):
         # A native group32 weight keeps its compact scales, and its bytes too
         # unless it is one the preshuffled group32 GEMM reads.
         if self.native_a8_group_rows is not None:
+            if (
+                self.weight.numel()
+                and self.weight.dtype == torch.float8_e4m3fn
+                and native_group32_runs_bf16()
+            ):
+                # gfx94x: no group32 FP8 GEMM, keep the dequantized BF16 weight
+                # instead. The scales are folded in, so drop them.
+                self.weight = atom_parameter(
+                    dequantize_native_group32_weight(
+                        self.weight.data,
+                        self.weight_scale.data,
+                        self.native_a8_group_rows,
+                    )
+                )
+                self.weight_scale = None
+                return
             if self.weight.numel() and weight_is_stored_preshuffled(
                 self.quant_type,
                 self.params_dtype,
@@ -1601,7 +1652,16 @@ class LinearBase(nn.Module):
             "Linear out= requested but this quant path does not support it "
             f"(quant_type={self.quant_type})."
         )
-        if self.native_a8_group_rows is not None:
+        if (
+            self.native_a8_group_rows is not None
+            and self.weight.dtype == torch.bfloat16
+        ):
+            # gfx94x BF16 fallback of a native group32 linear; an upstream fused
+            # quant may still hand over FP8 activations with 1x32 E8M0 scales.
+            if x_scale is not None:
+                x = dequantize_group32_activation(x, x_scale)
+            y = tgemm.mm(x, self.weight, self.bias, otype=otype)
+        elif self.native_a8_group_rows is not None:
             from atom.model_ops.blockscale import native_quant_linear
 
             y = native_quant_linear(

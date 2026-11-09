@@ -40,7 +40,7 @@ from atom.utils import envs
 from .attention import Attention
 from .config import build_attention_topology
 from .layers import native_quant_config
-from .model import Block, DeepseekV41ForCausalLM
+from .model import Block, DeepseekV41ForCausalLM, install_v41_quant_lookup
 
 logger = logging.getLogger("atom")
 
@@ -170,8 +170,12 @@ class DeepseekV41DSpark(DSparkDraftModel):
         draft = copy(args)
         draft.n_routed_experts = args.dspark_n_routed_experts
         draft.num_experts_per_tok = args.dspark_num_experts_per_tok
-        self.moe_quant_config = make_v4_quant_config(
-            draft, online_quant_config=getattr(config, "online_quant_config", None)
+        # The backbone's lookup rules too: the shared-expert pin and an online
+        # pattern for the routed experts reach the draft's stages alike.
+        self.moe_quant_config = install_v41_quant_lookup(
+            make_v4_quant_config(
+                draft, online_quant_config=getattr(config, "online_quant_config", None)
+            )
         )
         topology = build_attention_topology(args)[args.num_hidden_layers :]
         # The backbone's, handed down: the two models never run at once, so a
@@ -390,7 +394,16 @@ class DeepseekV41DSpark(DSparkDraftModel):
             for s in shards
         }
         (group_rows, _, width, preshuffled), *others = layouts
-        if others or group_rows is None or any(s.bias is not None for s in shards):
+        # Where the native group32 linears run as dequantized BF16 (gfx94x)
+        # there are no FP8 weights and scales to fuse for `native_quant_linear`;
+        # the per-stage path projects through each stage's own linear.
+        bf16 = any(s.weight.dtype == torch.bfloat16 for s in shards)
+        if (
+            others
+            or group_rows is None
+            or bf16
+            or any(s.bias is not None for s in shards)
+        ):
             fused = None
         else:
             fused = (

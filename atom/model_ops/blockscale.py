@@ -17,6 +17,7 @@ from .blockscale_kernels.blockscale_gemm import (
 )
 from .blockscale_kernels.quantization import (
     FP8_DTYPE,
+    dequantize_fp8_kernel,
     quantize_fp4_kernel,
     quantize_fp8_kernel,
 )
@@ -73,6 +74,21 @@ def quantize_fp8(x: torch.Tensor, *, dequantize: bool = False):
             dequantize,
         )
     return output if dequantize else (output, scales)
+
+
+def dequantize_fp8(
+    x: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype = torch.bfloat16
+) -> torch.Tensor:
+    """`quantize_fp8`'s inverse in one launch: E4M3 values with row-major 1x32
+    E8M0 scales (``[..., K // 32]``) -> ``dtype``, same shape as ``x``."""
+    x = x.contiguous()
+    scales = scales.contiguous().view(torch.uint8)
+    if x.shape[-1] % 32 or scales.numel() * 32 != x.numel():
+        raise ValueError("Expected one 1x32 E8M0 scale per 32 values")
+    y = torch.empty(x.shape, device=x.device, dtype=dtype)
+    if x.numel():
+        dequantize_fp8_kernel[(triton.cdiv(x.numel(), 1024),)](x, scales, y, x.numel())
+    return y
 
 
 def quantize_fp4(

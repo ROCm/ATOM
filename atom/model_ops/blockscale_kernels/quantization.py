@@ -101,6 +101,20 @@ def quantize_fp8_kernel(X, Y, S, SIZE, DEQUANT: tl.constexpr):
 
 
 @triton.jit
+def dequantize_fp8_kernel(X, S, Y, SIZE):
+    # `quantize_fp8_kernel`'s inverse: E4M3 rows with row-major 1x32 E8M0 codes,
+    # 32 groups a program, the scale rebuilt the same way it was made.
+    groups = tl.program_id(0) * 32 + tl.arange(0, 32)
+    offsets = groups[:, None] * 32 + tl.arange(0, 32)[None, :]
+    code = tl.load(S + groups, groups < SIZE // 32, other=0).to(tl.uint32)
+    scale = (code << 23).to(tl.float32, bitcast=True)
+    # No `other`: an FP8 pointer takes no integer fill, and masked lanes are
+    # never stored.
+    x = tl.load(X + offsets, offsets < SIZE).to(tl.float32)
+    tl.store(Y + offsets, (x * scale[:, None]).to(Y.dtype.element_ty), offsets < SIZE)
+
+
+@triton.jit
 def quantize_fp4_kernel(
     X,
     Y,

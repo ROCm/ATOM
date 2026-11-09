@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Full-layer eager text backbone. Checkpoint I/O and request preparation live outside."""
 
+import fnmatch
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import ClassVar
@@ -35,6 +36,58 @@ from .attention import Attention
 from .config import build_attention_topology
 from .layers import native_quant_config
 from .moe import MoE
+
+
+def install_v41_quant_lookup(cfg):
+    """V4.1's MoE quantization lookup over V4's, for the backbone and the draft.
+
+    - The shared expert is native FP8 32x32 like the attention projections.
+      The generic parser resolves it to `dtypes.fp8`, which is E4M3FNUZ on
+      gfx94x and so misses the native group32 path there; it is pinned to the
+      spec the attention linears use (identical to the parsed one on gfx950),
+      unless an online config names it (a pattern, or a global one), as in V4.
+    - V4 pins the routed experts to their checkpoint FP4 on the online lookup
+      too, so `--online_quant_config` never reaches them. Here an explicit
+      online pattern for the routed experts (e.g. ptpc_fp8 on gfx94x, which has
+      no FP4 MFMA) is honoured; without one nothing changes.
+    """
+    v4_lookup = cfg.get_layer_quant_config
+    shared_spec = native_quant_config().global_spec
+    generic_lookup = type(cfg).get_layer_quant_config.__get__(cfg)
+
+    def _online_pattern_matches(layer_name):
+        return any(
+            fnmatch.fnmatch(layer_name, p) if "*" in p else layer_name in p
+            for p, _ in cfg.online_layer_pattern_specs
+        )
+
+    def _lookup(layer_name, use_online_quant=False, *, check_children=False):
+        if ".shared_experts" in layer_name:
+            raw = cfg.online_quant_config_raw
+            if use_online_quant and (
+                (isinstance(raw, dict) and raw.get("global_quant_config"))
+                or _online_pattern_matches(layer_name)
+            ):
+                return v4_lookup(
+                    layer_name, use_online_quant=True, check_children=check_children
+                )
+            return shared_spec
+        if (
+            use_online_quant
+            and ".ffn.experts" in layer_name
+            and _online_pattern_matches(layer_name)
+        ):
+            return generic_lookup(
+                layer_name, use_online_quant=True, check_children=check_children
+            )
+        return v4_lookup(
+            layer_name,
+            use_online_quant=use_online_quant,
+            check_children=check_children,
+        )
+
+    cfg.get_layer_quant_config = _lookup
+    return cfg
 
 
 class Block(nn.Module):
@@ -258,8 +311,8 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         # One shared configuration owns all expert source/online quantization
         # rules. Native attention and Engram projections own their A8 layouts.
-        self.moe_quant_config = make_v4_quant_config(
-            config, online_quant_config=online_quant_config
+        self.moe_quant_config = install_v41_quant_lookup(
+            make_v4_quant_config(config, online_quant_config=online_quant_config)
         )
         # A stream earns a hardware queue only where two branches are live at
         # once -- overlapping lifetimes, not independent data. One per model

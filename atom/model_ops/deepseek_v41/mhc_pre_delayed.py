@@ -26,6 +26,7 @@ from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
     mhc_fused_post_pre_delayed_rmsnorm,
 )
 
+from atom.model_ops.deepseek_v41.mhc_seam_triton import mhc_seam_triton
 from atom.utils import envs
 
 # Archs with HIP Mega-MHC kernels.
@@ -205,7 +206,12 @@ def v41_mhc_pre_delayed(
     *outer, hc_mult, hidden = residual.shape
     rows = residual.numel() // (hc_mult * hidden)
     with_post = sublayer_output is not None
-    kernel = mhc_fused_post_pre_delayed_rmsnorm
+    # gfx94x: AITER's Triton seam with the column-parallel reduce (mhc_seam_triton).
+    kernel = (
+        mhc_seam_triton
+        if get_gfx_runtime().startswith("gfx94")
+        else mhc_fused_post_pre_delayed_rmsnorm
+    )
     options = {}
     if fuse_quant and not w_preshuffle_bf16:
         raise ValueError("Fused mHC quantization requires the HIP backend")

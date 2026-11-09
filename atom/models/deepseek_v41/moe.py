@@ -23,11 +23,19 @@ expert dispatch, quantization, shared overlap and combination stay in V4.
 The shared expert stays its own module rather than taking a routed slot: both
 are scaled per 1x32, but the shared one is FP8 where the routed ones are FP4,
 and one buffer holds one dtype. V4's checkpoints are the same pair, so there is
-no fused variant to inherit.
+no fused variant to inherit. gfx94x is the exception: there the routed experts
+are re-quantized to per-channel FP8 at load, and `_SharedExpertFold` moves the
+shared expert into the same buffers after loading
+(`ATOM_DSV41_FOLD_SHARED_EXPERT`).
 """
 
+import weakref
+
 import torch
+from aiter import QuantType, dtypes, get_hip_quant
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.shuffle import shuffle_weight
+from torch import nn
 
 from atom.model_ops.deepseek_v41.router import (
     router_logits as fixed_order_router_logits,
@@ -38,7 +46,73 @@ from atom.model_ops.topK import mm_topk
 from atom.model_ops.utils import atom_parameter
 from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
+
+
+class _SharedExpertFold(nn.Module):
+    """gfx94x: fold the shared expert into the routed experts' FP8 buffers.
+
+    There the routed experts are online-quantized to per-channel FP8 and run by
+    the clamped Triton MoE, and the shared expert -- the same shape per rank
+    (inter / TP) and the same clamped SwiGLU -- is four launches of its own
+    (gate_up GEMM, act, down GEMM, add). Folded in as expert `E` with weight 1
+    on every row, it costs the MoE one more expert's weights instead. Its
+    weights go from the checkpoint's 32x32-block FP8 (BF16 on gfx94x) to the
+    routed experts' per-channel FP8, and its input to their per-token FP8.
+
+    A child registered after `shared_experts`: the loader's pre-order
+    post-processing reaches it once both the routed experts are FP8 and the
+    shared expert's linears are BF16.
+    """
+
+    def __init__(self, moe):
+        super().__init__()
+        object.__setattr__(self, "_moe", weakref.ref(moe))
+
+    def process_weights_after_loading(self):
+        moe = self._moe()
+        experts, shared = moe.experts, moe.shared_experts
+        if shared is None or not getattr(
+            experts.quant_method, "ptpc_clamp_triton", False
+        ):
+            return
+        w13, w2 = shared.gate_up_proj.weight.data, shared.w2.weight.data
+        num_experts, n1, hidden = experts.w13_weight.shape
+        if (
+            w13.dtype != torch.bfloat16
+            or w2.dtype != torch.bfloat16
+            or tuple(w13.shape) != (n1, hidden)
+            or tuple(w2.shape) != tuple(experts.w2_weight.shape[1:])
+        ):
+            return
+        quant = get_hip_quant(QuantType.per_Token)
+        q13, s13 = quant(w13, quant_dtype=dtypes.fp8)
+        q2, s2 = quant(w2, quant_dtype=dtypes.fp8)
+        assert q13.dtype == experts.w13_weight.dtype == experts.w2_weight.dtype
+        # The FlyDSL backend reads (16, 16)-preshuffled experts; each expert is
+        # shuffled on its own, so the shared one joins in the same layout.
+        shuffled = getattr(experts.w13_weight, "is_shuffled", False)
+        if shuffled:
+            q13 = shuffle_weight(q13, layout=(16, 16))
+            q2 = shuffle_weight(q2, layout=(16, 16))
+        experts.w13_weight = atom_parameter(
+            torch.cat([experts.w13_weight.data, q13[None]])
+        )
+        experts.w13_weight_scale = atom_parameter(
+            torch.cat([experts.w13_weight_scale.data, s13.reshape(1, -1).float()])
+        )
+        experts.w2_weight = atom_parameter(
+            torch.cat([experts.w2_weight.data, q2[None]])
+        )
+        experts.w13_weight.is_shuffled = experts.w2_weight.is_shuffled = shuffled
+        experts.w2_weight_scale = atom_parameter(
+            torch.cat([experts.w2_weight_scale.data, s2.reshape(1, -1).float()])
+        )
+        experts.ptpc_shared_slot = num_experts
+        moe.shared_experts = None
+        # Nothing is left to overlap with the routed experts on `alt_stream`.
+        moe._use_dual_stream = False
 
 
 @torch_compile_guard(mutates_args=["output"], gen_fake=lambda output: None)
@@ -64,6 +138,13 @@ class MoE(V4MoE):
         args.quant_config = quant_config
         args.moe_fp8_activations = True
         super().__init__(layer_id, args, prefix=prefix, alt_stream=alt_stream)
+        # Registered after `shared_experts`; it folds only where the routed
+        # experts run the clamped FP8 Triton MoE (see `_SharedExpertFold`).
+        if (
+            getattr(self, "shared_experts", None) is not None
+            and envs.ATOM_DSV41_FOLD_SHARED_EXPERT
+        ):
+            self.shared_fold = _SharedExpertFold(self)
         self.gate.bias_vl = atom_parameter(
             torch.empty(args.n_routed_experts, dtype=torch.float32)
         )

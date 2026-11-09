@@ -474,6 +474,25 @@ def dequant_mxfp8(
     return y.reshape(M, K).to(out_dtype)
 
 
+def dequant_mxfp4(
+    x: torch.Tensor, s: torch.Tensor, block_size: int = 32
+) -> torch.Tensor:
+    """Dequantize an MXFP4 weight (E2M1 packed two per byte, low nibble first,
+    with a 1x32 E8M0 scale) to the default float dtype. Exact: every E2M1
+    value times a power of two is representable in BF16."""
+    from aiter.utility import fp4_utils
+
+    assert x.dim() == 2 and s.dim() == 2, "Input tensors must have 2 dimensions"
+    M = x.shape[0]
+    K = x.shape[1] * 2
+    n_blocks = K // block_size
+    assert s.shape == (M, n_blocks), f"scale shape {tuple(s.shape)} != {(M, n_blocks)}"
+    y = fp4_utils.mxfp4_to_f32(x.view(torch.uint8)).reshape(M, n_blocks, block_size)
+    scale = torch.exp2(s.view(torch.uint8).to(torch.float32) - 127.0)
+    y = y * scale.unsqueeze(-1)
+    return y.reshape(M, K).to(torch.get_default_dtype())
+
+
 def dequant_per_channel_fp8(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     """Dequantize a per-output-channel (per_Token / PTPC) FP8 weight to the
     default float dtype.
@@ -527,6 +546,11 @@ def can_dequant_weight_online(
     """Return whether the online path can dequantize this source."""
     if source_quant_type == QuantType.No:
         return True
+    if (
+        source_quant_type == QuantType.per_1x32
+        and source_quant_dtype == torch.float4_e2m1fn_x2
+    ):
+        return True
     if source_quant_dtype is not None and source_quant_dtype not in _FP8_SOURCE_DTYPES:
         return False
     return source_quant_type in (
@@ -574,6 +598,14 @@ def dequant_weight_online(
     """
     if source_quant_type == QuantType.No:
         return weight
+
+    # MXFP4 (E2M1 + 1x32 E8M0): a checkpoint format that has to be converted
+    # where the GPU has no FP4 MFMA (gfx94x), e.g. V4.1's routed experts.
+    if (
+        source_quant_type == QuantType.per_1x32
+        and source_quant_dtype == torch.float4_e2m1fn_x2
+    ):
+        return dequant_mxfp4(weight, weight_scale)
 
     # Reject any non-8-bit source up front. The element dtype -- not just the
     # block layout -- decides whether we can dequantize: MXFP4 (fp4x2) shares

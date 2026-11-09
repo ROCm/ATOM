@@ -324,6 +324,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # moe_gemm_a16w4 / a4w4 / a8w4 path. Defaults to on for gfx94x, and for
     # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    # gfx94x per-token FP8 experts with a SwiGLU clamp (DeepSeek-V4/V4.1 routed
+    # experts after online ptpc_fp8): run the clamped Triton experts
+    # (atom/model_ops/fused_moe_ptpc_clamp.py). aiter's asm per-token FP8 MoE
+    # there ignores swiglu_limit; 0 selects it anyway, for A/B only.
+    "ATOM_FP8_MOE_CLAMP_TRITON": lambda: (
+        os.getenv("ATOM_FP8_MOE_CLAMP_TRITON", "1") == "1"
+    ),
+    # Run those clamped per-token FP8 experts on AITER's gfx942 FlyDSL MoE
+    # (preshuffled weights) instead of the Triton kernels. Opt-in: it needs an
+    # AITER whose gfx9 FP8 Gate/Up clamps the SiLU path by swiglu_limit and
+    # offsets expert weights in 64 bits; an older one computes unclamped SiLU
+    # and, past 2^31 weight bytes before an expert, reads the wrong expert.
+    "ATOM_FP8_MOE_FLYDSL": lambda: os.getenv("ATOM_FP8_MOE_FLYDSL", "0") == "1",
     # Qwen3.8-Flash-Next eager prefill on SGLang-ATOM: run QSA sparse attention
     # with aiter's FlyDSL kernel (gfx942, BF16 D256, one KV head per rank)
     # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel. On by
@@ -650,6 +663,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DSpark, ...: `mono/hi_gate.py`), any other keeps ATOM's mono path; "1":
     # on, or an error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
+    # DeepSeek-V4.1 on gfx94x: fold the shared expert into the routed experts'
+    # per-channel FP8 buffers (one more expert in the clamped Triton MoE instead
+    # of its own four launches). Its weights become per-channel FP8 and its input
+    # per-token FP8, as the routed experts' are. 0 keeps it a BF16 module.
+    "ATOM_DSV41_FOLD_SHARED_EXPERT": lambda: (
+        os.getenv("ATOM_DSV41_FOLD_SHARED_EXPERT", "1") == "1"
+    ),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
