@@ -3675,14 +3675,41 @@ class ModelRunner:
                 )
                 if target_token_ids.numel() and get_tp_group().world_size > 1:
                     target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
-            bonus_token_ids = self.sampler(
-                logits=bonus_logits,
-                temperatures=temperatures,
-                top_ks=top_ks,
-                top_ps=top_ps,
-                all_greedy=all_greedy,
-                needs_independent_noise=needs_independent_noise or not all_greedy,
-            )
+            bonus_ready = None
+            if prob_src is not None:
+                # The bonus draw does not depend on verification, and
+                # verification reads it only in its last kernel: issue it on a
+                # side stream so it overlaps the verification passes. Host
+                # call order (and so the generator's offsets) is unchanged.
+                main_stream = torch.cuda.current_stream()
+                side = self.__dict__.get("_bonus_sample_stream")
+                if side is None:
+                    side = self._bonus_sample_stream = torch.cuda.Stream()
+                side.wait_stream(main_stream)
+                with torch.cuda.stream(side):
+                    bonus_token_ids = self.sampler(
+                        logits=bonus_logits,
+                        temperatures=temperatures,
+                        top_ks=top_ks,
+                        top_ps=top_ps,
+                        all_greedy=all_greedy,
+                        needs_independent_noise=needs_independent_noise
+                        or not all_greedy,
+                    )
+                    bonus_ready = torch.cuda.Event()
+                    bonus_ready.record(side)
+                bonus_logits.record_stream(side)
+                temperatures.record_stream(side)
+                bonus_token_ids.record_stream(main_stream)
+            else:
+                bonus_token_ids = self.sampler(
+                    logits=bonus_logits,
+                    temperatures=temperatures,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    all_greedy=all_greedy,
+                    needs_independent_noise=needs_independent_noise or not all_greedy,
+                )
             if prob_src is not None:
                 from atom.model_ops.dspark_prob_sample import (
                     BLOCK_VERIFY,
@@ -3706,6 +3733,7 @@ class ModelRunner:
                     use_block=BLOCK_VERIFY,
                     tp_group=get_tp_group(),
                     use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER,
+                    bonus_ready=bonus_ready,
                 )
                 if PROB_DEBUG and prob_state.verify_step % PROB_DEBUG == 0:
                     debug_acceptance(

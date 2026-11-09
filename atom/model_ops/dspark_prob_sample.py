@@ -1027,6 +1027,7 @@ def prob_rejection_sample(
     use_block: bool = False,
     tp_group=None,  # required when state.q_tp > 1
     use_custom: bool = True,
+    bonus_ready=None,  # Event: bonus_token_ids produced on another stream
 ) -> tuple[torch.Tensor, torch.Tensor]:
     target_logits = target_logits.contiguous()
     num_rows, vocab = target_logits.shape
@@ -1166,6 +1167,9 @@ def prob_rejection_sample(
         num_warps=_NUM_WARPS,
     )
     resall = gather(res)
+    if bonus_ready is not None:
+        # The bonus draw was issued on a side stream; it is first read here.
+        torch.cuda.current_stream().wait_event(bonus_ready)
     _prob_finish_kernel[(bs,)](
         output,
         verdict,

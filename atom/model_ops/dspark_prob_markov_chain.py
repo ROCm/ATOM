@@ -27,6 +27,14 @@ _BLOCK_V = _markov_stage1.BLOCK_V
 _MAX_BLOCK_ROW = _markov_stage1.MAX_BLOCK_ROW
 _MIN_BLOCK_ROW = _markov_stage1.MIN_BLOCK_ROW
 
+# Batches above this take `_prob_markov_chain_stage1_wide`: 16-row tiles and
+# two 32-column vocab tiles per program. Smaller batches keep the original
+# launch, which is already a single row tile there.
+_WIDE_MIN_ROWS = 16
+_WIDE_BLOCK_ROW = 16
+_WIDE_BLOCK_V = 32
+_WIDE_V_TILES = 2
+
 
 @triton.jit
 def _prob_markov_chain_stage1(
@@ -142,6 +150,120 @@ def _prob_markov_chain_stage1(
 
 
 @triton.jit
+def _prob_markov_chain_stage1_wide(
+    base_ptr,
+    prev_ids_ptr,
+    w1_ptr,
+    w2_ptr,
+    embed_out_ptr,
+    q_out_ptr,
+    temp_ptr,
+    seed_ptr,
+    winner_ptr,
+    num_rows,
+    vocab_size,
+    pos_k,
+    stride_base_row,
+    stride_prev,
+    stride_w1_vocab,
+    stride_embed_row,
+    stride_w2_vocab,
+    stride_q_row,
+    RANK: tl.constexpr,
+    BLOCK_ROW: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    NUM_V_TILES: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    FROM_PACKED: tl.constexpr,
+):
+    """`_prob_markov_chain_stage1` for larger batches (full vocabulary only).
+
+    Small row tiles keep many programs in flight; each program walks
+    NUM_V_TILES consecutive vocab tiles and folds their packed keys before a
+    single atomic. Per element the bias dot (same BLOCK_K accumulation
+    order), fp32 q, Philox counter and Gumbel transform are those of
+    `_prob_markov_chain_stage1`; the key max is order independent.
+    """
+    pid_v = tl.program_id(0)
+    offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
+    row_mask = offs_row < num_rows
+    previous = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
+    if FROM_PACKED:
+        prev = tl.where(previous == 0, 0, ~previous.to(tl.uint32)).to(tl.int64)
+    else:
+        prev = previous
+    if pid_v == 0:
+        offs_r = tl.arange(0, RANK)
+        embed = tl.load(
+            w1_ptr + prev[:, None] * stride_w1_vocab + offs_r[None, :],
+            mask=row_mask[:, None],
+            other=0.0,
+        )
+        tl.store(
+            embed_out_ptr + offs_row[:, None] * stride_embed_row + offs_r[None, :],
+            embed,
+            mask=row_mask[:, None],
+        )
+    temp = tl.load(temp_ptr + offs_row, mask=row_mask, other=1.0)
+    greedy = temp <= _GREEDY_T
+    inv_t = 1.0 / tl.where(greedy, 1.0, temp)
+    seed = tl.load(seed_ptr)
+    best = tl.zeros((BLOCK_ROW,), dtype=tl.uint64)
+    for j in range(NUM_V_TILES):
+        offs_v = (pid_v * NUM_V_TILES + j) * BLOCK_V + tl.arange(0, BLOCK_V)
+        v_mask = offs_v < vocab_size
+        acc = tl.zeros((BLOCK_ROW, BLOCK_V), dtype=tl.float32)
+        for kk in tl.static_range(RANK // BLOCK_K):
+            offs_k = kk * BLOCK_K + tl.arange(0, BLOCK_K)
+            e = tl.load(
+                w1_ptr + prev[:, None] * stride_w1_vocab + offs_k[None, :],
+                mask=row_mask[:, None],
+                other=0.0,
+            )
+            w2 = tl.load(
+                w2_ptr + offs_v[None, :] * stride_w2_vocab + offs_k[:, None],
+                mask=v_mask[None, :],
+                other=0.0,
+            )
+            acc = tl.dot(e, w2, acc)
+        mask2 = row_mask[:, None] & v_mask[None, :]
+        base = tl.load(
+            base_ptr + offs_row[:, None] * stride_base_row + offs_v[None, :],
+            mask=mask2,
+            other=0.0,
+        )
+        z = base.to(tl.float32) + acc
+        tl.store(
+            q_out_ptr + offs_row[:, None] * stride_q_row + offs_v[None, :],
+            z,
+            mask=mask2,
+        )
+        noise_offs = (pos_k * num_rows + offs_row)[:, None] * vocab_size + offs_v[
+            None, :
+        ]
+        g = _gumbel(seed, noise_offs)
+        score = tl.where(greedy[:, None], z, z * inv_t[:, None] + g)
+        vals = tl.where(v_mask[None, :], score, float("-inf"))
+        tile_max = tl.max(vals, axis=1)
+        cand = tl.where(
+            (vals == tile_max[:, None]) & v_mask[None, :], offs_v[None, :], vocab_size
+        )
+        tile_idx = tl.min(cand, axis=1)
+        tile_max = tl.where(tile_max == 0.0, 0.0, tile_max)
+        bits = tile_max.to(tl.uint32, bitcast=True)
+        ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000).to(
+            tl.uint32
+        )
+        key = (ordered.to(tl.uint64) << 32) | (~tile_idx.to(tl.uint32)).to(tl.uint64)
+        # A tile without a valid index contributes no key (as in the chain).
+        key = tl.where(tile_idx < vocab_size, key, 0)
+        best = tl.maximum(best, key)
+    tl.atomic_max(
+        winner_ptr + offs_row, best, mask=row_mask & (best != 0), sem="relaxed"
+    )
+
+
+@triton.jit
 def _finish_prob_markov_chain(
     keys_ptr,
     out_ptr,
@@ -188,7 +310,7 @@ def can_use_prob_markov_chain(base_logits, markov_w1, markov_w2, keys):
     return (
         base_logits.is_cuda
         and base_logits.dtype == torch.bfloat16
-        and 1 <= b <= 32
+        and b >= 1
         and t == 5
         and v == 129280
         and markov_w1.shape == markov_w2.shape == (v, 256)
@@ -252,8 +374,44 @@ def prob_markov_sample_chain(
         )
     block_row = min(_MAX_BLOCK_ROW, max(_MIN_BLOCK_ROW, triton.next_power_of_2(b)))
     num_tiles = triton.cdiv(v, _BLOCK_V)
+    wide = b > _WIDE_MIN_ROWS and rank % _BLOCK_K == 0
     for k in range(t):
         previous = prev_ids if k == 0 else keys[k - 1]
+        if wide:
+            _prob_markov_chain_stage1_wide[
+                (
+                    triton.cdiv(v, _WIDE_BLOCK_V * _WIDE_V_TILES),
+                    triton.cdiv(b, _WIDE_BLOCK_ROW),
+                )
+            ](
+                base_logits[:, k],
+                previous,
+                markov_w1,
+                markov_w2,
+                embed_out[:, k],
+                q_out[:, k],
+                temps,
+                seed,
+                keys[k],
+                b,
+                v,
+                k,
+                stride_base_row=base_logits.stride(0),
+                stride_prev=previous.stride(0),
+                stride_w1_vocab=markov_w1.stride(0),
+                stride_embed_row=embed_out.stride(0),
+                stride_w2_vocab=markov_w2.stride(0),
+                stride_q_row=q_out.stride(0),
+                RANK=rank,
+                BLOCK_ROW=_WIDE_BLOCK_ROW,
+                BLOCK_V=_WIDE_BLOCK_V,
+                NUM_V_TILES=_WIDE_V_TILES,
+                BLOCK_K=_BLOCK_K,
+                FROM_PACKED=k > 0,
+                num_warps=2,
+                num_stages=1,
+            )
+            continue
         _prob_markov_chain_stage1[(num_tiles, triton.cdiv(b, block_row))](
             base_logits[:, k],
             previous,
