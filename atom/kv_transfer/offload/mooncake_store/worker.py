@@ -563,6 +563,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     def _do_save_req(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
         ss = req.save_spec
         assert ss is not None
+        self._pin_in_place_stream()
         t_total0 = time.perf_counter()
         chunk = self.chunk_size
         end = len(req.chunk_hashes or b"") // DIGEST_BYTES
@@ -730,6 +731,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
         ls = req.load_spec
         assert ls is not None
+        self._pin_in_place_stream()
         hbm = int(ls.hbm_cached_tokens)
         lmc = int(ls.lmcache_cached_tokens)
         t_total0 = time.perf_counter()
@@ -889,9 +891,9 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     # -- in-place copies ---------------------------------------------------
     def _in_place_stream(self) -> torch.cuda.Stream:
         """This copy thread's stream for in-place packs and unpacks."""
-        # The forward's stream when it is known, looked up each time: the
-        # runner may move to another.
-        shared = compute_stream()
+        # The forward's stream as pinned when this transfer began
+        # (`_pin_in_place_stream`), so every window of it uses one stream.
+        shared = getattr(self._in_place_tls, "pinned", None)
         if shared is not None:
             return shared
         stream = getattr(self._in_place_tls, "stream", None)
@@ -901,6 +903,12 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             )
             self._in_place_tls.stream = stream
         return stream
+
+    def _pin_in_place_stream(self) -> None:
+        """Pin the stream this thread's coming load or save stages on: the
+        forward's, as it is now. A runner that picks a stream per forward may
+        move on during the transfer; the switch happens between transfers."""
+        self._in_place_tls.pinned = compute_stream()
 
     def _copy_in_place(
         self,

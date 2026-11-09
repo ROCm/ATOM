@@ -123,9 +123,10 @@ class _ThreadTransferState:
         self._pack_stream = None
         self._copy_stream = None
         # With the forward's stream known, both legs run on it, and follow it
-        # if the runner moves to another: `run_staged_pipeline` then skips the
-        # cross-stream handshake entirely.
-        self._follows_compute_stream = use_cuda and compute_stream() is not None
+        # if the runner moves to another, between transfers (`begin_transfer`):
+        # `run_staged_pipeline` then skips the cross-stream handshake entirely.
+        self._pinned_stream = compute_stream() if use_cuda else None
+        self._follows_compute_stream = self._pinned_stream is not None
         if use_cuda and not self._follows_compute_stream:
             priority = load_stream_priority()
             with torch.cuda.device(device):
@@ -133,13 +134,26 @@ class _ThreadTransferState:
                 self._copy_stream = torch.cuda.Stream(priority=priority)
         self.staging_buffer = _StagingBuffer(use_cuda)
 
+    def begin_transfer(self) -> None:
+        """Pin the stream this transfer stages on. A runner that picks a stream
+        per forward (the disaggregated prefill pool) may move on while a transfer
+        runs; the block-ID upload, both stages, the callbacks and the final fence
+        must all use one stream, so the switch happens only here, between
+        completed transfers."""
+        if self._follows_compute_stream:
+            self._pinned_stream = compute_stream() or self._pinned_stream
+
     @property
     def pack_stream(self):
-        return compute_stream() if self._follows_compute_stream else self._pack_stream
+        return (
+            self._pinned_stream if self._follows_compute_stream else self._pack_stream
+        )
 
     @property
     def copy_stream(self):
-        return compute_stream() if self._follows_compute_stream else self._copy_stream
+        return (
+            self._pinned_stream if self._follows_compute_stream else self._copy_stream
+        )
 
     def stream_ctx(self, stream):
         if stream is None:
@@ -225,5 +239,4 @@ def run_staged_pipeline(
             staging_buffer.free_event_valid = False
         raise
     finally:
-        if used_buffer and buffer_safe_to_release and release_buffer is not None:
-            release_buffer(staging_buffer)
+        if used_buffer and buffer_safe_to_release and release_buffer is not N

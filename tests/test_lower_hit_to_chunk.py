@@ -170,3 +170,20 @@ def test_share_cache_accepts_a_pd_multi_connector_with_a_shared_tier():
     cfg.kv_transfer_config = {"kv_connector": "multi", "connectors": [pd]}
     with pytest.raises(ValueError, match="shares"):
         CoreManager._build_store_router(mgr, cfg)
+
+
+def test_a_transfer_keeps_the_stream_it_began_on(monkeypatch):
+    """A runner that moves to another stream mid-transfer must not move the
+    transfer: the switch happens at `begin_transfer`."""
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    monkeypatch.setattr(staging, "_COMPUTE_STREAM", "A")
+    state = staging._ThreadTransferState.__new__(staging._ThreadTransferState)
+    state._pinned_stream = "A"
+    state._follows_compute_stream = True
+    state._pack_stream = state._copy_stream = None
+    assert state.pack_stream == state.copy_stream == "A"
+    staging.set_compute_stream("B")  # a CU-masked prefill picked another stream
+    assert state.pack_stream == state.copy_stream == "A"  # mid-transfer: unchanged
+    state.begin_transfer()
+    assert state.pack_stream == state.copy_stream == "B"
