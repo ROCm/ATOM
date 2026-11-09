@@ -331,7 +331,11 @@ function atomeshPointRow(point, meta, idx) {
   return {
     id: `benchmark-point-${idx}`, model: point.model || 'unknown',
     hardware: atomeshHardwareKey(point.hardware || meta.hardware),
-    sourceLabel: 'ATOM CI',
+    sourceLabel: point.source_label || 'ATOM CI',
+    sourceUrl: point.source_url || '', sourceStatus: point.source_status || '',
+    prNumber: atomeshPointNumber(point, 'pr_number'), prUrl: point.pr_url || '',
+    headSha: point.head_sha || '', runAttempt: atomeshPointNumber(point, 'run_attempt'),
+    sweepRunAttempt: atomeshPointNumber(point, 'sweep_run_attempt'),
     rocmVersion: point.rocm || meta.rocm_version || '',
     disaggregated: point.disaggregated ?? point.disagg ?? null,
     isMultinode: typeof point.is_multinode === 'boolean' ? point.is_multinode : null,
@@ -458,7 +462,7 @@ function renderAtomeshPerformanceTab() {
   Chart.getChart('ex-chart')?.destroy();
   const metric = atomeshInteractivityMetric();
   const metricLabel = metric.key === 'p90_itl' ? 'P90 Interactivity' : 'P90 Normalized Interactivity';
-  const available = explorerBenchmarkRows.filter(row => row.hardware === selectedHardware());
+  const available = [...explorerBenchmarkRows, ...localRows].filter(row => row.hardware === selectedHardware());
   const models = [...new Set(available.map(row => explorerModelName(row.model)))].sort(_lc);
   if (state.explorerModel) state.explorerModel = explorerModelName(state.explorerModel);
   if (!models.includes(state.explorerModel)) {
@@ -468,9 +472,11 @@ function renderAtomeshPerformanceTab() {
   const modelRows = available.filter(row => explorerModelName(row.model) === state.explorerModel);
   const sourceName = row => row.sourceLabel || 'ATOM CI';
   const sources = [...new Set(modelRows.map(sourceName))].sort(_lc);
+  if (sources.length > 1) sources.push('__compare__');
   if (!sources.includes(state.explorerSource)) state.explorerSource = sources[0] || '';
-  const sourceLabel = state.explorerSource;
-  const sourceRows = modelRows;
+  const compareSources = state.explorerSource === '__compare__';
+  const sourceLabel = compareSources ? 'Compare sources' : state.explorerSource;
+  const sourceRows = compareSources ? modelRows : modelRows.filter(row => sourceName(row) === state.explorerSource);
   const workloads = [...new Set(sourceRows.map(explorerWorkloadKey))].sort(_lc);
   if (!workloads.includes(state.explorerWorkload)) {
     state.explorerWorkload = workloads.find(key => sourceRows.some(row => explorerWorkloadKey(row) === key
@@ -483,8 +489,9 @@ function renderAtomeshPerformanceTab() {
   const seriesRows = new Map(rows.map(row => [seriesKey(row), row]));
   const seriesLabel = key => {
     const row = seriesRows.get(key);
+    const origin = sourceName(row).match(/PR #\d+/)?.[0] || sourceName(row).match(/#\d+/)?.[0] || sourceName(row);
     const variant = /eagle3/i.test(row.model) ? ' · Eagle3' : '';
-    return `${fmtHardware(row.hardware)} · ${explorerDeploymentLabel(row)}${variant}`;
+    return `${fmtHardware(row.hardware)} · ${explorerDeploymentLabel(row)}${variant}${compareSources ? ' · ' + origin : ''}`;
   };
   const light = document.documentElement.getAttribute('data-theme') === 'light';
   const palette = light ? { pd: ['#d4385a', '#a34591'], aggregated: ['#326acc', '#16856b'], unknown: ['#69717e'] }
@@ -503,7 +510,9 @@ function renderAtomeshPerformanceTab() {
   const frontierRows = new Set(frontiers.flat().map(point => point.row));
   const visible = points.filter(point => !state.explorerFrontierOnly || frontierRows.has(point.row));
   const missing = rows.filter(row => explorerMetricValue(row, metric) === null || !Number.isFinite(explorerThroughputValue(row)) || explorerThroughputValue(row) <= 0).length;
-  const sourceUrl = 'https://github.com/ROCm/ATOM/actions/workflows/atomesh-benchmark.yaml';
+  const sourceUrl = compareSources ? null : state.explorerSource === 'ATOM CI'
+    ? 'https://github.com/ROCm/ATOM/actions/workflows/atomesh-benchmark.yaml'
+    : safeHref(rows[0]?.sourceUrl || rows[0]?.runUrl);
   const optionHTML = (options, selected, label = x => x) => options.map(option => `<option value="${escHTML(option).replace(/"/g, '&quot;')}" ${option === selected ? 'selected' : ''}>${escHTML(label(option))}</option>`).join('');
   const initialPoint = visible.reduce((best, point) => !best || point.y > best.y
     || (point.y === best.y && point.x > best.x) ? point : best, null);
@@ -514,6 +523,8 @@ function renderAtomeshPerformanceTab() {
     return `<dl class="ex-metric-hero"><dt>Total throughput per GPU</dt><dd>${explorerCompact(explorerThroughputValue(row), 2)} <small>tok/s/GPU</small></dd></dl>
       <dl class="ex-metric-list">
         <div><dt>Engine</dt><dd>${explorerDeploymentLabel(row)}</dd></div>
+        ${row.runAttempt ? `<div><dt>Point attempt</dt><dd>${row.runAttempt}${row.sweepRunAttempt > row.runAttempt ? ' · retained' : ''}</dd></div>` : ''}
+        ${row.prNumber && safeHref(row.prUrl) ? `<div><dt>PR / commit</dt><dd><a href="${escHTML(row.prUrl).replace(/"/g, '&quot;')}" target="_blank" rel="noopener noreferrer">#${row.prNumber}</a>${row.headSha ? ' · ' + escHTML(row.headSha.slice(0, 7)) : ''}</dd></div>` : ''}
         <div><dt>P90 interactivity</dt><dd>${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), v => fmtNum(v, 2))}</dd></div>
         <div><dt>P90 normalized</dt><dd>${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</dd></div>
         <div><dt>Concurrency</dt><dd>${row.concurrency ?? '—'}</dd></div>
@@ -524,11 +535,11 @@ function renderAtomeshPerformanceTab() {
   }
   document.getElementById('agentic-controls').innerHTML = `
     <select class="filter-select" id="ex-model" aria-label="Model">${optionHTML(models, state.explorerModel)}</select>
-    <select class="filter-select" id="ex-source" aria-label="Source">${optionHTML(sources, state.explorerSource)}</select>
+    <select class="filter-select" id="ex-source" aria-label="Source">${optionHTML(sources, state.explorerSource, value => value === '__compare__' ? 'Compare sources' : value)}</select>
     <select class="filter-select" id="ex-workload" aria-label="Workload / precision">${optionHTML(workloads, state.explorerWorkload, explorerWorkloadLabel)}</select>`;
   updateHeader();
   container.innerHTML = `
-    <div class="ex-config-head">Agentic performance <span>Latest published CI result per recipe</span></div>
+    <div class="ex-config-head">Agentic performance <span>${compareSources ? 'Compared sources' : rows.some(row => localRows.includes(row)) ? escHTML(rows[0]?.sourceStatus || 'Local measurements') : 'Latest published CI result per recipe'}</span></div>
     <section class="ex-panel" aria-label="Throughput and interactivity chart">
       <div class="ex-panel-head">
         <div><div class="ex-model-title"><h2>${escHTML(state.explorerModel || 'Inference performance')}</h2><span class="ex-chip">${escHTML((rows[0]?.precision || 'Precision unavailable').toUpperCase())}</span></div><p>Total throughput per GPU vs. ${metricLabel}</p></div>
@@ -571,7 +582,7 @@ function renderAtomeshPerformanceTab() {
       <div class="ex-table-scroll"><table class="ex-table"><thead><tr><th>Configuration</th><th class="num">GPUs</th><th class="num">Concurrency</th><th class="num">P90 interactivity</th><th class="num">P90 normalized</th><th class="num">Total tok/s/GPU</th><th>CI run</th></tr></thead>
       <tbody>${rows.map((row, idx) => `<tr><td><button class="ex-button" data-ex-row="${idx}">${escHTML(explorerTopology(row))}</button></td><td class="num">${row.totalGpu ?? '—'}</td><td class="num">${row.concurrency ?? '—'}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(explorerThroughputValue(row), v => fmtNum(v, 2))}</td><td>${explorerRunLink(row)}</td></tr>`).join('')}</tbody></table></div>
     </details>
-    <div class="ex-footer"><span>${sourceUrl ? `<a href="${escHTML(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escHTML(sourceLabel)} ↗</a>` : escHTML(sourceLabel)}${missing ? ` · ${missing} configurations omitted from the chart: P90 metric or throughput unavailable.` : ''}</span><span>Per-GPU throughput = (input + output tokens / second) / all participating GPUs.</span></div>`;
+    <div class="ex-footer"><span>${sourceUrl ? `<a href="${escHTML(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escHTML(sourceLabel)} ↗</a>` : escHTML(sourceLabel)}${localRows.some(row => rows.includes(row)) ? ' · Local preview' : ''}${!compareSources && rows[0]?.sourceStatus ? ' · ' + escHTML(rows[0].sourceStatus) : ''}${missing ? ` · ${missing} configurations omitted from the chart: P90 metric or throughput unavailable.` : ''}</span><span>Per-GPU throughput = (input + output tokens / second) / all participating GPUs.</span></div>`;
 
   function updateRunLink(row, isPeak = false) {
     document.getElementById('ex-active-run').innerHTML = row
@@ -781,7 +792,9 @@ const fmtNum = (value, digits) => value == null ? '—' : value.toLocaleString(u
 function escHTML(value) { const node = document.createElement('span'); node.textContent = value; return node.innerHTML; }
 function safeHref(url) { return typeof url === 'string' && /^https:\/\//.test(url) ? url : null; }
 const explorerBenchmarkRows = buildExplorerBenchmarkRows(window.BENCHMARK_DATA);
-const hardwareOptions = [...new Set(explorerBenchmarkRows.map(row => row.hardware))].sort(_lc);
+const localRows = (window.ATOM_LOCAL_BENCHMARK?.points || [])
+  .map((point, idx) => atomeshPointRow(point, {}, idx)).filter(isAgenticTraceRow);
+const hardwareOptions = [...new Set([...explorerBenchmarkRows, ...localRows].map(row => row.hardware))].sort(_lc);
 const state = {hardware: hardwareOptions.includes('mi355x') ? 'mi355x' : hardwareOptions[0], explorerModel:'', explorerSource:'ATOM CI', explorerWorkload:'', atomeshIntvtyMetric:'p90_itl', explorerFrontierOnly:true, explorerHidden:new Set(), returnHash:'#mode=Disaggregated'};
 function selectedHardware() { return state.hardware; }
 function syncToHash() {
@@ -805,7 +818,8 @@ function updateHeader() {
   const updated = window.BENCHMARK_DATA?.lastUpdate;
   const hours = Math.max(0, Math.floor((Date.now() - updated) / 3600000));
   document.getElementById('last-update').textContent = Number.isFinite(hours) ? `Updated ${hours < 1 ? 'just now' : hours < 24 ? hours + 'h ago' : Math.floor(hours / 24) + 'd ago'}` : 'Published CI results';
-  const versions = [...new Set(explorerBenchmarkRows.filter(row => row.hardware === selectedHardware() && explorerModelName(row.model) === state.explorerModel).map(row => row.rocmVersion).filter(Boolean))];
+  const headerRows = [...explorerBenchmarkRows, ...localRows].filter(row => row.hardware === selectedHardware() && explorerModelName(row.model) === state.explorerModel && (state.explorerSource === '__compare__' || row.sourceLabel === state.explorerSource));
+  const versions = [...new Set(headerRows.map(row => row.rocmVersion || ''))];
   const rocm = versions.length === 1 ? versions[0] : '';
   document.getElementById('header-gpu-meta').textContent = ` · ${fmtHardware(selectedHardware())}${rocm ? ' · ROCm ' + rocm : ''}`;
   document.getElementById('header-spacer').style.height = document.querySelector('header').offsetHeight + 'px';
