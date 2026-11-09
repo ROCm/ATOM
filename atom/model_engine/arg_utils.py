@@ -608,8 +608,9 @@ class EngineArgs:
             "verification. Off by default; enabling it allocates a "
             "(num_tokens, vocab_size) float32 noise tensor per sampler call "
             "and changes the RNG stream, so identical seeds no longer "
-            "reproduce the default tokens. The top-k/top-p path does not "
-            "honor it yet, and greedy rows never draw noise. Native ATOM "
+            "reproduce the default tokens. The top-k/top-p path already "
+            "draws per-row noise, so the option is inert there by design; "
+            "greedy rows never draw noise. Native ATOM "
             "engine only (vLLM/SGLang plugin paths are unaffected). "
             "Use --no-sampler-independent-noise to state the default "
             "explicitly.",

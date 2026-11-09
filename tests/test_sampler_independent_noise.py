@@ -138,6 +138,56 @@ def test_opt_in_is_seeded_reproducible_and_matches_the_fanout_path(sampler, nois
     assert torch.equal(opt_in, fanout) and torch.equal(opt_in, again)
 
 
+@pytest.mark.parametrize(
+    "always,requested,expected",
+    [
+        # The engine policy is ORed into the per-call request, so the
+        # effective value covers both ways of asking.
+        (False, False, False),
+        (False, True, True),
+        (True, False, True),
+        (True, True, True),
+    ],
+)
+def test_forward_resolves_the_policy_once_for_every_consumer(
+    sampler, monkeypatch, always, requested, expected
+):
+    # ``forward`` is where the per-call request arrives, and where the engine
+    # option is ORed into it. Every consumer of that value must see the same
+    # resolved boolean, filtered or not -- the temperature path today, the
+    # filtered path for symmetry, and the fused unfiltered path a later change
+    # adds as a second consumer.
+    seen = []
+
+    def temperature_sample(self, logits, temperatures, needs_independent_noise=False):
+        seen.append(("temperature", needs_independent_noise))
+        return torch.zeros(logits.shape[0], dtype=torch.int)
+
+    def topk_topp_sample(
+        self, logits, temperatures, top_ks, top_ps, needs_independent_noise=False
+    ):
+        seen.append(("filtered", needs_independent_noise))
+        return torch.zeros(logits.shape[0], dtype=torch.int)
+
+    monkeypatch.setattr(sampler.Sampler, "_temperature_sample", temperature_sample)
+    monkeypatch.setattr(sampler.Sampler, "_topk_topp_sample", topk_topp_sample)
+    monkeypatch.setattr(
+        sampler,
+        "topk_select",
+        lambda probs, k, *, tie: (
+            None,
+            probs.argmax(-1, keepdim=True).to(torch.int32),
+        ),
+    )
+
+    instance = sampler.Sampler(always_independent_noise=always)
+    logits = torch.zeros(3, 8)
+    temperatures = torch.ones(3)
+    instance(logits, temperatures, None, None, needs_independent_noise=requested)
+    instance(logits, temperatures, top_ps=0.9, needs_independent_noise=requested)
+    assert seen == [("temperature", expected), ("filtered", expected)]
+
+
 @pytest.mark.parametrize("always", [False, True])
 def test_greedy_rows_take_the_argmax_whatever_the_option(sampler, noise, always):
     logits = torch.zeros(4, 8)
@@ -161,11 +211,12 @@ def test_all_greedy_does_not_draw_noise(sampler, noise, always):
 
 
 @pytest.mark.parametrize("always", [False, True])
-def test_filtered_sampling_does_not_honor_the_option(
+def test_filtered_sampling_is_inert_whatever_the_option(
     sampler, noise, monkeypatch, always
 ):
-    # The documented scope: top-k/top-p keeps its own per-row RNG and neither
-    # reads nor honors the option, so no exponential noise is drawn.
+    # The documented scope: top-k/top-p already draws per-row noise from
+    # torch's RNG, so the option has nothing to change there by design and no
+    # exponential noise is drawn.
     monkeypatch.setattr(sampler, "AITER_TOPK_TOPP_AVAILABLE", False)
     monkeypatch.setattr(sampler, "_NATIVE_SAMPLING_WARNING_ISSUED", True)
     logits = torch.zeros(4, 8)

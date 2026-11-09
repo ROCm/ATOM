@@ -2115,8 +2115,9 @@ class Config:
     # one row, so ordinary n=1 requests (not only fan-out siblings and
     # speculative verification) are sampled independently. Off by default; the
     # option costs a (num_tokens, vocab_size) float32 allocation per sampler
-    # call and changes the RNG stream. The top-k/top-p path does not honor it
-    # yet, and greedy rows never draw noise. Native ATOM engine only.
+    # call and changes the RNG stream. The top-k/top-p path already draws
+    # per-row noise, so the option is inert there by design; greedy rows never
+    # draw noise. Native ATOM engine only.
     sampler_independent_noise: bool = False
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
     throughput_log_interval: float = 10.0

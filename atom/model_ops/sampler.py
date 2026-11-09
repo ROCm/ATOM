@@ -70,9 +70,12 @@ class Sampler(nn.Module):
         Args:
             always_independent_noise: Use per-row exponential noise for
                 unfiltered stochastic sampling even when the caller does not
-                request it (``--sampler-independent-noise``). False preserves
-                the shared-row policy. The top-k/top-p path does not honor it,
-                and all-greedy batches never draw noise.
+                request it (``--sampler-independent-noise``). ``forward`` ORs
+                it into the per-call request once, so every consumer reads one
+                effective value. False preserves the shared-row policy. The
+                top-k/top-p path already draws per-row noise, so the option is
+                inert there by design (not a gap to close), and all-greedy
+                batches never draw noise.
         """
         super().__init__()
         self.eps = SAMPLER_EPS
@@ -138,16 +141,23 @@ class Sampler(nn.Module):
             top_ps: Uniform CPU scalar or per-token tensor; 1.0 means disabled
             all_greedy: True if all requests use greedy sampling (checked on CPU)
             needs_independent_noise: True when the batch contains fan-out
-                siblings (SamplingParams.n>1). Forces fresh per-row random
-                exponential noise so sibling sequences with identical logits
-                are sampled independently. Adds an O(bs * vocab_size)
-                allocation, so only enabled when actually needed;
-                ``Sampler(always_independent_noise=True)`` also enables it for
-                every unfiltered stochastic batch.
+                siblings (SamplingParams.n>1). ORed here, once, with the
+                sampler policy (``always_independent_noise``), so every
+                consumer below reads one effective value and the opt-in also
+                reaches callers that do not pass the argument. Adds an
+                O(bs * vocab_size) allocation on the unfiltered temperature
+                path.
 
         Returns:
             Sampled token IDs (num_tokens,)
         """
+        # Resolve the engine-wide opt-in once: every consumer below (the
+        # temperature and filtered paths, and any fused path added later)
+        # reads this value instead of each ORing the policy for itself.
+        needs_independent_noise = (
+            needs_independent_noise or self.always_independent_noise
+        )
+
         # Every path starts here: an all-greedy batch is an argmax whatever its
         # filters. `tie="low"` is what makes this the pick `torch.argmax` made:
         # the default promises no direction among equal scores, so a tie would
@@ -192,22 +202,22 @@ class Sampler(nn.Module):
     ) -> torch.Tensor:
         """Temperature-based Gumbel-max sampling.
 
-        When ``needs_independent_noise`` is True the per-row exponential noise
-        tensor is freshly drawn with shape ``(num_tokens, vocab_size)`` so that
-        fan-out siblings produced by ``SamplingParams.n > 1`` diverge instead
-        of collapsing onto the same token when they share logits. The same
-        happens for every call when the sampler was built with
-        ``always_independent_noise``. Otherwise one fresh ``(1, vocab_size)``
-        row is drawn and broadcast with stride 0, so every row of that call
-        uses the same noise.
+        ``needs_independent_noise`` is the effective value ``forward``
+        resolved from the per-call request and the sampler-wide option. When
+        it is True the per-row exponential noise tensor is freshly drawn with
+        shape ``(num_tokens, vocab_size)`` so that fan-out siblings produced
+        by ``SamplingParams.n > 1`` diverge instead of collapsing onto the
+        same token when they share logits; the opt-in
+        (``always_independent_noise``) arrives through this same argument, so
+        a caller that reaches this method directly gets exactly what it
+        passes. Otherwise one fresh ``(1, vocab_size)`` row is drawn and
+        broadcast with stride 0, so every row of that call uses the same
+        noise.
 
         Both branches materialize the noise in torch and score it with AITER's
         ``mixed_sample_outer_exponential``. AITER's in-kernel ``mixed_sample``
         is not used here, see #2928.
         """
-        needs_independent_noise = (
-            needs_independent_noise or self.always_independent_noise
-        )
         num_tokens, vocab_size = logits.shape
         sampled_tokens = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
         if needs_independent_noise:
@@ -233,14 +243,17 @@ class Sampler(nn.Module):
     ) -> torch.Tensor:
         """Top-K/Top-P sampling with temperature scaling.
 
-        The top-k/top-p paths below use ``torch.multinomial`` (native fallback)
-        or aiter's sampling ops that draw from torch's default RNG stream per
-        batch row, so fan-out siblings already diverge naturally and the
-        ``needs_independent_noise`` flag is accepted purely for API symmetry.
-        The ``always_independent_noise`` sampler option does not apply here
-        either: this path neither reads nor honors it.
+        This path already draws per-row noise: ``torch.multinomial`` over
+        ``[n, V]`` probs (the native fallback and the top-k-only branch),
+        aiter's ``top_k_top_p_sampling_from_probs`` /
+        ``top_p_sampling_from_probs``, or ``random_sample``'s
+        ``torch.empty_like(probs).exponential_(1)``. Fan-out siblings
+        therefore diverge here already, and the sampler-wide
+        ``always_independent_noise`` option has nothing to change. The
+        resolved flag arrives only because ``forward`` hands one value to
+        every consumer; it is inert here by design, not a gap to close later.
         """
-        # Accepted but unused here; see docstring.
+        # Per-row by construction; the resolved flag is not needed here.
         del needs_independent_noise
         # Apply temperature scaling
         # Temperatures are pre-clamped to eps in model_runner.prepare_sample()
