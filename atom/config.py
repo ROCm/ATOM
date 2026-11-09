@@ -1690,13 +1690,13 @@ class DSparkConfig:
     disable_sps_calib: bool = False
     # Explicit offline measurements; compatibility is checked before use.
     calibration_profile: str | None = None
-    # Experimental native V4.1 draft window precision. Auto retains the
-    # existing BF16/MXFP8 window, independently of target CSA precision.
+    # Native V4.1 draft attention: fp8 reads MXFP8 windows with OPUS A8W8;
+    # auto retains the existing BF16 path, independently of target CSA precision.
     draft_kv_dtype: str = "auto"
 
     def __post_init__(self):
-        if self.draft_kv_dtype not in ("auto", "fp8", "fp4"):
-            raise ValueError("DSpark draft_kv_dtype must be auto, fp8 or fp4")
+        if self.draft_kv_dtype not in ("auto", "fp8"):
+            raise ValueError("DSpark draft_kv_dtype must be auto or fp8")
         if self.calibration_profile is not None and (
             not isinstance(self.calibration_profile, str)
             or not self.calibration_profile
@@ -1710,7 +1710,7 @@ class DSparkConfig:
         if self.draft_kv_dtype == "auto":
             return
         spec = config.speculative_config
-        target_dtypes = ("fp4",) if self.draft_kv_dtype == "fp4" else ("fp8", "fp4")
+        target_dtypes = ("fp8", "fp4")
         if (
             config.hf_config.model_type != "deepseek_v41_text"
             or config.kv_cache_dtype not in target_dtypes

@@ -154,22 +154,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.config.engram_max_ngram_size - 1,
             kv_dtype=model_runner.config.kv_cache_dtype,
             speculative_tokens=num_drafts,
-            fp4_window_layers=(
-                tuple(
-                    range(
-                        len(topology),
-                        len(topology) + self.config.num_nextn_predict_layers,
-                    )
-                )
-                if num_drafts
-                and getattr(
-                    getattr(model_runner.config, "dspark", None),
-                    "draft_kv_dtype",
-                    "auto",
-                )
-                == "fp4"
-                else ()
-            ),
             # Only the ratios the built layers run: a configuration with no
             # window-only layer gets no buffer for one.
             layer_ratios=tuple(sorted({spec.ratio for spec in topology})),

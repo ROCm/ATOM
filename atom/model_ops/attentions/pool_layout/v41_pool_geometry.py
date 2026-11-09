@@ -102,19 +102,8 @@ class V41PoolGeometry:
     # or the FP4 page-8 layout the row-group scorer reads, values and E8M0
     # scales in two planes (`index_planes`).
     index_fp4: bool = False
-    # Only the DSpark stages use NVFP4 windows; target SWA remains MXFP8.
-    fp4_window_layers: tuple[int, ...] = ()
 
     def __post_init__(self):
-        if self.fp4_window_layers and (
-            self.kv_dtype == "bf16"
-            or len(set(self.fp4_window_layers)) != len(self.fp4_window_layers)
-            or any(not 0 <= layer < self.layers for layer in self.fp4_window_layers)
-            or set(self.fp4_window_layers).intersection(self.compress_owners)
-        ):
-            raise ValueError(
-                "FP4 windows require distinct draft layers in a quantized pool"
-            )
         if self.speculative_tokens < 0:
             raise ValueError("Speculative window slack cannot be negative")
         if self.kv_dtype not in KV_DTYPES:
@@ -229,22 +218,6 @@ class V41PoolGeometry:
     def window_row_bytes(self):
         return (
             self.head_dim + self.head_dim // 32 if self.window_fp8 else self.row_bytes
-        )
-
-    def window_packed(self, layer):
-        return layer in self.fp4_window_layers
-
-    def window_layer_bytes(self, layer):
-        return (
-            self.head_dim // 2 + self.head_dim // 16
-            if self.window_packed(layer)
-            else self.window_row_bytes
-        )
-
-    @property
-    def all_window_bytes(self):
-        return self.ring_slots * sum(
-            self.window_layer_bytes(layer) for layer in range(self.layers)
         )
 
     @property
@@ -368,10 +341,6 @@ class V41PoolGeometry:
             torch.uint8 if self.window_fp8 else torch.bfloat16,
             align=self.alignment,
         )
-        if self.fp4_window_layers:
-            window = EntryField(
-                "window", 1, (self.all_window_bytes,), torch.uint8, align=self.alignment
-            )
         # The compressor's own ring, V4's `kv_state` / `score_state`: the last
         # `K_pool` raw projections per owner, so a pool window reaching back
         # before this forward reads them from here instead of the caller
@@ -411,16 +380,13 @@ class V41PoolGeometry:
         """`(offset, num_bytes)` of a STATE entry a checkpoint image holds."""
         if self.window_fp8:
             # Image order follows the source buffers, then the original cursor.
-            window, offset = [], 0
-            for layer in range(self.layers):
-                row = self.ring_slots * self.window_layer_bytes(layer)
-                data = (
-                    self.ring_slots
-                    * self.head_dim
-                    // (2 if self.window_packed(layer) else 1)
-                )
-                window.extend(((offset, data), (offset + data, row - data)))
-                offset += row
+            row = self.ring_slots * self.window_row_bytes
+            data = self.ring_slots * self.head_dim
+            window = [
+                (layer * row + offset, size)
+                for layer in range(self.layers)
+                for offset, size in ((0, data), (data, row - data))
+            ]
             cursor = [
                 (start, field.bytes_per_entry)
                 for field, start, _ in field_extents(self.state_fields)
@@ -497,8 +463,6 @@ class V41PoolGeometry:
             f":block={self.block_size}:window={self.window_size}"
             f":dims={self.head_dim},{self.index_dim}:history={self.history_size}"
         )
-        if self.fp4_window_layers:
-            identity += f":fp4-windows={self.fp4_window_layers}"
         return identity + (
             f":spec={self.speculative_tokens}" if self.speculative_tokens else ""
         )

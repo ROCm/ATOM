@@ -151,7 +151,6 @@ def test_draft_context_write_follows_a_replayed_decoder(monkeypatch):
     outer = SimpleNamespace(replay=None, width=6)
     cache = SimpleNamespace(
         window_fp8=False,
-        geometry=SimpleNamespace(window_packed=lambda layer: False),
         write_window=lambda layer, keys, taken: written.append((keys, taken)),
     )
     monkeypatch.setattr(
@@ -303,8 +302,7 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("fp4", [False, True])
-def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch, fp4):
+def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch):
     from atom.model_ops.attentions.deepseek_v41.backend import (
         DeepseekV41MetadataBuilder,
     )
@@ -314,17 +312,7 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch, fp4):
 
     monkeypatch.setenv("ATOM_DRAFT_CUDAGRAPH", "1")
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
-    builder.geometry = V41PoolGeometry(
-        1,
-        (),
-        16,
-        4,
-        512,
-        32,
-        speculative_tokens=5,
-        kv_dtype="fp4" if fp4 else "bf16",
-        fp4_window_layers=(0,) if fp4 else (),
-    )
+    builder.geometry = V41PoolGeometry(1, (), 16, 4, 512, 32, speculative_tokens=5)
     builder.model_runner = SimpleNamespace(
         forward_vars=metadata_buffers(4, 24, 2, "cuda", geometry=builder.geometry)
     )
@@ -351,11 +339,7 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch, fp4):
     draft.mtp = nn.ModuleList([layer])
     # Exercise the real cache reader and metadata contract; model arithmetic is
     # covered by the checkpoint runtime test, not replaced in that acceptance.
-    draft.draft_hidden = lambda ids, pos, kv, kv_pos, **_: (
-        kv[0][0] if fp4 else kv[0],
-        kv_pos,
-        ids + 1,
-    )
+    draft.draft_hidden = lambda ids, pos, kv, kv_pos, **_: (kv[0], kv_pos, ids + 1)
     graph = DraftGraph(
         forward=lambda bs, anchor_ids, anchor_positions: draft.block_backbone(
             anchor_ids, anchor_positions, 5
@@ -366,12 +350,9 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch, fp4):
             "anchor_positions": StagedInput(dtype=torch.int64),
         },
     ).bind(SimpleNamespace(max_num_seqs=4), "cuda")
-    window = builder.cache.window_view(0)
-    if fp4:
-        window.random_(0, 256)
-    else:
-        window.normal_()
-    before = [buf.clone() for buf in builder.cache.allocations]
+    window = builder.cache.state.view("window")[0]
+    window.normal_()
+    before = builder.cache.backing.clone()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -399,9 +380,7 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch, fp4):
             actual_pos[: len(slots)], expected_pos, rtol=0, atol=0
         )
         torch.testing.assert_close(actual_ids[: len(slots)], ids + 1, rtol=0, atol=0)
-        assert all(
-            torch.equal(buf, old) for buf, old in zip(builder.cache.allocations, before)
-        )
+        assert torch.equal(builder.cache.backing, before)
     assert graph.is_captured(4)
 
 

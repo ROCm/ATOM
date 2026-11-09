@@ -94,39 +94,35 @@ def prefill_window(history, step, ring):
 
 @triton.jit
 def _reset_windows(
-    ptrs, formats, slots, NSLOTS: tl.constexpr, RING: tl.constexpr, D: tl.constexpr
+    ptrs, slots, NSLOTS: tl.constexpr, RING: tl.constexpr, D: tl.constexpr
 ):
     pair = tl.program_id(1)
     layer, request = pair // NSLOTS, pair % NSLOTS
     slot = tl.load(slots + request).to(tl.int64)
     data = tl.load(ptrs + layer * 2).to(tl.pointer_type(tl.uint8))
     scale = tl.load(ptrs + layer * 2 + 1).to(tl.pointer_type(tl.uint8))
-    fp4 = tl.load(formats + layer)
-    dw = tl.where(fp4, D // 2, D)
-    sw = tl.where(fp4, D // 16, D // 32)
     offset = tl.program_id(0) * 1024 + tl.arange(0, 1024)
-    tl.store(data + slot * RING * dw + offset, 0, offset < RING * dw)
-    tl.store(scale + slot * RING * sw + offset, 0, offset < RING * sw)
+    tl.store(data + slot * RING * D + offset, 0, offset < RING * D)
+    tl.store(scale + slot * RING * (D // 32) + offset, 0, offset < RING * (D // 32))
 
 
-def reset_windows(sources, ptrs, slots, ring, dim, formats, fp4_layers=()):
+def reset_windows(sources, ptrs, slots, ring, dim):
     """Reset selected slots across every layer's data and scale planes."""
     if not slots.numel() or not sources:
         return
     if slots.is_cuda:
         _reset_windows[(triton.cdiv(ring * dim, 1024), len(sources) * slots.numel())](
-            ptrs, formats, slots, slots.numel(), ring, dim
+            ptrs, slots, slots.numel(), ring, dim
         )
     else:
-        for layer, source in enumerate(sources):
-            for plane in split_source(source, dim, layer in fp4_layers):
+        for source in sources:
+            for plane in split_source(source, dim):
                 plane.view(plane.shape[0] // ring, -1).index_fill_(0, slots, 0)
 
 
 @triton.jit
 def _gather_windows(
     ptrs,
-    formats,
     layers,
     slots,
     output,
@@ -141,10 +137,7 @@ def _gather_windows(
     scales = tl.load(ptrs + layer * 2 + 1).to(tl.pointer_type(tl.uint8))
     i = tl.program_id(0) * 16 + tl.arange(0, 16)
     dims = tl.arange(0, D)
-    if tl.load(formats + layer):
-        result = _read_plane(values, scales, slot * RING + i, dims, i < RING, D, True)
-    else:
-        result = _read_plane(values, scales, slot * RING + i, dims, i < RING, D, False)
+    result = _read_plane(values, scales, slot * RING + i, dims, i < RING, D, False)
     tl.store(
         output + (pair.to(tl.int64) * RING + i)[:, None] * D + dims[None, :],
         result,
@@ -152,9 +145,7 @@ def _gather_windows(
     )
 
 
-def gather_windows(
-    sources, ptrs, layer_ids, layers, slots, ring, dim, formats, fp4_layers=()
-):
+def gather_windows(sources, ptrs, layer_ids, layers, slots, ring, dim):
     single = isinstance(layers, int)
     layers = layer_ids[layers : layers + 1] if single else layers.flatten()
     output = torch.empty(
@@ -167,7 +158,6 @@ def gather_windows(
     if output.is_cuda:
         _gather_windows[(triton.cdiv(ring, 16), layers.numel() * slots.numel())](
             ptrs,
-            formats,
             layers,
             slots,
             output,
@@ -176,11 +166,17 @@ def gather_windows(
             dim,
         )
     else:
+        from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
+
         rows = slots.long()[:, None] * ring + torch.arange(ring)
         for at, layer in enumerate(layers.tolist()):
-            fp4 = layer in fp4_layers
-            planes = split_source(sources[layer], dim, fp4)
-            output[at].copy_(decode_planes(tuple(p[rows] for p in planes), fp4=fp4))
+            data, scale = split_source(sources[layer], dim)
+            raw, codes = data[rows], scale[rows]
+            steps = torch.exp2(codes.float() - 127)
+            steps[codes == 255] = float("nan")
+            output[at].copy_(
+                raw.view(FP8_DTYPE).float() * steps.repeat_interleave(32, -1)
+            )
     return output[0] if single else output
 
 
@@ -200,7 +196,6 @@ def _write_planes(
     CACHED: tl.constexpr,
     RING: tl.constexpr,
     D: tl.constexpr,
-    S: tl.constexpr,
 ):
     t = tl.program_id(0)
     batch = tl.load(batches + t)
@@ -214,15 +209,13 @@ def _write_planes(
             return
     row = tl.load(slots + batch).to(tl.int64) * RING + pos % RING
     d = tl.arange(0, D)
-    g = tl.arange(0, S)
+    g = tl.arange(0, D // 32)
     tl.store(data + row * D + d, tl.load(values + t * vs + d))
-    tl.store(scale + row * S + g, tl.load(scales + t * ss + g))
+    tl.store(scale + row * (D // 32) + g, tl.load(scales + t * ss + g))
 
 
 def write_window_planes(values, scales, planes, step, window, dim, cached_until=None):
     data, scale = planes
-    if (values.shape[-1], scales.shape[-1]) != (data.shape[-1], scale.shape[-1]):
-        raise ValueError("Window producer and destination must use the same KV format")
     if not data.is_cuda:
         for t in range(step.width):
             batch = int(step.batch_ids[t])
@@ -250,22 +243,13 @@ def write_window_planes(values, scales, planes, step, window, dim, cached_until=
             cached_until,
             cached_until is not None,
             window.ring_slots,
-            data.shape[-1],
-            scale.shape[-1],
+            dim,
         )
 
 
 @triton.jit
 def _gather_window_planes(
-    ptrs,
-    layers,
-    slots,
-    data,
-    scale,
-    B: tl.constexpr,
-    R: tl.constexpr,
-    D: tl.constexpr,
-    S: tl.constexpr,
+    ptrs, layers, slots, data, scale, B: tl.constexpr, R: tl.constexpr, D: tl.constexpr
 ):
     pair = tl.program_id(1)
     layer = tl.load(layers + pair // B)
@@ -279,71 +263,23 @@ def _gather_window_planes(
         i < R * D,
     )
     tl.store(
-        scale + pair.to(tl.int64) * R * S + i,
-        tl.load(ss + slot * R * S + i, i < R * S, other=0),
-        i < R * S,
+        scale + pair.to(tl.int64) * R * (D // 32) + i,
+        tl.load(ss + slot * R * (D // 32) + i, i < R * (D // 32), other=0),
+        i < R * (D // 32),
     )
 
 
-def gather_window_planes(ptrs, layers, slots, ring, dim, *, fp4=True):
-    """Raw quantized draft windows; slot IDs stay live during graph replay."""
+def gather_window_planes(ptrs, layers, slots, ring, dim):
+    """Raw MXFP8 draft windows; slot IDs stay live during graph replay."""
     shape = (layers.numel(), slots.numel(), ring)
-    data_width, scale_width = (dim // 2, dim // 16) if fp4 else (dim, dim // 32)
     source = torch.empty(
-        layers.numel() * slots.numel() * ring * (data_width + scale_width),
+        layers.numel() * slots.numel() * ring * (dim + dim // 32),
         dtype=torch.uint8,
         device=slots.device,
     )
-    planes = split_source(source, dim, fp4=fp4)
+    planes = split_source(source, dim)
     if source.numel():
-        _gather_window_planes[
-            (triton.cdiv(ring * data_width, 1024), shape[0] * shape[1])
-        ](
-            ptrs,
-            layers,
-            slots,
-            *planes,
-            shape[1],
-            ring,
-            data_width,
-            scale_width,
+        _gather_window_planes[(triton.cdiv(ring * dim, 1024), shape[0] * shape[1])](
+            ptrs, layers, slots, *planes, shape[1], ring, dim
         )
     return tuple(p.view(*shape, p.shape[-1]) for p in planes)
-
-
-@triton.jit
-def _decode_planes(
-    data, scale, out, N: tl.constexpr, D: tl.constexpr, FP4: tl.constexpr
-):
-    rows = tl.program_id(0) * 16 + tl.arange(0, 16)
-    dims = tl.arange(0, D)
-    result = _read_plane(data, scale, rows, dims, rows < N, D, FP4)
-    tl.store(out + rows[:, None] * D + dims[None, :], result, (rows < N)[:, None])
-
-
-def decode_planes(planes, *, fp4):
-    """Decode only a gathered source, for the BF16 attention fallback."""
-    data, scale = (p.view(torch.uint8) for p in planes)
-    dim = data.shape[-1] * (2 if fp4 else 1)
-    shape = (*data.shape[:-1], dim)
-    if data.is_cuda:
-        output = torch.empty(shape, dtype=torch.bfloat16, device=data.device)
-        rows = data.numel() // data.shape[-1]
-        if rows:
-            _decode_planes[(triton.cdiv(rows, 16),)](
-                data, scale, output, rows, dim, fp4
-            )
-        return output
-    if fp4:
-        code = torch.stack((data & 15, data >> 4), -1).flatten(-2).long()
-        levels = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6])
-        values = levels[code & 7] * torch.where(code & 8 != 0, -1.0, 1.0)
-        steps = scale.view(torch.float8_e4m3fn).float().repeat_interleave(16, -1)
-    else:
-        from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
-
-        values = data.view(FP8_DTYPE).float()
-        steps = torch.exp2(scale.float() - 127)
-        steps[scale == 255] = float("nan")
-        steps = steps.repeat_interleave(32, -1)
-    return (values * steps).bfloat16()

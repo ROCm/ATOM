@@ -128,58 +128,19 @@ def draft_attention_csr(indices, ring):
     return prefix, pp, extend, ep
 
 
-def draft_attention_quantized(
-    query,
-    context_kv,
-    draft_kv,
-    sink,
-    step,
-    scale,
-    *,
-    fp4,
-    query_fp8=None,
-    backend="opus",
-):
-    """MXFP8 query/current KV over NVFP4 or MXFP8 historical windows.
+def draft_attention_fp8(query, context_kv, draft_kv, sink, step, scale):
+    """OPUS A8W8 over MXFP8 query, history and the whole current draft block."""
+    from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+        sparse_attn_v41_paged_2src,
+    )
 
-    Both kernels consume the same two-source CSR and output layout. Only the
-    FP4 path supports the existing BF16 adapter when ``backend`` is None.
-    """
-
-    if fp4 and backend is None:
-        from atom.model_ops.attentions.deepseek_v41.planes import decode_planes
-
-        return draft_attention(
-            query,
-            decode_planes(context_kv, fp4=True),
-            decode_planes(draft_kv, fp4=False),
-            sink,
-            step,
-            scale,
-        )
-    if query_fp8 is None:
-        raise ValueError("Quantized draft attention requires MXFP8 query planes")
-    if fp4:
-        from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
-            sparse_attn_v41_a8w4_paged_2src,
-        )
-
-        attend = sparse_attn_v41_a8w4_paged_2src
-        options = {"backend": backend}
-    else:
-        from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
-            sparse_attn_v41_paged_2src,
-        )
-
-        attend = sparse_attn_v41_paged_2src
-        options = {}
     csr = step.csr
     if csr is None:
         csr = draft_attention_csr(step.indices, context_kv[0].shape[-2])
     pi, pp, ei, ep = csr
-    output = torch.empty_like(query)
-    attend(
-        tuple(p.flatten(0, 1) for p in query_fp8),
+    output = torch.empty_like(query[0], dtype=torch.bfloat16)
+    sparse_attn_v41_paged_2src(
+        tuple(p.flatten(0, 1) for p in query),
         tuple(p.flatten(0, 1) for p in context_kv),
         pi,
         pp,
@@ -189,7 +150,6 @@ def draft_attention_quantized(
         sink,
         scale,
         out=output.flatten(0, 1),
-        **options,
     )
     return output
 
