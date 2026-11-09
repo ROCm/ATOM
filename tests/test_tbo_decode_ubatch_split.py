@@ -82,9 +82,14 @@ def test_decode_tbo_makes_every_bucket_past_two_even():
 def _forward_vars(running_tokens, device):
     return {
         "ubatch_token_order": CpuGpuBuffer(
-            running_tokens, dtype=torch.int64, device=device
+            running_tokens,
+            dtype=torch.int64,
+            device=device,
+            pin_memory=device != "cpu",
         ),
-        "ubatch_scheduled_tokens": CpuGpuBuffer(2, dtype=torch.int32, device=device),
+        "ubatch_scheduled_tokens": CpuGpuBuffer(
+            2, dtype=torch.int32, device=device, pin_memory=device != "cpu"
+        ),
     }
 
 

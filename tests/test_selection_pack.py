@@ -9,7 +9,12 @@ import numpy as np
 import pytest
 import torch
 
-from atom.model_ops.attentions.selection_pack import pack_row_selections
+try:
+    from atom.model_ops.attentions.selection_pack import pack_row_selections
+except ImportError as _e:  # pragma: no cover - environment, not the code
+    from import_guard import skip_if_dependency_missing
+
+    skip_if_dependency_missing(_e, "the selection pack is a Triton kernel")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton on GPU")
 

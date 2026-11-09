@@ -15,6 +15,15 @@ from typing import Any
 import pytest
 import torch
 
+try:
+    from atom.model_ops.attentions import aiter_mla
+    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    from atom.spec_decode import eagle_proposer
+except ImportError as _e:  # pragma: no cover - environment, not the code
+    from import_guard import skip_if_dependency_missing
+
+    skip_if_dependency_missing(_e, "the MLA builder and the drafter import AITER")
+
 
 class _FakeMlaAttn:
     def __init__(self, buf: torch.Tensor):
@@ -69,9 +78,6 @@ def test_compact_topk_indices_packs_the_rows_to_the_front(monkeypatch):
     """A sparse step 0 hands its last-token rows to `pack_row_selections`
     (tested on GPU in test_selection_pack) over the step's indptr and the
     shared buffer, and copies what it packed back to the front of both."""
-    from atom.model_ops.attentions import aiter_mla
-    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
-
     monkeypatch.setattr(
         aiter_mla,
         "get_forward_context",
@@ -113,9 +119,6 @@ def test_compact_topk_indices_after_a_dense_prefill_selects_every_key(monkeypatc
     key: the selection is each sequence's whole context (a row past
     `scheduled_bs` none),
     laid out from the block tables at the indptr it is packed by."""
-    from atom.model_ops.attentions import aiter_mla
-    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
-
     block_tables = torch.arange(12, dtype=torch.int32).reshape(3, 4)
     attn_metadata = SimpleNamespace(
         run_sparse=False,
@@ -170,8 +173,6 @@ def test_compact_topk_indices_after_a_dense_prefill_selects_every_key(monkeypatc
 def test_share_mtp_indices_gate(
     monkeypatch, method, index_share, index_topk, has_api, dcp, pcp, expected
 ):
-    from atom.spec_decode import eagle_proposer
-
     draft_hf = SimpleNamespace(index_share_for_mtp_iteration=index_share)
     if index_topk is not None:
         draft_hf.index_topk = index_topk

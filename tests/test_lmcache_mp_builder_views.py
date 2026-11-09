@@ -209,6 +209,9 @@ def mla_builder_cls():
             HEADS=128,
             SparsePrefillHeadGroups=noop,
         ),
+        "atom.model_ops.attentions.selection_pack": _module(
+            "atom.model_ops.attentions.selection_pack", pack_row_selections=noop
+        ),
         "atom.model_ops.attentions.backends": _builder_bases(),
         "atom.model_ops.attentions.pool_layout.sub_pool_spec": _sub_pool_module(),
     }

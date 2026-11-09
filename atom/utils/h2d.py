@@ -14,8 +14,6 @@ from functools import wraps
 
 import torch
 
-from atom.utils.packed_h2d import PackedCopy
-
 
 class PublicationError(RuntimeError):
     """A publication violates ownership or asynchronous source lifetime."""
@@ -438,6 +436,8 @@ class PublicationGroup:
         if self.owner.device.type != "cuda":
             backend, reason = None, "packing requires GPU destinations"
         else:
+            from atom.utils.packed_h2d import PackedCopy
+
             backend, reason = PackedCopy.create(self.members, self.owner.device)
         self._backend, self.fallback_reason = backend, reason
         self.transport = "packed" if backend is not None else "direct"

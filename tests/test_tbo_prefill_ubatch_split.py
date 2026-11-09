@@ -9,12 +9,17 @@ import numpy as np
 import pytest
 import torch
 
-from atom.model_ops.attentions.backends import CommonAttentionBuilder
-from atom.model_ops.attentions.token_layout.prefill import PrefillBatch
-from atom.utils.forward_context import Context, ForwardContext
-from atom.utils.tbo.ubatch_splitting import cut_prefill_ubatches
-from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
-from atom.utils.tbo.ubatching import prefill_tbo_vote
+try:
+    from atom.model_ops.attentions.backends import CommonAttentionBuilder
+    from atom.model_ops.attentions.token_layout.prefill import PrefillBatch
+    from atom.utils.forward_context import Context, ForwardContext
+    from atom.utils.tbo.ubatch_splitting import cut_prefill_ubatches
+    from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
+    from atom.utils.tbo.ubatching import prefill_tbo_vote
+except ImportError as _e:  # pragma: no cover - environment, not the code
+    from import_guard import skip_if_dependency_missing
+
+    skip_if_dependency_missing(_e, "the attention builders import AITER")
 
 
 def _split(num_reqs, lens, running_tokens):
