@@ -1407,3 +1407,30 @@ mod h_prepare_chat_generate {
         assert!(!std::any::type_name::<ResponseContext>().contains("mesh_grpc"));
     }
 }
+
+mod empty_stop_string {
+    use crate::protocols::common::StringOrArray;
+    use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
+    use crate::routers::test_mocks;
+    use crate::tokenizer::stop::SequenceDecoderOutput;
+
+    /// An empty stop string matches nothing; the output goes on.
+    #[test]
+    fn an_empty_stop_string_stops_nothing() {
+        let tok = test_mocks::tokenizer();
+        let stop = StringOrArray::Array(vec![String::new()]);
+        let mut decoder = create_stop_decoder(&tok, Some(&stop), None, true, false);
+        let mut text = String::new();
+        for id in [1, 5, 2] {
+            match decoder.process_token(id).unwrap() {
+                SequenceDecoderOutput::Text(t) => text.push_str(&t),
+                SequenceDecoderOutput::Held => {}
+                other => panic!("stopped on {other:?}"),
+            }
+        }
+        if let SequenceDecoderOutput::Text(t) = decoder.flush() {
+            text.push_str(&t);
+        }
+        assert_eq!(text, tok.decode(&[1, 5, 2], true).unwrap());
+    }
+}

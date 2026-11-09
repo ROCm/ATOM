@@ -1,6 +1,11 @@
-//! Failure modes emitted by `GrpcEngine::dispatch` and `merge_pd_streams`.
+//! Failure modes emitted by `GrpcEngine::dispatch` and `merge_pd_streams`,
+//! and the HTTP answer to each.
 
 use std::fmt;
+
+use axum::response::Response;
+
+use crate::routers::comm::error;
 
 #[derive(Debug)]
 pub enum EngineError {
@@ -15,6 +20,35 @@ pub enum EngineError {
     DecodeIncomplete,
     ConnectionAcquireFailed(String),
     RequestBuildFailed(String),
+}
+
+impl EngineError {
+    pub fn into_response(self) -> Response {
+        match self {
+            Self::Transport(s) => error::service_unavailable(
+                "engine_transport_error",
+                format!("transport error: {}", s),
+            ),
+            Self::Prefill(m) => {
+                error::internal_error("engine_prefill_error", format!("prefill error: {}", m))
+            }
+            Self::DecodeError(m) => {
+                error::internal_error("engine_decode_error", format!("decode error: {}", m))
+            }
+            Self::PrefillEarlyClose => error::internal_error(
+                "engine_prefill_early_close",
+                "prefill stream closed without Complete",
+            ),
+            Self::DecodeIncomplete => error::internal_error(
+                "engine_decode_incomplete",
+                "decode stream closed without Complete",
+            ),
+            Self::ConnectionAcquireFailed(r) => {
+                error::service_unavailable("engine_connection_failed", r)
+            }
+            Self::RequestBuildFailed(r) => error::bad_request("engine_request_build_failed", r),
+        }
+    }
 }
 
 impl fmt::Display for EngineError {

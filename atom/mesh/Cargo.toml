@@ -135,3 +135,8 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+# llm-tokenizer 1.0.0 with the incremental-decode fix in vendor/llm-tokenizer/src/sequence.rs
+# and minijinja's `loop_controls` ({% break %} / {% continue %}, used by GLM-5.x templates).
+[patch.crates-io]
+llm-tokenizer = { path = "vendor/llm-tokenizer" }

@@ -22,7 +22,7 @@ use crate::{
     routers::{
         prepare::{
             parser_factory_lookup::{check_reasoning_parser_availability, create_reasoning_parser},
-            response_context::{ProtocolRequest, ResponseContext},
+            response_context::{ProtocolRequest, ResponseContext, REASONING_OPEN},
             tool_constraints::{generate_tool_call_id, get_history_tool_calls_count},
         },
         render::logprob_conversion::token_logprobs_to_chat,
@@ -102,6 +102,7 @@ async fn run_chat_stream(
                 )
             })
             .unwrap_or(false);
+    let starts_in_reasoning = ctx.starts_in_reasoning();
 
     let used_json_schema = match tool_choice {
         Some(ToolChoice::Function { .. }) => true,
@@ -110,6 +111,8 @@ async fn run_chat_stream(
         _ => false,
     };
     let is_specific_function = matches!(tool_choice, Some(ToolChoice::Function { .. }));
+    let tool_choice_enabled =
+        !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
 
     let tool_parser_available = tools.is_some()
         && ctx
@@ -133,6 +136,7 @@ async fn run_chat_stream(
     let mut matched_stop_value: Option<Value> = None;
     let mut prompt_tokens: u32 = 0;
     let mut completion_tokens: u32 = 0;
+    let mut cached_tokens: u32 = 0;
     let mut has_tool_call = false;
 
     let mut stop_decoder = ctx.stop_decoder;
@@ -177,6 +181,7 @@ async fn run_chat_stream(
                         &mut reasoning_parser,
                         ctx.reasoning_parser_factory.as_ref(),
                         ctx.configured_reasoning_parser.as_deref(),
+                        starts_in_reasoning,
                         request_id,
                         model,
                         created,
@@ -193,12 +198,9 @@ async fn run_chat_stream(
                     false
                 };
 
-                let tool_choice_enabled =
-                    !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
                 if !in_reasoning
-                    && tool_choice_enabled
                     && tools.is_some()
-                    && (tool_parser_available || used_json_schema)
+                    && (tool_parser_available || (used_json_schema && tool_choice_enabled))
                 {
                     let tool_chunks = if is_specific_function {
                         process_specific_function_stream(
@@ -225,6 +227,7 @@ async fn run_chat_stream(
                             system_fingerprint.as_deref(),
                             history_tool_calls_count,
                             used_json_schema,
+                            !tool_choice_enabled,
                         )
                         .await
                     };
@@ -270,6 +273,7 @@ async fn run_chat_stream(
 
                 prompt_tokens = usage.prompt_tokens;
                 completion_tokens = usage.completion_tokens;
+                cached_tokens = meta.cached_tokens;
                 finish_reason_str = Some(finish_reason_to_string(&finish_reason));
                 matched_stop_value = matched_stop.map(|ms| match ms {
                     MatchedStop::Str(s) => Value::String(s),
@@ -282,7 +286,7 @@ async fn run_chat_stream(
         }
     }
 
-    if let Some(parser) = &tool_parser {
+    if let Some(parser) = tool_parser.as_ref().filter(|_| tool_choice_enabled) {
         let guard = parser.lock().await;
         if let Some(unstreamed) = guard.get_unstreamed_tool_args() {
             for item in unstreamed {
@@ -341,7 +345,8 @@ async fn run_chat_stream(
                 })
                 .maybe_system_fingerprint(system_fingerprint.clone())
                 .build();
-            let s = serde_json::to_string(&usage_chunk)
+            let s = serde_json::to_value(&usage_chunk)
+                .map(|chunk| super::with_cached_tokens(chunk, cached_tokens).to_string())
                 .map_err(|e| format!("Failed to serialize usage chunk: {}", e))?;
             tx.send(Ok(Bytes::from(format!("data: {}\n\n", s))))
                 .map_err(|_| "send usage".to_string())?;
@@ -395,6 +400,7 @@ async fn process_reasoning_stream(
     reasoning_parser: &mut Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
     factory: Option<&ReasoningParserFactory>,
     configured: Option<&str>,
+    starts_in_reasoning: bool,
     request_id: &str,
     model: &str,
     created: u64,
@@ -406,7 +412,12 @@ async fn process_reasoning_stream(
             None => return (delta.to_string(), None, false),
         };
         match create_reasoning_parser(factory, configured, model) {
-            Some(p) => *reasoning_parser = Some(Arc::new(tokio::sync::Mutex::new(p))),
+            Some(mut p) => {
+                if starts_in_reasoning {
+                    let _ = p.parse_reasoning_streaming_incremental(REASONING_OPEN);
+                }
+                *reasoning_parser = Some(Arc::new(tokio::sync::Mutex::new(p)));
+            }
             None => return (delta.to_string(), None, false),
         }
     }
@@ -497,6 +508,9 @@ async fn process_tool_calls_stream(
     system_fingerprint: Option<&str>,
     history_tool_calls_count: usize,
     use_json_parser: bool,
+    // `tool_choice: "none"`: the format is read, so its markup leaves the
+    // content, but no call is sent.
+    suppress_calls: bool,
 ) -> Vec<ChatCompletionStreamResponse> {
     let mut chunks = Vec::new();
     if tool_parser.is_none() {
@@ -531,7 +545,7 @@ async fn process_tool_calls_stream(
                         .build(),
                 );
             }
-            for item in calls {
+            for item in calls.into_iter().filter(|_| !suppress_calls) {
                 *has_tool_call = true;
                 let id = item.name.as_ref().map(|n| {
                     generate_tool_call_id(model, n, item.tool_index, history_tool_calls_count)
