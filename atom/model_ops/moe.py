@@ -2004,7 +2004,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
-        # No-ops returning None unless aiter enables IOD placement (MI455X).
+        # No-ops returning None unless aiter enables IOD placement (gfx1250).
         moe_shuffle_weight_iod(
             layer.w13_weight, layer.w13_weight_scale, self.num_experts
         )
