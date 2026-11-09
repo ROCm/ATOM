@@ -36,9 +36,18 @@ class StructuredRequest:
         return update
 
 
+def is_structured(request):
+    """A JSON Schema answer, strict tool arguments, or both constrain decoding."""
+    return (
+        getattr(request, "json_schema", None) is not None
+        or getattr(request, "structured_tool_format", None) is not None
+    )
+
+
 __all__ = [
     "StructuredOutput",
     "StructuredRequest",
+    "is_structured",
     "prepare_worker_grammar",
     "structured_stop_token_ids",
     "tokenizer_fingerprint",

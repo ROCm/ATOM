@@ -10,13 +10,14 @@ split across DCP or TP ranks, each rank's share of the rows and their
 all-gather -- are here.
 
 The names below are loaded on first use, so importing a submodule that needs
-no kernels (``schedule``) does not import AITER."""
+no kernels (``layout``) does not import AITER."""
 
 import importlib
 
 _EXPORTS = {
-    "NATURAL": ".rows",
-    "PRESHUFFLE": ".rows",
+    "MFMA": ".layout",
+    "NATURAL": ".layout",
+    "PRESHUFFLE": ".layout",
     "ConcatGroup": ".rows",
     "ConcatKeys": ".rows",
     "DcpConcatGather": ".rows",
@@ -38,6 +39,7 @@ _EXPORTS = {
 
 __all__ = [
     "FP8_MQA_LOGITS_TAKES_OUT",
+    "MFMA",
     "NATURAL",
     "PRESHUFFLE",
     "ConcatGroup",
