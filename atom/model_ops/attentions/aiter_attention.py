@@ -286,7 +286,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         self._index_score_max_block = 0
         if (
             self._has_sparse_attention
-            and getattr(self.model_runner.config, "index_cache_dtype", None) == "fp4"
+            and self.model_runner.config.index_cache_dtype == "fp4"
         ):
             from atom.model_ops.minimax_m3.index_mxfp4 import IndexScoreBuffers
             from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE

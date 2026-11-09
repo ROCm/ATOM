@@ -18,9 +18,10 @@ segments, each with a plan of its own from the shared plan cache
 including its once-a-step refresh under a step owner). There is no gluon fallback
 for MXFP4 pages, hence the segments rather than a refusal past one plan.
 
-Prefill runs plan-free (``plan_owner=None``): a chunk has a new row count nearly
-every forward, and ``plan_pa_decode`` JIT-compiles a kernel per batch size, so one task a row -- a row reads at most ``topk`` pages -- and
-one specialization whatever the rows.
+Prefill runs plan-free (``planned=False``): a chunk has a new row count nearly
+every forward, and ``plan_pa_decode`` JIT-compiles a kernel per batch size. So it
+takes one task a row (a row reads at most ``topk`` pages), and one specialization
+whatever the rows.
 """
 
 import torch
