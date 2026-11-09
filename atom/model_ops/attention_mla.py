@@ -66,7 +66,7 @@ from atom.distributed.pcp_utils import (
     pcp_is_enabled,
 )
 from atom.model_ops.attentions.sparse_mla_head_groups import (
-    MLA_WORK_NAMES,
+    PERSISTENT_WORK_BUFFERS,
 )
 from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
 from atom.model_ops.indexer.schedule import skips_index_topk
@@ -702,9 +702,10 @@ class MLAAttention(nn.Module):
             if self.topk_tokens is not None
             else 16
         )
-        # Shared layers have no indexer buffer at construction; the metadata
-        # builder rebinds it to the shared `_sparse_kv_indices_gpu` at runtime,
-        # so the layer reads the prior full layer's selected indices.
+        # Not read by this layer (its forward reads `sparse_kv_indices`): the
+        # metadata builder rebinds it to the shared `_sparse_kv_indices_gpu`,
+        # where a mono layer writes its selection
+        # (`glm52.mono.contract.shared_sparse_buffer`).
         self.sparse_kv_indices_buffer = (
             mla_modules.indexer.sparse_kv_indices_buffer
             if mla_modules.indexer is not None
@@ -893,11 +894,6 @@ class MLAAttention(nn.Module):
         self.sparse_dcp_metadata_rebuild = (
             self.is_sparse_mla and self.dcp_world_size > 1
         )
-
-        # Compacted per-layer sparse offsets for DCP decode; rebound by the
-        # metadata builder to the shared buffer (see aiter_mla.py).
-        self.dcp_sparse_kv_indptr_buffer = None
-        self.dcp_owned_counts_buffer = None
 
         self._configure_dcp_decode_head_padding(self.dcp_world_size)
         # Read from the same predicate the width/rebuild decision came from,
@@ -1453,7 +1449,7 @@ class MLAAttention(nn.Module):
             o,
             lse,
             merge_in_fp32=not self.dcp_prefill_merge_bf16_ok,
-            owned_counts=self.dcp_owned_counts_buffer[: q_out.shape[0]],
+            owned_counts=attn_metadata.dcp_owned_counts[: q_out.shape[0]],
         )
 
     @mark_trace(prefix="dcp_decode", torch_compile=False)
@@ -1471,8 +1467,8 @@ class MLAAttention(nn.Module):
             q_out = dcp_all_gather_query_heads(self.dcp_group, q_out)
         o, lse = self._forward_decode(q_out, kv_cache, attn_metadata, return_lse=True)
         owned_counts = (
-            self.dcp_owned_counts_buffer[: q_out.shape[0]]
-            if self.is_sparse_mla and self.dcp_owned_counts_buffer is not None
+            attn_metadata.dcp_owned_counts[: q_out.shape[0]]
+            if self.is_sparse_mla and attn_metadata.dcp_owned_counts is not None
             else None
         )
         return self._dcp_project_merge_out(
@@ -2335,7 +2331,7 @@ class MLAAttention(nn.Module):
         if self.is_sparse_mla:
             paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
             paged_kv_indptr = attn_metadata.sparse_kv_indptr
-            paged_kv_indices = self.sparse_kv_indices_buffer
+            paged_kv_indices = attn_metadata.sparse_kv_indices
             # Sparse attention needs one last-page len per query token; the dense
             # kv_last_page_lens (per-seq) would over-read -> illegal access.
             kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
@@ -2344,7 +2340,7 @@ class MLAAttention(nn.Module):
                 # of each query token's region, so the region lengths are the
                 # per-rank (and per-layer) ones, not the global sparse_kv_indptr.
                 # Same substitution the decode path makes.
-                paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[
+                paged_kv_indptr = attn_metadata.dcp_sparse_kv_indptr[
                     : paged_cu_seqlens_q.shape[0]
                 ]
             max_q_len = 1
@@ -2438,7 +2434,7 @@ class MLAAttention(nn.Module):
                 elif use_work_meta:
                     work = {
                         name: getattr(attn_metadata, f"sparse_prefill_{name}", None)
-                        for name in MLA_WORK_NAMES
+                        for name in PERSISTENT_WORK_BUFFERS
                     }
                 else:
                     work = {}
@@ -2561,7 +2557,7 @@ class MLAAttention(nn.Module):
     ) -> None:
         """Rebuild persistent work/reduce metadata from this layer's DCP top-k.
 
-        A full GLM IndexShare layer rewrites ``dcp_sparse_kv_indptr_buffer``
+        A full GLM IndexShare layer rewrites ``dcp_sparse_kv_indptr``
         after selecting and compacting the rank-owned top-k. Persistent work
         descriptors embed those region boundaries, so they must be rebuilt
         after that mutation rather than once per decode step from the global
@@ -2615,6 +2611,17 @@ class MLAAttention(nn.Module):
             uni_seqlen_qo=1,
             fast_mode=1,
             max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
+        )
+
+    def decode_is_persistent(self) -> bool:
+        """Whether this layer's aiter decode runs the persistent kernel over the
+        step's work plan (`should_use_persistent_mode`)."""
+        return should_use_persistent_mode(
+            dp_size=get_dp_group().world_size,
+            dpa_persistent_supported=self._dpa_persistent_supported,
+            page_size=envs.ATOM_MLA_PAGE_SIZE,
+            dcp_world_size=self.dcp_world_size,
+            dcp_persistent_supported=self.dcp_persistent_supported,
         )
 
     def _forward_decode(
@@ -2723,7 +2730,7 @@ class MLAAttention(nn.Module):
                     paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q[: B + 1]
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
-                    paged_kv_indices = self.sparse_kv_indices_buffer
+                    paged_kv_indices = attn_metadata.sparse_kv_indices
                     max_q_len = 1
                     # The persistent kernel reads q and writes o for every work
                     # item, so a plan over more rows than q holds runs past both.
@@ -2748,22 +2755,15 @@ class MLAAttention(nn.Module):
                     # past the written sparse-index region -> illegal access).
                     paged_cu_seqlens_q = attn_metadata.cu_seqlens_q[: B + 1]
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr[: B + 1]
-                    paged_kv_indices = self.sparse_kv_indices_buffer
+                    paged_kv_indices = attn_metadata.sparse_kv_indices
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
                 if self.dcp_world_size > 1:
                     # The indexer compacted this layer's owned top-k, so the
                     # real lengths are here, not in sparse_kv_indptr; `B` is a
                     # token count on both branches.
-                    paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
+                    paged_kv_indptr = attn_metadata.dcp_sparse_kv_indptr[: B + 1]
 
-            dp_size = get_dp_group().world_size
-            use_persistent_mode = should_use_persistent_mode(
-                dp_size=dp_size,
-                dpa_persistent_supported=self._dpa_persistent_supported,
-                page_size=envs.ATOM_MLA_PAGE_SIZE,
-                dcp_world_size=self.dcp_world_size,
-                dcp_persistent_supported=self.dcp_persistent_supported,
-            )
+            use_persistent_mode = self.decode_is_persistent()
             # Sparse DCP persistent decode rebuilds the work plan below from
             # the layer-local compact indptr; MTP verify is per-token q_len=1
             # rows and rebuilds into the sparse_mtp_ buffers.

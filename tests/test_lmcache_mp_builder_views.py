@@ -69,6 +69,7 @@ def _builder_bases():
 
     return _module(
         "atom.model_ops.attentions.backends",
+        PERSISTENT_WORK_BUFFERS=(),
         AttentionBackend=AttentionBackend,
         CommonAttentionBuilder=CommonAttentionBuilder,
     )
