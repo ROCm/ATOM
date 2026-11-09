@@ -18,6 +18,7 @@ from flydsl.expr import gpu, range_constexpr
 
 import device as hx
 import stamps
+import index_plan as IP
 from attention import T
 
 I32, F32 = fx.Int32, fx.Float32
@@ -206,62 +207,16 @@ def lds_topk(n, k, load, emit, sm, tid):
     stamps.point(5)
 
 
-SEG = LDS_KEYS          # 8192 values a level-0 list's input
-KSEL, KBLK = 512, 2048  # the selection's k, the candidate blocks' k (layer 20)
-NCAND = KBLK
-
-
-def _cdiv(a, b):
-    return (a + (b - 1)) // b
-
-
-def _lists(n, lev, fan):
-    """lists at level lev of a token with n inputs (§4: segments, then / fan a level)."""
-    x = _cdiv(fx.max(n, I32(0)), I32(SEG))
-    for _ in range(lev):
-        x = _cdiv(x, I32(fan))
-    return x
-
-
-def rx_context(c, tok, bd):
-    """A REINDEX token's compacted columns (candidate_table.py:47-75): kept = min(blocks(visible), 2048) candidates,
-    the last kept one possibly partial: (kept - 1) 8 + clamp(visible - 8 last, 0, 8); 0 without candidates."""
-    kept = fx.min(_cdiv(fx.max(bd, I32(0)), I32(8)), I32(NCAND))
-    last = hx.gload(c["icand"] + i64(tok * NCAND + fx.max(kept - 1, I32(0))) * 4, I32)
-    ctx = (kept - 1) * 8 + fx.min(fx.max(bd - last * 8, I32(0)), I32(8))
-    return (kept > 0).select(ctx, I32(0))
-
-
-NLMAX = 3                # the deepest tree (IDX_LEVELS <= 3: n <= 1M)
+SEG, KSEL, KBLK, NCAND, NLMAX = IP.SEG, IP.KSEL, IP.KBLK, IP.NCAND, IP.NLMAX
+_cdiv, _lists, _lists_rt, _list_inputs_rt, _list_count_rt = IP.cdiv, IP.lists, IP.lists_rt, IP.list_inputs_rt, IP.list_count_rt
 MODE_SEL, MODE_RX, MODE_BLK = 0, 1, 2
 
 
-def _lists_rt(n, lev, fan):
-    """_lists with a traced level (<= NLMAX) and fan."""
-    x = _cdiv(fx.max(n, I32(0)), I32(SEG))
-    for i in range_constexpr(NLMAX):
-        x = (I32(i) < lev).select(_cdiv(x, fan), x)
-    return x
-
-
-def _list_inputs_rt(n, lev, j, k, fan):
-    """_list_inputs with a traced level: down the chain of last children to level 0, then back up."""
-    jc = j
-    cnts = [None] * (NLMAX + 1)
-    for l in range_constexpr(NLMAX, 0, -1):
-        on = I32(l) <= lev
-        cnt = fx.min(_lists(n, l - 1, fan) - jc * fan, fan)
-        cnts[l] = cnt
-        jc = on.select(jc * fan + cnt - 1, jc)
-    v = fx.min(fx.max(n - jc * SEG, I32(0)), I32(SEG))
-    for l in range_constexpr(1, NLMAX + 1):
-        v = (I32(l) <= lev).select((cnts[l] - 1) * k + fx.min(v, k), v)
-    return v
-
-
-def _list_count_rt(n, lev, fan):
-    return (lev == 0).select(fx.max(_lists(n, 0, fan), I32(1)),
-                             (_lists_rt(n, fx.max(lev - 1, I32(0)), fan) > 1).select(_lists_rt(n, lev, fan), I32(0)))
+def rx_context(c, tok, bd):
+    """A REINDEX token's compacted columns (index_plan.rx_context; its last kept block from icand)."""
+    kept = IP.rx_kept(bd)
+    last = hx.gload(c["icand"] + i64(tok * NCAND + fx.max(kept - 1, I32(0))) * 4, I32)
+    return IP.rx_context(kept, last, bd)
 
 
 @ASTRewriter.transform

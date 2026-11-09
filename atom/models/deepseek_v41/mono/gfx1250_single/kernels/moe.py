@@ -34,6 +34,7 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr, rocdl
 
 import device as hx
+import moe_plan as MP
 import stamps
 from attention import q8words, bf, e8m0_of, handoff, inv_pow2
 
@@ -68,27 +69,12 @@ MOE_LDS = O_RED8 + 8 * 4 * 8 * 32 * 4
 
 UNIT8 = 2176
 SHARED_SLOT = 95
-# >= 3 shared token chunks (> 32 rows, c6..c8): 2 units a dedicated CTA and the shared down after the handoff on all
-# CTAs; fewer: 1 unit a dedicated CTA, the shared down on them
-WIDE_NCH = 3
-SH_EARLY = True   # wide (>= WIDE_NCH shared chunks): the shared expert's UG runs in the FFN front's idle CTAs (ug_shared_early),
-                  # its MID in the fixed last slots SHS0.., and the MoE's UG has no dedicated CTAs (the front leaves most CTAs
-                  # idle; dedicated CTAs were the MoE's shared tail)
+WIDE_NCH = MP.WIDE_NCH   # the wide schedule (moe_plan): the shared expert's UG early in the front's idle CTAs, its MID
+                         # in the fixed last slots SHS0..
 SHS0 = NE - WIDE_NCH                       # the shared MID slots (routed union entries < 288 + 16 overflow chunks < SHS0)
 
 
-def sh_early(nch):
-    return SH_EARLY and nch >= WIDE_NCH
-
-
-def sh8_upc(nch):
-    # 3 a CTA: the routed CTAs' units (bytes) a CU ~ the shared CTAs' (the UG is bandwidth-shared: the CUs with more
-    # bytes finish last)
-    return 3 if nch >= WIDE_NCH else 1
-
-
-def sh8_dnov(nch):
-    return nch < WIDE_NCH
+sh_early, sh8_upc, sh8_dnov = MP.sh_early, MP.sh8_upc, MP.sh8_dnov
 
 
 def pslot(e, sm):
@@ -412,26 +398,19 @@ def moe_ug(c):
     SH8_UPC = sh8_upc(NCH)
     SH8_DNOV = sh8_dnov(NCH)
     NSHU = NCH * NUG   # FP8 shared units: the last NDC CTAs take SH8_UPC each (all 8 waves, K split)
-    NDC = 0 if sh_early(NCH) else (NSHU + SH8_UPC - 1) // SH8_UPC
+    NDC = MP.dedicated_ctas(NCH, NUG)
     CR = CTAS - NDC
     U = (nuni - NCH) * NUG
-    u0 = ufl((b * U) // CR)
-    u1 = ufl(((b + 1) * U) // CR)
+    u0 = ufl(MP.block_lo(b, U, CR))
+    u1 = ufl(MP.block_lo(b + 1, U, CR))
     u1 = (b < CR).select(u1, u0)
     wu = u0 + w
     ded = b >= CR
     if fx.const_expr(sh_early(NCH)):
         if b < NSHU:
             ug_shared_fin(c, b)
-    # wide batches (>= WIDE_NCH shared chunks): routed units striped over the CTAs (unit (it * 8 + w) * CR + b):
-    # a hot expert's 16-token units (2x the B cache lines a K step) spread one a CU instead of all on 2-3 CUs (the UG tail).
-    # Narrow batches keep the contiguous blocks: a CTA's units there mostly share an expert and
-    # its B rows (striped was slower there)
-    STRIPE = NCH >= WIDE_NCH
-    if fx.const_expr(STRIPE):
-        nit = (U - (w * CR + b) + 8 * CR - 1) // (8 * CR)
-    else:
-        nit = (u1 - wu + 7) // 8
+    STRIPE = MP.striped(NCH)
+    nit = MP.unit_iters(STRIPE, U, CR, b, w, u1, wu)
     for it in range(ded.select(I32(SH8_UPC), fx.max(nit, I32(0)))):
         ui = I32(0)
         g = I32(0)
@@ -445,10 +424,7 @@ def moe_ug(c):
             acc, n = ug_shared8(c, ui, su // NUG, g)
             n = (su0 < NSHU).select(n, I32(0))   # a dedicated CTA's slot past the shared units: no MID written
         else:
-            if fx.const_expr(STRIPE):
-                wv = (it * 8 + w) * CR + b
-            else:
-                wv = wu + it * 8
+            wv = MP.unit_of(STRIPE, it, CR, b, w, wu)
             ui = wv // NUG
             g = wv % NUG
             e = hx.lload(sm + O_UNI + ui * 4, I32)

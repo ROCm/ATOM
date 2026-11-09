@@ -23,11 +23,12 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
 import device as hx
+import index_plan as IP
 from attention import CTAS, T
 
 F32, I32, I64 = fx.Float32, fx.Int32, fx.Int64
-HEADS, DIM, CHUNK, TOPK = 32, 128, 128, 512
-SUB = 4                           # 128-column chunks a task (a wave: SUB 16-column key tiles, their loads in flight together)
+HEADS, DIM = 32, 128
+CHUNK, TOPK, SUB = IP.CHUNK, IP.TOPK, IP.SUB   # (a wave: SUB 16-column key tiles a task, their loads in flight together)
 TCOLS = SUB * CHUNK
 ONE4 = 0x7F7F7F7F                 # four E8M0 codes of 1.0
 FLT_MAX = 3.4028234663852886e38
@@ -56,9 +57,7 @@ def stage_score_any(c, isrx):
     import topk as TK
     t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
     TR = c["TR"]
-    # 128-column chunks a task: ~16 a row at a ~2k context; take more a task only when TR x 16 exceeds one round of CTAs
-    # (c8: 3 rounds -> 1); c1 / c2 keep one (a longer task only adds latency there)
-    SUB_ = next((s_ for s_ in range(1, SUB + 1) if TR * -(-16 // s_) <= CTAS), SUB)
+    SUB_ = IP.score_sub(TR, CTAS)
     TCOLS_ = SUB_ * CHUNK
     ocnt = sm + O_SCNT
     tc = fx.min(t, I32(TR - 1))
@@ -69,7 +68,7 @@ def stage_score_any(c, isrx):
     qt = hx.gload(c["ibat"] + i64(tc) * 4, I32)
     osr = sm + O_SRB
     if t < TR:   # the task loop reads the row's context / bound / batch slot from LDS (no dependent global loads)
-        hx.lstore(ocnt + t * 4, (cxt > TOPK).select((cxt + (TCOLS_ - 1)) // TCOLS_, I32(0)))
+        hx.lstore(ocnt + t * 4, IP.score_tasks(cxt, TCOLS_))
         hx.lstore(osr + t * 4, cxt)
         hx.lstore(osr + (64 + t) * 4, bdt)
         hx.lstore(osr + (128 + t) * 4, qt)
@@ -119,7 +118,7 @@ def stage_score_any(c, isrx):
         if isrx:   # compacted column -> its candidate block's real row
             blks = [hx.gload(c["icand"] + i64(rr[j] * 2048 + fx.min(pcols[j] // 8, I32(2047))) * 4, I32) for j in range(RB * SUB_)]
             krows = [fx.max(blks[j], I32(0)) * 8 + pcols[j] % 8 for j in range(RB * SUB_)]
-        pages = [hx.gload(c["btab"] + (i64(qs[j]) * i64(c["bstride"]) + i64(fx.min(krows[j], fx.max(bds[j] - 1, I32(0))) // c["irpp"])) * 4, I32)
+        pages = [hx.gload(c["btab"] + (i64(qs[j]) * i64(c["bstride"]) + i64(IP.key_row(krows[j], bds[j]) // c["irpp"])) * 4, I32)
                  for j in range(RB * SUB_)]
         for j in range_constexpr(RB * SUB_):
             hx.lstore(sm + O_PF + (j * 256 + t) * 8, i64(pages[j]) * i64(c["irpp"]) + i64(krows[j] % c["irpp"]))
