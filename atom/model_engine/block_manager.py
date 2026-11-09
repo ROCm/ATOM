@@ -1545,6 +1545,67 @@ class BlockManager:
             decision = self._fit_joint(decision, probe)
             self._commit_joint_boundary(seq, decision)
 
+    def lower_hit_to_chunk(
+        self,
+        seq: Sequence,
+        probe: AdmissionProbe,
+        chunk: int,
+        tier_hit: int,
+        min_load: int,
+    ) -> bool:
+        """Lower an unaligned HBM hit to the tier's chunk floor, so a load can
+        start there.
+
+        A tier moves whole `chunk`-token chunks, so a load starts only on a
+        chunk boundary. An HBM hit that ends inside a chunk used to need a
+        hand-off prefill up to the next boundary, then the load, then the rest:
+        two prefill releases. Treat the part of the hit past the floor as a
+        miss instead. `allocate` then claims only the blocks below the floor
+        and fills the rest with fresh ones, which the load writes whole; the
+        shared blocks past the floor are left alone. The tier re-supplies at
+        most `chunk - hash_block` tokens that HBM already held.
+
+        Lowers `probe` in place and returns True when:
+          - the hit is a chunk multiple off, and the tier's hit reaches past
+            the HBM hit and, from the floor, clears `min_load`;
+          - the hit can be lowered at all: no joint boundary, and a request
+            state that is rebuilt by replay (or none);
+          - every cache class still accepts the lowered boundary -- the same
+            SWA-window and state gates `can_allocate` applied to the original,
+            so a lowered hit never claims a block whose window is gone;
+          - the pool can give the extra fresh blocks.
+        Otherwise leaves `probe` untouched and returns False.
+        """
+        hbs = self.hash_block_size
+        hit_blocks = probe.num_cached_blocks
+        if hit_blocks <= 0 or probe.num_new_blocks is None:
+            return False
+        if chunk <= 0 or chunk % hbs:
+            return False
+        hit = hit_blocks * hbs
+        floor = hit // chunk * chunk
+        if floor == hit or tier_hit <= hit or tier_hit - floor < min_load:
+            return False
+        if seq.offload_joint.boundary_tokens:
+            return False
+        if seq.has_per_req_cache and not self.state.transfer.replays:
+            # A checkpointed state cannot be rebuilt below the hit it was
+            # taken at.
+            return False
+        lowered = floor // hbs
+        chain = probe.block_hashes
+        if lowered > len(chain):
+            return False
+        if lowered and self._gated_hit(seq, lowered, chain) != lowered:
+            return False
+        demand = probe.num_new_blocks + (hit_blocks - lowered)
+        protected = chain[lowered - 1] if lowered else None
+        if not self._has_page_units(demand, protected):
+            return False
+        probe.num_cached_blocks = lowered
+        probe.num_new_blocks = demand
+        return True
+
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
         """Drop a failed unaligned joint and resume at the HBM hit it lowered.
 

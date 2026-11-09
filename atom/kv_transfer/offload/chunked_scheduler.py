@@ -446,6 +446,20 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._perf_bump("lookup_deferred")
         return True
 
+    # Whether the scheduler may start this tier's load at the chunk floor of an
+    # unaligned HBM hit (`BlockManager.lower_hit_to_chunk`) instead of handing
+    # off through a prefill to the next chunk boundary.
+    lowers_hbm_hit_to_chunk = False
+
+    def held_tier_hit(self, seq) -> int:
+        """The tier hit armed for `seq`'s coming load, 0 when none.
+
+        Set by `get_num_new_matched_tokens`; read side-effect free by the
+        scheduler to decide how far down the HBM hit may be lowered.
+        """
+        spec = self._load_specs.get(str(seq.id))
+        return int(spec.lmcache_cached_tokens) if spec is not None else 0
+
     def lookup_ready(self, seq) -> bool:
         """Whether `seq`'s tier answer can be consumed without a round trip.
 

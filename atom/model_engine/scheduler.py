@@ -2518,6 +2518,12 @@ class Scheduler:
                 self.waiting.appendleft(seq)
                 break
             if (
+                needs_remote_load
+                and num_cached_blocks > 0
+                and self._lower_hbm_hit_for_tier(seq, hbm_probe)
+            ):
+                num_cached_blocks = hbm_probe.num_cached_blocks
+            if (
                 seq.replay_kv_load
                 and not needs_remote_load
                 and len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
@@ -3334,6 +3340,21 @@ class Scheduler:
             or getattr(conn, "detach_lookup", None) is None
             or getattr(self.block_manager, "state_offload", None) is not None
             or (seq.kv_transfer_params or {}).get("do_remote_prefill")
+        )
+
+    def _lower_hbm_hit_for_tier(self, seq: Sequence, probe: AdmissionProbe) -> bool:
+        """Lower an unaligned HBM hit to the tier's chunk floor, so the tier's
+        load starts there (`BlockManager.lower_hit_to_chunk`). Only for a tier
+        that declares it (`lowers_hbm_hit_to_chunk`), once its answer is held."""
+        conn = self.kv_connector
+        if conn is None or not getattr(conn, "lowers_hbm_hit_to_chunk", False):
+            return False
+        chunk = int(getattr(conn, "chunk_size", 0) or 0)
+        held = getattr(conn, "held_tier_hit", None)
+        if not chunk or not callable(held):
+            return False
+        return self.block_manager.lower_hit_to_chunk(
+            seq, probe, chunk, int(held(seq)), envs.OFFLOAD_MIN_LOAD_TOKENS
         )
 
     def _probe_hbm_prefix(self, seq: Sequence) -> AdmissionProbe:
@@ -4188,7 +4209,11 @@ class Scheduler:
                 state.skip(seq.id, "no_tier_load")
                 state.settled.add(seq.id)
                 continue
-            if chunk and (hbm_probe.num_cached_blocks * hbs) % chunk:
+            if (
+                chunk
+                and (hbm_probe.num_cached_blocks * hbs) % chunk
+                and not self._lower_hbm_hit_for_tier(seq, hbm_probe)
+            ):
                 # Hand-off prefill runs first (`_maybe_start_unaligned_handoff`).
                 state.skip(seq.id, "unaligned_hbm")
                 state.settled.add(seq.id)

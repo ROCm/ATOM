@@ -227,6 +227,14 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "lookup_ready", None)
         return bool(callback(seq)) if callable(callback) else False
 
+    @property
+    def lowers_hbm_hit_to_chunk(self) -> bool:
+        return bool(getattr(self._impl, "lowers_hbm_hit_to_chunk", False))
+
+    def held_tier_hit(self, seq) -> int:
+        callback = getattr(self._impl, "held_tier_hit", None)
+        return int(callback(seq)) if callable(callback) else 0
+
     def cancel_preadmission(self, seq) -> None:
         callback = getattr(self._impl, "cancel_preadmission", None)
         if callable(callback):
