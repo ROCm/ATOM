@@ -34,13 +34,6 @@ ENG_W, ENG_N = (
 )  # Engram: embedding width; kv rows (4 x 5120 keys, then the 5120-wide value)
 
 
-def _plane(prefix):
-    hit = [v for k, v in planes.PLANES.items() if k.endswith(prefix)]
-    if not hit:
-        raise MonoUnsupported(f"no expert plane for {prefix}")
-    return hit[0]
-
-
 class StepTables:
     def __init__(self, K, model, drafter, scratch, recv, rank, tp_group):
         M, ST, CX = K["step"], K["tail"], K["draft_ctx"]
@@ -239,8 +232,9 @@ class StepTables:
             )
             for i in range(NL)
         ] + [dmodel.rope] * NDR
-        mpl = [_plane(f"layers.{i}.ffn") for i in range(NL)] + [
-            _plane(f"mtp.{j}.ffn") for j in range(NDR)
+        # the routed experts, read in place (the production MoE's own tensors)
+        mpl = [planes.routed_experts(target[i].ffn.experts) for i in range(NL)] + [
+            planes.routed_experts(stages[j].ffn.experts) for j in range(NDR)
         ]
         shp = [planes.pack_shared(target[i].ffn.shared_experts) for i in range(NL)] + [
             planes.pack_shared(stages[j].ffn.shared_experts) for j in range(NDR)
@@ -255,7 +249,7 @@ class StepTables:
         )  # the step epoch word (TP_EPOCH)
         self.keep.append(src["tpep"])
         src.update({k: v for k, v in rows[0].items()})
-        src.update(mplane=mpl[0], shplane=shp[0], emb=dw["emb"], noise=dw["noise"])
+        src.update(shplane=shp[0], emb=dw["emb"], noise=dw["noise"])
         src.update({k: v for k, v in self.step.items() if not k.startswith("ctx_")})
         # the layer-to-layer state: a layer's FFN front reads the gates the previous attention front wrote (its R comes
         # from LDS, RKEEP: layer 0's from the target entry's front)
@@ -339,8 +333,8 @@ class StepTables:
         the indexer / compressor keys stay 0 / the zero buffer."""
         p = {k: v.data_ptr() for k, v in w.items()}
         rope = self.ropes[min(Ly, NL + NDR - 1) if Ly != NL + NDR + 1 else 0]
+        p.update({k: v.data_ptr() for k, v in mpl.items()})
         p.update(
-            mplane=mpl.data_ptr(),
             shplane=shp.data_ptr(),
             rcos=rope.cos_cache.data_ptr(),
             rsin=rope.sin_cache.data_ptr(),

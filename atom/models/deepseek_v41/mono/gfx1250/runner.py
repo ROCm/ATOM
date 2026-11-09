@@ -11,7 +11,7 @@ What ``ModelRunner`` asks of it on a served step (``ModelRunner._single_step``):
 
 Construction (collective over the TP group, ``LazyRunner``): the kernel modules (``kernels/``: the whole step is
 ``kernels.step``), the scratch (``buffers.scratch_bytes``, once at the widest step),
-the peer receive buffers (``SymmetricPeerBuffer``), the routed-expert planes (``planes.PLANES``). The weight tables
+the peer receive buffers (``SymmetricPeerBuffer``). The weight tables
 and the step metadata (``buffers``: WEIGHT / STEP) are not bound yet, so construction still refuses at its end and
 ``LazyRunner`` keeps the production path."""
 
@@ -37,7 +37,6 @@ from atom.models.deepseek_v41.mono.gfx1250.config import (
 )
 from atom.models.deepseek_v41.mono.gfx1250.debug import RunnerDebug, timeline
 from atom.models.deepseek_v41.mono.gfx1250.inputs import StepInputs
-from atom.models.deepseek_v41.mono.gfx1250.weights import planes
 from atom.mono.plan.build_key import source_digest
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
@@ -131,24 +130,10 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             fine_grained=True,
         )
         self.recv = [int(a) for a in self.peer.addresses.tolist()]
-        # the routed experts a layer, as the loader packed them (``planes.capture``): target "layers.{i}.ffn", the
-        # draft's "mtp.{j}.ffn"
-        want = [f"layers.{i}.ffn" for i in range(NL)] + [
-            f"mtp.{j}.ffn" for j in range(NDR)
-        ]
-        missing = [p for p in want if not any(k.endswith(p) for k in planes.PLANES)]
-        if missing:
-            raise MonoUnsupported(
-                f"no expert plane for {missing[:3]} (planes.capture not run at load)"
-            )
-        self.planes = {
-            p: next(v for k, v in planes.PLANES.items() if k.endswith(p)) for p in want
-        }
         logger.info(
-            "V4.1 single-launch step: %.1f MB scratch, %.1f MB receive, %d planes (rank %d)",
+            "V4.1 single-launch step: %.1f MB scratch, %.1f MB receive (rank %d)",
             sum(t.numel() for t in self.scratch.values()) / 2**20,
             RECV_BYTES / 2**20,
-            len(self.planes),
             self.rank,
         )
         from atom.models.deepseek_v41.mono.gfx1250.tables import StepTables

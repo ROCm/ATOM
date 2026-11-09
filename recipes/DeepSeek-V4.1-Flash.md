@@ -232,11 +232,9 @@ DSpark proposer of a served step
   index cache, up to 8 requests (6 verify rows each), no DSpark confidence
   schedule or ragged verify. Anything else is refused at load
   (`V4.1 single-launch step off: <why>`).
-- **Memory.** The kernel keeps its own copy of the routed experts in its
-  layout (~81 GB a rank: 40 layers x 384 experts and the draft's 3 x 128,
-  5.16 MB an expert), packed at load. On MI455X TP4 this moves the KV pool
-  from ~275 GB to ~199 GB a rank (796,939 -> 577,335 blocks of 128 tokens,
-  ~102M -> ~74M tokens): still over 1M tokens a request at 64 sequences.
+- **Memory.** The kernel reads the routed experts in place, as the
+  production MoE keeps them (no second copy). Its own buffers a rank: ~77 MB
+  scratch, ~28 MB peer receive and the shared experts' FP8 planes (~0.4 GB).
 - **Steps it does not serve** take the production path; it says why once per
   kind in the log (`not served (...)`). These are:
   - prefill;

@@ -4,8 +4,7 @@
 stages and the step tail in a single persistent kernel.
 
 Switched like the gfx950 mono decode: on (``ATOM_MONO_ENABLE``, default 1) on a gfx1250 device for the deployment it is
-written for (``config.config_refusal``), decided before the model is built so the MoE layers can pack their routed
-experts into ``weights.planes`` before the loader shuffles them in place."""
+written for (``config.config_refusal``)."""
 
 import torch
 
@@ -30,7 +29,3 @@ def refusal(atom_config) -> str | None:
     from atom.models.deepseek_v41.mono.kernels.dims import Dims
 
     return config_refusal(atom_config, Dims)
-
-
-def serves(atom_config) -> bool:
-    return enabled() and refusal(atom_config) is None

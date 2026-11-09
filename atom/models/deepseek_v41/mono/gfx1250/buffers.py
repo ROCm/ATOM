@@ -51,7 +51,6 @@ FPTRS_ROLE = {
     "ncomb": SCRATCH,
     "ids": SCRATCH,
     "wts": SCRATCH,
-    "mplane": WEIGHT,  # routed experts, plane layout (planes.PLANES), every MoE layer
     "mout": SCRATCH,
     "mid8": SCRATCH,
     "midc": SCRATCH,

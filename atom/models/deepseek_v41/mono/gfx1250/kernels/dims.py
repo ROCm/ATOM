@@ -29,6 +29,7 @@ DSPARK_W = 5  # draft tokens a request (a draft block's rows)
 TP = 4
 HEADS = Q_HEADS // TP  # 16 attention heads a rank
 MOE_I = MOE_INTER // TP  # 576 expert intermediate columns a rank
+MOE_IPAD = 640  # MOE_I as the production MoE stores it, padded (the kernel reads its experts in place)
 VR = VOCAB // TP  # 32320 vocab rows a rank
 MAX_REQ = 8  # requests a step
 ROWS_PER_REQ = DSPARK_W + 1  # target rows a request: the anchor + its drafts

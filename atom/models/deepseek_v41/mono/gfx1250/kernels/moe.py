@@ -17,11 +17,13 @@
          (<= 3) experts in LDS; route weight applied; per (row, pick) fp32 partial to global. The shared expert's down:
          on the dedicated CTAs (< 3 token chunks) or on all CTAs after the routed down (>= 3).
 
-Weight plane (the runner's planes.py packing): per expert EXPU = 4480 units of 1152 B (one 16x16x128 FP4 A operand: 32 lanes x 32 B,
-then 32 x 4 E8M0 codes): 18 UG work units x (40 K steps x 4 tiles), then 320 DN tiles x 5 K steps. The shared expert:
-FP8 E4M3 (32x32-block E8M0 scales) in its own plane c["shplane"], UNIT8-byte units in the same order.
+Routed expert weights: the production tensors as loaded (MXFP4, aiter shuffle_weight (16, 16): [E][N/16][K/32][2][16 rows]
+[16 B]; w13 rows gate / up interleaved (GUGU), its N = 2 x 768 (576 padded); w2 K = 768 padded; E8M0 scales n32k4:
+[E][N/32][K/128][32 rows][4 codes]). An A operand (16 rows x 128 K, unit (tile t, K step k)) is two 512-byte blocks and
+32 x 4 codes (``lda``). The shared expert: FP8 E4M3 (32x32-block E8M0 scales) in its own plane c["shplane"] (UNIT8-byte
+units: 18 UG work units x 160, then 320 DN tiles x 5).
 
-`c` keys: t b w l sm (traced); pointers (Int64): plane shplane x8 xs ids wts out mid8 midc shcnt; python ints: NP (picks
+`c` keys: t b w l sm (traced); pointers (Int64): w13 s13 w2 s2 shplane x8 xs ids wts out mid8 midc shcnt; python ints: NP (picks
 used = rows x 6), nexp_max. Exchange stores are device-scope (hx.stx_dev, the fence-free handoff).
 """
 from __future__ import annotations
@@ -41,8 +43,11 @@ import stamps
 from attention import q8words, bf, e8m0_of, handoff, inv_pow2
 
 H, I, TOPK, NE, CTAS = D.HID, D.MOE_I, D.TOPK, D.EXPERTS, D.CTAS
-UNIT, UGU, NUG, DNU, NDN = 1152, 160, 18, 5, 320
-EXPU = NUG * UGU + NDN * DNU               # 4480 units an expert
+UGU, NUG, DNU, NDN = 160, 18, 5, 320
+# the production routed-expert tensors (bytes): a 16-row tile, a 32-row scale super-row, an expert
+IP = D.MOE_IPAD                             # I = 576 padded, as the production MoE stores its experts
+W13_TS, W13_KC, W13_E, S13_E = 16 * H // 2, H // 128 * 128, 2 * IP * H // 2, 2 * IP * H // 32
+W2_TS, W2_KC, W2_E, S2_E = 16 * IP // 2, IP // 128 * 128, H * IP // 2, H * IP // 32
 MAXTOK, MROW, CROW, KMID = 16, 640, 32, 640
 DUG = 16                                   # A units in flight (UG)
 MSLOT = 3                                  # experts a CTA stages for the down
@@ -80,7 +85,7 @@ sh_early, sh8_upc, sh8_dnov = MP.sh_early, MP.sh8_upc, MP.sh8_dnov
 
 
 def pslot(e, sm):
-    """plane slot of (virtual) expert id e (the shared pseudo-experts -> SHARED_SLOT, an overflow chunk -> its expert)."""
+    """routed expert of (virtual) expert id e (the shared pseudo-experts -> SHARED_SLOT, an overflow chunk -> its expert)."""
     r = (e >= NE).select(I32(SHARED_SLOT), e)
     ov = hx.lload(sm + O_VEXP + fx.max(e - V_OV0, I32(0)) * 4, I32)
     return (e >= V_OV0).select(ov, r)
@@ -153,12 +158,35 @@ def avec8(o):
     return fx.Vector.from_elements([o[k][e] for k in range(4) for e in range(4)], I32)
 
 
-def lda(u, l):
-    """A operand of the unit at byte address u: lane l's 32 B (8 dwords, packed as [2][32 lanes][16 B] so a load spans 4
-    cache lines, not 8) + its 4 scale codes."""
-    p = u + i64(l * 16)
-    return (hx.gload(p, I32, 4, nt=True), hx.gload(p + i64(512), I32, 4, nt=True),
-            hx.gload(u + i64(1024) + i64(l * 4), I32, nt=True))
+def lane_offs(l, gugu):
+    """Lane l's byte offsets in an A operand: (weights, scale codes). Lane l reads tile row r' (UG: lanes 0..7 the gate
+    rows 0..7 = even rows, lanes 8..15 the up rows = odd rows; DN: row l % 16), K half l // 16."""
+    r = l % 16
+    rp = ((r < 8).select(2 * r, 2 * r - 15)) if gugu else r
+    return i64(((l // 16) * 16 + rp) * 16), i64(rp * 4)
+
+
+def lda(w, s, lo):
+    """A operand: lane lo's 32 B of the unit's two 512-byte blocks at w, w + 512 (each a load of 4 cache lines) + its 4
+    scale codes at s."""
+    return (hx.gload(w + lo[0], I32, 4, nt=True), hx.gload(w + i64(512) + lo[0], I32, 4, nt=True),
+            hx.gload(s + lo[1], I32, nt=True))
+
+
+def ug_refill2(ra, wb, sb, lo, k1, kk, KB):
+    """Ring slots kk - 1, kk refilled with K steps k1 - 1, k1, issued tile-major: a tile's two K steps are 2 KB
+    contiguous (the 4 tiles of a K step are 40 KB apart in the production layout; one K step at a time was ~0.8 us a
+    layer slower)."""
+    na = {}
+    for tile in range(4):
+        for d in (1, 0):
+            na[(kk - d) * 4 + tile] = lda(*ug_unit(wb, sb, k1 - d, tile), lo)
+    return [na.get(i, ra[i]) for i in range(4 * KB)]
+
+
+def ug_unit(wb, sb, ks, tile):
+    """(weights, scales) of UG unit (K step ks, tile of 4) of the group whose first tile is at wb / sb."""
+    return wb + i64(tile * W13_TS) + i64(ks) * 1024, sb + i64((tile // 2) * W13_KC + (tile % 2) * 64) + i64(ks) * 128
 
 
 def avec(o):
@@ -378,13 +406,16 @@ def moe_combine(c, TR, sm_out):
     gpu.barrier()
 
 
-def ug_ring_init(ab, xrow, srow, l, KB):
+def ug_ring_init(wb, sb, lo, xrow, srow, l, KB):
     """The UG register rings, issued in the loop's order (per K step: 4 A units then the B) so the rolled loop's
     waits stay partial."""
     ra, rb = [], []
-    for kk in range(KB):
-        ra = ra + [lda(ab + i64((kk * 4 + tile) * UNIT), l) for tile in range(4)]
-        rb = rb + [ldb_g(xrow, srow, kk, l)]
+    ra = [None] * (4 * KB)
+    for k0 in range(0, KB, 2):   # a tile's two K steps back to back (2 KB contiguous; see ug_refill2)
+        for tile in range(4):
+            for kk in (k0, k0 + 1):
+                ra[kk * 4 + tile] = lda(*ug_unit(wb, sb, kk, tile), lo)
+        rb = rb + [ldb_g(xrow, srow, k0, l), ldb_g(xrow, srow, k0 + 1, l)]
         sched_barrier()
     return ra, rb
 
@@ -432,8 +463,8 @@ def moe_ug(c):
             e = hx.lload(sm + O_UNI + ui * 4, I32)
             n = fx.min(hx.lload(sm + O_CNT + e * 4, I32), I32(MAXTOK))
             pk = hx.lload(sm + O_LST + (e * MAXTOK + (tl < n).select(tl, I32(0))) * 4, I32)
-            ab = c["plane"] + (i64(pslot(e, sm)) * EXPU + i64(g) * UGU) * UNIT
-            acc = ug_body(c, pk, ab)
+            ex = i64(pslot(e, sm))
+            acc = ug_body(c, pk, c["w13"] + ex * W13_E + i64(g) * (4 * W13_TS), c["s13"] + ex * S13_E + i64(g) * (2 * W13_KC))
         ug_epilogue(c, ui, g, n, acc)
     if fx.const_expr(SH8_DNOV):
         # the dedicated CTAs: once all NSHU shared units' MID is out (a counter among them), the shared down
@@ -594,15 +625,16 @@ def ug_shared_fin(c, su):
 
 
 @ASTRewriter.transform
-def ug_body(c, pk, ab):
-    """One UG work unit (32 MID cols: 4 tiles x 40 K steps) of the expert whose A units start at ab, for the tokens of
-    pick list pk (lane tl's pick); returns the 4 tiles' accumulators."""
+def ug_body(c, pk, wb, sb):
+    """One UG work unit (32 MID cols: 4 tiles x 40 K steps) of the expert, its first tile's weights / scales at wb / sb,
+    for the tokens of pick list pk (lane tl's pick); returns the 4 tiles' accumulators."""
     l = c["l"]
+    lo = lane_offs(l, True)
     row = prow(pk, c["NP"], c["topk"])
     xrow = c["x8"] + i64(row) * H
     srow = c["xs"] + i64(row) * (H // 32)
     KB = DUG // 4
-    ra, rb = ug_ring_init(ab, xrow, srow, l, KB)
+    ra, rb = ug_ring_init(wb, sb, lo, xrow, srow, l, KB)
     # rolled over the 40 K steps in blocks of KB, fixed ring slots (slot kk*4+tile / kk refilled with K step
     # ks + KB right after K step ks used it): ~1/10 of the unrolled code, and no ring shifting through
     # loop-carried registers (that made the compiler wait for every load at the loop top)
@@ -612,9 +644,9 @@ def ug_body(c, pk, ab):
             ks = j * KB + kk
             bq = rb[kk]
             acc = [wmma_fp4(avec(ra[kk * 4 + tile]), ra[kk * 4 + tile][2], bq[0], bq[1], acc[tile]) for tile in range(4)]
-            na = [lda(ab + (i64(ks + KB) * 4 + tile) * UNIT, l) for tile in range(4)]
-            ra = ra[:kk * 4] + na + ra[kk * 4 + 4:]
-            rb = rb[:kk] + [ldb_g(xrow, srow, ks + KB, l)] + rb[kk + 1:]
+            if kk % 2 == 1:   # slots kk - 1, kk: K steps ks + KB - 1, ks + KB
+                ra = ug_refill2(ra, wb, sb, lo, ks + KB, kk, KB)
+                rb = rb[:kk - 1] + [ldb_g(xrow, srow, ks + KB - 1, l), ldb_g(xrow, srow, ks + KB, l)] + rb[kk + 1:]
             sched_barrier()
     for kk in range_constexpr(KB):
         bq = rb[kk]
@@ -670,6 +702,7 @@ def moe_dn(c):
     (row, pick) partials to out."""
     w, l, b, sm = c["w"], c["l"], c["b"], c["sm"]
     tl = l % 16
+    lo = lane_offs(l, False)
     nuni = ufl(hx.lload(sm + O_NUNI, I32))
     Ud = dn_nuni(c, nuni) * NDN
     d0 = ufl((b * Ud) // CTAS)
@@ -688,8 +721,10 @@ def moe_dn(c):
 
     def loads(inf):
         tile, ui, tt, e = inf
-        base = c["plane"] + (i64(pslot(e, sm)) * EXPU + i64(NUG * UGU) + i64(tt) * DNU) * UNIT
-        return [lda(base + i64(ks * UNIT), l) for ks in range(DNU)]
+        ex = i64(pslot(e, sm))
+        wb = c["w2"] + ex * W2_E + i64(tt) * W2_TS
+        sb = c["s2"] + ex * S2_E + i64(tt // 2) * W2_KC + i64(tt % 2) * 64
+        return [lda(wb + i64(ks * 1024), sb + i64(ks * 128), lo) for ks in range(DNU)]
 
     PD = DN_PD
     bnd = (uiA + 1) * NDN
