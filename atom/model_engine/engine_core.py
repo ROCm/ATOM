@@ -519,9 +519,8 @@ class EngineCore:
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
-        if (
-            self.kv_transfer_enabled
-            and scheduled_batch.connector_meta_output is not None
+        if self.kv_transfer_enabled and connector_metadata_has_work(
+            scheduled_batch.connector_meta_output
         ):
             self.runner_mgr.call_func(
                 "process_kvconnector_output", scheduled_batch.connector_meta_output
@@ -552,6 +551,11 @@ class EngineCore:
 
         if not has_seqs:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
+            if self.kv_transfer_enabled:
+                # Let worker completion receiver threads run while the engine
+                # waits for remote KV instead of repeatedly spinning on an
+                # empty batch and delaying the TP completion quorum.
+                time.sleep(KV_IDLE_DRAIN_INTERVAL_S)
             return False
 
         self._postprocess(seqs.values(), fwd_out, scheduled_batch)
