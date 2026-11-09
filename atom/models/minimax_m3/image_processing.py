@@ -10,6 +10,7 @@ model nor AITER to render a prompt.
 from typing import TYPE_CHECKING, Any
 
 from atom.model_engine.multimodal_runtime import multimodal_cache_seed
+from atom.multimodal.processing import media_token_spans
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -40,17 +41,6 @@ def image_input_refusal(atom_config: "Config") -> str | None:
         # recorded on input_ids alone (`_run_capture_prefill`).
         return f"--cudagraph-mode {mode.name} (image input needs FULL or eager)"
     return None
-
-
-def _image_token_spans(input_ids: list[int], token_id: int) -> list[tuple]:
-    spans, start = [], None
-    for index, token in enumerate(input_ids + [None]):
-        if token == token_id and start is None:
-            start = index
-        elif token != token_id and start is not None:
-            spans.append((start, index - start))
-            start = None
-    return spans
 
 
 def build_minimax_m3_inputs(
@@ -97,18 +87,12 @@ def build_minimax_m3_inputs(
     )
     input_ids = processed["input_ids"][0].tolist()
     grid_thw = processed["image_grid_thw"]
-    spans = _image_token_spans(input_ids, token_id)
     merge_length = processor.image_processor.merge_size**2
     expected = [int(n) // merge_length for n in grid_thw.prod(-1).tolist()]
-    if [count for _, count in spans] != expected:
-        raise ValueError(
-            f"Image token runs {[c for _, c in spans]} disagree with the "
-            f"processed grids {expected}"
-        )
     data = {
         "pixel_values": processed["pixel_values"],
         "image_grid_thw": grid_thw,
-        "embedding_spans": tuple(spans),
+        "embedding_spans": media_token_spans(input_ids, expected, token_id),
     }
     data["cache_seed"] = multimodal_cache_seed(data)
     return input_ids, data

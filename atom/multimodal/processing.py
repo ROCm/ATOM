@@ -52,6 +52,44 @@ def expand_media_placeholders(
     return expanded, tuple(spans)
 
 
+def media_token_spans(
+    input_ids: Sequence[int],
+    tokens_per_media: Sequence[int],
+    placeholder_token_id: int,
+) -> tuple[tuple[int, int], ...]:
+    """Each media item's ``(start, count)`` run in already-expanded ids.
+
+    For processors that expand every placeholder themselves (Qwen3.5,
+    MiniMax-M3): the prompt already holds one placeholder token per embedding
+    row. Walk it and claim each item's run in turn, with the length its grid
+    produces, so adjacent items without separator tokens split correctly too.
+    The result is the ``embedding_spans`` that let an image prefill be chunked.
+    """
+    spans: list[tuple[int, int]] = []
+    position = 0
+    for index, count in enumerate(int(c) for c in tokens_per_media):
+        while position < len(input_ids) and input_ids[position] != placeholder_token_id:
+            position += 1
+        run = input_ids[position : position + count]
+        found = next(
+            (i for i, token in enumerate(run) if token != placeholder_token_id),
+            len(run),
+        )
+        if found != count:
+            raise ValueError(
+                f"media item {index} needs {count} consecutive placeholder tokens "
+                f"but only {found} start at position {position}"
+            )
+        spans.append((position, count))
+        position += count
+    if any(token == placeholder_token_id for token in input_ids[position:]):
+        raise ValueError(
+            f"prompt has more placeholder tokens than its {len(tokens_per_media)} "
+            "media items produce"
+        )
+    return tuple(spans)
+
+
 def _bind_images_to_messages(
     conversation: list[dict[str, Any]], images: list
 ) -> list[dict[str, Any]]:

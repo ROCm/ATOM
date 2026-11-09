@@ -357,3 +357,98 @@ def test_qwen3_5_image_prompt_is_chunked_and_resumes_after_a_prefix_hit():
     # `[0, 2048]` crash in ROCm/ATOM#2865).
     again = Sequence(token_ids, 4, params, multimodal_data=dict(data))
     assert prefill(again) == [4]
+
+
+def _cached_qwen3_5_processor():
+    """The real Qwen3.5 processor, when its files are in the local HF cache."""
+    transformers = pytest.importorskip("transformers")
+    pytest.importorskip("PIL")
+    pytest.importorskip("torchvision")  # the Qwen3-VL processor needs it
+    try:
+        return transformers.AutoProcessor.from_pretrained(
+            "Qwen/Qwen3.5-0.8B", local_files_only=True
+        )
+    except OSError:
+        pytest.skip("Qwen/Qwen3.5-0.8B is not in the local Hugging Face cache")
+
+
+class MergingVisionModel(VisionModel):
+    """One row per merged 2x2 patch group, as the real vision tower returns."""
+
+    def get_vision_embeddings(self, values, grids):
+        rows = int(grids.prod(-1).sum()) // 4
+        return values.reshape(rows, -1)[:, :2] + 100
+
+
+def test_qwen3_5_real_processor_spans_survive_every_prefix_hit():
+    # ROCm/ATOM#2865 with the real HF processor instead of a stub: two images
+    # of different sizes back to back, then text. For a prefix hit ending
+    # before, inside, between, at the end of and past the images, the forward
+    # must get exactly the image rows it still holds.
+    from PIL import Image
+
+    from atom.models.qwen3_5_vl import build_qwen_vl_inputs
+
+    processor = _cached_qwen3_5_processor()
+    atom_config = SimpleNamespace(
+        multimodal_config=SimpleNamespace(
+            model_type="qwen3_5",
+            image_token_id=248056,
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+        )
+    )
+    images = [Image.new("RGB", (256, 256), "red"), Image.new("RGB", (320, 256))]
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "image"},
+                {"type": "text", "text": "What differs between these?"},
+            ],
+        }
+    ]
+    token_ids, data = build_qwen_vl_inputs(
+        atom_config, processor, conversation, images, {}
+    )
+    spans = data["embedding_spans"]
+    image_positions = [i for i, t in enumerate(token_ids) if t == 248056]
+    assert [p for start, count in spans for p in range(start, start + count)] == (
+        image_positions
+    )
+    merged = [int(n) // 4 for n in data["image_grid_thw"].prod(-1).tolist()]
+    assert [count for _, count in spans] == merged
+
+    model = MergingVisionModel()
+    full_ids = torch.tensor(token_ids)
+    rows = model.get_vision_embeddings(
+        data["pixel_values"].float(), data["image_grid_thw"]
+    )
+    expected = model.embed_input_ids(full_ids)
+    expected[image_positions] = rows
+    (first, first_count), (second, second_count) = spans
+    for cached in sorted(
+        {
+            first - 1,
+            first + first_count // 2,
+            second,
+            second + second_count - 1,
+            second + second_count,
+            len(token_ids) - 1,
+        }
+    ):
+        batch = SimpleNamespace(
+            req_ids=[4],
+            num_scheduled_tokens=[len(token_ids) - cached],
+            context_lens=[len(token_ids)],
+            multimodal_data={4: data},
+        )
+        actual = embed_multimodal_batch(
+            model,
+            VisionEmbeddingCache(),
+            full_ids[cached:],
+            batch,
+            "cpu",
+            torch.float32,
+        )
+        torch.testing.assert_close(actual, expected[cached:], rtol=0, atol=0)
