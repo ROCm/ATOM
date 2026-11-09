@@ -16791,6 +16791,21 @@ models:
             common:
               <<: *m31_s65822_env
               ATOMESH_M31_P_EXTRA_ARGS: --long-prefill-token-threshold 4096
+        # Higher interactivity at a TTFT p90 of about 2 s: caps 3-5 at C36-C56 cost 8-20 s.
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c40-dcap6
+          concurrency: [40]
+          env:
+            common:
+              <<: *m31_s65822_env
+              ATOMESH_M31_D_MAX_SEQS: "6"
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c32-dcap5
+          concurrency: [32]
+          env:
+            common:
+              <<: *m31_s65822_env
+              ATOMESH_M31_D_MAX_SEQS: "5"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
