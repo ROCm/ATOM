@@ -145,7 +145,6 @@ def publish_tile_argmax(
     row_mask,
     v_mask,
     num_rows,
-    vocab_size,
     vocab_offset,
     part_val_ptr,
     part_idx_ptr,
@@ -155,10 +154,10 @@ def publish_tile_argmax(
     # `v_mask` also covers the all--inf row: without it a padded lane, which
     # is -inf too, could win the id.
     tile_max, tile_idx = argmax_lowest_id(
-        vals, offs_v[None, :], v_mask[None, :], vocab_size
+        vals, offs_v[None, :], v_mask[None, :], 2147483647
     )
-    # Global id; the no-hit sentinel stays `vocab_size`, unoffset and out of
-    # range, which `argmax_of_tiles` passes through to the caller.
-    tile_idx = tl.where(tile_idx < vocab_size, tile_idx + vocab_offset, vocab_size)
+    # Global id. A tile with no hit (all NaN) keeps `argmax_of_tiles`' one
+    # sentinel, unoffset, which it answers as id 0 for an all-NaN row.
+    tile_idx = tl.where(tile_idx != 2147483647, tile_idx + vocab_offset, 2147483647)
     tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
     tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)

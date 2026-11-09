@@ -139,7 +139,6 @@ def _markov_stage1(
         row_mask,
         v_mask,
         num_rows,
-        vocab_size,
         vocab_offset,
         part_val_ptr,
         part_idx_ptr,

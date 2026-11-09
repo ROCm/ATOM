@@ -31,10 +31,9 @@ def argmax_lowest_id(key, ids, mask, sentinel):
 def argmax_of_tiles(part_val_ptr, part_idx_ptr, row, num_rows, num_tiles, BLOCK_TILE):
     """One row's ``(max, lowest id)`` from its tiles' pairs, stored
     ``[num_tiles, num_rows]``, picking among tiles that tie as
-    `argmax_lowest_id` does within one. Only the ``2147483647`` sentinel maps
-    to id 0; a row whose winning tile published another out-of-range id (all
-    NaN, from a caller with its own sentinel) keeps it, for the caller to map
-    into range."""
+    `argmax_lowest_id` does within one. Tiles with no hit publish the
+    ``2147483647`` sentinel, so a row whose every tile is all NaN answers id
+    0, as ``torch.argmax`` would."""
     offs_tile = tl.arange(0, BLOCK_TILE)
     tile_mask = offs_tile < num_tiles
     vals = tl.load(

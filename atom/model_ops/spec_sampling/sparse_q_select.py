@@ -305,10 +305,7 @@ def _dspark_q_finalize(
         best_slot = tl.where(better, chunk_slot, best_slot)
 
     drawn = best > 0.0
-    # Markov stage 1 publishes `vocab_size` as its no-hit id, which an all-NaN
-    # row's combine keeps; answer 0, in range.
-    argmax = tl.load(row_argmax_ptr + row)
-    x = tl.where(drawn, best_id, tl.where(argmax < vocab_size, argmax, 0))
+    x = tl.where(drawn, best_id, tl.load(row_argmax_ptr + row))
     tl.store(q_ids_ptr + base, x, mask=has_q & ~drawn)
     tl.store(q_probs_ptr + base, 1.0, mask=has_q & ~drawn)
     tl.store(q_meta_ptr + (q_base + position).to(tl.int64) * 2, n, mask=has_q & drawn)

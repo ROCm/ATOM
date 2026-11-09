@@ -192,6 +192,45 @@ def test_sharded_sampling_matches_the_whole_vocab(tp, rows):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("tp", [1, 4])
+def test_an_all_nan_row_drafts_id_0_at_a_vocab_off_the_tile_width(tp):
+    """An all-NaN row drafts id 0, as `torch.argmax` does, also where the
+    (shard) vocab is not a multiple of the V tile, so its tail tile has no
+    hit: one GPU at V = 129 * 128 + 64, and four shards of that width (V4.1
+    at TP4 has 32320, %128 = 64). Other rows are unaffected."""
+    from atom.model_ops.dspark_markov_argmax import _launch, dspark_markov_argmax_tp
+
+    shard, rows, rank = 129 * 128 + 64, 3, 32
+    vocab = shard * tp
+    base, prev, w1, w2 = _tables(rows, vocab, rank, "cuda")
+    w1, w2 = w1 * 0.05, w2 * 0.05
+    base[1] = float("nan")
+    ref = _ids(rows, "cuda", torch.int32)
+    dspark_markov_argmax(base[[0, 2]], prev[[0, 2]], w1, w2, ref[:2])
+    if tp == 1:
+        out = _ids(rows, "cuda", torch.int32)
+        dspark_markov_argmax(base, prev, w1, w2, out)
+    else:
+        packs = []
+        for r in range(tp):
+            packed = torch.empty(rows, 2, dtype=torch.float32, device="cuda")
+            _launch(
+                base[:, r * shard : (r + 1) * shard],
+                prev,
+                w1,
+                w2,
+                ref,
+                r * shard,
+                packed,
+            )
+            packs.append(packed)
+        out = _ids(rows, "cuda", torch.int32)
+        dspark_markov_argmax_tp(base[:, :shard], prev, w1, w2, out, 0, _TpGroup(packs))
+    assert out[1].item() == 0
+    assert out[0].item() == ref[0].item() and out[2].item() == ref[1].item()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("num_j", [2, 4, 8])
 @pytest.mark.parametrize("rows", [1, 32, 160, 2048])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
