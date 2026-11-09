@@ -367,6 +367,8 @@
     .ex-legend button { display: flex; align-items: center; gap: 9px; border: none; padding: 6px 0; background: none; font: inherit; font-size: 13px; color: var(--text-primary); cursor: pointer; text-align: left; }
     .ex-legend button[aria-pressed="false"] { opacity: .4; text-decoration: line-through; }
     .ex-dot { width: 10px; height: 10px; flex-shrink: 0; border-radius: 50%; background: var(--series-color); display: inline-block; }
+    .ex-dot[data-mode="aggregated"] { border-radius: 1px; }
+    .ex-dot[data-mode="unknown"] { border-radius: 0; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
     .ex-check { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; margin-top: 14px; padding-top: 15px; border-top: 1px solid var(--border-light); color: var(--text-secondary); cursor: pointer; }
     .ex-check input { appearance: none; width: 29px; height: 17px; flex-shrink: 0; border-radius: 20px; background: var(--border); border: 1px solid var(--border); cursor: pointer; position: relative; }
     .ex-check input::after { content: ''; position: absolute; width: 11px; height: 11px; border-radius: 50%; background: var(--text-secondary); top: 2px; left: 2px; transition: transform .15s; }
@@ -861,6 +863,14 @@ function atomeshPointRow(point, meta, idx) {
     sourceLabel: point.source_label || 'ATOM CI',
     sourceUrl: point.source_url || '',
     sourceStatus: point.source_status || '',
+    prNumber: atomeshPointNumber(point, 'pr_number'),
+    prUrl: point.pr_url || '',
+    headSha: point.head_sha || '',
+    runAttempt: atomeshPointNumber(point, 'run_attempt'),
+    sweepRunAttempt: atomeshPointNumber(point, 'sweep_run_attempt'),
+    disaggregated: point.disaggregated ?? point.disagg ?? null,
+    isMultinode: typeof point.is_multinode === 'boolean' ? point.is_multinode : null,
+    nodeCount: atomeshPointNumber(point, 'num_nodes') ?? atomeshPointNumber(point, 'node_count'),
     topology: meta.display_topology || point.config_label || 'unknown',
     islOsl: Number.isFinite(isl) && Number.isFinite(osl) ? `${isl}/${osl}` : '--',
     isl,
@@ -1825,10 +1835,11 @@ function getFilterState(id) {
 
 function appendDashboardModeSelector(bar) {
   const group = document.createElement('div');
+  const modeLabel = mode => mode === 'Disaggregated' ? 'Explorer' : mode;
   group.className = 'filter-group dashboard-mode-group';
-  group.innerHTML = `<button class="filter-btn" data-filter="dashboard-mode">${state.dashboardMode} ▾</button>
+  group.innerHTML = `<button class="filter-btn" data-filter="dashboard-mode">${modeLabel(state.dashboardMode)} ▾</button>
     <div class="filter-dropdown" id="fd-dashboard-mode">
-      ${DASHBOARD_MODES.map(mode => `<label><input type="radio" name="dashboard-mode" value="${mode}" ${state.dashboardMode === mode ? 'checked' : ''}> ${mode}</label>`).join('')}
+      ${DASHBOARD_MODES.map(mode => `<label><input type="radio" name="dashboard-mode" value="${mode}" ${state.dashboardMode === mode ? 'checked' : ''}> ${modeLabel(mode)}</label>`).join('')}
     </div>`;
   bar.appendChild(group);
 }
@@ -4094,7 +4105,7 @@ function buildExplorerBenchmarkRows(data) {
       if (parsed?.point?.source !== 'ATOMesh') continue;
       const row = atomeshPointRow(parsed.point, parsed.meta, index++);
       const model = atomeshMergedModelName(row);
-      const key = JSON.stringify([row.sourceLabel, row.hardware, model,
+      const key = JSON.stringify([row.sourceLabel, row.hardware, model, explorerDeployment(row),
         row.configLabel || row.topology, explorerWorkloadKey(row), row.concurrency]);
       if (latest.has(key)) continue;
       latest.set(key, { ...row, model,
@@ -4126,7 +4137,37 @@ function explorerModelName(model) {
   return atomeshBaseModelName(model).split('/').pop().replace(/-(?:MXFP4|FP4|FP8|BF16)(?:-MTP\d*)?$/i, '');
 }
 
+function explorerDeployment(row) {
+  const declared = row.disaggregated;
+  if (declared === true || ['true', '1', 'yes'].includes(String(declared).toLowerCase())) return 'pd';
+  if (declared === false || ['false', '0', 'no'].includes(String(declared).toLowerCase())) return 'aggregated';
+  const topology = `${row.sourceTopology || ''} ${row.topology || ''} ${row.configLabel || ''}`;
+  if (/(?:^|[\s_-])agg(?:regated)?(?:[\s_-]|$)/i.test(topology)) return 'aggregated';
+  if ((row.prefillWorkers > 0 && row.decodeWorkers > 0) || /\d+p\d+d/i.test(topology)) return 'pd';
+  // Node placement is independent: PD can run on one physical node.
+  return 'unknown';
+}
+
+function explorerDeploymentLabel(row) {
+  return { pd: 'PD', aggregated: 'Aggregated', unknown: 'Mode unknown' }[explorerDeployment(row)];
+}
+
+function explorerSeriesKey(row) {
+  return JSON.stringify([row.sourceLabel || 'ATOM CI', row.hardware, row.model, explorerDeployment(row)]);
+}
+
+function explorerFrontiers(points) {
+  const cohorts = new Map();
+  for (const point of points) {
+    const key = explorerSeriesKey(point.row);
+    if (!cohorts.has(key)) cohorts.set(key, []);
+    cohorts.get(key).push(point);
+  }
+  return [...cohorts.values()].map(atomeshParetoFrontier);
+}
+
 function explorerTopology(row) {
+  if (explorerDeployment(row) === 'aggregated') return 'Aggregated';
   if (row.prefillWorkers && row.decodeWorkers) return `${row.prefillWorkers}P${row.decodeWorkers}D`;
   return row.sourceTopology || row.topology || 'Unknown topology';
 }
@@ -4164,8 +4205,11 @@ function renderAtomeshPerformanceTab() {
   const modelRows = available.filter(row => explorerModelName(row.model) === state.explorerModel);
   const sourceName = row => row.sourceLabel || 'ATOM CI';
   const sources = [...new Set(modelRows.map(sourceName))].sort(_lc);
+  if (sources.length > 1) sources.push('__compare__');
   if (!sources.includes(state.explorerSource)) state.explorerSource = sources[0] || '';
-  const sourceRows = modelRows.filter(row => sourceName(row) === state.explorerSource);
+  const compareSources = state.explorerSource === '__compare__';
+  const sourceLabel = compareSources ? 'Compare sources' : state.explorerSource;
+  const sourceRows = compareSources ? modelRows : modelRows.filter(row => sourceName(row) === state.explorerSource);
   const workloads = [...new Set(sourceRows.map(explorerWorkloadKey))].sort(_lc);
   if (!workloads.includes(state.explorerWorkload)) {
     state.explorerWorkload = workloads.find(key => sourceRows.some(row => explorerWorkloadKey(row) === key
@@ -4173,28 +4217,33 @@ function renderAtomeshPerformanceTab() {
   }
   const rows = sourceRows.filter(row => explorerWorkloadKey(row) === state.explorerWorkload)
     .sort((a, b) => _lc(explorerTopology(a), explorerTopology(b)) || a.concurrency - b.concurrency);
-  const seriesKey = row => row.model;
+  const seriesKey = explorerSeriesKey;
   const seriesKeys = [...new Set(rows.map(seriesKey))];
-  const seriesLabel = key => `${fmtHardware(selectedHardware())} · ATOM${seriesKeys.length > 1 ? ' · ' + key : ''}`;
+  const seriesRows = new Map(rows.map(row => [seriesKey(row), row]));
+  const seriesLabel = key => {
+    const row = seriesRows.get(key);
+    const origin = sourceName(row).match(/PR #\d+/)?.[0] || sourceName(row).match(/#\d+/)?.[0] || sourceName(row);
+    const variant = /eagle3/i.test(row.model) ? ' · Eagle3' : '';
+    return `${fmtHardware(row.hardware)} · ATOM ${explorerDeploymentLabel(row)}${variant}${compareSources ? ' · ' + origin : ''}`;
+  };
   const light = document.documentElement.getAttribute('data-theme') === 'light';
-  const palette = light ? ['#d4385a', '#326acc', '#16856b', '#ae791e', '#865bc4'] : ['#ff6685', '#75a5ff', '#5fceb0', '#e7b96e', '#bc9bed'];
-  const colors = new Map(seriesKeys.map((key, i) => [key, palette[i % palette.length]]));
+  const palette = light ? { pd: ['#d4385a', '#a34591'], aggregated: ['#326acc', '#16856b'], unknown: ['#69717e'] }
+    : { pd: ['#ff6685', '#de91d0'], aggregated: ['#75a5ff', '#5fceb0'], unknown: ['#a0a8b5'] };
+  const modeCounts = {};
+  const colors = new Map(seriesKeys.map(key => {
+    const mode = explorerDeployment(seriesRows.get(key));
+    const index = modeCounts[mode] || 0; modeCounts[mode] = index + 1;
+    return [key, palette[mode][index % palette[mode].length]];
+  }));
   const points = rows.filter(row => explorerMetricValue(row, metric) !== null
     && Number.isFinite(row.totalTput) && row.totalTput > 0
     && !state.explorerHidden.has(seriesKey(row)))
     .map(row => ({ x: explorerMetricValue(row, metric), y: row.totalTput, row }));
-  // Do not join different model variants (e.g. Eagle3) into one frontier.
-  const cohorts = new Map();
-  for (const point of points) {
-    const key = point.row.model;
-    if (!cohorts.has(key)) cohorts.set(key, []);
-    cohorts.get(key).push(point);
-  }
-  const frontiers = [...cohorts.values()].map(atomeshParetoFrontier);
+  const frontiers = explorerFrontiers(points);
   const frontierRows = new Set(frontiers.flat().map(point => point.row));
   const visible = points.filter(point => !state.explorerFrontierOnly || frontierRows.has(point.row));
   const missing = rows.filter(row => explorerMetricValue(row, metric) === null || !Number.isFinite(row.totalTput) || row.totalTput <= 0).length;
-  const sourceUrl = state.explorerSource === 'ATOM CI'
+  const sourceUrl = compareSources ? null : state.explorerSource === 'ATOM CI'
     ? 'https://github.com/ROCm/ATOM/actions/workflows/atomesh-benchmark.yaml'
     : safeHref(rows[0]?.sourceUrl || rows[0]?.runUrl);
   const optionHTML = (options, selected, label = x => x) => options.map(option => `<option value="${escHTML(option).replace(/"/g, '&quot;')}" ${option === selected ? 'selected' : ''}>${escHTML(label(option))}</option>`).join('');
@@ -4206,19 +4255,23 @@ function renderAtomeshPerformanceTab() {
     if (!row) return '<p class="ex-count">Select a configuration to inspect its measurements.</p>';
     return `<dl class="ex-metric-hero"><dt>Total throughput</dt><dd>${explorerCompact(row.totalTput, 2)} <small>tok/s</small></dd></dl>
       <dl class="ex-metric-list">
+        <div><dt>Serving mode</dt><dd>${explorerDeploymentLabel(row)}</dd></div>
+        ${row.runAttempt ? `<div><dt>Point attempt</dt><dd>${row.runAttempt}${row.sweepRunAttempt > row.runAttempt ? ' · retained' : ''}</dd></div>` : ''}
+        ${row.prNumber && safeHref(row.prUrl) ? `<div><dt>PR / commit</dt><dd><a href="${escHTML(row.prUrl).replace(/"/g, '&quot;')}" target="_blank" rel="noopener noreferrer">#${row.prNumber}</a>${row.headSha ? ' · ' + escHTML(row.headSha.slice(0, 7)) : ''}</dd></div>` : ''}
         <div><dt>P90 interactivity</dt><dd>${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), v => fmtNum(v, 2))}</dd></div>
         <div><dt>P90 normalized</dt><dd>${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</dd></div>
         <div><dt>Concurrency</dt><dd>${row.concurrency ?? '—'}</dd></div>
         <div><dt>Topology / GPUs</dt><dd>${escHTML(explorerTopology(row))} / ${row.totalGpu ?? '—'}</dd></div>
+        ${row.nodeCount || row.isMultinode !== null ? `<div><dt>Placement</dt><dd>${row.nodeCount ? row.nodeCount + ' node' + (row.nodeCount === 1 ? '' : 's') : row.isMultinode ? 'Multi-node' : 'Single node'}</dd></div>` : ''}
         <div><dt>Pareto optimal</dt><dd>${points.some(point => point.row === row) ? (frontierRows.has(row) ? 'Yes' : 'No') : '—'}</dd></div>
       </dl><p class="ex-count" style="margin-top:14px">Interactivity in tok/s/user</p>`;
   }
   container.innerHTML = `
     <section class="ex-config" aria-label="Benchmark configuration">
-      <div class="ex-config-head">Benchmark configuration <span>${rows.some(row => localRows.includes(row)) ? escHTML(rows[0]?.sourceStatus || 'Local measurements') : 'Latest result per recipe'}</span></div>
+      <div class="ex-config-head">Benchmark configuration <span>${compareSources ? 'Compared sources' : rows.some(row => localRows.includes(row)) ? escHTML(rows[0]?.sourceStatus || 'Local measurements') : 'Latest result per recipe'}</span></div>
       <div class="ex-controls">
         <div class="ex-field"><label for="ex-model">Model</label><select id="ex-model">${optionHTML(models, state.explorerModel)}</select></div>
-        <div class="ex-field"><label for="ex-source">Source</label><select id="ex-source">${optionHTML(sources, state.explorerSource)}</select></div>
+        <div class="ex-field"><label for="ex-source">Source</label><select id="ex-source">${optionHTML(sources, state.explorerSource, value => value === '__compare__' ? 'Compare sources' : value)}</select></div>
         <div class="ex-field"><label for="ex-workload">Workload / precision</label><select id="ex-workload">${optionHTML(workloads, state.explorerWorkload, explorerWorkloadLabel)}</select></div>
       </div>
     </section>
@@ -4246,7 +4299,7 @@ function renderAtomeshPerformanceTab() {
         <aside class="ex-sidebar" aria-label="Chart controls and configuration details">
           <div>
             <div class="ex-section-label"><span>Hardware / engine</span><span>${escHTML((rows[0]?.precision || '').toUpperCase())}</span></div>
-            <div class="ex-legend" aria-label="Series visibility">${seriesKeys.map((key, idx) => `<button data-ex-series="${idx}" aria-pressed="${!state.explorerHidden.has(key)}"><span class="ex-dot" style="--series-color:${colors.get(key)}"></span>${escHTML(seriesLabel(key))}</button>`).join('')}</div>
+            <div class="ex-legend" aria-label="Series visibility">${seriesKeys.map((key, idx) => `<button data-ex-series="${idx}" aria-pressed="${!state.explorerHidden.has(key)}"><span class="ex-dot" data-mode="${explorerDeployment(seriesRows.get(key))}" style="--series-color:${colors.get(key)}"></span>${escHTML(seriesLabel(key))}</button>`).join('')}</div>
             <label class="ex-check" for="ex-frontier"><span>Pareto only</span><input type="checkbox" id="ex-frontier" ${state.explorerFrontierOnly ? 'checked' : ''}></label>
             <p class="ex-count">${visible.length} shown · ${points.length} measured configurations</p>
           </div>
@@ -4264,7 +4317,7 @@ function renderAtomeshPerformanceTab() {
       <div class="ex-table-scroll"><table class="ex-table"><thead><tr><th>Configuration</th><th class="num">GPUs</th><th class="num">Concurrency</th><th class="num">P90 interactivity</th><th class="num">P90 normalized</th><th class="num">Total tok/s</th><th>CI run</th></tr></thead>
       <tbody>${rows.map((row, idx) => `<tr><td><button class="ex-button" data-ex-row="${idx}">${escHTML(explorerTopology(row))}</button></td><td class="num">${row.totalGpu ?? '—'}</td><td class="num">${row.concurrency ?? '—'}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(row.totalTput, v => fmtNum(v, 2))}</td><td>${explorerRunLink(row)}</td></tr>`).join('')}</tbody></table></div>
     </details>
-    <div class="ex-footer"><span>${sourceUrl ? `<a href="${escHTML(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escHTML(state.explorerSource)} ↗</a>` : escHTML(state.explorerSource)}${localRows.some(row => rows.includes(row)) ? ' · Local preview' : ''}${rows[0]?.sourceStatus ? ' · ' + escHTML(rows[0].sourceStatus) : ''}${missing ? ` · ${missing} configurations omitted from the chart: P90 metric or throughput unavailable.` : ''}</span><span>Total throughput = input + output tokens / second, across the full configuration.</span></div>`;
+    <div class="ex-footer"><span>${sourceUrl ? `<a href="${escHTML(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escHTML(sourceLabel)} ↗</a>` : escHTML(sourceLabel)}${localRows.some(row => rows.includes(row)) ? ' · Local preview' : ''}${!compareSources && rows[0]?.sourceStatus ? ' · ' + escHTML(rows[0].sourceStatus) : ''}${missing ? ` · ${missing} configurations omitted from the chart: P90 metric or throughput unavailable.` : ''}</span><span>Total throughput = input + output tokens / second, across the full configuration.</span></div>`;
 
   function updateRunLink(row, isPeak = false) {
     document.getElementById('ex-active-run').innerHTML = row
@@ -4322,8 +4375,8 @@ function renderAtomeshPerformanceTab() {
   };
   document.getElementById('ex-csv').addEventListener('click', () => {
     const escape = value => '"' + String(value ?? '').replace(/^[=+@-]/, "'$&").replace(/"/g, '""') + '"';
-    const records = [['model', 'source', 'workload', 'precision', 'topology', 'gpus', 'concurrency', 'p90_interactivity_tok_s_user', 'p90_normalized_interactivity_tok_s_user', 'total_throughput_tok_s', 'run_url'],
-      ...rows.map(row => [row.model, sourceName(row), row.publicDataset || row.scenario || row.islOsl, row.precision, explorerTopology(row), row.totalGpu, row.concurrency,
+    const records = [['model', 'source', 'workload', 'precision', 'serving_mode', 'topology', 'gpus', 'concurrency', 'p90_interactivity_tok_s_user', 'p90_normalized_interactivity_tok_s_user', 'total_throughput_tok_s', 'run_url'],
+      ...rows.map(row => [row.model, sourceName(row), row.publicDataset || row.scenario || row.islOsl, row.precision, explorerDeployment(row), explorerTopology(row), row.totalGpu, row.concurrency,
         explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), row.totalTput, row.runUrl])];
     download(new Blob([records.map(record => record.map(escape).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' }), 'atom-benchmark-measurements.csv');
   });
@@ -4332,6 +4385,7 @@ function renderAtomeshPerformanceTab() {
     const datasets = seriesKeys.filter(key => !state.explorerHidden.has(key)).map(key => ({
       label: key, data: visible.filter(point => seriesKey(point.row) === key),
       borderColor: colors.get(key), backgroundColor: colors.get(key),
+      pointStyle: explorerDeployment(seriesRows.get(key)) === 'aggregated' ? 'rect' : explorerDeployment(seriesRows.get(key)) === 'unknown' ? 'triangle' : 'circle',
       pointRadius: 4.5, pointHoverRadius: 6, pointHitRadius: 10,
       pointBorderWidth: 1.5, pointBorderColor: light ? '#ffffff' : '#18191b', showLine: false,
     }));
@@ -4402,7 +4456,7 @@ function renderAtomeshPerformanceTab() {
             padding: 14, displayColors: false,
             filter: item => !item.dataset._isFrontier,
             callbacks: {
-              title: items => items.length ? `${fmtHardware(selectedHardware())} · ATOM · c${items[0].raw.row.concurrency}` : '',
+              title: items => items.length ? `ATOM ${explorerDeploymentLabel(items[0].raw.row)} · c${items[0].raw.row.concurrency}` : '',
               label: item => [`Total throughput: ${fmtNum(item.raw.y, 2)} tok/s`, `${metricLabel}: ${fmtNum(item.raw.x, 2)} tok/s/user`, `${explorerTopology(item.raw.row)} · ${item.raw.row.totalGpu ?? '—'} GPUs`],
               footer: items => items.some(item => safeHref(item.raw.row.runUrl)) ? 'Click to inspect · CI run available in details' : 'Click to inspect configuration',
             } },
@@ -4425,22 +4479,30 @@ function renderAtomeshPerformanceTab() {
     explorerChart = chart;
     document.getElementById('ex-png').addEventListener('click', () => {
       const canvas = document.createElement('canvas');
-      canvas.width = chart.canvas.width; canvas.height = chart.canvas.height + 150;
+      canvas.width = chart.canvas.width;
       const ctx = canvas.getContext('2d');
+      ctx.font = '12px sans-serif';
+      let legendX = 24, legendY = chart.canvas.height + 105;
+      const legend = seriesKeys.filter(key => !state.explorerHidden.has(key)).map(key => {
+        const width = Math.min(ctx.measureText(seriesLabel(key)).width + 42, canvas.width - 48);
+        if (legendX > 24 && legendX + width > canvas.width - 24) { legendX = 24; legendY += 22; }
+        const item = { key, x: legendX, y: legendY }; legendX += width;
+        return item;
+      });
+      canvas.height = legendY + 54;
       ctx.fillStyle = light ? '#ffffff' : '#18191b'; ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.fillStyle = light ? '#1a1c24' : '#eef0f6'; ctx.font = 'bold 20px sans-serif';
       ctx.fillText(`ATOM · ${state.explorerModel}`, 24, 30);
-      ctx.font = '12px sans-serif'; ctx.fillText(`${state.explorerSource} · Total throughput vs. ${metricLabel}`, 24, 53);
+      ctx.font = '12px sans-serif'; ctx.fillText(`${sourceLabel} · Total throughput vs. ${metricLabel}`, 24, 53, canvas.width - 48);
       ctx.drawImage(chart.canvas, 0, 75);
-      let legendX = 24;
-      const legendY = chart.canvas.height + 105;
-      for (const key of seriesKeys.filter(key => !state.explorerHidden.has(key))) {
-        ctx.fillStyle = colors.get(key); ctx.fillRect(legendX, legendY - 8, 8, 8);
-        ctx.fillText(seriesLabel(key), legendX + 15, legendY);
-        legendX += ctx.measureText(seriesLabel(key)).width + 42;
+      for (const { key, x, y } of legend) {
+        ctx.fillStyle = colors.get(key);
+        if (explorerDeployment(seriesRows.get(key)) === 'aggregated') ctx.fillRect(x, y - 8, 8, 8);
+        else { ctx.beginPath(); ctx.arc(x + 4, y - 4, 4, 0, Math.PI * 2); ctx.fill(); }
+        ctx.fillText(seriesLabel(key), x + 15, y, canvas.width - x - 39);
       }
       ctx.fillStyle = light ? '#5c6070' : '#bfc1d0';
-      ctx.fillText(`Line: Pareto frontier · ${sourceUrl || ''}`, 24, legendY + 24);
+      ctx.fillText(`Line: Pareto frontier · ${sourceUrl || ''}`, 24, legendY + 24, canvas.width - 48);
       canvas.toBlob(blob => { if (blob) download(blob, 'atom-throughput-interactivity.png'); });
     });
   }

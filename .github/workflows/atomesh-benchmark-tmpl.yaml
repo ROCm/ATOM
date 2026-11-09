@@ -14,6 +14,10 @@ on:
         description: 'ATOM python package the servers import: mounted or image'
         type: string
         default: mounted
+      checkout_ref:
+        description: 'Exact source revision for a PR sweep; empty uses the caller revision'
+        type: string
+        default: ''
       model_root:
         description: 'ATOMESH_MODEL_ROOT the matrix was expanded with'
         type: string
@@ -32,7 +36,7 @@ env:
 
 jobs:
   benchmark:
-    name: c=${{ join(matrix.concurrency, ',') }}
+    name: ${{ inputs.checkout_ref != '' && format('sweep-point:{0}', matrix.id) || format('c={0}', join(matrix.concurrency, ',')) }}
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
     # Configs run in parallel, so this covers waiting in the Slurm queue; the
     # Slurm job's own --time (runner.time_limit) bounds the run itself.
@@ -44,6 +48,29 @@ jobs:
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
+
+      - name: Record sweep point provenance
+        if: ${{ inputs.checkout_ref != '' }}
+        env:
+          SWEEP_CELL_JSON: ${{ toJson(matrix) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          cell = json.loads(os.environ['SWEEP_CELL_JSON'])
+          root = Path('atomesh-results')
+          root.mkdir(exist_ok=True)
+          provenance = {
+              'run_id': int(os.environ['GITHUB_RUN_ID']),
+              'run_attempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
+              'head_sha': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'cell': cell,
+          }
+          (root / f"{cell['id']}-sweep-provenance.json").write_text(json.dumps(provenance), encoding='utf-8')
+          PY
 
       - name: Cancel existing jobs on benchmark nodes
         if: ${{ github.event_name == 'schedule' && matrix.runner.slurm_submit_runner != 'atomesh-cicd' }}
@@ -335,12 +362,21 @@ jobs:
             cat "${AIPERF_RAW_PATH}"
           fi
 
+      - name: Validate sweep point metrics
+        if: ${{ inputs.checkout_ref != '' }}
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+        run: |
+          python3 .github/scripts/atomesh/pr_sweep.py validate-point \
+            "atomesh-results/${MATRIX_ID}-sweep-provenance.json" \
+            --hardware "$ATOMESH_DASHBOARD_HARDWARE"
+
       - name: Upload AIPerf Perfetto traces
         if: ${{ always() && matrix.benchmark.kind == 'aiperf_agentic' }}
         uses: ./.github/actions/upload-aiperf-traces
         with:
           result-dir: atomesh-results/${{ matrix.id }}
-          artifact-name: aiperf-chrome-traces-${{ matrix.id }}
+          artifact-name: aiperf-chrome-traces-${{ matrix.id }}${{ inputs.checkout_ref != '' && format('-attempt-{0}', github.run_attempt) || '' }}
           output-dir: aiperf-traces/${{ matrix.id }}
           run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -401,7 +437,7 @@ jobs:
         if: ${{ always() && steps.torch-traces.outputs.has_traces == 'true' }}
         uses: actions/upload-artifact@v7
         with:
-          name: atomesh-torch-traces-${{ matrix.id }}
+          name: atomesh-torch-traces-${{ matrix.id }}${{ inputs.checkout_ref != '' && format('-attempt-{0}', github.run_attempt) || '' }}
           path: |
             ${{ steps.torch-traces.outputs.log_root }}/slurm_job-*/torch_traces/
             ${{ steps.torch-traces.outputs.log_root }}/slurm_job-*/benchmark_results/*/torch_profile.log
@@ -413,7 +449,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: atomesh-model-benchmark-${{ matrix.id }}
+          name: atomesh-model-benchmark-${{ matrix.id }}${{ inputs.checkout_ref != '' && format('-attempt-{0}', github.run_attempt) || '' }}
           path: |
             atomesh-results/
           if-no-files-found: ignore

@@ -91,12 +91,26 @@ def load_sweep(file, run_url=None):
         supplied = run_pattern.fullmatch(run_url) if run_url else None
         if run_url and (not supplied or supplied.groups()[:3] != match.groups()[:3]):
             raise ValueError("--run-url conflicts with the sweep record's run_url")
+        sweep_attempt = record.get("sweep_run_attempt")
+        if sweep_attempt is not None and (
+            type(sweep_attempt) is not int or sweep_attempt < 1
+        ):
+            raise ValueError("sweep_run_attempt must be a positive integer")
+        supplied_attempt = supplied[4] if supplied else None
+        # The bundle may assemble successful points retained from earlier
+        # attempts of this same logical run. Each point keeps its actual URL.
+        if (
+            sweep_attempt is not None
+            and supplied_attempt
+            and int(supplied_attempt) == sweep_attempt
+        ):
+            supplied_attempt = None
         attempts = [
             value
             for value in (
                 record.get("run_attempt"),
                 url_attempt,
-                supplied[4] if supplied else None,
+                supplied_attempt,
             )
             if value is not None
         ]
@@ -105,6 +119,11 @@ def load_sweep(file, run_url=None):
         if len({int(value) for value in attempts}) > 1:
             raise ValueError("Run URL attempt conflicts with sweep run_attempt")
         attempt = int(attempts[0]) if attempts else None
+        if sweep_attempt is not None and (attempt is None or attempt > sweep_attempt):
+            raise ValueError(
+                "Point attempt must be known and no later than its sweep assembly"
+            )
+        sweep_attempt = sweep_attempt or attempt
         if attempt:
             url = f"https://github.com/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt}"
         model = record.get("model")
@@ -122,13 +141,42 @@ def load_sweep(file, run_url=None):
             raise TypeError(f"{file}: dataset must be an object")
         prefill = positive(record.get("prefill_num_workers"))
         decode = positive(record.get("decode_num_workers"))
+        disaggregated = record.get("disagg", record.get("disaggregated"))
+        if disaggregated is not None and not isinstance(disaggregated, bool):
+            raise TypeError("Sweep disagg must be a boolean")
+        pr_number = record.get("pr_number") or None
+        if pr_number is not None and (type(pr_number) is not int or pr_number < 1):
+            raise ValueError("Sweep pr_number must be a positive integer")
+        head_sha = record.get("head_sha") or ""
+        if head_sha and not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+            raise ValueError("Sweep head_sha must identify the tested commit")
         points.append(
             {
                 "source": "ATOMesh",
-                "source_label": f"Sweep · {repo} #{run_id}"
-                + (f" / attempt {attempt}" if attempt else ""),
-                "source_url": url,
-                "source_status": "Imported sweep",
+                "source_label": (f"PR #{pr_number} · " if pr_number else "")
+                + f"Sweep · {repo} #{run_id}"
+                + (f" / attempt {sweep_attempt}" if sweep_attempt else ""),
+                "source_url": (
+                    f"https://github.com/{owner}/{repo}/actions/runs/{run_id}/attempts/{sweep_attempt}"
+                    if sweep_attempt
+                    else url
+                ),
+                "source_status": {
+                    "complete": "Complete sweep",
+                    "partial": "Partial sweep",
+                }.get(record.get("sweep_status"), "Imported sweep"),
+                "disaggregated": disaggregated,
+                "is_multinode": record.get("is_multinode"),
+                "num_nodes": positive(record.get("num_nodes")),
+                "pr_number": pr_number,
+                "pr_url": (
+                    f"https://github.com/{owner}/{repo}/pull/{pr_number}"
+                    if pr_number
+                    else ""
+                ),
+                "head_sha": head_sha,
+                "run_attempt": attempt,
+                "sweep_run_attempt": sweep_attempt,
                 "model": model,
                 "hardware": hardware,
                 "precision": record.get("precision", ""),

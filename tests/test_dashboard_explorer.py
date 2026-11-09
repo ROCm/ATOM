@@ -80,6 +80,33 @@ assert.deepEqual(atomeshParetoFrontier([]), []);
 """
         )
 
+    def test_modes_and_sources_keep_independent_frontiers(self):
+        self.run_js(
+            "const assert = require('node:assert/strict');\n"
+            + "\n".join(
+                javascript_function(name)
+                for name in [
+                    "explorerDeployment",
+                    "explorerSeriesKey",
+                    "atomeshParetoFrontier",
+                    "explorerFrontiers",
+                ]
+            )
+            + """
+const row = {model:'Example', hardware:'mi355x', sourceLabel:'PR #1'};
+const pd = {...row, disaggregated:true, isMultinode:false};
+const agg = {...row, disaggregated:false, prefillWorkers:1, decodeWorkers:1};
+assert.equal(explorerDeployment(pd), 'pd');
+assert.equal(explorerDeployment(agg), 'aggregated');
+assert.equal(explorerDeployment({...row,isMultinode:false}), 'unknown');
+assert.equal(explorerDeployment({...row,configLabel:'legacy_agg_tp8'}), 'aggregated');
+assert.equal(explorerDeployment({...row,prefillWorkers:1,decodeWorkers:2}), 'pd');
+const points = [{x:100,y:100,row:pd}, {x:10,y:10,row:agg},
+                {x:5,y:5,row:agg}, {x:1,y:1,row:{...agg,sourceLabel:'PR #2'}}];
+assert.deepEqual(explorerFrontiers(points).flat().map(p=>p.x), [100,10,1]);
+"""
+        )
+
     def test_ci_points_preserve_recipes_and_use_latest_publication(self):
         functions = [
             "parseAtomeshNumber",
@@ -91,6 +118,7 @@ assert.deepEqual(atomeshParetoFrontier([]), []);
             "atomeshMergedModelName",
             "isAgenticTraceRow",
             "explorerWorkloadKey",
+            "explorerDeployment",
             "buildExplorerBenchmarkRows",
             "atomeshParetoFrontier",
         ]
@@ -223,6 +251,30 @@ class SweepImportTests(unittest.TestCase):
         self.assertEqual(first["prefill_workers"], 1)
         self.assertNotEqual(first["config_label"], second["config_label"])
 
+    def test_sweep_preserves_pr_and_serving_mode_independently_of_placement(self):
+        self.record.update(
+            disagg=True,
+            is_multinode=False,
+            num_nodes=1,
+            pr_number=123,
+            head_sha="a" * 40,
+            sweep_status="partial",
+        )
+        self.write_records([self.record])
+        point = self.preview.load_sweep(self.file, self.run)[0]
+        self.assertTrue(point["disaggregated"])
+        self.assertFalse(point["is_multinode"])
+        self.assertEqual(point["num_nodes"], 1)
+        self.assertEqual(point["pr_url"], "https://github.com/ROCm/ATOM/pull/123")
+        self.assertIn("PR #123", point["source_label"])
+        self.assertEqual(point["head_sha"], "a" * 40)
+        self.assertEqual(point["source_status"], "Partial sweep")
+        self.record["disagg"] = False
+        self.write_records([self.record])
+        self.assertFalse(
+            self.preview.load_sweep(self.file, self.run)[0]["disaggregated"]
+        )
+
     def test_missing_p90_is_not_replaced_with_mean_or_rounded_latency(self):
         for missing in (None, {"mean": 100}, {"p50": 100}, {"p90": False}):
             with self.subTest(missing=missing):
@@ -234,6 +286,29 @@ class SweepImportTests(unittest.TestCase):
                 self.assertIsNone(point["interactivity_p90_itl"])
                 self.assertIsNone(point["interactivity"])
                 self.assertEqual(point["total_tput"], 123456.789)
+
+    def test_retry_assembly_is_one_source_with_original_point_attempts(self):
+        records = [
+            {
+                **self.record,
+                "conc": 16 * attempt,
+                "run_attempt": attempt,
+                "sweep_run_attempt": 2,
+                "run_url": self.run + f"/attempts/{attempt}",
+            }
+            for attempt in (1, 2)
+        ]
+        self.write_records(records)
+        for supplied_url in (None, self.run, self.run + "/attempts/2"):
+            points = self.preview.load_sweep(self.file, supplied_url)
+            self.assertEqual(len({point["source_label"] for point in points}), 1)
+            self.assertTrue(points[0]["source_url"].endswith("/attempts/2"))
+            self.assertTrue(points[0]["run_url"].endswith("/attempts/1"))
+            self.assertTrue(points[1]["run_url"].endswith("/attempts/2"))
+        for attempt in (0, 1, "2", True):
+            self.write_records([{**records[1], "sweep_run_attempt": attempt}])
+            with self.assertRaises(ValueError):
+                self.preview.load_sweep(self.file)
 
     def test_sweep_requires_valid_consistent_run_provenance(self):
         self.write_records([self.record])
