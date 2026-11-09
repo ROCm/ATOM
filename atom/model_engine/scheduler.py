@@ -993,8 +993,16 @@ class Scheduler:
 
     def _wait_for_inflight_prefix(self, seq: Sequence, cached_tokens: int) -> bool:
         """Bounded wait for a hybrid producer's planned prompt-end checkpoint."""
+        if not self._waits_for_inflight_prefix(seq, cached_tokens):
+            return False
+        self._inflight_prefix_wait.setdefault(
+            seq.id, self._schedule_tick + self.prefill_delayer.ttft_max_ticks
+        )
+        return True
+
+    def _waits_for_inflight_prefix(self, seq: Sequence, cached_tokens: int) -> bool:
+        """Whether `_wait_for_inflight_prefix` would wait; starts no deadline."""
         bm = self.block_manager
-        delayer = self.prefill_delayer
         if (
             not bm.enable_prefix_caching
             or not bm.state.enabled
@@ -1039,9 +1047,6 @@ class Scheduler:
                 np.frombuffer(seq.token_ids, dtype=np.int32, count=anchor),
                 np.frombuffer(producer.token_ids, dtype=np.int32, count=anchor),
             ):
-                self._inflight_prefix_wait.setdefault(
-                    seq.id, self._schedule_tick + delayer.ttft_max_ticks
-                )
                 return True
         return False
 
@@ -1092,14 +1097,7 @@ class Scheduler:
         prefillable = pending > 0
         if pending >= budget or len(self.running) >= self.max_num_seqs:
             return prefillable, min(pending, budget)
-        # The scan stops when the counted chunks fill the budget (a chunk is
-        # the rows a seq's forward computes, so a reused prefix is not
-        # counted), the free slots run out or are left to parked transfers,
-        # or a seq does not fit the pool or the remaining budget. Each pool
-        # fit is asked before earlier seqs take blocks, so under pool
-        # pressure the count can exceed what admission admits, never past
-        # the budget. A hold leaves the pool as it was, so the excess repeats
-        # every held tick until admission runs.
+        # A chunk counts the rows its forward computes, not the reused prefix.
         slots = self.max_num_seqs - len(self.running)
         for seq in self._waiting_prefills():
             offload_resume = self._is_offload_prefill_resume(seq)
@@ -1121,6 +1119,10 @@ class Scheduler:
                     prefillable = True
                     break
                 resume = cached_blocks * self.block_manager.hash_block_size
+                if self._waits_for_inflight_prefix(
+                    seq, max(resume, seq.offload_joint.kv_prefix_tokens)
+                ):
+                    break  # Admission defers it; the seqs behind it go uncounted.
                 cached = self.block_manager.replay_start(seq, resume, hit=True)
             remaining = (
                 seq.num_tokens - cached
