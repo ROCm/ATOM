@@ -19,6 +19,7 @@ from aiter.ops.shuffle import (
     interleave_gate_up_rows,
     moe_shuffle_scale,
     moe_shuffle_weight,
+    moe_shuffle_weight_iod,
 )
 from torch import nn
 from transformers import PretrainedConfig
@@ -2003,6 +2004,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
+        # No-ops returning None unless aiter enables IOD placement (MI455X).
+        moe_shuffle_weight_iod(
+            layer.w13_weight, layer.w13_weight_scale, self.num_experts
+        )
+        moe_shuffle_weight_iod(
+            layer.w2_weight, layer.w2_weight_scale, self.num_experts, gemm=2
+        )
 
     def _triton_views_of_flydsl_weights(self, layer) -> tuple:
         """Zero-copy Triton/gluon views of the FlyDSL-shuffled MXFP4 weights.
