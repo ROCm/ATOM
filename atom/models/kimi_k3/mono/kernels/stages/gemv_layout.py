@@ -36,6 +36,24 @@ K_PER_MMA = 32
 K_PER_CHUNK = 128
 PACK_ELEMENTS = 8
 LDS_PAD = 8
+# ``gemv_tdm_gfx1250``: 512-column K slabs whose LDS rows are padded once, two
+# token slabs and TDM_DEPTH + 1 slabs of every weight task resident.
+TDM_SLAB = 512
+TDM_ROW_STRIDE = TDM_SLAB + LDS_PAD
+TDM_DEPTH = 3
+
+
+def tdm_lds_words(rows: int, tasks: int) -> tuple[int, int]:
+    """``(token, weight)`` i32 LDS words of the TDM GEMV for one CTA."""
+
+    return (
+        2 * rows * TDM_ROW_STRIDE // 2,
+        (TDM_DEPTH + 1) * tasks * ROWS * TDM_ROW_STRIDE // 2,
+    )
+
+
+def tdm_lds_bytes(rows: int, tasks: int) -> int:
+    return 4 * sum(tdm_lds_words(rows, tasks))
 
 
 @dataclass(frozen=True)

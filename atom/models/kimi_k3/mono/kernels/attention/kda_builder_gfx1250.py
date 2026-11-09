@@ -29,12 +29,15 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import (
     KimiLdsPlan,
     LdsRegion,
 )
+from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import tdm_lds_bytes
 from atom.models.kimi_k3.mono.kernels.token_tiling import TokenTile
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.plan.layout import pair_layout
 
 TIMELINE_POINTS = 15
 HIDDEN = 7168
+# Each in-projection CTA owns two 16-row tasks (``kda_resident_gfx1250``).
+PROJECTION_TASKS_PER_CTA = 2
 HEAD_DIM = 128
 VALUE_CHUNK = 16
 HEADS = 12
@@ -350,6 +353,9 @@ class K1LocalBuildSpec:
     # The production AttnRes kernel already mixed, normed and banked the
     # input; K1 reads that normed row through its ``prefix`` argument.
     external_seam: bool = False
+    # Stream the in-projection's tokens and weights through the TDM
+    # (``gemv_tdm_gfx1250``) instead of register-loaded weight slabs.
+    tdm_projection: bool = True
 
     def validate(self, plan: Gfx1250KimiBuildPlan) -> None:
         if not 1 <= self.qlen <= 16 or plan.tokens % self.qlen:
@@ -445,7 +451,10 @@ def role_lds_plan(
     )
     widest_groups = max(groups for _, groups in slabs)
     xrow = widest_groups * contract.group_columns + LDS_PAD
-    projection_bytes = tile_rows * xrow * 2
+    projection_bytes = max(
+        tile_rows * xrow * 2,
+        tdm_lds_bytes(plan.tokens, PROJECTION_TASKS_PER_CTA),
+    )
     if smem_bytes + projection_bytes > plan.lds_bytes:
         raise ValueError(
             f"gfx1250 K1 projection needs {smem_bytes + projection_bytes} LDS bytes, "
@@ -458,7 +467,7 @@ def role_lds_plan(
     )
     projection = RoleLdsVariant(
         "projection",
-        _fields(("xl", tile_rows * xrow * 2)),
+        _fields(("xl", projection_bytes)),
     )
     state_width = HEAD_DIM
     recurrence = RoleLdsVariant(
