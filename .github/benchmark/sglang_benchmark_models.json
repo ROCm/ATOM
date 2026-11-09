@@ -183,7 +183,7 @@
       "bench_args": "",
       "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
-      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"]
+      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0", "ATOM_FUSE_SHARED_EXPERT=0"]
     },
     {
       "display": "DeepSeek-V3.2 FP8 TP8 DP8 EP8",
@@ -196,7 +196,7 @@
       "bench_args": "",
       "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
-      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"]
+      "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0", "ATOM_FUSE_SHARED_EXPERT=0"]
     },
     {
       "display": "DeepSeek-R1-0528-MXFP4 FP4 TP4",
@@ -671,7 +671,10 @@
       "bench_args": "",
       "runner": "atom-mi308-8gpu-plugins-benchmark",
       "nightly_group": "B",
-      "env_vars": "qwen_common"
+      "env_vars": [
+        "qwen_common",
+        "AITER_BYPASS_TUNE_CONFIG=1"
+      ]
     },
     {
       "display": "DeepSeek-V4-Flash FP8 TP8 MI308",

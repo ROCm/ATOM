@@ -46,6 +46,7 @@ Key entry points:
 - Engine: `atom/model_engine/llm_engine.py` → `engine_core.py` → `scheduler.py` → `model_runner.py`
 - Models: `atom/models/` — registered in `atom/models/registry.py:support_model_arch_dict`
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
+- Structured output: `atom/structured_output/` — request validation, schema compilation, grammar state and asynchronous token/mask transfers
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
 - Pipeline parallel: `atom/model_engine/pp_engine_core.py` (head / downstream stage
@@ -53,6 +54,12 @@ Key entry points:
   `atom/model_engine/dynamic_chunking.py` (latency model, pure) and
   `dynamic_chunking_worker.py` (startup sweep and runtime timing in the runner),
   sized by `Scheduler._dynamic_chunk_limit`
+- Ulysses sequence parallel (`-sp`, on the PCP rank dimension):
+  `atom/distributed/ulysses_sp.py` (the SP group, the token shard / gather and
+  the QKV exchange), `group_agreement.py` (verdicts every rank of a CPU group
+  takes alike); the model runs on a rank's token range through `atom/utils/sp_wrapper.py`; the
+  attention and its head gather in `atom/model_ops/sp_attention.py`, and the MXFP4 MoE
+  through AITER MegaMoE in `atom/model_ops/fused_moe/sp_mega_moe.py`
 - Mono decode (fused per-layer decode kernels): the shared mechanisms in `atom/mono/`
   (`runtime/`: TP consensus and a runner's bind-then-agree construction
   (`consensus.bind_agreed`), peer memory and its owned buffer (`lifecycle`),
@@ -99,7 +106,10 @@ Key entry points:
   implementations rather than two copies, and merging them is a GPU behaviour
   change, not a move; both allocate through `runtime/uncached.py`, as do every
   model's step scratch buffers (uncached device memory: a hand-off's polls
-  never hit a stale cache line). Where a model ships a
+  never hit a stale cache line). Qwen3.8-Flash-Next's kernels (`qwen38/mono/`, beside
+  the single-file `qwen4_exp.py`) are whole-layer programs composed from FlyDSL stages
+  (`kernels/blocks/`, `kernels/recipe.py`); its MTP drafter is wrapped at install like
+  V4.1's (`draft_model.MonoDraftModel`). Where a model ships a
   `mono/contract.py` with a `__main__` (DeepSeek-V4.1, MiniMax-M3), check its
   hand-offs without a GPU with `FLYDSL_RUNTIME_ENABLE_CACHE=0 ARCH=gfx950
   python -m atom.models.<model>.mono.contract`; GLM-5.2's `contract.py` is the
@@ -140,6 +150,7 @@ Key entry points:
 | Environment variables | `docs/environment_variables.md` |
 | Compilation & CUDAGraph | `docs/compilation_cudagraph_guide.md` |
 | Model support | `docs/model_support_guide.md` |
+| Structured output | `docs/structured_output_capabilities.md` |
 | Model ops (AITER kernels) | `docs/model_ops_guide.md` |
 | Scheduling & KV cache | `docs/scheduling_kv_cache_guide.md` |
 | Serving & benchmarking | `docs/serving_benchmarking_guide.md` |
@@ -153,3 +164,4 @@ Key entry points:
 | Adding a model | `/add-model` |
 | MiniMax-H3 (video+audio diffusion) | `recipes/MiniMax-H3.md` |
 | DeepSeek-V4.1-Flash | `recipes/DeepSeek-V4.1-Flash.md` |
+| Qwen3.8-Flash-Next mono decode | `recipes/Qwen3.8-Flash-Next-Mono-Program.md` |

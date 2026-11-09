@@ -22,6 +22,7 @@ from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
+from .sp_attention import gather_heads, ulysses_attention
 
 logger = logging.getLogger("atom")
 
@@ -1068,6 +1069,11 @@ def unified_attention_with_output_base(
             positions=positions,
             q_scale=q_scale,
         )
+    elif getattr(self, "sp_columns", None) is not None:
+        # Ulysses: trade this rank's token chunk for its head slice around the
+        # unchanged impl. Inside the custom op, so the collectives stay opaque.
+        out, rows = ulysses_attention(self, q, k, v, positions, q_scale, qkv)
+        return gather_heads(out, rows, self.sp_head_exchange)
     else:
         return self.impl.forward(
             query=q,

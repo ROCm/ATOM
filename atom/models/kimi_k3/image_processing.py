@@ -8,6 +8,7 @@ request does not import the vision model or AITER."""
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+from atom.model_engine.multimodal_runtime import multimodal_cache_seed
 from atom.multimodal.processing import expand_media_placeholders
 
 if TYPE_CHECKING:
@@ -49,6 +50,14 @@ def build_kimi_k3_inputs(
     ``image_grid_thw``, and emits a single ``<|media_pad|>`` per image that the
     reference model expands while merging embeddings. Normalize all three so the
     engine sees the same contract as every other multimodal model.
+
+    Each expanded run becomes one embedding span, so an image prefill can be
+    chunked like text and its embeddings are encoded once per request (see
+    ``multimodal_runtime``); without spans a prompt longer than
+    ``--max-num-batched-tokens`` could never be scheduled.
+
+    Images reach the processor in their decoded mode, so its own
+    ``media_proc_cfg.transparent_bg_config`` fill applies to transparent ones.
     """
     multimodal_config = getattr(atom_config, "multimodal_config", None)
     if multimodal_config is None:
@@ -78,12 +87,14 @@ def build_kimi_k3_inputs(
     tokens_per_image = kimi_k3_tokens_per_image(
         grid_thws, multimodal_config.vision_config.merge_kernel_size
     )
-    input_ids = expand_media_placeholders(
+    input_ids, spans = expand_media_placeholders(
         input_ids, tokens_per_image, placeholder_token_id
     )
 
     multimodal_data = {
         "pixel_values": inputs["pixel_values"],
         "image_grid_thw": grid_thws,
+        "embedding_spans": spans,
     }
+    multimodal_data["cache_seed"] = multimodal_cache_seed(multimodal_data)
     return input_ids, multimodal_data

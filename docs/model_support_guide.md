@@ -24,7 +24,7 @@ support_model_arch_dict = {
 }
 ```
 
-ATOM resolves the HuggingFace `architectures` field from a model's `config.json` against this dictionary. If the architecture string matches a key, ATOM imports and instantiates the corresponding class.
+ATOM resolves the HuggingFace `architectures` field from a model's `config.json` against this dictionary. If the architecture string matches a key, ATOM imports and instantiates the corresponding class. An architecture that is another's model under a new name (`KimiK31ForConditionalGeneration`) is listed in `ARCH_ALIASES` (`atom/config.py`) instead: `get_hf_config` loads it as that model, so every table keyed by architecture holds one entry for both.
 
 ## Supported model architectures
 
@@ -44,6 +44,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 | `Glm5NextForConditionalGeneration` | `atom.models.glm5_next` | `Glm5NextForConditionalGeneration` | Yes | Yes | Text-only GLM-5.3-Flash: hybrid KDA + pooled sparse MLA, mHC, NoPE zero padding; PCP/DCP/MTP/TBO not yet supported |
 | `Qwen3NextForCausalLM` | `atom.models.qwen3_next` | `Qwen3NextForCausalLM` | Yes | No | Hybrid architecture: full attention + Gated DeltaNet linear attention, GQA, QK norm, FusedMoE |
 | `KimiK3ForConditionalGeneration` | `atom.models.kimi_k3` | `KimiK3ForConditionalGeneration` | Yes | Yes | Hybrid architecture: MLA full attention + KDA linear attention, SiTU activation, MXFP4 latent MoE, MoonViT3d vision tower |
+| `KimiK31ForConditionalGeneration` | `atom.models.kimi_k3` | `KimiK3ForConditionalGeneration` | Yes | Yes | Original MXFP4/BF16 weights; NoPE DSA on the MLA layers, FP8 index cache and BF16 MLA KV; initial TP8 text path, see recipe for validation limits |
 | `DeepseekV41ForCausalLM` | `atom.models.deepseek_v41` | `DeepseekV41ForCausalLM` | Yes | Yes | CSA2 topology, Single-Pass mHC, Engram n-gram memory, FP8 or FP4 index plane with a paged scorer, native W4A8/FP4 weights, vision tower, native DSpark speculation |
 
 **Note:** `DeepSeekMTP` (`atom.models.deepseek_mtp.DeepSeekMTP`), `Qwen3NextMTP` (`atom.models.qwen3_next_mtp.Qwen3NextMTP`), and `Qwen3_5MTP` (`atom.models.qwen3_5_mtp.Qwen3_5MTP`) are not in the registry — they are used exclusively as speculative draft models and are loaded separately via `EagleProposer`.
@@ -155,7 +156,16 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **KDA Recurrent State:** The KDA layers keep per-request recurrent state in the generic per-request slot pool, like Qwen3-Next's Gated DeltaNet.
 - **MoE:** MXFP4 latent MoE (`KimiSparseMoeBlock`) with SiTU activation and optional dual-stream shared/routed overlap (`ATOM_K3_SHARED_EXPERT_OVERLAP`).
 - **Vision:** `atom/models/kimi_k3_vl.py` implements MoonViT3d — patch embed with a bilinearly resampled learnable position grid, 27 blocks with packed `wqkv` and complex 2D RoPE over non-causal varlen attention, then an `sd2_tpool` 2x2 merge and a `patchmergerv2` projector into the 7168-wide text space. Replicated per TP rank (~0.9 GB bf16), built only on the first pipeline rank.
-- **Image tokens:** The HF processor emits one `<|media_pad|>` per image and expands it inside the model. ATOM instead expands it during input processing (`build_kimi_k3_inputs` in `atom/models/kimi_k3/image_processing.py`, using the shared helper in `atom/multimodal/processing.py`) so the scheduler, KV blocks and positions see the true prompt length. Multimodal prefills are consequently never chunked.
+- **Image tokens:** The HF processor emits one `<|media_pad|>` per image and expands it inside the model. ATOM instead expands it during input processing (`build_kimi_k3_inputs` in `atom/models/kimi_k3/image_processing.py`, using the shared helper in `atom/multimodal/processing.py`) so the scheduler, KV blocks and positions see the true prompt length. It also returns each run as an `embedding_spans` entry, so image prefills chunk like text through `atom/model_engine/multimodal_runtime.py`.
+- **Pipeline parallel:** pp2 x tp4 runs with or without the DSpark drafter (`--enforce-eager`: PP decode has no CUDA graphs yet). The drafter sits on the last stage; `PPAuxRelay` (`atom/spec_decode/pp_aux_relay.py`) brings it the aux hidden states captured on earlier stages.
+
+### Kimi-K3.1 (`KimiK31ForConditionalGeneration`)
+
+- **Architecture:** Reuses the K3 backbone and multimodal wrapper, with a separate NoPE DSA indexer on each of the 24 MLA layers. Queries come from normalized q-lora activations; keys and head weights come from the layer's hidden states.
+- **Configuration:** `flatten_dsa_config` in `atom/config.py` flattens the nested `dsa_config` before selecting attention pools; only its `dsa_layers` own index planes. The initial path uses 32 index heads, 128 dimensions and causal top-k 2048, with no index sharing.
+- **Precision:** Original MXFP4/BF16 model weights, FP8 indexer Q/K and index cache, BF16 MLA KV. Other index-cache formats, and any quantization (checkpoint or online) of the fused q_a / kv_a / indexer projection, are rejected.
+- **Scope:** TP8, optionally with DCP. Local prefix caching reuses the KDA state checkpoints. Mono decode (`atom/models/kimi_k3/mono/`, on by default) serves decode steps up to 64 rows -- plain decode or a DSpark verify, with or without ReplaySSM -- and runs the DSA indexer as one mono launch (`atom/mono/dsa_indexer/`): under DCP equal to TP over each rank's own keys; without DCP over the replicated cache (a request's rows owned by one rank, a long one's keys split; validated on GLM-5.2, not yet on K3.1). PCP is rejected (the indexer's projections are fused into q_a). Online quantization of the other layers, PP, expert parallelism, DP attention, other speculative methods, plugins, TBO and KV transfer are untested (not rejected at startup). The shared vision wrapper is registered, but image inference requires separate validation.
+- **Guide:** [Kimi-K3.1 recipe](../recipes/Kimi-K3.1.md) describes launch settings and validation requirements.
 
 ### DeepSeek-V4.1 (`DeepseekV41ForCausalLM`)
 

@@ -22,68 +22,16 @@ from atom.plugin.sglang.runtime.context import is_draft_extend_mode
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
 
 
-def _fp4_rowgroup_decode_enabled() -> bool:
-    """Match native ``_fp4_rowgroup_decode``: gfx950 FP4 indexer only."""
-    try:
-        from aiter.jit.utils.chip_info import get_gfx
-
-        from atom.config import get_current_atom_config
-        from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
-            FP4_GFX1250_NATURAL,
-            fp4_indexer_layout_for_arch,
-        )
-        from atom.model_ops.v4_kernels import fp4_indexer_enabled
-
-        dtype = get_current_atom_config().index_cache_dtype
-    except Exception:  # noqa: BLE001 - ATOM config is absent outside a loaded model
-        return False
-    if not fp4_indexer_enabled(dtype):
-        return False
-    return fp4_indexer_layout_for_arch(get_gfx()) != FP4_GFX1250_NATURAL
-
-
 def _init_v4_split_plans(md) -> None:
     """Publish the V4 decode split-plan fields on a base AttentionMetaData.
 
     Native sparse attention reads ``split_plan_swa`` directly. The SGLang
     bridge builds the shared metadata type, which does not declare those
     fields. None lets aiter choose the plan.
-
-    ``fp4_decode_topk`` is the same kind of field. ``_attn_compress`` reads it
-    on every forward. The DSV4 dataclass defaults it to None; the base
-    metadata type does not have it, so CUDA-graph capture raises
-    AttributeError unless it is attached here. The FP4 row-group path
-    replaces None with a fixed buffer before returning.
     """
     md.split_plan_swa = None
     md.split_plan_csa = None
     md.split_plan_hca = None
-    md.fp4_decode_topk = None
-
-
-def _publish_fp4_decode_topk(md, n: int, storage: torch.Tensor | None) -> None:
-    """Point decode scoring at the persistent top-k buffer when FP4 is on."""
-    if storage is None or not _fp4_rowgroup_decode_enabled():
-        md.fp4_decode_topk = None
-        return
-    width = max(int(n), 0)
-    md.fp4_decode_topk = storage[:width]
-
-
-def _eager_fp4_decode_topk(proxy_pool, n: int, index_topk: int, device) -> torch.Tensor:
-    """Stable eager buffer. Graph paths use the persistent graph buffers."""
-    need = max(int(n), 1)
-    topk = max(int(index_topk), 1)
-    buf = getattr(proxy_pool, "_atom_v4_eager_fp4_decode_topk", None)
-    if (
-        buf is None
-        or buf.shape[0] < need
-        or buf.shape[1] != topk
-        or buf.device != device
-    ):
-        buf = torch.empty(need, topk, dtype=torch.int32, device=device)
-        proxy_pool._atom_v4_eager_fp4_decode_topk = buf
-    return buf
 
 
 try:
@@ -935,6 +883,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         allocator = getattr(self, "_atom_v4_slot_allocator", None)
         if allocator is not None:
             allocator.remap_blocks(block_pairs[:, 1], block_pairs[:, 0])
+            _publish_allocator_table(self, block_pairs.device)
 
 
 def install_deepseek_v4_proxy_pool_patch() -> None:
@@ -1224,6 +1173,49 @@ class _V4StateSlotAllocator:
         return victim
 
 
+def _block_slot_table(proxy_pool, device) -> torch.Tensor:
+    """GPU first-block -> ring slot table.
+
+    Draft-extend graph replay reads this instead of calling the CPU allocator.
+    A host sync on that replay would stall the captured extend. Prefill and
+    eager extend already ran ``assign`` and published the same mapping.
+    """
+    n = max(1, int(proxy_pool.num_blocks))
+    table = getattr(proxy_pool, "_atom_v4_block_slot_gpu", None)
+    dev = torch.device(device)
+    if table is None or table.numel() != n or table.device != dev:
+        table = torch.zeros(n, dtype=torch.int32, device=dev)
+        proxy_pool._atom_v4_block_slot_gpu = table
+        proxy_pool._atom_v4_published_blocks = None
+    return table
+
+
+def _publish_allocator_table(proxy_pool, device) -> None:
+    """Mirror the CPU allocator into ``_block_slot_table`` after assign/remap."""
+    alloc = getattr(proxy_pool, "_atom_v4_slot_allocator", None)
+    if alloc is None:
+        return
+    table = _block_slot_table(proxy_pool, device)
+    curr = np.asarray(alloc._slot_to_block, dtype=np.int64)
+    prev = getattr(proxy_pool, "_atom_v4_published_blocks", None)
+    if prev is None or getattr(prev, "shape", None) != curr.shape:
+        prev = np.full(curr.shape, -1, dtype=np.int64)
+    stale = prev[(prev >= 0) & (prev != curr)]
+    if stale.size:
+        stale_t = torch.as_tensor(stale, device=table.device, dtype=torch.int64)
+        stale_t.clamp_(0, table.shape[0] - 1)
+        table.index_fill_(0, stale_t, 0)
+    live_slots = np.nonzero(curr >= 0)[0]
+    if live_slots.size:
+        blocks = torch.as_tensor(
+            curr[live_slots], device=table.device, dtype=torch.int64
+        )
+        blocks.clamp_(0, table.shape[0] - 1)
+        slots = torch.as_tensor(live_slots, device=table.device, dtype=torch.int32)
+        table.index_copy_(0, blocks, slots)
+    proxy_pool._atom_v4_published_blocks = curr.copy()
+
+
 def _counts_to_indptr(counts: np.ndarray) -> np.ndarray:
     out = np.zeros(len(counts) + 1, dtype=np.int32)
     out[1:] = np.cumsum(counts, dtype=np.int32)
@@ -1319,9 +1311,6 @@ class _V4SGLangDecodeGraphBuffers:
         # Immutable empty extend CSR. Native stages this for the optional
         # H=128 prefill-ASM decode route; the model always reads the attribute.
         self.empty_kv_indptr = i32(t + 1)
-        # Device-only. ``score_decode_topk_into`` writes it and
-        # ``_sparse_attention`` reads the same address on replay.
-        self.fp4_decode_topk = torch.empty(t, topk, dtype=torch.int32, device=device)
         self.idx_swa = i32(t * max(1, win))
         self.idx_csa = i32(t * max(1, win + topk))
         self.idx_hca = i32(t * max(1, win + hca))
@@ -1410,7 +1399,6 @@ class _V4SGLangVerifyGraphBuffers:
         # Decode always reads this CSR, including when MTP verify/draft-extend
         # metadata is captured before the decode graph buffers exist.
         self.empty_kv_indptr = i32(t + 1)
-        self.fp4_decode_topk = torch.empty(t, topk, dtype=torch.int32, device=device)
         self.indptr_prefix_swa = i32(t + 1)
         self.indptr_prefix_csa = i32(t + 1)
         self.indptr_prefix_hca = i32(t + 1)
@@ -1751,10 +1739,32 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
 
     if total:
-        if positions_numel > scheduled_bs:
-            pos_np = positions[:total].detach().cpu().numpy().astype(np.int32)
-            repeats = max(1, total // max(1, bs))
-            batch_np = np.repeat(np.arange(bs, dtype=np.int64), repeats)[:total]
+        # SGLang's draft loop advances ``positions`` by one after each MTP step
+        # and leaves ``seq_lens`` at the committed length. A one-token draft
+        # step has ``positions.numel() == scheduled_bs`` (the new token sits at
+        # ``seq_lens``, not ``seq_lens - 1``). The old fallback pinned the index
+        # slice to ``seq_lens - 1`` while the kernel derives
+        # ``n = min(pos + 1, win)`` from the live tensor, so the write landed
+        # one row before the slice. Keep the fallback only when the position
+        # buffer is missing or still the all-zero capture placeholder.
+        live_pos = None
+        if positions_numel >= total:
+            live_pos = positions[:total].detach().cpu().numpy().astype(np.int32)
+            seq_pos = (seq_np[: min(total, seq_np.size)] - 1).astype(np.int32)
+            if (
+                live_pos.size
+                and np.all(live_pos == 0)
+                and seq_pos.size
+                and np.any(seq_pos > 0)
+            ):
+                live_pos = None
+        if live_pos is not None:
+            pos_np = live_pos
+            if total > bs:
+                repeats = max(1, total // max(1, bs))
+                batch_np = np.repeat(np.arange(bs, dtype=np.int64), repeats)[:total]
+            else:
+                batch_np = np.arange(total, dtype=np.int64)
         else:
             pos_np = (seq_np[:total] - 1).astype(np.int32)
             batch_np = np.arange(total, dtype=np.int64)
@@ -1784,6 +1794,8 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
 
     if reset_slots and model is not None:
         reset_deepseek_v4_state_slots(model, reset_slots)
+    if reset_slots:
+        _publish_allocator_table(proxy_pool, device)
 
     # Graph replay updates/reset state outside the captured region.  Do not let
     # the wrapper repeat the reset inside capture, because allocating the index
@@ -1878,8 +1890,116 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     if proxy_pool.use_fp8_kv:
         _stage_decode_fp8_page_metadata(md, total, t_pad, bufs=bufs)
     _publish_empty_kv_indptr(md, t_pad, bufs=bufs)
-    _publish_fp4_decode_topk(md, t_pad, bufs.fp4_decode_topk)
+    # Draft CUDA graph captures every MTP step as one replay. Replay rebuilds
+    # this metadata once, at step 0; later steps must refill the same buffers
+    # from the positions tensor the draft loop mutates in place.
+    md.v4_decode_graph_replay = True
     return md
+
+
+_V4_DECODE_INDPTR_KERNEL = None
+
+
+def _v4_decode_indptr_kernel():
+    global _V4_DECODE_INDPTR_KERNEL
+    if _V4_DECODE_INDPTR_KERNEL is not None:
+        return _V4_DECODE_INDPTR_KERNEL
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _kernel(
+        pos_ptr,
+        bid_ptr,
+        swa_ptr,
+        csa_ptr,
+        hca_ptr,
+        n_tok,
+        topk,
+        WIN: tl.constexpr,
+    ):
+        acc_s = 0
+        acc_c = 0
+        acc_h = 0
+        tl.store(swa_ptr, 0)
+        tl.store(csa_ptr, 0)
+        tl.store(hca_ptr, 0)
+        for t in tl.range(n_tok):
+            bid = tl.load(bid_ptr + t)
+            pos = tl.load(pos_ptr + t).to(tl.int32)
+            valid = bid >= 0
+            n = tl.where(valid, tl.minimum(pos + 1, WIN), 0)
+            csa_n = tl.where(valid, tl.minimum((pos + 1) // 4, topk), 0)
+            hca_n = tl.where(valid, (pos + 1) // 128, 0)
+            acc_s += n
+            acc_c += n + csa_n
+            acc_h += n + hca_n
+            tl.store(swa_ptr + t + 1, acc_s)
+            tl.store(csa_ptr + t + 1, acc_c)
+            tl.store(hca_ptr + t + 1, acc_h)
+
+    _V4_DECODE_INDPTR_KERNEL = _kernel
+    return _kernel
+
+
+def refresh_v4_decode_graph_window(md, positions: torch.Tensor) -> None:
+    """Refill decode-graph SWA indices from the live position tensor.
+
+    ``write_v4_paged_decode_indices`` trusts the caller-supplied indptr and
+    computes ``n = min(pos + 1, win)`` from ``positions``. The draft loop adds
+    one to that tensor between MTP steps without leaving the captured graph, so
+    the step-0 indptr and ``swa_dest_rows`` would otherwise be reused: step 1
+    overwrites step 0's KV row and cannot attend the token it just wrote.
+    """
+    if not getattr(md, "v4_decode_graph_replay", False):
+        return
+    if not torch.is_tensor(positions) or positions.ndim != 1:
+        return
+    swa_indptr = getattr(md, "kv_indptr_swa", None)
+    if not torch.is_tensor(swa_indptr) or swa_indptr.ndim != 1:
+        return
+    total = int(swa_indptr.shape[0]) - 1
+    if total <= 0 or int(positions.shape[0]) < total:
+        return
+    win = int(getattr(md, "swa_window", 0) or 0)
+    if win <= 0:
+        return
+
+    from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
+
+    csa_indptr = md.kv_indptr_csa
+    hca_indptr = md.kv_indptr_hca
+    index_topk = int(getattr(md, "index_topk", 0) or 0)
+    geometry = md.pool_geometry
+    has_csa = _geometry_serves_ratio(geometry, CSA_RATIO)
+    has_hca = _geometry_serves_ratio(geometry, HCA_RATIO)
+
+    _v4_decode_indptr_kernel()[(1,)](
+        positions,
+        md.batch_id_per_q_token,
+        swa_indptr,
+        csa_indptr if has_csa else swa_indptr,
+        hca_indptr if has_hca else swa_indptr,
+        total,
+        index_topk,
+        WIN=win,
+    )
+    dest_rows = md.swa_dest_rows
+    write_v4_paged_decode_indices(
+        state_slot_per_seq=md.state_slot_out,
+        batch_id_per_q_token=md.batch_id_per_q_token,
+        positions=positions[:total],
+        swa_indptr=swa_indptr,
+        csa_indptr=csa_indptr if has_csa else None,
+        hca_indptr=hca_indptr if has_hca else None,
+        swa_indices=md.kv_indices_swa,
+        csa_indices=md.kv_indices_csa if has_csa else None,
+        hca_indices=md.kv_indices_hca if has_hca else None,
+        dest_rows=dest_rows,
+        T=total,
+        win=win,
+        geometry=geometry,
+    )
 
 
 def build_atom_v4_verify_graph_metadata_from_sglang(
@@ -2010,19 +2130,17 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     )
     slot_arr = np.zeros(bs, dtype=np.int32)
     reset_slots: set[int] = set()
-    if is_draft_extend and os.environ.get(
-        "ATOM_SGLANG_V4_DRAFT_EXTEND_USE_ALLOCATOR_SLOT", "0"
-    ) not in ("1", "true", "True", "yes", "on"):
-        # Draft-extend graph replay must not synchronize GPU metadata back to
-        # CPU. It runs after request slots already exist, so use SGLang's
-        # req_pool_indices as stable per-request ATOM state slots and update the
-        # persistent GPU buffers directly.
+    if is_draft_extend:
+        # req_pool_indices is not a ring slot (a live request was handed 256).
+        # Replay stays on device: gather the slot prefill published for this
+        # first KV block. Do not call the CPU allocator here.
+        table = _block_slot_table(proxy_pool, device)
         if scheduled_bs:
-            src = forward_batch.req_pool_indices[:scheduled_bs]
-            bufs.state_slot_out.gpu[:scheduled_bs].copy_(src)
-            bufs.state_slot_in.gpu[:scheduled_bs].copy_(
-                bufs.state_slot_out.gpu[:scheduled_bs]
-            )
+            first = block_tables[:scheduled_bs, 0].to(dtype=torch.int64)
+            first.clamp_(0, table.shape[0] - 1)
+            gathered = table.index_select(0, first)
+            bufs.state_slot_out.gpu[:scheduled_bs].copy_(gathered)
+            bufs.state_slot_in.gpu[:scheduled_bs].copy_(gathered)
             slot_arr[:scheduled_bs] = -1
         if bs > scheduled_bs:
             bufs.state_slot_out.gpu[scheduled_bs:bs].zero_()
@@ -2048,6 +2166,8 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
             slot_arr[:scheduled_bs] = slot_real
         if reset_slots and model is not None:
             reset_deepseek_v4_state_slots(model, reset_slots)
+        if reset_slots:
+            _publish_allocator_table(proxy_pool, device)
         md.reset_slots = set()
         _stage_graph_state_slots(md, bufs, slot_arr, bs)
     _resolve_v4_pool_geometry(md, proxy_pool, model)
@@ -2160,7 +2280,6 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     torch.index_select(md.block_tables, 0, safe_batch_ids, out=block_rows)
     md.block_tables_per_token = block_rows
     _publish_empty_kv_indptr(md, total, bufs=bufs)
-    _publish_fp4_decode_topk(md, total, bufs.fp4_decode_topk)
     return md
 
 
@@ -2269,31 +2388,29 @@ def build_atom_v4_attention_metadata_from_sglang(
     md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
 
-    if is_draft_extend:
-        slot_arr = np.full(num_reqs, -1, dtype=np.int32)
-        md.reset_slots = set()
-        md.state_slot_mapping_cpu = slot_arr
-        md.state_slot_mapping = forward_batch.req_pool_indices[:num_reqs].to(
-            device=device, dtype=torch.int32
+    # req_pool_indices is not a ring slot. A live request was handed index 256
+    # while the SWA pool has one ring per running request, so extend writes
+    # missed the ring prefill and decode share. Key every path off the first
+    # KV block.
+    allocator = getattr(proxy_pool, "_atom_v4_slot_allocator", None)
+    if allocator is None:
+        allocator = proxy_pool._atom_v4_slot_allocator = _V4StateSlotAllocator(
+            proxy_pool.num_slots
         )
-    else:
-        allocator = getattr(proxy_pool, "_atom_v4_slot_allocator", None)
-        if allocator is None:
-            allocator = proxy_pool._atom_v4_slot_allocator = _V4StateSlotAllocator(
-                proxy_pool.num_slots
-            )
-        first_block_ids = block_tables[:num_reqs, 0].detach().cpu().numpy()
-        fresh_mask = (
-            pos_np[q_np[:-1]] == 0
-            if total and len(q_np) > 1
-            else np.zeros(num_reqs, dtype=bool)
-        )
-        slot_arr, reset_slots = allocator.assign(first_block_ids, fresh_mask)
-        md.reset_slots = reset_slots
-        md.state_slot_mapping_cpu = slot_arr
-        md.state_slot_mapping = torch.from_numpy(slot_arr).to(
-            device=device, dtype=torch.int32
-        )
+    first_block_ids = block_tables[:num_reqs, 0].detach().cpu().numpy()
+    fresh_mask = (
+        pos_np[q_np[:-1]] == 0
+        if total and len(q_np) > 1
+        else np.zeros(num_reqs, dtype=bool)
+    )
+    slot_arr, reset_slots = allocator.assign(first_block_ids, fresh_mask)
+    if reset_slots:
+        _publish_allocator_table(proxy_pool, device)
+    md.reset_slots = reset_slots
+    md.state_slot_mapping_cpu = slot_arr
+    md.state_slot_mapping = torch.from_numpy(slot_arr).to(
+        device=device, dtype=torch.int32
+    )
     _resolve_v4_pool_geometry(md, proxy_pool)
     _bind_v4_state_slots(md)
     md.batch_id_per_q_token = torch.from_numpy(batch_np).to(device=device)
@@ -2314,9 +2431,6 @@ def build_atom_v4_attention_metadata_from_sglang(
         if proxy_pool.use_fp8_kv:
             _stage_decode_fp8_page_metadata(md, total, total)
         _publish_empty_kv_indptr(md, total)
-        _publish_fp4_decode_topk(
-            md, total, _eager_fp4_decode_topk(proxy_pool, total, index_topk, device)
-        )
     else:
         _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device)
         # A decode scores paged off the per-token fields and reads none.

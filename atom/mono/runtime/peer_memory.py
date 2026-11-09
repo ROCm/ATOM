@@ -7,7 +7,8 @@ from __future__ import annotations
 import torch
 from typing_extensions import Self
 
-from atom.mono.runtime.consensus import MonoUnsupported, tp_agree
+from atom.distributed.group_agreement import group_agree
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.hip_ipc import (
     close_ipc_handle,
     get_allocation_base,
@@ -33,7 +34,7 @@ class PeerBuffer:
 
     The constructor is collective over ``group`` (the handle exchange, then an
     agreement that every rank mapped every peer): every rank must reach it, so a
-    runner reaches it only after ``tp_agree``. A failed mapping on any rank raises
+    runner reaches it only after ``group_agree``. A failed mapping on any rank raises
     ``MonoUnsupported`` on all of them.
     """
 
@@ -74,7 +75,7 @@ class PeerBuffer:
                         addresses.append(base)
             except RuntimeError as err:  # every rank must still reach the agreement
                 failure = err
-            if not tp_agree(failure is None, group):
+            if not group_agree(failure is None, group):
                 self.close()
                 raise MonoUnsupported(
                     f"peer memory handshake failed on {'this' if failure else 'another'}"

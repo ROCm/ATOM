@@ -6,7 +6,7 @@
 
 import asyncio
 import pickle
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 from conftest import MockConfig
@@ -122,6 +122,9 @@ def test_core_manager_captures_context_after_executor_preprocess(spans):
             label="test",
             _seq_id_to_callback={},
             _send_request=lambda rank, payload: frames.append(payload),
+        )
+        manager._add_prepared_requests = MethodType(
+            CoreManager._add_prepared_requests, manager
         )
         CoreManager.add_request(manager, [seq])
 
@@ -380,7 +383,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
     config = MockConfig(
         parallel_config=SimpleNamespace(control_address="unused", data_parallel_size=1),
         tp_world_size=1,
-        prefill_context_parallel_size=1,
+        pcp_group_size=1,
         runner_qualname="unused",
         enforce_eager=True,
         disagg_is_decode=False,

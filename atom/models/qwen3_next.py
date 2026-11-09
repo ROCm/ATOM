@@ -32,6 +32,7 @@ from atom.model_ops.linear import (
     QKVZBAParallelLinear,
     QKVZParallelLinear,
     RowParallelLinear,
+    mxfp4_k_pad_align,
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import (
@@ -128,12 +129,16 @@ class Qwen3NextMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # An MXFP4 down_proj cannot take an unaligned K (its per-rank
+        # intermediate); the pair pads it together. See mxfp4_k_pad_align.
+        intermediate_pad = mxfp4_k_pad_align(quant_config, f"{prefix}.down_proj")
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            output_pad_align=intermediate_pad,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -142,6 +147,7 @@ class Qwen3NextMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
+            input_pad_align=intermediate_pad,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -200,12 +206,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         #     self.physical_expert_start + self.n_local_physical_experts
         # )
 
+        # 512 experts + the merged shared_expert_gate row is N=513, which has
+        # no tuned GEMM row and which FlyDSL hgemm rejects (odd N), so it runs
+        # on a hipBLASLt split-K plus a reduce kernel at decode. Padded to 528
+        # rows, the shape AITER's tuned table can carry FlyDSL rows for.
         self.gate = MergedReplicatedLinear(
             config.hidden_size,
             [config.num_experts, config.n_shared_experts],
             bias=False,
             quant_config=None,
             prefix=f"{prefix}.gate",
+            output_row_alignment=16,
         )
         self.is_rocm_aiter_fusion_shared_expert_enabled = (
             is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
