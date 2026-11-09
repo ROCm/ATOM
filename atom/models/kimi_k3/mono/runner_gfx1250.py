@@ -229,22 +229,21 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 weight = layer.kda
                 spec = K1LocalBuildSpec(
                     qlen=qlen,
-                    delta=True,
+                    delta=False,
                     state_len=self.state_len,
                     eps=weight.seam.eps,
                     out_eps=weight.seam.out_eps,
                     onorm_eps=weight.onorm_eps,
                     lower_bound=weight.lower_bound,
-                    write_idx=weight.write_idx,
+                    write_idx=-1,
                     quant_core=_fuse_ptpc_core(self.inner.layers[layer.layer_id], rows),
+                    external_seam=True,
                 )
-                cache_key = (weight.blocks, spec)
+                cache_key = spec
                 local = k1_cache.get(cache_key)
                 if local is None:
                     local = (
-                        self._plan(rows, weight.blocks)
-                        .make_k1_local_runner(spec)
-                        .prepare(self.device)
+                        self._plan(rows, 1).make_k1_local_runner(spec).prepare(self.device)
                     )
                     k1_cache[cache_key] = local
                 k1_by_layer[layer.layer_id] = local
@@ -360,9 +359,12 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         if plan.layer_id not in self.routed:
             out = self._fallback(plan, positions, prefix, blocks, add, add2)
         else:
-            delta = add if add2 is None else (add2 if add is None else add + add2)
-            core = self._k1(build, plan, prefix, delta, blocks, metadata)
-            layer = self.inner.layers[plan.layer_id]
+            layer, normed, prefix, _, write_idx = self._seam(
+                plan, prefix, blocks, add, add2
+            )
+            if write_idx >= 0:
+                blocks[:, write_idx].copy_(prefix)
+            core = self._k1(build, plan, normed, None, blocks, metadata)
             if isinstance(core, tuple):
                 core, core_scale = core
                 attn_out = layer.self_attn.o_proj(core, x_scale=core_scale)

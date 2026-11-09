@@ -347,12 +347,19 @@ class K1LocalBuildSpec:
     kda0: int = 0
     xp: int = 0
     gemv_unit: int = 2
+    # The production AttnRes kernel already mixed, normed and banked the
+    # input; K1 reads that normed row through its ``prefix`` argument.
+    external_seam: bool = False
 
     def validate(self, plan: Gfx1250KimiBuildPlan) -> None:
         if not 1 <= self.qlen <= 16 or plan.tokens % self.qlen:
             raise ValueError("local K1 qlen must be in [1, 16] and divide tokens")
         if type(self.delta) is not bool:
             raise TypeError("local K1 delta must be bool")
+        if self.external_seam and (self.delta or self.write_idx >= 0):
+            raise ValueError(
+                "external-seam K1 cannot apply the residual delta or bank a block"
+            )
         if type(self.quant_core) is not bool:
             raise TypeError("local K1 quant_core must be bool")
         if self.debug:

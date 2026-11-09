@@ -27,7 +27,7 @@ class K1LocalRuntime:
     """One product K1 invocation in the local pipeline's named order."""
 
     prefix: torch.Tensor
-    delta: torch.Tensor
+    delta: torch.Tensor | None
     blocks: torch.Tensor
     blk_sm: int
     blk_sr: int
@@ -111,8 +111,10 @@ class Gfx1250K1LocalRunner:
         rows = self.plan.tokens
         if tuple(runtime.prefix.shape) != (rows, HIDDEN):
             raise ValueError(f"prefix must have shape {(rows, HIDDEN)}")
-        if tuple(runtime.delta.shape) != (rows, HIDDEN):
+        if self.spec.delta and tuple(runtime.delta.shape) != (rows, HIDDEN):
             raise ValueError(f"delta must have shape {(rows, HIDDEN)}")
+        if not self.spec.delta and runtime.delta is not None:
+            raise ValueError("delta is only read when K1 applies the residual delta")
         if (
             runtime.blocks.ndim != 3
             or runtime.blocks.shape[0] != rows
@@ -139,6 +141,8 @@ class Gfx1250K1LocalRunner:
             "conv_st",
             "core_out",
         ):
+            if getattr(runtime, name) is None and name == "delta":
+                continue
             if getattr(runtime, name).dtype != torch.bfloat16:
                 raise ValueError(f"local K1 {name} must be bfloat16")
         if self.spec.quant_core:

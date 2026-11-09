@@ -12,6 +12,7 @@ from aiter import QuantType, dtypes
 from aiter.jit.utils import chip_info
 
 import atom.models.kimi_k3.mono.runner_gfx1250 as runner_module
+from atom.models.kimi_k3.mono.config import layer_block
 from atom.models.kimi_k3.mono.dispatch import MonoDecodeModel
 from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
     K1LocalBuildSpec,
@@ -156,54 +157,55 @@ def test_external_k2_runner_still_validates_k1_state_pools():
     assert observed == [7]
 
 
-@pytest.mark.parametrize("write_idx", (-1, 1))
-def test_k1_hands_its_core_to_the_production_k2(write_idx):
+@pytest.mark.parametrize("layer_id", (5, 12))
+def test_k1_reads_the_production_seam_and_hands_its_core_to_k2(layer_id):
     rows, hidden = 2, 4
     prefix = torch.zeros(rows, hidden)
+    add = torch.ones_like(prefix)
     blocks = torch.zeros(rows, 3, hidden)
     core = torch.full((rows, hidden), 2.0)
     calls = {}
+
+    def self_attention_attn_res(value, visible, add_hidden, add_hidden2):
+        calls["seam"] = visible.shape[1]
+        return value + add_hidden + 10, value + add_hidden
 
     def o_proj(value):
         calls["core"] = value
         return value + 1
 
-    def mlp_attn_res(value, visible, attn_out):
-        calls["seam"] = (value, visible, attn_out)
-        return attn_out + 1, attn_out + 2
-
-    def ffn(normed):
-        calls["ffn"] = normed
-        return normed + 1, normed + 2
+    def k1(_build, _plan, normed, delta, _blocks, _metadata):
+        calls["k1"] = (normed, delta)
+        return core
 
     layer = SimpleNamespace(
+        self_attention_attn_res=self_attention_attn_res,
         self_attn=SimpleNamespace(o_proj=o_proj),
-        mlp_attn_res=mlp_attn_res,
-        _ffn=ffn,
     )
     runner = object.__new__(K3Gfx1250MonoDecodeRunner)
-    runner.inner = SimpleNamespace(layers=[layer])
-    runner.routed = {0: object()}
-    runner._k1 = lambda *_args, **_kwargs: core
+    runner.inner = SimpleNamespace(layers={layer_id: layer})
+    runner.routed = {layer_id: object()}
+    runner._k1 = k1
     runner._routed_k2 = lambda _build, _plan, attn, value, _blocks: (
         calls.update(routed=(attn, value)) or value + 1,
         attn + 2,
     )
     runner._write_aux = lambda *_args: None
-    plan = SimpleNamespace(
-        layer_id=0,
-        mono=True,
-        kda=SimpleNamespace(blocks=1, write_idx=write_idx),
-    )
+    plan = SimpleNamespace(layer_id=layer_id, mono=True, kda=object())
 
-    out = runner._layer(
-        None, plan, None, prefix, blocks, torch.ones_like(prefix), None, None
-    )
+    out = runner._layer(None, plan, None, prefix, blocks, add, None, None)
 
+    before, write_idx = layer_block(layer_id)
+    normed, delta = calls["k1"]
+    torch.testing.assert_close(normed, prefix + add + 10)
+    assert delta is None
+    assert calls["seam"] == before
     assert calls["core"] is core
     attn_out, routed_prefix = calls["routed"]
     torch.testing.assert_close(attn_out, core + 1)
-    assert routed_prefix is prefix
+    torch.testing.assert_close(routed_prefix, prefix + add)
+    if write_idx >= 0:
+        torch.testing.assert_close(blocks[:, write_idx], prefix + add)
     assert all(tensor is None or tensor.shape == prefix.shape for tensor in out)
 
 

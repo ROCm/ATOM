@@ -79,6 +79,7 @@ class ResidentBuildKey:
     debug: bool
     kda0: int
     gemv_unit: int
+    external_seam: bool
 
 
 @dataclass(frozen=True)
@@ -197,12 +198,14 @@ def build_resident_k1(
             spec.debug,
             spec.kda0,
             spec.gemv_unit,
+            spec.external_seam,
         ),
         SOURCES,
     )
     name = (
         f"k3_k1_gfx1250_resident_s{s}_l{qlen}_nb{declaration.nblocks}"
         f"_u{spec.gemv_unit}_q{int(spec.quant_core)}"
+        f"{'_xs' if spec.external_seam else ''}"
     )
 
     @traced
@@ -421,7 +424,7 @@ def build_resident_k1(
         weights = scratch + fx.Int64(layout["wgt"][0])
         mean_squares = scratch + fx.Int64(layout["msq"][0])
         x_ready = scratch + fx.Int64(layout["xrdy"][0])
-        x = scratch + fx.Int64(layout["x"][0])
+        x = prefix if spec.external_seam else scratch + fx.Int64(layout["x"][0])
         projected = scratch + fx.Int64(layout["proj"][0])
         # The seam's PART handoff is dead once every projection is visible.
         # Reuse its much larger tagged-pair region for post-KDA core readiness
@@ -429,168 +432,169 @@ def build_resident_k1(
         # kernel.
         core_ready = part
 
-        if bid < ATTENTION_CTAS:
-            for tile in range_constexpr(len(tile_starts)):
-                token0 = tile_starts[tile]
-                rows = tile_rows[tile]
-                work_items = rows * sources * (SEAM_COLUMNS // 4)
-                for iteration in range_constexpr(
-                    (work_items + declaration.threads - 1) // declaration.threads
-                ):
-                    work = tid + declaration.threads * iteration
-                    live = work < work_items
-                    item = fx.min(work, work_items - 1)
-                    local_token = item // (sources * (SEAM_COLUMNS // 4))
-                    source = (item // (SEAM_COLUMNS // 4)) % sources
-                    column = bid * SEAM_COLUMNS + (item % (SEAM_COLUMNS // 4)) * 4
-                    global_token = token0 + local_token
-                    is_prefix = source == declaration.nblocks
-                    block_values = base.ld_bf4(
-                        blocks,
-                        global_token * blk_sm
-                        + fx.min(source, declaration.nblocks - 1) * blk_sr
-                        + column,
-                    )
-                    prefix_values = base.ld_bf4(
-                        prefix,
-                        global_token * HIDDEN + column,
-                    )
-                    if const_expr(spec.delta):
-                        delta_values = base.ld_bf4(
-                            delta,
-                            global_token * HIDDEN + column,
-                        )
-                        prefix_values = [
-                            prefix_values[element] + delta_values[element]
-                            for element in range(4)
-                        ]
-                    selected = [
-                        live.select(
-                            is_prefix.select(
-                                prefix_values[element],
-                                block_values[element],
-                            ),
-                            fx.Float32(0.0),
-                        )
-                        for element in range(4)
-                    ]
-                    if live:
-                        fx.ptr_store(
-                            fx.Vector.from_elements(selected, fx.Float32),
-                            attention.vals.ptr
-                            + (
-                                (local_token * sources + source) * SEAM_COLUMNS
-                                + column % SEAM_COLUMNS
-                            ),
-                        )
-                    norm_weight = base.ld_bf4(ares_nw, column)
-                    query = base.ld_bf4(ares_qk, column)
-                    square_sum = sum(value * value for value in selected)
-                    dot = sum(
-                        selected[element] * (norm_weight[element] * query[element])
-                        for element in range(4)
-                    )
-                    square_sum = compute["attention_reduce32"](square_sum)
-                    dot = compute["attention_reduce32"](dot)
-                    if live & (lane == 0):
-                        index = ((bid * s + global_token) * sources + source) * 2
-                        gfx_backend.mailbox_store_device(
-                            part,
-                            index,
-                            square_sum,
-                            generation,
-                        )
-                        gfx_backend.mailbox_store_device(
-                            part,
-                            index + 1,
-                            dot,
-                            generation,
-                        )
-                gpu.barrier()
-                if const_expr(spec.delta or spec.write_idx >= 0):
-                    copy_items = rows * (SEAM_COLUMNS // 4)
+        if const_expr(not spec.external_seam):
+            if bid < ATTENTION_CTAS:
+                for tile in range_constexpr(len(tile_starts)):
+                    token0 = tile_starts[tile]
+                    rows = tile_rows[tile]
+                    work_items = rows * sources * (SEAM_COLUMNS // 4)
                     for iteration in range_constexpr(
-                        (copy_items + declaration.threads - 1) // declaration.threads
+                        (work_items + declaration.threads - 1) // declaration.threads
                     ):
                         work = tid + declaration.threads * iteration
-                        if work < copy_items:
-                            local_token = work // (SEAM_COLUMNS // 4)
-                            local_column = (work % (SEAM_COLUMNS // 4)) * 4
-                            global_token = token0 + local_token
-                            column = bid * SEAM_COLUMNS + local_column
-                            at = (
-                                local_token * sources + declaration.nblocks
-                            ) * SEAM_COLUMNS + local_column
-                            value = [
-                                fx.ptr_load(attention.vals.ptr + at + element)
+                        live = work < work_items
+                        item = fx.min(work, work_items - 1)
+                        local_token = item // (sources * (SEAM_COLUMNS // 4))
+                        source = (item // (SEAM_COLUMNS // 4)) % sources
+                        column = bid * SEAM_COLUMNS + (item % (SEAM_COLUMNS // 4)) * 4
+                        global_token = token0 + local_token
+                        is_prefix = source == declaration.nblocks
+                        block_values = base.ld_bf4(
+                            blocks,
+                            global_token * blk_sm
+                            + fx.min(source, declaration.nblocks - 1) * blk_sr
+                            + column,
+                        )
+                        prefix_values = base.ld_bf4(
+                            prefix,
+                            global_token * HIDDEN + column,
+                        )
+                        if const_expr(spec.delta):
+                            delta_values = base.ld_bf4(
+                                delta,
+                                global_token * HIDDEN + column,
+                            )
+                            prefix_values = [
+                                prefix_values[element] + delta_values[element]
                                 for element in range(4)
                             ]
-                            packed = base.bf4_words(value)
-                            if const_expr(spec.delta):
-                                bo.buffer_store(
-                                    packed,
-                                    rsrc(prefix),
-                                    (global_token * HIDDEN + column) // 2,
-                                )
-                            if const_expr(spec.write_idx >= 0):
-                                bo.buffer_store(
-                                    packed,
-                                    rsrc(blocks),
-                                    (
-                                        global_token * blk_sm
-                                        + spec.write_idx * blk_sr
-                                        + column
+                        selected = [
+                            live.select(
+                                is_prefix.select(
+                                    prefix_values[element],
+                                    block_values[element],
+                                ),
+                                fx.Float32(0.0),
+                            )
+                            for element in range(4)
+                        ]
+                        if live:
+                            fx.ptr_store(
+                                fx.Vector.from_elements(selected, fx.Float32),
+                                attention.vals.ptr
+                                + (
+                                    (local_token * sources + source) * SEAM_COLUMNS
+                                    + column % SEAM_COLUMNS
+                                ),
+                            )
+                        norm_weight = base.ld_bf4(ares_nw, column)
+                        query = base.ld_bf4(ares_qk, column)
+                        square_sum = sum(value * value for value in selected)
+                        dot = sum(
+                            selected[element] * (norm_weight[element] * query[element])
+                            for element in range(4)
+                        )
+                        square_sum = compute["attention_reduce32"](square_sum)
+                        dot = compute["attention_reduce32"](dot)
+                        if live & (lane == 0):
+                            index = ((bid * s + global_token) * sources + source) * 2
+                            gfx_backend.mailbox_store_device(
+                                part,
+                                index,
+                                square_sum,
+                                generation,
+                            )
+                            gfx_backend.mailbox_store_device(
+                                part,
+                                index + 1,
+                                dot,
+                                generation,
+                            )
+                    gpu.barrier()
+                    if const_expr(spec.delta or spec.write_idx >= 0):
+                        copy_items = rows * (SEAM_COLUMNS // 4)
+                        for iteration in range_constexpr(
+                            (copy_items + declaration.threads - 1) // declaration.threads
+                        ):
+                            work = tid + declaration.threads * iteration
+                            if work < copy_items:
+                                local_token = work // (SEAM_COLUMNS // 4)
+                                local_column = (work % (SEAM_COLUMNS // 4)) * 4
+                                global_token = token0 + local_token
+                                column = bid * SEAM_COLUMNS + local_column
+                                at = (
+                                    local_token * sources + declaration.nblocks
+                                ) * SEAM_COLUMNS + local_column
+                                value = [
+                                    fx.ptr_load(attention.vals.ptr + at + element)
+                                    for element in range(4)
+                                ]
+                                packed = base.bf4_words(value)
+                                if const_expr(spec.delta):
+                                    bo.buffer_store(
+                                        packed,
+                                        rsrc(prefix),
+                                        (global_token * HIDDEN + column) // 2,
                                     )
-                                    // 2,
-                                )
-                device["wait_vector_stores"]()
-                if bid < rows:
-                    gate_context = {
+                                if const_expr(spec.write_idx >= 0):
+                                    bo.buffer_store(
+                                        packed,
+                                        rsrc(blocks),
+                                        (
+                                            global_token * blk_sm
+                                            + spec.write_idx * blk_sr
+                                            + column
+                                        )
+                                        // 2,
+                                    )
+                    device["wait_vector_stores"]()
+                    if bid < rows:
+                        gate_context = {
+                            "S": rows,
+                            "total_S": s,
+                            "token0": token0,
+                            "NS": sources,
+                            "tid": tid,
+                            "lane": lane,
+                            "wave": wave,
+                            "red": smem.red.ptr,
+                            "eps": spec.eps,
+                            "part": part,
+                            "wgt": weights,
+                            "tag": generation,
+                        }
+                        compute["attention_gate_tile"](gate_context, bid)
+                        device["wait_vector_stores"]()
+                    mix_context = {
                         "S": rows,
                         "total_S": s,
                         "token0": token0,
+                        "tile": tile,
                         "NS": sources,
                         "tid": tid,
                         "lane": lane,
                         "wave": wave,
+                        "matrix_waves": declaration.waves,
+                        "matrix_threads": declaration.threads,
                         "red": smem.red.ptr,
-                        "eps": spec.eps,
-                        "part": part,
+                        "vals": attention.vals.ptr,
+                        "out_eps": spec.out_eps,
+                        "debug": False,
+                        "mix_lds_handoff": False,
                         "wgt": weights,
+                        "msq": mean_squares,
+                        "xrdy": x_ready,
+                        "xbuf": x,
                         "tag": generation,
+                        "args": {"in_nw": in_nw},
                     }
-                    compute["attention_gate_tile"](gate_context, bid)
-                    device["wait_vector_stores"]()
-                mix_context = {
-                    "S": rows,
-                    "total_S": s,
-                    "token0": token0,
-                    "tile": tile,
-                    "NS": sources,
-                    "tid": tid,
-                    "lane": lane,
-                    "wave": wave,
-                    "matrix_waves": declaration.waves,
-                    "matrix_threads": declaration.threads,
-                    "red": smem.red.ptr,
-                    "vals": attention.vals.ptr,
-                    "out_eps": spec.out_eps,
-                    "debug": False,
-                    "mix_lds_handoff": False,
-                    "wgt": weights,
-                    "msq": mean_squares,
-                    "xrdy": x_ready,
-                    "xbuf": x,
-                    "tag": generation,
-                    "args": {"in_nw": in_nw},
-                }
-                compute["attention_mix_tile"](mix_context, bid)
+                    compute["attention_mix_tile"](mix_context, bid)
 
         if bid >= ATTENTION_CTAS:
             # Observe every tile before issuing weights: a gfx buffer poll
             # retires behind prior vmcnt loads, so prefetching weights first
             # would serialize every spin iteration behind those loads.
-            for tile in range_constexpr(len(tile_starts)):
+            for tile in range_constexpr(0 if spec.external_seam else len(tile_starts)):
                 gfx_backend.mailbox_poll_device(
                     x_ready,
                     tile * ATTENTION_CTAS + tid % ATTENTION_CTAS,
