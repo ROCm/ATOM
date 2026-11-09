@@ -305,60 +305,61 @@ def kda_conv_inputs(c, request, head, chunk):
     """Land projection, f_a, and beta before holding convolution metadata."""
 
     L, tid = c["L"], c["tid"]
+    projected = _scratch_region(c, "proj")
     n_fa = L * GATE_K
     fa_rounds = (n_fa + c["matrix_threads"] - 1) // c["matrix_threads"]
+    raw_indices = [
+        tid + c["matrix_threads"] * iteration for iteration in range_constexpr(fa_rounds)
+    ]
+    fa_indices = [
+        raw_index
+        if const_expr(n_fa % c["matrix_threads"] == 0)
+        else fx.min(raw_index, n_fa - 1)
+        for raw_index in raw_indices
+    ]
+    # Clamped so that every thread polls only published pairs; the values
+    # are stored below only by the threads that own them.
+    beta_token = fx.min(tid, L - 1)
+    channel_thread = fx.min(tid, 3 * VALUE_CHUNK - 1)
+    channel = (
+        (channel_thread // VALUE_CHUNK) * PROJ
+        + head * HEAD_DIM
+        + chunk * VALUE_CHUNK
+        + channel_thread % VALUE_CHUNK
+    )
+    values = mailbox_poll_many_device(
+        [
+            (
+                projected,
+                (request * L + index // GATE_K) * NPROJ + FA_0 + index % GATE_K,
+            )
+            for index in fa_indices
+        ]
+        + [(projected, (request * L + beta_token) * NPROJ + BETA_0 + head)]
+        + [
+            (projected, (request * L + token) * NPROJ + channel)
+            for token in range_constexpr(L)
+        ],
+        c["tag"],
+    )
     for iteration in range_constexpr(fa_rounds):
-        raw_index = tid + c["matrix_threads"] * iteration
-        index = (
-            raw_index
-            if const_expr(n_fa % c["matrix_threads"] == 0)
-            else fx.min(raw_index, n_fa - 1)
-        )
-        value = mailbox_poll_device(
-            _scratch_region(c, "proj"),
-            (request * L + index // GATE_K) * NPROJ
-            + FA_0
-            + index % GATE_K,
-            c["tag"],
-        )
+        value = values[iteration]
         if const_expr(n_fa % c["matrix_threads"] == 0):
-            fx.ptr_store(
-                _f32_of(value),
-                c["fa"] + index,
-            )
+            fx.ptr_store(_f32_of(value), c["fa"] + fa_indices[iteration])
         else:
-            if raw_index < n_fa:
-                fx.ptr_store(_f32_of(value), c["fa"] + index)
+            if raw_indices[iteration] < n_fa:
+                fx.ptr_store(_f32_of(value), c["fa"] + fa_indices[iteration])
     if tid < L:
-        beta = _f32_of(
-            mailbox_poll_device(
-                _scratch_region(c, "proj"),
-                (request * L + tid) * NPROJ + BETA_0 + head,
-                c["tag"],
-            )
-        )
+        beta = _f32_of(values[fa_rounds])
         fx.ptr_store(
             fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(-beta * LOG2E)),
             c["beta"] + tid,
         )
 
     if tid < 3 * VALUE_CHUNK:
-        part = tid // VALUE_CHUNK
-        channel = (
-            part * PROJ
-            + head * HEAD_DIM
-            + chunk * VALUE_CHUNK
-            + tid % VALUE_CHUNK
-        )
         for token in range_constexpr(L):
             fx.ptr_store(
-                _f32_of(
-                    mailbox_poll_device(
-                        _scratch_region(c, "proj"),
-                        (request * L + token) * NPROJ + channel,
-                        c["tag"],
-                    )
-                ),
+                _f32_of(values[fa_rounds + 1 + token]),
                 c["qkl"] + tid * L + token,
             )
     gpu.barrier()
@@ -640,13 +641,14 @@ def kda_gates(c, k, request, head):
             (elements + c["matrix_threads"] - 1) // c["matrix_threads"]
         )
     ]
+    qk = _scratch_region(c, "qk")
+    base = (request * HEADS + head) * L * 2 * HEAD_DIM
+    values = mailbox_poll_many_device(
+        [(qk, base + index) for index in indices],
+        c["tag"],
+    )
     for iteration in range_constexpr(len(indices)):
-        value = mailbox_poll_device(
-            _scratch_region(c, "qk"),
-            (request * HEADS + head) * L * 2 * HEAD_DIM + indices[iteration],
-            c["tag"],
-        )
-        fx.ptr_store(_f32_of(value), c["qkl"] + indices[iteration])
+        fx.ptr_store(_f32_of(values[iteration]), c["qkl"] + indices[iteration])
     gpu.barrier()
     gate_compute(c, k)
     gpu.barrier()
@@ -754,22 +756,24 @@ def kda_recur(c, k, req, head, chunk):
 def _kda_norm_row(c, request, head, chunk, token, element):
     L = c["L"]
     row = chunk * VALUE_CHUNK + element
+    onrm = _scratch_region(c, "onrm")
+    values = mailbox_poll_many_device(
+        [
+            (onrm, ((request * HEADS + head) * L + token) * STATE_CHUNKS + other)
+            for other in range_constexpr(STATE_CHUNKS)
+        ]
+        + [
+            (
+                _scratch_region(c, "proj"),
+                (request * L + token) * NPROJ + G2_0 + head * HEAD_DIM + row,
+            )
+        ],
+        c["tag"],
+    )
     square_sum = fx.Float32(0.0)
     for other in range_constexpr(STATE_CHUNKS):
-        square_sum = square_sum + _f32_of(
-            mailbox_poll_device(
-                _scratch_region(c, "onrm"),
-                ((request * HEADS + head) * L + token) * STATE_CHUNKS + other,
-                c["tag"],
-            )
-        )
-    gate = _f32_of(
-        mailbox_poll_device(
-            _scratch_region(c, "proj"),
-            (request * L + token) * NPROJ + G2_0 + head * HEAD_DIM + row,
-            c["tag"],
-        )
-    )
+        square_sum = square_sum + _f32_of(values[other])
+    gate = _f32_of(values[STATE_CHUNKS])
     inverse = hw_rsq(
         square_sum * fx.Float32(1.0 / HEAD_DIM)
         + fx.Float32(c["onorm_eps"])
@@ -889,6 +893,27 @@ def mailbox_poll_device(pointer, index, expected_tag):
         rocdl.s_sleep(1)
         pair = mailbox_load_device(pointer, index)
     return pair[0]
+
+
+@traced
+def mailbox_poll_many_device(items, expected_tag):
+    """Poll ``(pointer, index)`` pairs with every load in flight at once.
+
+    Polling them one by one costs one dependent L2 round trip per pair even
+    when all of them are already published."""
+
+    def stale(pairs):
+        flags = [pair[1] != fx.Int32(expected_tag) for pair in pairs]
+        result = flags[0]
+        for flag in flags[1:]:
+            result = result | flag
+        return result
+
+    pairs = [mailbox_load_device(pointer, index) for pointer, index in items]
+    while stale(pairs):
+        rocdl.s_sleep(1)
+        pairs = [mailbox_load_device(pointer, index) for pointer, index in items]
+    return [pair[0] for pair in pairs]
 
 
 def mailbox_reset_device(pointer, index):
