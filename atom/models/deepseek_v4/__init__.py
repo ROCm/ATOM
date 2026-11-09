@@ -1717,25 +1717,8 @@ def _segment_forward_context(fc, ctx, seg_md, *, is_prefill: bool, input_ids):
 
 
 def _mixed_span(tag: str):
-    """A profiler span that is ~free when nothing is profiling.
-
-    `record_function` constructs and enters a real object whether or not a
-    profiler is attached: measured 4.354 us per enter/exit on this box against
-    0.129 us for the gated form. `_attn_mixed` opens three per layer, so at 61
-    layers that is 183 per mixed step -- 0.797 ms of pure host time on every
-    mixed step, forever, for instrumentation that is off by default.
-
-    Kept rather than deleted because the per-segment split is the measurement
-    the mixed path is actually tuned against; it just should not be billed to
-    runs that never look at it.
-
-    The runtime check genuinely fires: `_attn_mixed`'s only caller is
-    `forward_impl`, reached through `v4_attention_with_output`, which is
-    registered `@mark_spliting_op(is_custom=True)` and is therefore opaque to
-    Dynamo. A plain-Python predicate placed in a TRACED region instead would be
-    evaluated once against the warmup batch and baked out, which is why
-    `_forward_tr_hybrid_attention` carries no `is_mixed` check.
-    """
+    """Create a span only while profiling. Called inside the opaque attention op,
+    so the predicate is evaluated at runtime rather than captured by Dynamo."""
     if _profiler_enabled():
         return torch.profiler.record_function(tag)
     return _NULL_SPAN
@@ -2398,14 +2381,6 @@ class DeepseekV4Attention(nn.Module):
         ctx = fc.context
         n_p = attn_md.num_prefill_tokens
         n_d = x.size(0) - n_p
-        # Validate the independently sliced tensor and metadata token counts.
-        _declared_d = getattr(attn_md, "num_decode_tokens", None)
-        if _declared_d is not None and _declared_d != n_d:
-            raise RuntimeError(
-                f"mixed segment sizes disagree: tensor has {x.size(0)} rows "
-                f"({n_p} prefill + {n_d} decode) but metadata declares "
-                f"{_declared_d} decode tokens"
-            )
         # Only `input_ids` is still read here -- each segment slices it. The
         # metadata/is_prefill swap and its restore belong to
         # `_segment_forward_context`, per segment.
@@ -2653,6 +2628,7 @@ class DeepseekV4Attention(nn.Module):
                 prefix=f"{self.layer_name}.sparse_attn_decode",
                 split_plan=split_plan,
                 compress_ratio=ratio,
+                out=out,
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio

@@ -4,9 +4,11 @@ ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache 
 
 ## Quick reference
 
-| Class | File | Purpose |
+| Component | File | Purpose |
 |---|---|---|
 | `Scheduler` | `atom/model_engine/scheduler.py` | Orchestrates prefill/decode scheduling, preemption, and postprocessing |
+| `profile_mixed_memory` | `atom/model_engine/mixed_profile.py` | Mixed attention workspace profiling before KV sizing |
+| `capture_aux` | `atom/spec_decode/aux_capture.py` | Runtime aux capture for compiled target forwards |
 | `EngineStats` | `atom/model_engine/engine_stats.py` | MTP acceptance, prefix-cache hit, and throughput statistics |
 | `ScheduledBatch` | `atom/model_engine/scheduler.py` | Immutable snapshot of a scheduled batch sent to the model runner |
 | `ScheduledBatchOutput` | `atom/model_engine/scheduler.py` | Holds sampled token IDs and draft token IDs returned from forward pass |
@@ -812,6 +814,8 @@ def num_tokens(self, value):
 |---|---|
 | `atom/model_engine/scheduler.py` | `Scheduler`, `ScheduledBatch`, `ScheduledBatchOutput` — scheduling algorithm, postprocessing |
 | `atom/model_engine/engine_stats.py` | `EngineStats` — speculative-decode acceptance, prefix-cache hit, and throughput statistics |
+| `atom/model_engine/mixed_profile.py` | Real mixed attention workspace profiling before KV sizing |
+| `atom/spec_decode/aux_capture.py` | Runtime aux capture for compiled target forwards |
 | `atom/model_engine/block_manager.py` | `Block`, `BlockManager` — paged KV cache block pool, allocation/deallocation, prefix caching with xxhash64 |
 | `atom/model_engine/sequence.py` | `Sequence`, `SequenceStatus`, `SequenceType` — request lifecycle, token management, timing |
 | `atom/model_engine/request.py` | `RequestOutput` — streaming output dataclass with `request_id`, `output_tokens`, `finished`, `finish_reason` |
@@ -832,11 +836,14 @@ Prefill and decode share `max_num_batched_tokens`. A decode row costs
 `decode_spec_width + 1` tokens, including speculative verification. The
 scheduler reserves that demand for running decodes while retaining at least
 one eighth of the token budget for prefill progress. At high decode load,
-some decodes wait for a later step.
+decode admission follows FCFS order. Tail requests may wait until earlier
+decodes finish or the long prefill ends; this policy does not rotate them.
 
 New-prompt admission also reserves the eligible running decodes' append-page
 demand. A new prompt that would consume those pages stays in the waiting
 queue, rather than forcing an older decode to discard its KV and recompute.
+The scheduler calculates token and page reservations once per tick and
+passes them to the delayer, pending/cost/head probes, and actual admission.
 This reservation does not allocate pages and includes speculative lookahead.
 It excludes requests already scheduled as prefill in the current step, while
 including completed prefills waiting for their first decode.
@@ -856,7 +863,9 @@ FP8 attention allocates a separate BF16 output buffer.
 token fields, request-keyed maps, and filtered state/page rows. It rejects
 unclassified fields rather than passing parent data through to a segment.
 The V4 builder passes resolved rejection counts explicitly to decode
-preparation; decode code needs no proxy type or parent-row offset.
+preparation, which uses the common context rollback helper. The V4 carrier
+owns segment boundaries and a sampled-token row map shared by the LM head,
+draft verification, and anchor settlement; Context does not duplicate them.
 
 V4 owns separate publication banks for prefill metadata and decode metadata.
 Each bank has its own host sources, device destinations, and H2D ownership.
@@ -869,8 +878,9 @@ microbatch is pure prefill and the second holds the remaining prefill tokens
 and every decode token. Both use the same carrier construction and SWA-mask
 rules as an unsplit mixed batch. Segment state is checked when that carrier
 is built, rather than repeatedly in every model layer.
-When mixed is enabled, DSpark aux hooks read the live microbatch offset through
-an opaque operation so compiled target regions do not retain a stale offset.
+With either setting of the mixed flag, DSpark aux hooks read the live
+microbatch offset through an opaque operation so compiled target regions do
+not retain a stale offset.
 
 ### Startup memory profiling
 
@@ -890,6 +900,9 @@ Old history can share a read-only zero page during this allocation profile;
 current writes use private pages and state slots. Temporary KV bindings are
 released before allocating the serving pool. The budget uses the measured
 allocation/cache high-water mark with temporary KV subtracted, along with
-the existing graph, non-PyTorch, and safety allowances. There is no fixed
+the non-PyTorch and safety allowances. The graph estimate is saved from
+ordinary warmup before the eager mixed sweep; mixed workspace is counted
+once, without increasing graph-pool estimates. The sweep returns its peak
+and non-PyTorch usage to a single final KV budget calculation. There is no fixed
 5% mixed reserve. The sampled peak is configuration-dependent; it does not
 prove that every future allocator fragmentation pattern is bounded.

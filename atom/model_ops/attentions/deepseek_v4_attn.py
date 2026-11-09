@@ -157,7 +157,9 @@ from atom.utils.forward_context import (
     Context,
     get_forward_context,
 )
-from atom.utils.tbo import NUM_TBO_UBATCHES, UBatchSlice
+from atom.utils.h2d import h2d_producer
+from atom.utils.tbo import decode_bucket_splits, decode_ubatch_request_ranges
+from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
 
 logger = logging.getLogger("atom")
 
@@ -427,15 +429,13 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     kv_indptr_extend: torch.Tensor | None = None
     """[total_tokens + 1] int32 GPU — packed cumsum of `extend_count`."""
 
-    # ----- Mixed prefill+decode split dispatch (set by `prepare_mixed`) -----
-    # When `is_mixed`, `prefill_attn_metadata` / `decode_attn_metadata` (on the
-    # base class) carry the two per-segment metadata sets; the forward splits
-    # the flat q/kv tensor at `num_prefill_tokens` and runs each segment through
-    # its own path. None/False for non-mixed batches.
+    # Mixed target layout; TBO carriers use their own local token coordinates.
+    prefill_attn_metadata: "AttentionMetaData_DSV4 | None" = None
+    decode_attn_metadata: "AttentionMetaData_DSV4 | None" = None
     num_prefill_tokens: int = 0
     num_prefill_seqs: int = 0
     num_decode_tokens: int = 0
-    num_decode_seqs: int = 0
+    sampled_token_indices: torch.Tensor | None = None
 
     @property
     def is_mixed(self) -> bool:
@@ -529,7 +529,17 @@ def _mixed_carrier(
     merged.num_prefill_tokens = n_p_tokens
     merged.num_prefill_seqs = n_p_seqs
     merged.num_decode_tokens = n_d_tokens
-    merged.num_decode_seqs = n_d_seqs
+    merged.sampled_token_indices = torch.cat(
+        [
+            cu_seqlens_q[1 : n_p_seqs + 1] - 1,
+            torch.arange(
+                n_p_tokens,
+                n_p_tokens + n_d_tokens,
+                dtype=cu_seqlens_q.dtype,
+                device=cu_seqlens_q.device,
+            ),
+        ]
+    )
     # One QK-norm/RoPE launch for the whole batch. Negative row IDs mask
     # prefill's SWA stores: its prefix must survive until prefill attention
     # finishes. Decode stores remain fused, including in the mixed TBO tail.
@@ -2873,12 +2883,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             build_ubatches=False,
         )
 
-        # ---- Merge positions ([prefill | decode]) on the device. ----
-        # Both halves are already published: prefill's into the bank, decode's
-        # into the runner's buffer. Concatenating the two device views needs no
-        # host round-trip (the old `decode_positions.cpu()` stalled the host on
-        # the stream, ~12 ms of GPU idle per mixed step) and no third upload --
-        # re-staging either buffer would be a second publish of it this epoch.
+        # Both segments are already published. Concatenate device views to
+        # avoid a host round-trip or republishing a buffer in this epoch.
         positions = torch.cat(
             [prefill_positions[:n_p_tokens], decode_positions[:n_d_tokens]]
         )
@@ -2888,11 +2894,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         return merged, positions
 
-    def commit_speculative_state(self, metadata, last_token_indices):
+    def publish_draft_state(self, metadata):
         """Publish whole-batch state slots to the draft graph's fixed input buffer."""
-        del last_token_indices
-        if not getattr(metadata, "is_mixed", False):
-            return
         slots = metadata.state_slot_out
         buf = self.model_runner.forward_vars["v4_meta_state_slot_out"].gpu
         buf[: slots.shape[0]].copy_(slots)
@@ -2936,14 +2939,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Explicit counts belong to a mixed segment, including q=1. Ordinary
         # decode retains its existing max-query-width rollback condition.
         if not batch.is_dummy_run and (max_seqlen_q > 1 or num_rejected is not None):
-            if num_rejected is None:
-                context_lens_np = self.model_runner.tokenID_processor.verify_ctx_lens(
-                    context_lens_np
-                )
-            else:
-                if len(num_rejected) != len(context_lens_np):
-                    raise ValueError("num_rejected is not aligned with decode rows")
-                context_lens_np = context_lens_np - num_rejected.astype(np.int32)
+            context_lens_np = self.model_runner.tokenID_processor.verify_ctx_lens(
+                context_lens_np, num_rejected=num_rejected
+            )
         # DSpark q-shrink: anchor the forwarded q tokens to the draft span HEAD
         # (ctx-full_q), not the tail, so they stay in [ctx-full_q .. ctx-1] (never
         # OOB); dropped tail slots are re-drafted next step (lossless). No-op when
@@ -3583,8 +3581,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 "pure-prefill ubatch of a mixed batch needs the parent's "
                 "prefill segment metadata"
             )
-        from atom.utils.tbo.ubatch_splitting import UBatchSlice
-
         rs = ub_slice.request_slice
         # Strip the mixed markers before recursing. `build_ubatch_prefill_
         # metadata` dispatches on their presence, so passing `ub_slice` through
@@ -3605,8 +3601,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ubatch_idx: int,
     ) -> AttentionMetaData_DSV4:
         """Rebuild the prefill tail and retain all decode rows in the final microbatch."""
-        from atom.utils.tbo.ubatch_splitting import UBatchSlice
-
         src = cast(AttentionMetaData_DSV4, attn_metadata)
         rs = ub_slice.request_slice
         ts = ub_slice.token_slice
@@ -3685,8 +3679,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
           ranges come from the PcpBalGroup, not the ub_slice).
         - Token-split TBO (default, §11): uses `ub_slice` / `running_bs`.
         """
-        from atom.utils.tbo.ubatch_splitting import split_attn_metadata
-
         # Both ubatches of a split MIXED batch have to be rebuilt from the
         # parent's prefill SEGMENT metadata, never from the parent itself. The
         # parent of a mixed batch is a thin carrier -- `prepare_mixed` gives it
@@ -3858,8 +3850,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         GLOBAL for the group (the compressor/swa_write see the group's full
         all-gathered tokens), exactly as non-TBO PCP does for the whole batch.
         """
-        rs0, rs1 = pcp_group.req_start, pcp_group.req_stop
-        gts, gte = pcp_group.tok_start, pcp_group.tok_end
+        from atom.model_ops.v4_kernels import make_compress_plans
+
+        mr = self.model_runner
+        grp = mr._pcp_bal_groups[ubatch_idx]  # PcpBalGroup
+        rs0, rs1 = grp.req_start, grp.req_stop
+        gts, gte = grp.tok_start, grp.tok_end
         group_bs = rs1 - rs0
         group_total = gte - gts  # group's global token count (real, pre-pad)
         device = self.device

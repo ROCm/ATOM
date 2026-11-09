@@ -3226,36 +3226,13 @@ class Config:
         self.enable_dynamic_chunking = False
 
     def _validate_mixed_prefill_decode(self) -> None:
-        """Refuse `--enable-mixed-prefill-decode` on configs that cannot run it.
-
-        One table, checked at launch. The alternative -- and what this replaces
-        -- was a refusal scattered across five files, fired only once a mixed
-        batch had actually been built, so a user learned the combination was
-        unsupported some way into serving rather than at startup. Most of those
-        were `assert`s, which `python -O` strips: the combinations then did not
-        refuse at all, they ran with whichever wrong numerics the assert stood
-        in front of.
-
-        Each entry is a condition this config declares, not one a batch
-        discovers. That is the whole reason they can be checked here: they come
-        off the HF config and the CLI, both settled before a model loads.
-
-        Mixed batching is implemented for DeepSeek-V4 only. Every other
-        attention family is refused here; the base builder's `prepare_mixed`
-        and the MHA forward keep a runtime refusal as a backstop, which firing
-        means this table has a gap.
-        """
+        """Validate mixed batching capabilities before loading the model."""
         if not self.enable_mixed_prefill_decode:
             return
 
         from atom.utils import get_hf_text_config
         from atom.utils.selector import Family, attn_family
 
-        # `hf_config` is set earlier in `__post_init__`; the text sub-config is
-        # derived, not stored (multimodal configs nest it). ModelRunner keeps
-        # its own `hf_text_config` attribute -- that one is NOT on Config, and
-        # reading it here is what made this validator raise AttributeError on
-        # every launch that enabled the flag.
         hf = get_hf_text_config(self.hf_config)
         family = attn_family(hf)
         spec = self.speculative_config
@@ -3364,16 +3341,20 @@ class Config:
             )
 
         # The scheduler keeps at least 1/8 of the token budget for prefill.
-        # A full speculative decode set may therefore span several steps.
+        # FCFS decode tails can wait for the entire long prefill.
         if spec is not None and spec.num_speculative_tokens:
             full_reserve = self.max_num_seqs * (spec.num_speculative_tokens + 1)
-            if full_reserve >= self.max_num_batched_tokens:
+            decode_budget = self.max_num_batched_tokens - max(
+                1, self.max_num_batched_tokens // 8
+            )
+            if full_reserve > decode_budget:
                 logger.warning(
                     "--enable-mixed-prefill-decode with %d speculative tokens: a "
                     "full decode set (max_num_seqs=%d) needs %d tokens with "
                     "--max-num-batched-tokens=%d. The scheduler reserves at "
                     "least 1/8 of that budget for prefill, so some decodes "
-                    "may wait for a later step when prefill is present.",
+                    "at the FCFS tail may wait until preceding decodes finish "
+                    "or the long prefill ends.",
                     spec.num_speculative_tokens,
                     self.max_num_seqs,
                     full_reserve,

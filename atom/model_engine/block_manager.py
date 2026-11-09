@@ -1182,6 +1182,7 @@ class BlockManager:
         *,
         block_hashes: list[int] | None = None,
         probe: AdmissionProbe | None = None,
+        reserved_decode_blocks: int = 0,
     ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -1208,11 +1209,23 @@ class BlockManager:
         avoiding a second hash pass.
         """
         if probe is None:
-            return self._evaluate(seq, self._admission_walk, record, block_hashes)
+            return self._evaluate(
+                seq,
+                self._admission_walk,
+                record,
+                block_hashes,
+                reserved_decode_blocks=reserved_decode_blocks,
+            )
         assert block_hashes is None, "the probe carries its own chain"
         probe.num_new_blocks = None
+        probe.reserved_decode_blocks = reserved_decode_blocks
         probe.num_cached_blocks = self._evaluate(
-            seq, self._admission_walk, record, probe.block_hashes, probe
+            seq,
+            self._admission_walk,
+            record,
+            probe.block_hashes,
+            probe,
+            reserved_decode_blocks=reserved_decode_blocks,
         )
         return probe.num_cached_blocks
 
@@ -1223,6 +1236,8 @@ class BlockManager:
         record: bool,
         block_hashes: list[int] | None,
         probe: AdmissionProbe | None = None,
+        *,
+        reserved_decode_blocks: int = 0,
     ) -> int:
         """`can_allocate` over the walk `walk_of(seq)` returns; everything but
         the walk is asked afresh on every call. `probe.num_new_blocks` is set
@@ -1236,7 +1251,7 @@ class BlockManager:
             block_hashes.clear()
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
-        reserved = probe.reserved_decode_blocks if probe is not None else 0
+        reserved = reserved_decode_blocks
         if not self.enable_prefix_caching:
             if not self._has_page_units(
                 self.num_pool_blocks(len(seq))
@@ -1491,7 +1506,9 @@ class BlockManager:
             return None
         return walk
 
-    def can_allocate_memoized(self, seq: Sequence) -> int:
+    def can_allocate_memoized(
+        self, seq: Sequence, *, reserved_decode_blocks: int = 0
+    ) -> int:
         """`can_allocate(seq, record=False)` for the delayer and the DP chunk
         cost, with the walk memoised per seq. The same `_evaluate`, so state
         room, the gates, the replay, checkpoint demand/end, the used hit blocks
@@ -1505,7 +1522,9 @@ class BlockManager:
         by a publish of that hash), and token count and seed are unchanged.
         """
         walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
-        return self._evaluate(seq, walk_of, False, None)
+        return self._evaluate(
+            seq, walk_of, False, None, reserved_decode_blocks=reserved_decode_blocks
+        )
 
     def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
         memo = self._cached_walks.get(seq)

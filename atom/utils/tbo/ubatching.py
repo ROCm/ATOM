@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from atom.config import get_current_atom_config
+from atom.utils import envs
 from atom.utils.tbo.ubatch_splitting import (
     decode_bucket_splits,
     decode_ubatch_request_ranges,
@@ -130,24 +131,8 @@ def _precompute_mixed_token_split(
     if cuts is None:
         return False, False, 0, 0
 
-    # One contiguous cut of a `[prefill | decode]` layout can never leave BOTH
-    # halves mixed: whichever side the cut falls on, the other side is pure.
-    # Require it to land strictly inside the prefill region, which gives
-    #     ubatch 0 = pure prefill      (the ordinary prefill path, unchanged)
-    #     ubatch 1 = [prefill tail | every decode row]   (mixed)
-    # so both ubatches keep is_prefill=True and only ubatch 1 needs mixed
-    # metadata.
-    #
-    # The other landing -- cut at or past the prefill tokens -- would make
-    # ubatch 1 pure DECODE while its parent context says is_prefill=True, and
-    # TBO builds per-ubatch contexts off the parent's mode
-    # (`_make_ubatch_context` branches on `ctx.context.is_prefill`, one branch
-    # for all ubatches). Supporting that needs per-ubatch mode switching, which
-    # is a separate piece of work; refuse the split instead.
-    #
-    # Real mixed batches are overwhelmingly prefill (measured: 15831 prefill vs
-    # 379 decode tokens), so the midpoint lands inside the prefill region and
-    # this rejects almost nothing.
+    # Both children inherit prefill mode, so the cut must stay inside
+    # prefill: child 0 is pure prefill; child 1 owns the decode suffix.
     if not mixed_cut_inside_prefill(cuts, num_pref_tokens):
         return False, False, 0, 0
 
@@ -212,8 +197,6 @@ def local_tbo_precompute(
         return False, False, 0, 0
 
     if batch.is_mixed:
-        from atom.utils import envs
-
         # With TBO on, a mixed batch takes the mixed split. Whatever it cannot
         # split it refuses HERE, as can_split=False, not later in
         # `_maybe_create_tbo_slices`: `can_split` is AND-reduced across DP so
@@ -227,8 +210,6 @@ def local_tbo_precompute(
         )
 
     if is_prefill:
-        from atom.utils import envs
-
         num_pref_reqs = batch.total_seqs_num_prefill
         min_pref = envs.ATOM_TBO_PREFILL_MIN_TOKENS
         if envs.ATOM_TBO_PREFILL_TOKEN_SPLIT:

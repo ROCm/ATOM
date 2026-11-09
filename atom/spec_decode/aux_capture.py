@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Runtime aux capture for the opt-in mixed DSpark/TBO path."""
+"""Runtime aux capture shared by compiled and eager target forwards."""
 
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard

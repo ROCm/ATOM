@@ -22,6 +22,20 @@ from atom.spec_decode.status import SpecStatusQueue
 from atom.utils.selector import Family
 
 
+def test_postprocess_keeps_its_profiler_stage():
+    runner = SimpleNamespace(profiler=object())
+    with (
+        mock.patch("atom.model_engine.model_runner.record_function") as span,
+        mock.patch(
+            "atom.model_engine.model_runner.get_forward_context",
+            side_effect=RuntimeError("stop before sampling"),
+        ),
+        pytest.raises(RuntimeError, match="stop before sampling"),
+    ):
+        ModelRunner.postprocess(runner, None, None, None, None, None, False, None)
+    span.assert_called_once_with("ATOM::postprocess")
+
+
 def _prefill_batch(is_final_chunk: list[bool]) -> ScheduledBatch:
     batch = object.__new__(ScheduledBatch)
     batch.scheduled_tokens = np.arange(4, dtype=np.int32)
@@ -265,7 +279,6 @@ def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts(is_mixed):
     processor = _recurrent_producer_processor()
     batch = _decode_batch(num_spec_step=3)
     if is_mixed:
-        batch.is_mixed = True
         batch.scheduled_tokens = np.arange(5, dtype=np.int32)
         batch.total_tokens_num = 5
         batch.total_tokens_num_prefill = 1
@@ -451,6 +464,7 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
 
     batch = SimpleNamespace(
         scheduled_tokens=np.arange(8, dtype=np.int32),
+        is_mixed=False,
         # Two q=4 rows, so the flat width is 8 and the request count is 2.
         total_tokens_num=8,
         total_tokens_num_prefill=0,

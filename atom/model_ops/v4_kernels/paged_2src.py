@@ -75,24 +75,11 @@ except ImportError:
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
 
+from atom.model_ops.v4_kernels.output_buffer import call_with_output
+
 # Local head count the aiter asm fp8 prefill kernel ships for; anything else
 # raises there rather than dispatching, so we filter on it up front.
 _PREFILL_ASM_HEADS = 128
-
-
-def _prefill_with_output(kernel, args, out):
-    """Keep older AITER kernels usable when they allocate their own output."""
-    if out is None:
-        return kernel(*args)
-    try:
-        return kernel(*args, out=out)
-    except TypeError as exc:
-        # Retry only an unsupported output keyword, never a kernel's unrelated
-        # type error. Preserve the caller's output slice on the legacy path.
-        if "unexpected keyword argument 'out'" not in str(exc):
-            raise
-        out.copy_(kernel(*args))
-        return out
 
 
 # Fixed best-known Triton meta for DeepSeek-V4 TP=8 / local H=8 prefill.
@@ -696,13 +683,13 @@ def sparse_attn_v4_paged_2src(
             and q_packed.shape[1] == _PREFILL_ASM_HEADS
         ):
             try:
-                return _prefill_with_output(mla_sparse_prefill_fp8_asm, args, out)
+                return call_with_output(mla_sparse_prefill_fp8_asm, args, out)
             except RuntimeError:
                 # The ASM path has stricter runtime dtype/shape constraints;
                 # OPUS covers configurations it cannot serve.
                 pass
 
-        return _prefill_with_output(pa_sparse_prefill_fp8_opus, args, out)
+        return call_with_output(pa_sparse_prefill_fp8_opus, args, out)
     # Backend selection: prefer OPUS when available; fall back to Triton on
     # import failure, env override, or runtime error (e.g. unsupported GPU).
     # OPUS covers both archs: gfx950 from source, gfx1250 from a prebuilt code

@@ -114,7 +114,7 @@ def mode(monkeypatch):
     return set_mode
 
 
-def _run(inp, *, n=None, t_pad=None):
+def _run(inp, *, n=None, t_pad=None, out=None):
     """One ATOM decode call: q has `n` rows (default all), the CSR / qo_indptr
     have `t_pad` + 1 entries (default n), like the metadata builder stages them."""
     n = inp["q_packed"].shape[0] if n is None else n
@@ -137,7 +137,27 @@ def _run(inp, *, n=None, t_pad=None):
         qo_indptr=torch.arange(t_pad + 1, dtype=torch.int32, device=DEV),
         split_plan=plan,
         compress_ratio=128,
+        out=out,
     )
+
+
+@pytest.mark.parametrize("strided", [False, True])
+def test_persistent_caller_owned_output(mode, strided):
+    inp = _inputs([8] * 15, seed=41)
+    mode(True, min_rows=1)
+    expected = _run(inp)
+    parent = torch.full(
+        (17, H, 1024 if strided else 512), -99.0, dtype=torch.bfloat16, device=DEV
+    )
+    out = parent[1:-1, :, ::2] if strided else parent[1:-1]
+    before = hca_persist.stats["persist"]
+    actual = _run(inp, out=out)
+    assert hca_persist.stats["persist"] == before + 1
+    assert actual is out
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.all(parent[[0, -1]] == -99)
+    if strided:
+        assert torch.all(parent[:, :, 1::2] == -99)
 
 
 def _both(mode, inp, **kw):

@@ -387,13 +387,6 @@ class UBatchWrapper(nn.Module):
 
         # Split Context
         ub_scheduled_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
-        # Mixed only if this ubatch actually holds rows of both kinds. A slice
-        # from a non-mixed parent carries None; a pure-prefill slice carries a
-        # prefill count equal to its whole length.
-        ub_is_mixed = (
-            ub_slice.num_prefill_tokens is not None
-            and 0 < ub_slice.num_prefill_tokens < ub_scheduled_tokens
-        )
         if ub_running_tokens is not None:
             running_tokens = ub_running_tokens
         elif ctx.context.is_prefill:
@@ -429,20 +422,6 @@ class UBatchWrapper(nn.Module):
             ubatch_token_order=ub_token_order,
             scheduled_tokens_gpu=scheduled_tokens_gpu,
             pcp_split=ctx.context.pcp_split,
-            # Splitting a mixed batch leaves exactly ONE ubatch straddling the
-            # prefill/decode boundary; the others are pure prefill (the split
-            # is gated to guarantee that -- see split_mixed_token_midpoint).
-            # Only the straddling one is mixed, and it has its own boundary,
-            # which `_attn_mixed`'s split dispatch and `embed_head`'s sampling
-            # gather both read off the context and neither can rederive from
-            # the parent's.
-            #
-            # A pure-prefill ubatch reports is_mixed=False and takes the
-            # ordinary prefill path. On a non-mixed parent the slice carries
-            # None and everything below is the Context default, so single-mode
-            # TBO is untouched.
-            num_prefill_tokens=ub_slice.num_prefill_tokens if ub_is_mixed else 0,
-            num_prefill_seqs=ub_slice.num_prefill_seqs if ub_is_mixed else 0,
         )
 
         return ForwardContext(

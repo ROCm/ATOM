@@ -190,6 +190,57 @@ def test_partial_prefill_initializes_but_does_not_sample(controller):
     assert torch.isfinite(logits[0, ord("{")])
 
 
+@pytest.mark.parametrize("final_prefill", [False, True])
+@pytest.mark.parametrize("draft_count", [0, 2])
+def test_mixed_decode_masks_and_commits_beside_prefill(
+    controller, final_prefill, draft_count
+):
+    prefill = batch(controller, request_id=10, prefill=1)
+    decode = batch(controller, request_id=11)
+    mixed = NS(
+        structured_requests={
+            0: prefill.structured_requests[0],
+            1: decode.structured_requests[0],
+        },
+        req_ids=[10, 11],
+        total_seqs_num_prefill=1,
+        is_final_chunk=[final_prefill, False],
+    )
+    metadata = None
+    if draft_count:
+        snapshots = []
+        controller.draft_copy = NS(
+            start=lambda value: snapshots.append(value.clone()),
+            wait=lambda: snapshots[-1],
+        )
+        metadata = NS(
+            target_logits_indices_np=np.array([1, 2]),
+            bonus_logits_indices_np=np.array([0, 3]),
+            num_draft_tokens_np=np.array([0, 2]),
+            input_ids=torch.tensor([0, 0, ord("{"), ord('"')]),
+        )
+    controller.prepare(mixed, metadata)
+    logits = torch.zeros(2 + draft_count, 128)
+    prefixes = controller.apply(logits, mixed, metadata)
+    assert set(prefixes) == ({0, 1} if final_prefill else {1})
+    assert torch.isneginf(logits[1, ord("x")])
+    assert torch.isfinite(logits[1, ord("{")])
+    assert bool(torch.isneginf(logits[0, ord("x")])) == final_prefill
+    sampled = torch.full((2, draft_count + 1), -1)
+    sampled[:, 0] = ord("{")
+    if draft_count:
+        assert torch.isfinite(logits[2, ord('"')])
+        assert torch.isfinite(logits[3, ord("x")])
+        sampled[1, 1] = ord('"')
+    controller.commit(sampled, mixed, prefixes)
+    assert not controller.errors
+    next_logits = torch.zeros(1, 128)
+    controller.apply(next_logits, batch(controller, initial=False, request_id=11), None)
+    allowed = ord("x") if draft_count else ord('"')
+    assert torch.isfinite(next_logits[0, allowed])
+    assert torch.isneginf(next_logits[0, ord("z")])
+
+
 def test_runtime_uses_exact_preflight_key(controller, monkeypatch):
     b = batch(controller)
     monkeypatch.setattr(

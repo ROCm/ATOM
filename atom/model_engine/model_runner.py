@@ -64,6 +64,7 @@ from atom.kv_transfer.disaggregation import (
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.mixed_profile import profile_mixed_memory
 from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
@@ -137,7 +138,7 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.gc_utils import freeze_gc_heap
-from atom.utils.h2d import h2d_producer
+from atom.utils.h2d import PublicationOwner, PublicationRegistry, h2d_producer
 from atom.utils.region_graph import ReqGraph, TokenGraph
 from atom.utils.selector import attn_family, get_attn_backend, has_mla_indexer
 from atom.utils.sp_wrapper import SPModelWrapper
@@ -367,18 +368,23 @@ class tokenIDProcessor:
         self.num_rejected: np.ndarray | None = None
         self.num_bonus: np.ndarray | None = None
 
-    def verify_ctx_lens(self, context_lens: np.ndarray) -> np.ndarray:
+    def verify_ctx_lens(
+        self, context_lens: np.ndarray, *, num_rejected: np.ndarray | None = None
+    ) -> np.ndarray:
         """`batch.context_lens` moved back to the start of this verify window.
 
         Deferred output: the last step's `num_rejected` slots are still in
         `context_lens`. Undeferred (PP): postprocess already left one run of
         `mtp_k + 1` placeholders, so the shift is 1. Before any sampler output
         there is nothing to shift. Only a verify step has a window, so every
-        caller sits behind `max_seqlen_q > 1`.
+        caller sits behind `max_seqlen_q > 1`, or supplies mixed segment counts.
         """
-        if self.num_rejected is None:
+        rejected = self.num_rejected if num_rejected is None else num_rejected
+        if rejected is None:
             return context_lens
-        shift = self.num_rejected if self.is_deferred_out else 1
+        if len(rejected) != len(context_lens):
+            raise ValueError("num_rejected is not aligned with decode rows")
+        shift = rejected if self.is_deferred_out else 1
         return context_lens - np.asarray(shift, dtype=context_lens.dtype)
 
     @staticmethod
@@ -595,8 +601,10 @@ class tokenIDProcessor:
             # `max_seqlen_q` is the group's maximum, not this batch's row
             # width. Under PP only a producer is held to it; a PP consumer
             # verifies its own drafts below.
-            if not self.is_pipeline_parallel or self.is_pd_producer:
-                assert batch.num_spec_step == 0, (
+            if (
+                not self.is_pipeline_parallel or self.is_pd_producer
+            ) and batch.num_spec_step:
+                raise NotImplementedError(
                     "non-deferred decode got a speculative batch "
                     f"(num_spec_step={batch.num_spec_step})"
                 )
@@ -1051,11 +1059,7 @@ class ModelRunner:
         logger.info(f"Model warmup done: {self.config.model}")
 
     def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
-        """Override point for processes sharing the GPU (e.g. RapidServe).
-
-        Mixed workspace is measured with real attention in get_num_blocks,
-        rather than reserving a fixed percentage of the device.
-        """
+        """Override point for processes sharing the GPU (e.g. RapidServe)."""
         return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
@@ -1575,8 +1579,6 @@ class ModelRunner:
         logger.info(f"forward_vars ring: {pp_size} slots (pipeline parallel)")
 
     def _init_h2d_publication(self):
-        from atom.utils.h2d import PublicationRegistry
-
         # Shared by every slot `build_h2d_slot` binds, a mixed prefill bank's too.
         self.publication_registry = PublicationRegistry()
         transport = envs.ATOM_H2D_BACKEND
@@ -1602,8 +1604,6 @@ class ModelRunner:
         What every ring slot gets, and what a builder's private bank needs to
         publish under the same rules (see `mixed_prefill_bank_active`).
         """
-        from atom.utils.h2d import PublicationOwner
-
         transport = envs.ATOM_H2D_BACKEND
         owner = PublicationOwner(self.device, event, registry=self.publication_registry)
         members = {}
@@ -1784,10 +1784,7 @@ class ModelRunner:
         """
         if self.config.enforce_eager:
             return 0
-        peak = max(
-            torch.cuda.memory_stats()["allocated_bytes.all.peak"],
-            getattr(self, "_mixed_profile_peak_torch", 0),
-        )
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         activation_bytes = max(peak - current, 0)
 
@@ -1879,93 +1876,57 @@ class ModelRunner:
         """
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
-    def _local_checkpoint_spec(
-        self, plan: PoolPlan, transfer, slot_bytes: int
-    ) -> PagedStateCheckpointSpec:
-        """This worker's own checkpoint geometry, before any PP agreement."""
-        # None means the backend has not narrowed its image: carry it all.
-        narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
-        # The charged entry can be larger than the bytes a transfer
-        # publishes: MHA alignment padding is not a region, and a draft
-        # pool merged into the same class is ordinary KV after the
-        # checkpoint regions. The backend names the published unit.
-        page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
-        published_unit = getattr(
-            self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
-        )
-        if callable(published_unit):
-            published = published_unit()
-            if published is not None:
-                published = int(published)
-                if published <= 0 or published > page_unit_bytes:
-                    raise RuntimeError(
-                        f"checkpoint PAGE unit is {published} B but the "
-                        f"paged pool entry is {page_unit_bytes} B"
-                    )
-                page_unit_bytes = published
-        return PagedStateCheckpointSpec(
-            page_unit_bytes=page_unit_bytes,
-            slot_bytes=slot_bytes,
-            image_bytes=slot_bytes if narrowed is None else int(narrowed),
-            layout_id=transfer.paged_layout_id,
-        )
-
-    def _agree_pipeline_checkpoint_spec(
-        self, spec: PagedStateCheckpointSpec | None
-    ) -> PagedStateCheckpointSpec:
-        """Put every PP stage's checkpoint images on one set of unit ids.
-
-        Only the head schedules, so a store or restore op it builds names the
-        same unit ids on every stage. Each stage holds its own layers' state in
-        its own unit size, so the stages need different counts; all take the
-        largest, and a stage needing fewer leaves its tail units unwritten. An
-        op is checked against the joint layout id and the summed image bytes,
-        which change whenever any stage's geometry does. Collective over the
-        PP group, which holds one rank per stage in stage order.
-
-        A stage that holds no recurrent state passes None, and then every
-        stage refuses with the same error: one raising alone would leave the
-        others waiting here for its geometry.
-        """
-        pp = get_pp_group()
-        stages: list = [None] * pp.world_size
-        torch.distributed.all_gather_object(
-            stages,
-            (
-                None
-                if spec is None
-                else (
-                    spec.layout_id,
-                    spec.image_bytes,
-                    spec.page_unit_bytes,
-                    spec.units_per_checkpoint,
-                )
-            ),
-            group=pp.cpu_group,
-        )
-        stateless = [i for i, entry in enumerate(stages) if entry is None]
-        if stateless:
+    def _state_runtime_for_plan(self, plan: PoolPlan) -> StateRuntime:
+        """Checkpoint geometry shared by scratch profiling and serving pools."""
+        config = self.config
+        # Keep runtime state metadata out of Config.
+        transfer = self.attn_metadata_builder.state_transfer()
+        uses_paged_state = transfer.copies
+        if uses_paged_state and config.pipeline_parallel_size > 1:
             raise RuntimeError(
-                f"PP stages {stateless} of {len(stages)} hold no recurrent "
-                "state, so they cannot keep PAGE-backed state checkpoints; "
-                "give every stage a linear-attention layer "
-                "(VLLM_PP_LAYER_PARTITION)"
+                "PAGE-backed state checkpoints do not yet support pipeline "
+                "parallelism: every stage must first agree on one atomic "
+                "checkpoint/unit ownership transaction"
             )
-        units = max(entry[3] for entry in stages)
-        op_bytes = sum(entry[1] for entry in stages)
-        largest_image = max(entry[1] for entry in stages)
-        digest = hashlib.sha256(repr(stages).encode()).hexdigest()[:16]
-        layout_id = f"pp{len(stages)}-joint:{digest}"
-        logger.info(
-            "PAGE-backed state checkpoints span %d PP stages: units=%d "
-            "(per stage %s), op_bytes=%d, layout=%s",
-            len(stages),
-            units,
-            [entry[3] for entry in stages],
-            op_bytes,
-            layout_id,
-        )
-        return spec.for_pipeline(layout_id, units, op_bytes, largest_image)
+        if uses_paged_state and config.enable_rapidserve:
+            raise RuntimeError(
+                "PAGE-backed state checkpoints do not yet support RapidServe "
+                "prefill/decode disaggregation"
+            )
+        checkpoint_spec = None
+        if uses_paged_state:
+            if plan.paged_class is None:
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints require a PAGE sub-pool"
+                )
+            slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
+            # None means the backend has not narrowed its image: carry it all.
+            narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
+            # The charged entry can be larger than the bytes a transfer
+            # publishes: MHA alignment padding is not a region, and a draft
+            # pool merged into the same class is ordinary KV after the
+            # checkpoint regions. The backend names the published unit.
+            page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
+            published_unit = getattr(
+                self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
+            )
+            if callable(published_unit):
+                published = published_unit()
+                if published is not None:
+                    published = int(published)
+                    if published <= 0 or published > page_unit_bytes:
+                        raise RuntimeError(
+                            f"checkpoint PAGE unit is {published} B but the "
+                            f"paged pool entry is {page_unit_bytes} B"
+                        )
+                    page_unit_bytes = published
+            checkpoint_spec = PagedStateCheckpointSpec(
+                page_unit_bytes=page_unit_bytes,
+                slot_bytes=slot_bytes,
+                image_bytes=slot_bytes if narrowed is None else int(narrowed),
+                layout_id=transfer.paged_layout_id,
+            )
+        return StateRuntime(transfer=transfer, checkpoint_spec=checkpoint_spec)
 
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
@@ -1975,21 +1936,37 @@ class ModelRunner:
             hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
 
         free, total = torch.cuda.mem_get_info()
-        peak = max(
-            torch.cuda.memory_stats()["allocated_bytes.all.peak"],
-            getattr(self, "_mixed_profile_peak_torch", 0),
-        )
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         # weights + peak activation tensors (PyTorch allocator high-water).
         peak_torch = max(peak, current)
         # RCCL/NCCL buffers etc. held outside the allocator: device-used minus
         # torch-reserved. Ignoring it over-allocates KV and OOMs at runtime.
-        non_torch = max(
-            (total - free) - torch.cuda.memory_reserved(),
-            getattr(self, "_mixed_profile_non_torch", 0),
-        )
+        non_torch = max((total - free) - torch.cuda.memory_reserved(), 0)
 
+        # Preserve the ordinary warmup estimate before the eager mixed sweep
+        # resets allocator peaks. Mixed workspace does not belong to graph pools.
         cudagraph_overhead = self._estimate_cudagraph_overhead()
+        specs = self._sub_pool_specs()
+        if config.enable_mixed_prefill_decode:
+            torch.set_default_device(None)
+            old_plan = self.pool_plan
+            old_state = self.state_runtime
+            try:
+                # Geometry only; the profiler backs a bounded scratch pool.
+                self.pool_plan = plan_pools(specs, total, config.max_num_seqs)
+                self.state_runtime = self._state_runtime_for_plan(self.pool_plan)
+                mixed_peak, mixed_non_torch = profile_mixed_memory(self)
+            finally:
+                self.pool_plan = old_plan
+                self.state_runtime = old_state
+            peak_torch = max(peak_torch, mixed_peak)
+            free, total = torch.cuda.mem_get_info()
+            non_torch = max(
+                non_torch,
+                mixed_non_torch,
+                (total - free) - torch.cuda.memory_reserved(),
+            )
         safety_margin = int(total * 0.02)
 
         budget = int(total * config.gpu_memory_utilization)
@@ -2023,8 +2000,6 @@ class ModelRunner:
         available_for_kv = min(available_for_kv_budget, free_for_kv)
 
         torch.set_default_device(None)
-
-        specs = self._sub_pool_specs()
 
         # Sub-pool sizing is pure arithmetic over the byte budget — see
         # atom/model_ops/attentions/pool_layout/sub_pool_spec.py. STATE classes (GDN
@@ -2105,59 +2080,10 @@ class ModelRunner:
         self.pool_plan = plan
         config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
-        # Keep runtime state metadata out of Config.
-        transfer = self.attn_metadata_builder.state_transfer()
-        uses_paged_state = transfer.copies
-        if (
-            uses_paged_state
-            and config.pipeline_parallel_size > 1
-            and not getattr(
-                self.attn_metadata_builder, "paged_checkpoints_span_pipeline", False
-            )
-        ):
-            raise RuntimeError(
-                "PAGE-backed state checkpoints do not yet support pipeline "
-                "parallelism: every stage must first agree on one atomic "
-                "checkpoint/unit ownership transaction"
-            )
-        if uses_paged_state and config.enable_rapidserve:
-            raise RuntimeError(
-                "PAGE-backed state checkpoints do not yet support RapidServe "
-                "prefill/decode disaggregation"
-            )
-        checkpoint_spec = None
-        if uses_paged_state:
-            if plan.paged_class is None:
-                raise RuntimeError(
-                    "PAGE-backed state checkpoints require a PAGE sub-pool"
-                )
-            is_pp = config.pipeline_parallel_size > 1
-            if is_pp and not torch.distributed.is_initialized():
-                raise RuntimeError(
-                    "PAGE-backed state checkpoints under PP need the "
-                    "distributed groups initialized first"
-                )
-            slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
-            # A PP stage without a linear-attention layer has no image.
-            local_spec = (
-                self._local_checkpoint_spec(plan, transfer, slot_bytes)
-                if slot_bytes
-                else None
-            )
-            if is_pp:
-                # Every stage joins, a stateless one with None: raising before
-                # the collective would leave its peers waiting in it.
-                checkpoint_spec = self._agree_pipeline_checkpoint_spec(local_spec)
-                transfer = dataclasses.replace(
-                    transfer, paged_layout_id=checkpoint_spec.layout_id
-                )
-            elif local_spec is None:
-                raise RuntimeError(
-                    "PAGE-backed state checkpoints need recurrent state, but "
-                    "this model holds none"
-                )
-            else:
-                checkpoint_spec = local_spec
+        state_runtime = self._state_runtime_for_plan(plan)
+        self.state_runtime = state_runtime
+        checkpoint_spec = state_runtime.checkpoint_spec
+        if checkpoint_spec is not None:
             logger.info(
                 "PAGE-backed state checkpoints enabled: unit_bytes=%d, "
                 "slot_bytes=%d, image_bytes=%d (%.1f%% of a slot), "
@@ -2169,11 +2095,6 @@ class ModelRunner:
                 checkpoint_spec.units_per_checkpoint,
                 checkpoint_spec.layout_id,
             )
-        state_runtime = StateRuntime(
-            transfer=transfer,
-            checkpoint_spec=checkpoint_spec,
-        )
-        self.state_runtime = state_runtime
         for name in sorted(plan.entries):
             logger.info(
                 f"sub-pool {name}: entries={plan.entries[name]}, "
@@ -2239,17 +2160,6 @@ class ModelRunner:
             f"safety={safety_margin / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB)"
         )
-        if config.enable_mixed_prefill_decode and not hasattr(
-            self, "_mixed_profile_peak_torch"
-        ):
-            from atom.model_engine.mixed_profile import profile_mixed_memory
-
-            # The first plan supplies pool geometry only. Profile with a small
-            # temporary backing, release it, then size the serving pool from
-            # the measured eager workspace. No requests or graphs exist yet.
-            self._mixed_profile_peak_torch = profile_mixed_memory(self)
-            return self.get_num_blocks()
-
         # get_num_blocks runs in the RUNNER subprocess, so nothing it writes
         # to `config` is visible to the engine process that builds
         # BlockManager. Ship the whole per-class entry table across instead of
@@ -2491,21 +2401,9 @@ class ModelRunner:
         num_scheduled_tokens,
         tbo_collective_active: bool,
     ):
-        """Create TBO ubatch slices when the collective DP decision is True.
-
-        With the packed-reduce path the eligibility (local + cross-DP AND)
-        is decided in ``ForwardMode.decide``; here we just realise the split.
-
-        Deliberately has NO local veto of its own -- not even a defensive one.
-        `tbo_collective_active` is the cross-DP decision, and a rank that
-        second-guesses it here runs 1 ubatch while its peers run 2, which
-        deadlocks the per-ubatch collectives. Every reason to decline belongs in
-        `local_tbo_precompute`, where it reaches the AND-reduce and turns TBO
-        off for the whole group. A mixed batch used to be vetoed here; that
-        veto is now expressed as can_split=False, and re-adding one would
-        reintroduce the hang (observed: one rank scheduled a mixed batch, and
-        no rank scheduled another forward after it).
-        """
+        """Realize the collective TBO decision. All eligibility checks belong in
+        local_tbo_precompute before the DP reduction: a local veto here
+        would leave peers executing different numbers of collectives."""
         if not tbo_collective_active:
             return None
 
@@ -2565,13 +2463,6 @@ class ModelRunner:
         self._pcp_tbo_balanced_active = False
         self._pcp_bal_groups = None
         if is_prefill and pcp_size > 1 and not batch.is_dummy_run:
-            # Config._validate_mixed_prefill_decode rejects this at launch.
-            # Keep a backstop for callers that construct a runner directly:
-            # the PCP split below only sizes the prefill rows.
-            if batch.is_mixed:
-                raise NotImplementedError(
-                    "mixed prefill+decode is not supported with PCP"
-                )
             # PCP is always dp=1, so the single-rank path returns this verbatim
             # as `tbo_collective_active`; ub0/ub1 are only read under dp > 1.
             local_tokens = batch.total_tokens_num_prefill // pcp_size
@@ -2735,24 +2626,10 @@ class ModelRunner:
 
     def _verify_spans(
         self, batch: ScheduledBatch
-    ) -> tuple[np.ndarray, np.ndarray, int] | None:
-        """This step's verify layout in LOGIT-row space, or None if it verifies nothing.
-
-        Returns `(sampled_lens, cu_end, shift)`: rows each request samples, their
-        inclusive prefix sum (`cu_num_sampled_tokens`), and the offset from a
-        logit row to its token row. The spec indices are built over logit rows
-        and the draft ids gathered out of `input_ids[shift:]`.
-
-        Pure decode: every token row reaches the LM head, so the two row spaces
-        coincide and `shift` is 0. Mixed: the LM head keeps one row per prefill
-        seq (its last token) then every decode token, so a prefill row is a
-        0-draft request sampling one row, and decode token j sits at logit row
-        `n_p + j` but token row `n_p_tokens + j` -- a constant `n_p_tokens -
-        n_p`. The prefill rows' `(1, 0 drafts)` spans are exactly what
-        `prepare_spec_decode_indices` and the rejection sampler already accept.
-        """
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Sample counts and cumulative ends in logit-row space."""
         n_p = batch.total_seqs_num_prefill
-        is_mixed = n_p > 0 and batch.is_mixed
+        is_mixed = batch.is_mixed
         # A mixed step verifies its decode rows as a pure decode would, so it
         # asks `_verifies_drafts` the decode question; pure prefill samples
         # without verification.
@@ -2760,18 +2637,14 @@ class ModelRunner:
             return None
         if n_p == 0:
             _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
-            return lens, cu[1:], 0
+            return lens, cu[1:]
         lens = np.concatenate(
             [
                 np.ones(n_p, dtype=np.int32),
                 np.asarray(batch.num_scheduled_tokens[n_p:], dtype=np.int32),
             ]
         )
-        return (
-            lens,
-            np.cumsum(lens, dtype=np.int32),
-            batch.total_tokens_num_prefill - n_p,
-        )
+        return lens, np.cumsum(lens, dtype=np.int32)
 
     def prepare_inputs(
         self,
@@ -2796,14 +2669,6 @@ class ModelRunner:
         running_bs = forward_mode.running_bs
         running_tokens = forward_mode.running_tokens
         spec_decode_metadata = None
-        spans = self._verify_spans(batch)
-        if spans is not None:
-            lens, cu_end, shift = spans
-            # Inside the staging window: without the token group it publishes
-            # the indices itself. Packed indices already share the token upload.
-            spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
-                lens, cu_end, input_ids[shift:], prepared_indices=spec_decode_indices
-            )
         attn_metadata, positions = self.attn_metadata_builder.build(
             batch=batch,
             running_bs=running_bs,
@@ -2813,6 +2678,17 @@ class ModelRunner:
             ubatch_slices=forward_mode.ubatch_slices,
             pcp_groups=forward_mode.pcp_groups,
         )
+        spans = self._verify_spans(batch)
+        if spans is not None:
+            lens, cu_end = spans
+            sampled_ids = (
+                input_ids[attn_metadata.sampled_token_indices]
+                if is_mixed
+                else input_ids
+            )
+            spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
+                lens, cu_end, sampled_ids, prepared_indices=spec_decode_indices
+            )
         self.attn_metadata_builder.prepare_model_inputs(input_ids, attn_metadata)
         context = Context(
             positions=positions,
@@ -2825,8 +2701,6 @@ class ModelRunner:
             running_tokens_are_unified=running_tokens_are_unified,
             forward_mode=forward_mode,
             scheduled_tokens_gpu=self.forward_vars["batch_info"].gpu[1:2],
-            num_prefill_tokens=batch.total_tokens_num_prefill if is_mixed else 0,
-            num_prefill_seqs=batch.total_seqs_num_prefill if is_mixed else 0,
         )
 
         set_forward_context(
@@ -2893,7 +2767,7 @@ class ModelRunner:
             lengths, width = None, 1
             spans = self._verify_spans(batch)
             if spans is not None:
-                lengths, _, _ = spans
+                lengths, _ = spans
                 width = self.drafter.mtp_k + 1
             requested, model_rows, sample_rows = host_logprob_rows(
                 batch.logprob_requested, lengths, width
@@ -2982,7 +2856,7 @@ class ModelRunner:
             if spec_group is not None:
                 spans = self._verify_spans(batch)
                 if spans is not None:
-                    lens, cu_end, _ = spans
+                    lens, cu_end = spans
                     spec_decode_indices = self.drafter.prepare_spec_decode_indices(
                         lens, cu_end, token_group
                     )
@@ -3488,7 +3362,6 @@ class ModelRunner:
             request_ids,
         )
 
-    @_profile_runner_stage
     def _settle_mixed_verdict(
         self,
         batch: ScheduledBatch,
@@ -3515,12 +3388,10 @@ class ModelRunner:
             return
         n_p = batch.total_seqs_num_prefill
         num_reject_tokens[:n_p] = 0
-        # The carrier's whole-batch spans: its first `n_p + 1` entries are the
-        # prefill segment's.
-        cu = get_forward_context().attn_metadata.cu_seqlens_q
-        anchors[:n_p] = cu[1 : n_p + 1] - 1
-        anchors[n_p:] += batch.total_tokens_num_prefill - n_p
+        rows = get_forward_context().attn_metadata.sampled_token_indices
+        anchors.copy_(rows[anchors.long()])
 
+    @_profile_runner_stage
     def postprocess(
         self,
         batch: ScheduledBatch,
@@ -4045,6 +3916,10 @@ class ModelRunner:
         self.attn_metadata_builder.commit_speculative_state(
             forward_context.attn_metadata, last_token_indices
         )
+        if batch.is_mixed:
+            self.attn_metadata_builder.publish_draft_state(
+                forward_context.attn_metadata
+            )
 
         draft_token = self.drafter.propose(
             target_token_ids=input_ids,
@@ -4869,7 +4744,7 @@ class RapidServeModelRunner(ModelRunner):
         # Two processes share the GPU in disagg mode; reserve extra headroom so
         # NCCL/system allocs (e.g. the 512MB NCCL barrier buffer) don't OOM.
         safety_margin = int(total_bytes * 0.02)
-        return super()._kv_budget_extra_reserve(total_bytes) + 4 * safety_margin
+        return 4 * safety_margin
 
     def get_num_blocks(self) -> dict[str, object]:
         # Decode in disagg mode owns no GPU memory — kvcache is imported from

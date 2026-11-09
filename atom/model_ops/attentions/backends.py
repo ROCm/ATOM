@@ -173,6 +173,9 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """Keep parent resources alive until all microbatch work is enqueued."""
         return nullcontext()
 
+    def publish_draft_state(self, metadata):
+        """Publish target state-slot addresses consumed by the draft forward."""
+
     def prepare_model_inputs(self, input_ids, metadata):
         """Prepare model inputs after state maintenance and final token staging."""
 

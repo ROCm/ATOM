@@ -16,6 +16,14 @@ from . import backend_guidance as grammar
 from .utils import AsyncTokenCopy, StructuredOutputMask
 
 
+def _partial_prefill_row(batch, row):
+    return (
+        row < batch.total_seqs_num_prefill
+        and batch.is_final_chunk is not None
+        and not batch.is_final_chunk[row]
+    )
+
+
 def structured_stop_token_ids(config, tokenizer=None):
     stops = config.end_token_ids
     if not stops:
@@ -254,7 +262,7 @@ class StructuredOutput:
         starts = lengths.cumsum() - lengths
         plan, pieces, offset = {}, [], 0
         for i in requests:
-            if batch.is_final_chunk is not None and not batch.is_final_chunk[i]:
+            if _partial_prefill_row(batch, i):
                 continue
             start, count = int(starts[i]), int(lengths[i])
             rows = target[start : start + count].tolist()
@@ -333,7 +341,7 @@ class StructuredOutput:
         rows = []
         for i, update in batch.structured_requests.items():
             req_id = batch.req_ids[i]
-            final = batch.is_final_chunk is None or batch.is_final_chunk[i]
+            final = not _partial_prefill_row(batch, i)
             branch_rows, start, size = (
                 plan.get(i, ([], 0, 0)) if metadata else ([i], 0, 0)
             )

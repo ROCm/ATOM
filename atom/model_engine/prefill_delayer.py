@@ -89,7 +89,8 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
           hold_cost += G_waiting * t_decode
       HOLD
   # -- goal: fire once the aggregate fills a worthwhile forward --
-  fill = G_pending / (n_prefillable * budget)
+  G_prefill_budget = sum(prefill budgets on prefillable ranks)
+  fill = G_pending / G_prefill_budget if G_prefill_budget > 0 else 1.0
   if fill >= target_fill:                         FIRE
   if stall >= stall_ticks:                        FIRE
   HOLD

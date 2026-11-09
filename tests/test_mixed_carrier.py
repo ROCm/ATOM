@@ -58,10 +58,40 @@ def test_carrier_has_whole_batch_spans_and_state_slots():
     assert merged.cu_seqlens_q.tolist() == [0, 5, 9, 10, 11, 12]
     # Padded to running_bs with 0, as prepare_decode pads.
     assert merged.state_slot_out.tolist() == [7, 8, 4, 5, 6, 0]
-    assert (merged.num_prefill_seqs, merged.num_decode_seqs) == (2, 3)
+    assert merged.num_prefill_seqs == 2
+    assert merged.sampled_token_indices.tolist() == [4, 8, 9, 10, 11]
     assert (merged.num_prefill_tokens, merged.num_decode_tokens) == (9, 3)
     assert merged.prefill_attn_metadata is prefill
     assert merged.decode_attn_metadata is decode
+
+
+@pytest.mark.parametrize("decode_width", [1, 3])
+def test_lm_head_selects_prefill_ends_and_all_decode_tokens(monkeypatch, decode_width):
+    from atom.model_ops import embed_head
+
+    prefill = _meta([0, 5, 9], [7, 8], 5)
+    decode = _meta([0, decode_width, 2 * decode_width], [4, 5], decode_width)
+    decode.state = AttnState.DECODE
+    metadata = _mixed_carrier(prefill, decode, 2, 2, 9, 2 * decode_width, 4)
+    context = SimpleNamespace(is_prefill=True, is_draft=False)
+    monkeypatch.setattr(embed_head, "is_plugin_mode", lambda: False)
+    monkeypatch.setattr(embed_head, "sp_is_enabled", lambda: False)
+    monkeypatch.setattr(
+        embed_head,
+        "get_forward_context",
+        lambda: SimpleNamespace(context=context, attn_metadata=metadata),
+    )
+    monkeypatch.setattr(embed_head.tgemm, "mm", lambda x, w, b: x @ w.T)
+    head = SimpleNamespace(
+        weight=torch.eye(2),
+        bias=None,
+        tp_size=1,
+        _can_use_dp_sharded_head=lambda _: False,
+    )
+    hidden = torch.arange((9 + 2 * decode_width) * 2).float().reshape(-1, 2)
+    actual = embed_head.ParallelLMHead.forward(head, hidden)
+    expected = torch.cat((hidden[[4, 8]], hidden[9:]))
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("fn", ["prepare_mixed", "_build_ubatch_mixed_metadata"])

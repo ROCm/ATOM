@@ -157,8 +157,7 @@ def test_profile_budgets_unsplit_fallback_and_restores_config(
             mixed_profile.profile_mixed_memory(runner)
     else:
         # Include the unsplit reserved peak, excluding the temporary pool.
-        assert mixed_profile.profile_mixed_memory(runner) == 80 + (140 - 100)
-        assert runner._mixed_profile_non_torch == 7
+        assert mixed_profile.profile_mixed_memory(runner) == (80 + (140 - 100), 7)
     assert not pool_open
     assert (config.enable_tbo, config.enable_tbo_decode) == tbo_flags
     assert {flags for flags, _ in observed} == {tbo_flags, (False, False)}

@@ -68,10 +68,9 @@ def _spec_runner(*, drafter=True, pd_producer=False):
 def test_verify_spans_put_prefill_rows_at_one_sample_each():
     from atom.model_engine.model_runner import ModelRunner
 
-    lens, cu_end, shift = ModelRunner._verify_spans(_spec_runner(), _mixed_batch())
+    lens, cu_end = ModelRunner._verify_spans(_spec_runner(), _mixed_batch())
     assert lens.tolist() == [1, 1, 4, 4]
     assert cu_end.tolist() == [1, 2, 6, 10]  # ends at the 10 logit rows
-    assert shift == N_P_TOKENS - N_P
 
 
 def test_verify_spans_skip_pure_prefill_and_dummies():
@@ -119,7 +118,7 @@ def test_spec_indices_and_draft_gather_over_the_mixed_layout():
     from atom.model_engine.model_runner import ModelRunner
     from atom.spec_decode.drafter import Drafter
 
-    lens, cu_end, shift = ModelRunner._verify_spans(_spec_runner(), _mixed_batch())
+    lens, cu_end = ModelRunner._verify_spans(_spec_runner(), _mixed_batch())
     runner = _index_runner()
     drafter = SimpleNamespace(mtp_k=K, runner=runner)
     names = ["target_logits_indices", "cu_num_draft_tokens", "bonus_logits_indices"]
@@ -137,27 +136,41 @@ def test_spec_indices_and_draft_gather_over_the_mixed_layout():
     assert var["bonus_logits_indices"].np[: N_P + N_D].tolist() == [0, 1, 5, 9]
     assert var["cu_num_draft_tokens"].np[: N_P + N_D].tolist() == [0, 0, 3, 6]
 
-    # `calc_spec_decode_metadata` gathers `input_ids[1:][target]` from what it
-    # is handed; the runner hands it `input_ids[shift:]`. The drafts are the
-    # tokens after each decode row's anchor: 9..11 and 13..15.
+    # The same carrier mapping selects LM-head rows, draft IDs and verdicts.
     input_ids = torch.arange(N_P_TOKENS + N_D * (K + 1))
-    drafts = input_ids[shift:][1:][torch.from_numpy(target).long()]
+    rows = _mixed_metadata().sampled_token_indices
+    drafts = input_ids[rows][1:][torch.from_numpy(target).long()]
     assert drafts.tolist() == [9, 10, 11, 13, 14, 15]
 
 
 # ── verify outcome: the verdict, re-expressed in token rows ─────────────────
 
 
+def _mixed_metadata():
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        AttentionMetaData_DSV4,
+        _mixed_carrier,
+    )
+    from atom.utils.forward_context import AttnState
+
+    prefill = AttentionMetaData_DSV4(
+        cu_seqlens_q=torch.tensor([0, 5, 8], dtype=torch.int32),
+        state_slot_out=torch.tensor([0, 1]),
+        state=AttnState.PREFILL_PREFIX,
+    )
+    decode = AttentionMetaData_DSV4(
+        cu_seqlens_q=torch.tensor([0, 4, 8], dtype=torch.int32),
+        state_slot_out=torch.tensor([2, 3]),
+        state=AttnState.DECODE,
+    )
+    return _mixed_carrier(prefill, decode, 2, 2, 8, 8, 4)
+
+
 @pytest.fixture
 def mixed_forward_context():
     from atom.utils import forward_context as fc_mod
 
-    # The mixed carrier's whole-batch spans (`_mixed_carrier_spans`).
-    global_cu = torch.tensor([0, 5, 8, 12, 16], dtype=torch.int32)
-    ctx = SimpleNamespace(
-        attn_metadata=SimpleNamespace(cu_seqlens_q=global_cu),
-        context=SimpleNamespace(is_mixed=True, num_prefill_seqs=N_P),
-    )
+    ctx = SimpleNamespace(attn_metadata=_mixed_metadata())
     prev = getattr(fc_mod._forward_context_local, "ctx", None)
     fc_mod._forward_context_local.ctx = ctx
     try:

@@ -108,8 +108,6 @@ def test_unequal_dp_rows_keep_token_padding_and_restore_full_draft_state(
             running_tokens=tokens,
             running_tokens_are_unified=False,
             running_tokens_across_dp=tuple(sum(p + d) for p, d in layouts),
-            num_prefill_tokens=sum(prefill),
-            num_prefill_seqs=len(prefill),
         ),
         dp_metadata=DPMetadata(np.asarray([sum(p + d) for p, d in layouts])),
         ubatch_slices=splits[rank],
@@ -143,5 +141,5 @@ def test_unequal_dp_rows_keep_token_padding_and_restore_full_draft_state(
         assert len(observed) == 2
         assert get_forward_context() is ctx
         assert torch.all(published == sentinel)  # no draft publication in workers
-        builder.commit_speculative_state(get_forward_context().attn_metadata, None)
+        builder.publish_draft_state(get_forward_context().attn_metadata)
         assert published.tolist() == pslots + dslots + [0] * (8 - len(pslots + dslots))

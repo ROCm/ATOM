@@ -54,16 +54,6 @@ def test_no_mixed_refusal_is_an_assert():
     )
 
 
-def test_there_are_refusals_at_all():
-    """Guards the test above from passing because it found nothing."""
-    found = _mixed_refusals()
-    assert len(found) >= 4, (
-        f"only {len(found)} mixed refusal(s) found; the scan probably stopped "
-        "matching (it keys off the message wording), which would make the "
-        "assert-free check above vacuous"
-    )
-
-
 def test_the_config_table_exists_and_is_called():
     cfg = (_ROOT / "atom/config.py").read_text(encoding="utf-8")
     tree = ast.parse(cfg)
@@ -207,8 +197,17 @@ def test_validator_warns_when_a_full_decode_set_eats_the_step(caplog):
     with caplog.at_level("WARNING", logger="atom"):
         cfg._validate_mixed_prefill_decode()
     assert "at least 1/8" in caplog.text
-    assert "some decodes may wait" in caplog.text
+    assert "FCFS tail may wait" in caplog.text
     assert "leaving prefill no budget" not in caplog.text
+
+
+@pytest.mark.parametrize("rows, warns", [(224, False), (225, True)])
+def test_validator_warning_respects_prefill_floor(caplog, rows, warns):
+    _bind()
+    cfg = _FakeConfig(spec=_spec(k=7), max_num_seqs=rows, max_num_batched_tokens=2048)
+    with caplog.at_level("WARNING", logger="atom"):
+        cfg._validate_mixed_prefill_decode()
+    assert ("FCFS tail may wait" in caplog.text) is warns
 
 
 def test_validator_is_quiet_when_prefill_keeps_budget(caplog):

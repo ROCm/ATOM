@@ -160,6 +160,7 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
     s.kv_connector = conn
     s._local_prefill_coalescing = False
     s.enable_mixed_prefill_decode = False
+    s.max_num_batched_tokens = 64
     s._connector_flag = lambda name: getattr(conn, name, False)
     s.block_manager = SimpleNamespace(
         state_offload=state_offload,
@@ -516,7 +517,7 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     walks = []
 
-    def can_allocate(seq, *, record, probe):
+    def can_allocate(seq, *, record, probe, reserved_decode_blocks=0):
         walks.append(record)
         probe.block_hashes.extend([11, 12])
         return 2
@@ -525,6 +526,7 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
     s.kv_connector = _Conn()
     s._local_prefill_coalescing = False
     s.enable_mixed_prefill_decode = False
+    s.max_num_batched_tokens = 64
     s.block_manager = SimpleNamespace(hash_block_size=4, can_allocate=can_allocate)
     probe = s._probe_hbm_prefix(SimpleNamespace())
     assert (probe.num_cached_blocks, probe.block_hashes) == (2, [11, 12])

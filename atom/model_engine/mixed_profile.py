@@ -116,8 +116,8 @@ def _batch(runner, prefill_tokens, decode_seqs, width, *, long_context):
 
 
 @torch.inference_mode()
-def profile_mixed_memory(runner) -> int:
-    """Return weights + measured workspace/cache peak, excluding temporary KV.
+def profile_mixed_memory(runner) -> tuple[int, int]:
+    """Return (torch peak excluding scratch KV, non-torch peak) in bytes.
 
     This runs before graph capture or request admission, on every TP/DP rank.
     Unlike dummy warmup it executes attention, compressors, MoE and the draft.
@@ -136,7 +136,7 @@ def profile_mixed_memory(runner) -> int:
         )
     ]
     if not shapes:
-        return torch.cuda.max_memory_allocated()
+        return torch.cuda.max_memory_allocated(), 0
     # Enough private pages for all current writes plus shared zero history.
     pages = (
         math.ceil(
@@ -206,7 +206,6 @@ def profile_mixed_memory(runner) -> int:
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    runner._mixed_profile_non_torch = max_non_torch
     logger.info(
         "mixed memory profile complete: temporary KV released; "
         "resident_delta=%.2f GiB workspace_budget=%.2f GiB non_torch_peak=%.2f GiB",
@@ -214,4 +213,4 @@ def profile_mixed_memory(runner) -> int:
         max_workspace / (1 << 30),
         max_non_torch / (1 << 30),
     )
-    return max(baseline_peak, baseline + max_workspace)
+    return max(baseline_peak, baseline + max_workspace), max_non_torch

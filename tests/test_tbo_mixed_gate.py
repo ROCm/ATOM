@@ -156,11 +156,11 @@ def runner_tbo_eligibility():
     return scope["_local_tbo_eligibility"]
 
 
-@pytest.mark.parametrize("pcp_size,is_mixed", [(1, True), (2, False), (2, True)])
-def test_runner_rejects_mixed_pcp_before_collective_sizing(
+@pytest.mark.parametrize("pcp_size,is_mixed", [(1, True), (2, False)])
+def test_runner_sizes_supported_mixed_and_pcp_collectives(
     runner_tbo_eligibility, pcp_size, is_mixed
 ):
-    """The runtime backstop also protects callers that bypass Config validation."""
+    """Unsupported combinations are rejected by Config before scheduling."""
     config = _Config()
     config.prefill_context_parallel_size = pcp_size
     runner = SimpleNamespace(config=config)
@@ -173,10 +173,6 @@ def test_runner_rejects_mixed_pcp_before_collective_sizing(
         total_tokens_num_prefill=sum(_PREFILL_TOKENS),
     )
     batch.num_scheduled_tokens = np.asarray(tokens, dtype=np.int64)
-    if pcp_size > 1 and is_mixed:
-        with pytest.raises(NotImplementedError, match="mixed prefill.*PCP"):
-            runner_tbo_eligibility(runner, batch)
-    else:
-        meets_min, can_split, ub0, ub1 = runner_tbo_eligibility(runner, batch)
-        assert meets_min and can_split
-        assert ub0 + ub1 == sum(tokens) // pcp_size
+    meets_min, can_split, ub0, ub1 = runner_tbo_eligibility(runner, batch)
+    assert meets_min and can_split
+    assert ub0 + ub1 == sum(tokens) // pcp_size

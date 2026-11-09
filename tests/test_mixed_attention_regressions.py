@@ -17,6 +17,7 @@ pytest.importorskip("aiter")
         (4, False, True, [19, 22]),
         (1, True, True, [19, 22]),
         (4, False, False, [19, 23]),
+        (1, True, False, [19, 23]),
     ],
 )
 def test_decode_rollback_and_positions(width, explicit, deferred, expected):
@@ -145,7 +146,8 @@ def test_attention_output_reuse_keeps_decode_input_intact(monkeypatch, bf16):
 
 
 @pytest.mark.parametrize("compiled", [False, True])
-def test_mixed_aux_capture_uses_live_offsets(monkeypatch, compiled):
+@pytest.mark.parametrize("mixed", [False, True])
+def test_aux_capture_uses_live_offsets(monkeypatch, compiled, mixed):
     from atom.spec_decode.drafter import Drafter
     from atom.utils import forward_context as fc
 
@@ -158,7 +160,7 @@ def test_mixed_aux_capture_uses_live_offsets(monkeypatch, compiled):
     )
     buffer = torch.full((6, 2), -1.0, device="cuda")
     drafter = SimpleNamespace(
-        config=SimpleNamespace(enable_mixed_prefill_decode=True),
+        config=SimpleNamespace(enable_mixed_prefill_decode=mixed),
         _aux_buffers=[buffer],
     )
     hook = Drafter._make_aux_hook(drafter, 0, lambda output, module: output)
@@ -167,9 +169,28 @@ def test_mixed_aux_capture_uses_live_offsets(monkeypatch, compiled):
         hook(None, (), x)
         return x + 1
 
+    first = torch.ones(2, 2, device="cuda")
     if compiled:
-        run = torch.compile(run, fullgraph=True, backend="eager")
-    run(torch.ones(2, 2, device="cuda"))
+        captured = []
+
+        def backend(graph, args):
+            captured.append((graph, args))
+            return graph.forward
+
+        torch.compile(run, fullgraph=True, backend=backend)(first)
+        graph, args = captured[-1]
+
+        def run(x):
+            # The level >= 2 dispatcher reuses captured code without guards.
+            return graph.forward(
+                *[
+                    x if isinstance(arg, torch.Tensor) and arg is first else arg
+                    for arg in args
+                ]
+            )
+
+    else:
+        run(first)
     context.ubatch_token_offset = 3
     run(torch.full((2, 2), 2.0, device="cuda"))
     context.is_draft = True

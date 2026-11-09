@@ -84,4 +84,4 @@ def test_prefill_does_not_swallow_unrelated_type_errors():
         raise TypeError("invalid packed tensor dtype")
 
     with pytest.raises(TypeError, match="invalid packed tensor dtype"):
-        paged_2src._prefill_with_output(broken, (), torch.empty(1))
+        paged_2src.call_with_output(broken, (), torch.empty(1))
