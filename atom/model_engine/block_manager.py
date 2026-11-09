@@ -143,23 +143,33 @@ class AdmissionProbe:
 _RECENT_INDEX_CHANGES = 8192
 
 
-def draft_kv_lookahead(num_speculative_tokens: int) -> int:
-    """KV positions past `len(seq)` that one forward's MTP draft round writes.
+def draft_kv_lookahead(
+    num_speculative_tokens: int, *, block_drafter: bool = False
+) -> int:
+    """KV positions past `len(seq)` that one forward's draft round writes.
 
-    `EagleProposer.propose` runs the draft `k = num_speculative_tokens` times
-    per forward. Step 0 writes the target's own slots; each of the `k - 1`
-    mid-steps after it bumps `context_lens` and writes one token at
+    MTP (`EagleProposer.propose`) runs the draft `k = num_speculative_tokens`
+    times per forward. Step 0 writes the target's own slots; each of the
+    `k - 1` mid-steps after it bumps `context_lens` and writes one token at
     `context_lens - 1`. So a forward whose target context ends at `C` writes
     draft KV through position `C + k - 2`, and `C <= len(seq)` at schedule time
     (prefill: `C` is the chunk end; decode: `C = len(seq) - num_rejected`, the
     placeholders the scheduler appended assume full acceptance). The draft
     therefore needs `k - 1` positions past `len(seq)`.
 
+    A block drafter (DSpark, `block_drafter=True`) writes its whole block of
+    `T` rows past the anchor, the last verified position (`len(seq) - 1`), so
+    through `len(seq) + T - 1`: `T` positions. `T` is
+    `DSparkProposer.draft_tokens_per_seq`, `min(k, window_size)` where the
+    draft model has a rolling window, else `k`; the scheduler does not know the
+    window, so this returns the bound `k`.
+
     A position past the row's allocated blocks reads its block id from the
     zeroed tail of the block table, so the write lands in physical block 0 --
     another request's KV, or the units of a PAGE state checkpoint.
     """
-    return max(0, int(num_speculative_tokens or 0) - 1)
+    k = max(0, int(num_speculative_tokens or 0))
+    return k if block_drafter else max(0, k - 1)
 
 
 # Blocks `_hit_walk` hashes per round past the cached prompt chain, doubling
@@ -3494,8 +3504,8 @@ class BlockManager:
 
         Sized on `len(seq) + max(num_new_tokens, lookahead)`. A decode step's
         `num_new_tokens` (`1 + mtp_k`) already exceeds its draft lookahead
-        (`mtp_k - 1`), so the lookahead never raises the bar there; it is
-        passed so the check states what it covers.
+        (`draft_kv_lookahead`: at most `mtp_k`), so the lookahead never raises
+        the bar there; it is passed so the check states what it covers.
         """
         seq_len = len(seq)
         current_blocks = len(seq.block_table)
