@@ -1049,16 +1049,29 @@ class Scheduler:
                 return True
         return False
 
+    def _is_admittable_prefill(self, seq: Sequence) -> bool:
+        """Whether `seq` is prefill work admission can take this tick: the one
+        predicate behind the supply of prefill, its token count, the
+        prefillable probe, the chunk-cost estimate and the queue-age signal.
+
+        An aborted request or a statically rejected one is not. A request parked
+        for a tier load is once the load succeeded (admission resumes its suffix
+        on the blocks it holds); a failed load is not, until admission has
+        resolved it (`_consume_failed_remote_kv` may free and reallocate its
+        blocks, or park it again), and a load still in flight is not.
+        """
+        if seq.status == SequenceStatus.ABORTED:
+            return False
+        if (
+            seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+            and not self._tier_load_succeeded(seq)
+        ):
+            return False
+        return self._unschedulable_reason(seq) is None
+
     def _waiting_prefills(self):
         for seq in self.waiting:
-            if seq.status == SequenceStatus.ABORTED:
-                continue
-            if (
-                seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-                and not self._tier_load_finished(seq)
-            ):
-                continue
-            if self._unschedulable_reason(seq) is None:
+            if self._is_admittable_prefill(seq):
                 yield seq
 
     def _tier_loaded_tokens(self, seq: Sequence) -> int:
@@ -1094,12 +1107,14 @@ class Scheduler:
             or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
         )
 
-    def _tier_load_finished(self, seq: Sequence) -> bool:
-        """Whether `seq` waits on a tier load that completed (or failed) last
-        step: Phase 2 resumes its prefill this tick (`_resolve_waiting_remote_kv`)."""
-        return self._connector_flag("is_offload") and (
-            self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
-            or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
+    def _tier_load_succeeded(self, seq: Sequence) -> bool:
+        """Whether `seq` waits on a tier load that completed, reported last step:
+        Phase 2 resumes its suffix prefill this tick
+        (`_resolve_waiting_remote_kv`). A failed load is not one."""
+        return (
+            self._connector_flag("is_offload")
+            and self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
+            and not self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
         )
 
     def _local_prefill_pending_work(self) -> tuple[bool, int]:
@@ -1230,7 +1245,7 @@ class Scheduler:
         completed load admission has not resolved yet. `resume` is where its
         cached prefix ends and `start` where the forward begins (replay-adjusted).
         None for any other request."""
-        if self._tier_load_finished(seq):
+        if self._tier_load_succeeded(seq):
             cached = max(seq.num_cached_tokens, self._tier_loaded_tokens(seq))
         elif self._is_offload_prefill_resume(seq):
             cached = seq.num_cached_tokens
@@ -1468,7 +1483,7 @@ class Scheduler:
                 examined += 1
                 continue
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                if self._tier_load_finished(seq):
+                if self._tier_load_succeeded(seq):
                     # Its tier load completed (reported last step): Phase 2
                     # resumes its suffix prefill on its held blocks this tick
                     # (`_resolve_waiting_remote_kv`). Missing it here made the
@@ -1594,7 +1609,7 @@ class Scheduler:
         inflate the cross-rank aggregate and reach the fill target before a real
         batch has accumulated. A request whose tier load has finished is
         prefill work the admission pass resumes this tick
-        (`_tier_load_finished`): it counts what follows its loaded prefix,
+        (`_tier_load_succeeded`): it counts what follows its loaded prefix,
         like any waiting prefill; left out, the group's fill stays under target
         and the delayer waits out its stall bound instead. The
         `num_cached_tokens` discount is best-effort:
@@ -1603,16 +1618,7 @@ class Scheduler:
         """
         cap = self.max_num_batched_tokens
         total = 0
-        for seq in self.waiting:
-            if self._unschedulable_reason(seq) is not None:
-                continue
-            if seq.status == SequenceStatus.ABORTED:
-                continue
-            if (
-                seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-                and not self._tier_load_finished(seq)
-            ):
-                continue
+        for seq in self._waiting_prefills():
             num_new_tokens = self.pending_prefill_tokens(seq)
             if (
                 not self.enable_chunked_prefill
@@ -1681,18 +1687,12 @@ class Scheduler:
 
         After decode protection, max_queue_ms releases extra coalescing based
         on time since arrival, including backlog. This does not bound resource
-        or checkpoint waits. ABORTED, remote-loading and statically rejected
-        requests do not contribute.
+        or checkpoint waits. Only what `_is_admittable_prefill` accepts
+        contributes: not ABORTED, in-flight or failed tier loads, or statically
+        rejected requests, but a request whose tier load finished does.
         """
         oldest_arrive = None
-        for seq in self.waiting:
-            if self._unschedulable_reason(seq) is not None:
-                continue
-            if seq.status in (
-                SequenceStatus.ABORTED,
-                SequenceStatus.WAITING_FOR_REMOTE_KVS,
-            ):
-                continue
+        for seq in self._waiting_prefills():
             if oldest_arrive is None or seq.arrive_time < oldest_arrive:
                 oldest_arrive = seq.arrive_time
         if oldest_arrive is None:
@@ -4256,7 +4256,9 @@ class Scheduler:
                 break
             if not self._early_load_candidate(seq, state):
                 continue
-            if len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs:
+            if len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs - 1:
+                # The last slot is the head's: Phase 2 parks the head there, so
+                # early loads behind it can never fill every slot first.
                 state.skip(seq.id, "seq_slots")
                 break
             if self._lookup_detach_enabled(seq) and self._can_detach_tier_lookup(
@@ -5406,11 +5408,12 @@ class Scheduler:
             return
 
         # An early-loaded request keeps its place in line while the head can
-        # still allocate: it was not parked by the head of the queue, and moving
-        # it up would let it prefill ahead of earlier arrivals. When the head
-        # cannot allocate, it is promoted like any finished waiter: it owns
-        # blocks, and Phase 2 stops at a head that does not fit, so nothing else
-        # would ever free them.
+        # still be admitted: it was not parked by the head of the queue, and
+        # moving it up would let it prefill ahead of earlier arrivals. When the
+        # head cannot be admitted -- no blocks for it, or every parked slot is
+        # taken (`max_num_seqs`) -- it is promoted like any finished waiter: it
+        # owns blocks and a slot, and Phase 2 stops at a head it cannot admit, so
+        # nothing else would ever free them.
         early = self._early_load.entries
 
         def finished(seq: Sequence) -> bool:
@@ -5423,10 +5426,13 @@ class Scheduler:
         head_blocked = False
         if any(finished(seq) and seq.id in early for seq in queue):
             head = next((seq for seq in queue if not finished(seq)), None)
+            slots_full = (
+                len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
+            )
             head_blocked = (
                 head is not None
                 and head.status == SequenceStatus.WAITING
-                and self.block_manager.can_allocate_memoized(head) < 0
+                and (slots_full or self.block_manager.can_allocate_memoized(head) < 0)
             )
         ready: deque[Sequence] = deque()
         blocked: deque[Sequence] = deque()
