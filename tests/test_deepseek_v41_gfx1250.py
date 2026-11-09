@@ -12,6 +12,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest import mock
 
 import pytest
 import torch
@@ -370,16 +371,18 @@ class Z(int):
 
 def load(name):
     """kernels/<name>.py with its FlyDSL names (``fx``, ``I32``) bound to the integer stand-in."""
-    if importlib.util.find_spec("flydsl") is None and "flydsl.expr" not in sys.modules:
+    stub = {}  # without FlyDSL (CI): a stand-in, only while the file loads
+    if importlib.util.find_spec("flydsl") is None:
         fl = types.ModuleType("flydsl")
         fl.expr = types.ModuleType("flydsl.expr")
         fl.expr.Int32 = Z
-        sys.modules["flydsl"], sys.modules["flydsl.expr"] = fl, fl.expr
+        stub = {"flydsl": fl, "flydsl.expr": fl.expr}
     spec = importlib.util.spec_from_file_location(
         f"gfx1250_{name}", KERNELS / f"{name}.py"
     )
     m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
+    with mock.patch.dict(sys.modules, stub):
+        spec.loader.exec_module(m)
     if hasattr(m, "fx"):
         m.fx = NS(
             max=lambda a, b: Z(max(int(a), int(b))),
