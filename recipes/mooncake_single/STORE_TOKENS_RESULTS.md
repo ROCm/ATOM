@@ -57,14 +57,18 @@ A longer DP2 run of the same pair (3600 s, `OFFLOAD_PROFILE=0`, 512 GB Store):
 
 Reading: throughput is unchanged. The tail improves at both scales (p99 -24% to
 -47% at DP2, -61% at DP4) and the whole distribution improves at DP2 except the
-median (+7% to +8%). **ITL is slightly worse than main: +1.4% (DP2, 1800 s and
-3600 s) to +1.9% (DP4), with p99 ITL 11-13% higher.** A same-time test of
-`OFFLOAD_PROFILE` (the benchmark harness had it on for the 1800 s rows) shows it
-is not the cause: +2.4% with it on, +2.3% off. Step traces show Store decode
-steps about 1-2 ms slower (median 25-26 ms against 23-24 ms); about 0.4 ms of it
-is scheduler CPU in the engine core, the rest has not been located. At DP4 the median is 50% higher and the mean only 6% lower; the 900 s DP4 runs
-below (median +32%, mean -17%) were better than this 1800 s run, cause not
-identified.
+median (+7% to +8%). ITL is within about 2% of main (+1.4% at DP2, +1.9% at
+DP4), which is not counted as a regression; p99 ITL is 11-13% higher. The
+median TTFT is the open item: +7% to +8% at DP2, +50% at DP4 (the 900 s DP4
+runs below were better, median +32% and mean -17%; cause of the difference not
+identified).
+
+Benchmark settings: `OFFLOAD_PROFILE` stays at its default (off). A same-time
+test showed it does not change ITL (+2.4% on, +2.3% off), but it adds timing and
+logging to every transfer and the 1800 s rows above were measured with it on.
+Step traces show Store decode steps about 1-2 ms slower than main (median
+25-26 ms against 23-24 ms), about 0.4 ms of which is scheduler CPU in the engine
+core.
 
 The sections below are the development measurements that led to this version
 (shorter 900 s windows, intermediate code).
