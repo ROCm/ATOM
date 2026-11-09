@@ -148,45 +148,71 @@ workflows only from the default branch, so until ROCm/ATOM#2762 merges, nobody w
 `atom-bot review` triggers anything — configured runner or not. Merging is the
 prerequisite for going live, not the result of it.
 
-**Three admin actions, none of which wait for the merge.** Do them now and they are
-ready when it lands:
+**All three are already done on box308 — nothing is waiting on an admin.** Recorded
+here because "what does an admin still need to do" was the question this section was
+written to answer, and the answer is now "nothing".
 
-1. **Register a runner on ROCm/ATOM.** Needs **repo admin** on ROCm/ATOM (a `maintain`
-   or `push` role gets 403 from the registration-token endpoint). It coexists with
-   aiter's runner on the same box -- a repo-scoped runner serves one repo, so ATOM needs
-   its own service; what is shared is the machine, the GLM server and the disk, not the
-   runner.
+1. **Runner — registered and service-installed.** `srdc-8-atom-review`, against
+   `https://github.com/ROCm/ATOM`, labels `self-hosted,atom-bot`, coexisting with
+   aiter's runner on the same box. Both are `active` and `enabled`, so they survive a
+   reboot rather than merely being up right now:
 
-   ```bash
-   env -u GH_TOKEN -u GITHUB_TOKEN gh api -X POST \
-     repos/ROCm/ATOM/actions/runners/registration-token --jq .token
-
-   cd /mnt/raid0/zufa/atom-runner
-   ./config.sh --url https://github.com/ROCm/ATOM --token <token-from-above> \
-     --labels self-hosted,atom-bot --name srdc-8-atom-review --work _work \
-     --unattended --replace
+   ```
+   actions.runner.ROCm-ATOM.srdc-8-atom-review     active / enabled
+   actions.runner.ROCm-aiter.srdc-8-aiter-review   active / enabled
    ```
 
-   The labels are not cosmetic: the review job is `runs-on: [self-hosted, atom-bot]`.
+   A repo-scoped runner serves one repo, so ATOM needs its own service; what the two
+   share is the machine, the GLM server and the disk.
 
-2. **Secret `ATOM_BOT_TOKEN`** (Settings -> Secrets and variables -> Actions -> Secrets)
-   = the token of whichever account posts. `rocm-atom-bot` is suspended by GitHub, so
-   this is currently `aiter-bot`'s token -- the same one ROCm/aiter already uses. Add it
-   directly; it never needs to leave GitHub or pass through anyone's workstation.
+2. **Bot token — a file, not a secret.** The runner `.env` carries
+   `ATOM_BOT_TOKEN_FILE=/mnt/raid0/zufa/aiter-runner/git-credentials`, which is
+   aiter-bot's existing credential file (`0600`, verified to authenticate as `aiter-bot`
+   with `public_repo` — the scope a `COMMENT` review needs). This is how ROCm/aiter
+   already supplies its own token, so ATOM is not inventing a second mechanism.
 
-   A classic PAT with `public_repo` is enough (both repos are public); a fine-grained PAT
-   needs **Pull requests: Read and write**. Repo permission `read` for the account is
-   sufficient to create a `COMMENT` review -- write access is not required.
+   **No token was copied.** Both repos read the same file, so rotation has one place to
+   happen. `_publish.py` and `preflight.sh` both accept `ATOM_BOT_TOKEN_FILE`; the
+   workflow's `secrets.ATOM_BOT_TOKEN` path still works and takes precedence if someone
+   later prefers GitHub-managed secrets.
 
-3. **Variable `ATOM_BOT_LOGIN`** = `aiter-bot`. Optional (the code defaults to it) but
-   set it anyway: it is what the dedup marker and the self-trigger guard key on, and an
-   explicit value is what makes a later account switch a one-field edit.
+3. **`ATOM_BOT_LOGIN=aiter-bot`** is in the same `.env`. `rocm-atom-bot` is suspended by
+   GitHub (its profile 404s to everyone else, its quota is the anonymous tier), so
+   aiter-bot is the publishing account until an appeal clears. Because the login is
+   configuration, switching back is one line in that file and no code change.
+
+   Verified on the box, through the shipping code rather than by reading the config:
+   `_publish` resolves the token, reports `BOT = aiter-bot`, and `TOK_IS_FALLBACK` is
+   `False` — i.e. it is using the configured file, not the `~/.git-credentials` fallback
+   that would otherwise post under whoever owns that file.
 
 **Then:** anyone on `authorized.txt` (109 logins) writes `atom-bot review` on a line of
 its own in a PR comment. No `@` needed -- the trigger is text, not a mention, and it
 matches `atom-bot review` whatever account answers. The reply will come from `aiter-bot`
 while that is the configured login; the trigger word and the answering account do not
 have to match.
+
+**Write it exactly, lowercase, one space.** The gate job is cheap and deliberately
+literal (`contains(body, 'atom-bot review')`) so that most comments never take a hosted
+runner slot; the script behind it is the lenient one. Where they disagree, the literal
+test wins and the comment is simply ignored:
+
+| written | triggers | |
+|---|---|---|
+| `atom-bot review` | yes | the documented form |
+| `@atom-bot review` | yes | the `@` is just a character here |
+| `@rocm-atom-bot review` | yes | old habit still works |
+| `atom-bot review please` | yes | trailing words are fine |
+| `please atom-bot review` | no | must open the line |
+| `> atom-bot review` | no | quoted lines are skipped on purpose |
+| `atom-bot  review` | no | two spaces |
+| `Atom-Bot Review` | no | capitals |
+
+The last two are the ones that cost someone a minute: the regex accepts them, the
+literal `contains()` in front of it does not, and a near-miss produces **silence** --
+no run, no reply, nothing to notice. If that turns out to bite people, widen the gate's
+`contains()` to `'atom-bot'` and let the script keep deciding; the gate only exists to
+be cheap, not to be precise.
 
 **What is still unproven at that point:** whether `aiter-bot`'s token can create a
 review. Nothing has exercised it yet -- aiter's own bot has posted zero reviews since
