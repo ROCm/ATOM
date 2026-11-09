@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import inspect
 import warnings
 
 import torch
@@ -8,6 +9,8 @@ from aiter import mixed_sample_outer_exponential, topk_select
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from torch import nn
+
+from atom.utils import envs
 
 # Try to import aiter top-k/top-p sampling ops
 try:
@@ -60,11 +63,53 @@ def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     )
 
 
+def get_per_row_exponential(num_tokens: int, vocab_size: int, device) -> torch.Tensor:
+    """Fresh Exp(1) noise of shape (num_tokens, vocab_size), one row per token.
+
+    The one draw both per-row-noise paths take (`_temperature_sample` and the
+    `ATOM_SPEC_BONUS_FUSED` draw), so they consume the RNG identically.
+    """
+    return torch.empty(
+        (num_tokens, vocab_size), dtype=torch.float, device=device
+    ).exponential_(1)
+
+
+def _load_fused_mixed_sample():
+    """aiter's `fused_mixed_sample` (ROCm/aiter#7416), or None if this aiter has
+    none, or has one that `Sampler.forward`'s call does not bind to."""
+    try:
+        from aiter.ops.triton.fusions.fused_mixed_sample import fused_mixed_sample
+    except ImportError:
+        reason = "which this aiter does not have"
+    else:
+        try:
+            # The call in `Sampler.forward`: three positionals, two keywords.
+            inspect.signature(fused_mixed_sample).bind(
+                None, None, None, eps=0.0, greedy_eps=0.0
+            )
+            return fused_mixed_sample
+        except (TypeError, ValueError) as e:
+            reason = f"whose signature this ATOM does not match ({e})"
+    warnings.warn(
+        f"ATOM_SPEC_BONUS_FUSED=1 needs aiter's fused_mixed_sample "
+        f"(ROCm/aiter#7416), {reason}; the draw keeps "
+        "mixed_sample_outer_exponential.",
+        UserWarning,
+        stacklevel=2,
+    )
+    return None
+
+
 class Sampler(nn.Module):
 
     def __init__(self):
         super().__init__()
         self.eps = SAMPLER_EPS
+        # `ATOM_SPEC_BONUS_FUSED`: read once, so it must be set before the
+        # server starts. None keeps the aiter spelling in `forward`.
+        self._fused_temperature_sample = None
+        if envs.ATOM_SPEC_BONUS_FUSED:
+            self._fused_temperature_sample = _load_fused_mixed_sample()
 
     def sample_verification_tokens(
         self,
@@ -144,6 +189,37 @@ class Sampler(nn.Module):
 
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
+            if self._fused_temperature_sample is not None and needs_independent_noise:
+                # The same noise draw as `_temperature_sample`, then the race
+                # and the greedy override in aiter's two vocab-tiled launches.
+                num_tokens, vocab_size = logits.shape
+                exponential = get_per_row_exponential(
+                    num_tokens, vocab_size, logits.device
+                )
+                try:
+                    return self._fused_temperature_sample(
+                        logits,
+                        exponential,
+                        temperatures,
+                        eps=self.eps,
+                        greedy_eps=SAMPLER_EPS,
+                    )
+                except (FileNotFoundError, ValueError) as e:
+                    # Both raise before either kernel launches: no tuned config
+                    # for this arch, or an input precondition (2-D, f32 noise
+                    # and temperatures, contiguous last dim, shapes) that this
+                    # call no longer meets. Keep its HIP race, on this step's
+                    # noise, for this and every later step.
+                    warnings.warn(
+                        f"ATOM_SPEC_BONUS_FUSED: aiter's fused_mixed_sample "
+                        f"refused this draw ({type(e).__name__}: {e}); using "
+                        "mixed_sample_outer_exponential.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    self._fused_temperature_sample = None
+                    sampled = self._race(logits, temperatures, exponential)
+                    return _apply_greedy_tokens(logits, temperatures, sampled)
             sampled = self._temperature_sample(
                 logits, temperatures, needs_independent_noise=needs_independent_noise
             )
@@ -186,15 +262,24 @@ class Sampler(nn.Module):
         which preserves the existing run-to-run determinism optimization.
         """
         num_tokens, vocab_size = logits.shape
-        sampled_tokens = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
         if needs_independent_noise:
-            exponential = torch.empty(
-                (num_tokens, vocab_size), dtype=torch.float, device=logits.device
-            ).exponential_(1)
+            exponential = get_per_row_exponential(num_tokens, vocab_size, logits.device)
         else:
             exponential = get_per_token_exponential(vocab_size, logits.device).expand(
                 num_tokens, vocab_size
             )
+        return self._race(logits, temperatures, exponential)
+
+    def _race(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        exponential: torch.Tensor,
+    ) -> torch.Tensor:
+        """aiter's exponential race on the given noise, one token per row."""
+        sampled_tokens = torch.empty(
+            logits.shape[0], dtype=torch.int, device=logits.device
+        )
         mixed_sample_outer_exponential(
             sampled_tokens, logits, exponential, temperatures, eps=self.eps
         )
