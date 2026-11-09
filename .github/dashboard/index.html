@@ -514,7 +514,9 @@ const rawData = window.BENCHMARK_DATA || {
   repoUrl: 'https://github.com/ROCm/ATOM',
   entries: {},
 };
-const DASHBOARD_MODES = ['Aggregated', 'Disaggregated'];
+const DASHBOARD_MODES = ['AgentX', 'Aggregated', 'Disaggregated'];
+// Only AgentX is offered in the selector; the older views stay reachable via #mode=.
+const VISIBLE_DASHBOARD_MODES = ['AgentX'];
 const ATOMESH_DATA = {
   updatedAt: Date.UTC(2026, 6, 3, 7, 9, 0),
   backend: 'ATOMesh',
@@ -1318,7 +1320,7 @@ function atomeshInteractivityMetric() {
 }
 
 const state = {
-  dashboardMode: 'Aggregated',
+  dashboardMode: 'AgentX',
   filters: { backends: [...allBackends], models: [...allModels], islOsl: [...allIslOsl], conc: [...allConc], hardware: [defaultHardware] },
   activeTab: 'performance',
   perfMetric: 'Total Tput',
@@ -1619,6 +1621,10 @@ document.querySelector('.meta').appendChild(_headerGpuMeta);
 function updateHeaderGpuMeta() {
   const span = document.getElementById('header-gpu-meta');
   if (!span) return;
+  if (state.dashboardMode === 'AgentX') {
+    span.textContent = ` · ${fmtHardware(selectedHardware())}`;
+    return;
+  }
   if (state.dashboardMode === 'Disaggregated') {
     span.textContent = ` · ${fmtHardware(selectedHardware())} · ROCm ${ATOMESH_DATA.rocmVersion}`;
     return;
@@ -1659,7 +1665,7 @@ function appendDashboardModeSelector(bar) {
   group.className = 'filter-group dashboard-mode-group';
   group.innerHTML = `<button class="filter-btn" data-filter="dashboard-mode">${state.dashboardMode} ▾</button>
     <div class="filter-dropdown" id="fd-dashboard-mode">
-      ${DASHBOARD_MODES.map(mode => `<label><input type="radio" name="dashboard-mode" value="${mode}" ${state.dashboardMode === mode ? 'checked' : ''}> ${mode}</label>`).join('')}
+      ${DASHBOARD_MODES.filter(mode => VISIBLE_DASHBOARD_MODES.includes(mode) || mode === state.dashboardMode).map(mode => `<label><input type="radio" name="dashboard-mode" value="${mode}" ${state.dashboardMode === mode ? 'checked' : ''}> ${mode}</label>`).join('')}
     </div>`;
   bar.appendChild(group);
 }
@@ -1667,9 +1673,7 @@ function appendDashboardModeSelector(bar) {
 function setDashboardMode(mode) {
   if (!DASHBOARD_MODES.includes(mode) || state.dashboardMode === mode) return;
   state.dashboardMode = mode;
-  if (mode === 'Disaggregated' && !['performance', 'trends', 'accuracy'].includes(state.activeTab)) {
-    state.activeTab = 'performance';
-  }
+  if (!dashboardTabs().includes(state.activeTab)) state.activeTab = 'performance';
   renderFilters();
   updateHeaderGpuMeta();
   renderKPICards();
@@ -1695,7 +1699,11 @@ function renderFilters() {
   const bar = document.getElementById('filter-bar');
   bar.innerHTML = '';
   appendDashboardModeSelector(bar);
-  for (const d of filterDefs) {
+  // AgentX draws every model and concurrency, so hardware is its only filter.
+  const visibleDefs = state.dashboardMode === 'AgentX'
+    ? [{ ...filterDefs.find(d => d.id === 'hardware'), options: agentxHardwareOptions() }]
+    : filterDefs;
+  for (const d of visibleDefs) {
     const sel = getFilterState(d.id);
     const allSelected = sel.length === d.options.length;
     const group = document.createElement('div');
@@ -1720,7 +1728,9 @@ function renderFilters() {
   const allSelected = filterDefs.every(d => getFilterState(d.id).length === d.options.length);
   const summaryEl = document.createElement('span');
   summaryEl.className = 'filter-summary';
-  if (state.dashboardMode === 'Disaggregated') {
+  if (state.dashboardMode === 'AgentX') {
+    summaryEl.textContent = `${agentxRows().length} AgentX points`;
+  } else if (state.dashboardMode === 'Disaggregated') {
     const rows = filteredAtomeshRows();
     const completed = rows.filter(row => row.status === 'completed').length;
     summaryEl.textContent = `${completed}/${rows.length} ATOMesh rows`;
@@ -1833,18 +1843,24 @@ document.addEventListener('click', closeAllDropdowns);
 /* ================================================================
    7. KPI CARDS
    ================================================================ */
-function updateDashboardTabs() {
-  const allowedTabs = state.dashboardMode === 'Disaggregated'
+function dashboardTabs() {
+  if (state.dashboardMode === 'AgentX') return ['performance'];
+  return state.dashboardMode === 'Disaggregated'
     ? ['performance', 'trends', 'accuracy']
     : ['performance', 'tradeoff', 'trends', 'data', 'accuracy'];
+}
+
+function updateDashboardTabs() {
+  const allowedTabs = dashboardTabs();
   if (!allowedTabs.includes(state.activeTab)) state.activeTab = 'performance';
   document.querySelectorAll('#tabs-nav .tab').forEach(tab => {
     const tabName = tab.dataset.tab;
     tab.style.display = allowedTabs.includes(tabName) ? '' : 'none';
     if (tabName === 'performance' && tab.firstChild) {
-      tab.firstChild.nodeValue = state.dashboardMode === 'Disaggregated'
-        ? 'Token Throughput per GPU vs. Interactivity'
-        : 'Performance';
+      tab.firstChild.nodeValue = {
+        AgentX: 'AgentX',
+        Disaggregated: 'Token Throughput per GPU vs. Interactivity',
+      }[state.dashboardMode] || 'Performance';
     }
   });
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === state.activeTab));
@@ -1853,6 +1869,10 @@ function updateDashboardTabs() {
 
 function renderKPICards() {
   updateDashboardTabs();
+  if (state.dashboardMode === 'AgentX') {
+    renderAgentxKPICards();
+    return;
+  }
   if (state.dashboardMode === 'Disaggregated') {
     renderAtomeshKPICards();
     return;
@@ -2050,6 +2070,11 @@ document.getElementById('tabs-nav').addEventListener('click', (e) => {
 
 function renderActiveTab() {
   updateDashboardTabs();
+  if (state.dashboardMode === 'AgentX') {
+    renderAgentxTab();
+    syncHeaderH();
+    return;
+  }
   if (state.dashboardMode === 'Disaggregated') {
     if (state.activeTab === 'accuracy') renderAtomeshAccuracyTab();
     else if (state.activeTab === 'trends') renderAtomeshTrendsTab();
@@ -3314,7 +3339,7 @@ document.addEventListener('keydown', (e) => {
 let hashUpdateFromCode = false;
 function syncToHash() {
   const parts = [];
-  if (state.dashboardMode !== 'Aggregated') parts.push('mode=' + state.dashboardMode);
+  if (state.dashboardMode !== 'AgentX') parts.push('mode=' + state.dashboardMode);
   if (state.filters.backends.length !== allBackends.length) parts.push('backend=' + state.filters.backends.join(','));
   if (state.filters.models.length !== allModels.length) parts.push('model=' + state.filters.models.join(','));
   if (state.filters.islOsl.length !== allIslOsl.length) parts.push('isl=' + state.filters.islOsl.join(','));
@@ -3328,6 +3353,7 @@ function syncToHash() {
 
 function readFromHash() {
   const hash = window.location.hash.slice(1);
+  state.dashboardMode = 'AgentX';
   if (!hash) return;
   for (const part of hash.split('&')) {
     const [k, v] = part.split('=');
@@ -4380,6 +4406,229 @@ function renderAtomeshAccuracyTab() {
       }
     });
   });
+  syncHeaderH();
+  bindFixedThead(container);
+}
+
+/* ================================================================
+   18. AGENTX VIEW
+   ================================================================ */
+// One chart per model on the InferenceX AgentX axes: P90 E2E Normalized
+// Interactivity vs. token throughput per chip, ATOM single node vs. ATOMesh P/D.
+const AGENTX_FRAMEWORKS = [
+  { key: 'atom', label: 'ATOM single node', marker: 'triangle', color: { dark: '#4f8ff7', light: '#2563eb' } },
+  { key: 'atomesh', label: 'ATOMesh P/D disaggregated', marker: 'circle', color: { dark: '#d9730d', light: '#d9730d' } },
+];
+
+function agentxFramework(row) {
+  const topology = String(row.sourceTopology || row.topology || '');
+  const single = /^AGG\b/i.test(topology) || /_agg_/i.test(row.configLabel || '');
+  return AGENTX_FRAMEWORKS[single ? 0 : 1];
+}
+
+// Rows on the AgentX axes; points measured before the E2E-normalized formula are left out.
+function agentxAllRows() {
+  return atomeshSummaryRows.filter(row => isAgenticTraceRow(row)
+    && row.interactivityMethod === 'p90_e2e_normalized'
+    && Number.isFinite(row.interactivity) && Number.isFinite(row.totalTputPerGpu));
+}
+
+function agentxHardwareOptions() {
+  return [...new Set(agentxAllRows().map(row => row.hardware || 'unknown'))].sort(_lc);
+}
+
+function agentxRows() {
+  return agentxAllRows().filter(row => state.filters.hardware.includes(row.hardware || 'unknown'));
+}
+
+function agentxColor(framework, alpha = 1) {
+  const hex = framework.color[_theme === 'light' ? 'light' : 'dark'];
+  if (alpha >= 1) return hex;
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+}
+
+function agentxFmtDate(ts) {
+  return ts ? localDay(ts) : '—';
+}
+
+function renderAgentxKPICards() {
+  const rows = agentxRows();
+  const models = new Set(rows.map(row => row.model));
+  const count = key => rows.filter(row => agentxFramework(row).key === key).length;
+  const latest = rows.reduce((max, row) => Math.max(max, row.date || 0), 0);
+  document.getElementById('kpi-row').innerHTML = `
+    <div class="kpi-group">
+      <div class="kpi-card">
+        <div class="kpi-label">Models</div>
+        <div class="kpi-value">${models.size} <span class="kpi-unit">charts</span></div>
+        <div class="kpi-sub">AgentX agentic trace</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">ATOM single node</div>
+        <div class="kpi-value">${count('atom')} <span class="kpi-unit">points</span></div>
+        <div class="kpi-sub">aggregated serving</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">ATOMesh P/D</div>
+        <div class="kpi-value">${count('atomesh')} <span class="kpi-unit">points</span></div>
+        <div class="kpi-sub">disaggregated serving</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Latest Run</div>
+        <div class="kpi-value">${latest ? agentxFmtDate(latest) : '—'}</div>
+        <div class="kpi-sub">${fmtHardware(selectedHardware())}</div>
+      </div>
+    </div>`;
+}
+
+function agentxChartSpecs(rows) {
+  const byModel = {};
+  for (const row of rows) (byModel[row.model] = byModel[row.model] || []).push(row);
+  return Object.entries(byModel).sort(([a], [b]) => _lc(a, b)).map(([model, modelRows], idx) => {
+    const datasets = [];
+    const onFrontier = new Set();
+    for (const fw of AGENTX_FRAMEWORKS) {
+      const points = modelRows.filter(row => agentxFramework(row) === fw)
+        .map(row => ({ x: row.interactivity, y: row.totalTputPerGpu, row }));
+      if (!points.length) continue;
+      const frontier = atomeshParetoFrontier(points);
+      frontier.forEach(p => onFrontier.add(p.row));
+      datasets.push({
+        label: fw.label,
+        data: frontier,
+        borderColor: agentxColor(fw),
+        backgroundColor: agentxColor(fw),
+        pointStyle: fw.marker,
+        borderWidth: 2,
+        pointRadius: 5,
+        pointHoverRadius: 7,
+        showLine: frontier.length > 1,
+        _framework: fw,
+      });
+      const others = points.filter(p => !frontier.includes(p));
+      if (others.length) {
+        datasets.push({
+          label: `${fw.label} (off frontier)`,
+          data: others,
+          borderColor: agentxColor(fw, 0.35),
+          backgroundColor: agentxColor(fw, 0.35),
+          pointStyle: fw.marker,
+          pointRadius: 3.5,
+          pointHoverRadius: 6,
+          showLine: false,
+          datalabels: { display: false },
+          _framework: fw,
+          _offFrontier: true,
+        });
+      }
+    }
+    return { id: `agentx-chart-${idx}`, model, rows: modelRows, datasets, onFrontier };
+  });
+}
+
+function renderAgentxTab() {
+  const container = document.getElementById('tab-performance');
+  destroyChartsIn(container);
+  const rows = agentxRows();
+  if (!rows.length) {
+    container.innerHTML = `<div class="chart-empty">No AgentX agentic-trace result on ${escHTML(fmtHardware(selectedHardware()))}.</div>`;
+    return;
+  }
+  const specs = agentxChartSpecs(rows);
+  const onFrontier = new Set(specs.flatMap(spec => [...spec.onFrontier]));
+  const tableRows = rows.slice().sort((a, b) => _lc(a.model, b.model)
+    || _lc(agentxFramework(a).key, agentxFramework(b).key)
+    || b.totalTputPerGpu - a.totalTputPerGpu);
+
+  let html = `<div class="section-container"><div class="section-header">
+    <span class="section-title">AgentX · Token Throughput per Chip vs. P90 E2E Normalized Interactivity</span>
+    <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">Lines are each framework's Pareto frontier; faded points are dominated configs. Interactivity = 1 / p90(ITL + TTFT / output tokens).</span>
+  </div>
+  <div class="chart-grid">${specs.map(spec => `
+    <div class="chart-card ${specs.length === 1 ? 'hero' : 'half'}">
+      <h3>${escHTML(spec.model)}</h3>
+      <div class="chart-wrap"><canvas id="${spec.id}"></canvas></div>
+    </div>`).join('')}</div></div>`;
+
+  html += `<div class="section-container"><div class="section-header"><span class="section-title">AgentX Points</span></div>
+  <div class="table-watermark"><div class="table-watermark-scroll"><table class="perf-table"><thead><tr>
+    <th>Model</th><th>Framework</th><th>Topology</th><th class="num">GPUs</th><th class="num">Conc</th>
+    <th class="num">E2E Norm. Interactivity</th><th class="num">Tok/s/Chip</th><th class="num">TTFT ms</th><th class="num">TPOT ms</th>
+    <th class="num">Cache Hit</th><th>Pareto</th><th>Date</th><th>Run</th>
+  </tr></thead><tbody>`;
+  tableRows.forEach((c, idx) => {
+    const fw = agentxFramework(c);
+    html += `<tr data-agentx-row="${idx}" style="cursor:pointer">
+      <td class="model-name">${escHTML(c.model)}</td>
+      <td style="white-space:nowrap"><span style="color:${agentxColor(fw)}">${fw.marker === 'triangle' ? '▲' : '●'}</span> ${escHTML(fw.label)}</td>
+      <td>${escHTML(c.sourceTopology || c.topology)}</td>
+      <td class="num">${Number.isFinite(c.totalGpu) ? c.totalGpu : '—'}</td>
+      <td class="num">${c.concurrency}</td>
+      <td class="num">${fmtNum(c.interactivity, 2)}</td>
+      <td class="num">${fmtNum(c.totalTputPerGpu, 0)}</td>
+      <td class="num">${c.ttftMs != null ? fmtNum(c.ttftMs, 0) : '—'}</td>
+      <td class="num">${c.tpotMs != null ? fmtNum(c.tpotMs, 2) : '—'}</td>
+      <td class="num">${Number.isFinite(c.cacheHitRate) ? (c.cacheHitRate * 100).toFixed(1) + '%' : '—'}</td>
+      <td>${onFrontier.has(c) ? 'yes' : ''}</td>
+      <td style="white-space:nowrap">${agentxFmtDate(c.date)}</td>
+      <td>${atomeshRunCell(c)}</td>
+    </tr>`;
+  });
+  html += '</tbody></table></div></div></div>';
+  container.innerHTML = html;
+  container.querySelectorAll('tr[data-agentx-row]').forEach(rowEl => {
+    rowEl.addEventListener('click', (e) => {
+      if (e.target.closest('a') || e.target.closest('button')) return;
+      const row = tableRows[Number(rowEl.dataset.agentxRow)];
+      if (row) showAtomeshPopover(row);
+    });
+  });
+
+  for (const spec of specs) {
+    new Chart(document.getElementById(spec.id), {
+      type: 'scatter',
+      data: { datasets: spec.datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        layout: { padding: { top: 8, right: 16 } },
+        plugins: {
+          legend: { labels: {
+            color: C_LEGEND, font: { size: 11 }, usePointStyle: true, boxWidth: 8, boxHeight: 8,
+            filter: item => !spec.datasets[item.datasetIndex]._offFrontier,
+          } },
+          tooltip: { ...chartTooltipOpts(), callbacks: {
+            title: items => {
+              const c = items[0].raw.row;
+              return `${agentxFramework(c).label} · ${c.sourceTopology || c.topology} · c=${c.concurrency}`;
+            },
+            label: item => {
+              const c = item.raw.row;
+              return [
+                ` E2E Norm. Interactivity: ${fmtNum(item.parsed.x, 2)} tok/s/user`,
+                ` Token Throughput per Chip: ${fmtNum(item.parsed.y, 0)} tok/s`,
+                ` TTFT ${c.ttftMs != null ? fmtNum(c.ttftMs, 0) : '—'} ms · TPOT ${c.tpotMs != null ? fmtNum(c.tpotMs, 2) : '—'} ms`,
+                ` ${Number.isFinite(c.totalGpu) ? c.totalGpu + ' GPUs · ' : ''}${agentxFmtDate(c.date)}`,
+              ];
+            },
+            afterBody: () => '\nClick for details',
+          }},
+          datalabels: { display: true, color: C_LEGEND, align: 'top', font: { size: 10 }, formatter: value => 'c' + value.row.concurrency },
+        },
+        scales: {
+          x: { grid: chartGridOpts(), beginAtZero: true, title: { display: true, text: 'P90 E2E Normalized Interactivity (tok/s/user)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
+          y: { grid: chartGridOpts(), beginAtZero: true, title: { display: true, text: 'Token Throughput per Chip (tok/s)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
+        },
+        onClick: (_e, elems) => {
+          if (!elems.length) return;
+          const item = elems[0];
+          const row = spec.datasets[item.datasetIndex]?.data?.[item.index]?.row;
+          if (row) showAtomeshPopover(row);
+        },
+      },
+    });
+  }
   syncHeaderH();
   bindFixedThead(container);
 }
