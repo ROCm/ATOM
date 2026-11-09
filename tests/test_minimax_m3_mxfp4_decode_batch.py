@@ -86,6 +86,17 @@ def test_the_score_view_follows_its_step_width_layout_at_a_stand_in_threshold(
     _check_score_view(heads, S, 16, float("-inf"))
 
 
+def test_a_fill_of_zero_blocks_fills_nothing_and_none_fills_every_column(monkeypatch):
+    from atom.model_ops.minimax_m3.index_mxfp4 import fresh_index_score
+
+    _stand_in_scorer_module(monkeypatch)
+    buf = torch.full((2 * 4 * 6,), 7.0)
+    out = fresh_index_score(buf, 4, 2, 6, 1, fill_blocks=0)
+    assert (out == 7.0).all()
+    out = fresh_index_score(buf, 4, 2, 6, 1)
+    assert (out == float("-inf")).all()
+
+
 def test_an_eager_step_scores_at_its_own_block_count_a_graph_step_at_the_models(
     monkeypatch,
 ):

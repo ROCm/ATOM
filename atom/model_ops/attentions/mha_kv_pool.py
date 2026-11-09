@@ -89,6 +89,8 @@ class KvLayout(Protocol):
     backend passes in the layout its layers use. Hashable, so a row space can be
     keyed by it."""
 
+    tag: str  # names the row space in logs and transfer regions; "" for SHUFFLE
+
     def check(self, block_size: int, head_dim: int, blocks_per_entry: int) -> None:
         """Refuse a geometry this layout cannot hold."""
 
@@ -114,6 +116,7 @@ class ShuffleLayout:
     layers uses."""
 
     kv_dtype: torch.dtype
+    tag = ""
 
     @property
     def x(self) -> int:

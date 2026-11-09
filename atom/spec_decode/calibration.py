@@ -13,7 +13,8 @@ import torch
 def calibration_identity(config, device):
     model = Path(config.model)
     files = ("config.json", "model.safetensors.index.json")
-    draft_dtype = config.speculative_config.kv_cache_dtype
+    spec = config.speculative_config
+    draft_dtype = spec.kv_cache_dtype if spec is not None else config.kv_cache_dtype
     identity = {
         "model_files": {
             name: hashlib.sha256((model / name).read_bytes()).hexdigest()

@@ -50,7 +50,7 @@ def fresh_index_score(
         score = flat.view(max_block, rows, num_idx_heads).permute(2, 1, 0)
     else:
         score = flat.view(num_idx_heads, rows, max_block)
-    score[..., : fill_blocks or max_block].fill_(NEG_INF)
+    score[..., : max_block if fill_blocks is None else fill_blocks].fill_(NEG_INF)
     return score
 
 

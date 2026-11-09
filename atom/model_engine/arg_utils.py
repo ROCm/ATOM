@@ -479,7 +479,8 @@ class EngineArgs:
             help="KV dtype of the speculative draft's pages (the draft's setting "
             "inside SpeculativeConfig.kv_cache_dtype). A draft with a KV pool of "
             "its own -- MiniMax-M3.1's DSpark -- takes 'bf16' or 'fp8' (default "
-            "'fp8'; 'fp4' is refused, no draft FP4 layout). A draft in the "
+            "--kv_cache_dtype's, 'bf16' under an fp4 target; 'fp4' is refused, no "
+            "draft FP4 layout). A draft in the "
             "target's pool always has --kv_cache_dtype, and a different value "
             "here is an error. Needs --method.",
         )

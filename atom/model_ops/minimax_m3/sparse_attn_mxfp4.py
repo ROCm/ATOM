@@ -67,6 +67,11 @@ def sparse_pa_mxfp4(
         )
     if q.dtype != torch.float8_e4m3fn:
         raise TypeError(f"the MXFP4 path takes an e4m3 query, got {q.dtype}")
+    if k_pages.shape[1] != num_kv_heads or v_pages.shape[1] != num_kv_heads:
+        raise ValueError(
+            f"num_kv_heads is {num_kv_heads}, but the K / V pages hold "
+            f"{k_pages.shape[1]} / {v_pages.shape[1]} heads"
+        )
     group = num_heads // num_kv_heads
     pages = k_pages.shape[0] * num_kv_heads
     # [pages, Hkv, 8704] -> [pages * Hkv, 1, 8704]: the pool field is contiguous in
