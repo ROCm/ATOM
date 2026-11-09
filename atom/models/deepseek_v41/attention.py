@@ -384,6 +384,9 @@ class Attention(nn.Module):
             return
         wo_a_ws = scale.view(self.groups, self.o_rank // 32, -1)
         k = int(weight.view(self.groups, self.o_rank, -1).shape[-1])
+        # The gate checks wo_a only. The fused pair is the per-1x32 FP8 that
+        # wo_b reads because wo_b is fixed to native_quant_config(); a
+        # configurable wo_b quant would make this output the wrong layout.
         self._fuse_woa_quant = (
             batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
                 tuple(wo_a_ws.shape), self.o_rank, k
