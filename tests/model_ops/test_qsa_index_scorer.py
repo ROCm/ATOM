@@ -18,7 +18,6 @@ import ast
 import collections
 import functools
 import hashlib
-import importlib
 import json
 import logging
 import sys
@@ -41,6 +40,7 @@ ATTN_PY = ROOT / "atom" / "model_ops" / "qwen4_exp" / "qsa_attention.py"
 RUNNER_PY = ROOT / "atom" / "model_engine" / "model_runner.py"
 ENGINE_CORE_PY = ROOT / "atom" / "model_engine" / "engine_core.py"
 HOOK_PY = ROOT / "atom" / "aiter_fused_ops.py"
+ATTN = "atom.model_ops.qwen4_exp.qsa_attention"
 # The frozen golden scorer source aiter's contract is written against
 # (ATOM 8a07708's qsa.py, unchanged through 10b99a08): CRLF / LF sha256.
 FROZEN_QSA_SHA256 = "aaa78f43255cf950bfbdf5d618246f9a7a671f0262cff2398b2ca4ea703810ee"
@@ -452,16 +452,28 @@ def test_index_scorer_is_the_neutral_op_itself(fake_api):
 # ---------------------------------------------------------------------------
 # call site
 # ---------------------------------------------------------------------------
-def _module_or_skip(name):
-    try:
-        return importlib.import_module(name)
-    except Exception as exc:  # noqa: BLE001 -- needs aiter/Triton python packages
-        pytest.skip(f"{name} not importable on this host: {exc!r}")
+@pytest.fixture
+def stub_load():
+    """Import ATOM model code against tests/aiter_stub.py's stand-ins for
+    aiter / Triton (a no-device container cannot initialise Triton's driver).
+    Request it FIRST so the fake ``aiter.ops.qsa`` installed later sits on top
+    of the stubs and is removed before them."""
+    from aiter_stub import atom_under_stubs
+
+    with atom_under_stubs() as load:
+
+        def _load(name):
+            try:
+                return load(name)
+            except Exception as exc:  # noqa: BLE001 -- import chain needs more
+                pytest.skip(f"{name} not importable under the aiter stubs: {exc!r}")
+
+        yield _load
 
 
 @pytest.fixture
-def select_mod(monkeypatch):
-    S = _module_or_skip("atom.model_ops.qwen4_exp.qsa_index_scorer.select")
+def select_mod(stub_load, monkeypatch):
+    S = stub_load("atom.model_ops.qwen4_exp.qsa_index_scorer.select")
     monkeypatch.setattr(S, "top_k_per_row_prefill", lambda *a, **k: None)
     monkeypatch.setattr(S, "qsa_expand_block_indices", lambda *a, **k: None)
     return S
@@ -469,7 +481,7 @@ def select_mod(monkeypatch):
 
 @pytest.mark.parametrize("fp8", [False, True])
 def test_select_scores_through_the_neutral_op_with_all_12_args(
-    fake_api, select_mod, fp8
+    select_mod, fake_api, fp8
 ):
     _api, calls = fake_api()
     (q, cache, table, t2r, pos, ctx), kw = call_args(rows=10, fp8=fp8)
@@ -498,9 +510,9 @@ def test_select_scores_through_the_neutral_op_with_all_12_args(
 
 
 def test_op_errors_propagate_without_an_atom_fallback(
-    fake_api, select_mod, monkeypatch
+    stub_load, select_mod, fake_api, monkeypatch
 ):
-    qsa_ops = _module_or_skip("atom.model_ops.qwen4_exp.ops.qsa")
+    qsa_ops = stub_load("atom.model_ops.qwen4_exp.ops.qsa")
     monkeypatch.setattr(
         qsa_ops,
         "qsa_paged_mqa_logits",
@@ -513,10 +525,6 @@ def test_op_errors_propagate_without_an_atom_fallback(
             q, cache, table, t2r, pos, ctx, 64, 4, scorer=E.index_scorer(cfg())
         )
     assert len(calls["op"]) == 1
-
-
-def _qsa_attention():
-    return _module_or_skip("atom.model_ops.qwen4_exp.qsa_attention")
 
 
 def _fake_layer(M, monkeypatch, qsa_select):
@@ -555,8 +563,8 @@ def _qsa_meta():
     )
 
 
-def test_call_site_flag_off_uses_the_stock_select(monkeypatch):
-    M = _qsa_attention()
+def test_call_site_flag_off_uses_the_stock_select(stub_load, monkeypatch):
+    M = stub_load(ATTN)
     seen = []
     monkeypatch.setattr(
         M, "qsa_select_paged_tokens", lambda *a, **k: seen.append((a, k))
@@ -569,8 +577,8 @@ def test_call_site_flag_off_uses_the_stock_select(monkeypatch):
     assert a[:2] == ("index_q", "ccache") and "scorer" not in k
 
 
-def test_call_site_flag_on_injects_the_neutral_op(monkeypatch, fake_api):
-    M = _qsa_attention()
+def test_call_site_flag_on_injects_the_neutral_op(stub_load, fake_api, monkeypatch):
+    M = stub_load(ATTN)
     api, _ = fake_api()
     monkeypatch.setattr(
         M, "qsa_select_paged_tokens", lambda *a, **k: pytest.fail("stock called")
@@ -591,8 +599,8 @@ def test_call_site_flag_on_injects_the_neutral_op(monkeypatch, fake_api):
     assert k["allow_flydsl"] is False and k["max_seq_len"] == 128
 
 
-def test_layer_exposes_its_caches_for_prewarm_only_when_on():
-    M = _qsa_attention()
+def test_layer_exposes_its_caches_for_prewarm_only_when_on(stub_load):
+    M = stub_load(ATTN)
     on = SimpleNamespace(
         qsa_select=object(), compressed_key_cache="c", compressed_key_scale="s"
     )
