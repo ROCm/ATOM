@@ -431,11 +431,14 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
 
         launch_front(local.front, buffers["front_scratch"], stream)
 
+        # RCCL's small float32 all-gather is much faster than its byte path on
+        # gfx1250. All-gather only copies elements, so this view preserves every
+        # heterogeneous payload bit exactly.
         gathered = get_tp_group().all_gather(
-            buffers["payload"],
+            buffers["payload"].view(torch.float32),
             dim=0,
             use_custom=False,
-        )
+        ).view(torch.uint8)
         local.finish.launcher(
             gathered.data_ptr(),
             weight.bias.data_ptr(),

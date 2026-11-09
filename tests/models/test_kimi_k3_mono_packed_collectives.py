@@ -41,6 +41,17 @@ def test_packed_collective_plan(rows):
     assert payload.local_bytes % 16 == 0
 
 
+@pytest.mark.parametrize("rows", (1, 48))
+def test_float32_all_gather_view_preserves_payload_bits(rows):
+    layout = FrontPayloadLayout(rows)
+    peers = torch.arange(layout.tp * layout.local_bytes).to(torch.uint8)
+    peers = peers.view(layout.gathered_shape)
+    gathered = torch.cat([peer.view(torch.float32) for peer in peers])
+    gathered = gathered.view(torch.uint8).view(layout.gathered_shape)
+
+    assert torch.equal(gathered, peers)
+
+
 def test_packed_runner_orders_local_regions_and_collectives():
     rows = 2
     plan = ExternalCollectivePlan(rows)
