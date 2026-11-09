@@ -443,64 +443,63 @@ def build_packed_finish(
             )
             maximum_union = tile_rows * 16
             task = bid
+            active = task < union_size * GATE_UP_GROUPS
+            if active:
+                for iteration in range_constexpr(
+                    (16 * (LATENT // 8) + THREADS - 1) // THREADS
+                ):
+                    index = tid + THREADS * iteration
+                    if index < tile_rows * (LATENT // 8):
+                        value = fx.Int32(
+                            bo.buffer_load(
+                                rsrc(latent_fp4),
+                                tile_start * (LATENT // 8) + index,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
+                        fx.ptr_store(value, gate_up.latent_fp4.ptr + index)
+                for iteration in range_constexpr(
+                    (16 * (LATENT // 32) + THREADS - 1) // THREADS
+                ):
+                    index = tid + THREADS * iteration
+                    if index < tile_rows * (LATENT // 32):
+                        value = fx.Int32(
+                            bo.buffer_load(
+                                rsrc(latent_scales),
+                                tile_start * (LATENT // 32) + index,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
+                        fx.ptr_store(value, gate_up.latent_scales.ptr + index)
+                for iteration in range_constexpr((256 + THREADS - 1) // THREADS):
+                    index = tid + THREADS * iteration
+                    if index < maximum_union:
+                        value = fx.Int32(
+                            bo.buffer_load(
+                                rsrc(experts),
+                                tile * 256 + index,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
+                        fx.ptr_store(value, gate_up.experts.ptr + index)
+                for iteration in range_constexpr((256 * 16 + THREADS - 1) // THREADS):
+                    index = tid + THREADS * iteration
+                    if index < maximum_union * tile_rows:
+                        value = fx.Int32(
+                            bo.buffer_load(
+                                rsrc(kof),
+                                tile * 256 * 16 + index,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
+                        fx.ptr_store(value, gate_up.kof.ptr + index)
+                gpu.barrier()
             while task < maximum_union * GATE_UP_GROUPS:
-                active = task < union_size * GATE_UP_GROUPS
-                if active:
-                    for iteration in range_constexpr(
-                        (16 * (LATENT // 8) + THREADS - 1) // THREADS
-                    ):
-                        index = tid + THREADS * iteration
-                        if index < tile_rows * (LATENT // 8):
-                            value = fx.Int32(
-                                bo.buffer_load(
-                                    rsrc(latent_fp4),
-                                    tile_start * (LATENT // 8) + index,
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                )
-                            )
-                            fx.ptr_store(value, gate_up.latent_fp4.ptr + index)
-                    for iteration in range_constexpr(
-                        (16 * (LATENT // 32) + THREADS - 1) // THREADS
-                    ):
-                        index = tid + THREADS * iteration
-                        if index < tile_rows * (LATENT // 32):
-                            value = fx.Int32(
-                                bo.buffer_load(
-                                    rsrc(latent_scales),
-                                    tile_start * (LATENT // 32) + index,
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                )
-                            )
-                            fx.ptr_store(value, gate_up.latent_scales.ptr + index)
-                    for iteration in range_constexpr((256 + THREADS - 1) // THREADS):
-                        index = tid + THREADS * iteration
-                        if index < maximum_union:
-                            value = fx.Int32(
-                                bo.buffer_load(
-                                    rsrc(experts),
-                                    tile * 256 + index,
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                )
-                            )
-                            fx.ptr_store(value, gate_up.experts.ptr + index)
-                    for iteration in range_constexpr(
-                        (256 * 16 + THREADS - 1) // THREADS
-                    ):
-                        index = tid + THREADS * iteration
-                        if index < maximum_union * tile_rows:
-                            value = fx.Int32(
-                                bo.buffer_load(
-                                    rsrc(kof),
-                                    tile * 256 * 16 + index,
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                )
-                            )
-                            fx.ptr_store(value, gate_up.kof.ptr + index)
-                    gpu.barrier()
+                if task < union_size * GATE_UP_GROUPS:
                     context = {
                         "S": tile_rows,
                         "tid": tid,
