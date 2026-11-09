@@ -321,6 +321,13 @@ class MultiConnector(KVConnectorBase):
             if callable(callback):
                 callback()
 
+    def set_forward_stream(self, stream) -> None:
+        """Tell every child which stream the forward runs on."""
+        for connector in self._connectors:
+            callback = getattr(connector, "set_forward_stream", None)
+            if callable(callback):
+                callback(stream)
+
     def get_finished(self) -> KVConnectorOutput:
         recv: set = set()
         failed: set = set()

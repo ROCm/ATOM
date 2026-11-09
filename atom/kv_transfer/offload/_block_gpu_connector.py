@@ -455,8 +455,9 @@ class BlockGPUConnector:
         staging pipeline rejects that device anyway, so refuse loudly instead of
         host-synchronizing on the save thread.
 
-        A state that stages on the forward's stream needs no wait: the producer
-        recorded its event on that stream, whose order already holds.
+        Always waits, also on a state that follows the forward's stream: the
+        stream may have changed between the producer's record and this job's
+        pin, and waiting on an event of one's own stream is free.
         """
 
         if state.pack_stream is None:
@@ -464,8 +465,6 @@ class BlockGPUConnector:
                 "ATOM LMCache connector: producer fence requires a CUDA/HIP "
                 "pack stream"
             )
-        if state.follows_compute_stream:
-            return
         state.pack_stream.wait_event(producer_event)
 
     def _ensure_staging_buffer(
