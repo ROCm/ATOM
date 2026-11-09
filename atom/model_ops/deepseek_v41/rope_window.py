@@ -40,6 +40,10 @@ _HEAD_BLOCK = True
 # (16384: 422 -> 205 us) and c1024 serving +4.1%, with the same bytes out. 1
 # only for the tests' per-head reference.
 _FP8_HEADS = 8
+# Below this many query rows (tokens x heads) the grouped grid is too small
+# and a program a head is faster (1 token: 1.6 vs 2.4 us); 64 heads cross at
+# ~64 tokens, 16 heads at ~256.
+_FP8_HEADS_MIN_QUERY_ROWS = 4096
 
 
 @triton.jit
@@ -315,7 +319,8 @@ def rope_quant_window(
     One address serves both ring layouts: `window_row` returns a byte offset
     for a byte pool (FP8 values then codes, `V41PoolGeometry.window_bytes`)
     and a row index for a `[rows, head_dim]` BF16 one. `fp8_heads`: MXFP8
-    query heads a program, `_FP8_HEADS` when None.
+    query heads a program; when None, `_FP8_HEADS` from
+    `_FP8_HEADS_MIN_QUERY_ROWS` query rows on and 1 below.
     """
     tokens, heads, dim = query.shape
     kv_half = ring is not None or qat is not None or values is not None
@@ -333,7 +338,8 @@ def rope_quant_window(
         and rope_dim >= 2
         and (rope_dim & (rope_dim - 1)) == 0
     )
-    fp8_heads = _FP8_HEADS if fp8_heads is None else fp8_heads
+    if fp8_heads is None:
+        fp8_heads = _FP8_HEADS if tokens * heads >= _FP8_HEADS_MIN_QUERY_ROWS else 1
     if not (
         query_fp8 is not None
         and fp8_heads > 1

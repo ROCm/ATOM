@@ -339,6 +339,7 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
     def run(flag):
         monkeypatch.setattr(rope_window, "_HEAD_BLOCK", flag)
         monkeypatch.setattr(rope_window, "_FP8_HEADS", 8 if flag else 1)
+        monkeypatch.setattr(rope_window, "_FP8_HEADS_MIN_QUERY_ROWS", 0)
         spy = _GridSpy(rope_window._rope_window_kernel)
         monkeypatch.setattr(rope_window, "_rope_window_kernel", spy)
         out = {"query": query.clone()}
@@ -384,6 +385,42 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
         assert not torch.equal(expected["query"], query)
     for name, tensor in expected.items():
         assert torch.equal(actual[name].view(torch.uint8), tensor.view(torch.uint8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("tokens, fp8_heads", [(1, 1), (63, 1), (64, 8)])
+def test_fp8_query_groups_heads_from_the_query_row_threshold(
+    monkeypatch, tokens, fp8_heads
+):
+    """64 heads quantize 8 a program from 64 tokens (4096 query rows) on;
+    fewer keep a program a head, which is faster there."""
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.deepseek_v41 import rope_window
+
+    device, heads, dim, rope_dim = "cuda", 64, 512, 64
+    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
+    positions = torch.zeros(tokens, device=device, dtype=torch.int32)
+    normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16)
+    values, scales = quantize_fp8(normed)
+    query_fp8 = (
+        torch.empty(tokens, heads, dim, device=device, dtype=values.dtype),
+        torch.empty(tokens, heads, dim // 32, device=device, dtype=scales.dtype),
+    )
+    spy = _GridSpy(rope_window._rope_window_kernel)
+    monkeypatch.setattr(rope_window, "_rope_window_kernel", spy)
+    rope_window.rope_quant_window(
+        query,
+        normed,
+        rope.cos_cache,
+        rope.sin_cache,
+        positions,
+        rope_dim=rope_dim,
+        values=values,
+        scales=scales,
+        query_fp8=query_fp8,
+    )
+    assert spy.launches == [((tokens, heads // fp8_heads + 1), False, fp8_heads)]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
