@@ -689,6 +689,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_CTX_KV": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "1") == "1"
     ),
+    # "1": the Kimi-K3 DSpark GQA draft (`models/kimi_k3_dspark_gqa.py`) runs each
+    # layer's per-head q/k RMSNorm, neox rope and paged K/V write as ONE Triton
+    # launch (`model_ops/draft_qk_rope_cache.py`) instead of the two norms, the
+    # rope and `reshape_and_cache_flash` (four launches in the block pass; the
+    # context write fuses the k norm, rope and cache write the same way). The
+    # kernel keeps the unfused chain's two bf16 rounding points and its norm-then
+    # -rope order, so q, k and the pool bytes can differ from the chain by at most
+    # one bf16 ulp (fp32 reduction order, FMA contraction); that moves only the
+    # draft's proposals, and verification accepts against the q the draft drew
+    # from. It covers bf16 and float8_e4m3fn pools in the FLASH layout with a
+    # neox rope over the whole head; any other pool (the gfx942 fnuz fp8, say)
+    # or rope keeps the chain. Read when the draft is built, so it must be set
+    # before the server starts.
+    "ATOM_K3_DRAFT_QKROPE": lambda: os.getenv("ATOM_K3_DRAFT_QKROPE", "0") == "1",
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
