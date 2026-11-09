@@ -66,8 +66,9 @@
     .filter-bar { display: flex; gap: var(--gap-sm); flex-wrap: wrap; align-items: center; position: relative; }
     .filter-group { position: relative; }
     .filter-btn { background: var(--bg-secondary); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 12px; white-space: nowrap; }
+    .scenario-select { background: var(--bg-secondary); color: var(--text-secondary); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; cursor: pointer; font-size: 12px; }
     .filter-btn[data-filter="dashboard-mode"] { width: 116px; text-align: left; }
-    .dashboard-mode-group { position: absolute; right: calc(100% + var(--gap-sm)); top: 0; }
+    .dashboard-mode-group { position: relative; }
     .filter-btn:hover, .filter-btn.open { background: var(--bg-tertiary); color: var(--text-primary); }
     .filter-btn .count { background: var(--ui); color: #fff; border-radius: 10px; padding: 1px 6px; margin-left: 4px; font-size: 10px; }
     .filter-dropdown { display: none; position: absolute; top: 100%; left: 0; margin-top: 4px; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 0; min-width: 200px; max-height: 300px; overflow-y: auto; z-index: 100; box-shadow: 0 8px 24px rgba(0,0,0,0.4); right: auto; }
@@ -1695,6 +1696,19 @@ function renderFilters() {
   const bar = document.getElementById('filter-bar');
   bar.innerHTML = '';
   appendDashboardModeSelector(bar);
+  // Scenario navigation does not change the existing benchmark filters or data.
+  const scenario = document.createElement('select');
+  scenario.id = 'dashboard-scenario';
+  scenario.className = 'scenario-select';
+  scenario.setAttribute('aria-label', 'Scenario');
+  scenario.add(new Option('Scenario: Benchmarks', 'benchmarks'));
+  scenario.add(new Option('Scenario: Agentic', 'agentic'));
+  scenario.addEventListener('change', () => {
+    if (scenario.value !== 'agentic') return;
+    const params = new URLSearchParams({ hardware: selectedHardware(), returnHash: location.hash });
+    location.href = 'agentic.html#' + params;
+  });
+  bar.appendChild(scenario);
   for (const d of filterDefs) {
     const sel = getFilterState(d.id);
     const allSelected = sel.length === d.options.length;

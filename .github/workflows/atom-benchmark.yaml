@@ -342,12 +342,14 @@ jobs:
             .github/benchmark/models.json /tmp/dashboard_models_map.js
           # Save dashboard assets before switching branches
           cp .github/dashboard/index.html /tmp/dashboard_index.html
+          cp .github/dashboard/agentic.html /tmp/dashboard_agentic.html
           cp docs/assets/atom_logo.png /tmp/dashboard_logo.png
           cp docs/assets/atom_logo_mini.png /tmp/dashboard_logo_mini.png
           git fetch origin gh-pages
           git checkout gh-pages
           # Replace auto-generated index.html with custom dashboard + logo
           cp /tmp/dashboard_index.html benchmark-dashboard/index.html
+          cp /tmp/dashboard_agentic.html benchmark-dashboard/agentic.html
           cp /tmp/dashboard_models_map.js benchmark-dashboard/models_map.js
           cp /tmp/dashboard_logo.png benchmark-dashboard/atom_logo.png
           cp /tmp/dashboard_logo_mini.png benchmark-dashboard/atom_logo_mini.png
