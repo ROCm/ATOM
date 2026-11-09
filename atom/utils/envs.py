@@ -1301,6 +1301,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
     # Mooncake Store in-place packs and unpacks on a high-priority stream.
     "OFFLOAD_COPY_HIGH_PRIORITY": lambda: _flag_env("OFFLOAD_COPY_HIGH_PRIORITY"),
+    # Offload packs and unpacks (Mooncake Store in-place and staged copies) on
+    # the forward's stream, never beside a forward kernel that needs every CU
+    # co-resident (ROCm deadlock). Takes precedence over
+    # OFFLOAD_COPY_HIGH_PRIORITY.
+    "OFFLOAD_STAGING_ON_COMPUTE_STREAM": lambda: _flag_env(
+        "OFFLOAD_STAGING_ON_COMPUTE_STREAM"
+    ),
     # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.
     # Unset derives the size from the KV geometry.
     "OFFLOAD_GPU_STAGING_CHUNKS": lambda: _optional_int_env(

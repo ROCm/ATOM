@@ -4055,6 +4055,21 @@ models:
       - <<: *issue382_a9_1p2d_c240_pernic4352
         name: issue382-a9-1p2d-c240-pernic4352-tuned-icp
         env: *issue382_a9_pernic4352_tuned_icp_env
+      # The Store's packs and unpacks on each PP stage's forward stream. On
+      # their side streams they run beside the forward's kernels: at C260 stage
+      # 0's forward never finished and its copies sat for 686 s, the ROCm
+      # deadlock against a kernel needing every CU co-resident (the prefill
+      # MoE GEMM is persistent).
+      - <<: *issue382_a9_1p2d_c240_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c240-pernic4352-tuned-mem90-icp-cs
+        env: &issue382_a9_pernic4352_tuned_icp_cs_env
+          <<: *issue382_a9_pernic4352_tuned_icp_env
+          prefill:
+            <<: *issue382_a9_pernic4352_tuned_env_prefill
+            OFFLOAD_STAGING_ON_COMPUTE_STREAM: '1'
+      - <<: *issue382_a9_1p2d_c260_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c260-pernic4352-tuned-mem90-icp-cs
+        env: *issue382_a9_pernic4352_tuned_icp_cs_env
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c330
         concurrency:

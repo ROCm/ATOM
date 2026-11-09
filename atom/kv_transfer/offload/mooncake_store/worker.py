@@ -54,6 +54,10 @@ from atom.kv_transfer.offload._block_gpu_connector import (
     BlockGPUConnector,
 )
 from atom.kv_transfer.offload._offload_common import pp_aware_rank_and_world
+from atom.kv_transfer.offload.atom_lmcache_staging import (
+    compute_stream,
+    set_compute_stream,
+)
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
@@ -269,6 +273,9 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     def register_kv_caches(
         self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
     ) -> None:
+        if torch.cuda.is_available():
+            # The model runner's thread: its current stream is the forward's.
+            set_compute_stream(torch.cuda.current_stream())
         rank, world = pp_aware_rank_and_world(self._config, _tp_group())
         self._rank = rank
         self._world = world
@@ -895,10 +902,13 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         """This copy thread's stream for in-place packs and unpacks."""
         stream = getattr(self._in_place_tls, "stream", None)
         if stream is None:
-            # At the default priority a copy can wait behind a busy PP stage's
-            # compute for seconds (p99 unpack 1.8 s on the middle stages).
-            priority = -1 if envs.OFFLOAD_COPY_HIGH_PRIORITY else 0
-            stream = torch.cuda.Stream(device=self._codec.device, priority=priority)
+            stream = compute_stream()
+            if stream is None:
+                # At the default priority a copy can wait behind a busy PP
+                # stage's compute for seconds (p99 unpack 1.8 s on the middle
+                # stages).
+                priority = -1 if envs.OFFLOAD_COPY_HIGH_PRIORITY else 0
+                stream = torch.cuda.Stream(device=self._codec.device, priority=priority)
             self._in_place_tls.stream = stream
         return stream
 
@@ -941,7 +951,13 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             else codec.chunk_major_device_buffer_to_gpu_prepared
         )
         copy(run, owner, 0, stream=stream)
-        stream.synchronize()
+        if stream is compute_stream():
+            # Up to the copy only: the forwards queued after it share the stream.
+            done = torch.cuda.Event()
+            done.record(stream)
+            done.synchronize()
+        else:
+            stream.synchronize()
 
         # -- slot settlement -----------------------------------------------
 

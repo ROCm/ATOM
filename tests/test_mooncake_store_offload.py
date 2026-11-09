@@ -40,6 +40,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
     SaveSourceGroupId,
 )
+from atom.kv_transfer.offload import atom_lmcache_staging as staging_mod
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload.chunked_scheduler import (
@@ -3633,6 +3634,38 @@ def test_in_place_load_unpacks_each_window_once(cluster, make_in_place_worker):
     output = worker.get_finished()
     assert output.finished_loading == {load.load_operation}
     assert output.failed_loading == set()
+
+
+def test_in_place_copies_share_the_forwards_stream_when_recorded(cluster, monkeypatch):
+    worker = MooncakeStoreOffloadConnector(_config())
+    shared = object()
+    monkeypatch.setattr(worker_mod, "compute_stream", lambda: shared)
+    copies = []
+    threads = [
+        threading.Thread(target=lambda: copies.append(worker._in_place_stream()))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    worker.close()
+
+    # Every copy thread, save or load, on the one stream.
+    assert copies == [shared, shared]
+
+
+def test_the_forwards_stream_is_shared_only_when_enabled(monkeypatch):
+    monkeypatch.setattr(staging_mod, "_COMPUTE_STREAM", None)
+    forward = object()
+    staging_mod.set_compute_stream(forward)
+    staging_mod.set_compute_stream(object())
+
+    monkeypatch.delenv("OFFLOAD_STAGING_ON_COMPUTE_STREAM", raising=False)
+    assert staging_mod.compute_stream() is None
+    monkeypatch.setenv("OFFLOAD_STAGING_ON_COMPUTE_STREAM", "1")
+    # The first stream recorded: the model runner's.
+    assert staging_mod.compute_stream() is forward
 
 
 class _UnreadBlock:

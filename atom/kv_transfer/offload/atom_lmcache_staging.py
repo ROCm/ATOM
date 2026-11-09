@@ -41,6 +41,32 @@ def memory_object_as_uint8(memory_obj: Any, nbytes: int) -> torch.Tensor:
     return flat[: int(nbytes)]
 
 
+# The forward's stream, recorded by the offload connector on the model runner's
+# thread (`set_compute_stream`).
+_COMPUTE_STREAM = None
+
+
+def set_compute_stream(stream) -> None:
+    """Record the forward's stream once; later calls are no-ops."""
+    global _COMPUTE_STREAM
+    if _COMPUTE_STREAM is None and stream is not None:
+        _COMPUTE_STREAM = stream
+
+
+def compute_stream():
+    """The stream offload packs and unpacks must use, or None for their own.
+
+    On a stream of its own a pack or unpack runs beside the forward's kernels,
+    and on ROCm it can deadlock against one that needs every CU co-resident (a
+    persistent kernel). On the forward's stream it runs between them.
+    """
+    from atom.utils import envs
+
+    if not envs.OFFLOAD_STAGING_ON_COMPUTE_STREAM:
+        return None
+    return _COMPUTE_STREAM
+
+
 class _NullCtx:
     def __enter__(self):
         return None
@@ -69,7 +95,12 @@ class _ThreadTransferState:
         self.device = device
         self.pack_stream = None
         self.copy_stream = None
-        if use_cuda:
+        shared = compute_stream() if use_cuda else None
+        if shared is not None:
+            # One stream for both legs: `run_staged_pipeline` then skips the
+            # cross-stream handshake.
+            self.pack_stream = self.copy_stream = shared
+        elif use_cuda:
             with torch.cuda.device(device):
                 self.pack_stream = torch.cuda.Stream()
                 self.copy_stream = torch.cuda.Stream()
