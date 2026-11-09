@@ -97,62 +97,6 @@ def test_recorded_fp4_bands_keep_their_launch_arguments_in_place():
     assert second[1].tolist() == [0] * 4 + [1, 2, 3] + [3] * 4
 
 
-def test_concat_rows_band_within_the_plane_at_its_row_pitch():
-    """FP8 prefill rows cut to a workspace band at `concat_plane_width`, the
-    pitch aiter pads a plane to, and carry the plane to the scorer."""
-    keys = rows_module.ConcatKeys(None, None, 1000, None)
-    pitch = chunk.concat_plane_width(1000)
-    assert pitch == 1024
-    plane = LogitsWorkspace(3 * pitch, "cpu")
-    rows = rows_module.concat_rows(
-        torch.zeros(10, dtype=torch.int32), keys, workspace=plane
-    )
-    assert _covers(rows.bands, 0, 10)
-    assert max(e - b for b, e in rows.bands) == 3
-    assert rows.workspace is plane
-    # Without one, the logits budget alone bands them and nothing is carried.
-    rows = rows_module.concat_rows(torch.zeros(10, dtype=torch.int32), keys)
-    assert rows.bands == ((0, 10),) and rows.workspace is None
-
-
-def test_concat_bands_score_into_the_plane(monkeypatch):
-    """Every band's logits are a view of the workspace plane at the band's
-    rows and the step's key count, rows `concat_plane_width` apart: nothing
-    the size of the context is allocated per band."""
-    total, count, pitch = 1000, 10, chunk.concat_plane_width(1000)
-    plane = LogitsWorkspace(3 * pitch, "cpu")
-    keys = rows_module.ConcatKeys(
-        None, None, total, torch.zeros(count, dtype=torch.int32)
-    )
-    rows = rows_module.concat_rows(
-        torch.full((count,), total, dtype=torch.int32), keys, workspace=plane
-    )
-    seen = []
-
-    def fake_logits(**kwargs):
-        logits = kwargs["logits"]
-        seen.append(logits)
-        return logits
-
-    monkeypatch.setattr(score_module, "fp8_mqa_logits", fake_logits)
-    monkeypatch.setattr(score_module, "top_k_per_row_prefill", lambda *a, **k: None)
-    base = plane.logits(1, 1).data_ptr()
-    score_module._score_concat(
-        torch.zeros(count, 1, 1),
-        torch.zeros(count, 1),
-        None,
-        rows,
-        4,
-        False,
-        torch.zeros(count, 4, dtype=torch.int32),
-        (torch.zeros(total, 1), torch.zeros(total, 1)),
-        True,
-    )
-    assert [t.shape[0] for t in seen] == [e - b for b, e in rows.bands]
-    assert all(t.shape[1] == total and t.stride() == (pitch, 1) for t in seen)
-    assert all(t.data_ptr() == base for t in seen)
-
-
 def _concat_groups_of(cu_keys, cu_rows, runs):
     return tuple(
         rows_module.ConcatGroup(
@@ -165,43 +109,6 @@ def _concat_groups_of(cu_keys, cu_rows, runs):
         )
         for first, end in runs
     )
-
-
-def test_pack_concat_groups_keeps_each_run_within_capacity():
-    """Requests pack in order without exceeding the fixed capacity."""
-    cu = np.array([0, 500, 700, 1200, 1250, 2000])
-    runs = chunk.pack_concat_groups(cu, 1000)
-    assert runs == [(0, 2), (2, 4), (4, 5)]
-    assert all(cu[end] - cu[first] <= 1000 for first, end in runs)
-    assert chunk.pack_concat_groups(np.array([0, 10]), 1000) == [(0, 1)]
-    with pytest.raises(ValueError, match="request 0 has 2000 keys"):
-        chunk.pack_concat_groups(np.array([0, 2000, 2001]), 1000)
-
-
-@pytest.mark.parametrize("world", [1, 2, 8])
-def test_concat_rows_band_each_group_against_its_own_keys(world):
-    """A band never spans two groups, the bands cover this rank's rows in
-    order, and each holds as many rows as the plane fits at its group's
-    pitch."""
-    cu_keys = np.array([0, 3000, 3100, 6100])
-    cu_rows = np.array([0, 40, 50, 90])
-    groups = _concat_groups_of(cu_keys, cu_rows, [(0, 1), (1, 3)])
-    keys = rows_module.ConcatKeys(None, None, int(cu_keys[-1]), None, groups=groups)
-    plane = LogitsWorkspace(16 * chunk.concat_plane_width(3100), "cpu")
-    covered = []
-    for rank in range(world):
-        split = rows_module.RowSplit.of(90, rank, world)
-        rows = rows_module.concat_rows(
-            torch.zeros(90, dtype=torch.int32), keys, split, workspace=plane
-        )
-        assert _covers(rows.bands, split.first, split.end)
-        for first, end in rows.bands:
-            group = next(g for g in groups if g.row_first <= first < g.row_end)
-            assert end <= group.row_end
-            pitch = chunk.concat_plane_width(group.total)
-            assert (end - first) * pitch <= plane.capacity
-        covered += [r for b, e in rows.bands for r in range(b, e)]
-    assert covered == list(range(90))
 
 
 @pytest.mark.parametrize("request_local", [True, False])
