@@ -17,6 +17,14 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
+from aiter.jit.utils.chip_info import get_gfx
+
+try:
+    from aiter.ops.opus.pa_mqa_logits_mxfp4 import mqa_logits_mxfp4_lane_max_elems
+except ImportError:
+    # An aiter whose scorer writes no lane maxima: none are allocated, and the
+    # scorer and top-k are called as before.
+    mqa_logits_mxfp4_lane_max_elems = None
 
 from atom.model_ops.sparse_indexer_chunk import (
     LogitsWorkspace,
@@ -152,6 +160,19 @@ class ScoreWorkspace(LogitsWorkspace):
             if self.packed
             else None
         )
+        # The packed logits' lane maxima, which gfx1250's OPUS scorer writes
+        # beside them for the top-k of the same band (`packed_lane_max`).
+        self._lane_max = (
+            torch.empty(
+                mqa_logits_mxfp4_lane_max_elems(self.capacity, max_tokens),
+                dtype=torch.float32,
+                device=device,
+            )
+            if self.packed
+            and get_gfx() == "gfx1250"
+            and mqa_logits_mxfp4_lane_max_elems is not None
+            else None
+        )
         self._row_starts = torch.arange(
             max_tokens + 1, dtype=torch.int32, device=device
         )
@@ -212,6 +233,11 @@ class ScoreWorkspace(LogitsWorkspace):
         if not self.packed:
             raise ValueError("only the FP4 plane packs its logits")
         return self._maxima
+
+    def packed_lane_max(self):
+        """The packed logits' lane maxima (``mqa_logits_mxfp4(lane_max=...)``),
+        flat, or None where the scorer writes none."""
+        return self._lane_max
 
     def row_starts(self, rows):
         """`[rows + 1]` int32 0 .. rows: each of `rows` rows its own sequence."""
