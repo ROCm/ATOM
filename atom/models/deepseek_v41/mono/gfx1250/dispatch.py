@@ -43,6 +43,9 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
 
         self._single = LazyRunner(create, "V4.1 single-launch step")
         self._served = None  # this step's runner when the single launch served it
+        self._decode_batch = (
+            None  # this step's batch when it is a decode step (``step_override``)
+        )
         self._step_batch = None
         if drafter is not None:
             self._wrap_drafter(drafter)
@@ -57,12 +60,15 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
             return None
 
         def served_propose(*args, **kwargs):
+            batch = self._decode_batch
             if self._served is not None:
-                return self._served.draft_ids(kwargs["next_token_ids"].shape[0])
+                return self._served.draft_ids(batch.total_seqs_num)
             drafts = propose(*args, **kwargs)
             runner = self._single.runner
-            if drafts is not None and runner is not None:
-                runner.forget_drafts()  # the production drafter's drafts: the kept q no longer match them
+            if drafts is not None and runner is not None and batch is not None:
+                # a decode batch the production drafter drew for: its requests' kept q no longer match (a prefill
+                # batch's requests have none)
+                runner.forget_drafts(batch.req_ids[: batch.total_seqs_num])
             return drafts
 
         drafter.compute_draft_kv, drafter.propose = (
@@ -88,7 +94,7 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
         )
         if runner is not None:
             runner.run_step(input_ids, running_bs, get_forward_context(), batch)
-        self._served = runner
+        self._served, self._decode_batch = runner, batch
         return runner
 
     def single_step_runner(self, batch, rows: int):
@@ -116,9 +122,8 @@ class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
         return self._single.runner
 
     def forward(self, input_ids, positions, inputs_embeds=None):
-        self._served = (
-            None  # a production forward: this step is not the single launch's
-        )
+        # a production forward (prefill, or an eager decode): not the single launch's step
+        self._served = self._decode_batch = None
         if inputs_embeds is None and envs.ATOM_MONO_CHECK:
             return self.check_forward(input_ids, positions)
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)

@@ -117,18 +117,19 @@ class _Lazy:
         return True
 
 
+class _Inner(nn.Module):
+    def forward(self, input_ids, positions, inputs_embeds=None):
+        return ("inner", input_ids, inputs_embeds)
+
+    def compute_logits(self, hidden_states):
+        return hidden_states
+
+
 @pytest.fixture
 def model(monkeypatch):
     monkeypatch.setattr(dispatch, "LazyRunner", _Lazy)
 
-    class Inner(nn.Module):
-        def forward(self, input_ids, positions, inputs_embeds=None):
-            return ("inner", input_ids, inputs_embeds)
-
-        def compute_logits(self, hidden_states):
-            return hidden_states
-
-    return dispatch.SingleStepModel(Inner(), drafter=None, atom_config=atom_config())
+    return dispatch.SingleStepModel(_Inner(), drafter=None, atom_config=atom_config())
 
 
 @pytest.mark.parametrize(
@@ -199,6 +200,8 @@ def _batch(**kw):
             "structured_requests": None,
             "any_logprobs": False,
             "required_channel": None,
+            "total_seqs_num": 8,
+            "req_ids": [f"r{i}" for i in range(8)],
             **kw,
         }
     )
@@ -251,7 +254,7 @@ def test_check_mode_never_serves(model, verify_step, monkeypatch):
 class _ServingRunner(_Runner):
     def __init__(self):
         super().__init__()
-        self.steps, self.forgot = 0, 0
+        self.steps, self.forgot = 0, []
 
     def run_step(self, input_ids, running_bs, forward_context, batch):
         self.steps += 1
@@ -259,8 +262,8 @@ class _ServingRunner(_Runner):
     def draft_ids(self, bs):
         return ("kernel", bs)
 
-    def forget_drafts(self):
-        self.forgot += 1
+    def forget_drafts(self, req_ids):
+        self.forgot += list(req_ids)
 
 
 class _Drafter:
@@ -278,7 +281,7 @@ class _Drafter:
 def served(verify_step, monkeypatch):
     monkeypatch.setattr(dispatch, "LazyRunner", _Lazy)
     drafter = _Drafter()
-    m = dispatch.SingleStepModel(nn.Identity(), drafter, atom_config())
+    m = dispatch.SingleStepModel(_Inner(), drafter, atom_config())
     m._single.runner = _ServingRunner()
     return m, drafter
 
@@ -291,7 +294,7 @@ def test_a_served_step_drafts_from_the_kernel(served):
     drafter.compute_draft_kv()
     assert drafter.kv == 0
     assert drafter.propose(next_token_ids=torch.zeros(8)) == ("kernel", 8)
-    assert runner.forgot == 0
+    assert runner.forgot == []
 
 
 def test_a_step_with_fewer_rows_than_6_a_request_is_not_served(served):
@@ -304,12 +307,28 @@ def test_a_step_with_fewer_rows_than_6_a_request_is_not_served(served):
 def test_a_production_step_drafts_from_the_drafter(served):
     m, drafter = served
     runner = m._single.runner
-    assert m.step_override(torch.zeros(6), 1, 6, _batch(any_logprobs=True)) is None
+    batch = _batch(any_logprobs=True, total_seqs_num=1, req_ids=["a", "b"])
+    assert m.step_override(torch.zeros(6), 1, 6, batch) is None
     assert runner.steps == 0
     drafter.compute_draft_kv()
     assert drafter.kv == 1
     assert drafter.propose(next_token_ids=torch.zeros(1)) == "production"
-    assert runner.forgot == 1  # the kernel's kept q no longer match the drafts
+    assert runner.forgot == [
+        "a"
+    ]  # this batch's requests: their kept q no longer match their drafts
+
+
+def test_a_prefill_keeps_the_running_requests_kernel_q(served):
+    m, drafter = served
+    runner = m._single.runner
+    m.step_override(torch.zeros(48), 8, 48, _batch())  # a served decode step
+    m(
+        torch.zeros(3, dtype=torch.long), torch.zeros(3, dtype=torch.long)
+    )  # then a prefill (production forward)
+    assert drafter.propose(next_token_ids=torch.zeros(1)) == "production"
+    assert (
+        runner.forgot == []
+    )  # the new request has no kept q; the running ones keep theirs
 
 
 # --- the kernel's per-step arithmetic on Python ints ----------------------------------------------------------------
