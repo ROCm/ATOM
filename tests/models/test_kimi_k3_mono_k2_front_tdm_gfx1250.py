@@ -45,3 +45,12 @@ def test_replicated_finalize_covers_every_hidden_row_once(rows):
     kernel = fin.build_replicated_finalize(_plan(rows))
     assert kernel.grid == (fin.PAIRS,) == (7168 // 32,)
     assert kernel.abi.names == ("routed_normed", "shared", "up_weight", "output")
+
+
+def test_herd_candidates_feed_only_the_grouped_moe_finish():
+    with pytest.raises(ValueError, match="HERD"):
+        build_packed_finish(_plan(16), herd=True)
+    kernel = build_packed_finish(
+        _plan(16), include_routed=False, replicated_front=True, herd=True
+    )
+    assert kernel.name.endswith("_rf_herd")

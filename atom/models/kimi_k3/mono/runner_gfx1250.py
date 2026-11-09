@@ -24,6 +24,11 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.fused_moe import fused_moe
 from aiter.ops.flydsl.moe_common import GateMode
 
+try:
+    from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
+except ImportError:  # an AITER without HERD routes every step exactly
+    _FLYDSL_USE_HERD, _FLYDSL_HERD_MIN_M, _FLYDSL_HERD_MAX_M = False, 0, 0
+
 from atom.models.kimi_k3.mono.config import (
     EXPERTS,
     GFX1250_BLOCKS,
@@ -133,6 +138,7 @@ class Gfx1250RoutedK2Build:
     buffers: dict[str, torch.Tensor]
     grouped_experts: bool
     replicated_finalize: bool
+    herd: bool = False
 
 
 @dataclass(frozen=True)
@@ -297,6 +303,12 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         # Both partials then take one all-reduce and every rank applies the
         # whole up-projection.
         replicated = grouped and whole_up
+        # The production MoE's HERD window: Top-(K+1) candidates, one dropped
+        # by batch popularity inside the grouped MoE.
+        herd = (
+            grouped and _FLYDSL_USE_HERD and _FLYDSL_HERD_MIN_M <= rows <= _FLYDSL_HERD_MAX_M
+        )
+        width = TOPK + 1 if herd else TOPK
         front = (
             build_replicated_front(plan)
             if grouped
@@ -307,6 +319,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             gu_interleave=gu_interleave,
             include_routed=not grouped,
             replicated_front=grouped,
+            herd=herd,
         )
         finalize = (
             build_replicated_finalize(plan)
@@ -321,9 +334,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
 
         buffers = {
             "shared_gate_up": empty((rows, 2 * self.dims.sh_inter), torch.bfloat16),
-            "route": empty((rows, TOPK if grouped else 2 * TOPK), torch.int32),
+            "route": empty((rows, width if grouped else 2 * TOPK), torch.int32),
             "tile_route": (
-                empty((rows, TOPK))
+                empty((rows, width))
                 if grouped
                 else empty((tiles, 16, 32), torch.int32)
             ),
@@ -368,6 +381,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             buffers,
             grouped,
             replicated,
+            herd,
         )
 
     def forward(
@@ -482,6 +496,12 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 linear_beta=SITU_LINEAR_BETA,
                 gate_mode=GateMode.INTERLEAVE.value,
                 output=buffers["routed"],
+                # The mono config requires routed_scaling_factor == 1.
+                **(
+                    {"herd_topk": TOPK, "herd_routed_scaling_factor": 1.0}
+                    if local.herd
+                    else {}
+                ),
             )
         if local.replicated_finalize:
             reduced = get_tp_group().all_reduce(buffers["reduce"], ca_fp8_quant=False)

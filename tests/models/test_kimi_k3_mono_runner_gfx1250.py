@@ -275,7 +275,8 @@ def test_dispatch_selects_gfx1250_runner(monkeypatch):
     assert wrapped._mono._create() is sentinel
 
 
-def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch):
+@pytest.mark.parametrize("herd", (False, True))
+def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch, herd):
     rows, layer_id = 2, 3
     tensor = lambda *shape, dtype=torch.float32: torch.zeros(shape, dtype=dtype)  # noqa: E731
     weight = SimpleNamespace(
@@ -315,6 +316,7 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch):
         buffers=buffers,
         grouped_experts=True,
         replicated_finalize=False,
+        herd=herd,
     )
     x = tensor(rows, 4)
     experts = SimpleNamespace(w13_weight_scale=tensor(2), w2_weight_scale=tensor(2))
@@ -358,6 +360,11 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch):
     assert kwargs["a1_scale"] is buffers["latent_scales"]
     assert kwargs["w1_scale"] is experts.w13_weight_scale
     assert kwargs["output"] is buffers["routed"]
+    if herd:
+        assert kwargs["herd_topk"] == 16
+        assert kwargs["herd_routed_scaling_factor"] == 1.0
+    else:
+        assert "herd_topk" not in kwargs
     assert calls["finalize"][0] == buffers["routed"].data_ptr()
 
 
@@ -402,6 +409,7 @@ def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch):
         buffers=buffers,
         grouped_experts=True,
         replicated_finalize=True,
+        herd=False,
     )
     experts = SimpleNamespace(w13_weight_scale=None, w2_weight_scale=None)
     layer = SimpleNamespace(

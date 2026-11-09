@@ -97,6 +97,9 @@ def stage_route(c, token, front_payload_words=0):
 
     lane, wave, red = c["lane"], c["wave"], c["red"]
     contiguous = "contiguous_logits" in c and c["contiguous_logits"]
+    # HERD routing keeps TOPK + 1 candidates with their raw sigmoid scores;
+    # the MoE drops one and renormalizes.
+    width = TOPK + 1 if "herd" in c and c["herd"] else TOPK
     if wave == 0:
         per_lane = EXPERTS // GFX1250.wave_size
         scores = []
@@ -148,7 +151,7 @@ def stage_route(c, token, front_payload_words=0):
         threshold = fx.Uint32(0)
         for bit in range_constexpr(31, -1, -1):
             candidate = threshold | fx.Uint32(1 << bit)
-            threshold = (count_at_least(candidate) >= TOPK).select(candidate, threshold)
+            threshold = (count_at_least(candidate) >= width).select(candidate, threshold)
 
         greater = fx.Int32(0)
         equal = fx.Int32(0)
@@ -159,12 +162,12 @@ def stage_route(c, token, front_payload_words=0):
             equal = equal + (scores[index] == threshold).select(
                 fx.Int32(1), fx.Int32(0)
             )
-        needed = fx.Int32(TOPK) - butterfly(
+        needed = fx.Int32(width) - butterfly(
             greater, (16, 8, 4, 2, 1), architecture=GFX1250
         )
         if butterfly(equal, (16, 8, 4, 2, 1), architecture=GFX1250) == needed:
             # Every key at the threshold is kept, so a lane-major slot order
-            # suffices: the ranking below orders the sixteen by key and id.
+            # suffices: the ranking below orders them by key and id.
             kept = greater + equal
             slot = kept
             for step in range_constexpr(5):
@@ -206,12 +209,12 @@ def stage_route(c, token, front_payload_words=0):
                 equal_before = equal_before + _popcount32(equal_ballot)
                 selected_before = selected_before + _popcount32(selected_ballot)
 
-        item = fx.min(lane, TOPK - 1)
+        item = fx.min(lane, width - 1)
         my_key = fx.Uint32(fx.ptr_load(red + item * 3).bitcast(fx.Int32))
         my_expert = fx.ptr_load(red + item * 3 + 1).bitcast(fx.Int32)
         my_sigmoid = fx.ptr_load(red + item * 3 + 2)
         rank = fx.Int32(0)
-        for other in range_constexpr(TOPK):
+        for other in range_constexpr(width):
             other_key = fx.Uint32(fx.ptr_load(red + other * 3).bitcast(fx.Int32))
             other_expert = fx.ptr_load(red + other * 3 + 1).bitcast(fx.Int32)
             before = (other_key > my_key) | (
@@ -224,9 +227,12 @@ def stage_route(c, token, front_payload_words=0):
         for item in range_constexpr(TOPK):
             total = total + fx.ptr_load(red + 64 + item)
         inverse = fx.Float32(1.0) / total
-        if lane < TOPK:
+        if lane < width:
             expert = fx.min(fx.max(my_expert, 0), fx.Int32(EXPERTS - 1))
-            if const_expr("route_weights" in c):
+            if const_expr(width != TOPK):
+                c["put"](c["route"], token * width + rank, expert)
+                c["put"](c["route_weights"], token * width + rank, my_sigmoid)
+            elif const_expr("route_weights" in c):
                 c["put"](c["route"], token * TOPK + rank, expert)
                 c["put"](c["route_weights"], token * TOPK + rank, my_sigmoid * inverse)
             else:
