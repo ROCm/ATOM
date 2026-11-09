@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.model_engine.capabilities import pcp_group_size_of
+from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
     checkpoint_layer_key,
     unquantized_layer_keys,
@@ -750,9 +752,17 @@ _CONFIG_REGISTRY: dict[str, str] = {
 # as a bare PretrainedConfig instead (see get_hf_config).
 _PLAIN_CONFIG_MODEL_TYPES: frozenset[str] = frozenset({"k3_dspark"})
 
+# a checkpoint architecture that is another's model under a new name: loaded
+# as that one (``get_hf_config``), so every table keyed by architecture holds
+# one entry for both
+ARCH_ALIASES: dict[str, str] = {
+    "KimiK31ForConditionalGeneration": "KimiK3ForConditionalGeneration",
+}
+
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     "kimi_k3": "text_config",
+    "kimi_k31": "text_config",
     "kimi_k25": "text_config",
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
@@ -793,6 +803,16 @@ def flatten_dsa_config(hf_config) -> None:
 
 
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
+    """``model``'s config, its architecture the one ATOM's tables key
+    (``ARCH_ALIASES``)."""
+    hf_config = _load_hf_config(model, trust_remote_code)
+    architectures = getattr(hf_config, "architectures", None)
+    if architectures and architectures[0] in ARCH_ALIASES:
+        hf_config.architectures = [ARCH_ALIASES[architectures[0]]]
+    return hf_config
+
+
+def _load_hf_config(model: str, trust_remote_code: bool) -> PretrainedConfig:
     config_dict, _ = PretrainedConfig.get_config_dict(
         model,
     )
@@ -2038,6 +2058,10 @@ class Config:
     # --no-encoder-swa-bounded-replay keeps checkpoints. No effect on other models.
     enable_encoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
+    # Prefill admission (`--prefill-admit-policy`): "interval" keeps
+    # ATOM_PREFILL_DECODE_INTERVAL and the coalescer; "adaptive" replaces both
+    # with the rent-or-buy rule in prefill_delayer.py.
+    prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
@@ -2046,6 +2070,9 @@ class Config:
     dcp_config: DCPConfig = field(default_factory=DCPConfig)
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
+    # Ulysses shards tokens and exchanges them for heads around attention.
+    # Its workers form AITER's PCP process group; see `pcp_group_size`.
+    sequence_parallel_size: int = 1
     enforce_eager: bool = False
     # Number of vocabulary positions that carry a real token. A checkpoint
     # whose embedding matrix is padded up to a friendlier width -- Qwen3 rounds
@@ -2076,6 +2103,9 @@ class Config:
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
+    # V4/V4.1 FP4 physical layout, resolved before config is sent to scheduler
+    # and workers. Their PAGE namespace must describe the same stored bytes.
+    index_cache_layout: str | None = field(default=None, init=False)
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
@@ -2103,6 +2133,9 @@ class Config:
     compilation_config: CompilationConfig = field(default_factory=CompilationConfig)
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
+    # Queue finished sequences on outputs_queue; only its readers turn it on
+    # (LLMEngine.add_request for step / generate, and asyncio_mode).
+    keep_finished_outputs: bool = False
     mark_trace: bool = False
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
@@ -2131,6 +2164,11 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: SpeculativeConfig | None = None
     kv_transfer_config: dict = field(default_factory=dict)
+    # A frontend's own stable form of its speculative config, which the offload
+    # PAGE namespace hashes in place of `speculative_config`: only the frontend
+    # knows which of its fields differ between processes. None hashes
+    # `speculative_config` itself, as native ATOM does.
+    offload_speculative_config: Any = None
     kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
     # DSpark runtime knobs. Built once in the parent from --dspark-config (see
     # EngineArgs) and pickled into every worker. Read sites use `config.dspark.*`
@@ -2208,6 +2246,10 @@ class Config:
         return visible if 0 < visible < tp else tp
 
     @property
+    def pcp_group_size(self) -> int:
+        return pcp_group_size_of(self)
+
+    @property
     def capture_sizes(self) -> list[int]:
         """The declared CUDAGraph capture ladder, in batch sizes.
 
@@ -2276,7 +2318,124 @@ class Config:
         )
         self.throughput_log_interval_steps = 0
 
+    @property
+    def end_token_ids(self) -> tuple[int, ...]:
+        """Every token ID that terminates generation on this deployment."""
+        return tuple(
+            sorted(
+                {
+                    i
+                    for i in (self.eos_token_id, *self.stop_token_ids)
+                    if i is not None and i >= 0
+                }
+            )
+        )
+
+    def _init_sequence_parallel(self) -> None:
+        """Validate Ulysses SP, which runs over AITER's PCP process group."""
+        sp = self.sequence_parallel_size
+        if self.parallel_config.data_parallel_size != 1 or self.enable_dp_attention:
+            raise ValueError(
+                "Ulysses SP currently requires data_parallel_size=1 without "
+                "--enable-dp-attention: the DP MoE forward path does not "
+                "gather/scatter SP token shards."
+            )
+        if self.tensor_parallel_size != 1:
+            raise ValueError(
+                f"--sequence-parallel-size {sp} requires --tensor-parallel-size 1: "
+                "Ulysses SP requires unsharded attention projections."
+            )
+        if self.pipeline_parallel_size != 1:
+            raise ValueError("Ulysses SP is not validated with pipeline parallelism.")
+        if self.enable_expert_parallel:
+            raise ValueError("Ulysses SP is not validated with expert parallelism.")
+        if self.prefill_context_parallel_size != 1:
+            raise ValueError(
+                "--sequence-parallel-size and --prefill-context-parallel-size "
+                "both claim the same rank dimension; set only one."
+            )
+        if self.enable_tbo or self.enable_tbo_decode:
+            raise ValueError("Ulysses SP does not support TBO token slicing.")
+        if self.compilation_config.level == CompilationLevel.DYNAMO_AS_IS:
+            raise ValueError(
+                "Ulysses SP does not support --level 1: fullgraph cannot trace "
+                "its decode token gather."
+            )
+        # Each rank reads its token shard from the shared input buffer.
+        if self.max_num_batched_tokens % sp:
+            raise ValueError(
+                f"--sequence-parallel-size {sp} must divide "
+                f"--max-num-batched-tokens ({self.max_num_batched_tokens})."
+            )
+        # Also keeps each TR_HYBRID decode token bucket one (bs, q=1) request
+        # bucket, which the inline-recorded sp_attention_fp8 relies on.
+        if self.speculative_config is not None:
+            raise ValueError(
+                "Ulysses SP does not support speculative decoding: draft model "
+                "inputs and auxiliary hidden states are not sequence-sharded."
+            )
+        if self.kv_transfer_config:
+            raise ValueError(
+                "Ulysses SP does not support KV transfer or offload connectors: "
+                "they address KV by TP rank, while each SP rank holds 1/SP of "
+                "the KV heads."
+            )
+        if self.enable_rapidserve:
+            raise ValueError(
+                "Ulysses SP does not support --enable-rapidserve: it hands KV "
+                "over by TP rank only."
+            )
+        # Every vision tower but MiniMax-M3's is built from this config; M3
+        # builds none under SP (`image_input_refusal`) and serves text.
+        if getattr(self.hf_config, "_multimodal_config", None) is not None:
+            raise ValueError(
+                "Ulysses SP does not support multimodal checkpoints: it does "
+                "not shard the inputs_embeds a vision tower feeds the model."
+            )
+        # Local import: atom.utils pulls in atom.config at module scope.
+        from atom.utils import get_hf_text_config
+        from atom.utils.selector import Family, attn_family
+
+        hf_text = get_hf_text_config(self.hf_config)
+        if attn_family(hf_text) is not Family.MHA:
+            raise ValueError(
+                "Ulysses SP supports MHA models only; MLA and recurrent "
+                "attention do not exchange SP token shards."
+            )
+        from atom.distributed.ulysses_sp import sp_head_shards
+
+        heads = hf_text.num_attention_heads
+        if heads % sp:
+            raise ValueError(
+                f"--sequence-parallel-size {sp} does not shard the {heads} "
+                "query heads evenly."
+            )
+        sp_head_shards(getattr(hf_text, "num_key_value_heads", None) or heads, sp)
+
+    def _init_moe_backend(self) -> None:
+        self.moe_backend = self.moe_backend.strip().lower()
+        if self.moe_backend not in ("standard", "mega"):
+            raise ValueError(
+                "moe_backend must be one of {'standard', 'mega'}, "
+                f"got {self.moe_backend!r}"
+            )
+        # Under Ulysses SP, `mega` selects SP MegaMoE (sp_mega_moe.py) instead.
+        if self.moe_backend != "mega" or self.sequence_parallel_size > 1:
+            return
+        if not self.enable_expert_parallel:
+            raise ValueError(
+                "moe_backend='mega' requires expert parallelism; pass "
+                "--enable-expert-parallel, or --sequence-parallel-size for SP MegaMoE."
+            )
+        if self.moe_all2all_backend == "rccl":
+            raise ValueError(
+                "moe_backend='mega' owns its MoRI transport and cannot use the "
+                "experimental RCCL prepare/finalize backend"
+            )
+
     def __post_init__(self):
+        if self.sequence_parallel_size < 1:
+            raise ValueError("sequence_parallel_size must be at least 1")
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
@@ -2294,22 +2453,14 @@ class Config:
             self.enable_tbo = False
             self.enable_tbo_decode = False
 
-        self.moe_backend = self.moe_backend.strip().lower()
-        if self.moe_backend not in ("standard", "mega"):
+        self.prefill_admit_policy = self.prefill_admit_policy.strip().lower()
+        if self.prefill_admit_policy not in PREFILL_ADMIT_POLICIES:
             raise ValueError(
-                "moe_backend must be one of {'standard', 'mega'}, "
-                f"got {self.moe_backend!r}"
+                f"prefill_admit_policy must be one of {PREFILL_ADMIT_POLICIES}, "
+                f"got {self.prefill_admit_policy!r}"
             )
-        if self.moe_backend == "mega" and not self.enable_expert_parallel:
-            raise ValueError(
-                "moe_backend='mega' requires expert parallelism; "
-                "pass --enable-expert-parallel."
-            )
-        if self.moe_backend == "mega" and self.moe_all2all_backend == "rccl":
-            raise ValueError(
-                "moe_backend='mega' owns its MoRI transport and cannot use the "
-                "experimental RCCL prepare/finalize backend"
-            )
+
+        self._init_moe_backend()
 
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
@@ -2451,6 +2602,19 @@ class Config:
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
+        if hasattr(self, "kv_transfer_config") and isinstance(
+            self.kv_transfer_config, str
+        ):
+            import json
+
+            try:
+                self.kv_transfer_config = json.loads(self.kv_transfer_config)
+            except json.JSONDecodeError:
+                import ast
+
+                self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        if self.sequence_parallel_size > 1:
+            self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:
@@ -2546,17 +2710,6 @@ class Config:
             else torch.bfloat16
         )
 
-        if hasattr(self, "kv_transfer_config") and isinstance(
-            self.kv_transfer_config, str
-        ):
-            import json
-
-            try:
-                self.kv_transfer_config = json.loads(self.kv_transfer_config)
-            except json.JSONDecodeError:
-                import ast
-
-                self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
         # After the parse above: the P/D clause reads `kv_role` off
         # `kv_transfer_config`, which arrives from the CLI as a string.
         self._resolve_throughput_step_interval()
@@ -2578,6 +2731,7 @@ class Config:
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
         self._resolve_dynamic_chunking()
+        self._check_pp_support()
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
@@ -2782,12 +2936,90 @@ class Config:
 
             validate_runtime_config(self)
 
+        self._resolve_index_cache_layout()
+
         if is_deepseek_v4:
             from atom.model_ops.attentions.deepseek_v4_replay import (
                 state_replay_tokens,
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+    def _resolve_index_cache_layout(self) -> None:
+        self.index_cache_layout = None
+        if self.index_cache_dtype != "fp4":
+            return
+        is_v41 = self.hf_config.model_type == "deepseek_v41_text"
+        arches = getattr(self.hf_config, "architectures", None) or []
+        is_v4 = any(
+            str(a).startswith(("DeepseekV4For", "DeepseekV4MTP", "DeepseekV4DSpark"))
+            for a in arches
+        )
+        if not (is_v4 or is_v41):
+            return
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        arch = get_gfx_runtime()
+        if is_v4 and arch == "gfx942":
+            # The V4 runtime falls back to FP8 on gfx942, even for explicit FP4.
+            return
+        if is_v41:
+            from atom.model_ops.deepseek_v41.index_plane import (
+                fp4_index_layout_for_arch as layout_for_arch,
+            )
+        else:
+            from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+                fp4_indexer_layout_for_arch as layout_for_arch,
+            )
+        self.index_cache_layout = layout_for_arch(
+            arch, backend=envs.ATOM_V4_UNIFIED_MQA
+        )
+
+    def _check_pp_support(self) -> None:
+        """Refuse what PP does not wire yet: TBO, P/D consumers, and speculation
+        an architecture does not declare in ``pp_speculative_methods`` (a P/D
+        producer does not speculate); anything else fails mid-serving or drafts
+        from zero buffers.
+        """
+        if self.pipeline_parallel_size <= 1:
+            return
+        # UBatchWrapper.forward takes no intermediate_tensors.
+        if self.enable_tbo:
+            raise ValueError(
+                "TBO (enable_tbo) is not supported with pipeline_parallel_size > 1."
+            )
+        from atom.kv_transfer.disaggregation.pd_producer import (
+            disaggregated_kv_role,
+        )
+
+        # A consumer's first decode leaves T0 plus mtp_k placeholders, not the
+        # mtp_k + 1 the PP verify window assumes, and the PP loop has no
+        # remote-KV path at all.
+        role = disaggregated_kv_role(self)
+        if role == "kv_consumer":
+            raise ValueError(
+                "A P/D kv_consumer is not supported with pipeline_parallel_size > 1."
+            )
+        # A producer never speculates; it loads the drafter only to write the
+        # draft layer's KV.
+        if self.speculative_config is None or role == "kv_producer":
+            return
+        from atom.models.registry import pp_speculative_methods
+
+        archs = getattr(self.hf_config, "architectures", None) or ()
+        spec = self.speculative_config
+        method = "dspark" if spec.use_dspark() else spec.method
+        if not any(method in pp_speculative_methods.get(a, ()) for a in archs):
+            raise ValueError(
+                "pipeline_parallel_size > 1 with speculative decoding supports "
+                "only the methods registry.pp_speculative_methods declares, got "
+                f"architectures={list(archs)}, method={method!r}."
+            )
+        if self.dspark.confidence_schedule:
+            raise ValueError(
+                "The DSpark confidence scheduler (confidence_schedule) is not "
+                "supported with pipeline_parallel_size > 1."
+            )
 
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.
@@ -2866,6 +3098,9 @@ class Config:
         # runtime — the same stale-artifact hazard documented for the vocab-embed
         # flag below.
         factors.append(self.prefill_context_parallel_size)
+        if self.sequence_parallel_size > 1:
+            # SP and PCP use the same rank dimension but different head shapes.
+            factors.append(("sp", self.sequence_parallel_size))
         # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
         # is this rank's one head under TP and all `sparse_num_index_heads` of
         # them under CP (minimax_m3/model.py, linear.py), so the traced graph and the
@@ -2886,6 +3121,10 @@ class Config:
         # graphs (early + late layers) instead of one; both compile under the
         # `backbone` tag, so the flag must key the artifacts.
         factors.append(getattr(self, "enable_decoder_swa_bounded_replay", True))
+        # The resolved layout changes traced Q-scale shapes and compressor
+        # writes in both V4 and V4.1. Hash the same snapshot their caches use.
+        if self.index_cache_layout is not None:
+            factors.append(("index_cache_layout", self.index_cache_layout))
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (
@@ -2927,6 +3166,20 @@ class Config:
         # faults on the first decode past the old width.
         factors.append(self.max_model_len)
         factors.append(self.max_num_seqs)
+        # Buffers allocated once at max_num_batched_tokens rows reach the graph
+        # as fixed-shape inputs, and the compiled artifact checks them with
+        # assert_size_stride. A restart that only changes
+        # --max-num-batched-tokens would otherwise load the old artifact and
+        # fail that check on the first forward.
+        #
+        # attn_prefill_chunk_size and kv_cache_block_size stay out on purpose:
+        # they size attention-metadata workspaces and KV pages that are only
+        # read inside the attention ops the graph is split on, never traced.
+        factors.append(self.max_num_batched_tokens)
+        # The KV cache dtype is read as a Python constant by traced model code
+        # (DeepSeek-V4's `kv_fp8` branches, the DSpark drafter's fp8 plan), so a
+        # bf16 <-> fp8 restart traces a different graph.
+        factors.append(self.kv_cache_dtype)
         # The drafter graph bakes its draft width in as a constant (DSpark traces
         # `[bs, num_draft]`), so a run that only changes --num-speculative-tokens
         # would otherwise load the other width's artifact: draft 6 over a draft 3

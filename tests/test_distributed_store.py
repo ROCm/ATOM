@@ -31,7 +31,11 @@ def manager(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     manager = CoreManager.__new__(CoreManager)
     manager._init_shared_state(
-        SimpleNamespace(dp_load_balance="round_robin"),
+        SimpleNamespace(
+            dp_load_balance="round_robin",
+            keep_finished_outputs=False,
+            asyncio_mode=False,
+        ),
         label="test",
         local_engine_count=0,
     )
@@ -183,9 +187,11 @@ def _model_runner_worker(pc, layout, global_rank):
     config = SimpleNamespace(
         parallel_config=pc,
         tensor_parallel_size=tp,
+        sequence_parallel_size=1,
         tp_world_size=tp,
         pipeline_parallel_size=pp,
         prefill_context_parallel_size=pcp,
+        pcp_group_size=pcp,
         decode_context_parallel_size=dcp,
         master_addr="127.0.0.1",
         port=0,

@@ -50,6 +50,7 @@ from atom.model_ops.attention_mla import (
     MLAAttention,
     mla_dcp_kernel_num_heads,
     mla_dcp_sparse_prefill_num_heads,
+    mla_kernel_num_heads,
 )
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     HEADS as HEAD_GROUP_HEADS,
@@ -465,7 +466,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         config = model_runner.config
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
-        self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
+        # Must equal `MLAAttention.padded_num_heads`: that pads the query, this
+        # sizes the kernel's work descriptors for it.
+        self.padded_num_attention_heads = mla_kernel_num_heads(
+            max(self.num_attention_heads, _MLA_MIN_HEADS)
+        )
         self.is_sparse = model_runner.has_mla_indexer
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
         # GLM-5.3's pooled indexer selects `index_topk // index_kpool` POOLS --
@@ -1076,6 +1081,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "sparse_mtp_reduce_indptr": reduce_indptr,
             "sparse_mtp_reduce_final_map": reduce_final_map,
             "sparse_mtp_reduce_partial_map": reduce_partial_map,
+            # Rows the plan addresses; every consumer's q / o must hold at
+            # least this many. MLAAttention._forward_decode asserts it without
+            # DCP, on eager steps and at capture (a host check: not on replay).
+            "sparse_mtp_num_tokens": num_tokens,
         }
 
     def set_mla_persistent_worker_buffers(
@@ -2873,12 +2882,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables
         if not batch.is_dummy_run and max_seqlen_q > 1:
-            # Get num_rejected (already mapped to current batch order in prepare_input_ids)
-            num_rejected = self.model_runner.tokenID_processor.num_rejected
-            if num_rejected is not None:
-                context_lens -= num_rejected
-                num_blocks = cdiv(context_lens, self.model_runner.block_size)
-                block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
+            # Already in current batch order (prepare_input_ids).
+            context_lens = self.model_runner.tokenID_processor.verify_ctx_lens(
+                context_lens
+            )
+            num_blocks = cdiv(context_lens, self.model_runner.block_size)
+            block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
         positions = decode_positions(context_lens, max_seqlen_q)
 
         # Before the slots, not after: `slot_mapping` reads this packed table.
@@ -2968,7 +2977,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 )
                 for i, (ctx_len, is_first) in enumerate(
                     zip(
-                        batch.context_lens,
+                        context_lens,
                         batch.is_first_decode_without_local_prefill,
                     )
                 )
@@ -3098,8 +3107,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
                 running_bs, max_seqlen_q
             )
+            # Plan the sparse per-token work over the REAL tokens only, as the
+            # cprr branch below does for its requests. This plan is not the
+            # target's alone: the MTP drafter's step 0 runs the target's token
+            # stream through its own sparse MLA layer reusing this metadata,
+            # and that stream is NOT padded (eagle_proposer: "Step 0 carries
+            # the target's stream and pads nothing"), so its q and o hold
+            # scheduled_tokens rows. The persistent kernel reads q and writes o
+            # for every work item, zero-KV padding included, so a plan over
+            # running_tokens reads q and writes o past their ends whenever the
+            # batch was padded: silent corruption, or a GPU memory fault when
+            # the next page is unmapped (gfx1250 FlyDSL PS1, LLM-Booster #287).
+            # The target itself runs padded q/o, and the kernel is
+            # work_indptr-driven, so its padded rows are simply left unplanned.
             ctx_mla_ps_sparse = self._set_mla_persistent_worker_buffers_sparse_mtp(
-                running_tokens
+                scheduled_tokens
             )
         else:
             # DCP + MTP (max_q_len>1) needs the round-robin global-position causal

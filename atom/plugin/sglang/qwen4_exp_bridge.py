@@ -26,6 +26,7 @@ import logging
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import torch
 
 from atom.model_ops.attentions.qwen4_exp_attn import (
@@ -37,7 +38,7 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
@@ -1200,6 +1201,16 @@ def build_qsa_metadata(
 
     compressed = torch.empty_like(slot_mapping)
     _compressed_slots_native(slot_mapping, logical, compress_ratio, compressed)
+    host_lens = context_slots = None
+    # Only eager unpacked extends reach here (packed draft steps returned
+    # above), so this covers the target prefill and the drafter's prefill
+    # extend over the same tokens.
+    if not packed_step and _flydsl_layout_needed(
+        forward_batch, atom_config, compress_ratio, indexer_budget
+    ):
+        host_lens, context_slots = _flydsl_prefill_layout(
+            forward_batch, live_bs, num_tokens, block_tables, block_size
+        )
     qsa = Qwen4ExpQSAMetadata(
         block_tables=block_tables,
         slot_mapping=slot_mapping,
@@ -1208,8 +1219,100 @@ def build_qsa_metadata(
         logical_positions=logical,
         seq_lens=seq_lens,
         max_seq_len=max(max_seq_len, 1),
+        host_lens=host_lens,
+        context_slots=context_slots,
     )
     return qsa
+
+
+def _flydsl_layout_needed(
+    forward_batch: Any, atom_config: Any, compress_ratio: int, indexer_budget: int
+) -> bool:
+    """Whether this forward's QSA layers can take the FlyDSL attention, so
+    its host layout is worth building: `qsa_attention.flydsl_fallback_reason`,
+    the predicate the layer's fallback uses, on the per-rank head shape of
+    this model's config and the KV dtype of the pool the QSA caches are bound
+    from. An FP8 SGLang KV pool binds no scale planes, so the layer cannot
+    detect it; a pool whose dtype cannot be read keeps the native kernel. With
+    the flag on, each reason is logged once."""
+    if not envs.ATOM_QSA_FLYDSL_ATTN:
+        return False  # flag off: keep the bridge free of the layer module
+    from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+
+    from atom.model_ops.qwen4_exp import qsa_attention
+
+    hf = _hf_text_config(atom_config)
+    num_heads, num_kv_heads = qsa_attention.qsa_rank_heads(
+        int(hf.num_attention_heads),
+        int(hf.num_key_value_heads),
+        get_tensor_model_parallel_world_size(),
+    )
+    kv_dtype = getattr(_token_to_kv_pool(forward_batch), "dtype", None)
+    reason = qsa_attention.flydsl_fallback_reason(
+        compress_ratio,
+        indexer_budget,
+        num_heads,
+        num_kv_heads,
+        int(hf.head_dim),
+        kv_bf16=kv_dtype == torch.bfloat16,
+    )
+    if reason is not None:
+        qsa_attention.log_flydsl_fallback(reason)
+        return False
+    return True
+
+
+def _token_to_kv_pool(forward_batch: Any) -> Any:
+    """The SGLang KV pool the QSA K/V caches are bound from."""
+    pool = getattr(forward_batch, "token_to_kv_pool", None)
+    if pool is None:
+        backend = resolve_attn_backend(forward_batch)
+        pool = getattr(backend, "token_to_kv_pool", None) or getattr(
+            getattr(backend, "full_attn_backend", None), "token_to_kv_pool", None
+        )
+    return pool
+
+
+def _flydsl_prefill_layout(
+    forward_batch: Any,
+    live_bs: int,
+    num_tokens: int,
+    block_tables: torch.Tensor,
+    block_size: int,
+) -> tuple[tuple | None, torch.Tensor | None]:
+    """Host lengths for FlyDSL QSA attention, plus context rows when prefixed.
+
+    Returns (None, None) unless the packed tokens are exactly the scheduled
+    extends, so padded or partial batches keep the native kernel.
+    """
+    extends = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    seqs = getattr(forward_batch, "seq_lens_cpu", None)
+    if extends is None or seqs is None:
+        return None, None
+    extends = tuple(int(n) for n in list(extends)[:live_bs])
+    seqs = tuple(int(n) for n in list(seqs)[:live_bs])
+    if (
+        len(extends) != live_bs
+        or len(seqs) != live_bs
+        or sum(extends) != num_tokens
+        or any(e < 0 or s < e for e, s in zip(extends, seqs))
+    ):
+        return None, None
+    if all(s == e for e, s in zip(extends, seqs)):
+        return (extends, seqs), None
+    # Built on the device from the per-request lengths (a few bytes up):
+    # host-side index arrays would be MBs per prefixed forward.
+    device = block_tables.device
+    lengths = upload_numpy(np.asarray(seqs, dtype=np.int64), device)
+    total = sum(seqs)
+    requests = torch.repeat_interleave(
+        torch.arange(live_bs, device=device), lengths, output_size=total
+    )
+    tokens = torch.arange(total, device=device) - torch.repeat_interleave(
+        torch.cumsum(lengths, 0) - lengths, lengths, output_size=total
+    )
+    pages = block_tables[requests, tokens // block_size].to(torch.int64)
+    return (extends, seqs), pages * block_size + tokens % block_size
 
 
 def _mamba_physical_slots(pool: Any) -> int:
@@ -1534,12 +1637,7 @@ def bind_qsa_caches(model: Any, forward_batch: Any, atom_config: Any) -> None:
     if not qsa_layers:
         return
 
-    pool = getattr(forward_batch, "token_to_kv_pool", None)
-    if pool is None:
-        backend = resolve_attn_backend(forward_batch)
-        pool = getattr(backend, "token_to_kv_pool", None) or getattr(
-            getattr(backend, "full_attn_backend", None), "token_to_kv_pool", None
-        )
+    pool = _token_to_kv_pool(forward_batch)
     block_size = _block_size(forward_batch, atom_config)
     compress_ratio = _compress_ratio(atom_config)
     hf = _hf_text_config(atom_config)

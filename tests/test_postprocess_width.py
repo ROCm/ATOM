@@ -28,12 +28,24 @@ mod = pytest.importorskip(
 )
 
 
-def _batch(seqs):
+def _batch(seqs, mask=None):
+    from atom.model_engine.token_logprobs import LogprobRows, host_logprob_rows
+
+    mask = [False] * seqs if mask is None else mask
+    requested = tuple(i for i, enabled in enumerate(mask) if enabled)
+    rows = (
+        LogprobRows(*(torch.from_numpy(part) for part in host_logprob_rows(requested)))
+        if requested
+        else None
+    )
     return types.SimpleNamespace(
         total_seqs_num=seqs,
         total_tokens_num=seqs,
         req_ids=list(range(seqs)),
-        return_logprobs=[False] * seqs,
+        return_logprobs=mask,
+        any_logprobs=any(mask),
+        logprob_requested=requested,
+        logprob_rows=rows,
         required_channel=None,
     )
 
@@ -41,6 +53,7 @@ def _batch(seqs):
 def _runner(seen):
     """A ModelRunner carrying only what the no-spec branch of postprocess reads."""
     runner = object.__new__(mod.ModelRunner)
+    runner.rank = 0
 
     def _sampler(logits, temperatures, top_ks, top_ps, all_greedy, **kw):
         seen["logits_rows"] = logits.shape[0]
@@ -138,8 +151,7 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
     )
 
     scheduled_bs, running_bs = 3, 4
-    batch = _batch(scheduled_bs)
-    batch.return_logprobs = [True] * scheduled_bs
+    batch = _batch(scheduled_bs, [True] * scheduled_bs)
     captured = {}
     runner = _runner(seen)
     runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp, **_: (
@@ -156,10 +168,90 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
         hidden_states=None,
     )
 
-    assert captured["logprobs"].shape == (scheduled_bs,)
+    assert seen["logits_rows"] == seen["temperature_rows"] == scheduled_bs
+    values, candidates, ranks = _payload_tensors(captured["logprobs"])
+    assert values.shape == (scheduled_bs, 1, 1)
+    assert candidates.shape == (scheduled_bs, 1, 0)
+    assert ranks.shape == (scheduled_bs, 1)
+    torch.testing.assert_close(
+        values.flatten(), torch.full((scheduled_bs,), -__import__("math").log(8))
+    )
 
 
-def test_a_masked_row_still_reports_the_models_logprob(monkeypatch):
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("top_k", [0, 2])
+def test_deferred_tp_broadcasts_complete_probability_payload(
+    monkeypatch, rank, deferred, enabled, top_k
+):
+    monkeypatch.setattr(
+        mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(spec_decode_metadata=None),
+    )
+    monkeypatch.setattr(mod, "get_pcp_world_size", lambda: 1)
+    broadcasts = []
+
+    def broadcast(tensor, src):
+        # Distinct received values prove output uses the broadcast result.
+        received = tensor.clone()
+        if tensor.ndim >= 2:
+            received[..., 0] += 10
+            received[..., -1:].view(torch.int32).add_(100)
+        broadcasts.append((tensor, received, src))
+        return received
+
+    monkeypatch.setattr(
+        mod,
+        "get_tp_group",
+        lambda: types.SimpleNamespace(world_size=2, broadcast=broadcast),
+    )
+    batch = _batch(2, [False, enabled])
+    batch.top_logprobs = [0, top_k]
+    runner = _runner({})
+    runner.rank = rank
+    runner.tokenID_processor.is_deferred_out = deferred
+    captured = {}
+
+    class Transferred(Exception):
+        pass
+
+    def transfer(batch, ids, event, payload, **kwargs):
+        captured["payload"] = payload
+        raise Transferred
+
+    runner.tokenID_processor.prepare_sampled_ids = transfer
+    with pytest.raises(Transferred):
+        runner.postprocess(
+            batch, torch.zeros(2, 8), torch.ones(2), None, None, False, None
+        )
+    probability_calls = [entry for entry in broadcasts if entry[0].ndim >= 2]
+    if not enabled:
+        assert captured["payload"] is None
+        assert not probability_calls
+    elif not deferred:
+        assert captured["payload"] is not None
+        assert not probability_calls
+    else:
+        assert len(probability_calls) == 1
+        payload = captured["payload"]
+        for tensor, received, source in probability_calls:
+            assert source == 0
+            assert received is payload
+        values, candidates, ranks = _payload_tensors(payload)
+        assert values.shape == (1, 1, top_k + 1)
+        assert candidates.shape == (1, 1, top_k)
+        assert ranks.shape == (1, 1)
+        assert ranks.item() == 101
+
+
+@pytest.mark.parametrize(
+    "with_schema,with_channel", [(False, True), (True, False), (True, True)]
+)
+def test_a_masked_row_still_reports_the_models_logprob(
+    monkeypatch, with_schema, with_channel
+):
     """A required channel masks the logits in place. The logprob a client asked
     for is the model's own, as on every other request, not the forced row's
     0.0."""
@@ -171,14 +263,28 @@ def test_a_masked_row_still_reports_the_models_logprob(monkeypatch):
     monkeypatch.setattr(
         mod, "get_tp_group", lambda: types.SimpleNamespace(world_size=1)
     )
-    batch = _batch(2)
-    batch.return_logprobs = [True, True]
-    batch.required_channel = object()
+    batch = _batch(2, [True, True])
+    batch.required_channel = object() if with_channel else None
+    batch.top_logprobs = [3, 3]
     captured = {}
     runner = _runner({})
 
+    if with_schema:
+        # A batch may contain both schema and required-channel requests.
+        # The second mask must reuse the snapshot from before the first mask.
+        batch.structured_requests = {1: ("schema", (), ())}
+
+        def mask_schema_rows(logits, *_):
+            logits[1, 4:] = float("-inf")
+            return {}
+
+        runner.structured_output = types.SimpleNamespace(
+            vocab_size=8, apply=mask_schema_rows, errors={}
+        )
+
     def force_column_zero(_batch, logits, *_args):
-        logits[:, 1:] = float("-inf")  # the sampler's `_runner` samples id 0
+        if with_channel:
+            logits[:, 1:] = float("-inf")  # the sampler samples id 0
 
     runner._constrain_required_channel = force_column_zero
     runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp, **_: (
@@ -197,7 +303,12 @@ def test_a_masked_row_still_reports_the_models_logprob(monkeypatch):
         hidden_states=None,
     )
 
-    torch.testing.assert_close(captured["logprobs"], expected)
+    values, candidates, ranks = _payload_tensors(captured["logprobs"])
+    torch.testing.assert_close(values[:, 0, 0], expected)
+    expected_top, expected_ids = torch.topk(torch.log_softmax(logits, dim=-1), 3)
+    torch.testing.assert_close(values[:, 0, 1:], expected_top)
+    torch.testing.assert_close(candidates[:, 0].long(), expected_ids)
+    torch.testing.assert_close(ranks[:, 0].long(), (logits > logits[:, :1]).sum(-1) + 1)
 
 
 def test_prefill_really_does_run_wider_than_it_scheduled():
@@ -223,3 +334,12 @@ def test_prefill_really_does_run_wider_than_it_scheduled():
     )
 
     assert (mode.scheduled_bs, mode.running_bs) == (3, 4)
+
+
+def _payload_tensors(payload):
+    k = (payload.shape[-1] - 2) // 2
+    return (
+        payload[..., : k + 1],
+        payload[..., k + 1 : 2 * k + 1].view(torch.int32),
+        payload[..., -1].view(torch.int32),
+    )

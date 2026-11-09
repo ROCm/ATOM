@@ -3,10 +3,12 @@
 import ast
 import importlib.util
 import sys
+from copy import copy
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch
 from transformers import PretrainedConfig
 
 import atom.config as config_module
@@ -36,6 +38,7 @@ def _install_chip_info_stub(monkeypatch, get_gfx) -> None:
     utils.__path__ = []
     chip_info = ModuleType("aiter.jit.utils.chip_info")
     chip_info.get_gfx = get_gfx
+    chip_info.get_gfx_runtime = get_gfx
 
     aiter.jit = jit
     jit.utils = utils
@@ -121,6 +124,7 @@ def _make_config(
         compilation_config=CompilationConfig(level=0, use_cudagraph=False),
         **overrides,
     )
+    config.quant_config = None
     return config, probe
 
 
@@ -130,7 +134,7 @@ def test_native_v4_defaults_indexer_to_fp4(monkeypatch, gfx):
 
     assert config.index_cache_dtype == "fp4"
     assert config.kv_cache_block_size == 256
-    assert probe.calls == 1
+    assert probe.calls == 2
 
 
 def test_native_v4_defaults_indexer_to_fp8_on_gfx942(monkeypatch):
@@ -167,7 +171,7 @@ def test_v4_preserves_explicit_indexer_dtype(monkeypatch, requested, gfx):
     )
 
     assert config.index_cache_dtype == requested
-    assert probe.calls == 0
+    assert probe.calls == int(requested == "fp4")
 
 
 def test_non_v4_indexer_defaults_to_kv_cache_dtype(monkeypatch):
@@ -178,6 +182,46 @@ def test_non_v4_indexer_defaults_to_kv_cache_dtype(monkeypatch):
 
     assert config.index_cache_dtype == config.kv_cache_dtype == "fp8"
     assert probe.calls == 0
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["DeepseekV4ForCausalLM", "DeepseekV4MTPModel", "DeepseekV4DSparkModel"],
+)
+@pytest.mark.parametrize("gfx", ["gfx950", "gfx1250"])
+@pytest.mark.parametrize("backend", ["opus", "flydsl"])
+def test_v4_layout_snapshot_keys_page_and_compile_caches(
+    monkeypatch, architecture, gfx, backend
+):
+    from atom.kv_transfer.offload.config import build_page_namespace
+
+    monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", backend)
+    config, _ = _make_config(
+        monkeypatch, gfx=gfx, architectures=[architecture], index_cache_dtype="fp4"
+    )
+    expected = (
+        "fp4-gfx1250-natural"
+        if gfx == "gfx1250"
+        else "fp4-gfx950-opus" if backend == "opus" else "fp4-gfx950-preshuffle"
+    )
+    assert config.index_cache_layout == expected
+    offload = SimpleNamespace(chunk_size=8192)
+    namespace = build_page_namespace(config, offload, 4)
+    compile_hash = config.compute_hash()
+    # Old persisted FP4 pages did not identify their physical layout.
+    legacy = copy(config)
+    legacy.index_cache_layout = None
+    assert build_page_namespace(legacy, offload, 4) != namespace
+
+    monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", "flydsl" if backend == "opus" else "opus")
+    assert build_page_namespace(config, offload, 4) == namespace
+    assert config.compute_hash() == compile_hash
+    other, _ = _make_config(
+        monkeypatch, gfx=gfx, architectures=[architecture], index_cache_dtype="fp4"
+    )
+    same_layout = gfx == "gfx1250"
+    assert (build_page_namespace(other, offload, 4) == namespace) is same_layout
+    assert (other.compute_hash() == compile_hash) is same_layout
 
 
 @pytest.mark.parametrize(
@@ -200,3 +244,81 @@ def test_non_fp4_indexer_predicate_does_not_query_arch(monkeypatch):
 
     assert not v4_kernels.fp4_indexer_enabled("fp8")
     assert probe.calls == 0
+
+
+@pytest.mark.parametrize(
+    "gfx,backend,dtype,expected",
+    [
+        ("gfx950", "flydsl", "fp4", "fp4_gfx950_flydsl"),
+        ("gfx950", "opus", "fp4", "fp4_gfx950_opus"),
+        ("gfx1250", "opus", "fp4", "fp4"),
+        ("gfx950", "flydsl", "fp8", "fp8_per_row"),
+        ("gfx950", "opus", "fp8", "fp8_per_row"),
+        ("gfx942", "flydsl", "fp4", "fp8_per_row"),
+    ],
+)
+def test_indexer_initializes_compressor_writer_layout(
+    monkeypatch, gfx, backend, dtype, expected
+):
+    """Plugins and graph tracing need the writer mode before cache binding."""
+    from atom.model_ops.attentions.pool_layout import v4_pool_fields
+
+    v4_kernels, _ = _load_v4_kernels(monkeypatch, gfx)
+    config = SimpleNamespace(
+        max_model_len=64,
+        index_cache_dtype=dtype,
+        index_cache_layout=v4_pool_fields.fp4_indexer_layout_for_arch(
+            gfx, backend=backend
+        ),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    path = _V4_KERNELS_INIT.parents[2] / "models/deepseek_v4/__init__.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    indexer = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Indexer"
+    )
+    # Run the actual constructor, isolating projections and unrelated GPU
+    # forward methods so this regression also runs in CPU-only CI.
+    indexer.body = [
+        node
+        for node in indexer.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    ]
+    namespace = dict(
+        vars(v4_pool_fields),
+        nn=torch.nn,
+        torch=torch,
+        DeepseekV4Args=SimpleNamespace,
+        ReplicatedLinear=lambda *args, **kwargs: torch.nn.Identity(),
+        Compressor=lambda *args, **kwargs: SimpleNamespace(),
+        get_current_atom_config=lambda: config,
+        fp4_indexer_enabled=v4_kernels.fp4_indexer_enabled,
+        get_gfx_runtime=lambda: gfx,
+        # A later environment change must not reinterpret the allocated cache.
+        envs=SimpleNamespace(
+            ATOM_V4_UNIFIED_MQA="flydsl" if backend == "opus" else "opus"
+        ),
+        NATURAL="natural",
+        MFMA="mfma",
+        PRESHUFFLE="preshuffle",
+    )
+    exec(  # noqa: S102 -- execute only the checked-in constructor AST
+        compile(ast.Module(body=[indexer], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    args = SimpleNamespace(
+        dim=16,
+        index_n_heads=64,
+        index_head_dim=128,
+        rope_head_dim=64,
+        index_topk=16,
+        q_lora_rank=8,
+        quant_config=None,
+    )
+    module = namespace["Indexer"](args, prefix="layers.0.attn.indexer")
+
+    assert module.quant_mode == expected
+    assert module.compressor.quant_mode == expected
+    assert config.compilation_config.static_forward_context[module.prefix] is module

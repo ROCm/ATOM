@@ -66,6 +66,18 @@ def test_variant_selection_is_config_only():
     assert select_variant(_config(compress_ratios=None, layout="page_slot")) == "hybrid"
 
 
+def test_shells_refuse_deepseek_v41(monkeypatch):
+    """V4.1 is MP-only: the dense codec would restore KV over a window ring
+    it does not carry."""
+    from atom.kv_transfer.offload import connector as shell
+
+    monkeypatch.setattr(shell, "select_offload_layout", lambda _config: "dsv41")
+    with pytest.raises(ValueError, match="lmcache_mp"):
+        LMCacheOffloadConnector(_config())
+    with pytest.raises(ValueError, match="lmcache_mp"):
+        LMCacheOffloadConnectorScheduler(_config())
+
+
 def test_worker_shell_selects_family():
     hybrid = LMCacheOffloadConnector(_config(compress_ratios=[4]))
     dense = LMCacheOffloadConnector(_config(compress_ratios=None))
