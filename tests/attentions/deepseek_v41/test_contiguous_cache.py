@@ -101,6 +101,81 @@ def test_prefill_staging_grows_at_step_boundary_and_skips_decode(dtype):
         )
 
 
+@pytest.mark.parametrize("dtype", ["fp4", "fp8"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("slack", [0, 3])
+def test_published_decoder_tail_reuses_reserved_staging(
+    dtype, device, slack, monkeypatch
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
+    from tests.attentions.deepseek_v41.helpers import decoder_publisher
+
+    geo = geometry(dtype, slack)
+    reserved = torch.empty(
+        (2 * geo.ring_slots + 16) * geo.window_row_bytes,
+        dtype=torch.uint8,
+        device=device,
+    )
+    cache = PagedAttentionCache(
+        geo, 7, 4, device, max_tokens=16, prefill_window_staging=reserved
+    )
+    publish = decoder_publisher(cache, 2, 16, 1, device)
+    for requests in (2, 1, 0, 2):
+        rows = [[b] for b in range(requests)]
+        step = cache.begin_step(
+            tuple(RequestSpan(b, 8, b * 8, 8, b) for b in range(requests)),
+            block_tables=rows,
+            is_prefill=True,
+        )
+        step.request_finals[:] = True
+        tail = publish(step, rows).decoder.tail
+        assert not tail.decode
+        assert tail.prefill_window_staging is reserved
+        tail.begin_forward()
+        assert tail.prefill_window_staging is reserved
+        for layer in range(3):
+            history = cache.ring_view(layer)
+            for i, plane in enumerate(history):
+                plane.fill_(layer * 10 + i + 1)
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    torch,
+                    "empty",
+                    lambda *a, **k: pytest.fail("decoder tail allocated staging"),
+                )
+                source, current = prefill_window(history, tail, geo.ring_slots)
+            assert all(
+                p.untyped_storage().data_ptr() == reserved.data_ptr()
+                for p in (*source, *current)
+            )
+            for i, plane in enumerate(source):
+                assert (plane[: requests * geo.ring_slots] == layer * 10 + i + 1).all()
+
+    if device == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    torch,
+                    "empty",
+                    lambda *a, **k: pytest.fail("capture allocated staging"),
+                )
+                for layer in range(3):
+                    source, _ = prefill_window(
+                        cache.ring_view(layer), tail, geo.ring_slots
+                    )
+        for value in (41, 73):
+            for plane in cache.ring_view(2):
+                plane.fill_(value)
+            graph.replay()
+            assert all(
+                p.untyped_storage().data_ptr() == reserved.data_ptr() for p in source
+            )
+            assert all((p[: 2 * geo.ring_slots] == value).all() for p in source)
+
+
 @pytest.mark.parametrize("dtype", ["bf16", "fp4", "fp8"])
 @pytest.mark.parametrize("index_fp4", [False, True])
 def test_capture_validator_checks_real_index_allocations(dtype, index_fp4):

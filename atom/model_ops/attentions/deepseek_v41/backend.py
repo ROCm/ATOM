@@ -894,6 +894,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
         tail.request_floors = tail.request_positions.astype(np.int32)
         tail.request_cached_until = np.zeros(len(spans), np.int32)
+        # This tail runs prefill attention, but bypasses cache.begin_step().
+        # Bind the same reserved source before eager execution or graph capture.
+        cache._reserve_prefill_window(tail)
         cache.publish_replay_layout(tail, running_bs, floors=floors)
         return ReplayPlan(
             tail=tail,
