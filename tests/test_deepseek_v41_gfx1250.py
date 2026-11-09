@@ -304,6 +304,14 @@ def test_a_step_with_fewer_rows_than_6_a_request_is_not_served(served):
     assert m._single.runner.steps == 0
 
 
+def test_a_padded_step_is_not_served(served):
+    m, _ = served
+    # 7 requests (42 input rows) in a 48-row padded step: the launch reads 6 rows a request of input_ids
+    assert m.step_override(torch.zeros(48), 7, 48, _batch(total_seqs_num=7)) is None
+    assert m.step_override(torch.zeros(42), 8, 48, _batch()) is None
+    assert m._single.runner.steps == 0
+
+
 def test_a_production_step_drafts_from_the_drafter(served):
     m, drafter = served
     runner = m._single.runner
