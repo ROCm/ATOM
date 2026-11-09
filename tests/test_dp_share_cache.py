@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Unit tests for `--dp-load-balance share_cache` (atom/model_engine/store_aware.py)
+# Unit tests for `--dp-load-balance share_cache` (atom/model_engine/share_cache.py)
 # and its CoreManager bookkeeping (rank-reported prefill backlog).
 
 import os
@@ -8,7 +8,7 @@ from threading import Lock
 from types import SimpleNamespace
 
 from atom.model_engine.engine_core_mgr import DP_LB_STRATEGIES, CoreManager
-from atom.model_engine.store_aware import StoreAwareRouter
+from atom.model_engine.share_cache import ShareCacheRouter
 
 HBS = 16
 
@@ -39,14 +39,14 @@ def test_strategy_is_registered():
 
 
 def test_cold_prompt_goes_to_least_backlog():
-    router = StoreAwareRouter(min_load_tokens=512, req_equiv=512)
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
     route, cost = _route(router, _seq(1, PREFIX), [9_000, 0], [0, 0])
-    assert route.rank == 1 and route.decision == "store_cold_total"
+    assert route.rank == 1 and route.decision == "share_cache_cold_total"
     assert cost == len(PREFIX)
 
 
 def test_prefix_in_tier_is_credited_on_any_rank():
-    router = StoreAwareRouter(min_load_tokens=512, req_equiv=512)
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq(1, PREFIX), backlog, reqs)
     router.prefill_complete(1)
@@ -60,7 +60,7 @@ def test_prefix_in_tier_is_credited_on_any_rank():
 
 
 def test_prefix_still_prefilling_is_credited_only_on_its_rank():
-    router = StoreAwareRouter(min_load_tokens=512, req_equiv=512)
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq(1, PREFIX), backlog, reqs)
     other = 1 - first.rank
@@ -76,7 +76,7 @@ def test_prefix_still_prefilling_is_credited_only_on_its_rank():
 
 
 def test_unprefilled_producer_drops_its_entries():
-    router = StoreAwareRouter(min_load_tokens=512, req_equiv=512)
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
     backlog, reqs = [0, 0], [0, 0]
     _route(router, _seq(1, PREFIX), backlog, reqs)
     router.release(1)  # aborted before its prefill completed
@@ -183,7 +183,7 @@ def test_a_newcomer_does_not_take_a_prefix_from_an_owner_still_prefilling_it():
     """A prefills a system prompt on rank 0; B, same prompt, is placed on rank 1.
     A finishes, so the prefix is in the tier. B aborts before its first token:
     that must not make the prefix cold."""
-    router = StoreAwareRouter(min_load_tokens=512, req_equiv=512)
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
     backlog[first.rank] = 10_000_000  # B goes to the other rank for backlog
@@ -196,7 +196,7 @@ def test_a_newcomer_does_not_take_a_prefix_from_an_owner_still_prefilling_it():
 
 
 def test_the_newcomer_carries_the_entry_if_the_owner_leaves_unprefilled():
-    router = StoreAwareRouter(min_load_tokens=512, req_equiv=512)
+    router = ShareCacheRouter(min_load_tokens=512, req_equiv=512)
     backlog, reqs = [0, 0], [0, 0]
     first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
     backlog[first.rank] = 10_000_000

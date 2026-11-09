@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Store-aware DP routing (`--dp-load-balance share_cache`).
+"""Shared-cache DP routing (`--dp-load-balance share_cache`).
 
 With an offload tier every DP rank shares (Mooncake Store, one LMCache MP
 server), a prefix one rank computed can be loaded by any rank once its prefill
@@ -24,7 +24,7 @@ A prefix still being prefilled is reusable only on its producer's rank.
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Any, NamedTuple
+from typing import Any, ClassVar, NamedTuple
 
 # Offload connectors whose tier all DP ranks of one engine share.
 SHARED_TIER_CONNECTORS = frozenset({"mooncake_store", "lmcache_mp"})
@@ -35,13 +35,21 @@ class StoreRoute(NamedTuple):
     decision: str
 
 
-class StoreAwareRouter:
+class ShareCacheRouter:
     """Rank-agnostic prefix index and the work-based placement rule."""
 
     STRIDE_TOKENS = 1024
     CAP = 1 << 19
 
-    DECISIONS = ("store_hit_total", "store_source_rank_total", "store_cold_total")
+    # Routing decision counters and what each one counts; exported by
+    # `atom/metrics/exporter.py` as `atom:dp_<name without _total>`.
+    DECISIONS: ClassVar[dict[str, str]] = {
+        "share_cache_hit_total": "Requests placed on a prefix the shared tier holds.",
+        "share_cache_source_rank_total": (
+            "Requests placed on the rank still prefilling their prefix."
+        ),
+        "share_cache_cold_total": "Requests placed without a known prefix.",
+    }
 
     def __init__(self, min_load_tokens: int, req_equiv: int) -> None:
         self.min_load_tokens = int(min_load_tokens)
@@ -148,8 +156,10 @@ class StoreAwareRouter:
         self._est_hit[seq.id] = est
         self._record(chain, best, seq.id, reused=est)
         if hit and best == src_rank:
-            return StoreRoute(best, "store_source_rank_total")
-        return StoreRoute(best, "store_hit_total" if est else "store_cold_total")
+            return StoreRoute(best, "share_cache_source_rank_total")
+        return StoreRoute(
+            best, "share_cache_hit_total" if est else "share_cache_cold_total"
+        )
 
     # -- prefix index ----------------------------------------------------------
 
