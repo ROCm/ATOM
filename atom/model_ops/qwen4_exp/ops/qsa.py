@@ -23,11 +23,13 @@ Source provenance:
   without changing the other model's implementation.
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.topk import top_k_per_row_prefill
 
 from atom.model_ops.qwen4_exp.ops import qsa_flydsl_layout
@@ -335,6 +337,11 @@ def qsa_store_quantized_rows(
         GROUP=FP4_GROUP,
         num_warps=1,
     )
+
+
+@functools.lru_cache(maxsize=1)
+def _is_gfx1250() -> bool:
+    return get_gfx_runtime() == "gfx1250"
 
 
 def _prev_pow2(n: int) -> int:
@@ -2052,19 +2059,56 @@ def qsa_select_paged_tokens(
         row_starts = torch.empty(
             row_end - row_start, dtype=torch.int32, device=q.device
         )
-        logits, visible_groups = qsa_paged_mqa_logits(
-            q[row_slice],
-            compressed_k_cache,
-            page_table,
-            token_to_request[row_slice],
-            query_positions[row_slice],
-            context_lens,
-            compress_ratio,
-            max_columns=columns,
-            row_starts=row_starts,
-            allow_flydsl=allow_flydsl,
-            compressed_k_scale=compressed_k_scale,
+        q_chunk = q[row_slice]
+        token_to_request_chunk = token_to_request[row_slice]
+        query_positions_chunk = query_positions[row_slice]
+        use_gfx1250_scorer = (
+            envs.ATOM_QSA_GFX1250_SCORER
+            and not allow_flydsl
+            and compressed_k_scale is None
+            and _is_gfx1250()
+            and q_chunk.shape[0] == 4 * page_table.shape[0]
         )
+        if use_gfx1250_scorer:
+            from atom.model_ops.qwen4_exp.ops.qsa_select_gfx1250 import (
+                qsa_index_scores,
+                qsa_index_scores_supports,
+            )
+
+            use_gfx1250_scorer = qsa_index_scores_supports(
+                q_chunk, compressed_k_cache, page_table
+            )
+        if use_gfx1250_scorer:
+            visible_groups = torch.empty_like(row_starts)
+            logits = qsa_index_scores(
+                q_chunk,
+                compressed_k_cache,
+                page_table,
+                token_to_request_chunk,
+                query_positions_chunk,
+                context_lens,
+                compress_ratio,
+                columns,
+                q.shape[2] ** 0.5,
+                _table_width_bucket(page_table.shape[1]),
+                get_cu_num(),
+                visible_groups=visible_groups,
+                row_starts=row_starts,
+            )
+        else:
+            logits, visible_groups = qsa_paged_mqa_logits(
+                q_chunk,
+                compressed_k_cache,
+                page_table,
+                token_to_request_chunk,
+                query_positions_chunk,
+                context_lens,
+                compress_ratio,
+                max_columns=columns,
+                row_starts=row_starts,
+                allow_flydsl=allow_flydsl,
+                compressed_k_scale=compressed_k_scale,
+            )
         selected_groups = torch.empty(
             (row_end - row_start, block_topk), dtype=torch.int32, device=q.device
         )
@@ -2084,9 +2128,9 @@ def qsa_select_paged_tokens(
         )
         qsa_expand_block_indices(
             selected_groups,
-            query_positions[row_slice],
+            query_positions_chunk,
             context_lens,
-            token_to_request[row_slice],
+            token_to_request_chunk,
             compress_ratio,
             token_topk,
             out[row_slice],
@@ -2361,6 +2405,34 @@ def qsa_sparse_paged_gqa(
         raise ValueError("token_to_request must be contiguous int32/int64 [tokens]")
 
     scale = q.shape[2] ** -0.5 if softmax_scale is None else softmax_scale
+    if (
+        kv_splits is None
+        and q.shape[0] > 0
+        and logical_indices.shape[1] > 0
+        and logical_indices.stride(1) == 1
+        and block_table.stride(1) == 1
+        and envs.ATOM_QSA_GFX1250
+        and _is_gfx1250()
+    ):
+        from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import (
+            qsa_gfx1250_supports,
+            qsa_sparse_paged_gqa_gfx1250,
+        )
+
+        if qsa_gfx1250_supports(q, k_cache, v_cache, k_scale, v_scale):
+            return qsa_sparse_paged_gqa_gfx1250(
+                q,
+                k_cache,
+                v_cache,
+                logical_indices,
+                block_table,
+                token_to_request,
+                scale,
+                _table_width_bucket(block_table.shape[1]),
+                get_cu_num(),
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
     # Split-K reduction requires contiguous output head dimensions.
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     if q.shape[0] == 0:
