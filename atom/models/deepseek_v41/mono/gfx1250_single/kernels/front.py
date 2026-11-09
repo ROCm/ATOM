@@ -452,7 +452,7 @@ def front_E2(c):
         if l < TOPK:
             _stx(c["ids"] + i64(row * TOPK + l) * 4, sel)
             # the sum floored as aiter's topk_gating (RENORM_SUM_FLOOR 1e-20): six selected scores of exactly 0 (logits
-            # below ~-17: log(1 + exp(x)) rounds to 0) gave 0 x rcp(0) = NaN weights (CT16 11-09, the EOS-after NaN)
+            # below ~-17: log(1 + exp(x)) rounds to 0) gave 0 x rcp(0) = NaN weights
             _stx(c["wts"] + i64(row * TOPK + l) * 4, swv * frcp(fx.max(wsum, F32(1e-20))) * F32(1.5))
     if p == 1:
         # Sinkhorn, lane-parallel: CTA p=1, wave w = token w, lane e%16 = comb element (r = e/4, cc = e%4)

@@ -1,0 +1,10 @@
+"""Optional per-CTA phase stamps inside a stage (diagnostics only). A stage marks its phases with ``point(k)``; nothing is
+generated unless the trace sets ``HOOK[0]`` to a callable(slot) (the production build leaves it None)."""
+import flydsl.expr as fx
+
+HOOK = [None]
+
+
+def point(k):
+    if fx.const_expr(HOOK[0] is not None):
+        HOOK[0](k)

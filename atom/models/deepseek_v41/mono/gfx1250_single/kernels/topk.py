@@ -17,6 +17,7 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import gpu, range_constexpr
 
 import device as hx
+import stamps
 from attention import T
 
 I32, F32 = fx.Int32, fx.Float32
@@ -89,14 +90,6 @@ O_RBD = O_CNT + 64 * 4                   # stage_select_any's per-row bound, bat
 LDS_BYTES2 = O_RBD + 3 * 64 * 4
 
 
-TSTAMP = [None]   # (diagnostic, CT11) select-internal stamps: a callable(slot) set by the step kernel around a select
-
-
-def _ts(k):
-    if fx.const_expr(TSTAMP[0] is not None):
-        TSTAMP[0](k)
-
-
 @ASTRewriter.transform
 def lds_topk(n, k, load, emit, sm, tid):
     """The top k (traced, <= 2048) of n (<= 8192) values: load(q, i) -> the 4 values i..i+3 (thread's quad q);
@@ -120,7 +113,7 @@ def lds_topk(n, k, load, emit, sm, tid):
         if cz0 < 2 * HIST_WORDS:
             hx.lstore(hist + cz0 * 4, I32(0))
     gpu.barrier()
-    _ts(2)
+    stamps.point(2)
     prefix = I32(0)
     mask = I32(0)
     need = I32(k)
@@ -164,7 +157,7 @@ def lds_topk(n, k, load, emit, sm, tid):
             prefix = prefix | (((found >> 16) & 255) << shift)
             mask = mask | (I32(255) << shift)
             need = found & 0xFFFF
-    _ts(3)
+    stamps.point(3)
     take_all = n <= k
     gt_bits = I32(0)
     eq_bits = I32(0)
@@ -197,7 +190,7 @@ def lds_topk(n, k, load, emit, sm, tid):
                 hx.lstore(outs + at * 8, fx.Vector.from_elements([(kd < 0).select(kd & I32(0x7FFFFFFF), ~kd), iw], I32))
             ab = ab + gtw
             tb = tb + tiew
-    _ts(4)
+    stamps.point(4)
     n_out = fx.min(n, I32(k))
     for rp in range((I32(k) + (THREADS - 1)) // THREADS):   # k traced: runtime loops, one copy of the emit code
         posp = hx.fresh(tid) + THREADS * rp
@@ -210,7 +203,7 @@ def lds_topk(n, k, load, emit, sm, tid):
             ve = hx.lload(outs + pose * 8, I32, 2)
             emit(pose, ve[0], ve[1])
     gpu.barrier()
-    _ts(5)
+    stamps.point(5)
 
 
 SEG = LDS_KEYS          # 8192 values a level-0 list's input

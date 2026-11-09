@@ -172,7 +172,7 @@ def atab(fp, name, off=None):
 
 def iprefetch(kb):
     """Instruction prefetch of the next `kb` KB of code (s_prefetch_inst_pc_rel, 4 KB a request), issued before a
-    handoff so the stage after it starts warm (the layer loop is ~110 KB, past the ~60 KB I-cache knee CT3 measured)."""
+    handoff so the stage after it starts warm (the layer loop is larger than the instruction cache)."""
     from flydsl._mlir.dialects import llvm as _ll
     for off in range(0, kb * 1024, 4096):
         _ll.inline_asm(None, [], f"s_prefetch_inst_pc_rel {off}, null, 31", "", has_side_effects=True)
@@ -390,8 +390,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                     if hf == 0:
                         iprefetch(28)   # the front (the attention-front pass reuses it warm)
                     # a front CTA (g, p) reads y (TP1 / TP2's output) only in its cols 320p.. -- the 16 TP CTAs 16p..16p+15:
-                    # it waits for their column-group count, not a device-wide handoff (the idle CTAs do not wait at all;
-                    # CT16 11-08 fixture Zipf 48 rows 151.3 -> 150.1 us)
+                    # it waits for their column-group count, not a device-wide handoff (the idle CTAs do not wait at all)
                     if b < FS.FRONT_CTAS:
                         gwait(lc + (hf == 0).select(i64(LY.TP1_GROUPS), i64(LY.TP2_GROUPS)), b, t)
                     if b < FS.FRONT_CTAS:
@@ -433,7 +432,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                         FS.front_any(cu, x8pub)
                     if fx.const_expr(MS.sh_early((TRx + MS.MAXTOK - 1) // MS.MAXTOK)):
                         # the FFN front's idle CTAs: the shared expert's UG, K split over SHE_CTAS CTAs a unit, once every front
-                        # CTA's x8 is out (CT16 11-08: the front kept ~160 CTAs idle ~15 us; fixture Zipf 48 rows 150.4 -> ~148.4)
+                        # CTA's x8 is out (the front leaves most CTAs idle)
                         if (hf == 0) & (b >= FS.FRONT_CTAS) & (b < FS.FRONT_CTAS + ((TRx + MS.MAXTOK - 1) // MS.MAXTOK) * MS.NUG * MS.SHE_CTAS):
                             tq3 = hx.opaque_v(fx.thread_idx.x)
                             if tq3 == 0:

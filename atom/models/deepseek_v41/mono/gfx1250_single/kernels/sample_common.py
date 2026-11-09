@@ -2,9 +2,9 @@
 # ruff: noqa
 # fmt: off
 """sample4r: sample4_fly with the per-column passes as runtime loops re-reading the logits (L2) instead of 26 unrolled
-register copies (the step tail runs once a step: cold instruction fetch of ~30 KB cost ~15 us in the persistent kernel).
+register copies (the step tail runs once a step: cold instruction fetch of unrolled code is slow in the persistent kernel).
 
-CT16 device-side step tail, step 2b: 4-rank version of sample_fly.py (vocab-sharded logits, one GPU a rank).
+The 4-rank top-p sampling (vocab-sharded logits, one GPU a rank).
 Every pass: per-CTA record -> in-rank device handoff -> rank-row record (5 CTAs, fixed order) -> tagged 16-byte pushes to the
 3 peers (row scalar from CTA 0, histogram units split over the row's 5 CTAs) -> poll -> combine in rank order (identical
 bits on every rank). Noise and ids use the global vocab index rank * V + j, so every rank draws the same winner.
@@ -218,7 +218,7 @@ def xchg_hist(recv, rank, p, row, c, t, sm, tag, mid=None):
 
 
 def _row_params(sp, row, invT, topp, seed):
-    """CT16 (sampling semantics): sp = None -> the given constants (no greedy); else row's 16 B of sp: invT f32, topp f32,
+    """Sampling semantics: sp = None -> the given constants (no greedy); else row's 16 B of sp: invT f32, topp f32,
     seed i32, greedy i32 (!= 0: no noise, no top-p cut -> argmax, lowest index on ties). A plain helper: the choice is
     made when the kernel is built."""
     if sp is None:
