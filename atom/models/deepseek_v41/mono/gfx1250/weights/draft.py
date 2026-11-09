@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The step kernel's draft-side and step-tail weights (``buffers``: WEIGHT), from the loaded target and DSpark models.
 
-Each comes out in the layout the kernel was validated with (investigation/flydsl-merge run_layer4l_step_fly.py):
+Each comes out in the layout the kernel reads:
 - ``emb``: the full bf16 embedding ``[V][H]`` on every rank (the block state's anchor rows; the target's table is
   vocab-sharded, so it is gathered once), ``noise``: the noise token's row;
 - ``hw``: this rank's LM head shard ``[V/tp][H]`` in the head kernel's tile order ``[V/16][H/32][2][16][16]``;

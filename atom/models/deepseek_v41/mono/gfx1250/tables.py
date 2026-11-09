@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The step kernel's pointer tables, as the validated step fixture builds them (investigation/flydsl-merge
-run_layer4l_step_fly.py ``fptab`` / ``tp`` / ``ctxtab``), from the loaded model:
+"""The step kernel's pointer tables (``fptab`` / ``tp`` / ``ctxtab``), from the loaded model:
 
 - ``fp``: FPTRS, then ATAB, then one LKEYS row a layer: the 40 target layers, the 3 draft stages, the draft entry's row
   (its a* = draft stage 0's attention front);

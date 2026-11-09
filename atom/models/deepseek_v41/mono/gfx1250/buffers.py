@@ -8,8 +8,7 @@ head, sampling, verify, draft head, Markov) and the context-KV table (``draft_ct
 Each name is one of:
 
 - ``SCRATCH``: owned by the runner, allocated once at the widest step (``T_MAX`` rows), never read across steps but
-  through the kernel itself (sizes as the step fixture the kernel was validated with:
-  investigation/flydsl-merge/run_layer4l_step_fly.py);
+  through the kernel itself (``scratch_bytes`` gives their sizes);
 - ``PEER``: the TP group's receive buffers (``recv0..3``), the step epoch word (``tpep``) flips them, no host clear;
 - ``WEIGHT``: the model's tensors, or a layout the runner derives from them once (planes, head tiles, f32 norms);
 - ``STEP``: per-step inputs the runner refreshes before the launch (graph-static addresses): the step metadata

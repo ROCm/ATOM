@@ -121,8 +121,7 @@ def pack_shared_local(gate_up, gate_up_scale, w2, w2_scale):
     """The FP8 shared expert's plane ``[EXPU][UNIT8]`` (same unit order as the routed planes; lane l: row l % 16, K
     chunks 16 (l // 16) + 32 c, c < 4) from the rank's loaded parameters, checkpoint layout (``unshuffle_weight``
     first if the loader shuffled them): gate_up ``[2 I][H]`` (gate rows then up rows) with its 32 x 32 block scales
-    ``[2 I / 32][H / 32]``, w2 ``[H][I]`` with ``[H / 32][I / 32]``. Byte-identical to the investigation packer
-    (pack_plane.py pack_shared)."""
+    ``[2 I / 32][H / 32]``, w2 ``[H][I]`` with ``[H / 32][I / 32]``."""
     dev = gate_up.device
     ug_rows, ug_off, ug_u, dn_rows, dn_off, dn_u, sc_ug, sc_dn = [
         torch.as_tensor(a, device=dev) for a in _maps8()

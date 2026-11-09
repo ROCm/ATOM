@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The step kernel's per-layer weights (``buffers``: WEIGHT entries of a layer-table row, ``layer4l_ffn_fly.LKEYS``),
-from a loaded V4.1 ``Block`` (target ``layers.i`` or draft ``mtp.j``), in the layout the kernel was validated with
-(investigation/flydsl-merge run_layer4l_step_fly.py):
+"""The step kernel's per-layer weights (``buffers``: WEIGHT entries of a layer-table row, ``kernels/step.py`` LKEYS),
+from a loaded V4.1 ``Block`` (target ``layers.i`` or draft ``mtp.j``), in the layout the kernel reads:
 
 - attention (TP4 rank shard): ``wqkv`` [1792][5120] FP8 = ``wqkv_a`` (q_lora 1280 rows, then kv 512), ``wqb`` [8192][1280]
   = ``wq_b``, ``woa`` [2048][4096] = ``wo_a`` (2 groups x o_rank 1024), ``wob`` [5120][2048] = ``wo_b``, each in checkpoint
