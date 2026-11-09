@@ -2006,10 +2006,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
         # No-ops returning None unless aiter enables IOD placement (gfx1250).
         moe_shuffle_weight_iod(
-            layer.w13_weight, layer.w13_weight_scale, self.num_experts
+            layer.w13_weight,
+            layer.w13_weight_scale,
+            self.num_experts,
+            gate_up=True,
         )
         moe_shuffle_weight_iod(
-            layer.w2_weight, layer.w2_weight_scale, self.num_experts, gemm=2
+            layer.w2_weight, layer.w2_weight_scale, self.num_experts
         )
 
     def _triton_views_of_flydsl_weights(self, layer) -> tuple:
