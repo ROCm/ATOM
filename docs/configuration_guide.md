@@ -366,6 +366,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--trust-remote-code` | | flag | `False` | Trust remote code when loading model |
 | `--tensor-parallel-size` | `-tp` | `int` | `1` | Tensor parallel size |
 | `--data-parallel-size` | `-dp` | `int` | `1` | Data parallel size |
+| `--sequence-parallel-size` | `-sp` | `int` | `1` | Ulysses sequence parallel size; requires `-tp 1`, `-pp 1`, DP1, an MHA model whose heads divide across the ranks, and no expert parallelism, TBO, speculative decoding, KV transfer, RapidServe or image input; validated only on MiniMax-M3 MXFP4 at SP4, and fewer KV heads than SP ranks (KV replication, e.g. MiniMax-M3 at SP8) has not run end to end |
 | `--enforce-eager` | | flag | `False` | Enforce eager mode execution |
 | `--enable_prefix_caching` | | flag | `False` | Enable prefix caching |
 | `--enable-log-stats` / `--no-enable-log-stats` | | flag | `True` | Emit the periodic engine-status line |
@@ -380,6 +381,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--level` | | `int` | `3` | Compilation level (0 — 3) |
 | `--load_dummy` | | `{empty,zero,xavier}` (optional value) | `None` | Dummy weights: bare/`=empty` skip load; `=zero` all-zero; `=xavier` xavier(bf16)/constant-magnitude(fp4/fp8) |
 | `--enable-expert-parallel` | | flag | `False` | Enable Expert Parallelism (EP MoE) |
+| `--moe-backend` | | `str` | `"standard"` | MoE implementation; choices: `standard`, `mega`. `mega` runs FlyDSL MegaMoE and requires `--enable-expert-parallel`; with `-sp N` it instead runs the Ulysses SP MXFP4 MoE through AITER `MegaMoeTP` on gfx950, on every step whose native MoE quantizes activations to FP4 (prefill, and decode from 256 global rows), and needs MORI built with `BUILD_CCO_SDMA=ON`. Startup fails when a layer or setting is outside what it serves. Each launch covers at most `min(ceil(max_num_batched_tokens / N), 8192)` local rows |
 | `--torch-profiler-dir` | | `str` | `None` | Directory for torch profiler traces |
 | `--enable-dp-attention` | | flag | `False` | Enable DP attention |
 | `--method` | | `str` | `None` | Speculative method; choices: `mtp` |
@@ -392,6 +394,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--max-num-seqs` | | `int` | `512` | Maximum number of sequences to batch together |
 | `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 — 1.0) |
 | `--scheduler-delay-factor` | | `float` | `0.0` | Delay factor multiplied by previous prompt latency before scheduling next prompt |
+| `--prefill-admit-policy` | | `str` | `interval` | When the prefill delayer admits new prefills. `interval` (default) keeps `ATOM_PREFILL_DECODE_INTERVAL` and the coalescer. `adaptive` replaces both, after the must-fire bounds (no decode, KV, `MAX_QUEUE_MS`, `TTFT_MAX_TICKS`): it fits the decode step as `T0 + c*b` and the prefill step as `A + k*n` from measured step times, and fires once the held requests' accumulated cost (sum over held ticks of admittable requests × `T0`) reaches the fixed prefill cost × decode batch (`A × B`), i.e. the EOQ / rent-or-buy point. `T0` is taken as 0.75 × the mean decode step and `A` is clamped to 0.3–1.5 × the mean prefill step; a FIRE comes on the 4th decision after the previous one at the earliest (3 held ticks), and at the latest once about 600 ms of decode steps have passed (cold start: 24 decisions; at most 200). These are fixed constants in `prefill_delayer.py`. Fits and counts ride the delayer's existing all_reduce, so DP ranks decide in lockstep. Like a positive interval, it enables local coalescing on DP=1, PP=1, i.e. on plain TP runs too; the measurements so far are DEP4 only, so TP-only gains are unverified. Counterpart of vLLM's `--prefill-schedule-interval` (off by default there too). |
 | `--online_quant_config` | | JSON string | `None` | Load-time online quantization override; see Section 3.7 |
 
 **Example:**

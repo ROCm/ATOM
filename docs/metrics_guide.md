@@ -88,7 +88,7 @@ Observed in the API process, plus one live-read gauge.
 | --- | --- | --- |
 | `atom:time_to_first_token_seconds` | Histogram, s | Local API request arrival to first output. `streaming="true"` observes the first generated SSE payload; `streaming="false"` observes the first internal token delivery. One sample per request. Label: `streaming`. |
 | `atom:inter_token_latency_seconds` | Histogram, s | Frontend-observed output interval divided by new token count, weighted by that count. Excludes the first output batch. |
-| `atom:stream_longest_silence_seconds` | Gauge, s | Seconds the most starved in-flight SSE stream has gone without a chunk; 0 when none is waiting. Read live at scrape time from the event loop serving the stream, not from the snapshot. |
+| `atom:stream_longest_silence_seconds` | Gauge, s | Seconds the most starved in-flight SSE stream has gone without a chunk; 0 when none is waiting. Read live at scrape time from the event loop serving the stream, not from the snapshot. With `--api-server-count` > 1, the max over all processes: each worker publishes when its oldest waiting stream started waiting, and the hub turns that into a silence at scrape time. |
 
 ### Scheduler
 
@@ -233,12 +233,15 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 ### Process and exporter health
 
 `gc_*` describe the API process's own collector, not the engine's — each
-interpreter keeps its own counters.
+interpreter keeps its own counters. With `--api-server-count` > 1 every series
+also carries a `process` label: `hub` for the process that owns the engine and
+`worker0`, `worker1`, ... for the front-end workers (published by each worker
+on the `ATOM_METRICS_UPDATE_INTERVAL_S` cadence).
 
 | Metric | Type / unit | Definition |
 | --- | --- | --- |
-| `atom:gc_collections` / `atom:gc_collected` / `atom:gc_uncollectable` | Counter | Per-generation collections run, objects reclaimed, objects found unreclaimable. Label: `generation`. `gc_collected` flat after startup means raising `ATOM_GC_THRESHOLD` costs nothing; growth means it would defer real work. |
-| `atom:gc_threshold` | Gauge | Collection threshold in effect. Label: `generation`. |
+| `atom:gc_collections` / `atom:gc_collected` / `atom:gc_uncollectable` | Counter | Per-generation collections run, objects reclaimed, objects found unreclaimable. Labels: `generation`, plus `process` with `--api-server-count` > 1. `gc_collected` flat after startup means raising `ATOM_GC_THRESHOLD` costs nothing; growth means it would defer real work. |
+| `atom:gc_threshold` | Gauge | Collection threshold in effect. Labels: `generation`, plus `process` with `--api-server-count` > 1. |
 | `atom:metrics_snapshot_available` | Gauge, 0/1 | Whether a runtime snapshot has been collected successfully. |
 | `atom:metrics_refresh_errors` | Counter | Failed refreshes. Refresh failure, not scrape failure. |
 | `atom:metrics_last_refresh_timestamp_seconds` | Gauge, unix s | Timestamp of the last successful refresh. Stale value with a live scrape means the engine stopped answering. |

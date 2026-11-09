@@ -18,6 +18,7 @@ been given the startup answer. One question, one place to ask it.
 """
 
 import logging
+from types import EllipsisType
 from typing import Any
 
 from atom.sampling_params import RequiredChannel
@@ -235,6 +236,7 @@ def resolve_tool_call_parser(
     custom_encoder: Any = None,
     *,
     model: str = "",
+    rendered_probe: str | None | EllipsisType = ...,
 ) -> type[ToolCallParser] | None:
     """The format this model's tool calls will arrive in, or ``None``.
 
@@ -250,13 +252,18 @@ def resolve_tool_call_parser(
     Rendering is best-effort — a template can raise on a tools payload it does
     not accept — and a failure to render is reported and treated as
     unrecognised, never as a reason to fall back to reading the output.
+    ``rendered_probe`` is that render when the caller already made it.
     """
     parser = validate_tool_call_parser(override)
     if parser is not None:
         logger.info(f"Tool-call format: {parser.NAME} (from --tool-call-parser)")
         return parser
 
-    rendered = render_probe_prompt(tokenizer, custom_encoder, tools=True)
+    rendered = (
+        render_probe_prompt(tokenizer, custom_encoder, tools=True)
+        if rendered_probe is ...
+        else rendered_probe
+    )
     if rendered is None:
         logger.warning(
             f"Could not render {model or 'the model'}'s chat template with a tools "
@@ -275,3 +282,14 @@ def resolve_tool_call_parser(
     else:
         logger.info(f"Tool-call format: {parser.NAME} (from the chat template)")
     return parser
+
+
+def template_keeps_tool_call_arguments(rendered_probe: str | None) -> bool:
+    """Whether the template that rendered the tools probe takes history
+    tool-call argument strings as sent. Kimi-K3's encoder renders them
+    verbatim; parsing them first changes the prompt. Read off the template,
+    never off ``--tool-call-parser``."""
+    return (
+        rendered_probe is not None
+        and resolve_from_prompt(rendered_probe) is KimiK3Parser
+    )

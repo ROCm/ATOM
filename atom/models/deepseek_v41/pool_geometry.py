@@ -12,6 +12,7 @@ def build_v41_pool_geometry(
     kv_dtype: str,
     speculative_tokens: int,
     index_fp4: bool,
+    index_layout: str | None,
 ) -> V41PoolGeometry:
     """The pool geometry a CSA2 configuration runs, from its text config alone.
 
@@ -24,11 +25,13 @@ def build_v41_pool_geometry(
 
     ``kv_dtype`` is the main pool's format (native's ``kv_cache_dtype``: bf16,
     fp4 or fp8), ``speculative_tokens`` the draft width a verify step retains,
-    and ``index_fp4`` the index plane's format; each moves the geometry, so
-    none has a default that guesses. Beside the model's config rather than the
-    attention backend, so a frontend that only sizes the pool imports neither
-    the kernels nor AITER; and outside `pool_layout`, which reaches nothing of
-    `atom` (`tests/test_layout_packages.py`).
+    ``index_fp4`` the index plane's format and ``index_layout`` its physical
+    ordering (native's ``index_cache_layout``; None is the format's original
+    one); each moves the geometry, so none has a default that guesses. Beside
+    the model's config rather than the attention backend, so a frontend that
+    only sizes the pool imports neither the kernels nor AITER; and outside
+    `pool_layout`, which reaches nothing of `atom`
+    (`tests/test_layout_packages.py`).
     """
     topology = build_attention_topology(hf_config)[: hf_config.num_hidden_layers]
     return V41PoolGeometry(
@@ -55,4 +58,5 @@ def build_v41_pool_geometry(
         # short refuses when asked, so there is nothing to pre-empt here.
         index_block_rows=hf_config.candidate_block_size,
         index_fp4=index_fp4,
+        index_layout=index_layout,
     )

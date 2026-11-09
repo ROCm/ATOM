@@ -414,6 +414,11 @@ def build_page_namespace(
         or _stable_hf_geometry(hf),
         "speculative_config": speculative,
     }
+    # Snapshot at startup, before scheduler/worker config copies diverge.
+    # Needed even for PAGE-only offload, which has no checkpoint layout_id.
+    index_layout = getattr(config, "index_cache_layout", None)
+    if index_layout is not None:
+        document["index_cache_layout"] = index_layout
     canonical = json.dumps(
         document,
         sort_keys=True,

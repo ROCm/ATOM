@@ -80,10 +80,22 @@ arrangement and workload.
 
 The index plane is `index_cache_dtype="fp8"` (default) or `"fp4"`, and the
 runtime refuses any other before loading weights. FP4 is the official
-arithmetic (E2M1, one E8M0 per 32 dims) in the row-group scorer's page-8
-layout, values and scales in two planes (`index_plane.py`); one aiter kernel
-norms, rotates, quantizes and stores a key, bit for bit the FP8 path's key
-chain before its quantization. The main pool is independent of it and takes
+arithmetic (E2M1, one E8M0 per 32 dims), values and scales in two planes
+(`index_plane.py`). On gfx950, `ATOM_V4_UNIFIED_MQA=opus` selects AITER's
+unified OPUS scorer and 64-row physical cache groups; logical pages and
+candidate blocks remain 8 rows. `flydsl` selects the original page-8 layout.
+OPUS requires complete 64-row groups within each PAGE (block size a multiple
+of 128 with ratio-2 owners), index dimension 128, and at most 4 GiB per owner's
+values plane. Lower `gpu_memory_utilization` if the cache would exceed that
+bound. gfx1250 continues to use OPUS's natural layout. Select the backend
+before allocating caches or capturing graphs; existing cache bytes cannot be
+reinterpreted in another layout.
+
+The fused writer norms, rotates, quantizes and stores each key directly in the
+selected layout. V4.1 Mono reads either gfx950 cache layout with its own
+16x16x128 scorer; the OPUS backend does not replace Mono's scoring arithmetic.
+
+The main pool is independent of it and takes
 `kv_cache_dtype="fp8"` (the deployed configuration), `"bf16"` or `"fp4"`.
 Under FP8, main and SWA rows are MXFP8 (E4M3, one E8M0 per 32 dims) and
 attention runs on them through AITER's `mla_sparse_prefill_v41`; under FP4,

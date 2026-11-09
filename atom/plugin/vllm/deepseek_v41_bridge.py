@@ -143,6 +143,7 @@ def _build_v41_pool_geometry(
     kv_dtype: str,
     speculative_tokens: int,
     index_fp4: bool,
+    index_layout: str | None,
 ):
     """The CSA2 pool geometry, from core's single authority.
 
@@ -164,6 +165,7 @@ def _build_v41_pool_geometry(
         kv_dtype=kv_dtype,
         speculative_tokens=speculative_tokens,
         index_fp4=index_fp4,
+        index_layout=index_layout,
     )
 
 
@@ -224,6 +226,8 @@ def v41_proxy_geometry(vllm_config):
         # writes a rejected prefix leaves behind.
         speculative_tokens=v41_speculative_tokens(vllm_config),
         index_fp4=False,
+        # What `Config` resolves for an FP8 plane: its one ordering.
+        index_layout=None,
     )
     try:
         vllm_config._atom_v41_geometry = geometry

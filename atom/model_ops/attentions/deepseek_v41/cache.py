@@ -19,7 +19,10 @@ from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
 from atom.model_ops.deepseek_v41.compressor import compress_batch
 from atom.model_ops.deepseek_v41.dspark import gather_window_rows
-from atom.model_ops.deepseek_v41.index_plane import IndexUnits
+from atom.model_ops.deepseek_v41.index_plane import (
+    FP4_MFMA,
+    IndexUnits,
+)
 from atom.model_ops.deepseek_v41.index_write import (
     write_index_rows,
     write_index_rows_fp4,
@@ -76,6 +79,16 @@ class PagedAttentionCache:
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
         self.geometry, self.num_pages, self.num_slots = geometry, pages, slots
+        index_layout = geometry.index_layout
+        if index_layout == FP4_MFMA and (
+            geometry.index_dim != 128
+            or any(geometry.rows_per_page(ratio) % 64 for _, ratio in geometry.owners)
+        ):
+            raise ValueError(
+                "gfx950 OPUS FP4 index cache requires dim=128 and complete "
+                "64-row groups in every PAGE (block_size multiple of 128 "
+                "for ratio-2 owners)"
+            )
         # The scorer's `ScoreWorkspace`, owned by the builder so the startup
         # profile's throwaway cache and the serving one share it.
         self.workspace = workspace
@@ -115,7 +128,8 @@ class PagedAttentionCache:
                 *(
                     plane.view(-1, geometry.index_block_rows, plane.shape[-1])
                     for plane in planes
-                )
+                ),
+                layout=index_layout,
             )
             for owner, planes in self.index_planes.items()
         }
