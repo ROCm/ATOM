@@ -39,7 +39,7 @@ def config_refusal(atom_config) -> str | None:
     checks += common_refusals(
         atom_config, lambda *_: None, (1, 2, 4, 8), refuse_decode_cp=False
     )
-    checks += resident_grid_refusals(atom_config)
+    checks += resident_grid_refusals(atom_config, connectors=("lmcache_mp",))
     return first_refusal(checks)
 
 

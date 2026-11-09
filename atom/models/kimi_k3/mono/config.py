@@ -247,7 +247,7 @@ def config_refusal(atom_config) -> str | None:
     # under DCP = TP and is off otherwise (``dsa_indexer.bind._refusal``).
     checks += (
         common_refusals(atom_config, Dims, SUPPORTED_TP, refuse_decode_cp=False)
-        + resident_grid_refusals(atom_config)
+        + resident_grid_refusals(atom_config, connectors=("lmcache_mp",))
     ) + [
         # the KDA recurrence reads and writes fp32 state in place; a narrower
         # pool would be read as fp32 rather than converted

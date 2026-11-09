@@ -1532,6 +1532,11 @@ class Indexer(nn.Module):
             fp4_cache_layout() if self._indexer_fp4 else "preshuffle"
         )
         self._indexer_opus = self._indexer_fp4 and self._index_cache_layout == "mfma"
+        index_layout = getattr(atom_config, "index_cache_layout", None)
+        if self._indexer_fp4 and index_layout not in (None, self._index_cache_layout):
+            raise ValueError(
+                "DSA FP4 layout differs from the config-time cache namespace"
+            )
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
@@ -1541,9 +1546,17 @@ class Indexer(nn.Module):
             require_opus_api()
             if self.n_head not in (32, 64) or self.rope_dim not in (0, 64):
                 raise ValueError("OPUS DSA FP4 requires 32/64 heads and RoPE 0/64")
-            if atom_config.kv_transfer_config or atom_config.plugin_config:
+            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+            connector = KVConnectorFactory.connector_name(
+                atom_config.kv_transfer_config
+            )
+            if atom_config.plugin_config or (
+                atom_config.kv_transfer_config and connector != "lmcache_mp"
+            ):
                 raise ValueError(
-                    "OPUS DSA FP4 cache transfer and plugin routes are not yet supported"
+                    "OPUS DSA FP4 supports only standalone lmcache_mp cache transfer; "
+                    "other connectors and plugin routes are not yet supported"
                 )
         # A NoPE FP8 cache has its own writer: the RoPE writer requires 64
         # rotary lanes and uses a different Q scale policy. Under DCP every

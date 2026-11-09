@@ -145,6 +145,15 @@ and NSA index-cache planes as zero-copy PAGE views and deliberately stores one
 shard per TP rank. Both use chunk-completion events to release source PAGE
 blocks before the remote store becomes terminal.
 
+GLM-5.3 and K3.1 Pro also support the OPUS FP4 indexer cache
+(`ATOM_DSA_FP4_OPUS=1`, `--index-cache-dtype fp4`, `--block-size 64`) with
+standalone `lmcache_mp`, including Mono decode (`ATOM_MONO_ENABLE=1`). Packed
+keys and e8m0 scales retain the OPUS MFMA layout and are transferred as separate
+opaque planes. Their namespace is distinct from legacy FP4. K3 additionally
+transfers its native KDA checkpoint, without TP rank collapse. This combination
+requires DCP=PCP=PP=1; plugins, P/D, `multi`, and `lmcache_offload` remain
+unsupported for OPUS DSA FP4. Model checkpoint weight quantization is unchanged.
+
 ### Running the MP server
 
 The matching LMCache build must support the global `--null-block-id` setting

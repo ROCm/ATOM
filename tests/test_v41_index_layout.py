@@ -111,6 +111,37 @@ def test_equal_size_fp4_layouts_have_distinct_checkpoint_identities():
     }
 
 
+@pytest.mark.parametrize("nested", [False, True], ids=["glm", "k3"])
+def test_dsa_fp4_layout_separates_mp_namespaces(monkeypatch, nested):
+    hf = SimpleNamespace(
+        model_type="kimi_linear" if nested else "glm_moe_dsa",
+        index_topk=2048,
+        num_attention_heads=64,
+        architectures=[],
+    )
+    config = SimpleNamespace(
+        hf_config=(
+            SimpleNamespace(model_type="kimi_k3", text_config=hf) if nested else hf
+        ),
+        index_cache_dtype="fp4",
+        kv_cache_dtype="fp8",
+        model="dsa-test",
+        kv_cache_block_size=64,
+    )
+    cfg = SimpleNamespace(chunk_size=256)
+    namespaces = []
+    for opus, expected in (("0", "preshuffle"), ("1", "mfma")):
+        monkeypatch.setenv("ATOM_DSA_FP4_OPUS", opus)
+        Config._resolve_index_cache_layout(config)
+        assert config.index_cache_layout == expected
+        worker = pickle.loads(pickle.dumps(config))
+        namespace = offcfg.build_page_namespace(config, cfg, 8)
+        monkeypatch.setenv("ATOM_DSA_FP4_OPUS", str(1 - int(opus)))
+        assert offcfg.build_page_namespace(worker, cfg, 8) == namespace
+        namespaces.append(namespace)
+    assert namespaces[0] != namespaces[1]
+
+
 @pytest.fixture
 def cache_cls():
     # Load the actual allocation class independently of the module's GPU
