@@ -66,6 +66,9 @@ class UBatchWrapper(nn.Module):
                 if job is not None:
                     job()
             finally:
+                # Drop the closure's tensors before the worker waits for its
+                # next job, including when subsequent steps do not use TBO.
+                job = None
                 self._worker_job_done[idx].set()
 
     def _ensure_workers(self, device: torch.device):

@@ -143,11 +143,13 @@ class AdmissionProbe:
 _RECENT_INDEX_CHANGES = 8192
 
 
-def draft_kv_lookahead(num_speculative_tokens: int) -> int:
-    """KV positions past `len(seq)` that one forward's MTP draft round writes.
+def draft_kv_lookahead(
+    num_speculative_tokens: int, *, block_drafter: bool = False
+) -> int:
+    """KV positions past `len(seq)` that one forward's draft round writes.
 
-    `EagleProposer._propose` runs the draft `k = num_speculative_tokens` times
-    per forward. Step 0 writes the target's own slots; each of the `k - 1`
+    Serial MTP (`EagleProposer._propose`) runs the draft `k = num_speculative_tokens`
+    times per forward. Step 0 writes the target's own slots; each of the `k - 1`
     mid-steps after it bumps `context_lens` and writes one token at
     `context_lens - 1`. So a forward whose target context ends at `C` writes
     draft KV through position `C + k - 2`, and `C <= len(seq)` at schedule time
@@ -155,11 +157,22 @@ def draft_kv_lookahead(num_speculative_tokens: int) -> int:
     placeholders the scheduler appended assume full acceptance). The draft
     therefore needs `k - 1` positions past `len(seq)`.
 
+    A block drafter (DSpark) instead writes its whole block in one pass: the
+    `T = k` positions `anchor + 1 .. anchor + k` after the last verified token
+    (`DSparkProposer._build_paged_block_metadata`). The anchor is at most
+    `C - 1`, so it writes through `C + k - 1` and needs `k` positions past
+    `len(seq)` -- one more than the serial count.
+
     A position past the row's allocated blocks reads its block id from the
     zeroed tail of the block table, so the write lands in physical block 0 --
-    another request's KV, or the units of a PAGE state checkpoint.
+    another request's KV, or the units of a PAGE state checkpoint. For a
+    block drafter that is not hypothetical: a fully accepted step whose last
+    block position starts a new block writes the draft rows of physical
+    block 0, and a PAGE state checkpoint stored there is then restored
+    corrupted by every later request that hits its prefix.
     """
-    return max(0, int(num_speculative_tokens or 0) - 1)
+    k = max(0, int(num_speculative_tokens or 0))
+    return k if block_drafter else max(0, k - 1)
 
 
 # Blocks `_hit_walk` hashes per round past the cached prompt chain, doubling
