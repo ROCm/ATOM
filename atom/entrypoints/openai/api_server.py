@@ -91,6 +91,7 @@ from .chat_encoders import (
     resolve_reasoning_toggle,
 )
 from .fim import FimFormat, resolve_fim_format
+from .images import check_chat_images, load_chat_images
 from .logprobs import LogprobCollector, TokenBytes
 from .metrics_setup import create_metrics_exporter
 from .prefix_completion import continue_prompt, take_assistant_prefix
@@ -768,16 +769,20 @@ def _prepare_multimodal_inputs(
     chat_template_kwargs: dict[str, Any],
     tools: Any = None,
 ) -> tuple[list[int], dict[str, Any]]:
+    # The images arrive decoded: the processor's media loader reads any
+    # source it is given, server paths included.
     conversation, media = parse_chat_messages(
-        [
-            {
-                **message.to_template_dict(
-                    preserve_tool_call_arguments=preserve_tool_call_arguments
-                ),
-                "content": message.content,
-            }
-            for message in messages
-        ]
+        load_chat_images(
+            [
+                {
+                    **message.to_template_dict(
+                        preserve_tool_call_arguments=preserve_tool_call_arguments
+                    ),
+                    "content": message.content,
+                }
+                for message in messages
+            ]
+        )
     )
     return prepare_multimodal_inputs(
         _get_engine_config(),
@@ -2041,7 +2046,9 @@ async def _chat_completions(
     try:
         request.tools = normalize_chat_tools(request.tools)
         validate_chat_request(request)
-        messages = request.get_messages()
+        # Before any work: an image's source, form and place are the client's
+        # to get right, and nothing is fetched until they are.
+        messages = check_chat_images(request.get_messages())
         assistant_prefix = None
         if beta:
             messages, assistant_prefix = take_assistant_prefix(

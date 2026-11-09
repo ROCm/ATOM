@@ -314,6 +314,12 @@ that ever changes, so a fusion left inert by an unrecognised layout says so.
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_RELAXED_MTP** | bool | 0 (false) | Accept a draft token when it lands in the target's top 10 within 0.6 of the top logit, instead of requiring the argmax. Intended for quantized MTP heads, whose drafts are right about the region and wrong about the exact winner often enough that strict acceptance throws away usable tokens. Read once at `rejection_sampler` import, so it must be set before the server starts. |
 
+## API image input
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_IMAGE_URL_ALLOW_PRIVATE** | bool | 0 (false) | Let image URLs in Chat requests reach any address, through the system proxy if one is set. By default a URL, and every redirect, must resolve to public addresses and is fetched without a proxy, so a client cannot make the server read its own network. Set it where clients are trusted with the internal network: an intranet image store, or egress only through a proxy. See [API image input](api_image_input.md). |
+
 ## Engram (DeepSeek-V4.1)
 
 The n-gram tables are per-layer and large enough that where they live, and
