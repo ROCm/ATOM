@@ -21,8 +21,10 @@ from atom.models.kimi_k3.mono.kernels.stages.moe_layout import (
     TOPK,
 )
 from atom.mono.device.ops import (
+    butterfly,
     hw_exp2,
     hw_rcp,
+    lane_gather,
     rsrc,
     traced,
     uniform,
@@ -134,10 +136,14 @@ def stage_route(c, token, front_payload_words=0):
             )
 
         def count_at_least(threshold):
+            # Per-lane VALU counts and one wave sum: a ballot per score
+            # serializes on its VALU -> SALU mask hand-off.
             count = fx.Int32(0)
             for index in range_constexpr(per_lane):
-                count = count + _popcount32(_ballot32(scores[index] >= threshold))
-            return count
+                count = count + (scores[index] >= threshold).select(
+                    fx.Int32(1), fx.Int32(0)
+                )
+            return butterfly(count, (16, 8, 4, 2, 1), architecture=GFX1250)
 
         threshold = fx.Uint32(0)
         for bit in range_constexpr(31, -1, -1):
@@ -145,32 +151,60 @@ def stage_route(c, token, front_payload_words=0):
             threshold = (count_at_least(candidate) >= TOPK).select(candidate, threshold)
 
         greater = fx.Int32(0)
+        equal = fx.Int32(0)
         for index in range_constexpr(per_lane):
-            greater = greater + _popcount32(_ballot32(scores[index] > threshold))
-        needed = fx.Int32(TOPK) - greater
-        equal_before = fx.Int32(0)
-        selected_before = fx.Int32(0)
-        for index in range_constexpr(per_lane):
-            equal_ballot = _ballot32(scores[index] == threshold)
-            equal_rank = equal_before + _lanes_below32(equal_ballot, lane)
-            selected = (scores[index] > threshold) | (
-                (scores[index] == threshold) & (equal_rank < needed)
+            greater = greater + (scores[index] > threshold).select(
+                fx.Int32(1), fx.Int32(0)
             )
-            selected_ballot = _ballot32(selected)
-            position = selected_before + _lanes_below32(selected_ballot, lane)
-            if selected:
-                expert = lane + GFX1250.wave_size * index
-                fx.ptr_store(
-                    scores[index].bitcast(fx.Float32),
-                    red + position * 3,
+            equal = equal + (scores[index] == threshold).select(
+                fx.Int32(1), fx.Int32(0)
+            )
+        needed = fx.Int32(TOPK) - butterfly(
+            greater, (16, 8, 4, 2, 1), architecture=GFX1250
+        )
+        if butterfly(equal, (16, 8, 4, 2, 1), architecture=GFX1250) == needed:
+            # Every key at the threshold is kept, so a lane-major slot order
+            # suffices: the ranking below orders the sixteen by key and id.
+            kept = greater + equal
+            slot = kept
+            for step in range_constexpr(5):
+                shift = 1 << step
+                below = lane_gather(slot, fx.max(lane - shift, 0))
+                slot = slot + (lane >= shift).select(below, fx.Int32(0))
+            slot = slot - kept
+            for index in range_constexpr(per_lane):
+                if scores[index] >= threshold:
+                    expert = lane + GFX1250.wave_size * index
+                    fx.ptr_store(scores[index].bitcast(fx.Float32), red + slot * 3)
+                    fx.ptr_store(
+                        fx.Int32(expert).bitcast(fx.Float32), red + slot * 3 + 1
+                    )
+                    fx.ptr_store(sigmoid[index], red + slot * 3 + 2)
+                    slot = slot + 1
+        else:
+            equal_before = fx.Int32(0)
+            selected_before = fx.Int32(0)
+            for index in range_constexpr(per_lane):
+                equal_ballot = _ballot32(scores[index] == threshold)
+                equal_rank = equal_before + _lanes_below32(equal_ballot, lane)
+                selected = (scores[index] > threshold) | (
+                    (scores[index] == threshold) & (equal_rank < needed)
                 )
-                fx.ptr_store(
-                    fx.Int32(expert).bitcast(fx.Float32),
-                    red + position * 3 + 1,
-                )
-                fx.ptr_store(sigmoid[index], red + position * 3 + 2)
-            equal_before = equal_before + _popcount32(equal_ballot)
-            selected_before = selected_before + _popcount32(selected_ballot)
+                selected_ballot = _ballot32(selected)
+                position = selected_before + _lanes_below32(selected_ballot, lane)
+                if selected:
+                    expert = lane + GFX1250.wave_size * index
+                    fx.ptr_store(
+                        scores[index].bitcast(fx.Float32),
+                        red + position * 3,
+                    )
+                    fx.ptr_store(
+                        fx.Int32(expert).bitcast(fx.Float32),
+                        red + position * 3 + 1,
+                    )
+                    fx.ptr_store(sigmoid[index], red + position * 3 + 2)
+                equal_before = equal_before + _popcount32(equal_ballot)
+                selected_before = selected_before + _popcount32(selected_ballot)
 
         item = fx.min(lane, TOPK - 1)
         my_key = fx.Uint32(fx.ptr_load(red + item * 3).bitcast(fx.Int32))
