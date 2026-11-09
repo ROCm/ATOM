@@ -16,6 +16,7 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer, midstep_checkpoint_targets
 from atom.model_ops.attention_gdn import GatedDeltaNet
+from atom.model_ops.fla_ops.leapquant import leapquant_buffer_shapes, leapquant_fold
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
@@ -80,6 +81,12 @@ def slot_indexed_caches(runner, replayssm: bool) -> list[torch.Tensor]:
             runner.replayssm_buf_u,
             runner.replayssm_buf_g,
         ]
+    # LeapQuant's int8 state in `mamba_v_cache` means nothing without its
+    # scales and compensators.
+    for name in ("leapquant_scale", "leapquant_comp"):
+        cache = getattr(runner, name, None)
+        if cache is not None:
+            caches.append(cache)
     return caches
 
 
@@ -171,6 +178,10 @@ class GDNAttentionMetadata:
     replayssm_max_query_len: int = 1
     # A state fork's (write slot, source slot) rows, int64 [2, F]; None unforked.
     replayssm_fork_slots: torch.Tensor | None = None
+    # LeapQuant: `ssm_state` is the int8 residual, the layer cache carries its
+    # scales and compensators, and the step's flushes already ran (all layers
+    # at once, in `_attach_replayssm`).
+    leapquant: bool = False
 
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
@@ -248,6 +259,35 @@ class GDNStateMixin(PoolRowsMixin):
         # itself when there are drafts to roll back, and does not when there
         # are none.  `ATOM_ENABLE_REPLAYSSM` overrides in either direction.
         replayssm_override = envs.ATOM_ENABLE_REPLAYSSM
+        # LeapQuant replaces ReplaySSM's fp32 checkpoint with an int8 one and
+        # keeps everything else, so it needs ReplaySSM on.
+        self.leapquant = envs.ATOM_ENABLE_LEAPQUANT
+        self.leapquant_rank = envs.ATOM_LEAPQUANT_RANK
+        if self.leapquant:
+            if self._is_kda():
+                raise NotImplementedError(
+                    "ATOM_ENABLE_LEAPQUANT covers the GDN recurrence; KDA's "
+                    "per-channel gates are not supported."
+                )
+            if self.use_spec_decode:
+                raise NotImplementedError(
+                    "ATOM_ENABLE_LEAPQUANT decodes one token per step; it does "
+                    "not support speculative decoding yet."
+                )
+            # A prefix-cache checkpoint image holds the pool's planes, and the
+            # int8 residual is not a state without its scales, compensators
+            # and window records.
+            if model_runner.config.enable_prefix_caching:
+                raise NotImplementedError(
+                    "ATOM_ENABLE_LEAPQUANT does not support prefix caching "
+                    "yet; run with --no-enable_prefix_caching."
+                )
+            if replayssm_override is False:
+                raise ValueError(
+                    "ATOM_ENABLE_LEAPQUANT=1 is built on ReplaySSM and cannot "
+                    "run with ATOM_ENABLE_REPLAYSSM=0."
+                )
+            replayssm_override = True
         self.replayssm = (
             self.use_spec_decode if replayssm_override is None else replayssm_override
         )
@@ -256,6 +296,10 @@ class GDNStateMixin(PoolRowsMixin):
         self.replayssm_cache_len = 0
         if self.replayssm:
             requested_cache_len = envs.ATOM_REPLAYSSM_CACHE_LEN
+            if self.leapquant:
+                # A T == 1 flush fires when the cursor reaches cache_len - 1,
+                # so a window of p tokens takes p + 1 entries.
+                requested_cache_len = envs.ATOM_LEAPQUANT_WINDOW + 1
             min_cache_len = 2 * self.replayssm_max_query_len
             self.replayssm_cache_len = max(requested_cache_len, min_cache_len)
             if self.replayssm_cache_len != requested_cache_len:
@@ -280,6 +324,14 @@ class GDNStateMixin(PoolRowsMixin):
                 self.replayssm_max_query_len,
                 self.num_spec + 1,
             )
+            if self.leapquant:
+                logger.info(
+                    "LeapQuant enabled for linear attention: int8 state with "
+                    "%d fp16 compensator tokens per head, re-quantised every "
+                    "%d tokens.",
+                    self.leapquant_rank,
+                    self.replayssm_cache_len - 1,
+                )
         else:
             logger.info(
                 "ReplaySSM disabled for linear attention (%s).",
@@ -439,6 +491,38 @@ class GDNStateMixin(PoolRowsMixin):
             self.model_runner.config.torch_dtype,
         )
 
+    def _pool_state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
+        """What the pool stores: `_state_dtypes`, unless LeapQuant replaces the
+        temporal state with its int8 residual."""
+        dt_conv, dt_temporal = self._state_dtypes()
+        return dt_conv, torch.int8 if self.leapquant else dt_temporal
+
+    def _record_dtype(self) -> torch.dtype:
+        # LeapQuant keeps the window's tokens in fp16, as the paper does: they
+        # are replayed every step and folded into the int8 state, and bf16's
+        # 8-bit mantissa would add error each record carries until the fold.
+        return torch.float16 if self.leapquant else self.model_runner.config.torch_dtype
+
+    def _leapquant_buffer_shapes(self):
+        """Per-slot (scale, compensator) shapes, or None when disabled."""
+        if not self.leapquant:
+            return None
+        hf = self.model_runner.config.hf_config
+        return leapquant_buffer_shapes(
+            hf.linear_num_value_heads // get_tp_group().world_size,
+            hf.linear_key_head_dim,
+            hf.linear_value_head_dim,
+            self.leapquant_rank,
+        )
+
+    def _leapquant_bytes_per_slot(self) -> int:
+        shapes = self._leapquant_buffer_shapes()
+        if shapes is None:
+            return 0
+        s_scale, s_comp = shapes
+        per_layer = math.prod(s_scale) * 4 + math.prod(s_comp) * 2
+        return self.num_state_layers() * per_layer
+
     def _state_shape_for_runner(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         hf = self.model_runner.config.hf_config
         return self._state_shape(
@@ -481,7 +565,7 @@ class GDNStateMixin(PoolRowsMixin):
         shapes = self._replayssm_buffer_shapes()
         if shapes is None:
             return 0
-        rec_dtype = self.model_runner.config.torch_dtype
+        rec_dtype = self._record_dtype()
         sk, su, sg = shapes
         per_layer = (
             math.prod(sk) * rec_dtype.itemsize
@@ -564,13 +648,15 @@ class GDNStateMixin(PoolRowsMixin):
         can size without measuring, so it is not offered.
         """
         shape_k, shape_v = self._state_shape_for_runner()
-        dt_k, dt_v = self._state_dtypes()
+        dt_k, dt_v = self._pool_state_dtypes()
         per_layer = (
             math.prod(shape_k) * dt_k.itemsize + math.prod(shape_v) * dt_v.itemsize
         )
         return state_pool(
             STATE_SLOT_CLASS,
-            self.num_state_layers() * per_layer + self._replayssm_bytes_per_slot(),
+            self.num_state_layers() * per_layer
+            + self._replayssm_bytes_per_slot()
+            + self._leapquant_bytes_per_slot(),
             entries_per_req=self.slots_per_req(),
         )
 
@@ -596,7 +682,7 @@ class GDNStateMixin(PoolRowsMixin):
         """
         num_slots = entries.get(STATE_SLOT_CLASS, 0)
         shape_k, shape_v = self._state_shape_for_runner()
-        dt_k, dt_v = self._state_dtypes()
+        dt_k, dt_v = self._pool_state_dtypes()
         n = self.num_state_layers()
         tensors = {
             "mamba_k_cache": torch.zeros(
@@ -609,7 +695,7 @@ class GDNStateMixin(PoolRowsMixin):
         shapes = self._replayssm_buffer_shapes()
         if shapes is not None:
             sk, su, sg = shapes
-            rec_dtype = self.model_runner.config.torch_dtype
+            rec_dtype = self._record_dtype()
             tensors["replayssm_buf_k"] = torch.zeros(
                 (n, num_slots) + sk, dtype=rec_dtype, device="cuda"
             )
@@ -624,6 +710,16 @@ class GDNStateMixin(PoolRowsMixin):
             # on which layer is running.
             tensors["replayssm_write_pos"] = torch.zeros(
                 num_slots, dtype=torch.int32, device="cuda"
+            )
+        side = self._leapquant_buffer_shapes()
+        if side is not None:
+            s_scale, s_comp = side
+            # Layer-major like the state, so one launch can fold every layer.
+            tensors["leapquant_scale"] = torch.zeros(
+                (n, num_slots) + s_scale, dtype=torch.float32, device="cuda"
+            )
+            tensors["leapquant_comp"] = torch.zeros(
+                (n, num_slots) + s_comp, dtype=torch.float16, device="cuda"
             )
         self._assert_checkpoint_geometry_still_holds()
         return tensors
@@ -706,7 +802,7 @@ class GDNStateMixin(PoolRowsMixin):
         sizing.
         """
         shape_k, shape_v = self._state_shape_for_runner()
-        dt_k, dt_v = self._state_dtypes()
+        dt_k, dt_v = self._pool_state_dtypes()
         n = self.num_state_layers()
         return [
             (math.prod(shape_k) * dt_k.itemsize, n),
@@ -1446,6 +1542,7 @@ class GDNStateMixin(PoolRowsMixin):
         md.replayssm_cache_len = self.replayssm_cache_len
         md.replayssm_route = self.replayssm_route
         md.replayssm_max_query_len = self.replayssm_max_query_len
+        md.leapquant = self.leapquant
 
         if is_prefill:
             # A prefill (re)initialises the checkpoint wholesale via
@@ -1466,6 +1563,9 @@ class GDNStateMixin(PoolRowsMixin):
             return
 
         if self._fork_slots:
+            # Forks come from prefix-cache checkpoints, which LeapQuant refuses;
+            # seeding one would also have to copy its scales and compensators.
+            assert not self.leapquant, "LeapQuant cannot seed a state fork"
             # A fork's write slot starts from the source checkpoint alone (the
             # kernel wrapper seeds it), so park its cursor like a prefill's:
             # otherwise it folds the slot's previous tenant's records.
@@ -1485,6 +1585,21 @@ class GDNStateMixin(PoolRowsMixin):
             self.replayssm_max_query_len,
             self.replayssm_cache_len,
         )
+        if self.leapquant:
+            # This step's flushes, for every layer in one launch: the cursor
+            # decides them and is shared by all layers. Runs outside the
+            # captured graph, so the layer kernels only ever decode.
+            runner = self.model_runner
+            leapquant_fold(
+                runner.mamba_v_cache,
+                runner.leapquant_scale,
+                runner.leapquant_comp,
+                runner.replayssm_buf_k,
+                runner.replayssm_buf_u,
+                runner.replayssm_buf_g,
+                write_pos,
+                slot_idx,
+            )
 
     def _attach_gdn_decode_metadata(
         self,
@@ -1604,6 +1719,7 @@ class GDNStateMixin(PoolRowsMixin):
             gdn_metadata.replayssm_cache_len = self.replayssm_cache_len
             gdn_metadata.replayssm_route = self.replayssm_route
             gdn_metadata.replayssm_max_query_len = self.replayssm_max_query_len
+            gdn_metadata.leapquant = self.leapquant
         return gdn_metadata
 
 
@@ -1935,6 +2051,12 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 ),
                 replay_buf_g=(
                     runner.replayssm_buf_g[gdn_idx] if self.replayssm else None
+                ),
+                leapquant_scale=(
+                    runner.leapquant_scale[gdn_idx] if self.leapquant else None
+                ),
+                leapquant_comp=(
+                    runner.leapquant_comp[gdn_idx] if self.leapquant else None
                 ),
                 # Slot-addressed recurrent state, not paged KV. It has to be
                 # registered (the linear-attention forward reads its state out

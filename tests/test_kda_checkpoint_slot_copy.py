@@ -63,6 +63,8 @@ def builder(num_slots: int = 4, allocate: bool = True):
         num_state_layers=lambda: N_LAYERS,
         _state_shape_for_runner=lambda: (SHAPE_K, SHAPE_V),
         _state_dtypes=lambda: (DT_K, DT_V),
+        # LeapQuant would store the temporal plane as int8.
+        leapquant=False,
     )
     # The methods under test call each other through `self`. Bind the real
     # ones, so what runs is the shipped code and only the model/runner reads
@@ -72,6 +74,7 @@ def builder(num_slots: int = 4, allocate: bool = True):
         "_checkpoint_num_slots",
         "_checkpoint_layer_ranges",
         "_checkpoint_segment_sizes",
+        "_pool_state_dtypes",
     ):
         setattr(stub, name, getattr(Mixin, name).__get__(stub, type(stub)))
     return stub
@@ -238,6 +241,7 @@ def hybrid_with_kpool_tail(num_slots: int = 4):
     )
     stub = object.__new__(K3._KimiMLAGDNCommon)
     stub.model_runner = runner
+    stub.leapquant = False
     stub._state_shape_for_runner = lambda: (SHAPE_K, SHAPE_V)
     stub._state_dtypes = lambda: (DT_K, DT_V)
     stub._index_cache_layout = lambda: ((3, 7), (3, 7))
@@ -328,6 +332,7 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
             _state_shape_for_runner=lambda: (SHAPE_K, SHAPE_V),
             _state_dtypes=lambda: (DT_K, DT_V),
             _page_unit_region_cache=None,
+            leapquant=False,
         )
         for name in (
             "_checkpoint_plane_shapes",
@@ -336,6 +341,7 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
             "_checkpoint_segment_sizes",
             "_checkpoint_slot_bases",
             "checkpoint_image_bytes",
+            "_pool_state_dtypes",
         ):
             setattr(stub, name, getattr(Mixin, name).__get__(stub, type(stub)))
         for name in (
@@ -588,6 +594,7 @@ class TestAnImageSpansBothPoolsIntact:
         stub.num_state_layers = lambda: N_LAYERS
         stub._state_shape_for_runner = lambda: (SHAPE_K, SHAPE_V)
         stub._state_dtypes = lambda: (DT_K, DT_V)
+        stub.leapquant = False
         for name in (
             "_checkpoint_plane_shapes",
             "_checkpoint_num_slots",
@@ -595,6 +602,7 @@ class TestAnImageSpansBothPoolsIntact:
             "_checkpoint_segment_sizes",
             "_checkpoint_slot_bases",
             "checkpoint_image_bytes",
+            "_pool_state_dtypes",
         ):
             setattr(stub, name, getattr(Mixin, name).__get__(stub, type(stub)))
         return stub, k, v, pool, index_cache, plan_segmented_copy
