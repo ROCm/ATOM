@@ -2607,7 +2607,8 @@ class BlockManager:
         # each fork under one chunk while the prefix is still in HBM. A floor
         # at or below the hit would be no rung at all, so the demand then stays
         # where it was and serves HBM alone.
-        chunk = self._joint_chunk_tokens
+        # A/B reference only: demand flooring disabled.
+        chunk = 0
         if (
             demand
             and chunk > self.hash_block_size
@@ -2753,7 +2754,8 @@ class BlockManager:
         # one chunk of reuse while it is still there. An anchor below one chunk
         # stays put: the joint load has no whole chunk to restore it from, so
         # flooring it to 0 would only take away its HBM reuse.
-        chunk = self._joint_chunk_tokens
+        # A/B reference only: anchor flooring disabled.
+        chunk = 0
         if (
             chunk > self.hash_block_size
             and chunk % self.hash_block_size == 0
