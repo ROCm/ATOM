@@ -603,9 +603,9 @@ def test_pending_tokens_follow_the_replay_adjusted_resume_point(
     hbs = sched.block_manager.hash_block_size
     # The prefill starts one hash block below the loaded boundary.
     assert sched.pending_prefill_tokens(seq) == 40 - (32 - hbs)
-    # A failed load falls back to the HBM hit.
+    # A failed load falls back to the HBM hit, replay-adjusted the same way.
     sched.failed_recving_kv_req_ids = [seq.id]
-    assert sched.pending_prefill_tokens(seq) == 40 - 8
+    assert sched.pending_prefill_tokens(seq) == 40 - (8 - hbs)
 
 
 def test_a_completed_tier_waiter_is_not_probed_for_a_new_allocation(

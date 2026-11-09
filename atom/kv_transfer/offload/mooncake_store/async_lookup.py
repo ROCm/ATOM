@@ -35,17 +35,32 @@ class _DaemonExecutor:
     not.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, limit: int | None = None) -> None:
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
         self._closed = False
+        # Tasks queued and not yet taken by the worker, cancelled ones included:
+        # a stalled Store RPC must not let submit/cancel cycles pile them up.
+        self._limit = limit
+        self._queued = 0
+        self._queued_lock = threading.Lock()
         threading.Thread(target=self._run, name=name, daemon=True).start()
 
-    def submit(self, fn, *args) -> Future:
+    def submit(self, fn, *args) -> Future | None:
+        """None when `limit` tasks are already waiting for the worker."""
         future: Future = Future()
         if self._closed:
             future.cancel()
             return future
-        self._queue.put((future, fn, args))
+        with self._queued_lock:
+            if self._limit is not None and self._queued >= self._limit:
+                return None
+            self._queued += 1
+        item = [future, fn, args]
+        # A cancelled task releases its arguments (the sequence) at once.
+        future.add_done_callback(
+            lambda _f, item=item: item.__setitem__(slice(1, 3), (None, ()))
+        )
+        self._queue.put(item)
         # Hand the GIL over so the worker starts the call now, as starting a
         # thread would have: a Store query is mostly waiting on the network.
         time.sleep(0)
@@ -56,6 +71,8 @@ class _DaemonExecutor:
             item = self._queue.get()
             if item is None:
                 return
+            with self._queued_lock:
+                self._queued -= 1
             future, fn, args = item
             if not future.set_running_or_notify_cancel():
                 continue
@@ -82,11 +99,11 @@ class AsyncStoreLookup:
         self.backend = backend
         self.capacity = capacity
         self.lock = RLock()
-        self.executor = _DaemonExecutor("store-query")
+        self.executor = _DaemonExecutor("store-query", limit=capacity)
         # Renewals ride their own worker so a burst of arrival-time queries
         # cannot queue one behind it; the lock keeps the synchronous Store
         # client (and the pool state around it) to one call at a time.
-        self.renew_executor = _DaemonExecutor("store-renew")
+        self.renew_executor = _DaemonExecutor("store-renew", limit=64)
         self.backend_lock = Lock()
         self.pending = {}
         self.discarded = set()
@@ -104,7 +121,10 @@ class AsyncStoreLookup:
         with self.lock:
             if self.closed or sid in self.pending or len(self.pending) >= self.capacity:
                 return False
-            self.pending[sid] = self.executor.submit(self._query, seq, sid)
+            future = self.executor.submit(self._query, seq, sid)
+            if future is None:
+                return False
+            self.pending[sid] = future
             return True
 
     def pump(self):
@@ -207,6 +227,8 @@ class AsyncStoreLookup:
         is late costs a lease, never correctness.
         """
         future = self.renew_executor.submit(self._renew, seq, start, end)
+        if future is None:  # earlier renewals are still stuck behind a slow RPC
+            return 0
         try:
             return future.result(timeout=RENEW_TIMEOUT_S)
         except FutureTimeout:

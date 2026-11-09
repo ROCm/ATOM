@@ -1092,12 +1092,14 @@ class Scheduler:
         cached prefix (`dp_est_cached_tokens`)."""
         cached = seq.num_cached_tokens
         if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-            loaded = self._tier_loaded_tokens(seq)
-            if loaded > cached:
-                # Admission resumes at the replay-adjusted start, not at the
-                # loaded boundary (`_resume_start_after_tier_load`).
+            # Admission resumes at the replay-adjusted start of the loaded
+            # boundary, or of the HBM hit once the load failed
+            # (`_resume_start_after_tier_load`).
+            boundary = max(cached, self._tier_loaded_tokens(seq))
+            if boundary > 0:
                 return max(
-                    0, seq.num_tokens - self._resume_start_after_tier_load(seq, loaded)
+                    0,
+                    seq.num_tokens - self._resume_start_after_tier_load(seq, boundary),
                 )
         elif estimate and not seq.block_table:
             cached = max(cached, getattr(seq, "dp_est_cached_tokens", 0))
@@ -5782,6 +5784,10 @@ class PrefillScheduler:
 
     def shutdown_kv_events(self) -> None:
         # No-op: see publish_kv_events.
+        pass
+
+    def close_kv_connector(self) -> None:
+        # No-op: the decode process owns the KV connector's scheduler side.
         pass
 
     def add(self, seq: Sequence):

@@ -202,16 +202,16 @@ def test_every_other_connector_keeps_its_own_side_streams():
     assert (state.pack_stream, state.copy_stream) == ("pack", "copy")
 
 
-def test_a_pack_on_a_side_stream_still_waits_on_the_producer_device_side():
+def test_a_pack_always_waits_on_the_producer_device_side():
     from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 
-    waited = []
-    side = SimpleNamespace(
-        follows_compute_stream=False,
-        pack_stream=SimpleNamespace(wait_event=waited.append),
-    )
-    BlockGPUConnector._wait_for_save_source(side, "event")
-    assert waited == ["event"]
-    forward = SimpleNamespace(follows_compute_stream=True, pack_stream=object())
-    BlockGPUConnector._wait_for_save_source(forward, "event")  # stream order holds
-    assert waited == ["event"]
+    # Also a state that follows the forward's stream: the stream may have
+    # changed between the producer's record and the job's pin.
+    for follows in (False, True):
+        waited = []
+        state = SimpleNamespace(
+            follows_compute_stream=follows,
+            pack_stream=SimpleNamespace(wait_event=waited.append),
+        )
+        BlockGPUConnector._wait_for_save_source(state, "event")
+        assert waited == ["event"]

@@ -215,3 +215,42 @@ def test_a_hung_store_call_does_not_keep_the_process_alive():
     )
     assert "closed" in done.stdout, done.stderr
     assert time.monotonic() - started < 20
+
+
+def test_cancelled_lookups_do_not_pile_up_behind_a_stalled_rpc():
+    import threading
+
+    from atom.kv_transfer.offload.mooncake_store.async_lookup import AsyncStoreLookup
+
+    gate = threading.Event()
+
+    class Backend:
+        def lookup(self, seq, lookup_id=None):
+            gate.wait(5)
+            return 0
+
+    lk = AsyncStoreLookup(Backend(), capacity=4)
+    try:
+        accepted = 0
+        for i in range(50):
+            if lk.submit(object(), f"s{i}"):
+                accepted += 1
+            lk.clear_lookup_status(f"s{i}")
+        # One is being served; at most `capacity` more wait in the queue.
+        assert accepted <= 5 + 1
+    finally:
+        gate.set()
+        lk.close()
+
+
+def test_multi_connector_fans_the_forward_stream_out_to_children():
+    from atom.kv_transfer.disaggregation.multi.multi_connector import MultiConnector
+
+    got = []
+    m = MultiConnector.__new__(MultiConnector)
+    m._connectors = [
+        SimpleNamespace(set_forward_stream=got.append),
+        SimpleNamespace(),  # a child without the hook is skipped
+    ]
+    m.set_forward_stream("stream-B")
+    assert got == ["stream-B"]

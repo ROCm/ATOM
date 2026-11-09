@@ -925,10 +925,9 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         codec = self._codec
         chunk = self.chunk_size
         stream = self._in_place_stream()
-        if producer_event is not None and stream is not getattr(
-            self._in_place_tls, "pinned", None
-        ):
-            # On the forward's stream the producer's order already holds.
+        if producer_event is not None:
+            # Also on the forward's stream: it may have changed since the
+            # producer recorded the event, and a same-stream wait is free.
             stream.wait_event(producer_event)
         # Only the window's part of the block table, with token offsets from
         # its first chunk: converting the whole table would cost every window

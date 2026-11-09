@@ -5180,8 +5180,9 @@ class RapidServeModelRunner(ModelRunner):
         else:
             stream = torch.cuda.current_stream()
         # A connector that stages on the forward's stream follows it.
-        if self.kv_connector is not None:
-            self.kv_connector.set_forward_stream(stream)
+        connector = get_kvconnector()
+        if connector is not None:
+            connector.set_forward_stream(stream)
         with torch.cuda.stream(stream):
             self._advance_forward_vars()
             self._gate_staging_reuse()
