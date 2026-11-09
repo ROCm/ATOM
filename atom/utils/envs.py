@@ -588,6 +588,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
+    # DeepSeek-V4.1 on gfx1250: the whole decode step (target layers, sampling,
+    # verify, DSpark draft, Markov) as one FlyDSL launch
+    # (atom/models/deepseek_v41/mono/gfx1250_single). Off by default.
+    "ATOM_MONO_SINGLE": lambda: os.getenv("ATOM_MONO_SINGLE", "0") == "1",
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
     # with with_indexer=True), which does index Q/K/W projection, paged FP8

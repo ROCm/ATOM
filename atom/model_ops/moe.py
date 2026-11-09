@@ -1731,6 +1731,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self._process_weight_layout_after_loading(layer)
 
     def _process_weight_layout_after_loading(self, layer) -> None:
+        # A consumer of the checkpoint layout (the gfx1250 single-launch mono decode packs its expert planes from it)
+        # runs before the in-place shuffle below.
+        pre_shuffle = getattr(layer, "_mono_pre_shuffle", None)
+        if pre_shuffle is not None:
+            pre_shuffle(layer)
         is_silu = (
             getattr(layer, "activation", ActivationType.Silu) == ActivationType.Silu
         )

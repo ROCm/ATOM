@@ -69,6 +69,12 @@ class MoE(V4MoE):
         )
 
         self.experts.custom_routing_function = self._topk
+        from atom.models.deepseek_v41.mono import gfx1250_single
+
+        if gfx1250_single.enabled():
+            from atom.models.deepseek_v41.mono.gfx1250_single import planes
+
+            self.experts._mono_pre_shuffle = planes.capture(prefix)
 
     def _topk(self, hidden_states, gating_output, topk, renormalize):
         image_mask = getattr(get_forward_context().attn_metadata, "image_mask", None)

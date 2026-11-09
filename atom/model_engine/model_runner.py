@@ -3137,6 +3137,11 @@ class ModelRunner:
         # Single canonical shape check; contract owned by ForwardMode, which
         # short-circuits only on prefill. The padded step is the one it is for.
         forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
+        # The gfx1250 single-launch step samples on the GPU: it reads this step's
+        # per-request sampling parameters (`deepseek_v41/mono/gfx1250_single`).
+        step_batch = getattr(self.model, "set_step_batch", None)
+        if step_batch is not None:
+            step_batch(batch)
 
         # Profiler label. Kind (prefix) distinguishes real/dummy and
         # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches; `tok`
@@ -3349,6 +3354,14 @@ class ModelRunner:
                     logits = self.model.compute_logits(hidden_states)
                     return logits, hidden_states
 
+                single = self._single_step(batch, running_tokens)
+                if single is not None:
+                    # One launch did the whole step (target, sampling, verify,
+                    # draft); postprocess / propose read its outputs.
+                    single.run_step(input_ids, running_bs, forward_context, batch)
+                    self._single_served = single
+                    return None, None
+
                 graph_key = request_bucket(
                     running_bs, forward_context.attn_metadata.max_seqlen_q
                 )
@@ -3505,6 +3518,14 @@ class ModelRunner:
             # No drafts scored -> no verdict; the drafter anchors on each
             # segment's last row.
             anchors = None
+        elif getattr(self, "_single_served", None) is not None:
+            # The single-launch step verified on the GPU: the rejection
+            # sampler's (output_token_ids [bs, k + 1], verdict [3, bs]).
+            channel = None
+            sampled_tokens, verdict = self._single_served.verify_outputs(bs)
+            num_bonus_tokens, num_reject_tokens, anchors = verdict
+            next_token_locs = num_bonus_tokens
+            spec_counts = verdict[:2]
         else:
             assert logits is not None
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
@@ -3560,8 +3581,15 @@ class ModelRunner:
 
         # Drafter input must agree across TP ranks. Ids only: the verdict is
         # deterministic on TP ranks' bit-identical inputs.
-        if get_tp_group().world_size > 1 and _needs_id_sync(
-            self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
+        # A split single launch's ids are the kernel's, identical on every TP
+        # rank (and a broadcast here would wait for its draft launch).
+        single_split = getattr(getattr(self, "_single_served", None), "split", False)
+        if (
+            get_tp_group().world_size > 1
+            and not single_split
+            and _needs_id_sync(
+                self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
+            )
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
@@ -3589,7 +3617,15 @@ class ModelRunner:
                 # One bit-preserving broadcast for scores, candidate IDs and ranks.
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
-        self.forward_done_event.record()
+        if single_split:
+            # The output D2H waits for the verdict's copies, not the draft launch.
+            self.forward_done_event = self._single_served.verify_ready
+        else:
+            if self.forward_done_event is getattr(
+                getattr(self, "_single_served", None), "verify_ready", None
+            ):
+                self.forward_done_event = torch.cuda.Event()
+            self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
         token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
@@ -3740,6 +3776,9 @@ class ModelRunner:
         # race the dummy's still-pending H2D copies.
         self._advance_forward_vars()
         self._gate_staging_reuse()
+        # The gfx1250 single-launch step's runner when it served this forward
+        # (``run_model``): it sampled, verified and drafted already.
+        self._single_served = None
         (
             input_ids,
             temperatures,
@@ -3773,6 +3812,7 @@ class ModelRunner:
         # the peers never mirror.
         run_compute_draft_kv = (
             drafter is not None
+            and getattr(self, "_single_served", None) is None
             and not pp_non_last
             and not batch.is_dummy_run
             and not (will_align_draft and drafter.draft_kv_duplicates_propose)
@@ -3831,6 +3871,30 @@ class ModelRunner:
         self._record_forward_vars_event()
         self._record_kv_cache_ready(batch)
         return fwd_output
+
+    def _single_step(self, batch, running_tokens):
+        """The gfx1250 single-launch step's runner, when it serves this decode
+        step (``deepseek_v41/mono/gfx1250_single``), else None. Only a DSpark
+        verify with nothing the kernel does not produce: no structured output,
+        no logprobs, no required channel (it returns ids and the verdict, not
+        logits)."""
+        ready = getattr(self.model, "step_ready", None)
+        if os.environ.get("ATOM_MONO_SINGLE_SHADOW"):  # bring-up: the production path serves, the launch only compares
+            return None
+        if ready is None or not hasattr(self, "drafter"):
+            return None
+        if batch is not None and (
+            getattr(batch, "structured_requests", None)
+            or batch.any_logprobs
+            or getattr(batch, "required_channel", None) is not None
+        ):
+            return None
+        if get_forward_context().spec_decode_metadata is None:
+            return None
+        runner = self.model.single_runner if ready(running_tokens) else None
+        if runner is not None and not runner.precheck(batch, get_forward_context()):
+            return None  # a request shape the kernel refuses: this step on the production path
+        return runner
 
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:
@@ -3953,19 +4017,30 @@ class ModelRunner:
             forward_context.attn_metadata, last_token_indices
         )
 
-        draft_token = self.drafter.propose(
-            target_token_ids=input_ids,
-            target_positions=positions,
-            target_hidden_states=hidden_states,
-            num_reject_tokens=num_reject_tokens,
-            next_token_ids=next_token_ids,
-            last_token_indices=last_token_indices,
+        single = getattr(self, "_single_served", None)
+        draft_token = (
+            single.draft_ids(batch.total_seqs_num)
+            if single is not None
+            else self.drafter.propose(
+                target_token_ids=input_ids,
+                target_positions=positions,
+                target_hidden_states=hidden_states,
+                num_reject_tokens=num_reject_tokens,
+                next_token_ids=next_token_ids,
+                last_token_indices=last_token_indices,
+            )
         )
         # PCP runs the drafter on every rank and the ids come out different.
         # Align them before verification consumes them, so all ranks accept the
         # same count.
         if draft_token is not None and get_pcp_world_size() > 1:
             draft_token = get_pcp_group().broadcast(draft_token.contiguous(), src=0)
+        if single is None and draft_token is not None:
+            # These requests' next drafts are the production drafter's: the
+            # single launch's kept q no longer matches them.
+            runner_ = getattr(self.model, "single_runner", None)
+            if runner_ is not None:
+                runner_.forget_drafts(batch.req_ids[: batch.total_seqs_num])
         if align_only:
             return None
         # DSpark Phase 2: stash this step's scheduler-chosen ell keyed by req_id,
