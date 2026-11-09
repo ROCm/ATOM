@@ -1690,8 +1690,13 @@ class DSparkConfig:
     disable_sps_calib: bool = False
     # Explicit offline measurements; compatibility is checked before use.
     calibration_profile: str | None = None
+    # Native V4.1 draft attention: fp8 reads MXFP8 windows with OPUS A8W8;
+    # auto retains the existing BF16 path, independently of target CSA precision.
+    draft_kv_dtype: str = "auto"
 
     def __post_init__(self):
+        if self.draft_kv_dtype not in ("auto", "fp8"):
+            raise ValueError("DSpark draft_kv_dtype must be auto or fp8")
         if self.calibration_profile is not None and (
             not isinstance(self.calibration_profile, str)
             or not self.calibration_profile
@@ -1699,6 +1704,23 @@ class DSparkConfig:
         ):
             raise ValueError(
                 "DSpark calibration_profile requires a path and confidence_schedule=True"
+            )
+
+    def validate_draft_kv(self, config):
+        if self.draft_kv_dtype == "auto":
+            return
+        spec = config.speculative_config
+        target_dtypes = ("fp8", "fp4")
+        if (
+            config.hf_config.model_type != "deepseek_v41_text"
+            or config.kv_cache_dtype not in target_dtypes
+            or spec is None
+            or spec.method != "dspark"
+            or config.plugin_config is not None
+        ):
+            raise ValueError(
+                f"draft_kv_dtype={self.draft_kv_dtype} requires native DeepSeek-V4.1 "
+                f"DSpark with {' or '.join(t.upper() for t in target_dtypes)} target KV"
             )
 
     @classmethod
@@ -2598,6 +2620,7 @@ class Config:
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
         self._check_kv_cache_dtype()
+        self.dspark.validate_draft_kv(self)
         if hasattr(self, "kv_transfer_config") and isinstance(
             self.kv_transfer_config, str
         ):

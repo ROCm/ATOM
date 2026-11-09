@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from atom.model_ops.attentions.deepseek_v41.planes import (
+    gather_window_planes,
     gather_windows,
     prefill_window,
     reset_windows,
@@ -938,6 +939,19 @@ class PagedAttentionCache:
             self.window_sources,
             self.window_ptrs,
             self.window_layer_ids,
+            layers,
+            slots,
+            self.geometry.ring_slots,
+            self.geometry.head_dim,
+        )
+
+    def read_window_planes(self, layers, slots):
+        """Gather raw MXFP8 draft windows with live layer and slot IDs."""
+        self.require_committed()
+        if not self.window_fp8:
+            raise ValueError("A8W8 drafting requires MXFP8 window storage")
+        return gather_window_planes(
+            self.window_ptrs,
             layers,
             slots,
             self.geometry.ring_slots,

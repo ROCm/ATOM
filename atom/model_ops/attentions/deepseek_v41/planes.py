@@ -245,3 +245,41 @@ def write_window_planes(values, scales, planes, step, window, dim, cached_until=
             window.ring_slots,
             dim,
         )
+
+
+@triton.jit
+def _gather_window_planes(
+    ptrs, layers, slots, data, scale, B: tl.constexpr, R: tl.constexpr, D: tl.constexpr
+):
+    pair = tl.program_id(1)
+    layer = tl.load(layers + pair // B)
+    slot = tl.load(slots + pair % B).to(tl.int64)
+    src = tl.load(ptrs + layer * 2).to(tl.pointer_type(tl.uint8))
+    ss = tl.load(ptrs + layer * 2 + 1).to(tl.pointer_type(tl.uint8))
+    i = tl.program_id(0) * 1024 + tl.arange(0, 1024)
+    tl.store(
+        data + pair.to(tl.int64) * R * D + i,
+        tl.load(src + slot * R * D + i, i < R * D, other=0),
+        i < R * D,
+    )
+    tl.store(
+        scale + pair.to(tl.int64) * R * (D // 32) + i,
+        tl.load(ss + slot * R * (D // 32) + i, i < R * (D // 32), other=0),
+        i < R * (D // 32),
+    )
+
+
+def gather_window_planes(ptrs, layers, slots, ring, dim):
+    """Raw MXFP8 draft windows; slot IDs stay live during graph replay."""
+    shape = (layers.numel(), slots.numel(), ring)
+    source = torch.empty(
+        layers.numel() * slots.numel() * ring * (dim + dim // 32),
+        dtype=torch.uint8,
+        device=slots.device,
+    )
+    planes = split_source(source, dim)
+    if source.numel():
+        _gather_window_planes[(triton.cdiv(ring * dim, 1024), shape[0] * shape[1])](
+            ptrs, layers, slots, *planes, shape[1], ring, dim
+        )
+    return tuple(p.view(*shape, p.shape[-1]) for p in planes)
