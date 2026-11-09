@@ -33,6 +33,7 @@ from atom.models.deepseek_v41.mono.gfx1250_single import buffers, planes
 from atom.models.deepseek_v41.mono.gfx1250_single.debug import RunnerDebug, StepTimer
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -133,8 +134,8 @@ class SingleStepRunner(RunnerDebug):
             len(self.planes),
             self.rank,
         )
-        if os.environ.get("ATOM_MONO_SINGLE_CHECK_ROWS"):  # (debug) a layer's table row against the checkpoint
-            self._check_rows(model, int(os.environ["ATOM_MONO_SINGLE_CHECK_ROWS"]))
+        if envs.ATOM_MONO_SINGLE_CHECK_ROWS is not None:  # (debug) a layer's table row against the checkpoint
+            self._check_rows(model, envs.ATOM_MONO_SINGLE_CHECK_ROWS)
         from atom.models.deepseek_v41.mono.gfx1250_single.tables import StepTables
 
         self.tables = StepTables(
@@ -161,13 +162,13 @@ class SingleStepRunner(RunnerDebug):
         self._ev_verify = torch.cuda.Event()
         self.verify_ready = torch.cuda.Event()
         self._verify_stream = torch.cuda.Stream()
-        self._timer = StepTimer(self.rank, int(os.environ.get("ATOM_MONO_SINGLE_TIMING_EVERY", "64"))) if os.environ.get("ATOM_MONO_SINGLE_TIMING") == "1" else None
+        self._timer = StepTimer(self.rank, envs.ATOM_MONO_SINGLE_TIMING_EVERY) if envs.ATOM_MONO_SINGLE_TIMING else None
         self._eng_rows = None
         # (debug) ATOM_MONO_SINGLE_SHADOW: the production forward serves and the launch runs beside it (``debug``)
-        self.shadow = bool(os.environ.get("ATOM_MONO_SINGLE_SHADOW"))
+        self.shadow = envs.ATOM_MONO_SINGLE_SHADOW
         # its target layers (< NL: no step tail / draft; its xh is the normed collapse after layer shadow_layers - 1
         # with layer shadow_layers' attn_norm, compared to the production state there)
-        self.shadow_layers = int(os.environ.get("ATOM_MONO_SINGLE_SHADOW_NL", str(NL)))
+        self.shadow_layers = envs.ATOM_MONO_SINGLE_SHADOW_NL
         if not self.shadow and self.shadow_layers != NL:
             raise MonoUnsupported("single-launch step: serving runs all the layers (ATOM_MONO_SINGLE_SHADOW_NL unset)")
         # every width built now (each a compile or a disk-cache load, then a TP barrier: ``prepare``), not on its first
@@ -526,7 +527,7 @@ class SingleStepRunner(RunnerDebug):
         # commit_tentative picks from by the verdict's anchors) and the embedding rows' lookup on its side stream
         _w0 = time.perf_counter() if self._timer is not None else None
         md = forward_context.attn_metadata
-        if os.environ.get("ATOM_MONO_SINGLE_PROWDUMP"):   # (debug) this step's positions for ``dump_step``
+        if envs.ATOM_MONO_SINGLE_PROWDUMP:   # (debug) this step's positions for ``dump_step``
             self._dbg_pos = md.step.positions[: input_ids.numel()].clone()
         rows = md.engram_embeddings
         staged = isinstance(rows, EngramStagedRows) and not getattr(md, "staged_outside_forward", False)

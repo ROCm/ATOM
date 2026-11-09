@@ -9,7 +9,6 @@ call sites ask it). Until the runner binds a width, every step keeps the product
 """
 
 import logging
-import os
 
 import torch
 from torch import nn
@@ -17,6 +16,7 @@ from torch import nn
 from atom.mono.runtime.deployment import common_refusals, first_refusal
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.route import LazyRunner
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -132,7 +132,7 @@ class SingleStepModel(nn.Module):
     def _shadow(self, input_ids):
         """Bring-up (ATOM_MONO_SINGLE_SHADOW=1, eager): the runner of a decode verify forward the single launch shadows,
         or None."""
-        if not os.environ.get("ATOM_MONO_SINGLE_SHADOW") or torch.cuda.is_current_stream_capturing():
+        if not envs.ATOM_MONO_SINGLE_SHADOW or torch.cuda.is_current_stream_capturing():
             return None
         fc = get_forward_context()
         rows = input_ids.numel()
@@ -162,7 +162,7 @@ class SingleStepModel(nn.Module):
     def forward(self, input_ids, positions, inputs_embeds=None):
         if inputs_embeds is None:
             shadow = self._shadow(input_ids)
-            after = os.environ.get("ATOM_MONO_SINGLE_SHADOW_AFTER") == "1"
+            after = envs.ATOM_MONO_SINGLE_SHADOW_AFTER
             ctx_check = shadow is not None and shadow.shadow_layers == 40 and not after
             if ctx_check:  # the production's draft context rows of the step before, before the launch rewrites them
                 shadow.arm_native_draft_capture()
@@ -179,7 +179,7 @@ class SingleStepModel(nn.Module):
             # (bring-up: the kernel has no Engram yet; ATOM_MONO_SINGLE_SHADOW_NOENGRAM=1 drops it from the production
             # forward too, so the layers after it compare -- that forward's tokens are then not the model's)
             no_engram = []
-            if shadow is not None and os.environ.get("ATOM_MONO_SINGLE_SHADOW_NOENGRAM") == "1":
+            if shadow is not None and envs.ATOM_MONO_SINGLE_SHADOW_NOENGRAM:
                 for blk in shadow.tables.target_blocks:
                     if getattr(blk, "engram", None) is not None:
                         blk.engram_forward = lambda residual, embeddings, image_mask: residual.clone()

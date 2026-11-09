@@ -21,6 +21,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.models.deepseek_v41.mono.gfx1250_single import buffers
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 NL, NDR, ROWS_PER_REQ = 40, 3, 6
@@ -458,8 +459,8 @@ class RunnerDebug:
     def dump_step(self, bs, out, verdict) -> None:
         """ATOM_MONO_SINGLE_PROWDUMP=<dir>: this step's verification (inputs, outputs, per-row p) and which head-input
         rows are non-finite, for the first ATOM_MONO_SINGLE_PROWDUMP_N (default 80) steps."""
-        dd = os.environ.get("ATOM_MONO_SINGLE_PROWDUMP")
-        if not dd or getattr(self, "_ndump_prow", 0) >= int(os.environ.get("ATOM_MONO_SINGLE_PROWDUMP_N", "80")):
+        dd = envs.ATOM_MONO_SINGLE_PROWDUMP
+        if not dd or getattr(self, "_ndump_prow", 0) >= envs.ATOM_MONO_SINGLE_PROWDUMP_N:
             return
         self._ndump_prow = getattr(self, "_ndump_prow", 0) + 1
         torch.cuda.synchronize()
@@ -471,7 +472,7 @@ class RunnerDebug:
             t_ = t_[: (t_.numel() // width) * width].view(-1, width).float()
             return (~torch.isfinite(t_)).any(dim=1).cpu().numpy()
 
-        qlog_n = int(os.environ.get("ATOM_MONO_SINGLE_PROWDUMP_QLOG", "12"))
+        qlog_n = envs.ATOM_MONO_SINGLE_PROWDUMP_QLOG
         np.savez(
             os.path.join(dd, f"prow_r{self.rank}_{self._ndump_prow}.npz"),
             xh_bad=nanrows("xh", torch.bfloat16, 5120)[:48],   # the target head's input rows
