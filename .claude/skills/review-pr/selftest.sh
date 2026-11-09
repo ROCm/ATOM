@@ -395,6 +395,25 @@ t "a normal-sized diff is within one pass"   "$(_cov 6 50)"    "OK"
 t "too many files is flagged as a sample"    "$(_cov 40 10)"   "BEYOND"
 t "too many added lines is flagged too"      "$(_cov 5 1000)"  "BEYOND"
 
+# Tests do not count toward reviewability, on either axis. A change of 300 source lines
+# with 900 lines of table-driven tests is not what a reviewer loses track of, and counting
+# them would flag precisely the PRs that are best covered. The two counts exclude tests
+# together so they cannot disagree -- three source files beside nine test files is three
+# files of review surface.
+_cov_mixed() {  # <src files> <src lines> <test files> <test lines> -> OK|BEYOND
+  python3 -c '
+import sys; sys.path.insert(0, sys.argv[1]); import triage
+sf, sl, tf, tl = (int(x) for x in sys.argv[2:6])
+def blk(p, n):
+    return f"diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@ -1,1 +1,{n} @@\n" + "".join(f"+l{i}\n" for i in range(n))
+d = "".join(blk(f"atom/f{i}.py", sl) for i in range(sf)) + "".join(blk(f"tests/test_{i}.py", tl) for i in range(tf))
+line = triage.coverage_line(triage.parse(d))
+print("BEYOND" if "BEYOND ONE PASS" in line else "OK")' "$S" "$1" "$2" "$3" "$4"
+}
+t "a test-heavy diff is judged on its source only" "$(_cov_mixed 1 300 1 900)" "OK"
+t "many test files do not make a diff unreviewable" "$(_cov_mixed 3 10 9 10)" "OK"
+t "source lines alone can still exceed the bar"     "$(_cov_mixed 1 600 0 0)" "BEYOND"
+
 # Measuring the diff is not enough: the card has to SAY it. ATOM#3034's card carried the
 # coverage line and ATOM#2762's did not -- same worker, same instruction -- and the one
 # that dropped it was the 47-file diff where "a sample, not a sweep" mattered most. So the

@@ -1197,27 +1197,42 @@ def hardcoded_launch_knob(files):
     return False
 
 
-# Measured over 40 merged ATOM PRs (2026-11): files median 4, p90 11, max 19; added
-# lines median 230, p90 708, max 3369. A diff past the top of that range is not a harder
-# review, it is a review a single pass cannot sweep -- and the card does not show that.
-# On ATOM#2762 (47 files / 16,647 added) seven consecutive reviews each reported five
-# findings, the same count a 385-line PR gets: the number saturates, so five reads as
-# "these are the problems" when it means "these are five of them". Saying so is itself a
-# finding, and it belongs above the others because it changes what they mean.
-BIG_FILES, BIG_ADDED = 20, 3500
+# Measured over 40 merged ATOM PRs (2026-11), counting only NON-TEST added lines: median
+# 139, p75 324, p90 519, p95 908, max 1950. Tests are excluded because they are the part
+# of a diff that is long without being hard -- a 300-line change with 900 lines of table
+# -driven tests is not the thing a reviewer loses track of, and counting them would flag
+# the PRs that are best covered.
+#
+# The threshold is this repo's p90, not its maximum and not a borrowed rule of thumb.
+# Anchoring on "bigger than anything ever merged" (3500 lines) produced a line that fires
+# on 0 of those 40 PRs -- a warning that never warns. The usual 1000-line advice sits past
+# p95 here and fires on 2%. p90 fires on ~7%: the top of normal practice, and the point
+# past which one pass is plausibly sampling rather than sweeping.
+#
+# Why sampling is the right word: finding counts flatten. ATOM#2727 (6 files, 385 lines)
+# produced 5 findings and ATOM#2762 (47 files, 16,647 lines) also produced 5, across seven
+# consecutive reviews that never converged. Five does not mean "the problems" at any size
+# past the small end -- it means five of them -- and the card gives a reader no way to tell
+# those apart unless it says so.
+TEST_PATH = re.compile(r"(^|/)(tests?|op_tests)/|(^|/)test_|_test\.(py|cpp|cu)$")
+BIG_FILES, BIG_ADDED = 11, 519
 
 
 def coverage_line(files):
     """One line for the card: whether a single pass can cover this diff."""
-    nf = len(files)
-    na = sum(len(f["add"]) for f in files.values())
+    # Both counts exclude tests, for the same reason and so they cannot disagree: a diff
+    # of three source files and nine test files is three files of review surface, and
+    # counting the nine would flag exactly the PRs that are best covered.
+    code = {path: f for path, f in files.items() if not TEST_PATH.search(path)}
+    nf = len(code)
+    na = sum(len(f["add"]) for f in code.values())
     if nf <= BIG_FILES and na <= BIG_ADDED:
         return f"  coverage: {nf} files / {na} added lines -- within one review pass"
     over = []
     if nf > BIG_FILES:
-        over.append(f"{nf} files (no ATOM PR merged in the last 40 exceeded 19)")
+        over.append(f"{nf} files (p90 across 40 merged ATOM PRs is 11)")
     if na > BIG_ADDED:
-        over.append(f"{na} added lines (the largest merged was 3369)")
+        over.append(f"{na} non-test added lines (p90 across 40 merged ATOM PRs is 519)")
     return (
         "  coverage: BEYOND ONE PASS -- " + "; ".join(over) + ". Findings below are a "
         "sample, not a sweep: re-reviews of a diff this size return a similar count each "
