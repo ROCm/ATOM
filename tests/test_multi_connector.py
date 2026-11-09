@@ -372,6 +372,33 @@ def test_cancel_pending_load_forwards_to_offload_subs():
     assert not hasattr(moriio, "cancel_pending_load")
 
 
+def test_cancel_preadmission_clears_tier_state_and_load_winner():
+    """Taking back an early admission must reach the tier's stronger hook."""
+    seq = SimpleNamespace(id="early-load")
+    off = FakeSchedSub(is_offload=True, offload_methods=True)
+    off.held_answer = seq
+    off.parked = seq
+
+    def cancel_preadmission(request):
+        off.cancel_pending_load(request)
+        off.held_answer = None
+        off.parked = None
+
+    off.cancel_preadmission = cancel_preadmission
+    legacy = FakeSchedSub(is_offload=True, offload_methods=True)
+    producer = FakeSchedSub(is_producer=True)
+    sched = _sched([producer, off, legacy])
+    sched._load_winner[seq.id] = off
+
+    sched.cancel_preadmission(seq)
+
+    assert off.held_answer is None
+    assert off.parked is None
+    assert off.cancelled == [seq]
+    assert legacy.cancelled == [seq]
+    assert seq.id not in sched._load_winner
+
+
 def test_update_and_finished_fan_out_to_all():
     a, b = FakeSchedSub(), FakeSchedSub()
     sched = _sched([a, b])
