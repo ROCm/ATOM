@@ -110,20 +110,68 @@ def ship_prompt_hash_chain(seq, hash_block_size: int, *, block_hashes=None) -> N
     )
 
 
+class ShippedLMCacheChain(NamedTuple):
+    """`seq.lmcache_chunk_chain`: the prompt's LMCache chunk chain as the
+    frontend hashed it (`prefix_block_hashes.lmcache_chunk_chain`), and what it
+    was minted from. Adopted by
+    `atom.kv_transfer.offload.mp.chunk_hashes.prompt_chunk_hashes`."""
+
+    chunk_size: int
+    num_prompt_tokens: int
+    fingerprint: int  # `prompt_fingerprint`
+    hashes: bytes
+
+
+def ship_lmcache_chunk_chain(seq, chunk_size: int, *, chunk_hashes=None) -> None:
+    """Attach `seq`'s LMCache chunk chain, for an LMCache MP offload that names
+    prompts by it.
+
+    `chunk_hashes` (a `LMCacheChunkHashes` the tokenizer cache built from these
+    very tokens) supplies the chain when its chunk size and length fit;
+    otherwise it is hashed here. The engine checks it against the prompt and
+    LMCache's own hasher before use.
+    """
+    if not envs.ATOM_FRONTEND_PREFIX_HASH or chunk_size <= 0:
+        return
+    from atom.model_engine.prefix_block_hashes import lmcache_chunk_chain
+
+    n = seq.num_prompt_tokens // chunk_size
+    if (
+        chunk_hashes is not None
+        and chunk_hashes.chunk_size == chunk_size
+        and chunk_hashes.num_tokens == seq.num_prompt_tokens
+        and chunk_hashes.num_chunks == n
+    ):
+        hashes = chunk_hashes.hashes
+    else:
+        hashes = lmcache_chunk_chain(seq.token_ids[: n * chunk_size], chunk_size)
+    seq.lmcache_chunk_chain = ShippedLMCacheChain(
+        chunk_size, seq.num_prompt_tokens, prompt_fingerprint(seq), hashes
+    )
+
+
+# What rides the ADD frame beside each seq, in this order.
+_SHIPPED_ATTRS = ("prompt_hash_chain", "lmcache_chunk_chain")
+
+
 def take_shipped_chains(seqs) -> list | None:
     """`seqs`' shipped chains, detached for the ADD frame that carries them
-    beside the seqs (a pickled `Sequence` drops its chain); None if none has
-    one. The frontend keeps no copy."""
-    chains = [getattr(seq, "prompt_hash_chain", None) for seq in seqs]
-    if not any(chains):
+    beside the seqs (a pickled `Sequence` drops its chains): per seq, its
+    `_SHIPPED_ATTRS`. None if no seq has any. The frontend keeps no copy."""
+    chains = [
+        tuple(getattr(seq, attr, None) for attr in _SHIPPED_ATTRS) for seq in seqs
+    ]
+    if not any(any(shipped) for shipped in chains):
         return None
     for seq in seqs:
-        seq.prompt_hash_chain = None
+        for attr in _SHIPPED_ATTRS:
+            setattr(seq, attr, None)
     return chains
 
 
 def attach_shipped_chains(seqs, chains=None) -> None:
     """Hand an ADD frame's chains (`take_shipped_chains`) back to its seqs."""
     if chains:
-        for seq, chain in zip(seqs, chains, strict=True):
-            seq.prompt_hash_chain = chain
+        for seq, shipped in zip(seqs, chains, strict=True):
+            for attr, chain in zip(_SHIPPED_ATTRS, shipped, strict=True):
+                setattr(seq, attr, chain)

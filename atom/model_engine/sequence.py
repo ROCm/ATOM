@@ -398,6 +398,10 @@ class Sequence:
         # rides beside the seq in the ADD frame (`take_shipped_chains`), never
         # inside a pickled seq (`__getstate__`).
         self.prompt_hash_chain: tuple | None = None
+        # `prefix_hash.ShippedLMCacheChain`, consumed by an LMCache MP offload
+        # (`offload.mp.chunk_hashes.prompt_chunk_hashes`); rides the ADD frame
+        # the same way.
+        self.lmcache_chunk_chain: tuple | None = None
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never
         # carries speculation scratch. Filled by `BlockManager.plan_midstep`
@@ -628,9 +632,11 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        # The shipped prompt chain rides beside the seq (`prompt_hash_chain`).
+        # The shipped prompt chains ride beside the seq (`prompt_hash_chain`,
+        # `lmcache_chunk_chain`).
         state = self.__dict__.copy()
         state["prompt_hash_chain"] = None
+        state["lmcache_chunk_chain"] = None
         return state
 
     # def __getstate__(self):

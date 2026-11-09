@@ -39,7 +39,12 @@ from typing import NamedTuple
 import numpy as np
 
 from atom.model_engine.byte_lru import ByteLRU
-from atom.model_engine.prefix_block_hashes import PrefixBlockHashes, extend_block_hashes
+from atom.model_engine.prefix_block_hashes import (
+    LMCacheChunkHashes,
+    PrefixBlockHashes,
+    extend_block_hashes,
+    extend_lmcache_chunk_hashes,
+)
 from atom.model_engine.segment_split import AddedTokenSplitter
 
 logger = logging.getLogger("atom")
@@ -76,6 +81,7 @@ class _Prefix(NamedTuple):
     cut_chars: np.ndarray  # int64, ascending; the last is `len_chars`
     cut_ids: np.ndarray  # int64
     block_hashes: PrefixBlockHashes | None = None
+    lmcache_hashes: LMCacheChunkHashes | None = None
 
     @property
     def payload_bytes(self) -> int:
@@ -89,12 +95,18 @@ class _Prefix(NamedTuple):
             + sys.getsizeof(self.cut_chars)
             + sys.getsizeof(self.cut_ids)
             + (self.block_hashes.payload_bytes if self.block_hashes is not None else 0)
+            + (
+                self.lmcache_hashes.payload_bytes
+                if self.lmcache_hashes is not None
+                else 0
+            )
         )
 
 
 class PrefixEncoding(NamedTuple):
     token_ids: list[int]
     block_hashes: PrefixBlockHashes | None
+    lmcache_hashes: LMCacheChunkHashes | None = None
 
 
 def _shared_chars(a: str, b: str, limit: int) -> int:
@@ -162,11 +174,12 @@ class SegmentTokenizer:
     def encode(self, prompt: str) -> list[int]:
         return self._checked_encode(prompt)
 
-    def encode_with_prefix(self, prompt, block_size, seed=-1):
+    def encode_with_prefix(self, prompt, block_size, seed=-1, *, lmcache_chunk_size=0):
         """Encode, and extend the prompt block-hash chain kept with the same
-        stored prefix.
+        stored prefix -- and, with `lmcache_chunk_size`, the LMCache chunk
+        chain beside it. A size of 0 leaves that chain out.
 
-        Token IDs and block hashes are verified and evicted as one record.
+        Token IDs and both chains are verified and evicted as one record.
         Unsupported/short/disabled paths return no hint; ordinary hashing
         remains available to the caller.
         """
@@ -174,7 +187,7 @@ class SegmentTokenizer:
             # No stored prefix is ever found or kept, so the chain would be
             # rebuilt in full every request: let the caller hash as before.
             return PrefixEncoding(self._checked_encode(prompt), None)
-        return self._checked_encode(prompt, (block_size, seed))
+        return self._checked_encode(prompt, (block_size, seed, lmcache_chunk_size))
 
     def _checked_encode(self, prompt, hash_spec=None):
         def plain(ids):
@@ -281,14 +294,25 @@ class SegmentTokenizer:
         body = np.concatenate(chunks)
         out = body.tolist()
 
-        block_hashes = None
+        block_hashes = lmcache_hashes = None
         if hash_spec is not None:
-            block_hashes = extend_block_hashes(
-                body,
-                *hash_spec,
-                base=None if base is None else base.block_hashes,
-                shared_tokens=(len(split.head) + n_base if base is not None else 0),
-            )
+            block_size, seed, lmcache_chunk_size = hash_spec
+            shared_tokens = len(split.head) + n_base if base is not None else 0
+            if block_size > 0:
+                block_hashes = extend_block_hashes(
+                    body,
+                    block_size,
+                    seed,
+                    base=None if base is None else base.block_hashes,
+                    shared_tokens=shared_tokens,
+                )
+            if lmcache_chunk_size > 0:
+                lmcache_hashes = extend_lmcache_chunk_hashes(
+                    body,
+                    lmcache_chunk_size,
+                    base=None if base is None else base.lmcache_hashes,
+                    shared_tokens=shared_tokens,
+                )
 
         # With no added token past the reused cut, the new entry would be a
         # part of `base`, which already serves it.
@@ -301,10 +325,15 @@ class SegmentTokenizer:
                 new_cut_chars,
                 new_cut_ids,
                 block_hashes=block_hashes,
+                lmcache_hashes=lmcache_hashes,
             )
         fresh_ids = sum(len(v) for v in fresh.values())
         self._count(len(out) - fresh_ids, fresh_ids, time.perf_counter() - t0, base)
-        return out if hash_spec is None else PrefixEncoding(out, block_hashes)
+        return (
+            out
+            if hash_spec is None
+            else PrefixEncoding(out, block_hashes, lmcache_hashes)
+        )
 
     def _find_prefix(self, prompt: str):
         """`(entry, k)`: the stored prompt sharing the most with `prompt` and
@@ -337,7 +366,15 @@ class SegmentTokenizer:
         return best, best_k
 
     def _store_prefix(
-        self, prompt, body, base, k, new_cut_chars, new_cut_ids, block_hashes=None
+        self,
+        prompt,
+        body,
+        base,
+        k,
+        new_cut_chars,
+        new_cut_ids,
+        block_hashes=None,
+        lmcache_hashes=None,
     ):
         """Keep `prompt` for later turns; it replaces `base` if it extends it
         whole, and sits beside it otherwise (another conversation with the
@@ -357,15 +394,21 @@ class SegmentTokenizer:
             )
         if not len(cut_chars) or cut_chars[-1] <= _PREFIX_KEY_CHARS:
             return
+        stored_tokens = head + int(cut_ids[-1])
         entry = _Prefix(
             prompt,
             int(cut_chars[-1]),
-            body[head : head + int(cut_ids[-1])].copy(),
+            body[head:stored_tokens].copy(),
             cut_chars,
             cut_ids,
             (
-                block_hashes.truncated(head + int(cut_ids[-1]))
+                block_hashes.truncated(stored_tokens)
                 if block_hashes is not None
+                else None
+            ),
+            (
+                lmcache_hashes.truncated(stored_tokens)
+                if lmcache_hashes is not None
                 else None
             ),
         )

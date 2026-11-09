@@ -13,7 +13,11 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
-from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
+from atom.model_engine.prefix_hash import (
+    hash_block_size_for,
+    ship_lmcache_chunk_chain,
+    ship_prompt_hash_chain,
+)
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
@@ -748,8 +752,9 @@ class LLMEngine:
 
 
 class InputOutputProcessor:
-    # Class default: a processor built without `__init__` ships nothing.
+    # Class defaults: a processor built without `__init__` ships nothing.
     prefix_hash_block_size = 0
+    lmcache_chunk_size = 0
 
     def __init__(self, config, tokenizer, block_size):
         self.config = config
@@ -791,6 +796,11 @@ class InputOutputProcessor:
             self.prefix_hash_block_size = hash_block_size_for(
                 block_size, config.decode_context_parallel_size
             )
+        # LMCache's chunk size, for shipping the prompt's LMCache chunk chain
+        # to an LMCache MP offload; 0 = none. The engine rehashes on a mismatch.
+        from atom.kv_transfer.offload.mp.chunk_hashes import frontend_chunk_size
+
+        self.lmcache_chunk_size = frontend_chunk_size(config)
 
     @staticmethod
     def _per_req_cache_model_types() -> frozenset[str]:
@@ -889,12 +899,14 @@ class InputOutputProcessor:
             return self.tokenizer.encode(prompt)
         if (
             getattr(self, "_reuse_block_hashes", False)
-            and self.prefix_hash_block_size
+            and (self.prefix_hash_block_size or self.lmcache_chunk_size)
             and envs.ATOM_FRONTEND_PREFIX_HASH
             and not multimodal
         ):
             return segment_tokenizer.encode_with_prefix(
-                prompt, self.prefix_hash_block_size
+                prompt,
+                self.prefix_hash_block_size,
+                lmcache_chunk_size=self.lmcache_chunk_size,
             )
         return segment_tokenizer.encode(prompt)
 
@@ -1035,6 +1047,16 @@ class InputOutputProcessor:
             )
             for seq in seqs[1:]:
                 seq.prompt_hash_chain = seqs[0].prompt_hash_chain
+        if self.lmcache_chunk_size and multimodal_data is None:
+            ship_lmcache_chunk_chain(
+                seqs[0],
+                self.lmcache_chunk_size,
+                chunk_hashes=(
+                    None if prefix_encoding is None else prefix_encoding.lmcache_hashes
+                ),
+            )
+            for seq in seqs[1:]:
+                seq.lmcache_chunk_chain = seqs[0].lmcache_chunk_chain
 
         if n == 1:
             logger.info(

@@ -32,6 +32,10 @@ from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_STORE_CHANNEL,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
+from atom.kv_transfer.offload.mp.chunk_hashes import (
+    request_prefix_tokens,
+    transfer_key_fields,
+)
 from atom.kv_transfer.offload.mp.deployment import (
     _make_worker_adapter,
     _mp_session_id,
@@ -402,10 +406,10 @@ class LMCacheMPConnector(KVConnectorBase):
                 )
             block_ids = self._block_slice(req, start, end)
             op = AtomMPTransferSpec(
-                token_ids=list(req.token_ids),
                 block_ids=[block_ids],
                 start=start,
                 end=end,
+                **transfer_key_fields(req, end, self.chunk_size),
             )
         except Exception:
             # Nothing was sent: the failure is provable and terminal.
@@ -461,7 +465,7 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"duplicate LMCache MP save operation {operation_id!r}"
                 )
             self._submitting_saves.add(operation_id)
-        end = (len(req.token_ids) // self.chunk_size) * self.chunk_size
+        end = (request_prefix_tokens(req) // self.chunk_size) * self.chunk_size
         start = (
             int(req.save_spec.skip_leading_tokens) // self.chunk_size
         ) * self.chunk_size
@@ -490,10 +494,10 @@ class LMCacheMPConnector(KVConnectorBase):
         try:
             block_ids = self._block_slice(req, start, end)
             op = AtomMPTransferSpec(
-                token_ids=list(req.token_ids),
                 block_ids=[block_ids],
                 start=start,
                 end=end,
+                **transfer_key_fields(req, end, self.chunk_size),
             )
         except Exception:
             # Nothing was sent: report a terminal failure so the save settles.

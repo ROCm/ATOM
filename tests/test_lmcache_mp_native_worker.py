@@ -57,6 +57,7 @@ class _TransferSpec:
     start: int = 0
     end: int = 0
     request_configs: dict | None = None
+    chunk_hashes: bytes | None = None
 
 
 @pytest.fixture(autouse=True)
@@ -194,6 +195,28 @@ def test_store_transmits_page_zero_as_real_native_unit(worker):
     }
     assert page_ranges == {((0, 8),), ((8, 16),)}
     assert not finished.finished_saving  # one quorum channel for the entire pair
+
+
+def test_transfers_named_by_chunk_hashes_send_the_hashes_to_their_end(worker):
+    hashes = bytes(range(64))  # LMCache's hashes of chunks [0, 8) and [8, 16)
+    save = replace(request(), token_ids=[], chunk_hashes=hashes, token_end=16)
+    worker._submit_save(save, object())
+    op = worker.submitted[0]
+    assert (op.start, op.end, op.token_ids, op.chunk_hashes) == (0, 16, [], hashes)
+    worker.future.ready = True
+    page_ranges = {
+        completion.operation_id.ranges
+        for completion in worker.get_finished().connector_completions
+        if completion.channel == DENSE_PAGE_SOURCE_SAFE_CHANNEL
+    }
+    assert page_ranges == {((0, 8),), ((8, 16),)}
+
+    load = replace(
+        request(loading=True, hbm=8), token_ids=[], chunk_hashes=hashes, token_end=16
+    )
+    worker._submit_load(load, object())
+    op = worker.submitted[1]
+    assert (op.start, op.end, op.chunk_hashes) == (8, 16, hashes)
 
 
 def test_native_state_groups_share_one_presence_mask(worker):

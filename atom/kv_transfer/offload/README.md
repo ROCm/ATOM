@@ -259,7 +259,14 @@ older LMCache build runs without it (a value set to `true` logs a warning).
   send the blake3 chunk hashes of a prefix instead of its tokens, so the server
   neither decodes nor re-hashes them. Enable it only once the server supports
   it and hashes with blake3 (not with CacheBlend): an older server sees an empty
-  prefix, misses every lookup and fails every transfer.
+  prefix, misses every lookup and fails every transfer. When the installed
+  adapter also accepts the caller's hashes (`ACCEPTS_CALLER_CHUNK_HASHES`), ATOM
+  hashes each prompt once (the frontend's tokenizer cache keeps the chain per
+  conversation and ships it with the request; otherwise the scheduler hashes
+  it) and lookups, lock releases and every save and load carry only the hashes
+  of `[0, end)` -- the token prefix is no longer copied into each step's
+  metadata or re-hashed on every rank (`offload/mp/chunk_hashes.py`). An adapter
+  without it is warned about and keeps receiving the tokens.
 
 The model namespace includes PAGE/model geometry, TP and speculation settings,
 native layout/image sizes, the Hugging Face commit when available, and the

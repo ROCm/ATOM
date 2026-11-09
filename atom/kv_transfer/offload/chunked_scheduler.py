@@ -644,6 +644,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._load_nonce += 1
         return operation
 
+    def _prefix_fields(self, seq, end: int) -> dict:
+        """`LMCacheReqMeta` fields naming the first `end` tokens a transfer
+        covers, from which the worker derives the chunk keys. A transport that
+        names chunks otherwise overrides this."""
+        return {"token_ids": list(seq.token_ids[:end])}
+
     def _build_save_request(
         self,
         seq,
@@ -656,8 +662,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """Admit any layout-specific sources before advancing the watermark."""
         return LMCacheReqMeta(
             req_id=seq.id,
-            token_ids=list(seq.token_ids[:aligned]),
             block_ids=block_ids,
+            **self._prefix_fields(seq, aligned),
             save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
             is_last_prefill=is_last_prefill,
             save_operation=operation,
@@ -672,13 +678,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     ) -> LMCacheReqMeta:
         """Describe one dispatched load of ``[hbm, transfer_end)`` to the worker.
 
-        Ships the prompt prefix the transfer covers, from which the worker
-        derives the chunk keys. A transport keyed differently overrides this.
+        Ships the prompt prefix the transfer covers (`_prefix_fields`), from
+        which the worker derives the chunk keys.
         """
         return LMCacheReqMeta(
             req_id=seq.id,
-            token_ids=list(seq.token_ids[:transfer_end]),
             block_ids=list(seq.block_table),
+            **self._prefix_fields(seq, transfer_end),
             load_spec=load_spec,
             load_operation=load_operation,
         )

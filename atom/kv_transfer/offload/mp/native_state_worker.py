@@ -19,6 +19,10 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import max_pending_saves
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, NativeStateTransfer
+from atom.kv_transfer.offload.mp.chunk_hashes import (
+    request_prefix_tokens,
+    transfer_key_fields,
+)
 from atom.kv_transfer.offload.mp.deployment import (
     _make_worker_adapter,
     _mp_session_id,
@@ -206,7 +210,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             raise ValueError(
                 "native-state LMCache MP requires a nonempty chunk-aligned range"
             )
-        if state.boundary_tokens != end or len(req.token_ids) != end:
+        if state.boundary_tokens != end or request_prefix_tokens(req) != end:
             raise ValueError("native STATE and PAGE endpoints must match")
         count = (end - start) // self.chunk_size
         if state.kv_only != (not self._native_layout.images):
@@ -269,31 +273,34 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 )
                 pending[operation_id] = _NativePending(req, None)
                 return
-            end = len(req.token_ids)
-            start = (
-                req.load_spec.hbm_cached_tokens
-                if loading
-                else req.save_spec.skip_leading_tokens
-            )
-            try:
-                groups = self._native_block_ids(req, start, end, loading=loading)
-                spec = AtomMPTransferSpec(
-                    token_ids=list(req.token_ids),
-                    block_ids=groups,
-                    start=start,
-                    end=end,
-                )
-            except Exception:
-                logger.exception(
-                    "Invalid native-state LMCache MP descriptor %s", operation_id
-                )
-                pending[operation_id] = _NativePending(req, None)
-                return
-            # Installed before the transport call: if it raises, the server may
-            # still have taken the request, so the lease stays until the
-            # transfer deadline.
+            # Installed before the descriptor is built (outside the lock, which
+            # `get_finished` takes) and before the transport call: if that
+            # raises, the server may still have taken the request, so the lease
+            # stays until the transfer deadline.
             entry = _NativePending(req, _UnprovableSubmission())
             pending[operation_id] = entry
+        end = request_prefix_tokens(req)
+        start = (
+            req.load_spec.hbm_cached_tokens
+            if loading
+            else req.save_spec.skip_leading_tokens
+        )
+        try:
+            groups = self._native_block_ids(req, start, end, loading=loading)
+            spec = AtomMPTransferSpec(
+                block_ids=groups,
+                start=start,
+                end=end,
+                **transfer_key_fields(req, end, self.chunk_size),
+            )
+        except Exception:
+            logger.exception(
+                "Invalid native-state LMCache MP descriptor %s", operation_id
+            )
+            with self._lock:
+                # Nothing was sent: a terminal failure.
+                entry.future = None
+            return
         submit = (
             self._adapter.submit_retrieve_request
             if loading
@@ -423,7 +430,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             return
         save_spec = pending.request.save_spec
         start = 0 if save_spec is None else int(save_spec.skip_leading_tokens)
-        end = len(pending.request.token_ids)
+        end = request_prefix_tokens(pending.request)
         self._emit_page_source_safe(
             output, pending, _chunk_ranges(start, end, self.chunk_size)
         )

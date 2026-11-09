@@ -1068,7 +1068,7 @@ def test_stale_load_failure_does_not_release_current_generation_locks():
     stale = LoadOperationId(req_id=7, generation=1)
     scheduler._active_load_operations["7"] = (seq, current)
     lookup._lookups["7"] = mp_lookup._LookupState(
-        token_ids=list(range(8)),
+        prompt=list(range(8)),
         hit=8,
         retrieve_start=0,
     )

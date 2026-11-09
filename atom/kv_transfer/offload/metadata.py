@@ -149,7 +149,7 @@ class LMCacheReqMeta:
     req_id: ReqId
     # Token ids covering the prefix being moved (used to derive chunk-256 keys via
     # LMCache's ChunkedTokenDatabase). For load: prompt[:lmcache_cached_tokens];
-    # for save: computed token ids.
+    # for save: computed token ids. Empty when `chunk_hashes` name the prefix.
     token_ids: list[int]
     # The sequence's GPU block table (logical block ids). A chunk spanning token
     # range [start, end) maps to blocks block_ids[start // bs : ceil(end / bs)].
@@ -166,9 +166,10 @@ class LMCacheReqMeta:
     # Appended for positional compatibility with existing metadata producers.
     load_operation: LoadOperationId | None = None
     native_state: NativeStateTransfer | None = None
-    # 16-byte prefix-chained digests of chunks [0, n), concatenated, for
-    # transports that key objects by hash; they ship these instead of
-    # `token_ids`.
+    # Prefix-chained digests of chunks [0, n), concatenated, for transports
+    # that key objects by hash; they ship these instead of `token_ids`. 16 bytes
+    # each for the Mooncake Store, LMCache's 32-byte chunk hashes of
+    # [0, token_end) for LMCache MP (`offload.mp.chunk_hashes`).
     chunk_hashes: bytes | None = None
     # When the scheduler dispatched this save, on its CLOCK_MONOTONIC
     # (`time.monotonic()`), and which clock that is (its host's boot ID), for
@@ -179,6 +180,9 @@ class LMCacheReqMeta:
     # A save covering KV this step's forward computes: the worker submits it
     # behind that forward (`after_forward`) instead of before it.
     after_forward: bool = False
+    # With LMCache MP `chunk_hashes` and no `token_ids`: how many prompt tokens
+    # the prefix covers, which `token_ids` would have held.
+    token_end: int | None = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):

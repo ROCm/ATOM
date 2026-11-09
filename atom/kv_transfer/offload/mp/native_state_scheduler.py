@@ -21,6 +21,11 @@ from atom.kv_transfer.offload._offload_common import (
     validated_kv_role,
 )
 from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
+from atom.kv_transfer.offload.mp.chunk_hashes import (
+    CHUNK_HASH_BYTES,
+    HashedPrompt,
+    prompt_chunk_hashes,
+)
 from atom.kv_transfer.offload.mp.deployment import _validate_mp_config
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
@@ -190,11 +195,16 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             seq._mp_checkpoint_hashes = chain
         return int(chain[count - 1])
 
-    def _lookup_token_ids(self, seq: Any) -> list[int]:
+    def _lookup_token_ids(self, seq: Any) -> list[int] | HashedPrompt:
         # Truncate the QUERY, not its answer: MP recurrent/window keys and read
         # locks belong to the requested endpoint. A full-prompt query followed
         # by rounding the result would pair the earlier KV with later state.
         boundary = self._chunk_floor(max(0, int(seq.num_prompt_tokens) - 1))
+        if self._hash_chunks:
+            hashes = prompt_chunk_hashes(seq, self.chunk_size)
+            return HashedPrompt(
+                boundary, hashes[: boundary // self.chunk_size * CHUNK_HASH_BYTES]
+            )
         return list(seq.token_ids[:boundary])
 
     def _lookup_len(self, seq: Any) -> int:

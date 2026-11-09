@@ -21,6 +21,12 @@ from atom.kv_transfer.offload.chunked_scheduler import (
     ChunkedOffloadSchedulerBase,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+from atom.kv_transfer.offload.mp.chunk_hashes import (
+    HashedPrompt,
+    chunk_hashes_enabled,
+    prefix_fields,
+    prompt_chunk_hashes,
+)
 from atom.kv_transfer.offload.mp.deployment import (
     _extra_config,
     _make_scheduler_adapter,
@@ -49,6 +55,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     # `note_scheduled_tokens`). A subclass whose save reads more than the
     # PAGE blocks that forward writes turns it off.
     _supports_same_step_save = True
+    # Whether lookups and transfers name prompts by their LMCache chunk hashes
+    # instead of their tokens (`offload.mp.chunk_hashes`).
+    _hash_chunks = False
 
     def __init__(
         self, config: Any, *, checkpoint_spec: Any = None, images: bool = True
@@ -97,6 +106,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 chunk_size=int(adapter.lmcache_tokens_per_chunk),
                 lookup_client=lookup_client,
             )
+            self._hash_chunks = chunk_hashes_enabled(extra, adapter)
         except Exception:
             close = getattr(locals().get("lookup_client"), "close", None)
             if callable(close):
@@ -118,6 +128,10 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         self._step_compute_end: dict[str, int] = {}
         # sids whose save frontier this step's forward extended.
         self._step_extended: set[str] = set()
+        logger.info(
+            "LMCache MP keys name prompts by %s",
+            "chunk hashes" if self._hash_chunks else "token ids",
+        )
         if envs.OFFLOAD_MP_SAVE_SAME_STEP and not self._same_step_save:
             logger.info(
                 "LMCache MP same-step saves are off for %s (pipeline parallel "
@@ -142,7 +156,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 continue
             client.offer(str(seq.id), functools.partial(self._offered_tokens, seq))
 
-    def _offered_tokens(self, seq: Any) -> list[int] | None:
+    def _offered_tokens(self, seq: Any) -> list[int] | HashedPrompt | None:
         """The prompt to look up, or None once `seq` stopped waiting for one.
 
         Runs on the driver thread; reads only the request's own fields.
@@ -150,6 +164,18 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         if getattr(seq, "status", None) != SequenceStatus.WAITING:
             return None
         return self._lookup_token_ids(seq)
+
+    # -- prompts named by chunk hashes ------------------------------------------
+
+    def _lookup_token_ids(self, seq: Any) -> list[int] | HashedPrompt:
+        if not self._hash_chunks:
+            return super()._lookup_token_ids(seq)
+        return HashedPrompt(
+            int(seq.num_prompt_tokens), prompt_chunk_hashes(seq, self.chunk_size)
+        )
+
+    def _prefix_fields(self, seq: Any, end: int) -> dict:
+        return prefix_fields(seq, end, self.chunk_size, self._hash_chunks)
 
     # -- same-step saves -------------------------------------------------------
 

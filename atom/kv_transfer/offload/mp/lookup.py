@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from atom.kv_transfer.offload.mp.chunk_hashes import HashedPrompt, prompt_key
 from atom.kv_transfer.offload.mp.deployment import _mp_session_id
 from atom.kv_transfer.offload.mp.lookup_driver import _DRIVER_POLL_S, _LookupDriver
 
@@ -60,9 +61,14 @@ def _locked(method):
     return wrapper
 
 
+# What a lookup names its prompt by: the token ids, or their LMCache chunk
+# hashes (`offload.mp.chunk_hashes`). Kept as given, to free its locks later.
+Prompt = list[int] | HashedPrompt
+
+
 @dataclass
 class _LookupState:
-    token_ids: list[int]
+    prompt: Prompt
     hit: int | None = None
     retrieve_start: int | None = None
     retrieve_end: int | None = None
@@ -99,7 +105,7 @@ class _MPLookupClient:
         # lookup_id -> [request_id, prompt length, phase, future]
         self._async: dict[str, list] = {}
         # Prompts of submitted lookups not yet consumed, to free their locks.
-        self._async_tokens: dict[str, list[int]] = {}
+        self._async_prompts: dict[str, Prompt] = {}
         # Answered async hits. Kept here, not only in the adapter's result
         # cache, which `cleanup_lookup_result` clears by request ID.
         self._async_hits: dict[str, int] = {}
@@ -113,7 +119,7 @@ class _MPLookupClient:
         # Driver only: arrived requests whose lookup is not sent yet, in
         # arrival order. Each maps to a callable returning the prompt to look
         # up, or None once the request no longer wants a lookup.
-        self._offered: OrderedDict[str, Callable[[], list[int] | None]] = OrderedDict()
+        self._offered: OrderedDict[str, Callable[[], Prompt | None]] = OrderedDict()
         # When each unconsumed async hit was answered (monotonic seconds).
         self._answered_at: dict[str, float] = {}
         self._max_unconsumed_hold_s = read_ttl_s * _UNCONSUMED_HOLD_TTL_FRACTION
@@ -157,7 +163,7 @@ class _MPLookupClient:
     # admission consuming the answer, `discard`, the save floor -- is the
     # same path a prefetched lookup takes.
 
-    def offer(self, lookup_id: str, tokens: Callable[[], list[int] | None]) -> bool:
+    def offer(self, lookup_id: str, tokens: Callable[[], Prompt | None]) -> bool:
         """Queue an arrived request's lookup for the driver. False if not queued."""
 
         driver = self._driver
@@ -167,7 +173,7 @@ class _MPLookupClient:
             if (
                 lookup_id in self._offered
                 or lookup_id in self._async
-                or lookup_id in self._async_tokens
+                or lookup_id in self._async_prompts
                 or lookup_id in self._lookups
             ):
                 return False
@@ -198,13 +204,14 @@ class _MPLookupClient:
                 ):
                     break
                 lookup_id, tokens = self._offered.popitem(last=False)
-            # Outside the lock: copying a long prompt takes milliseconds, and
-            # `submit` re-checks whether admission took the request meanwhile.
-            token_ids = tokens()
-            if token_ids is None:
+            # Outside the lock: copying (or hashing) a long prompt takes
+            # milliseconds, and `submit` re-checks whether admission took the
+            # request meanwhile.
+            prompt = tokens()
+            if prompt is None:
                 continue
             with self._lock:
-                if self.submit(token_ids, lookup_id):
+                if self.submit(prompt, lookup_id):
                     self.driver_stats["sent"] += 1
         with self._lock:
             return bool(self._async)
@@ -223,14 +230,14 @@ class _MPLookupClient:
             if now - answered < self._max_unconsumed_hold_s:
                 continue
             del self._answered_at[lookup_id]
-            token_ids = self._async_tokens.get(lookup_id)
-            if lookup_id not in self._async_hits or token_ids is None:
+            prompt = self._async_prompts.get(lookup_id)
+            if lookup_id not in self._async_hits or prompt is None:
                 continue
             self._try_release_unconsumed(lookup_id)
             # A waiting request's answer, not a detached one's: no save floor.
             self._discarded_hits.pop(lookup_id, None)
             self.driver_stats["stale_released"] += 1
-            self.submit(token_ids, lookup_id)
+            self.submit(prompt, lookup_id)
 
     # -- asynchronous submission ------------------------------------------
     #
@@ -242,14 +249,14 @@ class _MPLookupClient:
     # locks after the adapter's result cache was cleaned up.
 
     @_locked
-    def submit(self, token_ids: list[int], lookup_id: str) -> bool:
+    def submit(self, prompt: Prompt, lookup_id: str) -> bool:
         """Send this request's lookup without waiting. False if not sent."""
 
         self._offered.pop(lookup_id, None)
         if (
             not self._async_supported
             or lookup_id in self._async
-            or lookup_id in self._async_tokens
+            or lookup_id in self._async_prompts
             or lookup_id in self._lookups
         ):
             return False
@@ -261,19 +268,21 @@ class _MPLookupClient:
         ):
             return False
         chunk = int(adapter.lmcache_tokens_per_chunk)
-        aligned_end = (len(token_ids) // chunk) * chunk
+        aligned_end = (len(prompt) // chunk) * chunk
         if aligned_end == 0:
             return False
+        token_ids, by_hash = prompt_key(prompt, aligned_end, adapter)
         key = adapter._create_key(
             token_ids,
             start=0,
             end=aligned_end,
             request_id=request_id,
             worker_id=None,
+            **by_hash,
         )
         future = adapter._client.lookup(key, adapter._parallel.tp_size)
-        self._async[lookup_id] = [request_id, len(token_ids), "lookup", future]
-        self._async_tokens[lookup_id] = token_ids
+        self._async[lookup_id] = [request_id, len(prompt), "lookup", future]
+        self._async_prompts[lookup_id] = prompt
         return True
 
     def supports_async(self) -> bool:
@@ -303,8 +312,8 @@ class _MPLookupClient:
         """Lookups already submitted and not yet consumed (do not mutate)."""
         if self._driver is not None:
             # The driver adds and removes entries concurrently.
-            return frozenset(self._async_tokens)
-        return self._async_tokens.keys()
+            return frozenset(self._async_prompts)
+        return self._async_prompts.keys()
 
     def _advance(self, lookup_id: str) -> bool:
         """One non-blocking step of an async lookup. True once answered."""
@@ -437,7 +446,7 @@ class _MPLookupClient:
         self._orphans.discard(lookup_id)
         self._orphan_since.pop(lookup_id, None)
         self._status_retries.pop(lookup_id, None)
-        self._async_tokens.pop(lookup_id, None)
+        self._async_prompts.pop(lookup_id, None)
         self._async_hits.pop(lookup_id, None)
         self._answered_at.pop(lookup_id, None)
         self._try_cleanup_lookup_result(lookup_id)
@@ -470,7 +479,7 @@ class _MPLookupClient:
                 lookup_id,
                 exc_info=True,
             )
-            self._async_tokens.pop(lookup_id, None)
+            self._async_prompts.pop(lookup_id, None)
             self._async_hits.pop(lookup_id, None)
             # `free_lookup_locks` may have raised before the cleanup ran.
             self._try_cleanup_lookup_result(lookup_id)
@@ -479,17 +488,26 @@ class _MPLookupClient:
     def _release_unconsumed(self, lookup_id: str) -> None:
         request_id = _mp_session_id(self._config, lookup_id)
         hit = self._async_hits.pop(lookup_id, None)
-        token_ids = self._async_tokens.pop(lookup_id, None)
+        prompt = self._async_prompts.pop(lookup_id, None)
         self._answered_at.pop(lookup_id, None)
         if hit is not None:
             # Its answer is not consumed as a hit, but the scheduler still
             # needs it as a save floor (`pop_discarded_hits`).
             self._discarded_hits[lookup_id] = int(hit)
-        if hit and token_ids is not None:
-            self._adapter.free_lookup_locks(
-                token_ids=token_ids, start=0, end=hit, request_id=request_id
-            )
+        if hit and prompt is not None:
+            self._free_locks(prompt, 0, hit, request_id)
         self._adapter.cleanup_lookup_result(request_id)
+
+    def _free_locks(self, prompt: Prompt, start: int, end: int, request_id: str):
+        """Release the lookup read locks on `[start, end)` of `prompt`."""
+        token_ids, by_hash = prompt_key(prompt, end, self._adapter)
+        self._adapter.free_lookup_locks(
+            token_ids=token_ids,
+            start=start,
+            end=end,
+            request_id=request_id,
+            **by_hash,
+        )
 
     @_locked
     def pop_discarded_hits(self) -> dict[str, int]:
@@ -507,10 +525,10 @@ class _MPLookupClient:
             self._orphans.add(lookup_id)
             self._orphan_since.setdefault(lookup_id, time.monotonic())
             return
-        if lookup_id in self._async_tokens:
+        if lookup_id in self._async_prompts:
             self._try_release_unconsumed(lookup_id)
 
-    def lookup(self, token_ids: list[int], lookup_id: str) -> int | None:
+    def lookup(self, prompt: Prompt, lookup_id: str) -> int | None:
         """Hit length for this prompt, or None if the tier never answered.
 
         None is a non-answer, not an empty answer: the caller must ask again
@@ -551,17 +569,20 @@ class _MPLookupClient:
                         return None
                 time.sleep(self._wait_interval())
         with self._lock:
-            self._async_tokens.pop(lookup_id, None)
+            self._async_prompts.pop(lookup_id, None)
             self._answered_at.pop(lookup_id, None)
             async_hit = self._async_hits.pop(lookup_id, None)
-            state = _LookupState(token_ids=list(token_ids))
+            state = _LookupState(
+                prompt if isinstance(prompt, HashedPrompt) else list(prompt)
+            )
             self._lookups[lookup_id] = state
             if async_hit is not None:
                 state.hit = async_hit
                 self._window_freed()
                 return async_hit
             request_id = _mp_session_id(self._config, lookup_id)
-            self._adapter.maybe_submit_lookup_request(request_id, token_ids)
+            token_ids, by_hash = prompt_key(prompt, len(prompt), self._adapter)
+            self._adapter.maybe_submit_lookup_request(request_id, token_ids, **by_hash)
         deadline = time.monotonic() + self._timeout
         while True:
             with self._lock:
@@ -620,24 +641,14 @@ class _MPLookupClient:
                 f"retrieve end {end} exceeds lookup hit {state.hit} for {lookup_id}"
             )
         if state is not None and state.hit is not None and start > 0:
-            self._adapter.free_lookup_locks(
-                token_ids=state.token_ids,
-                start=0,
-                end=min(start, state.hit),
-                request_id=request_id,
-            )
+            self._free_locks(state.prompt, 0, min(start, state.hit), request_id)
         if (
             state is not None
             and state.hit is not None
             and end is not None
             and end < state.hit
         ):
-            self._adapter.free_lookup_locks(
-                token_ids=state.token_ids,
-                start=end,
-                end=state.hit,
-                request_id=request_id,
-            )
+            self._free_locks(state.prompt, end, state.hit, request_id)
         if state is not None:
             state.retrieve_start = start
             state.retrieve_end = end
@@ -683,10 +694,5 @@ class _MPLookupClient:
             and state.hit
             and state.hit > 0
         ):
-            self._adapter.free_lookup_locks(
-                token_ids=state.token_ids,
-                start=0,
-                end=state.hit,
-                request_id=request_id,
-            )
+            self._free_locks(state.prompt, 0, state.hit, request_id)
         self._adapter.cleanup_lookup_result(request_id)
