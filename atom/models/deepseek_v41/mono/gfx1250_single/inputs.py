@@ -331,9 +331,6 @@ class StepInputs:
         # this launch's drafts (and their q in qlog / qids) by request: committed once the launch is issued
         self._qrow_next = {r: i for i, r in enumerate(rids)}
 
-    def forget_drafts(self, req_ids) -> None:
-        """These requests' next drafts are not the kernel's (the production drafter ran): no q for their verification."""
-        prev = getattr(self, "_qrow", None)
-        if prev:
-            for r in req_ids:
-                prev.pop(r, None)
+    def forget_drafts(self) -> None:
+        """The production drafter drew the next drafts: no request's verification has the kernel's q."""
+        self._qrow = {}

@@ -19,15 +19,19 @@ from atom.models.deepseek_v41.mono.gfx1250_single.config import (
 )
 from atom.models.deepseek_v41.mono.gfx1250_single.debug import ShadowModel
 from atom.mono.runtime.route import LazyRunner
+from atom.mono.runtime.step_override import StepOverrideModel
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
 
-class SingleStepModel(ShadowModel, nn.Module):
-    """The loaded V4.1 runtime model. Its forward is unchanged (a served step does not call it); ``step_ready(rows)``
-    tells the model runner whether this step runs as the single launch."""
+class SingleStepModel(ShadowModel, StepOverrideModel, nn.Module):
+    """The loaded V4.1 runtime model. ``ModelRunner`` offers it each decode step (``step_override``): it runs the
+    step as the single launch, or declines and the production path runs (its forward, unchanged).
+
+    A served step also sampled, verified and drafted: the drafter's ``compute_draft_kv`` and ``propose`` are wrapped
+    at install so that on a served step they do nothing / return the kernel's drafts."""
 
     def __init__(self, model: nn.Module, drafter, atom_config) -> None:
         super().__init__()
@@ -42,6 +46,33 @@ class SingleStepModel(ShadowModel, nn.Module):
             return SingleStepRunner(model, drafter, atom_config)
 
         self._single = LazyRunner(create, "V4.1 single-launch step")
+        self._served = None  # this step's runner when the single launch served it
+        self._step_batch = None
+        if drafter is not None:
+            self._wrap_drafter(drafter)
+
+    def _wrap_drafter(self, drafter) -> None:
+        """On a served step the kernel already wrote the draft context KV and drew the next drafts."""
+        compute_draft_kv, propose = drafter.compute_draft_kv, drafter.propose
+
+        def served_compute_draft_kv(*args, **kwargs):
+            if self._served is None:
+                return compute_draft_kv(*args, **kwargs)
+            return None
+
+        def served_propose(*args, **kwargs):
+            if self._served is not None:
+                return self._served.draft_ids(kwargs["next_token_ids"].shape[0])
+            drafts = propose(*args, **kwargs)
+            runner = self._single.runner
+            if drafts is not None and runner is not None:
+                runner.forget_drafts()  # the production drafter's drafts: the kept q no longer match them
+            return drafts
+
+        drafter.compute_draft_kv, drafter.propose = (
+            served_compute_draft_kv,
+            served_propose,
+        )
 
     def step_ready(self, rows: int) -> bool:
         return (
@@ -50,11 +81,22 @@ class SingleStepModel(ShadowModel, nn.Module):
             and self._single.ready(rows)
         )
 
+    def step_override(self, input_ids, running_bs: int, rows: int, batch):
+        """``ModelRunner.run_model``, each decode step: run it as the single launch and return the runner (its
+        ``verify_outputs`` / ``output_stream`` for postprocess), or None for the production path.
+        """
+        runner = self.single_step_runner(batch, rows)
+        if runner is not None:
+            runner.run_step(input_ids, running_bs, get_forward_context(), batch)
+        self._served = runner
+        return runner
+
     def single_step_runner(self, batch, rows: int):
-        """``ModelRunner``: the runner when this decode step runs as the single launch, else None (the production
-        path). Only a DSpark verify with nothing the kernel does not produce: no structured output, no logprobs, no
-        required channel (it returns ids and the verdict, not logits), and request shapes the kernel takes
-        (``precheck``)."""
+        """The runner when this decode step runs as the single launch, else None (the production path). Only a
+        DSpark verify with nothing the kernel does not produce: no structured output, no logprobs, no required
+        channel (it returns ids and the verdict, not logits), and request shapes the kernel takes (``precheck``).
+        """
+        self._step_batch = batch  # (the shadow launch's sampling parameters)
         if (
             envs.ATOM_MONO_SINGLE_SHADOW
         ):  # the production path serves, the launch only compares
@@ -71,15 +113,14 @@ class SingleStepModel(ShadowModel, nn.Module):
         runner = self._single.runner
         return runner if runner.precheck(batch, fc) else None
 
-    def set_step_batch(self, batch) -> None:
-        """``ModelRunner.run_model``: this step's batch (the per-request sampling parameters the launch reads)."""
-        self._step_batch = batch
-
     @property
     def single_runner(self):
         return self._single.runner
 
     def forward(self, input_ids, positions, inputs_embeds=None):
+        self._served = (
+            None  # a production forward: this step is not the single launch's
+        )
         if inputs_embeds is None and envs.ATOM_MONO_SINGLE_SHADOW:
             return self.shadow_forward(input_ids, positions)
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)

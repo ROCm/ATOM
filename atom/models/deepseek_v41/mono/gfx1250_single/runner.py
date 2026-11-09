@@ -187,8 +187,8 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         self._ev_verify = torch.cuda.Event()
         # ModelRunner's output D2H waits for it (its ``forward_done_event`` on a served step; marked as this runner's)
         self.verify_ready = torch.cuda.Event()
-        self.verify_ready.single_launch = True
-        self._verify_stream = torch.cuda.Stream()
+        # the stream the verdict's copies run on: ModelRunner's output D2H waits for it, not for the draft launch
+        self.output_stream = self._verify_stream = torch.cuda.Stream()
         self._timer = (
             StepTimer(self.rank, envs.ATOM_MONO_SINGLE_TIMING_EVERY)
             if envs.ATOM_MONO_SINGLE_TIMING
