@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import time
+from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
@@ -828,7 +829,8 @@ class ModelRunner:
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
         )
 
-        self._pp_pending_send: list = []
+        self._pp_pending_sends: deque[list] = deque()
+        self._pp_send_depth = envs.ATOM_PP_SEND_DEPTH
         self.tokenID_processor = tokenIDProcessor(
             self,
             self.config.max_num_batched_tokens,
@@ -3354,16 +3356,7 @@ class ModelRunner:
                     self._pp_aux_relay.attach(model_output)
                 if pp_enabled and not pp_group.is_last_rank:
                     self._store_pp_shared_indexer(model_output)
-                    if self._pp_pending_send:
-                        commit_pp_send_work(self._pp_pending_send)
-                    self._pp_pending_send = async_send_intermediate_tensors(
-                        model_output,
-                        rank_local_keys=(
-                            self._pp_rank_local_keys
-                            if self._pp_send_needs_sparse
-                            else ()
-                        ),
-                    )
+                    self._send_pp_output(model_output)
                     hidden_states = None
                     logits = None
                 elif self._is_pure_middle_chunk(batch):
@@ -3426,10 +3419,23 @@ class ModelRunner:
 
         return logits, hidden_states
 
+    def _send_pp_output(self, model_output) -> None:
+        """Send to the next stage, leaving at most ATOM_PP_SEND_DEPTH unfinished."""
+        while len(self._pp_pending_sends) >= self._pp_send_depth:
+            commit_pp_send_work(self._pp_pending_sends.popleft())
+        self._pp_pending_sends.append(
+            async_send_intermediate_tensors(
+                model_output,
+                rank_local_keys=(
+                    self._pp_rank_local_keys if self._pp_send_needs_sparse else ()
+                ),
+            )
+        )
+
     def flush_pp_send(self) -> bool:
-        """Flush pending PP isend. Returns True for call_func wait_out."""
-        if self._pp_pending_send:
-            commit_pp_send_work(self._pp_pending_send)
+        """Flush pending PP isends. Returns True for call_func wait_out."""
+        while self._pp_pending_sends:
+            commit_pp_send_work(self._pp_pending_sends.popleft())
         return True
 
     @_profile_runner_stage

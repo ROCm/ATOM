@@ -106,7 +106,8 @@ class PPEngineCoreProc(EngineCore):
 
     def _pp_head_step(self):
         launched = 0
-        while len(self._in_flight) < self.pp_size:
+        max_in_flight = envs.ATOM_PP_MAX_IN_FLIGHT or self.pp_size
+        while len(self._in_flight) < max_in_flight:
             result = self.scheduler.schedule()
 
             rejected = self.scheduler.take_rejected()

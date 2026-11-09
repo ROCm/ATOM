@@ -1219,6 +1219,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
+    # PP sends a stage may leave unfinished when its next forward starts. At 1
+    # each forward first waits for the previous one's send, so a stage stalls
+    # whenever the next one is a microbatch behind; more absorbs that jitter.
+    "ATOM_PP_SEND_DEPTH": lambda: _optional_int_env("ATOM_PP_SEND_DEPTH", min_value=1)
+    or 1,
+    # Output-producing microbatches the PP head keeps in flight. Unset means
+    # pipeline_parallel_size. Past that, a stage reusing a forward_vars slot
+    # waits for the slot's previous forward.
+    "ATOM_PP_MAX_IN_FLIGHT": lambda: _optional_int_env(
+        "ATOM_PP_MAX_IN_FLIGHT", min_value=1
+    ),
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
     # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the

@@ -1512,7 +1512,7 @@ def _pp_engine_core_cls():
     return PPEngineCoreProc
 
 
-def _fake_head(batch):
+def _fake_head(*batches):
     PPEngineCoreProc = _pp_engine_core_cls()
 
     head = SimpleNamespace(
@@ -1531,7 +1531,7 @@ def _fake_head(batch):
         # never sleeps, so it must go through `_advance_idle_kv_transfer`.
         _next_idle_kv_drain=0.0,
     )
-    head.scheduler.schedule.side_effect = [(batch, {}), None]
+    head.scheduler.schedule.side_effect = [(b, {}) for b in batches] + [None]
     head.scheduler.take_rejected.return_value = None
     head.scheduler.dynamic_chunking_active = False
     head.pp_transport.recv_completion.return_value = None
@@ -1607,6 +1607,30 @@ def test_pp_head_idle_dispatch_shares_the_drain_throttle(monkeypatch):
 
     assert head._dispatch_idle_offload_work.call_count == 2
     assert head._next_idle_kv_drain == now + engine_core.KV_IDLE_DRAIN_INTERVAL_S
+
+
+@pytest.mark.parametrize("limit, launched", [(None, 4), ("6", 6)])
+def test_pp_head_keeps_the_in_flight_limit(monkeypatch, limit, launched):
+    """Output-producing microbatches launch until the limit, then the head
+    waits for completions: pp_size unless ATOM_PP_MAX_IN_FLIGHT is set."""
+    if limit is None:
+        monkeypatch.delenv("ATOM_PP_MAX_IN_FLIGHT", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_PP_MAX_IN_FLIGHT", limit)
+    batches = []
+    for i in range(8):
+        batch = _fake_batch([i], None)
+        batch.produces_output = lambda: True
+        batches.append(batch)
+    head = _fake_head(*batches)
+
+    forwards = [
+        c.args[1]
+        for c in head.runner_mgr.call_func.call_args_list
+        if c.args and c.args[0] == "forward"
+    ]
+    assert forwards == batches[:launched]
+    assert [b for b, _, _ in head._in_flight] == batches[:launched]
 
 
 def test_pp_head_forwards_normal_batch_with_meta():
