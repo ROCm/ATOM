@@ -43,6 +43,11 @@ OPTIONAL = [
     # different facts about a PR, and a reader auditing the archive months later cannot
     # tell them apart from the card alone.
     "auto_validation_outcome.txt",
+    # The diff, so _publish.pr_diff() can anchor against the exact bytes the review read.
+    # Without it that branch never fired and every publish re-fetched from the API -- which
+    # returns the diff at the CURRENT head, so a push between review and publish silently
+    # moved the anchors off the lines the findings were written against.
+    "pr.diff",
     # The validator's own report. Kept because a non-PASS verdict is only diagnosable
     # from its findings, and the scratch dir that held it is deleted on a clean run.
     "auto_validation_report.json",

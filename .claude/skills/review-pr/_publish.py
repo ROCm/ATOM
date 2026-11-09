@@ -156,7 +156,9 @@ HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 CITE_SPAN = re.compile(r"\b([\w./-]+\.[A-Za-z]{1,6}):(\d+)-(\d+)\b")
 # Past this width a span is not a "section" any more -- it is a comment painted over most of
 # a hunk, which says less about where the problem is than the first line alone does.
-MAX_SPAN = 100# How much of a finding the summary index shows. Long enough to recognise the finding,
+MAX_SPAN = 100
+
+# How much of a finding the summary index shows. Long enough to recognise the finding,
 # short enough that the index stays one line per entry -- which is the whole point of it.
 CLAUSE = 110
 

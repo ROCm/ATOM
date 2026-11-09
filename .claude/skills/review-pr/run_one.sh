@@ -313,12 +313,16 @@ else
     # card admits it -- so the downgrade reaches the reader instead of hiding in the log.
     say "refuter hit the ${ATOM_AGENT_TIMEOUT}s timeout -- publishing the card unrefuted"
     printf 'NONE AVAILABLE -- the refuter did not finish within %ss on this box\n' "${ATOM_AGENT_TIMEOUT}" > "$W/independent.txt"
-    sed -i '0,/^Review (advisory):/s//Review (advisory, not independently refuted):/' "$W/card.md"
-    # That sed is anchored to one literal shape of a model-generated line. If the card bolds or
-    # indents it the edit silently does nothing, the gate finds no admission, and a known-good
-    # card is discarded -- the exact loss this branch exists to prevent. Say it unconditionally.
+    # Anchor on `Review:`, which is the shape SKILL.md's card format actually specifies --
+    # `Review (advisory):` is a Validation-line shape and never appears here, so this edit
+    # silently did nothing on every card ever produced.
+    sed -i '0,/^Review:/s//Review (not independently refuted):/' "$W/card.md"
+    # Still unconditional, because the line is model-generated and may be bolded or indented.
+    # But APPEND, never insert at line 1: _publish.severity() reads the FIRST line starting
+    # with "Review", so a line prepended above the real verdict makes a 🔴 BLOCK card report
+    # as 'ok' -- the high-severity path silently skipped on exactly the runs that degraded.
     grep -q 'not independently refuted' "$W/card.md" \
-      || sed -i '1i Review (advisory, not independently refuted): the refuter did not finish' "$W/card.md"
+      || printf '\nReview (not independently refuted): the refuter did not finish\n' >> "$W/card.md"
   elif [ "$rc" -ne 0 ]; then
     agent_fail refuter "$rc" 3
   fi

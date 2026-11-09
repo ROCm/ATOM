@@ -336,6 +336,24 @@ def test_a_crashed_checker_is_not_a_clean_verdict(report, monkeypatch):
     assert _publish.review_payload("9999")["comments"] == []
 
 
+def test_a_degraded_card_keeps_its_red_severity():
+    """The refuter-timeout notice must not become the line severity() reads.
+
+    severity() takes the FIRST line starting with "Review", so a notice prepended above
+    the verdict makes a 🔴 BLOCK card report as 'ok' -- the high-severity path skipped on
+    exactly the runs that already degraded. Found by @valar-cop in review.
+    """
+    red = "## T\n\nReview: 🔴 BLOCK\n\n🔴 something bad\n"
+    note = "Review (not independently refuted): the refuter did not finish\n"
+    assert _publish.severity(red) == "high"
+    assert (
+        _publish.severity(red + "\n" + note) == "high"
+    ), "appended notice ate the verdict"
+    assert (
+        _publish.severity(note + red) == "ok"
+    ), "a prepended notice is what this guards"
+
+
 def test_the_summary_says_what_the_pr_does(report, monkeypatch):
     """The card's bold one-sentence summary must reach the posted review.
 

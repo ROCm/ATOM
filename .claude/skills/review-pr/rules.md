@@ -663,18 +663,6 @@ motivates it.
 
 ---
 
-### T — Triton Kernel Review
-
-Ported from aiter's own `.claude/skills/review-pr/rules.md`, graded individually rather
-than flattened: aiter's own T1-T9 (plus its B2, which duplicates T1 under a second id) are
-not all equally evidenced on ATOM, and this section says so per rule instead of porting
-the whole family at the same confidence. T2 (mask with no `other=`) and T4 (AMD launch
-knobs — `waves_per_eu`/`matrix_instr_nonkdim`/`kpack` — hardcoded ACROSS archs) are **not
-ported**: T2 was never checked against ATOM (absence of a citation here is "not checked",
-not "clean"), and T4 was checked and came back with zero hits for those three names in the
-directories sampled for this assessment — "not found in sampled directories", not "absent
-from ATOM". Neither claim should be read as more than it is.
-
 **N6 — a self-described workaround with no root cause named** ⚠️
 The reviewer's standing objection to a special case is not that special cases are wrong, but
 that the PR stops at the symptom. A comment that calls its own code a workaround, a hack, or
@@ -693,6 +681,18 @@ This rule does not say the workaround is wrong. It says the card must carry the 
 the reason it is not being fixed here, so the reviewer decides that rather than inheriting it.
 → `⚠️ N6: [FILE]:[LINE] describes itself as [WORD] — name the underlying defect and say why it
 is handled here rather than at its source, or drop the wording if it is not actually temporary`
+
+### T — Triton Kernel Review
+
+Ported from aiter's own `.claude/skills/review-pr/rules.md`, graded individually rather
+than flattened: aiter's own T1-T9 (plus its B2, which duplicates T1 under a second id) are
+not all equally evidenced on ATOM, and this section says so per rule instead of porting
+the whole family at the same confidence. T2 (mask with no `other=`) and T4 (AMD launch
+knobs — `waves_per_eu`/`matrix_instr_nonkdim`/`kpack` — hardcoded ACROSS archs) are **not
+ported**: T2 was never checked against ATOM (absence of a citation here is "not checked",
+not "clean"), and T4 was checked and came back with zero hits for those three names in the
+directories sampled for this assessment — "not found in sampled directories", not "absent
+from ATOM". Neither claim should be read as more than it is.
 
 **T5 ("accumulator precision loses tail-of-sum bits") was landed here, then removed.** It
 had no ATOM citation from the start — carried from aiter and labeled uncited, same as T6

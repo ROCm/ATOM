@@ -114,8 +114,9 @@ for c in d.get('comments',[]):
 # caught 0 of 3 known overflow defects and no run invoked the scanner at all. Put the candidate
 # list in context before the rule pass instead of relying on the reviewer to remember it.
 #
-# The scanner lives under review-pr/, not validate-atom-pr/ (which still does not exist --
-# the same gap REVIEW_AUTO_VALIDATE guards further down). It feeds Step 1 review evidence
+# The scanner lives under review-pr/, not validate-atom-pr/ (which this PR adds, but whose
+# production_scale.md is still the gap REVIEW_AUTO_VALIDATE guards further down). It feeds
+# Step 1 review evidence
 # directly; it is not a validation-pipeline executor, so it does not wait on that directory.
 # SCALE/SCHEMA are genuinely P2 (validate-atom-pr/'s own artifacts) and stay gated: their
 # absence reads as an environment gap on the card, never a finding against the PR and never
