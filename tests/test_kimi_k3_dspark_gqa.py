@@ -813,6 +813,32 @@ def test_the_builder_drops_the_padded_decode_rows():
     ]
 
 
+def test_a_request_less_prefill_drops_every_padded_row(monkeypatch):
+    """An idle DP rank's prefill (`dummy_execution`) schedules no token but
+    runs `running_tokens` padding rows through the draft: `stage_prefill`
+    stages them all `-1`, out to the width the target's slots go up at."""
+    import numpy as np
+
+    kimi = _gpu_stack_import("atom.model_ops.attentions.kimi_mla_gdn_attn")
+    monkeypatch.setattr(
+        kimi.GDNStateMixin, "stage_prefill", lambda self, *a: ("md", "pos")
+    )
+    stub = _builder_stub(1024, _TABLES, [5, 6])
+    builder = object.__new__(kimi.KimiAiterMLAGDNMetadataBuilder)
+    builder.__dict__.update(vars(stub))
+    batch = types.SimpleNamespace(
+        is_dummy_run=False,
+        block_tables=[],
+        total_seqs_num_prefill=0,
+        num_scheduled_tokens=np.zeros(0, dtype=np.int32),
+    )
+    group = _Group()
+    assert builder.stage_prefill(batch, 1, 8, group) == ("md", "pos")
+    buf = stub.model_runner.forward_vars["draft_ctx_slots"]
+    assert group.counts[id(buf)] == 8
+    assert buf.np[:8].tolist() == [-1] * 8
+
+
 def test_the_builder_skips_dummy_runs_and_drafts_without_a_pool():
     """A dummy run stages and counts nothing; a target with no pooled draft
     has no buffer to fill and is a no-op."""

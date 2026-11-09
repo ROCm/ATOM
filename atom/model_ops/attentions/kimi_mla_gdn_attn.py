@@ -525,10 +525,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         built = super().stage_prefill(batch, running_bs, running_tokens, group)
         scheduled_bs = batch.total_seqs_num_prefill
         self._stage_draft_ctx_slots(
-            batch,
-            batch.num_scheduled_tokens[:scheduled_bs],
-            batch.total_tokens_num_prefill,
-            group,
+            batch, batch.num_scheduled_tokens[:scheduled_bs], running_tokens, group
         )
         return built
 
