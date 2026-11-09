@@ -148,19 +148,32 @@ def test_a_released_unsent_seq_gives_its_charge_back():
     assert mgr._backlog_effective_tokens_locked() == [0, 0]
 
 
-def test_a_mooncake_store_tier_defaults_min_load_to_512(monkeypatch):
-    from atom.kv_transfer.offload.config import default_store_min_load_tokens
+def test_load_threshold_is_per_config_and_preserves_explicit_override(monkeypatch):
+    from atom.config import Config
+    from atom.kv_transfer.offload.config import min_load_tokens
 
+    monkeypatch.delenv("OFFLOAD_MIN_LOAD_TOKENS", raising=False)
     store = {"kv_connector": "mooncake_store", "kv_role": "offload"}
     pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
-    for config in (store, {"kv_connector": "multi", "connectors": [pd, store]}):
-        monkeypatch.delenv("OFFLOAD_MIN_LOAD_TOKENS", raising=False)
-        default_store_min_load_tokens(config)
-        assert os.environ["OFFLOAD_MIN_LOAD_TOKENS"] == "512"
-    # Another tier keeps the global default, and a value the user set is kept.
-    monkeypatch.delenv("OFFLOAD_MIN_LOAD_TOKENS", raising=False)
-    default_store_min_load_tokens({"kv_connector": "lmcache_mp"})
+
+    def snapshot(kv):
+        config = object.__new__(Config)
+        config.kv_transfer_config = kv
+        config._resolve_offload_min_load_tokens()
+        return config
+
+    first = snapshot(store)
+    assert min_load_tokens(first) == 512
+    assert (
+        min_load_tokens(snapshot({"kv_connector": "multi", "connectors": [pd, store]}))
+        == 512
+    )
+    assert min_load_tokens(snapshot({"kv_connector": "lmcache_mp"})) == 8192
+    assert min_load_tokens(snapshot({})) == 8192
     assert "OFFLOAD_MIN_LOAD_TOKENS" not in os.environ
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "2048")
-    default_store_min_load_tokens(store)
-    assert os.environ["OFFLOAD_MIN_LOAD_TOKENS"] == "2048"
+    assert min_load_tokens(snapshot(store)) == 2048
+    assert min_load_tokens(snapshot({"kv_connector": "lmcache_mp"})) == 2048
+    assert min_load_tokens(first) == 512  # workers retain their parent's snapshot
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
+    assert min_load_tokens(snapshot(store)) == 0

@@ -1296,6 +1296,9 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
             self.state.current_stream = None
 
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self):
             self.current_stream = None
             self.staging_buffer = SimpleNamespace(
@@ -1382,6 +1385,9 @@ def test_staged_pipeline_skips_the_handshake_on_a_shared_stream(shared_stream):
             calls.append(("host_wait", self.name))
 
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self):
             self.staging_buffer = SimpleNamespace(
                 tensor=None,
@@ -1460,6 +1466,9 @@ def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | Non
             pass
 
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self) -> None:
             self.pack_stream = _FakeStream("pack")
             self.copy_stream = _FakeStream("copy")
@@ -1650,6 +1659,9 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     monkeypatch.setattr(connector, "_ensure_staging_buffer", _ensure_staging_buffer)
 
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self) -> None:
             # Real streams and events, not doubles: the connector hands these
             # to `torch.cuda.stream()` and to `Stream.wait_event`, which read a

@@ -68,6 +68,7 @@ class _Case:
         self.fail_stream = None
         self.fail_allocation = False
         self.state = SimpleNamespace(
+            begin_transfer=lambda: None,
             pack_stream=self.Stream(self, "pack"),
             copy_stream=self.Stream(self, "copy"),
             stream_ctx=self.stream_ctx,

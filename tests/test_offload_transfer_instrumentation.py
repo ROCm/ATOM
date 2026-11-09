@@ -16,6 +16,7 @@ class _PipelineHarness:
         self.pack = self.Stream()
         self.copy = self.Stream()
         self.state = SimpleNamespace(
+            begin_transfer=lambda: None,
             pack_stream=self.pack,
             copy_stream=self.copy,
             stream_ctx=self.stream_ctx,

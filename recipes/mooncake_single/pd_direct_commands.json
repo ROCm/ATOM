@@ -132,8 +132,7 @@
       "--tool-call-parser",
       "dsml_v41",
       "--kv-transfer-config",
-      "{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"127.0.0.1\",\"http_port\":19300,\"handshake_port\":29300,\"protocol\":\"rdma\"}",
-      "--offload-prefetch"
+      "{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"127.0.0.1\",\"http_port\":19300,\"handshake_port\":29300,\"protocol\":\"rdma\"}"
     ],
     "environment": {
       "HIP_VISIBLE_DEVICES": "0,1,2,3",

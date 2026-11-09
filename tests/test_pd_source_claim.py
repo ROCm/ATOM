@@ -160,3 +160,40 @@ def test_nothing_is_claimed_when_nothing_will_be_sent(build):
         seq.leave_reason = "stop_sequence"
         local_only.request_finished(seq)
         assert local_only.should_defer_free(seq) is False
+
+
+@pytest.mark.parametrize("previous_claim", [False, True])
+def test_mooncake_withdrawn_admission_drops_only_its_new_producer_state(previous_claim):
+    sched = _mooncake()
+    sched.enable_chunked_transfer = True
+    seq = _seq(chunked_transfer=True, do_remote_decode=True, transfer_id="t")
+    seq.prompt_token_ids = [1, 2, 3]
+    seq.num_prompt_tokens = 3
+    older = (seq, [8, 9], -1)
+    if previous_claim:
+        sched._awaiting_send.add(str(seq.id))
+        sched._reqs_need_save[seq.id] = older
+    sched._chunked_ready.add(seq.id)
+    sched.update_state_after_alloc(seq)
+    assert seq.id in sched._reqs_need_save
+    sched.cancel_preadmission(seq)
+    sched.cancel_preadmission(seq)  # idempotent
+    assert seq.id in sched._chunked_ready  # keep the already-ready D reservation
+    if previous_claim:
+        assert sched._reqs_need_save[seq.id] is older
+        assert sched.should_defer_free(seq)
+    else:
+        assert seq.id not in sched._reqs_need_save
+        assert not sched.should_defer_free(seq)
+
+
+def test_mooncake_preadmission_cancel_cannot_release_a_dispatched_source():
+    sched = _mooncake()
+    sched.enable_chunked_transfer = True
+    seq = _seq(chunked_transfer=True, do_remote_decode=True, transfer_id="t")
+    seq.prompt_token_ids = [1, 2, 3]
+    seq.num_prompt_tokens = 3
+    sched.update_state_after_alloc(seq)
+    sched.build_connector_meta()
+    sched.cancel_preadmission(seq)
+    assert sched.should_defer_free(seq)
