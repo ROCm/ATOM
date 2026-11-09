@@ -219,10 +219,9 @@ def _flydsl_explicit_plan_api() -> bool:
     """Whether aiter has #5809's FlyDSL decode API (explicit work plans).
 
     An older aiter would raise on the first call; probing once lets the gate
-    decline the call before entering aiter. Before #5809 `work_plan` was
-    positional and optional and `pa_decode` took no `max_context_length`;
-    aiter #7056 made the keyword `work_plan` optional again for MXFP4 K/V
-    only, so whether it has a default does not tell the two apart.
+    decline the call before entering aiter. Checks only markers of that API
+    (`max_context_length`, and the `plan_pa_decode` ATOM calls), not how
+    `work_plan` is declared: aiter may omit it for K/V ATOM does not send.
     """
     import inspect
 
@@ -234,13 +233,7 @@ def _flydsl_explicit_plan_api() -> bool:
         ok = False
     else:
         params = inspect.signature(mod.pa_decode).parameters
-        plan = params.get("work_plan")
-        ok = (
-            hasattr(mod, "plan_pa_decode")
-            and plan is not None
-            and plan.kind is inspect.Parameter.KEYWORD_ONLY
-            and "max_context_length" in params
-        )
+        ok = hasattr(mod, "plan_pa_decode") and "max_context_length" in params
     if not ok:
         fallback = (
             "using gluon"

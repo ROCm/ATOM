@@ -1273,46 +1273,35 @@ class TestExplicitPlan:
         ubatch[0] = 0
         assert self._call(ba, owner=step, cache_owner=step) is ub0
 
-    def test_old_aiter_api_takes_gluon(self, monkeypatch):
-        """An aiter without #5809's explicit work plan must not be routed."""
+    @staticmethod
+    def _before_5809(output, query, max_context_partition_num, work_plan=None):
+        raise AssertionError("not called")
+
+    @staticmethod
+    def _no_bound(output, *a, work_plan, sinks=None):
+        raise AssertionError("not called")
+
+    @staticmethod
+    def _optional_plan(output, *a, work_plan=None, max_context_length=None):
+        raise AssertionError("not called")
+
+    @pytest.mark.parametrize(
+        "signature,routed",
+        [("_before_5809", False), ("_no_bound", False), ("_optional_plan", True)],
+    )
+    def test_flydsl_api_probe(self, monkeypatch, signature, routed):
+        """Only an aiter with #5809's explicit-plan API is routed to FlyDSL."""
         from atom.model_ops import base_attention as ba
 
         mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
-
-        def before_5809(output, query, max_context_partition_num, work_plan=None):
-            raise AssertionError("not called")
-
-        def no_bound(output, *a, work_plan, sinks=None):
-            raise AssertionError("not called")
-
         try:
-            for old in (before_5809, no_bound):
-                monkeypatch.setattr(mod, "pa_decode", old)
-                ba._flydsl_explicit_plan_api.cache_clear()
-                assert ba._flydsl_explicit_plan_api() is False, old.__name__
+            monkeypatch.setattr(mod, "pa_decode", getattr(self, signature))
+            ba._flydsl_explicit_plan_api.cache_clear()
+            assert ba._flydsl_explicit_plan_api() is routed
         finally:
             monkeypatch.undo()
             ba._flydsl_explicit_plan_api.cache_clear()
         assert ba._flydsl_explicit_plan_api() is True
-
-    def test_mxfp4_optional_plan_api_is_routed(self, monkeypatch):
-        """aiter #7056 lets MXFP4 K/V omit the plan; ATOM still passes one."""
-        from atom.model_ops import base_attention as ba
-
-        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
-
-        def optional_plan(
-            output, *a, work_plan=None, max_context_length=None, mask_unowned_kv=True
-        ):
-            raise AssertionError("not called")
-
-        try:
-            monkeypatch.setattr(mod, "pa_decode", optional_plan)
-            ba._flydsl_explicit_plan_api.cache_clear()
-            assert ba._flydsl_explicit_plan_api() is True
-        finally:
-            monkeypatch.undo()
-            ba._flydsl_explicit_plan_api.cache_clear()
 
     def test_dense_site_leaves_the_bound_to_the_block_table(self):
         """max_seqlen_k differs between graph and eager and picks the kernel."""
