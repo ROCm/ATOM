@@ -1851,6 +1851,7 @@ jobs:
           set -euo pipefail
           test -s atomesh-dashboard-input/atomesh-benchmark-action.json
           cp .github/dashboard/index.html /tmp/atomesh_dashboard_index.html
+          cp .github/dashboard/agentic.html /tmp/atomesh_dashboard_agentic.html
 
       - name: Prepare existing dashboard data
         id: prepare_dashboard_data
@@ -1887,7 +1888,8 @@ jobs:
           mkdir -p benchmark-dashboard
 
           cp /tmp/atomesh_dashboard_index.html benchmark-dashboard/index.html
+          cp /tmp/atomesh_dashboard_agentic.html benchmark-dashboard/agentic.html
 
-          git add benchmark-dashboard/index.html
+          git add benchmark-dashboard/index.html benchmark-dashboard/agentic.html
           git diff --cached --quiet || git commit -m "Update ATOMesh benchmark dashboard"
           git push origin gh-pages

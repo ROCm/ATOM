@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ATOM · Agentic performance</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    a { color: inherit; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    header, .header-left, .header-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+    header { justify-content: space-between; }
+    .container { margin: 24px auto; }
+    .header-actions select { color: inherit; background: var(--bg-secondary); border: 1px solid var(--border); padding: 7px; border-radius: 6px; }
+    .header-actions label { font-size: 12px; }
+    .header-subtitle { color: var(--text-tertiary); margin-top: 4px; font-size: 12px; }
+    /* Performance explorer: neutral surfaces, a large plot and an inspection rail. */
+    body.explorer {
+      --bg-primary: #111214; --bg-secondary: #18191b; --bg-tertiary: #222326;
+      --border: #424448; --border-light: #2e3034;
+      --text-primary: #f2f2f3; --text-secondary: #c7c8cc; --text-tertiary: #94969e;
+      --explorer-accent: #ff6685; --explorer-soft: #322027;
+      background: var(--bg-primary); color: var(--text-secondary); color-scheme: dark;
+    }
+    [data-theme="light"] body.explorer {
+      --bg-primary: #f0f1f3; --bg-secondary: #ffffff; --bg-tertiary: #f5f6f7;
+      --border: #bfc3ca; --border-light: #dce0e5;
+      --text-primary: #202226; --text-secondary: #4d5159; --text-tertiary: #696f79;
+      --explorer-accent: #d4385a; --explorer-soft: #fff0f3; color-scheme: light;
+    }
+    .explorer header { position: static; max-width: none; min-height: 60px; padding: 12px 32px; background: var(--bg-primary); border-bottom: 1px solid var(--border-light); }
+    .explorer .header-left { gap: 18px; }
+    .explorer .header-logo { height: 24px; }
+    .explorer h1 { font-size: 14px; font-weight: 500; color: var(--text-secondary); }
+    .explorer .header-left > div { padding-right: 42px; }
+    .explorer .container { max-width: 1680px; padding: 0 32px 28px; }
+    .ex-config { padding: 12px 18px 16px; margin-bottom: 18px; border: 1px solid var(--border-light); border-radius: 10px; background: var(--bg-secondary); }
+    .ex-config-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; font-size: 12px; color: var(--text-secondary); }
+    .ex-config-head span { color: var(--text-tertiary); font-size: 11px; }
+    .ex-controls { display: grid; grid-template-columns: 1fr .7fr 1.5fr; gap: 16px; }
+    .ex-field { min-width: 0; }
+    .ex-field label { display: block; color: var(--text-secondary); font-size: 12px; margin-bottom: 7px; }
+    .ex-field select { min-width: 0; width: 100%; height: 37px; padding: 0 10px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 6px; color: var(--text-primary); font: inherit; font-size: 13px; cursor: pointer; text-overflow: ellipsis; }
+    .ex-field option { background: var(--bg-secondary); color: var(--text-primary); }
+    .ex-panel { border: 1px solid var(--border-light); border-radius: 12px; background: var(--bg-secondary); overflow: hidden; }
+    .ex-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 24px 14px; }
+    .ex-model-title { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .ex-model-title h2 { font-size: 19px; letter-spacing: -.3px; font-weight: 650; color: var(--text-primary); }
+    .ex-chip { font-size: 11px; font-weight: 500; padding: 3px 6px; border: 1px solid var(--border); color: var(--text-secondary); border-radius: 4px; }
+    .ex-panel-head p { font-size: 13px; color: var(--text-secondary); margin-top: 6px; }
+    .ex-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding: 0 24px 20px; }
+    .ex-axis-control { display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--text-tertiary); }
+    .ex-segments { display: inline-flex; background: var(--bg-primary); border: 1px solid var(--border-light); padding: 3px; border-radius: 6px; gap: 3px; }
+    .ex-segments button { padding: 7px 11px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--text-tertiary); font: inherit; font-size: 12px; cursor: pointer; }
+    .ex-segments button[aria-pressed="true"] { background: var(--bg-tertiary); color: var(--text-primary); border-color: var(--border); }
+    .ex-direction { font-size: 11px; color: var(--text-tertiary); }
+    .ex-actions { display: flex; align-items: center; gap: 7px; }
+    .ex-button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 7px 10px; background: transparent; color: var(--text-secondary); border: 1px solid var(--border); border-radius: 6px; font: inherit; font-size: 12px; cursor: pointer; }
+    .ex-button svg { width: 14px; height: 14px; }
+    .ex-button:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+    .ex-button:disabled { cursor: default; opacity: .4; }
+    .ex-chart-layout { display: grid; grid-template-columns: minmax(0, 1fr) 248px; gap: 20px; padding: 0 24px 0 16px; }
+    .ex-plot-main { min-width: 0; }
+    .ex-chart { height: clamp(420px, 55vh, 650px); position: relative; }
+    .ex-chart canvas { max-width: 100%; }
+    .ex-sidebar { align-self: start; min-width: 0; background: var(--bg-primary); border: 1px solid var(--border-light); border-radius: 8px; padding: 16px; }
+    .ex-section-label { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--text-tertiary); margin-bottom: 10px; }
+    .ex-legend { display: flex; flex-direction: column; gap: 5px; }
+    .ex-legend button { display: flex; align-items: center; gap: 9px; border: none; padding: 6px 0; background: none; font: inherit; font-size: 13px; color: var(--text-primary); cursor: pointer; text-align: left; }
+    .ex-legend button[aria-pressed="false"] { opacity: .4; text-decoration: line-through; }
+    .ex-dot { width: 10px; height: 10px; flex-shrink: 0; border-radius: 50%; background: var(--series-color); display: inline-block; }
+    .ex-dot[data-mode="aggregated"] { border-radius: 1px; }
+    .ex-dot[data-mode="unknown"] { border-radius: 0; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+    .ex-check { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; margin-top: 14px; padding-top: 15px; border-top: 1px solid var(--border-light); color: var(--text-secondary); cursor: pointer; }
+    .ex-check input { appearance: none; width: 29px; height: 17px; flex-shrink: 0; border-radius: 20px; background: var(--border); border: 1px solid var(--border); cursor: pointer; position: relative; }
+    .ex-check input::after { content: ''; position: absolute; width: 11px; height: 11px; border-radius: 50%; background: var(--text-secondary); top: 2px; left: 2px; transition: transform .15s; }
+    .ex-check input:checked { background: var(--explorer-accent); border-color: var(--explorer-accent); }
+    .ex-check input:checked::after { transform: translateX(12px); background: #fff; }
+    .ex-count { color: var(--text-tertiary); font-size: 11px; line-height: 1.6; margin-top: 8px; }
+    .ex-inspector { border-top: 1px solid var(--border-light); margin-top: 17px; padding-top: 17px; }
+    .ex-selection-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--text-secondary); font-size: 12px; margin-bottom: 11px; }
+    .ex-selection-head button { font-size: 11px; padding: 2px 5px; border: 0; }
+    .ex-active-run { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; font-size: 11px; color: var(--text-tertiary); margin-bottom: 17px; }
+    .ex-active-run > span { width: 100%; }
+    .ex-run-link { color: var(--explorer-accent); font-size: 12px; white-space: nowrap; }
+    .ex-detail[hidden], .ex-overview[hidden], .ex-selection-head button[hidden] { display: none; }
+    .ex-detail h4, .ex-eyebrow { font-size: 11px; color: var(--text-tertiary); font-weight: 400; margin-bottom: 10px; }
+    .ex-metric-hero { margin-bottom: 18px; }
+    .ex-metric-hero dt { color: var(--text-tertiary); font-size: 11px; margin-bottom: 6px; }
+    .ex-metric-hero dd { color: var(--text-primary); font-size: 25px; font-weight: 600; letter-spacing: -.6px; font-variant-numeric: tabular-nums; }
+    .ex-metric-hero dd small { font-size: 11px; font-weight: 400; color: var(--text-tertiary); letter-spacing: 0; }
+    .ex-metric-list { display: grid; gap: 12px; }
+    .ex-metric-list > div { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 12px; }
+    .ex-metric-list dt { color: var(--text-tertiary); }
+    .ex-metric-list dd { color: var(--text-primary); font-variant-numeric: tabular-nums; text-align: right; overflow-wrap: anywhere; }
+    .ex-detail > .ex-run-link { display: inline-block; margin-top: 16px; }
+    .ex-source { font-size: 12px; color: var(--text-tertiary); }
+    .ex-caption { display: flex; justify-content: space-between; gap: 15px; padding: 4px 12px 18px 58px; font-size: 11px; line-height: 1.5; color: var(--text-tertiary); }
+    .ex-panel-foot { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; border-top: 1px solid var(--border-light); padding: 12px 24px; font-size: 11px; color: var(--text-tertiary); }
+    .ex-table-panel { margin-top: 16px; border: 1px solid var(--border-light); border-radius: 8px; background: var(--bg-secondary); }
+    .ex-table-panel summary { padding: 15px 20px; font-size: 12px; color: var(--text-secondary); cursor: pointer; }
+    .ex-table-scroll { overflow-x: auto; }
+    .ex-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; white-space: nowrap; }
+    .ex-table th { font-weight: 500; color: var(--text-tertiary); background: var(--bg-primary); }
+    .ex-table td, .ex-table th { padding: 11px 20px; border-top: 1px solid var(--border-light); }
+    .ex-table td { font-variant-numeric: tabular-nums; }
+    .ex-table tbody tr:hover { background: var(--bg-tertiary); }
+    .ex-table .num { text-align: right; }
+    .ex-footer { display: flex; justify-content: space-between; gap: 20px; margin-top: 14px; font-size: 11px; line-height: 1.8; color: var(--text-tertiary); }
+    .ex-footer a { color: var(--text-secondary); }
+    .ex-empty { display: grid; align-content: center; height: 420px; text-align: center; padding: 30px; color: var(--text-tertiary); font-size: 13px; line-height: 1.8; }
+    .explorer :is(button, select, input, summary, a):focus-visible { outline: 2px solid var(--explorer-accent); outline-offset: 3px; }
+    @media (max-width: 1100px) {
+      .explorer header { gap: 12px; padding: 12px 22px; }
+      .explorer .container { padding-inline: 22px; }
+      .ex-controls { grid-template-columns: 1fr .7fr 1.3fr; gap: 12px; }
+      .ex-chart-layout { grid-template-columns: minmax(0, 1fr) 224px; gap: 10px; padding-right: 16px; padding-left: 8px; }
+      .ex-sidebar { padding: 14px; }
+      .ex-caption { padding-left: 16px; }
+    }
+    @media (max-width: 800px) {
+      .ex-chart-layout { grid-template-columns: minmax(0, 1fr); padding: 0 16px; }
+      .ex-sidebar { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 16px; }
+      .ex-inspector { border-top: 0; border-left: 1px solid var(--border-light); margin-top: 0; padding-top: 0; padding-left: 20px; }
+      .ex-chart { height: 420px; }
+      .ex-direction { display: none; }
+    }
+    @media (max-width: 550px) {
+      .explorer header { padding: 12px; }
+      .explorer .container { padding: 0 12px 20px; }
+      .explorer .header-logo { height: 21px; }
+      .explorer h1 { font-size: 12px; }
+      .ex-config { padding: 12px; margin-bottom: 14px; }
+      .ex-controls { grid-template-columns: 1fr 1fr; gap: 12px; }
+      .ex-field:last-child { grid-column: 1 / -1; }
+      .ex-model-title h2 { font-size: 17px; }
+      .ex-panel-head { padding: 16px 14px; gap: 12px; align-items: flex-start; }
+      .ex-panel-head p { font-size: 12px; }
+      .ex-actions { gap: 5px; }
+      .ex-actions .ex-button { padding: 7px; font-size: 11px; }
+      .ex-actions .ex-button svg { display: none; }
+      .ex-toolbar { padding: 0 14px 14px; }
+      .ex-axis-control { display: block; width: 100%; }
+      .ex-axis-control > span { display: none; }
+      .ex-segments { width: 100%; }
+      .ex-segments button { flex: 1; padding: 7px 5px; font-size: 11px; }
+      .ex-chart-layout { padding: 0 6px; }
+      .ex-chart, .ex-empty { height: 360px; }
+      .ex-caption { padding: 4px 10px 16px; }
+      .ex-sidebar { display: block; margin: 0 8px 16px; padding: 16px; }
+      .ex-inspector { border-left: 0; border-top: 1px solid var(--border-light); padding-left: 0; padding-top: 16px; margin-top: 16px; }
+      .ex-active-run > span { width: auto; }
+      .ex-metric-list { grid-template-columns: 1fr 1fr; gap: 16px; }
+      .ex-metric-list > div { flex-direction: column; gap: 5px; }
+      .ex-metric-hero dd { font-size: 24px; }
+      .ex-panel-foot { padding: 12px 16px; }
+      .ex-footer { flex-direction: column; gap: 4px; }
+    }
+  </style>
+</head>
+<body class="explorer">
+<header>
+  <div class="header-left"><img class="header-logo" src="atom_logo.png" alt="ATOM">
+    <div><h1>Agentic performance</h1><p class="header-subtitle">Throughput and response speed</p></div>
+  </div>
+  <div class="header-actions">
+    <label>Hardware <select id="hardware" aria-label="Hardware"></select></label>
+    <button class="ex-button" id="theme-toggle" aria-label="Toggle light/dark mode">Light mode</button>
+    <button class="ex-button" id="reset">Reset</button>
+    <button class="ex-button" id="copy-link">Copy link</button>
+    <a class="ex-button" href="index.html">Benchmark dashboard ↗</a>
+  </div>
+</header>
+<main class="container"><div id="tab-performance"></div></main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" integrity="sha384-bs/nf9FbdNouRbMiFcrcZfLXYPKiPaGVGplVbv7dLGECccEXDW+S3zjqSKR5ZEaD" crossorigin="anonymous"></script>
+<script src="data.js"></script>
+<script>
+'use strict';
+(() => {
+const ATOMESH_DATA = {backend: 'ATOMesh', hardware: 'unknown'};
+function parseAtomeshNumber(value) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  if (!text || text === '--' || text === '—') return null;
+  const parsed = Number(text.replace(/,/g, ''));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function atomeshInteractivityMethod(value) {
+  const text = String(value || '').toLowerCase();
+  if (!text) return '';
+  if (text.includes('p90')) return 'p90_e2e_normalized';
+  if (text.includes('median')) return 'median_tpot';
+  return text;
+}
+
+function atomeshHardwareKey(value) {
+  const text = String(value || ATOMESH_DATA.hardware || '').toLowerCase();
+  if (text.includes('mi350')) return 'mi350x';
+  if (text.includes('mi355')) return 'mi355x';
+  return text || 'unknown';
+}
+
+function parseAtomeshPerfPointExtra(extra) {
+  if (typeof extra !== 'string' || !extra) return null;
+  const meta = {};
+  let point = null;
+  for (const rawPart of extra.split(' | ')) {
+    const part = rawPart.trim();
+    if (part.startsWith('Run: ')) {
+      meta.runUrl = part.slice(5).trim();
+    } else if (part.startsWith('perf_point=')) {
+      try {
+        point = JSON.parse(decodeURIComponent(part.slice('perf_point='.length)));
+      } catch (_) {
+        point = null;
+      }
+    } else {
+      const eq = part.indexOf('=');
+      if (eq > 0) meta[part.slice(0, eq)] = part.slice(eq + 1);
+    }
+  }
+  return point ? { point, meta } : null;
+}
+
+function atomeshPointNumber(point, key) {
+  const value = point?.[key];
+  return Number.isFinite(value) ? value : parseAtomeshNumber(value);
+}
+
+function atomeshMergedModelName(row) {
+  const text = `${row.model || ''} ${row.topology || ''} ${row.id || ''}`.toLowerCase();
+  if (text.includes('eagle3') && !String(row.model || '').toLowerCase().includes('eagle3')) {
+    return `${row.model}-Eagle3`;
+  }
+  return row.model || 'unknown';
+}
+
+function atomeshBaseModelName(model) {
+  return String(model || 'unknown').replace(/-Eagle3$/i, '');
+}
+
+function isAgenticTraceRow(row) {
+  const benchmarkKind = String(row?.benchmarkKind || row?.benchmark_kind || '').toLowerCase();
+  if (benchmarkKind === 'aiperf_agentic' || benchmarkKind.includes('agentic')) return true;
+  const markers = [
+    row?.scenario,
+    row?.sourceTopology,
+    row?.topology,
+    row?.configLabel,
+    row?.id,
+  ].filter(Boolean).join(' ');
+  return /\bagent(?:ic|x)\b/i.test(markers);
+}
+
+function atomeshParetoFrontier(points) {
+  const sorted = points.slice().sort((a, b) => b.x - a.x || b.y - a.y);
+  const front = [];
+  let bestY = -Infinity;
+  for (const p of sorted) {
+    if (p.y > bestY) {
+      front.push(p);
+      bestY = p.y;
+    }
+  }
+  return front.reverse();
+}
+
+function atomeshDetailValue(value, formatter = null) {
+  if (value == null || value === '' || (typeof value === 'number' && !Number.isFinite(value))) return '—';
+  return formatter ? formatter(value) : escHTML(String(value));
+}
+const ATOMESH_INTERACTIVITY_METRICS = [
+  {
+    key: 'e2e_normalized',
+    label: 'P90 E2E Normalized Interactivity',
+    formula: '1 / p90(ITL + TTFT / output tokens) — amortizes prefill over the turn',
+    emptyHint: 'It is derived from every run, so an empty chart here means the selected rows have no throughput/latency data at all.',
+    value: row => row.interactivity,
+    frontierEligible: row => row.interactivityMethod === 'p90_e2e_normalized',
+  },
+  {
+    key: 'p90_itl',
+    label: 'P90 Interactivity',
+    formula: '1 / p90(ITL) — decode speed only, matching InferenceX p90_intvty',
+    emptyHint: 'It is recorded only for agentic runs published after this metric was added; older points carry P90 E2E Normalized Interactivity only.',
+    value: row => row.interactivityP90Itl,
+    frontierEligible: row => Number.isFinite(row.interactivityP90Itl),
+  },
+];
+
+function atomeshInteractivityMetric() {
+  return ATOMESH_INTERACTIVITY_METRICS.find(m => m.key === state.atomeshIntvtyMetric)
+    || ATOMESH_INTERACTIVITY_METRICS[0];
+}
+
+function atomeshPointRow(point, meta, idx) {
+  return {
+    id: `benchmark-point-${idx}`, model: point.model || 'unknown',
+    hardware: atomeshHardwareKey(point.hardware || meta.hardware),
+    sourceLabel: 'ATOM CI',
+    disaggregated: point.disaggregated ?? point.disagg ?? null,
+    isMultinode: typeof point.is_multinode === 'boolean' ? point.is_multinode : null,
+    nodeCount: atomeshPointNumber(point, 'num_nodes'),
+    topology: meta.display_topology || point.config_label || '',
+    configLabel: point.config_label || '',
+    benchmarkKind: point.benchmark_kind || '', scenario: point.scenario || '',
+    publicDataset: point.public_dataset || '', precision: point.precision || meta.precision || '',
+    concurrency: atomeshPointNumber(point, 'concurrency'),
+    interactivity: atomeshPointNumber(point, 'interactivity'),
+    interactivityMethod: atomeshInteractivityMethod(point.interactivity_method),
+    interactivityP90Itl: atomeshPointNumber(point, 'interactivity_p90_itl'),
+    totalTput: atomeshPointNumber(point, 'total_tput'),
+    totalGpu: atomeshPointNumber(point, 'total_gpu'),
+    prefillWorkers: atomeshPointNumber(point, 'prefill_workers'),
+    decodeWorkers: atomeshPointNumber(point, 'decode_workers'),
+    runUrl: point.run_url || meta.runUrl || '', date: point.timestamp || 0,
+  };
+}
+function buildExplorerBenchmarkRows(data) {
+  // Read the exact perf_point payload produced by process_result.py and stored
+  // by github-action-benchmark. Keep the latest publication of each recipe /
+  // concurrency; do not choose winners by throughput before calculating Pareto.
+  const runs = Object.values(data?.entries || {}).flat().sort((a, b) => (b.date || 0) - (a.date || 0));
+  const latest = new Map();
+  let index = 0;
+  for (const run of runs) {
+    for (const bench of run.benches || []) {
+      const parsed = parseAtomeshPerfPointExtra(bench.extra);
+      if (parsed?.point?.source !== 'ATOMesh') continue;
+      const row = atomeshPointRow(parsed.point, parsed.meta, index++);
+      if (!isAgenticTraceRow(row)) continue;
+      const model = atomeshMergedModelName(row);
+      const key = JSON.stringify([row.sourceLabel, row.hardware, model, explorerDeployment(row),
+        row.configLabel || row.topology, explorerWorkloadKey(row), row.concurrency]);
+      if (latest.has(key)) continue;
+      latest.set(key, { ...row, model,
+        sourceModel: row.model, sourceTopology: row.topology,
+        commit: run.commit, date: run.date || row.date || 0 });
+    }
+  }
+  return [...latest.values()];
+}
+
+// P90 axes only accept measurements with a known definition. In particular,
+// legacy 1000 / median(TPOT) values must never appear on the normalized P90 axis.
+function explorerMetricValue(row, metric) {
+  const value = metric.value(row);
+  return metric.frontierEligible(row) && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function explorerWorkloadKey(row) {
+  return JSON.stringify(['Agentic',
+    row.publicDataset || row.scenario || '', row.precision || 'Unspecified precision']);
+}
+
+function explorerWorkloadLabel(key) {
+  const [, dataset, precision] = JSON.parse(key);
+  return `${'Agentic coding'} · ${precision.toUpperCase()}${dataset ? ' · ' + dataset.split('/').pop() : ''}`;
+}
+
+function explorerModelName(model) {
+  return atomeshBaseModelName(model).split('/').pop().replace(/-(?:MXFP4|FP4|FP8|BF16)(?:-MTP\d*)?$/i, '');
+}
+
+function explorerDeployment(row) {
+  const declared = row.disaggregated;
+  if (declared === true || ['true', '1', 'yes'].includes(String(declared).toLowerCase())) return 'pd';
+  if (declared === false || ['false', '0', 'no'].includes(String(declared).toLowerCase())) return 'aggregated';
+  const topology = `${row.sourceTopology || ''} ${row.topology || ''} ${row.configLabel || ''}`;
+  if (/(?:^|[\s_-])agg(?:regated)?(?:[\s_-]|$)/i.test(topology)) return 'aggregated';
+  if ((row.prefillWorkers > 0 && row.decodeWorkers > 0) || /\d+p\d+d/i.test(topology)) return 'pd';
+  // Node placement is independent: PD can run on one physical node.
+  return 'unknown';
+}
+
+function explorerDeploymentLabel(row) {
+  return { pd: 'ATOMesh', aggregated: 'ATOM', unknown: 'Engine unknown' }[explorerDeployment(row)];
+}
+
+function explorerSeriesKey(row) {
+  return JSON.stringify([row.sourceLabel || 'ATOM CI', row.hardware, row.model, explorerDeployment(row)]);
+}
+
+function explorerFrontiers(points) {
+  const cohorts = new Map();
+  for (const point of points) {
+    const key = explorerSeriesKey(point.row);
+    if (!cohorts.has(key)) cohorts.set(key, []);
+    cohorts.get(key).push(point);
+  }
+  return [...cohorts.values()].map(atomeshParetoFrontier);
+}
+
+function explorerTopology(row) {
+  if (explorerDeployment(row) === 'aggregated') return 'Aggregated';
+  if (row.prefillWorkers && row.decodeWorkers) return `${row.prefillWorkers}P${row.decodeWorkers}D`;
+  return row.sourceTopology || row.topology || 'Unknown topology';
+}
+
+function explorerRunLink(row) {
+  const href = safeHref(row?.runUrl);
+  if (!href) return '<span class="ex-source">CI run unavailable</span>';
+  const runId = href.match(/\/actions\/runs\/(\d+)/)?.[1];
+  const label = runId ? `CI run #${runId} ↗` : 'Open CI run ↗';
+  return `<a class="ex-run-link" href="${escHTML(href).replace(/"/g, '&quot;')}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+}
+
+function explorerCompact(value, digits = 1) {
+  if (!Number.isFinite(value)) return '—';
+  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: digits }).format(value);
+}
+
+function renderAtomeshPerformanceTab() {
+  const container = document.getElementById('tab-performance');
+  Chart.getChart('ex-chart')?.destroy();
+  const metric = atomeshInteractivityMetric();
+  const metricLabel = metric.key === 'p90_itl' ? 'P90 Interactivity' : 'P90 Normalized Interactivity';
+  const available = explorerBenchmarkRows.filter(row => row.hardware === selectedHardware());
+  const models = [...new Set(available.map(row => explorerModelName(row.model)))].sort(_lc);
+  if (state.explorerModel) state.explorerModel = explorerModelName(state.explorerModel);
+  if (!models.includes(state.explorerModel)) {
+    state.explorerModel = models.find(model => available.some(row => explorerModelName(row.model) === model
+        && explorerMetricValue(row, metric) !== null && row.totalTput > 0)) || models[0] || '';
+  }
+  const modelRows = available.filter(row => explorerModelName(row.model) === state.explorerModel);
+  const sourceName = row => row.sourceLabel || 'ATOM CI';
+  const sources = [...new Set(modelRows.map(sourceName))].sort(_lc);
+  if (!sources.includes(state.explorerSource)) state.explorerSource = sources[0] || '';
+  const sourceLabel = state.explorerSource;
+  const sourceRows = modelRows;
+  const workloads = [...new Set(sourceRows.map(explorerWorkloadKey))].sort(_lc);
+  if (!workloads.includes(state.explorerWorkload)) {
+    state.explorerWorkload = workloads.find(key => sourceRows.some(row => explorerWorkloadKey(row) === key
+      && explorerMetricValue(row, metric) !== null && row.totalTput > 0)) || workloads[0] || '';
+  }
+  const rows = sourceRows.filter(row => explorerWorkloadKey(row) === state.explorerWorkload)
+    .sort((a, b) => _lc(explorerTopology(a), explorerTopology(b)) || a.concurrency - b.concurrency);
+  const seriesKey = explorerSeriesKey;
+  const seriesKeys = [...new Set(rows.map(seriesKey))];
+  const seriesRows = new Map(rows.map(row => [seriesKey(row), row]));
+  const seriesLabel = key => {
+    const row = seriesRows.get(key);
+    const variant = /eagle3/i.test(row.model) ? ' · Eagle3' : '';
+    return `${fmtHardware(row.hardware)} · ${explorerDeploymentLabel(row)}${variant}`;
+  };
+  const light = document.documentElement.getAttribute('data-theme') === 'light';
+  const palette = light ? { pd: ['#d4385a', '#a34591'], aggregated: ['#326acc', '#16856b'], unknown: ['#69717e'] }
+    : { pd: ['#ff6685', '#de91d0'], aggregated: ['#75a5ff', '#5fceb0'], unknown: ['#a0a8b5'] };
+  const modeCounts = {};
+  const colors = new Map(seriesKeys.map(key => {
+    const mode = explorerDeployment(seriesRows.get(key));
+    const index = modeCounts[mode] || 0; modeCounts[mode] = index + 1;
+    return [key, palette[mode][index % palette[mode].length]];
+  }));
+  const points = rows.filter(row => explorerMetricValue(row, metric) !== null
+    && Number.isFinite(row.totalTput) && row.totalTput > 0
+    && !state.explorerHidden.has(seriesKey(row)))
+    .map(row => ({ x: explorerMetricValue(row, metric), y: row.totalTput, row }));
+  const frontiers = explorerFrontiers(points);
+  const frontierRows = new Set(frontiers.flat().map(point => point.row));
+  const visible = points.filter(point => !state.explorerFrontierOnly || frontierRows.has(point.row));
+  const missing = rows.filter(row => explorerMetricValue(row, metric) === null || !Number.isFinite(row.totalTput) || row.totalTput <= 0).length;
+  const sourceUrl = 'https://github.com/ROCm/ATOM/actions/workflows/atomesh-benchmark.yaml';
+  const optionHTML = (options, selected, label = x => x) => options.map(option => `<option value="${escHTML(option).replace(/"/g, '&quot;')}" ${option === selected ? 'selected' : ''}>${escHTML(label(option))}</option>`).join('');
+  const initialPoint = visible.reduce((best, point) => !best || point.y > best.y
+    || (point.y === best.y && point.x > best.x) ? point : best, null);
+  let selectedRow = initialPoint?.row;
+  let explorerChart = null;
+  function inspectionMetrics(row) {
+    if (!row) return '<p class="ex-count">Select a configuration to inspect its measurements.</p>';
+    return `<dl class="ex-metric-hero"><dt>Total throughput</dt><dd>${explorerCompact(row.totalTput, 2)} <small>tok/s</small></dd></dl>
+      <dl class="ex-metric-list">
+        <div><dt>Engine</dt><dd>${explorerDeploymentLabel(row)}</dd></div>
+        <div><dt>P90 interactivity</dt><dd>${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), v => fmtNum(v, 2))}</dd></div>
+        <div><dt>P90 normalized</dt><dd>${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</dd></div>
+        <div><dt>Concurrency</dt><dd>${row.concurrency ?? '—'}</dd></div>
+        <div><dt>Topology / GPUs</dt><dd>${escHTML(explorerTopology(row))} / ${row.totalGpu ?? '—'}</dd></div>
+        ${row.nodeCount || row.isMultinode !== null ? `<div><dt>Placement</dt><dd>${row.nodeCount ? row.nodeCount + ' node' + (row.nodeCount === 1 ? '' : 's') : row.isMultinode ? 'Multi-node' : 'Single node'}</dd></div>` : ''}
+        <div><dt>Pareto optimal</dt><dd>${points.some(point => point.row === row) ? (frontierRows.has(row) ? 'Yes' : 'No') : '—'}</dd></div>
+      </dl><p class="ex-count" style="margin-top:14px">Interactivity in tok/s/user</p>`;
+  }
+  container.innerHTML = `
+    <section class="ex-config" aria-label="Benchmark configuration">
+      <div class="ex-config-head">Benchmark configuration <span>Latest published CI result per recipe</span></div>
+      <div class="ex-controls">
+        <div class="ex-field"><label for="ex-model">Model</label><select id="ex-model">${optionHTML(models, state.explorerModel)}</select></div>
+        <div class="ex-field"><label for="ex-source">Source</label><select id="ex-source">${optionHTML(sources, state.explorerSource)}</select></div>
+        <div class="ex-field"><label for="ex-workload">Workload / precision</label><select id="ex-workload">${optionHTML(workloads, state.explorerWorkload, explorerWorkloadLabel)}</select></div>
+      </div>
+    </section>
+    <section class="ex-panel" aria-label="Throughput and interactivity chart">
+      <div class="ex-panel-head">
+        <div><div class="ex-model-title"><h2>${escHTML(state.explorerModel || 'Inference performance')}</h2><span class="ex-chip">${escHTML((rows[0]?.precision || 'Precision unavailable').toUpperCase())}</span></div><p>Total throughput vs. ${metricLabel}</p></div>
+        <div class="ex-actions">
+          <button class="ex-button" id="ex-csv" title="Download measurements as CSV"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 9v12"/></svg>CSV</button>
+          <button class="ex-button" id="ex-png" title="Download chart as PNG" ${visible.length ? '' : 'disabled'}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5"/></svg>PNG</button>
+        </div>
+      </div>
+      <div class="ex-toolbar">
+        <div class="ex-axis-control"><span>X axis</span><div class="ex-segments" role="group" aria-label="X axis">
+          <button data-ex-metric="p90_itl" aria-pressed="${metric.key === 'p90_itl'}">P90 Interactivity</button>
+          <button data-ex-metric="e2e_normalized" aria-pressed="${metric.key === 'e2e_normalized'}">P90 Normalized Interactivity</button>
+        </div></div>
+        <span class="ex-direction">Higher throughput ↑ &nbsp; Faster responses →</span>
+      </div>
+      <div class="ex-chart-layout">
+        <div class="ex-plot-main">
+          ${visible.length ? '<div class="ex-chart"><canvas id="ex-chart" role="img" aria-label="Scatter plot of total throughput versus P90 interactivity. All values are available in the measurement table below."></canvas></div>'
+            : `<div class="ex-empty">No points available for ${metricLabel}.<br>${missing ? `${missing} configurations lack this P90 metric or total throughput.` : 'Choose a different model, workload, or filter; enable a series in the legend.'}</div>`}
+          <div class="ex-caption"><span>Click a point to inspect its measurements and CI run.</span></div>
+        </div>
+        <aside class="ex-sidebar" aria-label="Chart controls and configuration details">
+          <div>
+            <div class="ex-section-label"><span>Hardware / engine</span><span>${escHTML((rows[0]?.precision || '').toUpperCase())}</span></div>
+            <div class="ex-legend" aria-label="Series visibility">${seriesKeys.map((key, idx) => `<button data-ex-series="${idx}" aria-pressed="${!state.explorerHidden.has(key)}"><span class="ex-dot" data-mode="${explorerDeployment(seriesRows.get(key))}" style="--series-color:${colors.get(key)}"></span>${escHTML(seriesLabel(key))}</button>`).join('')}</div>
+            <label class="ex-check" for="ex-frontier"><span>Pareto only</span><input type="checkbox" id="ex-frontier" ${state.explorerFrontierOnly ? 'checked' : ''}></label>
+            <p class="ex-count">${visible.length} shown · ${points.length} measured configurations</p>
+          </div>
+          <div class="ex-inspector">
+            <div class="ex-selection-head"><span id="ex-selection-label">Peak throughput</span><button class="ex-button" id="ex-close-detail" aria-label="Close configuration details" hidden>Reset</button></div>
+            <div class="ex-active-run" id="ex-active-run" aria-label="Selected CI run" aria-live="polite"></div>
+            <div class="ex-overview" id="ex-overview">${inspectionMetrics(initialPoint?.row)}</div>
+            <aside class="ex-detail" id="ex-detail" aria-label="Selected configuration" aria-live="polite" hidden></aside>
+          </div>
+        </aside>
+      </div>
+      <div class="ex-panel-foot"><span>${frontierRows.size} Pareto-optimal configurations · ${escHTML(fmtHardware(selectedHardware()))}</span><span>${metric.key === 'p90_itl' ? '1 / p90(ITL)' : '1 / p90(ITL + TTFT / output tokens)'} · latency in seconds</span></div>
+    </section>
+    <details class="ex-table-panel"><summary>All measurements <span style="color:var(--text-tertiary)">· ${rows.length} configurations${missing ? ` · ${missing} missing the selected metric` : ''}</span></summary>
+      <div class="ex-table-scroll"><table class="ex-table"><thead><tr><th>Configuration</th><th class="num">GPUs</th><th class="num">Concurrency</th><th class="num">P90 interactivity</th><th class="num">P90 normalized</th><th class="num">Total tok/s</th><th>CI run</th></tr></thead>
+      <tbody>${rows.map((row, idx) => `<tr><td><button class="ex-button" data-ex-row="${idx}">${escHTML(explorerTopology(row))}</button></td><td class="num">${row.totalGpu ?? '—'}</td><td class="num">${row.concurrency ?? '—'}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</td><td class="num">${atomeshDetailValue(row.totalTput, v => fmtNum(v, 2))}</td><td>${explorerRunLink(row)}</td></tr>`).join('')}</tbody></table></div>
+    </details>
+    <div class="ex-footer"><span>${sourceUrl ? `<a href="${escHTML(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escHTML(sourceLabel)} ↗</a>` : escHTML(sourceLabel)}${missing ? ` · ${missing} configurations omitted from the chart: P90 metric or throughput unavailable.` : ''}</span><span>Total throughput = input + output tokens / second, across the full configuration.</span></div>`;
+
+  function updateRunLink(row, isPeak = false) {
+    document.getElementById('ex-active-run').innerHTML = row
+      ? `<span>${isPeak ? 'Peak · ' : ''}c${row.concurrency ?? '—'}</span>${explorerRunLink(row)}`
+      : '';
+  }
+  updateRunLink(initialPoint?.row, true);
+  document.getElementById('ex-close-detail').addEventListener('click', () => {
+    document.getElementById('ex-detail').hidden = true;
+    document.getElementById('ex-overview').hidden = false;
+    document.getElementById('ex-close-detail').hidden = true;
+    document.getElementById('ex-selection-label').textContent = 'Peak throughput';
+    selectedRow = initialPoint?.row;
+    updateRunLink(selectedRow, true);
+    explorerChart?.draw();
+  });
+  function showDetail(row) {
+    if (!row) return;
+    selectedRow = row;
+    updateRunLink(row);
+    document.getElementById('ex-overview').hidden = true;
+    document.getElementById('ex-close-detail').hidden = false;
+    document.getElementById('ex-selection-label').textContent = 'Selected configuration';
+    const detail = document.getElementById('ex-detail');
+    detail.hidden = false;
+    detail.innerHTML = `${inspectionMetrics(row)}${explorerRunLink(row)}`;
+    explorerChart?.draw();
+    detail.scrollIntoView({ block: 'nearest' });
+  }
+  function refresh() { renderAtomeshPerformanceTab(); syncToHash(); }
+  for (const [id, key] of [['ex-model', 'explorerModel'], ['ex-source', 'explorerSource'], ['ex-workload', 'explorerWorkload']]) {
+    document.getElementById(id).addEventListener('change', event => {
+      state[key] = event.target.value;
+      state.explorerHidden.clear();
+      refresh();
+    });
+  }
+  container.querySelectorAll('[data-ex-metric]').forEach(button => button.addEventListener('click', () => {
+    state.atomeshIntvtyMetric = button.dataset.exMetric; refresh();
+  }));
+  container.querySelectorAll('[data-ex-series]').forEach(button => button.addEventListener('click', () => {
+    const key = seriesKeys[Number(button.dataset.exSeries)];
+    if (state.explorerHidden.has(key)) state.explorerHidden.delete(key); else state.explorerHidden.add(key);
+    refresh();
+  }));
+  container.querySelectorAll('[data-ex-row]').forEach(button => button.addEventListener('click', () => {
+    showDetail(rows[Number(button.dataset.exRow)]);
+  }));
+  document.getElementById('ex-frontier').addEventListener('change', event => { state.explorerFrontierOnly = event.target.checked; refresh(); });
+
+  const download = (blob, filename) => {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a'); link.href = url; link.download = filename; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  document.getElementById('ex-csv').addEventListener('click', () => {
+    const escape = value => '"' + String(value ?? '').replace(/^[=+@-]/, "'$&").replace(/"/g, '""') + '"';
+    const records = [['model', 'source', 'workload', 'precision', 'serving_mode', 'topology', 'gpus', 'concurrency', 'p90_interactivity_tok_s_user', 'p90_normalized_interactivity_tok_s_user', 'total_throughput_tok_s', 'run_url'],
+      ...rows.map(row => [row.model, sourceName(row), row.publicDataset || row.scenario || row.islOsl, row.precision, explorerDeployment(row), explorerTopology(row), row.totalGpu, row.concurrency,
+        explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[1]), explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), row.totalTput, row.runUrl])];
+    download(new Blob([records.map(record => record.map(escape).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' }), 'atom-benchmark-measurements.csv');
+  });
+
+  if (visible.length) {
+    const datasets = seriesKeys.filter(key => !state.explorerHidden.has(key)).map(key => ({
+      label: key, data: visible.filter(point => seriesKey(point.row) === key),
+      borderColor: colors.get(key), backgroundColor: colors.get(key),
+      pointStyle: explorerDeployment(seriesRows.get(key)) === 'aggregated' ? 'rect' : explorerDeployment(seriesRows.get(key)) === 'unknown' ? 'triangle' : 'circle',
+      pointRadius: 4.5, pointHoverRadius: 6, pointHitRadius: 10,
+      pointBorderWidth: 1.5, pointBorderColor: light ? '#ffffff' : '#18191b', showLine: false,
+    }));
+    for (const frontier of frontiers) {
+      datasets.push({ label: 'Pareto frontier', data: frontier, showLine: true, fill: false,
+        borderColor: colors.get(seriesKey(frontier[0].row)), borderWidth: 2.2,
+        pointRadius: 0, pointHoverRadius: 0, pointHitRadius: 0, order: 1, _isFrontier: true });
+    }
+    // These annotations follow measured points; the frontier itself stays linear.
+    const inspectionPlugin = {
+      id: 'explorerInspection',
+      beforeDatasetsDraw(chart) {
+        const hit = chart.getActiveElements().find(item => !datasets[item.datasetIndex]._isFrontier);
+        if (!hit) return;
+        const { ctx, chartArea: area } = chart;
+        const { x, y } = hit.element;
+        ctx.save(); ctx.strokeStyle = light ? '#989da7' : '#777b85'; ctx.lineWidth = 1; ctx.setLineDash([3, 4]);
+        ctx.beginPath(); ctx.moveTo(area.left, y); ctx.lineTo(x, y); ctx.lineTo(x, area.bottom); ctx.stroke(); ctx.restore();
+      },
+      afterDatasetsDraw(chart) {
+        const { ctx, chartArea: area } = chart;
+        const labels = [];
+        ctx.save();
+        datasets.forEach((dataset, index) => {
+          if (dataset._isFrontier || !dataset.data.length) return;
+          const elements = chart.getDatasetMeta(index).data;
+          const selected = dataset.data.findIndex(point => point.row === selectedRow);
+          if (selected >= 0) {
+            const { x, y } = elements[selected];
+            ctx.strokeStyle = light ? '#42464e' : '#edeef0'; ctx.lineWidth = 1.2; ctx.setLineDash([2, 3]);
+            ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
+          }
+          // Attach one series label to an interior frontier point, clear of nearby dots.
+          const candidates = elements.filter((_element, i) => frontierRows.has(dataset.data[i].row));
+          const anchor = candidates.reduce((best, element) => !best || Math.abs(element.x - (area.left + area.width * .5)) < Math.abs(best.x - (area.left + area.width * .5)) ? element : best, null);
+          if (!anchor) return;
+          const label = seriesLabel(dataset.label);
+          ctx.font = '600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+          const width = Math.min(ctx.measureText(label).width + 18, area.width - 8), height = 24;
+          const left = Math.min(Math.max(anchor.x + 13, area.left + 4), area.right - width - 4);
+          let top = Math.max(area.top + 4, anchor.y - 38);
+          while (labels.some(box => left < box.right && left + width > box.left && top < box.bottom && top + height > box.top)) top += height + 5;
+          top = Math.min(top, area.bottom - height - 4);
+          labels.push({ left, right: left + width, top, bottom: top + height });
+          ctx.strokeStyle = dataset.borderColor; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(anchor.x, anchor.y - 5); ctx.lineTo(left + 8, top + height); ctx.stroke();
+          ctx.fillStyle = dataset.borderColor; ctx.beginPath(); ctx.roundRect(left, top, width, height, 4); ctx.fill();
+          ctx.fillStyle = light ? '#ffffff' : '#251219'; ctx.textBaseline = 'middle';
+          ctx.fillText(label, left + 9, top + height / 2, width - 18);
+        });
+        ctx.restore();
+      },
+    };
+    const chart = new Chart(document.getElementById('ex-chart'), {
+      type: 'scatter', data: { datasets },
+      plugins: [inspectionPlugin],
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        layout: { padding: { top: 12, right: 14 } },
+        interaction: { mode: 'nearest', intersect: true },
+        plugins: {
+          watermark: false,
+          legend: { display: false },
+          datalabels: { display: false },
+          tooltip: { borderWidth: 1, backgroundColor: light ? '#ffffff' : '#202124', borderColor: light ? '#bfc3ca' : '#53565e',
+            titleColor: light ? '#202226' : '#f2f2f3', bodyColor: light ? '#4d5159' : '#c7c8cc',
+            titleFont: { size: 13, weight: '600' }, bodyFont: { size: 12 }, bodySpacing: 7, titleMarginBottom: 12,
+            padding: 14, displayColors: false,
+            filter: item => !item.dataset._isFrontier,
+            callbacks: {
+              title: items => items.length ? `${explorerDeploymentLabel(items[0].raw.row)} · c${items[0].raw.row.concurrency}` : '',
+              label: item => [`Total throughput: ${fmtNum(item.raw.y, 2)} tok/s`, `${metricLabel}: ${fmtNum(item.raw.x, 2)} tok/s/user`, `${explorerTopology(item.raw.row)} · ${item.raw.row.totalGpu ?? '—'} GPUs`],
+              footer: items => items.some(item => safeHref(item.raw.row.runUrl)) ? 'Click to inspect · CI run available in details' : 'Click to inspect configuration',
+            } },
+        },
+        scales: {
+          x: { min: 0, grace: '6%', grid: { color: light ? '#dfe3e9' : '#303236', drawTicks: false }, border: { color: light ? '#989da7' : '#64676e' },
+            title: { display: true, text: `${metricLabel} (tok/s/user)`, color: light ? '#4d5159' : '#d2d3d7', font: { size: 12, weight: '500' }, padding: 15 },
+            ticks: { color: light ? '#696f79' : '#b1b3ba', maxTicksLimit: 9, padding: 8, font: { size: 12 } } },
+          y: { min: 0, grace: '8%', border: { color: light ? '#989da7' : '#64676e' }, grid: { color: light ? '#dfe3e9' : '#303236', drawTicks: false },
+            title: { display: true, text: 'Total throughput (tok/s)', color: light ? '#4d5159' : '#d2d3d7', font: { size: 12, weight: '500' }, padding: 12 },
+            ticks: { color: light ? '#696f79' : '#b1b3ba', maxTicksLimit: 9, padding: 8, font: { size: 12 }, callback: value => explorerCompact(value) } },
+        },
+        onHover: (_event, elements, hoveredChart) => { hoveredChart.canvas.style.cursor = elements.some(item => !datasets[item.datasetIndex]._isFrontier) ? 'pointer' : 'default'; },
+        onClick: (_event, elements) => {
+          const hit = elements.find(item => !datasets[item.datasetIndex]._isFrontier);
+          if (hit) showDetail(datasets[hit.datasetIndex].data[hit.index].row);
+        },
+      },
+    });
+    explorerChart = chart;
+    document.getElementById('ex-png').addEventListener('click', () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = chart.canvas.width;
+      const ctx = canvas.getContext('2d');
+      ctx.font = '12px sans-serif';
+      let legendX = 24, legendY = chart.canvas.height + 105;
+      const legend = seriesKeys.filter(key => !state.explorerHidden.has(key)).map(key => {
+        const width = Math.min(ctx.measureText(seriesLabel(key)).width + 42, canvas.width - 48);
+        if (legendX > 24 && legendX + width > canvas.width - 24) { legendX = 24; legendY += 22; }
+        const item = { key, x: legendX, y: legendY }; legendX += width;
+        return item;
+      });
+      canvas.height = legendY + 54;
+      ctx.fillStyle = light ? '#ffffff' : '#18191b'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = light ? '#1a1c24' : '#eef0f6'; ctx.font = 'bold 20px sans-serif';
+      ctx.fillText(`ATOM · ${state.explorerModel}`, 24, 30);
+      ctx.font = '12px sans-serif'; ctx.fillText(`${sourceLabel} · Total throughput vs. ${metricLabel}`, 24, 53, canvas.width - 48);
+      ctx.drawImage(chart.canvas, 0, 75);
+      for (const { key, x, y } of legend) {
+        ctx.fillStyle = colors.get(key);
+        if (explorerDeployment(seriesRows.get(key)) === 'aggregated') ctx.fillRect(x, y - 8, 8, 8);
+        else { ctx.beginPath(); ctx.arc(x + 4, y - 4, 4, 0, Math.PI * 2); ctx.fill(); }
+        ctx.fillText(seriesLabel(key), x + 15, y, canvas.width - x - 39);
+      }
+      ctx.fillStyle = light ? '#5c6070' : '#bfc1d0';
+      ctx.fillText(`Line: Pareto frontier · ${sourceUrl || ''}`, 24, legendY + 24, canvas.width - 48);
+      canvas.toBlob(blob => { if (blob) download(blob, 'atom-throughput-interactivity.png'); });
+    });
+  }
+}
+
+const _lc = (a, b) => String(a).localeCompare(String(b));
+const fmtHardware = value => String(value).toUpperCase();
+const fmtNum = (value, digits) => value == null ? '—' : value.toLocaleString(undefined, {minimumFractionDigits: digits, maximumFractionDigits: digits});
+function escHTML(value) { const node = document.createElement('span'); node.textContent = value; return node.innerHTML; }
+function safeHref(url) { return typeof url === 'string' && /^https:\/\//.test(url) ? url : null; }
+const explorerBenchmarkRows = buildExplorerBenchmarkRows(window.BENCHMARK_DATA);
+const hardwareOptions = [...new Set(explorerBenchmarkRows.map(row => row.hardware))].sort(_lc);
+const state = {hardware: hardwareOptions.includes('mi355x') ? 'mi355x' : hardwareOptions[0], explorerModel:'', explorerSource:'ATOM CI', explorerWorkload:'', atomeshIntvtyMetric:'p90_itl', explorerFrontierOnly:true, explorerHidden:new Set()};
+function selectedHardware() { return state.hardware; }
+function syncToHash() {
+  const params = new URLSearchParams({hardware:state.hardware || '', explorerModel:state.explorerModel, explorerSource:state.explorerSource, explorerWorkload:state.explorerWorkload, intvty:state.atomeshIntvtyMetric});
+  if (!state.explorerFrontierOnly) params.set('frontier','0');
+  const next = '#'+params;
+  if (location.hash !== next) history.pushState(null,'',next);
+}
+function readHash() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  if (hardwareOptions.includes(params.get('hardware'))) state.hardware = params.get('hardware');
+  for (const key of ['explorerModel','explorerSource','explorerWorkload']) state[key] = params.get(key) || (key === 'explorerSource' ? 'ATOM CI' : '');
+  state.atomeshIntvtyMetric = params.get('intvty') === 'e2e_normalized' ? 'e2e_normalized' : 'p90_itl';
+  state.explorerFrontierOnly = params.get('frontier') !== '0';
+  state.explorerHidden.clear();
+  document.getElementById('hardware').value = state.hardware;
+}
+const hardwareSelect = document.getElementById('hardware');
+for (const hardware of hardwareOptions) hardwareSelect.add(new Option(fmtHardware(hardware),hardware));
+hardwareSelect.onchange = () => { state.hardware = hardwareSelect.value; state.explorerHidden.clear(); renderAtomeshPerformanceTab(); syncToHash(); };
+document.getElementById('reset').onclick = () => { history.pushState(null,'',location.pathname); readHash(); renderAtomeshPerformanceTab(); syncToHash(); };
+document.getElementById('copy-link').onclick = async () => { syncToHash(); try { await navigator.clipboard.writeText(location.href); } catch (_) { document.getElementById('copy-link').textContent = 'Copy the address bar URL'; } };
+function applyTheme(light) {
+  document.documentElement.dataset.theme = light ? 'light' : 'dark';
+  document.getElementById('theme-toggle').textContent = light ? 'Dark mode' : 'Light mode';
+}
+applyTheme(localStorage.getItem('atom-agentic-theme') === 'light');
+document.getElementById('theme-toggle').onclick = () => { const light = document.documentElement.dataset.theme !== 'light'; localStorage.setItem('atom-agentic-theme',light ? 'light' : 'dark'); applyTheme(light); renderAtomeshPerformanceTab(); };
+window.addEventListener('hashchange', () => { readHash(); renderAtomeshPerformanceTab(); });
+readHash();
+renderAtomeshPerformanceTab();
+})();
+</script>
+</body>
+</html>
