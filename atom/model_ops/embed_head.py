@@ -354,14 +354,18 @@ class ParallelLMHead(VocabParallelEmbedding):
         return out.copy_(token)
 
     def _vocab_shard_logits(
-        self, x: torch.Tensor, rank: int, world: int
+        self,
+        x: torch.Tensor,
+        rank: int,
+        world: int,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``x``'s logits over the ``rank``-th of ``world`` equal vocab slices of
-        a replicated head."""
+        a replicated head, written into ``out`` when given."""
         vshard = self.num_embeddings // world
         vocab = slice(rank * vshard, (rank + 1) * vshard)
         bias = None if self.bias is None else self.bias[vocab]
-        return tgemm.mm(x, self.weight[vocab], bias)
+        return tgemm.mm(x, self.weight[vocab], bias, out=out)
 
     def _sp_sharded_logits(self, x: torch.Tensor) -> torch.Tensor:
         """Every Ulysses SP rank (TP1) holds the same rows here: project them
@@ -516,20 +520,7 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         # [max_rows, dim] -> [dp_size * max_rows, dim] (rank-major concat).
         gathered = dp_group.all_gather(x.contiguous(), dim=0, use_custom=use_custom)
-        # [dp_size * max_rows, V/dp]
-        logits_shard = self._vocab_shard_logits(gathered, dp_rank, dp_size)
         start = dp_rank * max_rows
-
-        if mode == "argmax":
-            # Reduce each shard to (max, global_id); exchange only [Σrows, 2].
-            packed = lm_head_argmax_pack(logits_shard, dp_rank * vshard)
-            gathered_packed = dp_group.all_gather(
-                packed, dim=0, use_custom=use_custom
-            ).view(dp_size, dp_size * max_rows, 2)
-            winner = gathered_packed[:, :, 0].argmax(dim=0)  # [Σrows] winning shard
-            token = gathered_packed[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)
-            return token[start : start + local_rows]  # keep own rows
-
         peer = self.__dict__.get("_dp_logits_exchange")
         if mode == "allgather" and peer is not None and max_rows <= peer.max_rows:
             if not self.__dict__.get("_dp_logits_peer_logged", False):
@@ -540,7 +531,27 @@ class ParallelLMHead(VocabParallelEmbedding):
                     local_rows,
                 )
                 self._dp_logits_peer_logged = True
-            return peer(logits_shard, local_rows)
+            # The GEMM writes this rank's shard straight into the peer pool.
+            return peer.produce(
+                lambda dst: self._vocab_shard_logits(
+                    gathered, dp_rank, dp_size, out=dst
+                ),
+                max_rows,
+                local_rows,
+            )
+
+        # [dp_size * max_rows, V/dp]
+        logits_shard = self._vocab_shard_logits(gathered, dp_rank, dp_size)
+
+        if mode == "argmax":
+            # Reduce each shard to (max, global_id); exchange only [Σrows, 2].
+            packed = lm_head_argmax_pack(logits_shard, dp_rank * vshard)
+            gathered_packed = dp_group.all_gather(
+                packed, dim=0, use_custom=use_custom
+            ).view(dp_size, dp_size * max_rows, 2)
+            winner = gathered_packed[:, :, 0].argmax(dim=0)  # [Σrows] winning shard
+            token = gathered_packed[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)
+            return token[start : start + local_rows]  # keep own rows
 
         if mode == "all2all":
             # Send each destination rank only the rows it owns; receive this

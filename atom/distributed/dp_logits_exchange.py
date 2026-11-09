@@ -49,6 +49,18 @@ def _gather(
     tl.store(Output + output_offsets, values, offsets < LocalRows * Vocab)
 
 
+class _DeviceBytes:
+    """``__cuda_array_interface__`` of raw device bytes, for a non-owning view."""
+
+    def __init__(self, ptr: int, nbytes: int):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (ptr, False),
+            "version": 3,
+        }
+
+
 class PeerLogitsExchange:
     def __init__(
         self,
@@ -105,6 +117,12 @@ class PeerLogitsExchange:
         if len(pointers) != 4 or not all(pointers):
             raise RuntimeError("Every peer must map the logits pool")
         self.peers = torch.tensor(pointers, dtype=torch.int64, device=self.device)
+        # This rank's own slot in the pool as a tensor, so a producer can write
+        # its logits there directly instead of staging a copy.
+        self.local = torch.as_tensor(
+            _DeviceBytes(self.buffer.data_ptr, 4 * max_rows * vocab_shard * width),
+            device=self.device,
+        ).view(dtype)
         self.token = torch.zeros(4, dtype=torch.float32, device=self.device)
         self.barrier_output = torch.empty_like(self.token)
         torch.cuda.synchronize()
@@ -141,8 +159,6 @@ class PeerLogitsExchange:
         # can lose alignment metadata in lowering; word-sized transport avoids
         # scalar 16-bit XGMI transactions without changing any logits bits.
         words = x.view(torch.int64)
-        output_words = output.view(torch.int64)
-        vocab_words = self.vocab // 4
         self._barrier()
         _stage[(triton.cdiv(words.numel(), 8192),)](
             words,
@@ -153,18 +169,35 @@ class PeerLogitsExchange:
             num_warps=8,
         )
         self._barrier()
+        self._gather_rows(output, rows, local_rows)
+        return output
+
+    def produce(self, fill, rows, local_rows):
+        """Like ``__call__``, but ``fill(dst)`` writes this rank's
+        ``[4 * rows, vocab]`` logits straight into its slot of the pool."""
+        if rows > self.max_rows or not 0 <= local_rows <= rows:
+            raise ValueError("Input rows exceed the peer pool capacity")
+        output = torch.empty(
+            (local_rows, 4 * self.vocab), device=self.device, dtype=self.dtype
+        )
+        self._barrier()
+        fill(self.local[: 4 * rows * self.vocab].view(4 * rows, self.vocab))
+        self._barrier()
+        self._gather_rows(output, rows, local_rows)
+        return output
+
+    def _gather_rows(self, output, rows, local_rows):
         if local_rows:
-            _gather[(triton.cdiv(local_rows * vocab_words, 4096), 4)](
+            _gather[(triton.cdiv(local_rows * (self.vocab // 4), 4096), 4)](
                 self.peers,
-                output_words,
+                output.view(torch.int64),
                 self.rank,
                 rows,
                 local_rows,
-                vocab_words,
+                self.vocab // 4,
                 4096,
                 num_warps=4,
             )
-        return output
 
     def close(self):
         torch.cuda.synchronize()
