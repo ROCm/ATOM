@@ -177,3 +177,32 @@ def test_load_threshold_is_per_config_and_preserves_explicit_override(monkeypatc
     assert min_load_tokens(first) == 512  # workers retain their parent's snapshot
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
     assert min_load_tokens(snapshot(store)) == 0
+
+
+def test_a_newcomer_does_not_take_a_prefix_from_an_owner_still_prefilling_it():
+    """A prefills a system prompt on rank 0; B, same prompt, is placed on rank 1.
+    A finishes, so the prefix is in the tier. B aborts before its first token:
+    that must not make the prefix cold."""
+    router = StoreAwareRouter(min_load_tokens=512, req_equiv=512)
+    backlog, reqs = [0, 0], [0, 0]
+    first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
+    backlog[first.rank] = 10_000_000  # B goes to the other rank for backlog
+    second, _ = _route(router, _seq("B", PREFIX), backlog, reqs)
+    assert second.rank != first.rank
+    router.prefill_complete("A")
+    router.release("B")  # B left before prefilling anything
+    router.select(_seq("C", PREFIX + [9] * 2_000), [0, 0], [0, 0])
+    assert router.charge("C") > 0  # the prefix is still in the tier: credited
+
+
+def test_the_newcomer_carries_the_entry_if_the_owner_leaves_unprefilled():
+    router = StoreAwareRouter(min_load_tokens=512, req_equiv=512)
+    backlog, reqs = [0, 0], [0, 0]
+    first, _ = _route(router, _seq("A", PREFIX), backlog, reqs)
+    backlog[first.rank] = 10_000_000
+    second, _ = _route(router, _seq("B", PREFIX), backlog, reqs)
+    router.release("A")  # aborted before its prefill completed
+    router.prefill_complete("B")
+    probe = router.select(_seq("C", PREFIX + [9] * 2_000), [0, 0], [0, 0])
+    assert router.charge("C") > 0
+    assert probe.rank == second.rank  # B holds the prefix now

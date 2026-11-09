@@ -50,6 +50,11 @@ class StoreAwareRouter:
         self.index: OrderedDict[int, tuple[int, Any]] = OrderedDict()
         # producer seq id -> hashes it produced (dropped if it leaves unprefilled).
         self.produced: dict[Any, list[int]] = {}
+        # A newcomer computing a prefix whose owner is still prefilling it does
+        # not take the entry over: hash -> (rank, seq id) of the one that would
+        # carry it if the owner leaves unprefilled (`_backing`: its hashes).
+        self.backups: dict[int, tuple[int, Any]] = {}
+        self._backing: dict[Any, list[int]] = {}
         self._prefilling: set = set()
         self._est_hit: dict = {}
         # Rotating tie-break, so fully tied ranks do not all go to rank 0.
@@ -58,6 +63,8 @@ class StoreAwareRouter:
     def reset(self) -> None:
         """Forget in-flight state; the index describes caches that outlive it."""
         self.produced.clear()
+        self.backups.clear()
+        self._backing.clear()
         self._prefilling.clear()
         self._est_hit.clear()
 
@@ -75,6 +82,16 @@ class StoreAwareRouter:
         """`seq_id` completed its prefill: what it produced is in the tier."""
         self._prefilling.discard(seq_id)
         self.produced.pop(seq_id, None)
+        # What it computed beside an owner still prefilling is in the tier now
+        # too: it carries the entry, so the prefix counts as loadable.
+        for h in self._backing.pop(seq_id, ()):
+            backup = self.backups.get(h)
+            if backup is None or backup[1] != seq_id:
+                continue
+            del self.backups[h]
+            owner = self.index.get(h)
+            if owner is not None and owner[1] in self._prefilling:
+                self.index[h] = backup
 
     def release(self, seq_id) -> None:
         """`seq_id` left (finished, aborted, rejected, failed send)."""
@@ -84,11 +101,20 @@ class StoreAwareRouter:
             return
         self._prefilling.discard(seq_id)
         # Left before its prefill completed: what it was producing never
-        # reached HBM or the tier.
+        # reached HBM or the tier. A newcomer computing the same prefix carries
+        # the entry on.
         for h in self.produced.pop(seq_id, ()):
             entry = self.index.get(h)
             if entry is not None and entry[1] == seq_id:
-                del self.index[h]
+                backup = self.backups.pop(h, None)
+                if backup is not None:
+                    self.index[h] = backup
+                else:
+                    del self.index[h]
+        for h in self._backing.pop(seq_id, ()):
+            backup = self.backups.get(h)
+            if backup is not None and backup[1] == seq_id:
+                del self.backups[h]
 
     # -- placement -------------------------------------------------------------
 
@@ -148,15 +174,31 @@ class StoreAwareRouter:
         stride = max(1, self.STRIDE_TOKENS // hbs)
         index = self.index
         mine = []
+        backing = []
         for i in range(stride - 1, len(chain.hashes), stride):
             h = chain.hashes[i]
-            if (i + 1) * hbs <= reused and h in index:
+            owner = index.get(h)
+            if (i + 1) * hbs <= reused and owner is not None:
                 index.move_to_end(h)
+                continue
+            if (
+                owner is not None
+                and owner[1] != seq_id
+                and owner[1] in self._prefilling
+            ):
+                # The owner is still prefilling it, on another rank. Taking the
+                # entry over would lose the prefix if this request left first
+                # (its release drops what it produced); rely on the owner and
+                # stand by to carry the entry.
+                self.backups[h] = (rank, seq_id)
+                backing.append(h)
                 continue
             index.pop(h, None)
             index[h] = (rank, seq_id)
             mine.append(h)
         if mine:
             self.produced[seq_id] = mine
+        if backing:
+            self._backing[seq_id] = backing
         while len(index) > self.CAP:
             index.popitem(last=False)
