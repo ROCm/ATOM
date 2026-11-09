@@ -16806,6 +16806,21 @@ models:
             common:
               <<: *m31_s65822_env
               ATOMESH_M31_D_MAX_SEQS: "5"
+        # MoRI-IO READ vs s65822-c64-dcap16 / -c40-dcap10; vLLM adds D-side READ post/barrier timing logs.
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c64-dcap16-read-diag
+          env:
+            common: &m31_s65822_read_diag_env
+              <<: *m31_s65822_env
+              ATOMESH_M31_VLLM_SHA: 335b0e9ec569080506fdae9ed5e9ee3e5c4fd662
+              ATOMESH_M31_MORIIO_READ_MODE: "true"
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c40-dcap10-read-diag
+          concurrency: [40]
+          env:
+            common:
+              <<: *m31_s65822_read_diag_env
+              ATOMESH_M31_D_MAX_SEQS: "10"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
