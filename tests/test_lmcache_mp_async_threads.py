@@ -10,6 +10,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from mp_shipping_helpers import shipped_tokens as _shipped_tokens
 from test_lmcache_mp import _config, _WorkerAdapter, fake_lmcache_modules  # noqa: F401
 from test_lmcache_mp_async_lookup import CHUNK, _Adapter, _Client, _Future
 
@@ -26,19 +27,6 @@ from atom.kv_transfer.offload.mp import worker as mp_worker
 from atom.kv_transfer.offload.mp.lookup_driver import _LockedAdapter
 from atom.kv_transfer.offload.mp.token_shipping import TokenShipper
 from atom.model_engine.sequence import SequenceStatus
-
-
-def _shipped_tokens(req):
-    """The token ids a worker hands the transfer for `req` (a request's first
-    shipment carries its whole prefix: `token_shipping.WorkerTokens`)."""
-    import copy
-    from types import SimpleNamespace as _NS
-
-    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
-
-    meta = _NS(requests=[copy.copy(req)])
-    WorkerTokens().resolve(meta)
-    return meta.requests[0].token_ids
 
 
 def _wait_until(predicate, timeout=5.0):

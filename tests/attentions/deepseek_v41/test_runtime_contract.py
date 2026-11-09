@@ -126,9 +126,20 @@ def test_unimplemented_modes_fail_before_loading(override):
 
 
 def test_mp_store_and_mooncake_are_the_kv_transfers_admitted():
-    for connector in ("lmcache_mp", "mooncake_store"):
+    validate_runtime_config(
+        runtime_config(kv_transfer_config={"kv_connector": "lmcache_mp"})
+    )
+    validate_runtime_config(
+        runtime_config(
+            kv_transfer_config={"kv_connector": "mooncake_store"},
+            enable_encoder_swa_bounded_replay=True,
+            kv_cache_block_size=256,
+        )
+    )
+    # The Store's PAGE-only load is sound only where a hit's state is replayed.
+    with pytest.raises(ValueError, match="Mooncake Store without encoder SWA"):
         validate_runtime_config(
-            runtime_config(kv_transfer_config={"kv_connector": connector})
+            runtime_config(kv_transfer_config={"kv_connector": "mooncake_store"})
         )
     for role in ("kv_producer", "kv_consumer"):
         validate_runtime_config(

@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from weakref import WeakKeyDictionary
 
+from mp_shipping_helpers import shipped_tokens as _shipped_tokens
+
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     KVConnectorOutput,
@@ -41,19 +43,6 @@ from atom.model_engine.sequence import Sequence
 CHUNK = 8
 REPLAY = 6
 SESSION = "atom-offload-dp0:1"
-
-
-def _shipped_tokens(req):
-    """The token ids a worker hands the transfer for `req` (a request's first
-    shipment carries its whole prefix: `token_shipping.WorkerTokens`)."""
-    import copy
-    from types import SimpleNamespace as _NS
-
-    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
-
-    meta = _NS(requests=[copy.copy(req)])
-    WorkerTokens().resolve(meta)
-    return meta.requests[0].token_ids
 
 
 @dataclass(frozen=True)

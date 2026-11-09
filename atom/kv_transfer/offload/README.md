@@ -105,12 +105,14 @@ Four rules carry the module:
 | `mp/connector.py` | Capability-selected public `lmcache_mp` worker/scheduler shells. |
 | `mp/deployment.py` | LMCache MP configuration, topology, model namespace and server adapters. |
 | `mp/worker.py`, `mp/scheduler.py` | Generic PAGE-only LMCache MP connector halves. |
+| `page_codec.py` | `replays_state` (does the backend rebuild per-request state by replay) and `pure_page_codec`: the PAGE-only `DSV4PageSlotCodec` the M3 and Mooncake Store connectors share. |
+| `load_math.py` | Pure functions for how many tokens a tier moves (`loadable_hit`, `tier_load_tokens`), used by the offload scheduler and by DP routing's `OffloadTierProfile`. |
 | `mp/token_shipping.py` | Incremental token shipping: the scheduler sends each transfer only the tokens past what the workers hold; the worker shell rebuilds the prefix. |
 | `mp/lookup.py` | Scheduler-side MP lookups and read-lock bookkeeping. |
 | `mp/transfer.py` | Transfer identity, terminal detection and the fail-stop transfer deadline. |
 | `mp/page_views.py` | Shared validation of backend-published PAGE views. |
 | `mp/native_state_{layout,scheduler,worker}.py` | PAGE-backed native-state registration, scheduler leases, and worker transfer/restore lifecycle. |
-| `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included), and the dense/DCP=1 startup refusals. |
+| `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included), `uses_replay_pages`, and the startup refusals (layouts other than dense and V4.1 PAGE, DCP > 1, odd chunks). |
 | `mooncake_store/keys.py` | Layout namespace, the prompt's 16-byte chunk hash chain, and Store key spelling. |
 | `mooncake_store/nic.py` | One PCI-local RDMA device per worker. |
 | `mooncake_store/client.py` | Pure zero-copy `MooncakeDistributedStore` client, result codes, per-call counters. |
@@ -337,7 +339,8 @@ comparison, per-rank retrieve counts, one-writer storage, and promoted ranges.
 `ChunkedOffloadSchedulerBase` (save cadence, load decisions, early block
 release, exact operation completions), the `DenseOffloadConnector` worker
 plumbing (executors, per-step producer fence, completion reports),
-`BlockGPUConnector` and `DenseKVByteCodec`. What replaces LMCache is a Mooncake
+`BlockGPUConnector` and a byte codec (`DenseKVByteCodec`, or the PAGE-only
+`DSV4PageSlotCodec` for V4.1). What replaces LMCache is a Mooncake
 Store whose memory belongs to separate owner processes -- on the prefill node's
 NUMA nodes and, across two nodes, on the decode node -- reached directly by
 every prefill worker. There is no CPU L1, no LMCache engine or lookup server,
@@ -646,8 +649,8 @@ this worker config.
 
 ### Not supported in phase 1
 
-- Layouts other than dense (DSV4 PAGE+SLOT, MiniMax-M3, Kimi-K3 state tier) and
-  DCP > 1 on the offload side: refused at startup.
+- Layouts other than dense and V4.1's replay PAGEs (DSV4 PAGE+SLOT, MiniMax-M3,
+  Kimi-K3 state tier) and DCP > 1 on the offload side: refused at startup.
 - Decode-side offload, and reading the Store from decode workers: decode DRAM
   joins as Store owners only.
 - A second offload connector beside it in one `multi`.

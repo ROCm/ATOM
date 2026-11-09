@@ -563,8 +563,7 @@ def _make_spread_mgr(n_ranks=2, tier=None):
     mgr._prefix_router = PrefixSpreadRouter(32768, tier, max_seqs=256)
     mgr._dp_route_counters.update(
         dict.fromkeys(
-            PrefixSpreadRouter.DECISIONS
-            + ("prefix_moved_tokens", "prefix_moved_partial_total"),
+            PrefixSpreadRouter.DECISIONS + ("prefix_moved_tokens",),
             0,
         )
     )
@@ -756,7 +755,6 @@ def test_idle_ratio_prefers_idle_rank_holding_part_of_the_prefix():
     (rank,) = _route(mgr, [seq])
     assert rank == 2  # 4k above the lightest, holds 48k of the prefix
     assert _est(mgr, seq) == 98_304  # 48k local + 48k loaded from the tier
-    assert _count(mgr, "prefix_moved_partial_total") == 1
     assert _count(mgr, "prefix_moved_tokens") == 98_304 - 49_152
 
 
@@ -1108,8 +1106,6 @@ def test_a_terminal_output_completes_the_prefill_only_after_forward():
 
     mgr = _make_spread_mgr()
     (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
-    out = SimpleNamespace(finished=True, output_tokens=[], prefill_complete=False)
-    assert not out.prefill_complete  # the STREAM handler's test
     mgr._release_terminal_seq(SimpleNamespace(id=1, prefill_completed=False))
     assert not mgr._prefix_router.index  # dropped: its KV was never written
 
@@ -1120,20 +1116,6 @@ def test_a_terminal_output_completes_the_prefill_only_after_forward():
     )
     assert src_owner == owner and hits[owner] == 98_304
     assert mgr._rank_reqs == [0, 0] and mgr._rank_tokens == [0, 0]
-
-
-def test_request_output_says_whether_a_prefill_completed():
-    """Outputs carrying a token complete it by default; the structured-output
-    error the scheduler builds mid-prefill says otherwise."""
-    from atom.model_engine.request import RequestOutput
-
-    assert RequestOutput(
-        request_id=1, output_tokens=[7], finished=False
-    ).prefill_complete
-    err = RequestOutput(
-        request_id=1, output_tokens=[], finished=True, prefill_complete=False
-    )
-    assert not err.prefill_complete
 
 
 def test_an_explicit_rank_indexes_the_prefix_it_lands():
@@ -1179,12 +1161,101 @@ def test_pending_remote_restore_does_not_count_as_local_hbm():
     (owner,) = _route(mgr, [_chain_seq(1, 65536)])
     mgr._mark_seq_prefill_complete(1)
     mgr._rank_tokens[owner] = 200000
-    moved = _chain_seq(2, 65536)
+    # Longer than the prefix, so the whole prefix is the tier hit (a prompt
+    # that is entirely a hit steps back one token and recomputes its last).
+    moved = _chain_seq(2, 65536 + 4096)
     (target,) = _route(mgr, [moved])
     assert target != owner
-    hits, actual_owner, _ = mgr._prefix_router._rank_hits(moved.prompt_hash_chain, 2)
+    probe = _chain_seq(9, 65536).prompt_hash_chain
+    hits, actual_owner, _ = mgr._prefix_router._rank_hits(probe, 2)
     assert actual_owner == owner
     assert target not in hits
     mgr._mark_seq_prefill_complete(2)
-    hits, _, _ = mgr._prefix_router._rank_hits(moved.prompt_hash_chain, 2)
+    hits, _, _ = mgr._prefix_router._rank_hits(probe, 2)
     assert hits[target] == 65536
+
+
+def test_a_follower_completing_confirms_the_prefix_it_reused():
+    """B reuses the prefix A is still prefilling, then completes: rank0 really
+    holds it. The entry must stop naming A as an unfinished producer, and a
+    later request that recomputes it and aborts must not delete it."""
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    a = _chain_seq(1, 8192)
+    (owner,) = _route(mgr, [a])
+    b = _chain_seq(2, 8192)
+    assert _route(mgr, [b]) == [owner]
+    mgr._mark_seq_prefill_complete(2)
+    assert all(
+        seq_id not in router._prefilling
+        for holders in router.index.values()
+        for seq_id in holders.values()
+    ), "a confirmed entry still names an unfinished producer"
+
+    # A recomputes nothing it did not hold; a request charged the full prompt
+    # (est_hit 0) joins and aborts, as does A.
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_tokens[1 - owner] = 200_000
+    c = _chain_seq(3, 8192)
+    router.place(c, owner, 2)
+    mgr._release_seq_load(1)
+    mgr._release_seq_load(3)
+    assert router._rank_hits(a.prompt_hash_chain, 2)[0].get(owner) == 8192
+
+
+def test_the_tier_serves_a_prefix_any_finished_holder_put_there():
+    """The newest holder of a prefix can be a request still prefilling it on
+    another rank while a finished copy has long been in the tier. A request
+    moved to an idle rank is credited that prefix."""
+    mgr = _make_spread_mgr(n_ranks=3)
+    router = mgr._prefix_router
+    s = _chain_seq(1, 16384)
+    router.place(s, 0, 3)
+    mgr._charge_seq_load_locked(s, 0)
+    mgr._mark_seq_prefill_complete(1)  # S finished: the tier holds the prefix
+    s2 = _chain_seq(2, 16384)
+    router.place(s2, 0, 3)
+    mgr._charge_seq_load_locked(s2, 0)  # keeps S's owner busy, never completes
+    p = _chain_seq(3, 16384)
+    router.place(p, 1, 3)  # P recomputes it on rank1: the newest holder
+    mgr._charge_seq_load_locked(p, 1)
+    mgr._rank_tokens = [200_000, 200_000, 0]
+    r = _chain_seq(4, 20480)
+    assert _route(mgr, [r]) == [2]
+    assert _est(mgr, r) == 16384
+
+
+def test_tier_credit_follows_the_offload_schedulers_load_decision():
+    """The router credits what the offload scheduler will load: a whole-prompt
+    hit steps back one token before flooring to a chunk (G4)."""
+    from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
+    from atom.kv_transfer.offload.load_math import loadable_hit, tier_load_tokens
+
+    tier = OffloadTierProfile(True, 512, load_chunk_tokens=256)
+    # Prompt 8192, fully hit: the scheduler loads 8192 - 256, not 8192.
+    assert loadable_hit(8192, 8192, 256) == 7936
+    assert tier.loadable_tokens(0, 8192, 8192) == 7936
+    assert tier.loadable_tokens(0, 8192) == 8192  # no prompt length: no step back
+    # An unaligned local prefix starts the load at the next boundary.
+    assert tier_load_tokens(300, 7936, 256, 512) == 7936 - 512
+    assert tier_load_tokens(300, 7936, 256, 8192) == 0
+
+
+def test_lmcache_mp_declares_its_chunk_through_the_registry(monkeypatch):
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    monkeypatch.delenv("LMCACHE_CHUNK_SIZE", raising=False)
+    mp = {
+        "kv_connector": "lmcache_mp",
+        "kv_role": "offload",
+        "kv_connector_extra_config": {"lmcache.chunk_size": 512},
+    }
+    cfg = SimpleNamespace(kv_transfer_config=mp)
+    assert KVConnectorFactory.offload_tier(cfg).load_chunk_tokens == 512
+    monkeypatch.setenv("LMCACHE_CHUNK_SIZE", "1024")
+    cfg = SimpleNamespace(
+        kv_transfer_config={"kv_connector": "lmcache_mp", "kv_role": "offload"}
+    )
+    assert KVConnectorFactory.offload_tier(cfg).load_chunk_tokens == 1024

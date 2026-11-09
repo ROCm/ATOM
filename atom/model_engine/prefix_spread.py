@@ -22,12 +22,11 @@ from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
 class Route(NamedTuple):
     """One placement: the rank, its route counter (`CoreManager.
     _record_dp_route_locked`), and for a move the prefix tokens the target
-    loads from the tier and whether it already held part of the prefix."""
+    loads from the tier."""
 
     rank: int
     decision: str
     moved_tokens: int = 0
-    partial: bool = False
 
 
 class PrefixSpreadRouter:
@@ -109,6 +108,12 @@ class PrefixSpreadRouter:
         rank, hashes = entry
         for h, _start in hashes:
             self.pending.pop((h, rank), None)
+            # The part is on the rank now. If the entry still names a producer
+            # that is prefilling, it names the request that confirmed it, so
+            # the producer leaving cannot take a real prefix with it.
+            holders = self.index.get(h)
+            if holders is not None and holders.get(rank) in self._prefilling:
+                holders[rank] = seq_id
 
     def release(self, seq_id) -> dict:
         """Release a request; return extra prefill charges for its successors."""
@@ -160,8 +165,8 @@ class PrefixSpreadRouter:
         # The tier holds the prefix only once its source finished prefilling,
         # and the connector loads only a rest of at least its load threshold.
         loaded = (
-            self.tier.loadable_tokens(local, hit)
-            if source not in self._prefilling
+            self.tier.loadable_tokens(local, hit, seq.num_prompt_tokens)
+            if self._tier_holds(chain, hit)
             else 0
         )
         est_hit = hit if rank == owner else local + loaded
@@ -169,7 +174,7 @@ class PrefixSpreadRouter:
         self._record(chain, rank, seq.id, est_hit, source)
         if rank == owner:
             return Route(rank, "prefix_owner_total")
-        return Route(rank, "prefix_moved_total", max(0, est_hit - local), local > 0)
+        return Route(rank, "prefix_moved_total", max(0, est_hit - local))
 
     def place(self, seq: Any, rank: int, n_ranks: int) -> None:
         """Index a request placed on `rank` from outside (an explicit
@@ -214,6 +219,17 @@ class PrefixSpreadRouter:
         return min(near, key=lambda r: (-hits.get(r, 0), rank_tokens[r], rank_load(r)))
 
     # -- prefix index ---------------------------------------------------------
+
+    def _tier_holds(self, chain, hit: int) -> bool:
+        """Whether the tier has the first `hit` tokens of this prompt: some
+        request that finished prefilling them put them there, on any rank. The
+        newest holder (the owner's) may still be prefilling; an older finished
+        copy on another rank is in the tier regardless."""
+        hbs = int(chain.hash_block_size)
+        holders = self.index.get(chain.hashes[hit // hbs - 1])
+        return holders is not None and any(
+            seq_id not in self._prefilling for seq_id in holders.values()
+        )
 
     def _rank_hits(self, chain, n: int):
         """Per rank, the longest sampled prefix of this prompt it holds.
@@ -277,6 +293,16 @@ class PrefixSpreadRouter:
                 index.move_to_end(h)
             reused = (i + 1) * hbs <= hit
             had = rank in holders
+            if (
+                had
+                and (h, rank) not in pending
+                and holders[rank] not in self._prefilling
+            ):
+                # Confirmed: the rank holds this part. A request that computes
+                # it again reuses the rank's blocks; it neither becomes the
+                # holder nor relies on the entry, so its leaving cannot
+                # delete what the rank really holds.
+                continue
             if had and holders[rank] in self._prefilling:
                 # A newcomer must not erase another request computing this
                 # prefix locally. It joins that producer's ordered waiters.

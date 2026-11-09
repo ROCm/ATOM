@@ -59,23 +59,6 @@ Finding a Store key is not proof that its KV was loaded. Keep request seeds,
 GPU assignment, prefill budget, HBM memory fraction and warmup identical across
 comparisons.
 
-A single-node MI355X TP2/DPA2 AgentX C128 run used 128 GiB CPU cache, a 16K
-prefill budget, memory utilization 0.9, DSpark5, seed 42, and a 900-second
-measurement target. MP and native Store used prefix-spread; main used HBM with
-DP session affinity. The three runs were sequential on the same GPU pair:
-
-| Metric | Main HBM/session | Prefix-spread MP | Prefix-spread Store |
-| --- | ---: | ---: | ---: |
-| TTFT mean (s) | 2.50 | 3.52 | 2.40 |
-| TTFT P90 (s) | 5.68 | 8.05 | 5.54 |
-| TTFT P99 (s) | 10.47 | 13.34 | 8.96 |
-| ITL P50 (ms) | 31.35 | 33.40 | 31.24 |
-| Output tok/s/GPU | 1239.6 | 1124.8 | 1193.0 |
-| Total prefix reuse | 94.18% | 94.28% | 94.46% |
-
-Store improved mean TTFT by 31.8% and output throughput by 6.1% relative to MP
-in this run. Relative to main, output throughput was 3.8% lower; this is not
-evidence of a general performance advantage over HBM/session. One run per
-configuration does not establish variance or results at larger concurrency.
+Measured results for this recipe are in the PR description, not in the repo.
 
 Native Store lookup is synchronous. KV restoration starts at admission.

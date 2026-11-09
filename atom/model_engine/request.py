@@ -16,7 +16,3 @@ class RequestOutput:
     kv_transfer_params_output: dict[str, Any] | None = None
     num_cached_tokens: int = 0
     logprobs: list[Any] | None = None
-    # The request's prompt prefill completed its forward
-    # (`Sequence.prefill_completed`). Any output with a sampled token implies
-    # it; a terminal output without one (an error, `max_tokens <= 0`) may not.
-    prefill_complete: bool = True

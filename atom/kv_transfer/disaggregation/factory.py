@@ -63,8 +63,7 @@ def pd_transfer_config(kv_transfer_config: dict | None) -> dict | None:
 
 @dataclass(frozen=True)
 class OffloadTierProfile:
-    """What the configured offload tier offers DP routing and admission,
-    read off the registry once at startup (`KVConnectorFactory.offload_tier`).
+    """What the configured offload tier offers DP routing, read off the registry once at startup (`KVConnectorFactory.offload_tier`).
 
     `loads`: a rank can load a prefix another DP rank computed from the tier
     (some configured transport, ``multi`` expanded, is an offload backend
@@ -76,23 +75,27 @@ class OffloadTierProfile:
 
     loads: bool = False
     min_load_tokens: int = 0
-    # Store's configured transfer granularity. MP negotiates its geometry
-    # with the external adapter; the static profile does not override it.
+    # The tier's transfer granularity in tokens (`register(chunk_tokens=...)`).
     load_chunk_tokens: int = 1
 
-    def loadable_tokens(self, local: int, hit: int) -> int:
-        """Credit only complete transferable chunks beyond the local prefix.
-
-        An unaligned head is recomputed before handoff and is not a cache hit.
-        The minimum load applies to the aligned remainder, not the raw gap.
-        """
+    def loadable_tokens(
+        self, local: int, hit: int, num_prompt: int | None = None
+    ) -> int:
+        """Tokens a rank with `local` cached tokens loads from a tier hit of
+        `hit` tokens: what the offload scheduler will load (`load_math`), so the
+        router charges the rest as prefill. 0 when the load is under the
+        minimum."""
         if not self.loads:
             return 0
+        from atom.kv_transfer.offload.load_math import loadable_hit, tier_load_tokens
+
         chunk = self.load_chunk_tokens
-        start = -(-local // chunk) * chunk
-        end = hit // chunk * chunk
-        count = max(0, end - start)
-        return count if count >= self.min_load_tokens else 0
+        return tier_load_tokens(
+            local,
+            loadable_hit(hit, num_prompt, chunk),
+            chunk,
+            self.min_load_tokens,
+        )
 
 
 class KVConnectorFactory:
@@ -132,6 +135,9 @@ class KVConnectorFactory:
     # Whether a backend's tier is one store every DP rank reads (an LMCache MP
     # server, Mooncake Store), not one per rank. Absent means per rank.
     _shared_tier: ClassVar[dict[str, bool]] = {}
+    # A backend's transfer granularity, read off its connector config alone:
+    # "module:function" taking the leaf's `kv_transfer_config`. Absent means 1.
+    _chunk_tokens: ClassVar[dict[str, str]] = {}
 
     @classmethod
     def register(
@@ -148,6 +154,7 @@ class KVConnectorFactory:
         requires_pd_staging: bool = True,
         offload: bool = False,
         shared_tier: bool = False,
+        chunk_tokens: str | None = None,
     ) -> None:
         """Register a KV connector backend.
 
@@ -160,6 +167,9 @@ class KVConnectorFactory:
             offload: The backend is a KV offload tier; a ``multi`` runs at most
                 one (`is_offload_backend`).
             shared_tier: The offload tier is shared by all DP ranks
+                (`offload_tier`).
+            chunk_tokens: ``"module:function"`` returning the tier's transfer
+                granularity in tokens from the leaf's ``kv_transfer_config``
                 (`offload_tier`).
         """
         cls._registry[name] = {
@@ -186,6 +196,8 @@ class KVConnectorFactory:
         cls._copies_whole_block_regions[name] = bool(copies_whole_block_regions)
         cls._offload[name] = bool(offload)
         cls._shared_tier[name] = bool(shared_tier)
+        if chunk_tokens:
+            cls._chunk_tokens[name] = chunk_tokens
 
     @classmethod
     def canonical_name(cls, value: object, *, path: str = "kv_transfer_config") -> str:
@@ -229,12 +241,12 @@ class KVConnectorFactory:
             if cls.is_offload_backend(name) and role in ("offload", "kv_both"):
                 tier = True
                 shared |= cls._shared_tier.get(name, False)
-                if name == "mooncake_store":
-                    from atom.kv_transfer.offload.mooncake_store.config import (
-                        store_chunk_tokens,
+                hook = cls._chunk_tokens.get(name)
+                if hook:
+                    module, _, attr = hook.partition(":")
+                    chunk_tokens = getattr(importlib.import_module(module), attr)(
+                        sub.kv_transfer_config
                     )
-
-                    chunk_tokens = store_chunk_tokens(sub.kv_transfer_config)
         if not tier:
             return OffloadTierProfile()
         return OffloadTierProfile(

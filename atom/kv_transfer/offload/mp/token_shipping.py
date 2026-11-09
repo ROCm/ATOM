@@ -12,15 +12,19 @@ transfer at 512k tokens).
 Here the scheduler (`TokenShipper`) sends only the tokens past what the
 workers already hold, as an `array('i')` slice (it pickles as raw bytes), in a
 `ShippedTokens` that rides in `LMCacheReqMeta.token_ids`. Each worker shell
-(`WorkerTokens`) appends it to its copy of the request's prefix and hands the
-transfer an ordinary list, so nothing past the shell knows about it. A
-finished request's copy is dropped through the next shipment: drops ride on
-it rather than on a metadata field of their own, since a worker copy only
-grows through a shipment.
+(`WorkerTokens`) appends it to its own `array('i')` copy of the request's
+prefix (4 bytes a token) and hands the transfer a copy of the part it covers.
+
+The scheduler only counts a shipment as delivered once the metadata carrying it
+was built (`begin` / `commit` / `rollback`): a build that raises after shipping
+would otherwise leave the workers a prefix behind and fail the request's next
+transfer. A finished request's copy is dropped through the metadata's
+`token_drops`, which makes the step work even when no transfer is left.
 """
 
 from __future__ import annotations
 
+from array import array
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,8 +40,6 @@ class ShippedTokens:
     end: int
     # Tokens ``[base, base + len(tokens))`` (an `array('i')` slice).
     tokens: Any
-    # Request ids whose worker copy is to be dropped, before this one is read.
-    drops: tuple = ()
 
 
 class TokenShipper:
@@ -48,6 +50,26 @@ class TokenShipper:
         # to tell a reused id from it.
         self._shipped: dict[Any, tuple[Any, int]] = {}
         self._drops: list = []
+        self._snapshot: tuple[dict, list] | None = None
+
+    def begin(self) -> None:
+        """Start a metadata build: what `ship` and `drop` do is provisional."""
+        self._snapshot = (dict(self._shipped), list(self._drops))
+
+    def commit(self) -> None:
+        """The metadata was built: its shipments are delivered."""
+        self._snapshot = None
+
+    def rollback(self) -> None:
+        """The build failed and its metadata is lost: forget what it shipped."""
+        if self._snapshot is not None:
+            self._shipped, self._drops = self._snapshot
+            self._snapshot = None
+
+    def take_drops(self) -> tuple:
+        """Request ids whose worker copy goes with the metadata being built."""
+        drops, self._drops = tuple(self._drops), []
+        return drops
 
     def ship(self, seq: Any, end: int) -> ShippedTokens:
         entry = self._shipped.get(seq.id)
@@ -59,12 +81,11 @@ class TokenShipper:
                 self.drop(seq.id)  # a reused id: start its copy over
         new = max(base, end)
         self._shipped[seq.id] = (seq, new)
-        drops, self._drops = tuple(self._drops), []
-        return ShippedTokens(base, end, seq.token_ids[base:new], drops)
+        return ShippedTokens(base, end, seq.token_ids[base:new])
 
     def drop(self, req_id: Any, seq: Any = None) -> None:
         """Forget `req_id`'s copy (with `seq`: only if it is that request's).
-        The workers drop theirs with the next shipment."""
+        The workers drop theirs with the next metadata (`take_drops`)."""
         entry = self._shipped.get(req_id)
         if entry is None or (seq is not None and entry[0] is not seq):
             return
@@ -76,19 +97,20 @@ class WorkerTokens:
     """Worker side: each request's prefix, rebuilt from its shipments."""
 
     def __init__(self) -> None:
-        self._held: dict[Any, list[int]] = {}
+        self._held: dict[Any, array] = {}
 
     def resolve(self, metadata: Any) -> None:
-        """Replace each request's `ShippedTokens` with its token list."""
+        """Drop finished requests' copies, and replace each request's
+        `ShippedTokens` with its token prefix (an `array('i')`)."""
         held = self._held
+        for req_id in getattr(metadata, "token_drops", ()) or ():
+            held.pop(req_id, None)
         for req in getattr(metadata, "requests", None) or ():
             shipped = req.token_ids
             if not isinstance(shipped, ShippedTokens):
                 continue
-            for req_id in shipped.drops:
-                held.pop(req_id, None)
             if shipped.base == 0:
-                tokens = held[req.req_id] = []
+                tokens = held[req.req_id] = array("i")
             else:
                 tokens = held.get(req.req_id)
                 # The scheduler starts a copy over only at base 0, so any
@@ -100,16 +122,14 @@ class WorkerTokens:
                         f"{0 if tokens is None else len(tokens)} tokens, the "
                         f"scheduler shipped from {shipped.base}"
                     )
-            # Boxed once per token over the request's life, not per transfer.
             tokens.extend(shipped.tokens)
             if len(tokens) < shipped.end:
                 raise RuntimeError(
                     f"LMCache MP token copy for {req.req_id!r} holds "
                     f"{len(tokens)} tokens, the transfer needs {shipped.end}"
                 )
-            # A copy, not the held list: the transfer thread reads it after
-            # later shipments have extended the held one. The same list copy
-            # an unpickled list would have cost.
+            # A copy, not the held array: the transfer thread reads it after
+            # later shipments have extended the held one.
             req.token_ids = tokens[: shipped.end]
 
 

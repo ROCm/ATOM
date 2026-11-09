@@ -394,6 +394,15 @@ def validate_runtime_config(config):
             and config.kv_transfer_config.get("kv_role")
             not in ("kv_producer", "kv_consumer"),
         ),
+        (
+            # The Store moves V4.1's PAGEs and relies on replay to rebuild the
+            # state a hit does not carry; without bounded replay the backend
+            # copies state instead and the Store's PAGE-only load is unsound.
+            "Mooncake Store without encoder SWA bounded replay",
+            KVConnectorFactory.connector_name(config.kv_transfer_config)
+            == "mooncake_store"
+            and not config.enable_encoder_swa_bounded_replay,
+        ),
         ("RapidServe", config.enable_rapidserve),
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),

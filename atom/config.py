@@ -2941,20 +2941,6 @@ class Config:
 
             self.state_replay_tokens = state_replay_tokens(self)
 
-        # Reject unsupported Store layouts/replay modes before workers load weights.
-        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-        for name, leaf in KVConnectorFactory.leaf_connectors(self) or ():
-            if name == "mooncake_store":
-                from atom.kv_transfer.offload.mooncake_store.config import (
-                    check_engine_compatibility,
-                    parse_mooncake_store_config,
-                )
-
-                check_engine_compatibility(
-                    parse_mooncake_store_config(leaf.kv_transfer_config), leaf
-                )
-
     def _resolve_index_cache_layout(self) -> None:
         self.index_cache_layout = None
         if self.index_cache_dtype != "fp4":

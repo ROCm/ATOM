@@ -19,9 +19,10 @@ from typing import Any, NamedTuple
 
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.mooncake_store.nic import parse_device_list
-from atom.utils.selector import Family, attn_family
 
 KEY_PREFIX = "mooncake_store."
+# `select_offload_layout`'s name for the V4.x PAGE-region layout.
+_REPLAY_PAGE_LAYOUT = "hybrid"
 _MIB = 1 << 20
 _PROTOCOLS = ("rdma", "tcp")
 
@@ -208,16 +209,10 @@ def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> 
             is not a whole number of KV blocks.
     """
     layout = offcfg.select_offload_layout(config)
-    if layout != "dense" and not uses_replay_pages(config):
+    if layout not in ("dense", _REPLAY_PAGE_LAYOUT):
         raise ValueError(
-            f"the Mooncake Store offload requires dense KV or V4.1 bounded-replay PAGEs; this "
-            f"model resolves to {layout!r}"
-        )
-    if uses_replay_pages(config) and not getattr(
-        config, "enable_encoder_swa_bounded_replay", False
-    ):
-        raise ValueError(
-            "Mooncake Store V4.1 requires enable_encoder_swa_bounded_replay"
+            "the Mooncake Store offload moves the dense KV layout and V4.1's "
+            f"replay PAGEs; this model resolves to {layout!r}"
         )
     dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
     if dcp > 1:
@@ -301,5 +296,8 @@ def _positive_seconds(name: str, value: Any) -> float:
 
 
 def uses_replay_pages(config: Any) -> bool:
-    """V4.1 restores PAGE bytes and rebuilds per-request state by replay."""
-    return attn_family(config.hf_config) == Family.CSA2
+    """Whether the Store moves this model's PAGE regions (and the state is
+    rebuilt by replay) rather than the dense KV layout. Decided by the one
+    selector the worker, the scheduler and the key namespace all use; the
+    worker still checks the backend's replay contract when it registers KV."""
+    return offcfg.select_offload_layout(config) == _REPLAY_PAGE_LAYOUT

@@ -7,6 +7,7 @@ from weakref import WeakKeyDictionary
 
 import pytest
 from conftest import MockConfig
+from mp_shipping_helpers import shipped_tokens as _shipped_tokens
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -34,19 +35,6 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Replay, Sequence, SequenceStatus, SequenceType
 from atom.model_engine.state_runtime import StateRuntime, StateTransfer
-
-
-def _shipped_tokens(req):
-    """The token ids a worker hands the transfer for `req` (a request's first
-    shipment carries its whole prefix: `token_shipping.WorkerTokens`)."""
-    import copy
-    from types import SimpleNamespace as _NS
-
-    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
-
-    meta = _NS(requests=[copy.copy(req)])
-    WorkerTokens().resolve(meta)
-    return meta.requests[0].token_ids
 
 
 @pytest.fixture(autouse=True)

@@ -198,41 +198,32 @@ class _AtomMetricsCollector:
                 ),
                 dp_router.get("load_balanced_total", 0),
             ),
-            (
-                "atom:dp_prefix_owner",
-                "Prefix-spread requests kept on the rank holding their prefix.",
-                dp_router.get("prefix_owner_total", 0),
-            ),
-            (
-                "atom:dp_prefix_moved",
-                (
-                    "Prefix-spread requests moved to an idle rank, which loads "
-                    "their prefix from the offload tier."
-                ),
-                dp_router.get("prefix_moved_total", 0),
-            ),
-            (
-                "atom:dp_prefix_moved_tokens",
-                "Prefix tokens the moved prefix-spread requests load from the tier.",
-                dp_router.get("prefix_moved_tokens", 0),
-            ),
-            (
-                "atom:dp_prefix_cold",
-                "Prefix-spread requests with no known prefix (lightest rank).",
-                dp_router.get("prefix_cold_total", 0),
-            ),
-            (
-                "atom:dp_prefix_moved_partial",
-                (
-                    "Prefix-spread moves onto a rank already holding part of "
-                    "the prefix."
-                ),
-                dp_router.get("prefix_moved_partial_total", 0),
-            ),
         ):
             metric = CounterMetricFamily(name, documentation)
             metric.add_metric([], float(value))
             yield metric
+
+        if "prefix_owner_total" in dp_router:
+            # Present only under `--dp-load-balance prefix_spread`.
+            routed = CounterMetricFamily(
+                "atom:dp_prefix_route",
+                "Prefix-spread placements by decision: owner (kept on the rank "
+                "holding the prefix), moved (to an idle rank that loads it from "
+                "the tier) or cold (no known prefix).",
+                labels=["decision"],
+            )
+            for decision in ("owner", "moved", "cold"):
+                routed.add_metric(
+                    [decision], float(dp_router.get(f"prefix_{decision}_total", 0))
+                )
+            yield routed
+            moved_tokens = CounterMetricFamily(
+                "atom:dp_prefix_moved_tokens",
+                "Prefix tokens credited to moved prefix-spread requests at "
+                "placement (an estimate, not completed restores).",
+            )
+            moved_tokens.add_metric([], float(dp_router.get("prefix_moved_tokens", 0)))
+            yield moved_tokens
 
         metric = CounterMetricFamily(
             "atom:dp_requests_routed",

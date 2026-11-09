@@ -764,11 +764,20 @@ class TestSchedule:
         )
         assert seq.prefill_completed is True
 
-        # A preempted request prefills again: the flag describes that one.
+        # A preempted request keeps it: the prefix it hashed is still the
+        # prefix the rank holds, whatever its next admission does.
         sched.running.remove(seq) if seq in sched.running else None
         sched.running.append(seq)
         assert sched.preempt(seq)
-        assert seq.prefill_completed is False
+        assert seq.prefill_completed is True
+
+    def test_a_failed_tier_load_does_not_revive_an_aborted_waiter(self, seq_factory):
+        sched = Scheduler(MockConfig(num_kvcache_blocks=100, kv_cache_block_size=4))
+        seq = seq_factory(list(range(8)))
+        seq.status = SequenceStatus.ABORTED
+        sched.failed_recving_kv_req_ids.append(seq.id)
+        sched._resolve_offload_load(seq)
+        assert seq.status == SequenceStatus.ABORTED
 
     def test_chunked_prefill_splits_prompt_across_steps(self, seq_factory):
         sched = Scheduler(

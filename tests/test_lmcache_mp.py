@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from mp_shipping_helpers import shipped_tokens as _shipped_tokens
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -40,19 +41,6 @@ from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
 from atom.kv_transfer.offload.mp.token_shipping import TokenShipper
-
-
-def _shipped_tokens(req):
-    """The token ids a worker hands the transfer for `req` (a request's first
-    shipment carries its whole prefix: `token_shipping.WorkerTokens`)."""
-    import copy
-    from types import SimpleNamespace as _NS
-
-    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
-
-    meta = _NS(requests=[copy.copy(req)])
-    WorkerTokens().resolve(meta)
-    return meta.requests[0].token_ids
 
 
 def _config(
@@ -2070,8 +2058,6 @@ def _shipping_pair():
     sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
 
     sched._token_shipper = TokenShipper()
-
-    sched._token_shipper = TokenShipper()
     from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
 
     shell = LMCacheMPConnector.__new__(LMCacheMPConnector)
@@ -2117,20 +2103,20 @@ def test_incremental_tokens_round_trip_through_the_worker_shell():
         _send(shell, save)
     assert sizes == [256, 256, 0, 232]
     assert [len(t) for t in received] == [256, 512, 768, 512, 1000]
-    assert all(t == list(range(len(t))) for t in received)
-    assert all(type(t) is list for t in received)
+    assert all(list(t) == list(range(len(t))) for t in received)
+    assert all(type(t) is array.array for t in received)
     # Raw bytes on the wire, not a pickled list of ints.
     assert len(pickle.dumps(save.token_ids)) < 232 * 4 + 200
 
-    # The session ends; the drop rides on the next shipment, here a reused id.
+    # The session ends; a reused id starts its copy over at base 0.
     sched._token_shipper.drop(7, seq)
     other = SimpleNamespace(
         id=7, token_ids=array.array("i", range(5000, 5600)), block_table=[0]
     )
     save = sched._build_save_request(other, 0, 600, None, [0], False)
-    assert save.token_ids.drops == (7,) and save.token_ids.base == 0
+    assert save.token_ids.base == 0
     _send(shell, save)
-    assert received[-1] == list(range(5000, 5600))
+    assert list(received[-1]) == list(range(5000, 5600))
 
 
 def test_a_reused_id_restarts_its_copy_and_a_late_drop_spares_it():
@@ -2142,7 +2128,7 @@ def test_a_reused_id_restarts_its_copy_and_a_late_drop_spares_it():
     shipper = sched._token_shipper
     assert shipper.ship(old, 32).base == 0
     shipped = shipper.ship(new, 32)  # reused id: old's copy goes first
-    assert shipped.base == 0 and shipped.drops == (7,)
+    assert shipped.base == 0 and shipper.take_drops() == (7,)
     shipper.drop(7, old)  # old's session ends late: new's copy stays
     assert shipper.ship(new, 64).base == 32
 
@@ -2170,8 +2156,6 @@ def test_the_session_end_drops_the_workers_copy(monkeypatch):
     sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
 
     sched._token_shipper = TokenShipper()
-
-    sched._token_shipper = TokenShipper()
     seq = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
     sched._token_shipper.ship(seq, 32)
     sched._lookup_client = SimpleNamespace()
@@ -2190,3 +2174,47 @@ def test_the_session_end_drops_the_workers_copy(monkeypatch):
     sched._end_finished_sessions()
     assert 7 not in sched._token_shipper._shipped
     assert sched._token_shipper._drops == [7]
+
+
+def test_a_failed_build_does_not_count_as_shipped():
+    """A metadata build that raises after shipping loses its metadata: the
+    workers never got the tokens, so the request's next transfer must ship them
+    again instead of starting from a base the workers do not hold."""
+    import array
+
+    sched, shell, received = _shipping_pair()
+    seq = SimpleNamespace(id=7, token_ids=array.array("i", range(100)))
+    shipper = sched._token_shipper
+    first = shipper.ship(seq, 40)
+    _send(shell, SimpleNamespace(req_id=7, token_ids=first))
+
+    shipper.begin()
+    lost = shipper.ship(seq, 80)  # shipped into a build that then fails
+    assert lost.base == 40
+    shipper.rollback()
+
+    retry = shipper.ship(seq, 80)
+    assert retry.base == 40 and len(retry.tokens) == 40
+    _send(shell, SimpleNamespace(req_id=7, token_ids=retry))
+    assert list(received[-1]) == list(range(80))
+
+
+def test_drops_reach_the_workers_without_a_transfer():
+    """A finished request's copy goes with the next metadata even when no
+    transfer is left to carry it."""
+    import array
+
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    sched, shell, _ = _shipping_pair()
+    seq = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
+    _send(
+        shell, SimpleNamespace(req_id=7, token_ids=sched._token_shipper.ship(seq, 32))
+    )
+    assert 7 in shell._tokens._held
+    sched._token_shipper.drop(7, seq)
+    meta = LMCacheOffloadMetadata()
+    meta.token_drops = sched._token_shipper.take_drops()
+    assert meta.has_work()
+    shell.start_load_kv(meta)
+    assert 7 not in shell._tokens._held

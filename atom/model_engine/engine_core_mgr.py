@@ -339,9 +339,7 @@ class CoreManager:
             )
             self._dp_route_counters.update(
                 dict.fromkeys(
-                    PrefixSpreadRouter.DECISIONS
-                    + ("prefix_moved_tokens", "prefix_moved_partial_total"),
-                    0,
+                    PrefixSpreadRouter.DECISIONS + ("prefix_moved_tokens",), 0
                 )
             )
         self._rank_routed_total = [0] * self.global_engine_count
@@ -803,11 +801,11 @@ class CoreManager:
                         # once per step rather than twice per chunk.
                         dbg = logger.isEnabledFor(logging.DEBUG)
                         for seq_id, request_output in stream_outputs:
-                            # The first emitted model output means this
-                            # sequence's prompt prefill has completed. Keep the
-                            # request count charged for decode pressure, but
-                            # stop advertising its prompt as queued prefill.
-                            if request_output.prefill_complete:
+                            # A sampled token means this sequence's prompt
+                            # prefill has completed. Keep the request count
+                            # charged for decode pressure, but stop advertising
+                            # its prompt as queued prefill.
+                            if request_output.output_tokens:
                                 self._mark_seq_prefill_complete(seq_id)
                             callback = self._seq_id_to_callback.get(seq_id)
                             if dbg:
@@ -828,7 +826,10 @@ class CoreManager:
                                     )
                             if request_output.finished:
                                 self._seq_id_to_callback.pop(seq_id, None)
-                                self._release_seq_load(seq_id)
+                                # The router is released by the finished
+                                # sequence (`_release_terminal_seq`), which
+                                # knows whether its prefill completed.
+                                self._release_seq_load(seq_id, route=False)
                                 if dbg:
                                     logger.debug(
                                         f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
@@ -1565,7 +1566,6 @@ class CoreManager:
         )
         if route.decision == "prefix_moved_total":
             self._dp_route_counters["prefix_moved_tokens"] += route.moved_tokens
-            self._dp_route_counters["prefix_moved_partial_total"] += route.partial
         return self._record_dp_route_locked(route.decision, route.rank)
 
     def get_dp_router_statistics(self) -> dict:
@@ -1633,7 +1633,6 @@ class CoreManager:
                     output_tokens=[],
                     finished=True,
                     finish_reason=reason,
-                    prefill_complete=getattr(seq, "prefill_completed", False),
                 )
             )
         except Exception as e:

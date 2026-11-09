@@ -2999,13 +2999,12 @@ class Scheduler:
         self, seq: Sequence, skipped_waiting_requests: deque[Sequence]
     ) -> bool | None:
         """Resolve a P/D consumer's ``WAITING_FOR_REMOTE_KVS`` request before
-        admission. An offload tier's loads are resolved at the top of the tick
-        (`_promote_ready_remote_kv_requests`), so one still waiting here is in
-        flight.
+        admission. An offload tier's loads are resolved once, at the top of the
+        tick (`_resolve_offload_load`), so one still waiting here is in flight.
 
         Returns:
           - ``None`` when the request is still blocked and has been requeued.
-          - ``True`` when a P/D consumer should jump to first decode.
+          - ``True`` when the request should jump to first decode.
           - ``False`` when normal prefill admission should continue.
         """
         if seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
@@ -3019,9 +3018,6 @@ class Scheduler:
             return None
 
         seq.status = SequenceStatus.WAITING
-        if self._connector_flag("is_offload"):
-            self._mark_offload_load_ready(seq)
-            return False
         self._uncount_inflight_load(seq)
         return True
 
@@ -3086,6 +3082,13 @@ class Scheduler:
         note = getattr(self.kv_connector, "note_scheduled_tokens", None)
         if callable(note):
             note(scheduled_seqs, num_scheduled_tokens)
+
+    @staticmethod
+    def _note_prefill_complete(seq: Sequence) -> None:
+        """The request's prompt prefill completed: the one place that says so
+        (the tracing span and the DP router's `Sequence.prefill_completed`)."""
+        seq.prefill_completed = True
+        tracing.prefill_complete(seq)
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
         self._inflight_prefix_wait.pop(seq.id, None)
@@ -4052,9 +4055,6 @@ class Scheduler:
         if seq.is_partial_prefill:
             seq.is_partial_prefill = False
             self._partial_prefill_count -= 1
-        # Its next admission prefills again; the flag says whether *that* one
-        # was dispatched to the end.
-        seq.prefill_completed = False
         # This free runs no `request_finished`; drop any stall-escaped save
         # tracker now so the connector's save loop cannot later read these
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
@@ -4242,12 +4242,10 @@ class Scheduler:
                     start_tokens=start_tokens,
                     replay_until=_scheduled_replay_until(batch, i),
                 )
-                if start_tokens + chunk >= seq.num_prompt_tokens:
-                    seq.prefill_completed = True
                 if not is_final:
                     pp_middle_chunk_ids.add(req_id)
                 elif i >= batch.total_seqs_num_decode:
-                    tracing.prefill_complete(seq)
+                    self._note_prefill_complete(seq)
         elif batch is not None:
             for i, req_id in enumerate(batch.req_ids):
                 seq = running_by_id.get(req_id)
@@ -4266,8 +4264,6 @@ class Scheduler:
                     seq, chunk, replay_until=_scheduled_replay_until(batch, i)
                 )
                 seq.num_cached_tokens += chunk
-                if seq.num_cached_tokens >= seq.num_prompt_tokens:
-                    seq.prefill_completed = True
                 # Ask the scheduler what it decided rather than re-deriving it
                 # from lengths here. It froze `is_final_chunk` at pre-advance
                 # offsets, against the whole admitted length -- which for a
@@ -4285,7 +4281,7 @@ class Scheduler:
                     self._partial_prefill_count += 1 if now_partial else -1
                     seq.is_partial_prefill = now_partial
                 if not now_partial:
-                    tracing.prefill_complete(seq)
+                    self._note_prefill_complete(seq)
 
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
@@ -4327,7 +4323,6 @@ class Scheduler:
                                 output_tokens=[],
                                 finished=True,
                                 finish_reason="structured_output_error",
-                                prefill_complete=seq.prefill_completed,
                             ),
                         )
                     )
@@ -4678,7 +4673,6 @@ class Scheduler:
                         seq, "kv_transfer_params_output", None
                     ),
                     num_cached_tokens=getattr(seq, "prefix_cache_hit_tokens", 0),
-                    prefill_complete=seq.prefill_completed,
                 )
 
                 if request_output.kv_transfer_params_output is not None:
@@ -4974,6 +4968,10 @@ class Scheduler:
 
     def _resolve_offload_load(self, seq: Sequence) -> None:
         """Resolve an admitted tier load before the delayer sizes prefill work."""
+        if seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
+            # Aborted (or otherwise moved on) while the load ran: its
+            # abort path reclaims it; a failed load must not revive it.
+            return
         if self._consume_failed_remote_kv(seq):
             if not seq.block_table:
                 self._uncount_inflight_load(seq)
