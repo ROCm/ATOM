@@ -92,13 +92,6 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --release --lib -- \
             routers::render routers::prepare
-          # The vendored llm-tokenizer (not a workspace member), whose unit
-          # tests cover both patches. Its integration tests are upstream's and
-          # do not build against the openai-protocol mesh resolves.
-          cargo test \
-            --manifest-path atom/mesh/vendor/llm-tokenizer/Cargo.toml \
-            --target-dir atom/mesh/mocker/target/llm-tokenizer \
-            --release --lib
 
       - name: Run Atomesh test harness
         run: |

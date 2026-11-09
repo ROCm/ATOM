@@ -128,6 +128,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                                 l0_max_entries: cfg.l0_max_entries,
                                 enable_l1: cfg.enable_l1,
                                 l1_max_memory: cfg.l1_max_memory,
+                                ..CacheConfig::default()
                             };
                             Arc::new(CachedTokenizer::new(base_tokenizer, cache_config))
                         }

@@ -74,7 +74,7 @@ reasoning-parser = "=1.0.0"
 openai-protocol = { version = "=1.0.0", features = ["axum"] }
 num-traits = "0.2"
 rustpython-parser = "0.4.0"
-llm-tokenizer = "=1.0.0"
+llm-tokenizer = "=1.11.0"
 wfaas = "=1.0.0"
 data-connector = "=1.0.0"
 openmetrics-parser = "0.4.4"
@@ -135,8 +135,3 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
-
-# llm-tokenizer 1.0.0 with the incremental-decode fix in vendor/llm-tokenizer/src/sequence.rs
-# and minijinja's `loop_controls` ({% break %} / {% continue %}, used by GLM-5.x templates).
-[patch.crates-io]
-llm-tokenizer = { path = "vendor/llm-tokenizer" }
