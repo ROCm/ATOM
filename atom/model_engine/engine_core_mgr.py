@@ -1486,14 +1486,15 @@ class CoreManager:
             )
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-        name = KVConnectorFactory.connector_name(
-            getattr(config, "kv_transfer_config", None) or None
-        )
-        if name not in SHARED_TIER_CONNECTORS:
+        # A P/D deployment wraps the offload tier in a `multi` connector next
+        # to the transport, so look at the transports it runs, not its name.
+        leaves = KVConnectorFactory.leaf_connectors(config) or []
+        names = [name for name, _ in leaves]
+        if not SHARED_TIER_CONNECTORS.intersection(names):
             raise ValueError(
                 "--dp-load-balance store_tokens needs an offload tier every DP "
                 f"rank shares ({', '.join(sorted(SHARED_TIER_CONNECTORS))}); "
-                f"the KV connector is {name!r}"
+                f"the KV connectors are {names!r}"
             )
         return StoreAwareRouter(envs.OFFLOAD_MIN_LOAD_TOKENS, self._dp_lb_req_equiv)
 

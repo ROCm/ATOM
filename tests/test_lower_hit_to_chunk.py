@@ -133,3 +133,22 @@ def test_a_tier_that_does_not_declare_it_keeps_the_hand_off(monkeypatch, seq_fac
     sched._early_load_tier_prefixes()
     assert seq.status == SequenceStatus.WAITING
     assert sched._early_load.skips["unaligned_hbm"] == 1
+
+
+def test_store_tokens_accepts_a_pd_multi_connector_with_a_shared_tier():
+    from types import SimpleNamespace
+
+    from atom.model_engine.engine_core_mgr import CoreManager
+
+    pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    store = {"kv_connector": "mooncake_store", "kv_role": "offload"}
+    mgr = SimpleNamespace(_dp_session_affinity_enabled=False, _dp_lb_req_equiv=512)
+    cfg = SimpleNamespace(
+        enable_prefix_caching=True,
+        kv_transfer_config={"kv_connector": "multi", "connectors": [pd, store]},
+    )
+    assert CoreManager._build_store_router(mgr, cfg) is not None
+
+    cfg.kv_transfer_config = {"kv_connector": "multi", "connectors": [pd]}
+    with pytest.raises(ValueError, match="shares"):
+        CoreManager._build_store_router(mgr, cfg)
