@@ -1,9 +1,12 @@
 # Benchmark explorer preview
 
-The disaggregated performance view shows one model at a time. Choose a model,
+The disaggregated performance view opens in a compact dark layout with a wide
+chart and one model at a time. Choose a model,
 data source and workload, then switch between P90 Interactivity and P90
 Normalized Interactivity. The vertical axis always shows **total throughput
-across the configuration**, in input + output tokens per second.
+across the configuration**, in input + output tokens per second. Summary
+metrics sit below the plot. Clicking a point opens its configuration details.
+The legend shows the engine and hardware; topology is retained as point metadata.
 
 ```sh
 python tools/preview_benchmark_dashboard.py \
@@ -45,7 +48,7 @@ its fastest P90 interactivity is 180.81277 tok/s/user. Configurations use 8, 12
 or 16 GPUs, so the total-throughput comparison is not a per-GPU efficiency chart.
 
 The dashed Pareto frontier maximizes both axes, is recomputed for visible
-topologies, and stays within one model variant, source, workload and precision.
+series, and stays within one model variant, source, workload and precision.
 Dominated points remain visible unless “Pareto points only” is selected. Older
 measurements without the selected P90 definition stay in the measurement table
 and are omitted from the chart; a median TPOT value is never substituted.
@@ -80,7 +83,7 @@ The numbers in this schema example are illustrative. Use measured values when
 importing results. Add `run_url`, `source_url`, `source_status`, topology details
 and other metric fields when available. Missing metrics are left unavailable.
 CSV exports include all measurements in the selected model/source/workload;
-PNG exports capture the selected axis and visible topologies.
+PNG exports capture the selected axis and visible series.
 
 ## Validation
 

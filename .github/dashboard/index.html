@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ATOM Benchmark Dashboard</title>
   <link rel="icon" type="image/png" href="atom_logo_mini.png" />
-  <script>if(localStorage.getItem('atom-dash-theme')==='light')document.documentElement.setAttribute('data-theme','light');</script>
+  <script>(()=>{const p=new URLSearchParams(location.hash.slice(1));const key=p.get('mode')==='Disaggregated'&&(!p.get('tab')||p.get('tab')==='performance')?'atom-explorer-theme':'atom-dash-theme';if(localStorage.getItem(key)==='light')document.documentElement.setAttribute('data-theme','light');})();</script>
   <style>
     /* ============================================================
        CSS VARIABLES & RESET
@@ -302,117 +302,131 @@
     .heatmap-table td { text-align: center; padding: 6px 10px; border: 1px solid var(--border-light); font-family: "SF Mono", monospace; font-size: 11px; color: var(--text-primary); }
     .heatmap-table td.row-label { text-align: left; font-family: inherit; color: var(--text-secondary); white-space: nowrap; }
 
-    /* Single-model performance explorer. Scoped to the disaggregated chart view. */
-    body.explorer { --explorer-accent: #da84c7; --explorer-soft: #29202d; background: #111117; }
-    [data-theme="light"] body.explorer { --explorer-accent: #a83b91; --explorer-soft: #f6eaf4; background: #f7f7fb; }
-    .explorer header { border-bottom: 1px solid var(--border-light); max-width: none; padding: 18px max(28px, calc((100vw - 1400px) / 2)); }
-    .explorer h1 { font-size: 16px; letter-spacing: -.3px; }
-    .explorer .header-logo { height: 30px; }
+
+    /* Compact performance workspace. The plot is the primary surface. */
+    body.explorer {
+      --bg-primary: #101216; --bg-secondary: #15181d; --bg-tertiary: #1d2128;
+      --border: #343943; --border-light: #2a2e36;
+      --text-primary: #f1f2f4; --text-secondary: #bcc2cd; --text-tertiary: #8d96a4;
+      --explorer-accent: #e396d7; --explorer-soft: #302431;
+      background: var(--bg-primary); color: var(--text-secondary); color-scheme: dark;
+    }
+    [data-theme="light"] body.explorer {
+      --bg-primary: #f6f7f9; --bg-secondary: #ffffff; --bg-tertiary: #f0f2f5;
+      --border: #cdd2db; --border-light: #e1e5eb;
+      --text-primary: #202631; --text-secondary: #505c6d; --text-tertiary: #697789;
+      --explorer-accent: #a83b91; --explorer-soft: #f6eaf4; color-scheme: light;
+    }
+    .explorer header { position: static; max-width: none; min-height: 64px; padding: 14px 32px; background: var(--bg-primary); border-bottom: 1px solid var(--border-light); }
     .explorer .header-left { gap: 18px; }
-    .explorer .header-left > div { padding-right: 40px; }
+    .explorer .header-logo { height: 24px; }
+    .explorer h1 { font-size: 13px; font-weight: 400; color: var(--text-tertiary); }
+    .explorer .header-left > div { padding-right: 38px; }
     .explorer .theme-toggle { right: 0; }
-    .explorer .meta { font-size: 10px; }
-    .explorer .container { max-width: 1456px; padding: 16px 28px 40px; }
-    .explorer #kpi-row, .explorer .filter-group:has([data-filter="models"]), .explorer .filter-summary { display: none; }
+    .explorer .meta, .explorer .header-spacer, .explorer #kpi-row, .explorer .filter-summary,
+    .explorer .filter-group:has([data-filter="models"]), .explorer footer { display: none; }
     .explorer .dashboard-mode-group { position: static; }
-    .explorer .filter-btn { padding: 8px 11px; }
-    .explorer .tabs { margin-bottom: 30px; gap: 12px; }
-    .explorer .tab { padding: 9px 4px 14px; margin-right: 18px; font-weight: 500; }
-    .explorer .tab.active { border-color: var(--explorer-accent); color: var(--explorer-accent); }
-    .ex-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 26px; }
-    .ex-eyebrow { font-size: 10px; font-weight: 700; letter-spacing: 1.9px; color: var(--explorer-accent); margin-bottom: 9px; }
-    .ex-heading h2 { font-size: 30px; letter-spacing: -1px; font-weight: 650; color: var(--text-primary); }
-    .ex-subtitle { color: var(--text-tertiary); font-size: 13px; margin-top: 8px; line-height: 1.7; }
-    .ex-badge { display: inline-flex; align-items: center; gap: 7px; padding: 7px 10px; border-radius: 6px; background: var(--explorer-soft); color: var(--explorer-accent); font-size: 11px; font-weight: 600; }
-    .ex-badge::before { content: ''; width: 5px; height: 5px; background: currentColor; border-radius: 50%; }
-    .ex-controls { display: grid; grid-template-columns: 1.25fr 1.15fr 1fr; gap: 18px; padding: 20px 22px; border: 1px solid var(--border-light); background: var(--bg-secondary); border-radius: 12px; }
-    .ex-field { min-width: 0; }
-    .ex-field label { display: block; font-size: 10px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; color: var(--text-tertiary); margin-bottom: 9px; }
-    .ex-field select { width: 100%; border: 1px solid var(--border); border-radius: 7px; color: var(--text-primary); background: var(--bg-secondary); padding: 10px 32px 10px 12px; font: inherit; font-size: 13px; cursor: pointer; text-overflow: ellipsis; }
-    .ex-stats { display: grid; grid-template-columns: repeat(4, 1fr); padding: 25px 4px 27px; }
+    .explorer .filter-btn { padding: 7px 10px; font-size: 11px; background: transparent; border-color: var(--border-light); }
+    .explorer .filter-reset { border-color: var(--border-light); }
+    .explorer .container { max-width: 1584px; padding: 0 32px 26px; }
+    .explorer .tabs { height: 49px; margin-bottom: 22px; gap: 24px; border-color: var(--border-light); }
+    .explorer .tab { display: flex; align-items: center; padding: 0 1px; font-size: 12px; font-weight: 500; }
+    .explorer .tab.active { color: var(--text-primary); border-color: var(--explorer-accent); }
+    .ex-controls { display: grid; grid-template-columns: 1fr 1fr 1.35fr; gap: 14px; margin-bottom: 20px; }
+    .ex-field { display: flex; align-items: center; min-width: 0; border: 1px solid var(--border-light); border-radius: 6px; background: var(--bg-secondary); padding: 0 12px; }
+    .ex-field label { color: var(--text-tertiary); font-size: 11px; white-space: nowrap; margin-right: 12px; }
+    .ex-field select { min-width: 0; width: 100%; padding: 12px 0; background: transparent; border: none; outline-offset: 3px; color: var(--text-primary); font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; text-overflow: ellipsis; }
+    .ex-field option { background: var(--bg-secondary); color: var(--text-primary); }
+    .ex-panel { border: 1px solid var(--border-light); border-radius: 9px; background: var(--bg-secondary); overflow: hidden; }
+    .ex-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 24px 16px; }
+    .ex-model-title { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .ex-model-title h2 { font-size: 22px; letter-spacing: -.6px; font-weight: 650; color: var(--text-primary); }
+    .ex-chip { font-size: 10px; font-weight: 500; padding: 4px 6px; border: 1px solid var(--border); color: var(--text-tertiary); border-radius: 4px; }
+    .ex-panel-head p { font-size: 12px; color: var(--text-tertiary); margin-top: 7px; }
+    .ex-segments { display: inline-flex; background: var(--bg-primary); border: 1px solid var(--border-light); padding: 3px; border-radius: 6px; gap: 3px; flex-shrink: 0; }
+    .ex-segments button { padding: 9px 13px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--text-tertiary); font: inherit; font-size: 11px; cursor: pointer; }
+    .ex-segments button[aria-pressed="true"] { background: var(--bg-tertiary); color: var(--text-primary); border-color: var(--border); }
+    .ex-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px; padding: 0 24px 14px; }
+    .ex-legend { display: flex; align-items: center; flex-wrap: wrap; gap: 20px; }
+    .ex-legend button { display: flex; align-items: center; gap: 8px; border: none; padding: 4px 0; background: none; font: inherit; font-size: 12px; color: var(--text-secondary); cursor: pointer; }
+    .ex-legend button[aria-pressed="false"] { opacity: .4; text-decoration: line-through; }
+    .ex-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--series-color); display: inline-block; }
+    .ex-legend-note { font-size: 11px; color: var(--text-tertiary); display: flex; align-items: center; gap: 7px; }
+    .ex-line { display: inline-block; width: 18px; border-top: 1px dashed var(--text-tertiary); }
+    .ex-actions { display: flex; align-items: center; gap: 8px; }
+    .ex-button { padding: 7px 10px; background: transparent; color: var(--text-secondary); border: 1px solid var(--border); border-radius: 5px; font: inherit; font-size: 11px; cursor: pointer; }
+    .ex-button:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+    .ex-button:disabled { cursor: default; opacity: .4; }
+    .ex-check { display: flex; align-items: center; gap: 7px; font-size: 11px; margin-right: 12px; color: var(--text-secondary); cursor: pointer; }
+    .ex-check input { accent-color: var(--explorer-accent); }
+    .ex-plot-main { padding: 0 19px; }
+    .ex-chart { height: clamp(390px, 53vh, 650px); position: relative; }
+    .ex-chart canvas { max-width: 100%; }
+    .ex-caption { display: flex; justify-content: space-between; gap: 15px; padding: 6px 26px 18px; font-size: 10px; line-height: 1.5; color: var(--text-tertiary); }
+    .ex-stats { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--border-light); padding: 18px 24px; }
     .ex-stat { padding: 0 24px; border-right: 1px solid var(--border-light); }
     .ex-stat:first-child { padding-left: 0; }
     .ex-stat:last-child { border: none; }
-    .ex-stat-label { font-size: 11px; color: var(--text-tertiary); margin-bottom: 7px; }
-    .ex-stat-value { font-size: 27px; font-weight: 650; letter-spacing: -1px; color: var(--text-primary); font-variant-numeric: tabular-nums; }
-    .ex-stat-value small { font-size: 11px; color: var(--text-tertiary); font-weight: 400; letter-spacing: 0; }
-    .ex-stat-note { font-size: 11px; margin-top: 5px; color: var(--text-tertiary); }
-    .ex-panel { background: var(--bg-secondary); border: 1px solid var(--border-light); border-radius: 12px; overflow: hidden; }
-    .ex-panel-head { padding: 22px 24px 18px; display: flex; align-items: center; justify-content: space-between; gap: 15px; }
-    .ex-panel-head h3 { font-size: 16px; letter-spacing: -.3px; font-weight: 600; color: var(--text-primary); }
-    .ex-panel-head p { font-size: 11px; color: var(--text-tertiary); margin-top: 6px; }
-    .ex-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .ex-button { padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-secondary); color: var(--text-secondary); font: inherit; font-size: 11px; cursor: pointer; }
-    .ex-button:hover { color: var(--explorer-accent); border-color: var(--explorer-accent); }
-    .ex-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 14px; padding: 0 24px 20px; flex-wrap: wrap; }
-    .ex-segments { display: inline-flex; background: var(--bg-primary); border: 1px solid var(--border-light); padding: 4px; border-radius: 8px; gap: 3px; }
-    .ex-segments button { padding: 8px 14px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: var(--text-tertiary); font: inherit; font-size: 11px; cursor: pointer; }
-    .ex-segments button[aria-pressed="true"] { border-color: var(--border-light); background: var(--bg-secondary); color: var(--explorer-accent); box-shadow: 0 1px 3px #0000000a; font-weight: 600; }
-    .ex-check { display: inline-flex; align-items: center; gap: 7px; font-size: 11px; color: var(--text-secondary); cursor: pointer; }
-    .ex-check input { accent-color: var(--explorer-accent); }
-    .ex-plot-layout { display: grid; grid-template-columns: minmax(0, 1fr) 235px; border-top: 1px solid var(--border-light); }
-    .ex-plot-main { min-width: 0; padding: 18px 18px 0; }
-    .ex-chart { height: 390px; position: relative; }
-    .ex-chart canvas { max-width: 100%; }
-    .ex-legend { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 20px; min-height: 48px; padding: 10px 30px 14px; }
-    .ex-legend button { display: flex; align-items: center; gap: 7px; border: none; background: none; font: inherit; font-size: 11px; color: var(--text-secondary); cursor: pointer; }
-    .ex-legend button[aria-pressed="false"] { opacity: .4; text-decoration: line-through; }
-    .ex-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--series-color); }
-    .ex-legend-note { color: var(--text-tertiary); font-size: 10px; margin-left: auto; }
-    .ex-detail { padding: 22px 20px; border-left: 1px solid var(--border-light); }
-    .ex-detail .ex-eyebrow { letter-spacing: 1px; font-size: 9px; }
-    .ex-detail h4 { color: var(--text-primary); font-size: 19px; font-weight: 600; margin: 12px 0 6px; }
-    .ex-detail dl { margin: 22px 0; }
-    .ex-detail dl div { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; padding: 10px 0; border-bottom: 1px solid var(--border-light); font-size: 11px; }
+    .ex-stat-label { font-size: 10px; color: var(--text-tertiary); margin-bottom: 7px; }
+    .ex-stat-value { font-size: 22px; line-height: 1; letter-spacing: -.6px; color: var(--text-primary); font-weight: 550; font-variant-numeric: tabular-nums; }
+    .ex-stat-value small { font-size: 10px; font-weight: 400; letter-spacing: 0; color: var(--text-tertiary); }
+    .ex-stat-note { font-size: 10px; color: var(--text-tertiary); margin-top: 7px; }
+    .ex-detail { display: flex; flex-wrap: wrap; gap: 24px; align-items: center; padding: 20px 24px; border-top: 1px solid var(--border-light); background: var(--bg-tertiary); }
+    .ex-detail[hidden] { display: none; }
+    .ex-detail-title { min-width: 150px; }
+    .ex-eyebrow { font-size: 9px; letter-spacing: .8px; color: var(--text-tertiary); margin-bottom: 7px; }
+    .ex-detail h4 { font-size: 16px; color: var(--text-primary); font-weight: 550; }
+    .ex-detail dl { display: flex; gap: 24px; flex-wrap: wrap; flex: 1; }
+    .ex-detail dl div { display: flex; flex-direction: column; gap: 7px; font-size: 11px; }
     .ex-detail dt { color: var(--text-tertiary); }
-    .ex-detail dd { color: var(--text-primary); text-align: right; font-variant-numeric: tabular-nums; }
-    .ex-detail .ex-source { font-size: 11px; color: var(--explorer-accent); }
-    .ex-caption { padding: 13px 24px; border-top: 1px solid var(--border-light); font-size: 10px; color: var(--text-tertiary); line-height: 1.8; display: flex; justify-content: space-between; gap: 16px; }
-    .ex-table-panel { margin-top: 20px; border: 1px solid var(--border-light); border-radius: 10px; background: var(--bg-secondary); }
-    .ex-table-panel summary { cursor: pointer; padding: 18px 22px; font-size: 12px; color: var(--text-primary); }
+    .ex-detail dd { color: var(--text-primary); font-variant-numeric: tabular-nums; }
+    .ex-source { font-size: 11px; color: var(--text-secondary); }
+    .ex-table-panel { margin-top: 14px; border: 1px solid var(--border-light); border-radius: 7px; background: var(--bg-secondary); }
+    .ex-table-panel summary { padding: 15px 20px; font-size: 12px; color: var(--text-secondary); cursor: pointer; }
     .ex-table-scroll { overflow-x: auto; }
     .ex-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 11px; white-space: nowrap; }
     .ex-table th { font-weight: 500; color: var(--text-tertiary); background: var(--bg-primary); }
-    .ex-table td, .ex-table th { padding: 12px 20px; border-top: 1px solid var(--border-light); }
+    .ex-table td, .ex-table th { padding: 10px 20px; border-top: 1px solid var(--border-light); }
     .ex-table td { font-variant-numeric: tabular-nums; }
-    .ex-table tbody tr:hover { background: var(--explorer-soft); }
+    .ex-table tbody tr:hover { background: var(--bg-tertiary); }
     .ex-table .num { text-align: right; }
-    .ex-footer { display: flex; justify-content: space-between; gap: 20px; color: var(--text-tertiary); font-size: 10px; line-height: 1.8; margin-top: 19px; }
-    .ex-empty { display: grid; align-content: center; height: 390px; padding: 30px; color: var(--text-tertiary); text-align: center; line-height: 1.8; font-size: 13px; }
+    .ex-footer { display: flex; justify-content: space-between; gap: 20px; margin-top: 15px; font-size: 10px; line-height: 1.8; color: var(--text-tertiary); }
+    .ex-footer a { color: var(--text-secondary); }
+    .ex-empty { display: grid; align-content: center; height: 390px; text-align: center; padding: 30px; color: var(--text-tertiary); font-size: 13px; line-height: 1.8; }
     .explorer :is(button, select, input, summary, a):focus-visible { outline: 2px solid var(--explorer-accent); outline-offset: 3px; }
-    @media (max-width: 1000px) {
-      .ex-plot-layout { grid-template-columns: minmax(0, 1fr); }
-      .ex-detail { border-left: none; border-top: 1px solid var(--border-light); }
-      .ex-detail dl { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0 20px; margin: 12px 0; }
-      .ex-heading h2 { font-size: 25px; }
-      .explorer .filter-bar { margin-top: 12px; }
+    @media (max-width: 1100px) {
+      .explorer header { gap: 12px; padding: 12px 22px; }
+      .explorer .container { padding-inline: 22px; }
+      .ex-controls { gap: 10px; }
+      .ex-field { flex-direction: column; align-items: stretch; padding-top: 9px; }
+      .ex-field select { padding: 8px 0; }
     }
-    @media (max-width: 640px) {
-      .explorer .container { padding: 12px; }
-      .explorer header { padding: 12px; position: static; }
-      .explorer .header-logo { height: 24px; }
-      .explorer h1 { font-size: 14px; }
-      .explorer .header-spacer { display: none; }
-      .explorer .tabs { margin-bottom: 20px; }
-      .ex-heading { align-items: flex-start; }
-      .ex-heading h2 { font-size: 23px; }
-      .ex-heading > .ex-badge { display: none; }
-      .ex-controls { grid-template-columns: 1fr; padding: 16px; gap: 13px; }
-      .ex-stats { grid-template-columns: 1fr 1fr; gap: 22px 0; }
+    @media (max-width: 700px) {
+      .explorer header { padding: 12px; }
+      .explorer .container { padding: 0 12px 20px; }
+      .explorer .header-logo { height: 21px; }
+      .explorer h1 { font-size: 11px; }
+      .explorer .tabs { height: 45px; margin-bottom: 15px; }
+      .ex-controls { grid-template-columns: 1fr 1fr; margin-bottom: 14px; }
+      .ex-field:last-child { grid-column: 1 / -1; flex-direction: row; align-items: center; padding-top: 0; }
+      .ex-model-title h2 { font-size: 20px; }
+      .ex-panel-head { flex-direction: column; align-items: stretch; padding: 16px; gap: 16px; }
+      .ex-segments { align-self: flex-start; }
+      .ex-segments button { padding: 8px 9px; font-size: 10px; }
+      .ex-toolbar { padding: 0 16px 12px; gap: 12px; }
+      .ex-legend { gap: 14px; }
+      .ex-plot-main { padding: 0 5px; }
+      .ex-chart, .ex-empty { height: 340px; }
+      .ex-caption { flex-direction: column; gap: 6px; padding: 6px 16px 16px; }
+      .ex-stats { grid-template-columns: 1fr 1fr; gap: 20px 0; padding: 18px 16px; }
       .ex-stat { padding: 0 12px; }
       .ex-stat:nth-child(3) { padding-left: 0; }
       .ex-stat:nth-child(2) { border: none; }
-      .ex-stat-value { font-size: 23px; }
-      .ex-panel-head { align-items: flex-start; padding: 18px 14px; }
-      .ex-toolbar { padding: 0 14px 16px; }
-      .ex-segments button { padding: 9px 8px; font-size: 10px; }
-      .ex-plot-main { padding: 14px 6px 0; }
-      .ex-chart, .ex-empty { height: 310px; }
-      .ex-legend { padding: 12px; }
-      .ex-detail dl { grid-template-columns: 1fr 1fr; }
-      .ex-caption, .ex-footer { flex-direction: column; gap: 5px; }
+      .ex-stat-value { font-size: 20px; }
+      .ex-detail { padding: 18px 16px; gap: 18px; }
+      .ex-detail dl { flex-basis: 100%; display: grid; grid-template-columns: 1fr 1fr; }
+      .ex-footer { flex-direction: column; gap: 4px; }
     }
-
   </style>
 </head>
 <body>
@@ -528,7 +542,9 @@ const THEME_COLORS = {
   dark:  { tick: '#8a8da0', legend: '#b0b2c4', tooltipBg: '#141519', tooltipBd: '#303140', tooltipTitle: '#eef0f6', tooltipBody: '#bfc1d0', grid: 'rgba(65,67,85,0.4)' },
   light: { tick: '#5a5d70', legend: '#4a4d5e', tooltipBg: '#ffffff', tooltipBd: '#d0d3dc', tooltipTitle: '#1a1c24', tooltipBody: '#4a4d5e', grid: 'rgba(0,0,0,0.10)' }
 };
-let _theme = localStorage.getItem('atom-dash-theme') || 'dark';
+const themeParams = new URLSearchParams(location.hash.slice(1));
+const initialExplorer = themeParams.get('mode') === 'Disaggregated' && (!themeParams.get('tab') || themeParams.get('tab') === 'performance');
+let _theme = localStorage.getItem(initialExplorer ? 'atom-explorer-theme' : 'atom-dash-theme') || 'dark';
 let C_TICK = THEME_COLORS[_theme].tick;
 let C_LEGEND = THEME_COLORS[_theme].legend;
 let C_TOOLTIP_BG = THEME_COLORS[_theme].tooltipBg;
@@ -543,6 +559,7 @@ if (_theme === 'light') document.documentElement.setAttribute('data-theme', 'lig
 function applyTheme(theme) {
   _theme = theme;
   localStorage.setItem('atom-dash-theme', theme);
+  if (document.body.classList.contains('explorer')) localStorage.setItem('atom-explorer-theme', theme);
   if (theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
   else document.documentElement.removeAttribute('data-theme');
   const tc = THEME_COLORS[theme];
@@ -4096,10 +4113,11 @@ function renderAtomeshPerformanceTab() {
   }
   const rows = sourceRows.filter(row => explorerWorkloadKey(row) === state.explorerWorkload)
     .sort((a, b) => _lc(explorerTopology(a), explorerTopology(b)) || a.concurrency - b.concurrency);
-  const seriesKey = row => `${row.model} · ${explorerTopology(row)}`;
+  const seriesKey = row => row.model;
   const seriesKeys = [...new Set(rows.map(seriesKey))];
+  const seriesLabel = key => `ATOM · ${fmtHardware(selectedHardware())}${seriesKeys.length > 1 ? ' · ' + key : ''}`;
   const light = document.documentElement.getAttribute('data-theme') === 'light';
-  const palette = light ? ['#b14b9d', '#5277cf', '#218d89', '#bf8535', '#865bc4'] : ['#e090ce', '#88aaff', '#67cfbd', '#e7b96e', '#bc9bed'];
+  const palette = light ? ['#b844a4', '#3f73cd', '#218d89', '#bf8535', '#865bc4'] : ['#e99cdb', '#8faeff', '#66d2bf', '#e7b96e', '#bc9bed'];
   const colors = new Map(seriesKeys.map((key, i) => [key, palette[i % palette.length]]));
   const points = rows.filter(row => explorerMetricValue(row, metric) !== null
     && Number.isFinite(row.totalTput) && row.totalTput > 0
@@ -4123,36 +4141,35 @@ function renderAtomeshPerformanceTab() {
   const sourceUrl = safeHref(rows[0]?.sourceUrl || rows[0]?.runUrl);
   const optionHTML = (options, selected, label = x => x) => options.map(option => `<option value="${escHTML(option).replace(/"/g, '&quot;')}" ${option === selected ? 'selected' : ''}>${escHTML(label(option))}</option>`).join('');
   container.innerHTML = `
-    <div class="ex-heading">
-      <div><div class="ex-eyebrow">ATOM / PERFORMANCE EXPLORER</div>
-        <h2>${escHTML(state.explorerModel || 'Explore inference performance')}</h2>
-        <p class="ex-subtitle">Throughput and responsiveness, at every operating point.</p></div>
-      <span class="ex-badge">${escHTML(fmtHardware(selectedHardware()))} · Disaggregated serving</span>
-    </div>
     <div class="ex-controls">
       <div class="ex-field"><label for="ex-model">Model</label><select id="ex-model">${optionHTML(models, state.explorerModel)}</select></div>
-      <div class="ex-field"><label for="ex-source">Data source</label><select id="ex-source">${optionHTML(sources, state.explorerSource)}</select></div>
-      <div class="ex-field"><label for="ex-workload">Workload / precision</label><select id="ex-workload">${optionHTML(workloads, state.explorerWorkload, explorerWorkloadLabel)}</select></div>
-    </div>
-    <div class="ex-stats">
-      <div class="ex-stat"><div class="ex-stat-label">Peak total throughput</div><div class="ex-stat-value">${explorerCompact(peak?.y, 2)} <small>tok/s</small></div><div class="ex-stat-note">${peak ? `${escHTML(explorerTopology(peak.row))} · concurrency ${peak.row.concurrency}` : 'No measured points'}</div></div>
-      <div class="ex-stat"><div class="ex-stat-label">Fastest ${metricLabel}</div><div class="ex-stat-value">${fastest ? fmtNum(fastest.x, 1) : '—'} <small>tok/s/user</small></div><div class="ex-stat-note">${fastest ? `${escHTML(explorerTopology(fastest.row))} · concurrency ${fastest.row.concurrency}` : 'No P90 measurements'}</div></div>
-      <div class="ex-stat"><div class="ex-stat-label">Measured configurations</div><div class="ex-stat-value">${points.length} <small>points</small></div><div class="ex-stat-note">${frontierRows.size} Pareto optimal · ${new Set(points.map(p => explorerTopology(p.row))).size} topologies</div></div>
-      <div class="ex-stat"><div class="ex-stat-label">GPUs per configuration</div><div class="ex-stat-value">${gpuRange} <small>${escHTML(fmtHardware(selectedHardware()))}</small></div><div class="ex-stat-note">Prefill + decode, all participating GPUs</div></div>
+      <div class="ex-field"><label for="ex-source">Source</label><select id="ex-source">${optionHTML(sources, state.explorerSource)}</select></div>
+      <div class="ex-field"><label for="ex-workload">Workload</label><select id="ex-workload">${optionHTML(workloads, state.explorerWorkload, explorerWorkloadLabel)}</select></div>
     </div>
     <section class="ex-panel" aria-label="Throughput and interactivity chart">
-      <div class="ex-panel-head"><div><h3>Total throughput vs. interactivity</h3><p>Find the operating point that fits your latency budget.</p></div>
-        <div class="ex-actions"><button class="ex-button" id="ex-csv">↓ CSV</button><button class="ex-button" id="ex-png" ${visible.length ? '' : 'disabled'}>↓ PNG</button></div></div>
-      <div class="ex-toolbar"><div class="ex-segments" role="group" aria-label="X axis">
-        <button data-ex-metric="p90_itl" aria-pressed="${metric.key === 'p90_itl'}">P90 Interactivity</button>
-        <button data-ex-metric="e2e_normalized" aria-pressed="${metric.key === 'e2e_normalized'}">P90 Normalized Interactivity</button>
-      </div><label class="ex-check"><input type="checkbox" id="ex-frontier" ${state.explorerFrontierOnly ? 'checked' : ''}> Pareto points only</label></div>
-      <div class="ex-plot-layout"><div class="ex-plot-main">
+      <div class="ex-panel-head">
+        <div><div class="ex-model-title"><h2>${escHTML(state.explorerModel || 'Inference performance')}</h2><span class="ex-chip">${escHTML((rows[0]?.precision || 'Precision unavailable').toUpperCase())}</span><span class="ex-chip">${escHTML(fmtHardware(selectedHardware()))}</span></div><p>Total throughput <span aria-hidden="true">/</span> ${metricLabel}</p></div>
+        <div class="ex-segments" role="group" aria-label="X axis">
+          <button data-ex-metric="p90_itl" aria-pressed="${metric.key === 'p90_itl'}">P90 Interactivity</button>
+          <button data-ex-metric="e2e_normalized" aria-pressed="${metric.key === 'e2e_normalized'}">P90 Normalized Interactivity</button>
+        </div>
+      </div>
+      <div class="ex-toolbar">
+        <div class="ex-legend" aria-label="Series visibility">${seriesKeys.map((key, idx) => `<button data-ex-series="${idx}" aria-pressed="${!state.explorerHidden.has(key)}"><span class="ex-dot" style="--series-color:${colors.get(key)}"></span>${escHTML(seriesLabel(key))}</button>`).join('')}<span class="ex-legend-note"><span class="ex-line"></span>Pareto frontier</span></div>
+        <div class="ex-actions"><label class="ex-check"><input type="checkbox" id="ex-frontier" ${state.explorerFrontierOnly ? 'checked' : ''}> Pareto only</label><button class="ex-button" id="ex-csv">↓ CSV</button><button class="ex-button" id="ex-png" ${visible.length ? '' : 'disabled'}>↓ PNG</button></div>
+      </div>
+      <div class="ex-plot-main">
         ${visible.length ? '<div class="ex-chart"><canvas id="ex-chart" role="img" aria-label="Scatter plot of total throughput versus P90 interactivity. All values are available in the measurement table below."></canvas></div>'
-          : `<div class="ex-empty">No points available for ${metricLabel}.<br>${missing ? `${missing} configurations lack this P90 metric or total throughput.` : 'Choose a different model, workload, or filter; enable a topology in the legend.'}</div>`}
-        <div class="ex-legend" aria-label="Topology visibility">${seriesKeys.map((key, idx) => `<button data-ex-series="${idx}" aria-pressed="${!state.explorerHidden.has(key)}"><span class="ex-dot" style="--series-color:${colors.get(key)}"></span>${escHTML(seriesKeys.length > new Set(rows.map(explorerTopology)).size ? key : explorerTopology(rows.find(r => seriesKey(r) === key)))}</button>`).join('')}<span class="ex-legend-note">Dashed line · Pareto frontier</span></div>
-      </div><aside class="ex-detail" id="ex-detail" aria-label="Selected configuration" aria-live="polite"></aside></div>
-      <div class="ex-caption"><span>${metric.key === 'p90_itl' ? 'P90 Interactivity = 1 / p90(ITL)' : 'P90 Normalized Interactivity = 1 / p90(ITL + TTFT / output tokens)'} · latency in seconds</span><span>Higher is better on both axes ↗</span></div>
+          : `<div class="ex-empty">No points available for ${metricLabel}.<br>${missing ? `${missing} configurations lack this P90 metric or total throughput.` : 'Choose a different model, workload, or filter; enable a series in the legend.'}</div>`}
+      </div>
+      <div class="ex-caption"><span>${metric.key === 'p90_itl' ? '1 / p90(ITL)' : '1 / p90(ITL + TTFT / output tokens)'} · latency in seconds · click a point for details</span><span>Higher throughput ↑ &nbsp; Faster responses →</span></div>
+      <div class="ex-stats">
+        <div class="ex-stat"><div class="ex-stat-label">Peak total throughput</div><div class="ex-stat-value">${explorerCompact(peak?.y, 2)} <small>tok/s</small></div><div class="ex-stat-note">${peak ? `Concurrency ${peak.row.concurrency} · ${peak.row.totalGpu ?? '—'} GPUs` : 'No measured points'}</div></div>
+        <div class="ex-stat"><div class="ex-stat-label">Fastest ${metricLabel}</div><div class="ex-stat-value">${fastest ? fmtNum(fastest.x, 1) : '—'} <small>tok/s/user</small></div><div class="ex-stat-note">${fastest ? `Concurrency ${fastest.row.concurrency} · ${fastest.row.totalGpu ?? '—'} GPUs` : 'No P90 measurements'}</div></div>
+        <div class="ex-stat"><div class="ex-stat-label">Measured configurations</div><div class="ex-stat-value">${points.length} <small>points</small></div><div class="ex-stat-note">${frontierRows.size} on the Pareto frontier</div></div>
+        <div class="ex-stat"><div class="ex-stat-label">GPUs per configuration</div><div class="ex-stat-value">${gpuRange} <small>${escHTML(fmtHardware(selectedHardware()))}</small></div><div class="ex-stat-note">Prefill + decode GPUs</div></div>
+      </div>
+      <aside class="ex-detail" id="ex-detail" aria-label="Selected configuration" aria-live="polite" hidden></aside>
     </section>
     <details class="ex-table-panel"><summary>All measurements <span style="color:var(--text-tertiary)">· ${rows.length} configurations${missing ? ` · ${missing} missing the selected metric` : ''}</span></summary>
       <div class="ex-table-scroll"><table class="ex-table"><thead><tr><th>Configuration</th><th class="num">GPUs</th><th class="num">Concurrency</th><th class="num">P90 interactivity</th><th class="num">P90 normalized</th><th class="num">Total tok/s</th><th>Source</th></tr></thead>
@@ -4160,20 +4177,20 @@ function renderAtomeshPerformanceTab() {
     </details>
     <div class="ex-footer"><span>${sourceUrl ? `<a href="${escHTML(sourceUrl)}" target="_blank" rel="noopener noreferrer">${escHTML(state.explorerSource)} ↗</a>` : escHTML(state.explorerSource)}${localRows.some(row => rows.includes(row)) ? ' · Local preview' : ''}${rows[0]?.sourceStatus ? ' · ' + escHTML(rows[0].sourceStatus) : ''}${missing ? ` · ${missing} configurations omitted from the chart: P90 metric or throughput unavailable.` : ''}</span><span>Total throughput = input + output tokens / second, across the full configuration.</span></div>`;
 
-  function showDetail(row, label = 'SELECTED CONFIGURATION') {
+  function showDetail(row) {
     const detail = document.getElementById('ex-detail');
-    if (!row) { detail.innerHTML = '<p class="ex-subtitle">Select a measured point to inspect its configuration.</p>'; return; }
-    detail.innerHTML = `<div class="ex-eyebrow">${label}</div><h4>${escHTML(explorerTopology(row))}</h4>
-      <div class="ex-subtitle">Concurrency ${row.concurrency} · ${row.totalGpu ?? '—'} GPUs</div>
-      <dl><div><dt>Total throughput</dt><dd>${explorerCompact(row.totalTput, 2)} tok/s</dd></div>
+    if (!row) return;
+    detail.hidden = false;
+    detail.innerHTML = `<div class="ex-detail-title"><div class="ex-eyebrow">SELECTED CONFIGURATION</div><h4>Concurrency ${row.concurrency}</h4></div>
+      <dl><div><dt>Total throughput</dt><dd>${fmtNum(row.totalTput, 2)} tok/s</dd></div>
       <div><dt>P90 interactivity</dt><dd>${atomeshDetailValue(row.interactivityP90Itl, v => fmtNum(v, 2))}</dd></div>
       <div><dt>P90 normalized</dt><dd>${atomeshDetailValue(explorerMetricValue(row, ATOMESH_INTERACTIVITY_METRICS[0]), v => fmtNum(v, 2))}</dd></div>
-      <div><dt>Precision</dt><dd>${escHTML((row.precision || '—').toUpperCase())}</dd></div>
+      <div><dt>Topology / GPUs</dt><dd>${escHTML(explorerTopology(row))} / ${row.totalGpu ?? '—'}</dd></div>
       <div><dt>Pareto optimal</dt><dd>${points.some(point => point.row === row) ? (frontierRows.has(row) ? 'Yes' : 'No') : '—'}</dd></div></dl>
-      ${safeHref(row.runUrl) ? `<a class="ex-source" href="${escHTML(row.runUrl)}" target="_blank" rel="noopener noreferrer">View benchmark run ↗</a>` : ''}
-      <p class="ex-subtitle" style="font-size:10px;margin-top:20px">Click a point to inspect it.<br>Interactivity is in tok/s/user.</p>`;
+      ${safeHref(row.runUrl) ? `<a class="ex-source" href="${escHTML(row.runUrl)}" target="_blank" rel="noopener noreferrer">View run ↗</a>` : ''}
+      <button class="ex-button" id="ex-close-detail" aria-label="Close configuration details">×</button>`;
+    document.getElementById('ex-close-detail').addEventListener('click', () => { detail.hidden = true; });
   }
-  showDetail(peak?.row, 'PEAK THROUGHPUT');
   function refresh() { renderAtomeshPerformanceTab(); syncToHash(); }
   for (const [id, key] of [['ex-model', 'explorerModel'], ['ex-source', 'explorerSource'], ['ex-workload', 'explorerWorkload']]) {
     document.getElementById(id).addEventListener('change', event => {
@@ -4213,37 +4230,38 @@ function renderAtomeshPerformanceTab() {
       label: key, data: visible.filter(point => seriesKey(point.row) === key),
       borderColor: colors.get(key), backgroundColor: colors.get(key),
       pointRadius: 5, pointHoverRadius: 8, pointHitRadius: 10,
-      pointBorderWidth: 2, pointBorderColor: light ? '#ffffff' : '#191921', showLine: false,
+      pointBorderWidth: 2, pointBorderColor: light ? '#ffffff' : '#15181d', showLine: false,
     }));
     for (const frontier of frontiers) {
       datasets.push({ label: 'Pareto frontier', data: frontier, showLine: true, fill: false,
-        borderColor: light ? '#9a829b' : '#ac97ad', borderWidth: 1.5, borderDash: [5, 5],
+        borderColor: light ? '#b18baa' : '#b493b1', borderWidth: 1.5, borderDash: [4, 4],
         pointRadius: 0, pointHoverRadius: 0, pointHitRadius: 0, order: 1, _isFrontier: true });
     }
     const chart = new Chart(document.getElementById('ex-chart'), {
       type: 'scatter', data: { datasets },
       options: {
         responsive: true, maintainAspectRatio: false, animation: false,
-        layout: { padding: { top: 18, right: 24 } },
+        layout: { padding: { top: 22, right: 24 } },
         interaction: { mode: 'nearest', intersect: true },
         plugins: {
+          watermark: false,
           legend: { display: false },
           datalabels: { display: context => !context.dataset._isFrontier && visible.length <= 18 ? 'auto' : false,
-            color: C_TICK, align: 'top', offset: 6, font: { size: 10 }, formatter: point => 'c' + point.row.concurrency },
+            color: light ? '#697789' : '#adb5c2', align: 'top', offset: 8, font: { size: 11 }, formatter: point => 'c' + point.row.concurrency },
           tooltip: { ...chartTooltipOpts(), padding: 14, displayColors: false,
             filter: item => !item.dataset._isFrontier,
             callbacks: {
-              title: items => items.length ? `${explorerTopology(items[0].raw.row)} · concurrency ${items[0].raw.row.concurrency}` : '',
+              title: items => items.length ? `Concurrency ${items[0].raw.row.concurrency}` : '',
               label: item => [`Total throughput: ${fmtNum(item.raw.y, 2)} tok/s`, `${metricLabel}: ${fmtNum(item.raw.x, 2)} tok/s/user`, `GPUs: ${item.raw.row.totalGpu ?? '—'}`],
             } },
         },
         scales: {
-          x: { min: 0, grace: '12%', grid: { display: false }, border: { display: false },
-            title: { display: true, text: `${metricLabel} (tok/s/user)`, color: C_TICK, font: { size: 11 }, padding: 16 },
-            ticks: { color: C_TICK, maxTicksLimit: 8, font: { size: 10 } } },
-          y: { min: 0, grace: '15%', border: { display: false }, grid: { color: light ? '#edf0f4' : '#2a2a34', drawTicks: false },
-            title: { display: true, text: 'Total throughput (tok/s)', color: C_TICK, font: { size: 11 }, padding: 12 },
-            ticks: { color: C_TICK, maxTicksLimit: 6, padding: 12, font: { size: 10 }, callback: value => explorerCompact(value) } },
+          x: { min: 0, grace: '8%', grid: { color: light ? '#f0f2f5' : '#20242c', drawTicks: false }, border: { display: false },
+            title: { display: true, text: `${metricLabel} (tok/s/user)`, color: light ? '#505c6d' : '#bcc2cd', font: { size: 12 }, padding: 16 },
+            ticks: { color: light ? '#697789' : '#9ba4b3', maxTicksLimit: 9, padding: 12, font: { size: 11 } } },
+          y: { min: 0, grace: '12%', border: { display: false }, grid: { color: light ? '#e9edf2' : '#292e37', drawTicks: false },
+            title: { display: true, text: 'Total throughput (tok/s)', color: light ? '#505c6d' : '#bcc2cd', font: { size: 12 }, padding: 12 },
+            ticks: { color: light ? '#697789' : '#9ba4b3', maxTicksLimit: 7, padding: 12, font: { size: 11 }, callback: value => explorerCompact(value) } },
         },
         onClick: (_event, elements) => {
           const hit = elements.find(item => !datasets[item.datasetIndex]._isFrontier);
@@ -4255,7 +4273,7 @@ function renderAtomeshPerformanceTab() {
       const canvas = document.createElement('canvas');
       canvas.width = chart.canvas.width; canvas.height = chart.canvas.height + 150;
       const ctx = canvas.getContext('2d');
-      ctx.fillStyle = light ? '#ffffff' : '#141519'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = light ? '#ffffff' : '#15181d'; ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.fillStyle = light ? '#1a1c24' : '#eef0f6'; ctx.font = 'bold 20px sans-serif';
       ctx.fillText(`ATOM · ${state.explorerModel}`, 24, 30);
       ctx.font = '12px sans-serif'; ctx.fillText(`${state.explorerSource} · Total throughput vs. ${metricLabel}`, 24, 53);
@@ -4264,8 +4282,8 @@ function renderAtomeshPerformanceTab() {
       const legendY = chart.canvas.height + 105;
       for (const key of seriesKeys.filter(key => !state.explorerHidden.has(key))) {
         ctx.fillStyle = colors.get(key); ctx.fillRect(legendX, legendY - 8, 8, 8);
-        ctx.fillText(key, legendX + 15, legendY);
-        legendX += ctx.measureText(key).width + 42;
+        ctx.fillText(seriesLabel(key), legendX + 15, legendY);
+        legendX += ctx.measureText(seriesLabel(key)).width + 42;
       }
       ctx.fillStyle = light ? '#5c6070' : '#bfc1d0';
       ctx.fillText(`Dashed: Pareto frontier · ${rows[0]?.sourceUrl || rows[0]?.runUrl || ''}`, 24, legendY + 24);
