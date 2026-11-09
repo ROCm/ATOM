@@ -96,3 +96,12 @@ def test_grid_follows_batch_not_launch_width(batch):
     for local_blocks in (1, 8, 64):
         programs = cp._context_score_programs(batch, local_blocks)
         assert 1 <= programs <= triton.cdiv(local_blocks, cp.CP_SCORE_MIN_SPAN)
+
+
+@needs_gpu
+@pytest.mark.parametrize("transposed", [False, True])
+def test_orientations_agree(monkeypatch, transposed):
+    q, cache, table, lengths = _inputs(6, 25000, seed=23)
+    expected = _scores(q, cache, table, lengths, WIDE, 2)
+    monkeypatch.setattr(cp, "_transposed_score", lambda: transposed)
+    assert torch.equal(_scores(q, cache, table, lengths, WIDE, 2), expected)
