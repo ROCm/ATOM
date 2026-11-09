@@ -50,6 +50,9 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import
 from atom.models.kimi_k3.mono.kernels.stages.k2_front_role_lds_gfx1250 import (
     build_role_lds_front,
 )
+from atom.models.kimi_k3.mono.kernels.stages.k2_finalize_tdm_gfx1250 import (
+    build_replicated_finalize,
+)
 from atom.models.kimi_k3.mono.kernels.stages.k2_front_tdm_gfx1250 import (
     build_replicated_front,
 )
@@ -129,6 +132,7 @@ class Gfx1250RoutedK2Build:
     finalize: object
     buffers: dict[str, torch.Tensor]
     grouped_experts: bool
+    replicated_finalize: bool
 
 
 @dataclass(frozen=True)
@@ -263,7 +267,8 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 routed = self.routed[layer.layer_id]
                 reset = routed.write_idx >= 0
                 nblocks = routed.blocks + reset
-                k2_key = (nblocks, reset, routed.gu_interleave)
+                whole_up = routed.w_up_full is not None
+                k2_key = (nblocks, reset, routed.gu_interleave, whole_up)
                 k2_local = k2_cache.get(k2_key)
                 if k2_local is None:
                     k2_local = self._build_routed_k2(
@@ -271,6 +276,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                         nblocks,
                         reset,
                         routed.gu_interleave,
+                        whole_up,
                     )
                     k2_cache[k2_key] = k2_local
                 k2_by_layer[layer.layer_id] = k2_local
@@ -283,10 +289,14 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         nblocks: int,
         reset: bool,
         gu_interleave: bool,
+        whole_up: bool = False,
     ) -> Gfx1250RoutedK2Build:
         plan = self._plan(rows, nblocks)
         # AITER's grouped TDM MoE reads GUGU gate/up planes only.
         grouped = gu_interleave
+        # Both partials then take one all-reduce and every rank applies the
+        # whole up-projection.
+        replicated = grouped and whole_up
         front = (
             build_replicated_front(plan)
             if grouped
@@ -298,7 +308,11 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             include_routed=not grouped,
             replicated_front=grouped,
         )
-        finalize = build_finalize_local(plan, input_normalized=True)
+        finalize = (
+            build_replicated_finalize(plan)
+            if replicated
+            else build_finalize_local(plan, input_normalized=True)
+        )
         payload = FrontPayloadLayout(rows)
         tiles = plan.token_tiling.tile_count
 
@@ -333,6 +347,11 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             ),
             "final": empty((rows, HIDDEN), torch.bfloat16),
         }
+        if replicated:
+            reduce = empty((rows * (LATENT + HIDDEN),), torch.bfloat16)
+            buffers["reduce"] = reduce
+            buffers["routed"] = reduce[: rows * LATENT].view(rows, LATENT)
+            buffers["shared"] = reduce[rows * LATENT :].view(rows, HIDDEN)
         if grouped:
             buffers["router_logits"] = empty((rows, EXPERTS))
         else:
@@ -348,6 +367,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             finalize,
             buffers,
             grouped,
+            replicated,
         )
 
     def forward(
@@ -463,6 +483,20 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 gate_mode=GateMode.INTERLEAVE.value,
                 output=buffers["routed"],
             )
+        if local.replicated_finalize:
+            reduced = get_tp_group().all_reduce(buffers["reduce"], ca_fp8_quant=False)
+            if reduced is None:
+                reduced = buffers["reduce"]
+            rows = buffers["routed"].size(0)
+            routed = moe.routed_expert_norm(reduced[: rows * LATENT].view(rows, LATENT))
+            local.finalize.launcher(
+                routed.data_ptr(),
+                reduced[rows * LATENT :].data_ptr(),
+                weight.w_up_full.data_ptr(),
+                buffers["final"].data_ptr(),
+                stream=stream,
+            )
+            return prefix, buffers["final"]
         routed = get_tp_group().all_reduce(buffers["routed"], ca_fp8_quant=False)
         if routed is None:
             routed = buffers["routed"]

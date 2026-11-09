@@ -255,6 +255,9 @@ class ExternalMoeLayer(RoutedMoeLayer):
 
     w_sgu: torch.Tensor
     w_sd: torch.Tensor
+    # The model's whole routed up-projection when it is plain BF16 (read in
+    # place); None when only the dequantized rank band ``w_up`` exists.
+    w_up_full: torch.Tensor | None = None
 
 
 def _seam(site, name: str) -> AttnRes:
@@ -520,8 +523,16 @@ def bind_external_moe(
     name = f"layer {layer_id}"
     shared = layer.block_sparse_moe.shared_experts
     _need(shared is not None, f"{name}: no shared experts")
+    up = _param(layer.block_sparse_moe.routed_expert_up_proj, f"{name} routed up")
+    whole_up = (
+        up.dtype == BF16
+        and not getattr(up, "is_shuffled", False)
+        and tuple(up.shape) == (HIDDEN, LATENT)
+        and up.is_contiguous()
+    )
     return ExternalMoeLayer(
         **routed.__dict__,
+        w_up_full=up.data if whole_up else None,
         w_sgu=_plain_bf16(
             shared.gate_up_proj,
             f"{name} shared gate_up_proj",

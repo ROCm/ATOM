@@ -36,3 +36,12 @@ def test_replicated_front_is_one_launch_of_one_cta_per_task_pair(rows):
 def test_replicated_front_feeds_only_the_grouped_moe_finish():
     with pytest.raises(ValueError, match="grouped-MoE"):
         build_packed_finish(_plan(16), replicated_front=True)
+
+
+@pytest.mark.parametrize("rows", (1, 16, 40, 48))
+def test_replicated_finalize_covers_every_hidden_row_once(rows):
+    from atom.models.kimi_k3.mono.kernels.stages import k2_finalize_tdm_gfx1250 as fin
+
+    kernel = fin.build_replicated_finalize(_plan(rows))
+    assert kernel.grid == (fin.PAIRS,) == (7168 // 32,)
+    assert kernel.abi.names == ("routed_normed", "shared", "up_weight", "output")

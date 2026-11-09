@@ -314,6 +314,7 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch):
         finalize=recorder("finalize"),
         buffers=buffers,
         grouped_experts=True,
+        replicated_finalize=False,
     )
     x = tensor(rows, 4)
     experts = SimpleNamespace(w13_weight_scale=tensor(2), w2_weight_scale=tensor(2))
@@ -358,3 +359,83 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch):
     assert kwargs["w1_scale"] is experts.w13_weight_scale
     assert kwargs["output"] is buffers["routed"]
     assert calls["finalize"][0] == buffers["routed"].data_ptr()
+
+
+def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch):
+    rows, layer_id, latent, hidden = 2, 3, 3584, 7168
+    weight = SimpleNamespace(
+        write_idx=-1,
+        blocks=2,
+        **{
+            name: torch.zeros(8, dtype=torch.uint8)
+            for name in (
+                "w_gate", "w_ld", "w_sgu", "bias", "w_sd", "w13", "w13s", "w2",
+                "w2s", "ln_w", "w_up", "w_up_full",
+            )
+        },
+        ln_eps=1e-6,
+    )
+    reduce = torch.zeros(rows * (latent + hidden), dtype=torch.bfloat16)
+    buffers = {
+        name: torch.zeros(rows, 4, dtype=torch.uint8)
+        for name in (
+            "router_logits", "latent_fp4", "latent_scales", "shared_gate_up",
+            "shared_hidden", "route", "tile_route", "flags", "experts", "kof",
+            "union_sizes", "intermediate_fp4", "intermediate_scales",
+            "finish_scratch", "final",
+        )
+    }
+    buffers["reduce"] = reduce
+    buffers["routed"] = reduce[: rows * latent].view(rows, latent)
+    buffers["shared"] = reduce[rows * latent :].view(rows, hidden)
+    calls = {"all_reduce": []}
+
+    def recorder(name):
+        return SimpleNamespace(
+            launcher=lambda *args, **_kwargs: calls.setdefault(name, args)
+        )
+
+    local = SimpleNamespace(
+        front=recorder("front"),
+        finish=recorder("finish"),
+        finalize=recorder("finalize"),
+        buffers=buffers,
+        grouped_experts=True,
+        replicated_finalize=True,
+    )
+    experts = SimpleNamespace(w13_weight_scale=None, w2_weight_scale=None)
+    layer = SimpleNamespace(
+        mlp_attn_res=lambda *_args: (torch.zeros(rows, 4), torch.zeros(rows, 4)),
+        block_sparse_moe=SimpleNamespace(
+            experts=experts, routed_expert_norm=lambda value: value
+        ),
+    )
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.rank = 0
+    runner.routed = {layer_id: weight}
+    runner.inner = SimpleNamespace(layers={layer_id: layer})
+    group = SimpleNamespace(
+        all_reduce=lambda value, ca_fp8_quant=False: calls["all_reduce"].append(
+            value
+        ),
+    )
+    monkeypatch.setattr(runner_module, "get_tp_group", lambda: group)
+    monkeypatch.setattr(runner_module.torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(runner_module, "fused_moe", lambda *_args, **_kwargs: None)
+
+    _, out = runner._routed_k2(
+        SimpleNamespace(k2={layer_id: local}),
+        SimpleNamespace(layer_id=layer_id),
+        torch.zeros(rows, 4),
+        torch.zeros(rows, 4),
+        torch.zeros(rows, 3, 4),
+    )
+
+    assert [value is reduce for value in calls["all_reduce"]] == [True]
+    assert calls["finalize"] == (
+        buffers["routed"].data_ptr(),
+        buffers["shared"].data_ptr(),
+        weight.w_up_full.data_ptr(),
+        buffers["final"].data_ptr(),
+    )
+    assert out is buffers["final"]
