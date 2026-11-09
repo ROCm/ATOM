@@ -14,7 +14,9 @@ kernels the original modules still run the compressor and Engram.
 ``draft_runner`` runs the DSpark draft's layers on the same kernels.
 """
 
+import collections
 import logging
+import os
 import struct
 from dataclasses import dataclass
 
@@ -60,6 +62,7 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_k1 import build_dspark
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_index_down import build_dspark_down
 from atom.models.deepseek_v41.mono.gfx1250.kernels.bf16_k2_abi import ABI as BF16_K2_ABI
 from atom.mono.device import queue
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dspark_stamps
 from atom.models.deepseek_v41.mono.gfx1250.dspark_runtime import with_default_stream
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
@@ -188,11 +191,20 @@ class V41MonoDecodeRunner:
             # CT1-P1A: split-K attention partials/ready pairs after the original state (offsets unchanged)
             from atom.models.deepseek_v41.mono.gfx1250.kernels.p1a_attention import P1A_STATE_WORDS as STATE_WORDS
             sq_words = self.max_rows * 160 * 2
+            stamp_words = dspark_stamps.STAMP_WORDS if dspark_stamps.ON else 0
             self.mhtjstest_workspace = torch.zeros(
-                sq_words + STATE_WORDS, dtype=torch.int32, device=self.scratch.device
+                sq_words + STATE_WORDS + stamp_words, dtype=torch.int32, device=self.scratch.device
             )
             self.mhc_sq = self.mhtjstest_workspace[:sq_words]
-            self.mhtjstest_state = self.mhtjstest_workspace[sq_words:]
+            self.mhtjstest_state = self.mhtjstest_workspace[sq_words:sq_words + STATE_WORDS]
+            # the dynamic K2's P1A attention finds this state at mhc_sq + MAX_ROWS rows
+            assert sq_words == MAX_ROWS * 160 * 2
+            if dspark_stamps.ON:
+                assert (sq_words + STATE_WORDS) * 4 == dspark_stamps.offset_bytes(self.max_rows)
+                self.k2_stamps = self.mhtjstest_workspace[sq_words + STATE_WORDS:].view(torch.int64)
+                self.k2_stamp_steps = collections.Counter()
+                if type(self).__name__ == "V41MonoDecodeRunner":
+                    self._start_stamp_sampler()
             scratch += (self.mhtjstest_workspace,)
         self.mailboxes = StepMailboxes(self.peers, *scratch, debug=self.debug)
         self.widths = WidthBuilds(
@@ -635,6 +647,8 @@ class V41MonoDecodeRunner:
         self._raise_on_given_up_waits(rows)
         for timeline in self.timelines.values():
             timeline.step_done(rows)
+        if dspark_stamps.ON and hasattr(self, "k2_stamps"):
+            self._save_k2_stamps(rows)
         return hidden.squeeze(0)
 
     def _gather_rows(self, hidden, rows):
@@ -833,6 +847,45 @@ class V41MonoDecodeRunner:
     def _rope_positions(self, cache, step) -> torch.Tensor:
         """Each row's position for RoPE (int64 [S])."""
         return cache.rope_positions(step)
+
+    def _start_stamp_sampler(self) -> None:
+        """Graph replays run no Python: a side-stream thread snapshots the stamp
+        region every 20 ms (a snapshot may mix launches; the report drops those)."""
+        import threading, time
+
+        prefix = os.environ.get("ATOM_GFX1250_K2_STAMP_PREFIX", "/tmp/k2stamps")
+        dev = self.k2_stamps.device
+        stamps = self.k2_stamps
+
+        def run():
+            torch.cuda.set_device(dev)
+            stream = torch.cuda.Stream(dev)
+            last, n = None, 0
+            while n < 10000:
+                time.sleep(0.02)
+                with torch.cuda.stream(stream):
+                    snap = stamps.clone()
+                stream.synchronize()
+                snap = snap.cpu()
+                if last is not None and torch.equal(snap, last) or not snap.any():
+                    continue
+                last = snap
+                torch.save(snap.view(BLOCKS, dspark_stamps.POINTS),
+                           f"{prefix}_graph_r{self.rank}_{n:04d}.pt")
+                n += 1
+
+        threading.Thread(target=run, daemon=True, name="k2-stamps").start()
+
+    def _save_k2_stamps(self, rows) -> None:
+        """Eager steps only: steps 20..24 of each width -> <prefix>_<class>_r<rank>_s<rows>_<i>.pt"""
+        if torch.cuda.is_current_stream_capturing():
+            return
+        seen = self.k2_stamp_steps[rows]
+        self.k2_stamp_steps[rows] += 1
+        if 20 <= seen < 25:
+            prefix = os.environ.get("ATOM_GFX1250_K2_STAMP_PREFIX", "/tmp/k2stamps")
+            stamps = self.k2_stamps.view(BLOCKS, dspark_stamps.POINTS).cpu()
+            torch.save(stamps, f"{prefix}_{type(self).__name__}_r{self.rank}_s{rows}_{seen - 20}.pt")
 
     def _timeline_ptr(self, kernel, layer_id) -> int:
         if self.row_tile_mhc and kernel in ("k1", "k2"):

@@ -18,6 +18,7 @@ from torch import nn
 
 from atom.models.deepseek_v41.mono.gfx1250.dspark_config import (
     DRAFT_ROWS,
+    DRAFT_REQUESTS,
     DRAFT_WIDTHS,
     MAX_REQUESTS,
     MAX_ROWS,
@@ -83,7 +84,7 @@ class MonoDecodeModel(nn.Module):
 
 
 class MonoDraftModel(nn.Module):
-    """The draft's full-width block backbone of ``MONO_REQUESTS`` requests on
+    """The draft's full-width block backbone of ``DRAFT_REQUESTS`` requests on
     mono, after a prefill as after a decode."""
 
     def __init__(self, model):
@@ -97,7 +98,7 @@ class MonoDraftModel(nn.Module):
         width = self.model.block_size if num_draft is None else num_draft
         rows = input_ids.numel() * width
         if (
-            input_ids.numel() in MONO_REQUESTS
+            input_ids.numel() in DRAFT_REQUESTS
             and width == self.model.block_size == DRAFT_ROWS
             and self._mono.ready(rows)
         ):

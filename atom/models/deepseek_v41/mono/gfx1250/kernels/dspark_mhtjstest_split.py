@@ -12,6 +12,8 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_moe_front import st_de
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_moe_front import rcp_pow2
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_state import *
 from atom.mono.device.ops import lane_gather, bf16_pair
+from flydsl.expr import const_expr
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dspark_stamps as ST
 
 
 @traced
@@ -36,6 +38,7 @@ def finish_pair(root, co, task0, rowbase):
             if tid % 32 == 0:
                 co["put"](rstd, token, r)
     (rr,) = co["poll"]([(rstd, global_row, 1)])
+    ST.mark(root.get("tls"), tid, ST.SEAM_POINTS["rstd"])
     r = rr[0].bitcast(fx.Float32)
     norm = seam_context(root, "norm")
     cb = x_context(root)
@@ -83,6 +86,7 @@ def finish_pair(root, co, task0, rowbase):
 def run_seam(root, key, bid):
     assert key.tokens == 48 and not key.tok_par
     unit = first_task(bid, 0)
+    tls = root.get("tls")
     enter_stage("k2a.paired_split")
     if unit < 240:
         rowbase = (unit // 80) * 16
@@ -95,5 +99,8 @@ def run_seam(root, key, bid):
             pre = tile_prefetch(local, task)
             reduce_attn_pair(co, task, co["tid"] + rowbase * 16)
             gpu.barrier()
+            ST.mark_any(tls, ST.SEAM_POINTS["reduce0"] + 2 * half)
             stage_tile(local, task, pre)
+            ST.mark_any(tls, ST.SEAM_POINTS["tile0"] + 2 * half)
         finish_pair(root, local, task0, rowbase)
+        ST.mark_any(tls, ST.SEAM_POINTS["seam"])

@@ -8,10 +8,15 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_multirow_projection
 from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import scalar_address
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_k1 import gemv_fp8_loads
 from atom.mono.device.ops import fresh,rsrc
-from atom.mono.device.sync import sreg,preg
+from atom.mono.device.sync import POLL_MAX,sreg,preg
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dspark_stamps as ST
 THREADS=256
 WAVES=8
 WO_PTRS=('woa','woa_s','wob','wob_s')
+# wo_a's attention rows polled a round trip where a kernel sets c["woa_poll"]
+# (the dynamic target K2: 12 rows' 54 pairs a thread took five trips at
+# POLL_MAX, wo_a +6 us over 6 rows; the draft K2 spills at 24)
+WOA_POLL=24
 
 def wo_context(c,stage):
     out=dict(c)
@@ -70,7 +75,7 @@ def woa_matrices_rows(c,ops):
 @traced
 def load_rows(
     c, words_mb, codes_mb, stride_w, off_w, words, stride_g, off_g, groups, xl, xsl,
-    t0=0, n=None,
+    t0=0, n=None, batch=POLL_MAX,
 ):  # fmt: skip
     """Tokens t0 .. t0 + n's (every token's by default) slice ``[off, off +
     words)`` of a mailbox of rows ``stride`` words apart (and its codes), into
@@ -99,6 +104,7 @@ def load_rows(
             ),
         ],
         live=None if isinstance(n, int) else [n * words, n * groups],
+        batch=batch,
     )
     gpu.barrier()
 @traced
@@ -110,8 +116,9 @@ def woa_tile(c, task, ops, t0, n):
     load_rows(
         c, c["xo"], c["xos"], d.xo_words, g * d.group_k // 4, d.group_k // 4,
         d.heads * HEAD_DIM // 32, g * d.group_k // 32, d.group_k // 32,
-        c["xl"], c["xsl"], t0, n,
+        c["xl"], c["xsl"], t0, n, c.get("woa_poll", POLL_MAX),
     )  # fmt: skip
+    ST.mark(c.get("tls"), c["tid"], ST.WOA_ROWS_IN)
     stage_woa(c, task, ops, t0, n)
 def load_wob_rows(c, part, t0, n):
     """wo_b's input over K part ``part`` (X8B / X8BS) of tokens t0 .. t0 + n
@@ -188,6 +195,7 @@ def reduce_attn_pair(c, task, idx):
 def stage_woa(c,task,ops,t0=0,n=None):
     n=c['S'] if n is None else n
     woa_matrices_rows(dict(c,S=n),ops)
+    ST.mark(c.get('tls'),c['tid'],ST.WOA_MMA)
     # Mother 512 logical lanes: two 256-lane output rounds for an N16 tile.
     for begin in range_constexpr(0,tile_rows(c['S'])*WOA_ROWS,THREADS):
         tid=c['tid']+begin
@@ -247,6 +255,7 @@ def run_wo(c,key,bid):
             t0 = unit // d.woa_tasks * TILE
             woa_ops = woa_loads(c, woa_task)
             woa_tile(c, woa_task, woa_ops, t0, fx.min(fx.Int32(TILE), s - t0))
+    ST.mark(c.get('tls'),tid,ST.WOA_DONE)
     c=wo_context(c,'wob')
     enter_stage("k2a.wo_b")
     assert d.wob_k // 4 <= d.group_k // 4  # xl holds a part
@@ -280,6 +289,7 @@ def run_wo(c,key,bid):
                 wob_ops = wob_loads(c, wob_task, part)
                 wob_ops2 = wob_loads(c, second, part)
             load_wob_rows(c, part, 0, s)
+            ST.mark(c.get('tls'), c['tid'], ST.WOB_INPUT)
             stage_wob(c, wob_task, wob_ops, 0, s, part)
             if has_second:
                 stage_wob(c, wob_second, wob_ops2, 0, s, part)

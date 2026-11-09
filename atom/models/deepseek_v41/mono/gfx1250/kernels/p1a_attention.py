@@ -60,19 +60,33 @@ def _sreg(v):
                                     has_side_effects=True))
 
 
+def _state(c, offset):
+    """The P1A state at ``offset``: past the mhtjstest state (late_meta 220), or
+    at ``c["p1a_state"]()`` where 220 holds another workspace."""
+    if "p1a_state" in c:
+        return c["p1a_state"]() + fx.Int64(offset)
+    return raw_address(c, offset)
+
+
 def _ready(c):
-    return sreg(raw_address(c, 0), P1A_READY_OFFSET, 'p1a_ready')
+    return sreg(_state(c, 0), P1A_READY_OFFSET, 'p1a_ready')
+
+
+def splits_for(tokens):
+    """Key splits a token: the most tasks (<= 240, the state's) of at least one tile."""
+    return min(KMAX // TILE, TOKENS * S // tokens)
 
 
 @traced
-def stage_fused(c, task):
+def stage_fused(c, task, splits=S):
     lane, wave, a, L = c["lane"], c["wave"], c["args"], c["p1a"]
     half, hl = lane // 16, lane % 16
-    t, s = task // S, task % S
+    maxt = -(-(KMAX // TILE) // splits)
+    t, s = task // splits, task % splits
     await_selection(c, t)
     n_keys, meta = _keys(a, t)
     n_tiles = (n_keys + TILE - 1) // TILE
-    per = (n_tiles + S - 1) // S
+    per = (n_tiles + splits - 1) // splits
     first = s * per
     count = fx.max(fx.min(per, n_tiles - first), 0)
     scale = fx.Int32(a["qk_scale"]).bitcast(fx.Float32)
@@ -102,14 +116,14 @@ def stage_fused(c, task):
     acc = [fx.Vector.filled(8, 0., fx.Float32) for _ in range(4)]
     if count > 0:
         issue(0, 0)
-    for it in range_constexpr(MAXT):
+    for it in range_constexpr(maxt):
         buf = it % 2
         if it < count:
             kv = L["kv"] + buf * TILE * ROW
             rocdl.s_wait_loadcnt(0)
             tdm_ops.tensor_wait(0)
             gpu.barrier()
-            if const_expr(it + 1 < MAXT):
+            if const_expr(it + 1 < maxt):
                 if it + 1 < count:
                     issue(it + 1, 1 - buf)
             part = fx.make_rmem_tensor(8, fx.Float32)
@@ -174,7 +188,7 @@ def stage_fused(c, task):
                     cacc.store(acc[j])
                     _wmma(cacc, aw.bitcast(fx.BFloat16), bw.bitcast(fx.BFloat16))
                     acc[j] = cacc.load()
-    base_o = raw_address(c, P1A_O_OFFSET)
+    base_o = _state(c, P1A_O_OFFSET)
     for j in range_constexpr(4):
         col = wave * 64 + j * 16 + half * 8
         ptr = fx.inttoptr(fx.PointerType.get(fx.Float32.ir_type, fx.AddressSpace.Global, 16),
@@ -182,7 +196,7 @@ def stage_fused(c, task):
         fx.ptr_store(fx.Vector.from_elements([acc[j][i] for i in range(8)], fx.Float32), ptr)
     if (wave == 0) & (lane < 16):
         bo.buffer_store(fx.Vector.from_elements([m_run, l_run], fx.Float32),
-                        rsrc(raw_address(c, P1A_ML_OFFSET)), (task * HEADS + hl) * 2)
+                        rsrc(_state(c, P1A_ML_OFFSET)), (task * HEADS + hl) * 2)
     # The original task publication: every wave's stores retire, then one lane.
     state.drain()
     if c["tid"] == 0:
@@ -237,3 +251,49 @@ def stage_irq_p1a(c, task, groups):
         if const_expr(i + 1 < groups):
             gpu.barrier()
     finish_irq_task(c, task)
+
+
+@traced
+def merge_splits(c, task, groups, splits):
+    """The dynamic-width IRQ task's PV: polls token t's ``splits`` ready pairs and
+    merges them with the sink, as ``stage_irq_p1a``, into the PV ``out`` LDS layout
+    of ``groups`` column groups (16 threads a head, 2 * groups columns each)."""
+    assert c["d"].head_tiles.count == 1
+    tid, wave, a, att = c["tid"], c["wave"], c["args"], c["att"]
+    t, tile, g0 = tile_task(task, GROUPS // groups, c["d"].head_tiles)
+    if wave == 0:
+        c["poll"]([(_ready(c), t * splits + s, 1) for s in range(splits)])
+    gpu.barrier()
+    per = 2 * groups
+    h = tid // 16
+    col = (tid % 16) * per                       # within this task's 32 * groups columns
+    ml = _state(c, P1A_ML_OFFSET)
+    pairs = [fx.Vector(bo.buffer_load(rsrc(ml), ((t * splits + s) * HEADS + h) * 2, vec_width=2, dtype=T.f32,
+                                      cache_modifier=CM_DEV)) for s in range(splits)]
+    ms = [fx.Float32(pairs[s][0]) for s in range(splits)]
+    ls = [fx.Float32(pairs[s][1]) for s in range(splits)]
+    mx = ms[0]
+    for s in range_constexpr(1, splits):
+        mx = fx.max(mx, ms[s])
+    w = [hw_exp2(ms[s] - mx) for s in range(splits)]
+    total = [fx.Float32(0.) for _ in range(per)]
+    combined = fx.Float32(0.)
+    base_o = _state(c, P1A_O_OFFSET)
+    for s in range_constexpr(splits):
+        at = ((t * splits + s) * HEADS + h) * HEAD_DIM + g0 * groups * COLS + col
+        parts = [fx.Vector(bo.buffer_load(rsrc(base_o), at + q * 2, vec_width=2, dtype=T.f32, cache_modifier=CM_DEV))
+                 for q in range(per // 2)]
+        o = [parts[i // 2][i % 2] for i in range(per)]
+        total = [total[i] + o[i] * w[s] for i in range(per)]
+        combined = combined + ls[s] * w[s]
+    sink_value = fx.Float32(bo.buffer_load(rsrc(a["sink"]), h, vec_width=1, dtype=T.f32))
+    final_m = fx.max(mx, sink_value * fx.Float32(LOG2E))
+    alpha_kv = hw_exp2(mx - final_m)
+    alpha_sink = hw_exp2(sink_value * fx.Float32(LOG2E) - final_m)
+    final_l = combined * alpha_kv + alpha_sink
+    group, gcol = col // COLS, col % COLS
+    for i in range_constexpr(per):
+        value = (total[i] * alpha_kv) / fx.max(final_l, fx.Float32(1e-30))
+        value = fx.Float32((final_l > fx.Float32(0.)).select(value, fx.Float32(0.)))
+        fx.ptr_store(bf16_round(value), att["out"] + ((group * HEAD_TILE + h) * COLS + gcol + i))
+    gpu.barrier()

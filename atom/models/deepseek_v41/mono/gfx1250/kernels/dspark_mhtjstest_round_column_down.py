@@ -12,6 +12,7 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_native_suppo
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_native_support import ready
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_native_support import retire_reads
 from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import publish_plain as publish
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dspark_stamps as ST
 
 
 def weight_words(inter):
@@ -176,6 +177,7 @@ def run_down(root, key, bid):
         owner_columns(c, [task])
     flag = sreg(late_pointer(root, 24), root['scratch_layout']['dnf'][0], 'dnf')
     publish(c['put'], flag, bid, 1, c['tid'] == 0)
+    ST.mark(root.get("tls"), c['tid'], ST.DOWN_OWNED)
     for t in range(first_task(fresh(bid), RED0), RED_TASKS, BLOCKS):
         stage_reduce(c, t)
 

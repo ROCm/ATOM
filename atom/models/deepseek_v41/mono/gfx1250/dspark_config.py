@@ -2,6 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Deployments and graph shapes enabled for the gfx1250 DSpark backend."""
 
+import os
+
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.mono.runtime import deployment
@@ -18,8 +20,27 @@ MAX_MOE_ROWS = 96
 # rows) stays native: its mono builds, and padding it to 48 rows, both measured
 # slower than native on CT16 (C05 width results).
 MONO_REQUESTS = (1, 2, 8)
-TARGET_WIDTHS = tuple(n * VERIFY_ROWS for n in MONO_REQUESTS)
-DRAFT_WIDTHS = tuple(n * DRAFT_ROWS for n in MONO_REQUESTS)
+
+
+def _requests(name, default):
+    """A subset of ``MONO_REQUESTS`` from env ``name`` ("1,2", "" for none)."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    picked = tuple(int(v) for v in value.split(",") if v.strip())
+    if not set(picked) <= set(MONO_REQUESTS):
+        raise ValueError(f"{name}={value!r}: not a subset of {MONO_REQUESTS}")
+    return picked
+
+
+# 8 requests stay native (target and draft) on 20261106: unprofiled TP4 c8 step
+# 7.29 ms all-mono vs 6.36 native, the loss all in the 48-row target K1+K2
+# (~157 us a layer); a native target under the mono draft took ~4% more steps.
+# 1-2 requests: mono 5.31 ms vs native 5.52 at c1.
+TARGET_REQUESTS = _requests("ATOM_GFX1250_MONO_TARGET_REQUESTS", (1, 2))
+DRAFT_REQUESTS = _requests("ATOM_GFX1250_MONO_DRAFT_REQUESTS", (1, 2))
+TARGET_WIDTHS = tuple(n * VERIFY_ROWS for n in TARGET_REQUESTS)
+DRAFT_WIDTHS = tuple(n * DRAFT_ROWS for n in DRAFT_REQUESTS)
 ATTENTION_KEYS_MAX = 64 * 16
 INDEXER_SHAPE = (ip.TOPK, ip.TOPK_BLOCKS, ip.BLOCK_ROWS, ip.HEADS, ip.DIM)
 

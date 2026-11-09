@@ -813,7 +813,7 @@ def gemv_fp8_mfmas(c, k, xl, xsl, red, ops, split=None, tiled=False, rows=None):
 
 
 @traced
-def poll_copy(c, idx, width, spans, live=None):
+def poll_copy(c, idx, width, spans, live=None, batch=POLL_MAX):
     """Mailbox spans [(region, pair_of, n, dst, row)] into LDS: element u (pair
     ``pair_of(u)``) to dst + u, or ``lds_at(u, row)`` for a span of rows
     ``row`` words wide. Thread ``idx`` of ``width`` takes u = idx, idx +
@@ -823,33 +823,34 @@ def poll_copy(c, idx, width, spans, live=None):
 
     ``live``: a span's elements the reader needs (traced, <= n), a span each;
     a batch past them is not polled and an element past them neither polled
-    nor written (one past a step's rows is never written)."""
+    nor written (one past a step's rows is never written). ``batch``: elements
+    a round trip (``POLL_MAX`` by default; more trades registers for trips)."""
     idx = fresh(idx)  # its elements' indices not hoisted out of a task loop
     if const_expr(live is None):
         _poll_store_batches(c, [
             (region, pair_of, n, (dst, row), idx + width * i)
             for region, pair_of, n, dst, row in spans
             for i in range((n + width - 1) // width)
-        ])  # fmt: skip
+        ], batch)  # fmt: skip
         return
     for (region, pair_of, n, dst, row), need in zip(spans, live):
         chunks = [
             (region, pair_of, need, (dst, row), idx + width * i)
             for i in range((n + width - 1) // width)
         ]
-        for b0 in range_constexpr(0, len(chunks), POLL_MAX):
+        for b0 in range_constexpr(0, len(chunks), batch):
             if chunks[b0][4] < need:
-                _poll_store_batches(c, chunks[b0 : b0 + POLL_MAX])
+                _poll_store_batches(c, chunks[b0 : b0 + batch], batch)
 
 
 @traced
-def _poll_store_batches(c, chunks):
-    """``poll_copy``'s chunks [(region, pair_of, n, (dst, row), u)], POLL_MAX a
+def _poll_store_batches(c, chunks, batch=POLL_MAX):
+    """``poll_copy``'s chunks [(region, pair_of, n, (dst, row), u)], ``batch`` a
     round trip, each batch stored before the next is polled."""
-    for b0 in range_constexpr(0, len(chunks), POLL_MAX):
-        batch = chunks[b0 : b0 + POLL_MAX]
-        got = c["poll"]([(r, p(fx.min(u, n - 1)), 1) for r, p, n, _, u in batch])
-        for (_, _, n, (dst, row), u), v in zip(batch, got):
+    for b0 in range_constexpr(0, len(chunks), batch):
+        part = chunks[b0 : b0 + batch]
+        got = c["poll"]([(r, p(fx.min(u, n - 1)), 1) for r, p, n, _, u in part], batch)
+        for (_, _, n, (dst, row), u), v in zip(part, got):
             at = u if row is None else lds_at(u, row)
             if u < n:
                 fx.ptr_store(v[0], dst + at)
