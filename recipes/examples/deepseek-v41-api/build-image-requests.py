@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """Build Chat, Responses and Messages image requests; no extra packages needed."""
 
 import argparse

@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash API recipe
 
-This recipe covers ordinary APIs, beta text APIs and image inputs merged into ROCm/ATOM main. Use commit `0a99b2b961f2f1dd393ba0b3d75ce66d45b6e489` or a later release containing it. The examples target the ATOM Python API server directly. The basic non-DSpark launch below also serves images when the complete multimodal checkpoint is installed.
+This recipe covers ordinary APIs, beta text APIs and image inputs merged into ROCm/ATOM main. Use latest `main`, including #3111 and #3115 (merged by `0a99b2b9`); the runtime source is not the documentation branch. The examples target the ATOM Python API server directly. The basic non-DSpark launch below also serves images when the complete multimodal checkpoint is installed.
 
 ## 1. Install and start the basic service
 
@@ -10,7 +10,10 @@ Run inside an ATOM development container with ROCm, PyTorch and the matching AIT
 cd /path/to/ATOM
 git switch main
 git pull --ff-only origin main
-python3 -m pip install -e '.[structured-output]'
+python3 -m pip install -e '.[structured-output]' pillow
+
+unset ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+unset ATOM_DSV41_BENCHMARK_SYNTHETIC ATOM_ENABLE_RELAXED_MTP
 
 export MODEL_PATH=/models/deepseek-ai/DeepSeek-V4.1-Flash
 export HIP_VISIBLE_DEVICES=0,1,2,3
@@ -18,6 +21,8 @@ export OMP_NUM_THREADS=4
 export USE_ATOMESH_ENTRYPOINTS=0
 export ATOM_MONO_ENABLE=0
 export ATOM_DISABLE_MMAP=true
+
+python3 -c "import torch, aiter, llguidance, jsonschema, re2; from PIL import Image; assert torch.version.hip, 'ROCm PyTorch required'; assert torch.cuda.device_count() == 4, 'Expected four visible GPUs'; print(torch.version.hip, torch.cuda.device_count())"
 
 python3 -m atom.entrypoints.openai_server \
   --model "$MODEL_PATH" --trust-remote-code \
@@ -30,7 +35,9 @@ python3 -m atom.entrypoints.openai_server \
   --max-num-batched-tokens 4096 --attn-prefill-chunk-size 4096 \
   --enable_prefix_caching --block-size 16 \
   --state-checkpoint-interval-tokens 8192 \
-  --level 0 \
+  --level 0 --cudagraph-mode FULL \
+  --cudagraph-capture-sizes '[1,2,4,8,16]' \
+  --timeout-keep-alive 900 \
   --tool-call-parser dsml_v41
 ```
 
@@ -38,13 +45,15 @@ This is a conservative native TP4 starting point, with no speculative decoding o
 
 Do not enable synthetic acceptance when checking output correctness: omit `--spec-decode-acceptance-length`, `--spec-decode-acceptance-rate` and synthetic benchmark environment settings. Start from a clean shell rather than inheriting a benchmark configuration.
 
-The structured-output extra installs llguidance, jsonschema and google-re2. Ordinary requests do not require a schema in the launch command: schema/strict tool definitions are supplied per request.
+The structured-output extra installs llguidance, jsonschema and google-re2; Pillow is needed to decode API images. The editable install does not install a ROCm PyTorch build, AITER or the complete kernel build toolchain: use the supported ATOM development environment for your GPU architecture. Do not reuse an older image's AITER blindly after updating main; follow the current model/development setup instructions. Ordinary requests do not require a schema in the launch command: schema/strict tool definitions are supplied per request.
+
+The import/device check in the startup block runs before weight loading and checks the same Python environment. `--server-port 8000` is the HTTP port clients use; `--port 10000` is internal engine communication. Confirm both ports and the GPUs are available. The graph buckets are request counts up to this recipe's `--max-num-seqs 16`; adjust both together for a larger deployment. Level 0 disables torch compilation optimizations, while the explicit FULL mode still enables CUDA graphs. The first launch may take time to load weights and compile kernels/capture graphs.
 
 Wait until startup finishes, then inspect model discovery:
 
 ```bash
 export BASE_URL=http://127.0.0.1:8000
-curl -sS "$BASE_URL/v1/models"
+curl --fail-with-body -sS "$BASE_URL/v1/models"
 ```
 
 From another host, replace `127.0.0.1` with the reachable server address. The launch above does not configure API authentication; use your deployment's access control. Request `model` must match `DeepSeek-V4.1-Flash`, the served alias configured above.
@@ -55,14 +64,26 @@ The standalone request files are in [examples/deepseek-v41-api](examples/deepsee
 
 ```bash
 cd /path/to/ATOM
-git fetch origin lirzhang/v41-api-recipe-20261109
+git fetch origin refs/heads/lirzhang/v41-api-recipe-20261109:refs/remotes/origin/lirzhang/v41-api-recipe-20261109
 mkdir -p /tmp/v41-api-examples
 git archive origin/lirzhang/v41-api-recipe-20261109 recipes/examples/deepseek-v41-api | tar -x -C /tmp/v41-api-examples
 cd /tmp/v41-api-examples/recipes/examples/deepseek-v41-api
 export BASE_URL=http://127.0.0.1:8000
 ```
 
-Then run the curl command beside each example. Each JSON file can also be copied and edited independently.
+Use curl 7.76 or later for `--fail-with-body`: it preserves the error body and returns a nonzero exit status on HTTP 4xx/5xx. Then run the curl command beside each example. Each JSON file can also be copied and edited independently.
+
+### Run a local smoke check
+
+The included checker uses Python's standard library to submit the examples and retain each JSON/SSE response. Run it after `/v1/models` is reachable:
+
+```bash
+python3 check-api.py --base-url "$BASE_URL"
+# Include the supplied base64 image examples on the native, non-DSpark service:
+python3 check-api.py --base-url "$BASE_URL" --images --output-dir api-check-with-images
+```
+
+The checker fails on HTTP errors, missing visible answers/probabilities, malformed example JSON output, missing tool calls, or incomplete/failed stream termination. It writes `summary.json` and raw responses under the output directory. Inspect image answers and generated FIM code as well: these checks are a smoke test, not broad model-quality or performance qualification. `--urls` additionally enables the public-URL image examples and requires server-side internet access.
 
 ### Plain Chat
 
@@ -86,7 +107,7 @@ Then run the curl command beside each example. Each JSON file can also be copied
 ```
 
 ```bash
-curl -sS "$BASE_URL/v1/chat/completions" \
+curl --fail-with-body -sS "$BASE_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   --data-binary @chat.json
 ```
@@ -119,7 +140,7 @@ Read the answer from `choices[0].message.content`.
 ```
 
 ```bash
-curl -N -sS "$BASE_URL/v1/chat/completions" \
+curl --fail-with-body -N -sS "$BASE_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   --data-binary @chat-stream.json
 ```
@@ -148,7 +169,7 @@ SSE chunks carry `choices[].delta`. V4.1 usage is on the finish chunk; earlier c
 ```
 
 ```bash
-curl -sS "$BASE_URL/v1/chat/completions" \
+curl --fail-with-body -sS "$BASE_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   --data-binary @chat-thinking.json
 ```
@@ -171,7 +192,7 @@ Read reasoning from `message.reasoning_content` and the visible answer from `mes
 ```
 
 ```bash
-curl -sS "$BASE_URL/v1/responses" \
+curl --fail-with-body -sS "$BASE_URL/v1/responses" \
   -H "Content-Type: application/json" \
   --data-binary @responses.json
 ```
@@ -195,7 +216,7 @@ Read assistant text from the output message content blocks. Supply full input/hi
 ```
 
 ```bash
-curl -N -sS "$BASE_URL/v1/responses" \
+curl --fail-with-body -N -sS "$BASE_URL/v1/responses" \
   -H "Content-Type: application/json" \
   --data-binary @responses-stream.json
 ```
@@ -223,7 +244,7 @@ Consume typed SSE events, including reasoning/text deltas and a terminal `respon
 ```
 
 ```bash
-curl -sS "$BASE_URL/v1/messages" \
+curl --fail-with-body -sS "$BASE_URL/v1/messages" \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   --data-binary @messages.json
@@ -256,7 +277,7 @@ Read the visible answer from text blocks in `content`. For streaming add `"strea
 ```
 
 ```bash
-curl -sS "$BASE_URL/v1/messages" \
+curl --fail-with-body -sS "$BASE_URL/v1/messages" \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   --data-binary @messages-thinking.json
@@ -288,7 +309,7 @@ curl -sS "$BASE_URL/v1/messages" \
 ```
 
 ```bash
-curl -sS "$BASE_URL/v1/chat/completions" \
+curl --fail-with-body -sS "$BASE_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   --data-binary @chat-logprobs.json
 ```
@@ -320,7 +341,7 @@ Read `choices[0].logprobs.content`; reasoning probabilities use the correspondin
 ```
 
 ```bash
-curl -sS "$BASE_URL/v1/chat/completions" \
+curl --fail-with-body -sS "$BASE_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   --data-binary @chat-json.json
 ```
@@ -372,7 +393,7 @@ Ask for JSON in the prompt and pass `response_format`. Parse `message.content` a
 ```
 
 ```bash
-curl -sS "$BASE_URL/v1/chat/completions" \
+curl --fail-with-body -sS "$BASE_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   --data-binary @chat-schema.json
 ```
@@ -418,7 +439,7 @@ The schema belongs in the request, not the startup command. Parse `message.conte
 ```
 
 ```bash
-curl -sS "$BASE_URL/v1/responses" \
+curl --fail-with-body -sS "$BASE_URL/v1/responses" \
   -H "Content-Type: application/json" \
   --data-binary @responses-schema.json
 ```
@@ -474,7 +495,7 @@ Responses uses `text.format`, rather than Chat’s `response_format`. Read the v
 ```
 
 ```bash
-curl -sS "$BASE_URL/v1/chat/completions" \
+curl --fail-with-body -sS "$BASE_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   --data-binary @chat-tools.json
 ```
@@ -496,7 +517,7 @@ The reply contains `message.tool_calls`. The client executes the function, then 
 ```
 
 ```bash
-curl -sS "$BASE_URL/beta/completions" \
+curl --fail-with-body -sS "$BASE_URL/beta/completions" \
   -H "Content-Type: application/json" \
   --data-binary @fim.json
 ```
@@ -530,7 +551,7 @@ Return `choices[0].text` is the generated middle: compose `prompt + generated te
 ```
 
 ```bash
-curl -sS "$BASE_URL/beta/chat/completions" \
+curl --fail-with-body -sS "$BASE_URL/beta/chat/completions" \
   -H "Content-Type: application/json" \
   --data-binary @prefix.json
 ```
@@ -587,7 +608,7 @@ Only the final assistant message may carry `prefix: true`. The returned content 
 ```
 
 ```bash
-curl -sS "$BASE_URL/beta/chat/completions" \
+curl --fail-with-body -sS "$BASE_URL/beta/chat/completions" \
   -H "Content-Type: application/json" \
   --data-binary @strict-tools.json
 ```
@@ -615,7 +636,7 @@ curl -sS "$BASE_URL/beta/chat/completions" \
 ```
 
 ```bash
-curl -sS "$BASE_URL/v1/responses" \
+curl --fail-with-body -sS "$BASE_URL/v1/responses" \
   -H "Content-Type: application/json" \
   --data-binary @flash-search-declaration.json
 ```
@@ -626,8 +647,9 @@ This declaration is accepted for Flash compatibility, but no search backend runs
 
 After the basic service works, stop that instance and restart with:
 
-- DSpark: add `--method dspark --num-speculative-tokens 5`.
-The basic launch uses the default CUDA-graph configuration at `--level 0`. `--enforce-eager` is only an optional debugging flag to disable graphs when isolating a problem; it is not part of the normal launch.
+Add `--method dspark --num-speculative-tokens 5` to the same startup command.
+
+The basic launch explicitly selects FULL CUDA graphs at `--level 0`. `--enforce-eager` is only an optional debugging flag to disable graphs when isolating a problem; it is not part of the normal launch.
 
 Keep forced/synthetic acceptance disabled. Ordinary Chat logprobs work with DSpark. JSON Schema and beta strict tools work with DSpark separately from logprobs; **Schema/strict tools + speculative decoding + logprobs is rejected**. Use the basic non-speculative launch if that combination is needed.
 
@@ -637,7 +659,7 @@ Access `/beta/*` directly on this Python API server. The beta route implementati
 
 ### Serving configuration
 
-Use the basic launch in section 1 with the full multimodal checkpoint. Keep `ATOM_MONO_ENABLE=0` and `--level 0`; use the default graph configuration. **Do not add `--method dspark` or `--enable-dp-attention` for images.** If you switched the service to DSpark for section 3, stop that instance and restart the basic service before sending images. The model rejects unsupported image deployments instead of answering from text alone.
+Use the basic launch in section 1 with the full multimodal checkpoint. Keep `ATOM_MONO_ENABLE=0` and `--level 0`; use the explicit FULL graph configuration from section 1. **Do not add `--method dspark` or `--enable-dp-attention` for images.** If you switched the service to DSpark for section 3, stop that instance and restart the basic service before sending images. The model rejects unsupported image deployments instead of answering from text alone.
 
 The same native instance can handle ordinary text requests and images. Begin with one image request at a time; tune prefill chunks/concurrency only after checking visual answers on your workload. Neither eager nor graph execution guarantees visual correctness.
 
@@ -649,11 +671,11 @@ The example directory includes `sample-red.png`, a generated red square, and req
 cd /tmp/v41-api-examples/recipes/examples/deepseek-v41-api
 export BASE_URL=http://127.0.0.1:8000
 
-curl -sS "$BASE_URL/v1/chat/completions" \
+curl --fail-with-body -sS "$BASE_URL/v1/chat/completions" \
   -H 'Content-Type: application/json' --data-binary @chat-image.json
-curl -sS "$BASE_URL/v1/responses" \
+curl --fail-with-body -sS "$BASE_URL/v1/responses" \
   -H 'Content-Type: application/json' --data-binary @responses-image.json
-curl -sS "$BASE_URL/v1/messages" \
+curl --fail-with-body -sS "$BASE_URL/v1/messages" \
   -H 'Content-Type: application/json' \
   -H 'anthropic-version: 2023-06-01' --data-binary @messages-image.json
 ```
@@ -718,4 +740,4 @@ There is no Files API: `file_id` and Anthropic `file` sources are rejected. Chat
 
 API compatibility: [#2844](https://github.com/ROCm/ATOM/pull/2844). Chat/DSpark probabilities: [#2856](https://github.com/ROCm/ATOM/pull/2856). JSON constraints and model metadata: [#2862](https://github.com/ROCm/ATOM/pull/2862). Beta FIM/prefix: [#3036](https://github.com/ROCm/ATOM/pull/3036). Beta strict tools: [#3090](https://github.com/ROCm/ATOM/pull/3090). Chat image input: [#3111](https://github.com/ROCm/ATOM/pull/3111). Responses/Messages image input: [#3115](https://github.com/ROCm/ATOM/pull/3115). Requirements tracker: [#2864](https://github.com/ROCm/ATOM/issues/2864).
 
-Prepared against main `0a99b2b9` on 2026-11-09. Commands and payloads were checked against source; this documentation and example set was not newly GPU-tested as a bundle. Prior real-model validation is recorded in the linked PRs. The issue's historical draft/unmerged labels are stale. See [API image input](../docs/api_image_input.md) for protocol/limits and [V4.1 vision](../docs/deepseek_v41_vision.md) for runtime and visual-quality limitations.
+Source review and live checks were refreshed against main `b986b653` on 2026-11-09. All 25 example payloads passed the current request-model checks. The native TP4 launch above loaded the full V4.1-Flash checkpoint and captured CUDA graphs successfully. All 22 text and inline-image examples passed the live smoke checker, including Chat logprobs, Chat/Responses JSON Schema, beta FIM/prefix/strict tools and streaming termination. The three non-streaming image examples correctly identified the red sample; a separate Chat tool-result round trip used the supplied weather result in its answer. These are small functional examples, not a throughput benchmark or a general image-accuracy evaluation. The three public-URL examples, optional DSpark launch, large-image workloads and tool-result images were not live-tested in this run. The issue's historical draft/unmerged labels are stale. See [API image input](../docs/api_image_input.md) for protocol/limits and [V4.1 vision](../docs/deepseek_v41_vision.md) for runtime and visual-quality limitations.
