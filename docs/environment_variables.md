@@ -64,11 +64,15 @@ interval; it does not guarantee end-to-end TTFT. DP decisions reduce local
 signals across ranks to keep their phases aligned.
 
 The local fill signal discounts HBM cache hits and uses the admission path's
-chunk limits. To bound CPU work, it stops probing fresh requests after their
-total prompt length reaches one batch budget. It reports only work found so
-far; it does not treat unseen requests as a full batch. A deep, cache-heavy
-queue can therefore release through the stall or hold bounds before reaching
-the fill target. If parked transfers exhaust the unreserved slots, a fresh
+chunk limits. It probes fresh requests until their chunks fill one batch
+budget, the free slots run out, or a request does not fit the pool or the
+remaining budget; a cached prefix counts only the rows left to compute. It
+reports only work found so far; it does not treat unseen requests as a full
+batch. Each request's fit is checked against the pool before earlier requests
+take blocks, so under KV-pool pressure the signal can exceed what admission
+admits, never past one batch budget. A hold does not change the pool, so the
+excess repeats on every held tick and can release the hold on fill early; it
+clears once admission runs. If parked transfers exhaust the unreserved slots, a fresh
 request may signal possible work with zero estimated tokens until admission
 resolves its connector match. This is an estimate, not a reservation: checkpoint dependencies,
 connector results and resource changes during admission can still reduce a batch.
