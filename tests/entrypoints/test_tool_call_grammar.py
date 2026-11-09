@@ -302,6 +302,25 @@ def test_parameters_given_as_a_ref_are_held_like_inline_ones(referenced):
     assert feed(matcher([tool(params)]), HEAD + arg("path", "a.py") + END_CALL)
 
 
+def test_literal_values_are_not_read_as_schemas():
+    # A "$ref" key inside a const is data; a property named "const" is a schema.
+    params = {
+        "type": "object",
+        "properties": {
+            "c": {"type": "object", "const": {"$ref": "#"}},
+            "d": {"type": "object", "properties": {"const": {"$ref": "#/x"}}},
+        },
+        "x": {"type": "integer"},
+    }
+    c = arg("c", '{"$ref": "#"}', kind="object")
+    assert feed(matcher([tool(params)]), HEAD + c + END_CALL)
+    good = arg("d", '{"const": 1}', kind="object")
+    assert feed(matcher([tool(params)]), HEAD + good + END_CALL)
+    assert not feed(
+        matcher([tool(params)]), HEAD + arg("d", '{"const": "a"}', "object")
+    )
+
+
 def test_parameters_ref_beside_other_keywords_raises():
     params = {"$ref": "#/$defs/A", "$defs": {"A": {}}, "required": ["path"]}
     with pytest.raises(ValueError, match=r"\$ref"):

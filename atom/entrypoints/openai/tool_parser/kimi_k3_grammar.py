@@ -33,6 +33,8 @@ import itertools
 import json
 import re
 
+from atom.structured_output.dsml_grammar import _LITERALS, _NAME_MAPS
+
 # The XTML `type` attribute values (`_xtml_type` in encoding_k3.py).
 XTML_TYPES = ("string", "number", "boolean", "null", "array", "object")
 # The JSON Schema types; an integer is written as an XTML number.
@@ -112,7 +114,14 @@ def _localize(schema: dict, root: dict) -> dict:
             return [rewrite(item) for item in node]
         if not isinstance(node, dict):
             return node
-        out = {key: rewrite(value) for key, value in node.items()}
+        out = {}
+        for key, value in node.items():
+            if key in _LITERALS:  # data: a "$ref" key inside is not a reference
+                out[key] = value
+            elif key in _NAME_MAPS and isinstance(value, dict):
+                out[key] = {name: rewrite(v) for name, v in value.items()}
+            else:
+                out[key] = rewrite(value)
         ref = node.get("$ref")
         if (
             isinstance(ref, str)
