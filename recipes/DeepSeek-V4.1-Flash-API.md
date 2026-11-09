@@ -30,24 +30,16 @@ python3 -m atom.entrypoints.openai_server \
   --host 0.0.0.0 --server-port 8000 --port 10000 \
   -tp 4 \
   --kv_cache_dtype bf16 --index-cache-dtype fp8 \
-  --gpu-memory-utilization 0.9 \
-  --max-model-len 32768 --max-num-seqs 16 \
-  --max-num-batched-tokens 4096 --attn-prefill-chunk-size 4096 \
-  --enable_prefix_caching --block-size 16 \
-  --state-checkpoint-interval-tokens 8192 \
-  --level 0 --cudagraph-mode FULL \
-  --cudagraph-capture-sizes '[1,2,4,8,16]' \
-  --timeout-keep-alive 900 \
   --tool-call-parser dsml_v41
 ```
 
-This is a conservative native TP4 starting point, with no speculative decoding or DP attention. It can exercise Chat logprobs and Schema together. The 32K limit is the configured prompt-plus-output budget, not a claim about the checkpoint's maximum supported context. Choose GPUs and ports that are free. TP2 is also supported on suitable MI350-class hardware; use two visible GPUs and `-tp 2` after checking host/GPU memory capacity.
+This is a native TP4 API launch, with no speculative decoding or DP attention. It can exercise Chat logprobs and Schema together. Set `--max-model-len` to the prompt-plus-output context budget your application needs and `--max-num-seqs` to its required concurrent serving capacity, subject to available memory. This recipe does not prescribe values for either option; when omitted, ATOM uses its current defaults. Choose GPUs and ports that are free. TP2 is also supported on suitable MI350-class hardware; use two visible GPUs and `-tp 2` after checking host/GPU memory capacity.
 
 Do not enable synthetic acceptance when checking output correctness: omit `--spec-decode-acceptance-length`, `--spec-decode-acceptance-rate` and synthetic benchmark environment settings. Start from a clean shell rather than inheriting a benchmark configuration.
 
 The structured-output extra installs llguidance, jsonschema and google-re2; Pillow is needed to decode API images. The editable install does not install a ROCm PyTorch build, AITER or the complete kernel build toolchain: use the supported ATOM development environment for your GPU architecture. Do not reuse an older image's AITER blindly after updating main; follow the current model/development setup instructions. Ordinary requests do not require a schema in the launch command: schema/strict tool definitions are supplied per request.
 
-The import/device check in the startup block runs before weight loading and checks the same Python environment. `--server-port 8000` is the HTTP port clients use; `--port 10000` is internal engine communication. Confirm both ports and the GPUs are available. The graph buckets are request counts up to this recipe's `--max-num-seqs 16`; adjust both together for a larger deployment. Level 0 disables torch compilation optimizations, while the explicit FULL mode still enables CUDA graphs. The first launch may take time to load weights and compile kernels/capture graphs.
+The import/device check in the startup block runs before weight loading and checks the same Python environment. `--server-port 8000` is the HTTP port clients use; `--port 10000` is internal engine communication. Confirm both ports and the GPUs are available. Compilation level, graph mode, graph capture sizes and scheduling budgets are left to the runtime defaults. Prefix caching and the cache block size are not repeated in the command. The first launch may take time to load weights and compile kernels/capture graphs.
 
 Wait until startup finishes, then inspect model discovery:
 
@@ -649,7 +641,7 @@ After the basic service works, stop that instance and restart with:
 
 Add `--method dspark --num-speculative-tokens 5` to the same startup command.
 
-The basic launch explicitly selects FULL CUDA graphs at `--level 0`. `--enforce-eager` is only an optional debugging flag to disable graphs when isolating a problem; it is not part of the normal launch.
+The basic launch uses the runtime defaults for compilation and CUDA graphs. `--enforce-eager` is an optional debugging flag, not part of the normal launch.
 
 Keep forced/synthetic acceptance disabled. Ordinary Chat logprobs work with DSpark. JSON Schema and beta strict tools work with DSpark separately from logprobs; **Schema/strict tools + speculative decoding + logprobs is rejected**. Use the basic non-speculative launch if that combination is needed.
 
@@ -659,7 +651,7 @@ Access `/beta/*` directly on this Python API server. The beta route implementati
 
 ### Serving configuration
 
-Use the basic launch in section 1 with the full multimodal checkpoint. Keep `ATOM_MONO_ENABLE=0` and `--level 0`; use the explicit FULL graph configuration from section 1. **Do not add `--method dspark` or `--enable-dp-attention` for images.** If you switched the service to DSpark for section 3, stop that instance and restart the basic service before sending images. The model rejects unsupported image deployments instead of answering from text alone.
+Use the basic launch in section 1 with the full multimodal checkpoint. Keep `ATOM_MONO_ENABLE=0`; follow the current V4.1 vision runtime requirements linked below. **Do not add `--method dspark` or `--enable-dp-attention` for images.** If you switched the service to DSpark for section 3, stop that instance and restart the basic service before sending images. The model rejects unsupported image deployments instead of answering from text alone.
 
 The same native instance can handle ordinary text requests and images. Begin with one image request at a time; tune prefill chunks/concurrency only after checking visual answers on your workload. Neither eager nor graph execution guarantees visual correctness.
 
@@ -740,4 +732,4 @@ There is no Files API: `file_id` and Anthropic `file` sources are rejected. Chat
 
 API compatibility: [#2844](https://github.com/ROCm/ATOM/pull/2844). Chat/DSpark probabilities: [#2856](https://github.com/ROCm/ATOM/pull/2856). JSON constraints and model metadata: [#2862](https://github.com/ROCm/ATOM/pull/2862). Beta FIM/prefix: [#3036](https://github.com/ROCm/ATOM/pull/3036). Beta strict tools: [#3090](https://github.com/ROCm/ATOM/pull/3090). Chat image input: [#3111](https://github.com/ROCm/ATOM/pull/3111). Responses/Messages image input: [#3115](https://github.com/ROCm/ATOM/pull/3115). Requirements tracker: [#2864](https://github.com/ROCm/ATOM/issues/2864).
 
-Source review and live checks were refreshed against main `b986b653` on 2026-11-09. All 25 example payloads passed the current request-model checks. The native TP4 launch above loaded the full V4.1-Flash checkpoint and captured CUDA graphs successfully. All 22 text and inline-image examples passed the live smoke checker, including Chat logprobs, Chat/Responses JSON Schema, beta FIM/prefix/strict tools and streaming termination. The three non-streaming image examples correctly identified the red sample; a separate Chat tool-result round trip used the supplied weather result in its answer. These are small functional examples, not a throughput benchmark or a general image-accuracy evaluation. The three public-URL examples, optional DSpark launch, large-image workloads and tool-result images were not live-tested in this run. The issue's historical draft/unmerged labels are stale. See [API image input](../docs/api_image_input.md) for protocol/limits and [V4.1 vision](../docs/deepseek_v41_vision.md) for runtime and visual-quality limitations.
+Source review and live checks were refreshed against main `b986b653` on 2026-11-09. All 25 example payloads passed the current request-model checks. The live test used native TP4 with explicitly selected level 0, FULL graphs, 32K context, 16 sequences and 4096-token scheduling/prefill budgets; it loaded the full V4.1-Flash checkpoint and captured CUDA graphs successfully. Those test settings are not prescribed by the simplified launch above, which leaves capacity and tuning choices to the deployment. The default compilation configuration was not separately live-tested in this run. All 22 text and inline-image examples passed the live smoke checker, including Chat logprobs, Chat/Responses JSON Schema, beta FIM/prefix/strict tools and streaming termination. The three non-streaming image examples correctly identified the red sample; a separate Chat tool-result round trip used the supplied weather result in its answer. These are small functional examples, not a throughput benchmark or a general image-accuracy evaluation. The three public-URL examples, optional DSpark launch, large-image workloads and tool-result images were not live-tested in this run. The issue's historical draft/unmerged labels are stale. See [API image input](../docs/api_image_input.md) for protocol/limits and [V4.1 vision](../docs/deepseek_v41_vision.md) for runtime and visual-quality limitations.
