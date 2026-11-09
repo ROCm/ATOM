@@ -163,6 +163,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             # short refuses when asked, so there is nothing to pre-empt here.
             index_block_rows=self.config.candidate_block_size,
             index_fp4=model_runner.config.index_cache_dtype == "fp4",
+            index_layout=model_runner.config.index_cache_layout,
         )
         model_runner.forward_vars.update(
             self._compress_plan_buffers(
@@ -470,6 +471,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 "DeepSeek-V4.1 publishes transfer regions after allocation"
             )
         names = [name for name, _ in self.cache.geometry.index_planes]
+        if self.cache.geometry.index_fp4:
+            # Equal byte widths do not imply equal physical layout. Mooncake
+            # checks these roles before writing any PAGE.
+            names = [f"{name}_fp4_{self.cache.geometry.index_layout}" for name in names]
         planes = [("dsv41.page", self.cache.page_bytes)] + [
             (f"dsv41.{name}_plane.{owner}", plane)
             for owner, owned in self.cache.index_planes.items()
@@ -1180,10 +1185,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         if self.geometry.speculative_tokens and not batch.is_dummy_run:
             # The scheduler reserves a full draft span, including placeholders
             # from the previous step. Ragged verification takes its head.
-            starts = np.asarray(batch.context_lens) - (batch.num_spec_step + 1)
-            rejected = self.model_runner.tokenID_processor.num_rejected
-            if rejected is not None:
-                starts = starts - rejected
+            starts = self.model_runner.tokenID_processor.verify_ctx_lens(
+                np.asarray(batch.context_lens) - (batch.num_spec_step + 1)
+            )
         return self._prepare(
             batch,
             running_bs,

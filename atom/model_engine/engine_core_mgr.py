@@ -21,6 +21,7 @@ import zmq
 import zmq.asyncio
 
 from atom.config import Config
+from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
@@ -40,6 +41,7 @@ from atom.model_engine.prefix_hash import take_shipped_chains
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
+from atom.structured_output import is_structured
 from atom.utils import (
     envs,
     get_open_zmq_inproc_path,
@@ -231,6 +233,7 @@ class CoreManager:
         )
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
+        self.keep_finished_outputs = config.keep_finished_outputs or config.asyncio_mode
         # Utility replies are matched to their caller by request id, not by
         # position on a shared queue, where a late or unasked-for reply became
         # the next caller's answer.
@@ -246,9 +249,8 @@ class CoreManager:
         # Runner processes behind each engine -- EngineCore's own sizing -- so
         # an engine that never answers still fails one result per rank. Read
         # with defaults: managers are also built from bare stand-in configs.
-        self._rpc_ranks_per_engine = getattr(config, "tp_world_size", 1) * getattr(
-            config, "prefill_context_parallel_size", 1
-        )
+        tp_world_size = getattr(config, "tp_world_size", 1)
+        self._rpc_ranks_per_engine = tp_world_size * pcp_group_size_of(config)
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
@@ -834,7 +836,8 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
-                        self.outputs_queue.put_nowait(seqs)
+                        if self.keep_finished_outputs:
+                            self.outputs_queue.put_nowait(seqs)
                         # These completions freed slots on their ranks — re-feed
                         # from the pending pool so a fast rank never drains to
                         # empty while peers still have work. No-op when
@@ -999,9 +1002,7 @@ class CoreManager:
             )
 
     def add_request(self, seqs: list[Sequence]):
-        structured = [
-            seq for seq in seqs if getattr(seq, "json_schema", None) is not None
-        ]
+        structured = [seq for seq in seqs if is_structured(seq)]
         if structured:
             try:
                 if self.structured_request_prepare is None:
@@ -1017,7 +1018,7 @@ class CoreManager:
     def _release_structured_requests(self, seqs):
         # The submitted/finished sequences own the cleanup information. There
         # is no cross-thread registry: workers tolerate repeated releases.
-        ids = [seq.id for seq in seqs if getattr(seq, "json_schema", None) is not None]
+        ids = [seq.id for seq in seqs if is_structured(seq)]
         if not ids:
             return
         try:
@@ -1306,7 +1307,23 @@ class CoreManager:
         ``LLMEngine.generate`` waits while the engine is alive and any request
         is unfinished. A dropped seq never finishes, so that wait never ends.
         The seqs are still in ``_bp_pending``; this only surfaces the error.
+        A pending seq with a stream callback is not reading that queue, so it
+        is taken out and ended through its callback, as abort does.
         """
+        with self._lb_lock:
+            waiting = [s for s in self._bp_pending if s.id in self._seq_id_to_callback]
+            for seq in waiting:
+                self._bp_pending.remove(seq)
+        delivered = False
+        for seq in waiting:
+            if not getattr(seq, "leave_reason", None):
+                seq.leave_reason = "aborted"
+            delivered |= self._deliver_terminal_output(seq)
+        if delivered and self._flush_stream_batch_fn is not None:
+            try:
+                self._flush_stream_batch_fn()
+            except Exception as e:  # noqa: BLE001 - the error below must still go out
+                logger.warning("%s: flush_stream_batch failed: %s", self.label, e)
         pending = len(getattr(self, "_bp_pending", ()))
         logger.error(
             "%s: backpressure send failed with nothing in flight; "

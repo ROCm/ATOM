@@ -180,6 +180,30 @@ change only `ATOM_MONO_ENABLE` between `0` and `1`. Pin
 `--spec-decode-acceptance-length` on both arms, or the two runs do different
 amounts of work and the comparison means nothing.
 
+### Pipeline parallel (PP2 × TP4) with DSpark
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model Kimi-K3 \
+  --kv_cache_dtype fp8 -tp 4 --pipeline-parallel-size 2 \
+  --enforce-eager \
+  --trust-remote-code \
+  --gpu-memory-utilization 0.9 \
+  --block-size 128 \
+  --enable_prefix_caching \
+  --method dspark \
+  --draft-model "${DRAFT_MODEL_PATH}" \
+  --num-speculative-tokens 7 \
+  --max-num-seqs 64 \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*", "*vision_tower*", "*mm_projector*", "context_proj", "layers"]}'
+```
+
+`--enforce-eager` is required: PP decode has no CUDA graphs yet. The drafter
+lives on the last stage, and earlier stages relay the target hidden states it
+reads (`atom/spec_decode/pp_aux_relay.py`). `"context_proj"` and `"layers"` are
+the draft's own unprefixed module names; they keep the draft out of online
+quant without touching the target. This is the CI case `Kimi-K3 DSpark PP2`.
+
 ---
 
 ## Accuracy test

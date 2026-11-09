@@ -178,7 +178,13 @@ def test_prefill_children_publish_independent_packed_score_plans(device):
 
     builder, parent = make_parent(device)
     workspace = ScoreWorkspace(
-        replace(builder.geometry, index_fp4=True, index_dim=128, index_block_rows=8),
+        replace(
+            builder.geometry,
+            index_fp4=True,
+            index_dim=128,
+            index_block_rows=8,
+            index_layout="preshuffle",
+        ),
         32,
         4,
         device,
