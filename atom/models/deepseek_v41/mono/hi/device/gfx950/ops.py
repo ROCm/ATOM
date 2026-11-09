@@ -183,7 +183,7 @@ def spin_pause():
 
 
 def rsqrt_rn_pos(x):
-    """:func:`rsqrt_rn` of a positive finite fp32 ``x`` (a norm's ``mean + eps``), the same value
+    """The correctly rounded ``1 / sqrt(x)`` of a positive finite fp32 ``x`` (a norm's ``mean + eps``),
     without LLVM's f64-sqrt range scaling and class checks: they never apply to an fp32 input
     above 0 (the scaling starts below 2^-767), but their f64 threshold is a constant LLVM hoists
     into an SGPR pair held across a whole persistent kernel (HCIn's norm: 2 SGPR spills seen in a
@@ -307,7 +307,7 @@ def torch_sum_lanes(
 
 
 def torch_thread_sum(term4, width: int, lanes: int, lane, m: int):
-    """Torch's thread ``t = lane + 64 m``'s part of a row sum (:func:`row_sum_torch_vec`): its 4
+    """Torch's thread ``t = lane + 64 m``'s part of a row sum (the rest: :func:`torch_tree`): its 4
     running sums over its vectors ``t, t + lanes, ...`` (in that order), combined ``((a0 + a1) +
     a2) + a3``. ``term4(v, c)``: the 4 fp32 terms of the row's elements ``4 v .. 4 v + 3``, ``v =
     lane + 64 c`` (``c`` a Python int: the lane's ``c``-th vector, for operands in registers).

@@ -41,7 +41,7 @@ Stages:
   LDS, 8 MFMAs a (row, 16 positions); relu, the two bf16 roundings, the head sum (in registers, then lanes 16 / 32)
   -> F32 channel ``<name>.scores`` [rows, n_max] (a BF16 value a pair). Keys the step itself emitted (a KV
   source: ``new_keys``, the Compressor's in-launch ``index_out`` channel) are polled from that channel;
-- ``TopK`` (``blocks.topk``, exact, ties to the lowest index) over the scores with the per-row bound
+- ``TopK`` (``blocks.gfx950.topk``, exact, ties to the lowest index) over the scores with the per-row bound
   ``bound`` (plain int32 [rows] = ``(P + j + 1) // ratio``, written by the host with ``pos``) -> ``out``.
 
 A candidate reader (``candidates``) built with ``compact`` (an n_max from which it applies) past ``CTOPK`` blocks
@@ -58,7 +58,7 @@ and the compact columns are the positions.
 Reduction order: the q . k sum and the head sum are exact in fp32 for FP4 operands unless a row's group scales
 span > ~11 (q . k) / ~16 (heads) binades; then the order is the MFMA's, then lanes (16, 32) and head tiles. The
 weights' fp32 sum order (the dot's) is not hipBLASLt's: a weight whose exact value sits at a bf16 rounding midpoint
-can come out an ulp apart (tests/gpu/test_indexer_v41.py; none in the fixtures' 128 rows).
+can come out an ulp apart (none in the fixtures' 128 rows).
 """
 
 from __future__ import annotations
@@ -924,9 +924,9 @@ def _cmask_all_if(k, t, p, out, live):
 
 
 def _cmask_bits(k, t, p: _Plan, cand: str, out: str):
-    """``_cmask_list``'s words built in LDS: the row's ``cwords`` words cleared (before the poll), each entry's bit
+    """``_cmask``'s words built in LDS: the row's ``cwords`` words cleared (before the poll), each entry's bit
     OR'd into its word (an LDS atomic; -1 padding into a junk word past them), then the words stored. Every entry
-    sets one bit of one word, so the words are ``_cmask_list``'s."""
+    sets one bit of one word, so the words are ``_cmask``'s."""
     tid = k.tid
     for w0 in range(0, p.cwords + 1, THREADS):  # (+1: the junk word)
         fx.ptr_store(fx.Int32(0), k.lds + fx.min(tid + w0, fx.Int32(p.cwords)))
@@ -1113,7 +1113,7 @@ class Indexer(Block):
             )
         self.scores_f32 = scores_f32
         # a second, narrow score stage (one 16-position subtile a wave) for rows short enough that its tasks fit one
-        # grid round, beside the wide one for the rest (``score_stages``; the same per-position arithmetic)
+        # grid round, beside the wide one for the rest (``score_plans``; the same per-position arithmetic)
         self.short_tiles = short_tiles
         # live tasks (``Stage.live_tasks``): the score stage and the TopK trees run only the tasks the step's rows
         # reach (from ``pos`` / the bounds), so a large build costs a short context nothing for its tasks past it
@@ -1143,7 +1143,7 @@ class Indexer(Block):
         # the persistent score tasks shared among the requests by their tiles (``_Plan.items``; with ``persist`` only:
         # a tile a task has no per-request share to deal)
         self.items = items
-        # the score epilogue with fewer VALU ops (``_epi_lean``): the same roundings, ReLU values and sum order
+        # the score epilogue with fewer VALU ops: the same roundings, ReLU values and sum order
         self.lean_epi = lean_epi
         # a compact reader's candidate list (``_clist``) from the row's live bitmap words only (its bound: the words
         # past it are 0) and its set bits only (a loop over each word's set bits): O(the row's blocks), not O(n_max)

@@ -35,7 +35,7 @@ from atom.models.deepseek_v41.mono.dispatch import (
     MonoDraftModel,
     step_supported,
 )
-from atom.mono.runtime.consensus import MonoUnsupported
+from atom.mono.runtime.consensus import MonoUnsupported, tp_uniform_local_validation
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -163,34 +163,63 @@ class HiDraftModel(MonoDraftModel):
         return self.model.head_and_sample(out, anchor_ids, num_draft)
 
 
+def _tp() -> tuple:
+    """(the TP group's CPU group, its size, this rank)."""
+    from aiter.dist.parallel_state import get_tp_group
+
+    tp = get_tp_group()
+    return tp.cpu_group, tp.world_size, tp.rank_in_group
+
+
 def install_hi(
     model: nn.Module, atom_config, drafter, metadata_builder, dp_ranks: int
 ) -> nn.Module:
     """``model`` wrapped for the hi hook (and ``drafter``'s draft model for its draft), on a deployment the hi path
-    serves (``hi_gate.decide``). Collective (the hook's peer groups): every rank calls it at the same point. A loaded
-    model the hi path does not serve raises ``MonoUnsupported`` (``dispatch.install_mono_decode`` falls back under
-    "auto"), the draft model left as it was."""
+    serves (``hi_gate.decide``). Collective (the agreement, the embedding's exchange, the hook's peer groups): every
+    rank calls it at the same point. First every refusal this rank's loaded model gives (``hi_runner.check``: its
+    weights, embedding, Engram host shards), before anything collective or allocated, its verdict agreed over the TP
+    group (``consensus.tp_uniform_local_validation``): every rank builds, or every rank raises ``MonoUnsupported``
+    naming the ranks that refused (``dispatch.install_mono_decode`` falls back under "auto") with nothing built, the
+    draft model left as it was."""
+    group, world, rank = _tp()
     draft = drafter.model
+    # whatever this rank's check raises is its refusal: a rank that alone raised would leave the others waiting in
+    # the build's first collective
+    refused = None
     try:
-        return _install_hi(model, atom_config, drafter, metadata_builder, dp_ranks)
+        hi_runner.check(model, atom_config, metadata_builder.engram, draft, world, rank)
+    except Exception as error:
+        refused = error
+    try:
+        tp_uniform_local_validation(
+            refused, group=group, world_size=world, context="refused at install"
+        )
+    except MonoUnsupported as agreed:
+        raise agreed from refused
+    try:
+        return _install_hi(
+            model, atom_config, drafter, metadata_builder, dp_ranks, group
+        )
     except MonoUnsupported:
         drafter.model = draft
         raise
 
 
 def _install_hi(
-    model, atom_config, drafter, metadata_builder, dp_ranks: int
+    model, atom_config, drafter, metadata_builder, dp_ranks: int, group
 ) -> nn.Module:
     engram = metadata_builder.engram
-    # the hi runtime's layers for every layer: weights (packed from the target's and the draft's loaded tensors), kernels
-    # and peer groups bound here, before the KV cache is sized (the Engram table lookup's hash constants from ATOM's own
-    # hash mapping)
+    # the token embedding's shards read in place from the rank holding a row (no all-reduce a lookup, no copy of
+    # the table): the begin-step's and the draft's begin kernel's lookups. First: its read check is the build's one
+    # refusal (agreed), and nothing else is built before it
+    embed = embed_full.install(model, group)
+    # the hi runtime's layers for every layer: weights (packed from the target's and the draft's loaded tensors),
+    # kernels and peer groups bound here, before the KV cache is sized (the Engram table lookup's hash constants from
+    # ATOM's own hash mapping)
     hook = hi_runner.install(model, atom_config, engram.mapping, drafter.model)
     runner = metadata_builder.model_runner
     hook.runner = runner
-    # the token embedding's shards read in place from the rank holding a row (no all-reduce a lookup, no copy of
-    # the table): the begin-step's and the draft's begin kernel's lookups
-    hook.embed = embed_full.install(model, hook._cpu_group)
+    hook.embed = embed
     if hook.eng:
         # the Engram lookup from ATOM's host shards, its staging skipped on served steps
         hook.use_host_tables(engram.host, engram.host.overlap)

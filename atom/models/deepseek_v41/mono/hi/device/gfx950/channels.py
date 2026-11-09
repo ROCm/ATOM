@@ -11,11 +11,11 @@ channel (the words without tags; the task then calls ``put_flag``).
 Bulk + flag (``Proto.FLAG``) in device terms:
 
 - producer: dense words stored at device scope (``store_words``: sc1, past the
-  XCD L2s, as the tagged puts), then ``put_flag`` / ``put_flag_wave``: every
+  XCD L2s, as the tagged puts), then ``put_flag``: every
   storing wave drains its stores (``s_waitcnt vmcnt(0)``: the stores are acknowledged
   at the device coherence point), the CTA meets (multi-wave producers), and one
   lane puts the tagged flag: a flag never overtakes its words;
-- consumer: ``wait_flags`` (every flag current, then a CTA barrier, so no thread
+- consumer: ``flag_try`` / ``flag_land`` (every flag current, then a CTA barrier, so no thread
   issues a word load before *all* flags were seen), then ``load_words`` at device
   scope. A word load issued before its flag is seen current may return stale bytes
   (no tag to catch it): never issue one speculatively. Loads return in issue order
@@ -46,7 +46,7 @@ def store_words(a, w, words):
 
 def load_words(a, w, n, cm=CM_DEV):
     """Dense words ``w .. w + n`` (n in 1, 2, 4) -> list of Int32, issued now (call only
-    after ``wait_flags``); recorded as a poll of ``a``'s region."""
+    after ``flag_land``); recorded as a poll of ``a``'s region."""
     note(a.region, a.space, "poll")
     v = mb.load(a, w, n, cm)
     if n == 1:

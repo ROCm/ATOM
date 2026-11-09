@@ -10,7 +10,7 @@ itself (the chain's exchange, the TP degree, the merge's cache copies) are the r
 "Knobs"). An index source at a context bucket from ``IDX_LONG`` on takes its kind's ``LONG`` (and ``LONG_ROWS``) on
 top. A build's own ``knobs`` dict goes over all of it (``knobs(over=)``).
 
-Kinds are the model's layer kinds (``config.layer_kind``): ``window`` (layer 0), ``window+engram`` (layer 1),
+Kinds are the model's layer kinds (``kind_of``): ``window`` (layer 0), ``window+engram`` (layer 1),
 ``ratio2_kv_source`` (2, 8), ``ratio2_kv_source+engram`` (14), ``ratio1_kv_source`` (20), ``ratio1_index_source``
 (24 .. 36), ``ratio2_consumer`` / ``ratio1_consumer`` (the rest; ``consumer``: a consumer built without its ratio).
 A layer built as two kernels (the attention kernel, then the FFN kernel) takes the kind ``<kind>/split``.
@@ -120,7 +120,7 @@ DEFAULT: dict = {
     "COMP_KSLICES": 4,  # the Compressor's dots' K slices (GatheredDot dense mode)
     "COMP_TILES": "auto",  # ... and 16-column tiles a task, an int or "auto"
     # precision: ATOM's arithmetic (False / True / True, the default: merge rule 4, no op below ATOM's default path;
-    # the gate's reference is the ATOM-arithmetic one, ``reference_atom``, keyed by these three) or the official
+    # the gate's reference is the ATOM-arithmetic one, keyed by these three) or the official
     # model's (True / False / False, the hw reference's). Numerics choices, never schedule entries
     "COMPRESS_QAT": False,  # the KV sources' compressed-cache entry: the rotated bf16 latent as is (ATOM's bf16 pool;
     #                         Compressor(qat=False)) or FP4 QAT'd (True: the official model's)

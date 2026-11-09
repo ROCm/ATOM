@@ -411,3 +411,24 @@ def test_a_taken_scatter_is_neither_copied_nor_launched(monkeypatch, packed_h2d)
     assert copy.submit([8, 3])
     assert reader.taken == [(0x1000, 8)] and launches == []
     assert not copy.device.any()
+
+
+def test_a_device_address_without_a_hip_runtime(monkeypatch, packed_h2d):
+    """`device_address` asks the HIP runtime torch runs; without one it raises, or (`identity_without_hip`: the PLE
+    table's copies, ``qwen38.mono.ple``) gives the host address back."""
+    monkeypatch.setattr(packed_h2d, "_host_get_device_pointer", lambda: None)
+    with pytest.raises(RuntimeError, match="no HIP runtime"):
+        packed_h2d.device_address(0x1000)
+    assert packed_h2d.device_address(0x1040, identity_without_hip=True) == 0x1040
+
+    def get(
+        out, base, flags
+    ):  # hipHostGetDevicePointer: the range at base is mapped at 0x9000
+        out._obj.value = 0x9000 if base == 0x1000 else 0
+        return 0
+
+    monkeypatch.setattr(packed_h2d, "_host_get_device_pointer", lambda: get)
+    assert packed_h2d.device_address(0x1040, 0x1000) == 0x9040
+    assert packed_h2d.device_address(0x1000, identity_without_hip=True) == 0x9000
+    with pytest.raises(RuntimeError, match="hipHostGetDevicePointer"):
+        packed_h2d.device_address(0x2000)

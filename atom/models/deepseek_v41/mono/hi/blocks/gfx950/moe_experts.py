@@ -16,7 +16,7 @@ with ``shared`` a BF16 channel (the shared expert, e.g. ``Linear`` blocks) or no
 Stages:
 
 1. ``<name>.rt`` (``route="cta"``, the default; a task on every CTA): the step's ``rows * K`` picks (``route_from``:
-   a ``MoERouter`` whose route this stage computes itself from the router's dot partials, ``router.route_lds``,
+   a ``MoERouter`` whose route this stage computes itself from the router's dot partials,
    instead of polling ``idx`` / ``weights``: one hop fewer, the same picks) deduplicated
    into slots, one per distinct expert, ascending by id (per-expert LDS counts and a CTA prefix sum: a thread per
    expert up to 512, two (2 t, 2 t + 1) up to 1024; a pick a thread, more picks than threads: t, t + 512, ..); a
@@ -920,7 +920,7 @@ def _gather_n(kk: int) -> int:
 def _gather_rows(k, c: _Cfg, pick_lds, npick, *row):
     """The slot's ``npick`` picks' MXFP8 rows into LDS rows 0 .. npick - 1 (``_gather_batch``), in a dynamic loop of
     ``_gather_n``-row batches (LDS rows past npick hold stale words: their MFMA columns are never read). A16W4
-    (``c.b16``): their bf16 rows, every staged row in one poll (``_gather16``)."""
+    (``c.b16``): their bf16 rows, every staged row in one poll."""
     gr = _gather_n(row[3])
     _gather_loop(k, c, pick_lds, uniform((npick + (gr - 1)) // gr), npick - 1, row)
 
@@ -989,8 +989,8 @@ def _gemv(k, c: _Cfg, e, g, kk, n_rows, part, w_arg, s_arg, pitch, spitch, stage
     it on are zero padding: their units read 0 without touching memory. ``fmt``: the weight format (the folded
     shared expert is MXFP8); ``prefetch``: units in flight a wave (None: the config's). ``live_k`` > 0: K from it on
     is zero padding (intra's padded down K): those lanes' chunks read 0 without touching memory. ``k0`` /
-    ``nsteps``: only K steps k0 .. k0 + nsteps - 1 (a K slice; ``stage_b`` gathers that slice of B). ``ring``
-    (``_ug_ring``): the wave's first ``ring.n`` units come from its LDS ring slots (``_ring_fill``; ``_ug_body`` fills
+    ``nsteps``: only K steps k0 .. k0 + nsteps - 1 (a K slice; ``stage_b`` gathers that slice of B). ``ring``:
+    the wave's first ``ring.n`` units come from its LDS ring slots (``_ring_word``; ``_ug_body`` fills
     them for the CTA's next task of the stage after its epilogue). ``cols`` > 0: the scale codes are ATOM's in place
     (``_Cfg.atom_scales``: aiter's ``shuffle_scale`` order, ``cols`` columns a row; full K, ``g`` even).
     """
@@ -1751,8 +1751,8 @@ class MoEExperts(Block):
             out_arg  # the output also stored to a plain arg (TP: by dsum, push reduce)
         )
         # a MoERouter whose route the rt stage computes (route "cta"): a softmax_topk / sigmoid router with the dot's
-        # slice partials and wave-0 scores (``route_lds``), or a ``consumer`` sigmoid / sqrtsoftplus router (any TP:
-        # every rank's dot all n experts; ``route_lds_rows``, a wave a row)
+        # slice partials and wave-0 scores, or a ``consumer`` sigmoid / sqrtsoftplus router (any TP: every rank's dot
+        # all n experts; a wave a row)
         if route_from is not None and (
             route != "cta" or rt_lean or not route_from.dot or not route_from.dot.part
             or not (route_from.consumer or (route_from.score_func in ("softmax_topk", "sigmoid")
@@ -1762,7 +1762,7 @@ class MoEExperts(Block):
                              "(wave0 scores) router with dot partials, or a consumer router")  # fmt: skip
         self.route_from = route_from
         # ug: the first weight units a wave of every task from an LDS ring the CTA's previous ug task fills after its
-        # epilogue (``_gemv``, ``_ug_ring``; MXFP4 routed experts, route "cta", no sh_own); 0: none (build unchanged)
+        # epilogue (``_gemv``; MXFP4 routed experts, route "cta", no sh_own); 0: none (build unchanged)
         if ug_ring and (route != "cta" or ug_ring < 0):
             raise ValueError("MoEExperts: ug_ring needs route='cta'")
         self.ug_ring = ug_ring
@@ -1932,7 +1932,7 @@ class MoEExperts(Block):
                              f"{picks}")  # fmt: skip
         if (
             sc.tp > 1 and self.layout == "expert" and picks > THREADS
-        ):  # ``_b_operand``: thread p < slots, pick p
+        ):  # the B operand: thread p < slots, pick p
             raise ValueError(f"MoEExperts {self.name}: layout 'expert' at TP checks a pick a thread: rows x K <= "
                              f"{THREADS}, got {picks}")  # fmt: skip
         ug_g, down_g = self.groups(sc)

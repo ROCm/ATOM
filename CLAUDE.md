@@ -110,9 +110,13 @@ Key entry points:
   implementations side by side — `PeerBuffer` (aiter's heap) and
   `SymmetricPeerBuffer` (HIP directly, GLM-5.2's) — because they are different
   implementations rather than two copies, and merging them is a GPU behaviour
-  change, not a move; both allocate through `runtime/uncached.py`, as do every
-  model's step scratch buffers (uncached device memory: a hand-off's polls
-  never hit a stale cache line). Qwen3.8-Flash-Next's kernels (`qwen38/mono/`, beside
+  change, not a move; both allocate through `runtime/uncached.py`, as do the
+  other models' step scratch buffers (uncached device memory: a hand-off's polls
+  never hit a stale cache line). DeepSeek-V4.1's high-interactivity monokernels
+  (below) keep a third, their own: the hi programs' peer groups
+  (`deepseek_v41/mono/hi/runtime/peer.py`, `PeerGroup`) and uncached scratch
+  arenas (`hi/runtime/uncached.py`, a block retired and reused, never freed), both
+  over `runtime/hip_ipc.py`. Qwen3.8-Flash-Next's kernels (`qwen38/mono/`, beside
   the single-file `qwen4_exp.py`) are whole-layer programs composed from FlyDSL stages
   (`kernels/blocks/`, `kernels/recipe.py`); its MTP drafter is wrapped at install like
   V4.1's (`draft_model.MonoDraftModel`). Where a model ships a

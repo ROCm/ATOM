@@ -10,7 +10,7 @@ from the step's positions, batch ids, slots and block tables, and the DSpark dra
 query starts, slots and window. On such a step this skips, on the host:
 
 - ``_build_compress_plans`` (numpy over the requests, three buffers a ratio staged into the step's publication);
-- the step planners (``ScorePlanner``, ``WalkPlanner``: the host layout and their buffers' upload);
+- the step planner (``ScorePlanner``: the host layout and its buffers' upload);
 
 (the per-ratio indptrs are filled lazily, by the first attention index build that reads them: none on such a step),
 

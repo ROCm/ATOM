@@ -37,13 +37,13 @@ and its parity-1 copy mirrored from the group's top (``PEER_TOP_ARG``, the group
 time): every program's parity-0 copies lie in ``[0, S)`` and its parity-1 copies in ``[top - S, top)``
 (``S``: its ``peer_bytes`` / 2), disjoint for any two programs whose ``peer_bytes`` the group holds; a
 region at the same offset and size in two programs (``peer_first``: the cross-launch regions) keeps one
-address in both. ``plan.peer_alias`` finds the overlaps of a launch sequence.
+address in both.
 
 Across steps: a step of an odd number of launches on a group ends on the parity it began with, and the next step's
 first launch (often one that reads nothing of its launch: a step's first layer) would share the previous launch's
 copy. A shared program adds its group's step phase to its tag's parity (the peer table's entry ``tp``, low word),
 which ``PeerGroup.end_step`` after a step's last launch flips when the step's launch count was odd: consecutive
-launches alternate across steps of any widths (``plan.peer_alias.steps`` checks a group's step shapes).
+launches alternate across steps of any widths.
 """
 
 from __future__ import annotations
@@ -184,7 +184,7 @@ class Stage:
     """One stage: ``tasks`` tasks, each emitted by ``emit(k, t)``.
 
     ``emit`` is a traced free function (or a closure over Python constants):
-    ``k`` is the stage's kernel context (``emit.kernel.StageCtx``), ``t``
+    ``k`` is the stage's kernel context (``emit.kernel._stage_ctx``), ``t``
     the traced task index. It must not call methods on, or assign attributes of,
     local objects inside dynamic control flow.
     """
@@ -214,14 +214,14 @@ class Stage:
     # Args this stage stores only for later launches (a cache's new entries): no stage of this launch uses the
     # elements it stores (they reach this launch's readers through a channel; a reader may load the stale bytes and
     # replace them). ``plan.check.check_memory`` takes it at its word for these args' same-launch pairs (the
-    # many-launch check, ``bench.alternate``, is what tests the claim); not part of the build.
+    # many-launch check is what tests the claim); not part of the build.
     later_args: tuple[str, ...] = ()
-    # What the stage moves and computes, for its speed-of-light floor (``sol.Cost``, or a callable of the
+    # What the stage moves and computes, for its speed-of-light floor (a cost, or a callable of the
     # scenario returning one). Measurement metadata only: not part of the build key, never read by the emitter.
     cost: object = None
     # Entry hold: a CTA with a task of this stage sleeps ``hold`` s_sleep units (64 clocks each) before its first
     # task, so an early starter stops taking bandwidth from the critical path (a stage hold). 0: none
-    # (the build is unchanged). The causal probe (``sol.causal``) sets it one stage at a time.
+    # (the build is unchanged). A causal probe sets it one stage at a time.
     hold: int = 0
     # With ``hold``, which CTAs with a task hold: "" every one; "first" those with no task of an earlier stage (of every
     # variant this stage runs in: the stage is their first work); "after" those with one

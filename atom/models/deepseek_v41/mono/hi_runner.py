@@ -161,15 +161,7 @@ class HiLayers(HiDraft, HiPrograms):
         self.tp = get_tensor_model_parallel_world_size()
         self.rank = get_tensor_model_parallel_rank()
         cfg = model.config
-        if cfg.hc_mult != HC or cfg.hidden_size != L.HIDDEN:
-            raise MonoUnsupported(
-                f"hc_mult {cfg.hc_mult} / hidden {cfg.hidden_size} is not the hi runtime's V4.1"
-            )
-        if int(atom_config.max_model_len) > max_ctx:
-            raise MonoUnsupported(
-                f"max_model_len {atom_config.max_model_len} > the hi programs' context bucket {max_ctx} (set "
-                "--max-model-len)"
-            )
+        # (what this rank loaded is checked, agreed over the ranks, before: ``check``)
         # the programs (``hi_compose``: the plan, the widths, every program built)
         self._cpu_group = get_tp_group().cpu_group
         HiPrograms.__init__(
@@ -180,10 +172,6 @@ class HiLayers(HiDraft, HiPrograms):
         self.runs_every_layer = True
         self.lean_host, self.served_widths, self.lean_steps = False, set(), 0
         self.head_rows = 0
-        if float(getattr(model.norm, "eps", L.EPS)) != float(L.EPS):
-            raise MonoUnsupported(
-                f"V4.1 mono hi verify head: final norm eps {model.norm.eps} != the hi runtime's {L.EPS}"
-            )
         dev = self.dev = torch.device("cuda", torch.cuda.current_device())
         # (a band's programs: the band's rows)
         R, H = max(self.pwidth(s) for s in self.widths), cfg.hidden_size
@@ -482,49 +470,22 @@ class HiLayers(HiDraft, HiPrograms):
         serves (``EngramStep.served_by_round``, the builder's routing decision: nothing reads its staged rows; the
         begin-step writes the cursor candidates the verdict commits: ``_fold_args``), keeping the cursor advance.
         """
-        from .hi.blocks.gfx950.engram import shard_rows
-        from .hi.v41 import engram_io
-
         if not getattr(host, "uva", False) or staging is None:
             raise RuntimeError("V4.1 mono hi: the Engram lookup from ATOM's host shards needs ATOM's UVA Engram lookup "
                                "with overlap staging")  # fmt: skip
         for n, i in self.eng.items():
-            table = host.prefetcher._tables[i]
-            weight, scales, lo, hi = table.registered_shard()
-            want = tuple(
-                int(x)
-                for x in shard_rows(
-                    engram_io.hash_words(self._eng_consts, i), self.tp, self.rank
-                )
-            )
-            tq, ts = weight.view(torch.uint8), scales.view(torch.uint8)
-            if (
-                (lo, hi) != want
-                or tq.shape[1:] != (256,)
-                or ts.shape[1:] != (8,)
-                or tq.shape[0] != hi - lo
-            ):
-                raise RuntimeError(f"Engram layer {i}: ATOM's host shard rows [{lo}, {hi}) {tuple(tq.shape)} / "
-                                   f"{tuple(ts.shape)}, the hi runtime's {want} x 256 / 8")  # fmt: skip
-            # the device's addresses of the page-locked host pages (the host pointer is not one: Triton maps it per
-            # launch, a hi pointer table holds what the device dereferences); each shard tensor's storage
-            # starts at its page-locked region's base (``host_memory.pin_rows``)
-            wbase, sbase = (
-                tq.untyped_storage().data_ptr(),
-                ts.untyped_storage().data_ptr(),
+            # (its rows and its device read checked at install: ``check``)
+            tq, ts, (lo, hi), tq_dev, ts_dev = host_shard(
+                host, self._eng_consts, i, self.tp, self.rank
             )
             logger.info("Engram layer %d: ATOM's host shard rows [%d, %d), page-locked at %#x / %#x", i, lo, hi,
-                        wbase, sbase)  # fmt: skip
-            self._eng_args[f"{n}.tq"] = device_address(tq.data_ptr(), wbase)
-            self._eng_args[f"{n}.ts"] = device_address(ts.data_ptr(), sbase)
+                        tq.untyped_storage().data_ptr(), ts.untyped_storage().data_ptr())  # fmt: skip
+            self._eng_args[f"{n}.tq"], self._eng_args[f"{n}.ts"] = tq_dev, ts_dev
             # kept alive with the hook
             self._eng_host = getattr(self, "_eng_host", []) + [
                 tq,
                 ts,
             ]
-            _check_host_shard(
-                i, tq, ts, self._eng_args[f"{n}.tq"], self._eng_args[f"{n}.ts"]
-            )
         dev = self.ids.device
         for s in self.widths:
             self.tables[ENGKV, s] = self.eng_programs[s].table(
@@ -542,17 +503,6 @@ class HiLayers(HiDraft, HiPrograms):
         norm and this rank's head rows, the last layer's streams (its R_F and gate; its plain output unless
         chained), the persistent outputs. -> bytes held."""
         norm_w, head_w = model.norm.weight.detach(), model.head.weight.detach()
-        n = self.H.VOCAB // self.tp
-        if (
-            tuple(head_w.shape) != (n, self.h_in0.shape[-1])
-            or head_w.dtype != torch.bfloat16
-        ):
-            raise MonoUnsupported(f"V4.1 mono hi verify head: head.weight {tuple(head_w.shape)} {head_w.dtype}, want bf16 "
-                             f"[{n}, {self.h_in0.shape[-1]}] (this rank's vocab rows)")  # fmt: skip
-        if not torch.equal(norm_w.float(), norm_w.bfloat16().float()):
-            raise MonoUnsupported(
-                "V4.1 mono hi verify head: the final norm weight is not bf16-exact"
-            )
         R, H = self.h_in0.shape[0], self.h_in0.shape[-1]
         self.head_ids = torch.zeros(R, dtype=torch.int32, device=dev)
         self.head_vals = torch.zeros(R, dtype=torch.float32, device=dev)
@@ -987,6 +937,119 @@ def head_launch_ids(last: int, requests: int) -> tuple[int, ...]:
     return (last + 1, *HEAD_MORE[: requests - 1])
 
 
+def check(model, atom_config, engram, draft, tp: int, rank: int) -> None:
+    """Every refusal of this TP rank's install that reads what it loaded, raised (``MonoUnsupported``) before anything
+    collective and before anything is built or allocated (temporaries aside): the model's geometry and context, the
+    layer plan (every layer on the hi path), the target layers' and the draft stages' weights
+    (``hi_weights.check_block``: the FP8 linears, the routed experts' layout and padding codes, a rank's own shard), the
+    Engram layers' and the context write's linears, the RoPE caches, the verify head's tensors, the draft's stages and
+    norms, the token embedding (``embed_full.check``) and ATOM's Engram host shards (their rows, read on the device
+    through their device addresses). ``engram``: ATOM's Engram runtime (its hash mapping and host shards); ``draft``:
+    ATOM's DSpark draft model. ``hi_dispatch.install_hi`` agrees on the verdict over the TP group before anything is
+    built, so every rank builds or every rank falls back with nothing built."""
+    from atom.models.deepseek_v41.mono.round import embed_full
+
+    from .hi.v41 import draft as D
+    from .hi.v41 import head as H
+    from .hi.v41 import layer as L
+
+    cfg = model.config
+    if cfg.hc_mult != HC or cfg.hidden_size != L.HIDDEN:
+        raise MonoUnsupported(
+            f"hc_mult {cfg.hc_mult} / hidden {cfg.hidden_size} is not the hi runtime's V4.1"
+        )
+    if int(atom_config.max_model_len) > MAX_CTX:
+        raise MonoUnsupported(
+            f"max_model_len {atom_config.max_model_len} > the hi programs' context bucket {MAX_CTX} (set "
+            "--max-model-len)"
+        )
+    plan = hi_plan.plan_layers(model.topology, cfg.engram_layer_ids, engram_on=True)
+    atom_layers = [p.layer_id for p in plan if not p.hi]
+    if atom_layers:
+        raise MonoUnsupported(
+            f"V4.1 mono hi: layers {atom_layers} cannot run on the hi path (the hook runs every layer)"
+        )
+    inter = cfg.moe_intermediate_size
+    for p in plan:
+        block = model.layers[p.layer_id]
+        hw.check_block(block, inter, tp)
+        if p.engram:
+            hw.check_linears(block.engram.wkv)
+    for rope in (model.window_rope, model.global_rope, draft.rope):
+        hw.rope_args(rope)
+    # the verify head: ATOM's final norm and this rank's head rows
+    if float(getattr(model.norm, "eps", L.EPS)) != float(L.EPS):
+        raise MonoUnsupported(
+            f"V4.1 mono hi verify head: final norm eps {model.norm.eps} != the hi runtime's {L.EPS}"
+        )
+    norm_w, head_w = model.norm.weight.detach(), model.head.weight.detach()
+    n = H.VOCAB // tp
+    if tuple(head_w.shape) != (n, cfg.hidden_size) or head_w.dtype != torch.bfloat16:
+        raise MonoUnsupported(f"V4.1 mono hi verify head: head.weight {tuple(head_w.shape)} {head_w.dtype}, want bf16 "
+                              f"[{n}, {cfg.hidden_size}] (this rank's vocab rows)")  # fmt: skip
+    if not torch.equal(norm_w.float(), norm_w.bfloat16().float()):
+        raise MonoUnsupported(
+            "V4.1 mono hi verify head: the final norm weight is not bf16-exact"
+        )
+    # the DSpark draft: its context write (``bind_draft``, ``_ctx_build``) and its stages (``_draft_build``)
+    layers = tuple(draft.context_layers)
+    if len(layers) != D.STAGES:
+        raise MonoUnsupported(
+            f"V4.1 mono hi draft: {len(layers)} draft stages, the hi runtime's CTX has {D.STAGES}"
+        )
+    eps = {float(a.kv_norm.eps) for a in layers} | {float(draft.mtp[0].main_norm.eps)}
+    if eps != {float(D.EPS)}:
+        raise MonoUnsupported(
+            f"V4.1 mono hi draft: the draft's norm eps {eps} != the hi runtime's {D.EPS}"
+        )
+    hw.check_linears(draft.mtp[0].main_proj)
+    for s in range(D.STAGES):
+        hw.check_block(draft.mtp[s], inter, tp)
+    embed_full.check(model)
+    # ATOM's Engram host shards, the rows the hi runtime reads (``use_host_tables``)
+    eng = [p.layer_id for p in plan if p.engram]
+    if eng:
+        consts = engram_consts(engram.mapping)
+        for i in eng:
+            tq, ts, _, tq_dev, ts_dev = host_shard(engram.host, consts, i, tp, rank)
+            _check_host_shard(i, tq, ts, tq_dev, ts_dev)
+
+
+def host_shard(host, consts: dict, layer: int, tp: int, rank: int) -> tuple:
+    """ATOM's page-locked host shard of Engram layer ``layer`` (``host``: its ``EngramHost``, page-locked at load, a
+    page-locked copy or the mapping registered in place) as the hi runtime reads it -> (codes, scales) uint8
+    [rows, 256] / [rows, 8], their rows [lo, hi) and their device addresses. Raises ``MonoUnsupported`` when the rows
+    are not those the hi runtime's ``shard_rows`` names for this rank (``consts``: ``engram_consts``).
+    """
+    from .hi.blocks.gfx950.engram import shard_rows
+    from .hi.v41 import engram_io
+
+    weight, scales, lo, hi = host.prefetcher._tables[layer].registered_shard()
+    want = tuple(
+        int(x) for x in shard_rows(engram_io.hash_words(consts, layer), tp, rank)
+    )
+    tq, ts = weight.view(torch.uint8), scales.view(torch.uint8)
+    if (
+        (lo, hi) != want
+        or tq.shape[1:] != (256,)
+        or ts.shape[1:] != (8,)
+        or tq.shape[0] != hi - lo
+    ):
+        raise MonoUnsupported(f"Engram layer {layer}: ATOM's host shard rows [{lo}, {hi}) {tuple(tq.shape)} / "
+                              f"{tuple(ts.shape)}, the hi runtime's {want} x 256 / 8")  # fmt: skip
+    # the device's addresses of the page-locked host pages (the host pointer is not one: Triton maps it per launch, a
+    # hi pointer table holds what the device dereferences); each shard tensor's storage starts at its page-locked
+    # region's base (``host_memory.pin_rows``)
+    wbase, sbase = tq.untyped_storage().data_ptr(), ts.untyped_storage().data_ptr()
+    return (
+        tq,
+        ts,
+        (lo, hi),
+        device_address(tq.data_ptr(), wbase),
+        device_address(ts.data_ptr(), sbase),
+    )
+
+
 def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
     """The hook for this rank (the deployment is one the hi path serves: ``hi_gate.decide``). ``engram_mapping``:
     ATOM's Engram hash mapping (its runtime's), the source of the table lookup's hash constants (``engram_consts``);
@@ -1036,11 +1099,11 @@ def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
 def _check_host_shard(
     layer: int, tq, ts, tq_dev: int, ts_dev: int, n: int = 64
 ) -> None:
-    """``use_host_tables``' load check on Engram layer ``layer``: ``n`` sampled rows of ATOM's host shard (``tq`` codes
-    / ``ts`` scales) and its first / last rows, read on the device through their device addresses (``tq_dev`` /
-    ``ts_dev``: ``_read_rows``, a kernel's loads as the hi runtime's), are the host's bytes. Raises otherwise. (The rows are
-    ATOM's, read from the checkpoint at load; a checkpoint re-read here would page the tables' files back in beside
-    every rank's resident copy.)"""
+    """The install's check (``check``) of Engram layer ``layer``'s host shard: ``n`` sampled rows of ATOM's host shard
+    (``tq`` codes / ``ts`` scales) and its first / last rows, read on the device through their device addresses
+    (``tq_dev`` / ``ts_dev``: ``_read_rows``, a kernel's loads as the hi runtime's), are the host's bytes. Raises
+    ``MonoUnsupported`` otherwise. (The rows are ATOM's, read from the checkpoint at load; a checkpoint re-read here
+    would page the tables' files back in beside every rank's resident copy.)"""
     t0 = time.time()
     rows = tq.shape[0]
     g = torch.Generator(device="cpu").manual_seed(0x5EED + layer)
@@ -1051,8 +1114,8 @@ def _check_host_shard(
         got = torch.stack([host[r].to("cpu", copy=True) for r in idx])
         back = _read_rows(dev, host.shape[1], idx).to("cpu")
         if not torch.equal(got, back):
-            raise RuntimeError(f"Engram layer {layer} {name}: the device read of ATOM's host shard differs from the "
-                               f"host's bytes on rows {idx[:4]}..")  # fmt: skip
+            raise MonoUnsupported(f"Engram layer {layer} {name}: the device read of ATOM's host shard differs from the "
+                                  f"host's bytes on rows {idx[:4]}..")  # fmt: skip
     logger.info("V4.1 mono hi: Engram layer %d host shard read on the device == host (%d rows, %.1f s)", layer,
                 len(idx), time.time() - t0)  # fmt: skip
 
@@ -1076,11 +1139,12 @@ def _read_rows(addr: int, width: int, idx) -> torch.Tensor:
 
 
 def engram_consts(mapping) -> dict:
-    """the hi runtime's Engram hash constants (``engram_io.load_consts``' dict: the token map, each layer's multipliers /
-    primes / offsets, the pad id, the layer ids, the table rows) from ATOM's own ``NgramHashMapping`` (``mapping``:
-    the Engram runtime's, its tokenizer compression, multipliers and head primes, the primes' sums checked against
-    the checkpoint's row counts when it was built), so the served path reads no file. The primes are n-gram major
-    ([orders, heads]: ``pack_hash``'s column order, ATOM's head order)."""
+    """the hi runtime's Engram hash constants (the dict ``engram_io.hash_words`` / ``pack_kv`` read: the token map, each
+    layer's multipliers / primes / offsets, the pad id, the layer ids, the table rows) from ATOM's own
+    ``NgramHashMapping`` (``mapping``: the Engram runtime's, its tokenizer compression, multipliers and head primes,
+    the primes' sums checked against the checkpoint's row counts when it was built), so the served path reads no file.
+    The primes are n-gram major ([orders, heads]: ``pack_hash``'s column order, ATOM's head order).
+    """
     cfg = mapping.config
     layers = [int(x) for x in cfg.layer_ids]
 

@@ -108,9 +108,8 @@ class PeerGroup:
 
     def bind(self, program) -> None:
         """Record ``program``'s peer layout (``MonoKernel.table``). Programs of different layouts on one group need
-        ``Program.peer_shared`` (``plan.program``: a later launch's early put could land on a slot a slower
-        peer still polls); a group holding unshared programs of two layouts warns once (``plan.peer_alias`` names
-        the overlapping slots of a launch order)."""
+        ``Program.peer_shared`` (``plan.program``: a later launch's early put could land on a slot a slower peer
+        still polls); a group holding unshared programs of two layouts warns once."""
         pairs = {r.name: r.pairs for r in program.regions}
         layout = (
             bool(program.peer_shared),
@@ -123,7 +122,7 @@ class PeerGroup:
             warnings.warn(f"dsv41hi PeerGroup: programs of {len(self.layouts)} peer layouts on one group, "
                           f"{len(unshared)} of them not shared ({', '.join(unshared[:4])}): a launch's early put may "
                           "land on a slot the previous launch still polls on a slower rank (Program.peer_shared, "
-                          "plan.program.share_peer_groups; plan.peer_alias)", stacklevel=3)  # fmt: skip
+                          "plan.program.share_peer_groups)", stacklevel=3)  # fmt: skip
 
     def end_step(self) -> None:
         """A step's last launch on the group is issued (module docstring, "The step phase"): after an odd number of

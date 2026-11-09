@@ -15,7 +15,6 @@ import torch
 import triton
 
 from atom.models.deepseek_v41.mono import hi_bridge as ml
-from atom.mono.runtime.consensus import MonoUnsupported
 from atom.models.deepseek_v41.mono import hi_weights as hw
 from atom.models.deepseek_v41.mono.hi_compose import _DraftLaunch
 from atom.models.deepseek_v41.mono.hi_gate import log_once
@@ -30,11 +29,11 @@ CTX_LAUNCH = 42  # the DSpark context write's launch id (40: the head, 41: the E
 
 
 class _Arena:
-    """One scratch arena the programs of a step counter share (``Kernel`` ABI): every launch's tags are new and the
-    programs run one after another on one stream, so each sees only other launches' stale pairs, which carry other
-    tags (their cross-launch hand-offs are peer regions). Sized for the largest program, uncached, 2 MiB aligned,
-    its dual-copy word calibrated once (a run's copy depends on the arena's page only). Two arenas: the target's
-    (layers, heads, the Engram kv launch, CTX: the step counter ``step``) and the draft's (its own counter).
+    """One scratch arena the programs of a step counter share (``emit.kernel``'s kernel ABI): every launch's tags are
+    new and the programs run one after another on one stream, so each sees only other launches' stale pairs, which
+    carry other tags (their cross-launch hand-offs are peer regions). Sized for the largest program, uncached, 2 MiB
+    aligned, its dual-copy word calibrated once (a run's copy depends on the arena's page only). Two arenas: the
+    target's (layers, heads, the Engram kv launch, CTX: the step counter ``step``) and the draft's (its own counter).
     """
 
     def __init__(self, name: str, kerns, dev) -> None:
@@ -62,7 +61,7 @@ class _Arena:
 
 def _buffers(kerns: dict, arena: _Arena, dev, step) -> dict:
     """``kerns``' buffers (key -> ``Buffers`` on the step counter ``step``): the arena's scratch, each program its own
-    private buffer (``Kernel`` ABI ``priv``: the dual-copy word, the atomics' regions).
+    private buffer (the kernel ABI's ``priv``: the dual-copy word, the atomics' regions).
     """
     from .hi.runtime.kernel import Buffers
 
@@ -116,23 +115,10 @@ class HiDraft:
         return sum(t.numel() * t.element_size() for t in self.cx_w.values())
 
     def bind_draft(self, drafter) -> None:
-        """The DSpark proposer (``install_mono_decode``): the draft's context layers (their window rings), and the
-        norms' eps checked against the hi runtime's."""
+        """The DSpark proposer (``install_mono_decode``): the draft's context layers (their window rings; their count
+        and the norms' eps checked at install, ``hi_runner.check``)."""
         self.cx_drafter = drafter
-        draft = drafter.model
-        layers = tuple(draft.context_layers)
-        if len(layers) != self.D.STAGES:
-            raise MonoUnsupported(
-                f"V4.1 mono hi draft: {len(layers)} draft stages, the hi runtime's CTX has {self.D.STAGES}"
-            )
-        self.cx_layers = [int(a.spec.layer_id) for a in layers]
-        eps = {float(a.kv_norm.eps) for a in layers} | {
-            float(draft.mtp[0].main_norm.eps)
-        }
-        if eps != {float(self.D.EPS)}:
-            raise MonoUnsupported(
-                f"V4.1 mono hi draft: the draft's norm eps {eps} != the hi runtime's {self.D.EPS}"
-            )
+        self.cx_layers = [int(a.spec.layer_id) for a in drafter.model.context_layers]
 
     def _ctx_taps(self) -> list | None:
         """ATOM's aux buffers of the tapped layers (the draft's ``dspark_target_layer_ids`` order; bound from the

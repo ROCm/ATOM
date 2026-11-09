@@ -187,7 +187,7 @@ def _put(a: Addr, words, i, scale):
 
 def _put_masked(a: Addr, words, w, ok):
     """A dead row's put dropped by its address (out of the buffer's range), not by a branch: a value from a cross-lane
-    reduction must not feed a store inside a lane-conditional branch (CLAUDE.md, the Indexer finding). The store goes
+    reduction must not feed a store inside a lane-conditional branch. The store goes
     through a resource bounded by the region (``Addr.nbytes``: the regions' own resources are unbounded, so an
     out-of-range offset there would land 2 GiB on)."""
     data = (

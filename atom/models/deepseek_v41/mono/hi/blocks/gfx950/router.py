@@ -38,7 +38,7 @@ maxima, the candidates above it ranked by a count; the same winners, ties to the
 With ``tp_cols`` "thresh" also moves the score function to the gather's landing threads (each its expert's s and
 biased bits, the 8 waves) instead of wave 0's n / 64 a lane: the same operations on the same values.
 
-**In a consumer** (``route_lds``; ``MoEExperts(route_from=)``, softmax_topk with the dot's slice partials): the
+**In a consumer** (``MoEExperts(route_from=)``, softmax_topk with the dot's slice partials): the
 consumer's CTA computes every row's picks itself from the partials, the route stage's arithmetic on the same values
 (the same bits), into its LDS; the route stage still runs (its channels for other readers), off the consumer's path.
 
@@ -106,13 +106,13 @@ class _Plan:
         False  # tp_cols gather, topk "thresh": s and the biased bits computed at landing, read from LDS
     )
     consumer: bool = (
-        False  # the route in the consumer's rt, a wave a row (``route_lds_rows``)
+        False  # the route in the consumer's rt (``MoEExperts(route_from=)``), a wave a row
     )
     hoist: bool = (
-        False  # tp_cols gather: the peer bases before the remote puts (``_tp_sum_put``)
+        False  # tp_cols gather: the peer bases before the remote puts (``MoERouter(tp_hoist=)``)
     )
     split_land: bool = (
-        False  # tp_cols gather: the landing by the waves that did not put (``_tp_gather``)
+        False  # tp_cols gather: the landing by the waves that did not put
     )
 
 
@@ -147,10 +147,10 @@ class MoERouter(Block):
         self.name, self.n, self.k, self.scores_by = name, n, k, scores
         self.scores = Channel(f"{name}.scores", n, Fmt.F32)
         self.tp_cols = tp_cols
-        # tp_cols, sigmoid: each rank's top-k of its experts, then a top-k of the tp x k candidates (``_tp_local``)
+        # tp_cols, sigmoid: each rank's top-k of its experts, then a top-k of the tp x k candidates
         self.tp_local = tp_local
         # tp_cols: the scores' puts by their own stage, a task a (row, destination rank): a CTA's remote puts no longer
-        # go out one destination after another; the route stage then only gathers (``_tp_push``)
+        # go out one destination after another; the route stage then only gathers
         self.tp_push = tp_push
         # the top-k (module docstring): "heads" (sorted heads / scanning rounds) or "thresh" (a bound + a rank count)
         if topk not in ("heads", "thresh") or (
@@ -160,10 +160,10 @@ class MoERouter(Block):
                 f"MoERouter {name}: topk 'heads' or 'thresh' (not softmax_topk / tp_local): {topk!r}"
             )
         self.topk = topk
-        # the route computed by its consumer (``MoEExperts(route_from=)``, ``route_lds_rows``): the dot's stages only
+        # the route computed by its consumer (``MoEExperts(route_from=)``): the dot's stages only
         # (every rank all n experts at TP; no route stage, idx / weights unwritten)
         self.consumer = consumer
-        self.tp_hoist = tp_hoist  # tp_cols gather: the peer bases loaded before the remote puts (``_tp_sum_put``)
+        self.tp_hoist = tp_hoist  # tp_cols gather: the peer bases loaded before the remote puts (``_Plan.hoist``)
         self.tp_split_land = (
             tp_split_land  # tp_cols gather: the landing by the waves that did not put
         )
@@ -190,7 +190,7 @@ class MoERouter(Block):
         self.route_scale, self.score_func = route_scale, score_func
 
     def route_plan(self, sc: Scenario) -> _Plan:
-        """The route's plan for ``sc`` (the route stage's, and ``route_lds``' in a consumer)."""
+        """The route's plan for ``sc`` (the route stage's, and a consumer's)."""
         part = self.dot.part.name if self.dot is not None and self.dot.part else ""
         return _Plan(self.name, sc.rows, self.n, self.k, self.scores.name, self.bias, self.idx.name, self.weights.name,
                      self.route_scale, self.score_func, part, self.dot.kslices if self.dot is not None else 0,
@@ -400,7 +400,7 @@ def _route_slots(k, p, won, s, pos):
 
 @traced
 def _route_put_lanes(k, p, row, live, tot):
-    """Lane j < k: slot j's id and weight (``_route_out``'s values, put by k lanes at once)."""
+    """Lane j < k: slot j's id and weight (put by k lanes at once)."""
     if live & (k.lane < p.k):
         at = _slots_at(p)
         e = fx.min(k.lane, fx.Int32(p.k - 1))

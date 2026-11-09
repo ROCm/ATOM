@@ -303,8 +303,8 @@ class TopK(Block):
                              "xhoist")  # fmt: skip
         self.groups = groups
         # ``wmerge`` (split): the merge's split x k answers (at most a wave's 64) ranked by one wave
-        # (``device.topk.wave_topk_won_thresh``: a bound and a rank count) instead of the CTA's radix select (~3 µs
-        # of passes and barriers whatever the count): the same winners, put in index order
+        # (``device.gfx950.topk.wave_topk_won_thresh``: a bound and a rank count) instead of the CTA's radix select
+        # (~3 µs of passes and barriers whatever the count): the same winners, put in index order
         if wmerge and (not self.split or self.split * k > 64):
             raise ValueError(
                 f"TopK {name}: wmerge needs split with split x k <= 64 (split {self.split}, k {k})"

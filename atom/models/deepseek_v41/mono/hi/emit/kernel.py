@@ -22,14 +22,14 @@ peer regions' ``k.mb`` entries in this rank's peer buffer (``device.gfx950.peer`
 (``Program.peer_shared``) also ``PEER_TOP_ARG``, its group's peer buffer bytes (``k.peer_top``), and its group's
 step phase (``k.peer_phase``: the peer table's entry ``tp``, ``PeerGroup.end_step``).
 
-The body walks the stages in order. Each stage gets a fresh ``StageCtx``: wave
+The body walks the stages in order. Each stage gets a fresh context (``_stage_ctx``): wave
 index, pointer-table loads and region addresses recomputed behind opaque moves,
 so LLVM cannot hold one stage's values in registers across later stages (the
 spills / scratch that would break residency).
 
 Target: the program's (``Program.target``). The device helpers the emitter calls (opaque moves,
 the step load, table loads, the mailbox's ``Addr`` and debug hooks, the kernel symbol)
-come from the target's device package (``device.package``), the launch grid and CTA
+come from the device package (``device.gfx950``: ``ops``, ``mailbox``), the launch grid and CTA
 count from ``target.grid``.
 """
 
@@ -93,7 +93,7 @@ def source_digest() -> str:
     """Hash of every hi source file: part of each build key, because FlyDSL
     does not key helper sources reached only through dynamic control flow. Hashed again only when a
     file's mtime or size moved (a walk and a stat a file: ~2 ms, where the pathlib walk and the reads took
-    ~32 ms a call, 14 of a snapshot's 17 s of composing; the same digest: ``tests/cpu/test_source_digest.py``).
+    ~32 ms a call, 14 of a snapshot's 17 s of composing; the same digest).
     """
     files = _source_files()
     sig = tuple(

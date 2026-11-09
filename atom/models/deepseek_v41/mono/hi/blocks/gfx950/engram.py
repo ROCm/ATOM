@@ -420,7 +420,7 @@ def kv_share_word(w, tp: int):
 
 def _store_full(k, t, p: _Plan):
     """Mode "kv", TP > 1: row t's full kv (every rank's share, from its slot) -> the plain arg in the natural
-    column order [4 keys, value] x 5120 (``kv_nat_word``). ``store_chunks`` > 1: task t = (row, chunk), the chunk's
+    column order [4 keys, value] x 5120 (``kv_share_word``). ``store_chunks`` > 1: task t = (row, chunk), the chunk's
     1 / n of the share's words."""
     words = p.n // 2  # a rank's share
     cw = -(-words // p.store_chunks)

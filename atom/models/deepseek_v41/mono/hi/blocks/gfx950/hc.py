@@ -295,7 +295,7 @@ def _write(k, w, hidden, row, col, y, got, res):
 
 @dataclass(frozen=True)
 class HCNames:
-    """``QuantizedLayer.retained`` names of one HC's weights: the norm gamma [width], the
+    """``layer.retained`` names of one HC's weights: the norm gamma [width], the
     low-rank down [lowrank, width], up [width, lowrank] and injection [streams, width].
     """
 

@@ -696,7 +696,7 @@ class NormQuant(Block):
 
     ``src``: a plain bf16 [rows, width] arg name (e.g. the layer input ``h_in``) or
     a BF16 ``Channel`` (e.g. the post-attention residual). ``gamma``: the bf16
-    [width] arg name; ``weight``: its ``QuantizedLayer.retained`` name (``pack``).
+    [width] arg name; ``weight``: its ``layer.retained`` name (``pack``).
     ``norm``: the geometry (width, eps), unless ``spec`` gives it.
     ``strategy``: "stage" (own stage, ``rows * spec.split`` tasks) or "prologue"
     (no stage: a consumer calls ``norm_quant`` itself; ``spec`` is its contract).

@@ -2,12 +2,12 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Build-key values that stay put when a parameter class grows a defaulted field.
 
-``Program.key()`` is the compile cache's key, the kernel symbol's digest and the snapshots' ``key_sha256``. A stage's
+``Program.key()`` is the compile cache's key and the kernel symbol's digest. A stage's
 ``key`` holds the Python constants its ``emit`` closes over: mostly a block's parameter dataclass. Keyed by ``repr``
 or ``astuple`` of all its fields, a new field with a default (the old behaviour) flipped every program's key with the
 ISA unchanged. :func:`stable` keys a dataclass by its class name and the fields whose value differs from the field's
 default, so a defaulted field is keyed only where a program sets it. ``KEY_VERSION`` ends every key: bump it when the
-key's form changes (a one-time flip, announced, snapshots re-keyed).
+key's form changes (a one-time flip, announced).
 """
 
 from __future__ import annotations

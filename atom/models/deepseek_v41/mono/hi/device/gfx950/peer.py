@@ -28,7 +28,7 @@ def _slot_bytes(k, region: str, src, tag=None) -> object:
     parity = fx.Int32(k.tag if tag is None else tag) & 1
     if (
         k.program.peer_shared
-    ):  # parity 1: the region's tp slots at top - offset - tp slots (``plan.peer_slot``)
+    ):  # parity 1: the region's tp slots at top - offset - tp slots
         # (the group's step phase on top of the tag: a step of an odd number of launches flips it, so the next
         # step's first launch has the other parity than this one's last: ``PeerGroup.end_step``)
         parity = (fx.Int32(k.tag if tag is None else tag) + k.peer_phase) & 1
@@ -155,7 +155,7 @@ def push_rs(
     wave's span, not a multiple of it: e.g. 640 at 8 ranks against a 256-column wave): the lanes of the first active
     lane's owner put there, the rest to the next owner (two wave-uniform addresses, predicated stores).
     ``fmt`` "f32p" / "f32q": the owner's slot in a packed layout (``_push_p``: 6 B a value instead of 8, lane-local,
-    with ``two_owners`` too; ``_push_q``: 5.5 B, lanes 4m .. 4m + 3 one 16-element group in order, every lane of a
+    with ``two_owners`` too; "f32q": 5.5 B, lanes 4m .. 4m + 3 one 16-element group in order, every lane of a
     group pushing, width / tp a multiple of 16, one owner a wave); the owner sums with ``sum_partials(fmt=)``, the same
     bits."""
     from . import mailbox as mb

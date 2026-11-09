@@ -169,8 +169,9 @@ def install_mono_decode(
     # The decoder layers on the high-interactivity monokernels where they serve
     # this deployment (``hi_gate``: ATOM_DSV41_MONO_HI, "auto" by default); any
     # other takes ATOM's mono decode below, unchanged.
-    # A mismatch only the loaded model shows (``MonoUnsupported``) falls back
-    # as the gate's refusals do.
+    # A mismatch only the loaded model shows (``MonoUnsupported``, agreed over
+    # the TP group before anything is built: ``install_hi``) falls back as the
+    # gate's refusals do, on every rank.
     if hi_gate.decide(atom_config, drafter, metadata_builder, dp_ranks):
         from atom.models.deepseek_v41.mono.hi_dispatch import install_hi
 

@@ -6,13 +6,14 @@ The ``k`` largest of ``n`` keys, ties to the lower index, output in rank order. 
 sampling, no approximation; the order is total, so the result is unique.
 
 **Keys.** A key is a 32-bit *order key* ``u``, compared unsigned, larger first. Floats
-become order keys with :func:`fold_f32`; the policy (torch's ``sort`` / ``topk``):
+become order keys with :func:`order_key` (aiter's rule, below):
 
-- NaN is larger than every number, all NaNs equal (canonical ``0xFFFFFFFF``);
-- ``-0.0`` equals ``+0.0``;
+- NaNs by their bits: positive ones above ``+inf``, negative ones below ``-inf``;
+- ``-0.0`` below ``+0.0``;
 - ``-inf`` is an ordinary value, below every finite one;
-- ``u = 0`` means **no key** (padding): never selected. No float folds to it (``-inf``
-  folds to ``0x007FFFFF``), so integer keys must avoid it too.
+- ``u = 0`` means **no key** (padding): never selected, unless :func:`select` takes
+  ``valid``. The float bits ``0xFFFFFFFF`` (a NaN) map to it, so float keys take ``valid``
+  (every u32 a key); integer keys without ``valid`` must avoid it.
 
 The order is ``(u desc, index asc)``: equal keys go to the lower index. Internally a key is
 the unique 64-bit ``(u, v)``, ``v = 2^B - 1 - index`` (``B = index_bits`` rounded up to a
@@ -49,18 +50,17 @@ selects the best ``k`` of its indices and publishes its slots as candidates ``(u
 index)`` (``u`` 0 past its ``n_out``); a final task polls every chunk's ``k`` candidates
 and runs :func:`select` + :func:`rank` on them. The best ``k`` of all keys are among their
 chunk's best ``k`` (the order is total), so the result is exact. The Indexer block
-(``blocks.gfx950.attention.indexer``) is the worked example; ``tests/gpu/test_topk.py``
-has a minimal one.
+(``blocks.gfx950.attention.dsa_indexer``) is the worked example.
 
 **Other uses.**
 
 - MoE routing (top 10 of 512 logits): one CTA, ``E = 1`` (thread ``t`` holds expert
   ``t``), ``k = 10``, ``index_bits = 9``; :func:`rank` then sorts 16 keys in wave 0.
-  :func:`unfold_f32` gives the selected logits back (bit-exact, ``-0.0`` as ``+0.0``).
+  :func:`key_bits` gives the selected logits' fp32 bits back (bit-exact).
 - Sampling (top-k / top-p over a vocabulary of ~150 K): two levels, chunk tasks over
   vocabulary slices, then softmax over the final ``k`` in rank order.
 
-**aiter's rule** (V4.1: ``blocks.topk.TopK``, a merge tree of
+**aiter's rule** (V4.1: ``blocks.gfx950.topk.TopK``, a merge tree of
 lists ascending by index; one implementation since the top-k fold):
 
 - keys by :func:`order_key` (``-0.0`` below ``+0.0``, NaNs by their bits): every u32 is a

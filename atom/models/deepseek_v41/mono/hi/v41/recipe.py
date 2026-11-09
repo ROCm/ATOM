@@ -30,8 +30,7 @@ kernel, then the FFN kernel). Stages, in order (channels between them):
                   or in a chain its partials pushed for the next layer's seam A
 
 The layer's last fold (hc_post of the MoE output into the streams) is the next layer's seam-A fold, so a layer hands
-over (R_F, the MoE output, the FFN seam's gate) as plain memory; ``final_fold_blocks`` is that fold alone (the layer
-eval's h_out).
+over (R_F, the MoE output, the FFN seam's gate) as plain memory.
 
 Args a layer reads: ``h_in`` [rows, 4, 5120] bf16 (the streams R before seam A), ``gin`` [rows, 24] f32 (the
 previous FFN seam's gate; layer 0: the one-hot pre), ``pos`` [batch] int32, ``ring`` [batch, ring_slots, 512] bf16,
@@ -268,8 +267,8 @@ def residual_layout(
 ) -> str:
     """``RESIDUAL`` resolved for a layer: "sharded" (TP, one kernel: R column-owned, ``HCSeam(residual="sharded")``)
     or "replicated"; "auto": sharded from ``R_SHARD_ROWS`` to ``R_SHARD_MAX_ROWS`` rows (``rows`` None:
-    replicated). A sharded layer's R args (``h_in``, ``r_a``, ``r_f``) hold the rank's columns: [rows, 4, hidden / tp]
-    (``shard_cols``)."""
+    replicated). A sharded layer's R args (``h_in``, ``r_a``, ``r_f``) hold the rank's columns:
+    [rows, 4, hidden / tp]."""
     kn = knobs or schedules.current()
     v = kn["RESIDUAL"]
     if (
@@ -436,7 +435,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     k, for the DSpark draft stages (128 / 3, ``dspark_n_routed_experts`` / ``dspark_num_experts_per_tok``).
 
     **A sharded residual** (``RESIDUAL`` "sharded", TP, one kernel): R is column-owned, so the R args a launch
-    reads and writes (``h_in``, ``r_a``, ``r_f``) are the rank's columns [rows, 4, hidden / tp] (``shard_cols``),
+    reads and writes (``h_in``, ``r_a``, ``r_f``) are the rank's columns [rows, 4, hidden / tp],
     except what leaves a chain whole: a chain's tail writes ``r_f`` whole (gathered), and ``full_r_a`` (the DSpark aux
     taps' layers) ``r_a``, and what enters it: a chain's first layer reads the whole ``h_in`` (the engine's). The Engram
     layers gather R for the Engram's gate (it needs every column).

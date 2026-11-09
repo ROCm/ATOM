@@ -73,6 +73,9 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         ),
         drafter=object(),
         forward_done_event=mock.Mock(),
+        # a model without its own verify head or decode round (ModelRunner's defaults)
+        verify_token_ids=None,
+        decode_round=None,
     )
     runner._constrain_required_channel = MethodType(
         runner_module.ModelRunner._constrain_required_channel, runner

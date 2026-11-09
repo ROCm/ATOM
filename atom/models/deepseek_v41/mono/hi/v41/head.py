@@ -128,8 +128,9 @@ def head_blocks(tp: int = 1, chain: bool = False, key: str | None = None, layout
         )
     from .layer import residual_layout
 
-    # a sharded residual (``layer.RESIDUAL``): a chained / fused head's fold runs on the rank's columns (R_F's, the
-    # MoE output's), its LIN gathered for the norm; the plain head reads the chain tail's whole R_F as before
+    # a sharded residual (``RESIDUAL``, ``residual_layout``): a chained / fused head's fold runs on the rank's columns
+    # (R_F's, the MoE output's), its LIN gathered for the norm; the plain head reads the chain tail's whole R_F as
+    # before
     shard = src != "plain" and residual_layout(tp, knobs=knobs, rows=rows) == "sharded"
     rsd = {"residual": "sharded"} if shard else {}
     from .layer import chain_pend

@@ -24,7 +24,7 @@ runtime's 128-slot ring from it (its own 128-slot layout would lose the accepted
 rows' keys under a rejection). Selections (``sel_out``) and layer 20's candidate bitmap are written and read
 within the step by hi layers only.
 
-The mHC hand-off (``atom_to_mf`` / ``gates_planar``): the hi runtime's layer reads
+The mHC hand-off (``_planar``): the hi runtime's layer reads
 and writes (R [rows, 4, 5120] bf16, gate [rows, 24] = pre 4 | post 4 |
 comb[i_in][o_out] 16, the pending MoE output [rows, 5120]); ATOM's
 ``SinglePassHCState`` holds the same with the gates planar.
@@ -371,7 +371,7 @@ def _draft_begin_kernel(anchor, noise, h_in, anchor_positions, pos, step, hidden
 
 # ---------------------------------------------------------------- the bridge in two launches a step
 #
-# ``begin_step_kernel`` / ``end_step_kernel``: one launch each for what would be 6 / 8 separate launches (every small
+# ``_begin_step_kernel`` / ``_end_step_kernel``: one launch each for what would be 6 / 8 separate launches (every small
 # launch costs ~4.5-5 us in a replayed graph, launch-bound). A 1-D grid split into segments, each running one of the
 # bodies above (the CPU tests run each body alone as a reference). The segments touch disjoint data (the ring import and
 # request words / the embedding expand; the ring export / taps / gates), so their order inside the launch is free.

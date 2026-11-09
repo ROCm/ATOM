@@ -24,9 +24,9 @@ that step (``PostVerify.committed``, at the builder's hook). On any other step t
 write it never asked for is overwritten. The ids that feed the next step are not staged here: the runner broadcasts
 the output ids over TP and gathers each request's next id from them, and the DSpark proposer stages its anchors from
 those, as on ATOM's logits path. The outputs are a width's fixed addresses, read after the step by the runner's
-side-stream copies (the sampled ids, the verdict counts) with no reverse wait, as ``send_to_cpu_async_draft`` reads
-the draft graph's: the replay that rewrites them is the next target forward's end, a draft pass and a whole forward
-later on the default stream.
+side-stream copies (the sampled ids, the verdict counts) with no reverse wait, as ``send_draft_token_ids_to_cpu``
+reads the draft graph's: the replay that rewrites them is the next target forward's end, a draft pass and a whole
+forward later on the default stream.
 """
 
 from __future__ import annotations

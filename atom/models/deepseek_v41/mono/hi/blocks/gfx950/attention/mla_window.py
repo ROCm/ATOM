@@ -17,7 +17,7 @@ chunks of 64 keys in order, a running max (initially -1e30), p = exp(s - max) wi
 numerator rescaled and accumulated with bf16(p), the denominator with fp32 p, and the attention sink added at the
 end (den + exp(sink - max)); o = bf16(num / den). Then the inverse RoPE on o's last 64 dims and the QAT before
 ``wo_a`` (MXFP8 group 32): the output is an MXFP8 channel of width 64 x 512. Scores and P V on the bf16 MFMA
-(``BlockAttn``'s layouts, D = 512): q . k sums in another order than torch's, nothing else.
+(D = 512): q . k sums in another order than torch's, nothing else.
 
 ``RingWrite``: after every attention task of the request has read the ring, the step rows' keys go into it
 (slot = position % 128). A row of a multi-row step sees the old contents of the slots its later rows overwrite,
@@ -282,7 +282,7 @@ class _APlan:
         return self.a_ml + 4 * TILE
 
     @property
-    def a_o(self):  # o f32 [TILE][OPITCH] after the P V, over the keys (``_o_word``)
+    def a_o(self):  # o f32 [TILE][OPITCH] after the P V, over the keys (``o_word``)
         return self.a_k
 
     def o_word(self, hh, dim):

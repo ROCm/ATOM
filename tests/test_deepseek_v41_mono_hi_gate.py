@@ -7,6 +7,9 @@ configuration, the environment and the device properties only: no hi module is i
 The configuration is ATOM's own ``Config`` of the served command line (serve_v41.sh's arguments, the InferenceX
 recipe at TP4), built the way ``LLMEngine`` builds it, so the gate sees every value ATOM settles on (its overrides
 included: V4.1's 128-token KV page whatever ``--block-size`` asks); each refusal case changes one of those fields.
+
+What only the loaded model shows is refused at install (``hi_dispatch.install_hi``): every rank's check agreed over
+the TP group before anything is built, so one rank refusing turns the hi path off on every rank.
 """
 
 import argparse
@@ -364,3 +367,197 @@ def test_a_deployments_line_is_logged_once(monkeypatch, caplog, rank, logged):
     assert [r.getMessage() for r in caplog.records] == (
         ["V4.1 mono hi off: why", "V4.1 mono hi off: other"] if logged else []
     )
+
+
+# ---- the install's refusals, agreed over the TP group (``hi_dispatch.install_hi``)
+
+
+@pytest.fixture
+def hi_dispatch_module(monkeypatch):
+    """``mono.hi_dispatch`` (Triton stood in for where AITER is missing) with ATOM's own mono runners stood in for:
+    loaded fresh, dropped after; this process is TP rank 1 of 4 (``_tp``)."""
+    import types
+
+    from aiter_stub import _drop
+
+    names = [f"atom.models.deepseek_v41.mono.{m}" for m in ("hi_dispatch", "dispatch")]
+    saved = {name: sys.modules.get(name) for name in names}
+    for mod, cls in (
+        ("runner", "V41MonoDecodeRunner"),
+        ("draft_runner", "DraftMonoRunner"),
+    ):
+        stub = types.ModuleType(f"atom.models.deepseek_v41.mono.{mod}")
+        setattr(stub, cls, object)
+        monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    for name in names:
+        _drop(name)
+    try:
+        with atom_without_aiter() as load:
+            module = load(names[0])
+            monkeypatch.setattr(module, "_tp", lambda: ("tp cpu group", 4, 1))
+            yield module
+    finally:
+        for name in names:
+            _drop(name)
+            if saved[name] is not None:
+                sys.modules[name] = saved[name]
+
+
+def _install_world(hi_dispatch, monkeypatch, *, local=None, others=(None, None, None)):
+    """``install_hi``'s collaborators recorded in ``log``: this rank's check (raising ``local`` when given), the
+    agreement's gather (the other ranks' reports ``others``: 0, 2, 3) and every build step.
+    """
+    import torch.distributed as dist
+
+    log = []
+
+    def check(model, atom_config, engram, draft, tp, rank):
+        log.append(("check", tp, rank))
+        if local is not None:
+            raise local
+
+    def gather(reports, report, group=None):
+        log.append(("agree", report, group))
+        reports[:] = [others[0], report, *others[1:]]
+
+    def built(name):
+        def step(*a, **k):
+            log.append(name)
+            return SimpleNamespace(
+                eng={}, bind_draft=lambda d: log.append("bind_draft")
+            )
+
+        return step
+
+    monkeypatch.setattr(hi_dispatch.hi_runner, "check", check)
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    monkeypatch.setattr(hi_dispatch.embed_full, "install", built("embed"))
+    monkeypatch.setattr(hi_dispatch.hi_runner, "install", built("hi layers"))
+    monkeypatch.setattr(hi_dispatch.hi_round, "install", built("round"))
+    monkeypatch.setattr(hi_dispatch, "HiDraftModel", built("draft model"))
+    monkeypatch.setattr(hi_dispatch, "HiDecodeModel", built("decode model"))
+    draft = SimpleNamespace(block_backbone=None)
+    drafter = SimpleNamespace(model=draft)
+    builder = SimpleNamespace(
+        engram=SimpleNamespace(mapping=None, host=None), model_runner=None
+    )
+    cfg = SimpleNamespace(max_model_len=4096, index_cache_dtype="fp4")
+    return log, (object(), cfg, drafter, builder, 0), draft
+
+
+@pytest.mark.parametrize(
+    "local, others, why",
+    [
+        # this rank's own expert shard (a rank-local data check)
+        (
+            "padding",
+            (None, None, None),
+            "refused at install: rank 1: MonoUnsupported: V4.1 mono hi weights: a routed expert's padding scale code "
+            "is 255 (E8M0 NaN)",
+        ),
+        # another rank's; this one passed
+        (
+            None,
+            (None, "MonoUnsupported: embedding", None),
+            "refused at install: rank 2: MonoUnsupported: embedding",
+        ),
+        # any failure of the check is a refusal every rank takes (alone, it would leave the others waiting)
+        (
+            "oom",
+            (None, None, None),
+            "refused at install: rank 1: RuntimeError: out of memory",
+        ),
+    ],
+)
+def test_one_rank_refusing_at_install_refuses_on_every_rank_before_anything_is_built(
+    hi_dispatch_module, monkeypatch, local, others, why
+):
+    """``install_hi``: this rank's check, then every rank's verdict agreed (one gather, this rank's report in it),
+    then the build. One rank refusing raises ``MonoUnsupported`` on every rank, naming it, before the first
+    collective of the build and before anything is built or allocated (the embedding stays where ATOM put it, no
+    peer group, no packed weight); the draft model is left as it was."""
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    error = {
+        "padding": MonoUnsupported(
+            "V4.1 mono hi weights: a routed expert's padding scale code is 255 (E8M0 NaN)"
+        ),
+        "oom": RuntimeError("out of memory"),
+        None: None,
+    }[local]
+    log, args, draft = _install_world(
+        hi_dispatch_module, monkeypatch, local=error, others=others
+    )
+    with pytest.raises(MonoUnsupported) as raised:
+        hi_dispatch_module.install_hi(*args)
+    assert str(raised.value) == why
+    report = None if error is None else f"{type(error).__name__}: {error}"
+    assert log == [("check", 4, 1), ("agree", report, "tp cpu group")]
+    assert args[2].model is draft
+
+
+def test_every_rank_passing_builds_after_the_agreement(hi_dispatch_module, monkeypatch):
+    """Every rank's check passed: the build follows the agreement, the embedding's exchange (its read check, the
+    build's one agreed refusal) before anything else."""
+    log, args, _ = _install_world(hi_dispatch_module, monkeypatch)
+    hi_dispatch_module.install_hi(*args)
+    assert log == [("check", 4, 1), ("agree", None, "tp cpu group"), "embed", "hi layers", "draft model",
+                   "bind_draft", "round", "decode model"]  # fmt: skip
+
+
+def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
+    mi355x, served, monkeypatch, caplog, hi_dispatch_module
+):
+    """Through ``install_mono_decode`` under "auto": a refusal agreed at install (here another rank's) leaves this
+    rank on ATOM's mono decode, as every other rank, with one line naming the rank and its reason.
+    """
+    dispatch = sys.modules["atom.models.deepseek_v41.mono.dispatch"]
+    _, args, draft = _install_world(
+        hi_dispatch_module, monkeypatch, others=("MonoUnsupported: shard", None, None)
+    )
+    monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
+    monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
+    monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
+    monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    monkeypatch.setattr(
+        dispatch, "MonoDraftModel", lambda m, dp: ("atom mono draft", m)
+    )
+    model, cfg, drafter, builder, _ = args
+    with caplog.at_level(logging.INFO, logger="atom"):
+        got = dispatch.install_mono_decode(
+            model, cfg, drafter, metadata_builder=builder
+        )
+    assert got == "atom mono"
+    assert drafter.model == ("atom mono draft", draft)
+    assert [r.getMessage() for r in caplog.records] == [
+        "V4.1 mono hi off: refused at install: rank 0: MonoUnsupported: shard"
+    ]
+
+
+def test_the_embeddings_own_check_is_a_refusal(hi_dispatch_module):
+    """``embed_full.check``: a model without exactly one sharded token embedding of a bf16 contiguous shard is
+    refused (``MonoUnsupported``, the install's agreed check), nothing moved."""
+    import torch
+    from torch import nn
+
+    from atom.model_ops.embed_head import VocabParallelEmbedding
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    def embedding(dtype):
+        emb = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
+        nn.Module.__init__(emb)
+        emb.weight = nn.Parameter(torch.zeros(4, 8, dtype=dtype), requires_grad=False)
+        return emb
+
+    check = hi_dispatch_module.embed_full.check
+    with pytest.raises(MonoUnsupported, match="0 sharded token embeddings"):
+        check(nn.Sequential(nn.Linear(2, 2)))
+    with pytest.raises(MonoUnsupported, match="2 sharded token embeddings"):
+        check(nn.Sequential(embedding(torch.bfloat16), embedding(torch.bfloat16)))
+    shard = embedding(torch.float32)
+    weight = shard.weight
+    with pytest.raises(MonoUnsupported, match="shard torch.float32"):
+        check(nn.Sequential(shard))
+    assert shard.weight is weight and shard.weight.dtype == torch.float32
+    ok = embedding(torch.bfloat16)
+    assert check(nn.Sequential(ok)) is ok

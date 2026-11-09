@@ -7,7 +7,7 @@ On a DSpark decode the host waits for the previous step's verdict (the rejected-
 builds the next step's metadata: the next verify starts where the verdict leaves the request (``starts = context_lens -
 (spec + 1) - rejected``). With lean host prep (``lean_host``) that is the only verdict-dependent input a served step still
 reads from the host. Everything else it reads is device-resident or the same every step for one request: the ids
-(``_fill_deferred_decode_ids`` from the previous sampled ids and the draft's), the slot, the batch ids, the query starts, the
+(``fill_deferred_decode_ids`` from the previous sampled ids and the draft's), the slot, the batch ids, the query starts, the
 block table (the scheduler allocates the whole draft span ahead), Engram's cursor (committed on the device).
 
 On a device-round step the next step's positions are advanced on the device instead: ``positions[i] = start + 1 + accepted + i``

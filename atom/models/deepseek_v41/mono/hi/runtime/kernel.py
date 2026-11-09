@@ -157,7 +157,7 @@ def _disassemble(elf: bytes, mcpu: str) -> str:
         return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
 
 
-_MEMO: list[dict] = []  # the active compile memos (``compile_memo``), innermost last
+_MEMO: list[dict] = []  # the active compile memos, innermost last
 
 
 class MonoKernel:
@@ -165,8 +165,8 @@ class MonoKernel:
     target (``Program.target``: LDS, grid, admission on a device of that arch).
 
     Construction raises ``ContractError`` (a hand-off could deadlock) or
-    ``ResourceError`` (scratch, spills, LDS, residency) before anything runs. Inside ``compile_memo`` a program
-    already built there returns a copy of that build.
+    ``ResourceError`` (scratch, spills, LDS, residency) before anything runs. Inside an active compile memo
+    (``_MEMO``) a program already built there returns a copy of that build.
     """
 
     def __new__(cls, program: Program | None = None):  # (None: copy.copy's call)
@@ -224,9 +224,9 @@ class MonoKernel:
                 word: int | None = None) -> Buffers:  # fmt: skip
         """Scratch (zeroed), the private buffer and the step counter for launches. ``scratch``: a zeroed uint8 tensor
         of at least ``program.scratch_bytes`` to use instead of a new allocation (a slice of an arena other programs
-        that never run at once share, ``Kernel`` ABI); the caller keeps it zero until the first launch. A dual-copy
-        program's must start a 2 MiB page, and ``word`` is its copy word (``runtime.dual.scratch_word`` of the
-        arena; None: calibrated here). ``uncached``: new allocations are uncached device memory
+        that never run at once share, ``emit.kernel``'s kernel ABI); the caller keeps it zero until the first launch.
+        A dual-copy program's must start a 2 MiB page, and ``word`` is its copy word (``runtime.dual.scratch_word``
+        of the arena; None: calibrated here). ``uncached``: new allocations are uncached device memory
         (``runtime.uncached``)."""
         p = self.program
         if scratch is not None:

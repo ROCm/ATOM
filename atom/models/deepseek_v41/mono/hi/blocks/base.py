@@ -7,7 +7,7 @@ mixer). It is plain Python on the plan side and produces ``Stage``s:
 
     class MyBlock(Block):
         def stages(self, sc: Scenario) -> list[Stage]: ...   # tasks, regions written, args, emit
-        def pack(self, layer) -> dict[str, torch.Tensor]: ...  # its pointer-table tensors from a QuantizedLayer
+        def pack(self, layer) -> dict[str, torch.Tensor]: ...  # its pointer-table tensors from the layer namespace
 
 Blocks talk to each other only through:
 
@@ -153,5 +153,6 @@ class Block:
         raise NotImplementedError
 
     def pack(self, layer) -> dict[str, torch.Tensor]:
-        """Device tensors this block's args need, from a ``QuantizedLayer``."""
+        """Device tensors this block's args need, from the layer namespace (``linears`` / ``retained``,
+        as ``v41.layer_impl.pack`` builds it)."""
         return {}

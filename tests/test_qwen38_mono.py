@@ -686,7 +686,7 @@ def fake_pin(monkeypatch):
 
     monkeypatch.setattr(_ple(), "pin_rows", pin_rows)
     # Copies in plain memory: the device would see them where the host does.
-    monkeypatch.setattr(_ple(), "device_address", lambda address: address)
+    monkeypatch.setattr(_ple(), "device_address", lambda address, **_: address)
     return state
 
 

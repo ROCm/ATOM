@@ -215,6 +215,10 @@ class TokenLocations(NamedTuple):
 
 
 class tokenIDProcessor:
+    # The model's decode round, the runner's (`ModelRunner.decode_round`),
+    # handed over at install; None for a model without one.
+    decode_round: model_hooks.DecodeRound | None = None
+
     def __init__(
         self,
         runner: "ModelRunner",
@@ -538,11 +542,11 @@ class tokenIDProcessor:
         GPU still works; only what follows (the attention metadata, through
         `num_rejected`) reads the status.
 
-        A model's decode round (`ModelRunner.decode_round`) sees the batch
-        first, and may hand the status over itself (`spec_status`: its own
-        wait comes later, `after_forward`).
+        A model's decode round (`decode_round`) sees the batch first, and may
+        hand the status over itself (`spec_status`: its own wait comes later,
+        `after_forward`).
         """
-        decode_round = self.runner.decode_round
+        decode_round = self.decode_round
         if decode_round is not None:
             decode_round.before_input_ids(batch, max_seqlen_q)
         bs = batch.total_seqs_num
@@ -727,7 +731,7 @@ class tokenIDProcessor:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
         # A model's decode round may fill them itself (fused with its own
         # pre-forward launches); else the fill kernel.
-        decode_round = self.runner.decode_round
+        decode_round = self.decode_round
         fill = None if decode_round is None else decode_round.decode_ids_filler()
         (fill_deferred_decode_ids if fill is None else fill)(
             self.input_ids.gpu,
@@ -1019,6 +1023,7 @@ class ModelRunner:
                 metadata_builder=self.attn_metadata_builder,
             )
         self.verify_head, self.decode_round = model_hooks.resolve(self.model)
+        self.tokenID_processor.decode_round = self.decode_round
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()

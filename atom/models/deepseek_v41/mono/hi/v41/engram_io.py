@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""DeepSeek-V4.1's Engram (layers 1 and 14) in the composed layer: the host inputs of ``layer.engram_kv_blocks``
+"""DeepSeek-V4.1's Engram (layers 1 and 14) in the composed layer: the host inputs of ``recipe.engram_kv_blocks``
 (the token-only half, an earlier launch) and of the gate half (``layer.window_layer_blocks(engram=True)``).
 
 - ``hash_words``: a layer's ``<name>.hash`` from ``NgramHashState``'s constants (``consts``: token map, multipliers,
@@ -38,7 +38,7 @@ def hist(
 
 def pack_kv(name: str, layer: int, w: dict, consts: dict | None, tp: int = 1, rank: int = 0,
             device="cuda") -> dict[str, torch.Tensor]:  # fmt: skip
-    """Block ``name``'s args (``layer.engram_kv_blocks``) for ``layer``: wkv's column share and the hash words from
+    """Block ``name``'s args (``recipe.engram_kv_blocks``) for ``layer``: wkv's column share and the hash words from
     ``w`` (``engram.wkv.{weight,scale}``) and ``consts`` (None: the hash words are unread, zeros), not the table
     shard (ATOM's host one)."""
     words = (

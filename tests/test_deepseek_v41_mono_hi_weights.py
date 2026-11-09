@@ -188,12 +188,14 @@ def test_expert_packs_are_the_checkpoints():
         assert torch.equal(
             ours[key + ".ws"][at[ok]], theirs[key + ".ws"][want[ok]]
         ), key
-    # a padding code 255 (E8M0 NaN) is refused: the kernels apply the padding's codes to its zero weights
+    # a padding code 255 (E8M0 NaN) is refused, before anything is packed (``check_experts``, the install's check):
+    # the kernels apply the padding's codes to its zero weights
+    hi_weights.check_experts(experts, inter, TP)
     experts.w13_weight_scale.view(torch.uint8).reshape(-1)[
         -1
     ] = 255  # (the last byte: the up half's last row: padding)
     with pytest.raises(hi_weights.MonoUnsupported, match="255"):
-        hi_weights.expert_packs(experts, inter, TP)
+        hi_weights.check_experts(experts, inter, TP)
 
 
 def test_a_layer_packed_from_atoms_tensors_is_the_checkpoints():
@@ -300,3 +302,19 @@ def test_a_layer_packed_from_atoms_tensors_is_the_checkpoints():
     bad = [k for k in sorted(theirs) if ours[k].dtype != theirs[k].dtype or not torch.equal(
         ours[k].contiguous().reshape(-1).view(torch.uint8), theirs[k].contiguous().reshape(-1).view(torch.uint8))]  # fmt: skip
     assert not bad, bad
+
+    # the install's check (``check_block``) refuses what ``block_tensors`` / ``expert_packs`` would, before anything
+    # is packed: each FP8 linear they read holding another dtype
+    hi_weights.check_block(block, INTER, TP)
+    lins = {"attn." + n: getattr(attn, n) for n in ("wqkv_a", "wq_b", "wo_a", "wo_b")}
+    lins.update(
+        {se + n: getattr(ffn.shared_experts, n) for n in ("gate_up_proj", "w2")}
+    )
+    for name, lin in lins.items():
+        fp8 = lin.weight
+        lin.weight = torch.nn.Parameter(fp8.data.view(torch.uint8), requires_grad=False)
+        with pytest.raises(hi_weights.MonoUnsupported, match="torch.uint8"):
+            hi_weights.check_block(block, INTER, TP)
+        with pytest.raises(hi_weights.MonoUnsupported, match="torch.uint8"):
+            hi_weights.block_tensors(block, "layers.3.")
+        lin.weight = fp8

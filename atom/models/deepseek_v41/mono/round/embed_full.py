@@ -9,8 +9,10 @@ block draft's begin kernel instead read each id's row directly from the rank tha
 address on this GPU (the shard moved into IPC-exportable memory, exported once at load, opened on the others): the same
 row, no collective, no copy of the table. ATOM's own forwards (prefill) keep their lookup.
 
-``install`` exchanges the addresses and checks the read on every rank (sampled ids, each shard's edges,
-out-of-range ids: the rows ATOM's lookup gives), refusing on any difference.
+``check`` refuses an embedding it cannot read so before anything is moved (the install's agreed check,
+``hi_runner.check``); ``install`` exchanges the addresses and checks the read on every rank (sampled ids, each shard's
+edges, out-of-range ids: the rows ATOM's lookup gives), refusing on any difference on every rank alike, with the
+shard moved back into ordinary device memory.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import triton.language as tl
 
 from atom.models.deepseek_v41.mono.hi_bridge import _shard_row
 from atom.models.deepseek_v41.mono.hi_gate import log_once
+from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
 
@@ -43,17 +46,9 @@ def _read_rows_kernel(
     )
 
 
-def install(model, group) -> SimpleNamespace:
-    """The model's (one) sharded token embedding's shards on every rank of the TP group (``group``: its CPU group)
-    -> ``shards`` (int64 [tp] on this GPU: each rank's shard address), ``per`` (rows a shard), ``rows`` (the
-    vocabulary), ``hidden``. Collective."""
-    import torch.distributed as dist
-
-    from atom.mono.runtime.hip_ipc import (
-        get_allocation_base,
-        get_ipc_handle,
-        open_ipc_handle,
-    )
+def check(model):
+    """The model's one sharded token embedding (ATOM's ``VocabParallelEmbedding``), its shard bf16 and contiguous;
+    raises ``MonoUnsupported`` otherwise. Rank-local, nothing moved."""
     from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 
     embeds = [
@@ -62,15 +57,35 @@ def install(model, group) -> SimpleNamespace:
         if isinstance(m, VocabParallelEmbedding) and not isinstance(m, ParallelLMHead)
     ]
     if len(embeds) != 1:
-        raise RuntimeError(
+        raise MonoUnsupported(
             f"V4.1 mono hi embedding: {len(embeds)} sharded token embeddings, expected one"
         )
-    emb = embeds[0]
-    shard = emb.weight.data
+    shard = embeds[0].weight.data
     if shard.dtype != torch.bfloat16 or not shard.is_contiguous():
-        raise RuntimeError(
+        raise MonoUnsupported(
             f"V4.1 mono hi embedding: shard {shard.dtype}, contiguous {shard.is_contiguous()}"
         )
+    return embeds[0]
+
+
+def install(model, group) -> SimpleNamespace:
+    """The model's (one) sharded token embedding's shards on every rank of the TP group (``group``: its CPU group)
+    -> ``shards`` (int64 [tp] on this GPU: each rank's shard address), ``per`` (rows a shard), ``rows`` (the
+    vocabulary), ``hidden``. Collective; ``check`` passed on every rank. A read that differs from ATOM's lookup on
+    any rank raises ``MonoUnsupported`` on every rank, the shard back in ordinary device memory (the uncached block it
+    was moved into stays allocated: uncached memory is never freed, ``atom.mono.runtime.uncached``).
+    """
+    import torch.distributed as dist
+
+    from atom.mono.runtime.hip_ipc import (
+        get_allocation_base,
+        get_ipc_handle,
+        open_ipc_handle,
+    )
+    from atom.model_ops.embed_head import VocabParallelEmbedding
+
+    emb = check(model)
+    shard = emb.weight.data
     tp, rank, per = emb.tp_size, emb.tp_rank, emb.num_embeddings_per_partition
     if (
         tp > 1
@@ -112,7 +127,9 @@ def install(model, group) -> SimpleNamespace:
     ok = torch.tensor([int(torch.equal(want, got))], dtype=torch.int32, device="cpu")
     dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
     if not int(ok):
-        raise RuntimeError(
+        if tp > 1:  # ATOM's own lookups back on ordinary memory
+            emb.weight.data = shard.clone()
+        raise MonoUnsupported(
             "V4.1 mono hi embedding: the in-place shard read differs from ATOM's lookup"
         )
     log_once(

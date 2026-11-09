@@ -43,9 +43,9 @@ id's bits (a later stage of the launch, e.g. a verdict).
 
 **MXFP4 weights** (``weight_format="mxfp4"``: a quantized head, the blog megakernel's precision): ``x`` is a tagged
 MXFP8 channel of width K (a multiple of 128: the final norm's MXFP8 output), the weight MXFP4 (``pack_weight`` of an
-``MXFP4Weight`` [n, K]: ``gemv.pack_weight``'s units, args ``<name>.w`` / ``<name>.ws``, rows padded to whole tasks),
-each wave's row group streamed over K in steps of 128 (``mfma_scale_f32_16x16x128_f8f6f4``, its scale code per lane
-from ``<name>.ws``), the same top-1 epilogue and pick. The logits are ``weights.mfma.wxa8``'s.
+MXFP4 weight [n, K], ``packed`` / ``codes``: ``gemv.pack_weight``'s units, args ``<name>.w`` / ``<name>.ws``, rows
+padded to whole tasks), each wave's row group streamed over K in steps of 128 (``mfma_scale_f32_16x16x128_f8f6f4``,
+its scale code per lane from ``<name>.ws``), the same top-1 epilogue and pick.
 
 Numerics contract: each logit is the MFMA's 32-element sums added over K steps 0, 1, .. in order, on the fp32
 accumulator (no split K; MXFP4: the 128-element scaled MFMA's). A bf16 GEMM elsewhere (hipBLASLt) sums in another

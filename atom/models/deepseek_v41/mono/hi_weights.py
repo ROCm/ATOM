@@ -5,7 +5,8 @@
 ``block_tensors``: a target layer's or a DSpark draft stage's tensors on this TP rank, in the checkpoint's form and
 names (what the hi runtime's ``layer_impl.pack(local=True)`` reads); ``expert_packs``: its routed experts' packs;
 ``ctx_tensors`` / ``engram_tensors``: the draft's context write's and an Engram layer's projection, likewise;
-``rope_args``: ATOM's RoPE caches, read in place.
+``rope_args``: ATOM's RoPE caches, read in place. ``check_block`` / ``check_experts`` / ``check_linears``: what these
+refuse, raised before anything is packed (the install's check, ``hi_runner.check``).
 
 ATOM holds every tensor these packers read, rank-local exactly as they slice it (TP without EP: ``wq_b`` / ``wo_a``
 rows, ``wo_b`` columns, ``attn_sink``, the shared expert's and every routed expert's width slice), and changes them
@@ -36,15 +37,23 @@ logger = logging.getLogger("atom")
 _GROUP = 32  # the checkpoint's E8M0 block: 32 x 32 (dense FP8) / 1 x 32 (routed experts' FP4)
 
 
+def check_linears(*lins) -> None:
+    """``_dense``'s refusal, without its copy: each of ``lins`` (ATOM's FP8 linears) holds FP8."""
+    for lin in lins:
+        if lin.weight.dtype != torch.float8_e4m3fn:
+            raise MonoUnsupported(
+                f"V4.1 mono hi weights: an FP8 linear holds {lin.weight.dtype}"
+            )
+
+
 @torch.no_grad()
 def _dense(
     lin, rows: tuple[int, int] | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``lin`` (an ATOM FP8 linear) -> its weight in the checkpoint's row-major order (rows ``rows`` of a fused one)
     and its E8M0 block scale (the rows' blocks)."""
+    check_linears(lin)
     w, s = _unshuffle_linear_weight(lin.weight).detach(), lin.weight_scale.detach()
-    if w.dtype != torch.float8_e4m3fn:
-        raise MonoUnsupported(f"V4.1 mono hi weights: an FP8 linear holds {w.dtype}")
     if rows is not None:
         a, b = rows
         w, s = w[a:b], s[a // _GROUP : b // _GROUP]
@@ -113,6 +122,22 @@ def block_tensors(block, prefix: str) -> tuple[dict, dict]:
 
 
 @torch.no_grad()
+def check_block(block, inter: int, tp: int) -> None:
+    """What ``block_tensors`` and ``expert_packs`` refuse in ``block`` (ATOM's V4.1 ``Block``: a target layer or a
+    draft stage, routed experts of ``inter`` features at TP ``tp``), raised as they would (``MonoUnsupported``) but
+    before anything is packed: every FP8 linear they read, the routed experts' layout and padding codes
+    (``check_experts``). The install's check (``hi_runner.check``)."""
+    a, f = block.attn, block.ffn
+    lins = [a.wqkv_a, a.wq_b, a.wo_b, a.wo_a]
+    lins += [f.shared_experts.gate_up_proj, f.shared_experts.w2]
+    idx = getattr(a, "indexer", None)
+    if idx is not None:
+        lins.append(idx.wq_b)
+    check_linears(*lins)
+    check_experts(f.experts, inter, tp)
+
+
+@torch.no_grad()
 def engram_tensors(engram) -> dict:
     """ATOM's ``EngramOp`` -> its ``wkv`` as ``engram_io.pack_kv`` reads it (``engram.wkv.{weight,scale}``)."""
     wt, sc = _dense(engram.wkv)
@@ -121,8 +146,8 @@ def engram_tensors(engram) -> dict:
 
 @torch.no_grad()
 def ctx_tensors(draft, stages: int) -> dict:
-    """ATOM's DSpark draft model -> the context write's tensors as ``draft.pack`` reads them (``draft.weight_names``:
-    main_proj whole, replicated as ATOM holds it, the stages' wkv rows of ``wqkv_a``, the norms).
+    """ATOM's DSpark draft model -> the context write's tensors as ``draft.pack`` reads them (main_proj whole,
+    replicated as ATOM holds it, the stages' wkv rows of ``wqkv_a``, the norms).
     """
     out = {}
     out["mtp.0.main_proj.weight"], out["mtp.0.main_proj.scale"] = _dense(
@@ -195,6 +220,23 @@ def _unshuffled_codes(
 
 
 @torch.no_grad()
+def check_experts(experts, inter: int, tp: int) -> None:
+    """``experts``' layout (``_expert_layout``) and padding codes, refused (``MonoUnsupported``) before anything is
+    packed. The kernels skip the padding's weights (rows past ``inter / tp`` of each half, down's K past it) but
+    apply their codes, to zero weights: any finite code gives 0, so a padding code 255 (E8M0 NaN) is refused. This
+    rank's shard's codes: the install agrees on the verdict over the ranks (``hi_dispatch.install_hi``).
+    """
+    _, _, _, _, pad, live, _, _, _, _ = _expert_layout(experts, inter, tp)
+    c13, c2 = _unshuffled_codes(experts, inter, tp)
+    if bool((c13[:, :, live:] == 255).any()) or bool(
+        (c2[:, :, live // _GROUP : pad // _GROUP] == 255).any()
+    ):
+        raise MonoUnsupported(
+            "V4.1 mono hi weights: a routed expert's padding scale code is 255 (E8M0 NaN)"
+        )
+
+
+@torch.no_grad()
 def expert_packs(
     experts, inter: int, tp: int, name: str = "moe"
 ) -> dict[str, torch.Tensor]:
@@ -206,19 +248,9 @@ def expert_packs(
     - ``<name>.ug.ws`` / ``<name>.down.ws``: ``w13_weight_scale`` / ``w2_weight_scale`` in aiter's ``shuffle_scale``
       order, which the kernels read in place (``MoEExperts(atom_scales=True)``).
 
-    The kernels skip the padding's weights (rows past ``inter / tp`` of each half, down's K past it) but apply their
-    codes, to zero weights: any finite code gives 0, so a padding code 255 (E8M0 NaN) is refused here.
+    Their padding codes are checked before (``check_experts``).
     """
-    e, n2, kb, hidden, pad, live, groups, s13, s2, g2 = _expert_layout(
-        experts, inter, tp
-    )
-    c13, c2 = _unshuffled_codes(experts, inter, tp)
-    if bool((c13[:, :, live:] == 255).any()) or bool(
-        (c2[:, :, live // _GROUP : pad // _GROUP] == 255).any()
-    ):
-        raise MonoUnsupported(
-            "V4.1 mono hi weights: a routed expert's padding scale code is 255 (E8M0 NaN)"
-        )
+    _, _, _, _, _, _, _, s13, s2, _ = _expert_layout(experts, inter, tp)
     out = {
         f"{name}.ug.w": experts.w13_weight.detach().view(torch.uint8).reshape(-1),
         f"{name}.ug.ws": s13.reshape(-1),

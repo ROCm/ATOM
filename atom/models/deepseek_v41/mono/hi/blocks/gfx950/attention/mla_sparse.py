@@ -34,7 +34,7 @@ cache by the selection, a source's new entries), then polls its heads' scores of
 with the producers' thread mapping and operations (each chunk's max exact, its prefix max the running max), P V with
 the producers' MFMA operands, the recurrence and the output: one hand-off after the scores. The same bits.
 Optionally the merge's window V comes from an exact copy the caller keeps beside the bf16 ring: ``ring8`` the ring's
-MXFP8 copy (``ring_mxfp8``).
+MXFP8 copy.
 
 Args: ``pos``, ``ring``, ``rope`` (the layer's table: a compressed layer's YaRN one), ``sink`` as ``MLAWindowAttn``;
 ``sel`` int32 [batch x spec, 512] the step rows' compressed positions (raw: no window offset; -1 pads), ``ckv`` the
@@ -474,7 +474,7 @@ def _gather_land(k, p: _SPlan, oks, idxs, vs, b, base):
 
 @traced
 def _new_entry_lds(k, p, base, idx, words):
-    """``_new_entry`` from the LDS copy ``_new_land`` made (the same words)."""
+    """An entry this launch emits, from the LDS copy ``_new_land`` made (the same words)."""
     w0, w1, w2, w3 = words
     if idx >= base // p.ratio:
         j = fx.min(fx.max((idx + 1) * p.ratio - 1 - base, 0), fx.Int32(p.spec - 1))

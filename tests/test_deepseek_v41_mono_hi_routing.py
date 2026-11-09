@@ -19,14 +19,17 @@ from aiter_stub import _drop, atom_without_aiter
 
 @pytest.fixture(scope="module")
 def D():
-    """``hi_dispatch`` with ATOM's own mono runners (FlyDSL kernels) stood in for (AITER and Triton stubbed where they
-    are not installed); every module it loaded dropped after."""
+    """``hi_dispatch`` with ATOM's own mono runners (FlyDSL kernels) stood in for where they are not imported yet (AITER
+    and Triton stubbed where they are not installed); every module it loaded dropped after. (A runner module already
+    imported stays: an imported ``mono.dispatch`` holds its classes.)"""
     before = set(sys.modules)
     with pytest.MonkeyPatch.context() as mp:
         for mod, cls in (
             ("runner", "V41MonoDecodeRunner"),
             ("draft_runner", "DraftMonoRunner"),
         ):
+            if f"atom.models.deepseek_v41.mono.{mod}" in sys.modules:
+                continue
             stub = types.ModuleType(f"atom.models.deepseek_v41.mono.{mod}")
             setattr(stub, cls, object)
             mp.setitem(sys.modules, stub.__name__, stub)

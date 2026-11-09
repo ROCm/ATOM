@@ -66,7 +66,7 @@ scaled MX MFMA truncates within its K groups; this does not. Over 16 rows, the s
 widened once, an MFMA per chunk): a row's bits do not depend on the row count.
 
 **FP8 per-channel weights** (``row_scale``, MXFP8 weights): E4M3 rows with every block code 127 and one fp32 scale
-an output row (``weights.fp8row``, Quark's per-channel FP8): an item's totals, after the K waves' and K
+an output row (Quark's per-channel FP8): an item's totals, after the K waves' and K
 slices' sums, times its row's scale (arg ``<name>.rs``, prefetched with the weights), then the bias and the output
 spec as above.
 
@@ -239,7 +239,7 @@ class Residual:
 class NormIn:
     """The input as a norm prologue: rows of ``src`` (a BF16 ``Channel`` of width K,
     polled, or the name of a plain bf16 [rows, K] arg) through zero-centred RMSNorm
-    with gamma arg ``gamma`` (``QuantizedLayer.retained[weight]``, packed by
+    with gamma arg ``gamma`` (``layer.retained[weight]``, packed by
     ``Linear.pack``) and MXFP8 quantization, by ``spec`` (default ``norm.prologue(norm)``:
     the same mapping and reduction order as ``NormQuant``'s channel stage). Give the
     norm geometry ``norm`` (width, eps) or a ``spec``. A ``spec`` with a ``pitch``: rows
@@ -1776,7 +1776,7 @@ def _res_prefetch(k, p, b):
     """The residual's words for every epilogue pass, issued with the weights: a plain
     arg's two words, or a first poll attempt of the channel's two pairs (value,
     tag, value, tag; landed in the epilogue by ``_res_words``). With ``row_scale`` each
-    pass's entry is (those words, the row scales: ``_rs_prefetch``)."""
+    pass's entry is (those words, the row scales)."""
     out = _res_issue(k, p, b)
     return out
 
@@ -2219,8 +2219,7 @@ def source_stages(ch: Channel, rows: int, per_thread: int = 2) -> list[Stage]:
     """Stages that publish channel ``ch`` [rows, width] from plain args: the stand-in
     for its producer in block tests and evals. MXFP8 reads args ``<ch>.q`` (E4M3
     bytes) and ``<ch>.s`` (one int32 code per group), BF16 reads arg ``<ch>`` (bf16),
-    F32 reads arg ``<ch>`` (f32);
-    ``source_args`` makes them. A FLAG channel's flags: one per source task, the
+    F32 reads arg ``<ch>`` (f32). A FLAG channel's flags: one per source task, the
     ``.q`` stage's slots first."""
     if ch.fmt is Fmt.MXFP8:
         parts = [(".q", rows * ch.width // 4), (".s", rows * ch.width // 32)]

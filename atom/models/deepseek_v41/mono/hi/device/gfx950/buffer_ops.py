@@ -9,7 +9,7 @@ Buffer operations use a scalar base pointer and per-thread offsets for efficient
 ``create_buffer_resource`` returns a byte-addressed buffer-descriptor pointer
 
 Example:
-    >>> from kernels.common import buffer_ops
+    >>> from atom.models.deepseek_v41.mono.hi.device.gfx950 import buffer_ops
     >>> from flydsl.expr import arith
     >>> from flydsl._mlir.extras import types as T
     >>>
