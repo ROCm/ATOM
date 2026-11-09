@@ -21,10 +21,12 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.models.deepseek_v41.mono.gfx1250_single import buffers
+from atom.models.deepseek_v41.mono.gfx1250_single.config import NDR, NL, ROWS_PER_REQ
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.utils import envs
+from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
-NL, NDR, ROWS_PER_REQ = 40, 3, 6
 
 
 def model_dir():
@@ -107,7 +109,9 @@ class RunnerDebug:
 
         from safetensors import safe_open
 
-        from atom.models.deepseek_v41.mono.gfx1250_single import layer_weights
+        from atom.models.deepseek_v41.mono.gfx1250_single.weights import (
+            layer as layer_weights,
+        )
 
         blocks = [m for n, m in model.named_modules() if n.endswith(f"layers.{li}")]
         nxt = [m for n, m in model.named_modules() if n.endswith(f"layers.{li + 1}")]
@@ -488,3 +492,120 @@ class RunnerDebug:
             mids=sc["mids"].view(torch.int32)[:40].cpu().numpy(),
             qlog=(self.tables.state["qlog"].view(40, -1).cpu().numpy() if self._ndump_prow <= qlog_n else np.zeros(1)),
         )
+
+
+class ShadowModel:
+    """``SingleStepModel``'s ATOM_MONO_SINGLE_SHADOW forward (eager): the production forward serves the step, the launch
+    runs beside it on the same inputs and ``RunnerDebug.shadow_*`` compare the two."""
+
+    def _layer_hook(self, k, ref):
+        """The production state after layer k - 1, collapsed and normed with layer k's attn_norm (eps as the kernel's
+        front, 1e-20): what a k-layer launch's xh holds."""
+        from atom.models.deepseek_v41.mono.gfx1250_single.runner import _base_model
+
+        base = _base_model(self.model)
+        w = base.layers[k].attn_norm.weight
+
+        def hook(module, args, output):
+            x = output.collapse().float()
+            ref["x"] = (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-20) * w.float()).to(torch.bfloat16)
+
+        last = base.layers[k - 1]
+        hooks = [last.register_forward_hook(hook)]
+        # the last layer's attention output (the kernel's y1: after wo_b and the TP all-reduce) and its FFN output (y2)
+        attn_fwd = last.attention_forward
+
+        def attention_forward(*a, **kw):
+            out = attn_fwd(*a, **kw)
+            ref["y1"] = out
+            return out
+
+        last.attention_forward = attention_forward
+        prep = last.prepare_attention
+
+        def prepare_attention(*a, **kw):
+            out = prep(*a, **kw)
+            normed = out[0]
+            ref["axn"] = normed[0] if isinstance(normed, tuple) else normed  # the attention input (bf16 rows)
+            return out
+
+        last.prepare_attention = prepare_attention
+
+        def ffn_hook(module, args, output):
+            ref["y2"] = output
+
+        hooks.append(last.ffn.register_forward_hook(ffn_hook))
+
+        class _Undo:
+            def remove(self_):
+                for h in hooks:
+                    h.remove()
+                del last.attention_forward
+                del last.prepare_attention
+
+        return _Undo()
+
+    def _shadow(self, input_ids):
+        """Bring-up (ATOM_MONO_SINGLE_SHADOW=1, eager): the runner of a decode verify forward the single launch shadows,
+        or None."""
+        if not envs.ATOM_MONO_SINGLE_SHADOW or torch.cuda.is_current_stream_capturing():
+            return None
+        fc = get_forward_context()
+        rows = input_ids.numel()
+        if fc.spec_decode_metadata is None or getattr(fc.context, "is_dummy_run", False) or not self.step_ready(rows):
+            return None
+        return self._single.runner
+
+    def _shadow_launch(self, runner, input_ids):
+        """The single launch on the production forward's inputs (False: refused, logged; the production forward goes
+        on). Before that forward its KV writes are rewritten by it; after it (ATOM_MONO_SINGLE_SHADOW_AFTER=1) it reads
+        the rows that forward wrote this step -- the compressed KV and index rows a kernel without COMP cannot."""
+        try:
+            runner.launch(input_ids, get_forward_context(), getattr(self, "_step_batch", None))
+        except MonoUnsupported as why:
+            logger.warning("single-launch shadow step skipped (%d rows): %s", input_ids.numel(), why)
+            return False
+        return True
+
+    def shadow_forward(self, input_ids, positions):
+        """ATOM_MONO_SINGLE_SHADOW: the production forward, with the launch beside it on the same inputs and the
+        comparisons logged (``RunnerDebug.shadow_*``)."""
+        shadow = self._shadow(input_ids)
+        after = envs.ATOM_MONO_SINGLE_SHADOW_AFTER
+        ctx_check = shadow is not None and shadow.shadow_layers == NL and not after
+        if ctx_check:  # the production's draft context rows of the step before, before the launch rewrites them
+            shadow.arm_native_draft_capture()
+            shadow.shadow_draft_hidden()
+            shadow.shadow_ctx_compare(get_forward_context())
+        if shadow is not None and not after and not self._shadow_launch(shadow, input_ids):
+            shadow = None
+        if shadow is not None and ctx_check:
+            shadow.shadow_ctx_after_launch(get_forward_context(), input_ids.numel())
+            shadow.shadow_draft_after_launch(input_ids.numel())
+        ref, hook = {}, None
+        if shadow is not None and shadow.shadow_layers < NL:
+            hook = self._layer_hook(shadow.shadow_layers, ref)
+        # (bring-up: the kernel has no Engram yet; ATOM_MONO_SINGLE_SHADOW_NOENGRAM=1 drops it from the production
+        # forward too, so the layers after it compare -- that forward's tokens are then not the model's)
+        no_engram = []
+        if shadow is not None and envs.ATOM_MONO_SINGLE_SHADOW_NOENGRAM:
+            for blk in shadow.tables.target_blocks:
+                if getattr(blk, "engram", None) is not None:
+                    blk.engram_forward = lambda residual, embeddings, image_mask: residual.clone()
+                    no_engram.append(blk)
+        try:
+            out = self.model(input_ids, positions)
+        finally:
+            if hook is not None:
+                hook.remove()
+            for blk in no_engram:
+                del blk.engram_forward
+        if shadow is not None and after and not self._shadow_launch(shadow, input_ids):
+            shadow = None
+        if shadow is not None:
+            shadow.shadow_compare(input_ids.numel(), out, ref.get("x"), ref)
+            shadow.shadow_selection(input_ids.numel(), get_forward_context())
+            if shadow.shadow_layers == NL:
+                shadow.shadow_taps(input_ids.numel())
+                shadow.shadow_drafts(input_ids, get_forward_context())
+        return out

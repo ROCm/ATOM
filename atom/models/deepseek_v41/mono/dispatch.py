@@ -158,7 +158,7 @@ def install_mono_decode(
     from atom.models.deepseek_v41.mono import gfx1250_single
 
     if gfx1250_single.enabled():
-        from atom.models.deepseek_v41.mono.gfx1250_single.install import (
+        from atom.models.deepseek_v41.mono.gfx1250_single.dispatch import (
             install_single_step,
         )
 

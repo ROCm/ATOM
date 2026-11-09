@@ -18,7 +18,9 @@ Kept apart from ``runner.py`` so a CPU test can build a row from a module stub."
 
 import torch
 
-from atom.models.deepseek_v41.mono.gfx1250_single.planes import checkpoint_weight
+from atom.models.deepseek_v41.mono.gfx1250_single.weights.planes import (
+    checkpoint_weight,
+)
 from atom.mono.runtime.consensus import MonoUnsupported
 
 H = 5120

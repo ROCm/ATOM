@@ -72,7 +72,7 @@ class MoE(V4MoE):
         from atom.models.deepseek_v41.mono import gfx1250_single
 
         if gfx1250_single.enabled():
-            from atom.models.deepseek_v41.mono.gfx1250_single import planes
+            from atom.models.deepseek_v41.mono.gfx1250_single.weights import planes
 
             self.experts._mono_pre_shuffle = planes.capture(prefix)
 

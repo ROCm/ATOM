@@ -29,8 +29,15 @@ from aiter.dist.parallel_state import (
     get_tp_group,
 )
 
-from atom.models.deepseek_v41.mono.gfx1250_single import buffers, planes
+from atom.models.deepseek_v41.mono.gfx1250_single import buffers
+from atom.models.deepseek_v41.mono.gfx1250_single.config import (
+    NDR,
+    NL,
+    ROWS_PER_REQ,
+    TP,
+)
 from atom.models.deepseek_v41.mono.gfx1250_single.debug import RunnerDebug, StepTimer
+from atom.models.deepseek_v41.mono.gfx1250_single.weights import planes
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
 from atom.utils import envs
@@ -47,9 +54,6 @@ def _base_model(model):
 
 
 KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
-NL, NDR = 40, 3
-ROWS_PER_REQ = 6  # a DSpark verify request's target rows (5 drafts + 1)
-TP = 4
 # the receive regions: 4 TP regions x 4 sources x 40960 16-byte words, the sampling and Markov exchange after them
 # (step_tail_ct3 SOFF / SOFF2), 2 MB-rounded, doubled for the step epoch
 # the recipe's draft temperature scale (dspark_prob_sample.DRAFT_TSCALE): q = softmax(z * invT / TSCALE)
@@ -254,7 +258,8 @@ class SingleStepRunner(RunnerDebug):
         ``_sampling`` / ``_host_inputs`` refuse with MonoUnsupported, checked before the step commits to the kernel (an
         exception after the Engram rows are staged left the worker without a fallback: CT11 11-08, a 4.4k-token prompt
         with 4096 outputs past the index bound). Identical on every rank (the batch and its spans are)."""
-        from atom.models.deepseek_v41.mono.gfx1250_single.tables import BCOLS, ILW, T as T_MAX
+        from atom.models.deepseek_v41.mono.gfx1250_single.tables import BCOLS, ILW
+        from atom.models.deepseek_v41.mono.gfx1250_single.tables import T as T_MAX
 
         why = None
         if batch is not None and (np.asarray(batch.top_ks[: batch.total_seqs_num]) != -1).any():
@@ -285,7 +290,8 @@ class SingleStepRunner(RunnerDebug):
     def _host_inputs(self, input_ids, forward_context):
         """The step's host-side checks and the rare host-to-device refills (geometry), before the device preparation;
         returns (the Engram layers' embedding rows, the key of every address / shape ``_device_inputs`` captures)."""
-        from atom.models.deepseek_v41.mono.gfx1250_single.tables import BCOLS, ILW, T as T_MAX
+        from atom.models.deepseek_v41.mono.gfx1250_single.tables import BCOLS, ILW
+        from atom.models.deepseek_v41.mono.gfx1250_single.tables import T as T_MAX
 
         md = forward_context.attn_metadata
         cache, step = md.cache, md.step
@@ -349,8 +355,9 @@ class SingleStepRunner(RunnerDebug):
     def _device_inputs(self, input_ids, forward_context, engs):
         """Every device operation of the step's preparation: from fixed addresses only (captured in the width's
         graph, ``launch``), sizes fixed by the key of ``_host_inputs``."""
+        from atom.models.deepseek_v41.mono.gfx1250_single.tables import BCOLS
+        from atom.models.deepseek_v41.mono.gfx1250_single.tables import T as T_MAX
         from atom.models.deepseek_v41.mono.step_meta import write_step_meta
-        from atom.models.deepseek_v41.mono.gfx1250_single.tables import BCOLS, T as T_MAX
 
         md = forward_context.attn_metadata
         cache, step = md.cache, md.step
