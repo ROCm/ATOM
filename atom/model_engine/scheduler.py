@@ -1075,7 +1075,13 @@ class Scheduler:
         cached prefix (`dp_est_cached_tokens`)."""
         cached = seq.num_cached_tokens
         if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-            cached = max(cached, self._tier_loaded_tokens(seq))
+            loaded = self._tier_loaded_tokens(seq)
+            if loaded > cached:
+                # Admission resumes at the replay-adjusted start, not at the
+                # loaded boundary (`_resume_start_after_tier_load`).
+                return max(
+                    0, seq.num_tokens - self._resume_start_after_tier_load(seq, loaded)
+                )
         elif estimate and not seq.block_table:
             cached = max(cached, getattr(seq, "dp_est_cached_tokens", 0))
         return max(0, seq.num_tokens - cached)
@@ -1091,8 +1097,8 @@ class Scheduler:
         """Whether `seq` waits on a tier load that completed (or failed) last
         step: Phase 2 resumes its prefill this tick (`_resolve_waiting_remote_kv`)."""
         return self._connector_flag("is_offload") and (
-            seq.id in self.finished_recving_kv_req_ids
-            or seq.id in self.failed_recving_kv_req_ids
+            self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
+            or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
         )
 
     def _local_prefill_pending_work(self) -> tuple[bool, int]:
@@ -1136,13 +1142,12 @@ class Scheduler:
         probed_tokens = 0
         slots = self.max_num_seqs - len(self.running)
         for seq in self._waiting_prefills():
-            offload_resume = self._is_offload_prefill_resume(seq)
-            if offload_resume:
-                resume = self._offload_prefill_start(seq)
-                # A replayed hit resumes as one, as admission starts it.
-                cached = self.block_manager.replay_start(
-                    seq, resume, hit=self.block_manager.tier_resume_replays(seq)
-                )
+            tier_waiter = self._tier_waiter_resume(seq)
+            offload_resume = tier_waiter is not None
+            if tier_waiter is not None:
+                # It owns its blocks: nothing to allocate or probe. A replayed
+                # hit resumes as one, as admission starts it.
+                resume, cached = tier_waiter
             else:
                 if probed_tokens >= budget:
                     break
@@ -1198,11 +1203,43 @@ class Scheduler:
         otherwise hold it, and everything queued behind it, forever."""
         return start + chunk <= resume and not seq.replays_hit
 
-    def _offload_prefill_start(self, seq: Sequence) -> int:
-        if seq.num_cached_tokens < seq.num_tokens:
-            return seq.num_cached_tokens
+    def _offload_prefill_start(self, seq: Sequence, cached: int | None = None) -> int:
+        """Where the suffix prefill of a request that owns its blocks resumes;
+        `cached` stands in for `seq.num_cached_tokens` (a completed tier load
+        not resolved by admission yet)."""
+        cached = seq.num_cached_tokens if cached is None else cached
+        if cached < seq.num_tokens:
+            return cached
         hbs = self.block_manager.hash_block_size
         return max(0, (seq.num_tokens - 1) // hbs * hbs)
+
+    def _resume_start_after_tier_load(self, seq: Sequence, loaded: int) -> int:
+        """Where the prefill of `seq` starts once its tier load, covering `loaded`
+        tokens, is resolved: the load boundary, moved down by the replay a
+        resume at a hit does (`BlockManager.replay_start`)."""
+        return self.block_manager.replay_start(
+            seq,
+            self._offload_prefill_start(seq, loaded),
+            hit=self.block_manager.tier_resume_replays(seq),
+        )
+
+    def _tier_waiter_resume(self, seq: Sequence) -> tuple[int, int] | None:
+        """`(resume, start)` of a request that owns its blocks and resumes
+        without a new allocation: one resumed from a tier load, or one whose
+        completed load admission has not resolved yet. `resume` is where its
+        cached prefix ends and `start` where the forward begins (replay-adjusted).
+        None for any other request."""
+        if self._tier_load_finished(seq):
+            cached = max(seq.num_cached_tokens, self._tier_loaded_tokens(seq))
+        elif self._is_offload_prefill_resume(seq):
+            cached = seq.num_cached_tokens
+        else:
+            return None
+        resume = self._offload_prefill_start(seq, cached)
+        start = self.block_manager.replay_start(
+            seq, resume, hit=self.block_manager.tier_resume_replays(seq)
+        )
+        return resume, start
 
     def _new_prefill_tokens(
         self, seq: Sequence, cached_tokens: int, resume: int | None = None
@@ -1301,11 +1338,9 @@ class Scheduler:
         for seq in itertools.islice(self._waiting_prefills(), self.max_num_seqs):
             if tokens >= token_cap:
                 break
-            if self._is_offload_prefill_resume(seq):
-                resume = seq.num_cached_tokens
-                start = self.block_manager.replay_start(
-                    seq, resume, hit=self.block_manager.tier_resume_replays(seq)
-                )
+            tier_waiter = self._tier_waiter_resume(seq)
+            if tier_waiter is not None:
+                resume, start = tier_waiter
             else:
                 # Runs on every tick with prefill work, holds included: reuse
                 # the walk across ticks; the answer is the exact probe's.
@@ -1438,6 +1473,10 @@ class Scheduler:
                     # (`_resolve_waiting_remote_kv`). Missing it here made the
                     # delayer fire vacuously and that prefill run alone.
                     return True
+                if seq.id in self._early_load.entries:
+                    # Phase 2 walks past an early load in flight without
+                    # counting it (`early_waiting`), so neither does this probe.
+                    continue
                 examined += 1
                 continue
             if seq.status == SequenceStatus.ABORTED:

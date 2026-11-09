@@ -111,6 +111,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         # prefix is stored to LMCache once prefill computes it
         # (seq.prefix_hashes_published flips True), chunk by chunk.
         self._save_tracker: dict[str, list] = {}
+        # The save tracker as it was before the last admission, `(sid, frontier
+        # or None)`: a take-back (`cancel_preadmission`) restores it.
+        self._admission_undo: tuple[str, int | None] | None = None
         # Round-robin cursor over `_save_tracker`: the last sid that emitted a
         # save. Subclasses may bound the number of outstanding saves through
         # `_may_emit_save`; resuming after this sid prevents starvation.
@@ -500,12 +503,30 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         admission asks the tier again instead of reusing an answer nothing pins
         (`_ensure_lookup_pin` trusts a held answer).
         """
-        self.cancel_pending_load(seq)
         sid = str(seq.id)
+        self._undo_admission_save_frontier(seq, sid)
+        self.cancel_pending_load(seq)
         held = self._lookup_results.get(sid)
         if held is not None and held[0] is seq:
             del self._lookup_results[sid]
         self._forget_tier_hit(sid)
+
+    def _undo_admission_save_frontier(self, seq, sid: str) -> None:
+        """Give the save tracker back what `update_state_after_alloc` set for an
+        admission the scheduler withdraws. Otherwise the frontier raised past the
+        tier hit survives: if that prefix is evicted before the next admission,
+        saves skip it and the Store cannot be refilled contiguously. A save
+        generation dispatched before the admission keeps its own frontier."""
+        undo, self._admission_undo = self._admission_undo, None
+        if undo is None or undo[0] != sid:
+            return
+        entry = self._save_tracker.get(sid)
+        if entry is None or entry[0] is not seq:
+            return
+        if undo[1] is None:
+            del self._save_tracker[sid]
+        else:
+            entry[1] = undo[1]
 
     def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
         """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
@@ -639,8 +660,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if self._do_save:
             entry = self._save_tracker.get(sid)
             if entry is None or entry[0] is not seq:
+                # What a take-back (`cancel_preadmission`) restores: no tracker
+                # entry, or the frontier before this admission.
+                self._admission_undo = (sid, None)
                 self._save_tracker[sid] = [seq, initial_saved]
             else:
+                self._admission_undo = (sid, int(entry[1]))
                 entry[1] = max(int(entry[1]), initial_saved)
 
     def _clear_pending_load(self, sid: str) -> None:

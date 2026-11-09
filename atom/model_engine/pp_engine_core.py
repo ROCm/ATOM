@@ -103,6 +103,7 @@ class PPEngineCoreProc(EngineCore):
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
+            self.scheduler.close_kv_connector()
 
     def _pp_head_step(self):
         launched = 0

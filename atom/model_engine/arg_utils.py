@@ -4,7 +4,6 @@
 import argparse
 import json
 import logging
-import os
 from dataclasses import dataclass, fields
 
 from atom import LLMEngine
@@ -92,31 +91,6 @@ def compose_kv_offload_config(kv_transfer_config: str, offload: dict | None) -> 
     if is_multi:
         return json.dumps({**transfer, "connectors": [*subs, offload]})
     return json.dumps({"kv_connector": "multi", "connectors": [transfer, offload]})
-
-
-# `OFFLOAD_MIN_LOAD_TOKENS` default for a Mooncake Store tier. The Store is
-# shared by every DP rank and is measured against HBM-only prefix caching, so
-# it should serve what HBM would; the other offload tiers keep the global default
-# (envs.OFFLOAD_MIN_LOAD_TOKENS) they were tuned with.
-MOONCAKE_STORE_MIN_LOAD_TOKENS = "512"
-
-
-def default_store_min_load_tokens(kv_transfer_config: str) -> None:
-    """Default `OFFLOAD_MIN_LOAD_TOKENS` for a Mooncake Store deployment.
-
-    Set in this process's environment, which the engine and worker processes
-    inherit, so every reader sees one value; a value the user set is kept.
-    """
-    if not kv_transfer_config or "OFFLOAD_MIN_LOAD_TOKENS" in os.environ:
-        return
-    transfer = json.loads(kv_transfer_config)
-    subs = (
-        transfer.get("connectors", [])
-        if _connector_name(transfer) == "multi"
-        else [transfer]
-    )
-    if any(_connector_name(sub) == "mooncake_store" for sub in subs):
-        os.environ["OFFLOAD_MIN_LOAD_TOKENS"] = MOONCAKE_STORE_MIN_LOAD_TOKENS
 
 
 def _connector_name(cfg: object) -> str:
@@ -970,7 +944,6 @@ class EngineArgs:
         kwargs["kv_transfer_config"] = compose_kv_offload_config(
             kwargs["kv_transfer_config"], offload
         )
-        default_store_min_load_tokens(kwargs["kv_transfer_config"])
         if offload is not None:
             logger.info(
                 "ATOM_KV_OFFLOAD: kv_transfer_config=%s", kwargs["kv_transfer_config"]

@@ -2713,6 +2713,7 @@ class Config:
             # different namespace and every scheduler lookup misses. Snapshot it
             # here, before the config is shipped to either process.
             from atom.kv_transfer.offload.config import (
+                default_store_min_load_tokens,
                 snapshot_kv_encoding,
                 snapshot_page_hf_geometry,
             )
@@ -2722,6 +2723,8 @@ class Config:
             # llama.py adds a key to the live `rope_parameters` while a worker
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
+            # Before the engine and worker processes are spawned.
+            default_store_min_load_tokens(self.kv_transfer_config)
         self._resolve_dynamic_chunking()
         self._check_pp_support()
 
