@@ -194,9 +194,7 @@ class K3MonoDecodeRunner:
         self.dims = Dims(self.tp)
         self.debug = envs.ATOM_MONO_DEBUG
         self.inner = inner_model(model)
-        self.plans = bind_model(
-            self.inner, self.dims, self.rank, bind_k2=self.bind_k2
-        )
+        self.plans = bind_model(self.inner, self.dims, self.rank, bind_k2=self.bind_k2)
         self.num_blocks = num_blocks(len(self.inner.layers))
         # a DSpark drafter taps hidden states; a plain-decode deployment has none
         self.aux = (
@@ -257,7 +255,7 @@ class K3MonoDecodeRunner:
         """
         lens = set()
         for plan in self.plans:
-            if not plan.mono:
+            if plan.kda is None:
                 continue
             lens.add(self._conv_state(plan.layer_id).size(-1))
             self._recurrent_state(plan.layer_id)
@@ -276,7 +274,7 @@ class K3MonoDecodeRunner:
         k and u bf16, the log gates fp32."""
         caps = set()
         for plan in self.plans:
-            if not plan.mono:
+            if plan.kda is None:
                 continue
             cache = get_forward_context().kv_cache_data[f"layer_{plan.layer_id}"]
             bufs = [getattr(cache, f"replay_buf_{n}", None) for n in "kug"]
@@ -403,7 +401,7 @@ class K3MonoDecodeRunner:
                 **k1.gemv_staging(rows),
             )
             for p in self.plans
-            if p.mono
+            if p.kda is not None
         }
         for key in set(keys.values()):
             if k1.lds_refusal(key):

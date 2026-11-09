@@ -145,6 +145,17 @@ def test_only_ptpc_o_proj_enables_fused_k1_quant():
     assert not runner_module._uses_ptpc_o_proj(layer(QuantType.No, torch.bfloat16))
 
 
+def test_external_k2_runner_still_validates_k1_state_pools():
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.plans = [SimpleNamespace(layer_id=7, kda=object(), mono=False)]
+    runner._conv_state = lambda _layer: torch.empty(1, 1, 7)
+    observed = []
+    runner._recurrent_state = lambda layer: observed.append(layer)
+
+    assert runner._state_len() == 7
+    assert observed == [7]
+
+
 @pytest.mark.parametrize("write_idx", (-1, 1))
 def test_k1_hands_its_core_to_the_production_k2(write_idx):
     rows, hidden = 2, 4
