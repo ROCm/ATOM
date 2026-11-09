@@ -239,10 +239,10 @@ DSpark proposer of a served step
 - **Build.** Every width (6..48 rows) is built at startup, ~2.5 min cold.
   The builds go to the FlyDSL disk cache; clear it after editing a kernel.
 - **Debug switches** (the mono ones, `atom/utils/envs.py`):
-  - `ATOM_MONO_TIMELINE`: per-step time split, logged every 16 steps;
+  - `ATOM_MONO_TIMELINE=<prefix>`: per-step time split, averaged over 64
+    steps, logged and appended to `<prefix>_r<rank>.jsonl`;
   - `ATOM_MONO_CHECK` (eager): the launch beside the production forward,
-    compared, and layer 0's table row against the checkpoint;
-  - `ATOM_MONO_TRACE=<dir>`: per-step verification dump.
+    its head, selection, taps and drafts compared.
 
 Measured on MI455X (TP4, `--level 0`, same machine, original path as the
 reference):

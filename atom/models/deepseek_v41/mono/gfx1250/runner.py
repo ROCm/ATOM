@@ -35,13 +35,12 @@ from atom.models.deepseek_v41.mono.gfx1250.config import (
     ROWS_PER_REQ,
     TP,
 )
-from atom.models.deepseek_v41.mono.gfx1250.debug import RunnerDebug, StepTimer
+from atom.models.deepseek_v41.mono.gfx1250.debug import RunnerDebug, timeline
 from atom.models.deepseek_v41.mono.gfx1250.inputs import StepInputs
 from atom.models.deepseek_v41.mono.gfx1250.weights import planes
 from atom.mono.plan.build_key import source_digest
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
-from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -152,8 +151,6 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             len(self.planes),
             self.rank,
         )
-        if envs.ATOM_MONO_CHECK:  # (debug) layer 0's table row against the checkpoint
-            self._check_rows(model, 0)
         from atom.models.deepseek_v41.mono.gfx1250.tables import StepTables
 
         self.tables = StepTables(
@@ -187,13 +184,8 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         self.verify_ready = torch.cuda.Event()
         # the stream the verdict's copies run on: ModelRunner's output D2H waits for it, not for the draft launch
         self.output_stream = self._verify_stream = torch.cuda.Stream()
-        self._timer = StepTimer(self.rank) if envs.ATOM_MONO_TIMELINE else None
+        self._timer = timeline(self.rank)  # ATOM_MONO_TIMELINE (``debug``)
         self._eng_rows = None
-        # (debug) ATOM_MONO_CHECK: the production forward serves and the launch runs beside it (``debug``)
-        self.shadow = envs.ATOM_MONO_CHECK
-        self.shadow_layers = (
-            NL  # its target layers (``debug``: fewer compare the state after them)
-        )
         # every width built now (each a compile or a disk-cache load, then a TP barrier: ``prepare``), not on its first
         # step: a width first met mid-serve stalled every request for its JIT (~18 s cold)
         t0 = time.perf_counter()
@@ -211,8 +203,7 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             return False
         if rows not in self.builds:
             M = self.K["step"]
-            nl = self.shadow_layers
-            kw = {"NL": nl, "ndr": NDR if nl == NL else 0, "trd": rows // 6 * 5}
+            kw = {"NL": NL, "ndr": NDR, "trd": rows // 6 * 5}
             # two launches: target .. verification, then the draft (the host reads the verdict between)
             launch = tuple(
                 M.build(rows, self.rank, part=pt, sources=SOURCES, **kw)[0]
@@ -356,10 +347,7 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         # what the production forward opens and closes around its layers (runtime.v41_begin_forward / end_forward): the
         # Engram stage -- its history snapshot, each verify prefix's cursor candidate (the TentativeState staging that
         # commit_tentative picks from by the verdict's anchors) and the embedding rows' lookup on its side stream
-        _w0 = time.perf_counter() if self._timer is not None else None
         md = forward_context.attn_metadata
-        if envs.ATOM_MONO_TRACE:  # (debug) this step's positions for ``dump_step``
-            self._dbg_pos = md.step.positions[: input_ids.numel()].clone()
         rows = md.engram_embeddings
         staged = isinstance(rows, EngramStagedRows) and not getattr(
             md, "staged_outside_forward", False
@@ -367,14 +355,9 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         # the Engram stage (its lookups, the side-stream gather and the join) runs inside the launch's preparation graph
         # (``launch``): issued op by op here it was ~0.26 ms of host time between the verdict and the next launch
         self._eng_rows = rows if staged else None
-        _w1 = time.perf_counter() if self._timer is not None else None
         self._t_rec = {} if self._timer is not None else None
         if self._t_rec is not None:
             self._timer.mark("a", self._t_rec)
-            self._t_rec["pre"] = (
-                self._t_rec["w_a"] - _w0,
-                _w1 - _w0,
-            )  # (run_step entry -> a, of which the Engram stage)
         self.launch(input_ids, forward_context, batch)
         if self._t_rec is not None:
             self._timer.copy_st(self._t_rec, self.scratch["st"])
@@ -406,7 +389,6 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         out.record_stream(cur)
         verdict.record_stream(cur)
         cur.wait_event(self.verify_ready)
-        self.dump_step(bs, out, verdict)
         return out, verdict
 
     def draft_ids(self, bs: int):

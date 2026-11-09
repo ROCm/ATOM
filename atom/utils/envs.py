@@ -618,13 +618,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # beside the production forward, mono/gfx1250/debug.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",
     # Debug: append every mono step's input tokens, positions and top-2 logits to
-    # this file (rank 0; check.trace_logits; the gfx1250 V4.1 step: its
-    # verification per step, one .npz a rank in this directory). Use with --enforce-eager.
+    # this file (rank 0; check.trace_logits). Use with --enforce-eager.
     "ATOM_MONO_TRACE": lambda: os.getenv("ATOM_MONO_TRACE"),
     # Debug: the mono layer kernels' per-phase stamps, a few steps per decode
     # token count saved under this path prefix (mono/timeline.py; the gfx1250
-    # V4.1 step: where its time goes, logged every 16 steps). Use with
-    # --enforce-eager.
+    # V4.1 step: where its time goes, averaged every 64 steps, logged and
+    # appended to <prefix>_r<rank>.jsonl). Use with --enforce-eager.
     "ATOM_MONO_TIMELINE": lambda: os.getenv("ATOM_MONO_TIMELINE"),
     # Debug: the mono kernels bound every mailbox wait (10 s): a wait that gives up
     # records its region, pair and tags, and the runner raises with them at the end

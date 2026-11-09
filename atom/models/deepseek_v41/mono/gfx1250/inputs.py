@@ -251,7 +251,7 @@ class StepInputs:
         self._hm("device_inputs")
 
     def _hm(self, name) -> None:
-        """Bring-up timing (ATOM_MONO_TIMELINE): a host time mark inside the step's preparation."""
+        """ATOM_MONO_TIMELINE: a host time mark inside the step's preparation (``debug.StepTimer``)."""
         r = getattr(self, "_t_rec", None)
         if r is not None:
             import time

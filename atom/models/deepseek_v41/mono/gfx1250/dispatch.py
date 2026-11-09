@@ -13,7 +13,7 @@ import logging
 from torch import nn
 
 from atom.models.deepseek_v41.mono.gfx1250.config import MAX_ROWS, ROWS_PER_REQ
-from atom.models.deepseek_v41.mono.gfx1250.debug import ShadowModel
+from atom.models.deepseek_v41.mono.gfx1250.debug import CheckModel
 from atom.mono.runtime.route import LazyRunner
 from atom.mono.runtime.step_override import StepOverrideModel
 from atom.utils import envs
@@ -22,7 +22,7 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
-class SingleStepModel(ShadowModel, StepOverrideModel, nn.Module):
+class SingleStepModel(CheckModel, StepOverrideModel, nn.Module):
     """The loaded V4.1 runtime model. ``ModelRunner`` offers it each decode step (``step_override``): it runs the
     step as the single launch, or declines and the production path runs (its forward, unchanged).
 
@@ -92,7 +92,7 @@ class SingleStepModel(ShadowModel, StepOverrideModel, nn.Module):
         DSpark verify with nothing the kernel does not produce: no structured output, no logprobs, no required
         channel (it returns ids and the verdict, not logits), and request shapes the kernel takes (``precheck``).
         """
-        self._step_batch = batch  # (the shadow launch's sampling parameters)
+        self._step_batch = batch  # (the ATOM_MONO_CHECK launch's sampling parameters)
         if envs.ATOM_MONO_CHECK:  # the production path serves, the launch only compares
             return None
         if batch is not None and (
@@ -116,7 +116,7 @@ class SingleStepModel(ShadowModel, StepOverrideModel, nn.Module):
             None  # a production forward: this step is not the single launch's
         )
         if inputs_embeds is None and envs.ATOM_MONO_CHECK:
-            return self.shadow_forward(input_ids, positions)
+            return self.check_forward(input_ids, positions)
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
     def compute_logits(self, hidden_states):

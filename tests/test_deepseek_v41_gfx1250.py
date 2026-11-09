@@ -251,7 +251,7 @@ def test_a_request_shape_the_kernel_refuses_takes_the_production_path(
 
 
 @needs_aiter
-def test_shadow_mode_never_serves(model, verify_step, monkeypatch):
+def test_check_mode_never_serves(model, verify_step, monkeypatch):
     monkeypatch.setenv("ATOM_MONO_CHECK", "1")
     model._single.runner = _Runner()
     assert model.single_step_runner(_batch(), 48) is None
