@@ -400,7 +400,8 @@ def validate_runtime_config(config):
             # offload read SLOT codecs this runtime does not publish.
             "KV transfer other than lmcache_mp or mooncake",
             any(
-                KVConnectorFactory.connector_name(leg) not in ("lmcache_mp", "mooncake", "mooncake_store")
+                KVConnectorFactory.connector_name(leg)
+                not in ("lmcache_mp", "mooncake", "mooncake_store")
                 for leg in transfers
             ),
         ),

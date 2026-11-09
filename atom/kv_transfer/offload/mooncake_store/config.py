@@ -282,5 +282,7 @@ def _positive_seconds(name: str, value: Any) -> float:
 def uses_replay_pages(config: Any) -> bool:
     """V4.1 restores PAGE bytes and rebuilds per-request state by replay."""
     return getattr(config.hf_config, "model_type", None) in (
-        "deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"
+        "deepseek_v41",
+        "deepseek_v41_text",
+        "deepseek_v41_dspark",
     )

@@ -1050,7 +1050,7 @@ class _EarlyDelayer:
     is_local = False
     max_queue_ms = None
     kv_high_watermark = 0.9
-    rank_prefill_costs = []
+    rank_prefill_costs = []  # noqa: RUF012
 
     def __init__(self):
         self.allow = False

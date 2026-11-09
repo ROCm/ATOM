@@ -1992,6 +1992,7 @@ def test_a_loaded_prefix_is_published_and_the_suffix_hashes_onto_it(
     engine.add(again)
     # Arrival-time lookup is asynchronous; let its background query finish.
     import time
+
     for _ in range(100):
         batch, _ = engine.schedule()
         if again.status == SequenceStatus.RUNNING:

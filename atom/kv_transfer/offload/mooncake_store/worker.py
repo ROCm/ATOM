@@ -247,18 +247,24 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         # Scheduler blocks, threaded from the model runner. MLA stores its KV
         # token-major, so the codec cannot infer the count from shape[0].
         if uses_replay_pages(self._config):
-            from atom.kv_transfer.offload.mp.connector import _replays_state
             from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+            from atom.kv_transfer.offload.mp.connector import _replays_state
+
             if not _replays_state(transfer_tensors):
-                raise ValueError("Mooncake Store V4.1 requires the PAGE replay contract")
+                raise ValueError(
+                    "Mooncake Store V4.1 requires the PAGE replay contract"
+                )
             self._codec = DSV4PageSlotCodec(
-                page_regions=transfer_tensors.block_regions, slot_regions=(),
+                page_regions=transfer_tensors.block_regions,
+                slot_regions=(),
                 num_blocks=int(num_blocks or transfer_tensors.num_blocks),
-                num_slots=0, device=torch.device("cuda", torch.cuda.current_device()),
+                num_slots=0,
+                device=torch.device("cuda", torch.cuda.current_device()),
             )
         else:
             self._codec = DenseKVByteCodec(
-                kv_caches, num_blocks=num_blocks,
+                kv_caches,
+                num_blocks=num_blocks,
                 permit_per_request_state=self._permit_per_request_state,
             )
         cfg = self._store_cfg

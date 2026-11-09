@@ -5,6 +5,7 @@ Only completed Store answers are cached, scoped to one request lifecycle.
 The worker rechecks/renews before loading; a stale answer never authorizes
 reuse of missing bytes. One executor serializes the synchronous Store client.
 """
+
 from concurrent.futures import ThreadPoolExecutor
 from threading import RLock
 
@@ -17,7 +18,9 @@ class AsyncStoreLookup:
         self.backend = backend
         self.capacity = capacity
         self.lock = RLock()
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="store-query")
+        self.executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="store-query"
+        )
         self.pending = {}
         self.discarded = set()
         self.discarded_hits = {}
@@ -52,7 +55,7 @@ class AsyncStoreLookup:
                             hit = f.result()
                             if hit is not None:
                                 self.discarded_hits[sid] = hit
-                        except Exception:
+                        except Exception:  # noqa: BLE001, S110
                             pass
 
     def pending_ids(self):
@@ -82,7 +85,7 @@ class AsyncStoreLookup:
                 return False
             try:
                 return f.result() is not None
-            except Exception:
+            except Exception:  # noqa: BLE001
                 return False
 
     def take_answer(self, sid, tokens, before=None):
@@ -107,7 +110,7 @@ class AsyncStoreLookup:
             return None
         try:
             result = f.result(timeout=30)
-        except Exception:
+        except Exception:  # noqa: BLE001
             result = None
         with self.lock:
             if self.pending.get(sid) is f and f.done():
@@ -144,4 +147,4 @@ class AsyncStoreLookup:
             for f in self.pending.values():
                 f.cancel()
             self.pending.clear()
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        self.executor.shutdown(wait=True

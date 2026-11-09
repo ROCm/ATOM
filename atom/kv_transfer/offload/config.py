@@ -417,7 +417,11 @@ def build_lmcache_config(
     try:
         from lmcache.inprocess.v1.config import LMCacheEngineConfig
     except ModuleNotFoundError as exc:
-        if exc.name not in ("lmcache.inprocess", "lmcache.inprocess.v1", "lmcache.inprocess.v1.config"):
+        if exc.name not in (
+            "lmcache.inprocess",
+            "lmcache.inprocess.v1",
+            "lmcache.inprocess.v1.config",
+        ):
             raise
         from lmcache.v1.config import LMCacheEngineConfig
 
@@ -663,10 +667,15 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     codec), but we fill them faithfully from hf_config so logging/keys are sane.
     """
     from aiter import dtypes
+
     try:
         from lmcache.inprocess.v1.metadata import LMCacheMetadata
     except ModuleNotFoundError as exc:
-        if exc.name not in ("lmcache.inprocess", "lmcache.inprocess.v1", "lmcache.inprocess.v1.metadata"):
+        if exc.name not in (
+            "lmcache.inprocess",
+            "lmcache.inprocess.v1",
+            "lmcache.inprocess.v1.metadata",
+        ):
             raise
         from lmcache.v1.metadata import LMCacheMetadata
 
