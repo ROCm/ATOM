@@ -26,6 +26,7 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
+from atom.models.qwen3_5_vl import QWEN3_5_MULTIMODAL_MODEL_TYPES
 from atom.models.qwen3_next import (
     ENABLE_ALLREDUCE_RMSNORM_FUSION,
     Qwen3NextAttention,
@@ -203,7 +204,7 @@ def _get_qwen3_5_mrope_input_positions(
         return None, 0
 
     model_type = getattr(multimodal_config, "model_type", None)
-    if model_type not in {"qwen3_5", "qwen3_5_moe"}:
+    if model_type not in QWEN3_5_MULTIMODAL_MODEL_TYPES:
         return None, 0
 
     vision_config = getattr(multimodal_config, "vision_config", None)

@@ -16,7 +16,7 @@ from atom.multimodal import (
     normalize_multimodal_data,
 )
 from atom.multimodal.media import load_multimodal_data
-from atom.multimodal.processing import prepare_multimodal_inputs
+from atom.multimodal.processing import media_token_spans, prepare_multimodal_inputs
 
 
 @pytest.fixture
@@ -509,10 +509,41 @@ def test_qwen3_5_cache_seed_tells_images_apart(image_module):
 def test_qwen3_5_image_tokens_that_disagree_with_the_grid_are_rejected(
     image_module, input_ids
 ):
-    with pytest.raises(ValueError, match="image tokens"):
+    with pytest.raises(ValueError, match="placeholder tokens"):
         prepare_qwen3_5(image_module, input_ids, [[1, 4, 4]])
 
 
 def test_other_qwen_model_types_keep_the_whole_image_merge(image_module):
     _, data = prepare_qwen3_5(image_module, [IMG] * 4, [[1, 4, 4]], "qwen4_exp")
     assert "embedding_spans" not in data and "cache_seed" not in data
+
+
+P = 9  # a placeholder id for the shared span scan
+
+
+@pytest.mark.parametrize(
+    "input_ids, counts, spans",
+    [
+        # MiniMax-M3: each run wrapped in start / end-of-image tokens.
+        ([1, 5, P, P, P, 6, 2, 5, P, P, 6], [3, 2], ((2, 3), (8, 2))),
+        # Qwen3.5: adjacent runs with no separator, split by their counts.
+        ([1, P, P, P, P, P, 2], [3, 2], ((1, 3), (4, 2))),
+        ([1, 2, 3], [], ()),
+    ],
+)
+def test_media_token_spans_claims_each_items_run_in_order(input_ids, counts, spans):
+    assert media_token_spans(input_ids, counts, P) == spans
+
+
+@pytest.mark.parametrize(
+    "input_ids, counts",
+    [
+        ([1, P, P, 2], [3]),  # run shorter than the item needs
+        ([1, P, P, 2, P], [3]),  # run split by another token
+        ([1, P, P, P, P], [3]),  # placeholder left over after the last item
+        ([1, P, P, P], [3, 1]),  # an item with no run at all
+    ],
+)
+def test_media_token_spans_rejects_runs_that_disagree_with_the_items(input_ids, counts):
+    with pytest.raises(ValueError, match="placeholder tokens"):
+        media_token_spans(input_ids, counts, P)

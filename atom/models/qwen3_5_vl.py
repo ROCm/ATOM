@@ -413,9 +413,11 @@ def _images_before_text(messages: list[dict]) -> list[dict]:
     return reordered
 
 
-# Qwen3.5 checkpoints whose image prompts carry explicit embedding spans. Same
-# model types as the Qwen3.5 MRoPE path (`_get_qwen3_5_mrope_input_positions`).
-_QWEN3_5_SPAN_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_moe"})
+# Qwen3.5 multimodal checkpoints: the model types whose image prompts carry
+# explicit embedding spans here and whose MRoPE positions `qwen3_5.py` builds.
+# Kept in this module, which the API server imports, rather than in
+# `qwen3_5.py`, which imports AITER.
+QWEN3_5_MULTIMODAL_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_moe"})
 
 
 def qwen3_5_image_spans(
@@ -428,36 +430,16 @@ def qwen3_5_image_spans(
 
     The HF Qwen processor has already expanded every ``<|image_pad|>`` into
     ``t * h * w / spatial_merge_size**2`` image tokens, one per row the vision
-    tower returns for that grid. Walk the prompt and claim each image's run in
-    turn, so adjacent images without separators split correctly too.
+    tower returns for that grid.
     """
+    from atom.multimodal.processing import media_token_spans
+
     grids = (
         image_grid_thw.tolist() if hasattr(image_grid_thw, "tolist") else image_grid_thw
     )
     merge_unit = int(spatial_merge_size) ** 2
-    spans: list[tuple[int, int]] = []
-    position = 0
-    for index, (t, h, w) in enumerate(grids):
-        count = int(t) * int(h) * int(w) // merge_unit
-        while position < len(input_ids) and input_ids[position] != image_token_id:
-            position += 1
-        run = input_ids[position : position + count]
-        found = next(
-            (i for i, token in enumerate(run) if token != image_token_id), len(run)
-        )
-        if found != count:
-            raise ValueError(
-                f"image {index} needs {count} consecutive image tokens (grid "
-                f"{t}x{h}x{w}, merge {spatial_merge_size}) but only {found} start "
-                f"at position {position}"
-            )
-        spans.append((position, count))
-        position += count
-    if any(token == image_token_id for token in input_ids[position:]):
-        raise ValueError(
-            f"prompt has more image tokens than its {len(grids)} image grids produce"
-        )
-    return tuple(spans)
+    counts = [int(t) * int(h) * int(w) // merge_unit for t, h, w in grids]
+    return media_token_spans(input_ids, counts, image_token_id)
 
 
 def build_qwen_vl_inputs(
@@ -501,7 +483,7 @@ def build_qwen_vl_inputs(
         "image_grid_thw": processed["image_grid_thw"],
     }
     multimodal_config = getattr(atom_config, "multimodal_config", None)
-    if getattr(multimodal_config, "model_type", None) in _QWEN3_5_SPAN_MODEL_TYPES:
+    if getattr(multimodal_config, "model_type", None) in QWEN3_5_MULTIMODAL_MODEL_TYPES:
         from atom.model_engine.multimodal_runtime import multimodal_cache_seed
 
         vision_config = getattr(multimodal_config, "vision_config", None)
