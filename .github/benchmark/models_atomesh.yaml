@@ -943,6 +943,245 @@ models:
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-2n-1m-c112
           concurrency: [112]
 
+      # Single-node ATOM: one aggregated server per cell, point for point the
+      # InferenceX recipe glm5.2/atom/mi355x-fp4-mtp/agentic.yaml at the golden AL.
+      agentic_agg:
+        - &glm52_agg_tp4
+          name: glm-52-mxfp4-agg-tp4-mtp-agentic-1m-c1
+          topology: agg
+          display_topology: AGG-TP4-MTP3
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [1]
+          # Unused: the aggregated server is configured by the decode block.
+          prefill: {}
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1]"
+          server:
+            common_args: &glm52_agg_args
+              kv_cache_dtype: fp8
+              block_size: 64
+              gpu_memory_utilization: 0.95
+              enable_prefix_caching: true
+              max_model_len: ""
+              max_num_seqs: 1
+              max_num_batched_tokens: 16384
+              # model.layers.78 is the BF16 MTP head; ptpc_fp8 stays off the draft.
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}'
+              method: mtp
+              num_speculative_tokens: 3
+              spec_decode_acceptance_length: 2.99
+              extra_args: "--index-cache-dtype fp4"
+          env:
+            common: &glm52_agg_mono_env
+              PYTHONNOUSERSITE: "1"
+              ATOM_MONO_ENABLE: "1"
+          benchmark: *agentic_1m_aiperf
+          run_eval: false
+
+        - <<: *glm52_agg_tp4
+          name: glm-52-mxfp4-agg-tp4-mtp-agentic-1m-c2
+          display_topology: AGG-TP4-MTP3
+          concurrency: [2]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2]"
+          server:
+            common_args:
+              <<: *glm52_agg_args
+              max_num_seqs: 2
+
+        - &glm52_agg_tp4_prod
+          <<: *glm52_agg_tp4
+          name: glm-52-mxfp4-agg-tp4-mtp-agentic-1m-c4
+          display_topology: AGG-TP4-MTP5
+          concurrency: [4]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,4,8]"
+          server:
+            common_args:
+              <<: *glm52_agg_args
+              max_num_seqs: 8
+              num_speculative_tokens: 5
+              spec_decode_acceptance_length: 3.61
+          env:
+            common: &glm52_agg_env
+              PYTHONNOUSERSITE: "1"
+              ATOM_MONO_ENABLE: "0"
+
+        - <<: *glm52_agg_tp4_prod
+          name: glm-52-mxfp4-agg-tp4-mtp-agentic-1m-c8
+          concurrency: [8]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,4,8,12,16]"
+          server:
+            common_args:
+              <<: *glm52_agg_args
+              max_num_seqs: 16
+              num_speculative_tokens: 5
+              spec_decode_acceptance_length: 3.61
+
+        - <<: *glm52_agg_tp4_prod
+          name: glm-52-mxfp4-agg-tp4-mtp-agentic-1m-c10
+          display_topology: AGG-TP4-MTP4
+          concurrency: [10]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,4,8,12,16,20]"
+          server:
+            common_args:
+              <<: *glm52_agg_args
+              max_num_seqs: 20
+              num_speculative_tokens: 4
+              spec_decode_acceptance_length: 3.33
+
+        # DCP4 shards the decode KV and adds the LMCache DRAM tier, 256 GiB per rank.
+        - &glm52_agg_tp4_dcp4
+          <<: *glm52_agg_tp4_prod
+          name: glm-52-mxfp4-agg-tp4-dcp4-mtp-agentic-lmcache-1m-c16
+          display_topology: AGG-TP4-DCP4-MTP4
+          concurrency: [16]
+          decode:
+            workers: 1
+            tp: 4
+            dcp: 4
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32]"
+          server:
+            common_args:
+              <<: *glm52_agg_args
+              max_num_seqs: 32
+              num_speculative_tokens: 4
+              spec_decode_acceptance_length: 3.33
+          env:
+            common: *glm52_agg_env
+            decode: &glm52_agg_lmcache_env
+              # DCP sparse prefill builds the group's query heads locally.
+              ATOM_DCP_PREFILL_QREP: "1"
+              PYTHONHASHSEED: "0"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_NUMA_MODE: auto
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+              LMCACHE_CHUNK_SIZE: "256"
+              OFFLOAD_MIN_LOAD_TOKENS: "8192"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"lmcache_offload","kv_role":"offload"}
+
+        - <<: *glm52_agg_tp4_dcp4
+          name: glm-52-mxfp4-agg-tp4-dcp4-mtp-agentic-lmcache-1m-c24
+          concurrency: [24]
+          decode:
+            workers: 1
+            tp: 4
+            dcp: 4
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48]"
+          server:
+            common_args:
+              <<: *glm52_agg_args
+              max_num_seqs: 48
+              num_speculative_tokens: 4
+              spec_decode_acceptance_length: 3.33
+
+        - <<: *glm52_agg_tp4_dcp4
+          name: glm-52-mxfp4-agg-tp4-dcp4-mtp-agentic-lmcache-1m-c32
+          concurrency: [32]
+          decode:
+            workers: 1
+            tp: 4
+            dcp: 4
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64]"
+          server:
+            common_args:
+              <<: *glm52_agg_args
+              max_num_seqs: 64
+              num_speculative_tokens: 4
+              spec_decode_acceptance_length: 3.33
+
+        - <<: *glm52_agg_tp4_dcp4
+          name: glm-52-mxfp4-agg-tp4-dcp4-mtp-agentic-lmcache-1m-c40
+          concurrency: [40]
+          decode:
+            workers: 1
+            tp: 4
+            dcp: 4
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80]"
+          server:
+            common_args:
+              <<: *glm52_agg_args
+              max_num_seqs: 80
+              num_speculative_tokens: 4
+              spec_decode_acceptance_length: 3.33
+
+        - <<: *glm52_agg_tp4_dcp4
+          name: glm-52-mxfp4-agg-tp4-dcp4-mtp-agentic-lmcache-1m-c48
+          display_topology: AGG-TP4-DCP4-MTP3
+          concurrency: [48]
+          decode:
+            workers: 1
+            tp: 4
+            dcp: 4
+            cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96]"
+          server:
+            common_args:
+              <<: *glm52_agg_args
+              max_num_seqs: 96
+              num_speculative_tokens: 3
+              spec_decode_acceptance_length: 2.99
+
+        # TP8 stays GPU-resident with no KV offload.
+        - &glm52_agg_tp8
+          <<: *glm52_agg_tp4_prod
+          name: glm-52-mxfp4-agg-tp8-mtp-agentic-1m-c1
+          display_topology: AGG-TP8-MTP5
+          concurrency: [1]
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: "[1,2]"
+          server:
+            common_args:
+              <<: *glm52_agg_args
+              max_num_seqs: 2
+              num_speculative_tokens: 5
+              spec_decode_acceptance_length: 3.61
+
+        - <<: *glm52_agg_tp8
+          name: glm-52-mxfp4-agg-tp8-mtp-agentic-1m-c2
+          concurrency: [2]
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: "[1,2,4]"
+          server:
+            common_args:
+              <<: *glm52_agg_args
+              max_num_seqs: 4
+              num_speculative_tokens: 5
+              spec_decode_acceptance_length: 3.61
+
+        - <<: *glm52_agg_tp8
+          name: glm-52-mxfp4-agg-tp8-mtp-agentic-1m-c4
+          concurrency: [4]
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: "[1,2,4,8]"
+          server:
+            common_args:
+              <<: *glm52_agg_args
+              max_num_seqs: 8
+              num_speculative_tokens: 5
+              spec_decode_acceptance_length: 3.61
+
     accuracy:
       task: gsm8k
       fewshot: 20
