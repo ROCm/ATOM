@@ -2975,13 +2975,10 @@ class Config:
                 # load. Overriding it here would accept the flag and ignore it.
                 self.index_cache_dtype = "fp8"
             else:
-                # M3's fp4 KV keeps an FP8 index plane: its own choice, not the
-                # KV dtype's. An explicit --index-cache-dtype is never overridden.
-                self.index_cache_dtype = (
-                    "fp8"
-                    if is_m3 and self.kv_cache_dtype == "fp4"
-                    else self.kv_cache_dtype
-                )
+                # M3's fp4 KV takes the fp4 index with it (the MXFP4 attention reads
+                # the selector's rows, which only that scorer sizes to match);
+                # `validate_runtime_config` refuses an explicit other index.
+                self.index_cache_dtype = self.kv_cache_dtype
         if self.speculative_config is not None:
             from atom.kv_transfer.offload.mp.deployment import (
                 _config_has_own_pool_draft,

@@ -1833,12 +1833,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             max_query_len,
             sparse_metadata.max_seq_len,
         )
-        # The rows the metadata was built for (`sparse_decode_batch`). On a DP step
-        # q has more (a prefill bucket's pad) or, ragged, fewer rows; the selector
-        # writes, and so attention may read, only these -- the rest of the output
-        # is zero. After the cache key: skip-index layers hold only the full shape.
-        rows = decode_md.seq_lens.shape[0] * max_query_len
-        assert rows <= q.shape[0], (rows, q.shape)
+        # MXFP4 index: the rows the metadata was built for (`decode_rows_batch`). On a
+        # DP step q has more (a prefill bucket's pad); the selector writes, and so
+        # attention may read, only these -- the rest of the output is zero. After the
+        # cache key: skip-index layers hold only the full shape.
+        rows = q.shape[0]
+        if self.index_cache_dtype == "fp4":
+            rows = decode_md.seq_lens.shape[0] * max_query_len
+            assert rows <= q.shape[0], (rows, q.shape)
         cached_topk = self._load_cached_topk(sparse_metadata, topk_key)
         if cached_topk is None:
             if index_q is None:

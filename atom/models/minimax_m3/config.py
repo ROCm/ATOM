@@ -70,6 +70,13 @@ def validate_runtime_config(config):
         raise ValueError(
             "MXFP4 KV / index caches do not run under the vLLM/SGLang bridges"
         )
+    if kv_fp4 and config.index_cache_dtype != "fp4":
+        # `sparse_pa_mxfp4` walks every row of q; only the MXFP4 index scorer is
+        # sized to those rows, the other index caches' selectors can leave some unwritten.
+        raise ValueError(
+            "--kv-cache-dtype fp4 needs --index-cache-dtype fp4, "
+            f"got {config.index_cache_dtype}"
+        )
     if kv_fp4:
         why = _mxfp4_kv_refusal(config)
         if why is not None:

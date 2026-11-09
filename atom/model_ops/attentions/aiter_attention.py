@@ -1376,11 +1376,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
             # the DECODE sparse path; the decode kernels handle q>1 per-token
             # causal internally via max_query_len.
-            # The rows the sparse decode runs, for every index cache: a DP step
-            # can hand the layers more rows (a prefill bucket's pad) or fewer
-            # than `running_bs * q`; `_sparse_decode` slices q to these.
-            index_bs = decode_rows_batch(
-                scheduled_bs, running_bs, running_tokens, max_seqlen_q
+            # The MXFP4 scorer takes its batch off the rows of idx_q, which a DP step
+            # can make more (a prefill bucket's pad) or fewer than `running_bs * q`;
+            # `_sparse_decode` slices q / idx_q to the rows of this batch. The other
+            # index caches keep the padded batch.
+            index_bs = (
+                decode_rows_batch(
+                    scheduled_bs, running_bs, running_tokens, max_seqlen_q
+                )
+                if self._index_score_kwargs()
+                else running_bs
             )
             sparse_block_tables = self._get_sparse_attention_block_tables(
                 attn_metadata.block_tables[:index_bs],

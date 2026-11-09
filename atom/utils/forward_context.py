@@ -812,8 +812,8 @@ class DPStage:
 
 
 def decode_rows_batch(scheduled_bs, running_bs, running_tokens, max_query_len):
-    """Requests whose rows a decode step's sparse attention runs -- its index scorer
-    and selector, and the attention itself, whatever the index cache.
+    """Requests whose rows a decode step's sparse attention runs under the MXFP4
+    index cache -- its scorer and selector, and the attention itself.
 
     The activations have ``running_tokens`` rows and the per-request arrays
     ``running_bs``; they differ on a DP step (`ForwardMode`). A rank

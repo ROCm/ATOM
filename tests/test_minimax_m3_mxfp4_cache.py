@@ -183,7 +183,7 @@ def check(monkeypatch, *, hf=None, text_config=False, **kw):
     text = PretrainedConfig(**(sparse_hf() if hf is None else hf))
     fields = {
         "kv_cache_dtype": "fp4",
-        "index_cache_dtype": "fp8",
+        "index_cache_dtype": "fp4",
         "kv_cache_block_size": 128,
         "torch_dtype": torch.bfloat16,
         "kv_transfer_config": {},
@@ -198,6 +198,11 @@ def check(monkeypatch, *, hf=None, text_config=False, **kw):
 @pytest.mark.parametrize("text_config", [False, True])
 def test_an_all_sparse_m3_passes_the_kv_gate(monkeypatch, text_config):
     check(monkeypatch, text_config=text_config)
+
+
+def test_an_fp4_kv_with_another_index_cache_is_refused(monkeypatch):
+    with pytest.raises(ValueError, match="needs --index-cache-dtype fp4, got fp8"):
+        check(monkeypatch, index_cache_dtype="fp8")
 
 
 @pytest.mark.parametrize("kv", ["fp4", "fp8"])  # the MXFP4 index alone is held to it
@@ -266,12 +271,11 @@ def test_v41_still_takes_a_fp4_kv():  # the refusal elsewhere: test_v4_indexer_d
 @pytest.mark.parametrize(
     ("kv", "index", "want"),
     [
-        # KV-only: the index keeps its own fp8 default, not the KV's fp4.
-        ("fp4", None, ("fp4", "fp8")),
+        # KV fp4: the index follows it (the MXFP4 attention needs the MXFP4 scorer).
+        ("fp4", None, ("fp4", "fp4")),
         # index-only: KV stays as asked.
         ("bf16", "fp4", ("bf16", "fp4")),
         ("fp4", "fp4", ("fp4", "fp4")),
-        ("fp4", "fp8", ("fp4", "fp8")),
         ("fp8", None, ("fp8", "fp8")),
     ],
 )
@@ -289,9 +293,9 @@ def test_m3_fp4_hashes_apart_from_fp8(monkeypatch):
     hf = sparse_hf()
     fp8 = _m3(monkeypatch, kv_cache_dtype="fp8", index_cache_dtype="fp8", hf=hf)
     fp4 = _m3(monkeypatch, kv_cache_dtype="fp4", index_cache_dtype="fp4", hf=hf)
-    kv_only = _m3(monkeypatch, kv_cache_dtype="fp4", index_cache_dtype="fp8", hf=hf)
+    index_only = _m3(monkeypatch, kv_cache_dtype="fp8", index_cache_dtype="fp4", hf=hf)
 
-    assert len({fp8.compute_hash(), fp4.compute_hash(), kv_only.compute_hash()}) == 3
+    assert len({fp8.compute_hash(), fp4.compute_hash(), index_only.compute_hash()}) == 3
 
 
 # ────────────────────────────────────────────── the draft's own KV dtype ──

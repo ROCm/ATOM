@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""Which requests the sparse decode (scorer, selector, attention) runs -- one rule
-for every index cache -- and the MXFP4 scorer's per-ubatch buffers (CPU).
+"""Which requests the sparse decode (scorer, selector, attention) runs under the
+MXFP4 index cache, and that scorer's per-ubatch buffers (CPU).
 
 The MXFP4 scorer takes its batch off the rows of ``idx_q``, so the lengths and
 block-table rows it is handed must be that many, on a padded step (a graph bucket,
@@ -278,16 +278,17 @@ def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
 def test_the_sparse_decode_runs_only_the_rows_the_metadata_covers(
     monkeypatch, kv, index, q_rows
 ):
-    """Whatever the KV and index caches, the scorer, the selector and the attention
-    get the same ``seq_lens.shape[0] * q`` rows; pad rows past them are never read
-    (the selector never wrote them) and the output is zero there. The skip-index
-    layer after it keys its cached selection on the unsliced shape."""
+    """With the MXFP4 index the scorer, the selector and the attention get the same
+    ``seq_lens.shape[0] * q`` rows; pad rows past them are never read (the selector
+    never wrote them) and the output is zero there. Another index cache keeps every
+    row, as before. The skip-index layer after it keys its cached selection on the
+    unsliced shape."""
     pytest.importorskip("aiter")
     from atom.model_ops import attention_mha
     from atom.model_ops.minimax_m3 import index_topk, sparse_attn, sparse_attn_mxfp4
 
     batch, mq, heads, hq = 3, 2, 1, 4
-    rows = batch * mq
+    rows = batch * mq if index == "fp4" else q_rows
     seen = {}
 
     def topk(idx_q, cache, block_table, seq_lens, *a, **kw):
