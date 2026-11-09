@@ -162,9 +162,10 @@ class SingleStepRunner(RunnerDebug):
         self._fast = {}  # rows -> the width's launchers (``_fast_launchers``)
         # the step is two launches (``prepare``): target .. verification, then the draft; the verdict's copies and the
         # output D2H wait for the first only (``verify_outputs`` / ``verify_ready``)
-        self.split = True   # (ModelRunner reads it: the step's output ids are the kernel's, ready at ``verify_ready``)
         self._ev_verify = torch.cuda.Event()
+        # ModelRunner's output D2H waits for it (its ``forward_done_event`` on a served step; marked as this runner's)
         self.verify_ready = torch.cuda.Event()
+        self.verify_ready.single_launch = True
         self._verify_stream = torch.cuda.Stream()
         self._timer = StepTimer(self.rank, envs.ATOM_MONO_SINGLE_TIMING_EVERY) if envs.ATOM_MONO_SINGLE_TIMING else None
         self._eng_rows = None

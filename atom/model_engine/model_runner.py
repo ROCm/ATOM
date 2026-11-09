@@ -3581,12 +3581,12 @@ class ModelRunner:
 
         # Drafter input must agree across TP ranks. Ids only: the verdict is
         # deterministic on TP ranks' bit-identical inputs.
-        # A split single launch's ids are the kernel's, identical on every TP
-        # rank (and a broadcast here would wait for its draft launch).
-        single_split = getattr(getattr(self, "_single_served", None), "split", False)
+        # A single launch's ids are the kernel's, identical on every TP rank
+        # (and a broadcast here would wait for its draft launch).
+        single = getattr(self, "_single_served", None)
         if (
             get_tp_group().world_size > 1
-            and not single_split
+            and single is None
             and _needs_id_sync(
                 self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
             )
@@ -3617,13 +3617,12 @@ class ModelRunner:
                 # One bit-preserving broadcast for scores, candidate IDs and ranks.
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
-        if single_split:
+        if single is not None:
             # The output D2H waits for the verdict's copies, not the draft launch.
-            self.forward_done_event = self._single_served.verify_ready
+            self.forward_done_event = single.verify_ready
         else:
-            if self.forward_done_event is getattr(
-                getattr(self, "_single_served", None), "verify_ready", None
-            ):
+            if getattr(self.forward_done_event, "single_launch", False):
+                # (the last step's was the single launch's event: record our own)
                 self.forward_done_event = torch.cuda.Event()
             self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
