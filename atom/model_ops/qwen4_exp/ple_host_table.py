@@ -80,10 +80,14 @@ class PleHostTable:
         """Take this rank's rows of checkpoint shard `shard`, from global row
         `row_start`; a shard already held (a weight sync) is written in place."""
         with self._lock:
-            held = shard in self._rows or shard in self._released
+            self._check_resumed("sync its rows")
+            held = shard in self._rows
         if held:
             self.sync_rows(row_start, rows)
-            return
+        else:
+            self._take_rows(shard, row_start, rows)
+
+    def _take_rows(self, shard: int, row_start: int, rows: torch.Tensor) -> None:
         if not self._in_hbm:
             pinned = host_memory.pin_rows([rows.contiguous()], copy=True)
             with self._lock:
@@ -150,9 +154,9 @@ class PleHostTable:
         parameters). The graphs that captured `shard_bases` are released
         first, and `hipHostFree` waits for the device."""
         with self._lock:
-            if self._in_hbm or self._released:
+            if self._in_hbm:
                 return
-            self._released = {
+            self._released |= {
                 shard: (row_start, pinned.shape[0])
                 for shard, (row_start, pinned) in self._rows.items()
             }
@@ -161,12 +165,15 @@ class PleHostTable:
     def resume(self) -> None:
         """Page-lock the released rows again, at new addresses and with
         undefined values, as the parameters are reallocated; the weight sync
-        after a resume writes them."""
+        after a resume writes them. A shard stays released until it is back,
+        so a resume that runs out of memory can be retried."""
         with self._lock:
-            released, self._released = self._released, {}
-        for shard, (row_start, num_rows) in released.items():
+            released = list(self._released.items())
+        for shard, (row_start, num_rows) in released:
             rows = torch.empty(num_rows, self.dim, dtype=self.dtype, device="cpu")
-            self.load_rows(shard, row_start, rows)
+            self._take_rows(shard, row_start, rows)
+            with self._lock:
+                del self._released[shard]
 
     def _to_hbm(self) -> None:
         """Make `weight` the table on `device`, with the rows pinned so far;

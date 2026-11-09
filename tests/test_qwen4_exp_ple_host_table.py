@@ -262,6 +262,60 @@ def test_releasing_the_weights_releases_the_table(fake_pin, monkeypatch, fail_at
     assert _bitwise_equal(got, new[ids])
 
 
+@pytest.mark.parametrize("sleep_again", [False, True])
+@pytest.mark.parametrize("shard", [0, 1])
+@pytest.mark.parametrize("failure", ["rows", "fallback"])
+def test_a_resume_that_runs_out_of_memory_can_be_retried(
+    fake_pin, monkeypatch, failure, shard, sleep_again
+):
+    """A resume that fails at a shard -- its rows cannot be allocated, or
+    page-locking is refused and the table does not fit on the device either
+    -- keeps the shards it has not restored: the table stays released, a
+    release frees the shards already back, and once memory is back a retry
+    restores them and the sync after it is read where the addresses point."""
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    table = _table()
+    model = _Model()
+    emb = model.ple.ngram_embedding
+    _load(table, emb.table)
+    emb.bind()
+    runner = _runner(model)
+    runner.release_memory(tags=["weights"])
+
+    empty, allocations = torch.empty, 0
+
+    def scarce(*size, **kwargs):
+        nonlocal allocations
+        if len(size) == 2 and size[1] == DIM:
+            allocations += 1
+            if allocations == shard + 1 + (failure == "fallback"):
+                raise RuntimeError("out of memory")
+        return empty(*size, **kwargs)
+
+    if failure == "fallback":
+        fake_pin.fail_at = fake_pin.calls + shard + 1
+    monkeypatch.setattr(torch, "empty", scarce)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        runner.resume_memory(tags=["weights"])
+    monkeypatch.setattr(torch, "empty", empty)
+    fake_pin.fail_at = None
+    with pytest.raises(ValueError, match="released; take its addresses after"):
+        emb.table.shard_bases(NUM_SHARDS)
+    if sleep_again:
+        runner.release_memory(tags=["weights"])
+        assert emb.table.pinned_bytes == 0
+
+    runner.resume_memory(tags=["weights"])
+    assert emb.table.on_host
+    assert emb.table.pinned_bytes == table.nbytes
+    new = table.neg()
+    assert _updater(model).update_weights(_sync_tensors(new, torch.ones(4, 4), True))
+    ids = _probe_ids(TABLE_ROWS)
+    got = _follow(emb.shard_bases, ids, 0, TABLE_ROWS, table.dtype)
+    assert _bitwise_equal(got, new[ids])
+
+
 @pytest.mark.parametrize("shards", [False, True])
 @pytest.mark.parametrize("fail_at", [None, 1])
 def test_a_sync_between_release_and_resume_is_out_of_order(
