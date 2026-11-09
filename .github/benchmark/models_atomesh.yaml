@@ -2669,7 +2669,11 @@ models:
         draft_model: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c/dspark
         num_speculative_tokens: 7
         hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
-        extra_args: --index-cache-dtype mxfp4
+        # uvicorn's 5 s keep-alive default is shorter than the router's 50 s
+        # pool idle timeout; a request sent on a socket the server just closed
+        # makes the router retry P+D and orphans the first attempt's D leg,
+        # whose KV pages stay held about 120 s.
+        extra_args: --index-cache-dtype mxfp4 --timeout-keep-alive 900
     service:
       prefill:
         cudagraph: '[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64]'
