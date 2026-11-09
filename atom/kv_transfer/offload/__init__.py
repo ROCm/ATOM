@@ -63,4 +63,7 @@ KVConnectorFactory.register(
     # V4.1 restores PAGE bytes through the block-region map (replay pages).
     reads_block_regions=True,
     copies_whole_block_regions=True,
+    # A Mooncake Store is shared by every DP rank and is measured against
+    # HBM-only prefix caching, so it serves what HBM would.
+    min_load_tokens=512,
 )

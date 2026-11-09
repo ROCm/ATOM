@@ -2240,7 +2240,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             return False, "stateful_nonzero_hbm_floor", hbm, lmc, need, chunk
         if hbm % chunk != 0:
             return False, "unaligned_hbm_prefill", hbm, lmc, need, chunk
-        min_load = int(getattr(self, "_min_load_tokens", 8192))
+        min_load = int(self._min_load_tokens)
         if need < min_load:
             return False, "too_small", hbm, lmc, need, chunk
         return True, "aligned_large_hit", hbm, lmc, need, chunk
@@ -2360,7 +2360,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 lmc,
                 seq.offload_loaded_tokens,
                 need,
-                int(getattr(self, "_min_load_tokens", 8192)),
+                int(self._min_load_tokens),
                 len(list(seq.block_table)),
             )
             loading_sids.add(sid)

@@ -74,6 +74,11 @@ def _optional_int_env(name: str, *, min_value: int | None = None) -> int | None:
     return value
 
 
+def _non_negative_or_none(value: int | None) -> int | None:
+    """A negative value clamps to 0; None stays None."""
+    return None if value is None else max(0, value)
+
+
 def _int_env(name: str, default: int) -> int:
     """Unset or empty reads as ``default``; anything else must be an integer."""
     value = _optional_int_env(name)
@@ -1331,8 +1336,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
         "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
     ),
-    "OFFLOAD_MIN_LOAD_TOKENS": lambda: max(
-        0, _int_env_or_default("OFFLOAD_MIN_LOAD_TOKENS", 8192)
+    # None when unset: each tier then uses its own default
+    # (`offload.config.resolve_min_load_tokens`).
+    "OFFLOAD_MIN_LOAD_TOKENS": lambda: _non_negative_or_none(
+        _optional_int_env("OFFLOAD_MIN_LOAD_TOKENS")
     ),
     "OFFLOAD_MIN_SAVE_TOKENS": lambda: max(
         0, _int_env_or_default("OFFLOAD_MIN_SAVE_TOKENS", 8192)

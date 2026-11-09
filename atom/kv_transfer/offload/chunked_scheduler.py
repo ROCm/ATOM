@@ -289,7 +289,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if not self._do_load or self._lookup_client is None:
             return False
         uncached = int(seq.num_tokens) - max(0, int(num_hbm_tokens))
-        return uncached < int(getattr(self, "_min_load_tokens", 8192))
+        return uncached < int(self._min_load_tokens)
 
     def can_detach_lookup(self, seq, num_hbm_tokens: int) -> bool:
         """Whether admission may proceed without waiting for `seq`'s lookup.
@@ -703,7 +703,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return False, "hbm_satisfies_after_alloc", hbm, lmc, need, chunk
         if hbm % chunk != 0:
             return False, "unaligned_hbm_prefill", hbm, lmc, need, chunk
-        min_load = int(getattr(self, "_min_load_tokens", 8192))
+        min_load = int(self._min_load_tokens)
         if need < min_load:
             return False, "too_small", hbm, lmc, need, chunk
         return True, "aligned_large_hit", hbm, lmc, need, chunk
@@ -898,7 +898,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 lmc,
                 seq.offload_loaded_tokens,
                 need,
-                int(getattr(self, "_min_load_tokens", 8192)),
+                int(self._min_load_tokens),
                 len(list(seq.block_table)),
             )
             loading_sids.add(sid)

@@ -2987,7 +2987,7 @@ class Config:
         from atom.kv_transfer.offload.config import resolve_min_load_tokens
 
         # Resolve once before spawning workers, identically for CLI and API.
-        self.offload_min_load_tokens = resolve_min_load_tokens(self.kv_transfer_config)
+        self.offload_min_load_tokens = resolve_min_load_tokens(self)
 
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.

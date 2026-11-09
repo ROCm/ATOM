@@ -340,24 +340,10 @@ def validate_runtime_config(config):
     from atom.config import CUDAGraphMode
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-    transfer = config.kv_transfer_config
-    connector = KVConnectorFactory.connector_name(transfer)
-    transfers = [transfer] if connector is not None else []
-    if connector == "multi":
-        # P/D with CPU offload composes one Mooncake leg and one MP tier.
-        # Validate the concrete legs, including Mooncake's explicit role.
-        transfers = transfer.get("connectors")
-        if (
-            not isinstance(transfers, (list, tuple))
-            or len(transfers) != 2
-            or not all(isinstance(leg, dict) for leg in transfers)
-            or sorted(KVConnectorFactory.connector_name(leg) or "" for leg in transfers)
-            not in (["lmcache_mp", "mooncake"], ["mooncake", "mooncake_store"])
-        ):
-            raise ValueError(
-                "DeepSeek-V4.1 runtime does not support KV transfer other than "
-                "lmcache_mp, mooncake_store or mooncake; multi requires mooncake plus one offload tier"
-            )
+    # The concrete legs, `multi` expanded; None for a `multi` that lists none.
+    leaves = KVConnectorFactory.leaf_connectors(config)
+    names = None if leaves is None else sorted(name for name, _ in leaves)
+    is_multi = KVConnectorFactory.connector_name(config.kv_transfer_config) == "multi"
 
     unsupported = []
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
@@ -396,13 +382,23 @@ def validate_runtime_config(config):
         (
             # `lmcache_mp` checkpoints STATE through the backend's PAGE-backed
             # copies; Mooncake P/D moves whole PAGE units plus the request's one
-            # STATE slot (`get_kv_transfer_tensors`). MoRI-IO and in-process
-            # offload read SLOT codecs this runtime does not publish.
-            "KV transfer other than lmcache_mp or mooncake",
-            any(
-                KVConnectorFactory.connector_name(leg)
-                not in ("lmcache_mp", "mooncake", "mooncake_store")
-                for leg in transfers
+            # STATE slot (`get_kv_transfer_tensors`), and the Mooncake Store
+            # restores PAGE bytes and rebuilds the state by replay. MoRI-IO and
+            # in-process offload read SLOT codecs this runtime does not publish.
+            # P/D with CPU offload composes one Mooncake leg and one offload tier.
+            (
+                "KV transfer other than lmcache_mp, mooncake_store or mooncake "
+                "(multi: mooncake plus one offload tier)"
+            ),
+            names is None
+            or any(
+                name not in ("lmcache_mp", "mooncake", "mooncake_store")
+                for name in names
+            )
+            or (
+                is_multi
+                and names
+                not in (["lmcache_mp", "mooncake"], ["mooncake", "mooncake_store"])
             ),
         ),
         (
@@ -412,9 +408,10 @@ def validate_runtime_config(config):
             # into the slot before handing it over.
             "Mooncake P/D without an explicit kv_role",
             any(
-                KVConnectorFactory.connector_name(leg) == "mooncake"
-                and leg.get("kv_role") not in ("kv_producer", "kv_consumer")
-                for leg in transfers
+                name == "mooncake"
+                and leaf.kv_transfer_config.get("kv_role")
+                not in ("kv_producer", "kv_consumer")
+                for name, leaf in leaves or ()
             ),
         ),
         ("RapidServe", config.enable_rapidserve),

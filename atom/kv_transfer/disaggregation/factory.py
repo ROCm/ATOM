@@ -93,6 +93,7 @@ class KVConnectorFactory:
     # Whether a backend is a KV offload tier, whose scheduler half rewrites the
     # completion sets it is handed (`process_completions`). Absent means no.
     _offload: ClassVar[dict[str, bool]] = {}
+    _min_load_tokens: ClassVar[dict[str, int | None]] = {}
 
     @classmethod
     def register(
@@ -108,6 +109,7 @@ class KVConnectorFactory:
         copies_whole_block_regions: bool = False,
         requires_pd_staging: bool = True,
         offload: bool = False,
+        min_load_tokens: int | None = None,
     ) -> None:
         """Register a KV connector backend.
 
@@ -119,6 +121,9 @@ class KVConnectorFactory:
             scheduler_class: Class name within *scheduler_module*.
             offload: The backend is a KV offload tier; a ``multi`` runs at most
                 one (`is_offload_backend`).
+            min_load_tokens: This tier's own default for the smallest hit worth
+                loading (`offload_min_load_tokens`); None keeps the global
+                default.
         """
         cls._registry[name] = {
             "worker_module": worker_module,
@@ -143,6 +148,7 @@ class KVConnectorFactory:
         cls._reads_block_regions[name] = bool(reads_block_regions)
         cls._copies_whole_block_regions[name] = bool(copies_whole_block_regions)
         cls._offload[name] = bool(offload)
+        cls._min_load_tokens[name] = min_load_tokens
 
     @classmethod
     def canonical_name(cls, value: object, *, path: str = "kv_transfer_config") -> str:
@@ -169,6 +175,19 @@ class KVConnectorFactory:
         """Whether the registered backend ``name`` (canonical) is an offload tier."""
 
         return cls._offload.get(name, False)
+
+    @classmethod
+    def offload_min_load_tokens(cls, config: Any) -> int | None:
+        """The configured offload tier's own default `min_load_tokens`, or None.
+
+        A ``multi`` runs at most one offload tier, so this reads that leaf, not
+        the P/D transport beside it.
+        """
+
+        for name, _ in cls.leaf_connectors(config) or ():
+            if cls.is_offload_backend(name):
+                return cls._min_load_tokens.get(name)
+        return None
 
     @classmethod
     def connector_name(cls, kv_transfer_config: dict[str, Any] | None) -> str | None:

@@ -16,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from dataclasses import asdict, is_dataclass
 from math import isfinite
 from numbers import Integral
@@ -762,25 +761,25 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     )
 
 
-def resolve_min_load_tokens(kv_transfer_config: dict | None) -> int:
-    """Resolve a tier's default without changing another engine's environment."""
+# The smallest tier hit worth loading unless the user or the tier says otherwise.
+DEFAULT_MIN_LOAD_TOKENS = 8192
+
+
+def resolve_min_load_tokens(config) -> int:
+    """`OFFLOAD_MIN_LOAD_TOKENS` for this configuration: the user's value, else
+    the configured offload tier's own default, else `DEFAULT_MIN_LOAD_TOKENS`.
+
+    Resolved per configuration (`Config.offload_min_load_tokens`), never written
+    into the process environment, so another engine in the process keeps its own.
+    """
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
     from atom.utils import envs
 
-    if "OFFLOAD_MIN_LOAD_TOKENS" in os.environ:
-        return envs.OFFLOAD_MIN_LOAD_TOKENS
-    config = kv_transfer_config or {}
-    subs = (
-        config.get("connectors", [])
-        if str(config.get("kv_connector", "")).strip().casefold() == "multi"
-        else [config]
-    )
-    if any(
-        isinstance(sub, dict)
-        and str(sub.get("kv_connector", "")).strip().casefold() == "mooncake_store"
-        for sub in subs
-    ):
-        return 512
-    return 8192
+    override = envs.OFFLOAD_MIN_LOAD_TOKENS
+    if override is not None:
+        return override
+    tier = KVConnectorFactory.offload_min_load_tokens(config)
+    return DEFAULT_MIN_LOAD_TOKENS if tier is None else tier
 
 
 def min_load_tokens(config) -> int:
@@ -788,4 +787,4 @@ def min_load_tokens(config) -> int:
     value = getattr(config, "offload_min_load_tokens", None)
     if value is not None:
         return int(value)
-    return resolve_min_load_tokens(getattr(config, "kv_transfer_config", None))
+    return resolve_min_load_tokens(config)

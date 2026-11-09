@@ -22,6 +22,7 @@ from atom.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
+from atom.kv_transfer.offload.config import min_load_tokens
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import (
@@ -206,7 +207,7 @@ class BlockManager:
         *,
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
     ):
-        self._offload_config = config
+        self._min_load_tokens = min_load_tokens(config)
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
@@ -819,9 +820,7 @@ class BlockManager:
             return hit
         # The connector skips a load under OFFLOAD_MIN_LOAD_TOKENS, so neither
         # LMCache figure counts unless it clears that above where it starts.
-        from atom.kv_transfer.offload.config import min_load_tokens
-
-        min_load = min_load_tokens(getattr(self, "_offload_config", None))
+        min_load = self._min_load_tokens
         resume = hit * hbs
         tier_hit = int(seq.offload_joint.kv_prefix_tokens or 0)
         if tier_hit - resume >= min_load:
