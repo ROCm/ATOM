@@ -5,9 +5,11 @@
 K1 fuses the attention-residual seam, projections, convolution and recurrent
 attention into one rank-local launch. K2 keeps the production output projection
 and its collective, uses the faster production AttnRes kernel, then runs native
-router/latent/shared projections and a persistent MXFP4 expert finish around
-regular TP collectives. The latent is quantized by its producer before the
-packed all-gather, so peers consume FP4 directly instead of re-quantizing BF16.
+router/latent/shared projections and a persistent finish (routing and the shared
+expert) around regular TP collectives. The latent is quantized by its producer
+before the packed all-gather, so peers consume FP4 directly instead of
+re-quantizing BF16; with GUGU expert planes AITER's grouped TDM MoE reads that
+FP4 latent and the finish's routes for the routed experts.
 """
 
 from __future__ import annotations
@@ -16,14 +18,19 @@ import logging
 from dataclasses import dataclass, replace
 
 import torch
-from aiter import QuantType, dtypes
+from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.parallel_state import get_tp_group
+from aiter.fused_moe import fused_moe
+from aiter.ops.flydsl.moe_common import GateMode
 
 from atom.models.kimi_k3.mono.config import (
     EXPERTS,
     GFX1250_BLOCKS,
     HIDDEN,
     LATENT,
+    SITU_BETA,
+    SITU_LINEAR_BETA,
+    TOPK,
 )
 from atom.models.kimi_k3.mono.external_collectives import FrontPayloadLayout
 from atom.models.kimi_k3.mono.k1_local_runner_gfx1250 import (
@@ -117,6 +124,7 @@ class Gfx1250RoutedK2Build:
     finish: object
     finalize: object
     buffers: dict[str, torch.Tensor]
+    grouped_experts: bool
 
 
 @dataclass(frozen=True)
@@ -278,11 +286,14 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             include_attention=False,
             reset=reset,
         )
+        # AITER's grouped TDM MoE reads GUGU gate/up planes only.
+        grouped = gu_interleave
         finish = build_packed_finish(
             plan,
             gu_interleave=gu_interleave,
+            include_routed=not grouped,
         )
-        finalize = build_finalize_local(plan)
+        finalize = build_finalize_local(plan, input_normalized=True)
         payload = FrontPayloadLayout(rows)
         tiles = plan.token_tiling.tile_count
 
@@ -296,14 +307,20 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             "front_scratch": torch.zeros(
                 front.scratch_bytes, dtype=torch.uint8, device=self.device
             ),
-            "route": empty((rows, 32), torch.int32),
-            "tile_route": empty((tiles, 16, 32), torch.int32),
+            "route": empty((rows, TOPK if grouped else 2 * TOPK), torch.int32),
+            "tile_route": (
+                empty((rows, TOPK))
+                if grouped
+                else empty((tiles, 16, 32), torch.int32)
+            ),
             "flags": empty((tiles, EXPERTS), torch.int32),
             "experts": empty((tiles, 256), torch.int32),
             "kof": empty((tiles, 256, 16), torch.int32),
             "union_sizes": empty((tiles,), torch.int32),
             "latent_fp4": empty((rows, LATENT // 8), torch.int32),
-            "latent_scales": empty((rows, LATENT // 32), torch.int32),
+            "latent_scales": empty(
+                (rows, LATENT // 32), torch.uint8 if grouped else torch.int32
+            ),
             "intermediate_fp4": empty((tiles, 256, self.dims.inter // 8), torch.int32),
             "intermediate_scales": empty(
                 (tiles, 256, self.dims.inter // 32), torch.int32
@@ -322,6 +339,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             finish,
             finalize,
             buffers,
+            grouped,
         )
 
     def forward(
@@ -466,9 +484,29 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             buffers["finish_scratch"].data_ptr(),
             stream=stream,
         )
+        moe = self.inner.layers[plan.layer_id].block_sparse_moe
+        if local.grouped_experts:
+            fused_moe(
+                buffers["latent_fp4"].view(torch.uint8).view(dtypes.fp4x2),
+                weight.w13.view(dtypes.fp4x2),
+                weight.w2.view(dtypes.fp4x2),
+                buffers["tile_route"],
+                buffers["route"],
+                activation=ActivationType.Situv2,
+                quant_type=QuantType.per_1x32,
+                w1_scale=moe.experts.w13_weight_scale,
+                w2_scale=moe.experts.w2_weight_scale,
+                a1_scale=buffers["latent_scales"],
+                dtype=torch.bfloat16,
+                beta=SITU_BETA,
+                linear_beta=SITU_LINEAR_BETA,
+                gate_mode=GateMode.INTERLEAVE.value,
+                output=buffers["routed"],
+            )
         routed = get_tp_group().all_reduce(buffers["routed"], ca_fp8_quant=False)
         if routed is None:
             routed = buffers["routed"]
+        routed = moe.routed_expert_norm(routed)
         local.finalize.launcher(
             routed.data_ptr(),
             buffers["shared"].data_ptr(),

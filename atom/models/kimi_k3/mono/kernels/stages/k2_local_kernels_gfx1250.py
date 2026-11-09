@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float32, Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import (
@@ -258,14 +258,23 @@ def build_oproj_local(
 
 def build_finalize_local(
     plan: Gfx1250KimiBuildPlan,
+    *,
+    input_normalized: bool = False,
+    fast_band: bool | None = None,
 ) -> LocalKernelEntryPoint:
     """Emit RMSNorm, sharded routed-up, and shared-partial merge."""
 
     _require_plan(plan)
+    if fast_band is None:
+        # The in-kernel RMSNorm path is slower with the hoisted band loads.
+        fast_band = input_normalized
     rows = plan.tokens
     tile_count = plan.token_tiling.tile_count
     row_stride = LATENT + LDS_PAD
-    name = f"k3_k2_gfx1250_finalize_local_s{rows}"
+    name = (
+        f"k3_k2_gfx1250_finalize_local_s{rows}_n{int(input_normalized)}"
+        f"_f{int(fast_band)}"
+    )
 
     @fx.struct
     class Smem:
@@ -309,31 +318,32 @@ def build_finalize_local(
         tile,
         epsilon,
     ):
-        if wave == 0:
-            for local_token in range_constexpr(WMMA_TOKEN_ROWS):
-                token = fx.min(
-                    tile * WMMA_TOKEN_ROWS + local_token,
-                    rows - 1,
-                )
-                total = fx.Float32(0.0)
-                for task in range_constexpr(LNORM_TASKS):
-                    pair0 = token * (LATENT // 2) + task * 64 + lane
-                    pair1 = pair0 + 32
-                    word0 = _load_pair(routed_reduced, pair0)
-                    word1 = _load_pair(routed_reduced, pair1)
-                    low0, high0 = bf_lo(word0), bf_hi(word0)
-                    low1, high1 = bf_lo(word1), bf_hi(word1)
-                    pair0_sum = low0 * low0 + high0 * high0
-                    pair1_sum = low1 * low1 + high1 * high1
-                    partial = pair0_sum + pair1_sum
-                    task_sum = wave_sum(partial, GFX1250)
-                    total = total + task_sum
-                if lane == 0:
-                    fx.ptr_store(
-                        hw_rsq(total * fx.Float32(1.0 / LATENT) + epsilon),
-                        shared.rstd.ptr + local_token,
+        if not input_normalized:
+            if wave == 0:
+                for local_token in range_constexpr(WMMA_TOKEN_ROWS):
+                    token = fx.min(
+                        tile * WMMA_TOKEN_ROWS + local_token,
+                        rows - 1,
                     )
-        gpu.barrier()
+                    total = fx.Float32(0.0)
+                    for task in range_constexpr(LNORM_TASKS):
+                        pair0 = token * (LATENT // 2) + task * 64 + lane
+                        pair1 = pair0 + 32
+                        word0 = _load_pair(routed_reduced, pair0)
+                        word1 = _load_pair(routed_reduced, pair1)
+                        low0, high0 = bf_lo(word0), bf_hi(word0)
+                        low1, high1 = bf_lo(word1), bf_hi(word1)
+                        pair0_sum = low0 * low0 + high0 * high0
+                        pair1_sum = low1 * low1 + high1 * high1
+                        partial = pair0_sum + pair1_sum
+                        task_sum = wave_sum(partial, GFX1250)
+                        total = total + task_sum
+                    if lane == 0:
+                        fx.ptr_store(
+                            hw_rsq(total * fx.Float32(1.0 / LATENT) + epsilon),
+                            shared.rstd.ptr + local_token,
+                        )
+            gpu.barrier()
 
         pairs = WMMA_TOKEN_ROWS * LATENT // 2
         for index in range_constexpr((pairs + THREADS - 1) // THREADS):
@@ -349,19 +359,21 @@ def build_finalize_local(
                     routed_reduced,
                     token * (LATENT // 2) + column_pair,
                 )
-                weight = _load_pair(norm_weight, column_pair)
-                inverse = fx.ptr_load(shared.rstd.ptr + local_token)
-                normalized = (
-                    fx.Vector.from_elements(
-                        [
-                            bf_lo(word) * inverse * bf_lo(weight),
-                            bf_hi(word) * inverse * bf_hi(weight),
-                        ],
-                        fx.Float32,
+                normalized = word
+                if not input_normalized:
+                    weight = _load_pair(norm_weight, column_pair)
+                    inverse = fx.ptr_load(shared.rstd.ptr + local_token)
+                    normalized = (
+                        fx.Vector.from_elements(
+                            [
+                                bf_lo(word) * inverse * bf_lo(weight),
+                                bf_hi(word) * inverse * bf_hi(weight),
+                            ],
+                            fx.Float32,
+                        )
+                        .to(fx.BFloat16)
+                        .bitcast(fx.Int32)[0]
                     )
-                    .to(fx.BFloat16)
-                    .bitcast(fx.Int32)[0]
-                )
                 fx.ptr_store(
                     normalized,
                     shared.normalized.ptr
@@ -370,8 +382,47 @@ def build_finalize_local(
         gpu.barrier()
 
     @traced
+    def stage_normalized_tile(routed_reduced, shared, tid, tile):
+        """Copy already-normalized rows into LDS as 8-BF16 vectors."""
+
+        vectors = WMMA_TOKEN_ROWS * LATENT // 8
+        for index in range_constexpr((vectors + THREADS - 1) // THREADS):
+            vector = tid + THREADS * index
+            if vector < vectors:
+                local_token = vector // (LATENT // 8)
+                column = (vector % (LATENT // 8)) * 8
+                token = fx.min(
+                    tile * WMMA_TOKEN_ROWS + local_token,
+                    rows - 1,
+                )
+                value = fx.Vector(
+                    bo.buffer_load(
+                        rsrc(routed_reduced),
+                        (token * LATENT + column) // 2,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
+                )
+                fx.ptr_store(
+                    value,
+                    shared.normalized.ptr + (local_token * row_stride + column) // 2,
+                )
+        gpu.barrier()
+
+    def band_loads(weight, lane, wave, task, rank):
+        return gemv_gfx1250.loads(
+            lane,
+            wave,
+            WAVES,
+            weight,
+            (task - rank * UP_TASKS) * ROWS,
+            LATENT,
+        )
+
+    @traced
     def add_routed_band(
         weight,
+        base_source,
         output,
         shared,
         tid,
@@ -380,16 +431,10 @@ def build_finalize_local(
         task,
         tile,
         rank,
+        operands=None,
     ):
-        local_task = task - rank * UP_TASKS
-        operands = gemv_gfx1250.loads(
-            lane,
-            wave,
-            WAVES,
-            weight,
-            local_task * ROWS,
-            LATENT,
-        )
+        if operands is None:
+            operands = band_loads(weight, lane, wave, task, rank)
         accumulator = gemv_gfx1250.mfmas(
             lane,
             wave,
@@ -417,7 +462,7 @@ def build_finalize_local(
                 token = tile * WMMA_TOKEN_ROWS + local_token
                 if token < rows:
                     location = (token * HIDDEN + task * ROWS + 2 * pair) // 2
-                    base = _load_pair(output, location)
+                    base = _load_pair(base_source, location)
                     low = bf16_round(
                         bf_lo(base)
                         + gemv_gfx1250.row_sum(
@@ -456,32 +501,67 @@ def build_finalize_local(
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
         shared = fx.SharedAllocator().allocate(Smem).peek()
-        copy_shared(shared_partial, output, tid, task, tile)
-        rocdl.s_wait_storecnt(0)
-        gpu.barrier()
         routed_task = (task >= rank * UP_TASKS) & (task < (rank + 1) * UP_TASKS)
-        if routed_task:
-            normalize_tile(
-                routed_reduced,
-                norm_weight,
-                shared,
-                tid,
-                lane,
-                wave,
-                tile,
-                epsilon,
-            )
-            add_routed_band(
-                weight,
-                output,
-                shared,
-                tid,
-                lane,
-                wave,
-                task,
-                tile,
-                rank,
-            )
+        if const_expr(fast_band):
+            # Band CTAs add the shared partial directly; their weight loads
+            # are in flight while the activation tile is staged.
+            if routed_task:
+                operands = band_loads(weight, lane, wave, task, rank)
+                if const_expr(input_normalized):
+                    stage_normalized_tile(routed_reduced, shared, tid, tile)
+                else:
+                    normalize_tile(
+                        routed_reduced,
+                        norm_weight,
+                        shared,
+                        tid,
+                        lane,
+                        wave,
+                        tile,
+                        epsilon,
+                    )
+                add_routed_band(
+                    weight,
+                    shared_partial,
+                    output,
+                    shared,
+                    tid,
+                    lane,
+                    wave,
+                    task,
+                    tile,
+                    rank,
+                    operands,
+                )
+            else:
+                copy_shared(shared_partial, output, tid, task, tile)
+        else:
+            copy_shared(shared_partial, output, tid, task, tile)
+            rocdl.s_wait_storecnt(0)
+            gpu.barrier()
+            if routed_task:
+                normalize_tile(
+                    routed_reduced,
+                    norm_weight,
+                    shared,
+                    tid,
+                    lane,
+                    wave,
+                    tile,
+                    epsilon,
+                )
+                add_routed_band(
+                    weight,
+                    output,
+                    output,
+                    shared,
+                    tid,
+                    lane,
+                    wave,
+                    task,
+                    tile,
+                    rank,
+                )
 
     @flyc.jit
     def launch(

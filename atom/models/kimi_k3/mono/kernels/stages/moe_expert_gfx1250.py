@@ -240,10 +240,15 @@ def ug_loads(c, task, gu_interleave=False):
 
 
 @traced
-def stage_ug(c, task, operands, gu_interleave=False):
-    """N32 gate/up WMMA, SiTUv2, and one MXFP4 output group."""
+def stage_ug(c, task, operands, gu_interleave=False, valid=None):
+    """N32 gate/up WMMA, SiTUv2, and one MXFP4 output group.
+
+    With ``valid`` set, even and odd waves own two independent tasks: each
+    wave passes its own ``task`` and ``valid`` says whether it may store.
+    """
 
     tokens, lane, wave = c["S"], c["lane"], c["wave"]
+    paired = valid is not None
     slot = task // UG_GROUPS
     group = task % UG_GROUPS
     token = fx.min(lane % 16, tokens - 1)
@@ -253,7 +258,15 @@ def stage_ug(c, task, operands, gu_interleave=False):
     steps = [
         half * (LATENT // K_STEP // 2) + index for index in range(LATENT // K_STEP // 2)
     ]
-    if wave % 2 == 0:
+    red_base = 0
+    compute = wave % 2 == 0
+    epilogue = wave == 0
+    if const_expr(paired):
+        red_base = (wave % 2) * 4
+        compute = wave < 8
+        epilogue = wave < 2
+        live = live & valid
+    if compute:
         accumulator = _zero_accumulator()
         for index in range_constexpr(len(steps)):
             step = steps[index]
@@ -270,18 +283,22 @@ def stage_ug(c, task, operands, gu_interleave=False):
             )
         fx.ptr_store(
             accumulator,
-            c["expert_red"] + _red_offset(wave // 2, lane),
+            c["expert_red"] + _red_offset(red_base + wave // 2, lane),
         )
     gpu.barrier()
 
-    if wave == 0:
+    if epilogue:
         if const_expr(gu_interleave):
             logical = []
             for tile in range_constexpr(2):
                 physical = [
-                    fx.ptr_load(c["expert_red"] + _red_offset(tile, lane) + element)
+                    fx.ptr_load(
+                        c["expert_red"] + _red_offset(red_base + tile, lane) + element
+                    )
                     + fx.ptr_load(
-                        c["expert_red"] + _red_offset(tile + 2, lane) + element
+                        c["expert_red"]
+                        + _red_offset(red_base + tile + 2, lane)
+                        + element
                     )
                     for element in range_constexpr(16)
                 ]
@@ -305,11 +322,15 @@ def stage_ug(c, task, operands, gu_interleave=False):
             values = []
             for element in range_constexpr(16):
                 gate = fx.ptr_load(
-                    c["expert_red"] + _red_offset(0, lane) + element
-                ) + fx.ptr_load(c["expert_red"] + _red_offset(2, lane) + element)
+                    c["expert_red"] + _red_offset(red_base, lane) + element
+                ) + fx.ptr_load(
+                    c["expert_red"] + _red_offset(red_base + 2, lane) + element
+                )
                 up = fx.ptr_load(
-                    c["expert_red"] + _red_offset(1, lane) + element
-                ) + fx.ptr_load(c["expert_red"] + _red_offset(3, lane) + element)
+                    c["expert_red"] + _red_offset(red_base + 1, lane) + element
+                ) + fx.ptr_load(
+                    c["expert_red"] + _red_offset(red_base + 3, lane) + element
+                )
                 values.append(_situ(gate, up))
 
         maximum = fx.Float32(0.0)

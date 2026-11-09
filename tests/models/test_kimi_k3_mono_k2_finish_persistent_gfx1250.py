@@ -22,19 +22,22 @@ def _plan(rows):
 @pytest.mark.parametrize("rows", (1, 16, 17, 32, 33, 48))
 @pytest.mark.parametrize("gu_interleave", (False, True))
 @pytest.mark.parametrize("include_shared", (False, True))
+@pytest.mark.parametrize("include_routed", (False, True))
 def test_persistent_finish_is_one_launch_with_static_resident_grid(
-    rows, gu_interleave, include_shared
+    rows, gu_interleave, include_shared, include_routed
 ):
     candidate = build_packed_finish(
         _plan(rows),
         gu_interleave=gu_interleave,
         include_shared=include_shared,
+        include_routed=include_routed,
     )
     assert candidate.grid == (256,)
     assert candidate.block == (256,)
     assert candidate.launch_count == 1
     assert candidate.required_lds_bytes == 113_664
-    assert candidate.name.endswith(f"_gu{int(gu_interleave)}_sh{int(include_shared)}")
+    assert f"_gu{int(gu_interleave)}_sh{int(include_shared)}_" in candidate.name
+    assert candidate.name.endswith(f"_r{int(include_routed)}")
 
 
 def test_persistent_finish_abi_is_packed_and_rank_local():

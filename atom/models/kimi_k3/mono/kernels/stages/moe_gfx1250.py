@@ -188,16 +188,17 @@ def stage_route(c, token, front_payload_words=0):
             total = total + fx.ptr_load(red + 64 + item)
         inverse = fx.Float32(1.0) / total
         if lane < TOPK:
-            c["put"](
-                c["route"],
-                token * 2 * TOPK + rank,
-                fx.min(fx.max(my_expert, 0), fx.Int32(EXPERTS - 1)),
-            )
-            c["put"](
-                c["route"],
-                token * 2 * TOPK + TOPK + rank,
-                my_sigmoid * inverse,
-            )
+            expert = fx.min(fx.max(my_expert, 0), fx.Int32(EXPERTS - 1))
+            if const_expr("route_weights" in c):
+                c["put"](c["route"], token * TOPK + rank, expert)
+                c["put"](c["route_weights"], token * TOPK + rank, my_sigmoid * inverse)
+            else:
+                c["put"](c["route"], token * 2 * TOPK + rank, expert)
+                c["put"](
+                    c["route"],
+                    token * 2 * TOPK + TOPK + rank,
+                    my_sigmoid * inverse,
+                )
     gpu.barrier()
 
 
