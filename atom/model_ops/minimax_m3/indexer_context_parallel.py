@@ -1,8 +1,11 @@
 """Opt-in M3 compute-only index context partitioning, independent of global DCP."""
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from atom.model_ops.minimax_m3.index_topk import (
     DECODE_TOPK_BLOCK_SIZE_K,
@@ -19,6 +22,13 @@ from atom.model_ops.minimax_m3.index_topk import (
 CP_SCORE_PROGRAMS = 1024
 CP_SCORE_MIN_SPAN = 2  # blocks a program scores at least
 CP_SCORE_PAD_TILE = 64  # -inf slots a store writes past the live blocks
+
+
+@functools.cache
+def _transposed_score() -> bool:
+    # As the gfx1250 TP decode scorer (ROCm/ATOM#2982): Q as WMMA's M operand,
+    # the converted K as its N operand, K loads streaming. Same bits.
+    return get_gfx_runtime() == "gfx1250"
 
 
 def _context_score_programs(batch: int, local_blocks: int) -> int:
@@ -51,6 +61,7 @@ def _context_score(
     PAD_TILE: tl.constexpr,
     N: tl.constexpr,
     SCALE: tl.constexpr,
+    TRANSPOSED: tl.constexpr,
 ):
     request = tl.program_id(0)
     tokens = tl.num_programs(0) * QUERY_LEN
@@ -74,23 +85,28 @@ def _context_score(
     if start < end:
         d = tl.arange(0, 128)
         pos = tl.arange(0, 128)
-        q = tl.load(
-            Q
-            + row[None, :] * Q_TOKEN_STRIDE
-            + head[None, :] * Q_HEAD_STRIDE
-            + d[:, None],
-            mask=live[None, :],
-            other=0,
-        )
+        q_rows = Q + row * Q_TOKEN_STRIDE + head * Q_HEAD_STRIDE
+        if TRANSPOSED:
+            q = tl.load(q_rows[:, None] + d[None, :], mask=live[:, None], other=0)
+        else:
+            q = tl.load(q_rows[None, :] + d[:, None], mask=live[None, :], other=0)
         for local in tl.range(start, end):
             block = local * WORLD + RANK
             page = tl.load(Table + request * TABLE_STRIDE + block).to(tl.int64)
-            k = tl.load(Cache + page * 128 * 128 + pos[:, None] * 128 + d[None, :])
-            dot = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32) * SCALE
-            dot = tl.where(
-                block * 128 + pos[:, None] < cutoff[None, :], dot, float("-inf")
-            )
-            tl.store(s_row + local, tl.max(dot, 0), mask=live)
+            k_page = Cache + page * 128 * 128
+            if TRANSPOSED:
+                k = tl.load(
+                    k_page + pos[None, :] * 128 + d[:, None], cache_modifier=".cv"
+                )
+                dot = tl.dot(q, k.to(q.dtype), out_dtype=tl.float32) * SCALE
+                in_ctx = block * 128 + pos[None, :] < cutoff[:, None]
+                score = tl.max(tl.where(in_ctx, dot, float("-inf")), 1)
+            else:
+                k = tl.load(k_page + pos[:, None] * 128 + d[None, :])
+                dot = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32) * SCALE
+                in_ctx = block * 128 + pos[:, None] < cutoff[None, :]
+                score = tl.max(tl.where(in_ctx, dot, float("-inf")), 0)
+            tl.store(s_row + local, score, mask=live)
     # Every output slot is overwritten, including empty shards and replay padding.
     pad_span = (LOCAL_BLOCKS - live_end + programs - 1) // programs
     lo = live_end + program * pad_span
@@ -195,6 +211,7 @@ def indexer_context_scores(
             PAD_TILE=CP_SCORE_PAD_TILE,
             N=max(16, triton.next_power_of_2(heads * max_query_len)),
             SCALE=sm_scale * 1.4426950409,
+            TRANSPOSED=_transposed_score(),
             num_stages=3,
         )
     return scores
