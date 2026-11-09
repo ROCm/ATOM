@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash API recipe
 
-This recipe covers ordinary APIs, beta text APIs and image inputs merged into ROCm/ATOM main. Use latest `main`, including #3111 and #3115 (merged by `0a99b2b9`); the runtime source is not the documentation branch. The examples target the ATOM Python API server directly. The basic non-DSpark launch below also serves images when the complete multimodal checkpoint is installed.
+This recipe covers ordinary APIs, beta text APIs and image inputs merged into ROCm/ATOM main. Use latest `main`, including #3111 and #3115 (merged by `0a99b2b9`). The examples target the ATOM Python API server directly. The basic non-DSpark launch below also serves images when the complete multimodal checkpoint is installed.
 
 ## 1. Install and start the basic service
 
@@ -51,36 +51,20 @@ From another host, replace `127.0.0.1` with the reachable server address. The la
 
 ## 2. Request examples
 
-The standalone request files are in [examples/deepseek-v41-api](examples/deepseek-v41-api) on the documentation branch. Run the server from latest `main`; extract the examples into a separate client directory without switching the serving checkout:
+Run the following examples from any client directory; no additional Git branch or example-file checkout is required. Each Bash block creates its request JSON locally before sending it.
 
 ```bash
-cd /path/to/ATOM
-git fetch origin refs/heads/lirzhang/v41-api-recipe-20261109:refs/remotes/origin/lirzhang/v41-api-recipe-20261109
-mkdir -p /tmp/v41-api-examples
-git archive origin/lirzhang/v41-api-recipe-20261109 recipes/examples/deepseek-v41-api | tar -x -C /tmp/v41-api-examples
-cd /tmp/v41-api-examples/recipes/examples/deepseek-v41-api
+mkdir -p ~/v41-api-requests
+cd ~/v41-api-requests
 export BASE_URL=http://127.0.0.1:8000
 ```
 
-Use curl 7.76 or later for `--fail-with-body`: it preserves the error body and returns a nonzero exit status on HTTP 4xx/5xx. Then run the curl command beside each example. Each JSON file can also be copied and edited independently.
-
-### Run a local smoke check
-
-The included checker uses Python's standard library to submit the examples and retain each JSON/SSE response. Run it after `/v1/models` is reachable:
-
-```bash
-python3 check-api.py --base-url "$BASE_URL"
-# Include the supplied base64 image examples on the native, non-DSpark service:
-python3 check-api.py --base-url "$BASE_URL" --images --output-dir api-check-with-images
-```
-
-The checker fails on HTTP errors, missing visible answers/probabilities, malformed example JSON output, missing tool calls, or incomplete/failed stream termination. It writes `summary.json` and raw responses under the output directory. Inspect image answers and generated FIM code as well: these checks are a smoke test, not broad model-quality or performance qualification. `--urls` additionally enables the public-URL image examples and requires server-side internet access.
+Use curl 7.76 or later for `--fail-with-body`: it preserves the error body and returns a nonzero exit status on HTTP 4xx/5xx. Replace the base URL when the client runs on another host.
 
 ### Plain Chat
 
-`chat.json`:
-
-```json
+```bash
+cat > chat.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "messages": [
@@ -95,6 +79,7 @@ The checker fails on HTTP errors, missing visible answers/probabilities, malform
     "type": "disabled"
   }
 }
+JSON
 ```
 
 ```bash
@@ -107,9 +92,8 @@ Read the answer from `choices[0].message.content`.
 
 ### Streaming Chat
 
-`chat-stream.json`:
-
-```json
+```bash
+cat > chat-stream.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "messages": [
@@ -128,6 +112,7 @@ Read the answer from `choices[0].message.content`.
     "include_usage": true
   }
 }
+JSON
 ```
 
 ```bash
@@ -140,9 +125,8 @@ SSE chunks carry `choices[].delta`. V4.1 usage is on the finish chunk; earlier c
 
 ### Thinking / reasoning effort
 
-`chat-thinking.json`:
-
-```json
+```bash
+cat > chat-thinking.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "messages": [
@@ -157,6 +141,7 @@ SSE chunks carry `choices[].delta`. V4.1 usage is on the finish chunk; earlier c
   "reasoning_effort": "high",
   "max_tokens": 2048
 }
+JSON
 ```
 
 ```bash
@@ -169,9 +154,8 @@ Read reasoning from `message.reasoning_content` and the visible answer from `mes
 
 ### Responses
 
-`responses.json`:
-
-```json
+```bash
+cat > responses.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "input": "What is 2 + 2? Answer briefly.",
@@ -180,6 +164,7 @@ Read reasoning from `message.reasoning_content` and the visible answer from `mes
   },
   "max_output_tokens": 256
 }
+JSON
 ```
 
 ```bash
@@ -192,9 +177,8 @@ Read assistant text from the output message content blocks. Supply full input/hi
 
 ### Streaming Responses
 
-`responses-stream.json`:
-
-```json
+```bash
+cat > responses-stream.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "input": "What is 2 + 2? Answer briefly.",
@@ -204,6 +188,7 @@ Read assistant text from the output message content blocks. Supply full input/hi
   "max_output_tokens": 256,
   "stream": true
 }
+JSON
 ```
 
 ```bash
@@ -216,9 +201,8 @@ Consume typed SSE events, including reasoning/text deltas and a terminal `respon
 
 ### Anthropic Messages
 
-`messages.json`:
-
-```json
+```bash
+cat > messages.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "messages": [
@@ -232,6 +216,7 @@ Consume typed SSE events, including reasoning/text deltas and a terminal `respon
   },
   "max_tokens": 256
 }
+JSON
 ```
 
 ```bash
@@ -245,9 +230,8 @@ Read the visible answer from text blocks in `content`. For streaming add `"strea
 
 ### Anthropic thinking
 
-`messages-thinking.json`:
-
-```json
+```bash
+cat > messages-thinking.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "messages": [
@@ -265,6 +249,7 @@ Read the visible answer from text blocks in `content`. For streaming add `"strea
     "effort": "high"
   }
 }
+JSON
 ```
 
 ```bash
@@ -278,9 +263,8 @@ curl --fail-with-body -sS "$BASE_URL/v1/messages" \
 
 ### Chat token logprobs
 
-`chat-logprobs.json`:
-
-```json
+```bash
+cat > chat-logprobs.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "messages": [
@@ -297,6 +281,7 @@ curl --fail-with-body -sS "$BASE_URL/v1/messages" \
   "logprobs": true,
   "top_logprobs": 5
 }
+JSON
 ```
 
 ```bash
@@ -309,9 +294,8 @@ Read `choices[0].logprobs.content`; reasoning probabilities use the correspondin
 
 ### JSON object
 
-`chat-json.json`:
-
-```json
+```bash
+cat > chat-json.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "messages": [
@@ -329,6 +313,7 @@ Read `choices[0].logprobs.content`; reasoning probabilities use the correspondin
     "type": "json_object"
   }
 }
+JSON
 ```
 
 ```bash
@@ -341,9 +326,8 @@ Ask for JSON in the prompt and pass `response_format`. Parse `message.content` a
 
 ### Chat JSON Schema
 
-`chat-schema.json`:
-
-```json
+```bash
+cat > chat-schema.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "messages": [
@@ -381,6 +365,7 @@ Ask for JSON in the prompt and pass `response_format`. Parse `message.content` a
     }
   }
 }
+JSON
 ```
 
 ```bash
@@ -393,9 +378,8 @@ The schema belongs in the request, not the startup command. Parse `message.conte
 
 ### Responses JSON Schema
 
-`responses-schema.json`:
-
-```json
+```bash
+cat > responses-schema.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "input": "Return city Paris and temperature_c 20.",
@@ -427,6 +411,7 @@ The schema belongs in the request, not the startup command. Parse `message.conte
     }
   }
 }
+JSON
 ```
 
 ```bash
@@ -439,9 +424,8 @@ Responses uses `text.format`, rather than Chat’s `response_format`. Read the v
 
 ### Ordinary function tools
 
-`chat-tools.json`:
-
-```json
+```bash
+cat > chat-tools.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "messages": [
@@ -483,6 +467,7 @@ Responses uses `text.format`, rather than Chat’s `response_format`. Read the v
     }
   }
 }
+JSON
 ```
 
 ```bash
@@ -495,9 +480,8 @@ The reply contains `message.tool_calls`. The client executes the function, then 
 
 ### Beta fill-in-the-middle
 
-`fim.json`:
-
-```json
+```bash
+cat > fim.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "prompt": "def add(a, b):\n",
@@ -505,6 +489,7 @@ The reply contains `message.tool_calls`. The client executes the function, then 
   "temperature": 0,
   "max_tokens": 128
 }
+JSON
 ```
 
 ```bash
@@ -517,9 +502,8 @@ Return `choices[0].text` is the generated middle: compose `prompt + generated te
 
 ### Beta assistant-prefix continuation
 
-`prefix.json`:
-
-```json
+```bash
+cat > prefix.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "messages": [
@@ -539,6 +523,7 @@ Return `choices[0].text` is the generated middle: compose `prompt + generated te
   "temperature": 0,
   "max_tokens": 128
 }
+JSON
 ```
 
 ```bash
@@ -551,9 +536,8 @@ Only the final assistant message may carry `prefix: true`. The returned content 
 
 ### Beta strict function tools
 
-`strict-tools.json`:
-
-```json
+```bash
+cat > strict-tools.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "messages": [
@@ -596,6 +580,7 @@ Only the final assistant message may carry `prefix: true`. The returned content 
     }
   }
 }
+JSON
 ```
 
 ```bash
@@ -608,9 +593,8 @@ curl --fail-with-body -sS "$BASE_URL/beta/chat/completions" \
 
 ### Flash web_search declaration compatibility
 
-`flash-search-declaration.json`:
-
-```json
+```bash
+cat > flash-search-declaration.json <<'JSON'
 {
   "model": "DeepSeek-V4.1-Flash",
   "input": "What is 2 + 2? Answer briefly.",
@@ -624,6 +608,7 @@ curl --fail-with-body -sS "$BASE_URL/beta/chat/completions" \
     }
   ]
 }
+JSON
 ```
 
 ```bash
@@ -656,11 +641,125 @@ The same native instance can handle ordinary text requests and images. Begin wit
 
 ### Ready-to-run local image examples
 
-The example directory includes `sample-red.png`, a generated red square, and request files for all three APIs. The client sends image bytes; it does not ask the server to read your local path.
+Create the image helper locally by copying this block. It reads images on the client, encodes their bytes and creates requests for all three APIs; it does not ask the server to read a local path.
 
 ```bash
-cd /tmp/v41-api-examples/recipes/examples/deepseek-v41-api
-export BASE_URL=http://127.0.0.1:8000
+cat > build-image-requests.py <<'PY'
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Build Chat, Responses and Messages image requests; no extra packages needed."""
+
+import argparse
+import base64
+import copy
+import json
+from pathlib import Path
+
+
+def read_image(path):
+    data = path.read_bytes()
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        media_type = "image/png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        media_type = "image/jpeg"
+    elif data.startswith((b"GIF87a", b"GIF89a")):
+        media_type = "image/gif"
+    elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        media_type = "image/webp"
+    else:
+        raise ValueError(f"Unsupported image format: {path}")
+    if len(data) > 32 * 1024 * 1024:
+        raise ValueError(f"Image exceeds 32 MiB: {path}")
+    encoded = base64.b64encode(data).decode("ascii")
+    return media_type, encoded
+
+
+def build_requests(images, prompt, model):
+    chat_parts = [{"type": "text", "text": prompt}]
+    responses_parts = [{"type": "input_text", "text": prompt}]
+    messages_parts = [{"type": "text", "text": prompt}]
+    for media_type, encoded in images:
+        url = f"data:{media_type};base64,{encoded}"
+        chat_parts.append(
+            {"type": "image_url", "image_url": {"url": url, "detail": "auto"}}
+        )
+        responses_parts.append(
+            {"type": "input_image", "image_url": url, "detail": "auto"}
+        )
+        messages_parts.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": encoded,
+                },
+            }
+        )
+    return {
+        "chat": {
+            "model": model,
+            "messages": [{"role": "user", "content": chat_parts}],
+            "thinking": {"type": "disabled"},
+            "temperature": 0,
+            "max_tokens": 256,
+        },
+        "responses": {
+            "model": model,
+            "input": [{"role": "user", "content": responses_parts}],
+            "reasoning": {"effort": "none"},
+            "temperature": 0,
+            "max_output_tokens": 256,
+        },
+        "messages": {
+            "model": model,
+            "messages": [{"role": "user", "content": messages_parts}],
+            "thinking": {"type": "disabled"},
+            "temperature": 0,
+            "max_tokens": 256,
+        },
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("image", type=Path)
+    parser.add_argument("--second", type=Path)
+    parser.add_argument("--prompt")
+    parser.add_argument("--model", default="DeepSeek-V4.1-Flash")
+    parser.add_argument("--output-dir", type=Path, default=Path("."))
+    args = parser.parse_args()
+    paths = [args.image] + ([args.second] if args.second else [])
+    images = [read_image(path) for path in paths]
+    prompt = args.prompt or (
+        "Compare the first and second images. Describe each in that order."
+        if args.second
+        else "Describe this image briefly."
+    )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    for endpoint, body in build_requests(images, prompt, args.model).items():
+        for stream in (False, True):
+            request = copy.deepcopy(body)
+            suffix = "-stream" if stream else ""
+            if stream:
+                request["stream"] = True
+                if endpoint == "chat":
+                    request["stream_options"] = {"include_usage": True}
+            target = args.output_dir / f"{endpoint}-image{suffix}.json"
+            target.write_text(json.dumps(request, indent=2) + "\n", encoding="utf8")
+            print(target)
+
+
+if __name__ == "__main__":
+    main()
+PY
+python3 - <<'PY'
+import base64
+from pathlib import Path
+Path("sample-red.png").write_bytes(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC"))
+PY
+python3 build-image-requests.py sample-red.png --prompt "What color is the square? Answer briefly."
 
 curl --fail-with-body -sS "$BASE_URL/v1/chat/completions" \
   -H 'Content-Type: application/json' --data-binary @chat-image.json
@@ -671,17 +770,17 @@ curl --fail-with-body -sS "$BASE_URL/v1/messages" \
   -H 'anthropic-version: 2023-06-01' --data-binary @messages-image.json
 ```
 
-Each request asks for the square's color, so check that the visible answer describes red. This is a simple image-content smoke check, not a visual benchmark. For streaming, use the corresponding `chat-image-stream.json`, `responses-image-stream.json` or `messages-image-stream.json` and add `curl -N`. Stream framing is the same as each endpoint's text stream.
+Check that the visible answer describes red. For streaming, use the generated `chat-image-stream.json`, `responses-image-stream.json` or `messages-image-stream.json` and add `curl -N`.
 
-To use your own image, the included standard-library-only helper writes the six request files (JSON/SSE × three interfaces):
+To use your own image:
 
 ```bash
 python3 build-image-requests.py /path/on/the/client/photo.png
-# Optional second image: preserves first/second order and asks to compare them.
+# Optional second image, in first/second order:
 python3 build-image-requests.py first.png --second second.jpg
 ```
 
-The helper reads the image on the **client**, base64-encodes it, and writes JSON. Use JPEG, PNG, GIF or WebP. Change its `--prompt` or edit the text block in the generated JSON to ask your own question. GIF means its first frame; this is not video serving.
+Use JPEG, PNG, GIF or WebP. Change `--prompt` to ask your own question. GIF uses its first frame.
 
 ### Protocol shapes
 
@@ -689,11 +788,11 @@ The helper reads the image on the **client**, base64-encodes it, and writes JSON
 - **Responses:** `input` contains a `user` message with `input_text` and `{"type":"input_image","image_url":"data:image/png;base64,<encoded bytes>","detail":"auto"}`.
 - **Messages:** a `user` message contains `text` and `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"<encoded bytes>"}}`. Here `data` is raw base64, without a `data:` prefix.
 
-The bundled JSON files contain actual sample bytes, rather than the placeholders above.
+The helper generates JSON containing the actual image bytes.
 
 ### Public image URLs
 
-Three additional files (`chat-image-url.json`, `responses-image-url.json`, `messages-image-url.json`) use a public HTTPS example image. Replace that URL with a public image URL you control for repeatable tests; the server must have egress access.
+To use a public HTTPS image, edit the generated request using the following shapes. Use an image URL you control for repeatable tests; the server must have egress access.
 
 - Chat: `image_url.url` is the public URL.
 - Responses: `input_image.image_url` is the public URL.
