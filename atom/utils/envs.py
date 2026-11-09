@@ -588,51 +588,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
-    # DeepSeek-V4.1 on gfx1250: the whole decode step (target layers, sampling,
-    # verify, DSpark draft, Markov) as one FlyDSL launch
-    # (atom/models/deepseek_v41/mono/gfx1250_single). Off by default.
-    "ATOM_MONO_SINGLE": lambda: os.getenv("ATOM_MONO_SINGLE", "0") == "1",
-    # Debug aids of ATOM_MONO_SINGLE (atom/models/deepseek_v41/mono/gfx1250_single/debug.py):
-    # SHADOW: the production forward serves and the launch runs beside it on the same
-    # inputs (eager), logging the kernel's head input, selection, draft context, taps
-    # and drafts against the production's; SHADOW_NL: the launch's target layers (its
-    # head input compared after that many layers); SHADOW_AFTER: launch after the
-    # production forward (reads the rows it wrote); SHADOW_NOENGRAM: the production
-    # forward without Engram.
-    "ATOM_MONO_SINGLE_SHADOW": lambda: os.getenv("ATOM_MONO_SINGLE_SHADOW", "0") == "1",
-    "ATOM_MONO_SINGLE_SHADOW_NL": lambda: int(
-        os.getenv("ATOM_MONO_SINGLE_SHADOW_NL", "40")
-    ),
-    "ATOM_MONO_SINGLE_SHADOW_AFTER": lambda: os.getenv(
-        "ATOM_MONO_SINGLE_SHADOW_AFTER", "0"
-    )
-    == "1",
-    "ATOM_MONO_SINGLE_SHADOW_NOENGRAM": lambda: os.getenv(
-        "ATOM_MONO_SINGLE_SHADOW_NOENGRAM", "0"
-    )
-    == "1",
-    # TIMING: where a served step's time goes (host preparation, GPU gaps, the
-    # kernel and its stamped spans), logged every TIMING_EVERY steps.
-    "ATOM_MONO_SINGLE_TIMING": lambda: os.getenv("ATOM_MONO_SINGLE_TIMING", "0") == "1",
-    "ATOM_MONO_SINGLE_TIMING_EVERY": lambda: int(
-        os.getenv("ATOM_MONO_SINGLE_TIMING_EVERY", "64")
-    ),
-    # CHECK_ROWS=<layer>: that layer's kernel table row against the checkpoint, once.
-    "ATOM_MONO_SINGLE_CHECK_ROWS": lambda: (
-        int(os.environ["ATOM_MONO_SINGLE_CHECK_ROWS"])
-        if os.getenv("ATOM_MONO_SINGLE_CHECK_ROWS")
-        else None
-    ),
-    # PROWDUMP=<dir>: per served step (the first PROWDUMP_N), the verification's
-    # inputs / outputs and the non-finite head-input rows, one .npz a rank (the draft
-    # logits too for the first PROWDUMP_QLOG).
-    "ATOM_MONO_SINGLE_PROWDUMP": lambda: os.getenv("ATOM_MONO_SINGLE_PROWDUMP"),
-    "ATOM_MONO_SINGLE_PROWDUMP_N": lambda: int(
-        os.getenv("ATOM_MONO_SINGLE_PROWDUMP_N", "80")
-    ),
-    "ATOM_MONO_SINGLE_PROWDUMP_QLOG": lambda: int(
-        os.getenv("ATOM_MONO_SINGLE_PROWDUMP_QLOG", "12")
-    ),
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
     # with with_indexer=True), which does index Q/K/W projection, paged FP8
@@ -659,13 +614,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # leaves the fused indexer running exactly as it does with CP off.
     "ATOM_GLM52_INDEXER_CP": lambda: os.getenv("ATOM_GLM52_INDEXER_CP", "0") == "1",
     # Debug: run each mono layer next to the original one and log the difference
-    # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
+    # (atom/models/minimax_m3/mono/check.py; the gfx1250 V4.1 step: the launch
+    # beside the production forward, mono/gfx1250/debug.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",
     # Debug: append every mono step's input tokens, positions and top-2 logits to
-    # this file (rank 0; check.trace_logits). Use with --enforce-eager.
+    # this file (rank 0; check.trace_logits; the gfx1250 V4.1 step: its
+    # verification per step, one .npz a rank in this directory). Use with --enforce-eager.
     "ATOM_MONO_TRACE": lambda: os.getenv("ATOM_MONO_TRACE"),
     # Debug: the mono layer kernels' per-phase stamps, a few steps per decode
-    # token count saved under this path prefix (mono/timeline.py). Use with
+    # token count saved under this path prefix (mono/timeline.py; the gfx1250
+    # V4.1 step: where its time goes, logged every 16 steps). Use with
     # --enforce-eager.
     "ATOM_MONO_TIMELINE": lambda: os.getenv("ATOM_MONO_TIMELINE"),
     # Debug: the mono kernels bound every mailbox wait (10 s): a wait that gives up

@@ -29,6 +29,7 @@ no fused variant to inherit.
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
+from atom.config import get_current_atom_config
 from atom.model_ops.deepseek_v41.router import (
     router_logits as fixed_order_router_logits,
 )
@@ -69,12 +70,16 @@ class MoE(V4MoE):
         )
 
         self.experts.custom_routing_function = self._topk
-        from atom.models.deepseek_v41.mono import gfx1250_single
 
-        if gfx1250_single.enabled():
-            from atom.models.deepseek_v41.mono.gfx1250_single.weights import planes
+    def process_weights_after_loading(self) -> None:
+        # The loader runs this before the experts' own weight processing (parent modules first): the gfx1250 mono step
+        # packs its expert planes from the checkpoint layout, before the experts' in-place shuffle.
+        from atom.models.deepseek_v41.mono import gfx1250
 
-            self.experts._mono_pre_shuffle = planes.capture(prefix)
+        if gfx1250.serves(get_current_atom_config()):
+            from atom.models.deepseek_v41.mono.gfx1250.weights import planes
+
+            planes.pack(self.prefix, self.experts)
 
     def _topk(self, hidden_states, gating_output, topk, renormalize):
         image_mask = getattr(get_forward_context().attn_metadata, "image_mask", None)

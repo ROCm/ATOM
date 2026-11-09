@@ -2,14 +2,13 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Diagnostics of the single-launch step, all off unless their switch is set (none runs on a served step by default).
 
-- ``ATOM_MONO_SINGLE_TIMING=1`` (``ATOM_MONO_SINGLE_TIMING_EVERY``, default 64): ``StepTimer``, where a served step's
-  time goes (host preparation, GPU gaps, the kernel and its stamped spans), logged every N steps.
-- ``ATOM_MONO_SINGLE_SHADOW=1`` (eager; ``ATOM_MONO_SINGLE_SHADOW_NL`` / ``_AFTER`` / ``_NOENGRAM``): the production
-  forward serves and the launch runs beside it on the same inputs; ``RunnerDebug.shadow_*`` log the kernel's head input,
-  selection, draft context, taps and drafts against the production's.
-- ``ATOM_MONO_SINGLE_CHECK_ROWS=<layer>``: that layer's table row against the checkpoint, at construction.
-- ``ATOM_MONO_SINGLE_PROWDUMP=<dir>`` (``_PROWDUMP_N``, ``_PROWDUMP_QLOG``): per served step, the verification's
-  inputs / outputs and the non-finite rows of the head inputs, one ``.npz`` a rank (``RunnerDebug.dump_step``).
+- ``ATOM_MONO_TIMELINE`` (set): ``StepTimer``, where a served step's time goes (host preparation, GPU gaps, the kernel
+  and its stamped spans), logged every 16 steps.
+- ``ATOM_MONO_CHECK=1`` (eager): the production forward serves and the launch runs beside it on the same inputs;
+  ``RunnerDebug.shadow_*`` log the kernel's head input, selection, draft context, taps and drafts against the
+  production's; layer 0's table row against the checkpoint, at construction.
+- ``ATOM_MONO_TRACE=<dir>``: per served step (the first 80), the verification's inputs / outputs and the non-finite rows
+  of the head inputs, one ``.npz`` a rank (``RunnerDebug.dump_step``).
 """
 
 import logging
@@ -20,8 +19,8 @@ import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.models.deepseek_v41.mono.gfx1250_single import buffers
-from atom.models.deepseek_v41.mono.gfx1250_single.config import NDR, NL, ROWS_PER_REQ
+from atom.models.deepseek_v41.mono.gfx1250 import buffers
+from atom.models.deepseek_v41.mono.gfx1250.config import NDR, NL, ROWS_PER_REQ
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -37,12 +36,12 @@ def model_dir():
 
 
 class StepTimer:
-    """ATOM_MONO_SINGLE_TIMING=1: where a served step's time goes. Events on the compute stream at the step's
+    """ATOM_MONO_TIMELINE: where a served step's time goes. Events on the compute stream at the step's
     entry (``a``), just before the kernel (``k``) and after it (``z``); host wall times at the same points. Logged every
     ``every`` steps (GPU spans resolved once the events complete, no sync on the hot path).
     """
 
-    def __init__(self, rank, every=64):
+    def __init__(self, rank, every=16):
         self.time, self.rank, self.every = time, rank, every
         self.pend, self.acc, self.n, self.last_z, self.last_wall = [], {}, 0, None, None
         self.pool = (
@@ -133,7 +132,7 @@ class RunnerDebug:
 
         from safetensors import safe_open
 
-        from atom.models.deepseek_v41.mono.gfx1250_single.weights import (
+        from atom.models.deepseek_v41.mono.gfx1250.weights import (
             layer as layer_weights,
         )
 
@@ -655,14 +654,11 @@ class RunnerDebug:
                 )
 
     def dump_step(self, bs, out, verdict) -> None:
-        """ATOM_MONO_SINGLE_PROWDUMP=<dir>: this step's verification (inputs, outputs, per-row p) and which head-input
-        rows are non-finite, for the first ATOM_MONO_SINGLE_PROWDUMP_N (default 80) steps.
+        """ATOM_MONO_TRACE=<dir>: this step's verification (inputs, outputs, per-row p) and which head-input
+        rows are non-finite, for the first 80 steps.
         """
-        dd = envs.ATOM_MONO_SINGLE_PROWDUMP
-        if (
-            not dd
-            or getattr(self, "_ndump_prow", 0) >= envs.ATOM_MONO_SINGLE_PROWDUMP_N
-        ):
+        dd = envs.ATOM_MONO_TRACE
+        if not dd or getattr(self, "_ndump_prow", 0) >= 80:
             return
         self._ndump_prow = getattr(self, "_ndump_prow", 0) + 1
         torch.cuda.synchronize()
@@ -674,7 +670,7 @@ class RunnerDebug:
             t_ = t_[: (t_.numel() // width) * width].view(-1, width).float()
             return (~torch.isfinite(t_)).any(dim=1).cpu().numpy()
 
-        qlog_n = envs.ATOM_MONO_SINGLE_PROWDUMP_QLOG
+        qlog_n = 12
         np.savez(
             os.path.join(dd, f"prow_r{self.rank}_{self._ndump_prow}.npz"),
             xh_bad=nanrows("xh", torch.bfloat16, 5120)[
@@ -704,13 +700,13 @@ class RunnerDebug:
 
 
 class ShadowModel:
-    """``SingleStepModel``'s ATOM_MONO_SINGLE_SHADOW forward (eager): the production forward serves the step, the launch
+    """``SingleStepModel``'s ATOM_MONO_CHECK forward (eager): the production forward serves the step, the launch
     runs beside it on the same inputs and ``RunnerDebug.shadow_*`` compare the two."""
 
     def _layer_hook(self, k, ref):
         """The production state after layer k - 1, collapsed and normed with layer k's attn_norm (eps as the kernel's
         front, 1e-20): what a k-layer launch's xh holds."""
-        from atom.models.deepseek_v41.mono.gfx1250_single.runner import _base_model
+        from atom.models.deepseek_v41.mono.gfx1250.runner import _base_model
 
         base = _base_model(self.model)
         w = base.layers[k].attn_norm.weight
@@ -759,9 +755,9 @@ class ShadowModel:
         return _Undo()
 
     def _shadow(self, input_ids):
-        """Bring-up (ATOM_MONO_SINGLE_SHADOW=1, eager): the runner of a decode verify forward the single launch shadows,
+        """Bring-up (ATOM_MONO_CHECK=1, eager): the runner of a decode verify forward the single launch shadows,
         or None."""
-        if not envs.ATOM_MONO_SINGLE_SHADOW or torch.cuda.is_current_stream_capturing():
+        if not envs.ATOM_MONO_CHECK or torch.cuda.is_current_stream_capturing():
             return None
         fc = get_forward_context()
         rows = input_ids.numel()
@@ -775,7 +771,7 @@ class ShadowModel:
 
     def _shadow_launch(self, runner, input_ids):
         """The single launch on the production forward's inputs (False: refused, logged; the production forward goes
-        on). Before that forward its KV writes are rewritten by it; after it (ATOM_MONO_SINGLE_SHADOW_AFTER=1) it reads
+        on). Before that forward its KV writes are rewritten by it; after it (an after-forward launch) it reads
         the rows that forward wrote this step -- the compressed KV and index rows a kernel without COMP cannot.
         """
         try:
@@ -792,10 +788,10 @@ class ShadowModel:
         return True
 
     def shadow_forward(self, input_ids, positions):
-        """ATOM_MONO_SINGLE_SHADOW: the production forward, with the launch beside it on the same inputs and the
+        """ATOM_MONO_CHECK: the production forward, with the launch beside it on the same inputs and the
         comparisons logged (``RunnerDebug.shadow_*``)."""
         shadow = self._shadow(input_ids)
-        after = envs.ATOM_MONO_SINGLE_SHADOW_AFTER
+        after = False
         ctx_check = shadow is not None and shadow.shadow_layers == NL and not after
         if (
             ctx_check
@@ -815,23 +811,11 @@ class ShadowModel:
         ref, hook = {}, None
         if shadow is not None and shadow.shadow_layers < NL:
             hook = self._layer_hook(shadow.shadow_layers, ref)
-        # (bring-up: the kernel has no Engram yet; ATOM_MONO_SINGLE_SHADOW_NOENGRAM=1 drops it from the production
-        # forward too, so the layers after it compare -- that forward's tokens are then not the model's)
-        no_engram = []
-        if shadow is not None and envs.ATOM_MONO_SINGLE_SHADOW_NOENGRAM:
-            for blk in shadow.tables.target_blocks:
-                if getattr(blk, "engram", None) is not None:
-                    blk.engram_forward = (
-                        lambda residual, embeddings, image_mask: residual.clone()
-                    )
-                    no_engram.append(blk)
         try:
             out = self.model(input_ids, positions)
         finally:
             if hook is not None:
                 hook.remove()
-            for blk in no_engram:
-                del blk.engram_forward
         if shadow is not None and after and not self._shadow_launch(shadow, input_ids):
             shadow = None
         if shadow is not None:

@@ -155,10 +155,10 @@ def install_mono_decode(
     """``model`` wrapped for mono decode (and ``drafter``'s DSpark draft model
     for its backbone), or ``model`` itself when this deployment is one mono
     does not serve."""
-    from atom.models.deepseek_v41.mono import gfx1250_single
+    from atom.models.deepseek_v41.mono import gfx1250
 
-    if gfx1250_single.enabled():
-        from atom.models.deepseek_v41.mono.gfx1250_single.dispatch import (
+    if gfx1250.enabled():
+        from atom.models.deepseek_v41.mono.gfx1250.dispatch import (
             install_single_step,
         )
 

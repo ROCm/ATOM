@@ -59,7 +59,7 @@ def _pack(ug, ugs, dn, dns):
     out = torch.empty((E, EXPU, UNIT), dtype=torch.uint8, device=dev)
     w = ug[:, ug_rows[:, None, :, None, None], ug_off[None]]
     # [E][72][40][32 lanes][2][16] -> [..][2][32 lanes][16]: a lane's 2 x 16 B 512 B apart, so each A load of the
-    # kernel (lda) spans 4 cache lines, not 8 (CT11 11-08: fixture Zipf -4.2..-5.2 us/layer)
+    # kernel (lda) spans 4 cache lines, not 8 (-4.2..-5.2 us a layer on the kernel's fixture, Zipf routes)
     w = w.transpose(3, 4)
     out[:, ug_u.reshape(-1), :1024] = w.reshape(E, 72 * 40, 1024)
     sc = ugs[:, ug_rows[:, None, :, None], sc_ug[None, :, None, :]]
@@ -207,17 +207,14 @@ def _u8(t):
     return t.data.view(torch.uint8)
 
 
-def capture(prefix: str):
-    """A FusedMoE ``_mono_pre_shuffle`` hook: pack the layer's experts into PLANES[prefix] (before the shuffle)."""
-
-    def hook(layer):
-        with torch.no_grad():
-            PLANES[prefix] = pack_routed_local(
-                _u8(layer.w13_weight),
-                _u8(layer.w13_weight_scale),
-                _u8(layer.w2_weight),
-                _u8(layer.w2_weight_scale),
-            )
-        logger.debug("mono single: packed %s (%d B)", prefix, PLANES[prefix].numel())
-
-    return hook
+def pack(prefix: str, experts) -> None:
+    """The MoE layer ``prefix``'s routed experts (a FusedMoE, its checkpoint layout: before its in-place shuffle) packed
+    into PLANES[prefix]."""
+    with torch.no_grad():
+        PLANES[prefix] = pack_routed_local(
+            _u8(experts.w13_weight),
+            _u8(experts.w13_weight_scale),
+            _u8(experts.w2_weight),
+            _u8(experts.w2_weight_scale),
+        )
+    logger.debug("mono single: packed %s (%d B)", prefix, PLANES[prefix].numel())

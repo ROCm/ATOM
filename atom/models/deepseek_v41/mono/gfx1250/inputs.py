@@ -10,8 +10,8 @@ import os
 import numpy as np
 import torch
 
-from atom.models.deepseek_v41.mono.gfx1250_single import buffers
-from atom.models.deepseek_v41.mono.gfx1250_single.config import ROWS_PER_REQ
+from atom.models.deepseek_v41.mono.gfx1250 import buffers
+from atom.models.deepseek_v41.mono.gfx1250.config import ROWS_PER_REQ
 from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
@@ -26,11 +26,11 @@ class StepInputs:
     def precheck(self, batch, forward_context) -> bool:
         """Can the kernel serve this step's request shapes (no device work, nothing staged)? The same limits
         ``_sampling`` / ``_host_inputs`` refuse with MonoUnsupported, checked before the step commits to the kernel (an
-        exception after the Engram rows are staged left the worker without a fallback: CT11 11-08, a 4.4k-token prompt
-        with 4096 outputs past the index bound). Identical on every rank (the batch and its spans are).
+        exception after the Engram rows are staged left the worker without a fallback: a 4.4k-token prompt with 4096
+        outputs past the index bound). Identical on every rank (the batch and its spans are).
         """
-        from atom.models.deepseek_v41.mono.gfx1250_single.tables import BCOLS, ILW
-        from atom.models.deepseek_v41.mono.gfx1250_single.tables import T as T_MAX
+        from atom.models.deepseek_v41.mono.gfx1250.tables import BCOLS, ILW
+        from atom.models.deepseek_v41.mono.gfx1250.tables import T as T_MAX
 
         why = None
         if (
@@ -71,8 +71,8 @@ class StepInputs:
         """The step's host-side checks and the rare host-to-device refills (geometry), before the device preparation;
         returns (the Engram layers' embedding rows, the key of every address / shape ``_device_inputs`` captures).
         """
-        from atom.models.deepseek_v41.mono.gfx1250_single.tables import BCOLS, ILW
-        from atom.models.deepseek_v41.mono.gfx1250_single.tables import T as T_MAX
+        from atom.models.deepseek_v41.mono.gfx1250.tables import BCOLS, ILW
+        from atom.models.deepseek_v41.mono.gfx1250.tables import T as T_MAX
 
         md = forward_context.attn_metadata
         cache, step = md.cache, md.step
@@ -181,8 +181,8 @@ class StepInputs:
     def _device_inputs(self, input_ids, forward_context, engs):
         """Every device operation of the step's preparation: from fixed addresses only (captured in the width's
         graph, ``launch``), sizes fixed by the key of ``_host_inputs``."""
-        from atom.models.deepseek_v41.mono.gfx1250_single.tables import BCOLS
-        from atom.models.deepseek_v41.mono.gfx1250_single.tables import T as T_MAX
+        from atom.models.deepseek_v41.mono.gfx1250.tables import BCOLS
+        from atom.models.deepseek_v41.mono.gfx1250.tables import T as T_MAX
         from atom.models.deepseek_v41.mono.step_meta import write_step_meta
 
         md = forward_context.attn_metadata
@@ -251,7 +251,7 @@ class StepInputs:
         self._hm("device_inputs")
 
     def _hm(self, name) -> None:
-        """Bring-up timing (ATOM_MONO_SINGLE_TIMING): a host time mark inside the step's preparation."""
+        """Bring-up timing (ATOM_MONO_TIMELINE): a host time mark inside the step's preparation."""
         r = getattr(self, "_t_rec", None)
         if r is not None:
             import time

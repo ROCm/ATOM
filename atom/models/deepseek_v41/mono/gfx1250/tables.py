@@ -15,10 +15,10 @@ point at a zero buffer until their binding (lflags 0: those layer bodies off).""
 
 import torch
 
-from atom.models.deepseek_v41.mono.gfx1250_single import buffers
-from atom.models.deepseek_v41.mono.gfx1250_single.weights import draft as draft_weights
-from atom.models.deepseek_v41.mono.gfx1250_single.weights import layer as layer_weights
-from atom.models.deepseek_v41.mono.gfx1250_single.weights import planes
+from atom.models.deepseek_v41.mono.gfx1250 import buffers
+from atom.models.deepseek_v41.mono.gfx1250.weights import draft as draft_weights
+from atom.models.deepseek_v41.mono.gfx1250.weights import layer as layer_weights
+from atom.models.deepseek_v41.mono.gfx1250.weights import planes
 from atom.mono.runtime.consensus import MonoUnsupported
 
 NL, NDR = 40, 3

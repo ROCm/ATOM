@@ -100,9 +100,10 @@ What differs from gfx950:
 - **The per-layer mono kernels are gfx950-only** (wave64, `permlane32`). On
   gfx1250 the deployment check refuses them and logs `V4.1 mono decode off:
   arch gfx1250`. gfx1250 has its own fused decode instead, the
-  [single-launch step](#gfx1250-single-launch-decode-step), opt-in with
-  `ATOM_MONO_SINGLE=1`; without it DSpark's draft passes and verify steps take
-  the original, unfused path.
+  [single-launch step](#gfx1250-single-launch-decode-step), switched like the
+  gfx950 mono decode (`ATOM_MONO_ENABLE`, on by default); with
+  `ATOM_MONO_ENABLE=0`, or a deployment it refuses, DSpark's draft passes and
+  verify steps take the original, unfused path.
 - **The router GEMV** (bf16 MFMA) is gfx950-only; gfx1250 uses the regular gate.
 - **FP4 index interface (hardware validation pending).** With
   `--index-cache-dtype fp4`, gfx1250 uses natural query/cache rows with AITER's
@@ -213,7 +214,8 @@ AITER's gfx950 FP8 blockscale GEMM needs K to be a multiple of its K tile.
 
 ## gfx1250 single-launch decode step
 
-On gfx1250, `ATOM_MONO_SINGLE=1` runs each DSpark decode step as one
+On gfx1250, mono decode (`ATOM_MONO_ENABLE`, on by default) runs each DSpark
+decode step as one
 persistent FlyDSL kernel per TP rank, issued as two launches: the target
 launch covers the 40 target layers, the LM head, sampling and the block
 verification; the draft launch covers the draft context KV, the three draft
@@ -224,7 +226,7 @@ stages, the draft head and the Markov drafts. Inside the kernel:
 
 It replaces the target forward, the sampler, the rejection sampler and the
 DSpark proposer of a served step
-(`atom/models/deepseek_v41/mono/gfx1250_single/`).
+(`atom/models/deepseek_v41/mono/gfx1250/`).
 
 - **Deployment.** TP4, DSpark with 5 speculative tokens, BF16 KV cache, FP8
   index cache, up to 8 requests (6 verify rows each). Anything else is refused
@@ -236,11 +238,11 @@ DSpark proposer of a served step
   - a block table or index bound past the kernel's (`tables.BCOLS`, `ILW`).
 - **Build.** Every width (6..48 rows) is built at startup, ~2.5 min cold.
   The builds go to the FlyDSL disk cache; clear it after editing a kernel.
-- **Debug switches** (`ATOM_MONO_SINGLE_*`, `atom/utils/envs.py`):
-  - `TIMING`: per-step time split;
-  - `SHADOW`: the launch beside the production forward, compared;
-  - `PROWDUMP`: per-step verification dump;
-  - `CHECK_ROWS`: a layer's table row against the checkpoint.
+- **Debug switches** (the mono ones, `atom/utils/envs.py`):
+  - `ATOM_MONO_TIMELINE`: per-step time split, logged every 16 steps;
+  - `ATOM_MONO_CHECK` (eager): the launch beside the production forward,
+    compared, and layer 0's table row against the checkpoint;
+  - `ATOM_MONO_TRACE=<dir>`: per-step verification dump.
 
 Measured on MI455X (TP4, `--level 0`, same machine, original path as the
 reference):

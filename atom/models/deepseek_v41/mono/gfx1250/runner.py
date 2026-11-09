@@ -28,16 +28,16 @@ from aiter.dist.parallel_state import (
     get_tp_group,
 )
 
-from atom.models.deepseek_v41.mono.gfx1250_single import buffers
-from atom.models.deepseek_v41.mono.gfx1250_single.config import (
+from atom.models.deepseek_v41.mono.gfx1250 import buffers
+from atom.models.deepseek_v41.mono.gfx1250.config import (
     NDR,
     NL,
     ROWS_PER_REQ,
     TP,
 )
-from atom.models.deepseek_v41.mono.gfx1250_single.debug import RunnerDebug, StepTimer
-from atom.models.deepseek_v41.mono.gfx1250_single.inputs import StepInputs
-from atom.models.deepseek_v41.mono.gfx1250_single.weights import planes
+from atom.models.deepseek_v41.mono.gfx1250.debug import RunnerDebug, StepTimer
+from atom.models.deepseek_v41.mono.gfx1250.inputs import StepInputs
+from atom.models.deepseek_v41.mono.gfx1250.weights import planes
 from atom.mono.plan.build_key import source_digest
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
@@ -68,7 +68,7 @@ RECV_BYTES = 2 * (
 
 
 # the kernel sources' digest: part of every build's FlyDSL JIT key (an edit to any kernel module rebuilds)
-SOURCES = source_digest("models/deepseek_v41/mono/gfx1250_single/kernels")
+SOURCES = source_digest("models/deepseek_v41/mono/gfx1250/kernels")
 
 
 def import_kernels() -> dict:
@@ -123,7 +123,7 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             for n, b in buffers.scratch_bytes(self.K, NL + NDR).items()
         }
         # fine-grained, not uncached: the step's few-word peer pushes (Markov, sampling) waited ~80-100 us each for an
-        # uncached store to become visible (CT12 11-08: the fixture's fine-grained receive buffers did not)
+        # uncached store to become visible (fine-grained receive buffers did not, measured on the kernel's fixture)
         self.peer = SymmetricPeerBuffer(
             RECV_BYTES,
             rank=self.rank,
@@ -152,11 +152,9 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             len(self.planes),
             self.rank,
         )
-        if (
-            envs.ATOM_MONO_SINGLE_CHECK_ROWS is not None
-        ):  # (debug) a layer's table row against the checkpoint
-            self._check_rows(model, envs.ATOM_MONO_SINGLE_CHECK_ROWS)
-        from atom.models.deepseek_v41.mono.gfx1250_single.tables import StepTables
+        if envs.ATOM_MONO_CHECK:  # (debug) layer 0's table row against the checkpoint
+            self._check_rows(model, 0)
+        from atom.models.deepseek_v41.mono.gfx1250.tables import StepTables
 
         self.tables = StepTables(
             self.K,
@@ -189,21 +187,13 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         self.verify_ready = torch.cuda.Event()
         # the stream the verdict's copies run on: ModelRunner's output D2H waits for it, not for the draft launch
         self.output_stream = self._verify_stream = torch.cuda.Stream()
-        self._timer = (
-            StepTimer(self.rank, envs.ATOM_MONO_SINGLE_TIMING_EVERY)
-            if envs.ATOM_MONO_SINGLE_TIMING
-            else None
-        )
+        self._timer = StepTimer(self.rank) if envs.ATOM_MONO_TIMELINE else None
         self._eng_rows = None
-        # (debug) ATOM_MONO_SINGLE_SHADOW: the production forward serves and the launch runs beside it (``debug``)
-        self.shadow = envs.ATOM_MONO_SINGLE_SHADOW
-        # its target layers (< NL: no step tail / draft; its xh is the normed collapse after layer shadow_layers - 1
-        # with layer shadow_layers' attn_norm, compared to the production state there)
-        self.shadow_layers = envs.ATOM_MONO_SINGLE_SHADOW_NL
-        if not self.shadow and self.shadow_layers != NL:
-            raise MonoUnsupported(
-                "single-launch step: serving runs all the layers (ATOM_MONO_SINGLE_SHADOW_NL unset)"
-            )
+        # (debug) ATOM_MONO_CHECK: the production forward serves and the launch runs beside it (``debug``)
+        self.shadow = envs.ATOM_MONO_CHECK
+        self.shadow_layers = (
+            NL  # its target layers (``debug``: fewer compare the state after them)
+        )
         # every width built now (each a compile or a disk-cache load, then a TP barrier: ``prepare``), not on its first
         # step: a width first met mid-serve stalled every request for its JIT (~18 s cold)
         t0 = time.perf_counter()
@@ -368,9 +358,7 @@ class SingleStepRunner(StepInputs, RunnerDebug):
         # commit_tentative picks from by the verdict's anchors) and the embedding rows' lookup on its side stream
         _w0 = time.perf_counter() if self._timer is not None else None
         md = forward_context.attn_metadata
-        if (
-            envs.ATOM_MONO_SINGLE_PROWDUMP
-        ):  # (debug) this step's positions for ``dump_step``
+        if envs.ATOM_MONO_TRACE:  # (debug) this step's positions for ``dump_step``
             self._dbg_pos = md.step.positions[: input_ids.numel()].clone()
         rows = md.engram_embeddings
         staged = isinstance(rows, EngramStagedRows) and not getattr(

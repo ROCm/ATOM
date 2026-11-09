@@ -15,7 +15,7 @@ Each comes out in the layout the kernel was validated with (investigation/flydsl
 import torch
 import torch.distributed as dist
 
-from atom.models.deepseek_v41.mono.gfx1250_single.weights.planes import (
+from atom.models.deepseek_v41.mono.gfx1250.weights.planes import (
     checkpoint_weight,
 )
 from atom.mono.runtime.consensus import MonoUnsupported

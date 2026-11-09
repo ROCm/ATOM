@@ -19,8 +19,8 @@ from torch import nn
 
 try:  # the deployment / routing tests import the model package, which needs aiter
     from atom.models.deepseek_v41.mono import dispatch as mono_dispatch
-    from atom.models.deepseek_v41.mono import gfx1250_single
-    from atom.models.deepseek_v41.mono.gfx1250_single import config, dispatch
+    from atom.models.deepseek_v41.mono import gfx1250
+    from atom.models.deepseek_v41.mono.gfx1250 import config, dispatch
     from atom.models.deepseek_v41.mono.kernels.dims import Dims
     from atom.mono.runtime import deployment
 
@@ -61,7 +61,7 @@ def cpu(monkeypatch):
     monkeypatch.setattr(deployment, "_takes_weight_updates", lambda c: False)
     monkeypatch.setattr(deployment, "_uses_tr_hybrid", lambda c: False)
     monkeypatch.setattr(deployment, "pcp_group_size_of", lambda c: 1)
-    monkeypatch.setenv("ATOM_MONO_SINGLE_SHADOW", "0")
+    monkeypatch.setenv("ATOM_MONO_CHECK", "0")
 
 
 @needs_aiter
@@ -160,9 +160,9 @@ def test_the_wrapper_forwards_the_model_attributes(model):
 
 
 @needs_aiter
-def test_off_unless_switched_on(monkeypatch):
-    monkeypatch.setenv("ATOM_MONO_SINGLE", "0")
-    assert not gfx1250_single.enabled()
+def test_off_when_mono_is_switched_off(monkeypatch):
+    monkeypatch.setenv("ATOM_MONO_ENABLE", "0")
+    assert not gfx1250.enabled()
 
 
 @needs_aiter
@@ -176,7 +176,7 @@ def test_a_refused_deployment_keeps_the_model(monkeypatch):
 
 @needs_aiter
 def test_mono_dispatch_routes_to_the_single_launch_when_enabled(monkeypatch):
-    monkeypatch.setattr(gfx1250_single, "enabled", lambda: True)
+    monkeypatch.setattr(gfx1250, "enabled", lambda: True)
     seen = {}
 
     def install(model, cfg, drafter):
@@ -252,7 +252,7 @@ def test_a_request_shape_the_kernel_refuses_takes_the_production_path(
 
 @needs_aiter
 def test_shadow_mode_never_serves(model, verify_step, monkeypatch):
-    monkeypatch.setenv("ATOM_MONO_SINGLE_SHADOW", "1")
+    monkeypatch.setenv("ATOM_MONO_CHECK", "1")
     model._single.runner = _Runner()
     assert model.single_step_runner(_batch(), 48) is None
 
@@ -318,7 +318,7 @@ def test_a_production_step_drafts_from_the_drafter(served):
 # --- the kernel's per-step arithmetic on Python ints ----------------------------------------------------------------
 KERNELS = (
     Path(__file__).resolve().parents[1]
-    / "atom/models/deepseek_v41/mono/gfx1250_single/kernels"
+    / "atom/models/deepseek_v41/mono/gfx1250/kernels"
 )
 
 

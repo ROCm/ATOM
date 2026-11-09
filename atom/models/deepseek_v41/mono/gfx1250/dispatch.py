@@ -12,12 +12,8 @@ import logging
 
 from torch import nn
 
-from atom.models.deepseek_v41.mono.gfx1250_single.config import (
-    MAX_ROWS,
-    ROWS_PER_REQ,
-    config_refusal,
-)
-from atom.models.deepseek_v41.mono.gfx1250_single.debug import ShadowModel
+from atom.models.deepseek_v41.mono.gfx1250.config import MAX_ROWS, ROWS_PER_REQ
+from atom.models.deepseek_v41.mono.gfx1250.debug import ShadowModel
 from atom.mono.runtime.route import LazyRunner
 from atom.mono.runtime.step_override import StepOverrideModel
 from atom.utils import envs
@@ -39,7 +35,7 @@ class SingleStepModel(ShadowModel, StepOverrideModel, nn.Module):
         self._drafter = drafter
 
         def create():
-            from atom.models.deepseek_v41.mono.gfx1250_single.runner import (
+            from atom.models.deepseek_v41.mono.gfx1250.runner import (
                 SingleStepRunner,
             )
 
@@ -97,9 +93,7 @@ class SingleStepModel(ShadowModel, StepOverrideModel, nn.Module):
         channel (it returns ids and the verdict, not logits), and request shapes the kernel takes (``precheck``).
         """
         self._step_batch = batch  # (the shadow launch's sampling parameters)
-        if (
-            envs.ATOM_MONO_SINGLE_SHADOW
-        ):  # the production path serves, the launch only compares
+        if envs.ATOM_MONO_CHECK:  # the production path serves, the launch only compares
             return None
         if batch is not None and (
             getattr(batch, "structured_requests", None)
@@ -121,7 +115,7 @@ class SingleStepModel(ShadowModel, StepOverrideModel, nn.Module):
         self._served = (
             None  # a production forward: this step is not the single launch's
         )
-        if inputs_embeds is None and envs.ATOM_MONO_SINGLE_SHADOW:
+        if inputs_embeds is None and envs.ATOM_MONO_CHECK:
             return self.shadow_forward(input_ids, positions)
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
@@ -136,9 +130,9 @@ class SingleStepModel(ShadowModel, StepOverrideModel, nn.Module):
 
 
 def install_single_step(model: nn.Module, atom_config, drafter) -> nn.Module:
-    from atom.models.deepseek_v41.mono.kernels.dims import Dims
+    from atom.models.deepseek_v41.mono.gfx1250 import refusal
 
-    why = config_refusal(atom_config, Dims)
+    why = refusal(atom_config)
     if why is not None:
         logger.info("V4.1 single-launch step off: %s", why)
         return model
