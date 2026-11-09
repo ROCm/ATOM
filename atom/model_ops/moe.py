@@ -111,6 +111,7 @@ from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
+from atom.utils.tbo.ubatch_splitting import NUM_TBO_UBATCHES
 from atom.utils.tbo.ubatching import (
     tbo_active,
     tbo_enabled,
@@ -119,8 +120,6 @@ from atom.utils.tbo.ubatching import (
 )
 
 logger = logging.getLogger("atom")
-
-_NUM_TBO_UBATCHES = 2
 
 
 class MoEActivationQuant(Enum):
@@ -474,10 +473,10 @@ def dp_gather_routed_rows(
     """
     if dp_eager_mode:
         sizes = ctx.dp_metadata.get_sizes_across_dp()
-        # Eager means nothing was padded, so the context's two heights agree
-        # and either is the row count to unpad back to. Taken from the context
-        # rather than the tensor for the reason `pad_for_all_gather` gives.
-        local_tokens = ctx.context.scheduled_tokens
+        # The rows this rank runs, which its entry in `sizes` counts. Taken
+        # from the context rather than the tensor for the reason
+        # `pad_for_all_gather` gives.
+        local_tokens = ctx.context.running_tokens
         assert rows[0].shape[0] == local_tokens, (
             f"MoE was handed {rows[0].shape[0]} rows on an eager step "
             f"expecting {local_tokens}"
@@ -726,7 +725,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # TBO and regular forwards are mutually exclusive. Slot 0 serves
             # regular forwards and TBO ubatch 0; slot 1 exists only for the
             # concurrently running second ubatch.
-            num_mori_ops = _NUM_TBO_UBATCHES if tbo_is_enabled else 1
+            num_mori_ops = NUM_TBO_UBATCHES if tbo_is_enabled else 1
             mori_ops = [
                 all2all_manager.get_handle(all_to_all_args, index=slot)
                 for slot in range(num_mori_ops)

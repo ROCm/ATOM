@@ -26,6 +26,7 @@ from atom.spec_decode import dspark_lossless, dspark_proposer
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.dspark_proposer import DSparkProposer
 from atom.utils import CpuGpuBuffer
+from atom.utils.h2d import PublicationGroup
 
 MAX_BS = 4
 T = 3
@@ -101,9 +102,15 @@ def target_vars():
 
 
 def group(prop):
-    names = list(prop.metadata_buffers)
-    return SimpleNamespace(
-        counts=[None] * len(names), indices={n: i for i, n in enumerate(names)}
+    """The runner's publication over the proposer's buffers: the real
+    `PublicationGroup`, so staging records counts through `set_counts`."""
+    return PublicationGroup(
+        None,
+        "sampling",
+        [
+            SimpleNamespace(name=name, buffer=buffer)
+            for name, buffer in prop.metadata_buffers.items()
+        ],
     )
 
 

@@ -16,6 +16,17 @@ runner_module = pytest.importorskip(
 )
 
 
+def sampling_group(buffers):
+    """The `sampling` members `prepare_sample` records counts for, as the real
+    `PublicationGroup` (CPU count scratch only; nothing is published)."""
+    from atom.utils.h2d import PublicationGroup
+
+    names = [*buffers, "required_channel_states", "logprob_request_indices"]
+    return PublicationGroup(
+        None, "sampling", [SimpleNamespace(name=n, buffer=n) for n in names]
+    )
+
+
 @pytest.mark.parametrize("verified", [False, True])
 @pytest.mark.parametrize("pcp_size", [1, 2])
 def test_postprocess_submits_prefill_or_final_broadcast_counts(
@@ -25,7 +36,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
     bs = 2
     verdict = torch.tensor([[1, 2], [4, 3], [91, 92]], dtype=torch.int32)
     broadcast_verdict = torch.tensor([[2, 1], [3, 4], [93, 94]], dtype=torch.int32)
-    sampled = torch.tensor([[3, 4], [5, 6]], dtype=torch.int32)
+    sampled = torch.tensor([[3, 4, 0], [5, 6, 0]], dtype=torch.int32)
     spec = (
         SimpleNamespace(
             bonus_logits_indices=torch.tensor([1, 3]),
@@ -63,7 +74,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         prev_batch=None,
         prev_rejected_num=None,
         prev_bonus_num=None,
-        prepare_sampled_ids=mock.Mock(return_value=({7: (3,), 8: (5,), -1: 1}, None)),
+        prepare_sampled_ids=mock.Mock(return_value=({7: (3,), 8: (5,)}, None)),
         spec_status_queue=SimpleNamespace(send=send_status),
     )
     runner = SimpleNamespace(
@@ -86,6 +97,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
                 return_logprobs=[False] * bs,
                 any_logprobs=False,
                 required_channel=None,
+                num_spec_step=2 if verified else 0,
             ),
             torch.zeros(4, 8),
             torch.ones(bs),
@@ -212,10 +224,7 @@ def test_a_uniform_k_reaches_the_sampler_as_a_scalar(ks, ps):
             ("top_ps", np.float32),
         )
     }
-    names = [*buffers, "required_channel_states", "logprob_request_indices"]
-    group = SimpleNamespace(
-        counts=[None] * len(names), indices={n: i for i, n in enumerate(names)}
-    )
+    group = sampling_group(buffers)
     runner = SimpleNamespace(forward_vars=buffers)
     batch = SimpleNamespace(
         total_seqs_num=bs,
@@ -224,9 +233,7 @@ def test_a_uniform_k_reaches_the_sampler_as_a_scalar(ks, ps):
         top_ps=np.array(ps, np.float32),
         required_channel=None,
     )
-    _, top_ks, _, _, _ = runner_module.ModelRunner.prepare_sample(
-        runner, batch, publication_group=group
-    )
+    _, top_ks, _, _, _ = runner_module.ModelRunner.prepare_sample(runner, batch, group)
     assert type(top_ks) is int and top_ks == ks[0]
     assert group.counts[group.indices["top_ks"]] is None
 
@@ -248,10 +255,7 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
             ("top_ps", np.float32),
         )
     }
-    names = [*buffers, "required_channel_states", "logprob_request_indices"]
-    group = SimpleNamespace(
-        counts=[None] * len(names), indices={n: i for i, n in enumerate(names)}
-    )
+    group = sampling_group(buffers)
     runner = SimpleNamespace(
         forward_vars=buffers,
         drafter=SimpleNamespace(lossless=SimpleNamespace(stage=mock.Mock())),
@@ -268,7 +272,7 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
         total_tokens_num_prefill=0,
     )
     _, top_ks, top_ps, _, _ = runner_module.ModelRunner.prepare_sample(
-        runner, batch, publication_group=group
+        runner, batch, group
     )
     assert buffers["top_ks"].np[:bs].tolist() == ks
     np.testing.assert_array_equal(buffers["top_ps"].np[:bs], np.float32(ps))
@@ -300,10 +304,7 @@ def test_the_draft_q_lookup_is_gated_like_its_consumer(temps, prefill, verifies)
             ("top_ps", np.float32),
         )
     }
-    names = [*buffers, "required_channel_states", "logprob_request_indices"]
-    group = SimpleNamespace(
-        counts=[None] * len(names), indices={n: i for i, n in enumerate(names)}
-    )
+    group = sampling_group(buffers)
     staged = mock.Mock()
     runner = SimpleNamespace(
         forward_vars=buffers,
@@ -320,12 +321,12 @@ def test_the_draft_q_lookup_is_gated_like_its_consumer(temps, prefill, verifies)
         is_dummy_run=False,
         total_tokens_num_prefill=prefill,
     )
-    *_, all_greedy, _ = runner_module.ModelRunner.prepare_sample(
-        runner, batch, publication_group=group
-    )
+    *_, all_greedy, _ = runner_module.ModelRunner.prepare_sample(runner, batch, group)
     consumer_reads_q = not all_greedy and runner._verifies_drafts(batch, prefill > 0)
     assert consumer_reads_q is verifies
     assert staged.call_args.kwargs["verifies"] is verifies
+    # Into the publication the sampling inputs ride: one upload.
+    assert staged.call_args.args[2] is group
 
 
 @pytest.mark.parametrize("max_num_seqs", [1, 64])

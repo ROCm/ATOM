@@ -248,6 +248,20 @@ def test_decode_mrope_storage_matches_padded_graph_stride(monkeypatch, k):
     from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
     from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
 
+    class Group:
+        """The decode group, as far as the MRoPE planes are concerned."""
+
+        def __init__(self):
+            self.counts = []
+
+        def set_count(self, buffer, count):
+            self.counts.append((buffer, count))
+
+        def publish(self):
+            for buffer, count in self.counts:
+                buffer.gpu.view(-1)[:count] = buffer.cpu.view(-1)[:count]
+            self.counts = []
+
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     cpu = torch.full((3, 32), -999, dtype=torch.int64)
     gpu = torch.full_like(cpu, -777)
@@ -255,23 +269,34 @@ def test_decode_mrope_storage_matches_padded_graph_stride(monkeypatch, k):
         config=SimpleNamespace(max_model_len=8192),
         use_mrope=True,
         forward_vars={
-            "mrope_positions": SimpleNamespace(cpu=cpu, np=cpu.numpy(), gpu=gpu)
+            "mrope_positions": SimpleNamespace(cpu=cpu, np=cpu.numpy(), gpu=gpu),
+            "cu_seqlens_q": SimpleNamespace(np=np.zeros(33, dtype=np.int32)),
+        },
+        h2d_groups={
+            "decode_metadata": Group(),
+            "mrope": SimpleNamespace(check_writable=lambda: None),
         },
         _mrope_positions_view=lambda n: gpu.as_strided((3, n), (n, 1)),
     )
-    builder._build_qsa_metadata = lambda *args, **kwargs: None
-    builder._build_ple_metadata = lambda *args, **kwargs: None
+    for name in ("_stage_qsa", "_stage_ple", "_finish_qsa", "_finish_ple"):
+        setattr(builder, name, lambda *args, **kwargs: None)
     width = k + 1
 
-    def prepare(self, batch, running_bs, running_tokens, max_seqlen_q):
+    def stage(self, batch, running_bs, running_tokens, max_seqlen_q, group):
         return (
             SimpleNamespace(max_seqlen_q=max_seqlen_q),
             self._build_mrope_decode_positions(
-                batch, batch.context_lens, max_seqlen_q, running_tokens=running_tokens
+                batch,
+                batch.context_lens,
+                group,
+                running_tokens=running_tokens,
             ),
         )
 
-    monkeypatch.setattr(GDNAttentionMetadataBuilder, "prepare_decode", prepare)
+    monkeypatch.setattr(GDNAttentionMetadataBuilder, "stage_decode", stage)
+    monkeypatch.setattr(
+        GDNAttentionMetadataBuilder, "finish_decode", lambda *args: None
+    )
     # Shrinking requests must not expose the previous batch's axis/tail data.
     for scheduled in (4, 3, 1):
         tokens = scheduled * width
@@ -281,14 +306,17 @@ def test_decode_mrope_storage_matches_padded_graph_stride(monkeypatch, k):
         )
         batch = SimpleNamespace(
             total_tokens_num_decode=tokens,
+            total_seqs_num_decode=scheduled,
+            num_scheduled_tokens=np.full(scheduled, width, dtype=np.int32),
             context_lens=ends,
             req_ids=tuple(range(scheduled)),
             mrope_position_deltas={},
         )
         _, positions = builder.prepare_decode(batch, 4, 4 * width, width)
         reference = torch.from_numpy(expected)
-        torch.testing.assert_close(positions, reference)
-        assert positions.stride(0) == 4 * width
+        # The running tokens, the scheduled ones first and zeros after.
+        assert positions.shape == (3, 4 * width) and positions.stride(0) == 4 * width
+        torch.testing.assert_close(positions[:, :tokens], reference)
         graph_positions = builder.model_runner._mrope_positions_view(4 * width)
         torch.testing.assert_close(graph_positions[:, :tokens], reference)
         assert not graph_positions[:, tokens:].count_nonzero()

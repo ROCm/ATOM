@@ -309,10 +309,10 @@ def test_width_invariant_is_checked_on_both_staging_paths(
     )
 
     # The width this step declared is accepted on both paths ...
-    runtime.v41_begin_forward(torch.zeros(1, step.width, 64))
+    runtime.v41_begin_forward(torch.zeros(1, step.running_tokens, 64))
     # ... and one row short is refused on both, staged or not.
     with pytest.raises(ValueError, match="width this step declared"):
-        runtime.v41_begin_forward(torch.zeros(1, step.width + 1, 64))
+        runtime.v41_begin_forward(torch.zeros(1, step.running_tokens + 1, 64))
 
 
 def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):

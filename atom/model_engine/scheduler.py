@@ -399,8 +399,13 @@ class ScheduledBatch:
         # its length, and at decode a window is a single token. `extend`
         # between two `array("i")` is a memcpy. 4x at bs=256.
         staged = new_token_ids()
+        # Whether any request prefills. A batch with none (an idle DP rank's
+        # dummy) has no phase of its own: `ForwardMode.decide` gives it the
+        # group's.
+        self.has_prefill = False
         for i, (seq, num) in enumerate(zip(seqs.values(), num_scheduled_tokens)):
             if seq.type == SequenceType.PREFILL:
+                self.has_prefill = True
                 offset = self.num_cached_tokens[i]
             elif is_deferred_out or num_spec_step == 0:
                 offset = seq.num_tokens - num_rejected[i] - num
@@ -688,8 +693,8 @@ class Scheduler:
     ):
         # The runners recorded prefill token graphs
         # (`ModelRunner.prefill_token_graphs`), not merely configured them: a
-        # backend without `supports_token_graph` records none, and its idle DP
-        # rank has no bucket to dummy-prefill on.
+        # backend without `supports_token_graph` records none, and its decoding
+        # rank has no bucket to yield its decode to.
         self.prefill_token_graphs = prefill_token_graphs
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
@@ -973,9 +978,6 @@ class Scheduler:
         self._arrived_requests = 0
         self._local_prefill_coalescing = False
         self._inflight_prefix_wait: dict[int, int] = {}
-        # This tick is the DP group's prefill step and this rank has none of its
-        # own: EngineCore runs a dummy prefill instead of a decode.
-        self.dummy_prefill = False
 
     def _group_prefill_tick(self, decision: PrefillDecision) -> bool:
         """Whether some DP rank prefills this tick, from the delayer's reduce.
@@ -2181,7 +2183,7 @@ class Scheduler:
 
         # Before the early return below: an idle rank keeps its peers' prefill
         # company too.
-        self.dummy_prefill = self._group_prefill_tick(decision)
+        group_prefill_tick = self._group_prefill_tick(decision)
 
         if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
@@ -2833,9 +2835,9 @@ class Scheduler:
 
             return (prefill_batch, scheduled_seqs)
 
-        if self.dummy_prefill:
+        if group_prefill_tick:
             # The group's prefill step, with no prefill of this rank's own: it
-            # keeps its peers company on a dummy prefill rather than decode, so
+            # keeps its peers company on an idle step rather than decode, so
             # every rank's forward replays its token graph (`ForwardMode.decide`).
             return None
 

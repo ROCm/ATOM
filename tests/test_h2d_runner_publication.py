@@ -18,9 +18,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def runner_with_buffers(
-    monkeypatch, transport, pp_size=1, speculative=False, builder_cls=None
-):
+def runner_with_buffers(monkeypatch, pp_size=1, speculative=False, builder_cls=None):
     from atom.model_engine.model_runner import ModelRunner, tokenIDProcessor
 
     if builder_cls is None:
@@ -28,7 +26,6 @@ def runner_with_buffers(
 
         builder_cls = Qwen4ExpMetadataBuilder
 
-    monkeypatch.setenv("ATOM_H2D_BACKEND", transport)
     runner = ModelRunner.__new__(ModelRunner)
     runner.device = torch.device("cuda", 0)
     runner.config = SimpleNamespace(
@@ -37,6 +34,7 @@ def runner_with_buffers(
         max_num_seqs=8,
         hf_config=SimpleNamespace(hidden_size=8),
         torch_dtype=torch.float32,
+        prefill_context_parallel_size=1,
     )
     runner.attn_family = SimpleNamespace(has_recurrent_state=False)
     runner.model = SimpleNamespace()
@@ -63,23 +61,29 @@ def runner_with_buffers(
         )
         runner.arange_np = np.arange(64, dtype=np.int32)
     runner.allocate_forward_vars()
+    # The attention builder's query prefix and token -> request map.
     runner.forward_vars["cu_seqlens_q"] = CpuGpuBuffer(
         9, dtype=torch.int32, device=runner.device, publication_group="early"
     )
+    runner.forward_vars["batch_id_per_q_token"] = CpuGpuBuffer(
+        64, dtype=torch.int32, device=runner.device, publication_group="early"
+    )
     builder = builder_cls.__new__(builder_cls)
     builder.model_runner = runner
+    # Only the query prefix is allocated here; the backend's own phase
+    # members are not.
+    builder.h2d_group_members = dict
     runner.attn_metadata_builder = builder
     runner._init_forward_vars_ring()
     runner._init_h2d_publication()
     return runner
 
 
-@pytest.mark.parametrize("transport", ["direct", "packed"])
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_sampling_optional_members_and_scalar_filters(monkeypatch, transport, pp_size):
+def test_sampling_optional_members_and_scalar_filters(monkeypatch, pp_size):
     from atom.model_ops.sampler import SAMPLER_EPS
 
-    runner = runner_with_buffers(monkeypatch, transport, pp_size)
+    runner = runner_with_buffers(monkeypatch, pp_size)
     results = []
     cases = (
         ([0, 0, 0], [-1, -1, -1], [1, 1, 1]),
@@ -104,7 +108,9 @@ def test_sampling_optional_members_and_scalar_filters(monkeypatch, transport, pp
             required_channel=None,
         )
         torch.cuda._sleep(2_000_000)
-        t, k, p, greedy, noise = runner.prepare_sample(batch)
+        group = runner.h2d_groups["token_inputs"]
+        t, k, p, greedy, noise = runner.prepare_sample(batch, group)
+        group.publish()
         results.append(
             (
                 t.clone(),
@@ -114,9 +120,8 @@ def test_sampling_optional_members_and_scalar_filters(monkeypatch, transport, pp
                 noise,
             )
         )
-        counts = runner.h2d_groups["sampling"].counts
         for name in ("top_ks", "top_ps"):
-            count = counts[runner.h2d_groups["sampling"].indices[name]]
+            count = group._counts[group.indices[name]]
             buf = runner.forward_vars[name]
             # The omitted or unselected tail is never overwritten.
             results[-1] += (buf.gpu[count or 0 :].clone(),)
@@ -149,11 +154,8 @@ def test_sampling_optional_members_and_scalar_filters(monkeypatch, transport, pp
         assert torch.all(ktail.cpu() == -99) and torch.all(ptail.cpu() == -99)
 
 
-@pytest.mark.parametrize("transport", ["direct", "packed"])
-def test_input_ids_deferred_and_new_requests_share_one_publication(
-    monkeypatch, transport
-):
-    runner = runner_with_buffers(monkeypatch, transport)
+def test_input_ids_deferred_and_new_requests_share_one_publication(monkeypatch):
+    runner = runner_with_buffers(monkeypatch)
     processor = runner.tokenID_processor
     runner._gate_staging_reuse()
     processor.prev_batch = SimpleNamespace(req_ids=[10, 20], is_dummy_run=False)
@@ -161,6 +163,7 @@ def test_input_ids_deferred_and_new_requests_share_one_publication(
     batch = SimpleNamespace(
         scheduled_tokens=np.array([-1, 93, -1], dtype=np.int32),
         total_tokens_num=3,
+        has_prefill=False,
         total_tokens_num_prefill=0,
         total_tokens_num_decode=3,
         total_seqs_num_prefill=0,
@@ -173,11 +176,13 @@ def test_input_ids_deferred_and_new_requests_share_one_publication(
         num_bonus=np.zeros(3, dtype=np.int32),
         produces_output=lambda: True,
     )
-    runner.attn_metadata_builder.publish_cu_seqlens_q(
-        batch, SimpleNamespace(running_bs=3)
-    )
+    group = runner.h2d_groups["token_inputs"]
+    for name, count in runner.attn_metadata_builder.prepare_query_metadata(
+        batch.num_scheduled_tokens, 3, 3
+    ).items():
+        group.counts[group.indices[name]] = count
     torch.cuda._sleep(2_000_000)
-    ids = processor.prepare_input_ids(batch, 1).clone()
+    ids = processor.prepare_input_ids(batch, 1, group).clone()
     with pytest.raises(PublicationError, match="republish_reason"):
         processor.input_ids.copy_to_gpu(3)
     runner._mark_staging_h2d_enqueued()
@@ -189,7 +194,7 @@ def test_input_ids_deferred_and_new_requests_share_one_publication(
 
 @pytest.mark.parametrize("pp_size", [1, 2])
 def test_prefill_and_first_decode_ids_rotate_with_the_runner(monkeypatch, pp_size):
-    runner = runner_with_buffers(monkeypatch, "direct", pp_size)
+    runner = runner_with_buffers(monkeypatch, pp_size)
     outputs = []
     for i in range(6):
         runner._advance_forward_vars()
@@ -202,6 +207,7 @@ def test_prefill_and_first_decode_ids_rotate_with_the_runner(monkeypatch, pp_siz
             scheduled_tokens=np.array([i + 1, i + 2], dtype=np.int32),
             total_tokens_num=2,
             total_seqs_num=1 if prefill else 2,
+            has_prefill=prefill,
             total_tokens_num_prefill=2 if prefill else 0,
             total_tokens_num_decode=0 if prefill else 2,
             total_seqs_num_prefill=1 if prefill else 0,
@@ -209,7 +215,8 @@ def test_prefill_and_first_decode_ids_rotate_with_the_runner(monkeypatch, pp_siz
             produces_output=lambda: False,
         )
         torch.cuda._sleep(2_000_000)
-        outputs.append(processor.prepare_input_ids(batch, 1).clone())
+        group = runner.h2d_groups["token_inputs"]
+        outputs.append(processor.prepare_input_ids(batch, 1, group).clone())
         runner._mark_staging_h2d_enqueued()
         runner._record_forward_vars_event()
     torch.cuda.synchronize()
@@ -218,7 +225,7 @@ def test_prefill_and_first_decode_ids_rotate_with_the_runner(monkeypatch, pp_siz
 
 @pytest.mark.parametrize("pp_size", [1, 2])
 def test_mrope_padding_is_final_before_its_only_publication(monkeypatch, pp_size):
-    runner = runner_with_buffers(monkeypatch, "packed", pp_size)
+    runner = runner_with_buffers(monkeypatch, pp_size)
     outputs = []
     for i, bs in enumerate((4, 3, 1, 4, 2, 1)):
         runner._advance_forward_vars()
@@ -228,14 +235,18 @@ def test_mrope_padding_is_final_before_its_only_publication(monkeypatch, pp_size
         buf.gpu.fill_(-999)
         batch = SimpleNamespace(
             total_tokens_num_decode=bs * 2,
+            num_scheduled_tokens=np.full(bs, 2, dtype=np.int32),
             req_ids=range(bs),
             mrope_position_deltas={j: j * 10 for j in range(bs)},
         )
         ends = np.arange(bs) * 100 + i * 2 + 2
         torch.cuda._sleep(2_000_000)
-        positions = runner.attn_metadata_builder._build_mrope_decode_positions(
-            batch, ends, 2, running_tokens=8
+        builder = runner.attn_metadata_builder
+        group = builder.model_runner.h2d_groups["decode_metadata"]
+        positions = builder._build_mrope_decode_positions(
+            batch, ends, group, running_tokens=8
         )
+        group.publish()
         assert positions.stride(0) == 8
         outputs.append(
             (
@@ -247,28 +258,23 @@ def test_mrope_padding_is_final_before_its_only_publication(monkeypatch, pp_size
             )
         )
         with pytest.raises(PublicationError, match="republish_reason"):
-            runner.attn_metadata_builder._copy_mrope_to_gpu(8)
+            builder._build_mrope_decode_positions(batch, ends, group, running_tokens=8)
         runner._mark_staging_h2d_enqueued()
         runner._record_forward_vars_event()
     torch.cuda.synchronize()
     for positions, padded, tail, bs, i in outputs:
         expected = [j * 110 + i * 2 + k for j in range(bs) for k in range(2)]
+        expected += [0] * (8 - len(expected))
         assert positions.cpu().tolist() == [expected] * 3
-        assert torch.all(padded.cpu()[:, bs * 2 :] == 0)
+        assert torch.equal(padded.cpu(), positions.cpu())
         assert torch.all(tail.cpu() == -999)
 
 
-@pytest.mark.parametrize(
-    "transport,coalesce",
-    [("direct", False), ("packed", False), ("packed", True)],
-)
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_speculative_indices_publish_before_verification_reads(
-    monkeypatch, transport, coalesce, pp_size
-):
+def test_speculative_indices_publish_before_verification_reads(monkeypatch, pp_size):
     from atom.spec_decode.drafter import Drafter
 
-    runner = runner_with_buffers(monkeypatch, transport, pp_size, speculative=True)
+    runner = runner_with_buffers(monkeypatch, pp_size, speculative=True)
     saved = []
     for step, lengths in enumerate(([3, 1, 2], [1, 1], [4] * 8, [1, 3, 1]) * 2):
         runner._advance_forward_vars()
@@ -277,16 +283,11 @@ def test_speculative_indices_publish_before_verification_reads(
         ends = np.cumsum(lengths)
         ids = torch.arange(int(ends[-1]), device="cuda", dtype=torch.int32) + step * 100
         torch.cuda._sleep(2_000_000)
-        prepared = None
-        if coalesce:
-            group = runner.h2d_groups["token_inputs"]
-            prepared = runner.drafter.prepare_spec_decode_indices(lengths, ends, group)
-            group.publish(group.counts)
-        metadata = runner.drafter.calc_spec_decode_metadata(
-            lengths, ends, ids, prepared_indices=prepared
-        )
-        if coalesce:
-            assert runner.h2d_groups["spec_decode"]._backend is None
+        group = runner.h2d_groups["token_inputs"]
+        prepared = runner.drafter.prepare_spec_decode_indices(lengths, ends, group)
+        group.publish()
+        metadata = runner.drafter.calc_spec_decode_metadata(ids, prepared)
+        assert runner.h2d_groups["spec_decode"]._backend is None
         assert metadata.input_ids is ids
         # The verification read, as the rejection sampler makes it: right
         # after publication, behind the sleep, so unpublished indices show.
@@ -323,6 +324,31 @@ def test_speculative_indices_publish_before_verification_reads(
         assert anchors.cpu().tolist() == [-1] * len(lengths)
 
 
+@pytest.mark.parametrize(
+    "lengths,expected",
+    [
+        ([1, 3], [0, 1, 1, 1, -1, -1, -1, -1]),
+        ([2, 3], [0, 0, 1, 1, 1, -1, -1, -1]),
+        # An idle DP rank's dummy step (`dummy_execution`) has no request.
+        ([], [-1] * 8),
+    ],
+)
+def test_query_metadata_numbers_only_requests_that_own_tokens(
+    monkeypatch, lengths, expected
+):
+    runner = runner_with_buffers(monkeypatch)
+    runner._gate_staging_reuse()
+    group = runner.h2d_groups["token_inputs"]
+    lengths = np.array(lengths, dtype=np.int32)
+    counts = runner.attn_metadata_builder.prepare_query_metadata(lengths, 4, 8)
+    group.set_counts(counts)
+    group.publish()
+    runner._mark_staging_h2d_enqueued()
+    torch.cuda.synchronize()
+    published = runner.forward_vars["batch_id_per_q_token"].gpu[:8]
+    assert published.cpu().tolist() == expected
+
+
 def _one_rank_sync():
     """A group of one's step exchange: its own row, nothing exchanged."""
     return sync_dp_metadata(
@@ -332,25 +358,34 @@ def _one_rank_sync():
         scheduled_bs=3,
         is_prefill=False,
         tbo_on=False,
+        running_tokens_per_dp_rank=np.zeros(1, dtype=np.int32),
     )
 
 
 @pytest.mark.parametrize("phase", ["prefill", "first_decode", "deferred"])
-@pytest.mark.parametrize("transport", ["direct", "packed"])
 def test_prepare_model_publishes_sampling_and_query_prefix_before_token_consumer(
-    monkeypatch, phase, transport
+    monkeypatch, phase
 ):
     from atom.model_engine import model_runner
 
-    runner = runner_with_buffers(monkeypatch, transport)
+    runner = runner_with_buffers(monkeypatch)
     runner.config.parallel_config = SimpleNamespace(data_parallel_size=1)
     runner.config.enable_tbo = False
+    runner.config.enable_tbo_decode = False
     runner.capture_sizes_np = np.array([1, 2, 4, 8])
     runner._dspark_apply_q_bucket = lambda batch: None
     runner._tr_hybrid_active = lambda: False
     runner._local_tbo_eligibility = lambda batch: False
     runner.prepare_inputs = lambda *args, **kwargs: None
-    mode = SimpleNamespace(sync=_one_rank_sync(), max_seqlen_q=1, running_bs=4)
+    mode = SimpleNamespace(
+        sync=_one_rank_sync(),
+        max_seqlen_q=1,
+        running_bs=4,
+        running_tokens=4,
+        is_prefill=phase == "prefill",
+        tbo_collective_active=False,
+        decode_ubatch_slices=None,
+    )
     monkeypatch.setattr(model_runner.ForwardMode, "decide", lambda **kwargs: mode)
     processor = runner.tokenID_processor
     prefill = phase == "prefill"
@@ -362,6 +397,7 @@ def test_prepare_model_publishes_sampling_and_query_prefix_before_token_consumer
     batch = SimpleNamespace(
         scheduled_tokens=np.array([51, 93, 61], dtype=np.int32),
         total_tokens_num=3,
+        has_prefill=prefill,
         total_tokens_num_prefill=3 if prefill else 0,
         total_tokens_num_decode=0 if prefill else 3,
         total_seqs_num_prefill=3 if prefill else 0,
@@ -391,6 +427,7 @@ def test_prepare_model_publishes_sampling_and_query_prefix_before_token_consumer
         observed = [x.clone() for x in (ids, temperatures, ks, ps)]
         staged_states = runner.forward_vars["required_channel_states"].gpu[:3].clone()
         cu = runner.forward_vars["cu_seqlens_q"].gpu[:5].clone()
+        batch_ids = runner.forward_vars["batch_id_per_q_token"].gpu[:4].clone()
         runner._mark_staging_h2d_enqueued()
         runner.h2d_owner.completion.synchronize()
         assert observed[0].cpu().tolist() == (
@@ -401,71 +438,83 @@ def test_prepare_model_publishes_sampling_and_query_prefix_before_token_consumer
         ):
             np.testing.assert_array_equal(value.cpu().numpy(), expected)
         assert cu.cpu().tolist() == [0, 1, 2, 3, 3]
+        assert batch_ids.cpu().tolist() == [0, 1, 2, -1]
         if with_channel:
             assert staged_states.cpu().tolist() == channel_states.tolist()
-        if transport == "packed":
-            group = runner.h2d_groups["token_inputs"]
-            assert group._backend.kernel is not None
-            # Optional members a step does not carry keep an older epoch.
-            unpublished = {
-                b.name for b in group.members if b._epoch != runner.h2d_owner.epoch
-            }
-            expected = {"logprob_request_indices"}
-            if phase != "deferred":
-                expected.add("decode_src")
-            if not with_channel:
-                expected.add("required_channel_states")
-            assert unpublished == expected
+        group = runner.h2d_groups["token_inputs"]
+        assert group._backend.kernel is not None
+        # Optional members a step does not carry keep an older epoch.
+        unpublished = {
+            b.name for b in group.members if b._epoch != runner.h2d_owner.epoch
+        }
+        expected = {"logprob_request_indices"}
+        if phase != "deferred":
+            expected.add("decode_src")
+        if not with_channel:
+            expected.add("required_channel_states")
+        assert unpublished == expected
 
 
 def test_packed_spec_indices_follow_decode_prefill_and_dummy_transitions(monkeypatch):
     from atom.model_engine import model_runner
 
-    runner = runner_with_buffers(monkeypatch, "packed", speculative=True)
+    runner = runner_with_buffers(monkeypatch, speculative=True)
     runner.config.parallel_config = SimpleNamespace(data_parallel_size=1)
     runner.config.enable_tbo = False
+    runner.config.enable_tbo_decode = False
     runner.capture_sizes_np = np.array([1, 2, 4, 8])
     runner._dspark_apply_q_bucket = lambda batch: None
     runner._tr_hybrid_active = lambda: False
     runner._local_tbo_eligibility = lambda batch: False
-    mode = SimpleNamespace(sync=_one_rank_sync(), max_seqlen_q=4, running_bs=4)
-    monkeypatch.setattr(model_runner.ForwardMode, "decide", lambda **kwargs: mode)
+    monkeypatch.setattr(
+        model_runner.ForwardMode,
+        "decide",
+        lambda **kwargs: SimpleNamespace(
+            sync=_one_rank_sync(),
+            max_seqlen_q=4,
+            running_bs=4,
+            running_tokens=16,
+            is_prefill=kwargs["batch"].has_prefill,
+            tbo_collective_active=False,
+            decode_ubatch_slices=None,
+        ),
+    )
     monkeypatch.setattr(model_runner, "get_forward_context", lambda: None)
     saved = []
 
     def consume(batch, ids, forward_mode, *, spec_decode_indices):
-        if batch.total_tokens_num_prefill or batch.is_dummy_run:
+        if batch.total_tokens_num_prefill or not batch.total_seqs_num_decode:
             assert spec_decode_indices is None
             group = runner.h2d_groups["token_inputs"]
             for binding in runner.h2d_groups["spec_decode"].members:
                 assert group.counts[group.indices[binding.name]] is None
                 assert binding._epoch != runner.h2d_owner.epoch
             return
-        _, lens, cu = runner.attn_metadata_builder.decode_spans(batch)
-        metadata = runner.drafter.calc_spec_decode_metadata(
-            lens, cu[1:], ids, prepared_indices=spec_decode_indices
-        )
+        metadata = runner.drafter.calc_spec_decode_metadata(ids, spec_decode_indices)
         saved.append(ids[metadata.target_logits_indices + 1])
         assert runner.h2d_groups["spec_decode"]._backend is None
 
     runner.prepare_inputs = consume
-    for phase in ["decode", "prefill", "dummy", "decode"]:
-        prefill, dummy = phase == "prefill", phase == "dummy"
+    for phase in ["decode", "prefill", "idle", "decode"]:
+        prefill, idle = phase == "prefill", phase == "idle"
+        # An idle DP rank's step: no request.
+        bs, tokens = (0, 0) if idle else (3, 7)
         batch = SimpleNamespace(
-            scheduled_tokens=np.arange(7, dtype=np.int32) + 10,
-            total_tokens_num=7,
-            total_tokens_num_prefill=7 if prefill else 0,
-            total_tokens_num_decode=0 if prefill else 7,
-            total_seqs_num_prefill=3 if prefill else 0,
-            total_seqs_num_decode=0 if prefill else 3,
-            total_seqs_num=3,
+            scheduled_tokens=(np.arange(7, dtype=np.int32) + 10)[:tokens],
+            total_tokens_num=tokens,
+            has_prefill=prefill,
+            total_tokens_num_prefill=tokens if prefill else 0,
+            total_tokens_num_decode=0 if prefill else tokens,
+            total_seqs_num_prefill=bs if prefill else 0,
+            total_seqs_num_decode=0 if prefill else bs,
+            total_seqs_num=bs,
             num_spec_step=3,
-            req_ids=[20, 30, 10],
-            is_dummy_run=dummy,
-            num_scheduled_tokens=np.array([4, 1, 2], dtype=np.int32),
-            temperatures=np.zeros(3, dtype=np.float32),
-            top_ks=np.full(3, -1, dtype=np.int32),
-            top_ps=np.ones(3, dtype=np.float32),
+            req_ids=[20, 30, 10][:bs],
+            is_dummy_run=False,
+            num_scheduled_tokens=np.array([4, 1, 2], dtype=np.int32)[:bs],
+            temperatures=np.zeros(bs, dtype=np.float32),
+            top_ks=np.full(bs, -1, dtype=np.int32),
+            top_ps=np.ones(bs, dtype=np.float32),
             produces_output=lambda: True,
             next_token_ids=None,
             required_channel=None,
@@ -485,19 +534,22 @@ def test_mrope_producer_and_padded_model_view_share_axis_stride(
 ):
     from atom.model_ops.attentions.aiter_attention import AiterAttentionMetadataBuilder
 
-    runner = runner_with_buffers(monkeypatch, "direct")
+    runner = runner_with_buffers(monkeypatch)
     builder = runner.attn_metadata_builder
     if builder_kind == "common":
         builder.__class__ = AiterAttentionMetadataBuilder
     runner._gate_staging_reuse()
     batch = SimpleNamespace(
         total_tokens_num_decode=4,
+        num_scheduled_tokens=np.full(2, 2, dtype=np.int32),
         req_ids=[10, 20],
         mrope_position_deltas={10: 100, 20: 200},
     )
+    group = builder.model_runner.h2d_groups["decode_metadata"]
     builder._build_mrope_decode_positions(
-        batch, np.array([12, 22]), 2, running_tokens=8
+        batch, np.array([12, 22]), group, running_tokens=8
     )
+    group.publish()
     _, positions = runner._padded_inputs(
         SimpleNamespace(scheduled_tokens=4, running_tokens=8)
     )
@@ -507,18 +559,17 @@ def test_mrope_producer_and_padded_model_view_share_axis_stride(
     assert observed.tolist() == [[110, 111, 220, 221, 0, 0, 0, 0]] * 3
 
 
-@pytest.mark.parametrize("transport", ["direct", "packed"])
 @pytest.mark.parametrize("sealed", [False, True], ids=["active", "sealed"])
 @pytest.mark.parametrize(
     "producer",
     ["sampling", "prefill_ids", "deferred_ids", "query_prefix", "spec_indices"],
 )
 def test_producer_reentry_preserves_sources_and_first_consumer(
-    monkeypatch, transport, sealed, producer
+    monkeypatch, sealed, producer
 ):
-    runner = runner_with_buffers(monkeypatch, transport, speculative=True)
+    runner = runner_with_buffers(monkeypatch, speculative=True)
     processor = runner.tokenID_processor
-    combined = runner.h2d_groups.get("token_inputs")
+    combined = runner.h2d_groups["token_inputs"]
     source_name = {
         "sampling": "sampling",
         "prefill_ids": "input_ids",
@@ -542,14 +593,14 @@ def test_producer_reentry_preserves_sources_and_first_consumer(
                 top_ps=np.array([0.7, 0.8, 0.9]) - changed * 0.1,
                 required_channel=None,
             )
-            runner.prepare_sample(batch, publication_group=combined)
-            if combined is not None:
-                combined.publish(combined.counts)
+            runner.prepare_sample(batch, combined)
+            combined.publish()
         elif producer in ("prefill_ids", "deferred_ids"):
             prefill = producer == "prefill_ids"
             batch = SimpleNamespace(
                 scheduled_tokens=np.array([11, 12, 13], dtype=np.int32) + changed * 10,
                 total_tokens_num=3,
+                has_prefill=prefill,
                 total_tokens_num_prefill=3 if prefill else 0,
                 total_tokens_num_decode=0 if prefill else 3,
                 total_seqs_num_prefill=3 if prefill else 0,
@@ -562,28 +613,18 @@ def test_producer_reentry_preserves_sources_and_first_consumer(
                 num_bonus=np.zeros(3, dtype=np.int32),
                 produces_output=lambda: True,
             )
-            processor.prepare_input_ids(batch, 1, publication_group=combined)
+            processor.prepare_input_ids(batch, 1, combined)
         elif producer == "query_prefix":
             lengths = np.array([2, 3], dtype=np.int32) + changed
-            batch = SimpleNamespace(
-                total_seqs_num=2,
-                num_scheduled_tokens=lengths,
-                total_tokens_num=int(lengths.sum()),
-            )
-            mode = SimpleNamespace(running_bs=3)
-            if combined is None:
-                runner.attn_metadata_builder.publish_cu_seqlens_q(batch, mode)
-            else:
-                count = runner.attn_metadata_builder.prepare_cu_seqlens_q(batch, mode)
-                combined.set_count(runner.forward_vars["cu_seqlens_q"], count)
-                combined.publish(combined.counts)
+            counts = runner.attn_metadata_builder.prepare_query_metadata(lengths, 3, 8)
+            combined.set_counts(counts)
+            combined.publish()
         else:
             lengths = np.array([2, 3], dtype=np.int32) + changed
-            group = sources if combined is None else combined
             runner.drafter.prepare_spec_decode_indices(
-                lengths, np.cumsum(lengths), group
+                lengths, np.cumsum(lengths), combined
             )
-            group.publish(group.counts)
+            combined.publish()
 
     # Deferred token assembly consumes an already-published unit-stride prefix.
     # This immutable input is not among the source group being tested.
@@ -620,9 +661,8 @@ def test_producer_reentry_preserves_sources_and_first_consumer(
         assert torch.equal(output, reference), member.name
 
 
-@pytest.mark.parametrize("transport", ["direct", "packed"])
-def test_logprob_request_indices_share_sampling_publication(monkeypatch, transport):
-    runner = runner_with_buffers(monkeypatch, transport, builder_cls=SimpleNamespace)
+def test_logprob_request_indices_share_sampling_publication(monkeypatch):
+    runner = runner_with_buffers(monkeypatch, builder_cls=SimpleNamespace)
     for mask in ([True, False, True], [False, False, False], [False, True, False]):
         runner._advance_forward_vars()
         runner._gate_staging_reuse()
@@ -634,15 +674,17 @@ def test_logprob_request_indices_share_sampling_publication(monkeypatch, transpo
             required_channel=None,
             return_logprobs=mask,
             total_tokens_num_prefill=1,
+            has_prefill=True,
             any_logprobs=any(mask),
             logprob_requested=tuple(i for i, enabled in enumerate(mask) if enabled),
         )
-        runner.prepare_sample(batch)
+        group = runner.h2d_groups["token_inputs"]
+        runner.prepare_sample(batch, group)
         expected = [i for i, enabled in enumerate(mask) if enabled]
-        group = runner.h2d_groups["sampling"]
         assert group.counts[group.indices["logprob_request_indices"]] == (
             3 * len(expected) or None
         )
+        group.publish()
         if expected:
             assert batch.logprob_request_indices.tolist() == expected
         else:
@@ -651,13 +693,10 @@ def test_logprob_request_indices_share_sampling_publication(monkeypatch, transpo
         runner._record_forward_vars_event()
 
 
-@pytest.mark.parametrize("transport", ["direct", "packed"])
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_logprob_host_rows_survive_step_and_slot_transitions(
-    monkeypatch, transport, pp_size
-):
+def test_logprob_host_rows_survive_step_and_slot_transitions(monkeypatch, pp_size):
     runner = runner_with_buffers(
-        monkeypatch, transport, pp_size, speculative=True, builder_cls=SimpleNamespace
+        monkeypatch, pp_size, speculative=True, builder_cls=SimpleNamespace
     )
     for lengths, enabled in [
         (None, True),
@@ -677,7 +716,9 @@ def test_logprob_host_rows_survive_step_and_slot_transitions(
         )
         batch = SimpleNamespace(
             total_seqs_num=3,
+            total_seqs_num_decode=0 if lengths is None else 3,
             total_tokens_num_prefill=3 if lengths is None else 0,
+            has_prefill=lengths is None,
             is_dummy_run=False,
             temperatures=np.ones(3),
             top_ks=np.full(3, -1),
@@ -691,10 +732,12 @@ def test_logprob_host_rows_survive_step_and_slot_transitions(
         def no_readback(*args, **kwargs):
             pytest.fail("row preparation must use host metadata, never D2H")
 
+        group = runner.h2d_groups["token_inputs"]
         with monkeypatch.context() as m:
             m.setattr(torch.Tensor, "cpu", no_readback)
             m.setattr(torch.Tensor, "tolist", no_readback)
-            runner.prepare_sample(batch)
+            runner.prepare_sample(batch, group)
+        group.publish()
         if enabled:
             rows = batch.logprob_rows
             actual = [
@@ -704,12 +747,7 @@ def test_logprob_host_rows_survive_step_and_slot_transitions(
             ]
         else:
             assert batch.logprob_rows is None
-            assert (
-                runner.h2d_groups["sampling"].counts[
-                    runner.h2d_groups["sampling"].indices["logprob_request_indices"]
-                ]
-                is None
-            )
+            assert group.counts[group.indices["logprob_request_indices"]] is None
         runner._mark_staging_h2d_enqueued()
         runner._record_forward_vars_event()
         if enabled:

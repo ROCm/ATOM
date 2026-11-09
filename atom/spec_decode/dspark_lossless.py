@@ -245,10 +245,13 @@ class DSparkLossless:
             drafts_verifiable=drafts_verifiable,
             verifies=verifies,
         )
-        counts, at = group.counts, group.indices
-        counts[at["draft_seed"]] = rows.seed
-        counts[at["draft_q_row_base"]] = rows.q_row_base
-        counts[at["draft_verify_q_row_base"]] = rows.verify_q_row_base
+        group.set_counts(
+            {
+                "draft_seed": rows.seed,
+                "draft_q_row_base": rows.q_row_base,
+                "draft_verify_q_row_base": rows.verify_q_row_base,
+            }
+        )
 
     def verify_inputs(
         self,
