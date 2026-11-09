@@ -1642,7 +1642,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if self.index_cache_dtype == "fp4":
             kw["index_mxfp4"] = True
             if decode:
-                kw["index_score"] = sparse_metadata.index_score
+                kw["index_work_map"] = sparse_metadata.index_work_map
         return kw
 
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)

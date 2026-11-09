@@ -1379,12 +1379,12 @@ def minimax_m3_index_topk_decode(
     n_valid_column_per_row: torch.Tensor | None = None,
     index_mxfp4: bool = False,
     pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
-    index_score=None,
+    index_work_map=None,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
     ``index_mxfp4`` and ``pages_per_block`` as in :func:`minimax_m3_index_topk`.
-    The MXFP4 scorer takes the step's ``index_score`` (``IndexScoreStep``: work map
+    The MXFP4 scorer takes the step's ``index_work_map`` (``IndexWorkMapStep``: work map
     and the block bound it was built against, which does not move between graph
     replays); omitted, it builds its own map. The scorer allocates the scores per call.
 
@@ -1445,7 +1445,7 @@ def minimax_m3_index_topk_decode(
 
         from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
-        step = index_score
+        step = index_work_map
         score_max_block = max(max_block, step.max_block if step else 0)
         _require_packable(score_max_block)
         k_data, k_scale = page_views(index_kv_cache)

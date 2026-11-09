@@ -11,7 +11,7 @@ The query is e4m3 as the fused writer emits it (cast as stored, no per-tensor
 scale).
 
 The decode scorer wants a per-step work map. It is built once per step in the
-metadata (outside any graph) into a persistent buffer (``IndexScoreBuffers``);
+metadata (outside any graph) into a persistent buffer (``IndexWorkMap``);
 its row count is the grid, so every call of a step -- and every graph replay --
 must pass the same ``max_block`` the map was built against. The scores themselves
 are allocated per call, as the Triton scorers' are: the scorer, given no ``out``,
@@ -26,7 +26,7 @@ from atom.model_ops.minimax_m3.mxfp4_pages import PAGE_TOKENS
 
 
 @dataclass(frozen=True)
-class IndexScoreStep:
+class IndexWorkMapStep:
     """What one decode step hands every layer's scorer: the step's work map and the
     block bound it was built against."""
 
@@ -34,10 +34,10 @@ class IndexScoreStep:
     max_block: int
 
 
-class IndexScoreBuffers:
+class IndexWorkMap:
     """Persistent storage of the MXFP4 decode scorer's work map, whose pointer a
     captured graph bakes. ``begin_step`` fills it for one step, outside any graph,
-    and returns the step's ``IndexScoreStep``."""
+    and returns the step's ``IndexWorkMapStep``."""
 
     def __init__(self, work_map, max_block, num_idx_heads):
         self.work_map = work_map
@@ -79,4 +79,4 @@ class IndexScoreBuffers:
             self.num_idx_heads,
             out=self.work_map,
         )
-        return IndexScoreStep(work_map, max_block)
+        return IndexWorkMapStep(work_map, max_block)

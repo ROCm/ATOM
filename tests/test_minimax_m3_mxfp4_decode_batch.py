@@ -31,7 +31,8 @@ def mod():
 
 def builder(mod, mxfp4=True, tbo_decode=True, forward_vars=None):
     b = object.__new__(mod.AiterAttentionMetadataBuilder)
-    b._index_score_max_block = BOUND if mxfp4 else 0
+    b._index_work_map_blocks = BOUND if mxfp4 else 0
+    b._index_work_maps = {}
     b._num_idx_heads = HEADS
     b.max_bs = MAX_BS
     b.device = "cpu"
@@ -70,7 +71,7 @@ def test_an_eager_step_scores_at_its_own_block_count_a_graph_step_at_the_models(
         lambda seq_lens, max_block, *a, **kw: built.append(max_block)
         or torch.zeros(1, 2)
     )
-    buffers = index_mxfp4.IndexScoreBuffers.alloc(4, 2, 1, 64, "cpu")
+    buffers = index_mxfp4.IndexWorkMap.alloc(4, 2, 1, 64, "cpu")
     seq = torch.tensor([300, 1000, 0])
     graph = buffers.begin_step(seq, 2, 1000)
     eager = buffers.begin_step(seq, 2, 1000, eager=True)
@@ -151,7 +152,7 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     max_qlen = 8  # a speculative config: the TBO sparse decode still runs one token
     var = b.model_runner.forward_vars
     if mxfp4:
-        var["sparse_attention_index_score"] = index_mxfp4.IndexScoreBuffers.alloc(
+        b._index_work_maps[""] = index_mxfp4.IndexWorkMap.alloc(
             max_bs, max_qlen, HEADS, BOUND, "cpu"
         )
         capacity_args.clear()
@@ -162,17 +163,18 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     # the work plan sizes are not under test
     b._allocate_ubatch_buffers(max_qlen, *([1, torch.int32] * 6))
     # `enable_tbo` alone is the prefill split, which never scores a decode
-    names = [f"ub{i}_sparse_attention_index_score" for i in (0, 1)]
+    names = ["ub0_", "ub1_"]
+    maps = b._index_work_maps
     if not (mxfp4 and tbo_decode):
-        assert not [n for n in names if n in var] and not capacity_args
+        assert not [n for n in names if n in maps] and not capacity_args
         return
     for i in (0, 1):
-        ub = var[names[i]]
+        ub = maps[names[i]]
         assert ub.work_map.shape == (100, 2) and ub.work_map.dtype == torch.int32
         assert (ub.max_block, ub.num_idx_heads) == (BOUND, HEADS)
     assert capacity_args == [(rows[0], BOUND, 1, HEADS), (rows[1], BOUND, 1, HEADS)]
     # each ubatch has its own map
-    assert var[names[1]].work_map.data_ptr() != var[names[0]].work_map.data_ptr()
+    assert maps[names[1]].work_map.data_ptr() != maps[names[0]].work_map.data_ptr()
     # the other per-ubatch buffers stay at max_bs
     assert var["ub0_context_lens"].gpu.numel() == max_bs
 
@@ -198,19 +200,19 @@ def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
         ):
             var[p + name] = None
         var[p + "sparse_attention_n_valid_column_per_row"] = torch.zeros(1)
-        var[p + "sparse_attention_index_score"] = object()
     seen = []
     monkeypatch.setattr(
         sparse_attn, "make_sparse_decode_metadata", lambda **kw: seen.append(kw)
     )
     b = builder(mod, forward_vars=var)
+    b._index_work_maps = {"ub0_": object(), "ub1_": object()}
     for i in (0, 1):
         b.build_ubatch_metadata(i, rows)
     for i, kw in enumerate(seen):
-        assert kw["index_score_buffers"] is var[f"ub{i}_sparse_attention_index_score"]
-    assert seen[0]["index_score_buffers"] is not seen[1]["index_score_buffers"]
+        assert kw["index_work_map"] is b._index_work_maps[f"ub{i}_"]
+    assert seen[0]["index_work_map"] is not seen[1]["index_work_map"]
     # another index cache allocated none: nothing to pass
-    assert builder(mod)._index_score_kwargs("ub0_") == {}
+    assert builder(mod)._index_work_map_kwargs("ub0_") == {}
 
 
 @pytest.mark.parametrize("kv", ["fp4", "fp8"])
@@ -277,7 +279,7 @@ def test_the_sparse_decode_runs_only_the_rows_the_metadata_covers(
         ),
         max_seq_len=100,
         n_valid_column_per_row=None,
-        index_score=None,
+        index_work_map=None,
     )
     ctx = types.SimpleNamespace(
         attn_metadata=types.SimpleNamespace(sparse_attention_metadata=md)

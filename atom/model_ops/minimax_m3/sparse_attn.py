@@ -22,7 +22,7 @@ import triton
 import triton.language as tl
 from aiter.ops.attention import pa_fwd_asm_supports_arch
 
-from atom.model_ops.minimax_m3.index_mxfp4 import IndexScoreBuffers, IndexScoreStep
+from atom.model_ops.minimax_m3.index_mxfp4 import IndexWorkMap, IndexWorkMapStep
 from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
 
 # One sparse block == one KV page.
@@ -98,7 +98,7 @@ class MiniMaxM3SparseMetadata:
     `deepseek_v4_attn.csa_n_committed_per_token` hoists out for the sibling
     indexer. `index_topk` consumes it and never derives its own.
     """
-    index_score: IndexScoreStep | None = None
+    index_work_map: IndexWorkMapStep | None = None
     """The MXFP4 decode index scorer's step state (index_mxfp4): its work map and the
     block bound it was built against (`ceil(max_model_len / 128)`, which must not move
     between graph replays), built once a step. None on prefill, on an empty batch and
@@ -161,14 +161,14 @@ def make_sparse_decode_metadata(
     num_idx_heads: int,
     max_query_len: int = 1,
     n_valid_column_per_row_out: torch.Tensor | None = None,
-    index_score_buffers: IndexScoreBuffers | None = None,
-    index_score_eager: bool = False,
+    index_work_map: IndexWorkMap | None = None,
+    index_work_map_eager: bool = False,
 ) -> MiniMaxM3SparseMetadata:
-    """``index_score_buffers`` is the persistent storage of an MXFP4 index cache's
+    """``index_work_map`` is the persistent storage of an MXFP4 index cache's
     scorer's work map (the builder allocates it only then): given, the step's map is
-    built into it here, once. ``index_score_eager``: the step is not replayed from a
+    built into it here, once. ``index_work_map_eager``: the step is not replayed from a
     graph, so it is built at the batch's own block count (see
-    `IndexScoreBuffers.begin_step`).
+    `IndexWorkMap.begin_step`).
     ``seq_lens`` and ``block_table`` must be the requests whose rows the scorer,
     selector and attention run (`decode_rows_batch`; pad requests of a padded step:
     length 0): the map's encoding and grid and the head offsets of ``n_valid_column_per_row`` all follow that batch.
@@ -177,11 +177,11 @@ def make_sparse_decode_metadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )
     batch = seq_lens.shape[0]
-    index_score = (
-        index_score_buffers.begin_step(
-            seq_lens, max_query_len, max_seq_len, index_score_eager
+    index_work_map = (
+        index_work_map.begin_step(
+            seq_lens, max_query_len, max_seq_len, index_work_map_eager
         )
-        if index_score_buffers is not None
+        if index_work_map is not None
         else None
     )
     return MiniMaxM3SparseMetadata(
@@ -202,7 +202,7 @@ def make_sparse_decode_metadata(
             decode_max_q=max_query_len,
             out=n_valid_column_per_row_out,
         ),
-        index_score=index_score,
+        index_work_map=index_work_map,
     )
 
 
