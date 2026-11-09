@@ -1108,11 +1108,9 @@ models:
                 - layers.*.mlp.down_proj
                 - context_proj
           # An ATOM that does not define a setting ignores it, so the cells
-          # fail on one without these instead of measuring without them.
+          # fail on one without it instead of measuring without it.
           requires_atom_env: &kimi_k3_pd_atom_env
             - ATOM_KV_POLL_FRESH_WAIT_MS
-            - ATOM_PD_PROMPT_IDS_B64
-            - ATOM_PD_EARLY_T0
           env:
             common:
               <<: &kimi_k3_pd_env
@@ -1127,15 +1125,7 @@ models:
                 # prefills ignore the setting.
                 ATOM_KV_POLL_FRESH_WAIT_MS: "5"
               ATOM_GDN_SSM_DTYPE: fp32
-            prefill: &kimi_k3_pd_prefill_env
-              # Hand decode the prompt ids as base64 int32, not a JSON list
-              # that every hop re-parses (~670K ints at 1M context).
-              ATOM_PD_PROMPT_IDS_B64: "1"
             decode:
-              <<: &kimi_k3_pd_decode_env
-                # Stream the prefill's first token when the request's KV
-                # lands, not with the first local decode's deferred output.
-                ATOM_PD_EARLY_T0: "1"
               # Overrides the common "0" on purpose: this is the only cell that
               # runs mono, and only its decode does.
               ATOM_MONO_ENABLE: "1"
@@ -1154,8 +1144,6 @@ models:
           requires_atom_env: *kimi_k3_pd_atom_env
           env:
             common: *kimi_k3_pd_env
-            prefill: *kimi_k3_pd_prefill_env
-            decode: *kimi_k3_pd_decode_env
 
         - <<: *kimi_k3_agentic_tp8
           name: kimi-k3-mxfp4-1p1d-tp8ep8-tp8-dspark7-agentic-1m-c4
@@ -1167,8 +1155,6 @@ models:
           requires_atom_env: *kimi_k3_pd_atom_env
           env:
             common: *kimi_k3_pd_env
-            prefill: *kimi_k3_pd_prefill_env
-            decode: *kimi_k3_pd_decode_env
           run_eval: true
           eval_concurrency: [4]
 
@@ -1197,7 +1183,6 @@ models:
               <<: *kimi_k3_pd_env
               ATOM_ENABLE_REPLAYSSM: "1"
             prefill: &kimi_k3_pd_lmcache128_prefill_env
-              <<: *kimi_k3_pd_prefill_env
               LMCACHE_LOCAL_CPU: "True"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "128"
               LMCACHE_CHUNK_SIZE: "1024"
@@ -1210,7 +1195,6 @@ models:
               OFFLOAD_GPU_STAGING_CHUNKS: "32"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode: *kimi_k3_pd_decode_env
 
         # The PP8 prefill is eight one-GPU stages. Only the last holds the
         # drafter, so its stage is cut to nine layers, on AttnRes block
@@ -1246,8 +1230,6 @@ models:
           # without them would ignore as well.
           requires_atom_env:
             - ATOM_KV_POLL_FRESH_WAIT_MS
-            - ATOM_PD_PROMPT_IDS_B64
-            - ATOM_PD_EARLY_T0
             - ATOM_PD_MLA_STAGING_CHUNK_PAGES
             - ATOM_PD_MLA_STAGING_STREAM_PRIORITY
           env:
@@ -1257,7 +1239,6 @@ models:
               VLLM_PP_LAYER_PARTITION: "12,12,12,12,12,12,12,9"
               ATOM_PD_MLA_STAGING_CHUNK_PAGES: "128"
               ATOM_PD_MLA_STAGING_STREAM_PRIORITY: "-1"
-            decode: *kimi_k3_pd_decode_env
 
         - <<: *kimi_k3_1p1d_pp8_dcp8
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c48
@@ -1274,7 +1255,6 @@ models:
               <<: *kimi_k3_pp8_lmcache128_prefill_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
               OFFLOAD_STATE_CPU_SIZE: "128"
-            decode: *kimi_k3_pd_decode_env
 
         - &kimi_k3_1p1d_pp8_dcp8_c56
           <<: *kimi_k3_1p1d_pp8_dcp8
@@ -1289,7 +1269,6 @@ models:
               <<: *kimi_k3_pp8_ondemand_env
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
             prefill: *kimi_k3_pp8_state128_prefill_env
-            decode: *kimi_k3_pd_decode_env
 
         # From CONC 72 the decode asks aiter for its OPUS MLA kernel, which the
         # names and dashboard labels carry. aiter falls back to the asm kernel
@@ -1311,7 +1290,6 @@ models:
             common: *kimi_k3_pp8_reuse_env
             prefill: *kimi_k3_pp8_state128_prefill_env
             decode: &kimi_k3_pd_opus_decode_env
-              <<: *kimi_k3_pd_decode_env
               AITER_MLA_USE_OPUS: "1"
           run_eval: true
           eval_concurrency: [72]
@@ -1330,8 +1308,6 @@ models:
           # Plus the in-flight cap.
           requires_atom_env:
             - ATOM_KV_POLL_FRESH_WAIT_MS
-            - ATOM_PD_PROMPT_IDS_B64
-            - ATOM_PD_EARLY_T0
             - ATOM_PD_MLA_STAGING_CHUNK_PAGES
             - ATOM_PD_MLA_STAGING_STREAM_PRIORITY
             - ATOM_PP_MAX_INFLIGHT
