@@ -125,7 +125,9 @@ def load_chat_images(messages: list[dict]) -> list[dict]:
 
 
 def _is_image(part: Any) -> bool:
-    return isinstance(part, Mapping) and part.get("type") in _IMAGE_PARTS
+    # A client may send any JSON as `type`: a list is unhashable.
+    kind = part.get("type") if isinstance(part, Mapping) else None
+    return isinstance(kind, str) and kind in _IMAGE_PARTS
 
 
 def _image_url_part(part: Mapping) -> dict:
@@ -159,7 +161,7 @@ def _image_url_part(part: Mapping) -> dict:
         )
     elif len(url) > MAX_URL_CHARS:
         raise ValueError(f"image URLs are limited to {MAX_URL_CHARS} characters")
-    if detail is not None and detail not in DETAILS:
+    if detail is not None and (not isinstance(detail, str) or detail not in DETAILS):
         raise ValueError(f"image detail must be one of {', '.join(sorted(DETAILS))}")
     image_url = {"url": url} if detail is None else {"url": url, "detail": detail}
     return {"type": "image_url", "image_url": image_url}

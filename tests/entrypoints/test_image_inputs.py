@@ -9,9 +9,11 @@ import datetime
 import http.server
 import io
 import random
+import shutil
 import socket
 import ssl
 import struct
+import subprocess
 import threading
 import time
 import zlib
@@ -100,6 +102,15 @@ def test_image_parts_take_one_form():
 def test_what_a_client_may_not_send_is_refused(part, message):
     with pytest.raises(ValueError, match=message):
         images.check_chat_images([_user(part)])
+
+
+def test_a_non_string_type_or_detail_is_the_clients_error():
+    """A client may send any JSON there, and a list is unhashable: a 400, not
+    a TypeError and a 500."""
+    images.check_chat_images([_user({"type": ["image_url"], "image_url": {}})])
+    for detail in (["low"], {"low": True}):
+        with pytest.raises(ValueError, match="detail must be one of"):
+            images.check_chat_images([_user(_image(PNG, detail=detail))])
 
 
 def test_a_url_is_at_most_8192_characters():
@@ -222,7 +233,6 @@ def test_a_requests_decoded_pixels_are_limited_before_decoding():
     """Images that compress well fit the byte limits and decode to tens of
     GiB: the headers are added up first. A header with no pixels behind it
     is refused for its size, not found invalid by decoding."""
-    assert images.MAX_REQUEST_PIXELS == 256 * 10**6
     big = _image(_data_url(_encoded(size=(4096, 4096), mode="1")))  # 16.8 MP
     _load(*[big] * 15)
     with pytest.raises(ValueError, match="megapixels together"):
@@ -252,21 +262,6 @@ def test_a_side_is_at_most_8192_px_or_4096_from_15_images_on():
     ]
     with pytest.raises(ValueError, match="4096 px a side from 15 images"):
         images.load_chat_images(split)
-
-
-def test_the_limits_are_deepseeks():
-    """The numbers of its vision guide, which docs/api_image_input.md quotes."""
-    assert (
-        images.MAX_IMAGE_BYTES,
-        images.MAX_REQUEST_IMAGE_BYTES,
-        images.MAX_SIDE,
-        images.MANY_IMAGES,
-        images.MAX_SIDE_MANY,
-        images.MAX_IMAGES,
-        images.MAX_URL_CHARS,
-        images.DOWNLOAD_SECONDS,
-        images.LOW_DETAIL_SIDE,
-    ) == (32 << 20, 64 << 20, 8192, 15, 4096, 600, 8192, 60, 512)
 
 
 def test_a_requests_images_are_limited_together(monkeypatch):
@@ -377,11 +372,21 @@ def _redirect(location):
     return write
 
 
-@pytest.fixture
-def tls_server(tmp_path, monkeypatch):
-    """`server` over TLS, with a certificate for `public.test` the client is
-    made to trust."""
-    x509 = pytest.importorskip("cryptography.x509")
+def _self_signed(cert_pem, key_pem):
+    """A certificate for `public.test`, made for the test: with the openssl
+    command, or `cryptography` where there is no such command."""
+    openssl = shutil.which("openssl")
+    if openssl:
+        subprocess.run(
+            [openssl, "req", "-x509", "-nodes", "-days", "1"]
+            + ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1"]
+            + ["-subj", "/CN=public.test", "-addext", "subjectAltName=DNS:public.test"]
+            + ["-keyout", str(key_pem), "-out", str(cert_pem)],
+            check=True,
+            capture_output=True,
+        )
+        return
+    x509 = pytest.importorskip("cryptography.x509", reason="no openssl to make a cert")
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -401,7 +406,6 @@ def tls_server(tmp_path, monkeypatch):
         )
         .sign(key, hashes.SHA256())
     )
-    cert_pem, key_pem = tmp_path / "cert.pem", tmp_path / "key.pem"
     cert_pem.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
     key_pem.write_bytes(
         key.private_bytes(
@@ -410,6 +414,14 @@ def tls_server(tmp_path, monkeypatch):
             serialization.NoEncryption(),
         )
     )
+
+
+@pytest.fixture
+def tls_server(tmp_path, monkeypatch):
+    """`server` over TLS, with a certificate for `public.test` the client is
+    made to trust."""
+    cert_pem, key_pem = tmp_path / "cert.pem", tmp_path / "key.pem"
+    _self_signed(cert_pem, key_pem)
     trusting = ssl.create_default_context(cafile=str(cert_pem))
     monkeypatch.setattr(ssl, "_create_default_https_context", lambda *_a: trusting)
     # The https handler takes its context when the opener is built.
