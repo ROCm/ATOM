@@ -1902,6 +1902,37 @@ class ModelRunner:
         """
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
+    def _local_checkpoint_spec(
+        self, plan: PoolPlan, transfer, slot_bytes: int
+    ) -> PagedStateCheckpointSpec:
+        """This worker's own checkpoint geometry, before any PP agreement."""
+        # None means the backend has not narrowed its image: carry it all.
+        narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
+        # The charged entry can be larger than the bytes a transfer
+        # publishes: MHA alignment padding is not a region, and a draft
+        # pool merged into the same class is ordinary KV after the
+        # checkpoint regions. The backend names the published unit.
+        page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
+        published_unit = getattr(
+            self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
+        )
+        if callable(published_unit):
+            published = published_unit()
+            if published is not None:
+                published = int(published)
+                if published <= 0 or published > page_unit_bytes:
+                    raise RuntimeError(
+                        f"checkpoint PAGE unit is {published} B but the "
+                        f"paged pool entry is {page_unit_bytes} B"
+                    )
+                page_unit_bytes = published
+        return PagedStateCheckpointSpec(
+            page_unit_bytes=page_unit_bytes,
+            slot_bytes=slot_bytes,
+            image_bytes=slot_bytes if narrowed is None else int(narrowed),
+            layout_id=transfer.paged_layout_id,
+        )
+
     def _agree_pipeline_checkpoint_spec(
         self, spec: PagedStateCheckpointSpec | None
     ) -> PagedStateCheckpointSpec:
@@ -2117,49 +2148,33 @@ class ModelRunner:
                 raise RuntimeError(
                     "PAGE-backed state checkpoints require a PAGE sub-pool"
                 )
+            is_pp = config.pipeline_parallel_size > 1
+            if is_pp and not torch.distributed.is_initialized():
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints under PP need the "
+                    "distributed groups initialized first"
+                )
             slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
-            pipelined = (
-                config.pipeline_parallel_size > 1 and torch.distributed.is_initialized()
+            # A PP stage without a linear-attention layer has no image.
+            local_spec = (
+                self._local_checkpoint_spec(plan, transfer, slot_bytes)
+                if slot_bytes
+                else None
             )
-            if not slot_bytes:
-                # A PP stage without a linear-attention layer.
-                if pipelined:
-                    self._agree_pipeline_checkpoint_spec(None)
+            if is_pp:
+                # Every stage joins, a stateless one with None: raising before
+                # the collective would leave its peers waiting in it.
+                checkpoint_spec = self._agree_pipeline_checkpoint_spec(local_spec)
+                transfer = dataclasses.replace(
+                    transfer, paged_layout_id=checkpoint_spec.layout_id
+                )
+            elif local_spec is None:
                 raise RuntimeError(
                     "PAGE-backed state checkpoints need recurrent state, but "
                     "this model holds none"
                 )
-            # None means the backend has not narrowed its image: carry it all.
-            narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
-            # The charged entry can be larger than the bytes a transfer
-            # publishes: MHA alignment padding is not a region, and a draft
-            # pool merged into the same class is ordinary KV after the
-            # checkpoint regions. The backend names the published unit.
-            page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
-            published_unit = getattr(
-                self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
-            )
-            if callable(published_unit):
-                published = published_unit()
-                if published is not None:
-                    published = int(published)
-                    if published <= 0 or published > page_unit_bytes:
-                        raise RuntimeError(
-                            f"checkpoint PAGE unit is {published} B but the "
-                            f"paged pool entry is {page_unit_bytes} B"
-                        )
-                    page_unit_bytes = published
-            checkpoint_spec = PagedStateCheckpointSpec(
-                page_unit_bytes=page_unit_bytes,
-                slot_bytes=slot_bytes,
-                image_bytes=slot_bytes if narrowed is None else int(narrowed),
-                layout_id=transfer.paged_layout_id,
-            )
-            if pipelined:
-                checkpoint_spec = self._agree_pipeline_checkpoint_spec(checkpoint_spec)
-                transfer = dataclasses.replace(
-                    transfer, paged_layout_id=checkpoint_spec.layout_id
-                )
+            else:
+                checkpoint_spec = local_spec
             logger.info(
                 "PAGE-backed state checkpoints enabled: unit_bytes=%d, "
                 "slot_bytes=%d, image_bytes=%d (%.1f%% of a slot), "

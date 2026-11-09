@@ -2598,13 +2598,15 @@ class BlockManager:
             else 0
         )
         # Onto the LMCache chunk grid when the joint load serves this tier, as
-        # the prompt-end anchor is (`_record_checkpoint_end`). A demand sits
-        # where a shared prefix forks, the part of a prompt HBM keeps longest,
-        # so it is what an evicted prompt's HBM hit stops on. Off the grid that
-        # hit cannot be continued from LMCache at all (`_joint_kv_boundary`
-        # refuses `hbm_off_chunk_grid`) and the whole evicted tail is
-        # recomputed; on it, the joint load resumes the tail. Flooring costs
-        # the forks under one chunk each while the prefix is in HBM. A floored
+        # the prompt-end anchor is (`_record_checkpoint_end`), and for the same
+        # missing chunk. A demand sits where prompts fork, so the chunk covering
+        # it also holds tokens past the fork, and LMCache keys a chunk by all of
+        # its tokens: the next fork's lookup stops at the chunk floor. Once the
+        # prefix leaves HBM, `_joint_kv_boundary` takes rungs only up to that
+        # lookup, so an off-grid demand is never reached and the fork recomputes
+        # from its HBM hit (`no_rung_above_hbm`). An unaligned HBM hit is not
+        # the problem; the joint load reloads its partial chunk. Flooring costs
+        # each fork under one chunk while the prefix is still in HBM. A floored
         # demand at or below the hit is no rung anybody gains from.
         chunk = self._joint_chunk_tokens
         if (
