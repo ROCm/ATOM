@@ -2563,6 +2563,13 @@ run_aiperf_agentic_benchmark() {
     echo "${aiperf_pid}" > "${aiperf_pid_file}"
     local aiperf_rc=0
     wait "${aiperf_pid}" || aiperf_rc=$?
+    if [[ "${AGGREGATED}" != "1" ]]; then
+      # Routing-decision counters after the run, staged with the latency report.
+      mkdir -p "${out_dir}/metrics"
+      curl -sSf --max-time 10 -o "${out_dir}/metrics/router-metrics.prom" \
+        "http://127.0.0.1:${ROUTER_PORT}/metrics" \
+        || echo "[aiperf] WARNING: router /metrics snapshot failed" >&2
+    fi
 
     if [[ -n "${profile_pid}" ]]; then
       touch "${profile_done}"

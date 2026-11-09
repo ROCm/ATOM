@@ -434,13 +434,15 @@ def test_staging_selects_current_cell_and_job_and_links_the_artifact(tmp_path):
     stage = load_module("stage_reports")
     results, output = tmp_path / "results", tmp_path / "staged"
     make_report(results, "cell-a", 100)
-    make_report(results, "cell-a", 101)
+    folder = make_report(results, "cell-a", 101)
+    (folder / "router-metrics.prom").write_text("mesh_route_branch_total 1\n")
     make_report(results, "cell-b", 101)
     (results / "cell-a.slurm-job-id").write_text("101\n")
     manifest = stage.stage_reports(results, "cell-a", output)
     assert len(manifest["reports"]) == 1
     html = output / manifest["reports"][0]["html"]
     assert html.read_text() == "report for cell-a/101"
+    assert (html.parent / "router-metrics.prom").is_file()
     summary = tmp_path / "summary.md"
     stage.write_summary(
         manifest, "https://github.com/org/repo/actions/runs/123/artifacts/456", summary
