@@ -98,9 +98,9 @@ def pslot(e, sm):
     return (e >= V_OV0).select(ov, r)
 
 
-def prow(pk, NP):
+def prow(pk, NP, topk):
     """token row of a pick (routed: pk // 6; shared pseudo-pick: pk - NP)."""
-    return (pk >= NP).select(pk - NP, pk // TOPK)
+    return (pk >= NP).select(pk - NP, pk // topk)
 
 
 def _stx(addr, val):
@@ -355,15 +355,15 @@ def moe_union(c):
         if has:
             hx.lstore(sm + O_UNI + (base + mbcnt(m)) * 4, ve)
         base = base + popc(m)
-        for k in range_constexpr((NP // TOPK + MAXTOK - 1) // MAXTOK):
-            nk = min(MAXTOK, NP // TOPK - MAXTOK * k)
+        for k in range_constexpr((NP // c["topk"] + MAXTOK - 1) // MAXTOK):
+            nk = min(MAXTOK, NP // c["topk"] - MAXTOK * k)
             if l == 0:
                 hx.lstore(sm + O_UNI + (base + k) * 4, I32(NE + k))
                 hx.lstore(sm + O_CNT + (NE + k) * 4, I32(nk))
             if l < nk:
                 hx.lstore(sm + O_LST + ((NE + k) * MAXTOK + l) * 4, NP + MAXTOK * k + l)
                 hx.lstore(sm + O_WTS + (NP + MAXTOK * k + l) * 4, F32(1.0))
-        base = base + (NP // TOPK + MAXTOK - 1) // MAXTOK
+        base = base + (NP // c["topk"] + MAXTOK - 1) // MAXTOK
         if l == 0:
             hx.lstore(sm + O_NUNI, base)
     gpu.barrier()
@@ -375,15 +375,15 @@ def moe_combine(c, TR, sm_out):
     sum over the row's 6 picks of out[pick] (already route-weighted) + the shared expert's row, as f32 [r][20]
     at sm_out (the layout tp_allreduce reads). One thread = 4 cols of a row (16-byte loads, all issued before the adds)."""
     t, b = c["t"], c["b"]
-    NP = TR * TOPK
+    NP = TR * c["topk"]
     if t < TR * 5:
         row = t // 5
         c4 = (t % 5) * 4
         col = (b // 4) * 80 + (b % 4) * 20 + c4
-        vb = [hx.gload(c["out"] + (i64(row * TOPK + k) * H + i64(col)) * 2, fx.BFloat16, 4) for k in range(TOPK)]
+        vb = [hx.gload(c["out"] + (i64(row * c["topk"] + k) * H + i64(col)) * 2, fx.BFloat16, 4) for k in range(c["topk"])]
         vsh = hx.gload(c["out"] + (i64(NP + row) * H + i64(col)) * 4, F32, 4)   # the shared expert's row stays f32
         acc = [vb[0][j].to(F32) for j in range(4)]
-        for k in range_constexpr(1, TOPK):
+        for k in range_constexpr(1, c["topk"]):
             acc = [acc[j] + vb[k][j].to(F32) for j in range(4)]
         acc = [acc[j] + vsh[j] for j in range(4)]
         hx.lstore(sm_out + (row * 20 + c4) * 4, fx.Vector.from_elements(acc, F32), align=16)
@@ -408,7 +408,7 @@ def moe_ug(c):
     t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
     tl = l % 16
     nuni = ufl(hx.lload(sm + O_NUNI, I32))
-    NCH = (c["NP"] // TOPK + MAXTOK - 1) // MAXTOK   # shared pseudo-experts (python int)
+    NCH = (c["NP"] // c["topk"] + MAXTOK - 1) // MAXTOK   # shared pseudo-experts (python int)
     SH8_UPC = sh8_upc(NCH)
     SH8_DNOV = sh8_dnov(NCH)
     NSHU = NCH * NUG   # FP8 shared units: the last NDC CTAs take SH8_UPC each (all 8 waves, K split)
@@ -510,10 +510,10 @@ def ug_shared8(c, ui, k, g):
     # the shared pseudo-expert's picks are NP + 16 k + 0 .. n - 1 by construction (moe_union), so computed here, not
     # read from the union's LDS list (a served 4-request draft layer once read stale 0x7FFFFFFF slots there -> a
     # fault; the writer of that LDS state is not found)
-    rows_ = c["NP"] // TOPK
+    rows_ = c["NP"] // c["topk"]
     n = fx.min(I32(rows_) - MAXTOK * k, I32(MAXTOK))
     pk = c["NP"] + MAXTOK * k + (tl < n).select(tl, I32(0))
-    row = prow(pk, c["NP"])
+    row = prow(pk, c["NP"], c["topk"])
     xrow = c["x8"] + i64(row) * H
     srow = c["xs"] + i64(row) * (H // 32)
     ab = c["shplane"] + i64(g * UGU) * UNIT8
@@ -561,9 +561,9 @@ def ug_shared_early(c, bi):
     su = bi // SHE_CTAS
     k = su // NUG
     g = su % NUG
-    rows_ = c["NP"] // TOPK
+    rows_ = c["NP"] // c["topk"]
     n = fx.min(I32(rows_) - MAXTOK * k, I32(MAXTOK))
-    row = prow(c["NP"] + MAXTOK * k + (tl < n).select(tl, I32(0)), c["NP"])
+    row = prow(c["NP"] + MAXTOK * k + (tl < n).select(tl, I32(0)), c["NP"], c["topk"])
     xrow = c["x8"] + i64(row) * H
     srow = c["xs"] + i64(row) * (H // 32)
     ab = c["shplane"] + i64(g * UGU) * UNIT8
@@ -604,7 +604,7 @@ def ug_shared_fin(c, su):
     w, l = c["w"], c["l"]
     k = su // NUG
     g = su % NUG
-    n = fx.min(I32(c["NP"] // TOPK) - MAXTOK * k, I32(MAXTOK))
+    n = fx.min(I32(c["NP"] // c["topk"]) - MAXTOK * k, I32(MAXTOK))
     tot = [fx.Vector.filled(8, 0.0, F32) for _ in range(4)]
     for h in range_constexpr(SHE_CTAS):
         for tile in range_constexpr(4):
@@ -620,7 +620,7 @@ def ug_body(c, pk, ab):
     """One UG work unit (32 MID cols: 4 tiles x 40 K steps) of the expert whose A units start at ab, for the tokens of
     pick list pk (lane tl's pick); returns the 4 tiles' accumulators."""
     l = c["l"]
-    row = prow(pk, c["NP"])
+    row = prow(pk, c["NP"], c["topk"])
     xrow = c["x8"] + i64(row) * H
     srow = c["xs"] + i64(row) * (H // 32)
     KB = DUG // 4
@@ -646,7 +646,7 @@ def ug_body(c, pk, ab):
 
 def dn_nuni(c, nuni):
     """Union entries in the routed down ranges (the shared pseudo-experts, last, go to moe_dn_shared)."""
-    return nuni - (c["NP"] // TOPK + MAXTOK - 1) // MAXTOK
+    return nuni - (c["NP"] // c["topk"] + MAXTOK - 1) // MAXTOK
 
 
 @ASTRewriter.transform
@@ -767,7 +767,7 @@ def moe_dn_shared(c):
     t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
     tl = l % 16
     NP = c["NP"]
-    NCH = (NP // TOPK + MAXTOK - 1) // MAXTOK
+    NCH = (NP // c["topk"] + MAXTOK - 1) // MAXTOK
     Us = NCH * NDN
     nuni = ufl(hx.lload(sm + O_NUNI, I32))
     bi = c.get("dn8_bi", b)
@@ -779,7 +779,7 @@ def moe_dn_shared(c):
         k = tile // NDN
         tt = tile % NDN
         ui = (I32(SHS0) + k) if sh_early(NCH) else nuni - NCH + k
-        n = fx.min(I32(c["NP"] // TOPK) - MAXTOK * k, I32(MAXTOK))   # (as ug_shared8: not the LDS count)
+        n = fx.min(I32(c["NP"] // c["topk"]) - MAXTOK * k, I32(MAXTOK))   # (as ug_shared8: not the LDS count)
         mrow = c["mid8"] + (i64(ui) * MAXTOK + i64(tl)) * MROW
         crow = c["midc"] + (i64(ui) * MAXTOK + i64(tl)) * CROW
         base = c["shplane"] + (i64(NUG * UGU) + i64(tt) * DNU) * UNIT8
@@ -813,6 +813,6 @@ def moe(c, cnt_off):
     moe_dn_stage(c)
     st(4)
     moe_dn(c)
-    if fx.const_expr(not sh8_dnov((c["NP"] // TOPK + MAXTOK - 1) // MAXTOK)):
+    if fx.const_expr(not sh8_dnov((c["NP"] // c["topk"] + MAXTOK - 1) // MAXTOK)):
         moe_dn_shared(c)
     st(3)

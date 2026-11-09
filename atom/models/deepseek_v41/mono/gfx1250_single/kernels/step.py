@@ -125,7 +125,7 @@ def cwith(c, **kw):
     return c.with_(**kw) if isinstance(c, LazyC) else dict(c, **kw)
 
 
-def entry_front(fp, sm, b, row):
+def entry_front(fp, sm, b, row, ne, topk):
     """A segment entry's attention front (front CTAs): the block state (dR / dy / dpre / dpost / dcomb) through the
     attention front of layer-table row `row` (its a* weights) -> axn / x8 / xs / the gates; R kept in LDS (first)."""
     nof = fx.Int32(0) != fx.Int32(0)
@@ -138,7 +138,7 @@ def entry_front(fp, sm, b, row):
               xs=fptr(fp, "xs"), part=fptr(fp, "part"), plog=fptr(fp, "plog"), cand=fptr(fp, "cand"),
               cands=fptr(fp, "cands"), npre=fptr(fp, "anpre"), npost=fptr(fp, "anpost"), ncomb=fptr(fp, "ancomb"),
               ids=fptr(fp, "ids"), wts=fptr(fp, "wts"), isffn=nof, xs32=fx.Int32(1) != fx.Int32(0), merge=nof,
-              rk=sm + RKOFF, first=fx.Int32(1) != fx.Int32(0), last=nof)
+              rk=sm + RKOFF, first=fx.Int32(1) != fx.Int32(0), last=nof, hdev=True, ne=ne, topk=topk)
     FS.front_any(cu, lambda k: None)
 
 
@@ -201,7 +201,6 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
     L = smem_layout(TR)
     TPG = TR * 10 // 3
     stx = hx.stx_dev
-    FS.STX[0] = stx   # the fronts' exchange stores: device scope (fence-free handoffs)
     SEGS = ([(0, NL, 1)] if part != "draft" else []) + ([(NL, NL + ndr, 4)] if ndr and part != "target" else [])
     NDR = ndr
     TRD = TR if trd is None else trd
@@ -230,11 +229,12 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                                           comb=fptr(fp, "dcomb")), TR, 1)
                 handoff(TCNT + i64(LY.TARGET_STATE), t, False)
                 if b < FS.FRONT_CTAS:
-                    entry_front(fp, sm, b, TENTRY_ROW)
+                    entry_front(fp, sm, b, TENTRY_ROW, FS.NE, FS.TOPK)
                 handoff(TCNT + i64(LY.TARGET_FRONT), t, False)
             TRx = TRD if DRS else TR
             Lx = LD if DRS else L
             DSUF = "_d" if DRS else ""
+            RNE, RTOPK = (DRAFT_NE, DRAFT_TOPK) if DRS else (FS.NE, FS.TOPK)   # the segment's router shape
             if fx.const_expr(DRS):
                 t = hx.opaque_v(fx.thread_idx.x)
                 b = hx.opaque_s(fx.block_idx.x)
@@ -257,14 +257,8 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                                           comb=fptr(fp, "dcomb")), TRD // DSPARK_W, DSPARK_W)
                 handoff(TCNT + i64(LY.DRAFT_STATE), t, False)
                 if b < FS.FRONT_CTAS:
-                    _rt = (FS.NE, FS.TOPK)
-                    FS.set_router(DRAFT_NE, DRAFT_TOPK)
-                    entry_front(fp, sm, b, NL + NDR)
-                    FS.set_router(*_rt)
+                    entry_front(fp, sm, b, NL + NDR, DRAFT_NE, DRAFT_TOPK)
                 handoff(TCNT + i64(LY.DRAFT_FRONT), t, False)
-                _shape = (FS.NE, FS.TOPK, MS.TOPK)
-                FS.set_router(DRAFT_NE, DRAFT_TOPK)
-                MS.TOPK = DRAFT_TOPK
             for Ly in range(seg_lo, seg_hi):
                 kind = seg_kind
                 t = hx.opaque_v(fx.thread_idx.x)
@@ -401,7 +395,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                                   xs=isf.select(fptr(fp, "fxs"), c["xs"]), part=fptr(fp, "part"), plog=fptr(fp, "plog"),
                                   cand=fptr(fp, "cand"), cands=fptr(fp, "cands"), npre=fsel("npre", "anpre"),
                                   npost=fsel("npost", "anpost"), ncomb=fsel("ncomb", "ancomb"), ids=fptr(fp, "ids"),
-                                  wts=fptr(fp, "wts"), isffn=isf, xs32=hf != 0, merge=isf)
+                                  wts=fptr(fp, "wts"), isffn=isf, xs32=hf != 0, merge=isf, hdev=True, ne=RNE, topk=RTOPK)
                         cu.update(fnh=lsel(fp, Ly, isf, "fnh", "afnh"), fnl=lsel(fp, Ly, isf, "fnl", "afnl"),
                                   hsc=lsel(fp, Ly, isf, "hsc", "ahsc"), hbs=lsel(fp, Ly, isf, "hbs", "ahbs"),
                                   nw=lsel(fp, Ly, isf, "nw", "anw"), gate=ltab(fp, Ly, "gate")(), gbias=ltab(fp, Ly, "gbias")())
@@ -429,7 +423,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                             if tq3 == 0:
                                 hx.wait_count(lambda: lc + i64(LY.X8_PUB), FS.FRONT_CTAS, 6)
                             gpu.barrier()
-                            ce = dict(t=tq3, b=b, w=tq3 // 32, l=tq3 % 32, sm=sm + FRONT_LDS_OFF, NP=TRx * MS.TOPK,
+                            ce = dict(t=tq3, b=b, w=tq3 // 32, l=tq3 % 32, sm=sm + FRONT_LDS_OFF, NP=TRx * RTOPK, topk=RTOPK,
                                       x8=fptr(fp, "fx8"), xs=fptr(fp, "fxs"), shplane=ltab(fp, Ly, "shplane")(),
                                       mid8=fptr(fp, "mid8"), midc=fptr(fp, "midc"), out=fptr(fp, "mout"))
                             MS.ug_shared_early(ce, b - FS.FRONT_CTAS)
@@ -439,14 +433,14 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                         mfx8, mfxs, mwts, mout, mid8, midc = [fptr(fp, k) for k in ("fx8", "fxs", "wts", "mout", "mid8", "midc")]
                         tq2 = hx.opaque_v(fx.thread_idx.x)
                         cm = LazyC({'shplane': (lambda Ly=Ly: ltab(fp, Ly, 'shplane')())},   # (re-read at its uses: not live across the layer)
-                                   t=tq2, b=b, w=tq2 // 32, l=tq2 % 32, sm=sm + FRONT_LDS_OFF, NP=TRx * MS.TOPK, nexp_max=96,
+                                   t=tq2, b=b, w=tq2 // 32, l=tq2 % 32, sm=sm + FRONT_LDS_OFF, NP=TRx * RTOPK, topk=RTOPK, nexp_max=96,
                                    plane=ltab(fp, Ly, "mplane")(), x8=mfx8, xs=mfxs, ids=fptr(fp, ('mroute' if (not DRS and os.environ.get('MROUTE_FIXED') == '1') else 'ids')), wts=mwts, out=mout,
                                    mid8=mid8, midc=midc, shcnt=lc + i64(LY.SHARED_DOWN))
                         MS.moe(cm, lc + i64(LY.MOE_UG))
                         gpu.barrier()
                         handoff(lc + i64(LY.MOE_DONE), t, True)
                         # TP2 payload = the MoE output rows, result -> y2 (the attention front's y)
-                        MS.moe_combine(dict(t=hx.opaque_v(fx.thread_idx.x), b=b, out=fptr(fp, "mout")), TRx, sm)
+                        MS.moe_combine(dict(t=hx.opaque_v(fx.thread_idx.x), b=b, out=fptr(fp, "mout"), topk=RTOPK), TRx, sm)
                         tp_allreduce(cwith(c, tpout=fptr(fp, "tp2out"), ytgt=fptr(fp, "y2")), par * 2 + 1, 2 * Ly + 2)
                         gpub(lc + i64(LY.TP2_GROUPS), b, t)
                 handoff(lc + i64(LY.LAYER_END), t, True)
@@ -465,8 +459,6 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
             ST.target(tp, t, b, sm, st, cnt + i64((NL + NDR) * LCB), recv, rank, head_d=4,
                      ctx=_ctxtab(fp, NDR), T=TR)
         if fx.const_expr(NDR > 0 and part != "target"):
-            FS.set_router(_shape[0], _shape[1])
-            MS.TOPK = _shape[2]
             t = hx.opaque_v(fx.thread_idx.x)
             b = hx.opaque_s(fx.block_idx.x)
             sm = hx.lds_base()

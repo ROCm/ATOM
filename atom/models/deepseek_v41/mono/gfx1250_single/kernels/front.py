@@ -39,14 +39,14 @@ from moe import sched_barrier
 T, H, NG, TG, CL, NE, TOPK = 48, 5120, 6, 8, 16, 384, 6
 
 
-def set_router(ne, topk):
-    """Trace-time router shape (the draft blocks: 128 experts, top 3); set before tracing that code."""
-    global NE, TOPK, EPC, NCI
+def router(c):
+    """The router shape of front context c (c["ne"] experts, top c["topk"]; the target's 384 / 6 by default, the draft
+    blocks' 128 / 3): (NE, TOPK, experts a CTA (E1), 32-lane rounds of the CL x TOPK candidates (E2))."""
+    ne, topk = c.get("ne", NE), c.get("topk", TOPK)
     assert ne % CL == 0 and ne // CL <= 32 and CL * topk <= 96
-    NE, TOPK, EPC, NCI = ne, topk, ne // CL, (CL * topk + 31) // 32
+    return ne, topk, ne // CL, (CL * topk + 31) // 32
 
 
-EPC, NCI = NE // CL, (CL * TOPK + 31) // 32   # experts a CTA (E1), 32-lane rounds of the CL x TOPK candidates (E2)
 COLS = H // CL          # 320
 CP = COLS + 8           # padded LDS row (bf16)
 FRONT_CTAS = NG * CL    # 96
@@ -61,13 +61,10 @@ FRONT_LDS = O_RSTD + 64
 RK_BYTES = 8 * 4 * CP * 2                 # residual streams kept in LDS between fronts
 
 
-# exchange store for the outputs other CTAs read after a handoff: hx.gstore, or hx.stx_dev in the fence-free (hdev)
-# whole-layer kernel (set by its build; a function inside the traced `c` dict breaks the AST rewriter's scf.if states)
-STX = [hx.gstore]
-
-
-def _stx(addr, val):
-    STX[0](addr, val)
+def _stx(c, addr, val):
+    """Exchange store of an output other CTAs read after a handoff: device scope (hx.stx_dev) in the fence-free step
+    kernel (c["hdev"]), else hx.gstore. (A bool in `c`: a function there breaks the AST rewriter's scf.if states.)"""
+    (hx.stx_dev if c.get("hdev", False) else hx.gstore)(addr, val)
 
 
 def i64(x):
@@ -217,7 +214,7 @@ def front_A(c):
                 pv = fx.Vector.from_elements(outs[j], BF16)
                 hx.lstore(c["rk"] + ((w * 4 + j) * CP + cs[s_]) * 2, pv, align=16)
                 if c["last"]:
-                    _stx(c["Rout"] + i64((tok * 4 + j) * H + c0 + cs[s_]) * 2, pv)
+                    _stx(c, c["Rout"] + i64((tok * 4 + j) * H + c0 + cs[s_]) * 2, pv)
                 hx.lstore(sm + O_RP + ((w * 4 + j) * CP + cs[s_]) * 2, pv, align=16)
             hx.lstore(sm + O_X1 + (w * CP + cs[s_]) * 2, fx.Vector.from_elements(x1s, BF16), align=16)
     for o in range_constexpr(5):
@@ -317,17 +314,17 @@ def front_C(c):
         code = e8m0_of(am)
         inv = inv_pow2(code)
         words = q8words([vals[e] for e in range(32)], inv)
-        _stx(c["x8"] + i64(row * H + c0 + gi * 32), fx.Vector.from_elements(words[:4], I32))
-        _stx(c["x8"] + i64(row * H + c0 + gi * 32 + 16), fx.Vector.from_elements(words[4:], I32))
+        _stx(c, c["x8"] + i64(row * H + c0 + gi * 32), fx.Vector.from_elements(words[:4], I32))
+        _stx(c, c["x8"] + i64(row * H + c0 + gi * 32 + 16), fx.Vector.from_elements(words[4:], I32))
         if c["xs32"]:   # the attention front: one int32 a 32-col block (the wq_a / wkv input); the FFN front: int8
-            _stx(c["xs"] + i64(row * (H // 32) + c0 // 32 + gi) * 4, code)
+            _stx(c, c["xs"] + i64(row * (H // 32) + c0 // 32 + gi) * 4, code)
         else:
-            _stx(c["xs"] + i64(row * (H // 32) + c0 // 32 + gi), code.to(fx.Int8))
+            _stx(c, c["xs"] + i64(row * (H // 32) + c0 // 32 + gi), code.to(fx.Int8))
         for k in range_constexpr(4):
-            _stx(c["xn"] + i64(row * H + c0 + gi * 32 + 8 * k) * 2, vs[k])
+            _stx(c, c["xn"] + i64(row * H + c0 + gi * 32 + 8 * k) * 2, vs[k])
 
 
-def _grow(w, m, l):
+def _grow(w, m, l, NE):
     """gate row of wave w's tile m, lane l (clamped to the NE rows: the draft router has 128)."""
     r = (w * 3 + m) * 16 + l % 16
     return fx.min(r, I32(NE - 1)) if NE < 384 else r
@@ -336,8 +333,9 @@ def _grow(w, m, l):
 @ASTRewriter.transform
 def front_D(c):
     """router partial: experts as M (this CTA's 320 gate columns, all loads issued first), tokens as N."""
+    NE, TOPK, EPC, NCI = router(c)
     t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
-    gw = [[hx.gload(c["gate"] + i64(_grow(w, m, l) * H + (b % CL) * COLS + k * 32 + (l // 16) * 16) * 2,
+    gw = [[hx.gload(c["gate"] + i64(_grow(w, m, l, NE) * H + (b % CL) * COLS + k * 32 + (l // 16) * 16) * 2,
                     BF16, 16, align=16) for k in range(10)] for m in range(3)]
     sched_barrier()
     g = b // CL
@@ -358,6 +356,7 @@ def front_D(c):
 @ASTRewriter.transform
 def front_E1(c):
     """experts 24p..24p+23 of the 8 tokens (wave = token): logits sum, score, local top-6 -> candidates."""
+    NE, TOPK, EPC, NCI = router(c)
     t, b, w, l = c["t"], c["b"], c["w"], c["l"]
     g = b // CL
     p = b % CL
@@ -400,6 +399,7 @@ def front_E1(c):
 def front_E2(c):
     """CTA p=0 of a group merges the 16 x 6 candidates of each token (wave = token); CTA p=1 runs the Sinkhorn of the
     group's 8 tokens lane-parallel (wave = token). The merge runs for the FFN front only (c["merge"], runtime)."""
+    NE, TOPK, EPC, NCI = router(c)
     t, b, w, l = c["t"], c["b"], c["w"], c["l"]
     g = b // CL
     p = b % CL
@@ -450,10 +450,10 @@ def front_E2(c):
             swv = mine.select(bsc, swv)
             wsum = wsum + bsc
         if l < TOPK:
-            _stx(c["ids"] + i64(row * TOPK + l) * 4, sel)
+            _stx(c, c["ids"] + i64(row * TOPK + l) * 4, sel)
             # the sum floored as aiter's topk_gating (RENORM_SUM_FLOOR 1e-20): six selected scores of exactly 0 (logits
             # below ~-17: log(1 + exp(x)) rounds to 0) gave 0 x rcp(0) = NaN weights
-            _stx(c["wts"] + i64(row * TOPK + l) * 4, swv * frcp(fx.max(wsum, F32(1e-20))) * F32(1.5))
+            _stx(c, c["wts"] + i64(row * TOPK + l) * 4, swv * frcp(fx.max(wsum, F32(1e-20))) * F32(1.5))
     if p == 1:
         # Sinkhorn, lane-parallel: CTA p=1, wave w = token w, lane e%16 = comb element (r = e/4, cc = e%4)
         row = g * TG + w
@@ -478,8 +478,8 @@ def front_E2(c):
         bq = hx.gload(c["hbs"] + i64(4 + j4) * 4, F32)
         be = hx.gload(c["hbs"] + i64(8 + e) * 4, F32)
         if l < 4:
-            _stx(c["npre"] + i64(row * 4 + j4) * 4, frcp(F32(1.0) + fexp2(-(mj * rstd * sc0 + bj))) + F32(c["hc_eps"]))
-            _stx(c["npost"] + i64(row * 4 + j4) * 4, F32(2.0) * frcp(F32(1.0) + fexp2(-(mq * rstd * sc1 + bq))))
+            _stx(c, c["npre"] + i64(row * 4 + j4) * 4, frcp(F32(1.0) + fexp2(-(mj * rstd * sc0 + bj))) + F32(c["hc_eps"]))
+            _stx(c, c["npost"] + i64(row * 4 + j4) * 4, F32(2.0) * frcp(F32(1.0) + fexp2(-(mq * rstd * sc1 + bq))))
         eps = F32(c["hc_eps"])
 
         def rsum(v):   # sum over the 4 lanes of a row (cc)
@@ -500,7 +500,7 @@ def front_E2(c):
             P = dv(P, eps + rsum(P))
             P = dv(P, eps + csum(P))
         if l < 16:
-            _stx(c["ncomb"] + i64(row * 16 + e) * 4, P)
+            _stx(c, c["ncomb"] + i64(row * 16 + e) * 4, P)
 
 
 @ASTRewriter.transform
