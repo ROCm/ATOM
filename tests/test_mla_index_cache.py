@@ -464,8 +464,6 @@ class _FakePool:
 
 
 class _FakeCacheSlice:
-    shape = (8, 64, 144)  # Kimi-K3's binder reads it to flatten the slice.
-
     def __init__(self, identity):
         self.identity = identity
 
@@ -505,7 +503,23 @@ def _bind_builder(module, index_cache_layer_map, *, rows_before: int, cls=None):
     return builder
 
 
-def test_build_kv_cache_tensor_binds_compact_index_slice():
+@pytest.fixture(params=("aiter", "kimi_aiter", "kimi_triton"))
+def mla_builder_cls(request):
+    if request.param == "aiter":
+        return AiterMLAMetadataBuilder
+
+    from atom.model_ops.attentions.kimi_mla_gdn_attn import (
+        KimiAiterMLAGDNMetadataBuilder,
+        KimiTritonMLAGDNMetadataBuilder,
+    )
+
+    return {
+        "kimi_aiter": KimiAiterMLAGDNMetadataBuilder,
+        "kimi_triton": KimiTritonMLAGDNMetadataBuilder,
+    }[request.param]
+
+
+def test_build_kv_cache_tensor_binds_compact_index_slice(mla_builder_cls):
     module = _MlaLayer(
         layer_num=5,
         indexer=SimpleNamespace(
@@ -515,19 +529,21 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
             _indexer_fp4=False,
         ),
     )
-    builder = _bind_builder(module, {3: 0, 5: 1}, rows_before=2)
+    builder = _bind_builder(module, {3: 0, 5: 1}, rows_before=2, cls=mla_builder_cls)
 
     cache_tensor = builder.build_kv_cache_tensor(module)
 
     assert module.kv_cache == (("kv", 2), (-1, 1, 576))
-    assert module.indexer.k_cache.kv_cache[0][0] == ("index", 1)
+    assert module.max_model_len == 1024
+    assert module.indexer.k_cache.kv_cache[0] == (("index", 1), (-1, 1, 144))
     assert cache_tensor.layer_num == module.layer_num
+    assert cache_tensor.k_cache is module.kv_cache
     assert cache_tensor.index_cache.identity == ("index", 1)
     # FP8 has one index plane; the second stays unset rather than aliasing it.
     assert cache_tensor.index_scale is None
 
 
-def test_build_kv_cache_tensor_publishes_both_fp4_index_planes():
+def test_build_kv_cache_tensor_publishes_both_fp4_index_planes(mla_builder_cls):
     """Under FP4 the index region is two planes, and both have to leave here.
 
     The e8m0 plane is bound onto the indexer either way -- what this pins is
@@ -542,7 +558,7 @@ def test_build_kv_cache_tensor_publishes_both_fp4_index_planes():
             _indexer_fp4=True,
         ),
     )
-    builder = _bind_builder(module, {3: 0, 5: 1}, rows_before=2)
+    builder = _bind_builder(module, {3: 0, 5: 1}, rows_before=2, cls=mla_builder_cls)
     builder._indexer_fp4 = True
 
     cache_tensor = builder.build_kv_cache_tensor(module)
@@ -551,56 +567,58 @@ def test_build_kv_cache_tensor_publishes_both_fp4_index_planes():
     assert module.indexer.k_cache.kv_cache_scale.identity == ("index_scale", 1)
     assert cache_tensor.index_cache.identity == ("index", 1)
     assert cache_tensor.index_scale.identity == ("index_scale", 1)
+    assert cache_tensor.index_cache is module.indexer.k_cache.kv_cache[0]
+    assert cache_tensor.index_scale is module.indexer.k_cache.kv_cache_scale
 
 
-def test_build_shared_layer_keeps_main_kv_without_index_slice():
-    module = _MlaLayer(
-        layer_num=1,
-        indexer=None,
-    )
-    builder = _bind_builder(module, {0: 0}, rows_before=1)
+@pytest.mark.parametrize("indexer_attrs", ({}, {"indexer": None}))
+def test_build_shared_layer_keeps_main_kv_without_index_slice(
+    mla_builder_cls, indexer_attrs
+):
+    """Shared layers and dense draft layers own no index planes."""
+    module = _MlaLayer(layer_num=1, **indexer_attrs)
+    builder = _bind_builder(module, {0: 0}, rows_before=1, cls=mla_builder_cls)
 
     cache_tensor = builder.build_kv_cache_tensor(module)
 
     assert module.kv_cache == (("kv", 1), (-1, 1, 576))
     assert cache_tensor.index_cache is None
-
-
-def _kimi_builder_cls():
-    from atom.model_ops.attentions.kimi_mla_gdn_attn import (
-        KimiAiterMLAGDNMetadataBuilder,
-    )
-
-    return KimiAiterMLAGDNMetadataBuilder
-
-
-def test_kimi_k3_publishes_its_index_slice_on_the_kv_cache_tensor():
-    """Offload codecs read the index slice only from the `KVCacheTensor`."""
-    module = _MlaLayer(
-        layer_num=5,
-        indexer=SimpleNamespace(k_cache=SimpleNamespace(kv_cache=[None])),
-    )
-    builder = _bind_builder(
-        module, {3: 0, 5: 1}, rows_before=2, cls=_kimi_builder_cls()
-    )
-
-    cache_tensor = builder.build_kv_cache_tensor(module)
-
-    assert module.kv_cache == (("kv", 2), (-1, 1, 576))
-    assert module.indexer.k_cache.kv_cache[0][0] == ("index", 1)
-    assert cache_tensor.index_cache.identity == ("index", 1)
     assert cache_tensor.index_scale is None
 
 
-def test_kimi_k3_layer_without_an_indexer_publishes_no_index_slice():
-    """E.g. the K3.1 DSpark draft's dense MLA layers."""
-    module = _MlaLayer(layer_num=1, indexer=None)
-    builder = _bind_builder(module, {0: 0}, rows_before=1, cls=_kimi_builder_cls())
+def test_build_indexer_missing_from_compact_map_fails(mla_builder_cls):
+    module = _MlaLayer(
+        layer_num=5,
+        indexer=SimpleNamespace(
+            k_cache=SimpleNamespace(kv_cache=[None]), _indexer_fp4=False
+        ),
+    )
+    builder = _bind_builder(module, {3: 0}, rows_before=2, cls=mla_builder_cls)
+
+    with pytest.raises(RuntimeError, match="layer_num=5"):
+        builder.build_kv_cache_tensor(module)
+
+
+@pytest.mark.parametrize(
+    "mla_builder_cls", ("kimi_aiter", "kimi_triton"), indirect=True
+)
+def test_kimi_binds_kpool_tail_with_compact_index_slice(mla_builder_cls):
+    """GLM-5.3's partial pooled keys keep their hybrid-specific binding."""
+    module = _MlaLayer(
+        layer_num=5,
+        indexer=SimpleNamespace(
+            k_cache=SimpleNamespace(kv_cache=[None]), _indexer_fp4=False
+        ),
+    )
+    builder = _bind_builder(module, {3: 0, 5: 1}, rows_before=2, cls=mla_builder_cls)
+    tail = [object(), object()]
+    builder.model_runner.kpool_tail_cache = tail
 
     cache_tensor = builder.build_kv_cache_tensor(module)
 
-    assert module.kv_cache == (("kv", 1), (-1, 1, 576))
-    assert cache_tensor.index_cache is None
+    assert module.indexer.kpool_tail_cache is tail[1]
+    assert cache_tensor.index_cache.identity == ("index", 1)
+    assert cache_tensor.index_scale is None
 
 
 def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
