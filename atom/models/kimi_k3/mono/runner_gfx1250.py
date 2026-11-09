@@ -14,6 +14,7 @@ import logging
 from dataclasses import dataclass, replace
 
 import torch
+from aiter import QuantType, dtypes
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.models.kimi_k3.mono.config import (
@@ -40,6 +41,19 @@ from atom.mono.runtime.widths import WidthBuilds
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+K1_PTPC_FUSION_MAX_ROWS = 40
+
+
+def _uses_ptpc_o_proj(layer) -> bool:
+    o_proj = layer.self_attn.o_proj
+    return (
+        o_proj.quant_type == QuantType.per_Token and o_proj.params_dtype == dtypes.fp8
+    )
+
+
+def _fuse_ptpc_core(layer, rows: int) -> bool:
+    """Measured crossover against K1 + AITER per-token quant on gfx1250."""
+    return rows <= K1_PTPC_FUSION_MAX_ROWS and _uses_ptpc_o_proj(layer)
 
 
 def _resident_hazards(launcher: object) -> tuple[str, ...]:
@@ -85,10 +99,7 @@ class Gfx1250WidthBuild:
 
     def kernels(self) -> list[tuple[object, KernelAbi]]:
         """All local launchers, for compile-time scratch validation."""
-        pairs = [
-            (k1.entrypoint.launcher, k1.entrypoint.abi)
-            for k1 in self.k1.values()
-        ]
+        pairs = [(k1.entrypoint.launcher, k1.entrypoint.abi) for k1 in self.k1.values()]
 
         unique = {}
         for launcher, abi in pairs:
@@ -135,7 +146,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         ).multi_processor_count
         if self.blocks != GFX1250_BLOCKS:
             raise MonoUnsupported(
-                f"gfx1250 packed mono needs {GFX1250_BLOCKS} CUs, " f"got {self.blocks}"
+                f"gfx1250 packed mono needs {GFX1250_BLOCKS} CUs, got {self.blocks}"
             )
 
     def _allocate(self) -> None:
@@ -177,6 +188,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     onorm_eps=weight.onorm_eps,
                     lower_bound=weight.lower_bound,
                     write_idx=weight.write_idx,
+                    quant_core=_fuse_ptpc_core(self.inner.layers[layer.layer_id], rows),
                 )
                 cache_key = (weight.blocks, spec)
                 local = k1_cache.get(cache_key)
@@ -229,7 +241,11 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             delta = add if add2 is None else (add2 if add is None else add + add2)
             core = self._k1(build, plan, prefix, delta, blocks, metadata)
             layer = self.inner.layers[plan.layer_id]
-            attn_out = layer.self_attn.o_proj(core)
+            if isinstance(core, tuple):
+                core, core_scale = core
+                attn_out = layer.self_attn.o_proj(core, x_scale=core_scale)
+            else:
+                attn_out = layer.self_attn.o_proj(core)
 
             # K1 already banked a closing block. The production MLP seam must
             # therefore restart its prefix exactly as DecoderLayer.forward does.
@@ -262,6 +278,16 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         recurrent = self._recurrent_state(plan.layer_id)
         slots, accepted = state_slots(metadata, self.ones)
         core = prefix.new_empty(prefix.size(0), self.dims.proj)
+        core_q = core_scale = None
+        if local.spec.quant_core:
+            o_proj = self.inner.layers[plan.layer_id].self_attn.o_proj
+            quant_bytes = torch.empty(
+                core.numel() + core.size(0) * 4,
+                dtype=torch.uint8,
+                device=core.device,
+            )
+            core_q = quant_bytes[: core.numel()].view(o_proj.params_dtype).view_as(core)
+            core_scale = quant_bytes[core.numel() :].view(torch.float32).view(-1, 1)
         runtime = K1LocalRuntime(
             prefix=prefix,
             delta=delta,
@@ -287,5 +313,8 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             st_stride=slots.stride(0),
             num_acc=accepted,
             core_out=core,
+            core_q=core_q,
+            core_scale=core_scale,
         )
-        return local(runtime, stream=torch.cuda.current_stream())
+        local(runtime, stream=torch.cuda.current_stream())
+        return (core_q, core_scale) if local.spec.quant_core else core

@@ -78,6 +78,8 @@ def _runtime():
         st_stride=1,
         num_acc=i32(1),
         core_out=bf16(1),
+        core_q=None,
+        core_scale=None,
     )
 
 
@@ -161,3 +163,33 @@ def test_block_write_requires_the_new_residual_row():
 
     with pytest.raises(ValueError, match="at least 2 residual rows"):
         Gfx1250K1LocalRunner(plan, spec, result)(_runtime())
+
+
+def test_quantized_core_outputs_are_typed_and_packed_into_the_abi():
+    plan = _plan()
+    spec = replace(_spec(), quant_core=True)
+    declaration = builder.declare_local(plan, qlen=1)
+    observed = []
+    kernel = SimpleNamespace(
+        complete=True,
+        launcher=lambda *args, **_kwargs: observed.append(args),
+        launch_count=1,
+    )
+    result = SimpleNamespace(
+        runnable=True,
+        kernel=kernel,
+        declaration=declaration,
+        launch_count=1,
+    )
+    quant_bytes = torch.empty(12 * 128 + 4, dtype=torch.uint8)
+    runtime = replace(
+        _runtime(),
+        core_q=quant_bytes[: 12 * 128].view(1, 12 * 128),
+        core_scale=quant_bytes[12 * 128 :].view(torch.float32).view(1, 1),
+    )
+
+    Gfx1250K1LocalRunner(plan, spec, result)(runtime)
+
+    assert (
+        observed[0][builder.K1_ABI_NAMES.index("core_q")] == runtime.core_q.data_ptr()
+    )

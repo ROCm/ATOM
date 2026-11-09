@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter import QuantType, dtypes
 from aiter.jit.utils import chip_info
 
 import atom.models.kimi_k3.mono.runner_gfx1250 as runner_module
@@ -114,6 +115,24 @@ def test_gfx1250_keeps_k2_on_the_production_path():
     assert "layer.self_attn.o_proj(core)" in source
     assert "layer._ffn(normed)" in source
     assert "def _k2(" not in source
+
+
+def test_only_ptpc_o_proj_enables_fused_k1_quant():
+    def layer(quant_type, params_dtype):
+        return SimpleNamespace(
+            self_attn=SimpleNamespace(
+                o_proj=SimpleNamespace(
+                    quant_type=quant_type,
+                    params_dtype=params_dtype,
+                )
+            )
+        )
+
+    ptpc = layer(QuantType.per_Token, dtypes.fp8)
+    assert runner_module._uses_ptpc_o_proj(ptpc)
+    assert runner_module._fuse_ptpc_core(ptpc, 40)
+    assert not runner_module._fuse_ptpc_core(ptpc, 48)
+    assert not runner_module._uses_ptpc_o_proj(layer(QuantType.No, torch.bfloat16))
 
 
 @pytest.mark.parametrize("write_idx", (-1, 1))

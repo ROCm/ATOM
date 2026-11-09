@@ -234,9 +234,7 @@ class K1Protocol:
     def head_tasks(self, block: int) -> tuple[int, ...]:
         if not self.uses_head_tasks:
             return ()
-        return tuple(
-            range(self.first_task(block), self.head_task_count, self.blocks)
-        )
+        return tuple(range(self.first_task(block), self.head_task_count, self.blocks))
 
     def projection_tasks(self, block: int) -> tuple[int, ...]:
         if block < ATTENTION_CTAS:
@@ -295,6 +293,17 @@ class K1Protocol:
     @staticmethod
     def _onrm(request: int, head: int, chunk: int) -> str:
         return f"onrm:{request}:{head}:{chunk}"
+
+    @staticmethod
+    def _core_ready(request: int, head: int, chunk: int) -> str:
+        return f"core-ready:{request}:{head}:{chunk}"
+
+    def request_core_ready(self, request: int) -> frozenset[str]:
+        return frozenset(
+            self._core_ready(request, head, chunk)
+            for head in range(HEADS)
+            for chunk in range(STATE_CHUNKS)
+        )
 
     @property
     def all_parts(self) -> frozenset[str]:
@@ -401,10 +410,16 @@ class K1Protocol:
                 )
             if self.uses_head_tasks:
                 for task in assignment.head_tasks:
+                    request = task // HEADS
+                    head = task % HEADS
                     actions.append(
                         ProtocolAction(
                             f"head:{task}",
                             waits=self.all_projection,
+                            publishes=frozenset(
+                                self._core_ready(request, head, chunk)
+                                for chunk in range(STATE_CHUNKS)
+                            ),
                         )
                     )
             else:
@@ -414,9 +429,7 @@ class K1Protocol:
                         ProtocolAction(
                             f"conv:{task}",
                             waits=self.all_projection,
-                            publishes=frozenset(
-                                {self._qk(request, head, chunk)}
-                            ),
+                            publishes=frozenset({self._qk(request, head, chunk)}),
                         )
                     )
                     actions.append(
@@ -432,9 +445,7 @@ class K1Protocol:
                     actions.append(
                         ProtocolAction(
                             f"recur:{task}",
-                            publishes=frozenset(
-                                {self._onrm(request, head, chunk)}
-                            ),
+                            publishes=frozenset({self._onrm(request, head, chunk)}),
                         )
                     )
                     actions.append(
@@ -445,8 +456,20 @@ class K1Protocol:
                                 self._onrm(request, head, other)
                                 for other in range(STATE_CHUNKS)
                             ),
+                            publishes=frozenset(
+                                {self._core_ready(request, head, chunk)}
+                            ),
                         )
                     )
+            quant_token = assignment.block - ATTENTION_CTAS
+            if 0 <= quant_token < self.tokens:
+                request = quant_token // self.qlen
+                actions.append(
+                    ProtocolAction(
+                        f"core-quant:{quant_token}",
+                        waits=self.request_core_ready(request),
+                    )
+                )
             queues.append(tuple(actions))
         return tuple(queues)
 

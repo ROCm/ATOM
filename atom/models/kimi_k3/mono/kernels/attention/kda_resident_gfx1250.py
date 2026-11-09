@@ -9,6 +9,7 @@ import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import GFX1250_BLOCKS
@@ -33,7 +34,16 @@ from atom.models.kimi_k3.mono.kernels.attention.protocol import (
 )
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
 from atom.models.kimi_k3.mono.sources import SOURCES
-from atom.mono.device.ops import CM_DEV, ld_i32, rsrc, traced, uniform
+from atom.mono.device.ops import (
+    CM_DEV,
+    fp8_pack4,
+    hw_rcp,
+    ld_i32,
+    rsrc,
+    traced,
+    uniform,
+    wave_max,
+)
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.runtime.abi import KernelAbi
@@ -43,6 +53,8 @@ ROWS = 16
 PROJECTION_ROWS_PER_CTA = 2
 SEAM_COLUMNS = 128
 VALUE_CHUNK = 16
+PROJ = HEADS * HEAD_DIM
+PTPC_FP8_MAX = 448.0
 _STREAM = fx.Stream(None)
 _BUILDS: dict[tuple[object, ...], object] = {}
 LOCAL_ABI = KernelAbi(K1_ABI_NAMES)
@@ -63,6 +75,7 @@ class ResidentBuildKey:
     onorm_eps: float
     lower_bound: float
     write_idx: int
+    quant_core: bool
     debug: bool
     kda0: int
     gemv_unit: int
@@ -180,6 +193,7 @@ def build_resident_k1(
             spec.onorm_eps,
             spec.lower_bound,
             spec.write_idx,
+            spec.quant_core,
             spec.debug,
             spec.kda0,
             spec.gemv_unit,
@@ -188,7 +202,7 @@ def build_resident_k1(
     )
     name = (
         f"k3_k1_gfx1250_resident_s{s}_l{qlen}_nb{declaration.nblocks}"
-        f"_u{spec.gemv_unit}"
+        f"_u{spec.gemv_unit}_q{int(spec.quant_core)}"
     )
 
     @traced
@@ -301,6 +315,62 @@ def build_resident_k1(
         compute["kda_state_loads"](context, metadata, head, chunk)
         return metadata
 
+    @traced
+    def quantize_core(token, tid, lane, wave, red, core_out, core_q):
+        values = []
+        maximum = fx.Float32(0.0)
+        for iteration in range_constexpr(
+            (PROJ + declaration.threads * 4 - 1) // (declaration.threads * 4)
+        ):
+            element = (iteration * declaration.threads + tid) * 4
+            live = element < PROJ
+            loaded = base.ld_bf4(
+                core_out,
+                token * PROJ + fx.min(element, PROJ - 4),
+            )
+            loaded = [live.select(value, fx.Float32(0.0)) for value in loaded]
+            values.extend(loaded)
+            for value in loaded:
+                maximum = fx.max(maximum, fmath.absf(value))
+
+        maximum = wave_max(maximum, GFX1250)
+        gpu.barrier()
+        if lane == 0:
+            fx.ptr_store(maximum, red + wave)
+        gpu.barrier()
+        maximum = fx.ptr_load(red)
+        for other_wave in range_constexpr(1, declaration.waves):
+            maximum = fx.max(maximum, fx.ptr_load(red + other_wave))
+        scale = maximum * fx.Float32(1.0 / PTPC_FP8_MAX)
+        if tid == 0:
+            bo.buffer_store(
+                scale,
+                rsrc(core_q + fx.Int64(s * PROJ)),
+                token,
+            )
+        inverse = hw_rcp(scale)
+
+        for iteration in range_constexpr(len(values) // 4):
+            element = (iteration * declaration.threads + tid) * 4
+            if element < PROJ:
+                quantized = [
+                    fx.max(
+                        fx.min(
+                            values[iteration * 4 + offset] * inverse,
+                            fx.Float32(PTPC_FP8_MAX),
+                        ),
+                        fx.Float32(-PTPC_FP8_MAX),
+                    )
+                    for offset in range(4)
+                ]
+                bo.buffer_store(
+                    fp8_pack4(*quantized),
+                    rsrc(core_q),
+                    (token * PROJ + element) // 4,
+                    cache_modifier=CM_DEV,
+                )
+        device["wait_vector_stores"]()
+
     @flyc.kernel(name=name, known_block_size=[declaration.threads, 1, 1])
     def resident(
         prefix: Int64,
@@ -327,6 +397,7 @@ def build_resident_k1(
         st_stride: Int32,
         num_acc: Int64,
         core_out: Int64,
+        core_q: Int64,
         scratch: Int64,
     ):
         _ = keyed
@@ -352,6 +423,11 @@ def build_resident_k1(
         x_ready = scratch + fx.Int64(layout["xrdy"][0])
         x = scratch + fx.Int64(layout["x"][0])
         projected = scratch + fx.Int64(layout["proj"][0])
+        # The seam's PART handoff is dead once every projection is visible.
+        # Reuse its much larger tagged-pair region for post-KDA core readiness
+        # instead of keeping another base pointer live through the resident
+        # kernel.
+        core_ready = part
 
         if bid < ATTENTION_CTAS:
             for tile in range_constexpr(len(tile_starts)):
@@ -665,11 +741,25 @@ def build_resident_k1(
         if const_expr(qlen == 1):
             head_tasks = (s // qlen) * HEADS
             for task in range(first, head_tasks, declaration.blocks):
+                request = task // HEADS
+                head = task % HEADS
                 compute["kda_head"](
                     recurrence_context,
-                    task // HEADS,
-                    task % HEADS,
+                    request,
+                    head,
                 )
+                if const_expr(spec.quant_core):
+                    device["wait_vector_stores"]()
+                    gpu.barrier()
+                    if tid == 0:
+                        for chunk in range_constexpr(STATE_CHUNKS):
+                            gfx_backend.mailbox_store_device(
+                                core_ready,
+                                (request * HEADS + head) * STATE_CHUNKS + chunk,
+                                fx.Int32(1),
+                                generation + fx.Int32(1),
+                            )
+                    gpu.barrier()
         else:
             for task in range(first, task_count, declaration.blocks):
                 request = task // (HEADS * STATE_CHUNKS)
@@ -720,7 +810,40 @@ def build_resident_k1(
                     head,
                     chunk,
                 )
+                if const_expr(spec.quant_core):
+                    device["wait_vector_stores"]()
+                    gpu.barrier()
+                    if tid == 0:
+                        gfx_backend.mailbox_store_device(
+                            core_ready,
+                            (request * HEADS + head) * STATE_CHUNKS + chunk,
+                            fx.Int32(1),
+                            generation + fx.Int32(1),
+                        )
+                    gpu.barrier()
         device["wait_vector_stores"]()
+
+        if const_expr(spec.quant_core):  # noqa: SIM102
+            if (bid >= ATTENTION_CTAS) & (bid < ATTENTION_CTAS + s):
+                token = bid - ATTENTION_CTAS
+                request = token // qlen
+                if tid < HEADS * STATE_CHUNKS:
+                    gfx_backend.mailbox_poll_device(
+                        core_ready,
+                        request * HEADS * STATE_CHUNKS + tid,
+                        generation + fx.Int32(1),
+                    )
+                gpu.barrier()
+                device["device_fence_acquire"]()
+                quantize_core(
+                    token,
+                    tid,
+                    lane,
+                    wave,
+                    smem.red.ptr,
+                    core_out,
+                    core_q,
+                )
 
     @flyc.jit
     def launch(
@@ -748,6 +871,7 @@ def build_resident_k1(
         st_stride: Int32,
         num_acc: Int64,
         core_out: Int64,
+        core_q: Int64,
         scratch: Int64,
         stream: fx.Stream = _STREAM,
     ):
@@ -778,6 +902,7 @@ def build_resident_k1(
                 st_stride,
                 num_acc,
                 core_out,
+                core_q,
                 scratch,
             )
             call.launch(

@@ -68,6 +68,7 @@ K1_ABI_NAMES = (
     "st_stride",
     "num_acc",
     "core_out",
+    "core_q",
     "scratch",
 )
 
@@ -340,6 +341,7 @@ class K1LocalBuildSpec:
     onorm_eps: float
     lower_bound: float
     write_idx: int
+    quant_core: bool = False
     debug: bool = False
     timeline: bool = False
     kda0: int = 0
@@ -351,6 +353,8 @@ class K1LocalBuildSpec:
             raise ValueError("local K1 qlen must be in [1, 16] and divide tokens")
         if type(self.delta) is not bool:
             raise TypeError("local K1 delta must be bool")
+        if type(self.quant_core) is not bool:
+            raise TypeError("local K1 quant_core must be bool")
         if self.debug:
             raise ValueError("resident gfx1250 K1 does not expose debug taps")
         # ATOM's conv pool keeps ``kernel - 1 + num_spec`` entries.  The
@@ -543,8 +547,7 @@ def declare(
     GFX1250_MAILBOX.require(*K1_REQUIRED_CAPABILITIES)
     assert plan.nblocks is not None
     name = (
-        f"k3_mono_kda_pre_gfx1250_s{plan.tokens}_l{qlen}"
-        f"_nb{plan.nblocks}_u{gemv_unit}"
+        f"k3_mono_kda_pre_gfx1250_s{plan.tokens}_l{qlen}_nb{plan.nblocks}_u{gemv_unit}"
     )
     return K1KernelDeclaration(
         name=name,
@@ -625,7 +628,7 @@ def build_local(
     dependency_refusal = ()
     try:
         kernels = import_module(
-            "atom.models.kimi_k3.mono.kernels.attention." "kda_resident_gfx1250"
+            "atom.models.kimi_k3.mono.kernels.attention.kda_resident_gfx1250"
         )
     except ModuleNotFoundError as error:
         if (error.name or "").split(".", 1)[0] not in {"aiter", "flydsl"}:

@@ -43,11 +43,7 @@ def test_every_cta_role_and_task_has_unique_complete_ownership(kda0):
     ]
     assert slices == list(range(ATTENTION_CTAS))
 
-    gates = [
-        token
-        for assignment in assignments
-        for token in assignment.gate_tokens
-    ]
+    gates = [token for assignment in assignments for token in assignment.gate_tokens]
     assert sorted(gates) == list(range(protocol.tokens))
 
     projection = [
@@ -80,15 +76,11 @@ def test_each_head_chunk_group_runs_on_distinct_ctas():
 def test_plain_decode_uses_one_local_task_per_request_head():
     protocol = _protocol(tokens=16, qlen=1)
     tasks = [
-        task
-        for assignment in protocol.assignments
-        for task in assignment.head_tasks
+        task for assignment in protocol.assignments for task in assignment.head_tasks
     ]
     assert protocol.uses_head_tasks
     assert sorted(tasks) == list(range(protocol.head_task_count))
-    assert not any(
-        assignment.kda_tasks for assignment in protocol.assignments
-    )
+    assert not any(assignment.kda_tasks for assignment in protocol.assignments)
 
 
 @pytest.mark.parametrize(
@@ -117,6 +109,8 @@ def test_all_resident_state_machine_reaches_completion(tokens, qlen):
     assert protocol.all_msq <= proof.published
     assert protocol.all_xrdy <= proof.published
     assert protocol.all_projection <= proof.published
+    for request in range(protocol.requests):
+        assert protocol.request_core_ready(request) <= proof.published
     assert proof.assumption is assumption
     assert not proof.assumption.hardware_validated
 

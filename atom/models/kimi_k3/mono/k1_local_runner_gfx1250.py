@@ -9,6 +9,8 @@ from dataclasses import dataclass, fields
 import torch
 
 from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
+    HEAD_DIM,
+    HEADS,
     HIDDEN,
     K1_ABI_NAMES,
     K1BuildResult,
@@ -48,9 +50,13 @@ class K1LocalRuntime:
     st_stride: int
     num_acc: torch.Tensor
     core_out: torch.Tensor
+    core_q: torch.Tensor | None
+    core_scale: torch.Tensor | None
 
     def __post_init__(self) -> None:
-        names = tuple(field.name for field in fields(self))
+        names = tuple(
+            field.name for field in fields(self) if field.name != "core_scale"
+        )
         expected = tuple(name for name in K1_ABI_NAMES if name != "scratch")
         if names != expected:
             raise TypeError("K1LocalRuntime fields drifted from the K1 ABI")
@@ -135,6 +141,31 @@ class Gfx1250K1LocalRunner:
         ):
             if getattr(runtime, name).dtype != torch.bfloat16:
                 raise ValueError(f"local K1 {name} must be bfloat16")
+        if self.spec.quant_core:
+            if runtime.core_q is None or tuple(runtime.core_q.shape) != (
+                rows,
+                HEADS * HEAD_DIM,
+            ):
+                raise ValueError(
+                    f"local K1 core_q must have shape {(rows, HEADS * HEAD_DIM)}"
+                )
+            if runtime.core_q.element_size() != 1:
+                raise ValueError("local K1 core_q must use an 8-bit FP8 container")
+            if (
+                runtime.core_scale is None
+                or tuple(runtime.core_scale.shape) != (rows, 1)
+                or runtime.core_scale.dtype != torch.float32
+            ):
+                raise ValueError(f"local K1 core_scale must be float32 {(rows, 1)}")
+            if (
+                runtime.core_scale.data_ptr()
+                != runtime.core_q.data_ptr() + rows * HEADS * HEAD_DIM
+            ):
+                raise ValueError(
+                    "local K1 core_scale must immediately follow packed core_q"
+                )
+        elif runtime.core_q is not None or runtime.core_scale is not None:
+            raise ValueError("unquantized local K1 must not receive quant outputs")
         for name in ("conv_w", "a_log", "dt_bias", "on_w", "rstate"):
             if getattr(runtime, name).dtype != torch.float32:
                 raise ValueError(f"local K1 {name} must be float32")
@@ -180,7 +211,9 @@ class Gfx1250K1LocalRunner:
                 continue
             value = getattr(runtime, name)
             values[name] = (
-                value.data_ptr() if isinstance(value, torch.Tensor) else value
+                value.data_ptr()
+                if isinstance(value, torch.Tensor)
+                else (0 if value is None else value)
             )
         return values
 
