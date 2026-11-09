@@ -4070,6 +4070,18 @@ models:
       - <<: *issue382_a9_1p2d_c260_pernic4352_tuned_mem90
         name: issue382-a9-1p2d-c260-pernic4352-tuned-mem90-icp-cs
         env: *issue382_a9_pernic4352_tuned_icp_cs_env
+      # A deeper prefill pipeline: at C240 P runs ~7.4 batches/s with every
+      # stage's GPU ~75 ms per batch, because each stage waits for its last
+      # send before the next forward and the head stops at 4 batches in flight.
+      - <<: *issue382_a9_1p2d_c240_pernic4352_tuned_mem90
+        name: issue382-a9-1p2d-c240-pernic4352-tuned-mem90-icp-cs-ppdeep
+        env:
+          <<: *issue382_a9_pernic4352_tuned_icp_env
+          prefill:
+            <<: *issue382_a9_pernic4352_tuned_env_prefill
+            OFFLOAD_STAGING_ON_COMPUTE_STREAM: '1'
+            ATOM_PP_MAX_IN_FLIGHT: '8'
+            ATOM_PP_SEND_DEPTH: '2'
       - <<: *issue382_a9_1p3d_c264
         name: issue382-a9-1p3d-c330
         concurrency:
