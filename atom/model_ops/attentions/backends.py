@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 
 if TYPE_CHECKING:
+    from atom.distributed.pcp_utils import PcpBalGroup
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
 import numpy as np
@@ -16,7 +17,6 @@ from torch import nn
 
 from atom.config import DCPConfig
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
-from atom.distributed.pcp_utils import PcpBalGroup
 from atom.distributed.ulysses_sp import attn_head_shard_size
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
@@ -129,7 +129,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         running_bs: int,
         running_tokens: int,
         ubatch_slices: tuple[UBatchSlice, ...] | None = None,
-        pcp_groups: tuple[PcpBalGroup, ...] | None = None,
+        pcp_groups: "tuple[PcpBalGroup, ...] | None" = None,
     ):
         raise NotImplementedError
 
@@ -143,7 +143,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         *,
         is_prefill: bool,
         ubatch_slices: tuple[UBatchSlice, ...] | None = None,
-        pcp_groups: tuple[PcpBalGroup, ...] | None = None,
+        pcp_groups: "tuple[PcpBalGroup, ...] | None" = None,
     ):
         raise NotImplementedError
 
@@ -1277,7 +1277,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         running_bs: int,
         running_tokens: int,
         ubatch_slices: tuple[UBatchSlice, ...] | None = None,
-        pcp_groups: tuple[PcpBalGroup, ...] | None = None,
+        pcp_groups: "tuple[PcpBalGroup, ...] | None" = None,
     ):
         """`stage_prefill` (and a split prefill's `stage_ubatch_prefill`), the
         phase's uploads, then `finish_prefill` (and `finish_ubatch_prefill`),
@@ -1308,7 +1308,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         batch: ScheduledBatch,
         attn_metadata: AttentionMetaData,
         ubatches: list[tuple[UBatchSlice, PrefillBatch]],
-        pcp_groups: tuple[PcpBalGroup, ...] | None,
+        pcp_groups: "tuple[PcpBalGroup, ...] | None",
     ) -> list:
         """Stage each micro-batch of ``ubatches`` (`_prefill_ubatches`) as a
         prefill of its own, into its ``ub{i}_`` buffers, counted into its
@@ -1355,7 +1355,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         self,
         batch: ScheduledBatch,
         ubatch_slices: tuple[UBatchSlice, ...],
-        pcp_groups: tuple[PcpBalGroup, ...] | None,
+        pcp_groups: "tuple[PcpBalGroup, ...] | None",
     ) -> list[tuple[UBatchSlice, PrefillBatch]]:
         """Each micro-batch of a split prefill, in the step's token axis, and
         its batch (`PrefillBatch.cut`): a slice of ``ubatch_slices``, or under
@@ -1392,7 +1392,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         batch: ScheduledBatch,
         attn_metadata: AttentionMetaData,
         ubatches: list[tuple[UBatchSlice, PrefillBatch]],
-        pcp_groups: tuple[PcpBalGroup, ...] | None,
+        pcp_groups: "tuple[PcpBalGroup, ...] | None",
     ) -> None:
         """Each micro-batch's GPU work over its uploaded ``ub{i}_`` metadata
         (`_finish_prefill_batch`)."""
@@ -1594,7 +1594,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         *,
         is_prefill: bool,
         ubatch_slices: tuple[UBatchSlice, ...] | None = None,
-        pcp_groups: tuple[PcpBalGroup, ...] | None = None,
+        pcp_groups: "tuple[PcpBalGroup, ...] | None" = None,
     ):
         """Build this step's metadata at the shape `prepare_inputs` settled.
 
