@@ -2164,6 +2164,11 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: SpeculativeConfig | None = None
     kv_transfer_config: dict = field(default_factory=dict)
+    # A frontend's own stable form of its speculative config, which the offload
+    # PAGE namespace hashes in place of `speculative_config`: only the frontend
+    # knows which of its fields differ between processes. None hashes
+    # `speculative_config` itself, as native ATOM does.
+    offload_speculative_config: Any = None
     kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
     # DSpark runtime knobs. Built once in the parent from --dspark-config (see
     # EngineArgs) and pickled into every worker. Read sites use `config.dspark.*`
