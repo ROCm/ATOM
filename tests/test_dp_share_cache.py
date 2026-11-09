@@ -206,3 +206,46 @@ def test_the_newcomer_carries_the_entry_if_the_owner_leaves_unprefilled():
     probe = router.select(_seq("C", PREFIX + [9] * 2_000), [0, 0], [0, 0])
     assert router.charge("C") > 0
     assert probe.rank == second.rank  # B holds the prefix now
+
+
+def _engine_with(waiting, running=()):
+    from collections import deque
+
+    from atom.model_engine.engine_core import EngineCore
+
+    class Sched:
+        def __init__(self):
+            self.waiting = deque(waiting)
+            self.running = list(running)
+
+        def pending_prefill_tokens(self, seq, *, estimate=False):
+            return seq.tokens
+
+    engine = EngineCore.__new__(EngineCore)
+    engine.scheduler = Sched()
+    engine._ingested_seqs = 0
+    engine._last_backlog_report = None
+    sent = []
+    engine.output_queue = SimpleNamespace(put_nowait=sent.append)
+    return engine, sent
+
+
+def test_the_backlog_report_skips_aborted_requests_and_bounds_its_scan(monkeypatch):
+    from atom.model_engine.sequence import SequenceStatus
+
+    live = SimpleNamespace(
+        status=SequenceStatus.WAITING, tokens=100, num_completion_tokens=0
+    )
+    dead = SimpleNamespace(
+        status=SequenceStatus.ABORTED, tokens=10_000, num_completion_tokens=0
+    )
+    engine, sent = _engine_with([live, dead, live])
+    engine._report_prefill_backlog()
+    assert sent[-1] == ("PREFILL_BACKLOG", (0, 200))  # the aborted one is no work
+
+    from atom.model_engine.engine_core import EngineCore
+
+    monkeypatch.setattr(EngineCore, "_BACKLOG_SCAN", 10)
+    engine, sent = _engine_with([live] * 100)
+    engine._report_prefill_backlog()
+    assert sent[-1] == ("PREFILL_BACKLOG", (0, 10_000))  # 
