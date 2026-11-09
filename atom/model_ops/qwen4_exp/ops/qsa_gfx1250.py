@@ -19,6 +19,11 @@ Same contract and split-K partial format as `_qsa_sparse_paged_gqa_kernel` in
   direct-copy conditions (first tile dimension >= 256 B, 128 B aligned global
   rows, padding interval a multiple of 128 B) while the padding spreads the
   transposed K reads over LDS banks.
+* FP8 (E4M3) K/V are gathered the same way as 256-byte rows, still at the
+  direct-copy minimum, and converted to BF16 after the LDS read. Each (slot,
+  KV head) row has one FP32 scale: the key's multiplies its score column and
+  the value's its probability column before PV, while the running sum stays
+  over unscaled probabilities, as in the portable kernel's `KV_FP8` path.
 """
 
 import triton
@@ -36,6 +41,7 @@ def _qsa_tile_rows(
     request_valid,
     kv_head,
     num_cache_pages,
+    stride_scale_page,
     PAGE_SIZE: gl.constexpr,
     PAGE_TABLE_WIDTH: gl.constexpr,
     ROWS_PER_PAGE: gl.constexpr,
@@ -46,6 +52,7 @@ def _qsa_tile_rows(
     Invalid columns map to row 0 so every gathered row stays in bounds; TDM
     gather only handles out-of-bounds rows correctly for non-decreasing ids,
     which a top-k selection does not provide. The returned mask hides them.
+    The third result indexes the FP8 scale plane; BF16 callers ignore it.
     """
     cols = col0 + columns
     logical = gl.load(index_base + cols, mask=cols < col_end, other=-1)
@@ -60,7 +67,22 @@ def _qsa_tile_rows(
     )
     valid = valid & (physical_page >= 0) & (physical_page < num_cache_pages)
     rows = physical_page * ROWS_PER_PAGE + page_offset * NUM_KV_HEADS + kv_head
-    return gl.where(valid, rows, 0), valid
+    scale_offsets = (
+        physical_page * stride_scale_page + page_offset * NUM_KV_HEADS + kv_head
+    )
+    return gl.where(valid, rows, 0), valid, gl.where(valid, scale_offsets, 0)
+
+
+@gluon.jit
+def _qsa_tile_scales(k_scale_ptr, v_scale_ptr, scale_offsets, valid, KV_FP8: gl.constexpr):
+    """Per-column K/V scales of one tile; 1.0 placeholders for BF16 caches."""
+    if KV_FP8:
+        k_scale = gl.load(k_scale_ptr + scale_offsets, mask=valid, other=0.0)
+        v_scale = gl.load(v_scale_ptr + scale_offsets, mask=valid, other=0.0)
+    else:
+        k_scale = gl.full(valid.shape, 1.0, gl.float32, layout=valid.type.layout)
+        v_scale = k_scale
+    return k_scale, v_scale
 
 
 @gluon.jit
@@ -68,6 +90,8 @@ def _qsa_sparse_paged_gqa_gfx1250_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     logical_indices_ptr,
     block_table_ptr,
     token_to_request_ptr,
@@ -81,6 +105,7 @@ def _qsa_sparse_paged_gqa_gfx1250_kernel(
     stride_table_request,
     stride_output_token,
     stride_output_head,
+    stride_scale_page,
     num_cache_rows,
     num_cache_pages,
     num_requests,
@@ -96,6 +121,7 @@ def _qsa_sparse_paged_gqa_gfx1250_kernel(
     BLOCK_K: gl.constexpr,
     KV_SPLITS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
+    KV_FP8: gl.constexpr,
     num_warps: gl.constexpr,
 ):
     WARP_SIZE: gl.constexpr = 32
@@ -126,8 +152,10 @@ def _qsa_sparse_paged_gqa_gfx1250_kernel(
     INDEX: gl.constexpr = gl.BlockedLayout([1], [WARP_SIZE], [num_warps], [0])
     # The TDM descriptor is wave-uniform, so every lane carries the tile's ids.
     GATHER: gl.constexpr = gl.BlockedLayout([BLOCK_K], [WARP_SIZE], [num_warps], [0])
+    # 16 bytes of padding per row whatever the element width.
+    ROW_PAD: gl.constexpr = 16 if KV_FP8 else 8
     KV_SHARED: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[HEAD_DIM, 8]], [BLOCK_K, HEAD_DIM], [1, 0]
+        [[HEAD_DIM, ROW_PAD]], [BLOCK_K, HEAD_DIM], [1, 0]
     )
 
     token = gl.program_id(0)
@@ -194,20 +222,28 @@ def _qsa_sparse_paged_gqa_gfx1250_kernel(
     # Prologue: put tiles 0 .. NUM_STAGES-2 in flight. Tiles past the end of
     # the partition gather row 0 and are never consumed, which keeps the
     # number of outstanding TDM operations per iteration a compile-time value.
-    rows, valid_0 = _qsa_tile_rows(
+    rows, valid_0, scale_offsets = _qsa_tile_rows(
         index_base, table_base, col_begin, col_end, columns, request_valid,
-        kv_head, num_cache_pages, PAGE_SIZE, PAGE_TABLE_WIDTH, ROWS_PER_PAGE,
-        NUM_KV_HEADS,
+        kv_head, num_cache_pages, stride_scale_page, PAGE_SIZE,
+        PAGE_TABLE_WIDTH, ROWS_PER_PAGE, NUM_KV_HEADS,
+    )
+    ks_0, vs_0 = _qsa_tile_scales(
+        k_scale_ptr, v_scale_ptr, scale_offsets, valid_0, KV_FP8
     )
     rows = gl.convert_layout(rows, GATHER)
     gl.amd.gfx1250.tdm.async_gather(k_desc, rows, k_bufs.index(0))
     gl.amd.gfx1250.tdm.async_gather(v_desc, rows, v_bufs.index(0))
     valid_1 = valid_0
+    ks_1 = ks_0
+    vs_1 = vs_0
     if NUM_STAGES == 3:
-        rows, valid_1 = _qsa_tile_rows(
+        rows, valid_1, scale_offsets = _qsa_tile_rows(
             index_base, table_base, col_begin + BLOCK_K, col_end, columns,
-            request_valid, kv_head, num_cache_pages, PAGE_SIZE,
-            PAGE_TABLE_WIDTH, ROWS_PER_PAGE, NUM_KV_HEADS,
+            request_valid, kv_head, num_cache_pages, stride_scale_page,
+            PAGE_SIZE, PAGE_TABLE_WIDTH, ROWS_PER_PAGE, NUM_KV_HEADS,
+        )
+        ks_1, vs_1 = _qsa_tile_scales(
+            k_scale_ptr, v_scale_ptr, scale_offsets, valid_1, KV_FP8
         )
         rows = gl.convert_layout(rows, GATHER)
         gl.amd.gfx1250.tdm.async_gather(k_desc, rows, k_bufs.index(1))
@@ -219,10 +255,14 @@ def _qsa_sparse_paged_gqa_gfx1250_kernel(
 
     for i in range(0, num_tiles):
         ahead = i + NUM_STAGES - 1
-        rows, valid_n = _qsa_tile_rows(
+        rows, valid_n, scale_offsets = _qsa_tile_rows(
             index_base, table_base, col_begin + ahead * BLOCK_K, col_end,
-            columns, request_valid, kv_head, num_cache_pages, PAGE_SIZE,
-            PAGE_TABLE_WIDTH, ROWS_PER_PAGE, NUM_KV_HEADS,
+            columns, request_valid, kv_head, num_cache_pages,
+            stride_scale_page, PAGE_SIZE, PAGE_TABLE_WIDTH, ROWS_PER_PAGE,
+            NUM_KV_HEADS,
+        )
+        ks_n, vs_n = _qsa_tile_scales(
+            k_scale_ptr, v_scale_ptr, scale_offsets, valid_n, KV_FP8
         )
         rows = gl.convert_layout(rows, GATHER)
         stage_n = ahead % NUM_STAGES
@@ -234,9 +274,13 @@ def _qsa_sparse_paged_gqa_gfx1250_kernel(
 
         stage = i % NUM_STAGES
         k_t = k_bufs.index(stage).permute([1, 0]).load(dot_b)
+        if KV_FP8:
+            k_t = k_t.to(q_ptr.dtype.element_ty)
         scores = gl.amd.gfx1250.wmma(
             q_op, k_t, gl.zeros([BLOCK_H, BLOCK_K], gl.float32, layout=WMMA)
         )
+        if KV_FP8:
+            scores = scores * gl.convert_layout(ks_0, COL)[None, :]
         valid = gl.convert_layout(valid_0, COL)[None, :]
         scores = gl.where(valid, scores, -1.0e20)
         m_new = gl.maximum(m_i, gl.max(scores, axis=1))
@@ -244,6 +288,9 @@ def _qsa_sparse_paged_gqa_gfx1250_kernel(
         probabilities = gl.where(valid, gl.exp2(scores - m_new[:, None]), 0.0)
         l_i = l_i * alpha + gl.sum(probabilities, axis=1)
         v_t = v_bufs.index(stage).load(dot_b)
+        if KV_FP8:
+            v_t = v_t.to(q_ptr.dtype.element_ty)
+            probabilities = probabilities * gl.convert_layout(vs_0, COL)[None, :]
         p_op = gl.convert_layout(probabilities.to(q_ptr.dtype.element_ty), dot_a)
         acc = gl.amd.gfx1250.wmma(p_op, v_t, acc * alpha[:, None])
         m_i = m_new
@@ -251,8 +298,14 @@ def _qsa_sparse_paged_gqa_gfx1250_kernel(
         if NUM_STAGES == 3:
             valid_0 = valid_1
             valid_1 = valid_n
+            ks_0 = ks_1
+            ks_1 = ks_n
+            vs_0 = vs_1
+            vs_1 = vs_n
         else:
             valid_0 = valid_n
+            ks_0 = ks_n
+            vs_0 = vs_n
 
     # Drain the look-ahead gathers before the ring is released.
     gl.amd.gfx1250.tdm.async_wait(0)
@@ -293,16 +346,31 @@ def _qsa_sparse_paged_gqa_gfx1250_kernel(
         )
 
 
-def qsa_gfx1250_supports(q, k_cache, v_cache) -> bool:
+def qsa_gfx1250_supports(q, k_cache, v_cache, k_scale=None, v_scale=None) -> bool:
     """Whether the gfx1250 kernel can serve these operands.
 
     The caches must be viewable as one `[rows, head_dim]` row table: unit dim
     stride, heads and page slots packed, page stride a whole number of rows,
-    and K/V sharing that layout.
+    and K/V sharing that layout. FP8 caches also need `[pages, page, heads]`
+    FP32 scales with packed slots and heads, shared by K and V.
     """
     import torch
 
-    if q.dtype != torch.bfloat16 or k_cache.dtype != q.dtype or v_cache.dtype != q.dtype:
+    if q.dtype != torch.bfloat16 or v_cache.dtype != k_cache.dtype:
+        return False
+    if k_cache.dtype == torch.float8_e4m3fn:
+        if k_scale is None or v_scale is None:
+            return False
+        if (
+            k_scale.dtype != torch.float32
+            or v_scale.dtype != torch.float32
+            or k_scale.shape != k_cache.shape[:3]
+            or v_scale.stride() != k_scale.stride()
+            or k_scale.stride(2) != 1
+            or k_scale.stride(1) != k_cache.shape[2]
+        ):
+            return False
+    elif k_cache.dtype != q.dtype or k_scale is not None:
         return False
     tokens, q_heads, head_dim = q.shape
     pages, page_size, kv_heads, _ = k_cache.shape
@@ -355,6 +423,8 @@ def qsa_sparse_paged_gqa_gfx1250(
     block_k: int | None = None,
     num_stages: int | None = None,
     num_warps: int | None = None,
+    k_scale=None,
+    v_scale=None,
 ):
     import torch
 
@@ -362,6 +432,7 @@ def qsa_sparse_paged_gqa_gfx1250(
     pages, page_size, kv_heads, _ = k_cache.shape
     group_size = q_heads // kv_heads
     topk = logical_indices.shape[1]
+    kv_fp8 = k_scale is not None
     cfg = qsa_gfx1250_launch_config(tokens, kv_heads, topk, num_cu)
     block_k = cfg[0] if block_k is None else block_k
     num_stages = cfg[1] if num_stages is None else num_stages
@@ -390,6 +461,8 @@ def qsa_sparse_paged_gqa_gfx1250(
         q,
         k_cache,
         v_cache,
+        k_scale if kv_fp8 else k_cache,
+        v_scale if kv_fp8 else v_cache,
         logical_indices,
         block_table,
         token_to_request,
@@ -403,6 +476,7 @@ def qsa_sparse_paged_gqa_gfx1250(
         block_table.stride(0),
         target.stride(0),
         target.stride(1),
+        k_scale.stride(0) if kv_fp8 else 0,
         num_cache_rows,
         pages,
         block_table.shape[0],
@@ -418,6 +492,7 @@ def qsa_sparse_paged_gqa_gfx1250(
         BLOCK_K=block_k,
         KV_SPLITS=kv_splits,
         NUM_STAGES=num_stages,
+        KV_FP8=kv_fp8,
         num_warps=num_warps,
     )
     if kv_splits > 1:

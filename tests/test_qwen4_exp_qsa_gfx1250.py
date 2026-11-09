@@ -77,6 +77,51 @@ def test_gfx1250_qsa_matches_portable_kernel(
     assert not fast[min(1, tokens - 1)].any()
 
 
+def _fp8_rows(cache):
+    from atom.model_ops.qwen4_exp.ops.qsa import FP8_DTYPE, FP8_MAX
+
+    scale = cache.float().abs().amax(-1).clamp_min(1e-12) / FP8_MAX
+    rows = (cache.float() / scale[..., None]).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
+    return rows, scale.contiguous()
+
+
+@pytest.mark.parametrize(
+    "tokens,requests,context,topk,invalid_frac",
+    [
+        (64, 16, 8192, 2051, 0.02),
+        (8, 2, 100, 103, 0.1),
+        (2100, 1, 4096, 2051, 0.0),
+    ],
+)
+def test_gfx1250_qsa_fp8_matches_portable_kernel(
+    monkeypatch, tokens, requests, context, topk, invalid_frac
+):
+    q, k, v, idx, table, token_to_req = _case(
+        tokens, requests, context, topk, invalid_frac, seed=tokens + topk + 1
+    )
+    token_to_req[min(1, tokens - 1)] = -1
+    k8, k_scale = _fp8_rows(k)
+    v8, v_scale = _fp8_rows(v)
+    scale = 256**-0.5
+    kwargs = dict(softmax_scale=scale, k_scale=k_scale, v_scale=v_scale)
+
+    monkeypatch.setenv("ATOM_QSA_GFX1250", "0")
+    portable = qsa_sparse_paged_gqa(q, k8, v8, idx, table, token_to_req, **kwargs)
+    monkeypatch.setenv("ATOM_QSA_GFX1250", "1")
+    fast = qsa_sparse_paged_gqa(q, k8, v8, idx, table, token_to_req, **kwargs)
+
+    from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import qsa_sparse_paged_gqa_gfx1250
+
+    direct = qsa_sparse_paged_gqa_gfx1250(
+        q, k8, v8, idx, table, token_to_req, scale,
+        _table_width_bucket(table.shape[1]), get_cu_num(),
+        k_scale=k_scale, v_scale=v_scale,
+    )
+    torch.testing.assert_close(fast, direct, rtol=0, atol=0)
+    torch.testing.assert_close(fast, portable, rtol=1e-2, atol=4e-3)
+    assert not fast[min(1, tokens - 1)].any()
+
+
 def test_unsupported_layout_falls_back(monkeypatch):
     """A cache that is not one row table keeps the portable kernel."""
     q, k, v, idx, table, token_to_req = _case(8, 2, 256, 259, 0.0, seed=3)
