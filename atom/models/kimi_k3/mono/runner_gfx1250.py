@@ -455,7 +455,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 buffers["router_logits"].data_ptr(),
                 buffers["latent_fp4"].data_ptr(),
                 buffers["latent_scales"].data_ptr(),
-                buffers["shared_gate_up"].data_ptr(),
+                buffers["shared_hidden"].data_ptr(),
                 stream=stream,
             )
             gathered = buffers["router_logits"]

@@ -3,10 +3,11 @@
 """Replicated gfx1250 K2 front: no all-gather.
 
 Every rank projects the whole router and latent, like the production MoE, plus
-its shared gate/up shard, through ``gemv_tdm_gfx1250``. CTA ``p`` owns the
-16-row tasks ``2p`` and ``2p + 1``; both always fall in one weight, and in the
-latent they are one 32-column E8M0 group, so a CTA quantizes the latent columns
-it projected without waiting on any other CTA.
+its shared gate/up shard, through ``gemv_tdm_gfx1250``. CTA ``p`` owns two
+16-row tasks of one weight: in the latent they are one 32-column E8M0 group,
+and in the shared gate/up they are the gate and the up rows of the same 16
+columns, so a CTA quantizes its latent columns or activates its shared columns
+without waiting on any other CTA.
 """
 
 from dataclasses import dataclass
@@ -19,11 +20,15 @@ from flydsl.expr.typing import Int64
 
 from atom.models.kimi_k3.mono.config import EXPERTS, HIDDEN, LATENT, SUPPORTED_TP
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
-from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250, moe_gfx1250
+from atom.models.kimi_k3.mono.kernels.stages import (
+    gemv_gfx1250,
+    moe_expert_gfx1250,
+    moe_gfx1250,
+)
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import tdm_lds_words
 from atom.models.kimi_k3.mono.sources import SOURCES
-from atom.mono.device.ops import butterfly, rsrc
+from atom.mono.device.ops import bf_hi, bf_lo, butterfly, rsrc
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
 
@@ -31,6 +36,7 @@ THREADS = 256
 WAVES = 8
 ROWS = 16
 SHARED_ROWS = 2 * 2 * 3072 // SUPPORTED_TP[0]
+SHARED_COLUMNS = SHARED_ROWS // 2
 ROUTER_TASKS = EXPERTS // ROWS
 LATENT_TASKS = LATENT // ROWS
 SHARED_TASKS = SHARED_ROWS // ROWS
@@ -48,7 +54,7 @@ REPLICATED_FRONT_ABI = KernelAbi(
         "router_logits",
         "latent_fp4",
         "latent_scales",
-        "shared_gate_up",
+        "shared_hidden",
     )
 )
 
@@ -78,7 +84,8 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
     class Lds:
         gemv: fx.Array[fx.Int32, staged, 16]
         red: fx.Array[fx.Float32, ACCUMULATOR_WORDS, 16]
-        # One token's 32 projected latent columns, as 16 BF16 pairs.
+        # Per token, 32 projected latent columns or 16 shared gate then 16 up
+        # columns, as 16 BF16 pairs.
         group: fx.Array[fx.Int32, rows * 16, 16]
 
     name = f"k3_k2_gfx1250_replicated_front_s{rows}"
@@ -94,7 +101,7 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
         router_logits: Int64,
         latent_fp4: Int64,
         latent_scales: Int64,
-        shared_gate_up: Int64,
+        shared_hidden: Int64,
     ):
         _ = sources
         tid = fx.thread_idx.x
@@ -117,6 +124,11 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
                 latent.select(fx.Int32(LATENT_PAIR0), fx.Int32(SHARED_PAIR0)),
             )
             row0 = (pair - first_pair) * (2 * ROWS)
+            shared_column0 = (pair - first_pair) * ROWS
+            second = (router | latent).select(
+                row0 + ROWS, shared_column0 + SHARED_COLUMNS
+            )
+            first = (router | latent).select(row0, shared_column0)
             accumulators = gemv_tdm.project(
                 lds.gemv.ptr,
                 x,
@@ -125,7 +137,7 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
                 weight,
                 weight_rows,
                 HIDDEN,
-                [row0, row0 + ROWS],
+                [first, second],
                 lane,
                 wave,
             )
@@ -163,7 +175,7 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
                                     rsrc(router_logits),
                                     token * EXPERTS + row + 1,
                                 )
-                            elif latent:
+                            else:
                                 fx.ptr_store(
                                     packed,
                                     lds.group.ptr
@@ -171,13 +183,24 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
                                     + task * 8
                                     + row_pair,
                                 )
-                            else:
-                                bo.buffer_store(
-                                    packed,
-                                    rsrc(shared_gate_up),
-                                    (token * SHARED_ROWS + row) // 2,
-                                )
             gpu.barrier()
+            if pair >= SHARED_PAIR0:
+                for round_index in range_constexpr((rows * 8 + THREADS - 1) // THREADS):
+                    work = tid + THREADS * round_index
+                    if work < rows * 8:
+                        token = work // 8
+                        column_pair = work % 8
+                        gate = fx.ptr_load(lds.group.ptr + token * 16 + column_pair)
+                        up = fx.ptr_load(lds.group.ptr + token * 16 + 8 + column_pair)
+                        low = moe_expert_gfx1250._situ(bf_lo(gate), bf_lo(up))
+                        high = moe_expert_gfx1250._situ(bf_hi(gate), bf_hi(up))
+                        bo.buffer_store(
+                            fx.Vector.from_elements([low, high], fx.Float32)
+                            .to(fx.BFloat16)
+                            .bitcast(fx.Int32)[0],
+                            rsrc(shared_hidden),
+                            (token * SHARED_COLUMNS + shared_column0) // 2 + column_pair,
+                        )
             if latent & (tid < rows * 4):
                 token = tid // 4
                 packed_word = tid % 4
@@ -215,7 +238,7 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
         router_logits: Int64,
         latent_fp4: Int64,
         latent_scales: Int64,
-        shared_gate_up: Int64,
+        shared_hidden: Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         _ = sources
@@ -227,7 +250,7 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
             router_logits,
             latent_fp4,
             latent_scales,
-            shared_gate_up,
+            shared_hidden,
         ).launch(grid=(PAIRS,), block=(THREADS,), stream=stream)
 
     REPLICATED_FRONT_ABI.check(kernel, launch)

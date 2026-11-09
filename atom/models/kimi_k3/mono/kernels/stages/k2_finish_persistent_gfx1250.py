@@ -198,8 +198,8 @@ def build_packed_finish(
     MoE: ``route`` and ``tile_route`` then receive contiguous [rows, 16] expert
     ids and weights, and ``latent_scales`` one E8M0 byte per 32-column group.
     After a ``replicated_front`` there is no gathered payload: ``front_gathered``
-    is the rank's [rows, EXPERTS] f32 router logits and the latent planes are
-    already in place."""
+    is the rank's [rows, EXPERTS] f32 router logits, the latent planes are
+    already in place and ``shared_hidden`` holds the activated shared rows."""
     if replicated_front and include_routed:
         raise ValueError("a replicated front feeds only the grouped-MoE finish")
     if plan.architecture is not GFX1250:
@@ -483,15 +483,17 @@ def build_packed_finish(
             _grid_barrier(scratch, ticket, plan.blocks)
 
         if const_expr(include_shared and not include_routed):
-            moe_tail_gfx1250.stage_activated_rows(
-                {
-                    "S": rows,
-                    "tid": tid,
-                    "threads": THREADS,
-                    "tail": {"gemv_rows": shared_down.rows.ptr},
-                },
-                shared_gate_up,
-            )
+            staging = {
+                "S": rows,
+                "tid": tid,
+                "threads": THREADS,
+                "tail": {"gemv_rows": shared_down.rows.ptr},
+            }
+            if const_expr(replicated_front):
+                # The replicated front already activated the shared columns.
+                moe_tail_gfx1250.stage_hidden_rows(staging, shared_hidden)
+            else:
+                moe_tail_gfx1250.stage_activated_rows(staging, shared_gate_up)
             task = bid
             while task < SHARED_DOWN_TASKS:
                 operands = gemv_gfx1250.loads(

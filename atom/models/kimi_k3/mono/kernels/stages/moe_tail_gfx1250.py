@@ -87,6 +87,13 @@ def stage_activated_rows(c, gate_up):
 
 
 @traced
+def stage_hidden_rows(c, hidden):
+    """Stage every token's shared hidden row in ``gemv_rows`` once, for
+    ``sdown_staged`` to reuse across tasks."""
+    _rows_to_lds(c, hidden, SHARED_INTERMEDIATE, SHARED_ROW_STRIDE)
+
+
+@traced
 def stage_sdown(c, task, operands, waves):
     """Shared-down GEMV into the rank-local final contribution."""
 
