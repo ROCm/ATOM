@@ -14,9 +14,12 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
-from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
+if TYPE_CHECKING:
+    # Annotation only: importing the factory at runtime pulls in torch, and the
+    # metrics exporter imports this module for its decision names.
+    from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
 
 
 class Route(NamedTuple):

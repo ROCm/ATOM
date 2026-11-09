@@ -7,7 +7,6 @@ from weakref import WeakKeyDictionary
 
 import pytest
 from conftest import MockConfig
-from mp_shipping_helpers import shipped_tokens as _shipped_tokens
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -35,6 +34,7 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Replay, Sequence, SequenceStatus, SequenceType
 from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+from tests.lmcache_mp_support import shipped_tokens as _shipped_tokens
 
 
 @pytest.fixture(autouse=True)

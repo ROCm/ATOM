@@ -13,7 +13,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from mp_shipping_helpers import shipped_tokens as _shipped_tokens
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -48,9 +47,11 @@ from atom.kv_transfer.offload.mp import (
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
-from atom.kv_transfer.offload.mp.token_shipping import TokenShipper, token_list
+from atom.kv_transfer.offload.mp.token_shipping import token_list
+from tests.lmcache_mp_support import bare_mp_scheduler as _bare_mp_scheduler
 from tests.lmcache_mp_support import close_workers, cpu_step_events  # noqa: F401
 from tests.lmcache_mp_support import settle as _settle
+from tests.lmcache_mp_support import shipped_tokens as _shipped_tokens
 from tests.lmcache_mp_support import start_transfers as _start_transfers
 from tests.lmcache_mp_support import step_event as _step_event
 
@@ -689,10 +690,7 @@ def test_mp_lookup_releases_hit_suffix_outside_retrieve_range(monkeypatch):
             ),
         )
     )
-    scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
-    scheduler._token_shipper = TokenShipper()
+    scheduler = _bare_mp_scheduler()
     scheduler._lookup_client = client
     monkeypatch.setattr(
         ChunkedOffloadSchedulerBase,
@@ -777,10 +775,7 @@ def _full_prompt_hit_scheduler(monkeypatch, chunk_size, hit=8):
         timeout=1.0,
         poll_interval=0.01,
     )
-    scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
-    scheduler._token_shipper = TokenShipper()
+    scheduler = _bare_mp_scheduler()
     scheduler._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         scheduler,
@@ -977,10 +972,7 @@ def test_stale_load_failure_does_not_release_current_generation_locks():
         timeout=1.0,
         poll_interval=0.01,
     )
-    scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
-    scheduler._token_shipper = TokenShipper()
+    scheduler = _bare_mp_scheduler()
     scheduler._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         scheduler,
@@ -2318,11 +2310,9 @@ def _shipping_pair():
     `start_load_kv`). The worker has no adapter, so `start_load_kv` resolves the
     shipped tokens and then stops at "not registered"; `_send` collects what it
     resolved."""
-    from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
     from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
 
-    sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
-    sched._token_shipper = TokenShipper()
+    sched = _bare_mp_scheduler()
     worker = mp_worker.LMCacheMPConnector.__new__(mp_worker.LMCacheMPConnector)
     worker._tokens = WorkerTokens()
     worker._adapter = None
@@ -2424,11 +2414,7 @@ def test_the_session_end_drops_the_workers_copy(monkeypatch):
     request's shipped prefix, and only then."""
     import array
 
-    from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
-
-    sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
-
-    sched._token_shipper = TokenShipper()
+    sched = _bare_mp_scheduler()
     seq = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
     sched._token_shipper.ship(seq, 32)
     sched._lookup_client = SimpleNamespace()

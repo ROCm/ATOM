@@ -4,17 +4,16 @@
 """Incremental token shipping for LMCache MP transfers.
 
 A transfer names its LMCache chunks by the request's token prefix, so every
-save and load carries `token_ids[:end]`. Long prompts are saved a chunk at a
-time: shipping the whole prefix with each one is quadratic in the prompt, and
-the scheduler boxed it into a Python list and pickled it every time (77 ms per
-transfer at 512k tokens).
-
-Here the scheduler (`TokenShipper`) sends only the tokens past what the
-workers already hold, as an `array('i')` slice (it pickles as raw bytes), in a
-`ShippedTokens` that rides in `LMCacheReqMeta.token_ids`. Each worker shell
+save and load carries `token_ids[:end]`. The scheduler (`TokenShipper`) sends
+only the tokens past what the workers already hold, as an `array('i')` slice
+in a `ShippedTokens` that rides in `LMCacheReqMeta.token_ids`. Each worker
 (`WorkerTokens`) appends it to its own `array('i')` copy of the request's
-prefix (4 bytes a token); a transfer builds the list of the part it covers
-only when it is submitted (`token_list`).
+prefix (4 bytes a token).
+
+What this does not remove: `AtomMPTransferSpec` takes the whole `[0, end)`
+prefix, and LMCache turns it into a tuple, so a rank that submits a transfer
+still builds an O(prefix) sequence for it (`token_list`, built only there).
+Removing that needs incremental specs in LMCache MP.
 
 A finished request's copy is dropped through the metadata's `token_drops`,
 which counts as pending work (`has_drops`), so the drop is delivered even when
@@ -117,8 +116,8 @@ class WorkerTokens:
                     f"LMCache MP token copy for {req.req_id!r} holds "
                     f"{len(tokens)} tokens, the transfer needs {shipped.end}"
                 )
-            # No copy here: a transfer that is submitted (not every rank
-            # writes) builds its list when it builds its spec (`token_list`).
+            # No copy here: a rank builds the list only for a transfer it
+            # submits (`token_list`).
             req.token_ids = TokenPrefix(tokens, shipped.end)
 
 

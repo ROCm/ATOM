@@ -10,7 +10,6 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from mp_shipping_helpers import shipped_tokens as _shipped_tokens
 from test_lmcache_mp import _config, _WorkerAdapter, fake_lmcache_modules  # noqa: F401
 from test_lmcache_mp_async_lookup import CHUNK, _Adapter, _Client, _Future
 
@@ -21,12 +20,12 @@ from atom.kv_transfer.offload.metadata import (
     SaveSpec,
 )
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
-from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import transfer_thread
 from atom.kv_transfer.offload.mp import worker as mp_worker
 from atom.kv_transfer.offload.mp.lookup_driver import _LockedAdapter
-from atom.kv_transfer.offload.mp.token_shipping import TokenShipper
 from atom.model_engine.sequence import SequenceStatus
+from tests.lmcache_mp_support import bare_mp_scheduler
+from tests.lmcache_mp_support import shipped_tokens as _shipped_tokens
 
 
 def _wait_until(predicate, timeout=5.0):
@@ -203,10 +202,7 @@ def test_offer_is_a_noop_without_a_driver():
 def test_scheduler_offers_only_waiting_requests_to_the_driver():
     adapter = _Adapter(_PerRequestClient(chunks=1))
     client = _driven_client(adapter)
-    sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
-    sched._token_shipper = TokenShipper()
+    sched = bare_mp_scheduler()
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client
@@ -567,10 +563,7 @@ def _same_step_scheduler():
     client = mp_lookup._MPLookupClient(
         adapter, config=_config(), timeout=1.0, poll_interval=0.01
     )
-    sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
-    sched._token_shipper = TokenShipper()
+    sched = bare_mp_scheduler()
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client

@@ -17,8 +17,6 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from weakref import WeakKeyDictionary
 
-from mp_shipping_helpers import shipped_tokens as _shipped_tokens
-
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     KVConnectorOutput,
@@ -39,6 +37,7 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
 )
 from atom.model_engine.sequence import Sequence
+from tests.lmcache_mp_support import shipped_tokens as _shipped_tokens
 
 CHUNK = 8
 REPLAY = 6

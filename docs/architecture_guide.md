@@ -316,6 +316,7 @@ Each attention backend provides its own `prepare_mtp_decode()` implementation:
 | `atom/model_engine/engine_core.py` | `EngineCore` main execution loop, `DPEngineCoreProc` data-parallel variant, `EngineCoreRequestType` message protocol |
 | `atom/model_engine/engine_core_mgr.py` | `CoreManager` ZMQ orchestration, process launching, load-balanced DP dispatch |
 | `atom/model_engine/model_runner.py` | `ModelRunner` per-GPU execution (model loading, CUDA graph capture, forward pass), `tokenIDProcessor` deferred output handling |
+| `atom/model_engine/prefix_spread.py` | `PrefixSpreadRouter`: the `--dp-load-balance prefix_spread` prefix index and placement rule `CoreManager` calls under its load-balancing lock |
 | `atom/model_engine/scheduler.py` | `Scheduler` prefill-first scheduling, `ScheduledBatch` batch descriptor, `ScheduledBatchOutput` forward results |
 | `atom/model_engine/engine_stats.py` | `EngineStats` — MTP acceptance, prefix-cache hits, and the periodic engine-status line, each on its own cadence |
 | `atom/model_engine/sequence.py` | `Sequence` request state, `SequenceStatus` and `SequenceType` enums |

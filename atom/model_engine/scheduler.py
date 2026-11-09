@@ -2265,6 +2265,7 @@ class Scheduler:
             unschedulable = self._unschedulable_reason(seq)
             if unschedulable is not None:
                 self._inflight_prefix_wait.pop(seq.id, None)
+                self._lookup_detach_declined.discard(seq.id)
                 seq.status = SequenceStatus.FINISHED
                 seq.leave_reason = f"unschedulable: {unschedulable}"
                 seq.multimodal_data = None
@@ -3194,7 +3195,7 @@ class Scheduler:
         Only the offload tier is told: a P/D connector would treat the request
         as a finished prefill (a Mooncake chunked producer reads its first
         output token, which does not exist) and publish a handoff. Without an
-        offload tier nothing is called, as before.
+        offload tier nothing is called.
         """
         if self.kv_connector is None or not self._connector_flag("is_offload"):
             return

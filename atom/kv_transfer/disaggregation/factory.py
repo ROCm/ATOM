@@ -342,10 +342,11 @@ class KVConnectorFactory:
         * `multi` is whatever it wraps. Each entry of `connectors` is a full
           transfer config, and `MultiConnector.register_kv_caches` forwards the
           same tensors to every sub, so one region reader settles it.
-        * `lmcache_offload` picks a codec from the MODEL, not the config, and
-          only the dense one ignores the regions -- hybrid, m3 and kimi_k3
-          source their PAGE bytes from them. That is not knowable at
-          registration, so the layout is asked here.
+        * An offload backend registered with `reads_block_regions=False`
+          (`lmcache_offload`, `mooncake_store`) picks its codec from the MODEL,
+          not the config: only the dense codec ignores the regions, the PAGE
+          layouts (hybrid, m3, kimi_k3, V4.1) source their bytes from them.
+          That is not knowable at registration, so the layout is asked here.
         """
 
         leaves = cls.leaf_connectors(config)
