@@ -102,6 +102,17 @@ WORKER_CMD=("$AGENT" -p --dangerously-skip-permissions)
 # flags (`claude-glm --backend kimi`) is not runnable here. `refuter-kimi` in this
 # directory is that wrapper for the Kimi backend; an Opus entrypoint works directly.
 REFUTER_CMD=("${ATOM_REVIEW_REFUTER_AGENT:-$AGENT}" -p --dangerously-skip-permissions)
+# Default stays same-family, decided 2026-11-09 on the evidence available then, not on
+# preference. Cross-family was wired up and run end to end (refuter-kimi vs claude-glm,
+# ATOM#3034): the path works, the card says which it got, and Kimi's verdicts cite code
+# positions rather than restating the card -- so it is doing the work. What it did NOT
+# show is that cross-family judges BETTER: that run killed 0 of 6, and across all 64
+# recorded runs the same-family refuter has killed 6 of 254 (2.4%), so a single 0-kill
+# round is ordinary either way. One run cannot separate the two.
+#
+# Flip the default when the data can: tens of rounds on real PRs, comparing kill rate
+# and false-kill rate between the two. Until then the cheaper, already-proven path is
+# the default and ATOM_REVIEW_REFUTER_AGENT=./refuter-kimi is how to run the other.
 
 # Whether the refuter is a different model family from the worker, decided here in the
 # shell so no agent can report it. aiter's own note at the top of this file says the
