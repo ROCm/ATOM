@@ -131,7 +131,19 @@ def _compare(reference, fused):
     fused.check_guards()
 
 
-@pytest.mark.parametrize("b,strided", [(1, False), (3, True), (24, False), (32, True)])
+@pytest.mark.parametrize(
+    "b,strided",
+    [
+        (1, False),
+        (3, True),
+        (24, False),
+        (32, True),
+        (48, True),
+        (96, False),
+        (112, True),
+        (128, False),
+    ],
+)
 def test_matches_native_ids_q_bits_and_embeddings(weights, b, strided):
     reference = _Case(b, weights, strided=strided)
     fused = _Case(b, weights, strided=strided)
@@ -151,11 +163,12 @@ def test_matches_native_ids_q_bits_and_embeddings(weights, b, strided):
     "pattern",
     ["ties", "negative_inf", "positive_inf", "negative_zero", "nan_tile", "all_nan"],
 )
-def test_maximum_edge_cases_preserve_native_choice(pattern):
+@pytest.mark.parametrize("b", [3, 48])
+def test_maximum_edge_cases_preserve_native_choice(pattern, b):
     weights = tuple(
         torch.zeros(V, R, device="cuda", dtype=torch.bfloat16) for _ in range(2)
     )
-    reference, fused = _Case(3, weights, strided=True), _Case(3, weights, strided=True)
+    reference, fused = _Case(b, weights, strided=True), _Case(b, weights, strided=True)
     reference.temps.zero_()
     reference.base.zero_()
     if pattern == "ties":
@@ -178,10 +191,10 @@ def test_maximum_edge_cases_preserve_native_choice(pattern):
 
 
 def test_graphs_with_different_batches_share_reset_workspace(weights):
-    keys = torch.zeros((T + 2, 64), device="cuda", dtype=torch.uint64)
+    keys = torch.zeros((T + 2, 128), device="cuda", dtype=torch.uint64)
     stream = torch.cuda.Stream()
     cases = []
-    for b in (24, 32):
+    for b in (24, 32, 96, 128):
         reference, fused = _Case(b, weights), _Case(b, weights, keys=keys)
         fused.copy_inputs(reference)
         fused.fused()
@@ -213,13 +226,14 @@ def test_state_opt_in_and_fallback_metadata(weights, monkeypatch):
     keys = torch.zeros((T, 64), device="cuda", dtype=torch.uint64)
     assert can_use_prob_markov_chain(base, *weights, keys)
     assert not can_use_prob_markov_chain(base, *weights, None)
-    assert not can_use_prob_markov_chain(base.expand(64, -1, -1), *weights, keys)
+    assert can_use_prob_markov_chain(base.expand(64, -1, -1), *weights, keys)
+    assert not can_use_prob_markov_chain(base.expand(65, -1, -1), *weights, keys)
     assert not can_use_prob_markov_chain(base[:, :2], *weights, keys)
     assert not can_use_prob_markov_chain(base[:, :, :128], *weights, keys)
     assert not can_use_prob_markov_chain(base.float(), *weights, keys)
 
 
-@pytest.mark.parametrize("b,width", [(24, 5), (64, 5), (3, 2)])
+@pytest.mark.parametrize("b,width", [(24, 5), (64, 5), (112, 5), (3, 2)])
 def test_model_dispatch_preserves_native_and_verifier_buffers(
     weights, monkeypatch, b, width
 ):
@@ -260,7 +274,7 @@ def test_model_dispatch_preserves_native_and_verifier_buffers(
     ids, emb = DeepseekV41DSpark._head_and_sample_prob(
         model, normed, hidden, anchors, candidate
     )
-    assert len(calls) == int(b <= 32 and width == T)
+    assert len(calls) == int(width == T)
     assert torch.equal(ids, expected_ids)
     assert torch.equal(candidate.ids, reference.ids)
     assert _bits_equal(candidate.q, reference.q)
