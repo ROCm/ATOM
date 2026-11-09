@@ -1,10 +1,10 @@
-# DeepSeek-V4.1-Flash text API recipe
+# DeepSeek-V4.1-Flash API recipe
 
-This recipe covers ordinary APIs and beta text APIs merged into ROCm/ATOM main. Use commit `10b99a085ba46e5b3a125f0114cec7c71e401552` or a later release containing it. The examples target the ATOM Python API server directly. Image serving is a separate deployment recipe.
+This recipe covers ordinary APIs, beta text APIs and image inputs merged into ROCm/ATOM main. Use commit `0a99b2b961f2f1dd393ba0b3d75ce66d45b6e489` or a later release containing it. The examples target the ATOM Python API server directly. The basic non-DSpark launch below also serves images when the complete multimodal checkpoint is installed.
 
 ## 1. Install and start the basic service
 
-Run inside an ATOM development container with ROCm, PyTorch and the matching AITER dependencies already installed. Use the checkpoint directory containing the model weights, tokenizer and model-specific encoder. Follow the [model recipe](https://github.com/ROCm/ATOM/blob/main/recipes/DeepSeek-V4.1-Flash.md) for the hardware/dependency build; this recipe does not replace that setup.
+Run inside an ATOM development container with ROCm, PyTorch and the matching AITER dependencies already installed. Use the checkpoint directory containing the model weights, tokenizer and model-specific encoder. For images, include the vision tower, aligner and image processor files from the full checkpoint. Follow the [model recipe](https://github.com/ROCm/ATOM/blob/main/recipes/DeepSeek-V4.1-Flash.md) for the hardware/dependency build; this recipe does not replace that setup.
 
 ```bash
 cd /path/to/ATOM
@@ -34,7 +34,7 @@ python3 -m atom.entrypoints.openai_server \
   --tool-call-parser dsml_v41
 ```
 
-This is a conservative TP4, text-only starting point, with no speculative decoding. It can exercise Chat logprobs and Schema together. The 32K limit is the configured prompt-plus-output budget, not a claim about the checkpoint's maximum supported context. Choose GPUs and ports that are free. TP2 is also supported on suitable MI350-class hardware; use two visible GPUs and `-tp 2` after checking host/GPU memory capacity.
+This is a conservative native TP4 starting point, with no speculative decoding or DP attention. It can exercise Chat logprobs and Schema together. The 32K limit is the configured prompt-plus-output budget, not a claim about the checkpoint's maximum supported context. Choose GPUs and ports that are free. TP2 is also supported on suitable MI350-class hardware; use two visible GPUs and `-tp 2` after checking host/GPU memory capacity.
 
 Do not enable synthetic acceptance when checking output correctness: omit `--spec-decode-acceptance-length`, `--spec-decode-acceptance-rate` and synthetic benchmark environment settings. Start from a clean shell rather than inheriting a benchmark configuration.
 
@@ -629,7 +629,78 @@ Keep forced/synthetic acceptance disabled. Ordinary Chat logprobs work with DSpa
 
 Access `/beta/*` directly on this Python API server. The beta route implementation is not currently routed through Atomesh DP/P-D mesh; do not substitute a mesh frontend for this recipe.
 
-## 4. Boundaries and errors
+## 4. Image requests
+
+### Serving configuration
+
+Use the basic launch in section 1 with the full multimodal checkpoint. Keep `ATOM_MONO_ENABLE=0`, `--level 0` and `--enforce-eager` as a starting point. **Do not add `--method dspark` or `--enable-dp-attention` for images.** If you switched the service to DSpark for section 3, stop that instance and restart the basic service before sending images. The model rejects unsupported image deployments instead of answering from text alone.
+
+The same native instance can handle ordinary text requests and images. Begin with one image request at a time; tune prefill chunks/concurrency only after checking visual answers on your workload. Eager mode is a starting configuration, not a guarantee of visual correctness.
+
+### Ready-to-run local image examples
+
+The example directory includes `sample-red.png`, a generated red square, and request files for all three APIs. The client sends image bytes; it does not ask the server to read your local path.
+
+```bash
+cd /path/to/ATOM/recipes/examples/deepseek-v41-api
+export BASE_URL=http://127.0.0.1:8000
+
+curl -sS "$BASE_URL/v1/chat/completions" \
+  -H 'Content-Type: application/json' --data-binary @chat-image.json
+curl -sS "$BASE_URL/v1/responses" \
+  -H 'Content-Type: application/json' --data-binary @responses-image.json
+curl -sS "$BASE_URL/v1/messages" \
+  -H 'Content-Type: application/json' \
+  -H 'anthropic-version: 2023-06-01' --data-binary @messages-image.json
+```
+
+Each request asks for the square's color, so check that the visible answer describes red. This is a simple image-content smoke check, not a visual benchmark. For streaming, use the corresponding `chat-image-stream.json`, `responses-image-stream.json` or `messages-image-stream.json` and add `curl -N`. Stream framing is the same as each endpoint's text stream.
+
+To use your own image, the included standard-library-only helper writes the six request files (JSON/SSE × three interfaces):
+
+```bash
+python3 build-image-requests.py /path/on/the/client/photo.png
+# Optional second image: preserves first/second order and asks to compare them.
+python3 build-image-requests.py first.png --second second.jpg
+```
+
+The helper reads the image on the **client**, base64-encodes it, and writes JSON. Use JPEG, PNG, GIF or WebP. Change its `--prompt` or edit the text block in the generated JSON to ask your own question. GIF means its first frame; this is not video serving.
+
+### Protocol shapes
+
+- **Chat:** a `user` message contains a text block plus `{"type":"image_url","image_url":{"url":"data:image/png;base64,<encoded bytes>","detail":"auto"}}`.
+- **Responses:** `input` contains a `user` message with `input_text` and `{"type":"input_image","image_url":"data:image/png;base64,<encoded bytes>","detail":"auto"}`.
+- **Messages:** a `user` message contains `text` and `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"<encoded bytes>"}}`. Here `data` is raw base64, without a `data:` prefix.
+
+The bundled JSON files contain actual sample bytes, rather than the placeholders above.
+
+### Public image URLs
+
+Three additional files (`chat-image-url.json`, `responses-image-url.json`, `messages-image-url.json`) use a public HTTPS example image. Replace that URL with a public image URL you control for repeatable tests; the server must have egress access.
+
+- Chat: `image_url.url` is the public URL.
+- Responses: `input_image.image_url` is the public URL.
+- Messages: image `source` becomes `{"type":"url","url":"https://..."}`.
+
+URLs and redirects must resolve to public addresses. Local paths, `file://`, private/loopback/link-local URLs and file references are refused by default. For a trusted intranet image store, the operator can explicitly set `ATOM_IMAGE_URL_ALLOW_PRIVATE=1` before launch; that permits internal destinations and system proxies. Base64 data avoids a server-side download.
+
+### Placement and limits
+
+| Interface | Supported placement |
+| --- | --- |
+| Chat | Image parts in `user` messages |
+| Responses | `user` and `developer` messages; image blocks in `function_call_output` / `custom_tool_call_output` output |
+| Messages | `user` messages; image blocks in `tool_result.content` |
+
+Images in `system` or `assistant` messages are rejected. For multi-turn requests, resend the relevant image-bearing history in that interface's format. Tool-result images require the preceding matching tool call and its returned call ID; they are not standalone user messages.
+
+JPEG, PNG, GIF (first frame) and WebP are detected from their bytes. Per image: 32 MiB, up to 8192 px per side; from 15 images onward, up to 4096 px per side. Per request: at most 600 images, 64 MiB of image bytes and 256 megapixels of decoded images. Public URLs are at most 8192 characters; a download has a 60-second limit. Prompt image tokens plus requested output must also fit the configured model context. These input limits are not a recommendation to start with a 600-image workload.
+
+For Chat and Responses, `detail: "low"` downscales to fit 512×512. `auto`, `high` and `original` retain the incoming dimensions at the API loader; the model processor still performs its own processing.
+
+There is no Files API: `file_id` and Anthropic `file` sources are rejected. Chat's `file_data` form accepts image data URLs, not arbitrary documents. Image output/generation, audio and video are outside this recipe.
+
+## 5. Boundaries and errors
 
 - JSON Schema is a supported subset, not every JSON Schema predicate. External references and unsupported predicates fail before enqueue. Prefer simple typed objects, required fields, enums and bounds; unsupported unbounded `uniqueItems` and complex negations are rejected.
 - Schema and strict tools require the DSML tool parser and text serving; no P/D, pipeline parallelism, custom stop strings, ignored EOS, relaxed MTP or synthetic acceptance. Strict schemas additionally reject `minLength`, `maxLength`, `minItems`, `maxItems`, `patternProperties`; supported strict formats are email, hostname, ipv4, ipv6 and uuid. Local definitions/references must follow the documented strict rules.
@@ -637,10 +708,10 @@ Access `/beta/*` directly on this Python API server. The beta route implementati
 - Use a list for ordinary `/v1` stop strings, e.g. `"stop": ["END"]`. Beta accepts a string as well. Do not combine custom stops with Schema/strict tools.
 - An unknown served model returns HTTP 400. Invalid fields can produce HTTP 400/422; inspect the returned error body rather than only the HTTP code. Streaming errors/truncation must be handled as terminal failure/incomplete events.
 - Enabled Schema/strict constraints and logprobs add work; performance depends on workload and topology. This recipe makes no zero-overhead claim. Start with those request options absent when measuring the ordinary path.
-- Image input and vision, including its remaining qualification work, are excluded from this text recipe. Never assume successful text generation establishes image understanding.
+- Images use the native multimodal path and cannot be combined with DSpark, DP attention, P/D, Schema/strict tools, Chat logprobs or beta assistant prefixes. Visual quality remains unstable across concurrency, chunk size and execution mode; validate answer content on representative images. A successful HTTP response or graph capture does not establish image accuracy.
 
-## 5. Merge references
+## 6. Merge references
 
-API compatibility: [#2844](https://github.com/ROCm/ATOM/pull/2844). Chat/DSpark probabilities: [#2856](https://github.com/ROCm/ATOM/pull/2856). JSON constraints and model metadata: [#2862](https://github.com/ROCm/ATOM/pull/2862). Beta FIM/prefix: [#3036](https://github.com/ROCm/ATOM/pull/3036). Beta strict tools: [#3090](https://github.com/ROCm/ATOM/pull/3090). Requirements tracker: [#2864](https://github.com/ROCm/ATOM/issues/2864).
+API compatibility: [#2844](https://github.com/ROCm/ATOM/pull/2844). Chat/DSpark probabilities: [#2856](https://github.com/ROCm/ATOM/pull/2856). JSON constraints and model metadata: [#2862](https://github.com/ROCm/ATOM/pull/2862). Beta FIM/prefix: [#3036](https://github.com/ROCm/ATOM/pull/3036). Beta strict tools: [#3090](https://github.com/ROCm/ATOM/pull/3090). Chat image input: [#3111](https://github.com/ROCm/ATOM/pull/3111). Responses/Messages image input: [#3115](https://github.com/ROCm/ATOM/pull/3115). Requirements tracker: [#2864](https://github.com/ROCm/ATOM/issues/2864).
 
-Prepared against main `10b99a08` on 2026-11-09. Commands and payloads were checked against source; this documentation and example set was not newly GPU-tested as a bundle. Prior real-model validation is recorded in the linked PRs. The issue's historical draft/unmerged labels are stale.
+Prepared against main `0a99b2b9` on 2026-11-09. Commands and payloads were checked against source; this documentation and example set was not newly GPU-tested as a bundle. Prior real-model validation is recorded in the linked PRs. The issue's historical draft/unmerged labels are stale. See [API image input](../docs/api_image_input.md) for protocol/limits and [V4.1 vision](../docs/deepseek_v41_vision.md) for runtime and visual-quality limitations.
