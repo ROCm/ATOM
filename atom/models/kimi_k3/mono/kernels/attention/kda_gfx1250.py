@@ -423,27 +423,37 @@ def kda_conv_compute(c, k, request, head, chunk):
 
 @traced
 def kda_head_norm(c, request, head):
-    """Finish a whole plain-decode head from CTA-local partial norms."""
+    """Finish a whole head from CTA-local partial norms."""
 
-    L, tid = c["L"], c["tid"]
-    if tid < L * HEAD_DIM:
-        token = tid // HEAD_DIM
-        row = tid % HEAD_DIM
+    L, tid, threads = c["L"], c["tid"], c["matrix_threads"]
+    outputs = L * HEAD_DIM
+    rounds = (outputs + threads - 1) // threads
+    items = [
+        fx.min(tid + threads * round_index, outputs - 1)
+        for round_index in range_constexpr(rounds)
+    ]
+    gates = mailbox_poll_many_device(
+        [
+            (
+                _scratch_region(c, "proj"),
+                (request * L + item // HEAD_DIM) * NPROJ
+                + G2_0
+                + head * HEAD_DIM
+                + item % HEAD_DIM,
+            )
+            for item in items
+        ],
+        c["tag"],
+    )
+    for round_index in range_constexpr(rounds):
+        item = items[round_index]
+        token = item // HEAD_DIM
+        row = item % HEAD_DIM
         square_sum = fx.Float32(0.0)
         for chunk in range_constexpr(STATE_CHUNKS):
             square_sum = square_sum + fx.ptr_load(
                 c["head_onrm"] + token * STATE_CHUNKS + chunk
             )
-        gate = _f32_of(
-            mailbox_poll_device(
-                _scratch_region(c, "proj"),
-                (request * L + token) * NPROJ
-                + G2_0
-                + head * HEAD_DIM
-                + row,
-                c["tag"],
-            )
-        )
         inverse = hw_rsq(
             square_sum * fx.Float32(1.0 / HEAD_DIM)
             + fx.Float32(c["onorm_eps"])
@@ -460,13 +470,110 @@ def kda_head_norm(c, request, head):
             fx.ptr_load(c["ol"] + token * HEAD_DIM + row)
             * inverse
             * weight
-            / (fx.Float32(1.0) + hw_exp2(-gate * LOG2E))
+            / (fx.Float32(1.0) + hw_exp2(-_f32_of(gates[round_index]) * LOG2E))
         )
-        bo.buffer_store(
-            output.to(fx.BFloat16),
-            rsrc(c["args"]["core_out"]),
-            (request * L + token) * PROJ + head * HEAD_DIM + row,
+        if tid + threads * round_index < outputs:
+            bo.buffer_store(
+                output.to(fx.BFloat16),
+                rsrc(c["args"]["core_out"]),
+                (request * L + token) * PROJ + head * HEAD_DIM + row,
+            )
+    gpu.barrier()
+
+
+@traced
+def kda_recur_head(c, k, request, head):
+    """Advance a whole head: wave ``w`` owns chunk ``w``'s sixteen state rows.
+
+    Every row is an independent recurrence over the head's q/k/decay, so one
+    token loop advances all of a wave's rows and their reduction chains
+    overlap; partial output norms stay CTA-local."""
+
+    L, lane, wave = c["L"], c["lane"], c["wave"]
+    args = c["args"]
+    live = k["slot0"] >= 0
+    column = lane * 4
+    row0 = wave * ROWS
+    source = rsrc(
+        args["rstate"] + fx.Int64(fx.max(k["slot0"], 0)) * fx.Int64(args["rs_seq"]) * 4
+    )
+    loaded = [
+        fx.Vector(
+            bo.buffer_load(
+                source,
+                (head * GATE_K + row0 + row) * GATE_K + column,
+                vec_width=4,
+                dtype=T.f32,
+            )
         )
+        for row in range(ROWS)
+    ]
+    state = [
+        live.select(loaded[row][element], fx.Float32(0.0))
+        for row in range(ROWS)
+        for element in range(4)
+    ]
+    token = fx.Int32(0)
+    while token < L:
+        q = [
+            fx.ptr_load(c["qkl"] + (2 * token) * GATE_K + column + element)
+            for element in range(4)
+        ]
+        key = [
+            fx.ptr_load(c["qkl"] + (2 * token + 1) * GATE_K + column + element)
+            for element in range(4)
+        ]
+        decay = [
+            fx.ptr_load(c["decay"] + token * GATE_K + column + element)
+            for element in range(4)
+        ]
+        beta = fx.ptr_load(c["beta"] + token)
+        slot = fx.ptr_load(c["slots"] + token)
+        updated = []
+        outputs = []
+        for row in range_constexpr(ROWS):
+            row_state = [state[4 * row + element] * decay[element] for element in range(4)]
+            projection = (
+                row_state[0] * key[0]
+                + row_state[1] * key[1]
+                + row_state[2] * key[2]
+                + row_state[3] * key[3]
+            )
+            projection = butterfly(projection, (16, 8, 4, 2, 1), architecture=GFX1250)
+            value = (
+                fx.ptr_load(c["vloc"] + token * HEAD_DIM + row0 + row) - projection
+            ) * beta
+            row_state = [row_state[element] + value * key[element] for element in range(4)]
+            output = (
+                row_state[0] * q[0]
+                + row_state[1] * q[1]
+                + row_state[2] * q[2]
+                + row_state[3] * q[3]
+            )
+            output = _bf16_round(
+                butterfly(output, (16, 8, 4, 2, 1), architecture=GFX1250)
+            )
+            updated.extend(row_state)
+            outputs.append(live.select(output, fx.Float32(0.0)))
+        state = updated
+        if (slot >= 0) & live:
+            destination = rsrc(
+                args["rstate"] + fx.Int64(slot) * fx.Int64(args["rs_seq"]) * 4
+            )
+            for row in range_constexpr(ROWS):
+                bo.buffer_store(
+                    fx.Vector.from_elements(state[4 * row : 4 * row + 4], fx.Float32),
+                    destination,
+                    (head * GATE_K + row0 + row) * GATE_K + column,
+                )
+        square_sum = fx.Float32(0.0)
+        for row in range_constexpr(ROWS):
+            square_sum = square_sum + outputs[row] * outputs[row]
+        if lane == 0:
+            for row in range_constexpr(ROWS):
+                fx.ptr_store(outputs[row], c["ol"] + token * HEAD_DIM + row0 + row)
+            fx.ptr_store(square_sum, c["head_onrm"] + token * STATE_CHUNKS + wave)
+        token = token + fx.Int32(1)
     gpu.barrier()
 
 
@@ -490,38 +597,53 @@ def kda_head(c, request, head):
             c["slots"] + tid,
         )
 
+    projected = _scratch_region(c, "proj")
+    threads = c["matrix_threads"]
     n_fa = L * HEAD_DIM
-    fa_rounds = (n_fa + c["matrix_threads"] - 1) // c["matrix_threads"]
-    for iteration in range_constexpr(fa_rounds):
-        raw = tid + c["matrix_threads"] * iteration
-        index = fx.min(raw, n_fa - 1)
-        value = mailbox_poll_device(
-            _scratch_region(c, "proj"),
-            (request * L + index // HEAD_DIM) * NPROJ
-            + FA_0
-            + index % HEAD_DIM,
-            c["tag"],
-        )
-        if raw < n_fa:
-            fx.ptr_store(_f32_of(value), c["fa"] + index)
-    if tid < L:
-        beta = _f32_of(
-            mailbox_poll_device(
-                _scratch_region(c, "proj"),
-                (request * L + tid) * NPROJ + BETA_0 + head,
-                c["tag"],
+    fa_rounds = (n_fa + threads - 1) // threads
+    channels = 3 * HEAD_DIM
+    channel_rounds = (channels + threads - 1) // threads
+    fa_raw = [tid + threads * iteration for iteration in range_constexpr(fa_rounds)]
+    fa_index = [fx.min(raw, n_fa - 1) for raw in fa_raw]
+    channel_raw = [
+        tid + threads * round_index for round_index in range_constexpr(channel_rounds)
+    ]
+    channel_of = [
+        (fx.min(raw, channels - 1) // HEAD_DIM) * PROJ
+        + head * HEAD_DIM
+        + fx.min(raw, channels - 1) % HEAD_DIM
+        for raw in channel_raw
+    ]
+    # Clamped indices keep every polled pair a published one; each value is
+    # stored below only by the thread that owns it.
+    polled = mailbox_poll_many_device(
+        [
+            (
+                projected,
+                (request * L + index // HEAD_DIM) * NPROJ + FA_0 + index % HEAD_DIM,
             )
-        )
+            for index in fa_index
+        ]
+        + [(projected, (request * L + fx.min(tid, L - 1)) * NPROJ + BETA_0 + head)]
+        + [
+            (projected, (request * L + token) * NPROJ + channel)
+            for channel in channel_of
+            for token in range_constexpr(L)
+        ],
+        c["tag"],
+    )
+    for iteration in range_constexpr(fa_rounds):
+        if fa_raw[iteration] < n_fa:
+            fx.ptr_store(_f32_of(polled[iteration]), c["fa"] + fa_index[iteration])
+    if tid < L:
+        beta = _f32_of(polled[fa_rounds])
         fx.ptr_store(
             fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(-beta * LOG2E)),
             c["beta"] + tid,
         )
 
-    channels = 3 * HEAD_DIM
-    for round_index in range_constexpr(
-        (channels + c["matrix_threads"] - 1) // c["matrix_threads"]
-    ):
-        raw = tid + c["matrix_threads"] * round_index
+    for round_index in range_constexpr(channel_rounds):
+        raw = channel_raw[round_index]
         local_channel = fx.min(raw, channels - 1)
         part = local_channel // HEAD_DIM
         column = local_channel % HEAD_DIM
@@ -547,13 +669,7 @@ def kda_head(c, request, head):
             for tap in range(3)
         ]
         new_values = [
-            _f32_of(
-                mailbox_poll_device(
-                    _scratch_region(c, "proj"),
-                    (request * L + token) * NPROJ + channel,
-                    c["tag"],
-                )
-            )
+            _f32_of(polled[fa_rounds + 1 + round_index * L + token])
             for token in range(L)
         ]
         if (raw < channels) & (slot_c >= 0):
@@ -616,17 +732,9 @@ def kda_head(c, request, head):
     gpu.barrier()
 
     metadata["slot0"] = slot0
-    vloc = c["vloc"]
-    output = c["ol"]
     c["head_onrm"] = c["head_onrm_lds"]
-    for chunk in range_constexpr(STATE_CHUNKS):
-        c["vloc"] = vloc + chunk * VALUE_CHUNK
-        c["ol"] = output + chunk * VALUE_CHUNK
-        state_loads(c, metadata, head, chunk)
-        kda_recur(c, metadata, request, head, chunk)
-    c["ol"] = output
+    kda_recur_head(c, metadata, request, head)
     kda_head_norm(c, request, head)
-    c["vloc"], c["ol"] = vloc, output
 
 
 @traced

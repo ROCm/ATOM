@@ -460,7 +460,7 @@ def role_lds_plan(
         "projection",
         _fields(("xl", tile_rows * xrow * 2)),
     )
-    state_width = HEAD_DIM if qlen == 1 else VALUE_CHUNK
+    state_width = HEAD_DIM
     recurrence = RoleLdsVariant(
         "recurrence",
         _fields(

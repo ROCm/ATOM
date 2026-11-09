@@ -742,7 +742,10 @@ def build_resident_k1(
             },
         }
         first = _task_start(bid, spec.kda0, declaration.blocks)
-        if const_expr(qlen == 1):
+        # A chunk task spreads one request/head over eight CTAs; once those
+        # tasks need more than one pass of the grid, a whole head per CTA is
+        # faster.
+        if const_expr(qlen == 1 or task_count > declaration.blocks):
             head_tasks = (s // qlen) * HEADS
             for task in range(first, head_tasks, declaration.blocks):
                 request = task // HEADS
