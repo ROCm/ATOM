@@ -117,14 +117,13 @@ def restrict_to_candidates_reference(logits, candidates, visible, block_size, ti
 
 
 def _maxima_lanes(rows):
-    """Programs per row for `_block_maxima_kernel`, about 2048 in the grid.
+    """Programs per row for `_block_maxima_kernel`, about 16384 in the grid.
 
-    A tile is one load and one max, so extra lanes have little latency to hide
-    and an idle one is pure launch cost: the grid wants to fill the machine
-    once and no more. Within about 10% of the best lane count from 6 to 8191
-    rows and 2k to 256k context.
+    A tile is one load and one max, so a program has little latency of its
+    own to hide: the grid needs enough of them in flight to keep the loads
+    coming, and an idle one is pure launch cost.
     """
-    return min(256, max(1, 2048 // max(rows, 1)))
+    return min(256, max(1, 16384 // max(rows, 1)))
 
 
 @triton.jit(do_not_specialize=["lanes"])
@@ -186,7 +185,7 @@ def _block_maxima_kernel(
         tl.store(ends + row, last)
 
 
-def pick_candidate_blocks(logits, visible, block_size, out, tile=64):
+def pick_candidate_blocks(logits, visible, block_size, out, tile=128):
     """Write the best blocks per row into `out`, ascending, `-1` padded.
 
     `out` is as wide as the count to keep. A block's score is its best visible
@@ -222,7 +221,7 @@ def pick_candidate_blocks_packed(
     block_size,
     out,
     plane_width,
-    tile=64,
+    tile=128,
 ):
     """`pick_candidate_blocks` on packed logits (`ScoreWorkspace`): row r's at
     `offsets[r]` of the flat `logits`, its block maxima to `block_offsets[r]`
