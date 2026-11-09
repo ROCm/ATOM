@@ -802,6 +802,7 @@ class BlockGPUConnector:
         if not memory_objs:
             return None
         state = self._thread_state()
+        state.begin_transfer()
         chunks = self._iter_transfer_chunks(memory_objs, block_id_groups, starts, ends)
         if not chunks:
             return None
