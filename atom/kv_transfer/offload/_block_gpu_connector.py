@@ -655,6 +655,8 @@ class BlockGPUConnector:
         directions; the returned owner must survive the pipeline's final or
         recovery fence.
         """
+        # Pin the stream: the runner can switch compute streams concurrently.
+        pack_stream = state.pack_stream
         prepare = getattr(self.codec, "prepare_block_id_groups", None)
         prepared_call = (
             getattr(self.codec, f"{method_name}_prepared", None)
@@ -664,9 +666,9 @@ class BlockGPUConnector:
         if not callable(prepared_call):
             return (
                 _PipelineStage(
-                    state.pack_stream,
+                    pack_stream,
                     lambda group, buf: getattr(self.codec, method_name)(
-                        buf, self._group_block_ids(group), stream=state.pack_stream
+                        buf, self._group_block_ids(group), stream=pack_stream
                     ),
                 ),
                 None,
@@ -680,7 +682,7 @@ class BlockGPUConnector:
         owner = prepare(
             [self._group_block_ids(group) for group in groups],
             device=self.device,
-            stream=state.pack_stream,
+            stream=pack_stream,
         )
         stats = getattr(self._tls, "active_transfer_stats", None)
         if stats is not None:
@@ -691,9 +693,9 @@ class BlockGPUConnector:
             )
         return (
             _PipelineStage(
-                state.pack_stream,
+                pack_stream,
                 lambda group, buf: prepared_call(
-                    buf, owner, group_indices[id(group)], stream=state.pack_stream
+                    buf, owner, group_indices[id(group)], stream=pack_stream
                 ),
             ),
             owner,
@@ -948,7 +950,7 @@ class BlockGPUConnector:
                     state, groups, "gpu_to_chunk_major_device_buffer"
                 )
             )
-            copy_stream = state.pack_stream if _SINGLE_STREAM else state.copy_stream
+            copy_stream = pack_stage.stream if _SINGLE_STREAM else state.copy_stream
             self._run_staged_pipeline(
                 state,
                 groups,
@@ -985,7 +987,7 @@ class BlockGPUConnector:
                     state, groups, "chunk_major_device_buffer_to_gpu"
                 )
             )
-            copy_stream = state.pack_stream if _SINGLE_STREAM else state.copy_stream
+            copy_stream = pack_stage.stream if _SINGLE_STREAM else state.copy_stream
             self._run_staged_pipeline(
                 state,
                 groups,

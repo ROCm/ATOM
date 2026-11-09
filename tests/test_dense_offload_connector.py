@@ -1448,3 +1448,42 @@ def test_dense_request_finished_releases_the_failed_load_mark(monkeypatch):
 
     sched.request_finished(seq)
     assert sched._load_failed_seqs == {}
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize(
+    "method", ["gpu_to_chunk_major_device_buffer", "chunk_major_device_buffer_to_gpu"]
+)
+def test_block_id_stage_pins_stream_when_runner_switches(prepared, method):
+    stream_a, stream_b = object(), object()
+    state = SimpleNamespace(pack_stream=stream_a)
+    calls = []
+    owner = SimpleNamespace(group_count=1, upload_count=1)
+
+    def prepare(groups, *, device, stream):
+        assert stream is stream_a
+        state.pack_stream = stream_b
+        return owner
+
+    def run(*args, stream):
+        calls.append(stream)
+
+    codec = SimpleNamespace(**{method: run})
+    if prepared:
+        codec.prepare_block_id_groups = prepare
+        setattr(codec, method + "_prepared", run)
+    connector = object.__new__(BlockGPUConnector)
+    connector.codec = codec
+    connector.device = "cuda:0"
+    connector._tls = threading.local()
+    connector._assert_fused_chunk_major_available = lambda: None
+    group = SimpleNamespace(chunks=[SimpleNamespace(block_ids=[1])])
+    stage, retained_owner, enabled = connector._prepare_block_id_stage(
+        state, [group], method
+    )
+    state.pack_stream = stream_b
+    stage.run(group, object())
+    assert stage.stream is stream_a
+    assert calls == [stream_a]
+    assert enabled is prepared
+    assert retained_owner is (owner if prepared else None)
