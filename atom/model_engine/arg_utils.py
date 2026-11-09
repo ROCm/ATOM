@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass, fields
 
 from atom import LLMEngine
+from atom.aiter_provider import normalize_provider_names
 from atom.config import (
     CompilationConfig,
     CUDAGraphMode,
@@ -183,6 +184,12 @@ class EngineArgs:
     dspark_config: dict | None = None
     gemm_fusion_profile: str | None = None
     gemm_fusion_check_period: int | None = None
+    # Comma-separated aiter provider names, order = preference order. Parsed to
+    # the Config tuple in `_get_engine_kwargs()`; empty (default) = OFF.
+    aiter_provider_enable: str = ""
+    # Mode-B call site: route MiniMax-M3 SP4 QKV+norm/RoPE/cache through the
+    # neutral aiter `sp_qkv_fused` op. Unsupported layers/deployments keep native.
+    enable_sp_qkv_fused: bool = False
 
     eplb_enable: bool = False
     eplb_config: dict | None = None
@@ -750,6 +757,29 @@ class EngineArgs:
             ),
         )
         parser.add_argument(
+            "--aiter-provider-enable",
+            type=str,
+            default="",
+            help=(
+                "Comma-separated aiter kernel Provider names to enable, in preference "
+                "order (aiter.plugin.configure(enable=...)). Unset/empty (default) is "
+                "OFF: ATOM never calls configure() and every routed op runs native. "
+                "A missing provider interface or provider error falls back to native "
+                "with a warning; AITER_PLUGINS=0 is aiter's own kill switch."
+            ),
+        )
+        parser.add_argument(
+            "--enable-sp-qkv-fused",
+            action="store_true",
+            help=(
+                "Call the neutral aiter `sp_qkv_fused` routed op for MiniMax-M3 SP4 "
+                "attention (QKV GEMM + SP exchange + head norm/RoPE + KV/index cache "
+                "as one op). Requires --aiter-provider-enable with a provider that "
+                "serves the op; every unsupported layer/deployment keeps the current "
+                "native composition, and the flag is OFF by default."
+            ),
+        )
+        parser.add_argument(
             "--dspark-config",
             type=json.loads,
             default=None,
@@ -932,6 +962,11 @@ class EngineArgs:
         if check_period is not None:
             gemm_fusion_kwargs["check_period"] = check_period
         kwargs["gemm_fusion"] = GemmFusionConfig(**gemm_fusion_kwargs)
+        # --aiter-provider-enable (comma list) -> Config tuple; parsed here so the
+        # raw CLI string never reaches the pickled Config.
+        kwargs["aiter_provider_enable"] = normalize_provider_names(
+            kwargs.pop("aiter_provider_enable", "")
+        )
         # --eplb-config (JSON dict) → EPLBConfig object (--eplb-enable
         # is the master switch, --eplb-config only tunes it).
         kwargs["eplb_config"] = EPLBConfig.from_dict(kwargs.pop("eplb_config"))

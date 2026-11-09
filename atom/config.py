@@ -14,6 +14,10 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.aiter_provider import normalize_provider_names
+
+# The provider-enable name normalizer lives with the enable call so the Config
+# value, CLI/env parsing and the `configure()` argument share one definition.
 from atom.model_loader.weight_utils import (
     checkpoint_layer_key,
     unquantized_layer_keys,
@@ -2187,6 +2191,17 @@ class Config:
     dspark: DSparkConfig = field(default_factory=DSparkConfig)
     # GEMM-fusion switch. Default OFF (empty profile): behavior is unchanged.
     gemm_fusion: GemmFusionConfig = field(default_factory=GemmFusionConfig)
+    # Out-of-tree aiter kernel providers to enable, in preference order
+    # (aiter.plugin.configure(enable=...)). Empty = OFF and ATOM never calls
+    # configure(); this tuple is pickled into every spawned worker. Normalized
+    # in __post_init__ (ATOM_AITER_PROVIDER_ENABLE is the operator override).
+    aiter_provider_enable: tuple[str, ...] = ()
+    # Opt-in call site for the neutral `sp_qkv_fused` routed op (MiniMax-M3 SP4
+    # QKV + SP exchange + norm/RoPE/cache as one aiter op). Default OFF keeps the
+    # existing composition byte-identical. Requires aiter_provider_enable to name
+    # a provider that serves the op; the per-layer matrix is checked in
+    # atom/model_ops/sp_qkv_fused.py before anything is bound.
+    enable_sp_qkv_fused: bool = False
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
@@ -2405,6 +2420,13 @@ class Config:
 
     def __post_init__(self):
         self.m3_tp_replicated_o_proj = envs.ATOM_M3_TP_REPLICATED_O_PROJ
+        # AITER provider enable list: programmatic tuple/CLI string, with the
+        # ATOM_AITER_PROVIDER_ENABLE deployment override read ONCE here (the env
+        # registry is lazy; workers receive the normalized tuple through spawn).
+        raw_providers = self.aiter_provider_enable or envs.ATOM_AITER_PROVIDER_ENABLE
+        self.aiter_provider_enable = normalize_provider_names(raw_providers)
+        if not isinstance(self.enable_sp_qkv_fused, bool):
+            raise TypeError("enable_sp_qkv_fused must be a bool")
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
         self.moe_all2all_backend = (
@@ -3093,6 +3115,16 @@ class Config:
             # and changes its schema; never share artifacts with the OFF path.
             # Appended only when ON so OFF hashes stay byte-identical.
             factors.append(("gemm_fusion", gemm_fusion.profile))
+        # AITER provider enabling changes which kernel runs under an existing
+        # signature (mode A) and the `enable_sp_qkv_fused` call site moves the
+        # QKV GEMM into one routed op with a different output schema (mode B).
+        # Both are graph-changing; key them only when on so the default OFF
+        # hash (and every existing compile-cache artifact) is unchanged.
+        provider_enable = tuple(getattr(self, "aiter_provider_enable", ()) or ())
+        if provider_enable:
+            factors.append(("aiter_providers", provider_enable))
+        if getattr(self, "enable_sp_qkv_fused", False):
+            factors.append("sp_qkv_fused_v1")
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

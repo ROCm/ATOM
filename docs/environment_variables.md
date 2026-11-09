@@ -140,6 +140,27 @@ cannot affect a server that does not use the feature.
 | **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
 | **ATOM_V4_CG_INSTR_DIR** | str | — (off) | vLLM plugin, DeepSeek-V4 diagnostic: directory for per-process cudagraph dispatch counters (dispatched modes, steps whose uniform decode was overridden for a still-prefilling row, guard trips), one `cg_<pid>.json` per process, rewritten on every step. |
 
+## aiter kernel providers
+
+ATOM can enable out-of-tree AITER kernel Providers (the `aiter.plugin` interface
+stack). Enablement is opt-in and off by default: ATOM makes one
+`aiter.plugin.configure(source="atom <version>", enable=[...])` call per worker
+process before model loading/warm-up/CUDA-graph capture, and never raises when
+the interface or a provider is missing — the routed ops then run AITER's native
+path. `AITER_PLUGINS=0` is AITER's own kill switch (the only environment control;
+it can only turn routing off and records no decision), and ATOM does not manage
+that variable.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_AITER_PROVIDER_ENABLE** | str | unset (off) | Comma-separated AITER Provider names, in preference order; the operator/deployment override for `--aiter-provider-enable` / `Config.aiter_provider_enable`. Empty or unset means off (ATOM does not call `configure()`). A provider that does not serve an op, an API-version mismatch or a missing routed op falls back to native with a warning. |
+
+The mode-B call site flag is the CLI-only `--enable-sp-qkv-fused`
+(`Config.enable_sp_qkv_fused`, default off): it routes MiniMax-M3 SP4 QKV +
+exchange + norm/RoPE/cache through the neutral `sp_qkv_fused` op when that op is
+present in the installed AITER and the layer's deployment matrix is supported;
+every other layer keeps the current native composition.
+
 ## Kernel / backend selection
 
 | Variable | Type | Default | Description |

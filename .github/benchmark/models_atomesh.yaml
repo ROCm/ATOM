@@ -1557,10 +1557,13 @@ models:
         cudagraph: &minimax_decode_cudagraph_256 >-
           [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
     suites:
-      # Opt-in route-A / T=65536 cell: aggregated single server, SP4, GEMM fusion on.
-      # No scheduled or manual run selects this suite name today (the runners iterate
-      # nightly / weekly / smoke / accuracy), so existing cells are unchanged. Schedule
-      # it only with the route-A aiter build (18-bit r19 large tag) deployed.
+      # Opt-in route-A / T=65536 cell: aggregated single server, SP4. This PR's
+      # active path for the 16K band is the existing ATOM gemm-fusion hook path
+      # (18-bit r19 large tag + `--gemm-fusion-profile`); the neutral sp_qkv_fused
+      # provider path takes over once aiter's Phase-2 post-exchange native
+      # prologue lands. No scheduled or manual run selects this suite name today
+      # (the runners iterate nightly / weekly / smoke / accuracy), so existing
+      # cells are unchanged.
       route_a_16k:
         - name: minimax-m3-mxfp4-agg-sp4-16k-route-a
           topology: agg

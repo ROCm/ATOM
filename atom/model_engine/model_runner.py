@@ -766,6 +766,17 @@ class ModelRunner:
         self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)
 
+        # aiter kernel providers: opt-in, one configure() per worker process,
+        # after device/distributed state is up and before the model is built /
+        # loaded / warmed / captured. aiter snapshots config+discovery at the
+        # first dispatch, so a later hook would silently serve native; every
+        # spawned worker is its own interpreter and must configure here.
+        # Default off: configure_aiter_providers() returns without calling
+        # aiter.plugin.configure(), so the native path is unchanged.
+        from atom.aiter_provider import configure_aiter_providers
+
+        configure_aiter_providers(self.config)
+
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
         # `ForwardMode.decide` searches. Separate from the list because the list
@@ -835,6 +846,17 @@ class ModelRunner:
             logger.info(
                 "gemm_fusion: installed fused QKV+attention on %d layers",
                 n_fused_layers,
+            )
+        if getattr(config, "enable_sp_qkv_fused", False):
+            # Mode-B call site: neutral aiter `sp_qkv_fused` routed op. Installed
+            # after weight loading and before warm-up/compile/capture; unsupported
+            # layers keep the native composition (bind() logs why once).
+            from atom.model_ops.sp_qkv_fused import install_m3 as install_sp_qkv_fused
+
+            n_sp_qkv = install_sp_qkv_fused(self.model, self.config)
+            logger.info(
+                "sp_qkv_fused: installed the routed QKV prologue on %d layers",
+                n_sp_qkv,
             )
 
         # Optional debug instrumentation; no-op when env vars unset.

@@ -905,6 +905,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
     ),
+    # --- aiter kernel providers ---
+    # Operator/deployment override for Config.aiter_provider_enable. Comma-separated
+    # provider names, order = preference order; unset/empty = ATOM's default (off).
+    # Read once while Config is built; the enable call itself is aiter.plugin.configure().
+    "ATOM_AITER_PROVIDER_ENABLE": lambda: os.getenv(
+        "ATOM_AITER_PROVIDER_ENABLE", ""
+    ).strip(),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
@@ -1345,6 +1352,10 @@ def __getattr__(name: str):
 # MASTER_ADDR, MASTER_PORT        — PyTorch distributed; set in model_runner.py
 # AITER_LOG_LEVEL                 — AITER library log verbosity
 # AITER_QUICK_REDUCE_QUANTIZATION — AITER; set conditionally in model_runner.py
+# AITER_PLUGINS                   — AITER provider interface kill switch; the only
+#                                    env control for aiter kernel providers and it can
+#                                    only turn routing OFF (no Decision recorded).
+#                                    ATOM does not manage it.
 # TORCHINDUCTOR_CACHE_DIR         — PyTorch Inductor; set in compiler_inferface.py
 # TRITON_CACHE_DIR                — Triton compiler; set in compiler_inferface.py
 # HF_TOKEN                        — HuggingFace Hub auth token
