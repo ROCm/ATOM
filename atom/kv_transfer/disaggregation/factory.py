@@ -97,6 +97,7 @@ class KVConnectorFactory:
     # Whether a backend is a KV offload tier, whose scheduler half rewrites the
     # completion sets it is handed (`process_completions`). Absent means no.
     _offload: ClassVar[dict[str, bool]] = {}
+    _min_load_tokens: ClassVar[dict[str, int | None]] = {}
     # Whether a backend's tier is one store every DP rank reads (an LMCache MP
     # server, Mooncake Store), not one per rank. Absent means per rank.
     _shared_tier: ClassVar[dict[str, bool]] = {}
@@ -118,6 +119,7 @@ class KVConnectorFactory:
         copies_whole_block_regions: bool = False,
         requires_pd_staging: bool = True,
         offload: bool = False,
+        min_load_tokens: int | None = None,
         shared_tier: bool = False,
         chunk_tokens: str | None = None,
     ) -> None:
@@ -168,6 +170,7 @@ class KVConnectorFactory:
             )
         cls._copies_whole_block_regions[name] = bool(copies_whole_block_regions)
         cls._offload[name] = bool(offload)
+        cls._min_load_tokens[name] = min_load_tokens
         cls._shared_tier[name] = bool(shared_tier)
         if chunk_tokens:
             cls._chunk_tokens[name] = chunk_tokens

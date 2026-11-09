@@ -2379,7 +2379,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 lmc,
                 seq.offload_loaded_tokens,
                 need,
-                int(getattr(self, "_min_load_tokens", 8192)),
+                int(self._min_load_tokens),
                 len(list(seq.block_table)),
             )
             loading_sids.add(sid)
