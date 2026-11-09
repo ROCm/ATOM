@@ -662,41 +662,53 @@ def _bf16_round(value):
 
 @traced
 def kda_recur(c, k, req, head, chunk):
-    """Run two serial state rows per wave32 with 32-lane reductions."""
+    """Run a wave32's two state rows over the tokens with 32-lane reductions.
+
+    The rows are independent recurrences over the same q/k/decay, so one
+    token loop advances both and their reduction chains overlap."""
 
     L, tid, lane = c["L"], c["tid"], c["lane"]
     args = c["args"]
     live = k["slot0"] >= 0
-    for row_index in range_constexpr(2):
-        state_row = c["wave"] + c["matrix_waves"] * row_index
-        head_offset = (
-            (head * GATE_K + chunk * ROWS + state_row) * GATE_K + lane * 4
-        )
-        state = [
-            live.select(k["states"][row_index][element], fx.Float32(0.0))
+    rows = [c["wave"] + c["matrix_waves"] * row_index for row_index in range(2)]
+    head_offsets = [
+        (head * GATE_K + chunk * ROWS + state_row) * GATE_K + lane * 4
+        for state_row in rows
+    ]
+    state = [
+        live.select(k["states"][row_index][element], fx.Float32(0.0))
+        for row_index in range(2)
+        for element in range(4)
+    ]
+    column = lane * 4
+    token = fx.Int32(0)
+    while token < L:
+        q = [
+            fx.ptr_load(c["qkl"] + (2 * token) * GATE_K + column + element)
             for element in range(4)
         ]
-        column = lane * 4
-        token = fx.Int32(0)
-        while token < L:
-            q = [
-                fx.ptr_load(c["qkl"] + (2 * token) * GATE_K + column + element)
+        key = [
+            fx.ptr_load(c["qkl"] + (2 * token + 1) * GATE_K + column + element)
+            for element in range(4)
+        ]
+        decay = [
+            fx.ptr_load(c["decay"] + token * GATE_K + column + element)
+            for element in range(4)
+        ]
+        beta = fx.ptr_load(c["beta"] + token)
+        slot = fx.ptr_load(c["slots"] + token)
+        updated = []
+        outputs = []
+        for row_index in range_constexpr(2):
+            row_state = [
+                state[4 * row_index + element] * decay[element]
                 for element in range(4)
             ]
-            key = [
-                fx.ptr_load(c["qkl"] + (2 * token + 1) * GATE_K + column + element)
-                for element in range(4)
-            ]
-            decay = [
-                fx.ptr_load(c["decay"] + token * GATE_K + column + element)
-                for element in range(4)
-            ]
-            state = [state[element] * decay[element] for element in range(4)]
             projection = (
-                state[0] * key[0]
-                + state[1] * key[1]
-                + state[2] * key[2]
-                + state[3] * key[3]
+                row_state[0] * key[0]
+                + row_state[1] * key[1]
+                + row_state[2] * key[2]
+                + row_state[3] * key[3]
             )
             projection = butterfly(
                 projection,
@@ -704,11 +716,16 @@ def kda_recur(c, k, req, head, chunk):
                 architecture=GFX1250,
             )
             value = (
-                fx.ptr_load(c["vloc"] + token * ROWS + state_row) - projection
-            ) * fx.ptr_load(c["beta"] + token)
-            state = [state[element] + value * key[element] for element in range(4)]
+                fx.ptr_load(c["vloc"] + token * ROWS + rows[row_index]) - projection
+            ) * beta
+            row_state = [
+                row_state[element] + value * key[element] for element in range(4)
+            ]
             output = (
-                state[0] * q[0] + state[1] * q[1] + state[2] * q[2] + state[3] * q[3]
+                row_state[0] * q[0]
+                + row_state[1] * q[1]
+                + row_state[2] * q[2]
+                + row_state[3] * q[3]
             )
             output = _bf16_round(
                 butterfly(
@@ -717,20 +734,27 @@ def kda_recur(c, k, req, head, chunk):
                     architecture=GFX1250,
                 )
             )
-            output = live.select(output, fx.Float32(0.0))
-            slot = fx.ptr_load(c["slots"] + token)
-            if (slot >= 0) & live:
-                destination = rsrc(
-                    args["rstate"] + fx.Int64(slot) * fx.Int64(args["rs_seq"]) * 4
-                )
+            updated.extend(row_state)
+            outputs.append(live.select(output, fx.Float32(0.0)))
+        state = updated
+        if (slot >= 0) & live:
+            destination = rsrc(
+                args["rstate"] + fx.Int64(slot) * fx.Int64(args["rs_seq"]) * 4
+            )
+            for row_index in range_constexpr(2):
                 bo.buffer_store(
-                    fx.Vector.from_elements(state, fx.Float32),
+                    fx.Vector.from_elements(
+                        state[4 * row_index : 4 * row_index + 4], fx.Float32
+                    ),
                     destination,
-                    head_offset,
+                    head_offsets[row_index],
                 )
-            if lane == 0:
-                fx.ptr_store(output, c["ol"] + token * ROWS + state_row)
-            token = token + fx.Int32(1)
+        if lane == 0:
+            for row_index in range_constexpr(2):
+                fx.ptr_store(
+                    outputs[row_index], c["ol"] + token * ROWS + rows[row_index]
+                )
+        token = token + fx.Int32(1)
     gpu.barrier()
     if tid < L:
         square_sum = fx.Float32(0.0)
