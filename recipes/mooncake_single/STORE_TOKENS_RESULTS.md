@@ -46,10 +46,23 @@ branch defaults; main is session-affinity routing with HBM prefix caching only.
 No stall of 5 s or more in any arm. Store usage at the end: 190 GB of 512 GB (DP4),
 97 GB of 256 GB (DP2); no capacity pressure.
 
-Reading: throughput is unchanged and ITL moves by about 1-2% (within the
-run-to-run noise of 3% measured on repeats). The tail improves at both scales
-(p99 -24% at DP2, -61% at DP4) and the whole distribution improves at DP2. At
-DP4 the median is 50% higher and the mean only 6% lower; the 900 s DP4 runs
+A longer DP2 run of the same pair (3600 s, `OFFLOAD_PROFILE=0`, 512 GB Store):
+
+| | 128 concurrency, DP2, 3600 s |
+|---|---|
+| Completed requests, main / Store | 15223 / 15410 |
+| Output throughput (tok/s) | 4007.4 -> 4044.4 (**+0.9%**) |
+| TTFT mean / p50 / p90 / p99 (ms) | 2028 / 925 / 4654 / 12957 -> 1380 / 999 / 2622 / 6889 (**-31.9% / +7.9% / -43.7% / -46.8%**) |
+| ITL (ms) | 14.77 -> 14.97 (**+1.4%**) |
+
+Reading: throughput is unchanged. The tail improves at both scales (p99 -24% to
+-47% at DP2, -61% at DP4) and the whole distribution improves at DP2 except the
+median (+7% to +8%). **ITL is slightly worse than main: +1.4% (DP2, 1800 s and
+3600 s) to +1.9% (DP4), with p99 ITL 11-13% higher.** A same-time test of
+`OFFLOAD_PROFILE` (the benchmark harness had it on for the 1800 s rows) shows it
+is not the cause: +2.4% with it on, +2.3% off. Step traces show Store decode
+steps about 1-2 ms slower (median 25-26 ms against 23-24 ms); about 0.4 ms of it
+is scheduler CPU in the engine core, the rest has not been located. At DP4 the median is 50% higher and the mean only 6% lower; the 900 s DP4 runs
 below (median +32%, mean -17%) were better than this 1800 s run, cause not
 identified.
 
