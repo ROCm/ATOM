@@ -16791,6 +16791,41 @@ models:
             common:
               <<: *m31_s65822_env
               ATOMESH_M31_P_EXTRA_ARGS: --long-prefill-token-threshold 4096
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c40-dcap10-lpt4k
+          concurrency: [40]
+          env:
+            common:
+              <<: *m31_s65822_env
+              ATOMESH_M31_D_MAX_SEQS: "10"
+              ATOMESH_M31_P_EXTRA_ARGS: --long-prefill-token-threshold 4096
+        - <<: *m31_moriio_1p2d_n4fab_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-n4fab-c96-dcap16-cpu19-nodbo-lpt4k
+          concurrency: [96]
+          env:
+            common:
+              <<: *m31_n4fab_env
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1900000000000"
+              ATOMESH_M31_P_DBO: "0"
+              ATOMESH_M31_P_EXTRA_ARGS: --long-prefill-token-threshold 4096
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c112-dcap20-cpu19-lpt4k
+          concurrency: [112]
+          env:
+            common:
+              <<: *m31_s65822_env
+              ATOMESH_M31_D_MAX_SEQS: "20"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1900000000000"
+              ATOMESH_M31_P_EXTRA_ARGS: --long-prefill-token-threshold 4096
+        - <<: *m31_moriio_1p2d_s65822_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c128-dcap24-cpu22-lpt4k
+          concurrency: [128]
+          env:
+            common:
+              <<: *m31_s65822_env
+              ATOMESH_M31_D_MAX_SEQS: "24"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "2200000000000"
+              ATOMESH_M31_P_EXTRA_ARGS: --long-prefill-token-threshold 4096
         # Higher interactivity at a TTFT p90 of about 2 s: caps 3-5 at C36-C56 cost 8-20 s.
         - <<: *m31_moriio_1p2d_s65822_case
           name: m31-flash-vllm-moriio-rdma-1p2d-s65822-c40-dcap6
