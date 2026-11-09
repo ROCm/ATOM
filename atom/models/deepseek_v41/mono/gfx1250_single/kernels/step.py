@@ -32,6 +32,7 @@ from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int64
 
 import device as hx
+import layout as LY
 import front as FS
 import moe as MS
 import tail as ST
@@ -47,9 +48,9 @@ from attention import (CL, CTAS, KWOA, NWOA, QL, THREADS, handoff, i64, pf_rows,
 
 DRAFT_NE, DRAFT_TOPK = 128, 3
 DSPARK_W = 5          # the DSpark block width: a build's draft requests = its draft rows // 5
-TENTRY_ROW = 44       # the layer-table row of the target entry's attention front (tables.StepTables: after 40 + 3 layers and the draft entry)
+TENTRY_ROW = LY.TARGET_ENTRY_ROW       # the layer-table row of the target entry's attention front (tables.StepTables: after 40 + 3 layers and the draft entry)
 
-FRONT_LDS_OFF = 4096                # keep the TP payload ([TR][20] f32 at LDS 0) intact
+FRONT_LDS_OFF = LY.FRONT_LDS                # keep the TP payload ([TR][20] f32 at LDS 0) intact
 FPTRS = ['R', 'y', 'pre', 'post', 'comb', 'fnh', 'fnl', 'hsc', 'hbs', 'nw', 'gate', 'gbias', 'Rout', 'xn', 'fx8', 'fxs', 'part', 'plog', 'cand', 'cands', 'npre', 'npost', 'ncomb', 'ids', 'wts', 'mplane', 'mroute', 'mout', 'mid8', 'midc', 'afnh', 'afnl', 'ahsc', 'ahbs', 'anw', 'aRout', 'axn', 'anpre', 'anpost', 'ancomb', 'tp2out', 'cyc', 'y1', 'y2', 'shplane', 'kmeta', 'knsel', 'ksel', 'kvw', 'rpos', 'iq', 'iwp', 'iq_out', 'iqs_out', 'iw_out', 'xh', 'cpart', 'ilvl', 'aux8', 'auxs', 'tpep', 'kmeta_d', 'kvw_d', 'rpos_d', 'dR', 'dy', 'dpre', 'dpost', 'dcomb', 'emb', 'noise', 'x8', 'xs', 'ctxtab', 'dgeom', 'tids', 'eng8', 'engs', 'engkv', 'engpart']   # the step's pointers, in a device table (kernel arg `fp`):
 # as ~30 more kernel args they pushed SGPRs into spills and a 64-bit VGPR spill whose ~45 scratch reloads each waited,
 # by the in-order loadcnt, for every outstanding load of the stage they sat in
@@ -58,8 +59,8 @@ ATAB = ("x8 xs wqkv wqkv_s qnw kvnw wqb wqb_s kv sel sink rcos rsin woa woa_s wo
 LKEYS = ("wqkv wqkv_s wqb wqb_s woa woa_s wob wob_s qnw kvnw sink fnh fnl hsc hbs nw gate gbias "
          "afnh afnl ahsc ahbs anw mplane rcos rsin shplane ksel knsel kring lflags iqw iqws iww cwkv cnw cape cwk cknw cplan wplan ccap wcap cmain crpp cprow cplane ckv cscore cstate btab bstride slots ibat ibound iplane irpp ilog ilw isel irow imain ibmax icand engw engws enggw engemb").split()   # ksel/knsel: the layer's topk owner's selection; kring: ring start row   # rcos/rsin: this layer's RoPE row table (window or global, by the layer's ratio)   # a*: the attention front at the END of layer Ly = layer Ly+1's weights (host fills)
 RECV_HALF = 16 * 40960 * 16 + (2 << 20)   # bytes a parity half of a receive buffer (TP regions + tail)
-RKOFF = 294912        # LDS: the residual streams kept between the fronts
-LCB = 256             # (+ 128..255: the TP1 / TP2 column-group counters, gpub / gwait)  # bytes of handoff counters a layer (16: the indexer layers' extra phases use 4, 44.., 60)
+RKOFF = LY.RKEEP        # LDS: the residual streams kept between the fronts
+LCB = LY.LAYER_BYTES             # (+ 128..255: the TP1 / TP2 column-group counters, gpub / gwait)  # bytes of handoff counters a layer (16: the indexer layers' extra phases use 4, 44.., 60)
 IDX_LEVELS = 2        # selection-tree levels (1: bound <= 8192 index rows; 2: <= 8192 x 16 -- the 64K-token ILW)
 IPF_KB = 32           # instruction prefetch (KB) before the fronts / the MoE
 FPF_SPLIT = True      # (front prefetch layout; the step build does not prefetch the front weights)
@@ -213,7 +214,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                 CX.stage_block_state(dict(t=t, b=b, aid=fptr(fp, "tids"), emb=fptr(fp, "emb"), noise=fptr(fp, "noise"),
                                           R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"),
                                           comb=fptr(fp, "dcomb")), TR, 1)
-                handoff(TCNT + i64(432), t, False)
+                handoff(TCNT + i64(LY.TARGET_STATE), t, False)
                 if b < FS.FRONT_CTAS:
                     nof = fx.Int32(0) != fx.Int32(0)
                     tq = hx.opaque_v(fx.thread_idx.x)
@@ -228,7 +229,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                               ids=fptr(fp, "ids"), wts=fptr(fp, "wts"), isffn=nof, xs32=fx.Int32(1) != fx.Int32(0), merge=nof,
                               rk=sm + RKOFF, first=fx.Int32(1) != fx.Int32(0), last=nof)
                     FS.front_any(cu, lambda k: None)
-                handoff(TCNT + i64(448), t, False)
+                handoff(TCNT + i64(LY.TARGET_FRONT), t, False)
             TRx = TRD if DRS else TR
             Lx = LD if DRS else L
             DSUF = "_d" if DRS else ""
@@ -252,7 +253,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                 CX.stage_block_state(dict(t=t, b=b, aid=ST.tptr(tp, "anc"), emb=fptr(fp, "emb"), noise=fptr(fp, "noise"),
                                           R=fptr(fp, "dR"), y=fptr(fp, "dy"), pre=fptr(fp, "dpre"), post=fptr(fp, "dpost"),
                                           comb=fptr(fp, "dcomb")), TRD // DSPARK_W, DSPARK_W)
-                handoff(TCNT + i64(400), t, False)
+                handoff(TCNT + i64(LY.DRAFT_STATE), t, False)
                 if b < FS.FRONT_CTAS:
                     _rt = (FS.NE, FS.TOPK)
                     FS.set_router(DRAFT_NE, DRAFT_TOPK)
@@ -269,7 +270,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                               rk=sm + RKOFF, first=fx.Int32(1) != fx.Int32(0), last=nof)
                     FS.front_any(cu, lambda k: None)
                     FS.set_router(*_rt)
-                handoff(TCNT + i64(416), t, False)
+                handoff(TCNT + i64(LY.DRAFT_FRONT), t, False)
                 _shape = (FS.NE, FS.TOPK, MS.TOPK)
                 FS.set_router(DRAFT_NE, DRAFT_TOPK)
                 MS.TOPK = DRAFT_TOPK
@@ -316,7 +317,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                 stage_A(c)
                 pf_rows(c["wqb"] + i64(b) * (16 * QL), QL, 16, QL, t)
                 pf_rows(c["wqb"] + i64(b + CTAS) * (16 * QL), QL, 16, QL, t)
-                handoff(lc, t, True)
+                handoff(lc, t, True)   # LY.ATTN_A (offset 0)
                 if fx.const_expr((kind & 1) != 0):   # the next layer's Engram kv = emb . wkv^T (read by this layer's attention front)
                     if (ltab(fp, Ly, "lflags")() & fx.Int64(128)) != fx.Int64(0):
                         ES.stage_engkv(cwith(c, eng8=fptr(fp, "eng8"), engs=fptr(fp, "engs"), engw=ltab(fp, Ly, "engw")(),
@@ -335,7 +336,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                         r1 = (lfl & fx.Int64(4)) != fx.Int64(0)
                         if hascomp:   # the compressor's wkv_gate GEMM (compressor)
                             CS.stage_cgemm(cwith(c, cwkv=ltab(fp, Ly, "cwkv")(), axn=fptr(fp, "axn"), cpart=fptr(fp, "cpart")), r1)
-                handoff(lc + i64(8), t, True)
+                handoff(lc + i64(LY.KV_C), t, True)
                 if fx.const_expr((kind & 1) != 0):   # iquant, then its own handoff (the scorer reads iq_out / iw_out; lc + 4 is free)
                     if isidx:
                         IS.stage_iquant(cwith(c, iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), iq_out=fptr(fp, "iq_out"),
@@ -351,7 +352,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                                        bstride=fx.Int32(ltab(fp, Ly, "bstride")()), slots=ltab(fp, Ly, "slots")())
                             CS.stage_crow(cc, r1b)
                             CS.stage_cring(cc, r1b)
-                        handoff(lc + i64(4), t, True)
+                        handoff(lc + i64(LY.INDEX_QUANT), t, True)
                         if ltab(fp, Ly, "ibat")() != fx.Int64(0):   # a layer whose table has no scorer inputs skips it
                             # FULL: the scores of every visible index row, then the top-512 -> isel / irow (the attention's ksel)
                             cs_ = cwith(c, ibat=ltab(fp, Ly, "ibat")(), ibound=ltab(fp, Ly, "ibound")(), iplane=ltab(fp, Ly, "iplane")(),
@@ -366,24 +367,24 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                                         ts=None)
                             # one instance of the scorer (FULL and REINDEX, isrx traced) and of the selection code for every pass (I-cache)
                             SC.stage_score_any(cs_, isrx)
-                            handoff(lc + i64(48), t, True)
+                            handoff(lc + i64(LY.SCORE), t, True)
                             npass = isrx.select(fx.Int32(IDX_LEVELS), cs_["iprod"].select(fx.Int32(2 * IDX_LEVELS), fx.Int32(IDX_LEVELS)))
                             for pi in range(npass):   # sel or rx levels, then (layer 20) the blk levels
                                 pmode = isrx.select(fx.Int32(TK.MODE_RX), (pi < IDX_LEVELS).select(fx.Int32(TK.MODE_SEL), fx.Int32(TK.MODE_BLK)))
                                 plev = pi % IDX_LEVELS
                                 TK.stage_select_any(cwith(cs_, ts=None), plev, IDX_LEVELS, pmode)
-                                handoff(lc + i64(52) + i64(pi) * 4, t, True)
+                                handoff(lc + i64(LY.SELECT0) + i64(pi) * 4, t, True)
                 stage_D(c)
                 pf_rows(c["woa"] + i64(b // 4) * (32 * KWOA) + i64((b % 4) * 1024), KWOA, 32, 1024, t)
-                handoff(lc + i64(12), t, True)
+                handoff(lc + i64(LY.ATTN_D), t, True)
                 stage_E(c)
                 pf_rows(c["wob"] + i64(b // 4) * (80 * NWOA) + i64((b % 4) * 512), NWOA, 80, 512, t)
-                handoff(lc + i64(16), t, True)
+                handoff(lc + i64(LY.ATTN_E), t, True)
                 stage_F_cluster(c)
                 gpu.barrier()
                 par = Ly % 2
                 tp_allreduce(cwith(c, ytgt=fptr(fp, 'y1')), par * 2, 2 * Ly + 1)
-                gpub(lc + i64(128), b, t)
+                gpub(lc + i64(LY.TP1_GROUPS), b, t)
                 # the two fronts with one copy of the code: pass 0 = FFN front, MoE, TP2; pass 1 = attention front
                 for hf in range(hx.opaque_s(fx.Int32(2))):
                     if hf == 0:
@@ -392,7 +393,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                     # it waits for their column-group count, not a device-wide handoff (the idle CTAs do not wait at all;
                     # CT16 11-08 fixture Zipf 48 rows 151.3 -> 150.1 us)
                     if b < FS.FRONT_CTAS:
-                        gwait(lc + (hf == 0).select(i64(128), i64(192)), b, t)
+                        gwait(lc + (hf == 0).select(i64(LY.TP1_GROUPS), i64(LY.TP2_GROUPS)), b, t)
                     if b < FS.FRONT_CTAS:
                         isf = hf == 0
 
@@ -428,7 +429,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                                     hx.wait_storecnt0()
                                     gpu.barrier()
                                     if tq == 0:
-                                        hx.atomic_add(lc + i64(92), 1)
+                                        hx.atomic_add(lc + i64(LY.X8_PUB), 1)
                         FS.front_any(cu, x8pub)
                     if fx.const_expr(MS.sh_early((TRx + MS.MAXTOK - 1) // MS.MAXTOK)):
                         # the FFN front's idle CTAs: the shared expert's UG, K split over SHE_CTAS CTAs a unit, once every front
@@ -437,7 +438,7 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                             tq3 = hx.opaque_v(fx.thread_idx.x)
                             if tq3 == 0:
                                 t0 = hx.clock()
-                                while (hx.gload(lc + i64(92), fx.Int32, scope="agent") < FS.FRONT_CTAS) & (hx.clock() - t0 < fx.Int64(200000000)):
+                                while (hx.gload(lc + i64(LY.X8_PUB), fx.Int32, scope="agent") < FS.FRONT_CTAS) & (hx.clock() - t0 < fx.Int64(200000000)):
                                     hx.s_sleep(1)
                                 hx.note_timeout(t0, 6)
                             gpu.barrier()
@@ -447,21 +448,21 @@ def build(TR, rank, NL=40, ndr=3, trd=None, part="all"):
                             MS.ug_shared_early(ce, b - FS.FRONT_CTAS)
                     if hf == 0:
                         iprefetch(16)   # the routed MoE
-                        handoff(lc + i64(24), t, True)
+                        handoff(lc + i64(LY.FRONT), t, True)
                         mfx8, mfxs, mwts, mout, mid8, midc = [fptr(fp, k) for k in ("fx8", "fxs", "wts", "mout", "mid8", "midc")]
                         tq2 = hx.opaque_v(fx.thread_idx.x)
                         cm = LazyC({'shplane': (lambda Ly=Ly: ltab(fp, Ly, 'shplane')())},   # (re-read at its uses: not live across the layer)
                                    t=tq2, b=b, w=tq2 // 32, l=tq2 % 32, sm=sm + FRONT_LDS_OFF, NP=TRx * MS.TOPK, nexp_max=96,
                                    plane=ltab(fp, Ly, "mplane")(), x8=mfx8, xs=mfxs, ids=fptr(fp, ('mroute' if (not DRS and os.environ.get('MROUTE_FIXED') == '1') else 'ids')), wts=mwts, out=mout,
-                                   mid8=mid8, midc=midc, shcnt=lc + i64(44))
-                        MS.moe(cm, lc + i64(40))
+                                   mid8=mid8, midc=midc, shcnt=lc + i64(LY.SHARED_DOWN))
+                        MS.moe(cm, lc + i64(LY.MOE_UG))
                         gpu.barrier()
-                        handoff(lc + i64(20), t, True)
+                        handoff(lc + i64(LY.MOE_DONE), t, True)
                         # TP2 payload = the MoE output rows, result -> y2 (the attention front's y)
                         MS.moe_combine(dict(t=hx.opaque_v(fx.thread_idx.x), b=b, out=fptr(fp, "mout")), TRx, sm)
                         tp_allreduce(cwith(c, tpout=fptr(fp, "tp2out"), ytgt=fptr(fp, "y2")), par * 2 + 1, 2 * Ly + 2)
-                        gpub(lc + i64(192), b, t)
-                handoff(lc + i64(28), t, True)
+                        gpub(lc + i64(LY.TP2_GROUPS), b, t)
+                handoff(lc + i64(LY.LAYER_END), t, True)
                 if fx.const_expr((kind & 1) != 0):   # the target body: the draft context taps (read before the next front rewrites aRout)
                     if (ltab(fp, Ly, "lflags")() & fx.Int64(16)) != fx.Int64(0):
                         tap0 = NL - 4

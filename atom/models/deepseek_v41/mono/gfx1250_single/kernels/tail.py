@@ -26,6 +26,7 @@ import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
 import device as hx
+import layout as LY
 import head as HF
 import sample_common as SF
 import sample as SPF
@@ -72,17 +73,17 @@ def _ctxp(ctx, t, b, T):   # (plain python) the draft context KV's 4 stages, run
 @ASTRewriter.transform
 def target(tp, t, b, sm, st, tc, recv, rank, stamps=True, head_d=4, ctx=None, T=None):
     P = {k: tptr(tp, k) for k in ('xh', 'hw', 'logits', 's0', 's1', 's2', 's3', 'sids', 'dids', 'outtok', 'verdict', 'anc')}
-    handoff(tc, t, False)
+    handoff(tc, t, False)   # LY.HEAD (offset 0)
     HF.head_once_r(P['xh'], P['hw'], P['logits'], t, t % 32, t // 32, sm, b, head_d, 2, 4)
-    handoff(tc + i64(16), t, False)
+    handoff(tc + i64(LY.HEAD_DONE), t, False)
     _stamp(st, b, t, 19, stamps)
     # sampling + verification in one (outtok / verdict / anc written by CTA 0 after its last handoff)
-    SPF.sample_once_p(P['logits'], P['s0'], P['s1'], P['s2'], P['s3'], P['sids'], tc + i64(64), t, b, sm, HF.VR,
+    SPF.sample_once_p(P['logits'], P['s0'], P['s1'], P['s2'], P['s3'], P['sids'], tc + i64(LY.SAMPLE), t, b, sm, HF.VR,
                       [r + i64(SOFF) for r in recv], rank, 1, tptr(tp, 'sparam'), tptr(tp, 'qlog'), P['dids'],
                       tptr(tp, 'prow'), P['outtok'], P['verdict'], P['anc'], tptr(tp, 'qids'),
                       ctxp=_ctxp(ctx, t, b, T))
     _stamp(st, b, t, 20, stamps)
-    handoff(tc + i64(160), t, False)
+    handoff(tc + i64(LY.VERIFY_DONE), t, False)
     _stamp(st, b, t, 21, stamps)
 
 
@@ -90,8 +91,8 @@ def target(tp, t, b, sm, st, tc, recv, rank, stamps=True, head_d=4, ctx=None, T=
 def draft(tp, t, b, sm, st, tc, recv, rank, stamps=True, head_d=4):
     P = {k: tptr(tp, k) for k in ('hw', 'anc', 'dh', 'dlog', 'mw1', 'mw2', 'mids', 'memb', 'mbest')}
     HF.head_once_r(P['dh'], P['hw'], P['dlog'], t, t % 32, t // 32, sm, b, head_d, 2, 4)
-    handoff(tc + i64(176), t, False)
+    handoff(tc + i64(LY.DRAFT_HEAD_DONE), t, False)
     _stamp(st, b, t, 22, stamps)
-    MPF.markov_once(P['dlog'], P['anc'], P['mw1'], P['mw2'], P['mids'], P['memb'], P['mbest'], tc + i64(192),
+    MPF.markov_once(P['dlog'], P['anc'], P['mw1'], P['mw2'], P['mids'], P['memb'], P['mbest'], tc + i64(LY.MARKOV),
                     [r + i64(SOFF2) for r in recv], rank, 101, t, b, sm, tptr(tp, 'sparam'), tptr(tp, 'qlog'), tptr(tp, 'qids'))
     _stamp(st, b, t, 24, stamps)
