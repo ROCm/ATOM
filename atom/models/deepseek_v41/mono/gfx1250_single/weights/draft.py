@@ -29,7 +29,7 @@ def _gather_rows(shard: torch.Tensor, group) -> torch.Tensor:
 
 
 def _tile_head(w: torch.Tensor) -> torch.Tensor:
-    """``[V/tp][H]`` bf16 -> the head kernel's ``[V/16][H/32][2][16][16]`` (head_fly: a 16-row vocab tile, its K in
+    """``[V/tp][H]`` bf16 -> the head kernel's ``[V/16][H/32][2][16][16]`` (head: a 16-row vocab tile, its K in
     32-col groups of two 16-col halves, each 16 rows x 16 cols)."""
     v, h = w.shape
     return w.view(v // 16, 16, h // 32, 2, 16).permute(0, 2, 3, 1, 4).contiguous()

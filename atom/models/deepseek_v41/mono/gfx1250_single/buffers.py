@@ -2,9 +2,9 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Every pointer the step kernel reads, by its table, and who provides it.
 
-The kernel takes four pointer tables (``layer4l_step_fly``): ``fp`` (FPTRS, the FFN / step buffers, then ATAB, then one
-row of LKEYS a layer -- the target's, the draft stages', and the draft entry's row), ``tp`` (``step_tail_ct3.TPTRS``:
-head, sampling, verify, draft head, Markov) and the context-KV table (``ctx_stages.CTPTRS``, its address in ``fp``).
+The kernel takes four pointer tables (``step``): ``fp`` (FPTRS, the FFN / step buffers, then ATAB, then one
+row of LKEYS a layer -- the target's, the draft stages', and the draft entry's row), ``tp`` (``tail.TPTRS``:
+head, sampling, verify, draft head, Markov) and the context-KV table (``draft_ctx.CTPTRS``, its address in ``fp``).
 Each name is one of:
 
 - ``SCRATCH``: owned by the runner, allocated once at the widest step (``T_MAX`` rows), never read across steps but
@@ -102,7 +102,7 @@ FPTRS_ROLE = {
     "ctxtab": SCRATCH,  # the context-KV pointer table (filled by the runner)
     "dgeom": STEP,  # the draft metadata's geometry and the requests' slots (DRAFT_META_DEV)
     "tids": STEP,  # this step's input ids (TARGET_ENTRY)
-    # Engram (engram_stages): the step's embedding rows as MXFP8, their kv projection, the gate's partial sums
+    # Engram (engram): the step's embedding rows as MXFP8, their kv projection, the gate's partial sums
     "eng8": SCRATCH,
     "engs": SCRATCH,
     "engkv": SCRATCH,
@@ -151,7 +151,7 @@ ATAB_ROLE = {
     "recv3": PEER,
 }
 
-# tp table (step_tail_ct3.TPTRS)
+# tp table (tail.TPTRS)
 TPTRS_ROLE = {
     "xh": SCRATCH,
     "hw": WEIGHT,  # the LM head's rank shard, in the head kernel's tile order
@@ -179,7 +179,7 @@ TPTRS_ROLE = {
     "qids": STATE,  # [8][5] i32: the drafts qlog was kept for (-1 at start)
 }
 
-# context-KV table (ctx_stages.CTPTRS)
+# context-KV table (draft_ctx.CTPTRS)
 CTPTRS_ROLE = {
     "aux8": SCRATCH,
     "auxs": SCRATCH,
@@ -215,11 +215,11 @@ BCOLS = 4096  # block-table columns a request (16-token pages: 64K tokens)
 
 
 def scratch_bytes(K, nlt: int) -> dict[str, int]:
-    """Bytes of every SCRATCH buffer at the widest step; ``K``: the kernel modules (attn_stages, ffn_stages,
-    moe_stages, head_fly, sample4r_fly, layer4l_step_fly), as the runner imported them; ``nlt``: target + draft layers.
+    """Bytes of every SCRATCH buffer at the widest step; ``K``: the kernel modules (attention, front,
+    moe, head, sample_common, step), as the runner imported them; ``nlt``: target + draft layers.
     """
-    S, FS, MS, HF = K["attn_stages"], K["ffn_stages"], K["moe_stages"], K["head_fly"]
-    M = K["layer4l_step_fly"]
+    S, FS, MS, HF = K["attention"], K["front"], K["moe"], K["head"]
+    M = K["step"]
     T, H = T_MAX, FS.H
     QV = S.smem_layout(T)["QV"]
     G = FS.NG * FS.CL * FS.TG
@@ -282,9 +282,9 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         "iq_out": T * 4096,
         "iqs_out": T * 32 * 4,
         "iw_out": T * 32 * 4,
-        "cpart": 8 * T * 1024 * 4,  # the compressor's wkv_gate K-split partials (comp_stages.stage_cgemm)
+        "cpart": 8 * T * 1024 * 4,  # the compressor's wkv_gate K-split partials (compressor.stage_cgemm)
         # the selection tree (M.IDX_LEVELS levels): a level's lists of (value, index) pairs a row, a level-0 list per
-        # 8192 index rows of the bound (ILW), k a list -- 2048 for layer 20's candidate blocks (topk_stages "blk": also
+        # 8192 index rows of the bound (ILW), k a list -- 2048 for layer 20's candidate blocks (topk "blk": also
         # its dummy-row store, row T, lands there), 512 otherwise
         "ilvl": M.IDX_LEVELS * (T + 1) * (-(-ILW // 8192) * 2048) * 8 + 64,
         "aux8": T * 15360,
@@ -301,7 +301,7 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         # step tail
         "xh": T * HF.HID * 2,
         "logits": T * HF.VR * 4,
-        "s0": T * 5 * 24,  # sample4p_fly records
+        "s0": T * 5 * 24,  # sample records
         "s1": T * 5 * 256 * 4,
         "s2": T * 5 * 256 * 4,
         "s3": T * 5 * 20,
@@ -329,7 +329,7 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
 
 def check_catalog(K) -> list[str]:
     """Names the kernel's tables hold that this catalog does not classify (empty when in sync)."""
-    M, ST, CX = K["layer4l_step_fly"], K["step_tail_ct3"], K["ctx_stages"]
+    M, ST, CX = K["step"], K["tail"], K["draft_ctx"]
     miss = [f"FPTRS {n}" for n in M.FPTRS if n not in FPTRS_ROLE]
     miss += [f"ATAB {n}" for n in M.ATAB if n not in ATAB_ROLE]
     miss += [f"TPTRS {n}" for n in ST.TPTRS if n not in TPTRS_ROLE]

@@ -364,7 +364,7 @@ class RunnerDebug:
                     ov.append(len(a & b) / max(len(a), len(b), 1))
                 out[name] = (sum(ov) / len(ov), min(ov))
             # the pool rows the attention reads: page(btab[request][col // irpp]) * cprow + imain + col % irpp
-            L = self.K["layer4l_step_fly"].LKEYS
+            L = self.K["step"].LKEYS
             irpp, imain, cprow = (T_.rows[Ly][L.index(k)] for k in ("irpp", "imain", "cprow"))
             bt = step.block_tables.long().cpu()
             req = step.batch_ids[:rows].long().cpu().clamp_min(0)
@@ -419,7 +419,7 @@ class RunnerDebug:
         if not parts and hasattr(self.base, "head"):   # the head input: what the logits make of the difference
             lg = self.base.head.get_logits(got.to(torch.bfloat16)).float()
             lr = self.base.head.get_logits(ref.to(torch.bfloat16)).float()
-            # the kernel's own head (head_fly over its rank's vocab shard): its logits against the same columns of lg,
+            # the kernel's own head (head over its rank's vocab shard): its logits against the same columns of lg,
             # and its global argmax (the ranks' (max, index) gathered) against its sampled ids
             n = lg.shape[0]
             vr = self.scratch["logits"].numel() // 4 // buffers.T_MAX

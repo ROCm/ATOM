@@ -5,8 +5,8 @@ run_layer4l_step_fly.py ``fptab`` / ``tp`` / ``ctxtab``), from the loaded model:
 
 - ``fp``: FPTRS, then ATAB, then one LKEYS row a layer: the 40 target layers, the 3 draft stages, the draft entry's row
   (its a* = draft stage 0's attention front);
-- ``tp``: ``step_tail_ct3.TPTRS`` (head, sampling, verify, draft head, Markov);
-- ``ctxtab``: ``ctx_stages.CTPTRS`` (the draft context KV), its address in ``fp`` (FPTRS ``ctxtab``).
+- ``tp``: ``tail.TPTRS`` (head, sampling, verify, draft head, Markov);
+- ``ctxtab``: ``draft_ctx.CTPTRS`` (the draft context KV), its address in ``fp`` (FPTRS ``ctxtab``).
 
 Every pointer is the address of a tensor this object keeps (``self.keep``). The STEP entries (``buffers.STEP``: step
 metadata, input ids, the cache pool, the RoPE rows) get owned, graph-static buffers here (``self.step``) that the runner
@@ -39,7 +39,7 @@ def _plane(prefix):
 
 class StepTables:
     def __init__(self, K, model, drafter, scratch, recv, rank, tp_group):
-        M, ST, CX = K["layer4l_step_fly"], K["step_tail_ct3"], K["ctx_stages"]
+        M, ST, CX = K["step"], K["tail"], K["draft_ctx"]
         dev = next(iter(scratch.values())).device
         self.keep = []
         target = [_find(model, f"layers.{i}") for i in range(NL)]
@@ -70,12 +70,12 @@ class StepTables:
             "ctx_rcos": torch.zeros(T * 32, dtype=torch.float32, device=dev),
             "ctx_rsin": torch.zeros(T * 32, dtype=torch.float32, device=dev),
             "tids": z32(T),  # this step's input ids (TARGET_ENTRY embeds them)
-            "sparam": _sparam_default(T, dev),  # each target row's sampling (sample4p_fly.SPW words: ``_sparam_default``)
+            "sparam": _sparam_default(T, dev),  # each target row's sampling (sample.SPW words: ``_sparam_default``)
             "dgeom": z32(64),  # window, slot_rows, ring_slots, num_slots, -, -, -, -, then the requests' slots (DRAFT_META_DEV)
         }
         # STATE (buffers.STATE): the prob drafter's q of the last kernel step, read by the next step's verification
         self.state = {
-            "qlog": torch.zeros(8 * 5 * K["markov_prob_fly"].VR, dtype=torch.float32, device=dev),
+            "qlog": torch.zeros(8 * 5 * K["markov"].VR, dtype=torch.float32, device=dev),
             "qids": z32(8 * 5, -1),
         }
         self.pool = self.dummy  # cache.pool, bound by bind_pool
@@ -105,7 +105,7 @@ class StepTables:
                                      iww=ix.weights_proj.weight.data.to(torch.bfloat16).contiguous())
             self.keep.append(self.idx_w)
             # the same layers' compressor -- this step's compressed main KV row, index row and ring entries, which the
-            # attention and the scorer of later rows of the step read (comp_stages)
+            # attention and the scorer of later rows of the step read (compressor)
             self.comp = True
             if self.comp:
                 self.step.update(cplan1=z32(T * 4, -1), cplan2=z32(T * 4, -1), wplan1=z32(T * 4, -1), wplan2=z32(T * 4, -1),
@@ -312,7 +312,7 @@ class StepTables:
 
 
 def _sparam_default(rows, dev):
-    """[rows][8] 32 B a row (sample4p_fly.SPW): invT f32, top_p f32, seed i32, greedy i32 | invTd f32, hasq i32,
+    """[rows][8] 32 B a row (sample.SPW): invT f32, top_p f32, seed i32, greedy i32 | invTd f32, hasq i32,
     qsrc i32, seed_acc i32 -- greedy rows (argmax, no q) until ``runner._sampling`` fills them."""
     sp = torch.zeros(rows, 8, dtype=torch.float32, device=dev)
     sp[:, 0], sp[:, 1], sp[:, 4] = 1.0, 1.0, 1.0

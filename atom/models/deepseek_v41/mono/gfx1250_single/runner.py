@@ -10,7 +10,7 @@ What ``ModelRunner`` asks of it on a served step (``ModelRunner._single_step``):
 - ``draft_ids(bs)``: the next step's draft tokens, as ``Drafter.propose`` returns them.
 
 Construction (collective over the TP group, ``LazyRunner``): the kernel modules (``kernels/``: the whole step is
-``kernels.layer4l_step_fly``), the scratch (``buffers.scratch_bytes``, once at the widest step),
+``kernels.step``), the scratch (``buffers.scratch_bytes``, once at the widest step),
 the peer receive buffers (``SymmetricPeerBuffer``), the routed-expert planes (``planes.PLANES``). The weight tables
 and the step metadata (``buffers``: WEIGHT / STEP) are not bound yet, so construction still refuses at its end and
 ``LazyRunner`` keeps the production path."""
@@ -55,7 +55,7 @@ def _base_model(model):
 
 KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
 # the receive regions: 4 TP regions x 4 sources x 40960 16-byte words, the sampling and Markov exchange after them
-# (step_tail_ct3 SOFF / SOFF2), 2 MB-rounded, doubled for the step epoch
+# (tail SOFF / SOFF2), 2 MB-rounded, doubled for the step epoch
 # the recipe's draft temperature scale (dspark_prob_sample.DRAFT_TSCALE): q = softmax(z * invT / TSCALE)
 DRAFT_TSCALE = float(os.environ.get("ATOM_DSPARK_PROB_DRAFT_TSCALE", "1.0"))
 RECV_BYTES = 2 * (
@@ -64,21 +64,21 @@ RECV_BYTES = 2 * (
 
 
 def import_kernels() -> dict:
-    """The kernel modules (this package's kernels/: the whole step is layer4l_step_fly)."""
+    """The kernel modules (this package's kernels/: the whole step is step)."""
     if KERNELS not in sys.path:
         sys.path.insert(0, KERNELS)
     names = (
-        "hx",
-        "attn_stages",
-        "ffn_stages",
-        "moe_stages",
-        "ctx_stages",
-        "head_fly",
-        "sample4r_fly",
-        "sample4p_fly",
-        "markov_prob_fly",
-        "step_tail_ct3",
-        "layer4l_step_fly",
+        "device",
+        "attention",
+        "front",
+        "moe",
+        "draft_ctx",
+        "head",
+        "sample_common",
+        "sample",
+        "markov",
+        "tail",
+        "step",
     )
     return {n: importlib.import_module(n) for n in names}
 
@@ -102,7 +102,7 @@ class SingleStepRunner(RunnerDebug):
                 f"step kernel import: {type(err).__name__}: {err}"
             ) from err
         # the kernel's ring slots (window + block width) and pool row width (bf16 elements) are compile-time constants
-        AS = self.K["attn_stages"]
+        AS = self.K["attention"]
         if int(window.ring_slots) != AS.KG_RING:
             raise MonoUnsupported(f"window ring {window.ring_slots} slots (the step kernel's: {AS.KG_RING})")
         miss = buffers.check_catalog(self.K)
@@ -188,7 +188,7 @@ class SingleStepRunner(RunnerDebug):
         if rows % 6 or not 0 < rows <= buffers.T_MAX:
             return False
         if rows not in self.builds:
-            M = self.K["layer4l_step_fly"]
+            M = self.K["step"]
             nl = self.shadow_layers
             kw = dict(NL=nl, ndr=NDR if nl == NL else 0, trd=rows // 6 * 5)
             # two launches: target .. verification, then the draft (the host reads the verdict between)
@@ -555,7 +555,7 @@ class SingleStepRunner(RunnerDebug):
 
     def verify_outputs(self, bs: int):
         """``(output_token_ids [bs, 6] int32, -1 past the emitted tokens; verdict [3, bs] int32: accepted drafts,
-        rejected drafts, anchor row)`` -- the kernel's verify (step_tail_ct3), copied out of the scratch the next launch
+        rejected drafts, anchor row)`` -- the kernel's verify (tail), copied out of the scratch the next launch
         rewrites: on a side stream right after the first launch, so the host's wait for them (the step's output D2H,
         ``verify_ready``) overlaps the draft launch; the caller's stream waits for the copies."""
         cur = torch.cuda.current_stream()

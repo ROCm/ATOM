@@ -63,7 +63,7 @@ def attention(block) -> dict[str, torch.Tensor]:
     out = {}
     for name, src in ATTN_SRC.items():
         out[name], out[name + "_s"] = _fp8_rows(getattr(attn, src), name)
-    # qnw padded to the whole qkv row (1792): attn_stages' C epilogue loads qnw[col] for every column, the kv ones too,
+    # qnw padded to the whole qkv row (1792): attention' C epilogue loads qnw[col] for every column, the kv ones too,
     # before it selects (a page past 1280 floats may be unmapped -- the 11-07 memory fault)
     qnw = attn.q_norm.weight.data.float()
     out["qnw"] = torch.zeros(QKV_ROW, dtype=torch.float32, device=qnw.device)
