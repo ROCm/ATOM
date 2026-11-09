@@ -5,9 +5,10 @@ view. Select a model, source and workload, then switch between P90 Interactivity
 and P90 Normalized Interactivity. The vertical axis is total input + output
 throughput across all participating GPUs, in tok/s.
 
-The chart toolbar shows the CI run for the peak-throughput point. Selecting a
-point updates that link and reveals its configuration details. The measurement
-table also displays explicit CI run numbers and links.
+The chart uses solid Pareto lines, inline series labels and a dashed ring around
+the selected point. The side panel shows its measurements and CI run, initially
+for the peak-throughput point. Selecting another point updates the panel without
+covering the chart. The measurement table also displays CI run numbers and links.
 
 ## CI data
 
@@ -50,6 +51,38 @@ Optional local measurements can be supplied with `--points path/to/results.json`
 schema. Add `source_label` to distinguish local results and `run_url` to retain
 their original run links. No sample data files are bundled with the dashboard.
 
+## Import a sweep
+
+Import the `agg_bmk.json` array produced by InferenceX's `results_bmk` artifact
+directly, without rewriting it into the dashboard's point schema:
+
+```sh
+python tools/preview_benchmark_dashboard.py --sweep path/to/agg_bmk.json --run-url https://github.com/OWNER/REPO/actions/runs/RUN_ID
+```
+
+Replace the path and URL with the downloaded artifact and its original run.
+If every record already contains `run_url`, the flag is optional. The importer
+preserves `run_attempt` in each link and rejects conflicting run IDs or attempts.
+Open the printed URL to select the imported model and sweep automatically.
+The Source dropdown switches between that sweep and published ATOM CI results;
+results from different runs/attempts stay in separate sources.
+
+This importer supports ATOM AgentX records (`atom`, `atom-disagg`, `atomesh`)
+with `request_metrics`. Other engines in mixed sweeps are skipped. It retains
+recipe fingerprints, model, hardware, precision, concurrency, GPU counts and
+the following measured fields:
+
+| Dashboard value | Sweep field |
+| --- | --- |
+| P90 Interactivity | `request_metrics.latency.intvty.p90` |
+| P90 Normalized Interactivity | `request_metrics.latency.e2e_norm_intvty.p90` |
+| Total throughput | `request_metrics.throughput.total.tokens_per_second` |
+
+Total throughput is not the `per_gpu` value. Missing P90 measurements remain
+unavailable; rounded latency or mean values are never substituted. Imported
+results stay in the temporary preview directory. This does not configure PR
+triggers or publish sweep artifacts to the hosted dashboard.
+
 ## Validation
 
 ```sh
@@ -58,6 +91,7 @@ python tests/test_dashboard_explorer.py
 
 Checks cover CI payload parsing, latest-publication selection, preserving
 distinct recipes, P90 definitions, Pareto ties and dominance, JavaScript syntax,
-CI-only preview and safe local-data embedding. Browser verification also checks
+CI-only preview, sweep metric mapping, run provenance and safe local-data
+embedding. Browser verification also checks
 source values, Pareto filtering, CI run links, model and axis switching, URL
 state, exports, themes, narrow screens and the existing tabs.
