@@ -93,13 +93,15 @@ def _builder(
     builder.block_size, builder.device = 32, "cuda"
     builder.max_bs, builder.max_num_batched_tokens = _CAPACITY, max_tokens
     buffers = metadata_buffers(_CAPACITY, max_tokens, 1, "cuda", geometry)
-    for name in ("positions", "batch_id_per_q_token"):
-        buffers[name].publication_group = "v41_step"
-    buffers["cu_seqlens_q"].publication_group = "early"
-    buffers["block_tables"].publication_group = "prefill"
+    buffers["positions"].publication_group = "v41_step"
+    for name in ("cu_seqlens_q", "batch_id_per_q_token"):
+        buffers[name].publication_group = "early"
+    buffers["block_tables"].publication_group = "seq_metadata"
     assert all(buffer.cpu.is_pinned() for buffer in buffers.values())
     builder.model_runner = SimpleNamespace(
-        forward_vars=buffers, v41_graphs_enabled=True
+        forward_vars=buffers,
+        v41_graphs_enabled=True,
+        config=SimpleNamespace(enable_tbo=False),
     )
     builder.engram = None
     return builder
@@ -709,7 +711,7 @@ def test_profile_to_serving_full_graph_rebinds_real_engram_and_cache(
                 prepared = returned.atom_v41_prepared
                 step = prepared.metadata.step
                 assert returned.atom_v41_snapshot.full_graph and step.decode
-                assert step.scheduled == count < step.width == total
+                assert step.scheduled_tokens == count < step.running_tokens == total
                 assert [span.slot for span in step.requests] == list(slots)
                 assert step.tentative == bool(speculative_tokens)
                 assert staging.step.cursor.data_ptr() == cache.cursor.data_ptr()
@@ -882,7 +884,8 @@ def test_plugin_publication_owner_waits_before_pinned_source_overwrite():
         buffer.cpu.fill_(22)  # only AFTER begin waited for the old source reader
 
         torch.cuda._sleep(100_000_000)
-        groups["v4_plans"].publish((8,))
+        groups["v4_plans"].set_count(buffer, 8)
+        groups["v4_plans"].publish()
         observations[1].copy_(buffer.gpu)
         read_done[1].record()
         owner.finish()
@@ -890,7 +893,8 @@ def test_plugin_publication_owner_waits_before_pinned_source_overwrite():
         owner.begin()
         assert read_done[1].query(), "begin returned before the previous epoch H2D read"
         buffer.cpu.fill_(33)
-        groups["v4_plans"].publish((8,))
+        groups["v4_plans"].set_count(buffer, 8)
+        groups["v4_plans"].publish()
         observations[2].copy_(buffer.gpu)
         owner.finish()
         owner.completion.synchronize()
@@ -1006,5 +1010,10 @@ def test_decode_indptr_oracle_matches_live_metadata(packed, width):
     step = _prepare(builder, [3, 7], slots=(3, 1), pages=(2, 4), width=width)
     builder.cache.indptrs(step)
     _assert_decode_indptrs(
-        step.indptrs[2][:2], builder.cache.geometry, [3, 7], width, step.width, 2
+        step.indptrs[2][:2],
+        builder.cache.geometry,
+        [3, 7],
+        width,
+        step.running_tokens,
+        2,
     )

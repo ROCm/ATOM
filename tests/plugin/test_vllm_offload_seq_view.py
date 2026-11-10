@@ -93,6 +93,7 @@ def test_preemption_forgets_placement_but_not_what_was_stored():
     view.set_num_cached_tokens(384)
     view.offload_loaded_tokens = 256
     view.offload_handoff_boundary_tokens = 256
+    view._deferred_save_at = 12.5
     view.prefix_hashes_published = True
 
     view.reset_for_preemption()
@@ -101,10 +102,34 @@ def test_preemption_forgets_placement_but_not_what_was_stored():
     assert view.num_cached_tokens == 0
     assert view.offload_loaded_tokens == 0
     assert view.offload_handoff_boundary_tokens == 0
+    assert view._deferred_save_at is None
     assert view.prefix_hashes_published is False
     # Same view: the request keeps its identity, so ATOM's scheduler must not
     # see this as a recycled request id.
     assert reg.get_or_create(req) is view
+
+
+def test_deferred_save_clock_refreshes_on_the_slotted_view():
+    """``_refresh_save_reclaim_clock`` writes ``seq._deferred_save_at``.
+
+    ATOM's ``Sequence`` has a ``__dict__`` and absorbs the write. A slotted
+    view without the slot raises ``AttributeError`` out of the save path, and
+    a clock that is not restarted abandons the copy while the worker is still
+    reading the blocks -- a truncated image under a valid prefix hash.
+    """
+    import time
+
+    from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+
+    view = SeqViewRegistry().get_or_create(_request())
+    parked = time.monotonic() - 1000.0
+    view._deferred_save_at = parked
+
+    OffloadSchedulerMixin._refresh_save_reclaim_clock(
+        SimpleNamespace(_save_lease_at={id(view): parked}), view
+    )
+
+    assert view._deferred_save_at > parked
 
 
 def test_view_accepts_the_frozen_placement_the_chunked_scheduler_writes():
@@ -130,6 +155,9 @@ def test_view_accepts_the_frozen_placement_the_chunked_scheduler_writes():
         _load_lifecycles={},
         _active_load_operations={},
         _load_failed_seqs={},
+        _lookup_defer_since={},
+        _lookup_client=None,
+        _save_retry_blocked={},
         _save_tracker={"r1": [view, 0]},
         _early_release=True,
         should_defer_free=lambda seq: False,
@@ -141,6 +169,10 @@ def test_view_accepts_the_frozen_placement_the_chunked_scheduler_writes():
     )
     scheduler._drop_finished_save_state = (
         ChunkedOffloadSchedulerBase._drop_finished_save_state.__get__(scheduler)
+    )
+    ChunkedOffloadSchedulerBase._init_tier_hit_memo(scheduler)
+    scheduler._forget_tier_hit = ChunkedOffloadSchedulerBase._forget_tier_hit.__get__(
+        scheduler
     )
 
     ChunkedOffloadSchedulerBase.request_finished(scheduler, view)
@@ -300,3 +332,32 @@ def test_view_takes_every_attribute_the_scheduler_the_plugin_builds_writes():
         "SeqView.__slots__; do not delete the assignment -- the native path "
         "reads it back."
     )
+
+
+def test_view_answers_every_attribute_the_chunked_scheduler_reads():
+    """A plain `seq.<name>` the view lacks is an AttributeError inside vLLM's
+    schedule(). `num_tokens` was missing, read only on the detached-lookup
+    path, and the first local-hit request killed the engine."""
+    import ast
+    import inspect
+
+    from atom.kv_transfer.offload import chunked_scheduler
+    from atom.plugin.vllm.kv_transfer.seq_view import SeqView
+
+    tree = ast.parse(inspect.getsource(chunked_scheduler))
+    read = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "seq"
+    }
+    have = set(dir(SeqView)) | set(SeqView.__slots__)
+    assert read - have == set()
+
+
+def test_num_tokens_counts_output_as_atom_does():
+    from atom.plugin.vllm.kv_transfer.seq_view import SeqView
+
+    view = SeqView(SimpleNamespace(prompt_token_ids=[1] * 10, num_tokens=13))
+    assert view.num_tokens == 13

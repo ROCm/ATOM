@@ -46,7 +46,7 @@ def test_csr_resolves_to_causal_main_and_window_rows(
     tables = [[2, 0, 1], [3, 4, 5]]
     slots = [2, 0]
     step = SimpleNamespace(
-        width=7,
+        running_tokens=7,
         max_q_len=4,
         decode=decode,
         positions=tensor(positions).to(position_dtype),

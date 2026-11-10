@@ -4,11 +4,8 @@
 Step-mode throughput has state that only the loop can get wrong: `bump_step`
 must see every forward and `note_idle` / `note_busy` must bracket exactly the
 passes where none ran. Asserting that on an `EngineStats` built by hand proves
-nothing about either loop, and the DP loop in particular has a shape that
-defeats naive wiring -- `engines_running` starts True, so the first pass runs a
-dummy and counts it before the idle branch is ever reachable. A guard keyed on
-the step count would have been dead there and no unit test on `EngineStats`
-could have seen it.
+nothing about either loop: the DP loop runs a dummy on a pass where this rank
+has nothing scheduled but a peer has requests, and that pass is a step.
 
 Executed by AST extraction, so the loops under test are the real ones with no
 torch, aiter or GPU present.
@@ -95,7 +92,6 @@ class _Engine:
             push_metrics=lambda: None,
         )
         self.label = "test"
-        self.engines_running = True
         self._is_rl_weights_offloaded = False
         self._weight_sync_fenced = False
         self.forwards = 0
@@ -170,48 +166,34 @@ BURST_IDLE_BURST = [
 ]
 
 
-@pytest.mark.parametrize(
-    "class_name, origin, work_seconds",
-    # The loops differ by one pass, and legitimately: at 2.0 the base loop has
-    # nothing to run, while the DP loop pads the pass with a dummy for its
-    # peers. A forward ran, so that second is work on one and silence on the
-    # other. Both drop the 600 in the middle.
-    [("EngineCore", 601.0, 3.0), ("DPEngineCoreProc", 600.0, 4.0)],
-)
-def test_a_silent_stretch_is_not_charged_to_the_window(
-    class_name, origin, work_seconds
-):
+@pytest.mark.parametrize("class_name", ["EngineCore", "DPEngineCoreProc"])
+def test_a_silent_stretch_is_not_charged_to_the_window(class_name):
     stats = _run(class_name, BURST_IDLE_BURST).stats
-    assert stats._throughput_last_log_time == pytest.approx(origin)
-    assert 604.0 - stats._throughput_last_log_time == pytest.approx(work_seconds)
+    assert stats._throughput_last_log_time == pytest.approx(601.0)
+    assert 604.0 - stats._throughput_last_log_time == pytest.approx(3.0)
 
 
 @pytest.mark.parametrize("class_name", ["EngineCore", "DPEngineCoreProc"])
 def test_every_pass_with_a_forward_is_counted(class_name):
-    """And no pass without one is.
-
-    The DP loop pads an empty schedule with a dummy and counts that; the base
-    loop has no dummy, so its idle passes count nothing. Both must agree that
-    a silent pass is not a step.
-    """
+    """And no pass without one is."""
     engine = _run(class_name, BURST_IDLE_BURST)
     forwards = engine.forwards + engine.dummies
     assert engine.stats._throughput_steps == forwards
     assert engine.forwards == 4  # the four passes that had work
 
 
-def test_the_dp_loop_reaches_its_idle_branch_with_a_dummy_already_counted():
-    """The shape that makes a step-count guard on the idle path dead.
-
-    `engines_running` is True out of `__init__`, so pass one runs a dummy and
-    counts it; the branch that notices idleness is first reachable on pass two,
-    by which time the counter is non-zero. Idle accounting must not depend on
-    it.
-    """
-    engine = _run("DPEngineCoreProc", [(0.0, IDLE), (1.0, IDLE), (601.0, WORK)])
-    assert engine.dummies == 1  # pass one, before the idle branch was reachable
-    assert engine.stats._throughput_steps == 2  # that dummy, plus pass three
-    assert engine.stats._throughput_last_log_time == pytest.approx(600.0)
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        [(0.0, IDLE), (1.0, IDLE), (601.0, WORK)],  # startup
+        [(0.0, WORK), (1.0, IDLE), (2.0, IDLE)],  # the pass after the last request
+    ],
+)
+def test_the_dp_loop_runs_no_dummy_while_no_rank_has_requests(schedule):
+    """A dummy keeps an idle rank company for a peer's forward; with no
+    request anywhere there is no such forward, on any pass."""
+    engine = _run("DPEngineCoreProc", schedule)
+    assert engine.dummies == 0
 
 
 def test_the_dp_loop_has_no_stalled_state_it_pads_with_a_dummy():

@@ -348,6 +348,10 @@ def test_native_draft_graph_replays_live_requests_queries_and_csr(
         ([1], [0]),
         ([2, 3, 0, 1], [130, -1, 400, 1]),
     ]:
+        # DraftGraph stages exact bucket shapes; unused requests are sentinels.
+        live = len(slot_ids)
+        slot_ids = slot_ids + [0] * (4 - live)
+        anchors = anchors + [-1] * (4 - live)
         staged = graph.stage(
             4,
             {

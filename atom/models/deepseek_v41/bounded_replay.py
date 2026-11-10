@@ -120,7 +120,7 @@ def replayable(forward, running_tokens: int) -> bool:
         step is not None
         and step.decoder is not None
         and not step.decode
-        and running_tokens == step.width
+        and running_tokens == step.running_tokens
     )
 
 

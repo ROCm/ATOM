@@ -203,8 +203,12 @@ def test_capture_validator_checks_real_index_allocations(dtype, index_fp4):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_prefill_staging_cannot_grow_under_capture(monkeypatch):
     cache = PagedAttentionCache(geometry("fp8"), 7, 4, "cuda")
-    small = SimpleNamespace(decode=False, width=16, cu_seqlens_q=torch.tensor([0, 16]))
-    large = SimpleNamespace(decode=False, width=32, cu_seqlens_q=torch.tensor([0, 32]))
+    small = SimpleNamespace(
+        decode=False, running_tokens=16, cu_seqlens_q=torch.tensor([0, 16])
+    )
+    large = SimpleNamespace(
+        decode=False, running_tokens=32, cu_seqlens_q=torch.tensor([0, 32])
+    )
     cache._reserve_prefill_window(small)
     pointer = small.prefill_window_staging.data_ptr()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
@@ -309,7 +313,7 @@ def test_prefill_source_retains_history_until_ring_commit(dtype):
     old[0][:8].fill_(7)
     old[1].fill_(127)
     step = SimpleNamespace(
-        width=12,
+        running_tokens=12,
         batch_ids=torch.tensor([0] * 11 + [-1]),
         positions=torch.arange(100, 112),
         cu_seqlens_q=torch.tensor([0, 11, 11]),
@@ -458,7 +462,7 @@ def test_quantized_csr_launch_contract(dtype, decode, monkeypatch):
     monkeypatch.setattr(idx, "_indices", Launch())
     geo = geometry(dtype)
     step = SimpleNamespace(
-        width=5,
+        running_tokens=5,
         max_q_len=2,
         decode=decode,
         positions=torch.arange(5),
@@ -505,7 +509,7 @@ def test_rope_producer_writes_the_native_plane_destinations(dtype, decode, monke
     query = torch.empty(1, 3, 4, 512, dtype=torch.bfloat16)
     kv = torch.empty(1, 3, 512, dtype=torch.bfloat16)
     step = SimpleNamespace(
-        width=3,
+        running_tokens=3,
         decode=decode,
         positions=torch.arange(3),
         slots=torch.tensor([2]),
@@ -577,7 +581,7 @@ def test_prefill_scratch_depends_on_batch_capacity_and_keeps_slot_mapping(slots)
         data[slot * 11 : (slot + 1) * 11].fill_(slot)
         scale[slot * 11 : (slot + 1) * 11].fill_(127 + slot % 2)
     step = SimpleNamespace(
-        width=8,
+        running_tokens=8,
         slots=torch.tensor([slots - 1, -1, 1]),
         cu_seqlens_q=torch.tensor([0, 3, 4, 7]),
     )
@@ -608,7 +612,7 @@ def test_a8w4_prefill_reuses_mxfp8_window_and_keeps_history(monkeypatch):
     old[1].fill_(128)
     snapshot = tuple(plane.clone() for plane in old)
     step = SimpleNamespace(
-        width=3,
+        running_tokens=3,
         decode=False,
         positions=torch.tensor([8, 9, 13]),
         slots=torch.tensor([2, 0]),
@@ -650,7 +654,7 @@ def test_a8w4_indptrs_are_owned_by_each_step_and_separate_from_fallback(monkeypa
     cache = PagedAttentionCache(geometry("fp4"), 7, 4, "cpu")
     steps = [
         SimpleNamespace(
-            width=3,
+            running_tokens=3,
             positions=torch.arange(3),
             a8w4_indptrs={},
             indptrs={2: (torch.full((4,), 9), torch.full((4,), 7), 4)},
@@ -679,7 +683,7 @@ def test_a8w4_indices_request_untagged_source_rows(decode, monkeypatch):
     monkeypatch.setattr(module, "_indices", Launch())
     geo = geometry("fp4")
     step = SimpleNamespace(
-        width=3,
+        running_tokens=3,
         max_q_len=2,
         decode=decode,
         positions=torch.tensor([8, 9, 13]),

@@ -65,7 +65,7 @@ def prefill_window(history, step, ring):
     dim = history[0].shape[-1]
     batches = step.cu_seqlens_q.numel() - 1
     rows = batches * ring
-    size = (rows + step.width) * (dim + dim // 32)
+    size = (rows + step.running_tokens) * (dim + dim // 32)
     source = getattr(step, "prefill_window_staging", None)
     if source is None:
         # Standalone callers have no cache/builder to reserve scratch for them.
@@ -217,7 +217,7 @@ def _write_planes(
 def write_window_planes(values, scales, planes, step, window, dim, cached_until=None):
     data, scale = planes
     if not data.is_cuda:
-        for t in range(step.width):
+        for t in range(step.running_tokens):
             batch = int(step.batch_ids[t])
             if batch < 0 or t < int(step.cu_seqlens_q[batch + 1]) - window.ring_slots:
                 continue
@@ -228,8 +228,8 @@ def write_window_planes(values, scales, planes, step, window, dim, cached_until=
             data[row].copy_(values.flatten(0, -2)[t].view(torch.uint8))
             scale[row].copy_(scales.flatten(0, -2)[t].view(torch.uint8))
         return
-    if step.width:
-        _write_planes[(step.width,)](
+    if step.running_tokens:
+        _write_planes[(step.running_tokens,)](
             values.view(torch.uint8),
             scales.view(torch.uint8),
             values.stride(-2),

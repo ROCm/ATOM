@@ -387,7 +387,7 @@ class PagedAttentionCache:
         if not self.window_fp8 or step.decode:
             return
         batches = step.cu_seqlens_q.numel() - 1
-        size = (batches * self.geometry.ring_slots + step.width) * (
+        size = (batches * self.geometry.ring_slots + step.running_tokens) * (
             self.geometry.window_row_bytes
         )
         source = self.prefill_window_staging
@@ -416,7 +416,6 @@ class PagedAttentionCache:
         plans=None,
         publication_group=None,
         query_prefix_ready=False,
-        query_prefix_republish_reason=None,
         planners=(),
         floors=None,
         cached_until=None,
@@ -470,7 +469,6 @@ class PagedAttentionCache:
             ratios=tuple(ratio for ratio, _ in self.geometry.compress_ratios),
             publication_group=publication_group,
             query_prefix_ready=query_prefix_ready,
-            query_prefix_republish_reason=query_prefix_republish_reason,
             planners=planners,
         )
         step.plans = (
@@ -497,7 +495,7 @@ class PagedAttentionCache:
         self.current_step = step
         if not step.positions.is_cuda:
             return step
-        self._reserve_indptrs(step.width)
+        self._reserve_indptrs(step.running_tokens)
         # Before the indptrs, which count each row's window from its floor.
         self.publish_replay_layout(step, count if running_bs is None else running_bs)
         return step
@@ -798,7 +796,7 @@ class PagedAttentionCache:
                 # parent's BF16 adapter indptrs or another child's buffers.
                 buffers = {
                     ratio: torch.empty(
-                        (2, step.width + 1),
+                        (2, step.running_tokens + 1),
                         dtype=torch.int32,
                         device=step.positions.device,
                     ).unbind()
@@ -991,15 +989,15 @@ class PagedAttentionCache:
         """
         dim, window_fp8 = self.geometry.head_dim, self.window_fp8
 
-        if not step.width:
+        if not step.running_tokens:
             return (None, None) if step.decode else (torch.empty_like(kv), None)
         seam = (
             (
-                kv.new_empty(step.width, 0, dim)
+                kv.new_empty(step.running_tokens, 0, dim)
                 if query is None
-                else query.view(step.width, -1, dim)
+                else query.view(step.running_tokens, -1, dim)
             ),
-            kv.view(step.width, dim),
+            kv.view(step.running_tokens, dim),
             rope.cos_cache,
             rope.sin_cache,
             step.positions,
@@ -1031,7 +1029,7 @@ class PagedAttentionCache:
                 )
             else:
                 source = torch.empty(
-                    step.width * self.geometry.window_row_bytes,
+                    step.running_tokens * self.geometry.window_row_bytes,
                     dtype=torch.uint8,
                     device=kv.device,
                 )
@@ -1065,9 +1063,9 @@ class PagedAttentionCache:
 
     def write_window(self, layer, kv, step):
         # `None` is `rope_quant_window` reporting that it already stored the
-        # row, not an empty batch: those two differ in whether `step.width` is
+        # row, not an empty batch: those two differ in whether `step.running_tokens` is
         # zero, and only this one can reach here after a real forward.
-        if kv is not None and step.width:
+        if kv is not None and step.running_tokens:
             window = self.geometry.window(layer, self.num_pages)
             # rows below where a request's ring already holds them stay
             cached = step.swa_cached_until if step.request_cached_until.any() else None
