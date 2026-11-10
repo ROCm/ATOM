@@ -4709,6 +4709,7 @@ class ModelRunner:
             # A fresh step for each pass: a replaying forward spends its
             # step's indptrs on the tail (`rows_of`).
             for mode in (None, "record"):
+                self._capture_barrier()
                 self._run_capture_prefill(
                     *self._build_capture(
                         builder.build_for_token_graph_capture, running_tokens
@@ -4735,6 +4736,7 @@ class ModelRunner:
         for running_bs in sizes:
             for finishing in variants:
                 for mode in (None, "record_req"):
+                    self._capture_barrier()
                     attn_metadata, context = self._build_capture(
                         builder.build_for_req_graph_capture, running_bs, finishing
                     )
@@ -4744,6 +4746,21 @@ class ModelRunner:
             torch.cuda.synchronize()
         if sizes and self.rank == 0:
             logger.info("Prefill request graphs recorded for running_bs %s", sizes)
+
+    def _capture_barrier(self) -> None:
+        """Every DP rank enters the next prefill recording pass together.
+
+        Each pass runs collectives for real: the warmup forward's, and those
+        of a recording forward's eager stretches. What runs before them need
+        not line the ranks up (a draft model may run no collective), and on a
+        cold start, with per-rank JIT, one rank can arrive long after its
+        peers. The early ranks then sit in a device-side collective while the
+        late one is still capturing and instantiating graphs, and the late one
+        can stall there for good: startup hangs with half the GPUs spinning.
+        Waiting on the CPU (gloo) group instead puts nothing on a stream and
+        nothing into a graph."""
+        if self.config.parallel_config.data_parallel_size > 1:
+            get_dp_group().barrier()
 
     def _build_capture(self, build, *args, **kwargs):
         """The synthetic step ``build`` makes for a capture, staged in a
