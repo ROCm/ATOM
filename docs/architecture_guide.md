@@ -287,7 +287,7 @@ The `embed_tokens` layer is always shared when shapes match and pipeline paralle
 
 ### Propose loop: metadata is the backend's, not the proposer's
 
-The `propose()` method iterates `mtp_k` draft steps. Every step calls
+`EagleProposer._propose()` (the flavor body `Drafter.propose` calls) iterates `mtp_k` draft steps. Every step calls
 `runner.attn_metadata_builder.prepare_mtp_decode()` and merges the dict it
 returns into `attn_metadata`, so *which* fields a step updates — `kv_indptr`
 and `kv_indices` for MLA, `block_tables` and `context_lens` for MHA — is the
@@ -298,7 +298,7 @@ rejected speculative tokens are taken back out.
 One thing does branch, on a builder capability rather than a model family:
 `fuse_mtp_decode_position_update`. Where a builder sets it, the per-step
 position bump and the `context_lens` increment ride into its kernel through
-`update_context_lens` / `positions_out`; where it does not, `propose()` does
+`update_context_lens` / `positions_out`; where it does not, `_propose()` does
 both itself before the call.
 
 ### `prepare_mtp_decode()`
