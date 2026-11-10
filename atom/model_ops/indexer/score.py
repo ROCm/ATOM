@@ -38,7 +38,7 @@ from atom.utils import forward_context
 from atom.utils.region_graph import eager_region
 
 from .layout import MFMA, NATURAL
-from .rows import IndexCache, IndexRows, concat_groups
+from .rows import IndexCache, IndexRows
 
 # Whether aiter's dense FP8 scorer writes into a caller's plane (`logits=`).
 # Without it each prefill band's logits are allocated per call.
@@ -81,9 +81,8 @@ def score_topk(
     `on_band(scores, span)`, when given, sees each band's logits before its
     top-k: a scorer that reads more than the top-k off them (a layer picking
     its successors' candidate blocks) does it there. `keys`: FP8 concat rows'
-    keys gathered elsewhere -- `(values, scales)` end to end, or a callable
-    returning a group's (DCP's all-gathered shards, `_score_concat`);
-    gathered here from `cache` otherwise.
+    `(values, scales)` already gathered end to end (DCP's all-gathered
+    shards); gathered here from `cache` otherwise.
 
     A striped split (`RowSplit.striped`) scores this rank's rows of `query`
     and `weights` into its slot and returns the gathered slots rank-major:
@@ -240,28 +239,22 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
             )
 
 
-def _gather_concat(query, cache, keys, group):
-    """A group's committed keys, end to end: into `keys.workspace` when it has
-    one, else allocated for the step."""
-    tables, cu_committed = keys.block_tables, keys.cu_committed
-    if group.end is not None:
-        tables = tables[group.first : group.end]
-        cu_committed = cu_committed[group.first : group.end + 1] - group.key_first
+def _gather_concat(query, cache, keys):
+    """The step's requests' committed keys, end to end: into `keys.workspace`
+    when it has one, else allocated for the step."""
     if keys.workspace is not None:
-        k_fp8, k_scale = keys.workspace.keys(group.total)
+        k_fp8, k_scale = keys.workspace.keys(keys.total)
     else:
         k_fp8 = torch.empty(
-            (group.total, query.shape[-1]), device=query.device, dtype=dtypes.fp8
+            (keys.total, query.shape[-1]), device=query.device, dtype=dtypes.fp8
         )
-        k_scale = torch.empty(
-            (group.total, 1), device=query.device, dtype=torch.float32
-        )
+        k_scale = torch.empty((keys.total, 1), device=query.device, dtype=torch.float32)
     cp_gather_indexer_k_quant_cache(
         cache.values,
         k_fp8,
         k_scale.view(dtypes.fp8),  # 4-byte scale rows read as fp8 bytes
-        tables,
-        cu_committed,
+        keys.block_tables,
+        keys.cu_committed,
         preshuffle=True,
     )
     return k_fp8, k_scale
@@ -270,81 +263,57 @@ def _gather_concat(query, cache, keys, group):
 def _score_concat(
     query, weights, cache, rows, topk, stable, out, gathered, request_local
 ):
-    """FP8 prefill against the gathered keys, a group of requests at a time
-    (`ConcatKeys.groups`). `gathered`: a group's keys already gathered --
-    `(values, scales)` for a step of one group, or a callable taking the
-    group (DCP's all-gather, which every rank calls for every group); read
-    off `cache` otherwise. The top-k reports a key's place in the step's
+    """FP8 prefill against the gathered keys, each band against its window of
+    them (`IndexRows.key_windows`). The top-k reports a key's place in the
     gathered run; less its request's start it is the request's own."""
     keys = rows.concat
-    groups = concat_groups(keys, rows.row_ends.shape[0])
-    if isinstance(gathered, tuple) and len(groups) > 1:
-        raise ValueError("pre-gathered keys cover one group, the step has several")
-    # The bands' plane: the workspace's, rows at `concat_plane_width` apart;
-    # without one, each band allocated by the kernel. Those allocations follow
-    # the step's context, which the memory profile (an 8K prefill with no
-    # history) never reaches, and grow every chunk of a long prefill.
+    k_fp8, k_scale = (
+        _gather_concat(query, cache, keys) if gathered is None else gathered
+    )
+    # The bands' plane: the workspace's, rows at `concat_plane_width` of their
+    # window apart; without one, each band allocated by the kernel.
     plane = rows.workspace
-    for group in groups:
-        bands = [
-            (first, end)
-            for first, end in rows.bands
-            if group.row_first <= first and end <= group.row_end
-        ]
-        if callable(gathered):
-            k_fp8, k_scale = gathered(group)
-        elif gathered is not None:
-            k_fp8, k_scale = gathered
-        elif bands:
-            k_fp8, k_scale = _gather_concat(query, cache, keys, group)
-        else:
-            continue
-        pitch = concat_plane_width(group.total)
-        base = group.key_first
-        for first, end in bands:
-            span = slice(first, end)
-            starts = keys.row_starts[span]
-            if base:
-                # PCP's padded queries have start=0, length=0 and belong to
-                # the last group. Keep their empty range inside this group.
-                starts = (starts - base).clamp_min_(0)
-            stops = starts + rows.row_ends[span]
-            out_plane = (
-                {}
-                if plane is None
-                else {"logits": plane.logits(end - first, pitch)[:, : group.total]}
-            )
-            scores = fp8_mqa_logits(
-                Q=query[span],
-                KV=k_fp8,
-                kv_scales=k_scale,
-                weights=weights[span],
-                cu_starts=starts,
-                cu_ends=stops,
-                clean_logits=False,
-                **out_plane,
-            )
-            top_k_per_row_prefill(
-                scores,
-                starts,
-                stops,
-                out[span],
-                None,
-                end - first,
-                scores.stride(0),
-                scores.stride(1),
-                k=topk,
-                stable=stable,
-            )
-        if base and bands:
-            # A group's top-k reports places in the group's run; the step's
-            # run is `base` further on.
-            picked = out[bands[0][0] : bands[-1][1]]
-            torch.where(picked < 0, picked, picked + base, out=picked)
-    if request_local and rows.bands:
-        scored = slice(rows.bands[0][0], rows.bands[-1][1])
-        picked, base = out[scored], keys.row_starts[scored].unsqueeze(1)
-        torch.where(picked < 0, picked, picked - base, out=picked)
+    windows = rows.key_windows or [(0, keys.total)] * len(rows.bands)
+    for (first, end), (lo, hi) in zip(rows.bands, windows):
+        span = slice(first, end)
+        starts = keys.row_starts[span]
+        if lo:
+            # PCP's padding rows (start 0, length 0) stay empty in the window.
+            starts = (starts - lo).clamp_min_(0)
+        stops = starts + rows.row_ends[span]
+        out_plane = {}
+        if plane is not None:
+            band = plane.logits(end - first, concat_plane_width(hi - lo))
+            out_plane["logits"] = band[:, : hi - lo]
+        scores = fp8_mqa_logits(
+            Q=query[span],
+            KV=k_fp8[lo:hi],
+            kv_scales=k_scale[lo:hi],
+            weights=weights[span],
+            cu_starts=starts,
+            cu_ends=stops,
+            clean_logits=False,
+            **out_plane,
+        )
+        picked = out[span]
+        top_k_per_row_prefill(
+            scores,
+            starts,
+            stops,
+            picked,
+            None,
+            end - first,
+            scores.stride(0),
+            scores.stride(1),
+            k=topk,
+            stable=stable,
+        )
+        # Window places: less the row's window start for its request's own,
+        # plus `lo` for the gathered run's.
+        if request_local:
+            torch.where(picked < 0, picked, picked - starts.unsqueeze(1), out=picked)
+        elif lo:
+            torch.where(picked < 0, picked, picked + lo, out=picked)
 
 
 def _live_rows():

@@ -16,7 +16,6 @@ from aiter import (
     get_mla_metadata_v1,
 )
 
-from atom.distributed.dcp_layout import dcp_concat_gather_plan
 from atom.distributed.dcp_utils import (
     NONPS_MAX_Q_ROWS,
     dcp_persistent_supported,
@@ -70,9 +69,7 @@ from atom.model_ops.glm5_next.geometry import (
 )
 from atom.model_ops.indexer import (
     FP8_MQA_LOGITS_TAKES_OUT,
-    ConcatGroup,
     ConcatKeys,
-    DcpConcatGather,
     Fp4LaunchStorages,
     IndexRows,
     RowSplit,
@@ -84,10 +81,8 @@ from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
 from atom.model_ops.sparse_indexer_chunk import (
     ConcatKeyWorkspace,
     LogitsWorkspace,
-    concat_group_capacity,
     concat_plane_width,
     logits_rows,
-    pack_concat_groups,
 )
 from atom.model_ops.sparse_indexer_fp4 import (
     fp4_index_scale_rows,
@@ -1939,16 +1934,27 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             round-robin ``p%W`` / ``p//W``), hence
             ``src = owner(p) * sum(Lpad) + cu_pad[b] + local_index(p)``.
         """
+        from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
+
+        W = self.dcp_world_size
+        S = self.cp_kv_cache_interleave_size
         var = self.model_runner.forward_vars
-        g_cu = self._committed_cu(attn_metadata, bs, prefix)
-        if self._concat_grouped(int(g_cu[bs])):
-            # Gathered a group at a time, each by its own plan (`_concat_groups`).
-            attn_metadata.dcp_indexer_local_total = None
-            attn_metadata.dcp_indexer_local_cu_seqlens = None
-            attn_metadata.dcp_indexer_gather_index = None
-            return
-        g_lens, lpad, cu_pad, local_total, src = dcp_concat_gather_plan(
-            g_cu, 0, bs, self.dcp_world_size, self.cp_kv_cache_interleave_size
+        committed = "cu_seqlens_k" if attn_metadata.has_cached else "cu_seqlens_q"
+        g_cu = var[prefix + committed].np[: bs + 1].astype(np.int64)
+        g_lens = g_cu[1:] - g_cu[:bs]
+
+        lpad = ((g_lens + S * W - 1) // (S * W)) * S
+        cu_pad = np.zeros(bs + 1, dtype=np.int64)
+        np.cumsum(lpad, out=cu_pad[1:])
+        local_total = int(cu_pad[bs])
+        total_kv = int(g_cu[bs])
+
+        # Position within its sequence for every global KV token.
+        pos = np.arange(total_kv, dtype=np.int64) - np.repeat(g_cu[:bs], g_lens)
+        src = (
+            dcp_owner_rank(pos, W, S) * local_total
+            + np.repeat(cu_pad[:bs], g_lens)
+            + dcp_local_index(pos, W, S)
         )
 
         dev = self.device
@@ -2777,74 +2783,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         and a pooled one's."""
         return self.is_sparse and not self._indexer_fp4 and self.index_kpool == 1
 
-    def _committed_cu(self, attn_metadata, bs: int, prefix: str = ""):
-        """Host cumsum of the ``prefix`` set's requests' committed keys (cached
-        and scheduled), int64."""
+    def _concat_requests(self, attn_metadata, bs, prefix, pcp_split, rows):
+        """Host cumsums of the ``prefix`` set's requests' index rows (under PCP
+        the rows this rank owns) and committed keys (`concat_rows`)."""
         var = self.model_runner.forward_vars
-        committed = "cu_seqlens_k" if attn_metadata.has_cached else "cu_seqlens_q"
-        return var[prefix + committed].np[: bs + 1].astype(np.int64)
-
-    def _concat_capacity(self) -> int:
-        """Keys that fit the held key buffer and at least one aligned logits row."""
-        plane = self._prefill_concat_plane()
-        return concat_group_capacity(
-            self.index_prefill_key_workspace.capacity,
-            None if plane is None else plane.capacity,
-        )
-
-    def _concat_grouped(self, total_kv: int) -> bool:
-        return (
-            self.index_prefill_key_workspace is not None
-            and total_kv > self._concat_capacity()
-        )
-
-    def _concat_groups(
-        self, attn_metadata, bs: int, prefix: str = "", *, pcp_split=False, rows=None
-    ):
-        """The step's requests in consecutive groups whose committed keys each
-        fit both workspaces, with each group's query rows, keys
-        and, under DCP, its own gather plan; None when one group is the
-        step (`_concat_grouped`)."""
-        g_cu = self._committed_cu(attn_metadata, bs, prefix)
-        if not self._concat_grouped(int(g_cu[bs])):
-            return None
-        cu_q = self.model_runner.forward_vars[f"{prefix}cu_seqlens_q"].np[: bs + 1]
+        cu_q = var[f"{prefix}cu_seqlens_q"].np[: bs + 1]
         if pcp_split:
             cu_q = pcp_owned_rows_by_request(
                 cu_q, get_pcp_rank(), get_pcp_world_size(), rows
             )
-        groups = []
-        for first, end in pack_concat_groups(g_cu, self._concat_capacity()):
-            plan = None
-            if self.dcp_world_size > 1:
-                _, _, cu_pad, local_total, src = dcp_concat_gather_plan(
-                    g_cu,
-                    first,
-                    end,
-                    self.dcp_world_size,
-                    self.cp_kv_cache_interleave_size,
-                )
-                plan = DcpConcatGather(
-                    local_total,
-                    torch.from_numpy(cu_pad.astype(np.int32)).to(
-                        self.device, non_blocking=True
-                    ),
-                    torch.from_numpy(src.astype(np.int32)).to(
-                        self.device, non_blocking=True
-                    ),
-                )
-            groups.append(
-                ConcatGroup(
-                    first,
-                    end,
-                    int(cu_q[first]),
-                    int(cu_q[end]),
-                    int(g_cu[first]),
-                    int(g_cu[end] - g_cu[first]),
-                    plan,
-                )
-            )
-        return tuple(groups)
+        committed = "cu_seqlens_k" if attn_metadata.has_cached else "cu_seqlens_q"
+        return cu_q, var[prefix + committed].np[: bs + 1]
 
     def _prefill_concat_plane(self) -> LogitsWorkspace | None:
         """The plane FP8 prefill bands are scored into; None when aiter's
@@ -2855,7 +2804,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """Allocate the FP8 prefill indexer's gathered-key workspace: one
         request of the model length plus a chunk, and under DCP the
         all-gathered shards of that many keys. A step whose requests together
-        hold more is scored a group of them at a time (`_concat_groups`).
+        hold more grows it (`ConcatKeyWorkspace`).
 
         Sized by the configuration, not the step: allocated per step these are
         as long as the step's context, so every chunk of a long prefill asks
@@ -3059,12 +3008,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 total=total_kv,
                 row_starts=attn_metadata.cu_seqlen_ks,
                 workspace=self.index_prefill_key_workspace,
-                groups=self._concat_groups(
-                    attn_metadata, bs, prefix, pcp_split=pcp_split, rows=rows
-                ),
             )
             attn_metadata.index_rows = concat_rows(
-                ends, keys, split, workspace=self._prefill_concat_plane()
+                ends,
+                keys,
+                split,
+                workspace=self._prefill_concat_plane(),
+                requests=self._concat_requests(
+                    attn_metadata, bs, prefix, pcp_split, rows
+                ),
             )
             return
         # A prefill is eager, so its plane is as wide as its longest row.

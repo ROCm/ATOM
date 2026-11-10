@@ -14,6 +14,7 @@ owns the one rule they all need to agree on.
 
 import logging
 
+import numpy as np
 import torch
 
 from atom.utils import envs
@@ -249,43 +250,36 @@ def concat_plane_width(keys: int) -> int:
     return max(align, -(-keys // align) * align)
 
 
-def concat_group_capacity(key_capacity: int, logits_capacity: int | None) -> int:
-    """Keys that fit both the gathered-key buffer and one aligned logits row.
-
-    `logits_capacity` counts fp32 elements, not bytes. A partial row-alignment
-    tile cannot hold another key. None means aiter allocates its own logits.
-    """
-    if logits_capacity is None:
-        return key_capacity
-    return min(
-        key_capacity,
-        logits_capacity // CONCAT_PLANE_ROW_ALIGN * CONCAT_PLANE_ROW_ALIGN,
-    )
-
-
-def pack_concat_groups(cu_committed, capacity: int) -> list[tuple[int, int]]:
-    """Pack consecutive requests into groups of at most `capacity` keys.
-
-    The fixed workspaces must hold one max-model-length request at startup.
-    An oversized request is a configuration error; splitting its query rows
-    cannot make even one logits row fit.
-    """
-    requests = len(cu_committed) - 1
-    runs, first = [], 0
-    for end in range(1, requests + 1):
-        length = int(cu_committed[end] - cu_committed[end - 1])
-        if length > capacity:
-            raise ValueError(
-                f"prefill request {end - 1} has {length} keys, exceeding the "
-                f"concat workspace capacity of {capacity}; the workspace must "
-                "hold one max-model-length request"
-            )
-        if end - 1 > first and cu_committed[end] - cu_committed[first] > capacity:
-            runs.append((first, end - 1))
-            first = end - 1
-    if requests:
-        runs.append((first, requests))
-    return runs
+def concat_window_bands(first, end, row_cu, key_cu, plane: LogitsWorkspace):
+    """Bands of rows `[first, end)` in `plane`, each scored against a window
+    `(lo, hi)` of just its own requests' keys (`row_cu`/`key_cu` per request)."""
+    bands, windows = [], []
+    start = first
+    while start < end:
+        request = int(np.searchsorted(row_cu, start, side="right")) - 1
+        lo = int(key_cu[request])
+        stop, hi = start, lo
+        while stop < end:
+            next_stop = min(int(row_cu[request + 1]), end)
+            next_hi = int(key_cu[request + 1])
+            rows = next_stop - start
+            width = concat_plane_width(next_hi - lo)
+            fit = plane.logits_rows(rows, width) if width <= plane.capacity else 0
+            if fit < rows:
+                if stop == start:
+                    if fit < 1:
+                        raise ValueError(
+                            f"the logits plane holds no row of request {request}'s "
+                            f"{next_hi - lo} keys"
+                        )
+                    stop, hi = start + fit, next_hi
+                break
+            stop, hi = next_stop, next_hi
+            request += 1
+        bands.append((start, stop))
+        windows.append((lo, hi))
+        start = stop
+    return tuple(bands), tuple(windows)
 
 
 class ConcatKeyWorkspace:
@@ -298,11 +292,10 @@ class ConcatKeyWorkspace:
     of a long prefill asks for a slightly larger block than the last one: the
     caching allocator never finds one to reuse and reserves another, chunk
     after chunk, until HBM runs out. Sized from the configuration before the
-    memory profile, they are counted in it. One request's keys are at most
-    the model length, so a step whose requests together outgrow the buffers
-    is gathered and scored a group of requests at a time
-    (`ConcatKeys.groups`). Callers without group metadata retain a growing
-    buffer for compatibility."""
+    memory profile, they are counted in it. A step whose keys outgrow a buffer
+    doubles it -- the only allocation after startup, and a rare one: one
+    request is at most the model length, a step past it is several long
+    requests scheduled together."""
 
     def __init__(
         self, capacity: int, dim: int, dtype, device, gathered_capacity: int = 0
@@ -316,12 +309,6 @@ class ConcatKeyWorkspace:
             torch.empty((rows, self.dim), dtype=self.dtype, device=self.device),
             torch.empty((rows, 1), dtype=torch.float32, device=self.device),
         )
-
-    @property
-    def capacity(self) -> int:
-        """Keys the key buffer holds: a step, or a group of its requests
-        (`ConcatKeys.groups`), of at most this many keys fits without growth."""
-        return self._keys[0].shape[0]
 
     @property
     def nbytes(self) -> int:

@@ -10,14 +10,17 @@ rank abort()s inside the Triton AMDGCN backend. So the cap is a hard one and the
 bound is exclusive.
 """
 
+import numpy as np
 import pytest
 import torch
 
 from atom.model_ops.sparse_indexer_chunk import (
     _BUFFER_DESCRIPTOR_LIMIT_BYTES,
     ConcatKeyWorkspace,
+    LogitsWorkspace,
     capped_logits_rows,
     concat_plane_width,
+    concat_window_bands,
     decode_band_rows,
     flat_view,
     indexer_qsplit_world,
@@ -200,38 +203,69 @@ def test_concat_plane_width_is_aiter_s_row_pitch():
     assert concat_plane_width(359_768) == 359_936
 
 
+def _check_window_bands(first, end, row_cu, key_cu, plane, bands, windows):
+    """The bands tile `[first, end)`; each fits the plane at its window's pitch,
+    and its window holds every key its rows' requests have."""
+    assert bands[0][0] == first and bands[-1][1] == end
+    assert all(a < b == c for (a, b), (c, _) in zip(bands, bands[1:] + ((end, 0),)))
+    for (a, b), (lo, hi) in zip(bands, windows):
+        assert (b - a) * concat_plane_width(hi - lo) <= plane.capacity
+        for row in range(a, b):
+            request = np.searchsorted(row_cu, row, side="right") - 1
+            assert lo <= key_cu[request] and key_cu[request + 1] <= hi
+
+
 @pytest.mark.parametrize(
-    "keys, plane, expected",
-    [(4096, None, 4096), (1000, 4096, 1000), (4096, 1023, 768), (4096, 1024, 1024)],
+    "rows, keys, capacity, expected",
+    [
+        # Everything fits one row's plane: one band against every key.
+        ([3, 2], [100, 50], 4096, [((0, 5), (0, 150))]),
+        # Two requests together outgrow the plane: one band each.
+        ([4, 4], [300, 300], 3072, [((0, 4), (0, 300)), ((4, 8), (300, 600))]),
+        # One request's rows outgrow the plane: cut, each piece its window.
+        ([5], [200], 512, [((0, 2), (0, 200)), ((2, 4), (0, 200)), ((4, 5), (0, 200))]),
+        # An empty request (a PCP rank owning none of its rows) widens a window.
+        ([2, 0, 2], [100, 100, 100], 4096, [((0, 4), (0, 300))]),
+    ],
 )
-def test_concat_group_capacity_accounts_for_the_aligned_row(keys, plane, expected):
-    from atom.model_ops.sparse_indexer_chunk import concat_group_capacity
-
-    capacity = concat_group_capacity(keys, plane)
-    assert capacity == expected
-    if plane is not None:
-        assert concat_plane_width(capacity) <= plane
-
-
-@pytest.mark.parametrize(
-    "lengths, capacity, expected",
-    [([], 256, []), ([256], 256, [(0, 1)]), ([128, 128, 1], 256, [(0, 2), (2, 3)])],
-)
-def test_concat_groups_fit_at_the_capacity_boundary(lengths, capacity, expected):
+def test_concat_window_bands(rows, keys, capacity, expected):
     from itertools import accumulate
 
-    from atom.model_ops.sparse_indexer_chunk import pack_concat_groups
+    row_cu = np.array(list(accumulate(rows, initial=0)))
+    key_cu = np.array(list(accumulate(keys, initial=0)))
+    plane = LogitsWorkspace(capacity, "cpu")
+    bands, windows = concat_window_bands(0, row_cu[-1], row_cu, key_cu, plane)
+    assert list(zip(bands, windows)) == expected
+    _check_window_bands(0, row_cu[-1], row_cu, key_cu, plane, bands, windows)
 
-    assert (
-        pack_concat_groups(list(accumulate(lengths, initial=0)), capacity) == expected
-    )
+
+def test_concat_window_bands_fit_a_one_row_plane():
+    """1M context, 8 MiB budget: the plane holds one 1M-key row, two requests'
+    keys together do not; each row is scored against its own request's."""
+    width = concat_plane_width(1 << 20)
+    plane = LogitsWorkspace(width, "cpu")
+    row_cu, key_cu = np.array([0, 3, 6]), np.array([0, 525_312, 1_050_624])
+    bands, windows = concat_window_bands(0, 6, row_cu, key_cu, plane)
+    assert len(bands) == 6
+    _check_window_bands(0, 6, row_cu, key_cu, plane, bands, windows)
 
 
-def test_concat_groups_reject_an_oversized_request():
-    from atom.model_ops.sparse_indexer_chunk import pack_concat_groups
+@pytest.mark.parametrize("rank", range(8))
+def test_concat_window_bands_cover_a_dcp_rank_of_many_cached_requests(rank):
+    """DCP8, 32K context, 256 batched tokens: 64 requests each adding 4 rows
+    to a 30,720-key prefix fill 1.97M columns, the 32-row plane 1M."""
+    plane = LogitsWorkspace(32 * concat_plane_width(32_768), "cpu")
+    row_cu = np.arange(65) * 4
+    key_cu = np.arange(65) * (30_720 + 4)
+    first, end = rank * 32, rank * 32 + 32
+    bands, windows = concat_window_bands(first, end, row_cu, key_cu, plane)
+    _check_window_bands(first, end, row_cu, key_cu, plane, bands, windows)
 
-    with pytest.raises(ValueError, match="request 1 has 257 keys"):
-        pack_concat_groups([0, 100, 357], 256)
+
+def test_concat_window_bands_refuse_a_request_wider_than_the_plane():
+    plane = LogitsWorkspace(512, "cpu")
+    with pytest.raises(ValueError, match="no row of request 1"):
+        concat_window_bands(0, 2, np.array([0, 1, 2]), np.array([0, 10, 600]), plane)
 
 
 def test_concat_key_workspace_hands_out_views_of_held_buffers():

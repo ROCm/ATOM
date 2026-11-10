@@ -10,8 +10,6 @@ conversion otherwise. The `Indexer` module (models/deepseek_v2.py) owns the
 projections and calls this op.
 """
 
-import functools
-
 import torch
 from aiter import cp_gather_indexer_k_quant_cache, dtypes, indexer_k_quant_and_cache
 
@@ -42,8 +40,7 @@ def _dcp_gather_indexer_k_prefill(
     prefill_metadata,
     head_dim: int,
     device: torch.device,
-    keys=None,
-    group=None,
+    workspace=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather the full-sequence indexer K under DCP for prefill top-k.
 
@@ -54,29 +51,18 @@ def _dcp_gather_indexer_k_prefill(
     to global order -- the same local-shard + all-gather the decode path uses, on
     k rather than logits. Returns (k_fp8, k_scale) in global order.
 
-    With `keys.workspace` (`ConcatKeyWorkspace`) the shard is gathered straight
-    into this rank's slot of the workspace's all-gather buffer, all-gathered in
-    place and de-interleaved into its key buffer: nothing here is allocated per
-    step. `group` (`ConcatGroup`): gather only its requests, by its own
-    `DcpConcatGather` when it has one; every request by the step's otherwise.
+    With `workspace` (`ConcatKeyWorkspace`) the shard is gathered straight into
+    this rank's slot of the workspace's all-gather buffer, all-gathered in place
+    and de-interleaved into its key buffer: nothing here is allocated per step.
     """
-    workspace = getattr(keys, "workspace", None)
-    plan = getattr(group, "dcp", None)
-    if plan is None:
-        local_total = prefill_metadata.dcp_indexer_local_total
-        local_cu_seqlens = prefill_metadata.dcp_indexer_local_cu_seqlens
-        gather_index = prefill_metadata.dcp_indexer_gather_index
-        # Cached prefill pads block tables to running_bs for later consumers,
-        # while these local cums contain only the scheduled requests. AITER
-        # takes its request count from the table height: passing the padded
-        # rows would read beyond local_cu_seqlens and can gather another
-        # request's keys.
-        block_tables = prefill_metadata.block_tables[: local_cu_seqlens.numel() - 1]
-    else:
-        local_total, local_cu_seqlens, gather_index = plan
-        # The step's tables (`ConcatKeys`): a TBO ubatch's metadata holds only
-        # its own requests' rows, and a group counts the step's requests.
-        block_tables = keys.block_tables[group.first : group.end]
+    local_total = prefill_metadata.dcp_indexer_local_total
+    local_cu_seqlens = prefill_metadata.dcp_indexer_local_cu_seqlens
+    gather_index = prefill_metadata.dcp_indexer_gather_index
+    # Cached prefill pads block tables to running_bs for later consumers,
+    # while these local cums contain only the scheduled requests. AITER takes
+    # its request count from the table height: passing the padded rows would
+    # read beyond local_cu_seqlens and can gather another request's keys.
+    block_tables = prefill_metadata.block_tables[: local_cu_seqlens.numel() - 1]
     if workspace is not None:
         return _dcp_gather_indexer_k_prefill_into(
             workspace,
@@ -397,13 +383,8 @@ def sparse_attn_indexer(
         stable=stable_topk,
         out=topk_indices[: rows.out_rows],
         keys=(
-            functools.partial(
-                _dcp_gather_indexer_k_prefill,
-                kv_cache,
-                attn_metadata,
-                head_dim,
-                k.device,
-                rows.concat,
+            _dcp_gather_indexer_k_prefill(
+                kv_cache, attn_metadata, head_dim, k.device, rows.concat.workspace
             )
             if rows.concat is not None
             and rows.split.world > 1

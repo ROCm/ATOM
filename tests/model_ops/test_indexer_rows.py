@@ -97,131 +97,62 @@ def test_recorded_fp4_bands_keep_their_launch_arguments_in_place():
     assert second[1].tolist() == [0] * 4 + [1, 2, 3] + [3] * 4
 
 
-def _concat_groups_of(cu_keys, cu_rows, runs):
-    return tuple(
-        rows_module.ConcatGroup(
-            first,
-            end,
-            int(cu_rows[first]),
-            int(cu_rows[end]),
-            int(cu_keys[first]),
-            int(cu_keys[end] - cu_keys[first]),
-        )
-        for first, end in runs
-    )
-
-
 @pytest.mark.parametrize("request_local", [True, False])
 @pytest.mark.parametrize("world", [1, 2])
-def test_concat_groups_score_against_their_own_keys(monkeypatch, request_local, world):
-    """Each group's keys are gathered once, on every rank whether or not it
-    scores rows of the group (DCP's all-gather); its rows score against them
-    with starts and ends rebased to the group, into the plane at the group's
-    pitch, and the top-k's places come back in the step's run -- less the
-    row's request start when request-local."""
+def test_concat_bands_score_against_their_own_requests_keys(
+    monkeypatch, request_local, world
+):
+    """Each band reads only its window of the keys, into a plane row as wide as
+    the window; ids come back step- or request-local. Row 9 is PCP padding."""
     cu_keys = np.array([0, 300, 310, 610])
-    cu_rows = np.array([0, 4, 5, 9])
-    groups = _concat_groups_of(cu_keys, cu_rows, [(0, 1), (1, 3)])
+    cu_rows = np.array([0, 4, 5, 10])
     requests = np.repeat(np.arange(3), np.diff(cu_rows))
     row_starts = torch.tensor(cu_keys[requests], dtype=torch.int32)
-    row_ends = torch.tensor([1, 2, 3, 4, 7, 1, 2, 3, 4], dtype=torch.int32)
-    keys = rows_module.ConcatKeys(None, None, 610, row_starts, groups=groups)
+    row_starts[9] = 0
+    row_ends = torch.tensor([1, 2, 3, 4, 7, 1, 2, 3, 4, 0], dtype=torch.int32)
+    keys = rows_module.ConcatKeys(None, None, 610, row_starts)
     plane = LogitsWorkspace(8 * chunk.concat_plane_width(310), "cpu")
+    gathered = torch.arange(610, dtype=torch.float32).view(610, 1)
+    windows = []
 
     def fake_logits(**kwargs):
-        scored.append((kwargs["cu_starts"].tolist(), kwargs["cu_ends"].tolist()))
-        logits = kwargs["logits"]
-        assert logits.stride() == (chunk.concat_plane_width(logits.shape[1]), 1)
+        kv, logits = kwargs["KV"], kwargs["logits"]
+        lo = int(kv[0, 0]) if kv.shape[0] else 0
+        windows.append((lo, lo + kv.shape[0]))
+        assert logits.shape[1] == kv.shape[0]
+        assert logits.stride() == (chunk.concat_plane_width(kv.shape[0]), 1)
+        for a, b in zip(kwargs["cu_starts"].tolist(), kwargs["cu_ends"].tolist()):
+            assert 0 <= a <= b <= kv.shape[0]
         return logits
 
     def fake_topk(scores, starts, ends, out, _, rows, *strides, k, stable):
-        out[:, 0] = ends - 1  # each row's last visible key, in the group's run
+        out[:, 0] = ends - 1  # each row's last visible key, in its window
         out[:, 1:] = -1
 
     monkeypatch.setattr(score_module, "fp8_mqa_logits", fake_logits)
     monkeypatch.setattr(score_module, "top_k_per_row_prefill", fake_topk)
-    out = torch.zeros(9, 3, dtype=torch.int32)
+    out = torch.zeros(10, 3, dtype=torch.int32)
     for rank in range(world):
-        gathered, scored = [], []
-
-        def gather(group, seen=gathered):
-            seen.append(group.first)
-            return torch.zeros(group.total, 1), torch.zeros(group.total, 1)
-
-        split = rows_module.RowSplit.of(9, rank, world)
-        rows = rows_module.concat_rows(row_ends, keys, split, workspace=plane)
+        split = rows_module.RowSplit.of(10, rank, world)
+        rows = rows_module.concat_rows(
+            row_ends, keys, split, workspace=plane, requests=(cu_rows, cu_keys)
+        )
         score_module._score_concat(
-            torch.zeros(9, 1, 1),
-            torch.zeros(9, 1),
+            torch.zeros(10, 1, 1),
+            torch.zeros(10, 1),
             None,
             rows,
             3,
             False,
             out,
-            gather,
+            (gathered, gathered),
             request_local,
         )
-        assert gathered == [0, 1]
-        for starts, stops in scored:
-            assert all(0 <= a < b <= 310 for a, b in zip(starts, stops))
+    assert set(windows) == {(0, 310), (310, 610)}
     expected = row_ends - 1 + (0 if request_local else row_starts)
+    expected[9] = -1
     assert out[:, 0].tolist() == expected.tolist()
     assert (out[:, 1:] == -1).all()
-
-
-def test_a_dcp_group_gathers_its_requests_off_the_step_tables(monkeypatch):
-    """Under DCP a group's gather reads its requests' rows of the step's block
-    tables (`ConcatKeys`), not the forward's metadata's, which a TBO ubatch
-    cuts to its own requests."""
-    from atom.model_ops.indexer import indexer_forward as forward
-
-    seen = {}
-
-    def fake_gather(kv_cache, k_fp8, k_scale, block_tables, cu_seqlens, preshuffle):
-        seen["tables"] = block_tables.clone()
-
-    monkeypatch.setattr(forward, "cp_gather_indexer_k_quant_cache", fake_gather)
-    monkeypatch.setattr(
-        forward,
-        "get_dcp_group",
-        lambda: SimpleNamespace(world_size=1, rank_in_group=0, device_group=None),
-    )
-    monkeypatch.setattr(
-        torch.distributed, "all_gather_into_tensor", lambda out, inp, group: None
-    )
-    workspace = chunk.ConcatKeyWorkspace(64, 4, torch.uint8, "cpu", 64)
-    step_tables = torch.arange(12).view(6, 2)
-    keys = rows_module.ConcatKeys(step_tables, None, 30, None, workspace=workspace)
-    plan = rows_module.DcpConcatGather(
-        10, torch.tensor([0, 4, 10], dtype=torch.int32), torch.arange(10)
-    )
-    group = rows_module.ConcatGroup(2, 4, 0, 5, 12, 10, plan)
-    ubatch = SimpleNamespace(block_tables=torch.full((3, 2), -1))
-    values, scales = forward._dcp_gather_indexer_k_prefill(
-        None, ubatch, 4, "cpu", keys, group
-    )
-    assert torch.equal(seen["tables"], step_tables[2:4])
-    assert values.shape == (10, 4) and scales.shape == (10, 1)
-
-
-def test_a_ubatch_keeps_the_groups_its_rows_fall_in():
-    """A TBO ubatch reads its rows' starts and the groups its rows fall in,
-    their rows rebased to the ubatch and their keys whole."""
-    groups = _concat_groups_of(
-        np.array([0, 300, 310, 610]), np.array([0, 4, 5, 9]), [(0, 1), (1, 3)]
-    )
-    keys = rows_module.ConcatKeys(None, None, 610, torch.arange(9), groups=groups)
-    ubatch = rows_module.ubatch_concat_keys(keys, 2, 6)
-    assert ubatch.row_starts.tolist() == [2, 3, 4, 5]
-    assert [(g.first, g.row_first, g.row_end, g.total) for g in ubatch.groups] == [
-        (0, 0, 2, 300),
-        (1, 2, 4, 310),
-    ]
-    ubatch = rows_module.ubatch_concat_keys(keys, 5, 9)
-    assert [(g.first, g.row_first, g.row_end) for g in ubatch.groups] == [(1, 0, 4)]
-    assert (
-        rows_module.ubatch_concat_keys(keys._replace(groups=None), 2, 6).groups is None
-    )
 
 
 @pytest.mark.parametrize("world", [2, 4, 8])
