@@ -99,6 +99,9 @@ def test_a_run_tbo_is_turned_off_for_is_not_refused(monkeypatch):
         enable_tbo_decode=True,
         enable_dp_attention=True,
         enable_expert_parallel=True,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=8, data_parallel_size_local=8
+        ),
         moe_all2all_backend="auto",
         prefill_context_parallel_size=1,
         speculative_config=SimpleNamespace(method="mtp"),

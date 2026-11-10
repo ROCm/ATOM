@@ -6,6 +6,12 @@ import pytest
 import torch
 from import_guard import skip_if_dependency_missing
 
+from atom.moe_config import (
+    MoEBackendConfig,
+    MoEParallelMapping,
+    resolve_moe_execution_plan,
+)
+
 try:
     # aiter/triton absent under bare non-GPU pytest
     import atom.model_ops.moe as moe_mod
@@ -15,6 +21,17 @@ except ImportError as exc:
 
 def test_mega_method_is_mxfp4_specialization():
     assert issubclass(moe_mod.MegaMxfp4MoEMethod, moe_mod.Mxfp4MoEMethod)
+
+
+def _parallel(backend="standard", sp=False):
+    mapping = MoEParallelMapping.make(tp_size=8, dp_size=1, enable_ep=not sp)
+    return SimpleNamespace(
+        execution_plan=resolve_moe_execution_plan(
+            mapping,
+            MoEBackendConfig(backend=backend),
+            sequence_parallel_size=4 if sp else 1,
+        )
+    )
 
 
 @pytest.mark.parametrize("sp", [False, True])
@@ -28,14 +45,19 @@ def test_mxfp4_method_selection(monkeypatch, backend_name, sp):
     monkeypatch.setattr(moe_mod, "Mxfp4MoEMethod", lambda *_args: standard_method)
     monkeypatch.setattr(moe_mod, "MegaMxfp4MoEMethod", lambda *_args: mega_method)
 
-    selected = moe_mod._make_mxfp4_moe_method(object(), object())
+    parallel = _parallel(backend_name, sp)
+    selected = moe_mod._make_mxfp4_moe_method(
+        object(), SimpleNamespace(moe_parallel_config=parallel)
+    )
 
     # Under SP, `mega` is SP MegaMoE over the standard method's weights.
     use_mega = backend_name == "mega" and not sp
     assert selected is (mega_method if use_mega else standard_method)
     if sp:
         # Nor does it hold the layer to the EP backend's requirements.
-        moe_mod.FusedMoE._validate_moe_backend(SimpleNamespace(quant_method=selected))
+        moe_mod.FusedMoE._validate_moe_backend(
+            SimpleNamespace(quant_method=selected, moe_parallel_config=parallel)
+        )
 
 
 @pytest.mark.parametrize("fp8_activations", [False, True])
@@ -53,6 +75,7 @@ def test_fp8_activations_interleave_without_the_env_flag(monkeypatch, fp8_activa
         quant_type=object(), quant_dtype=object(), quant_method=None, is_dynamic=True
     )
     moe_config = SimpleNamespace(
+        moe_parallel_config=_parallel(),
         a_quant_dtype=None,
         mxfp4_fp8_activations=fp8_activations,
         use_ep=False,
@@ -93,7 +116,10 @@ def test_eplb_controls_effective_triton_backend(
     # TP, not EP: `use_triton` is `use_triton_moe and not use_ep`, so the
     # expectation below is about the TP half of that pair.
     moe_config = SimpleNamespace(
-        a_quant_dtype=None, mxfp4_fp8_activations=False, use_ep=False
+        moe_parallel_config=_parallel(),
+        a_quant_dtype=None,
+        mxfp4_fp8_activations=False,
+        use_ep=False,
     )
 
     method = moe_mod.Mxfp4MoEMethod(quant_config, moe_config)
@@ -227,6 +253,7 @@ def test_mega_rejects_the_legacy_shared_expert_fusion(monkeypatch):
         moe_mod, "get_current_atom_config", lambda: SimpleNamespace(moe_backend="mega")
     )
     layer = SimpleNamespace(
+        moe_parallel_config=_parallel("mega"),
         quant_method=object.__new__(moe_mod.MegaMxfp4MoEMethod),
         expert_layout=SimpleNamespace(mode=moe_mod.SharedExpertMode.LEGACY_AITER),
     )

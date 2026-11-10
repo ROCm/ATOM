@@ -4,7 +4,6 @@
 import enum
 import fnmatch
 import hashlib
-import importlib.util
 import logging
 import os
 import re
@@ -25,6 +24,11 @@ from atom.model_loader.weight_utils import (
 # plugin-related utilities
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
+)
+from atom.moe_config import (
+    MoEBackendConfig,
+    get_moe_backend_config,
+    moe_execution_plan_for_config,
 )
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
@@ -2198,6 +2202,9 @@ class Config:
     # Post-routing routed-MoE implementation. This is deliberately separate
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
+    # Normalize entry-point flags/env once; resolve worker mappings after
+    # CoreManager/plugin topology changes, before creating weights.
+    moe_backend_config: MoEBackendConfig | None = field(default=None, init=False)
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
     # EPLB master switch + sub-config
     eplb_enable: bool = False
@@ -2425,38 +2432,17 @@ class Config:
         sp_head_shards(getattr(hf_text, "num_key_value_heads", None) or heads, sp)
 
     def _init_moe_backend(self) -> None:
-        self.moe_backend = self.moe_backend.strip().lower()
-        if self.moe_backend not in ("standard", "mega"):
-            raise ValueError(
-                "moe_backend must be one of {'standard', 'mega'}, "
-                f"got {self.moe_backend!r}"
-            )
-        # Under Ulysses SP, `mega` selects SP MegaMoE (sp_mega_moe.py) instead.
-        if self.moe_backend != "mega" or self.sequence_parallel_size > 1:
-            return
-        if not self.enable_expert_parallel:
-            raise ValueError(
-                "moe_backend='mega' requires expert parallelism; pass "
-                "--enable-expert-parallel, or --sequence-parallel-size for SP MegaMoE."
-            )
-        if self.moe_all2all_backend == "rccl":
-            raise ValueError(
-                "moe_backend='mega' owns its MoRI transport and cannot use the "
-                "experimental RCCL prepare/finalize backend"
-            )
+        backend = get_moe_backend_config(self)
+        self.moe_backend = backend.backend
+        self.moe_all2all_backend = backend.all2all_backend
+        backend.validate_request(
+            enable_ep=self.enable_expert_parallel,
+            sequence_parallel_size=self.sequence_parallel_size,
+        )
 
     def __post_init__(self):
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
-        self.moe_all2all_backend = (
-            str(self.moe_all2all_backend or "auto").strip().lower()
-        )
-        if self.moe_all2all_backend not in ("auto", "mori", "rccl", "none"):
-            raise ValueError(
-                "moe_all2all_backend must be one of "
-                "{'auto', 'mori', 'rccl', 'none'}, "
-                f"got {self.moe_all2all_backend!r}"
-            )
         self.prefill_admit_policy = self.prefill_admit_policy.strip().lower()
         if self.prefill_admit_policy not in PREFILL_ADMIT_POLICIES:
             raise ValueError(
@@ -2978,7 +2964,8 @@ class Config:
         """Turn TBO off where it cannot run (`_check_tbo_support` refuses what
         it cannot run with), before anything sizes itself off
         `enable_tbo_decode`."""
-        if self.moe_all2all_backend == "rccl" and self.enable_tbo:
+        moe_plan = moe_execution_plan_for_config(self)
+        if moe_plan.transport == "rccl" and self.enable_tbo:
             logger.warning(
                 "Disabling TBO for the experimental RCCL routed MoE backend; "
                 "the first implementation is synchronous."
@@ -2991,19 +2978,9 @@ class Config:
         # those streams can enter the collectives in opposite order and hang.
         # Keep the fallback usable by serializing it until it has dedicated
         # per-ubatch communicators, analogous to the PCP/TP guard below.
-        mori_ep_enabled = (
-            getattr(self, "moe_all2all_backend", "auto") in {"auto", "mori"}
-            and not envs.ATOM_DISABLE_MORI_EP
-            and importlib.util.find_spec("mori") is not None
-        )
-        if (
-            self.enable_dp_attention
-            and self.enable_expert_parallel
-            and self.enable_tbo
-            and not mori_ep_enabled
-        ):
+        if self.enable_tbo and moe_plan.needs_dp_gather_scatter:
             logger.warning(
-                "Disabling TBO for the DP-attention + EP collective fallback: "
+                "Disabling TBO for the DP MoE collective fallback: "
                 "concurrent all-gather/reduce-scatter ubatches can deadlock. "
                 "Use mori EP or run the fallback without --enable-tbo."
             )
@@ -3272,6 +3249,10 @@ class Config:
         # share one artifact, as they should.
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
+        factors.append(get_moe_backend_config(self))
+        factors.append(getattr(self, "enable_expert_parallel", False))
+        factors.append(getattr(self, "moe_ep_flatten_tp_across_dp", False))
+        factors.append(getattr(self, "dp_logical_size", 0))
         factors.append(self.index_cache_dtype)
         # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
         # graphs (early + late layers) instead of one; both compile under the

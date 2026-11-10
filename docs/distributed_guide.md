@@ -269,41 +269,21 @@ Expert Parallelism distributes MoE experts across GPUs so that each GPU owns a s
 
 ### FusedMoEParallelConfig
 
-The `FusedMoEParallelConfig` dataclass (in `atom/model_ops/moe.py`) determines how MoE layers are parallelized:
+MoE topology and transport are resolved in `atom/moe_config.py`:
 
-```python
-@dataclass
-class FusedMoEParallelConfig:
-    tp_size: int        # Tensor parallel size (1 when EP is active)
-    dp_size: int        # Data parallel size
-    ep_size: int        # Expert parallel size
-    tp_rank: int
-    dp_rank: int
-    ep_rank: int
-    use_ep: bool        # Whether EP is enabled
-    local_ep_size: int  # Number of EP ranks on this node
-```
+- `MoEBackendConfig` normalizes `moe_backend`, `moe_all2all_backend`, low-latency mode, and the MoRI environment settings once. `Config` carries this immutable snapshot into native workers and plugin execution.
+- `MoEParallelMapping` describes the final TP/DP/EP ranks, local EP width, simulated DP ratio, and whether DP and PCP participate in expert sharding. It does not import AITER or create process groups.
+- `MoEExecutionPlan` selects the implementation and the owner of routed-row communication. Weight partitioning, shared-expert routing, prepare/finalize construction, and DP gather/scatter consume this same plan. Startup logs report the resolved mapping, transport, and selection reason once per worker mapping.
 
-Key properties:
+`FusedMoEParallelConfig.make()` reads the worker's actual groups **after** CoreManager or a plugin has finalized the topology and **before** MoE weights are created. Its existing TP/DP/EP properties delegate to the resolved mapping and plan.
 
-- **`use_all2all_kernels`**: returns `True` when `dp_size > 1 and use_ep and mori is available`. This activates the MORI all-to-all dispatch/combine kernels.
-- When EP is enabled, `tp_size` is set to 1 and `ep_size = dp_size * tp_size` (the original TP size). Each device fully owns its assigned experts.
+DP participates in expert sharding only with DP-attention or `moe_ep_flatten_tp_across_dp`. PCP merge (including Ulysses SP) folds PCP into the sharding width in AITER's `DP x PCP x TP` rank order. EP is enabled only when that final width exceeds one. With EP, each device owns whole experts and the MoE TP size becomes one. Pure DP keeps independent expert replicas; enabling EP with TP1 alone does not turn a DP replica into an EP shard.
 
-The `FusedMoEParallelConfig.make()` static method constructs the config:
+For the standard implementation, a real DP expert dispatch group uses explicit RCCL, or MoRI when available and enabled. `auto`/`mori` fall back when MoRI is unavailable or disabled; `none` disables routed all-to-all explicitly. A fallback gathers and scatters DP rows whenever DP participates in sharding, including plugin flattening. Simulated DP keeps the collective fallback because its logical expert map is wider than the real process group. TBO is disabled for concurrent DP gather/scatter or synchronous RCCL execution.
 
-```python
-use_ep = dp_size_ * tp_size_ > 1 and parallel_config.enable_expert_parallel
+Mega owns dispatch, expert compute, and combine. Its plan therefore uses dispatch-space expert IDs but allocates no standard prepare/finalize kernel and performs no outer DP/PCP gather/scatter or TP reduction, including with `--all2all-backend none` or `ATOM_DISABLE_MORI_EP=1`. These switches control the standard transport. Mega refuses EP1, unflattened DP replicas, simulated DP, or RCCL before weight preparation. Under Ulysses SP, Mega instead retains the native TP weight mapping and the existing per-step SP Mega eligibility checks.
 
-if enable_dp_attention:
-    # Flatten DP into TP: effective tp_size = dp_size * tp_size
-    tp_size, tp_rank = flatten_tp_across_dp(dp_rank)
-
-if use_ep:
-    ep_size = tp_size
-    ep_rank = tp_rank
-    # Each device owns experts fully -- no intra-expert tensor parallelism
-    return FusedMoEParallelConfig(tp_size=1, tp_rank=0, ep_size=ep_size, ...)
-```
+The compile cache key includes the normalized MoE backend snapshot and expert-sharding settings, so runs with different transport or backend decisions cannot reuse a graph from the other configuration.
 
 ### Expert distribution
 
@@ -325,7 +305,7 @@ Each GPU only loads weights for its assigned experts, reducing per-GPU memory us
 
 ### MORI communication
 
-When `use_all2all_kernels` is `True`, the `MoriPrepareAndFinalize` class (in `atom/model_ops/fused_moe/mori_prepare_finalize.py`) handles token routing:
+When the plan selects the standard MoRI v1 transport, the `MoriPrepareAndFinalize` class (in `atom/model_ops/fused_moe/mori_prepare_finalize.py`) handles token routing:
 
 **Dispatch phase** (`prepare()`):
 1. Receives input activations, top-k weights, and top-k expert IDs.
