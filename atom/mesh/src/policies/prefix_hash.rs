@@ -235,6 +235,8 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
         let (result, branch) = self.select_worker_impl(workers, info);
+        // Kept for existing scrapers until they move to mesh_route_branch_total.
+        #[allow(deprecated)]
         MeshMetrics::record_worker_prefix_hash_policy_branch(branch.as_str());
         let cost = match branch {
             Branch::LoadBalanceWalk | Branch::FallbackLeastLoad => {

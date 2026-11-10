@@ -438,6 +438,9 @@ impl MeshMetrics {
     }
 
     /// Record prefix hash policy execution branch for routing decisions.
+    #[deprecated(
+        note = "Use record_route_branch: mesh_route_branch_total{policy=\"prefix_hash\"} counts the same branches by pool."
+    )]
     pub fn record_worker_prefix_hash_policy_branch(branch: &'static str) {
         counter!(
             names::PREFIX_HASH_POLICY_BRANCH_TOTAL,

@@ -468,7 +468,7 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     MetricSpec {
         name: names::PREFIX_HASH_POLICY_BRANCH_TOTAL,
         kind: MetricKind::Counter,
-        help: "Prefix hash policy execution branches by branch",
+        help: "Deprecated, use mesh_route_branch_total{policy=\"prefix_hash\"}. Prefix hash policy execution branches by branch",
         status: MetricStatus::Active,
     },
     MetricSpec {
