@@ -3759,3 +3759,28 @@ def test_the_dense_codec_id_is_unchanged_and_v41_has_its_own():
     v41 = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"))
     assert keys.codec_id(dense) == "dense-opaque-block-v1"  # stored entries stay valid
     assert keys.codec_id(v41) == "replay-page-block-v1"
+
+
+def test_an_answer_taken_late_is_as_old_as_its_store_query(cluster):
+    """The asynchronous lookup answered long before admission took the answer:
+    its read lease ran from the query, so the load renews it before dispatch."""
+    scheduler = MooncakeStoreOffloadScheduler(_config("kv_consumer"))
+    scheduler._min_load_tokens = 0
+    seq = _seq(61, 40)
+    sid = str(seq.id)
+    client = scheduler._lookup_client
+    assert client.submit(seq, sid)
+    for _ in range(200):
+        if client.answered(sid):
+            break
+        time.sleep(0.005)
+    assert client.answered(sid)
+    client.asked_at[sid] = time.monotonic() - 5.0  # answered 5 s ago
+    scheduler._fresh_tier_lookup(seq, sid)
+    assert time.monotonic() - scheduler._looked_up_at[sid] >= 5.0
+    renewed = []
+    client.renew = lambda *args: renewed.append(args) or 0
+    spec = LoadSpec(hbm_cached_tokens=0, lmcache_cached_tokens=16, can_load=True)
+    scheduler._ensure_lookup_pin(seq, sid, spec)
+    assert renewed  # an old answer is confirmed again before the get
+    scheduler.close()

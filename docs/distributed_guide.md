@@ -239,8 +239,8 @@ where it lands and the router balances purely by work:
   counts it.
 - **Rank backlog**: each DP engine core reports `(requests ingested, prefill
   tokens left)` when it changed, at most every 10 ms
-  (`EngineCoreRequestType.PREFILL_BACKLOG`, which also carries the reuse
-  reports above).
+  (`EngineCoreRequestType.PREFILL_BACKLOG`). The reuse reports above go on
+  their own (`DP_REUSE`), queued ahead of the request's first output.
   A started request counts `prompt - num_cached_tokens`, so HBM hits, tier
   loads and finished chunks all shrink it as they happen; a request not yet
   allocated counts the router's estimate. The CoreManager adds the charges of

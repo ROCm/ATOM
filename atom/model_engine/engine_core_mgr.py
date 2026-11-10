@@ -832,9 +832,11 @@ class CoreManager:
                         self.latest_metrics[dp_rank] = data
                     elif request_type == EngineCoreRequestType.PREFILL_BACKLOG:
                         with self._lb_lock:
-                            self._backlog_report[dp_rank] = data[:2]
+                            self._backlog_report[dp_rank] = data
                             self._backlog_pop_seen_locked(dp_rank)
-                            self._note_dp_reuse_locked(data[2] if len(data) > 2 else ())
+                    elif request_type == EngineCoreRequestType.DP_REUSE:
+                        with self._lb_lock:
+                            self._note_dp_reuse_locked(data)
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self._route_utility_response(dp_rank, data)
                     elif request_type == EngineCoreRequestType.ADD:

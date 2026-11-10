@@ -22,7 +22,7 @@ from atom.model_engine.dynamic_chunking import (
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
-from atom.model_engine.prefill_backlog import prefill_backlog
+from atom.model_engine.prefill_backlog import flush_dp_reuse, prefill_backlog
 from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
@@ -581,6 +581,8 @@ class EngineCore:
         self._kv_progress_event.wait(KV_IDLE_DRAIN_INTERVAL_S)
 
     def _postprocess(self, seqs, fwd_out, batch):
+        # Ahead of this step's outputs, which complete or release placements.
+        flush_dp_reuse(self.scheduler, self.output_queue)
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
             seqs,
@@ -787,28 +789,22 @@ class EngineCore:
     BACKLOG_REPORT_INTERVAL_S = 0.01
 
     def _report_prefill_backlog(self, now: float) -> None:
-        """Push (seqs ingested, prefill tokens still to compute, reuse reports)
-        when it changed, at most every `BACKLOG_REPORT_INTERVAL_S`.
+        """Push (seqs ingested, prefill tokens still to compute) when it changed,
+        at most every `BACKLOG_REPORT_INTERVAL_S`.
 
         For `share_cache` DP routing, which balances on what each rank really
         has left to prefill (`Scheduler.pending_prefill_tokens`). A running seq
         that has produced tokens is decoding and counts nothing; a preempted one
-        waits to prefill again and counts what it must recompute. The reuse
-        reports (`Scheduler.dp_reuse_reports`) let the router drop prefixes this
-        rank did not find.
+        waits to prefill again and counts what it must recompute.
         """
         if now < self._next_backlog_report:
             return
         self._next_backlog_report = now + self.BACKLOG_REPORT_INTERVAL_S
-        reuse = getattr(self.scheduler, "dp_reuse_reports", None)
-        reports = ()
-        if reuse:
-            reports, self.scheduler.dp_reuse_reports = reuse, []
         backlog = prefill_backlog(self.scheduler)
         report = (self._ingested_seqs, backlog)
-        if report != self._last_backlog_report or reports:
+        if report != self._last_backlog_report:
             self._last_backlog_report = report
-            self.output_queue.put_nowait(("PREFILL_BACKLOG", (*report, reports)))
+            self.output_queue.put_nowait(("PREFILL_BACKLOG", report))
 
     def _offer_tier_lookups(self, reqs) -> None:
         """Let an offload connector start tier lookups for arrived requests.
@@ -931,6 +927,11 @@ class EngineCore:
 
                 if isinstance(item, tuple) and item[0] == "PREFILL_BACKLOG":
                     obj = pickle.dumps((EngineCoreRequestType.PREFILL_BACKLOG, item[1]))
+                    socket.send(obj)
+                    continue
+
+                if isinstance(item, tuple) and item[0] == "DP_REUSE":
+                    obj = pickle.dumps((EngineCoreRequestType.DP_REUSE, item[1]))
                     socket.send(obj)
                     continue
 

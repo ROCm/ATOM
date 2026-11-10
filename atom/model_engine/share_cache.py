@@ -69,9 +69,10 @@ class ShareCacheRouter:
         # producer seq id -> hashes it produced (dropped if it leaves unprefilled).
         self.produced: dict[Any, list[int]] = {}
         # A newcomer computing a prefix whose owner is still prefilling it does
-        # not take the entry over: hash -> (rank, seq id) of the one that would
-        # carry it if the owner leaves unprefilled (`_backing`: its hashes).
-        self.backups: dict[int, tuple[int, Any]] = {}
+        # not take the entry over: hash -> the (rank, seq id) of every such
+        # request, in arrival order; the first one left carries the entry if
+        # the owner leaves unprefilled (`_backing`: each one's hashes).
+        self.backups: dict[int, list[tuple[int, Any]]] = {}
         self._backing: dict[Any, list[int]] = {}
         self._prefilling: set = set()
         self._est_hit: dict = {}
@@ -107,10 +108,9 @@ class ShareCacheRouter:
         # What it computed beside an owner still prefilling is in the tier now
         # too: it carries the entry, so the prefix counts as loadable.
         for h in self._backing.pop(seq_id, ()):
-            backup = self.backups.get(h)
-            if backup is None or backup[1] != seq_id:
+            backup = self._drop_backup(h, seq_id)
+            if backup is None:
                 continue
-            del self.backups[h]
             owner = self.index.get(h)
             if owner is not None and owner[1] in self._prefilling:
                 self.index[h] = backup
@@ -129,7 +129,10 @@ class ShareCacheRouter:
         for h in self.produced.pop(seq_id, ()):
             entry = self.index.get(h)
             if entry is not None and entry[1] == seq_id:
-                backup = self.backups.pop(h, None)
+                waiting = self.backups.get(h)
+                backup = waiting.pop(0) if waiting else None
+                if waiting is not None and not waiting:
+                    del self.backups[h]
                 if backup is not None:
                     self.index[h] = backup
                     # The promoted request now produces this prefix: if it too
@@ -141,9 +144,19 @@ class ShareCacheRouter:
                 else:
                     del self.index[h]
         for h in self._backing.pop(seq_id, ()):
-            backup = self.backups.get(h)
-            if backup is not None and backup[1] == seq_id:
+            self._drop_backup(h, seq_id)
+
+    def _drop_backup(self, h: int, seq_id):
+        """Remove `seq_id` from the backups of `h`; its (rank, seq id), or None."""
+        waiting = self.backups.get(h)
+        if not waiting:
+            return None
+        backup = next((b for b in waiting if b[1] == seq_id), None)
+        if backup is not None:
+            waiting.remove(backup)
+            if not waiting:
                 del self.backups[h]
+        return backup
 
     # -- placement -------------------------------------------------------------
 
@@ -250,6 +263,11 @@ class ShareCacheRouter:
             owner = index.get(h)
             if (i + 1) * hbs <= reused and owner is not None:
                 index.move_to_end(h)
+                if owner[1] != seq_id and owner[1] in self._prefilling:
+                    # Reused from a producer still prefilling it: if that one
+                    # leaves unprefilled, this request computes the prefix.
+                    self.backups.setdefault(h, []).append((rank, seq_id))
+                    backing.append(h)
                 continue
             if (
                 owner is not None
@@ -260,7 +278,7 @@ class ShareCacheRouter:
                 # entry over would lose the prefix if this request left first
                 # (its release drops what it produced); rely on the owner and
                 # stand by to carry the entry.
-                self.backups[h] = (rank, seq_id)
+                self.backups.setdefault(h, []).append((rank, seq_id))
                 backing.append(h)
                 continue
             index.pop(h, None)

@@ -576,9 +576,15 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         num_prompt = int(seq.num_prompt_tokens)
         if self._loadable_hit(num_prompt, num_prompt) < self._min_load_tokens:
             return 0
-        # Stamped before asking: the lease runs from the master's answer.
+        # Stamped before asking: the lease runs from the master's answer. An
+        # answer the asynchronous lookup took earlier is as old as its query.
         self._looked_up_at[sid] = time.monotonic()
-        return super()._fresh_tier_lookup(seq, sid)
+        hit = super()._fresh_tier_lookup(seq, sid)
+        query_started = getattr(self._lookup_client, "query_started", None)
+        started = query_started(sid) if callable(query_started) else None
+        if started is not None and started < self._looked_up_at.get(sid, started):
+            self._looked_up_at[sid] = started
+        return hit
 
     def _ensure_lookup_pin(self, seq: Any, sid: str, spec: LoadSpec) -> bool:
         """Renew the read leases of what a load reads; the load always goes ahead.

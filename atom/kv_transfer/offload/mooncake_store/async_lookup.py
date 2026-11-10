@@ -12,6 +12,7 @@ import logging
 import queue
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from threading import Lock, RLock
@@ -106,6 +107,9 @@ class AsyncStoreLookup:
         self.renew_executor = DaemonExecutor("store-renew", limit=64)
         self.backend_lock = Lock()
         self.pending = {}
+        # sid -> when its Store query was sent: the read lease the answer grants
+        # runs from then, not from when the scheduler takes the answer.
+        self.asked_at: OrderedDict = OrderedDict()
         self.discarded = set()
         self.discarded_hits = {}
         self.closed = False
@@ -115,7 +119,17 @@ class AsyncStoreLookup:
 
     def _query(self, seq, sid):
         with self.backend_lock:
+            with self.lock:
+                self.asked_at[sid] = time.monotonic()
+                self.asked_at.move_to_end(sid)
+                while len(self.asked_at) > 2 * self.capacity:
+                    self.asked_at.popitem(last=False)
             return self.backend.lookup(seq, lookup_id=sid)
+
+    def query_started(self, sid):
+        """When the Store query behind `sid`'s answer was sent; None if unknown."""
+        with self.lock:
+            return self.asked_at.get(sid)
 
     def submit(self, seq, sid):
         with self.lock:
@@ -195,6 +209,7 @@ class AsyncStoreLookup:
 
     def clear_lookup_status(self, sid):
         with self.lock:
+            self.asked_at.pop(sid, None)
             f = self.pending.pop(sid, None)
             if f is not None:
                 f.cancel()
