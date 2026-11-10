@@ -600,7 +600,7 @@ def dequant_weight_online(
         return weight
 
     # MXFP4 (E2M1 + 1x32 E8M0): a checkpoint format that has to be converted
-    # where the GPU has no FP4 MFMA (gfx94x), e.g. V4.1's routed experts.
+    # where the GPU has no FP4 MFMA, e.g. V4.1's routed experts.
     if (
         source_quant_type == QuantType.per_1x32
         and source_quant_dtype == torch.float4_e2m1fn_x2

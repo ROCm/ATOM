@@ -23,8 +23,8 @@ expert dispatch, quantization, shared overlap and combination stay in V4.
 The shared expert stays its own module rather than taking a routed slot: both
 are scaled per 1x32, but the shared one is FP8 where the routed ones are FP4,
 and one buffer holds one dtype. V4's checkpoints are the same pair, so there is
-no fused variant to inherit. gfx94x is the exception: there the routed experts
-are re-quantized to per-channel FP8 at load, and `_SharedExpertFold` moves the
+no fused variant to inherit. The exception is where the routed experts are
+re-quantized to per-channel FP8 at load: `_SharedExpertFold` moves the
 shared expert into the same buffers after loading
 (`ATOM_DSV41_FOLD_SHARED_EXPERT`).
 """
@@ -51,14 +51,14 @@ from atom.utils.forward_context import get_forward_context, pass_scheduled_token
 
 
 class _SharedExpertFold(nn.Module):
-    """gfx94x: fold the shared expert into the routed experts' FP8 buffers.
+    """Fold the shared expert into the routed experts' FP8 buffers.
 
     There the routed experts are online-quantized to per-channel FP8 and run by
     the clamped Triton MoE, and the shared expert -- the same shape per rank
     (inter / TP) and the same clamped SwiGLU -- is four launches of its own
     (gate_up GEMM, act, down GEMM, add). Folded in as expert `E` with weight 1
     on every row, it costs the MoE one more expert's weights instead. Its
-    weights go from the checkpoint's 32x32-block FP8 (BF16 on gfx94x) to the
+    weights go from the checkpoint's 32x32-block FP8 (dequantized to BF16) to the
     routed experts' per-channel FP8, and its input to their per-token FP8.
 
     A child registered after `shared_experts`: the loader's pre-order

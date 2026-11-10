@@ -394,7 +394,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
             for s in shards
         }
         (group_rows, _, width, preshuffled), *others = layouts
-        # Where the native group32 linears run as dequantized BF16 (gfx94x)
+        # Where the native group32 linears run as dequantized BF16
         # there are no FP8 weights and scales to fuse for `native_quant_linear`;
         # the per-stage path projects through each stage's own linear.
         bf16 = any(s.weight.dtype == torch.bfloat16 for s in shards)

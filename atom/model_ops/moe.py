@@ -3298,7 +3298,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data[expert_id] = w2_q
                 layer.w2_weight_scale.data[expert_id] = w2_s.squeeze(-1)
 
-        # gfx94x with a SwiGLU clamp: aiter's per-token FP8 MoE there (the asm
+        # With a SwiGLU clamp: aiter's per-token FP8 MoE here (the asm
         # one-stage kernels) drops `swiglu_limit`, so these layers run the
         # clamped Triton experts, which read the weights row-major. Those
         # implement clamped SiLU(gate) * up with dynamic per-token activation
@@ -3314,7 +3314,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and self.fused_experts is None
             and getattr(layer, "expert_mask", None) is None
         )
-        # The same clamped experts on AITER's gfx942 FlyDSL MoE (opt-in: it needs
+        # The same clamped experts on AITER's FlyDSL MoE (opt-in: it needs
         # an AITER with the SiLU clamp and 64-bit expert offsets), which reads
         # the (16, 16)-preshuffled weights.
         from atom.model_ops.fused_moe_ptpc_clamp import flydsl_moe_available
@@ -4329,7 +4329,7 @@ class FusedMoE(torch.nn.Module):
         # Switch quant_method and allocate target quantized-type buffers.
         if online_quant_dtype == dtypes.fp8:
             self.quant_method = Fp8MoEMethod(online_quant_config, self.moe_config)
-            # The online quantizer below emits the platform FP8 (FNUZ on gfx94x)
+            # The online quantizer below emits the platform FP8
             # as values, not OCP checkpoint bytes, so the e4m3fn -> e4m3fnuz
             # fixup in process_weights_after_loading must not run: it would
             # reinterpret them and double every scale.

@@ -163,9 +163,9 @@ def check_mxfp4_preshuffle_k(prefix: str, weight: torch.Tensor) -> None:
 def native_group32_runs_bf16() -> bool:
     """Whether native E4M3/E8M0 group32 linears run as BF16 on this GPU.
 
-    gfx94x has no microscaling MFMA, and AITER's group32 FP8 GEMM asserts
-    gfx950. There the 32x32 / 1x32 FP8 weights are dequantized once at load
-    and the GEMM runs in BF16 (hipBLASLt via tgemm).
+    Without microscaling MFMA there is no group32 FP8 GEMM. There the
+    32x32 / 1x32 FP8 weights are dequantized once at load and the GEMM runs
+    in BF16 (hipBLASLt via tgemm).
     """
     from aiter.jit.utils.chip_info import get_gfx
 
@@ -1381,7 +1381,7 @@ class LinearBase(nn.Module):
                 and self.weight.dtype == torch.float8_e4m3fn
                 and native_group32_runs_bf16()
             ):
-                # gfx94x: no group32 FP8 GEMM, keep the dequantized BF16 weight
+                # No group32 FP8 GEMM here: keep the dequantized BF16 weight
                 # instead. The scales are folded in, so drop them.
                 self.weight = atom_parameter(
                     dequantize_native_group32_weight(
@@ -1656,7 +1656,7 @@ class LinearBase(nn.Module):
             self.native_a8_group_rows is not None
             and self.weight.dtype == torch.bfloat16
         ):
-            # gfx94x BF16 fallback of a native group32 linear; an upstream fused
+            # BF16 fallback of a native group32 linear; an upstream fused
             # quant may still hand over FP8 activations with 1x32 E8M0 scales.
             if x_scale is not None:
                 x = dequantize_group32_activation(x, x_scale)

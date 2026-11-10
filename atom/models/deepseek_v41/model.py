@@ -42,14 +42,14 @@ def install_v41_quant_lookup(cfg):
     """V4.1's MoE quantization lookup over V4's, for the backbone and the draft.
 
     - The shared expert is native FP8 32x32 like the attention projections.
-      The generic parser resolves it to `dtypes.fp8`, which is E4M3FNUZ on
-      gfx94x and so misses the native group32 path there; it is pinned to the
-      spec the attention linears use (identical to the parsed one on gfx950),
+      The generic parser resolves it to `dtypes.fp8`, which can be E4M3FNUZ
+      and then misses the native group32 path; it is pinned to the spec the
+      attention linears use (identical to the parsed one for OCP E4M3),
       unless an online config names it (a pattern, or a global one), as in V4.
     - V4 pins the routed experts to their checkpoint FP4 on the online lookup
       too, so `--online_quant_config` never reaches them. Here an explicit
-      online pattern for the routed experts (e.g. ptpc_fp8 on gfx94x, which has
-      no FP4 MFMA) is honoured; without one nothing changes.
+      online pattern for the routed experts (e.g. ptpc_fp8 where there is no
+      FP4 MFMA) is honoured; without one nothing changes.
     """
     v4_lookup = cfg.get_layer_quant_config
     shared_spec = native_quant_config().global_spec

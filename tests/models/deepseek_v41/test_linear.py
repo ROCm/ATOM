@@ -122,7 +122,7 @@ def test_parallel_source_slices_and_scale_alignment(linear_modules, kind):
         shard = weight.chunk(4, axis)[rank].contiguous()
         scale_shard = scales.chunk(4, axis)[rank]
         if linear.native_group32_runs_bf16():
-            # gfx94x has no group32 FP8 GEMM: the shard is dequantized once at
+            # No group32 FP8 GEMM here: the shard is dequantized once at
             # load (each value times its 32x32 block's power of two) and the
             # scales are folded in.
             block_scale = scale_shard.float().repeat_interleave(32, 0)

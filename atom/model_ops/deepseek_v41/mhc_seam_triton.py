@@ -8,7 +8,7 @@ token's H columns in a serial loop. At decode widths that loop is the reduce's
 critical path on a few CUs. Here the reduce's grid is (T, H / BLOCK_C): every
 program normalizes one column chunk (each re-summing the norm's partial, 160
 floats), and the chunk-0 program alone computes the gates. Same arithmetic per
-value; on MI308X the reduce drops from ~11.5 to ~8 us at 1-32 tokens.
+value, so the results are bitwise those of AITER's reduce.
 """
 
 import torch

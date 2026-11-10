@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""Routed experts with FP8 per-channel weights and a SwiGLU clamp, for gfx94x.
+"""Routed experts with FP8 per-channel weights and a SwiGLU clamp.
 
-aiter's per-token FP8 MoE on gfx94x (the one-stage asm ``fmoe_*_pertokenFp8``
+aiter's per-token FP8 MoE (the one-stage asm ``fmoe_*_pertokenFp8``
 kernels, which it always picks when the intermediate is not a multiple of 128)
 fuses the activation and ignores ``swiglu_limit``. Models whose experts were
 trained with a clamp (DeepSeek-V4/V4.1: gate <= limit, |up| <= limit) need it:
@@ -31,7 +31,7 @@ from aiter import fused_moe as _aiter_fused_moe
 from aiter.fused_moe import moe_sorting
 
 # FlyDSL's sort is ~1.5-2x faster than the default (opus) one at decode widths
-# on MI308X (M <= 16: 15 vs 22-30 us); from 32 tokens the default multiphase
+# (M <= 16: 15 vs 22-30 us); from 32 tokens the default multiphase
 # sort is faster. Same output contract (sorted ids, weights, block experts,
 # valid count).
 _flydsl_moe_sorting = getattr(_aiter_fused_moe, "_flydsl_moe_sorting", None)
@@ -182,7 +182,7 @@ def _topk_sum_kernel(
 
 def _configs(m: int):
     """((BLOCK_M, BLOCK_N, BLOCK_K, warps, stages[, B cache modifier]) for GEMM1,
-    same for GEMM2), swept on MI308X (80 CU) at V4.1-Flash TP4 (E 384, hidden
+    same for GEMM2), swept at V4.1-Flash TP4 (E 384, hidden
     5120, inter 576, top-6). BLOCK_M is also the sort's block size, so the two
     must agree. The decode widths are per CUDA-graph capture size, swept with
     measured routing over eight distinct layers a graph (no Infinity Cache
@@ -234,7 +234,7 @@ def _route_rows_kernel(
 
 
 def _flydsl_config(m: int) -> str:
-    """AITER gfx942 FlyDSL MoE config per token count, measured at V4.1-Flash
+    """AITER FlyDSL MoE config per token count, measured at V4.1-Flash
     TP4 (E 385 with the folded shared expert, top-7, inter 576, cold weights):
     the direct batch-1 kernels at 2 tokens, 16-row split-K decode tiles to 16,
     the 128-wide ones to 256 (its decode limit), the prefill pipeline above."""
@@ -270,9 +270,9 @@ def flydsl_moe_ptpc_clamp(
     shared_slot: int | None = None,
     num_valid_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """`fused_moe_ptpc_clamp`'s contract on AITER's gfx942 FlyDSL MoE: w13 / w2
+    """`fused_moe_ptpc_clamp`'s contract on AITER's FlyDSL MoE: w13 / w2
     preshuffled (16, 16), per-channel fp32 scales [E, 2I] / [E, D]. Needs an
-    AITER whose gfx9 FP8 Gate/Up clamps its SiLU path by swiglu_limit and
+    AITER whose FP8 Gate/Up clamps its SiLU path by swiglu_limit and
     offsets expert weights in 64 bits (E * 2I * D past 2^31 at V4.1 TP4)."""
     from aiter import ActivationType, QuantType
     from aiter.ops.flydsl.fused_moe_gfx942 import run_flydsl_moe_gfx942

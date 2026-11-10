@@ -421,7 +421,7 @@ def validate_runtime_config(config):
         ("RapidServe", config.enable_rapidserve),
         (
             # Only the routed experts may be re-quantized at load (e.g. FP4 ->
-            # ptpc_fp8 on gfx94x, which has no FP4 MFMA); the native FP8 32x32
+            # ptpc_fp8 where there is no FP4 MFMA); the native FP8 32x32
             # linears and everything else keep their checkpoint layouts.
             "online quantization other than of the routed experts",
             not _online_quant_is_routed_experts_only(config.online_quant_config),

@@ -294,8 +294,8 @@ class Attention(nn.Module):
         self.kv_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         # Both latents are slices of the one `wqkv_a` output and neither norm
         # reads the other's result, so they are one launch rather than two.
-        # On gfx94x wq_b / indexer.wq_b run as BF16 GEMMs (native group32 FP8
-        # has no GEMM there), so Q stays BF16 instead of a quantize/dequantize
+        # Where wq_b / indexer.wq_b run as BF16 GEMMs (native group32 FP8
+        # has no GEMM there), Q stays BF16 instead of a quantize/dequantize
         # round trip.
         self.qk_norm = (
             DualRMSNormBF16(
@@ -419,7 +419,7 @@ class Attention(nn.Module):
         """
         rows = output.shape[:-2].numel()
         if self.wo_a.weight.dtype == torch.bfloat16:
-            # gfx94x: wo_a was dequantized at load (no mxscale BMM there), so
+            # wo_a was dequantized at load (no mxscale BMM here), so
             # the inverse RoPE stays in BF16 -- no group quant to undo.
             x = output.reshape(rows, self.heads, self.head_dim)
             if not x.is_contiguous():
@@ -531,7 +531,7 @@ class Attention(nn.Module):
             hidden, qr, qr_scale, cache, step, rope, compressed=compressed
         )
         if queries is not None:
-            if qr_scale is None:  # BF16 Q (gfx94x)
+            if qr_scale is None:  # BF16 Q
                 (qr,) = queries.take(qr)
             else:
                 qr, qr_scale = queries.take(qr, qr_scale)

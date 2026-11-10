@@ -206,7 +206,6 @@ def v41_mhc_pre_delayed(
     *outer, hc_mult, hidden = residual.shape
     rows = residual.numel() // (hc_mult * hidden)
     with_post = sublayer_output is not None
-    # gfx94x: AITER's Triton seam with the column-parallel reduce (mhc_seam_triton).
     kernel = (
         mhc_seam_triton
         if get_gfx_runtime().startswith("gfx94")

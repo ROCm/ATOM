@@ -581,7 +581,7 @@ def _sparse_attn_v4_split_combine_kernel(
 # never cut a token's keys finer than the minimum below. `ATOM_V4_ATTN_SPLIT_KV=0`
 # disables it.
 #
-# gfx94x (tuned on MI308X, 80 CUs, V4.1-Flash TP4: 16 heads, ~640 keys a token):
+# `_split_tuning`'s first branch (V4.1-Flash TP4: 16 heads, ~640 keys a token):
 # a decode step's keys are scattered rows of a pool tens of GB large, so the
 # split kernel waits on TLB misses rather than on bandwidth (~2x slower than
 # over a 1.5 GB pool) and more, smaller splits keep more of them in flight: 32
