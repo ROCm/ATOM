@@ -1730,14 +1730,19 @@ function appendDashboardModeSelector(bar) {
   bar.appendChild(serving);
 }
 
+// Moves AgentX onto hardware that has AgentX points; leaves it alone when none exist.
+function ensureAgentxHardware() {
+  if (!allAgentxHardware.length || allAgentxHardware.includes(selectedHardware())) return false;
+  state.filters.hardware = [allAgentxHardware.includes(defaultHardware) ? defaultHardware : allAgentxHardware[0]];
+  return true;
+}
+
 function setDashboardMode(mode) {
   if (!DASHBOARD_MODES.includes(mode) || state.dashboardMode === mode) return;
   state.dashboardMode = mode;
   if (NON_AGENTX_MODES.includes(mode)) state.lastNonAgentxMode = mode;
   if (!dashboardTabs().includes(state.activeTab)) state.activeTab = 'performance';
-  if (mode === 'AgentX' && !allAgentxHardware.includes(selectedHardware())) {
-    state.filters.hardware = [allAgentxHardware.includes(defaultHardware) ? defaultHardware : allAgentxHardware[0]];
-  }
+  if (mode === 'AgentX') ensureAgentxHardware();
   renderFilters();
   updateHeaderGpuMeta();
   renderKPICards();
@@ -1813,6 +1818,7 @@ function renderFilters() {
     state.filters.axModels = [...allAgentxModels];
     state.filters.axFrameworks = [...allAgentxFrameworks];
     state.filters.axConc = [...allAgentxConc];
+    if (state.dashboardMode === 'AgentX') ensureAgentxHardware();
     renderFilters();
     updateHeaderGpuMeta();
     renderActiveTab();
@@ -3421,45 +3427,54 @@ function syncToHash() {
   window.location.hash = parts.join('&');
 }
 
-function readFromHash() {
-  const hash = window.location.hash.slice(1);
+// Everything syncToHash writes, at its default; readFromHash starts from here.
+function resetHashState() {
   state.dashboardMode = 'Aggregated';
+  state.activeTab = 'performance';
+  state.filters.backends = [...allBackends];
+  state.filters.models = [...allModels];
+  state.filters.islOsl = [...allIslOsl];
+  state.filters.conc = [...allConc];
+  state.filters.hardware = [defaultHardware];
+  state.filters.axModels = [...allAgentxModels];
+  state.filters.axFrameworks = [...allAgentxFrameworks];
+  state.filters.axConc = [...allAgentxConc];
+  state.agentxShowAll = false;
+  state.agentxIntvtyMetric = ATOMESH_INTERACTIVITY_METRICS[0].key;
+}
+
+// A parameter the hash omits means its default; a present but empty list means none selected.
+function readFromHash() {
+  resetHashState();
+  const hash = window.location.hash.slice(1);
   if (!hash) return;
   let openAgentx = false;
   for (const part of hash.split('&')) {
-    const [k, v] = part.split('=');
-    if (!v) continue;
+    const [k, v = ''] = part.split('=');
+    const list = v ? v.split(',') : [];
     if (k === 'mode' && DASHBOARD_MODES.includes(v)) {
       state.dashboardMode = v;
       if (NON_AGENTX_MODES.includes(v)) state.lastNonAgentxMode = v;
     }
-    if (k === 'backend') state.filters.backends = v.split(',').filter(b => allBackends.includes(b));
-    if (k === 'model') state.filters.models = v.split(',').filter(m => allModels.includes(m));
+    if (k === 'backend') state.filters.backends = list.filter(b => allBackends.includes(b));
+    if (k === 'model') state.filters.models = list.filter(m => allModels.includes(m));
     if (k === 'isl') {
       // Agentic traces moved to AgentX, so an old agentic-trace link opens AgentX.
-      if (v.split(',').includes(LEGACY_AGENTIC_ISL_FILTER)) { openAgentx = true; continue; }
-      state.filters.islOsl = v.split(',').filter(i => allIslOsl.includes(i));
+      if (list.includes(LEGACY_AGENTIC_ISL_FILTER)) { openAgentx = true; continue; }
+      state.filters.islOsl = list.filter(i => allIslOsl.includes(i));
     }
-    if (k === 'conc') state.filters.conc = v.split(',').map(Number).filter(c => allConc.includes(c));
-    if (k === 'hardware') {
-      const hw = v.split(',')[0];
-      state.filters.hardware = hw && allHardware.includes(hw) ? [hw] : [defaultHardware];
-    }
-    if (k === 'axmodel') state.filters.axModels = v.split(',').filter(m => allAgentxModels.includes(m));
-    if (k === 'axfw') state.filters.axFrameworks = v.split(',').filter(f => allAgentxFrameworks.includes(f));
+    if (k === 'conc') state.filters.conc = list.map(Number).filter(c => allConc.includes(c));
+    if (k === 'hardware' && allHardware.includes(list[0])) state.filters.hardware = [list[0]];
+    if (k === 'axmodel') state.filters.axModels = list.filter(m => allAgentxModels.includes(m));
+    if (k === 'axfw') state.filters.axFrameworks = list.filter(f => allAgentxFrameworks.includes(f));
+    if (k === 'axconc') state.filters.axConc = list.map(Number).filter(c => allAgentxConc.includes(c));
     if (k === 'axall') state.agentxShowAll = v === '1';
     if (k === 'axintvty' && ATOMESH_INTERACTIVITY_METRICS.some(m => m.key === v)) state.agentxIntvtyMetric = v;
-    if (k === 'axconc') state.filters.axConc = v.split(',').map(Number).filter(c => allAgentxConc.includes(c));
-    if (k === 'tab') {
-      state.activeTab = v;
-      document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === v));
-      document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === 'tab-' + v));
-    }
+    if (k === 'tab' && v) state.activeTab = v;
   }
-  if (openAgentx) {
-    state.dashboardMode = 'AgentX';
-    syncToHash();
-  }
+  if (openAgentx) state.dashboardMode = 'AgentX';
+  const movedHardware = state.dashboardMode === 'AgentX' && ensureAgentxHardware();
+  if (openAgentx || movedHardware) syncToHash();
 }
 
 /* ================================================================
@@ -4637,10 +4652,20 @@ function renderAgentxTab() {
         maintainAspectRatio: false,
         layout: { padding: { top: 8, right: 16 } },
         plugins: {
-          legend: { labels: {
-            color: C_LEGEND, font: { size: 11 }, usePointStyle: true, boxWidth: 8, boxHeight: 8,
-            filter: item => !spec.datasets[item.datasetIndex]._offFrontier,
-          } },
+          legend: {
+            labels: {
+              color: C_LEGEND, font: { size: 11 }, usePointStyle: true, boxWidth: 8, boxHeight: 8,
+              filter: item => !spec.datasets[item.datasetIndex]._offFrontier,
+            },
+            // One entry per framework, so it toggles the frontier and its non-optimal points together.
+            onClick: (_e, item, legend) => {
+              const chart = legend.chart;
+              const framework = spec.datasets[item.datasetIndex]._framework;
+              const visible = !chart.isDatasetVisible(item.datasetIndex);
+              spec.datasets.forEach((d, i) => { if (d._framework === framework) chart.setDatasetVisibility(i, visible); });
+              chart.update();
+            },
+          },
           tooltip: { ...chartTooltipOpts(), callbacks: {
             title: items => {
               const c = items[0].raw.row;
