@@ -70,6 +70,51 @@ def _aiter():
     return aiter
 
 
+# Process-local: the site-side enablement is idempotent at the point of use.
+_ENSURE_DONE = False
+
+
+def _ensure_plugin_enabled(aiter, plugin, enabled):
+    """Make this process's aiter.plugin configuration match the deployment.
+
+    ModelRunner configures before model build, but the forward path can run in a
+    worker/child context that never saw that call (fork/spawn, model
+    re-instantiation).  The aiter interface has one process-local config, so the
+    site re-asserts it once, at the first routed call, and logs the resulting
+    ``enabled``/``routed_ops`` so an empty case is loud.
+    """
+    global _ENSURE_DONE
+    status = None
+    try:
+        # A lazy-op export registers its @route entry on first attribute access.
+        getattr(aiter, _OP_NAME)
+        status = plugin.status()
+        if not tuple(status.get("enabled", ()) or ()) and enabled:
+            from atom.aiter_provider import atom_version
+
+            plugin.configure(source=f"atom {atom_version()}", enable=enabled)
+            status = plugin.status()
+    except Exception:
+        logger.warning(
+            "gemm_fusion: could not re-assert aiter provider enablement; "
+            "explain() will decide",
+            exc_info=True,
+        )
+    if not _ENSURE_DONE:
+        _ENSURE_DONE = True
+        if status is None:
+            logger.warning(
+                "aiter plugin status unavailable; provider explain will decline"
+            )
+        else:
+            logger.info(
+                "aiter plugin enabled=%s routed=%s",
+                tuple(status.get("enabled", ()) or ()),
+                tuple(status.get("routed_ops", {}) or {}),
+            )
+    return status
+
+
 def _shared_outputs(device, mode, impl, rows):
     key = (
         str(device),
@@ -185,7 +230,8 @@ class QkvSite:
         self.mode = mode
         self.out_width = out_width
         self.world = int(config.sequence_parallel_size)
-        self.provider_enabled = bool(getattr(config, "aiter_provider_enable", ()) or ())
+        self.provider_enable = tuple(getattr(config, "aiter_provider_enable", ()) or ())
+        self.provider_enabled = bool(self.provider_enable)
         self._norm_f32 = {}
         self._routes = {}
         self._group = None
@@ -336,10 +382,13 @@ class QkvSite:
         served = False
         try:
             aiter = _aiter()
-            # The op is a lazy export; resolving it also completes its
-            # @route registration before explain() looks it up.
-            getattr(aiter, _OP_NAME)
-            explanation = aiter.plugin.explain(_OP_NAME, *args, **kwargs)
+            plugin = getattr(aiter, "plugin", None)
+            if plugin is None:
+                raise AttributeError("aiter.plugin")
+            # Re-assert enablement at the point of use: the process running this
+            # forward is not necessarily the process ModelRunner initialized.
+            _ensure_plugin_enabled(aiter, plugin, self.provider_enable)
+            explanation = plugin.explain(_OP_NAME, *args, **kwargs)
             decision = getattr(explanation, "decision", None)
             served = getattr(decision, "route", None) == "provider"
         except Exception:

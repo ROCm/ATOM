@@ -15,10 +15,16 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import atom.aiter_provider as provider
 import atom.model_ops.gemm_fusion.site as site_mod
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_gate(monkeypatch):
+    monkeypatch.setattr(site_mod, "_ENSURE_DONE", False)
 
 
 def _fwd_ctx():
@@ -192,6 +198,44 @@ def test_configure_resolves_lazy_routed_ops_before_status(monkeypatch):
     assert provider.configure_aiter_providers(config) is True
     assert resolved[0] is True
     assert events.index("getattr") < events.index("status")
+
+
+def test_site_reasserts_enablement_once_per_process(monkeypatch):
+    events = []
+    configured = []
+
+    def status():
+        events.append("status")
+        return {
+            "enabled": ("sp-qkv-provider",) if configured else (),
+            "routed_ops": {"sp_qkv_fused": {}},
+        }
+
+    def configure(**kwargs):
+        events.append("configure")
+        configured.append(kwargs)
+
+    def explain(op, *args, **kwargs):
+        events.append("explain")
+        return SimpleNamespace(decision=SimpleNamespace(route="provider"), declines={})
+
+    module = types.ModuleType("aiter")
+    module.plugin = SimpleNamespace(
+        API_VERSION=1, status=status, configure=configure, explain=explain
+    )
+    module.sp_qkv_fused = object()
+    monkeypatch.setitem(sys.modules, "aiter", module)
+
+    site = _site()
+    assert site._serves(2, [], {}) is True
+    assert [c["enable"] for c in configured] == [("sp-qkv-provider",)]
+    assert events.index("configure") < events.index("explain")
+
+    # A second site in the same process must not configure again.
+    site2 = _site()
+    assert site2._serves(2, [], {}) is True
+    assert len(configured) == 1
+    assert site_mod._ENSURE_DONE is True
 
 
 def test_provider_warmup_is_framework_owned_and_fail_open(monkeypatch):
