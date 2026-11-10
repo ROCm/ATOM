@@ -109,9 +109,12 @@ Four rules carry the module:
 | `mp/connector.py` | Capability-selected public `lmcache_mp` worker/scheduler shells. |
 | `mp/deployment.py` | LMCache MP configuration, topology, model namespace and server adapters. |
 | `mp/worker.py`, `mp/scheduler.py` | LMCache MP connector halves. The worker registers PAGE views, plus checkpoint image groups when the backend publishes them; the vLLM plugin builds it directly. |
-| `page_codec.py` | `replays_state` (does the backend rebuild per-request state by replay) and `pure_page_codec`: the PAGE-only `DSV4PageSlotCodec` the M3 and Mooncake Store connectors share. |
+| `page_codec.py` | `pure_page_codec`: complete PAGE-only geometry validation and the `DSV4PageSlotCodec` shared by M3 and Mooncake Store. |
+| `capabilities.py` | `publishes_native_state`, `copies_paged_state`, and `replays_state`: lightweight state-transfer capability checks, independent of Torch and byte codecs. |
+| `tier.py` | `OffloadTierProfile`: shared tier loadability and minimum-transfer contract consumed by the connector factory and DP routing. |
 | `load_math.py` | Pure functions for how many tokens a tier moves (`loadable_hit`, `tier_load_tokens`), used by the offload scheduler and by DP routing's `OffloadTierProfile`. |
 | `mp/token_shipping.py` | Incremental token shipping: the scheduler sends each transfer only the tokens past what the workers hold; the worker shell rebuilds the prefix. |
+| `mp/metadata.py` | MP-specific shipped/resolved token types and drop-only step metadata; shared metadata keeps plain token lists. |
 | `mp/transfer_thread.py` | The transfer thread: submits off the forward thread under `OFFLOAD_MP_TRANSFER_THREAD`, and also polls for a worker built with `transfers_off_step`; `_ProducerFences`, the reused producer events. |
 | `mp/lookup.py` | Scheduler-side MP lookups and read-lock bookkeeping. |
 | `mp/transfer.py` | Transfer identity, terminal detection and the fail-stop transfer deadline. |

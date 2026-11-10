@@ -20,28 +20,18 @@ from atom.kv_transfer.disaggregation.base import (
 )
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.kv_transfer.offload._offload_common import validated_kv_role
-from atom.kv_transfer.offload.capabilities import replays_state
+from atom.kv_transfer.offload.capabilities import (
+    copies_paged_state as _copies_paged_state,
+)
+from atom.kv_transfer.offload.capabilities import (
+    publishes_native_state as _publishes_native_state,
+)
+from atom.kv_transfer.offload.capabilities import (
+    replays_state,
+)
 from atom.kv_transfer.offload.mp import deployment
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
-
-
-def _publishes_native_state(transfer_tensors: Any) -> bool:
-    """Validate and detect the reusable PAGE-backed native-state contract."""
-
-    spec = getattr(transfer_tensors, "paged_state_checkpoint_spec", None)
-    copy = getattr(transfer_tensors, "execute_paged_state_copies", None)
-    if spec is None and copy is None:
-        return False
-    if spec is None:
-        raise ValueError(
-            "execute_paged_state_copies requires paged_state_checkpoint_spec"
-        )
-    if not callable(copy):
-        raise TypeError(
-            "paged_state_checkpoint_spec requires a callable execute_paged_state_copies"
-        )
-    return True
 
 
 def _has_per_request_state(kv_caches: Any) -> bool:
@@ -52,18 +42,6 @@ def _has_per_request_state(kv_caches: Any) -> bool:
     return any(
         getattr(value, "per_request_state", False) for value in kv_caches.values()
     )
-
-
-def _copies_paged_state(transfer_tensors: Any) -> bool:
-    """Whether the backend keeps PAGE-backed state checkpoints.
-
-    This is the predicate `BlockManager` builds `paged_state_checkpoints` from,
-    and that coordinator is what selects the native-state scheduler.
-    """
-
-    builder = getattr(transfer_tensors, "state_backend", None)
-    state_transfer = getattr(builder, "state_transfer", None)
-    return callable(state_transfer) and bool(state_transfer().copies)
 
 
 class LMCacheMPConnector(KVConnectorBase):
