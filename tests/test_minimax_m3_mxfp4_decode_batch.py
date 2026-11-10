@@ -279,3 +279,27 @@ def test_the_row_rule_and_its_refusal_are_the_mxfp4_indexs(
         return
     b.finish_decode(batch, attn, running_bs, rows, q)
     assert seen[0]["seq_lens"].shape[0] == want
+
+
+def test_the_scorer_is_given_the_bound_its_map_was_built_at():
+    """The map's bound travels on the metadata; the impl does not derive it again
+    (a length source of its own that drifted would fail every decode's exact check)."""
+    pytest.importorskip("aiter")
+    from atom.model_ops import attention_mha
+    from atom.model_ops.minimax_m3.sparse_attn import MiniMaxM3SparseMetadata
+
+    impl = object.__new__(attention_mha.SparseMHAPagedAttentionImpl)
+    impl.kv_cache_dtype, impl.index_cache_dtype = "bf16", "fp4"
+    impl.max_model_len = 10**9  # not the bound
+    wmap = object()
+    md = MiniMaxM3SparseMetadata(
+        seq_lens=None,
+        max_seq_len=0,
+        slot_mapping=None,
+        num_prefills=0,
+        index_work_map=wmap,
+        index_work_map_max_block=37,
+    )
+    kw = impl._mxfp4_select_kwargs(md, decode=True)
+    assert kw["index_work_map"] is wmap and kw["index_work_map_max_block"] == 37
+    assert "index_work_map" not in impl._mxfp4_select_kwargs(md, decode=False)

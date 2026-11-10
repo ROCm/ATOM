@@ -103,6 +103,10 @@ class MiniMaxM3SparseMetadata:
     None on prefill, on an empty batch and wherever the index cache is not MXFP4; the
     scorer then builds its own map, correctly but per layer.
     """
+    index_work_map_max_block: int = 0
+    """The block count `index_work_map` was built at (0 with no map); the scorer
+    must be given the same one, so it travels with the map and is not derived again.
+    """
 
 
 def make_sparse_prefill_metadata(
@@ -205,6 +209,9 @@ def make_sparse_decode_metadata(
             out=n_valid_column_per_row_out,
         ),
         index_work_map=index_work_map,
+        index_work_map_max_block=(
+            index_work_map_max_block if index_work_map is not None else 0
+        ),
     )
 
 
