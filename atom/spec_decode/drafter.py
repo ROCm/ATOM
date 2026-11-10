@@ -122,6 +122,16 @@ def tap_is_resident(layers: nn.Module, lid: int) -> bool:
     return 0 <= lid < len(layers) and not isinstance(layers[lid], PPMissingLayer)
 
 
+def check_shared_embedding(draft: nn.Module) -> None:
+    """Refuse a draft that shared a ``PPMissingLayer`` as its embedding."""
+    if isinstance(getattr(draft, "embed_tokens", None), PPMissingLayer):
+        raise TypeError(
+            "The draft shares the target's embedding, which this PP stage does "
+            "not build: declare the method in registry.pp_speculative_methods "
+            "and build the embedding with models.utils.pp_holds_embedding."
+        )
+
+
 def _identity_extract(output: Any, _module: nn.Module) -> torch.Tensor:
     """Aux extractor for the ``-1`` (embedding) tap: the embedding output is
     already ``[N, hidden]``, so take it verbatim (unwrapping a (tensor, scale)
@@ -619,6 +629,7 @@ class Drafter(abc.ABC):
         # their own setattr-rebinding and short-circuit the default path.
         if hasattr(self.model, "share_with_target"):
             self.model.share_with_target(target_base, loaded)
+            check_shared_embedding(self.model)
             if self.is_block_drafter and hasattr(self.model, "reset_kv_cache"):
                 # Allocate DSpark's private rolling target-KV window now that the
                 # device/dtype and max concurrency are known.

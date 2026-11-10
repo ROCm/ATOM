@@ -67,6 +67,25 @@ mono_decode_installers = {
 }
 # Speculative methods each architecture serves under pipeline_parallel_size > 1
 # (its drafts verified per stage, its drafter's aux taps relayed across stages).
+# Each one's drafter shares the target's embedding, which the last stage then
+# builds (models.utils.pp_holds_embedding).
 pp_speculative_methods = {
     "KimiK3ForConditionalGeneration": ("dspark",),
 }
+
+
+def pp_speculative_method(atom_config) -> str | None:
+    """The configured speculative method, or None when there is none."""
+    spec = atom_config.speculative_config
+    if spec is None:
+        return None
+    return "dspark" if spec.use_dspark() else spec.method
+
+
+def serves_pp_speculation(atom_config) -> bool:
+    """Whether the architecture declares the configured method under PP."""
+    method = pp_speculative_method(atom_config)
+    archs = getattr(atom_config.hf_config, "architectures", None) or ()
+    return method is not None and any(
+        method in pp_speculative_methods.get(a, ()) for a in archs
+    )
