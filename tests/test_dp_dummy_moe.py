@@ -15,13 +15,7 @@ import pytest
 import torch
 
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.sequence import (
-    Sequence,
-    SequenceStatus,
-    SequenceType,
-    new_block_table,
-)
-from atom.utils.region_graph import TokenGraph
+from atom.model_engine.sequence import Sequence
 
 
 def _method(owner, name):
@@ -38,11 +32,6 @@ def _method(owner, name):
         "np": np,
         "torch": torch,
         "ScheduledBatch": ScheduledBatch,
-        "Sequence": Sequence,
-        "SequenceStatus": SequenceStatus,
-        "SequenceType": SequenceType,
-        "new_block_table": new_block_table,
-        "TokenGraph": TokenGraph,
     }
     exec(  # noqa: S102 -- execute the repository method without its GPU imports
         compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
@@ -55,15 +44,14 @@ dummy_execution = _method("ModelRunner", "dummy_execution")
 prepare_input_ids = _method("tokenIDProcessor", "prepare_input_ids")
 
 
-def _dummy(*, prefill=False, mtp_k=None, producer=False):
+def _dummy(*, mtp_k=None, producer=False):
     runner = SimpleNamespace(
-        block_size=16,
         tokenID_processor=SimpleNamespace(is_pd_producer=producer),
         forward=lambda batch: batch,
     )
     if mtp_k is not None:
         runner.drafter = SimpleNamespace(mtp_k=mtp_k)
-    return dummy_execution(runner, prefill)
+    return dummy_execution(runner)
 
 
 def _processor(draft_width):
@@ -86,24 +74,23 @@ def _processor(draft_width):
     )
 
 
-@pytest.mark.parametrize("prefill", [False, True])
+@pytest.mark.parametrize("max_seqlen_q", [1, 4, 16])
 @pytest.mark.parametrize("mtp_k", [None, 0, 3])
 @pytest.mark.parametrize("producer", [False, True])
-def test_dp_dummy_keeps_its_shape_and_publishes_zero_expert_rows(
-    monkeypatch, prefill, mtp_k, producer
+def test_dp_dummy_schedules_nothing_and_publishes_zero_expert_rows(
+    max_seqlen_q, mtp_k, producer
 ):
-    monkeypatch.setattr(TokenGraph, "captured_sizes", lambda phase=None: (16,))
-    batch = _dummy(prefill=prefill, mtp_k=mtp_k, producer=producer)
-    expected_tokens = 16 if prefill else (mtp_k or 0) + 1 if not producer else 1
-    assert batch.is_dummy_run and batch.is_dp_dummy
-    assert batch.total_seqs_num == 1
-    assert batch.total_tokens_num == expected_tokens
-    assert batch.num_scheduled_tokens.tolist() == [expected_tokens]
+    batch = _dummy(mtp_k=mtp_k, producer=producer)
+    assert not batch.is_dummy_run  # Reserved for startup profiling/warmup.
+    assert batch.total_seqs_num == batch.total_tokens_num == 0
+    assert batch.req_ids == []
+    assert batch.num_scheduled_tokens.tolist() == []
+    assert batch.num_spec_step == ((mtp_k or 0) if not producer else 0)
 
     processor = _processor(4)
-    ids = prepare_input_ids(processor, batch, expected_tokens)
-    assert ids.shape == (expected_tokens,)
-    assert torch.equal(ids, torch.zeros_like(ids))
+    # A peer's padded query width must not turn local empty rows into work.
+    ids = prepare_input_ids(processor, batch, max_seqlen_q, None)
+    assert ids.shape == (0,)
     assert processor.batch_info.gpu.tolist() == [0, 0, 0]
 
 
@@ -119,7 +106,6 @@ def test_real_dummy_real_reuses_counts_without_losing_real_or_warmup_rows(warmup
         total_seqs_num_prefill=2,
         is_dummy_run=warmup,
     )
-    assert not batch.is_dp_dummy
     processor = _processor(4)
     tensor = processor.batch_info.gpu
     # Target uses entry 1, Eagle mid-steps entry 0, DSpark entry 2.
@@ -129,7 +115,7 @@ def test_real_dummy_real_reuses_counts_without_losing_real_or_warmup_rows(warmup
         (_dummy(), [0, 0, 0]),
         (batch, [2, 6, 8]),
     ):
-        ids = prepare_input_ids(processor, current, 1)
+        ids = prepare_input_ids(processor, current, 1, None)
         assert torch.equal(ids, torch.from_numpy(current.scheduled_tokens))
         assert processor.batch_info.gpu is tensor
         assert [count.item() for count in pass_counts] == expected

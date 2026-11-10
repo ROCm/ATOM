@@ -19,12 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.blockscale_kernels.quantization import (
-    AMAX_FLOOR,
-    FP8_MAX,
-    FP8_TL_DTYPE,
-    ceil_pow2_code,
-)
+from atom.model_ops.blockscale_kernels.quantization import fp8_groups
 from atom.model_ops.v4_kernels.pool_index import window_row
 
 # A token's query heads rotated by one program rather than one each. The
@@ -88,13 +83,19 @@ def _quantized_row(row, position, cos, sin, D, ROPE):
     normed = tl.load(row + dim).to(tl.float32)
 
     even, odd = tl.split(tl.reshape(normed, (D // 2, 2)))
-    phase = tl.arange(0, D // 2) - (D - ROPE) // 2
-    # A NoPE pair reads no table entry, and `other=` leaves it alone: cos 1
-    # with sin 0 is the identity rotation.
-    cosine = tl.load(cos + position * half + phase, phase >= 0, other=1.0).to(
-        tl.float32
+    # Every pair reads the table row, unmasked so the reads stay contiguous;
+    # a NoPE pair then takes cos 1 with sin 0, the identity rotation.
+    # `pair % half` is a RoPE pair's table entry only when the NoPE pairs
+    # fill whole table rows.
+    tl.static_assert((D - ROPE) % ROPE == 0)
+    pair = tl.arange(0, D // 2)
+    rope_pair = pair >= (D - ROPE) // 2
+    cosine = tl.where(
+        rope_pair, tl.load(cos + position * half + pair % half).to(tl.float32), 1.0
     )
-    sine = tl.load(sin + position * half + phase, phase >= 0, other=0.0).to(tl.float32)
+    sine = tl.where(
+        rope_pair, tl.load(sin + position * half + pair % half).to(tl.float32), 0.0
+    )
     # Back through the activation dtype first: the kernels this replaces each
     # returned BF16, so the amax has to see the rounded row.
     groups = (
@@ -105,14 +106,7 @@ def _quantized_row(row, position, cos, sin, D, ROPE):
         .to(activation)
         .to(tl.float32)
     )
-
-    amax = tl.maximum(tl.max(tl.abs(groups), 1), AMAX_FLOOR)
-    code = ceil_pow2_code(amax * (1.0 / FP8_MAX))
-    step = (code << 23).to(tl.float32, bitcast=True)
-    quantized = tl.minimum(tl.maximum(groups / step[:, None], -FP8_MAX), FP8_MAX).to(
-        FP8_TL_DTYPE
-    )
-    return quantized, code, step
+    return fp8_groups(groups)
 
 
 @triton.jit
@@ -135,6 +129,7 @@ def _rope_window_kernel(
     slots,
     ring_start,
     kv_stride,
+    tokens,
     HEADS: tl.constexpr,
     D: tl.constexpr,
     ROPE: tl.constexpr,
@@ -149,8 +144,9 @@ def _rope_window_kernel(
     WRITE_RING: tl.constexpr,
     PACKED_RING: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
+    QUERY_PROGRAMS: tl.constexpr,  # a token's query slots
 ):
-    """One program per (token, slot); the last slot of a token is its KV.
+    """One program per (token, slot); slot `QUERY_PROGRAMS` of a token is its KV.
 
     With `HEAD_BLOCK` (the in-place BF16 query) slot 0 rotates all of a
     token's heads and slot 1 runs the whole KV chain: one query program per
@@ -159,12 +155,19 @@ def _rope_window_kernel(
     chain has its own program rather than sharing the token's, which keeps a
     decode bucket -- a few dozen rows -- wide enough to fill the device; the
     two branches are otherwise independent.
+
+    One grid axis (the token count may pass the second's limit): every
+    query program, then every KV program, each run in memory order, so
+    neighbouring programs read and write neighbouring rows.
     """
     # The head-blocked query is the in-place BF16 rotation only; the host
     # keeps an MXFP8-emitting query on a program a head.
     tl.static_assert(not (HEAD_BLOCK and EMIT_QUERY_FP8))
-    token = tl.program_id(0)
-    slot = tl.program_id(1)
+    pid = tl.program_id(0)
+    query_rows = tokens * QUERY_PROGRAMS
+    is_query = pid < query_rows
+    token = tl.where(is_query, pid // max(QUERY_PROGRAMS, 1), pid - query_rows)
+    slot = tl.where(is_query, pid % max(QUERY_PROGRAMS, 1), QUERY_PROGRAMS)
     position = tl.load(positions + token)
     dim = tl.arange(0, D)
     if HEAD_BLOCK:
@@ -276,7 +279,7 @@ def rope_quant_window(
         and (rope_dim & (rope_dim - 1)) == 0
     )
     query_programs = 1 if head_block else heads
-    _rope_window_kernel[(tokens, query_programs + kv_half)](
+    _rope_window_kernel[(tokens * (query_programs + kv_half),)](
         query,
         kv if kv_half else query,
         cos,
@@ -295,6 +298,7 @@ def rope_quant_window(
         None if step is None else step.slots,
         0 if window is None else window.ring_start,
         kv.stride(0) if kv_half else 0,
+        tokens,
         HEADS=heads,
         D=dim,
         ROPE=rope_dim,
@@ -309,4 +313,7 @@ def rope_quant_window(
         EMIT_QUERY_FP8=query_fp8 is not None,
         WRITE_RING=ring is not None,
         HEAD_BLOCK=head_block,
+        QUERY_PROGRAMS=query_programs,
+        # The most waves a row splits over with every lane still loading 16 B.
+        num_warps=max(1, dim * query.element_size() // (64 * 16)),
     )

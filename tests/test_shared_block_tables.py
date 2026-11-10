@@ -229,14 +229,15 @@ def test_group_validation_failure_does_not_publish_a_revision():
     row = new_block_table([3])
     state = block_table_state(buf).prepare([row], pad_to=2)
     group.set_count(other, 5)  # exceeds capacity, after the table's valid count
+    state.stage(2, group)
     with pytest.raises(ValueError):
-        state.publish(2, group=group)
+        group.publish()
     assert state.published is None and buf.gpu.count_nonzero() == 0
     group.set_count(other, 2)
-    state.publish(2, group=group)
+    group.publish()
     owner.finish()
     owner.begin()
-    state.prepare([row], pad_to=2).publish(2, group=group)
+    state.prepare([row], pad_to=2).stage(2, group)
     assert group.counts[group.indices["block_tables"]] is None
     assert buf.gpu[0, 0] == 3
     owner.finish()
