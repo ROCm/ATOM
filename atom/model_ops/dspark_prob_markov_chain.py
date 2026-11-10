@@ -374,7 +374,13 @@ def prob_markov_sample_chain(
         )
     block_row = min(_MAX_BLOCK_ROW, max(_MIN_BLOCK_ROW, triton.next_power_of_2(b)))
     num_tiles = triton.cdiv(v, _BLOCK_V)
-    wide = b > _WIDE_MIN_ROWS and rank % _BLOCK_K == 0
+    # The wide kernel loads whole embedding rows (`tl.arange(0, RANK)`), so
+    # it needs a power-of-two rank that BLOCK_K divides.
+    wide = (
+        b > _WIDE_MIN_ROWS
+        and rank == triton.next_power_of_2(rank)
+        and rank % _BLOCK_K == 0
+    )
     for k in range(t):
         previous = prev_ids if k == 0 else keys[k - 1]
         if wide:
