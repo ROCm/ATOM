@@ -574,6 +574,46 @@ def test_a_deferred_probe_skips_the_slot_its_own_step_resets(small_config, devic
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_a_device_round_step_continues_the_previous_steps_requests(
+    small_config, device
+):
+    """A device-round step skips the probe and the slot resets: it must be the
+    previous step's requests, in the same order, none fresh or resuming. Any
+    other step raises before a layer reads its slots; a steady run of them
+    never does."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, device)
+    cache.cursor[0] = torch.tensor([3, 19, -1, 27], device=device)
+    cache.cursor[1] = torch.tensor([5, 19, -1, 27], device=device)
+    a, b = PagedRequest(27, 3, 0, 1, 0, (0, 1)), PagedRequest(28, 5, 1, 1, 1, (2, 3))
+
+    def device_round(*requests, **kwargs):
+        cache.prepare_device_round_state(
+            begin_step(cache, requests, **kwargs), histories=False
+        )
+
+    # nothing prepared before it: no step to continue
+    with pytest.raises(RuntimeError, match="does not continue"):
+        device_round(a, b)
+    cache.prepare_state(begin_step(cache, [a, b]), histories=False)
+    # steady decode: the same requests, a step further on each time
+    for step in range(1, 4):
+        device_round(replace(a, position=3 + step), replace(b, position=5 + step))
+    # another request in the slot (recycled), one gone, the order changed
+    swapped = [replace(b, offset=0), replace(a, offset=1)]
+    for requests in ([replace(a, request_id=29), b], [a], swapped):
+        with pytest.raises(RuntimeError, match="does not continue"):
+            device_round(*requests)
+    # the same request starting over at its floor, or resuming
+    with pytest.raises(RuntimeError, match=r"fresh \[0\]"):
+        device_round(replace(a, position=0), b)
+    with pytest.raises(RuntimeError, match=r"resuming \[1\]"):
+        device_round(a, b, cached_until=np.asarray([0, 5], np.int32))
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("histories", [True, False])
 def test_a_forward_recomputing_below_its_state_keeps_it(
     small_config, device, histories

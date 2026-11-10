@@ -318,7 +318,6 @@ class KimiK3MoriIOCellTest(unittest.TestCase):
         )
 
 
-TW_WEEKLY = "0 16 * * 5"
 SPUR_NIGHTLY = "10 16 * * *"
 SPUR_MORIIO = "10 4 * * *"
 # atomesh-benchmark.yaml's model root for the Spur lane.
@@ -369,21 +368,22 @@ class MoriIOScheduleTest(unittest.TestCase):
 
     def test_the_moriio_cron_runs_on_the_spur_lane_like_the_nightly(self):
         # PyYAML reads the workflow's `on:` key as True.
-        self.assertIn({"cron": SPUR_MORIIO}, self.workflow[True]["schedule"])
+        self.assertEqual(
+            {entry["cron"] for entry in self.workflow[True]["schedule"]},
+            {SPUR_NIGHTLY, SPUR_MORIIO},
+        )
         self.assertEqual(self.lane(SPUR_MORIIO), self.lane(SPUR_NIGHTLY))
         runner = "ATOMESH_SLURM_SUBMIT_RUNNER"
         self.assertEqual(self.lane(SPUR_MORIIO)[runner], "atomesh-cicd-mi350")
-        self.assertEqual(self.lane(TW_WEEKLY)[runner], "atomesh-cicd")
 
     def test_the_moriio_cron_has_a_concurrency_group_of_its_own(self):
         group = self.workflow["concurrency"]["group"]
         groups = {
             schedule: github_expressions(group, "schedule", schedule)
-            for schedule in (TW_WEEKLY, SPUR_NIGHTLY, SPUR_MORIIO)
+            for schedule in (SPUR_NIGHTLY, SPUR_MORIIO)
         }
-        self.assertEqual(len(set(groups.values())), 3)
+        self.assertEqual(len(set(groups.values())), 2)
         prefix = "Atomesh Benchmark-refs/heads/main-"
-        self.assertEqual(groups[TW_WEEKLY], prefix + "schedule-atomesh-cicd")
         self.assertEqual(groups[SPUR_NIGHTLY], prefix + "schedule-atomesh-cicd-mi350")
         self.assertEqual(
             github_expressions(group, "push"), prefix + "push-atomesh-cicd"

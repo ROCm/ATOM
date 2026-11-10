@@ -6,7 +6,9 @@ numerics, and SpeculativeConfig DSpark detection/routing.
 """
 
 import importlib
+import inspect
 import types
+from contextlib import nullcontext
 
 import numpy as np
 import pytest
@@ -23,6 +25,7 @@ pytest.importorskip(
 
 import torch
 
+import atom.model_ops.spec_sampling.dspark_markov_sample as dspark_markov_sample_mod
 import atom.spec_decode.drafter as mod_drafter
 from atom.model_ops.v4_kernels.dspark_fp8_indices import DSparkIndexBuffers
 from atom.models.deepseek_v4_dspark import (
@@ -106,6 +109,42 @@ def test_semi_autoregressive_bias_changes_argmax():
     combined = base + bias
     assert int(base.argmax(-1)) == 9
     assert int(combined.argmax(-1)) == 2
+
+
+def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch):
+    """`DSparkMarkovHead.sample_block`, the block loop Kimi-K3 samples
+    through: position k draws from x_{k-1} into its own column, at store
+    position k, with the noise counter strided by the buffers' max batch."""
+    max_bs, bs, steps, V = 4, 3, 3, 10
+    head = DSparkMarkovHead(vocab_size=V, rank=2)
+    per_row = torch.zeros(max_bs)
+    sampling = types.SimpleNamespace(
+        q_store=(None, None, None),
+        q_row_base=torch.zeros(max_bs, dtype=torch.int32),
+        temperatures=per_row,
+        top_k=per_row,
+        top_p=per_row,
+        seed=None,
+        scratch=None,
+    )
+    calls = []
+    # The op's own parameters, as its fake (which torch requires to match) has
+    # them: the registered op itself is wrapped as (*args, **kwargs).
+    signature = inspect.signature(dspark_markov_sample_mod._dspark_markov_sample_fake)
+
+    def sample(*args, **kwargs):
+        # By name, so a reordered signature cannot read the wrong inputs.
+        a = signature.bind(*args, **kwargs).arguments
+        calls.append((a["q_row_base"].shape[0], a["position"], a["noise_offset"]))
+        assert torch.equal(a["base_logits"], base_logits[:, a["position"]])
+        a["out"].copy_(a["prev_ids"] + 1)
+
+    monkeypatch.setattr(dspark_markov_sample_mod, "dspark_markov_sample", sample)
+    base_logits = torch.randn(bs, steps, V)
+    anchors = torch.tensor([0, 3, 5])
+    drafts = head.sample_block(base_logits, anchors, sampling)
+    assert torch.equal(drafts, anchors[:, None] + torch.arange(1, steps + 1))
+    assert calls == [(bs, k, k * max_bs * V) for k in range(steps)]
 
 
 def _real_hf_config_override():
@@ -851,6 +890,7 @@ def _proposer_with_graph_bs(
     )
     p.device = torch.device("cpu")
     p.mtp_k = mtp_k
+    p.lossless = None  # lossless sampling off: the greedy draft
     p.model = types.SimpleNamespace(
         vocab_size=1024, window_size=window, supports_block_graph=True
     )
@@ -887,7 +927,14 @@ def _install_block_halves(p, inner):
     p.model.model = inner
     p.model.prepare_block = types.MethodType(DeepseekV4DSpark.prepare_block, p.model)
     p.model.block_backbone = lambda ids, pos, num_draft: inner(ids, pos, num_draft)
-    p.model.head_and_sample = lambda out, ids, _: inner.head_and_sample(*out, ids)
+    # Which head each call asked for, `greedy` or the bound sampling.
+    p.model.greedy_heads = []
+
+    def head_and_sample(out, ids, _, *, greedy=False):
+        p.model.greedy_heads.append(greedy)
+        return inner.head_and_sample(*out, ids)
+
+    p.model.head_and_sample = head_and_sample
     return p
 
 
@@ -1053,7 +1100,7 @@ def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
 class _BareFlavor(mod_drafter.Drafter):
     """The abstract methods, stubbed. `_publish_draft_shape` reads neither."""
 
-    _resolve_mtp_k = propose = staticmethod(lambda *a, **k: None)
+    _resolve_mtp_k = _propose = staticmethod(lambda *a, **k: None)
 
 
 def _bare_drafter(dp_size):
@@ -1434,6 +1481,61 @@ def test_both_flavors_declare_one_block_pass_bound_to_the_same_halves(monkeypatc
     assert p.draft_graphs == (p.block,)
     assert p.block.forward == p._block_backbone
     assert p.block.epilogue == p._block_head
+
+
+def _armed(draws_q):
+    """A lossless stand-in: only what `propose` and the declaration read."""
+    return types.SimpleNamespace(
+        staging=types.SimpleNamespace(draws_q=draws_q, consume=lambda: None)
+    )
+
+
+def test_an_armed_drafter_declares_a_greedy_block_beside_the_sampled_one(
+    monkeypatch,
+):
+    """Armed without DP: two passes over one backbone, the sampled head in
+    ``block`` and the greedy one in ``block_greedy``. With DP the choice
+    would be per rank, so only ``block`` is declared."""
+    p = _proposer_with_graph_bs(monkeypatch)
+    assert p.block_greedy is None
+    p.lossless = _armed(True)
+    p._build_draft_graphs()
+    assert p.draft_graphs == (p.block, p.block_greedy)
+    assert p.block_greedy.forward == p.block.forward == p._block_backbone
+    assert p.block.epilogue == p._block_head
+    assert p.block_greedy.epilogue == p._block_head_greedy
+    assert p.block_greedy.label(4, 8).endswith(" greedy")
+    assert not p.block.label(4, 8).endswith(" greedy")
+
+    p = _proposer_with_graph_bs(monkeypatch)
+    _on_two_dp_ranks(p)
+    p.lossless = _armed(True)
+    p._build_draft_graphs()
+    assert p.draft_graphs == (p.block,) and p.block_greedy is None
+
+
+@pytest.mark.parametrize("draws_q", [True, False])
+def test_a_step_that_draws_no_q_replays_the_greedy_block(monkeypatch, draws_q):
+    """The pass is picked once per step and carries the anchors, the run and
+    the profiler label; only the greedy one asks the head for ``greedy``."""
+    import atom.spec_decode.dspark_proposer as mod
+
+    seen, labels = {}, []
+    p = _proposer_with_graph_bs(monkeypatch)
+    p.lossless = _armed(draws_q)
+    p._build_draft_graphs()
+    monkeypatch.setattr(
+        mod, "record_function", lambda name: labels.append(name) or nullcontext()
+    )
+    fc = _stub_forward_context(scheduled_bs=8, target_bs=8)
+    _run_propose(p, fc, 8, monkeypatch, seen)
+
+    ran, idle = (p.block, p.block_greedy) if draws_q else (p.block_greedy, p.block)
+    assert p.model.greedy_heads == [not draws_q]
+    assert ran.buffer("anchor_ids", 8).tolist() == [5] * 8
+    assert idle.buffer("anchor_ids", 8).tolist() == [0] * 8
+    (label,) = [name for name in labels if name.startswith("propose_dspark")]
+    assert (" greedy" in label) is (not draws_q)
 
 
 def test_the_backbone_gets_the_positions_the_slot_mapping_was_built_from(monkeypatch):
@@ -2357,7 +2459,7 @@ def test_rows_past_scheduled_bs_are_described_as_pad(monkeypatch):
         type(p), "_publish_draft_shape", lambda self, *a, **k: None, raising=False
     )
     monkeypatch.setattr(type(p), "verify_scheduler", None, raising=False)
-    p.block = types.SimpleNamespace(
+    block = types.SimpleNamespace(
         label=lambda s, r: f"bs={s}/{r}",
         run=lambda bs, **staged: (torch.zeros(bs, T, dtype=torch.int32), None),
     )
@@ -2366,6 +2468,7 @@ def test_rows_past_scheduled_bs_are_described_as_pad(monkeypatch):
         fc = _paged_fc()
         fc.context.running_bs = 4
         out = p._propose_with_draft(
+            block,
             fc,
             fc.attn_metadata,
             {"anchor_positions": torch.zeros(4, dtype=torch.int64)},

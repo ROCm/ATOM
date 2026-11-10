@@ -183,20 +183,26 @@ def test_default_share_with_target_reads_the_vocab_off_the_head_under_pp():
         _stub_draft(163840).share_with_target(_target_base(200064), set())
 
 
-def test_default_sample_block_chains_each_token_into_the_next():
-    """Each position samples off the previous id, starting from the anchor."""
+def test_default_sample_block_passes_the_drafts_sampling_unless_greedy():
+    """The block goes through the head's `sample_block` with the model's
+    `draft_sampling` (None keeps it greedy), or with none when `greedy`."""
     import torch
 
+    seen = []
+
     class _Head:
-        def sample_next(self, prev, logits, out):
-            out.copy_(prev + logits.argmax(-1))
+        def sample_block(self, base_logits, anchor_ids, sampling):
+            seen.append(sampling)
+            return anchor_ids
 
     draft = _stub_draft()
     draft.markov_head = _Head()
-    base_logits = torch.zeros(2, 3, 5)
-    base_logits[:, :, 1] = 1.0
-    ids = draft._sample_block(base_logits, torch.tensor([10, 20]))
-    assert ids.tolist() == [[11, 12, 13], [21, 22, 23]]
+    logits, ids = torch.zeros(2, 3, 5), torch.tensor([10, 20])
+    draft._sample_block(logits, ids)
+    draft.draft_sampling = sampling = object()
+    draft._sample_block(logits, ids)
+    draft._sample_block(logits, ids, greedy=True)
+    assert seen == [None, sampling, None]
 
 
 def test_default_forward_spec_is_the_backbone_then_the_head():
@@ -207,7 +213,7 @@ def test_default_forward_spec_is_the_backbone_then_the_head():
     draft = _stub_draft()
     draft.block_backbone = lambda ids, pos, t: torch.ones(ids.shape[0] * t, 4)
     draft.lm_head = lambda out: out.sum(-1, keepdim=True).expand(-1, 5)
-    draft._sample_block = lambda logits, ids: (logits.shape, ids.tolist())
+    draft._sample_block = lambda logits, ids, greedy: (logits.shape, ids.tolist())
     ids, confidence = draft.forward_spec(torch.tensor([7, 8]), None, 3)
     assert ids == (torch.Size([2, 3, 5]), [7, 8])
     assert confidence is None
