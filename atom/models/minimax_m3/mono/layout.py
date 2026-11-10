@@ -370,3 +370,17 @@ def pool_words(tokens: int) -> int:
         tokens * (XN8_ROW + XSC_ROW + N_ROUTED) + WAVES * 64 * 4,
         rows * (MID_ROW + MIDSC_ROW),
     )
+
+
+def mxfp8_tile_dword(row, cols, kc, g):
+    """Dword offset, in an MXFP8 weight of ``cols`` columns in aiter's (16, 16)
+    preshuffle (``[N / 16][K / 32][2][16][16]`` bytes), of the first 16 B piece of
+    lane group ``g``'s operand of row ``row`` at 128-k chunk ``kc`` (k 16 g .. + 16;
+    the second piece, k 64 + 16 g .. + 16, is 256 dwords on). Ints or traced."""
+    return (
+        (row // 16) * (cols // 32 * 128)
+        + kc * 512
+        + (g // 2) * 128
+        + (g % 2) * 64
+        + (row % 16) * 4
+    )

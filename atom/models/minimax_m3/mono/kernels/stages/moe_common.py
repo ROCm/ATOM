@@ -30,6 +30,7 @@ from atom.models.minimax_m3.mono.kernels.stages.shared import (
     W13S_BYTES,
 )
 from atom.models.minimax_m3.mono.layout import (
+    mxfp8_tile_dword,
     SH_ROWS,
     UG_PER_SLOT,
     UG_ROWS,
@@ -207,13 +208,7 @@ def moe_common_defs(k4ctx):
         16-k halves apart), row ``row`` at 128-k chunk ``kc``: k 16 g .. + 16 and
         64 + 16 g .. + 16 (g = lane // 16), the f8f6f4 MFMA's operand layout (the B
         operand's, ``lds_b8``). Each 16 B piece of the 64 lanes is 1 KB contiguous."""
-        dw = (
-            (row // 16) * (cols // 32 * 128)
-            + kc * 512
-            + (g4 // 2) * 128
-            + (g4 % 2) * 64
-            + (row % 16) * 4
-        )
+        dw = mxfp8_tile_dword(row, cols, kc, g4)
         halves = [
             fx.Vector(
                 bo.buffer_load(
