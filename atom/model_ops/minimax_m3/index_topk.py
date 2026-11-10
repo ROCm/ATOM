@@ -31,7 +31,12 @@ import torch
 # which couples to vLLM internals. ATOM imports triton directly everywhere else.
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+
+from . import prefill_score_policy as _prefill_policy
+
+SCORE_BLOCK_SIZE_Q = _prefill_policy.SCORE_BLOCK_SIZE_Q
+_prefill_score_config = _prefill_policy.prefill_score_config
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
@@ -61,24 +66,23 @@ def _small_k_selector():
     return topk_per_row_small_k, topk_per_row_small_k_supported
 
 
-# Query rows one prefill score program owns.
-#
-# Before the block axis was split, this and the grid were the same knob, so it
-# had to be chosen per shape -- narrow wherever a wide one would drop the grid
-# below a CTA per compute unit, which on an fp8 cache was everywhere. Chunks
-# supply the parallelism now, so a flat tile is free to be the widest one that
-# still amortizes: 128 was best or within noise on all 20 measured
-# (dtype x heads x shape) points, while the old occupancy rule gives away 12x
-# more than it does and no other flat tile comes close (64 gives away 25x, 256
-# gives away 9x).
-SCORE_BLOCK_SIZE_Q = 128
 # Workgroups per compute unit the block-axis split aims for (_score_chunk_blocks).
-SCORE_CHUNK_CTAS_PER_CU = 8
+SCORE_CHUNK_CTAS_PER_CU = _prefill_policy.SCORE_CHUNK_CTAS_PER_CU
 # Stages, both score kernels. 2 -- triton's default -- was the worst of 1/2/3
 # nearly everywhere. Between 1 and 3, 3 wins on fp8 and ties on bf16; 1 wins the
 # short-context rows, which is not where a step spends its time.
 SCORE_NUM_STAGES = 3
 DECODE_SCORE_NUM_STAGES = 3
+_FP8_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dtype is not None
+)
 
 
 @functools.cache
@@ -90,13 +94,7 @@ def _prefill_score_launch_config(dtype: torch.dtype) -> tuple[int, int]:
     # For FP8 on wave32, a single pipeline stage cuts LDS/register pressure
     # enough that four warps outperform eight on long-context prefill. Keep
     # the BF16 configuration separate: it does not have the same tradeoff.
-    fp8_dtypes = (
-        getattr(torch, "float8_e4m3fn", None),
-        getattr(torch, "float8_e4m3fnuz", None),
-        getattr(torch, "float8_e5m2", None),
-        getattr(torch, "float8_e5m2fnuz", None),
-    )
-    return (4, 1) if dtype in fp8_dtypes else (8, SCORE_NUM_STAGES)
+    return (4, 1) if dtype in _FP8_DTYPES else (8, SCORE_NUM_STAGES)
 
 
 # Bounds on the decode score split, one per end of the batch range. MIN_BLOCKS
@@ -420,6 +418,47 @@ def _emit_sparse_block_table_kernel(
 # does not move between steps.
 # ---------------------------------------------------------------------------
 @triton.jit
+def _index_block_score_page(
+    q,
+    ik_cache_ptr,
+    page,
+    blk,
+    off_q,
+    off_k,
+    off_d,
+    q_start,
+    sm_scale_log2e,
+    stride_ik_blk,
+    stride_ik_pos,
+    stride_ik_d,
+    BLOCK_SIZE_K: tl.constexpr,
+    POST_REDUCE_SCALE: tl.constexpr,
+):
+    """One page's dot, causal mask and block max."""
+    i = blk * BLOCK_SIZE_K
+    # Every page id names a fully allocated 128-row cache page; the causal mask
+    # below removes positions past the live sequence, so this load needs no mask.
+    k = tl.load(
+        ik_cache_ptr
+        + page * stride_ik_blk
+        + off_k[None, :] * stride_ik_pos
+        + off_d[:, None] * stride_ik_d,
+    )
+    if k.dtype.is_fp8():
+        qk = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32)
+    else:
+        qk = tl.dot(q, k, out_dtype=tl.float32)
+    if not POST_REDUCE_SCALE:
+        qk *= sm_scale_log2e
+    if q_start < i + BLOCK_SIZE_K:
+        qk = tl.where(off_q[:, None] >= (i + off_k)[None, :], qk, float("-inf"))
+    score = tl.max(qk, axis=1)
+    if POST_REDUCE_SCALE:
+        score *= sm_scale_log2e
+    return score
+
+
+@triton.jit
 def _index_block_score_kernel(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
     ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
@@ -444,6 +483,9 @@ def _index_block_score_kernel(
     stride_bt_b,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+    STORE_GROUP: tl.constexpr = 1,
+    PREFETCH_PAGES: tl.constexpr = False,
+    POST_REDUCE_SCALE: tl.constexpr = False,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q = tl.program_id(0)
@@ -486,38 +528,93 @@ def _index_block_score_kernel(
     if blk_lo >= blk_end:
         return
     blk_hi = min(blk_lo + chunk_blocks, blk_end)
-    for blk in tl.range(blk_lo, blk_hi):
-        i = blk * BLOCK_SIZE_K
-        page = tl.load(bt_row + blk).to(tl.int64)
-        pos = i + off_k
-        # index-K for this page: [BLOCK_SIZE_D, BLOCK_SIZE_K] (transposed)
-        # we don't need masked load for K, because KV cache ensures
-        # allocation is multiple of BLOCK_SIZE_K.
-        # for tokens beyond seqlen, they will be masked in qk later.
-        k = tl.load(
-            ik_cache_ptr
-            + page * stride_ik_blk
-            + off_k[None, :] * stride_ik_pos
-            + off_d[:, None] * stride_ik_d,
-        )
-        if k.dtype.is_fp8():
-            qk = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32) * sm_scale_log2e
-        else:
-            qk = tl.dot(q, k, out_dtype=tl.float32) * sm_scale_log2e
-        # apply causal mask as needed
-        if q_start < i + BLOCK_SIZE_K:
-            qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
-        # one sparse block per K-tile -> max over the 128 positions
-        score = tl.max(qk, axis=1)  # [BLOCK_SIZE_Q]
-        s_ptrs = (
-            score_ptr
-            + pid_h * stride_s_h
-            + (seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q))
-            * stride_s_n
-            + blk * stride_s_k
-        )
-        q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
-        tl.store(s_ptrs, score, mask=q_store_mask)
+    q_row = seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
+    if STORE_GROUP == 1:
+        for blk in tl.range(blk_lo, blk_hi):
+            page = tl.load(bt_row + blk).to(tl.int64)
+            score = _index_block_score_page(
+                q,
+                ik_cache_ptr,
+                page,
+                blk,
+                off_q,
+                off_k,
+                off_d,
+                q_start,
+                sm_scale_log2e,
+                stride_ik_blk,
+                stride_ik_pos,
+                stride_ik_d,
+                BLOCK_SIZE_K,
+                POST_REDUCE_SCALE,
+            )
+            s_ptrs = (
+                score_ptr + pid_h * stride_s_h + q_row * stride_s_n + blk * stride_s_k
+            )
+            tl.store(s_ptrs, score, mask=q_store_mask)
+    else:
+        tl.static_assert(STORE_GROUP == 4)
+        slots = tl.arange(0, STORE_GROUP)
+        num_groups = tl.cdiv(blk_hi - blk_lo, STORE_GROUP)
+        for group in tl.range(0, num_groups):
+            group_start = blk_lo + group * STORE_GROUP
+            if PREFETCH_PAGES:
+                pages = (
+                    tl.load(bt_row + group_start).to(tl.int64),
+                    tl.load(
+                        bt_row + group_start + 1,
+                        mask=group_start + 1 < blk_hi,
+                        other=0,
+                    ).to(tl.int64),
+                    tl.load(
+                        bt_row + group_start + 2,
+                        mask=group_start + 2 < blk_hi,
+                        other=0,
+                    ).to(tl.int64),
+                    tl.load(
+                        bt_row + group_start + 3,
+                        mask=group_start + 3 < blk_hi,
+                        other=0,
+                    ).to(tl.int64),
+                )
+            scores = tl.full((BLOCK_SIZE_Q, STORE_GROUP), float("-inf"), tl.float32)
+            for slot in tl.static_range(0, STORE_GROUP):
+                blk = group_start + slot
+                if blk < blk_hi:
+                    if PREFETCH_PAGES:
+                        page = pages[slot]
+                    else:
+                        page = tl.load(bt_row + blk).to(tl.int64)
+                    score = _index_block_score_page(
+                        q,
+                        ik_cache_ptr,
+                        page,
+                        blk,
+                        off_q,
+                        off_k,
+                        off_d,
+                        q_start,
+                        sm_scale_log2e,
+                        stride_ik_blk,
+                        stride_ik_pos,
+                        stride_ik_d,
+                        BLOCK_SIZE_K,
+                        POST_REDUCE_SCALE,
+                    )
+                    scores = tl.where(slots[None, :] == slot, score[:, None], scores)
+            blocks = group_start + slots
+            s_ptrs = (
+                score_ptr
+                + pid_h * stride_s_h
+                + q_row[:, None] * stride_s_n
+                + blocks[None, :] * stride_s_k
+            )
+            tl.store(
+                s_ptrs,
+                scores,
+                mask=q_store_mask[:, None] & (blocks[None, :] < blk_hi),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -653,10 +750,9 @@ def _score_chunk_blocks(max_block: int, q_tiles: int, batch: int, heads: int, de
     chunk z is the same pages for every query tile that reaches it.
     """
     index = device.index if device.index is not None else torch.cuda.current_device()
-    want = _compute_units(index) * SCORE_CHUNK_CTAS_PER_CU
-    chunks = max(1, want // max(1, q_tiles * batch * heads))
-    chunks = min(1 << (chunks.bit_length() - 1), max(1, max_block))
-    return triton.cdiv(max_block, chunks)
+    return _prefill_policy.score_chunk_blocks(
+        max_block, q_tiles, batch * heads, _compute_units(index)
+    )
 
 
 def _decode_score_chunks(batch: int, max_block: int) -> int:
@@ -757,6 +853,218 @@ _AITER_MIN_WIDTH_WITH_EMIT = 2048
 
 def _aiter_selector_wins(width, emit):
     return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
+
+
+def _parallel_prefill_selector_wins(
+    arch, width, rows, compute_units, emit, topk, num_idx_heads, decode_max_q
+):
+    num_tiles = triton.cdiv(width, PREFILL_TOPK_MAX_BLOCK_SIZE_K)
+    return (
+        arch == "gfx1250"
+        and decode_max_q == 0
+        and emit
+        and topk == 16
+        and num_idx_heads == 1
+        # The second tile has at least one block per CU.
+        and width - PREFILL_TOPK_MAX_BLOCK_SIZE_K >= compute_units
+        # Pay for the merge only when the extra tiles add two CTAs per CU.
+        and rows * (num_tiles - 1) >= 2 * compute_units
+        # Four local lists fit in sparse_bt's 128-int32 output row.
+        and width <= 4 * PREFILL_TOPK_MAX_BLOCK_SIZE_K
+    )
+
+
+@triton.jit
+def _prefill_partial_topk_kernel(
+    score_ptr,
+    partial_key_ptr,
+    row_starts,
+    row_prefix,
+    num_idx_heads,
+    init_blocks: tl.constexpr,
+    local_blocks: tl.constexpr,
+    stride_s_h,
+    stride_s_n,
+    stride_s_k,
+    stride_p_h,
+    stride_p_n,
+    stride_p_k,
+    SPARSE_BLOCK: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    pid_q = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+    pid_group = tl.program_id(2)
+    pid_b = pid_bh // num_idx_heads
+    pid_h = pid_bh % num_idx_heads
+
+    seq_start = tl.load(row_starts + pid_b)
+    block_num = tl.load(row_starts + pid_b + 1) - seq_start
+    if pid_q >= block_num:
+        return
+    prefix_len = tl.load(row_prefix + pid_b)
+    valid_blocks = (prefix_len + pid_q + SPARSE_BLOCK) // SPARSE_BLOCK
+    local_start = tl.maximum(0, valid_blocks - local_blocks)
+    offset = pid_group * BLOCK_SIZE_K
+    score_row = score_ptr + pid_h * stride_s_h + (seq_start + pid_q) * stride_s_n
+    winners = tl.topk(
+        _score_tile_keys(
+            score_row,
+            offset,
+            valid_blocks,
+            local_start,
+            stride_s_k,
+            init_blocks,
+            BLOCK_SIZE_K,
+        ),
+        BLOCK_SIZE_T,
+    )
+    slots = tl.arange(0, BLOCK_SIZE_T)
+    tl.store(
+        partial_key_ptr
+        + pid_h * stride_p_h
+        + (seq_start + pid_q) * stride_p_n
+        + (pid_group * BLOCK_SIZE_T + slots) * stride_p_k,
+        winners,
+    )
+
+
+@triton.jit
+def _prefill_merge_topk_kernel(
+    partial_key_ptr,
+    topk_ptr,
+    row_starts,
+    row_prefix,
+    topk,
+    num_partial,
+    stride_p_h,
+    stride_p_n,
+    stride_p_k,
+    stride_ti_h,
+    stride_ti_n,
+    stride_ti_t,
+    block_table_ptr,
+    sparse_bt_ptr,
+    sparse_ctx_ptr,
+    stride_bt_b,
+    stride_sbt_n,
+    NUM_KV_HEADS: tl.constexpr,
+    SPARSE_BLOCK: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    MERGE_SIZE: tl.constexpr,
+    pages_per_block: tl.constexpr,
+    block_page_stride: tl.constexpr,
+):
+    pid_q = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    seq_start = tl.load(row_starts + pid_b)
+    block_num = tl.load(row_starts + pid_b + 1) - seq_start
+    if pid_q >= block_num:
+        return
+    prefix_len = tl.load(row_prefix + pid_b)
+    valid_blocks = (prefix_len + pid_q + SPARSE_BLOCK) // SPARSE_BLOCK
+
+    cols = tl.arange(0, MERGE_SIZE)
+    keys = tl.load(
+        partial_key_ptr
+        + pid_h * stride_p_h
+        + (seq_start + pid_q) * stride_p_n
+        + cols * stride_p_k,
+        mask=cols < num_partial,
+        other=0,
+    )
+    winners = tl.topk(keys, BLOCK_SIZE_T)
+    slots = tl.arange(0, BLOCK_SIZE_T)
+    topk_idx = (winners & 0xFFFF).to(tl.int32) - 1
+    topk_idx = tl.where(slots < tl.minimum(topk, valid_blocks), topk_idx, -1)
+    tl.store(
+        topk_ptr
+        + pid_h * stride_ti_h
+        + (seq_start + pid_q) * stride_ti_n
+        + slots * stride_ti_t,
+        topk_idx,
+        mask=slots < topk,
+    )
+
+    emit_row = (seq_start + pid_q) * NUM_KV_HEADS + pid_h
+    _emit_sparse_block_table_row(
+        topk_idx,
+        block_table_ptr + pid_b * stride_bt_b,
+        sparse_bt_ptr + emit_row * stride_sbt_n,
+        sparse_ctx_ptr + emit_row,
+        prefix_len + pid_q + 1,
+        topk,
+        pid_h,
+        SPARSE_BLOCK,
+        pages_per_block,
+        block_page_stride=block_page_stride,
+        NUM_KV_HEADS=NUM_KV_HEADS,
+        BLOCK_SIZE_T=BLOCK_SIZE_T,
+    )
+
+
+def _launch_parallel_prefill_selector(
+    score,
+    topk_idx,
+    row_starts,
+    row_prefix,
+    block_table,
+    emit_args,
+    rows_per_req,
+    topk,
+    init_blocks,
+    local_blocks,
+    block_page_stride,
+):
+    """Select exact top-k, using sparse_bt as the partial-key workspace."""
+    num_idx_heads, total_q, max_block = score.shape
+    batch = row_starts.shape[0] - 1
+    num_groups = triton.cdiv(max_block, PREFILL_TOPK_MAX_BLOCK_SIZE_K)
+    block_size_t = triton.next_power_of_2(topk)
+    sparse_bt, sparse_ctx, stride_bt_b, stride_sbt_n = emit_args
+    partial_keys = sparse_bt.view(torch.int64).view(num_idx_heads, total_q, -1)
+    assert num_groups * block_size_t <= partial_keys.shape[2]
+    _prefill_partial_topk_kernel[(rows_per_req, batch * num_idx_heads, num_groups)](
+        score,
+        partial_keys,
+        row_starts,
+        row_prefix,
+        num_idx_heads,
+        init_blocks,
+        local_blocks,
+        *score.stride(),
+        *partial_keys.stride(),
+        SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+        BLOCK_SIZE_K=PREFILL_TOPK_MAX_BLOCK_SIZE_K,
+        BLOCK_SIZE_T=block_size_t,
+        num_warps=1,
+    )
+
+    num_partial = num_groups * block_size_t
+    _prefill_merge_topk_kernel[(rows_per_req, batch, num_idx_heads)](
+        partial_keys,
+        topk_idx,
+        row_starts,
+        row_prefix,
+        topk,
+        num_partial,
+        *partial_keys.stride(),
+        *topk_idx.stride(),
+        block_table,
+        sparse_bt,
+        sparse_ctx,
+        stride_bt_b,
+        stride_sbt_n,
+        NUM_KV_HEADS=num_idx_heads,
+        SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
+        BLOCK_SIZE_T=block_size_t,
+        MERGE_SIZE=triton.next_power_of_2(num_partial),
+        pages_per_block=PAGES_PER_SPARSE_BLOCK,
+        block_page_stride=block_page_stride,
+        num_warps=1,
+    )
 
 
 # aiter's support predicate answers from shape, dtype and arch alone, but costs
@@ -870,6 +1178,49 @@ def _launch_select(
                 # time 8.03us -> 4.66us, decode 2.63 -> 2.50, same bytes out.
                 num_warps=1,
             )
+        return
+
+    # A second 1024-wide tile with at least one block per CU repays a parallel
+    # first pass. Its partial keys reuse sparse_bt until the merge overwrites it.
+    parallel_prefill = False
+    if (
+        decode_max_q == 0
+        and emit
+        and topk == 16
+        and num_idx_heads == 1
+        and PREFILL_TOPK_MAX_BLOCK_SIZE_K
+        < score.shape[2]
+        <= 4 * PREFILL_TOPK_MAX_BLOCK_SIZE_K
+    ):
+        device_index = (
+            score.device.index
+            if score.device.index is not None
+            else torch.cuda.current_device()
+        )
+        parallel_prefill = _parallel_prefill_selector_wins(
+            get_gfx_runtime(),
+            score.shape[2],
+            score.shape[1],
+            _compute_units(device_index),
+            emit,
+            topk,
+            num_idx_heads,
+            decode_max_q,
+        )
+    if parallel_prefill:
+        _launch_parallel_prefill_selector(
+            score,
+            topk_idx,
+            row_starts,
+            row_prefix,
+            block_table,
+            emit_args,
+            rows_per_req,
+            topk,
+            init_blocks,
+            local_blocks,
+            block_page_stride,
+        )
         return
 
     _topk_index_packed_kernel[(rows_per_req, batch, num_idx_heads)](
@@ -1281,8 +1632,31 @@ def _triton_prefill_score(
         dtype=torch.float32,
         device=idx_q.device,
     )
-    q_tiles = triton.cdiv(max_query_len, SCORE_BLOCK_SIZE_Q)
-    chunk_blocks = _score_chunk_blocks(
+    arch = get_gfx_runtime()
+    is_fp8 = index_kv_cache.dtype in _FP8_DTYPES
+    (
+        score_block_size_q,
+        measured_chunk,
+        measured_warps,
+        measured_stages,
+        store_group,
+        prefetch_pages,
+        post_reduce_scale,
+    ) = _prefill_score_config(
+        arch,
+        is_fp8,
+        max_query_len,
+        max_block,
+        batch,
+        num_idx_heads,
+        _compute_units(
+            idx_q.device.index
+            if idx_q.device.index is not None
+            else torch.cuda.current_device()
+        ),
+    )
+    q_tiles = triton.cdiv(max_query_len, score_block_size_q)
+    chunk_blocks = measured_chunk or _score_chunk_blocks(
         max_block, q_tiles, batch, num_idx_heads, idx_q.device
     )
     grid_score = (
@@ -1293,6 +1667,8 @@ def _triton_prefill_score(
     score_num_warps, score_num_stages = _prefill_score_launch_config(
         index_kv_cache.dtype
     )
+    score_num_warps = measured_warps or score_num_warps
+    score_num_stages = measured_stages or score_num_stages
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
@@ -1315,8 +1691,11 @@ def _triton_prefill_score(
         score.stride(1),
         score.stride(2),
         block_table.stride(0),
-        BLOCK_SIZE_Q=SCORE_BLOCK_SIZE_Q,
+        BLOCK_SIZE_Q=score_block_size_q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        STORE_GROUP=store_group,
+        PREFETCH_PAGES=prefetch_pages,
+        POST_REDUCE_SCALE=post_reduce_scale,
         num_warps=score_num_warps,
         num_stages=score_num_stages,
     )
