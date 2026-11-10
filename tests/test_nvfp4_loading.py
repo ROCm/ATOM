@@ -8,6 +8,12 @@ import pytest
 import torch
 from torch import nn
 
+from atom.moe_config import (
+    MoEBackendConfig,
+    MoEParallelMapping,
+    resolve_moe_execution_plan,
+)
+
 aiter = pytest.importorskip("aiter")
 QuantType = aiter.QuantType
 dtypes = aiter.dtypes
@@ -37,6 +43,15 @@ validate_nvfp4_global_scales = quant_spec.validate_nvfp4_global_scales
 dequantize_nvfp4 = importlib.import_module(
     "atom.quantization.quark.utils"
 ).dequantize_nvfp4
+
+
+def _moe_config():
+    mapping = MoEParallelMapping.make(tp_size=1, dp_size=1)
+    return SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(
+            execution_plan=resolve_moe_execution_plan(mapping, MoEBackendConfig())
+        )
+    )
 
 
 def _nvfp4_spec() -> LayerQuantConfig:
@@ -491,7 +506,7 @@ def test_nvfp4_moe_loads_split_expert_scalars_and_blocks_forward():
     )
     layer.expert_map = None
 
-    method = Nvfp4MoEMethod(_nvfp4_spec(), SimpleNamespace())
+    method = Nvfp4MoEMethod(_nvfp4_spec(), _moe_config())
     layer.quant_method = method
     layer.layer_name = layer.prefix
     layer.local_num_experts = 2
@@ -576,7 +591,7 @@ def test_nvfp4_moe_streaming_counts_split_global_scales(monkeypatch):
     layer._load_device = torch.device("cpu")
     layer._comm_fused_moe = None
 
-    method = Nvfp4MoEMethod(_nvfp4_spec(), SimpleNamespace())
+    method = Nvfp4MoEMethod(_nvfp4_spec(), _moe_config())
     layer.quant_method = method
     method.create_weights(
         layer,
@@ -946,7 +961,7 @@ def test_nvfp4_moe_global_scale_check_skips_eplb_redundant_replicas(
 def test_nvfp4_moe_rejects_non_group_aligned_dimensions(hidden_size, intermediate_size):
     layer = nn.Module()
     layer.has_bias = False
-    method = Nvfp4MoEMethod(_nvfp4_spec(), SimpleNamespace())
+    method = Nvfp4MoEMethod(_nvfp4_spec(), _moe_config())
 
     with pytest.raises(ValueError, match="must be divisible by group_size=16"):
         method.create_weights(
@@ -971,7 +986,7 @@ def test_nvfp4_moe_rejects_mxfp4_misaligned_dimensions_at_construction(
 ):
     layer = nn.Module()
     layer.has_bias = False
-    method = Nvfp4MoEMethod(_nvfp4_spec(), SimpleNamespace())
+    method = Nvfp4MoEMethod(_nvfp4_spec(), _moe_config())
 
     with pytest.raises(ValueError, match=f"NVFP4 {axis}.*multiple of 32"):
         method.create_weights(
@@ -986,7 +1001,7 @@ def test_nvfp4_moe_rejects_mxfp4_misaligned_dimensions_at_construction(
 def test_nvfp4_moe_rejects_expert_biases():
     layer = nn.Module()
     layer.has_bias = True
-    method = Nvfp4MoEMethod(_nvfp4_spec(), SimpleNamespace())
+    method = Nvfp4MoEMethod(_nvfp4_spec(), _moe_config())
 
     with pytest.raises(ValueError, match="NVFP4 MoE expert biases are not supported"):
         method.create_weights(
