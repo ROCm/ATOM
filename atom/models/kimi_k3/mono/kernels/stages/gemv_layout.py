@@ -41,6 +41,9 @@ LDS_PAD = 8
 TDM_SLAB = 512
 TDM_ROW_STRIDE = TDM_SLAB + LDS_PAD
 TDM_DEPTH = 3
+# Every CTA of a TDM GEMV reads the same token slabs: launched in clusters of
+# this many CTAs, their identical slab loads merge (multicast) in GL1.
+TDM_CLUSTER = 2
 
 
 def tdm_lds_words(rows: int, tasks: int) -> tuple[int, int]:

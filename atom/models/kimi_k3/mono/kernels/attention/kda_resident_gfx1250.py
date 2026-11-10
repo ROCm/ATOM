@@ -933,11 +933,21 @@ def build_resident_k1(
                 core_out,
                 core_q,
                 scratch,
+                **(
+                    {"value_attrs": gemv_tdm.CLUSTER_LAUNCH["value_attrs"]}
+                    if spec.tdm_projection
+                    else {}
+                ),
             )
             call.launch(
                 grid=(declaration.blocks,),
                 block=(declaration.threads,),
                 stream=stream,
+                **(
+                    {"cluster": gemv_tdm.CLUSTER_LAUNCH["cluster"]}
+                    if spec.tdm_projection
+                    else {}
+                ),
             )
 
     LOCAL_ABI.check(resident, launch)

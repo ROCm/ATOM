@@ -10,6 +10,10 @@ multiply the current one. Every wave owns 64 columns of a slab (two K32 WMMA
 steps); the v8 f32 accumulators keep ``gemv_gfx1250``'s lane mapping, so its
 ``store_accumulator``/``row_sum`` finish the cross-wave reduction.
 
+Kernels using it launch in clusters of ``TDM_CLUSTER`` CTAs (``CLUSTER_LAUNCH``):
+the token slab loads carry the cluster's multicast mask and a cluster barrier
+opens every slab, so the CTAs' identical loads are in flight together and merge.
+
 LDS rows are padded by 8 BF16 after each 512 columns: a TDM pad interval is at
 most 256 dwords, and the 1040-byte row pitch spreads the 16 rows one operand
 read touches over distinct banks.
@@ -22,6 +26,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects import vector
 from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import T, as_ir_value
 
 from atom.models.kimi_k3.mono.kernels.stages.gemv_gfx1250 import ACCUMULATOR_ELEMENTS
@@ -31,6 +36,7 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     LDS_PAD,
     PACK_ELEMENTS,
     ROWS,
+    TDM_CLUSTER,
     TDM_DEPTH,
     TDM_ROW_STRIDE,
     TDM_SLAB,
@@ -46,15 +52,21 @@ WAVES = 8
 WAVE_COLUMNS = SLAB // WAVES
 WAVE_STEPS = WAVE_COLUMNS // K_PER_MMA
 _DESCRIPTOR_TYPE = 2 << 30
+_CLUSTER_MASK = (1 << TDM_CLUSTER) - 1 if TDM_CLUSTER > 1 else 0
+CLUSTER_LAUNCH = {
+    "value_attrs": {"rocdl.cluster_dims": f"{TDM_CLUSTER},1,1"},
+    "cluster": (TDM_CLUSTER, 1, 1),
+}
 
 
 def _i32(value: int):
     return fx.Int32(value - (1 << 32) if value >= 1 << 31 else value)
 
 
-def load_rows(address, row_stride: int, lds, rows, rows_per_wave: int):
+def load_rows(address, row_stride: int, lds, rows, rows_per_wave: int, mask: int = 0):
     """Issue this wave's TDM copy of ``rows_per_wave`` of a [rows, SLAB] BF16
-    tile starting at ``address`` into ``lds``; rows past ``rows`` are skipped."""
+    tile starting at ``address`` into ``lds``; rows past ``rows`` are skipped.
+    ``mask`` is the cluster multicast mask of identical loads to merge."""
 
     wave = fx.Int32(rocdl.wave_id())
     row0 = wave * rows_per_wave
@@ -75,7 +87,7 @@ def load_rows(address, row_stride: int, lds, rows, rows_per_wave: int):
     )
     pad_interval = int(math.log2(SLAB * 2 // 4)) - 1
     pad_amount = LDS_PAD * 2 // 4 - 1
-    config = (1 << 16) | (1 << 20) | (pad_interval << 22) | (pad_amount << 25)
+    config = (1 << 16) | (1 << 20) | (pad_interval << 22) | (pad_amount << 25) | mask
     group1 = vector.from_elements(
         T.vec(8, T.i32),
         [
@@ -155,6 +167,7 @@ def project(lds, x, x_stride: int, rows: int, w, w_rows: int, k: int, task_rows,
             lds + (slab % 2) * token_words,
             rows,
             rows_per_wave,
+            _CLUSTER_MASK,
         )
         issued.append(slab)
 
@@ -179,7 +192,10 @@ def project(lds, x, x_stride: int, rows: int, w, w_rows: int, k: int, task_rows,
     for slab in range(slabs):
         if slab:
             # The buffers slab - 1 read are the ones refilled below.
-            gpu.barrier()
+            if TDM_CLUSTER > 1:
+                cluster.cluster_barrier()
+            else:
+                gpu.barrier()
             if slab + 1 < slabs:
                 issue_tokens(slab + 1)
         elif slabs > 1:

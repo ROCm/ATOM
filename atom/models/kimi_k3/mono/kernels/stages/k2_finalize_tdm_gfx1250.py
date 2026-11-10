@@ -129,8 +129,17 @@ def build_replicated_finalize(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFinaliz
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         _ = sources
-        kernel(routed_normed, shared, up_weight, output).launch(
-            grid=(PAIRS,), block=(THREADS,), stream=stream
+        kernel(
+            routed_normed,
+            shared,
+            up_weight,
+            output,
+            value_attrs=gemv_tdm.CLUSTER_LAUNCH["value_attrs"],
+        ).launch(
+            grid=(PAIRS,),
+            block=(THREADS,),
+            stream=stream,
+            cluster=gemv_tdm.CLUSTER_LAUNCH["cluster"],
         )
 
     REPLICATED_FINALIZE_ABI.check(kernel, launch)

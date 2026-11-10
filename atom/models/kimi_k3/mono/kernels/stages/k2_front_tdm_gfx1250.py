@@ -251,7 +251,13 @@ def build_replicated_front(plan: Gfx1250KimiBuildPlan) -> K2ReplicatedFrontKerne
             latent_fp4,
             latent_scales,
             shared_hidden,
-        ).launch(grid=(PAIRS,), block=(THREADS,), stream=stream)
+            value_attrs=gemv_tdm.CLUSTER_LAUNCH["value_attrs"],
+        ).launch(
+            grid=(PAIRS,),
+            block=(THREADS,),
+            stream=stream,
+            cluster=gemv_tdm.CLUSTER_LAUNCH["cluster"],
+        )
 
     REPLICATED_FRONT_ABI.check(kernel, launch)
     return K2ReplicatedFrontKernel(name, launch, (PAIRS,), (THREADS,))
