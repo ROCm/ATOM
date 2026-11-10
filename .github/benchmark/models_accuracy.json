@@ -417,7 +417,7 @@
   {
     "model_name": "GLM-5.3-Flash-kpool-16shot",
     "model_path": "zai-org/GLM-5.3-Flash",
-    "extraArgs": "--kv_cache_dtype bf16 -tp 8 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.85 --no-enable_prefix_caching",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.85 --no-enable_prefix_caching",
     "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=32,max_retries=3,tokenized_requests=False,max_gen_toks=512 --tasks gsm8k --num_fewshot 16 --batch_size 65 --apply_chat_template --fewshot_as_multiturn --output_path ${OUTPUT_PATH} --log_samples",
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
