@@ -28,6 +28,7 @@ Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns t
 | `POST /parse/reasoning` / `/parse/function_call` | Reasoning and tool-call parsing |
 | `GET /health` / `/readiness` / `/liveness` | Health probes |
 | `GET /engine_metrics` | Aggregated worker engine Prometheus metrics |
+| `GET /metrics` | Mesh self metrics, the same registry as the Prometheus exporter |
 | `GET /v1/models` | Model metadata |
 
 Responses resource operations (GET, DELETE, cancel and input_items) probe regular
@@ -298,10 +299,14 @@ registered token-routing template, so under `prefix_hash` they return
 
 Default bind: `0.0.0.0:29000` (`--prometheus-host` / `--prometheus-port`)
 
-Mesh self metrics are exposed by the Prometheus exporter above. Worker engine
-metrics remain available through the router's `/engine_metrics` endpoint, which
-scrapes backend workers, injects `worker_addr`, and aggregates their Prometheus
-text without changing worker metric names.
+Mesh self metrics are exposed by the Prometheus exporter above and by the
+router's own `/metrics` endpoint, which returns 503 when the exporter is not
+running. The router port serves the whole registry whatever `--prometheus-host`
+is set to, so binding the exporter to a private address does not hide these
+metrics from clients that can reach the router. Worker engine metrics remain
+available through the router's `/engine_metrics` endpoint, which scrapes backend
+workers, injects `worker_addr`, and aggregates their Prometheus text without
+changing worker metric names.
 
 | Layer | Prefix | Description |
 |-------|--------|-------------|
