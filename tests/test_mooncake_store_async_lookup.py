@@ -315,3 +315,53 @@ def test_multi_connector_fans_the_forward_stream_out_to_children():
     ]
     m.set_forward_stream("stream-B")
     assert got == ["stream-B"]
+
+
+def test_hashing_a_prompt_on_the_lookup_worker_never_blocks_a_token_append():
+    """The async lookup hashes the prompt on its worker while the scheduler
+    thread appends the request's tokens: the append must never meet an array
+    that exports its buffer (BufferError fails the engine step)."""
+    from atom.kv_transfer.offload.mooncake_store import scheduler as store_sched
+    from atom.kv_transfer.offload.mooncake_store.config import (
+        parse_mooncake_store_config,
+    )
+    from atom.model_engine.sequence import Sequence
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        def exists(self, keys):
+            return [0] * len(keys)
+
+    original = store_sched.store_client.MooncakeStoreClient
+    store_sched.store_client.MooncakeStoreClient = Client
+    try:
+        cfg = parse_mooncake_store_config(
+            {
+                "kv_connector_extra_config": {
+                    "mooncake_store.master": "127.0.0.1:1",
+                    "mooncake_store.metadata": "http://127.0.0.1:2/metadata",
+                }
+            }
+        )
+        lookup = AsyncStoreLookup(
+            store_sched._StoreLookup(
+                cfg, namespace="t", world=1, chunk_tokens=cfg.chunk_tokens
+            )
+        )
+        appends = 0
+        for trial in range(20):
+            seq = Sequence(list(range(1_000_000)), 16)
+            sid = f"s{trial}"
+            assert lookup.submit(seq, sid)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not lookup.answered(sid):
+                seq.append_token(7)  # raised BufferError while hashing in place
+                appends += 1
+            assert lookup.answered(sid)
+            lookup.clear_lookup_status(sid)
+        assert appends > 0
+        lookup.close()
+    finally:
+        store_sched.store_client.MooncakeStoreClient = original
