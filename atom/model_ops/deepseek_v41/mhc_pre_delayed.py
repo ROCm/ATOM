@@ -6,7 +6,9 @@ pre-mix carried from the PREVIOUS sublayer while the one computed here is
 carried to the next. HIP Mega-MHC and the Triton implementation cover that seam --
 the owed post, the gate projection, Sinkhorn, the collapse with the carried
 pre-mix and the sublayer's input RMSNorm. HIP uses one compute kernel on gfx950
-and gfx1250; Triton remains available through ATOM_DSV41_MHC_BACKEND=triton.
+and gfx1250. On gfx942 with H=5120, seams with a post pass the FP32 weight to
+mega_mhc, which runs AITER's ASM seam kernels and RMSNorm; seams without a post
+stay on Triton. Triton remains available through ATOM_DSV41_MHC_BACKEND=triton.
 
 The norm is the sublayer's own. Attention can request HIP's fused MXFP8
 output alongside BF16 for its other readers; FFN keeps the BF16 interface.
@@ -56,6 +58,21 @@ def _row_major_scale_options():
     ):
         return {"scale_row_major": True}
     return None
+
+
+@cache
+def _asm_seam_supported(hc_mult, hidden):
+    """Whether mega_mhc takes the FP32 weight to AITER's gfx942 ASM seam:
+    hc_mult=4, H=5120, and an AITER whose mega_mhc dispatches it there."""
+    if envs.ATOM_DSV41_MHC_BACKEND == "triton":
+        return False
+    if (hc_mult, hidden) != (4, 5120) or get_gfx_runtime() != "gfx942":
+        return False
+    try:
+        from aiter.ops import mega_mhc
+    except ImportError:
+        return False
+    return hasattr(mega_mhc, "_mega_mhc_asm")
 
 
 def fuse_quant_supported() -> bool:
@@ -220,6 +237,9 @@ def v41_mhc_pre_delayed(
         options["out_dtype"] = "mxfp8" if fuse_quant else "bf16"
         if fuse_quant:
             options.update(_row_major_scale_options())
+    elif with_post and _asm_seam_supported(hc_mult, hidden):
+        # FP32 fn: mega_mhc runs the ASM seam, then RMSNorm.
+        kernel = _hip_ops()[0]
     new_residual, post, comb, normed, pre = kernel(
         residual.view(rows, hc_mult, hidden),
         hc_fn,
