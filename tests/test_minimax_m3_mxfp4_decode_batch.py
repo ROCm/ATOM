@@ -234,3 +234,48 @@ def test_the_sparse_decode_runs_only_the_rows_the_metadata_covers(
     out = skip._sparse_decode(q, None, v, None, None, None, None, ctx)
     assert "scorer" not in seen and seen["attend"][0] == rows
     assert (out[rows:] == 0).all()
+
+
+@pytest.mark.parametrize(
+    "mxfp4, scheduled, rows, want",
+    [
+        (True, 3, 24, 3),  # a DP step padded past the requests it runs: rows decide
+        (False, 3, 24, 8),  # the other index caches keep the padded batch
+        (True, 9, 24, ValueError),  # fewer rows than scheduled requests: refused
+    ],
+)
+def test_the_row_rule_and_its_refusal_are_the_mxfp4_indexs(
+    mod, monkeypatch, mxfp4, scheduled, rows, want
+):
+    running_bs, q = 8, 8
+    seen = []
+    monkeypatch.setattr(
+        mod, "make_sparse_decode_metadata", lambda **kw: seen.append(kw)
+    )
+    monkeypatch.setattr(mod, "kv_indices_generate_triton", lambda *a: None)
+    monkeypatch.setattr(
+        mod.AiterAttentionMetadataBuilder.__mro__[1],
+        "finish_decode",
+        lambda self, *a: None,
+    )
+    b = builder(mod, mxfp4=mxfp4)
+    if mxfp4:
+        b._index_work_maps[""] = object()
+    b.refresh_flydsl_plan = lambda *_a, **_k: None
+    b._get_sparse_attention_block_tables = lambda bt, sl, bs: bt
+    b._n_valid_column_per_row_buffer = lambda: None
+    attn = types.SimpleNamespace(
+        max_seqlen_k=8,
+        block_tables=torch.zeros(running_bs, 4),
+        context_lens=torch.zeros(running_bs),
+        slot_mapping=torch.zeros(running_bs),
+        kv_indices=None,
+        kv_indptr=None,
+    )
+    batch = types.SimpleNamespace(total_seqs_num_decode=scheduled)
+    if want is ValueError:
+        with pytest.raises(ValueError, match="do not cover"):
+            b.finish_decode(batch, attn, running_bs, rows, q)
+        return
+    b.finish_decode(batch, attn, running_bs, rows, q)
+    assert seen[0]["seq_lens"].shape[0] == want

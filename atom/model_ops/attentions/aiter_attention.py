@@ -1130,17 +1130,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # can make more (a prefill bucket's pad) or fewer than `running_bs * q`;
             # `_sparse_decode` slices q / idx_q to the rows of this batch. The other
             # index caches keep the padded batch.
-            index_bs = (
-                min(running_bs, running_tokens // max_seqlen_q)
-                if self._index_work_map_kwargs()
-                else running_bs
-            )
-            if index_bs < batch.total_seqs_num_decode:
-                raise ValueError(
-                    f"MXFP4 index decode: {running_tokens} rows of {max_seqlen_q} "
-                    f"query tokens do not cover the {batch.total_seqs_num_decode} "
-                    "scheduled requests"
-                )
+            index_bs = running_bs
+            if self._index_work_map_blocks:  # the MXFP4 index cache
+                index_bs = min(running_bs, running_tokens // max_seqlen_q)
+                if index_bs < batch.total_seqs_num_decode:
+                    raise ValueError(
+                        f"MXFP4 index decode: {running_tokens} rows of {max_seqlen_q} "
+                        f"query tokens do not cover the {batch.total_seqs_num_decode} "
+                        "scheduled requests"
+                    )
             sparse_block_tables = self._get_sparse_attention_block_tables(
                 attn_metadata.block_tables[:index_bs],
                 attn_metadata.context_lens[:index_bs],
