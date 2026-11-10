@@ -298,3 +298,63 @@ def test_a_graph_replays_a_padded_step_like_the_scheduled_batch(S, heads, fill):
     want = _select(q[: scheduled * S], cache, table[:scheduled], seq[:scheduled], S, md, heads)  # fmt: skip
     _assert_live_rows_match(got, want, scheduled * S, heads)
     _assert_pad_rows_are_empty(got, scheduled * S, heads)
+
+
+def _scores(running, S, bound, heads=HEADS):
+    """The builder's persistent score storage: flat, at the map's width, and never
+    filled -- here with values no selector may read (NaN, +-inf, a huge finite)."""
+    flat = torch.empty(heads * running * S * bound, dtype=torch.float32, device="cuda")
+    junk = torch.tensor(
+        [float("nan"), float("inf"), -float("inf"), 3e38], device="cuda"
+    )
+    flat.copy_(junk[torch.randint(0, 4, flat.shape, device="cuda")])
+    return flat
+
+
+def _select_persistent(q, cache, table, seq, S, md, scores, heads=HEADS):
+    from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
+
+    bound = table.shape[1]
+    return minimax_m3_index_topk_decode(
+        q, cache, table, seq, bound * 128, TOPK, 0, 1, heads, SM_SCALE,
+        emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
+        index_mxfp4=True, pages_per_block=1,
+        n_valid_column_per_row=md.n_valid_column_per_row,
+        index_work_map=md.index_work_map, index_work_map_max_block=bound,
+        index_score_out=scores,
+    )  # fmt: skip
+
+
+# S * heads >= 16 is where aiter's scorer lays the scores out transposed, and with
+# 2048+ blocks a row is wide enough for the aiter selector, which only the
+# contiguous layout of a persistent buffer can use there
+@pytest.mark.parametrize(
+    "S,heads,blocks",
+    [(1, 1, 70), (8, 1, 70), (4, 4, 70), (8, 2, 70), (1, 2, 2100), (8, 2, 2100)],
+)
+def test_a_persistent_unfilled_score_buffer_selects_like_the_allocated_one(
+    S, heads, blocks
+):
+    """The scorer given `out=` (contiguous, filled with junk, reused by a second step
+    with other lengths) leaves the selection, the block table and the contexts of
+    every row bit for bit what the allocated, -inf-filled scores give: ragged lengths,
+    pad rows past the scheduled ones, e8m0-bounded random pages."""
+    running, scheduled = 8, 5
+    scores = None
+    for step, seed in enumerate((90, 91)):
+        cache, table, seq, q = make_case(
+            scheduled, S, seed=seed + S, max_len=128 * blocks, heads=heads
+        )
+        if step:  # the second step is shorter than the one that wrote the buffer
+            seq = (seq // 3).clamp(min=S + 1).to(torch.int32)
+        pt, ps, pq = _pad(table, seq, q, S, running, 0x7FFFFFFF)
+        bound = table.shape[1]
+        buffers, nvalid = _buffers(running, S, bound, heads)
+        md = _metadata(pt, ps, S, buffers, nvalid, heads)
+        want = _select(pq, cache, pt, ps, S, md, heads)
+        if scores is None:
+            scores = _scores(running, S, bound, heads)
+        got = _select_persistent(pq, cache, pt, ps, S, md, scores, heads)
+        for g, w in zip(got, want):
+            assert torch.equal(g, w), f"step {step}"
+        _assert_pad_rows_are_empty(got, scheduled * S, heads)

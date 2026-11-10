@@ -296,6 +296,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
         # The MXFP4 index scorer's work map buffer, by ubatch prefix ("" the whole step).
         self._index_work_maps = {}
+        self._index_scores = {}  # its score storage, by the same prefix
         self._index_work_map_blocks = 0
         if (
             self._has_sparse_attention
@@ -314,6 +315,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             self._index_work_maps[""] = self._alloc_index_work_map(
                 self.max_bs, max_qlen
             )
+            self._index_scores[""] = self._alloc_index_scores(self.max_bs * max_qlen)
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
@@ -367,6 +369,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 self._index_work_maps[f"ub{ub_idx}_"] = self._alloc_index_work_map(
                     rows, 1
                 )
+                # and its own scores, for the same reason
+                self._index_scores[f"ub{ub_idx}_"] = self._alloc_index_scores(rows)
+
+    def _alloc_index_scores(self, max_rows: int):
+        """Score storage for up to ``max_rows`` query rows at the work map's width,
+        allocated once (a captured graph bakes its pointer) and never filled: see
+        `MiniMaxM3SparseMetadata.index_score_out`."""
+        return torch.empty(
+            self._num_idx_heads * max_rows * self._index_work_map_blocks,
+            dtype=torch.float32,
+            device=self.device,
+        )
 
     def _alloc_index_work_map(self, max_batch: int, max_query_len: int):
         """Work map buffer for up to ``max_batch`` requests of up to ``max_query_len``
@@ -704,10 +718,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             f"{prefix}sparse_attention_n_valid_column_per_row"
         ]
 
-    def _index_work_map_kwargs(self, prefix: str = "") -> dict:
-        """The MXFP4 decode scorer's work map buffer, for `make_sparse_decode_metadata`;
-        nothing for any other index cache. `prefix`
-        selects the ubatch's buffer (`ub<i>_`): both ubatches' metadata are alive at once
+    def _index_scorer_kwargs(self, prefix: str = "") -> dict:
+        """The MXFP4 decode scorer's work map and score buffers, for
+        `make_sparse_decode_metadata`; nothing for any other index cache. `prefix`
+        selects the ubatch's buffers (`ub<i>_`): both ubatches' metadata are alive at once
         on one stream, so a shared map would be overwritten by the second before the
         first one's layers ran."""
         work_map = self._index_work_maps.get(prefix)
@@ -716,6 +730,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         return {
             "index_work_map_out": work_map,
             "index_work_map_max_block": self._index_work_map_blocks,
+            "index_score_out": self._index_scores[prefix],
         }
 
     def _get_sparse_attention_block_tables(
@@ -1152,7 +1167,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=int(max_seqlen_q),
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
-                **self._index_work_map_kwargs(),
+                **self._index_scorer_kwargs(),
             )
 
     def finish_ubatch(
@@ -1189,7 +1204,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(
                     f"ub{ubatch_idx}_"
                 ),
-                **self._index_work_map_kwargs(f"ub{ubatch_idx}_"),
+                **self._index_scorer_kwargs(f"ub{ubatch_idx}_"),
             )
 
     def build_for_cudagraph_capture(
@@ -1239,7 +1254,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=max_q_len,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
-                **self._index_work_map_kwargs(),
+                **self._index_scorer_kwargs(),
             )
 
         positions = var["positions"].copy_to_gpu(scheduled_tokens)

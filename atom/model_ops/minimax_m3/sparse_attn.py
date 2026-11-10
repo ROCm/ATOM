@@ -107,6 +107,13 @@ class MiniMaxM3SparseMetadata:
     """The block count `index_work_map` was built at (0 with no map); the scorer
     must be given the same one, so it travels with the map and is not derived again.
     """
+    index_score_out: torch.Tensor | None = None
+    """Persistent fp32 storage the MXFP4 decode scorer writes its block scores into,
+    viewed ``[heads, rows, index_work_map_max_block]`` contiguous (the aiter selector
+    reads only that layout). Never filled: every selector reads only the first
+    ``n_valid_column_per_row`` columns of a row, which the scorer writes each step.
+    None where there is no work map; the scorer then allocates (and fills) its own.
+    """
 
 
 def make_sparse_prefill_metadata(
@@ -165,8 +172,11 @@ def make_sparse_decode_metadata(
     n_valid_column_per_row_out: torch.Tensor | None = None,
     index_work_map_out: torch.Tensor | None = None,
     index_work_map_max_block: int = 0,
+    index_score_out: torch.Tensor | None = None,
 ) -> MiniMaxM3SparseMetadata:
-    """``index_work_map_out`` is the persistent storage of an MXFP4 index cache's
+    """``index_score_out`` is the scorer's score storage (flat, at least ``heads *
+    rows * index_work_map_max_block`` fp32), carried through to the selection.
+    ``index_work_map_out`` is the persistent storage of an MXFP4 index cache's
     scorer's work map (the builder allocates it only then): given, the step's map is
     built into it here, once, at ``index_work_map_max_block`` blocks (the model
     length's); an empty batch builds none.
@@ -212,6 +222,7 @@ def make_sparse_decode_metadata(
         index_work_map_max_block=(
             index_work_map_max_block if index_work_map is not None else 0
         ),
+        index_score_out=index_score_out if index_work_map is not None else None,
     )
 
 

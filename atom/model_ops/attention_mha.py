@@ -1658,6 +1658,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 kw["index_work_map_max_block"] = (
                     sparse_metadata.index_work_map_max_block
                 )
+                kw["index_score_out"] = sparse_metadata.index_score_out
         return kw
 
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)

@@ -31,6 +31,7 @@ def builder(mod, mxfp4=True, tbo_decode=True, forward_vars=None):
     b = object.__new__(mod.AiterAttentionMetadataBuilder)
     b._index_work_map_blocks = BOUND if mxfp4 else 0
     b._index_work_maps = {}
+    b._index_scores = {}
     b._num_idx_heads = HEADS
     b.max_bs = MAX_BS
     b.device = "cpu"
@@ -80,6 +81,7 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     max_qlen = 8  # a speculative config: the TBO sparse decode still runs one token
     if mxfp4:
         b._index_work_maps[""] = b._alloc_index_work_map(max_bs, max_qlen)
+        b._index_scores[""] = b._alloc_index_scores(max_bs * max_qlen)
         capacity_args.clear()
     # each ubatch's requests, from the split every backend's ubatch metadata follows
     import numpy as np
@@ -101,12 +103,17 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     if not (mxfp4 and tbo_decode):
         assert not [n for n in names if n in maps] and not capacity_args
         return
+    scores = b._index_scores
     for i in (0, 1):
         assert maps[names[i]].shape == (100, 2)
         assert maps[names[i]].dtype == torch.int32
+        # the scores of that ubatch's requests, one token each, at the map's width
+        assert scores[names[i]].shape == (HEADS * rows[i] * BOUND,)
+        assert scores[names[i]].dtype == torch.float32
     assert capacity_args == [(rows[0], BOUND, 1, HEADS), (rows[1], BOUND, 1, HEADS)]
     # each ubatch has its own map
     assert maps[names[1]].data_ptr() != maps[names[0]].data_ptr()
+    assert scores[names[1]].data_ptr() != scores[names[0]].data_ptr()
 
 
 def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
@@ -125,6 +132,7 @@ def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
     )
     b = builder(mod, forward_vars=var)
     b._index_work_maps = {"ub0_": object(), "ub1_": object()}
+    b._index_scores = {"ub0_": object(), "ub1_": object()}
     ub = types.SimpleNamespace(running_bs=rows)
     attn = types.SimpleNamespace(
         block_tables=torch.zeros(rows, 4),
@@ -137,9 +145,10 @@ def test_the_ubatch_metadata_is_built_with_its_own_buffers(mod, monkeypatch):
     for i, kw in enumerate(seen):
         assert kw["index_work_map_out"] is b._index_work_maps[f"ub{i}_"]
         assert kw["index_work_map_max_block"] == BOUND
+        assert kw["index_score_out"] is b._index_scores[f"ub{i}_"]
     assert seen[0]["index_work_map_out"] is not seen[1]["index_work_map_out"]
     # another index cache allocated none: nothing to pass
-    assert builder(mod)._index_work_map_kwargs("ub0_") == {}
+    assert builder(mod)._index_scorer_kwargs("ub0_") == {}
 
 
 @pytest.mark.parametrize("kv", ["fp4", "fp8"])
@@ -263,7 +272,7 @@ def test_the_row_rule_and_its_refusal_are_the_mxfp4_indexs(
     )
     b = builder(mod, mxfp4=mxfp4)
     if mxfp4:
-        b._index_work_maps[""] = object()
+        b._index_work_maps[""] = b._index_scores[""] = object()
     b.refresh_flydsl_plan = lambda *_a, **_k: None
     b._get_sparse_attention_block_tables = lambda bt, sl, bs: bt
     b._n_valid_column_per_row_buffer = lambda: None
@@ -294,7 +303,7 @@ def test_the_scorer_is_given_the_bound_its_map_was_built_at():
     impl = object.__new__(attention_mha.SparseMHAPagedAttentionImpl)
     impl.kv_cache_dtype, impl.index_cache_dtype = "bf16", "fp4"
     impl.max_model_len = 10**9  # not the bound
-    wmap = object()
+    wmap, scores = object(), object()
     md = MiniMaxM3SparseMetadata(
         seq_lens=None,
         max_seq_len=0,
@@ -302,9 +311,11 @@ def test_the_scorer_is_given_the_bound_its_map_was_built_at():
         num_prefills=0,
         index_work_map=wmap,
         index_work_map_max_block=37,
+        index_score_out=scores,
     )
     kw = impl._mxfp4_select_kwargs(md, decode=True)
     assert kw["index_work_map"] is wmap and kw["index_work_map_max_block"] == 37
+    assert kw["index_score_out"] is scores
     assert "index_work_map" not in impl._mxfp4_select_kwargs(md, decode=False)
 
 
@@ -351,3 +362,50 @@ def test_the_caller_can_own_the_output(monkeypatch, planned):
 
     with pytest.raises(ValueError, match="out must be"):
         m.sparse_pa_mxfp4(*args, out=torch.empty(q.shape, dtype=torch.float32))
+
+
+def test_the_scorer_writes_a_contiguous_view_of_the_persistent_scores(monkeypatch):
+    """`index_score_out` is flat storage: the scorer is handed a contiguous
+    [heads, rows, width] view of its head (the layout the aiter selector needs), the
+    selection reads that same tensor, and storage too small for the step is refused
+    rather than overrun."""
+    pytest.importorskip("aiter")
+    from aiter.ops import flydsl
+
+    from atom.model_ops.minimax_m3 import index_topk
+
+    heads, rows, width = 4, 8, 6
+    seen = {}
+
+    def scorer(*args, out=None, **kw):
+        seen["out"] = out
+        return out
+
+    monkeypatch.setattr(
+        flydsl, "minimax_m3_index_score_fp4_flydsl", scorer, raising=False
+    )
+    monkeypatch.setattr(
+        index_topk, "_launch_select", lambda score, *a, **kw: seen.update(sel=score)
+    )
+    monkeypatch.setattr(
+        "atom.model_ops.minimax_m3.mxfp4_pages.page_views", lambda c: (c, c)
+    )
+    idx_q = torch.zeros(rows, heads, 128)
+    table = torch.zeros(rows, width, dtype=torch.int32)
+    seq = torch.ones(rows, dtype=torch.int32)
+
+    def call(storage):
+        index_topk.minimax_m3_index_topk_decode(
+            idx_q, torch.zeros(1), table, seq, width * 128, 2, 1, 1, heads, 1.0,
+            max_query_len=1, index_mxfp4=True,
+            index_work_map=object(), index_work_map_max_block=width,
+            index_score_out=storage,
+        )  # fmt: skip
+
+    storage = torch.empty(heads * rows * width + 5)  # a buffer sized for more
+    call(storage)
+    out = seen["out"]
+    assert out.shape == (heads, rows, width) and out.is_contiguous()
+    assert out.data_ptr() == storage.data_ptr() and seen["sel"] is out
+    with pytest.raises(ValueError, match="index_score_out holds"):
+        call(torch.empty(heads * rows * width - 1))
