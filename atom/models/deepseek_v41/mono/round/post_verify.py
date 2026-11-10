@@ -1,39 +1,40 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """A served verify step's verdict and Engram cursor commit inside the target graph (the V4.1 mono hi hook,
-``ATOM_DSV41_MONO_HI``).
+``ATOM_DSV41_MONO_HI``): the forward's head output.
 
-Between the target graph and the draft graph a served step would run two eager launches: the verdict
-(``head_verdict``) and Engram's cursor commit (``TentativeState.commit``: ``_commit_cursors``). Both read only device
-state; the hook launches them as one kernel (``_post_verify_kernel``, a program a request, each request's rows at
-once) at the end of its forward (``HiLayers.end_step``), so a captured graph replays it:
+After the target graph a verify step runs, on ATOM's path, the verdict (the rejection sampler on the logits' rows)
+and Engram's cursor commit (``TentativeState.commit``: ``_commit_cursors``). On a served step both read only device
+state: the head's id a row (the hook's verify head, greedy or one draw a sampled row) and the tentative staging plane.
+The hook launches them as one kernel (``_post_verify_kernel``, a program a request, each request's rows at once) at the
+end of its forward (``HiLayers.end_step``), so a captured graph replays it:
 
-- the verdict on the head's ids (``head_verdict``'s arithmetic), the width's verify / bonus rows and draft counts
-  laid out as the served step lays them (B requests of ``rq`` rows: ``rq - 1`` drafts and a bonus row each), into
-  persistent outputs a width; under forced acceptance the uniforms are seeded from the hook's launch-tag step
-  (bumped by every forward: the same on every TP rank);
+- the verdict on the head's ids (ATOM's greedy / synthetic rejection kernels' arithmetic), the width's verify / bonus
+  rows and draft counts laid out as the served step lays them (B requests of ``rq`` rows: ``rq - 1`` drafts and a bonus
+  row each), into persistent outputs a width (the output ids [B, rq] and the verdict [3, B], as the rejection sampler
+  lays them out); under forced acceptance the uniforms are seeded from the hook's launch-tag step (bumped by every
+  forward: the same on every TP rank);
 - the commit: each live request's accepted prefix's candidate cursor (ATOM's tentative staging plane, written on
   the device on served steps) into its slot's Engram cursor (a padding request of a bs-B graph commits nothing: its
   slot entry is padding, which names some other slot).
 
-The host then takes the kernel's results on a step the head's verdict serves (``ModelRunner.postprocess`` asks
-``HiVerifyHead.verdict``) whose layout is the one the kernel assumed (every request ``rq - 1`` drafts): ``verdict``
-returns the persistent outputs without a launch, and the commit (``commit_speculative_state``) skips its launch on
-that step (``PostVerify.committed``, at the builder's hook). On any other step the eager path runs
-(``head_verdict``'s one-launch verdict, then ATOM's commit), after the graph: it rewrites the cursor, so the in-graph
-write it never asked for is overwritten. The ids that feed the next step are not staged here: the runner broadcasts
-the output ids over TP and gathers each request's next id from them, and the DSpark proposer stages its anchors from
-those, as on ATOM's logits path. The outputs are a width's fixed addresses, read after the step by the runner's
-side-stream copies (the sampled ids, the verdict counts) with no reverse wait, as ``send_draft_token_ids_to_cpu``
-reads the draft graph's: the replay that rewrites them is the next target forward's end, a draft pass and a whole
-forward later on the default stream.
+The outputs are the forward's head output (``HiDecodeModel.compute_head`` -> ``ModelRunner._head_output``, recorded
+with the forward). The runner takes them for its step's requests (the first of the width's) where they stand for it
+(``ModelRunner._head_ids_serve``: every request verifying the full span, the rows' picks all it reads), else ATOM's
+path runs on the logits. The commit (``commit_speculative_state``) then skips its launch exactly when the anchors it
+commits are these outputs' (``PostVerify.committed``): the runner took them, and the kernel committed them; on any
+other step ATOM's commit rewrites the cursor, so the in-graph write it never asked for is overwritten. The ids that
+feed the next step are not staged here: the runner broadcasts the output ids over TP and gathers each request's next
+id from them, and the DSpark proposer stages its anchors from those, as on ATOM's logits path. The outputs are a
+width's fixed addresses, read after the step by the runner's side-stream copies (the sampled ids, the verdict counts)
+with no reverse wait, as ``send_draft_token_ids_to_cpu`` reads the draft graph's: the replay that rewrites them is the
+next target forward's end, a draft pass and a whole forward later on the default stream.
 """
 
 from __future__ import annotations
 
 import logging
 
-import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -50,7 +51,7 @@ def _post_verify_kernel(
     slots_ptr, live_ptr, num_spec_steps, seed_base,
     WIDTH: tl.constexpr, BLOCK: tl.constexpr, SP: tl.constexpr, SYNTHETIC: tl.constexpr, SHADOW: tl.constexpr,
 ):  # fmt: skip
-    """Program b, request b: the verdict (``head_verdict``'s kernel's, its rows at once: the first rejected
+    """Program b, request b: the verdict (ATOM's rejection kernels' arithmetic, its rows at once: the first rejected
     position is a min over the rows) and the commit (request b's accepted prefix's candidate cursor,
     ``staging[b, anchor - start]``, into ``cursor[slot]`` when ``live_ptr[b]`` (the hook's request word: not a padding
     request); ``SHADOW``: into ``cursor[b]``, the check's rows). The uniforms' seed is ``seed_base`` + the hook's
@@ -111,7 +112,8 @@ def _post_verify_kernel(
 
 class PostVerify:
     """The hook's in-graph post-verify (module docstring): a width's persistent outputs and constant row layout, its
-    launch from the hook's forward, and the host's side of a step."""
+    launch from the hook's forward, its outputs as the forward's head output and the commit's skip.
+    """
 
     def __init__(self, widths, split, device):
         from atom.model_ops.rejection_sampler import _SYNTHETIC_RNG_BASE_SEED
@@ -131,7 +133,6 @@ class PostVerify:
                                        device=device),
                 "bonus": torch.tensor([b * rq + s for b in range(nb)], dtype=torch.long, device=device),
             }  # fmt: skip
-        self.used = None  # the width whose in-graph results this step took (``take``), for the skip wrappers
 
     def launch(self, hook, cache, step, rows: int) -> None:
         """At the end of a served forward (``HiLayers.end_step``; a capture records it): the kernel on this
@@ -166,61 +167,27 @@ class PostVerify:
             SYNTHETIC=rates is not None, SHADOW=False, num_warps=1,
         )  # fmt: skip
 
-    def serves(self, spec, head_ids) -> int | None:
-        """The width whose in-graph results stand for this step (the forward the hook served ran the kernel at it,
-        and the step's verify is laid out as the kernel assumed: every request ``rq - 1`` drafts), else None.
-        """
-        rows = head_ids.shape[0]
-        if rows not in self.launched:
-            return None
-        nb, rq = self.split[rows]
-        drafts = np.asarray(spec.num_draft_tokens_np)
-        if (
-            drafts.shape != (nb,)
-            or (drafts != rq - 1).any()
-            or spec.num_spec_steps != rq - 1
-        ):
-            return None
-        return rows
-
-    def take(self, rows: int, sampler):
-        """The in-graph results as this step's (output ids, verdict); the commit skips its launch on this step."""
+    def output(self, rows: int):
+        """Width ``rows``' outputs, the forward's head output (``HiLayers.head_output``): (output ids [B, rq], verdict
+        [3, B])."""
         b = self.bufs[rows]
-        self.used = rows
-        if sampler.synthetic_acceptance_rates is not None:
-            sampler._synthetic_step += 1  # as ``RejectionSampler.forward``
         return b["out"], b["verdict"]
 
-    def committed(self, metadata) -> bool:
-        """The builder's commit (``HiRound.committed``): a step that took the in-graph results committed in the graph
-        (``_post_verify_kernel``); here only the bookkeeping ``cache.commit_tentative`` does. -> committed. Takes the
-        step's results (``used``) either way.
+    def committed(self, metadata, anchors) -> bool:
+        """The builder's commit (``HiRound.committed``) at ``anchors``: a step whose anchors are a width's in-graph
+        verdict's (the runner took the forward's head output) committed in the graph (``_post_verify_kernel``); here
+        only the bookkeeping ``cache.commit_tentative`` does. -> committed.
         """
-        used, self.used = self.used, None
         cache = metadata.cache
         pending = getattr(cache, "pending", None)
-        if used is None or pending is None or not pending.staged_on_device:
+        if anchors is None or pending is None or not pending.staged_on_device:
+            return False
+        ptr = anchors.data_ptr()
+        if not any(
+            ptr == self.bufs[rows]["verdict"][2].data_ptr() for rows in self.launched
+        ):
             return False
         if pending.step is not metadata.step:
             raise RuntimeError("Tentative state was not prepared for this step")
         cache.pending = None
         return True
-
-
-def verdict(hook, spec, head_ids, sampler):
-    """``ModelRunner.postprocess``'s verdict (``HiVerifyHead.verdict``): (output ids, verdict), the in-graph results
-    on a step laid out as the kernel assumed; on any other step the one-launch verdict (``head_verdict``). Reported to
-    the device round as ATOM's verdict is (``HiRound.note_verdict``)."""
-    pv = hook.pv
-    pv.used = None
-    rows = pv.serves(spec, head_ids)
-    if rows is not None:
-        out = pv.take(rows, sampler)
-    else:
-        from atom.models.deepseek_v41.mono.round import head_verdict
-
-        out = head_verdict.verdict(spec, head_ids, sampler)
-    rnd = getattr(hook, "round", None)
-    if rnd is not None:
-        rnd.note_verdict(out)
-    return out

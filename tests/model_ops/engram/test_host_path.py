@@ -1406,7 +1406,7 @@ def test_the_hip_runtime_is_the_one_torch_loaded(monkeypatch):
     none (copying would silently stop), and another one is a second runtime."""
     import io
 
-    from atom.utils import hip_runtime as hr
+    from atom.model_ops.engram import host_memory as hm
 
     loaded = "/venv/lib/python3/site-packages/torch/lib/libamdhip64.so.7"
     maps = (
@@ -1414,14 +1414,14 @@ def test_the_hip_runtime_is_the_one_torch_loaded(monkeypatch):
         f"7f0000002000-7f0000003000 r-xp 00000000 08:01 2 {loaded}\n"
     )
     opened = []
-    monkeypatch.setattr(hr.torch.version, "hip", "7.0", raising=False)
-    monkeypatch.setattr(hr, "open", lambda path, *a: io.StringIO(maps), raising=False)
-    monkeypatch.setattr(hr.ctypes, "CDLL", lambda path, *a, **k: opened.append(path))
-    hr.hip_runtime.cache_clear()
+    monkeypatch.setattr(hm.torch.version, "hip", "7.0", raising=False)
+    monkeypatch.setattr(hm, "open", lambda path, *a: io.StringIO(maps), raising=False)
+    monkeypatch.setattr(hm.ctypes, "CDLL", lambda path, *a, **k: opened.append(path))
+    hm._hip_runtime.cache_clear()
     try:
-        hr.hip_runtime()
+        hm._hip_runtime()
     finally:
-        hr.hip_runtime.cache_clear()
+        hm._hip_runtime.cache_clear()
     assert opened == [loaded]
 
 
@@ -1434,6 +1434,29 @@ def test_without_a_hip_runtime_there_is_no_allocator(monkeypatch):
         assert hm._hip_runtime() is None
     finally:
         hm._hip_runtime.cache_clear()
+
+
+def test_a_device_address_of_page_locked_memory(monkeypatch):
+    """`device_address` asks the runtime that page-locks (`_hip_runtime`): a byte of a range at its offset from the
+    range's device base. Without one it raises, or (`identity_without_hip`: the PLE table's copies,
+    ``qwen38.mono.ple``) gives the host address back; a refused range raises."""
+    from atom.model_ops.engram import host_memory as hm
+
+    monkeypatch.setattr(hm, "_host_get_device_pointer", lambda: None)
+    with pytest.raises(RuntimeError, match="no HIP runtime"):
+        hm.device_address(0x1000)
+    assert hm.device_address(0x1040, identity_without_hip=True) == 0x1040
+
+    # hipHostGetDevicePointer: the range at base is mapped at 0x9000
+    def get(out, base, flags):
+        out._obj.value = 0x9000 if base == 0x1000 else 0
+        return 0
+
+    monkeypatch.setattr(hm, "_host_get_device_pointer", lambda: get)
+    assert hm.device_address(0x1040, 0x1000) == 0x9040
+    assert hm.device_address(0x1000, identity_without_hip=True) == 0x9000
+    with pytest.raises(RuntimeError, match="hipHostGetDevicePointer"):
+        hm.device_address(0x2000)
 
 
 def _shared_file_table(tmp_path, rows=512, width=64):

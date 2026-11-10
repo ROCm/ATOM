@@ -1,24 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""ModelRunner's model hooks (``model_engine.model_hooks``) and DeepSeek-V4.1's hi verify head behind them.
+"""ModelRunner's two generic switches DeepSeek-V4.1's hi path uses, and the hi verify head's sampling rows.
 
-The runner's hooks are declared (``VerifyHead``, ``DecodeRound``) and resolved once at install: a model without them
-takes the logits path and runs no decode round; with them the runner asks the head for a verify's ids and its
-verdict (the ids broadcast over TP, the next step's ids taken from the broadcast ones), and calls the decode round
-where its work sits. Which steps the hi head serves is its own policy (``round.verify_head.HiVerifyHead``), tested
-here against a stub hook: pure Python, no Triton, AITER or FlyDSL."""
+- The in-graph head output (``ModelRunner._head_output``): a model's ``compute_head`` gives its forward's logits, or a
+  verify's output ids and verdict (recorded with a captured forward, as the logits are at TP 1); a model without one
+  gives its logits. The runner takes the ids and verdict only where they stand for the step
+  (``_head_ids_serve``), broadcasts the ids over TP and takes the next step's ids from the broadcast ones.
+- The deferrable status wait: an attention builder that advances the step from the device-resident verdict
+  (``consumes_device_verdict``) has the runner build it from zero counts and take the status after the target's launch.
+
+Pure Python against stand-ins: no Triton, AITER or FlyDSL."""
 
 import ast
 import inspect
 import textwrap
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pytest
 import torch
 from aiter_stub import atom_without_aiter
-
-from atom.models.deepseek_v41.mono.round import verify_head as vh
 
 
 @pytest.fixture(scope="module")
@@ -27,12 +29,24 @@ def runner_module():
         yield load("atom.model_engine.model_runner")
 
 
+class _Model:
+    """A model as the runner's head sees it: its logits, and (``head``) its own head output."""
+
+    def __init__(self, head=None):
+        self.head, self.logits_calls = head, 0
+        if head is not None:
+            self.compute_head = lambda hidden_states: self.head
+
+    def compute_logits(self, hidden_states):
+        self.logits_calls += 1
+        return hidden_states + 1
+
+
 def _runner(runner_module, model):
-    """A runner with ``model`` installed: its hooks resolved as ``ModelRunner.__init__`` resolves them."""
+    """A runner with ``model`` installed, its head output resolved as ``ModelRunner.__init__`` resolves it."""
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.model = model
-    runner.verify_head, runner.decode_round = runner_module.model_hooks.resolve(model)
-    runner.verify_token_ids = None
+    runner.compute_head = getattr(model, "compute_head", None)
     runner.rejection_sampler = SimpleNamespace(synthetic_acceptance_rates=None)
     return runner
 
@@ -40,6 +54,7 @@ def _runner(runner_module, model):
 def _batch(temps=(0.0,), **over):
     n = len(temps)
     b = dict(
+        total_seqs_num=n,
         temperatures=np.asarray(temps, dtype=np.float32),
         top_ks=np.full(n, -1, dtype=np.int32),
         top_ps=np.ones(n, dtype=np.float32),
@@ -53,64 +68,183 @@ def _batch(temps=(0.0,), **over):
     return SimpleNamespace(**b)
 
 
-# ---- the runner's declared hooks
-
-
-def _stub_head(runner_module, ids=None):
-    class StubHead(runner_module.model_hooks.VerifyHead):
-        """A verify head as the runner sees one."""
-
-        def __init__(self):
-            self.ids_out, self.calls = ids, []
-
-        def before_forward(self, runner, batch):
-            self.calls.append(("before", batch))
-
-        def ids(self, runner, batch, hidden_states, graph_key=None):
-            self.calls.append(("ids", graph_key))
-            return self.ids_out
-
-    return StubHead()
-
-
-def test_a_model_without_the_hooks_takes_the_logits_path(runner_module):
-    runner = _runner(runner_module, SimpleNamespace())
-    assert runner.verify_head is None and runner.decode_round is None
-    assert runner._verify_head_ids(_batch(), torch.zeros(6, 4)) is None
-
-
-def test_hooks_are_declared_types(runner_module):
-    """``resolve``: a model attribute of that name that is not the declared hook type is an error, not a hook."""
-    with pytest.raises(TypeError, match="verify_head"):
-        runner_module.model_hooks.resolve(SimpleNamespace(verify_head=object()))
-    rnd = runner_module.model_hooks.DecodeRound()
-    assert runner_module.model_hooks.resolve(SimpleNamespace(decode_round=rnd)) == (
-        None,
-        rnd,
+def _head(requests=1, rows=6):
+    """A verify's head output: output ids [requests, rows], verdict [3, requests]."""
+    return (
+        torch.zeros(requests, rows, dtype=torch.int32),
+        torch.zeros(3, requests, dtype=torch.int32),
     )
-    # every member defaults to "nothing taken over"
-    assert rnd.spec_status() is None and rnd.decode_ids_filler() is None
-    assert rnd.host_arena_reader("token_inputs") is None
-    assert not rnd.committed(None)
 
 
-def test_the_runner_asks_the_models_head(runner_module):
-    ids = torch.arange(6, dtype=torch.int32)
-    head = _stub_head(runner_module, ids)
-    runner = _runner(runner_module, SimpleNamespace(verify_head=head))
-    assert runner.verify_head is head
-    assert runner._verify_head_ids(_batch(), torch.zeros(6, 4)) is ids
-    assert runner._verify_head_ids(_batch(), torch.zeros(6, 4), (1, 6)) is ids
-    assert head.calls == [("ids", None), ("ids", (1, 6))]
+@pytest.fixture
+def spec_step(monkeypatch, runner_module):
+    """A speculative verify step of one request (5 drafts), exact acceptance, no context parallelism."""
+    spec = SimpleNamespace(num_spec_steps=5, num_draft_tokens_np=np.full(1, 5))
+    monkeypatch.setattr(
+        runner_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(spec_decode_metadata=spec),
+    )
+    monkeypatch.setattr(runner_module, "RELAXED_TOP_N", 1)
+    monkeypatch.setattr(runner_module, "get_pcp_world_size", lambda: 1)
+    return spec
 
 
+# ---- the head output
+
+
+def test_a_model_without_its_own_head_output_gives_its_logits(runner_module):
+    model = _Model()
+    runner = _runner(runner_module, model)
+    assert runner.compute_head is None
+    hidden = torch.zeros(6, 4)
+    assert torch.equal(runner._head_output(hidden), hidden + 1)
+    # a capture at TP > 1 records no head output for it
+    assert runner._head_output(hidden, logits=False) is None
+    assert model.logits_calls == 1
+
+
+def test_the_models_head_output_is_recorded_as_the_logits_are(runner_module):
+    """``compute_head`` gives the head output (logits or a verify's ids and verdict) at any TP; None leaves it to the
+    logits (recorded only where they are: ``logits_in_graph``)."""
+    head = _head()
+    model = _Model(head)
+    runner = _runner(runner_module, model)
+    assert runner._head_output(torch.zeros(6, 4), logits=False) is head
+    model.head = None
+    assert runner._head_output(torch.zeros(6, 4), logits=False) is None
+    assert torch.equal(runner._head_output(torch.zeros(6, 4)), torch.ones(6, 4))
+
+
+@pytest.mark.parametrize("phase", ["warmup", "record"])
+def test_the_recorded_forward_ends_in_the_head_output(runner_module, phase):
+    """``capture_cudagraph``'s recorded forward returns ``_head_output`` (its warmup runs it too): the head is part
+    of the recorded forward, as the logits are at TP 1."""
+    src = textwrap.dedent(
+        inspect.getsource(runner_module.ModelRunner.capture_cudagraph)
+    )
+    if phase == "warmup":
+        assert "self._head_output(outputs[:running_tokens], logits_in_graph)" in src
+    else:
+        tree = ast.parse(src)
+        (full,) = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "full_forward"
+        ]
+        assert "return self._head_output(outputs[:n], logits_in_graph)" in (
+            ast.unparse(full)
+        )
+    assert "compute_logits" not in src
+
+
+def test_a_step_takes_the_logits_where_the_ids_do_not_stand(runner_module, spec_step):
+    model = _Model(_head())
+    runner = _runner(runner_module, model)
+    hidden = torch.zeros(6, 4)
+    head = model.head
+    assert runner._step_head(head, hidden, _batch()) is head
+    logits = runner._step_head(head, hidden, _batch(any_logprobs=True))
+    assert torch.equal(logits, hidden + 1)
+    # a replay with no recorded head output, and a recorded tensor (the logits) as they are
+    assert torch.equal(runner._step_head(None, hidden, _batch()), hidden + 1)
+    recorded = torch.ones(6, 4)
+    assert runner._step_head(recorded, hidden, _batch()) is recorded
+
+
+def test_greedy_verify_takes_the_head_ids(runner_module, spec_step):
+    runner = _runner(runner_module, _Model())
+    assert runner._head_ids_serve(_head(), _batch())
+    for over in (
+        dict(any_logprobs=True),
+        dict(structured_requests={0: object()}),
+        dict(required_channel=object()),
+    ):
+        assert not runner._head_ids_serve(_head(), _batch(**over))
+    assert not runner._head_ids_serve(_head(), None)
+    runner.rejection_sampler = None
+    assert not runner._head_ids_serve(_head(), _batch())
+
+
+@pytest.mark.parametrize("why", ["not_a_verify", "relaxed", "pcp"])
+def test_the_logits_path(runner_module, spec_step, monkeypatch, why):
+    if why == "not_a_verify":
+        monkeypatch.setattr(
+            runner_module,
+            "get_forward_context",
+            lambda: SimpleNamespace(spec_decode_metadata=None),
+        )
+    elif why == "relaxed":
+        monkeypatch.setattr(runner_module, "RELAXED_TOP_N", 10)
+    else:
+        monkeypatch.setattr(runner_module, "get_pcp_world_size", lambda: 2)
+    assert not _runner(runner_module, _Model())._head_ids_serve(_head(), _batch())
+
+
+def test_the_verdict_stands_for_its_layout_only(runner_module, spec_step):
+    """The verdict is laid out for the forward's requests each verifying the full span: a step with a shorter span,
+    or whose span the output ids do not hold, reads the logits; a padded bucket's first requests are the step's.
+    """
+    runner = _runner(runner_module, _Model())
+    spec_step.num_draft_tokens_np = np.asarray([5, 3])
+    two = _batch((0.0, 0.0))
+    assert not runner._head_ids_serve(_head(2), two)
+    spec_step.num_draft_tokens_np = np.asarray([5, 5])
+    assert runner._head_ids_serve(_head(2), two)
+    assert not runner._head_ids_serve(_head(2, rows=4), two)
+    # fewer requests than the step's: no
+    assert not runner._head_ids_serve(_head(1), two)
+    # a bs-4 bucket replayed for 2 requests: the first 2 stand
+    assert runner._head_ids_serve(_head(4), two)
+
+
+def test_sampled_verify(runner_module, spec_step):
+    """Every request sampled from temperature and top-p alone (ATOM's sample-and-match verify): the head's draws."""
+    runner = _runner(runner_module, _Model())
+    spec_step.num_draft_tokens_np = np.asarray([5, 5])
+    batch = _batch((0.7, 0.5), top_ps=np.asarray([0.9, 0.8], dtype=np.float32))
+    assert runner._head_ids_serve(_head(2), batch)
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(top_ks=np.full(1, 20, dtype=np.int32)),
+        dict(needs_independent_noise=np.ones(1, dtype=bool)),
+        dict(temperatures=np.asarray([1e-12], dtype=np.float32)),
+    ],
+)
+def test_a_sampled_step_the_head_does_not_draw(runner_module, spec_step, over):
+    runner = _runner(runner_module, _Model())
+    assert not runner._head_ids_serve(_head(), _batch((0.7,), **over))
+
+
+def test_a_mixed_step_is_not_served(runner_module, spec_step):
+    """Some requests greedy, some sampled: ATOM's sampler on the logits."""
+    runner = _runner(runner_module, _Model())
+    spec_step.num_draft_tokens_np = np.asarray([5, 5])
+    assert not runner._head_ids_serve(_head(2), _batch((0.0, 0.7)))
+
+
+def test_forced_acceptance_serves_as_without_it(runner_module, spec_step):
+    """Under ``--spec-decode-acceptance-length`` the head's ids serve greedy and sampled steps alike (the synthetic
+    schedule decides only acceptance)."""
+    runner = _runner(runner_module, _Model())
+    runner.rejection_sampler = SimpleNamespace(
+        synthetic_acceptance_rates=(1.0, 0.5, 0.0)
+    )
+    assert runner._head_ids_serve(_head(), _batch())
+    assert runner._head_ids_serve(_head(), _batch((1.0,)))
+
+
+@pytest.mark.parametrize("bs, nb", [(2, 2), (2, 4)])
 def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
-    monkeypatch, runner_module
+    monkeypatch, runner_module, bs, nb
 ):
-    """A head-served step: the head's verdict in place of the rejection sampler's; the ids are broadcast over TP and
-    every id that feeds the next step (the next forward's ids, the drafter's anchors) is taken from the broadcast
-    ids, at the head verdict's accepted counts, as on every other step."""
-    bs = 2
+    """A step the head output stands for: its output ids and verdict (the step's requests: the first of a padded
+    bucket's) in place of the samplers'; the ids are broadcast over TP and every id that feeds the next step (the
+    next forward's ids, the drafter's anchors) is taken from the broadcast ids, at the verdict's accepted counts, as
+    on every other step."""
     spec = SimpleNamespace(
         bonus_logits_indices=torch.tensor([5, 11]),
         target_logits_indices=torch.arange(10),
@@ -133,30 +267,29 @@ def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
     monkeypatch.setattr(runner_module, "get_pcp_world_size", lambda: 1)
     monkeypatch.setattr(runner_module, "pcp_is_enabled", lambda: False)
     monkeypatch.setattr(runner_module, "sp_is_enabled", lambda: False)
-    out = torch.zeros(bs, 6, dtype=torch.int32)  # this rank's own picks
-    verdict = torch.tensor([[3, 5], [2, 0], [3, 11]], dtype=torch.int32)
-    calls, proposed = [], []
+    out = torch.zeros(nb, 6, dtype=torch.int32)  # this rank's own picks
+    verdict = torch.zeros(3, nb, dtype=torch.int32)
+    verdict[:, :bs] = torch.tensor([[3, 5], [2, 0], [3, 11]], dtype=torch.int32)
+    sent, proposed = [], []
 
     class Stop(Exception):
         pass
 
-    head = _stub_head(runner_module)
-    head.verdict = lambda s, ids, sampler: calls.append(ids) or (out, verdict)
-
     def propose(batch, input_ids, hidden, next_token_ids, num_reject, anchors):
         proposed.append(next_token_ids)
-        assert torch.equal(anchors, verdict[2])
+        # the verdict's own anchor row (``commit_speculative_state`` sees the head output's buffer)
+        assert anchors.data_ptr() == verdict[2].data_ptr()
+        assert anchors.tolist() == [3, 11]
         raise Stop
 
-    runner = _runner(runner_module, SimpleNamespace(verify_head=head))
-    runner.verify_token_ids = torch.arange(12, dtype=torch.int32)
+    runner = _runner(runner_module, _Model())
     runner.tokenID_processor = SimpleNamespace(
         is_deferred_out=True,
         prev_batch=None,
         prev_rejected_num=None,
         prev_bonus_num=None,
         prepare_sampled_ids=lambda *a, **kw: ({7: (3,), 8: (5,), -1: 1}, None),
-        spec_status_queue=SimpleNamespace(send=lambda *a, **kw: None),
+        spec_status_queue=SimpleNamespace(send=lambda t, **kw: sent.append(t)),
         input_ids=SimpleNamespace(gpu=torch.zeros(16, dtype=torch.int32)),
     )
     runner.forward_done_event = SimpleNamespace(record=lambda: None)
@@ -175,215 +308,111 @@ def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
         runner_module.ModelRunner.postprocess(
             runner,
             batch,
-            None,
+            (out, verdict),
             None,
             None,
             None,
             True,
             hidden_states=torch.zeros(12, 4),
         )
-    assert len(calls) == 1 and len(broadcasts) == 1 and broadcasts[0] is out
+    assert len(broadcasts) == 1 and broadcasts[0].shape == (bs, 6)
+    assert broadcasts[0].data_ptr() == out.data_ptr()
+    assert sent[0].tolist() == [[3, 5], [2, 0]]
     # rank 0's ids at each request's accepted count (3 and 5), not this rank's picks
     assert proposed[0].tolist() == [103, 111]
     assert runner.tokenID_processor.prev_token_ids is proposed[0]
 
 
-def test_the_staging_mark_calls_the_decode_round(runner_module):
-    calls = []
+# ---- the deferrable status wait
 
-    class Round(runner_module.model_hooks.DecodeRound):
-        def before_staging_mark(self):
-            calls.append("mark")
 
-    for model, want in (
-        (SimpleNamespace(decode_round=Round()), ["mark", "finish"]),
-        (SimpleNamespace(), ["finish"]),
-    ):
-        calls.clear()
-        runner = _runner(runner_module, model)
-        runner.h2d_owner = SimpleNamespace(finish=lambda: calls.append("finish"))
-        runner._mark_staging_h2d_enqueued()
-        assert calls == want
+def test_no_builder_consumes_the_device_verdict_by_default():
+    with atom_without_aiter() as load:
+        backends = load("atom.model_ops.attentions.backends")
+    builder = backends.AttentionMetadataBuilder
+    assert not builder.consumes_device_verdict(None, None, 6)
+
+
+def _processor(runner_module):
+    """A token processor as ``prepare_input_ids`` sees it, a prefill batch's (``_stage_input_ids`` stubbed)."""
+    processor = object.__new__(runner_module.tokenIDProcessor)
+    processor.runner = SimpleNamespace(h2d_groups=None)  # (no publication registry)
+    processor.batch_info = SimpleNamespace(np=np.zeros(3, dtype=np.int32))
+    processor.draft_tokens_per_seq = 0
+    processor._stage_input_ids = lambda batch, q, group: ("ids", None)
+    processor.recv_spec_status = mock.Mock(
+        return_value=(np.array([2, 1], np.int32), np.array([1, 0], np.int32))
+    )
+    processor.prev_batch = SimpleNamespace(total_seqs_num=2)
+    processor.spec_status_owed = False
+    return processor
+
+
+def _output_batch():
+    return SimpleNamespace(
+        total_seqs_num=2, total_tokens_num=12, produces_output=lambda: True
+    )
+
+
+def test_a_step_that_consumes_the_device_verdict_waits_after_the_launch(runner_module):
+    """Built from zero counts (one a request of the forward the status is for), the wait owed; taken once, after."""
+    processor = _processor(runner_module)
+    cls = runner_module.tokenIDProcessor
+    cls.prepare_input_ids(processor, _output_batch(), 6, None, defer_spec_status=True)
+    processor.recv_spec_status.assert_not_called()
+    assert processor.prev_rejected_num.tolist() == [0, 0] and processor.spec_status_owed
+    assert processor.prev_bonus_num.tolist() == [0, 0]
+    assert processor.prev_bonus_num is not processor.prev_rejected_num
+    cls.take_deferred_spec_status(processor)
+    processor.recv_spec_status.assert_called_once()
+    assert (
+        processor.prev_rejected_num.tolist() == [2, 1]
+        and not processor.spec_status_owed
+    )
+    cls.take_deferred_spec_status(processor)
+    processor.recv_spec_status.assert_called_once()
+
+
+def test_any_other_step_waits_where_it_did(runner_module):
+    processor = _processor(runner_module)
+    runner_module.tokenIDProcessor.prepare_input_ids(
+        processor, _output_batch(), 6, None
+    )
+    processor.recv_spec_status.assert_called_once()
+    assert processor.prev_rejected_num.tolist() == [2, 1]
+    assert not processor.spec_status_owed
+
+
+def test_the_builder_decides_the_deferral_before_the_input_ids(runner_module):
+    """``prepare_model`` asks the attention builder once a step and hands its answer to ``prepare_input_ids``."""
+    src = textwrap.dedent(inspect.getsource(runner_module.ModelRunner.prepare_model))
+    ask = src.index("self.attn_metadata_builder.consumes_device_verdict(")
+    assert ask < src.index("self.tokenID_processor.prepare_input_ids(")
+    assert "defer_spec_status=self.spec_status_deferred" in src
 
 
 @pytest.mark.parametrize("cls", ["ModelRunner", "RapidServeModelRunner"])
-def test_after_forward_follows_every_target_launch(runner_module, cls):
-    """Each ``forward`` that runs a decode step calls the decode round's ``after_forward`` right after
-    ``run_model`` (the target's launch), at that one call site."""
+def test_the_deferred_wait_follows_every_target_launch(runner_module, cls):
+    """Each ``forward`` that runs a step takes the deferred status right after ``run_model`` (the target's launch),
+    at that one call site."""
     tree = ast.parse(
         textwrap.dedent(inspect.getsource(getattr(runner_module, cls).forward))
     )
-    stmts = [
-        b
-        for node in ast.walk(tree)
-        for field in ("body", "orelse")
-        for b in [getattr(node, field, None)]
-        if isinstance(b, list)
-    ]
     found = 0
-    for body in stmts:
-        for i, s in enumerate(body):
-            if not isinstance(s, (ast.Assign, ast.Expr)):
+    for node in ast.walk(tree):
+        for field in ("body", "orelse"):
+            body = getattr(node, field, None)
+            if not isinstance(body, list):
                 continue
-            if "self.run_model(" in ast.unparse(s):
-                assert "self.decode_round.after_forward" in ast.unparse(body[i + 1])
-                found += 1
+            for i, s in enumerate(body):
+                if isinstance(s, (ast.Assign, ast.Expr)) and "self.run_model(" in (
+                    ast.unparse(s)
+                ):
+                    nxt = ast.unparse(body[i + 1])
+                    assert nxt.startswith("if self.spec_status_deferred:")
+                    assert "self.tokenID_processor.take_deferred_spec_status()" in nxt
+                    found += 1
     assert found == 1
-
-
-# ---- the hi verify head's policy (``HiVerifyHead``)
-
-
-class _Hook:
-    """The hi hook's surface ``HiVerifyHead`` uses."""
-
-    def __init__(self, ids=None):
-        self.ids, self.sampling = ids, []
-
-    def set_head_sampling(self, temps=None, top_ps=None, rows=None):
-        self.sampling.append(
-            None
-            if temps is None
-            else (temps.tolist(), top_ps.tolist(), [int(n) for n in rows])
-        )
-        return True
-
-    def head_out(self):
-        return self.ids
-
-
-@pytest.fixture
-def spec_step(monkeypatch):
-    """A speculative verify step (``vh._spec``), exact acceptance, no context parallelism."""
-    spec = SimpleNamespace(num_spec_steps=5)
-    monkeypatch.setattr(vh, "_spec", lambda: spec)
-    monkeypatch.setattr(vh, "_limits", lambda: (1, 1e-10))
-    monkeypatch.setattr(vh, "_pcp_world_size", lambda: 1)
-    return spec
-
-
-_RUNNER = SimpleNamespace(rejection_sampler=object())
-
-
-def test_greedy_verify_takes_the_head_ids(spec_step):
-    ids = torch.arange(8, dtype=torch.int32)
-    hook = _Hook(ids)
-    head = vh.HiVerifyHead(hook)
-    batch = _batch()
-    head.before_forward(_RUNNER, batch)
-    assert not head.sampled and hook.sampling == []  # greedy: nothing staged
-    assert torch.equal(head.ids(_RUNNER, batch, torch.zeros(6, 4)), ids[:6])
-    for over in (
-        dict(any_logprobs=True),
-        dict(structured_requests={0: object()}),
-        dict(required_channel=object()),
-    ):
-        assert head.ids(_RUNNER, _batch(**over), torch.zeros(6, 4)) is None
-    assert (
-        head.ids(SimpleNamespace(rejection_sampler=None), batch, torch.zeros(6, 4))
-        is None
-    )
-    assert head.ids(_RUNNER, None, torch.zeros(6, 4)) is None
-    # fewer ids than rows: the logits path
-    assert head.ids(_RUNNER, batch, torch.zeros(9, 4)) is None
-
-
-@pytest.mark.parametrize("why", ["not_a_verify", "relaxed", "pcp"])
-def test_the_logits_path(spec_step, monkeypatch, why):
-    head = vh.HiVerifyHead(_Hook(torch.arange(8, dtype=torch.int32)))
-    if why == "not_a_verify":
-        monkeypatch.setattr(vh, "_spec", lambda: None)
-    elif why == "relaxed":
-        monkeypatch.setattr(vh, "_limits", lambda: (10, 1e-10))
-    else:
-        monkeypatch.setattr(vh, "_pcp_world_size", lambda: 2)
-    assert head.ids(_RUNNER, _batch(), torch.zeros(6, 4)) is None
-
-
-def test_a_replay_reads_the_captured_buffer(spec_step):
-    ids = torch.arange(12, dtype=torch.int32)
-    hook = _Hook(ids)
-    head = vh.HiVerifyHead(hook)
-    head.captured((1, 6))
-    hook.ids = None
-    head.captured((2, 6))  # the head did not run in that graph
-    assert torch.equal(head.ids(_RUNNER, _batch(), torch.zeros(6, 4), (1, 6)), ids[:6])
-    assert head.ids(_RUNNER, _batch(), torch.zeros(6, 4), (2, 6)) is None
-    assert head.ids(_RUNNER, _batch(), torch.zeros(6, 4), (4, 6)) is None
-
-
-def test_sampled_verify(spec_step):
-    hook = _Hook(torch.zeros(12, dtype=torch.int32))
-    head = vh.HiVerifyHead(hook)
-    batch = _batch(
-        (0.7, 0.5),
-        top_ps=np.asarray([0.9, 0.8], dtype=np.float32),
-        num_scheduled_tokens=np.asarray([6, 6], dtype=np.int32),
-    )
-    head.before_forward(_RUNNER, batch)
-    assert head.sampled and head.rows_sampling
-    (temps, top_ps, rows), *_ = hook.sampling
-    assert temps == pytest.approx([0.7, 0.5]) and top_ps == pytest.approx([0.9, 0.8])
-    assert rows == [6, 6]
-    assert head.ids(_RUNNER, batch, torch.zeros(12, 4)) is not None
-    # top-k: not the head's draw (ATOM's sampler), and the head's rows go back to greedy
-    topk = _batch((0.7,), top_ks=np.full(1, 20, dtype=np.int32))
-    head.before_forward(_RUNNER, topk)
-    assert not head.sampled and not head.rows_sampling and hook.sampling[-1] is None
-    assert head.ids(_RUNNER, topk, torch.zeros(6, 4)) is None
-    # a greedy step after it: rows greedy already, nothing staged
-    head.before_forward(_RUNNER, _batch())
-    assert len(hook.sampling) == 2
-
-
-@pytest.mark.parametrize(
-    "over",
-    [
-        dict(any_logprobs=True),
-        dict(needs_independent_noise=np.ones(1, dtype=bool)),
-        dict(temperatures=np.asarray([1e-12], dtype=np.float32)),
-    ],
-)
-def test_a_sampled_step_the_head_does_not_draw(spec_step, over):
-    hook = _Hook(torch.zeros(6, dtype=torch.int32))
-    head = vh.HiVerifyHead(hook)
-    head.before_forward(_RUNNER, _batch((0.7,), **over))
-    assert not head.sampled and hook.sampling == []
-
-
-def test_a_mixed_step_is_not_served(spec_step):
-    """Some requests greedy, some sampled: ATOM's sampler (the head draws only all-sampled steps)."""
-    head = vh.HiVerifyHead(_Hook(torch.zeros(12, dtype=torch.int32)))
-    batch = _batch((0.0, 0.7), num_scheduled_tokens=np.asarray([6, 6], dtype=np.int32))
-    head.before_forward(_RUNNER, batch)
-    assert not head.sampled
-    assert head.ids(_RUNNER, batch, torch.zeros(12, 4)) is None
-
-
-def test_forced_acceptance_serves_as_without_it(spec_step):
-    """Under ``--spec-decode-acceptance-length`` the head serves greedy steps and the sampled steps it drew (the
-    synthetic schedule decides only acceptance)."""
-    runner = SimpleNamespace(
-        rejection_sampler=SimpleNamespace(synthetic_acceptance_rates=(1.0, 0.5, 0.0))
-    )
-    head = vh.HiVerifyHead(_Hook(torch.zeros(6, dtype=torch.int32)))
-    assert head.ids(runner, _batch(), torch.zeros(6, 4)) is not None
-    sampled = _batch((1.0,))
-    head.before_forward(runner, sampled)
-    assert head.sampled
-    assert head.ids(runner, sampled, torch.zeros(6, 4)) is not None
-
-
-def test_a_capture_stages_nothing(spec_step):
-    """A graph capture's dummy step: ``set_head_sampling`` stages nothing (False), so the head's ids are not served
-    as samples."""
-    hook = _Hook(torch.zeros(6, dtype=torch.int32))
-    hook.set_head_sampling = lambda *a: False
-    head = vh.HiVerifyHead(hook)
-    sampled = _batch((1.0,))
-    head.before_forward(_RUNNER, sampled)
-    assert not head.sampled and not head.rows_sampling
-    assert head.ids(_RUNNER, sampled, torch.zeros(6, 4)) is None
 
 
 # ---- the head's sampling rows (``HiLayers.set_head_sampling``)

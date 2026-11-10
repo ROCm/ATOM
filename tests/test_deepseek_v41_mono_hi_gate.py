@@ -438,7 +438,6 @@ def _install_world(hi_dispatch, monkeypatch, *, local=None, others=(None, None, 
 
     monkeypatch.setattr(hi_dispatch.hi_runner, "check", check)
     monkeypatch.setattr(dist, "all_gather_object", gather)
-    monkeypatch.setattr(hi_dispatch.embed_full, "install", built("embed"))
     monkeypatch.setattr(hi_dispatch.hi_runner, "install", built("hi layers"))
     monkeypatch.setattr(hi_dispatch.hi_round, "install", built("round"))
     monkeypatch.setattr(hi_dispatch, "HiDraftModel", built("draft model"))
@@ -446,7 +445,9 @@ def _install_world(hi_dispatch, monkeypatch, *, local=None, others=(None, None, 
     draft = SimpleNamespace(block_backbone=None)
     drafter = SimpleNamespace(model=draft)
     builder = SimpleNamespace(
-        engram=SimpleNamespace(mapping=None, host=None), model_runner=None
+        engram=SimpleNamespace(mapping=None, host=None),
+        model_runner=None,
+        use_decode_round=lambda rnd: log.append("use round"),
     )
     cfg = SimpleNamespace(max_model_len=4096, index_cache_dtype="fp4")
     return log, (object(), cfg, drafter, builder, 0), draft
@@ -465,8 +466,8 @@ def _install_world(hi_dispatch, monkeypatch, *, local=None, others=(None, None, 
         # another rank's; this one passed
         (
             None,
-            (None, "MonoUnsupported: embedding", None),
-            "refused at install: rank 2: MonoUnsupported: embedding",
+            (None, "MonoUnsupported: Engram host shard", None),
+            "refused at install: rank 2: MonoUnsupported: Engram host shard",
         ),
         # any failure of the check is a refusal every rank takes (alone, it would leave the others waiting)
         (
@@ -481,8 +482,8 @@ def test_one_rank_refusing_at_install_refuses_on_every_rank_before_anything_is_b
 ):
     """``install_hi``: this rank's check, then every rank's verdict agreed (one gather, this rank's report in it),
     then the build. One rank refusing raises ``MonoUnsupported`` on every rank, naming it, before the first
-    collective of the build and before anything is built or allocated (the embedding stays where ATOM put it, no
-    peer group, no packed weight); the draft model is left as it was."""
+    collective of the build and before anything is built or allocated (no peer group, no packed weight); the draft
+    model is left as it was."""
     from atom.mono.runtime.consensus import MonoUnsupported
 
     error = {
@@ -504,12 +505,12 @@ def test_one_rank_refusing_at_install_refuses_on_every_rank_before_anything_is_b
 
 
 def test_every_rank_passing_builds_after_the_agreement(hi_dispatch_module, monkeypatch):
-    """Every rank's check passed: the build follows the agreement, the embedding's exchange (its read check, the
-    build's one agreed refusal) before anything else."""
+    """Every rank's check passed: the build follows the agreement; the decode round goes to V4.1's metadata builder
+    (``use_decode_round``) last, before the model is wrapped."""
     log, args, _ = _install_world(hi_dispatch_module, monkeypatch)
     hi_dispatch_module.install_hi(*args)
-    assert log == [("check", 4, 1), ("agree", None, "tp cpu group"), "embed", "hi layers", "draft model",
-                   "bind_draft", "round", "decode model"]  # fmt: skip
+    assert log == [("check", 4, 1), ("agree", None, "tp cpu group"), "hi layers", "draft model", "bind_draft",
+                   "round", "use round", "decode model"]  # fmt: skip
 
 
 def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
@@ -539,32 +540,3 @@ def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
     assert [r.getMessage() for r in caplog.records] == [
         "V4.1 mono hi off: refused at install: rank 0: MonoUnsupported: shard"
     ]
-
-
-def test_the_embeddings_own_check_is_a_refusal(hi_dispatch_module):
-    """``embed_full.check``: a model without exactly one sharded token embedding of a bf16 contiguous shard is
-    refused (``MonoUnsupported``, the install's agreed check), nothing moved."""
-    import torch
-    from torch import nn
-
-    from atom.model_ops.embed_head import VocabParallelEmbedding
-    from atom.mono.runtime.consensus import MonoUnsupported
-
-    def embedding(dtype):
-        emb = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
-        nn.Module.__init__(emb)
-        emb.weight = nn.Parameter(torch.zeros(4, 8, dtype=dtype), requires_grad=False)
-        return emb
-
-    check = hi_dispatch_module.embed_full.check
-    with pytest.raises(MonoUnsupported, match="0 sharded token embeddings"):
-        check(nn.Sequential(nn.Linear(2, 2)))
-    with pytest.raises(MonoUnsupported, match="2 sharded token embeddings"):
-        check(nn.Sequential(embedding(torch.bfloat16), embedding(torch.bfloat16)))
-    shard = embedding(torch.float32)
-    weight = shard.weight
-    with pytest.raises(MonoUnsupported, match="shard torch.float32"):
-        check(nn.Sequential(shard))
-    assert shard.weight is weight and shard.weight.dtype == torch.float32
-    ok = embedding(torch.bfloat16)
-    assert check(nn.Sequential(ok)) is ok

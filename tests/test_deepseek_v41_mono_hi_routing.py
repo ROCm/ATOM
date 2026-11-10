@@ -4,7 +4,8 @@
 (``AttentionMetaData.served_by_round``). A step routed to the hook runs on the hi path and never creates ATOM's K1 / K2
 runner; another decode step creates it (once) and runs on it, and invalidates the hook's incremental import; a step
 routed to the hook whose forward the hi layers cannot run (``inputs_embeds``) raises instead of leaving Engram staging
-and the draft's context write on the hook's side while the forward takes ATOM's.
+and the draft's context write on the hook's side while the forward takes ATOM's. A served forward expands ATOM's own
+embedding rows into the hi layers' input; its head output is the hook's in-graph verify (``compute_head``).
 """
 
 from types import SimpleNamespace
@@ -42,7 +43,7 @@ def D():
 
 class _Hook:
     def __init__(self):
-        self.head_rows, self.invalidated = 0, []
+        self.verified, self.invalidated = 0, []
 
     def invalidate(self, step, dummy=False):
         self.invalidated.append(step)
@@ -122,3 +123,85 @@ def test_a_served_step_the_hi_layers_cannot_run_raises(D, monkeypatch):
     m2, _ = _model(D, monkeypatch, _Hook(), served=())
     assert m2(torch.zeros(6, dtype=torch.int64), emb=torch.zeros(6, 4)) == "atom"
     assert made == []
+
+
+def test_the_head_output_is_the_hooks_in_graph_verify(D, monkeypatch):
+    """``compute_head``: the hook's head output at the forward's rows (``HiLayers.head_output``); every forward
+    starts with no verify of its own (``verified``), so a forward that served none gives None (the logits).
+    """
+    hook = _Hook()
+    hook.head_output = lambda rows: (
+        ("ids", "verdict", rows) if hook.verified == rows else None
+    )
+    m, _ = _model(D, monkeypatch, hook, served={6})
+    hook.verified = 6
+    m(torch.zeros(7, dtype=torch.int64))  # (ATOM's path: no verify of its own)
+    assert hook.verified == 0
+    model = D.HiDecodeModel.__new__(D.HiDecodeModel)
+    torch.nn.Module.__init__(model)
+    model._hi = hook
+    assert model.compute_head(torch.zeros(6, 4)) is None
+    hook.verified = 6
+    assert model.compute_head(torch.zeros(6, 4)) == ("ids", "verdict", 6)
+
+
+def test_a_served_forward_takes_atoms_embedding_rows(D, monkeypatch):
+    """``_hi_forward``: ATOM's embedding lookup of the step's ids (its masked lookup and TP all-reduce) is the forward's
+    boundary input and the begin-step's rows, which it expands into layer 0's streams; then every layer, the
+    end-step, and ATOM's collapse back as the forward's output rows."""
+    calls = []
+    rows, hidden = 6, 4
+    emb = torch.arange(rows * hidden, dtype=torch.float32).view(rows, hidden)
+
+    class Model:
+        topology = [SimpleNamespace(layer_id=i) for i in range(3)]
+
+        def embed(self, ids):
+            calls.append(("embed", ids.numel()))
+            return emb
+
+        def begin_forward(self, h, engram):
+            calls.append(
+                ("begin_forward", tuple(h.shape), h.data_ptr() == emb.data_ptr())
+            )
+
+        def end_forward(self, h, engram):
+            calls.append(("end_forward", tuple(h.shape)))
+
+    out = torch.zeros(rows, hidden)
+
+    class Hook:
+        served_widths = set()
+
+        def begin_step(self, cache, step, n, h, staged=None, input_ids=None):
+            calls.append(("begin_step", n, torch.equal(h, emb), input_ids.numel()))
+
+        def layer(self, i, n):
+            calls.append(("layer", i))
+
+        def end_step(self, cache, step, n):
+            calls.append(("end_step", n))
+
+        def collapse_view(self, n):
+            return out[:n]
+
+    md = SimpleNamespace(
+        step="step", cache=SimpleNamespace(packed=False), engram_embeddings=None
+    )
+    monkeypatch.setattr(
+        D, "get_forward_context", lambda: SimpleNamespace(attn_metadata=md)
+    )
+    m = D.HiDecodeModel.__new__(D.HiDecodeModel)
+    torch.nn.Module.__init__(m)
+    m.model, m._hi = Model(), Hook()
+    got = m._hi_forward(torch.zeros(rows, dtype=torch.int64), None)
+    assert got.data_ptr() == out.data_ptr() and got.shape == (rows, hidden)
+    assert calls == [
+        ("embed", rows),
+        ("begin_forward", (1, rows, hidden), True),
+        ("begin_step", rows, True, rows),
+        *[("layer", i) for i in range(3)],
+        ("end_step", rows),
+        ("end_forward", (1, rows, hidden)),
+    ]
+    assert m._hi.served_widths == {rows}

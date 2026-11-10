@@ -17,8 +17,8 @@ import triton.language as tl
 from torch import nn
 
 from atom.model_ops.engram import host_memory
+from atom.model_ops.engram.host_memory import device_address
 from atom.model_ops.utils import atom_parameter
-from atom.utils.packed_h2d import device_address
 
 logger = logging.getLogger("atom")
 

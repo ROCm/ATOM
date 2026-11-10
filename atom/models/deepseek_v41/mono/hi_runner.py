@@ -13,11 +13,10 @@ decode, K1 / K2).
 One served step:
 
 1. ``begin_step`` (one launch, ``hi_bridge._begin_step_kernel``): the
-   launch-tag step bump, the token embedding read in place from the rank
-   holding each row (``embed_full``) and expanded into layer 0's streams, the
-   window rings' import from ATOM's pool, each request's first position, its
-   request words (batch id, slot, liveness: the in-place programs') and the
-   indexer / candidate bounds, and the Engram history and cursor candidates;
+   launch-tag step bump, ATOM's token embedding rows of the step expanded into
+   layer 0's streams, the window rings' import from ATOM's pool, each
+   request's first position, its request words (batch id, slot, liveness:
+   the in-place programs') and the indexer / candidate bounds, and the Engram history and cursor candidates;
    then the Engram token-only halves (one launch, ``engram_kv_stages``) looked
    up from ATOM's page-locked host shards.
 2. ``layer``: the 40 layer launches, chained (a layer pushes its MoE partials,
@@ -70,17 +69,20 @@ collapse, the final RMSNorm, the bf16 vocab-sharded GEMV with a top-1 epilogue
 and the exact cross-rank argmax with ATOM's rule: the bf16 logit, ties to the
 lowest id) runs right after the last layer inside the target graph, its weights
 packed from ATOM's own ``model.norm.weight`` / ``model.head.weight``. Its ids
-land in a persistent int32 buffer (``head_out``) that ATOM's runner reads
-instead of logits on the verify steps that read nothing but each row's pick
-(``round.verify_head``, the runner's model-side verify head). It samples (the hi runtime's
-``head_blocks(sample=True)``): per row, temperature 0 takes the greedy pick,
-else one draw of softmax(bf16 logits / T) in ATOM's top-p nucleus, the rows
-with top_p >= 1 drawn in the dot epilogue (``race``); Philox counters keyed by
-the seed, the launch tag, the row and the id (the same draw on every rank). The
-rows' (T, top_p) are a persistent buffer (``head.par``) the runner sets before
-each forward (``set_head_sampling``). Under forced acceptance
+land in a persistent int32 buffer (``head_ids``) that the in-graph post-verify
+(``round.post_verify``) turns into the verify's output ids and verdict: the
+forward's head output (``HiDecodeModel.compute_head``), which ATOM's runner
+takes instead of logits on the verify steps that read nothing but each row's
+pick. It samples (the hi runtime's ``head_blocks(sample=True)``): per row,
+temperature 0 takes the greedy pick, else one draw of softmax(bf16 logits / T)
+in ATOM's top-p nucleus, the rows with top_p >= 1 drawn in the dot epilogue
+(``race``); Philox counters keyed by the seed, the launch tag, the row and the
+id (the same draw on every rank). The rows' (T, top_p) are a persistent buffer
+(``head.par``) published with each served step's metadata
+(``set_head_sampling``, from the builder's routing decision,
+``round.HiRound.service``). Under forced acceptance
 (``--spec-decode-acceptance-length``) the head's ids feed the same synthetic
-acceptance schedule (``round.verify_head``).
+acceptance schedule (``round.post_verify``).
 
 Graph capture: weights, buffers, programs, pointer tables and the peer groups
 are bound at install, so a step only launches; the launch-tag step counter is
@@ -125,7 +127,7 @@ from atom.models.deepseek_v41.mono.hi_gate import (  # noqa: F401 (REQ_ROWS re-e
     MAX_CTX,
     REQ_ROWS,
 )
-from atom.utils.packed_h2d import DeviceAddress, device_address
+from atom.model_ops.engram.host_memory import device_address
 from atom.models.deepseek_v41.mono.hi_gate import log_once
 
 logger = logging.getLogger("atom")
@@ -170,7 +172,8 @@ class HiLayers(HiDraft, HiPrograms):
         # hook's path at (a capture's included), the builder's lean-step test
         self.runs_every_layer = True
         self.lean_host, self.served_widths, self.lean_steps = False, set(), 0
-        self.head_rows = 0
+        # the rows of this forward's in-graph verify (``end_step``; 0: none), its head output (``head_output``)
+        self.verified = 0
         dev = self.dev = torch.device("cuda", torch.cuda.current_device())
         # (a band's programs: the band's rows)
         R, H = max(self.pwidth(s) for s in self.widths), cfg.hidden_size
@@ -244,13 +247,8 @@ class HiLayers(HiDraft, HiPrograms):
         # table lookup from ATOM's page-locked host shards (``use_host_tables``), its history and cursor candidates
         # written by the begin-step (``_fold_args``)
         self._eng_mapping = engram_mapping  # ATOM's NgramHashMapping: the hash constants (``engram_consts``)
-        # ``post_verify`` (set by ``install``); the runner and the step's input ids; the decode round's host work
-        # (``round.install``)
-        self.pv, self.runner, self.step_ids, self.round = None, None, None, None
-        # the token embedding's shards on every rank (``round.embed_full``): the begin-step's and the draft's lookups
-        self.embed = None
-        # the boundary op's stand-in
-        self.no_embedding = torch.empty(1, R, 0, dtype=torch.bfloat16, device=dev)
+        # ``post_verify`` (set by ``install``); the runner and the step's input ids
+        self.pv, self.runner, self.step_ids = None, None, None
         if self.eng:
             from .hi.blocks.gfx950.engram import NOUT
 
@@ -576,11 +574,12 @@ class HiLayers(HiDraft, HiPrograms):
         return sum(t.numel() * t.element_size() for t in packed.values())
 
     def set_head_sampling(self, temps=None, top_ps=None, rows=None) -> bool:
-        """This step's rows' (temperature, top_p) for the sampling head, before the forward: request i's
-        ``temps[i]`` / ``top_ps[i]`` on its ``rows[i]`` rows (numpy, the step's requests in order; None: every row
-        greedy; rows past them greedy). Filled in place into persistent host buffers; one H2D copy from a pinned slot
-        when they changed, on the current stream (so ahead of the forward that reads them); unchanged: nothing (a few
-        µs of host). -> False when a graph capture is recording (nothing staged).
+        """This step's rows' (temperature, top_p) for the sampling head, with the step's metadata (the builder's
+        routing decision, ``round.HiRound.service``): request i's ``temps[i]`` / ``top_ps[i]`` on its ``rows[i]`` rows
+        (numpy, the step's requests in order; None: every row greedy; rows past them greedy). Filled in place into
+        persistent host buffers; one H2D copy from a pinned slot when they changed, on the current stream (so ahead of
+        the forward that reads them); unchanged: nothing (a few µs of host). -> False when a graph capture is
+        recording (nothing staged).
         """
         buf = self.par_row_buf
         buf.fill(0.0)  # (past the step's rows: greedy)
@@ -608,11 +607,13 @@ class HiLayers(HiDraft, HiPrograms):
         self.par_last[:] = self.par_work
         return True
 
-    def head_out(self) -> torch.Tensor | None:
-        """The verify head's ids of the forward that just ran on the host (an eager step, or the one a graph
-        capture recorded), int32 [rows] (a view of the persistent buffer), or None when it did not run.
-        """
-        return self.head_ids[: self.head_rows] if self.head_rows else None
+    def head_output(self, rows: int):
+        """The head output of the forward that just ran on the host (an eager step, or the one a graph capture
+        records; ``HiDecodeModel.compute_head``): its in-graph verify's output ids and verdict at width ``rows``
+        (``post_verify``), or None when it ran none."""
+        if self.pv is None or self.verified != rows:
+            return None
+        return self.pv.output(rows)
 
     # ------------------------------------------------------------ routing
 
@@ -735,12 +736,14 @@ class HiLayers(HiDraft, HiPrograms):
             len(self.mf),
         )
 
-    def begin_step(self, cache, step, rows: int, staged=None, input_ids=None) -> None:
+    def begin_step(
+        self, cache, step, rows: int, hidden, staged=None, input_ids=None
+    ) -> None:
         """One launch (``_begin_step_kernel``): the step bump (recorded by a capture), the rings, the request words,
-        the embedding read in place from the ranks' shards and expanded into layer 0's input, the Engram history and
-        cursor candidates (``staged``: ATOM's Engram rows of the step, its staging's step; ``input_ids``: the step's
-        tokens); then the Engram token-only halves. First the programs' pointers into ATOM's storage
-        (``_bind_cache``)."""
+        the embedding rows (``hidden``: ATOM's lookup of the step's tokens, [rows, hidden]) expanded into layer 0's
+        input, the Engram history and cursor candidates (``staged``: ATOM's Engram rows of the step, its staging's
+        step; ``input_ids``: the step's tokens); then the Engram token-only halves. First the programs' pointers into
+        ATOM's storage (``_bind_cache``)."""
         self._bind_cache(cache, step)
         if self.pv is not None and input_ids is not None:
             # the post-verify's drafts (a fixed address under a capture)
@@ -757,19 +760,13 @@ class HiLayers(HiDraft, HiPrograms):
         # the step's requests (each its batch slot of the hi-side caches)
         nb = self.split[rows][0]
         eflat, ke = self._engram_segments(cache, step, rows, staged, input_ids)
-        # the lookup in the expand program, each row read from the rank holding it: ATOM's embedding launch and its
-        # all-reduce skipped (``HiDecodeModel._hi_forward``)
-        emb = self.embed
-        ke = dict(
-            ke, emb_ids=input_ids.view(-1), emb_rows=emb.rows, emb_per=emb.per, EMB=1
-        )
         rp = self.ring_p
         n = nb * len(self.mf) * rp + rows + ke["NE0"] + ke["NE1"] + ke["EHIST"]
         ml._begin_step_kernel[(n,)](
             cache.pool, step.positions, step.batch_ids, step.slots, self.rings, self.ring_layers, self.pos,
-            self.bounds, *self._geo(cache), rows, emb.shards, emb.hidden, self.h_in0,
+            self.bounds, *self._geo(cache), rows, hidden, hidden.stride(0), self.h_in0,
             self.step, self.req, *eflat, self.imp, NMF=len(self.mf), WIN=WINDOW, DIM=HEAD_DIM,
-            RB=self.RB, HIDDEN=emb.hidden, BLOCK=1024, NHC=HC, **ke, INCR=1, RP=rp, NB=nb, BM=self.bmax,
+            RB=self.RB, HIDDEN=hidden.shape[-1], BLOCK=1024, NHC=HC, **ke, INCR=1, RP=rp, NB=nb, BM=self.bmax,
             RQP=triton.next_power_of_2(rows // nb),
         )  # fmt: skip
         if rows in self.band_of:
@@ -878,7 +875,6 @@ class HiLayers(HiDraft, HiPrograms):
                                                 stream=torch.cuda.current_stream())  # fmt: skip
             # the step's last launch on the group: 41 (odd) flip the step phase
             _end_step(self.peers)
-            self.head_rows = rows
 
     def _taps(self) -> list:
         """(r_a, ATOM's aux buffer) of the hi layers ATOM's DSpark taps. (Bound here on the first served step,
@@ -897,8 +893,9 @@ class HiLayers(HiDraft, HiPrograms):
         self._end_step(cache, step, rows)
         self._ctx_after_target(cache, step, rows)
         if self.pv is not None and step.max_q_len == self.split[rows][1]:
-            # the verdict and commit in the graph (``post_verify``)
+            # the verdict and commit in the graph (``post_verify``): the forward's head output (``head_output``)
             self.pv.launch(self, cache, step, rows)
+            self.verified = rows
 
     def _end_step(self, cache, step, rows: int) -> None:
         taps = self._taps()
@@ -946,12 +943,10 @@ def check(model, atom_config, engram, draft, tp: int, rank: int) -> None:
     layer plan (every layer on the hi path), the target layers' and the draft stages' weights
     (``hi_weights.check_block``: the FP8 linears, the routed experts' layout and padding codes, a rank's own shard), the
     Engram layers' and the context write's linears, the RoPE caches, the verify head's tensors, the draft's stages and
-    norms, the token embedding (``embed_full.check``) and ATOM's Engram host shards (their rows, read on the device
-    through their device addresses). ``engram``: ATOM's Engram runtime (its hash mapping and host shards); ``draft``:
-    ATOM's DSpark draft model. ``hi_dispatch.install_hi`` agrees on the verdict over the TP group before anything is
-    built, so every rank builds or every rank falls back with nothing built."""
-    from atom.models.deepseek_v41.mono.round import embed_full
-
+    norms and ATOM's Engram host shards (their rows, read on the device through their device addresses). ``engram``:
+    ATOM's Engram runtime (its hash mapping and host shards); ``draft``: ATOM's DSpark draft model.
+    ``hi_dispatch.install_hi`` agrees on the verdict over the TP group before anything is built, so every rank builds
+    or every rank falls back with nothing built."""
     from .hi.v41 import draft as D
     from .hi.v41 import head as H
     from .hi.v41 import layer as L
@@ -1008,7 +1003,6 @@ def check(model, atom_config, engram, draft, tp: int, rank: int) -> None:
     hw.check_linears(draft.mtp[0].main_proj)
     for s in range(D.STAGES):
         hw.check_block(draft.mtp[s], inter, tp)
-    embed_full.check(model)
     # ATOM's Engram host shards, the rows the hi runtime reads (``use_host_tables``)
     eng = [p.layer_id for p in plan if p.engram]
     if eng:
@@ -1089,13 +1083,8 @@ def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
         torch.set_default_device(device)
     from atom.models.deepseek_v41.mono.round import post_verify
 
-    # the verdict and the Engram cursor commit inside the target graph (``post_verify``; the fused one-launch
-    # verdict, ``head_verdict``, on the steps it does not take)
+    # the verdict and the Engram cursor commit inside the target graph (``post_verify``): the forward's head output
     hook.pv = post_verify.PostVerify(hook.widths, hook.split, hook.step.device)
-    # the runner's model-side verify head on the head's ids (``round.verify_head``)
-    from atom.models.deepseek_v41.mono.round.verify_head import HiVerifyHead
-
-    hook.verify_head = HiVerifyHead(hook)
     return hook
 
 
@@ -1123,6 +1112,16 @@ def _check_host_shard(
                 len(idx), time.time() - t0)  # fmt: skip
 
 
+class _DeviceAddress:
+    """A raw device address as a Triton kernel's pointer argument."""
+
+    def __init__(self, address: int, dtype=torch.uint8):
+        self.address, self.dtype = address, dtype
+
+    def data_ptr(self) -> int:
+        return self.address
+
+
 @triton.jit
 def _read_rows_kernel(src, rows, out, WIDTH: tl.constexpr):
     """Program i: ``WIDTH`` bytes of row ``rows[i]`` of the table at ``src`` (a device address) into ``out[i]``."""
@@ -1136,7 +1135,7 @@ def _read_rows(addr: int, width: int, idx) -> torch.Tensor:
     """uint8 [len(idx), width] read on the device from the uint8 [*, width] table at device address ``addr``."""
     rows = torch.tensor(idx, dtype=torch.int64, device="cuda")
     out = torch.empty(len(idx), width, dtype=torch.uint8, device="cuda")
-    _read_rows_kernel[(len(idx),)](DeviceAddress(addr), rows, out, WIDTH=width)
+    _read_rows_kernel[(len(idx),)](_DeviceAddress(addr), rows, out, WIDTH=width)
     torch.cuda.synchronize()
     return out
 

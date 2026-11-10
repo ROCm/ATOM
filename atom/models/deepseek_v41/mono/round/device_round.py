@@ -12,12 +12,16 @@ block table (the scheduler allocates the whole draft span ahead), Engram's curso
 
 On a device-round step the next step's positions are advanced on the device instead: ``positions[i] = start + 1 + accepted + i``
 (``_advance_kernel``), where ``start`` is the previous served step's first position (the hook's ``pos``, written by its
-begin-step bridge) and ``accepted`` is the previous verdict's accepted-draft count (row 0 of the rejection sampler's verdict, a
-device tensor). The host builds the step's metadata without waiting, as if no draft had been rejected (the status it
-hands ``prepare_input_ids`` is zeros: a start no lower than the true one, inside the block table's span), publishes it, and the advance kernel overwrites the positions on the same
-stream before any reader runs (Engram staging and the target graph come after it). The host collects the verdict after the
-target graph is launched, where the scheduler's output needs it. The stale-state probe (``cache.prepare_state``), which
-compares the restored cursor with the host's start, is skipped on these steps.
+begin-step bridge) and ``accepted`` is the previous verdict's accepted-draft count, read off its anchor row (a device
+tensor: the anchors the runner committed, ``DeviceRound.committed``; request b's anchor is its row b x rows +
+accepted). The builder tells the runner the step consumes the device verdict (``consumes``,
+``AttentionMetadataBuilder.consumes_device_verdict``): the runner builds the step's metadata without waiting, as if no
+draft had been rejected (zero counts: a start no lower than the true one, inside the block table's span), the builder
+publishes it, and the advance kernel overwrites the positions on the same stream before any reader runs (Engram staging
+and the target graph come after it). The runner collects the status after the target graph is launched, where the
+scheduler's output needs it. The stale-state probe (``cache.prepare_state``), which compares the restored cursor with
+the host's start, is skipped on these steps; ``cache.prepare_device_round_state`` checks on the host instead that the
+step continues the previous one's requests.
 
 A step is a device-round step only when every link holds: the lean predicate (a served one-request verify at a served width,
 every layer on the hi path), the previous forward was a served step of the same request that produced a verdict, the verify
@@ -34,14 +38,11 @@ the same verdict.
 host, for the prefill's status (the rejected / bonus counts the next step's metadata reads), which is ready only when
 the whole prefill has run: the host then prepares the step while the GPU idles (~0.85 ms at ~10K, every turn of a
 conversation). A prefill verifies nothing, so that status is known: 0 rejected, 0 bonus. Such a step (a served verify
-of the same requests, in the same order, as the output-producing prefill forward before it) builds its metadata from
-zeros without waiting and takes the owed wait after the target launch, like a device-round step; its positions are
-the host's (nothing to advance).
+of the requests the output-producing prefill forward before it prefilled) consumes no verdict either: the runner builds
+its metadata from zeros without waiting and takes the owed wait after the target launch, like a device-round step; its
+positions are the host's (nothing to advance).
 
-``prologue``: a device-round step's packed publications and ids fill are recorded and launched with its advance as
-one kernel.
-
-Called at the runner's and the builder's decode-round hooks (``round.HiRound``); such a step's routing decision is
+Called at the builder's decode-round points (``round.HiRound``); such a step's routing decision is
 ``RoundService.DEVICE`` (``AttentionMetaData.served_by_round``), on which the builder takes the cache's device-round
 state (no probe). Nothing changes with the hook off, or on any other step.
 """
@@ -50,7 +51,6 @@ from __future__ import annotations
 
 import logging
 
-import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -62,18 +62,18 @@ logger = logging.getLogger("atom")
 
 
 @triton.jit
-def _advance_kernel(
-    positions, start, verdict, verdict_stride, rows, BLOCK: tl.constexpr
-):
-    """Program b: positions[b rows + i] = start[b] + 1 + verdict[0, b] + i, i < rows (request b of the step: the
-    next verify's anchor is the previous one's bonus token, ``accepted`` rows past its anchor).
+def _advance_kernel(positions, start, anchors, rows, BLOCK: tl.constexpr):
+    """Program b: positions[b rows + i] = start[b] + 1 + accepted + i, i < rows, where accepted = anchors[b] - b rows
+    (request b of the step: the next verify's anchor is the previous one's bonus token, ``accepted`` rows past its
+    anchor; the previous verify laid request b out at row b x rows, its anchor that row + its accepted drafts).
     """
     b = tl.program_id(0)
     i = tl.arange(0, BLOCK)
     s = (
         tl.load(start + b).to(tl.int64)
         + 1
-        + tl.load(verdict + b * verdict_stride).to(tl.int64)
+        + tl.load(anchors + b).to(tl.int64)
+        - b * rows
     )
     tl.store(
         positions + b * rows + i, (s + i).to(positions.dtype.element_ty), mask=i < rows
@@ -83,15 +83,16 @@ def _advance_kernel(
 def advance(
     positions: torch.Tensor,
     start: torch.Tensor,
-    verdict: torch.Tensor,
+    anchors: torch.Tensor,
     rows: int,
     requests: int = 1,
 ) -> None:
     """``_advance_kernel`` on the current stream: ``positions`` [>= requests x rows] (int32 / int64), ``start`` int32
-    [>= requests] (each request's previous first position), ``verdict`` int32 [3, requests] (the rejection sampler's:
-    accepted, rejected, anchor, a column a request); ``rows`` a request."""
-    _advance_kernel[(requests,)](positions, start, verdict, verdict.stride(1), rows,
-                                 BLOCK=triton.next_power_of_2(max(rows, 2)))  # fmt: skip
+    [>= requests] (each request's previous first position), ``anchors`` int32 [requests] (the previous verdict's anchor
+    rows: the rejection sampler's verdict row 2); ``rows`` a request."""
+    _advance_kernel[(requests,)](
+        positions, start, anchors, rows, BLOCK=triton.next_power_of_2(max(rows, 2))
+    )
 
 
 def device_round_step(state, batch, max_seqlen_q, hook) -> bool:
@@ -118,23 +119,6 @@ def first_step(state, batch, max_seqlen_q, hook) -> bool:
     )
 
 
-def may_serve(batch, max_seqlen_q, hook) -> bool:
-    """Whether the hook may serve this forward, before the step's routing decision (``HiRound.service``, the builder's:
-    after the token inputs' publication): a decode of at most as many requests, of at most as many rows each, as a
-    width of the hook takes. Host-side, TP-uniform."""
-    n = batch.total_seqs_num
-    if (
-        hook is None
-        or batch.is_dummy_run
-        or getattr(batch, "total_seqs_num_prefill", 0) > 0
-        or n < 1
-    ):
-        return False
-    return any(
-        b >= n and max_seqlen_q <= rq for b, rq in getattr(hook, "split", {}).values()
-    )
-
-
 def _served_verify(batch, max_seqlen_q, hook) -> bool:
     """A decode verify the hook serves on the lean path: its full DSpark span at a served width, no image rows, no
     replayed rows."""
@@ -157,40 +141,34 @@ class _State:
 
     def __init__(self):
         self.on = False  # this forward is a device-round step
-        self.owed = (
-            False  # its verdict wait is still owed (taken after the target launch)
-        )
         self.cur_req = None  # this forward's requests (a tuple), if it may be served
         self.cur_served = False  # this forward's step was a lean served one
         self.ready = (
-            None  # the request whose served step left a verdict + start on the device
+            None  # the requests whose served step left a verdict + start on the device
         )
-        self.verdict = None  # that verdict (device int32 [3, 1])
+        self.anchors = None  # that verdict's anchor rows (device int32 [requests])
         self.advance_from = (
-            None  # the verdict this forward advances from (a device-round step)
+            None  # the anchors this forward advances from (a device-round step)
         )
         self.first = False  # this forward is a first step after a prefill that skips the prefill's status wait
         self.prefilled = None  # the requests of the previous forward, if it was an output-producing prefill of them all
-        self.prefilled_by = None  # this forward's previous one's (``prefilled`` before this forward replaced it)
         self.steps = 0
 
 
 class DeviceRound:
-    """The device round at the runner's and the builder's hooks (``HiRound``: ``before_input_ids``, ``spec_status``,
-    ``laid_out``, ``after_forward``, ``note_verdict``), on its host-side state (``_State``) and the prologue's recorder
-    (``pro``)."""
+    """The device round at the builder's decode-round points (``HiRound``: ``consumes``, ``laid_out``,
+    ``committed``), on its host-side state (``_State``)."""
 
-    def __init__(self, hook, pro) -> None:
-        self.hook, self.pro, self.state = hook, pro, _State()
+    def __init__(self, hook) -> None:
+        self.hook, self.state = hook, _State()
 
-    def before_input_ids(self, batch, max_seqlen_q) -> None:
-        """``prepare_input_ids``, first: whether this forward is a device-round step or a first step after a prefill,
-        and the requests it may serve."""
+    def consumes(self, batch, max_seqlen_q) -> bool:
+        """Before the step's input ids, every forward (``consumes_device_verdict``): whether this forward is a
+        device-round step or a first step after a prefill (either consumes no host-side status: the runner defers
+        its wait), and the requests it may serve."""
         state, hook = self.state, self.hook
         state.on = device_round_step(state, batch, max_seqlen_q, hook)
         state.first = not state.on and first_step(state, batch, max_seqlen_q, hook)
-        # the prefill forward whose status this step owes (when ``first``)
-        state.prefilled_by = state.prefilled
         n, pre = batch.total_seqs_num, getattr(batch, "total_seqs_num_prefill", 0)
         produced = getattr(batch, "produces_output", None)
         state.prefilled = (
@@ -202,41 +180,20 @@ class DeviceRound:
             else None
         )
         # the previous forward's verdict feeds this step only; whatever this forward is, it leaves its own (or none)
-        state.advance_from = state.verdict if state.on else None
-        state.ready = state.verdict = None
+        state.advance_from = state.anchors if state.on else None
+        state.ready = state.anchors = None
         state.cur_req = (
             tuple(batch.req_ids[:n])
             if 1 <= n <= getattr(hook, "bmax", 1) and not batch.is_dummy_run
             else None
         )
         state.cur_served = False
-        # a device-round step's pre-target launches recorded until its advance; a decode step the hook may serve
-        # reads its publications' pinned arenas directly
-        self.pro.arm(state.on, served=may_serve(batch, max_seqlen_q, hook))
-
-    def spec_status(self):
-        """``prepare_input_ids``' status: zeros on a device-round step (the step is built as if no draft had been
-        rejected: module docstring) and the prefill's zeros on a first step (each wait owed: ``after_forward``), else
-        None (the queue's).
-        """
-        state = self.state
-        if state.on:
-            state.owed = True  # taken after the target launch (``after_forward``), in the same queue order
-            # one a request of the served step that left the verdict (this step's requests, in the same order)
-            zeros = np.zeros(len(state.cur_req), dtype=np.int32)
-            return zeros, zeros.copy()
-        if state.first:
-            state.owed = (
-                True  # the same, for the prefill's status: known (module docstring)
-            )
-            # one a request of the prefill forward
-            zeros = np.zeros(len(state.prefilled_by), dtype=np.int32)
-            return zeros, zeros.copy()
-        return None
+        return state.on or state.first
 
     def laid_out(self, metadata) -> None:
         """After the builder's layout: a device-round step's (``RoundService.DEVICE``) positions advanced on the
-        device (with the prologue's recorded launches as one kernel)."""
+        device. The step's routing decision is taken: no later layout of this forward is a device-round one.
+        """
         state, hook, step = self.state, self.hook, metadata.step
         running_bs, running_tokens = int(step.slots.shape[0]), step.running_tokens
         state.cur_served = (
@@ -244,51 +201,39 @@ class DeviceRound:
             and state.cur_req is not None
             and running_bs == len(state.cur_req)
         )
+        on, state.on, state.first = state.on, False, False
         if metadata.served_by_round is not RoundService.DEVICE:
             return
-        if state.advance_from is None:
+        if not on or state.advance_from is None:
             raise RuntimeError(
                 "V4.1 mono: a device-round step without the verdict it advances from"
             )
         # after the step's publication on this stream: every reader of the positions runs after this
-        args = (
+        advance(
             step.positions,
             hook.pos,
             state.advance_from,
             running_tokens // running_bs,
             running_bs,
         )
-        if self.pro.armed:  # with the recorded publications and ids fill, as one kernel
-            self.pro.advance(*args)
-        else:
-            advance(*args)
         state.steps += 1
 
-    def note_verdict(self, out) -> None:
-        """A verify's (tokens, verdict, ..): the verdict a served step of its requests leaves for the next step's
-        advance."""
+    def committed(self, metadata, anchors) -> None:
+        """A served verify's commit at the verdict's ``anchors`` (the runner's, whichever verdict it took): the
+        verdict a served step of its requests leaves for the next step's advance."""
         state = self.state
         if (
             state.cur_served
             and state.cur_req is not None
-            and out[1].shape == (3, len(state.cur_req))
+            and anchors is not None
+            and tuple(anchors.shape) == (len(state.cur_req),)
         ):
-            state.ready, state.verdict = state.cur_req, out[1]
-
-    def after_forward(self, processor) -> None:
-        """After the target's launch: the owed verdict wait (what the scheduler's output reads, ``postprocess``)."""
-        state = self.state
-        if state.owed:
-            state.owed = False
-            processor.prev_rejected_num, processor.prev_bonus_num = (
-                processor.recv_spec_status()
-            )
-        state.on = state.first = False
+            state.ready, state.anchors = state.cur_req, anchors
 
 
-def install(metadata_builder, hook, runner) -> DeviceRound | None:
-    """The device round for ``hook`` (``HiRound``'s) with its prologue recorder on ``runner``'s publications, or None:
-    it needs the lean host prep and the on-device Engram path."""
+def install(metadata_builder, hook) -> DeviceRound | None:
+    """The device round for ``hook`` (``HiRound``'s), or None: it needs the lean host prep and the on-device Engram
+    path."""
     if hook is None:
         return None
     if not hook.lean_host:
@@ -304,12 +249,9 @@ def install(metadata_builder, hook, runner) -> DeviceRound | None:
             "V4.1 mono hi: the device round needs the on-device Engram path: off",
         )
         return None
-    from atom.models.deepseek_v41.mono.round import prologue
-
-    pro = prologue.install(runner)
     log_once(
         logging.INFO,
         "V4.1 mono hi: device round advance on served steps; the first step after a prefill without its "
         "wait",
     )
-    return DeviceRound(hook, pro)
+    return DeviceRound(hook)

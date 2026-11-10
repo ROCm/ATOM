@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.model_hooks import DecodeRound
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_loader.weight_utils import local_model_dir
 from atom.model_ops.attentions.backends import (
@@ -245,6 +246,21 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
     step_planners = ()
     _decoder_replays = False
+    # The model's decode round (`use_decode_round`), None for a model without
+    # one.
+    decode_round: DecodeRound | None = None
+
+    def use_decode_round(self, decode_round: DecodeRound) -> None:
+        """Have a model's decode round (`model_hooks.DecodeRound`, from its
+        install) take part in every step: the device verdict a step consumes,
+        its routing decision, its layout and its commit."""
+        self.decode_round = decode_round
+
+    def consumes_device_verdict(self, batch, max_seqlen_q) -> bool:
+        """The model's decode round's answer, False without one."""
+        return self.decode_round is not None and (
+            self.decode_round.consumes_device_verdict(batch, max_seqlen_q)
+        )
 
     def add_step_planner(self, planner):
         """Have `planner` lay its per-step tables out of each step's staged rows
@@ -646,9 +662,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         token_mask = self._token_mask(batch, spans, offset)
         verifying = tentative and bool(spans)
         # The step's one routing decision (`AttentionMetaData.served_by_round`):
-        # how much of it the model's decode round takes over. None for a runner
-        # without one (a plugin's).
-        decode_round = getattr(self.model_runner, "decode_round", None)
+        # how much of it the model's decode round takes over.
+        decode_round = self.decode_round
         service = (
             RoundService.NONE
             if decode_round is None
@@ -1280,10 +1295,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             cache.pending.staged_on_device = True
 
     def commit_speculative_state(self, metadata, last_token_indices):
-        # A served step whose forward committed it already (the model's decode
-        # round's word on its own step).
-        if metadata.served_by_round and self.model_runner.decode_round.committed(
-            metadata
+        # A served step whose forward committed it already, at these anchors
+        # (the model's decode round's word on its own step).
+        if metadata.served_by_round and self.decode_round.committed(
+            metadata, last_token_indices
         ):
             return
         if metadata.cache.pending is not None:

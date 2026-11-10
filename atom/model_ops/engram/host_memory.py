@@ -47,7 +47,6 @@ import numpy as np
 import torch
 
 from atom.utils import envs
-from atom.utils.hip_runtime import hip_runtime as _hip_runtime
 
 logger = logging.getLogger("atom")
 
@@ -97,6 +96,89 @@ def _page_span(t: torch.Tensor) -> tuple[int, int]:
     lo = base - base % _PAGE
     hi = -(-(base + t.numel() * t.element_size()) // _PAGE) * _PAGE
     return lo, hi
+
+
+@functools.cache
+def _hip_runtime():
+    """The HIP runtime this process already runs -- the `libamdhip64` torch
+    loaded (a ROCm wheel bundles its own, e.g. `torch/lib/libamdhip64.so.7`)
+    -- or None.
+
+    Not `CDLL("libamdhip64.so")`: that is the system's unversioned dev link,
+    which a wheel-only install lacks (the copy would quietly turn into an
+    in-place registration) and which can name a second, different runtime
+    than torch's, with its own allocations and last error.
+    """
+    if not torch.version.hip:
+        return None
+    candidates = []
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                path = line.split(maxsplit=5)[-1].strip()
+                name = os.path.basename(path)
+                if name.startswith("libamdhip64.so") and path not in candidates:
+                    candidates.append(path)
+    except OSError:
+        pass
+    torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+    try:
+        candidates += sorted(
+            os.path.join(torch_lib, n)
+            for n in os.listdir(torch_lib)
+            if n.startswith("libamdhip64.so")
+        )
+    except OSError:
+        pass
+    candidates.append("libamdhip64.so")
+    for path in candidates:
+        try:
+            hip = ctypes.CDLL(path)
+        except OSError:
+            continue
+        logger.info("engram: HIP runtime for page-locking: %s", path)
+        return hip
+    logger.warning(
+        "engram: no HIP runtime found (tried %s); a UVA shard is registered in "
+        "place instead of copied",
+        ", ".join(candidates),
+    )
+    return None
+
+
+@functools.cache
+def _host_get_device_pointer():
+    """`hipHostGetDevicePointer` of the HIP runtime that page-locks
+    (`_hip_runtime`), resolved once; None without one."""
+    hip = _hip_runtime()
+    fn = None if hip is None else getattr(hip, "hipHostGetDevicePointer", None)
+    if fn is not None:
+        fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+    return fn
+
+
+def device_address(
+    host_ptr: int, base: int | None = None, *, identity_without_hip: bool = False
+) -> int:
+    """The device's address of `host_ptr`, a byte of the page-locked host
+    range starting at `base` (default: `host_ptr` itself). Not always the host
+    address: memory registered in place is mapped at another device address,
+    and a kernel handed the host one faults.
+
+    Without a HIP runtime to ask it raises, or with `identity_without_hip`
+    returns `host_ptr` itself (where the caller's host memory is read at its
+    host address: copies the HIP allocator page-locked, or no device at all)."""
+    fn = _host_get_device_pointer()
+    if fn is None:
+        if identity_without_hip:
+            return host_ptr
+        raise RuntimeError("no HIP runtime loaded: no device address of host memory")
+    base = host_ptr if base is None else base
+    dev = ctypes.c_void_p()
+    rc = fn(ctypes.byref(dev), base, 0)
+    if rc != 0 or not dev.value:
+        raise RuntimeError(f"hipHostGetDevicePointer({base:#x}) failed ({rc})")
+    return dev.value + (host_ptr - base)
 
 
 def _clear_hip_error() -> None:

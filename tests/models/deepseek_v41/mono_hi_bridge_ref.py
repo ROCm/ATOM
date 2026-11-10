@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Reference launches for ``test_mono_hi_bridge``: each of the fused bridge's bodies (``hi_bridge``) as a kernel
-of its own, the separate launches the fused begin-step / end-step replace. Loaded by the test with the layout's jit helpers in its namespace (``_ring_in``, ``_req_words``,
-...); not a module of its own."""
+of its own, the separate launches the fused begin-step / end-step replace, and the per-request verdict the in-graph
+post-verify is checked against. Loaded by the test with the layout's jit helpers in its namespace (``_ring_in``,
+``_req_words``, ...); not a module of its own."""
 
 # ruff: noqa: F821  (the layout's jit helpers are injected into this module's namespace by the test)
 
@@ -70,11 +71,18 @@ def _engram_rows_kernel(src, src_stride, dst, KIN: tl.constexpr, BLOCK: tl.const
 
 
 @triton.jit
-def _expand_rows_kernel(hidden, hidden_stride, h_in, emb_ids, emb_rows, emb_per, HIDDEN: tl.constexpr,
-                        BLOCK: tl.constexpr, NHC: tl.constexpr, EMB: tl.constexpr):  # fmt: skip
+def _expand_rows_kernel(
+    hidden,
+    hidden_stride,
+    h_in,
+    HIDDEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NHC: tl.constexpr,
+):
     """Program j: ``_expand_row`` (the CPU check's)."""
-    _expand_row(tl.program_id(0).to(tl.int64), hidden, hidden_stride, h_in, emb_ids, emb_rows, emb_per, HIDDEN, BLOCK,
-                NHC, EMB)  # fmt: skip
+    _expand_row(
+        tl.program_id(0).to(tl.int64), hidden, hidden_stride, h_in, HIDDEN, BLOCK, NHC
+    )
 
 
 @triton.jit
@@ -130,3 +138,74 @@ def _aux_tap_kernel(
 ):
     """Program j: ``_tap``."""
     _tap(tl.program_id(0), r_a, aux, HIDDEN, BLOCK, NHC)
+
+
+@triton.jit(do_not_specialize=["num_spec_steps", "seed"])
+def _head_verdict_kernel(
+    out_ptr,  # int32 [requests, num_spec_steps + 1]
+    verdict_ptr,  # int32 [3, requests]: accepted drafts, rejected, anchor row
+    cu_num_draft_ptr,  # [requests]
+    input_ids_ptr,  # the step's input ids; draft r is input_ids[target_idx[r] + 1]
+    target_idx_ptr,  # [verify rows]: each verify row's row of the step
+    bonus_idx_ptr,  # [requests]: each request's bonus row
+    head_ids_ptr,  # [rows of the step]: the head's id a row
+    uniform_ptr,  # [verify rows] f32 (SYNTHETIC and not DRAW)
+    cond_rates_ptr,  # [num_spec_steps] f32 (SYNTHETIC)
+    seed,
+    num_spec_steps,
+    SYNTHETIC: tl.constexpr,
+    DRAW: tl.constexpr,
+):
+    """The verdict reference the in-graph post-verify (``round.post_verify._post_verify_kernel``) is checked against,
+    a program a request: ATOM's ``rejection_greedy_sample_kernel`` / ``rejection_synthetic_sample_kernel`` +
+    ``_finish_request`` on the head's ids read through the row indices (the two ``index_select``), the uniforms given
+    (ATOM's) or drawn here (``DRAW``, as the post-verify draws them).
+    """
+    req = tl.program_id(0)
+    if req == 0:
+        start = 0
+    else:
+        start = tl.load(cu_num_draft_ptr + req - 1)
+    n = tl.load(cu_num_draft_ptr + req) - start
+    INVALID: tl.constexpr = -1
+    row_out = out_ptr + req * (num_spec_steps + 1)
+    rejected = False
+    last = -1
+    for pos in range(n):
+        if rejected:
+            oid = INVALID
+        else:
+            r = start + pos
+            vrow = tl.load(target_idx_ptr + r)
+            target = tl.load(head_ids_ptr + vrow).to(tl.int32)
+            draft = tl.load(input_ids_ptr + vrow + 1).to(tl.int32)
+            if SYNTHETIC:
+                if DRAW:
+                    u = tl.rand(seed, r)
+                else:
+                    u = tl.load(uniform_ptr + r)
+                if u < tl.load(cond_rates_ptr + pos):
+                    oid = draft
+                else:
+                    oid = target
+                    rejected = True
+            else:
+                oid = target
+                if draft != target:
+                    rejected = True
+            last += 1
+        tl.store(row_out + pos, oid)
+    accepted = last
+    brow = tl.load(bonus_idx_ptr + req)
+    if rejected:
+        bonus = INVALID
+    else:
+        bonus = tl.load(head_ids_ptr + brow).to(tl.int32)
+        accepted += 1
+    tl.store(row_out + n, bonus)
+    for pos in range(n + 1, num_spec_steps + 1):
+        tl.store(row_out + pos, INVALID)
+    nreq = tl.num_programs(0)
+    tl.store(verdict_ptr + req, accepted)
+    tl.store(verdict_ptr + nreq + req, num_spec_steps - accepted)
+    tl.store(verdict_ptr + 2 * nreq + req, brow - n + accepted)

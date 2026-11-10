@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: MIT
 """Pack metadata into one pinned arena, upload once, scatter to stable addresses."""
 
-import ctypes
-import functools
-
 import torch
 import triton
 import triton.language as tl
-
-from atom.utils.hip_runtime import hip_runtime
 
 
 @triton.jit
@@ -21,50 +16,6 @@ def scatter_packed_bytes(arena, destinations, BLOCK: tl.constexpr):
     offset = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     values = tl.load(arena + start + offset, offset < length, other=0)
     tl.store(destination + offset, values, offset < length)
-
-
-class DeviceAddress:
-    """A raw device address as a kernel's pointer argument."""
-
-    def __init__(self, address, dtype=torch.uint8):
-        self.address, self.dtype = address, dtype
-
-    def data_ptr(self):
-        return self.address
-
-
-@functools.cache
-def _host_get_device_pointer():
-    """`hipHostGetDevicePointer` of the HIP runtime torch runs (the one that
-    page-locked the memory; `hip_runtime`), resolved once; None without one."""
-    hip = hip_runtime()
-    fn = None if hip is None else getattr(hip, "hipHostGetDevicePointer", None)
-    if fn is not None:
-        fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
-    return fn
-
-
-def device_address(
-    host_ptr: int, base: int | None = None, *, identity_without_hip: bool = False
-) -> int:
-    """The device's address of `host_ptr`, a byte of the page-locked host
-    range starting at `base` (default: `host_ptr` itself). Not always the host
-    address: memory registered in place is mapped at another device address.
-
-    Without a HIP runtime to ask it raises, or with `identity_without_hip`
-    returns `host_ptr` itself (where the caller's host memory is read at its
-    host address: copies the HIP allocator page-locked, or no device at all)."""
-    fn = _host_get_device_pointer()
-    if fn is None:
-        if identity_without_hip:
-            return host_ptr
-        raise RuntimeError("no HIP runtime loaded: no device address of host memory")
-    base = host_ptr if base is None else base
-    dev = ctypes.c_void_p()
-    rc = fn(ctypes.byref(dev), base, 0)
-    if rc != 0 or not dev.value:
-        raise RuntimeError(f"hipHostGetDevicePointer({base:#x}) failed ({rc})")
-    return dev.value + (host_ptr - base)
 
 
 class PackedCopy:
@@ -103,10 +54,6 @@ class PackedCopy:
         result.prefixes = {}
         result.launch = scatter_packed_bytes
         result.kernel = None
-        # A model's opt-in (`read_host_arena`), else None: every launch is the
-        # copy-then-scatter below.
-        result.reader = None
-        result.host_arena = None
         return result, None
 
     def submit(self, counts):
@@ -127,25 +74,15 @@ class PackedCopy:
                 self.payload[offset : offset + length] = self.sources[i][:length]
                 offset += length
                 largest = max(largest, length)
-        grid = (len(self.members), (largest + 1023) // 1024, 1)
-        reader = self.reader
-        if (
-            reader is not None
-            and not torch.cuda.is_current_stream_capturing()
-            and reader.reads(offset)
-        ):
-            # The scatter reads the arena written above through its device
-            # address: no H2D. The owner's reuse event, recorded after the
-            # launch (the reader's, when it takes it), fences the arena as it
-            # fences the copy.
-            if reader.take(self, self.host_arena.data_ptr(), largest):
-                return True
-            if self.kernel is not None:
-                self.kernel[grid](self.host_arena, self.destinations)
-                return True
-        prefix = self._prefix(offset)
+        prefix = self.prefixes.get(offset)
+        if prefix is None:
+            prefix = self.host[:offset], self.device[:offset]
+            if len(self.prefixes) == 4:
+                del self.prefixes[next(iter(self.prefixes))]
+            self.prefixes[offset] = prefix
         # Header and payload share this single asynchronous H2D.
         prefix[1].copy_(prefix[0], non_blocking=True)
+        grid = (len(self.members), (largest + 1023) // 1024, 1)
         if self.kernel is None:
             self.kernel = self.launch[grid](self.device, self.destinations, BLOCK=1024)
         else:
@@ -153,19 +90,3 @@ class PackedCopy:
             # binding. Reuse its compiled kernel; counts and grid stay dynamic.
             self.kernel[grid](self.device, self.destinations)
         return True
-
-    def _prefix(self, offset):
-        prefix = self.prefixes.get(offset)
-        if prefix is None:
-            prefix = self.host[:offset], self.device[:offset]
-            if len(self.prefixes) == 4:
-                del self.prefixes[next(iter(self.prefixes))]
-            self.prefixes[offset] = prefix
-        return prefix
-
-    def read_host_arena(self, reader):
-        """`PublicationGroup.read_host_arena`: the eager launches `reader`
-        accepts read the pinned arena through its device address (one launch
-        a publication, not two) or are recorded by it."""
-        self.host_arena = DeviceAddress(device_address(self.host.data_ptr()))
-        self.reader = reader

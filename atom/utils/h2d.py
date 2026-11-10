@@ -19,26 +19,6 @@ class PublicationError(RuntimeError):
     """A publication violates ownership or asynchronous source lifetime."""
 
 
-class HostArenaReader:
-    """A model's opt-in to zero-copy packed publications, one publication at a
-    time (`PublicationGroup.read_host_arena`).
-
-    Neither applies inside a graph capture, which records the copy as before.
-    """
-
-    def reads(self, nbytes: int) -> bool:
-        """Whether this eager launch of `nbytes` (header and payload) reads the
-        pinned arena through its device address instead of after an H2D."""
-        return False
-
-    def take(self, copy, arena: int, largest: int) -> bool:
-        """Record the scatter of `copy` (a `PackedCopy`) from the host arena at
-        device address `arena` (`largest`: its longest member, in bytes)
-        instead of launching it. True: the reader launches it later on the
-        same stream, before the owner's reuse event."""
-        return False
-
-
 def h2d_producer(*group_names, runner=None):
     """Declare source groups a method writes, checking before its body runs.
 
@@ -462,18 +442,6 @@ class PublicationGroup:
         self._backend, self.fallback_reason = backend, reason
         self.transport = "packed" if backend is not None else "direct"
         return self.transport
-
-    def read_host_arena(self, reader: HostArenaReader) -> bool:
-        """Opt this publication into `reader` (`HostArenaReader`) at
-        initialization: its eager launches the reader accepts read the pinned
-        arena in place, or are recorded by it. False (nothing changes) when
-        the group is direct."""
-        if self.owner._state != "idle":
-            raise PublicationError("opt into host-arena reads during initialization")
-        if self._backend is None:
-            return False
-        self._backend.read_host_arena(reader)
-        return True
 
     def after_publish(self, callback):
         """Run ``callback`` once this group's next publish has succeeded."""

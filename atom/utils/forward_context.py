@@ -49,7 +49,7 @@ class AttnState(Enum):
 
 class RoundService(IntEnum):
     """How much of a step the model's decode round takes over
-    (``ModelRunner.decode_round``, ``model_engine.model_hooks.DecodeRound``):
+    (``model_engine.model_hooks.DecodeRound``, the attention builder's):
     ``AttentionMetaData.served_by_round``, decided once a step by the attention
     builder (``DecodeRound.service``). Each level includes the ones below it;
     ``NONE`` (falsy) is every other step.
@@ -61,7 +61,7 @@ class RoundService(IntEnum):
       planners: the builder lays it out without them.
     - ``DEVICE``: its positions are advanced on the device from the previous
       verdict: no state probe, and the host builds it as if no draft had been
-      rejected.
+      rejected (``AttentionMetadataBuilder.consumes_device_verdict``).
     """
 
     NONE = 0

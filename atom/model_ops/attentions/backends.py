@@ -183,6 +183,16 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         rank answers alike, and `ForwardMode.decide` agrees it across DP."""
         return False
 
+    def consumes_device_verdict(self, batch: ScheduledBatch, max_seqlen_q: int) -> bool:
+        """True when this step's metadata advances from the previous verify's
+        verdict on the device, not from its host-side status (the rejected /
+        bonus counts): the runner then builds the step as if no draft had been
+        rejected and waits for that status only after the target's launch
+        (`tokenIDProcessor.prepare_input_ids`' `defer_spec_status`). Asked
+        once a step, before its input ids, from the batch and the forwards
+        before it, alike on every TP rank."""
+        return False
+
     def close(self):
         """Release backend-owned host workers and mapped resources."""
         self.release_kv_pools()

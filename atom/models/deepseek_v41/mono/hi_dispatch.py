@@ -11,13 +11,13 @@ unless ``hi_gate.decide`` says yes.
 - ``HiDecodeModel``: the forwards the builder's routing decision gives the hook (``AttentionMetaData.served_by_round``,
   ``round.HiRound.service``) run every decoder layer on hi (``HiDecodeModel._hi_forward``); every other forward takes
   ATOM's path as before (a decode step ATOM's K1 / K2, their runner created on the first such step only) and
-  invalidates the hook's incremental import for its requests. Its ``verify_head`` (``round.verify_head.HiVerifyHead``):
-  a served verify step's ids come from the head inside the forward instead of the logits; its ``decode_round``
-  (``round.HiRound``): the host work of the decode round (``model_engine.model_hooks``).
+  invalidates the hook's incremental import for its requests. Its head output (``compute_head``): a served verify
+  step's output ids and verdict from the head and the post-verify inside the forward, which the runner takes instead
+  of the logits where they stand for the step.
 - ``HiDraftModel``: the DSpark draft's block draft on the hi path (``block_backbone``); its context-KV write on a
   served step is the target forward's (the proposer skips ATOM's on such a step).
-- the token embedding's shards read in place across the ranks (``embed_full``) and ATOM's Engram staging skipped on
-  served steps (``HiLayers.use_host_tables``).
+- the decode round (``round.HiRound``) for V4.1's metadata builder (``use_decode_round``): the routing decision, the
+  device round, the commit; ATOM's Engram staging skipped on served steps (``HiLayers.use_host_tables``).
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ import torch
 from torch import nn
 
 from atom.models.deepseek_v41.mono import hi_runner
-from atom.models.deepseek_v41.mono.round import embed_full
 from atom.models.deepseek_v41.mono import round as hi_round
 from atom.models.deepseek_v41.mono.dispatch import (
     MonoDecodeModel,
@@ -60,7 +59,8 @@ class HiDecodeModel(MonoDecodeModel):
         rows = input_ids.numel()
         supported = step_supported(input_ids, inputs_embeds, self._dp_ranks)
         hook = self._hi
-        hook.head_rows = 0  # set again by a step whose verify head ran
+        # set again by a step whose post-verify ran (``compute_head``)
+        hook.verified = 0
         fwd = get_forward_context()
         metadata = fwd.attn_metadata
         if metadata is not None and metadata.served_by_round:
@@ -98,16 +98,23 @@ class HiDecodeModel(MonoDecodeModel):
             raise MonoUnsupported("packed KV cache")
         hook.served_widths.add(rows)
         # Every layer runs on the hi path: ATOM's mailboxes and K1 / K2 step metadata have no reader on this step
-        # (``lean_host``). The begin-step looks the rows up itself in the embedding's shards; the forward's boundary op,
-        # which reads only the rows' count, gets a shape-only stand-in.
-        model.begin_forward(hook.no_embedding[:, :rows], None)
+        # (``lean_host``). The begin-step expands ATOM's embedding rows into layer 0's streams.
+        hidden_in = model.embed(input_ids)
+        model.begin_forward(hidden_in.view(1, rows, -1), None)
         # Engram staging's side-stream all-gather spins on CUs until every rank joins it: beside a kernel that needs
         # every CU resident it deadlocks, so it ends before the first one
         rows_staged = metadata.engram_embeddings
         if getattr(rows_staged, "stage", None) is not None:
             rows_staged.join()
         # the embedding streams in layer 0's input, the cache import, the Engram token-only halves
-        hook.begin_step(cache, step, rows, staged=rows_staged, input_ids=input_ids)
+        hook.begin_step(
+            cache,
+            step,
+            rows,
+            hidden_in.view(rows, -1),
+            staged=rows_staged,
+            input_ids=input_ids,
+        )
         for spec in model.topology:
             hook.layer(spec.layer_id, rows)
         # the cache export, the DSpark taps, ATOM's collapse into this forward's output rows; the draft's context
@@ -118,15 +125,11 @@ class HiDecodeModel(MonoDecodeModel):
         model.end_forward(hidden, None)
         return hidden.squeeze(0)
 
-    @property
-    def decode_round(self):
-        """The decode round's host work at ``ModelRunner``'s hooks (``round.HiRound``)."""
-        return self._hi.round
-
-    @property
-    def verify_head(self):
-        """The model-side verify head ``ModelRunner`` takes a served verify's ids from (``round.verify_head``)."""
-        return self._hi.verify_head
+    def compute_head(self, hidden_states):
+        """The head output of the forward that just ran (``ModelRunner._head_output``, recorded with a captured one):
+        on a step the hook served, its in-graph verify's output ids and verdict (``round.post_verify``); else None
+        (the runner computes the logits)."""
+        return self._hi.head_output(hidden_states.shape[0])
 
 
 class HiDraftModel(MonoDraftModel):
@@ -148,6 +151,8 @@ class HiDraftModel(MonoDraftModel):
             hook.draft_run(
                 metadata.cache,
                 input_ids,
+                # ATOM's embedding rows of the anchors (as its own block draft looks them up)
+                self.model.embed(input_ids.view(-1)),
                 positions,
                 metadata.state_slot_out[:requests],
                 self.model._noise_embedding(),
@@ -175,9 +180,9 @@ def install_hi(
     model: nn.Module, atom_config, drafter, metadata_builder, dp_ranks: int
 ) -> nn.Module:
     """``model`` wrapped for the hi hook (and ``drafter``'s draft model for its draft), on a deployment the hi path
-    serves (``hi_gate.decide``). Collective (the agreement, the embedding's exchange, the hook's peer groups): every
-    rank calls it at the same point. First every refusal this rank's loaded model gives (``hi_runner.check``: its
-    weights, embedding, Engram host shards), before anything collective or allocated, its verdict agreed over the TP
+    serves (``hi_gate.decide``). Collective (the agreement, the hook's peer groups): every rank calls it at the same
+    point. First every refusal this rank's loaded model gives (``hi_runner.check``: its weights, Engram host shards),
+    before anything collective or allocated, its verdict agreed over the TP
     group (``consensus.tp_uniform_local_validation``): every rank builds, or every rank raises ``MonoUnsupported``
     naming the ranks that refused (``dispatch.install_mono_decode`` falls back under "auto") with nothing built, the
     draft model left as it was."""
@@ -197,39 +202,30 @@ def install_hi(
     except MonoUnsupported as agreed:
         raise agreed from refused
     try:
-        return _install_hi(
-            model, atom_config, drafter, metadata_builder, dp_ranks, group
-        )
+        return _install_hi(model, atom_config, drafter, metadata_builder, dp_ranks)
     except MonoUnsupported:
         drafter.model = draft
         raise
 
 
 def _install_hi(
-    model, atom_config, drafter, metadata_builder, dp_ranks: int, group
+    model, atom_config, drafter, metadata_builder, dp_ranks: int
 ) -> nn.Module:
     engram = metadata_builder.engram
-    # the token embedding's shards read in place from the rank holding a row (no all-reduce a lookup, no copy of
-    # the table): the begin-step's and the draft's begin kernel's lookups. First: its read check is the build's one
-    # refusal (agreed), and nothing else is built before it
-    embed = embed_full.install(model, group)
     # the hi runtime's layers for every layer: weights (packed from the target's and the draft's loaded tensors),
     # kernels and peer groups bound here, before the KV cache is sized (the Engram table lookup's hash constants from
     # ATOM's own hash mapping)
     hook = hi_runner.install(model, atom_config, engram.mapping, drafter.model)
-    runner = metadata_builder.model_runner
-    hook.runner = runner
-    hook.embed = embed
+    hook.runner = metadata_builder.model_runner
     if hook.eng:
         # the Engram lookup from ATOM's host shards, its staging skipped on served steps
         hook.use_host_tables(engram.host, engram.host.overlap)
     # the draft's context write and block draft on the hi path
     drafter.model = HiDraftModel(drafter.model, dp_ranks, hook)
     hook.bind_draft(drafter)
-    # the round's host work (``HiDecodeModel.decode_round``): the routing decision with lean host prep on the steps it
-    # serves, the device-side round advance on top of it, the verdict / Engram commit inside the target graph, the
-    # served decode steps' publications reading their pinned arenas directly
-    hi_round.install(hook, metadata_builder, runner)
+    # the round's host work at the builder's points (``round.HiRound``): the routing decision with lean host prep on the
+    # steps it serves, the device-side round advance on top of it, the verdict / Engram commit inside the target graph
+    metadata_builder.use_decode_round(hi_round.install(hook, metadata_builder))
     return HiDecodeModel(
         model,
         drafter,

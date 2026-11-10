@@ -8,8 +8,8 @@ interpreter, no GPU.
 - [5]: the fused begin-step / end-step launches == those separate launches (and the Engram segments);
 - [8]: the incremental ring import == the full import over a scripted run;
 - [10]: the bridge at B requests a step and on the batch bands' slots, the block draft's begin kernel;
-- [ef] / [vf] / [pv] / [gf]: the Engram fold, the one-launch verdict, the in-graph post-verify and the glue folds
-  against ATOM's own launches (these need AITER: they skip without it).
+- [ef] / [vf] / [pv] / [gf]: the Engram fold, the verdict reference, the in-graph post-verify (the forward's head
+  output) and the glue folds against ATOM's own launches (these need AITER: they skip without it).
 
 The interpreter's sections need Triton's interpreter from the start (minutes):
 
@@ -1282,8 +1282,8 @@ def check_engram_fold():
     )
 
 
-def _verdict_launch(hv, rs, spec, head_ids, sampler, uniform=None, seed=None):
-    """``head_verdict._head_verdict_kernel`` as the reference's ``_launch`` drove it: ``uniform``, the step's uniforms
+def _verdict_launch(rs, spec, head_ids, sampler, uniform=None, seed=None):
+    """The verdict reference (``mono_hi_bridge_ref._head_verdict_kernel``) on a step: ``uniform``, the step's uniforms
     (ATOM's), else drawn in the kernel from the sampler's step (``seed``: another seed, the post-verify's).
     """
     cu = spec.cu_num_draft_tokens
@@ -1293,7 +1293,7 @@ def _verdict_launch(hv, rs, spec, head_ids, sampler, uniform=None, seed=None):
     rates = sampler.synthetic_acceptance_rates
     synthetic = rates is not None
     cond = rs._get_synthetic_cond_rates(rates, dev) if synthetic else out
-    hv._head_verdict_kernel[(nreq,)](
+    ml._head_verdict_kernel[(nreq,)](
         out, verdict, cu, spec.input_ids, spec.target_logits_indices, spec.bonus_logits_indices, head_ids,
         uniform if uniform is not None else out, cond,
         rs._SYNTHETIC_RNG_BASE_SEED + int(sampler._synthetic_step) if seed is None else seed, steps,
@@ -1304,14 +1304,13 @@ def _verdict_launch(hv, rs, spec, head_ids, sampler, uniform=None, seed=None):
     return out, verdict
 
 
-def check_head_verdict():
-    """[vf] The one-launch verdict (``head_verdict``) against ATOM's path (the two ``index_select``,
-    ``RejectionSampler.forward``) on scripted steps of 1-4 requests with 0-5 drafts each
+def check_verdict_reference():
+    """[vf] The verdict reference the in-graph post-verify is checked against (``_verdict_launch``) against ATOM's path
+    (the two ``index_select``, ``RejectionSampler.forward``) on scripted steps of 1-4 requests with 0-5 drafts each
     (head ids agreeing with the drafts up to a random row): real acceptance bit for bit; forced acceptance on ATOM's own
-    uniforms bit for bit, the step counter advanced alike; with the uniforms drawn in the kernel (``verdict``), the same
-    on a re-run (the same seed: TP-uniform), the schedule's certain positions as ATOM's and the fractional one accepted
-    at its rate."""
-    hv = importlib.import_module("atom.models.deepseek_v41.mono.round.head_verdict")
+    uniforms bit for bit, the step counter advanced alike; with the uniforms drawn in the kernel, the same on a re-run
+    (the same seed: TP-uniform), the schedule's certain positions as ATOM's and the fractional one accepted at its
+    rate."""
     rs = importlib.import_module("atom.model_ops.rejection_sampler")
     dev = torch.get_default_device()
     g = torch.Generator(device="cpu").manual_seed(11)
@@ -1353,12 +1352,18 @@ def check_head_verdict():
         )
 
     steps = [[5], [5], [3], [0], [5, 5], [2, 5, 0], [5, 4, 3, 1], [1, 1, 1, 1]] * 4
-    got = {"real": True, "forced, ATOM's uniforms": True, "drawn: re-run equal": True, "drawn: certain rows": True,
-           "verdict == the kernel's own draw": True}  # fmt: skip
+    got = {
+        "real": True,
+        "forced, ATOM's uniforms": True,
+        "drawn: re-run equal": True,
+        "drawn: certain rows": True,
+    }
     real = rs.RejectionSampler(None)
     for d in steps:
         meta, head = scenario(d)
-        got["real"] &= same(atom(meta, head, real), hv.verdict(meta, head, real))
+        got["real"] &= same(
+            atom(meta, head, real), _verdict_launch(rs, meta, head, real)
+        )
     rates = rs.acceptance_length_to_rates(3.51, 5)
     fa, fb = rs.RejectionSampler(rates), rs.RejectionSampler(rates)
     frac = [0, 0]
@@ -1366,18 +1371,14 @@ def check_head_verdict():
         meta, head = scenario(d)
         u = torch.rand(meta.target_logits_indices.shape[0], dtype=torch.float32, device=dev,
                        generator=rs._synthetic_generator(dev).manual_seed(rs._SYNTHETIC_RNG_BASE_SEED + fa._synthetic_step))  # fmt: skip
-        f = _verdict_launch(hv, rs, meta, head, fb, u)
+        f = _verdict_launch(rs, meta, head, fb, u)
         got["forced, ATOM's uniforms"] &= (
             same(atom(meta, head, fa), f) and fa._synthetic_step == fb._synthetic_step
         )
         fb._synthetic_step -= 1
-        dr = hv.verdict(meta, head, fb)
+        dr = _verdict_launch(rs, meta, head, fb)
         fb._synthetic_step -= 1
-        got["drawn: re-run equal"] &= same(dr, hv.verdict(meta, head, fb))
-        fb._synthetic_step -= 1
-        got["verdict == the kernel's own draw"] &= same(
-            dr, _verdict_launch(hv, rs, meta, head, fb)
-        )
+        got["drawn: re-run equal"] &= same(dr, _verdict_launch(rs, meta, head, fb))
         acc = dr[1][0].cpu()
         for r, n in enumerate(d):
             # positions 0, 1 always accepted (rate 1), 3+ never; position 2 at 0.51 (of those reaching it)
@@ -1392,7 +1393,7 @@ def check_head_verdict():
         abs(rate - 0.51) < 0.12
     )
     report(
-        "[vf] verdict in one launch: == ATOM's selects + rejection (real, forced on ATOM's uniforms); "
+        "[vf] verdict reference: == ATOM's selects + rejection (real, forced on ATOM's uniforms); "
         "in-kernel draws TP-uniform at the schedule's rates",
         all(got.values()),
         f"({got})",
@@ -1401,12 +1402,12 @@ def check_head_verdict():
 
 def check_post_verify():
     """[pv] The in-graph post-verify kernel (``_post_verify_kernel`` through ``PostVerify.launch`` on stand-ins of the
-    hook, cache and step) against the eager path it replaces: the one-launch verdict on the same seed and Engram's
-    ``_commit_cursors``, at 1-4 requests of 6 rows (real and forced acceptance, head ids agreeing with the drafts up to
-    a random row); the seed from the hook's step counter; ``serves`` declines a ragged verify or an unlaunched width;
-    ``take`` advances the sampler's step; the commit skips a taken step's launch and runs ATOM's otherwise.
+    hook, cache and step) against the eager path it replaces: the verdict (ATOM's rejection sampler with real
+    acceptance; the verdict reference on the same seed with forced acceptance) and Engram's ``_commit_cursors``, at 1-4
+    requests of 6 rows (head ids agreeing with the drafts up to a random row); the seed from the hook's step counter;
+    the outputs are the forward's head output (``output``); the commit skips its launch at the outputs' own anchors
+    and runs ATOM's at any other.
     """
-    hv = importlib.import_module("atom.models.deepseek_v41.mono.round.head_verdict")
     pvm = importlib.import_module("atom.models.deepseek_v41.mono.round.post_verify")
     rs = importlib.import_module("atom.model_ops.rejection_sampler")
     spec_mod = importlib.import_module(
@@ -1457,43 +1458,44 @@ def check_post_verify():
             pv.launch(hook, cache, step, nb * rq)
             got["seed from the step counter"] &= int(pv.used_seed) == seed0
             b = pv.bufs[nb * rq]
-            # the eager path: the one-launch verdict on the same seed, ATOM's commit
+            # the eager path: ATOM's verdict (forced: the reference on the same seed), ATOM's commit
             sampler = rs.RejectionSampler(rates)
-            out, vd = _verdict_launch(hv, rs, meta, hook.head_ids, sampler, seed=seed0)
+            if rates is None:
+                t = torch.index_select(hook.head_ids, 0, meta.target_logits_indices)
+                bonus = torch.index_select(hook.head_ids, 0, meta.bonus_logits_indices)
+                logits = torch.nn.functional.one_hot(t.long(), vocab).float()
+                out, vd = sampler.forward(meta, logits, bonus, target_token_ids=t)
+            else:
+                out, vd = _verdict_launch(rs, meta, hook.head_ids, sampler, seed=seed0)
             cur = cur0.clone()
             st = cache.tentative_staging.gpu
             spec_mod._commit_cursors[(nb,)](cur, st, vd[2], step.cu_seqlens_q[:nb], step.slots, cur.stride(0),
                                             st.stride(0), st.stride(1), WIDTH=W, BLOCK=4)  # fmt: skip
             got["graph == eager"] &= (torch.equal(b["out"], out) and torch.equal(b["verdict"], vd)
                                       and torch.equal(cache.cursor, cur))  # fmt: skip
-    # serves / take
+    # the head output and the commit
     hook, cache, step, meta = world(2, None)
     pv = pvm.PostVerify([12, 6], {12: (2, 6), 6: (1, 6)}, dev)
     pv.launch(hook, cache, step, 12)
-    got["serves the launched width"] = pv.serves(meta, hook.head_ids) == 12
-    got["declines a ragged verify"] = pv.serves(SimpleNamespace(**{**vars(meta), "num_draft_tokens_np": np.array([5, 4])}),
-                                                hook.head_ids) is None  # fmt: skip
-    got["declines an unlaunched width"] = pv.serves(meta, hook.head_ids[:6]) is None
-    smp = rs.RejectionSampler(rs.acceptance_length_to_rates(3.51, 5))
-    out = pv.take(12, smp)
-    got["take: the width's outputs, the sampler's step advanced"] = (
-        out[0] is pv.bufs[12]["out"] and smp._synthetic_step == 1
+    out, vd = pv.output(12)
+    got["the width's outputs are the head output"] = (
+        out is pv.bufs[12]["out"] and vd is pv.bufs[12]["verdict"]
     )
-    # the commit: a step that took the in-graph results launches none (the tentative state released as
-    # ``commit_tentative`` releases it); any other step: ATOM's
+    # the commit: at the outputs' anchors (the runner took them) none is launched (the tentative state released as
+    # ``commit_tentative`` releases it); at any other anchors: ATOM's
     st = SimpleNamespace()
     pending = SimpleNamespace(step=st, staged_on_device=True)
     md = SimpleNamespace(cache=SimpleNamespace(pending=pending), step=st)
     got["taken step: no commit, pending released"] = (
-        pv.committed(md) and md.cache.pending is None
+        pv.committed(md, vd[2]) and md.cache.pending is None
     )
     md.cache.pending = pending
-    got["other step: ATOM's commit"] = (
-        not pv.committed(md) and md.cache.pending is pending
+    got["other anchors: ATOM's commit"] = (
+        not pv.committed(md, vd[2].clone()) and md.cache.pending is pending
     )
     report(
-        "[pv] post-verify in the graph: == the one-launch verdict + commit (1-4 requests, real / forced); serves / "
-        "take; the commit's skip",
+        "[pv] post-verify in the graph: == ATOM's verdict + commit (1-4 requests, real; forced on the reference's "
+        "draws); the head output; the commit's skip",
         all(got.values()),
         f"({got})",
     )
@@ -1547,10 +1549,11 @@ def check_post_verify_pad(pad_slot: int):
 
 
 def check_glue_folds():
-    """[gf] The begin-step's expand row with its own lookup (``_expand_row``, EMB: each id's row read from the shard
-    holding it, two shards here) == ATOM's lookup (``_masked_embedding_launcher`` over the full table) expanded to
-    every stream, bit for bit, ids in range, at the edges and outside it (-1, V, V + 3: zero rows). The end-step's collapse blocks (``_collapse_chunk``, fp fusion off as the end-step launches it) == ATOM's
-    ``collapse_streams`` on the same streams and pre-mix, bit for bit (and whether fused multiply-adds would differ).
+    """[gf] The begin-step's expand row (``_expand_row``) of ATOM's lookup (``_masked_embedding_launcher``, ids in
+    range, at the edges and outside it: -1, V, V + 3, zero rows) == ATOM's ``from_embeddings`` (every stream the row),
+    bit for bit. The end-step's collapse blocks (``_collapse_chunk``, fp fusion off as the end-step launches it) ==
+    ATOM's ``collapse_streams`` on the same streams and pre-mix, bit for bit (and whether fused multiply-adds would
+    differ).
     """
     eh = importlib.import_module("atom.model_ops.embed_head")
     mhc = importlib.import_module("atom.model_ops.deepseek_v41.mhc")
@@ -1562,14 +1565,10 @@ def check_glue_folds():
                        dtype=torch.int32, device=dev)  # fmt: skip
     want = eh._masked_embedding_launcher(ids, table, 0, V)
     h_in = torch.full((rows, NHC, H), 7.0, dtype=torch.bfloat16, device=dev)
-    per = V // 2
-    shards = torch.tensor(
-        [table.data_ptr(), table[per:].data_ptr()], dtype=torch.int64, device=dev
-    )
     ml._expand_rows_kernel[(rows,)](
-        shards, table.stride(0), h_in, ids, V, per, HIDDEN=H, BLOCK=1024, NHC=NHC, EMB=1
+        want, want.stride(0), h_in, HIDDEN=H, BLOCK=1024, NHC=NHC
     )
-    got = {"embedding lookup == ATOM's masked lookup, every stream": torch.equal(h_in, want.unsqueeze(1).expand_as(h_in)),
+    got = {"embedding expand == ATOM's lookup, every stream": torch.equal(h_in, want.unsqueeze(1).expand_as(h_in)),
            "ids outside the table: zero rows": not h_in[2:5].any()}  # fmt: skip
     gate = torch.rand(rows, 24, generator=g, device="cpu").to(dev)
     res = (
@@ -1584,7 +1583,7 @@ def check_glue_folds():
     ml._collapse_rows_kernel[(rows, H // 1024)](
         gate, res, fused, HIDDEN=H, BLOCK=1024, NHC=NHC, NMIX=24
     )
-    report("[gf] glue folds: the begin-step's own embedding lookup == ATOM's; the end-step's collapse == ATOM's",
+    report("[gf] glue folds: the begin-step's embedding expand == ATOM's; the end-step's collapse == ATOM's",
            all(got.values()), f"({got}; with fp fusion on the collapse would differ on "
                               f"{int((fused != ref).any(-1).sum())} of {rows} rows)")  # fmt: skip
 
@@ -1671,8 +1670,8 @@ def test_engram_fold(on_gpu):
     _run(check_engram_fold)
 
 
-def test_head_verdict(on_gpu):
-    _run(check_head_verdict)
+def test_verdict_reference(on_gpu):
+    _run(check_verdict_reference)
 
 
 def test_post_verify(on_gpu):

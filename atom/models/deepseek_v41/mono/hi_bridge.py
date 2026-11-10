@@ -267,36 +267,21 @@ def _planar(j, gate, pre, post, comb, NMIX: tl.constexpr, NHC: tl.constexpr):
 
 
 @triton.jit
-def _shard_row(shards, tok, emb_rows, emb_per, stride):
-    """ATOM's embedding row of id ``tok`` in the TP shards, read in place on the rank that holds it (``shards``: int64
-    [tp], each rank's shard of ``emb_per`` rows, its address on this GPU: ``round.embed_full``) -> (the row's
-    pointer, hit). An id outside [0, ``emb_rows``) is ATOM's masked lookup's zero row (``hit`` False).
-    """
-    hit = (tok >= 0) & (tok < emb_rows)
-    tok = tl.where(hit, tok, 0)
-    q = tok // emb_per
-    base = tl.load(shards + q).to(tl.pointer_type(tl.bfloat16))
-    return base + (tok - q * emb_per) * stride, hit
-
-
-@triton.jit
-def _expand_row(j, hidden, hidden_stride, h_in, emb_ids, emb_rows, emb_per, HIDDEN: tl.constexpr,
-                BLOCK: tl.constexpr, NHC: tl.constexpr, EMB: tl.constexpr):  # fmt: skip
+def _expand_row(
+    j,
+    hidden,
+    hidden_stride,
+    h_in,
+    HIDDEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NHC: tl.constexpr,
+):
     """Row j of the embedding expand into layer 0's ``h_in`` [rows, NHC, HIDDEN] (``from_embeddings``): ATOM's
-    embedding row ``hidden[j]``, or (``EMB``, the hook's served path) the row of ``emb_ids[j]`` read here from the
-    rank holding it (``hidden``: the shards' addresses, ``_shard_row``), as ATOM's masked lookup and its all-reduce
-    give it."""
-    if EMB:
-        tok = tl.load(emb_ids + j).to(tl.int64)
-        src, hit = _shard_row(hidden, tok, emb_rows, emb_per, hidden_stride)
-    else:
-        src = hidden + j * hidden_stride
+    embedding row ``hidden[j]``."""
+    src = hidden + j * hidden_stride
     for o in range(0, HIDDEN, BLOCK):
         d = o + tl.arange(0, BLOCK)
-        if EMB:
-            v = tl.load(src + d, mask=hit & (d < HIDDEN), other=0.0)
-        else:
-            v = tl.load(src + d)
+        v = tl.load(src + d)
         for c in range(NHC):
             tl.store(h_in + (j * NHC + c) * HIDDEN + d, v)
 
@@ -338,27 +323,18 @@ def _tap(j, r_a, aux, HIDDEN: tl.constexpr, BLOCK: tl.constexpr, NHC: tl.constex
 
 @triton.jit
 def _draft_begin_kernel(anchor, noise, h_in, anchor_positions, pos, step, hidden, max_pos, NHC: tl.constexpr,
-                        BLOCK: tl.constexpr, BUMP: tl.constexpr = 1, ids=None, emb_rows=0, emb_per=1,
-                        EMB: tl.constexpr = 0):  # fmt: skip
+                        BLOCK: tl.constexpr, BUMP: tl.constexpr = 1):  # fmt: skip
     """The hi block draft's inputs (one request): row r of the block's streams =
-    the anchor's embedding (r = 0) or the noise token's, in each of the ``NHC`` streams (``build_block_state``'s);
-    program (0, 0) also writes the block's first position (anchor + 1, int32), clamped to [0, max_pos] as the
-    target's first position is (``_request``: a capture's dummy or a stale anchor reads in-range RoPE rows; every
-    real position is below it, so the same bits), and (``BUMP``) bumps the draft's launch-tag step (a draft of B
-    requests in one launch set: once, with its first request). ``EMB`` (the hook's served path):
-    ``anchor`` is the embedding shards' address table and the anchor's row ``ids[0]`` is read here from the rank
-    holding it (``_shard_row``: an id outside [0, ``emb_rows``) a zero row, as ATOM's masked lookup).
+    the anchor's embedding (r = 0: ``anchor``, ATOM's embedding row) or the noise token's, in each of the ``NHC``
+    streams (``build_block_state``'s); program (0, 0) also writes the block's first position (anchor + 1, int32),
+    clamped to [0, max_pos] as the target's first position is (``_request``: a capture's dummy or a stale anchor reads
+    in-range RoPE rows; every real position is below it, so the same bits), and (``BUMP``) bumps the draft's
+    launch-tag step (a draft of B requests in one launch set: once, with its first request).
     """
     r = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     m = offs < hidden
-    if EMB:
-        src, hit = _shard_row(
-            anchor, tl.load(ids).to(tl.int64), emb_rows, emb_per, hidden
-        )
-        a = tl.load(src + offs, mask=m & hit, other=0.0)
-    else:
-        a = tl.load(anchor + offs, mask=m, other=0.0)
+    a = tl.load(anchor + offs, mask=m, other=0.0)
     v = tl.where(r == 0, a, tl.load(noise + offs, mask=m, other=0.0))
     for j in tl.static_range(NHC):
         tl.store(h_in + (r * NHC + j) * hidden + offs, v, mask=m)
@@ -455,15 +431,13 @@ def _begin_step_kernel(
     NB: tl.constexpr = 1, BM: tl.constexpr = 1, RQP: tl.constexpr = 1,
     fold_ids=None, fold_dst=None, fold_tmap=None, fold_dead=None, fold_cand=None, fold_cand_stride=0,
     fold_live=None, hist_stride=0, fold_cand_req_stride=0, EFOLD: tl.constexpr = 0, RPOW: tl.constexpr = 16,
-    emb_ids=None, emb_rows=0, emb_per=1, EMB: tl.constexpr = 0,
 ):  # fmt: skip
     """Grid NMF * NB * RP + rows + NE0 + NE1 + EHIST:
     the ring import of each of the step's ``NB`` requests (and its pos /
     bounds; program (0, b, 0) also request b's words, ``_req_words``), a row
     each of the embedding expand
-    into layer 0's ``h_in`` (``SinglePassHCState.from_embeddings``; ``EMB``: the
-    row looked up in the token embedding's shards by ``emb_ids``, ATOM's
-    masked lookup: an id outside [0, ``emb_rows``) is a zero row), then the
+    into layer 0's ``h_in`` (``SinglePassHCState.from_embeddings``; ``hidden``:
+    ATOM's embedding rows), then the
     Engram inputs: a row each of ATOM's staged
     rows of the two Engram layers (``_eng_row``; NE* = rows, or 0), and
     (EHIST = the step's requests, the table lookup) each request's history from ATOM's cursor
@@ -499,17 +473,7 @@ def _begin_step_kernel(
             _dead_words(req, pos_out, rows, NB, BM)
     elif pid < n5:
         _expand_row(
-            (pid - n0).to(tl.int64),
-            hidden,
-            hidden_stride,
-            h_in,
-            emb_ids,
-            emb_rows,
-            emb_per,
-            HIDDEN,
-            BLOCK,
-            NHC,
-            EMB,
+            (pid - n0).to(tl.int64), hidden, hidden_stride, h_in, HIDDEN, BLOCK, NHC
         )
     elif pid < n5 + NE0:
         _eng_row(pid - n5, e0_src, e0_src_stride, e0_dst, KIN, BLOCK)

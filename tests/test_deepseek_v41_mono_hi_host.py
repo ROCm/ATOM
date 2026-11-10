@@ -5,13 +5,13 @@ sampler, metadata builder, cache and proposer: no GPU, no hi, no aiter. The devi
 Triton interpreter; the parts that load a module with Triton kernels (the device round, the post-verify) skip without
 Triton, the rest (the routing decision, the lean host prep, the gate's import guard) run without it.
 
-- the step's routing decision (``HiRound.service``: ``AttentionMetaData.served_by_round``) and the lean host prep's
-  predicate (``lean_host``);
-- the device round (``device_round``): the advance kernel, its predicates and its hooks (``hi_round``) in forward
-  order, the first step after a prefill;
-- the post-verify's routing (``post_verify``) and ATOM's Engram staging on served steps
-  (``EngramStep.served_by_round``);
-- the install's refusals (``hi_dispatch``) and the flag's guard: no ``hi`` import without it.
+- the step's routing decision (``HiRound.service``: ``AttentionMetaData.served_by_round``), a served step's sampling
+  rows for the verify head, and the lean host prep's predicate (``lean_host``);
+- the device round (``device_round``): the advance kernel, its predicates and the builder's points (``hi_round``) in
+  forward order around ATOM's token processor (its deferred status wait), the first step after a prefill;
+- the post-verify as the forward's head output and the commit it makes (``post_verify``), and ATOM's Engram staging
+  on served steps (``EngramStep.served_by_round``);
+- the flag's guard: no ``hi`` import without it.
 """
 
 import ast
@@ -276,6 +276,46 @@ def test_service_is_the_steps_one_routing_decision():
     assert hook.lean_steps == 1
 
 
+def test_a_served_step_publishes_its_sampling_rows():
+    """``HiRound.service`` publishes a served step's rows' (T, top_p), request by request on its rows, for the verify
+    head (``HiLayers.set_head_sampling``, with the step's metadata); a greedy step after a sampled one sets the rows
+    back to greedy once; a greedy step, a capture's (no sampling rows) and a step the hook does not serve stage
+    nothing. Pure Python (no Triton)."""
+    from atom.models.deepseek_v41.mono.round import HiRound
+
+    staged = []
+
+    def set_head_sampling(temps=None, top_ps=None, rows=None):
+        staged.append(
+            None if temps is None else (temps.tolist(), top_ps.tolist(), rows.tolist())
+        )
+        return True
+
+    hook = _ServingHook(runs_every_layer=True, lean_host=False, served_widths={6}, lean_steps=0, plan={},
+                        split={6: (1, 6), 12: (2, 6)}, set_head_sampling=set_head_sampling)  # fmt: skip
+    rnd = HiRound(hook)
+    span = SimpleNamespace(request_id=7, length=6)
+
+    def step(temps=None, prefill=False, bs=1):
+        batch = SimpleNamespace(is_dummy_run=False, multimodal_data={})
+        if temps is not None:
+            batch.temperatures = np.asarray(temps, dtype=np.float32)
+            batch.top_ps = np.full(len(temps), 0.9, dtype=np.float32)
+            batch.num_scheduled_tokens = np.full(len(temps), 6, dtype=np.int32)
+        return rnd.service(batch, (span,) * bs, bs, 6 * bs, max_q_len=6, decode=not prefill, tentative=not prefill,
+                           is_prefill=prefill, resumes=None, image_rows=False)  # fmt: skip
+
+    assert step([0.0]) and staged == []
+    assert step() and staged == []  # (a capture's step: no sampling rows)
+    assert step([0.7, 0.5], bs=2)
+    ((temps, top_ps, rows),) = staged
+    assert temps == pytest.approx([0.7, 0.5]) and top_ps == pytest.approx([0.9, 0.9])
+    assert rows == [6, 6]
+    assert not step([0.7], prefill=True) and len(staged) == 1
+    assert step([0.0]) and staged[-1] is None
+    assert step([0.0]) and len(staged) == 2
+
+
 def test_lean_attributes_keep_one_meaning_each():
     """The hook's lean attributes through the code that writes them after ``HiLayers.__init__``: ``lean_host.install``
     turns ``lean_host`` on, ``HiRound.laid_out`` counts a lean or device-round step in ``lean_steps``; neither touches
@@ -299,20 +339,22 @@ def test_lean_attributes_keep_one_meaning_each():
 
 @pytest.mark.parametrize("dt", [torch.int64, torch.int32])
 def test_advance_kernel(dr, dt):
-    """start + 1 + accepted + i for every accepted count 0..5, nothing past the rows; at B requests each request from
-    its own start and verdict column."""
+    """start + 1 + accepted + i for every accepted count 0..5, nothing past the rows, accepted read off the verdict's
+    anchor row (request b's: b x rows + accepted); at B requests each request from its own start and anchor.
+    """
     for acc in range(6):
         pos = torch.full((8,), -7, dtype=dt)
         start = torch.tensor([1234], dtype=torch.int32)
         verdict = torch.tensor([[acc], [5 - acc], [acc]], dtype=torch.int32)
-        dr.advance(pos, start, verdict, 6)
+        dr.advance(pos, start, verdict[2], 6)
         assert pos.tolist() == [1235 + acc + i for i in range(6)] + [-7, -7]
     for nb in (2, 3, 4):
         pos = torch.full((nb * 6 + 2,), -7, dtype=dt)
         start = torch.tensor([100 * (b + 1) for b in range(4)], dtype=torch.int32)
         acc = [(b * 2 + 1) % 6 for b in range(nb)]
-        verdict = torch.tensor([acc, [5 - a for a in acc], acc], dtype=torch.int32)
-        dr.advance(pos, start, verdict, 6, nb)
+        anchors = [b * 6 + a for b, a in enumerate(acc)]
+        verdict = torch.tensor([acc, [5 - a for a in acc], anchors], dtype=torch.int32)
+        dr.advance(pos, start, verdict[2], 6, nb)
         want = [100 * (b + 1) + 1 + acc[b] + i for b in range(nb) for i in range(6)]
         assert pos.tolist() == want + [-7, -7]
 
@@ -322,6 +364,7 @@ def _batch(req=7, **over):
         is_dummy_run=False,
         total_seqs_num_prefill=0,
         total_seqs_num=1,
+        total_tokens_num=6,
         num_spec_step=5,
         req_ids=[req],
         multimodal_data={},
@@ -405,73 +448,18 @@ def test_device_round_predicate(dr):
     assert [k for k, args in cases.items() if dr.device_round_step(*args)] == []
 
 
-_ZERO_COPY_SPLIT = {6: (1, 6), 12: (2, 6), 48: (8, 6)}
-
-
-def test_the_token_inputs_read_the_host_arena_on_a_step_the_hook_may_serve(dr):
-    """``may_serve``, before the routing decision: a decode of at most as many requests, of at most as many rows
-    each, as a width of the hook takes. A decode of more requests (ATOM's own path, e.g. bs 16) copies as before.
-    """
-    hook = SimpleNamespace(split=_ZERO_COPY_SPLIT)
-
-    def batch(n=1, **over):
-        return _batch(**{"total_seqs_num": n, "req_ids": list(range(n)), **over})
-
-    assert dr.may_serve(batch(), 6, hook) and dr.may_serve(batch(8), 6, hook)
-    assert dr.may_serve(batch(3), 6, hook)  # (the bs-4 graph's requests)
-    assert dr.may_serve(batch(), 3, hook)  # (a shorter verify in the served bucket)
-    cases = {
-        "bs 9": (batch(9), 6),
-        "bs 16": (batch(16), 6),
-        "prefill": (batch(total_seqs_num_prefill=1), 6),
-        "dummy": (batch(is_dummy_run=True), 6),
-        "longer verify": (batch(), 7),
-        "empty": (batch(0), 6),
-    }
-    assert [k for k, (b, q) in cases.items() if dr.may_serve(b, q, hook)] == []
-    assert not dr.may_serve(batch(), 6, None)
-
-
-def test_the_step_metadata_reads_the_host_arena_on_a_served_step():
-    """``HiRound.service`` hands its decision to the prologue's reader before the step metadata's publication: a
-    served step reads its pinned arena, a decode at a width the hook does not serve (bs 16) copies. Pure Python.
-    """
-    from atom.models.deepseek_v41.mono.round import HiRound
-
-    hook = _ServingHook(lean_host=False, runs_every_layer=True, served_widths={6}, lean_steps=0, plan={},
-                        split=_ZERO_COPY_SPLIT)  # fmt: skip
-    pro = SimpleNamespace(served=[])
-    pro.serve = pro.served.append
-    rnd = HiRound(hook, pro=pro)
-    batch = SimpleNamespace(is_dummy_run=False, multimodal_data={})
-    for bs in (1, 16, 8):
-        spans = (SimpleNamespace(request_id=0, length=6),) * bs
-        rnd.service(batch, spans, bs, bs * 6, max_q_len=6, decode=True, tentative=True, is_prefill=False,
-                    resumes=None, image_rows=False)  # fmt: skip
-    assert pro.served == [True, False, True]
-
-
-class _Recorder:
-    """``prologue.Prologue``'s stand-in: never armed past ``arm``, so the plain advance runs."""
-
-    armed = False
-
-    def __init__(self):
-        self.arms, self.served = [], []
-
-    def arm(self, on, served):
-        self.arms.append(on)
-        self.served.append(served)
-
-
 def _round_world(dr, monkeypatch):
-    """Stand-ins for the runner / token processor / sampler / builder / cache calling the decode round's hooks
-    (``hi_round.HiRound``) where ATOM's do, and ``forward``: one forward as ``ModelRunner.forward`` runs them
-    (prepare_input_ids -> builder (+ the model inputs' probe) -> run_model -> postprocess's sampler).
+    """ATOM's token processor (``tokenIDProcessor.prepare_input_ids`` / ``take_deferred_spec_status``, its staging
+    stubbed) and stand-ins for the sampler, builder and cache around the decode round (``hi_round.HiRound``) at the
+    points ATOM's call it, and ``forward``: one forward as ``ModelRunner.forward`` runs them (prepare_model: the
+    builder's ``consumes_device_verdict`` -> prepare_input_ids -> the builder's layout (+ the model inputs' probe) ->
+    run_model -> the deferred status wait -> postprocess's verdict -> the builder's commit at its anchors).
     """
     from atom.models.deepseek_v41.mono.round import HiRound
 
-    log, queue, served_now, sampler_verdict = [], [], [True], [None]
+    with atom_without_aiter() as load:
+        tip = load("atom.model_engine.model_runner").tokenIDProcessor
+    log, queue, served_now = [], [], [True]
     hook = _ServingHook(
         lean_host=True,
         runs_every_layer=True,
@@ -482,31 +470,19 @@ def _round_world(dr, monkeypatch):
         lean_steps=0,
     )
 
-    rnd = HiRound(hook, device=dr.DeviceRound(hook, _Recorder()))
+    rnd = HiRound(hook, device=dr.DeviceRound(hook))
+    processor = object.__new__(tip)
+    processor.runner = SimpleNamespace(h2d_groups=None)
+    processor.batch_info = SimpleNamespace(np=np.zeros(3, dtype=np.int32))
+    processor.draft_tokens_per_seq = 0
+    processor._stage_input_ids = lambda b, q, group: ("ids", None)
+    processor.prev_batch, processor.spec_status_owed = None, False
 
-    class TP:  # ``tokenIDProcessor.prepare_input_ids``
-        prev_rejected_num = prev_bonus_num = None
+    def recv_spec_status():
+        log.append("recv")
+        return queue.pop(0)
 
-        def recv_spec_status(self):
-            log.append("recv")
-            return queue.pop(0)
-
-        def prepare_input_ids(self, b, max_q, publication_group=None):
-            rnd.before_input_ids(b, max_q)
-            if b.produces_output():
-                status = rnd.spec_status()
-                self.prev_rejected_num, self.prev_bonus_num = (
-                    self.recv_spec_status() if status is None else status
-                )
-            r = self.prev_rejected_num
-            zeros = isinstance(r, np.ndarray) and not r.any()
-            log.append(("ids", f"zeros{len(r)}" if zeros else r))
-            return "ids"
-
-    class Sampler:
-        def forward(self, *a, **kw):
-            log.append("verdict")
-            return "tokens", sampler_verdict[0]
+    processor.recv_spec_status = recv_spec_status
 
     class Cache:  # ``PagedAttentionCache``: a device-round step takes no probe
         cursor = pending = None
@@ -519,65 +495,62 @@ def _round_world(dr, monkeypatch):
 
     cache = Cache()
 
-    class Builder:  # ``_prepare_step``: the routing decision, the layout, then ``laid_out``
-        engram = None
-
-        def _prepare_step(
-            self, b, spans, rows, cache_, running_bs, running_tokens, **kw
-        ):
-            span = SimpleNamespace(request_id=b.req_ids[0], length=6)
-            service = (
-                rnd.service(b, (span,), running_bs, running_tokens, max_q_len=6, decode=True, tentative=True,
-                            is_prefill=False, resumes=None, image_rows=False)  # fmt: skip
-                if served_now[0]
-                else RoundService.NONE
-            )
-            step = SimpleNamespace(
-                positions=torch.zeros(6, dtype=torch.int64),
-                tentative=True,
-                slots=torch.zeros(1, dtype=torch.int32),
-                running_tokens=6,
-            )
-            log.append(("build", running_bs, running_tokens))
-            md = SimpleNamespace(step=step, cache=cache_, served_by_round=service)
-            rnd.laid_out(md)
-            return md, step.positions
-
-    class Runner:
-        def __init__(self):
-            self.tokenID_processor, self.rejection_sampler = TP(), Sampler()
-
-        def run_model(self, ids, b=None):
-            log.append("replay")
-            rnd.after_forward(self.tokenID_processor)
-            return "logits", "hidden"
-
-    runner, builder = Runner(), Builder()
+    def build(b, running_bs, running_tokens):
+        """``_prepare_step``: the routing decision, the layout, then ``laid_out``."""
+        span = SimpleNamespace(request_id=b.req_ids[0], length=6)
+        service = (
+            rnd.service(b, (span,), running_bs, running_tokens, max_q_len=6, decode=True, tentative=True,
+                        is_prefill=False, resumes=None, image_rows=False)  # fmt: skip
+            if served_now[0]
+            else RoundService.NONE
+        )
+        step = SimpleNamespace(
+            positions=torch.zeros(6, dtype=torch.int64),
+            tentative=True,
+            slots=torch.zeros(1, dtype=torch.int32),
+            running_tokens=6,
+        )
+        log.append(("build", running_bs, running_tokens))
+        md = SimpleNamespace(step=step, cache=cache, served_by_round=service)
+        rnd.laid_out(md)
+        return md
 
     def forward(b, served=True, accepted=3):
         log.clear()
         served_now[0] = served and not b.total_seqs_num_prefill
-        runner.tokenID_processor.prepare_input_ids(b, 6)
-        md, _ = builder._prepare_step(b, (), [], cache, 1, 6)
+        # ``prepare_model``: the builder's answer, then the input ids
+        defer = rnd.consumes_device_verdict(b, 6)
+        tip.prepare_input_ids(processor, b, 6, None, defer_spec_status=defer)
+        r = processor.prev_rejected_num
+        zeros = isinstance(r, np.ndarray) and not r.any()
+        log.append(("ids", f"zeros{len(r)}" if zeros else r))
+        md = build(b, 1, 6)
         if md.served_by_round is RoundService.DEVICE:
             cache.prepare_device_round_state(md.step, histories=False)
         else:
             cache.prepare_state(md.step, histories=False)
-        runner.run_model("ids", b)
-        sampler_verdict[0] = torch.tensor(
+        log.append("replay")
+        if defer:
+            tip.take_deferred_spec_status(processor)
+        verdict = torch.tensor(
             [[accepted], [5 - accepted], [accepted]], dtype=torch.int32
         )
-        rnd.note_verdict(runner.rejection_sampler.forward())
+        log.append("verdict")
+        # ``commit_speculative_state`` at the verdict's anchors, on a served step
+        if md.served_by_round:
+            rnd.committed(md, verdict[2])
+        if b.produces_output():
+            processor.prev_batch = b
         return list(log), md
 
-    return forward, queue, runner, hook
+    return forward, queue, processor, hook
 
 
 def test_device_round_wrappers_in_forward_order(dr, monkeypatch):
     """A device-round step skips the verdict wait (its host status zeros: built as if no draft had been rejected),
     advances, skips the probe and takes the owed wait after the launch, in queue order; a stale verdict never carries
     across a forward that left none; every other step runs as without the hooks."""
-    forward, queue, runner, hook = _round_world(dr, monkeypatch)
+    forward, queue, processor, hook = _round_world(dr, monkeypatch)
     queue[:] = [("r0", "b0"), ("r1", "b1"), ("r2", "b2"), ("r3", "b3"), ("r4", "b4")]
     # the first decode: no verdict yet -> host path
     l1, s1 = forward(_batch())
@@ -589,7 +562,7 @@ def test_device_round_wrappers_in_forward_order(dr, monkeypatch):
     assert l2 == [("ids", "zeros1"), ("build", 1, 6), "replay", "recv", "verdict"]
     assert s2.served_by_round is RoundService.DEVICE
     assert s2.step.positions.tolist() == [104 + i for i in range(6)]
-    assert runner.tokenID_processor.prev_rejected_num == "r1"
+    assert processor.prev_rejected_num == "r1"
     # another request: host path, and the verdict of 7 is gone
     l3, s3 = forward(_batch(req=8))
     assert l3[:2] == ["recv", ("ids", "r2")] and "probe" in l3
@@ -609,7 +582,7 @@ def test_first_step_after_a_prefill(dr, monkeypatch):
     prefill chunk or a prefill of a request not in the step, the first step waits as before.
     """
     z = np.zeros(1, dtype=np.int32)
-    forward, queue, runner, _ = _round_world(dr, monkeypatch)
+    forward, queue, processor, _ = _round_world(dr, monkeypatch)
     queue[:] = [("p", "p"), (z, z), ("r1", "b1")]
     forward(
         _batch(total_seqs_num_prefill=1)
@@ -624,13 +597,13 @@ def test_first_step_after_a_prefill(dr, monkeypatch):
         "verdict",
     ]
     assert s1.served_by_round is not RoundService.DEVICE
-    assert runner.tokenID_processor.prev_rejected_num is z
+    assert processor.prev_rejected_num is z
     l2, s2 = forward(_batch())  # then a device-round step, as before
     assert l2 == [("ids", "zeros1"), ("build", 1, 6), "replay", "recv", "verdict"]
     assert s2.served_by_round is RoundService.DEVICE and not queue
 
     # a batch: request 8 prefilled alone, then a decode of 7 and 8 at the batch width
-    forward, queue, runner, _ = _round_world(dr, monkeypatch)
+    forward, queue, processor, _ = _round_world(dr, monkeypatch)
     queue[:] = [("p", "p"), (z, z)]
     forward(_batch(req=8, total_seqs_num_prefill=1))
     lm, sm = forward(_batch(total_seqs_num=2, req_ids=[7, 8]))
@@ -653,7 +626,7 @@ def test_first_step_after_a_prefill(dr, monkeypatch):
         assert lf[0] == "recv"  # waits as before
 
 
-# ---------------------------------------------------------------- the post-verify's routing
+# ---------------------------------------------------------------- the post-verify: head output and commit
 
 
 @pytest.fixture
@@ -669,63 +642,63 @@ def no_aiter_sampler(monkeypatch):
             monkeypatch.setitem(sys.modules, "atom.model_ops.rejection_sampler", fake)
 
 
-def test_post_verify_takes_the_in_graph_results_only_where_it_ran(
-    monkeypatch, no_aiter_sampler
-):
-    """``verdict``: the in-graph results on a step laid out as the kernel assumed (its width ran the kernel, every
-    request ``rq - 1`` drafts); the one-launch verdict otherwise; either reported to the decode round. ``take``
-    advances the forced-acceptance step."""
-    from atom.models.deepseek_v41.mono.round import head_verdict, post_verify
+def test_the_post_verify_is_the_forwards_head_output(no_aiter_sampler):
+    """A width's fixed outputs, laid out as the served step lays its rows out (B requests of ``rq`` rows: ``rq - 1``
+    drafts and a bonus row each), are the forward's head output (``HiLayers.head_output``: output ids [B, rq],
+    verdict [3, B]) exactly when this forward ran the post-verify at that width; else None (the logits).
+    """
+    from atom.models.deepseek_v41.mono import hi_runner
+    from atom.models.deepseek_v41.mono.round import post_verify
 
     split = {6: (1, 6), 12: (2, 6)}
     pv = post_verify.PostVerify((6, 12), split, torch.device("cpu"))
     assert pv.bufs[12]["target"].tolist() == [0, 1, 2, 3, 4, 6, 7, 8, 9, 10]
-    assert pv.bufs[12]["bonus"].tolist() == [5, 11] and pv.bufs[12]["cu"].tolist() == [
-        5,
-        10,
-    ]
-    noted = []
-    hook = SimpleNamespace(pv=pv, round=SimpleNamespace(note_verdict=noted.append))
-    sampler = SimpleNamespace(synthetic_acceptance_rates=(1.0, 0.5), _synthetic_step=3)
-    eager = ("eager",)
-    monkeypatch.setattr(head_verdict, "verdict", lambda spec, ids, s: eager)
-
-    def spec(drafts, steps=5):
-        return SimpleNamespace(
-            num_draft_tokens_np=np.asarray(drafts), num_spec_steps=steps
-        )
-
-    ids12 = torch.zeros(12, dtype=torch.int32)
-    # the forward did not run the kernel at 12 rows: the eager verdict
-    assert post_verify.verdict(hook, spec([5, 5]), ids12, sampler) is eager
-    pv.launched.add(12)
-    got = post_verify.verdict(hook, spec([5, 5]), ids12, sampler)
-    assert got == (pv.bufs[12]["out"], pv.bufs[12]["verdict"])
-    assert pv.used == 12 and sampler._synthetic_step == 4 and noted == [eager, got]
-    # another layout: the eager verdict, and the next step's skip wrappers see none taken
-    assert post_verify.verdict(hook, spec([5, 3]), ids12, sampler) is eager
-    assert post_verify.verdict(hook, spec([5, 5], steps=3), ids12, sampler) is eager
-    assert pv.used is None
+    assert pv.bufs[12]["bonus"].tolist() == [5, 11]
+    assert pv.bufs[12]["cu"].tolist() == [5, 10]
+    out, verdict = pv.output(12)
+    assert out is pv.bufs[12]["out"] and out.shape == (2, 6)
+    assert verdict is pv.bufs[12]["verdict"] and verdict.shape == (3, 2)
+    hook = object.__new__(hi_runner.HiLayers)
+    hook.pv, hook.verified = pv, 0
+    assert hook.head_output(12) is None  # (no post-verify this forward)
+    hook.verified = 12
+    assert hook.head_output(12) == (out, verdict) and hook.head_output(6) is None
+    hook.pv = None
+    assert hook.head_output(12) is None
 
 
-def test_post_verify_skips_the_commit_where_it_ran(no_aiter_sampler):
-    """On a step that took the in-graph results the builder's commit skips its launch (``committed``: the bookkeeping
-    kept); on any other step it runs as before. ``committed`` takes the step's results either way, so a later step
-    the head did not serve never sees them."""
+def test_post_verify_skips_the_commit_at_its_own_anchors(no_aiter_sampler):
+    """The builder's commit skips its launch (``committed``: the bookkeeping kept) exactly when the anchors it commits
+    are a launched width's in-graph verdict's (the runner took the head output, a padded bucket's first requests
+    included); at any other anchors (the logits path's verdict), or with nothing staged on the device, it runs as
+    before."""
     from atom.models.deepseek_v41.mono.round import post_verify
 
-    pv = post_verify.PostVerify((6,), {6: (1, 6)}, torch.device("cpu"))
+    pv = post_verify.PostVerify((6, 12), {6: (1, 6), 12: (2, 6)}, torch.device("cpu"))
     step = object()
-    pending = SimpleNamespace(staged_on_device=True, step=step)
-    md = SimpleNamespace(cache=SimpleNamespace(pending=pending), step=step)
-    pv.used = 6
-    assert pv.committed(md) and md.cache.pending is None and pv.used is None
-    md.cache.pending = pending
-    assert not pv.committed(md) and md.cache.pending is pending
-    # taken, but nothing staged on the device: ATOM's commit, and the results are gone
-    pv.used = 6
-    md.cache.pending = SimpleNamespace(staged_on_device=False, step=step)
-    assert not pv.committed(md) and pv.used is None
+
+    def md():
+        pending = SimpleNamespace(staged_on_device=True, step=step)
+        return SimpleNamespace(cache=SimpleNamespace(pending=pending), step=step)
+
+    verdict = pv.bufs[12]["verdict"]
+    m = md()
+    # a width the forward never ran the kernel at
+    assert not pv.committed(m, verdict[2]) and m.cache.pending is not None
+    pv.launched.add(12)
+    assert pv.committed(m, verdict[2]) and m.cache.pending is None
+    m = md()
+    assert pv.committed(m, verdict[:, :1][2])  # (one request in the bs-2 bucket)
+    for anchors in (verdict[2].clone(), torch.zeros(2, dtype=torch.int32), None):
+        m = md()
+        assert not pv.committed(m, anchors) and m.cache.pending is not None
+    m = md()
+    m.cache.pending.staged_on_device = False
+    assert not pv.committed(m, verdict[2]) and m.cache.pending is not None
+    m = md()
+    m.cache.pending.step = object()
+    with pytest.raises(RuntimeError, match="not prepared for this step"):
+        pv.committed(m, verdict[2])
 
 
 # ---------------------------------------------------------------- ATOM's Engram staging on served steps
@@ -807,13 +780,9 @@ def test_the_gate_decides_before_any_hi_import():
         "hi_dispatch",
         "device_round",
         "post_verify",
-        "prologue",
-        "head_verdict",
         "lean_host",
-        "embed_full",
         "hi_weights",
         "round/__init__",
-        "verify_head",
         "hi_plan",
         "hi_compose",
         "hi_bands",
@@ -824,7 +793,7 @@ def test_the_gate_decides_before_any_hi_import():
                 assert ".mono.hi." not in (n.module or "") + ".", (name, n.module)
     before = set(sys.modules)
     from atom.models.deepseek_v41.mono import hi_compose, hi_gate  # noqa: F401
-    from atom.models.deepseek_v41.mono.round import verify_head  # noqa: F401
+    from atom.models.deepseek_v41.mono.round import HiRound  # noqa: F401
 
     assert not [m for m in set(sys.modules) - before if ".mono.hi." in m + "."]
     pytest.importorskip("triton")

@@ -396,20 +396,20 @@ class HiDraft:
         to ``dr_bmax``)."""
         return 1 <= requests <= self.dr_bmax and width == self.dr_width
 
-    def draft_run(self, cache, anchor_ids, anchor_positions, slots, noise_row) -> None:
+    def draft_run(
+        self, cache, anchor_ids, anchor_rows, anchor_positions, slots, noise_row
+    ) -> None:
         """The block draft on the hi path (inside the draft graph's capture) by the plan of its request count
-        (``_draft_plan``): each request's block streams and first position (``_draft_begin_kernel``, its anchor's row
-        read in place from the token embedding's shards, with the launch-tag bump), then stages 0-2 and the head(s);
-        request b's ids land in ``mk_ids[b]``. ``anchor_ids`` / ``anchor_positions`` / ``slots``: a row a request.
+        (``_draft_plan``): each request's block streams and first position (``_draft_begin_kernel``, its anchor's
+        embedding row, with the launch-tag bump), then stages 0-2 and the head(s); request b's ids land in
+        ``mk_ids[b]``. ``anchor_ids`` / ``anchor_positions`` / ``slots``: a row a request; ``anchor_rows``: their
+        embedding rows (ATOM's lookup).
         """
         requests = int(anchor_ids.numel())
         self.dr_requests = requests
         self.cx_captured |= torch.cuda.is_current_stream_capturing()
         W, Hd = self.dr_width, self.dr_h_in.shape[-1]
         ids, apos, sl = anchor_ids.view(-1), anchor_positions.view(-1), slots.view(-1)
-        # the begin kernel reads the anchors' rows from the ranks holding them itself (``round.embed_full``)
-        table = self.embed.shards
-        fk = {"emb_rows": self.embed.rows, "emb_per": self.embed.per, "EMB": 1}
         stream = torch.cuda.current_stream()
         self.dr_peers.last_parity = (
             None  # its own group; the previous draft is a step back
@@ -429,8 +429,8 @@ class HiDraft:
                     cache, ids[b : b + 1], sl[b : b + 1], self.mk_ids[b]
                 )
                 ml._draft_begin_kernel[(W, triton.cdiv(Hd, 1024))](
-                    table, noise_row, self.dr_h_in, apos[b : b + 1], self.dr_pos, self.dr_step, Hd,
-                    self.draft_max_pos, NHC=HC, BLOCK=1024, ids=ids[b:], **fk,
+                    anchor_rows[b], noise_row, self.dr_h_in, apos[b : b + 1], self.dr_pos, self.dr_step, Hd,
+                    self.draft_max_pos, NHC=HC, BLOCK=1024,
                 )  # fmt: skip
                 launches(plan.launches, tables)
             return
@@ -438,7 +438,7 @@ class HiDraft:
         # request b's streams (rows b W ..) and first position; one tag bump a draft
         for b in range(requests):
             ml._draft_begin_kernel[(W, triton.cdiv(Hd, 1024))](
-                table, noise_row, self.dr_h_in[b * W :], apos[b : b + 1], self.dr_pos[b:], self.dr_step, Hd,
-                self.draft_max_pos, NHC=HC, BLOCK=1024, BUMP=int(b == 0), ids=ids[b:], **fk,
+                anchor_rows[b], noise_row, self.dr_h_in[b * W :], apos[b : b + 1], self.dr_pos[b:], self.dr_step, Hd,
+                self.draft_max_pos, NHC=HC, BLOCK=1024, BUMP=int(b == 0),
             )  # fmt: skip
         launches(plan.launches, tables)
