@@ -387,6 +387,8 @@ def moe_common_defs(k4ctx):
 
     return {
         "SH_FMT": SH_FMT,
+        "fp8_tile_load": fp8_tile_load,
+        "fp8_scale_load": fp8_scale_load,
         "ug_task_id": ug_task_id,
         "ug_task": ug_task,
         "ug_load": ug_load,

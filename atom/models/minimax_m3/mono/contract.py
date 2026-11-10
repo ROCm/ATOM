@@ -89,5 +89,5 @@ if __name__ == "__main__":
             if s < WIDE_FROM:
                 check_build(s, ih, xn_flag=1, mid_flag=1)
                 print(f"S={s} index heads={ih} xn_flag=1 mid_flag=1: contract holds")
-                check_build(s, ih, shared_mxfp8=True)
-                print(f"S={s} index heads={ih} shared_mxfp8: contract holds")
+            check_build(s, ih, shared_mxfp8=True)
+            print(f"S={s} index heads={ih} shared_mxfp8: contract holds")

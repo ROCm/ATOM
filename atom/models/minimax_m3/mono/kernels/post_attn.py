@@ -123,7 +123,6 @@ from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
 from atom.mono.plan.trace import enter_stage
 from atom.mono.runtime.abi import KernelAbi
-from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.debug import region_ids
 
 # The launch goes on the caller's current stream (graph capture included).
@@ -198,11 +197,10 @@ def build_post_attn_kernel(
     selecting layer of the step left in scratch. ``shared_mxfp8``: the shared
     expert is not one of the MXFP4 experts (``w13`` / ``w2`` hold the routed 128)
     but an MXFP8 MLP of its own (``w13s`` / ``s13s`` / ``w2s`` / ``s2s``: (16, 16)-
-    preshuffled fp8 weights and their row-major per-1x32 E8M0 scales), run by the narrow MoE (S <= 4).
+    preshuffled fp8 weights and their row-major per-1x32 E8M0 scales), run by the narrow MoE as its shared window, by the wide one as task pairs after
+    the grouped loop.
     """
     assert 1 <= tokens <= MAX_TOKENS
-    if shared_mxfp8 and wide_moe(tokens):
-        raise MonoUnsupported(f"an MXFP8 shared expert at {tokens} tokens (S <= 4)")
     key = K4Build(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
@@ -564,7 +562,9 @@ def build_post_attn_kernel(
         W_MIDSC = (MID_ROWS + 1) * MID_ROW
         # up / gate tasks go in pairs, a CTA runs both: an MXFP8 block is 32 rows
         UG_PAIRS = UG_PER_SLOT // 2
-        UGW_ITERS = 2 * ((U_MAX * UG_PAIRS + G - 1) // G)  # up / gate tasks a CTA runs
+        UGW_ITERS = 2 * (
+            ((U_MAX - (1 if shared_mxfp8 else 0)) * UG_PAIRS + G - 1) // G
+        )  # up / gate tasks a CTA runs
         # a wave takes chunks q and q + 4 of an expert (``wide_down``)
         assert 4 < DN_KC <= 8
         DN_WITERS = 2 * U_MAX  # (expert, chunk) units a wave runs, at most
