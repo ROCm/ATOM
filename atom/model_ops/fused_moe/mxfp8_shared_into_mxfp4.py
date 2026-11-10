@@ -102,6 +102,8 @@ class Mxfp8SharedIntoMxfp4:
             )
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be w1/w2/w3, got {shard_id!r}.")
+        if name.endswith("_scale"):
+            loaded_weight = self._scale_as_1x32(layer, name, shard_id, loaded_weight)
         layer._load_model_weight_or_group_weight_scale(
             shard_dim=expert_shard_dim(shard_id, False),
             expert_data=self.staged[name][expert_id - self.shared_lo],
@@ -111,6 +113,17 @@ class Mxfp8SharedIntoMxfp4:
         )
         self.loaded.add((name, expert_id, shard_id))
         return True
+
+    def _scale_as_1x32(self, layer, name, shard_id, scale):
+        """DeepSeek-V4.1 stores one E8M0 per 32x32 block, 1/32 of the 1x32 rows:
+        repeat each over its 32 rows before the TP shard, as the weights are."""
+        rows = self.staged[name].shape[1] // len(_STAGED_SHARDS[name])
+        if expert_shard_dim(shard_id, False) == 0:
+            rows *= layer.tp_size
+        # A 1x32 scale has a row per weight row, so 32x its rows never fit.
+        if scale.shape[0] * 32 > rows:
+            return scale
+        return scale.view(torch.uint8).repeat_interleave(32, dim=0)
 
     def fuse(self, layer) -> None:
         """Re-quantize the staged shared experts into their MXFP4 slots, then

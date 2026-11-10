@@ -17,6 +17,7 @@ dtypes = aiter.dtypes
 
 moe_mod = importlib.import_module("atom.model_ops.moe")
 quant_spec = importlib.import_module("atom.quant_spec")
+topk_mod = importlib.import_module("atom.model_ops.topK")
 staging_mod = importlib.import_module(
     "atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4"
 )
@@ -36,16 +37,17 @@ def _param(*shape, dtype=torch.float32):
     return nn.Parameter(torch.zeros(*shape, dtype=dtype), requires_grad=False)
 
 
-def _fused_mxfp4_layer():
+def _fused_mxfp4_layer(tp_size=1, tp_rank=0):
     """An MXFP4 FusedMoE with one fused shared slot, buffers as the target
     lays them out (w13 halves padded), its shared expert staged in MXFP8."""
     layer = object.__new__(FusedMoE)
     nn.Module.__init__(layer)
+    layer.quant_method = None
     layer.has_bias = False
     layer.prefix = layer.layer_name = "model.layers.3.block_sparse_moe.experts"
     layer.layer_quant_config = _spec(dtypes.fp4x2)
     layer.moe_parallel_config = SimpleNamespace(
-        tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, dp_rank=0, use_ep=False
+        tp_size=tp_size, tp_rank=tp_rank, ep_size=1, ep_rank=0, dp_rank=0, use_ep=False
     )
     layer.expert_map = None
     layer.expert_layout = SimpleNamespace(
@@ -67,13 +69,14 @@ def _fused_mxfp4_layer():
     return layer
 
 
-def _shared_checkpoint():
+def _shared_checkpoint(tp_size=1):
     """MXFP8 shared expert as the checkpoint stores it (full, unsharded)."""
     torch.manual_seed(0)
+    inter = I_LOCAL * tp_size
     w = {
-        "w1": (torch.randn(I_LOCAL, H) * 4).to(FP8),
-        "w3": (torch.randn(I_LOCAL, H) * 4).to(FP8),
-        "w2": (torch.randn(H, I_LOCAL) * 4).to(FP8),
+        "w1": (torch.randn(inter, H) * 4).to(FP8),
+        "w3": (torch.randn(inter, H) * 4).to(FP8),
+        "w2": (torch.randn(H, inter) * 4).to(FP8),
     }
     s = {
         k: torch.randint(100, 140, (v.shape[0], v.shape[1] // 32), dtype=torch.uint8)
@@ -127,6 +130,55 @@ def test_shared_slot_loads_into_mxfp8_staging_not_mxfp4_buffers():
     assert torch.equal(staged["w2_weight_scale"][0], s["w2"])
     # The MXFP4 buffers never saw the shared expert.
     assert not layer.w13_weight.data.any() and not layer.w2_weight.data.any()
+
+
+@pytest.mark.parametrize(("tp_size", "tp_rank"), [(1, 0), (2, 1)])
+def test_32x32_block_scales_stage_as_their_1x32_rows(tp_size, tp_rank):
+    """DeepSeek-V4.1's FP8 shared expert has one E8M0 scale per 32x32 block."""
+    w, _ = _shared_checkpoint(tp_size)
+    blocks = {
+        k: torch.randint(
+            100, 140, (v.shape[0] // 32, v.shape[1] // 32), dtype=torch.uint8
+        )
+        for k, v in w.items()
+    }
+    rows = {k: v.repeat_interleave(32, dim=0) for k, v in blocks.items()}
+    staged = []
+    for scales in (blocks, rows):
+        layer = _fused_mxfp4_layer(tp_size, tp_rank)
+        _load_shared(layer, w, scales)
+        staged.append(layer.shared_mxfp8_into_mxfp4.staged)
+    for name, got in staged[0].items():
+        assert torch.equal(got.view(torch.uint8), staged[1][name].view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    ("prefix", "fused"), [("layers.3.ffn.experts", True), ("mtp.0.ffn.experts", False)]
+)
+def test_dspark_drafter_keeps_its_shared_expert(monkeypatch, prefix, fused):
+    monkeypatch.setenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "1")
+    specs = {"shared_experts": _spec(dtypes.fp8), "experts": _spec(dtypes.fp4x2)}
+    qc = SimpleNamespace(
+        get_layer_quant_config=lambda p, check_children=False: specs[
+            p.rsplit(".", 1)[-1]
+        ]
+    )
+    monkeypatch.setattr(
+        topk_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(
+            quant_config=qc,
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            moe_ep_flatten_tp_across_dp=False,
+        ),
+    )
+    shared = prefix.removesuffix("experts") + "shared_experts"
+    assert (
+        topk_mod.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+            qc, shared_expert_prefix=shared, routed_expert_prefix=prefix
+        )
+        is fused
+    )
 
 
 def test_missing_shared_tensor_is_reported():
