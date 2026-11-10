@@ -3,9 +3,10 @@
 
 """Wan2.1 VAE: parity with Diffusers' AutoencoderKLWan, layout, conv3d dispatch.
 
-CPU only. The AITER kernels are stood in for by torch convs that take and
-return the same layouts the real ones do, so what is checked here is the
-plumbing around them -- the GPU numerics of the kernels themselves are what
+CPU, except the fused norm checks at the end, which skip without a GPU. The
+AITER kernels are stood in for by torch convs that take and return the same
+layouts the real ones do, so what is checked here is the plumbing around them
+-- the GPU numerics of the kernels themselves are what
 ``atom.diffusion.examples.wan_vae_bench`` measures.
 """
 
@@ -17,6 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from atom.diffusion.models.wan import conv_dispatch
+from atom.diffusion.models.wan import vae as wan_vae
 from atom.diffusion.models.wan.conv_dispatch import (
     conv3d,
     conv3d_backend_override,
@@ -457,3 +459,60 @@ def test_original_checkpoint_conversion_agrees_with_diffusers():
     theirs = single_file_utils.convert_wan_vae_to_diffusers(dict(original))
     ours = convert_original_wan_vae_state_dict(original)
     assert set(theirs) == set(ours) == set(keys)
+
+
+# --- fused norm + SiLU (GPU) ---------------------------------------------------
+
+needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+
+@needs_gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("channels_last", [True, False])
+@pytest.mark.parametrize(("c", "t"), [(96, 4), (20, 1), (384, 2)])
+def test_fused_norm_silu_matches_unfused(dtype, channels_last, c, t):
+    """The kernel against ``F.silu(norm(x))``, writing into a strided view the
+    way it writes into a conv's staging buffer. They differ only by the order
+    of the fp32 sum of squares: about an ulp in fp32, and in bf16 only where
+    that tips a rounding."""
+    from atom.diffusion.models.wan.norm_kernels import rms_norm_silu
+
+    gen = torch.Generator().manual_seed(c + t)
+    fmt = torch.channels_last_3d if channels_last else torch.contiguous_format
+    x = (torch.randn(2, c, t, 9, 13, generator=gen) * 3).to("cuda", dtype)
+    x = x.contiguous(memory_format=fmt)
+    norm = wan_vae.WanRMSNorm(c, images=False).to("cuda", dtype)
+    with torch.no_grad():
+        norm.gamma.copy_(torch.rand(c, 1, 1, 1, generator=gen) + 0.5)
+        expected = F.silu(norm(x))
+    buffer = torch.full(
+        (2, c, t + 2, 11, 15), float("nan"), device="cuda", dtype=dtype
+    ).contiguous(memory_format=fmt)
+    out = buffer[:, :, 2:, 1:-1, 1:-1]
+    rms_norm_silu(x, norm.gamma, norm.scale, out=out)
+
+    assert torch.isnan(buffer[:, :, :2]).all() and torch.isnan(buffer[..., 0]).all()
+    ulp = 2**-7 if dtype == torch.bfloat16 else 2**-20
+    torch.testing.assert_close(out, expected, rtol=ulp, atol=1e-6)
+    if dtype == torch.bfloat16:
+        assert (out != expected).float().mean() < 1e-3
+
+
+@needs_gpu
+@pytest.mark.parametrize("channels_last", [True, False])
+def test_fused_vae_matches_unfused(monkeypatch, channels_last):
+    """The whole VAE, fused against unfused, on GPU in fp32: the cached tail
+    frames read back from the staging buffer -- first chunk, one-frame and
+    four-frame chunks -- must be the ones the unfused path caches."""
+    vae = tiny_vae(channels_last=channels_last).cuda()
+    video = sample_video(frames=9).cuda()
+    latents = torch.randn(1, Z_DIM, 3, 4, 6, generator=torch.Generator().manual_seed(5))
+    fused = vae.encode_moments(video), vae.decode(latents.cuda())
+
+    def unfused(norm, conv, x, cache):
+        return wan_vae._cached_conv(conv, F.silu(norm(x)), cache)
+
+    monkeypatch.setattr(wan_vae, "_norm_silu_conv", unfused)
+    expected = vae.encode_moments(video), vae.decode(latents.cuda())
+    for got, want in zip(fused, expected):
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)

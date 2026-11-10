@@ -18,6 +18,9 @@ every op matches it in order and dtype. What differs is execution, not math:
 * The causal temporal pad, the cached tail frames and the spatial pad are
   staged into one buffer per conv (:func:`_stage_causal_input`), where
   Diffusers pays a ``cat`` and a ``pad``.
+* On GPU, the ``silu(norm(x))`` in front of each causal conv is one Triton
+  kernel that writes into that buffer (:func:`_norm_silu_conv`), rounding
+  where the unfused ops do.
 
 Video is processed causally in temporal chunks: encode sees the first frame,
 then 4 frames at a time; decode sees one latent frame at a time. Each causal
@@ -219,12 +222,28 @@ def _stage_causal_input(
     cat then pad copy it twice -- at 480x832 that buffer is ~460 MB per conv.
     """
     cache_t = 0 if cache is None else int(cache.shape[2])
+    if not (front - cache_t or cache_t or pad_h or pad_w):
+        return x
+    out, slot = _staging_buffer(x, cache, front=front, pad_h=pad_h, pad_w=pad_w)
+    slot.copy_(x)
+    return out
+
+
+def _staging_buffer(
+    x: torch.Tensor,
+    cache: torch.Tensor | None,
+    *,
+    front: int,
+    pad_h: int,
+    pad_w: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`_stage_causal_input`'s buffer with the pads and ``cache`` in
+    place, and the view of it that ``x`` goes into."""
+    cache_t = 0 if cache is None else int(cache.shape[2])
     if cache_t > front:
         raise ValueError(f"cache holds {cache_t} frames, conv pads only {front}")
     b, c, t, h, w = x.shape
     zero_t = front - cache_t
-    if not (zero_t or cache_t or pad_h or pad_w):
-        return x
     out = torch.empty(
         (b, c, front + t, h + 2 * pad_h, w + 2 * pad_w),
         dtype=x.dtype,
@@ -242,8 +261,7 @@ def _stage_causal_input(
     inner = out[:, :, :, pad_h : pad_h + h, pad_w : pad_w + w]
     if cache_t:
         inner[:, :, zero_t:front].copy_(cache)
-    inner[:, :, front:].copy_(x)
-    return out
+    return out, inner[:, :, front:]
 
 
 class WanCausalConv3d(nn.Conv3d):
@@ -256,12 +274,23 @@ class WanCausalConv3d(nn.Conv3d):
         self.causal_front = 2 * pad[0]
         self.pad_h, self.pad_w = pad[1], pad[2]
 
-    def forward(self, x: torch.Tensor, cache: torch.Tensor | None = None):
-        if not self.causal_front:
-            cache = None
-        x = _stage_causal_input(
-            x, cache, front=self.causal_front, pad_h=self.pad_h, pad_w=self.pad_w
-        )
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache: torch.Tensor | None = None,
+        *,
+        staged: bool = False,
+    ):
+        """``staged``: ``x`` is already the padded buffer, e.g. from
+        :func:`_norm_silu_conv`."""
+        if not staged:
+            x = _stage_causal_input(
+                x,
+                cache if self.causal_front else None,
+                front=self.causal_front,
+                pad_h=self.pad_h,
+                pad_w=self.pad_w,
+            )
         return conv3d(x, self.weight, self.bias, self.stride)
 
 
@@ -333,6 +362,38 @@ def _cached_conv(conv: WanCausalConv3d, x: torch.Tensor, cache: FeatureCache | N
     return out
 
 
+def _norm_silu_conv(
+    norm: WanRMSNorm,
+    conv: WanCausalConv3d,
+    x: torch.Tensor,
+    cache: FeatureCache | None,
+):
+    """``_cached_conv(conv, F.silu(norm(x)), cache)``.
+
+    On GPU the norm and SiLU run as one kernel that writes straight into the
+    conv's staging buffer, and the cached tail frames are read back from it.
+    """
+    if x.device.type != "cuda" or torch.is_grad_enabled():
+        return _cached_conv(conv, F.silu(norm(x)), cache)
+    from atom.diffusion.models.wan.norm_kernels import rms_norm_silu
+
+    prev = cache.peek() if cache is not None else None
+    staged_prev = prev if conv.causal_front else None
+    pad_h, pad_w = conv.pad_h, conv.pad_w
+    staged, slot = _staging_buffer(
+        x, staged_prev, front=conv.causal_front, pad_h=pad_h, pad_w=pad_w
+    )
+    rms_norm_silu(x, norm.gamma, norm.scale, out=slot)
+    if cache is not None:
+        _, _, t, h, w = x.shape
+        frames = min(CACHE_T, t + (0 if prev is None else int(prev.shape[2])))
+        if frames > conv.causal_front + t:
+            raise ValueError("conv pads too few frames to hold its cached tail")
+        tail = staged[:, :, -frames:, pad_h : pad_h + h, pad_w : pad_w + w]
+        cache.store(tail.clone(memory_format=memory_format_of(x)))
+    return conv(staged, staged=True)
+
+
 class WanResidualBlock(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
@@ -346,8 +407,8 @@ class WanResidualBlock(nn.Module):
 
     def forward(self, x, cache: FeatureCache | None = None):
         h = self.conv_shortcut(x)
-        x = _cached_conv(self.conv1, F.silu(self.norm1(x)), cache)
-        x = _cached_conv(self.conv2, F.silu(self.norm2(x)), cache)
+        x = _norm_silu_conv(self.norm1, self.conv1, x, cache)
+        x = _norm_silu_conv(self.norm2, self.conv2, x, cache)
         return x + h
 
 
@@ -479,7 +540,7 @@ class WanEncoder3d(nn.Module):
         for layer in self.down_blocks:
             x = layer(x, cache)
         x = self.mid_block(x, cache)
-        return _cached_conv(self.conv_out, F.silu(self.norm_out(x)), cache)
+        return _norm_silu_conv(self.norm_out, self.conv_out, x, cache)
 
 
 class WanUpBlock(nn.Module):
@@ -527,7 +588,7 @@ class WanDecoder3d(nn.Module):
         x = self.mid_block(x, cache)
         for block in self.up_blocks:
             x = block(x, cache)
-        return _cached_conv(self.conv_out, F.silu(self.norm_out(x)), cache)
+        return _norm_silu_conv(self.norm_out, self.conv_out, x, cache)
 
 
 class WanVAE(nn.Module):
