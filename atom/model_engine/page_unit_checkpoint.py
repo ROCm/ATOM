@@ -177,7 +177,7 @@ class PagedStateCheckpointSpec:
         )
 
 
-def checkpoint_page_unit_bytes(builder) -> int:
+def published_page_unit_bytes(builder) -> int:
     """Bytes of one PAGE unit a checkpoint transfer publishes for `builder`.
 
     The state image lives in the target's own PAGE rows, so the unit is the

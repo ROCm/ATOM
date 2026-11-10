@@ -67,7 +67,7 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
-    checkpoint_page_unit_bytes,
+    published_page_unit_bytes,
 )
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import (
@@ -1870,13 +1870,13 @@ class ModelRunner:
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
     def _local_checkpoint_spec(
-        self, plan: PoolPlan, transfer, slot_bytes: int
+        self, transfer, slot_bytes: int
     ) -> PagedStateCheckpointSpec:
         """This worker's own checkpoint geometry, before any PP agreement."""
         # None means the backend has not narrowed its image: carry it all.
         narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
         return PagedStateCheckpointSpec(
-            page_unit_bytes=checkpoint_page_unit_bytes(self.attn_metadata_builder),
+            page_unit_bytes=published_page_unit_bytes(self.attn_metadata_builder),
             slot_bytes=slot_bytes,
             image_bytes=slot_bytes if narrowed is None else int(narrowed),
             layout_id=transfer.paged_layout_id,
@@ -2106,7 +2106,7 @@ class ModelRunner:
             slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
             # A PP stage without a linear-attention layer has no image.
             local_spec = (
-                self._local_checkpoint_spec(plan, transfer, slot_bytes)
+                self._local_checkpoint_spec(transfer, slot_bytes)
                 if slot_bytes
                 else None
             )
