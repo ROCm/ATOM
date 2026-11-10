@@ -132,9 +132,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_OTEL_TRACE": lambda: os.getenv("ATOM_ENABLE_OTEL_TRACE", "0").lower()
     in {"1", "true"},
     "ATOM_TRACE_VERSION": lambda: os.getenv("ATOM_TRACE_VERSION", "unknown"),
-    # Forward metadata transport: direct or packed. Both keep source checks.
-    # Single-member groups and strided bindings retain direct copies.
-    "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
     # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
@@ -321,8 +318,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # Qwen3.8-Flash-Next eager prefill on SGLang-ATOM: run QSA sparse attention
     # with aiter's FlyDSL kernel (gfx942, BF16 D256, one KV head per rank)
-    # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel.
-    "ATOM_QSA_FLYDSL_ATTN": lambda: os.getenv("ATOM_QSA_FLYDSL_ATTN", "0") == "1",
+    # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel. On by
+    # default; 0 / false / off disables. Needs aiter with ROCm/aiter#6576.
+    "ATOM_QSA_FLYDSL_ATTN": lambda: _flag_env("ATOM_QSA_FLYDSL_ATTN", "1"),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
     # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
@@ -971,9 +969,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen3.8-Flash-Next under TP: forwards with at least this many tokens
     # (eager prefill) keep the hyper-connection residual streams token-sharded
     # across the TP ranks (reduce-scatter + all-gather instead of all-reduce),
-    # so the replicated HC norm/GEMM work is split TP ways. 0 disables.
-    "ATOM_QWEN4_EXP_SP_MIN_TOKENS": lambda: int(
-        os.getenv("ATOM_QWEN4_EXP_SP_MIN_TOKENS", "1024")
+    # so the replicated HC norm/GEMM work is split TP ways. The target model
+    # additionally never shards forwards of at most HC_QUANT_ROWS_MAX (1024)
+    # tokens, so they keep the fused HC FP8 quant; the MTP drafter (no fused
+    # quant) follows this value alone. 0 disables.
+    "ATOM_QWEN4_EXP_SP_MIN_TOKENS": lambda: _nonnegative_int_env(
+        "ATOM_QWEN4_EXP_SP_MIN_TOKENS", 1024
     ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
@@ -1055,6 +1056,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep that expert placement for the rest of the process. Rebalances the
     # balancedness gate skips do not count. 0 (default) = no limit.
     "ATOM_EPLB_MAX_REBALANCES": lambda: _int_env("ATOM_EPLB_MAX_REBALANCES", 0),
+    # --- Structured output ---
+    # Hold tool calls to the declared schemas when the tool parser declares a
+    # grammar for them (Kimi-K3) and the structured-output extra is installed.
+    "ATOM_TOOL_CALL_GRAMMAR": lambda: (
+        os.getenv("ATOM_TOOL_CALL_GRAMMAR", "0").lower() == "1"
+    ),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
@@ -1244,12 +1251,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # claims. "0" walks block by block with a token compare per block.
     "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",
     # --- TBO prefill ubatch splitting ---
-    # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
-    # cutting through a request if needed for perfectly balanced 50/50 ubatches.
-    # Default on; set "0" to fall back to the request-boundary balanced split.
-    "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
-        os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
-    ),
     # Minimum prefill tokens (per rank) required to TBO-split.
     "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")

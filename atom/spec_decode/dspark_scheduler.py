@@ -384,7 +384,7 @@ def apply_q_bucket(batch, drafter, dspark, *, apply_ragged=None) -> int | None:
     """
     if drafter is None or not drafter.uses_confidence_schedule:
         return None
-    if batch.total_tokens_num_prefill > 0:
+    if batch.has_prefill:
         return None
     scheduled_bs = batch.total_seqs_num_decode
     if scheduled_bs <= 0:
