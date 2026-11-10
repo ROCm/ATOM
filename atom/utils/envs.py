@@ -760,7 +760,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is built and at import of the sampling module.
     "ATOM_DSPARK_PROB_DRAFT": lambda: os.getenv("ATOM_DSPARK_PROB_DRAFT", "0") == "1",
     # Preserve sampled-prefix q and RNG while fusing Markov reductions on
-    # gfx1250: BF16 full vocabulary, rank 256, B <= 32, and five positions.
+    # gfx1250: BF16 full vocabulary, rank 256, any batch the zeroed workspace
+    # holds, and five positions.
     # Read before allocating the persistent probabilistic-draft state.
     "ATOM_DSPARK_PROB_FUSED_CHAIN": lambda: (
         os.getenv("ATOM_DSPARK_PROB_FUSED_CHAIN", "0") == "1"

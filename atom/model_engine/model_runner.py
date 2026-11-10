@@ -3676,11 +3676,12 @@ class ModelRunner:
                 if target_token_ids.numel() and get_tp_group().world_size > 1:
                     target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
             bonus_ready = None
-            if prob_src is not None:
+            if prob_src is not None and bonus_logits.is_cuda:
                 # The bonus draw does not depend on verification, and
                 # verification reads it only in its last kernel: issue it on a
                 # side stream so it overlaps the verification passes. Host
                 # call order (and so the generator's offsets) is unchanged.
+                # Off-device (CPU tests) the draw stays inline below.
                 main_stream = torch.cuda.current_stream()
                 side = self.__dict__.get("_bonus_sample_stream")
                 if side is None:
