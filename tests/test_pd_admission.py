@@ -172,14 +172,14 @@ def test_bytes_limit_and_isolated_large_request(build, chunked):
     sched.schedule()
     assert not b.block_table
     # B waited two passes; it is one deferred request, not two attempts.
-    assert sched.pd_admission.deferred == {"bytes": 1}
+    assert sched.pd_admission.deferred == {"bytes": 1, "free_kv": 0}
     sched._update_from_kv_xfer_finished(receive_success(a))
     sched.schedule()
     sched.schedule()
     # Alone, B is admitted past the 3072-byte limit.
     assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert sched.pd_admission.pending_bytes == 4096
-    assert sched.pd_admission.deferred == {"bytes": 1}
+    assert sched.pd_admission.deferred == {"bytes": 1, "free_kv": 0}
 
 
 @pytest.mark.parametrize("fraction", [None, 0.25])
@@ -190,6 +190,77 @@ def test_fraction_uses_physical_pool_bytes(build, fraction):
     sched, _ = build(options=options)
     # 64 blocks of 1024 bytes; the default fraction is 0.15.
     assert sched.pd_admission.max_bytes == int(64 * 1024 * (fraction or 0.15))
+    assert sched.pd_admission.reserve_blocks is None
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_free_kv_watermark_keeps_room_for_running_requests(build, chunked):
+    sched, request = build(
+        chunked=chunked,
+        num_kvcache_blocks=10,
+        options={
+            "enabled": True,
+            "max_pending_kv_fraction": None,
+            "min_free_kv_fraction": 0.5,
+        },
+    )
+    assert sched.pd_admission.reserve_blocks == 5
+    a, b, c = request(), request(), request()
+    sched.extend([a, b, c])
+    batch, _ = sched.schedule()
+    # After B, 6 blocks stay free; C would leave 4, below the 5 reserved.
+    assert set(batch.connector_meta_output.reqs_to_recv) == {a.id, b.id}
+    assert not c.block_table
+    sched.schedule()
+    assert not c.block_table
+    assert sched.pd_admission.deferred == {"bytes": 0, "free_kv": 1}
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    sched._update_from_kv_xfer_finished(receive_success(b))
+    batch, _ = sched.schedule()
+    assert {a.id, b.id} <= set(batch.req_ids)
+    assert not c.block_table  # A and B held credits during this pass.
+    sched.schedule()
+    # Alone, C may enter below the watermark; the allocator still has room.
+    assert c.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert set(sched.pd_admission.pending) == {str(c.id)}
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_free_kv_watermark_counts_claimed_prefix_hits(build, seq_factory, chunked):
+    sched, request = build(
+        chunked=chunked,
+        prefix=True,
+        num_kvcache_blocks=10,
+        options={
+            "enabled": True,
+            "max_pending_kv_fraction": None,
+            "min_free_kv_fraction": 0.6,
+        },
+    )
+    bm = sched.block_manager
+    seed = seq_factory(list(range(16)))
+    bm.allocate(seed, bm.can_allocate(seed))
+    bm.hash_blocks(seed, seed.num_tokens)
+    bm.deallocate(seed)
+    a, b = request(), request(16)
+    sched.add(a)
+    sched.schedule()
+    assert set(sched.pd_admission.pending) == {str(a.id)}
+    free = bm.kv.num_free
+    assert free == 8
+    sched.add(b)
+    sched.schedule()
+    # B receives one block, but its hit also takes two cached-but-free blocks:
+    # 8 - 3 would leave fewer than the 6 reserved.
+    assert not b.block_table
+    assert bm.kv.num_free == free
+    assert sched.pd_admission.deferred == {"bytes": 0, "free_kv": 1}
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    sched.schedule()
+    batch, _ = sched.schedule()
+    # Alone, B enters with the same three-block hit.
+    assert batch.connector_meta_output.reqs_to_recv[b.id].num_computed_blocks == 3
+    assert set(sched.pd_admission.pending) == {str(b.id)}
 
 
 @pytest.mark.parametrize("geometry_matches", [False, True])
@@ -552,6 +623,10 @@ def test_multiconnector_uses_load_winner(build):
         {"enabled": True, "max_pending_kv_fraction": 0.1, "max_pending_kv_bytes": 10},
         {"enabled": True, "max_pending_kv_fraction": None},
         {"enabled": True, "extra_growth_blocks_per_request": 1},
+        {"enabled": True, "min_free_kv_fraction": 0},
+        {"enabled": True, "min_free_kv_fraction": 1},
+        {"enabled": True, "min_free_kv_fraction": True},
+        {"enabled": True, "min_free_kv_fraction": float("inf")},
     ],
 )
 def test_invalid_config_rejected(build, options):
@@ -634,7 +709,12 @@ def test_admission_state_is_exported_from_the_metrics_snapshot(build):
     # A plain `Scheduler` reports no role, which aggregation exports as "default".
     labels = (("dp_rank", "0"), ("engine_role", "default"))
     pending_bytes = ("atom:pd_admission_pending_kv_bytes", labels)
-    deferred = ("atom:pd_admission_deferred_total", (*labels, ("reason", "bytes")))
+    deferred = "atom:pd_admission_deferred_total"
+    # Cumulative: B deferred once by bytes, never by the free-KV reserve.
+    counters = {
+        (deferred, (*labels, ("reason", "bytes"))): 1,
+        (deferred, (*labels, ("reason", "free_kv"))): 0,
+    }
 
     def pending(**counts):
         states = {"receiving": 0, "ready": 0, "cancel_draining": 0} | counts
@@ -647,15 +727,15 @@ def test_admission_state_is_exported_from_the_metrics_snapshot(build):
     sched.extend([a, b])
     sched.schedule()
     sched.schedule()
-    assert exported() == pending(receiving=1) | {pending_bytes: 2048, deferred: 1}
+    assert exported() == pending(receiving=1) | {pending_bytes: 2048, **counters}
     sched._update_from_kv_xfer_finished(receive_success(a, as_str=True))
-    assert exported() == pending(ready=1) | {pending_bytes: 2048, deferred: 1}
+    assert exported() == pending(ready=1) | {pending_bytes: 2048, **counters}
     # A's first forward returns its credit; B is admitted on the next pass.
     sched.schedule()
-    assert exported() == pending() | {pending_bytes: 0, deferred: 1}
+    assert exported() == pending() | {pending_bytes: 0, **counters}
     sched.schedule()
     assert sched.abort_request(b.id)
     # A cancelled receive keeps its credit while its writes drain.
-    assert exported() == pending(cancel_draining=1) | {pending_bytes: 2048, deferred: 1}
+    assert exported() == pending(cancel_draining=1) | {pending_bytes: 2048, **counters}
     sched._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={str(b.id)}))
-    assert exported() == pending() | {pending_bytes: 0, deferred: 1}
+    assert exported() == pending() | {pending_bytes: 0, **counters}
