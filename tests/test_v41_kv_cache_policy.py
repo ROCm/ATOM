@@ -115,7 +115,9 @@ def bridge_functions():
         if isinstance(n, ast.FunctionDef) and n.name in names
     ]
     scope = {"ATOM_DEEPSEEK_V41_BLOCK_SIZE": 256, "v41_speculative_tokens": lambda _: 0}
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), scope)
+    # Execute only the selected repository functions without importing vLLM.
+    code = compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec")
+    exec(code, scope)  # noqa: S102
     return scope
 
 
